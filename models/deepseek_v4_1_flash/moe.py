@@ -1487,8 +1487,7 @@ def _local_mhc_compare(num_tokens):
     return compare
 
 
-def validate(argv=None):
-    """Validate the complete mHC and MoE block against its golden reference."""
+if __name__ == "__main__":
     import argparse
 
 
@@ -1517,7 +1516,7 @@ def validate(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--skip-shared", action="store_true", help="diagnostic only: zero shared expert output and still run gate/dispatch/routed/combine")
     parser.add_argument("--skip-transport", action="store_true", help="diagnostic only: bypass dispatch/routed/combine and write shared output on local rows")
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device_ids = [int(d) for d in args.device.split(",") if d != ""]
@@ -1581,15 +1580,5 @@ def validate(argv=None):
         atol=1e-3,
         compare_fn=compare_fn,
     )
-    return result
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

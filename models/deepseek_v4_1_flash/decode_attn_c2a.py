@@ -35,7 +35,6 @@ from config import (
     COMPRESSED_CACHE_GROUP,
     DECODE_MAX_TOKENS,
     INDEX_CACHE_GROUP,
-    PREFILL_MAX_TOKENS,
     STATE_CAPACITY,
     WINDOW_CACHE_GROUP,
 )
@@ -1912,95 +1911,6 @@ def build_specs(args, mode, full_rope_tables=True):
     return specs
 
 
-def run_c2a(operator, mode, argv=None, *, ring_heap=None):
-    """Validate a C2A full production operator on A5."""
-    from pypto.ir import DistributedConfig
-
-    parser = argparse.ArgumentParser(description=f"DeepSeek V4.1 {mode} C2A full: A5 precision and timing")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
-    parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
-    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
-    parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
-    parser.add_argument("--tokens", "--batch", type=int, default=24 if mode == "decode" else 48)
-    parser.add_argument("--requests", type=int, default=6)
-    parser.add_argument("--case", default="mixed", choices=["mixed", "long", "masked", "zero"])
-    parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
-    parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--runtime-dir", help="replay a compatible compiled build without recompiling")
-    parser.add_argument("--save-data", action="store_true", help="save validated inputs and golden outputs for replay")
-    parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
-    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
-    parser.add_argument("--enable-dep-gen", action="store_true")
-    args = parser.parse_args(argv)
-    if args.tp != TP_SIZE:
-        parser.error(f"--tp {args.tp} does not match import-time TP_SIZE {TP_SIZE}")
-
-    args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
-    devices = list(range(TP_SIZE * args.dp))
-    if args.device:
-        devices = [int(value) for value in args.device.split(",")]
-    if len(devices) != TP_SIZE * args.dp or len(set(devices)) != len(devices) or min(devices) < 0:
-        parser.error(f"--device must name {TP_SIZE * args.dp} distinct non-negative device IDs")
-    capacity = DECODE_MAX_TOKENS if mode == "decode" else PREFILL_MAX_TOKENS
-    if not 1 <= args.tokens <= capacity:
-        parser.error(f"--tokens must be in [1, {capacity}]")
-    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
-        parser.error(f"--requests must be in [1, {min(MAX_BATCH_PER_DP, args.tokens)}]")
-    if not 1 <= args.epochs <= 1000:
-        parser.error("--epochs must be in [1, 1000]")
-    if args.bench and args.enable_chip_swimlane:
-        parser.error("benchmark epoch stepping and multi-pass chip swimlane must be run separately")
-    torch.set_num_threads(8)
-
-    print(
-        f"[C2A] mode={mode} tokens={args.tokens} requests={args.requests} TP={TP_SIZE} "
-        f"DP={args.dp} case={args.case} seed={args.seed} epochs/dispatch={args.epochs} devices={devices}"
-    )
-    if args.bench:
-        print(
-            "[C2A] Resident device timing excludes compilation, input generation and CPU golden; "
-            "each dispatch advances the communication epoch. Timing includes all epochs/dispatch."
-        )
-
-    # Zero and masked outputs are exactly zero, so any residue is a failure.
-    output_compare = (
-        ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
-        if args.case in ("masked", "zero") else ratio_allclose(atol=1e-2, rtol=1.0 / 128)
-    )
-    compare = {
-        "output": output_compare,
-        "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-        "state_cache": ratio_allclose(atol=1e-3, rtol=1e-3),
-    }
-    compare.update(cache_compare(len(devices), args.tokens))
-
-    result = run(
-        fn=make_program(operator, capacity, len(devices), args.epochs),
-        specs=build_specs(args, mode),
-        golden_fn=make_golden(args.epochs),
-        runtime_dir=args.runtime_dir,
-        compile_only=args.compile_only,
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        config=dict(
-            platform=args.platform,
-            distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            enable_dep_gen=args.enable_dep_gen,
-            **({"ring_heap": ring_heap} if ring_heap is not None else {}),
-        ),
-        compare_fn=compare,
-    )
-    print(f"[C2A] work_dir={result.work_dir}")
-    if args.compile_only:
-        print("[C2A] Compilation passed; device accuracy was NOT validated.")
-    if args.save_data and result.work_dir:
-        print(f"[C2A] Validated snapshot: {result.work_dir}/data")
-    return result
-
-
 def make_c2a_reuse_partial(qkv_operator=qkv_proj_rope, output_operator=o_proj, attention_operator=attend_sparse):
     """Bind preprocessing and projection schedules while preserving the shared C2A core."""
     @pl.jit.inline(auto_scope=False)
@@ -2506,17 +2416,89 @@ def build_reuse_specs(args, mode, initial_cache):
     return specs
 
 
-def validate(argv=None):
-    """Validate the Decode C2A Full production operator on A5."""
-    return run_c2a(decode_attn_c2a_full, "decode", argv=argv)
+if __name__ == "__main__":
+    from pypto.ir import DistributedConfig
 
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 decode C2A full: A5 precision and timing")
+    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
+    parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
+    parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
+    parser.add_argument("--tokens", "--batch", type=int, default=24)
+    parser.add_argument("--requests", type=int, default=6)
+    parser.add_argument("--case", default="mixed", choices=["mixed", "long", "masked", "zero"])
+    parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--epochs", type=int, default=1, help="operator calls per dispatch; timing includes all epochs")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--runtime-dir", help="replay a compatible compiled build without recompiling")
+    parser.add_argument("--save-data", action="store_true", help="save validated inputs and golden outputs for replay")
+    parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
+    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
+    parser.add_argument("--enable-dep-gen", action="store_true")
+    args = parser.parse_args()
+    if args.tp != TP_SIZE:
+        parser.error(f"--tp {args.tp} does not match import-time TP_SIZE {TP_SIZE}")
 
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
+    args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
+    devices = list(range(TP_SIZE * args.dp))
+    if args.device:
+        devices = [int(value) for value in args.device.split(",")]
+    if len(devices) != TP_SIZE * args.dp or len(set(devices)) != len(devices) or min(devices) < 0:
+        parser.error(f"--device must name {TP_SIZE * args.dp} distinct non-negative device IDs")
+    capacity = DECODE_MAX_TOKENS
+    if not 1 <= args.tokens <= capacity:
+        parser.error(f"--tokens must be in [1, {capacity}]")
+    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
+        parser.error(f"--requests must be in [1, {min(MAX_BATCH_PER_DP, args.tokens)}]")
+    if not 1 <= args.epochs <= 1000:
+        parser.error("--epochs must be in [1, 1000]")
+    if args.bench and args.enable_chip_swimlane:
+        parser.error("benchmark epoch stepping and multi-pass chip swimlane must be run separately")
+    torch.set_num_threads(8)
+
+    print(
+        f"[C2A] mode=decode tokens={args.tokens} requests={args.requests} TP={TP_SIZE} "
+        f"DP={args.dp} case={args.case} seed={args.seed} epochs/dispatch={args.epochs} devices={devices}"
+    )
+    if args.bench:
+        print(
+            "[C2A] Resident device timing excludes compilation, input generation and CPU golden; "
+            "each dispatch advances the communication epoch. Timing includes all epochs/dispatch."
+        )
+
+    # Zero and masked outputs are exactly zero, so any residue is a failure.
+    output_compare = (
+        ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
+        if args.case in ("masked", "zero") else ratio_allclose(atol=1e-2, rtol=1.0 / 128)
+    )
+    compare = {
+        "output": output_compare,
+        "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+        "state_cache": ratio_allclose(atol=1e-3, rtol=1e-3),
+    }
+    compare.update(cache_compare(len(devices), args.tokens))
+
+    result = run(
+        fn=make_program(decode_attn_c2a_full, capacity, len(devices), args.epochs),
+        specs=build_specs(args, "decode"),
+        golden_fn=make_golden(args.epochs),
+        runtime_dir=args.runtime_dir,
+        compile_only=args.compile_only,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
+        config=dict(
+            platform=args.platform,
+            distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
+            enable_chip_swimlane=args.enable_chip_swimlane,
+            enable_dep_gen=args.enable_dep_gen,
+        ),
+        compare_fn=compare,
+    )
+    print(f"[C2A] work_dir={result.work_dir}")
+    if args.compile_only:
+        print("[C2A] Compilation passed; device accuracy was NOT validated.")
+    if args.save_data and result.work_dir:
+        print(f"[C2A] Validated snapshot: {result.work_dir}/data")
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

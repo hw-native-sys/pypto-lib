@@ -6,16 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Continuous-batch decode C1A full attention wired through mHC.
-
-The attention operator stays in ``decode_attn_c1a.py``; this entry consumes the staggered
-``pre_mix`` the previous sub-layer produced (identity one-hot at the very first site),
-computes this site's coefficients with ``mhc_mixes``, collapses with ``mhc_pre``, runs the
-operator, and expands the residual with ``mhc_post``. ``post_mix`` and ``residual_mix``
-apply immediately, while the computed ``pre_mix`` is handed to the next sub-layer. The
-module also hosts the shared HC fixture, goldens, and validation harness the reindex and
-reuse entries reuse.
-"""
+"""Continuous-batch decode C1A full attention wired through mHC."""
 
 import utils as _decode_utils
 
@@ -776,15 +767,12 @@ def golden_decode_c1a_full_case(tensors, epochs=1, sharded=False):
     golden_c1a_hc_case(tensors, golden_decode_attn_c1a_full, epochs, sharded)
 
 
-def parse_c1a_hc_args(mode, argv=None):
-    """Parse and validate one mHC C1A Attention harness command line.
-
-    Both wirings share one parse so ``--wiring`` can decide up front which of
-    them run, and so a replay directory is never handed to two ABIs.
-    """
+if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description=f"TP1/2/4 A5 mHC C1A {mode} validation")
+    from pypto.ir import DistributedConfig
+
+    parser = argparse.ArgumentParser(description="TP1/2/4 A5 mHC C1A full validation")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
     parser.add_argument(
         "--dp", type=int, default=1, choices=[1],
@@ -807,16 +795,32 @@ def parse_c1a_hc_args(mode, argv=None):
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    parser.add_argument("--check-fp4", action="store_true", default=False,
-                        help="run the CPU E2M1 midpoint check and exit")
-    _decode_utils.add_wiring_argument(parser)
-    _decode_utils.add_start_pos_argument(parser)
-    args = parser.parse_args(argv)
+    parser.add_argument("--check-fp4", action="store_true", help="run the CPU E2M1 midpoint check and exit")
+    parser.add_argument("--wiring", choices=("both", "replicated", "sharded"), default="both",
+                        help="which wiring to run; replay directories use a separate subdirectory per wiring")
+    parser.add_argument("--start-pos", type=str, default=None,
+                        help="absolute decode start positions; a comma-separated list sets batch to its length")
+    args = parser.parse_args()
     if args.check_fp4:
         raise SystemExit(check_fp4_boundaries())
-    _decode_utils.resolve_start_pos(parser, args)
-    if _decode_utils.WIRING_SHARDED in _decode_utils.selected_wirings(args.wiring):
-        _decode_utils.validate_sp_tokens(parser, args)
+    if args.start_pos is not None:
+        try:
+            positions = [int(value.strip()) for value in args.start_pos.split(",")]
+        except ValueError:
+            parser.error("--start-pos must contain comma-separated integers")
+        if not 1 <= len(positions) <= min(MAX_BATCH_PER_DP, DECODE_MAX_TOKENS):
+            parser.error("--start-pos batch exceeds the decode request capacity")
+        if any(position < 0 or position >= M.max_position_embeddings for position in positions):
+            parser.error(f"--start-pos values must be in [0, {M.max_position_embeddings})")
+        if args.case not in ("random", "mixed"):
+            parser.error("--start-pos requires the default random/mixed case")
+        args.start_pos = positions
+        args.tokens = args.requests = len(positions)
+        args.pages = sum((position + 128) // 128 for position in positions)
+    if args.wiring in ("both", "sharded"):
+        if args.tokens < 1 or args.tp < 1:
+            parser.error("sequence-parallel requires positive tokens and tp")
+        args.local_tokens = (args.tokens + args.tp - 1) // args.tp
     if args.tp != TP_SIZE:
         parser.error(f"--tp {args.tp} does not match the TP_SIZE {TP_SIZE} the operator was built for")
     try:
@@ -827,101 +831,58 @@ def parse_c1a_hc_args(mode, argv=None):
         parser.error(f"device IDs must be {TP_SIZE} distinct nonnegative integers, one per rank")
     if not 1 <= args.tokens <= min(DECODE_MAX_TOKENS, args.pages * 128) or args.pages < 1 or args.epochs < 1:
         parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1, epochs >= 1")
+
     if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
         parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens {args.tokens})")
-    return args, devices
 
-
-def make_wiring_program(factory, wiring):
-    """Bind one wiring to a C1A host factory.
-
-    Every mode's ``make_program`` already dispatches on ``sharded``; this binds
-    the wiring to the caller's own factory so a wrapper cannot substitute another
-    mode's host.
-    """
-    if wiring == _decode_utils.WIRING_SHARDED:
-        return lambda tokens, pages, requests, epochs: factory(tokens, pages, requests, epochs, sharded=True)
-    return factory
-
-
-def validate_c1a_wirings(mode, factory, golden_case, argv=None):
-    """Validate every wiring ``--wiring`` selects and combine the results."""
-    args, devices = parse_c1a_hc_args(mode, argv)
-    return _decode_utils.combine_validation(
-        [
-            run_c1a_hc(
-                mode,
-                make_wiring_program(factory, wiring),
-                golden_case,
-                args=args,
-                devices=devices,
-                sharded=wiring == _decode_utils.WIRING_SHARDED,
-            )
-            for wiring in _decode_utils.selected_wirings(args.wiring)
+    results = []
+    wirings = ("replicated", "sharded") if args.wiring == "both" else (args.wiring,)
+    for wiring in wirings:
+        sharded = wiring == "sharded"
+        host = make_program(args.tokens, args.pages, requests=args.requests, epochs=args.epochs, sharded=sharded)
+        values = build_hc_validation_values(
+            "full", args.tokens, args.pages, args.requests, args.seed, args.case,
+            sharded, args.start_pos,
+        )
+        # Independent initial storage for each harness allocation.
+        specs = [
+            TensorSpec(n, list(values[n].shape), values[n].dtype, init_value=lambda n=n: values[n].clone())
+            for n in host.param_names
         ]
-    )
 
+        def golden_fn(tensors, sharded=sharded):
+            golden_decode_c1a_full_case(tensors, args.epochs, sharded)
 
-def run_c1a_hc(mode, kernel_factory, golden_case, *, args, devices, sharded=False):
-    """Run A5 validation for one mHC-wired C1A operator and one wiring."""
-    from pypto.ir import DistributedConfig
-
-    wiring = _decode_utils.WIRING_SHARDED if sharded else _decode_utils.WIRING_REPLICATED
-    host = kernel_factory(args.tokens, args.pages, args.requests, args.epochs)
-    values = build_hc_validation_values(mode, args.tokens, args.pages, args.requests, args.seed, args.case, sharded, args.start_pos)
-    # Clone per call: the harness builds the golden scratch from these same specs, and a
-    # tensor init_value whose dtype already matches comes back as itself.
-    specs = [
-        TensorSpec(n, list(values[n].shape), values[n].dtype, init_value=lambda n=n: values[n].clone())
-        for n in host.param_names
-    ]
-
-    def golden_fn(tensors):
-        golden_case(tensors, args.epochs, sharded)
-
-    output_budget = ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO)
-    comparisons = {
-        "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0) if mode == "reuse" else ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-        "candidate_mask": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-        "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-        "output": output_budget,
-        # One BF16 step is the noise floor of rows rounded once before the AllGather.
-        "gathered": ratio_allclose(atol=2 ** -6, rtol=2 ** -6),
-        **cache_compare(len(devices), args.tokens, mode),
-    }
-    comparisons = {name: fn for name, fn in comparisons.items() if name in host.param_names}
-    result = run(
-        fn=host,
-        specs=specs,
-        golden_fn=golden_fn,
-        compile_only=args.compile_only,
-        save_data=args.save_data,
-        golden_data=_decode_utils.wiring_replay_dir(args.golden_data, wiring),
-        runtime_dir=_decode_utils.wiring_replay_dir(args.runtime_dir, wiring),
-        config=dict(
-            platform=args.platform,
-            dump_passes=args.dump_passes,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn=comparisons,
-    )
-    return result
-
-
-def validate(argv=None):
-    """Validate every wiring ``--wiring`` selects on A5."""
-    return validate_c1a_wirings("full", make_program, golden_decode_c1a_full_case, argv)
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
-    if not result.passed:
-        raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()
+        output_budget = ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO)
+        comparisons = {
+            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+            "candidate_mask": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "output": output_budget,
+            # BF16 rounding tolerance for gathered rows.
+            "gathered": ratio_allclose(atol=2 ** -6, rtol=2 ** -6),
+            **cache_compare(len(devices), args.tokens, "full"),
+        }
+        comparisons = {name: fn for name, fn in comparisons.items() if name in host.param_names}
+        result = run(
+            fn=host,
+            specs=specs,
+            golden_fn=golden_fn,
+            compile_only=args.compile_only,
+            save_data=args.save_data,
+            golden_data=_decode_utils.wiring_replay_dir(args.golden_data, wiring),
+            runtime_dir=_decode_utils.wiring_replay_dir(args.runtime_dir, wiring),
+            config=dict(
+                platform=args.platform,
+                dump_passes=args.dump_passes,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+                distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn=comparisons,
+        )
+        results.append(result)
+    for result in results:
+        if not result.passed:
+            raise SystemExit(result.error or 1)

@@ -1039,8 +1039,7 @@ def build_tensor_specs():
     return specs
 
 
-def validate(argv=None):
-    """Validate the routed-expert compute and scatter on one device."""
+if __name__ == "__main__":
     import argparse
 
     from golden import ratio_reldiff, run
@@ -1056,9 +1055,9 @@ def validate(argv=None):
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
 
-    return run(
+    result = run(
         fn=l3_expert_routed,
         specs=build_tensor_specs(),
         golden_fn=golden_expert_routed_scatter,
@@ -1086,16 +1085,7 @@ def validate(argv=None):
             "routed_y": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
         },
     )
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
     if not result.passed:
         if result.error:
             print(result.error)
         raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()

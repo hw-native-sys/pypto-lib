@@ -130,7 +130,6 @@ def golden_paged_sparse_attention_stats(
     return maximum, denominator, numerator
 
 
-
 def golden_paged_sparse_attention(
     q: torch.Tensor,
     window_cache: torch.Tensor,
@@ -145,7 +144,6 @@ def golden_paged_sparse_attention(
         golden_paged_sparse_attention_stats(q, compressed_cache, compressed_indices),
     )
     return golden_merge_attention_stats(parts, sink).to(q.dtype)
-
 
 
 def golden_merge_attention_stats(
@@ -164,7 +162,6 @@ def golden_merge_attention_stats(
         denominator = denominator + local_sum * scale
         numerator = numerator + local_numerator * scale.unsqueeze(-1)
     return numerator / denominator.unsqueeze(-1)
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -793,113 +790,6 @@ def sparse_mla_bf16(
     return output
 
 
-def main():
-    import argparse
-
-    import torch
-
-    from golden import TensorSpec, ratio_allclose, run
-    from quant import (
-        dequantize_mxfp4_cache, dequantize_mxfp8_cache,
-        quantize_mxfp4_cache, quantize_mxfp8_cache,
-    )
-
-    parser = argparse.ArgumentParser(description="Validate sparse MLA on Ascend950")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4, 8])
-    parser.add_argument("--rows", type=int, default=7)
-    parser.add_argument("--mode", default="both", choices=["packed", "bf16", "both"])
-    parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--fixture", type=Path)
-    parser.add_argument("--runtime-dir", type=str)
-    args = parser.parse_args()
-    if args.tp != TP_SIZE:
-        raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
-    if args.runtime_dir and args.mode == "both":
-        raise ValueError("--runtime-dir requires one --mode")
-    if args.rows < 1:
-        raise ValueError("--rows must be positive")
-    fixture = torch.load(args.fixture, weights_only=True) if args.fixture else None
-    if fixture is None:
-        torch.manual_seed(4102026)
-        query = (torch.randn(args.rows, LOCAL_H, HEAD_DIM) * 0.7).bfloat16()
-        window = (torch.randn(256, HEAD_DIM) * 0.6).bfloat16()
-        compressed = (torch.randn(512, HEAD_DIM) * 0.6).bfloat16()
-        window_indices = torch.randint(0, 256, (args.rows, 128), dtype=torch.int32)
-        compressed_indices = torch.randint(0, 512, (args.rows, INDEX_TOPK), dtype=torch.int32)
-        window_indices[0] = -1
-        compressed_indices[0] = -1
-        sink = torch.linspace(-2, 3, LOCAL_H)
-        extents = torch.tensor([128, INDEX_TOPK], dtype=torch.int32).repeat(args.rows, 1)
-        wp, ws = quantize_mxfp8_cache(window.reshape(-1, 128, 1, HEAD_DIM))
-        cp, cs = quantize_mxfp4_cache(compressed.reshape(-1, 128, 1, HEAD_DIM), 16, "bf16")
-        wd = dequantize_mxfp8_cache(wp, ws).bfloat16().reshape(-1, HEAD_DIM)
-        cd = dequantize_mxfp4_cache(cp, cs, 16, "bf16").bfloat16().reshape(-1, HEAD_DIM)
-    else:
-        query = fixture["q"]
-        if list(query.shape) != [args.rows, LOCAL_H, HEAD_DIM]:
-            raise ValueError("Fixture query shape does not match --rows and --tp")
-        window, compressed = fixture["w"], fixture["c"]
-        window_indices, compressed_indices = fixture["wi"], fixture["ci"]
-        sink, extents = fixture["sink"], fixture["extents"]
-        wp, ws, cp, cs = fixture["wp"], fixture["ws"], fixture["cp"], fixture["cs"]
-
-    modes = ["packed", "bf16"] if args.mode == "both" else [args.mode]
-    records = []
-    for mode in modes:
-        if fixture is None:
-            wkeys, ckeys = (wd, cd) if mode == "packed" else (window, compressed)
-            expected = torch.empty_like(query, dtype=torch.float32)
-            for row in range(args.rows):
-                ids = torch.cat([window_indices[row], compressed_indices[row]])
-                wvalues = wkeys[window_indices[row].clamp_min(0).long()]
-                cvalues = ckeys[compressed_indices[row].clamp_min(0).long()]
-                keys = torch.cat([wvalues, cvalues]).float()
-                keys[ids < 0] = 0
-                scores = query[row].float() @ keys.T * SCALE
-                scores[:, ids < 0] = -float("inf")
-                probability = torch.cat([scores, sink[:, None]], dim=1).softmax(dim=1)
-                expected[row] = probability[:, :-1] @ keys
-        else:
-            expected = fixture[f"expected_{mode}"]
-        if mode == "packed":
-            inputs = dict(query=query.flatten(1), window_indices=window_indices, window=wp, window_scale=ws,
-                          compressed_indices=compressed_indices, compressed=cp, compressed_scale=cs, sink=sink)
-            reference = expected.flatten(1)
-            result_dtype = torch.bfloat16
-            entry = sparse_mla
-        else:
-            inputs = dict(query=query.float(), window=window.float().reshape(-1, 128, HEAD_DIM),
-                          window_indices=window_indices, compressed=compressed.float().reshape(-1, 128, HEAD_DIM),
-                          compressed_indices=compressed_indices, sink=sink, extents=extents)
-            reference = expected
-            result_dtype = torch.float32
-            entry = sparse_mla_bf16
-        specs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in inputs.items()]
-        specs.append(TensorSpec("output", list(reference.shape), result_dtype))
-
-        def golden(tensors):
-            tensors["output"].copy_(reference.bfloat16().to(result_dtype))
-
-        result = run(
-            entry,
-            specs,
-            golden_fn=golden,
-            compare_fn={"output": ratio_allclose(atol=0.003, rtol=0.03, max_error_ratio=0.0)},
-            config=dict(platform=args.platform, device_id=args.device),
-            compile_only=args.compile_only,
-            runtime_dir=args.runtime_dir,
-        )
-        records.append(dict(mode=mode, passed=result.passed, work_dir=str(result.work_dir)))
-        if not result.passed:
-            raise RuntimeError(result.error)
-        status = "COMPILE_ONLY" if args.compile_only else "DEVICE_VALIDATED"
-        print(status, mode, result.work_dir)
-    return records
-
-
-
 def golden_swa_attention(
     x: torch.Tensor,
     wq_a: torch.Tensor,
@@ -949,7 +839,6 @@ def golden_swa_attention(
     return AttentionGoldenResult(
         output, window_payload, updated_window_scale, None, None, None, None, None, None, None
     )
-
 
 
 def golden_compressed_attention(
@@ -1162,6 +1051,107 @@ def golden_compressed_attention(
     )
 
 
-
 if __name__ == "__main__":
-    _main_results = main()
+    import argparse
+
+    import torch
+
+    from golden import TensorSpec, ratio_allclose, run
+    from quant import (
+        dequantize_mxfp4_cache, dequantize_mxfp8_cache,
+        quantize_mxfp4_cache, quantize_mxfp8_cache,
+    )
+
+    parser = argparse.ArgumentParser(description="Validate sparse MLA on Ascend950")
+    parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4, 8])
+    parser.add_argument("--rows", type=int, default=7)
+    parser.add_argument("--mode", default="both", choices=["packed", "bf16", "both"])
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--fixture", type=Path)
+    parser.add_argument("--runtime-dir", type=str)
+    args = parser.parse_args()
+    if args.tp != TP_SIZE:
+        raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
+    if args.runtime_dir and args.mode == "both":
+        raise ValueError("--runtime-dir requires one --mode")
+    if args.rows < 1:
+        raise ValueError("--rows must be positive")
+    fixture = torch.load(args.fixture, weights_only=True) if args.fixture else None
+    if fixture is None:
+        torch.manual_seed(4102026)
+        query = (torch.randn(args.rows, LOCAL_H, HEAD_DIM) * 0.7).bfloat16()
+        window = (torch.randn(256, HEAD_DIM) * 0.6).bfloat16()
+        compressed = (torch.randn(512, HEAD_DIM) * 0.6).bfloat16()
+        window_indices = torch.randint(0, 256, (args.rows, 128), dtype=torch.int32)
+        compressed_indices = torch.randint(0, 512, (args.rows, INDEX_TOPK), dtype=torch.int32)
+        window_indices[0] = -1
+        compressed_indices[0] = -1
+        sink = torch.linspace(-2, 3, LOCAL_H)
+        extents = torch.tensor([128, INDEX_TOPK], dtype=torch.int32).repeat(args.rows, 1)
+        wp, ws = quantize_mxfp8_cache(window.reshape(-1, 128, 1, HEAD_DIM))
+        cp, cs = quantize_mxfp4_cache(compressed.reshape(-1, 128, 1, HEAD_DIM), 16, "bf16")
+        wd = dequantize_mxfp8_cache(wp, ws).bfloat16().reshape(-1, HEAD_DIM)
+        cd = dequantize_mxfp4_cache(cp, cs, 16, "bf16").bfloat16().reshape(-1, HEAD_DIM)
+    else:
+        query = fixture["q"]
+        if list(query.shape) != [args.rows, LOCAL_H, HEAD_DIM]:
+            raise ValueError("Fixture query shape does not match --rows and --tp")
+        window, compressed = fixture["w"], fixture["c"]
+        window_indices, compressed_indices = fixture["wi"], fixture["ci"]
+        sink, extents = fixture["sink"], fixture["extents"]
+        wp, ws, cp, cs = fixture["wp"], fixture["ws"], fixture["cp"], fixture["cs"]
+
+    modes = ["packed", "bf16"] if args.mode == "both" else [args.mode]
+    records = []
+    for mode in modes:
+        if fixture is None:
+            wkeys, ckeys = (wd, cd) if mode == "packed" else (window, compressed)
+            expected = torch.empty_like(query, dtype=torch.float32)
+            for row in range(args.rows):
+                ids = torch.cat([window_indices[row], compressed_indices[row]])
+                wvalues = wkeys[window_indices[row].clamp_min(0).long()]
+                cvalues = ckeys[compressed_indices[row].clamp_min(0).long()]
+                keys = torch.cat([wvalues, cvalues]).float()
+                keys[ids < 0] = 0
+                scores = query[row].float() @ keys.T * SCALE
+                scores[:, ids < 0] = -float("inf")
+                probability = torch.cat([scores, sink[:, None]], dim=1).softmax(dim=1)
+                expected[row] = probability[:, :-1] @ keys
+        else:
+            expected = fixture[f"expected_{mode}"]
+        if mode == "packed":
+            inputs = dict(query=query.flatten(1), window_indices=window_indices, window=wp, window_scale=ws,
+                          compressed_indices=compressed_indices, compressed=cp, compressed_scale=cs, sink=sink)
+            reference = expected.flatten(1)
+            result_dtype = torch.bfloat16
+            entry = sparse_mla
+        else:
+            inputs = dict(query=query.float(), window=window.float().reshape(-1, 128, HEAD_DIM),
+                          window_indices=window_indices, compressed=compressed.float().reshape(-1, 128, HEAD_DIM),
+                          compressed_indices=compressed_indices, sink=sink, extents=extents)
+            reference = expected
+            result_dtype = torch.float32
+            entry = sparse_mla_bf16
+        specs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in inputs.items()]
+        specs.append(TensorSpec("output", list(reference.shape), result_dtype))
+
+        def golden(tensors):
+            tensors["output"].copy_(reference.bfloat16().to(result_dtype))
+
+        result = run(
+            entry,
+            specs,
+            golden_fn=golden,
+            compare_fn={"output": ratio_allclose(atol=0.003, rtol=0.03, max_error_ratio=0.0)},
+            config=dict(platform=args.platform, device_id=args.device),
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir,
+        )
+        records.append(dict(mode=mode, passed=result.passed, work_dir=str(result.work_dir)))
+        if not result.passed:
+            raise RuntimeError(result.error)
+        status = "COMPILE_ONLY" if args.compile_only else "DEVICE_VALIDATED"
+        print(status, mode, result.work_dir)
+    _main_results = records

@@ -1574,14 +1574,13 @@ def cache_compare(world_size, tokens, mode):
     return compare
 
 
-def run_c1a(mode, kernel_factory, golden_fn, argv=None):
-    """Run A5 validation for a production C1A operator."""
+if __name__ == "__main__":
     import argparse
     import inspect
 
     from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description=f"TP1/2/4 A5 C1A {mode} validation")
+    parser = argparse.ArgumentParser(description="TP1/2/4 A5 C1A full validation")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
     parser.add_argument(
         "--dp", type=int, default=1, choices=[1],
@@ -1606,7 +1605,7 @@ def run_c1a(mode, kernel_factory, golden_fn, argv=None):
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--check-fp4", action="store_true", default=False,
                         help="run the CPU E2M1 midpoint check and exit")
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     if args.check_fp4:
         raise SystemExit(check_fp4_boundaries())
     if args.tp != TP_SIZE:
@@ -1621,10 +1620,9 @@ def run_c1a(mode, kernel_factory, golden_fn, argv=None):
         parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1, epochs >= 1")
     if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
         parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens {args.tokens})")
-    host = kernel_factory(args.tokens, args.pages, args.requests, args.epochs)
-    values = build_validation_values(mode, args.tokens, args.pages, args.requests, args.seed, args.case)
-    # Clone per call: the harness builds the golden scratch from these same specs, and a
-    # tensor init_value whose dtype already matches comes back as itself.
+    host = make_program(args.tokens, args.pages, args.requests, args.epochs)
+    values = build_validation_values("full", args.tokens, args.pages, args.requests, args.seed, args.case)
+    # Independent initial storage for each harness allocation.
     specs = [
         TensorSpec(n, list(values[n].shape), values[n].dtype, init_value=lambda n=n: values[n].clone())
         for n in host.param_names
@@ -1634,8 +1632,8 @@ def run_c1a(mode, kernel_factory, golden_fn, argv=None):
         for _ in range(args.epochs):
             partials = []
             for rank in range(TP_SIZE):
-                kwargs = {n: tensors[n][rank] for n in inspect.signature(golden_fn).parameters}
-                result = golden_fn(**kwargs)
+                kwargs = {n: tensors[n][rank] for n in inspect.signature(golden_decode_attn_c1a_full).parameters}
+                result = golden_decode_attn_c1a_full(**kwargs)
                 partials.append(result.output.float())
                 for name in CACHE_STATE_NAMES:
                     value = getattr(result, name, None)
@@ -1653,10 +1651,10 @@ def run_c1a(mode, kernel_factory, golden_fn, argv=None):
             tensors["output"].copy_(reduced.to(torch.bfloat16).unsqueeze(0).expand_as(tensors["output"]))
 
     comparisons = {
-        "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0) if mode == "reuse" else ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+        "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
         "candidate_mask": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
         "output": ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO),
-        **cache_compare(len(devices), args.tokens, mode),
+        **cache_compare(len(devices), args.tokens, "full"),
     }
     comparisons = {name: fn for name, fn in comparisons.items() if name in host.param_names}
     result = run(
@@ -1677,20 +1675,5 @@ def run_c1a(mode, kernel_factory, golden_fn, argv=None):
         atol=1e-3,
         compare_fn=comparisons,
     )
-    return result
-
-
-def validate(argv=None):
-    """Validate the Decode C1A Full production operator on A5."""
-    return run_c1a("full", make_program, golden_decode_attn_c1a_full, argv=argv)
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

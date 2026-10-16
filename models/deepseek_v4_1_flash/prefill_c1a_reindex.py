@@ -413,7 +413,7 @@ def golden_prefill_c1a_reindex_case(tensors):
     tensors["output"][:] = hc_output.unsqueeze(0)
 
 
-def validate(argv=None):
+if __name__ == "__main__":
     import argparse
 
     from pypto.ir import DistributedConfig
@@ -435,14 +435,17 @@ def validate(argv=None):
     parser.add_argument("--wiring", choices=("replicated", "sharded"), default="replicated")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--dp-tokens")
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     if args.tp != TP_SIZE:
         parser.error(f"--tp was parsed as TP{TP_SIZE}, got --tp {args.tp}")
     if args.device is None:
         args.device = ",".join(str(rank) for rank in range(TP_SIZE * args.dp))
     if args.wiring == "sharded":
         from prefill_c1a_full import validate_c1a_sp
-        return validate_c1a_sp("reindex", args)
+        result = validate_c1a_sp("reindex", args)
+        if not result.passed:
+            raise SystemExit(result.error or 1)
+        raise SystemExit(0)
     if args.dp != 1:
         parser.error("replicated wiring requires --dp 1")
     if args.case == "causal" and not 1 <= args.tokens <= CASE_MAX_TOKENS:
@@ -477,15 +480,5 @@ def validate(argv=None):
             "topk_indices": wrap_attention_compare(topk_indices_compare("reindex")),
         },
     )
-    return result
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

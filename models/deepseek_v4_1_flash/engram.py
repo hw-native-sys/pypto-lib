@@ -575,8 +575,7 @@ def golden_engram_tp_case(tensors):
     tensors["out"][:] = out.unsqueeze(0).expand_as(tensors["out"])
 
 
-def validate(argv=None):
-    """Validate the Engram block on A5 (or its simulator), single-rank or TP."""
+if __name__ == "__main__":
     import argparse
 
     from golden import ratio_allclose, run
@@ -595,7 +594,7 @@ def validate(argv=None):
     parser.add_argument("--sequence", type=int, default=4)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
 
     if args.tp != TP_SIZE:
         raise ValueError(f"--tp {args.tp} disagrees with module TP_SIZE {TP_SIZE}")
@@ -643,15 +642,5 @@ def validate(argv=None):
             compare_fn={"out": ratio_allclose(atol=1e-3, rtol=1e-2)},
             compile_only=args.compile_only,
         )
-    return result
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

@@ -753,17 +753,7 @@ def run_swa(operator, mode, argv=None):
     return result
 
 
-def validate(argv=None):
-    """Validate the Decode SWA production operator on A5."""
-    return run_swa(decode_attn_swa, "decode", argv=argv)
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
+if __name__ == "__main__":
+    result = run_swa(decode_attn_swa, "decode", argv=None)
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

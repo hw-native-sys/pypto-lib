@@ -586,8 +586,7 @@ def compare_sampled_ids(actual, _expected, *, actual_outputs, **_):
     )
 
 
-def validate(argv=None):
-    """Validate TP-sharded LM head + greedy sampling on A5."""
+if __name__ == "__main__":
     import argparse
 
     from golden import ratio_allclose, run
@@ -610,7 +609,7 @@ def validate(argv=None):
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
     required_devices = WORLD_SIZE
@@ -620,7 +619,7 @@ def validate(argv=None):
     assert args.tp == TP_SIZE and args.dp == DP_SIZE and args.repeat == REPEAT
     assert 0 <= args.num_tokens <= TEST_TOKENS
 
-    return run(
+    result = run(
         fn=l3_lm_head,
         specs=build_tensor_specs(args.num_tokens),
         golden_fn=golden_lm_head,
@@ -642,16 +641,7 @@ def validate(argv=None):
         rtol=1e-3,
         atol=1e-3,
     )
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
     if not result.passed:
         if result.error:
             print(result.error)
         raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()

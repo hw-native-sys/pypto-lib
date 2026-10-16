@@ -188,10 +188,6 @@ def prefill_c1a_partial(
     return output
 
 
-
-
-
-
 def make_prefill_publish_decoder():
     """Reuse the C1A source stages over the complete encoder output."""
     from prefill_attn_c1a import (
@@ -252,7 +248,6 @@ def make_prefill_publish_decoder():
         return ready
 
     return prefill_publish_decoder
-
 
 
 def golden_prefill_attn_c1a_full(
@@ -1093,7 +1088,7 @@ def cache_compare(world_size, tokens, names=None):
     }
 
 
-def validate(argv=None):
+if __name__ == "__main__":
     import argparse
 
     from pypto.ir import DistributedConfig
@@ -1112,7 +1107,7 @@ def validate(argv=None):
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--runtime-dir")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
 
     if args.tp != TP_SIZE:
         parser.error(f"--tp was parsed as TP{TP_SIZE}, got --tp {args.tp}")
@@ -1143,15 +1138,5 @@ def validate(argv=None):
             "topk_indices": topk_indices_compare("full"),
         },
     )
-    return result
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

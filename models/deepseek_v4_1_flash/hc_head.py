@@ -64,8 +64,7 @@ def golden_hc_head_case(tensors):
     tensors["output"][:] = golden_hc_head(tensors["x_hc"], tensors["pre_mix"])
 
 
-def validate(argv=None):
-    """Validate final HC stream collapse on A5."""
+if __name__ == "__main__":
     import argparse
 
     from golden import ratio_allclose, run
@@ -76,7 +75,7 @@ def validate(argv=None):
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=1)
     parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     result = run(
         fn=hc_head_test,
         specs=build_hc_head_tensor_specs(args.batch, args.sequence),
@@ -87,15 +86,5 @@ def validate(argv=None):
         compare_fn={"output": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},
         compile_only=args.compile_only,
     )
-    return result
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

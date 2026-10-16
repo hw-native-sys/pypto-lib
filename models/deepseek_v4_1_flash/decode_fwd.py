@@ -4856,8 +4856,7 @@ def build_tensor_specs():
     return specs
 
 
-def validate(argv=None):
-    """Run both decode stages on the configured A5 EP group without a forward golden."""
+if __name__ == "__main__":
     from golden import run
     from pypto.ir import DistributedConfig
 
@@ -4870,7 +4869,7 @@ def validate(argv=None):
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-scope-stats", action="store_true")
     parser.add_argument("--log-level", default=None)
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     if args.tp != TP_SIZE or args.ep != EP_SIZE:
         parser.error("--tp/--ep are import-time configuration; pass them on the Python command line")
     if args.tp != 1:
@@ -4897,12 +4896,3 @@ def validate(argv=None):
     )
     if not result.passed:
         raise SystemExit(result.error or 1)
-    return result
-
-
-def main():
-    validate()
-
-
-if __name__ == "__main__":
-    main()

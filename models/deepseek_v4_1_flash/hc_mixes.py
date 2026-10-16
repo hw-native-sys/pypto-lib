@@ -258,8 +258,7 @@ def golden_mhc_mixes_case(tensors):
     tensors["residual_mix"][:] = residual_mix
 
 
-def validate(argv=None):
-    """Validate mHC coefficient generation on A5."""
+if __name__ == "__main__":
     import argparse
 
     from golden import ratio_allclose, run
@@ -270,7 +269,7 @@ def validate(argv=None):
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=1)
     parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     result = run(
         fn=mhc_mixes_test,
         specs=build_mhc_mixes_tensor_specs(args.batch, args.sequence),
@@ -285,15 +284,5 @@ def validate(argv=None):
         },
         compile_only=args.compile_only,
     )
-    return result
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

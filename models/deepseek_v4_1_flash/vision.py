@@ -726,8 +726,7 @@ def validation_comparators(cfg):
     return {"features": accuracy, "embeddings": accuracy}
 
 
-def main(argv=None):
-    """Compile, execute and compare both device outputs with independent Torch."""
+if __name__ == "__main__":
     from golden import ScalarSpec, TensorSpec, run
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -743,7 +742,7 @@ def main(argv=None):
     parser.add_argument("--golden-data", type=Path, help="Directory with frozen input and expected output tensors")
     parser.add_argument("--runtime-dir", type=Path, help="Reuse a compiled artifact for device execution")
     parser.add_argument("--ring-heap", type=int, help="Temporary heap bytes per runtime ring (power of two)")
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     n_h, n_w = map(int, args.grid.split(","))
     if n_h < 1 or n_w < 1:
         parser.error("Image grid dimensions must be positive")
@@ -782,7 +781,3 @@ def main(argv=None):
     if args.compile_only:
         print("COMPILE ONLY: device accuracy was not checked")
     print(f"WORK_DIR={result.work_dir}")
-
-
-if __name__ == "__main__":
-    main()

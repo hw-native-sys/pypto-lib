@@ -1324,8 +1324,7 @@ def run_two_layer_decode_chain(golden_fn: Callable[..., object], *, tp_size: int
     )
 
 
-def validate(argv=None):
-    """Compile, run, and compare one complete decode Block on A5."""
+if __name__ == "__main__":
     from golden import ratio_allclose, ratio_reldiff, run
     import decode_attn_swa
     from pypto.ir import DistributedConfig
@@ -1344,11 +1343,11 @@ def validate(argv=None):
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--cpu-golden", action="store_true")
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     if args.cpu_golden:
         run_decode_layer_goldens(golden_decode_layer, REPRESENTATIVE_LAYER_IDS.values())
         run_two_layer_decode_chain(golden_decode_layer)
-        return None
+        raise SystemExit(0)
     if args.tp != TP_SIZE or args.ep != EP_SIZE:
         parser.error("--tp/--ep are import-time configuration; pass them on the Python command line")
     devices = [int(device) for device in args.device.split(",") if device]
@@ -1357,7 +1356,7 @@ def validate(argv=None):
     specs = build_tensor_specs(args.layer_id, args.seed)
     counts = _fixture_moe_counts()
     exact = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
-    return run(
+    result = run(
         fn=l3_decode_layer,
         specs=specs,
         golden_fn=golden_l3_decode_layer,
@@ -1413,13 +1412,5 @@ def validate(argv=None):
             "x_next": _compare_moe_from_actual_attention(counts),
         },
     )
-
-
-def main():
-    result = validate()
     if result is not None and not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

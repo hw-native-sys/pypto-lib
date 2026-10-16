@@ -8,7 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Metadata lowering and shared validation helpers for prefill and decode."""
 
-import argparse
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -21,13 +20,12 @@ from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import pypto.language as pl
-from pypto.ir import DistributedConfig
 import torch
 
 
 import config as C
-from config import BLOCK_SIZE, DECODE_MAX_TOKENS, FLASH as M, MAX_BATCH_PER_DP, TP_SIZE
-from golden import ScalarSpec, TensorSpec, ratio_allclose, run
+from config import BLOCK_SIZE, FLASH as M, TP_SIZE
+from golden import ScalarSpec, TensorSpec, ratio_allclose
 from rope_tables import precompute_rope_tables
 
 
@@ -103,9 +101,6 @@ TOPK_SCORE_RTOL = 0.015
 
 COMMON_INPUT_NAMES = ('x', 'wq_a', 'wq_a_scale', 'q_norm_weight', 'wq_b', 'wq_b_scale', 'wkv', 'wkv_scale', 'kv_norm_weight', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'window_cache', 'window_cache_scale', 'compressed_cache', 'compressed_cache_scale')
 
-M_TILE = 16
-
-ATTENTION_TILE = 32
 
 def _ranked(value: torch.Tensor) -> torch.Tensor:
     from config import TP_SIZE
@@ -1380,35 +1375,6 @@ def make_boundary_comparisons(compare_output):
     }
 
 
-WIRING_REPLICATED = "replicated"
-
-
-WIRING_SHARDED = "sharded"
-
-
-WIRING_CHOICES = ("both", WIRING_REPLICATED, WIRING_SHARDED)
-
-
-def add_wiring_argument(parser):
-    """Add the wiring selector every decode Attention entry shares."""
-    parser.add_argument(
-        "--wiring", choices=WIRING_CHOICES, default="both",
-        help=(
-            "which wiring to run; a replay tree is namespaced per wiring "
-            "(<dir>/replicated, <dir>/sharded) because the two ABIs differ"
-        ),
-    )
-
-
-def selected_wirings(wiring: str) -> tuple[str, ...]:
-    """Return the wirings one ``--wiring`` choice runs, in execution order."""
-    if wiring not in WIRING_CHOICES:
-        raise ValueError(f"unknown wiring {wiring!r}; expected one of {WIRING_CHOICES}")
-    if wiring == "both":
-        return (WIRING_REPLICATED, WIRING_SHARDED)
-    return (wiring,)
-
-
 def wiring_replay_dir(base: str | None, wiring: str) -> str | None:
     """Namespace a replay directory per wiring.
 
@@ -1418,132 +1384,9 @@ def wiring_replay_dir(base: str | None, wiring: str) -> str | None:
     """
     if base is None:
         return None
-    if wiring not in (WIRING_REPLICATED, WIRING_SHARDED):
+    if wiring not in ("replicated", "sharded"):
         raise ValueError(f"a replay directory needs a concrete wiring, got {wiring!r}")
     return str(Path(base) / wiring)
-
-
-def add_start_pos_argument(parser):
-    """Add one absolute decode start position per request."""
-    parser.add_argument(
-        "--start-pos", type=str, default=None,
-        help="absolute decode start positions; a comma-separated list sets batch to its length",
-    )
-
-
-def resolve_start_pos(parser, args):
-    """Resolve the single-token request batch before validating shape arguments."""
-    if args.start_pos is None:
-        return
-    try:
-        positions = [int(value.strip()) for value in args.start_pos.split(",")]
-    except ValueError:
-        parser.error("--start-pos must contain comma-separated integers")
-    if not 1 <= len(positions) <= min(MAX_BATCH_PER_DP, DECODE_MAX_TOKENS):
-        parser.error("--start-pos batch exceeds the decode request capacity")
-    if any(position < 0 or position >= M.max_position_embeddings for position in positions):
-        parser.error(f"--start-pos values must be in [0, {M.max_position_embeddings})")
-    if args.case not in ("random", "mixed"):
-        parser.error("--start-pos requires the default random/mixed case")
-    args.start_pos = positions
-    args.tokens = args.requests = len(positions)
-    if hasattr(args, "active_tokens"):
-        if args.active_tokens is not None and args.active_tokens != args.tokens:
-            parser.error("--start-pos requires every request to be active")
-        args.active_tokens = args.tokens
-    if hasattr(args, "pages"):
-        args.pages = sum((position + 128) // 128 for position in positions)
-
-
-def make_parser(description, default_layer_id, default_tokens, cases, default_seed=17):
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--stage", choices=("attention", "block"), default="attention")
-    parser.add_argument("--cpu-golden", action="store_true")
-    parser.add_argument("-p", "--platform", default="a5")
-    parser.add_argument("-d", "--device", default=None)
-    parser.add_argument("--tp", type=int, choices=(1, 4), default=TP_SIZE)
-    parser.add_argument("--layer-id", type=int, default=default_layer_id)
-    parser.add_argument("--tokens", type=int, default=default_tokens)
-    parser.add_argument("--active-tokens", type=int)
-    parser.add_argument("--requests", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=default_seed)
-    parser.add_argument("--case", choices=cases, default=cases[0])
-    parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--save-data", action="store_true")
-    add_wiring_argument(parser)
-    add_start_pos_argument(parser)
-    return parser
-
-
-def validate_args(parser, args, *, allow_inactive=False):
-    resolve_start_pos(parser, args)
-    if args.cpu_golden:
-        parser.error("Block CPU goldens are provided by decode_layer.py")
-    if args.stage == "block":
-        parser.error("Block composition is provided by decode_layer.py")
-    if not 1 <= args.tokens <= DECODE_MAX_TOKENS or not 1 <= args.epochs <= 1000:
-        parser.error("tokens or epochs out of range")
-    args.active_tokens = args.tokens if args.active_tokens is None else args.active_tokens
-    if not 1 <= args.active_tokens <= args.tokens or not 1 <= args.requests <= args.active_tokens:
-        parser.error("require 1 <= requests <= active tokens <= tokens")
-    if args.requests > MAX_BATCH_PER_DP:
-        parser.error(f"requests must not exceed {MAX_BATCH_PER_DP}")
-    if not allow_inactive and args.active_tokens != args.tokens:
-        # The reference of this mode publishes every capacity row (caches, state,
-        # output), so an inactive suffix cannot be compared yet. Refusing the shape
-        # is better than entering a comparison whose expectation is wrong. C2A
-        # reuse publishes only the active prefix and passes ``allow_inactive``.
-        parser.error(
-            "this Attention mode's reference publishes all capacity rows; "
-            "--active-tokens needs a reference that publishes the active prefix"
-        )
-    args.dp, args.bench = 1, False
-    if args.tp != TP_SIZE:
-        parser.error("--tp must match the import-time tensor parallel configuration")
-    devices = (
-        list(range(args.tp))
-        if args.device is None or args.compile_only
-        else [int(device) for device in args.device.split(",")]
-    )
-    if len(devices) != args.tp or len(set(devices)) != args.tp or min(devices) < 0:
-        parser.error("--device must name exactly TP distinct nonnegative device IDs")
-    return devices
-
-
-def validate_sp_tokens(parser, args):
-    """Validate the physical slab without rejecting empty logical owners.
-
-    Sequence parallel always allocates ``ceil(tokens / tp)`` rows per rank.
-    A rank may therefore have zero valid rows; it still participates in the
-    collective using its padding row(s).
-    """
-    if args.tokens < 1 or args.tp < 1:
-        parser.error("sequence-parallel requires positive tokens and tp")
-    # The mHC entries keep the token count in the host signature instead of a
-    # runtime scalar, so they always run every capacity row.
-    active_tokens = getattr(args, "active_tokens", args.tokens)
-    if active_tokens > args.tokens:
-        parser.error("active tokens cannot exceed physical token capacity")
-    args.local_tokens = (args.tokens + args.tp - 1) // args.tp
-    return args.local_tokens
-
-
-def run_attention(args, program, specs, golden_fn, comparisons, kind_name, devices):
-    result = run(
-        fn=program,
-        specs=specs,
-        golden_fn=golden_fn,
-        compare_fn=comparisons,
-        config={
-            "platform": args.platform,
-            "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),
-        },
-        compile_only=args.compile_only,
-        save_data=args.save_data,
-    )
-    print(f"[HALF] layer={args.layer_id} kind={kind_name} work_dir={result.work_dir}")
-    return result
 
 
 @dataclass(frozen=True)
@@ -1554,25 +1397,6 @@ class DecodeTokenShard:
     token_ids: torch.Tensor
     position_ids: torch.Tensor
     valid_mask: torch.Tensor
-
-
-def combine_validation(results: Sequence[object]) -> object:
-    """Return the failing result when any wiring missed, else the last one.
-
-    The decode Attention entries validate the replicated wiring and the
-    sequence-parallel wiring in one call.  Returning the replicated result as soon
-    as it passes would hide a sequence-parallel mismatch, and a failing replicated
-    run would hide behind a passing sequence-parallel one, so the aggregate has to
-    fail whenever *either* wiring failed.  Returns the last (sequence-parallel)
-    result only when every wiring passed.
-    """
-    ordered = list(results)
-    if not ordered:
-        raise ValueError("at least one validation result is required")
-    for result in ordered:
-        if not getattr(result, "passed", False):
-            return result
-    return ordered[-1]
 
 
 def sequence_parallel_bounds(

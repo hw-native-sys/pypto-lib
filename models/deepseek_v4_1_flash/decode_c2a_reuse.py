@@ -769,61 +769,104 @@ def comparisons_sharded(initial_state=None):
     return compare
 
 
-def validate(argv=None):
-    """Validate every wiring ``--wiring`` selects on A5."""
-    parser = _decode_utils.make_parser(
-        "DeepSeek V4.1 C2A Reuse decode Attention composition",
-        REPRESENTATIVE_LAYER_ID,
-        32,
-        ("mixed", "long", "masked", "zero"),
+if __name__ == "__main__":
+    import argparse
+    from pypto.ir import DistributedConfig
+    from golden import run
+    from config import MAX_BATCH_PER_DP
+
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 C2A Reuse decode Attention composition")
+    parser.add_argument("--stage", choices=("attention", "block"), default="attention")
+    parser.add_argument("--cpu-golden", action="store_true")
+    parser.add_argument("-p", "--platform", default="a5")
+    parser.add_argument("-d", "--device", default=None)
+    parser.add_argument("--tp", type=int, choices=(1, 4), default=TP_SIZE)
+    parser.add_argument("--layer-id", type=int, default=REPRESENTATIVE_LAYER_ID)
+    parser.add_argument("--tokens", type=int, default=32)
+    parser.add_argument("--active-tokens", type=int)
+    parser.add_argument("--requests", type=int, default=6)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--case", choices=('mixed', 'long', 'masked', 'zero'), default="mixed")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--wiring", choices=("both", "replicated", "sharded"), default="both",
+                        help="which wiring to run")
+    parser.add_argument("--start-pos", type=str, default=None,
+                        help="absolute decode start positions; a comma-separated list sets batch to its length")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    args = parser.parse_args()
+    if args.start_pos is not None:
+        try:
+            positions = [int(value.strip()) for value in args.start_pos.split(",")]
+        except ValueError:
+            parser.error("--start-pos must contain comma-separated integers")
+        if not 1 <= len(positions) <= min(MAX_BATCH_PER_DP, DECODE_MAX_TOKENS):
+            parser.error("--start-pos batch exceeds the decode request capacity")
+        if any(position < 0 or position >= M.max_position_embeddings for position in positions):
+            parser.error(f"--start-pos values must be in [0, {M.max_position_embeddings})")
+        if args.case not in ("random", "mixed"):
+            parser.error("--start-pos requires the default random/mixed case")
+        args.start_pos = positions
+        args.tokens = args.requests = len(positions)
+        if args.active_tokens is not None and args.active_tokens != args.tokens:
+            parser.error("--start-pos requires every request to be active")
+        args.active_tokens = args.tokens
+    if args.cpu_golden:
+        parser.error("Block CPU goldens are provided by decode_layer.py")
+    if args.stage == "block":
+        parser.error("Block composition is provided by decode_layer.py")
+    if not 1 <= args.tokens <= DECODE_MAX_TOKENS or not 1 <= args.epochs <= 1000:
+        parser.error("tokens or epochs out of range")
+    args.active_tokens = args.tokens if args.active_tokens is None else args.active_tokens
+    if not 1 <= args.active_tokens <= args.tokens or not 1 <= args.requests <= args.active_tokens:
+        parser.error("require 1 <= requests <= active tokens <= tokens")
+    if args.requests > MAX_BATCH_PER_DP:
+        parser.error(f"requests must not exceed {MAX_BATCH_PER_DP}")
+    args.dp, args.bench = 1, False
+    if args.tp != TP_SIZE:
+        parser.error("--tp must match the import-time tensor parallel configuration")
+    devices = (
+        list(range(args.tp))
+        if args.device is None or args.compile_only
+        else [int(device) for device in args.device.split(",")]
     )
-    parser.set_defaults(requests=6)
-    args = parser.parse_args(argv)
-    devices = _decode_utils.validate_args(parser, args, allow_inactive=True)
+    if len(devices) != args.tp or len(set(devices)) != args.tp or min(devices) < 0:
+        parser.error("--device must name exactly TP distinct nonnegative device IDs")
     reason = skip_reason(args.layer_id)
     if reason:
         parser.error(reason)
-    wirings = _decode_utils.selected_wirings(args.wiring)
     results = []
-    if _decode_utils.WIRING_REPLICATED in wirings:
+    wirings = ("replicated", "sharded") if args.wiring == "both" else (args.wiring,)
+    for wiring in wirings:
+        sharded = wiring == "sharded"
+        if sharded:
+            if args.tokens < 1 or args.tp < 1:
+                parser.error("sequence-parallel requires positive tokens and tp")
+            if args.active_tokens > args.tokens:
+                parser.error("active tokens cannot exceed physical token capacity")
+            args.local_tokens = (args.tokens + args.tp - 1) // args.tp
         initial_state = {}
-        specs = build_specs(args, initial_state)
-        results.append(
-            _decode_utils.run_attention(
-                args,
-                make_program(args.tp, args.epochs, specs),
-                specs,
-                make_golden(args.epochs),
-                comparisons(initial_state),
-                KIND,
-                devices,
-            )
+        specs = build_specs_sharded(args, initial_state) if sharded else build_specs(args, initial_state)
+        compare = comparisons_sharded(initial_state) if sharded else comparisons(initial_state)
+        program = make_program(args.tp, args.epochs, specs, sharded=sharded)
+        golden_fn = make_golden_sharded(args.epochs) if sharded else make_golden(args.epochs)
+        result = run(
+            fn=program,
+            specs=specs,
+            golden_fn=golden_fn,
+            compare_fn=compare,
+            config={
+                "platform": args.platform,
+                "enable_chip_swimlane": args.enable_chip_swimlane,
+                "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),
+            },
+            compile_only=args.compile_only,
+            save_data=args.save_data,
         )
-    if _decode_utils.WIRING_SHARDED in wirings:
-        # The sequence-parallel wiring: layer-head AllGather, ReduceScatter output.
-        _decode_utils.validate_sp_tokens(parser, args)
-        sharded_state = {}
-        sharded = build_specs_sharded(args, sharded_state)
-        results.append(
-            _decode_utils.run_attention(
-                args,
-                make_program(args.tp, args.epochs, sharded, sharded=True),
-                sharded,
-                make_golden_sharded(args.epochs),
-                comparisons_sharded(sharded_state),
-                f"{KIND} sequence-parallel",
-                devices,
-            )
-        )
-    return _decode_utils.combine_validation(results)
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
-    if not result.passed:
-        raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()
+        kind_name = f"{KIND} sequence-parallel" if sharded else KIND
+        print(f"[HALF] layer={args.layer_id} kind={kind_name} work_dir={result.work_dir}")
+        results.append(result)
+    for result in results:
+        if not result.passed:
+            raise SystemExit(result.error or 1)

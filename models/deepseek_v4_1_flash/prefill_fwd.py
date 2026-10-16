@@ -119,7 +119,6 @@ B32 = pl.dynamic("PREFILL_FP32_VALUES")
 ROPE_DIM = M.qk_rope_head_dim
 
 
-
 def make_prefill_attention():
     """Compose existing attention leaves for the resident CED graph.
 
@@ -262,7 +261,6 @@ def make_prefill_attention():
         return output
 
     return prefill_attention
-
 
 
 attention = make_prefill_attention()
@@ -904,7 +902,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens):
     }
 
 
-def main(argv=None):
+if __name__ == "__main__":
     from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -918,7 +916,7 @@ def main(argv=None):
     parser.add_argument("--prompt", action="append", help="one prompt per rank; provide exactly --ep prompts")
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--report", type=Path)
-    options = parser.parse_args(argv)
+    options = parser.parse_args()
     if (options.tp, options.ep, options.dp) != (C.TP_SIZE, RANKS, RANKS):
         raise ValueError("parallel sizes must match compilation: TP1 with EP4/DP4 or EP8/DP8")
     if options.capacity != CAPACITY or not 16 <= CAPACITY <= C.PREFILL_MAX_TOKENS or CAPACITY % 16:
@@ -946,8 +944,3 @@ def main(argv=None):
         options.report.parent.mkdir(parents=True, exist_ok=True)
         options.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     print("CED_GENERATION_COMPLETE", json.dumps(report, ensure_ascii=False), flush=True)
-    return report
-
-
-if __name__ == "__main__":
-    main()

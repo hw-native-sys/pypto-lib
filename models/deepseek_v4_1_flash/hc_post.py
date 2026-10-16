@@ -171,39 +171,6 @@ def golden_mhc_post_case(tensors):
     )
 
 
-def validate(argv=None):
-    """Validate mHC residual expansion on A5."""
-    import argparse
-
-    from golden import ratio_allclose, run
-
-    parser = argparse.ArgumentParser(description="DeepSeek V4.1 mHC post validation")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--batch", type=int, default=2)
-    parser.add_argument("--sequence", type=int, default=1)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args(argv)
-    result = run(
-        fn=mhc_post_test,
-        specs=build_mhc_post_tensor_specs(args.batch, args.sequence),
-        golden_fn=golden_mhc_post_case,
-        config={"platform": args.platform, "device_id": args.device},
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={"output": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},
-        compile_only=args.compile_only,
-    )
-    return result
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
-    if not result.passed:
-        raise SystemExit(result.error or 1)
-
-
 @pl.jit.inline
 def prefill_sp_post(
     sublayer: pl.Tensor[[SP_T_DYN, D], pl.BF16],
@@ -271,4 +238,26 @@ def golden_attention_post(tensors, post, residual):
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    from golden import ratio_allclose, run
+
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 mHC post validation")
+    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--batch", type=int, default=2)
+    parser.add_argument("--sequence", type=int, default=1)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    result = run(
+        fn=mhc_post_test,
+        specs=build_mhc_post_tensor_specs(args.batch, args.sequence),
+        golden_fn=golden_mhc_post_case,
+        config={"platform": args.platform, "device_id": args.device},
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={"output": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},
+        compile_only=args.compile_only,
+    )
+    if not result.passed:
+        raise SystemExit(result.error or 1)

@@ -135,8 +135,7 @@ def build_tensor_specs(token_count, vocab_size):
     ]
 
 
-def validate(argv=None):
-    """Validate token embedding + HC packing on A5."""
+if __name__ == "__main__":
     import argparse
     from golden import run
 
@@ -146,7 +145,7 @@ def validate(argv=None):
     parser.add_argument("--tokens", type=int, default=DEFAULT_TOKENS)
     parser.add_argument("--vocab", type=int, default=TEST_VOCAB_SIZE)
     parser.add_argument("--compile-only", action="store_true", default=False)
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
 
     result = run(
         fn=pack_x_hc_test,
@@ -160,15 +159,5 @@ def validate(argv=None):
         rtol=0.0,
         atol=0.0,
     )
-    return result
-
-
-def main():
-    """Run local validation and return a failing exit status on errors."""
-    result = validate()
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

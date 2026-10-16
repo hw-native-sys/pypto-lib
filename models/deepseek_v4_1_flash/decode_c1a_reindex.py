@@ -6,13 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Continuous-batch decode C1A reindex attention wired through mHC.
-
-The attention operator stays in ``decode_attn_c1a.py``; the shared mHC wiring and
-validation harness live in ``decode_c1a_full.py``. Like the full entry, this one
-consumes the staggered ``pre_mix`` the previous sub-layer produced and hands its own
-computed ``pre_mix`` to the next sub-layer.
-"""
+"""Continuous-batch decode C1A reindex attention wired through mHC."""
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -21,6 +15,7 @@ from config import (
     COMPRESSED_CACHE_GROUP,
     DECODE_INPUT_MAX_TOKENS,
     DECODE_MAX_TOKENS,
+    MAX_BATCH_PER_DP,
     INDEX_CACHE_GROUP,
     WINDOW_CACHE_GROUP,
     FLASH as M,
@@ -38,7 +33,11 @@ from config import (
 
 from config import LOCAL_T_DYN
 from decode_cp_allgather import decode_tp_input_all_gather
-from decode_c1a_full import golden_c1a_hc_case, validate_c1a_wirings
+from decode_c1a_full import golden_c1a_hc_case, build_hc_validation_values
+from decode_attn_c1a import OUTPUT_ATOL, OUTPUT_RTOL, OUTPUT_MAX_ERROR_RATIO, check_fp4_boundaries
+from decode_attn_c1a import cache_compare
+from golden import TensorSpec, ratio_allclose, run
+import utils as _decode_utils
 from hc_pre import mhc_pre_norm
 from decode_cp_allgather import slab_owner
 from decode_attn_c1a import (
@@ -644,17 +643,122 @@ def golden_decode_c1a_reindex_case(tensors, epochs=1, sharded=False):
     golden_c1a_hc_case(tensors, golden_decode_attn_c1a_reindex, epochs, sharded)
 
 
-def validate(argv=None):
-    """Validate every wiring ``--wiring`` selects on A5."""
-    return validate_c1a_wirings("reindex", make_program, golden_decode_c1a_reindex_case, argv)
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
-    if not result.passed:
-        raise SystemExit(result.error or 1)
-
-
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    from pypto.ir import DistributedConfig
+
+    parser = argparse.ArgumentParser(description="TP1/2/4 A5 mHC C1A reindex validation")
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
+    parser.add_argument(
+        "--dp", type=int, default=1, choices=[1],
+        help="one data-parallel group; the shared A5 entry command passes 1",
+    )
+    parser.add_argument("-p", "--platform", type=str, default="a5", choices=["a5", "a5sim"])
+    parser.add_argument(
+        "-d", "--device", "--devices", type=str, default=None,
+        help="comma-separated physical device IDs, one per rank; default: 0 through TP-1",
+    )
+    parser.add_argument("--tokens", type=int, default=1)
+    parser.add_argument("--pages", type=int, default=8)
+    parser.add_argument("--requests", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--check-fp4", action="store_true", help="run the CPU E2M1 midpoint check and exit")
+    parser.add_argument("--wiring", choices=("both", "replicated", "sharded"), default="both",
+                        help="which wiring to run; replay directories use a separate subdirectory per wiring")
+    parser.add_argument("--start-pos", type=str, default=None,
+                        help="absolute decode start positions; a comma-separated list sets batch to its length")
+    args = parser.parse_args()
+    if args.check_fp4:
+        raise SystemExit(check_fp4_boundaries())
+    if args.start_pos is not None:
+        try:
+            positions = [int(value.strip()) for value in args.start_pos.split(",")]
+        except ValueError:
+            parser.error("--start-pos must contain comma-separated integers")
+        if not 1 <= len(positions) <= min(MAX_BATCH_PER_DP, DECODE_MAX_TOKENS):
+            parser.error("--start-pos batch exceeds the decode request capacity")
+        if any(position < 0 or position >= M.max_position_embeddings for position in positions):
+            parser.error(f"--start-pos values must be in [0, {M.max_position_embeddings})")
+        if args.case not in ("random", "mixed"):
+            parser.error("--start-pos requires the default random/mixed case")
+        args.start_pos = positions
+        args.tokens = args.requests = len(positions)
+        args.pages = sum((position + 128) // 128 for position in positions)
+    if args.wiring in ("both", "sharded"):
+        if args.tokens < 1 or args.tp < 1:
+            parser.error("sequence-parallel requires positive tokens and tp")
+        args.local_tokens = (args.tokens + args.tp - 1) // args.tp
+    if args.tp != TP_SIZE:
+        parser.error(f"--tp {args.tp} does not match the TP_SIZE {TP_SIZE} the operator was built for")
+    try:
+        devices = list(range(TP_SIZE)) if args.device is None else [int(d) for d in args.device.split(",")]
+    except ValueError:
+        parser.error("device IDs must be comma-separated integers")
+    if len(devices) != TP_SIZE or len(set(devices)) != len(devices) or min(devices) < 0:
+        parser.error(f"device IDs must be {TP_SIZE} distinct nonnegative integers, one per rank")
+    if not 1 <= args.tokens <= min(DECODE_MAX_TOKENS, args.pages * 128) or args.pages < 1 or args.epochs < 1:
+        parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1, epochs >= 1")
+
+    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
+        parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens {args.tokens})")
+
+    results = []
+    wirings = ("replicated", "sharded") if args.wiring == "both" else (args.wiring,)
+    for wiring in wirings:
+        sharded = wiring == "sharded"
+        host = make_program(args.tokens, args.pages, requests=args.requests, epochs=args.epochs, sharded=sharded)
+        values = build_hc_validation_values(
+            "reindex", args.tokens, args.pages, args.requests, args.seed, args.case,
+            sharded, args.start_pos,
+        )
+        # Independent initial storage for each harness allocation.
+        specs = [
+            TensorSpec(n, list(values[n].shape), values[n].dtype, init_value=lambda n=n: values[n].clone())
+            for n in host.param_names
+        ]
+
+        def golden_fn(tensors, sharded=sharded):
+            golden_decode_c1a_reindex_case(tensors, args.epochs, sharded)
+
+        output_budget = ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO)
+        comparisons = {
+            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+            "candidate_mask": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "output": output_budget,
+            # BF16 rounding tolerance for gathered rows.
+            "gathered": ratio_allclose(atol=2 ** -6, rtol=2 ** -6),
+            **cache_compare(len(devices), args.tokens, "reindex"),
+        }
+        comparisons = {name: fn for name, fn in comparisons.items() if name in host.param_names}
+        result = run(
+            fn=host,
+            specs=specs,
+            golden_fn=golden_fn,
+            compile_only=args.compile_only,
+            save_data=args.save_data,
+            golden_data=_decode_utils.wiring_replay_dir(args.golden_data, wiring),
+            runtime_dir=_decode_utils.wiring_replay_dir(args.runtime_dir, wiring),
+            config=dict(
+                platform=args.platform,
+                dump_passes=args.dump_passes,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+                distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn=comparisons,
+        )
+        results.append(result)
+    for result in results:
+        if not result.passed:
+            raise SystemExit(result.error or 1)

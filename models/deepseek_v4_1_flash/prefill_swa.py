@@ -733,17 +733,7 @@ def run_prefill_swa(argv=None):
     return result
 
 
-def validate(argv=None):
-    """Validate packed prefill SWA wired through mHC on A5."""
-    return run_prefill_swa(argv=argv)
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
+if __name__ == "__main__":
+    result = run_prefill_swa(argv=None)
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

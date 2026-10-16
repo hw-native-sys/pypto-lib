@@ -1222,17 +1222,7 @@ def run_prefill_layer(make_program, mode, argv=None):
     return result
 
 
-def validate(argv=None):
-    """Validate the complete packed prefill layer against its golden reference on A5."""
-    return run_prefill_layer(make_layer_program, "reuse", argv=argv)
-
-
-def main():
-    """Validate one complete prefill layer, C2A Reuse attention followed by the EP MoE."""
-    result = validate()
+if __name__ == "__main__":
+    result = run_prefill_layer(make_layer_program, "reuse", argv=None)
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-if __name__ == "__main__":
-    main()

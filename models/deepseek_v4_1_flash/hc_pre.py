@@ -105,39 +105,6 @@ def golden_mhc_pre_case(tensors):
     tensors["output"][:] = golden_mhc_pre(tensors["x_hc"], tensors["pre_mix"])
 
 
-def validate(argv=None):
-    """Validate mHC stream collapse on A5."""
-    import argparse
-
-    from golden import ratio_allclose, run
-
-    parser = argparse.ArgumentParser(description="DeepSeek V4.1 mHC pre validation")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--batch", type=int, default=2)
-    parser.add_argument("--sequence", type=int, default=1)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args(argv)
-    result = run(
-        fn=mhc_pre_test,
-        specs=build_mhc_pre_tensor_specs(args.batch, args.sequence),
-        golden_fn=golden_mhc_pre_case,
-        config={"platform": args.platform, "device_id": args.device},
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={"output": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},
-        compile_only=args.compile_only,
-    )
-    return result
-
-
-def main():
-    """Run local validation and return a failing exit status on precision errors."""
-    result = validate()
-    if not result.passed:
-        raise SystemExit(result.error or 1)
-
-
 @pl.jit.inline
 def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
     """Clear physical rows that belong to an empty or partial TP slab.
@@ -181,7 +148,6 @@ def mhc_pre_norm(
     zero_bf16_padding(normalized_attention, pl.min(owned_rows, pl.tensor.dim(normalized_attention, 0)))
 
 
-
 @pl.jit.inline(auto_scope=False)
 def attention_pre(
     x_hc: pl.Tensor,
@@ -204,7 +170,6 @@ def attention_pre(
     return post_mix, residual_mix
 
 
-
 def golden_attention_pre(tensors):
     """Build normalized Attention inputs and return the mHC post state."""
     world = tensors["x_hc"].shape[0]
@@ -225,7 +190,6 @@ def golden_attention_pre(tensors):
         post.append(post_mix)
         residual.append(residual_mix)
     return torch.stack(normalized), post, residual
-
 
 
 def golden_attention_pre_sharded(tensors):
@@ -274,6 +238,27 @@ def golden_attention_pre_sharded(tensors):
     return torch.stack(per_rank_full), post, residual
 
 
-
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    from golden import ratio_allclose, run
+
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 mHC pre validation")
+    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--batch", type=int, default=2)
+    parser.add_argument("--sequence", type=int, default=1)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    result = run(
+        fn=mhc_pre_test,
+        specs=build_mhc_pre_tensor_specs(args.batch, args.sequence),
+        golden_fn=golden_mhc_pre_case,
+        config={"platform": args.platform, "device_id": args.device},
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={"output": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},
+        compile_only=args.compile_only,
+    )
+    if not result.passed:
+        raise SystemExit(result.error or 1)
