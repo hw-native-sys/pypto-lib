@@ -1,11 +1,10 @@
 # GLM-5.3-Flash
 
-`models/glm5_3_flash/` is the implementation staging area for
+`models/glm5_3_flash/` contains the implementation of
 [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (`glm5_next`,
-`Glm5NextForConditionalGeneration`) on **Ascend a2a3**. This first milestone
-establishes the configuration, the layer schedule, the metadata lowering, the
-shared Torch goldens, the W8A8 references, and one `@pl.jit.inline` ABI per
-operator. Kernel bodies are the parallel work that follows.
+`Glm5NextForConditionalGeneration`) on **Ascend a2a3**. It includes component
+kernels, Torch goldens, W8A8 checkpoint staging, and composed MoE FFN entries.
+Complete prefill/decode forward composition is a separate integration step.
 
 ## Why W8A8, and why a2a3 forces it
 
@@ -104,9 +103,10 @@ Each rank adds its local shared output to the routed output returned by EP
 combine. Token batches may differ across ranks.
 
 The standalone MoE entries select `--ep` independently of attention TP. Their
-fixtures use distinct rank-local activations and replicated checkpoint weights
-for the router, RMSNorm and shared expert. The routing fixture fixes eight
-global experts spread across EP ranks to bound receive capacity. The common
+fixtures use distinct rank-local activations and replicated weights for the
+router, RMSNorm and shared expert. The generated routing fixture fixes eight
+global experts spread across EP ranks to bound receive capacity; checkpoint mode
+uses the saved router and correction bias. The common
 configuration defaults attention TP to the selected EP size when `--tp` is
 omitted; explicitly configured attention topologies retain their own checks.
 
@@ -122,51 +122,93 @@ does it: each row's amax, floored by `INT8_AMAX_EPS = 1e-4`, is rescaled to
 The router kernel produces that INT8 view once and both the shared expert and the
 EP dispatch payload reuse it.
 
-The boundary below is read from the deployment checkpoint
-(`Eco-Tech/GLM-5.3-Flash-w8a8` on modelers.cn), not inferred: its
-`quant_model_description.json` labels every tensor except `rot.weight`, and the
-shard headers confirm the dtypes. The split is sharper than the released FP8 checkpoint's.
+`quant_model_description.json` and the tensor dtypes determine how a checkpoint
+is loaded. The AscendV1 W8A8 checkpoints used for integration have the following
+formats; a floating-point MLA projection is also accepted when its metadata and
+stored dtype agree.
 
 | Tensor | Format |
 | --- | --- |
-| `mlp.experts.N.{gate,up,down}_proj`, `mlp.shared_experts.*`, and the three dense layers' `mlp.{gate,up,down}_proj` — **the FFN and nothing else** | **INT8**, with an FP32 `[out, 1]` per-output-channel `weight_scale` |
-| **All of attention**: every MLA projection (`q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`, `kv_b_proj`, `o_proj`), every KDA projection and conv, every indexer weight, all mHC tensors, `mlp.gate.weight`, `e_score_correction_bias`, every norm, `embed_tokens`, `lm_head`, and the whole vision tower | BF16 |
+| Routed/shared/dense FFN `gate_proj`, `up_proj`, `down_proj` | INT8 with per-output-channel scales; staged as INT8 plus flattened FP32 scales |
+| MLA `q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`, `o_proj` | W8A8 INT8 in these checkpoints; explicitly dequantized to BF16 for the current attention kernels |
+| MLA `kv_b_proj`, KDA/indexer projections, norms, router, embedding and LM head | BF16 |
+| mHC function, scale and base; router correction bias | Source BF16; the function stays BF16, while scale, base and correction bias are staged as FP32 to match the kernels |
 | MLA 512-latent cache | BF16 |
 | Indexer state cache | FP32 today, 256 wide per token; the sibling port quantizes its indexer cache to INT8 with a per-row FP32 scale, which would save about 2.3 KB per token here |
 | Hyper-connection stream | BF16 — see above, this is where GLM departs from DeepSeek-V4's FP32 stream |
 | Logits | FP32 |
 
-Of 113,352 labelled tensors, 111,870 are `W8A8_DYNAMIC` and 1,482 are `FLOAT`. Each
-quantized weight also carries a `weight_offset`, but it is **all zero** — measured
-across tensors of 12,288, 2,048 and 4,096 channels — so the weight quantization is
-symmetric and the loader reads and discards the offset. There is no static
-activation path and no SmoothQuant vector.
+The loader requires `W8A8_DYNAMIC` with `group_size: 0`. For every requested
+quantized weight it checks INT8 storage, positive finite scales, and zero offsets.
+It rejects incompatible formats rather than casting FP8 or BF16 values to INT8.
+MLA's BF16 adaptation is `BF16(FP32(weight) * scale)`; it does not reproduce a
+native W8A8 attention path with runtime activation quantization. `mla_mode="native"`
+keeps the INT8/scale pairs for consumers that implement that path, and does not
+produce a BF16 absorbed output weight.
 
-The consequence for the work list is that W8A8 is confined to the MoE and dense-MLP
-streams. Attention carries no quantization at all, which removes the scale plumbing
-from `mla_prolog`, `mla_epilog` and the indexer projections.
+### Rotation assets
 
-### The checkpoint also ships two matrices that are not weights
+The quantization description can include `is_rot_used` and an optional QuaRot
+rotation map. The loader preserves that metadata and exposes the indexed
+`rot.weight` through `Checkpoint.rotation()` on request. Optional files need not
+be loaded to stage the 45-layer text backbone. Converted weights are used as
+stored; no additional global rotation is applied to the backbone activations.
+MTP and vision weights are outside this loader's full-model assembly.
 
-`rot.weight`, BF16 `[4096, 4096]`, is the only tensor in the weight index with no
-entry in the quantization description; it is announced solely by `is_rot_used:
-true`. It belongs to the **MTP layer**, not the backbone — vLLM Ascend's
-`AscendDeepSeekMTP` applies it to the previous hidden state before `hnorm`. GLM
-routes to `Glm5NextMTP` instead, which has no `rot` and drops the tensor silently,
-so whether it is required is an open question the MTP owner inherits. It is not a
-rotation, despite the name: it is symmetric with `R[i,j] = g(i xor j)`, a
-per-channel diagonal scaling in the Hadamard basis.
+The indexer's Hadamard-128 is a separate transform. The loader supplies the same
+matrix as the indexer golden; it is not the checkpoint's hidden-size rotation.
 
-`optional/quarot.safetensors` holds `global_rotation`, F32 `[4096, 4096]`, an exact
-scaled Hadamard (every entry +/-1/64, rows orthonormal) — a textbook QuaRot matrix.
-It is unreachable for this checkpoint: vLLM Ascend looks it up under
-`quant_description["optional"]["quarot"]`, and this description's `optional` is
-empty. Where that matrix is used elsewhere in vLLM Ascend it is folded into weights
-offline, never applied to activations. **No backbone kernel applies a rotation.**
+## Loading weights
 
-The one rotation that does matter is 128 wide and lives in the indexer: the upstream
-kernel rotates each query head by a Hadamard-128 before quantizing it. See the
-indexer files.
+`models/glm5_3_flash/weights.py` provides an indexed CPU reader. It opens only
+requested tensors and TP slices instead of materializing all checkpoint shards.
+The checkpoint configuration must match the compiled GLM dimensions and layer
+schedule. Quantization metadata, shapes, dtypes and topology are checked before
+the returned weights reach a kernel.
+
+```python
+from models.glm5_3_flash.weights import Checkpoint
+
+checkpoint = Checkpoint("/path/to/vllm-ascend-a3-w8a8")
+layer = checkpoint.layer(3, tp_rank=0, tp=16, ep_rank=0, ep=16)
+vocabulary = checkpoint.vocabulary(tp_rank=0, tp=16)
+
+# Load and consume one layer at a time when full residency is unnecessary.
+for layer_id, weights in checkpoint.iter_layers(tp_rank=0, tp=16, ep_rank=0, ep=16):
+    ...
+
+# Or retain all 45 layers and the layer-external weights for this rank.
+model = checkpoint.model(tp_rank=0, tp=16, ep_rank=0, ep=16)
+```
+
+`layer` groups `input_norm`, `attn_hc`, `ffn_hc`, `attention`, `ffn`, and an
+`indexer` for sparse-attention layers. `model["layers"]` is keyed by layer ID;
+its other entries are `embedding`, `lm_head`, `final_norm`, `vocab_start` and
+`vocab_stop`. Embedding and LM-head rows are TP-sharded; the final norm is
+replicated. Dense FFNs are TP-sharded along their intermediate dimension.
+Routed experts are EP-sharded by expert ID, and shared experts remain complete
+on every EP rank. Attention follows the existing head partition; the indexer
+remains replicated. Prefill and decode can reuse the same staged weights.
+
+The existing FFN validation entries keep generated weights as their default.
+Add `--checkpoint` to load real weights into the same kernels, goldens and
+precision checks:
+
+```bash
+# Run these inside a two-device allocation; TASK_DEVICE comes from the allocator.
+python models/glm5_3_flash/decode_layer.py -p a2a3 -d "$TASK_DEVICE" --ep 2 \
+  --checkpoint /path/to/vllm-ascend-a3-w8a8 --layer 3 --num-tokens 3
+python models/glm5_3_flash/prefill_layer.py -p a2a3 -d "$TASK_DEVICE" --ep 2 \
+  --checkpoint /path/to/vllm-ascend-a3-w8a8 --layer 3 --tokens 64 --num-tokens 3
+```
+
+These entries execute the MoE FFN half of a layer, so `--layer` must be 3–44.
+By default, checkpoint mode mixes deterministic synthetic activations with the
+selected layer's real FFN mHC weights. To supply activations from another stage,
+use `--hidden hidden.pt`, containing a CPU BF16 tensor `[EP, active_tokens, 4096]`
+after mHC pre-mixing and before RMSNorm. The active token count is inferred from
+that tensor unless supplied explicitly; it must fit the entry's capacity.
+This component fixture is not a complete model forward or a text-generation test.
 
 ## Prior art, and what it is actually worth
 
@@ -470,6 +512,8 @@ RoPE machinery, and add the KDA family and the kpool indexer.
 | `config.py` | Complete. Layer schedule, derived per-rank shapes, TP/EP validation, W8A8 metadata |
 | `golden.py` | Complete for the shared transforms: RMSNorm, gated RMSNorm, L2 norm, clamped SwiGLU, the expert body, the sigmoid `noaux_tc` router, and the four mHC references |
 | `quantization.py` | Complete. Per-channel and per-token INT8 with the repo's exact rounding, the dynamic W8A8 linear, and the fused dequant-SwiGLU-requant epilogue |
+| `weights.py` | Indexed W8A8 CPU loading for all 45 backbone layers, TP vocabulary shards and final norm. Includes dense TP, complete EP experts, replicated shared experts, KDA, MLA BF16 adaptation, indexer and mHC |
+| `decode_layer.py`, `prefill_layer.py`, `utils.py` | Composed MoE FFN validation with generated weights by default and optional checkpoint weights/hidden inputs; full attention-plus-FFN forward composition remains separate |
 | `metadata.py` | Complete. Packed-batch lowering, the three distinct slot mappings (latent, per-token indexer state, pooled state), TP token ownership, and the indexer's pool and tail derivation |
 | `_golden_smoke.py` | Complete. Deterministic CPU fixtures behind every golden that exists |
 | `rmsnorm.py` | Plain BF16 RMSNorm, INT8-emitting per-token RMSNorm, and fused residual-add RMSNorm. Each has a colocated Torch golden and JIT validation entry; the CLI runs all three cases. Passes `a2a3sim` and a2a3 |
@@ -490,8 +534,10 @@ RoPE machinery, and add the KDA family and the kpool indexer.
   cache and a separate FP32 pooled-state page class with a page of four tokens;
   storing the raw row instead is simpler but larger. Stream C decides, stream E's
   cache manager implements.
-- **Whether the MLA decode path absorbs.** `kv_b_proj` is BF16 in the checkpoint,
-  so folding it into an INT8 `o_proj` changes the numerics of the epilogue.
+- **MLA precision against native W8A8 inference.** The current loader dequantizes
+  MLA weights to BF16 and absorbs the value projection into the output weight.
+  Component golden agreement does not establish equivalence to a deployment
+  runtime that also quantizes MLA activations.
 - **The cache budget.** At about 18 KB per token per rank the hybrid cache holds
   roughly 1.5 M tokens per node once weights are placed, so the recipe's
   `--max-model-len 133120` and `--max-num-seqs 32` cannot both be satisfied at

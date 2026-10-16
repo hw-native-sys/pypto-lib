@@ -14,13 +14,13 @@ routed expert. All three of these layers are KDA attention layers.
 
 W8A8 with the same per-channel weight scales and per-token activation scales as the
 experts; the intermediate is TP-sharded, so each rank owns 12288 / 16 = 768
-channels and the ``down_proj`` result needs the layer's TP all-reduce.
+channels at TP16 and the ``down_proj`` result needs the layer's TP all-reduce.
 
-Like the shared expert (``expert_shared.py``), the checkpoint stores one fused
-``w_gate_up [2 * LOCAL_DENSE_INTER, D]``: the gate rows occupy ``[0, LOCAL_DENSE_INTER)``
-and the up rows ``[LOCAL_DENSE_INTER, 2 * LOCAL)`` with a single per-channel scale
-vector. The output is FP32 — the dense MLP joins the same FP32 residual path as
-the MoE layers.
+Like the shared expert (``expert_shared.py``), the kernel consumes fused
+``w_gate_up [2 * LOCAL_DENSE_INTER, D]``. The loader packs gate rows into
+``[0, LOCAL_DENSE_INTER)`` and up rows into ``[LOCAL_DENSE_INTER, 2 * LOCAL_DENSE_INTER)``,
+with a single per-channel scale vector. The output is FP32 — the dense MLP joins
+the same FP32 residual path as the MoE layers.
 """
 
 import sys
@@ -107,11 +107,10 @@ def dense_mlp(
         h_i8 = pl.create_tensor([DN_M_TILE, LOCAL_DENSE_INTER], dtype=pl.INT8)
         h_scale_dq = pl.create_tensor([DN_M_TILE, DN_ROW_PAD], dtype=pl.FP32, manual_dep=True)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="dn_h_i8_init"):
-            h_i8[:, :] = pl.cast(
-                pl.full([DN_M_TILE, LOCAL_DENSE_INTER], dtype=pl.FP16, value=0.0),
-                target_type=pl.INT8,
-                mode="trunc",
-            )
+            for init_k0 in pl.pipeline(0, LOCAL_DENSE_INTER, QUANT_TILE, stage=1):
+                zero_fp16 = pl.full([DN_M_TILE, QUANT_TILE], dtype=pl.FP16, value=0.0)
+                zero_i8 = pl.cast(zero_fp16, target_type=pl.INT8, mode="trunc")
+                h_i8[:, init_k0 : init_k0 + QUANT_TILE] = zero_i8
         n_act_blocks = (valid_rows + DN_ROWS_PER_BLOCK - 1) // DN_ROWS_PER_BLOCK
         for row_block in pl.spmd(n_act_blocks, name_hint="dn_gate_up_act_q"):
             row0 = row_block * DN_ROWS_PER_BLOCK
@@ -205,7 +204,7 @@ def dense_mlp_test(
     w_gate_up_scale: pl.Tensor[[2 * LOCAL_DENSE_INTER], pl.FP32],
     w_down: pl.Tensor[[D, LOCAL_DENSE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[D], pl.FP32],
-    output: pl.Tensor[[T_DYN, D], pl.FP32],
+    output: pl.Out[pl.Tensor[[T_DYN, D], pl.FP32]],
 ):
     x_int8.bind_dynamic(0, T_DYN)
     x_scale.bind_dynamic(0, T_DYN)
