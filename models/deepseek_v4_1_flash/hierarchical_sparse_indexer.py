@@ -39,7 +39,21 @@ HEAD_DIM = M.head_dim
 
 INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
+INDEX_QUERY_WIDTH = M.index_n_heads * M.index_head_dim
+INDEX_QUERY_SCALE_WIDTH = INDEX_QUERY_WIDTH // 32
 TOPK_CACHED_PAGES = (M.max_position_embeddings + 127) // 128
+
+
+@pl.jit.inline
+def _index_key_decode_lut():
+    """Map packed FP4 nibbles to exact FP8 carrier bits."""
+    codes = pl.tile.arange(0, [1, 16], dtype=pl.INT32)
+    magnitude = pl.ands(codes, 7)
+    values = pl.add(pl.shls(magnitude, 2), 48)
+    values = pl.tile.select(pl.tile.cmps(magnitude, 0, cmp_type=0), 0, values)
+    values = pl.tile.select(pl.tile.cmps(magnitude, 1, cmp_type=0), 48, values)
+    values = pl.or_(values, pl.shls(pl.ands(codes, 8), 4))
+    return pl.cast(values, pl.INT16)
 
 
 @pl.jit.inline
@@ -130,78 +144,72 @@ def publish_index_cache(
     return publish_tid
 
 
-def make_index_query_quantizer(*, dequantize=False):
-    """Quantize group-32 index queries to E2M1/E8M0, optionally returning BF16 values."""
-    heads = M.index_n_heads
-    width = M.index_head_dim
-    query_width = heads * width
-    scale_width = query_width // 32
-    output_dtype = pl.BF16 if dequantize else pl.FP8E4M3FN
-
-    @pl.jit.inline(auto_scope=False)
-    def quantize_query(
-        source: pl.Tensor[[T_DYN, query_width], pl.BF16],
-        output: pl.Tensor[[T_DYN, query_width], output_dtype],
-        output_scale: pl.Tensor[[T_DYN, scale_width], pl.FP8E8M0],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        # Materialize the producer dependency before entering the scoped task.
-        entry_deps = pl.array.create(1, pl.TASK_ID)
-        entry_deps[0] = ready
-        with pl.spmd(32, name_hint="c1a_index_query_fp4_as_fp8", deps=[entry_deps[0]]) as quant_tid:
-            worker = pl.tile.get_block_idx()
-            for t in pl.range(worker, num_tokens, 32):
-                raw = pl.load(source, [t, 0], [1, query_width])
-                values = pl.reshape(pl.cast(raw, pl.FP32), [scale_width, 32])
-                reduce_tmp = pl.tile.create([scale_width, 32], dtype=pl.FP32)
-                raw_maximum = pl.row_max(pl.abs(values), tmp_tile=reduce_tmp)
-                maximum = pl.maximum(raw_maximum, 7.052966104933725e-38)
-                bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 6.0), pl.INT32)
-                exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                normalized = pl.minimum(pl.maximum(pl.row_expand_div(values, scale), -6.0), 6.0)
-                magnitude = pl.abs(normalized)
-                rounded = pl.tile.full([scale_width, 32], dtype=pl.FP32, value=0.0)
-                select_tmp = pl.tile.create([1, 16], dtype=pl.UINT32)
-                predicate = pl.tile.cmps(magnitude, 0.25, cmp_type=4)
-                level = pl.tile.full([scale_width, 32], dtype=pl.FP32, value=0.5)
-                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                predicate = pl.tile.cmps(magnitude, 0.75, cmp_type=5)
-                level = pl.tile.full([scale_width, 32], dtype=pl.FP32, value=1.0)
-                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                predicate = pl.tile.cmps(magnitude, 1.25, cmp_type=4)
-                level = pl.tile.full([scale_width, 32], dtype=pl.FP32, value=1.5)
-                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                predicate = pl.tile.cmps(magnitude, 1.75, cmp_type=5)
-                level = pl.tile.full([scale_width, 32], dtype=pl.FP32, value=2.0)
-                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                predicate = pl.tile.cmps(magnitude, 2.5, cmp_type=4)
-                level = pl.tile.full([scale_width, 32], dtype=pl.FP32, value=3.0)
-                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                predicate = pl.tile.cmps(magnitude, 3.5, cmp_type=5)
-                level = pl.tile.full([scale_width, 32], dtype=pl.FP32, value=4.0)
-                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                predicate = pl.tile.cmps(magnitude, 5.0, cmp_type=4)
-                level = pl.tile.full([scale_width, 32], dtype=pl.FP32, value=6.0)
-                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                sign = pl.ands(pl.reinterpret_view(normalized, pl.INT32), -2147483648)
-                signed_bits = pl.or_(pl.reinterpret_view(rounded, pl.INT32), sign)
-                exact = pl.reinterpret_view(signed_bits, pl.FP32)
-                packed_input = pl.reshape(exact, [1, query_width])
-                # E2M1 values use exact E4M3 carriers.
-                if dequantize:
-                    dequantized = pl.row_expand_mul(exact, scale)
-                    stored_values = pl.reshape(dequantized, [1, query_width])
-                else:
-                    stored_values = packed_input
-                result = pl.cast(stored_values, output_dtype, mode="rint")
-                codes = pl.cast(pl.reshape(exponent, [1, scale_width]), pl.UINT8)
-                pl.store(result, [t, 0], output)
-                pl.store(pl.reinterpret_view(codes, pl.FP8E8M0), [t, 0], output_scale)
-        return quant_tid
-
-    return quantize_query
+@pl.jit.inline(auto_scope=False)
+def quantize_index_query(
+    source: pl.Tensor[[T_DYN, INDEX_QUERY_WIDTH], pl.BF16],
+    output: pl.Tensor,
+    output_scale: pl.Tensor[[T_DYN, INDEX_QUERY_SCALE_WIDTH], pl.FP8E8M0],
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+    dequantize: pl.constexpr,
+):
+    """Quantize group-32 queries to E2M1/E8M0, optionally dequantizing to BF16."""
+    # Materialize the producer dependency before entering the scoped task.
+    entry_deps = pl.array.create(1, pl.TASK_ID)
+    entry_deps[0] = ready
+    with pl.spmd(32, name_hint="c1a_index_query_fp4_as_fp8", deps=[entry_deps[0]]) as quant_tid:
+        worker = pl.tile.get_block_idx()
+        for t in pl.range(worker, num_tokens, 32):
+            raw = pl.load(source, [t, 0], [1, INDEX_QUERY_WIDTH])
+            values = pl.reshape(pl.cast(raw, pl.FP32), [INDEX_QUERY_SCALE_WIDTH, 32])
+            reduce_tmp = pl.tile.create([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32)
+            raw_maximum = pl.row_max(pl.abs(values), tmp_tile=reduce_tmp)
+            maximum = pl.maximum(raw_maximum, 7.052966104933725e-38)
+            bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 6.0), pl.INT32)
+            exponent = pl.shrs(pl.add(bits, 8388607), 23)
+            scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+            normalized = pl.minimum(pl.maximum(pl.row_expand_div(values, scale), -6.0), 6.0)
+            magnitude = pl.abs(normalized)
+            rounded = pl.tile.full([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32, value=0.0)
+            select_tmp = pl.tile.create([1, 16], dtype=pl.UINT32)
+            predicate = pl.tile.cmps(magnitude, 0.25, cmp_type=4)
+            level = pl.tile.full([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32, value=0.5)
+            rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+            predicate = pl.tile.cmps(magnitude, 0.75, cmp_type=5)
+            level = pl.tile.full([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32, value=1.0)
+            rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+            predicate = pl.tile.cmps(magnitude, 1.25, cmp_type=4)
+            level = pl.tile.full([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32, value=1.5)
+            rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+            predicate = pl.tile.cmps(magnitude, 1.75, cmp_type=5)
+            level = pl.tile.full([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32, value=2.0)
+            rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+            predicate = pl.tile.cmps(magnitude, 2.5, cmp_type=4)
+            level = pl.tile.full([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32, value=3.0)
+            rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+            predicate = pl.tile.cmps(magnitude, 3.5, cmp_type=5)
+            level = pl.tile.full([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32, value=4.0)
+            rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+            predicate = pl.tile.cmps(magnitude, 5.0, cmp_type=4)
+            level = pl.tile.full([INDEX_QUERY_SCALE_WIDTH, 32], dtype=pl.FP32, value=6.0)
+            rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+            sign = pl.ands(pl.reinterpret_view(normalized, pl.INT32), -2147483648)
+            signed_bits = pl.or_(pl.reinterpret_view(rounded, pl.INT32), sign)
+            exact = pl.reinterpret_view(signed_bits, pl.FP32)
+            packed_input = pl.reshape(exact, [1, INDEX_QUERY_WIDTH])
+            # E2M1 values use exact E4M3 carriers.
+            if dequantize:
+                dequantized = pl.row_expand_mul(exact, scale)
+                stored_values = pl.reshape(dequantized, [1, INDEX_QUERY_WIDTH])
+                bf16_result = pl.cast(stored_values, pl.BF16, mode="rint")
+                pl.store(bf16_result, [t, 0], output)
+            else:
+                stored_values = packed_input
+                fp8_result = pl.cast(stored_values, pl.FP8E4M3FN, mode="rint")
+                pl.store(fp8_result, [t, 0], output)
+            codes = pl.cast(pl.reshape(exponent, [1, INDEX_QUERY_SCALE_WIDTH]), pl.UINT8)
+            pl.store(pl.reinterpret_view(codes, pl.FP8E8M0), [t, 0], output_scale)
+    return quant_tid
 
 
 
@@ -210,11 +218,13 @@ def materialize_index_topk(
     scores: pl.Tensor,
     block_table: pl.Tensor,
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    pool_ids: pl.Tensor,
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     token: pl.Scalar[pl.INDEX],
     width: pl.Scalar[pl.INDEX],
     cutoff: pl.Scalar[pl.FP32],
     tie_quota: pl.Scalar[pl.INDEX],
+    pool: pl.constexpr,
 ):
     """Compact winners in logical order and gather physical pages from UB."""
     request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
@@ -222,6 +232,12 @@ def materialize_index_topk(
     valid_pages = pl.min(table_width, TOPK_CACHED_PAGES)
     raw_pages = pl.load(block_table, [request, 0], [1, TOPK_CACHED_PAGES], valid_shape=[1, valid_pages])
     pages = pl.tile.fillpad(raw_pages, pad_value=pl.PadValue.zero)
+    empty_blocks = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=0)
+    pool_blocks = pl.tile.fillpad(empty_blocks, pad_value=pl.PadValue.zero)
+    if pool:
+        pool_width = pl.tensor.dim(pool_ids, 1)
+        raw_blocks = pl.load(pool_ids, [token, 0], [1, CANDIDATE_TOPK_BLOCKS], valid_shape=[1, pool_width])
+        pool_blocks = pl.tile.fillpad(raw_blocks, pad_value=pl.PadValue.zero)
     pl.store(pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1), [token, 0], output)
     ones = pl.tile.full([1, 256], dtype=pl.FP32, value=1.0)
     lanes = pl.tile.arange(0, [1, 256], dtype=pl.INT32)
@@ -289,6 +305,10 @@ def materialize_index_topk(
                 compact_valid = pl.tile.set_validshape(offsets_i32, 1, selected_count)
                 compact_safe = pl.tile.fillpad(compact_valid, pad_value=pl.PadValue.zero)
                 logical = pl.add(compact_safe, pl.cast(start, pl.INT32))
+                if pool:
+                    block_indices = pl.tile.shrs(logical, 3)
+                    blocks = pl.tile.gather(pool_blocks, block_indices, tmp)
+                    logical = pl.add(pl.mul(blocks, CANDIDATE_BLOCK_SIZE), pl.ands(logical, 7))
                 page_indices = pl.tile.shrs(logical, 7)
                 if start < TOPK_CACHED_PAGES * 128:
                     page_ids = pl.tile.gather(pages, page_indices, tmp)
@@ -305,7 +325,6 @@ def materialize_index_topk(
                 pl.store(pl.tile.set_validshape(physical, 1, selected_count), [token, count], output)
                 count = count + selected_count
     return output
-
 
 
 def golden_index_query_fp4(value: torch.Tensor) -> torch.Tensor:

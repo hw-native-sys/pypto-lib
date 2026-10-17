@@ -18,7 +18,6 @@ from compressor import golden_compressor_ratio1 as compressor_ratio1
 from compressor import golden_compressor_ratio2_paged as compressor_ratio2_paged
 from hierarchical_sparse_indexer import golden_index_key as index_key
 from hierarchical_sparse_indexer import golden_paged_indexer as paged_indexer
-from hierarchical_sparse_indexer import select_candidate_blocks
 from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
 from o_proj import golden_o_proj, golden_grouped_output
@@ -2367,6 +2366,7 @@ def golden_compressed_attention(
     query_start_loc: torch.Tensor | None = None,
     sequential_query: bool = False,
     round_cache_to_even: bool = False,
+    indexer_fn: Callable | None = None,
 ) -> AttentionGoldenResult:
     """Evaluate C2A/C1A full, reindex, or reuse with paged cache state."""
     query, window_kv, query_latent = qkv_proj_rope(
@@ -2406,6 +2406,8 @@ def golden_compressed_attention(
     updated_state = None if state_cache is None else state_cache.clone()
     topk_indices = compressed_indices
     candidates = candidate_mask
+    pool_ids = None
+    pool_counts = None
 
     if mode is AttentionMode.FULL:
         if compressor_wkv is None or compressor_norm_weight is None or compressed_slots is None:
@@ -2488,34 +2490,25 @@ def golden_compressed_attention(
             or compressed_lens is None
         ):
             raise ValueError("indexing modes require cache addressing and causal compressed lengths")
-        scores, topk_indices = paged_indexer(
-            x,
-            query_latent,
-            request_ids,
-            quantized_index,
-            index_block_table,
-            compressed_lens,
-            index_wq_b,
-            index_wq_b_scale,
-            index_weights_proj,
-            rope_cos,
-            rope_sin,
-            candidates=candidate_mask,
-            topk=M.index_topk,
-            fp4_query=(ratio == 1),
-            stable_topk=(ratio == 1),
-            sequential_query=sequential_query,
+        if ratio == 1 and mode is AttentionMode.FULL and indexer_fn is None:
+            raise ValueError("C1A Full requires a block-pool indexer")
+        index_args = (
+            x, query_latent, request_ids, quantized_index, index_block_table, compressed_lens,
+            index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
         )
+        if indexer_fn is not None:
+            scores, topk_indices = indexer_fn(*index_args, topk=M.index_topk)
+        else:
+            scores, topk_indices = paged_indexer(
+                *index_args, candidates=candidate_mask, topk=M.index_topk,
+                fp4_query=(ratio == 1), stable_topk=(ratio == 1), sequential_query=sequential_query,
+            )
         if ratio == 1 and mode is AttentionMode.FULL:
-            candidate_scores = torch.nn.functional.pad(
-                scores, (0, -scores.shape[-1] % M.candidate_block_size), value=-torch.inf
-            )
-            candidates = select_candidate_blocks(
-                candidate_scores,
-                compressed_lens,
-                M.candidate_topk_blocks,
-                M.candidate_block_size,
-            )
+            from hierarchical_sparse_indexer import golden_select_candidate_block_pool
+
+            pool_width = index_block_table.shape[-1] * 128
+            pool_scores = torch.nn.functional.pad(scores, (0, pool_width - scores.shape[-1]), value=-torch.inf)
+            pool_ids, pool_counts = golden_select_candidate_block_pool(pool_scores, compressed_lens)
     if topk_indices is None:
         raise ValueError("reuse mode requires published compressed Top-K indices")
 
@@ -2538,6 +2531,8 @@ def golden_compressed_attention(
         updated_state,
         topk_indices,
         candidates,
+        pool_ids,
+        pool_counts,
     )
 
 

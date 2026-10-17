@@ -55,11 +55,7 @@ from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk,
     prefill_attend_sparse, prefill_publish_window,
 )
-from prefill_indexer import (
-    LEAF, prefill_c2a_index_key_project, prefill_c2a_rotate_index_key, prefill_c2a_publish_index_key,
-    prefill_c2a_project_index_q, prefill_c2a_index_query, prefill_c2a_index_weights,
-    prefill_c2a_index_select,
-)
+from prefill_indexer import prefill_indexer, publish_c2a_index_key
 
 
 from compressor import prefill_c2a_compressed_rope
@@ -168,12 +164,9 @@ def prefill_c2a_full_attention(
     )
 
     # Index keys come from the unrotated latent; the compressed cache stores the rotated one.
-    index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    prefill_c2a_index_key_project(latent, index_wk, index_norm_weight, index_key, num_tokens, pool_tid)
-    rotated_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    prefill_c2a_rotate_index_key(index_key, compressed_rope_cos, compressed_rope_sin, rotated_key, num_tokens)
-    index_publish_tid = prefill_c2a_publish_index_key(
-        rotated_key, compressed_slots, index_cache, index_cache_scale, num_tokens, cache_ready
+    index_publish_tid = publish_c2a_index_key(
+        latent, index_wk, index_norm_weight, compressed_rope_cos, compressed_rope_sin,
+        compressed_slots, index_cache, index_cache_scale, num_tokens, pool_tid, cache_ready,
     )
     rotated_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     prefill_c2a_compressed_rope(latent, compressed_rope_cos, compressed_rope_sin, rotated_latent, num_tokens)
@@ -182,18 +175,10 @@ def prefill_c2a_full_attention(
         num_tokens, cache_ready, pool_tid,
     )
 
-    index_query_raw = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    prefill_c2a_project_index_q(qr, index_wq_b, index_wq_b_scale, index_query_raw, num_tokens)
-    index_query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    prefill_c2a_index_query(index_query_raw, rope_cos, rope_sin, index_query, num_tokens)
-    index_weight = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-    prefill_c2a_index_weights(x, index_weights_proj, index_weight, num_tokens)
-    leaf_scores = pl.create_tensor([tokens, LEAF], dtype=pl.FP32)
-    leaf_rows = pl.create_tensor([tokens, LEAF], dtype=pl.INT32)
-    select_tid = prefill_c2a_index_select(
-        index_query, index_weight, index_cache, index_cache_scale, index_block_table,
-        token_to_req_indices, compressed_lens, leaf_scores, leaf_rows, topk_indices,
-        num_tokens, index_publish_tid,
+    select_tid = prefill_indexer(
+        x, qr, token_to_req_indices, compressed_lens, index_cache, index_cache_scale, index_block_table,
+        rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
+        topk_indices, compressed_lens, topk_indices, num_tokens, index_publish_tid, pool=False, c2a=True,
     )
 
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
@@ -462,37 +447,14 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
 
     index_values = _flat_cache_rows(index_cache, index_cache_scale, IDX_GROUP, "e8m0")
 
-    # f. Indexer: score every causal compressed position against the freshly written keys.
-    index_q = golden_mxfp8_linear(qr, t["index_wq_b"], t["index_wq_b_scale"]).unflatten(
-        -1, (index_heads, index_dim)
-    )
-    index_q = golden_rope_tail(index_q, t["rope_cos"], t["rope_sin"])
-    head_weights = golden_bf16_gemm(x, t["index_weights_proj"])
-    head_weights = head_weights * index_dim**-0.5 * index_heads**-0.5
-    lens = t["compressed_lens"].long()
-    max_len = int(lens.max()) if lens.numel() else 0
-    topk_indices = torch.full((tokens, TOPK), -1, dtype=torch.int32)
-    if max_len:
-        positions = torch.arange(max_len)
-        blocks = torch.div(positions, BLOCK_SIZE, rounding_mode="floor")
-        offsets = positions.remainder(BLOCK_SIZE)
-        pages = t["index_block_table"][t["token_to_req_indices"].long().unsqueeze(-1), blocks]
-        physical_rows = pages.to(torch.int64) * BLOCK_SIZE + offsets
-        keys = index_values[physical_rows.reshape(-1)].reshape(tokens, max_len, index_dim)
-        scores = torch.einsum("thd,tkd->thk", index_q.float(), keys.float()).relu()
-        scores = (scores * head_weights.float().unsqueeze(-1)).sum(dim=-2)
-        scores = scores.masked_fill(positions.unsqueeze(0) >= lens.unsqueeze(-1), -torch.inf)
-        count = min(TOPK, max_len)
-        logical = scores.topk(count, dim=-1, sorted=False).indices.sort(dim=-1).values
-        selected_scores = scores.gather(-1, logical)
-        selected_rows = physical_rows.gather(-1, logical)
-        rows = torch.where(torch.isfinite(selected_scores), selected_rows, -1)
-        for token in range(tokens):
-            if int(lens[token]) > TOPK:
-                # The scored device path orders winners by physical cache row.
-                rows[token] = rows[token].sort().values
-        topk_indices[:, :count] = rows.to(torch.int32)
+    # f. Indexer uses logical group-32 FP4 queries and physical-order winners.
+    from prefill_indexer import golden_prefill_indexer
 
+    scores, topk_indices = golden_prefill_indexer(
+        x, qr, t["token_to_req_indices"], index_values.reshape(*index_cache.shape[:-1], index_dim),
+        t["index_block_table"], t["compressed_lens"], t["index_wq_b"], t["index_wq_b_scale"],
+        t["index_weights_proj"], t["rope_cos"], t["rope_sin"], c2a=True,
+    )
     # g. Sparse attention: one online softmax over window rows plus selected compressed rows.
     window_values = (
         window_cache.float() * window_cache_scale.float().repeat_interleave(MX_GROUP, -1)

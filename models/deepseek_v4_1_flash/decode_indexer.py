@@ -12,8 +12,8 @@ import pypto.language as pl
 import torch
 
 from hierarchical_sparse_indexer import (
-    golden_index_query_fp4,
-    make_index_query_quantizer,
+    _index_key_decode_lut, golden_index_query_fp4,
+    quantize_index_query,
     materialize_index_topk as _materialize_index_topk,
 )
 
@@ -292,18 +292,6 @@ def _make_fp4_publish_e8m0(width, group, cache_dim):
         return published
 
     return publish
-
-
-@pl.jit.inline
-def _index_key_decode_lut():
-    """Map packed FP4 nibbles to exact FP8 carrier bits."""
-    codes = pl.tile.arange(0, [1, 16], dtype=pl.INT32)
-    magnitude = pl.ands(codes, 7)
-    values = pl.add(pl.shls(magnitude, 2), 48)
-    values = pl.tile.select(pl.tile.cmps(magnitude, 0, cmp_type=0), 0, values)
-    values = pl.tile.select(pl.tile.cmps(magnitude, 1, cmp_type=0), 48, values)
-    values = pl.or_(values, pl.shls(pl.ands(codes, 8), 4))
-    return pl.cast(values, pl.INT16)
 
 
 def _make_page_index_scores(workers, skip_short=False):
@@ -1081,9 +1069,6 @@ def score_reindex(
     return result
 
 
-quantize_index_query = make_index_query_quantizer()
-
-
 _TOPK_PAGE = 128
 _TOPK_CACHED_PAGES = (FLASH.max_position_embeddings + 127) // 128
 _TOPK_PAIR_WIDTH = 2 * INDEX_TOPK
@@ -1171,8 +1156,8 @@ def select_index_topk(
                 invalid_bits = pl.tile.full([1, 8], dtype=pl.INT32, value=_TOPK_INVALID_SCORE_BITS)
                 invalid_score = pl.tile.read(pl.reinterpret_view(invalid_bits, pl.FP32), [0, 0])
                 _materialize_index_topk(
-                    index_scores, block_table, request_ids, output,
-                    token, width, invalid_score, pl.cast(0, pl.INDEX),
+                    index_scores, block_table, request_ids, block_table, output,
+                    token, width, invalid_score, pl.cast(0, pl.INDEX), pool=False,
                 )
     total_leaves = pl.cast(num_tokens, pl.INDEX) * leaf_count
     with pl.spmd(32, name_hint="c1a_index_topk_leaf", deps=[scores_ready]) as leaf_tid:
@@ -1217,8 +1202,8 @@ def select_index_topk(
                     partial = pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
                     above = above + pl.cast(partial, pl.INDEX)
                 _materialize_index_topk(
-                    index_scores, block_table, request_ids, output,
-                    token, width, cutoff, INDEX_TOPK - above,
+                    index_scores, block_table, request_ids, block_table, output,
+                    token, width, cutoff, INDEX_TOPK - above, pool=False,
                 )
     return merge_tid
 
@@ -1474,7 +1459,7 @@ def c1a_index(
     query_scale = pl.create_tensor(
         [tokens, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0
     )
-    query_tid = quantize_index_query(rotated, query, query_scale, num_tokens, rotated_tid)
+    query_tid = quantize_index_query(rotated, query, query_scale, num_tokens, rotated_tid, dequantize=False)
     weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
     weights_tid = project_index_weights(
         x, index_weights_proj, weights, num_tokens, entry_ready
@@ -1662,11 +1647,12 @@ def select_c2a_index_topk(
                     index_scores,
                     block_table,
                     request_ids,
+                    block_table,
                     output,
                     token,
                     width,
                     cutoff,
-                    INDEX_TOPK - above,
+                    INDEX_TOPK - above, pool=False,
                 )
 
     with pl.spmd(32, name_hint="c2a_index_topk_physical_order", deps=[merge_tid]) as order_tid:

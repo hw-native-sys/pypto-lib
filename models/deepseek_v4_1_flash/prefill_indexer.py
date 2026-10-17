@@ -6,17 +6,20 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Packed-prefill C1A and C2A index-key publication, scoring, and Top-K selection."""
+"""Prefill C1A and C2A index-key preparation, paged scoring, and selection."""
+
+import torch
 
 import pypto.language as pl
-from config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, T_DYN, B_DYN, TABLE_DYN
+
+from config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, T_DYN
 from hierarchical_sparse_indexer import (
-    _hierarchical_sparse_indexer, make_index_query_quantizer, materialize_index_topk,
+    _index_key_decode_lut, golden_index_query_fp4, quantize_index_query, materialize_index_topk,
+    publish_index_cache, select_candidate_block_pool,
 )
-from rmsnorm import EPS
-
-
-from quant import mxfp8_gemm, bf16_gemm_staged
+from rmsnorm import EPS, rms_norm
+from quant import bf16_gemm_staged, mxfp8_gemm, dequantize_mxfp4_cache, golden_mxfp8_linear
+from qkv_proj_rope import golden_rope_tail
 
 
 # model config
@@ -29,96 +32,56 @@ INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
 
 
-# tiling
-M_TILE = 16
 INDEX_SCORE_SCALE = INDEX_DIM ** -0.5 * INDEX_H ** -0.5
-INDEX_PAGE = 128
-INDEX_SCORE_TILE = 64
-INDEX_QUERY_TILE = 128
-INDEX_MAX_LOGITS_BYTES = 512 * 1024 * 1024
-INDEX_PACKED_ELEMENTS = INDEX_SCORE_TILE * INDEX_DIM // 2
+INDEX_MAX_LOGITS_BYTES = 64 * 1024 * 1024
 TOPK_LEAF = 8192
 TOPK_PAIR_WIDTH = 2 * INDEX_TOPK
-TOPK_MAX_LEAVES = (1048576 + TOPK_LEAF - 1) // TOPK_LEAF
 TOPK_GROUP_LEAVES = 2
-TOPK_GROUPS_PER_TOKEN = (TOPK_MAX_LEAVES + TOPK_GROUP_LEAVES - 1) // TOPK_GROUP_LEAVES
+IDX_SCALES = INDEX_DIM // 32
+IDX_PACKED = INDEX_DIM // 2
+FP4_MAX_INV = 1.0 / 6.0
+FP4_SCALE_FLOOR = 2.0**-9
+LEAF = 2048
+SORT_FLOOR = -3.0e38
 
-
-quantize_index_query = make_index_query_quantizer(dequantize=True)
-
+# tiling
+M_TILE = 16
 INDEX_PROJ_N_TILE = 128
-INDEX_WEIGHT_N_TILE = min(128, INDEX_H)
 INDEX_PROJ_K_TILE = 256
 
 
 @pl.jit.inline
-def _index_query_rope_block(
-    x: pl.Tensor,
-    cos: pl.Tensor,
-    sin: pl.Tensor,
-    output: pl.Tensor,
-    block: pl.Scalar[pl.INT32],
-):
-    t = block // INDEX_H
-    h = block % INDEX_H
-    base = h * INDEX_DIM
-    output[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)]
-    tail = pl.cast(x[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM], pl.FP32)
-    even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-    odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-    c = cos[t : t + 1, :]
-    s = pl.mul(sin[t : t + 1, :], 1.0)
-    re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-    im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-    rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-    rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-    rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-    output[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM] = pl.cast(
-        rotated, pl.BF16, mode="rint"
-    )
-    return output
-
-
-@pl.jit.inline
-def _index_key_rope_block(
-    x: pl.Tensor,
-    cos: pl.Tensor,
-    sin: pl.Tensor,
-    output: pl.Tensor,
-    block: pl.Scalar[pl.INT32],
-):
-    t = block
-    base = 0
-    output[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)]
-    tail = pl.cast(x[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM], pl.FP32)
-    even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-    odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-    c = cos[t : t + 1, :]
-    s = pl.mul(sin[t : t + 1, :], 1.0)
-    re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-    im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-    rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-    rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-    rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-    output[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM] = pl.cast(
-        rotated, pl.BF16, mode="rint"
-    )
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def rotate_index_query(
+def _index_rope(
     x: pl.Tensor,
     cos: pl.Tensor,
     sin: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    heads: pl.constexpr,
+    max_workers: pl.constexpr,
 ):
-    blocks = num_tokens * INDEX_H
-    workers = pl.min(blocks, 64)
-    for worker in pl.spmd(workers, name_hint='prefill_c1a_index_rope'):
+    """Rotate adjacent pairs in trailing lanes of INDEX_DIM-wide heads."""
+    blocks = num_tokens * heads
+    workers = pl.min(blocks, max_workers)
+    for worker in pl.spmd(workers, name_hint="prefill_index_rope"):
         for block in pl.range(worker, blocks, workers):
-            _index_query_rope_block(x, cos, sin, output, block)
+            token = block // heads
+            head = block % heads
+            base = head * INDEX_DIM
+            rope_start = base + INDEX_DIM - ROPE_DIM
+            nope = pl.slice(x, [1, INDEX_DIM - ROPE_DIM], [token, base])
+            output[token:token + 1, base:base + INDEX_DIM - ROPE_DIM] = nope
+            tail = pl.cast(pl.slice(x, [1, ROPE_DIM], [token, rope_start]), pl.FP32)
+            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+            c = cos[token:token + 1, :]
+            sine = pl.mul(sin[token:token + 1, :], 1.0)
+            re = pl.sub(pl.mul(even, c), pl.mul(odd, sine))
+            im = pl.add(pl.mul(even, sine), pl.mul(odd, c))
+            rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
+            rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
+            output[token:token + 1, rope_start:rope_start + ROPE_DIM] = pl.cast(rotated, pl.BF16, mode="rint")
     return output
 
 
@@ -132,13 +95,11 @@ def project_index_weights(
     """Project BF16 per-head weights with BF16 rounding before and after scaling."""
     tokens = pl.tensor.dim(x, 0)
     projected_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-    weight_projection_ready = pl.system.task_dummy(deps=[])
-    weight_projection_result, weight_projection_tid = bf16_gemm_staged(
-        x, weight,
-        projected_weights,
-        num_tokens, weight_projection_ready,
-        width=D, output_width=INDEX_H, n_tile=INDEX_WEIGHT_N_TILE,
-        k_tile=INDEX_PROJ_K_TILE, workers=2147483647, name_hint='prefill_bf16_projection_cube',
+    ready = pl.system.task_dummy(deps=[])
+    projected_result, projected_tid = bf16_gemm_staged(
+        x, weight, projected_weights, num_tokens, ready,
+        width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
+        workers=2147483647, name_hint="prefill_index_weights",
     )
     with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights_scale") as weights_tid:
         block = pl.tile.get_block_idx()
@@ -149,6 +110,227 @@ def project_index_weights(
         rounded = pl.cast(scaled, pl.BF16, mode="rint")
         output[token:token + M_TILE, :] = pl.set_validshape(rounded, rows, INDEX_H)
     return weights_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def prepare_prefill_index_query(
+    x: pl.Tensor,
+    latent: pl.Tensor,
+    query_weight: pl.Tensor,
+    query_weight_scale: pl.Tensor,
+    weight_projection: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    query: pl.Tensor,
+    query_scale: pl.Tensor,
+    weights: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    """Project, rotate, and quantize query rows with group-32 scales."""
+    tokens = pl.tensor.dim(x, 0)
+    projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
+    mxfp8_gemm(
+        latent, query_weight, query_weight_scale, projected, num_tokens,
+        width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
+        n_tile=128, name_hint="c1a_mx_projection",
+    )
+    rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
+    _index_rope(projected, cos, sin, rotated, num_tokens, heads=INDEX_H, max_workers=32)
+    query_tid = quantize_index_query(rotated, query, query_scale, num_tokens, ready, dequantize=False)
+    weights_tid = project_index_weights(x, weight_projection, weights, num_tokens)
+    return query_tid, weights_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _prefill_index_scores(
+    query: pl.Tensor,
+    query_scale: pl.Tensor,
+    weights: pl.Tensor,
+    cache: pl.Tensor,
+    cache_scale: pl.Tensor,
+    block_table: pl.Tensor,
+    request_ids: pl.Tensor,
+    lengths: pl.Tensor,
+    pool_ids: pl.Tensor,
+    pool_counts: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+    tile_n: pl.constexpr,
+    query_tile: pl.constexpr,
+    pool: pl.constexpr,
+    skip_short: pl.constexpr,
+    head_rows: pl.constexpr,
+    part_rows: pl.constexpr,
+):
+    """Score paged or compact-pool MX index keys."""
+    groups = pl.cast((num_tokens + query_tile - 1) // query_tile, pl.INDEX)
+    width = pl.tensor.dim(output, 1)
+    capacity = pl.tensor.dim(pool_ids, 1)
+    prefix_rows = groups + 1
+    prefix = pl.create_tensor([prefix_rows], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_index_plan", deps=[ready]) as plan_tid:
+        total = pl.cast(0, pl.INDEX)
+        pl.write(prefix, [0], pl.cast(total, pl.INT32))
+        for group in pl.range(groups):
+            visible = pl.cast(0, pl.INDEX)
+            for row in pl.unroll(query_tile):
+                token = group * query_tile + row
+                if token < num_tokens:
+                    length = pl.cast(pl.max(0, pl.read(lengths, [token])), pl.INDEX)
+                    if pool:
+                        length = pl.min(capacity, pl.max(0, pl.read(pool_counts, [token]))) * 8
+                    elif skip_short:
+                        if length <= INDEX_TOPK:
+                            length = pl.cast(0, pl.INDEX)
+                    visible = pl.max(visible, pl.min(length, width))
+            total = total + (visible + tile_n - 1) // tile_n
+            pl.write(prefix, [group + 1], pl.cast(total, pl.INT32))
+
+    output_panels = (width + 127) // 128
+    with pl.spmd(32, name_hint="prefill_index_score_clear", deps=[ready]) as clear_tid:
+        worker = pl.tile.get_block_idx()
+        for work in pl.range(worker, num_tokens * output_panels, 32):
+            token = work // output_panels
+            begin = (work % output_panels) * 128
+            clear_value = pl.reinterpret_view(pl.tile.full([1, 128], dtype=pl.INT32, value=-8388608), pl.FP32)
+            pl.store(pl.set_validshape(clear_value, 1, pl.min(128, width - begin)), [token, begin], output)
+
+    cache_pages = pl.tensor.dim(cache, 0)
+    cache_rows = cache_pages * 128
+    packed_flat = pl.reshape(cache, [cache_rows, INDEX_DIM // 2])
+    scale_rows = cache_rows // 8
+    scale_flat = pl.reshape(cache_scale, [scale_rows, 32])
+    query_rows = pl.tensor.dim(query, 0) * INDEX_H
+    query_flat = pl.reshape(query, [query_rows, INDEX_DIM])
+    table_width = pl.tensor.dim(block_table, 1)
+    requests = pl.tensor.dim(block_table, 0)
+    with pl.spmd(32, name_hint="prefill_index_mx_scores", deps=[plan_tid, clear_tid],
+                 optimizations=[pl.cross_core_slot(slot_num=2)]) as score_tid:
+        worker = pl.tile.get_block_idx()
+        lut = _index_key_decode_lut()
+        work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)
+        for work in pl.range(worker, work_items, 32):
+            lower = pl.cast(0, pl.INDEX)
+            upper = groups
+            for _ in pl.range(32):
+                if lower + 1 < upper:
+                    middle = (lower + upper) // 2
+                    if pl.read(prefix, [middle]) <= work:
+                        lower = middle
+                    else:
+                        upper = middle
+            token = lower * query_tile
+            macro = work - pl.read(prefix, [lower])
+            begin = macro * tile_n
+            request = pl.read(request_ids, [token])
+            maximum_visible = pl.cast(0, pl.INDEX)
+            for row in pl.unroll(query_tile):
+                if token + row < num_tokens:
+                    row_length = pl.cast(pl.max(0, pl.read(lengths, [token + row])), pl.INDEX)
+                    if skip_short:
+                        if row_length <= INDEX_TOPK:
+                            row_length = pl.cast(0, pl.INDEX)
+                    maximum_visible = pl.max(maximum_visible, row_length)
+            valid_heads = pl.min(query_tile, num_tokens - token) * INDEX_H
+            query_panel = pl.load(query_flat, [token * INDEX_H, 0], [head_rows, INDEX_DIM],
+                                  valid_shape=[valid_heads, INDEX_DIM])
+            query_padded = pl.tile.fillpad(pl.reinterpret_view(query_panel, pl.INT8),
+                                           pad_value=pl.PadValue.zero)
+            query_panel = pl.reinterpret_view(query_padded, pl.FP8E4M3FN)
+            query_scales = pl.load(query_scale, [token, 0], [query_tile, INDEX_H * 4],
+                                   valid_shape=[pl.min(query_tile, num_tokens - token), INDEX_H * 4])
+            query_signed = pl.reinterpret_view(pl.reinterpret_view(query_scales, pl.UINT8), pl.INT8)
+            query_signed = pl.tile.fillpad(query_signed, pad_value=pl.PadValue.zero)
+            query_bytes = pl.reinterpret_view(query_signed, pl.UINT8)
+            query_bytes = pl.reshape(query_bytes, [1, head_rows * 4])
+            query_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+            query_zz = pl.tmov_x2zz(query_bytes, query_tmp, group_axis=1, dst_rows=head_rows, dst_cols=4)
+            query_mat = pl.tile.move(query_panel, target_memory=pl.MemorySpace.Mat,
+                                     blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major)
+            query_left = pl.tile.move(query_mat, target_memory=pl.MemorySpace.Left)
+            query_scale_mat = pl.tile.move(pl.reinterpret_view(query_zz, pl.FP8E8M0),
+                                           target_memory=pl.MemorySpace.Mat,
+                                           blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major)
+            query_scale_left = pl.tile.move(query_scale_mat, target_memory=pl.MemorySpace.LeftScale)
+            packed = pl.tile.full([tile_n, INDEX_DIM // 2], dtype=pl.INT8, value=0)
+            raw_scale = pl.tile.full([1, tile_n * 4], dtype=pl.INT8, value=127)
+            valid_lanes = pl.tile.full([1, tile_n], dtype=pl.INT32, value=0)
+            for part in pl.range(tile_n // part_rows):
+                if pool:
+                    slot = begin // 8 + part
+                    logical = pl.cast(-1, pl.INDEX)
+                    if slot < pl.min(capacity, pl.max(0, pl.read(pool_counts, [token]))):
+                        candidate = pl.read(pool_ids, [token, slot])
+                        if candidate >= 0 and candidate < (maximum_visible + 7) // 8:
+                            logical = pl.cast(candidate, pl.INDEX) * 8
+                else:
+                    logical = begin + part * 128
+                if logical >= 0 and logical < maximum_visible:
+                    logical_page = logical // 128
+                    if request >= 0 and request < requests and logical_page < table_width:
+                        page = pl.read(block_table, [pl.cast(request, pl.INDEX), logical_page])
+                        if page >= 0 and page < cache_pages:
+                            physical_row = pl.cast(page, pl.INDEX) * 128 + logical % 128
+                            valid_rows = pl.min(part_rows, maximum_visible - logical)
+                            payload_raw = pl.load(packed_flat, [physical_row, 0], [part_rows, INDEX_DIM // 2])
+                            payload = pl.reinterpret_view(payload_raw, pl.INT8)
+                            packed = pl.tile.assemble(packed, payload, [part * part_rows, 0])
+                            scales = pl.load(scale_flat, [physical_row // 8, 0], [part_rows // 8, 32])
+                            scale_bytes = pl.reinterpret_view(pl.reinterpret_view(scales, pl.UINT8), pl.INT8)
+                            scale_bytes = pl.reshape(scale_bytes, [1, part_rows * 4])
+                            raw_scale = pl.tile.assemble(raw_scale, scale_bytes, [0, part * part_rows * 4])
+                            lanes = pl.tile.arange(0, [1, part_rows], dtype=pl.INT32)
+                            ones = pl.tile.full([1, part_rows], dtype=pl.INT32, value=1)
+                            part_mask = pl.tile.cmps(lanes, pl.cast(valid_rows, pl.INT32), cmp_type=2)
+                            part_valid = pl.tile.select(part_mask, ones, 0)
+                            valid_lanes = pl.tile.assemble(valid_lanes, part_valid, [0, part * part_rows])
+            byte_values = pl.ands(pl.cast(packed, pl.INT16), 255)
+            low = pl.ands(byte_values, 15)
+            high = pl.ands(pl.shrs(byte_values, 4), 15)
+            lut_tmp = pl.create_tile([1, 32], dtype=pl.UINT8)
+            low_bytes = pl.tile.gather(lut, low, lut_tmp)
+            high_bytes = pl.tile.gather(lut, high, lut_tmp)
+            words = pl.or_(low_bytes, pl.shls(high_bytes, 8))
+            carrier = pl.reinterpret_view(words, pl.INT8, shape=[tile_n, INDEX_DIM])
+            keys = pl.reinterpret_view(carrier, pl.FP8E4M3FN)
+            scale_tmp = pl.create_tile([1, 128], dtype=pl.UINT8)
+            scale_zz = pl.tmov_x2zz(pl.reinterpret_view(raw_scale, pl.UINT8), scale_tmp,
+                                   group_axis=1, dst_rows=tile_n, dst_cols=4)
+            scale_nn = pl.tile.transpose_view(pl.reinterpret_view(scale_zz, pl.FP8E8M0))
+            keys_kn = pl.reinterpret_view(pl.tile.transpose(pl.reinterpret_view(keys, pl.INT8), 0, 1),
+                                          pl.FP8E4M3FN)
+            dot = pl.cast(pl.matmul_mx(query_left, query_scale_left, keys_kn, scale_nn),
+                          pl.BF16, mode="rint")
+            relu = pl.maximum(pl.cast(dot, pl.FP32), 0.0)
+            weight_rows = pl.load(weights, [token, 0], [query_tile, INDEX_H],
+                                  valid_shape=[pl.min(query_tile, num_tokens - token), INDEX_H])
+            weight_rows = pl.tile.fillpad(weight_rows, pad_value=pl.PadValue.zero)
+            head_weights = pl.reshape(pl.cast(weight_rows, pl.FP32), [head_rows, 1])
+            weighted = pl.row_expand_mul(relu, head_weights)
+            weighted = pl.cast(pl.cast(weighted, pl.BF16, mode="rint"), pl.FP32)
+            for row in pl.unroll(query_tile):
+                if token + row < num_tokens:
+                    heads = pl.tile.slice(weighted, [INDEX_H, tile_n], [row * INDEX_H, 0])
+                    reduced_scores = pl.cast(pl.cast(pl.col_sum(heads), pl.BF16, mode="rint"), pl.FP32)
+                    length = pl.cast(pl.read(lengths, [token + row]), pl.INDEX)
+                    if skip_short:
+                        if length <= INDEX_TOPK:
+                            length = pl.cast(0, pl.INDEX)
+                    if pool:
+                        valid = valid_lanes
+                    else:
+                        positions = pl.add(pl.tile.arange(0, [1, tile_n], dtype=pl.INT32),
+                                           pl.cast(begin, pl.INT32))
+                        visible_mask = pl.tile.cmps(positions, pl.cast(length, pl.INT32), cmp_type=2)
+                        valid = pl.tile.select(visible_mask, valid_lanes, 0)
+                    invalid = pl.reinterpret_view(pl.tile.full([1, tile_n], dtype=pl.INT32,
+                                                              value=-8388608), pl.FP32)
+                    masked = pl.tile.select(pl.tile.cmps(valid, 1, cmp_type=0), reduced_scores, invalid)
+                    pl.store(pl.set_validshape(masked, 1, pl.min(tile_n, width - begin)),
+                             [token + row, begin], output)
+    return score_tid
 
 
 @pl.jit.inline
@@ -213,527 +395,148 @@ def _sort_topk_leaf(
     pl.store(top_pairs, [output_slot, 0], arena)
 
 
-def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes=INDEX_MAX_LOGITS_BYTES):
-    """Specialize paged FP4 index scoring with optional candidate filtering."""
-
-    @pl.jit.inline(auto_scope=False)
-    def paged_indexer_chunk(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-        request_ids: pl.Tensor[[T_DYN], pl.INT32],
-        compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-        index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-        index_cache_scale: pl.Tensor[
-            [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP],
-            pl.FP8E8M0,
-        ],
-        index_block_table: pl.Tensor,
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
-        index_wq_b_scale: pl.Tensor[
-            [Q_LORA // 32, INDEX_H * INDEX_DIM],
-            pl.FP8E8M0,
-            pl.MX_B_NN,
-        ],
-        index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
-        candidate_mask: pl.Tensor,
-        scores: pl.Tensor,
-        topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-        num_tokens: pl.Scalar[pl.INT32],
-        cache_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        tokens = pl.tensor.dim(x, 0)
-        positions = pl.tensor.dim(candidate_mask, 1)
-        index_query_raw = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-        mxfp8_gemm(
-            query_latent, index_wq_b, index_wq_b_scale,
-            index_query_raw,
-            num_tokens,
-            width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
-            n_tile=128, name_hint="c1a_mx_projection",
+@pl.jit.inline(auto_scope=False)
+def _select_c1a_topk(
+    scores: pl.Tensor,
+    lengths: pl.Tensor,
+    requests: pl.Tensor,
+    table: pl.Tensor,
+    pool_ids: pl.Tensor,
+    pool_counts: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+    pool: pl.constexpr,
+):
+    """Select stable C1A Top-K physical rows."""
+    tokens = pl.tensor.dim(scores, 0)
+    width = pl.tensor.dim(scores, 1)
+    groups_per_token = (width + TOPK_GROUP_LEAVES * TOPK_LEAF - 1) // (TOPK_GROUP_LEAVES * TOPK_LEAF)
+    roots = tokens * groups_per_token
+    arena_rows = roots + tokens * TOPK_GROUP_LEAVES
+    arena = pl.create_tensor([arena_rows, TOPK_PAIR_WIDTH], dtype=pl.FP32)
+    with pl.spmd(num_tokens, name_hint="prefill_index_topk_groups", deps=[ready]) as group_tid:
+        token = pl.tile.get_block_idx()
+        visible = pl.min(pl.max(pl.read(lengths, [token]), 0), width)
+        if pool:
+            visible = pl.min(pl.max(pl.read(pool_counts, [token]), 0) * 8, width)
+        work_visible = pl.max(visible, 1)
+        leaves = (work_visible + TOPK_LEAF - 1) // TOPK_LEAF
+        group_count = (leaves + TOPK_GROUP_LEAVES - 1) // TOPK_GROUP_LEAVES
+        scratch = roots + token * TOPK_GROUP_LEAVES
+        for group in pl.range(group_count):
+            leaf_begin = group * TOPK_GROUP_LEAVES
+            count = pl.min(TOPK_GROUP_LEAVES, leaves - leaf_begin)
+            root = token * groups_per_token + group
+            if count == 1:
+                begin = leaf_begin * TOPK_LEAF
+                valid = pl.min(TOPK_LEAF, work_visible - begin)
+                _sort_topk_leaf(scores, arena, token, begin, valid, root)
+            else:
+                for leaf in pl.unroll(TOPK_GROUP_LEAVES):
+                    begin = (leaf_begin + leaf) * TOPK_LEAF
+                    valid = pl.min(TOPK_LEAF, work_visible - begin)
+                    _sort_topk_leaf(scores, arena, token, begin, valid, scratch + leaf)
+                _merge_topk_pairs(arena, scratch, scratch + 1, root)
+    with pl.spmd(num_tokens, name_hint="prefill_index_topk_merge", deps=[group_tid]) as selected:
+        token = pl.tile.get_block_idx()
+        visible = pl.min(pl.max(pl.read(lengths, [token]), 0), width)
+        if pool:
+            visible = pl.min(pl.max(pl.read(pool_counts, [token]), 0) * 8, width)
+        count = (pl.max(visible, 1) + TOPK_GROUP_LEAVES * TOPK_LEAF - 1) // (TOPK_GROUP_LEAVES * TOPK_LEAF)
+        base = token * groups_per_token
+        for _ in pl.unroll(6):
+            if count > 1:
+                count = _merge_topk_level(arena, base, count)
+        pairs = pl.load(arena, [base, 0], [1, TOPK_PAIR_WIDTH])
+        values = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+        finite_values = pl.maximum(values, -1e29)
+        cutoff = pl.tile.read(finite_values, [0, INDEX_TOPK - 1])
+        ones = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=1.0)
+        flags = pl.tile.select(pl.tile.cmps(values, cutoff, cmp_type=4), ones, 0.0)
+        sums64 = pl.col_sum(pl.reshape(flags, [8, 64]))
+        sums8 = pl.col_sum(pl.reshape(sums64, [8, 8]))
+        above = pl.cast(0, pl.INDEX)
+        for lane in pl.unroll(8):
+            partial = pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
+            above = above + pl.cast(partial, pl.INDEX)
+        materialize_index_topk(
+            scores, table, requests, pool_ids, output, token, visible, cutoff, INDEX_TOPK - above, pool=pool,
         )
-        index_query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-        rotate_index_query(
-            index_query_raw,
-            rope_cos,
-            rope_sin,
-            index_query,
-            num_tokens,
-        )
-        rounded_query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-        query_scales = pl.create_tensor([tokens, INDEX_H * 4], dtype=pl.FP8E8M0)
-        query_ready = quantize_index_query(index_query, rounded_query, query_scales, num_tokens, cache_ready)
-        index_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-        weights_tid = project_index_weights(x, index_weights_proj, index_weights, num_tokens)
+    return selected
 
-        score_completion = pl.array.create(1, pl.TASK_ID)
-        score_completion[0] = cache_ready
-        if not direct_topk:
-            cache_rows = pl.tensor.dim(index_cache, 0) * 128
-            cache_flat = pl.reshape(index_cache, [cache_rows, INDEX_DIM // 2])
-            scale_flat = pl.reshape(index_cache_scale, [cache_rows, INDEX_DIM // INDEX_CACHE_GROUP])
-            query_flat = pl.reshape(rounded_query, [tokens * INDEX_H, INDEX_DIM])
-            pages = (positions + INDEX_SCORE_TILE - 1) // INDEX_SCORE_TILE
-            # Read packed keys and score in one task, without a decoded-key GM arena.
-            score_blocks = num_tokens * pages
-            score_workers = pl.min(score_blocks, 64)
-            with pl.spmd(score_workers, name_hint="c1a_index_score",
-                         deps=[score_completion[0], weights_tid, query_ready], allow_early_resolve=False) as score_tid:
-                worker = pl.tile.get_block_idx()
-                for block in pl.range(worker, score_blocks, score_workers):
-                    token = block // pages
-                    page = block % pages
-                    logical_begin = page * INDEX_SCORE_TILE
-                    empty_score = pl.tile.full([1, INDEX_SCORE_TILE], dtype=pl.FP32, value=-1e30)
-                    pl.store(empty_score, [token, logical_begin], scores)
-                    visible = pl.read(compressed_lens, [token])
-                    if logical_begin < visible:
-                        request = pl.read(request_ids, [token])
-                        logical_page = logical_begin // INDEX_PAGE
-                        physical_block_i32 = pl.read(index_block_table, [request, logical_page])
-                        if physical_block_i32 >= 0:
-                            physical_block = pl.cast(physical_block_i32, pl.INDEX)
-                            physical_row = physical_block * INDEX_PAGE + logical_begin % INDEX_PAGE
-                            payload_bytes = pl.load(
-                                cache_flat,
-                                [physical_row, 0],
-                                [INDEX_SCORE_TILE, INDEX_DIM // 2],
-                            )
-                            payload_signed = pl.reinterpret_view(payload_bytes, pl.INT8)
-                            payload_i32 = pl.ands(pl.cast(payload_signed, pl.INT32), 255)
-                            low = pl.ands(payload_i32, 15)
-                            high = pl.ands(pl.shrs(payload_i32, 4), 15)
-                            low = pl.reshape(low, [1, INDEX_PACKED_ELEMENTS])
-                            high = pl.reshape(high, [1, INDEX_PACKED_ELEMENTS])
-                            combined_codes = pl.concat(low, high)
-                            output_ids = pl.tile.arange(
-                                0,
-                                [1, INDEX_SCORE_TILE * INDEX_DIM],
-                                dtype=pl.INT32,
-                            )
-                            pair_ids = pl.shrs(output_ids, 1)
-                            parity = pl.ands(output_ids, 1)
-                            code_indices = pl.add(pair_ids, pl.mul(parity, INDEX_PACKED_ELEMENTS))
-                            code_tmp = pl.create_tile([1, INDEX_SCORE_TILE * INDEX_DIM], dtype=pl.INT32)
-                            payload_codes = pl.tile.gather(combined_codes, code_indices, code_tmp)
-                            payload_codes = pl.reshape(
-                                payload_codes,
-                                [INDEX_SCORE_TILE, INDEX_DIM],
-                            )
-                            magnitude_codes = pl.ands(payload_codes, 7)
-                            magnitude = pl.mul(pl.cast(magnitude_codes, pl.FP32), 0.5)
-                            extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 4), 0), 1)
-                            magnitude = pl.add(
-                                magnitude,
-                                pl.mul(pl.cast(extra, pl.FP32), 0.5),
-                            )
-                            extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 5), 0), 1)
-                            magnitude = pl.add(
-                                magnitude,
-                                pl.mul(pl.cast(extra, pl.FP32), 0.5),
-                            )
-                            extra = pl.minimum(pl.maximum(pl.sub(magnitude_codes, 6), 0), 1)
-                            magnitude = pl.add(
-                                magnitude,
-                                pl.mul(pl.cast(extra, pl.FP32), 1.5),
-                            )
-                            sign = pl.cast(pl.ands(pl.shrs(payload_codes, 3), 1), pl.FP32)
-                            sign_value = pl.add(pl.mul(sign, -2.0), 1.0)
-                            decoded_payload = pl.mul(magnitude, sign_value)
-                            payload_fp32 = pl.reshape(
-                                decoded_payload,
-                                [INDEX_SCORE_TILE * (INDEX_DIM // INDEX_CACHE_GROUP), INDEX_CACHE_GROUP],
-                            )
-                            scale_rows = pl.load(
-                                scale_flat,
-                                [physical_row, 0],
-                                [INDEX_SCORE_TILE, 32],
-                                valid_shape=[INDEX_SCORE_TILE, INDEX_DIM // INDEX_CACHE_GROUP],
-                            )
-                            # Pad the encoded bytes before decoding the E8M0 scales.
-                            signed_scale_codes_reinterpret_view = pl.reinterpret_view(scale_rows, pl.UINT8)
-                            signed_scale_codes = pl.reinterpret_view(signed_scale_codes_reinterpret_view, pl.INT8)
-                            signed_scale_codes_fillpad = pl.tile.fillpad(signed_scale_codes, pad_value=pl.PadValue.zero)
-                            signed_scale_codes = pl.tile.set_validshape(signed_scale_codes_fillpad, INDEX_SCORE_TILE, 32)
-                            signed_codes = pl.cast(signed_scale_codes, pl.INT32)
-                            codes = pl.ands(signed_codes, 255)
-                            scale_bits = pl.maximum(pl.shls(codes, 23), 4194304)
-                            scale_values = pl.reinterpret_view(scale_bits, pl.FP32)
-                            scale_flattened = pl.reshape(scale_values, [1, INDEX_SCORE_TILE * 32])
-                            group_ids = pl.tile.arange(
-                                0,
-                                [1, INDEX_SCORE_TILE * (INDEX_DIM // INDEX_CACHE_GROUP)],
-                                dtype=pl.INT32,
-                            )
-                            group_rows = pl.cast(
-                                pl.div(pl.cast(group_ids, pl.FP32), INDEX_DIM // INDEX_CACHE_GROUP),
-                                pl.INT32,
-                                mode="trunc",
-                            )
-                            group_columns = pl.sub(
-                                group_ids,
-                                pl.mul(group_rows, INDEX_DIM // INDEX_CACHE_GROUP),
-                            )
-                            scale_indices = pl.add(
-                                pl.mul(group_rows, 32),
-                                group_columns,
-                            )
-                            gather_tmp = pl.create_tile([1, INDEX_SCORE_TILE * 4], dtype=pl.INT32)
-                            scale_vector = pl.tile.gather(scale_flattened, scale_indices, gather_tmp)
-                            payload_transposed = pl.tile.transpose(payload_fp32, 0, 1)
-                            scaled_transposed = pl.col_expand_mul(payload_transposed, scale_vector)
-                            key_fp32 = pl.tile.transpose(scaled_transposed, 0, 1)
-                            keys = pl.cast(pl.reshape(key_fp32, [INDEX_SCORE_TILE, INDEX_DIM]), pl.BF16, mode="rint")
-                            query_row = token * INDEX_H
-                            query = pl.load(
-                                query_flat, [query_row, 0], [INDEX_H, INDEX_DIM],
-                                target_memory=pl.MemorySpace.Vec,
-                            )
-                            # Materialize ND layout before the A5 vector-to-cube NZ transfer.
-                            keys_transposed = pl.tile.transpose(keys, 0, 1)
-                            dot = pl.matmul(query, keys_transposed, out_dtype=pl.FP32)
-                            head_scores = pl.cast(dot, pl.BF16, mode="rint")
-                            head_scores = pl.maximum(pl.cast(head_scores, pl.FP32), 0.0)
-                            weights = pl.reshape(
-                                pl.load(index_weights, [token, 0], [1, INDEX_H]),
-                                [INDEX_H, 1],
-                            )
-                            weighted = pl.row_expand_mul(head_scores, pl.cast(weights, pl.FP32))
-                            weighted = pl.cast(weighted, pl.BF16, mode="rint")
-                            reduced = pl.col_sum(pl.cast(weighted, pl.FP32))
-                            rounded_score = pl.cast(reduced, pl.BF16, mode="rint")
-                            computed_score = pl.reshape(pl.cast(rounded_score, pl.FP32), [1, INDEX_SCORE_TILE])
-                            if use_candidates:
-                                candidate_u8 = pl.load(
-                                    candidate_mask,
-                                    [token, logical_begin],
-                                    [1, INDEX_SCORE_TILE],
-                                )
-                                candidate_i8 = pl.reinterpret_view(candidate_u8, pl.INT8)
-                                candidate = pl.cast(pl.cast(candidate_i8, pl.INT32), pl.FP32)
-                                filtered_score = pl.add(
-                                    computed_score,
-                                    pl.mul(pl.sub(candidate, 1.0), 1e30),
-                                )
-                            else:
-                                filtered_score = computed_score
-                            valid_count = pl.min(INDEX_SCORE_TILE, visible - logical_begin)
-                            valid_score = pl.fillpad(
-                                pl.set_validshape(filtered_score, 1, valid_count),
-                                pad_value=pl.PadValue.min,
-                            )
-                            stored_score = pl.maximum(
-                                valid_score,
-                                pl.tile.full([1, INDEX_SCORE_TILE], dtype=pl.FP32, value=-1e30),
-                            )
-                            pl.store(stored_score, [token, logical_begin], scores)
-            score_completion[0] = score_tid
 
-        if direct_topk:
-            with pl.spmd(num_tokens, name_hint="c1a_index_topk_direct", deps=[score_completion[0]]) as direct_tid:
-                token = pl.tile.get_block_idx()
-                request = pl.read(request_ids, [token])
-                visible_i32 = pl.read(compressed_lens, [token])
-                direct_visible = pl.cast(pl.min(visible_i32, positions), pl.INDEX)
-                for lane in pl.range(INDEX_TOPK):
-                    physical_row_i32 = pl.cast(-1, pl.INT32)
-                    if lane < direct_visible:
-                        direct_page = lane // INDEX_PAGE
-                        direct_offset = lane % INDEX_PAGE
-                        direct_block = pl.read(index_block_table, [request, direct_page])
-                        physical_row_i32 = pl.cast(
-                            direct_block * INDEX_PAGE + direct_offset,
-                            pl.INT32,
-                        )
-                    pl.write(topk_indices, [token, lane], physical_row_i32)
-                direct_scores = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=0.0)
-                pl.store(direct_scores, [token, 0], scores)
-            score_completion[0] = direct_tid
+@pl.jit.inline(auto_scope=False)
+def _select_c2a_topk(
+    scores: pl.Tensor,
+    lengths: pl.Tensor,
+    requests: pl.Tensor,
+    table: pl.Tensor,
+    cache_pages: pl.Scalar[pl.INDEX],
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    """Fold 2048-key leaves into the original running physical-row Top-K."""
+    tokens = pl.tensor.dim(scores, 0)
+    width = pl.tensor.dim(scores, 1)
+    leaf_rows = pl.create_tensor([tokens, LEAF], dtype=pl.INT32)
+    with pl.spmd(num_tokens, name_hint="prefill_c2a_topk", deps=[ready]) as selected:
+        token = pl.tile.get_block_idx()
+        request = pl.read(requests, [token])
+        length = pl.min(pl.max(pl.read(lengths, [token]), 0), width)
+        empty = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+        pl.store(empty, [token, 0], output)
+        if length <= INDEX_TOPK:
+            written = pl.cast(0, pl.INDEX)
+            for part in pl.range(INDEX_TOPK // 128):
+                begin = part * 128
+                if begin < length and request >= 0 and request < pl.tensor.dim(table, 0):
+                    page = pl.read(table, [request, part])
+                    if page >= 0 and page < cache_pages:
+                        count = pl.min(128, length - begin)
+                        short_rows = pl.add(pl.tile.arange(0, [1, 128], dtype=pl.INT32), pl.cast(page * 128, pl.INT32))
+                        pl.store(pl.set_validshape(short_rows, 1, count), [token, written], output)
+                        written = written + count
         else:
-            root_rows = tokens * TOPK_GROUPS_PER_TOKEN
-            pair_arena = pl.create_tensor(
-                [tokens * (TOPK_GROUPS_PER_TOKEN + TOPK_GROUP_LEAVES), TOPK_PAIR_WIDTH],
-                dtype=pl.FP32,
-            )
-            with pl.spmd(
-                num_tokens,
-                name_hint="c1a_index_topk_group_wave",
-                deps=[score_completion[0]],
-            ) as group_tid:
-                token = pl.tile.get_block_idx()
-                group_visible_i32 = pl.read(compressed_lens, [token])
-                group_visible = pl.cast(pl.min(group_visible_i32, positions), pl.INDEX)
-                work_visible = pl.max(group_visible, 1)
-                leaf_count = (work_visible + TOPK_LEAF - 1) // TOPK_LEAF
-                group_count = (leaf_count + TOPK_GROUP_LEAVES - 1) // TOPK_GROUP_LEAVES
-                scratch_base = root_rows + token * TOPK_GROUP_LEAVES
-                for group in pl.range(group_count):
-                    leaf_begin = group * TOPK_GROUP_LEAVES
-                    group_leaf_count = pl.min(TOPK_GROUP_LEAVES, leaf_count - leaf_begin)
-                    root_slot = token * TOPK_GROUPS_PER_TOKEN + group
-                    if group_leaf_count == 1:
-                        group_logical_begin = leaf_begin * TOPK_LEAF
-                        group_valid_count = pl.min(
-                            TOPK_LEAF,
-                            work_visible - group_logical_begin,
-                        )
-                        _sort_topk_leaf(
-                            scores,
-                            pair_arena,
-                            token,
-                            group_logical_begin,
-                            group_valid_count,
-                            root_slot,
-                        )
-                    else:
-                        for group_leaf in pl.unroll(TOPK_GROUP_LEAVES):
-                            leaf = leaf_begin + group_leaf
-                            scratch_logical_begin = leaf * TOPK_LEAF
-                            scratch_valid_count = pl.min(
-                                TOPK_LEAF,
-                                work_visible - scratch_logical_begin,
-                            )
-                            _sort_topk_leaf(
-                                scores,
-                                pair_arena,
-                                token,
-                                scratch_logical_begin,
-                                scratch_valid_count,
-                                scratch_base + group_leaf,
-                            )
-                        _merge_topk_pairs(
-                            pair_arena,
-                            scratch_base,
-                            scratch_base + 1,
-                            root_slot,
-                        )
-
-            with pl.spmd(num_tokens, name_hint="c1a_index_topk_merge", deps=[group_tid]) as merge_tid:
-                token = pl.tile.get_block_idx()
-                request = pl.read(request_ids, [token])
-                merge_visible_i32 = pl.read(compressed_lens, [token])
-                merge_visible = pl.cast(pl.min(merge_visible_i32, positions), pl.INDEX)
-                if merge_visible <= INDEX_TOPK:
-                    short_indices = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
-                    for lane in pl.range(INDEX_TOPK):
-                        physical_row_i32 = pl.cast(-1, pl.INT32)
-                        if lane < merge_visible:
-                            direct_page = lane // INDEX_PAGE
-                            direct_offset = lane % INDEX_PAGE
-                            direct_block = pl.read(index_block_table, [request, direct_page])
-                            physical_row_i32 = pl.cast(
-                                direct_block * INDEX_PAGE + direct_offset,
-                                pl.INT32,
-                            )
-                        pl.tile.write(short_indices, [0, lane], physical_row_i32)
-                    pl.store(short_indices, [token, 0], topk_indices)
-                else:
-                    leaf_count = (merge_visible + TOPK_LEAF - 1) // TOPK_LEAF
-                    count = (leaf_count + TOPK_GROUP_LEAVES - 1) // TOPK_GROUP_LEAVES
-                    arena_base = token * TOPK_GROUPS_PER_TOKEN
-                    if count > 1:
-                        count = _merge_topk_level(pair_arena, arena_base, count)
-                    if count > 1:
-                        count = _merge_topk_level(pair_arena, arena_base, count)
-                    if count > 1:
-                        count = _merge_topk_level(pair_arena, arena_base, count)
-                    if count > 1:
-                        count = _merge_topk_level(pair_arena, arena_base, count)
-                    if count > 1:
-                        count = _merge_topk_level(pair_arena, arena_base, count)
-                    if count > 1:
-                        count = _merge_topk_level(pair_arena, arena_base, count)
-                    root = pl.load(pair_arena, [arena_base, 0], [1, TOPK_PAIR_WIDTH])
-                    root_scores = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P0101)
-                    cutoff = pl.tile.read(root_scores, [0, INDEX_TOPK - 1])
-                    root_ones = pl.tile.full([1, INDEX_TOPK], dtype=pl.FP32, value=1.0)
-                    above_flags = pl.tile.select(pl.tile.cmps(root_scores, cutoff, cmp_type=4), root_ones, 0.0)
-                    sums64 = pl.col_sum(pl.reshape(above_flags, [8, 64]))
-                    sums8 = pl.col_sum(pl.reshape(sums64, [8, 8]))
-                    above = pl.cast(0, pl.INDEX)
-                    for lane in pl.unroll(8):
-                        partial = pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
-                        above = above + pl.cast(partial, pl.INDEX)
-                    materialize_index_topk(
-                        scores, index_block_table, request_ids, topk_indices,
-                        token, merge_visible, cutoff, INDEX_TOPK - above,
-                    )
-
-            score_completion[0] = merge_tid
-        return score_completion[0]
-
-    if max_logits_bytes < TOPK_LEAF * 4:
-        raise ValueError("the score budget must hold at least one Top-K leaf")
-
-    @pl.jit.inline(auto_scope=False)
-    def paged_indexer(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-        request_ids: pl.Tensor[[T_DYN], pl.INT32],
-        compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-        index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-        index_cache_scale: pl.Tensor[
-            [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0,
-        ],
-        index_block_table: pl.Tensor,
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
-        index_wq_b_scale: pl.Tensor[
-            [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN,
-        ],
-        index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
-        candidate_mask: pl.Tensor,
-        topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-        num_tokens: pl.Scalar[pl.INT32],
-        cache_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        """Score and select query chunks within the FP32 logits budget."""
-        positions = pl.tensor.dim(candidate_mask, 1)
-        score_width = (positions + TOPK_LEAF - 1) // TOPK_LEAF * TOPK_LEAF
-        completion = pl.array.create(1, pl.TASK_ID)
-        completion[0] = cache_ready
-        if num_tokens > 0:
-            active_tokens = pl.cast(num_tokens, pl.INDEX)
-            budget_rows = pl.max(1, max_logits_bytes // (score_width * 4))
-            chunk_tokens = pl.min(active_tokens, pl.min(INDEX_QUERY_TILE, budget_rows))
-            scores = pl.create_tensor([chunk_tokens, score_width], dtype=pl.FP32)
-            for begin in pl.range(0, active_tokens, chunk_tokens):
-                with pl.scope():
-                    rows = pl.min(chunk_tokens, active_tokens - begin)
-                    chunk_x = pl.slice(x, [rows, D], [begin, 0])
-                    chunk_latent = pl.slice(query_latent, [rows, Q_LORA], [begin, 0])
-                    chunk_requests = pl.slice(request_ids, [rows], [begin])
-                    chunk_lens = pl.slice(compressed_lens, [rows], [begin])
-                    chunk_cos = pl.slice(rope_cos, [rows, ROPE_DIM // 2], [begin, 0])
-                    chunk_sin = pl.slice(rope_sin, [rows, ROPE_DIM // 2], [begin, 0])
-                    chunk_candidates = pl.slice(candidate_mask, [rows, positions], [begin, 0])
-                    chunk_topk = pl.slice(topk_indices, [rows, INDEX_TOPK], [begin, 0])
-                    chunk_scores = pl.slice(scores, [rows, score_width], [0, 0])
-                    chunk_count = pl.cast(rows, pl.INT32)
-                    topk_tid = paged_indexer_chunk(
-                        chunk_x, chunk_latent, chunk_requests, chunk_lens,
-                        index_cache, index_cache_scale, index_block_table,
-                        chunk_cos, chunk_sin, index_wq_b, index_wq_b_scale,
-                        index_weights_proj, chunk_candidates, chunk_scores, chunk_topk,
-                        chunk_count, completion[0],
-                    )
-                    if use_candidates:
-                        completion[0] = topk_tid
-                    else:
-                        candidate_tid = _hierarchical_sparse_indexer(chunk_scores, chunk_lens, chunk_candidates)
-                        # Join both score readers before the next chunk overwrites the arena.
-                        completion[0] = pl.system.task_dummy(deps=[topk_tid, candidate_tid])
-        return completion[0]
-
-    return paged_indexer
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_c1a_index_key_project(
-    source: pl.Tensor,
-    weight: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    ready = pl.system.task_dummy(deps=[])
-    result, completed = bf16_gemm_staged(
-        source, weight, output, num_tokens, ready,
-        width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint='prefill_bf16_projection_cube',
-    )
-    return result
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_c1a_index_key_rope(
-    x: pl.Tensor,
-    cos: pl.Tensor,
-    sin: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    blocks = num_tokens
-    workers = pl.min(blocks, 2147483647)
-    for worker in pl.spmd(workers, name_hint='attention_rope'):
-        for block in pl.range(worker, blocks, workers):
-            _index_key_rope_block(x, cos, sin, output, block)
-    return output
-
-
-prefill_c1a_index = make_paged_indexer()
-
-
-prefill_c1a_reindex = make_paged_indexer(use_candidates=True)
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_c1a_select(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-    index_cache_scale: pl.Tensor[
-        [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0,
-    ],
-    index_block_table: pl.Tensor,
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
-    index_wq_b_scale: pl.Tensor[
-        [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN,
-    ],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
-    candidate_mask: pl.Tensor,
-    topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    use_candidates: pl.constexpr = True,
-):
-    if use_candidates:
-        ready = prefill_c1a_reindex(x, query_latent, request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table, rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj, candidate_mask, topk_indices, num_tokens, cache_ready)
-    else:
-        ready = prefill_c1a_index(x, query_latent, request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table, rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj, candidate_mask, topk_indices, num_tokens, cache_ready)
-    return ready
-
-
-IDX_SCALES = INDEX_DIM // 32
-
-
-IDX_PACKED = INDEX_DIM // 2
-
-
-FP4_MAX_INV = 1.0 / 6.0
-
-
-FP4_SCALE_FLOOR = 2.0**-9
-
-
-E8M0_FLOOR_BITS = 4194304
-
-
-SCORE_TILE = 64
-
-
-LEAF = 2048
-
-
-LEAF_TILES = LEAF // SCORE_TILE
-
-
-PAIR_WIDTH = 2 * INDEX_TOPK
-
-
-SORT_FLOOR = -3.0e38
-
-
-MASK_BIAS = 1.0e30
+            running = pl.tile.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=SORT_FLOOR)
+            for leaf, (previous,) in pl.range((length + LEAF - 1) // LEAF, init_values=(running,)):
+                begin = leaf * LEAF
+                for part in pl.range(LEAF // 128):
+                    logical = begin + part * 128
+                    physical_rows = pl.tile.full([1, 128], dtype=pl.INT32, value=-1)
+                    if logical < length and request >= 0 and request < pl.tensor.dim(table, 0):
+                        page = pl.read(table, [request, logical // 128])
+                        if page >= 0 and page < cache_pages:
+                            row_offsets = pl.tile.arange(0, [1, 128], dtype=pl.INT32)
+                            physical_rows = pl.add(row_offsets, pl.cast(page * 128, pl.INT32))
+                    pl.store(physical_rows, [token, part * 128], leaf_rows)
+                raw = pl.load(scores, [token, begin], [1, LEAF], valid_shape=[1, pl.min(LEAF, length - begin)])
+                padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
+                values = pl.maximum(padded, SORT_FLOOR)
+                leaf_row_ids = pl.load(leaf_rows, [token, 0], [1, LEAF])
+                pairs = pl.tile.sort32(values, pl.reinterpret_view(leaf_row_ids, pl.UINT32))
+                pairs = pl.tile.mrgsort(pairs, block_len=64)
+                pairs = pl.tile.mrgsort(pairs, block_len=256)
+                pairs = pl.tile.mrgsort(pairs, block_len=1024)
+                merge_tmp = pl.tile.create([1, 2 * TOPK_PAIR_WIDTH], dtype=pl.FP32)
+                merged = pl.tile.mrgsort(previous, pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0]), tmp=merge_tmp)
+                running = pl.yield_(pl.tile.slice(merged, [1, TOPK_PAIR_WIDTH], [0, 0]))
+            chosen_values = pl.tile.gather_mask(running, mask_pattern=pl.tile.MaskPattern.P0101)
+            chosen = pl.tile.gather_mask(running, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            valid = pl.tile.cmps(chosen_values, -1e29, cmp_type=4)
+            order_values = pl.tile.select(valid, pl.mul(pl.cast(chosen, pl.FP32), -1.0), SORT_FLOOR)
+            order_rows = pl.tile.select(valid, chosen, -1)
+            ordered = pl.tile.sort32(order_values, pl.reinterpret_view(order_rows, pl.UINT32))
+            ordered = pl.tile.mrgsort(ordered, block_len=64)
+            ordered = pl.tile.mrgsort(ordered, block_len=256)
+            final = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            pl.store(final, [token, 0], output)
+    return selected
 
 
 @pl.jit.inline
-def prefill_c2a_publish_index_key(
+def publish_index_key(
     keys: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8],
@@ -741,7 +544,12 @@ def prefill_c2a_publish_index_key(
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Publish index keys as packed E2M1 with group-32 E8M0 scales."""
+    """Publish C2A group-32 MXFP4 keys after cache_ready.
+
+    Scales have a 2**-9 floor and midpoint ties round toward zero;
+    publish_index_cache uses a 2**-126 floor and round-to-nearest-even.
+    Both payloads use the same group-32 MXFP4 scoring reader.
+    """
     blocks = pl.tensor.dim(cache, 0)
     cache_rows = blocks * 128
     flat = pl.reshape(cache, [cache_rows, IDX_PACKED])
@@ -767,244 +575,27 @@ def prefill_c2a_publish_index_key(
             step4 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 2.5), pl.INT32), 1), 31)
             step5 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32), 1), 31)
             step6 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 5.0), pl.INT32), 1), 31)
-            index = pl.add(
-                pl.add(pl.add(step0, step1), pl.add(step2, step3)),
-                pl.add(pl.add(step4, step5), pl.add(step6, 7)),
-            )
+            lower = pl.add(pl.add(step0, step1), pl.add(step2, step3))
+            upper = pl.add(pl.add(step4, step5), pl.add(step6, 7))
+            index = pl.add(lower, upper)
             sign = pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 31)
             codes = pl.reshape(pl.sub(index, pl.mul(sign, 8)), [1, INDEX_DIM * 8])
             low = pl.gather(codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32)
             high = pl.gather(codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
             packed = pl.add(low, pl.mul(high, 16))
             signed = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
-            flat[slot : slot + 1, :] = pl.set_validshape(
-                pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8), 1, IDX_PACKED
-            )
+            packed_bytes = pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
+            flat[slot : slot + 1, :] = pl.set_validshape(packed_bytes, 1, IDX_PACKED)
             signed_exponent = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
-            encoded = pl.reinterpret_view(
-                pl.reinterpret_view(pl.cast(signed_exponent, pl.INT8), pl.UINT8), pl.FP8E8M0
-            )
-            scale_flat[slot : slot + 1, :] = pl.set_validshape(
-                pl.reshape(encoded, [1, INDEX_DIM * 8 // 32]), 1, IDX_SCALES
-            )
+            scale_bytes = pl.reinterpret_view(pl.cast(signed_exponent, pl.INT8), pl.UINT8)
+            encoded = pl.reinterpret_view(scale_bytes, pl.FP8E8M0)
+            encoded_row = pl.reshape(encoded, [1, INDEX_DIM * 8 // 32])
+            scale_flat[slot : slot + 1, :] = pl.set_validshape(encoded_row, 1, IDX_SCALES)
     return publish_tid
 
 
 @pl.jit.inline
-def prefill_c2a_index_select(
-    query: pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM], pl.BF16],
-    weights: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
-    cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8],
-    scales: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0],
-    block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-    leaf_scores: pl.Tensor[[T_DYN, LEAF], pl.FP32],
-    leaf_rows: pl.Tensor[[T_DYN, LEAF], pl.INT32],
-    topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    publish_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Select up to INDEX_TOPK compressed cache rows per token.
-
-    A token that can reach at most INDEX_TOPK positions takes all of them and
-    never scores. Longer histories are scored one LEAF-sized block at a time and
-    folded into a running Top-K, so the sort width does not grow with context.
-    The sort carries physical cache rows, which removes a per-entry block-table
-    lookup from the result.
-    """
-    query_rows = pl.tensor.dim(query, 0) * INDEX_H
-    query_flat = pl.reshape(query, [query_rows, INDEX_DIM])
-    blocks = pl.tensor.dim(cache, 0)
-    cache_rows = blocks * 128
-    flat = pl.reshape(cache, [cache_rows, IDX_PACKED])
-    # Four E8M0 codes per row is below the 32-byte tile row, so the scale pool is
-    # read eight cache rows at a time and reshaped back to one row per key.
-    scale_wide = pl.reshape(scales, [cache_rows // 8, 32])
-    with pl.spmd(num_tokens, name_hint="c2a_index_select", deps=[publish_ready]) as select_tid:
-        t = pl.tile.get_block_idx()
-        length = pl.read(compressed_lens, [t])
-        request = pl.cast(pl.read(token_to_req_indices, [t]), pl.INDEX)
-        if length <= INDEX_TOPK:
-            for c in pl.range(INDEX_TOPK // SCORE_TILE):
-                p0 = c * SCORE_TILE
-                # Inactive tiles need no page-table entry.
-                if p0 < length:
-                    block_id = pl.read(block_table, [request, p0 // 128])
-                    ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
-                    # Integer scalars broadcast correctly into a tensor op; an FP32 runtime
-                    # scalar does not, and a one-element column is below the tile alignment.
-                    slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
-                    visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
-                    block_base = pl.cast(block_id * 128 + p0 % 128, pl.INT32)
-                    physical = pl.cast(pl.add(ramp, block_base), pl.FP32)
-                    masked = pl.sub(pl.mul(visible, pl.add(physical, 1.0)), 1.0)
-                    topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.cast(masked, pl.INT32, mode="rint")
-                else:
-                    topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.full(
-                        [1, SCORE_TILE], dtype=pl.INT32, value=-1
-                    )
-        else:
-            running = pl.tile.full([1, PAIR_WIDTH], dtype=pl.FP32, value=SORT_FLOOR)
-            weight_row = pl.reshape(pl.cast(weights[t : t + 1, :], pl.FP32), [INDEX_H, 1])
-            for leaf, (running_iter,) in pl.range((length + LEAF - 1) // LEAF, init_values=(running,)):
-                leaf_base = leaf * LEAF
-                for c in pl.range(LEAF_TILES):
-                    p0 = leaf_base + c * SCORE_TILE
-                    # The last leaf may extend beyond the visible page table.
-                    if p0 < length:
-                        block_id = pl.read(block_table, [request, p0 // 128])
-                        base = pl.cast(pl.max(block_id, 0), pl.INDEX) * 128 + p0 % 128
-                        packed = flat[base : base + SCORE_TILE, :]
-                        wide = pl.reinterpret_view(pl.cast(packed, target_type=pl.UINT16), pl.INT16)
-                        low = pl.ands(wide, 15)
-                        high = pl.ands(pl.shrs(wide, 4), 15)
-                        low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
-                        low_exponent = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.FP32)
-                        low_fraction = pl.cast(pl.ands(low, 1), pl.FP32)
-                        # Assemble the exact FP32 exponent for E2M1 exponent codes 0..3.
-                        low_exponent_i32 = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.INT32)
-                        low_exponent_bits = pl.shls(pl.add(low_exponent_i32, 127), 23)
-                        low_pow2 = pl.reinterpret_view(low_exponent_bits, pl.FP32)
-                        low_normal = pl.mul(pl.mul(low_pow2, 0.5), pl.add(pl.mul(low_fraction, 0.5), 1.0))
-                        low_is_normal = pl.minimum(low_exponent, 1.0)
-                        low_magnitude = pl.add(
-                            pl.mul(low_is_normal, low_normal),
-                            pl.mul(pl.mul(pl.sub(low_is_normal, 1.0), -1.0), pl.mul(low_fraction, 0.5)),
-                        )
-                        low_value = pl.mul(low_magnitude, pl.mul(pl.sub(pl.mul(low_sign, 2.0), 1.0), -1.0))
-                        high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
-                        high_exponent = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.FP32)
-                        high_fraction = pl.cast(pl.ands(high, 1), pl.FP32)
-                        # Assemble the exact FP32 exponent for E2M1 exponent codes 0..3.
-                        high_exponent_i32 = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.INT32)
-                        high_exponent_bits = pl.shls(pl.add(high_exponent_i32, 127), 23)
-                        high_pow2 = pl.reinterpret_view(high_exponent_bits, pl.FP32)
-                        high_normal = pl.mul(pl.mul(high_pow2, 0.5), pl.add(pl.mul(high_fraction, 0.5), 1.0))
-                        high_is_normal = pl.minimum(high_exponent, 1.0)
-                        high_magnitude = pl.add(
-                            pl.mul(high_is_normal, high_normal),
-                            pl.mul(pl.mul(pl.sub(high_is_normal, 1.0), -1.0), pl.mul(high_fraction, 0.5)),
-                        )
-                        high_value = pl.mul(high_magnitude, pl.mul(pl.sub(pl.mul(high_sign, 2.0), 1.0), -1.0))
-                        scale_tile = pl.slice(scale_wide, [SCORE_TILE // 8, 32], [base // 8, 0])
-                        raw_codes = pl.reinterpret_view(scale_tile, pl.UINT8)
-                        signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                        codes = pl.ands(signed_codes, 255)
-                        factors = pl.reinterpret_view(
-                            pl.maximum(pl.shls(codes, 23), E8M0_FLOOR_BITS), pl.FP32
-                        )
-                        factor_column = pl.reshape(factors, [SCORE_TILE * IDX_SCALES, 1])
-                        low_scaled = pl.reshape(
-                            pl.row_expand_mul(
-                                pl.reshape(low_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
-                            ),
-                            [SCORE_TILE, IDX_PACKED],
-                        )
-                        high_scaled = pl.reshape(
-                            pl.row_expand_mul(
-                                pl.reshape(high_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
-                            ),
-                            [SCORE_TILE, IDX_PACKED],
-                        )
-                        keys = pl.concat(
-                            pl.cast(low_scaled, pl.BF16, mode="rint"),
-                            pl.cast(high_scaled, pl.BF16, mode="rint"),
-                        )
-                        query_tile = query_flat[t * INDEX_H : t * INDEX_H + INDEX_H, :]
-                        scored = pl.maximum(pl.matmul(query_tile, keys, b_trans=True), 0.0)
-                        row = pl.col_sum(pl.row_expand_mul(scored, weight_row))
-                        ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
-                        slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
-                        visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
-                        row = pl.maximum(pl.add(row, pl.mul(pl.sub(visible, 1.0), MASK_BIAS)), SORT_FLOOR)
-                        leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = row
-                        leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.add(
-                            ramp, pl.cast(base, pl.INT32)
-                        )
-                    else:
-                        leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.full(
-                            [1, SCORE_TILE], dtype=pl.FP32, value=SORT_FLOOR
-                        )
-                        leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.full(
-                            [1, SCORE_TILE], dtype=pl.INT32, value=-1
-                        )
-                score_row = pl.load(leaf_scores, [t, 0], [1, LEAF], target_memory=pl.Mem.Vec)
-                row_ids = pl.load(leaf_rows, [t, 0], [1, LEAF], target_memory=pl.Mem.Vec)
-                pairs = pl.sort32(score_row, pl.reinterpret_view(row_ids, pl.UINT32))
-                pairs = pl.mrgsort(pairs, block_len=64)
-                pairs = pl.mrgsort(pairs, block_len=256)
-                pairs = pl.mrgsort(pairs, block_len=1024)
-                merge_tmp = pl.tile.create([1, 2 * PAIR_WIDTH], dtype=pl.FP32)
-                merged = pl.tile.mrgsort(
-                    running_iter, pl.tile.slice(pairs, [1, PAIR_WIDTH], [0, 0]), tmp=merge_tmp
-                )
-                running = pl.yield_(pl.tile.slice(merged, [1, PAIR_WIDTH], [0, 0]))
-            chosen = pl.tile.gather_mask(
-                running, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-            )
-            ordered = pl.sort32(
-                pl.mul(pl.cast(chosen, pl.FP32), -1.0), pl.reinterpret_view(chosen, pl.UINT32)
-            )
-            ordered = pl.mrgsort(ordered, block_len=64)
-            ordered = pl.mrgsort(ordered, block_len=256)
-            final = pl.tile.gather_mask(
-                pl.tile.slice(ordered, [1, PAIR_WIDTH], [0, 0]),
-                mask_pattern=pl.tile.MaskPattern.P1010,
-                output_dtype=pl.INT32,
-            )
-            topk_indices = pl.store(final, [t, 0], topk_indices)
-    return select_tid
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_c2a_project_index_q(
-    x: pl.Tensor,
-    weight: pl.Tensor,
-    scale: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    mxfp8_gemm(
-        x, weight, scale, output, num_tokens,
-        width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
-        n_tile=128, name_hint='attention_mx_projection',
-    )
-    return output
-
-
-@pl.jit.inline
-def prefill_c2a_rotate_index_key(
-    x: pl.Tensor,
-    cos: pl.Tensor,
-    sin: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    blocks = num_tokens
-    workers = pl.min(blocks, 2147483647)
-    for worker in pl.spmd(workers, name_hint="c2a_rope"):
-        for block in pl.range(worker, blocks, workers):
-            t = block
-            base = 0
-            output[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)]
-            tail = pl.cast(x[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM], pl.FP32)
-            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-            c = cos[t : t + 1, :]
-            s = pl.mul(sin[t : t + 1, :], 1.0)
-            re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-            im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-            rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-            rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-            rotated_bf16 = pl.cast(rotated, pl.BF16, mode="rint")
-            output[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM] = rotated_bf16
-    return output
-
-
-@pl.jit.inline
-def prefill_c2a_index_key_project(
+def prefill_index_key_project(
     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     weight: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
     norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
@@ -1012,18 +603,17 @@ def prefill_c2a_index_key_project(
     num_tokens: pl.Scalar[pl.INT32],
     pool_ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Stage the index-key projection before its normalization."""
+    """Project C2A keys, then normalize after the compressor pool_ready dependency."""
     tokens = pl.tensor.dim(latent, 0)
     projected = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    key_projection_ready = pl.system.task_dummy(deps=[])
-    key_projection_result, key_projection_tid = bf16_gemm_staged(
-        latent, weight,
-        projected,
-        num_tokens, key_projection_ready,
-        width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE,
-        k_tile=INDEX_PROJ_K_TILE, workers=2147483647, name_hint='prefill_bf16_projection_cube',
+    projection_ready = pl.system.task_dummy(deps=[])
+    projected_result, projected_tid = bf16_gemm_staged(
+        latent, weight, projected, num_tokens, projection_ready,
+        width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
+        workers=2147483647, name_hint="prefill_index_key",
     )
-    with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
+    norm_blocks = (num_tokens + M_TILE - 1) // M_TILE
+    with pl.spmd(norm_blocks, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
         t0 = pl.tile.get_block_idx() * M_TILE
         rows = pl.min(M_TILE, num_tokens - t0)
         value = pl.cast(pl.slice(projected, [M_TILE, INDEX_DIM], [t0, 0], valid_shape=[rows, INDEX_DIM]), pl.FP32)
@@ -1035,65 +625,267 @@ def prefill_c2a_index_key_project(
     return norm_tid
 
 
-@pl.jit.inline
-def prefill_c2a_index_weights(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D, INDEX_H], pl.BF16],
-    output: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
+@pl.jit.inline(auto_scope=False)
+def publish_c1a_index_key(
+    compressed_latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Preserve the index-weight rounding boundaries with a staged projection."""
-    tokens = pl.tensor.dim(x, 0)
-    projected = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-    weight_projection_ready = pl.system.task_dummy(deps=[])
-    weight_projection_result, weight_projection_tid = bf16_gemm_staged(
-        x, weight,
-        projected,
-        num_tokens, weight_projection_ready,
-        width=D, output_width=INDEX_H, n_tile=INDEX_WEIGHT_N_TILE,
-        k_tile=INDEX_PROJ_K_TILE, workers=2147483647, name_hint='prefill_bf16_projection_cube',
+    tokens = pl.tensor.dim(compressed_latent, 0)
+    index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    projection_ready = pl.system.task_dummy(deps=[])
+    projected_result, projected_tid = bf16_gemm_staged(
+        compressed_latent, index_wk, index_projection, num_tokens, projection_ready,
+        width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
+        workers=2147483647, name_hint="prefill_index_key",
     )
-    for block in pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="prefill_c2a_index_weight_scale"):
-        t0 = block * M_TILE
-        rows = pl.min(M_TILE, num_tokens - t0)
-        value = pl.cast(pl.slice(projected, [M_TILE, INDEX_H], [t0, 0], valid_shape=[rows, INDEX_H]), pl.FP32)
-        scaled = pl.cast(pl.mul(value, INDEX_DIM**-0.5), pl.BF16, mode="rint")
-        result = pl.cast(pl.mul(pl.cast(scaled, pl.FP32), INDEX_H**-0.5), pl.BF16, mode="rint")
-        output[t0 : t0 + M_TILE, :] = pl.set_validshape(result, rows, INDEX_H)
-    return output
+    index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    norm_blocks = (num_tokens + 7) // 8
+    for norm_worker in pl.spmd(pl.max(1, norm_blocks), name_hint="attention_rmsnorm"):
+        if norm_worker < norm_blocks:
+            rms_norm(index_projection, index_norm_weight, index_normalized, norm_worker, num_tokens, width=INDEX_DIM)
+    index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    _index_rope(
+        index_normalized, compressed_rope_cos, compressed_rope_sin, index_rotated, num_tokens,
+        heads=1, max_workers=2147483647,
+    )
+    index_ready = publish_index_cache(
+        index_rotated, compressed_slots, index_cache, index_cache_scale, num_tokens,
+    )
+    return index_ready
 
 
-@pl.jit.inline
-def prefill_c2a_index_query(
+@pl.jit.inline(auto_scope=False)
+def publish_c2a_index_key(
+    latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0],
+    num_tokens: pl.Scalar[pl.INT32],
+    pool_tid: pl.Scalar[pl.TASK_ID],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+):
+    tokens = pl.tensor.dim(latent, 0)
+    index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    prefill_index_key_project(latent, index_wk, index_norm_weight, index_key, num_tokens, pool_tid)
+    rotated_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    _index_rope(
+        index_key, compressed_rope_cos, compressed_rope_sin, rotated_key, num_tokens,
+        heads=1, max_workers=2147483647,
+    )
+    index_publish_tid = publish_index_key(
+        rotated_key, compressed_slots, index_cache, index_cache_scale, num_tokens, cache_ready
+    )
+    return index_publish_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _clear_inactive_pool(
+    ids: pl.Tensor,
+    counts: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    rows = pl.tensor.dim(ids, 0)
+    width = pl.tensor.dim(ids, 1)
+    first = pl.cast(pl.max(num_tokens, 0), pl.INDEX)
+    tiles = (width + 127) // 128
+    with pl.spmd(32, name_hint="prefill_inactive_pool_ids", deps=[ready]) as ids_tid:
+        worker = pl.tile.get_block_idx()
+        for work in pl.range(worker, (rows - first) * tiles, 32):
+            row = first + work // tiles
+            column = work % tiles * 128
+            invalid = pl.tile.full([1, 128], dtype=pl.INT32, value=-1)
+            pl.store(pl.set_validshape(invalid, 1, pl.min(128, width - column)), [row, column], ids)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_inactive_pool_counts", deps=[ids_tid]) as counts_tid:
+        for row in pl.range(first, rows):
+            pl.write(counts, [row], pl.cast(0, pl.INT32))
+    return counts_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_indexer(
     x: pl.Tensor,
+    latent: pl.Tensor,
+    request_ids: pl.Tensor,
+    lengths: pl.Tensor,
+    cache: pl.Tensor,
+    cache_scale: pl.Tensor,
+    table: pl.Tensor,
     cos: pl.Tensor,
     sin: pl.Tensor,
+    query_weight: pl.Tensor,
+    query_weight_scale: pl.Tensor,
+    weight_projection: pl.Tensor,
+    pool_ids: pl.Tensor,
+    pool_counts: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+    pool: pl.constexpr,
+    c2a: pl.constexpr,
 ):
-    blocks = num_tokens * INDEX_H
-    workers = pl.min(blocks, 64)
-    for worker in pl.spmd(workers, name_hint="c2a_rope"):
-        for block in pl.range(worker, blocks, workers):
-            t = block // INDEX_H
-            h = block % INDEX_H
-            base = h * INDEX_DIM
-            tail = pl.cast(x[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM], pl.FP32)
-            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-            c = cos[t : t + 1, :]
-            s = pl.mul(sin[t : t + 1, :], 1.0)
-            re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-            im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-            rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-            rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-            rotated_bf16 = pl.cast(rotated, pl.BF16, mode="rint")
-            # Preserve the RoPE BF16 rounding before the lossless lane permutation.
-            source = pl.concat(x[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)], rotated_bf16)
-            source_fp32 = pl.cast(source, pl.FP32)
-            even_lanes = pl.gather(source_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd_lanes = pl.gather(source_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
-            output[t : t + 1, base : base + INDEX_DIM // 2] = pl.cast(even_lanes, pl.BF16, mode="rint")
-            output[t : t + 1, base + INDEX_DIM // 2 : base + INDEX_DIM] = pl.cast(odd_lanes, pl.BF16, mode="rint")
-    return output
+    """Prepare queries, score bounded chunks, and select sparse cache rows."""
+    width = pl.tensor.dim(table, 1) * 128
+    if pool:
+        width = pl.tensor.dim(pool_ids, 1) * 8
+    width = (width + 127) // 128 * 128
+    completion = pl.array.create(1, pl.TASK_ID)
+    completion[0] = ready
+    if not pool and not c2a:
+        if num_tokens < pl.tensor.dim(x, 0):
+            cleared = _clear_inactive_pool(pool_ids, pool_counts, num_tokens, ready)
+            completion[0] = cleared
+    if num_tokens > 0:
+        active = pl.cast(num_tokens, pl.INDEX)
+        chunk = pl.min(active, pl.max(1, INDEX_MAX_LOGITS_BYTES // (width * 4)))
+        scores = pl.create_tensor([chunk, width], dtype=pl.FP32)
+        for begin in pl.range(0, active, chunk):
+            with pl.scope():
+                rows = pl.min(chunk, active - begin)
+                count = pl.cast(rows, pl.INT32)
+                chunk_x = pl.slice(x, [rows, D], [begin, 0])
+                chunk_latent = pl.slice(latent, [rows, Q_LORA], [begin, 0])
+                chunk_requests = pl.slice(request_ids, [rows], [begin])
+                chunk_lengths = pl.slice(lengths, [rows], [begin])
+                chunk_cos = pl.slice(cos, [rows, ROPE_DIM // 2], [begin, 0])
+                chunk_sin = pl.slice(sin, [rows, ROPE_DIM // 2], [begin, 0])
+                capacity = pl.tensor.dim(pool_ids, 1)
+                chunk_pool = pl.slice(pool_ids, [rows, capacity], [begin, 0])
+                chunk_counts = pl.slice(pool_counts, [rows], [begin])
+                chunk_output = pl.slice(output, [rows, INDEX_TOPK], [begin, 0])
+                chunk_scores = pl.slice(scores, [rows, width], [0, 0])
+                query = pl.create_tensor([rows, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
+                query_scale = pl.create_tensor([rows, INDEX_H * 4], dtype=pl.FP8E8M0)
+                weights = pl.create_tensor([rows, INDEX_H], dtype=pl.BF16)
+                maximum_visible = pl.cast(0, pl.INDEX)
+                paired = pl.cast(0, pl.INT32)
+                if not pool:
+                    if width >= 256:
+                        paired = pl.cast(rows % 2 == 0, pl.INT32)
+                    for token in pl.range(rows):
+                        if c2a:
+                            maximum_visible = pl.max(maximum_visible, pl.read(chunk_lengths, [token]))
+                        if token % 2 == 1:
+                            if pl.read(chunk_requests, [token]) != pl.read(chunk_requests, [token - 1]):
+                                paired = pl.cast(0, pl.INT32)
+                chunk_ready = completion[0]
+                scoring = pl.array.create(1, pl.TASK_ID)
+                scoring[0] = chunk_ready
+                if not c2a or maximum_visible > INDEX_TOPK:
+                    query_tid, weights_tid = prepare_prefill_index_query(
+                        chunk_x, chunk_latent, query_weight, query_weight_scale, weight_projection,
+                        chunk_cos, chunk_sin, query, query_scale, weights, count, chunk_ready,
+                    )
+                    prepared = pl.system.task_dummy(deps=[query_tid, weights_tid])
+                    if paired != 0:
+                        paired_tid = _prefill_index_scores(
+                            query, query_scale, weights, cache, cache_scale, table,
+                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                            count, prepared, tile_n=256, query_tile=2, pool=False, skip_short=c2a,
+                            head_rows=2 * INDEX_H, part_rows=128,
+                        )
+                        scoring[0] = paired_tid
+                    else:
+                        general_tid = _prefill_index_scores(
+                            query, query_scale, weights, cache, cache_scale, table,
+                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                            count, prepared, tile_n=128, query_tile=1, pool=pool, skip_short=c2a,
+                            head_rows=INDEX_H, part_rows=8 if pool else 128,
+                        )
+                        scoring[0] = general_tid
+                score_ready = scoring[0]
+                selection = pl.array.create(1, pl.TASK_ID)
+                selection[0] = score_ready
+                if c2a:
+                    selected = _select_c2a_topk(chunk_scores, chunk_lengths, chunk_requests,
+                                              table, pl.tensor.dim(cache, 0), chunk_output, count, score_ready)
+                    selection[0] = selected
+                else:
+                    selected = _select_c1a_topk(
+                        chunk_scores, chunk_lengths, chunk_requests, table,
+                        chunk_pool, chunk_counts, chunk_output, count, score_ready, pool=pool,
+                    )
+                    selection[0] = selected
+                topk_ready = selection[0]
+                completion[0] = topk_ready
+                if not pool and not c2a:
+                    pool_ready = select_candidate_block_pool(chunk_scores, chunk_lengths, chunk_pool,
+                                                            chunk_counts, count, score_ready)
+                    completion[0] = pl.system.task_dummy(deps=[topk_ready, pool_ready])
+    return completion[0]
+
+
+def golden_prefill_indexer(
+    x, qr, request_ids, index_cache, block_table, compressed_lens,
+    wq_b, wq_b_scale, weights_proj, cos, sin, *,
+    pool_block_ids=None, pool_block_counts=None, c2a=False, topk=INDEX_TOPK,
+):
+    """Reference logical FP4 queries, BF16 rounding, and sparse physical-row selection."""
+    tokens = x.shape[0]
+    width = int(compressed_lens.max()) if tokens else 0
+    scores = torch.full((tokens, width), -torch.inf, dtype=torch.float32)
+    selected = torch.full((tokens, topk), -1, dtype=torch.int32)
+    query = golden_mxfp8_linear(qr, wq_b, wq_b_scale).reshape(tokens, INDEX_H, INDEX_DIM)
+    query = golden_rope_tail(query, cos, sin)
+    query = golden_index_query_fp4(query)
+    weights = (x.float() @ weights_proj.float()).bfloat16()
+    weights = (weights.float() * INDEX_SCORE_SCALE).bfloat16()
+    keys = index_cache.flatten(0, 1).squeeze(-2)
+    for token in range(tokens):
+        length = max(0, int(compressed_lens[token]))
+        positions = torch.arange(length)
+        if pool_block_ids is not None:
+            count = int(pool_block_counts[token])
+            positions = (pool_block_ids[token, :count, None].long() * 8 + torch.arange(8)).flatten()
+            positions = positions[(positions >= 0) & (positions < length)]
+        if not positions.numel():
+            continue
+        pages = block_table[int(request_ids[token]), positions // 128]
+        present = (pages >= 0) & (pages < index_cache.shape[0])
+        positions, pages = positions[present], pages[present]
+        physical = pages.long() * 128 + positions % 128
+        if c2a and length <= topk:
+            selected[token, :physical.numel()] = physical.int()
+            continue
+        dots = (query[token].float() @ keys[physical].T.float()).bfloat16().float().relu()
+        weighted = (dots * weights[token].float()[:, None]).bfloat16().float()
+        values = weighted.sum(0).bfloat16().float()
+        scores[token, positions] = values
+        count = min(topk, positions.numel())
+        if count:
+            chosen = torch.argsort(values, descending=True, stable=True)[:count]
+            order = physical[chosen].argsort() if c2a else positions[chosen].argsort()
+            selected[token, :count] = physical[chosen[order]].int()
+    return scores, selected
+
+
+def golden_prefill_index_scores(mode, rank, cache_outputs, inputs):
+    """Use the same Prefill profile for the existing cutoff comparator."""
+    from qkv_proj_rope import golden_qkv_proj_rope
+
+    payload = cache_outputs["index_cache"] if mode == "full" else inputs["index_cache"]
+    scales = cache_outputs["index_cache_scale"] if mode == "full" else inputs["index_cache_scale"]
+    keys = dequantize_mxfp4_cache(payload[rank], scales[rank], 32, "e8m0").bfloat16()
+    _, _, latent = golden_qkv_proj_rope(
+        inputs["x"][rank], inputs["wq_a"][rank], inputs["wq_a_scale"][rank], inputs["q_norm_weight"][rank],
+        inputs["wq_b"][rank], inputs["wq_b_scale"][rank], inputs["wkv"][rank], inputs["wkv_scale"][rank],
+        inputs["kv_norm_weight"][rank], inputs["rope_cos"][rank], inputs["rope_sin"][rank],
+    )
+    pool = {} if mode == "full" else {name: inputs[name][rank] for name in ("pool_block_ids", "pool_block_counts")}
+    scores, _ = golden_prefill_indexer(
+        inputs["x"][rank], latent, inputs["request_ids"][rank], keys, inputs["index_block_table"][rank],
+        inputs["compressed_lens"][rank], inputs["index_wq_b"][rank], inputs["index_wq_b_scale"][rank],
+        inputs["index_weights_proj"][rank], inputs["rope_cos"][rank], inputs["rope_sin"][rank], **pool,
+    )
+    return scores
