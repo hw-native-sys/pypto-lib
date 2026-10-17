@@ -21,11 +21,11 @@ The deployment checkpoint is ``Eco-Tech/GLM-5.3-Flash-w8a8`` and its
 
 So there is a single flavour: int8 weights with an FP32 per-output-channel
 ``weight_scale``, and the activation quantized per token at run time. ``group_size:
-0`` means per-channel rather than grouped. Every quantized weight also ships a
-``weight_offset``, but it is **all zero** — measured across three tensors of 12288,
-2048 and 4096 channels — so the weight quantization is symmetric and the loader
-reads and discards the offset. There is no static-activation path and no
-SmoothQuant vector in this checkpoint.
+0`` means per-channel rather than grouped. The loader requires positive finite
+scales and checks each requested weight's ``weight_offset`` is zero before using
+the symmetric quantization path. It preserves the converted weights without
+applying offline smoothing or rotation a second time. Static activation
+quantization is not supported by this path.
 """
 
 import torch

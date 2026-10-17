@@ -19,13 +19,12 @@ removes the usual DeepSeek MLA rope/nope split and every rope table with it.
     kv_pass  = kv_a_layernorm(kv_a_proj_with_mqa(x))      [T, 512]
 
 ``q_resid`` is also the indexer's input, so this kernel publishes it separately
-rather than fusing the whole prolog. **Every MLA projection is BF16.** The released FP8 checkpoint quantizes
-``q_a_proj``, ``q_b_proj``, ``kv_a_proj_with_mqa`` and ``o_proj`` blockwise, but the
-deployment checkpoint — ``Eco-Tech/GLM-5.3-Flash-w8a8`` on modelers.cn, which is
-what the 16-card A3 recipe serves — does not: its ``quant_model_description.json``
-marks all of them ``FLOAT``, and the shards confirm it (``q_b_proj.weight`` is BF16
-``[16384, 1536]``). W8A8_DYNAMIC in that checkpoint covers the FFN and nothing else.
-This differs from the a2a3 sibling port, which does keep its ``wq_b`` INT8
+rather than fusing the whole prolog. The current kernel accepts BF16 projections.
+W8A8 checkpoints can store ``q_a_proj``, ``q_b_proj``, ``kv_a_proj_with_mqa`` and
+``o_proj`` as INT8 with per-output-channel scales. The checkpoint loader explicitly
+dequantizes those weights to BF16 for this ABI, according to the quantization
+description. This adaptation does not implement dynamic activation quantization
+inside MLA.
 
 **Prior art.** ``ops/pypto_python/impl/mla_prolog_pypto.py`` and its
 ``mla_prolog_quant_pypto.py`` sibling in cann-recipes-infer implement the MLA prolog
@@ -40,12 +39,12 @@ export, so treat them as algorithm and tiling references rather than code.
 The reference expands it per token and attends in full head space, which is right
 for prefill but throws away the point of the latent cache in decode. The absorbed
 form folds the key half into the query (giving a ``[H, KV_LORA]`` query that attends
-directly against the cached latent) and the value half into ``o_proj``. Both are
-weight-time transforms, so they live here rather than in a per-token kernel.
+directly against the cached latent) and the value half into ``o_proj``. The query
+transform runs per token; the output-weight transform runs once during loading.
 
 ``kv_b_proj`` has **no** ``weight_scale_inv`` in the checkpoint — it is BF16
-``[32768, 512]`` — so folding it into an INT8 ``o_proj`` is the numerical question
-the owner has to settle.
+``[32768, 512]``. The loader folds its value half into the prepared BF16 ``o_proj``
+using FP32 accumulation and rounds the result to BF16.
 """
 
 import sys
@@ -86,8 +85,8 @@ def golden_mla_prolog(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project one packed token batch into ``q_resid``, ``query`` and ``kv_latent``.
 
-    Every projection on this path is BF16 in the deployment checkpoint, so nothing is
-    quantized here, and ``qk_rope_head_dim`` is 0, so there is no rope half to split.
+    Every projection on this path has been prepared as BF16 by the loader, so nothing
+    is quantized here. ``qk_rope_head_dim`` is 0, so there is no rope half to split.
 
     ``query`` is projected from the **rounded** ``q_resid`` rather than from an FP32
     intermediate: ``q_resid`` is also published to the indexer, and both consumers must
@@ -546,7 +545,7 @@ def golden_absorb_output(w_v: torch.Tensor, w_o: torch.Tensor) -> torch.Tensor:
     Decode attends in latent space, so its context rows are ``[H, KV_LORA]`` and the
     value expansion never has to happen per token: ``o_proj @ (ctx @ w_v^T)`` equals
     ``(o_proj folded with w_v) @ ctx``. This is a weight-time transform, and both
-    operands are BF16 in the deployment checkpoint, so nothing is requantized.
+    operands have been prepared as BF16 by the loader, so nothing is requantized.
 
     Args:
         w_v: ``[H, V_DIM, KV_LORA]`` value half from :func:`golden_split_kv_b`.

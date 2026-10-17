@@ -14,9 +14,9 @@ by :mod:`models.glm5_3_flash.mla_prolog`. Both are row-parallel over heads, so t
 result is a partial sum that needs an all-reduce across the 16 ranks before mHC
 folds it back into the residual stream.
 
-``o_proj`` carries a ``weight_scale_inv`` in the released FP8 checkpoint but is
-**BF16** in the deployment W8A8 one (``[4096, 8192]``, marked ``FLOAT`` in
-``quant_model_description.json``), so neither path quantizes here.
+Both paths consume BF16 weights. When the checkpoint stores ``o_proj`` as W8A8
+INT8, the loader dequantizes it with its per-output-channel scales before slicing
+and absorption are complete. Neither epilog quantizes activations at runtime.
 """
 
 import sys
@@ -39,7 +39,7 @@ def golden_mla_epilog_prefill(
     attn_out: torch.Tensor,
     w_o: torch.Tensor,
 ) -> torch.Tensor:
-    """Head-space projection. ``o_proj`` is BF16 in the deployment checkpoint."""
+    """Head-space projection with the loader's prepared BF16 ``o_proj``."""
     flattened = attn_out.reshape(*attn_out.shape[:-2], -1)
     return torch.nn.functional.linear(flattened.float(), w_o.float())
 
