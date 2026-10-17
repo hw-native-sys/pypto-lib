@@ -21,7 +21,7 @@ from hierarchical_sparse_indexer import golden_paged_indexer as paged_indexer
 from hierarchical_sparse_indexer import select_candidate_blocks
 from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
-from o_proj import _project_output, golden_grouped_output
+from o_proj import golden_o_proj, golden_grouped_output
 from qkv_proj_rope import golden_rope_tail
 from rmsnorm import golden_rms_norm
 from golden import ScalarSpec, TensorSpec
@@ -94,9 +94,7 @@ PACKED_KEY_TILE = 64
 PACKED_KEY_PARTS = SELECTED_KEYS // PACKED_KEY_TILE
 
 
-M_TILE = 16
 
-ATTENTION_TILE = 32
 
 # SWA tiling.
 SWA_HEAD_TILE = 32
@@ -109,6 +107,88 @@ SWA_CROSS_CORE_SLOT_TILE = 1
 SWA_RUN_TILE = 32
 SWA_RUN_PARTS = SWA_WINDOW // SWA_RUN_TILE
 SWA_RUN_DESCRIPTOR_WIDTH = 8
+
+
+@pl.jit.inline
+def prefill_publish_window(
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    slots: pl.Tensor[[T_DYN], pl.INT64],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+):
+    with pl.spmd(num_tokens, name_hint="c1a_cache_publish", deps=[cache_ready]) as publish_tid:
+        t = pl.tile.get_block_idx()
+        _publish_window_row(kv, slots, cache, scales, t)
+    return publish_tid
+
+
+
+@pl.jit.inline
+def prefill_publish_window_batched(
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    slots: pl.Tensor[[T_DYN], pl.INT64],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+):
+    with pl.spmd(64, name_hint="prefill_swa_cache_publish", deps=[cache_ready]) as publish_tid:
+        worker = pl.tile.get_block_idx()
+        for t in pl.range(worker, num_tokens, 64):
+            _publish_window_row(kv, slots, cache, scales, t)
+    return publish_tid
+
+
+
+@pl.jit.inline
+def _publish_window_row(
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    slots: pl.Tensor[[T_DYN], pl.INT64],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    t: pl.Scalar[pl.INT32],
+):
+    blocks = pl.tensor.dim(cache, 0)
+    cache_rows = blocks * 128
+    flat = pl.tensor.view(cache, [cache_rows, HEAD_DIM])
+    scale_flat = pl.tensor.view(scales, [cache_rows, HEAD_DIM // 32])
+    slot_i64 = pl.read(slots, [t])
+    if slot_i64 >= 0:
+        slot = pl.cast(slot_i64, pl.INDEX)
+        source = pl.load(kv, [t, 0], [1, HEAD_DIM * 2], valid_shape=[1, HEAD_DIM])
+        source_padded = pl.fillpad(source, pad_value=pl.PadValue.zero)
+        source = pl.set_validshape(source_padded, 1, HEAD_DIM * 2)
+        source_fp32 = pl.cast(source, pl.FP32)
+        value = pl.reshape(source_fp32, [HEAD_DIM // 16, 32])
+        absolute = pl.abs(value)
+        reduce_tmp = pl.create_tile([HEAD_DIM // 16, 32], dtype=pl.FP32)
+        row_maximum = pl.row_max(absolute, tmp_tile=reduce_tmp)
+        amax = pl.maximum(row_maximum, 1e-4)
+        raw_scale = pl.mul(amax, 1.0 / 448.0)
+        scale = pl.cast(raw_scale, pl.BF16, mode="rint")
+        scale_fp32 = pl.cast(scale, pl.FP32)
+        normalized = pl.row_expand_div(value, scale_fp32)
+        payload = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
+        payload_row = pl.reshape(payload, [1, HEAD_DIM * 2])
+        flat = pl.store(pl.set_validshape(payload_row, 1, HEAD_DIM), [slot, 0], flat)
+        scale_row = pl.reshape(scale, [1, HEAD_DIM // 16])
+        scale_flat = pl.store(pl.set_validshape(scale_row, 1, HEAD_DIM // 32), [slot, 0], scale_flat)
+    return flat, scale_flat
+
+
+@pl.jit.inline(auto_scope=False)
+def publish_window_row(
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    slots: pl.Tensor[[T_DYN], pl.INT64],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    for t in pl.spmd(num_tokens, name_hint="swa_cache_publish"):
+        _publish_window_row(kv, slots, cache, scales, t)
+    return cache, scales
 
 
 @pl.jit.inline(auto_scope=False)
@@ -784,13 +864,6 @@ def swa_attention_packed(
     return output
 
 
-
-
-
-
-
-
-
 @pl.jit(auto_scope=False)
 def l2_sparse_attention_swa(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -1111,6 +1184,45 @@ def golden_swa_leaf(tensors, sharded=False, *, mode="decode"):
                     tensors["output"][base + offset][:count].copy_(reduced[first : first + count])
         else:
             tensors["output"][base:base + TP_SIZE].copy_(reduced.unsqueeze(0).expand(TP_SIZE, -1, -1))
+
+
+GOLDEN_SELECTED_KEY_TILE = 64
+
+
+def golden_selected_attention(q, window_value, window_indices, compressed_value, compressed_indices, sink):
+    """Attend selected paged KV rows with BF16 probability tiles and one sink."""
+    tokens, heads, head_dim = q.shape
+    gathered = torch.cat(
+        (
+            window_value.flatten(0, 1).squeeze(-2)[window_indices.clamp_min(0).long()],
+            compressed_value.flatten(0, 1).squeeze(-2)[compressed_indices.clamp_min(0).long()],
+        ),
+        dim=-2,
+    ).to(torch.bfloat16).float()
+    visible = torch.cat((window_indices >= 0, compressed_indices >= 0), dim=-1)
+    gathered = gathered.masked_fill(~visible.unsqueeze(-1), 0.0)
+    maximum = torch.full((tokens, heads), -1e30)
+    denominator = torch.zeros_like(maximum)
+    numerator = torch.zeros(tokens, heads, head_dim, dtype=torch.float32)
+    for start in range(0, gathered.shape[-2], GOLDEN_SELECTED_KEY_TILE):
+        tile = gathered[:, start : start + GOLDEN_SELECTED_KEY_TILE]
+        tile_visible = visible[:, None, start : start + GOLDEN_SELECTED_KEY_TILE]
+        logits = torch.einsum("thd,tkd->thk", q.float(), tile) * head_dim**-0.5
+        logits = logits.masked_fill(~tile_visible, -1e30)
+        next_maximum = torch.maximum(maximum, logits.amax(-1))
+        correction = torch.exp(maximum - next_maximum)
+        probabilities = torch.exp(logits - next_maximum.unsqueeze(-1))
+        probabilities = probabilities * tile_visible
+        denominator = denominator * correction + probabilities.sum(-1)
+        weights = probabilities.to(torch.bfloat16).float()
+        numerator = numerator * correction.unsqueeze(-1) + torch.einsum("thk,tkd->thd", weights, tile)
+        maximum = next_maximum
+    sink_value = sink.float().view(1, -1)
+    final_maximum = torch.maximum(maximum, sink_value)
+    correction = torch.exp(maximum - final_maximum)
+    denominator = denominator * correction + torch.exp(sink_value - final_maximum)
+    return (numerator * (correction / denominator).unsqueeze(-1)).to(q.dtype)
+
 
 
 def golden_prefill_c1a_attention(
@@ -1509,7 +1621,6 @@ def _attend_cube(
     output: pl.Tensor[[T_DYN, CUBE_HEADS * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     selected_ready: pl.Scalar[pl.TASK_ID],
-    query_ready: pl.Scalar[pl.TASK_ID],
 ):
     tokens = pl.tensor.dim(query, 0)
     head_rows = tokens * CUBE_HEADS
@@ -1518,7 +1629,7 @@ def _attend_cube(
     kflat = pl.reshape(selected, [cache_rows, HEAD_DIM])
     oflat = pl.reshape(output, [head_rows, HEAD_DIM])
     workers = pl.max(1, pl.min(num_tokens * ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE), WORKERS))
-    with pl.spmd(workers, name_hint="sparse_online_cube", deps=[selected_ready, query_ready], optimizations=[pl.cross_core_slot(slot_num=1)]) as attended:
+    with pl.spmd(workers, name_hint="sparse_online_cube", deps=[selected_ready], optimizations=[pl.cross_core_slot(slot_num=1)]) as attended:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, num_tokens * ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE), workers):
             token = block // ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE)
@@ -1580,7 +1691,6 @@ def _attend_padded(
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     selected_ready: pl.Scalar[pl.TASK_ID],
-    query_ready: pl.Scalar[pl.TASK_ID],
 ):
     # Cube uses at least 16 rows. TP8 retains only its eight real heads.
     rows = pl.tensor.dim(query, 0)
@@ -1591,7 +1701,7 @@ def _attend_padded(
     padded_sink_row = pl.reshape(padded_sink, [1, CUBE_HEADS])
     sink_row = pl.reshape(sink, [1, LOCAL_H])
     workers = pl.max(1, pl.min(num_tokens, WORKERS))
-    with pl.spmd(workers, name_hint="sparse_pad_heads", deps=[query_ready]) as padded:
+    with pl.spmd(workers, name_hint="sparse_pad_heads"):
         worker = pl.tile.get_block_idx()
         if worker == 0:
             sinks = pl.full([1, CUBE_HEADS], dtype=pl.FP32, value=0.0)
@@ -1607,7 +1717,7 @@ def _attend_padded(
     padded_output = pl.create_tensor([rows, CUBE_HEADS * HEAD_DIM], dtype=pl.BF16)
     cube_ready = _attend_cube(
         padded_query, selected, indices, padded_sink, padded_output,
-        num_tokens, selected_ready, padded,
+        num_tokens, selected_ready,
     )
     poflat = pl.reshape(padded_output, [rows * CUBE_HEADS, HEAD_DIM])
     oflat = pl.reshape(output, [rows * LOCAL_H, HEAD_DIM])
@@ -1621,6 +1731,7 @@ def _attend_padded(
 
 
 attend_selected = _attend_cube if LOCAL_H >= 16 else _attend_padded
+attend_c2a_chunk = make_attend_selected_chunk(vector_query=True)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1641,7 +1752,7 @@ def _attend_bf16_block(
     qbf16 = pl.create_tensor([rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     qbflat = pl.reshape(qbf16, [head_rows, HEAD_DIM])
     workers_q = pl.max(1, pl.min(rows * (LOCAL_H // QUERY_HEAD_TILE), WORKERS))
-    with pl.spmd(workers_q, name_hint="sparse_bf16_query", deps=[previous]) as query_ready:
+    with pl.spmd(workers_q, name_hint="sparse_bf16_query", deps=[previous]):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, rows * (LOCAL_H // QUERY_HEAD_TILE), workers_q):
             q0 = block * QUERY_HEAD_TILE
@@ -1684,7 +1795,7 @@ def _attend_bf16_block(
             pl.tile.store(valid, [token, column], indices)
 
     result = pl.create_tensor([rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attended = attend_selected(qbf16, selected, indices, sink, result, rows, selected_ready, query_ready)
+    attended = attend_selected(qbf16, selected, indices, sink, result, rows, selected_ready)
     rflat = pl.reshape(result, [head_rows, HEAD_DIM])
     oflat = pl.reshape(output, [head_rows, HEAD_DIM])
     with pl.spmd(workers_q, name_hint="sparse_bf16_output", deps=[attended]) as converted:
@@ -1872,7 +1983,7 @@ def _attend_cache_shared(
             decoded_window, decoded_compressed, wi, ci, selected, indices,
             count, window_ready, compressed_ready, previous,
         )
-        previous = attend_selected(q, selected, indices, sink, out, count, gathered, previous)
+        previous = attend_selected(q, selected, indices, sink, out, count, gathered)
     return output
 
 
@@ -1896,7 +2007,7 @@ def _attend_packed_block(
         window, window_scale, compressed, compressed_scale,
         window_indices, compressed_indices, selected, indices, num_tokens, query_ready,
     )
-    attended = attend_selected(query, selected, indices, sink, output, num_tokens, gathered, query_ready)
+    attended = attend_selected(query, selected, indices, sink, output, num_tokens, gathered)
     return attended
 
 
@@ -2192,7 +2303,7 @@ def golden_swa_attention(
     quantized_window = dequantize_mxfp8_cache(window_payload, updated_window_scale).to(query.dtype)
     window_stats = golden_paged_sparse_attention_stats(query, quantized_window, window_indices)
     attended = golden_merge_attention_stats((window_stats,), attn_sink).to(query.dtype)
-    output = _project_output(attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale)
+    output = golden_o_proj(attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale)
     return AttentionGoldenResult(
         output, window_payload, updated_window_scale, None, None, None, None, None, None, None
     )
@@ -2404,7 +2515,7 @@ def golden_compressed_attention(
     attended = attend(
         query, quantized_window, window_indices, quantized_compressed, topk_indices, attn_sink
     )
-    output = _project_output(
+    output = golden_o_proj(
         attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale,
         output_dtype=output_dtype, sequential_projection=sequential_query,
     )
@@ -2420,6 +2531,12 @@ def golden_compressed_attention(
         topk_indices,
         candidates,
     )
+
+
+
+
+prefill_attend_sparse = make_attend_selected_chunk(vector_query=True)
+
 
 
 if __name__ == "__main__":

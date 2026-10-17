@@ -23,7 +23,7 @@ import torch
 
 import config as C
 from config import BLOCK_SIZE, FLASH as M, TP_SIZE
-from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose
+from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose
 from rope_tables import precompute_rope_tables
 
 
@@ -85,7 +85,6 @@ INDEX_TOPK = M.index_topk
 
 CASE_DEFAULT = 'multi_1k'
 
-CASE_TOKENS = 64
 
 CASE_MAX_TOKENS = C.PREFILL_MAX_TOKENS
 
@@ -195,27 +194,6 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
     values['attn_norm_weight'] = _ranked(torch.randn(D).mul_(0.1).add_(1).to(torch.bfloat16))
     return values
 
-def make_tensor_specs(input_names: tuple[str, ...], output_names: tuple[str, ...], token_count: int=CASE_TOKENS, case_name: str=CASE_DEFAULT) -> list[TensorSpec | ScalarSpec]:
-    import torch
-    from golden import ScalarSpec, TensorSpec
-    from config import TP_SIZE
-    values = make_fixture_values(token_count, case_name)
-    token_count = values['x'].shape[1]
-    specs = [TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=values[name]) for name in input_names]
-    for name in output_names:
-        if name == 'topk_indices':
-            shape = [TP_SIZE, token_count, INDEX_TOPK]
-            dtype = torch.int32
-        elif name == 'candidate_mask':
-            shape = list(values['candidate_mask'].shape)
-            dtype = torch.uint8
-        else:
-            shape = [TP_SIZE, token_count, D]
-            dtype = torch.bfloat16
-        specs.append(TensorSpec(name, shape, dtype))
-    specs.append(ScalarSpec('num_tokens', torch.int32, token_count))
-    return specs
-
 def _copy_storage(destination: torch.Tensor, source: torch.Tensor) -> None:
     import torch
     destination.view(torch.uint8).copy_(source.contiguous().view(torch.uint8))
@@ -227,31 +205,6 @@ def _reduce_tp_partials(partials: list[torch.Tensor]) -> torch.Tensor:
     for partial in partials:
         reduced.add_(partial.float())
     return reduced.to(torch.bfloat16)
-
-def golden_prefill_tp_attention(attention_fn: Callable, hidden: torch.Tensor, attention_args: tuple[torch.Tensor, ...], tp_size: int) -> tuple[torch.Tensor, object]:
-    """Run one prefill attention golden per TP rank and reduce its FP32 partials.
-
-    The exported mHC helpers accept either one rank's attention arguments or rank-stacked
-    arguments (the first dimension is ``tp_size``).  Rank-stacked arguments reproduce the
-    sharded invocation; the local form remains available for CPU-side smoke checks.
-    """
-    import torch
-    ranked_args = bool(attention_args and isinstance(attention_args[0], torch.Tensor) and (attention_args[0].ndim >= 2) and (attention_args[0].shape[0] == tp_size))
-    results = []
-    for rank in range(tp_size):
-        rank_hidden = hidden
-        if hidden.ndim > 0 and hidden.shape[0] == tp_size and (hidden.ndim == 3):
-            rank_hidden = hidden[rank]
-        rank_args = attention_args
-        if ranked_args:
-            rank_args = tuple((argument[rank] for argument in attention_args))
-        result = attention_fn(rank_hidden, *rank_args)
-        results.append(result)
-        output = result.output
-        if output.ndim == rank_hidden.ndim + 1 and output.shape[0] == tp_size:
-            partials = [output[peer] for peer in range(tp_size)]
-            return (_reduce_tp_partials(partials), result)
-    return (_reduce_tp_partials([result.output for result in results]), results[0])
 
 def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, torch.Tensor], active_tokens: int | None=None) -> None:
     import torch
@@ -1475,38 +1428,11 @@ class AttentionGoldenResult:
     pool_block_counts: torch.Tensor | None = None
 
 
-BOUNDARY_PREFIX_NAMES = (
-    "x_hc",
-    "incoming_pre_mix",
-    "hc_attn_fn",
-    "hc_attn_scale",
-    "hc_attn_base",
-    "attn_norm_weight",
-)
 
 
-BOUNDARY_OUTPUT_NAMES = (
-    "attention_output",
-    "attention_hidden",
-    "attention_pre_mix",
-)
 
 
 SCALAR_NAMES = ("num_tokens", "attention_epoch")
-
-
-def owner_rows(actual, rank: int, active: int, *, tp_size: int | None = None) -> tuple[int, int, int]:
-    """Return ``(first, count, width)`` of *rank* inside a per-rank slab tensor.
-
-    The CPU mirror of :func:`slab_owner` for goldens and comparators: ``actual`` is
-    a ``[ranks, slab, ...]`` tensor, so its second extent is the physical slab and
-    its first one the number of ranks that participate (``tp_size`` when several
-    DP groups share the tensor).
-    """
-    width = actual.shape[1]
-    world = tp_size or actual.shape[0]
-    first, count, _ = sequence_parallel_bounds(active, world, rank % world, capacity=width * world)
-    return first, count, width
 
 
 def make_boundary_specs(args):
@@ -1606,14 +1532,6 @@ def wrap_attention_compare(compare):
         )
 
     return compare_hc
-
-
-def make_boundary_comparisons(compare_output):
-    """Build comparisons shared by every mHC-Attention composition boundary."""
-    return {
-        "attention_hidden": compare_output,
-        "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
-    }
 
 
 @dataclass(frozen=True)

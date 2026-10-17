@@ -37,7 +37,6 @@ from config import (
     T_DYN,
     BLOCK_SIZE,
     COMPRESSED_CACHE_GROUP,
-    DECODE_INPUT_MAX_TOKENS,
     DECODE_MAX_TOKENS,
     INDEX_CACHE_GROUP,
     STATE_CAPACITY,
@@ -49,12 +48,12 @@ from compressor import STATE_WIDTH
 from config import TP_SIZE
 
 
-from decode_c1a_full import decode_c1a_full_sharded
-from decode_c1a_reindex import decode_c1a_reindex_sharded
-from decode_c1a_reuse import decode_c1a_reuse_sharded
-from decode_c2a_full import decode_c2a_full_sharded
-from decode_c2a_reuse import decode_c2a_reuse_sharded
-from decode_swa import decode_swa_sharded
+from decode_c1a_full import decode_c1a_full
+from decode_c1a_reindex import decode_c1a_reindex
+from decode_c1a_reuse import decode_c1a_reuse
+from decode_c2a_full import decode_c2a_full
+from decode_c2a_reuse import decode_c2a_reuse
+from decode_swa import decode_swa
 from rope_tables import precompute_rope_tables
 from utils import build_forward_metadata
 from expert_routed import (
@@ -110,22 +109,9 @@ INDEX_CACHE_GROUP = INDEX_CACHE_GROUP
 STATE_CAPACITY = STATE_CAPACITY
 WINDOW_CACHE_GROUP = WINDOW_CACHE_GROUP
 
-BACKBONE_SCHEDULE = tuple(M.layer_config(layer_id) for layer_id in range(N_LAYERS))
 FIXTURE_BATCH = 12
 FIXTURE_SEQUENCE = 6
 FIXTURE_TOKENS = FIXTURE_BATCH * FIXTURE_SEQUENCE
-
-
-def cache_source_ordinals(layer_id: int) -> tuple[int | None, int | None, int | None]:
-    """Return packed KV, index, and C2A-state source ordinals for one layer."""
-    layer = M.layer_config(layer_id)
-    if layer.compression_ratio == 0:
-        return None, None, None
-    kv_sources = M.kv_source_layer_ids
-    kv_ordinal = kv_sources.index(layer.kv_source_layer_id)
-    index_ordinal = kv_ordinal
-    state_ordinal = kv_ordinal if layer.compression_ratio == 2 else None
-    return kv_ordinal, index_ordinal, state_ordinal
 
 
 FWD_ORI_BLOCKS_DYN = pl.dynamic("V41_FWD_ORI_BLOCKS_DYN")
@@ -201,10 +187,6 @@ def _decode_encoder(
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    attention_input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
-    attention_input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    attention_output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
-    attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -263,7 +245,6 @@ def _decode_encoder(
     pre_mix_pong = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
-    gathered = pl.create_tensor([global_tokens, D], dtype=pl.BF16)
     topk_indices = pl.create_tensor([global_tokens, INDEX_TOPK], dtype=pl.INT32)
     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
@@ -312,7 +293,7 @@ def _decode_encoder(
         pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [0 * (LOCAL_O_WIDTH // MX_GROUP), 0])
     )
     fwd_swa_layer_2_attention_output_l0 = pl.create_tensor([pl.tensor.dim(x_hc, 0), D], dtype=pl.BF16)
-    decode_swa_sharded(
+    decode_swa(
         x_hc,
         pre_mix,
         fwd_swa_layer_2_hc_fn_l0,
@@ -340,14 +321,7 @@ def _decode_encoder(
         fwd_swa_layer_2_attention_output_l0,
         attention_hidden,
         attention_pre_mix,
-        gathered,
-        attention_input_window,
-        attention_input_arrived,
-        attention_output_window,
-        attention_output_arrived,
-        rank,
         attention_count,
-        0 + 1,
     )
     fwd_moe_layer_8_routed_base_l0 = 0 * N_LOCAL_EXPERTS
     fwd_moe_layer_8_hc_ffn_fn_layer_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -503,7 +477,7 @@ def _decode_encoder(
         [LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN
     ] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [1 * (LOCAL_O_WIDTH // MX_GROUP), 0])
     fwd_swa_layer_10_attention_output_l1 = pl.create_tensor([pl.tensor.dim(x_pong, 0), D], dtype=pl.BF16)
-    decode_swa_sharded(
+    decode_swa(
         x_pong,
         pre_mix_pong,
         fwd_swa_layer_10_hc_fn_l1,
@@ -531,14 +505,7 @@ def _decode_encoder(
         fwd_swa_layer_10_attention_output_l1,
         attention_hidden,
         attention_pre_mix,
-        gathered,
-        attention_input_window,
-        attention_input_arrived,
-        attention_output_window,
-        attention_output_arrived,
-        rank,
         attention_count,
-        1 + 1,
     )
     fwd_moe_layer_16_routed_base_l1 = 1 * N_LOCAL_EXPERTS
     fwd_moe_layer_16_hc_ffn_fn_layer_l1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -764,10 +731,7 @@ def _decode_encoder(
         ] = pl.slice(
             wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [(c2a_block * 6 + 2) * (LOCAL_O_WIDTH // MX_GROUP), 0]
         )
-        fwd_c2a_full_layer_3_attention_output_l2 = pl.create_tensor(
-            [pl.tensor.dim(x_hc, 0), D], dtype=pl.BF16
-        )
-        decode_c2a_full_sharded(
+        decode_c2a_full(
             x_hc,
             pre_mix,
             fwd_c2a_full_layer_3_hc_fn_l2,
@@ -815,17 +779,9 @@ def _decode_encoder(
             fwd_attention_layer_1_index_wq_b_scale_source_l2,
             fwd_attention_layer_1_index_weights_proj_source_l2,
             topk_indices,
-            fwd_c2a_full_layer_3_attention_output_l2,
             attention_hidden,
             attention_pre_mix,
-            gathered,
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
-            rank,
             attention_count,
-            c2a_block * 6 + 2 + 1,
         )
         fwd_moe_layer_8_routed_base_l2 = (c2a_block * 6 + 2) * N_LOCAL_EXPERTS
         fwd_moe_layer_8_hc_ffn_fn_layer_l2: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -1017,10 +973,7 @@ def _decode_encoder(
         ] = pl.slice(
             wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [(c2a_block * 6 + 3) * (LOCAL_O_WIDTH // MX_GROUP), 0]
         )
-        fwd_c2a_reuse_layer_12_attention_output_l3 = pl.create_tensor(
-            [pl.tensor.dim(x_pong, 0), D], dtype=pl.BF16
-        )
-        decode_c2a_reuse_sharded(
+        decode_c2a_reuse(
             x_pong,
             pre_mix_pong,
             fwd_c2a_reuse_layer_12_hc_fn_l3,
@@ -1048,17 +1001,9 @@ def _decode_encoder(
             fwd_attention_layer_9_compressed_cache_l3,
             fwd_attention_layer_9_compressed_cache_scale_l3,
             topk_indices,
-            fwd_c2a_reuse_layer_12_attention_output_l3,
             attention_hidden,
             attention_pre_mix,
-            gathered,
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
-            rank,
             attention_count,
-            c2a_block * 6 + 3 + 1,
         )
         fwd_moe_layer_16_routed_base_l3 = (c2a_block * 6 + 3) * N_LOCAL_EXPERTS
         fwd_moe_layer_16_hc_ffn_fn_layer_l3: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -1250,10 +1195,7 @@ def _decode_encoder(
         ] = pl.slice(
             wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [(c2a_block * 6 + 4) * (LOCAL_O_WIDTH // MX_GROUP), 0]
         )
-        fwd_c2a_reuse_layer_4_attention_output_l4 = pl.create_tensor(
-            [pl.tensor.dim(x_hc, 0), D], dtype=pl.BF16
-        )
-        decode_c2a_reuse_sharded(
+        decode_c2a_reuse(
             x_hc,
             pre_mix,
             fwd_c2a_reuse_layer_4_hc_fn_l4,
@@ -1281,17 +1223,9 @@ def _decode_encoder(
             fwd_attention_layer_1_compressed_cache_l4,
             fwd_attention_layer_1_compressed_cache_scale_l4,
             topk_indices,
-            fwd_c2a_reuse_layer_4_attention_output_l4,
             attention_hidden,
             attention_pre_mix,
-            gathered,
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
-            rank,
             attention_count,
-            c2a_block * 6 + 4 + 1,
         )
         fwd_moe_layer_8_routed_base_l4 = (c2a_block * 6 + 4) * N_LOCAL_EXPERTS
         fwd_moe_layer_8_hc_ffn_fn_layer_l4: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -1483,10 +1417,7 @@ def _decode_encoder(
         ] = pl.slice(
             wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [(c2a_block * 6 + 5) * (LOCAL_O_WIDTH // MX_GROUP), 0]
         )
-        fwd_c2a_reuse_layer_12_attention_output_l5 = pl.create_tensor(
-            [pl.tensor.dim(x_pong, 0), D], dtype=pl.BF16
-        )
-        decode_c2a_reuse_sharded(
+        decode_c2a_reuse(
             x_pong,
             pre_mix_pong,
             fwd_c2a_reuse_layer_12_hc_fn_l5,
@@ -1514,17 +1445,9 @@ def _decode_encoder(
             fwd_attention_layer_9_compressed_cache_l5,
             fwd_attention_layer_9_compressed_cache_scale_l5,
             topk_indices,
-            fwd_c2a_reuse_layer_12_attention_output_l5,
             attention_hidden,
             attention_pre_mix,
-            gathered,
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
-            rank,
             attention_count,
-            c2a_block * 6 + 5 + 1,
         )
         fwd_moe_layer_16_routed_base_l5 = (c2a_block * 6 + 5) * N_LOCAL_EXPERTS
         fwd_moe_layer_16_hc_ffn_fn_layer_l5: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -1716,10 +1639,7 @@ def _decode_encoder(
         ] = pl.slice(
             wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [(c2a_block * 6 + 6) * (LOCAL_O_WIDTH // MX_GROUP), 0]
         )
-        fwd_c2a_reuse_layer_4_attention_output_l6 = pl.create_tensor(
-            [pl.tensor.dim(x_hc, 0), D], dtype=pl.BF16
-        )
-        decode_c2a_reuse_sharded(
+        decode_c2a_reuse(
             x_hc,
             pre_mix,
             fwd_c2a_reuse_layer_4_hc_fn_l6,
@@ -1747,17 +1667,9 @@ def _decode_encoder(
             fwd_attention_layer_1_compressed_cache_l6,
             fwd_attention_layer_1_compressed_cache_scale_l6,
             topk_indices,
-            fwd_c2a_reuse_layer_4_attention_output_l6,
             attention_hidden,
             attention_pre_mix,
-            gathered,
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
-            rank,
             attention_count,
-            c2a_block * 6 + 6 + 1,
         )
         fwd_moe_layer_8_routed_base_l6 = (c2a_block * 6 + 6) * N_LOCAL_EXPERTS
         fwd_moe_layer_8_hc_ffn_fn_layer_l6: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -1949,10 +1861,7 @@ def _decode_encoder(
         ] = pl.slice(
             wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [(c2a_block * 6 + 7) * (LOCAL_O_WIDTH // MX_GROUP), 0]
         )
-        fwd_c2a_reuse_layer_12_attention_output_l7 = pl.create_tensor(
-            [pl.tensor.dim(x_pong, 0), D], dtype=pl.BF16
-        )
-        decode_c2a_reuse_sharded(
+        decode_c2a_reuse(
             x_pong,
             pre_mix_pong,
             fwd_c2a_reuse_layer_12_hc_fn_l7,
@@ -1980,17 +1889,9 @@ def _decode_encoder(
             fwd_attention_layer_9_compressed_cache_l7,
             fwd_attention_layer_9_compressed_cache_scale_l7,
             topk_indices,
-            fwd_c2a_reuse_layer_12_attention_output_l7,
             attention_hidden,
             attention_pre_mix,
-            gathered,
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
-            rank,
             attention_count,
-            c2a_block * 6 + 7 + 1,
         )
         fwd_moe_layer_16_routed_base_l7 = (c2a_block * 6 + 7) * N_LOCAL_EXPERTS
         fwd_moe_layer_16_hc_ffn_fn_layer_l7: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -2179,10 +2080,6 @@ def _decode_decoder(
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    attention_input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
-    attention_input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    attention_output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
-    attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -2240,7 +2137,6 @@ def _decode_decoder(
     pre_mix_pong = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
-    gathered = pl.create_tensor([global_tokens, D], dtype=pl.BF16)
     topk_indices = pl.create_tensor([global_tokens, INDEX_TOPK], dtype=pl.INT32)
     # Sorted eight-token blocks shared by the four Decode Reindex layers.
     pool_blocks_raw = pl.tensor.dim(c1a_index_block_table, 1) * (BLOCK_SIZE // CANDIDATE_BLOCK_SIZE)
@@ -2339,62 +2235,32 @@ def _decode_decoder(
     fwd_c1a_full_layer_5_wo_b_scale_layer_l20: pl.Tensor[
         [LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN
     ] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [20 * (LOCAL_O_WIDTH // MX_GROUP), 0])
-    decode_c1a_full_sharded(
-        x_hc,
-        pre_mix,
-        fwd_c1a_full_layer_5_hc_fn_l20,
-        fwd_c1a_full_layer_5_hc_scale_l20,
-        fwd_c1a_full_layer_5_hc_base_l20,
+    decode_c1a_full(
+        x_hc, pre_mix,
+        fwd_c1a_full_layer_5_hc_fn_l20, fwd_c1a_full_layer_5_hc_scale_l20, fwd_c1a_full_layer_5_hc_base_l20,
         fwd_c1a_full_layer_5_norm_weight_l20,
-        fwd_c1a_full_layer_5_wq_a_layer_l20,
-        fwd_c1a_full_layer_5_wq_a_scale_layer_l20,
+        fwd_c1a_full_layer_5_wq_a_layer_l20, fwd_c1a_full_layer_5_wq_a_scale_layer_l20,
         fwd_c1a_full_layer_5_q_norm_layer_l20,
-        fwd_c1a_full_layer_5_wq_b_layer_l20,
-        fwd_c1a_full_layer_5_wq_b_scale_layer_l20,
-        fwd_c1a_full_layer_5_wkv_layer_l20,
-        fwd_c1a_full_layer_5_wkv_scale_layer_l20,
+        fwd_c1a_full_layer_5_wq_b_layer_l20, fwd_c1a_full_layer_5_wq_b_scale_layer_l20,
+        fwd_c1a_full_layer_5_wkv_layer_l20, fwd_c1a_full_layer_5_wkv_scale_layer_l20,
         fwd_c1a_full_layer_5_kv_norm_layer_l20,
         fwd_c1a_full_layer_5_sink_layer_l20,
-        fwd_c1a_full_layer_5_wo_a_layer_l20,
-        fwd_c1a_full_layer_5_wo_b_layer_l20,
+        fwd_c1a_full_layer_5_wo_a_layer_l20, fwd_c1a_full_layer_5_wo_b_layer_l20,
         fwd_c1a_full_layer_5_wo_b_scale_layer_l20,
-        compressed_token_rope_cos,
-        compressed_token_rope_sin,
-        window_slots,
-        window_indices,
-        fwd_attention_layer_1_window_cache_l20,
-        fwd_attention_layer_1_window_cache_scale_l20,
-        fwd_attention_layer_1_compressed_cache_l20,
-        fwd_attention_layer_1_compressed_cache_scale_l20,
-        request_ids,
-        c1a_compressed_lens,
-        fwd_attention_layer_1_index_cache_l20,
-        fwd_attention_layer_1_index_cache_scale_l20,
-        c1a_index_block_table,
-        compressed_token_rope_cos,
-        compressed_token_rope_sin,
-        c1a_compressor_wkv,
-        fwd_attention_layer_1_compressor_norm_source_l20,
-        c1a_compressed_slots,
-        fwd_attention_layer_1_index_wk_source_l20,
-        fwd_attention_layer_1_index_norm_source_l20,
-        fwd_attention_layer_1_index_wq_b_source_l20,
-        fwd_attention_layer_1_index_wq_b_scale_source_l20,
+        compressed_token_rope_cos, compressed_token_rope_sin,
+        window_slots, window_indices,
+        fwd_attention_layer_1_window_cache_l20, fwd_attention_layer_1_window_cache_scale_l20,
+        fwd_attention_layer_1_compressed_cache_l20, fwd_attention_layer_1_compressed_cache_scale_l20,
+        request_ids, c1a_compressed_lens,
+        fwd_attention_layer_1_index_cache_l20, fwd_attention_layer_1_index_cache_scale_l20, c1a_index_block_table,
+        compressed_token_rope_cos, compressed_token_rope_sin,
+        c1a_compressor_wkv, fwd_attention_layer_1_compressor_norm_source_l20, c1a_compressed_slots,
+        fwd_attention_layer_1_index_wk_source_l20, fwd_attention_layer_1_index_norm_source_l20,
+        fwd_attention_layer_1_index_wq_b_source_l20, fwd_attention_layer_1_index_wq_b_scale_source_l20,
         fwd_attention_layer_1_index_weights_proj_source_l20,
-        topk_indices,
-        pool_block_ids,
-        pool_block_counts,
-        gathered,
-        attention_input_window,
-        attention_input_arrived,
-        attention_output_window,
-        attention_output_arrived,
-        attention_hidden,
-        attention_pre_mix,
-        rank // TP_SIZE * TP_SIZE,
-        rank % TP_SIZE,
+        topk_indices, pool_block_ids, pool_block_counts,
+        attention_hidden, attention_pre_mix,
         attention_count,
-        20 + 1,
     )
     fwd_moe_layer_8_routed_base_l20 = 20 * N_LOCAL_EXPERTS
     fwd_moe_layer_8_hc_ffn_fn_layer_l20: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -2564,45 +2430,25 @@ def _decode_decoder(
     fwd_c1a_reuse_layer_15_wo_b_scale_layer_l21: pl.Tensor[
         [LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN
     ] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [21 * (LOCAL_O_WIDTH // MX_GROUP), 0])
-    decode_c1a_reuse_sharded(
-        x_pong,
-        pre_mix_pong,
-        fwd_c1a_reuse_layer_15_hc_fn_l21,
-        fwd_c1a_reuse_layer_15_hc_scale_l21,
-        fwd_c1a_reuse_layer_15_hc_base_l21,
+    decode_c1a_reuse(
+        x_pong, pre_mix_pong,
+        fwd_c1a_reuse_layer_15_hc_fn_l21, fwd_c1a_reuse_layer_15_hc_scale_l21, fwd_c1a_reuse_layer_15_hc_base_l21,
         fwd_c1a_reuse_layer_15_norm_weight_l21,
-        fwd_c1a_reuse_layer_15_wq_a_layer_l21,
-        fwd_c1a_reuse_layer_15_wq_a_scale_layer_l21,
+        fwd_c1a_reuse_layer_15_wq_a_layer_l21, fwd_c1a_reuse_layer_15_wq_a_scale_layer_l21,
         fwd_c1a_reuse_layer_15_q_norm_layer_l21,
-        fwd_c1a_reuse_layer_15_wq_b_layer_l21,
-        fwd_c1a_reuse_layer_15_wq_b_scale_layer_l21,
-        fwd_c1a_reuse_layer_15_wkv_layer_l21,
-        fwd_c1a_reuse_layer_15_wkv_scale_layer_l21,
+        fwd_c1a_reuse_layer_15_wq_b_layer_l21, fwd_c1a_reuse_layer_15_wq_b_scale_layer_l21,
+        fwd_c1a_reuse_layer_15_wkv_layer_l21, fwd_c1a_reuse_layer_15_wkv_scale_layer_l21,
         fwd_c1a_reuse_layer_15_kv_norm_layer_l21,
         fwd_c1a_reuse_layer_15_sink_layer_l21,
-        fwd_c1a_reuse_layer_15_wo_a_layer_l21,
-        fwd_c1a_reuse_layer_15_wo_b_layer_l21,
+        fwd_c1a_reuse_layer_15_wo_a_layer_l21, fwd_c1a_reuse_layer_15_wo_b_layer_l21,
         fwd_c1a_reuse_layer_15_wo_b_scale_layer_l21,
-        compressed_token_rope_cos,
-        compressed_token_rope_sin,
-        window_slots,
-        window_indices,
-        fwd_attention_layer_9_window_cache_l21,
-        fwd_attention_layer_9_window_cache_scale_l21,
-        fwd_attention_layer_9_compressed_cache_l21,
-        fwd_attention_layer_9_compressed_cache_scale_l21,
+        compressed_token_rope_cos, compressed_token_rope_sin,
+        window_slots, window_indices,
+        fwd_attention_layer_9_window_cache_l21, fwd_attention_layer_9_window_cache_scale_l21,
+        fwd_attention_layer_9_compressed_cache_l21, fwd_attention_layer_9_compressed_cache_scale_l21,
         topk_indices,
-        gathered,
-        attention_input_window,
-        attention_input_arrived,
-        attention_output_window,
-        attention_output_arrived,
-        attention_hidden,
-        attention_pre_mix,
-        rank // TP_SIZE * TP_SIZE,
-        rank % TP_SIZE,
+        attention_hidden, attention_pre_mix,
         attention_count,
-        21 + 1,
     )
     fwd_moe_layer_16_routed_base_l21 = 21 * N_LOCAL_EXPERTS
     fwd_moe_layer_16_hc_ffn_fn_layer_l21: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -2770,45 +2616,25 @@ def _decode_decoder(
     fwd_c1a_reuse_layer_7_wo_b_scale_layer_l22: pl.Tensor[
         [LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN
     ] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [22 * (LOCAL_O_WIDTH // MX_GROUP), 0])
-    decode_c1a_reuse_sharded(
-        x_hc,
-        pre_mix,
-        fwd_c1a_reuse_layer_7_hc_fn_l22,
-        fwd_c1a_reuse_layer_7_hc_scale_l22,
-        fwd_c1a_reuse_layer_7_hc_base_l22,
+    decode_c1a_reuse(
+        x_hc, pre_mix,
+        fwd_c1a_reuse_layer_7_hc_fn_l22, fwd_c1a_reuse_layer_7_hc_scale_l22, fwd_c1a_reuse_layer_7_hc_base_l22,
         fwd_c1a_reuse_layer_7_norm_weight_l22,
-        fwd_c1a_reuse_layer_7_wq_a_layer_l22,
-        fwd_c1a_reuse_layer_7_wq_a_scale_layer_l22,
+        fwd_c1a_reuse_layer_7_wq_a_layer_l22, fwd_c1a_reuse_layer_7_wq_a_scale_layer_l22,
         fwd_c1a_reuse_layer_7_q_norm_layer_l22,
-        fwd_c1a_reuse_layer_7_wq_b_layer_l22,
-        fwd_c1a_reuse_layer_7_wq_b_scale_layer_l22,
-        fwd_c1a_reuse_layer_7_wkv_layer_l22,
-        fwd_c1a_reuse_layer_7_wkv_scale_layer_l22,
+        fwd_c1a_reuse_layer_7_wq_b_layer_l22, fwd_c1a_reuse_layer_7_wq_b_scale_layer_l22,
+        fwd_c1a_reuse_layer_7_wkv_layer_l22, fwd_c1a_reuse_layer_7_wkv_scale_layer_l22,
         fwd_c1a_reuse_layer_7_kv_norm_layer_l22,
         fwd_c1a_reuse_layer_7_sink_layer_l22,
-        fwd_c1a_reuse_layer_7_wo_a_layer_l22,
-        fwd_c1a_reuse_layer_7_wo_b_layer_l22,
+        fwd_c1a_reuse_layer_7_wo_a_layer_l22, fwd_c1a_reuse_layer_7_wo_b_layer_l22,
         fwd_c1a_reuse_layer_7_wo_b_scale_layer_l22,
-        compressed_token_rope_cos,
-        compressed_token_rope_sin,
-        window_slots,
-        window_indices,
-        fwd_attention_layer_1_window_cache_l22,
-        fwd_attention_layer_1_window_cache_scale_l22,
-        fwd_attention_layer_1_compressed_cache_l22,
-        fwd_attention_layer_1_compressed_cache_scale_l22,
+        compressed_token_rope_cos, compressed_token_rope_sin,
+        window_slots, window_indices,
+        fwd_attention_layer_1_window_cache_l22, fwd_attention_layer_1_window_cache_scale_l22,
+        fwd_attention_layer_1_compressed_cache_l22, fwd_attention_layer_1_compressed_cache_scale_l22,
         topk_indices,
-        gathered,
-        attention_input_window,
-        attention_input_arrived,
-        attention_output_window,
-        attention_output_arrived,
-        attention_hidden,
-        attention_pre_mix,
-        rank // TP_SIZE * TP_SIZE,
-        rank % TP_SIZE,
+        attention_hidden, attention_pre_mix,
         attention_count,
-        22 + 1,
     )
     fwd_moe_layer_8_routed_base_l22 = 22 * N_LOCAL_EXPERTS
     fwd_moe_layer_8_hc_ffn_fn_layer_l22: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -2978,45 +2804,25 @@ def _decode_decoder(
     fwd_c1a_reuse_layer_15_wo_b_scale_layer_l23: pl.Tensor[
         [LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN
     ] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [23 * (LOCAL_O_WIDTH // MX_GROUP), 0])
-    decode_c1a_reuse_sharded(
-        x_pong,
-        pre_mix_pong,
-        fwd_c1a_reuse_layer_15_hc_fn_l23,
-        fwd_c1a_reuse_layer_15_hc_scale_l23,
-        fwd_c1a_reuse_layer_15_hc_base_l23,
+    decode_c1a_reuse(
+        x_pong, pre_mix_pong,
+        fwd_c1a_reuse_layer_15_hc_fn_l23, fwd_c1a_reuse_layer_15_hc_scale_l23, fwd_c1a_reuse_layer_15_hc_base_l23,
         fwd_c1a_reuse_layer_15_norm_weight_l23,
-        fwd_c1a_reuse_layer_15_wq_a_layer_l23,
-        fwd_c1a_reuse_layer_15_wq_a_scale_layer_l23,
+        fwd_c1a_reuse_layer_15_wq_a_layer_l23, fwd_c1a_reuse_layer_15_wq_a_scale_layer_l23,
         fwd_c1a_reuse_layer_15_q_norm_layer_l23,
-        fwd_c1a_reuse_layer_15_wq_b_layer_l23,
-        fwd_c1a_reuse_layer_15_wq_b_scale_layer_l23,
-        fwd_c1a_reuse_layer_15_wkv_layer_l23,
-        fwd_c1a_reuse_layer_15_wkv_scale_layer_l23,
+        fwd_c1a_reuse_layer_15_wq_b_layer_l23, fwd_c1a_reuse_layer_15_wq_b_scale_layer_l23,
+        fwd_c1a_reuse_layer_15_wkv_layer_l23, fwd_c1a_reuse_layer_15_wkv_scale_layer_l23,
         fwd_c1a_reuse_layer_15_kv_norm_layer_l23,
         fwd_c1a_reuse_layer_15_sink_layer_l23,
-        fwd_c1a_reuse_layer_15_wo_a_layer_l23,
-        fwd_c1a_reuse_layer_15_wo_b_layer_l23,
+        fwd_c1a_reuse_layer_15_wo_a_layer_l23, fwd_c1a_reuse_layer_15_wo_b_layer_l23,
         fwd_c1a_reuse_layer_15_wo_b_scale_layer_l23,
-        compressed_token_rope_cos,
-        compressed_token_rope_sin,
-        window_slots,
-        window_indices,
-        fwd_attention_layer_9_window_cache_l23,
-        fwd_attention_layer_9_window_cache_scale_l23,
-        fwd_attention_layer_9_compressed_cache_l23,
-        fwd_attention_layer_9_compressed_cache_scale_l23,
+        compressed_token_rope_cos, compressed_token_rope_sin,
+        window_slots, window_indices,
+        fwd_attention_layer_9_window_cache_l23, fwd_attention_layer_9_window_cache_scale_l23,
+        fwd_attention_layer_9_compressed_cache_l23, fwd_attention_layer_9_compressed_cache_scale_l23,
         topk_indices,
-        gathered,
-        attention_input_window,
-        attention_input_arrived,
-        attention_output_window,
-        attention_output_arrived,
-        attention_hidden,
-        attention_pre_mix,
-        rank // TP_SIZE * TP_SIZE,
-        rank % TP_SIZE,
+        attention_hidden, attention_pre_mix,
         attention_count,
-        23 + 1,
     )
     fwd_moe_layer_16_routed_base_l23 = 23 * N_LOCAL_EXPERTS
     fwd_moe_layer_16_hc_ffn_fn_layer_l23: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -3231,55 +3037,30 @@ def _decode_decoder(
             [LOCAL_O_WIDTH // MX_GROUP, D],
             [(c1a_block * 4 + 24) * (LOCAL_O_WIDTH // MX_GROUP), 0],
         )
-        decode_c1a_reindex_sharded(
-            x_hc,
-            pre_mix,
-            fwd_c1a_reindex_layer_6_hc_fn_l24,
-            fwd_c1a_reindex_layer_6_hc_scale_l24,
-            fwd_c1a_reindex_layer_6_hc_base_l24,
+        decode_c1a_reindex(
+            x_hc, pre_mix,
+            fwd_c1a_reindex_layer_6_hc_fn_l24, fwd_c1a_reindex_layer_6_hc_scale_l24, fwd_c1a_reindex_layer_6_hc_base_l24,
             fwd_c1a_reindex_layer_6_norm_weight_l24,
-            fwd_c1a_reindex_layer_6_wq_a_layer_l24,
-            fwd_c1a_reindex_layer_6_wq_a_scale_layer_l24,
+            fwd_c1a_reindex_layer_6_wq_a_layer_l24, fwd_c1a_reindex_layer_6_wq_a_scale_layer_l24,
             fwd_c1a_reindex_layer_6_q_norm_layer_l24,
-            fwd_c1a_reindex_layer_6_wq_b_layer_l24,
-            fwd_c1a_reindex_layer_6_wq_b_scale_layer_l24,
-            fwd_c1a_reindex_layer_6_wkv_layer_l24,
-            fwd_c1a_reindex_layer_6_wkv_scale_layer_l24,
+            fwd_c1a_reindex_layer_6_wq_b_layer_l24, fwd_c1a_reindex_layer_6_wq_b_scale_layer_l24,
+            fwd_c1a_reindex_layer_6_wkv_layer_l24, fwd_c1a_reindex_layer_6_wkv_scale_layer_l24,
             fwd_c1a_reindex_layer_6_kv_norm_layer_l24,
             fwd_c1a_reindex_layer_6_sink_layer_l24,
-            fwd_c1a_reindex_layer_6_wo_a_layer_l24,
-            fwd_c1a_reindex_layer_6_wo_b_layer_l24,
+            fwd_c1a_reindex_layer_6_wo_a_layer_l24, fwd_c1a_reindex_layer_6_wo_b_layer_l24,
             fwd_c1a_reindex_layer_6_wo_b_scale_layer_l24,
-            compressed_token_rope_cos,
-            compressed_token_rope_sin,
-            window_slots,
-            window_indices,
-            fwd_attention_layer_1_window_cache_l24,
-            fwd_attention_layer_1_window_cache_scale_l24,
-            fwd_attention_layer_1_compressed_cache_l24,
-            fwd_attention_layer_1_compressed_cache_scale_l24,
-            request_ids,
-            c1a_compressed_lens,
-            fwd_attention_layer_1_index_cache_l24,
-            fwd_attention_layer_1_index_cache_scale_l24,
-            c1a_index_block_table,
-            pool_block_ids,
-            pool_block_counts,
-            fwd_attention_layer_1_index_wq_b_source_l24,
-            fwd_attention_layer_1_index_wq_b_scale_source_l24,
+            compressed_token_rope_cos, compressed_token_rope_sin,
+            window_slots, window_indices,
+            fwd_attention_layer_1_window_cache_l24, fwd_attention_layer_1_window_cache_scale_l24,
+            fwd_attention_layer_1_compressed_cache_l24, fwd_attention_layer_1_compressed_cache_scale_l24,
+            request_ids, c1a_compressed_lens,
+            fwd_attention_layer_1_index_cache_l24, fwd_attention_layer_1_index_cache_scale_l24, c1a_index_block_table,
+            pool_block_ids, pool_block_counts,
+            fwd_attention_layer_1_index_wq_b_source_l24, fwd_attention_layer_1_index_wq_b_scale_source_l24,
             fwd_attention_layer_1_index_weights_proj_source_l24,
             topk_indices,
-            gathered,
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
-            attention_hidden,
-            attention_pre_mix,
-            rank // TP_SIZE * TP_SIZE,
-            rank % TP_SIZE,
+            attention_hidden, attention_pre_mix,
             attention_count,
-            c1a_block * 4 + 24 + 1,
         )
         fwd_moe_layer_8_routed_base_l24 = (c1a_block * 4 + 24) * N_LOCAL_EXPERTS
         fwd_moe_layer_8_hc_ffn_fn_layer_l24: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -3475,45 +3256,25 @@ def _decode_decoder(
             [LOCAL_O_WIDTH // MX_GROUP, D],
             [(c1a_block * 4 + 25) * (LOCAL_O_WIDTH // MX_GROUP), 0],
         )
-        decode_c1a_reuse_sharded(
-            x_pong,
-            pre_mix_pong,
-            fwd_c1a_reuse_layer_15_hc_fn_l25,
-            fwd_c1a_reuse_layer_15_hc_scale_l25,
-            fwd_c1a_reuse_layer_15_hc_base_l25,
+        decode_c1a_reuse(
+            x_pong, pre_mix_pong,
+            fwd_c1a_reuse_layer_15_hc_fn_l25, fwd_c1a_reuse_layer_15_hc_scale_l25, fwd_c1a_reuse_layer_15_hc_base_l25,
             fwd_c1a_reuse_layer_15_norm_weight_l25,
-            fwd_c1a_reuse_layer_15_wq_a_layer_l25,
-            fwd_c1a_reuse_layer_15_wq_a_scale_layer_l25,
+            fwd_c1a_reuse_layer_15_wq_a_layer_l25, fwd_c1a_reuse_layer_15_wq_a_scale_layer_l25,
             fwd_c1a_reuse_layer_15_q_norm_layer_l25,
-            fwd_c1a_reuse_layer_15_wq_b_layer_l25,
-            fwd_c1a_reuse_layer_15_wq_b_scale_layer_l25,
-            fwd_c1a_reuse_layer_15_wkv_layer_l25,
-            fwd_c1a_reuse_layer_15_wkv_scale_layer_l25,
+            fwd_c1a_reuse_layer_15_wq_b_layer_l25, fwd_c1a_reuse_layer_15_wq_b_scale_layer_l25,
+            fwd_c1a_reuse_layer_15_wkv_layer_l25, fwd_c1a_reuse_layer_15_wkv_scale_layer_l25,
             fwd_c1a_reuse_layer_15_kv_norm_layer_l25,
             fwd_c1a_reuse_layer_15_sink_layer_l25,
-            fwd_c1a_reuse_layer_15_wo_a_layer_l25,
-            fwd_c1a_reuse_layer_15_wo_b_layer_l25,
+            fwd_c1a_reuse_layer_15_wo_a_layer_l25, fwd_c1a_reuse_layer_15_wo_b_layer_l25,
             fwd_c1a_reuse_layer_15_wo_b_scale_layer_l25,
-            compressed_token_rope_cos,
-            compressed_token_rope_sin,
-            window_slots,
-            window_indices,
-            fwd_attention_layer_9_window_cache_l25,
-            fwd_attention_layer_9_window_cache_scale_l25,
-            fwd_attention_layer_9_compressed_cache_l25,
-            fwd_attention_layer_9_compressed_cache_scale_l25,
+            compressed_token_rope_cos, compressed_token_rope_sin,
+            window_slots, window_indices,
+            fwd_attention_layer_9_window_cache_l25, fwd_attention_layer_9_window_cache_scale_l25,
+            fwd_attention_layer_9_compressed_cache_l25, fwd_attention_layer_9_compressed_cache_scale_l25,
             topk_indices,
-            gathered,
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
-            attention_hidden,
-            attention_pre_mix,
-            rank // TP_SIZE * TP_SIZE,
-            rank % TP_SIZE,
+            attention_hidden, attention_pre_mix,
             attention_count,
-            c1a_block * 4 + 25 + 1,
         )
         fwd_moe_layer_16_routed_base_l25 = (c1a_block * 4 + 25) * N_LOCAL_EXPERTS
         fwd_moe_layer_16_hc_ffn_fn_layer_l25: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -3709,45 +3470,25 @@ def _decode_decoder(
             [LOCAL_O_WIDTH // MX_GROUP, D],
             [(c1a_block * 4 + 26) * (LOCAL_O_WIDTH // MX_GROUP), 0],
         )
-        decode_c1a_reuse_sharded(
-            x_hc,
-            pre_mix,
-            fwd_c1a_reuse_layer_7_hc_fn_l26,
-            fwd_c1a_reuse_layer_7_hc_scale_l26,
-            fwd_c1a_reuse_layer_7_hc_base_l26,
+        decode_c1a_reuse(
+            x_hc, pre_mix,
+            fwd_c1a_reuse_layer_7_hc_fn_l26, fwd_c1a_reuse_layer_7_hc_scale_l26, fwd_c1a_reuse_layer_7_hc_base_l26,
             fwd_c1a_reuse_layer_7_norm_weight_l26,
-            fwd_c1a_reuse_layer_7_wq_a_layer_l26,
-            fwd_c1a_reuse_layer_7_wq_a_scale_layer_l26,
+            fwd_c1a_reuse_layer_7_wq_a_layer_l26, fwd_c1a_reuse_layer_7_wq_a_scale_layer_l26,
             fwd_c1a_reuse_layer_7_q_norm_layer_l26,
-            fwd_c1a_reuse_layer_7_wq_b_layer_l26,
-            fwd_c1a_reuse_layer_7_wq_b_scale_layer_l26,
-            fwd_c1a_reuse_layer_7_wkv_layer_l26,
-            fwd_c1a_reuse_layer_7_wkv_scale_layer_l26,
+            fwd_c1a_reuse_layer_7_wq_b_layer_l26, fwd_c1a_reuse_layer_7_wq_b_scale_layer_l26,
+            fwd_c1a_reuse_layer_7_wkv_layer_l26, fwd_c1a_reuse_layer_7_wkv_scale_layer_l26,
             fwd_c1a_reuse_layer_7_kv_norm_layer_l26,
             fwd_c1a_reuse_layer_7_sink_layer_l26,
-            fwd_c1a_reuse_layer_7_wo_a_layer_l26,
-            fwd_c1a_reuse_layer_7_wo_b_layer_l26,
+            fwd_c1a_reuse_layer_7_wo_a_layer_l26, fwd_c1a_reuse_layer_7_wo_b_layer_l26,
             fwd_c1a_reuse_layer_7_wo_b_scale_layer_l26,
-            compressed_token_rope_cos,
-            compressed_token_rope_sin,
-            window_slots,
-            window_indices,
-            fwd_attention_layer_1_window_cache_l26,
-            fwd_attention_layer_1_window_cache_scale_l26,
-            fwd_attention_layer_1_compressed_cache_l26,
-            fwd_attention_layer_1_compressed_cache_scale_l26,
+            compressed_token_rope_cos, compressed_token_rope_sin,
+            window_slots, window_indices,
+            fwd_attention_layer_1_window_cache_l26, fwd_attention_layer_1_window_cache_scale_l26,
+            fwd_attention_layer_1_compressed_cache_l26, fwd_attention_layer_1_compressed_cache_scale_l26,
             topk_indices,
-            gathered,
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
-            attention_hidden,
-            attention_pre_mix,
-            rank // TP_SIZE * TP_SIZE,
-            rank % TP_SIZE,
+            attention_hidden, attention_pre_mix,
             attention_count,
-            c1a_block * 4 + 26 + 1,
         )
         fwd_moe_layer_8_routed_base_l26 = (c1a_block * 4 + 26) * N_LOCAL_EXPERTS
         fwd_moe_layer_8_hc_ffn_fn_layer_l26: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -3943,45 +3684,25 @@ def _decode_decoder(
             [LOCAL_O_WIDTH // MX_GROUP, D],
             [(c1a_block * 4 + 27) * (LOCAL_O_WIDTH // MX_GROUP), 0],
         )
-        decode_c1a_reuse_sharded(
-            x_pong,
-            pre_mix_pong,
-            fwd_c1a_reuse_layer_15_hc_fn_l27,
-            fwd_c1a_reuse_layer_15_hc_scale_l27,
-            fwd_c1a_reuse_layer_15_hc_base_l27,
+        decode_c1a_reuse(
+            x_pong, pre_mix_pong,
+            fwd_c1a_reuse_layer_15_hc_fn_l27, fwd_c1a_reuse_layer_15_hc_scale_l27, fwd_c1a_reuse_layer_15_hc_base_l27,
             fwd_c1a_reuse_layer_15_norm_weight_l27,
-            fwd_c1a_reuse_layer_15_wq_a_layer_l27,
-            fwd_c1a_reuse_layer_15_wq_a_scale_layer_l27,
+            fwd_c1a_reuse_layer_15_wq_a_layer_l27, fwd_c1a_reuse_layer_15_wq_a_scale_layer_l27,
             fwd_c1a_reuse_layer_15_q_norm_layer_l27,
-            fwd_c1a_reuse_layer_15_wq_b_layer_l27,
-            fwd_c1a_reuse_layer_15_wq_b_scale_layer_l27,
-            fwd_c1a_reuse_layer_15_wkv_layer_l27,
-            fwd_c1a_reuse_layer_15_wkv_scale_layer_l27,
+            fwd_c1a_reuse_layer_15_wq_b_layer_l27, fwd_c1a_reuse_layer_15_wq_b_scale_layer_l27,
+            fwd_c1a_reuse_layer_15_wkv_layer_l27, fwd_c1a_reuse_layer_15_wkv_scale_layer_l27,
             fwd_c1a_reuse_layer_15_kv_norm_layer_l27,
             fwd_c1a_reuse_layer_15_sink_layer_l27,
-            fwd_c1a_reuse_layer_15_wo_a_layer_l27,
-            fwd_c1a_reuse_layer_15_wo_b_layer_l27,
+            fwd_c1a_reuse_layer_15_wo_a_layer_l27, fwd_c1a_reuse_layer_15_wo_b_layer_l27,
             fwd_c1a_reuse_layer_15_wo_b_scale_layer_l27,
-            compressed_token_rope_cos,
-            compressed_token_rope_sin,
-            window_slots,
-            window_indices,
-            fwd_attention_layer_9_window_cache_l27,
-            fwd_attention_layer_9_window_cache_scale_l27,
-            fwd_attention_layer_9_compressed_cache_l27,
-            fwd_attention_layer_9_compressed_cache_scale_l27,
+            compressed_token_rope_cos, compressed_token_rope_sin,
+            window_slots, window_indices,
+            fwd_attention_layer_9_window_cache_l27, fwd_attention_layer_9_window_cache_scale_l27,
+            fwd_attention_layer_9_compressed_cache_l27, fwd_attention_layer_9_compressed_cache_scale_l27,
             topk_indices,
-            gathered,
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
-            attention_hidden,
-            attention_pre_mix,
-            rank // TP_SIZE * TP_SIZE,
-            rank % TP_SIZE,
+            attention_hidden, attention_pre_mix,
             attention_count,
-            c1a_block * 4 + 27 + 1,
         )
         fwd_moe_layer_16_routed_base_l27 = (c1a_block * 4 + 27) * N_LOCAL_EXPERTS
         fwd_moe_layer_16_hc_ffn_fn_layer_l27: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -4173,10 +3894,6 @@ def _decode_fwd(
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    attention_input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
-    attention_input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    attention_output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
-    attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -4264,10 +3981,6 @@ def _decode_fwd(
         shared_w1,
         shared_w2,
         shared_w3,
-        attention_input_window,
-        attention_input_arrived,
-        attention_output_window,
-        attention_output_arrived,
         recv_meta,
         recv_x,
         recv_scale,
@@ -4351,10 +4064,6 @@ def _decode_fwd(
         shared_w1,
         shared_w2,
         shared_w3,
-        attention_input_window,
-        attention_input_arrived,
-        attention_output_window,
-        attention_output_arrived,
         recv_meta,
         recv_x,
         recv_scale,
@@ -4555,10 +4264,6 @@ def l3_decode_fwd(
     c2a_index_block_table.bind_dynamic(2, FWD_C2A_TABLE_DYN)
     c1a_index_block_table.bind_dynamic(1, B_DYN)
     c1a_index_block_table.bind_dynamic(2, FWD_C1A_TABLE_DYN)
-    attention_input_buffer = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
-    attention_input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    attention_output_buffer = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
-    attention_output_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
@@ -4573,10 +4278,6 @@ def l3_decode_fwd(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
     for rank in pl.range(pld.world_size()):
-        attention_input_window = pld.window(attention_input_buffer, [DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
-        attention_input_arrived = pld.window(attention_input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        attention_output_window = pld.window(attention_output_buffer, [DECODE_MAX_TOKENS, D], dtype=pl.FP32)
-        attention_output_arrived = pld.window(attention_output_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
         recv_scale = pld.window(
@@ -4657,10 +4358,6 @@ def l3_decode_fwd(
             shared_w1[rank],
             shared_w2[rank],
             shared_w3[rank],
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
             recv_meta,
             recv_x,
             recv_scale,
@@ -4745,10 +4442,6 @@ def l3_decode_fwd(
             shared_w1[rank],
             shared_w2[rank],
             shared_w3[rank],
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
             recv_meta,
             recv_x,
             recv_scale,

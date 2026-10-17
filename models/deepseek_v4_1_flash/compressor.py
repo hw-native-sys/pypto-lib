@@ -6,43 +6,62 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Ratio-2 compression with request-owned FP32 ring state."""
+"""Compression projections, rotary embedding, cache publication, and ratio-2 ring state."""
 
 import pypto.language as pl
 import torch
 
 from config import (
-    FLASH as M,
-    STATE_CAPACITY,
-    B_DYN,
-    Q_START_DYN,
-    STATE_BLOCKS_DYN,
-    T_DYN,
-    COMPRESSED_CACHE_GROUP,
-    CMP_BLOCKS_DYN,
+    FLASH as M, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN,
+    T_DYN, COMPRESSED_CACHE_GROUP, CMP_BLOCKS_DYN,
 )
-
-
-STATE_WIDTH = 2 * M.head_dim
-
-
+from quant import bf16_gemm_staged
 from rmsnorm import golden_rms_norm
 
 
 # model config
-HEAD_DIM = M.head_dim
-
-
-EPS = M.rms_norm_eps
-
-
 D = M.hidden_size
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+EPS = M.rms_norm_eps
+STATE_WIDTH = 2 * M.head_dim
+
+# tiling
 M_TILE = 16
 N_TILE = 128
 COMPRESSOR_K_TILE = 64
 COMPRESSOR_QUERY_TILE = 128
 COMPRESSOR_SEGMENTS = 16
 COMPRESSOR_K_CHUNK = D // COMPRESSOR_SEGMENTS
+COMPRESSOR_PROJ_N_TILE = 128
+COMPRESSOR_PROJ_K_TILE = 256
+
+
+@pl.jit.inline
+def _compressed_rope_block(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
+    block: pl.Scalar[pl.INT32],
+):
+    t = block
+    base = 0
+    output[t : t + 1, base : base + (HEAD_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (HEAD_DIM - ROPE_DIM)]
+    tail = pl.cast(x[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM], pl.FP32)
+    even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+    odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+    c = cos[t : t + 1, :]
+    s = pl.mul(sin[t : t + 1, :], 1.0)
+    re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
+    im = pl.add(pl.mul(even, s), pl.mul(odd, c))
+    rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
+    rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
+    rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
+    output[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM] = pl.cast(
+        rotated, pl.BF16, mode="rint"
+    )
+    return output
 
 
 @pl.jit.inline
@@ -148,7 +167,6 @@ def project_ratio2(
     project_ratio2_weights(x, wkv, kv_out, num_tokens)
     project_ratio2_weights(x, wgate, score_out, num_tokens)
     return kv_out, score_out
-
 
 
 @pl.jit.inline
@@ -422,3 +440,160 @@ def compressor_ratio2(
         state_block_table, state_cache, num_tokens, pool_tid,
     )
     return pool_tid, state_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_c1a_compressor_project(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    ready = pl.system.task_dummy(deps=[])
+    result, completed = bf16_gemm_staged(
+        source, weight, output, num_tokens, ready,
+        width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
+        workers=2147483647, name_hint='prefill_bf16_projection_cube',
+    )
+    return result
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_c1a_compressor_rope(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    blocks = num_tokens
+    workers = pl.min(blocks, 2147483647)
+    for worker in pl.spmd(workers, name_hint='attention_rope'):
+        for block in pl.range(worker, blocks, workers):
+            _compressed_rope_block(x, cos, sin, output, block)
+    return output
+
+
+@pl.jit.inline
+def publish_c2a_compressed(
+    latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    slots: pl.Tensor[[T_DYN], pl.INT64],
+    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, (HEAD_DIM // 2)], pl.UINT8],
+    scales: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, (HEAD_DIM // 16)], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+    latent_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Publish rotated compressed KV rows as packed E2M1 with group-16 BF16 scales."""
+    blocks = pl.tensor.dim(cache, 0)
+    cache_rows = blocks * 128
+    flat = pl.reshape(cache, [cache_rows, (HEAD_DIM // 2)])
+    scale_flat = pl.reshape(scales, [cache_rows, (HEAD_DIM // 16)])
+    with pl.spmd(num_tokens, name_hint="c2a_compressed_publish", deps=[cache_ready, latent_ready]) as publish_tid:
+        t = pl.tile.get_block_idx()
+        slot_i64 = pl.read(slots, [t])
+        if slot_i64 >= 0:
+            slot = pl.cast(slot_i64, pl.INDEX)
+            source = pl.slice(latent, [1, HEAD_DIM * 2], [t, 0], valid_shape=[1, HEAD_DIM])
+            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, HEAD_DIM * 2)
+            groups = pl.reshape(pl.cast(source, pl.FP32), [HEAD_DIM * 2 // 16, 16])
+            amax = pl.row_max(pl.abs(groups))
+            stored = pl.cast(pl.maximum(pl.mul(amax, (1.0 / 6.0)), (2.0**-9)), pl.BF16, mode="rint")
+            normalized = pl.minimum(
+                pl.maximum(pl.row_expand_div(groups, pl.cast(stored, pl.FP32)), -6.0), 6.0
+            )
+            magnitude = pl.abs(normalized)
+            # Nearest E2M1 magnitude index: seven minus the number of table midpoints
+            # at or above |v|, which resolves an exact midpoint toward zero.
+            step0 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 0.25), pl.INT32), 1), 31)
+            step1 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 0.75), pl.INT32), 1), 31)
+            step2 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 1.25), pl.INT32), 1), 31)
+            step3 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 1.75), pl.INT32), 1), 31)
+            step4 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 2.5), pl.INT32), 1), 31)
+            step5 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32), 1), 31)
+            step6 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 5.0), pl.INT32), 1), 31)
+            index = pl.add(
+                pl.add(pl.add(step0, step1), pl.add(step2, step3)),
+                pl.add(pl.add(step4, step5), pl.add(step6, 7)),
+            )
+            sign = pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 31)
+            codes = pl.reshape(pl.sub(index, pl.mul(sign, 8)), [1, HEAD_DIM * 2])
+            low = pl.gather(codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32)
+            high = pl.gather(codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            packed = pl.add(low, pl.mul(high, 16))
+            signed = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
+            flat[slot : slot + 1, :] = pl.set_validshape(
+                pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8), 1, (HEAD_DIM // 2)
+            )
+            scale_flat[slot : slot + 1, :] = pl.set_validshape(
+                pl.reshape(stored, [1, HEAD_DIM * 2 // 16]), 1, (HEAD_DIM // 16)
+            )
+    return publish_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_c1a_compressor_project(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    result, completed = bf16_gemm_staged(
+        source, weight, output, num_tokens, ready,
+        width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
+        workers=32, name_hint='c1a_compressor_projection',
+    )
+    return completed
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_c1a_compressor_rope(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    blocks = num_tokens
+    workers = pl.min(blocks, 2147483647)
+    with pl.spmd(workers, name_hint='c1a_compressor_rope', deps=[ready]) as rope_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, workers):
+            _compressed_rope_block(x, cos, sin, output, block)
+    return rope_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_c2a_compressor_rope(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    blocks = num_tokens
+    workers = pl.min(blocks, 2147483647)
+    with pl.spmd(workers, name_hint='c2a_compressed_rope', deps=[ready]) as rope_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, workers):
+            _compressed_rope_block(x, cos, sin, output, block)
+    return rope_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_c2a_compressed_rope(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    blocks = num_tokens
+    workers = pl.min(blocks, 2147483647)
+    for worker in pl.spmd(workers, name_hint='attention_rope'):
+        for block in pl.range(worker, blocks, workers):
+            _compressed_rope_block(x, cos, sin, output, block)
+    return output

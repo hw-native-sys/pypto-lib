@@ -10,38 +10,26 @@
 
 
 import math
-
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
-
-from sparse_attention import golden_swa_attention
-from config import (
-    MAX_BATCH_PER_DP,
-    WINDOW_CACHE_GROUP,
-    FLASH as M,
-    ORI_BLOCKS_DYN,
-    T_DYN,
-    TP_SIZE,
+from sparse_attention import (
+    SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
+    analyze_index_runs, attend_shared_cache, decode_shared_cache_after_publish,
+    prefill_publish_window_batched, swa_official_reference as golden_reference,
+    make_swa_inputs as make_inputs, make_packed_swa_inputs as make_packed_inputs,
 )
-
-from hc_mixes import golden_mhc_mixes
-from hc_post import golden_mhc_post
-from hc_pre import golden_mhc_pre
-from hc_pre import attention_pre
-from rmsnorm import golden_rms_norm
-from prefill_attn_swa import PREFILL_MAX_TOKENS, prefill_attn_swa_partial
 from config import (
+    MAX_BATCH_PER_DP, WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, PREFILL_MAX_TOKENS,
     SP_T_DYN,
 )
+from hc import golden_mhc_mixes, hc_mixes
+from hc import golden_hc_post, prefill_sp_post
+from hc import golden_hc_pre, hc_pre, zero_bf16_padding
+from rmsnorm import golden_rms_norm, rms_norm_tiled
+from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
+from o_proj import o_proj, prefill_sp_output_reduce_scatter
 from prefill_cp_allgather import make_prefill_sp_input_allgather
-from o_proj import make_prefill_sp_output_reduce_scatter
-from hc_post import prefill_sp_post
-from sparse_attention import (
-    swa_official_reference as golden_reference,
-    make_swa_inputs as make_inputs,
-    make_packed_swa_inputs as make_packed_inputs,
-)
 from utils import swa_window_cache_compare as window_cache_compare
 
 
@@ -63,7 +51,100 @@ MIX_HC = M.mix_hc
 
 
 prefill_sp_input_allgather = make_prefill_sp_input_allgather(PREFILL_MAX_TOKENS)
-prefill_sp_output_reduce_scatter = make_prefill_sp_output_reduce_scatter(PREFILL_MAX_TOKENS)
+
+
+# tiling
+QUERY_TILE = 128
+WORKER_TILE = 64
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_swa_attention(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    """Write FP32 head-TP partials for packed causal SWA; write slots must be unique."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_prefill_previous_epoch", allow_early_resolve=False) as cache_ready:
+        for peer in pl.range(TP_SIZE):
+            previous_epoch = (attention_epoch - 1) * 2
+            pld.system.wait(output_arrived, offsets=[peer, 0], expected=previous_epoch, cmp=pld.WaitCmp.Ge)
+    tokens = pl.tensor.dim(x, 0)
+    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    # Gate every projection tile before scratch storage is reused by a new epoch.
+    with pl.spmd(WORKER_TILE, name_hint="prefill_swa_begin", deps=[cache_ready]):
+        worker = pl.tile.get_block_idx()
+        for row in pl.range(worker, num_tokens, WORKER_TILE):
+            kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+    kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
+    chunk_done = prefill_publish_window_batched(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
+    cache_blocks = pl.tensor.dim(window_cache, 0)
+    cache_rows = cache_blocks * 128
+    decoded_cache = pl.create_tensor([cache_blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
+    zero_row = pl.create_tensor([32, HEAD_DIM], dtype=pl.BF16)
+    # Decode once for the entire packed prompt. The explicit publication
+    # dependency protects the hoisted reader independently of query staging.
+    decoded_ready = decode_shared_cache_after_publish(window_cache, window_cache_scale, decoded_cache, zero_row, chunk_done)
+
+    chunk_x = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
+    chunk_cos = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
+    chunk_sin = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
+    chunk_indices = pl.create_tensor([QUERY_TILE, 128], dtype=pl.INT32)
+    qr = pl.create_tensor([QUERY_TILE, Q_LORA], dtype=pl.BF16)
+    q = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    descriptors = pl.create_tensor([QUERY_TILE, RUN_PARTS, RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
+    attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.FP32)
+
+    for start in pl.range(0, num_tokens, QUERY_TILE):
+        active = pl.min(QUERY_TILE, num_tokens - start)
+        # The prior chunk must finish reading every reusable scratch buffer.
+        with pl.spmd(WORKER_TILE, name_hint="prefill_swa_stage", deps=[chunk_done]) as stage_tid:
+            worker = pl.tile.get_block_idx()
+            for row in pl.range(worker, active, WORKER_TILE):
+                source_row = start + row
+                for col in pl.range(0, D, 512):
+                    chunk_x[row:row + 1, col:col + 512] = x[source_row:source_row + 1, col:col + 512]
+                chunk_cos[row:row + 1, :] = rope_cos[source_row:source_row + 1, :]
+                chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
+                chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
+        q_proj_qr(chunk_x, wq_a, wq_a_scale, q_norm_weight, qr, active)
+        q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active)
+        index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
+        attend_shared_cache(
+            q, decoded_cache, zero_row,
+            descriptors, chunk_indices, attn_sink,
+            attended, active, decoded_ready, index_ready,
+        )
+        o_proj(attended, wo_a, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active, None, group32=False)
+        with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
+            worker = pl.tile.get_block_idx()
+            for row in pl.range(worker, active, WORKER_TILE):
+                for col in pl.range(0, D, 512):
+                    partial[start + row:start + row + 1, col:col + 512] = chunk_partial[row:row + 1, col:col + 512]
+        chunk_done = collect_tid
+    return partial
 
 
 @pl.jit.inline(auto_scope=False)
@@ -109,10 +190,16 @@ def prefill_swa(
     tokens = pl.tensor.dim(x_hc, 0)
     collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    post_mix, residual_mix = attention_pre(
-        x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
-        collapsed, local_hidden, next_pre_mix, tokens,
+    post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
+    residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
+    hc_mixes(
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
     )
+    hc_pre(x_hc, incoming_pre_mix, collapsed)
+    norm_tokens = pl.tensor.dim(collapsed, 0)
+    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+        rms_norm_tiled(collapsed, attn_norm_weight, local_hidden, norm_block, norm_tokens)
+    zero_bf16_padding(local_hidden, pl.min(tokens, pl.tensor.dim(local_hidden, 0)))
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, hidden,
         group_base, tp_rank, num_tokens, attention_epoch,
@@ -120,7 +207,7 @@ def prefill_swa(
     group_tokens = pl.tensor.dim(hidden, 0)
     partial = pl.create_tensor([group_tokens, D], dtype=pl.FP32)
     if num_tokens > 0:
-        prefill_attn_swa_partial(
+        prefill_swa_attention(
             hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
             wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
             rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
@@ -134,45 +221,6 @@ def prefill_swa(
         attn_out, x_hc, post_mix, residual_mix, output, next_pre_mix, tp_rank, num_tokens,
     )
     return output, next_pre_mix
-
-
-def golden_prefill_swa(
-    x_hc: torch.Tensor,
-    incoming_pre_mix: torch.Tensor,
-    hc_attn_fn: torch.Tensor,
-    hc_attn_scale: torch.Tensor,
-    hc_attn_base: torch.Tensor,
-    attn_norm_weight: torch.Tensor,
-    wq_a: torch.Tensor,
-    wq_a_scale: torch.Tensor,
-    q_norm_weight: torch.Tensor,
-    wq_b: torch.Tensor,
-    wq_b_scale: torch.Tensor,
-    wkv: torch.Tensor,
-    wkv_scale: torch.Tensor,
-    kv_norm_weight: torch.Tensor,
-    attn_sink: torch.Tensor,
-    wo_a: torch.Tensor,
-    wo_b: torch.Tensor,
-    wo_b_scale: torch.Tensor,
-    rope_cos: torch.Tensor,
-    rope_sin: torch.Tensor,
-    window_slots: torch.Tensor,
-    window_indices: torch.Tensor,
-    window_cache: torch.Tensor,
-    window_cache_scale: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Official staggered mHC boundary, input RMSNorm, SWA, and residual expansion."""
-    pre_mix, post_mix, residual_mix = golden_mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base)
-    normalized_hidden = golden_rms_norm(golden_mhc_pre(x_hc, incoming_pre_mix), attn_norm_weight)
-    result = golden_swa_attention(
-        normalized_hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-        wkv, wkv_scale, kv_norm_weight, attn_sink,
-        wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-        window_slots, window_indices, window_cache, window_cache_scale,
-    )
-    output = golden_mhc_post(result.output.to(torch.bfloat16), x_hc, post_mix, residual_mix)
-    return output, result.window_cache, result.window_cache_scale, pre_mix
 
 
 HC_INPUT_NAMES = (
@@ -347,13 +395,6 @@ def l3_prefill_swa(
         )
 
 
-
-
-
-
-
-
-
 def build_hc_specs(args):
     """Stacked TP/DP specs with HC streams in and HC streams out."""
     from golden import ScalarSpec, TensorSpec
@@ -491,14 +532,14 @@ def golden_prefill_swa_case(tensors):
             tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base],
         )
         incoming = tensors["incoming_pre_mix"][group].flatten(0, 1)[:tokens]
-        hidden = golden_rms_norm(golden_mhc_pre(x_hc, incoming), tensors["attn_norm_weight"][base])
+        hidden = golden_rms_norm(golden_hc_pre(x_hc, incoming).to(torch.bfloat16), tensors["attn_norm_weight"][base])
         pre_mix[active:] = 0
         tensors["next_pre_mix"][group].copy_(token_shards(pre_mix, local_tokens))
         reduced, caches = reference_attention(tensors, hidden, base)
         for rank, (cache, scale) in enumerate(caches, base):
             tensors["window_cache"][rank].copy_(cache)
             tensors["window_cache_scale"][rank].copy_(scale)
-        output = golden_mhc_post(reduced, x_hc, post_mix, residual_mix)
+        output = golden_hc_post(reduced, x_hc, post_mix, residual_mix).to(torch.float32)
         output[active:] = 0
         tensors["hidden"][group].copy_(hidden.unsqueeze(0).expand(TP_SIZE, -1, -1))
         tensors["attn_out"][group].copy_(token_shards(reduced, local_tokens))
@@ -577,7 +618,6 @@ if __name__ == "__main__":
             **window_cache_compare(len(devices), args.tokens),
         },
     )
-    print(f"[SWA+HC] work_dir={result.work_dir}")
     if args.compile_only and result.passed:
         print("[SWA+HC] Compilation passed; device accuracy was NOT validated.")
     if not result.passed:

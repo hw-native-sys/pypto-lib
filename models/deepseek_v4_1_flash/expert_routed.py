@@ -30,7 +30,6 @@ DECODE_SEQ = 1
 # model config
 B = DECODE_BATCH
 S = DECODE_SEQ
-T = B * S
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit

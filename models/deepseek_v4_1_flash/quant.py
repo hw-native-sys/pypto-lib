@@ -6,19 +6,24 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Checkpoint layouts and the released group-32 MX activation quantization."""
+"""V4.1 quantized GEMMs, staged BF16 GEMMs, and checkpoint layouts."""
 
 from collections.abc import Callable
 
 import math
 
 import torch
+import pypto.language as pl
 
 from config import FLASH as M
 
 
 # model config
 MX_GROUP = M.weight_block_size[0]
+
+# tiling
+MX_K_TILE = 256
+MX_SCALE_TILE = MX_K_TILE // 32
 
 
 FP4_VALUES = torch.tensor(
@@ -33,6 +38,184 @@ FP4_E4M3_CODES = torch.tensor(
      0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC],
     dtype=torch.int16,
 )
+
+
+@pl.jit.inline(auto_scope=False)
+def mxfp8_gemm(
+    x: pl.Tensor,
+    weight: pl.Tensor,
+    scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    fp32_output: pl.constexpr,
+    n_tile: pl.constexpr,
+    name_hint: pl.constexpr,
+):
+    """Compute M32 MXFP8 products with in-task activation quantization."""
+    for mt in pl.parallel((num_tokens + 31) // 32):
+        for block in pl.spmd(output_width // n_tile, name_hint=name_hint):
+            t0 = mt * 32
+            n0 = block * n_tile
+            rows = pl.min(32, num_tokens - t0)
+            first = pl.load(x, [t0, 0], [32, MX_K_TILE], valid_shape=[rows, MX_K_TILE])
+            first = pl.set_validshape(pl.fillpad(first, pad_value=pl.PadValue.zero), 32, MX_K_TILE)
+            firstq_values = pl.reshape(pl.cast(first, pl.FP32), [32 * (MX_K_TILE // 32), 32])
+            firstq_reduce_tmp = pl.create_tile([32 * (MX_K_TILE // 32), 32], dtype=pl.FP32)
+            firstq_maximum = pl.maximum(pl.row_max(pl.abs(firstq_values), tmp_tile=firstq_reduce_tmp), 1e-4)
+            firstq_bits = pl.reinterpret_view(pl.mul(firstq_maximum, 1.0 / 448.0), pl.INT32)
+            firstq_exponent = pl.shrs(pl.add(firstq_bits, 8388607), 23)
+            firstq_scale = pl.reinterpret_view(pl.shls(firstq_exponent, 23), pl.FP32)
+            firstq_quantized = pl.cast(pl.row_expand_div(firstq_values, firstq_scale), pl.FP8E4M3FN, mode="rint")
+            firstq_payload = pl.reshape(firstq_quantized, [32, MX_K_TILE])
+            firstq_signed_exponent = pl.sub(firstq_exponent, pl.mul(pl.shrs(firstq_exponent, 7), 256))
+            firstq_codes = pl.reinterpret_view(pl.cast(firstq_signed_exponent, pl.INT8), pl.UINT8)
+            firstq_flat = pl.reshape(firstq_codes, [1, 32 * (MX_K_TILE // 32)])
+            firstq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+            firstq_packed = pl.tmov_x2zz(firstq_flat, firstq_tmp, group_axis=1, dst_rows=32, dst_cols=MX_SCALE_TILE)
+            a0 = firstq_payload
+            sa0 = pl.reinterpret_view(firstq_packed, pl.FP8E8M0)
+            b0 = pl.load(weight, [0, n0], [MX_K_TILE, n_tile])
+            sb0 = pl.load(scale, [0, n0], [MX_K_TILE // 32, n_tile])
+            acc = pl.matmul_mx(a0, sa0, b0, sb0)
+            for kb in pl.range(1, width // MX_K_TILE):
+                k0 = kb * MX_K_TILE
+                values = pl.load(x, [t0, k0], [32, MX_K_TILE], valid_shape=[rows, MX_K_TILE])
+                values = pl.set_validshape(pl.fillpad(values, pad_value=pl.PadValue.zero), 32, MX_K_TILE)
+                nextq_values = pl.reshape(pl.cast(values, pl.FP32), [32 * (MX_K_TILE // 32), 32])
+                nextq_reduce_tmp = pl.create_tile([32 * (MX_K_TILE // 32), 32], dtype=pl.FP32)
+                nextq_maximum = pl.maximum(pl.row_max(pl.abs(nextq_values), tmp_tile=nextq_reduce_tmp), 1e-4)
+                nextq_bits = pl.reinterpret_view(pl.mul(nextq_maximum, 1.0 / 448.0), pl.INT32)
+                nextq_exponent = pl.shrs(pl.add(nextq_bits, 8388607), 23)
+                nextq_scale = pl.reinterpret_view(pl.shls(nextq_exponent, 23), pl.FP32)
+                nextq_quantized = pl.cast(pl.row_expand_div(nextq_values, nextq_scale), pl.FP8E4M3FN, mode="rint")
+                nextq_payload = pl.reshape(nextq_quantized, [32, MX_K_TILE])
+                nextq_signed_exponent = pl.sub(nextq_exponent, pl.mul(pl.shrs(nextq_exponent, 7), 256))
+                nextq_codes = pl.reinterpret_view(pl.cast(nextq_signed_exponent, pl.INT8), pl.UINT8)
+                nextq_flat = pl.reshape(nextq_codes, [1, 32 * (MX_K_TILE // 32)])
+                nextq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+                nextq_packed = pl.tmov_x2zz(nextq_flat, nextq_tmp, group_axis=1, dst_rows=32, dst_cols=MX_SCALE_TILE)
+                a = nextq_payload
+                sa = pl.reinterpret_view(nextq_packed, pl.FP8E8M0)
+                b = pl.load(weight, [k0, n0], [MX_K_TILE, n_tile])
+                sb = pl.load(scale, [k0 // 32, n0], [MX_K_TILE // 32, n_tile])
+                acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+            if fp32_output:
+                output = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile), [t0, n0], output)
+            else:
+                value = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def mxfp8_gemm_group32(
+    x: pl.Tensor,
+    weight: pl.Tensor,
+    scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    fp32_output: pl.constexpr,
+):
+    """Accumulate separately scaled group-32 products and return completion."""
+    scale_storage = pl.tensor.view(scale, [output_width // 16, width // 2], layout=pl.ND)
+    # Read after the explicit scratch producer completes.
+    producer_deps = pl.array.create(1, pl.TASK_ID)
+    producer_deps[0] = ready
+    with pl.spmd(32, name_hint="c1a_mx_projection", deps=[producer_deps[0]]) as project_tid:
+        worker = pl.tile.get_block_idx()
+        for task in pl.range(worker, (num_tokens + 15) // 16 * (output_width // 128), 32):
+            t0 = task // (output_width // 128) * 16
+            n0 = task % (output_width // 128) * 128
+            rows = pl.min(16, num_tokens - t0)
+            acc = pl.tile.full([16, 128], dtype=pl.FP32, value=0.0)
+            for kb in pl.range(width // 64):
+                raw = pl.load(scale_storage, [n0 // 16, kb * 32], [128 // 16, 32])
+                raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
+                codes = pl.ands(pl.cast(pl.reinterpret_view(raw_u8, pl.INT8), pl.INT32), 255)
+                scale_pair = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
+                for half in pl.unroll(2):
+                    k0 = (kb * 2 + half) * 32
+                    if half == 0:
+                        selected_scale = pl.tile.gather_mask(
+                            scale_pair, mask_pattern=pl.tile.MaskPattern.P0101
+                        )
+                    else:
+                        selected_scale = pl.tile.gather_mask(
+                            scale_pair, mask_pattern=pl.tile.MaskPattern.P1010
+                        )
+                    sb = pl.reshape(selected_scale, [1, 128])
+                    source = pl.load(x, [t0, k0], [16, 32], valid_shape=[rows, 32])
+                    source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 16, 32)
+                    values = pl.cast(source, pl.FP32)
+                    temporary = pl.tile.create([16, 32], dtype=pl.FP32)
+                    maximum = pl.maximum(pl.row_max(pl.abs(values), tmp_tile=temporary), 1e-4)
+                    bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
+                    exponent = pl.shrs(pl.add(bits, 8388607), 23)
+                    sa = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+                    payload = pl.cast(pl.row_expand_div(values, sa), pl.FP8E4M3FN, mode="rint")
+                    a = pl.cast(payload, pl.BF16)
+                    b = pl.cast(pl.load(weight, [k0, n0], [32, 128]), pl.BF16)
+                    dot = pl.matmul(a, b)
+                    part = pl.col_expand_mul(pl.row_expand_mul(dot, sa), sb)
+                    acc = pl.add(acc, part)
+            if fp32_output:
+                output = pl.store(pl.set_validshape(acc, rows, 128), [t0, n0], output)
+            else:
+                result = pl.cast(acc, pl.BF16, mode="rint")
+                output = pl.store(pl.set_validshape(result, rows, 128), [t0, n0], output)
+    return output, project_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def bf16_gemm_staged(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    workers: pl.constexpr,
+    name_hint: pl.constexpr,
+):
+    """Stage FP32 GEMM results before the separate BF16 rounding task."""
+    tokens = pl.tensor.dim(source, 0)
+    accumulated = pl.create_tensor([tokens, output_width], dtype=pl.FP32)
+    blocks = (num_tokens + 16 - 1) // 16 * (output_width // n_tile)
+    task_workers = pl.max(pl.min(blocks, workers), 1)
+    entry_deps = pl.array.create(1, pl.TASK_ID)
+    entry_deps[0] = ready
+    with pl.spmd(task_workers, name_hint=name_hint, deps=[entry_deps[0]]) as cube_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, task_workers):
+            row = block // (output_width // n_tile) * 16
+            col = block % (output_width // n_tile) * n_tile
+            rows = pl.min(16, num_tokens - row)
+            acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
+            for k in pl.range(0, width, k_tile):
+                a = pl.slice(source, [16, k_tile], [row, k], valid_shape=[rows, k_tile])
+                # Establish Vector startup before the local Cube result transfer (#2829).
+                a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
+                w = pl.slice(weight, [k_tile, n_tile], [k, col])
+                acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
+            value = pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile)
+            accumulated[row:row + 16, col:col + n_tile] = value
+    with pl.spmd(task_workers, name_hint="bf16_projection_cast", deps=[cube_tid]) as cast_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, task_workers):
+            row = block // (output_width // n_tile) * 16
+            col = block % (output_width // n_tile) * n_tile
+            rows = pl.min(16, num_tokens - row)
+            value = pl.slice(accumulated, [16, n_tile], [row, col], valid_shape=[rows, n_tile])
+            output[row:row + 16, col:col + n_tile] = pl.cast(value, pl.BF16, mode="rint")
+    return output, cast_tid
 
 
 def build_mxfp4_pair_lut() -> torch.Tensor:
@@ -455,5 +638,3 @@ def _publish_quantized_cache(
         _copy_cache_rows(updated_payload, row_payload, rows)
         _copy_cache_rows(updated_scale, row_scale, rows)
     return updated_payload, updated_scale
-
-

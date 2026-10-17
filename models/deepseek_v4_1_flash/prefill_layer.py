@@ -106,13 +106,13 @@ MOE_INTER = M.moe_intermediate_size
 
 from o_proj import prefill_tp_output_all_reduce  # noqa: E402
 from gate import golden_gate_reference as gate
-from hc_mixes import golden_mhc_mixes as hc_mixes
-from hc_post import golden_hc_post as hc_post
-from hc_pre import golden_hc_pre as hc_pre
+from hc import golden_mhc_mixes
+from hc import golden_hc_post
+from hc import golden_hc_pre
 from rmsnorm import golden_rms_norm
-from hc_mixes import mhc_mixes  # noqa: E402
-from hc_post import mhc_post  # noqa: E402
-from hc_pre import mhc_pre  # noqa: E402
+from hc import hc_mixes  # noqa: E402
+from hc import hc_post  # noqa: E402
+from hc import hc_pre  # noqa: E402
 from prefill_c2a_full import (  # noqa: E402
     ATTENTION_STATE,
     CMP_PACKED,
@@ -124,11 +124,12 @@ from prefill_c2a_full import (  # noqa: E402
     _report as report_stage,
     cache_compare,
     golden_attention_input,
+    golden_reference_c2a,
     make_attention_inputs,
     make_hc_inputs,
     reference_attention,
 )
-from prefill_c2a_reuse import prefill_c2a_reuse  # noqa: E402
+from prefill_c2a_reuse import prefill_c2a_reuse, golden_reference_c2a_reuse, make_c2a_reuse_inputs  # noqa: E402
 from quant import build_mxfp4_pair_lut  # noqa: E402
 from rmsnorm import rms_norm_tiled  # noqa: E402
 from moe import (  # noqa: E402
@@ -188,8 +189,8 @@ def moe_hc_pre(
     The collapsed stream stays in BF16 here; ``prefill_moe_sublayer`` applies RMSNorm
     immediately before the packed MoE core consumes it.
     """
-    mhc_mixes(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
-    mhc_pre(x_hc, pre_mix, ffn_input)
+    hc_mixes(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+    hc_pre(x_hc, pre_mix, ffn_input)
     return ffn_input
 
 
@@ -369,7 +370,7 @@ def prefill_ffn_restore(
     prefill_tp_output_all_reduce(
         partial, ffn_window, ffn_arrived, ffn_output, group_base, tp_rank, num_tokens, ffn_epoch,
     )
-    mhc_post(ffn_output, x_hc, post_mix, residual_mix, x_hc_out)
+    hc_post(ffn_output, x_hc, post_mix, residual_mix, x_hc_out)
     return x_hc_out
 
 
@@ -461,10 +462,10 @@ def golden_moe_sublayer(tensors, x_hc_mid, attn_pre_mix, tokens):
     mixes = {}
     for base in range(0, world, TP_SIZE):
         mid = x_hc_mid[base]
-        pre, post, comb = hc_mixes(
+        pre, post, comb = golden_mhc_mixes(
             mid, tensors["hc_ffn_fn"][base], tensors["hc_ffn_scale"][base], tensors["hc_ffn_base"][base]
         )
-        hidden = hc_pre(mid, attn_pre_mix[base]).to(torch.bfloat16)
+        hidden = golden_hc_pre(mid, attn_pre_mix[base]).to(torch.bfloat16)
         for rank in range(base, base + TP_SIZE):
             ffn_input[rank] = hidden
         mixes[base] = (pre, post, comb)
@@ -483,7 +484,7 @@ def golden_moe_sublayer(tensors, x_hc_mid, attn_pre_mix, tokens):
         # Each row has one owner in the group and the rest are zero, so the group sum is the
         # complete routed result.
         group = ffn_owned[base : base + TP_SIZE].float().sum(dim=0).to(torch.bfloat16)
-        expanded = hc_post(group, x_hc_mid[base], post, comb).float()
+        expanded = golden_hc_post(group, x_hc_mid[base], post, comb).float()
         for rank in range(base, base + TP_SIZE):
             outputs["ffn_output"][rank] = group
             outputs["next_pre_mix"][rank] = pre
@@ -538,15 +539,15 @@ def make_layer_golden(mode):
         for base in range(0, world, TP_SIZE):
             ranks = range(base, base + TP_SIZE)
             x_hc = tensors["x_hc"][base]
-            pre, post, comb = hc_mixes(
+            pre, post, comb = golden_mhc_mixes(
                 x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
             )
             x = golden_attention_input(x_hc, tensors["pre_mix"][base], tensors["attn_norm_weight"][base])
-            attention, results = reference_attention(mode, tensors, x, ranks)
+            attention, results = reference_attention(mode, tensors, x, ranks, reference=golden_reference_c2a_reuse if mode == "reuse" else golden_reference_c2a)
             for rank, result in zip(ranks, results):
                 for name in ATTENTION_STATE[mode]:
                     tensors[name][rank].copy_(result[name])
-            mid = hc_post(attention, x_hc, post, comb).float()
+            mid = golden_hc_post(attention, x_hc, post, comb).float()
             for rank in ranks:
                 attn_input[rank] = x
                 attn_output[rank] = attention
@@ -597,7 +598,7 @@ def compare_ffn_input(actual, expected, *, inputs, actual_outputs, **kwargs):
     check = ratio_allclose(atol=1e-4, rtol=2**-8, max_error_ratio=0.002)
     passed = True
     for base in range(0, actual.shape[0], TP_SIZE):
-        replay = hc_pre(actual_outputs["x_hc_mid"][base], actual_outputs["attn_pre_mix"][base]).to(torch.bfloat16)
+        replay = golden_hc_pre(actual_outputs["x_hc_mid"][base], actual_outputs["attn_pre_mix"][base]).to(torch.bfloat16)
         valid, _ = check(actual[base], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
         passed &= valid
         passed &= report_stage("ffn_input(end-to-end)", actual[base], expected[base])[0] <= 0.01
@@ -613,7 +614,7 @@ def compare_hc_mixes_output(name, source_name, weight_prefix, coefficient=0):
         passed = True
         for base in range(0, actual.shape[0], TP_SIZE):
             stream = inputs["x_hc"][base] if source_name is None else actual_outputs[source_name][base]
-            replay = hc_mixes(
+            replay = golden_mhc_mixes(
                 stream, inputs[f"{weight_prefix}_fn"][base], inputs[f"{weight_prefix}_scale"][base],
                 inputs[f"{weight_prefix}_base"][base],
             )[coefficient]
@@ -633,11 +634,11 @@ def compare_expanded_stream(name, sublayer_name, source_name, weight_prefix, end
         passed = True
         for base in range(0, actual.shape[0], TP_SIZE):
             stream = inputs["x_hc"][base] if source_name is None else actual_outputs[source_name][base]
-            _, post, comb = hc_mixes(
+            _, post, comb = golden_mhc_mixes(
                 stream, inputs[f"{weight_prefix}_fn"][base], inputs[f"{weight_prefix}_scale"][base],
                 inputs[f"{weight_prefix}_base"][base],
             )
-            replay = hc_post(actual_outputs[sublayer_name][base], stream, post, comb).float()
+            replay = golden_hc_post(actual_outputs[sublayer_name][base], stream, post, comb).float()
             valid, _ = check(actual[base], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
             passed &= valid
             passed &= report_stage(f"{name}(end-to-end)", actual[base], expected[base])[0] <= end_to_end_bound
@@ -728,7 +729,7 @@ def compare_ffn_output(staged, tokens):
 
 def make_layer_compare(mode, tokens, initial_state, world_size):
     """Stage-wise comparators: every sublayer boundary forced on the device's own input."""
-    attention = StagedAttentionReference(mode, initial_state)
+    attention = StagedAttentionReference(mode, initial_state, attention_reference=functools.partial(reference_attention, reference=golden_reference_c2a_reuse if mode == "reuse" else golden_reference_c2a))
     moe = StagedMoeReference(tokens)
     compare = {
         "attn_input": ratio_allclose(atol=1e-4, rtol=2**-8, max_error_ratio=0.002),
@@ -1059,7 +1060,7 @@ def l3_prefill_layer(
 def build_specs(args, mode, initial_state):
     """Stacked specs whose per-rank fixtures are drawn once, on first use."""
     world_size = EP_SIZE
-    names, mutable_names, sharded_names, _ = MODES[mode]
+    names, mutable_names, sharded_names = MODES[mode]
     attention_names = tuple(name for name in names if name != "x")
     ranks = {}
 
@@ -1069,7 +1070,8 @@ def build_specs(args, mode, initial_state):
             replicated = {**make_moe_replicated_inputs(args.seed + 5003), **make_ffn_hc_inputs(args.seed + 3001)}
             for rank in range(world_size):
                 ranks[rank] = make_attention_inputs(
-                    mode, args.tokens, args.requests, args.seed + rank, args.case
+                    mode, args.tokens, args.requests, args.seed + rank, args.case,
+                    make_inputs=make_c2a_reuse_inputs if mode == "reuse" else None,
                 )
                 ranks[rank].update(make_moe_rank_inputs(rank))
                 ranks[rank].update(replicated)
@@ -1093,7 +1095,7 @@ def build_specs(args, mode, initial_state):
             initial_state[name] = stacked.clone()
         return stacked
 
-    shapes = make_attention_inputs(mode, args.tokens, args.requests, args.seed, args.case)
+    shapes = make_attention_inputs(mode, args.tokens, args.requests, args.seed, args.case, make_inputs=make_c2a_reuse_inputs if mode == "reuse" else None)
     shapes.update(make_hc_inputs(args.tokens, args.seed, args.case))
     shapes.update(make_ffn_hc_inputs(args.seed + 3001))
     shapes.update(make_moe_replicated_inputs(args.seed + 5003))

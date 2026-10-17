@@ -32,7 +32,6 @@ MX_GROUP = 32
 MX_K_TILE = 512
 MX_RIGHT_K_TILE = 256
 MX_MM_INTER_TILE = 256
-MX_K_SCALE_GROUPS = MX_K_TILE // MX_GROUP
 MX_RIGHT_K_SCALE_GROUPS = MX_RIGHT_K_TILE // MX_GROUP
 # W2 reduces over MOE_INTER, whose V4.1 value (2304) is *not* a multiple of
 # MX_K_TILE (512): 2304 = 512 * 4 + 256. The V4-Pro presets all happen to be

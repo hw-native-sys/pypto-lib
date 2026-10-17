@@ -26,7 +26,6 @@ import pypto.language.distributed as pld
 
 from config import (
     FLASH as M,
-    DECODE_INPUT_MAX_TOKENS,
     DECODE_MAX_TOKENS,
     AttentionMode,
     COMPRESSED_CACHE_GROUP,
@@ -38,7 +37,6 @@ from config import (
 from config import MOE_TOKENS
 from config import (
     TP_SIZE,
-    SUPPORTED_TP_SIZES,
     SUPPORTED_EP_SIZES,
     ORI_BLOCKS_DYN,
     CMP_BLOCKS_DYN,
@@ -56,24 +54,23 @@ from compressor import STATE_WIDTH
 
 from utils import AttentionGoldenResult
 from config import LOCAL_T_DYN
-from decode_attn_c1a import (
+from decode_c1a_full import (
     golden_decode_attn_c1a_full,
-    golden_decode_attn_c1a_reindex,
-    golden_decode_attn_c1a_reuse,
 )
-from decode_attn_c2a import golden_decode_attn_c2a_full, golden_decode_attn_c2a_reuse
-from decode_attn_swa import golden_decode_attn_swa
-from decode_c1a_full import decode_c1a_full_sharded
-from decode_c1a_reindex import decode_c1a_reindex_sharded
-from decode_c1a_reuse import decode_c1a_reuse_sharded
-from decode_c2a_full import decode_c2a_full_sharded
-from decode_c2a_reuse import decode_c2a_reuse_sharded
-from decode_swa import decode_swa_sharded
+from decode_c2a_full import golden_decode_attn_c2a_full
+from decode_c2a_reuse import golden_decode_attn_c2a_reuse
+from sparse_attention import golden_swa_attention
+from decode_c1a_full import decode_c1a_full
+from decode_c1a_reindex import decode_c1a_reindex, golden_decode_attn_c1a_reindex
+from decode_c1a_reuse import decode_c1a_reuse, golden_decode_attn_c1a_reuse
+from decode_c2a_full import decode_c2a_full
+from decode_c2a_reuse import decode_c2a_reuse
+from decode_swa import decode_swa
 from gate import golden_gate_reference as gate
 from rmsnorm import golden_rms_norm
-from hc_mixes import golden_mhc_mixes
-from hc_post import golden_mhc_post
-from hc_pre import golden_mhc_pre
+from hc import golden_mhc_mixes
+from hc import golden_hc_post
+from hc import golden_hc_pre
 from expert_routed import (
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
@@ -261,7 +258,6 @@ def l2_decode_layer(
     attention_output: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    gathered: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -296,10 +292,6 @@ def l2_decode_layer(
     next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     x_mixed: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_input_window: pld.DistributedTensor[[DECODE_INPUT_MAX_TOKENS, D], pl.BF16],
-    attention_input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    attention_output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
-    attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -317,7 +309,6 @@ def l2_decode_layer(
     layer_id: pl.Scalar[pl.INT32],
     rank: pl.Scalar[pl.INT32],
     attention_num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Run one scheduled Attention sublayer followed by the EP MoE sublayer."""
@@ -332,88 +323,163 @@ def l2_decode_layer(
     next_pre_mix.bind_dynamic(0, LOCAL_T_DYN)
     x_mixed.bind_dynamic(0, LOCAL_T_DYN)
     x_next.bind_dynamic(0, LOCAL_T_DYN)
-    group_base = rank // TP_SIZE * TP_SIZE
-    tp_rank = rank % TP_SIZE
 
     if layer_id < 2:
-        decode_swa_sharded(
+        decode_swa(
             x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
             attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
             wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
             rope_cos, rope_sin, window_slots, window_indices, window_cache,
             window_cache_scale, attention_output, attention_hidden, attention_pre_mix,
-            gathered, attention_input_window, attention_input_arrived,
-            attention_output_window, attention_output_arrived, rank,
-            attention_num_tokens, attention_epoch,
+            attention_num_tokens,
         )
     elif layer_id < 20:
         if (layer_id - 2) % 6 == 0:
-            decode_c2a_full_sharded(
-                x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-                attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-                wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
-                rope_cos, rope_sin, window_slots, window_indices, window_cache,
-                window_cache_scale, compressed_cache, compressed_cache_scale,
-                token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
-                index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin,
-                compressor_wkv, compressor_wgate, query_start_loc, state_block_table,
-                state_cache, compressor_norm_weight, compressed_slots, index_wk,
-                index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj,
-                topk_indices, attention_output, attention_hidden, attention_pre_mix,
-                gathered, attention_input_window, attention_input_arrived,
-                attention_output_window, attention_output_arrived, rank,
-                attention_num_tokens, attention_epoch,
+            decode_c2a_full(
+                x_hc,
+                incoming_pre_mix,
+                hc_attn_fn,
+                hc_attn_scale,
+                hc_attn_base,
+                attn_norm_weight,
+                wq_a,
+                wq_a_scale,
+                q_norm_weight,
+                wq_b,
+                wq_b_scale,
+                wkv,
+                wkv_scale,
+                kv_norm_weight,
+                attn_sink,
+                wo_a,
+                wo_b,
+                wo_b_scale,
+                rope_cos,
+                rope_sin,
+                window_slots,
+                window_indices,
+                window_cache,
+                window_cache_scale,
+                compressed_cache,
+                compressed_cache_scale,
+                token_to_req_indices,
+                compressed_lens,
+                index_cache,
+                index_cache_scale,
+                index_block_table,
+                position_ids,
+                compressed_rope_cos,
+                compressed_rope_sin,
+                compressor_wkv,
+                compressor_wgate,
+                query_start_loc,
+                state_block_table,
+                state_cache,
+                compressor_norm_weight,
+                compressed_slots,
+                index_wk,
+                index_norm_weight,
+                index_wq_b,
+                index_wq_b_scale,
+                index_weights_proj,
+                topk_indices,
+                attention_hidden,
+                attention_pre_mix,
+                attention_num_tokens,
             )
         else:
-            decode_c2a_reuse_sharded(
-                x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-                attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-                wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
-                rope_cos, rope_sin, window_slots, window_indices, window_cache,
-                window_cache_scale, compressed_cache, compressed_cache_scale,
-                topk_indices, attention_output, attention_hidden, attention_pre_mix,
-                gathered, attention_input_window, attention_input_arrived,
-                attention_output_window, attention_output_arrived, rank,
-                attention_num_tokens, attention_epoch,
+            decode_c2a_reuse(
+                x_hc,
+                incoming_pre_mix,
+                hc_attn_fn,
+                hc_attn_scale,
+                hc_attn_base,
+                attn_norm_weight,
+                wq_a,
+                wq_a_scale,
+                q_norm_weight,
+                wq_b,
+                wq_b_scale,
+                wkv,
+                wkv_scale,
+                kv_norm_weight,
+                attn_sink,
+                wo_a,
+                wo_b,
+                wo_b_scale,
+                rope_cos,
+                rope_sin,
+                window_slots,
+                window_indices,
+                window_cache,
+                window_cache_scale,
+                compressed_cache,
+                compressed_cache_scale,
+                topk_indices,
+                attention_hidden,
+                attention_pre_mix,
+                attention_num_tokens,
             )
     elif layer_id == 20:
-        decode_c1a_full_sharded(
-            x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
-            rope_cos, rope_sin, window_slots, window_indices, window_cache,
-            window_cache_scale, compressed_cache, compressed_cache_scale, request_ids,
-            compressed_lens, index_cache, index_cache_scale, index_block_table,
-            compressed_rope_cos, compressed_rope_sin, c1a_compressor_wkv,
-            compressor_norm_weight, compressed_slots, index_wk, index_norm_weight,
-            index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices,
-            pool_block_ids, pool_block_counts, gathered, attention_input_window, attention_input_arrived,
-            attention_output_window, attention_output_arrived, attention_hidden,
-            attention_pre_mix, group_base, tp_rank, attention_num_tokens, attention_epoch,
+        decode_c1a_full(
+            x_hc, incoming_pre_mix,
+            hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_weight,
+            wq_a, wq_a_scale, q_norm_weight,
+            wq_b, wq_b_scale,
+            wkv, wkv_scale, kv_norm_weight,
+            attn_sink,
+            wo_a, wo_b, wo_b_scale,
+            rope_cos, rope_sin,
+            window_slots, window_indices,
+            window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+            request_ids, compressed_lens,
+            index_cache, index_cache_scale, index_block_table,
+            compressed_rope_cos, compressed_rope_sin,
+            c1a_compressor_wkv, compressor_norm_weight, compressed_slots,
+            index_wk, index_norm_weight,
+            index_wq_b, index_wq_b_scale, index_weights_proj,
+            topk_indices, pool_block_ids, pool_block_counts,
+            attention_hidden, attention_pre_mix,
+            attention_num_tokens,
         )
     elif layer_id % 4 == 0:
-        decode_c1a_reindex_sharded(
-            x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
-            rope_cos, rope_sin, window_slots, window_indices, window_cache,
-            window_cache_scale, compressed_cache, compressed_cache_scale, request_ids,
-            compressed_lens, index_cache, index_cache_scale, index_block_table,
-            pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj,
-            topk_indices, gathered, attention_input_window, attention_input_arrived,
-            attention_output_window, attention_output_arrived, attention_hidden,
-            attention_pre_mix, group_base, tp_rank, attention_num_tokens, attention_epoch,
+        decode_c1a_reindex(
+            x_hc, incoming_pre_mix,
+            hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_weight,
+            wq_a, wq_a_scale, q_norm_weight,
+            wq_b, wq_b_scale,
+            wkv, wkv_scale, kv_norm_weight,
+            attn_sink,
+            wo_a, wo_b, wo_b_scale,
+            rope_cos, rope_sin,
+            window_slots, window_indices,
+            window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+            request_ids, compressed_lens,
+            index_cache, index_cache_scale, index_block_table,
+            pool_block_ids, pool_block_counts,
+            index_wq_b, index_wq_b_scale, index_weights_proj,
+            topk_indices,
+            attention_hidden, attention_pre_mix,
+            attention_num_tokens,
         )
     else:
-        decode_c1a_reuse_sharded(
-            x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
-            rope_cos, rope_sin, window_slots, window_indices, window_cache,
-            window_cache_scale, compressed_cache, compressed_cache_scale,
-            compressed_indices, gathered, attention_input_window, attention_input_arrived,
-            attention_output_window, attention_output_arrived, attention_hidden,
-            attention_pre_mix, group_base, tp_rank, attention_num_tokens, attention_epoch,
+        decode_c1a_reuse(
+            x_hc, incoming_pre_mix,
+            hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_weight,
+            wq_a, wq_a_scale, q_norm_weight,
+            wq_b, wq_b_scale,
+            wkv, wkv_scale, kv_norm_weight,
+            attn_sink,
+            wo_a, wo_b, wo_b_scale,
+            rope_cos, rope_sin,
+            window_slots, window_indices,
+            window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+            compressed_indices,
+            attention_hidden, attention_pre_mix,
+            attention_num_tokens,
         )
 
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
@@ -514,7 +580,6 @@ def l3_decode_layer(
     attention_pre_mix: pl.Out[
         pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]
     ],
-    gathered: pl.Out[pl.Tensor[[EP_SIZE, T_DYN, D], pl.BF16]],
     hc_ffn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
@@ -540,10 +605,9 @@ def l3_decode_layer(
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     attention_num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    """Launch one complete sequence-parallel decode Block on the EP world."""
+    """Launch one complete TP1 decode Block on the EP world."""
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
     index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
@@ -551,10 +615,6 @@ def l3_decode_layer(
     index_block_table.bind_dynamic(2, TABLE_DYN)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     pool_block_ids.bind_dynamic(2, INDEX_POOL_BLOCKS_DYN)
-    attention_input_buffer = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
-    attention_input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    attention_output_buffer = pld.alloc_window_buffer([DECODE_MAX_TOKENS, D], dtype=pl.FP32)
-    attention_output_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
@@ -569,10 +629,6 @@ def l3_decode_layer(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
     for rank in pl.range(pld.world_size()):
-        attention_input_window = pld.window(attention_input_buffer, [DECODE_INPUT_MAX_TOKENS, D], dtype=pl.BF16)
-        attention_input_arrived = pld.window(attention_input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        attention_output_window = pld.window(attention_output_buffer, [DECODE_MAX_TOKENS, D], dtype=pl.FP32)
-        attention_output_arrived = pld.window(attention_output_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
         recv_scale = pld.window(recv_scale_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
@@ -657,7 +713,6 @@ def l3_decode_layer(
             attention_output[rank],
             attention_hidden[rank],
             attention_pre_mix[rank],
-            gathered[rank],
             hc_ffn_fn[rank],
             hc_ffn_scale[rank],
             hc_ffn_base[rank],
@@ -680,10 +735,6 @@ def l3_decode_layer(
             next_pre_mix[rank],
             x_mixed[rank],
             x_next[rank],
-            attention_input_window,
-            attention_input_arrived,
-            attention_output_window,
-            attention_output_arrived,
             recv_meta,
             recv_x,
             recv_scale,
@@ -697,12 +748,11 @@ def l3_decode_layer(
             layer_id,
             rank,
             attention_num_tokens,
-            attention_epoch,
             moe_epoch,
             device=rank,
         )
 ATTENTION_GOLDENS = {
-    DecodeLayerKind.SWA: golden_decode_attn_swa,
+    DecodeLayerKind.SWA: golden_swa_attention,
     DecodeLayerKind.C2A_FULL: golden_decode_attn_c2a_full,
     DecodeLayerKind.C2A_REUSE: golden_decode_attn_c2a_reuse,
     DecodeLayerKind.C1A_FULL: golden_decode_attn_c1a_full,
@@ -839,22 +889,22 @@ def golden_decode_layer(
         raise ValueError("Block golden currently requires all capacity rows to be active")
     attention_golden = ATTENTION_GOLDENS[decode_layer_kind(layer_id)]
     attn_pre, attn_post, attn_residual = golden_mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base)
-    attention_input = golden_mhc_pre(x_hc, incoming_pre_mix)
+    attention_input = golden_hc_pre(x_hc, incoming_pre_mix).to(torch.bfloat16)
     normalized_attention = golden_rms_norm(attention_input, attn_norm_weight)
     attention_kwargs = _select_inputs(attention_golden, attention_inputs, {"x": normalized_attention})
     attention = attention_golden(**attention_kwargs)
-    attention_hidden = golden_mhc_post(attention.output, x_hc, attn_post, attn_residual)
+    attention_hidden = golden_hc_post(attention.output, x_hc, attn_post, attn_residual).to(torch.float32)
 
     next_pre_mix, ffn_post, ffn_residual = golden_mhc_mixes(
         attention_hidden, hc_ffn_fn, hc_ffn_scale, hc_ffn_base
     )
-    ffn_input = golden_mhc_pre(attention_hidden, attn_pre)
+    ffn_input = golden_hc_pre(attention_hidden, attn_pre).to(torch.bfloat16)
     moe_overrides = {"x": ffn_input, "norm_weight": ffn_norm_weight}
     if num_tokens is not None:
         moe_overrides["num_tokens"] = num_tokens
     moe_kwargs = _select_inputs(golden_decode_moe, moe_inputs, moe_overrides)
     ffn_output = golden_decode_moe(**moe_kwargs)
-    output = golden_mhc_post(ffn_output, attention_hidden, ffn_post, ffn_residual)
+    output = golden_hc_post(ffn_output, attention_hidden, ffn_post, ffn_residual).to(torch.float32)
     return DecodeLayerGoldenResult(
         output=output,
         next_pre_mix=next_pre_mix,
@@ -900,8 +950,7 @@ def _fixture_extent(dim, global_tokens):
 def build_tensor_specs(layer_id=0, seed=0):
     """Build a complete L3 fixture for one SWA decode Block.
 
-    Layer 0 is the cheapest branch that still exercises the real TP input
-    gather, TP output reduce-scatter, mHC boundaries, EP dispatch, experts,
+    Layer 0 exercises local attention, mHC boundaries, EP dispatch, experts,
     combine, and final residual expansion.
     """
     if decode_layer_kind(layer_id) != DecodeLayerKind.SWA:
@@ -928,12 +977,12 @@ def build_tensor_specs(layer_id=0, seed=0):
         pages=1,
         case="mixed",
     )
-    attention_specs = decode_swa.build_specs_sharded(args)
+    attention_specs = decode_swa.build_specs(args)
     by_name = {}
     groups = EP_SIZE // TP_SIZE
     attention_outputs = {
-        "attention_output", "attention_hidden", "attention_pre_mix", "gathered",
-        "num_tokens", "attention_epoch",
+        "attention_output", "attention_hidden", "attention_pre_mix",
+        "num_tokens",
     }
     for spec in attention_specs:
         if not isinstance(spec, TensorSpec) or spec.name in attention_outputs:
@@ -1002,7 +1051,6 @@ def build_tensor_specs(layer_id=0, seed=0):
         "attention_output",
         "attention_hidden",
         "attention_pre_mix",
-        "gathered",
         "next_pre_mix",
         "x_mixed",
         "x_next",
@@ -1010,7 +1058,6 @@ def build_tensor_specs(layer_id=0, seed=0):
     scalar_values = {
         "layer_id": layer_id,
         "attention_num_tokens": global_tokens,
-        "attention_epoch": 1,
         "moe_epoch": 1,
     }
     specs = []
@@ -1047,7 +1094,7 @@ def _fixture_moe_counts():
 
 
 def golden_l3_decode_layer(tensors):
-    """Run the sequence-parallel Attention golden, then the distributed MoE golden."""
+    """Run the local Attention golden, then the distributed MoE golden."""
     import decode_swa
     from moe import golden_moe
 
@@ -1067,10 +1114,8 @@ def golden_l3_decode_layer(tensors):
         ]
         group["attention_hidden"] = attention_hidden[group_base : group_base + TP_SIZE]
         group["attention_pre_mix"] = attention_pre_mix[group_base : group_base + TP_SIZE]
-        group["gathered"] = tensors["gathered"][group_base : group_base + TP_SIZE]
         group["num_tokens"] = global_tokens
-        group["attention_epoch"] = int(tensors["attention_epoch"])
-        decode_swa.golden_decode_swa_sharded(group)
+        decode_swa.golden_decode_swa(group)
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = attention_hidden
@@ -1137,7 +1182,7 @@ def _compare_moe_from_actual_attention(counts):
 def _compare_next_pre_mix_from_actual_attention(counts):
     """Check mHC coefficients independently of accepted Attention error."""
     from golden import ratio_allclose
-    from hc_mixes import golden_mhc_mixes
+    from hc import golden_mhc_mixes
 
     compare_mixes = _compare_active_rows_per_rank(
         ratio_allclose(atol=2.5e-5, rtol=5e-3, max_error_ratio=0.03), counts,
@@ -1287,12 +1332,12 @@ def make_decode_layer_golden_inputs(layer_id: int) -> dict:
 
 if __name__ == "__main__":
     from golden import ratio_allclose, ratio_reldiff, run
-    import decode_attn_swa
+    from utils import swa_window_cache_compare
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", default="a5", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(SUPPORTED_TP_SIZES))
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1])
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=list(SUPPORTED_EP_SIZES))
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--layer-id", type=int, default=0)
@@ -1392,7 +1437,7 @@ if __name__ == "__main__":
             # allow a 2% relative ceiling there too (observed: 2/2304, max rel ~0.9%).
             # window_slots is sized by the attention token capacity (DECODE_MAX_TOKENS), not
             # the padded MoE dispatch capacity (MOE_TOKENS).
-            **decode_attn_swa.window_cache_compare(
+            **swa_window_cache_compare(
                 EP_SIZE, DECODE_MAX_TOKENS, payload_atol=2 ** -9, payload_rtol=2 ** -3,
                 payload_error_ratio=0.01, scale_rtol=0.02, scale_error_ratio=0.01,
             ),
@@ -1413,7 +1458,6 @@ if __name__ == "__main__":
                 counts,
             ),
             "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
-            "gathered": ratio_allclose(atol=2 ** -6, rtol=2 ** -6),
             "next_pre_mix": _compare_next_pre_mix_from_actual_attention(counts),
             "x_mixed": _compare_active_rows_per_rank(
                 ratio_reldiff(diff_thd=0.01, pct_thd=0.05),

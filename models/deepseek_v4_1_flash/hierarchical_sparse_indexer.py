@@ -785,17 +785,6 @@ def select_candidate_block_pool(
     return counts_tid
 
 
-@pl.jit.inline(auto_scope=False)
-def hierarchical_sparse_indexer(
-    index_scores: pl.Tensor[[T_DYN, INDEX_SCORE_POSITIONS_DYN], pl.FP32],
-    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-    candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
-):
-    """Select candidate blocks from scores with optional trailing row padding."""
-    _hierarchical_sparse_indexer(index_scores, compressed_lens, candidate_mask)
-    return candidate_mask
-
-
 if __name__ == "__main__":
     width = 2050 * 8
     scores = -torch.arange(width, dtype=torch.float32).reshape(1, width)

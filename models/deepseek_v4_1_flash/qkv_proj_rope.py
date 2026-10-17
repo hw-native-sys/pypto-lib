@@ -11,17 +11,9 @@
 import pypto.language as pl
 import torch
 
-from rmsnorm import rms_norm
-from config import (
-    FLASH as M,
-    T_DYN,
-    TP_SIZE,
-    ORI_BLOCKS_DYN,
-)
-
-
+from config import FLASH as M, T_DYN, TP_SIZE
 from quant import golden_mxfp8_linear, mxfp8_linear
-from rmsnorm import golden_rms_norm
+from rmsnorm import golden_rms_norm, rms_norm
 
 
 # model config
@@ -31,442 +23,180 @@ HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 Q_LORA = M.q_lora_rank
 
-# Shared projection tiling.
+# tiling
 M_TILE = 16
-MX_M_TILE = 32
 N_TILE = 128
 K_TILE = 256
 
 
-_PREFILL_WORKERS = 64
-_PREFILL_PROJECTION_K_TILE = 32
-
-
 @pl.jit.inline
-def prefill_c1a_publish_window(
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+def rope(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
+    heads: pl.constexpr,
+    name_hint: pl.constexpr,
+    max_workers: pl.constexpr,
 ):
-    blocks = pl.tensor.dim(cache, 0)
-    cache_rows = blocks * 128
-    flat = pl.reshape(cache, [cache_rows, HEAD_DIM])
-    scale_flat = pl.reshape(scales, [cache_rows, HEAD_DIM // 32])
-    with pl.spmd(num_tokens, name_hint="c1a_cache_publish", deps=[cache_ready]) as publish_tid:
-        t = pl.tile.get_block_idx()
-        slot_i64 = pl.read(slots, [t])
-        if slot_i64 >= 0:
-            slot = pl.cast(slot_i64, pl.INDEX)
-            source = pl.slice(kv, [1, HEAD_DIM * 2], [t, 0], valid_shape=[1, HEAD_DIM])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, HEAD_DIM * 2)
-            value = pl.reshape(pl.cast(source, pl.FP32), [HEAD_DIM // 16, 32])
-            amax = pl.maximum(pl.row_max(pl.abs(value)), 1e-4)
-            scale = pl.cast(pl.mul(amax, 1.0 / 448.0), pl.BF16, mode="rint")
-            payload = pl.cast(pl.row_expand_div(value, pl.cast(scale, pl.FP32)), pl.FP8E4M3FN, mode="rint")
-            flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(payload, [1, HEAD_DIM * 2]), 1, HEAD_DIM)
-            scale_flat[slot:slot + 1, :] = pl.set_validshape(pl.reshape(scale, [1, HEAD_DIM // 16]), 1, HEAD_DIM // 32)
-    return publish_tid
+    blocks = num_tokens * heads
+    workers = pl.min(blocks, max_workers)
+    for worker in pl.spmd(workers, name_hint=name_hint):
+        for block in pl.range(worker, blocks, workers):
+            t = block // heads
+            h = block % heads
+            base = h * HEAD_DIM
+            output[t : t + 1, base : base + (HEAD_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (HEAD_DIM - ROPE_DIM)]
+            tail = pl.cast(x[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM], pl.FP32)
+            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+            c = cos[t : t + 1, :]
+            s = pl.mul(sin[t : t + 1, :], 1.0)
+            re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
+            im = pl.add(pl.mul(even, s), pl.mul(odd, c))
+            rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
+            rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
+            output[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM] = pl.cast(rotated, pl.BF16, mode="rint")
+    return output
 
 
-def _make_mx_projection_block(width, output_width, output_dtype, n_tile):
-    """Compute one scaled FP8/MX projection tile."""
-    fp32_output = output_dtype == pl.FP32
-
-    @pl.jit.inline
-    def project_block(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
-        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Tensor[[T_DYN, output_width], output_dtype],
-        num_tokens: pl.Scalar[pl.INT32],
-        mt: pl.Scalar[pl.INDEX],
-        block: pl.Scalar[pl.INDEX],
-    ):
-        t0 = mt * MX_M_TILE
-        n0 = block * n_tile
-        rows = pl.min(MX_M_TILE, num_tokens - t0)
-        first = pl.load(x, [t0, 0], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
-        first = pl.set_validshape(pl.fillpad(first, pad_value=pl.PadValue.zero), MX_M_TILE, K_TILE)
-        firstq_values = pl.reshape(pl.cast(first, pl.FP32), [MX_M_TILE * (K_TILE // 32), 32])
-        firstq_reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
-        firstq_maximum = pl.maximum(pl.row_max(pl.abs(firstq_values), tmp_tile=firstq_reduce_tmp), 1e-4)
-        firstq_bits = pl.reinterpret_view(pl.mul(firstq_maximum, 1.0 / 448.0), pl.INT32)
-        firstq_exponent = pl.shrs(pl.add(firstq_bits, 8388607), 23)
-        firstq_scale = pl.reinterpret_view(pl.shls(firstq_exponent, 23), pl.FP32)
-        firstq_quantized = pl.cast(pl.row_expand_div(firstq_values, firstq_scale), pl.FP8E4M3FN, mode="rint")
-        firstq_payload = pl.reshape(firstq_quantized, [MX_M_TILE, K_TILE])
-        firstq_signed_exponent = pl.sub(firstq_exponent, pl.mul(pl.shrs(firstq_exponent, 7), 256))
-        firstq_codes = pl.reinterpret_view(pl.cast(firstq_signed_exponent, pl.INT8), pl.UINT8)
-        firstq_flat = pl.reshape(firstq_codes, [1, MX_M_TILE * (K_TILE // 32)])
-        firstq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-        firstq_packed = pl.tmov_x2zz(firstq_flat, firstq_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8)
-        a0 = firstq_payload
-        sa0 = pl.reinterpret_view(firstq_packed, pl.FP8E8M0)
-        b0 = pl.load(weight, [0, n0], [K_TILE, n_tile])
-        sb0 = pl.load(scale, [0, n0], [K_TILE // 32, n_tile])
-        acc = pl.matmul_mx(a0, sa0, b0, sb0)
-        for kb in pl.range(1, width // K_TILE):
-            k0 = kb * K_TILE
-            values = pl.load(x, [t0, k0], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
-            values = pl.set_validshape(pl.fillpad(values, pad_value=pl.PadValue.zero), MX_M_TILE, K_TILE)
-            nextq_values = pl.reshape(pl.cast(values, pl.FP32), [MX_M_TILE * (K_TILE // 32), 32])
-            nextq_reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
-            nextq_maximum = pl.maximum(pl.row_max(pl.abs(nextq_values), tmp_tile=nextq_reduce_tmp), 1e-4)
-            nextq_bits = pl.reinterpret_view(pl.mul(nextq_maximum, 1.0 / 448.0), pl.INT32)
-            nextq_exponent = pl.shrs(pl.add(nextq_bits, 8388607), 23)
-            nextq_scale = pl.reinterpret_view(pl.shls(nextq_exponent, 23), pl.FP32)
-            nextq_quantized = pl.cast(pl.row_expand_div(nextq_values, nextq_scale), pl.FP8E4M3FN, mode="rint")
-            nextq_payload = pl.reshape(nextq_quantized, [MX_M_TILE, K_TILE])
-            nextq_signed_exponent = pl.sub(nextq_exponent, pl.mul(pl.shrs(nextq_exponent, 7), 256))
-            nextq_codes = pl.reinterpret_view(pl.cast(nextq_signed_exponent, pl.INT8), pl.UINT8)
-            nextq_flat = pl.reshape(nextq_codes, [1, MX_M_TILE * (K_TILE // 32)])
-            nextq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-            nextq_packed = pl.tmov_x2zz(nextq_flat, nextq_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8)
-            a = nextq_payload
-            sa = pl.reinterpret_view(nextq_packed, pl.FP8E8M0)
-            b = pl.load(weight, [k0, n0], [K_TILE, n_tile])
-            sb = pl.load(scale, [k0 // 32, n0], [K_TILE // 32, n_tile])
-            acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-        if fp32_output:
-            output = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile), [t0, n0], output)
-        else:
-            value = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
-        return output
-
-    return project_block
-
-
-def make_mx_projection(width, output_width, output_dtype=pl.BF16, *, name_hint="attention_mx_projection", n_tile=N_TILE):
-    """Specialize an MXFP8 projection without expanding weights in HBM."""
-    if n_tile <= 0 or n_tile % 16 or output_width % n_tile:
-        raise ValueError("MXFP8 output tile must be a positive multiple of 16 that divides output_width")
-    project_block = _make_mx_projection_block(width, output_width, output_dtype, n_tile)
-
-    @pl.jit.inline
-    def project(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
-        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Tensor[[T_DYN, output_width], output_dtype],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
-            for block in pl.spmd(output_width // n_tile, name_hint=name_hint):
-                output = project_block(x, weight, scale, output, num_tokens, mt, block)
-        return output
-
-    return project
-
-
-def make_mx_projection_ready(
-    width, output_width, output_dtype=pl.BF16, *, name_hint="attention_mx_projection", n_tile=N_TILE,
+@pl.jit.inline(auto_scope=False)
+def _mx_projection(
+    x: pl.Tensor,
+    weight: pl.Tensor,
+    scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+    quant_name: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
 ):
-    """Specialize an MXFP8 projection with an explicit completion TaskId."""
-    if n_tile <= 0 or n_tile % 16 or output_width % n_tile:
-        raise ValueError("MXFP8 output tile must be a positive multiple of 16 that divides output_width")
-    project_block = _make_mx_projection_block(width, output_width, output_dtype, n_tile)
-
-    @pl.jit.inline
-    def project(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
-        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Tensor[[T_DYN, output_width], output_dtype],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        # Dispatch all query tiles with one completion TaskId.
-        with pl.spmd(output_width // n_tile, name_hint=name_hint, deps=[ready]) as projection_tid:
-            block = pl.tile.get_block_idx()
-            for mt in pl.range((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
-                project_block(x, weight, scale, output, num_tokens, mt, block)
-        return projection_tid
-
-    return project
-
-
-def _make_group32_mx_projection(width, output_width, output_dtype=pl.BF16):
-    """Accumulate scale-corrected group-32 products without whole-weight expansion."""
-    fp32_output = output_dtype == pl.FP32
-
-    @pl.jit.inline
-    def project(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
-        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Tensor[[T_DYN, output_width], output_dtype],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        scale_storage = pl.tensor.view(scale, [output_width // 16, width // 2], layout=pl.ND)
-        # Read after the explicit scratch producer completes.
-        producer_deps = pl.array.create(1, pl.TASK_ID)
-        producer_deps[0] = ready
-        with pl.spmd(32, name_hint="c1a_mx_projection", deps=[producer_deps[0]]) as project_tid:
-            worker = pl.tile.get_block_idx()
-            for task in pl.range(worker, (num_tokens + 15) // 16 * (output_width // N_TILE), 32):
-                t0 = task // (output_width // N_TILE) * 16
-                n0 = task % (output_width // N_TILE) * N_TILE
-                rows = pl.min(16, num_tokens - t0)
-                acc = pl.tile.full([16, N_TILE], dtype=pl.FP32, value=0.0)
-                for kb in pl.range(width // 64):
-                    raw = pl.load(scale_storage, [n0 // 16, kb * 32], [N_TILE // 16, 32])
-                    raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
-                    codes = pl.ands(pl.cast(pl.reinterpret_view(raw_u8, pl.INT8), pl.INT32), 255)
-                    scale_pair = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
-                    for half in pl.unroll(2):
-                        k0 = (kb * 2 + half) * 32
-                        if half == 0:
-                            selected_scale = pl.tile.gather_mask(
-                                scale_pair, mask_pattern=pl.tile.MaskPattern.P0101
-                            )
-                        else:
-                            selected_scale = pl.tile.gather_mask(
-                                scale_pair, mask_pattern=pl.tile.MaskPattern.P1010
-                            )
-                        sb = pl.reshape(selected_scale, [1, N_TILE])
-                        source = pl.load(x, [t0, k0], [16, 32], valid_shape=[rows, 32])
-                        source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 16, 32)
-                        values = pl.cast(source, pl.FP32)
-                        temporary = pl.tile.create([16, 32], dtype=pl.FP32)
-                        maximum = pl.maximum(pl.row_max(pl.abs(values), tmp_tile=temporary), 1e-4)
-                        bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
-                        exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                        sa = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                        payload = pl.cast(pl.row_expand_div(values, sa), pl.FP8E4M3FN, mode="rint")
-                        a = pl.cast(payload, pl.BF16)
-                        b = pl.cast(pl.load(weight, [k0, n0], [32, N_TILE]), pl.BF16)
-                        dot = pl.matmul(a, b)
-                        part = pl.col_expand_mul(pl.row_expand_mul(dot, sa), sb)
-                        acc = pl.add(acc, part)
-                if fp32_output:
-                    output = pl.store(pl.set_validshape(acc, rows, N_TILE), [t0, n0], output)
-                else:
-                    result = pl.cast(acc, pl.BF16, mode="rint")
-                    output = pl.store(pl.set_validshape(result, rows, N_TILE), [t0, n0], output)
-        return output, project_tid
-
-    return project
+    """Quantize activation tiles once, then run separate MX projection tasks."""
+    for mt in pl.parallel((num_tokens + M_TILE - 1) // M_TILE):
+        t0 = mt * M_TILE
+        payload = pl.create_tensor([M_TILE, width], dtype=pl.FP8E4M3FN)
+        scale_size = M_TILE * (width // 32)
+        scale_backing = pl.create_tensor([1, scale_size], dtype=pl.FP8E8M0)
+        for block in pl.spmd(width // K_TILE, name_hint=quant_name):
+            k0 = block * K_TILE
+            rows = pl.min(M_TILE, num_tokens - t0)
+            source = pl.load(x, [t0, k0], [M_TILE, K_TILE], valid_shape=[rows, K_TILE])
+            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), M_TILE, K_TILE)
+            groups = pl.reshape(pl.cast(source, pl.FP32), [M_TILE * (K_TILE // 32), 32])
+            reduce_tmp = pl.create_tile([M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
+            maximum = pl.maximum(pl.row_max(pl.abs(groups), tmp_tile=reduce_tmp), 1e-4)
+            bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
+            exponent = pl.shrs(pl.add(bits, 8388607), 23)
+            group_scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+            quantized = pl.cast(pl.row_expand_div(groups, group_scale), pl.FP8E4M3FN, mode="rint")
+            quantized_tile = pl.reshape(quantized, [M_TILE, K_TILE])
+            payload = pl.store(quantized_tile, [0, k0], payload)
+            signed = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
+            codes = pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
+            flat = pl.reshape(codes, [1, M_TILE * (K_TILE // 32)])
+            pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+            packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=M_TILE, dst_cols=8)
+            packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
+            scale_offset = k0 // K_TILE * M_TILE * (K_TILE // 32)
+            packed_flat = pl.reshape(packed_scale, [1, M_TILE * (K_TILE // 32)])
+            scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
+        activation_scale = pl.tensor.view(scale_backing, [M_TILE, width // 32], layout=pl.MX_A_ZZ)
+        # Synchronize Cube/Vector startup within available clusters.
+        workers = pl.min(output_width // n_tile, pl.system.available_cluster_count())
+        for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
+            block_num = pl.tile.get_block_num()
+            for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
+                block = wave * block_num + worker
+                if block < output_width // n_tile:
+                    n0 = block * n_tile
+                    rows = pl.min(M_TILE, num_tokens - t0)
+                    a0 = pl.load(payload, [0, 0], [M_TILE, k_tile])
+                    sa0 = pl.load(activation_scale, [0, 0], [M_TILE, k_tile // 32])
+                    b0 = pl.load(weight, [0, n0], [k_tile, n_tile])
+                    sb0 = pl.load(scale, [0, n0], [k_tile // 32, n_tile])
+                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                    for k0 in pl.pipeline(k_tile, width, k_tile, stage=2):
+                        a = pl.load(payload, [0, k0], [M_TILE, k_tile])
+                        sa = pl.load(activation_scale, [0, k0 // 32], [M_TILE, k_tile // 32])
+                        b = pl.load(weight, [k0, n0], [k_tile, n_tile])
+                        sb = pl.load(scale, [k0 // 32, n0], [k_tile // 32, n_tile])
+                        acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                    value = pl.cast(acc, pl.BF16, mode="rint")
+                    output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
+    return output
 
 
-def make_group32_mx_projection(width, output_width, output_dtype=pl.BF16):
-    core = _make_group32_mx_projection(width, output_width, output_dtype)
-
-    @pl.jit.inline(auto_scope=False)
-    def project(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
-        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Tensor[[T_DYN, output_width], output_dtype],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        ready = pl.system.task_dummy(deps=[])
-        result, completed = core(x, weight, scale, output, num_tokens, ready)
-        return result
-
-    return project
-
-
-def make_group32_mx_projection_with_deps(width, output_width, output_dtype=pl.BF16):
-    core = _make_group32_mx_projection(width, output_width, output_dtype)
-
-    @pl.jit.inline(auto_scope=False)
-    def project(
-        x: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.FP8E4M3FN],
-        scale: pl.Tensor[[width // 32, output_width], pl.FP8E8M0, pl.MX_B_NN],
-        output: pl.Tensor[[T_DYN, output_width], output_dtype],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        result, completed = core(x, weight, scale, output, num_tokens, ready)
-        return completed
-
-    return project
-
-
-def _make_rope_block(heads, inverse, head_dim, rope_dim):
-    sign = -1.0 if inverse else 1.0
-    nope_dim = head_dim - rope_dim
-
-    @pl.jit.inline
-    def rotate_block(
-        x: pl.Tensor[[T_DYN, heads * head_dim], pl.BF16],
-        cos: pl.Tensor[[T_DYN, rope_dim // 2], pl.FP32],
-        sin: pl.Tensor[[T_DYN, rope_dim // 2], pl.FP32],
-        output: pl.Tensor[[T_DYN, heads * head_dim], pl.BF16],
-        block: pl.Scalar[pl.INT32],
-    ):
-        t = block // heads
-        h = block % heads
-        base = h * head_dim
-        output[t : t + 1, base : base + nope_dim] = x[t : t + 1, base : base + nope_dim]
-        tail = pl.cast(x[t : t + 1, base + nope_dim : base + head_dim], pl.FP32)
-        even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-        odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-        c = cos[t : t + 1, :]
-        s = pl.mul(sin[t : t + 1, :], sign)
-        re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-        im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-        rotated = pl.full([1, rope_dim], dtype=pl.FP32, value=0.0)
-        rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-        rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-        output[t : t + 1, base + nope_dim : base + head_dim] = pl.cast(
-            rotated, pl.BF16, mode="rint"
-        )
-        return output
-
-    return rotate_block
-
-
-def make_rope(
-    heads,
-    inverse=False,
-    *,
-    head_dim=HEAD_DIM,
-    rope_dim=ROPE_DIM,
-    max_workers=None,
-    name_hint="attention_rope",
+@pl.jit.inline(auto_scope=False)
+def q_proj_qr(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Specialize adjacent-pair RoPE with direct or capped strided scheduling."""
-    rotate_block = _make_rope_block(heads, inverse, head_dim, rope_dim)
-    worker_limit = 2**31 - 1 if max_workers is None else max_workers
-
-    @pl.jit.inline
-    def rotate(
-        x: pl.Tensor[[T_DYN, heads * head_dim], pl.BF16],
-        cos: pl.Tensor[[T_DYN, rope_dim // 2], pl.FP32],
-        sin: pl.Tensor[[T_DYN, rope_dim // 2], pl.FP32],
-        output: pl.Tensor[[T_DYN, heads * head_dim], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        blocks = num_tokens * heads
-        workers = pl.min(blocks, worker_limit)
-        for worker in pl.spmd(workers, name_hint=name_hint):
-            for block in pl.range(worker, blocks, workers):
-                rotate_block(x, cos, sin, output, block)
-        return output
-
-    return rotate
+    tokens = pl.tensor.dim(x, 0)
+    projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+    _mx_projection(
+        x, wq_a, wq_a_scale, projected,
+        num_tokens,
+        D, Q_LORA, "attention_q_a", "attention_q_a_quant", N_TILE, K_TILE,
+    )
+    norm_blocks = (num_tokens + 7) // 8
+    for norm_worker in pl.spmd(norm_blocks, name_hint="attention_q_norm"):
+        rms_norm(projected, q_norm_weight, query_latent, norm_worker, num_tokens, width=Q_LORA)
+    return query_latent
 
 
-def make_rope_with_deps(
-    heads,
-    inverse=False,
-    *,
-    head_dim=HEAD_DIM,
-    rope_dim=ROPE_DIM,
-    max_workers=None,
-    name_hint="attention_rope",
+@pl.jit.inline(auto_scope=False)
+def q_proj_rope(
+    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Specialize adjacent-pair RoPE with an explicit producer dependency."""
-    rotate_block = _make_rope_block(heads, inverse, head_dim, rope_dim)
-    worker_limit = 2**31 - 1 if max_workers is None else max_workers
-
-    @pl.jit.inline
-    def rotate(
-        x: pl.Tensor[[T_DYN, heads * head_dim], pl.BF16],
-        cos: pl.Tensor[[T_DYN, rope_dim // 2], pl.FP32],
-        sin: pl.Tensor[[T_DYN, rope_dim // 2], pl.FP32],
-        output: pl.Tensor[[T_DYN, heads * head_dim], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        blocks = num_tokens * heads
-        workers = pl.min(blocks, worker_limit)
-        with pl.spmd(workers, name_hint=name_hint, deps=[ready]) as rope_tid:
-            worker = pl.tile.get_block_idx()
-            for block in pl.range(worker, blocks, workers):
-                rotate_block(x, cos, sin, output, block)
-        return rope_tid
-
-    return rotate
+    tokens = pl.tensor.dim(query_latent, 0)
+    expanded = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    _mx_projection(
+        query_latent, wq_b, wq_b_scale, expanded, num_tokens,
+        Q_LORA, LOCAL_H * HEAD_DIM, "attention_q_b", "attention_q_b_quant", N_TILE, K_TILE,
+    )
+    rope(expanded, rope_cos, rope_sin, query, num_tokens, LOCAL_H, "attention_q_rope", 2147483647)
+    return query
 
 
-def _make_staged_bf16_projection(width, output_width, workers, name_hint):
-    n_tile = min(N_TILE, output_width)
-    k_tile = min(K_TILE, width)
-
-    @pl.jit.inline(auto_scope=False)
-    def project(
-        source: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.BF16],
-        output: pl.Tensor[[T_DYN, output_width], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        tokens = pl.tensor.dim(source, 0)
-        accumulated = pl.create_tensor([tokens, output_width], dtype=pl.FP32)
-        blocks = (num_tokens + M_TILE - 1) // M_TILE * (output_width // n_tile)
-        task_workers = pl.max(pl.min(blocks, workers), 1)
-        entry_deps = pl.array.create(1, pl.TASK_ID)
-        entry_deps[0] = ready
-        with pl.spmd(task_workers, name_hint=name_hint, deps=[entry_deps[0]]) as cube_tid:
-            worker = pl.tile.get_block_idx()
-            for block in pl.range(worker, blocks, task_workers):
-                row = block // (output_width // n_tile) * M_TILE
-                col = block % (output_width // n_tile) * n_tile
-                rows = pl.min(M_TILE, num_tokens - row)
-                acc = pl.create_tensor([M_TILE, n_tile], dtype=pl.FP32)
-                for k in pl.range(0, width, k_tile):
-                    a = pl.slice(source, [M_TILE, k_tile], [row, k], valid_shape=[rows, k_tile])
-                    # Establish Vector startup before the local Cube result transfer (#2829).
-                    a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
-                    w = pl.slice(weight, [k_tile, n_tile], [k, col])
-                    acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
-                value = pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile)
-                accumulated[row:row + M_TILE, col:col + n_tile] = value
-        with pl.spmd(task_workers, name_hint="bf16_projection_cast", deps=[cube_tid]) as cast_tid:
-            worker = pl.tile.get_block_idx()
-            for block in pl.range(worker, blocks, task_workers):
-                row = block // (output_width // n_tile) * M_TILE
-                col = block % (output_width // n_tile) * n_tile
-                rows = pl.min(M_TILE, num_tokens - row)
-                value = pl.slice(accumulated, [M_TILE, n_tile], [row, col], valid_shape=[rows, n_tile])
-                output[row:row + M_TILE, col:col + n_tile] = pl.cast(value, pl.BF16, mode="rint")
-        return output, cast_tid
-
-    return project
-
-
-def make_bf16_projection_staged(width, output_width):
-    """Stage FP32 values through Vector before the separate BF16 RNE boundary."""
-    core = _make_staged_bf16_projection(width, output_width, 2**31 - 1, "prefill_bf16_projection_cube")
-
-    @pl.jit.inline(auto_scope=False)
-    def project(
-        source: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.BF16],
-        output: pl.Tensor[[T_DYN, output_width], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        ready = pl.system.task_dummy(deps=[])
-        result, completed = core(source, weight, output, num_tokens, ready)
-        return result
-
-    return project
-
-
-def make_bf16_projection_with_deps(width, output_width, *, workers=32, name_hint="attention_bf16_projection"):
-    """Return completion of the shared staged projection and its BF16 store."""
-    core = _make_staged_bf16_projection(width, output_width, workers, name_hint)
-
-    @pl.jit.inline(auto_scope=False)
-    def project(
-        source: pl.Tensor[[T_DYN, width], pl.BF16],
-        weight: pl.Tensor[[width, output_width], pl.BF16],
-        output: pl.Tensor[[T_DYN, output_width], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        result, completed = core(source, weight, output, num_tokens, ready)
-        return completed
-
-    return project
+@pl.jit.inline(auto_scope=False)
+def kv_proj_rope(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    projected: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    tokens = pl.tensor.dim(x, 0)
+    _mx_projection(
+        x, wkv, wkv_scale, projected,
+        num_tokens,
+        D, HEAD_DIM, "attention_kv", "attention_kv_quant", N_TILE, K_TILE,
+    )
+    normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    norm_blocks = (num_tokens + 7) // 8
+    for norm_worker in pl.spmd(norm_blocks, name_hint="attention_kv_norm"):
+        rms_norm(projected, kv_norm_weight, normalized, norm_worker, num_tokens, width=HEAD_DIM)
+    rope(normalized, rope_cos, rope_sin, window_kv, num_tokens, 1, "attention_kv_rope", 2147483647)
+    return window_kv
 
 
 def golden_rope_interleave(
@@ -532,251 +262,3 @@ def golden_qkv_proj_rope(
     q = golden_rope_tail(q, cos, sin)
     kv = golden_rope_tail(kv, cos, sin)
     return q, kv, qr
-
-
-@pl.jit.inline
-def _prefill_project_qa(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    output: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Preserve the scale-corrected group-32 Prefill SWA Q projection."""
-    scale_storage = pl.tensor.view(scale, [Q_LORA // 16, D // 2], layout=pl.ND)
-    for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
-        t0 = mt * MX_M_TILE
-        for block in pl.spmd(Q_LORA // N_TILE, name_hint="prefill_attention_q_a"):
-            n0 = block * N_TILE
-            rows = pl.min(MX_M_TILE, num_tokens - t0)
-            acc = pl.tile.full([MX_M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(D // (2 * _PREFILL_PROJECTION_K_TILE)):
-                raw = pl.load(scale_storage, [n0 // 16, kb * 32], [N_TILE // 16, 32])
-                raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
-                codes = pl.ands(pl.cast(pl.reinterpret_view(raw_u8, pl.INT8), pl.INT32), 255)
-                scale_pair = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
-                for half in pl.unroll(2):
-                    k0 = (kb * 2 + half) * _PREFILL_PROJECTION_K_TILE
-                    if half == 0:
-                        gathered_scale = pl.tile.gather_mask(
-                            scale_pair, mask_pattern=pl.tile.MaskPattern.P0101
-                        )
-                    else:
-                        gathered_scale = pl.tile.gather_mask(
-                            scale_pair, mask_pattern=pl.tile.MaskPattern.P1010
-                        )
-                    sb = pl.reshape(gathered_scale, [1, N_TILE])
-                    source = pl.load(
-                        x,
-                        [t0, k0],
-                        [MX_M_TILE, _PREFILL_PROJECTION_K_TILE],
-                        valid_shape=[rows, _PREFILL_PROJECTION_K_TILE],
-                    )
-                    source = pl.set_validshape(
-                        pl.fillpad(source, pad_value=pl.PadValue.zero),
-                        MX_M_TILE,
-                        _PREFILL_PROJECTION_K_TILE,
-                    )
-                    value = pl.cast(source, pl.FP32)
-                    reduce_tmp = pl.create_tile([MX_M_TILE, _PREFILL_PROJECTION_K_TILE], dtype=pl.FP32)
-                    maximum = pl.maximum(pl.row_max(pl.abs(value), tmp_tile=reduce_tmp), 1e-4)
-                    bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
-                    exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                    sa = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                    payload = pl.cast(pl.row_expand_div(value, sa), pl.FP8E4M3FN, mode="rint")
-                    a = pl.cast(payload, pl.BF16)
-                    b = pl.cast(
-                        pl.load(weight, [k0, n0], [_PREFILL_PROJECTION_K_TILE, N_TILE]), pl.BF16
-                    )
-                    part = pl.col_expand_mul(pl.row_expand_mul(pl.matmul(a, b), sa), sb)
-                    acc = pl.add(acc, part)
-            result = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, N_TILE)
-            output = pl.store(result, [t0, n0], output)
-    return output
-
-
-def _make_q_proj_qr(project, worker_limit, norm_name):
-    @pl.jit.inline(auto_scope=False)
-    def q_proj_qr(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-        query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        tokens = pl.tensor.dim(x, 0)
-        projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        project(x, wq_a, wq_a_scale, projected, num_tokens)
-        norm_blocks = (num_tokens + 7) // 8
-        norm_workers = pl.min(norm_blocks, worker_limit)
-        for norm_worker in pl.spmd(norm_workers, name_hint=norm_name):
-            for norm_block in pl.range(norm_worker, norm_blocks, norm_workers):
-                rms_norm(projected, q_norm_weight, query_latent, norm_block, num_tokens, width=Q_LORA)
-        return query_latent
-
-    return q_proj_qr
-
-
-def _make_q_proj_rope(project, rotate):
-    @pl.jit.inline(auto_scope=False)
-    def q_proj_rope(
-        query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        tokens = pl.tensor.dim(query_latent, 0)
-        expanded = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        project(query_latent, wq_b, wq_b_scale, expanded, num_tokens)
-        rotate(expanded, rope_cos, rope_sin, query, num_tokens)
-        return query
-
-    return q_proj_rope
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_kv_proj_rope(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    projected: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Run Prefill KV preprocessing with caller-owned dependency scratch."""
-    tokens = pl.tensor.dim(x, 0)
-    _project_kv(x, wkv, wkv_scale, projected, num_tokens)
-    normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    norm_blocks = (num_tokens + 7) // 8
-    norm_workers = pl.min(norm_blocks, _PREFILL_WORKERS)
-    for norm_worker in pl.spmd(norm_workers, name_hint="prefill_attention_kv_norm"):
-        for norm_block in pl.range(norm_worker, norm_blocks, norm_workers):
-            rms_norm(projected, kv_norm_weight, normalized, norm_block, num_tokens, width=HEAD_DIM)
-    _prefill_rotate_kv(normalized, rope_cos, rope_sin, window_kv, num_tokens)
-    return window_kv
-
-
-@pl.jit.inline(auto_scope=False)
-def qkv_proj_rope(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
-    q_proj_rope(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
-    kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens)
-    return query_latent, query, window_kv
-
-
-def make_qkv_proj_rope_with_deps(
-    project_a,
-    project_b,
-    rotate_query,
-    project_kv,
-    rotate_kv,
-):
-    """Compose dependency-aware C1A decode primitives behind the shared stage boundary."""
-
-    @pl.jit.inline(auto_scope=False)
-    def qkv_proj_rope_with_deps(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-        q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-        wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-        kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-        query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-        ready: pl.Scalar[pl.TASK_ID],
-    ):
-        tokens = pl.tensor.dim(x, 0)
-        projected_q = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        qa_tid = project_a(x, wq_a, wq_a_scale, projected_q, num_tokens, ready)
-        norm_blocks = (num_tokens + 7) // 8
-        with pl.spmd(norm_blocks, name_hint="c1a_q_rmsnorm", deps=[qa_tid]) as qr_tid:
-            norm_worker = pl.tile.get_block_idx()
-            rms_norm(projected_q, q_norm_weight, query_latent, norm_worker, num_tokens, width=Q_LORA)
-        expanded_q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        qb_tid = project_b(query_latent, wq_b, wq_b_scale, expanded_q, num_tokens, qr_tid)
-        q_tid = rotate_query(expanded_q, rope_cos, rope_sin, query, num_tokens, qb_tid)
-        projected_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        kv_tid = project_kv(x, wkv, wkv_scale, projected_kv, num_tokens, ready)
-        normalized_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        norm_blocks = (num_tokens + 7) // 8
-        with pl.spmd(norm_blocks, name_hint="c1a_kv_rmsnorm", deps=[kv_tid]) as kvn_tid:
-            norm_worker = pl.tile.get_block_idx()
-            rms_norm(projected_kv, kv_norm_weight, normalized_kv, norm_worker, num_tokens, width=HEAD_DIM)
-        kvr_tid = rotate_kv(normalized_kv, rope_cos, rope_sin, window_kv, num_tokens, kvn_tid)
-        return qr_tid, q_tid, kvr_tid
-
-    return qkv_proj_rope_with_deps
-
-
-_project_qa = make_mx_projection(D, Q_LORA, name_hint="attention_q_a")
-_project_qb = make_mx_projection(Q_LORA, LOCAL_H * HEAD_DIM, name_hint="attention_q_b")
-_project_kv = make_mx_projection(D, HEAD_DIM, name_hint="attention_kv")
-_rotate_q = make_rope(LOCAL_H, name_hint="attention_q_rope")
-_rotate_kv = make_rope(1, name_hint="attention_kv_rope")
-
-_prefill_rotate_q = make_rope(
-    LOCAL_H, max_workers=_PREFILL_WORKERS, name_hint="prefill_attention_q_rope"
-)
-_prefill_rotate_kv = make_rope(
-    1, max_workers=_PREFILL_WORKERS, name_hint="prefill_attention_kv_rope"
-)
-
-q_proj_qr = _make_q_proj_qr(_prefill_project_qa, 2**31 - 1, "attention_q_norm")
-q_proj_rope = _make_q_proj_rope(_project_qb, _rotate_q)
-
-@pl.jit.inline(auto_scope=False)
-def kv_proj_rope(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    tokens = pl.tensor.dim(x, 0)
-    projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    _project_kv(x, wkv, wkv_scale, projected, num_tokens)
-    normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    norm_blocks = (num_tokens + 7) // 8
-    for norm_worker in pl.spmd(norm_blocks, name_hint="attention_kv_norm"):
-        rms_norm(projected, kv_norm_weight, normalized, norm_worker, num_tokens, width=HEAD_DIM)
-    _rotate_kv(normalized, rope_cos, rope_sin, window_kv, num_tokens)
-    return window_kv
-
-prefill_q_proj_qr = _make_q_proj_qr(_prefill_project_qa, _PREFILL_WORKERS, "prefill_attention_q_norm")
-prefill_q_proj_rope = _make_q_proj_rope(_project_qb, _prefill_rotate_q)
-
-
-make_mx_projection_with_deps = make_group32_mx_projection_with_deps

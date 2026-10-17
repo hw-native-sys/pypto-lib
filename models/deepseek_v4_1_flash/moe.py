@@ -52,9 +52,9 @@ from expert_routed import (
     MX_W3_PACKED_ROWS,
     expert_routed_scatter,
 )
-from hc_mixes import golden_mhc_mixes, mhc_mixes
-from hc_pre import golden_mhc_pre, mhc_pre
-from hc_post import golden_mhc_post, mhc_post_after
+from hc import golden_mhc_mixes, hc_mixes
+from hc import golden_hc_pre, hc_pre
+from hc import golden_hc_post, hc_post_after
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
 
 
@@ -709,11 +709,11 @@ def moe(
         [t, HC_MULT, HC_MULT], dtype=pl.FP32
     )
     ffn_input = pl.create_tensor([t, D], dtype=pl.BF16)
-    mixes_ready = mhc_mixes(
+    mixes_ready = hc_mixes(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         next_pre_mix, post_mix, residual_mix,
     )
-    mhc_pre(x_hc, pre_mix, x_mixed)
+    hc_pre(x_hc, pre_mix, x_mixed)
     norm_tokens = pl.tensor.dim(x_mixed, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
         rms_norm_tiled(x_mixed, norm_weight, ffn_input, norm_block, norm_tokens)
@@ -721,7 +721,7 @@ def moe(
     # Keep the transport windows and routed result alive through combine.
     with pl.scope():
         # combine writes every local active row, and _moe_core zero-initialises
-        # the whole buffer as its first action, so padded rows reach mhc_post
+        # the whole buffer as its first action, so padded rows reach hc_post
         # as the pure residual expansion.
         #
         # This must stay a pl.create_tensor(): pl.full() produces a fill value
@@ -740,7 +740,7 @@ def moe(
             combine_arrived, sublayer,
             num_tokens, ep_rank, moe_epoch,
         )
-        mhc_post_after(sublayer, x_hc, post_mix, residual_mix, x_next, sublayer_ready, mixes_ready)
+        hc_post_after(sublayer, x_hc, post_mix, residual_mix, x_next, sublayer_ready, mixes_ready)
     return x_next
 
 
@@ -1374,9 +1374,9 @@ def golden_moe(tensors):
         next_pre_mix[rank] = pre
         post_mix[rank] = post
         residual_mix[rank] = residual
-        x_mixed[rank] = golden_mhc_pre(
+        x_mixed[rank] = golden_hc_pre(
             x_hc[rank], tensors["pre_mix"][rank]
-        )
+        ).to(torch.bfloat16)
 
     tensors["next_pre_mix"][:] = next_pre_mix
     tensors["x_mixed"][:] = x_mixed
@@ -1396,10 +1396,10 @@ def golden_moe(tensors):
         EP_SIZE, MOE_TOKENS, HC_MULT, D, dtype=torch.float32
     )
     for rank in range(EP_SIZE):
-        x_next[rank] = golden_mhc_post(
+        x_next[rank] = golden_hc_post(
             sublayer[rank], x_hc[rank],
             post_mix[rank], residual_mix[rank],
-        )
+        ).to(torch.float32)
     tensors["x_next"][:] = x_next
 
 

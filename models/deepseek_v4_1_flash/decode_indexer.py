@@ -9,16 +9,16 @@
 """Decode indexer query preparation, key publication, scoring, and TopK."""
 
 import pypto.language as pl
+import torch
 
 from hierarchical_sparse_indexer import (
+    golden_index_query_fp4,
     make_index_query_quantizer,
     materialize_index_topk as _materialize_index_topk,
 )
 
-from qkv_proj_rope import (
-    make_bf16_projection_with_deps,
-    make_rope_with_deps,
-)
+from qkv_proj_rope import golden_rope_tail
+from quant import dequantize_mxfp4_cache, golden_bf16_gemm, golden_mxfp8_linear
 from rmsnorm import make_norm_with_deps
 from config import (
     B_DYN,
@@ -31,6 +31,9 @@ from config import (
     TABLE_DYN,
     T_DYN,
 )
+
+
+from quant import mxfp8_gemm_group32, bf16_gemm_staged
 
 
 # model config
@@ -50,6 +53,66 @@ _SCORE_SCALE = (INDEX_DIM * INDEX_H) ** -0.5
 _SCORE_N_TILE = 256
 _SCORE_MACRO_N_TILE = 512
 _PAIR_M_TILE = INDEX_H * 2
+
+
+INDEX_PROJ_N_TILE = 128
+INDEX_WEIGHT_N_TILE = min(128, INDEX_H)
+INDEX_PROJ_K_TILE = 256
+
+
+@pl.jit.inline
+def _index_query_rope_block(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
+    block: pl.Scalar[pl.INT32],
+):
+    t = block // INDEX_H
+    h = block % INDEX_H
+    base = h * INDEX_DIM
+    output[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)]
+    tail = pl.cast(x[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM], pl.FP32)
+    even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+    odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+    c = cos[t : t + 1, :]
+    s = pl.mul(sin[t : t + 1, :], 1.0)
+    re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
+    im = pl.add(pl.mul(even, s), pl.mul(odd, c))
+    rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
+    rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
+    rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
+    output[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM] = pl.cast(
+        rotated, pl.BF16, mode="rint"
+    )
+    return output
+
+
+@pl.jit.inline
+def _index_key_rope_block(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
+    block: pl.Scalar[pl.INT32],
+):
+    t = block
+    base = 0
+    output[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (INDEX_DIM - ROPE_DIM)]
+    tail = pl.cast(x[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM], pl.FP32)
+    even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+    odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+    c = cos[t : t + 1, :]
+    s = pl.mul(sin[t : t + 1, :], 1.0)
+    re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
+    im = pl.add(pl.mul(even, s), pl.mul(odd, c))
+    rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
+    rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
+    rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
+    output[t : t + 1, base + (INDEX_DIM - ROPE_DIM) : base + INDEX_DIM] = pl.cast(
+        rotated, pl.BF16, mode="rint"
+    )
+    return output
 
 
 def make_fp4_publish(width, group, scale_dtype, cache_dim):
@@ -1086,8 +1149,6 @@ _sort_index_topk_leaf, _merge_index_topk_rows = _make_index_topk_pairs()
 _sort_c2a_topk_leaf, _merge_c2a_topk_rows = _make_index_topk_pairs(query_rows=True)
 
 
-
-
 @pl.jit.inline(auto_scope=False)
 def select_index_topk(
     index_scores: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.FP32],
@@ -1349,59 +1410,116 @@ def select_pool_index_topk(
     return merge_tid
 
 
-project_index_weights = make_bf16_projection_with_deps(
-    D, INDEX_H, name_hint="c1a_index_weights_projection"
-)
-rotate_index_query = make_rope_with_deps(
-    INDEX_H, head_dim=INDEX_DIM, name_hint="c1a_index_query_rope"
-)
+@pl.jit.inline(auto_scope=False)
+def project_index_weights(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    result, completed = bf16_gemm_staged(
+        source, weight, output, num_tokens, ready,
+        width=D, output_width=INDEX_H, n_tile=INDEX_WEIGHT_N_TILE, k_tile=INDEX_PROJ_K_TILE,
+        workers=32, name_hint='c1a_index_weights_projection',
+    )
+    return completed
 
 
-def make_indexer_prepare(project_query):
-    """Bind the Full-owned MX query projection to indexer preparation."""
+@pl.jit.inline(auto_scope=False)
+def rotate_index_query(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    blocks = num_tokens * INDEX_H
+    workers = pl.min(blocks, 2147483647)
+    with pl.spmd(workers, name_hint='c1a_index_query_rope', deps=[ready]) as rope_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, workers):
+            _index_query_rope_block(x, cos, sin, output, block)
+    return rope_tid
 
-    @pl.jit.inline(auto_scope=False)
-    def c1a_index(
-        x: pl.Tensor[[T_DYN, D], pl.BF16],
-        qr: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-        index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
-        index_wq_b_scale: pl.Tensor[
-            [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
-        ],
-        index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
-        cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        num_tokens: pl.Scalar[pl.INT32],
-        score_width: pl.Scalar[pl.INDEX],
-        entry_ready: pl.Scalar[pl.TASK_ID],
-        qr_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        tokens = pl.tensor.dim(x, 0)
-        projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-        projected_tid = project_query(
-            qr, index_wq_b, index_wq_b_scale, projected, num_tokens, qr_ready,
-        )
-        rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-        rotated_tid = rotate_index_query(projected, cos, sin, rotated, num_tokens, projected_tid)
-        query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
-        query_scale = pl.create_tensor(
-            [tokens, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0
-        )
-        query_tid = quantize_index_query(rotated, query, query_scale, num_tokens, rotated_tid)
-        weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-        weights_tid = project_index_weights(
-            x, index_weights_proj, weights, num_tokens, entry_ready
-        )
-        scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
-        return query, query_scale, weights, scores, query_tid, weights_tid
 
-    return c1a_index
+@pl.jit.inline(auto_scope=False)
+def c1a_index(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    qr: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[
+        [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
+    ],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    score_width: pl.Scalar[pl.INDEX],
+    entry_ready: pl.Scalar[pl.TASK_ID],
+):
+    tokens = pl.tensor.dim(x, 0)
+    projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
+    query_projection_result, query_projection_tid = mxfp8_gemm_group32(
+        qr, index_wq_b, index_wq_b_scale,
+        projected,
+        num_tokens, entry_ready,
+        width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
+    )
+    projected_tid = query_projection_tid
+    rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
+    rotated_tid = rotate_index_query(projected, cos, sin, rotated, num_tokens, projected_tid)
+    query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
+    query_scale = pl.create_tensor(
+        [tokens, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0
+    )
+    query_tid = quantize_index_query(rotated, query, query_scale, num_tokens, rotated_tid)
+    weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
+    weights_tid = project_index_weights(
+        x, index_weights_proj, weights, num_tokens, entry_ready
+    )
+    scores = pl.create_tensor([tokens, score_width], dtype=pl.FP32)
+    return query, query_scale, weights, scores, query_tid, weights_tid
 
 
 # C2A index-key projection, RMSNorm, and trailing RoPE.
-c2a_project_index_key = make_bf16_projection_with_deps(HEAD_DIM, INDEX_DIM, name_hint="c2a_index_key_projection")
+
+
+@pl.jit.inline(auto_scope=False)
+def c2a_project_index_key(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    result, completed = bf16_gemm_staged(
+        source, weight, output, num_tokens, ready,
+        width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
+        workers=32, name_hint='c2a_index_key_projection',
+    )
+    return completed
+
 c2a_normalize_index_key = make_norm_with_deps(INDEX_DIM, name_hint="c2a_index_key_rmsnorm")
-c2a_rotate_index_key = make_rope_with_deps(1, head_dim=INDEX_DIM, name_hint="c2a_index_key_rope")
+
+
+@pl.jit.inline(auto_scope=False)
+def c2a_rotate_index_key(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    blocks = num_tokens
+    workers = pl.min(blocks, 2147483647)
+    with pl.spmd(workers, name_hint='c2a_index_key_rope', deps=[ready]) as rope_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, workers):
+            _index_key_rope_block(x, cos, sin, output, block)
+    return rope_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1559,7 +1677,214 @@ def select_c2a_index_topk(
     return order_tid
 
 
+publish_c2a_index = make_fp4_publish(INDEX_DIM, INDEX_CACHE_GROUP, pl.FP8E8M0, INDEX_BLOCKS_DYN)
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_c2a_indexer(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    qr: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+    latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, (INDEX_DIM // 2)], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, (INDEX_DIM // INDEX_CACHE_GROUP)], pl.FP8E8M0],
+    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+    latent_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Publish C2A keys and select long histories through the shared MX scorer."""
+    index_key, index_key_tid = prepare_c2a_index_key(
+        latent, index_wk, index_norm_weight,
+        compressed_rope_cos, compressed_rope_sin,
+        num_tokens, latent_ready,
+    )
+    index_publish_tid = publish_c2a_index(
+        index_key, compressed_slots,
+        index_cache, index_cache_scale,
+        num_tokens, cache_ready, index_key_tid,
+    )
+    # The dense arena follows logical page-table capacity, never allocated cache pages.
+    score_width = pl.tensor.dim(index_block_table, 1) * 128
+    query, query_scale, raw_weights, scores, query_tid, weights_tid = c1a_index(
+        x, qr,
+        index_wq_b, index_wq_b_scale, index_weights_proj,
+        rope_cos, rope_sin,
+        num_tokens, score_width,
+        cache_ready,
+    )
+    scores_tid = score_c2a_full(
+        query, query_scale, raw_weights,
+        index_cache, index_cache_scale,
+        index_block_table, token_to_req_indices, compressed_lens,
+        scores,
+        num_tokens,
+        index_publish_tid, query_tid, weights_tid,
+    )
+    return select_c2a_index_topk(
+        scores,
+        index_block_table, token_to_req_indices, compressed_lens,
+        topk_indices,
+        num_tokens, scores_tid,
+    )
+
+
+def golden_c1a_index_scores(a, qr, index_payload, index_scale):
+    """Rebuild the per-token index scores and the physical row behind every logical column."""
+    from qkv_proj_rope import golden_rope_interleave as rope_interleave
+    from quant import dequantize_mxfp4_cache
+
+    x = a["x"]
+    lengths = a["compressed_lens"]
+    # Logical page-table score columns.
+    width = a["index_block_table"].shape[-1] * 128
+    heads = a["index_weights_proj"].shape[-1]
+    iq = golden_mxfp8_linear(qr, a["index_wq_b"], a["index_wq_b_scale"])
+    if iq.shape[-1] % heads:
+        raise RuntimeError(f"index query width {iq.shape[-1]} is not divisible by {heads} heads")
+    dim = iq.shape[-1] // heads
+    rd = a["rope_cos"].shape[-1] * 2
+    iq = iq.unflatten(-1, (heads, dim))
+    iq = torch.cat((iq[..., :-rd], rope_interleave(iq[..., -rd:], a["rope_cos"], a["rope_sin"])), -1)
+    iq = golden_index_query_fp4(iq)
+    keys = dequantize_mxfp4_cache(index_payload, index_scale, 32, "e8m0").to(x.dtype).flatten(0, 1)[:, 0]
+    # The device scales the projected head weight in FP32 and rounds it once to BF16.
+    weight = golden_bf16_gemm(x, a["index_weights_proj"]).float() * (dim * heads) ** -0.5
+    weight = weight.to(torch.bfloat16).float()
+    scores = torch.full((x.shape[0], width), -torch.inf)
+    physical = torch.full((x.shape[0], width), -1, dtype=torch.int64)
+    for t in range(x.shape[0]):
+        count = max(0, min(int(lengths[t]), width))
+        pos = torch.arange(count)
+        pages = a["index_block_table"][a["request_ids"][t].long(), pos // 128]
+        valid = pages >= 0
+        valid_pos = pos[valid]
+        rows = pages[valid] * 128 + valid_pos % 128
+        physical[t, valid_pos] = rows
+        if not valid_pos.numel():
+            continue
+        # Device order: BF16-cast the dot, ReLU in FP32, multiply by the rounded weight,
+        # BF16-cast the product, sum in FP32, BF16-cast the total.
+        dots = golden_bf16_gemm(iq[t], keys[rows.long()].T)
+        product = dots.float().relu() * weight[t, :, None]
+        values = product.to(torch.bfloat16).float().sum(0).to(torch.bfloat16).float()
+        scores[t, valid_pos] = values
+    return scores, physical
+
+
+def golden_pool_index_scores(scores, physical, pool_block_ids, pool_block_counts):
+    """Pack dense logical scores into the Reindex block-pool score layout."""
+    tokens, dense_width = scores.shape
+    capacity = pool_block_ids.shape[-1]
+    compact_width = capacity * FLASH.candidate_block_size
+    compact_scores = torch.full((tokens, compact_width), -torch.inf, dtype=scores.dtype)
+    compact_physical = torch.full((tokens, compact_width), -1, dtype=physical.dtype)
+    for token in range(tokens):
+        count = max(0, min(int(pool_block_counts[token]), capacity))
+        for slot in range(count):
+            block = int(pool_block_ids[token, slot])
+            logical_begin = block * FLASH.candidate_block_size
+            if block < 0 or logical_begin >= dense_width:
+                continue
+            logical_end = min(logical_begin + FLASH.candidate_block_size, dense_width)
+            compact_begin = slot * FLASH.candidate_block_size
+            compact_end = compact_begin + (logical_end - logical_begin)
+            compact_scores[token, compact_begin:compact_end] = scores[token, logical_begin:logical_end]
+            compact_physical[token, compact_begin:compact_end] = physical[token, logical_begin:logical_end]
+    return compact_scores, compact_physical
+
+
+def golden_c1a_index_topk(scores, physical, lengths, pool_block_counts=None):
+    """Select finite TopK rows with stable ties and ascending physical order."""
+    topk = torch.full((scores.shape[0], INDEX_TOPK), -1, dtype=torch.int32)
+    for token in range(scores.shape[0]):
+        if pool_block_counts is None:
+            count = min(int(lengths[token]), scores.shape[-1])
+        else:
+            count = min(int(pool_block_counts[token]) * FLASH.candidate_block_size, scores.shape[-1])
+        chosen = torch.argsort(scores[token, :count], descending=True, stable=True)[:INDEX_TOPK]
+        chosen = chosen[torch.isfinite(scores[token, chosen])].sort().values
+        topk[token, :chosen.numel()] = physical[token, chosen].int()
+    return topk
+
+
+def _select_shared_c2a_topk(scores, physical_rows, lengths):
+    """Apply C2A's direct-short and common logical-earliest selection contract."""
+    tokens, width = scores.shape
+    output = torch.full((tokens, INDEX_TOPK), -1, dtype=torch.int32)
+    for token in range(tokens):
+        count = max(0, min(int(lengths[token]), width))
+        if count <= INDEX_TOPK:
+            output[token, :count] = physical_rows[token, :count].to(torch.int32)
+            continue
+        # Stable descending order makes the common logical-earliest cutoff explicit.
+        logical = torch.argsort(scores[token, :count], descending=True, stable=True)[:INDEX_TOPK]
+        logical = logical[torch.isfinite(scores[token, logical])]
+        rows = physical_rows[token, logical]
+        rows = rows[rows >= 0].sort().values
+        output[token, :rows.numel()] = rows.to(torch.int32)
+    return output
+
+
+def golden_c2a_index(t, qr, index_cache, index_cache_scale):
+    """Score and select C2A paged history with BF16 head reduction."""
+    x = t["x"]
+    tokens = x.shape[0]
+    index_dim = t["index_norm_weight"].numel()
+    index_heads = t["index_weights_proj"].shape[-1]
+    index_values = dequantize_mxfp4_cache(index_cache, index_cache_scale, INDEX_CACHE_GROUP, "e8m0").flatten(0, -2)
+    # Accumulate the index-query projection in sequential group-32 partials.
+    index_q = golden_mxfp8_linear(qr, t["index_wq_b"], t["index_wq_b_scale"]).unflatten(-1, (index_heads, index_dim))
+    index_q = golden_rope_tail(index_q, t["rope_cos"], t["rope_sin"])
+    index_q = golden_index_query_fp4(index_q)
+    head_weights = golden_bf16_gemm(x, t["index_weights_proj"]).float()
+    head_weights = (head_weights * (index_dim * index_heads) ** -0.5).to(torch.bfloat16).float()
+    lens = t["compressed_lens"].long()
+    score_width = t["index_block_table"].shape[1] * 128
+    scores = torch.full((tokens, score_width), -torch.inf)
+    physical_rows = torch.full((tokens, score_width), -1, dtype=torch.int64)
+    for token in range(tokens):
+        count = max(0, min(int(lens[token]), score_width))
+        request = int(t["token_to_req_indices"][token])
+        if not count or not 0 <= request < t["index_block_table"].shape[0]:
+            continue
+        logical = torch.arange(count)
+        pages = t["index_block_table"][request, logical // 128].long()
+        rows = pages * 128 + logical.remainder(128)
+        valid = (pages >= 0) & (rows >= 0) & (rows < index_values.shape[0])
+        valid_logical = logical[valid]
+        valid_rows = rows[valid]
+        physical_rows[token, valid_logical] = valid_rows
+        if count <= INDEX_TOPK or not valid_rows.numel():
+            continue
+        # Round dot, weighted values, and the head sum to BF16.
+        dots = golden_bf16_gemm(index_q[token], index_values[valid_rows].to(torch.bfloat16).T)
+        weighted = dots.float().relu() * head_weights[token, :, None]
+        weighted = weighted.to(torch.bfloat16).float()
+        total = weighted.sum(dim=0).to(torch.bfloat16).float()
+        scores[token, valid_logical] = total
+    return _select_shared_c2a_topk(scores, physical_rows, lens)
+
+
 __all__ = [
+    "c1a_index",
+    "decode_c2a_indexer",
+    "golden_c2a_index",
+    "golden_c1a_index_scores",
+    "golden_pool_index_scores",
+    "golden_c1a_index_topk",
     "make_index_scores",
     "score_full",
     "score_reindex",
@@ -1568,5 +1893,38 @@ __all__ = [
     "select_c2a_index_topk",
     "select_pool_index_topk",
     "select_index_topk",
-    "make_indexer_prepare",
 ]
+
+
+@pl.jit.inline(auto_scope=False)
+def c1a_project_index_key(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    result, completed = bf16_gemm_staged(
+        source, weight, output, num_tokens, ready,
+        width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
+        workers=32, name_hint='c1a_index_key_projection',
+    )
+    return completed
+
+
+@pl.jit.inline(auto_scope=False)
+def c1a_rotate_index_key(
+    x: pl.Tensor,
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    blocks = num_tokens
+    workers = pl.min(blocks, 2147483647)
+    with pl.spmd(workers, name_hint='c1a_index_key_rope', deps=[ready]) as rope_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, workers):
+            _index_key_rope_block(x, cos, sin, output, block)
+    return rope_tid

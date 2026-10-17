@@ -82,10 +82,10 @@ from config import (
     ROUTE_T_DYN,
 )
 
-from hc_head import hc_head
-from hc_mixes import mhc_mixes
-from hc_post import mhc_post
-from hc_pre import mhc_pre, zero_bf16_padding
+from hc import hc_head
+from hc import hc_mixes
+from hc import hc_post
+from hc import hc_pre, zero_bf16_padding
 from input_pack import gather_rows, pack_x_hc
 from lm_head import greedy_sample, lm_head
 from utils import (
@@ -93,16 +93,13 @@ from utils import (
 )
 from moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, moe
 from compressor import STATE_WIDTH
-from prefill_attn_c1a import prefill_publish_decoder
-from prefill_attn_swa import make_prefill_attn_swa
-from o_proj import make_prefill_tp_output_all_reduce
-from prefill_attn_c2a import prefill_attn_c2a_full, prefill_attn_c2a_reuse
-from prefill_attn_c1a import (
-    make_prefill_attn_c1a_reindex,
-    prefill_attn_c1a_reindex,
-    prefill_attn_c1a_reuse,
-)
-from prefill_c1a_indexer import make_paged_indexer
+from prefill_c1a_full import prefill_publish_decoder
+from prefill_swa import prefill_swa_attention
+from o_proj import prefill_tp_output_all_reduce
+from prefill_c2a_full import prefill_c2a_full_attention
+from prefill_c2a_reuse import prefill_c2a_reuse_attention
+from prefill_c1a_reindex import prefill_c1a_reindex_attention
+from prefill_c1a_reuse import prefill_c1a_reuse_attention
 from quant import build_mxfp4_pair_lut
 from rmsnorm import rms_norm_tiled, rms_norm_tiled_compensated
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
@@ -138,11 +135,6 @@ B32 = pl.dynamic("PREFILL_FP32_VALUES")
 ROPE_DIM = M.qk_rope_head_dim
 
 
-
-prefill_attn_swa = make_prefill_attn_swa(
-    capacity=PREFILL_MAX_TOKENS, reducer=make_prefill_tp_output_all_reduce(PREFILL_MAX_TOKENS),
-)
-initial_index = make_prefill_attn_c1a_reindex(make_paged_indexer(use_candidates=False))
 
 
 @pl.jit.inline(auto_scope=False)
@@ -204,16 +196,21 @@ def prefill_attention(
     mode: pl.Scalar[pl.INT32],
 ):
     if mode == 0:
-        prefill_attn_swa(
-            x, wq_a, wq_a_scale, q_norm_weight, wq_b,
-            wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
-            window_slots, window_indices, window_cache, window_cache_scale, output_window,
-            output_arrived, output, group_base, tp_rank, num_tokens,
-            attention_epoch,
+        tokens = pl.tensor.dim(x, 0)
+        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        prefill_swa_attention(
+            x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale,
+            rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale,
+            output_arrived, partial, num_tokens, attention_epoch,
+        )
+        prefill_tp_output_all_reduce(
+            partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
         )
     elif mode == 1:
-        prefill_attn_c2a_full(
+        attention_tokens = pl.tensor.dim(x, 0)
+        attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.FP32)
+        prefill_c2a_full_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
             wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
@@ -222,20 +219,28 @@ def prefill_attention(
             index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv,
             compressor_wgate, query_start_loc, state_block_table, state_cache, compressor_norm_weight,
             compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
-            index_weights_proj, topk_indices, output_window, output_arrived, output,
-            group_base, tp_rank, num_tokens, attention_epoch,
+            index_weights_proj, topk_indices, output_arrived, attention_partial, num_tokens,
+            attention_epoch,
+        )
+        prefill_tp_output_all_reduce(
+            attention_partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
         )
     elif mode == 2:
-        prefill_attn_c2a_reuse(
+        attention_tokens = pl.tensor.dim(x, 0)
+        attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.FP32)
+        prefill_c2a_reuse_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
             wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
-            compressed_cache_scale, topk_indices, output_window, output_arrived, output,
-            group_base, tp_rank, num_tokens, attention_epoch,
+            compressed_cache_scale, topk_indices, output_arrived, attention_partial, num_tokens,
+            attention_epoch,
+        )
+        prefill_tp_output_all_reduce(
+            attention_partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
         )
     elif mode == 3:
-        initial_index(
+        prefill_c1a_reindex_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
             wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
@@ -244,9 +249,10 @@ def prefill_attention(
             index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices, output_window, output_arrived, output, group_base,
             tp_rank, num_tokens, attention_epoch,
+            use_candidates=False, scatter_output=False,
         )
     elif mode == 4:
-        prefill_attn_c1a_reindex(
+        prefill_c1a_reindex_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
             wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
@@ -255,18 +261,19 @@ def prefill_attention(
             index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices, output_window, output_arrived, output, group_base,
             tp_rank, num_tokens, attention_epoch,
+            scatter_output=False, use_candidates=True,
         )
     elif mode == 5:
-        prefill_attn_c1a_reuse(
+        prefill_c1a_reuse_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
             wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
             compressed_cache_scale, topk_indices, output_window, output_arrived, output,
             group_base, tp_rank, num_tokens, attention_epoch,
+            scatter_output=False,
         )
     return output
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -648,7 +655,7 @@ def l2_prefill_fwd(
                 encoder_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [0, 0])
                 encoder_collapsed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
                 encoder_normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-                mhc_pre(encoder_hidden, encoder_pre, encoder_collapsed)
+                hc_pre(encoder_hidden, encoder_pre, encoder_collapsed)
                 norm_tokens = pl.tensor.dim(encoder_collapsed, 0)
                 for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
                     rms_norm_tiled(encoder_collapsed, attn_norm, encoder_normalized, norm_block, norm_tokens)
@@ -669,8 +676,8 @@ def l2_prefill_fwd(
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             attn_output = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             zero_bf16_padding(attn_output, pl.cast(0, pl.INT32))
-            mhc_mixes(hidden, attn_fn, attn_scale, attn_base, attn_pre, attn_post, attn_residual)
-            mhc_pre(hidden, delayed_pre, collapsed)
+            hc_mixes(hidden, attn_fn, attn_scale, attn_base, attn_pre, attn_post, attn_residual)
+            hc_pre(hidden, delayed_pre, collapsed)
             norm_tokens = pl.tensor.dim(collapsed, 0)
             for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
                 rms_norm_tiled(collapsed, attn_norm, normalized, norm_block, norm_tokens)
@@ -704,7 +711,7 @@ def l2_prefill_fwd(
                 index_weights, candidate_mask, topk_indices, attention_window, attention_arrived,
                 attn_output, rank, 0, active, layer + 1, mode,
             )
-            mhc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden)
+            hc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden)
         moe_ready = _prefill_moe(
             attn_hidden, attn_pre, ffn_fn, ffn_scale, ffn_base, ffn_norm, gate_weight, gate_bias,
             routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
