@@ -2248,6 +2248,7 @@ def golden_compressed_attention(
     query_start_loc: torch.Tensor | None = None,
     sequential_query: bool = False,
     round_cache_to_even: bool = False,
+    indexer_fn: Callable | None = None,
 ) -> AttentionGoldenResult:
     """Evaluate C2A/C1A full, reindex, or reuse with paged cache state."""
     query, window_kv, query_latent = qkv_proj_rope(
@@ -2287,6 +2288,8 @@ def golden_compressed_attention(
     updated_state = None if state_cache is None else state_cache.clone()
     topk_indices = compressed_indices
     candidates = candidate_mask
+    pool_ids = None
+    pool_counts = None
 
     if mode is AttentionMode.FULL:
         if compressor_wkv is None or compressor_norm_weight is None or compressed_slots is None:
@@ -2369,7 +2372,8 @@ def golden_compressed_attention(
             or compressed_lens is None
         ):
             raise ValueError("indexing modes require cache addressing and causal compressed lengths")
-        scores, topk_indices = paged_indexer(
+        index = indexer_fn or paged_indexer
+        scores, topk_indices = index(
             x,
             query_latent,
             request_ids,
@@ -2391,12 +2395,19 @@ def golden_compressed_attention(
             candidate_scores = torch.nn.functional.pad(
                 scores, (0, -scores.shape[-1] % M.candidate_block_size), value=-torch.inf
             )
-            candidates = select_candidate_blocks(
-                candidate_scores,
-                compressed_lens,
-                M.candidate_topk_blocks,
-                M.candidate_block_size,
-            )
+            if indexer_fn is not None:
+                from hierarchical_sparse_indexer import golden_select_candidate_block_pool
+
+                pool_width = index_block_table.shape[-1] * 128
+                pool_scores = torch.nn.functional.pad(scores, (0, pool_width - scores.shape[-1]), value=-torch.inf)
+                pool_ids, pool_counts = golden_select_candidate_block_pool(pool_scores, compressed_lens)
+            else:
+                candidates = select_candidate_blocks(
+                    candidate_scores,
+                    compressed_lens,
+                    M.candidate_topk_blocks,
+                    M.candidate_block_size,
+                )
     if topk_indices is None:
         raise ValueError("reuse mode requires published compressed Top-K indices")
 
@@ -2419,6 +2430,8 @@ def golden_compressed_attention(
         updated_state,
         topk_indices,
         candidates,
+        pool_ids,
+        pool_counts,
     )
 
 

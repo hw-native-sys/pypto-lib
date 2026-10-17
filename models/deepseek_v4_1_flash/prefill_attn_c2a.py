@@ -12,6 +12,7 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
+from functools import partial
 
 
 from config import (
@@ -34,6 +35,7 @@ from config import (
 )
 
 from compressor import STATE_WIDTH, project_ratio2, project_ratio2_weights
+from prefill_indexer import prefill_c2a_indexer, publish_c2a_index_key, golden_prefill_indexer
 
 
 from utils import AttentionGoldenResult
@@ -42,10 +44,7 @@ from sparse_attention import (
     gather_packed_chunk, golden_compressed_attention, make_attend_selected_chunk,
 )
 from o_proj import prefill_tp_output_all_reduce
-from rmsnorm import EPS
 from qkv_proj_rope import (
-    M_TILE,
-    make_bf16_projection_staged,
     make_rope,
 )
 from o_proj import prefill_o_proj
@@ -125,70 +124,6 @@ FP4_MAX_INV = 1.0 / 6.0
 
 FP4_SCALE_FLOOR = 2.0**-9
 
-E8M0_FLOOR_BITS = 4194304
-
-
-SCORE_TILE = 64
-
-LEAF = 2048
-
-LEAF_TILES = LEAF // SCORE_TILE
-
-PAIR_WIDTH = 2 * INDEX_TOPK
-
-SORT_FLOOR = -3.0e38
-
-MASK_BIAS = 1.0e30
-
-
-def make_wide_rope(heads, width, inverse=False, *, max_workers=None, permute=False):
-    """Specialize interleaved RoPE over the trailing ROPE_DIM lanes of each head."""
-    sign = -1.0 if inverse else 1.0
-    nope = width - ROPE_DIM
-    worker_limit = 2**31 - 1 if max_workers is None else max_workers
-
-    @pl.jit.inline
-    def rotate(
-        x: pl.Tensor[[T_DYN, heads * width], pl.BF16],
-        cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        output: pl.Tensor[[T_DYN, heads * width], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        blocks = num_tokens * heads
-        workers = pl.min(blocks, worker_limit)
-        for worker in pl.spmd(workers, name_hint="c2a_rope"):
-            for block in pl.range(worker, blocks, workers):
-                t = block // heads
-                h = block % heads
-                base = h * width
-                if not permute:
-                    output[t : t + 1, base : base + nope] = x[t : t + 1, base : base + nope]
-                tail = pl.cast(x[t : t + 1, base + nope : base + width], pl.FP32)
-                even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-                odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-                c = cos[t : t + 1, :]
-                s = pl.mul(sin[t : t + 1, :], sign)
-                re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-                im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-                rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-                rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-                rotated_bf16 = pl.cast(rotated, pl.BF16, mode="rint")
-                if permute:
-                    # Preserve the RoPE BF16 rounding before the lossless lane permutation.
-                    source = pl.concat(x[t : t + 1, base : base + nope], rotated_bf16)
-                    source_fp32 = pl.cast(source, pl.FP32)
-                    even_lanes = pl.gather(source_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
-                    odd_lanes = pl.gather(source_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
-                    output[t : t + 1, base : base + width // 2] = pl.cast(even_lanes, pl.BF16, mode="rint")
-                    output[t : t + 1, base + width // 2 : base + width] = pl.cast(odd_lanes, pl.BF16, mode="rint")
-                else:
-                    output[t : t + 1, base + nope : base + width] = rotated_bf16
-        return output
-
-    return rotate
-
 
 @pl.jit.inline
 def publish_compressed(
@@ -245,229 +180,6 @@ def publish_compressed(
             )
     return publish_tid
 
-@pl.jit.inline
-def publish_index_key(
-    keys: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8],
-    scales: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0],
-    num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Publish index keys as packed E2M1 with group-32 E8M0 scales."""
-    blocks = pl.tensor.dim(cache, 0)
-    cache_rows = blocks * 128
-    flat = pl.reshape(cache, [cache_rows, IDX_PACKED])
-    scale_flat = pl.reshape(scales, [cache_rows, IDX_SCALES])
-    with pl.spmd(num_tokens, name_hint="c2a_index_publish", deps=[cache_ready]) as publish_tid:
-        t = pl.tile.get_block_idx()
-        slot_i64 = pl.read(slots, [t])
-        if slot_i64 >= 0:
-            slot = pl.cast(slot_i64, pl.INDEX)
-            source = pl.slice(keys, [1, INDEX_DIM * 8], [t, 0], valid_shape=[1, INDEX_DIM])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, INDEX_DIM * 8)
-            groups = pl.reshape(pl.cast(source, pl.FP32), [INDEX_DIM * 8 // 32, 32])
-            amax = pl.row_max(pl.abs(groups))
-            raw = pl.maximum(pl.mul(amax, FP4_MAX_INV), FP4_SCALE_FLOOR)
-            exponent = pl.shrs(pl.add(pl.reinterpret_view(raw, pl.INT32), 8388607), 23)
-            factor = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-            normalized = pl.minimum(pl.maximum(pl.row_expand_div(groups, factor), -6.0), 6.0)
-            magnitude = pl.abs(normalized)
-            step0 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 0.25), pl.INT32), 1), 31)
-            step1 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 0.75), pl.INT32), 1), 31)
-            step2 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 1.25), pl.INT32), 1), 31)
-            step3 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 1.75), pl.INT32), 1), 31)
-            step4 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 2.5), pl.INT32), 1), 31)
-            step5 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32), 1), 31)
-            step6 = pl.shrs(pl.sub(pl.reinterpret_view(pl.sub(magnitude, 5.0), pl.INT32), 1), 31)
-            index = pl.add(
-                pl.add(pl.add(step0, step1), pl.add(step2, step3)),
-                pl.add(pl.add(step4, step5), pl.add(step6, 7)),
-            )
-            sign = pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 31)
-            codes = pl.reshape(pl.sub(index, pl.mul(sign, 8)), [1, INDEX_DIM * 8])
-            low = pl.gather(codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32)
-            high = pl.gather(codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            packed = pl.add(low, pl.mul(high, 16))
-            signed = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
-            flat[slot : slot + 1, :] = pl.set_validshape(
-                pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8), 1, IDX_PACKED
-            )
-            signed_exponent = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
-            encoded = pl.reinterpret_view(
-                pl.reinterpret_view(pl.cast(signed_exponent, pl.INT8), pl.UINT8), pl.FP8E8M0
-            )
-            scale_flat[slot : slot + 1, :] = pl.set_validshape(
-                pl.reshape(encoded, [1, INDEX_DIM * 8 // 32]), 1, IDX_SCALES
-            )
-    return publish_tid
-
-@pl.jit.inline
-def index_select(
-    query: pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM], pl.BF16],
-    weights: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
-    cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8],
-    scales: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_SCALES], pl.FP8E8M0],
-    block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-    leaf_scores: pl.Tensor[[T_DYN, LEAF], pl.FP32],
-    leaf_rows: pl.Tensor[[T_DYN, LEAF], pl.INT32],
-    topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    publish_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Select up to INDEX_TOPK compressed cache rows per token.
-
-    A token that can reach at most INDEX_TOPK positions takes all of them and
-    never scores. Longer histories are scored one LEAF-sized block at a time and
-    folded into a running Top-K, so the sort width does not grow with context.
-    The sort carries physical cache rows, which removes a per-entry block-table
-    lookup from the result.
-    """
-    query_rows = pl.tensor.dim(query, 0) * INDEX_H
-    query_flat = pl.reshape(query, [query_rows, INDEX_DIM])
-    blocks = pl.tensor.dim(cache, 0)
-    cache_rows = blocks * 128
-    flat = pl.reshape(cache, [cache_rows, IDX_PACKED])
-    # Four E8M0 codes per row is below the 32-byte tile row, so the scale pool is
-    # read eight cache rows at a time and reshaped back to one row per key.
-    scale_wide = pl.reshape(scales, [cache_rows // 8, 32])
-    with pl.spmd(num_tokens, name_hint="c2a_index_select", deps=[publish_ready]) as select_tid:
-        t = pl.tile.get_block_idx()
-        length = pl.read(compressed_lens, [t])
-        request = pl.cast(pl.read(token_to_req_indices, [t]), pl.INDEX)
-        if length <= INDEX_TOPK:
-            for c in pl.range(INDEX_TOPK // SCORE_TILE):
-                p0 = c * SCORE_TILE
-                # Inactive tiles need no page-table entry.
-                if p0 < length:
-                    block_id = pl.read(block_table, [request, p0 // 128])
-                    ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
-                    # Integer scalars broadcast correctly into a tensor op; an FP32 runtime
-                    # scalar does not, and a one-element column is below the tile alignment.
-                    slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
-                    visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
-                    block_base = pl.cast(block_id * 128 + p0 % 128, pl.INT32)
-                    physical = pl.cast(pl.add(ramp, block_base), pl.FP32)
-                    masked = pl.sub(pl.mul(visible, pl.add(physical, 1.0)), 1.0)
-                    topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.cast(masked, pl.INT32, mode="rint")
-                else:
-                    topk_indices[t : t + 1, p0 : p0 + SCORE_TILE] = pl.full(
-                        [1, SCORE_TILE], dtype=pl.INT32, value=-1
-                    )
-        else:
-            running = pl.tile.full([1, PAIR_WIDTH], dtype=pl.FP32, value=SORT_FLOOR)
-            weight_row = pl.reshape(pl.cast(weights[t : t + 1, :], pl.FP32), [INDEX_H, 1])
-            for leaf, (running_iter,) in pl.range((length + LEAF - 1) // LEAF, init_values=(running,)):
-                leaf_base = leaf * LEAF
-                for c in pl.range(LEAF_TILES):
-                    p0 = leaf_base + c * SCORE_TILE
-                    # The last leaf may extend beyond the visible page table.
-                    if p0 < length:
-                        block_id = pl.read(block_table, [request, p0 // 128])
-                        base = pl.cast(pl.max(block_id, 0), pl.INDEX) * 128 + p0 % 128
-                        packed = flat[base : base + SCORE_TILE, :]
-                        wide = pl.reinterpret_view(pl.cast(packed, target_type=pl.UINT16), pl.INT16)
-                        low = pl.ands(wide, 15)
-                        high = pl.ands(pl.shrs(wide, 4), 15)
-                        low_sign = pl.cast(pl.shrs(low, 3), pl.FP32)
-                        low_exponent = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.FP32)
-                        low_fraction = pl.cast(pl.ands(low, 1), pl.FP32)
-                        # Assemble the exact FP32 exponent for E2M1 exponent codes 0..3.
-                        low_exponent_i32 = pl.cast(pl.shrs(pl.ands(low, 7), 1), pl.INT32)
-                        low_exponent_bits = pl.shls(pl.add(low_exponent_i32, 127), 23)
-                        low_pow2 = pl.reinterpret_view(low_exponent_bits, pl.FP32)
-                        low_normal = pl.mul(pl.mul(low_pow2, 0.5), pl.add(pl.mul(low_fraction, 0.5), 1.0))
-                        low_is_normal = pl.minimum(low_exponent, 1.0)
-                        low_magnitude = pl.add(
-                            pl.mul(low_is_normal, low_normal),
-                            pl.mul(pl.mul(pl.sub(low_is_normal, 1.0), -1.0), pl.mul(low_fraction, 0.5)),
-                        )
-                        low_value = pl.mul(low_magnitude, pl.mul(pl.sub(pl.mul(low_sign, 2.0), 1.0), -1.0))
-                        high_sign = pl.cast(pl.shrs(high, 3), pl.FP32)
-                        high_exponent = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.FP32)
-                        high_fraction = pl.cast(pl.ands(high, 1), pl.FP32)
-                        # Assemble the exact FP32 exponent for E2M1 exponent codes 0..3.
-                        high_exponent_i32 = pl.cast(pl.shrs(pl.ands(high, 7), 1), pl.INT32)
-                        high_exponent_bits = pl.shls(pl.add(high_exponent_i32, 127), 23)
-                        high_pow2 = pl.reinterpret_view(high_exponent_bits, pl.FP32)
-                        high_normal = pl.mul(pl.mul(high_pow2, 0.5), pl.add(pl.mul(high_fraction, 0.5), 1.0))
-                        high_is_normal = pl.minimum(high_exponent, 1.0)
-                        high_magnitude = pl.add(
-                            pl.mul(high_is_normal, high_normal),
-                            pl.mul(pl.mul(pl.sub(high_is_normal, 1.0), -1.0), pl.mul(high_fraction, 0.5)),
-                        )
-                        high_value = pl.mul(high_magnitude, pl.mul(pl.sub(pl.mul(high_sign, 2.0), 1.0), -1.0))
-                        scale_tile = pl.slice(scale_wide, [SCORE_TILE // 8, 32], [base // 8, 0])
-                        raw_codes = pl.reinterpret_view(scale_tile, pl.UINT8)
-                        signed_codes = pl.cast(pl.reinterpret_view(raw_codes, pl.INT8), pl.INT32)
-                        codes = pl.ands(signed_codes, 255)
-                        factors = pl.reinterpret_view(
-                            pl.maximum(pl.shls(codes, 23), E8M0_FLOOR_BITS), pl.FP32
-                        )
-                        factor_column = pl.reshape(factors, [SCORE_TILE * IDX_SCALES, 1])
-                        low_scaled = pl.reshape(
-                            pl.row_expand_mul(
-                                pl.reshape(low_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
-                            ),
-                            [SCORE_TILE, IDX_PACKED],
-                        )
-                        high_scaled = pl.reshape(
-                            pl.row_expand_mul(
-                                pl.reshape(high_value, [SCORE_TILE * IDX_SCALES, 16]), factor_column
-                            ),
-                            [SCORE_TILE, IDX_PACKED],
-                        )
-                        keys = pl.concat(
-                            pl.cast(low_scaled, pl.BF16, mode="rint"),
-                            pl.cast(high_scaled, pl.BF16, mode="rint"),
-                        )
-                        query_tile = query_flat[t * INDEX_H : t * INDEX_H + INDEX_H, :]
-                        scored = pl.maximum(pl.matmul(query_tile, keys, b_trans=True), 0.0)
-                        row = pl.col_sum(pl.row_expand_mul(scored, weight_row))
-                        ramp = pl.arange(0, [1, SCORE_TILE], dtype=pl.INT32)
-                        slack = pl.cast(pl.add(pl.mul(ramp, -1), pl.cast(length - p0, pl.INT32)), pl.FP32)
-                        visible = pl.minimum(pl.maximum(slack, 0.0), 1.0)
-                        row = pl.maximum(pl.add(row, pl.mul(pl.sub(visible, 1.0), MASK_BIAS)), SORT_FLOOR)
-                        leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = row
-                        leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.add(
-                            ramp, pl.cast(base, pl.INT32)
-                        )
-                    else:
-                        leaf_scores[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.full(
-                            [1, SCORE_TILE], dtype=pl.FP32, value=SORT_FLOOR
-                        )
-                        leaf_rows[t : t + 1, c * SCORE_TILE : c * SCORE_TILE + SCORE_TILE] = pl.full(
-                            [1, SCORE_TILE], dtype=pl.INT32, value=-1
-                        )
-                score_row = pl.load(leaf_scores, [t, 0], [1, LEAF], target_memory=pl.Mem.Vec)
-                row_ids = pl.load(leaf_rows, [t, 0], [1, LEAF], target_memory=pl.Mem.Vec)
-                pairs = pl.sort32(score_row, pl.reinterpret_view(row_ids, pl.UINT32))
-                pairs = pl.mrgsort(pairs, block_len=64)
-                pairs = pl.mrgsort(pairs, block_len=256)
-                pairs = pl.mrgsort(pairs, block_len=1024)
-                merge_tmp = pl.tile.create([1, 2 * PAIR_WIDTH], dtype=pl.FP32)
-                merged = pl.tile.mrgsort(
-                    running_iter, pl.tile.slice(pairs, [1, PAIR_WIDTH], [0, 0]), tmp=merge_tmp
-                )
-                running = pl.yield_(pl.tile.slice(merged, [1, PAIR_WIDTH], [0, 0]))
-            chosen = pl.tile.gather_mask(
-                running, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-            )
-            ordered = pl.sort32(
-                pl.mul(pl.cast(chosen, pl.FP32), -1.0), pl.reinterpret_view(chosen, pl.UINT32)
-            )
-            ordered = pl.mrgsort(ordered, block_len=64)
-            ordered = pl.mrgsort(ordered, block_len=256)
-            final = pl.tile.gather_mask(
-                pl.tile.slice(ordered, [1, PAIR_WIDTH], [0, 0]),
-                mask_pattern=pl.tile.MaskPattern.P1010,
-                output_dtype=pl.INT32,
-            )
-            topk_indices = pl.store(final, [t, 0], topk_indices)
-    return select_tid
-
 
 @pl.jit.inline
 def publish_window(
@@ -499,69 +211,14 @@ def publish_window(
     return cache, scales
 
 
-project_index_q = make_mx_projection(Q_LORA, INDEX_H * INDEX_DIM)
-
 rotate_compressed = make_rope(1)
-
-rotate_index_key = make_wide_rope(1, INDEX_DIM)
 
 
 prefill_compressor_projection = project_ratio2_weights
 prefill_compressor_project = project_ratio2
 
 
-_prefill_index_key_projection = make_bf16_projection_staged(HEAD_DIM, INDEX_DIM)
-_prefill_index_weight_projection = make_bf16_projection_staged(D, INDEX_H)
-
-
-@pl.jit.inline
-def prefill_index_key_project(
-    latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    weight: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
-    norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
-    output: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    pool_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Stage the index-key projection before its normalization."""
-    tokens = pl.tensor.dim(latent, 0)
-    projected = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    _prefill_index_key_projection(latent, weight, projected, num_tokens)
-    with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
-        t0 = pl.tile.get_block_idx() * M_TILE
-        rows = pl.min(M_TILE, num_tokens - t0)
-        value = pl.cast(pl.slice(projected, [M_TILE, INDEX_DIM], [t0, 0], valid_shape=[rows, INDEX_DIM]), pl.FP32)
-        square = pl.mul(pl.row_sum(pl.mul(value, value)), 1.0 / INDEX_DIM)
-        inv = pl.rsqrt(pl.add(square, EPS), high_precision=True)
-        gamma = pl.reshape(pl.cast(norm_weight[:], pl.FP32), [1, INDEX_DIM])
-        normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv), gamma)
-        output[t0 : t0 + M_TILE, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, INDEX_DIM)
-    return norm_tid
-
-
-@pl.jit.inline
-def prefill_indexer_weights(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D, INDEX_H], pl.BF16],
-    output: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Preserve the index-weight rounding boundaries with a staged projection."""
-    tokens = pl.tensor.dim(x, 0)
-    projected = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-    _prefill_index_weight_projection(x, weight, projected, num_tokens)
-    for block in pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="prefill_c2a_index_weight_scale"):
-        t0 = block * M_TILE
-        rows = pl.min(M_TILE, num_tokens - t0)
-        value = pl.cast(pl.slice(projected, [M_TILE, INDEX_H], [t0, 0], valid_shape=[rows, INDEX_H]), pl.FP32)
-        scaled = pl.cast(pl.mul(value, INDEX_DIM**-0.5), pl.BF16, mode="rint")
-        result = pl.cast(pl.mul(pl.cast(scaled, pl.FP32), INDEX_H**-0.5), pl.BF16, mode="rint")
-        output[t0 : t0 + M_TILE, :] = pl.set_validshape(result, rows, INDEX_H)
-    return output
-
-
 prefill_attend_sparse = make_attend_selected_chunk(vector_query=True)
-c2a_index_query = make_wide_rope(INDEX_H, INDEX_DIM, max_workers=64, permute=True)
 
 @pl.jit.inline(auto_scope=False)
 def c2a_full_partial(
@@ -633,12 +290,9 @@ def c2a_full_partial(
     )
 
     # Index keys come from the unrotated latent; the compressed cache stores the rotated one.
-    index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    prefill_index_key_project(latent, index_wk, index_norm_weight, index_key, num_tokens, pool_tid)
-    rotated_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    rotate_index_key(index_key, compressed_rope_cos, compressed_rope_sin, rotated_key, num_tokens)
-    index_publish_tid = publish_index_key(
-        rotated_key, compressed_slots, index_cache, index_cache_scale, num_tokens, cache_ready
+    index_publish_tid = publish_c2a_index_key(
+        latent, index_wk, index_norm_weight, compressed_rope_cos, compressed_rope_sin,
+        compressed_slots, index_cache, index_cache_scale, num_tokens, pool_tid, cache_ready,
     )
     rotated_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     rotate_compressed(latent, compressed_rope_cos, compressed_rope_sin, rotated_latent, num_tokens)
@@ -647,18 +301,10 @@ def c2a_full_partial(
         num_tokens, cache_ready,
     )
 
-    index_query_raw = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    project_index_q(qr, index_wq_b, index_wq_b_scale, index_query_raw, num_tokens)
-    index_query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    c2a_index_query(index_query_raw, rope_cos, rope_sin, index_query, num_tokens)
-    index_weight = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
-    prefill_indexer_weights(x, index_weights_proj, index_weight, num_tokens)
-    leaf_scores = pl.create_tensor([tokens, LEAF], dtype=pl.FP32)
-    leaf_rows = pl.create_tensor([tokens, LEAF], dtype=pl.INT32)
-    select_tid = index_select(
-        index_query, index_weight, index_cache, index_cache_scale, index_block_table,
-        token_to_req_indices, compressed_lens, leaf_scores, leaf_rows, topk_indices,
-        num_tokens, index_publish_tid,
+    select_tid = prefill_c2a_indexer(
+        x, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
+        index_cache, index_cache_scale, index_block_table, token_to_req_indices,
+        compressed_lens, topk_indices, num_tokens, index_publish_tid,
     )
 
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
@@ -769,6 +415,7 @@ def golden_prefill_attn_c2a_full(
         index_block_table=index_block_table,
         request_ids=token_to_req_indices,
         candidate_mask=None,
+        indexer_fn=partial(golden_prefill_indexer, c2a=True),
     )
 
 

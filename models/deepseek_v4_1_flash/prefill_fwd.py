@@ -72,7 +72,7 @@ from config import (
     T_DYN,
     TP_SIZE,
     B_DYN,
-    CMP_POSITIONS_DYN,
+    INDEX_POOL_BLOCKS_DYN,
     PREFILL_MAX_TOKENS,
     Q_START_DYN,
     STATE_BLOCKS_DYN,
@@ -102,7 +102,7 @@ from prefill_attn_c1a import (
     prefill_attn_c1a_reindex,
     prefill_attn_c1a_reuse,
 )
-from prefill_c1a_indexer import make_paged_indexer
+from prefill_indexer import prefill_c1a_full_indexer
 from quant import build_mxfp4_pair_lut
 from rmsnorm import rms_norm_tiled, rms_norm_tiled_compensated
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
@@ -119,6 +119,7 @@ HEAD_DIM = M.head_dim
 INDEX_DIM = M.index_head_dim
 INDEX_H = M.index_n_heads
 INDEX_TOPK = M.index_topk
+INDEX_POOL_BLOCKS = M.candidate_topk_blocks
 LOCAL_H = M.num_attention_heads // C.TP_SIZE
 LOCAL_O_GROUPS = M.o_groups // C.TP_SIZE
 LOCAL_O_WIDTH = LOCAL_O_GROUPS * M.o_lora_rank
@@ -142,7 +143,7 @@ ROPE_DIM = M.qk_rope_head_dim
 prefill_attn_swa = make_prefill_attn_swa(
     capacity=PREFILL_MAX_TOKENS, reducer=make_prefill_tp_output_all_reduce(PREFILL_MAX_TOKENS),
 )
-initial_index = make_prefill_attn_c1a_reindex(make_paged_indexer(use_candidates=False))
+initial_index = make_prefill_attn_c1a_reindex(prefill_c1a_full_indexer)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -192,7 +193,8 @@ def prefill_attention(
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
-    candidate_mask: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8],
+    pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+    pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -241,7 +243,7 @@ def prefill_attention(
             wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
             compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
-            index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
+            index_block_table, pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices, output_window, output_arrived, output, group_base,
             tp_rank, num_tokens, attention_epoch,
         )
@@ -252,7 +254,7 @@ def prefill_attention(
             wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
             compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
-            index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
+            index_block_table, pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices, output_window, output_arrived, output, group_base,
             tp_rank, num_tokens, attention_epoch,
         )
@@ -490,9 +492,11 @@ def l2_prefill_fwd(
     pack_x_hc(embedding_ids, embedding, initial_hidden)
     gather_rows(initial_pre, identity_rows, initial_mix, gather_ready)
     topk_indices = pl.create_tensor([CAPACITY, INDEX_TOPK], dtype=pl.INT32)
-    candidate_mask = pl.create_tensor([CAPACITY, pl.tensor.dim(compressed_cache, 1) * 128], dtype=pl.UINT8)
-    # Keep stage handoff buffers outside attention scopes and reuse bounded
-    # MoE slabs across all layers and rounds.
+    history_positions = pl.tensor.dim(compressed_cache, 1) * 128
+    pool_blocks = pl.min(INDEX_POOL_BLOCKS, (history_positions // 8 + 31) // 32 * 32)
+    pool_block_ids = pl.create_tensor([CAPACITY, pool_blocks], dtype=pl.INT32)
+    pool_block_counts = pl.create_tensor([CAPACITY], dtype=pl.INT32)
+    # Reuse bounded MoE slabs across all layers and rounds.
     attn_hidden = pl.create_tensor([CAPACITY, HC_MULT, D], dtype=pl.FP32)
     attn_pre = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
     ffn_mixed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
@@ -701,7 +705,7 @@ def l2_prefill_fwd(
                 index_block_tables[stage], position_ids[stage], compressed_cos, compressed_sin,
                 compressor_wkv, compressor_wgate, query_starts[stage], state_block_table, state_cache[state_slot],
                 compressor_norm, compressed_slots, index_wk, index_norm, index_wq_b, index_wq_b_scale,
-                index_weights, candidate_mask, topk_indices, attention_window, attention_arrived,
+                index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
                 attn_output, rank, 0, active, layer + 1, mode,
             )
             mhc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden)

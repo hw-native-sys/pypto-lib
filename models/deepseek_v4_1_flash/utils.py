@@ -193,6 +193,17 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
     angles = angles * torch.arange(ROPE_DIM // 2, dtype=torch.float32).unsqueeze(0) * 0.001
     values = {'x': _ranked(torch.randn(token_count, D).to(torch.bfloat16)), 'wq_a': wq_a, 'wq_a_scale': wq_a_scale, 'q_norm_weight': _ranked(torch.ones(Q_LORA, dtype=torch.bfloat16)), 'wq_b': wq_b, 'wq_b_scale': wq_b_scale, 'wkv': wkv, 'wkv_scale': wkv_scale, 'kv_norm_weight': _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)), 'attn_sink': torch.zeros(TP_SIZE, LOCAL_H, dtype=torch.float32), 'wo_a': torch.randn(TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16).mul_(O_GROUP_IN ** (-0.5)), 'wo_b': wo_b, 'wo_b_scale': wo_b_scale, 'rope_cos': _ranked(torch.cos(angles)), 'rope_sin': _ranked(torch.sin(angles)), 'window_slots': _ranked(slots), 'window_indices': _ranked(window_indices), 'window_cache': _ranked(window_cache), 'window_cache_scale': _ranked(window_cache_scale), 'compressed_cache': _ranked(compressed_cache), 'compressed_cache_scale': _ranked(compressed_cache_scale), 'compressed_indices': _ranked(compressed_indices), 'request_ids': _ranked(request_ids), 'compressed_lens': _ranked(compressed_lens), 'index_cache': _ranked(index_cache), 'index_cache_scale': _ranked(index_cache_scale), 'index_block_table': _ranked(block_table), 'candidate_mask': _ranked(candidate_mask), 'compressed_rope_cos': _ranked(torch.cos(angles)), 'compressed_rope_sin': _ranked(torch.sin(angles)), 'compressor_wkv': _ranked(torch.randn(D, HEAD_DIM).mul_(D ** (-0.5)).to(torch.bfloat16)), 'compressor_norm_weight': _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)), 'compressed_slots': _ranked(slots), 'index_wk': _ranked(torch.randn(HEAD_DIM, INDEX_DIM).mul_(HEAD_DIM ** (-0.5)).to(torch.bfloat16)), 'index_norm_weight': _ranked(torch.ones(INDEX_DIM, dtype=torch.bfloat16)), 'index_wq_b': index_wq_b, 'index_wq_b_scale': index_wq_b_scale, 'index_weights_proj': _ranked(torch.randn(D, INDEX_H).mul_(D ** (-0.5)).to(torch.bfloat16))}
     values['attn_norm_weight'] = _ranked(torch.randn(D).mul_(0.1).add_(1).to(torch.bfloat16))
+    from hierarchical_sparse_indexer import index_pool_block_capacity
+    pool_width = index_pool_block_capacity(candidate_mask.shape[1])
+    ids = torch.full((token_count, pool_width), -1, dtype=torch.int32)
+    counts = torch.zeros(token_count, dtype=torch.int32)
+    for token in range(token_count):
+        blocks = torch.nonzero(candidate_mask[token].reshape(-1, 8).any(-1)).flatten()
+        count = min(blocks.numel(), pool_width)
+        ids[token, :count] = blocks[-count:].int()
+        counts[token] = count
+    values['pool_block_ids'] = _ranked(ids)
+    values['pool_block_counts'] = _ranked(counts)
     return values
 
 def make_tensor_specs(input_names: tuple[str, ...], output_names: tuple[str, ...], token_count: int=CASE_TOKENS, case_name: str=CASE_DEFAULT) -> list[TensorSpec | ScalarSpec]:
@@ -205,6 +216,9 @@ def make_tensor_specs(input_names: tuple[str, ...], output_names: tuple[str, ...
     for name in output_names:
         if name == 'topk_indices':
             shape = [TP_SIZE, token_count, INDEX_TOPK]
+            dtype = torch.int32
+        elif name in ('pool_block_ids', 'pool_block_counts'):
+            shape = list(values[name].shape)
             dtype = torch.int32
         elif name == 'candidate_mask':
             shape = list(values['candidate_mask'].shape)
@@ -258,7 +272,7 @@ def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, 
     from config import FLASH as M, TP_SIZE
     parameter_names = tuple(name for name, parameter in inspect.signature(golden_fn).parameters.items()
                             if parameter.default is inspect.Parameter.empty)
-    token_input_names = {'x', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'request_ids', 'compressed_lens', 'compressed_rope_cos', 'compressed_rope_sin', 'compressed_slots', 'candidate_mask', 'compressed_indices'}
+    token_input_names = {'x', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'request_ids', 'compressed_lens', 'compressed_rope_cos', 'compressed_rope_sin', 'compressed_slots', 'candidate_mask', 'pool_block_ids', 'pool_block_counts', 'compressed_indices'}
     results = []
     for rank in range(TP_SIZE):
         kwargs = {}
@@ -281,15 +295,24 @@ def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, 
             tensors['compressed_cache_scale'][rank].copy_(result.compressed_cache_scale)
             tensors['index_cache'][rank].copy_(result.index_cache)
             _copy_storage(tensors['index_cache_scale'][rank], result.index_cache_scale)
-            candidate_mask = tensors['candidate_mask'][rank]
-            candidate_mask.zero_()
-            block_size = M.candidate_block_size
-            for token in range(result.candidate_mask.shape[0]):
-                selected = torch.nonzero(result.candidate_mask[token], as_tuple=False).flatten()
-                for block in torch.unique(selected // block_size):
-                    begin = int(block) * block_size
-                    end = min(begin + block_size, candidate_mask.shape[1])
-                    candidate_mask[token, begin:end] = 1
+            if 'pool_block_ids' in tensors:
+                ids = tensors['pool_block_ids'][rank]
+                counts = tensors['pool_block_counts'][rank]
+                ids.fill_(-1)
+                counts.zero_()
+                rows = result.pool_block_ids.shape[0]
+                ids[:rows].copy_(result.pool_block_ids)
+                counts[:rows].copy_(result.pool_block_counts)
+            else:
+                candidate_mask = tensors['candidate_mask'][rank]
+                candidate_mask.zero_()
+                block_size = M.candidate_block_size
+                for token in range(result.candidate_mask.shape[0]):
+                    selected = torch.nonzero(result.candidate_mask[token], as_tuple=False).flatten()
+                    for block in torch.unique(selected // block_size):
+                        begin = int(block) * block_size
+                        end = min(begin + block_size, candidate_mask.shape[1])
+                        candidate_mask[token, begin:end] = 1
         if mode in ('full', 'reindex'):
             if active_tokens is None:
                 tensors['topk_indices'][rank].copy_(result.topk_indices)
