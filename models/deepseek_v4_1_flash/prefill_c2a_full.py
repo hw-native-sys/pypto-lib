@@ -438,37 +438,14 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
 
     index_values = _flat_cache_rows(index_cache, index_cache_scale, IDX_GROUP, "e8m0")
 
-    # f. Indexer: score every causal compressed position against the freshly written keys.
-    index_q = golden_mxfp8_linear(qr, t["index_wq_b"], t["index_wq_b_scale"]).unflatten(
-        -1, (index_heads, index_dim)
-    )
-    index_q = golden_rope_tail(index_q, t["rope_cos"], t["rope_sin"])
-    head_weights = golden_bf16_gemm(x, t["index_weights_proj"])
-    head_weights = head_weights * index_dim**-0.5 * index_heads**-0.5
-    lens = t["compressed_lens"].long()
-    max_len = int(lens.max()) if lens.numel() else 0
-    topk_indices = torch.full((tokens, TOPK), -1, dtype=torch.int32)
-    if max_len:
-        positions = torch.arange(max_len)
-        blocks = torch.div(positions, BLOCK_SIZE, rounding_mode="floor")
-        offsets = positions.remainder(BLOCK_SIZE)
-        pages = t["index_block_table"][t["token_to_req_indices"].long().unsqueeze(-1), blocks]
-        physical_rows = pages.to(torch.int64) * BLOCK_SIZE + offsets
-        keys = index_values[physical_rows.reshape(-1)].reshape(tokens, max_len, index_dim)
-        scores = torch.einsum("thd,tkd->thk", index_q.float(), keys.float()).relu()
-        scores = (scores * head_weights.float().unsqueeze(-1)).sum(dim=-2)
-        scores = scores.masked_fill(positions.unsqueeze(0) >= lens.unsqueeze(-1), -torch.inf)
-        count = min(TOPK, max_len)
-        logical = scores.topk(count, dim=-1, sorted=False).indices.sort(dim=-1).values
-        selected_scores = scores.gather(-1, logical)
-        selected_rows = physical_rows.gather(-1, logical)
-        rows = torch.where(torch.isfinite(selected_scores), selected_rows, -1)
-        for token in range(tokens):
-            if int(lens[token]) > TOPK:
-                # The scored device path orders winners by physical cache row.
-                rows[token] = rows[token].sort().values
-        topk_indices[:, :count] = rows.to(torch.int32)
+    # f. Indexer uses logical group-32 FP4 queries and physical-order winners.
+    from prefill_indexer import golden_prefill_indexer
 
+    scores, topk_indices = golden_prefill_indexer(
+        x, qr, t["token_to_req_indices"], index_values.reshape(*index_cache.shape[:-1], index_dim),
+        t["index_block_table"], t["compressed_lens"], t["index_wq_b"], t["index_wq_b_scale"],
+        t["index_weights_proj"], t["rope_cos"], t["rope_sin"], c2a=True,
+    )
     # g. Sparse attention: one online softmax over window rows plus selected compressed rows.
     window_values = (
         window_cache.float() * window_cache_scale.float().repeat_interleave(MX_GROUP, -1)

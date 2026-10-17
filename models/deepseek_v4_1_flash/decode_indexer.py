@@ -11,6 +11,7 @@
 import pypto.language as pl
 
 from hierarchical_sparse_indexer import (
+    _index_key_decode_lut,
     make_index_query_quantizer,
     materialize_index_topk as _materialize_index_topk,
 )
@@ -231,16 +232,6 @@ def _make_fp4_publish_e8m0(width, group, cache_dim):
     return publish
 
 
-@pl.jit.inline
-def _index_key_decode_lut():
-    """Map packed FP4 nibbles to exact FP8 carrier bits."""
-    codes = pl.tile.arange(0, [1, 16], dtype=pl.INT32)
-    magnitude = pl.ands(codes, 7)
-    values = pl.add(pl.shls(magnitude, 2), 48)
-    values = pl.tile.select(pl.tile.cmps(magnitude, 0, cmp_type=0), 0, values)
-    values = pl.tile.select(pl.tile.cmps(magnitude, 1, cmp_type=0), 48, values)
-    values = pl.or_(values, pl.shls(pl.ands(codes, 8), 4))
-    return pl.cast(values, pl.INT16)
 
 
 def _make_page_index_scores(workers, skip_short=False):

@@ -54,7 +54,7 @@ from o_proj import prefill_sp_output_reduce_scatter
 from hc_post import prefill_sp_post
 from hc_pre import attention_hc_pre
 import prefill_attn_c1a as attn
-from config import SP_T_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN, CMP_POSITIONS_DYN, INDEX_CACHE_GROUP
+from config import SP_T_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN, INDEX_POOL_BLOCKS_DYN, INDEX_CACHE_GROUP
 
 
 # model config
@@ -128,7 +128,8 @@ def l2_prefill_c1a_reuse_sharded(
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
-    candidate_mask: pl.InOut[pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    pool_block_ids: pl.InOut[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.InOut[pl.Tensor[[T_DYN], pl.INT32]],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     attn_input: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     attn_output: pl.Out[pl.Tensor[[SP_T_DYN, D], pl.BF16]],
@@ -162,8 +163,9 @@ def l2_prefill_c1a_reuse_sharded(
     compressed_rope_sin.bind_dynamic(0, T_DYN)
     compressed_slots.bind_dynamic(0, T_DYN)
     topk_indices.bind_dynamic(0, T_DYN)
-    candidate_mask.bind_dynamic(0, T_DYN)
-    candidate_mask.bind_dynamic(1, CMP_POSITIONS_DYN)
+    pool_block_ids.bind_dynamic(0, T_DYN)
+    pool_block_counts.bind_dynamic(0, T_DYN)
+    pool_block_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
     compressed_indices.bind_dynamic(0, T_DYN)
     attn_input.bind_dynamic(0, T_DYN)
     attn_output.bind_dynamic(0, SP_T_DYN)
@@ -237,7 +239,8 @@ def l3_prefill_c1a_reuse_sharded(
     index_wq_b_scale: pl.Tensor[[RANKS_DYN, Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0],
     index_weights_proj: pl.Tensor[[RANKS_DYN, D, INDEX_H], pl.BF16],
     topk_indices: pl.InOut[pl.Tensor[[RANKS_DYN, T_DYN, INDEX_TOPK], pl.INT32]],
-    candidate_mask: pl.InOut[pl.Tensor[[RANKS_DYN, T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    pool_block_ids: pl.InOut[pl.Tensor[[RANKS_DYN, T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
+    pool_block_counts: pl.InOut[pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32]],
     compressed_indices: pl.Tensor[[RANKS_DYN, T_DYN, INDEX_TOPK], pl.INT32],
     attn_input: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, D], pl.BF16]],
     attn_output: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, D], pl.BF16]],
@@ -267,8 +270,9 @@ def l3_prefill_c1a_reuse_sharded(
     compressed_rope_sin.bind_dynamic(1, T_DYN)
     compressed_slots.bind_dynamic(1, T_DYN)
     topk_indices.bind_dynamic(1, T_DYN)
-    candidate_mask.bind_dynamic(1, T_DYN)
-    candidate_mask.bind_dynamic(2, CMP_POSITIONS_DYN)
+    pool_block_ids.bind_dynamic(1, T_DYN)
+    pool_block_counts.bind_dynamic(1, T_DYN)
+    pool_block_ids.bind_dynamic(2, INDEX_POOL_BLOCKS_DYN)
     compressed_indices.bind_dynamic(1, T_DYN)
     attn_input.bind_dynamic(1, T_DYN)
     attn_output.bind_dynamic(1, SP_T_DYN)
@@ -298,7 +302,7 @@ def l3_prefill_c1a_reuse_sharded(
             index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank],
             compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
             index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r, index_weights_proj[rank],
-            topk_indices[rank], candidate_mask[rank], compressed_indices[rank], attn_input[rank],
+            topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], compressed_indices[rank], attn_input[rank],
             attn_output[rank], next_pre_mix[rank], x_hc_out[rank], input_window, input_arrived, output_window,
             output_arrived, num_tokens[rank], rank, attention_epoch, device=rank,
         )
