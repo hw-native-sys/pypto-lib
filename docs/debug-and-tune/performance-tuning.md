@@ -437,7 +437,7 @@ compute that is already running. It writes no tensor, so it is free to try and
 free to delete — but a partial or oversized warm costs more than it saves. See
 [L2 Prefetch](l2-prefetch.md).
 
-#### 6. Stream a weight that has no reuse: NZ layout and `CachePolicy.BYPASS`
+#### 6. Stream a weight that has no reuse: NZ layout and `LoadL2Hint.NotAllocClean`
 
 A weight read once per dispatch and never re-read is *streamed*, not cached, and
 two declarations make that read cheaper. Both are properties of the weight, so
@@ -447,7 +447,14 @@ compiler inference.
 | Declaration | What it changes | What it costs |
 | --- | --- | --- |
 | `pl.Tensor[[E, N, K], pl.INT8, pl.NZ]` | the cube loads the weight NZ→NZ instead of reformatting ND on the way into L1, so the contiguous run is one fractal column block rather than one K-tile row | the fixture must write the bytes in fractal order (`utils.pack_nz`) and the golden must read them back (`utils.unpack_nz`) |
-| `pl.set_cache_policy(w, pl.CachePolicy.BYPASS)` at the top of the reading scope | the load is issued against the device's uncached alias, so it does not evict what *does* have reuse | nothing to the kernel; the author asserts nobody writes those bytes while it runs |
+| `pl.set_l2_hint(w, load=pl.LoadL2Hint.NotAllocClean)` at the top of the reading scope | A2/A3 loads use the device's uncached alias; A5 loads use the ISA nonallocating cache-control mode | the author asserts nobody writes those bytes while it runs |
+
+Use the load hint enum for scope reads and `StoreL2Hint` for store hints. An
+explicit `l2_hint=` on a transfer overrides its scope default, including
+`NormalFirstVictim` with encoding zero. A2/A3's three `NotAlloc*` load modes
+share the same address-alias implementation; A5 distinguishes them through
+ISA cache control. These interfaces replace `CachePolicy` and
+`pl.set_cache_policy` and require a PyPTO version that provides scope L2 hints.
 
 The ND penalty is worth seeing concretely. A logical `[E, N, K]` INT8 weight
 sliced by a K tile gives the DMA `K_TILE` contiguous bytes before the next row

@@ -297,7 +297,7 @@ def q_proj_qr(
                 (Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True
             ):
                 # Weight reads bypass L2.
-                pl.set_cache_policy(wq_a, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(wq_a, load=pl.LoadL2Hint.NotAllocClean)
                 q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
                 qr_k_base = (qbg_idx % QR_OK) * QR_SPLIT_K_TILE
                 for dense_t0 in pl.range(0, qr_full_rows, QR_DENSE_M_TILE):
@@ -408,7 +408,7 @@ def q_proj_q_matmul(
         QPROJ_WORKERS, name_hint="qproj_matmul", deps=[qproj_dep],
     ) as qproj_tid:
         # Weight reads bypass L2.
-        pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(wq_b, load=pl.LoadL2Hint.NotAllocClean)
         qproj_worker = pl.tile.get_block_idx()
         for qproj_n_idx in pl.range(
             qproj_worker, (H * HEAD_DIM) // QPROJ_MM_N_TILE, QPROJ_WORKERS,
@@ -693,7 +693,7 @@ def kv_proj_rope(
                 (HEAD_DIM // KV_N_TILE) * KV_OK * kv_m_groups, name_hint="kv_proj_matmul", deps=[late_dep],
             ) as _kv_tid:
                 # Weight reads bypass L2.
-                pl.set_cache_policy(wkv, pl.CachePolicy.BYPASS)
+                pl.set_l2_hint(wkv, load=pl.LoadL2Hint.NotAllocClean)
                 kbg = pl.tile.get_block_idx()
                 kv_col0 = (kbg // (KV_OK * kv_m_groups)) * KV_N_TILE
                 kv_k_base = ((kbg // kv_m_groups) % KV_OK) * KV_SPLIT_K_TILE

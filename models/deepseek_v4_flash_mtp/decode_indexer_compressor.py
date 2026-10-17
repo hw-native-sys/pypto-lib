@@ -106,8 +106,8 @@ def indexer_compressor(
         BS_PAD * OUT_DIM // (MM_B_TILE * PROJ_OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
     ) as _kv_score_tid:
         # Weight reads bypass L2.
-        pl.set_cache_policy(wkv, pl.CachePolicy.BYPASS)
-        pl.set_cache_policy(wgate, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(wkv, load=pl.LoadL2Hint.NotAllocClean)
+        pl.set_l2_hint(wgate, load=pl.LoadL2Hint.NotAllocClean)
         idx = pl.tile.get_block_idx()
         global_row0 = (idx // (OUT_DIM // PROJ_OUT_TILE)) * MM_B_TILE
         o0 = (idx % (OUT_DIM // PROJ_OUT_TILE)) * PROJ_OUT_TILE

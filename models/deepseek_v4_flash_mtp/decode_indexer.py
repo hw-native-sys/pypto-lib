@@ -140,7 +140,7 @@ def indexer(
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_Q_DIM], dtype=pl.INT32)
     for ot in pl.spmd(IDX_Q_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_matmul", allow_early_resolve=True):
         # Weight reads bypass L2.
-        pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(wq_b, load=pl.LoadL2Hint.NotAllocClean)
         o_base = ot * Q_OUT_TILE
         for ns in pl.range(0, Q_OUT_TILE, MM_N_TILE):
             qr_acc = pl.create_tensor([MM_ROW_TILE, MM_N_TILE], dtype=pl.INT32)
@@ -221,7 +221,7 @@ def indexer(
     x_flat = pl.reshape(x, [T, D])
     weights_partial = pl.create_tensor([WEIGHTS_OK * MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
     with pl.spmd(WEIGHTS_OK, name_hint="weights_proj", deps=[late_dep]) as _weights_tid:
-        pl.set_cache_policy(weights_proj, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(weights_proj, load=pl.LoadL2Hint.NotAllocClean)
         kb = pl.tile.get_block_idx()
         k_base = kb * WEIGHTS_K_TILE
         weights_acc = pl.create_tensor([MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)

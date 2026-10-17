@@ -82,7 +82,7 @@ def _expert_shared(
             allow_early_resolve=True,
         ):
             # Weight reads bypass L2.
-            pl.set_cache_policy(shared_w1, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(shared_w1, load=pl.LoadL2Hint.NotAllocClean)
             for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
                 n0 = ng * MM_INTER_TILE
                 gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
@@ -99,7 +99,7 @@ def _expert_shared(
             allow_early_resolve=True,
         ):
             # Weight reads bypass L2.
-            pl.set_cache_policy(shared_w3, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(shared_w3, load=pl.LoadL2Hint.NotAllocClean)
             for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
                 n0 = ng * MM_INTER_TILE
                 up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
@@ -237,7 +237,7 @@ def _expert_shared(
             allow_early_resolve=True,
         ):
             # Weight reads bypass L2.
-            pl.set_cache_policy(shared_w2, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(shared_w2, load=pl.LoadL2Hint.NotAllocClean)
             d_base = db_idx * (W2_INNER * D_OUT_TILE)
             for dg in pl.range(W2_INNER):
                 d0 = d_base + dg * D_OUT_TILE

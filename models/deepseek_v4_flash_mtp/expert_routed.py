@@ -68,7 +68,7 @@ def expert_routed_tile(
         up_tile_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
 
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
-            pl.set_cache_policy(routed_w1, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(routed_w1, load=pl.LoadL2Hint.NotAllocClean)
             nb_idx = pl.tile.get_block_idx()
             n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
             for ng in pl.range(MM_GATE_INNER):
@@ -81,7 +81,7 @@ def expert_routed_tile(
                 gate_tile_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
 
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
-            pl.set_cache_policy(routed_w3, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(routed_w3, load=pl.LoadL2Hint.NotAllocClean)
             ub_idx = pl.tile.get_block_idx()
             u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
             for ug in pl.range(MM_GATE_INNER):
@@ -137,7 +137,7 @@ def expert_routed_tile(
 
     y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
     with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm", allow_early_resolve=True):
-        pl.set_cache_policy(routed_w2, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(routed_w2, load=pl.LoadL2Hint.NotAllocClean)
         wb_idx = pl.tile.get_block_idx()
         d_base = wb_idx * (W2_INNER * D_OUT_TILE)
         for dg in pl.range(W2_INNER):

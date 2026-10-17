@@ -75,7 +75,7 @@ def expert_routed_tile(
 
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm", deps=[inputs_ready]):
             # Weight reads bypass L2.
-            pl.set_cache_policy(routed_w1, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(routed_w1, load=pl.LoadL2Hint.NotAllocClean)
             block = pl.tile.get_block_idx()
             n_base = block * (MM_GATE_INNER * MM_INTER_TILE)
             for inner in pl.range(MM_GATE_INNER):
@@ -89,7 +89,7 @@ def expert_routed_tile(
 
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm", deps=[inputs_ready]):
             # Weight reads bypass L2.
-            pl.set_cache_policy(routed_w3, pl.CachePolicy.BYPASS)
+            pl.set_l2_hint(routed_w3, load=pl.LoadL2Hint.NotAllocClean)
             block = pl.tile.get_block_idx()
             n_base = block * (MM_GATE_INNER * MM_INTER_TILE)
             for inner in pl.range(MM_GATE_INNER):
@@ -183,7 +183,7 @@ def expert_routed_tile(
         allow_early_resolve=True,
     ) as w2_tid:
         # Weight reads bypass L2.
-        pl.set_cache_policy(routed_w2, pl.CachePolicy.BYPASS)
+        pl.set_l2_hint(routed_w2, load=pl.LoadL2Hint.NotAllocClean)
         block = pl.tile.get_block_idx()
         d_base = block * (W2_INNER * D_OUT_TILE)
         for inner in pl.range(W2_INNER):
