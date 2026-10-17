@@ -33,7 +33,7 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 from pypto.backend import BackendType, set_backend_type
-from pypto.runtime import RunConfig
+from pypto.runtime import ExecutionMode, RunConfig
 
 from config import (
     QWEN3_14B_DIMS as D,
@@ -1988,7 +1988,10 @@ if __name__ == "__main__":
     if args.smoke or args.platform.endswith("sim"):
         compiled = decode_fwd.compile(
             *_decode_smoke_inputs(),
-            config=RunConfig(platform=args.platform),
+            config=RunConfig(
+                backend_type=BackendType.Ascend950 if args.platform.startswith("a5") else BackendType.Ascend910B,
+                execution_mode=ExecutionMode.SIM if args.platform.endswith("sim") else ExecutionMode.ONBOARD,
+            ),
         )
         print(f"Compiled dynamic B{BATCH_PAD + 1} decode smoke: {compiled.output_dir}")
         raise SystemExit(0)
@@ -2060,7 +2063,8 @@ if __name__ == "__main__":
     # dropped") on the full 40-layer --max-seq graph, so capture with a small
     # --fwd-layers.
     run_cfg = RunConfig(
-        platform=args.platform,
+        backend_type=BackendType.Ascend950 if args.platform.startswith("a5") else BackendType.Ascend910B,
+        execution_mode=ExecutionMode.SIM if args.platform.endswith("sim") else ExecutionMode.ONBOARD,
         device_id=args.device,
         enable_chip_swimlane=args.enable_chip_swimlane,
         enable_dep_gen=args.enable_dep_gen,

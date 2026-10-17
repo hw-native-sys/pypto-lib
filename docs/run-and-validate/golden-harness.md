@@ -226,3 +226,15 @@ PYPTO_GOLDEN_NUM_THREADS=8 \
   validation fails.
 - Use [Precision Tuning](../debug-and-tune/precision-tuning.md) when the mismatch itself is
   the subject of the work.
+
+## Backend and execution mode
+
+New configurations can select `backend_type` (`BackendType.Ascend910B` or
+`BackendType.Ascend950`) and `execution_mode` (`ExecutionMode.ONBOARD` or
+`ExecutionMode.SIM`) separately. Import `BackendType` from `pypto.backend` and
+`ExecutionMode` from `pypto.runtime`. The harness passes these choices through
+`RunConfig` and uses both when reloading saved builds.
+
+Existing `platform` configurations and `-p` command-line arguments remain
+supported. PyPTO retains the derived platform string in cache keys and artifact
+metadata, so equivalent old and new configurations select the same target.
