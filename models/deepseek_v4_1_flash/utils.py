@@ -27,6 +27,22 @@ from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose
 from rope_tables import precompute_rope_tables
 
 
+def parse_decode_startpos(value):
+    """Parse one absolute decode position per request."""
+    import argparse
+
+    try:
+        positions = [int(item) for item in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("startpos must be a comma-separated list of integers") from error
+    limit = min(C.MAX_BATCH_PER_DP, C.DECODE_MAX_TOKENS)
+    if not 1 <= len(positions) <= limit:
+        raise argparse.ArgumentTypeError(f"startpos must contain between 1 and {limit} positions")
+    if any(position < 0 or position >= M.max_position_embeddings for position in positions):
+        raise argparse.ArgumentTypeError(f"positions must be in [0, {M.max_position_embeddings})")
+    return positions
+
+
 # Model config.
 D = M.hidden_size
 HC_MULT = M.hc_mult

@@ -18,7 +18,7 @@ from config import (
     FLASH as M, LOCAL_T_DYN, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN,
     INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN, Q_START_DYN, STATE_BLOCKS_DYN,
     COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
-    MAX_BATCH_PER_DP, DECODE_MAX_TOKENS, BLOCK_SIZE,
+    MAX_BATCH_PER_DP, BLOCK_SIZE,
 )
 from compressor import publish_c2a_compressed, STATE_WIDTH, project_ratio2, compressor_ratio2, golden_compressor_ratio2_paged
 from hc import hc_mixes, golden_mhc_mixes
@@ -592,7 +592,7 @@ def _plan(tokens, requests, case):
     return lengths, prefixes
 
 
-def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed"):
+def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None):
     """Deterministic inputs for ``golden_decode_attn_c2a_full``.
 
     case: "mixed" keeps contexts short so every causal position is selected, "long" pushes
@@ -606,6 +606,8 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed"):
     gen = torch.Generator().manual_seed(seed)
 
     lengths, prefixes = _plan(tokens, requests, case)
+    if start_pos is not None:
+        lengths, prefixes = [1] * requests, list(start_pos)
     token_to_req_indices = torch.repeat_interleave(torch.arange(requests), torch.tensor(lengths))
     positions = torch.cat(
         [torch.arange(prefix, prefix + length) for prefix, length in zip(prefixes, lengths)]
@@ -859,14 +861,14 @@ def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     }
 
 
-def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed"):
+def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed", start_pos=None):
     """Inputs for a reuse layer, taken from what a full layer actually published.
 
     The compressed pool and the Top-K row list come from running the full-mode
     reference on the same batch, so the fixture exercises the real Full-to-Reuse
     hand-off rather than a synthetic selection.
     """
-    source = make_c2a_inputs(tokens=tokens, requests=requests, seed=seed, case=case)
+    source = make_c2a_inputs(tokens=tokens, requests=requests, seed=seed, case=case, start_pos=start_pos)
     published = golden_reference_c2a(source)
     values = {name: source[name] for name in REUSE_INPUT_NAMES if name != "compressed_indices"}
     values["compressed_cache"] = published["compressed_cache"]
@@ -881,10 +883,10 @@ def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed"):
     return values
 
 
-def build_hc_validation_values(mode, tokens=24, requests=6, seed=17, case="mixed"):
+def build_hc_validation_values(mode, tokens=24, requests=6, seed=17, case="mixed", start_pos=None):
     """Build TP1 C2A weights, cache state, and mHC inputs."""
     values = (make_c2a_inputs if mode == "full" else make_c2a_reuse_inputs)(
-        tokens=tokens, requests=requests, seed=seed, case=case,
+        tokens=tokens, requests=requests, seed=seed, case=case, start_pos=start_pos,
     )
     del values["x"]
     values = {name: value.unsqueeze(0) for name, value in values.items()}
@@ -945,14 +947,16 @@ def golden_decode_c2a_full_case(tensors):
 
 
 if __name__ == "__main__":
+    from utils import parse_decode_startpos
+
     import argparse
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="TP1 A5 mHC C2A full validation")
     parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tokens", type=int, default=24)
-    parser.add_argument("--requests", type=int, default=6)
+    startpos_help = "one position per request; omitted: default validation workload"
+    parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["mixed", "long", "masked", "zero"], default="mixed")
     parser.add_argument("--compile-only", action="store_true")
@@ -961,12 +965,11 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.set_defaults(tokens=24, requests=6)
     args = parser.parse_args()
-    if not 1 <= args.tokens <= DECODE_MAX_TOKENS:
-        parser.error(f"require 1 <= tokens <= {DECODE_MAX_TOKENS}")
-    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
-        parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens)")
-    values = build_hc_validation_values("full", args.tokens, args.requests, args.seed, args.case)
+    if args.startpos is not None:
+        args.tokens = args.requests = len(args.startpos)
+    values = build_hc_validation_values("full", args.tokens, args.requests, args.seed, args.case, start_pos=args.startpos)
     host = l3_decode_c2a_full
     specs = [
         TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=lambda name=name: values[name].clone())

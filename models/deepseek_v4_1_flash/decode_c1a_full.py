@@ -55,9 +55,7 @@ from config import (
     AttentionMode, BLOCK_SIZE,
     LOCAL_T_DYN,
     COMPRESSED_CACHE_GROUP,
-    DECODE_MAX_TOKENS,
     INDEX_CACHE_GROUP,
-    MAX_BATCH_PER_DP,
     WINDOW_CACHE_GROUP,
     FLASH as M,
     B_DYN,
@@ -544,7 +542,7 @@ def golden_decode_attn_c1a_full(
     )
 
 
-def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="random"):
+def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None):
     """Deterministic synthetic tensors at released model dimensions."""
     import math
 
@@ -555,6 +553,7 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
         quantize_mxfp4_cache,
     )
 
+    cache_pages = PAGES * REQUESTS if start_pos is not None else PAGES
     torch.manual_seed(seed)
     # Balanced token-to-request split. Every request carries the same page
     # permutation, so the page-addressable caches stay conflict-free while the
@@ -584,6 +583,8 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
         torch.bfloat16
     )
     positions = torch.arange(PAGES * 128 - 1, PAGES * 128 - TOKENS - 1, -1)
+    if start_pos is not None:
+        positions = torch.tensor(start_pos, dtype=torch.int64)
     freqs_cos, freqs_sin = precompute_rope_tables(PAGES * 128, compressed_attention=True)
     values["rope_cos"] = freqs_cos[positions].unsqueeze(0).expand(RANKS, -1, -1).contiguous()
     values["rope_sin"] = freqs_sin[positions].unsqueeze(0).expand(RANKS, -1, -1).contiguous()
@@ -595,9 +596,9 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
     )
     values["compressed_indices"] = torch.full((RANKS, TOKENS, INDEX_TOPK), -1, dtype=torch.int32)
     values["compressed_indices"][:, :, :128] = torch.arange(128, dtype=torch.int32)
-    wc, ws = quantize_mxfp8_cache(torch.randn(1, PAGES, 128, 1, HEAD_DIM).expand(RANKS, -1, -1, -1, -1).contiguous())
+    wc, ws = quantize_mxfp8_cache(torch.randn(1, cache_pages, 128, 1, HEAD_DIM).expand(RANKS, -1, -1, -1, -1).contiguous())
     cc, cs = quantize_mxfp4_cache(
-        torch.randn(1, PAGES, 128, 1, HEAD_DIM).expand(RANKS, -1, -1, -1, -1).contiguous(), 16, "bf16"
+        torch.randn(1, cache_pages, 128, 1, HEAD_DIM).expand(RANKS, -1, -1, -1, -1).contiguous(), 16, "bf16"
     )
     values["window_cache"], values["window_cache_scale"] = wc, ws
     values["compressed_cache"], values["compressed_cache_scale"] = cc, cs
@@ -617,14 +618,29 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
     values["index_block_table"] = (
         torch.randperm(PAGES).int().view(1, 1, PAGES).expand(RANKS, REQUESTS, -1).contiguous()
     )
+    if start_pos is not None:
+        from utils import window_metadata
+
+        table = torch.arange(cache_pages, dtype=torch.int32).reshape(REQUESTS, PAGES)
+        slots, indices, _ = window_metadata(positions, token_to_req, table)
+        values["window_slots"] = slots.unsqueeze(0).expand(RANKS, -1).contiguous()
+        values["window_indices"] = indices.unsqueeze(0).expand(RANKS, -1, -1).contiguous()
+        values["compressed_lens"] = (positions + 1).int().unsqueeze(0).expand(RANKS, -1).contiguous()
+        values["index_block_table"] = table.unsqueeze(0).expand(RANKS, -1, -1).contiguous()
+        selected = torch.arange(INDEX_TOPK).expand(TOKENS, -1)
+        valid = selected < values["compressed_lens"][0, :, None]
+        physical = token_to_req[:, None] * PAGES * 128 + selected
+        values["compressed_indices"] = physical.masked_fill(~valid, -1).int().unsqueeze(0)
+        values["compressed_indices"] = values["compressed_indices"].expand(RANKS, -1, -1).contiguous()
+
     # Index keys carry a page-level magnitude ladder: the first half of the pages dominates the
     # second half by 2^10. The candidate window then ends in a magnitude gap instead of a dense
     # score band, so a ulp-level stack difference cannot reorder the cut. The index query is
     # quantized to E2M1 inside the operator, so a cutoff decided by a dense band would move with
     # any build. A few quiet positions stay visible so the mask still excludes something.
-    quiet_page = torch.arange(PAGES) >= PAGES // 2
-    page_gain = torch.where(quiet_page, torch.full((PAGES,), 2.0**-10), torch.ones(PAGES))
-    keys = torch.randn(RANKS, PAGES, 128, 1, INDEX_DIM) * page_gain.view(1, PAGES, 1, 1, 1)
+    quiet_page = torch.arange(cache_pages).remainder(PAGES) >= PAGES // 2
+    page_gain = torch.where(quiet_page, torch.full((cache_pages,), 2.0**-10), torch.ones(cache_pages))
+    keys = torch.randn(RANKS, cache_pages, 128, 1, INDEX_DIM) * page_gain.view(1, cache_pages, 1, 1, 1)
     ic, ics = quantize_mxfp4_cache(keys.to(torch.bfloat16), 32, "e8m0", round_to_even=True)
     values["index_cache"], values["index_cache_scale"] = (
         ic,
@@ -643,9 +659,10 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
         # the published key magnitude.
         values["index_norm_weight"] = torch.full((RANKS, INDEX_DIM), 2.0**-10, dtype=torch.bfloat16)
         positions = values["compressed_lens"].long() - 1
-        values["compressed_slots"] = (
-            values["index_block_table"][:, 0].gather(1, positions // 128).long() * 128 + positions % 128
-        )
+        request_rows = values["request_ids"][:, :, None].long().expand(-1, -1, PAGES)
+        token_tables = values["index_block_table"].gather(1, request_rows)
+        physical_pages = token_tables.gather(2, (positions // 128)[:, :, None]).squeeze(-1).long()
+        values["compressed_slots"] = physical_pages * 128 + positions % 128
     for name in (
         "wq_a",
         "wq_a_scale",
@@ -672,9 +689,10 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
         if mode == "full":
             positions = values["compressed_lens"].long() - 1
             safe = positions.clamp_min(0)
-            values["compressed_slots"] = (
-                values["index_block_table"][:, 0].gather(1, safe // 128).long() * 128 + safe % 128
-            )
+            request_rows = values["request_ids"][:, :, None].long().expand(-1, -1, PAGES)
+            token_tables = values["index_block_table"].gather(1, request_rows)
+            physical_pages = token_tables.gather(2, (safe // 128)[:, :, None]).squeeze(-1).long()
+            values["compressed_slots"] = physical_pages * 128 + safe % 128
             values["compressed_slots"][positions < 0] = -1
     elif case == "masked":
         values["window_indices"].fill_(-1)
@@ -747,11 +765,11 @@ def cache_compare(world_size, tokens, mode):
     return compare
 
 
-def build_hc_validation_values(mode, tokens, pages, requests=1, seed=17, case="random"):
+def build_hc_validation_values(mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None):
     """Create local HC token slabs and full-range attention operands."""
     import math
 
-    values = build_validation_values(mode, tokens, pages, requests, seed, case)
+    values = build_validation_values(mode, tokens, pages, requests, seed, case, start_pos=start_pos)
     del values["x"]
     generator = torch.Generator().manual_seed(seed)
     local_tokens = (tokens + TP_SIZE - 1) // TP_SIZE
@@ -813,6 +831,8 @@ def golden_decode_c1a_full_case(tensors):
 
 
 if __name__ == "__main__":
+    from utils import parse_decode_startpos
+
     import argparse
 
     from pypto.ir import DistributedConfig
@@ -820,9 +840,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TP1 A5 mHC C1A full validation")
     parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tokens", type=int, default=1)
-    parser.add_argument("--pages", type=int, default=8)
-    parser.add_argument("--requests", type=int, default=1)
+    startpos_help = "one position per request; omitted: default validation workload"
+    parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -831,16 +850,15 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.set_defaults(tokens=1, requests=1, pages=8)
     args = parser.parse_args()
-    if not 1 <= args.tokens <= min(DECODE_MAX_TOKENS, args.pages * 128) or args.pages < 1:
-        parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1")
-
-    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
-        parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens {args.tokens})")
-
+    if args.startpos is not None:
+        args.tokens = args.requests = len(args.startpos)
+        args.pages = (max(args.startpos) + 128) // 128
     host = l3_decode_c1a_full
     values = build_hc_validation_values(
         "full", args.tokens, args.pages, args.requests, args.seed, args.case,
+        start_pos=args.startpos,
     )
     # Independent initial storage for each harness allocation.
     specs = [

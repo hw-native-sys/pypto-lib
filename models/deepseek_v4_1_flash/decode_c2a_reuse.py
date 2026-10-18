@@ -19,7 +19,6 @@ from decode_c2a_full import (
 from config import (
     FLASH as M, LOCAL_T_DYN, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN,
     COMPRESSED_CACHE_GROUP, WINDOW_CACHE_GROUP,
-    MAX_BATCH_PER_DP, DECODE_MAX_TOKENS,
 )
 from hc import hc_mixes
 from hc import hc_pre
@@ -322,14 +321,16 @@ def golden_decode_c2a_reuse_case(tensors):
 
 
 if __name__ == "__main__":
+    from utils import parse_decode_startpos
+
     import argparse
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="TP1 A5 mHC C2A reuse validation")
     parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tokens", type=int, default=32)
-    parser.add_argument("--requests", type=int, default=6)
+    startpos_help = "one position per request; omitted: default validation workload"
+    parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["mixed", "long", "masked", "zero"], default="mixed")
     parser.add_argument("--compile-only", action="store_true")
@@ -338,12 +339,11 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.set_defaults(tokens=32, requests=6)
     args = parser.parse_args()
-    if not 1 <= args.tokens <= DECODE_MAX_TOKENS:
-        parser.error(f"require 1 <= tokens <= {DECODE_MAX_TOKENS}")
-    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
-        parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens)")
-    values = build_hc_validation_values("reuse", args.tokens, args.requests, args.seed, args.case)
+    if args.startpos is not None:
+        args.tokens = args.requests = len(args.startpos)
+    values = build_hc_validation_values("reuse", args.tokens, args.requests, args.seed, args.case, start_pos=args.startpos)
     host = l3_decode_c2a_reuse
     specs = [
         TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=lambda name=name: values[name].clone())

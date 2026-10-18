@@ -15,7 +15,6 @@ import pypto.language as pl
 
 from config import (
     FLASH as M,
-    DECODE_MAX_TOKENS,
     TP_SIZE,
     T_DYN,
     ORI_BLOCKS_DYN,
@@ -303,27 +302,28 @@ def comparisons(args, devices):
 
 
 if __name__ == "__main__":
+    from utils import parse_decode_startpos
+
     import argparse
 
     from pypto.ir import DistributedConfig
     from golden import run
-    from config import MAX_BATCH_PER_DP
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 TP1 SWA decode composition")
     parser.add_argument("-p", "--platform", default="a5", choices=("a5", "a5sim"))
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tokens", type=int, default=32)
-    parser.add_argument("--requests", type=int, default=4)
+    startpos_help = "one position per request; omitted: default validation workload"
+    parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=("mixed", "shuffle", "prefix"), default="mixed")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.set_defaults(tokens=32, requests=4)
     args = parser.parse_args()
-    if not 1 <= args.tokens <= DECODE_MAX_TOKENS:
-        parser.error(f"tokens must be in [1, {DECODE_MAX_TOKENS}]")
-    if not 1 <= args.requests <= min(args.tokens, MAX_BATCH_PER_DP):
-        parser.error(f"requests must be in [1, min(tokens, {MAX_BATCH_PER_DP})]")
+    if args.startpos is not None:
+        args.tokens = args.requests = len(args.startpos)
+    args.start_pos = args.startpos
     args.tp = args.dp = 1
     args.active_tokens = args.tokens
     args.bench = False

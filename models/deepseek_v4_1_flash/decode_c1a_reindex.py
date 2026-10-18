@@ -14,8 +14,6 @@ import torch
 from config import (
     AttentionMode,
     COMPRESSED_CACHE_GROUP,
-    DECODE_MAX_TOKENS,
-    MAX_BATCH_PER_DP,
     INDEX_CACHE_GROUP,
     WINDOW_CACHE_GROUP,
     FLASH as M,
@@ -387,6 +385,8 @@ def golden_decode_c1a_reindex_case(tensors):
 
 
 if __name__ == "__main__":
+    from utils import parse_decode_startpos
+
     import argparse
 
     from pypto.ir import DistributedConfig
@@ -394,9 +394,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TP1 A5 mHC C1A reindex validation")
     parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tokens", type=int, default=1)
-    parser.add_argument("--pages", type=int, default=8)
-    parser.add_argument("--requests", type=int, default=1)
+    startpos_help = "one position per request; omitted: default validation workload"
+    parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -405,16 +404,15 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.set_defaults(tokens=1, requests=1, pages=8)
     args = parser.parse_args()
-    if not 1 <= args.tokens <= min(DECODE_MAX_TOKENS, args.pages * 128) or args.pages < 1:
-        parser.error(f"require 1 <= tokens <= min({DECODE_MAX_TOKENS}, pages * 128), pages >= 1")
-
-    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
-        parser.error(f"require 1 <= requests <= min({MAX_BATCH_PER_DP}, tokens {args.tokens})")
-
+    if args.startpos is not None:
+        args.tokens = args.requests = len(args.startpos)
+        args.pages = (max(args.startpos) + 128) // 128
     host = l3_decode_c1a_reindex
     values = build_hc_validation_values(
         "reindex", args.tokens, args.pages, args.requests, args.seed, args.case,
+        start_pos=args.startpos,
     )
     # Independent initial storage for each harness allocation.
     specs = [
