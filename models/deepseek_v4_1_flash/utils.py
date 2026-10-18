@@ -112,7 +112,7 @@ TOPK_SCORE_ATOL = 5e-05
 
 TOPK_SCORE_RTOL = 0.015
 
-COMMON_INPUT_NAMES = ('x', 'wq_a', 'wq_a_scale', 'q_norm_weight', 'wq_b', 'wq_b_scale', 'wkv', 'wkv_scale', 'kv_norm_weight', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'window_cache', 'window_cache_scale', 'compressed_cache', 'compressed_cache_scale')
+COMMON_INPUT_NAMES = ('x', 'wq_a', 'wq_a_scale', 'q_norm_weight', 'wq_b', 'wq_b_scale', 'wkv', 'wkv_scale', 'kv_norm_weight', 'attn_sink', 'wo_a', 'wo_a_scale', 'wo_b', 'wo_b_scale', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'window_cache', 'window_cache_scale', 'compressed_cache', 'compressed_cache_scale')
 
 
 def _ranked(value: torch.Tensor) -> torch.Tensor:
@@ -187,7 +187,7 @@ def fixture_token_count(token_count: int, case_name: str) -> int:
 def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Tensor]:
     import torch
     from config import TP_SIZE, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP
-    from quant import quantize_mxfp4_cache, quantize_mxfp8_cache
+    from quant import quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
     torch.manual_seed(41)
     request_ids, compressed_lens, block_table, slots, window_indices, compressed_indices, candidate_mask = _case_metadata(token_count, case_name)
     token_count = request_ids.numel()
@@ -208,6 +208,7 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
     angles = angles * torch.arange(ROPE_DIM // 2, dtype=torch.float32).unsqueeze(0) * 0.001
     values = {'x': _ranked(torch.randn(token_count, D).to(torch.bfloat16)), 'wq_a': wq_a, 'wq_a_scale': wq_a_scale, 'q_norm_weight': _ranked(torch.ones(Q_LORA, dtype=torch.bfloat16)), 'wq_b': wq_b, 'wq_b_scale': wq_b_scale, 'wkv': wkv, 'wkv_scale': wkv_scale, 'kv_norm_weight': _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)), 'attn_sink': torch.zeros(TP_SIZE, LOCAL_H, dtype=torch.float32), 'wo_a': torch.randn(TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16).mul_(O_GROUP_IN ** (-0.5)), 'wo_b': wo_b, 'wo_b_scale': wo_b_scale, 'rope_cos': _ranked(torch.cos(angles)), 'rope_sin': _ranked(torch.sin(angles)), 'window_slots': _ranked(slots), 'window_indices': _ranked(window_indices), 'window_cache': _ranked(window_cache), 'window_cache_scale': _ranked(window_cache_scale), 'compressed_cache': _ranked(compressed_cache), 'compressed_cache_scale': _ranked(compressed_cache_scale), 'compressed_indices': _ranked(compressed_indices), 'request_ids': _ranked(request_ids), 'compressed_lens': _ranked(compressed_lens), 'index_cache': _ranked(index_cache), 'index_cache_scale': _ranked(index_cache_scale), 'index_block_table': _ranked(block_table), 'candidate_mask': _ranked(candidate_mask), 'compressed_rope_cos': _ranked(torch.cos(angles)), 'compressed_rope_sin': _ranked(torch.sin(angles)), 'compressor_wkv': _ranked(torch.randn(D, HEAD_DIM).mul_(D ** (-0.5)).to(torch.bfloat16)), 'compressor_norm_weight': _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)), 'compressed_slots': _ranked(slots), 'index_wk': _ranked(torch.randn(HEAD_DIM, INDEX_DIM).mul_(HEAD_DIM ** (-0.5)).to(torch.bfloat16)), 'index_norm_weight': _ranked(torch.ones(INDEX_DIM, dtype=torch.bfloat16)), 'index_wq_b': index_wq_b, 'index_wq_b_scale': index_wq_b_scale, 'index_weights_proj': _ranked(torch.randn(D, INDEX_H).mul_(D ** (-0.5)).to(torch.bfloat16))}
     values['attn_norm_weight'] = _ranked(torch.randn(D).mul_(0.1).add_(1).to(torch.bfloat16))
+    values["wo_a"], values["wo_a_scale"] = quantize_grouped_mxfp8_weight(values["wo_a"])
     return values
 
 def _copy_storage(destination: torch.Tensor, source: torch.Tensor) -> None:
@@ -968,13 +969,13 @@ class ResidentPrefillWeights:
         "ffn.shared_experts.w1",
         "ffn.shared_experts.w3",
         "ffn.shared_experts.w2",
+        "attn.wo_a",
     )
     bf16_names = (
         "attn_norm.weight",
         "ffn_norm.weight",
         "attn.q_norm.weight",
         "attn.kv_norm.weight",
-        "attn.wo_a.weight",
         "attn.compressor.wkv.weight",
         "attn.compressor.norm.weight",
         "attn.indexer.wk.weight",
@@ -1038,13 +1039,11 @@ class ResidentPrefillWeights:
                 name = f"layers.{layer}.{suffix}"
                 if name not in checkpoint.weight_map:
                     continue
-                if column == 5 and M.compress_ratios[layer] != 1:
+                if suffix == "attn.compressor.wkv.weight" and M.compress_ratios[layer] != 1:
                     continue
                 header = self._header(name)
-                if header["dtype"] not in ("F32", "BF16", "F8_E4M3"):
+                if header["dtype"] not in ("F32", "BF16"):
                     raise ValueError(f"unsupported BF16 inference weight: {name}")
-                if header["dtype"] == "F8_E4M3" and column != 4:
-                    raise ValueError(f"unexpected quantized BF16 inference weight: {name}")
                 self.bf16_offsets[layer, column] = self.bf16_values
                 self.bf16_entries.append((name, column, self.bf16_values))
                 self.bf16_values += math.prod(header["shape"])
@@ -1152,14 +1151,20 @@ class ResidentPrefillWeights:
             weight = checkpoint.tensor(stem + ".weight")
             codes = checkpoint.tensor(stem + ".scale").view(torch.uint8)
             logical_scale = codes.repeat_interleave(32, dim=0).t().contiguous()
-            copy("bank8", weight.t(), offset)
+            if stem.endswith(".attn.wo_a"):
+                # Checkpoint [G*N, K] becomes grouped [G, K, N].
+                n, k = weight.shape
+                if n != M.o_groups * M.o_lora_rank or k != M.num_attention_heads * M.head_dim // M.o_groups:
+                    raise ValueError(f"unsupported grouped Wo-A weight shape: {stem}")
+                weight = weight.reshape(M.o_groups, M.o_lora_rank, k).transpose(-1, -2)
+                logical_scale = logical_scale.reshape(k // 32, M.o_groups, M.o_lora_rank).permute(1, 0, 2)
+            else:
+                weight = weight.t()
+            copy("bank8", weight, offset)
             copy("scales8", pack_mx_b_scale(logical_scale).view(torch.float8_e8m0fnu), scale_offset)
         for name, column, offset in self.bf16_entries:
-            if column == 4:
-                value = checkpoint.linear(name.removesuffix(".weight")).to(torch.bfloat16)
-            else:
-                value = checkpoint.tensor(name).to(torch.bfloat16)
-            if column in (5, 7, 9):
+            value = checkpoint.tensor(name).to(torch.bfloat16)
+            if name.endswith((".attn.compressor.wkv.weight", ".attn.indexer.wk.weight", ".attn.indexer.weights_proj.weight")):
                 value = value.t()
             copy("bf16", value, offset)
         for name, column, offset in self.dense_entries:

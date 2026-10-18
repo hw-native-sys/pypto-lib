@@ -31,6 +31,7 @@ from quant import (
     dequantize_mxfp8_cache,
     golden_mxfp8_linear,
     golden_mxfp8_quantize,
+    quantize_grouped_mxfp8_weight,
     pack_mx_b_scale,
     quantize_mxfp4_cache,
     quantize_mxfp8_cache,
@@ -894,7 +895,7 @@ def l2_sparse_attention_swa_packed(
 
 SWA_INPUT_NAMES = (
     "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
-    "kv_norm_weight", "attn_sink", "wo_a", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
+    "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
     "window_slots", "window_indices", "window_cache", "window_cache_scale",
 )
 
@@ -928,7 +929,7 @@ def swa_official_reference(tensors, *, shared_cache=False):
     head_dim = t["window_cache"].shape[-1]
     local_heads = t["attn_sink"].numel()
     groups = t["wo_a"].shape[0]
-    group_in = t["wo_a"].shape[-1]
+    group_in = t["wo_a"].shape[-2]
 
     qr = golden_rms_norm(golden_mxfp8_linear(t["x"], t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
     q = golden_mxfp8_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
@@ -975,7 +976,7 @@ def swa_official_reference(tensors, *, shared_cache=False):
     attended = (numerator * multiplier[..., None]).to(torch.bfloat16)
     attended = golden_rope_tail(attended, t["rope_cos"], t["rope_sin"], inverse=True)
     grouped = attended.reshape(-1, groups, group_in)
-    latent = golden_grouped_output(grouped, t["wo_a"])
+    latent = golden_grouped_output(grouped, t["wo_a"], t["wo_a_scale"])
     output = golden_mxfp8_linear(latent.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=True)
     return output, cache, cache_scale
 
@@ -1008,7 +1009,9 @@ def make_swa_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
     values = (rand(batch, D).to(torch.bfloat16), qa, qas,
               (rand(Q_LORA) * 0.1 + 1).to(torch.bfloat16), qb, qbs, kv, kvs,
               (rand(HEAD_DIM) * 0.1 + 1).to(torch.bfloat16), rand(LOCAL_H) * 2,
-              (rand(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN) / math.sqrt(O_GROUP_IN)).to(torch.bfloat16),
+              *quantize_grouped_mxfp8_weight(
+                  (rand(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN) / math.sqrt(O_GROUP_IN)).to(torch.bfloat16)
+              ),
               ob, obs, angles.cos(), angles.sin(), slots, indices, cache,
               cache_scale)
     return dict(zip(SWA_INPUT_NAMES, values))
@@ -1097,12 +1100,13 @@ def build_swa_leaf_specs(args, mode):
         [args.tokens, D], [D, Q_LORA], [D // 32, Q_LORA], [Q_LORA],
         [Q_LORA, LOCAL_H * HEAD_DIM], [Q_LORA // 32, LOCAL_H * HEAD_DIM],
         [D, HEAD_DIM], [D // 32, HEAD_DIM], [HEAD_DIM], [LOCAL_H],
-        [LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], [LOCAL_O_WIDTH, D], [LOCAL_O_WIDTH // 32, D],
+        [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA],
+        [LOCAL_O_WIDTH, D], [LOCAL_O_WIDTH // 32, D],
         [args.tokens, ROPE_DIM // 2], [args.tokens, ROPE_DIM // 2], [args.tokens], [args.tokens, 128],
         [pages, 128, 1, HEAD_DIM], [pages, 128, 1, HEAD_DIM // 32],
     )
     bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
-    dtypes = (bf, fp, mx, bf, fp, mx, fp, mx, bf, torch.float32, bf, fp, mx,
+    dtypes = (bf, fp, mx, bf, fp, mx, fp, mx, bf, torch.float32, fp, mx, fp, mx,
               torch.float32, torch.float32, torch.int64, torch.int32, fp, bf)
     values = {}
 
@@ -2270,6 +2274,7 @@ def golden_swa_attention(
     kv_norm_weight: torch.Tensor,
     attn_sink: torch.Tensor,
     wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
     wo_b: torch.Tensor,
     wo_b_scale: torch.Tensor | None,
     rope_cos: torch.Tensor,
@@ -2303,7 +2308,9 @@ def golden_swa_attention(
     quantized_window = dequantize_mxfp8_cache(window_payload, updated_window_scale).to(query.dtype)
     window_stats = golden_paged_sparse_attention_stats(query, quantized_window, window_indices)
     attended = golden_merge_attention_stats((window_stats,), attn_sink).to(query.dtype)
-    output = golden_o_proj(attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale)
+    output = golden_o_proj(
+        attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale, wo_a_scale=wo_a_scale,
+    )
     return AttentionGoldenResult(
         output, window_payload, updated_window_scale, None, None, None, None, None, None, None
     )
@@ -2323,6 +2330,7 @@ def golden_compressed_attention(
     kv_norm_weight: torch.Tensor,
     attn_sink: torch.Tensor,
     wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
     wo_b: torch.Tensor,
     wo_b_scale: torch.Tensor | None,
     rope_cos: torch.Tensor,
@@ -2517,7 +2525,7 @@ def golden_compressed_attention(
     )
     output = golden_o_proj(
         attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale,
-        output_dtype=output_dtype, sequential_projection=sequential_query,
+        wo_a_scale=wo_a_scale, output_dtype=output_dtype, sequential_projection=sequential_query,
     )
     return AttentionGoldenResult(
         output,

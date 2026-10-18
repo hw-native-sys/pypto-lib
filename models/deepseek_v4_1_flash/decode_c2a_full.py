@@ -36,6 +36,7 @@ from o_proj import o_proj, golden_o_proj
 from golden import TensorSpec, ScalarSpec, ratio_allclose, mapped_pool_ratio_allclose, run
 from utils import AttentionGoldenResult, paged_slots, window_metadata
 from quant import (
+    quantize_grouped_mxfp8_weight,
     dequantize_mxfp4_cache, golden_bf16_gemm, golden_mxfp8_quantize,
     pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache,
 )
@@ -85,7 +86,8 @@ def decode_c2a_full(
     wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -177,7 +179,7 @@ def decode_c2a_full(
         chunk_done = attend_c2a_chunk(query, selected, combined, attn_sink, attended, start, active, gather_tid)
 
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, None, group32=False)
+    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, None, group32=False)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd(tokens, name_hint="c2a_output_cast"):
         row = pl.tile.get_block_idx()
@@ -208,7 +210,8 @@ def l2_decode_c2a_full(
     wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -268,7 +271,7 @@ def l2_decode_c2a_full(
         wkv_scale,
         kv_norm_weight,
         attn_sink,
-        wo_a,
+        wo_a, wo_a_scale,
         wo_b,
         wo_b_scale,
         rope_cos,
@@ -323,7 +326,8 @@ def l3_decode_c2a_full(
     wkv_scale: pl.Tensor[[TP_SIZE, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
     kv_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[TP_SIZE, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
     rope_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -388,7 +392,7 @@ def l3_decode_c2a_full(
         wkv_scale_mx,
         kv_norm_weight[0],
         attn_sink[0],
-        wo_a[0],
+        wo_a[0], wo_a_scale[0],
         wo_b[0],
         wo_b_scale_mx,
         rope_cos[0],
@@ -508,7 +512,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     # h. Inverse RoPE, grouped low-rank output projection, per-rank partial.
     output = golden_o_proj(
         attended, t["rope_cos"], t["rope_sin"], t["wo_a"], t["wo_b"], t["wo_b_scale"],
-        output_dtype=torch.float32 if fp32_output else None, sequential_projection=True,
+        wo_a_scale=t["wo_a_scale"], output_dtype=torch.float32 if fp32_output else None, sequential_projection=True,
     )
 
     return {
@@ -536,6 +540,7 @@ def golden_decode_attn_c2a_full(
     kv_norm_weight: torch.Tensor,
     attn_sink: torch.Tensor,
     wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
     wo_b: torch.Tensor,
     wo_b_scale: torch.Tensor,
     rope_cos: torch.Tensor,
@@ -719,6 +724,8 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None
         "index_weights_proj": (torch.randn(D, INDEX_H, generator=gen) / math.sqrt(D)).bfloat16(),
     }
 
+    values["wo_a"], values["wo_a_scale"] = quantize_grouped_mxfp8_weight(values["wo_a"])
+
     if case == "masked":
         values["window_slots"] = torch.full_like(window_slots, -1)
         values["window_indices"] = torch.full_like(window_indices, -1)
@@ -803,7 +810,7 @@ def cache_compare(world_size, tokens, names=None):
 
 REUSE_INPUT_NAMES = (
     "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
-    "kv_norm_weight", "attn_sink", "wo_a", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
+    "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
     "window_slots", "window_indices", "window_cache", "window_cache_scale", "compressed_cache",
     "compressed_cache_scale", "compressed_indices",
 )
@@ -851,7 +858,7 @@ def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
 
     output = golden_o_proj(
         attended, t["rope_cos"], t["rope_sin"], t["wo_a"], t["wo_b"], t["wo_b_scale"],
-        output_dtype=torch.float32 if fp32_output else None, sequential_projection=True,
+        wo_a_scale=t["wo_a_scale"], output_dtype=torch.float32 if fp32_output else None, sequential_projection=True,
     )
 
     return {

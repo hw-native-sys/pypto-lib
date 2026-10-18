@@ -22,7 +22,7 @@ from config import (
 )
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import (
-    prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce, golden_grouped_output,
+    prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce, golden_o_proj,
 )
 from hc import prefill_sp_post, hc_post
 from prefill_c2a_full import (
@@ -66,7 +66,8 @@ def prefill_c2a_reuse_attention(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -120,7 +121,7 @@ def prefill_c2a_reuse_attention(
             query, selected, combined, attn_sink, attended, start, active, gather_tid
         )
 
-    o_proj(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, None, group32=False)
+    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, None, group32=False)
     return partial
 
 
@@ -141,7 +142,8 @@ def prefill_c2a_reuse_sp(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -191,7 +193,7 @@ def prefill_c2a_reuse_sp(
         prefill_c2a_reuse_attention(
             attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-            wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+            wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
             compressed_cache_scale, compressed_indices, output_arrived, partial, num_tokens,
             attention_epoch,
@@ -223,7 +225,8 @@ def prefill_c2a_reuse(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -265,7 +268,7 @@ def prefill_c2a_reuse(
     prefill_c2a_reuse_attention(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b,
         wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-        wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
         compressed_cache_scale, compressed_indices, output_arrived, attention_partial, num_tokens,
         attention_epoch,
@@ -297,7 +300,8 @@ def l2_prefill_c2a_reuse(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -332,7 +336,7 @@ def l2_prefill_c2a_reuse(
     prefill_c2a_reuse_sp(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-        kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin,
+        kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale,
         compressed_cache, compressed_cache_scale, compressed_indices, input_window, input_arrived, output_window,
         output_arrived, attn_input, attn_output, next_pre_mix, x_hc_out,
@@ -358,7 +362,8 @@ def l3_prefill_c2a_reuse(
     wkv_scale: pl.Tensor[[RANKS_DYN, D // 32, HEAD_DIM], pl.FP8E8M0],
     kv_norm_weight: pl.Tensor[[RANKS_DYN, HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[RANKS_DYN, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[RANKS_DYN, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[RANKS_DYN, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
     rope_cos: pl.Tensor[[RANKS_DYN, T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -403,7 +408,7 @@ def l3_prefill_c2a_reuse(
             x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank],
             wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank],
-            attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank],
+            attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank],
             rope_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
             window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
             compressed_indices[rank], attn_input[rank], attn_output[rank], next_pre_mix[rank],
@@ -423,7 +428,6 @@ def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     tokens = x.shape[0]
     head_dim = t["window_cache"].shape[-1]
     local_heads = t["attn_sink"].numel()
-    groups, _, group_in = t["wo_a"].shape
 
     qr = golden_rms_norm(golden_mxfp8_linear(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
     q = golden_mxfp8_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
@@ -482,10 +486,11 @@ def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     denominator = denominator * correction + (t["attn_sink"].float()[None] - final_maximum).exp()
     attended = (numerator * (correction / denominator)[..., None]).to(torch.bfloat16)
 
-    attended = golden_rope_tail(attended, t["rope_cos"], t["rope_sin"], inverse=True)
-    grouped = attended.reshape(tokens, groups, group_in)
-    projected = golden_grouped_output(grouped, t["wo_a"])
-    output = golden_mxfp8_linear(projected.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=fp32_output)
+    output = golden_o_proj(
+        attended, t["rope_cos"], t["rope_sin"], t["wo_a"], t["wo_b"], t["wo_b_scale"],
+        wo_a_scale=t["wo_a_scale"], output_dtype=torch.float32 if fp32_output else None,
+        sequential_projection=True,
+    )
 
     return {
         "output": output,

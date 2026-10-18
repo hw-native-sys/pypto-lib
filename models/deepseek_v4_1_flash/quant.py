@@ -447,14 +447,25 @@ def dequantize_mxfp8(weight: torch.Tensor, logical_scale_e8m0: torch.Tensor) -> 
     return weight.float() * scales
 
 
-def _quantize_mxfp8_activation(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_mxfp8_activation(
+    x: torch.Tensor, *, scale_alg: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
     *leading, width = x.shape
     if width % MX_GROUP:
         raise ValueError("MXFP8 activations require the last dimension to be divisible by 32")
     grouped = x.float().reshape(*leading, width // MX_GROUP, MX_GROUP)
-    amax = grouped.abs().amax(dim=-1).clamp_min(1e-4)
-    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
-    quantized = (grouped / scale.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    amax = grouped.abs().amax(dim=-1)
+    if scale_alg == 0:
+        # npu_dynamic_mx_quant defaults to OCP: floor(log2(amax)) - 8.
+        codes = _e8m0_codes_from_amax(amax)
+        scale = decode_e8m0(codes)
+        normalized = torch.where(codes.unsqueeze(-1) > 0, grouped / scale.unsqueeze(-1), 0.0)
+    elif scale_alg == 1:
+        scale = torch.exp2(torch.ceil(torch.log2(amax.clamp_min(1e-4) / 448.0)))
+        normalized = grouped / scale.unsqueeze(-1)
+    else:
+        raise ValueError("MXFP8 scale_alg must be 0 (OCP) or 1 (upward)")
+    quantized = normalized.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     return quantized, scale
 
 
@@ -513,14 +524,38 @@ def golden_mxfp8_linear(x, weight, packed_scale, fp32=False):
         result = result + scaled
     return result if fp32 else result.bfloat16()
 
+def quantize_grouped_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize output-major grouped fixtures into [G, K, N] MXFP8 storage."""
+    payload, scale = _quantize_mxfp8_activation(weight)
+    payload = payload.flatten(-2).transpose(-1, -2).contiguous()
+    codes = encode_e8m0(scale).transpose(-1, -2).contiguous()
+    return payload, pack_mx_b_scale(codes).view(torch.float8_e8m0fnu)
+
+
+def grouped_mxfp8_linear(
+    grouped: torch.Tensor,
+    wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
+    *,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Evaluate grouped W8A8 MXFP8 with [G, K, N] weights and MX_B_NN scales."""
+    activation, activation_scale = _quantize_mxfp8_activation(grouped, scale_alg=0)
+    weight_scale = decode_e8m0(unpack_mx_b_scale(wo_a_scale))
+    weight_groups = wo_a.float().unflatten(-2, (-1, MX_GROUP))
+    partials = torch.einsum("tgmk,gmkr->tgmr", activation.float(), weight_groups)
+    partials = partials * activation_scale.unsqueeze(-1) * weight_scale.unsqueeze(0)
+    return partials.sum(dim=2).to(output_dtype or grouped.dtype)
+
+
 # E8M0 has no native dtype in some PyTorch versions, so it is always carried as uint8.
 FP8_E4M3_MAX = 448.0
 
 def _e8m0_codes_from_amax(amax: torch.Tensor, fp_max: float = FP8_E4M3_MAX) -> torch.Tensor:
     """OCP shared-exponent scales used by random weight fixtures.
 
-    Released activation quantization uses the upward E8M0 scale in
-    ``host_quant_mxfp8_v41`` instead.
+    Grouped Wo-A uses this default OCP policy. The other projection references
+    retain the upward E8M0 policy in ``host_quant_mxfp8_v41``.
     """
     format_emax = int(math.floor(math.log2(fp_max)))
     _, exponent = torch.frexp(amax.float())

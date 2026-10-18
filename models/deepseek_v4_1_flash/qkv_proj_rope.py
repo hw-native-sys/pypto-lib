@@ -12,7 +12,7 @@ import pypto.language as pl
 import torch
 
 from config import FLASH as M, T_DYN, TP_SIZE
-from quant import golden_mxfp8_linear, mxfp8_linear
+from quant import golden_mxfp8_linear, mxfp8_gemm_group32, mxfp8_linear
 from rmsnorm import golden_rms_norm, rms_norm
 
 
@@ -142,13 +142,13 @@ def q_proj_qr(
 ):
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    _mx_projection(
-        x, wq_a, wq_a_scale, projected,
-        num_tokens,
-        D, Q_LORA, "attention_q_a", "attention_q_a_quant", N_TILE, K_TILE,
+    # Keep group-32 FP32 accumulation aligned with the query golden before RMSNorm.
+    projected, projected_tid = mxfp8_gemm_group32(
+        x, wq_a, wq_a_scale, projected, num_tokens, None,
+        width=D, output_width=Q_LORA, fp32_output=False,
     )
     norm_blocks = (num_tokens + 7) // 8
-    for norm_worker in pl.spmd(norm_blocks, name_hint="attention_q_norm"):
+    for norm_worker in pl.spmd(norm_blocks, name_hint="attention_q_norm", deps=[projected_tid]):
         rms_norm(projected, q_norm_weight, query_latent, norm_worker, num_tokens, width=Q_LORA)
     return query_latent
 

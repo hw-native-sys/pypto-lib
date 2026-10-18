@@ -85,7 +85,8 @@ def decode_c1a_reindex(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -155,7 +156,7 @@ def decode_c1a_reindex(
     attend_tid = attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
     oproj_result, ob_tid = o_proj(
-        attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, attend_tid, group32=True,
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, attend_tid, group32=True,
     )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd(tokens, name_hint="c1a_output_cast", deps=[ob_tid]):
@@ -187,7 +188,8 @@ def l2_decode_c1a_reindex(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -232,7 +234,7 @@ def l2_decode_c1a_reindex(
         wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight,
         attn_sink,
-        wo_a, wo_b, wo_b_scale,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin,
         window_slots, window_indices,
         window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
@@ -263,7 +265,8 @@ def l3_decode_c1a_reindex(
     wkv_scale: pl.Tensor[[TP_SIZE, D // 32, HEAD_DIM], pl.FP8E8M0],
     kv_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[TP_SIZE, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
     rope_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -315,7 +318,7 @@ def l3_decode_c1a_reindex(
         wq_b[0], wq_b_scale_r,
         wkv[0], wkv_scale_r, kv_norm_weight[0],
         attn_sink[0],
-        wo_a[0], wo_b[0], wo_b_scale_r,
+        wo_a[0], wo_a_scale[0], wo_b[0], wo_b_scale_r,
         rope_cos[0], rope_sin[0],
         window_slots[0], window_indices[0],
         window_cache[0], window_cache_scale[0], compressed_cache[0], compressed_cache_scale[0],
@@ -342,6 +345,7 @@ def golden_decode_attn_c1a_reindex(
     kv_norm_weight: torch.Tensor,
     attn_sink: torch.Tensor,
     wo_a: torch.Tensor,
+    wo_a_scale: torch.Tensor,
     wo_b: torch.Tensor,
     wo_b_scale: torch.Tensor,
     rope_cos: torch.Tensor,
@@ -367,7 +371,7 @@ def golden_decode_attn_c1a_reindex(
     return golden_c1a_attention(
         mode=AttentionMode.REINDEX,
         x=x, wq_a=wq_a, wq_a_scale=wq_a_scale, q_norm_weight=q_norm_weight, wq_b=wq_b, wq_b_scale=wq_b_scale,
-        wkv=wkv, wkv_scale=wkv_scale, kv_norm_weight=kv_norm_weight, attn_sink=attn_sink, wo_a=wo_a, wo_b=wo_b,
+        wkv=wkv, wkv_scale=wkv_scale, kv_norm_weight=kv_norm_weight, attn_sink=attn_sink, wo_a=wo_a, wo_a_scale=wo_a_scale, wo_b=wo_b,
         wo_b_scale=wo_b_scale, rope_cos=rope_cos, rope_sin=rope_sin, window_slots=window_slots,
         window_indices=window_indices, window_cache=window_cache, window_cache_scale=window_cache_scale,
         compressed_cache=compressed_cache, compressed_cache_scale=compressed_cache_scale,
