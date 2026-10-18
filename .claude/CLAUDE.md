@@ -8,6 +8,10 @@ This file is the shared project entry point; `AGENTS.md` adapts it for Codex.
 
 - Keep changes scoped to the requested kernel, model, test, or documentation
   area. Prefer existing project patterns when they agree with current rules.
+- `tests/` primarily tests the `golden` harness. `tests/contract/` tests model
+  integration with serving, not model computation or implementation structure.
+  Model development should leave these tests unchanged unless the task
+  specifically requires harness or serving-contract test changes.
 - Keep public documentation and examples aligned when behavior changes.
 - Keep agent constraints in `.claude/rules/`, task execution workflows in
   `.claude/skills/`, and public technical guidance in `docs/`. Link to the
