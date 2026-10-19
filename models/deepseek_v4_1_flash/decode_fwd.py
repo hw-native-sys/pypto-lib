@@ -54,6 +54,7 @@ from decode_c1a_reuse import decode_c1a_reuse
 from decode_c2a_full import decode_c2a_full
 from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
+from input_pack import prepare_compressed_lens
 from rope_tables import precompute_rope_tables
 from utils import build_forward_metadata
 from expert_routed import (
@@ -154,7 +155,6 @@ def _decode_encoder(
     ],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    c2a_compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[
         pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
@@ -230,13 +230,14 @@ def _decode_encoder(
     compressed_cache_scale_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
     index_cache_scale_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
-    c2a_compressed_lens.bind_dynamic(0, T_DYN)
     c2a_compressed_slots.bind_dynamic(0, T_DYN)
     c2a_index_block_table.bind_dynamic(0, B_DYN)
     c2a_index_block_table.bind_dynamic(1, FWD_C2A_TABLE_DYN)
     state_cache_pool.bind_dynamic(0, FWD_STATE_BLOCKS_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
     global_tokens = pl.tensor.dim(base_rope_cos, 0)
+    c2a_compressed_lens = pl.create_tensor([global_tokens], dtype=pl.INT32)
+    prepare_compressed_lens(position_ids, c2a_compressed_lens, 1)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
     compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
     index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // KV_SOURCE_COUNT
@@ -2071,7 +2072,6 @@ def _decode_decoder(
     ],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    c1a_compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[
         pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
@@ -2147,13 +2147,14 @@ def _decode_decoder(
     compressed_cache_scale_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
     index_cache_scale_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
-    c1a_compressed_lens.bind_dynamic(0, T_DYN)
     c1a_compressed_slots.bind_dynamic(0, T_DYN)
     c1a_index_block_table.bind_dynamic(0, B_DYN)
     c1a_index_block_table.bind_dynamic(1, FWD_C1A_TABLE_DYN)
     state_cache_pool.bind_dynamic(0, FWD_STATE_BLOCKS_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
     global_tokens = pl.tensor.dim(base_rope_cos, 0)
+    c1a_compressed_lens = pl.create_tensor([global_tokens], dtype=pl.INT32)
+    prepare_compressed_lens(position_ids, c1a_compressed_lens, 0)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
     compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
     index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // KV_SOURCE_COUNT
@@ -3914,8 +3915,6 @@ def _decode_fwd(
     ],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    c2a_compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-    c1a_compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[
         pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
@@ -4005,7 +4004,6 @@ def _decode_fwd(
         compressed_cache_scale_pool,
         token_to_req_indices,
         position_ids,
-        c2a_compressed_lens,
         index_cache_pool,
         index_cache_scale_pool,
         c2a_index_block_table,
@@ -4087,7 +4085,6 @@ def _decode_fwd(
         compressed_cache_scale_pool,
         token_to_req_indices,
         position_ids,
-        c1a_compressed_lens,
         index_cache_pool,
         index_cache_scale_pool,
         c1a_index_block_table,
@@ -4196,8 +4193,6 @@ def l3_decode_fwd(
     ],
     token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     position_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
-    c2a_compressed_lens: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
-    c1a_compressed_lens: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[
         pl.Tensor[[EP_SIZE, FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]
     ],
@@ -4273,15 +4268,17 @@ def l3_decode_fwd(
     cache pools, with BLOCK_SIZE compressed rows per page. Sources within
     one family share a page mapping; the two families may use different
     page ids and table widths. Index and main KV caches share that mapping.
-    build_forward_metadata lowers request positions and allocator tables
-    into these lengths and slots. It does not allocate physical pages.
+    Visible lengths are derived once on device from position_ids and reused
+    across layers. build_forward_metadata lowers allocator tables into slots
+    without allocating physical pages.
 
     token_to_req_indices is the single token-to-request map for both families.
     query_start_loc contains packed request offsets. Padding uses -1 for
     positions, request IDs and physical rows, and zero for visible lengths.
-    Prefill uses the same named family tables, slots and lengths, with separate
-    encoder/replay token sequences. state_block_table contains source-local
-    block IDs shared by the three C2A sources; block zero is valid, -1 is inactive.
+    Prefill uses the same named family tables and slots and derives lengths
+    from separate encoder/replay token sequences. state_block_table contains
+    source-local block IDs shared by the three C2A sources; block zero is valid,
+    -1 is inactive.
 
     Window pools contain 40 equal layer slices. Compressed and index-key pools
     contain four M.kv_source_layer_ids slices; index-query weights retain eight
@@ -4317,9 +4314,7 @@ def l3_decode_fwd(
     index_cache_pool.bind_dynamic(1, FWD_INDEX_BLOCKS_DYN)
     index_cache_scale_pool.bind_dynamic(1, FWD_INDEX_BLOCKS_DYN)
     state_cache_pool.bind_dynamic(1, FWD_STATE_BLOCKS_DYN)
-    c2a_compressed_lens.bind_dynamic(1, T_DYN)
     c2a_compressed_slots.bind_dynamic(1, T_DYN)
-    c1a_compressed_lens.bind_dynamic(1, T_DYN)
     c1a_compressed_slots.bind_dynamic(1, T_DYN)
     c2a_index_block_table.bind_dynamic(1, B_DYN)
     c2a_index_block_table.bind_dynamic(2, FWD_C2A_TABLE_DYN)
@@ -4387,7 +4382,6 @@ def l3_decode_fwd(
             compressed_cache_scale_pool[rank],
             token_to_req_indices[rank],
             position_ids[rank],
-            c2a_compressed_lens[rank],
             index_cache_pool[rank],
             index_cache_scale_pool[rank],
             c2a_index_block_table[rank],
@@ -4470,7 +4464,6 @@ def l3_decode_fwd(
             compressed_cache_scale_pool[rank],
             token_to_req_indices[rank],
             position_ids[rank],
-            c1a_compressed_lens[rank],
             index_cache_pool[rank],
             index_cache_scale_pool[rank],
             c1a_index_block_table[rank],
@@ -4600,7 +4593,6 @@ def build_tensor_specs():
     metadata_rows = {"window_slots": metadata.window_slots, "window_indices": metadata.window_indices}
     for family, ratio in (("c2a", 2), ("c1a", 1)):
         source = next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == ratio)
-        metadata_rows[family + "_compressed_lens"] = metadata.compressed_lens[source]
         metadata_rows[family + "_compressed_slots"] = metadata.compressed_slots[source]
         metadata_rows[family + "_index_block_table"] = compressed_tables[source]
     for name in l3_decode_fwd.param_names:

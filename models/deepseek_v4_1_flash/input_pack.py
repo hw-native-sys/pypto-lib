@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Token-embedding lookup and HC input packing for DeepSeek-V4.1 Flash."""
+"""Token-embedding lookup, HC input packing and cache lengths for DeepSeek-V4.1 Flash."""
 
 import pypto.language as pl
 
@@ -24,11 +24,32 @@ SOURCE_ROWS = pl.dynamic("PACK_SOURCE_ROWS")
 ROW_WIDTH = pl.dynamic("PACK_ROW_WIDTH")
 
 HIDDEN_TILE = 512
+LENGTH_TILE = 128
 SPMD_BLOCKS = 48
 TEST_VOCAB_SIZE = 256
 DEFAULT_TOKENS = 8
 
 assert D % HIDDEN_TILE == 0
+
+
+@pl.jit.inline(auto_scope=False)
+def prepare_compressed_lens(
+    position_ids: pl.Tensor[[TOKEN_DYN], pl.INT32],
+    lengths: pl.Tensor[[TOKEN_DYN], pl.INT32],
+    compression_shift: pl.constexpr,
+):
+    """Derive visible C1A (shift 0) or C2A (shift 1) lengths; position -1 gives zero."""
+    rows = pl.tensor.dim(position_ids, 0)
+    positions_row = pl.reshape(position_ids, [1, rows])
+    lengths_row = pl.reshape(lengths, [1, rows])
+    for row in pl.parallel(0, rows, LENGTH_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prepare_compressed_lens"):
+            active = pl.min(LENGTH_TILE, rows - row)
+            positions = pl.load(positions_row, [0, row], [1, LENGTH_TILE], valid_shape=[1, active])
+            visible = pl.add(positions, 1)
+            compressed = pl.shrs(visible, compression_shift)
+            pl.store(compressed, [0, row], lengths_row)
+    return lengths
 
 
 @pl.jit.inline

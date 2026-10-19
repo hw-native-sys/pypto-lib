@@ -85,7 +85,7 @@ from hc import hc_head
 from hc import hc_mixes
 from hc import hc_post
 from hc import hc_pre, zero_bf16_padding
-from input_pack import gather_rows, pack_x_hc
+from input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
 from lm_head import greedy_sample, lm_head
 from utils import (
     PrefillCheckpoint, ResidentPrefillWeights, prepare_prefill_inputs, prepare_resident_inputs,
@@ -441,15 +441,11 @@ def l2_prefill_fwd(
     rope_sin: pl.Tensor[[3, CAPACITY, 32], pl.FP32],
     compressed_cos: pl.Tensor[[CAPACITY, 32], pl.FP32],
     compressed_sin: pl.Tensor[[CAPACITY, 32], pl.FP32],
-    publisher_cos: pl.Tensor[[CAPACITY, 32], pl.FP32],
-    publisher_sin: pl.Tensor[[CAPACITY, 32], pl.FP32],
     window_slots: pl.Tensor[[2, CAPACITY], pl.INT64],
     window_indices: pl.Tensor[[2, CAPACITY, 128], pl.INT32],
     c2a_compressed_slots: pl.Tensor[[CAPACITY], pl.INT64],
     c1a_compressed_slots: pl.Tensor[[CAPACITY], pl.INT64],
     token_to_req_indices: pl.Tensor[[2, CAPACITY], pl.INT32],
-    c2a_compressed_lens: pl.Tensor[[CAPACITY], pl.INT32],
-    c1a_compressed_lens: pl.Tensor[[CAPACITY], pl.INT32],
     query_start_loc: pl.Tensor[[2, Q_START_DYN], pl.INT32],
     c2a_index_block_table: pl.Tensor[[B_DYN, C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[B_DYN, C1A_TABLE_DYN], pl.INT32],
@@ -499,6 +495,10 @@ def l2_prefill_fwd(
     scales8.bind_dynamic(0, S8)
     bf16.bind_dynamic(0, B16)
     dense.bind_dynamic(0, B32)
+    c2a_compressed_lens = pl.create_tensor([CAPACITY], dtype=pl.INT32)
+    c1a_compressed_lens = pl.create_tensor([CAPACITY], dtype=pl.INT32)
+    prepare_compressed_lens(position_ids[0], c2a_compressed_lens, 1)
+    prepare_compressed_lens(position_ids[1], c1a_compressed_lens, 0)
     hidden_pair = pl.create_tensor([4 * CAPACITY, HC_MULT, D], dtype=pl.FP32)
     pre_pair = pl.create_tensor([4 * CAPACITY, HC_MULT], dtype=pl.FP32)
     initial_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [0, 0, 0])
@@ -674,7 +674,7 @@ def l2_prefill_fwd(
                     rms_norm_tiled(encoder_collapsed, attn_norm, encoder_normalized, norm_block, norm_tokens)
                 publisher_ready = prefill_publish_decoder(
                     encoder_normalized, publisher_wkv, compressor_norm, index_wk, index_norm,
-                    publisher_cos, publisher_sin, c1a_compressed_slots,
+                    rope_cos[1], rope_sin[1], c1a_compressed_slots,
                     compressed_cache[3], compressed_scales[3], index_cache[3], index_scales[3],
                     pl.read(counts, [0]),
                 )
@@ -777,15 +777,11 @@ def l3_prefill_fwd(
     rope_sin: pl.Tensor[[RANKS, 3, CAPACITY, 32], pl.FP32],
     compressed_cos: pl.Tensor[[RANKS, CAPACITY, 32], pl.FP32],
     compressed_sin: pl.Tensor[[RANKS, CAPACITY, 32], pl.FP32],
-    publisher_cos: pl.Tensor[[RANKS, CAPACITY, 32], pl.FP32],
-    publisher_sin: pl.Tensor[[RANKS, CAPACITY, 32], pl.FP32],
     window_slots: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT64],
     window_indices: pl.Tensor[[RANKS, 2, CAPACITY, 128], pl.INT32],
     c2a_compressed_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
     c1a_compressed_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
     token_to_req_indices: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT32],
-    c2a_compressed_lens: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
-    c1a_compressed_lens: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
     query_start_loc: pl.Tensor[[RANKS, 2, Q_START_DYN], pl.INT32],
     c2a_index_block_table: pl.Tensor[[RANKS, B_DYN, C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[RANKS, B_DYN, C1A_TABLE_DYN], pl.INT32],
@@ -824,11 +820,11 @@ def l3_prefill_fwd(
     C2A/C1A index_block_table arguments have independent widths and source-local
     physical page IDs. KV and index keys share their family's mapping. Pages
     contain 128 stored rows: 256 original tokens for C2A, 128 for C1A/SWA.
-    c2a_compressed_lens follows encoder rows; c1a_compressed_lens follows decoder
-    replay rows. Each is floor((position+1)/ratio), including completed current
-    groups. Token RoPE profiles are encoder base, encoder compressed, decoder compressed.
+    Visible lengths are derived once as floor((position+1)/ratio), including
+    completed current groups: C2A follows encoder rows and C1A decoder replay rows.
+    Token RoPE profiles are encoder base, encoder compressed, decoder compressed.
     compressed_cos/sin rotates completed C2A pairs at their group-first
-    position; publisher_cos/sin rotates C1A keys at their token position.
+    position; the C1A publisher uses encoder compressed token rows (profile 1).
     c2a_compressed_slots and c1a_compressed_slots both follow encoder rows;
     C1A publishes all encoder rows before decoder replay selection. Slots are
     source-local physical rows; -1 disables publication. C2A publishes only at
@@ -913,14 +909,11 @@ def l3_prefill_fwd(
             rope_sin[rank],
             compressed_cos[rank],
             compressed_sin[rank],
-            publisher_cos[rank],
-            publisher_sin[rank],
             window_slots[rank],
             window_indices[rank],
             c2a_compressed_slots[rank],
             c1a_compressed_slots[rank],
             token_to_req_indices[rank],
-            c2a_compressed_lens[rank], c1a_compressed_lens[rank],
             query_start_loc[rank],
             c2a_index_block_table[rank], c1a_index_block_table[rank],
             state_block_table[rank],
@@ -980,14 +973,11 @@ PREFILL_TENSORS = (
     "rope_sin",
     "compressed_cos",
     "compressed_sin",
-    "publisher_cos",
-    "publisher_sin",
     "window_slots",
     "window_indices",
     "c2a_compressed_slots",
     "c1a_compressed_slots",
     "token_to_req_indices",
-    "c2a_compressed_lens", "c1a_compressed_lens",
     "query_start_loc",
     "c2a_index_block_table", "c1a_index_block_table",
     "state_block_table",

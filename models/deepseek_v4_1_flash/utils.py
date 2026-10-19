@@ -854,12 +854,10 @@ def decode_forward_metadata(
         "moe_num_tokens": torch.tensor(count, dtype=torch.int32),
     }
     for family, source, table in zip(("c2a", "c1a"), sources, tables):
-        values[family + "_compressed_lens"] = metadata.compressed_lens[source]
         values[family + "_compressed_slots"] = metadata.compressed_slots[source]
         values[family + "_index_block_table"] = table
     for name in ("base_rope_cos", "base_rope_sin", "compressed_token_rope_cos",
                  "compressed_token_rope_sin", "c2a_rope_cos", "c2a_rope_sin",
-                 "c2a_compressed_lens", "c1a_compressed_lens",
                  "c2a_compressed_slots", "c1a_compressed_slots"):
         value = values[name]
         fill = 1 if name.endswith("cos") else -1 if name.endswith("slots") else 0
@@ -1389,15 +1387,11 @@ def prepare_prefill_inputs(
         "rope_sin": torch.stack((encoder_plain[1], encoder_compressed[1], decoder_compressed[1])),
         "compressed_cos": pair_cos,
         "compressed_sin": pair_sin,
-        "publisher_cos": encoder_compressed[0],
-        "publisher_sin": encoder_compressed[1],
         "window_slots": torch.stack((pad(encoder.window_slots, -1), pad(decoder.window_slots, -1))),
         "window_indices": torch.stack((pad(encoder.window_indices, -1), pad(decoder.window_indices, -1))),
         "c2a_compressed_slots": pad(encoder.compressed_slots[c2_source], -1),
         "c1a_compressed_slots": pad(encoder.compressed_slots[publisher_source], -1),
         "token_to_req_indices": torch.stack((pad(encoder.token_to_req_indices, -1), pad(decoder.token_to_req_indices, -1))),
-        "c2a_compressed_lens": pad(encoder.compressed_lens[c2_source]),
-        "c1a_compressed_lens": pad(decoder.compressed_lens),
         "query_start_loc": torch.stack((encoder.query_start_loc, decoder.query_start_loc.int())),
         "c2a_index_block_table": c2a_table,
         "c1a_index_block_table": table,
