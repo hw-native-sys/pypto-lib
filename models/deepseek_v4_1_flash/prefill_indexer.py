@@ -966,9 +966,9 @@ def prefill_c2a_project_index_q(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     mxfp8_gemm(
-        x, weight, scale, output, num_tokens,
+        x, weight, scale, output, num_tokens, None,
         width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
-        n_tile=128, name_hint='attention_mx_projection',
+        n_tile=128, name_hint='attention_mx_projection', workers=0,
     )
     return output
 
