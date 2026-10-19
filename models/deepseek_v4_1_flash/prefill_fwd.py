@@ -87,6 +87,7 @@ from hc import hc_mixes
 from hc import hc_post
 from hc import hc_pre, zero_bf16_padding
 from input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
+from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from lm_head import greedy_sample, lm_head
 from utils import (
     PrefillCheckpoint, ResidentPrefillWeights, prepare_prefill_inputs, prepare_resident_inputs,
@@ -440,10 +441,8 @@ def l2_prefill_fwd(
     counts: pl.Tensor[[2], pl.INT32],
     replay_rows: pl.Tensor[[CAPACITY], pl.INT32],
     position_ids: pl.Tensor[[2, CAPACITY], pl.INT32],
-    rope_cos: pl.Tensor[[3, CAPACITY, 32], pl.FP32],
-    rope_sin: pl.Tensor[[3, CAPACITY, 32], pl.FP32],
-    compressed_cos: pl.Tensor[[CAPACITY, 32], pl.FP32],
-    compressed_sin: pl.Tensor[[CAPACITY, 32], pl.FP32],
+    freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, 32], pl.FP32],
+    freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, 32], pl.FP32],
     window_slots: pl.Tensor[[2, CAPACITY], pl.INT64],
     window_indices: pl.Tensor[[2, CAPACITY, 128], pl.INT32],
     c2a_compressed_slots: pl.Tensor[[CAPACITY], pl.INT64],
@@ -498,6 +497,26 @@ def l2_prefill_fwd(
     scales8.bind_dynamic(0, S8)
     bf16.bind_dynamic(0, B16)
     dense.bind_dynamic(0, B32)
+    freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
+    freqs_sin.bind_dynamic(1, ROPE_ROWS_DYN)
+    rope_cos = pl.create_tensor([3, CAPACITY, 32], dtype=pl.FP32)
+    rope_sin = pl.create_tensor([3, CAPACITY, 32], dtype=pl.FP32)
+    compressed_cos = pl.create_tensor([CAPACITY, 32], dtype=pl.FP32)
+    compressed_sin = pl.create_tensor([CAPACITY, 32], dtype=pl.FP32)
+    encoder_count = pl.read(counts, [0])
+    decoder_count = pl.read(counts, [1])
+    materialize_rope_rows(
+        freqs_cos[0], freqs_sin[0], position_ids[0], encoder_count, rope_cos[0], rope_sin[0], False,
+    )
+    materialize_rope_rows(
+        freqs_cos[1], freqs_sin[1], position_ids[0], encoder_count, rope_cos[1], rope_sin[1], False,
+    )
+    materialize_rope_rows(
+        freqs_cos[1], freqs_sin[1], position_ids[1], decoder_count, rope_cos[2], rope_sin[2], False,
+    )
+    materialize_rope_rows(
+        freqs_cos[1], freqs_sin[1], position_ids[0], encoder_count, compressed_cos, compressed_sin, True,
+    )
     c2a_compressed_lens = pl.create_tensor([CAPACITY], dtype=pl.INT32)
     c1a_compressed_lens = pl.create_tensor([CAPACITY], dtype=pl.INT32)
     prepare_compressed_lens(position_ids[0], c2a_compressed_lens, 1)
@@ -780,10 +799,8 @@ def l3_prefill_fwd(
     counts: pl.Tensor[[RANKS, 2], pl.INT32],
     replay_rows: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
     position_ids: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT32],
-    rope_cos: pl.Tensor[[RANKS, 3, CAPACITY, 32], pl.FP32],
-    rope_sin: pl.Tensor[[RANKS, 3, CAPACITY, 32], pl.FP32],
-    compressed_cos: pl.Tensor[[RANKS, CAPACITY, 32], pl.FP32],
-    compressed_sin: pl.Tensor[[RANKS, CAPACITY, 32], pl.FP32],
+    freqs_cos: pl.Tensor[[RANKS, 2, ROPE_ROWS_DYN, 32], pl.FP32],
+    freqs_sin: pl.Tensor[[RANKS, 2, ROPE_ROWS_DYN, 32], pl.FP32],
     window_slots: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT64],
     window_indices: pl.Tensor[[RANKS, 2, CAPACITY, 128], pl.INT32],
     c2a_compressed_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
@@ -829,9 +846,11 @@ def l3_prefill_fwd(
     contain 128 stored rows: 256 original tokens for C2A, 128 for C1A/SWA.
     Visible lengths are derived once as floor((position+1)/ratio), including
     completed current groups: C2A follows encoder rows and C1A decoder replay rows.
-    Token RoPE profiles are encoder base, encoder compressed, decoder compressed.
-    compressed_cos/sin rotates completed C2A pairs at their group-first
-    position; the C1A publisher uses encoder compressed token rows (profile 1).
+    freqs_cos/sin are resident full FP32 half-width tables with profile order
+    base, compressed. Their row capacity is independent of current CAPACITY
+    and covers all active absolute positions. The graph gathers encoder base,
+    encoder compressed, decoder compressed and C2A group-first rows once.
+    C1A publication reuses encoder compressed rows before replay selection.
     c2a_compressed_slots and c1a_compressed_slots both follow encoder rows;
     C1A publishes all encoder rows before decoder replay selection. Slots are
     source-local physical rows; -1 disables publication. C2A publishes only at
@@ -853,6 +872,8 @@ def l3_prefill_fwd(
     assigning them to another request; failed calls require cache restoration
     or reset before retry. Engram, vision and DSpark have no inputs here.
     """
+    freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
+    freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
     compressed_cache.bind_dynamic(2, PAGES)
     state_cache.bind_dynamic(2, STATE_BLOCKS_DYN)
     state_block_table.bind_dynamic(1, B_DYN)
@@ -912,10 +933,7 @@ def l3_prefill_fwd(
             counts[rank],
             replay_rows[rank],
             position_ids[rank],
-            rope_cos[rank],
-            rope_sin[rank],
-            compressed_cos[rank],
-            compressed_sin[rank],
+            freqs_cos[rank], freqs_sin[rank],
             window_slots[rank],
             window_indices[rank],
             c2a_compressed_slots[rank],
@@ -976,10 +994,7 @@ PREFILL_TENSORS = (
     "counts",
     "replay_rows",
     "position_ids",
-    "rope_cos",
-    "rope_sin",
-    "compressed_cos",
-    "compressed_sin",
+    "freqs_cos", "freqs_sin",
     "window_slots",
     "window_indices",
     "c2a_compressed_slots",
@@ -1065,6 +1080,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         "index_cache", "index_scales", "state_cache",
     }
     constants.update(cache_names)
+    constants.update(("freqs_cos", "freqs_sin"))
     generated = [[] for _ in prompts]
     finished = [False] * RANKS
     print("CED_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
@@ -1073,10 +1089,13 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     with compiled.prepare(config, persistent=True, reset_persistent_windows=False) as runtime:
         per_rank = [{} for _ in device_ids]
         host_cache = []
+        rope_tables = None
         for rank, tensors in enumerate(per_rank):
             inputs = prepare_resident_inputs(
-                checkpoint, weights, sequences[rank][:chunk_size], CAPACITY, max_seq_len=max_seq_len,
+                checkpoint, weights, sequences[rank][:chunk_size], CAPACITY,
+                max_seq_len=max_seq_len, rope_tables=rope_tables,
             )
+            rope_tables = inputs["freqs_cos"], inputs["freqs_sin"]
             host_cache.append({name: inputs[name] for name in cache_names})
             inputs["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
             for name in PREFILL_TENSORS:
@@ -1112,7 +1131,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             for rank, (tensors, token_ids) in enumerate(zip(per_rank, rows)):
                 inputs = prepare_resident_inputs(
                     checkpoint, weights, token_ids, CAPACITY,
-                    start_pos=committed[rank], max_seq_len=max_seq_len, cache_state=host_cache[rank],
+                    start_pos=committed[rank], max_seq_len=max_seq_len,
+                    cache_state=host_cache[rank], rope_tables=rope_tables,
                 )
                 for name, value in inputs.items():
                     if name not in constants:

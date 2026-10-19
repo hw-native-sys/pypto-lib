@@ -1117,10 +1117,10 @@ def l2_prefill_c2a_full(
     rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
-    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, active, rope_cos, rope_sin)
+    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, active, rope_cos, rope_sin, False)
     materialize_rope_rows(
         compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, active,
-        compressed_rope_cos, compressed_rope_sin,
+        compressed_rope_cos, compressed_rope_sin, False,
     )
     prefill_c2a_full_sp(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,

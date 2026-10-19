@@ -24,7 +24,7 @@ import torch
 import config as C
 from config import BLOCK_SIZE, FLASH as M, TP_SIZE
 from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose
-from rope_tables import precompute_rope_tables
+from rope_tables import prepare_forward_rope_tables
 
 
 def parse_decode_startpos(value):
@@ -808,12 +808,14 @@ def decode_forward_metadata(
     cache_state: Mapping[str, torch.Tensor],
     window_block_table: torch.Tensor,
     max_seq_len: int | None = None,
+    rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Pack one TP1 rank's independent C2A/C1A metadata for ``l3_decode_fwd``.
 
     Keep the decode entry's named C2A/C1A arguments and independent table
-    widths. Base and compressed token RoPE use absolute token positions;
-    C2A publication RoPE uses the first position of a completed pair.
+    widths. Full RoPE tables have profile order base, compressed. Pass shared
+    rope_tables or the same max_seq_len on every rank, including idle ranks.
+    Reuse tables across calls; the graph gathers token and publication rows.
     Stack returned tensors over ranks, including zero-count idle ranks.
     TP1 uses the padded 80-row slab for metadata and x_hc/pre_mix, with at
     most 72 active rows. Padding is distinct from the per-rank active count.
@@ -843,6 +845,8 @@ def decode_forward_metadata(
     row_capacity = C.DECODE_INPUT_MAX_TOKENS
     if count > C.DECODE_MAX_TOKENS:
         raise ValueError("decode active rows exceed the per-rank bound")
+    if max_seq_len is None and rope_tables is None:
+        raise ValueError("provide shared rope_tables or the same max_seq_len on every rank")
     table_rows = int(metadata.position_ids.max()) + 1 if count else 1
     if max_seq_len is not None:
         if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, Integral):
@@ -850,21 +854,14 @@ def decode_forward_metadata(
         if not table_rows <= max_seq_len <= M.max_position_embeddings:
             raise ValueError("max_seq_len must cover the active absolute positions")
         table_rows = max_seq_len
-    base = precompute_rope_tables(table_rows, False)
-    compressed = precompute_rope_tables(table_rows, True)
-    token_rows = metadata.position_ids.long()
-    pair_rows = metadata.compressed_rope_position_ids[sources[0]].long()
+    freqs_cos, freqs_sin = prepare_forward_rope_tables(table_rows, rope_tables)
     values = {
-        "base_rope_cos": base[0][token_rows],
-        "base_rope_sin": base[1][token_rows],
-        "compressed_token_rope_cos": compressed[0][token_rows],
-        "compressed_token_rope_sin": compressed[1][token_rows],
+        "freqs_cos": freqs_cos,
+        "freqs_sin": freqs_sin,
         "window_slots": metadata.window_slots,
         "window_indices": metadata.window_indices,
         "token_to_req_indices": metadata.token_to_req_indices,
         "position_ids": metadata.position_ids,
-        "c2a_rope_cos": compressed[0][pair_rows.clamp_min(0)],
-        "c2a_rope_sin": compressed[1][pair_rows.clamp_min(0)],
         "query_start_loc": metadata.query_start_loc,
         "state_block_table": metadata.state_block_tables[sources[0]],
         "attention_num_tokens": torch.tensor(count, dtype=torch.int32),
@@ -873,12 +870,9 @@ def decode_forward_metadata(
     for family, source, table in zip(("c2a", "c1a"), sources, tables):
         values[family + "_compressed_slots"] = metadata.compressed_slots[source]
         values[family + "_index_block_table"] = table
-    for name in ("base_rope_cos", "base_rope_sin", "compressed_token_rope_cos",
-                 "compressed_token_rope_sin", "c2a_rope_cos", "c2a_rope_sin",
-                 "c2a_compressed_slots", "c1a_compressed_slots"):
+    for name in ("c2a_compressed_slots", "c1a_compressed_slots"):
         value = values[name]
-        fill = 1 if name.endswith("cos") else -1 if name.endswith("slots") else 0
-        padded = torch.full((row_capacity, *value.shape[1:]), fill, dtype=value.dtype)
+        padded = torch.full((row_capacity, *value.shape[1:]), -1, dtype=value.dtype)
         padded[:count] = value
         values[name] = padded
     for name in ("window_slots", "window_indices", "token_to_req_indices", "position_ids"):
@@ -1296,11 +1290,13 @@ def prepare_prefill_inputs(
     start_pos: int = 0,
     max_seq_len: int | None = None,
     cache_state: Mapping[str, torch.Tensor] | None = None,
+    rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Prepare one TP1 rank's next embedding chunk with Engram disabled.
 
     ``capacity`` bounds current rows, independently of ``max_seq_len``, which
-    sizes the retained history. Pass the previous call's cache tensors after
+    sizes the retained history. Reuse rope_tables across calls; their full
+    table capacity may exceed capacity. Pass the previous call's cache tensors after
     its completion and advance ``start_pos`` by its valid count. An empty
     sequence has zero work and preserves every cache byte. This convenience
     helper owns one request at physical slot zero per DP rank; serving may
@@ -1349,30 +1345,13 @@ def prepare_prefill_inputs(
     decoder_count = decoder.source_rows.numel()
     c2_source = next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == 2)
     publisher_source = M.num_hidden_layers // 2
-    rope_count = max_seq_len
-    plain_cos, plain_sin = precompute_rope_tables(rope_count, False)
-    compressed_cos, compressed_sin = precompute_rope_tables(rope_count, True)
+    freqs_cos, freqs_sin = prepare_forward_rope_tables(max_seq_len, rope_tables)
 
     def pad(value, fill=0):
         result = torch.full((capacity, *value.shape[1:]), fill, dtype=value.dtype)
         result[: value.shape[0]] = value
         return result
 
-    def rope_rows(cosine, sine, positions):
-        cos = torch.ones((capacity, M.qk_rope_head_dim // 2), dtype=torch.float32)
-        sin = torch.zeros_like(cos)
-        active = positions >= 0
-        rows = torch.arange(positions.numel())[active]
-        cos[rows] = cosine[positions[active].long()]
-        sin[rows] = sine[positions[active].long()]
-        return cos, sin
-
-    encoder_plain = rope_rows(plain_cos, plain_sin, encoder.position_ids)
-    encoder_compressed = rope_rows(compressed_cos, compressed_sin, encoder.position_ids)
-    decoder_compressed = rope_rows(compressed_cos, compressed_sin, decoder.position_ids)
-    pair_cos, pair_sin = rope_rows(
-        compressed_cos, compressed_sin, encoder.compressed_rope_position_ids[c2_source]
-    )
     initial_pre = torch.zeros((capacity, M.hc_mult), dtype=torch.float32)
     initial_pre[:, 0] = 1.0
     logit_rows = torch.full((16,), -1, dtype=torch.int32)
@@ -1400,10 +1379,8 @@ def prepare_prefill_inputs(
         "counts": torch.tensor([count, decoder_count], dtype=torch.int32),
         "replay_rows": pad(decoder.source_rows.int(), -1),
         "position_ids": torch.stack((pad(encoder.position_ids, -1), pad(decoder.position_ids, -1))),
-        "rope_cos": torch.stack((encoder_plain[0], encoder_compressed[0], decoder_compressed[0])),
-        "rope_sin": torch.stack((encoder_plain[1], encoder_compressed[1], decoder_compressed[1])),
-        "compressed_cos": pair_cos,
-        "compressed_sin": pair_sin,
+        "freqs_cos": freqs_cos,
+        "freqs_sin": freqs_sin,
         "window_slots": torch.stack((pad(encoder.window_slots, -1), pad(decoder.window_slots, -1))),
         "window_indices": torch.stack((pad(encoder.window_indices, -1), pad(decoder.window_indices, -1))),
         "c2a_compressed_slots": pad(encoder.compressed_slots[c2_source], -1),
@@ -1443,6 +1420,7 @@ def prepare_resident_inputs(
     start_pos: int = 0,
     max_seq_len: int | None = None,
     cache_state: Mapping[str, torch.Tensor] | None = None,
+    rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Prepare checkpoint embeddings, weights and causal replay for one prefill rank."""
     ids = torch.as_tensor(token_ids, device="cpu")
@@ -1459,7 +1437,8 @@ def prepare_resident_inputs(
     embedding = weights.lookup_rows(ids)
 
     values = prepare_prefill_inputs(
-        embedding, capacity, start_pos=start_pos, max_seq_len=max_seq_len, cache_state=cache_state,
+        embedding, capacity, start_pos=start_pos, max_seq_len=max_seq_len,
+        cache_state=cache_state, rope_tables=rope_tables,
     )
     if not hasattr(weights, "_output_weights"):
         head = checkpoint.tensor("head.weight")

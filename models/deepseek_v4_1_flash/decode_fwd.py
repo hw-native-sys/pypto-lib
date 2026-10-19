@@ -38,6 +38,7 @@ from config import (
     BLOCK_SIZE,
     COMPRESSED_CACHE_GROUP,
     DECODE_MAX_TOKENS,
+    DECODE_INPUT_MAX_TOKENS,
     INDEX_CACHE_GROUP,
     STATE_CAPACITY,
     WINDOW_CACHE_GROUP,
@@ -56,7 +57,7 @@ from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
 from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, final_output
-from rope_tables import precompute_rope_tables
+from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
 from utils import build_forward_metadata
 from expert_routed import (
     MX_PACKED_LANE_COLS,
@@ -141,10 +142,10 @@ def _decode_encoder(
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    base_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    base_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_token_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_token_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
+    freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
+    token_rope_cos: pl.Out[pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32]],
+    token_rope_sin: pl.Out[pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32]],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
@@ -162,8 +163,6 @@ def _decode_encoder(
         pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
     c2a_index_block_table: pl.Tensor[[B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
-    c2a_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    c2a_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
@@ -216,16 +215,15 @@ def _decode_encoder(
     shared_w1_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w2_scale: pl.Tensor[[N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-):
+) -> tuple[
+    pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
+    pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
+]:
     attention_count = pl.read(attention_num_tokens, [rank])
     x_hc.bind_dynamic(0, LOCAL_T_DYN)
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
-    base_rope_cos.bind_dynamic(0, T_DYN)
-    base_rope_sin.bind_dynamic(0, T_DYN)
-    compressed_token_rope_cos.bind_dynamic(0, T_DYN)
-    compressed_token_rope_sin.bind_dynamic(0, T_DYN)
-    c2a_rope_cos.bind_dynamic(0, T_DYN)
-    c2a_rope_sin.bind_dynamic(0, T_DYN)
     window_cache_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
@@ -237,7 +235,26 @@ def _decode_encoder(
     c2a_index_block_table.bind_dynamic(1, FWD_C2A_TABLE_DYN)
     state_cache_pool.bind_dynamic(0, FWD_STATE_BLOCKS_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
-    global_tokens = pl.tensor.dim(base_rope_cos, 0)
+    position_ids.bind_dynamic(0, T_DYN)
+    freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
+    freqs_sin.bind_dynamic(1, ROPE_ROWS_DYN)
+    global_tokens = pl.tensor.dim(position_ids, 0)
+    compressed_token_rope_cos = pl.slice(token_rope_cos, [global_tokens, ROPE_DIM // 2], [0, 0])
+    compressed_token_rope_sin = pl.slice(token_rope_sin, [global_tokens, ROPE_DIM // 2], [0, 0])
+    base_rope_cos = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
+    base_rope_sin = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
+    c2a_rope_cos = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
+    c2a_rope_sin = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
+    materialize_rope_rows(
+        freqs_cos[0], freqs_sin[0], position_ids, attention_count, base_rope_cos, base_rope_sin, False,
+    )
+    materialize_rope_rows(
+        freqs_cos[1], freqs_sin[1], position_ids, attention_count,
+        compressed_token_rope_cos, compressed_token_rope_sin, False,
+    )
+    materialize_rope_rows(
+        freqs_cos[1], freqs_sin[1], position_ids, attention_count, c2a_rope_cos, c2a_rope_sin, True,
+    )
     c2a_compressed_lens = pl.create_tensor([global_tokens], dtype=pl.INT32)
     prepare_compressed_lens(position_ids, c2a_compressed_lens, 1)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
@@ -394,7 +411,7 @@ def _decode_encoder(
             routed_output, combine_arrived,
             local_moe_tokens, rank, layer + 1,
         )
-    return x_hc
+    return x_hc, pre_mix, token_rope_cos, token_rope_sin
 
 
 def _decode_decoder(
@@ -413,10 +430,8 @@ def _decode_decoder(
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    base_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    base_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_token_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_token_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    token_rope_cos: pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
+    token_rope_sin: pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
@@ -434,8 +449,6 @@ def _decode_decoder(
         pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
     c1a_index_block_table: pl.Tensor[[B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
-    c2a_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    c2a_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
@@ -492,12 +505,6 @@ def _decode_decoder(
     attention_count = pl.read(attention_num_tokens, [rank])
     x_hc.bind_dynamic(0, LOCAL_T_DYN)
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
-    base_rope_cos.bind_dynamic(0, T_DYN)
-    base_rope_sin.bind_dynamic(0, T_DYN)
-    compressed_token_rope_cos.bind_dynamic(0, T_DYN)
-    compressed_token_rope_sin.bind_dynamic(0, T_DYN)
-    c2a_rope_cos.bind_dynamic(0, T_DYN)
-    c2a_rope_sin.bind_dynamic(0, T_DYN)
     window_cache_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
@@ -509,7 +516,10 @@ def _decode_decoder(
     c1a_index_block_table.bind_dynamic(1, FWD_C1A_TABLE_DYN)
     state_cache_pool.bind_dynamic(0, FWD_STATE_BLOCKS_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
-    global_tokens = pl.tensor.dim(base_rope_cos, 0)
+    position_ids.bind_dynamic(0, T_DYN)
+    global_tokens = pl.tensor.dim(position_ids, 0)
+    compressed_token_rope_cos = pl.slice(token_rope_cos, [global_tokens, ROPE_DIM // 2], [0, 0])
+    compressed_token_rope_sin = pl.slice(token_rope_sin, [global_tokens, ROPE_DIM // 2], [0, 0])
     c1a_compressed_lens = pl.create_tensor([global_tokens], dtype=pl.INT32)
     prepare_compressed_lens(position_ids, c1a_compressed_lens, 0)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
@@ -693,10 +703,8 @@ def _decode_fwd(
     wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    base_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    base_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_token_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_token_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
+    freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
@@ -715,8 +723,6 @@ def _decode_fwd(
     ],
     c2a_index_block_table: pl.Tensor[[B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
-    c2a_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    c2a_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
@@ -771,7 +777,9 @@ def _decode_fwd(
     shared_w2_scale: pl.Tensor[[N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
 ):
-    decode_encoder(
+    compressed_token_rope_cos = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
+    compressed_token_rope_sin = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
+    encoder_hidden, encoder_pre_mix, token_cos, token_sin = decode_encoder(
         x_hc,
         pre_mix,
         hc_attn_fn,
@@ -786,8 +794,7 @@ def _decode_fwd(
         attn_sink,
         wo_a, wo_a_scale,
         wo_b,
-        base_rope_cos,
-        base_rope_sin,
+        freqs_cos, freqs_sin,
         compressed_token_rope_cos,
         compressed_token_rope_sin,
         window_slots,
@@ -801,8 +808,6 @@ def _decode_fwd(
         index_cache_pool,
         index_cache_scale_pool,
         c2a_index_block_table,
-        c2a_rope_cos,
-        c2a_rope_sin,
         c2a_compressor_wkv,
         c2a_compressor_wgate,
         c1a_compressor_wkv,
@@ -852,9 +857,9 @@ def _decode_fwd(
         shared_w2_scale,
         shared_w3_scale,
     )
-    decode_decoder(
-        x_hc,
-        pre_mix,
+    result = decode_decoder(
+        encoder_hidden,
+        encoder_pre_mix,
         hc_attn_fn,
         hc_attn_scale,
         hc_attn_base,
@@ -867,10 +872,7 @@ def _decode_fwd(
         attn_sink,
         wo_a, wo_a_scale,
         wo_b,
-        base_rope_cos,
-        base_rope_sin,
-        compressed_token_rope_cos,
-        compressed_token_rope_sin,
+        token_cos, token_sin,
         window_slots,
         window_indices,
         window_cache_pool,
@@ -882,8 +884,6 @@ def _decode_fwd(
         index_cache_pool,
         index_cache_scale_pool,
         c1a_index_block_table,
-        c2a_rope_cos,
-        c2a_rope_sin,
         c2a_compressor_wkv,
         c2a_compressor_wgate,
         c1a_compressor_wkv,
@@ -933,7 +933,7 @@ def _decode_fwd(
         shared_w2_scale,
         shared_w3_scale,
     )
-    return x_hc
+    return result
 
 
 decode_encoder = pl.jit.inline(auto_scope=False)(_decode_encoder)
@@ -965,10 +965,8 @@ def l3_decode_fwd(
     wo_a_scale: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[EP_SIZE, N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
-    base_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    base_rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_token_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_token_rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
+    freqs_cos: pl.Tensor[[EP_SIZE, 2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
+    freqs_sin: pl.Tensor[[EP_SIZE, 2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
     window_indices: pl.Tensor[[EP_SIZE, T_DYN, BLOCK_SIZE], pl.INT32],
     window_cache_pool: pl.InOut[
@@ -995,8 +993,6 @@ def l3_decode_fwd(
     ],
     c2a_index_block_table: pl.Tensor[[EP_SIZE, B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[EP_SIZE, B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
-    c2a_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    c2a_rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
     c2a_compressor_wkv: pl.Tensor[[EP_SIZE, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c2a_compressor_wgate: pl.Tensor[[EP_SIZE, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c1a_compressor_wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.BF16],
@@ -1054,11 +1050,14 @@ def l3_decode_fwd(
     logits: pl.Out[pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
 ):
-    """Run SWA with base rows and C2A/C1A with compressed-profile token rows.
+    """Run SWA with base RoPE and C2A/C1A with compressed-profile RoPE.
 
-    All rows use absolute original-token positions. C2A publication rows use
-    p-1 for completed pairs and identity rotation otherwise. C1A publication
-    uses compressed_token_rope_cos/sin at p, including its index key.
+    freqs_cos/sin are resident full FP32 half-width tables with profile order
+    base, compressed. Their row capacity is independent of T and must cover
+    all active absolute positions. The encoder gathers token rows at p and
+    C2A publication rows at p-1 for completed pairs, identity otherwise, once.
+    C1A attention and publication reuse compressed token rows at p, including
+    index keys. Shared row buffers remain live through decoder completion.
 
     The c2a_* and c1a_* metadata address separate compression families. At
     position p, their visible lengths include the current publication and
@@ -1103,12 +1102,6 @@ def l3_decode_fwd(
     """
     x_hc.bind_dynamic(1, LOCAL_T_DYN)
     pre_mix.bind_dynamic(1, LOCAL_T_DYN)
-    base_rope_cos.bind_dynamic(1, T_DYN)
-    base_rope_sin.bind_dynamic(1, T_DYN)
-    compressed_token_rope_cos.bind_dynamic(1, T_DYN)
-    compressed_token_rope_sin.bind_dynamic(1, T_DYN)
-    c2a_rope_cos.bind_dynamic(1, T_DYN)
-    c2a_rope_sin.bind_dynamic(1, T_DYN)
     window_cache_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(1, FWD_CMP_BLOCKS_DYN)
@@ -1122,6 +1115,12 @@ def l3_decode_fwd(
     c2a_index_block_table.bind_dynamic(2, FWD_C2A_TABLE_DYN)
     c1a_index_block_table.bind_dynamic(1, B_DYN)
     c1a_index_block_table.bind_dynamic(2, FWD_C1A_TABLE_DYN)
+    position_ids.bind_dynamic(1, T_DYN)
+    freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
+    freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
+    # Shared token rows use the decode metadata capacity and remain live across both stages.
+    token_cos_buffer = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
+    token_sin_buffer = pld.alloc_window_buffer([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
@@ -1140,6 +1139,8 @@ def l3_decode_fwd(
     head_logits_buffer = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
     head_logits_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
+        token_cos = pld.window(token_cos_buffer, [DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
+        token_sin = pld.window(token_sin_buffer, [DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
         recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
         recv_scale = pld.window(
@@ -1176,10 +1177,8 @@ def l3_decode_fwd(
             attn_sink[rank],
             wo_a[rank], wo_a_scale[rank],
             wo_b[rank],
-            base_rope_cos[rank],
-            base_rope_sin[rank],
-            compressed_token_rope_cos[rank],
-            compressed_token_rope_sin[rank],
+            freqs_cos[rank], freqs_sin[rank],
+            token_cos, token_sin,
             window_slots[rank],
             window_indices[rank],
             window_cache_pool[rank],
@@ -1191,8 +1190,6 @@ def l3_decode_fwd(
             index_cache_pool[rank],
             index_cache_scale_pool[rank],
             c2a_index_block_table[rank],
-            c2a_rope_cos[rank],
-            c2a_rope_sin[rank],
             c2a_compressor_wkv[rank],
             c2a_compressor_wgate[rank],
             c1a_compressor_wkv[rank],
@@ -1243,6 +1240,8 @@ def l3_decode_fwd(
             shared_w3_scale[rank],
             device=rank,
         )
+        decoder_cos = pld.window(token_cos_buffer, [DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
+        decoder_sin = pld.window(token_sin_buffer, [DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
         l2_decode_decoder(
             x_hc[rank],
             pre_mix[rank],
@@ -1258,10 +1257,7 @@ def l3_decode_fwd(
             attn_sink[rank],
             wo_a[rank], wo_a_scale[rank],
             wo_b[rank],
-            base_rope_cos[rank],
-            base_rope_sin[rank],
-            compressed_token_rope_cos[rank],
-            compressed_token_rope_sin[rank],
+            decoder_cos, decoder_sin,
             window_slots[rank],
             window_indices[rank],
             window_cache_pool[rank],
@@ -1273,8 +1269,6 @@ def l3_decode_fwd(
             index_cache_pool[rank],
             index_cache_scale_pool[rank],
             c1a_index_block_table[rank],
-            c2a_rope_cos[rank],
-            c2a_rope_sin[rank],
             c2a_compressor_wkv[rank],
             c2a_compressor_wgate[rank],
             c1a_compressor_wkv[rank],
@@ -1358,6 +1352,7 @@ def _fixture_extent(dim):
         return dim
     name = repr(dim)
     extents = {
+        "ROPE_ROWS_DYN": FIXTURE_SEQUENCE,
         "LOCAL_T_DYN": MOE_TOKENS,
         "Q_START_DYN": FIXTURE_BATCH + 1,
         "T_DYN": FIXTURE_TOKENS,
@@ -1389,16 +1384,8 @@ def build_tensor_specs():
     request_ids = torch.arange(FIXTURE_BATCH, dtype=torch.int32).repeat_interleave(FIXTURE_SEQUENCE)
     position_ids = torch.arange(FIXTURE_SEQUENCE, dtype=torch.int32).repeat(FIXTURE_BATCH)
     query_starts = torch.arange(0, FIXTURE_TOKENS + 1, FIXTURE_SEQUENCE, dtype=torch.int32)
-    base_cos, base_sin = precompute_rope_tables(FIXTURE_SEQUENCE, compressed_attention=False)
-    token_cos, token_sin = precompute_rope_tables(FIXTURE_SEQUENCE, compressed_attention=True)
-    complete = (position_ids + 1).remainder(2) == 0
-    pair_start = (position_ids - 1).clamp_min(0)
-    rope_rows = {
-        "base_rope_cos": base_cos[position_ids], "base_rope_sin": base_sin[position_ids],
-        "compressed_token_rope_cos": token_cos[position_ids], "compressed_token_rope_sin": token_sin[position_ids],
-        "c2a_rope_cos": token_cos[pair_start].masked_fill(~complete[:, None], 1.0),
-        "c2a_rope_sin": token_sin[pair_start].masked_fill(~complete[:, None], 0.0),
-    }
+    freqs_cos, freqs_sin = prepare_forward_rope_tables(FIXTURE_SEQUENCE)
+    rope_tables = {"freqs_cos": freqs_cos, "freqs_sin": freqs_sin}
     window_table = torch.arange(FIXTURE_BATCH, dtype=torch.int32).reshape(FIXTURE_BATCH, 1)
     c2a_table = window_table.flip(0)
     c1a_table = torch.cat((window_table, torch.full_like(window_table, -1)), dim=1)
@@ -1422,8 +1409,8 @@ def build_tensor_specs():
             init_value = request_ids.repeat(EP_SIZE, 1)
         elif name == "position_ids":
             init_value = position_ids.repeat(EP_SIZE, 1)
-        elif name in rope_rows:
-            init_value = rope_rows[name].unsqueeze(0).repeat(EP_SIZE, 1, 1)
+        elif name in rope_tables:
+            init_value = rope_tables[name].unsqueeze(0).repeat(EP_SIZE, 1, 1, 1)
         elif name in metadata_rows:
             row = metadata_rows[name]
             init_value = row.unsqueeze(0).repeat(EP_SIZE, *([1] * row.ndim))

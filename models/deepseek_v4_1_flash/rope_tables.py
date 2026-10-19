@@ -16,7 +16,6 @@ import pypto.language as pl
 from config import FLASH as M, DeepSeekV41Config, T_DYN
 
 
-
 # model config
 ROPE_DIM = M.qk_rope_head_dim
 
@@ -48,6 +47,30 @@ def precompute_rope_tables(
     return angles.cos(), angles.sin()
 
 
+def prepare_forward_rope_tables(
+    sequence_length: int,
+    tables: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare or reuse full FP32 tables with profile order base, compressed."""
+    if not 1 <= sequence_length <= M.max_position_embeddings:
+        raise ValueError("RoPE capacity must fit the model position range")
+    if tables is None:
+        base_cos, base_sin = precompute_rope_tables(sequence_length, False)
+        compressed_cos, compressed_sin = precompute_rope_tables(sequence_length, True)
+        return torch.stack((base_cos, compressed_cos)), torch.stack((base_sin, compressed_sin))
+    freqs_cos, freqs_sin = tables
+    for value in (freqs_cos, freqs_sin):
+        if value.device.type != "cpu" or value.dtype != torch.float32 or not value.is_contiguous():
+            raise ValueError("full RoPE tables must be contiguous CPU FP32 tensors")
+        if value.ndim != 3 or value.shape[0] != 2 or value.shape[2] != ROPE_DIM // 2:
+            raise ValueError("full RoPE tables must have shape [2, rows, rope_dim // 2]")
+        if not sequence_length <= value.shape[1] <= M.max_position_embeddings:
+            raise ValueError("full RoPE tables must cover the retained history capacity")
+    if freqs_cos.shape != freqs_sin.shape:
+        raise ValueError("full RoPE cosine and sine tables must have the same shape")
+    return freqs_cos, freqs_sin
+
+
 ROPE_ROWS_DYN = pl.dynamic("V41_ROPE_ROWS_DYN")
 
 
@@ -57,14 +80,16 @@ def materialize_rope_rows(
     freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    rope_cos: pl.Out[pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32]],
-    rope_sin: pl.Out[pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32]],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    pair_start: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
     """Gather active token rows from serving-owned full tables inside the graph.
 
     Tables are read-only FP32 half-width arrays for one RoPE profile. The caller
     provides 0 <= num_tokens <= T and positions below table capacity. Negative
     positions produce identity rotation for unpublished compressed tokens.
+    pair_start selects p-1 for completed C2A pairs and identity otherwise.
     Padding rows are untouched. Return the producer TaskId for consumers that
     use explicit dependencies, as the attention entries do with cache_ready.
     """
@@ -73,14 +98,15 @@ def materialize_rope_rows(
         worker = pl.tile.get_block_idx()
         for token in pl.range(worker, num_tokens, 32):
             position = pl.cast(pl.read(position_ids, [token]), pl.INDEX)
+            if pair_start:
+                if position >= 0 and (position + 1) % 2 == 0:
+                    position = position - 1
+                else:
+                    position = -1
             if position >= 0:
                 rope_cos[token : token + 1, :] = freqs_cos[position : position + 1, :]
                 rope_sin[token : token + 1, :] = freqs_sin[position : position + 1, :]
             else:
-                rope_cos[token : token + 1, :] = pl.full(
-                    [1, ROPE_DIM // 2], dtype=pl.FP32, value=1.0
-                )
-                rope_sin[token : token + 1, :] = pl.full(
-                    [1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0
-                )
+                rope_cos[token : token + 1, :] = pl.full([1, ROPE_DIM // 2], dtype=pl.FP32, value=1.0)
+                rope_sin[token : token + 1, :] = pl.full([1, ROPE_DIM // 2], dtype=pl.FP32, value=0.0)
     return rope_ready
