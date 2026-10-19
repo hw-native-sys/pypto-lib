@@ -288,7 +288,13 @@ def _nearest_fp4_indices(values: torch.Tensor, *, round_to_even: bool = False) -
         selected = (magnitude - table[order]).abs().argmin(dim=-1)
         index = order[selected].to(torch.uint8)
     else:
-        index = (magnitude - table).abs().argmin(dim=-1).to(torch.uint8)
+        boundaries = (table[:-1] + table[1:]) * 0.5
+        absolute = magnitude.squeeze(-1)
+        if torch.any(absolute > table[-1]):
+            index = (magnitude - table).abs().argmin(dim=-1).to(torch.uint8)
+        else:
+            index = torch.bucketize(absolute, boundaries, out_int32=True).to(torch.uint8)
+            index.masked_fill_(~torch.isfinite(absolute), 0)
     return index | (torch.signbit(values).to(torch.uint8) << 3)
 
 

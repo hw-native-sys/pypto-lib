@@ -688,6 +688,8 @@ def golden_expert_routed(tensors):
 
 def gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base=0):
     """Generate checkpoint-style packed MXFP4 routed weights and scales."""
+    from concurrent.futures import ThreadPoolExecutor
+
     import torch
 
     from quant import (
@@ -696,10 +698,14 @@ def gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base=0):
         quantize_mxfp4_weight,
     )
 
-    w1_list, w1s_list = [], []
-    w3_list, w3s_list = [], []
-    w2_list, w2s_list = [], []
-    for e in range(n_experts):
+    w1_weights = torch.empty((n_experts, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS), dtype=torch.uint8)
+    w3_weights = torch.empty_like(w1_weights)
+    w2_weights = torch.empty((n_experts, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS), dtype=torch.uint8)
+    w1_scales = torch.empty((n_experts, D // MX_GROUP, MOE_INTER), dtype=torch.uint8)
+    w3_scales = torch.empty_like(w1_scales)
+    w2_scales = torch.empty((n_experts, MOE_INTER // MX_GROUP, D), dtype=torch.uint8)
+
+    def generate_expert(e):
         seed = seed_base + e * 3
         generator = torch.Generator().manual_seed(seed)
         w1, w1s = quantize_mxfp4_weight(
@@ -711,38 +717,28 @@ def gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base=0):
         w2, w2s = quantize_mxfp4_weight(
             torch.randn(D, MOE_INTER, generator=generator) * dequant_std["w2"]
         )
-        w1_list.append(
-            pack_mxfp4_weight_tiles(w1, MX_K_TILE, MX_MM_INTER_TILE).reshape(
-                MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS
-            )
-        )
-        w3_list.append(
-            pack_mxfp4_weight_tiles(w3, MX_K_TILE, MX_MM_INTER_TILE).reshape(
-                MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS
-            )
-        )
-        w2_list.append(
-            pack_mxfp4_weight_tiles(w2, MX_K_TILE, MX_W2_D_OUT_TILE).reshape(
-                MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS
-            )
-        )
-        w1s_list.append(w1s.transpose(0, 1).contiguous().view(torch.uint8))
-        w3s_list.append(w3s.transpose(0, 1).contiguous().view(torch.uint8))
-        w2s_list.append(w2s.transpose(0, 1).contiguous().view(torch.uint8))
+        w1_tiles = pack_mxfp4_weight_tiles(w1, MX_K_TILE, MX_MM_INTER_TILE)
+        w1_weights[e] = w1_tiles.reshape(MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS)
+        w3_tiles = pack_mxfp4_weight_tiles(w3, MX_K_TILE, MX_MM_INTER_TILE)
+        w3_weights[e] = w3_tiles.reshape(MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS)
+        w2_tiles = pack_mxfp4_weight_tiles(w2, MX_K_TILE, MX_W2_D_OUT_TILE)
+        w2_weights[e] = w2_tiles.reshape(MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS)
+        w1_scales[e] = w1s.transpose(0, 1).contiguous().view(torch.uint8)
+        w3_scales[e] = w3s.transpose(0, 1).contiguous().view(torch.uint8)
+        w2_scales[e] = w2s.transpose(0, 1).contiguous().view(torch.uint8)
+
+    with ThreadPoolExecutor(max_workers=min(4, n_experts)) as pool:
+        list(pool.map(generate_expert, range(n_experts)))
 
     def pack_expert_scales(scales):
-        logical = torch.stack(scales).flatten(0, 1)
-        packed = pack_mx_b_scale(logical)
+        packed = pack_mx_b_scale(scales.flatten(0, 1))
         e8m0 = getattr(torch, "float8_e8m0fnu", None)
         return packed.view(e8m0) if e8m0 is not None else packed
 
     return (
-        torch.stack(w1_list),
-        pack_expert_scales(w1s_list),
-        torch.stack(w3_list),
-        pack_expert_scales(w3s_list),
-        torch.stack(w2_list),
-        pack_expert_scales(w2s_list),
+        w1_weights, pack_expert_scales(w1_scales),
+        w3_weights, pack_expert_scales(w3_scales),
+        w2_weights, pack_expert_scales(w2_scales),
     )
 
 

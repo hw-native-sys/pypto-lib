@@ -1333,8 +1333,11 @@ if __name__ == "__main__":
             cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
             compiled = DistributedCompiledProgram.from_dir(result.work_dir, platform=cfg.platform)
             host_inputs = {}
-            with compiled.prepare(cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=list(host_inputs.values())) as runtime:
-                arguments = upload_forward_inputs(runtime, specs, compiled._get_metadata()[0], len(devices), host_inputs)
+            upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
+            inherited = [*host_inputs.values(), upload_buffer]
+            with compiled.prepare(cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=inherited) as runtime:
+                parameters = compiled._get_metadata()[0]
+                arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
                 runtime(*arguments, config=cfg)
             print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)
         if not result.passed:

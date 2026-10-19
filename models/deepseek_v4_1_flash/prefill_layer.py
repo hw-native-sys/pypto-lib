@@ -393,8 +393,7 @@ MOE_RANK_NAMES = (
 MOE_REPLICATED_NAMES = MOE_GATE_NAMES + MOE_SHARED_NAMES
 
 
-# Drawing the routed shards costs minutes, and the spec shapes need the same draw the
-# stacked fixtures use; cache each rank's fixture so it is built once.
+# Cached replicated and rank-local fixtures.
 @functools.lru_cache(maxsize=None)
 def make_ffn_hc_inputs(seed):
     """FFN-sublayer mHC coefficients and the RMSNorm weight the MoE gate applies."""
@@ -1105,7 +1104,18 @@ def build_specs(args, mode, initial_state):
     shapes.update(make_hc_inputs(args.tokens, args.seed, args.case))
     shapes.update(make_ffn_hc_inputs(args.seed + 3001))
     shapes.update(make_moe_replicated_inputs(args.seed + 5003))
-    shapes.update(make_moe_rank_inputs(0))
+    weight_shapes = {
+        "routed_w1": (N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS),
+        "routed_w3": (N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS),
+        "routed_w2": (N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS),
+        "routed_w1_scale": (N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER),
+        "routed_w3_scale": (N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER),
+        "routed_w2_scale": (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D),
+    }
+    for name, shape in weight_shapes.items():
+        dtype = torch.float8_e8m0fnu if name.endswith("_scale") else torch.uint8
+        shapes[name] = torch.empty(shape, dtype=dtype, device="meta")
+    shapes["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
     shapes["token_owners"] = make_token_owners(args.tokens, 0)
     # The spec order is the device entry's parameter order.
     input_names = (

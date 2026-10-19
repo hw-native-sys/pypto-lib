@@ -1457,12 +1457,12 @@ def prepare_resident_inputs(
     return values
 
 
-def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs):
-    """Allocate rank-local inputs and upload storage in bounded chunks."""
+def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload_buffer):
+    """Upload rank-local storage through a shared buffer registered before runtime preparation."""
     from pypto.ir import ParamDirection
     from pypto.runtime import StackedDeviceTensor
 
-    chunk_bytes = 64 * 1024**2
+    chunk_bytes = upload_buffer.numel()
     arguments = []
     for spec, parameter in zip(specs, parameters, strict=True):
         if isinstance(spec, ScalarSpec):
@@ -1480,24 +1480,24 @@ def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs):
             shards.append(handle)
             if parameter.direction == ParamDirection.Out:
                 continue
-            if isinstance(spec.init_value, torch.Tensor):
+            tensor_value = isinstance(spec.init_value, torch.Tensor)
+            if tensor_value:
                 if list(spec.init_value.shape) != spec.shape:
                     raise ValueError(f"{spec.name} initialization must match its tensor spec")
-                value = spec.init_value[rank].contiguous()
+                value = spec.init_value[rank].contiguous().view(torch.uint8).reshape(-1)
             else:
                 fill = 0 if spec.init_value is None else spec.init_value
-                element_bytes = torch.empty((), dtype=spec.dtype).element_size()
-                elements = min(math.prod(shape), chunk_bytes // element_bytes)
+                active_buffer = upload_buffer[:min(chunk_bytes, handle.nbytes)]
                 if spec.dtype == torch.float8_e8m0fnu:
                     code = torch.tensor(float(fill)).to(spec.dtype).view(torch.uint8).item()
-                    value = torch.full((elements,), code, dtype=torch.uint8).view(spec.dtype)
+                    active_buffer.fill_(code)
                 else:
-                    value = torch.full((elements,), fill, dtype=spec.dtype)
+                    active_buffer.view(spec.dtype).fill_(fill)
             for offset in range(0, handle.nbytes, chunk_bytes):
                 size = min(chunk_bytes, handle.nbytes - offset)
-                source_offset = offset if isinstance(spec.init_value, torch.Tensor) else 0
-                source = value.data_ptr() + source_offset
-                runtime.copy_to(handle.data_ptr, source, size, dst_offset=offset, worker_id=rank)
+                if tensor_value:
+                    upload_buffer[:size].copy_(value[offset:offset + size])
+                runtime.copy_to(handle.data_ptr, upload_buffer.data_ptr(), size, dst_offset=offset, worker_id=rank)
         arguments.append(StackedDeviceTensor(shards, tuple(spec.shape), tuple(range(ranks))))
     return arguments
 
