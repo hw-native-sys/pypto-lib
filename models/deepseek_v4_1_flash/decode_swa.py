@@ -56,6 +56,9 @@ HC_DIM = M.hc_dim
 MIX_HC = M.mix_hc
 MX_GROUP = M.weight_block_size[0]
 
+# Tiling.
+Q_ROPE_WORKER_TILE = 64 if TP_SIZE == 1 else 2147483647
+
 
 
 @pl.jit.inline(auto_scope=False)
@@ -108,7 +111,7 @@ def decode_swa(
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens, max_workers=2147483647)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens, max_workers=Q_ROPE_WORKER_TILE)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)

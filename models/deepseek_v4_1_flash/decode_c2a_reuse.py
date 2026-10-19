@@ -27,7 +27,7 @@ from rmsnorm import rms_norm_tiled
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH,
-    gather_packed_chunk, attend_c2a_chunk, publish_window_row,
+    gather_packed_chunk, attend_c2a_chunk, publish_window_row, attend_packed_cohorts,
 )
 from o_proj import o_proj
 from golden import TensorSpec, ScalarSpec, ratio_allclose, run
@@ -100,25 +100,34 @@ def decode_c2a_reuse(
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
+    q_proj_rope(
+        qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens,
+        max_workers=64 if TP_SIZE == 1 else 2147483647,
+    )
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
     publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
 
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
-    combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
     chunk_done = cache_ready
-    for start in pl.range(0, num_tokens, QUERY_TILE):
-        active = pl.min(QUERY_TILE, num_tokens - start)
-        gather_tid = gather_packed_chunk(
-            window_cache, window_cache_scale, window_indices, compressed_cache,
-            compressed_cache_scale, compressed_indices, selected, combined, start, active,
-            chunk_done,
+    if TP_SIZE == 1 and num_tokens <= 12:
+        chunk_done = attend_packed_cohorts(
+            query, window_indices, window_cache, window_cache_scale, compressed_indices,
+            compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
         )
-        chunk_done = attend_c2a_chunk(
-            query, selected, combined, attn_sink, attended, start, active, gather_tid
-        )
+    else:
+        selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
+        combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
+        for start in pl.range(0, num_tokens, QUERY_TILE):
+            active = pl.min(QUERY_TILE, num_tokens - start)
+            gather_tid = gather_packed_chunk(
+                window_cache, window_cache_scale, window_indices, compressed_cache,
+                compressed_cache_scale, compressed_indices, selected, combined, start, active,
+                chunk_done,
+            )
+            chunk_done = attend_c2a_chunk(
+                query, selected, combined, attn_sink, attended, start, active, gather_tid
+            )
 
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
     o_proj(
