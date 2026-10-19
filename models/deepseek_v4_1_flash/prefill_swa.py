@@ -131,7 +131,7 @@ def prefill_swa_attention(
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
         q_proj_qr(chunk_x, wq_a, wq_a_scale, q_norm_weight, qr, active)
-        q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active)
+        q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active, max_workers=2147483647)
         index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
         attend_shared_cache(
             q, decoded_cache, zero_row,

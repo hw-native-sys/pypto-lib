@@ -162,6 +162,7 @@ def q_proj_rope(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
+    max_workers: pl.constexpr = 2147483647,
 ):
     tokens = pl.tensor.dim(query_latent, 0)
     expanded = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
@@ -169,7 +170,7 @@ def q_proj_rope(
         query_latent, wq_b, wq_b_scale, expanded, num_tokens,
         Q_LORA, LOCAL_H * HEAD_DIM, "attention_q_b", "attention_q_b_quant", N_TILE, K_TILE,
     )
-    rope(expanded, rope_cos, rope_sin, query, num_tokens, LOCAL_H, "attention_q_rope", 2147483647)
+    rope(expanded, rope_cos, rope_sin, query, num_tokens, LOCAL_H, "attention_q_rope", max_workers)
     return query
 
 
