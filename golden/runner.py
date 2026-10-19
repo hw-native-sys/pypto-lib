@@ -153,7 +153,7 @@ class _Stage:
         return False
 
 
-def _normalize_config(config: Any | None) -> Any:
+def normalize_config(config: Any | None) -> Any:
     """Build the one ``RunConfig`` that drives both phases.
 
     PyPTO reads the compile half off it via ``compile_kwargs()`` and the
@@ -1519,7 +1519,7 @@ def _run_pipeline(
 
     compile_state: Any = None
     try:
-        cfg = _normalize_config(config)
+        cfg = normalize_config(config)
         _validate_unique_spec_names(specs)
         _validate_stepped_swimlane(scalar_specs, cfg)
         if data_dir is not None and not data_dir.is_dir():

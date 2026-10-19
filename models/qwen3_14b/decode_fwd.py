@@ -33,7 +33,6 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 from pypto.backend import BackendType, set_backend_type
-from pypto.runtime import ExecutionMode, RunConfig
 
 from config import (
     QWEN3_14B_DIMS as D,
@@ -1836,6 +1835,8 @@ if __name__ == "__main__":
     # the repo root, so this insert is the standalone-run fallback.
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+    from golden import normalize_config
+
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
@@ -1983,10 +1984,10 @@ if __name__ == "__main__":
     if args.smoke or args.execution_mode:
         compiled = decode_fwd.compile(
             *_decode_smoke_inputs(),
-            config=RunConfig(
-                backend_type=BackendType.Ascend950 if args.backend_type.startswith("a5") else BackendType.Ascend910B,
-                execution_mode=ExecutionMode.SIM if args.execution_mode else ExecutionMode.ONBOARD,
-            ),
+            config=normalize_config(dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+            )),
         )
         print(f"Compiled dynamic B{BATCH_PAD + 1} decode smoke: {compiled.output_dir}")
         raise SystemExit(0)
@@ -2058,16 +2059,16 @@ if __name__ == "__main__":
     # dfx_outputs/deps.json. The per-run SHM record buffer can overflow ("records
     # dropped") on the full 40-layer --max-seq graph, so capture with a small
     # --fwd-layers.
-    run_cfg = RunConfig(
-        backend_type=BackendType.Ascend950 if args.backend_type.startswith("a5") else BackendType.Ascend910B,
-        execution_mode=ExecutionMode.SIM if args.execution_mode else ExecutionMode.ONBOARD,
+    run_cfg = normalize_config(dict(
+        backend_type=args.backend_type,
+        execution_mode=args.execution_mode,
         device_id=args.device,
         enable_chip_swimlane=args.enable_chip_swimlane,
         enable_dep_gen=args.enable_dep_gen,
         save_kernels=args.dep_output_dir is not None,
         save_kernels_dir=(str(args.dep_output_dir.resolve()) if args.dep_output_dir is not None else None),
         dump_passes=False,
-    )
+    ))
 
     # Full fused decode_fwd validation: N stacked layers + on-device LM head -> logits,
     # vs host (chain N hidden -> final RMSNorm + lm_head matmul). Builds N-layer stacks by

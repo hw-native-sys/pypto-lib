@@ -67,7 +67,7 @@ host's allocator rather than probing for an idle card and racing another user.
 | `-p a5` | `Ascend950` | Ascend 950 NPU | usually one integer ID |
 
 The mapping is enforced by
-[`golden.runner._normalize_config`](../../golden/runner.py) — an unknown
+[`golden.runner.normalize_config`](../../golden/runner.py) — an unknown
 platform fails instead of silently choosing a default. The host's own CPU
 architecture (`uname -m`) only picks the PTOAS release asset at install time; it
 does not decide whether a run uses a simulator or a real NPU.

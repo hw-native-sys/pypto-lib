@@ -54,7 +54,6 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 from pypto.backend import BackendType, set_backend_type
-from pypto.runtime import ExecutionMode, RunConfig
 
 from config import QWEN3_14B_DIMS as D, QWEN3_14B_TILING as T, QWEN3_14B as M
 
@@ -370,6 +369,8 @@ def _backend_type(platform: str) -> BackendType:
 
 
 if __name__ == "__main__":
+    from golden import normalize_config
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
@@ -402,10 +403,10 @@ if __name__ == "__main__":
     # DEFAULT backend and collide with the set_backend_type above.
     compiled = rope_qkv_regen.compile(
         *_dummy_inputs(args.batch),
-        config=RunConfig(
-            backend_type=BackendType.Ascend950 if args.backend_type.startswith("a5") else BackendType.Ascend910B,
-            execution_mode=ExecutionMode.SIM if args.execution_mode else ExecutionMode.ONBOARD,
-        ),
+        config=normalize_config(dict(
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
+        )),
     )
     post_pass = compiled.program
     print(f"Compiled program has {len(post_pass.functions)} function(s):")

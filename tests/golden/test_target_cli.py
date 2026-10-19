@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from golden.runner import _normalize_config
+from golden import normalize_config
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,5 +53,5 @@ def test_entry_target_cli(path, tree, platform):
     for backend in next(keyword.value for keyword in platform.keywords if keyword.arg == "choices").elts:
         for sim in (False, True):
             args = parser.parse_args(["-p", backend.value] + (["--sim"] if sim else []))
-            cfg = _normalize_config(dict(backend_type=args.backend_type, execution_mode=args.execution_mode))
+            cfg = normalize_config(dict(backend_type=args.backend_type, execution_mode=args.execution_mode))
             assert cfg.platform == backend.value + ("sim" if sim else "")

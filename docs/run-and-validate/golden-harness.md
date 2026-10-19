@@ -250,6 +250,18 @@ parser.add_argument("--sim", dest="execution_mode", action="store_true")
 Then pass `backend_type=args.backend_type` and
 `execution_mode=args.execution_mode` in the run configuration.
 
+Drivers that call PyPTO compilation or execution APIs directly can import
+`normalize_config` from `golden` to build a `RunConfig` with the same conversion:
+
+```python
+config = normalize_config(dict(
+    backend_type=args.backend_type,
+    execution_mode=args.execution_mode,
+    device_id=args.device,
+))
+compiled = kernel.compile(*inputs, config=config)
+```
+
 Existing `platform` configurations and `-p` command-line arguments remain
 supported. PyPTO retains the derived platform string in cache keys and artifact
 metadata, so equivalent old and new configurations select the same target.

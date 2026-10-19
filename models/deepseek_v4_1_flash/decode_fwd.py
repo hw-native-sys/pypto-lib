@@ -1424,10 +1424,8 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     from utils import upload_forward_inputs
-    from golden import run
+    from golden import normalize_config, run
     from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-    from pypto.backend import BackendType
-    from pypto.runtime import ExecutionMode, RunConfig
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -1453,8 +1451,8 @@ if __name__ == "__main__":
         parser.error(f"need exactly {EP_SIZE} distinct devices, got {devices}")
     specs = build_tensor_specs()
     config = dict(
-        backend_type=BackendType.Ascend950,
-        execution_mode=ExecutionMode.SIM if args.execution_mode else ExecutionMode.ONBOARD,
+        backend_type=args.backend_type,
+        execution_mode=args.execution_mode,
         dump_passes=args.dump_passes,
         enable_scope_stats=args.enable_scope_stats,
         log_level=args.log_level,
@@ -1472,7 +1470,7 @@ if __name__ == "__main__":
         compile_only=True,
     )
     if result.passed and not args.compile_only:
-        cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
+        cfg = normalize_config(config)
         compiled = DistributedCompiledProgram.from_dir(
             result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
             distributed_config=cfg.distributed_config,

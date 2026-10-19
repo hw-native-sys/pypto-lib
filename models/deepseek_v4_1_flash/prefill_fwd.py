@@ -1296,9 +1296,8 @@ if __name__ == "__main__":
         print("CED_GENERATION_COMPLETE", json.dumps(report, ensure_ascii=False), flush=True)
     else:
         from utils import upload_forward_inputs
-        from golden import run
+        from golden import normalize_config, run
         from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-        from pypto.runtime import RunConfig
 
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
@@ -1323,8 +1322,8 @@ if __name__ == "__main__":
             parser.error(f"need exactly {RANKS} distinct devices, got {devices}")
         specs = build_tensor_specs()
         config = dict(
-            backend_type=BackendType.Ascend950,
-            execution_mode=ExecutionMode.SIM if args.execution_mode else ExecutionMode.ONBOARD,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             dump_passes=args.dump_passes,
             enable_scope_stats=args.enable_scope_stats,
             log_level=args.log_level,
@@ -1339,7 +1338,7 @@ if __name__ == "__main__":
             compile_only=True,
         )
         if result.passed and not args.compile_only:
-            cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
+            cfg = normalize_config(config)
             compiled = DistributedCompiledProgram.from_dir(
                 result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
             )
