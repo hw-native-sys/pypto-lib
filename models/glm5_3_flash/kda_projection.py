@@ -74,9 +74,10 @@ K_TILE = 128
 # above LOCAL_KDA_H are unused; at TP4, where LOCAL_KDA_H is already 16, there is no
 # padding at all.
 BETA_PAD = 16
-# Padding rows to zero. Folded here rather than in the traced body, which takes only
-# pl.* calls; it floors at one because a zero-task region is not dispatchable, and at
-# TP4 LOCAL_KDA_H already reaches BETA_PAD so that one task writes nothing.
+# Padding rows to zero. Kept for the archived probe kit (logs_t16/relay_j.py
+# imports it); since the pad rows moved into one unrolled task this count no
+# longer sizes a region: at TP4, where LOCAL_KDA_H already reaches BETA_PAD,
+# the unrolled loop simply writes no zero rows.
 B_ZERO_TASKS = max(BETA_PAD - LOCAL_KDA_H, 1)
 
 
@@ -159,18 +160,24 @@ def kda_projection(
     # columns further along than they should. Materialising a zero-padded weight makes
     # all 16 accumulator columns real, and the store is width-matched.
     w_b_pad = pl.create_tensor([BETA_PAD, D], dtype=pl.BF16)
-    with pl.spmd(BETA_PAD, name_hint="kda_projection_b_pad") as b_pad_tid:
-        r = pl.tile.get_block_idx()
-        w_b_pad[r : r + 1, 0:D] = pl.slice(w_b, [1, D], [pl.min(r, LOCAL_KDA_H - 1), 0])
-    with pl.spmd(B_ZERO_TASKS, name_hint="kda_projection_b_zero",
-                 deps=[b_pad_tid]) as b_zero_tid:
-        r = LOCAL_KDA_H + pl.tile.get_block_idx()
-        if r < BETA_PAD:
-            w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+    # composition-compat store form, numerics unchanged: one task builds every pad
+    # row inside a pl.unroll body, so each w_b load carries a constant row offset.
+    # A plain-spmd load of a raw weight at a traced offset blocks the downstream
+    # dim folding that composed entries rely on (logs_t16/relay_m.py: s04 form
+    # poisons, s05/s12/s13 unrolled form is clean); kda_conv's unrolled weight
+    # taps are the in-tree precedent. Rows at and above LOCAL_KDA_H take the same
+    # zeros the b_zero pass used to write.
+    with pl.spmd(1, name_hint="kda_projection_b_pad") as b_pad_tid:
+        zero = pl.tile.get_block_idx() * 0  # single task, block index zero
+        for r in pl.unroll(BETA_PAD):
+            if r < LOCAL_KDA_H + zero:
+                w_b_pad[r : r + 1, 0:D] = pl.slice(w_b, [1, D], [r, 0])
+            else:
+                w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
     tiles = (t_dim + T_TILE - 1) // T_TILE
 
-    with pl.spmd(tiles, name_hint="kda_projection", deps=[b_zero_tid]):
+    with pl.spmd(tiles, name_hint="kda_projection", deps=[b_pad_tid]):
         task = pl.tile.get_block_idx()
         t0 = task * T_TILE
         # The last block spills past t_dim; valid_shape zero-fills what it reads and

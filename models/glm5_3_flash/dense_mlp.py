@@ -175,7 +175,15 @@ def dense_mlp(
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([DN_M_TILE, D_OUT_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, LOCAL_DENSE_INTER, INTER_K, stage=2):
-                hs_k = h_i8[:, k0 : k0 + INTER_K]
+                # composition-compat load form, numerics unchanged: the operand
+                # reads h_i8 through a reshape view of the same buffer. A row-open
+                # (``[:, k]``) getitem directly on the create inside this
+                # spmd+pipeline body blocks dim folding for ForStmt boundaries
+                # elsewhere in a composed entry (probe: d0 poisoned; d7 without
+                # this region and d10 with the view both compile); kda_output
+                # already routes its create reads the same way.
+                h_i8_view = pl.reshape(h_i8, [DN_M_TILE, LOCAL_DENSE_INTER])
+                hs_k = h_i8_view[:, k0 : k0 + INTER_K]
                 sw2_k = w_down[d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
                 y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True, init_cond=(k0 == 0))
             y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
