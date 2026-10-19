@@ -135,8 +135,9 @@ def o_proj(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
     group32: pl.constexpr,
+    native_ob: pl.constexpr = False,
 ):
-    """Project attention output; return output and group32 completion (None for native MX)."""
+    """Project attention output and return its explicit completion when requested."""
     tokens = pl.tensor.dim(attended, 0)
     unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     if group32:
@@ -147,16 +148,22 @@ def o_proj(
     latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
     latent, grouped_tid = grouped_output(unrotated, wo_a, latent, num_tokens, rotate_tid)
     output_tid = None
-    if group32:
+    if native_ob:
+        result, output_tid = mxfp8_gemm(
+            latent, wo_b, wo_b_scale, output, num_tokens, grouped_tid,
+            width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
+            n_tile=128, name_hint="c1a_ob_native_mx", workers=32,
+        )
+    elif group32:
         result, output_tid = mxfp8_gemm_group32(
             latent, wo_b, wo_b_scale, output, num_tokens, grouped_tid,
             width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
         )
     else:
         mxfp8_gemm(
-            latent, wo_b, wo_b_scale, output, num_tokens,
+            latent, wo_b, wo_b_scale, output, num_tokens, None,
             width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
-            n_tile=128, name_hint="attention_o_b",
+            n_tile=128, name_hint="attention_o_b", workers=0,
         )
     return output, output_tid
 
