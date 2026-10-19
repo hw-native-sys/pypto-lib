@@ -33,7 +33,7 @@ from config import (
 )
 
 
-from quant import mxfp8_gemm_group32, bf16_gemm_staged
+from quant import mxfp8_gemm, bf16_gemm_staged
 
 
 # model config
@@ -1461,15 +1461,15 @@ def c1a_index(
 ):
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    query_projection_result, query_projection_tid = mxfp8_gemm_group32(
+    mxfp8_gemm(
         qr, index_wq_b, index_wq_b_scale,
         projected,
-        num_tokens, entry_ready,
+        num_tokens,
         width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
+        n_tile=128, name_hint="c1a_mx_projection",
     )
-    projected_tid = query_projection_tid
     rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    rotated_tid = rotate_index_query(projected, cos, sin, rotated, num_tokens, projected_tid)
+    rotated_tid = rotate_index_query(projected, cos, sin, rotated, num_tokens, entry_ready)
     query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
     query_scale = pl.create_tensor(
         [tokens, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0

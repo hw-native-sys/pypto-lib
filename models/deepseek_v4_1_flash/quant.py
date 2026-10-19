@@ -53,7 +53,7 @@ def mxfp8_gemm(
     n_tile: pl.constexpr,
     name_hint: pl.constexpr,
 ):
-    """Compute M32 MXFP8 products with in-task activation quantization."""
+    """Compute native M32 MXFP8 products with in-task activation quantization."""
     for mt in pl.parallel((num_tokens + 31) // 32):
         for block in pl.spmd(output_width // n_tile, name_hint=name_hint):
             t0 = mt * 32
@@ -107,68 +107,6 @@ def mxfp8_gemm(
                 value = pl.cast(acc, target_type=pl.BF16, mode="rint")
                 output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
     return output
-
-
-@pl.jit.inline(auto_scope=False)
-def mxfp8_gemm_group32(
-    x: pl.Tensor,
-    weight: pl.Tensor,
-    scale: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
-    width: pl.constexpr,
-    output_width: pl.constexpr,
-    fp32_output: pl.constexpr,
-):
-    """Accumulate separately scaled group-32 products and return completion."""
-    scale_storage = pl.tensor.view(scale, [output_width // 16, width // 2], layout=pl.ND)
-    # Read after the explicit scratch producer completes.
-    producer_deps = pl.array.create(1, pl.TASK_ID)
-    producer_deps[0] = ready
-    with pl.spmd(32, name_hint="c1a_mx_projection", deps=[producer_deps[0]]) as project_tid:
-        worker = pl.tile.get_block_idx()
-        for task in pl.range(worker, (num_tokens + 15) // 16 * (output_width // 128), 32):
-            t0 = task // (output_width // 128) * 16
-            n0 = task % (output_width // 128) * 128
-            rows = pl.min(16, num_tokens - t0)
-            acc = pl.tile.full([16, 128], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(width // 64):
-                raw = pl.load(scale_storage, [n0 // 16, kb * 32], [128 // 16, 32])
-                raw_u8 = pl.reinterpret_view(raw, pl.UINT8)
-                codes = pl.ands(pl.cast(pl.reinterpret_view(raw_u8, pl.INT8), pl.INT32), 255)
-                scale_pair = pl.reinterpret_view(pl.maximum(pl.shls(codes, 23), 4194304), pl.FP32)
-                for half in pl.unroll(2):
-                    k0 = (kb * 2 + half) * 32
-                    if half == 0:
-                        selected_scale = pl.tile.gather_mask(
-                            scale_pair, mask_pattern=pl.tile.MaskPattern.P0101
-                        )
-                    else:
-                        selected_scale = pl.tile.gather_mask(
-                            scale_pair, mask_pattern=pl.tile.MaskPattern.P1010
-                        )
-                    sb = pl.reshape(selected_scale, [1, 128])
-                    source = pl.load(x, [t0, k0], [16, 32], valid_shape=[rows, 32])
-                    source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 16, 32)
-                    values = pl.cast(source, pl.FP32)
-                    temporary = pl.tile.create([16, 32], dtype=pl.FP32)
-                    maximum = pl.maximum(pl.row_max(pl.abs(values), tmp_tile=temporary), 1e-4)
-                    bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
-                    exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                    sa = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                    payload = pl.cast(pl.row_expand_div(values, sa), pl.FP8E4M3FN, mode="rint")
-                    a = pl.cast(payload, pl.BF16)
-                    b = pl.cast(pl.load(weight, [k0, n0], [32, 128]), pl.BF16)
-                    dot = pl.matmul(a, b)
-                    part = pl.col_expand_mul(pl.row_expand_mul(dot, sa), sb)
-                    acc = pl.add(acc, part)
-            if fp32_output:
-                output = pl.store(pl.set_validshape(acc, rows, 128), [t0, n0], output)
-            else:
-                result = pl.cast(acc, pl.BF16, mode="rint")
-                output = pl.store(pl.set_validshape(result, rows, 128), [t0, n0], output)
-    return output, project_tid
 
 
 @pl.jit.inline(auto_scope=False)

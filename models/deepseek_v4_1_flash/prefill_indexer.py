@@ -16,7 +16,7 @@ from hierarchical_sparse_indexer import (
 from rmsnorm import EPS
 
 
-from quant import mxfp8_gemm, mxfp8_gemm_group32, bf16_gemm_staged
+from quant import mxfp8_gemm, bf16_gemm_staged
 
 
 # model config
@@ -246,12 +246,12 @@ def make_paged_indexer(use_candidates=False, direct_topk=False, max_logits_bytes
         tokens = pl.tensor.dim(x, 0)
         positions = pl.tensor.dim(candidate_mask, 1)
         index_query_raw = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-        query_projection_ready = pl.system.task_dummy(deps=[])
-        query_projection_result, query_projection_tid = mxfp8_gemm_group32(
+        mxfp8_gemm(
             query_latent, index_wq_b, index_wq_b_scale,
             index_query_raw,
-            num_tokens, query_projection_ready,
+            num_tokens,
             width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
+            n_tile=128, name_hint="c1a_mx_projection",
         )
         index_query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
         rotate_index_query(

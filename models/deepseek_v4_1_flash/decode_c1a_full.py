@@ -226,13 +226,13 @@ def decode_c1a_full(
         window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
     )
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attend_tid = attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
+    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    oproj_result, ob_tid = o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, attend_tid, group32=True,
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens,
     )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    with pl.spmd(tokens, name_hint="c1a_output_cast", deps=[ob_tid]):
+    with pl.spmd(tokens, name_hint="c1a_output_cast"):
         row = pl.tile.get_block_idx()
         for col in pl.range(0, D, 512):
             value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)

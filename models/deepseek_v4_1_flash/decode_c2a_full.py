@@ -179,7 +179,7 @@ def decode_c2a_full(
         chunk_done = attend_c2a_chunk(query, selected, combined, attn_sink, attended, start, active, gather_tid)
 
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, None, group32=False)
+    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd(tokens, name_hint="c2a_output_cast"):
         row = pl.tile.get_block_idx()

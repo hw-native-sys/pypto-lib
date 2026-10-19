@@ -22,7 +22,7 @@ from config import (
 )
 
 
-from quant import mxfp8_gemm, mxfp8_gemm_group32
+from quant import mxfp8_gemm
 
 
 # model config
@@ -51,15 +51,12 @@ def _rotate_output(
     sin: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
     max_workers: pl.constexpr,
     name_hint: pl.constexpr,
 ):
     blocks = num_tokens * LOCAL_H
     workers = pl.min(blocks, max_workers)
-    rope_deps = pl.array.create(1, pl.TASK_ID)
-    rope_deps[0] = ready
-    with pl.spmd(workers, name_hint=name_hint, deps=[rope_deps[0]]) as rope_tid:
+    with pl.spmd(workers, name_hint=name_hint):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
             t = block // LOCAL_H
@@ -78,7 +75,7 @@ def _rotate_output(
             rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
             rotated = pl.cast(rotated, pl.BF16, mode="rint")
             output[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM] = rotated
-    return rope_tid
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -88,14 +85,11 @@ def grouped_output(
     scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
 ):
     tokens = pl.tensor.dim(x, 0)
     accumulated = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.FP32)
     blocks = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
     workers = pl.max(pl.min(blocks, GROUPED_WORKER_TILE), 1)
-    entry_deps = pl.array.create(1, pl.TASK_ID)
-    entry_deps[0] = ready
     cube_tids = pl.array.create(LOCAL_O_GROUPS * (O_LORA // N_TILE), pl.TASK_ID)
     group_blocks = (num_tokens + M_TILE - 1) // M_TILE
     group_workers = pl.max(pl.min(group_blocks, GROUPED_WORKER_TILE), 1)
@@ -106,7 +100,7 @@ def grouped_output(
         )
         for nb in pl.parallel(O_LORA // N_TILE):
             local_n = nb * N_TILE
-            with pl.spmd(group_workers, name_hint="attention_grouped_o_a_cube", deps=[entry_deps[0]]) as cube_tid:
+            with pl.spmd(group_workers, name_hint="attention_grouped_o_a_cube") as cube_tid:
                 worker = pl.tile.get_block_idx()
                 for block in pl.range(worker, group_blocks, GROUPED_WORKER_TILE):
                     t0 = block * M_TILE
@@ -163,7 +157,7 @@ def grouped_output(
 
                     accumulated = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE), [t0, output_n], accumulated)
             cube_tids[group * (O_LORA // N_TILE) + nb] = cube_tid
-    with pl.spmd(workers, name_hint="attention_grouped_o_a_cast", deps=[cube_tids]) as cast_tid:
+    with pl.spmd(workers, name_hint="attention_grouped_o_a_cast", deps=[cube_tids]):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, GROUPED_WORKER_TILE):
             t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
@@ -171,7 +165,7 @@ def grouped_output(
             rows = pl.min(M_TILE, num_tokens - t0)
             value = pl.slice(accumulated, [M_TILE, N_TILE], [t0, n0], valid_shape=[rows, N_TILE])
             output[t0:t0 + M_TILE, n0:n0 + N_TILE] = pl.cast(value, pl.BF16, mode="rint")
-    return output, cast_tid
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -185,32 +179,19 @@ def o_proj(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     output: pl.Tensor[[T_DYN, D], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
-    group32: pl.constexpr,
 ):
-    """Project attention output; return output and group32 completion (None for native MX)."""
+    """Project attention output with native MXFP8 GEMM."""
     tokens = pl.tensor.dim(attended, 0)
     unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    if group32:
-        rotate_tid = _rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens, ready, 64, "c1a_o_rope")
-    else:
-        _rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens, ready, 2147483647, "attention_o_rope")
-        rotate_tid = pl.system.task_dummy(deps=[])
+    _rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens, 64, "attention_o_rope")
     latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
-    latent, grouped_tid = grouped_output(unrotated, wo_a, wo_a_scale, latent, num_tokens, rotate_tid)
-    output_tid = None
-    if group32:
-        result, output_tid = mxfp8_gemm_group32(
-            latent, wo_b, wo_b_scale, output, num_tokens, grouped_tid,
-            width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
-        )
-    else:
-        mxfp8_gemm(
-            latent, wo_b, wo_b_scale, output, num_tokens,
-            width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
-            n_tile=128, name_hint="attention_o_b",
-        )
-    return output, output_tid
+    grouped_output(unrotated, wo_a, wo_a_scale, latent, num_tokens)
+    mxfp8_gemm(
+        latent, wo_b, wo_b_scale, output, num_tokens,
+        width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
+        n_tile=128, name_hint="attention_o_b",
+    )
+    return output
 
 
 def golden_grouped_output(
