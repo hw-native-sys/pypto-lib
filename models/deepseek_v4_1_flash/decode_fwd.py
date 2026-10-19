@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4.1-Flash 40-layer decode backbone with a TP1/EP2, 128-expert CI smoke case."""
+"""DeepSeek-V4.1-Flash 40-layer decode with final HC, RMSNorm, logits and greedy sampling."""
 
 import argparse
 import inspect
@@ -55,6 +55,7 @@ from decode_c2a_full import decode_c2a_full
 from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
+from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, final_output
 from rope_tables import precompute_rope_tables
 from utils import build_forward_metadata
 from expert_routed import (
@@ -1047,6 +1048,11 @@ def l3_decode_fwd(
     shared_w3_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
+    final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[EP_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Out[pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
+    sampled_ids: pl.Out[pl.Tensor[[EP_SIZE, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
 ):
     """Run SWA with base rows and C2A/C1A with compressed-profile token rows.
 
@@ -1083,8 +1089,11 @@ def l3_decode_fwd(
     TP1 uses padded 80-row local x_hc/pre_mix slabs, with up to 72 active rows.
     Idle ranks use zero counts, -1 publication slots and empty query ranges;
     they still participate in EP collectives. Each new token starts from its
-    embedding and identity pre-mix, then finishes after layer 39. Pass that
-    state to lm_head.l3_final_output for final HC/Norm, logits and greedy IDs.
+    embedding and identity pre-mix. After layer 39, final HC collapse and
+    RMSNorm feed the TP-sharded LM head and greedy sampler. logit_row_indices
+    selects up to MAX_LOGIT_ROWS rank-local rows; -1 produces zero logits and
+    sampled ID zero, which the caller ignores, including on idle ranks.
+    x_hc/pre_mix retain the final layer state; logits and sampled_ids are outputs.
 
     Retain cache allocations and page ownership until runtime completion, then
     commit lengths before the next call. Completed forwards clear MoE signals;
@@ -1126,6 +1135,10 @@ def l3_decode_fwd(
     combine_arrived_buffer = pld.alloc_window_buffer(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
+    head_hidden_buffer = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+    head_hidden_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    head_logits_buffer = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+    head_logits_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
@@ -1313,6 +1326,18 @@ def l3_decode_fwd(
             device=rank,
         )
 
+        head_hidden = pld.window(head_hidden_buffer, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+        head_hidden_done = pld.window(head_hidden_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        head_logits = pld.window(head_logits_buffer, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+        head_logits_done = pld.window(head_logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        final_output(
+            x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank],
+            logit_row_indices[rank], logits[rank], sampled_ids[rank],
+            head_hidden, head_hidden_done, head_logits, head_logits_done,
+            rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, 1, 1, device=rank,
+        )
+    return logits, sampled_ids
+
 
 def _torch_dtype(dtype):
     values = {
@@ -1412,6 +1437,11 @@ def build_tensor_specs():
             )
         elif name in ("moe_num_tokens", "attention_num_tokens"):
             init_value = torch.full(shape, FIXTURE_TOKENS, dtype=torch.int32)
+        elif name == "logit_row_indices":
+            init_value = torch.full(shape, -1, dtype=torch.int32)
+            init_value[:, :FIXTURE_BATCH] = query_starts[1:] - 1
+        elif name == "final_norm_weight":
+            init_value = 1.0
         elif name == "correction_bias":
             init_value = _route_bias().repeat(EP_SIZE, N_LAYERS)
         elif name == "mxfp4_pair_lut":
@@ -1477,12 +1507,25 @@ if __name__ == "__main__":
         )
         replicated = ('moe_num_tokens', 'attention_num_tokens')
         host_inputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in replicated}
+        output_names = ("logits", "sampled_ids")
+        host_outputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in output_names}
         upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
-        inherited = [*host_inputs.values(), upload_buffer]
+        inherited = [*host_inputs.values(), *host_outputs.values(), upload_buffer]
         with compiled.prepare(cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=inherited) as runtime:
             parameters = compiled._get_metadata()[0]
             arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
             runtime(*arguments, config=cfg)
-        print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)
+            stacked = dict(zip((spec.name for spec in specs), arguments, strict=True))
+            for name, tensor in host_outputs.items():
+                runtime.copy_stacked_from(stacked[name], tensor)
+        row_spec = next(spec for spec in specs if spec.name == "logit_row_indices")
+        inactive_rows = row_spec.create_tensor() < 0
+        if torch.count_nonzero(host_outputs["logits"][inactive_rows]).item():
+            raise RuntimeError("inactive decode logit rows must be zero")
+        if torch.count_nonzero(host_outputs["sampled_ids"][inactive_rows]).item():
+            raise RuntimeError("inactive decode sampled-id rows must be zero")
+        if torch.count_nonzero(host_outputs["sampled_ids"][:, :, 1:]).item():
+            raise RuntimeError("decode sampled-id padding must be zero")
+        print("[FWD] Execution and head output checks passed; numerical accuracy was not validated.", flush=True)
     if not result.passed:
         raise SystemExit(result.error or 1)
