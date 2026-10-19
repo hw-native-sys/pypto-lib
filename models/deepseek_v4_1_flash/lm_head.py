@@ -26,10 +26,9 @@ block count.
 Per-card cost tracks ``VOCAB_PER_TP``, not the DP world size: the matmul M extent
 is always ``TP_SIZE * MAX_LOGIT_ROWS``.
 
-Retained CommDomains reuse the same done windows across forwards by passing an
-incrementing ``done_epoch`` (1, 2, …). Counters are never cleared: wait expects
-``done_epoch * notifies_per_source``, so a fixed epoch plus clear would race with
-the next round's AtomicAdd.
+Each dispatch clears its signal windows after all TP ranks finish reading
+the communication windows. Complete a dispatch on all ranks before replacing
+its inputs or launching another host dispatch with the same resident buffers.
 
 TP1 bring-up uses ``MAX_LOGIT_ROWS=16`` so ``GROUP_LOGIT_ROWS`` stays a multiple of
 16 without MTP's AIV/MATMUL_ROWS padding path. Do not size the fixture from
@@ -93,8 +92,7 @@ LOGITS_COMM_TILE = 2048
 VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 FUSED_LM_HEAD_CORES = 24
-# Host passes done_epoch = epoch_idx + 1 for each retained-CommDomain forward.
-# --repeat N runs N forwards with epoch 1..N on the same windows (no clear).
+# Repeated projections advance epochs and clear signals after the final projection.
 _REPEAT_CHOICES = (1, 2, 4)
 REPEAT: int = _parse_int_argv("--repeat") or 1
 
@@ -139,6 +137,7 @@ def lm_head(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
+    completed_epochs: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
     # Scratch is allocated just outside the scope that first writes it: a
     # create_tensor inside a pl.at yields a tile, not a GM tensor view.
@@ -148,7 +147,8 @@ def lm_head(
     # Publish this card's logit rows into every group member's window slot: the
     # window holds one slot per group member and each card writes only its own,
     # `tp_rank * MAX_LOGIT_ROWS`. One block per logit row, one [1, D] put per peer.
-    for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_dispatch_push"):
+    with pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_dispatch_push") as _dispatch_push_tid:
+        row = pl.tile.get_block_idx()
         hidden_rows = pl.tensor.dim(hidden_states, 0)
         source_row_raw = pl.read(logit_row_indices, [row])
         # Clamp so the load address is always inside hidden_states even if a
@@ -183,11 +183,9 @@ def lm_head(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    # Barrier on the group's publishes. The hidden_states read is an anchor, not
-    # data: it deps this task on the hidden-state producer so the wait runs
-    # alongside our own push instead of trailing it.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait") as _dwait_tid:
-        _hidden_anchor = pl.read(hidden_states, [0, 0])
+    # Wait after all local hidden-row publishes complete.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait", deps=[_dispatch_push_tid],
+               allow_early_resolve=False) as _dwait_tid:
         for owner_tp in pl.range(TP_SIZE):
             if owner_tp != tp_rank:
                 pld.system.wait(
@@ -238,7 +236,8 @@ def lm_head(
 
     # Send each owner its slice of this card's vocab shard, split over vocab comm
     # tiles: block blk pushes its tiles to every owner.
-    for blk in pl.spmd(LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_push"):
+    with pl.spmd(LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_push") as _push_tid:
+        blk = pl.tile.get_block_idx()
         vocab_base = tp_rank * VOCAB_PER_TP
         for owner_tp in pl.range(TP_SIZE):
             source_row_base = owner_tp * MAX_LOGIT_ROWS
@@ -283,18 +282,15 @@ def lm_head(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    # Wait only (the notify rides inside the push). The logits_shards read is an
-    # anchor, not data: it deps this task on lm_head_matmul so the wait runs
-    # alongside our own push. An unanchored wait dispatches immediately and spins
-    # holding a core group.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait") as _cwait_tid:
-        _shard_anchor = pl.read(logits_shards, [0, 0])
+    # Wait after all local vocab-shard publishes complete.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid],
+               allow_early_resolve=False) as _cwait_tid:
         for src_tp in pl.range(TP_SIZE):
             if src_tp != tp_rank:
                 pld.system.wait(
                     signal=logits_done,
                     offsets=[src_tp, 0],
-                    expected=pl.cast(done_epoch * LOGITS_COMM_BLOCKS, pl.INT32),
+                    expected=pl.cast((done_epoch - 1) * (LOGITS_COMM_BLOCKS + 1) + LOGITS_COMM_BLOCKS, pl.INT32),
                     cmp=pld.WaitCmp.Ge,
                 )
 
@@ -317,8 +313,37 @@ def lm_head(
                     tl = src_vocab_base + tail_o0
                     logits[:, tl : tl + LOGITS_COMM_TAIL] = logits_window[:, tl : tl + LOGITS_COMM_TAIL]
 
-    # Counters stay cumulative. The next retained-CommDomain forward must pass
-    # done_epoch = previous + 1 so waits observe the new AtomicAdd totals.
+    # Publish completion of every local logits-window reader.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_readback_notify", deps=[_gather_tid]) as _readback_notify_tid:
+        for peer in pl.range(TP_SIZE):
+            if peer != tp_rank:
+                pld.system.notify(
+                    logits_done, peer=group_base + peer, offsets=[tp_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_readback_wait") as _readback_wait_tid:
+        for peer in pl.range(TP_SIZE):
+            if peer != tp_rank:
+                pld.system.defer_wait(
+                    logits_done, offsets=[peer, 0], expected=done_epoch * (LOGITS_COMM_BLOCKS + 1), cmp=pld.WaitCmp.Ge,
+                )
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_retire",
+        deps=[_readback_notify_tid, _readback_wait_tid], allow_early_resolve=False,
+    ):
+        anchor = pl.read(logits, [0, 0])
+        if done_epoch == completed_epochs:
+            for peer in pl.range(TP_SIZE):
+                if peer != tp_rank:
+                    pld.system.notify(
+                        hidden_done, peer=group_base + tp_rank, offsets=[peer, 0],
+                        value=0, op=pld.NotifyOp.Set,
+                    )
+                    pld.system.notify(
+                        logits_done, peer=group_base + tp_rank, offsets=[peer, 0],
+                        value=0, op=pld.NotifyOp.Set,
+                    )
+        pl.write(logits, [0, 0], anchor)
     return logits
 
 
@@ -408,6 +433,7 @@ def lm_head_with_sampling(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
+    completed_epochs: pl.Scalar[pl.INT32],
 ):
     """Project logits and sample top-1 tokens in one opaque L2 entry."""
     lm_head(
@@ -422,6 +448,7 @@ def lm_head_with_sampling(
         group_base,
         tp_rank,
         done_epoch,
+        completed_epochs,
     )
     greedy_sample(logits, sampled_ids)
     return logits, sampled_ids
@@ -441,6 +468,7 @@ def l2_lm_head(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
+    completed_epochs: pl.Scalar[pl.INT32],
 ):
     """Standalone opaque entry for projection plus greedy sampling tests."""
     return lm_head_with_sampling(
@@ -456,6 +484,7 @@ def l2_lm_head(
         group_base,
         tp_rank,
         done_epoch,
+        completed_epochs,
     )
 
 
@@ -476,8 +505,8 @@ def l3_final_output(
     produces zero logits and is ignored by the caller, including idle ranks.
     This entry only reads layer state and never mutates caches. Wait for the
     backbone to complete before dispatch and for this call before reading
-    logits or reusing state. Communication windows are fresh per invocation
-    (prepare with persistent=False). TP1/DP8 uses eight full head replicas.
+    logits or reusing state. Use persistent=True with reset_persistent_windows=False for repeated calls.
+    Wait for each dispatch to complete on all ranks before the next call. TP1/DP8 uses eight full head replicas.
     """
     x_hc.bind_dynamic(1, T_DYN)
     hidden_buffer = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
@@ -494,7 +523,7 @@ def l3_final_output(
                 x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank],
                 logit_row_indices[rank], logits[rank], sampled_ids[rank],
                 hidden_window, hidden_done, logits_window, logits_done,
-                rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, epoch_idx + 1, device=rank,
+                rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, epoch_idx + 1, REPEAT, device=rank,
             )
 
 
@@ -514,6 +543,7 @@ def final_output(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
+    completed_epochs: pl.Scalar[pl.INT32],
 ):
     """Compose final HC, Norm and LM head from the current layer state."""
     x_hc.bind_dynamic(0, T_DYN)
@@ -525,7 +555,7 @@ def final_output(
         rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, norm_block, rows)
     lm_head_with_sampling(
         normalized, lm_head_weight, logit_row_indices, logits, sampled_ids,
-        hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch,
+        hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,
     )
     return logits, sampled_ids
 
@@ -547,8 +577,7 @@ def l3_lm_head(
     hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
     logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
 
-    # REPEAT forwards share the same windows; epoch_idx+1 is the done_epoch so
-    # wait expected values track cumulative AtomicAdd totals without clearing.
+    # Epochs advance inside a dispatch; the final projection clears its signals.
     for epoch_idx in pl.range(REPEAT):
         for r in pl.range(pld.world_size()):
             hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
@@ -559,7 +588,7 @@ def l3_lm_head(
                 hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
                 sampled_ids[r],
                 hidden_window, hidden_done, logits_window, logits_done,
-                r // TP_SIZE * TP_SIZE, r % TP_SIZE, epoch_idx + 1, device=r,
+                r // TP_SIZE * TP_SIZE, r % TP_SIZE, epoch_idx + 1, REPEAT, device=r,
             )
 
 
@@ -695,7 +724,7 @@ if __name__ == "__main__":
     parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES),
                         help="DP groups (world size = tp * dp)")
     parser.add_argument("--repeat", type=int, default=REPEAT, choices=list(_REPEAT_CHOICES),
-                        help="retained-CommDomain forwards with done_epoch 1..N")
+                        help="projections sharing windows, cleared after the final projection")
     parser.add_argument("--num-tokens", type=int, default=TEST_TOKENS,
                         help="Active hidden rows each owner projects (0 = empty shard)")
     parser.add_argument("-d", "--device", type=str,

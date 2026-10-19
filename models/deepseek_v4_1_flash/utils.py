@@ -1513,7 +1513,7 @@ def make_boundary_specs(args):
             torch.int32,
             1,
             compile_runtime=True,
-            benchmark_step=1 if args.bench else None,
+            benchmark_step=None,
         )
     )
     return specs

@@ -22,6 +22,7 @@ from config import (
 )
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import (
+    retire_prefill_signals,
     prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce, golden_o_proj,
 )
 from hc import prefill_sp_post, hc_post
@@ -342,6 +343,8 @@ def l2_prefill_c2a_reuse(
         output_arrived, attn_input, attn_output, next_pre_mix, x_hc_out,
         rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, attention_epoch,
     )
+    retire_prefill_signals(x_hc_out, input_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
+    retire_prefill_signals(x_hc_out, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     return x_hc_out, next_pre_mix, attn_output, attn_input, window_cache, window_cache_scale
 
 

@@ -28,7 +28,7 @@ from hc import golden_hc_post, prefill_sp_post
 from hc import golden_hc_pre, hc_pre, zero_bf16_padding
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
-from o_proj import o_proj, prefill_sp_output_reduce_scatter
+from o_proj import retire_prefill_signals, o_proj, prefill_sp_output_reduce_scatter
 from prefill_cp_allgather import make_prefill_sp_input_allgather
 from utils import swa_window_cache_compare as window_cache_compare
 
@@ -329,6 +329,8 @@ def l2_prefill_swa(
         input_window, input_arrived, output_window, output_arrived, hidden, attn_out, output, next_pre_mix,
         rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active_tokens, attention_epoch,
     )
+    retire_prefill_signals(output, input_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
+    retire_prefill_signals(output, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     return output, next_pre_mix, hidden, attn_out, window_cache, window_cache_scale
 
 
@@ -489,7 +491,7 @@ def build_hc_specs(args):
               TensorSpec("attn_out", [world_size, local_tokens, D], bf, resident="stacked"),
               TensorSpec("num_tokens", [world_size, 1], torch.int32, init_value=lambda: rank_counts, resident="stacked"),
               ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True,
-                         benchmark_step=1 if args.bench else None)]
+                         benchmark_step=None)]
     return specs
 
 

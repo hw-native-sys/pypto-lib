@@ -86,6 +86,8 @@ def make_prefill_sp_input_allgather(capacity=PREFILL_MAX_TOKENS):
                    allow_early_resolve=False):
             for peer in pl.range(TP_SIZE):
                 pld.system.wait(input_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
+            anchor = pl.read(hidden, [0, 0])
+            pl.write(hidden, [0, 0], anchor)
         return hidden
 
     return prefill_sp_input_allgather

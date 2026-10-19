@@ -358,7 +358,7 @@ def engram_tp(
     # first K chunk goes through pl.matmul so the accumulator is produced in
     # Acc memory; later chunks accumulate onto it.
     kv = pl.create_tensor([t_dim, KV_OUT], dtype=pl.FP32)
-    with pl.spmd(t_blocks * n_blocks, name_hint="engram_tp_matmul", deps=[wait_tid]):
+    with pl.spmd(t_blocks * n_blocks, name_hint="engram_tp_matmul", deps=[wait_tid]) as matmul_tid:
         block = pl.tile.get_block_idx()
         t0 = (block // n_blocks) * T_TILE
         n0 = (block % n_blocks) * N_TILE
@@ -402,7 +402,26 @@ def engram_tp(
             acc = pl.matmul_acc(acc, a_tile, w_tile)
         pl.store(pl.set_validshape(acc, valid_rows, N_TILE), [t0, n0], kv)
 
-    # ---- Stage 2: per (token block, hc copy) gate and residual add
+    # Publish completion of all remote lookup readers.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="engram_tp_consumed", deps=[matmul_tid]) as consumed_tid:
+        for peer in pl.range(TP_SIZE):
+            if peer != my_rank:
+                pld.system.notify(signal, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="engram_tp_consumed_wait") as consumed_wait_tid:
+        for peer in pl.range(TP_SIZE):
+            if peer != my_rank:
+                pld.system.defer_wait(signal, offsets=[peer, 0], expected=2, cmp=pld.WaitCmp.Ge)
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="engram_tp_signal_retire",
+        deps=[consumed_tid, consumed_wait_tid], allow_early_resolve=False,
+    ):
+        anchor = pl.read(kv, [0, 0])
+        for peer in pl.range(TP_SIZE):
+            if peer != my_rank:
+                pld.system.notify(signal, peer=my_rank, offsets=[peer, 0], value=0, op=pld.NotifyOp.Set)
+        pl.write(kv, [0, 0], anchor)
+
+    # Gate and residual add after signal retirement.
     engram_gate(kv, weight, x, out)
     return out
 

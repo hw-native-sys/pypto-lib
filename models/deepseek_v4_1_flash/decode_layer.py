@@ -79,6 +79,7 @@ from expert_routed import (
 )
 from moe import SIGNAL_PAD
 from moe import (
+    clear_moe_signals,
     AUX_WIDTH,
     EP_SIZE,
     N_LOCAL_EXPERTS,
@@ -494,6 +495,7 @@ def l2_decode_layer(
         recv_scale, recv_weights, recv_routes, arrived, data_arrived, routed_output,
         combine_arrived, local_moe_tokens, rank, moe_epoch,
     )
+    clear_moe_signals(x_next, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
 
 
 @pl.jit.host

@@ -64,6 +64,7 @@ from expert_routed import (
 )
 from moe import SIGNAL_PAD
 from moe import (
+    clear_moe_signals,
     AUX_WIDTH,
     EP_SIZE,
     N_LOCAL_EXPERTS,
@@ -3881,6 +3882,7 @@ def _decode_decoder(
             rank,
             c1a_block * 4 + 27 + 1,
         )
+    clear_moe_signals(x_hc, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_hc
 
 
@@ -4296,9 +4298,9 @@ def l3_decode_fwd(
     state to lm_head.l3_final_output for final HC/Norm, logits and greedy IDs.
 
     Retain cache allocations and page ownership until runtime completion, then
-    commit lengths before the next call. Use fresh communication windows
-    (persistent=False). Reset a reused request slot in all C2A sources after
-    its users complete. Restore or reset mutated state before retrying failed
+    commit lengths before the next call. Completed forwards clear MoE signals;
+    use persistent=True with reset_persistent_windows=False for serialized calls.
+    Reset a reused request slot in all C2A sources after its users complete. Restore or reset mutated state before retrying failed
     calls. Engram, vision and DSpark require no inputs here.
     """
     x_hc.bind_dynamic(1, LOCAL_T_DYN)
@@ -4687,7 +4689,7 @@ if __name__ == "__main__":
         compiled = DistributedCompiledProgram.from_dir(result.work_dir, platform=cfg.platform)
         replicated = ('moe_num_tokens', 'attention_num_tokens')
         host_inputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in replicated}
-        with compiled.prepare(cfg, persistent=False, inherited_host_tensors=list(host_inputs.values())) as runtime:
+        with compiled.prepare(cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=list(host_inputs.values())) as runtime:
             arguments = upload_forward_inputs(runtime, specs, compiled._get_metadata()[0], len(devices), host_inputs)
             runtime(*arguments, config=cfg)
         print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)

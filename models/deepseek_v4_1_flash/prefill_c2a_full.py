@@ -38,6 +38,7 @@ from config import (
 from compressor import STATE_WIDTH, project_ratio2, compressor_ratio2, publish_c2a_compressed
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import (
+    retire_prefill_signals,
     golden_o_proj, prefill_sp_output_reduce_scatter, o_proj,
 )
 from hc import prefill_sp_post, golden_hc_post
@@ -1169,6 +1170,8 @@ def l2_prefill_c2a_full(
         attn_output, next_pre_mix, x_hc_out, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
         active, attention_epoch,
     )
+    retire_prefill_signals(x_hc_out, input_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
+    retire_prefill_signals(x_hc_out, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     return (
         x_hc_out, next_pre_mix, attn_output, attn_input, topk_indices, window_cache, window_cache_scale,
         compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, state_cache,
@@ -1371,7 +1374,7 @@ def build_specs(args, mode, initial_state, *, make_inputs=None):
             torch.int32,
             1,
             compile_runtime=True,
-            benchmark_step=1 if args.bench else None,
+            benchmark_step=None,
         ),
     ]
     return specs

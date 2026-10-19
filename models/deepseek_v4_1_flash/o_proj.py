@@ -225,6 +225,25 @@ def golden_o_proj(
 
 
 @pl.jit.inline(auto_scope=False)
+def retire_prefill_signals(
+    completion_anchor: pl.Tensor,
+    arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+):
+    """Clear ready and consumed signals at a serialized entry boundary."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_signal_retire", allow_early_resolve=False):
+        anchor = pl.read(completion_anchor, [0, 0, 0])
+        for peer in pl.range(TP_SIZE):
+            pld.system.notify(
+                arrived, peer=group_base + tp_rank, offsets=[peer, 0],
+                value=0, op=pld.NotifyOp.Set,
+            )
+        pl.write(completion_anchor, [0, 0, 0], anchor)
+    return completion_anchor
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_sp_output_reduce_scatter(
     partial: pl.Tensor[[T_DYN, D], pl.FP32],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
@@ -285,6 +304,8 @@ def prefill_sp_output_reduce_scatter(
                allow_early_resolve=False):
         for peer in pl.range(TP_SIZE):
             pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
+        anchor = pl.read(output, [0, 0])
+        pl.write(output, [0, 0], anchor)
     return output
 
 
@@ -344,4 +365,6 @@ def prefill_tp_output_all_reduce(
                allow_early_resolve=False):
         for peer in pl.range(TP_SIZE):
             pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
+        anchor = pl.read(output, [0, 0])
+        pl.write(output, [0, 0], anchor)
     return output

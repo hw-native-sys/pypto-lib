@@ -76,6 +76,27 @@ RECV_TILE = 16
 SCALE_PACK_TILES = (RECV_MAX + RECV_TILE - 1) // RECV_TILE
 
 
+@pl.jit.inline(auto_scope=False)
+def clear_moe_signals(
+    completion_anchor: pl.Tensor,
+    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    anchor_indices: pl.constexpr,
+):
+    """Clear a completed entry's MoE arrival and round-release signals."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear", allow_early_resolve=False):
+        anchor = pl.read(completion_anchor, anchor_indices)
+        zero = pl.cast(0, pl.INT32)
+        for peer in pl.range(EP_SIZE):
+            pl.write(arrived, [peer, 0], zero)
+            pl.write(data_arrived, [peer, 0, 0], zero)
+            pl.write(combine_arrived, [peer, 0, 0], zero)
+            pl.write(combine_arrived, [peer, 1, 0], zero)
+        pl.write(completion_anchor, anchor_indices, anchor)
+    return completion_anchor
+
+
 @pl.jit.inline
 def dispatch(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
@@ -817,7 +838,7 @@ def l2_moe(
     x_mixed.bind_dynamic(0, LOCAL_T_DYN)
     x_next.bind_dynamic(0, LOCAL_T_DYN)
     local_num_tokens = pl.read(num_tokens, [ep_rank])
-    return moe(
+    moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_weight, gate_weight, correction_bias,
         routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
@@ -828,6 +849,8 @@ def l2_moe(
         arrived, data_arrived, routed_output, combine_arrived,
         local_num_tokens, ep_rank, moe_epoch,
     )
+    clear_moe_signals(x_next, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
+    return x_next
 
 
 @pl.jit.host
@@ -1112,7 +1135,7 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
         TensorSpec("output", [EP_SIZE, MOE_TOKENS, D], torch.bfloat16),
         TensorSpec("num_tokens", [EP_SIZE], torch.int32,
                    init_value=lambda: counts),
-        ScalarSpec("moe_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=1),
+        ScalarSpec("moe_epoch", torch.int32, 1, compile_runtime=True),
     ]
 
     for spec in specs:

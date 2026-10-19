@@ -91,11 +91,11 @@ from lm_head import greedy_sample, lm_head
 from utils import (
     PrefillCheckpoint, ResidentPrefillWeights, prepare_prefill_inputs, prepare_resident_inputs,
 )
-from moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, moe
+from moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals, moe
 from compressor import STATE_WIDTH
 from prefill_c1a_full import prefill_publish_decoder
 from prefill_swa import prefill_swa_attention
-from o_proj import prefill_tp_output_all_reduce
+from o_proj import retire_prefill_signals, prefill_tp_output_all_reduce
 from prefill_c2a_full import prefill_c2a_full_attention
 from prefill_c2a_reuse import prefill_c2a_reuse_attention
 from prefill_c1a_reindex import prefill_c1a_reindex_attention
@@ -480,7 +480,7 @@ def l2_prefill_fwd(
     head_logits_done: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
 ):
-    """Run both CED stages and the head with fresh, zeroed communication windows."""
+    """Run both CED stages and retire communication signals after the decoder."""
     compressed_cache.bind_dynamic(1, PAGES)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     state_block_table.bind_dynamic(0, B_DYN)
@@ -731,6 +731,8 @@ def l2_prefill_fwd(
     output_hidden = pl.reshape(x_hc_out, [CAPACITY, HC_DIM])
     gather_rows(source_hidden, identity_rows, output_hidden, gather_ready)
     gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready)
+    clear_moe_signals(x_hc_out, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
+    retire_prefill_signals(x_hc_out, attention_arrived, rank, 0)
     collapsed_head = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
     normalized_head = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
     hc_head(final_hidden, final_pre, collapsed_head)
@@ -738,7 +740,7 @@ def l2_prefill_fwd(
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
         rms_norm_tiled_compensated(collapsed_head, final_norm, normalized_head, norm_block, norm_tokens)
     lm_head(normalized_head, head, logit_rows, logits, head_hidden, head_hidden_done,
-            head_logits, head_logits_done, rank, 0, 1)
+            head_logits, head_logits_done, rank, 0, 1, 1)
     greedy_sample(logits, sampled_ids)
     return logits, sampled_ids
 
@@ -822,9 +824,9 @@ def l3_prefill_fwd(
 
     Zero-count ranks participate in EP communication without publishing cache
     rows. Wait for runtime completion before advancing lengths, launching a
-    dependent call or reusing buffers. Communication windows are fresh per
-    invocation (prepare with persistent=False). After request completion, the
-    caller releases its pages and resets its request slot in all C2A sources before
+    dependent call or reusing buffers. Use persistent=True with
+    reset_persistent_windows=False; signals are retired at forward completion.
+    After request completion, release pages and reset the request slot in all C2A sources before
     assigning them to another request; failed calls require cache restoration
     or reset before retry. Engram, vision and DSpark have no inputs here.
     """
@@ -1046,8 +1048,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     finished = [False] * RANKS
     print("CED_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
     start = time.monotonic()
-    # Fresh communication windows start epoch 1; native cache allocations persist.
-    with compiled.prepare(config, persistent=False) as runtime:
+    # Completed forwards retire signals; native cache allocations persist.
+    with compiled.prepare(config, persistent=True, reset_persistent_windows=False) as runtime:
         per_rank = [{} for _ in device_ids]
         host_cache = []
         for rank, tensors in enumerate(per_rank):
@@ -1315,7 +1317,7 @@ if __name__ == "__main__":
             cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
             compiled = DistributedCompiledProgram.from_dir(result.work_dir, platform=cfg.platform)
             host_inputs = {}
-            with compiled.prepare(cfg, persistent=False, inherited_host_tensors=list(host_inputs.values())) as runtime:
+            with compiled.prepare(cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=list(host_inputs.values())) as runtime:
                 arguments = upload_forward_inputs(runtime, specs, compiled._get_metadata()[0], len(devices), host_inputs)
                 runtime(*arguments, config=cfg)
             print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)

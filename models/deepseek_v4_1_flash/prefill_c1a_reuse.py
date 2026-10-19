@@ -27,7 +27,7 @@ from utils import (
     make_fixture_values, AttentionGoldenResult, COMMON_INPUT_NAMES,
 )
 from prefill_cp_allgather import prefill_sp_input_allgather
-from o_proj import prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
+from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from sparse_attention import (
     attend_packed, golden_compressed_attention, golden_prefill_c1a_attention, prefill_publish_window,
 )
@@ -294,6 +294,8 @@ def l2_prefill_c1a_reuse_sharded(
         scatter_output=True,
     )
     prefill_sp_post(attn_output, x_hc, post_mix, residual_mix, x_hc_out, next_pre_mix, rank % TP_SIZE, active)
+    retire_prefill_signals(x_hc_out, input_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
+    retire_prefill_signals(x_hc_out, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     return x_hc_out
 
 
@@ -518,7 +520,7 @@ def l2_prefill_c1a_reuse(
     """Run one TP rank of the delayed-mix C1A reuse path."""
     x_hc.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
-    return prefill_c1a_reuse(
+    prefill_c1a_reuse(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_weight,
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
@@ -528,6 +530,8 @@ def l2_prefill_c1a_reuse(
         output_window, output_arrived, hidden, attn_input, attn_out, output, next_pre_mix,
         0, tp_rank, num_tokens, 1,
     )
+    retire_prefill_signals(output, output_arrived, 0, tp_rank)
+    return output
 
 
 @pl.jit.host

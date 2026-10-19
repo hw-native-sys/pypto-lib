@@ -104,7 +104,7 @@ TOPK = M.num_experts_per_tok
 MOE_INTER = M.moe_intermediate_size
 
 
-from o_proj import prefill_tp_output_all_reduce  # noqa: E402
+from o_proj import retire_prefill_signals, prefill_tp_output_all_reduce  # noqa: E402
 from gate import golden_gate_reference as gate
 from hc import golden_mhc_mixes
 from hc import golden_hc_post
@@ -133,6 +133,7 @@ from prefill_c2a_reuse import prefill_c2a_reuse, golden_reference_c2a_reuse, mak
 from quant import build_mxfp4_pair_lut  # noqa: E402
 from rmsnorm import rms_norm_tiled  # noqa: E402
 from moe import (  # noqa: E402
+    clear_moe_signals,
     AUX_WIDTH,
     EP_SIZE,
     MX_GROUP,
@@ -810,6 +811,7 @@ def l2_prefill_layer_attention(
         attn_pre_mix, x_hc_mid, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens,
         attention_epoch,
     )
+    retire_prefill_signals(x_hc_mid, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     return x_hc_mid, attn_pre_mix, attn_output, attn_input, window_cache, window_cache_scale
 
 @pl.jit
@@ -868,6 +870,7 @@ def l2_prefill_layer_moe(
         ffn_input, ffn_owned, next_pre_mix, ffn_post_mix, ffn_residual_mix,
         num_tokens, rank, rank % TP_SIZE, moe_epoch,
     )
+    clear_moe_signals(ffn_owned, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0))
     return ffn_owned, next_pre_mix, ffn_post_mix, ffn_residual_mix, ffn_input
 
 @pl.jit
@@ -890,9 +893,10 @@ def l2_prefill_layer_restore(
         ffn_output, x_hc_out, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens,
         ffn_epoch,
     )
+    retire_prefill_signals(x_hc_out, ffn_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     return x_hc_out, ffn_output
 
-# EP receive/result windows have no consumed handshake; repeat only in separate dispatches.
+# Completed entries retire signals before the next serialized dispatch.
 @pl.jit.host
 def l3_prefill_layer(
     x_hc: pl.Tensor[[EP_SIZE, TOKENS, HC_MULT, D], pl.FP32],
@@ -1138,8 +1142,8 @@ def build_specs(args, mode, initial_state):
             torch.int32,
             1,
             compile_runtime=True,
-            # Every dispatch runs the layer once; a benchmark advances the epoch per dispatch.
-            benchmark_step=1 if args.bench else None,
+            # Every dispatch retires its communication signals before completion.
+            benchmark_step=None,
         ),
     ]
     return specs
