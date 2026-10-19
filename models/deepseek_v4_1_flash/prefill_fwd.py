@@ -77,7 +77,6 @@ from config import (
     Q_START_DYN,
     STATE_BLOCKS_DYN,
     STATE_CAPACITY,
-    TABLE_DYN,
     MOE_TOKENS,
     ROUTE_T_DYN,
 )
@@ -109,6 +108,8 @@ D = M.hidden_size
 HC_MULT = M.hc_mult
 VOCAB = M.vocab_size
 PAGES = pl.dynamic("V41_PREFILL_HISTORY_PAGES")
+C2A_TABLE_DYN = pl.dynamic("V41_PREFILL_C2A_TABLE")
+C1A_TABLE_DYN = pl.dynamic("V41_PREFILL_C1A_TABLE")
 LOCAL_EXPERTS = C.N_LOCAL_EXPERTS
 RECV_MAX = C.MOE_RECV_MAX
 HC_DIM = M.hc_dim
@@ -164,12 +165,14 @@ def prefill_attention(
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
     ],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    c2a_compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    c1a_compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[
         [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0
     ],
-    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    c2a_index_block_table: pl.Tensor[[B_DYN, C2A_TABLE_DYN], pl.INT32],
+    c1a_index_block_table: pl.Tensor[[B_DYN, C1A_TABLE_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -179,7 +182,7 @@ def prefill_attention(
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    c2a_compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
     index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
@@ -216,10 +219,10 @@ def prefill_attention(
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
             wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
-            compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
-            index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv,
+            compressed_cache_scale, token_to_req_indices, c2a_compressed_lens, index_cache, index_cache_scale,
+            c2a_index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv,
             compressor_wgate, query_start_loc, state_block_table, state_cache, compressor_norm_weight,
-            compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
+            c2a_compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
             index_weights_proj, topk_indices, output_arrived, attention_partial, num_tokens,
             attention_epoch,
         )
@@ -246,8 +249,8 @@ def prefill_attention(
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
             wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
-            compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
-            index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
+            compressed_cache_scale, token_to_req_indices, c1a_compressed_lens, index_cache, index_cache_scale,
+            c1a_index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices, output_window, output_arrived, output, group_base,
             tp_rank, num_tokens, attention_epoch,
             use_candidates=False, scatter_output=False,
@@ -258,8 +261,8 @@ def prefill_attention(
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
             wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
-            compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
-            index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
+            compressed_cache_scale, token_to_req_indices, c1a_compressed_lens, index_cache, index_cache_scale,
+            c1a_index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices, output_window, output_arrived, output, group_base,
             tp_rank, num_tokens, attention_epoch,
             scatter_output=False, use_candidates=True,
@@ -442,12 +445,14 @@ def l2_prefill_fwd(
     publisher_sin: pl.Tensor[[CAPACITY, 32], pl.FP32],
     window_slots: pl.Tensor[[2, CAPACITY], pl.INT64],
     window_indices: pl.Tensor[[2, CAPACITY, 128], pl.INT32],
-    compressed_slots: pl.Tensor[[CAPACITY], pl.INT64],
-    publisher_slots: pl.Tensor[[CAPACITY], pl.INT64],
-    token_requests: pl.Tensor[[2, CAPACITY], pl.INT32],
-    compressed_lens: pl.Tensor[[2, CAPACITY], pl.INT32],
-    query_starts: pl.Tensor[[2, Q_START_DYN], pl.INT32],
-    index_block_tables: pl.Tensor[[2, B_DYN, PAGES], pl.INT32],
+    c2a_compressed_slots: pl.Tensor[[CAPACITY], pl.INT64],
+    c1a_compressed_slots: pl.Tensor[[CAPACITY], pl.INT64],
+    token_to_req_indices: pl.Tensor[[2, CAPACITY], pl.INT32],
+    c2a_compressed_lens: pl.Tensor[[CAPACITY], pl.INT32],
+    c1a_compressed_lens: pl.Tensor[[CAPACITY], pl.INT32],
+    query_start_loc: pl.Tensor[[2, Q_START_DYN], pl.INT32],
+    c2a_index_block_table: pl.Tensor[[B_DYN, C2A_TABLE_DYN], pl.INT32],
+    c1a_index_block_table: pl.Tensor[[B_DYN, C1A_TABLE_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[40, PAGES, 128, 1, 512], pl.FP8E4M3FN]],
     window_scales: pl.InOut[pl.Tensor[[40, PAGES, 128, 1, 16], pl.BF16]],
@@ -484,7 +489,11 @@ def l2_prefill_fwd(
     compressed_cache.bind_dynamic(1, PAGES)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     state_block_table.bind_dynamic(0, B_DYN)
-    query_starts.bind_dynamic(1, Q_START_DYN)
+    c2a_index_block_table.bind_dynamic(0, B_DYN)
+    c2a_index_block_table.bind_dynamic(1, C2A_TABLE_DYN)
+    c1a_index_block_table.bind_dynamic(0, B_DYN)
+    c1a_index_block_table.bind_dynamic(1, C1A_TABLE_DYN)
+    query_start_loc.bind_dynamic(1, Q_START_DYN)
     bank8.bind_dynamic(0, B8)
     bank4.bind_dynamic(0, B4)
     scales8.bind_dynamic(0, S8)
@@ -665,7 +674,7 @@ def l2_prefill_fwd(
                     rms_norm_tiled(encoder_collapsed, attn_norm, encoder_normalized, norm_block, norm_tokens)
                 publisher_ready = prefill_publish_decoder(
                     encoder_normalized, publisher_wkv, compressor_norm, index_wk, index_norm,
-                    publisher_cos, publisher_sin, publisher_slots,
+                    publisher_cos, publisher_sin, c1a_compressed_slots,
                     compressed_cache[3], compressed_scales[3], index_cache[3], index_scales[3],
                     pl.read(counts, [0]),
                 )
@@ -707,11 +716,11 @@ def l2_prefill_fwd(
                 normalized, wq_a, wq_a_scale, q_norm, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm,
                 attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos[rope_slot], rope_sin[rope_slot],
                 window_slots[stage], window_indices[stage], window_cache[layer], window_scales[layer],
-                compressed_cache[cache_slot], compressed_scales[cache_slot], token_requests[stage],
-                compressed_lens[stage], index_cache[cache_slot], index_scales[cache_slot],
-                index_block_tables[stage], position_ids[stage], compressed_cos, compressed_sin,
-                compressor_wkv, compressor_wgate, query_starts[stage], state_block_table, state_cache[state_slot],
-                compressor_norm, compressed_slots, index_wk, index_norm, index_wq_b, index_wq_b_scale,
+                compressed_cache[cache_slot], compressed_scales[cache_slot], token_to_req_indices[stage],
+                c2a_compressed_lens, c1a_compressed_lens, index_cache[cache_slot], index_scales[cache_slot],
+                c2a_index_block_table, c1a_index_block_table, position_ids[stage], compressed_cos, compressed_sin,
+                compressor_wkv, compressor_wgate, query_start_loc[stage], state_block_table, state_cache[state_slot],
+                compressor_norm, c2a_compressed_slots, index_wk, index_norm, index_wq_b, index_wq_b_scale,
                 index_weights, candidate_mask, topk_indices, attention_window, attention_arrived,
                 attn_output, rank, 0, active, layer + 1, mode,
             )
@@ -772,12 +781,14 @@ def l3_prefill_fwd(
     publisher_sin: pl.Tensor[[RANKS, CAPACITY, 32], pl.FP32],
     window_slots: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT64],
     window_indices: pl.Tensor[[RANKS, 2, CAPACITY, 128], pl.INT32],
-    compressed_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
-    publisher_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
-    token_requests: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT32],
-    compressed_lens: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT32],
-    query_starts: pl.Tensor[[RANKS, 2, Q_START_DYN], pl.INT32],
-    index_block_tables: pl.Tensor[[RANKS, 2, B_DYN, PAGES], pl.INT32],
+    c2a_compressed_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
+    c1a_compressed_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
+    token_to_req_indices: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT32],
+    c2a_compressed_lens: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    c1a_compressed_lens: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    query_start_loc: pl.Tensor[[RANKS, 2, Q_START_DYN], pl.INT32],
+    c2a_index_block_table: pl.Tensor[[RANKS, B_DYN, C2A_TABLE_DYN], pl.INT32],
+    c1a_index_block_table: pl.Tensor[[RANKS, B_DYN, C1A_TABLE_DYN], pl.INT32],
     state_block_table: pl.Tensor[[RANKS, B_DYN, 1], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[RANKS, 40, PAGES, 128, 1, 512], pl.FP8E4M3FN]],
     window_scales: pl.InOut[pl.Tensor[[RANKS, 40, PAGES, 128, 1, 16], pl.BF16]],
@@ -806,12 +817,23 @@ def l3_prefill_fwd(
 
     embedding holds caller-gathered BF16 rows; embedding_ids indexes that
     rank-local slab, not the model vocabulary. initial_pre is the current
-    rows' delayed mix (identity for new tokens). Stage axes are encoder,
-    decoder; index_block_tables instead has family order C2A, C1A. Token RoPE
-    profiles are encoder base, encoder compressed, decoder compressed.
+    rows' delayed mix (identity for new tokens). position_ids, window_slots,
+    window_indices, token_to_req_indices and query_start_loc have stage order
+    encoder, decoder. Each stage has packed query_start_loc and absolute
+    position_ids; token_to_req_indices indexes request-table rows.
+    C2A/C1A index_block_table arguments have independent widths and source-local
+    physical page IDs. KV and index keys share their family's mapping. Pages
+    contain 128 stored rows: 256 original tokens for C2A, 128 for C1A/SWA.
+    c2a_compressed_lens follows encoder rows; c1a_compressed_lens follows decoder
+    replay rows. Each is floor((position+1)/ratio), including completed current
+    groups. Token RoPE profiles are encoder base, encoder compressed, decoder compressed.
     compressed_cos/sin rotates completed C2A pairs at their group-first
     position; publisher_cos/sin rotates C1A keys at their token position.
-    compressed_slots publishes C2A rows and publisher_slots publishes C1A.
+    c2a_compressed_slots and c1a_compressed_slots both follow encoder rows;
+    C1A publishes all encoder rows before decoder replay selection. Slots are
+    source-local physical rows; -1 disables publication. C2A publishes only at
+    completed pair positions. state_block_table maps requests to source-local
+    state blocks shared across three independent C2A source slices; -1 is inactive.
     logit_rows indexes the decoder replay slab; -1 disables that output row.
 
     Preserve all seven InOut cache tensors across chunks and decode. Their
@@ -831,7 +853,11 @@ def l3_prefill_fwd(
     compressed_cache.bind_dynamic(2, PAGES)
     state_cache.bind_dynamic(2, STATE_BLOCKS_DYN)
     state_block_table.bind_dynamic(1, B_DYN)
-    query_starts.bind_dynamic(2, Q_START_DYN)
+    c2a_index_block_table.bind_dynamic(1, B_DYN)
+    c2a_index_block_table.bind_dynamic(2, C2A_TABLE_DYN)
+    c1a_index_block_table.bind_dynamic(1, B_DYN)
+    c1a_index_block_table.bind_dynamic(2, C1A_TABLE_DYN)
+    query_start_loc.bind_dynamic(2, Q_START_DYN)
     recv_meta_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
@@ -891,12 +917,12 @@ def l3_prefill_fwd(
             publisher_sin[rank],
             window_slots[rank],
             window_indices[rank],
-            compressed_slots[rank],
-            publisher_slots[rank],
-            token_requests[rank],
-            compressed_lens[rank],
-            query_starts[rank],
-            index_block_tables[rank],
+            c2a_compressed_slots[rank],
+            c1a_compressed_slots[rank],
+            token_to_req_indices[rank],
+            c2a_compressed_lens[rank], c1a_compressed_lens[rank],
+            query_start_loc[rank],
+            c2a_index_block_table[rank], c1a_index_block_table[rank],
             state_block_table[rank],
             window_cache[rank],
             window_scales[rank],
@@ -958,12 +984,12 @@ PREFILL_TENSORS = (
     "publisher_sin",
     "window_slots",
     "window_indices",
-    "compressed_slots",
-    "publisher_slots",
-    "token_requests",
-    "compressed_lens",
-    "query_starts",
-    "index_block_tables",
+    "c2a_compressed_slots",
+    "c1a_compressed_slots",
+    "token_to_req_indices",
+    "c2a_compressed_lens", "c1a_compressed_lens",
+    "query_start_loc",
+    "c2a_index_block_table", "c1a_index_block_table",
     "state_block_table",
     "window_cache",
     "window_scales",

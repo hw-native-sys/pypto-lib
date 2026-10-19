@@ -685,7 +685,7 @@ def decode_cache_views(cache_state: Mapping[str, torch.Tensor]) -> dict[str, tor
         if value.ndim not in (5, 6) or not value.is_contiguous():
             raise ValueError(f"{name} must preserve the contiguous native source/page layout")
         sources = M.num_hidden_layers if name.startswith("window") else len(M.kv_source_layer_ids)
-        if value.shape[-5] != sources or tuple(value.shape[-3:-1]) != (BLOCK_SIZE, 1):
+        if value.shape[-5] != sources or value.shape[-4] < 1 or tuple(value.shape[-3:-1]) != (BLOCK_SIZE, 1):
             raise ValueError(f"{name} has an incompatible source or page geometry")
         expected_dtype = {
             "window_cache": torch.float8_e4m3fn, "window_scales": torch.bfloat16,
@@ -705,6 +705,8 @@ def decode_cache_views(cache_state: Mapping[str, torch.Tensor]) -> dict[str, tor
         reference = cache_state["window_cache"]
         if value.shape[:-5] != reference.shape[:-5] or value.shape[-4] != reference.shape[-4]:
             raise ValueError("all prefill cache pools must preserve the same rank and page extents")
+        if value.device != reference.device:
+            raise ValueError("all cache payloads and scales must reside on the same device")
         values[destination] = value.flatten(-5, -4)
     state = cache_state["state_cache"]
     if state.ndim not in (4, 5) or not state.is_contiguous():
@@ -715,14 +717,79 @@ def decode_cache_views(cache_state: Mapping[str, torch.Tensor]) -> dict[str, tor
         raise ValueError("state_cache must preserve the cache pools' rank extent")
     if state.dtype != torch.float32:
         raise ValueError("state_cache must retain FP32 compressor state")
+    if state.device != cache_state["window_cache"].device:
+        raise ValueError("state_cache must reside on the cache pools' device")
     values["state_cache_pool"] = state.flatten(-4, -3)
     return values
+
+
+def bind_forward_caches(
+    cache_state: Mapping[str, torch.Tensor],
+    window_block_table: torch.Tensor,
+    compressed_block_tables: Mapping[int, torch.Tensor],
+    state_block_tables: Mapping[int, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Validate rank-local page/state addresses and alias native forward storage.
+
+    Tables are CPU INT32 tensors with source-local physical IDs; -1 is an
+    unallocated entry. Compressed KV and index keys share each source's page
+    table. C2A sources share one table, C1A has its own, and all state sources
+    share one request-slot mapping. Returned pools share the original storage.
+    Bind each rank separately before stacking metadata for the L3 entry.
+    Each payload page contains BLOCK_SIZE stored rows. State block zero is
+    valid; -1 disables the request's state mapping.
+    """
+    pools = decode_cache_views(cache_state)
+    if cache_state["window_cache"].ndim != 5:
+        raise ValueError("bind_forward_caches requires one rank's native cache tensors")
+    if window_block_table.ndim != 2:
+        raise ValueError("window block table must be a matrix")
+    requests = window_block_table.shape[0]
+    pages = cache_state["window_cache"].shape[1]
+    state_blocks = cache_state["state_cache"].shape[1]
+
+    def validate_table(name, table, capacity, state=False):
+        if table.device.type != "cpu" or table.dtype != torch.int32:
+            raise ValueError(f"{name} must be a CPU INT32 tensor")
+        if table.ndim != 2 or table.shape[0] != requests or (state and table.shape[1] != 1):
+            raise ValueError(f"{name} has incompatible request or table dimensions")
+        if bool(((table < -1) | (table >= capacity)).any()):
+            raise ValueError(f"{name} IDs must be -1 or within the source-local capacity {capacity}")
+        if state:
+            allocated = table[table >= 0]
+            if allocated.unique().numel() != allocated.numel():
+                raise ValueError("live requests must own distinct state blocks")
+
+    validate_table("window block table", window_block_table, pages)
+    family_tables = {}
+    shared_state = None
+    for source in M.kv_source_layer_ids:
+        if source not in compressed_block_tables:
+            raise ValueError(f"missing compressed block table for source layer {source}")
+        table = compressed_block_tables[source]
+        validate_table(f"source {source} compressed block table", table, pages)
+        ratio = M.compress_ratios[source]
+        family_table = family_tables.setdefault(ratio, table)
+        if not torch.equal(table, family_table):
+            raise ValueError("sources in one family must share local physical page IDs")
+        if ratio > 1:
+            if source not in state_block_tables:
+                raise ValueError(f"missing state block table for source layer {source}")
+            state_table = state_block_tables[source]
+            validate_table(f"source {source} state block table", state_table, state_blocks, state=True)
+            if shared_state is None:
+                shared_state = state_table
+            elif not torch.equal(state_table, shared_state):
+                raise ValueError("C2A sources must share request slots within their separate state pools")
+    return pools
 
 
 def decode_forward_metadata(
     metadata: ForwardMetadata,
     compressed_block_tables: Mapping[int, torch.Tensor],
     *,
+    cache_state: Mapping[str, torch.Tensor],
+    window_block_table: torch.Tensor,
     max_seq_len: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Pack one TP1 rank's independent C2A/C1A metadata for ``l3_decode_fwd``.
@@ -735,12 +802,24 @@ def decode_forward_metadata(
     most 72 active rows. Padding is distinct from the per-rank active count.
     Page allocation, request ownership and advancing committed sequence
     lengths after completion remain the caller's responsibility.
+
+    Bind the retained native cache tensors and their page tables before
+    lowering. Positive physical IDs must fit the actual payload/scale and
+    state allocations, including entries beyond the current visible prefix.
     """
+    bind_forward_caches(cache_state, window_block_table, compressed_block_tables, metadata.state_block_tables)
+    if metadata.kv_seq_lens.numel() != window_block_table.shape[0]:
+        raise ValueError("cache tables must cover the metadata request slots")
+    cache_row_capacity = cache_state["window_cache"].shape[1] * BLOCK_SIZE
+    slot_vectors = [metadata.window_slots, metadata.window_indices]
+    slot_vectors.extend(metadata.compressed_slots[source] for source in M.kv_source_layer_ids)
+    slot_vectors.extend(metadata.index_slots[source] for source in M.kv_source_layer_ids)
+    for slots in slot_vectors:
+        if bool(((slots < -1) | (slots >= cache_row_capacity)).any()):
+            raise ValueError("metadata physical rows exceed the bound source-local cache capacity")
     sources = tuple(next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == ratio)
                     for ratio in (2, 1))
     tables = [compressed_block_tables[source] for source in sources]
-    if tables[0].shape[0] != tables[1].shape[0]:
-        raise ValueError("both compressed families must describe the same request slots")
     count = metadata.position_ids.numel()
     if TP_SIZE != 1:
         raise ValueError("decode_forward_metadata packs TP1 rank-local rows")
@@ -765,7 +844,6 @@ def decode_forward_metadata(
         "compressed_token_rope_sin": compressed[1][token_rows],
         "window_slots": metadata.window_slots,
         "window_indices": metadata.window_indices,
-        "request_ids": metadata.token_to_req_indices,
         "token_to_req_indices": metadata.token_to_req_indices,
         "position_ids": metadata.position_ids,
         "c2a_rope_cos": compressed[0][pair_rows.clamp_min(0)],
@@ -779,13 +857,6 @@ def decode_forward_metadata(
         values[family + "_compressed_lens"] = metadata.compressed_lens[source]
         values[family + "_compressed_slots"] = metadata.compressed_slots[source]
         values[family + "_index_block_table"] = table
-    for source in M.kv_source_layer_ids:
-        family = 0 if M.compress_ratios[source] == 2 else 1
-        if not torch.equal(compressed_block_tables[source], tables[family]):
-            raise ValueError("sources in one family must share local physical page IDs")
-        if M.compress_ratios[source] == 2:
-            if not torch.equal(metadata.state_block_tables[source], values["state_block_table"]):
-                raise ValueError("C2A sources must share request slots within their separate state pools")
     for name in ("base_rope_cos", "base_rope_sin", "compressed_token_rope_cos",
                  "compressed_token_rope_sin", "c2a_rope_cos", "c2a_rope_sin",
                  "c2a_compressed_lens", "c1a_compressed_lens",
@@ -795,7 +866,7 @@ def decode_forward_metadata(
         padded = torch.full((row_capacity, *value.shape[1:]), fill, dtype=value.dtype)
         padded[:count] = value
         values[name] = padded
-    for name in ("window_slots", "window_indices", "request_ids", "token_to_req_indices", "position_ids"):
+    for name in ("window_slots", "window_indices", "token_to_req_indices", "position_ids"):
         value = values[name]
         padded = torch.full((row_capacity, *value.shape[1:]), -1, dtype=value.dtype)
         padded[:count] = value
@@ -1240,7 +1311,12 @@ def prepare_prefill_inputs(
     data_pages = (max_seq_len + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
     pages = data_pages + 1
     table = torch.arange(data_pages, dtype=torch.int32).reshape(1, -1)
-    compressed_tables = {source: table for source in M.kv_source_layer_ids}
+    c2a_pages = max(1, (max_seq_len // 2 + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE)
+    c2a_table = torch.arange(c2a_pages, dtype=torch.int32).reshape(1, -1)
+    compressed_tables = {
+        source: c2a_table if M.compress_ratios[source] == 2 else table
+        for source in M.kv_source_layer_ids
+    }
     state_table = torch.zeros((1, 1), dtype=torch.int32)
     state_tables = {
         source: state_table
@@ -1284,8 +1360,6 @@ def prepare_prefill_inputs(
     )
     initial_pre = torch.zeros((capacity, M.hc_mult), dtype=torch.float32)
     initial_pre[:, 0] = 1.0
-    index_tables = torch.full((2, 1, pages), -1, dtype=torch.int32)
-    index_tables[:, :, :data_pages] = table
     logit_rows = torch.full((16,), -1, dtype=torch.int32)
     logit_rows[0] = decoder_count - 1
     window_shape = (M.num_hidden_layers, pages, C.BLOCK_SIZE, 1)
@@ -1319,12 +1393,14 @@ def prepare_prefill_inputs(
         "publisher_sin": encoder_compressed[1],
         "window_slots": torch.stack((pad(encoder.window_slots, -1), pad(decoder.window_slots, -1))),
         "window_indices": torch.stack((pad(encoder.window_indices, -1), pad(decoder.window_indices, -1))),
-        "compressed_slots": pad(encoder.compressed_slots[c2_source], -1),
-        "publisher_slots": pad(encoder.compressed_slots[publisher_source], -1),
-        "token_requests": torch.stack((pad(encoder.token_to_req_indices, -1), pad(decoder.token_to_req_indices, -1))),
-        "compressed_lens": torch.stack((pad(encoder.compressed_lens[c2_source]), pad(decoder.compressed_lens))),
-        "query_starts": torch.stack((encoder.query_start_loc, decoder.query_start_loc.int())),
-        "index_block_tables": index_tables,
+        "c2a_compressed_slots": pad(encoder.compressed_slots[c2_source], -1),
+        "c1a_compressed_slots": pad(encoder.compressed_slots[publisher_source], -1),
+        "token_to_req_indices": torch.stack((pad(encoder.token_to_req_indices, -1), pad(decoder.token_to_req_indices, -1))),
+        "c2a_compressed_lens": pad(encoder.compressed_lens[c2_source]),
+        "c1a_compressed_lens": pad(decoder.compressed_lens),
+        "query_start_loc": torch.stack((encoder.query_start_loc, decoder.query_start_loc.int())),
+        "c2a_index_block_table": c2a_table,
+        "c1a_index_block_table": table,
         "state_block_table": state_table,
         "window_cache": native_cache("window_cache", (*window_shape, M.head_dim), torch.float8_e4m3fn),
         "window_scales": native_cache(
@@ -1343,6 +1419,7 @@ def prepare_prefill_inputs(
         ),
         "logit_rows": logit_rows,
     }
+    bind_forward_caches(values, table, compressed_tables, state_tables)
     return values
 
 
