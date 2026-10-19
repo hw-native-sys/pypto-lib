@@ -347,7 +347,7 @@ result = run(
     specs=build_tensor_specs(),
     golden_fn=golden_moe,
     config=dict(
-        platform=args.platform,
+        backend_type=args.backend_type, execution_mode=args.execution_mode,
         distributed_config=DistributedConfig(device_ids=device_ids),
     ),
 )

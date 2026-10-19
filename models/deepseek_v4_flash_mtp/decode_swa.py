@@ -410,8 +410,8 @@ if __name__ == "__main__":
     from utils import parse_start_pos_arg
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--start-pos", type=str, default=None,
                         help="Fixture start_pos: one value for every request or a comma-separated per-request list; "
@@ -430,7 +430,8 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

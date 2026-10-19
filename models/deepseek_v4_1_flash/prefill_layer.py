@@ -1166,7 +1166,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=f"DeepSeek V4.1 prefill layer ({mode} attention + EP MoE): A5 precision"
     )
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through EP-1")
     # TP4 needs eight cards and has not been validated.
     parser.add_argument("--tp", type=int, default=LAYER_TP, choices=[1, 2])
@@ -1181,6 +1182,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
 
     # Parallel sizes and MoE shapes were frozen from the same command line before argparse ran.
     if (args.tp, args.dp, args.ep, args.tokens) != (TP_SIZE, DP_SIZE, EP_SIZE, MOE_TOKENS):
@@ -1208,7 +1211,8 @@ if __name__ == "__main__":
         golden_fn=make_layer_golden(mode),
         compile_only=args.compile_only,
         config=dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
             ring_heap=LAYER_RING_HEAP,
         ),

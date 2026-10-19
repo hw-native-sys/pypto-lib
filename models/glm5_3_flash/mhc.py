@@ -582,7 +582,8 @@ def main():
     run_mhc_goldens(golden_mhc_mixes, golden_mhc_pre, golden_mhc_post, golden_mhc_head)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tokens", type=int, default=20)
     parser.add_argument("--compile-only", action="store_true")
@@ -607,7 +608,7 @@ def main():
             fn=fn,
             specs=specs,
             golden_fn=golden_fn,
-            config={"platform": args.platform, "device_id": args.device},
+            config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
             rtol=1.0 / 128,
             atol=1e-4,
             compare_fn=(

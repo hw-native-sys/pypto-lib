@@ -148,7 +148,8 @@ if __name__ == "__main__":
     TEST_VOCAB_SIZE = 4096
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 DSpark Markov-head validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--token-count", type=int, default=DECODE_BATCH // TP)
     parser.add_argument("--vocab-size", type=int, default=TEST_VOCAB_SIZE)
@@ -162,7 +163,8 @@ if __name__ == "__main__":
         golden_fn=golden_markov_head,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

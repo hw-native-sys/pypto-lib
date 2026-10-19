@@ -333,7 +333,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description="Standalone context-parallel zigzag exchange test.")
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(CP_SIZE)))
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=CP_CHOICES)
     parser.add_argument("--compile-only", action="store_true")
@@ -352,7 +353,8 @@ if __name__ == "__main__":
         compile_only=args.compile_only,
         config=dict(
             distributed_config=DistributedConfig(device_ids=device_ids[:args.cp], num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
         ),
         rtol=0.0,
         atol=0.0,

@@ -118,7 +118,8 @@ result = run(
     specs=build_specs(),
     golden_fn=golden_hello_world,
     config={
-        "platform": args.platform,
+        "backend_type": args.backend_type,
+        "execution_mode": args.execution_mode,
         "device_id": args.device,
     },
     rtol=1e-5,
@@ -134,7 +135,8 @@ result = run(
     specs=build_specs(),
     golden_fn=golden_fn,
     config={
-        "platform": args.platform,
+        "backend_type": args.backend_type,
+        "execution_mode": args.execution_mode,
         "device_id": args.device,
     },
 )
@@ -234,6 +236,19 @@ New configurations can select `backend_type` (`BackendType.Ascend910B` or
 `ExecutionMode.SIM`) separately. Import `BackendType` from `pypto.backend` and
 `ExecutionMode` from `pypto.runtime`. The harness passes these choices through
 `RunConfig` and uses both when reloading saved builds.
+
+Dictionary configurations also accept `backend_type="a2a3"` or `"a5"`
+and `execution_mode=True` (simulator) or `False` (hardware). The harness
+converts these CLI values to PyPTO enums before constructing `RunConfig`.
+For example, entry scripts can define:
+
+```python
+parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+parser.add_argument("--sim", dest="execution_mode", action="store_true")
+```
+
+Then pass `backend_type=args.backend_type` and
+`execution_mode=args.execution_mode` in the run configuration.
 
 Existing `platform` configurations and `-p` command-line arguments remain
 supported. PyPTO retains the derived platform string in cache keys and artifact

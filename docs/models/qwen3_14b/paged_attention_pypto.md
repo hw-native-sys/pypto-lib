@@ -688,7 +688,7 @@ structure, and finally run on a real NPU.
 ```bash title="Example checks · run from the repository root"
 # First: compile the mixed kernel on the simulator.
 python models/qwen3_14b/test_paged_attention_pypto.py \
-  -p a2a3sim --compile-only --batch 2 --seq-lens 128,129
+  -p a2a3 --sim --compile-only --batch 2 --seq-lens 128,129
 
 # Then: run one non-identity mapping on NPU device 0.
 python models/qwen3_14b/test_paged_attention_pypto.py \

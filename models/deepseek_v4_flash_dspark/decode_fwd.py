@@ -2021,7 +2021,8 @@ def main():
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 D-Spark decode-forward integration")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=_TP_CHOICES)
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=_EP_CHOICES)
     parser.add_argument(
@@ -2097,7 +2098,8 @@ def main():
             distributed_config=DistributedConfig(
                 device_ids=device_ids, num_sub_workers=0,
             ),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_scope_stats=args.enable_scope_stats,
             enable_chip_swimlane=args.enable_chip_swimlane,
             log_level=args.log_level,

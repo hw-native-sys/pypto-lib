@@ -1507,7 +1507,8 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=("decode", "prefill"), default="decode")
     parser.add_argument("--tp", type=int, choices=_TP_CHOICES, default=TP_SIZE)
     parser.add_argument("--ep", type=int, choices=_EP_CHOICES, default=N_RANKS)
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)))
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
@@ -1525,7 +1526,8 @@ if __name__ == "__main__":
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             ring_heap=_DSPARK_RING_HEAP,
         ),
         rtol=1e-3,

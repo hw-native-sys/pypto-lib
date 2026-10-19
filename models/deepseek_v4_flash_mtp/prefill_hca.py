@@ -1817,7 +1817,8 @@ def golden_prefill_cp_hca(tensors):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 context-parallel HCA test.")
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(CP_SIZE)))
     parser.add_argument("--cp", type=int, default=CP_SIZE, choices=list(CP_CHOICES))
     parser.add_argument("--num-tokens", type=int, default=None, help="actual request length; defaults to full capacity")
@@ -1846,7 +1847,8 @@ if __name__ == "__main__":
         config=dict(
             distributed_config=DistributedConfig(device_ids=device_ids[: args.cp], num_sub_workers=0),
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_dep_gen=args.enable_dep_gen,
             ring_heap=PREFILL_CP_HCA_RING_HEAP,

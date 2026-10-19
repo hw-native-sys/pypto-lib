@@ -749,7 +749,8 @@ def golden_mtp_prefill_fwd(tensors):
 
 def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP packed-prefill forward driver.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument(
         "--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
         help="EP world size / rank count (parsed at import by prefill_moe).",
@@ -776,6 +777,8 @@ def main():
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
 
     print(f"[RUN] output_mode={args.output_mode}", flush=True)
 
@@ -797,7 +800,8 @@ def main():
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
         ),

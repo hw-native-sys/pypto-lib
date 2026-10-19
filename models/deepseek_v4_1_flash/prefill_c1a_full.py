@@ -737,7 +737,7 @@ def validate_c1a_sp(mode, args, fn, reference):
         golden_fn=common.make_golden(mode, attention_reference=functools.partial(c1a_sp_reference_attention, reference=reference), state_names=STATE_NAMES[mode]),
         compare_fn=make_c1a_sp_compare(mode, initial_state, len(devices), fixture_tokens),
         compile_only=args.compile_only,
-        config=dict(platform=args.platform, distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0)),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0)),
     )
 
 
@@ -1109,7 +1109,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C1A full with mHC validation")
-    parser.add_argument("-p", "--platform", default="a5", choices=("a5", "a5sim"))
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=None)
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=(1, 2, 4))
     parser.add_argument("--seed", type=int, default=17)
@@ -1153,7 +1154,7 @@ if __name__ == "__main__":
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         config={
-            "platform": args.platform,
+            "backend_type": args.backend_type, "execution_mode": args.execution_mode,
             "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),
             "dump_passes": args.dump_passes,
             "enable_chip_swimlane": args.enable_chip_swimlane,

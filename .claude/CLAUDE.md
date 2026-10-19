@@ -81,7 +81,7 @@ script's `--help` and the [platform guide](../docs/get-started/first-kernel.md)
 before running it. Common commands from the repository root:
 
 ```bash
-python examples/beginner/hello_world.py -p a2a3sim
+python examples/beginner/hello_world.py -p a2a3 --sim
 python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
 python -m pytest tests/golden -v
 python tests/lint/check_headers.py

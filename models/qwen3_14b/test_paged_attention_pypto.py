@@ -826,7 +826,7 @@ def _write_json_atomic(path: Path, value: object) -> None:
 
 def _run_case(case: DynamicCase, args: argparse.Namespace) -> dict[str, object]:
     _validate_case(case)
-    compile_only = args.compile_only or args.platform.endswith("sim")
+    compile_only = args.compile_only or args.execution_mode
     fixture = None if compile_only else make_fixture(case)
     result = run(
         fn=paged_attention_pypto_dynamic,
@@ -834,7 +834,8 @@ def _run_case(case: DynamicCase, args: argparse.Namespace) -> dict[str, object]:
         golden_fn=None if fixture is None else lambda values: golden_attention(values, case),
         config=dict(
             dump_passes=True,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
         ),
         compile_only=compile_only,
@@ -866,7 +867,7 @@ def _run_case(case: DynamicCase, args: argparse.Namespace) -> dict[str, object]:
         "execution_time_seconds": result.execution_time,
     }
     if args.benchmark_json is not None:
-        report["benchmark"] = _raw_benchmark(result, case, args.platform, args.device)
+        report["benchmark"] = _raw_benchmark(result, case, args.backend_type + ("sim" if args.execution_mode else ""), args.device)
         _write_json_atomic(args.benchmark_json, report["benchmark"])
     print(
         f"[test_paged_attention_pypto] case={case.name} status={report['status']} work_dir={result.work_dir}"
@@ -876,11 +877,11 @@ def _run_case(case: DynamicCase, args: argparse.Namespace) -> dict[str, object]:
 
 def _run_matrix(args: argparse.Namespace) -> dict[str, object]:
     cases = matrix_cases(args.matrix)
-    compile_only = args.compile_only or args.platform.endswith("sim")
+    compile_only = args.compile_only or args.execution_mode
     report: dict[str, object] = {
         "schema": MATRIX_SCHEMA,
         "matrix": args.matrix,
-        "platform": args.platform,
+        "platform": args.backend_type + ("sim" if args.execution_mode else ""),
         "device": args.device,
         "compile_only": compile_only,
         "declared_case_count": len(cases),
@@ -952,7 +953,8 @@ def _case_from_args(args: argparse.Namespace) -> DynamicCase:
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-p", "--platform", choices=("a2a3", "a2a3sim"), default="a2a3")
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=2)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--matrix", choices=("pr", "full"))
@@ -987,7 +989,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.matrix_json is not None and args.matrix is None:
         parser.error("--matrix-json requires --matrix")
     if args.benchmark_json is not None:
-        if args.matrix is not None or args.compile_only or args.platform.endswith("sim"):
+        if args.matrix is not None or args.compile_only or args.execution_mode:
             parser.error("--benchmark-json requires one real-device case")
         if os.environ.get("PYPTO_BENCH", "").strip() in ("", "0", "false", "False"):
             parser.error("--benchmark-json requires PYPTO_BENCH=1")

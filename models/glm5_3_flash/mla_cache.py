@@ -151,7 +151,8 @@ def main():
     run_mla_cache_golden(golden_mla_cache_write)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tokens", type=int, default=24)
     parser.add_argument("--pages", type=int, default=4)
@@ -162,7 +163,7 @@ def main():
         fn=mla_cache_write_test,
         specs=build_mla_cache_tensor_specs(args.tokens, args.pages),
         golden_fn=golden_mla_cache_case,
-        config={"platform": args.platform, "device_id": args.device},
+        config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
         rtol=0.0,
         atol=0.0,
         compile_only=args.compile_only,

@@ -1745,7 +1745,8 @@ def main():
     from utils import parse_start_pos_arg
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 Flash packed single-token decode forward driver.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8], help="EP world size / rank count (parsed at import by decode_moe)")
     parser.add_argument("--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8, 16], help="LM-head TP world size; must be <= --ep")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")
@@ -1773,6 +1774,8 @@ def main():
                              "requires an unchanged spec set.")
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
     assert args.tp <= args.ep, f"decode_fwd device lm_head requires --tp <= --ep, got tp={args.tp}, ep={args.ep}"
     assert args.ep % args.tp == 0, (
         f"grouped LM head needs --ep % --tp == 0, got ep={args.ep}, tp={args.tp}"
@@ -1807,7 +1810,8 @@ def main():
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
         ),

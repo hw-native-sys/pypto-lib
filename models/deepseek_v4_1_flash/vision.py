@@ -546,12 +546,17 @@ class VisionEncoder:
     """
 
     def __init__(self, cfg=VisionConfig(), *, run_config=None):
-        from pypto.runtime import RunConfig
+        from pypto.backend import BackendType
+        from pypto.runtime import ExecutionMode, RunConfig
 
         self.cfg = cfg
         self.program = make_vision_program(cfg)
-        self.run_config = (RunConfig(**run_config) if isinstance(run_config, dict)
-                           else run_config or RunConfig(platform="a5"))
+        if isinstance(run_config, dict):
+            self.run_config = RunConfig(**run_config)
+        elif run_config is not None:
+            self.run_config = run_config
+        else:
+            self.run_config = RunConfig(backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD)
 
     def __call__(self, patches, weights, n_h, n_w):
         if n_h < 1 or n_w < 1:
@@ -730,7 +735,8 @@ if __name__ == "__main__":
     from golden import ScalarSpec, TensorSpec, run
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--grid", default="4,5", help="Patch grid height,width")
     parser.add_argument("--checkpoint", type=Path)
@@ -773,7 +779,7 @@ if __name__ == "__main__":
 
     result = run(make_vision_program(cfg), specs, golden_fn=golden,
                  compare_fn=validation_comparators(cfg),
-                 config={"platform": args.platform, "device_id": args.device, "ring_heap": args.ring_heap},
+                 config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device, "ring_heap": args.ring_heap},
                  compile_only=args.compile_only, save_data=args.save_data,
                  golden_data=args.golden_data, runtime_dir=args.runtime_dir)
     if not result.passed:

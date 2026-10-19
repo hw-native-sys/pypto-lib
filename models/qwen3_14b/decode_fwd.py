@@ -1837,13 +1837,8 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-p",
-        "--platform",
-        type=str,
-        default="a2a3",
-        choices=PA_SUPPORTED_PLATFORMS,
-    )
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument(
         "--enable-chip-swimlane",
@@ -1972,7 +1967,7 @@ if __name__ == "__main__":
         ):
             parser.error(f"--seq-lens must contain {expected_seq_lens} values in [1, {MAX_SEQ}]")
 
-    set_backend_type(_backend_type(args.platform))
+    set_backend_type(_backend_type(args.backend_type))
 
     # The default golden drives a one-layer decode_fwd_layers chunk.  The smoke
     # instead traces the production dynamic decode_fwd entry for one layer.
@@ -1985,12 +1980,12 @@ if __name__ == "__main__":
     # production dynamic entry at B17, not the static B16 layer harness: the
     # second one-row window exercises the same sliced block-table shapes used by
     # serving.  `.lower()` alone does not exercise kernel-wrapper extraction.
-    if args.smoke or args.platform.endswith("sim"):
+    if args.smoke or args.execution_mode:
         compiled = decode_fwd.compile(
             *_decode_smoke_inputs(),
             config=RunConfig(
-                backend_type=BackendType.Ascend950 if args.platform.startswith("a5") else BackendType.Ascend910B,
-                execution_mode=ExecutionMode.SIM if args.platform.endswith("sim") else ExecutionMode.ONBOARD,
+                backend_type=BackendType.Ascend950 if args.backend_type.startswith("a5") else BackendType.Ascend910B,
+                execution_mode=ExecutionMode.SIM if args.execution_mode else ExecutionMode.ONBOARD,
             ),
         )
         print(f"Compiled dynamic B{BATCH_PAD + 1} decode smoke: {compiled.output_dir}")
@@ -2008,7 +2003,7 @@ if __name__ == "__main__":
         )
         specs = _build_specs(inputs)
         print(
-            f"[decode_fwd] single-layer golden unit test | platform={args.platform} "
+            f"[decode_fwd] single-layer golden unit test | platform={args.backend_type} "
             f"device={args.device} seq={'MAX' if args.max_seq else 'varied'} seed={args.seed} "
             f"seq_lens={inputs['seq_lens'].tolist()}"
         )
@@ -2024,7 +2019,8 @@ if __name__ == "__main__":
                 dump_passes=False,
                 save_kernels=args.dep_output_dir is not None,
                 save_kernels_dir=str(args.dep_output_dir.resolve()) if args.dep_output_dir is not None else None,
-                platform=args.platform,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
                 device_id=args.device,
                 enable_chip_swimlane=args.enable_chip_swimlane,
                 enable_dep_gen=args.enable_dep_gen,
@@ -2063,8 +2059,8 @@ if __name__ == "__main__":
     # dropped") on the full 40-layer --max-seq graph, so capture with a small
     # --fwd-layers.
     run_cfg = RunConfig(
-        backend_type=BackendType.Ascend950 if args.platform.startswith("a5") else BackendType.Ascend910B,
-        execution_mode=ExecutionMode.SIM if args.platform.endswith("sim") else ExecutionMode.ONBOARD,
+        backend_type=BackendType.Ascend950 if args.backend_type.startswith("a5") else BackendType.Ascend910B,
+        execution_mode=ExecutionMode.SIM if args.execution_mode else ExecutionMode.ONBOARD,
         device_id=args.device,
         enable_chip_swimlane=args.enable_chip_swimlane,
         enable_dep_gen=args.enable_dep_gen,

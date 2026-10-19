@@ -30,11 +30,11 @@ Follow the
 run a beginner example:
 
 ```bash
-python examples/beginner/hello_world.py -p a2a3sim   # simulator
+python examples/beginner/hello_world.py -p a2a3 --sim   # simulator
 python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0   # real NPU, device 0
 ```
 
-The learning examples accept `-p {a2a3,a2a3sim,a5,a5sim}` and exit non-zero
+The learning examples accept `-p {a2a3,a5} [--sim]` and exit non-zero
 on validation mismatch. Model and distributed entry points have
 script-specific platform and device arguments; inspect `--help` and the
 [platform table](docs/get-started/first-kernel.md#platforms-and-devices). See the

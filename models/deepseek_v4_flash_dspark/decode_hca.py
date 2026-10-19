@@ -1342,7 +1342,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES), help="tensor-parallel world size")
     parser.add_argument(
         "-d", "--device", type=str, default=None,
@@ -1403,7 +1404,8 @@ if __name__ == "__main__":
                 compile_only=args.compile_only,
                 config=dict(
                     dump_passes=args.dump_passes,
-                    platform=args.platform,
+                    backend_type=args.backend_type,
+                    execution_mode=args.execution_mode,
                     device_id=device_ids[0],
                     enable_chip_swimlane=args.enable_chip_swimlane,
                 ),
@@ -1430,8 +1432,8 @@ if __name__ == "__main__":
             )
         else:
             # The A2A3 simulator's distributed O path uses the CSA-level threshold and near-zero cap.
-            full_x_out_diff_thd = 4e-3 if args.platform == "a2a3sim" else 3e-3
-            full_x_out_max_diff = 2 if args.platform == "a2a3sim" else 1
+            full_x_out_diff_thd = 4e-3 if (args.backend_type == "a2a3" and args.execution_mode) else 3e-3
+            full_x_out_max_diff = 2 if (args.backend_type == "a2a3" and args.execution_mode) else 1
             mapping_shape = (TP_SIZE, local_t)
             full_mapping_shape = (TP_SIZE, TP_SIZE * local_t)
             result = run(
@@ -1444,7 +1446,8 @@ if __name__ == "__main__":
                 config=dict(
                     dump_passes=args.dump_passes,
                     distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-                    platform=args.platform,
+                    backend_type=args.backend_type,
+                    execution_mode=args.execution_mode,
                     enable_chip_swimlane=args.enable_chip_swimlane,
                 ),
                 rtol=1e-3,

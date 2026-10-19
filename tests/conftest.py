@@ -106,6 +106,10 @@ def _install_pypto_stubs() -> None:
             execution_mode=ExecutionMode.SIM, **kwargs,
         ):
             if platform is None:
+                if not isinstance(backend_type, BackendType):
+                    raise TypeError("backend_type must be a BackendType")
+                if not isinstance(execution_mode, ExecutionMode):
+                    raise TypeError("execution_mode must be an ExecutionMode")
                 arch = "a5" if backend_type == BackendType.Ascend950 else "a2a3"
                 platform = arch + ("sim" if execution_mode is ExecutionMode.SIM else "")
             if platform not in _PLATFORM_BACKEND:
@@ -131,7 +135,8 @@ def _install_pypto_stubs() -> None:
         def compile_kwargs(self):
             """The subset of fields the real RunConfig maps onto ir.compile."""
             kwargs = {
-                "platform": self.platform,
+                "backend_type": self.backend_type,
+                "execution_mode": self.execution_mode,
                 "strategy": self.strategy,
                 "dump_passes": self.dump_passes,
                 "dump_ptoas_passes": self.dump_ptoas_passes,

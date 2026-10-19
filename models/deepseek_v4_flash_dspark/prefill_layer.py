@@ -1033,7 +1033,8 @@ def _compare_functions(layer_id):
 
 def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 Flash DSpark DSA-CP single-layer golden.")
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8, 16])
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
     parser.add_argument("--layer-id", type=int, default=0, choices=list(SUPPORTED_LAYERS))
@@ -1051,6 +1052,8 @@ def main():
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--runtime-dir", default=None)
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
 
     device_ids = [int(device) for device in args.device.split(",")]
     if len(device_ids) < N_RANKS:
@@ -1079,7 +1082,8 @@ def main():
             distributed_config=DistributedConfig(
                 device_ids=device_ids[:N_RANKS], num_sub_workers=0
             ),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             ring_heap=PREFILL_RING_HEAP,
         ),
         rtol=1e-3,

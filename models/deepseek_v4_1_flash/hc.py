@@ -499,7 +499,8 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 HC mixes and pre validation")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=1)
@@ -527,7 +528,7 @@ if __name__ == "__main__":
             fn=fn,
             specs=build_specs(args.batch, args.sequence),
             golden_fn=golden_fn,
-            config={"platform": args.platform, "device_id": args.device},
+            config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
             rtol=1e-3,
             atol=1e-3,
             compare_fn=compare_fn,

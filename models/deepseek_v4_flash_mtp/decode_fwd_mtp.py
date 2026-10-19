@@ -1201,7 +1201,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="DeepSeek-V4 fused main-decode, verification, and MTP decode driver."
     )
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument(
         "--ep",
         type=int,
@@ -1244,6 +1245,8 @@ def main():
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
 
     assert args.tp <= args.ep, f"fused decode requires --tp <= --ep, got tp={args.tp}, ep={args.ep}"
     assert args.ep % args.tp == 0, (
@@ -1280,7 +1283,8 @@ def main():
                 device_ids=device_ids[:N_RANKS],
                 num_sub_workers=0,
             ),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
         ),

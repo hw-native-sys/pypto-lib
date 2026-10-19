@@ -148,7 +148,7 @@ result = run(
     runtime_dir=args.runtime_dir,
     golden_data=args.golden_data,
     config=dict(
-        platform=args.platform,
+        backend_type=args.backend_type, execution_mode=args.execution_mode,
         device_id=args.device,
         enable_chip_swimlane=args.enable_chip_swimlane,
         dump_passes=args.dump_passes,

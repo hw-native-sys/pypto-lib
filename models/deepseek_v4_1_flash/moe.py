@@ -1518,7 +1518,8 @@ if __name__ == "__main__":
     from golden.runner import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", default="a5", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=list(SUPPORTED_EP_SIZES))
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(SUPPORTED_TP_SIZES))
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(EP_SIZE)))
@@ -1590,7 +1591,8 @@ if __name__ == "__main__":
                 device_ids=device_ids,
                 num_sub_workers=0,
             ),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_dep_gen=args.enable_dep_gen,
             enable_chip_swimlane=args.enable_chip_swimlane,
             # Real EP8 routing spans more than 1 GiB in the routed-expert

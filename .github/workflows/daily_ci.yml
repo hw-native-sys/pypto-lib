@@ -94,10 +94,13 @@ jobs:
           source activate.sh
           : > results.tsv
           failed=()
+          target="${{ matrix.platform }}"
+          target_args=(-p "${target%sim}")
+          if [[ "$target" == *sim ]]; then target_args+=(--sim); fi
           run_case() {
             local file="$1" label="$2"; shift 2
             echo "::group::${label}"
-            if ! timeout --kill-after=10s 300s python "$file" -p ${{ matrix.platform }} "$@"; then
+            if ! timeout --kill-after=10s 300s python "$file" "${target_args[@]}" "$@"; then
               failed+=("$label")
               echo "::error file=${file}::FAIL (${label})"
               printf '%s\tfail\n' "$label" >> results.tsv
@@ -108,7 +111,7 @@ jobs:
           }
           # Run every model file once with no extra args. Files marked
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
-          # device-only and would just argparse-reject *sim, so skip them here.
+          # device-only and would just reject --sim, so skip them here.
           for f in $(python .github/scripts/detect_changes.py --all --root models --platform ${{ matrix.platform }}); do
             if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
               echo "::group::${f}"

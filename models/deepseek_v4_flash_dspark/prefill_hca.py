@@ -1558,9 +1558,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Standalone DeepSeek V4 packed prefill HCA correctness test."
     )
-    parser.add_argument(
-        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
-    )
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument(
         "-d", "--device", type=str, default=",".join(str(i) for i in range(TP_SIZE)),
         help="comma-separated rank group; one ID at --tp 1",
@@ -1606,7 +1605,8 @@ if __name__ == "__main__":
             golden_fn=golden_prefill_attention_hca,
             config=dict(
                 dump_passes=args.dump_passes,
-                platform=args.platform,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
                 device_id=device_ids[0],
                 enable_chip_swimlane=args.enable_chip_swimlane,
                 enable_dep_gen=args.enable_dep_gen,
@@ -1637,7 +1637,8 @@ if __name__ == "__main__":
             config=dict(
                 dump_passes=args.dump_passes,
                 distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-                platform=args.platform,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
                 ring_heap=PREFILL_RING_HEAP,
             ),
             compile_only=args.compile_only,

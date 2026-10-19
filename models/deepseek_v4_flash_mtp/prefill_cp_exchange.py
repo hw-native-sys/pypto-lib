@@ -1252,13 +1252,16 @@ def main():
     from golden import run
 
     parser = argparse.ArgumentParser(description="Exact CP request transfer, owner output isolation and communication reuse tests.")
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(CP_SIZE)))
     parser.add_argument("--cp", type=int, default=CP_SIZE)
     parser.add_argument("--ep", type=int, default=CP_SIZE)
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
     devices = [int(device) for device in args.device.split(",")]
     if len(devices) != CP_SIZE or args.cp != CP_SIZE or args.ep != CP_SIZE:
         parser.error("The device count and CP/EP group sizes must agree.")
@@ -1296,7 +1299,8 @@ def main():
             save_data=False,
             # Two active owners must fit by reusing one scratch allocation.
             config=dict(
-                platform=args.platform,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
                 distributed_config=DistributedConfig(device_ids=devices),
                 ring_heap=128 * 1024**2,
             ),

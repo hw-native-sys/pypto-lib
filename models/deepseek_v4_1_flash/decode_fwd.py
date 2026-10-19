@@ -1426,11 +1426,13 @@ if __name__ == "__main__":
     from utils import upload_forward_inputs
     from golden import run
     from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-    from pypto.runtime import RunConfig
+    from pypto.backend import BackendType
+    from pypto.runtime import ExecutionMode, RunConfig
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1])
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--experts-per-rank", type=int, default=N_LOCAL_EXPERTS, help="routed experts on each EP rank")
@@ -1440,6 +1442,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable-scope-stats", action="store_true")
     parser.add_argument("--log-level", default=None)
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this forward entry requires hardware; --sim is unsupported")
     if (args.tp, args.ep, args.experts_per_rank) != (TP_SIZE, EP_SIZE, N_LOCAL_EXPERTS):
         parser.error("--tp/--ep/--experts-per-rank are import-time configuration; pass them on the Python command line")
     if args.tp != 1:
@@ -1449,7 +1453,8 @@ if __name__ == "__main__":
         parser.error(f"need exactly {EP_SIZE} distinct devices, got {devices}")
     specs = build_tensor_specs()
     config = dict(
-        platform=args.platform,
+        backend_type=BackendType.Ascend950,
+        execution_mode=ExecutionMode.SIM if args.execution_mode else ExecutionMode.ONBOARD,
         dump_passes=args.dump_passes,
         enable_scope_stats=args.enable_scope_stats,
         log_level=args.log_level,
@@ -1468,7 +1473,10 @@ if __name__ == "__main__":
     )
     if result.passed and not args.compile_only:
         cfg = RunConfig(**{name: value for name, value in config.items() if name != "log_level"})
-        compiled = DistributedCompiledProgram.from_dir(result.work_dir, platform=cfg.platform, distributed_config=cfg.distributed_config)
+        compiled = DistributedCompiledProgram.from_dir(
+            result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
+            distributed_config=cfg.distributed_config,
+        )
         replicated = ('moe_num_tokens', 'attention_num_tokens')
         host_inputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in replicated}
         upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()

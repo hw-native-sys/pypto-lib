@@ -2246,7 +2246,7 @@ def validate_swa_core(args):
                 build_swa_specs(inputs),
                 golden_fn=golden_swa_core,
                 compare_fn={"output": partial(compare_swa_core, reference=reference)},
-                config=dict(platform=args.platform, device_id=args.device),
+                config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
                 compile_only=args.compile_only,
                 save_data=True,
             )
@@ -2554,7 +2554,8 @@ if __name__ == "__main__":
     )
 
     parser = argparse.ArgumentParser(description="Validate sparse MLA and SWA on Ascend950")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4, 8])
     parser.add_argument("--rows", type=int, default=7, help="query rows for the sparse MLA modes")
@@ -2565,6 +2566,8 @@ if __name__ == "__main__":
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--runtime-dir", type=str)
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
     if args.tp != TP_SIZE:
         raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
     if args.mode in ("swa", "swa-packed", "swa-both", "all") and (args.fixture or args.runtime_dir):
@@ -2643,7 +2646,7 @@ if __name__ == "__main__":
                 specs,
                 golden_fn=golden,
                 compare_fn={"output": ratio_allclose(atol=0.003, rtol=0.03, max_error_ratio=0.0)},
-                config=dict(platform=args.platform, device_id=args.device),
+                config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
                 compile_only=args.compile_only,
                 runtime_dir=args.runtime_dir,
             )

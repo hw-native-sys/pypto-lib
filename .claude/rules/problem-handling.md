@@ -171,7 +171,7 @@ A repro qualifies when it is:
   ops, collapse loops.
 - **Self-contained** — imports nothing from `models/` or `examples/`, needs no
   local weights or scratch files, runs standalone.
-- **Cheap to run** — prefer compile-only and the simulator (`-p a2a3sim`) so a
+- **Cheap to run** — prefer compile-only and the simulator (`-p a2a3 --sim`) so a
   reader without a device can reproduce it. If it only reproduces on hardware,
   say so explicitly and give the platform and device flags.
 - **Exact** — the literal command plus the observed output: the error-message

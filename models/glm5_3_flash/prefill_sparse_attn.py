@@ -412,7 +412,8 @@ def main():
     run_prefill_sparse_attn_golden(golden_prefill_sparse_attn)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument("--rows", type=int, default=6)
@@ -424,7 +425,7 @@ def main():
         fn=prefill_sparse_attn_test,
         specs=build_prefill_sparse_attn_specs(args.requests, args.rows, args.pages),
         golden_fn=golden_prefill_sparse_attn_case,
-        config={"platform": args.platform, "device_id": args.device},
+        config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
         rtol=1.0 / 32,
         atol=2e-3,
         compare_fn={"output": ratio_allclose(atol=2e-3, rtol=1.0 / 32)},

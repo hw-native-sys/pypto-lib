@@ -163,7 +163,7 @@ dispatch, which builds a `CallConfig` and transcribes the ring sizes into
 
 ```python
 PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)   # ring 2 only
-config=dict(platform=args.platform, ring_heap=PREFILL_RING_HEAP)
+config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, ring_heap=PREFILL_RING_HEAP)
 ```
 
 Live examples: [`models/deepseek_v4_flash_mtp/prefill_layer.py`](../../models/deepseek_v4_flash_mtp/prefill_layer.py)
@@ -208,7 +208,7 @@ and pass it through:
 parser.add_argument("--enable-scope-stats", action="store_true", default=False)
 ...
 config=dict(
-    platform=args.platform,
+    backend_type=args.backend_type, execution_mode=args.execution_mode,
     device_id=args.device,
     enable_scope_stats=args.enable_scope_stats,
 )

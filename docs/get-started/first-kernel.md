@@ -23,7 +23,7 @@ root, and run:
 
 ```bash
 PYTHONPATH="$PWD" \
-  python examples/beginner/hello_world.py -p a2a3sim
+  python examples/beginner/hello_world.py -p a2a3 --sim
 ```
 
 The harness reports these stages:
@@ -57,17 +57,17 @@ host's allocator rather than probing for an idle card and racing another user.
 
 ## Platforms and devices
 
-`-p` selects both the PyPTO backend and the simpler runtime target:
+`-p` selects the chip family; `--sim` selects simulator execution:
 
 | CLI value | PyPTO backend | Execution target | Device argument |
 |---|---|---|---|
-| `a2a3sim` | `Ascend910B` | A2/A3 simulator | none |
-| `a2a3` | `Ascend910B` | Ascend 910B/C NPU | usually one integer ID |
-| `a5sim` | `Ascend950` | A5 simulator | none |
-| `a5` | `Ascend950` | Ascend 950 NPU | usually one integer ID |
+| `-p a2a3 --sim` | `Ascend910B` | A2/A3 simulator | none |
+| `-p a2a3` | `Ascend910B` | Ascend 910B/C NPU | usually one integer ID |
+| `-p a5 --sim` | `Ascend950` | A5 simulator | none |
+| `-p a5` | `Ascend950` | Ascend 950 NPU | usually one integer ID |
 
 The mapping is enforced by
-[`golden.runner._backend_for_platform`](../../golden/runner.py) — an unknown
+[`golden.runner._normalize_config`](../../golden/runner.py) — an unknown
 platform fails instead of silently choosing a default. The host's own CPU
 architecture (`uname -m`) only picks the PTOAS release asset at install time; it
 does not decide whether a run uses a simulator or a real NPU.

@@ -600,7 +600,8 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 Engram validation")
-    parser.add_argument("-p", "--platform", default="a5sim", choices=["a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument(
         "-d",
         "--device",
@@ -632,7 +633,7 @@ if __name__ == "__main__":
             specs=build_engram_tensor_specs(args.batch, args.sequence),
             golden_fn=golden_engram_case,
             config={
-                "platform": args.platform,
+                "backend_type": args.backend_type, "execution_mode": args.execution_mode,
                 "device_id": device_ids[0],
                 "enable_chip_swimlane": args.enable_chip_swimlane,
             },
@@ -649,7 +650,7 @@ if __name__ == "__main__":
             specs=build_engram_tp_tensor_specs(args.batch, args.sequence),
             golden_fn=golden_engram_tp_case,
             config={
-                "platform": args.platform,
+                "backend_type": args.backend_type, "execution_mode": args.execution_mode,
                 "enable_chip_swimlane": args.enable_chip_swimlane,
                 "distributed_config": DistributedConfig(
                     device_ids=device_ids,

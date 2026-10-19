@@ -24,7 +24,7 @@ result = run(
     golden_fn=golden_indexer,
     runtime_dir=args.runtime_dir,                     # reuse a compile (§3)
     config=dict(
-        platform=args.platform, device_id=args.device,
+        backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device,
         log_level="v5",                               # runtime log level; raise to v0 for hangs (§4)
         enable_dump_args=args.dump_args,              # argument dump (§5)
         enable_dep_gen=args.enable_dep_gen,           # dependency graph (§6)
@@ -55,8 +55,8 @@ mechanisms below.
   It is not a `RunConfig` field, so `run`'s `config` does not carry it — reach
   it by calling `ir.compile(program, skip_ptoas=True, ...)` on a `@pl.program`
   kernel directly.
-- **Runtime crash** — rerun on the matching simulator (`-p a2a3sim` /
-  `a5sim`); it gives more diagnostic output than the device backend and
+- **Runtime crash** — rerun on the matching simulator (`-p a2a3 --sim` /
+  `-p a5 --sim`); it gives more diagnostic output than the device backend and
   reproduces most lowering bugs.
 
 ---

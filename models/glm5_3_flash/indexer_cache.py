@@ -568,7 +568,8 @@ def main():
     _self_check()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--case", default="both", choices=["write", "pool", "both"])
@@ -602,7 +603,7 @@ def main():
                 fn=indexer_cache_write_test,
                 specs=build_indexer_cache_write_specs(args.tokens, args.pages),
                 golden_fn=None if args.bench else golden_indexer_cache_write_case,
-                config={"platform": args.platform, "device_id": args.device},
+                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                 rtol=0.0,
                 atol=0.0,
                 compile_only=args.compile_only,
@@ -616,7 +617,7 @@ def main():
                 fn=indexer_pool_write_test,
                 specs=build_indexer_pool_write_specs(args.events, args.raw_pages, args.pool_pages),
                 golden_fn=None if args.bench else golden_indexer_pool_write_case,
-                config={"platform": args.platform, "device_id": args.device},
+                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                 rtol=1.0 / 64,
                 atol=1e-3,
                 # The quantization chain itself is deterministic, but the pooled

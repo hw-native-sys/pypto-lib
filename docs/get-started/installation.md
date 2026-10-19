@@ -148,7 +148,7 @@ re-cloned rather than reused in place.
 
 ```bash
 python -c "import pypto, torch; from golden import run; print(torch.__version__)"
-python examples/beginner/hello_world.py -p a2a3sim
+python examples/beginner/hello_world.py -p a2a3 --sim
 ```
 
 The example ends in a `[RUN] PASS` line, having exercised the whole chain —

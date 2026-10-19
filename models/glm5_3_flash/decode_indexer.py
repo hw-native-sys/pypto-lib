@@ -534,7 +534,8 @@ def main():
     from golden import ratio_allclose, run, topk_pair_compare
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--requests", type=int, default=16)
@@ -585,7 +586,7 @@ def main():
             fn=decode_indexer_step_test,
             specs=specs,
             golden_fn=None,
-            config={"platform": args.platform, "device_id": args.device},
+            config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
             compile_only=args.compile_only,
         )
         print_bench(label, result)
@@ -733,7 +734,7 @@ def main():
                 fn=decode_indexer_step_test,
                 specs=build_decode_indexer_step_specs(args.requests),
                 golden_fn=golden_decode_indexer_step_case,
-                config={"platform": args.platform, "device_id": args.device},
+                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                 rtol=1.0 / 64,
                 atol=1e-3,
                 compare_fn=step_compare,
@@ -748,7 +749,7 @@ def main():
                 fn=decode_indexer_step_test,
                 specs=step_specs,
                 golden_fn=golden_decode_indexer_step_case,
-                config={"platform": args.platform, "device_id": args.device},
+                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                 rtol=1.0 / 64,
                 atol=1e-3,
                 compare_fn={**step_compare, "topk_indices": capture_topk_indices},
@@ -770,7 +771,7 @@ def main():
                     fn=decode_sparse_attn_test,
                     specs=build_decode_indexer_abi_specs(indices, kv_len),
                     golden_fn=golden_decode_sparse_attn_case,
-                    config={"platform": args.platform, "device_id": args.device},
+                    config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                     rtol=1.0 / 64,
                     atol=1e-3,
                     compare_fn={"output": ratio_allclose(atol=1e-3, rtol=1.0 / 64)},

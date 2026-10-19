@@ -209,16 +209,19 @@ jobs:
             exit 0
           fi
           failed=()
+          target="${{ matrix.platform }}"
+          target_args=(-p "${target%sim}")
+          if [[ "$target" == *sim ]]; then target_args+=(--sim); fi
           for f in $FILES; do
             echo "::group::$f"
             # Files marked `# ci: no-sim` (full multi-layer / multi-card
-            # forwards) are device-only and would just argparse-reject *sim.
+            # forwards) are device-only and would just reject --sim.
             if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
               echo "skip (no-sim): $f"
               echo "::endgroup::"
               continue
             fi
-            if ! python "$f" -p ${{ matrix.platform }}; then
+            if ! python "$f" "${target_args[@]}"; then
               failed+=("$f")
               echo "::error file=${f}::FAIL"
             fi

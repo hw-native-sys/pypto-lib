@@ -163,7 +163,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description="Validate DeepSeek-V4.1 Flash token input packing.")
-    parser.add_argument("-p", "--platform", type=str, default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tokens", type=int, default=DEFAULT_TOKENS)
     parser.add_argument("--vocab", type=int, default=TEST_VOCAB_SIZE)
@@ -176,7 +177,8 @@ if __name__ == "__main__":
         golden_fn=golden_pack_x_hc,
         compile_only=args.compile_only,
         config=dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
         ),
         rtol=0.0,

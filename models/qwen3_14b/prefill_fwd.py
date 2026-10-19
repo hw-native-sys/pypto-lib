@@ -2200,9 +2200,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"]
-    )
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-b", "--batch", type=int, default=BATCH_PAD,
                         help=("User-visible batch size. Host allocates every "
@@ -2245,6 +2244,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-golden", action="store_true", default=False,
                         help="skip host golden computation and output validation")
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
 
     result = run(
         fn=prefill_fwd,
@@ -2258,7 +2259,8 @@ if __name__ == "__main__":
         ),
         golden_fn=None if args.no_golden else golden_qwen3_14b_prefill,
         config=dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,

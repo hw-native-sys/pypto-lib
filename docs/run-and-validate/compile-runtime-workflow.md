@@ -13,7 +13,8 @@ A typical model `__main__` block parses three flags and dispatches into
 the harness:
 
 ```python
-parser.add_argument("-p", "--platform", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+parser.add_argument("--sim", dest="execution_mode", action="store_true")
 parser.add_argument("-d", "--device", type=int, default=0)
 parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
 args = parser.parse_args()
@@ -22,7 +23,7 @@ result = run(
     fn=qwen3_decode,                          # module-level @pl.jit function
     specs=build_tensor_specs(...),            # TensorSpec / ScalarSpec, in fn's param order
     golden_fn=golden_qwen3_decode,            # PyTorch reference
-    config=dict(dump_passes=True, platform=args.platform,
+    config=dict(dump_passes=True, backend_type=args.backend_type, execution_mode=args.execution_mode,
                 device_id=args.device,
                 enable_chip_swimlane=args.enable_chip_swimlane),
     rtol=3e-3, atol=3e-3,
@@ -36,7 +37,8 @@ differs, see [Compile configuration](#compile-configuration).
 
 | Flag | Purpose |
 |------|---------|
-| `-p` / `--platform` | Target backend. `a2a3` is Ascend 910B/C; `a5` is Ascend 950 — both run on real NPU. `a2a3sim` / `a5sim` are the matching simulators. |
+| `-p` / `--platform` | Chip family: `a2a3` is Ascend 910B/C; `a5` is Ascend 950. |
+| `--sim` | Run on the matching simulator. Omit for real hardware. |
 | `-d` / `--device` | Device ID for multi-card hosts. |
 | `--enable-chip-swimlane` | Capture **level** 0-4 forwarded to the runtime; collects per-task chip swimlane records into the build_output (see [Runtime DFX flags](#runtime-dfx-flags)). A bare flag means level 1; dispatch analysis needs an explicit `4`. |
 
@@ -145,7 +147,8 @@ The compile-side ones:
 
 | `config` field | Compiler mapping |
 |---|---|
-| `platform` | Selects the target; `ir.compile` derives `backend_type` from it. |
+| `backend_type` | Selects the chip family: `"a2a3"` or `"a5"`, or a PyPTO `BackendType`. |
+| `execution_mode` | Selects hardware (`False`) or simulator (`True`), or a PyPTO `ExecutionMode`. Both target fields are forwarded as enums to `ir.compile`. |
 | `dump_passes` | Write pass IR under `passes_dump/`. Defaults to `False`. |
 | `strategy` | Select the optimization strategy. |
 | `save_kernels_dir` | Maps to `ir.compile(output_dir=...)` — override `build_output/<name>_<timestamp>/`. |

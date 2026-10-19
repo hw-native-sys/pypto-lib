@@ -778,7 +778,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="Standalone context-parallel decode payload all-gather test.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(TP_SIZE)))
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=_TP_CHOICES)
     parser.add_argument("--payload-kind", choices=tuple(_PAYLOAD_FIXTURES), default=FIXTURE_KIND)
@@ -810,7 +811,8 @@ if __name__ == "__main__":
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
         ),
         rtol=0.0,
         atol=0.0,

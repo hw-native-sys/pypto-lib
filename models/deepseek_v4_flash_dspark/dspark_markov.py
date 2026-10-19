@@ -1001,7 +1001,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Validate the DeepSeek V4 DSpark Markov sampler.")
     parser.add_argument("--batch", type=int, choices=DSPARK_SUPPORTED_BATCHES, default=4)
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--distributed", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[2, 4, 8, 16])
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2, 4, 8, 16])
@@ -1012,7 +1013,7 @@ if __name__ == "__main__":
 
     assert args.tp == TP_SIZE
     assert args.dp * args.tp == WORLD_SIZE
-    config = dict(dump_passes=args.dump_passes, platform=args.platform)
+    config = dict(dump_passes=args.dump_passes, backend_type=args.backend_type, execution_mode=args.execution_mode)
     fn = markov_sample
     golden_fn = golden_nonzero_markov
     if args.distributed:
