@@ -41,6 +41,7 @@ from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
 from compressor import prefill_c1a_compressor_project, prefill_c1a_compressor_rope, publish_compressed_cache
 from prefill_indexer import (
     prefill_indexer, publish_c1a_index_key, golden_prefill_indexer,
+    golden_index_key, golden_select_candidate_block_pool,
     golden_prefill_index_scores as golden_index_scores,
 )
 
@@ -252,7 +253,8 @@ def golden_prefill_attn_c1a_full(
         compressed_slots=compressed_slots, position_ids=None, compressed_lens=compressed_lens, compressed_rope_cos=compressed_rope_cos, compressed_rope_sin=compressed_rope_sin,
         index_wk=index_wk, index_norm_weight=index_norm_weight, index_wq_b=index_wq_b, index_wq_b_scale=index_wq_b_scale, index_weights_proj=index_weights_proj,
         index_cache=index_cache, index_cache_scale=index_cache_scale, index_block_table=index_block_table, request_ids=request_ids, candidate_mask=None,
-        indexer_fn=golden_prefill_indexer,
+        indexer_fn=golden_prefill_indexer, index_key_fn=golden_index_key,
+        pool_selector_fn=golden_select_candidate_block_pool,
         attention_fn=golden_prefill_c1a_attention, sequential_query=True, round_cache_to_even=True, output_dtype=torch.float32,
     )
 

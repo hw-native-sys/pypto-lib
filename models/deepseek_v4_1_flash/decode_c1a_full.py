@@ -16,12 +16,6 @@ import torch
 
 from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
 from compressor import golden_compressor_ratio1
-from hierarchical_sparse_indexer import (
-    golden_index_key,
-    golden_select_candidate_block_pool,
-    index_pool_block_capacity,
-    select_candidate_block_pool,
-)
 from qkv_proj_rope import (
     golden_qkv_proj_rope,
     golden_rope_tail,
@@ -31,6 +25,7 @@ from qkv_proj_rope import (
 )
 from o_proj import o_proj, golden_o_proj
 from decode_indexer import (
+    golden_index_key, golden_select_candidate_block_pool, select_candidate_block_pool,
     c1a_index,
     golden_c1a_index_scores,
     golden_pool_index_scores,
@@ -49,7 +44,7 @@ from quant import (
     dequantize_mxfp8_cache,
 )
 from rope_tables import precompute_rope_tables
-from utils import AttentionGoldenResult
+from utils import AttentionGoldenResult, index_pool_block_capacity
 
 from hc import golden_hc_pre, hc_pre
 from config import (
