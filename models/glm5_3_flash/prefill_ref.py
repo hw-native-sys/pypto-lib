@@ -273,7 +273,7 @@ def read_reference_float(checkpoint: Checkpoint, name: str) -> torch.Tensor:
     Dequant is ``int8 * per-output-channel scale`` with the all-zero offset
     verified (not assumed), exactly the boundary ``weights.py`` pins.
     """
-    label = checkpoint.label(name)
+    label = checkpoint.description.get(name)
     raw = checkpoint.read(name)
     if label == "FLOAT":
         return raw.to(torch.float32)
@@ -1815,7 +1815,7 @@ def _test_lm_head_top1(model: Glm53FlashConfig) -> None:
 def _real_checkpoint_smoke(root: str) -> None:
     """Against the real (possibly still downloading) W8A8 snapshot."""
     driver = PrefillReferenceDriver(root)
-    print(f"  checkpoint opened: {len(list(driver.checkpoint.tensor_names()))} present tensors")
+    print(f"  checkpoint opened: {len(driver.checkpoint)} indexed tensors")
     # Dequant one real W8A8 tensor through this module's reader and verify the
     # scale multiply against the raw INT8 payload directly.
     name = "model.language_model.layers.0.mlp.down_proj.weight"
@@ -1853,18 +1853,8 @@ def run_self_tests(model: Glm53FlashConfig = FLASH, checkpoint_root: str | None 
 
 
 def main() -> None:
-    """CLI: run the synthetic self-test; optionally probe the real checkpoint.
-
-    The a2a3 sweep invokes every model file as ``python <file> -p a2a3 -d <ids>``,
-    so those switches (and ``--tp``/``--ep``, consumed by ``config.py`` at import)
-    are accepted and ignored here.
-    """
+    """Run the CPU self-test and optionally probe a real W8A8 checkpoint."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
-    parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("-d", "--device", type=str, default="0")
-    parser.add_argument("--tp", type=int, default=16)
-    parser.add_argument("--ep", type=int, default=16)
     parser.add_argument(
         "--checkpoint", type=str, default=None,
         help="optional real W8A8 checkpoint root for a read/dequant/coverage smoke",
