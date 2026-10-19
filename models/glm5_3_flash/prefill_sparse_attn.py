@@ -9,10 +9,9 @@
 """Sparse NoPE MLA attention over the indexer's selected rows, prefill path.
 
 Each query row carries up to ``TOPK_INDEX_WIDTH = 2051`` int32 cache rows, padded
-with ``-1``. The reference turns them into a dense boolean mask and runs SDPA, which
-is only tractable because the mask is built with ``scatter_add``; on device the
-kernel gathers the selected latent rows instead and runs an online-softmax
-attention over them.
+with ``-1``. The kernel gathers selected latent rows and runs online-softmax
+attention. The implementation golden follows its BF16 rounding boundaries; an
+independent FP32 reference expands the selected keys and values in head space.
 
 Scale is ``qk_head_dim ** -0.5`` = ``256 ** -0.5``; ``v_head_dim`` is 256, so the
 per-head output is 256 wide and the heads flatten to ``[T, LOCAL_H * 256]``.
@@ -53,7 +52,7 @@ import torch
 from models.glm5_3_flash.config import BLOCK_SIZE, B_DYN, KV_LORA, LOCAL_H, QK_DIM
 from models.glm5_3_flash.config import BLOCK_TABLE_DYN, TABLE_DYN, TOPK_INDEX_WIDTH, T_DYN, V_DIM
 from models.glm5_3_flash.metadata import paged_slots
-from models.glm5_3_flash.mla_prolog import absorb_query
+from models.glm5_3_flash.mla_prolog import absorb_query, golden_absorb_query
 
 SOFTMAX_SCALE = QK_DIM**-0.5
 NEG_INF = -1.0e20       # finite floor; a true -inf would make an all-masked row NaN
@@ -87,10 +86,10 @@ def golden_prefill_sparse_attn(
     reference keeps. A row whose slots are all ``-1`` contributes nothing and yields a
     zero output row rather than a NaN.
 
-    Keys and values are expanded from the gathered 512-wide latent rows, which is what
-    prefill does; decode absorbs ``w_k`` / ``w_v`` into the query and ``o_proj``
-    instead. This reference materialises ``[T, W, H, *]``, so it is meant for reduced
-    fixtures and small validation batches, not for a full 2051-wide production step.
+    This independent mathematical reference expands keys and values from the gathered
+    latent rows in FP32. The implementation absorbs ``w_k`` into the query and rounds
+    its intermediates to BF16. This reference materialises ``[T, W, H, *]`` and is
+    intended for bounded numerical comparisons.
 
     Args:
         query: ``[T, H, QK_DIM]`` from :func:`models.glm5_3_flash.mla_prolog.golden_mla_prolog`.
@@ -117,6 +116,58 @@ def golden_prefill_sparse_attn(
     return torch.einsum("thw,twhv->thv", weights, value).to(query.dtype)
 
 
+def _golden_prefill_sparse_attn_impl(
+    query: torch.Tensor,
+    latent_cache: torch.Tensor,
+    w_k: torch.Tensor,
+    w_v: torch.Tensor,
+    topk_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    request_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Emulate BF16 absorption, exp weights and contexts with FP32 online softmax.
+
+    The expanded FP32 reference remains :func:`golden_prefill_sparse_attn`.
+    """
+    tokens, heads, _ = query.shape
+    latent_width = latent_cache.shape[-1]
+    output = query.new_zeros((tokens, heads, w_v.shape[1]))
+    absorbed = golden_absorb_query(query, w_k).float()
+    value_weight = w_v.float()
+    scale = query.shape[-1] ** -0.5
+    selection_width = topk_indices.shape[1]
+    for token in range(tokens):
+        if selection_width == 0 or int(topk_indices[token, 0]) < 0:
+            continue
+        running_m = torch.full((heads, 1), NEG_INF, dtype=torch.float32, device=query.device)
+        running_l = torch.zeros_like(running_m)
+        running_o = torch.zeros((heads, latent_width), dtype=torch.float32, device=query.device)
+        for start in range(0, selection_width, ATTN_K_TILE):
+            selected = topk_indices[token, start : start + ATTN_K_TILE]
+            positions = selected.new_full((ATTN_K_TILE,), -1)
+            positions[: selected.numel()] = selected
+            valid = positions >= 0
+            slots = positions.new_zeros((ATTN_K_TILE,), dtype=torch.int64)
+            slots[valid] = paged_slots(positions[valid], request_ids[token], block_table)
+            latent = latent_cache[slots].float()
+            scores = torch.matmul(absorbed[token], latent.T) * scale
+            scores = scores + (~valid).to(torch.float32).unsqueeze(0) * NEG_INF
+            block_m = scores.amax(dim=-1, keepdim=True)
+            weights = torch.exp(scores - block_m)
+            block_l = weights.sum(dim=-1, keepdim=True)
+            block_o = torch.matmul(weights.to(torch.bfloat16).float(), latent)
+            next_m = torch.maximum(running_m, block_m)
+            alpha = torch.exp(running_m - next_m)
+            beta = torch.exp(block_m - next_m)
+            running_l = alpha * running_l + beta * block_l
+            running_o = alpha * running_o + beta * block_o
+            running_m = next_m
+        context = (running_o / running_l).to(torch.bfloat16).float()
+        expanded = torch.einsum("hk,hvk->hv", context, value_weight)
+        output[token] = expanded.to(query.dtype)
+    return output
+
+
 @pl.jit.inline
 def prefill_sparse_attn(
     query: pl.Tensor[[T_DYN, LOCAL_H, QK_DIM], pl.BF16],
@@ -137,9 +188,9 @@ def prefill_sparse_attn(
     QK_DIM`` twice over. Absorbing instead — ``q . K^T`` as ``(q @ w_k) . latent^T``,
     and ``P @ V`` as ``(P @ latent) @ w_v^T`` — is the same value with the two
     expansions moved out of the block loop and onto the token, where ``w_v`` is
-    applied once to the finished context. The cost of the identity is one extra BF16
-    rounding of the query and of the context, so the kernel is close to, but not
-    bit-comparable with, the expanded reference.
+    applied once to the finished context. Absorbed queries, exp weights and normalized
+    contexts are rounded to BF16; matrix products accumulate in FP32. The expanded
+    mathematical reference remains separate from the implementation golden.
 
     One work item per token: the online softmax runs over ``SPARSE_BLOCKS`` blocks
     inside the item with ``pl.yield_``-carried ``(max, sum, context)``, so no
@@ -161,7 +212,7 @@ def prefill_sparse_attn(
     initialisation in the cube half of this mixed cube/vector scope, where
     ``vector_dup`` does not exist and ``ccec`` rejects the kernel -- ``a2a3sim``
     compiles both halves with ``g++`` and does not see it. The filler rows keep the
-    second matmul finite, which a skip over uninitialised L1 would not.
+    PV products finite, which a skip over uninitialised L1 would not.
 
     Returns the attention output so the caller can chain it.
     """
@@ -385,8 +436,8 @@ def build_prefill_sparse_attn_specs(requests: int = 2, rows: int = 6, pages_per_
 
 
 def golden_prefill_sparse_attn_case(tensors):
-    """Fill the expected output for :func:`build_prefill_sparse_attn_specs`."""
-    tensors["output"][:] = golden_prefill_sparse_attn(
+    """Fill the mixed-precision expected output for the prefill kernel."""
+    tensors["output"][:] = _golden_prefill_sparse_attn_impl(
         tensors["query"],
         tensors["latent_cache"],
         tensors["w_k"],
@@ -398,18 +449,13 @@ def golden_prefill_sparse_attn_case(tensors):
 
 
 def main():
-    """Prove the golden on CPU, then validate the sparse prefill on device.
-
-    The kernel absorbs where the reference expands, so on top of the flash block split it
-    carries two extra BF16 roundings and its budget is a rounding wider than the decode
-    scope's.
-    """
+    """Validate sparse prefill against its mixed-precision implementation golden."""
     import argparse
 
     from golden import ratio_allclose, run
     from models.glm5_3_flash._golden_smoke import run_prefill_sparse_attn_golden
 
-    run_prefill_sparse_attn_golden(golden_prefill_sparse_attn)
+    run_prefill_sparse_attn_golden(golden_prefill_sparse_attn, _golden_prefill_sparse_attn_impl)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])

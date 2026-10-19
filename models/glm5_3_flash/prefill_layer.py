@@ -18,7 +18,7 @@ A GLM-5.3-Flash MoE layer has two branches, assembled as in ``decode_layer.py``:
   ``expert_shared.py`` produces the local FP32 result without cross-rank reduction.
 
 ``moe_layer_add`` adds these local results and zeros inactive capacity rows. The
-router is the head of the block: ``moe_gate`` provides deferred norm, routing and
+router is the head of the block: ``moe_gate`` provides RMSNorm, routing and
 an INT8 activation view that both branches reuse. Each rank may supply a different
 batch; the expert weights are not tensor-parallel.
 
@@ -145,7 +145,7 @@ def l2_prefill_layer(
     x_int8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
 
-    # Block head: deferred norm + router + the INT8 view both branches reuse.
+    # Block head: normalized router and the INT8 view both branches reuse.
     moe_gate(
         x_mixed, norm_weight, gate_weight, correction_bias,
         route_weights, route_indices, x_int8, x_scale, num_tokens,

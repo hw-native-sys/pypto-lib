@@ -358,8 +358,78 @@ def _selected_rows(topk_row, request_id, block_table):
     return rows
 
 
-def run_prefill_sparse_attn_golden(golden_prefill) -> None:
-    """Check the head-space sparse attention against an independent loop reference."""
+def _check_sparse_attention_impl(golden_impl, prefill: bool) -> None:
+    """Check paged uniform attention and the BF16 exponential boundary."""
+    generator = torch.Generator().manual_seed(93)
+    counts = [0, 1, 127, 128, 129, 511, 512, 513, 2051] + [1] * 8
+    tokens, heads, pages = len(counts), 2, 17
+    qk, kv_lora, v_dim = FLASH.qk_head_dim, FLASH.kv_lora_rank, FLASH.v_head_dim
+    block_table = torch.randperm(2 * pages, generator=generator).reshape(2, pages).int()
+    request_ids = torch.arange(tokens, dtype=torch.int32) % 2
+    cache = torch.randint(-16, 17, (2 * pages * BLOCK_SIZE, kv_lora), generator=generator)
+    cache = (cache.float() / 32).bfloat16()
+    indices = torch.full((tokens, max(counts)), -1, dtype=torch.int32)
+    context = torch.zeros(tokens, heads, kv_lora, dtype=torch.bfloat16)
+    for token, count in enumerate(counts):
+        if count:
+            chosen = torch.randperm(pages * BLOCK_SIZE - 1, generator=generator)[: count - 1]
+            indices[token, :count] = torch.cat((chosen, torch.tensor([pages * BLOCK_SIZE - 1])))
+            rows = _selected_rows(indices[token], int(request_ids[token]), block_table)
+            context[token] = (cache[rows].float().sum(dim=0) / count).bfloat16()
+    query_width = qk if prefill else kv_lora
+    query = torch.zeros(tokens, heads, query_width, dtype=torch.bfloat16)
+    w_k = torch.zeros(heads, qk, kv_lora, dtype=torch.bfloat16)
+    w_v = torch.zeros(heads, v_dim, kv_lora, dtype=torch.bfloat16)
+    eye = torch.eye(v_dim, dtype=torch.bfloat16)
+    for head in range(heads):
+        w_v[head, :, :v_dim] = eye
+        w_v[head, :, v_dim : 2 * v_dim] = eye * (head + 1) / 2
+
+    def evaluate(selection):
+        if prefill:
+            return golden_impl(query, cache, w_k, w_v, selection, block_table, request_ids)
+        return golden_impl(query, cache, selection, block_table, request_ids)
+
+    expected = context
+    if prefill:
+        coefficients = torch.arange(1, heads + 1).reshape(1, heads, 1).float() / 2
+        expanded = context[..., :v_dim].float() + context[..., v_dim : 2 * v_dim].float() * coefficients
+        expected = expanded.bfloat16()
+    actual = evaluate(indices)
+    _check(actual.dtype is torch.bfloat16, "implementation output must be BF16")
+    _check(torch.equal(actual, expected), "implementation changed uniform paged attention")
+    trimmed = indices[:, :129].contiguous()
+    padded = torch.nn.functional.pad(trimmed, (0, 7), value=-1)
+    _check(torch.equal(evaluate(trimmed), evaluate(padded)), "implementation included padded slots")
+
+    cache = torch.zeros(2 * BLOCK_SIZE, kv_lora, dtype=torch.bfloat16)
+    cache[BLOCK_SIZE, 1] = 1
+    cache[BLOCK_SIZE + 1, 0] = 1
+    block_table = torch.tensor([[1, 0]], dtype=torch.int32)
+    request_ids = torch.zeros(1, dtype=torch.int32)
+    indices = torch.tensor([[0, 1, -1]], dtype=torch.int32)
+    query = torch.zeros(1, 1, query_width, dtype=torch.bfloat16)
+    query[0, 0, 0] = qk**0.5
+    w_k = torch.zeros(1, qk, kv_lora, dtype=torch.bfloat16)
+    w_k[0, :, :qk] = torch.eye(qk, dtype=torch.bfloat16)
+    w_v = torch.zeros(1, v_dim, kv_lora, dtype=torch.bfloat16)
+    w_v[0, :, :v_dim] = eye
+    exponentials = torch.exp(torch.tensor([-1.0, 0.0]))
+    denominator = exponentials.sum()
+    context = torch.zeros(1, 1, kv_lora, dtype=torch.bfloat16)
+    context[0, 0, 0] = 1 / denominator
+    context[0, 0, 1] = exponentials[0].bfloat16().float() / denominator
+    unrounded = (exponentials[0] / denominator).bfloat16()
+    rounded_denominator = exponentials.bfloat16().float().sum()
+    rounded_ratio = (exponentials[0].bfloat16().float() / rounded_denominator).bfloat16()
+    _check(context[0, 0, 1] != unrounded, "boundary fixture did not expose the BF16 exponential")
+    _check(context[0, 0, 1] != rounded_ratio, "boundary fixture did not expose the FP32 denominator")
+    expected = context[..., :v_dim] if prefill else context
+    _check(torch.equal(evaluate(indices), expected), "implementation changed exponential rounding")
+
+
+def run_prefill_sparse_attn_golden(golden_prefill, golden_prefill_impl) -> None:
+    """Check independent attention mathematics and the mixed-precision implementation reference."""
     cache, block_table, request_ids, indices, query, w_k, w_v = _sparse_attention_fixture(31)
     tokens, heads, _ = query.shape
     v_dim = w_v.shape[1]
@@ -391,11 +461,12 @@ def run_prefill_sparse_attn_golden(golden_prefill) -> None:
     reference = golden_prefill(query, cache, w_k, w_v, trimmed, block_table, request_ids)
     _check(torch.equal(same, reference), "padded -1 slots changed the prefill result")
 
+    _check_sparse_attention_impl(golden_prefill_impl, prefill=True)
     _report("prefill_sparse_attn")
 
 
-def run_decode_sparse_attn_golden(golden_decode) -> None:
-    """Check the latent-space sparse attention and its scale against a loop reference."""
+def run_decode_sparse_attn_golden(golden_decode, golden_decode_impl) -> None:
+    """Check independent latent attention and the mixed-precision implementation reference."""
     cache, block_table, request_ids, indices, query, w_k, _ = _sparse_attention_fixture(37)
     tokens, heads, _ = query.shape
     kv_lora = cache.shape[-1]
@@ -427,6 +498,7 @@ def run_decode_sparse_attn_golden(golden_decode) -> None:
     reference = golden_decode(absorbed, cache, trimmed, block_table, request_ids)
     _check(torch.equal(same, reference), "padded -1 slots changed the decode result")
 
+    _check_sparse_attention_impl(golden_decode_impl, prefill=False)
     _report("decode_sparse_attn")
 
 

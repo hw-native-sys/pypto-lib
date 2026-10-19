@@ -24,7 +24,7 @@ A GLM-5.3-Flash MoE layer's feed-forward half is two branches that meet once:
 ``moe_layer_add`` then adds the two, with the inactive capacity rows written as
 zeros. The residual / hyper-connection path is downstream and out of scope here: this
 file ends at the MLP contribution to the sublayer. The router is the head of the
-block, so the entry runs ``moe_gate`` (deferred norm + router + INT8 view) and
+block, so the entry runs ``moe_gate`` (normalized router + INT8 view) and
 then the two branches over its outputs.
 
 Scope policy: the hyper-connection coefficients, ``hc_pre`` / ``hc_post``,
@@ -153,7 +153,7 @@ def l2_decode_layer(
     x_int8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
 
-    # Block head: deferred norm + router + the INT8 view both branches reuse.
+    # Block head: normalized router and the INT8 view both branches reuse.
     moe_gate(
         x_mixed, norm_weight, gate_weight, correction_bias,
         route_weights, route_indices, x_int8, x_scale, num_tokens,
@@ -163,7 +163,7 @@ def l2_decode_layer(
     pack_tid = moe_pack(
         route_indices, route_weights, x_int8, x_scale,
         lane_x, lane_aux, lane_count, lane_ready,
-        num_tokens, num_ranks, my_rank, epoch,
+        num_tokens, num_ranks, my_rank,
     )
     moe_arrive(
         lane_x, lane_aux, lane_count, lane_ready,
@@ -184,7 +184,7 @@ def l2_decode_layer(
         expert_out,
     )
     return_tid = moe_return(expert_out, recv_src, recv_route, slot_out, arrive_total)
-    sync_tid = moe_return_notify(return_ready, num_ranks, my_rank, epoch, return_tid)
+    sync_tid = moe_return_notify(return_ready, num_ranks, my_rank, return_tid)
     moe_combine(
         slot_out, return_ready, routed, num_tokens, num_ranks, my_rank, epoch, sync_tid
     )

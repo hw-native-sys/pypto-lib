@@ -421,9 +421,8 @@ def absorb_query(
 ):
     """Fold the key half into the query, one block per (head, output-column) pair.
 
-    Both attention paths call this: decode consumes the absorbed query directly, and
-    prefill absorbs as well so the key expansion stays out of its per-token block loop
-    (see :mod:`models.glm5_3_flash.prefill_sparse_attn`). ``w_k`` is stored
+    Both attention paths use this BF16 absorbed query: decode consumes it directly,
+    and prefill absorbs before its per-token block loop. ``w_k`` is stored
     ``[QK_DIM, KV_LORA]`` per head — reduction dim first — so the matmul takes no
     ``b_trans``.
 
@@ -523,10 +522,10 @@ def golden_split_kv_b(w_kv_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
 def golden_absorb_query(query: torch.Tensor, w_k: torch.Tensor) -> torch.Tensor:
     """Fold the key half into the query so it attends against the raw latent.
 
-    ``q . K^T`` with ``K = latent @ w_k^T`` equals ``(q @ w_k) . latent^T``, so folding
-    ``w_k`` into the query leaves every score unchanged while removing the per-token key
-    expansion from the decode path. ``w_k`` is BF16 in the deployment checkpoint and so
-    is the query, so this introduces no quantization step.
+    The exact identity ``q . K^T = (q @ w_k) . latent^T`` uses
+    ``K = latent @ w_k^T``. This reference multiplies in FP32, then rounds the absorbed
+    query to the input dtype. BF16 inputs therefore introduce an intermediate BF16
+    rounding compared with an expanded FP32 key computation.
 
     Args:
         query: ``[T, H, QK_DIM]`` from :func:`golden_mla_prolog`.
