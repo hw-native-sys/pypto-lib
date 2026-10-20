@@ -519,7 +519,7 @@ def l3_final_output(
             hidden_done = pld.window(hidden_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
             logits_window = pld.window(logits_buffer, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
             logits_done = pld.window(logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-            final_output(
+            l2_final_output(
                 x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank],
                 logit_row_indices[rank], logits[rank], sampled_ids[rank],
                 hidden_window, hidden_done, logits_window, logits_done,
@@ -527,8 +527,7 @@ def l3_final_output(
             )
 
 
-@pl.jit
-def final_output(
+def _final_output(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
@@ -558,6 +557,10 @@ def final_output(
         hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,
     )
     return logits, sampled_ids
+
+
+final_output = pl.jit.inline(_final_output)
+l2_final_output = pl.jit(_final_output)
 
 
 @pl.jit.host
