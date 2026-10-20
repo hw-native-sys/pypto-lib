@@ -742,7 +742,6 @@ def _make_page_index_scores(workers, skip_short=False):
             name_hint="c1a_index_score_page_mxfp8",
             deps=[cache_ready, query_ready, weights_ready],
         ) as score_tid:
-            lut = _index_key_decode_lut()
             worker = pl.tile.get_block_idx()
             for work in pl.range(worker, work_items, workers):
                 first_token = (work // tiles) * 2
@@ -774,17 +773,9 @@ def _make_page_index_scores(workers, skip_short=False):
                                     physical_page = pl.cast(physical_page_i32, pl.INDEX)
                                     physical_row = physical_page * 128 + logical_begin % 128
                                     packed = pl.load(cache_flat, [physical_row, 0], [tile_n, packed_width])
-                                    byte_values = pl.ands(pl.cast(pl.reinterpret_view(packed, pl.INT8), pl.INT16), 255)
-                                    low = pl.ands(byte_values, 15)
-                                    high = pl.ands(pl.shrs(byte_values, 4), 15)
-                                    lut_tmp = pl.create_tile([1, 32], dtype=pl.UINT8)
-                                    low_bytes = pl.tile.gather(lut, low, lut_tmp)
-                                    high_bytes = pl.tile.gather(lut, high, lut_tmp)
-                                    interleaved_words = pl.or_(low_bytes, pl.shls(high_bytes, 8))
-                                    keys = pl.reinterpret_view(
-                                        pl.reinterpret_view(interleaved_words, pl.INT8, shape=[tile_n, INDEX_DIM]),
-                                        pl.FP8E4M3FN,
-                                    )
+                                    packed_fp4 = pl.reinterpret_view(packed, pl.FP4E2M1X2)
+                                    exact_values = pl.cast(packed_fp4, pl.BF16)
+                                    keys = pl.cast(exact_values, pl.FP8E4M3FN, mode="rint")
                                     raw_scale = pl.reinterpret_view(
                                         pl.load(scale_flat, [0, physical_row * scale_count],
                                                 [1, tile_n * scale_count]), pl.UINT8
@@ -795,8 +786,10 @@ def _make_page_index_scores(workers, skip_short=False):
                                         dst_rows=tile_n, dst_cols=scale_count,
                                     )
                                     key_scale_nn = pl.tile.transpose_view(pl.reinterpret_view(key_scale_zz, pl.FP8E8M0))
+                                    key_flat = pl.reshape(keys, [1, tile_n * INDEX_DIM])
+                                    key_bytes = pl.reinterpret_view(key_flat, pl.INT8, shape=[tile_n, INDEX_DIM])
                                     keys_kn = pl.reinterpret_view(
-                                        pl.tile.transpose(pl.reinterpret_view(keys, pl.INT8), 0, 1), pl.FP8E4M3FN,
+                                        pl.tile.transpose(key_bytes, 0, 1), pl.FP8E4M3FN,
                                     )
                                     keys_mat = pl.tile.move(keys_kn, target_memory=pl.MemorySpace.Mat,
                                                             blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major)

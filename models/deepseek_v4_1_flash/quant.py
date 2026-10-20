@@ -22,6 +22,7 @@ from config import FLASH as M
 MX_GROUP = M.weight_block_size[0]
 
 # tiling
+MX_M_TILE = 16
 MX_K_TILE = 256
 MX_SCALE_TILE = MX_K_TILE // 32
 
@@ -38,6 +39,108 @@ FP4_E4M3_CODES = torch.tensor(
      0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC],
     dtype=torch.int16,
 )
+
+
+@pl.jit.inline(auto_scope=False)
+def mx_projection(
+    x: pl.Tensor,
+    weight: pl.Tensor,
+    scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+    quant_name: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    fp32_output: pl.constexpr = False,
+    floor_scale: pl.constexpr = False,
+    group_count: pl.constexpr = 1,
+):
+    """Quantize activation tiles once, then run separate MX projection tasks."""
+    weight_flat = pl.reshape(weight, [group_count * width, output_width])
+    scale_group_size = (width // 32) * output_width
+    scale_backing_flat = pl.tensor.view(scale, [1, group_count * scale_group_size], layout=pl.ND)
+    for group in pl.parallel(group_count):
+        # Each group's scale bytes use the physical [N/16, K/64, 16, 2] layout.
+        scale_group_offset = group * scale_group_size
+        group_scale_backing = pl.tensor.slice(scale_backing_flat, [1, scale_group_size], [0, scale_group_offset])
+        scale_group = pl.tensor.view(group_scale_backing, [width // 32, output_width], layout=pl.MX_B_NN)
+        for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
+            t0 = mt * MX_M_TILE
+            payload = pl.create_tensor([MX_M_TILE, width], dtype=pl.FP8E4M3FN)
+            scale_size = MX_M_TILE * (width // 32)
+            scale_backing = pl.create_tensor([1, scale_size], dtype=pl.FP8E8M0)
+            quant_chunks = 1
+            if group_count > 1 and width % (2 * MX_K_TILE) == 0:
+                quant_chunks = 2
+            for block in pl.spmd(width // (MX_K_TILE * quant_chunks), name_hint=quant_name):
+                rows = pl.min(MX_M_TILE, num_tokens - t0)
+                for chunk in pl.unroll(2):
+                    if chunk == 0 or (group_count > 1 and width % (2 * MX_K_TILE) == 0):
+                        k0 = (chunk * (width // (MX_K_TILE * quant_chunks)) + block) * MX_K_TILE
+                        source = pl.load(x, [t0, group * width + k0], [MX_M_TILE, MX_K_TILE], valid_shape=[rows, MX_K_TILE])
+                        source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), MX_M_TILE, MX_K_TILE)
+                        groups = pl.reshape(pl.cast(source, pl.FP32), [MX_M_TILE * (MX_K_TILE // 32), 32])
+                        reduce_tmp = pl.create_tile([MX_M_TILE * (MX_K_TILE // 32), 32], dtype=pl.FP32)
+                        if floor_scale:
+                            maximum_floor = pl.row_max(pl.abs(groups), tmp_tile=reduce_tmp)
+                            bits_floor = pl.reinterpret_view(maximum_floor, pl.INT32)
+                            exponent = pl.maximum(pl.sub(pl.shrs(bits_floor, 23), 8), 0)
+                            divisor_floor = pl.reinterpret_view(pl.shls(pl.maximum(exponent, 1), 23), pl.FP32)
+                            normalized_floor = pl.row_expand_div(groups, divisor_floor)
+                            floor_mask = pl.cast(pl.minimum(exponent, 1), pl.FP32)
+                            normalized_floor = pl.row_expand_mul(normalized_floor, floor_mask)
+                            normalized = pl.minimum(pl.maximum(normalized_floor, -448.0), 448.0)
+                        else:
+                            maximum = pl.maximum(pl.row_max(pl.abs(groups), tmp_tile=reduce_tmp), 1e-4)
+                            bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
+                            exponent = pl.shrs(pl.add(bits, 8388607), 23)
+                            group_scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+                            normalized = pl.row_expand_div(groups, group_scale)
+                        quantized = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
+                        quantized_tile = pl.reshape(quantized, [MX_M_TILE, MX_K_TILE])
+                        payload = pl.store(quantized_tile, [0, k0], payload)
+                        signed = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
+                        codes = pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
+                        flat = pl.reshape(codes, [1, MX_M_TILE * (MX_K_TILE // 32)])
+                        pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+                        packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8)
+                        packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
+                        scale_offset = k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32)
+                        packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
+                        scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
+            activation_scale = pl.tensor.view(scale_backing, [MX_M_TILE, width // 32], layout=pl.MX_A_ZZ)
+            # Synchronize Cube/Vector startup within available clusters.
+            workers = pl.min(output_width // n_tile, pl.system.available_cluster_count())
+            for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
+                block_num = pl.tile.get_block_num()
+                for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
+                    block = wave * block_num + worker
+                    if block < output_width // n_tile:
+                        n0 = block * n_tile
+                        rows = pl.min(MX_M_TILE, num_tokens - t0)
+                        a0 = pl.load(payload, [0, 0], [MX_M_TILE, k_tile])
+                        sa0 = pl.load(activation_scale, [0, 0], [MX_M_TILE, k_tile // 32])
+                        b0 = pl.load(weight_flat, [group * width, n0], [k_tile, n_tile])
+                        sb0 = pl.load(scale_group, [0, n0], [k_tile // 32, n_tile])
+                        acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                        for k0 in pl.pipeline(k_tile, width, k_tile, stage=2):
+                            a = pl.load(payload, [0, k0], [MX_M_TILE, k_tile])
+                            sa = pl.load(activation_scale, [0, k0 // 32], [MX_M_TILE, k_tile // 32])
+                            b = pl.load(weight_flat, [group * width + k0, n0], [k_tile, n_tile])
+                            sb = pl.load(scale_group, [k0 // 32, n0], [k_tile // 32, n_tile])
+                            acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                        output_n = group * output_width + n0
+                        if fp32_output:
+                            value_fp32 = pl.mul(acc, 1.0)
+                            output = pl.store(pl.set_validshape(value_fp32, rows, n_tile), [t0, output_n], output)
+                        else:
+                            value = pl.cast(acc, pl.BF16, mode="rint")
+                            output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, output_n], output)
+    return output
+
 
 
 @pl.jit.inline(auto_scope=False)

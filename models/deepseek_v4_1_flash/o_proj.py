@@ -6,12 +6,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
+# Re-enable CPU validation when flat MX scale packing is corrected:
+# https://github.com/hw-native-sys/pto-isa/issues/357
 """V4.1 inverse RoPE, grouped W8A8 MXFP8 output projection, and TP reductions."""
 
 import torch
 
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
-from quant import golden_mxfp8_linear, grouped_mxfp8_linear, mxfp8_linear
+from quant import golden_mxfp8_linear, grouped_mxfp8_linear, mx_projection, mxfp8_linear
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -79,7 +82,7 @@ def _rotate_output(
 
 
 @pl.jit.inline(auto_scope=False)
-def grouped_output(
+def _grouped_output_inline_quant(
     x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
@@ -170,6 +173,26 @@ def grouped_output(
 
 
 @pl.jit.inline(auto_scope=False)
+def grouped_output(
+    x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    max_workers: pl.constexpr = GROUPED_WORKER_TILE,
+):
+    if TP_SIZE == 1 and num_tokens <= 16 and max_workers >= O_GROUP_IN // K_TILE:
+        mx_projection(
+            x, weight, scale, output, num_tokens,
+            O_GROUP_IN, O_LORA, "attention_grouped_o_a", "attention_grouped_o_a_quant",
+            N_TILE, K_TILE, False, True, LOCAL_O_GROUPS,
+        )
+    else:
+        _grouped_output_inline_quant(x, weight, scale, output, num_tokens, max_workers)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def o_proj(
     attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
@@ -190,11 +213,18 @@ def o_proj(
     grouped_output(
         unrotated, wo_a, wo_a_scale, latent, num_tokens, max_workers=grouped_max_workers,
     )
-    mxfp8_gemm(
-        latent, wo_b, wo_b_scale, output, num_tokens,
-        width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
-        n_tile=128, name_hint="attention_o_b",
-    )
+    if TP_SIZE == 1 and num_tokens <= 16:
+        mx_projection(
+            latent, wo_b, wo_b_scale, output, num_tokens,
+            LOCAL_O_WIDTH, D, "attention_o_b", "attention_o_b_quant", 128, K_TILE,
+            True, False, 1,
+        )
+    else:
+        mxfp8_gemm(
+            latent, wo_b, wo_b_scale, output, num_tokens,
+            width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
+            n_tile=128, name_hint="attention_o_b",
+        )
     return output
 
 
@@ -372,3 +402,126 @@ def prefill_tp_output_all_reduce(
         anchor = pl.read(output, [0, 0])
         pl.write(output, [0, 0], anchor)
     return output
+
+
+def build_o_proj_validation(grouped_max_workers: int):
+    """Build the production output projection with a fixed grouped worker limit."""
+    @pl.jit
+    def o_proj_validation(
+        attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+        wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+        output: pl.InOut[pl.Tensor[[T_DYN, D], pl.FP32]],
+        num_tokens: pl.Scalar[pl.INT32],
+    ):
+        attended.bind_dynamic(0, T_DYN)
+        rope_cos.bind_dynamic(0, T_DYN)
+        rope_sin.bind_dynamic(0, T_DYN)
+        output.bind_dynamic(0, T_DYN)
+        o_proj(
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            output, num_tokens, grouped_max_workers=grouped_max_workers,
+        )
+        return output
+
+    return o_proj_validation
+
+
+def build_o_proj_specs(active_tokens: int):
+    """Build deterministic output-projection fixtures with padded inactive rows."""
+    from golden import ScalarSpec, TensorSpec
+    from quant import golden_mxfp8_quantize, pack_mx_b_scale, quantize_grouped_mxfp8_weight
+
+    tokens = (active_tokens + 15) // 16 * 16
+    values = {}
+
+    def inputs():
+        if not values:
+            generator = torch.Generator().manual_seed(17)
+            attended = torch.randn(tokens, LOCAL_H * HEAD_DIM, generator=generator).bfloat16()
+            attended[active_tokens:] = float("nan")
+            wo_a = torch.randn(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, generator=generator) / O_GROUP_IN**0.5
+            wo_a, wo_a_scale = quantize_grouped_mxfp8_weight(wo_a.bfloat16())
+            wo_b = torch.randn(D, LOCAL_O_WIDTH, generator=generator) / LOCAL_O_WIDTH**0.5
+            wo_b, wo_b_scale = golden_mxfp8_quantize(wo_b)
+            frequencies = 10000.0 ** (-torch.arange(0, ROPE_DIM, 2).float() / ROPE_DIM)
+            angles = torch.arange(tokens).float()[:, None] * frequencies
+            values.update(
+                attended=attended, wo_a=wo_a, wo_a_scale=wo_a_scale,
+                wo_b=wo_b.T.contiguous(),
+                wo_b_scale=pack_mx_b_scale(wo_b_scale.T.contiguous()).view(torch.float8_e8m0fnu),
+                rope_cos=angles.cos(), rope_sin=angles.sin(),
+            )
+        return values
+
+    shapes = (
+        ("attended", [tokens, LOCAL_H * HEAD_DIM], torch.bfloat16),
+        ("wo_a", [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], torch.float8_e4m3fn),
+        ("wo_a_scale", [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], torch.float8_e8m0fnu),
+        ("wo_b", [LOCAL_O_WIDTH, D], torch.float8_e4m3fn),
+        ("wo_b_scale", [LOCAL_O_WIDTH // 32, D], torch.float8_e8m0fnu),
+        ("rope_cos", [tokens, ROPE_DIM // 2], torch.float32),
+        ("rope_sin", [tokens, ROPE_DIM // 2], torch.float32),
+    )
+    specs = [TensorSpec(name, shape, dtype, init_value=lambda name=name: inputs()[name])
+             for name, shape, dtype in shapes]
+    return specs + [
+        TensorSpec("output", [tokens, D], torch.float32, init_value=13.0),
+        ScalarSpec("num_tokens", torch.int32, active_tokens),
+    ]
+
+
+def golden_o_proj_validation(tensors):
+    """Apply the existing projection reference only to active rows."""
+    active = int(tensors["num_tokens"])
+    attended = tensors["attended"][:active].unflatten(-1, (LOCAL_H, HEAD_DIM))
+    result = golden_o_proj(
+        attended, tensors["rope_cos"][:active], tensors["rope_sin"][:active],
+        tensors["wo_a"], tensors["wo_b"], tensors["wo_b_scale"],
+        wo_a_scale=tensors["wo_a_scale"], output_dtype=torch.float32, sequential_projection=True,
+    )
+    tensors["output"][:active].copy_(result)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from golden import ratio_allclose, run
+
+    parser = argparse.ArgumentParser(description="V4.1 output projection branch and padding validation")
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--case", choices=["all", "fast", "low-workers", "tail"], default="all")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    args = parser.parse_args()
+    cases = (("fast", 12, GROUPED_WORKER_TILE), ("low-workers", 12, 8), ("tail", 17, GROUPED_WORKER_TILE))
+    for name, active, workers in cases:
+        if args.case not in ("all", name):
+            continue
+        print(f"[O_PROJ] {name}: active={active}, grouped_max_workers={workers}", flush=True)
+        active_compare = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
+
+        def compare(actual, expected, **kwargs):
+            passed, detail = active_compare(actual[:active], expected[:active], **kwargs)
+            inactive_ok = torch.equal(actual[active:], expected[active:])
+            return passed and inactive_ok, f"{detail}; inactive rows unchanged={inactive_ok}"
+
+        result = run(
+            fn=build_o_proj_validation(workers),
+            specs=build_o_proj_specs(active),
+            golden_fn=golden_o_proj_validation,
+            compare_fn={"output": compare},
+            config={
+                "backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device,
+            },
+            compile_only=args.compile_only,
+            save_data=args.save_data,
+        )
+        if not result.passed:
+            raise SystemExit(result.error or 1)

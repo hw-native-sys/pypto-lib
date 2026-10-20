@@ -12,7 +12,7 @@ import pypto.language as pl
 import torch
 
 from config import FLASH as M, T_DYN, TP_SIZE
-from quant import golden_mxfp8_linear, mxfp8_linear
+from quant import golden_mxfp8_linear, mx_projection, mxfp8_linear
 from rmsnorm import golden_rms_norm, rms_norm
 
 
@@ -24,7 +24,6 @@ ROPE_DIM = M.qk_rope_head_dim
 Q_LORA = M.q_lora_rank
 
 # tiling
-M_TILE = 16
 N_TILE = 128
 K_TILE = 256
 Q_A_N_TILE = 128
@@ -65,75 +64,6 @@ def rope(
 
 
 @pl.jit.inline(auto_scope=False)
-def _mx_projection(
-    x: pl.Tensor,
-    weight: pl.Tensor,
-    scale: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    width: pl.constexpr,
-    output_width: pl.constexpr,
-    name_hint: pl.constexpr,
-    quant_name: pl.constexpr,
-    n_tile: pl.constexpr,
-    k_tile: pl.constexpr,
-):
-    """Quantize activation tiles once, then run separate MX projection tasks."""
-    for mt in pl.parallel((num_tokens + M_TILE - 1) // M_TILE):
-        t0 = mt * M_TILE
-        payload = pl.create_tensor([M_TILE, width], dtype=pl.FP8E4M3FN)
-        scale_size = M_TILE * (width // 32)
-        scale_backing = pl.create_tensor([1, scale_size], dtype=pl.FP8E8M0)
-        for block in pl.spmd(width // K_TILE, name_hint=quant_name):
-            k0 = block * K_TILE
-            rows = pl.min(M_TILE, num_tokens - t0)
-            source = pl.load(x, [t0, k0], [M_TILE, K_TILE], valid_shape=[rows, K_TILE])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), M_TILE, K_TILE)
-            groups = pl.reshape(pl.cast(source, pl.FP32), [M_TILE * (K_TILE // 32), 32])
-            reduce_tmp = pl.create_tile([M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
-            maximum = pl.maximum(pl.row_max(pl.abs(groups), tmp_tile=reduce_tmp), 1e-4)
-            bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
-            exponent = pl.shrs(pl.add(bits, 8388607), 23)
-            group_scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-            quantized = pl.cast(pl.row_expand_div(groups, group_scale), pl.FP8E4M3FN, mode="rint")
-            quantized_tile = pl.reshape(quantized, [M_TILE, K_TILE])
-            payload = pl.store(quantized_tile, [0, k0], payload)
-            signed = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
-            codes = pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
-            flat = pl.reshape(codes, [1, M_TILE * (K_TILE // 32)])
-            pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-            packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=M_TILE, dst_cols=8)
-            packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
-            scale_offset = k0 // K_TILE * M_TILE * (K_TILE // 32)
-            packed_flat = pl.reshape(packed_scale, [1, M_TILE * (K_TILE // 32)])
-            scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
-        activation_scale = pl.tensor.view(scale_backing, [M_TILE, width // 32], layout=pl.MX_A_ZZ)
-        # Synchronize Cube/Vector startup within available clusters.
-        workers = pl.min(output_width // n_tile, pl.system.available_cluster_count())
-        for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
-            block_num = pl.tile.get_block_num()
-            for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
-                block = wave * block_num + worker
-                if block < output_width // n_tile:
-                    n0 = block * n_tile
-                    rows = pl.min(M_TILE, num_tokens - t0)
-                    a0 = pl.load(payload, [0, 0], [M_TILE, k_tile])
-                    sa0 = pl.load(activation_scale, [0, 0], [M_TILE, k_tile // 32])
-                    b0 = pl.load(weight, [0, n0], [k_tile, n_tile])
-                    sb0 = pl.load(scale, [0, n0], [k_tile // 32, n_tile])
-                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                    for k0 in pl.pipeline(k_tile, width, k_tile, stage=2):
-                        a = pl.load(payload, [0, k0], [M_TILE, k_tile])
-                        sa = pl.load(activation_scale, [0, k0 // 32], [M_TILE, k_tile // 32])
-                        b = pl.load(weight, [k0, n0], [k_tile, n_tile])
-                        sb = pl.load(scale, [k0 // 32, n0], [k_tile // 32, n_tile])
-                        acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-                    value = pl.cast(acc, pl.BF16, mode="rint")
-                    output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
 def q_proj_qr(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
@@ -144,9 +74,9 @@ def q_proj_qr(
 ):
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    _mx_projection(
+    mx_projection(
         x, wq_a, wq_a_scale, projected, num_tokens,
-        D, Q_LORA, "attention_q_a", "attention_q_a_quant", Q_A_N_TILE, Q_A_K_TILE,
+        D, Q_LORA, "attention_q_a", "attention_q_a_quant", Q_A_N_TILE, Q_A_K_TILE, False, False, 1,
     )
     norm_blocks = (num_tokens + 7) // 8
     for norm_worker in pl.spmd(norm_blocks, name_hint="attention_q_norm"):
@@ -167,9 +97,9 @@ def q_proj_rope(
 ):
     tokens = pl.tensor.dim(query_latent, 0)
     expanded = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    _mx_projection(
+    mx_projection(
         query_latent, wq_b, wq_b_scale, expanded, num_tokens,
-        Q_LORA, LOCAL_H * HEAD_DIM, "attention_q_b", "attention_q_b_quant", N_TILE, K_TILE,
+        Q_LORA, LOCAL_H * HEAD_DIM, "attention_q_b", "attention_q_b_quant", N_TILE, K_TILE, False, False, 1,
     )
     rope(expanded, rope_cos, rope_sin, query, num_tokens, LOCAL_H, "attention_q_rope", max_workers)
     return query
@@ -188,10 +118,10 @@ def kv_proj_rope(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x, 0)
-    _mx_projection(
+    mx_projection(
         x, wkv, wkv_scale, projected,
         num_tokens,
-        D, HEAD_DIM, "attention_kv", "attention_kv_quant", N_TILE, K_TILE,
+        D, HEAD_DIM, "attention_kv", "attention_kv_quant", N_TILE, K_TILE, False, False, 1,
     )
     normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8
