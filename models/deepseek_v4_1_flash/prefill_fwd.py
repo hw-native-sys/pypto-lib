@@ -20,7 +20,7 @@ Engram is disabled, including host hashes, table lookup and weight preparation.
 import struct
 import math
 from numbers import Integral
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
@@ -115,6 +115,11 @@ PAGES = pl.dynamic("V41_PREFILL_HISTORY_PAGES")
 C2A_TABLE_DYN = pl.dynamic("V41_PREFILL_C2A_TABLE")
 C1A_TABLE_DYN = pl.dynamic("V41_PREFILL_C1A_TABLE")
 LOCAL_EXPERTS = C.N_LOCAL_EXPERTS
+N_LAYERS = M.num_hidden_layers
+C2A_SOURCE_COUNT = sum(M.compress_ratios[source] == 2 for source in M.kv_source_layer_ids)
+KV_SOURCE_COUNT = len(M.kv_source_layer_ids)
+INDEX_SOURCE_COUNT = len(M.index_source_layer_ids)
+MX_GROUP = M.weight_block_size[0]
 RECV_MAX = C.MOE_RECV_MAX
 HC_DIM = M.hc_dim
 HEAD_DIM = M.head_dim
@@ -132,11 +137,6 @@ O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 O_LORA = M.o_lora_rank
 Q_LORA = M.q_lora_rank
 TOPK = M.num_experts_per_tok
-B8 = pl.dynamic("PREFILL_FP8_BLOCKS")
-B4 = pl.dynamic("PREFILL_FP4_BLOCKS")
-S8 = pl.dynamic("PREFILL_SCALE_BLOCKS")
-B16 = pl.dynamic("PREFILL_BF16_VALUES")
-B32 = pl.dynamic("PREFILL_FP32_VALUES")
 
 ROPE_DIM = M.qk_rope_head_dim
 
@@ -426,17 +426,50 @@ def l2_prefill_fwd(
     embedding_ids: pl.Tensor[[CAPACITY], pl.INT64],
     initial_pre: pl.Tensor[[CAPACITY, HC_MULT], pl.FP32],
     identity_rows: pl.Tensor[[CAPACITY], pl.INT32],
-    bank8: pl.Tensor[[B8, 128], pl.FP8E4M3FN],
-    bank4: pl.Tensor[[B4, 128], pl.UINT8],
-    scales8: pl.Tensor[[S8, 128], pl.FP8E8M0],
-    bf16: pl.Tensor[[B16], pl.BF16],
-    dense: pl.Tensor[[B32], pl.FP32],
-    fp8_offsets: pl.Tensor[[40, 9], pl.INT64],
-    fp8_scale_offsets: pl.Tensor[[40, 9], pl.INT64],
-    bf16_offsets: pl.Tensor[[40, 9], pl.INT64],
-    dense_offsets: pl.Tensor[[40, 11], pl.INT64],
-    expert_offsets: pl.Tensor[[40, 3], pl.INT64],
-    expert_scale_offsets: pl.Tensor[[40, 3], pl.INT64],
+    hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
+    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[N_LAYERS * Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[N_LAYERS * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
+    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
+    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
+    c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    compressor_norm_weight: pl.Tensor[[KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
+    index_wk: pl.Tensor[[INDEX_SOURCE_COUNT * HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[INDEX_SOURCE_COUNT * (Q_LORA // MX_GROUP), INDEX_H * INDEX_DIM], pl.FP8E8M0],
+    index_weights_proj: pl.Tensor[[INDEX_SOURCE_COUNT, D, INDEX_H], pl.BF16],
+    hc_ffn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
+    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.FP32],
+    correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    routed_w2: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
+    routed_w3: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     counts: pl.Tensor[[2], pl.INT32],
     replay_rows: pl.Tensor[[CAPACITY], pl.INT32],
@@ -459,8 +492,8 @@ def l2_prefill_fwd(
     index_cache: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 64], pl.UINT8]],
     index_scales: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 4], pl.FP8E8M0]],
     state_cache: pl.InOut[pl.Tensor[[3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
-    final_norm: pl.Tensor[[D], pl.BF16],
-    head: pl.Tensor[[VOCAB, D], pl.BF16],
+    final_norm_weight: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB, D], pl.BF16],
     logit_rows: pl.Tensor[[16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
@@ -492,11 +525,6 @@ def l2_prefill_fwd(
     c1a_index_block_table.bind_dynamic(0, B_DYN)
     c1a_index_block_table.bind_dynamic(1, C1A_TABLE_DYN)
     query_start_loc.bind_dynamic(1, Q_START_DYN)
-    bank8.bind_dynamic(0, B8)
-    bank4.bind_dynamic(0, B4)
-    scales8.bind_dynamic(0, S8)
-    bf16.bind_dynamic(0, B16)
-    dense.bind_dynamic(0, B32)
     freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(1, ROPE_ROWS_DYN)
     rope_cos = pl.create_tensor([3, CAPACITY, 32], dtype=pl.FP32)
@@ -542,7 +570,7 @@ def l2_prefill_fwd(
     slab_mixed = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     slab_rows = pl.create_tensor([MOE_TOKENS], dtype=pl.INT32)
     moe_ready = pl.system.task_dummy(deps=[])
-    for layer in pl.range(40):
+    for layer in pl.range(N_LAYERS):
         stage = layer // 20
         active = pl.read(counts, [stage])
         current_slot = (2 * stage + layer % 2) * CAPACITY
@@ -551,140 +579,56 @@ def l2_prefill_fwd(
         delayed_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [current_slot, 0])
         next_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [next_slot, 0, 0])
         next_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [next_slot, 0])
-        # Use 128-element rows: runtime view coordinates are uint32, while
-        # their row-stride product and storage offsets are uint64.
-        wq_a_offset = pl.cast(pl.max(pl.read(fp8_offsets, [layer, 0]), 0), pl.INDEX)
-        wq_a_storage = pl.slice(bank8, [(D * Q_LORA) // 128, 128], [wq_a_offset // 128, 0])
-        wq_a = pl.reshape(wq_a_storage, [D, Q_LORA])
-        wq_a_scale_offset = pl.cast(pl.max(pl.read(fp8_scale_offsets, [layer, 0]), 0), pl.INDEX)
-        wq_a_scale_storage = pl.slice(scales8, [(D // 32 * Q_LORA) // 128, 128], [wq_a_scale_offset // 128, 0])
-        wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(wq_a_scale_storage, [D // 32, Q_LORA])
-        wq_b_offset = pl.cast(pl.max(pl.read(fp8_offsets, [layer, 1]), 0), pl.INDEX)
-        wq_b_storage = pl.slice(bank8, [(Q_LORA * (LOCAL_H * HEAD_DIM)) // 128, 128], [wq_b_offset // 128, 0])
-        wq_b = pl.reshape(wq_b_storage, [Q_LORA, LOCAL_H * HEAD_DIM])
-        wq_b_scale_offset = pl.cast(pl.max(pl.read(fp8_scale_offsets, [layer, 1]), 0), pl.INDEX)
-        wq_b_scale_storage = pl.slice(scales8, [(Q_LORA // 32 * (LOCAL_H * HEAD_DIM)) // 128, 128], [wq_b_scale_offset // 128, 0])
-        wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(wq_b_scale_storage, [Q_LORA // 32, LOCAL_H * HEAD_DIM])
-        wkv_offset = pl.cast(pl.max(pl.read(fp8_offsets, [layer, 2]), 0), pl.INDEX)
-        wkv_storage = pl.slice(bank8, [(D * HEAD_DIM) // 128, 128], [wkv_offset // 128, 0])
-        wkv = pl.reshape(wkv_storage, [D, HEAD_DIM])
-        wkv_scale_offset = pl.cast(pl.max(pl.read(fp8_scale_offsets, [layer, 2]), 0), pl.INDEX)
-        wkv_scale_storage = pl.slice(scales8, [(D // 32 * HEAD_DIM) // 128, 128], [wkv_scale_offset // 128, 0])
-        wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(wkv_scale_storage, [D // 32, HEAD_DIM])
-        wo_b_offset = pl.cast(pl.max(pl.read(fp8_offsets, [layer, 3]), 0), pl.INDEX)
-        wo_b_storage = pl.slice(bank8, [(LOCAL_O_WIDTH * D) // 128, 128], [wo_b_offset // 128, 0])
-        wo_b = pl.reshape(wo_b_storage, [LOCAL_O_WIDTH, D])
-        wo_b_scale_offset = pl.cast(pl.max(pl.read(fp8_scale_offsets, [layer, 3]), 0), pl.INDEX)
-        wo_b_scale_storage = pl.slice(scales8, [(LOCAL_O_WIDTH // 32 * D) // 128, 128], [wo_b_scale_offset // 128, 0])
-        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(wo_b_scale_storage, [LOCAL_O_WIDTH // 32, D])
-        index_wq_b_offset = pl.cast(pl.max(pl.read(fp8_offsets, [layer, 4]), 0), pl.INDEX)
-        index_wq_b_storage = pl.slice(bank8, [(Q_LORA * (INDEX_H * INDEX_DIM)) // 128, 128], [index_wq_b_offset // 128, 0])
-        index_wq_b = pl.reshape(index_wq_b_storage, [Q_LORA, INDEX_H * INDEX_DIM])
-        index_wq_b_scale_offset = pl.cast(pl.max(pl.read(fp8_scale_offsets, [layer, 4]), 0), pl.INDEX)
-        index_wq_b_scale_storage = pl.slice(scales8, [(Q_LORA // 32 * (INDEX_H * INDEX_DIM)) // 128, 128], [index_wq_b_scale_offset // 128, 0])
-        index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(index_wq_b_scale_storage, [Q_LORA // 32, INDEX_H * INDEX_DIM])
-        shared_w1_offset = pl.cast(pl.max(pl.read(fp8_offsets, [layer, 5]), 0), pl.INDEX)
-        shared_w1_storage = pl.slice(bank8, [(D * MOE_INTER) // 128, 128], [shared_w1_offset // 128, 0])
-        shared_w1 = pl.reshape(shared_w1_storage, [D, MOE_INTER])
-        shared_w1_scale_offset = pl.cast(pl.max(pl.read(fp8_scale_offsets, [layer, 5]), 0), pl.INDEX)
-        shared_w1_scale_storage = pl.slice(scales8, [(D // 32 * MOE_INTER) // 128, 128], [shared_w1_scale_offset // 128, 0])
-        shared_w1_scale: pl.Tensor[[D // 32, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(shared_w1_scale_storage, [D // 32, MOE_INTER])
-        shared_w3_offset = pl.cast(pl.max(pl.read(fp8_offsets, [layer, 6]), 0), pl.INDEX)
-        shared_w3_storage = pl.slice(bank8, [(D * MOE_INTER) // 128, 128], [shared_w3_offset // 128, 0])
-        shared_w3 = pl.reshape(shared_w3_storage, [D, MOE_INTER])
-        shared_w3_scale_offset = pl.cast(pl.max(pl.read(fp8_scale_offsets, [layer, 6]), 0), pl.INDEX)
-        shared_w3_scale_storage = pl.slice(scales8, [(D // 32 * MOE_INTER) // 128, 128], [shared_w3_scale_offset // 128, 0])
-        shared_w3_scale: pl.Tensor[[D // 32, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(shared_w3_scale_storage, [D // 32, MOE_INTER])
-        shared_w2_offset = pl.cast(pl.max(pl.read(fp8_offsets, [layer, 7]), 0), pl.INDEX)
-        shared_w2_storage = pl.slice(bank8, [(MOE_INTER * D) // 128, 128], [shared_w2_offset // 128, 0])
-        shared_w2 = pl.reshape(shared_w2_storage, [MOE_INTER, D])
-        shared_w2_scale_offset = pl.cast(pl.max(pl.read(fp8_scale_offsets, [layer, 7]), 0), pl.INDEX)
-        shared_w2_scale_storage = pl.slice(scales8, [(MOE_INTER // 32 * D) // 128, 128], [shared_w2_scale_offset // 128, 0])
-        shared_w2_scale: pl.Tensor[[MOE_INTER // 32, D], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(shared_w2_scale_storage, [MOE_INTER // 32, D])
-        attn_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 0]), 0), pl.INDEX)
-        attn_norm_storage = pl.slice(bf16, [D], [attn_norm_offset])
-        attn_norm = pl.reshape(attn_norm_storage, [D])
-        ffn_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 1]), 0), pl.INDEX)
-        ffn_norm_storage = pl.slice(bf16, [D], [ffn_norm_offset])
-        ffn_norm = pl.reshape(ffn_norm_storage, [D])
-        q_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 2]), 0), pl.INDEX)
-        q_norm_storage = pl.slice(bf16, [Q_LORA], [q_norm_offset])
-        q_norm = pl.reshape(q_norm_storage, [Q_LORA])
-        kv_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 3]), 0), pl.INDEX)
-        kv_norm_storage = pl.slice(bf16, [HEAD_DIM], [kv_norm_offset])
-        kv_norm = pl.reshape(kv_norm_storage, [HEAD_DIM])
-        wo_a_offset = pl.cast(pl.max(pl.read(fp8_offsets, [layer, 8]), 0), pl.INDEX)
-        wo_a_storage = pl.slice(bank8, [(LOCAL_O_GROUPS * O_GROUP_IN * O_LORA) // 128, 128], [wo_a_offset // 128, 0])
-        wo_a = pl.reshape(wo_a_storage, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA])
-        wo_a_scale_offset = pl.cast(pl.max(pl.read(fp8_scale_offsets, [layer, 8]), 0), pl.INDEX)
-        wo_a_scale_storage = pl.slice(scales8, [(LOCAL_O_GROUPS * (O_GROUP_IN // 32) * O_LORA) // 128, 128], [wo_a_scale_offset // 128, 0])
-        wo_a_scale = pl.reshape(wo_a_scale_storage, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA])
-        publisher_wkv_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 4]), 0), pl.INDEX)
-        publisher_wkv_storage = pl.slice(bf16, [D * HEAD_DIM], [publisher_wkv_offset])
-        publisher_wkv = pl.reshape(publisher_wkv_storage, [D, HEAD_DIM])
-        compressor_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 5]), 0), pl.INDEX)
-        compressor_norm_storage = pl.slice(bf16, [HEAD_DIM], [compressor_norm_offset])
-        compressor_norm = pl.reshape(compressor_norm_storage, [HEAD_DIM])
-        index_wk_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 6]), 0), pl.INDEX)
-        index_wk_storage = pl.slice(bf16, [HEAD_DIM * INDEX_DIM], [index_wk_offset])
-        index_wk = pl.reshape(index_wk_storage, [HEAD_DIM, INDEX_DIM])
-        index_norm_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 7]), 0), pl.INDEX)
-        index_norm_storage = pl.slice(bf16, [INDEX_DIM], [index_norm_offset])
-        index_norm = pl.reshape(index_norm_storage, [INDEX_DIM])
-        index_weights_offset = pl.cast(pl.max(pl.read(bf16_offsets, [layer, 8]), 0), pl.INDEX)
-        index_weights_storage = pl.slice(bf16, [D * INDEX_H], [index_weights_offset])
-        index_weights = pl.reshape(index_weights_storage, [D, INDEX_H])
-        attn_fn_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 0]), 0), pl.INDEX)
-        attn_fn_storage = pl.slice(dense, [MIX_HC * HC_DIM], [attn_fn_offset])
-        attn_fn = pl.reshape(attn_fn_storage, [MIX_HC, HC_DIM])
-        attn_scale_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 1]), 0), pl.INDEX)
-        attn_scale_storage = pl.slice(dense, [3], [attn_scale_offset])
-        attn_scale = pl.reshape(attn_scale_storage, [3])
-        attn_base_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 2]), 0), pl.INDEX)
-        attn_base_storage = pl.slice(dense, [MIX_HC], [attn_base_offset])
-        attn_base = pl.reshape(attn_base_storage, [MIX_HC])
-        ffn_fn_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 3]), 0), pl.INDEX)
-        ffn_fn_storage = pl.slice(dense, [MIX_HC * HC_DIM], [ffn_fn_offset])
-        ffn_fn = pl.reshape(ffn_fn_storage, [MIX_HC, HC_DIM])
-        ffn_scale_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 4]), 0), pl.INDEX)
-        ffn_scale_storage = pl.slice(dense, [3], [ffn_scale_offset])
-        ffn_scale = pl.reshape(ffn_scale_storage, [3])
-        ffn_base_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 5]), 0), pl.INDEX)
-        ffn_base_storage = pl.slice(dense, [MIX_HC], [ffn_base_offset])
-        ffn_base = pl.reshape(ffn_base_storage, [MIX_HC])
-        attn_sink_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 6]), 0), pl.INDEX)
-        attn_sink_storage = pl.slice(dense, [LOCAL_H], [attn_sink_offset])
-        attn_sink = pl.reshape(attn_sink_storage, [LOCAL_H])
-        gate_weight_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 7]), 0), pl.INDEX)
-        gate_weight_storage = pl.slice(dense, [N_EXPERTS * D], [gate_weight_offset])
-        gate_weight = pl.reshape(gate_weight_storage, [N_EXPERTS, D])
-        gate_bias_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 8]), 0), pl.INDEX)
-        gate_bias_storage = pl.slice(dense, [N_EXPERTS], [gate_bias_offset])
-        gate_bias = pl.reshape(gate_bias_storage, [N_EXPERTS])
-        compressor_wkv_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 9]), 0), pl.INDEX)
-        compressor_wkv_storage = pl.slice(dense, [D * HEAD_DIM], [compressor_wkv_offset])
-        compressor_wkv = pl.reshape(compressor_wkv_storage, [D, HEAD_DIM])
-        compressor_wgate_offset = pl.cast(pl.max(pl.read(dense_offsets, [layer, 10]), 0), pl.INDEX)
-        compressor_wgate_storage = pl.slice(dense, [D * HEAD_DIM], [compressor_wgate_offset])
-        compressor_wgate = pl.reshape(compressor_wgate_storage, [D, HEAD_DIM])
-        routed_w1_offset = pl.cast(pl.max(pl.read(expert_offsets, [layer, 0]), 0), pl.INDEX)
-        routed_w1_storage = pl.slice(bank4, [(LOCAL_EXPERTS * (D * MOE_INTER // 256) * 128) // 128, 128], [routed_w1_offset // 128, 0])
-        routed_w1 = pl.reshape(routed_w1_storage, [LOCAL_EXPERTS, D * MOE_INTER // 256, 128])
-        routed_w1_scale_offset = pl.cast(pl.max(pl.read(expert_scale_offsets, [layer, 0]), 0), pl.INDEX)
-        routed_w1_scale_storage = pl.slice(scales8, [(LOCAL_EXPERTS * (D // 32) * MOE_INTER) // 128, 128], [routed_w1_scale_offset // 128, 0])
-        routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // 32), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(routed_w1_scale_storage, [LOCAL_EXPERTS * (D // 32), MOE_INTER])
-        routed_w3_offset = pl.cast(pl.max(pl.read(expert_offsets, [layer, 1]), 0), pl.INDEX)
-        routed_w3_storage = pl.slice(bank4, [(LOCAL_EXPERTS * (D * MOE_INTER // 256) * 128) // 128, 128], [routed_w3_offset // 128, 0])
-        routed_w3 = pl.reshape(routed_w3_storage, [LOCAL_EXPERTS, D * MOE_INTER // 256, 128])
-        routed_w3_scale_offset = pl.cast(pl.max(pl.read(expert_scale_offsets, [layer, 1]), 0), pl.INDEX)
-        routed_w3_scale_storage = pl.slice(scales8, [(LOCAL_EXPERTS * (D // 32) * MOE_INTER) // 128, 128], [routed_w3_scale_offset // 128, 0])
-        routed_w3_scale: pl.Tensor[[LOCAL_EXPERTS * (D // 32), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(routed_w3_scale_storage, [LOCAL_EXPERTS * (D // 32), MOE_INTER])
-        routed_w2_offset = pl.cast(pl.max(pl.read(expert_offsets, [layer, 2]), 0), pl.INDEX)
-        routed_w2_storage = pl.slice(bank4, [(LOCAL_EXPERTS * (D * MOE_INTER // 256) * 128) // 128, 128], [routed_w2_offset // 128, 0])
-        routed_w2 = pl.reshape(routed_w2_storage, [LOCAL_EXPERTS, D * MOE_INTER // 256, 128])
-        routed_w2_scale_offset = pl.cast(pl.max(pl.read(expert_scale_offsets, [layer, 2]), 0), pl.INDEX)
-        routed_w2_scale_storage = pl.slice(scales8, [(LOCAL_EXPERTS * (MOE_INTER // 32) * D) // 128, 128], [routed_w2_scale_offset // 128, 0])
-        routed_w2_scale: pl.Tensor[[LOCAL_EXPERTS * (MOE_INTER // 32), D], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(routed_w2_scale_storage, [LOCAL_EXPERTS * (MOE_INTER // 32), D])
+        kv_source = pl.min(pl.max((layer - 2) // 6, 0), 2)
+        if layer >= 20:
+            kv_source = 3
+        index_source = kv_source
+        if layer >= 24:
+            index_source = (layer - 24) // 4 + 4
+        c2a_source = pl.min(kv_source, 2)
+        layer_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [layer * MIX_HC, 0])
+        layer_attn_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [layer * 3])
+        layer_attn_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [layer * MIX_HC])
+        layer_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [layer * MIX_HC, 0])
+        layer_ffn_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_ffn_scale, [3], [layer * 3])
+        layer_ffn_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_ffn_base, [MIX_HC], [layer * MIX_HC])
+        layer_attn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(attn_norm_weight, [D], [layer * D])
+        layer_ffn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(ffn_norm_weight, [D], [layer * D])
+        layer_q_norm: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(q_norm_weight, [Q_LORA], [layer * Q_LORA])
+        layer_kv_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(kv_norm_weight, [HEAD_DIM], [layer * HEAD_DIM])
+        layer_wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN] = wq_a[layer]
+        layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wq_a_scale, [D // MX_GROUP, Q_LORA], [layer * (D // MX_GROUP), 0])
+        layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN] = wq_b[layer]
+        layer_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wq_b_scale, [Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], [layer * (Q_LORA // MX_GROUP), 0])
+        layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN] = wkv[layer]
+        layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wkv_scale, [D // MX_GROUP, HEAD_DIM], [layer * (D // MX_GROUP), 0])
+        layer_wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[layer]
+        layer_wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [layer * (LOCAL_O_WIDTH // MX_GROUP), 0])
+        layer_shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w1[layer]
+        layer_shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w1_scale, [D // MX_GROUP, MOE_INTER], [layer * (D // MX_GROUP), 0])
+        layer_shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN] = shared_w2[layer]
+        layer_shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w2_scale, [MOE_INTER // MX_GROUP, D], [layer * (MOE_INTER // MX_GROUP), 0])
+        layer_shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w3[layer]
+        layer_shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w3_scale, [D // MX_GROUP, MOE_INTER], [layer * (D // MX_GROUP), 0])
+        layer_attn_sink: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(attn_sink, [LOCAL_H], [layer * LOCAL_H])
+        layer_wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
+        layer_wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
+        layer_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32] = c2a_compressor_wkv[c2a_source]
+        layer_compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32] = c2a_compressor_wgate[c2a_source]
+        layer_compressor_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(compressor_norm_weight, [HEAD_DIM], [kv_source * HEAD_DIM])
+        layer_index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16] = pl.slice(index_wk, [HEAD_DIM, INDEX_DIM], [index_source * HEAD_DIM, 0])
+        layer_index_norm: pl.Tensor[[INDEX_DIM], pl.BF16] = pl.slice(index_norm_weight, [INDEX_DIM], [index_source * INDEX_DIM])
+        layer_index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN] = index_wq_b[index_source]
+        layer_index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(index_wq_b_scale, [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], [index_source * (Q_LORA // MX_GROUP), 0])
+        layer_index_weights: pl.Tensor[[D, INDEX_H], pl.BF16] = index_weights_proj[index_source]
+        layer_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
+        layer_gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [layer * N_EXPERTS])
+        layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
+        layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
+        layer_routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
+        layer_routed_w2_scale: pl.Tensor[[LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [layer * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
+        layer_routed_w3: pl.Tensor[[LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
+        layer_routed_w3_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
         if layer == 20:
             with pl.scope():
                 # Publish C1A source KV for ALL encoder rows before selecting replay.
@@ -695,9 +639,9 @@ def l2_prefill_fwd(
                 hc_pre(encoder_hidden, encoder_pre, encoder_collapsed)
                 norm_tokens = pl.tensor.dim(encoder_collapsed, 0)
                 for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                    rms_norm_tiled(encoder_collapsed, attn_norm, encoder_normalized, norm_block, norm_tokens)
+                    rms_norm_tiled(encoder_collapsed, layer_attn_norm, encoder_normalized, norm_block, norm_tokens)
                 publisher_ready = prefill_publish_decoder(
-                    encoder_normalized, publisher_wkv, compressor_norm, index_wk, index_norm,
+                    encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
                     compressed_cache[3], compressed_scales[3], index_cache[3], index_scales[3],
                     pl.read(counts, [0]),
@@ -713,11 +657,11 @@ def l2_prefill_fwd(
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             attn_output = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             zero_bf16_padding(attn_output, pl.cast(0, pl.INT32))
-            hc_mixes(hidden, attn_fn, attn_scale, attn_base, attn_pre, attn_post, attn_residual)
+            hc_mixes(hidden, layer_attn_fn, layer_attn_scale, layer_attn_base, attn_pre, attn_post, attn_residual)
             hc_pre(hidden, delayed_pre, collapsed)
             norm_tokens = pl.tensor.dim(collapsed, 0)
             for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                rms_norm_tiled(collapsed, attn_norm, normalized, norm_block, norm_tokens)
+                rms_norm_tiled(collapsed, layer_attn_norm, normalized, norm_block, norm_tokens)
             mode = 0
             cache_slot = 0
             rope_slot = 0
@@ -738,23 +682,23 @@ def l2_prefill_fwd(
             state_slot = pl.min(cache_slot, 2)
             if active > 0:
                 prefill_attention(
-                    normalized, wq_a, wq_a_scale, q_norm, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm,
-                    attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos[rope_slot], rope_sin[rope_slot],
+                    normalized, layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_wkv_scale, layer_kv_norm,
+                    layer_attn_sink, layer_wo_a, layer_wo_a_scale, layer_wo_b, layer_wo_b_scale, rope_cos[rope_slot], rope_sin[rope_slot],
                     window_slots[stage], window_indices[stage], window_cache[layer], window_scales[layer],
                     compressed_cache[cache_slot], compressed_scales[cache_slot], token_to_req_indices[stage],
                     c2a_compressed_lens, c1a_compressed_lens, index_cache[cache_slot], index_scales[cache_slot],
                     c2a_index_block_table, c1a_index_block_table, position_ids[stage], compressed_cos, compressed_sin,
-                    compressor_wkv, compressor_wgate, query_start_loc[stage], state_block_table, state_cache[state_slot],
-                    compressor_norm, c2a_compressed_slots, index_wk, index_norm, index_wq_b, index_wq_b_scale,
-                    index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
+                    layer_compressor_wkv, layer_compressor_wgate, query_start_loc[stage], state_block_table, state_cache[state_slot],
+                    layer_compressor_norm, c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale,
+                    layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
                     attn_output, rank, 0, active, layer + 1, mode,
                 )
             hc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden)
         moe_ready = _prefill_moe(
-            attn_hidden, attn_pre, ffn_fn, ffn_scale, ffn_base, ffn_norm, gate_weight, gate_bias,
-            routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
-            mxfp4_pair_lut, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
-            shared_w3, shared_w3_scale, next_pre, ffn_mixed, next_hidden,
+            attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
+            layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
+            mxfp4_pair_lut, layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
+            layer_shared_w3, layer_shared_w3_scale, next_pre, ffn_mixed, next_hidden,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
             moe_ready, active, rank, layer + 1,
@@ -772,8 +716,8 @@ def l2_prefill_fwd(
     hc_head(final_hidden, final_pre, collapsed_head)
     norm_tokens = pl.tensor.dim(collapsed_head, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled_compensated(collapsed_head, final_norm, normalized_head, norm_block, norm_tokens)
-    lm_head(normalized_head, head, logit_rows, logits, head_hidden, head_hidden_done,
+        rms_norm_tiled_compensated(collapsed_head, final_norm_weight, normalized_head, norm_block, norm_tokens)
+    lm_head(normalized_head, lm_head_weight, logit_rows, logits, head_hidden, head_hidden_done,
             head_logits, head_logits_done, rank, 0, 1, 1)
     greedy_sample(logits, sampled_ids)
     return logits, sampled_ids
@@ -785,17 +729,50 @@ def l3_prefill_fwd(
     embedding_ids: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
     initial_pre: pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32],
     identity_rows: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
-    bank8: pl.Tensor[[RANKS, B8, 128], pl.FP8E4M3FN],
-    bank4: pl.Tensor[[RANKS, B4, 128], pl.UINT8],
-    scales8: pl.Tensor[[RANKS, S8, 128], pl.FP8E8M0],
-    bf16: pl.Tensor[[RANKS, B16], pl.BF16],
-    dense: pl.Tensor[[RANKS, B32], pl.FP32],
-    fp8_offsets: pl.Tensor[[RANKS, 40, 9], pl.INT64],
-    fp8_scale_offsets: pl.Tensor[[RANKS, 40, 9], pl.INT64],
-    bf16_offsets: pl.Tensor[[RANKS, 40, 9], pl.INT64],
-    dense_offsets: pl.Tensor[[RANKS, 40, 11], pl.INT64],
-    expert_offsets: pl.Tensor[[RANKS, 40, 3], pl.INT64],
-    expert_scale_offsets: pl.Tensor[[RANKS, 40, 3], pl.INT64],
+    hc_attn_fn: pl.Tensor[[RANKS, N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[RANKS, N_LAYERS * 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[RANKS, N_LAYERS * MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[RANKS, N_LAYERS * D], pl.BF16],
+    wq_a: pl.Tensor[[RANKS, N_LAYERS, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[RANKS, N_LAYERS * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[RANKS, N_LAYERS * Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[RANKS, N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[RANKS, N_LAYERS * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[RANKS, N_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[RANKS, N_LAYERS * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[RANKS, N_LAYERS * HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[RANKS, N_LAYERS * LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[RANKS, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[RANKS, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[RANKS, N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
+    c2a_compressor_wkv: pl.Tensor[[RANKS, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
+    c2a_compressor_wgate: pl.Tensor[[RANKS, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
+    c1a_compressor_wkv: pl.Tensor[[RANKS, D, HEAD_DIM], pl.BF16],
+    compressor_norm_weight: pl.Tensor[[RANKS, KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
+    index_wk: pl.Tensor[[RANKS, INDEX_SOURCE_COUNT * HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[RANKS, INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[RANKS, INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[RANKS, INDEX_SOURCE_COUNT * (Q_LORA // MX_GROUP), INDEX_H * INDEX_DIM], pl.FP8E8M0],
+    index_weights_proj: pl.Tensor[[RANKS, INDEX_SOURCE_COUNT, D, INDEX_H], pl.BF16],
+    hc_ffn_fn: pl.Tensor[[RANKS, N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[RANKS, N_LAYERS * 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[RANKS, N_LAYERS * MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[RANKS, N_LAYERS * D], pl.BF16],
+    gate_weight: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS, D], pl.FP32],
+    correction_bias: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    routed_w2: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
+    routed_w3: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    shared_w1: pl.Tensor[[RANKS, N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[RANKS, N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w2: pl.Tensor[[RANKS, N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[RANKS, N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    shared_w3: pl.Tensor[[RANKS, N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[RANKS, N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     mxfp4_pair_lut: pl.Tensor[[RANKS, 2, 256], pl.INT16],
     counts: pl.Tensor[[RANKS, 2], pl.INT32],
     replay_rows: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
@@ -818,8 +795,8 @@ def l3_prefill_fwd(
     index_cache: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 64], pl.UINT8]],
     index_scales: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 4], pl.FP8E8M0]],
     state_cache: pl.InOut[pl.Tensor[[RANKS, 3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
-    final_norm: pl.Tensor[[RANKS, D], pl.BF16],
-    head: pl.Tensor[[RANKS, VOCAB, D], pl.BF16],
+    final_norm_weight: pl.Tensor[[RANKS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[RANKS, VOCAB, D], pl.BF16],
     logit_rows: pl.Tensor[[RANKS, 16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
@@ -919,17 +896,24 @@ def l3_prefill_fwd(
             embedding_ids[rank],
             initial_pre[rank],
             identity_rows[rank],
-            bank8[rank],
-            bank4[rank],
-            scales8[rank],
-            bf16[rank],
-            dense[rank],
-            fp8_offsets[rank],
-            fp8_scale_offsets[rank],
-            bf16_offsets[rank],
-            dense_offsets[rank],
-            expert_offsets[rank],
-            expert_scale_offsets[rank],
+            hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
+            attn_norm_weight[rank],
+            wq_a[rank], wq_a_scale[rank], q_norm_weight[rank],
+            wq_b[rank], wq_b_scale[rank],
+            wkv[rank], wkv_scale[rank], kv_norm_weight[rank],
+            attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale[rank],
+            c2a_compressor_wkv[rank], c2a_compressor_wgate[rank], c1a_compressor_wkv[rank],
+            compressor_norm_weight[rank],
+            index_wk[rank], index_norm_weight[rank],
+            index_wq_b[rank], index_wq_b_scale[rank], index_weights_proj[rank],
+            hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
+            ffn_norm_weight[rank], gate_weight[rank], correction_bias[rank],
+            routed_w1[rank], routed_w1_scale[rank],
+            routed_w2[rank], routed_w2_scale[rank],
+            routed_w3[rank], routed_w3_scale[rank],
+            shared_w1[rank], shared_w1_scale[rank],
+            shared_w2[rank], shared_w2_scale[rank],
+            shared_w3[rank], shared_w3_scale[rank],
             mxfp4_pair_lut[rank],
             counts[rank],
             replay_rows[rank],
@@ -950,8 +934,8 @@ def l3_prefill_fwd(
             index_cache[rank],
             index_scales[rank],
             state_cache[rank],
-            final_norm[rank],
-            head[rank],
+            final_norm_weight[rank],
+            lm_head_weight[rank],
             logit_rows[rank],
             x_hc_out[rank], pre_mix_out[rank],
             logits[rank],
@@ -980,17 +964,20 @@ PREFILL_TENSORS = (
     "embedding_ids",
     "initial_pre",
     "identity_rows",
-    "bank8",
-    "bank4",
-    "scales8",
-    "bf16",
-    "dense",
-    "fp8_offsets",
-    "fp8_scale_offsets",
-    "bf16_offsets",
-    "dense_offsets",
-    "expert_offsets",
-    "expert_scale_offsets",
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+    "attn_norm_weight",
+    "wq_a", "wq_a_scale", "q_norm_weight",
+    "wq_b", "wq_b_scale",
+    "wkv", "wkv_scale", "kv_norm_weight",
+    "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale",
+    "c2a_compressor_wkv", "c2a_compressor_wgate", "c1a_compressor_wkv",
+    "compressor_norm_weight",
+    "index_wk", "index_norm_weight",
+    "index_wq_b", "index_wq_b_scale", "index_weights_proj",
+    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
+    "ffn_norm_weight", "gate_weight", "correction_bias",
+    "routed_w1", "routed_w1_scale", "routed_w2", "routed_w2_scale", "routed_w3", "routed_w3_scale",
+    "shared_w1", "shared_w1_scale", "shared_w2", "shared_w2_scale", "shared_w3", "shared_w3_scale",
     "mxfp4_pair_lut",
     "counts",
     "replay_rows",
@@ -1011,8 +998,8 @@ PREFILL_TENSORS = (
     "index_cache",
     "index_scales",
     "state_cache",
-    "final_norm",
-    "head",
+    "final_norm_weight",
+    "lm_head_weight",
     "logit_rows",
     "x_hc_out", "pre_mix_out",
     "logits",
@@ -1128,254 +1115,212 @@ class PrefillCheckpoint:
         )
 
 
+def forward_weight_layouts(local_experts: int):
+    """Return TP1 rank-local weight layouts shared by prefill and decode."""
+    layers = M.num_hidden_layers
+    d = M.hidden_size
+    inter = M.moe_intermediate_size
+    local_h = M.num_attention_heads // TP_SIZE
+    local_groups = M.o_groups // TP_SIZE
+    o_width = local_groups * M.o_lora_rank
+    o_group_in = M.num_attention_heads * M.head_dim // M.o_groups
+    experts = C.EP_SIZE * local_experts
+    packed_rows = d * inter // 256
+    kv_sources = len(M.kv_source_layer_ids)
+    index_sources = len(M.index_source_layer_ids)
+    c2a_sources = sum(M.compress_ratios[source] == 2 for source in M.kv_source_layer_ids)
+    return {
+        "hc_attn_fn": ((layers * M.mix_hc, M.hc_dim), torch.float32),
+        "hc_attn_scale": ((layers * 3,), torch.float32),
+        "hc_attn_base": ((layers * M.mix_hc,), torch.float32),
+        "attn_norm_weight": ((layers * d,), torch.bfloat16),
+        "wq_a": ((layers, d, M.q_lora_rank), torch.float8_e4m3fn),
+        "wq_a_scale": ((layers * (d // 32), M.q_lora_rank), torch.float8_e8m0fnu),
+        "q_norm_weight": ((layers * M.q_lora_rank,), torch.bfloat16),
+        "wq_b": ((layers, M.q_lora_rank, local_h * M.head_dim), torch.float8_e4m3fn),
+        "wq_b_scale": ((layers * (M.q_lora_rank // 32), local_h * M.head_dim), torch.float8_e8m0fnu),
+        "wkv": ((layers, d, M.head_dim), torch.float8_e4m3fn),
+        "wkv_scale": ((layers * (d // 32), M.head_dim), torch.float8_e8m0fnu),
+        "kv_norm_weight": ((layers * M.head_dim,), torch.bfloat16),
+        "attn_sink": ((layers * local_h,), torch.float32),
+        "wo_a": ((layers * local_groups, o_group_in, M.o_lora_rank), torch.float8_e4m3fn),
+        "wo_a_scale": ((layers * local_groups, o_group_in // 32, M.o_lora_rank), torch.float8_e8m0fnu),
+        "wo_b": ((layers, o_width, d), torch.float8_e4m3fn),
+        "wo_b_scale": ((layers * (o_width // 32), d), torch.float8_e8m0fnu),
+        "c2a_compressor_wkv": ((c2a_sources, d, M.head_dim), torch.float32),
+        "c2a_compressor_wgate": ((c2a_sources, d, M.head_dim), torch.float32),
+        "c1a_compressor_wkv": ((d, M.head_dim), torch.bfloat16),
+        "compressor_norm_weight": ((kv_sources * M.head_dim,), torch.bfloat16),
+        "index_wk": ((index_sources * M.head_dim, M.index_head_dim), torch.bfloat16),
+        "index_norm_weight": ((index_sources * M.index_head_dim,), torch.bfloat16),
+        "index_wq_b": ((index_sources, M.q_lora_rank, M.index_n_heads * M.index_head_dim), torch.float8_e4m3fn),
+        "index_wq_b_scale": ((index_sources * (M.q_lora_rank // 32), M.index_n_heads * M.index_head_dim), torch.float8_e8m0fnu),
+        "index_weights_proj": ((index_sources, d, M.index_n_heads), torch.bfloat16),
+        "hc_ffn_fn": ((layers * M.mix_hc, M.hc_dim), torch.float32),
+        "hc_ffn_scale": ((layers * 3,), torch.float32),
+        "hc_ffn_base": ((layers * M.mix_hc,), torch.float32),
+        "ffn_norm_weight": ((layers * d,), torch.bfloat16),
+        "gate_weight": ((layers * experts, d), torch.float32),
+        "correction_bias": ((layers * experts,), torch.float32),
+        "routed_w1": ((layers * local_experts, packed_rows, 128), torch.uint8),
+        "routed_w1_scale": ((layers * (local_experts * (d // 32)), inter), torch.float8_e8m0fnu),
+        "routed_w2": ((layers * local_experts, packed_rows, 128), torch.uint8),
+        "routed_w2_scale": ((layers * (local_experts * (inter // 32)), d), torch.float8_e8m0fnu),
+        "routed_w3": ((layers * local_experts, packed_rows, 128), torch.uint8),
+        "routed_w3_scale": ((layers * (local_experts * (d // 32)), inter), torch.float8_e8m0fnu),
+        "shared_w1": ((layers, d, inter), torch.float8_e4m3fn),
+        "shared_w1_scale": ((layers * (d // 32), inter), torch.float8_e8m0fnu),
+        "shared_w2": ((layers, inter, d), torch.float8_e4m3fn),
+        "shared_w2_scale": ((layers * (inter // 32), d), torch.float8_e8m0fnu),
+        "shared_w3": ((layers, d, inter), torch.float8_e4m3fn),
+        "shared_w3_scale": ((layers * (d // 32), inter), torch.float8_e8m0fnu),
+        "final_norm_weight": ((d,), torch.bfloat16),
+        "lm_head_weight": ((M.vocab_size // TP_SIZE, d), torch.bfloat16),
+    }
+
+
 class ResidentPrefillWeights:
-    """Pack Engram-disabled prefill weights into TP1/EP4 or TP1/EP8 layouts.
+    """Stream native checkpoint weights into named TP1 forward tensors."""
 
-    Routed weights retain their FP4 nibbles; MXFP8 payloads retain their bytes.
-    Scale bytes are reordered into the native MX_B_NN layout. Only projections
-    whose released inference dtype is BF16 or FP32 are decoded on the host.
-    Offsets count elements in their named bank. Large byte banks use 128-column
-    rows so runtime shapes and slice coordinates fit their uint32 ABI.
-    """
-
-    bank_columns = 128
-    fp8_names = (
-        "attn.wq_a",
-        "attn.wq_b",
-        "attn.wkv",
-        "attn.wo_b",
-        "attn.indexer.wq_b",
-        "ffn.shared_experts.w1",
-        "ffn.shared_experts.w3",
-        "ffn.shared_experts.w2",
-        "attn.wo_a",
+    fp8_projections = (
+        ("wq_a", "attn.wq_a"), ("wq_b", "attn.wq_b"), ("wkv", "attn.wkv"),
+        ("wo_a", "attn.wo_a"), ("wo_b", "attn.wo_b"),
+        ("shared_w1", "ffn.shared_experts.w1"), ("shared_w2", "ffn.shared_experts.w2"),
+        ("shared_w3", "ffn.shared_experts.w3"),
     )
-    bf16_names = (
-        "attn_norm.weight",
-        "ffn_norm.weight",
-        "attn.q_norm.weight",
-        "attn.kv_norm.weight",
-        "attn.compressor.wkv.weight",
-        "attn.compressor.norm.weight",
-        "attn.indexer.wk.weight",
-        "attn.indexer.k_norm.weight",
-        "attn.indexer.weights_proj.weight",
+    layer_projections = (
+        ("hc_attn_fn", "hc_attn_fn"), ("hc_attn_scale", "hc_attn_scale"),
+        ("hc_attn_base", "hc_attn_base"), ("attn_norm_weight", "attn_norm.weight"),
+        ("q_norm_weight", "attn.q_norm.weight"), ("kv_norm_weight", "attn.kv_norm.weight"),
+        ("attn_sink", "attn.attn_sink"), ("hc_ffn_fn", "hc_ffn_fn"),
+        ("hc_ffn_scale", "hc_ffn_scale"), ("hc_ffn_base", "hc_ffn_base"),
+        ("ffn_norm_weight", "ffn_norm.weight"), ("gate_weight", "ffn.gate.weight"),
+        ("correction_bias", "ffn.gate.bias"),
     )
-    dense_names = (
-        "hc_attn_fn",
-        "hc_attn_scale",
-        "hc_attn_base",
-        "hc_ffn_fn",
-        "hc_ffn_scale",
-        "hc_ffn_base",
-        "attn.attn_sink",
-        "ffn.gate.weight",
-        "ffn.gate.bias",
-        "attn.compressor.wkv.weight",
-        "attn.compressor.wgate.weight",
-    )
-    expert_names = ("w1", "w3", "w2")
 
     def __init__(self, checkpoint: PrefillCheckpoint, *, ep_size: int = 4):
         if isinstance(ep_size, bool) or not isinstance(ep_size, Integral) or ep_size not in (4, 8):
             raise ValueError("resident prefill requires EP4 or EP8")
+        if TP_SIZE != 1 or ep_size != C.EP_SIZE:
+            raise ValueError("resident weights require TP1 and the configured EP size")
         self.ranks = int(ep_size)
         self.local_experts = M.n_routed_experts // self.ranks
         self.checkpoint = checkpoint
-        layers = M.num_hidden_layers
-        self.fp8_offsets = torch.full((layers, len(self.fp8_names)), -1, dtype=torch.int64)
-        self.fp8_scale_offsets = torch.full_like(self.fp8_offsets, -1)
-        self.bf16_offsets = torch.full((layers, len(self.bf16_names)), -1, dtype=torch.int64)
-        self.dense_offsets = torch.full((layers, len(self.dense_names)), -1, dtype=torch.int64)
-        self.expert_offsets = torch.empty((layers, 3), dtype=torch.int64)
-        self.expert_scale_offsets = torch.empty_like(self.expert_offsets)
-        self.fp8_entries, self.bf16_entries, self.dense_entries = [], [], []
-        self.fp8_values = self.scale_values = self.bf16_values = self.dense_values = 0
-        for layer in range(layers):
-            for column, suffix in enumerate(self.fp8_names):
-                stem = f"layers.{layer}.{suffix}"
-                if stem + ".weight" not in checkpoint.weight_map:
-                    continue
-                header = self._header(stem + ".weight")
-                n, k = header["shape"]
-                scale = self._header(stem + ".scale")
-                if (
-                    header["dtype"] != "F8_E4M3"
-                    or n % 32
-                    or k % 64
-                    or scale["dtype"] != "F8_E8M0"
-                    or scale["shape"] != [n // 32, k // 32]
-                ):
-                    raise ValueError(f"unsupported native MXFP8 weight layout: {stem}")
-                assert n * k % self.bank_columns == 0
-                assert (n * k // 32) % self.bank_columns == 0
-                self.fp8_offsets[layer, column] = self.fp8_values
-                self.fp8_scale_offsets[layer, column] = self.scale_values
-                self.fp8_entries.append((stem, self.fp8_values, self.scale_values))
-                self.fp8_values += n * k
-                self.scale_values += n * k // 32
-            for column, suffix in enumerate(self.bf16_names):
-                name = f"layers.{layer}.{suffix}"
-                if name not in checkpoint.weight_map:
-                    continue
-                if suffix == "attn.compressor.wkv.weight" and M.compress_ratios[layer] != 1:
-                    continue
-                header = self._header(name)
-                if header["dtype"] not in ("F32", "BF16"):
-                    raise ValueError(f"unsupported BF16 inference weight: {name}")
-                self.bf16_offsets[layer, column] = self.bf16_values
-                self.bf16_entries.append((name, column, self.bf16_values))
-                self.bf16_values += math.prod(header["shape"])
-            for column, suffix in enumerate(self.dense_names):
-                name = f"layers.{layer}.{suffix}"
-                if name not in checkpoint.weight_map:
-                    continue
-                if column in (9, 10) and M.compress_ratios[layer] != 2:
-                    continue
-                header = self._header(name)
-                if header["dtype"] not in ("F32", "BF16"):
-                    raise ValueError(f"unsupported FP32 inference weight: {name}")
-                # Keep native matrix bases aligned after small mHC scalar vectors.
-                self.dense_values = (self.dense_values + 127) // 128 * 128
-                self.dense_offsets[layer, column] = self.dense_values
-                self.dense_entries.append((name, column, self.dense_values))
-                self.dense_values += math.prod(header["shape"])
-        self.fp4_values = 0
-        for layer in range(layers):
-            for column in range(3):
-                self.expert_offsets[layer, column] = self.fp4_values
-                self.expert_scale_offsets[layer, column] = self.scale_values
-                self.fp4_values += self.local_experts * M.hidden_size * M.moe_intermediate_size // 2
-                self.scale_values += self.local_experts * M.hidden_size * M.moe_intermediate_size // 32
-        assert (M.hidden_size * M.moe_intermediate_size // 2) % self.bank_columns == 0
-        assert (M.hidden_size * M.moe_intermediate_size // 32) % self.bank_columns == 0
-        for values in (self.fp4_values, self.fp8_values, self.scale_values):
-            assert values % self.bank_columns == 0
-            assert values // self.bank_columns < 2**32
-        for offsets in (
-            self.fp8_offsets, self.fp8_scale_offsets, self.expert_offsets, self.expert_scale_offsets,
-        ):
-            assert bool((offsets[offsets >= 0] % self.bank_columns == 0).all())
-        assert self.bf16_values * 2 < 2**32
-        assert self.dense_values * 4 < 2**32
-
-    def _header(self, name: str) -> dict[str, Any]:
-        checkpoint = self.checkpoint
-        shard = checkpoint.weight_map[name]
-        if shard not in checkpoint._headers:
-            path = (checkpoint.root / shard).resolve()
-            if not path.is_relative_to(checkpoint.root):
-                raise ValueError(f"checkpoint shard leaves its root: {shard}")
-            with path.open("rb") as file:
-                size = struct.unpack("<Q", file.read(8))[0]
-                if size > 64 * 1024 * 1024:
-                    raise ValueError(f"safetensors header is too large: {shard}")
-                checkpoint._headers[shard] = json.loads(file.read(size))
-        return checkpoint._headers[shard][name]
-
-    @property
-    def tensor_layouts(self):
-        """Return contiguous bank allocation shapes and exact storage dtypes."""
-        return {
-            "bank4": ((self.fp4_values // self.bank_columns, self.bank_columns), torch.uint8),
-            "bank8": ((self.fp8_values // self.bank_columns, self.bank_columns), torch.float8_e4m3fn),
-            "scales8": ((self.scale_values // self.bank_columns, self.bank_columns), torch.float8_e8m0fnu),
-            "bf16": ((self.bf16_values,), torch.bfloat16),
-            "dense": ((self.dense_values,), torch.float32),
-        }
+        self.tensor_layouts = forward_weight_layouts(self.local_experts)
+        self.entries = []
+        for layer in range(M.num_hidden_layers):
+            for target, suffix in self.fp8_projections:
+                self.entries.append((target, f"layers.{layer}.{suffix}", layer, M.num_hidden_layers, "fp8"))
+            for target, suffix in self.layer_projections:
+                self.entries.append((target, f"layers.{layer}.{suffix}", layer, M.num_hidden_layers, "plain"))
+        for slot, layer in enumerate(M.kv_source_layer_ids):
+            self.entries.append(("compressor_norm_weight", f"layers.{layer}.attn.compressor.norm.weight",
+                                 slot, len(M.kv_source_layer_ids), "plain"))
+        for slot, layer in enumerate(M.index_source_layer_ids):
+            prefix = f"layers.{layer}.attn.indexer."
+            self.entries.extend((
+                ("index_wq_b", prefix + "wq_b", slot, len(M.index_source_layer_ids), "fp8"),
+                ("index_wk", prefix + "wk.weight", slot, len(M.index_source_layer_ids), "transpose"),
+                ("index_norm_weight", prefix + "k_norm.weight", slot, len(M.index_source_layer_ids), "plain"),
+                ("index_weights_proj", prefix + "weights_proj.weight", slot, len(M.index_source_layer_ids), "transpose"),
+            ))
+        c2a_sources = [source for source in M.kv_source_layer_ids if M.compress_ratios[source] == 2]
+        for slot, layer in enumerate(c2a_sources):
+            for projection in ("wkv", "wgate"):
+                name = f"layers.{layer}.attn.compressor.{projection}.weight"
+                self.entries.append(("c2a_compressor_" + projection, name, slot, len(c2a_sources), "transpose"))
+        c1a_source = next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == 1)
+        self.entries.extend((
+            ("c1a_compressor_wkv", f"layers.{c1a_source}.attn.compressor.wkv.weight", 0, 1, "transpose"),
+            ("final_norm_weight", "norm.weight", 0, 1, "plain"),
+            ("lm_head_weight", "head.weight", 0, 1, "plain"),
+        ))
+        for target, name, slot, slots, kind in self.entries:
+            optional = (target in ("index_wk", "index_norm_weight")
+                        and M.index_source_layer_ids[slot] not in M.kv_source_layer_ids)
+            required = (name + ".weight", name + ".scale") if kind == "fp8" else (name,)
+            for key in required:
+                if key not in checkpoint.weight_map and not optional:
+                    raise ValueError(f"checkpoint is missing required forward weight: {key}")
 
     @property
     def bytes_per_rank(self):
-        return sum(
-            math.prod(shape) * torch.empty((), dtype=dtype).element_size()
-            for shape, dtype in self.tensor_layouts.values()
-        )
-
-    @property
-    def offset_tensors(self):
-        return {
-            name: getattr(self, name)
-            for name in (
-                "fp8_offsets",
-                "fp8_scale_offsets",
-                "bf16_offsets",
-                "dense_offsets",
-                "expert_offsets",
-                "expert_scale_offsets",
-            )
-        }
+        return sum(math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+                   for shape, dtype in self.tensor_layouts.values())
 
     def upload(self, runtime, rank: int, handles):
-        """Upload a rank's persistent banks with one projection staged at a time."""
+        """Upload one projection at a time into persistent named allocations."""
         from quant import pack_mx_b_scale, pack_mxfp4_weight_tiles
 
         if rank not in range(self.ranks):
             raise ValueError(f"expert rank must be in [0, {self.ranks})")
         checkpoint = self.checkpoint
 
-        def copy(bank, data, offset):
+        def copy(target, data, slot=0, slots=1):
+            shape, dtype = self.tensor_layouts[target]
+            elements = math.prod(shape) // slots
             data = data.contiguous()
-            if bank in ("bank4", "bank8", "scales8"):
-                assert int(offset) % self.bank_columns == 0
-                assert data.numel() % self.bank_columns == 0
-            runtime.copy_to(
-                handles[bank].data_ptr,
-                data.data_ptr(),
-                data.numel() * data.element_size(),
-                dst_offset=int(offset) * data.element_size(),
-                worker_id=rank,
-            )
+            if data.dtype != dtype or data.numel() != elements:
+                raise ValueError(f"checkpoint tensor does not match {target}: {data.shape}, {data.dtype}")
+            runtime.copy_to(handles[target].data_ptr, data.data_ptr(), data.numel() * data.element_size(),
+                            dst_offset=slot * elements * data.element_size(), worker_id=rank)
 
-        for stem, offset, scale_offset in self.fp8_entries:
-            weight = checkpoint.tensor(stem + ".weight")
-            codes = checkpoint.tensor(stem + ".scale").view(torch.uint8)
-            logical_scale = codes.repeat_interleave(32, dim=0).t().contiguous()
-            if stem.endswith(".attn.wo_a"):
-                # Checkpoint [G*N, K] becomes grouped [G, K, N].
+        for target, name, slot, slots, kind in self.entries:
+            if kind == "fp8":
+                shape, dtype = self.tensor_layouts[target]
+                weight = checkpoint.tensor(name + ".weight")
+                scale = checkpoint.tensor(name + ".scale")
                 n, k = weight.shape
-                if n != M.o_groups * M.o_lora_rank or k != M.num_attention_heads * M.head_dim // M.o_groups:
-                    raise ValueError(f"unsupported grouped Wo-A weight shape: {stem}")
-                weight = weight.reshape(M.o_groups, M.o_lora_rank, k).transpose(-1, -2)
-                logical_scale = logical_scale.reshape(k // 32, M.o_groups, M.o_lora_rank).permute(1, 0, 2)
+                expected = ((M.o_groups * M.o_lora_rank, shape[-2]) if target == "wo_a"
+                            else (shape[-1], shape[-2]))
+                valid_payload = weight.dtype == torch.float8_e4m3fn and (n, k) == expected
+                valid_scale = scale.dtype == torch.float8_e8m0fnu and tuple(scale.shape) == (n // 32, k // 32)
+                if not valid_payload or not valid_scale or n % 32 or k % 64:
+                    raise ValueError(f"unsupported native MXFP8 weight layout: {name}")
+                logical_scale = scale.view(torch.uint8).repeat_interleave(32, dim=0).t().contiguous()
+                if target == "wo_a":
+                    weight = weight.reshape(M.o_groups, M.o_lora_rank, k).transpose(-1, -2)
+                    logical_scale = logical_scale.reshape(k // 32, M.o_groups, M.o_lora_rank).permute(1, 0, 2)
+                else:
+                    weight = weight.t()
+                copy(target, weight, slot, slots)
+                packed_scale = pack_mx_b_scale(logical_scale).view(torch.float8_e8m0fnu)
+                copy(target + "_scale", packed_scale, slot, slots)
             else:
-                weight = weight.t()
-            copy("bank8", weight, offset)
-            copy("scales8", pack_mx_b_scale(logical_scale).view(torch.float8_e8m0fnu), scale_offset)
-        for name, column, offset in self.bf16_entries:
-            value = checkpoint.tensor(name).to(torch.bfloat16)
-            if name.endswith((".attn.compressor.wkv.weight", ".attn.indexer.wk.weight", ".attn.indexer.weights_proj.weight")):
-                value = value.t()
-            copy("bf16", value, offset)
-        for name, column, offset in self.dense_entries:
-            value = checkpoint.tensor(name).float()
-            if column in (9, 10):
-                value = value.t()
-            copy("dense", value, offset)
+                shape, dtype = self.tensor_layouts[target]
+                if name not in checkpoint.weight_map:
+                    value = torch.zeros(math.prod(shape) // slots, dtype=dtype)
+                else:
+                    value = checkpoint.tensor(name)
+                    if value.dtype not in (torch.float32, torch.bfloat16):
+                        raise ValueError(f"unsupported inference weight dtype: {name}")
+                    valid_head = value.dtype == torch.bfloat16 and tuple(value.shape) == shape
+                    if target == "lm_head_weight" and not valid_head:
+                        raise ValueError("the native LM head requires the released BF16 checkpoint matrix")
+                    value = value.to(dtype)
+                    if kind == "transpose":
+                        value = value.t()
+                copy(target, value, slot, slots)
         for layer in range(M.num_hidden_layers):
-            for column, projection in enumerate(self.expert_names):
-                k, n = (M.moe_intermediate_size, M.hidden_size) if projection == "w2" else (M.hidden_size, M.moe_intermediate_size)
+            for projection in ("w1", "w2", "w3"):
+                k, n = ((M.moe_intermediate_size, M.hidden_size) if projection == "w2"
+                        else (M.hidden_size, M.moe_intermediate_size))
                 logical_scales = torch.empty((self.local_experts * (k // 32), n), dtype=torch.uint8)
-                offset = int(self.expert_offsets[layer, column])
                 for local in range(self.local_experts):
                     expert = rank * self.local_experts + local
                     stem = f"layers.{layer}.ffn.experts.{expert}.{projection}"
                     weight = checkpoint.tensor(stem + ".weight")
                     scale = checkpoint.tensor(stem + ".scale")
-                    if (
-                        weight.dtype != torch.int8
-                        or tuple(weight.shape) != (n, k // 2)
-                        or scale.dtype != torch.float8_e8m0fnu
-                        or tuple(scale.shape) != (n, k // 32)
-                    ):
+                    valid_payload = weight.dtype == torch.int8 and tuple(weight.shape) == (n, k // 2)
+                    valid_scale = scale.dtype == torch.float8_e8m0fnu and tuple(scale.shape) == (n, k // 32)
+                    if not valid_payload or not valid_scale:
                         raise ValueError(f"unsupported native MXFP4 weight layout: {stem}")
                     packed = pack_mxfp4_weight_tiles(weight, 256, 256)
-                    copy("bank4", packed, offset + local * (n * k // 2))
+                    copy("routed_" + projection, packed, layer * self.local_experts + local,
+                         M.num_hidden_layers * self.local_experts)
                     logical_scales[local * (k // 32) : (local + 1) * (k // 32)] = scale.view(torch.uint8).t()
-                copy(
-                    "scales8",
-                    pack_mx_b_scale(logical_scales).view(torch.float8_e8m0fnu),
-                    self.expert_scale_offsets[layer, column],
-                )
+                packed_scale = pack_mx_b_scale(logical_scales).view(torch.float8_e8m0fnu)
+                copy("routed_" + projection + "_scale", packed_scale, layer, M.num_hidden_layers)
 
     def lookup_rows(self, token_ids: torch.Tensor):
         """Read only the prompt's BF16 token embeddings."""
@@ -1506,7 +1451,6 @@ def prepare_prefill_inputs(
 
 
 def prepare_resident_inputs(
-    checkpoint: PrefillCheckpoint,
     weights: ResidentPrefillWeights,
     token_ids: torch.Tensor | Sequence[int],
     capacity: int,
@@ -1516,7 +1460,7 @@ def prepare_resident_inputs(
     cache_state: Mapping[str, torch.Tensor] | None = None,
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Prepare checkpoint embeddings, weights and causal replay for one prefill rank."""
+    """Prepare checkpoint embeddings and causal replay for one prefill rank."""
     ids = torch.as_tensor(token_ids, device="cpu")
     if ids.ndim != 1 or ids.numel() and ids.dtype not in (torch.int32, torch.int64):
         raise ValueError("token_ids must be a one-dimensional integer sequence")
@@ -1534,16 +1478,6 @@ def prepare_resident_inputs(
         embedding, capacity, start_pos=start_pos, max_seq_len=max_seq_len,
         cache_state=cache_state, rope_tables=rope_tables,
     )
-    if not hasattr(weights, "_output_weights"):
-        head = checkpoint.tensor("head.weight")
-        if head.dtype != torch.bfloat16 or tuple(head.shape) != (M.vocab_size, M.hidden_size):
-            raise ValueError("the native LM head requires the released BF16 checkpoint matrix")
-        weights._output_weights = {
-            "head": head,
-            "final_norm": checkpoint.tensor("norm.weight").to(torch.bfloat16),
-        }
-    values.update(weights._output_weights)
-    values.update(weights.offset_tensors)
     return values
 
 
@@ -1602,7 +1536,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         "logits": ((16, VOCAB), torch.float32),
         "sampled_ids": ((16, 8), torch.int32),
     }
-    constants = {*weights.tensor_layouts, *weights.offset_tensors, "head", "final_norm", "mxfp4_pair_lut"}
+    constants = {*weights.tensor_layouts, "mxfp4_pair_lut"}
     cache_names = {
         "window_cache", "window_scales", "compressed_cache", "compressed_scales",
         "index_cache", "index_scales", "state_cache",
@@ -1620,7 +1554,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         rope_tables = None
         for rank, tensors in enumerate(per_rank):
             inputs = prepare_resident_inputs(
-                checkpoint, weights, sequences[rank][:chunk_size], CAPACITY,
+                weights, sequences[rank][:chunk_size], CAPACITY,
                 max_seq_len=max_seq_len, rope_tables=rope_tables,
             )
             rope_tables = inputs["freqs_cos"], inputs["freqs_sin"]
@@ -1658,7 +1592,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         def run_rows(rows):
             for rank, (tensors, token_ids) in enumerate(zip(per_rank, rows)):
                 inputs = prepare_resident_inputs(
-                    checkpoint, weights, token_ids, CAPACITY,
+                    weights, token_ids, CAPACITY,
                     start_pos=committed[rank], max_seq_len=max_seq_len,
                     cache_state=host_cache[rank], rope_tables=rope_tables,
                 )
@@ -1724,67 +1658,26 @@ def build_tensor_specs():
     from golden import TensorSpec
     from moe import _route_bias
 
-    fp8_sizes = (
-        D * Q_LORA, Q_LORA * LOCAL_H * HEAD_DIM, D * HEAD_DIM, LOCAL_O_WIDTH * D,
-        Q_LORA * INDEX_H * INDEX_DIM, D * MOE_INTER, D * MOE_INTER, MOE_INTER * D,
-        LOCAL_O_GROUPS * O_GROUP_IN * O_LORA,
-    )
-    bf16_sizes = (
-        D, D, Q_LORA, HEAD_DIM,
-        D * HEAD_DIM, HEAD_DIM, HEAD_DIM * INDEX_DIM, INDEX_DIM, D * INDEX_H,
-    )
-    dense_sizes = (
-        MIX_HC * HC_DIM, 3, MIX_HC, MIX_HC * HC_DIM, 3, MIX_HC,
-        LOCAL_H, N_EXPERTS * D, N_EXPERTS, D * HEAD_DIM, D * HEAD_DIM,
-    )
-
-    def offsets(sizes, start=0, alignment=128):
-        rows = []
-        for layer in range(M.num_hidden_layers):
-            row = []
-            for size in sizes:
-                start = (start + alignment - 1) // alignment * alignment
-                row.append(start)
-                start += size
-            rows.append(row)
-        return torch.tensor(rows, dtype=torch.int64), start
-
-    fp8_offsets, fp8_values = offsets(fp8_sizes)
-    fp8_scale_offsets, scale_values = offsets(tuple(size // 32 for size in fp8_sizes))
-    bf16_offsets, bf16_values = offsets(bf16_sizes, alignment=1)
-    dense_offsets, dense_values = offsets(dense_sizes)
-    expert_sizes = (LOCAL_EXPERTS * D * MOE_INTER // 2,) * 3
-    expert_offsets, fp4_values = offsets(expert_sizes)
-    expert_scale_sizes = (LOCAL_EXPERTS * D * MOE_INTER // 32,) * 3
-    expert_scale_offsets, scale_values = offsets(expert_scale_sizes, start=scale_values)
-    layouts = {
-        "bank8": ([RANKS, fp8_values // 128, 128], torch.float8_e4m3fn, 0.0),
-        "bank4": ([RANKS, fp4_values // 128, 128], torch.uint8, 0),
-        "scales8": ([RANKS, scale_values // 128, 128], torch.float8_e8m0fnu, 1.0),
-        "bf16": ([RANKS, bf16_values], torch.bfloat16, 0.0),
-        "head": ([RANKS, VOCAB, D], torch.bfloat16, None),
-        "x_hc_out": ([RANKS, CAPACITY, HC_MULT, D], torch.float32, None),
-        "pre_mix_out": ([RANKS, CAPACITY, HC_MULT], torch.float32, None),
-        "logits": ([RANKS, 16, VOCAB], torch.float32, None),
-        "sampled_ids": ([RANKS, 16, 8], torch.int32, None),
+    weight_layouts = forward_weight_layouts(LOCAL_EXPERTS)
+    outputs = {
+        "x_hc_out": ([RANKS, CAPACITY, HC_MULT, D], torch.float32),
+        "pre_mix_out": ([RANKS, CAPACITY, HC_MULT], torch.float32),
+        "logits": ([RANKS, 16, VOCAB], torch.float32),
+        "sampled_ids": ([RANKS, 16, 8], torch.int32),
     }
     values = prepare_prefill_inputs(torch.zeros((CAPACITY, D), dtype=torch.bfloat16), CAPACITY)
-    values.update({
-        "fp8_offsets": fp8_offsets, "fp8_scale_offsets": fp8_scale_offsets,
-        "bf16_offsets": bf16_offsets, "dense_offsets": dense_offsets,
-        "expert_offsets": expert_offsets, "expert_scale_offsets": expert_scale_offsets,
-        "mxfp4_pair_lut": build_mxfp4_pair_lut(), "final_norm": torch.ones(D, dtype=torch.bfloat16),
-    })
-    dense = torch.zeros((RANKS, dense_values), dtype=torch.float32)
-    for layer in range(M.num_hidden_layers):
-        bias_offset = int(dense_offsets[layer, 8])
-        dense[:, bias_offset : bias_offset + N_EXPERTS] = _route_bias()
+    values["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
     specs = []
     for name in PREFILL_TENSORS:
-        if name in layouts:
-            shape, dtype, value = layouts[name]
-        elif name == "dense":
-            shape, dtype, value = list(dense.shape), dense.dtype, dense
+        if name in weight_layouts:
+            rank_shape, dtype = weight_layouts[name]
+            shape = [RANKS, *rank_shape]
+            value = 1.0 if dtype == torch.float8_e8m0fnu or name == "final_norm_weight" else 0.0
+            if name == "correction_bias":
+                value = _route_bias().repeat(RANKS, N_LAYERS)
+        elif name in outputs:
+            shape, dtype = outputs[name]
+            value = None
         else:
             tensor = values[name]
             value = tensor.unsqueeze(0).repeat(RANKS, *([1] * tensor.ndim))
