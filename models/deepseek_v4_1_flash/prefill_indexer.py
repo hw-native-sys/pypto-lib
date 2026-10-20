@@ -618,7 +618,7 @@ def prepare_prefill_index_query(
     mxfp8_gemm(
         latent, query_weight, query_weight_scale, projected, num_tokens,
         width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
-        n_tile=128, name_hint="c1a_mx_projection",
+        n_tile=128, name_hint="c1a_mx_projection", single_task=False,
     )
     rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
     _index_rope(projected, cos, sin, rotated, num_tokens, heads=INDEX_H, max_workers=32)

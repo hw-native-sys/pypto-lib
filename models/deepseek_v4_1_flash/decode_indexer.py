@@ -1848,6 +1848,7 @@ def c1a_index(
     num_tokens: pl.Scalar[pl.INT32],
     score_width: pl.Scalar[pl.INDEX],
     entry_ready: pl.Scalar[pl.TASK_ID],
+    single_query_task: pl.constexpr,
 ):
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
@@ -1856,7 +1857,7 @@ def c1a_index(
         projected,
         num_tokens,
         width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
-        n_tile=128, name_hint="c1a_mx_projection",
+        n_tile=128, name_hint="c1a_mx_projection", single_task=single_query_task,
     )
     rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
     rotated_tid = rotate_index_query(projected, cos, sin, rotated, num_tokens, entry_ready)
@@ -2114,7 +2115,7 @@ def decode_c2a_indexer(
         index_wq_b, index_wq_b_scale, index_weights_proj,
         rope_cos, rope_sin,
         num_tokens, score_width,
-        cache_ready,
+        cache_ready, single_query_task=False,
     )
     scores_tid = score_c2a_full(
         query, query_scale, raw_weights,

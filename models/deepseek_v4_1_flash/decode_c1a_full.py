@@ -204,7 +204,7 @@ def decode_c1a_full(
     score_width = pl.tensor.dim(index_block_table, 1) * 128
     (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
         x_norm, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
-        num_tokens, score_width, x_ready,
+        num_tokens, score_width, x_ready, single_query_task=True,
     )
     scores_tid = score_full(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
