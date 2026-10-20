@@ -86,14 +86,13 @@ from config import (
     ROUTE_T_DYN,
 )
 
-from hc import hc_head
 from hc import hc_mixes
 from hc import hc_post
 from hc import hc_pre, zero_bf16_padding
 from input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
 from utils import paged_slots, window_metadata
-from lm_head import greedy_sample, lm_head
+from lm_head import final_output
 from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals
 from prefill_moe import prefill_moe
 from compressor import STATE_WIDTH
@@ -105,7 +104,7 @@ from prefill_c2a_reuse import prefill_c2a_reuse_attention
 from prefill_c1a_reindex import prefill_c1a_reindex_attention
 from prefill_c1a_reuse import prefill_c1a_reuse_attention
 from quant import build_mxfp4_pair_lut
-from rmsnorm import rms_norm_tiled, rms_norm_tiled_compensated
+from rmsnorm import rms_norm_tiled
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 
 RANKS = C.EP_SIZE
@@ -712,16 +711,13 @@ def l2_prefill_fwd(
     gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready)
     clear_moe_signals(x_hc_out, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     retire_prefill_signals(x_hc_out, attention_arrived, rank, 0)
-    collapsed_head = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-    normalized_head = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-    hc_head(final_hidden, final_pre, collapsed_head)
-    norm_tokens = pl.tensor.dim(collapsed_head, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled_compensated(collapsed_head, final_norm_weight, normalized_head, norm_block, norm_tokens)
-    lm_head(normalized_head, lm_head_weight, logit_rows, logits, head_hidden, head_hidden_done,
-            head_logits, head_logits_done, rank, 0, 1, 1)
-    greedy_sample(logits, sampled_ids)
-    return logits, sampled_ids
+    final_logits, final_sampled_ids = final_output(
+        final_hidden, final_pre, final_norm_weight, lm_head_weight,
+        logit_rows, logits, sampled_ids,
+        head_hidden, head_hidden_done, head_logits, head_logits_done,
+        rank, 0, 1, 1,
+    )
+    return final_logits, final_sampled_ids
 
 
 @pl.jit.host
@@ -1875,6 +1871,7 @@ if __name__ == "__main__":
             cfg = normalize_config(config)
             compiled = DistributedCompiledProgram.from_dir(
                 result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
+                distributed_config=cfg.distributed_config,
             )
             host_inputs = {}
             upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
