@@ -13,6 +13,8 @@ import math
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
+from utils import token_shards
+from golden import mapped_pool_ratio_allclose
 from sparse_attention import (
     SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
     analyze_index_runs, attend_shared_cache, decode_shared_cache_after_publish,
@@ -30,7 +32,6 @@ from rmsnorm import golden_rms_norm, rms_norm_tiled
 from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
 from o_proj import retire_prefill_signals, o_proj, prefill_sp_output_reduce_scatter
 from prefill_cp_allgather import make_prefill_sp_input_allgather
-from utils import swa_window_cache_compare as window_cache_compare
 
 
 # model config
@@ -521,13 +522,6 @@ def reference_attention(tensors, hidden, base):
     return sum(partials).bfloat16(), caches
 
 
-def token_shards(value, local_tokens):
-    """Pad a global token tensor and split it in TP rank order."""
-    padded = value.new_zeros(TP_SIZE * local_tokens, *value.shape[1:])
-    padded[:value.shape[0]].copy_(value)
-    return padded.reshape(TP_SIZE, local_tokens, *value.shape[1:])
-
-
 def golden_prefill_swa_case(tensors):
     """Reconstruct full residuals, run replicated attention, and split the reference."""
     world_size, local_tokens = tensors["x_hc"].shape[:2]
@@ -554,6 +548,28 @@ def golden_prefill_swa_case(tensors):
         tensors["hidden"][group].copy_(hidden.unsqueeze(0).expand(TP_SIZE, -1, -1))
         tensors["attn_out"][group].copy_(token_shards(reduced, local_tokens))
         tensors["output"][group].copy_(token_shards(output, local_tokens))
+
+
+def window_cache_compare(
+    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
+    scale_rtol=0.0, scale_error_ratio=0.0,
+):
+    """Compare the mapped window rows and require every other row to stay unchanged."""
+    options = dict(
+        mapping_shape=(world_size, tokens),
+        block_size=128,
+        leading_rank_axis=True,
+    )
+    return {
+        "window_cache": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache",
+            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
+        ),
+        "window_cache_scale": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache scale",
+            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
+        ),
+    }
 
 
 if __name__ == "__main__":

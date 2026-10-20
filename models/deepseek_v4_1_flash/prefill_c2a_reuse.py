@@ -28,7 +28,7 @@ from o_proj import (
 from hc import prefill_sp_post, hc_post
 from prefill_c2a_full import (
     CMP_PACKED, CMP_SCALES, REUSE_INPUT_NAMES, make_c2a_inputs, golden_reference_c2a,
-    reference_attention, _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
+    _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
 )
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope, golden_rope_tail
 from sparse_attention import (
@@ -536,7 +536,7 @@ if __name__ == "__main__":
 
     from config import MAX_BATCH_PER_DP
     from golden import run
-    from prefill_c2a_full import PREFILL_ATTN_RING_HEAP, build_specs, make_compare, make_golden
+    from prefill_c2a_full import PREFILL_ATTN_RING_HEAP, golden_prefill_c2a, build_specs, make_compare
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C2A reuse with mHC: A5 precision")
@@ -576,7 +576,7 @@ if __name__ == "__main__":
     result = run(
         fn=l3_prefill_c2a_reuse,
         specs=build_specs(args, "reuse", initial_state, make_inputs=make_c2a_reuse_inputs),
-        golden_fn=make_golden("reuse", attention_reference=functools.partial(reference_attention, reference=golden_reference_c2a_reuse)),
+        golden_fn=functools.partial(golden_prefill_c2a, mode="reuse", reference=golden_reference_c2a_reuse),
         compile_only=args.compile_only,
         config=dict(
             backend_type=args.backend_type,

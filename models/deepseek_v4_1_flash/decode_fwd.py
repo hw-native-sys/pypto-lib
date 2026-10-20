@@ -58,7 +58,7 @@ from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
 from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, final_output
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
-from utils import build_forward_metadata
+from utils import paged_slots, window_metadata
 from expert_routed import (
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
@@ -107,11 +107,8 @@ KV_SOURCE_COUNT = 4
 INDEX_SOURCE_COUNT = 8
 
 BLOCK_SIZE = BLOCK_SIZE
-COMPRESSED_CACHE_GROUP = COMPRESSED_CACHE_GROUP
 DECODE_MAX_TOKENS = DECODE_MAX_TOKENS
-INDEX_CACHE_GROUP = INDEX_CACHE_GROUP
 STATE_CAPACITY = STATE_CAPACITY
-WINDOW_CACHE_GROUP = WINDOW_CACHE_GROUP
 
 FIXTURE_BATCH = 12
 FIXTURE_SEQUENCE = 6
@@ -1067,7 +1064,7 @@ def l3_decode_fwd(
     one family share a page mapping; the two families may use different
     page ids and table widths. Index and main KV caches share that mapping.
     Visible lengths are derived once on device from position_ids and reused
-    across layers. build_forward_metadata lowers allocator tables into slots
+    across layers. Host paging helpers lower allocator tables into slots
     without allocating physical pages.
 
     token_to_req_indices is the single token-to-request map for both families.
@@ -1082,7 +1079,7 @@ def l3_decode_fwd(
     contain four M.kv_source_layer_ids slices; index-query weights retain eight
     M.index_source_layer_ids slices. C1A Reindex reads layer-20 keys. C2A state
     has three source slices, each with caller-owned request slots. Native
-    prefill caches alias these pools through utils.decode_cache_views.
+    prefill caches alias these pools by flattening their source/page dimensions.
 
     attention_num_tokens is per rank; TP peers supply equal group counts.
     TP1 uses padded 80-row local x_hc/pre_mix slabs, with up to 72 active rows.
@@ -1389,17 +1386,12 @@ def build_tensor_specs():
     window_table = torch.arange(FIXTURE_BATCH, dtype=torch.int32).reshape(FIXTURE_BATCH, 1)
     c2a_table = window_table.flip(0)
     c1a_table = torch.cat((window_table, torch.full_like(window_table, -1)), dim=1)
-    compressed_tables = {
-        source: c2a_table if M.compress_ratios[source] == 2 else c1a_table for source in M.kv_source_layer_ids
-    }
-    state_tables = {source: window_table for source in M.kv_source_layer_ids if M.compress_ratios[source] == 2}
-    prefix_lens = torch.zeros(FIXTURE_BATCH, dtype=torch.int32)
-    metadata = build_forward_metadata(query_starts, prefix_lens, window_table, compressed_tables, state_tables)
-    metadata_rows = {"window_slots": metadata.window_slots, "window_indices": metadata.window_indices}
-    for family, ratio in (("c2a", 2), ("c1a", 1)):
-        source = next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == ratio)
-        metadata_rows[family + "_compressed_slots"] = metadata.compressed_slots[source]
-        metadata_rows[family + "_index_block_table"] = compressed_tables[source]
+    window_slots, window_indices, _ = window_metadata(position_ids, request_ids, window_table)
+    metadata_rows = {"window_slots": window_slots, "window_indices": window_indices}
+    for family, ratio, table in (("c2a", 2, c2a_table), ("c1a", 1, c1a_table)):
+        slots = paged_slots(position_ids, request_ids, table, BLOCK_SIZE, ratio, True)
+        metadata_rows[family + "_compressed_slots"] = slots
+        metadata_rows[family + "_index_block_table"] = table
     for name in l3_decode_fwd.param_names:
         annotation = signature.parameters[name].annotation
         shape = [_fixture_extent(dim) for dim in annotation.shape]

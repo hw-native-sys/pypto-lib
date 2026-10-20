@@ -17,6 +17,10 @@ weights remain resident. Calls append current rows to caller-owned native caches
 Engram is disabled, including host hashes, table lookup and weight preparation.
 """
 
+import struct
+import math
+from numbers import Integral
+from typing import Any, Mapping, Sequence
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
@@ -87,11 +91,9 @@ from hc import hc_mixes
 from hc import hc_post
 from hc import hc_pre, zero_bf16_padding
 from input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
-from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
+from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
+from utils import paged_slots, window_metadata
 from lm_head import greedy_sample, lm_head
-from utils import (
-    PrefillCheckpoint, ResidentPrefillWeights, prepare_prefill_inputs, prepare_resident_inputs,
-)
 from moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals, moe
 from compressor import STATE_WIDTH
 from prefill_c1a_full import prefill_publish_decoder
@@ -137,8 +139,6 @@ B16 = pl.dynamic("PREFILL_BF16_VALUES")
 B32 = pl.dynamic("PREFILL_FP32_VALUES")
 
 ROPE_DIM = M.qk_rope_head_dim
-
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -859,7 +859,7 @@ def l3_prefill_fwd(
     logit_rows indexes the decoder replay slab; -1 disables that output row.
 
     Preserve all seven InOut cache tensors across chunks and decode. Their
-    source/page layout aliases decode pools through utils.decode_cache_views.
+    source/page dimensions can be flattened into decode pool views.
     Residual/pre-mix outputs describe these rows after layer 39. New tokens
     start from their own embedding and identity pre-mix; historical mHC state
     is represented by the committed KV/index/compressor caches.
@@ -1019,13 +1019,540 @@ PREFILL_TENSORS = (
 )
 
 
+_DTYPES = {
+    "F32": torch.float32,
+    "BF16": torch.bfloat16,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E8M0": torch.float8_e8m0fnu,
+    "I8": torch.int8,
+}
+
+
+class PrefillCheckpoint:
+    """Read requested original checkpoint tensors and selected embedding rows."""
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root).resolve()
+        config = json.loads((self.root / "config.json").read_text())
+        text = config["text_config"]
+        quant = config.get("quantization_config", {})
+        if quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]:
+            raise ValueError("checkpoint must use the official block-32 FP8/FP4 format")
+        required = {
+            "hidden_size": M.hidden_size,
+            "num_hidden_layers": M.num_hidden_layers,
+            "num_attention_heads": M.num_attention_heads,
+            "head_dim": M.head_dim,
+            "sliding_window": M.sliding_window,
+            "kv_source_layer_ids": list(M.kv_source_layer_ids),
+            "index_source_layer_ids": list(M.index_source_layer_ids),
+        }
+        for name, expected in required.items():
+            if text.get(name) != expected:
+                raise ValueError(f"checkpoint {name}={text.get(name)!r}, expected {expected!r}")
+        index = json.loads((self.root / "model.safetensors.index.json").read_text())
+        self.weight_map = index["weight_map"]
+        self._headers = {}
+
+    def tensor(self, name: str) -> torch.Tensor:
+        """Return an owned CPU tensor without loading the rest of its shard."""
+        shard = self.weight_map[name]
+        path = (self.root / shard).resolve()
+        if not path.is_relative_to(self.root):
+            raise ValueError(f"checkpoint shard leaves its root: {shard}")
+        with path.open("rb") as file:
+            header_size = struct.unpack("<Q", file.read(8))[0]
+            if header_size > 64 * 1024 * 1024:
+                raise ValueError(f"safetensors header is too large: {shard}")
+            if shard not in self._headers:
+                self._headers[shard] = json.loads(file.read(header_size))
+            entry = self._headers[shard][name]
+            dtype = _DTYPES[entry["dtype"]]
+            shape = entry["shape"]
+            start, end = entry["data_offsets"]
+            expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+            if start < 0 or end - start != expected_bytes or 8 + header_size + end > path.stat().st_size:
+                raise ValueError(f"invalid safetensors range for {name}")
+            file.seek(8 + header_size + start)
+            payload = bytearray(file.read(expected_bytes))
+        if len(payload) != expected_bytes:
+            raise ValueError(f"truncated safetensors payload for {name}")
+        return torch.frombuffer(payload, dtype=dtype).reshape(shape)
+
+    def tensor_rows(self, name: str, rows: torch.Tensor) -> torch.Tensor:
+        """Read selected table rows without loading the complete tensor."""
+        if rows.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+            raise ValueError("table row ids must have an integer dtype")
+        ids = rows.to(dtype=torch.int64, device="cpu").flatten()
+        shard = self.weight_map[name]
+        path = (self.root / shard).resolve()
+        if not path.is_relative_to(self.root):
+            raise ValueError(f"checkpoint shard leaves its root: {shard}")
+        with path.open("rb") as file:
+            header_size = struct.unpack("<Q", file.read(8))[0]
+            if header_size > 64 * 1024 * 1024:
+                raise ValueError(f"safetensors header is too large: {shard}")
+            if shard not in self._headers:
+                self._headers[shard] = json.loads(file.read(header_size))
+            entry = self._headers[shard][name]
+            dtype, shape = _DTYPES[entry["dtype"]], entry["shape"]
+            if len(shape) != 2 or bool(((ids < 0) | (ids >= shape[0])).any()):
+                raise ValueError(f"invalid table rows for {name}")
+            row_bytes = shape[1] * torch.empty((), dtype=dtype).element_size()
+            start, end = entry["data_offsets"]
+            if (
+                start < 0
+                or end - start != shape[0] * row_bytes
+                or 8 + header_size + end > path.stat().st_size
+            ):
+                raise ValueError(f"invalid safetensors range for {name}")
+            unique, inverse = torch.unique(ids, sorted=True, return_inverse=True)
+            payload = bytearray(unique.numel() * row_bytes)
+            for index, row in enumerate(unique.tolist()):
+                file.seek(8 + header_size + start + row * row_bytes)
+                data = file.read(row_bytes)
+                if len(data) != row_bytes:
+                    raise ValueError(f"truncated safetensors row for {name}")
+                payload[index * row_bytes : (index + 1) * row_bytes] = data
+        if not ids.numel():
+            return torch.empty(*rows.shape, shape[1], dtype=dtype)
+        table = torch.frombuffer(payload, dtype=dtype).reshape(-1, shape[1])
+        # CPU indexing is unavailable for FP8; index its byte representation.
+        return (
+            table.view(torch.uint8)
+            .reshape(unique.numel(), row_bytes)[inverse]
+            .contiguous()
+            .view(dtype)
+            .reshape(*rows.shape, shape[1])
+        )
+
+
+class ResidentPrefillWeights:
+    """Pack Engram-disabled prefill weights into TP1/EP4 or TP1/EP8 layouts.
+
+    Routed weights retain their FP4 nibbles; MXFP8 payloads retain their bytes.
+    Scale bytes are reordered into the native MX_B_NN layout. Only projections
+    whose released inference dtype is BF16 or FP32 are decoded on the host.
+    Offsets count elements in their named bank. Large byte banks use 128-column
+    rows so runtime shapes and slice coordinates fit their uint32 ABI.
+    """
+
+    bank_columns = 128
+    fp8_names = (
+        "attn.wq_a",
+        "attn.wq_b",
+        "attn.wkv",
+        "attn.wo_b",
+        "attn.indexer.wq_b",
+        "ffn.shared_experts.w1",
+        "ffn.shared_experts.w3",
+        "ffn.shared_experts.w2",
+        "attn.wo_a",
+    )
+    bf16_names = (
+        "attn_norm.weight",
+        "ffn_norm.weight",
+        "attn.q_norm.weight",
+        "attn.kv_norm.weight",
+        "attn.compressor.wkv.weight",
+        "attn.compressor.norm.weight",
+        "attn.indexer.wk.weight",
+        "attn.indexer.k_norm.weight",
+        "attn.indexer.weights_proj.weight",
+    )
+    dense_names = (
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_attn_base",
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+        "hc_ffn_base",
+        "attn.attn_sink",
+        "ffn.gate.weight",
+        "ffn.gate.bias",
+        "attn.compressor.wkv.weight",
+        "attn.compressor.wgate.weight",
+    )
+    expert_names = ("w1", "w3", "w2")
+
+    def __init__(self, checkpoint: PrefillCheckpoint, *, ep_size: int = 4):
+        if isinstance(ep_size, bool) or not isinstance(ep_size, Integral) or ep_size not in (4, 8):
+            raise ValueError("resident prefill requires EP4 or EP8")
+        self.ranks = int(ep_size)
+        self.local_experts = M.n_routed_experts // self.ranks
+        self.checkpoint = checkpoint
+        layers = M.num_hidden_layers
+        self.fp8_offsets = torch.full((layers, len(self.fp8_names)), -1, dtype=torch.int64)
+        self.fp8_scale_offsets = torch.full_like(self.fp8_offsets, -1)
+        self.bf16_offsets = torch.full((layers, len(self.bf16_names)), -1, dtype=torch.int64)
+        self.dense_offsets = torch.full((layers, len(self.dense_names)), -1, dtype=torch.int64)
+        self.expert_offsets = torch.empty((layers, 3), dtype=torch.int64)
+        self.expert_scale_offsets = torch.empty_like(self.expert_offsets)
+        self.fp8_entries, self.bf16_entries, self.dense_entries = [], [], []
+        self.fp8_values = self.scale_values = self.bf16_values = self.dense_values = 0
+        for layer in range(layers):
+            for column, suffix in enumerate(self.fp8_names):
+                stem = f"layers.{layer}.{suffix}"
+                if stem + ".weight" not in checkpoint.weight_map:
+                    continue
+                header = self._header(stem + ".weight")
+                n, k = header["shape"]
+                scale = self._header(stem + ".scale")
+                if (
+                    header["dtype"] != "F8_E4M3"
+                    or n % 32
+                    or k % 64
+                    or scale["dtype"] != "F8_E8M0"
+                    or scale["shape"] != [n // 32, k // 32]
+                ):
+                    raise ValueError(f"unsupported native MXFP8 weight layout: {stem}")
+                assert n * k % self.bank_columns == 0
+                assert (n * k // 32) % self.bank_columns == 0
+                self.fp8_offsets[layer, column] = self.fp8_values
+                self.fp8_scale_offsets[layer, column] = self.scale_values
+                self.fp8_entries.append((stem, self.fp8_values, self.scale_values))
+                self.fp8_values += n * k
+                self.scale_values += n * k // 32
+            for column, suffix in enumerate(self.bf16_names):
+                name = f"layers.{layer}.{suffix}"
+                if name not in checkpoint.weight_map:
+                    continue
+                if suffix == "attn.compressor.wkv.weight" and M.compress_ratios[layer] != 1:
+                    continue
+                header = self._header(name)
+                if header["dtype"] not in ("F32", "BF16"):
+                    raise ValueError(f"unsupported BF16 inference weight: {name}")
+                self.bf16_offsets[layer, column] = self.bf16_values
+                self.bf16_entries.append((name, column, self.bf16_values))
+                self.bf16_values += math.prod(header["shape"])
+            for column, suffix in enumerate(self.dense_names):
+                name = f"layers.{layer}.{suffix}"
+                if name not in checkpoint.weight_map:
+                    continue
+                if column in (9, 10) and M.compress_ratios[layer] != 2:
+                    continue
+                header = self._header(name)
+                if header["dtype"] not in ("F32", "BF16"):
+                    raise ValueError(f"unsupported FP32 inference weight: {name}")
+                # Keep native matrix bases aligned after small mHC scalar vectors.
+                self.dense_values = (self.dense_values + 127) // 128 * 128
+                self.dense_offsets[layer, column] = self.dense_values
+                self.dense_entries.append((name, column, self.dense_values))
+                self.dense_values += math.prod(header["shape"])
+        self.fp4_values = 0
+        for layer in range(layers):
+            for column in range(3):
+                self.expert_offsets[layer, column] = self.fp4_values
+                self.expert_scale_offsets[layer, column] = self.scale_values
+                self.fp4_values += self.local_experts * M.hidden_size * M.moe_intermediate_size // 2
+                self.scale_values += self.local_experts * M.hidden_size * M.moe_intermediate_size // 32
+        assert (M.hidden_size * M.moe_intermediate_size // 2) % self.bank_columns == 0
+        assert (M.hidden_size * M.moe_intermediate_size // 32) % self.bank_columns == 0
+        for values in (self.fp4_values, self.fp8_values, self.scale_values):
+            assert values % self.bank_columns == 0
+            assert values // self.bank_columns < 2**32
+        for offsets in (
+            self.fp8_offsets, self.fp8_scale_offsets, self.expert_offsets, self.expert_scale_offsets,
+        ):
+            assert bool((offsets[offsets >= 0] % self.bank_columns == 0).all())
+        assert self.bf16_values * 2 < 2**32
+        assert self.dense_values * 4 < 2**32
+
+    def _header(self, name: str) -> dict[str, Any]:
+        checkpoint = self.checkpoint
+        shard = checkpoint.weight_map[name]
+        if shard not in checkpoint._headers:
+            path = (checkpoint.root / shard).resolve()
+            if not path.is_relative_to(checkpoint.root):
+                raise ValueError(f"checkpoint shard leaves its root: {shard}")
+            with path.open("rb") as file:
+                size = struct.unpack("<Q", file.read(8))[0]
+                if size > 64 * 1024 * 1024:
+                    raise ValueError(f"safetensors header is too large: {shard}")
+                checkpoint._headers[shard] = json.loads(file.read(size))
+        return checkpoint._headers[shard][name]
+
+    @property
+    def tensor_layouts(self):
+        """Return contiguous bank allocation shapes and exact storage dtypes."""
+        return {
+            "bank4": ((self.fp4_values // self.bank_columns, self.bank_columns), torch.uint8),
+            "bank8": ((self.fp8_values // self.bank_columns, self.bank_columns), torch.float8_e4m3fn),
+            "scales8": ((self.scale_values // self.bank_columns, self.bank_columns), torch.float8_e8m0fnu),
+            "bf16": ((self.bf16_values,), torch.bfloat16),
+            "dense": ((self.dense_values,), torch.float32),
+        }
+
+    @property
+    def bytes_per_rank(self):
+        return sum(
+            math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+            for shape, dtype in self.tensor_layouts.values()
+        )
+
+    @property
+    def offset_tensors(self):
+        return {
+            name: getattr(self, name)
+            for name in (
+                "fp8_offsets",
+                "fp8_scale_offsets",
+                "bf16_offsets",
+                "dense_offsets",
+                "expert_offsets",
+                "expert_scale_offsets",
+            )
+        }
+
+    def upload(self, runtime, rank: int, handles):
+        """Upload a rank's persistent banks with one projection staged at a time."""
+        from quant import pack_mx_b_scale, pack_mxfp4_weight_tiles
+
+        if rank not in range(self.ranks):
+            raise ValueError(f"expert rank must be in [0, {self.ranks})")
+        checkpoint = self.checkpoint
+
+        def copy(bank, data, offset):
+            data = data.contiguous()
+            if bank in ("bank4", "bank8", "scales8"):
+                assert int(offset) % self.bank_columns == 0
+                assert data.numel() % self.bank_columns == 0
+            runtime.copy_to(
+                handles[bank].data_ptr,
+                data.data_ptr(),
+                data.numel() * data.element_size(),
+                dst_offset=int(offset) * data.element_size(),
+                worker_id=rank,
+            )
+
+        for stem, offset, scale_offset in self.fp8_entries:
+            weight = checkpoint.tensor(stem + ".weight")
+            codes = checkpoint.tensor(stem + ".scale").view(torch.uint8)
+            logical_scale = codes.repeat_interleave(32, dim=0).t().contiguous()
+            if stem.endswith(".attn.wo_a"):
+                # Checkpoint [G*N, K] becomes grouped [G, K, N].
+                n, k = weight.shape
+                if n != M.o_groups * M.o_lora_rank or k != M.num_attention_heads * M.head_dim // M.o_groups:
+                    raise ValueError(f"unsupported grouped Wo-A weight shape: {stem}")
+                weight = weight.reshape(M.o_groups, M.o_lora_rank, k).transpose(-1, -2)
+                logical_scale = logical_scale.reshape(k // 32, M.o_groups, M.o_lora_rank).permute(1, 0, 2)
+            else:
+                weight = weight.t()
+            copy("bank8", weight, offset)
+            copy("scales8", pack_mx_b_scale(logical_scale).view(torch.float8_e8m0fnu), scale_offset)
+        for name, column, offset in self.bf16_entries:
+            value = checkpoint.tensor(name).to(torch.bfloat16)
+            if name.endswith((".attn.compressor.wkv.weight", ".attn.indexer.wk.weight", ".attn.indexer.weights_proj.weight")):
+                value = value.t()
+            copy("bf16", value, offset)
+        for name, column, offset in self.dense_entries:
+            value = checkpoint.tensor(name).float()
+            if column in (9, 10):
+                value = value.t()
+            copy("dense", value, offset)
+        for layer in range(M.num_hidden_layers):
+            for column, projection in enumerate(self.expert_names):
+                k, n = (M.moe_intermediate_size, M.hidden_size) if projection == "w2" else (M.hidden_size, M.moe_intermediate_size)
+                logical_scales = torch.empty((self.local_experts * (k // 32), n), dtype=torch.uint8)
+                offset = int(self.expert_offsets[layer, column])
+                for local in range(self.local_experts):
+                    expert = rank * self.local_experts + local
+                    stem = f"layers.{layer}.ffn.experts.{expert}.{projection}"
+                    weight = checkpoint.tensor(stem + ".weight")
+                    scale = checkpoint.tensor(stem + ".scale")
+                    if (
+                        weight.dtype != torch.int8
+                        or tuple(weight.shape) != (n, k // 2)
+                        or scale.dtype != torch.float8_e8m0fnu
+                        or tuple(scale.shape) != (n, k // 32)
+                    ):
+                        raise ValueError(f"unsupported native MXFP4 weight layout: {stem}")
+                    packed = pack_mxfp4_weight_tiles(weight, 256, 256)
+                    copy("bank4", packed, offset + local * (n * k // 2))
+                    logical_scales[local * (k // 32) : (local + 1) * (k // 32)] = scale.view(torch.uint8).t()
+                copy(
+                    "scales8",
+                    pack_mx_b_scale(logical_scales).view(torch.float8_e8m0fnu),
+                    self.expert_scale_offsets[layer, column],
+                )
+
+    def lookup_rows(self, token_ids: torch.Tensor):
+        """Read only the prompt's BF16 token embeddings."""
+        return self.checkpoint.tensor_rows("embed.weight", token_ids).to(torch.bfloat16)
+
+
+def prepare_prefill_inputs(
+    embedding: torch.Tensor,
+    capacity: int,
+    *,
+    start_pos: int = 0,
+    max_seq_len: int | None = None,
+    cache_state: Mapping[str, torch.Tensor] | None = None,
+    rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Prepare one TP1 rank's next embedding chunk with Engram disabled.
+
+    ``capacity`` bounds current rows, independently of ``max_seq_len``, which
+    sizes the retained history. Reuse rope_tables across calls; their full
+    table capacity may exceed capacity. Pass the previous call's cache tensors after
+    its completion and advance ``start_pos`` by its valid count. An empty
+    sequence has zero work and preserves every cache byte. This convenience
+    helper owns one request at physical slot zero per DP rank; serving may
+    supply its own paged metadata directly to the forward entry instead.
+    """
+    if embedding.ndim != 2 or embedding.shape[1] != M.hidden_size:
+        raise ValueError("embedding must have shape [current tokens, hidden size]")
+    if not isinstance(capacity, Integral) or isinstance(capacity, bool) or capacity < 16 or capacity % 16:
+        raise ValueError("prefill capacity must be an integer multiple of 16")
+    count = embedding.shape[0]
+    if not 0 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
+        raise ValueError("current rows must fit the configured prefill capacity")
+    if isinstance(start_pos, bool) or not isinstance(start_pos, Integral) or start_pos < 0:
+        raise ValueError("start_pos must be a non-negative integer")
+    max_seq_len = capacity if max_seq_len is None else max_seq_len
+    if isinstance(max_seq_len, bool) or not isinstance(max_seq_len, Integral):
+        raise ValueError("max_seq_len must be a positive integer")
+    if not 1 <= max_seq_len <= M.max_position_embeddings or start_pos + count > max_seq_len:
+        raise ValueError("current rows exceed the retained history capacity")
+    if start_pos and cache_state is None:
+        raise ValueError("continuation requires the preceding call's retained cache state")
+
+    data_pages = (max_seq_len + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
+    pages = data_pages + 1
+    table = torch.arange(data_pages, dtype=torch.int32).reshape(1, -1)
+    c2a_pages = max(1, (max_seq_len // 2 + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE)
+    c2a_table = torch.arange(c2a_pages, dtype=torch.int32).reshape(1, -1)
+    compressed_tables = {
+        source: c2a_table if M.compress_ratios[source] == 2 else table
+        for source in M.kv_source_layer_ids
+    }
+    state_table = torch.zeros((1, 1), dtype=torch.int32)
+    state_tables = {
+        source: state_table
+        for source in M.kv_source_layer_ids
+        if M.compress_ratios[source] == 2
+    }
+    query_starts = torch.tensor([0, count], dtype=torch.int32)
+    request_ids = torch.zeros(count, dtype=torch.int32)
+    positions = torch.arange(start_pos, start_pos + count, dtype=torch.int32)
+    window_slots, window_indices, _ = window_metadata(positions, request_ids, table)
+    c2a_slots = paged_slots(positions, request_ids, c2a_table, C.BLOCK_SIZE, 2, True)
+    c1a_slots = paged_slots(positions, request_ids, table)
+    freqs_cos, freqs_sin = prepare_forward_rope_tables(max_seq_len, rope_tables)
+
+    def pad(value, fill=0):
+        result = torch.full((capacity, *value.shape[1:]), fill, dtype=value.dtype)
+        result[: value.shape[0]] = value
+        return result
+
+    initial_pre = torch.zeros((capacity, M.hc_mult), dtype=torch.float32)
+    initial_pre[:, 0] = 1.0
+    logit_rows = torch.full((16,), -1, dtype=torch.int32)
+    logit_rows[0] = count - 1
+    window_shape = (M.num_hidden_layers, pages, C.BLOCK_SIZE, 1)
+    source_shape = (len(M.kv_source_layer_ids), pages, C.BLOCK_SIZE, 1)
+
+    def native_cache(name, shape, dtype, fill=0):
+        if cache_state is not None:
+            value = cache_state[name]
+            if value.device.type != "cpu" or value.dtype != dtype:
+                raise ValueError(f"retained {name} must be a CPU tensor with the native cache dtype")
+            if tuple(value.shape) != shape or not value.is_contiguous():
+                raise ValueError(f"retained {name} must preserve the history layout and capacity")
+            return value
+        if dtype in (torch.float32, torch.bfloat16):
+            return torch.full(shape, float(fill), dtype=dtype)
+        return torch.full(shape, fill, dtype=torch.uint8).view(dtype)
+
+    values = {
+        "embedding": pad(embedding),
+        "embedding_ids": torch.arange(capacity, dtype=torch.int64),
+        "initial_pre": initial_pre,
+        "identity_rows": pad(torch.arange(count, dtype=torch.int32), -1),
+        "counts": torch.tensor([count, count], dtype=torch.int32),
+        "replay_rows": pad(torch.arange(count, dtype=torch.int32), -1),
+        "position_ids": pad(positions, -1).repeat(2, 1),
+        "freqs_cos": freqs_cos,
+        "freqs_sin": freqs_sin,
+        "window_slots": pad(window_slots, -1).repeat(2, 1),
+        "window_indices": pad(window_indices, -1).repeat(2, 1, 1),
+        "c2a_compressed_slots": pad(c2a_slots, -1),
+        "c1a_compressed_slots": pad(c1a_slots, -1),
+        "token_to_req_indices": pad(request_ids, -1).repeat(2, 1),
+        "query_start_loc": query_starts.repeat(2, 1),
+        "c2a_index_block_table": c2a_table,
+        "c1a_index_block_table": table,
+        "state_block_table": state_table,
+        "window_cache": native_cache("window_cache", (*window_shape, M.head_dim), torch.float8_e4m3fn),
+        "window_scales": native_cache(
+            "window_scales", (*window_shape, M.head_dim // C.WINDOW_CACHE_GROUP), torch.bfloat16, 1.0,
+        ),
+        "compressed_cache": native_cache("compressed_cache", (*source_shape, M.head_dim // 2), torch.uint8),
+        "compressed_scales": native_cache(
+            "compressed_scales", (*source_shape, M.head_dim // C.COMPRESSED_CACHE_GROUP), torch.bfloat16, 1.0,
+        ),
+        "index_cache": native_cache("index_cache", (*source_shape, M.index_head_dim // 2), torch.uint8),
+        "index_scales": native_cache(
+            "index_scales", (*source_shape, M.index_head_dim // C.INDEX_CACHE_GROUP), torch.float8_e8m0fnu, 127,
+        ),
+        "state_cache": native_cache(
+            "state_cache", (len(state_tables), 2, C.STATE_CAPACITY, 2 * M.head_dim), torch.float32,
+        ),
+        "logit_rows": logit_rows,
+    }
+    validate_prefill_caches(values, table, compressed_tables, state_tables)
+    return values
+
+
+def prepare_resident_inputs(
+    checkpoint: PrefillCheckpoint,
+    weights: ResidentPrefillWeights,
+    token_ids: torch.Tensor | Sequence[int],
+    capacity: int,
+    *,
+    start_pos: int = 0,
+    max_seq_len: int | None = None,
+    cache_state: Mapping[str, torch.Tensor] | None = None,
+    rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Prepare checkpoint embeddings, weights and causal replay for one prefill rank."""
+    ids = torch.as_tensor(token_ids, device="cpu")
+    if ids.ndim != 1 or ids.numel() and ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("token_ids must be a one-dimensional integer sequence")
+    if not isinstance(capacity, Integral) or isinstance(capacity, bool) or capacity % 16:
+        raise ValueError("prefill capacity must be an integer multiple of 16")
+    count = ids.numel()
+    if not 0 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
+        raise ValueError("current rows must fit the configured prefill capacity")
+    if bool(((ids < 0) | (ids >= M.vocab_size)).any()):
+        raise ValueError("token id is outside the checkpoint vocabulary")
+    ids = ids.long()
+    embedding = weights.lookup_rows(ids)
+
+    values = prepare_prefill_inputs(
+        embedding, capacity, start_pos=start_pos, max_seq_len=max_seq_len,
+        cache_state=cache_state, rope_tables=rope_tables,
+    )
+    if not hasattr(weights, "_output_weights"):
+        head = checkpoint.tensor("head.weight")
+        if head.dtype != torch.bfloat16 or tuple(head.shape) != (M.vocab_size, M.hidden_size):
+            raise ValueError("the native LM head requires the released BF16 checkpoint matrix")
+        weights._output_weights = {
+            "head": head,
+            "final_norm": checkpoint.tensor("norm.weight").to(torch.bfloat16),
+        }
+    values.update(weights._output_weights)
+    values.update(weights.offset_tensors)
+    return values
+
+
 def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk_size=None):
     """Generate one independent continuation per rank using resident checkpoint weights.
 
     Prefill and subsequent one-token calls retain native device caches. Only
     current-token metadata is uploaded; completed history is never recomputed.
     This example uses the prefill composition for one-token continuation too;
-    l3_decode_fwd can consume the same cache storage through decode_cache_views.
+    l3_decode_fwd can consume the same cache storage by flattening source/page dimensions.
     """
     from tokenizers import Tokenizer
 
@@ -1263,6 +1790,98 @@ def build_tensor_specs():
             shape, dtype = list(value.shape), value.dtype
         specs.append(TensorSpec(name, shape, dtype, init_value=value))
     return specs
+
+
+def validate_prefill_caches(
+    cache_state: Mapping[str, torch.Tensor],
+    window_block_table: torch.Tensor,
+    compressed_block_tables: Mapping[int, torch.Tensor],
+    state_block_tables: Mapping[int, torch.Tensor],
+) -> None:
+    """Validate native prefill cache layouts and source-local page/state ownership."""
+    cache_names = (
+        "window_cache", "window_scales", "compressed_cache", "compressed_scales", "index_cache", "index_scales",
+    )
+    for name in cache_names:
+        value = cache_state[name]
+        if value.ndim not in (5, 6) or not value.is_contiguous():
+            raise ValueError(f"{name} must preserve the contiguous native source/page layout")
+        sources = M.num_hidden_layers if name.startswith("window") else len(M.kv_source_layer_ids)
+        if value.shape[-5] != sources or value.shape[-4] < 1 or tuple(value.shape[-3:-1]) != (C.BLOCK_SIZE, 1):
+            raise ValueError(f"{name} has an incompatible source or page geometry")
+        expected_dtype = {
+            "window_cache": torch.float8_e4m3fn, "window_scales": torch.bfloat16,
+            "compressed_cache": torch.uint8, "compressed_scales": torch.bfloat16,
+            "index_cache": torch.uint8, "index_scales": torch.float8_e8m0fnu,
+        }[name]
+        if value.dtype != expected_dtype:
+            raise ValueError(f"{name} must retain its native payload or scale dtype")
+        expected_width = {
+            "window_cache": M.head_dim, "window_scales": M.head_dim // C.WINDOW_CACHE_GROUP,
+            "compressed_cache": M.head_dim // 2,
+            "compressed_scales": M.head_dim // C.COMPRESSED_CACHE_GROUP,
+            "index_cache": M.index_head_dim // 2, "index_scales": M.index_head_dim // C.INDEX_CACHE_GROUP,
+        }[name]
+        if value.shape[-1] != expected_width:
+            raise ValueError(f"{name} has an incompatible native row width")
+        reference = cache_state["window_cache"]
+        if value.shape[:-5] != reference.shape[:-5] or value.shape[-4] != reference.shape[-4]:
+            raise ValueError("all prefill cache pools must preserve the same rank and page extents")
+        if value.device != reference.device:
+            raise ValueError("all cache payloads and scales must reside on the same device")
+    state = cache_state["state_cache"]
+    if state.ndim not in (4, 5) or not state.is_contiguous():
+        raise ValueError("state_cache must preserve its contiguous source/request layout")
+    if state.shape[-4] != 3 or state.shape[-3] < 1 or tuple(state.shape[-2:]) != (C.STATE_CAPACITY, 2 * M.head_dim):
+        raise ValueError("state_cache has an incompatible C2A source or state geometry")
+    if state.shape[:-4] != cache_state["window_cache"].shape[:-5]:
+        raise ValueError("state_cache must preserve the cache pools' rank extent")
+    if state.dtype != torch.float32:
+        raise ValueError("state_cache must retain FP32 compressor state")
+    if state.device != cache_state["window_cache"].device:
+        raise ValueError("state_cache must reside on the cache pools' device")
+
+    if cache_state["window_cache"].ndim != 5:
+        raise ValueError("validate_prefill_caches requires one rank's native cache tensors")
+    if window_block_table.ndim != 2:
+        raise ValueError("window block table must be a matrix")
+    requests = window_block_table.shape[0]
+    pages = cache_state["window_cache"].shape[1]
+    state_blocks = cache_state["state_cache"].shape[1]
+
+    def validate_table(name, table, capacity, state=False):
+        if table.device.type != "cpu" or table.dtype != torch.int32:
+            raise ValueError(f"{name} must be a CPU INT32 tensor")
+        if table.ndim != 2 or table.shape[0] != requests or (state and table.shape[1] != 1):
+            raise ValueError(f"{name} has incompatible request or table dimensions")
+        if bool(((table < -1) | (table >= capacity)).any()):
+            raise ValueError(f"{name} IDs must be -1 or within the source-local capacity {capacity}")
+        if state:
+            allocated = table[table >= 0]
+            if allocated.unique().numel() != allocated.numel():
+                raise ValueError("live requests must own distinct state blocks")
+
+    validate_table("window block table", window_block_table, pages)
+    family_tables = {}
+    shared_state = None
+    for source in M.kv_source_layer_ids:
+        if source not in compressed_block_tables:
+            raise ValueError(f"missing compressed block table for source layer {source}")
+        table = compressed_block_tables[source]
+        validate_table(f"source {source} compressed block table", table, pages)
+        ratio = M.compress_ratios[source]
+        family_table = family_tables.setdefault(ratio, table)
+        if not torch.equal(table, family_table):
+            raise ValueError("sources in one family must share local physical page IDs")
+        if ratio > 1:
+            if source not in state_block_tables:
+                raise ValueError(f"missing state block table for source layer {source}")
+            state_table = state_block_tables[source]
+            validate_table(f"source {source} state block table", state_table, state_blocks, state=True)
+            if shared_state is None:
+                shared_state = state_table
+            elif not torch.equal(state_table, shared_state):
+                raise ValueError("C2A sources must share request slots within their separate state pools")
 
 
 if __name__ == "__main__":

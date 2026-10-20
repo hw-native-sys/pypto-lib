@@ -8,6 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """Packed-prefill C1A full attention wired through delayed mHC mixing."""
 
+from collections.abc import Callable
+import config as C
+from prefill_indexer import index_pool_block_capacity
 import functools
 import inspect
 import math
@@ -30,11 +33,8 @@ from sparse_attention import (
     attend_packed, golden_compressed_attention, golden_prefill_c1a_attention,
     prefill_publish_window,
 )
-from utils import (
-    CASE_DEFAULT, CASE_MAX_TOKENS, CASE_NAMES, apply_distributed_golden, fixture_token_count,
-    make_fixture_values, topk_indices_compare, wrap_attention_compare,
-    AttentionGoldenResult, COMMON_INPUT_NAMES,
-)
+from hc import HC_INPUT_NAMES, make_hc_inputs
+from utils import token_shards, AttentionGoldenResult
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
@@ -44,6 +44,15 @@ from prefill_indexer import (
     golden_index_key, golden_select_candidate_block_pool,
     golden_prefill_index_scores as golden_index_scores,
 )
+
+
+CASE_DEFAULT = 'multi_1k'
+CASE_MAX_TOKENS = C.PREFILL_MAX_TOKENS
+CASE_PAGE = 128
+CASE_NAMES = (CASE_DEFAULT, 'causal', 'mixed', 'long')
+TOPK_SCORE_ATOL = 5e-05
+TOPK_SCORE_RTOL = 0.015
+COMMON_INPUT_NAMES = ('x', 'wq_a', 'wq_a_scale', 'q_norm_weight', 'wq_b', 'wq_b_scale', 'wkv', 'wkv_scale', 'kv_norm_weight', 'attn_sink', 'wo_a', 'wo_a_scale', 'wo_b', 'wo_b_scale', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'window_cache', 'window_cache_scale', 'compressed_cache', 'compressed_cache_scale')
 
 
 # model config
@@ -197,6 +206,261 @@ def prefill_c1a_full_attention(
             group_base, tp_rank, num_tokens, attention_epoch,
         )
     return output
+
+
+def _ranked(value: torch.Tensor) -> torch.Tensor:
+    from config import TP_SIZE
+    return value.unsqueeze(0).repeat(TP_SIZE, *[1] * value.ndim).contiguous()
+
+
+def _fp8_weight(input_width: int, output_width: int) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch
+    from quant import pack_mx_b_scale
+    weight = torch.randn(input_width, output_width).mul_(input_width ** (-0.5))
+    weight = weight.clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+    scale_codes = torch.full((input_width // 32, output_width), 127, dtype=torch.uint8)
+    scale = pack_mx_b_scale(scale_codes).view(torch.float8_e8m0fnu)
+    return (weight, scale)
+
+
+def _ranked_fp8_weight(input_width: int, output_width: int, shared: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    import torch
+    from config import TP_SIZE
+    pairs = [_fp8_weight(input_width, output_width) for _ in range(1 if shared else TP_SIZE)]
+    if shared:
+        weight = _ranked(pairs[0][0])
+        scale = _ranked(pairs[0][1])
+    else:
+        weight = torch.stack([pair[0] for pair in pairs])
+        scale = torch.stack([pair[1] for pair in pairs])
+    return (weight, scale)
+
+
+def _case_metadata(token_count: int, case_name: str) -> tuple[torch.Tensor, ...]:
+    import torch
+    if case_name == CASE_DEFAULT:
+        request_ids = torch.arange(3, dtype=torch.int32)
+        compressed_lens = torch.full((3,), 1024, dtype=torch.int32)
+    elif case_name == 'causal':
+        if not 1 <= token_count <= CASE_MAX_TOKENS:
+            raise ValueError(f'token_count must be in [1, {CASE_MAX_TOKENS}], got {token_count}')
+        request_ids = torch.zeros(token_count, dtype=torch.int32)
+        compressed_lens = torch.arange(1, token_count + 1, dtype=torch.int32)
+    elif case_name == 'mixed':
+        request_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2], dtype=torch.int32)
+        compressed_lens = torch.tensor([1, 2, 3, 127, 128, 511, 512, 513], dtype=torch.int32)
+    elif case_name == 'long':
+        request_ids = torch.arange(3, dtype=torch.int32)
+        compressed_lens = torch.tensor([1024, 4096, 8192], dtype=torch.int32)
+    else:
+        raise ValueError(f'unknown case {case_name!r}; expected one of {CASE_NAMES}')
+    request_count = int(request_ids.max().item()) + 1
+    table_pages = (int(compressed_lens.max().item()) + CASE_PAGE - 1) // CASE_PAGE
+    block_table = torch.arange(request_count * table_pages, dtype=torch.int32).reshape(request_count, table_pages)
+    positions = compressed_lens.to(torch.int64) - 1
+    pages = torch.div(positions, CASE_PAGE, rounding_mode='floor')
+    offsets = positions.remainder(CASE_PAGE)
+    slots = block_table[request_ids.to(torch.long), pages] * CASE_PAGE + offsets
+    window_indices = torch.full((request_ids.numel(), CASE_PAGE), -1, dtype=torch.int32)
+    compressed_indices = torch.full((request_ids.numel(), INDEX_TOPK), -1, dtype=torch.int32)
+    candidate_mask = torch.zeros(request_ids.numel(), table_pages * CASE_PAGE, dtype=torch.uint8)
+    for token in range(request_ids.numel()):
+        request = int(request_ids[token])
+        visible = int(compressed_lens[token])
+        logical = torch.arange(visible, dtype=torch.int64)
+        physical = block_table[request, logical // CASE_PAGE] * CASE_PAGE + logical % CASE_PAGE
+        window_count = min(visible, CASE_PAGE)
+        window_indices[token, :window_count] = physical[-window_count:].to(torch.int32)
+        compressed_count = min(visible, INDEX_TOPK)
+        compressed_indices[token, :compressed_count] = physical[:compressed_count].to(torch.int32)
+        candidate_mask[token, :visible] = 1
+    return (request_ids, compressed_lens, block_table, slots.to(torch.int64), window_indices, compressed_indices, candidate_mask)
+
+
+def fixture_token_count(token_count: int, case_name: str) -> int:
+    """Return the token rows a case fixture provides; only the causal case follows ``token_count``."""
+    return int(_case_metadata(token_count, case_name)[0].numel())
+
+
+def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Tensor]:
+    import torch
+    from config import TP_SIZE, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP
+    from quant import quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
+    torch.manual_seed(41)
+    request_ids, compressed_lens, block_table, slots, window_indices, compressed_indices, candidate_mask = _case_metadata(token_count, case_name)
+    token_count = request_ids.numel()
+    cache_blocks = block_table.numel()
+    wq_a, wq_a_scale = _ranked_fp8_weight(D, Q_LORA, shared=True)
+    wq_b, wq_b_scale = _ranked_fp8_weight(Q_LORA, LOCAL_H * HEAD_DIM, shared=False)
+    wkv, wkv_scale = _ranked_fp8_weight(D, HEAD_DIM, shared=True)
+    wo_b, wo_b_scale = _ranked_fp8_weight(LOCAL_O_WIDTH, D, shared=False)
+    index_wq_b, index_wq_b_scale = _ranked_fp8_weight(Q_LORA, INDEX_H * INDEX_DIM, shared=True)
+    window_value = torch.randn(cache_blocks, CASE_PAGE, 1, HEAD_DIM).mul_(0.05)
+    window_cache, window_cache_scale = quantize_mxfp8_cache(window_value)
+    compressed_value = torch.randn(cache_blocks, CASE_PAGE, 1, HEAD_DIM).mul_(0.05)
+    compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(compressed_value, group_size=COMPRESSED_CACHE_GROUP, scale_format='bf16')
+    index_value = torch.randn(cache_blocks, CASE_PAGE, 1, INDEX_DIM).mul_(0.05)
+    index_cache, index_cache_scale = quantize_mxfp4_cache(index_value, group_size=INDEX_CACHE_GROUP, scale_format='e8m0')
+    index_cache_scale = index_cache_scale.view(torch.float8_e8m0fnu)
+    angles = (compressed_lens - 1).to(torch.float32).unsqueeze(1)
+    angles = angles * torch.arange(ROPE_DIM // 2, dtype=torch.float32).unsqueeze(0) * 0.001
+    values = {'x': _ranked(torch.randn(token_count, D).to(torch.bfloat16)), 'wq_a': wq_a, 'wq_a_scale': wq_a_scale, 'q_norm_weight': _ranked(torch.ones(Q_LORA, dtype=torch.bfloat16)), 'wq_b': wq_b, 'wq_b_scale': wq_b_scale, 'wkv': wkv, 'wkv_scale': wkv_scale, 'kv_norm_weight': _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)), 'attn_sink': torch.zeros(TP_SIZE, LOCAL_H, dtype=torch.float32), 'wo_a': torch.randn(TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16).mul_(O_GROUP_IN ** (-0.5)), 'wo_b': wo_b, 'wo_b_scale': wo_b_scale, 'rope_cos': _ranked(torch.cos(angles)), 'rope_sin': _ranked(torch.sin(angles)), 'window_slots': _ranked(slots), 'window_indices': _ranked(window_indices), 'window_cache': _ranked(window_cache), 'window_cache_scale': _ranked(window_cache_scale), 'compressed_cache': _ranked(compressed_cache), 'compressed_cache_scale': _ranked(compressed_cache_scale), 'compressed_indices': _ranked(compressed_indices), 'request_ids': _ranked(request_ids), 'compressed_lens': _ranked(compressed_lens), 'index_cache': _ranked(index_cache), 'index_cache_scale': _ranked(index_cache_scale), 'index_block_table': _ranked(block_table), 'candidate_mask': _ranked(candidate_mask), 'compressed_rope_cos': _ranked(torch.cos(angles)), 'compressed_rope_sin': _ranked(torch.sin(angles)), 'compressor_wkv': _ranked(torch.randn(D, HEAD_DIM).mul_(D ** (-0.5)).to(torch.bfloat16)), 'compressor_norm_weight': _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)), 'compressed_slots': _ranked(slots), 'index_wk': _ranked(torch.randn(HEAD_DIM, INDEX_DIM).mul_(HEAD_DIM ** (-0.5)).to(torch.bfloat16)), 'index_norm_weight': _ranked(torch.ones(INDEX_DIM, dtype=torch.bfloat16)), 'index_wq_b': index_wq_b, 'index_wq_b_scale': index_wq_b_scale, 'index_weights_proj': _ranked(torch.randn(D, INDEX_H).mul_(D ** (-0.5)).to(torch.bfloat16))}
+    values['attn_norm_weight'] = _ranked(torch.randn(D).mul_(0.1).add_(1).to(torch.bfloat16))
+    values["wo_a"], values["wo_a_scale"] = quantize_grouped_mxfp8_weight(values["wo_a"])
+    pool_width = index_pool_block_capacity(candidate_mask.shape[1])
+    ids = torch.full((token_count, pool_width), -1, dtype=torch.int32)
+    counts = torch.zeros(token_count, dtype=torch.int32)
+    for token in range(token_count):
+        blocks = torch.nonzero(candidate_mask[token].reshape(-1, 8).any(-1)).flatten()
+        count = min(blocks.numel(), pool_width)
+        ids[token, :count] = blocks[-count:].int()
+        counts[token] = count
+    values['pool_block_ids'] = _ranked(ids)
+    values['pool_block_counts'] = _ranked(counts)
+    return values
+
+
+def _copy_storage(destination: torch.Tensor, source: torch.Tensor) -> None:
+    import torch
+    destination.view(torch.uint8).copy_(source.contiguous().view(torch.uint8))
+
+
+def _reduce_tp_partials(partials: list[torch.Tensor]) -> torch.Tensor:
+    """Sum rank partials in rank order and round the completed reduction to BF16."""
+    import torch
+    reduced = torch.zeros_like(partials[0], dtype=torch.float32)
+    for partial in partials:
+        reduced.add_(partial.float())
+    return reduced.to(torch.bfloat16)
+
+
+def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, torch.Tensor], active_tokens: int | None=None) -> None:
+    from config import TP_SIZE
+    parameter_names = tuple(name for name, parameter in inspect.signature(golden_fn).parameters.items()
+                            if parameter.default is inspect.Parameter.empty)
+    token_input_names = {'x', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'request_ids', 'compressed_lens', 'compressed_rope_cos', 'compressed_rope_sin', 'compressed_slots', 'pool_block_ids', 'pool_block_counts', 'compressed_indices'}
+    results = []
+    for rank in range(TP_SIZE):
+        kwargs = {}
+        for name in parameter_names:
+            value = tensors[name][rank]
+            if active_tokens is not None and name in token_input_names and (value.ndim > 0):
+                value = value[:active_tokens]
+            kwargs[name] = value
+        results.append(golden_fn(**kwargs))
+    reduced = _reduce_tp_partials([result.output for result in results])
+    if active_tokens is None:
+        tensors['output'][:] = reduced.unsqueeze(0)
+    else:
+        tensors['output'][:, :active_tokens] = reduced.unsqueeze(0)
+    for rank, result in enumerate(results):
+        tensors['window_cache'][rank].copy_(result.window_cache)
+        _copy_storage(tensors['window_cache_scale'][rank], result.window_cache_scale)
+        if mode == 'full':
+            tensors['compressed_cache'][rank].copy_(result.compressed_cache)
+            tensors['compressed_cache_scale'][rank].copy_(result.compressed_cache_scale)
+            tensors['index_cache'][rank].copy_(result.index_cache)
+            _copy_storage(tensors['index_cache_scale'][rank], result.index_cache_scale)
+            ids = tensors['pool_block_ids'][rank]
+            counts = tensors['pool_block_counts'][rank]
+            ids.fill_(-1)
+            counts.zero_()
+            rows = result.pool_block_ids.shape[0]
+            ids[:rows].copy_(result.pool_block_ids)
+            counts[:rows].copy_(result.pool_block_counts)
+        if mode in ('full', 'reindex'):
+            if active_tokens is None:
+                tensors['topk_indices'][rank].copy_(result.topk_indices)
+            else:
+                tensors['topk_indices'][rank, :active_tokens].copy_(result.topk_indices)
+
+
+def _physical_to_logical(inputs: dict[str, torch.Tensor], rank: int, token: int) -> dict[int, int]:
+    import torch
+    request = int(inputs['request_ids'][rank, token])
+    visible = int(inputs['compressed_lens'][rank, token])
+    logical = torch.arange(visible, dtype=torch.int64)
+    table = inputs['index_block_table'][rank, request]
+    physical = table[logical // CASE_PAGE].to(torch.int64) * CASE_PAGE + logical % CASE_PAGE
+    return {int(row): index for index, row in enumerate(physical.tolist())}
+
+
+def topk_indices_compare(mode: str, score_fn: Callable) -> Callable:
+    """Accept device/CPU substitutions only at a numerically tied top-k cutoff."""
+    import torch
+
+    def compare(actual: torch.Tensor, expected: torch.Tensor, *, actual_outputs: dict[str, torch.Tensor], expected_outputs: dict[str, torch.Tensor], inputs: dict[str, torch.Tensor], rtol: float, atol: float) -> tuple[bool, str]:
+        del rtol, atol
+        if actual.shape != expected.shape or actual.dtype != expected.dtype:
+            return (False, '    Top-K shape and dtype must match the reference')
+        active = min(int(inputs.get('num_tokens', actual.shape[1])), actual.shape[1])
+        actual_active = actual[:, :active]
+        expected_active = expected[:, :active]
+        if bool((actual_active < -1).any()):
+            return (False, '    Top-K padding must use -1')
+        valid = actual_active >= 0
+        if bool((valid[..., 1:] & ~valid[..., :-1]).any()):
+            return (False, '    Top-K padding must follow all valid indices')
+        if torch.equal(actual_active, expected_active):
+            return (True, '')
+        for rank in range(actual_active.shape[0]):
+            scores = None
+            for token in range(actual_active.shape[1]):
+                actual_row = actual_active[rank, token]
+                expected_row = expected_active[rank, token]
+                actual_valid = actual_row[actual_row >= 0].to(torch.int64)
+                expected_valid = expected_row[expected_row >= 0].to(torch.int64)
+                if actual_valid.numel() != expected_valid.numel():
+                    return (False, f'    rank {rank} token {token} has {actual_valid.numel()} valid indices; expected {expected_valid.numel()}')
+                if torch.unique(actual_valid).numel() != actual_valid.numel():
+                    return (False, f'    rank {rank} token {token} contains duplicate indices')
+                physical_to_logical = _physical_to_logical(inputs, rank, token)
+                if any((row not in physical_to_logical for row in actual_valid.tolist())):
+                    return (False, f'    rank {rank} token {token} selected a row outside its request')
+                positions = [physical_to_logical[row] for row in actual_valid.tolist()]
+                if any((left >= right for left, right in zip(positions, positions[1:]))):
+                    return (False, f'    rank {rank} token {token} indices must follow logical position order')
+                actual_set = set(actual_valid.tolist())
+                expected_set = set(expected_valid.tolist())
+                if actual_set == expected_set:
+                    continue
+                missing = sorted(expected_set - actual_set)
+                extra = sorted(actual_set - expected_set)
+                if scores is None:
+                    score_outputs = actual_outputs if mode == 'full' else expected_outputs
+                    scores = score_fn(mode, rank, score_outputs, inputs)
+                missing_logical = torch.tensor([physical_to_logical[row] for row in missing], dtype=torch.int64)
+                extra_logical = torch.tensor([physical_to_logical[row] for row in extra], dtype=torch.int64)
+                missing_scores = torch.sort(scores[token, missing_logical], descending=True).values
+                extra_scores = torch.sort(scores[token, extra_logical], descending=True).values
+                tolerance = TOPK_SCORE_ATOL + TOPK_SCORE_RTOL * missing_scores.abs()
+                score_gap = missing_scores - extra_scores
+                if torch.all(score_gap <= tolerance):
+                    continue
+                worst = int(torch.argmax(score_gap - tolerance))
+                return (False, f'    rank {rank} token {token} top-k cutoff differs: missing score {float(missing_scores[worst]):.8g}, replacement score {float(extra_scores[worst]):.8g}, tolerance {float(tolerance[worst]):.8g}')
+        return (True, '')
+    compare.__name__ = 'numerical_cutoff_topk_compare'
+    return compare
+
+
+def wrap_attention_compare(compare):
+    """Present HC workspace names through the attention-only comparator ABI."""
+
+    def compare_hc(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
+        attention_inputs = {**inputs, "x": expected_outputs["attn_input"]}
+        attention_actual = {**actual_outputs, "output": actual_outputs["attn_out"]}
+        attention_expected = {**expected_outputs, "output": expected_outputs["attn_out"]}
+        return compare(
+            actual,
+            expected,
+            inputs=attention_inputs,
+            actual_outputs=attention_actual,
+            expected_outputs=attention_expected,
+            **kwargs,
+        )
+
+    return compare_hc
 
 
 def golden_prefill_attn_c1a_full(
@@ -605,7 +869,6 @@ def c1a_sp_reference_attention(mode, tensors, x, ranks, *, reference):
 
 def build_c1a_sp_specs(args, initial_state):
     """Make distinct DP requests, contiguous local residuals, and global-order metadata."""
-    import prefill_c2a_full as common
 
     fixture = make_fixture_values(args.tokens, args.case)
     tokens = fixture['x'].shape[1]
@@ -620,12 +883,12 @@ def build_c1a_sp_specs(args, initial_state):
         else:
             value = fixture[name]
         values[name] = torch.cat([value.view(torch.uint8)] * args.dp).view(value.dtype)
-    hc_keys = common.HC_INPUT_NAMES
+    hc_keys = HC_INPUT_NAMES
     seed = getattr(args, "seed", 17)
-    groups = [common.make_hc_inputs(tokens, seed + group * 7919, 'mixed') for group in range(args.dp)]
+    groups = [make_hc_inputs(tokens, seed + group * 7919, 'mixed') for group in range(args.dp)]
     for name in hc_keys:
         if name in ('x_hc', 'pre_mix'):
-            values[name] = torch.cat([common.token_shards(group[name], local) for group in groups])
+            values[name] = torch.cat([token_shards(group[name], local) for group in groups])
         else:
             values[name] = torch.stack([group[name] for group in groups]).repeat_interleave(TP_SIZE, 0)
     for rank in range(world):
@@ -710,10 +973,38 @@ def make_c1a_sp_compare(mode, initial_state, world_size, tokens):
     return compares
 
 
+def golden_c1a_sp(tensors, *, mode, reference):
+    """Evaluate attention and mHC outputs with per-rank cache state."""
+    local = tensors["x_hc"].shape[1]
+    tokens = tensors["attn_input"].shape[1]
+    for base in range(0, tensors["x_hc"].shape[0], TP_SIZE):
+        ranks = range(base, base + TP_SIZE)
+        group = slice(base, base + TP_SIZE)
+        active = int(tensors["num_tokens"][base, 0])
+        x_hc = tensors["x_hc"][group].flatten(0, 1)[:tokens].clone()
+        x_hc[active:] = 0
+        incoming = tensors["pre_mix"][group].flatten(0, 1)[:tokens]
+        pre, post, comb = golden_mhc_mixes(
+            x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
+        )
+        collapsed = golden_hc_pre(x_hc, incoming).to(torch.bfloat16)
+        x = golden_rms_norm(collapsed, tensors["attn_norm_weight"][base])
+        x[active:] = 0
+        attention, results = c1a_sp_reference_attention(mode, tensors, x, ranks, reference=reference)
+        for rank, result in zip(ranks, results):
+            for name in STATE_NAMES[mode]:
+                tensors[name][rank].copy_(result[name])
+        output = golden_hc_post(attention, x_hc, post, comb).float()
+        output[active:] = 0
+        pre[active:] = 0
+        tensors["attn_input"][group].copy_(x.expand_as(tensors["attn_input"][group]))
+        for name, value in (("attn_output", attention), ("next_pre_mix", pre), ("x_hc_out", output)):
+            tensors[name][group].copy_(token_shards(value, local))
+
+
 def validate_c1a_sp(mode, args, fn, reference):
     if args.tp != TP_SIZE:
         raise ValueError(f"--tp was parsed as TP{TP_SIZE}, got --tp {args.tp}")
-    import prefill_c2a_full as common
 
     args.mode = mode
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
@@ -736,7 +1027,7 @@ def validate_c1a_sp(mode, args, fn, reference):
         golden_data=getattr(args, "golden_data", None),
         runtime_dir=getattr(args, "runtime_dir", None),
         save_data=getattr(args, "save_data", False),
-        golden_fn=common.make_golden(mode, attention_reference=functools.partial(c1a_sp_reference_attention, reference=reference), state_names=STATE_NAMES[mode]),
+        golden_fn=functools.partial(golden_c1a_sp, mode=mode, reference=reference),
         compare_fn=make_c1a_sp_compare(mode, initial_state, len(devices), fixture_tokens),
         compile_only=args.compile_only,
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0)),

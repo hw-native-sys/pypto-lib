@@ -41,9 +41,7 @@ from o_proj import (
     retire_prefill_signals,
     golden_o_proj, prefill_sp_output_reduce_scatter, o_proj,
 )
-from hc import prefill_sp_post, golden_hc_post
-from hc import golden_mhc_mixes
-from hc import golden_hc_pre
+from hc import golden_hc_pre, golden_hc_post, golden_mhc_mixes, prefill_sp_post
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables
 from qkv_proj_rope import golden_rope_tail, q_proj_qr, q_proj_rope, kv_proj_rope
@@ -51,7 +49,8 @@ from quant import (
     dequantize_mxfp4_cache, golden_bf16_gemm, golden_mxfp8_linear, golden_mxfp8_quantize, pack_mx_b_scale,
     quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache,
 )
-from utils import paged_slots, window_metadata
+from hc import HC_INPUT_NAMES, make_hc_inputs
+from utils import paged_slots, token_shards, window_metadata
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk,
     prefill_attend_sparse, prefill_publish_window,
@@ -322,16 +321,6 @@ def prefill_c2a_full_sp(
     return x_hc_out
 
 
-def golden_attention_input(
-    x_hc: torch.Tensor,
-    pre_mix: torch.Tensor,
-    attn_norm_weight: torch.Tensor,
-) -> torch.Tensor:
-    """Collapse the streams with the delayed pre-mix, round to BF16, then apply RMSNorm."""
-    return golden_rms_norm(golden_hc_pre(x_hc, pre_mix).to(torch.bfloat16), attn_norm_weight)
-
-
-HC_INPUT_NAMES = ("x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight")
 MX_GROUP = M.weight_block_size[0]
 
 CMP_SCALES = HEAD_DIM // 16
@@ -824,38 +813,12 @@ MODES = {
 ATTENTION_STATE = {"full": MUTABLE_NAMES + ("topk_indices",), "reuse": REUSE_MUTABLE_NAMES}
 
 
-def make_hc_inputs(tokens, seed, case):
-    """mHC inputs with distinct per-token magnitudes so both RMS statistics stay observable."""
-    gen = torch.Generator().manual_seed(seed)
-    magnitudes = (0.5 + torch.arange(tokens) % 4).reshape(-1, 1, 1)
-    # The residual stream holds BF16 values; FP32 storage only keeps hc_post's single rounding.
-    x_hc = (torch.randn(tokens, HC_MULT, D, generator=gen) * magnitudes).bfloat16().float()
-    values = {
-        "x_hc": x_hc,
-        "pre_mix": torch.sigmoid(torch.randn(tokens, HC_MULT, generator=gen)) + M.hc_eps,
-        "hc_attn_fn": torch.randn(MIX_HC, HC_DIM, generator=gen) / math.sqrt(HC_DIM),
-        "hc_attn_scale": torch.randn(3, generator=gen),
-        "hc_attn_base": torch.randn(MIX_HC, generator=gen),
-        "attn_norm_weight": (torch.randn(D, generator=gen) * 0.1 + 1).bfloat16(),
-    }
-    if case == "zero":
-        values["x_hc"] = torch.zeros_like(x_hc)
-    return values
-
-
 def make_attention_inputs(mode, tokens, requests, seed, case, *, make_inputs=None):
     """Attention fixture of the chained mode, without ``x``: the chain derives it from x_hc."""
     make = make_c2a_inputs if make_inputs is None else make_inputs
     options = {"full_rope_tables": True} if mode == "full" else {}
     values = make(tokens=tokens, requests=requests, seed=seed, case=case, mode="prefill", **options)
     return {name: value for name, value in values.items() if name != "x"}
-
-
-def token_shards(value, local_tokens):
-    """Pad scheduled rows and split them in contiguous TP rank order."""
-    padded = value.new_zeros(TP_SIZE * local_tokens, *value.shape[1:])
-    padded[:value.shape[0]].copy_(value)
-    return padded.reshape(TP_SIZE, local_tokens, *value.shape[1:])
 
 
 def reference_attention(mode, tensors, x, ranks, *, reference=golden_reference_c2a):
@@ -904,37 +867,33 @@ def reference_attention(mode, tensors, x, ranks, *, reference=golden_reference_c
     return sum(partials).bfloat16(), results
 
 
-def make_golden(mode, *, attention_reference=None, state_names=None):
-    """Reconstruct scheduled rows, evaluate full references, then shard local state."""
-
-    def golden(tensors):
-        local = tensors["x_hc"].shape[1]
-        tokens = tensors["attn_input"].shape[1]
-        for base in range(0, tensors["x_hc"].shape[0], TP_SIZE):
-            ranks = range(base, base + TP_SIZE)
-            group = slice(base, base + TP_SIZE)
-            active = int(tensors["num_tokens"][base, 0])
-            x_hc = tensors["x_hc"][group].flatten(0, 1)[:tokens].clone()
-            x_hc[active:] = 0
-            incoming = tensors["pre_mix"][group].flatten(0, 1)[:tokens]
-            pre, post, comb = golden_mhc_mixes(
-                x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
-            )
-            x = golden_attention_input(x_hc, incoming, tensors["attn_norm_weight"][base])
-            x[active:] = 0
-            reference = attention_reference or reference_attention
-            attention, results = reference(mode, tensors, x, ranks)
-            for rank, result in zip(ranks, results):
-                for name in ATTENTION_STATE[mode] if state_names is None else state_names:
-                    tensors[name][rank].copy_(result[name])
-            output = golden_hc_post(attention, x_hc, post, comb).float()
-            output[active:] = 0
-            pre[active:] = 0
-            tensors["attn_input"][group].copy_(x.expand_as(tensors["attn_input"][group]))
-            for name, value in (("attn_output", attention), ("next_pre_mix", pre), ("x_hc_out", output)):
-                tensors[name][group].copy_(token_shards(value, local))
-
-    return golden
+def golden_prefill_c2a(tensors, *, mode="full", reference=golden_reference_c2a):
+    """Evaluate attention and mHC outputs with per-rank cache state."""
+    local = tensors["x_hc"].shape[1]
+    tokens = tensors["attn_input"].shape[1]
+    for base in range(0, tensors["x_hc"].shape[0], TP_SIZE):
+        ranks = range(base, base + TP_SIZE)
+        group = slice(base, base + TP_SIZE)
+        active = int(tensors["num_tokens"][base, 0])
+        x_hc = tensors["x_hc"][group].flatten(0, 1)[:tokens].clone()
+        x_hc[active:] = 0
+        incoming = tensors["pre_mix"][group].flatten(0, 1)[:tokens]
+        pre, post, comb = golden_mhc_mixes(
+            x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
+        )
+        collapsed = golden_hc_pre(x_hc, incoming).to(torch.bfloat16)
+        x = golden_rms_norm(collapsed, tensors["attn_norm_weight"][base])
+        x[active:] = 0
+        attention, results = reference_attention(mode, tensors, x, ranks, reference=reference)
+        for rank, result in zip(ranks, results):
+            for name in ATTENTION_STATE[mode]:
+                tensors[name][rank].copy_(result[name])
+        output = golden_hc_post(attention, x_hc, post, comb).float()
+        output[active:] = 0
+        pre[active:] = 0
+        tensors["attn_input"][group].copy_(x.expand_as(tensors["attn_input"][group]))
+        for name, value in (("attn_output", attention), ("next_pre_mix", pre), ("x_hc_out", output)):
+            tensors[name][group].copy_(token_shards(value, local))
 
 
 def _report(name, actual, expected):
@@ -1389,7 +1348,7 @@ if __name__ == "__main__":
     result = run(
         fn=l3_prefill_c2a_full,
         specs=build_specs(args, "full", initial_state),
-        golden_fn=make_golden("full"),
+        golden_fn=golden_prefill_c2a,
         compile_only=args.compile_only,
         config=dict(
             backend_type=args.backend_type,

@@ -493,6 +493,28 @@ def build_mhc_pre_tensor_specs(batch: int = 2, sequence: int = 1):
     ]
 
 
+HC_INPUT_NAMES = ("x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight")
+
+
+def make_hc_inputs(tokens, seed, case):
+    """mHC inputs with distinct per-token magnitudes so both RMS statistics stay observable."""
+    gen = torch.Generator().manual_seed(seed)
+    magnitudes = (0.5 + torch.arange(tokens) % 4).reshape(-1, 1, 1)
+    # The residual stream holds BF16 values; FP32 storage only keeps hc_post's single rounding.
+    x_hc = (torch.randn(tokens, HC_MULT, D, generator=gen) * magnitudes).bfloat16().float()
+    values = {
+        "x_hc": x_hc,
+        "pre_mix": torch.sigmoid(torch.randn(tokens, HC_MULT, generator=gen)) + M.hc_eps,
+        "hc_attn_fn": torch.randn(MIX_HC, HC_DIM, generator=gen) / math.sqrt(HC_DIM),
+        "hc_attn_scale": torch.randn(3, generator=gen),
+        "hc_attn_base": torch.randn(MIX_HC, generator=gen),
+        "attn_norm_weight": (torch.randn(D, generator=gen) * 0.1 + 1).bfloat16(),
+    }
+    if case == "zero":
+        values["x_hc"] = torch.zeros_like(x_hc)
+    return values
+
+
 if __name__ == "__main__":
     import argparse
 

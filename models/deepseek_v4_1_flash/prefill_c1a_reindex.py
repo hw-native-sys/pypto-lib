@@ -28,11 +28,10 @@ from sparse_attention import (
     attend_packed, golden_compressed_attention, golden_prefill_c1a_attention,
     prefill_publish_window,
 )
-from utils import (
-    CASE_DEFAULT, CASE_MAX_TOKENS, CASE_NAMES, apply_distributed_golden, fixture_token_count,
-    make_fixture_values, topk_indices_compare, wrap_attention_compare,
-    AttentionGoldenResult, COMMON_INPUT_NAMES,
+from prefill_c1a_full import (
+    CASE_DEFAULT, CASE_MAX_TOKENS, CASE_NAMES, apply_distributed_golden, fixture_token_count, make_fixture_values, topk_indices_compare, wrap_attention_compare, COMMON_INPUT_NAMES,
 )
+from utils import AttentionGoldenResult
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope

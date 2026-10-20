@@ -11,6 +11,7 @@
 
 import pypto.language as pl
 import torch
+from golden import mapped_pool_ratio_allclose
 
 from decode_c2a_full import (
     build_hc_validation_values, golden_c2a_hc_case, golden_reference_c2a_reuse,
@@ -31,7 +32,7 @@ from sparse_attention import (
 )
 from o_proj import o_proj
 from golden import TensorSpec, ScalarSpec, ratio_allclose, run
-from utils import swa_window_cache_compare, AttentionGoldenResult
+from utils import AttentionGoldenResult
 
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
@@ -48,7 +49,6 @@ HC_DIM = M.hc_dim
 MIX_HC = M.mix_hc
 INDEX_TOPK = M.index_topk
 MX_GROUP = M.weight_block_size[0]
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -328,6 +328,28 @@ def golden_decode_c2a_reuse_case(tensors):
     golden_c2a_hc_case(tensors, golden_decode_attn_c2a_reuse)
 
 
+def c2a_reuse_window_cache_compare(
+    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
+    scale_rtol=0.0, scale_error_ratio=0.0,
+):
+    """Compare the mapped window rows and require every other row to stay unchanged."""
+    options = dict(
+        mapping_shape=(world_size, tokens),
+        block_size=128,
+        leading_rank_axis=True,
+    )
+    return {
+        "window_cache": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache",
+            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
+        ),
+        "window_cache_scale": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache scale",
+            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
+        ),
+    }
+
+
 if __name__ == "__main__":
     from utils import parse_decode_startpos
 
@@ -363,7 +385,7 @@ if __name__ == "__main__":
         "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
         "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
     }
-    comparisons.update(swa_window_cache_compare(
+    comparisons.update(c2a_reuse_window_cache_compare(
         1, args.tokens, payload_atol=2 ** -9, payload_rtol=2 ** -3,
     ))
     result = run(

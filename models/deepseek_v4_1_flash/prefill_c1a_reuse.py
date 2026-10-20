@@ -22,10 +22,10 @@ from hc import golden_mhc_mixes, hc_mixes
 from hc import golden_hc_post, hc_post, prefill_sp_post
 from hc import golden_hc_pre, hc_pre
 from rmsnorm import golden_rms_norm, rms_norm_tiled
-from utils import (
-    CASE_DEFAULT, CASE_MAX_TOKENS, CASE_NAMES, apply_distributed_golden, fixture_token_count,
-    make_fixture_values, AttentionGoldenResult, COMMON_INPUT_NAMES,
+from prefill_c1a_full import (
+    CASE_DEFAULT, CASE_MAX_TOKENS, CASE_NAMES, apply_distributed_golden, fixture_token_count, make_fixture_values, COMMON_INPUT_NAMES,
 )
+from utils import AttentionGoldenResult
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from sparse_attention import (

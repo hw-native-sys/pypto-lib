@@ -8,13 +8,12 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4.1 decode Block composition and CPU reference."""
+"""DeepSeek-V4.1 decode attention and MoE block."""
 
 
 import argparse
 import inspect
 from dataclasses import dataclass
-from quant import pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp4_weight, quantize_mxfp8_cache
 from enum import IntEnum
 from typing import Any, Mapping
 
@@ -23,76 +22,35 @@ import torch.nn.functional as F
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-
 from config import (
-    FLASH as M,
-    DECODE_MAX_TOKENS,
-    AttentionMode,
-    COMPRESSED_CACHE_GROUP,
-    INDEX_CACHE_GROUP,
-    STATE_CAPACITY,
-    WINDOW_CACHE_GROUP,
-)
-
-from config import MOE_TOKENS
-from config import (
-    TP_SIZE,
-    SUPPORTED_EP_SIZES,
-    ORI_BLOCKS_DYN,
-    CMP_BLOCKS_DYN,
-    INDEX_BLOCKS_DYN,
-    B_DYN,
-    TABLE_DYN,
-    INDEX_POOL_BLOCKS_DYN,
-    STATE_BLOCKS_DYN,
-    T_DYN,
-    Q_START_DYN,
-    ROUTE_T_DYN,
+    FLASH as M, AttentionMode,
+    DECODE_MAX_TOKENS, MOE_TOKENS, TP_SIZE, SUPPORTED_EP_SIZES,
+    B_DYN, T_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, TABLE_DYN,
+    ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, STATE_BLOCKS_DYN,
+    COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
 )
 from compressor import STATE_WIDTH
-
-
-from utils import AttentionGoldenResult
-from config import LOCAL_T_DYN
-from decode_c1a_full import (
-    golden_decode_attn_c1a_full,
-)
-from decode_c2a_full import golden_decode_attn_c2a_full
-from decode_c2a_reuse import golden_decode_attn_c2a_reuse
-from sparse_attention import golden_swa_attention
-from decode_c1a_full import decode_c1a_full
+from decode_c1a_full import decode_c1a_full, golden_decode_attn_c1a_full
 from decode_c1a_reindex import decode_c1a_reindex, golden_decode_attn_c1a_reindex
 from decode_c1a_reuse import decode_c1a_reuse, golden_decode_attn_c1a_reuse
-from decode_c2a_full import decode_c2a_full
-from decode_c2a_reuse import decode_c2a_reuse
+from decode_c2a_full import decode_c2a_full, golden_decode_attn_c2a_full
+from decode_c2a_reuse import decode_c2a_reuse, golden_decode_attn_c2a_reuse
 from decode_swa import decode_swa
+from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from gate import golden_gate_reference as gate
-from rmsnorm import golden_rms_norm
-from hc import golden_mhc_mixes
-from hc import golden_hc_post
-from hc import golden_hc_pre
-from expert_routed import (
-    MX_PACKED_LANE_COLS,
-    MX_W1_PACKED_ROWS,
-    MX_W2_PACKED_ROWS,
-    MX_W3_PACKED_ROWS,
-)
-from moe import SIGNAL_PAD
+from hc import golden_mhc_mixes, golden_hc_post, golden_hc_pre
 from moe import (
-    clear_moe_signals,
-    AUX_WIDTH,
-    EP_SIZE,
-    N_LOCAL_EXPERTS,
-    RECV_MAX,
-    ROUTE_WIDTH,
-    moe,
+    AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD,
+    clear_moe_signals, moe,
 )
 from quant import (
-    quantize_grouped_mxfp8_weight,
-    dequantize_mxfp4,
-    dequantize_mxfp8,
-    unpack_mx_b_scale,
+    pack_mx_b_scale, unpack_mx_b_scale,
+    quantize_mxfp4_cache, quantize_mxfp4_weight, quantize_mxfp8_cache, quantize_grouped_mxfp8_weight,
+    dequantize_mxfp4, dequantize_mxfp8,
 )
+from rmsnorm import golden_rms_norm
+from sparse_attention import golden_swa_attention
+from utils import AttentionGoldenResult
 
 
 # model config
@@ -117,61 +75,6 @@ MOE_INTER = M.moe_intermediate_size
 MX_GROUP = M.weight_block_size[0]
 
 
-@dataclass(frozen=True)
-class DecodeLayerGoldenResult:
-    """Block outputs, intermediate boundaries, and attention state updates."""
-
-    output: torch.Tensor
-    next_pre_mix: torch.Tensor
-    attention_input: torch.Tensor
-    attention_output: torch.Tensor
-    attention_hidden: torch.Tensor
-    ffn_input: torch.Tensor
-    ffn_output: torch.Tensor
-    attention: AttentionGoldenResult
-
-
-class DecodeLayerKind(IntEnum):
-    """Attention branch used by one decode Block."""
-
-    SWA = 0
-    C2A_FULL = 1
-    C2A_REUSE = 2
-    C1A_FULL = 3
-    C1A_REINDEX = 4
-    C1A_REUSE = 5
-
-
-REPRESENTATIVE_LAYER_IDS = {
-    DecodeLayerKind.SWA: 0,
-    DecodeLayerKind.C2A_FULL: 2,
-    DecodeLayerKind.C2A_REUSE: 3,
-    DecodeLayerKind.C1A_FULL: 20,
-    DecodeLayerKind.C1A_REINDEX: 24,
-    DecodeLayerKind.C1A_REUSE: 21,
-}
-
-
-def decode_layer_kind(layer_id: int) -> DecodeLayerKind:
-    """Map the checkpoint-backed layer schedule to one decode branch."""
-    layer = M.layer_config(layer_id)
-    if layer.mode == AttentionMode.SWA:
-        return DecodeLayerKind.SWA
-    if layer.compression_ratio == 2 and layer.mode == AttentionMode.FULL:
-        return DecodeLayerKind.C2A_FULL
-    if layer.compression_ratio == 2 and layer.mode == AttentionMode.REUSE:
-        return DecodeLayerKind.C2A_REUSE
-    if layer.compression_ratio == 1 and layer.mode == AttentionMode.FULL:
-        return DecodeLayerKind.C1A_FULL
-    if layer.compression_ratio == 1 and layer.mode == AttentionMode.REINDEX:
-        return DecodeLayerKind.C1A_REINDEX
-    if layer.compression_ratio == 1 and layer.mode == AttentionMode.REUSE:
-        return DecodeLayerKind.C1A_REUSE
-    raise ValueError(
-        f"unsupported decode layer {layer_id}: ratio={layer.compression_ratio}, mode={layer.mode.value}"
-    )
-
-
 @pl.jit
 def l2_decode_layer(
     x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
@@ -184,11 +87,7 @@ def l2_decode_layer(
     wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
     q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[
-        [Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM],
-        pl.FP8E8M0,
-        pl.MX_B_NN,
-    ],
+    wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
     wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
@@ -201,37 +100,16 @@ def l2_decode_layer(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[
-        pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]
-    ],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[
-            [ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP],
-            pl.BF16,
-        ]
-    ],
-    compressed_cache: pl.InOut[
-        pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]
-    ],
-    compressed_cache_scale: pl.InOut[
-        pl.Tensor[
-            [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-            pl.BF16,
-        ]
-    ],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
+    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
-    index_cache: pl.InOut[
-        pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]
-    ],
-    index_cache_scale: pl.InOut[
-        pl.Tensor[
-            [INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP],
-            pl.FP8E8M0,
-        ]
-    ],
+    index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -240,19 +118,13 @@ def l2_decode_layer(
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
-    state_cache: pl.InOut[
-        pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]
-    ],
+    state_cache: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
     index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
-    index_wq_b_scale: pl.Tensor[
-        [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM],
-        pl.FP8E8M0,
-        pl.MX_B_NN,
-    ],
+    index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
     pool_block_ids: pl.InOut[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
@@ -268,23 +140,11 @@ def l2_decode_layer(
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w1_scale: pl.Tensor[
-        [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER],
-        pl.FP8E8M0,
-        pl.MX_B_NN,
-    ],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2_scale: pl.Tensor[
-        [N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D],
-        pl.FP8E8M0,
-        pl.MX_B_NN,
-    ],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
     routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3_scale: pl.Tensor[
-        [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER],
-        pl.FP8E8M0,
-        pl.MX_B_NN,
-    ],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
@@ -301,13 +161,9 @@ def l2_decode_layer(
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
     arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
-    data_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -329,98 +185,64 @@ def l2_decode_layer(
 
     if layer_id < 2:
         decode_swa(
-            x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
-            rope_cos, rope_sin, window_slots, window_indices, window_cache,
-            window_cache_scale, attention_output, attention_hidden, attention_pre_mix,
+            x_hc, incoming_pre_mix,
+            hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_weight,
+            wq_a, wq_a_scale, q_norm_weight,
+            wq_b, wq_b_scale,
+            wkv, wkv_scale, kv_norm_weight,
+            attn_sink,
+            wo_a, wo_a_scale, wo_b, wo_b_scale,
+            rope_cos, rope_sin,
+            window_slots, window_indices,
+            window_cache, window_cache_scale,
+            attention_output, attention_hidden, attention_pre_mix,
             attention_num_tokens,
         )
     elif layer_id < 20:
         if (layer_id - 2) % 6 == 0:
             decode_c2a_full(
-                x_hc,
-                incoming_pre_mix,
-                hc_attn_fn,
-                hc_attn_scale,
-                hc_attn_base,
+                x_hc, incoming_pre_mix,
+                hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_weight,
-                wq_a,
-                wq_a_scale,
-                q_norm_weight,
-                wq_b,
-                wq_b_scale,
-                wkv,
-                wkv_scale,
-                kv_norm_weight,
+                wq_a, wq_a_scale, q_norm_weight,
+                wq_b, wq_b_scale,
+                wkv, wkv_scale, kv_norm_weight,
                 attn_sink,
-                wo_a, wo_a_scale,
-                wo_b,
-                wo_b_scale,
-                rope_cos,
-                rope_sin,
-                window_slots,
-                window_indices,
-                window_cache,
-                window_cache_scale,
-                compressed_cache,
-                compressed_cache_scale,
-                token_to_req_indices,
-                compressed_lens,
-                index_cache,
-                index_cache_scale,
-                index_block_table,
+                wo_a, wo_a_scale, wo_b, wo_b_scale,
+                rope_cos, rope_sin,
+                window_slots, window_indices,
+                window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+                token_to_req_indices, compressed_lens,
+                index_cache, index_cache_scale, index_block_table,
                 position_ids,
-                compressed_rope_cos,
-                compressed_rope_sin,
+                compressed_rope_cos, compressed_rope_sin,
                 compressor_wkv,
                 compressor_wgate,
-                query_start_loc,
-                state_block_table,
-                state_cache,
+                query_start_loc, state_block_table, state_cache,
                 compressor_norm_weight,
                 compressed_slots,
-                index_wk,
-                index_norm_weight,
-                index_wq_b,
-                index_wq_b_scale,
-                index_weights_proj,
+                index_wk, index_norm_weight,
+                index_wq_b, index_wq_b_scale, index_weights_proj,
                 topk_indices,
-                attention_hidden,
-                attention_pre_mix,
+                attention_hidden, attention_pre_mix,
                 attention_num_tokens,
             )
         else:
             decode_c2a_reuse(
-                x_hc,
-                incoming_pre_mix,
-                hc_attn_fn,
-                hc_attn_scale,
-                hc_attn_base,
+                x_hc, incoming_pre_mix,
+                hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_weight,
-                wq_a,
-                wq_a_scale,
-                q_norm_weight,
-                wq_b,
-                wq_b_scale,
-                wkv,
-                wkv_scale,
-                kv_norm_weight,
+                wq_a, wq_a_scale, q_norm_weight,
+                wq_b, wq_b_scale,
+                wkv, wkv_scale, kv_norm_weight,
                 attn_sink,
-                wo_a, wo_a_scale,
-                wo_b,
-                wo_b_scale,
-                rope_cos,
-                rope_sin,
-                window_slots,
-                window_indices,
-                window_cache,
-                window_cache_scale,
-                compressed_cache,
-                compressed_cache_scale,
+                wo_a, wo_a_scale, wo_b, wo_b_scale,
+                rope_cos, rope_sin,
+                window_slots, window_indices,
+                window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
                 topk_indices,
-                attention_hidden,
-                attention_pre_mix,
+                attention_hidden, attention_pre_mix,
                 attention_num_tokens,
             )
     elif layer_id == 20:
@@ -439,7 +261,9 @@ def l2_decode_layer(
             request_ids, compressed_lens,
             index_cache, index_cache_scale, index_block_table,
             compressed_rope_cos, compressed_rope_sin,
-            c1a_compressor_wkv, compressor_norm_weight, compressed_slots,
+            c1a_compressor_wkv,
+            compressor_norm_weight,
+            compressed_slots,
             index_wk, index_norm_weight,
             index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices, pool_block_ids, pool_block_counts,
@@ -487,13 +311,22 @@ def l2_decode_layer(
 
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
     moe(
-        attention_hidden, attention_pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        ffn_norm_weight, gate_weight, correction_bias, routed_w1, routed_w1_scale,
-        routed_w2, routed_w2_scale, routed_w3, routed_w3_scale, mxfp4_pair_lut,
-        shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3,
-        shared_w3_scale, next_pre_mix, x_mixed, x_next, recv_meta, recv_x,
-        recv_scale, recv_weights, recv_routes, arrived, data_arrived, routed_output,
-        combine_arrived, local_moe_tokens, rank, moe_epoch,
+        attention_hidden, attention_pre_mix,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        ffn_norm_weight,
+        gate_weight,
+        correction_bias,
+        routed_w1, routed_w1_scale,
+        routed_w2, routed_w2_scale,
+        routed_w3, routed_w3_scale,
+        mxfp4_pair_lut,
+        shared_w1, shared_w1_scale,
+        shared_w2, shared_w2_scale,
+        shared_w3, shared_w3_scale,
+        next_pre_mix, x_mixed, x_next,
+        recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+        arrived, data_arrived, routed_output, combine_arrived,
+        local_moe_tokens, rank, moe_epoch,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
 
@@ -523,37 +356,16 @@ def l3_decode_layer(
     rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
     window_indices: pl.Tensor[[EP_SIZE, T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[
-        pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]
-    ],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[
-            [EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP],
-            pl.BF16,
-        ]
-    ],
-    compressed_cache: pl.InOut[
-        pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]
-    ],
-    compressed_cache_scale: pl.InOut[
-        pl.Tensor[
-            [EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP],
-            pl.BF16,
-        ]
-    ],
+    window_cache: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    compressed_cache: pl.InOut[pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
+    compressed_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
     request_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     position_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
-    index_cache: pl.InOut[
-        pl.Tensor[[EP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]
-    ],
-    index_cache_scale: pl.InOut[
-        pl.Tensor[
-            [EP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP],
-            pl.FP8E8M0,
-        ]
-    ],
+    index_cache: pl.InOut[pl.Tensor[[EP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
     index_block_table: pl.Tensor[[EP_SIZE, B_DYN, TABLE_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -562,9 +374,7 @@ def l3_decode_layer(
     c1a_compressor_wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.BF16],
     query_start_loc: pl.Tensor[[EP_SIZE, Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[EP_SIZE, B_DYN, 1], pl.INT32],
-    state_cache: pl.InOut[
-        pl.Tensor[[EP_SIZE, STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]
-    ],
+    state_cache: pl.InOut[pl.Tensor[[EP_SIZE, STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     compressor_norm_weight: pl.Tensor[[EP_SIZE, HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
     index_wk: pl.Tensor[[EP_SIZE, HEAD_DIM, INDEX_DIM], pl.BF16],
@@ -573,18 +383,12 @@ def l3_decode_layer(
     index_wq_b_scale: pl.Tensor[[EP_SIZE, Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0],
     index_weights_proj: pl.Tensor[[EP_SIZE, D, INDEX_H], pl.BF16],
     topk_indices: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN, INDEX_TOPK], pl.INT32]],
-    pool_block_ids: pl.InOut[
-        pl.Tensor[[EP_SIZE, T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]
-    ],
+    pool_block_ids: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
     pool_block_counts: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN], pl.INT32]],
     compressed_indices: pl.Tensor[[EP_SIZE, T_DYN, INDEX_TOPK], pl.INT32],
     attention_output: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, D], pl.BF16]],
-    attention_hidden: pl.Out[
-        pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]
-    ],
-    attention_pre_mix: pl.Out[
-        pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]
-    ],
+    attention_hidden: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    attention_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
     hc_ffn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
@@ -626,13 +430,9 @@ def l3_decode_layer(
     recv_weights_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
     recv_routes_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
     arrived_buffer = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
-    data_arrived_buffer = pld.alloc_window_buffer(
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
-    )
+    data_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32 )
     routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-    combine_arrived_buffer = pld.alloc_window_buffer(
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
-    )
+    combine_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32 )
     for rank in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
@@ -640,17 +440,9 @@ def l3_decode_layer(
         recv_weights = pld.window(recv_weights_buffer, [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
         recv_routes = pld.window(recv_routes_buffer, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
         arrived = pld.window(arrived_buffer, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
-        data_arrived = pld.window(
-            data_arrived_buffer,
-            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
-            dtype=pl.INT32,
-        )
+        data_arrived = pld.window(data_arrived_buffer, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
         routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
-        combine_arrived = pld.window(
-            combine_arrived_buffer,
-            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
-            dtype=pl.INT32,
-        )
+        combine_arrived = pld.window(combine_arrived_buffer, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
         wq_a_scale_rank: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
         wq_b_scale_rank: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
         wkv_scale_rank: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
@@ -663,99 +455,209 @@ def l3_decode_layer(
         shared_w2_scale_rank: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[rank]
         shared_w3_scale_rank: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[rank]
         l2_decode_layer(
-            x_hc[rank],
-            incoming_pre_mix[rank],
-            hc_attn_fn[rank],
-            hc_attn_scale[rank],
-            hc_attn_base[rank],
+            x_hc[rank], incoming_pre_mix[rank],
+            hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank],
             wq_a[rank],
             wq_a_scale_rank,
             q_norm_weight[rank],
-            wq_b[rank],
-            wq_b_scale_rank,
+            wq_b[rank], wq_b_scale_rank,
             wkv[rank],
             wkv_scale_rank,
             kv_norm_weight[rank],
             attn_sink[rank],
-            wo_a[rank], wo_a_scale[rank],
-            wo_b[rank],
-            wo_b_scale_rank,
-            rope_cos[rank],
-            rope_sin[rank],
-            window_slots[rank],
-            window_indices[rank],
-            window_cache[rank],
-            window_cache_scale[rank],
-            compressed_cache[rank],
-            compressed_cache_scale[rank],
-            request_ids[rank],
-            token_to_req_indices[rank],
-            position_ids[rank],
-            compressed_lens[rank],
-            index_cache[rank],
-            index_cache_scale[rank],
-            index_block_table[rank],
-            compressed_rope_cos[rank],
-            compressed_rope_sin[rank],
+            wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_rank,
+            rope_cos[rank], rope_sin[rank],
+            window_slots[rank], window_indices[rank],
+            window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
+            request_ids[rank], token_to_req_indices[rank], position_ids[rank], compressed_lens[rank],
+            index_cache[rank], index_cache_scale[rank], index_block_table[rank],
+            compressed_rope_cos[rank], compressed_rope_sin[rank],
             compressor_wkv[rank],
             compressor_wgate[rank],
             c1a_compressor_wkv[rank],
-            query_start_loc[rank],
-            state_block_table[rank],
-            state_cache[rank],
+            query_start_loc[rank], state_block_table[rank], state_cache[rank],
             compressor_norm_weight[rank],
             compressed_slots[rank],
-            index_wk[rank],
-            index_norm_weight[rank],
-            index_wq_b[rank],
-            index_wq_b_scale_rank,
-            index_weights_proj[rank],
-            topk_indices[rank],
-            pool_block_ids[rank],
-            pool_block_counts[rank],
-            compressed_indices[rank],
-            attention_output[rank],
-            attention_hidden[rank],
-            attention_pre_mix[rank],
-            hc_ffn_fn[rank],
-            hc_ffn_scale[rank],
-            hc_ffn_base[rank],
+            index_wk[rank], index_norm_weight[rank],
+            index_wq_b[rank], index_wq_b_scale_rank, index_weights_proj[rank],
+            topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], compressed_indices[rank],
+            attention_output[rank], attention_hidden[rank], attention_pre_mix[rank],
+            hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
             ffn_norm_weight[rank],
             gate_weight[rank],
             correction_bias[rank],
-            routed_w1[rank],
-            routed_w1_scale_rank,
-            routed_w2[rank],
-            routed_w2_scale_rank,
-            routed_w3[rank],
-            routed_w3_scale_rank,
+            routed_w1[rank], routed_w1_scale_rank,
+            routed_w2[rank], routed_w2_scale_rank,
+            routed_w3[rank], routed_w3_scale_rank,
             mxfp4_pair_lut[rank],
-            shared_w1[rank],
-            shared_w1_scale_rank,
-            shared_w2[rank],
-            shared_w2_scale_rank,
-            shared_w3[rank],
-            shared_w3_scale_rank,
-            next_pre_mix[rank],
-            x_mixed[rank],
-            x_next[rank],
-            recv_meta,
-            recv_x,
-            recv_scale,
-            recv_weights,
-            recv_routes,
-            arrived,
-            data_arrived,
-            routed_output,
-            combine_arrived,
-            moe_num_tokens,
-            layer_id,
-            rank,
-            attention_num_tokens,
-            moe_epoch,
+            shared_w1[rank], shared_w1_scale_rank,
+            shared_w2[rank], shared_w2_scale_rank,
+            shared_w3[rank], shared_w3_scale_rank,
+            next_pre_mix[rank], x_mixed[rank], x_next[rank],
+            recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+            arrived, data_arrived, routed_output, combine_arrived,
+            moe_num_tokens, layer_id, rank, attention_num_tokens, moe_epoch,
             device=rank,
         )
+class DecodeLayerKind(IntEnum):
+    """Attention branch used by one decode Block."""
+
+    SWA = 0
+    C2A_FULL = 1
+    C2A_REUSE = 2
+    C1A_FULL = 3
+    C1A_REINDEX = 4
+    C1A_REUSE = 5
+
+
+REPRESENTATIVE_LAYER_IDS = {
+    DecodeLayerKind.SWA: 0,
+    DecodeLayerKind.C2A_FULL: 2,
+    DecodeLayerKind.C2A_REUSE: 3,
+    DecodeLayerKind.C1A_FULL: 20,
+    DecodeLayerKind.C1A_REINDEX: 24,
+    DecodeLayerKind.C1A_REUSE: 21,
+}
+
+
+def decode_layer_kind(layer_id: int) -> DecodeLayerKind:
+    """Map the checkpoint-backed layer schedule to one decode branch."""
+    layer = M.layer_config(layer_id)
+    if layer.mode == AttentionMode.SWA:
+        return DecodeLayerKind.SWA
+    if layer.compression_ratio == 2 and layer.mode == AttentionMode.FULL:
+        return DecodeLayerKind.C2A_FULL
+    if layer.compression_ratio == 2 and layer.mode == AttentionMode.REUSE:
+        return DecodeLayerKind.C2A_REUSE
+    if layer.compression_ratio == 1 and layer.mode == AttentionMode.FULL:
+        return DecodeLayerKind.C1A_FULL
+    if layer.compression_ratio == 1 and layer.mode == AttentionMode.REINDEX:
+        return DecodeLayerKind.C1A_REINDEX
+    if layer.compression_ratio == 1 and layer.mode == AttentionMode.REUSE:
+        return DecodeLayerKind.C1A_REUSE
+    raise ValueError(f"unsupported decode layer {layer_id}: ratio={layer.compression_ratio}, mode={layer.mode.value}" )
+
+
+@dataclass(frozen=True)
+class DecodeLayerGoldenResult:
+    """Block outputs, intermediate boundaries, and attention state updates."""
+
+    output: torch.Tensor
+    next_pre_mix: torch.Tensor
+    attention_input: torch.Tensor
+    attention_output: torch.Tensor
+    attention_hidden: torch.Tensor
+    ffn_input: torch.Tensor
+    ffn_output: torch.Tensor
+    attention: AttentionGoldenResult
+
+
+@dataclass(frozen=True)
+class DecodeTokenShard:
+    """One TP rank's fixed-capacity token slab and its request metadata."""
+
+    hidden: torch.Tensor
+    token_ids: torch.Tensor
+    position_ids: torch.Tensor
+    valid_mask: torch.Tensor
+
+
+def sequence_parallel_bounds(
+    num_tokens: int, tp_size: int, tp_rank: int, capacity: int | None = None
+) -> tuple[int, int, int]:
+    """Return ``(first, count, width)`` for one contiguous TP slab.
+
+    Physical slab width uses capacity, including padding and idle ranks.
+    """
+    if num_tokens < 0:
+        raise ValueError("num_tokens must be non-negative")
+    if tp_size <= 0:
+        raise ValueError("tp_size must be positive")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
+    physical = num_tokens if capacity is None else capacity
+    if physical < num_tokens:
+        raise ValueError(f"capacity {physical} cannot be smaller than {num_tokens} active tokens")
+    width = (physical + tp_size - 1) // tp_size if physical else 0
+    first = min(tp_rank * width, num_tokens)
+    count = max(0, min(width, num_tokens - first))
+    return first, count, width
+
+
+def shard_decode_batch(
+    hidden: torch.Tensor,
+    token_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    *,
+    tp_size: int,
+    capacity: int | None = None,
+) -> tuple[DecodeTokenShard, ...]:
+    """Split global token rows into TP slabs with token_id=-1 and valid_mask=False padding."""
+    if hidden.ndim < 1:
+        raise ValueError("hidden must have a token dimension")
+    num_tokens = hidden.shape[0]
+    if token_ids.shape != (num_tokens,) or position_ids.shape != (num_tokens,):
+        raise ValueError("token_ids and position_ids must have one entry per token")
+    if valid_mask is None:
+        valid_mask = torch.ones(num_tokens, dtype=torch.bool, device=hidden.device)
+    if valid_mask.shape != (num_tokens,) or valid_mask.dtype is not torch.bool:
+        raise ValueError("valid_mask must be a bool vector with one entry per token")
+    if not bool(valid_mask.all()):
+        raise ValueError("sequence-parallel ownership requires a contiguous valid token prefix")
+
+    shards: list[DecodeTokenShard] = []
+    for rank in range(tp_size):
+        first, count, width = sequence_parallel_bounds(num_tokens, tp_size, rank, capacity)
+        local_hidden = hidden.new_zeros((width, *hidden.shape[1:]))
+        local_tokens = torch.full((width,), -1, dtype=token_ids.dtype, device=token_ids.device)
+        local_positions = torch.full((width,), -1, dtype=position_ids.dtype, device=position_ids.device)
+        local_valid = torch.zeros(width, dtype=torch.bool, device=hidden.device)
+        if count:
+            local_hidden[:count].copy_(hidden[first : first + count])
+            local_tokens[:count].copy_(token_ids[first : first + count])
+            local_positions[:count].copy_(position_ids[first : first + count])
+            local_valid[:count] = True
+        shards.append(DecodeTokenShard(local_hidden, local_tokens, local_positions, local_valid))
+    return tuple(shards)
+
+
+def gather_decode_batch(shards: tuple[DecodeTokenShard, ...] | list[DecodeTokenShard], num_tokens: int) -> DecodeTokenShard:
+    """Restore global token order from TP slabs using their physical width."""
+    if not shards:
+        raise ValueError("at least one TP shard is required")
+    tp_size = len(shards)
+    slab_width = shards[0].hidden.shape[0]
+    pieces = []
+    token_pieces = []
+    position_pieces = []
+    mask_pieces = []
+    for rank, shard in enumerate(shards):
+        if shard.hidden.shape[0] != slab_width:
+            raise ValueError(f"rank {rank} has slab width {shard.hidden.shape[0]}, expected {slab_width}" )
+        first, count, _ = sequence_parallel_bounds(num_tokens, tp_size, rank, capacity=slab_width * tp_size )
+        if count:
+            pieces.append(shard.hidden[:count])
+            token_pieces.append(shard.token_ids[:count])
+            position_pieces.append(shard.position_ids[:count])
+            mask_pieces.append(shard.valid_mask[:count])
+    if pieces:
+        hidden = torch.cat(pieces, dim=0)
+        token_ids = torch.cat(token_pieces, dim=0)
+        position_ids = torch.cat(position_pieces, dim=0)
+        valid_mask = torch.cat(mask_pieces, dim=0)
+    else:
+        template = shards[0].hidden
+        hidden = template[:0]
+        token_ids = shards[0].token_ids[:0]
+        position_ids = shards[0].position_ids[:0]
+        valid_mask = shards[0].valid_mask[:0]
+    if hidden.shape[0] != num_tokens or not bool(valid_mask.all()):
+        raise RuntimeError("sequence-parallel gather did not restore every active token")
+    return DecodeTokenShard(hidden, token_ids, position_ids, valid_mask)
+
+
 ATTENTION_GOLDENS = {
     DecodeLayerKind.SWA: golden_swa_attention,
     DecodeLayerKind.C2A_FULL: golden_decode_attn_c2a_full,
@@ -780,17 +682,9 @@ def _select_inputs(function, values: Mapping[str, Any], overrides: Mapping[str, 
     return selected
 
 
-def _golden_expert(
-    x: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w3: torch.Tensor,
-) -> torch.Tensor:
+def _golden_expert(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, w3: torch.Tensor) -> torch.Tensor:
     gate_value = F.linear(x.float(), w1.float()).clamp(max=M.swiglu_limit)
-    up_value = F.linear(x.float(), w3.float()).clamp(
-        -M.swiglu_limit,
-        M.swiglu_limit,
-    )
+    up_value = F.linear(x.float(), w3.float()).clamp(-M.swiglu_limit, M.swiglu_limit)
     return F.linear(F.silu(gate_value) * up_value, w2.float())
 
 
@@ -800,11 +694,7 @@ def _sequence_parallel_token_owners(tokens: int, tp_size: int) -> torch.Tensor:
     width = (tokens + tp_size - 1) // tp_size if tokens else 0
     if width == 0:
         return torch.empty(0, dtype=torch.int32)
-    return torch.div(
-        torch.arange(tokens, dtype=torch.int32),
-        width,
-        rounding_mode="floor",
-    )
+    return torch.div(torch.arange(tokens, dtype=torch.int32), width, rounding_mode="floor")
 
 
 def golden_decode_moe(
@@ -843,18 +733,9 @@ def golden_decode_moe(
     routed_w1 = dequantize_mxfp4(routed_w1, routed_w1_scale)
     routed_w2 = dequantize_mxfp4(routed_w2, routed_w2_scale)
     routed_w3 = dequantize_mxfp4(routed_w3, routed_w3_scale)
-    shared_w1 = dequantize_mxfp8(
-        shared_w1,
-        unpack_mx_b_scale(shared_w1_scale),
-    ).transpose(-2, -1)
-    shared_w2 = dequantize_mxfp8(
-        shared_w2,
-        unpack_mx_b_scale(shared_w2_scale),
-    ).transpose(-2, -1)
-    shared_w3 = dequantize_mxfp8(
-        shared_w3,
-        unpack_mx_b_scale(shared_w3_scale),
-    ).transpose(-2, -1)
+    shared_w1 = dequantize_mxfp8(shared_w1, unpack_mx_b_scale(shared_w1_scale)).transpose(-2, -1)
+    shared_w2 = dequantize_mxfp8(shared_w2, unpack_mx_b_scale(shared_w2_scale)).transpose(-2, -1)
+    shared_w3 = dequantize_mxfp8(shared_w3, unpack_mx_b_scale(shared_w3_scale)).transpose(-2, -1)
     route_weights, expert_indices = gate(normalized, gate_weight, correction_bias)
     output = _golden_expert(normalized, shared_w1, shared_w2, shared_w3)
     for expert_id in range(routed_w1.shape[0]):
@@ -863,9 +744,7 @@ def golden_decode_moe(
             continue
         routed = _golden_expert(
             normalized[token_rows],
-            routed_w1[expert_id],
-            routed_w2[expert_id],
-            routed_w3[expert_id],
+            routed_w1[expert_id], routed_w2[expert_id], routed_w3[expert_id],
         )
         output[token_rows] += routed * route_weights[token_rows, route_columns].unsqueeze(-1)
     result = x.reshape(-1, shape[-1]).clone()
@@ -900,9 +779,7 @@ def golden_decode_layer(
     attention = attention_golden(**attention_kwargs)
     attention_hidden = golden_hc_post(attention.output, x_hc, attn_post, attn_residual).to(torch.float32)
 
-    next_pre_mix, ffn_post, ffn_residual = golden_mhc_mixes(
-        attention_hidden, hc_ffn_fn, hc_ffn_scale, hc_ffn_base
-    )
+    next_pre_mix, ffn_post, ffn_residual = golden_mhc_mixes(attention_hidden, hc_ffn_fn, hc_ffn_scale, hc_ffn_base)
     ffn_input = golden_hc_pre(attention_hidden, attn_pre).to(torch.bfloat16)
     moe_overrides = {"x": ffn_input, "norm_weight": ffn_norm_weight}
     if num_tokens is not None:
@@ -911,13 +788,9 @@ def golden_decode_layer(
     ffn_output = golden_decode_moe(**moe_kwargs)
     output = golden_hc_post(ffn_output, attention_hidden, ffn_post, ffn_residual).to(torch.float32)
     return DecodeLayerGoldenResult(
-        output=output,
-        next_pre_mix=next_pre_mix,
-        attention_input=attention_input,
-        attention_output=attention.output,
-        attention_hidden=attention_hidden,
-        ffn_input=ffn_input,
-        ffn_output=ffn_output,
+        output=output, next_pre_mix=next_pre_mix,
+        attention_input=attention_input, attention_output=attention.output, attention_hidden=attention_hidden,
+        ffn_input=ffn_input, ffn_output=ffn_output,
         attention=attention,
     )
 
@@ -953,11 +826,7 @@ def _fixture_extent(dim, global_tokens):
 
 
 def build_tensor_specs(layer_id=0, seed=0):
-    """Build a complete L3 fixture for one SWA decode Block.
-
-    Layer 0 exercises local attention, mHC boundaries, EP dispatch, experts,
-    combine, and final residual expansion.
-    """
+    """Build an L3 SWA decode block fixture with mHC and EP MoE."""
     if decode_layer_kind(layer_id) != DecodeLayerKind.SWA:
         raise ValueError("the complete-layer fixture currently supports SWA layers 0 and 1")
 
@@ -970,17 +839,9 @@ def build_tensor_specs(layer_id=0, seed=0):
 
     global_tokens = DECODE_MAX_TOKENS
     args = SimpleNamespace(
-        tokens=global_tokens,
-        active_tokens=global_tokens,
-        local_tokens=MOE_TOKENS,
-        requests=min(global_tokens, 8),
-        tp=TP_SIZE,
-        dp=EP_SIZE // TP_SIZE,
-        seed=seed,
-        epochs=1,
-        bench=False,
-        pages=1,
-        case="mixed",
+        tokens=global_tokens, active_tokens=global_tokens, local_tokens=MOE_TOKENS,
+        requests=min(global_tokens, 8), tp=TP_SIZE, dp=EP_SIZE // TP_SIZE,
+        seed=seed, epochs=1, bench=False, pages=1, case="mixed",
     )
     attention_specs = decode_swa.build_specs(args)
     by_name = {}
@@ -995,9 +856,7 @@ def build_tensor_specs(layer_id=0, seed=0):
 
         rank_extent = spec.shape[0]
         if rank_extent not in {TP_SIZE, EP_SIZE}:
-            raise ValueError(
-                f"attention tensor {spec.name} has unsupported rank extent {rank_extent}"
-            )
+            raise ValueError(f"attention tensor {spec.name} has unsupported rank extent {rank_extent}" )
 
         def grouped_init(spec=spec, rank_extent=rank_extent):
             value = spec.init_value() if callable(spec.init_value) else spec.init_value
@@ -1007,11 +866,7 @@ def build_tensor_specs(layer_id=0, seed=0):
 
         shape = list(spec.shape)
         shape[0] = EP_SIZE
-        by_name[spec.name] = replace(
-            spec,
-            shape=shape,
-            init_value=grouped_init,
-        )
+        by_name[spec.name] = replace(spec, shape=shape, init_value=grouped_init)
 
     moe_aliases = {
         "norm_weight": "ffn_norm_weight",
@@ -1025,11 +880,7 @@ def build_tensor_specs(layer_id=0, seed=0):
             by_name[name] = spec if name == spec.name else replace(spec, name=name)
 
     mhc_generator = torch.Generator().manual_seed(seed + 73)
-    hc_ffn_fn = torch.randn(
-        MIX_HC,
-        HC_DIM,
-        generator=mhc_generator,
-    ) * 0.0635
+    hc_ffn_fn = torch.randn(MIX_HC, HC_DIM, generator=mhc_generator) * 0.0635
     hc_ffn_scale = torch.tensor([0.11334, 0.035901, 0.058183])
     hc_ffn_base = torch.tensor([
         2.4153, -2.0252, -2.0019, -2.1947,
@@ -1046,19 +897,12 @@ def build_tensor_specs(layer_id=0, seed=0):
     }
     for name, value in calibrated_mhc.items():
         stacked = value.unsqueeze(0).expand(EP_SIZE, *value.shape).contiguous()
-        by_name[name] = replace(
-            by_name[name],
-            init_value=lambda stacked=stacked: stacked.clone(),
-        )
+        by_name[name] = replace(by_name[name], init_value=lambda stacked=stacked: stacked.clone())
 
     signature = inspect.signature(l3_decode_layer._func)
     outputs = {
-        "attention_output",
-        "attention_hidden",
-        "attention_pre_mix",
-        "next_pre_mix",
-        "x_mixed",
-        "x_next",
+        "attention_output", "attention_hidden", "attention_pre_mix",
+        "next_pre_mix", "x_mixed", "x_next",
     }
     scalar_values = {
         "layer_id": layer_id,
@@ -1081,9 +925,7 @@ def build_tensor_specs(layer_id=0, seed=0):
         else:
             specs.append(
                 TensorSpec(
-                    name,
-                    shape,
-                    dtype,
+                    name, shape, dtype,
                     init_value=lambda shape=shape, dtype=dtype: torch.zeros(shape, dtype=dtype),
                 )
             )
@@ -1103,7 +945,6 @@ def golden_l3_decode_layer(tensors):
     import decode_swa
     from moe import golden_moe
 
-    local_tokens = tensors["x_hc"].shape[1]
     global_tokens = int(tensors["attention_num_tokens"])
     attention_hidden = tensors["attention_hidden"]
     attention_pre_mix = tensors["attention_pre_mix"]
@@ -1114,9 +955,7 @@ def golden_l3_decode_layer(tensors):
                 group[name] = value[group_base : group_base + TP_SIZE]
             else:
                 group[name] = value
-        group["attention_output"] = tensors["attention_output"][
-            group_base : group_base + TP_SIZE
-        ]
+        group["attention_output"] = tensors["attention_output"][group_base : group_base + TP_SIZE]
         group["attention_hidden"] = attention_hidden[group_base : group_base + TP_SIZE]
         group["attention_pre_mix"] = attention_pre_mix[group_base : group_base + TP_SIZE]
         group["num_tokens"] = global_tokens
@@ -1136,11 +975,7 @@ def _compare_active_rows_per_rank(compare, counts):
         for rank, active in enumerate(counts.tolist()):
             if active == 0:
                 continue
-            passed, detail = compare(
-                actual[rank : rank + 1, :active],
-                expected[rank : rank + 1, :active],
-                **kwargs,
-            )
+            passed, detail = compare(actual[rank : rank + 1, :active], expected[rank : rank + 1, :active], **kwargs)
             if not passed:
                 return False, f"rank {rank} active rows [:{active}] failed\n{detail}"
         return True, "every EP rank's active rows pass"
@@ -1159,10 +994,7 @@ def _compare_moe_from_actual_attention(counts):
         expected_f = expected.float()
         diff = actual_f - expected_f
         rel_l2 = diff.norm() / expected_f.norm().clamp_min(1e-12)
-        print(
-            f"[PRECISION] composed x_next rel_l2={rel_l2.item():.8g} "
-            f"max_abs={diff.abs().max().item():.8g}"
-        )
+        print(f"[PRECISION] composed x_next rel_l2={rel_l2.item():.8g} " f"max_abs={diff.abs().max().item():.8g}" )
 
         conditioned = dict(inputs)
         conditioned["x_hc"] = actual_outputs["attention_hidden"]
@@ -1189,9 +1021,7 @@ def _compare_next_pre_mix_from_actual_attention(counts):
     from golden import ratio_allclose
     from hc import golden_mhc_mixes
 
-    compare_mixes = _compare_active_rows_per_rank(
-        ratio_allclose(atol=2.5e-5, rtol=5e-3, max_error_ratio=0.03), counts,
-    )
+    compare_mixes = _compare_active_rows_per_rank(ratio_allclose(atol=2.5e-5, rtol=5e-3, max_error_ratio=0.03), counts)
 
     def compare(actual, expected, *, actual_outputs, inputs, **kwargs):
         conditioned = torch.zeros_like(expected)
@@ -1203,9 +1033,7 @@ def _compare_next_pre_mix_from_actual_attention(counts):
                     inputs["hc_ffn_base"][rank],
                 )
                 conditioned[rank, :active] = pre
-        return compare_mixes(
-            actual, conditioned, actual_outputs=actual_outputs, inputs=inputs, **kwargs,
-        )
+        return compare_mixes(actual, conditioned, actual_outputs=actual_outputs, inputs=inputs, **kwargs)
 
     return compare
 
@@ -1339,7 +1167,7 @@ def make_decode_layer_golden_inputs(layer_id: int) -> dict:
 
 if __name__ == "__main__":
     from golden import ratio_allclose, ratio_reldiff, run
-    from utils import swa_window_cache_compare
+    from decode_swa import window_cache_compare
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -1369,7 +1197,6 @@ if __name__ == "__main__":
                 f"[GOLDEN] PASS decode_layer layer={layer_id} "
                 f"output={tuple(result.output.shape)} next_pre_mix={tuple(result.next_pre_mix.shape)}"
             )
-        from utils import gather_decode_batch, sequence_parallel_bounds, shard_decode_batch
 
         first_inputs = make_decode_layer_golden_inputs(0)
         first = golden_decode_layer(**first_inputs)
@@ -1397,8 +1224,7 @@ if __name__ == "__main__":
         ):
             raise RuntimeError("the Attention boundary changed the residual stream or the delayed mHC rows")
 
-        # The second layer consumes what the boundary published, not the pristine
-        # global tensor.
+        # Restore the next layer's residual stream and delayed pre-mix.
         second_inputs = make_decode_layer_golden_inputs(2)
         second_inputs["x_hc"] = gathered.hidden
         second_inputs["incoming_pre_mix"] = gathered_pre_mix.hidden
@@ -1439,14 +1265,8 @@ if __name__ == "__main__":
             ring_heap=1073741824,
         ),
         compare_fn={
-            # Composed upstream rows can flip one FP8 code at a quantization boundary: allow
-            # one subnormal step (2**-9) plus one relative step (2**-3) on the payload, and
-            # less than 1% of mapped rows to miss even that (observed: 1/73728). The scale is
-            # a derived BF16 quantity (amax / 448): device and CPU can differ by a ULP, so
-            # allow a 2% relative ceiling there too (observed: 2/2304, max rel ~0.9%).
-            # window_slots is sized by the attention token capacity (DECODE_MAX_TOKENS), not
-            # the padded MoE dispatch capacity (MOE_TOKENS).
-            **swa_window_cache_compare(
+            # Window-cache payload and scale tolerances on mapped attention rows.
+            **window_cache_compare(
                 EP_SIZE, DECODE_MAX_TOKENS, payload_atol=2 ** -9, payload_rtol=2 ** -3,
                 payload_error_ratio=0.01, scale_rtol=0.02, scale_error_ratio=0.01,
             ),

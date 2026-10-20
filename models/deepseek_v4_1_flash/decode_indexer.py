@@ -16,7 +16,6 @@ import torch.nn.functional as F
 from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
 from quant import dequantize_mxfp4_cache, golden_bf16_gemm, golden_mxfp8_linear, quantize_mxfp4_cache
 from rmsnorm import make_norm_with_deps, golden_rms_norm
-from utils import index_pool_block_capacity
 from config import (
     B_DYN,
     CMP_POSITIONS_DYN,
@@ -61,7 +60,6 @@ _PAIR_M_TILE = INDEX_H * 2
 INDEX_PROJ_N_TILE = 128
 INDEX_WEIGHT_N_TILE = min(128, INDEX_H)
 INDEX_PROJ_K_TILE = 256
-
 
 
 CANDIDATE_SCORE_TILE = 1024
@@ -2142,7 +2140,6 @@ def golden_index_key(
     return torch.cat((key[..., :-rd], golden_rope_interleave(key[..., -rd:], cos, sin)), dim=-1)
 
 
-
 def golden_select_candidate_block_pool(
     logits: torch.Tensor,
     compressed_lens: torch.Tensor | int,
@@ -2380,3 +2377,13 @@ def c1a_rotate_index_key(
         for block in pl.range(worker, blocks, workers):
             _index_key_rope_block(x, cos, sin, output, block)
     return rope_tid
+
+
+def index_pool_block_capacity(score_width: int) -> int:
+    """Return the aligned compact-pool capacity for one score row."""
+    if score_width < 0:
+        raise ValueError(f"score_width must be nonnegative, got {score_width}")
+    block_size = FLASH.candidate_block_size
+    blocks = max(1, (score_width + block_size - 1) // block_size)
+    aligned = (blocks + 31) // 32 * 32
+    return min(FLASH.candidate_topk_blocks, aligned)

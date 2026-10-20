@@ -9,7 +9,10 @@
 """SWA decode Attention half-layer composition entry."""
 
 
+from dataclasses import replace
+from golden import ScalarSpec, TensorSpec
 import torch
+from golden import mapped_pool_ratio_allclose
 
 import pypto.language as pl
 
@@ -31,10 +34,6 @@ from sparse_attention import publish_window_row
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
 from sparse_attention import swa_attention_partial
 from o_proj import o_proj
-from utils import (
-    assemble_specs,
-    swa_window_cache_compare as window_cache_compare,
-)
 from hc import hc_pre, zero_bf16_padding, golden_hc_pre
 from hc import golden_mhc_mixes, hc_mixes
 from rmsnorm import golden_rms_norm, rms_norm_tiled
@@ -55,7 +54,6 @@ HC_MULT = M.hc_mult
 HC_DIM = M.hc_dim
 MIX_HC = M.mix_hc
 MX_GROUP = M.weight_block_size[0]
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -259,6 +257,89 @@ def l3_decode_swa(
     )
 
 
+SCALAR_NAMES = ("num_tokens", "attention_epoch")
+
+
+def make_boundary_specs(args):
+    """Create local mHC token slabs, full attention gather storage, and runtime scalars."""
+    # Keep one uniform physical slab per rank.  The last rank(s) may contain
+    # padding when the active token count is not divisible by TP; the runtime
+    # scalar ``num_tokens`` and the collectives' first/count calculation keep
+    # those rows out of the gather and reduce-scatter.
+    local = getattr(args, "local_tokens", (args.tokens + args.tp - 1) // args.tp)
+    generator = torch.Generator().manual_seed(args.seed + 1000)
+    specs = []
+    shapes = {
+        "x_hc": [local, HC_MULT, D],
+        "incoming_pre_mix": [local, HC_MULT],
+        "hc_attn_fn": [MIX_HC, HC_DIM],
+        "hc_attn_scale": [3],
+        "hc_attn_base": [MIX_HC],
+        "attn_norm_weight": [D],
+    }
+    for name, shape in shapes.items():
+        value = torch.randn(shape, generator=generator)
+        if name == "hc_attn_fn":
+            value /= HC_DIM**0.5
+        elif name == "attn_norm_weight":
+            value = torch.ones(shape, dtype=torch.bfloat16)
+        elif name == "incoming_pre_mix":
+            value = torch.softmax(value, dim=-1)
+        if name in ("x_hc", "incoming_pre_mix"):
+            # Sequence-parallel ranks own different slices of the batch, so the token
+            # inputs must differ per rank: with replicated values a gather or
+            # ReduceScatter that mis-orders the slabs would still compare equal.
+            stacked = torch.randn([args.tp, *shape], generator=generator)
+            if name == "incoming_pre_mix":
+                stacked = torch.softmax(stacked, dim=-1)
+        else:
+            stacked = value.unsqueeze(0).repeat(args.tp, *([1] * len(shape)))
+        specs.append(
+            TensorSpec(name, [args.tp, *shape], value.dtype, init_value=stacked, resident="stacked")
+        )
+    for name, shape, dtype in (
+        ("attention_output", [local, D], torch.bfloat16),
+        ("attention_hidden", [local, HC_MULT, D], torch.float32),
+        ("attention_pre_mix", [local, HC_MULT], torch.float32),
+    ):
+        sentinel = 13.0 if name == "attention_output" else 0.0
+        specs.append(TensorSpec(name, [args.tp, *shape], dtype, init_value=sentinel, resident="stacked"))
+    specs.append(
+        TensorSpec(
+            "gathered", [args.tp, args.tokens, D], torch.bfloat16,
+            init_value=13.0, resident="stacked",
+        )
+    )
+    specs.append(ScalarSpec("num_tokens", torch.int32, args.active_tokens))
+    specs.append(
+        ScalarSpec(
+            "attention_epoch",
+            torch.int32,
+            1,
+            compile_runtime=True,
+            benchmark_step=None,
+        )
+    )
+    return specs
+
+
+def assemble_specs(args, leaf_specs, spec_names, aliases=None):
+    """Combine one leaf's exact specs with the stable half-layer boundary specs."""
+    aliases = aliases or {}
+    specs = []
+    for spec in leaf_specs:
+        name = aliases.get(spec.name, spec.name)
+        if name in ("x", "output", *SCALAR_NAMES):
+            continue
+        specs.append(spec if name == spec.name else replace(spec, name=name))
+    specs.extend(make_boundary_specs(args))
+    by_name = {spec.name: spec for spec in specs}
+    missing = [name for name in spec_names if name not in by_name]
+    if missing:
+        raise ValueError(f"missing Attention specs: {missing}")
+    return [by_name[name] for name in spec_names]
+
+
 def build_specs(args):
     """Specs for the TP1 SWA attention composition."""
     value_build_swa_specs = build_swa_leaf_specs(args, 'decode')
@@ -306,6 +387,28 @@ def comparisons(args, devices):
         }
     )
     return compare
+
+
+def window_cache_compare(
+    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
+    scale_rtol=0.0, scale_error_ratio=0.0,
+):
+    """Compare the mapped window rows and require every other row to stay unchanged."""
+    options = dict(
+        mapping_shape=(world_size, tokens),
+        block_size=128,
+        leading_rank_axis=True,
+    )
+    return {
+        "window_cache": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache",
+            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
+        ),
+        "window_cache_scale": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache scale",
+            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
+        ),
+    }
 
 
 if __name__ == "__main__":

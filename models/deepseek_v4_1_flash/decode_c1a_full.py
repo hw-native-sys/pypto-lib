@@ -44,7 +44,8 @@ from quant import (
     dequantize_mxfp8_cache,
 )
 from rope_tables import precompute_rope_tables
-from utils import AttentionGoldenResult, index_pool_block_capacity
+from utils import AttentionGoldenResult
+from decode_indexer import index_pool_block_capacity
 
 from hc import golden_hc_pre, hc_pre
 from config import (

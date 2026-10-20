@@ -8,36 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""One complete packed-prefill text-backbone layer: attention and MoE sublayers through mHC.
-
-The official ``Block.forward`` runs a layer as two mHC sublayers::
-
-    attn_pre, attn_post, attn_comb = hc_mixes(x_hc)     # this sublayer's coefficients
-    x     = attn_norm(hc_pre(x_hc, pre_mix))            # pre_mix: the previous sublayer's delayed mix
-    x_hc  = hc_post(attention(x), x_hc, attn_post, attn_comb)
-    ffn_pre, ffn_post, ffn_comb = hc_mixes(x_hc)
-    y     = moe(hc_pre(x_hc, attn_pre))                 # ffn_norm lives inside the MoE gate
-    x_hc  = hc_post(y, x_hc, ffn_post, ffn_comb)
-
-``ffn_pre`` leaves the layer as ``next_pre_mix``: the next layer's attention sublayer collapses
-its input with it. Attention is replicated over a TP group and reduced there; the EP MoE gives
-each token row one owner inside that group, so the routed result comes back partitioned and one
-FP32 sum over the group restores the replicated residual stream.
-
-Every sublayer boundary is exposed as caller workspace (``attn_input``, ``attn_output``,
-``x_hc_mid``, ``ffn_input``, ``ffn_output``), which is what lets the validation force each stage
-on the device's own input instead of diluting one stage's error into the next. The layer runs
-as three device entries - attention, MoE, TP restore - with static packed token extents
-and one sublayer call per launch.
-"""
+"""DeepSeek-V4.1 packed-prefill attention and MoE layer with mHC."""
 
 import argparse
 import functools
 import os
 import sys
 
-# A5-only; intentionally excluded from the A2/A3 device sweep. The complete-layer
-# entry exercises the packed MxFp4 routed-weight ABI and the TP-to-EP local-token path.
 import torch
 
 import pypto.language as pl
@@ -57,8 +34,7 @@ def _command_line_int(flag, default):
 LAYER_TP = _command_line_int("--tp", 1)
 LAYER_DP = _command_line_int("--dp", 2)
 LAYER_TOKENS = _command_line_int("--tokens", 48)
-# One layer owns both sublayers: EP = TP * DP.
-# Supply entry defaults before importing parallel sizes and MoE kernels.
+# Parallel configuration: EP = TP * DP.
 if not any(argument == "--tp" or argument.startswith("--tp=") for argument in sys.argv):
     sys.argv += ["--tp", str(LAYER_TP)]
 if not any(argument == "--ep" or argument.startswith("--ep=") for argument in sys.argv):
@@ -66,22 +42,41 @@ if not any(argument == "--ep" or argument.startswith("--ep=") for argument in sy
 
 
 from config import (
-    FLASH as M,
-    CMP_BLOCKS_DYN,
-    ORI_BLOCKS_DYN,
-    T_DYN,
-    ROUTE_T_DYN,
-    TP_SIZE,
-    MAX_BATCH_PER_DP,
-    PREFILL_MAX_TOKENS,
-    WINDOW_CACHE_GROUP,
+    FLASH as M, TP_SIZE, MAX_BATCH_PER_DP, PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP,
+    CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, ROUTE_T_DYN,
     set_moe_tokens,
 )
 
 
-# Set the packed token extent before the transport and MoE kernels are imported.
+# Freeze MoE token shapes before importing its kernels.
 set_moe_tokens(LAYER_TOKENS)
-from config import MOE_TOKENS, EP_SIZE
+from config import MOE_TOKENS
+
+
+from expert_routed import (
+    MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
+    ROUTED_DEQUANT_STD, gen_routed_mxfp4_weights,
+)
+from gate import golden_gate_reference as gate
+from golden import ScalarSpec, TensorSpec, ratio_allclose, run
+from golden.validation import ratio_reldiff
+from hc import (
+    HC_INPUT_NAMES, make_hc_inputs,
+    hc_mixes, hc_post, hc_pre, golden_mhc_mixes, golden_hc_post, golden_hc_pre,
+)
+from moe import (
+    AUX_WIDTH, EP_SIZE, MX_GROUP, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD,
+    clear_moe_signals, _golden_moe_core as golden_moe_core, _moe_core as moe_core,
+)
+from o_proj import retire_prefill_signals, prefill_tp_output_all_reduce
+from prefill_c2a_full import (
+    ATTENTION_STATE, CMP_PACKED, CMP_SCALES, MODES, REUSE_MUTABLE_NAMES,
+    StagedAttentionReference, _report as report_stage, cache_compare,
+    golden_reference_c2a, make_attention_inputs, reference_attention,
+)
+from prefill_c2a_reuse import prefill_c2a_reuse, golden_reference_c2a_reuse, make_c2a_reuse_inputs
+from quant import build_mxfp4_pair_lut
+from rmsnorm import golden_rms_norm, rms_norm_tiled
 
 
 # model config
@@ -103,73 +98,13 @@ N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
 MOE_INTER = M.moe_intermediate_size
 
-
-from o_proj import retire_prefill_signals, prefill_tp_output_all_reduce  # noqa: E402
-from gate import golden_gate_reference as gate
-from hc import golden_mhc_mixes
-from hc import golden_hc_post
-from hc import golden_hc_pre
-from rmsnorm import golden_rms_norm
-from hc import hc_mixes  # noqa: E402
-from hc import hc_post  # noqa: E402
-from hc import hc_pre  # noqa: E402
-from prefill_c2a_full import (  # noqa: E402
-    ATTENTION_STATE,
-    CMP_PACKED,
-    CMP_SCALES,
-    HC_INPUT_NAMES,
-    MODES,
-    REUSE_MUTABLE_NAMES,
-    StagedAttentionReference,
-    _report as report_stage,
-    cache_compare,
-    golden_attention_input,
-    golden_reference_c2a,
-    make_attention_inputs,
-    make_hc_inputs,
-    reference_attention,
-)
-from prefill_c2a_reuse import prefill_c2a_reuse, golden_reference_c2a_reuse, make_c2a_reuse_inputs  # noqa: E402
-from quant import build_mxfp4_pair_lut  # noqa: E402
-from rmsnorm import rms_norm_tiled  # noqa: E402
-from moe import (  # noqa: E402
-    clear_moe_signals,
-    AUX_WIDTH,
-    EP_SIZE,
-    MX_GROUP,
-    N_LOCAL_EXPERTS,
-    RECV_MAX,
-    ROUTE_WIDTH,
-    _golden_moe_core as golden_moe_core,
-    _moe_core as moe_core,
-)
-from expert_routed import (  # noqa: E402
-    MX_PACKED_LANE_COLS,
-    MX_W1_PACKED_ROWS,
-    MX_W2_PACKED_ROWS,
-    MX_W3_PACKED_ROWS,
-    ROUTED_DEQUANT_STD,
-    gen_routed_mxfp4_weights,
-)
-from moe import SIGNAL_PAD
-
-from golden import ScalarSpec, TensorSpec, ratio_allclose, run  # noqa: E402
-from golden.validation import ratio_reldiff  # noqa: E402
-
-
-# The packed prefill token extent of one layer call.
+# Execution shapes.
 TOKENS = MOE_TOKENS
-# The routed-result window holds one row per token per selected expert.
+
 ROUTE_ROWS = MOE_TOKENS * TOPK
-# End-to-end bound for the stages the MoE feeds. It is loose on purpose: the MoE quantizes
-# its input to MXFP8 per group of 32, and that step amplifies about tenfold - measured on
-# this fixture, a 0.19% difference in the collapsed stream becomes 1.9% once quantized,
-# because an E4M3 code is coarse enough that a small shift moves many elements of a group
-# a whole code. The per-stage forced checks are the acceptance; this bound only has to
-# catch a miswired chain.
+# Validation defaults.
 CHAIN_BUDGET = 0.15
-# Attention plus a four-stream mHC and the EP MoE dispatch buffers overflow the default
-# 256 MiB ring heap; one GiB per ring is the prefill attention and MoE bring-up budget.
+
 LAYER_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 
@@ -185,11 +120,7 @@ def moe_hc_pre(
     residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
     ffn_input: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
-    """Derive the FFN sublayer's mixes, then collapse with the attention sublayer's pre-mix.
-
-    The collapsed stream stays in BF16 here; ``prefill_moe_sublayer`` applies RMSNorm
-    immediately before the packed MoE core consumes it.
-    """
+    """Derive FFN mHC coefficients and collapse the residual stream to BF16."""
     hc_mixes(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
     hc_pre(x_hc, pre_mix, ffn_input)
     return ffn_input
@@ -204,18 +135,14 @@ def widen_to_fp32(
     t_dim = pl.tensor.dim(source, 0)
     for row in pl.spmd(t_dim, name_hint="ffn_partial_widen"):
         for d0 in pl.pipeline(0, D, 512, stage=2):
-            output[row : row + 1, d0 : d0 + 512] = pl.cast(
-                source[row : row + 1, d0 : d0 + 512], target_type=pl.FP32
-            )
+            output[row : row + 1, d0 : d0 + 512] = pl.cast(source[row : row + 1, d0 : d0 + 512], target_type=pl.FP32)
     return output
 
 
 @pl.jit.inline
 def _local_token_count(num_tokens: pl.Scalar[pl.INT32], tp_rank: pl.Scalar[pl.INT32]):
     """Map the replicated TP token prefix to this rank's compact local prefix."""
-    # The runtime validates 1 <= num_tokens <= TOKENS and tp_rank is a valid TP lane,
-    # so the integer ceiling is already in [0, TOKENS].  Keep the native INDEX scalar
-    # type produced by the division for comparisons and row addressing.
+    # Native INDEX scalar for local row counts and addresses.
     return (num_tokens + TP_SIZE - 1 - tp_rank) // TP_SIZE
 
 
@@ -291,13 +218,9 @@ def prefill_moe_sublayer(
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
     arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
-    data_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
+    combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     ffn_input: pl.Tensor[[T_DYN, D], pl.BF16],
     ffn_owned: pl.Tensor[[T_DYN, D], pl.BF16],
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
@@ -308,28 +231,18 @@ def prefill_moe_sublayer(
     tp_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    """Derive the FFN sublayer's mixes, collapse the stream, and run the EP MoE on it.
-
-    Each token row has exactly one owner inside the TP group, so ``ffn_owned`` comes back
-    holding only this rank's share, with every other row at zero; ``prefill_ffn_restore``
-    puts the group back together. ``post_mix`` and ``residual_mix`` are this sublayer's own
-    coefficients, handed on so the restore can expand the residual without re-deriving them.
-    """
-    moe_hc_pre(
-        x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        next_pre_mix, post_mix, residual_mix, ffn_input,
-    )
-    # The current EP ABI consumes one compact local-token prefix per rank.  The
-    # prefill residual stream still stores rows in the replicated TP layout, so
-    # compact this rank's interleaved owner rows before MoE and scatter them back.
+    """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
+    moe_hc_pre(x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix, ffn_input)
+    # Compact interleaved TP owner rows for the EP local-token ABI.
     local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-    local_ffn_normed = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-    local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
     _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
     norm_tokens = pl.tensor.dim(local_ffn_input, 0)
+    local_ffn_normed = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
         rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens)
+
     local_num_tokens = _local_token_count(num_tokens, tp_rank)
+    local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
     with pl.scope():
         local_ffn_ready = moe_core(
             local_ffn_normed, gate_weight, correction_bias,
@@ -358,13 +271,7 @@ def prefill_ffn_restore(
     num_tokens: pl.Scalar[pl.INT32],
     ffn_epoch: pl.Scalar[pl.INT32],
 ):
-    """Restore the replicated routed rows inside the TP group, then expand the residual.
-
-    The MoE leaves every row it does not own at zero, so summing the group's partials is
-    the all-gather that puts the attention layout back. At TP1 the group is this rank alone
-    and the BF16 values survive the FP32 round trip unchanged. This is the layer's second
-    collective, in a device entry of its own.
-    """
+    """Sum TP routed partials and expand the residual stream with mHC."""
     tokens = pl.tensor.dim(x_hc, 0)
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
     widen_to_fp32(ffn_owned, partial)
@@ -375,13 +282,288 @@ def prefill_ffn_restore(
     return x_hc_out
 
 
+@pl.jit
+def l2_prefill_layer_attention(
+    x_hc: pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[TOKENS, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[TOKENS, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[TOKENS, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[TOKENS], pl.INT64],
+    window_indices: pl.Tensor[[TOKENS, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
+    compressed_indices: pl.Tensor[[TOKENS, INDEX_TOPK], pl.INT32],
+    attn_input: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
+    attn_output: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
+    attn_pre_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT], pl.FP32]],
+    x_hc_mid: pl.Out[pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32]],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    """Bind the runtime shapes and run the attention sublayer."""
+    window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
+    prefill_c2a_reuse(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
+        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
+        attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
+        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+        compressed_indices, output_window, output_arrived, attn_input, attn_output,
+        attn_pre_mix, x_hc_mid, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens,
+        attention_epoch,
+    )
+    retire_prefill_signals(x_hc_mid, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
+    return x_hc_mid, attn_pre_mix, attn_output, attn_input, window_cache, window_cache_scale
+
+
+@pl.jit
+def l2_prefill_layer_moe(
+    x_hc_mid: pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32],
+    attn_pre_mix: pl.Tensor[[TOKENS, HC_MULT], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
+    shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
+    shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    ffn_input: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
+    ffn_owned: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
+    next_pre_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT], pl.FP32]],
+    ffn_post_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT], pl.FP32]],
+    ffn_residual_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT, HC_MULT], pl.FP32]],
+    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
+    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
+    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
+    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
+    data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+):
+    """Run the FFN sublayer's mixes, collapse and EP MoE."""
+    prefill_moe_sublayer(
+        x_hc_mid, attn_pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        ffn_norm_weight, gate_weight, correction_bias,
+        routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
+        mxfp4_pair_lut, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
+        shared_w3, shared_w3_scale, recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+        arrived, data_arrived, routed_output, combine_arrived,
+        ffn_input, ffn_owned, next_pre_mix, ffn_post_mix, ffn_residual_mix,
+        num_tokens, rank, rank % TP_SIZE, moe_epoch,
+    )
+    clear_moe_signals(ffn_owned, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0))
+    return ffn_owned, next_pre_mix, ffn_post_mix, ffn_residual_mix, ffn_input
+
+
+@pl.jit
+def l2_prefill_layer_restore(
+    x_hc_mid: pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32],
+    ffn_owned: pl.Tensor[[TOKENS, D], pl.BF16],
+    ffn_post_mix: pl.Tensor[[TOKENS, HC_MULT], pl.FP32],
+    ffn_residual_mix: pl.Tensor[[TOKENS, HC_MULT, HC_MULT], pl.FP32],
+    ffn_output: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
+    x_hc_out: pl.Out[pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32]],
+    ffn_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    ffn_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    ffn_epoch: pl.Scalar[pl.INT32],
+):
+    """Put the TP group's routed rows back together and expand the residual."""
+    prefill_ffn_restore(
+        x_hc_mid, ffn_owned, ffn_post_mix, ffn_residual_mix, ffn_window, ffn_arrived,
+        ffn_output, x_hc_out, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens,
+        ffn_epoch,
+    )
+    retire_prefill_signals(x_hc_out, ffn_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
+    return x_hc_out, ffn_output
+
+# Completed entries retire signals before the next serialized dispatch.
+
+@pl.jit.host
+def l3_prefill_layer(
+    x_hc: pl.Tensor[[EP_SIZE, TOKENS, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[EP_SIZE, TOKENS, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
+    wq_a: pl.Tensor[[EP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[EP_SIZE, D // 32, Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[EP_SIZE, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[EP_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[EP_SIZE, Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[EP_SIZE, D // 32, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[EP_SIZE, HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[EP_SIZE, LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[EP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[EP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[EP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[EP_SIZE, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
+    rope_cos: pl.Tensor[[EP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[EP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[EP_SIZE, TOKENS], pl.INT64],
+    window_indices: pl.Tensor[[EP_SIZE, TOKENS, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    compressed_cache: pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
+    compressed_indices: pl.Tensor[[EP_SIZE, TOKENS, INDEX_TOPK], pl.INT32],
+    hc_ffn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
+    gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.FP32],
+    correction_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    mxfp4_pair_lut: pl.Tensor[[EP_SIZE, 2, 256], pl.INT16],
+    shared_w1: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
+    shared_w2: pl.Tensor[[EP_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[EP_SIZE, MOE_INTER // MX_GROUP, D], pl.FP8E8M0],
+    shared_w3: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
+    token_owners: pl.Tensor[[EP_SIZE, TOKENS], pl.INT32],
+    attn_input: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
+    attn_output: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
+    attn_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT], pl.FP32]],
+    x_hc_mid: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT, D], pl.FP32]],
+    ffn_input: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
+    ffn_owned: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
+    ffn_output: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
+    next_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT], pl.FP32]],
+    ffn_post_mix: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT], pl.FP32]],
+    ffn_residual_mix: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT, HC_MULT], pl.FP32]],
+    x_hc_out: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT, D], pl.FP32]],
+    num_tokens: pl.Scalar[pl.INT32],
+    layer_epoch: pl.Scalar[pl.INT32],
+):
+    """Allocate the TP and EP communication windows and launch both sublayers per device."""
+    window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
+    attention_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    attention_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    for rank in pl.range(pld.world_size()):
+        attention_data = pld.window(attention_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        attention_signal = pld.window(attention_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        # Each rank consumes packed MX_B_NN scale rows; a bare slice is ND.
+        wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
+        wq_b_scale_r: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
+        wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
+        wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
+        l2_prefill_layer_attention(
+            x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
+            attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank],
+            wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank],
+            wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank],
+            window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank],
+            compressed_cache[rank], compressed_cache_scale[rank], compressed_indices[rank],
+            attn_input[rank], attn_output[rank], attn_pre_mix[rank], x_hc_mid[rank],
+            attention_data, attention_signal, rank, num_tokens, layer_epoch, device=rank,
+        )
+
+    recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
+    recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
+    recv_scale_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
+    recv_weights_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
+    recv_routes_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
+    arrived_buffer = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
+    data_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+    routed_output_buffer = pld.alloc_window_buffer([ROUTE_ROWS, D], dtype=pl.BF16)
+    combine_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+    for rank in pl.range(pld.world_size()):
+        recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
+        recv_scale = pld.window(recv_scale_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
+        recv_weights = pld.window(recv_weights_buffer, [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
+        recv_routes = pld.window(recv_routes_buffer, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
+        arrived = pld.window(arrived_buffer, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buffer, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+        routed_output = pld.window(routed_output_buffer, [ROUTE_ROWS, D], dtype=pl.BF16)
+        combine_arrived = pld.window(combine_arrived_buffer, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
+        routed_w1_scale_r: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = routed_w1_scale[rank]
+        routed_w2_scale_r: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = routed_w2_scale[rank]
+        routed_w3_scale_r: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = routed_w3_scale[rank]
+        shared_w1_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[rank]
+        shared_w2_scale_r: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[rank]
+        shared_w3_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[rank]
+        l2_prefill_layer_moe(
+            x_hc_mid[rank], attn_pre_mix[rank], hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
+            ffn_norm_weight[rank], gate_weight[rank], correction_bias[rank],
+            routed_w1[rank], routed_w1_scale_r, routed_w2[rank], routed_w2_scale_r,
+            routed_w3[rank], routed_w3_scale_r, mxfp4_pair_lut[rank],
+            shared_w1[rank], shared_w1_scale_r, shared_w2[rank], shared_w2_scale_r,
+            shared_w3[rank], shared_w3_scale_r,
+            ffn_input[rank], ffn_owned[rank], next_pre_mix[rank], ffn_post_mix[rank],
+            ffn_residual_mix[rank],
+            recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
+            arrived, data_arrived, routed_output, combine_arrived,
+            rank, num_tokens, layer_epoch, device=rank,
+        )
+
+    ffn_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    ffn_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    for rank in pl.range(pld.world_size()):
+        ffn_data = pld.window(ffn_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        ffn_signal = pld.window(ffn_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        l2_prefill_layer_restore(
+            x_hc_mid[rank], ffn_owned[rank], ffn_post_mix[rank], ffn_residual_mix[rank],
+            ffn_output[rank], x_hc_out[rank], ffn_data, ffn_signal,
+            rank, num_tokens, layer_epoch, device=rank,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 FFN_HC_NAMES = ("hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "ffn_norm_weight")
-# Gate, shared expert and FFN mHC weights are one model copy on every rank; only the routed
-# experts are sharded, and each rank owns a different slice of the global expert ids.
+# Replicated gate/shared weights and rank-local routed experts.
 MOE_GATE_NAMES = ("gate_weight", "correction_bias")
 MOE_SHARED_NAMES = (
     "shared_w1", "shared_w1_scale", "shared_w2", "shared_w2_scale", "shared_w3", "shared_w3_scale",
@@ -421,8 +603,7 @@ def make_moe_replicated_inputs(seed):
     shared_w2, shared_w2_scale = gen_mxfp8_weight_kn_v41(D, MOE_INTER, shared_std["w2"], chan_cv=0.33, seed=seed + 3)
     return {
         "gate_weight": torch.randn(N_EXPERTS, D, generator=gen) / D ** 0.5,
-        # The bias offset dominates the O(1) score, which keeps top-k off the boundary where an
-        # FP32 reduction-order difference could swap an expert and change the output.
+        # Separate expert routing scores with correction-bias offsets.
         "correction_bias": _route_bias(),
         "shared_w1": shared_w1, "shared_w1_scale": shared_w1_scale,
         "shared_w2": shared_w2, "shared_w2_scale": shared_w2_scale,
@@ -481,8 +662,7 @@ def golden_moe_sublayer(tensors, x_hc_mid, attn_pre_mix, tokens):
     }
     for base in range(0, world, TP_SIZE):
         pre, post, comb = mixes[base]
-        # Each row has one owner in the group and the rest are zero, so the group sum is the
-        # complete routed result.
+        # Sum TP owner partials into complete routed rows.
         group = ffn_owned[base : base + TP_SIZE].float().sum(dim=0).to(torch.bfloat16)
         expanded = golden_hc_post(group, x_hc_mid[base], post, comb).float()
         for rank in range(base, base + TP_SIZE):
@@ -542,8 +722,10 @@ def make_layer_golden(mode):
             pre, post, comb = golden_mhc_mixes(
                 x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
             )
-            x = golden_attention_input(x_hc, tensors["pre_mix"][base], tensors["attn_norm_weight"][base])
-            attention, results = reference_attention(mode, tensors, x, ranks, reference=golden_reference_c2a_reuse if mode == "reuse" else golden_reference_c2a)
+            collapsed = golden_hc_pre(x_hc, tensors["pre_mix"][base]).to(torch.bfloat16)
+            x = golden_rms_norm(collapsed, tensors["attn_norm_weight"][base])
+            reference = golden_reference_c2a_reuse if mode == "reuse" else golden_reference_c2a
+            attention, results = reference_attention(mode, tensors, x, ranks, reference=reference)
             for rank, result in zip(ranks, results):
                 for name in ATTENTION_STATE[mode]:
                     tensors[name][rank].copy_(result[name])
@@ -689,13 +871,7 @@ def compare_ffn_owned(staged, tokens):
 
 
 def compare_ffn_output(staged, tokens):
-    """Hold the routed result to the MoE budget against the teacher-forced reference.
-
-    The end-to-end difference carries the chain budget instead of the stage budget, because
-    the input quantization amplifies (see ``CHAIN_BUDGET``). The printed flip count separates
-    that from the other thing a perturbed input could do here: move the top-k selection, which
-    would change a row by a whole expert's contribution. It has measured zero so far.
-    """
+    """Compare routed outputs to the forced reference and the end-to-end chain budget."""
     check = ratio_reldiff(diff_thd=3e-3, pct_thd=0.02)
 
     def compare(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
@@ -713,9 +889,7 @@ def compare_ffn_output(staged, tokens):
                 for owner in owners[:tokens].unique()
             )
             print(f"[PRECISION] ffn_output max_abs by owning rank: {lanes}")
-            end_to_end, _ = report_stage(
-                "ffn_output(end-to-end)", actual[base, :tokens], expected[base, :tokens]
-            )
+            end_to_end, _ = report_stage("ffn_output(end-to-end)", actual[base, :tokens], expected[base, :tokens])
             report_stage("ffn_output(forced)", actual[base, :tokens], forced[base, :tokens])
             valid, _ = check(
                 actual[base, :tokens], forced[base, :tokens],
@@ -729,7 +903,9 @@ def compare_ffn_output(staged, tokens):
 
 def make_layer_compare(mode, tokens, initial_state, world_size):
     """Stage-wise comparators: every sublayer boundary forced on the device's own input."""
-    attention = StagedAttentionReference(mode, initial_state, attention_reference=functools.partial(reference_attention, reference=golden_reference_c2a_reuse if mode == "reuse" else golden_reference_c2a))
+    reference = golden_reference_c2a_reuse if mode == "reuse" else golden_reference_c2a
+    staged_reference = functools.partial(reference_attention, reference=reference)
+    attention = StagedAttentionReference(mode, initial_state, attention_reference=staged_reference)
     moe = StagedMoeReference(tokens)
     compare = {
         "attn_input": ratio_allclose(atol=1e-4, rtol=2**-8, max_error_ratio=0.002),
@@ -742,319 +918,12 @@ def make_layer_compare(mode, tokens, initial_state, world_size):
         "ffn_residual_mix": compare_hc_mixes_output("ffn_residual_mix", "x_hc_mid", "hc_ffn", coefficient=2),
         "ffn_owned": compare_ffn_owned(moe, tokens),
         "ffn_output": compare_ffn_output(moe, tokens),
-        # This stream is the MoE result expanded, so it carries the MoE's end-to-end budget
-        # rather than the attention sublayer's.
+        # MoE residual-stream precision budget.
         "x_hc_out": compare_expanded_stream("x_hc_out", "ffn_output", "x_hc_mid", "hc_ffn", CHAIN_BUDGET),
     }
     for name, check in cache_compare(world_size, tokens, REUSE_MUTABLE_NAMES).items():
         compare[name] = attention.compare(name, check)
     return compare
-
-
-# ---------------------------------------------------------------------------
-# Device program
-# ---------------------------------------------------------------------------
-
-
-@pl.jit
-def l2_prefill_layer_attention(
-    x_hc: pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[TOKENS, HC_MULT], pl.FP32],
-    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[3], pl.FP32],
-    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[TOKENS, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[TOKENS, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[TOKENS], pl.INT64],
-    window_indices: pl.Tensor[[TOKENS, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
-    ],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
-    compressed_indices: pl.Tensor[[TOKENS, INDEX_TOPK], pl.INT32],
-    attn_input: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
-    attn_output: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
-    attn_pre_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT], pl.FP32]],
-    x_hc_mid: pl.Out[pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32]],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
-    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-):
-    """Bind the runtime shapes and run the attention sublayer."""
-    window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
-    compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
-    prefill_c2a_reuse(
-        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
-        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
-        attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
-        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-        compressed_indices, output_window, output_arrived, attn_input, attn_output,
-        attn_pre_mix, x_hc_mid, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens,
-        attention_epoch,
-    )
-    retire_prefill_signals(x_hc_mid, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
-    return x_hc_mid, attn_pre_mix, attn_output, attn_input, window_cache, window_cache_scale
-
-@pl.jit
-def l2_prefill_layer_moe(
-    x_hc_mid: pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32],
-    attn_pre_mix: pl.Tensor[[TOKENS, HC_MULT], pl.FP32],
-    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    ffn_norm_weight: pl.Tensor[[D], pl.BF16],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
-    shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
-    shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    ffn_input: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
-    ffn_owned: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
-    next_pre_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT], pl.FP32]],
-    ffn_post_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT], pl.FP32]],
-    ffn_residual_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT, HC_MULT], pl.FP32]],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
-    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
-    data_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    moe_epoch: pl.Scalar[pl.INT32],
-):
-    """Run the FFN sublayer's mixes, collapse and EP MoE."""
-    prefill_moe_sublayer(
-        x_hc_mid, attn_pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        ffn_norm_weight, gate_weight, correction_bias,
-        routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
-        mxfp4_pair_lut, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
-        shared_w3, shared_w3_scale, recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-        arrived, data_arrived, routed_output, combine_arrived,
-        ffn_input, ffn_owned, next_pre_mix, ffn_post_mix, ffn_residual_mix,
-        num_tokens, rank, rank % TP_SIZE, moe_epoch,
-    )
-    clear_moe_signals(ffn_owned, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0))
-    return ffn_owned, next_pre_mix, ffn_post_mix, ffn_residual_mix, ffn_input
-
-@pl.jit
-def l2_prefill_layer_restore(
-    x_hc_mid: pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32],
-    ffn_owned: pl.Tensor[[TOKENS, D], pl.BF16],
-    ffn_post_mix: pl.Tensor[[TOKENS, HC_MULT], pl.FP32],
-    ffn_residual_mix: pl.Tensor[[TOKENS, HC_MULT, HC_MULT], pl.FP32],
-    ffn_output: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
-    x_hc_out: pl.Out[pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32]],
-    ffn_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
-    ffn_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    ffn_epoch: pl.Scalar[pl.INT32],
-):
-    """Put the TP group's routed rows back together and expand the residual."""
-    prefill_ffn_restore(
-        x_hc_mid, ffn_owned, ffn_post_mix, ffn_residual_mix, ffn_window, ffn_arrived,
-        ffn_output, x_hc_out, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens,
-        ffn_epoch,
-    )
-    retire_prefill_signals(x_hc_out, ffn_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
-    return x_hc_out, ffn_output
-
-# Completed entries retire signals before the next serialized dispatch.
-@pl.jit.host
-def l3_prefill_layer(
-    x_hc: pl.Tensor[[EP_SIZE, TOKENS, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[EP_SIZE, TOKENS, HC_MULT], pl.FP32],
-    hc_attn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    wq_a: pl.Tensor[[EP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[EP_SIZE, D // 32, Q_LORA], pl.FP8E8M0],
-    q_norm_weight: pl.Tensor[[EP_SIZE, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[EP_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[EP_SIZE, Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-    wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[EP_SIZE, D // 32, HEAD_DIM], pl.FP8E8M0],
-    kv_norm_weight: pl.Tensor[[EP_SIZE, HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[EP_SIZE, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[EP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[EP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[EP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[EP_SIZE, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
-    rope_cos: pl.Tensor[[EP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[EP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[EP_SIZE, TOKENS], pl.INT64],
-    window_indices: pl.Tensor[[EP_SIZE, TOKENS, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
-    ],
-    compressed_cache: pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
-    compressed_indices: pl.Tensor[[EP_SIZE, TOKENS, INDEX_TOPK], pl.INT32],
-    hc_ffn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
-    ffn_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.FP32],
-    correction_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    mxfp4_pair_lut: pl.Tensor[[EP_SIZE, 2, 256], pl.INT16],
-    shared_w1: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w1_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
-    shared_w2: pl.Tensor[[EP_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w2_scale: pl.Tensor[[EP_SIZE, MOE_INTER // MX_GROUP, D], pl.FP8E8M0],
-    shared_w3: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w3_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
-    token_owners: pl.Tensor[[EP_SIZE, TOKENS], pl.INT32],
-    attn_input: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
-    attn_output: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
-    attn_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT], pl.FP32]],
-    x_hc_mid: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT, D], pl.FP32]],
-    ffn_input: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
-    ffn_owned: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
-    ffn_output: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
-    next_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT], pl.FP32]],
-    ffn_post_mix: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT], pl.FP32]],
-    ffn_residual_mix: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT, HC_MULT], pl.FP32]],
-    x_hc_out: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT, D], pl.FP32]],
-    num_tokens: pl.Scalar[pl.INT32],
-    layer_epoch: pl.Scalar[pl.INT32],
-):
-    """Allocate the TP and EP communication windows and launch both sublayers per device."""
-    window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
-    compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
-    attention_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
-    attention_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    ffn_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
-    ffn_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
-    recv_weights_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
-    recv_routes_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    arrived_buffer = pld.alloc_window_buffer(
-        [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32
-    )
-    data_arrived_buffer = pld.alloc_window_buffer(
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
-    )
-    routed_output_buffer = pld.alloc_window_buffer([ROUTE_ROWS, D], dtype=pl.BF16)
-    combine_arrived_buffer = pld.alloc_window_buffer(
-        [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
-    )
-    for rank in pl.range(pld.world_size()):
-        attention_data = pld.window(attention_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
-        attention_signal = pld.window(attention_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        # Each rank consumes packed MX_B_NN scale rows; a bare slice is ND.
-        wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
-        wq_b_scale_r: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
-        wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
-        wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
-        l2_prefill_layer_attention(
-            x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
-            attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank],
-            wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank],
-            wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank],
-            window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank],
-            compressed_cache[rank], compressed_cache_scale[rank], compressed_indices[rank],
-            attn_input[rank], attn_output[rank], attn_pre_mix[rank], x_hc_mid[rank],
-            attention_data, attention_signal, rank, num_tokens, layer_epoch, device=rank,
-        )
-    for rank in pl.range(pld.world_size()):
-        recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
-        recv_scale = pld.window(recv_scale_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
-        recv_weights = pld.window(recv_weights_buffer, [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
-        recv_routes = pld.window(recv_routes_buffer, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        arrived = pld.window(
-            arrived_buffer, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32
-        )
-        data_arrived = pld.window(
-            data_arrived_buffer,
-            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
-            dtype=pl.INT32,
-        )
-        routed_output = pld.window(routed_output_buffer, [ROUTE_ROWS, D], dtype=pl.BF16)
-        combine_arrived = pld.window(
-            combine_arrived_buffer,
-            [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
-            dtype=pl.INT32,
-        )
-        routed_w1_scale_r: pl.Tensor[
-            [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
-        ] = routed_w1_scale[rank]
-        routed_w2_scale_r: pl.Tensor[
-            [N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN
-        ] = routed_w2_scale[rank]
-        routed_w3_scale_r: pl.Tensor[
-            [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
-        ] = routed_w3_scale[rank]
-        shared_w1_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[rank]
-        shared_w2_scale_r: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[rank]
-        shared_w3_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[rank]
-        l2_prefill_layer_moe(
-            x_hc_mid[rank], attn_pre_mix[rank], hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
-            ffn_norm_weight[rank], gate_weight[rank], correction_bias[rank],
-            routed_w1[rank], routed_w1_scale_r, routed_w2[rank], routed_w2_scale_r,
-            routed_w3[rank], routed_w3_scale_r, mxfp4_pair_lut[rank],
-            shared_w1[rank], shared_w1_scale_r, shared_w2[rank], shared_w2_scale_r,
-            shared_w3[rank], shared_w3_scale_r,
-            ffn_input[rank], ffn_owned[rank], next_pre_mix[rank], ffn_post_mix[rank],
-            ffn_residual_mix[rank],
-            recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-            arrived, data_arrived, routed_output, combine_arrived,
-            rank, num_tokens, layer_epoch, device=rank,
-        )
-    for rank in pl.range(pld.world_size()):
-        ffn_data = pld.window(ffn_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
-        ffn_signal = pld.window(ffn_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        l2_prefill_layer_restore(
-            x_hc_mid[rank], ffn_owned[rank], ffn_post_mix[rank], ffn_residual_mix[rank],
-            ffn_output[rank], x_hc_out[rank], ffn_data, ffn_signal,
-            rank, num_tokens, layer_epoch, device=rank,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1100,7 +969,8 @@ def build_specs(args, mode, initial_state):
             initial_state[name] = stacked.clone()
         return stacked
 
-    shapes = make_attention_inputs(mode, args.tokens, args.requests, args.seed, args.case, make_inputs=make_c2a_reuse_inputs if mode == "reuse" else None)
+    make_inputs = make_c2a_reuse_inputs if mode == "reuse" else None
+    shapes = make_attention_inputs(mode, args.tokens, args.requests, args.seed, args.case, make_inputs=make_inputs)
     shapes.update(make_hc_inputs(args.tokens, args.seed, args.case))
     shapes.update(make_ffn_hc_inputs(args.seed + 3001))
     shapes.update(make_moe_replicated_inputs(args.seed + 5003))
@@ -1142,9 +1012,7 @@ def build_specs(args, mode, initial_state):
         TensorSpec("ffn_output", [world_size, args.tokens, D], torch.bfloat16, resident="stacked"),
         TensorSpec("next_pre_mix", [world_size, args.tokens, HC_MULT], torch.float32, resident="stacked"),
         TensorSpec("ffn_post_mix", [world_size, args.tokens, HC_MULT], torch.float32, resident="stacked"),
-        TensorSpec(
-            "ffn_residual_mix", [world_size, args.tokens, HC_MULT, HC_MULT], torch.float32, resident="stacked"
-        ),
+        TensorSpec("ffn_residual_mix", [world_size, args.tokens, HC_MULT, HC_MULT], torch.float32, resident="stacked"),
         TensorSpec("x_hc_out", [world_size, args.tokens, HC_MULT, D], torch.float32, resident="stacked"),
         ScalarSpec("num_tokens", torch.int32, args.tokens, compile_runtime=True),
         ScalarSpec(
@@ -1173,9 +1041,7 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=int, default=LAYER_TP, choices=[1, 2])
     parser.add_argument("--dp", type=int, default=LAYER_DP, choices=[2])
     parser.add_argument("--tokens", type=int, default=LAYER_TOKENS)
-    # config.py reads --ep from the command line (the import above supplies TP x DP when it is
-    # absent). Declare it so argparse consumes it as itself instead of prefix-matching it to
-    # another long option.
+    # Consume the import-time EP option explicitly.
     parser.add_argument("--ep", type=int, default=EP_SIZE, help="set from --tp x --dp; read by config")
     parser.add_argument("--requests", type=int, default=6)
     parser.add_argument("--case", default="mixed", choices=["mixed", "long", "masked", "zero"])
@@ -1185,7 +1051,7 @@ if __name__ == "__main__":
     if args.execution_mode:
         parser.error("this entry requires hardware; --sim is unsupported")
 
-    # Parallel sizes and MoE shapes were frozen from the same command line before argparse ran.
+    # Validate the frozen parallel and token shapes.
     if (args.tp, args.dp, args.ep, args.tokens) != (TP_SIZE, DP_SIZE, EP_SIZE, MOE_TOKENS):
         parser.error("--tp/--dp/--ep/--tokens are read before argparse; pass them once on the command line")
     args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"

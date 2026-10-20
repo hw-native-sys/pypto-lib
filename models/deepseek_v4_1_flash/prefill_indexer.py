@@ -19,7 +19,6 @@ from quant import (
     bf16_gemm_staged, mxfp8_gemm, dequantize_mxfp4_cache, golden_mxfp8_linear, quantize_mxfp4_cache,
 )
 from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
-from utils import index_pool_block_capacity
 
 
 # model config
@@ -54,7 +53,6 @@ SORT_FLOOR = -3.0e38
 M_TILE = 16
 INDEX_PROJ_N_TILE = 128
 INDEX_PROJ_K_TILE = 256
-
 
 
 CANDIDATE_SCORE_TILE = 1024
@@ -1333,7 +1331,6 @@ def golden_index_key(
     return torch.cat((key[..., :-rd], golden_rope_interleave(key[..., -rd:], cos, sin)), dim=-1)
 
 
-
 def golden_select_candidate_block_pool(
     logits: torch.Tensor,
     compressed_lens: torch.Tensor | int,
@@ -1447,3 +1444,13 @@ def golden_prefill_index_scores(mode, rank, cache_outputs, inputs):
         inputs["index_weights_proj"][rank], inputs["rope_cos"][rank], inputs["rope_sin"][rank], **pool,
     )
     return scores
+
+
+def index_pool_block_capacity(score_width: int) -> int:
+    """Return the aligned compact-pool capacity for one score row."""
+    if score_width < 0:
+        raise ValueError(f"score_width must be nonnegative, got {score_width}")
+    block_size = M.candidate_block_size
+    blocks = max(1, (score_width + block_size - 1) // block_size)
+    aligned = (blocks + 31) // 32 * 32
+    return min(M.candidate_topk_blocks, aligned)
