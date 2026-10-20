@@ -39,9 +39,10 @@ from decode_swa import decode_swa
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from gate import golden_gate_reference as gate
 from hc import golden_mhc_mixes, golden_hc_post, golden_hc_pre
-from moe import (
+from decode_moe import moe
+from decode_moe import (
     AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD,
-    clear_moe_signals, moe,
+    clear_moe_signals,
 )
 from quant import (
     pack_mx_b_scale, unpack_mx_b_scale,
@@ -310,6 +311,7 @@ def l2_decode_layer(
         )
 
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
+    force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     moe(
         attention_hidden, attention_pre_mix,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -327,6 +329,7 @@ def l2_decode_layer(
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         arrived, data_arrived, routed_output, combine_arrived,
         local_moe_tokens, rank, moe_epoch,
+        force_topk,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
 
@@ -835,7 +838,7 @@ def build_tensor_specs(layer_id=0, seed=0):
 
     from golden import ScalarSpec, TensorSpec
     import decode_swa
-    from moe import build_tensor_specs as build_moe_specs
+    from decode_moe import build_tensor_specs as build_moe_specs
 
     global_tokens = DECODE_MAX_TOKENS
     args = SimpleNamespace(
@@ -943,7 +946,7 @@ def _fixture_moe_counts():
 def golden_l3_decode_layer(tensors):
     """Run the local Attention golden, then the distributed MoE golden."""
     import decode_swa
-    from moe import golden_moe
+    from decode_moe import golden_moe
 
     global_tokens = int(tensors["attention_num_tokens"])
     attention_hidden = tensors["attention_hidden"]
@@ -985,7 +988,7 @@ def _compare_active_rows_per_rank(compare, counts):
 
 def _compare_moe_from_actual_attention(counts):
     """Validate MoE against the actual, already-validated Attention boundary."""
-    from moe import _local_mhc_compare, golden_moe
+    from decode_moe import _local_mhc_compare, golden_moe
 
     compare_moe = _local_mhc_compare(counts)
 

@@ -187,19 +187,25 @@ def gate_normalized(
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     # Reserve both engines before any local Cube-to-Vector transfer.
     # Bound synchronous cohorts to the target A5 core count.
-    gate_tasks = task_gate_tiles * (N_EXPERTS // GATE_N_TILE)
-    gate_workers = pl.min(gate_tasks, 16)
+    gate_bias_matrix = pl.reshape(gate_bias, [1, N_EXPERTS])
+    gate_tasks = task_gate_tiles * ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
+    gate_workers = pl.min(gate_tasks, pl.min(16, pl.system.available_cluster_count()))
     for gate_worker in pl.spmd(gate_workers, name_hint="gate", sync_start=True):
         for gb_idx in pl.range(gate_worker, gate_tasks, gate_workers):
-            tg = gb_idx // (N_EXPERTS // GATE_N_TILE)
-            nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
+            tg = gb_idx // ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
+            nb = gb_idx % ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
             t1 = tg * GATE_M_TILE
             n0 = nb * GATE_N_TILE
             gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
             for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
                 gd_kd = kb * GATE_D_TILE
                 gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
-                gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
+                gd_w_raw = pl.slice(
+                    gate_w, [GATE_N_TILE, GATE_D_TILE], [n0, gd_kd], valid_shape=[valid_n, GATE_D_TILE],
+                )
+                gd_w_pad = pl.fillpad(gd_w_raw, pad_value=pl.PadValue.zero)
+                gd_w = pl.set_validshape(gd_w_pad, GATE_N_TILE, GATE_D_TILE)
                 if gd_kd == 0:
                     gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
                 else:
@@ -221,7 +227,12 @@ def gate_normalized(
             gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
             gp_score = pl.sqrt(gp_softplus)
             route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
-            gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
+            bias_valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
+            gp_bias_raw = pl.slice(
+                gate_bias_matrix, [1, GATE_N_TILE], [0, n0], valid_shape=[1, bias_valid_n],
+            )
+            gp_bias_pad = pl.fillpad(gp_bias_raw, pad_value=pl.PadValue.min)
+            gp_bias_row = pl.set_validshape(gp_bias_pad, 1, GATE_N_TILE)
             gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
             biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
 

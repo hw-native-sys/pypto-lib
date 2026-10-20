@@ -94,7 +94,8 @@ from input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
 from utils import paged_slots, window_metadata
 from lm_head import greedy_sample, lm_head
-from moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals, moe
+from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals
+from prefill_moe import prefill_moe
 from compressor import STATE_WIDTH
 from prefill_c1a_full import prefill_publish_decoder
 from prefill_swa import prefill_swa_attention
@@ -389,7 +390,7 @@ def _prefill_moe(
             gather_rows(source_hidden, row_ids, packed_hidden, rows_ready)
             gather_rows(pre_mix, row_ids, round_pre, rows_ready)
             epoch = (moe_epoch - 1) * rounds + round_id + 1
-            moe(
+            prefill_moe(
                 round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
                 gate_weight, correction_bias,
                 routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
@@ -1721,7 +1722,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
 def build_tensor_specs():
     """Build a checkpoint-free, 40-layer CED prefill smoke fixture."""
     from golden import TensorSpec
-    from moe import _route_bias
+    from prefill_moe import _route_bias
 
     fp8_sizes = (
         D * Q_LORA, Q_LORA * LOCAL_H * HEAD_DIM, D * HEAD_DIM, LOCAL_O_WIDTH * D,

@@ -65,15 +65,15 @@ from expert_routed import (
     MX_W2_PACKED_ROWS,
     MX_W3_PACKED_ROWS,
 )
-from moe import SIGNAL_PAD
-from moe import (
+from decode_moe import moe
+from decode_moe import SIGNAL_PAD
+from decode_moe import (
     clear_moe_signals,
     AUX_WIDTH,
     EP_SIZE,
     N_LOCAL_EXPERTS,
     RECV_MAX,
     ROUTE_WIDTH,
-    moe,
 )
 
 
@@ -389,6 +389,7 @@ def _decode_encoder(
         ffn_shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w2_scale, [MOE_INTER // MX_GROUP, D], [layer * (MOE_INTER // MX_GROUP), 0])
         ffn_shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w3[layer]
         ffn_shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w3_scale, [D // MX_GROUP, MOE_INTER], [layer * (D // MX_GROUP), 0])
+        force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
         moe(
             attention_hidden, attention_pre_mix,
             ffn_hc_fn, ffn_hc_scale, ffn_hc_base,
@@ -407,6 +408,7 @@ def _decode_encoder(
             arrived, data_arrived,
             routed_output, combine_arrived,
             local_moe_tokens, rank, layer + 1,
+            force_topk,
         )
     return x_hc, pre_mix, token_rope_cos, token_rope_sin
 
@@ -661,6 +663,7 @@ def _decode_decoder(
         ffn_shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w2_scale, [MOE_INTER // MX_GROUP, D], [layer * (MOE_INTER // MX_GROUP), 0])
         ffn_shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w3[layer]
         ffn_shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w3_scale, [D // MX_GROUP, MOE_INTER], [layer * (D // MX_GROUP), 0])
+        force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
         moe(
             attention_hidden, attention_pre_mix,
             ffn_hc_fn, ffn_hc_scale, ffn_hc_base,
@@ -679,6 +682,7 @@ def _decode_decoder(
             arrived, data_arrived,
             routed_output, combine_arrived,
             local_moe_tokens, rank, layer + 1,
+            force_topk,
         )
     clear_moe_signals(x_hc, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_hc
@@ -1370,7 +1374,7 @@ def _fixture_extent(dim):
 def build_tensor_specs():
     """Build the TP1 twelve-request decode smoke fixture."""
     from golden import TensorSpec
-    from moe import _route_bias
+    from decode_moe import _route_bias
     from quant import build_mxfp4_pair_lut
 
     if TP_SIZE != 1:

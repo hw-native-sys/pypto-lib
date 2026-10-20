@@ -9,7 +9,7 @@
 """DeepSeek-V4.1 routed expert compute with immediate distributed scatter.
 
 Only the routed-expert path lives here. The shared expert was split out
-into ``expert_shared.py``; both kernels are composed in ``moe.py``.
+into ``expert_shared.py``; both kernels are composed in ``decode_moe.py`` and ``prefill_moe.py``.
 
 Run this file directly to validate the routed compute and scatter on one device.
 """

@@ -295,6 +295,21 @@
         "--startpos",
         "8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192,8192"
       ]
+    },
+    {
+      "case_id": "dsv4.1-flash-decode-moe-ep2-b12-eplb",
+      "entrypoint": "models/deepseek_v4_1_flash/decode_moe.py",
+      "platform": "a5",
+      "device_count": 2,
+      "arguments": [
+        "--ep",
+        "2",
+        "--num-tokens",
+        "72",
+        "--experts-per-rank",
+        "12",
+        "--balanced-routing"
+      ]
     }
   ]
 }
