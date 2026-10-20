@@ -353,95 +353,106 @@ def select_candidate_block_pool(
     tokens = pl.tensor.dim(index_scores, 0)
     positions = pl.tensor.dim(index_scores, 1)
     capacity = pl.tensor.dim(pool_block_ids, 1)
-    block_count = (positions + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
-    padded_block_count = (block_count + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE * CANDIDATE_LEAF_TILE
-    score_tiles = (block_count + CANDIDATE_SCORE_TILE - 1) // CANDIDATE_SCORE_TILE
-    block_scores = pl.create_tensor([tokens, padded_block_count], dtype=pl.FP32)
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > tokens:
         active_tokens = pl.cast(tokens, pl.INDEX)
-    # Dispatch one guarded work item for an empty batch.
-    score_task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
-    score_task_tiles = pl.max(score_tiles, pl.cast(1, pl.INDEX))
+    block_count = (positions + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+    if block_count <= pl.min(capacity, CANDIDATE_TOPK_BLOCKS):
+        with pl.spmd(tokens, name_hint="c1a_pool_all_blocks") as all_tid:
+            token = pl.tile.get_block_idx()
+            lanes = pl.tile.arange(0, [1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32)
+            ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+            if token < active_tokens:
+                visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
+                visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+                valid = pl.tile.cmps(lanes, pl.cast(visible_blocks, pl.INT32), cmp_type=2)
+                ids = pl.tile.select(valid, lanes, ids)
+            pl.store(pl.tile.set_validshape(ids, 1, capacity), [token, 0], pool_block_ids)
+        pool_tid = pl.yield_(all_tid)
+    else:
+        padded_block_count = (block_count + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE * CANDIDATE_LEAF_TILE
+        score_tiles = (block_count + CANDIDATE_SCORE_TILE - 1) // CANDIDATE_SCORE_TILE
+        block_scores = pl.create_tensor([tokens, padded_block_count], dtype=pl.FP32)
+        # Dispatch one guarded work item for an empty batch.
+        score_task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
+        score_task_tiles = pl.max(score_tiles, pl.cast(1, pl.INDEX))
+        score_work_items = score_task_tokens * score_task_tiles
+        score_workers = pl.min(score_work_items, 32)
 
-    with pl.spmd(
-        score_task_tokens * score_task_tiles,
-        name_hint="c1a_pool_block_scores",
-        deps=[scores_ready],
-    ) as score_tid:
-        work = pl.tile.get_block_idx()
-        token = work // score_task_tiles
-        score_tile = work % score_task_tiles
-        if token < active_tokens and score_tile < score_tiles:
-            block_begin = score_tile * CANDIDATE_SCORE_TILE
-            position_begin = block_begin * CANDIDATE_BLOCK_SIZE
-            valid_blocks = pl.min(CANDIDATE_SCORE_TILE, block_count - block_begin)
-            valid_positions = pl.min(CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE, positions - position_begin)
-            raw = pl.load(
-                index_scores,
-                [token, position_begin],
-                [1, CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE],
-                valid_shape=[1, valid_positions],
-            )
-            padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
-            grouped = pl.reshape(padded, [CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE])
-            reduce_tmp = pl.create_tile([CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE], dtype=pl.FP32)
-            maxima = pl.reshape(pl.row_max(grouped, tmp_tile=reduce_tmp), [1, CANDIDATE_SCORE_TILE])
-            visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
-            if visible > 0:
-                last_block = (visible - 1) // CANDIDATE_BLOCK_SIZE
-                if last_block >= block_begin and last_block < block_begin + valid_blocks:
-                    pl.tile.write(maxima, [0, last_block - block_begin], 1e30)
-            maxima = pl.tile.set_validshape(maxima, 1, valid_blocks)
-            pl.store(maxima, [token, block_begin], block_scores)
+        with pl.spmd(score_workers, name_hint="c1a_pool_block_scores", deps=[scores_ready]) as score_tid:
+            worker = pl.tile.get_block_idx()
+            for work in pl.range(worker, score_work_items, score_workers):
+                token = work // score_task_tiles
+                score_tile = work % score_task_tiles
+                if token < active_tokens and score_tile < score_tiles:
+                    block_begin = score_tile * CANDIDATE_SCORE_TILE
+                    position_begin = block_begin * CANDIDATE_BLOCK_SIZE
+                    valid_blocks = pl.min(CANDIDATE_SCORE_TILE, block_count - block_begin)
+                    valid_positions = pl.min(CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE, positions - position_begin)
+                    raw = pl.load(
+                        index_scores, [token, position_begin],
+                        [1, CANDIDATE_SCORE_TILE * CANDIDATE_BLOCK_SIZE], valid_shape=[1, valid_positions],
+                    )
+                    padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
+                    grouped = pl.reshape(padded, [CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE])
+                    reduce_tmp = pl.create_tile([CANDIDATE_SCORE_TILE, CANDIDATE_BLOCK_SIZE], dtype=pl.FP32)
+                    maxima = pl.reshape(pl.row_max(grouped, tmp_tile=reduce_tmp), [1, CANDIDATE_SCORE_TILE])
+                    visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
+                    if visible > 0:
+                        last_block = (visible - 1) // CANDIDATE_BLOCK_SIZE
+                        if last_block >= block_begin and last_block < block_begin + valid_blocks:
+                            pl.tile.write(maxima, [0, last_block - block_begin], 1e30)
+                    maxima = pl.tile.set_validshape(maxima, 1, valid_blocks)
+                    pl.store(maxima, [token, block_begin], block_scores)
 
-    arena = pl.create_tensor([tokens * CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
-    with pl.spmd(tokens, name_hint="c1a_pool_block_select", deps=[score_tid]) as pool_tid:
-        token = pl.tile.get_block_idx()
-        sorted_ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
-        if token < active_tokens:
-            visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
-            visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
-            arena_base = token * CANDIDATE_MAX_LEAVES
-            count = 0
-            if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF_TILE:
-                _sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
-                count = 1
-            elif visible_blocks > 0:
-                leaf_count = (visible_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
-                for leaf in pl.range(leaf_count):
-                    block_begin = leaf * CANDIDATE_LEAF_TILE
-                    valid_count = pl.min(CANDIDATE_LEAF_TILE, visible_blocks - block_begin)
-                    _sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
-                count = leaf_count
-            if count > 1:
-                count = _merge_candidate_level(arena, arena_base, count)
-            if count > 1:
-                count = _merge_candidate_level(arena, arena_base, count)
-            if count > 1:
-                count = _merge_candidate_level(arena, arena_base, count)
-            if count > 1:
-                count = _merge_candidate_level(arena, arena_base, count)
+        arena = pl.create_tensor([tokens * CANDIDATE_MAX_LEAVES, CANDIDATE_PAIR_WIDTH], dtype=pl.FP32)
+        with pl.spmd(tokens, name_hint="c1a_pool_block_select", deps=[score_tid]) as selected_tid:
+            token = pl.tile.get_block_idx()
+            sorted_ids = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+            if token < active_tokens:
+                visible = pl.min(pl.max(pl.read(compressed_lens, [token]), 0), positions)
+                visible_blocks = (visible + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+                arena_base = token * CANDIDATE_MAX_LEAVES
+                count = 0
+                if visible_blocks > 0 and visible_blocks <= CANDIDATE_SHORT_LEAF_TILE:
+                    _sort_candidate_short_leaf(block_scores, arena, token, visible_blocks, arena_base)
+                    count = 1
+                elif visible_blocks > 0:
+                    leaf_count = (visible_blocks + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE
+                    for leaf in pl.range(leaf_count):
+                        block_begin = leaf * CANDIDATE_LEAF_TILE
+                        valid_count = pl.min(CANDIDATE_LEAF_TILE, visible_blocks - block_begin)
+                        _sort_candidate_leaf(block_scores, arena, token, block_begin, valid_count, arena_base + leaf)
+                    count = leaf_count
+                if count > 1:
+                    count = _merge_candidate_level(arena, arena_base, count)
+                if count > 1:
+                    count = _merge_candidate_level(arena, arena_base, count)
+                if count > 1:
+                    count = _merge_candidate_level(arena, arena_base, count)
+                if count > 1:
+                    count = _merge_candidate_level(arena, arena_base, count)
 
-            selected_count = pl.min(pl.min(visible_blocks, CANDIDATE_TOPK_BLOCKS), capacity)
-            ordered_scores = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
-            ordered_indices = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
-            if selected_count > 0:
-                root = pl.load(arena, [arena_base, 0], [1, CANDIDATE_PAIR_WIDTH])
-                selected = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                for lane in pl.range(selected_count):
-                    block_id = pl.tile.read(selected, [0, lane])
-                    pl.tile.write(ordered_scores, [0, lane], -pl.cast(block_id, pl.FP32))
-                    pl.tile.write(ordered_indices, [0, lane], block_id)
-            ordered = pl.tile.sort32(ordered_scores, pl.reinterpret_view(ordered_indices, pl.UINT32))
-            ordered = pl.tile.mrgsort(ordered, block_len=64)
-            ordered = pl.tile.mrgsort(ordered, block_len=256)
-            ordered = pl.tile.mrgsort(ordered, block_len=1024)
-            sorted_ids = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-        # Publish the sorted prefix and -1 padding as one aligned pool row.
-        pl.store(pl.tile.set_validshape(sorted_ids, 1, capacity), [token, 0], pool_block_ids)
+                selected_count = pl.min(pl.min(visible_blocks, CANDIDATE_TOPK_BLOCKS), capacity)
+                ordered_scores = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.FP32, value=-1e30)
+                ordered_indices = pl.tile.full([1, CANDIDATE_TOPK_BLOCKS], dtype=pl.INT32, value=-1)
+                if selected_count > 0:
+                    root = pl.load(arena, [arena_base, 0], [1, CANDIDATE_PAIR_WIDTH])
+                    selected = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                    for lane in pl.range(selected_count):
+                        block_id = pl.tile.read(selected, [0, lane])
+                        pl.tile.write(ordered_scores, [0, lane], -pl.cast(block_id, pl.FP32))
+                        pl.tile.write(ordered_indices, [0, lane], block_id)
+                ordered = pl.tile.sort32(ordered_scores, pl.reinterpret_view(ordered_indices, pl.UINT32))
+                ordered = pl.tile.mrgsort(ordered, block_len=64)
+                ordered = pl.tile.mrgsort(ordered, block_len=256)
+                ordered = pl.tile.mrgsort(ordered, block_len=1024)
+                sorted_ids = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            # Publish the sorted prefix and -1 padding as one aligned pool row.
+            pl.store(pl.tile.set_validshape(sorted_ids, 1, capacity), [token, 0], pool_block_ids)
+        pool_tid = pl.yield_(selected_tid)
     # Publish cache-line-sharing counts from one worker after the ID rows.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="c1a_pool_count_publish", deps=[pool_tid]) as counts_tid:
         for publish_token in pl.range(tokens):
@@ -604,7 +615,8 @@ def _make_fp4_publish_bf16(width, group, cache_dim):
 
 
 def _make_fp4_publish_e8m0(width, group, cache_dim):
-    padded_width = max(width, 32 * group)
+    token_tile = 8
+    padded_width = token_tile * width
 
     @pl.jit.inline(auto_scope=False)
     def publish(
@@ -623,66 +635,72 @@ def _make_fp4_publish_e8m0(width, group, cache_dim):
         with pl.at(
             level=pl.Level.CORE_GROUP, name_hint="c1a_publish_fp4", deps=[cache_ready, kv_ready]
         ) as published:
-            for t in pl.range(num_tokens):
-                slot = pl.read(slots, [t])
-                if slot >= 0:
-                    physical = pl.cast(slot, pl.INDEX)
-                    raw = pl.load(source, [t, 0], [1, padded_width], valid_shape=[1, width])
-                    raw = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 1, padded_width)
-                    values = pl.reshape(pl.cast(raw, pl.FP32), [padded_width // group, group])
-                    temporary = pl.tile.create([padded_width // group, group], dtype=pl.FP32)
-                    amax = pl.row_max(pl.abs(values), tmp_tile=temporary)
-                    bounded = pl.maximum(amax, 7.052966104933725e-38)
-                    bits = pl.reinterpret_view(pl.mul(bounded, 1.0 / 6.0), pl.INT32)
-                    exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                    factors = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                    # Raw codes span 0..255; folding to a signed byte would saturate.
-                    stored_codes = exponent
-                    normalized = pl.minimum(pl.maximum(pl.row_expand_div(values, factors), -6.0), 6.0)
-                    magnitude = pl.abs(normalized)
-                    rounded = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=0.0)
-                    select_tmp = pl.tile.create([1, 16], dtype=pl.UINT32)
-                    predicate = pl.tile.cmps(magnitude, 0.25, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=0.5)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 0.75, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=1.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 1.25, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=1.5)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 1.75, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=2.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 2.5, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=3.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 3.5, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=4.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 5.0, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=6.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    # Convert the exact RNE levels to E2M1 codes, then pack adjacent lanes.
-                    codes = pl.add(pl.minimum(pl.mul(rounded, 2.0), 4.0),
-                                   pl.minimum(pl.maximum(pl.sub(rounded, 2.0), 0.0), 3.0))
-                    sign = pl.ands(pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 28), 8)
-                    codes = pl.reshape(pl.or_(pl.cast(codes, pl.INT32), sign), [1, padded_width])
-                    low = pl.tile.gather_mask(
-                        codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32
-                    )
-                    high = pl.tile.gather_mask(
-                        codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-                    )
-                    packed = pl.add(low, pl.mul(high, 16))
-                    signed_bytes = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
-                    payload_bytes = pl.reinterpret_view(pl.cast(signed_bytes, pl.INT8), pl.UINT8)
-                    payload = pl.set_validshape(payload_bytes, 1, width // 2)
-                    encoded_codes = pl.reinterpret_view(pl.cast(stored_codes, pl.UINT8), pl.FP8E8M0)
-                    encoded = pl.set_validshape(pl.reshape(encoded_codes, [1, padded_width // group]),
-                                                1, width // group)
-                    pl.store(payload, [physical, 0], flat)
-                    pl.store(encoded, [physical, 0], flat_scale)
+            for t in pl.range(0, num_tokens, token_tile):
+                rows = pl.min(token_tile, num_tokens - t)
+                raw = pl.load(source, [t, 0], [token_tile, width], valid_shape=[rows, width])
+                raw = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), token_tile, width)
+                values = pl.reshape(pl.cast(raw, pl.FP32), [padded_width // group, group])
+                temporary = pl.tile.create([padded_width // group, group], dtype=pl.FP32)
+                amax = pl.row_max(pl.abs(values), tmp_tile=temporary)
+                bounded = pl.maximum(amax, 7.052966104933725e-38)
+                bits = pl.reinterpret_view(pl.mul(bounded, 1.0 / 6.0), pl.INT32)
+                exponent = pl.shrs(pl.add(bits, 8388607), 23)
+                factors = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
+                # Raw codes span 0..255; folding to a signed byte would saturate.
+                stored_codes = exponent
+                normalized = pl.minimum(pl.maximum(pl.row_expand_div(values, factors), -6.0), 6.0)
+                magnitude = pl.abs(normalized)
+                rounded = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=0.0)
+                select_tmp = pl.tile.create([1, 16], dtype=pl.UINT32)
+                predicate = pl.tile.cmps(magnitude, 0.25, cmp_type=4)
+                level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=0.5)
+                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+                predicate = pl.tile.cmps(magnitude, 0.75, cmp_type=5)
+                level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=1.0)
+                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+                predicate = pl.tile.cmps(magnitude, 1.25, cmp_type=4)
+                level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=1.5)
+                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+                predicate = pl.tile.cmps(magnitude, 1.75, cmp_type=5)
+                level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=2.0)
+                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+                predicate = pl.tile.cmps(magnitude, 2.5, cmp_type=4)
+                level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=3.0)
+                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+                predicate = pl.tile.cmps(magnitude, 3.5, cmp_type=5)
+                level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=4.0)
+                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+                predicate = pl.tile.cmps(magnitude, 5.0, cmp_type=4)
+                level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=6.0)
+                rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
+                # Pack adjacent E2M1 codes.
+                codes_base = pl.minimum(pl.mul(rounded, 2.0), 4.0)
+                codes_extra = pl.minimum(pl.maximum(pl.sub(rounded, 2.0), 0.0), 3.0)
+                codes = pl.add(codes_base, codes_extra)
+                sign = pl.ands(pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 28), 8)
+                codes = pl.reshape(pl.or_(pl.cast(codes, pl.INT32), sign), [1, padded_width])
+                low = pl.tile.gather_mask(codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32)
+                high = pl.tile.gather_mask(codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                packed = pl.add(low, pl.mul(high, 16))
+                signed_bytes = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
+                payload_bytes = pl.reinterpret_view(pl.cast(signed_bytes, pl.INT8), pl.UINT8)
+                payload_rows = pl.reshape(payload_bytes, [token_tile, width // 2])
+                scale_codes = pl.reshape(stored_codes, [1, padded_width // group])
+                scale_lanes = pl.tile.arange(0, [1, 32], dtype=pl.INT32)
+                scale_tmp = pl.tile.create([1, 128], dtype=pl.UINT8)
+                for row in pl.range(rows):
+                    slot = pl.read(slots, [t + row])
+                    if slot >= 0:
+                        physical = pl.cast(slot, pl.INDEX)
+                        payload = pl.tile.slice(payload_rows, [1, width // 2], [row, 0])
+                        scale_offset = pl.cast(row * (width // group), pl.INT32)
+                        indices = pl.minimum(pl.add(scale_lanes, scale_offset), padded_width // group - 1)
+                        selected_codes = pl.tile.gather(scale_codes, indices, scale_tmp)
+                        encoded_bytes = pl.cast(selected_codes, pl.UINT8)
+                        encoded = pl.reinterpret_view(encoded_bytes, pl.FP8E8M0)
+                        encoded = pl.set_validshape(encoded, 1, width // group)
+                        pl.store(payload, [physical, 0], flat)
+                        pl.store(encoded, [physical, 0], flat_scale)
         return published
 
     return publish
@@ -1539,24 +1557,25 @@ def select_index_topk(
     """Select exact Top-512 indices from dynamic C1A score rows."""
     width = pl.tensor.dim(index_scores, 1)
     tokens = pl.tensor.dim(index_scores, 0)
-    leaf_count = (width + _TOPK_LEAF_TILE - 1) // _TOPK_LEAF_TILE
-    arena_rows = tokens * leaf_count
-    pair_arena = pl.create_tensor([arena_rows, _TOPK_PAIR_WIDTH], dtype=pl.FP32)
-    with pl.spmd(32, name_hint="c1a_index_topk_short", deps=[scores_ready]) as short_tid:
-        worker = pl.tile.get_block_idx()
-        for token in pl.range(worker, num_tokens, 32):
-            if width <= INDEX_TOPK:
+    if width <= INDEX_TOPK:
+        with pl.spmd(32, name_hint="c1a_index_topk_short", deps=[scores_ready]) as short_tid:
+            worker = pl.tile.get_block_idx()
+            for token in pl.range(worker, num_tokens, 32):
                 invalid_bits = pl.tile.full([1, 8], dtype=pl.INT32, value=_TOPK_INVALID_SCORE_BITS)
                 invalid_score = pl.tile.read(pl.reinterpret_view(invalid_bits, pl.FP32), [0, 0])
                 _materialize_index_topk(
                     index_scores, block_table, request_ids, block_table, output,
                     token, width, invalid_score, pl.cast(0, pl.INDEX), pool=False,
                 )
-    total_leaves = pl.cast(num_tokens, pl.INDEX) * leaf_count
-    with pl.spmd(32, name_hint="c1a_index_topk_leaf", deps=[scores_ready]) as leaf_tid:
-        worker = pl.tile.get_block_idx()
-        for work in pl.range(worker, total_leaves, 32):
-            if width > INDEX_TOPK:
+        topk_tid = pl.yield_(short_tid)
+    else:
+        leaf_count = (width + _TOPK_LEAF_TILE - 1) // _TOPK_LEAF_TILE
+        arena_rows = tokens * leaf_count
+        pair_arena = pl.create_tensor([arena_rows, _TOPK_PAIR_WIDTH], dtype=pl.FP32)
+        total_leaves = pl.cast(num_tokens, pl.INDEX) * leaf_count
+        with pl.spmd(32, name_hint="c1a_index_topk_leaf", deps=[scores_ready]) as leaf_tid:
+            worker = pl.tile.get_block_idx()
+            for work in pl.range(worker, total_leaves, 32):
                 token = work // leaf_count
                 leaf = work - token * leaf_count
                 logical_begin = leaf * _TOPK_LEAF_TILE
@@ -1564,10 +1583,9 @@ def select_index_topk(
                 if valid_count > 0:
                     output_slot = token * leaf_count + leaf
                     _sort_index_topk_leaf(index_scores, pair_arena, token, logical_begin, valid_count, output_slot)
-    with pl.spmd(32, name_hint="c1a_index_topk_merge", deps=[short_tid, leaf_tid]) as merge_tid:
-        worker = pl.tile.get_block_idx()
-        for token in pl.range(worker, num_tokens, 32):
-            if width > INDEX_TOPK:
+        with pl.spmd(32, name_hint="c1a_index_topk_merge", deps=[leaf_tid]) as merge_tid:
+            worker = pl.tile.get_block_idx()
+            for token in pl.range(worker, num_tokens, 32):
                 base = token * leaf_count
                 count = leaf_count
                 # INT32 logical positions require at most 21 binary merge levels.
@@ -1598,7 +1616,8 @@ def select_index_topk(
                     index_scores, block_table, request_ids, block_table, output,
                     token, width, cutoff, INDEX_TOPK - above, pool=False,
                 )
-    return merge_tid
+        topk_tid = pl.yield_(merge_tid)
+    return topk_tid
 
 
 @pl.jit.inline
@@ -2371,7 +2390,7 @@ def c1a_rotate_index_key(
     ready: pl.Scalar[pl.TASK_ID],
 ):
     blocks = num_tokens
-    workers = pl.min(blocks, 2147483647)
+    workers = pl.min(blocks, 32)
     with pl.spmd(workers, name_hint='c1a_index_key_rope', deps=[ready]) as rope_tid:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
