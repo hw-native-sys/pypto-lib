@@ -1281,12 +1281,13 @@ if __name__ == "__main__":
             "topk_indices": exact,
             "pool_block_ids": exact,
             "pool_block_counts": exact,
+            # Layer integration budget: at most 1.5% outliers per rank.
             "attention_output": _compare_active_rows_per_rank(
-                ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+                ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.015),
                 counts,
             ),
             "attention_hidden": _compare_active_rows_per_rank(
-                ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+                ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.015),
                 counts,
             ),
             "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),

@@ -76,7 +76,7 @@ def q_proj_qr(
     projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     mx_projection(
         x, wq_a, wq_a_scale, projected, num_tokens,
-        D, Q_LORA, "attention_q_a", "attention_q_a_quant", Q_A_N_TILE, Q_A_K_TILE, False, False, 1,
+        D, Q_LORA, "attention_q_a", "attention_q_a_quant", Q_A_N_TILE, Q_A_K_TILE, False, 1,
     )
     norm_blocks = (num_tokens + 7) // 8
     for norm_worker in pl.spmd(norm_blocks, name_hint="attention_q_norm"):
@@ -99,7 +99,7 @@ def q_proj_rope(
     expanded = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     mx_projection(
         query_latent, wq_b, wq_b_scale, expanded, num_tokens,
-        Q_LORA, LOCAL_H * HEAD_DIM, "attention_q_b", "attention_q_b_quant", N_TILE, K_TILE, False, False, 1,
+        Q_LORA, LOCAL_H * HEAD_DIM, "attention_q_b", "attention_q_b_quant", N_TILE, K_TILE, False, 1,
     )
     rope(expanded, rope_cos, rope_sin, query, num_tokens, LOCAL_H, "attention_q_rope", max_workers)
     return query
@@ -121,7 +121,7 @@ def kv_proj_rope(
     mx_projection(
         x, wkv, wkv_scale, projected,
         num_tokens,
-        D, HEAD_DIM, "attention_kv", "attention_kv_quant", N_TILE, K_TILE, False, False, 1,
+        D, HEAD_DIM, "attention_kv", "attention_kv_quant", N_TILE, K_TILE, False, 1,
     )
     normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8

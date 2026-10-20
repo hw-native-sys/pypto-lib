@@ -189,7 +189,7 @@ def grouped_output(
         mx_projection(
             x, weight, scale, output, num_tokens,
             O_GROUP_IN, O_LORA, "attention_grouped_o_a", "attention_grouped_o_a_quant",
-            O_A_N_TILE, K_TILE, False, True, LOCAL_O_GROUPS,
+            O_A_N_TILE, K_TILE, False, LOCAL_O_GROUPS,
         )
     else:
         _grouped_output_inline_quant(x, weight, scale, output, num_tokens, max_workers)
@@ -207,7 +207,7 @@ def _grouped_output_rope_to_mx(
     output_scale: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Apply inverse RoPE and grouped O-A with floor input and upward output MX quantization."""
+    """Apply inverse RoPE and grouped O-A with OCP input and output MX quantization."""
     weight_flat = pl.reshape(weight, [LOCAL_O_GROUPS * O_GROUP_IN, O_LORA])
     for group in pl.parallel(LOCAL_O_GROUPS):
         payload = pl.create_tensor([MX_M_TILE, O_GROUP_IN], dtype=pl.FP8E4M3FN)
@@ -300,7 +300,7 @@ def o_proj(
         )
         mx_projection_from_mx(
             latent_payload, latent_scale_backing, wo_b, wo_b_scale, output, num_tokens, 0, 0, 0,
-            LOCAL_O_WIDTH, D, "attention_o_b", 128, K_TILE, True, 1,
+            LOCAL_O_WIDTH, D, "attention_o_b", 128, K_TILE, True, 1, 0, 0, MX_M_TILE,
         )
     else:
         unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
@@ -313,7 +313,7 @@ def o_proj(
             mx_projection(
                 latent, wo_b, wo_b_scale, output, num_tokens,
                 LOCAL_O_WIDTH, D, "attention_o_b", "attention_o_b_quant", 128, K_TILE,
-                True, False, 1,
+                True, 1,
             )
         else:
             mxfp8_gemm(

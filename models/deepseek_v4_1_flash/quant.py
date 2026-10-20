@@ -42,59 +42,85 @@ FP4_E4M3_CODES = torch.tensor(
 
 
 @pl.jit.inline(auto_scope=False)
-def mx_quantize_activation(
+def _produce_mxfp8_activation(
     x: pl.Tensor,
-    payload: pl.Tensor,
-    scale_backing: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    t0: pl.Scalar[pl.INDEX],
-    input_n: pl.Scalar[pl.INDEX],
-    width: pl.constexpr,
-    quant_name: pl.constexpr,
-    floor_scale: pl.constexpr,
-    group_count: pl.constexpr,
+    weight: pl.Tensor,
+    scale: pl.Tensor,
+    t0: pl.Scalar[pl.INT32],
+    n0: pl.Scalar[pl.INT32],
+    input_col: pl.Scalar[pl.INT32],
+    rows: pl.Scalar[pl.INT32],
+    m_tile: pl.constexpr,
+    columns: pl.constexpr,
 ):
-    """Quantize one M16 activation row tile into MX payload and packed scales."""
-    quant_chunks = 1
-    if group_count > 1 and width % (2 * MX_K_TILE) == 0:
-        quant_chunks = 2
-    for block in pl.spmd(width // (MX_K_TILE * quant_chunks), name_hint=quant_name):
-        rows = pl.min(MX_M_TILE, num_tokens - t0)
-        for chunk in pl.unroll(2):
-            if chunk == 0 or (group_count > 1 and width % (2 * MX_K_TILE) == 0):
-                k0 = (chunk * (width // (MX_K_TILE * quant_chunks)) + block) * MX_K_TILE
-                source = pl.load(x, [t0, input_n + k0], [MX_M_TILE, MX_K_TILE], valid_shape=[rows, MX_K_TILE])
-                source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), MX_M_TILE, MX_K_TILE)
-                groups = pl.reshape(pl.cast(source, pl.FP32), [MX_M_TILE * (MX_K_TILE // 32), 32])
-                reduce_tmp = pl.create_tile([MX_M_TILE * (MX_K_TILE // 32), 32], dtype=pl.FP32)
-                if floor_scale:
-                    maximum_floor = pl.row_max(pl.abs(groups), tmp_tile=reduce_tmp)
-                    bits_floor = pl.reinterpret_view(maximum_floor, pl.INT32)
-                    exponent = pl.maximum(pl.sub(pl.shrs(bits_floor, 23), 8), 0)
-                    divisor_floor = pl.reinterpret_view(pl.shls(pl.maximum(exponent, 1), 23), pl.FP32)
-                    normalized_floor = pl.row_expand_div(groups, divisor_floor)
-                    floor_mask = pl.cast(pl.minimum(exponent, 1), pl.FP32)
-                    normalized_floor = pl.row_expand_mul(normalized_floor, floor_mask)
-                    normalized = pl.minimum(pl.maximum(normalized_floor, -448.0), 448.0)
-                else:
-                    maximum = pl.maximum(pl.row_max(pl.abs(groups), tmp_tile=reduce_tmp), 1e-4)
-                    bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
-                    exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                    group_scale = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                    normalized = pl.row_expand_div(groups, group_scale)
-                quantized = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
-                quantized_tile = pl.reshape(quantized, [MX_M_TILE, MX_K_TILE])
-                payload = pl.store(quantized_tile, [0, k0], payload)
-                signed = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
-                codes = pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
-                flat = pl.reshape(codes, [1, MX_M_TILE * (MX_K_TILE // 32)])
-                pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-                packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8)
-                packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
-                scale_offset = k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32)
-                packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
-                scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
-    return payload, scale_backing
+    """Load a BF16 activation tile for the shared OCP quantizer."""
+    return pl.load(x, [t0, n0], [m_tile, columns], valid_shape=[rows, columns])
+
+
+def make_mxfp8_producer_quantizer(produce_tile: Callable, scale_columns: int):
+    @pl.jit.inline(auto_scope=False)
+    def quantize(
+        x: pl.Tensor,
+        weight: pl.Tensor,
+        scale: pl.Tensor,
+        t0: pl.Scalar[pl.INT32],
+        n0: pl.Scalar[pl.INT32],
+        input_col: pl.Scalar[pl.INT32],
+        rows: pl.Scalar[pl.INT32],
+        m_tile: pl.constexpr,
+        columns: pl.constexpr,
+    ):
+        """Quantize finite BF16 tiles with OCP E4M3FN and packed E8M0 scales."""
+        source = produce_tile(x, weight, scale, t0, n0, input_col, rows, m_tile, columns)
+        source = pl.fillpad(source, pad_value=pl.PadValue.zero)
+        source = pl.set_validshape(source, m_tile, columns)
+        source_fp32 = pl.cast(source, pl.FP32)
+        groups = pl.reshape(source_fp32, [m_tile * (columns // 32), 32])
+        reduce_tmp = pl.create_tile([m_tile * (columns // 32), 32], dtype=pl.FP32)
+        magnitude = pl.abs(groups)
+        maximum = pl.row_max(magnitude, tmp_tile=reduce_tmp)
+        bits = pl.reinterpret_view(maximum, pl.INT32)
+        biased_exponent = pl.shrs(bits, 23)
+        scale_exponent = pl.sub(biased_exponent, 8)
+        exponent = pl.maximum(scale_exponent, 0)
+        # Scale code zero has a zero reciprocal.
+        negative_exponent = pl.mul(exponent, -1)
+        reciprocal_exponent = pl.add(negative_exponent, 254)
+        nonzero_exponent = pl.minimum(exponent, 1)
+        reciprocal_code = pl.mul(reciprocal_exponent, nonzero_exponent)
+        reciprocal_bits = pl.shls(reciprocal_code, 23)
+        reciprocal = pl.reinterpret_view(reciprocal_bits, pl.FP32)
+        normalized = pl.row_expand_mul(groups, reciprocal)
+        normalized = pl.maximum(normalized, -448.0)
+        normalized = pl.minimum(normalized, 448.0)
+        payload_fp8 = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
+        payload = pl.reshape(payload_fp8, [m_tile, columns])
+        sign_bit = pl.shrs(exponent, 7)
+        sign_offset = pl.mul(sign_bit, 256)
+        signed = pl.sub(exponent, sign_offset)
+        signed_codes = pl.cast(signed, pl.INT8)
+        codes = pl.reinterpret_view(signed_codes, pl.UINT8)
+        flat = pl.reshape(codes, [1, m_tile * (columns // 32)])
+        pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+        packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=m_tile, dst_cols=scale_columns)
+        packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
+        return payload, packed_scale
+    return quantize
+
+
+_quantize_mxfp8_loaded_activation = make_mxfp8_producer_quantizer(_produce_mxfp8_activation, MX_SCALE_TILE)
+
+
+@pl.jit.inline(auto_scope=False)
+def quantize_mxfp8_activation(
+    x: pl.Tensor,
+    t0: pl.Scalar[pl.INT32],
+    k0: pl.Scalar[pl.INT32],
+    rows: pl.Scalar[pl.INT32],
+    m_tile: pl.constexpr,
+):
+    """Quantize a loaded BF16 activation with the shared OCP implementation."""
+    return _quantize_mxfp8_loaded_activation(x, x, x, t0, k0, 0, rows, m_tile, MX_K_TILE)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -115,76 +141,48 @@ def mx_projection_from_mx(
     k_tile: pl.constexpr,
     fp32_output: pl.constexpr,
     group_count: pl.constexpr,
+    scale_row: pl.Scalar[pl.INDEX],
+    payload_row: pl.Scalar[pl.INDEX],
+    m_tile: pl.constexpr,
 ):
-    """Project one prequantized M16 row tile into BF16 or FP32 output."""
-    activation_scale = pl.tensor.view(activation_scale_backing, [MX_M_TILE, width // 32], layout=pl.MX_A_ZZ)
+    """Project one prequantized row tile into BF16 or FP32 output."""
+    scale_slice = activation_scale_backing[scale_row:scale_row + 1, :]
+    activation_scale = pl.tensor.view(scale_slice, [m_tile, width // 32], layout=pl.MX_A_ZZ)
     scale_group_size = (width // 32) * output_width
     scale_backing_flat = pl.tensor.view(weight_scale, [1, group_count * scale_group_size], layout=pl.ND)
     scale_group_offset = weight_row // 32 * output_width
-    scale_group_backing = pl.tensor.slice(scale_backing_flat, [1, scale_group_size], [0, scale_group_offset])
+    scale_group_end = scale_group_offset + scale_group_size
+    scale_group_backing = scale_backing_flat[0:1, scale_group_offset:scale_group_end]
     scale_group = pl.tensor.view(scale_group_backing, [width // 32, output_width], layout=pl.MX_B_NN)
-    workers = pl.min(output_width // n_tile, pl.system.available_cluster_count())
+    available_clusters = pl.system.available_cluster_count()
+    workers = pl.min(output_width // n_tile, available_clusters)
     for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
         block_num = pl.tile.get_block_num()
         for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
             block = wave * block_num + worker
             if block < output_width // n_tile:
                 n0 = block * n_tile
-                rows = pl.min(MX_M_TILE, num_tokens - t0)
-                a0 = pl.load(payload, [0, 0], [MX_M_TILE, k_tile])
-                sa0 = pl.load(activation_scale, [0, 0], [MX_M_TILE, k_tile // 32])
+                rows = pl.min(m_tile, num_tokens - t0)
+                a0 = pl.load(payload, [payload_row, 0], [m_tile, k_tile])
+                sa0 = pl.load(activation_scale, [0, 0], [m_tile, k_tile // 32])
                 b0 = pl.load(weight, [weight_row, n0], [k_tile, n_tile])
                 sb0 = pl.load(scale_group, [0, n0], [k_tile // 32, n_tile])
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
                 for k0 in pl.pipeline(k_tile, width, k_tile, stage=2):
-                    a = pl.load(payload, [0, k0], [MX_M_TILE, k_tile])
-                    sa = pl.load(activation_scale, [0, k0 // 32], [MX_M_TILE, k_tile // 32])
+                    a = pl.load(payload, [payload_row, k0], [m_tile, k_tile])
+                    sa = pl.load(activation_scale, [0, k0 // 32], [m_tile, k_tile // 32])
                     b = pl.load(weight, [weight_row + k0, n0], [k_tile, n_tile])
                     sb = pl.load(scale_group, [k0 // 32, n0], [k_tile // 32, n_tile])
                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                 output_n = output_col + n0
                 if fp32_output:
                     value_fp32 = pl.mul(acc, 1.0)
-                    output = pl.store(pl.set_validshape(value_fp32, rows, n_tile), [t0, output_n], output)
+                    valid_fp32 = pl.set_validshape(value_fp32, rows, n_tile)
+                    output = pl.store(valid_fp32, [t0, output_n], output)
                 else:
                     value = pl.cast(acc, pl.BF16, mode="rint")
-                    output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, output_n], output)
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def mx_projection(
-    x: pl.Tensor,
-    weight: pl.Tensor,
-    scale: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    width: pl.constexpr,
-    output_width: pl.constexpr,
-    name_hint: pl.constexpr,
-    quant_name: pl.constexpr,
-    n_tile: pl.constexpr,
-    k_tile: pl.constexpr,
-    fp32_output: pl.constexpr = False,
-    floor_scale: pl.constexpr = False,
-    group_count: pl.constexpr = 1,
-):
-    """Quantize activation tiles once, then run separate MX projection tasks."""
-    weight_flat = pl.reshape(weight, [group_count * width, output_width])
-    for group in pl.parallel(group_count):
-        for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
-            t0 = mt * MX_M_TILE
-            payload = pl.create_tensor([MX_M_TILE, width], dtype=pl.FP8E4M3FN)
-            scale_backing = pl.create_tensor([1, MX_M_TILE * (width // 32)], dtype=pl.FP8E8M0)
-            payload, scale_backing = mx_quantize_activation(
-                x, payload, scale_backing, num_tokens, t0, group * width,
-                width, quant_name, floor_scale, group_count,
-            )
-            mx_projection_from_mx(
-                payload, scale_backing, weight_flat, scale, output,
-                num_tokens, t0, group * width, group * output_width,
-                width, output_width, name_hint, n_tile, k_tile, fp32_output, group_count,
-            )
+                    valid_bf16 = pl.set_validshape(value, rows, n_tile)
+                    output = pl.store(valid_bf16, [t0, output_n], output)
     return output
 
 
@@ -232,21 +230,37 @@ def mx_projection_from_mx_to_mx(
                     b = pl.load(weight_flat, [(group * width) + k0, n0], [k_tile, n_tile])
                     sb = pl.load(scale_group, [k0 // 32, n0], [k_tile // 32, n_tile])
                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-                rounded = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile)
-                source = pl.set_validshape(pl.fillpad(rounded, pad_value=pl.PadValue.zero), MX_M_TILE, n_tile)
-                groups = pl.reshape(pl.cast(source, pl.FP32), [MX_M_TILE * (n_tile // 32), 32])
+                rounded_value = pl.cast(acc, pl.BF16, mode="rint")
+                rounded = pl.set_validshape(rounded_value, rows, n_tile)
+                source = pl.fillpad(rounded, pad_value=pl.PadValue.zero)
+                source = pl.set_validshape(source, MX_M_TILE, n_tile)
+                source_fp32 = pl.cast(source, pl.FP32)
+                groups = pl.reshape(source_fp32, [MX_M_TILE * (n_tile // 32), 32])
                 reduce_tmp = pl.create_tile([MX_M_TILE * (n_tile // 32), 32], dtype=pl.FP32)
-                maximum = pl.maximum(pl.row_max(pl.abs(groups), tmp_tile=reduce_tmp), 1e-4)
-                bits = pl.reinterpret_view(pl.mul(maximum, 1.0 / 448.0), pl.INT32)
-                exponent = pl.shrs(pl.add(bits, 8388607), 23)
-                output_divisor = pl.reinterpret_view(pl.shls(exponent, 23), pl.FP32)
-                normalized = pl.row_expand_div(groups, output_divisor)
-                quantized = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
-                quantized_tile = pl.reshape(quantized, [MX_M_TILE, n_tile])
+                magnitude = pl.abs(groups)
+                maximum = pl.row_max(magnitude, tmp_tile=reduce_tmp)
+                bits = pl.reinterpret_view(maximum, pl.INT32)
+                biased_exponent = pl.shrs(bits, 23)
+                scale_exponent = pl.sub(biased_exponent, 8)
+                exponent = pl.maximum(scale_exponent, 0)
+                negative_exponent = pl.mul(exponent, -1)
+                reciprocal_exponent = pl.add(negative_exponent, 254)
+                nonzero_exponent = pl.minimum(exponent, 1)
+                reciprocal_code = pl.mul(reciprocal_exponent, nonzero_exponent)
+                reciprocal_bits = pl.shls(reciprocal_code, 23)
+                reciprocal = pl.reinterpret_view(reciprocal_bits, pl.FP32)
+                normalized = pl.row_expand_mul(groups, reciprocal)
+                normalized = pl.maximum(normalized, -448.0)
+                normalized = pl.minimum(normalized, 448.0)
+                payload_fp8 = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
+                quantized_tile = pl.reshape(payload_fp8, [MX_M_TILE, n_tile])
                 output_n = group * output_width + n0
                 output = pl.store(quantized_tile, [0, output_n], output)
-                signed = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
-                codes = pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
+                sign_bit = pl.shrs(exponent, 7)
+                sign_offset = pl.mul(sign_bit, 256)
+                signed = pl.sub(exponent, sign_offset)
+                signed_codes = pl.cast(signed, pl.INT8)
+                codes = pl.reinterpret_view(signed_codes, pl.UINT8)
                 flat = pl.reshape(codes, [1, MX_M_TILE * (n_tile // 32)])
                 pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
                 packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=pack_cols)
@@ -255,6 +269,52 @@ def mx_projection_from_mx_to_mx(
                 scale_offset = output_n // 32 * MX_M_TILE
                 output_scale = pl.store(packed_flat, [0, scale_offset], output_scale)
     return output, output_scale
+
+
+@pl.jit.inline(auto_scope=False)
+def mx_projection(
+    x: pl.Tensor,
+    weight: pl.Tensor,
+    scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+    quant_name: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    fp32_output: pl.constexpr = False,
+    group_count: pl.constexpr = 1,
+):
+    """Quantize activation tiles once, then run separate MX projection tasks."""
+    weight_flat = pl.reshape(weight, [group_count * width, output_width])
+    for group in pl.parallel(group_count):
+        for mt in pl.parallel((num_tokens + MX_M_TILE - 1) // MX_M_TILE):
+            t0 = mt * MX_M_TILE
+            payload = pl.create_tensor([MX_M_TILE, width], dtype=pl.FP8E4M3FN)
+            scale_size = MX_M_TILE * (width // 32)
+            scale_backing = pl.create_tensor([1, scale_size], dtype=pl.FP8E8M0)
+            quant_chunks = 1
+            if group_count > 1 and width % (2 * MX_K_TILE) == 0:
+                quant_chunks = 2
+            for block in pl.spmd(width // (MX_K_TILE * quant_chunks), name_hint=quant_name):
+                rows = pl.min(MX_M_TILE, num_tokens - t0)
+                for chunk in pl.unroll(2):
+                    if chunk == 0 or (group_count > 1 and width % (2 * MX_K_TILE) == 0):
+                        k0 = (chunk * (width // (MX_K_TILE * quant_chunks)) + block) * MX_K_TILE
+                        input_k = group * width + k0
+                        quantized_tile, packed_scale = quantize_mxfp8_activation(x, t0, input_k, rows, MX_M_TILE)
+                        payload = pl.store(quantized_tile, [0, k0], payload)
+                        scale_offset = k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32)
+                        packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
+                        scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
+            output = mx_projection_from_mx(
+                payload, scale_backing, weight_flat, scale, output, num_tokens,
+                t0, group * width, group * output_width,
+                width, output_width, name_hint, n_tile, k_tile, fp32_output, group_count, 0, 0, MX_M_TILE,
+            )
+    return output
 
 
 
@@ -277,45 +337,13 @@ def mxfp8_gemm(
             t0 = mt * 32
             n0 = block * n_tile
             rows = pl.min(32, num_tokens - t0)
-            first = pl.load(x, [t0, 0], [32, MX_K_TILE], valid_shape=[rows, MX_K_TILE])
-            first = pl.set_validshape(pl.fillpad(first, pad_value=pl.PadValue.zero), 32, MX_K_TILE)
-            firstq_values = pl.reshape(pl.cast(first, pl.FP32), [32 * (MX_K_TILE // 32), 32])
-            firstq_reduce_tmp = pl.create_tile([32 * (MX_K_TILE // 32), 32], dtype=pl.FP32)
-            firstq_maximum = pl.maximum(pl.row_max(pl.abs(firstq_values), tmp_tile=firstq_reduce_tmp), 1e-4)
-            firstq_bits = pl.reinterpret_view(pl.mul(firstq_maximum, 1.0 / 448.0), pl.INT32)
-            firstq_exponent = pl.shrs(pl.add(firstq_bits, 8388607), 23)
-            firstq_scale = pl.reinterpret_view(pl.shls(firstq_exponent, 23), pl.FP32)
-            firstq_quantized = pl.cast(pl.row_expand_div(firstq_values, firstq_scale), pl.FP8E4M3FN, mode="rint")
-            firstq_payload = pl.reshape(firstq_quantized, [32, MX_K_TILE])
-            firstq_signed_exponent = pl.sub(firstq_exponent, pl.mul(pl.shrs(firstq_exponent, 7), 256))
-            firstq_codes = pl.reinterpret_view(pl.cast(firstq_signed_exponent, pl.INT8), pl.UINT8)
-            firstq_flat = pl.reshape(firstq_codes, [1, 32 * (MX_K_TILE // 32)])
-            firstq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-            firstq_packed = pl.tmov_x2zz(firstq_flat, firstq_tmp, group_axis=1, dst_rows=32, dst_cols=MX_SCALE_TILE)
-            a0 = firstq_payload
-            sa0 = pl.reinterpret_view(firstq_packed, pl.FP8E8M0)
+            a0, sa0 = quantize_mxfp8_activation(x, t0, 0, rows, 32)
             b0 = pl.load(weight, [0, n0], [MX_K_TILE, n_tile])
             sb0 = pl.load(scale, [0, n0], [MX_K_TILE // 32, n_tile])
             acc = pl.matmul_mx(a0, sa0, b0, sb0)
             for kb in pl.range(1, width // MX_K_TILE):
                 k0 = kb * MX_K_TILE
-                values = pl.load(x, [t0, k0], [32, MX_K_TILE], valid_shape=[rows, MX_K_TILE])
-                values = pl.set_validshape(pl.fillpad(values, pad_value=pl.PadValue.zero), 32, MX_K_TILE)
-                nextq_values = pl.reshape(pl.cast(values, pl.FP32), [32 * (MX_K_TILE // 32), 32])
-                nextq_reduce_tmp = pl.create_tile([32 * (MX_K_TILE // 32), 32], dtype=pl.FP32)
-                nextq_maximum = pl.maximum(pl.row_max(pl.abs(nextq_values), tmp_tile=nextq_reduce_tmp), 1e-4)
-                nextq_bits = pl.reinterpret_view(pl.mul(nextq_maximum, 1.0 / 448.0), pl.INT32)
-                nextq_exponent = pl.shrs(pl.add(nextq_bits, 8388607), 23)
-                nextq_scale = pl.reinterpret_view(pl.shls(nextq_exponent, 23), pl.FP32)
-                nextq_quantized = pl.cast(pl.row_expand_div(nextq_values, nextq_scale), pl.FP8E4M3FN, mode="rint")
-                nextq_payload = pl.reshape(nextq_quantized, [32, MX_K_TILE])
-                nextq_signed_exponent = pl.sub(nextq_exponent, pl.mul(pl.shrs(nextq_exponent, 7), 256))
-                nextq_codes = pl.reinterpret_view(pl.cast(nextq_signed_exponent, pl.INT8), pl.UINT8)
-                nextq_flat = pl.reshape(nextq_codes, [1, 32 * (MX_K_TILE // 32)])
-                nextq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-                nextq_packed = pl.tmov_x2zz(nextq_flat, nextq_tmp, group_axis=1, dst_rows=32, dst_cols=MX_SCALE_TILE)
-                a = nextq_payload
-                sa = pl.reinterpret_view(nextq_packed, pl.FP8E8M0)
+                a, sa = quantize_mxfp8_activation(x, t0, k0, rows, 32)
                 b = pl.load(weight, [k0, n0], [MX_K_TILE, n_tile])
                 sb = pl.load(scale, [k0 // 32, n0], [MX_K_TILE // 32, n_tile])
                 acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
@@ -621,7 +649,8 @@ def _quantize_mxfp8_activation(
         # npu_dynamic_mx_quant defaults to OCP: floor(log2(amax)) - 8.
         codes = _e8m0_codes_from_amax(amax)
         scale = decode_e8m0(codes)
-        normalized = torch.where(codes.unsqueeze(-1) > 0, grouped / scale.unsqueeze(-1), 0.0)
+        reciprocal = torch.where(codes > 0, torch.exp2(127.0 - codes.float()), 0.0)
+        normalized = grouped * reciprocal.unsqueeze(-1)
     elif scale_alg == 1:
         scale = torch.exp2(torch.ceil(torch.log2(amax.clamp_min(1e-4) / 448.0)))
         normalized = grouped / scale.unsqueeze(-1)
@@ -643,7 +672,7 @@ def mxfp8_linear(
         if output_dtype is not None:
             return torch.matmul(x.float(), weight.float()).to(output_dtype)
         return torch.matmul(x, weight)
-    activation, activation_scale = _quantize_mxfp8_activation(x)
+    activation, activation_scale = _quantize_mxfp8_activation(x, scale_alg=0)
     logical_scale = unpack_mx_b_scale(packed_weight_scale)
     weight_scale = decode_e8m0(logical_scale)
     weight_groups = weight.float().unflatten(0, (-1, MX_GROUP))
@@ -672,10 +701,9 @@ def golden_mxfp8_quantize(value):
 
 
 def golden_mxfp8_linear(x, weight, packed_scale, fp32=False):
-    """Match official FP8 GEMM's group-32 product, A scale, B scale, FP32 sum."""
-    payload, codes = golden_mxfp8_quantize(x)
-    activation, weights = payload.float(), weight.float()
-    scale_a = decode_e8m0(codes)
+    """Apply OCP activation quantization and sequential group-32 FP32 accumulation."""
+    payload, scale_a = _quantize_mxfp8_activation(x, scale_alg=0)
+    activation, weights = payload.flatten(-2).float(), weight.float()
     scale_b = decode_e8m0(unpack_mx_b_scale(packed_scale))
     result = torch.zeros(x.shape[0], weight.shape[1], dtype=torch.float32)
     for group in range(weight.shape[0] // MX_GROUP):
@@ -685,6 +713,7 @@ def golden_mxfp8_linear(x, weight, packed_scale, fp32=False):
         scaled = scaled * scale_b[group : group + 1]
         result = result + scaled
     return result if fp32 else result.bfloat16()
+
 
 def quantize_grouped_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize output-major grouped fixtures into [G, K, N] MXFP8 storage."""
@@ -714,11 +743,7 @@ def grouped_mxfp8_linear(
 FP8_E4M3_MAX = 448.0
 
 def _e8m0_codes_from_amax(amax: torch.Tensor, fp_max: float = FP8_E4M3_MAX) -> torch.Tensor:
-    """OCP shared-exponent scales used by random weight fixtures.
-
-    Grouped Wo-A uses this default OCP policy. The other projection references
-    retain the upward E8M0 policy in ``host_quant_mxfp8_v41``.
-    """
+    """Compute OCP shared-exponent codes for activations and random weight fixtures."""
     format_emax = int(math.floor(math.log2(fp_max)))
     _, exponent = torch.frexp(amax.float())
     codes = exponent.to(torch.int32) - 1 - format_emax + 127
