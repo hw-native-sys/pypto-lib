@@ -101,7 +101,6 @@ def _hc_post(
 
 
 hc_post = pl.jit.inline(_hc_post)
-hc_post_test = pl.jit(_hc_post)
 
 
 @pl.jit.inline
@@ -185,73 +184,3 @@ def golden_hc_post_prefill(tensors):
     golden_hc_post(tensors)
     num_tokens = int(tensors["num_tokens"])
     tensors["y"][num_tokens:] = 0
-
-
-def build_tensor_specs(B, S):
-    import torch
-    from golden import TensorSpec
-
-    T = B * S
-
-    def init_x():
-        return torch.randn(T, D) * 0.05
-    def init_residual():
-        return torch.randn(T, HC_MULT, D) * 0.05
-    def init_post():
-        return 2.0 * torch.sigmoid(torch.randn(T, HC_MULT))
-    def init_comb():
-        c = torch.rand(B, S, HC_MULT, HC_MULT) + 0.1
-        return (c / c.sum(dim=-1, keepdim=True)).reshape(T, HC_MULT * HC_MULT)
-    return [
-        TensorSpec("x",        [T, D],                    torch.bfloat16, init_value=init_x),
-        TensorSpec("residual", [T, HC_MULT, D],           torch.float32,  init_value=init_residual),
-        TensorSpec("post",     [T, HC_MULT],              torch.float32,  init_value=init_post),
-        TensorSpec("comb",     [T, HC_MULT * HC_MULT],    torch.float32,  init_value=init_comb),
-        TensorSpec("y",        [T, HC_MULT, D],           torch.float32),
-    ]
-
-
-if __name__ == "__main__":
-    import argparse
-    from golden import run
-
-    MODES = {
-        "decode":  (DECODE_BATCH // TP, DECODE_SEQ),
-        "prefill": (PREFILL_BATCH, PREFILL_SEQ),
-    }
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
-    parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="decode",
-                        help="Use decode or prefill batch sizes, or 'all' to test both.")
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    parser.add_argument("--compile-only", action="store_true", default=False)
-    parser.add_argument("--dump-passes", action="store_true", default=False)
-    args = parser.parse_args()
-
-    modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
-
-    for mode_name in modes_to_run:
-        B, S = MODES[mode_name]
-        print(f"--- hc_post {mode_name}: B={B}, S={S} ---")
-        result = run(
-            fn=hc_post_test,
-            specs=build_tensor_specs(B, S),
-            golden_fn=golden_hc_post,
-            config=dict(
-                dump_passes=args.dump_passes,
-                backend_type=args.backend_type,
-                execution_mode=args.execution_mode,
-                device_id=args.device,
-                enable_chip_swimlane=args.enable_chip_swimlane,
-            ),
-            rtol=1e-3,
-            atol=1e-3,
-            compile_only=args.compile_only,
-        )
-        if not result.passed:
-            if result.error:
-                print(result.error)
-            raise SystemExit(1)

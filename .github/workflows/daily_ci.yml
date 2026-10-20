@@ -149,139 +149,18 @@ jobs:
           # defaults.run.working-directory, so name the checkout dir explicitly.
           path: checkout/results.tsv
 
-  model-tests-a2a3:
+  model-tests-device:
+    name: Model tests (${{ matrix.platform }})
     if: ${{ !inputs.performance_only }}
-    # Runs directly on the host like pypto's dist-system-tests — multi-card
-    # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
-    # paths); under docker the chip child silent-crashes in comm_init. It holds
-    # NO card: every model run is wrapped in `task-submit --device "$DEVICE_ID"`
-    # (mechanism B), which borrows a card (or an N-card set for the multi-card
-    # `# ci: devices=N` files) from the host-level device queue and passes the
-    # lent set as $TASK_DEVICE. The backend controls whether DEVICE_ID is `auto`
-    # or a fixed card id. Checkout / install happen under ./checkout rather
-    # than at the workspace root, so the root holds only the sparsely-fetched
-    # action defs and any second repo a job needs sits beside this one.
-    runs-on: [self-hosted, linux, npu, a3]
-    # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
-    # --max-time 900 run), or the job dies before task-submit's own timeout can
-    # ever fire — and the first queued case would eat the whole job budget.
-    timeout-minutes: 120
-    defaults:
-      run:
-        working-directory: checkout
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_MAXSIZE: 30G
-      # Shared with the sim job via the same ci-cache dir; 000 keeps cache files
-      # mutually writable. Both jobs now run as ci-runner, but the dir still holds
-      # root-owned entries from the container era, so keep the umask.
-      # The cache *paths* are exported by setup-ci-job from the runner config's
-      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
-      CCACHE_UMASK: '000'
-
-    steps:
-      - name: Fetch composite action definitions
-        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./checkout — sparse-fetch just
-        # the action defs at the workspace root first (clean: false leaves sibling
-        # subdir checkouts on this persistent runner untouched).
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: checkout
-          needs-device: 'true'
-          build-namespace: a2a3-daily
-          pip-cache-name: pip-a2a3
-          toolchain: bundle
-
-      - name: Run model tests (a2a3, via task-submit)
-        id: sweep
-        shell: bash
-        env:
-          PYPTO_LOG_LEVEL: error
-          PYPTO_WARNING_LEVEL: none
-          # Quiet simpler's runtime logger — see the sim job for the full note.
-          # Without this a SIMPLER_PROFILING build floods the log with [STRACE]
-          # INFO_V9 markers on every dispatch (correctness runs included, not just
-          # benchmark's own fd-captured loop). benchmark() still reads timing.
-          PYPTO_RUNTIME_LOG: error
-          PYPTO_BENCH: '0'  # Correctness only; the dedicated performance job owns timing.
-        run: |
-          source activate.sh
-          set +e
-          : > results.tsv
-          failed=()
-          run_case() {
-            local file="$1" label="$2"; shift 2
-            echo "::group::${label}"
-            # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
-            # the top; borrow that many cards with `--device-num N` (defaults to
-            # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
-            # comma-separated for N>1) and is passed straight to -d. The child's
-            # stdout is captured and then printed with the case result.
-            local ndev devnum_flag out rc
-            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
-            ndev=${ndev:-1}
-            devnum_flag=""
-            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
-            out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYPTO_BENCH=0 PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a2a3 -d \$TASK_DEVICE $*" 2>&1 )
-            rc=$?
-            printf '%s\n' "$out"
-            if [ "$rc" -ne 0 ]; then
-              failed+=("$label")
-              echo "::error file=${file}::FAIL (${label})"
-              printf '%s\tfail\n' "$label" >> results.tsv
-            else
-              printf '%s\tpass\n' "$label" >> results.tsv
-            fi
-            echo "::endgroup::"
-          }
-          # Run every model file once at its default world size (ep2 / 2-card).
-          for f in $(python .github/scripts/detect_changes.py --all --root models --platform a2a3); do
-            run_case "$f" "$f"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            echo "Failed cases (${#failed[@]}):"
-            printf '  - %s\n' "${failed[@]}"
-            exit 1
-          fi
-          echo "All model tests passed."
-
-      - name: Kill orphaned task-submit tasks
-        if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
-        with:
-          checkout-path: checkout
-
-      - name: Clean up build artifacts
-        if: always()
-        working-directory: checkout
-        run: rm -rf build_output
-
-      - name: Upload results artifact
-        # Gated on the sweep having started — see the sim job's upload step
-        # for why a bare always() re-publishes a previous run's leftover
-        # results.tsv when the job dies in setup.
-        if: ${{ always() && steps.sweep.outcome != 'skipped' }}
-        uses: ./.github/actions/upload-results
-        with:
-          name: results-a2a3
-          path: checkout/results.tsv
-
-  model-tests-a5:
-    if: ${{ !inputs.performance_only }}
-    # All A5 model entries selected by the shared directory platform map.
-    runs-on: [self-hosted, linux, npu-a5]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: a2a3
+            runner: [self-hosted, linux, npu, a3]
+          - platform: a5
+            runner: [self-hosted, linux, npu-a5]
+    runs-on: ${{ matrix.runner }}
     # The cases run one after another, each bounded by task-submit's own
     # --timeout 3600 queue wait + --max-time 900 run, on top of the build.
     # Each entry declares its device count with a CI marker.
@@ -301,6 +180,7 @@ jobs:
 
     steps:
       - name: Point git at the runner's live proxy
+        if: ${{ matrix.platform == 'a5' }}
         # The A5 host's git carries a file-scope http(s).proxy that has gone
         # stale (a dead local forwarder — every nightly since 2026-08-07 died
         # in the checkout below with "Failed to connect to 127.0.0.1 port
@@ -346,20 +226,13 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'true'
-          build-namespace: a5-daily
-          pip-cache-name: pip-a5
+          build-namespace: ${{ matrix.platform }}-daily
+          pip-cache-name: pip-${{ matrix.platform }}
           toolchain: bundle
-          # The same stack as ci.yml's a5 job, which gates these entries.
-          # PyPTO follows the shared default (origin HEAD) like every other job
-          # here, so this sweep is also where an upstream break shows up first,
-          # attributable to a night rather than to whichever V4.1 pull request
-          # happens to run next. torch does not follow it: these entries need
-          # `float8_e8m0fnu`, the MXFP8 scale dtype added in 2.7, and a shim is
-          # not an option because pypto maps that IR dtype through its own table
-          # and the golden runner then compares the two for equality.
+          # A5 MXFP8 entries require float8_e8m0fnu from newer Torch.
           torch-version: 'torch==2.10.0'
 
-      - name: Run A5 model entries via task-submit
+      - name: Run model tests (${{ matrix.platform }}, via task-submit)
         id: sweep
         shell: bash
         env:
@@ -367,26 +240,30 @@ jobs:
           PYPTO_WARNING_LEVEL: none
           # Quiet simpler's runtime logger — see the sim job for the full note.
           PYPTO_RUNTIME_LOG: error
+          MODEL_PLATFORM: ${{ matrix.platform }}
           PYPTO_BENCH: '0'  # Correctness only; the dedicated performance job owns timing.
         run: |
           source activate.sh
-          FILES=$(python .github/scripts/detect_changes.py --all --root models --platform a5)
+          FILES=$(python .github/scripts/detect_changes.py --all --root models --platform "$MODEL_PLATFORM")
           : > results.tsv
           failed=()
           for f in $FILES; do
             echo "::group::$f"
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
             ndev=${ndev:-1}
-            devnum_flag=""
-            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev --ignore-whitelist"
-            if task-submit --device auto $devnum_flag --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a5 -d \$TASK_DEVICE"; then
+            device_flags=()
+            if [ "$ndev" -gt 1 ]; then
+              device_flags+=(--device-num "$ndev" --ignore-whitelist)
+            fi
+            if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 900 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYPTO_BENCH=0 PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $MODEL_PLATFORM -d \$TASK_DEVICE"; then
               status=pass
             else
               status=fail
               failed+=("$f")
               echo "::error file=${f}::FAIL"
             fi
+            echo "[model][$MODEL_PLATFORM] $f: $status"
             printf '%s\t%s\n' "$f" "$status" >> results.tsv
             echo "::endgroup::"
           done
@@ -416,10 +293,13 @@ jobs:
         if: ${{ always() && steps.sweep.outcome != 'skipped' }}
         uses: ./.github/actions/upload-results
         with:
-          name: results-a5
+          name: results-${{ matrix.platform }}
           path: checkout/results.tsv
 
   operator-performance:
+    needs: model-tests-device
+    # Run after both sweeps, including failures or performance-only skips.
+    if: ${{ !cancelled() }}
     name: Operator performance (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -427,10 +307,8 @@ jobs:
         include:
           - platform: a2a3
             runner: [self-hosted, linux, npu, a3]
-            torch-version: 'torch==2.6.0'
           - platform: a5
             runner: [self-hosted, linux, npu-a5]
-            torch-version: 'torch==2.10.0'
     runs-on: ${{ matrix.runner }}
     # Each platform runs its own serial task-submit cases.
     timeout-minutes: 300
@@ -463,7 +341,7 @@ jobs:
           build-namespace: operator-performance-${{ matrix.platform }}
           pip-cache-name: pip-operator-performance-${{ matrix.platform }}
           toolchain: bundle
-          torch-version: ${{ matrix.torch-version }}
+          torch-version: 'torch==2.10.0'
 
       - name: Run operator performance cases
         id: perf
@@ -508,11 +386,9 @@ jobs:
 
   summary:
     name: Aggregate results summary
-    # model-tests-a5 is a real dependency: it is the longest job (hours of
-    # serial device cases against the others' ~40 min), so without it here the
-    # summary is built before results-a5 exists and the A5 table is empty.
+    # Wait for all model and performance jobs to finish before summarizing.
     # `always()` keeps the summary running when any sweep fails.
-    needs: [model-tests-sim, model-tests-a2a3, model-tests-a5]
+    needs: [model-tests-sim, model-tests-device, operator-performance]
     if: ${{ always() && !inputs.performance_only }}
     runs-on: ubuntu-latest
     steps:

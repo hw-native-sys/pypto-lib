@@ -15,7 +15,7 @@ identical copies of the embedding row.
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_TOKENS, PREFILL_TOKENS
+from config import FLASH as M
 
 
 # Dynamic shape variables.
@@ -62,66 +62,3 @@ def _lookup_embedding(
 
 
 lookup_embedding = pl.jit.inline(_lookup_embedding)
-lookup_embedding_test = pl.jit(_lookup_embedding)
-
-
-def golden_lookup_embedding_test(tensors):
-    embed = tensors["embed_weight"].index_select(0, tensors["input_ids"].long())
-    tensors["hidden_states"][:] = embed
-    tensors["x_hc"][:] = embed.float().unsqueeze(1).repeat(1, HC_MULT, 1)
-
-
-def build_tensor_specs(token_count, vocab_size):
-    import torch
-    from golden import TensorSpec
-
-    def init_input_ids():
-        sample_ids = torch.tensor([0, 1, 17, vocab_size - 1, 17, 2, vocab_size // 2, 1], dtype=torch.int64)
-        repeats = (token_count + sample_ids.numel() - 1) // sample_ids.numel()
-        return sample_ids.repeat(repeats)[:token_count].contiguous()
-
-    def init_embed_weight():
-        return torch.randn(vocab_size, D, dtype=torch.bfloat16)
-
-    return [
-        TensorSpec("input_ids", [token_count], torch.int64, init_value=init_input_ids),
-        TensorSpec("embed_weight", [vocab_size, D], torch.bfloat16, init_value=init_embed_weight),
-        TensorSpec("hidden_states", [token_count, D], torch.bfloat16),
-        TensorSpec("x_hc", [token_count, HC_MULT, D], torch.float32),
-    ]
-
-
-if __name__ == "__main__":
-    import argparse
-    from golden import run
-
-    MODES = {"decode": DECODE_TOKENS, "prefill": PREFILL_TOKENS}
-    TEST_VOCAB_SIZE = 256
-
-    parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 Flash embedding lookup validation.")
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
-    parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all")
-    args = parser.parse_args()
-
-    modes_to_run = list(MODES) if args.mode == "all" else [args.mode]
-    for mode_name in modes_to_run:
-        token_count = MODES[mode_name]
-        print(f"--- lookup_embedding_test {mode_name}: T={token_count} ---")
-        result = run(
-            fn=lookup_embedding_test,
-            specs=build_tensor_specs(token_count, TEST_VOCAB_SIZE),
-            golden_fn=golden_lookup_embedding_test,
-            config=dict(
-                backend_type=args.backend_type,
-                execution_mode=args.execution_mode,
-                device_id=args.device,
-            ),
-            rtol=0.0,
-            atol=0.0,
-        )
-        if not result.passed:
-            if result.error:
-                print(result.error)
-            raise SystemExit(1)

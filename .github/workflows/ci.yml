@@ -55,7 +55,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sim_matrix: ${{ steps.check.outputs.sim_matrix }}
-      files: ${{ steps.check.outputs.files }}
+      a2a3_files: ${{ steps.check.outputs.a2a3_files }}
+      device_matrix: ${{ steps.check.outputs.device_matrix }}
       a2a3sim_files: ${{ steps.check.outputs.a2a3sim_files }}
       a5sim_files: ${{ steps.check.outputs.a5sim_files }}
       run_qwen_serving_tests: ${{ steps.check.outputs.run_qwen_serving_tests }}
@@ -104,6 +105,7 @@ jobs:
           # Device and simulator entries share platform ownership; simulator
           # selection additionally honors file-level exclusions such as no-sim.
           SIM_PLATFORMS=()
+          DEVICE_PLATFORMS=()
           for platform in a2a3 a2a3sim a5 a5sim; do
             # Main pushes run the full examples suite on A2/A3 and both
             # simulators; A5 device coverage stays in PR and daily CI.
@@ -114,18 +116,18 @@ jobs:
             else
               FILES=$(printf '%s\n' "$CHANGED_FILES" | python .github/scripts/detect_changes.py --platform "$platform")
             fi
-            if [ "$platform" = "a2a3" ]; then
-              echo "files=$FILES" >> "$GITHUB_OUTPUT"
-            else
-              echo "${platform}_files=$FILES" >> "$GITHUB_OUTPUT"
-            fi
+            echo "${platform}_files=$FILES" >> "$GITHUB_OUTPUT"
             if [[ "$platform" = *sim ]] && [ -n "$FILES" ]; then
               SIM_PLATFORMS+=("$platform")
+            elif [ -n "$FILES" ]; then
+              DEVICE_PLATFORMS+=("$platform")
             fi
             echo "Selected $platform files: $FILES"
           done
           SIM_MATRIX=$(python -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${SIM_PLATFORMS[@]}")
           echo "sim_matrix=$SIM_MATRIX" >> "$GITHUB_OUTPUT"
+          DEVICE_MATRIX=$(python -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${DEVICE_PLATFORMS[@]}")
+          echo "device_matrix=$DEVICE_MATRIX" >> "$GITHUB_OUTPUT"
 
           # Serving e2e jobs are model-specific and expensive. CI-infra edits
           # (.github/**) must not trigger them.
@@ -237,21 +239,15 @@ jobs:
         if: always()
         run: rm -rf build_output
 
-  a2a3:
+  device:
+    name: device (${{ matrix.platform }})
     needs: detect-changes
-    if: needs.detect-changes.outputs.files != ''
-    # Runs directly on the host like pypto's dist-system-tests — multi-card
-    # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
-    # paths); under docker the chip child silent-crashes in comm_init. It holds
-    # NO card: every device run is wrapped in `task-submit --device "$DEVICE_ID"`
-    # (mechanism B), which borrows a card (or an N-card set for the multi-card
-    # `# ci: devices=N` files) from the host-level device queue and passes the
-    # lent set as $TASK_DEVICE. The backend controls whether DEVICE_ID is `auto`
-    # (borrow any free card) or a fixed card id. Checkout / install happen under
-    # ./checkout rather than at the workspace root, so the root holds only the
-    # sparsely-fetched action defs and any second repo a job needs (serving's
-    # pypto-serving) sits beside this one instead of inside it.
-    runs-on: [self-hosted, linux, npu, a3]
+    if: needs.detect-changes.outputs.device_matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.detect-changes.outputs.device_matrix) }}
+    runs-on: ${{ fromJSON(matrix.platform == 'a5' && '["self-hosted", "linux", "npu-a5"]' || '["self-hosted", "linux", "npu", "a3"]') }}
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
     # --max-time 600 run), or the job dies before task-submit's own timeout can
     # ever fire — and the first queued case would eat the whole job budget.
@@ -289,39 +285,36 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'true'
-          build-namespace: a2a3
-          pip-cache-name: pip-a2a3
+          build-namespace: ${{ matrix.platform }}-ci
+          pip-cache-name: pip-${{ matrix.platform }}
           toolchain: bundle
+          torch-version: 'torch==2.10.0'
 
-      - name: Run a2a3 tests (via task-submit)
+      - name: Run ${{ matrix.platform }} tests (via task-submit)
         shell: bash
+        env:
+          CI_PLATFORM: ${{ matrix.platform }}
+          CI_ENTRIES: ${{ needs.detect-changes.outputs[format('{0}_files', matrix.platform)] }}
         run: |
           source activate.sh
-          set +e
-          FILES="${{ needs.detect-changes.outputs.files }}"
-          if [ -z "$FILES" ]; then
-            echo "No runnable changed files; nothing to test."
-            exit 0
-          fi
           failed=()
-          for f in $FILES; do
+          for f in $CI_ENTRIES; do
             echo "::group::$f"
-            # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
-            # the top; borrow that many cards with `--device-num N` (defaults to
-            # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
-            # comma-separated for N>1) and is passed straight to -d. Higher
-            # world sizes (ep4/ep8) are exercised as explicit --device-num 4/8
-            # steps in daily_ci.yml.
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
             ndev=${ndev:-1}
-            devnum_flag=""
-            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
-            task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 600 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a2a3 -d \$TASK_DEVICE"
-            if [ $? -ne 0 ]; then
+            device_flags=()
+            if [ "$ndev" -gt 1 ]; then
+              device_flags+=(--device-num "$ndev" --ignore-whitelist)
+            fi
+            if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 600 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE"; then
+              status=pass
+            else
+              status=fail
               failed+=("$f")
               echo "::error file=${f}::FAIL"
             fi
+            echo "[device][$CI_PLATFORM] $f: $status"
             echo "::endgroup::"
           done
           if [ ${#failed[@]} -ne 0 ]; then
@@ -330,95 +323,11 @@ jobs:
           fi
           echo "All selected files passed."
 
-      - name: Kill orphaned task-submit tasks
-        if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
-        with:
-          checkout-path: checkout
-
-      - name: Clean up build artifacts
-        if: always()
-        working-directory: checkout
-        run: rm -rf build_output
-
-  a5:
-    needs: detect-changes
-    # Directory-selected A5 coverage through standalone script entry points.
-    if: needs.detect-changes.outputs.a5_files != ''
-    runs-on: [self-hosted, linux, npu-a5]
-    # Standalone scripts run sequentially, with room for one task-submit
-    # worst case
-    # (--timeout 3600 queue wait + --max-time 900 run) on top.
-    timeout-minutes: 180
-    defaults:
-      run:
-        working-directory: checkout
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-
-    steps:
-      - name: Fetch composite action definitions
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: checkout
-          needs-device: 'true'
-          # Its own build tree: this can run while the nightly a5-daily job is
-          # building, and concurrent jobs must not share a build namespace.
-          build-namespace: a5-ci
-          pip-cache-name: pip-a5
-          toolchain: bundle
-          # PyPTO follows the shared default like every other job. torch does
-          # not: these entries need `float8_e8m0fnu`, the MXFP8 scale dtype,
-          # added in 2.7 — a shim is not an option because pypto maps that IR
-          # dtype through its own table and the golden runner then compares
-          # the two for equality.
-          torch-version: 'torch==2.10.0'
-
-      - name: Run A5 entries via task-submit
-        shell: bash
-        env:
-          PYPTO_LOG_LEVEL: error
-          PYPTO_WARNING_LEVEL: none
-          PYPTO_RUNTIME_LOG: error
-          A5_CI_ENTRIES: ${{ needs.detect-changes.outputs.a5_files }}
-        run: |
-          source activate.sh
-          FILES="$A5_CI_ENTRIES"
-          failed=()
-          for f in $FILES; do
-            echo "::group::$f"
-            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
-            ndev=${ndev:-1}
-            devnum_flag=""
-            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev --ignore-whitelist"
-            if task-submit --device auto $devnum_flag --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p a5 -d \$TASK_DEVICE"; then
-              status=pass
-            else
-              status=fail
-              failed+=("$f")
-              echo "::error file=${f}::FAIL"
-            fi
-            echo "::endgroup::"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            printf 'FAILED: %s\n' "${failed[@]}"
-            exit 1
-          fi
-
-      - name: Upload A5 failure diagnostics
+      - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: a5-failure-diagnostics
+          name: ${{ matrix.platform }}-failure-diagnostics
           retention-days: 7
           if-no-files-found: ignore
           path: |

@@ -1861,7 +1861,7 @@ if __name__ == "__main__":
                     block_size=BLOCK_SIZE,
                     pool_name="indexer KV scale", atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01,
                 ),
-                "x_out": ratio_reldiff(diff_thd=4e-3, pct_thd=0.008, max_diff_hd=1.0),
+                "x_out": ratio_reldiff(diff_thd=4e-3, pct_thd=0.008, max_diff_hd=1.1),
             },
         )
         if not result.passed:

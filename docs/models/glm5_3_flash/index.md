@@ -154,8 +154,8 @@ responsibility. Embedding contributions can use the existing `tp_all_reduce`
 on one FP32 stream; the caller replicates the reduced BF16 embeddings into the
 four identical mHC streams.
 
-Both files include bounded prefill/decode and boundary cases in their existing
-executable entries. LM-head validation defaults to TP2/EP2 on two devices and
+The LM-head executable includes bounded prefill/decode and boundary cases.
+Validation defaults to TP2/EP2 on two devices and
 also checks the TP reducer against its Torch golden. Three different input
 epochs reuse the same windows and notification counts; cases cover every winning
 peer, lowest-global-ID ties, all-absent rows, invalid local IDs and NaN/`-inf`
@@ -165,7 +165,6 @@ Use `--case tp_reduce` for the collective alone, or a local case such as
 `--case decode` with one device. `--compile-only` skips device execution:
 
 ```bash
-python models/glm5_3_flash/lookup_embedding.py -p a2a3 -d 0 --compile-only
 python models/glm5_3_flash/lm_head.py -p a2a3 -d 0,1 --compile-only
 ```
 
@@ -361,15 +360,15 @@ A file has **no script-entry guard until its golden is real**. The a2a3 daily CI
 selects a case purely by grepping for that guard, so adding one to a file whose
 golden still raises would put an unimplementable operator into the sweep. Today
 `config.py`, `golden.py`, `quantization.py`, `metadata.py`, `mhc.py`, `rmsnorm.py`
-and all five stream-B MLA files carry real references, and nine of them run as
-CI cases:
+and all five stream-B MLA files carry real references. RMSNorm and embedding
+lookup are library operators without standalone validation entry points. The
+remaining validation commands include:
 
 ```bash
 source .venv/bin/activate
 python models/glm5_3_flash/golden.py              # [GOLDEN] PASS norms / swiglu / moe_gate
 python models/glm5_3_flash/quantization.py        # [GOLDEN] PASS quantization
 python models/glm5_3_flash/mhc.py                 # [GOLDEN] PASS mhc
-python models/glm5_3_flash/rmsnorm.py             # [GOLDEN] PASS rmsnorm plain / quant / add
 python models/glm5_3_flash/mla_prolog.py          # [GOLDEN] PASS mla_prolog + prolog/absorb
 python models/glm5_3_flash/mla_cache.py           # [GOLDEN] PASS mla_cache + device scatter
 python models/glm5_3_flash/mla_epilog.py          # [GOLDEN] PASS mla_epilog + both paths
@@ -571,7 +570,7 @@ RoPE machinery, and add the KDA family and the kpool indexer.
 | `decode_layer.py`, `prefill_layer.py`, `utils.py` | Composed MoE FFN validation with generated weights by default and optional checkpoint weights/hidden inputs; full attention-plus-FFN forward composition remains separate |
 | `metadata.py` | Complete. Packed-batch lowering, the three distinct slot mappings (latent, per-token indexer state, pooled state), TP token ownership, and the indexer's pool and tail derivation |
 | `_golden_smoke.py` | Complete. Deterministic CPU fixtures behind every golden that exists |
-| `rmsnorm.py` | Plain BF16 RMSNorm, INT8-emitting per-token RMSNorm, and fused residual-add RMSNorm. Each has a colocated Torch golden and JIT validation entry; the CLI runs all three cases. Passes `a2a3sim` and a2a3 |
+| `rmsnorm.py` | Plain BF16 RMSNorm, INT8-emitting per-token RMSNorm, and fused residual-add RMSNorm. Each has a colocated Torch golden; validation is exercised through consuming operators rather than a standalone CLI |
 | `mla_prolog.py` | Goldens, the prolog body (three `b_trans` matmuls and two rms-norm scopes, no split-K yet), the per-token `absorb_query` body, and a device test entry per case. `absorb_output` is weight-time and belongs to the loader. Passes `a2a3sim` and a2a3 |
 | `mla_cache.py` | Golden, kernel body (`pl.spmd` scatter, one block per row), device test entry and specs. Passes `a2a3sim` and a2a3 |
 | `mla_epilog.py` | Goldens, both kernel bodies (row-parallel `b_trans` projection over D, FP32 partial sum for the TP16 all-reduce) and a device test entry per path. Passes `a2a3sim` and a2a3 |

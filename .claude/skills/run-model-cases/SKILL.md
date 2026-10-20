@@ -30,7 +30,9 @@ substituting a local full-suite run.
 ## Before running anything
 
 Entry-point names, flags, and platform support change with the tree. Confirm
-against the file, not against memory or this table:
+against the file, not against memory or this table. Confirm that the file has
+an executable entry point before invoking it; library operators without one
+are validated through their consuming component or layer entries.
 
 ```bash
 PYTHONPATH="$PWD" python models/<family>/<entry>.py --help
@@ -86,10 +88,15 @@ rank count that the MoE module parses at import. The layer and forward cases
 carry `# ci: devices=2`; their per-file CI coverage is the default two-rank
 case only, so a larger `--ep` is an experiment rather than a covered path.
 
-Component entry points such as `decode_csa.py` and `rmsnorm.py` take a single
+Component entry points such as `decode_csa.py` and `decode_hca.py` take a single
 card. Their CLIs also accept a simulator, but a simulator run can fail in the
 runtime stage on workspace provisioning while the same case validates on a
 device — prefer the device form when a card is available.
+
+`rmsnorm.py`, `lookup_embedding.py`, and `hc_post.py` in the MTP and DSpark
+trees are library operators without standalone test harnesses. Use their
+consuming attention, MoE, or forward entries for validation. GLM RMSNorm and
+embedding lookup follow the same library-only convention.
 
 ## Escalating within a tree
 
