@@ -12,7 +12,7 @@ import pypto.language as pl
 import torch
 
 from config import FLASH as M, T_DYN, TP_SIZE
-from quant import golden_mxfp8_linear, mxfp8_gemm, mxfp8_linear
+from quant import golden_mxfp8_linear, mxfp8_linear
 from rmsnorm import golden_rms_norm, rms_norm
 
 
@@ -27,6 +27,8 @@ Q_LORA = M.q_lora_rank
 M_TILE = 16
 N_TILE = 128
 K_TILE = 256
+Q_A_N_TILE = 128
+Q_A_K_TILE = 256
 
 
 @pl.jit.inline
@@ -142,10 +144,9 @@ def q_proj_qr(
 ):
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    mxfp8_gemm(
+    _mx_projection(
         x, wq_a, wq_a_scale, projected, num_tokens,
-        width=D, output_width=Q_LORA, fp32_output=False,
-        n_tile=128, name_hint="attention_q_a",
+        D, Q_LORA, "attention_q_a", "attention_q_a_quant", Q_A_N_TILE, Q_A_K_TILE,
     )
     norm_blocks = (num_tokens + 7) // 8
     for norm_worker in pl.spmd(norm_blocks, name_hint="attention_q_norm"):
