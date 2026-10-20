@@ -28,7 +28,7 @@ from config import (
 )
 
 
-from quant import mxfp8_gemm
+from quant import make_mxfp8_producer_quantizer, quantize_mxfp8_activation
 
 
 # model config
@@ -277,6 +277,78 @@ def _grouped_output_rope_to_mx(
 
 
 @pl.jit.inline(auto_scope=False)
+def _grouped_output_bf16_tile(
+    x: pl.Tensor,
+    weight: pl.Tensor,
+    scale: pl.Tensor,
+    t0: pl.Scalar[pl.INT32],
+    n0: pl.Scalar[pl.INT32],
+    input_col: pl.Scalar[pl.INT32],
+    rows: pl.Scalar[pl.INT32],
+    m_tile: pl.constexpr,
+    columns: pl.constexpr,
+):
+    """Compute one Wo-A tile and preserve its BF16 rounding boundary."""
+    scale_mx = pl.tensor.view(scale, [O_GROUP_IN // 32, O_LORA], layout=pl.MX_B_NN)
+    a, sa = quantize_mxfp8_activation(x, t0, input_col, rows, M_TILE)
+    b = pl.load(weight, [0, n0], [K_TILE, N_TILE])
+    sb = pl.load(scale_mx, [0, n0], [K_TILE // 32, N_TILE])
+    acc = pl.matmul_mx(a, sa, b, sb)
+
+    for kb in pl.range(1, O_GROUP_IN // K_TILE):
+        k0 = kb * K_TILE
+        a, sa = quantize_mxfp8_activation(x, t0, input_col + k0, rows, M_TILE)
+        b = pl.load(weight, [k0, n0], [K_TILE, N_TILE])
+        sb = pl.load(scale_mx, [k0 // 32, n0], [K_TILE // 32, N_TILE])
+        acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+
+    acc_vector = pl.mul(acc, 1.0)
+    value = pl.cast(acc_vector, pl.BF16, mode="rint")
+    return pl.set_validshape(value, pl.cast(rows, pl.INDEX), N_TILE)
+
+
+_quantized_grouped_output = make_mxfp8_producer_quantizer(_grouped_output_bf16_tile, N_TILE // 32)
+
+
+@pl.jit.inline(auto_scope=False)
+def grouped_output_quantized(
+    x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    payload: pl.Tensor,
+    scale_backing: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    max_workers: pl.constexpr = GROUPED_WORKER_TILE,
+):
+    """Produce Wo-B FP8 payload and scales in the Wo-A MIX epilogue."""
+    group_blocks = (num_tokens + M_TILE - 1) // M_TILE
+    group_workers = pl.max(pl.min(group_blocks, max_workers), 1)
+    for group in pl.parallel(LOCAL_O_GROUPS):
+        weight_window = pl.slice(weight, [1, O_GROUP_IN, O_LORA], [group, 0, 0])
+        weight_group = pl.reshape(weight_window, [O_GROUP_IN, O_LORA])
+        scale_window = pl.slice(scale, [1, O_GROUP_IN // 32, O_LORA], [group, 0, 0])
+        scale_group = pl.reshape(scale_window, [O_GROUP_IN // 32, O_LORA])
+        for nb in pl.parallel(O_LORA // N_TILE):
+            local_n = nb * N_TILE
+            with pl.spmd(group_workers, name_hint="attention_grouped_o_a_cube"):
+                worker = pl.tile.get_block_idx()
+                for block in pl.range(worker, group_blocks, max_workers):
+                    t0 = block * M_TILE
+                    output_n = group * O_LORA + local_n
+                    rows = pl.min(M_TILE, num_tokens - t0)
+                    quantized, packed_scale = _quantized_grouped_output(
+                        x, weight_group, scale_group, t0, local_n, group * O_GROUP_IN, rows, M_TILE, N_TILE,
+                    )
+                    payload = pl.store(quantized, [t0, output_n], payload)
+                    packed_halves = pl.reshape(packed_scale, [M_TILE // 16, 16 * (N_TILE // 32)])
+                    for half in pl.range(M_TILE // 16):
+                        half_scale = pl.slice(packed_halves, [1, 16 * (N_TILE // 32)], [half, 0])
+                        offset = half * (LOCAL_O_WIDTH // 32) * 16 + (output_n // N_TILE) * 16 * (N_TILE // 32)
+                        scale_backing = pl.store(half_scale, [block, offset], scale_backing)
+    return payload, scale_backing
+
+
+@pl.jit.inline(auto_scope=False)
 def o_proj(
     attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
@@ -305,22 +377,29 @@ def o_proj(
     else:
         unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         _rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens, 64, "attention_o_rope")
-        latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
-        grouped_output(
-            unrotated, wo_a, wo_a_scale, latent, num_tokens, max_workers=grouped_max_workers,
-        )
         if TP_SIZE == 1 and num_tokens <= 16:
+            latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
+            grouped_output(
+                unrotated, wo_a, wo_a_scale, latent, num_tokens, max_workers=grouped_max_workers,
+            )
             mx_projection(
                 latent, wo_b, wo_b_scale, output, num_tokens,
                 LOCAL_O_WIDTH, D, "attention_o_b", "attention_o_b_quant", 128, K_TILE,
                 True, 1,
             )
         else:
-            mxfp8_gemm(
-                latent, wo_b, wo_b_scale, output, num_tokens,
-                width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
-                n_tile=128, name_hint="attention_o_b",
+            tile_rows = (tokens + M_TILE - 1) // M_TILE
+            payload = pl.create_tensor([tile_rows * M_TILE, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
+            scale_backing = pl.create_tensor([tile_rows, M_TILE * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
+            payload, scale_backing = grouped_output_quantized(
+                unrotated, wo_a, wo_a_scale, payload, scale_backing, num_tokens, max_workers=grouped_max_workers,
             )
+            for mt in pl.parallel((num_tokens + M_TILE - 1) // M_TILE):
+                t0 = mt * M_TILE
+                output = mx_projection_from_mx(
+                    payload, scale_backing, wo_b, wo_b_scale, output, num_tokens,
+                    t0, 0, 0, LOCAL_O_WIDTH, D, "attention_o_b", N_TILE, K_TILE, True, 1, mt, t0, M_TILE,
+                )
     return output
 
 
