@@ -34,7 +34,7 @@ Four things decide whether this is correct rather than merely plausible:
 * **The state's stored layout is ``[V, K]``** (``state_v_first`` in the AscendC ABI)
   while the recurrence is natural in ``[K, V]``. Both axes are 128, so a transposed
   state passes every shape check and shows up only as wrong output from the second
-  chunk onward. The transposes happen here, at seed and at flush.
+  chunk onward. The scan keeps ``[V, K]`` storage and uses matmul transpose flags.
 * ``decay`` carries the **log** decay. This kernel exponentiates it; the projection
   that produced it does not.
 
@@ -44,16 +44,11 @@ second is the sequential scan and touches only matmuls against the state. Splitt
 them keeps the live set inside UB — a single fused body would need q, k, the
 cumulative sum, both decay factors, the Gram matrix and its inverse simultaneously.
 
-``CHUNK`` is 64, the value both the reference and vLLM-Ascend's ``KDA_CHUNK_SIZE``
-use. The Ascend-tuned pypto implementation in cann-recipes-infer uses 128, but it
-targets a frontend that spills tiles automatically; here every intermediate is
-explicit, and 128 does not fit.
-
-The triangular inverse is a plain forward substitution, one row per step, staged in
-GM. That is the straightforward correct form, not the fast one — the tuned reference
-inverts eight stacked 16x16 leaves and merges them, which needs tile shapes that grow
-with the loop index and so cannot be written in this frontend. It is the first thing
-to revisit when this kernel is profiled.
+``CHUNK`` is 16. The triangular inverse uses four FP32 finite-series doubling
+steps. Matrix operands in the W/U recomputation and state scan round to BF16;
+the carried state remains FP32. ``golden_prefill_kda_mixed_precision`` follows
+these boundaries for kernel validation. ``golden_prefill_kda_fp32`` is the
+independent per-token mathematical reference for precision diagnostics.
 """
 
 import sys
@@ -94,7 +89,7 @@ Q_SCALE = KDA_DIM ** -0.5
 V_TILE = 64  # value columns per scan task: the carried state slice is [128, 64] FP32
 
 
-def golden_prefill_kda(
+def golden_prefill_kda_fp32(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -104,11 +99,16 @@ def golden_prefill_kda(
     query_start_loc: torch.Tensor,
     state_rows: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns ``(output, recurrent_state)``; the state is returned updated.
+    """FP32 mathematical reference for independent precision diagnostics.
 
-    ``recurrent_state`` is ``[rows, LOCAL_KDA_H, V, K]``. The reference runs the plain
-    per-token recurrence rather than the chunked form: it is the definition the
-    chunked kernel has to reproduce, and it cannot share a bug with it.
+    Algorithm: evaluate the delta-rule recurrence one token at a time.
+    Precision: normalize Q/K, apply decay, update state and reduce outputs in FP32.
+    Intermediate values retain FP32 precision throughout the recurrence.
+    Returns: activations in ``query.dtype`` (BF16 for the kernel ABI) and the
+    updated state in its original dtype (FP32), with ``[rows, H, V, K]`` layout.
+
+    Use this reference to measure the mixed-precision approximation error.
+    The default kernel comparison uses ``golden_prefill_kda_mixed_precision``.
     """
     tokens = query.shape[0]
     state = recurrent_state.clone().float()
@@ -132,6 +132,83 @@ def golden_prefill_kda(
                 sh = sh + delta.unsqueeze(-1) * k.unsqueeze(0)
                 out[t, h] = (sh * q.unsqueeze(0)).sum(dim=-1)
             state[row, h] = sh
+    return out.to(query.dtype), state.to(recurrent_state.dtype)
+
+
+def golden_prefill_kda_mixed_precision(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    decay: torch.Tensor,
+    beta: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    state_rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mixed-precision implementation reference for default PTO3 validation.
+
+    Algorithm: process each request in ``CHUNK``-token blocks with zero-padded tails.
+    Precision: compute normalization, decay, Gram matrices and the inverse in FP32;
+    round the kernel's intermediate GEMM operands to BF16 and accumulate in FP32.
+    The carried state remains FP32, with a BF16 view used by the chunk scan GEMMs.
+    Returns: BF16 activations and the updated FP32 ``[rows, H, V, K]`` state.
+
+    The ``_golden_tensors`` adapter selects this reference for kernel comparisons.
+    Use ``golden_prefill_kda_fp32`` separately for mathematical precision diagnostics.
+    """
+    state = recurrent_state.clone().float()
+    out = torch.zeros_like(query, dtype=torch.float32)
+    heads = query.shape[1]
+    eye = torch.eye(CHUNK, dtype=torch.float32, device=query.device)
+    tri = torch.tril(torch.ones_like(eye))
+    strict = torch.tril(tri, diagonal=-1)
+    for request in range(query_start_loc.numel() - 1):
+        begin = int(query_start_loc[request])
+        end = int(query_start_loc[request + 1])
+        row = int(state_rows[request])
+        carried = state[row]
+        for start in range(begin, end, CHUNK):
+            stop = min(start + CHUNK, end)
+            count = stop - start
+            padding = (0, 0, 0, CHUNK - count)
+            q = torch.nn.functional.pad(query[start:stop].float().transpose(0, 1), padding)
+            k = torch.nn.functional.pad(key[start:stop].float().transpose(0, 1), padding)
+            v = torch.nn.functional.pad(value[start:stop].float().transpose(0, 1), padding)
+            g = torch.nn.functional.pad(decay[start:stop].float().transpose(0, 1), padding)
+            b = beta[start:stop, :heads].float().T.unsqueeze(-1)
+            b = torch.nn.functional.pad(b, padding)
+            q = q * torch.rsqrt(q.square().sum(dim=-1, keepdim=True) + L2_EPS) * Q_SCALE
+            k = k * torch.rsqrt(k.square().sum(dim=-1, keepdim=True) + L2_EPS)
+            cumulative = tri @ g
+            exp_decay = cumulative.exp()
+            pivot = cumulative[:, :1]
+            row_decay = (cumulative - pivot).exp()
+            key_columns = k * (pivot - cumulative).clamp(max=DECAY_CAP).exp()
+            gram = ((k * row_decay) @ key_columns.transpose(-1, -2)) * b * strict
+            a2 = (((q * row_decay) @ key_columns.transpose(-1, -2)) * tri).bfloat16().float()
+            qg = (q * exp_decay).bfloat16().float()
+            kdec = (k * (cumulative[:, -1:] - cumulative).exp()).bfloat16().float()
+            kg = (k * exp_decay).bfloat16().float()
+
+            # Four FP32 doubling steps produce (I + gram)^-1 for CHUNK=16.
+            inverse_step = eye - gram
+            inverse = eye.expand(heads, -1, -1)
+            for _ in range(4):
+                inverse = inverse_step @ inverse
+                inverse_step = inverse_step @ (inverse_step - 2 * eye) + 2 * eye
+            inverse_bf16 = inverse.bfloat16().float()
+            beta_kg = (kg * b).bfloat16().float()
+            w = (inverse_bf16 @ beta_kg).bfloat16().float()
+            beta_v = (v * b).bfloat16().float()
+            u = inverse_bf16 @ beta_v
+
+            # BF16 operands feed the scan; the persistent state update stays FP32.
+            carried_bf16 = carried.bfloat16().float()
+            vi = (u - w @ carried_bf16.transpose(-1, -2)).bfloat16().float()
+            result = qg @ carried_bf16.transpose(-1, -2) + a2 @ vi
+            out[start:stop] = result[:, :count].transpose(0, 1)
+            carried = carried * cumulative[:, -1:].exp() + vi.transpose(-1, -2) @ kdec
+        state[row] = carried
     return out.to(query.dtype), state.to(recurrent_state.dtype)
 
 
@@ -562,7 +639,8 @@ def prefill_kda(
 __all__ = [
     "CHUNK",
     "DECAY_CAP",
-    "golden_prefill_kda",
+    "golden_prefill_kda_fp32",
+    "golden_prefill_kda_mixed_precision",
     "prefill_kda",
 ]
 
@@ -590,7 +668,7 @@ def prefill_kda_test(
 
 
 def _golden_tensors(tensors) -> None:
-    out, state = golden_prefill_kda(
+    out, state = golden_prefill_kda_mixed_precision(
         tensors["query"], tensors["key"], tensors["value"], tensors["decay"],
         tensors["beta"], tensors["recurrent_state"], tensors["query_start_loc"],
         tensors["state_rows"])
@@ -600,7 +678,7 @@ def _golden_tensors(tensors) -> None:
 
 _POOL_ROWS = 6
 # One request spans several chunks with a ragged tail, one is shorter than a chunk,
-# one is exactly one chunk. A single-chunk zero-state fixture passes with the state
+# and one spans four complete chunks. A single-chunk zero-state fixture passes with the state
 # transposed and with the carry dropped, so the multi-chunk case is the real test.
 # ``ragged`` is the default because it is the case that discriminates: three requests,
 # mixed lengths, and a partial chunk after several full ones -- which is the only shape

@@ -59,7 +59,7 @@ if __name__ == "__main__" and not any(tok == "--ep" or tok.startswith("--ep=") f
     sys.argv += ["--ep", "2"]
 
 from models.glm5_3_flash.config import D, EP_SIZE, FLASH, N_LOCAL_EXPERTS, TOPK
-from models.glm5_3_flash.expert_routed import expert_routed
+from models.glm5_3_flash.expert_routed import RECV_TILE as EXPERT_RECV_TILE, expert_routed
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -686,6 +686,20 @@ def build_tensor_specs(num_tokens=T):
     ]
 
 
+def prefill_ring_heap(*, additional_bytes=0):
+    """Size ring zero for routed scratch plus the enclosing entry's allocations."""
+    expert_rows = ((GROUPED_CAP + EXPERT_RECV_TILE - 1) // EXPERT_RECV_TILE) * EXPERT_RECV_TILE
+    routed_bytes = GROUPED_CAP * (5 * D + 16)
+    expert_bytes = expert_rows * (13 * MOE_INTER + 4 * D + 4)
+    send_bytes = ROUTES_PER_SRC * (D + 4 * AUX_PAD + 4)
+    # Reserve count buffers and allocation alignment separately from caller scratch.
+    required_bytes = routed_bytes + expert_bytes + send_bytes + additional_bytes + 16 * 1024 * 1024
+    if required_bytes <= 256 * 1024 * 1024:
+        return None
+    ring_bytes = 1 << (required_bytes - 1).bit_length()
+    return (ring_bytes, 0, 0, 0)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -720,6 +734,7 @@ if __name__ == "__main__":
             execution_mode=args.execution_mode,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
             enable_chip_swimlane=args.enable_chip_swimlane,
+            ring_heap=prefill_ring_heap(),
         ),
         rtol=1e-3,
         atol=1e-3,
@@ -741,4 +756,5 @@ __all__ = [
     "l3_prefill_moe",
     "prefill_moe_dispatch",
     "prefill_moe_return",
+    "prefill_ring_heap",
 ]

@@ -335,11 +335,11 @@ def moe_gate_test(
 
 
 def golden_moe_gate(tensors):
-    """Fill outputs in-place from the CPU router reference.
+    """Mirror the router's separate normalized and quantized input paths.
 
-    route_weights/route_indices come from the sigmoid top-k over the biased
-    scores; x_int8/x_scale are the per-token INT8 view of the normalized xg,
-    exactly what the shared expert and the EP dispatch payload consume.
+    Routing consumes BF16-rounded RMSNorm output. The INT8 branch quantizes
+    FP32 ``x * gamma`` and folds the inverse RMS into its dequantization scale,
+    matching the view consumed by shared experts and the EP dispatch payload.
     """
     from models.glm5_3_flash.quantization import quantize_per_token_int8
 
@@ -348,7 +348,11 @@ def golden_moe_gate(tensors):
     x = tensors["x"]
     x_norm = rms_norm(x, tensors["norm_weight"])
     weights, indices = gate(x_norm, tensors["gate_weight"], tensors["correction_bias"])
-    x_int8, x_scale = quantize_per_token_int8(x_norm)
+    x_f = x.float()
+    xg = x_f * tensors["norm_weight"].float()
+    inverse_rms = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + NORM_EPS)
+    x_int8, dequant_scale = quantize_per_token_int8(xg)
+    x_scale = dequant_scale * inverse_rms
 
     tensors["route_weights"][:] = weights
     tensors["route_indices"][:] = indices

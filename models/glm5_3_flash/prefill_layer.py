@@ -55,8 +55,8 @@ from models.glm5_3_flash.config import (
 )
 from models.glm5_3_flash.decode_moe import gen_routed_weight
 from models.glm5_3_flash.expert_routed import expert_routed
-from models.glm5_3_flash.expert_shared import expert_shared
-from models.glm5_3_flash.gate import make_correction_bias, moe_gate
+from models.glm5_3_flash.expert_shared import SH_M_TILE, SH_ROW_PAD, expert_shared
+from models.glm5_3_flash.gate import GATE_M_TILE, SCORE_PAD, TOPK_PAD, make_correction_bias, moe_gate
 from models.glm5_3_flash.prefill_moe import (
     AUX_PAD,
     COUNT_PAD,
@@ -69,6 +69,7 @@ from models.glm5_3_flash.prefill_moe import (
     golden_prefill_moe,
     prefill_moe_dispatch,
     prefill_moe_return,
+    prefill_ring_heap,
 )
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
 
@@ -405,6 +406,19 @@ def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, laye
     ]
 
 
+def prefill_layer_ring_heap():
+    """Budget routed scratch, Gate buffers, shared tiles and FFN intermediates."""
+    gate_rows = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
+    # FP32 x*gamma, BF16 routing inputs, scale, scores, logits and sort buffers.
+    gate_bytes = gate_rows * (6 * D + 4 + 12 * SCORE_PAD + 4 * N_EXPERTS + 8 * TOPK_PAD)
+    shared_rows = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
+    # Gate/up INT32, FP32/INT8 activations, padded scales and down INT32 outputs.
+    shared_bytes = shared_rows * (13 * MOE_INTER + 4 * SH_ROW_PAD + 4 * D)
+    # Routed/shared FP32 outputs, router results and the reused INT8 activation view.
+    layer_bytes = T * (9 * D + 8 * TOPK + 4)
+    return prefill_ring_heap(additional_bytes=gate_bytes + shared_bytes + layer_bytes)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -450,6 +464,7 @@ if __name__ == "__main__":
             execution_mode=args.execution_mode,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
             enable_chip_swimlane=args.enable_chip_swimlane,
+            ring_heap=prefill_layer_ring_heap(),
         ),
         rtol=1e-3,
         atol=1e-3,

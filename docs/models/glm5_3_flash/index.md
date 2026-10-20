@@ -114,6 +114,61 @@ Callers that hold a replicated attention stream must assign each token to one
 MoE source rank before dispatch and restore their required output layout after
 MoE. Those token-layout operations belong to the surrounding composition.
 
+Prefill callers must also size the runtime heap for the receive capacity and
+padded expert tiles. `prefill_moe.py` uses `prefill_ring_heap()` for routed
+scratch. `prefill_layer.py` adds the capacity-sized Gate buffers, padded shared
+expert buffers and FFN intermediates through `prefill_layer_ring_heap()`.
+Both helpers retain a 16 MiB allocation reserve and round larger requirements
+up to a power of two. At 64 rows per rank both entries keep the 256 MiB default
+for EP2/EP4 and select 512 MiB for EP8 or 1 GiB for EP16 on ring zero. An enclosing
+forward must additionally budget its own live allocations and pass sufficient
+runtime capacity; see [runtime ring sizing](../../debug-and-tune/ring-heap-and-scope-stats.md).
+
+### Vocabulary operators
+
+`lookup_embedding.py` gathers from one BF16 vocabulary shard using global token
+IDs and replicates each row into the four BF16 mHC streams. IDs outside that
+shard contribute exact zeros. The caller sums these contributions within its TP
+group before entering the backbone.
+
+`lm_head.py` selects the hidden rows requested by `row_indices`, applies the
+loaded final RMSNorm, rounds the normalized inputs to BF16, and projects against
+one BF16 vocabulary shard with FP32 accumulation. It returns each selected row's
+maximum score and **shard-local** token index; ties choose the lowest index.
+A `-1` row index produces `(-inf, -1)` and contributes no sampling candidate.
+Other row indices must lie within the input rows.
+
+The caller adds the vocabulary-shard offset to valid local indices and selects
+the global maximum within its TP group, breaking ties by the lowest global ID.
+These local operators do not perform TP communication. The LM-head Torch golden
+returns the full local FP32 logits; its executable adapter selects the requested
+rows and compares the maximum and local index.
+
+`lm_head_tp_reduce` combines the local LM-head candidates through TP windows. It
+adds each rank's vocabulary offset, selects the maximum score and resolves ties
+to the lowest global token ID. Invalid local IDs, NaN scores and `-inf` scores
+contribute no candidate; an all-absent row returns `(-inf, -1)`. Its notification
+epochs start at one and increase whenever a caller reuses the same windows.
+This collective returns a global argmax candidate; sampling remains a caller
+responsibility. Embedding contributions can use the existing `tp_all_reduce`
+on one FP32 stream; the caller replicates the reduced BF16 embeddings into the
+four identical mHC streams.
+
+Both files include bounded prefill/decode and boundary cases in their existing
+executable entries. LM-head validation defaults to TP2/EP2 on two devices and
+also checks the TP reducer against its Torch golden. Three different input
+epochs reuse the same windows and notification counts; cases cover every winning
+peer, lowest-global-ID ties, all-absent rows, invalid local IDs and NaN/`-inf`
+scores. With EP larger than TP, each TP group is checked independently.
+Local projection cases and the distributed case run in separate processes.
+Use `--case tp_reduce` for the collective alone, or a local case such as
+`--case decode` with one device. `--compile-only` skips device execution:
+
+```bash
+python models/glm5_3_flash/lookup_embedding.py -p a2a3 -d 0 --compile-only
+python models/glm5_3_flash/lm_head.py -p a2a3 -d 0,1 --compile-only
+```
+
 ## What is quantized
 
 Activations are quantized **dynamically per token** the way the a2a3 W8A8 sibling
