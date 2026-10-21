@@ -29,7 +29,7 @@ from config import (
 )
 
 
-from quant import mxfp8_gemm, bf16_gemm_staged
+from quant import bf16_gemm_staged
 
 
 # model config
@@ -61,6 +61,7 @@ _PAIR_M_TILE = INDEX_H * 2
 INDEX_PROJ_N_TILE = 128
 INDEX_WEIGHT_N_TILE = min(128, INDEX_H)
 INDEX_PROJ_K_TILE = 256
+INDEX_PROJ_SCALE_TILE = INDEX_PROJ_K_TILE // 32
 
 
 CANDIDATE_SCORE_TILE = 1024
@@ -1804,6 +1805,72 @@ def select_pool_index_topk(
 
 
 @pl.jit.inline(auto_scope=False)
+def project_index_query(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Project active Decode queries in one M32 MXFP8 SPMD task."""
+    if num_tokens > 0:
+        for block in pl.spmd(INDEX_QUERY_WIDTH // INDEX_PROJ_N_TILE, name_hint="c1a_mx_projection"):
+            n0 = block * INDEX_PROJ_N_TILE
+            for row in pl.range((num_tokens + 31) // 32):
+                t0 = row * 32
+                rows = pl.min(32, num_tokens - t0)
+                first = pl.load(source, [t0, 0], [32, INDEX_PROJ_K_TILE], valid_shape=[rows, INDEX_PROJ_K_TILE])
+                first = pl.set_validshape(pl.fillpad(first, pad_value=pl.PadValue.zero), 32, INDEX_PROJ_K_TILE)
+                firstq_values = pl.reshape(pl.cast(first, pl.FP32), [32 * (INDEX_PROJ_K_TILE // 32), 32])
+                firstq_reduce_tmp = pl.create_tile([32 * (INDEX_PROJ_K_TILE // 32), 32], dtype=pl.FP32)
+                firstq_maximum = pl.maximum(pl.row_max(pl.abs(firstq_values), tmp_tile=firstq_reduce_tmp), 1e-4)
+                firstq_bits = pl.reinterpret_view(pl.mul(firstq_maximum, 1.0 / 448.0), pl.INT32)
+                firstq_exponent = pl.shrs(pl.add(firstq_bits, 8388607), 23)
+                firstq_scale = pl.reinterpret_view(pl.shls(firstq_exponent, 23), pl.FP32)
+                firstq_quantized = pl.cast(pl.row_expand_div(firstq_values, firstq_scale), pl.FP8E4M3FN, mode="rint")
+                firstq_payload = pl.reshape(firstq_quantized, [32, INDEX_PROJ_K_TILE])
+                firstq_signed_exponent = pl.sub(firstq_exponent, pl.mul(pl.shrs(firstq_exponent, 7), 256))
+                firstq_codes = pl.reinterpret_view(pl.cast(firstq_signed_exponent, pl.INT8), pl.UINT8)
+                firstq_flat = pl.reshape(firstq_codes, [1, 32 * (INDEX_PROJ_K_TILE // 32)])
+                firstq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+                firstq_packed = pl.tmov_x2zz(
+                    firstq_flat, firstq_tmp, group_axis=1, dst_rows=32, dst_cols=INDEX_PROJ_SCALE_TILE,
+                )
+                a0 = firstq_payload
+                sa0 = pl.reinterpret_view(firstq_packed, pl.FP8E8M0)
+                b0 = pl.load(weight, [0, n0], [INDEX_PROJ_K_TILE, INDEX_PROJ_N_TILE])
+                sb0 = pl.load(scale, [0, n0], [INDEX_PROJ_K_TILE // 32, INDEX_PROJ_N_TILE])
+                acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                for kb in pl.range(1, Q_LORA // INDEX_PROJ_K_TILE):
+                    k0 = kb * INDEX_PROJ_K_TILE
+                    values = pl.load(source, [t0, k0], [32, INDEX_PROJ_K_TILE], valid_shape=[rows, INDEX_PROJ_K_TILE])
+                    values = pl.set_validshape(pl.fillpad(values, pad_value=pl.PadValue.zero), 32, INDEX_PROJ_K_TILE)
+                    nextq_values = pl.reshape(pl.cast(values, pl.FP32), [32 * (INDEX_PROJ_K_TILE // 32), 32])
+                    nextq_reduce_tmp = pl.create_tile([32 * (INDEX_PROJ_K_TILE // 32), 32], dtype=pl.FP32)
+                    nextq_maximum = pl.maximum(pl.row_max(pl.abs(nextq_values), tmp_tile=nextq_reduce_tmp), 1e-4)
+                    nextq_bits = pl.reinterpret_view(pl.mul(nextq_maximum, 1.0 / 448.0), pl.INT32)
+                    nextq_exponent = pl.shrs(pl.add(nextq_bits, 8388607), 23)
+                    nextq_scale = pl.reinterpret_view(pl.shls(nextq_exponent, 23), pl.FP32)
+                    nextq_quantized = pl.cast(pl.row_expand_div(nextq_values, nextq_scale), pl.FP8E4M3FN, mode="rint")
+                    nextq_payload = pl.reshape(nextq_quantized, [32, INDEX_PROJ_K_TILE])
+                    nextq_signed_exponent = pl.sub(nextq_exponent, pl.mul(pl.shrs(nextq_exponent, 7), 256))
+                    nextq_codes = pl.reinterpret_view(pl.cast(nextq_signed_exponent, pl.INT8), pl.UINT8)
+                    nextq_flat = pl.reshape(nextq_codes, [1, 32 * (INDEX_PROJ_K_TILE // 32)])
+                    nextq_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+                    nextq_packed = pl.tmov_x2zz(
+                        nextq_flat, nextq_tmp, group_axis=1, dst_rows=32, dst_cols=INDEX_PROJ_SCALE_TILE,
+                    )
+                    a = nextq_payload
+                    sa = pl.reinterpret_view(nextq_packed, pl.FP8E8M0)
+                    b = pl.load(weight, [k0, n0], [INDEX_PROJ_K_TILE, INDEX_PROJ_N_TILE])
+                    sb = pl.load(scale, [k0 // 32, n0], [INDEX_PROJ_K_TILE // 32, INDEX_PROJ_N_TILE])
+                    acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                value = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                output = pl.store(pl.set_validshape(value, rows, INDEX_PROJ_N_TILE), [t0, n0], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def project_index_weights(
     source: pl.Tensor,
     weight: pl.Tensor,
@@ -1854,13 +1921,7 @@ def c1a_index(
 ):
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    mxfp8_gemm(
-        qr, index_wq_b, index_wq_b_scale,
-        projected,
-        num_tokens,
-        width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
-        n_tile=128, name_hint="c1a_mx_projection", single_task=True,
-    )
+    project_index_query(qr, index_wq_b, index_wq_b_scale, projected, num_tokens)
     rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
     rotated_tid = rotate_index_query(projected, cos, sin, rotated, num_tokens, entry_ready)
     query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)

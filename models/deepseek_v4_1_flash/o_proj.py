@@ -319,7 +319,7 @@ def o_proj(
             mxfp8_gemm(
                 latent, wo_b, wo_b_scale, output, num_tokens,
                 width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
-                n_tile=128, name_hint="attention_o_b", single_task=False,
+                n_tile=128, name_hint="attention_o_b",
             )
     return output
 
