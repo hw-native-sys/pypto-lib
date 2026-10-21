@@ -145,8 +145,7 @@ def _inputs(t: int, h: int, d: int, hg: int) -> dict:
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
-                       hg: int = HG):
+def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE, hg: int = HG):
     from golden import TensorSpec
 
     def init_tril():
@@ -201,13 +200,11 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=None,
-                        help="run this one shape instead of DEFAULT_CASES")
+    parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0,
-                        choices=range(5))
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
     if args.seq_len and args.seq_len % DISPATCH_TOKENS:

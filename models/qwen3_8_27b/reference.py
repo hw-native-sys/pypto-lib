@@ -32,8 +32,7 @@ REF_DTYPE = torch.float64
 # ---------------------------------------------------------------------------
 
 
-def make_inputs(t: int, h: int, d: int, hg: int | None = None,
-                seed: int = 42) -> dict[str, torch.Tensor]:
+def make_inputs(t: int, h: int, d: int, hg: int | None = None, seed: int = 42) -> dict[str, torch.Tensor]:
     """The model's own input distribution, in the model's dtypes.
 
     `hg` is the number of QK heads; `h` the number of value heads. They differ
@@ -53,10 +52,8 @@ def make_inputs(t: int, h: int, d: int, hg: int | None = None,
         return torch.Generator().manual_seed(seed + offset)
 
     return dict(
-        q=F.normalize(torch.randn(t, hg, d, dtype=torch.float16, generator=gen(1)),
-                      dim=-1, p=2),
-        k=F.normalize(torch.randn(t, hg, d, dtype=torch.float16, generator=gen(2)),
-                      dim=-1, p=2),
+        q=F.normalize(torch.randn(t, hg, d, dtype=torch.float16, generator=gen(1)), dim=-1, p=2),
+        k=F.normalize(torch.randn(t, hg, d, dtype=torch.float16, generator=gen(2)), dim=-1, p=2),
         v=torch.randn(t, h, d, dtype=torch.float16, generator=gen(3)),
         beta=torch.rand(t, h, dtype=torch.float16, generator=gen(4)),
         g=F.logsigmoid(torch.randn(t, h, dtype=torch.float32, generator=gen(5))),
@@ -96,8 +93,7 @@ def frob(actual: torch.Tensor, expected: torch.Tensor) -> float | None:
     return float(torch.sqrt(((act - exp) ** 2).sum())) / denom
 
 
-def frob_ok(name: str, ftol: float = FTOL, diff_thd: float = DIFF_THD,
-            pct_thd: float = PCT_THD):
+def frob_ok(name: str, ftol: float = FTOL, diff_thd: float = DIFF_THD, pct_thd: float = PCT_THD):
     """`ratio_reldiff` per point, plus the relative Frobenius norm over the whole output.
 
     Every per-point check is the harness comparator's: the floored relative difference,
@@ -125,8 +121,7 @@ def frob_ok(name: str, ftol: float = FTOL, diff_thd: float = DIFF_THD,
             if value > ftol:
                 ok = False
                 detail = f"relative Frobenius norm {value:.4g} over {ftol}; " + detail
-        print(f"[stats] {name}: {stats}, max diff={max_diff:.4g}, peak |ref|={peak:.4g}",
-              flush=True)
+        print(f"[stats] {name}: {stats}, max diff={max_diff:.4g}, peak |ref|={peak:.4g}", flush=True)
         return ok, detail
 
     cmp.__name__ = f"frob_ok({name})"

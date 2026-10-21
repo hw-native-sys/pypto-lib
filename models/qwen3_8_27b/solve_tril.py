@@ -72,8 +72,7 @@ def _gdn_solve_tril(
     # slot_num=1: the mask multiplies are vector ops, so a ring exists, and
     # its default depth reserves more of the vector buffer than the tile
     # needs (pypto#2903).
-    for c0 in pl.spmd(t_dim // CHUNK_TILE, name_hint="solve_tril",
-                      optimizations=[pl.cross_core_slot(slot_num=1)]):
+    for c0 in pl.spmd(t_dim // CHUNK_TILE, name_hint="solve_tril", optimizations=[pl.cross_core_slot(slot_num=1)]):
         t0 = c0 * CHUNK_TILE
         for hh in pl.range(H):
             col = hh * CHUNK_TILE
@@ -155,8 +154,7 @@ def solve_tril_ref(a: torch.Tensor, chunk: int) -> torch.Tensor:
     eye = torch.eye(chunk, dtype=REF_DTYPE)
     for t0 in range(0, t, chunk):
         for hh in range(h):
-            out[t0 : t0 + chunk, hh, :] = torch.linalg.inv(
-                eye + af[t0 : t0 + chunk, hh, :])
+            out[t0 : t0 + chunk, hh, :] = torch.linalg.inv( eye + af[t0 : t0 + chunk, hh, :])
     return out
 
 
@@ -212,8 +210,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=None,
-                        help="run this one shape instead of DEFAULT_CASES")
+    parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
