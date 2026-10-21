@@ -25,6 +25,8 @@ SWIGLU_LIMIT = M.swiglu_limit
 SH_M_TILE = 16
 SH_ROW_TILE = 2
 T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
+GATE_M_TILE = T_PAD if T_PAD <= 80 else 16
+W2_M_TILE = T_PAD if T_PAD <= 80 else 16
 SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
 assert T < SH_M_TILE or T % SH_M_TILE == 0
 assert SH_VALID_M % SH_ROW_TILE == 0
@@ -85,18 +87,18 @@ def expert_shared(
         [T_PAD, D // MX_GROUP],
         layout=pl.MX_A_ZZ,
     )
-    for mt in pl.parallel(T_PAD // SH_M_TILE):
-        ts0 = mt * SH_M_TILE
-
-        gate_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
+    gate_fp32 = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP32)
+    up_fp32 = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP32)
+    for gm in pl.parallel(T_PAD // GATE_M_TILE):
+        ts0 = gm * GATE_M_TILE
 
         for nb_idx in pl.spmd(MOE_INTER // MX_MM_INTER_TILE, name_hint="sh_gate_mx_mm"):
             n0 = nb_idx * MX_MM_INTER_TILE
-            xs0 = pl.load(x_local, [ts0, 0], [SH_M_TILE, MX_RIGHT_K_TILE])
+            xs0 = pl.load(x_local, [ts0, 0], [GATE_M_TILE, MX_RIGHT_K_TILE])
             xs_scale0 = pl.load(
                 x_local_scale_mx,
                 [ts0, 0],
-                [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
+                [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
             )
             w1_0 = pl.load(shared_w1, [0, n0], [MX_RIGHT_K_TILE, MX_MM_INTER_TILE])
             w1_scale0 = pl.load(
@@ -107,11 +109,11 @@ def expert_shared(
             gate_acc = pl.matmul_mx(xs0, xs_scale0, w1_0, w1_scale0)
             for kb in pl.range(1, MX_K_TILE // MX_RIGHT_K_TILE):
                 k_local = kb * MX_RIGHT_K_TILE
-                xs_part = pl.load(x_local, [ts0, k_local], [SH_M_TILE, MX_RIGHT_K_TILE])
+                xs_part = pl.load(x_local, [ts0, k_local], [GATE_M_TILE, MX_RIGHT_K_TILE])
                 xs_scale_part = pl.load(
                     x_local_scale_mx,
                     [ts0, k_local // MX_GROUP],
-                    [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
+                    [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
                 )
                 w1_part = pl.load(
                     shared_w1,
@@ -136,12 +138,12 @@ def expert_shared(
                     xs_part = pl.load(
                         x_local,
                         [ts0, k0 + k_local],
-                        [SH_M_TILE, MX_RIGHT_K_TILE],
+                        [GATE_M_TILE, MX_RIGHT_K_TILE],
                     )
                     xs_scale_part = pl.load(
                         x_local_scale_mx,
                         [ts0, (k0 + k_local) // MX_GROUP],
-                        [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
+                        [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
                     )
                     w1_part = pl.load(
                         shared_w1,
@@ -160,17 +162,15 @@ def expert_shared(
                         w1_part,
                         w1_scale_part,
                     )
-            gate_fp32 = pl.store(gate_acc, [0, n0], gate_fp32)
-
-        up_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
+            gate_fp32 = pl.store(gate_acc, [ts0, n0], gate_fp32)
 
         for nb_idx in pl.spmd(MOE_INTER // MX_MM_INTER_TILE, name_hint="sh_up_mx_mm"):
             n0 = nb_idx * MX_MM_INTER_TILE
-            xs0 = pl.load(x_local, [ts0, 0], [SH_M_TILE, MX_RIGHT_K_TILE])
+            xs0 = pl.load(x_local, [ts0, 0], [GATE_M_TILE, MX_RIGHT_K_TILE])
             xs_scale0 = pl.load(
                 x_local_scale_mx,
                 [ts0, 0],
-                [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
+                [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
             )
             w3_0 = pl.load(shared_w3, [0, n0], [MX_RIGHT_K_TILE, MX_MM_INTER_TILE])
             w3_scale0 = pl.load(
@@ -181,11 +181,11 @@ def expert_shared(
             up_acc = pl.matmul_mx(xs0, xs_scale0, w3_0, w3_scale0)
             for kb in pl.range(1, MX_K_TILE // MX_RIGHT_K_TILE):
                 k_local = kb * MX_RIGHT_K_TILE
-                xs_part = pl.load(x_local, [ts0, k_local], [SH_M_TILE, MX_RIGHT_K_TILE])
+                xs_part = pl.load(x_local, [ts0, k_local], [GATE_M_TILE, MX_RIGHT_K_TILE])
                 xs_scale_part = pl.load(
                     x_local_scale_mx,
                     [ts0, k_local // MX_GROUP],
-                    [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
+                    [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
                 )
                 w3_part = pl.load(
                     shared_w3,
@@ -210,12 +210,12 @@ def expert_shared(
                     xs_part = pl.load(
                         x_local,
                         [ts0, k0 + k_local],
-                        [SH_M_TILE, MX_RIGHT_K_TILE],
+                        [GATE_M_TILE, MX_RIGHT_K_TILE],
                     )
                     xs_scale_part = pl.load(
                         x_local_scale_mx,
                         [ts0, (k0 + k_local) // MX_GROUP],
-                        [SH_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
+                        [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
                     )
                     w3_part = pl.load(
                         shared_w3,
@@ -234,20 +234,20 @@ def expert_shared(
                         w3_part,
                         w3_scale_part,
                     )
-            up_fp32 = pl.store(up_acc, [0, n0], up_fp32)
+            up_fp32 = pl.store(up_acc, [ts0, n0], up_fp32)
 
+    h_tile_mx = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP8E4M3FN)
+    h_scale_backing = pl.create_tensor([1, T_PAD * (MOE_INTER // MX_GROUP)], dtype=pl.FP8E8M0)
+    for mt in pl.parallel(T_PAD // SH_M_TILE):
+        ts0 = mt * SH_M_TILE
         h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
-        h_tile_mx = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP8E4M3FN)
-        h_scale_backing = pl.create_tensor(
-            [1, SH_M_TILE * (MOE_INTER // MX_GROUP)], dtype=pl.FP8E8M0
-        )
         for q_idx in pl.spmd(MOE_INTER // QUANT_TILE, name_hint="sh_gate_up_act"):
             k0 = q_idx * QUANT_TILE
             for row_block in pl.range(SH_M_TILE // SH_ROW_TILE):
                 row0 = row_block * SH_ROW_TILE
                 for n0 in pl.pipeline(k0, k0 + QUANT_TILE, ACT_INTER_TILE, stage=2):
-                    gate_rows = gate_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
-                    up_rows = up_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
+                    gate_rows = gate_fp32[ts0 + row0 : ts0 + row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
+                    up_rows = up_fp32[ts0 + row0 : ts0 + row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
                     gate_rows = pl.cast(pl.cast(gate_rows, pl.BF16, mode="rint"), pl.FP32)
                     up_rows = pl.cast(pl.cast(up_rows, pl.BF16, mode="rint"), pl.FP32)
                     if SWIGLU_LIMIT > 0.0:
@@ -282,19 +282,17 @@ def expert_shared(
                 dst_rows=SH_M_TILE, dst_cols=QUANT_GROUPS,
             )
             h_scale_mx = pl.reinterpret_view(quant_packed, pl.FP8E8M0)
-            h_tile_mx = pl.store(h_mx, [0, k0], h_tile_mx)
-            scale_offset = q_idx * SH_M_TILE * (QUANT_TILE // MX_GROUP)
+            h_tile_mx = pl.store(h_mx, [ts0, k0], h_tile_mx)
+            scale_offset = ts0 * (MOE_INTER // MX_GROUP) + q_idx * SH_M_TILE * (QUANT_TILE // MX_GROUP)
             h_scale_backing = pl.store(
                 pl.reshape(h_scale_mx, [1, SH_M_TILE * (QUANT_TILE // MX_GROUP)]),
                 [0, scale_offset],
                 h_scale_backing,
             )
 
-        h_tile_scale_mx = pl.tensor.view(
-            h_scale_backing,
-            [SH_M_TILE, MOE_INTER // MX_GROUP],
-            layout=pl.MX_A_ZZ,
-        )
+    for wm in pl.parallel(T_PAD // W2_M_TILE):
+        ts0 = wm * W2_M_TILE
+        h_tile_scale_mx = pl.tensor.view(h_scale_backing, [T_PAD, MOE_INTER // MX_GROUP], layout=pl.MX_A_ZZ)
         # Synchronize Cube/Vector startup (pypto#2829) within available clusters.
         workers = pl.min(D // W2_TASK_TILE, pl.system.available_cluster_count())
         for worker in pl.spmd(workers, name_hint="sh_w2_mm", sync_start=True):
@@ -303,11 +301,11 @@ def expert_shared(
                 db_idx = wave * block_num + worker
                 if db_idx < D // D_OUT_TILE:
                     d0 = db_idx * D_OUT_TILE
-                    hs0 = pl.load(h_tile_mx, [0, 0], [SH_M_TILE, MX_W2_RIGHT_K_TILE])
+                    hs0 = pl.load(h_tile_mx, [ts0, 0], [W2_M_TILE, MX_W2_RIGHT_K_TILE])
                     hs_scale0 = pl.load(
                         h_tile_scale_mx,
-                        [0, 0],
-                        [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
+                        [ts0, 0],
+                        [W2_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
                     )
                     sw2_0 = pl.load(shared_w2, [0, d0], [MX_W2_RIGHT_K_TILE, D_OUT_TILE])
                     sw2_scale0 = pl.load(
@@ -318,11 +316,11 @@ def expert_shared(
                     y_acc = pl.matmul_mx(hs0, hs_scale0, sw2_0, sw2_scale0)
                     for kb in pl.range(1, MX_W2_K_TILE // MX_W2_RIGHT_K_TILE):
                         k_local = kb * MX_W2_RIGHT_K_TILE
-                        hs_part = pl.load(h_tile_mx, [0, k_local], [SH_M_TILE, MX_W2_RIGHT_K_TILE])
+                        hs_part = pl.load(h_tile_mx, [ts0, k_local], [W2_M_TILE, MX_W2_RIGHT_K_TILE])
                         hs_scale_part = pl.load(
                             h_tile_scale_mx,
-                            [0, k_local // MX_GROUP],
-                            [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
+                            [ts0, k_local // MX_GROUP],
+                            [W2_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
                         )
                         sw2_part = pl.load(
                             shared_w2,
@@ -346,13 +344,13 @@ def expert_shared(
                             k_local = kb * MX_W2_RIGHT_K_TILE
                             hs_part = pl.load(
                                 h_tile_mx,
-                                [0, k0 + k_local],
-                                [SH_M_TILE, MX_W2_RIGHT_K_TILE],
+                                [ts0, k0 + k_local],
+                                [W2_M_TILE, MX_W2_RIGHT_K_TILE],
                             )
                             hs_scale_part = pl.load(
                                 h_tile_scale_mx,
-                                [0, (k0 + k_local) // MX_GROUP],
-                                [SH_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
+                                [ts0, (k0 + k_local) // MX_GROUP],
+                                [W2_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
                             )
                             sw2_part = pl.load(
                                 shared_w2,
@@ -372,7 +370,8 @@ def expert_shared(
                                 sw2_scale_part,
                             )
                     y_bf16 = pl.cast(y_acc, target_type=pl.BF16, mode="rint")
-                    y_valid = pl.set_validshape(y_bf16, SH_VALID_M, D_OUT_TILE)
+                    valid_rows = pl.min(W2_M_TILE, T - ts0)
+                    y_valid = pl.set_validshape(y_bf16, valid_rows, D_OUT_TILE)
                     sh = pl.store(y_valid, [ts0, d0], sh)
 
     return sh

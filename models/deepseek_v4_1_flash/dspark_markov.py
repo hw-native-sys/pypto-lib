@@ -339,7 +339,7 @@ def _markov_sample_from_hidden(
     flat_hidden = pl.reshape(head_hidden, [rows, D])
     normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
     for block in pl.spmd((rows + 7) // 8, name_hint="dspark_final_norm"):
-        rms_norm_tiled(flat_hidden, final_norm_weight, normalized, block, rows)
+        rms_norm_tiled(flat_hidden, final_norm_weight, normalized, block, rows, output_fp32=False)
     base_logits = pl.create_tensor([batch, DSPARK_QUERY_WIDTH, VOCAB], dtype=pl.FP32)
     flat_logits = pl.reshape(base_logits, [rows, VOCAB])
     group_base = rank // C.TP_SIZE * C.TP_SIZE

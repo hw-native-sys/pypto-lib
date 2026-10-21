@@ -38,6 +38,7 @@ LINEAR_K_TILE = 256
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 D_TILE = 2560
+PRE_T_TILE = 2
 OUT_TILE = 2
 D_TILES = D // D_TILE
 POST_SPMD_BLOCKS = 64
@@ -53,6 +54,7 @@ def hc_mixes(
     pre_mix: pl.Tensor,
     post_mix: pl.Tensor,
     residual_mix: pl.Tensor,
+    sinkhorn_blocks: pl.constexpr,
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
@@ -107,7 +109,7 @@ def hc_mixes(
     scale1 = pl.read(scale, [1])
     scale2 = pl.read(scale, [2])
     sinkhorn_tasks = (t_dim + COMB_T_TILE - 1) // COMB_T_TILE
-    sinkhorn_workers = pl.min(sinkhorn_tasks, 64)
+    sinkhorn_workers = pl.min(sinkhorn_tasks, sinkhorn_blocks)
     with pl.spmd(sinkhorn_workers, name_hint="mhc_split_sinkhorn") as mixes_ready:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, sinkhorn_tasks, sinkhorn_workers):
@@ -190,23 +192,26 @@ def hc_pre(
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
-    for t in pl.spmd(t_dim, name_hint="hc_pre", allow_early_resolve=True):
-        pre0 = pl.read(pre_mix, [t, 0])
-        pre1 = pl.read(pre_mix, [t, 1])
-        pre2 = pl.read(pre_mix, [t, 2])
-        pre3 = pl.read(pre_mix, [t, 3])
-        for d0 in pl.pipeline(0, D, D_TILE, stage=2):
-            x0 = pl.load(x_flat, [t, d0], [1, D_TILE])
-            x1 = pl.load(x_flat, [t, D + d0], [1, D_TILE])
-            x2 = pl.load(x_flat, [t, 2 * D + d0], [1, D_TILE])
-            x3 = pl.load(x_flat, [t, 3 * D + d0], [1, D_TILE])
-            y0 = pl.mul(x0, pre0)
-            y1 = pl.mul(x1, pre1)
-            y2 = pl.mul(x2, pre2)
-            y3 = pl.mul(x3, pre3)
-            y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
-            y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-            pl.store(y_bf16, [t, d0], output)
+    for block in pl.spmd((t_dim + PRE_T_TILE - 1) // PRE_T_TILE, name_hint="hc_pre", allow_early_resolve=True):
+        for t in pl.range(block * PRE_T_TILE, pl.min((block + 1) * PRE_T_TILE, t_dim)):
+            pre0 = pl.read(pre_mix, [t, 0])
+            pre1 = pl.read(pre_mix, [t, 1])
+            pre2 = pl.read(pre_mix, [t, 2])
+            pre3 = pl.read(pre_mix, [t, 3])
+            for d0 in pl.pipeline(0, D, D_TILE, stage=2):
+                x0 = pl.load(x_flat, [t, d0], [1, D_TILE])
+                x1 = pl.load(x_flat, [t, D + d0], [1, D_TILE])
+                x2 = pl.load(x_flat, [t, 2 * D + d0], [1, D_TILE])
+                x3 = pl.load(x_flat, [t, 3 * D + d0], [1, D_TILE])
+                y0 = pl.mul(x0, pre0)
+                y1 = pl.mul(x1, pre1)
+                y2 = pl.mul(x2, pre2)
+                y3 = pl.mul(x3, pre3)
+                y01 = pl.add(y0, y1)
+                y23 = pl.add(y2, y3)
+                y_tile = pl.add(y01, y23)
+                y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+                pl.store(y_bf16, [t, d0], output)
     return output
 
 
@@ -473,7 +478,7 @@ def l2_hc_mixes(
     pre_mix.bind_dynamic(0, T_DYN)
     post_mix.bind_dynamic(0, T_DYN)
     residual_mix.bind_dynamic(0, T_DYN)
-    hc_mixes(x_hc, function, scale, base, pre_mix, post_mix, residual_mix)
+    hc_mixes(x_hc, function, scale, base, pre_mix, post_mix, residual_mix, sinkhorn_blocks=64)
     return residual_mix
 
 

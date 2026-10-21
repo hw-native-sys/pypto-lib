@@ -44,7 +44,7 @@ config.N_LOCAL_EXPERTS = _experts_per_rank
 from config import FLASH as M
 from config import EP_SIZE, TP_SIZE, SUPPORTED_EP_SIZES
 from config import MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
-from gate import gate_normalized as npu_gate
+from gate import gate
 from expert_shared import expert_shared
 from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
@@ -52,7 +52,7 @@ from expert_routed import (
 )
 from hc import golden_mhc_mixes, golden_hc_pre, golden_hc_post
 from hc import hc_mixes, hc_pre, hc_post_after
-from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
+from rmsnorm import golden_rms_norm_tiled
 
 
 if EP_SIZE % TP_SIZE:
@@ -87,7 +87,6 @@ IDX_PAD = ROUTE_WIDTH
 SIGNAL_PAD = 128  # 512-byte padded monotonic counter lane
 
 # tiling
-DISPATCH_COPY_TILE = 8
 DISPATCH_STAGE_TILE = 8
 COMBINE_T_TILE = 2
 SCALE_PACK_TMP_TILE = ((64 + K_SCALE + 31) // 32) * 32
@@ -102,7 +101,7 @@ def clear_moe_signals(
     combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     anchor_indices: pl.constexpr,
 ):
-    """Clear a completed entry's MoE arrival and round-release signals."""
+    """Clear a completed entry's MoE arrival signals."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear", allow_early_resolve=False):
         anchor = pl.read(completion_anchor, anchor_indices)
         zero = pl.cast(0, pl.INT32)
@@ -110,7 +109,6 @@ def clear_moe_signals(
             pl.write(arrived, [peer, 0], zero)
             pl.write(data_arrived, [peer, 0, 0], zero)
             pl.write(combine_arrived, [peer, 0, 0], zero)
-            pl.write(combine_arrived, [peer, 1, 0], zero)
         pl.write(completion_anchor, anchor_indices, anchor)
     return completion_anchor
 
@@ -138,43 +136,34 @@ def dispatch(
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    # MX_A_ZZ scale backing: [1, M/16, G/2, 16, 2].
+    # Raw payload and logical MX scale rows in ND order.
     x_norm_mx_raw = pl.create_tensor([T, D], dtype=pl.INT8)
-    x_norm_scale_raw = pl.create_tensor([1, T * K_SCALE], dtype=pl.UINT8)
-    with pl.spmd(T // DISPATCH_COPY_TILE, name_hint="dispatch_raw_copy"):
-        copy_row = pl.tile.get_block_idx() * DISPATCH_COPY_TILE
-        raw_row = pl.load(x_norm_mx, [copy_row, 0], [DISPATCH_COPY_TILE, D])
-        raw_row_i8 = pl.reinterpret_view(raw_row, pl.INT8)
-        x_norm_mx_raw = pl.store(raw_row_i8, [copy_row, 0], x_norm_mx_raw)
-        scale_copy_offset = copy_row * K_SCALE
-        raw_scale = pl.load(x_norm_scale, [0, scale_copy_offset], [1, DISPATCH_COPY_TILE * K_SCALE])
-        raw_scale_u8 = pl.reinterpret_view(raw_scale, pl.UINT8)
-        x_norm_scale_raw = pl.store(raw_scale_u8, [0, scale_copy_offset], x_norm_scale_raw)
-
-    # Dispatch-round start dependency.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_reuse_wait") as _reuse_tid:
-        _indices_anchor = pl.read(indices, [0, 0])
-
-    # Logical MX scale rows in ND order.
     scale_src = pl.create_tensor([T, K_SCALE], dtype=pl.UINT8, manual_dep=True)
-
-    x_norm_scale_physical = pl.tensor.view(x_norm_scale_raw, [1, T // 16, K_SCALE // 2, 16, 2], layout=pl.ND)
-    with pl.spmd(T // DISPATCH_STAGE_TILE, name_hint="dispatch_stage", deps=[_reuse_tid]) as _stage_tid:
+    with pl.spmd(T // DISPATCH_STAGE_TILE, name_hint="dispatch_stage") as _stage_tid:
+        t_begin = pl.tile.get_block_idx() * DISPATCH_STAGE_TILE
+        raw_row = pl.load(x_norm_mx, [t_begin, 0], [DISPATCH_STAGE_TILE, D])
+        raw_row_i8 = pl.reinterpret_view(raw_row, pl.INT8)
+        x_norm_mx_raw = pl.store(raw_row_i8, [t_begin, 0], x_norm_mx_raw)
+        scale_offset = t_begin // 16 * 16 * K_SCALE
+        raw_scale = pl.load(x_norm_scale, [0, scale_offset], [1, 16 * K_SCALE])
+        raw_scale_u8 = pl.reinterpret_view(raw_scale, pl.UINT8)
+        raw_scale_i8 = pl.reinterpret_view(raw_scale_u8, pl.INT8)
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
         # Each block owns whole 64-byte lines in the UINT8 scale buffer.
-        t_begin = pl.tile.get_block_idx() * DISPATCH_STAGE_TILE
         t_end = pl.min(t_begin + DISPATCH_STAGE_TILE, active_tokens)
         for t in pl.range(t_begin, t_end):
             for group in pl.range(K_SCALE):
-                scale = pl.read(x_norm_scale_physical, [0, t // 16, group // 2, t % 16, group % 2])
+                scale_index = group // 2 * 32 + t % 16 * 2 + group % 2
+                scale_i8 = pl.tile.read(raw_scale_i8, [0, scale_index])
+                scale = pl.cast(scale_i8, pl.UINT8)
                 pl.write(scale_src, [t, group], scale)
 
     # Publish per-source route counts.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_publish", deps=[_reuse_tid], allow_early_resolve=True) as _meta_push_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_publish", allow_early_resolve=True) as _meta_push_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -218,7 +207,7 @@ def dispatch(
             pl.write(recv_count_out, [e, 0], acc)
 
     # Publish one payload lane per destination and local expert.
-    with pl.spmd(N_RANKS * N_LOCAL, name_hint="dispatch_push", deps=[_reuse_tid, _stage_tid], allow_early_resolve=False) as _push_tid:
+    with pl.spmd(N_RANKS * N_LOCAL, name_hint="dispatch_push", deps=[_stage_tid], allow_early_resolve=False) as _push_tid:
         push_block = pl.tile.get_block_idx()
         dst = push_block // N_LOCAL
         loc_e = push_block - dst * N_LOCAL
@@ -403,12 +392,11 @@ def moe(
     t = MOE_TOKENS
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
-    mixes_ready = hc_mixes(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+    mixes_ready = hc_mixes(
+        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=16,
+    )
     hc_pre(x_hc, pre_mix, x_mixed)
-    ffn_input = pl.create_tensor([t, D], dtype=pl.BF16)
-    norm_tokens = pl.tensor.dim(x_mixed, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(x_mixed, norm_weight, ffn_input, norm_block, norm_tokens)
 
     # MoE transport and routed-result scope.
     with pl.scope():
@@ -416,7 +404,10 @@ def moe(
         x_norm_scale = pl.create_tensor([1, t * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         indices = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
         weights = pl.create_tensor([t, TOPK], dtype=pl.FP32)
-        npu_gate(ffn_input, gate_weight, correction_bias, num_tokens, x_norm_mx, x_norm_scale, indices, weights)
+        gate(
+            x_mixed, norm_weight, gate_weight, correction_bias, num_tokens,
+            x_norm_mx, x_norm_scale, indices, weights,
+        )
         if BALANCED_ROUTING:
             dispatch_indices = force_topk
         else:
@@ -461,16 +452,7 @@ def moe(
             scatter_done,
             num_tokens, ep_rank, moe_epoch,
         )
-        # Complete all peer readers before reusing the windows.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_release", deps=[output_ready]) as released:
-            for peer in pl.range(EP_SIZE):
-                if peer != ep_rank:
-                    pld.system.notify(target=combine_arrived, peer=peer, offsets=[ep_rank, 1, 0], value=moe_epoch, op=pld.NotifyOp.Set)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_released", deps=[released]) as round_ready:
-            for peer in pl.range(EP_SIZE):
-                if peer != ep_rank:
-                    pld.system.defer_wait(signal=combine_arrived, offsets=[peer, 1, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
-        hc_post_after(sublayer, x_hc, post_mix, residual_mix, x_next, round_ready, mixes_ready)
+        hc_post_after(sublayer, x_hc, post_mix, residual_mix, x_next, output_ready, mixes_ready)
     return x_next
 
 

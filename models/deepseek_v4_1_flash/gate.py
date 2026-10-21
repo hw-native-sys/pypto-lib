@@ -120,8 +120,6 @@ def gate_normalized(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
-    task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
     for block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="gate_normalized_input"):
@@ -131,6 +129,31 @@ def gate_normalized(
         normalized = pl.fillpad(normalized, pad_value=pl.PadValue.zero)
         normalized = pl.set_validshape(normalized, GATE_INPUT_TILE, D)
         xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = pl.cast(normalized, pl.FP32)
+
+    return gate_from_fp32(
+        xg_buf, gate_w, gate_bias, num_tokens,
+        x_norm_mx, x_norm_scale, indices, weights,
+    )
+
+
+@pl.jit.inline
+def gate_from_fp32(
+    xg_buf: pl.Tensor[[T_PAD, D], pl.FP32],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    x_norm_mx: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
+    x_norm_scale: pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0],
+    indices: pl.Tensor[[T, TOPK], pl.INT32],
+    weights: pl.Tensor[[T, TOPK], pl.FP32],
+):
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > T:
+        active_tokens = pl.cast(T, pl.INDEX)
+    task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
+    task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
     for quant_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), name_hint="x_norm_mx_quant"):
         tile_idx = quant_idx // (D // QUANT_TASK_TILE)
@@ -283,13 +306,15 @@ def gate(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
-    """Keep the standalone gate ABI while making FFN RMSNorm explicit."""
-    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    norm_tokens = pl.tensor.dim(x_mixed, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(x_mixed, norm_w, x_normed, norm_block, norm_tokens)
-    return gate_normalized(
-        x_normed, gate_w, gate_bias, num_tokens,
+    """Normalize router inputs with BF16 rounding and FP32 output."""
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    active_tokens = pl.max(active_tokens, 0)
+    active_tokens = pl.min(active_tokens, T)
+    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
+    for norm_block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="rms_norm"):
+        rms_norm_tiled(x_mixed, norm_w, xg_buf, norm_block, active_tokens, output_fp32=True)
+    return gate_from_fp32(
+        xg_buf, gate_w, gate_bias, num_tokens,
         x_norm_mx, x_norm_scale, indices, weights,
     )
 

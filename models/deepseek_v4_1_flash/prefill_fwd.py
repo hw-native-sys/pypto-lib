@@ -639,7 +639,10 @@ def l2_prefill_fwd(
                 hc_pre(encoder_hidden, encoder_pre, encoder_collapsed)
                 norm_tokens = pl.tensor.dim(encoder_collapsed, 0)
                 for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                    rms_norm_tiled(encoder_collapsed, layer_attn_norm, encoder_normalized, norm_block, norm_tokens)
+                    rms_norm_tiled(
+                        encoder_collapsed, layer_attn_norm, encoder_normalized, norm_block, norm_tokens,
+                        output_fp32=False,
+                    )
                 publisher_ready = prefill_publish_decoder(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
@@ -657,11 +660,14 @@ def l2_prefill_fwd(
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             attn_output = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             zero_bf16_padding(attn_output, pl.cast(0, pl.INT32))
-            hc_mixes(hidden, layer_attn_fn, layer_attn_scale, layer_attn_base, attn_pre, attn_post, attn_residual)
+            hc_mixes(
+                hidden, layer_attn_fn, layer_attn_scale, layer_attn_base,
+                attn_pre, attn_post, attn_residual, sinkhorn_blocks=64,
+            )
             hc_pre(hidden, delayed_pre, collapsed)
             norm_tokens = pl.tensor.dim(collapsed, 0)
             for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                rms_norm_tiled(collapsed, layer_attn_norm, normalized, norm_block, norm_tokens)
+                rms_norm_tiled(collapsed, layer_attn_norm, normalized, norm_block, norm_tokens, output_fp32=False)
             mode = 0
             cache_slot = 0
             rope_slot = 0

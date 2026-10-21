@@ -31,10 +31,12 @@ def _rms_norm_tiled(
     block: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     compensated: pl.constexpr,
+    output_fp32: pl.constexpr,
 ):
     """Normalize eight rows with optional compensated 512-column accumulation."""
     t0 = block * NORM_T_TILE
-    valid_rows = pl.min(NORM_T_TILE, num_tokens - t0)
+    remaining_rows = pl.max(num_tokens - t0, 0)
+    valid_rows = pl.min(NORM_T_TILE, remaining_rows)
     sq_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
     compensation = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
     for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
@@ -60,9 +62,13 @@ def _rms_norm_tiled(
         value = pl.cast(source, target_type=pl.FP32)
         gamma = pl.reshape(pl.cast(norm_w[k0 : k0 + NORM_D_TILE], target_type=pl.FP32), [1, NORM_D_TILE])
         normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv_rms), gamma)
-        x_normed[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = pl.set_validshape(
-            pl.cast(normalized, target_type=pl.BF16, mode="rint"), valid_rows, NORM_D_TILE
-        )
+        rounded = pl.cast(normalized, target_type=pl.BF16, mode="rint")
+        if output_fp32:
+            rounded_fp32 = pl.cast(rounded, pl.FP32)
+            x_normed[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = rounded_fp32
+        else:
+            valid_output = pl.set_validshape(rounded, valid_rows, NORM_D_TILE)
+            x_normed[t0 : t0 + NORM_T_TILE, k0 : k0 + NORM_D_TILE] = valid_output
     return x_normed
 
 
@@ -73,9 +79,10 @@ def rms_norm_tiled(
     x_normed: pl.Tensor,
     block: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    output_fp32: pl.constexpr,
 ):
-    """Normalize eight rows using 512-column FP32 accumulation."""
-    return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=False)
+    """Normalize eight rows with BF16 rounding and optional padded FP32 output."""
+    return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=False, output_fp32=output_fp32)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -87,7 +94,7 @@ def rms_norm_tiled_compensated(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Normalize final projection inputs with compensated FP32 chunk sums."""
-    return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=True)
+    return _rms_norm_tiled(x, norm_w, x_normed, block, num_tokens, compensated=True, output_fp32=False)
 
 
 @pl.jit.inline

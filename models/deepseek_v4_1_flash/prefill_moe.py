@@ -424,12 +424,15 @@ def prefill_moe(
     t = MOE_TOKENS
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
-    mixes_ready = hc_mixes(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+    mixes_ready = hc_mixes(
+        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
+    )
     hc_pre(x_hc, pre_mix, x_mixed)
     ffn_input = pl.create_tensor([t, D], dtype=pl.BF16)
     norm_tokens = pl.tensor.dim(x_mixed, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(x_mixed, norm_weight, ffn_input, norm_block, norm_tokens)
+        rms_norm_tiled(x_mixed, norm_weight, ffn_input, norm_block, norm_tokens, output_fp32=False)
 
     # MoE transport and routed-result scope.
     with pl.scope():
@@ -653,7 +656,7 @@ def moe_hc_pre(
     ffn_input: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     """Derive FFN mHC coefficients and collapse the residual stream to BF16."""
-    hc_mixes(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+    hc_mixes(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64)
     hc_pre(x_hc, pre_mix, ffn_input)
     return ffn_input
 
@@ -771,7 +774,7 @@ def prefill_moe_sublayer(
     norm_tokens = pl.tensor.dim(local_ffn_input, 0)
     local_ffn_normed = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens)
+        rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens, output_fp32=False)
 
     local_num_tokens = _local_token_count(num_tokens, tp_rank)
     local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)

@@ -185,7 +185,7 @@ def dspark_proj(
             pl.cast(acc, pl.BF16, mode="rint"), rows, 128
         )
     for block in pl.spmd((num_tokens + 7) // 8, name_hint="dspark_main_norm"):
-        rms_norm_tiled(projected, main_norm_weight, main_x, block, num_tokens)
+        rms_norm_tiled(projected, main_norm_weight, main_x, block, num_tokens, output_fp32=False)
     return main_x
 
 
@@ -374,10 +374,13 @@ def draft_layer(
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
+    hc_mixes(
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attention_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
+    )
     hc_pre(x_hc, incoming_pre_mix, attention_input)
     for block in pl.spmd((tokens + 7) // 8, name_hint="dspark_attn_norm"):
-        rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, tokens)
+        rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, tokens, output_fp32=False)
     zero_bf16_padding(normalized_attention, num_tokens)
     attention_partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
     dspark_attention(
