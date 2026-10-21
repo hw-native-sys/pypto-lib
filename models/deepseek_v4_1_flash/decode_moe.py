@@ -89,6 +89,7 @@ SIGNAL_PAD = 128  # 512-byte padded monotonic counter lane
 # tiling
 DISPATCH_COPY_TILE = 8
 DISPATCH_STAGE_TILE = 8
+COMBINE_T_TILE = 2
 SCALE_PACK_TMP_TILE = ((64 + K_SCALE + 31) // 32) * 32
 RECV_TILE = 16
 
@@ -180,7 +181,7 @@ def dispatch(
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
 
-        # Count how many routes land in each (dst, loc_e) lane (no payload move).
+        # Route counts for each destination and local expert.
         cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
         for d in pl.range(N_RANKS):
             for e in pl.range(N_LOCAL):
@@ -200,18 +201,12 @@ def dispatch(
             meta_valid = pl.tile.set_validshape(meta_tile, 1, N_LOCAL)
             pld.tile.remote_store(meta_valid, target=recv_meta, peer=dst, offsets=[my_rank, 0])
             if dst != my_rank:
-                pld.system.notify(
-                    target=arrived, peer=dst, offsets=[my_rank, 0],
-                    value=moe_epoch, op=pld.NotifyOp.Set,
-                )
+                pld.system.notify(target=arrived, peer=dst, offsets=[my_rank, 0], value=moe_epoch, op=pld.NotifyOp.Set)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_wait") as _meta_wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(
-                    signal=arrived, offsets=[src, 0],
-                    expected=moe_epoch, cmp=pld.WaitCmp.Ge,
-                )
+                pld.system.defer_wait(signal=arrived, offsets=[src, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_finalize", deps=[_meta_push_tid, _meta_wait_tid], allow_early_resolve=True) as _meta_tid:
         for e in pl.range(N_LOCAL):
@@ -251,14 +246,8 @@ def dispatch(
                         slot = slot_ctr[0]
                         slot_ctr[0] = slot + 1
                         row = e_lane_base + slot
-                        pld.tensor.put(
-                            dst=recv_x, peer=dst, src=x_norm_mx_raw,
-                            dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, D],
-                        )
-                        pld.tensor.put(
-                            dst=recv_scale, peer=dst, src=scale_src,
-                            dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, K_SCALE],
-                        )
+                        pld.tensor.put(dst=recv_x, peer=dst, src=x_norm_mx_raw, dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, D])
+                        pld.tensor.put(dst=recv_scale, peer=dst, src=scale_src, dst_offsets=[row, 0], src_offsets=[t, 0], shape=[1, K_SCALE])
                         route_index = pl.cast(t * TOPK + k, pl.INT32)
                         route_weight = pl.tile.read(weights_tile, [t, k])
                         pl.tile.write(aux_lane, [slot, AUX_W], route_weight)
@@ -270,18 +259,12 @@ def dispatch(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_publish_epoch", deps=[_push_tid], allow_early_resolve=False) as _publish_tid:
         for dst in pl.range(N_RANKS):
             if dst != my_rank:
-                pld.system.notify(
-                    target=data_arrived, peer=dst, offsets=[my_rank, 0, 0],
-                    value=moe_epoch, op=pld.NotifyOp.Set,
-                )
+                pld.system.notify(target=data_arrived, peer=dst, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_publish_tid]) as _wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(
-                    signal=data_arrived, offsets=[src, 0, 0],
-                    expected=moe_epoch, cmp=pld.WaitCmp.Ge,
-                )
+                pld.system.defer_wait(signal=data_arrived, offsets=[src, 0, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
     # Gather aligned row tiles into compact expert buffers.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
@@ -321,25 +304,19 @@ def dispatch(
                         recv_route = pl.read(recv_routes, [in_row, 0])
                         pl.write(recv_route_out, [e, out_col], recv_route)
                     source_begin = source_end
+                flat_t0 = e_base_row + tile_row
+                scale_nd = pl.load(recv_scale_nd, [flat_t0, 0], [RECV_TILE, K_SCALE])
+                scale_raw = pl.reinterpret_view(scale_nd, pl.UINT8)
+                tmp = pl.create_tile([1, SCALE_PACK_TMP_TILE], dtype=pl.UINT8)
+                scale_zz_raw = pl.tmov_x2zz(scale_raw, tmp, group_axis=1, dst_rows=RECV_TILE, dst_cols=K_SCALE)
+                scale_zz = pl.reinterpret_view(scale_zz_raw, pl.FP8E8M0)
+                scale_zz_flat = pl.reshape(scale_zz, [1, RECV_TILE * K_SCALE])
+                recv_scale_out = pl.store(scale_zz_flat, [0, flat_t0 * K_SCALE], recv_scale_out)
             gather_tile_tids[tile] = gather_tile_tid
         gather_tids[e] = pl.system.task_dummy(deps=[gather_tile_tids])
     _gather_tid = pl.system.task_dummy(deps=[gather_tids[e] for e in range(N_LOCAL)])
 
-    with pl.spmd(N_LOCAL * ((RECV_MAX + RECV_TILE - 1) // RECV_TILE), name_hint="dispatch_scale_pack", deps=[_gather_tid]) as _scale_pack_tid:
-        block_idx = pl.tile.get_block_idx()
-        local_e = block_idx // ((RECV_MAX + RECV_TILE - 1) // RECV_TILE)
-        tile_idx = block_idx % ((RECV_MAX + RECV_TILE - 1) // RECV_TILE)
-        e_rows = pl.read(recv_count_out, [local_e, 0])
-        if tile_idx * RECV_TILE < e_rows:
-            flat_t0 = local_e * RECV_MAX + tile_idx * RECV_TILE
-            scale_nd = pl.load(recv_scale_nd, [flat_t0, 0], [RECV_TILE, K_SCALE])
-            scale_raw = pl.reinterpret_view(scale_nd, pl.UINT8)
-            tmp = pl.create_tile([1, SCALE_PACK_TMP_TILE], dtype=pl.UINT8)
-            scale_zz_raw = pl.tmov_x2zz(scale_raw, tmp, group_axis=1, dst_rows=RECV_TILE, dst_cols=K_SCALE)
-            scale_zz = pl.reinterpret_view(scale_zz_raw, pl.FP8E8M0)
-            scale_zz_flat = pl.reshape(scale_zz, [1, RECV_TILE * K_SCALE])
-            recv_scale_out = pl.store(scale_zz_flat, [0, flat_t0 * K_SCALE], recv_scale_out)
-    return _scale_pack_tid
+    return _gather_tid
 
 
 @pl.jit.inline
@@ -356,34 +333,29 @@ def combine_scattered(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_notify", deps=[scatter_done], allow_early_resolve=False) as notify_tid:
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
-                pld.system.notify(
-                    target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0],
-                    value=moe_epoch, op=pld.NotifyOp.Set,
-                )
+                pld.system.notify(target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[notify_tid]) as _cwait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.defer_wait(
-                    signal=combine_arrived, offsets=[src, 0, 0],
-                    expected=moe_epoch, cmp=pld.WaitCmp.Ge,
-                )
+                pld.system.defer_wait(signal=combine_arrived, offsets=[src, 0, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
     # Wait for local and peer routed-output stores.
-    with pl.spmd(T, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
-        t = pl.tile.get_block_idx()
-        if t < num_tokens:
-            shared_row = pl.load(shared_output, [t, 0], [1, D])
-            acc = pl.cast(shared_row, target_type=pl.FP32)
-            for k in pl.range(TOPK):
-                routed_row = pl.load(routed_output, [t * TOPK + k, 0], [1, D])
-                routed_fp32 = pl.cast(routed_row, target_type=pl.FP32)
-                acc = pl.add(acc, routed_fp32)
-            ffn_row = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            ffn_out = pl.store(ffn_row, [t, 0], ffn_out)
-        else:
-            zero_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
-            ffn_out = pl.store(zero_row, [t, 0], ffn_out)
+    with pl.spmd((T + COMBINE_T_TILE - 1) // COMBINE_T_TILE, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
+        t_begin = pl.tile.get_block_idx() * COMBINE_T_TILE
+        for t in pl.range(t_begin, pl.min(t_begin + COMBINE_T_TILE, T)):
+            if t < num_tokens:
+                shared_row = pl.load(shared_output, [t, 0], [1, D])
+                acc = pl.cast(shared_row, target_type=pl.FP32)
+                for k in pl.range(TOPK):
+                    routed_row = pl.load(routed_output, [t * TOPK + k, 0], [1, D])
+                    routed_fp32 = pl.cast(routed_row, target_type=pl.FP32)
+                    acc = pl.add(acc, routed_fp32)
+                ffn_row = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                ffn_out = pl.store(ffn_row, [t, 0], ffn_out)
+            else:
+                zero_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+                ffn_out = pl.store(zero_row, [t, 0], ffn_out)
     return _reduce_tid
 
 
@@ -440,7 +412,6 @@ def moe(
 
     # MoE transport and routed-result scope.
     with pl.scope():
-        sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
         x_norm_mx = pl.create_tensor([t, D], dtype=pl.FP8E4M3FN)
         x_norm_scale = pl.create_tensor([1, t * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         indices = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
@@ -483,6 +454,7 @@ def moe(
             recv_route_local, recv_meta_local,
             routed_output, input_ready,
         )
+        sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
         output_ready = combine_scattered(
             shared_output, sublayer,
             routed_output, combine_arrived,
@@ -493,17 +465,11 @@ def moe(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_release", deps=[output_ready]) as released:
             for peer in pl.range(EP_SIZE):
                 if peer != ep_rank:
-                    pld.system.notify(
-                        target=combine_arrived, peer=peer, offsets=[ep_rank, 1, 0],
-                        value=moe_epoch, op=pld.NotifyOp.Set,
-                    )
+                    pld.system.notify(target=combine_arrived, peer=peer, offsets=[ep_rank, 1, 0], value=moe_epoch, op=pld.NotifyOp.Set)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_released", deps=[released]) as round_ready:
             for peer in pl.range(EP_SIZE):
                 if peer != ep_rank:
-                    pld.system.defer_wait(
-                        signal=combine_arrived, offsets=[peer, 1, 0],
-                        expected=moe_epoch, cmp=pld.WaitCmp.Ge,
-                    )
+                    pld.system.defer_wait(signal=combine_arrived, offsets=[peer, 1, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
         hc_post_after(sublayer, x_hc, post_mix, residual_mix, x_next, round_ready, mixes_ready)
     return x_next
 
@@ -622,15 +588,9 @@ def l3_moe(
         routed_output = pld.window(routed_output_buf, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
         # Per-rank MX_B_NN scale views.
-        routed_w1_scale_r: pl.Tensor[
-            [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
-        ] = routed_w1_scale[r]
-        routed_w2_scale_r: pl.Tensor[
-            [N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN
-        ] = routed_w2_scale[r]
-        routed_w3_scale_r: pl.Tensor[
-            [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
-        ] = routed_w3_scale[r]
+        routed_w1_scale_r: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = routed_w1_scale[r]
+        routed_w2_scale_r: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = routed_w2_scale[r]
+        routed_w3_scale_r: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = routed_w3_scale[r]
         shared_w1_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[r]
         shared_w2_scale_r: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[r]
         shared_w3_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[r]
@@ -649,9 +609,7 @@ def l3_moe(
 
 def _gen_routed_mx_weights_fixture(n_experts, dequant_std, seed_base=0):
     """Generate the packed FP4 device ABI used by the routed kernel."""
-    from expert_routed import (
-        gen_routed_mxfp4_weights,
-    )
+    from expert_routed import gen_routed_mxfp4_weights
     return gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base)
 
 
@@ -669,15 +627,9 @@ def _normalise_num_tokens(value):
     if counts.numel() == 1:
         counts = counts.repeat(EP_SIZE)
     if counts.numel() != EP_SIZE:
-        raise ValueError(
-            f"num_tokens must be a scalar or contain {EP_SIZE} counts, "
-            f"got shape {tuple(counts.shape)}"
-        )
+        raise ValueError(f'num_tokens must be a scalar or contain {EP_SIZE} counts, got shape {tuple(counts.shape)}')
     if bool((counts < 0).any()) or bool((counts > MOE_TOKENS).any()):
-        raise ValueError(
-            f"num_tokens values must be in [0, {MOE_TOKENS}], "
-            f"got {counts.tolist()}"
-        )
+        raise ValueError(f'num_tokens values must be in [0, {MOE_TOKENS}], got {counts.tolist()}')
     if BALANCED_ROUTING:
         if not bool((counts == counts[0]).all()) or int(counts[0]) * TOPK % EP_SIZE:
             raise ValueError("balanced routing requires equal token counts and per-rank routes divisible by EP")
@@ -713,13 +665,8 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     import torch
 
     from golden.spec import ScalarSpec, TensorSpec
-    from expert_routed import (
-        ROUTED_DEQUANT_STD,
-    )
-    from quant import (
-        build_mxfp4_pair_lut,
-        gen_mxfp8_weight_kn_v41,
-    )
+    from expert_routed import ROUTED_DEQUANT_STD
+    from quant import build_mxfp4_pair_lut, gen_mxfp8_weight_kn_v41
 
     counts = _normalise_num_tokens(num_tokens)
     torch.manual_seed(41)
@@ -742,9 +689,7 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     def routed_weights():
         # Tuple order: w1, w1_scale, w3, w3_scale, w2, w2_scale.
         shards = [
-            _gen_routed_mx_weights_fixture(
-                N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=rank * N_LOCAL_EXPERTS * 3,
-            )
+            _gen_routed_mx_weights_fixture(N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=rank * N_LOCAL_EXPERTS * 3)
             for rank in range(EP_SIZE)
         ]
         return tuple(torch.stack([shard[index] for shard in shards]) for index in range(6))
@@ -775,10 +720,7 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
         TensorSpec("routed_w2_scale", list(routed_w2_scale_shape), e8m0, init_value=lambda: routed_weights()[5]),
         TensorSpec("routed_w3", list(routed_w3_shape), torch.uint8, init_value=lambda: routed_weights()[2]),
         TensorSpec("routed_w3_scale", list(routed_w3_scale_shape), e8m0, init_value=lambda: routed_weights()[3]),
-        TensorSpec(
-            "mxfp4_pair_lut", [EP_SIZE, 2, 256], torch.int16,
-            init_value=lambda: mxfp4_pair_lut,
-        ),
+        TensorSpec('mxfp4_pair_lut', [EP_SIZE, 2, 256], torch.int16, init_value=lambda: mxfp4_pair_lut),
         TensorSpec("shared_w1", [EP_SIZE, D, MOE_INTER], fp8, init_value=lambda: shared_weights()[0]),
         TensorSpec("shared_w1_scale", [EP_SIZE, D // MX_GROUP, MOE_INTER], e8m0, init_value=lambda: shared_weights()[1]),
         TensorSpec("shared_w2", [EP_SIZE, MOE_INTER, D], fp8, init_value=lambda: shared_weights()[4]),
@@ -786,8 +728,7 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
         TensorSpec("shared_w3", [EP_SIZE, D, MOE_INTER], fp8, init_value=lambda: shared_weights()[2]),
         TensorSpec("shared_w3_scale", [EP_SIZE, D // MX_GROUP, MOE_INTER], e8m0, init_value=lambda: shared_weights()[3]),
         TensorSpec("output", [EP_SIZE, MOE_TOKENS, D], torch.bfloat16),
-        TensorSpec("num_tokens", [EP_SIZE], torch.int32,
-                   init_value=lambda: counts),
+        TensorSpec('num_tokens', [EP_SIZE], torch.int32, init_value=lambda: counts),
         ScalarSpec("moe_epoch", torch.int32, 1, compile_runtime=True),
         TensorSpec("force_topk", [EP_SIZE, MOE_TOKENS, TOPK], torch.int32, init_value=lambda: _build_force_topk(counts)),
     ]
@@ -817,12 +758,8 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
     magnitudes = (0.5 + torch.arange(MOE_TOKENS) % 4).reshape(1, -1, 1, 1)
     # BF16 residual values stored in FP32 with per-token magnitudes.
     x_hc = (torch.randn(EP_SIZE, MOE_TOKENS, HC_MULT, D, generator=generator) * magnitudes).bfloat16().float()
-    pre_mix = torch.sigmoid(torch.randn(
-        EP_SIZE, MOE_TOKENS, HC_MULT, generator=generator
-    )) + M.hc_eps
-    hc_ffn_fn = torch.randn(
-        MIX_HC, HC_DIM, generator=generator
-    ) / math.sqrt(HC_DIM)
+    pre_mix = torch.sigmoid(torch.randn(EP_SIZE, MOE_TOKENS, HC_MULT, generator=generator)) + M.hc_eps
+    hc_ffn_fn = torch.randn(MIX_HC, HC_DIM, generator=generator) / math.sqrt(HC_DIM)
     hc_ffn_scale = torch.randn(3, generator=generator)
     hc_ffn_base = torch.randn(MIX_HC, generator=generator)
     hc_ffn_fn = hc_ffn_fn.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
@@ -830,26 +767,11 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
     hc_ffn_base = hc_ffn_base.unsqueeze(0).expand(EP_SIZE, -1).contiguous()
 
     mhc_specs = [
-        TensorSpec(
-            "x_hc", [EP_SIZE, MOE_TOKENS, HC_MULT, D],
-            torch.float32, init_value=lambda: x_hc,
-        ),
-        TensorSpec(
-            "pre_mix", [EP_SIZE, MOE_TOKENS, HC_MULT],
-            torch.float32, init_value=lambda: pre_mix,
-        ),
-        TensorSpec(
-            "hc_ffn_fn", [EP_SIZE, MIX_HC, HC_DIM],
-            torch.float32, init_value=lambda: hc_ffn_fn,
-        ),
-        TensorSpec(
-            "hc_ffn_scale", [EP_SIZE, 3],
-            torch.float32, init_value=lambda: hc_ffn_scale,
-        ),
-        TensorSpec(
-            "hc_ffn_base", [EP_SIZE, MIX_HC],
-            torch.float32, init_value=lambda: hc_ffn_base,
-        ),
+        TensorSpec('x_hc', [EP_SIZE, MOE_TOKENS, HC_MULT, D], torch.float32, init_value=lambda: x_hc),
+        TensorSpec('pre_mix', [EP_SIZE, MOE_TOKENS, HC_MULT], torch.float32, init_value=lambda: pre_mix),
+        TensorSpec('hc_ffn_fn', [EP_SIZE, MIX_HC, HC_DIM], torch.float32, init_value=lambda: hc_ffn_fn),
+        TensorSpec('hc_ffn_scale', [EP_SIZE, 3], torch.float32, init_value=lambda: hc_ffn_scale),
+        TensorSpec('hc_ffn_base', [EP_SIZE, MIX_HC], torch.float32, init_value=lambda: hc_ffn_base),
     ]
     next_pre_mix_spec = TensorSpec('next_pre_mix', [EP_SIZE, MOE_TOKENS, HC_MULT], torch.float32)
     x_mixed_spec = TensorSpec('x_mixed', [EP_SIZE, MOE_TOKENS, D], torch.bfloat16)
@@ -858,9 +780,7 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
     output_specs = [next_pre_mix_spec, x_mixed_spec, x_next_spec]
     specs = mhc_specs + common_specs + output_specs + runtime_specs
     for spec in specs:
-        if spec.name in {
-            "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
-        }:
+        if spec.name in {'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base'}:
             spec.resident = "stacked"
     return specs
 
@@ -894,9 +814,7 @@ def _golden_moe_core(tensors):
         indices = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.int32)
         weights = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.float32)
         golden_gate_normalized_core({
-            "x_normed": golden_rms_norm_tiled(
-                tensors["x"][src], tensors["norm_weight"][src]
-            ),
+            "x_normed": golden_rms_norm_tiled(tensors['x'][src], tensors['norm_weight'][src]),
             "gate_w": tensors["gate_weight"][src],
             "gate_bias": tensors["correction_bias"][src],
             "layer_id": 0,
@@ -1025,7 +943,7 @@ def golden_moe(tensors):
     tensors["next_pre_mix"][:] = next_pre_mix
     tensors["x_mixed"][:] = x_mixed
 
-    # Compose the MoE reference with mHC inputs and outputs.
+    # MoE reference with mHC inputs and outputs.
     moe_tensors = dict(tensors)
     moe_tensors["x"] = x_mixed
     sublayer = torch.zeros(EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16)
@@ -1119,16 +1037,10 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=list(SUPPORTED_EP_SIZES))
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(EP_SIZE)))
-    parser.add_argument(
-        "--experts-per-rank", type=int, default=N_LOCAL_EXPERTS,
-        help="local routed experts; test model has EP times this many total experts",
-    )
+    parser.add_argument('--experts-per-rank', type=int, default=N_LOCAL_EXPERTS, help='local routed experts; test model has EP times this many total experts')
     parser.add_argument("--balanced-routing", action="store_true", help="force balanced expert ids, retaining gate weights")
     parser.add_argument("--num-tokens", type=int, default=MOE_TOKENS)
-    parser.add_argument(
-        "--num-tokens-per-rank", type=str, default=None,
-        help="comma-separated local counts (overrides --num-tokens)",
-    )
+    parser.add_argument('--num-tokens-per-rank', type=str, default=None, help='comma-separated local counts (overrides --num-tokens)')
     parser.add_argument("--moe-epoch", type=int, default=1)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -1158,9 +1070,7 @@ if __name__ == "__main__":
         try:
             count_value = [int(value) for value in args.num_tokens_per_rank.split(",")]
         except ValueError as exc:
-            raise SystemExit(
-                "--num-tokens-per-rank must be comma-separated integers"
-            ) from exc
+            raise SystemExit('--num-tokens-per-rank must be comma-separated integers') from exc
     try:
         counts = _normalise_num_tokens(count_value)
     except ValueError as exc:
@@ -1191,7 +1101,7 @@ if __name__ == "__main__":
             execution_mode=args.execution_mode,
             enable_dep_gen=args.enable_dep_gen,
             enable_chip_swimlane=args.enable_chip_swimlane,
-            # Resident prefill heap capacity.
+            # Resident MoE heap capacity.
             ring_heap=2 * 1024**3,
             log_level=args.log_level,
         ),
