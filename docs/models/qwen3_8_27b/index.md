@@ -69,7 +69,8 @@ rest of the block and are not built yet.
 
 Each operator file is its own test. It owns the float64 torch reference for its own
 stage, builds its inputs by calling the references of the stages before it, computes a
-golden and scores the device result on relative Frobenius norm.
+golden, and scores the device result with the harness's `ratio_reldiff` per point plus a
+relative Frobenius norm over the whole output.
 [reference.py](../../../models/qwen3_8_27b/reference.py) holds only what they share: the
 drawn inputs, the two layout conversions and the acceptance criterion.
 A default invocation runs each entry's `DEFAULT_CASES`: a single chunk where the entry

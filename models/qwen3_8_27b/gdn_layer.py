@@ -137,49 +137,49 @@ def delta_rule_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 _INPUTS: dict = {}
 
 
-def _inputs(t: int, h: int, d: int, hg: int) -> dict:
+def _inputs(t: int) -> dict:
     """The drawn q, k, v, beta and g, memoised so the five specs pay for them once."""
-    key = (t, h, d, hg)
+    key = t
     if key not in _INPUTS:
-        _INPUTS[key] = make_inputs(t, h, d, hg)
+        _INPUTS[key] = make_inputs(t, H, D, HG)
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE, hg: int = HG):
+def build_tensor_specs(t: int = BENCH_SEQ):
     from golden import TensorSpec
 
     def init_tril():
-        return torch.tril(torch.ones(chunk, chunk, dtype=torch.float32))
+        return torch.tril(torch.ones(CHUNK_TILE, CHUNK_TILE, dtype=torch.float32))
 
     def init_mask_strict():
-        rows = torch.arange(chunk)[:, None]
-        cols = torch.arange(chunk)[None, :]
+        rows = torch.arange(CHUNK_TILE)[:, None]
+        cols = torch.arange(CHUNK_TILE)[None, :]
         return (rows > cols).float()
 
     def draw(key, transform=None):
         def make():
-            value = _inputs(t, h, d, hg)[key]
+            value = _inputs(t)[key]
             return transform(value) if transform is not None else value
 
         return make
 
     return [
-        TensorSpec("q", [t, hg, d], torch.float16, init_value=draw("q")),
-        TensorSpec("k", [t, hg, d], torch.float16, init_value=draw("k")),
-        TensorSpec("v", [t, h, d], torch.float16, init_value=draw("v")),
-        TensorSpec("g", [t, h], torch.float32, init_value=draw("g")),
-        TensorSpec("beta", [h, t], torch.float32,
+        TensorSpec("q", [t, HG, D], torch.float16, init_value=draw("q")),
+        TensorSpec("k", [t, HG, D], torch.float16, init_value=draw("k")),
+        TensorSpec("v", [t, H, D], torch.float16, init_value=draw("v")),
+        TensorSpec("g", [t, H], torch.float32, init_value=draw("g")),
+        TensorSpec("beta", [H, t], torch.float32,
                    init_value=draw("beta", to_hT)),
-        TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
-        TensorSpec("mask_strict", [chunk, chunk], torch.float32,
+        TensorSpec("tril", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_tril),
+        TensorSpec("mask_strict", [CHUNK_TILE, CHUNK_TILE], torch.float32,
                    init_value=init_mask_strict),
-        TensorSpec("eye", [chunk, chunk], torch.float16,
-                   init_value=lambda: solve_tril.eye_block(chunk)),
-        TensorSpec("m_diag", [chunk, chunk], torch.float16,
-                   init_value=lambda: solve_tril.blk_masks(chunk)[0]),
-        TensorSpec("m_low", [chunk, chunk], torch.float16,
-                   init_value=lambda: solve_tril.blk_masks(chunk)[1]),
-        TensorSpec("o_out", [t, h, d], torch.float16),
+        TensorSpec("eye", [CHUNK_TILE, CHUNK_TILE], torch.float16,
+                   init_value=lambda: solve_tril.eye_block(CHUNK_TILE)),
+        TensorSpec("m_diag", [CHUNK_TILE, CHUNK_TILE], torch.float16,
+                   init_value=lambda: solve_tril.blk_masks()[0]),
+        TensorSpec("m_low", [CHUNK_TILE, CHUNK_TILE], torch.float16,
+                   init_value=lambda: solve_tril.blk_masks()[1]),
+        TensorSpec("o_out", [t, H, D], torch.float16),
     ]
 
 

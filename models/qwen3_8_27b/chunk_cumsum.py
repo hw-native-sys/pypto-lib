@@ -70,34 +70,33 @@ def cumsum_ref(g: torch.Tensor, chunk: int) -> torch.Tensor:
 _INPUTS: dict = {}
 
 
-def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
+def _inputs(t: int) -> dict:
     """The chain this stage consumes, memoised so the several specs pay for it once."""
-    key = (t, h, d, chunk, hg)
+    key = t
     if key not in _INPUTS:
-        _INPUTS[key] = make_inputs(t, h, d, hg)
+        _INPUTS[key] = make_inputs(t, H, D, HG)
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE, hg: int = HG):
-    # hg only picks which reference chain to draw from; this stage reads no q or k.
+def build_tensor_specs(t: int = BENCH_SEQ):
     from golden import TensorSpec
 
     def draw(key, transform=None):
         def make():
-            value = _inputs(t, h, d, chunk, hg)[key]
+            value = _inputs(t)[key]
             return transform(value) if transform is not None else value
 
         return make
 
 
     def init_tril():
-        return torch.tril(torch.ones(chunk, chunk, dtype=torch.float32))
+        return torch.tril(torch.ones(CHUNK_TILE, CHUNK_TILE, dtype=torch.float32))
 
     return [
-        TensorSpec("g", [t, h], torch.float32,
+        TensorSpec("g", [t, H], torch.float32,
                    init_value=draw("g")),
-        TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
-        TensorSpec("g_sum", [h, t], torch.float32),
+        TensorSpec("tril", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_tril),
+        TensorSpec("g_sum", [H, t], torch.float32),
     ]
 
 

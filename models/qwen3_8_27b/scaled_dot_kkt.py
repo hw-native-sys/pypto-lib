@@ -118,40 +118,40 @@ def kkt_ref(k: torch.Tensor, beta: torch.Tensor, g_sum: torch.Tensor, chunk: int
 _INPUTS: dict = {}
 
 
-def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
+def _inputs(t: int) -> dict:
     """The chain this stage consumes, memoised so the several specs pay for it once."""
-    key = (t, h, d, chunk, hg)
+    key = t
     if key not in _INPUTS:
-        st = make_inputs(t, h, d, hg)
-        st["g_sum"] = cumsum_ref(st["g"], chunk)
+        st = make_inputs(t, H, D, HG)
+        st["g_sum"] = cumsum_ref(st["g"], CHUNK_TILE)
         _INPUTS[key] = st
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE, hg: int = HG):
+def build_tensor_specs(t: int = BENCH_SEQ):
     from golden import TensorSpec
 
     def draw(key, transform=None):
         def make():
-            value = _inputs(t, h, d, chunk, hg)[key]
+            value = _inputs(t)[key]
             return transform(value) if transform is not None else value
 
         return make
 
     def init_mask():
-        rows = torch.arange(chunk)[:, None]
-        cols = torch.arange(chunk)[None, :]
+        rows = torch.arange(CHUNK_TILE)[:, None]
+        cols = torch.arange(CHUNK_TILE)[None, :]
         return (rows > cols).float()
 
     return [
-        TensorSpec("k", [t, hg, d], torch.float16,
+        TensorSpec("k", [t, HG, D], torch.float16,
                    init_value=draw("k")),
-        TensorSpec("beta", [h, t], torch.float32,
+        TensorSpec("beta", [H, t], torch.float32,
                    init_value=draw("beta", to_hT)),
-        TensorSpec("g_sum", [h, t], torch.float32,
+        TensorSpec("g_sum", [H, t], torch.float32,
                    init_value=draw("g_sum", to_hT)),
-        TensorSpec("mask", [chunk, chunk], torch.float32, init_value=init_mask),
-        TensorSpec("a_out", [t, h, chunk], torch.float16),
+        TensorSpec("mask", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_mask),
+        TensorSpec("a_out", [t, H, CHUNK_TILE], torch.float16),
     ]
 
 

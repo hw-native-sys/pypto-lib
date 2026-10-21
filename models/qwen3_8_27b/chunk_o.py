@@ -139,54 +139,54 @@ def chunk_o_ref(q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
 _INPUTS: dict = {}
 
 
-def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
+def _inputs(t: int) -> dict:
     """The chain this stage consumes, memoised so the several specs pay for it once."""
-    key = (t, h, d, chunk, hg)
+    key = t
     if key not in _INPUTS:
-        st = make_inputs(t, h, d, hg)
-        st["g_sum"] = cumsum_ref(st["g"], chunk)
-        a16 = kkt_ref(st["k"], st["beta"], st["g_sum"], chunk).to(torch.float16)
-        a_inv16 = solve_tril_ref(a16, chunk).to(torch.float16)
-        w, u = wy_fast_ref(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], chunk)
+        st = make_inputs(t, H, D, HG)
+        st["g_sum"] = cumsum_ref(st["g"], CHUNK_TILE)
+        a16 = kkt_ref(st["k"], st["beta"], st["g_sum"], CHUNK_TILE).to(torch.float16)
+        a_inv16 = solve_tril_ref(a16, CHUNK_TILE).to(torch.float16)
+        w, u = wy_fast_ref(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], CHUNK_TILE)
         w16 = w.to(torch.float16)
         u16 = u.to(torch.float16)
-        state, v_new, _ = chunk_h_ref(st["k"], w16, u16, st["g_sum"], chunk)
+        state, v_new, _ = chunk_h_ref(st["k"], w16, u16, st["g_sum"], CHUNK_TILE)
         st["state"] = state
         st["v_new16"] = v_new.to(torch.float16)
         _INPUTS[key] = st
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE, hg: int = HG):
+def build_tensor_specs(t: int = BENCH_SEQ):
     from golden import TensorSpec
 
     def draw(key, transform=None):
         def make():
-            value = _inputs(t, h, d, chunk, hg)[key]
+            value = _inputs(t)[key]
             return transform(value) if transform is not None else value
 
         return make
 
-    nc = t // chunk
+    nc = t // CHUNK_TILE
 
     def init_mask():
-        rows = torch.arange(chunk)[:, None]
-        cols = torch.arange(chunk)[None, :]
+        rows = torch.arange(CHUNK_TILE)[:, None]
+        cols = torch.arange(CHUNK_TILE)[None, :]
         return (rows >= cols).float()      # inclusive diagonal
 
     return [
-        TensorSpec("q", [t, hg, d], torch.float16,
+        TensorSpec("q", [t, HG, D], torch.float16,
                    init_value=draw("q")),
-        TensorSpec("k", [t, hg, d], torch.float16,
+        TensorSpec("k", [t, HG, D], torch.float16,
                    init_value=draw("k")),
-        TensorSpec("v", [t, h, d], torch.float16,
+        TensorSpec("v", [t, H, D], torch.float16,
                    init_value=draw("v_new16")),
-        TensorSpec("state", [nc * h * d, d], torch.float16,
+        TensorSpec("state", [nc * H * D, D], torch.float16,
                    init_value=draw("state", flat_state)),
-        TensorSpec("g_sum", [h, t], torch.float32,
+        TensorSpec("g_sum", [H, t], torch.float32,
                    init_value=draw("g_sum", to_hT)),
-        TensorSpec("mask", [chunk, chunk], torch.float32, init_value=init_mask),
-        TensorSpec("o_out", [t, h, d], torch.float16),
+        TensorSpec("mask", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_mask),
+        TensorSpec("o_out", [t, H, D], torch.float16),
     ]
 
 

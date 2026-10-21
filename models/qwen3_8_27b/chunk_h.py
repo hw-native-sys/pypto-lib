@@ -148,44 +148,44 @@ def chunk_h_ref(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.
 _INPUTS: dict = {}
 
 
-def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
+def _inputs(t: int) -> dict:
     """The chain this stage consumes, memoised so the several specs pay for it once."""
-    key = (t, h, d, chunk, hg)
+    key = t
     if key not in _INPUTS:
-        st = make_inputs(t, h, d, hg)
-        st["g_sum"] = cumsum_ref(st["g"], chunk)
-        a16 = kkt_ref(st["k"], st["beta"], st["g_sum"], chunk).to(torch.float16)
-        a_inv16 = solve_tril_ref(a16, chunk).to(torch.float16)
-        w, u = wy_fast_ref(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], chunk)
+        st = make_inputs(t, H, D, HG)
+        st["g_sum"] = cumsum_ref(st["g"], CHUNK_TILE)
+        a16 = kkt_ref(st["k"], st["beta"], st["g_sum"], CHUNK_TILE).to(torch.float16)
+        a_inv16 = solve_tril_ref(a16, CHUNK_TILE).to(torch.float16)
+        w, u = wy_fast_ref(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], CHUNK_TILE)
         st["w16"] = w.to(torch.float16)
         st["u16"] = u.to(torch.float16)
         _INPUTS[key] = st
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE, hg: int = HG):
+def build_tensor_specs(t: int = BENCH_SEQ):
     from golden import TensorSpec
 
     def draw(key, transform=None):
         def make():
-            value = _inputs(t, h, d, chunk, hg)[key]
+            value = _inputs(t)[key]
             return transform(value) if transform is not None else value
 
         return make
 
-    nc = t // chunk
+    nc = t // CHUNK_TILE
 
     return [
-        TensorSpec("k", [t, hg, d], torch.float16,
+        TensorSpec("k", [t, HG, D], torch.float16,
                    init_value=draw("k")),
-        TensorSpec("w", [t, h, d], torch.float16,
+        TensorSpec("w", [t, H, D], torch.float16,
                    init_value=draw("w16")),
-        TensorSpec("u", [t, h, d], torch.float16,
+        TensorSpec("u", [t, H, D], torch.float16,
                    init_value=draw("u16")),
-        TensorSpec("g_sum", [h, t], torch.float32,
+        TensorSpec("g_sum", [H, t], torch.float32,
                    init_value=draw("g_sum", to_hT)),
-        TensorSpec("state", [nc * h * d, d], torch.float16),
-        TensorSpec("v_new", [t, h, d], torch.float16),
+        TensorSpec("state", [nc * H * D, D], torch.float16),
+        TensorSpec("v_new", [t, H, D], torch.float16),
     ]
 
 

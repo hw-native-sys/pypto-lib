@@ -161,39 +161,37 @@ def solve_tril_ref(a: torch.Tensor, chunk: int) -> torch.Tensor:
 _INPUTS: dict = {}
 
 
-def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
+def _inputs(t: int) -> dict:
     """The chain this stage consumes, memoised so the several specs pay for it once."""
-    key = (t, h, d, chunk, hg)
+    key = t
     if key not in _INPUTS:
-        st = make_inputs(t, h, d, hg)
-        g_sum = cumsum_ref(st["g"], chunk)
-        st["a16"] = kkt_ref(st["k"], st["beta"], g_sum, chunk).to(torch.float16)
+        st = make_inputs(t, H, D, HG)
+        g_sum = cumsum_ref(st["g"], CHUNK_TILE)
+        st["a16"] = kkt_ref(st["k"], st["beta"], g_sum, CHUNK_TILE).to(torch.float16)
         _INPUTS[key] = st
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
-                       hg: int = HG, block: int = BLOCK_TILE):
-    # hg only picks which reference chain to draw from; this stage reads no q or k.
+def build_tensor_specs(t: int = BENCH_SEQ):
     from golden import TensorSpec
 
     def draw(key, transform=None):
         def make():
-            value = _inputs(t, h, d, chunk, hg)[key]
+            value = _inputs(t)[key]
             return transform(value) if transform is not None else value
 
         return make
 
     return [
-        TensorSpec("a_in", [t, h, chunk], torch.float16,
+        TensorSpec("a_in", [t, H, CHUNK_TILE], torch.float16,
                    init_value=draw("a16")),
-        TensorSpec("eye", [chunk, chunk], torch.float16,
-                   init_value=lambda: eye_block(chunk)),
-        TensorSpec("m_diag", [chunk, chunk], torch.float16,
-                   init_value=lambda: blk_masks(chunk, block)[0]),
-        TensorSpec("m_low", [chunk, chunk], torch.float16,
-                   init_value=lambda: blk_masks(chunk, block)[1]),
-        TensorSpec("t_out", [t, h, chunk], torch.float16),
+        TensorSpec("eye", [CHUNK_TILE, CHUNK_TILE], torch.float16,
+                   init_value=lambda: eye_block(CHUNK_TILE)),
+        TensorSpec("m_diag", [CHUNK_TILE, CHUNK_TILE], torch.float16,
+                   init_value=lambda: blk_masks()[0]),
+        TensorSpec("m_low", [CHUNK_TILE, CHUNK_TILE], torch.float16,
+                   init_value=lambda: blk_masks()[1]),
+        TensorSpec("t_out", [t, H, CHUNK_TILE], torch.float16),
     ]
 
 
