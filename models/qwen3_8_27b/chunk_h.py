@@ -38,7 +38,10 @@ KEY_WIDTH = HG * D
 VAL_WIDTH = H * D
 
 # validation
-BENCH_SEQ = 8192        # prefill tokens, this entry's default case
+# One chunk, the cross-chunk recurrence, then eight chunks. The token count must be a
+# multiple of CHUNK_TILE.
+DEFAULT_CASES = (128, 256, 1024)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 
 def _gdn_chunk_h(
@@ -205,25 +208,33 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="run this one shape instead of DEFAULT_CASES")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
-    if args.seq_len % CHUNK_TILE:
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % CHUNK_TILE:
         parser.error(f"--seq-len must be a multiple of CHUNK_TILE={CHUNK_TILE}")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
-    result = run(
-        fn=gdn_chunk_h_test,
-        specs=build_tensor_specs(t=args.seq_len),
-        golden_fn=golden_gdn_chunk_h,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-        compare_fn={"state": frob_ok("state"), "v_new": frob_ok("v_new")},
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] chunk_h T={t}", flush=True)
+        result = run(
+            fn=gdn_chunk_h_test,
+            specs=build_tensor_specs(t=t),
+            golden_fn=golden_gdn_chunk_h,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            compare_fn={"state": frob_ok("state"), "v_new": frob_ok("v_new")},
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            # Stop at the first failure: one device failure poisons the chip run lane, so
+            # every later case in this process reports a failure it did not cause.
+            raise SystemExit(f"FAILED at T={t}")

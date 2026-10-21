@@ -40,7 +40,10 @@ D = QWEN3_8_27B.linear_value_head_dim       # head dimension
 VAL_WIDTH = H * D
 
 # validation
-BENCH_SEQ = 8192        # prefill tokens, this entry's default case
+# The minimum dispatch, then two of them. One chunk is below DISPATCH_TOKENS, so this
+# entry has no single-chunk case.
+DEFAULT_CASES = (512, 1024)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # Bytes per ring, one entry per scope depth, 0 leaving a ring at its default. The stage
 # scopes allocate on ring 1, the only ring the default cannot hold at BENCH_SEQ; a scalar
@@ -198,27 +201,35 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="run this one shape instead of DEFAULT_CASES")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0,
                         choices=range(5))
     args = parser.parse_args()
-    if args.seq_len % DISPATCH_TOKENS:
-        parser.error(f"--seq-len must be a multiple of {DISPATCH_TOKENS}")
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % DISPATCH_TOKENS:
+        parser.error(f"--seq-len must be a multiple of DISPATCH_TOKENS={DISPATCH_TOKENS}")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
-    result = run(
-        fn=gdn_layer_test,
-        specs=build_tensor_specs(t=args.seq_len),
-        golden_fn=golden_gdn_layer,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=run_config(args.backend_type, args.execution_mode, args.device, args.enable_chip_swimlane),
-        compare_fn={"o_out": frob_ok("o_out")},
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] gdn_layer T={t}", flush=True)
+        result = run(
+            fn=gdn_layer_test,
+            specs=build_tensor_specs(t=t),
+            golden_fn=golden_gdn_layer,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=run_config(args.backend_type, args.execution_mode, args.device, args.enable_chip_swimlane),
+            compare_fn={"o_out": frob_ok("o_out")},
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            # Stop at the first failure: one device failure poisons the chip run lane, so
+            # every later case in this process reports a failure it did not cause.
+            raise SystemExit(f"FAILED at T={t}")

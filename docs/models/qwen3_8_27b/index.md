@@ -72,13 +72,16 @@ stage, builds its inputs by calling the references of the stages before it, comp
 golden and scores the device result on relative Frobenius norm.
 [reference.py](../../../models/qwen3_8_27b/reference.py) holds only what they share: the
 drawn inputs, the two layout conversions and the acceptance criterion.
+A default invocation runs each entry's `DEFAULT_CASES`: a single chunk where the entry
+supports one, the cross-chunk recurrence, and the minimum dispatch. `--seq-len` runs one
+shape instead, and `BENCH_SEQ = 8192` is the prefill shape a performance run names.
 `PYPTO_BENCH=1` turns any of them into a benchmark, and the harness prints the median
 `effective_us`.
 
 ```bash
 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0
-python models/qwen3_8_27b/solve_tril.py -p a2a3 -d 0
-python models/qwen3_8_27b/chunk_h.py -p a2a3 --sim --seq-len 1024
+python models/qwen3_8_27b/chunk_h.py -p a2a3 --sim
+PYPTO_BENCH=1 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0 --seq-len 8192
 ```
 
 These are device entry points, not pytest cases: they need an NPU and a compile,
