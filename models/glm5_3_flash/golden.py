@@ -93,7 +93,9 @@ def gate(
     masking of ``DeepseekV3TopkRouter`` degenerates to a plain top-k.
     """
     scores = torch.sigmoid(F.linear(x.float(), weight.float()))
-    indices = (scores + correction_bias.float()).topk(FLASH.num_experts_per_tok, dim=-1).indices
+    biased = scores + correction_bias.float()
+    # Exact corrected-score ties keep ascending expert ids.
+    indices = torch.argsort(-biased, dim=-1, stable=True)[..., :FLASH.num_experts_per_tok]
     weights = scores.gather(-1, indices)
     if FLASH.norm_topk_prob:
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
