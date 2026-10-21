@@ -49,6 +49,7 @@ assert MOE_INTER % MX_W2_K_TILE == 0
 assert MX_W2_K_TILE % MX_W2_RIGHT_K_TILE == 0
 ACT_INTER_TILE = 256
 D_OUT_TILE = 256
+W2_TASK_TILE = 512
 QUANT_TILE = 768
 QUANT_GROUPS = QUANT_TILE // 32
 QUANT_SCALE_TMP = ((64 + (SH_M_TILE // 16) * QUANT_GROUPS + 31) // 32) * 32
@@ -295,7 +296,7 @@ def expert_shared(
             layout=pl.MX_A_ZZ,
         )
         # Synchronize Cube/Vector startup (pypto#2829) within available clusters.
-        workers = pl.min(D // D_OUT_TILE, pl.system.available_cluster_count())
+        workers = pl.min(D // W2_TASK_TILE, pl.system.available_cluster_count())
         for worker in pl.spmd(workers, name_hint="sh_w2_mm", sync_start=True):
             block_num = pl.tile.get_block_num()
             for wave in pl.range((D // D_OUT_TILE + block_num - 1) // block_num):

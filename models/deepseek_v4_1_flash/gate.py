@@ -34,6 +34,7 @@ N_HASH_LAYERS = 0
 
 # tiling
 GATE_T_TILE = 8
+GATE_INPUT_TILE = 8
 assert T % GATE_T_TILE == 0
 GATE_M_TILE = 16
 GATE_N_TILE = 16
@@ -120,21 +121,16 @@ def gate_normalized(
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
     task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
-    active_mask = pl.cast(pl.min(pl.max(num_tokens, 0), 1), pl.FP32)
     task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
-    for init_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // GATE_D_TILE), name_hint="gate_normalized_zero"):
-        init_t = (init_idx // (D // GATE_D_TILE)) * GATE_M_TILE
-        init_k = (init_idx % (D // GATE_D_TILE)) * GATE_D_TILE
-        xg_buf[init_t : init_t + GATE_M_TILE, init_k : init_k + GATE_D_TILE] = pl.full(
-            [GATE_M_TILE, GATE_D_TILE], dtype=pl.FP32, value=0.0
-        )
-
-    for tok in pl.spmd(task_tokens, name_hint="gate_normalized_input"):
-        normalized = pl.cast(pl.tile.load(x_normed, [tok, 0], [1, D]), pl.FP32)
-        normalized = pl.mul(normalized, active_mask)
-        pl.tile.store(normalized, [tok, 0], xg_buf, shapes=[1, D])
+    for block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="gate_normalized_input"):
+        t0 = block * GATE_INPUT_TILE
+        valid_rows = pl.min(GATE_INPUT_TILE, pl.max(active_tokens - t0, 0))
+        normalized = pl.slice(x_normed, [GATE_INPUT_TILE, D], [t0, 0], valid_shape=[valid_rows, D])
+        normalized = pl.fillpad(normalized, pad_value=pl.PadValue.zero)
+        normalized = pl.set_validshape(normalized, GATE_INPUT_TILE, D)
+        xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = pl.cast(normalized, pl.FP32)
 
     for quant_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), name_hint="x_norm_mx_quant"):
         tile_idx = quant_idx // (D // QUANT_TASK_TILE)

@@ -87,7 +87,8 @@ IDX_PAD = ROUTE_WIDTH
 SIGNAL_PAD = 128  # 512-byte padded monotonic counter lane
 
 # tiling
-SCALE_COPY_TILE = 256
+DISPATCH_COPY_TILE = 8
+DISPATCH_STAGE_TILE = 8
 SCALE_PACK_TMP_TILE = ((64 + K_SCALE + 31) // 32) * 32
 RECV_TILE = 16
 
@@ -138,16 +139,14 @@ def dispatch(
 ):
     # MX_A_ZZ scale backing: [1, M/16, G/2, 16, 2].
     x_norm_mx_raw = pl.create_tensor([T, D], dtype=pl.INT8)
-    with pl.spmd(T, name_hint="dispatch_fp8_raw_copy"):
-        copy_row = pl.tile.get_block_idx()
-        raw_row = pl.load(x_norm_mx, [copy_row, 0], [1, D])
+    x_norm_scale_raw = pl.create_tensor([1, T * K_SCALE], dtype=pl.UINT8)
+    with pl.spmd(T // DISPATCH_COPY_TILE, name_hint="dispatch_raw_copy"):
+        copy_row = pl.tile.get_block_idx() * DISPATCH_COPY_TILE
+        raw_row = pl.load(x_norm_mx, [copy_row, 0], [DISPATCH_COPY_TILE, D])
         raw_row_i8 = pl.reinterpret_view(raw_row, pl.INT8)
         x_norm_mx_raw = pl.store(raw_row_i8, [copy_row, 0], x_norm_mx_raw)
-
-    x_norm_scale_raw = pl.create_tensor([1, T * K_SCALE], dtype=pl.UINT8)
-    with pl.spmd((T * K_SCALE) // SCALE_COPY_TILE, name_hint="dispatch_e8m0_raw_copy"):
-        scale_copy_offset = pl.tile.get_block_idx() * SCALE_COPY_TILE
-        raw_scale = pl.load(x_norm_scale, [0, scale_copy_offset], [1, SCALE_COPY_TILE])
+        scale_copy_offset = copy_row * K_SCALE
+        raw_scale = pl.load(x_norm_scale, [0, scale_copy_offset], [1, DISPATCH_COPY_TILE * K_SCALE])
         raw_scale_u8 = pl.reinterpret_view(raw_scale, pl.UINT8)
         x_norm_scale_raw = pl.store(raw_scale_u8, [0, scale_copy_offset], x_norm_scale_raw)
 
@@ -159,13 +158,16 @@ def dispatch(
     scale_src = pl.create_tensor([T, K_SCALE], dtype=pl.UINT8, manual_dep=True)
 
     x_norm_scale_physical = pl.tensor.view(x_norm_scale_raw, [1, T // 16, K_SCALE // 2, 16, 2], layout=pl.ND)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_stage", deps=[_reuse_tid]) as _stage_tid:
+    with pl.spmd(T // DISPATCH_STAGE_TILE, name_hint="dispatch_stage", deps=[_reuse_tid]) as _stage_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
-        for t in pl.range(active_tokens):
+        # Each block owns whole 64-byte lines in the UINT8 scale buffer.
+        t_begin = pl.tile.get_block_idx() * DISPATCH_STAGE_TILE
+        t_end = pl.min(t_begin + DISPATCH_STAGE_TILE, active_tokens)
+        for t in pl.range(t_begin, t_end):
             for group in pl.range(K_SCALE):
                 scale = pl.read(x_norm_scale_physical, [0, t // 16, group // 2, t % 16, group % 2])
                 pl.write(scale_src, [t, group], scale)
@@ -346,7 +348,6 @@ def combine_scattered(
     ffn_out: pl.Tensor[[T, D], pl.BF16],
     routed_output: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, N_LOCAL, SIGNAL_PAD], pl.INT32],
-    output_ready: pl.Scalar[pl.TASK_ID],
     scatter_done: pl.Scalar[pl.TASK_ID],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -369,7 +370,7 @@ def combine_scattered(
                 )
 
     # Wait for local and peer routed-output stores.
-    with pl.spmd(T, name_hint="combine_reduce", deps=[_cwait_tid, output_ready]) as _reduce_tid:
+    with pl.spmd(T, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
         t = pl.tile.get_block_idx()
         if t < num_tokens:
             shared_row = pl.load(shared_output, [t, 0], [1, D])
@@ -380,6 +381,9 @@ def combine_scattered(
                 acc = pl.add(acc, routed_fp32)
             ffn_row = pl.cast(acc, target_type=pl.BF16, mode="rint")
             ffn_out = pl.store(ffn_row, [t, 0], ffn_out)
+        else:
+            zero_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+            ffn_out = pl.store(zero_row, [t, 0], ffn_out)
     return _reduce_tid
 
 
@@ -437,11 +441,6 @@ def moe(
     # MoE transport and routed-result scope.
     with pl.scope():
         sublayer = pl.create_tensor([t, D], dtype=pl.BF16)
-        with pl.spmd(t, name_hint="moe_output_zero") as _output_zero_tid:
-            zero_t = pl.tile.get_block_idx()
-            zero_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
-            sublayer = pl.store(zero_row, [zero_t, 0], sublayer)
-
         x_norm_mx = pl.create_tensor([t, D], dtype=pl.FP8E4M3FN)
         x_norm_scale = pl.create_tensor([1, t * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         indices = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
@@ -487,7 +486,7 @@ def moe(
         output_ready = combine_scattered(
             shared_output, sublayer,
             routed_output, combine_arrived,
-            _output_zero_tid, scatter_done,
+            scatter_done,
             num_tokens, ep_rank, moe_epoch,
         )
         # Complete all peer readers before reusing the windows.

@@ -40,7 +40,7 @@ LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 D_TILE = 2560
 OUT_TILE = 2
 D_TILES = D // D_TILE
-POST_SPMD_BLOCKS = 4096
+POST_SPMD_BLOCKS = 64
 
 
 @pl.jit.inline
@@ -105,76 +105,79 @@ def hc_mixes(
     scale0 = pl.read(scale, [0])
     scale1 = pl.read(scale, [1])
     scale2 = pl.read(scale, [2])
-    with pl.spmd((t_dim + COMB_T_TILE - 1) // COMB_T_TILE, name_hint="mhc_split_sinkhorn") as mixes_ready:
-        block = pl.tile.get_block_idx()
-        t0 = block * COMB_T_TILE
-        valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
-        inv_scalar = pl.read(inv_rms, [t0, 0])
-        total = pl.load(
-            mixes_partials,
-            [t0, 0],
-            [COMB_T_TILE, MIX_PAD],
-            valid_shape=[valid_rows, MIX_HC],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        partial1 = pl.load(
-            mixes_partials,
-            [t_linear + t0, 0],
-            [COMB_T_TILE, MIX_PAD],
-            valid_shape=[valid_rows, MIX_HC],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        partial2 = pl.load(
-            mixes_partials,
-            [2 * t_linear + t0, 0],
-            [COMB_T_TILE, MIX_PAD],
-            valid_shape=[valid_rows, MIX_HC],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        partial3 = pl.load(
-            mixes_partials,
-            [3 * t_linear + t0, 0],
-            [COMB_T_TILE, MIX_PAD],
-            valid_shape=[valid_rows, MIX_HC],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        total = pl.add(pl.add(total, partial1), pl.add(partial2, partial3))
-        pre_logits = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
-        post_logits = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
-        for j in pl.unroll(HC_PAD):
-            pre_value_j = pl.tile.read(total, [0, j]) * inv_scalar * scale0 + pl.read(base, [j])
-            post_value_j = (
-                pl.tile.read(total, [0, HC_MULT + j % HC_MULT]) * inv_scalar * scale1
-                + pl.read(base, [HC_MULT + j % HC_MULT])
+    sinkhorn_tasks = (t_dim + COMB_T_TILE - 1) // COMB_T_TILE
+    sinkhorn_workers = pl.min(sinkhorn_tasks, 64)
+    with pl.spmd(sinkhorn_workers, name_hint="mhc_split_sinkhorn") as mixes_ready:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, sinkhorn_tasks, sinkhorn_workers):
+            t0 = block * COMB_T_TILE
+            valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
+            inv_scalar = pl.read(inv_rms, [t0, 0])
+            total = pl.load(
+                mixes_partials,
+                [t0, 0],
+                [COMB_T_TILE, MIX_PAD],
+                valid_shape=[valid_rows, MIX_HC],
+                target_memory=pl.MemorySpace.Vec,
             )
-            pl.tile.write(pre_logits, [0, j], pre_value_j)
-            pl.tile.write(post_logits, [0, j], post_value_j)
-        pre_value = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0)), HC_EPS)
-        post_value = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
-        pl.store(pl.set_validshape(pre_value, valid_rows, HC_MULT), [t0, 0], pre_mix)
-        pl.store(pl.set_validshape(post_value, valid_rows, HC_MULT), [t0, 0], post_mix)
-        comb_offset = HC_MULT * 2
-        logits = pl.tile.full([HC_PAD, HC_PAD], dtype=pl.FP32, value=0.0)
-        for i in pl.unroll(HC_PAD):
+            partial1 = pl.load(
+                mixes_partials,
+                [t_linear + t0, 0],
+                [COMB_T_TILE, MIX_PAD],
+                valid_shape=[valid_rows, MIX_HC],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            partial2 = pl.load(
+                mixes_partials,
+                [2 * t_linear + t0, 0],
+                [COMB_T_TILE, MIX_PAD],
+                valid_shape=[valid_rows, MIX_HC],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            partial3 = pl.load(
+                mixes_partials,
+                [3 * t_linear + t0, 0],
+                [COMB_T_TILE, MIX_PAD],
+                valid_shape=[valid_rows, MIX_HC],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            total = pl.add(pl.add(total, partial1), pl.add(partial2, partial3))
+            pre_logits = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
+            post_logits = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
             for j in pl.unroll(HC_PAD):
-                lane = comb_offset + (i % HC_MULT) * HC_MULT + j % HC_MULT
-                value = pl.tile.read(total, [0, lane]) * inv_scalar * scale2 + pl.read(base, [lane])
-                pl.tile.write(logits, [i, j], value)
-        row_tmp = pl.create_tile([HC_PAD, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-        rows = pl.exp(pl.row_expand_sub(logits, pl.row_max(logits, row_tmp)))
-        rows = pl.add(pl.row_expand_div(rows, pl.mul(pl.row_sum(rows, row_tmp), 0.5)), HC_EPS)
-        rows = pl.col_expand_div(rows, pl.add(pl.mul(pl.col_sum(rows), 0.5), HC_EPS))
-        for _ in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
-            rows = pl.row_expand_div(rows, pl.add(pl.mul(pl.row_sum(rows, row_tmp), 0.5), HC_EPS))
+                pre_value_j = pl.tile.read(total, [0, j]) * inv_scalar * scale0 + pl.read(base, [j])
+                post_value_j = (
+                    pl.tile.read(total, [0, HC_MULT + j % HC_MULT]) * inv_scalar * scale1
+                    + pl.read(base, [HC_MULT + j % HC_MULT])
+                )
+                pl.tile.write(pre_logits, [0, j], pre_value_j)
+                pl.tile.write(post_logits, [0, j], post_value_j)
+            pre_value = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0)), HC_EPS)
+            post_value = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
+            pl.store(pl.set_validshape(pre_value, valid_rows, HC_MULT), [t0, 0], pre_mix)
+            pl.store(pl.set_validshape(post_value, valid_rows, HC_MULT), [t0, 0], post_mix)
+            comb_offset = HC_MULT * 2
+            logits = pl.tile.full([HC_PAD, HC_PAD], dtype=pl.FP32, value=0.0)
+            for i in pl.unroll(HC_PAD):
+                for j in pl.unroll(HC_PAD):
+                    lane = comb_offset + (i % HC_MULT) * HC_MULT + j % HC_MULT
+                    value = pl.tile.read(total, [0, lane]) * inv_scalar * scale2 + pl.read(base, [lane])
+                    pl.tile.write(logits, [i, j], value)
+            row_tmp = pl.create_tile([HC_PAD, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            rows = pl.exp(pl.row_expand_sub(logits, pl.row_max(logits, row_tmp)))
+            rows = pl.add(pl.row_expand_div(rows, pl.mul(pl.row_sum(rows, row_tmp), 0.5)), HC_EPS)
             rows = pl.col_expand_div(rows, pl.add(pl.mul(pl.col_sum(rows), 0.5), HC_EPS))
-        for row in pl.unroll(HC_MULT):
-            logical_row = pl.slice(
-                rows,
-                [1, HC_PAD],
-                [row, 0],
-                valid_shape=[1, HC_MULT],
-            )
-            pl.store(logical_row, [t0, row * HC_MULT], residual_mix_flat)
+            for _ in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
+                rows = pl.row_expand_div(rows, pl.add(pl.mul(pl.row_sum(rows, row_tmp), 0.5), HC_EPS))
+                rows = pl.col_expand_div(rows, pl.add(pl.mul(pl.col_sum(rows), 0.5), HC_EPS))
+            for row in pl.unroll(HC_MULT):
+                logical_row = pl.slice(
+                    rows,
+                    [1, HC_PAD],
+                    [row, 0],
+                    valid_shape=[1, HC_MULT],
+                )
+                pl.store(logical_row, [t0, row * HC_MULT], residual_mix_flat)
     return mixes_ready
 
 
@@ -276,26 +279,26 @@ def hc_post_after(
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
     residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
     output_flat = pl.reshape(output, [t_dim, HC_DIM])
-    total_work = t_dim * HC_MULT
+    total_work = t_dim * (D // D_TILE)
     workers = pl.min(total_work, POST_SPMD_BLOCKS)
     with pl.spmd(workers, name_hint="hc_post", deps=[sublayer_ready, mixes_ready]):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, total_work, POST_SPMD_BLOCKS):
-            t = block // HC_MULT
-            out_h = block % HC_MULT
-            for d0 in pl.pipeline(0, D, 256, stage=2):
-                x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + 256], target_type=pl.FP32)
+            t = block // (D // D_TILE)
+            d0 = (block % (D // D_TILE)) * D_TILE
+            x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + D_TILE], target_type=pl.FP32)
+            residual0 = residual_flat[t : t + 1, d0 : d0 + D_TILE]
+            residual1 = residual_flat[t : t + 1, D + d0 : D + d0 + D_TILE]
+            residual2 = residual_flat[t : t + 1, 2 * D + d0 : 2 * D + d0 + D_TILE]
+            residual3 = residual_flat[t : t + 1, 3 * D + d0 : 3 * D + d0 + D_TILE]
+            for out_h in pl.unroll(HC_MULT):
                 value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
-                for in_h in pl.unroll(HC_MULT):
-                    residual_tile = residual_flat[t : t + 1, in_h * D + d0 : in_h * D + d0 + 256]
-                    value = pl.add(
-                        value,
-                        pl.mul(residual_tile, pl.read(residual_mix_flat, [t, in_h * HC_MULT + out_h])),
-                    )
-                output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + 256] = pl.cast(
-                    pl.cast(value, target_type=pl.BF16, mode="rint"),
-                    target_type=pl.FP32,
-                )
+                value = pl.add(value, pl.mul(residual0, pl.read(residual_mix_flat, [t, out_h])))
+                value = pl.add(value, pl.mul(residual1, pl.read(residual_mix_flat, [t, HC_MULT + out_h])))
+                value = pl.add(value, pl.mul(residual2, pl.read(residual_mix_flat, [t, 2 * HC_MULT + out_h])))
+                value = pl.add(value, pl.mul(residual3, pl.read(residual_mix_flat, [t, 3 * HC_MULT + out_h])))
+                rounded = pl.cast(value, target_type=pl.BF16, mode="rint")
+                output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + D_TILE] = pl.cast(rounded, pl.FP32)
     return output
 
 
