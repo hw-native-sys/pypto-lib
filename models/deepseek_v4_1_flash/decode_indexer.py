@@ -54,6 +54,7 @@ _SCORE_SCALE = (INDEX_DIM * INDEX_H) ** -0.5
 # tiling
 _SCORE_N_TILE = 256
 _SCORE_MACRO_N_TILE = 512
+_KEY_DECODE_TILE = 64
 _PAIR_M_TILE = INDEX_H * 2
 
 
@@ -935,7 +936,7 @@ def _make_page_index_scores(workers, skip_short=False):
 
 
 def _make_paired_block_index_scores(skip_short=False):
-    """Share Q/Qscale across two independent N256 dots over four mapped pages."""
+    """Reuse local K across same-request pairs with independent M64/N256 dots."""
     packed_width = INDEX_DIM // 2
 
     @pl.jit.inline
@@ -950,6 +951,7 @@ def _make_paired_block_index_scores(skip_short=False):
         lengths: pl.Tensor[[T_DYN], pl.INT32],
         output: pl.Tensor,
         num_tokens: pl.Scalar[pl.INT32],
+        pairs_per_group: pl.Scalar[pl.INT32],
         cache_ready: pl.Scalar[pl.TASK_ID],
         query_ready: pl.Scalar[pl.TASK_ID],
         weights_ready: pl.Scalar[pl.TASK_ID],
@@ -961,7 +963,7 @@ def _make_paired_block_index_scores(skip_short=False):
         query_rows = pl.tensor.dim(query, 0) * INDEX_H
         query_flat = pl.reshape(query, [query_rows, INDEX_DIM])
         macro_tiles = (width + _SCORE_MACRO_N_TILE - 1) // _SCORE_MACRO_N_TILE
-        work_items = (num_tokens // 2) * macro_tiles
+        work_items = (num_tokens // (pairs_per_group * 2)) * macro_tiles
 
         with pl.spmd(
             32,
@@ -970,67 +972,26 @@ def _make_paired_block_index_scores(skip_short=False):
             optimizations=[pl.cross_core_slot(slot_num=2)],
         ) as score_tid:
             worker = pl.tile.get_block_idx()
-            lut = _index_key_decode_lut()
 
             for work in pl.range(worker, work_items, 32):
-                first_token = (work // macro_tiles) * 2
+                group_token = (work // macro_tiles) * pairs_per_group * 2
                 macro_index = work % macro_tiles
                 logical_begin = macro_index * _SCORE_MACRO_N_TILE
-                second_token = first_token + 1
-                first_request = pl.read(request_ids, [first_token])
-
-                first_visible = pl.min(pl.read(lengths, [first_token]), width)
-                second_visible = pl.min(pl.read(lengths, [second_token]), width)
-                if skip_short:
-                    if first_visible <= INDEX_TOPK:
-                        first_visible = 0
-                    if second_visible <= INDEX_TOPK:
-                        second_visible = 0
-                maximum_visible = pl.max(first_visible, second_visible)
-                query_pair = pl.load(
-                    query_flat,
-                    [first_token * INDEX_H, 0],
-                    [_PAIR_M_TILE, INDEX_DIM],
-                    target_memory=pl.MemorySpace.Vec,
-                )
-                pair_scale_raw = pl.reinterpret_view(
-                    pl.load(
-                        query_scale,
-                        [first_token, 0],
-                        [2, INDEX_H * _SCALE_COUNT],
-                        target_memory=pl.MemorySpace.Vec,
-                    ),
-                    pl.UINT8,
-                )
-                pair_scale_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-                pair_scale_zz = pl.reinterpret_view(
-                    pl.tmov_x2zz(
-                        pl.reshape(pair_scale_raw, [1, _PAIR_M_TILE * _SCALE_COUNT]),
-                        pair_scale_tmp,
-                        group_axis=1,
-                        dst_rows=_PAIR_M_TILE,
-                        dst_cols=_SCALE_COUNT,
-                    ),
-                    pl.FP8E8M0,
-                )
-                query_mat = pl.tile.move(
-                    query_pair,
-                    target_memory=pl.MemorySpace.Mat,
-                    blayout=pl.TileLayout.row_major,
-                    slayout=pl.TileLayout.row_major,
-                )
-                query_left = pl.tile.move(query_mat, target_memory=pl.MemorySpace.Left)
-                pair_scale_mat = pl.tile.move(
-                    pair_scale_zz,
-                    target_memory=pl.MemorySpace.Mat,
-                    blayout=pl.TileLayout.row_major,
-                    slayout=pl.TileLayout.row_major,
-                )
-                pair_scale_left = pl.tile.move(pair_scale_mat, target_memory=pl.MemorySpace.LeftScale)
+                first_request = pl.read(request_ids, [group_token])
+                maximum_visible = 0
+                for shared_pair in pl.range(pairs_per_group):
+                    pair_token = group_token + shared_pair * 2
+                    first_visible = pl.min(pl.read(lengths, [pair_token]), width)
+                    second_visible = pl.min(pl.read(lengths, [pair_token + 1]), width)
+                    if skip_short:
+                        if first_visible <= INDEX_TOPK:
+                            first_visible = 0
+                        if second_visible <= INDEX_TOPK:
+                            second_visible = 0
+                    maximum_visible = pl.max(maximum_visible, pl.max(first_visible, second_visible))
 
                 for half_index in pl.unroll(2):
                     half_begin = logical_begin + half_index * _SCORE_N_TILE
-
                     if half_begin < maximum_visible:
                         packed = pl.tile.full([_SCORE_N_TILE, packed_width], dtype=pl.INT8, value=0)
                         raw_scale = pl.tile.full([1, _SCORE_N_TILE * _SCALE_COUNT], dtype=pl.INT8, value=127)
@@ -1071,17 +1032,20 @@ def _make_paired_block_index_scores(skip_short=False):
                                         [0, page_offset * _PAGE_SIZE * _SCALE_COUNT],
                                     )
 
-                        byte_values = pl.ands(pl.cast(packed, pl.INT16), 255)
-                        low = pl.ands(byte_values, 15)
-                        high = pl.ands(pl.shrs(byte_values, 4), 15)
-                        lut_tmp = pl.create_tile([1, 32], dtype=pl.UINT8)
-                        low_bytes = pl.tile.gather(lut, low, lut_tmp)
-                        high_bytes = pl.tile.gather(lut, high, lut_tmp)
-                        interleaved_words = pl.or_(low_bytes, pl.shls(high_bytes, 8))
-                        keys = pl.reinterpret_view(
-                            pl.reinterpret_view(interleaved_words, pl.INT8, shape=[_SCORE_N_TILE, INDEX_DIM]),
-                            pl.FP8E4M3FN,
-                        )
+                        key_bytes = pl.tile.full([_SCORE_N_TILE, INDEX_DIM], dtype=pl.INT8, value=0)
+                        # Static UB slice offsets for packed FP4 aliases.
+                        for decode_part in pl.unroll(_SCORE_N_TILE // _KEY_DECODE_TILE):
+                            packed_part = pl.tile.slice(
+                                packed, [_KEY_DECODE_TILE, packed_width],
+                                [decode_part * _KEY_DECODE_TILE, 0],
+                            )
+                            packed_u8 = pl.reinterpret_view(packed_part, pl.UINT8)
+                            packed_fp4 = pl.reinterpret_view(packed_u8, pl.FP4E2M1X2)
+                            exact_values = pl.cast(packed_fp4, pl.BF16)
+                            keys = pl.cast(exact_values, pl.FP8E4M3FN, mode="rint")
+                            key_flat = pl.reshape(keys, [1, _KEY_DECODE_TILE * INDEX_DIM])
+                            decoded_bytes = pl.reinterpret_view(key_flat, pl.INT8, shape=[_KEY_DECODE_TILE, INDEX_DIM])
+                            key_bytes = pl.tile.assemble(key_bytes, decoded_bytes, [decode_part * _KEY_DECODE_TILE, 0])
                         key_scale_tmp = pl.create_tile([1, 128], dtype=pl.UINT8)
                         key_scale_zz = pl.reinterpret_view(
                             pl.tmov_x2zz(
@@ -1094,73 +1058,122 @@ def _make_paired_block_index_scores(skip_short=False):
                             pl.FP8E8M0,
                         )
                         key_scale_nn = pl.tile.transpose_view(key_scale_zz)
-                        keys_kn = pl.reinterpret_view(
-                            pl.tile.transpose(pl.reinterpret_view(keys, pl.INT8), 0, 1),
-                            pl.FP8E4M3FN,
+                        keys_kn = pl.reinterpret_view(pl.tile.transpose(key_bytes, 0, 1), pl.FP8E4M3FN)
+                        key_mat = pl.tile.move(
+                            keys_kn, target_memory=pl.MemorySpace.Mat,
+                            blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
                         )
-                        dot_bf16 = pl.cast(
-                            pl.matmul_mx(query_left, pair_scale_left, keys_kn, key_scale_nn),
-                            pl.BF16,
-                            mode="rint",
+                        key_right = pl.tile.move(key_mat, target_memory=pl.MemorySpace.Right)
+                        key_scale_mat = pl.tile.move(
+                            key_scale_nn, target_memory=pl.MemorySpace.Mat,
+                            blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major,
                         )
-                        for panel_index in pl.unroll(2):
-                            output_begin = half_begin + panel_index * _PAGE_SIZE
-                            if output_begin < width:
-                                output_count = pl.min(_PAGE_SIZE, width - output_begin)
-                                for pair_offset in pl.unroll(2):
-                                    token = first_token + pair_offset
-                                    visible = pl.min(pl.read(lengths, [token]), width)
-                                    negative_bits = pl.tile.full([1, _PAGE_SIZE], dtype=pl.INT32, value=-8388608)
-                                    masked = pl.reinterpret_view(negative_bits, pl.FP32)
-                                    if output_begin < visible:
-                                        valid_count = pl.min(_PAGE_SIZE, visible - output_begin)
-                                        page_id = pl.read(
-                                            block_table,
-                                            [
-                                                pl.cast(first_request, pl.INDEX),
-                                                output_begin // _PAGE_SIZE,
-                                            ],
-                                        )
-                                        if page_id >= 0:
-                                            head_dot = pl.tile.slice(
-                                                dot_bf16,
-                                                [INDEX_H, _PAGE_SIZE],
-                                                [pair_offset * INDEX_H, panel_index * _PAGE_SIZE],
+                        key_scale_right = pl.tile.move(key_scale_mat, target_memory=pl.MemorySpace.RightScale)
+                        for shared_pair in pl.range(pairs_per_group):
+                            first_token = group_token + shared_pair * 2
+                            query_pair = pl.load(
+                                query_flat,
+                                [first_token * INDEX_H, 0],
+                                [_PAIR_M_TILE, INDEX_DIM],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            pair_scale_raw = pl.reinterpret_view(
+                                pl.load(
+                                    query_scale,
+                                    [first_token, 0],
+                                    [2, INDEX_H * _SCALE_COUNT],
+                                    target_memory=pl.MemorySpace.Vec,
+                                ),
+                                pl.UINT8,
+                            )
+                            pair_scale_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+                            pair_scale_zz = pl.reinterpret_view(
+                                pl.tmov_x2zz(
+                                    pl.reshape(pair_scale_raw, [1, _PAIR_M_TILE * _SCALE_COUNT]),
+                                    pair_scale_tmp,
+                                    group_axis=1,
+                                    dst_rows=_PAIR_M_TILE,
+                                    dst_cols=_SCALE_COUNT,
+                                ),
+                                pl.FP8E8M0,
+                            )
+                            query_mat = pl.tile.move(
+                                query_pair,
+                                target_memory=pl.MemorySpace.Mat,
+                                blayout=pl.TileLayout.row_major,
+                                slayout=pl.TileLayout.row_major,
+                            )
+                            query_left = pl.tile.move(query_mat, target_memory=pl.MemorySpace.Left)
+                            pair_scale_mat = pl.tile.move(
+                                pair_scale_zz,
+                                target_memory=pl.MemorySpace.Mat,
+                                blayout=pl.TileLayout.row_major,
+                                slayout=pl.TileLayout.row_major,
+                            )
+                            pair_scale_left = pl.tile.move(pair_scale_mat, target_memory=pl.MemorySpace.LeftScale)
+
+                            dot = pl.matmul_mx(query_left, pair_scale_left, key_right, key_scale_right)
+                            dot_bf16 = pl.cast(dot, pl.BF16, mode="rint")
+                            for panel_index in pl.unroll(2):
+                                output_begin = half_begin + panel_index * _PAGE_SIZE
+                                if output_begin < width:
+                                    output_count = pl.min(_PAGE_SIZE, width - output_begin)
+                                    for pair_offset in pl.unroll(2):
+                                        token = first_token + pair_offset
+                                        visible = pl.min(pl.read(lengths, [token]), width)
+                                        negative_bits = pl.tile.full([1, _PAGE_SIZE], dtype=pl.INT32, value=-8388608)
+                                        masked = pl.reinterpret_view(negative_bits, pl.FP32)
+                                        if output_begin < visible:
+                                            valid_count = pl.min(_PAGE_SIZE, visible - output_begin)
+                                            page_id = pl.read(
+                                                block_table,
+                                                [
+                                                    pl.cast(first_request, pl.INDEX),
+                                                    output_begin // _PAGE_SIZE,
+                                                ],
                                             )
-                                            relu = pl.maximum(pl.cast(head_dot, pl.FP32), 0.0)
-                                            head_weight = pl.load(
-                                                weights,
-                                                [token, 0],
-                                                [1, INDEX_H],
-                                                target_memory=pl.MemorySpace.Vec,
-                                            )
-                                            head_weight = pl.mul(pl.cast(head_weight, pl.FP32), _SCORE_SCALE)
-                                            rounded_weight = pl.cast(
-                                                pl.cast(head_weight, pl.BF16, mode="rint"), pl.FP32
-                                            )
-                                            weighted = pl.row_expand_mul(relu, pl.reshape(rounded_weight, [INDEX_H, 1]))
-                                            weighted = pl.cast(pl.cast(weighted, pl.BF16, mode="rint"), pl.FP32)
-                                            total = pl.cast(
-                                                pl.cast(pl.col_sum(weighted), pl.BF16, mode="rint"),
-                                                pl.FP32,
-                                            )
-                                            lanes = pl.tile.arange(0, [1, _PAGE_SIZE], dtype=pl.INT32)
-                                            in_range = pl.tile.cmps(lanes, pl.cast(valid_count, pl.INT32), cmp_type=2)
-                                            masked = pl.tile.select(in_range, total, masked)
-                                    pl.store(pl.set_validshape(masked, 1, output_count), [token, output_begin], output)
+                                            if page_id >= 0:
+                                                head_dot = pl.tile.slice(
+                                                    dot_bf16,
+                                                    [INDEX_H, _PAGE_SIZE],
+                                                    [pair_offset * INDEX_H, panel_index * _PAGE_SIZE],
+                                                )
+                                                relu = pl.maximum(pl.cast(head_dot, pl.FP32), 0.0)
+                                                head_weight = pl.load(
+                                                    weights,
+                                                    [token, 0],
+                                                    [1, INDEX_H],
+                                                    target_memory=pl.MemorySpace.Vec,
+                                                )
+                                                head_weight = pl.mul(pl.cast(head_weight, pl.FP32), _SCORE_SCALE)
+                                                rounded_weight = pl.cast(
+                                                    pl.cast(head_weight, pl.BF16, mode="rint"), pl.FP32
+                                                )
+                                                weight_column = pl.reshape(rounded_weight, [INDEX_H, 1])
+                                                weighted = pl.row_expand_mul(relu, weight_column)
+                                                weighted = pl.cast(pl.cast(weighted, pl.BF16, mode="rint"), pl.FP32)
+                                                total = pl.cast(
+                                                    pl.cast(pl.col_sum(weighted), pl.BF16, mode="rint"),
+                                                    pl.FP32,
+                                                )
+                                                lanes = pl.tile.arange(0, [1, _PAGE_SIZE], dtype=pl.INT32)
+                                                in_range = pl.tile.cmps(lanes, pl.cast(valid_count, pl.INT32), cmp_type=2)
+                                                masked = pl.tile.select(in_range, total, masked)
+                                        masked_valid = pl.set_validshape(masked, 1, output_count)
+                                        pl.store(masked_valid, [token, output_begin], output)
                     else:
-                        for panel_index in pl.unroll(2):
-                            output_begin = half_begin + panel_index * _PAGE_SIZE
-                            if output_begin < width:
-                                output_count = pl.min(_PAGE_SIZE, width - output_begin)
-                                for pair_offset in pl.unroll(2):
-                                    token = first_token + pair_offset
-                                    negative_bits = pl.tile.full([1, _PAGE_SIZE], dtype=pl.INT32, value=-8388608)
-                                    pl.store(
-                                        pl.set_validshape(pl.reinterpret_view(negative_bits, pl.FP32), 1, output_count),
-                                        [token, output_begin],
-                                        output,
-                                    )
+                        for shared_pair in pl.range(pairs_per_group):
+                            first_token = group_token + shared_pair * 2
+                            for panel_index in pl.unroll(2):
+                                output_begin = half_begin + panel_index * _PAGE_SIZE
+                                if output_begin < width:
+                                    output_count = pl.min(_PAGE_SIZE, width - output_begin)
+                                    for pair_offset in pl.unroll(2):
+                                        token = first_token + pair_offset
+                                        negative_bits = pl.tile.full([1, _PAGE_SIZE], dtype=pl.INT32, value=-8388608)
+                                        negative = pl.reinterpret_view(negative_bits, pl.FP32)
+                                        negative_valid = pl.set_validshape(negative, 1, output_count)
+                                        pl.store(negative_valid, [token, output_begin], output)
         return score_tid
 
     return score
@@ -1192,6 +1205,10 @@ def make_index_scores(skip_short=False):
         panels = (width + _PAGE_SIZE - 1) // _PAGE_SIZE
         paired_panels = ((num_tokens + 1) // 2) * panels
         complete_pairs = 0
+        complete_groups = 0
+        if not skip_short:
+            if num_tokens % 6 == 0:
+                complete_groups = 1
         if width >= 4096:
             if num_tokens % 2 == 0:
                 complete_pairs = 1
@@ -1200,6 +1217,11 @@ def make_index_scores(skip_short=False):
                     second_request = pl.read(request_ids, [token + 1])
                     if first_request != second_request:
                         complete_pairs = 0
+                    if not skip_short:
+                        if token % 6 != 0:
+                            group_first = token - token % 6
+                            if first_request != pl.read(request_ids, [group_first]):
+                                complete_groups = 0
                     if skip_short:
                         first_short = pl.cast(0, pl.INT32)
                         second_short = pl.cast(0, pl.INT32)
@@ -1218,10 +1240,13 @@ def make_index_scores(skip_short=False):
         if long_rows == 0:
             result = pl.system.task_dummy(deps=[cache_ready, query_ready, weights_ready])
         elif complete_pairs != 0:
+            pairs_per_group = 1
+            if complete_groups != 0:
+                pairs_per_group = 3
             result = paired_blocks(
                 query, query_scale, weights, index_cache, index_cache_scale,
                 block_table, request_ids, lengths, output,
-                num_tokens, cache_ready, query_ready, weights_ready,
+                num_tokens, pairs_per_group, cache_ready, query_ready, weights_ready,
             )
         elif paired_panels <= 16:
             result = general_small(
