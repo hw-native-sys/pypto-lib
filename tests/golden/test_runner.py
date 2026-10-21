@@ -975,7 +975,8 @@ class TestJitCompilePath:
 class TestRuntimeDir:
     """``runtime_dir`` skips compile and executes against a pre-compiled dir."""
 
-    def test_runtime_dir_skips_compile(self, three_kinds_specs, tmp_path):
+    @pytest.mark.parametrize("platform", ["a5", "a5sim"])
+    def test_runtime_dir_skips_compile(self, three_kinds_specs, tmp_path, platform):
         """When runtime_dir is set, ir.compile must not be called and
         execute_compiled gets the runtime_dir as work_dir."""
         prebuilt = tmp_path / "prebuilt"
@@ -992,15 +993,18 @@ class TestRuntimeDir:
 
         with patch("pypto.ir.compile", side_effect=compile_must_not_run), \
              _patch_reload(prebuilt), \
+             patch("golden.runner._stale_cpps", return_value=[]) as stale, \
              patch("golden.runner._dispatch", side_effect=_as_dispatch(fake_execute)):
             r = run(
                 fn=object(),
                 specs=three_kinds_specs,
                 runtime_dir=str(prebuilt),
+                config={"platform": platform},
             )
 
         assert r.passed, f"unexpected failure: {r.error}"
         assert observed_work_dir == [prebuilt]
+        stale.assert_called_once_with(prebuilt, platform=platform)
 
     def test_runtime_dir_writes_data_under_runtime_dir(
         self, three_kinds_specs, tmp_path,
@@ -1771,7 +1775,7 @@ class TestStaleCpps:
         kernels.mkdir(parents=True)
         cpp = kernels / "foo.cpp"
         cpp.write_text("// cpp")
-        assert _stale_cpps(tmp_path) == [cpp]
+        assert _stale_cpps(tmp_path, platform="a5sim") == [cpp]
 
     def test_l3_next_levels_cpp_is_scanned(self, tmp_path):
         """L3 builds keep cpps under next_levels/{rank}/ — they must be scanned
@@ -1780,7 +1784,7 @@ class TestStaleCpps:
         kernels.mkdir(parents=True)
         cpp = kernels / "foo.cpp"
         cpp.write_text("// cpp")
-        assert _stale_cpps(tmp_path) == [cpp]
+        assert _stale_cpps(tmp_path, platform="a5sim") == [cpp]
 
     def test_so_older_than_cpp_is_stale(self, tmp_path):
         """cpp edited after .so was built → reported as stale."""
@@ -1792,7 +1796,7 @@ class TestStaleCpps:
         cpp.write_text("// new")
         _set_mtime(so, 1000.0)
         _set_mtime(cpp, 2000.0)
-        assert _stale_cpps(tmp_path) == [cpp]
+        assert _stale_cpps(tmp_path, platform="a5sim") == [cpp]
 
     def test_so_newer_than_cpp_not_stale(self, tmp_path):
         """.so built after cpp last edited → not stale."""
@@ -1804,7 +1808,7 @@ class TestStaleCpps:
         so.write_text("")
         _set_mtime(cpp, 1000.0)
         _set_mtime(so, 2000.0)
-        assert _stale_cpps(tmp_path) == []
+        assert _stale_cpps(tmp_path, platform="a5sim") == []
 
     def test_o_file_also_compared(self, tmp_path):
         """sibling .o is checked just like .so."""
@@ -1816,7 +1820,7 @@ class TestStaleCpps:
         cpp.write_text("// new")
         _set_mtime(o_file, 1000.0)
         _set_mtime(cpp, 2000.0)
-        assert _stale_cpps(tmp_path) == [cpp]
+        assert _stale_cpps(tmp_path, platform="a5sim") == [cpp]
 
     def test_orchestration_dir_also_scanned(self, tmp_path):
         """orchestration/ is scanned in addition to kernels/."""
@@ -1828,7 +1832,200 @@ class TestStaleCpps:
         cpp.write_text("// new")
         _set_mtime(so, 1000.0)
         _set_mtime(cpp, 2000.0)
-        assert _stale_cpps(tmp_path) == [cpp]
+        assert _stale_cpps(tmp_path, platform="a5sim") == [cpp]
+
+
+class TestGeneratedCppCache:
+    """Replay uses the exact sidecar that PyPTO writes for each code contract."""
+
+    @pytest.fixture(autouse=True)
+    def _require_real_pypto(self):
+        import pypto
+
+        if getattr(pypto, "__pypto_stub__", False):
+            pytest.skip("Requires the installed PyPTO cache writer")
+
+    @staticmethod
+    def _kernel(tmp_path, **overrides):
+        cpp = tmp_path / "kernels" / "aiv" / "shared.cpp"
+        cpp.parent.mkdir(parents=True, exist_ok=True)
+        if not cpp.exists():
+            cpp.write_text("// generated kernel\n")
+        return dict(
+            source=str(cpp), core_type="aiv", code_name="shared",
+            func_id=0, signature=[], **overrides,
+        )
+
+    @staticmethod
+    def _config(tmp_path, kernels):
+        # Like generated configs, resolve sources against the relocated root.
+        entries = [dict(k, source=str(Path(k["source"]).relative_to(tmp_path))) for k in kernels]
+        (tmp_path / "kernel_config.py").write_text(
+            "from pathlib import Path\n"
+            f"KERNELS = {entries!r}\n"
+            "for kernel in KERNELS:\n"
+            "    kernel['source'] = str(Path(__file__).parent / kernel['source'])\n"
+        )
+
+    @staticmethod
+    def _compile_sidecar(kernel, platform="a5sim"):
+        # Exercise the real runtime cache writer with a fake byte producer.
+        # This cannot invoke a native compiler or initialize a device.
+        from pypto.runtime.device_runner import _compile_single_kernel
+
+        compiler = MagicMock()
+        compiler.compile_incore.return_value = b"cached kernel"
+        with patch("pypto.runtime.device_runner.extract_text_section", side_effect=lambda raw: raw):
+            _compile_single_kernel(kernel, compiler, platform, "", "hbg")
+        compiler.compile_incore.assert_called_once()
+
+    @pytest.mark.parametrize("platform", ["a5", "a5sim"])
+    def test_current_runtime_sidecar_is_reused(self, tmp_path, platform):
+        kernel = self._kernel(tmp_path)
+        self._config(tmp_path, [kernel])
+        self._compile_sidecar(kernel, platform)
+        assert _stale_cpps(tmp_path, platform=platform) == []
+
+    @pytest.mark.parametrize("platform", ["a5", "a5sim"])
+    @pytest.mark.parametrize("selected_state", ["missing", "stale", "fresh"])
+    def test_replay_checks_only_selected_sidecar(self, tmp_path, platform, selected_state):
+        kernel = self._kernel(tmp_path)
+        self._config(tmp_path, [kernel])
+        other_platform = "a5" if platform.endswith("sim") else "a5sim"
+        self._compile_sidecar(kernel, other_platform)
+        if selected_state != "missing":
+            self._compile_sidecar(kernel, platform)
+        cpp = Path(kernel["source"])
+        selected_suffix = ".so" if platform.endswith("sim") else ".o"
+        if selected_state == "stale":
+            old_sidecar = next(cpp.parent.glob(f"shared_*{selected_suffix}"))
+            _set_mtime(old_sidecar, cpp.stat().st_mtime - 100)
+        elif selected_state == "fresh":
+            unused_suffix = ".o" if selected_suffix == ".so" else ".so"
+            old_sidecar = next(cpp.parent.glob(f"shared_*{unused_suffix}"))
+            _set_mtime(old_sidecar, cpp.stat().st_mtime - 100)
+        expected = [] if selected_state == "fresh" else [cpp]
+        assert _stale_cpps(tmp_path, platform=platform) == expected
+
+    def test_sidecar_stays_beside_registered_symlink(self, tmp_path):
+        kernel = self._kernel(tmp_path)
+        cpp = Path(kernel["source"])
+        target = tmp_path / "shared_source.cpp"
+        cpp.rename(target)
+        cpp.symlink_to(target)
+        self._config(tmp_path, [kernel])
+        self._compile_sidecar(kernel)
+        assert _stale_cpps(tmp_path, platform="a5sim") == []
+
+    def test_deduplicated_registrations_share_one_sidecar(self, tmp_path):
+        kernel = self._kernel(tmp_path)
+        other_signature = dict(kernel, func_id=9, signature=["different"])
+        self._config(tmp_path, [kernel, other_signature])
+        self._compile_sidecar(kernel)
+        assert len(list((tmp_path / "kernels").rglob("*.so"))) == 1
+        assert _stale_cpps(tmp_path, platform="a5sim") == []
+
+    @pytest.mark.parametrize("change", ["code_name", "core_type", "extra_include_dirs"])
+    def test_each_code_contract_needs_its_own_sidecar(self, tmp_path, change):
+        kernel = self._kernel(tmp_path)
+        value = ["unused_include"] if change == "extra_include_dirs" else "different"
+        other_contract = dict(kernel, **{change: value})
+        self._config(tmp_path, [kernel, other_contract])
+        self._compile_sidecar(kernel)
+        assert _stale_cpps(tmp_path, platform="a5sim") == [Path(kernel["source"])]
+        self._compile_sidecar(other_contract)
+        assert _stale_cpps(tmp_path, platform="a5sim") == []
+
+    def test_plain_or_unrelated_hash_does_not_satisfy_generated_code(self, tmp_path):
+        kernel = self._kernel(tmp_path)
+        self._config(tmp_path, [kernel])
+        cpp = Path(kernel["source"])
+        cpp.with_suffix(".so").write_bytes(b"legacy binary")
+        cpp.with_name("shared_wrong.so").write_bytes(b"wrong contract")
+        assert _stale_cpps(tmp_path, platform="a5sim") == [cpp]
+
+    def test_content_edit_with_preserved_mtime_requires_new_hash(self, tmp_path):
+        kernel = self._kernel(tmp_path)
+        self._config(tmp_path, [kernel])
+        self._compile_sidecar(kernel)
+        cpp = Path(kernel["source"])
+        mtime = cpp.stat().st_mtime
+        cpp.write_text("// changed kernel\n")
+        _set_mtime(cpp, mtime)
+        assert _stale_cpps(tmp_path, platform="a5sim") == [cpp]
+
+    def test_touch_still_invalidates_exact_hashed_sidecar(self, tmp_path):
+        kernel = self._kernel(tmp_path)
+        self._config(tmp_path, [kernel])
+        self._compile_sidecar(kernel)
+        cpp = Path(kernel["source"])
+        _set_mtime(cpp, cpp.stat().st_mtime + 100)
+        assert _stale_cpps(tmp_path, platform="a5sim") == [cpp]
+
+    def test_local_header_change_requires_new_hash(self, tmp_path):
+        kernel = self._kernel(tmp_path)
+        cpp = Path(kernel["source"])
+        cpp.write_text('#include "local.h"\n')
+        header = cpp.with_name("local.h")
+        header.write_text("// version one\n")
+        self._config(tmp_path, [kernel])
+        self._compile_sidecar(kernel)
+        header.write_text("// version two\n")
+        assert _stale_cpps(tmp_path, platform="a5sim") == [cpp]
+
+    def test_relocation_keeps_generated_code_identity(self, tmp_path):
+        import shutil
+
+        original = tmp_path / "original"
+        kernel = self._kernel(original)
+        self._config(original, [kernel])
+        self._compile_sidecar(kernel)
+        moved = tmp_path / "moved"
+        shutil.copytree(original, moved)
+        shutil.rmtree(original)
+        assert _stale_cpps(moved, platform="a5sim") == []
+
+    def test_l3_child_config_uses_its_own_registration_metadata(self, tmp_path):
+        child = tmp_path / "next_levels" / "rank0"
+        kernel = self._kernel(child)
+        self._config(child, [kernel])
+        self._compile_sidecar(kernel)
+        assert _stale_cpps(tmp_path, platform="a5sim") == []
+
+    @pytest.mark.parametrize("platform", ["a5", "a5sim"])
+    def test_legacy_registration_uses_plain_sibling(self, tmp_path, platform):
+        kernel = self._kernel(tmp_path)
+        del kernel["code_name"]
+        self._config(tmp_path, [kernel])
+        self._compile_sidecar(kernel)
+        assert _stale_cpps(tmp_path, platform=platform) == []
+        cpp = Path(kernel["source"])
+        cpp.with_suffix(".o").write_bytes(b"old legacy binary")
+        _set_mtime(cpp.with_suffix(".o"), cpp.stat().st_mtime - 100)
+        assert _stale_cpps(tmp_path, platform=platform) == [cpp]
+
+    @pytest.mark.parametrize("fresh", [False, True])
+    def test_setup_invalidates_only_missing_generated_cache(self, tmp_path, fresh):
+        import importlib
+
+        kernel = self._kernel(tmp_path)
+        self._config(tmp_path, [kernel])
+        if fresh:
+            self._compile_sidecar(kernel)
+        replay = importlib.import_module("pypto.runtime.debug.replay")
+        pto = importlib.import_module("pypto.runtime.debug.pto_rebuild")
+        with (
+            patch.object(pto, "rebuild_kernel_cpp_from_pto"),
+            patch.object(replay, "invalidate_binary_cache") as invalidate,
+        ):
+            _setup_runtime_dir(str(tmp_path), compile_label="test", platform="a5sim")
+        assert invalidate.call_count == int(not fresh)
+
+    @pytest.mark.parametrize("kind", ["external", "builtin"])
+    def test_external_and_builtin_sidecars_are_runtime_owned(self, tmp_path, kind):
+        kernel = self._kernel(tmp_path, **{kind: True})
+        self._config(tmp_path, [kernel])
+        assert _stale_cpps(tmp_path, platform="a5sim") == []
 
 
 class TestFormatStalePaths:
@@ -1867,7 +2064,7 @@ class TestSetupRuntimeDir:
         """No edited cpp → invalidate_binary_cache must NOT be called."""
         inv_p, pto_p = self._patch_pypto_helpers()
         with inv_p as mock_inv, pto_p:
-            _setup_runtime_dir(str(tmp_path), compile_label="compile")
+            _setup_runtime_dir(str(tmp_path), compile_label="compile", platform="a5sim")
         mock_inv.assert_not_called()
 
     def test_stale_cpp_triggers_invalidation(self, tmp_path):
@@ -1883,14 +2080,14 @@ class TestSetupRuntimeDir:
 
         inv_p, pto_p = self._patch_pypto_helpers()
         with inv_p as mock_inv, pto_p:
-            _setup_runtime_dir(str(tmp_path), compile_label="compile")
+            _setup_runtime_dir(str(tmp_path), compile_label="compile", platform="a5sim")
         mock_inv.assert_called_once()
 
     def test_missing_dir_raises(self, tmp_path):
         """Non-existent runtime_dir → ValueError surfaces."""
         missing = tmp_path / "does_not_exist"
         with pytest.raises(ValueError, match="runtime_dir does not exist"):
-            _setup_runtime_dir(str(missing), compile_label="compile")
+            _setup_runtime_dir(str(missing), compile_label="compile", platform="a5sim")
 
 
 class TestLogLevelConsumption:
