@@ -13,7 +13,8 @@
 """
 import pypto.language as pl
 
-from config import GDN_TILING, PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
+from solve_tril import CHUNK_TILE
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -22,12 +23,15 @@ T_DYN = pl.dynamic("T_DYN")                 # tokens
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
 HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension
-CHUNK_TILE = GDN_TILING.chunk               # chunk size in tokens, our tiling choice
 GRP = H // HG                               # value heads sharing one key head
 KEY_WIDTH = HG * D
 VAL_WIDTH = H * D
+
+# tiling
 A_WIDTH = H * CHUNK_TILE
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+
+# validation
+BENCH_SEQ = 8192        # prefill tokens, this entry's default case
 
 
 def _gdn_wy_fast(
@@ -102,7 +106,7 @@ def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
+def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG):
     import torch
     from golden import TensorSpec
@@ -157,9 +161,10 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -174,10 +179,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(
-            platform=args.platform,
-            device_id=args.device,
-        ),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-2,
         atol=1e-5,
         compare_fn={"w_out": _stats_ok, "u_out": _stats_ok},

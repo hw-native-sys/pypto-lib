@@ -19,7 +19,8 @@ exact because D^BLOCK_TILE = 0 and M^(CHUNK_TILE/BLOCK_TILE) = 0.
 """
 import pypto.language as pl
 
-from config import GDN_TILING, PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
+from scaled_dot_kkt import CHUNK_TILE
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -28,10 +29,13 @@ T_DYN = pl.dynamic("T_DYN")                 # tokens
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
 HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension; unused here, drawn inputs match the pipeline
-CHUNK_TILE = GDN_TILING.chunk               # chunk size in tokens, our tiling choice
+
+# tiling
 A_WIDTH = H * CHUNK_TILE
-BLOCK_TILE = 16              # doubling block; see the split above. 32 also passes, 64 does not
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BLOCK_TILE = 16         # doubling block; see the split above
+
+# validation
+BENCH_SEQ = 8192        # prefill tokens, this entry's default case
 
 
 # A is nilpotent at A^CHUNK_TILE, and the doubling reaches A^(2^ndouble). Off a power
@@ -87,11 +91,9 @@ def _gdn_solve_tril(
             xd = pl.matmul_acc(xa, xc, yc)
             xdf = pl.cast(xd, target_type=pl.FP16, mode="rint")
 
-            # --- -M = Xd (-N), strictly block-lower, so M^nblk = 0. Taking the
-            # negated N here means the product lands in the accumulator with
-            # the sign `I - M` needs, so the identity costs one matmul rather
-            # than a negate-then-add pair. (-M)^2 = M^2, so the squaring below
-            # is unaffected.
+            # --- -M = Xd (-N), strictly block-lower, so M^nblk = 0. The negated N
+            # carries the sign `I - M` needs into the accumulator, and (-M)^2 = M^2
+            # leaves the squaring below unchanged.
             nm = pl.mul(a_flat[t0 : t0 + CHUNK_TILE, col : col + CHUNK_TILE], m_low[:, :])
             mn = pl.matmul(xdf, nm, out_dtype=pl.FP32)         # -M
             mf = pl.cast(mn, target_type=pl.FP16, mode="rint")
@@ -109,8 +111,7 @@ def _gdn_solve_tril(
             pn = pl.matmul_acc(pa, pc, qc)
             pnf = pl.cast(pn, target_type=pl.FP16, mode="rint")
 
-            # --- X = (I + M)^-1 Xd. No cast: the store carries the dtype, so
-            # an FP16 t_out narrows the FP32 accumulator on the way out.
+            # --- X = (I + M)^-1 Xd. The FP16 store narrows the FP32 accumulator.
             t_out_tile = pl.matmul(pnf, xdf, out_dtype=pl.FP32)
             t_flat[t0 : t0 + CHUNK_TILE, col : col + CHUNK_TILE] = t_out_tile
     return t_out
@@ -171,7 +172,7 @@ def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
+def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG, block: int = BLOCK_TILE):
     # hg only picks which reference chain to draw from; this stage reads no q or k.
     import torch
@@ -222,9 +223,10 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -239,7 +241,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=1e-2,
         atol=1e-5,
         compare_fn={"t_out": _tri_inv_ok},

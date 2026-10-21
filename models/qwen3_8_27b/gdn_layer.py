@@ -19,10 +19,10 @@ Only q, k, v, the gate and beta come in, and only O goes out.
 """
 import pypto.language as pl
 
-from chunk_cumsum import DISPATCH_TOKENS, gdn_chunk_cumsum
+from chunk_cumsum import CHUNK_TILE, DISPATCH_TOKENS, gdn_chunk_cumsum
 from chunk_h import gdn_chunk_h
 from chunk_o import gdn_chunk_o
-from config import GDN_TILING, PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 from scaled_dot_kkt import gdn_scaled_dot_kkt
 import solve_tril
 from solve_tril import gdn_solve_tril
@@ -36,8 +36,9 @@ H = QWEN3_8_27B.linear_num_value_heads      # value heads
 HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension
 VAL_WIDTH = H * D
-CHUNK_TILE = GDN_TILING.chunk               # chunk size in tokens, our tiling choice
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+
+# validation
+BENCH_SEQ = 8192        # prefill tokens, this entry's default case
 
 # A, A_inv, W, U, the state snapshots and V_new are all [T, H, *] and live at once:
 # about 600 MiB at T = 8192, H = 48, against the runtime's default 256 MiB per ring.
@@ -46,10 +47,12 @@ T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
 LAYER_RING_HEAP = 1024 * 1024 * 1024
 
 
-def run_config(platform: str = "a2a3", device: int = 0, swimlane: int = 0) -> dict:
-    """The config `golden.run` needs for this layer. The ring heap is not optional."""
-    return dict(platform=platform, device_id=device, ring_heap=LAYER_RING_HEAP,
-                enable_chip_swimlane=swimlane)
+def run_config(backend_type: str = "a2a3", sim: bool = False, device: int = 0, swimlane: int = 0) -> dict:
+    """The config `golden.run` needs for this layer, the ring heap included."""
+    return dict(
+        backend_type=backend_type, execution_mode=sim, device_id=device,
+        ring_heap=LAYER_RING_HEAP, enable_chip_swimlane=swimlane,
+    )
 
 
 def _gdn_layer(
@@ -117,7 +120,7 @@ def _inputs(t: int, h: int, d: int, hg: int) -> dict:
     return _INPUTS[key]
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
+def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG):
     import torch
     from golden import TensorSpec
@@ -184,9 +187,10 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -203,7 +207,7 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=run_config(args.platform, args.device, args.enable_chip_swimlane),
+        config=run_config(args.backend_type, args.execution_mode, args.device, args.enable_chip_swimlane),
         rtol=1e-2, atol=1e-5,
         compare_fn={"o_out": _stats_ok},
     )

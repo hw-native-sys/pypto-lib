@@ -76,7 +76,7 @@ the median `effective_us`.
 ```bash
 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0
 python models/qwen3_8_27b/solve_tril.py -p a2a3 -d 0
-python models/qwen3_8_27b/chunk_h.py -p a2a3sim --seq-len 1024
+python models/qwen3_8_27b/chunk_h.py -p a2a3 --sim --seq-len 1024
 ```
 
 These are device entry points, not pytest cases: they need an NPU and a compile,
