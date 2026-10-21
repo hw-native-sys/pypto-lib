@@ -24,7 +24,7 @@ from chunk_cumsum import CHUNK_TILE, DISPATCH_TOKENS, cumsum_ref, gdn_chunk_cums
 from chunk_h import chunk_h_ref, gdn_chunk_h
 from chunk_o import chunk_o_ref, gdn_chunk_o
 from config import QWEN3_8_27B
-from reference import make_inputs, stats_ok, to_hT
+from reference import frob_ok, make_inputs, to_hT
 from scaled_dot_kkt import gdn_scaled_dot_kkt, kkt_ref
 import solve_tril
 from solve_tril import gdn_solve_tril, solve_tril_ref
@@ -190,13 +190,6 @@ def golden_gdn_layer(tensors):
     tensors["o_out"].copy_(st["o"])
 
 
-def _stats_ok(actual, expected, **_kwargs):
-    """Relative Frobenius norm against the float64 golden, with the peak reported."""
-    ok, detail = stats_ok(actual, expected, chunk=CHUNK_TILE)
-    print(f"[stats] {detail}", flush=True)
-    return ok, detail
-
-
 if __name__ == "__main__":
     import argparse
     from golden import run
@@ -223,8 +216,7 @@ if __name__ == "__main__":
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
         config=run_config(args.backend_type, args.execution_mode, args.device, args.enable_chip_swimlane),
-        rtol=1e-2, atol=1e-5,
-        compare_fn={"o_out": _stats_ok},
+        compare_fn={"o_out": frob_ok("o_out")},
     )
     if not result.passed:
         if result.error:

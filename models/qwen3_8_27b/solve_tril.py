@@ -22,7 +22,7 @@ import torch
 
 from chunk_cumsum import cumsum_ref
 from config import QWEN3_8_27B
-from reference import REF_DTYPE, make_inputs, stats_ok
+from reference import REF_DTYPE, frob_ok, make_inputs
 from scaled_dot_kkt import CHUNK_TILE, kkt_ref
 
 # Dynamic shape variables.
@@ -201,15 +201,6 @@ def golden_gdn_solve_tril(tensors):
     tensors["t_out"].copy_(solve_tril_ref(tensors["a_in"], chunk))
 
 
-def _tri_inv_ok(actual, expected, **_kwargs):
-    """Relative Frobenius norm against the float64 golden, plus the FP16 rounding floor."""
-    exp = expected.double()
-    _, floor_detail = stats_ok(exp.half(), exp)
-    ok, detail = stats_ok(actual, exp)
-    print(f"[stats] {detail}  |  fp16 floor: {floor_detail}", flush=True)
-    return ok, detail
-
-
 if __name__ == "__main__":
     import argparse
     from golden import run
@@ -234,9 +225,7 @@ if __name__ == "__main__":
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-        rtol=1e-2,
-        atol=1e-5,
-        compare_fn={"t_out": _tri_inv_ok},
+        compare_fn={"t_out": frob_ok("t_out")},
     )
     if not result.passed:
         if result.error:

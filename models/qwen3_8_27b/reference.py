@@ -78,26 +78,57 @@ def flat_state(state: torch.Tensor, dtype=torch.float16) -> torch.Tensor:
 # Acceptance criterion
 # ---------------------------------------------------------------------------
 
-# rtol scales with the chunk size: that is how many rounding steps a
-# chunk-length reduction accumulates.
-RTOL = 5e-3
-ATOL = 1.5e-4
-FTOL = 1e-3
+# Measured on a2a3 at T = 512 and T = 8192, every output of the six stages and the layer:
+# not one point exceeds DIFF_THD, and the worst relative Frobenius norm is 3.6e-4.
+DIFF_THD = 1e-3         # per-point floored relative difference
+PCT_THD = 1e-6          # share of points allowed to exceed it
+MAX_DIFF_HD = 1.0       # one point this far out fails whatever the share
+FTOL = 1e-3             # relative Frobenius norm over the whole output
 
 
-def stats_ok(actual: torch.Tensor, expected: torch.Tensor,
-             chunk: int = 1) -> tuple[bool, str]:
-    """The acceptance test, and the numbers behind it."""
-    act = actual.to(REF_DTYPE)
-    exp = expected.to(REF_DTYPE)
-    diff = (act - exp).abs()
-    denom = torch.sqrt((exp ** 2).sum())
-    frob = float(torch.sqrt((diff ** 2).sum()) / denom) if float(denom) > 0 else 0.0
-    bound = ATOL + min(0.5, RTOL * chunk) * exp.abs()
-    elementwise = not bool((diff > bound).all())
-    detail = (f"frob={frob:.4g} (<={FTOL}), max diff={float(diff.max()):.4g}, "
-              f"peak |ref|={float(exp.abs().max()):.4g}")
-    if not elementwise:
-        return False, "every element outside the relative bound; " + detail
-    return frob <= FTOL, detail
+def frob(actual: torch.Tensor, expected: torch.Tensor) -> float | None:
+    """Relative Frobenius norm, or None when the reference is all zeros."""
+    act = actual.cpu().to(REF_DTYPE)
+    exp = expected.cpu().to(REF_DTYPE)
+    denom = float(torch.sqrt((exp ** 2).sum()))
+    if denom == 0.0:
+        return None
+    return float(torch.sqrt(((act - exp) ** 2).sum())) / denom
+
+
+def frob_ok(name: str, ftol: float = FTOL, diff_thd: float = DIFF_THD,
+            pct_thd: float = PCT_THD):
+    """`ratio_reldiff` per point, plus the relative Frobenius norm over the whole output.
+
+    Every per-point check is the harness comparator's: the floored relative difference,
+    its bad-point budget, the single-point cap and the non-finite rejection. The Frobenius
+    norm is the one criterion it does not carry, and a chunk-length reduction's
+    accumulated rounding shows up there and nowhere else.
+
+    An all-zero reference has no relative norm, so there the per-point check stands alone.
+    That case is reachable: `chunk_h`'s state snapshot entering a single chunk is all
+    zeros, and a criterion that scored it would accept any output at all.
+    """
+    from golden import ratio_reldiff
+
+    per_point = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd, max_diff_hd=MAX_DIFF_HD)
+
+    def cmp(actual, expected, **kwargs):
+        ok, detail = per_point(actual, expected, **kwargs)
+        value = frob(actual, expected)
+        max_diff = float((actual.cpu().to(REF_DTYPE) - expected.cpu().to(REF_DTYPE)).abs().max())
+        peak = float(expected.cpu().to(REF_DTYPE).abs().max())
+        if value is None:
+            stats = "frob n/a (the reference is all zeros)"
+        else:
+            stats = f"frob={value:.4g} (<={ftol})"
+            if value > ftol:
+                ok = False
+                detail = f"relative Frobenius norm {value:.4g} over {ftol}; " + detail
+        print(f"[stats] {name}: {stats}, max diff={max_diff:.4g}, peak |ref|={peak:.4g}",
+              flush=True)
+        return ok, detail
+
+    cmp.__name__ = f"frob_ok({name})"
+    return cmp
 

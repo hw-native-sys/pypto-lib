@@ -20,7 +20,7 @@ import torch
 
 from chunk_cumsum import cumsum_ref
 from config import QWEN3_8_27B
-from reference import REF_DTYPE, flat_state, make_inputs, stats_ok, to_hT
+from reference import REF_DTYPE, flat_state, frob_ok, make_inputs, to_hT
 from scaled_dot_kkt import kkt_ref
 from solve_tril import solve_tril_ref
 from wy_fast import CHUNK_TILE, wy_fast_ref
@@ -197,13 +197,6 @@ def golden_gdn_chunk_h(tensors):
     tensors["v_new"].copy_(v_new)
 
 
-def _stats_ok(actual, expected, **_kwargs):
-    """Relative Frobenius norm against the float64 golden, with the peak reported."""
-    ok, detail = stats_ok(actual, expected, chunk=CHUNK_TILE)
-    print(f"[stats] {detail}", flush=True)
-    return ok, detail
-
-
 if __name__ == "__main__":
     import argparse
     from golden import run
@@ -228,9 +221,7 @@ if __name__ == "__main__":
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-        rtol=1e-2,
-        atol=1e-5,
-        compare_fn={"state": _stats_ok, "v_new": _stats_ok},
+        compare_fn={"state": frob_ok("state"), "v_new": frob_ok("v_new")},
     )
     if not result.passed:
         if result.error:
