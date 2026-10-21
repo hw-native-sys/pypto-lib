@@ -222,7 +222,7 @@ if __name__ == "__main__":
             runtime_dir=args.runtime_dir,
             save_data=args.save_data,
             config=run_config(args.backend_type, args.execution_mode, args.device, args.enable_chip_swimlane),
-            compare_fn={"o_out": frob_ok("o_out")},
+            compare_fn={"o_out": frob_ok()},
         )
         if not result.passed:
             if result.error:

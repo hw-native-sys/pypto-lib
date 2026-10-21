@@ -188,7 +188,7 @@ if __name__ == "__main__":
             runtime_dir=args.runtime_dir,
             save_data=args.save_data,
             config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-            compare_fn={"w_out": frob_ok("w_out"), "u_out": frob_ok("u_out")},
+            compare_fn={"w_out": frob_ok(), "u_out": frob_ok()},
         )
         if not result.passed:
             if result.error:

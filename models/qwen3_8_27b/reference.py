@@ -93,7 +93,7 @@ def frob(actual: torch.Tensor, expected: torch.Tensor) -> float | None:
     return float(torch.sqrt(((act - exp) ** 2).sum())) / denom
 
 
-def frob_ok(name: str, ftol: float = FTOL, diff_thd: float = DIFF_THD, pct_thd: float = PCT_THD):
+def frob_ok(ftol: float = FTOL, diff_thd: float = DIFF_THD, pct_thd: float = PCT_THD):
     """`ratio_reldiff` per point, plus the relative Frobenius norm over the whole output.
 
     Every per-point check is the harness comparator's: the floored relative difference,
@@ -112,18 +112,21 @@ def frob_ok(name: str, ftol: float = FTOL, diff_thd: float = DIFF_THD, pct_thd: 
     def cmp(actual, expected, **kwargs):
         ok, detail = per_point(actual, expected, **kwargs)
         value = frob(actual, expected)
-        max_diff = float((actual.cpu().to(REF_DTYPE) - expected.cpu().to(REF_DTYPE)).abs().max())
-        peak = float(expected.cpu().to(REF_DTYPE).abs().max())
+        if value is not None and value > ftol:
+            ok = False
+        if ok:
+            return True, ""
+        act = actual.cpu().to(REF_DTYPE)
+        exp = expected.cpu().to(REF_DTYPE)
         if value is None:
             stats = "frob n/a (the reference is all zeros)"
         else:
-            stats = f"frob={value:.4g} (<={ftol})"
-            if value > ftol:
-                ok = False
-                detail = f"relative Frobenius norm {value:.4g} over {ftol}; " + detail
-        print(f"[stats] {name}: {stats}, max diff={max_diff:.4g}, peak |ref|={peak:.4g}", flush=True)
-        return ok, detail
+            # The relation, not a fixed ">": a per-point failure can carry a healthy norm.
+            stats = f"frob={value:.4g} ({'>' if value > ftol else '<='}{ftol})"
+        head = (f"    {stats}, max diff={float((act - exp).abs().max()):.4g}, "
+                f"peak |ref|={float(exp.abs().max()):.4g}")
+        return False, f"{head}\n{detail}"
 
-    cmp.__name__ = f"frob_ok({name})"
+    cmp.__name__ = "frob_ok"
     return cmp
 

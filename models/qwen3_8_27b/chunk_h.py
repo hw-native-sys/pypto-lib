@@ -227,7 +227,7 @@ if __name__ == "__main__":
             runtime_dir=args.runtime_dir,
             save_data=args.save_data,
             config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-            compare_fn={"state": frob_ok("state"), "v_new": frob_ok("v_new")},
+            compare_fn={"state": frob_ok(), "v_new": frob_ok()},
         )
         if not result.passed:
             if result.error:
