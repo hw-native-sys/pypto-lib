@@ -135,7 +135,7 @@ def decode_c1a_reindex(
     score_width = pl.tensor.dim(pool_block_ids, 1) * 8
     index_query, index_query_scale, index_weights, scores, query_tid, weights_tid = c1a_index(
         x_norm, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
-        num_tokens, score_width, x_ready, single_query_task=False,
+        num_tokens, score_width, x_ready,
     )
     scores_tid = score_reindex(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
