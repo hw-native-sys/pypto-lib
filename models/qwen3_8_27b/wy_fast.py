@@ -12,9 +12,13 @@
     A1[i, j] = A[i, j] * beta_j * exp(g_j)      W = A1 @ K
 """
 import pypto.language as pl
+import torch
 
+from chunk_cumsum import cumsum_ref
 from config import QWEN3_8_27B
-from solve_tril import CHUNK_TILE
+from reference import REF_DTYPE, make_inputs, stats_ok, to_hT
+from scaled_dot_kkt import kkt_ref
+from solve_tril import CHUNK_TILE, solve_tril_ref
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -84,34 +88,45 @@ gdn_wy_fast = pl.jit.inline(_gdn_wy_fast)
 gdn_wy_fast_test = pl.jit(_gdn_wy_fast)
 
 
+def wy_fast_ref(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
+            a_inv: torch.Tensor, g_sum: torch.Tensor,
+            chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """S5: the WY representation. -> (W, U), both [T, H, D]."""
+    t, hg, d = k.shape
+    h = v.shape[1]
+    grp = h // hg
+    kf, vf, bf, af, gf = (x.to(REF_DTYPE) for x in (k, v, beta, a_inv, g_sum))
+    w = torch.zeros(t, h, d, dtype=REF_DTYPE)
+    u = torch.zeros(t, h, d, dtype=REF_DTYPE)
+    for t0 in range(0, t, chunk):
+        for hh in range(h):
+            ab = af[t0 : t0 + chunk, hh, :]
+            bc = bf[t0 : t0 + chunk, hh, None]
+            gc = gf[t0 : t0 + chunk, hh, None]
+            u[t0 : t0 + chunk, hh, :] = ab @ (vf[t0 : t0 + chunk, hh, :] * bc)
+            w[t0 : t0 + chunk, hh, :] = ab @ (
+                kf[t0 : t0 + chunk, hh // grp, :] * bc * torch.exp(gc))
+    return w, u
+
+
 _INPUTS: dict = {}
 
 
 def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
-    """The chain this stage consumes, run here rather than shared with the other stages.
-
-    Memoised so the several specs that draw from it pay for it once.
-    """
-    import torch
-
-    import reference
-
+    """The chain this stage consumes, memoised so the several specs pay for it once."""
     key = (t, h, d, chunk, hg)
     if key not in _INPUTS:
-        st = reference.make_inputs(t, h, d, hg)
-        st["g_sum"] = reference.cumsum(st["g"], chunk)
-        a16 = reference.kkt(st["k"], st["beta"], st["g_sum"], chunk).to(torch.float16)
-        st["a_inv16"] = reference.solve_tril(a16, chunk).to(torch.float16)
+        st = make_inputs(t, h, d, hg)
+        st["g_sum"] = cumsum_ref(st["g"], chunk)
+        a16 = kkt_ref(st["k"], st["beta"], st["g_sum"], chunk).to(torch.float16)
+        st["a_inv16"] = solve_tril_ref(a16, chunk).to(torch.float16)
         _INPUTS[key] = st
     return _INPUTS[key]
 
 
 def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG):
-    import torch
     from golden import TensorSpec
-
-    import reference
 
     def draw(key, transform=None):
         def make():
@@ -120,8 +135,6 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = 
 
         return make
 
-
-
     return [
         TensorSpec("k", [t, hg, d], torch.float16,
                    init_value=draw("k")),
@@ -129,29 +142,25 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = 
         TensorSpec("a_in", [t, h, chunk], torch.float16,
                    init_value=draw("a_inv16")),
         TensorSpec("beta", [h, t], torch.float32,
-                   init_value=draw("beta", reference.to_hT)),
+                   init_value=draw("beta", to_hT)),
         TensorSpec("g_sum", [h, t], torch.float32,
-                   init_value=draw("g_sum", reference.to_hT)),
+                   init_value=draw("g_sum", to_hT)),
         TensorSpec("w_out", [t, h, d], torch.float16),
         TensorSpec("u_out", [t, h, d], torch.float16),
     ]
 
 
 def golden_gdn_wy_fast(tensors):
-    import reference
-
     chunk = tensors["a_in"].shape[-1]
-    w, u = reference.wy_fast(tensors["k"], tensors["v"], tensors["beta"].t(),
-                             tensors["a_in"], tensors["g_sum"].t(), chunk)
+    w, u = wy_fast_ref(tensors["k"], tensors["v"], tensors["beta"].t(),
+                       tensors["a_in"], tensors["g_sum"].t(), chunk)
     tensors["w_out"].copy_(w)
     tensors["u_out"].copy_(u)
 
 
 def _stats_ok(actual, expected, **_kwargs):
     """Relative Frobenius norm against the float64 golden, with the peak reported."""
-    import reference
-
-    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK_TILE)
+    ok, detail = stats_ok(actual, expected, chunk=CHUNK_TILE)
     print(f"[stats] {detail}", flush=True)
     return ok, detail
 

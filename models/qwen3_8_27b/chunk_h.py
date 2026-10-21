@@ -16,9 +16,14 @@ with S the state entering the chunk,
 Chunks carry state, so work is parallel over heads and sequential within one.
 """
 import pypto.language as pl
+import torch
 
+from chunk_cumsum import cumsum_ref
 from config import QWEN3_8_27B
-from wy_fast import CHUNK_TILE
+from reference import REF_DTYPE, flat_state, make_inputs, stats_ok, to_hT
+from scaled_dot_kkt import kkt_ref
+from solve_tril import solve_tril_ref
+from wy_fast import CHUNK_TILE, wy_fast_ref
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -105,25 +110,50 @@ gdn_chunk_h = pl.jit.inline(_gdn_chunk_h)
 gdn_chunk_h_test = pl.jit(_gdn_chunk_h)
 
 
+def chunk_h_ref(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.Tensor,
+            chunk: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """S6: the inter-chunk state recurrence.
+
+    Returns the state snapshot ENTERING each chunk, [NCHUNK, H, D, D]; the
+    residual-corrected values V_new, [T, H, D]; and the state LEAVING the last
+    chunk, [H, D, D], which is what an inference cache carries forward.
+    """
+    t, hg, d = k.shape
+    h = w.shape[1]
+    grp = h // hg
+    nc = t // chunk
+    kf, wf, uf, gf = (x.to(REF_DTYPE) for x in (k, w, u, g_sum))
+    state = torch.zeros(nc, h, d, d, dtype=REF_DTYPE)
+    v_new = torch.zeros(t, h, d, dtype=REF_DTYPE)
+    final_state = torch.zeros(h, d, d, dtype=REF_DTYPE)
+    for hh in range(h):
+        s = torch.zeros(d, d, dtype=REF_DTYPE)
+        for ci in range(nc):
+            t0 = ci * chunk
+            gc = gf[t0 : t0 + chunk, hh]
+            g_last = gc[-1]
+            state[ci, hh] = s
+            vc = uf[t0 : t0 + chunk, hh, :] - wf[t0 : t0 + chunk, hh, :] @ s
+            v_new[t0 : t0 + chunk, hh, :] = vc
+            kv = (kf[t0 : t0 + chunk, hh // grp, :].T
+                  @ (vc * torch.exp(g_last - gc)[:, None]))
+            s = torch.exp(g_last) * s + kv
+        final_state[hh] = s
+    return state, v_new, final_state
+
+
 _INPUTS: dict = {}
 
 
 def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
-    """The chain this stage consumes, run here rather than shared with the other stages.
-
-    Memoised so the several specs that draw from it pay for it once.
-    """
-    import torch
-
-    import reference
-
+    """The chain this stage consumes, memoised so the several specs pay for it once."""
     key = (t, h, d, chunk, hg)
     if key not in _INPUTS:
-        st = reference.make_inputs(t, h, d, hg)
-        st["g_sum"] = reference.cumsum(st["g"], chunk)
-        a16 = reference.kkt(st["k"], st["beta"], st["g_sum"], chunk).to(torch.float16)
-        a_inv16 = reference.solve_tril(a16, chunk).to(torch.float16)
-        w, u = reference.wy_fast(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], chunk)
+        st = make_inputs(t, h, d, hg)
+        st["g_sum"] = cumsum_ref(st["g"], chunk)
+        a16 = kkt_ref(st["k"], st["beta"], st["g_sum"], chunk).to(torch.float16)
+        a_inv16 = solve_tril_ref(a16, chunk).to(torch.float16)
+        w, u = wy_fast_ref(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], chunk)
         st["w16"] = w.to(torch.float16)
         st["u16"] = u.to(torch.float16)
         _INPUTS[key] = st
@@ -132,10 +162,7 @@ def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
 
 def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG):
-    import torch
     from golden import TensorSpec
-
-    import reference
 
     def draw(key, transform=None):
         def make():
@@ -154,29 +181,25 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = 
         TensorSpec("u", [t, h, d], torch.float16,
                    init_value=draw("u16")),
         TensorSpec("g_sum", [h, t], torch.float32,
-                   init_value=draw("g_sum", reference.to_hT)),
+                   init_value=draw("g_sum", to_hT)),
         TensorSpec("state", [nc * h * d, d], torch.float16),
         TensorSpec("v_new", [t, h, d], torch.float16),
     ]
 
 
 def golden_gdn_chunk_h(tensors):
-    import reference
-
     t, _, d = tensors["k"].shape          # k has Hg heads under GQA
     h = tensors["w"].shape[1]             # W, U and the state are per value head
     chunk = t // (tensors["state"].shape[0] // (h * d))
-    state, v_new, _ = reference.chunk_h(tensors["k"], tensors["w"], tensors["u"],
-                                        tensors["g_sum"].t(), chunk)
-    tensors["state"].copy_(reference.flat_state(state))
+    state, v_new, _ = chunk_h_ref(tensors["k"], tensors["w"], tensors["u"],
+                                  tensors["g_sum"].t(), chunk)
+    tensors["state"].copy_(flat_state(state))
     tensors["v_new"].copy_(v_new)
 
 
 def _stats_ok(actual, expected, **_kwargs):
     """Relative Frobenius norm against the float64 golden, with the peak reported."""
-    import reference
-
-    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK_TILE)
+    ok, detail = stats_ok(actual, expected, chunk=CHUNK_TILE)
     print(f"[stats] {detail}", flush=True)
     return ok, detail
 

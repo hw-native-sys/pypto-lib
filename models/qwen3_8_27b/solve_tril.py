@@ -18,9 +18,12 @@ Each factor comes from the doubling `X = I - D; Y = D @ D; X += X @ Y; Y = Y @ Y
 exact because D^BLOCK_TILE = 0 and M^(CHUNK_TILE/BLOCK_TILE) = 0.
 """
 import pypto.language as pl
+import torch
 
+from chunk_cumsum import cumsum_ref
 from config import QWEN3_8_27B
-from scaled_dot_kkt import CHUNK_TILE
+from reference import REF_DTYPE, make_inputs, stats_ok
+from scaled_dot_kkt import CHUNK_TILE, kkt_ref
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -124,16 +127,9 @@ gdn_solve_tril_test = pl.jit(_gdn_solve_tril)
 def blk_masks(chunk: int = CHUNK_TILE, block: int = BLOCK_TILE):
     """The negated block-diagonal indicator and its strictly-block-lower complement.
 
-    Negated because both matmuls that consume them want `-D` and `-N`: that is
-    what lets `matmul_acc(acc, I, I)` finish `I - D` and `I - M` in one matmul
-    each. `D @ D` and `M @ M` square the sign away.
-
-    Two constants rather than one plus a subtraction: `N = A - D` would need D
-    live where the doubling has just finished with it, and holding it there is
-    the 32 KB that does not fit.
+    Both matmuls that consume them take `-D` and `-N`, so `matmul_acc(acc, I, I)`
+    forms `I - D` and `I - M`; `D @ D` and `M @ M` square the sign away.
     """
-    import torch
-
     i = torch.arange(chunk)[:, None] // block
     j = torch.arange(chunk)[None, :] // block
     return -(i == j).to(torch.float16), -(i > j).to(torch.float16)
@@ -143,31 +139,34 @@ def eye_block(chunk: int):
     """`I`, `[chunk, chunk]`: the only constant the cube needs.
 
     `matmul_acc(acc, I, I)` adds the identity to an accumulator, which is how both
-    `I - D` and `I - M` are formed. A positive identity serves as well as a
-    negative one here, since the increment squares its sign.
+    `I - D` and `I - M` are formed. The sign does not matter: the increment squares it.
     """
-    import torch
-
     return torch.eye(chunk, dtype=torch.float16)
+
+
+def solve_tril_ref(a: torch.Tensor, chunk: int) -> torch.Tensor:
+    """S4: `(I + A)^-1` per (chunk, head), exact in float64. -> [T, H, chunk]."""
+    t, h, _ = a.shape
+    af = a.to(REF_DTYPE)
+    out = torch.zeros_like(af)
+    eye = torch.eye(chunk, dtype=REF_DTYPE)
+    for t0 in range(0, t, chunk):
+        for hh in range(h):
+            out[t0 : t0 + chunk, hh, :] = torch.linalg.inv(
+                eye + af[t0 : t0 + chunk, hh, :])
+    return out
 
 
 _INPUTS: dict = {}
 
 
 def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
-    """The chain this stage consumes, run here rather than shared with the other stages.
-
-    Memoised so the several specs that draw from it pay for it once.
-    """
-    import torch
-
-    import reference
-
+    """The chain this stage consumes, memoised so the several specs pay for it once."""
     key = (t, h, d, chunk, hg)
     if key not in _INPUTS:
-        st = reference.make_inputs(t, h, d, hg)
-        g_sum = reference.cumsum(st["g"], chunk)
-        st["a16"] = reference.kkt(st["k"], st["beta"], g_sum, chunk).to(torch.float16)
+        st = make_inputs(t, h, d, hg)
+        g_sum = cumsum_ref(st["g"], chunk)
+        st["a16"] = kkt_ref(st["k"], st["beta"], g_sum, chunk).to(torch.float16)
         _INPUTS[key] = st
     return _INPUTS[key]
 
@@ -175,9 +174,7 @@ def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
 def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG, block: int = BLOCK_TILE):
     # hg only picks which reference chain to draw from; this stage reads no q or k.
-    import torch
     from golden import TensorSpec
-
 
     def draw(key, transform=None):
         def make():
@@ -185,7 +182,6 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = 
             return transform(value) if transform is not None else value
 
         return make
-
 
     return [
         TensorSpec("a_in", [t, h, chunk], torch.float16,
@@ -201,19 +197,15 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = 
 
 
 def golden_gdn_solve_tril(tensors):
-    import reference
-
     chunk = tensors["a_in"].shape[-1]
-    tensors["t_out"].copy_(reference.solve_tril(tensors["a_in"], chunk))
+    tensors["t_out"].copy_(solve_tril_ref(tensors["a_in"], chunk))
 
 
 def _tri_inv_ok(actual, expected, **_kwargs):
     """Relative Frobenius norm against the float64 golden, plus the FP16 rounding floor."""
-    import reference
-
     exp = expected.double()
-    _, floor_detail = reference.stats_ok(exp.half(), exp)
-    ok, detail = reference.stats_ok(actual, exp)
+    _, floor_detail = stats_ok(exp.half(), exp)
+    ok, detail = stats_ok(actual, exp)
     print(f"[stats] {detail}  |  fp16 floor: {floor_detail}", flush=True)
     return ok, detail
 

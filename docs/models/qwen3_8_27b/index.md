@@ -67,11 +67,13 @@ rest of the block and are not built yet.
 
 ## Validating and benchmarking
 
-[reference.py](../../../models/qwen3_8_27b/reference.py) is a float64 torch chain
-of all six stages. Each operator file is its own test: it builds its inputs from
-that chain, computes a golden and scores the device result on relative Frobenius
-norm. `PYPTO_BENCH=1` turns any of them into a benchmark, and the harness prints
-the median `effective_us`.
+Each operator file is its own test. It owns the float64 torch reference for its own
+stage, builds its inputs by calling the references of the stages before it, computes a
+golden and scores the device result on relative Frobenius norm.
+[reference.py](../../../models/qwen3_8_27b/reference.py) holds only what they share: the
+drawn inputs, the two layout conversions and the acceptance criterion.
+`PYPTO_BENCH=1` turns any of them into a benchmark, and the harness prints the median
+`effective_us`.
 
 ```bash
 python models/qwen3_8_27b/gdn_layer.py -p a2a3 -d 0

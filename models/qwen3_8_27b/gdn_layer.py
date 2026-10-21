@@ -18,15 +18,17 @@
 Only q, k, v, the gate and beta come in, and only O goes out.
 """
 import pypto.language as pl
+import torch
 
-from chunk_cumsum import CHUNK_TILE, DISPATCH_TOKENS, gdn_chunk_cumsum
-from chunk_h import gdn_chunk_h
-from chunk_o import gdn_chunk_o
+from chunk_cumsum import CHUNK_TILE, DISPATCH_TOKENS, cumsum_ref, gdn_chunk_cumsum
+from chunk_h import chunk_h_ref, gdn_chunk_h
+from chunk_o import chunk_o_ref, gdn_chunk_o
 from config import QWEN3_8_27B
-from scaled_dot_kkt import gdn_scaled_dot_kkt
+from reference import make_inputs, stats_ok, to_hT
+from scaled_dot_kkt import gdn_scaled_dot_kkt, kkt_ref
 import solve_tril
-from solve_tril import gdn_solve_tril
-from wy_fast import gdn_wy_fast
+from solve_tril import gdn_solve_tril, solve_tril_ref
+from wy_fast import gdn_wy_fast, wy_fast_ref
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -107,25 +109,42 @@ gdn_layer_test = pl.jit(_gdn_layer)
 
 
 
+def delta_rule_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+               beta: torch.Tensor, g: torch.Tensor, chunk: int) -> dict[str, torch.Tensor]:
+    """All six stages on the given inputs; every intermediate, `o` the output.
+
+    Values crossing a stage boundary are narrowed to the dtype the kernels
+    exchange -- FP16 for A, A_inv, W, U, V_new and the state snapshots -- so a
+    stage reads what the preceding kernel would have handed it.
+    """
+    st = dict(q=q, k=k, v=v, beta=beta, g=g)
+    st["g_sum"] = cumsum_ref(g, chunk)
+    st["a16"] = kkt_ref(k, beta, st["g_sum"], chunk).to(torch.float16)
+    st["a_inv16"] = solve_tril_ref(st["a16"], chunk).to(torch.float16)
+    w, u = wy_fast_ref(k, v, beta, st["a_inv16"], st["g_sum"], chunk)
+    st["w16"] = w.to(torch.float16)
+    st["u16"] = u.to(torch.float16)
+    state, v_new, st["final_state"] = chunk_h_ref(k, st["w16"], st["u16"], st["g_sum"], chunk)
+    st["state16"] = state.to(torch.float16)
+    st["v_new16"] = v_new.to(torch.float16)
+    st["o"] = chunk_o_ref(q, k, st["v_new16"], st["state16"], st["g_sum"], chunk)
+    return st
+
+
 _INPUTS: dict = {}
 
 
 def _inputs(t: int, h: int, d: int, hg: int) -> dict:
     """The drawn q, k, v, beta and g, memoised so the five specs pay for them once."""
-    import reference
-
     key = (t, h, d, hg)
     if key not in _INPUTS:
-        _INPUTS[key] = reference.make_inputs(t, h, d, hg)
+        _INPUTS[key] = make_inputs(t, h, d, hg)
     return _INPUTS[key]
 
 
 def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG):
-    import torch
     from golden import TensorSpec
-
-    import reference
 
     def init_tril():
         return torch.tril(torch.ones(chunk, chunk, dtype=torch.float32))
@@ -148,7 +167,7 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = 
         TensorSpec("v", [t, h, d], torch.float16, init_value=draw("v")),
         TensorSpec("g", [t, h], torch.float32, init_value=draw("g")),
         TensorSpec("beta", [h, t], torch.float32,
-                   init_value=draw("beta", reference.to_hT)),
+                   init_value=draw("beta", to_hT)),
         TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
         TensorSpec("mask_strict", [chunk, chunk], torch.float32,
                    init_value=init_mask_strict),
@@ -164,20 +183,16 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = 
 
 def golden_gdn_layer(tensors):
     """The whole chain in float64 on the tensors the kernel was given, scored end to end."""
-    import reference
-
     chunk = tensors["tril"].shape[0]
-    st = reference.delta_rule(tensors["q"].double(), tensors["k"].double(),
-                              tensors["v"].double(), tensors["beta"].t().double(),
-                              tensors["g"].double(), chunk)
+    st = delta_rule_ref(tensors["q"].double(), tensors["k"].double(),
+                        tensors["v"].double(), tensors["beta"].t().double(),
+                        tensors["g"].double(), chunk)
     tensors["o_out"].copy_(st["o"])
 
 
 def _stats_ok(actual, expected, **_kwargs):
     """Relative Frobenius norm against the float64 golden, with the peak reported."""
-    import reference
-
-    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK_TILE)
+    ok, detail = stats_ok(actual, expected, chunk=CHUNK_TILE)
     print(f"[stats] {detail}", flush=True)
     return ok, detail
 

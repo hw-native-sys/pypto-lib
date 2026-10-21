@@ -15,9 +15,15 @@
 The causal mask includes the diagonal, unlike scaled_dot_kkt's strictly-lower one.
 """
 import pypto.language as pl
+import torch
 
-from chunk_h import CHUNK_TILE
+from chunk_cumsum import cumsum_ref
+from chunk_h import CHUNK_TILE, chunk_h_ref
 from config import QWEN3_8_27B
+from reference import REF_DTYPE, flat_state, make_inputs, stats_ok, to_hT
+from scaled_dot_kkt import kkt_ref
+from solve_tril import solve_tril_ref
+from wy_fast import wy_fast_ref
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -99,27 +105,49 @@ gdn_chunk_o_test = pl.jit(_gdn_chunk_o)
 
 
 
+def chunk_o_ref(q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
+            state: torch.Tensor, g_sum: torch.Tensor, chunk: int) -> torch.Tensor:
+    """S7: the chunk output, inter-chunk plus intra-chunk. -> [T, H, D].
+
+    The causal mask includes the diagonal here, unlike :func:`scaled_dot_kkt.kkt_ref`'s.
+    """
+    t, hg, d = q.shape
+    h = v_new.shape[1]
+    grp = h // hg
+    qf, kf, vf, sf, gf = (x.to(REF_DTYPE) for x in (q, k, v_new, state, g_sum))
+    out = torch.zeros(t, h, d, dtype=REF_DTYPE)
+    rows = torch.arange(chunk)[:, None]
+    cols = torch.arange(chunk)[None, :]
+    causal = (rows >= cols).to(REF_DTYPE)
+    zero = torch.zeros(chunk, chunk, dtype=REF_DTYPE)
+    for ci in range(t // chunk):
+        t0 = ci * chunk
+        for hh in range(h):
+            qc = qf[t0 : t0 + chunk, hh // grp, :]
+            kc = kf[t0 : t0 + chunk, hh // grp, :]
+            gc = gf[t0 : t0 + chunk, hh]
+            inter = (qc @ sf[ci, hh]) * torch.exp(gc)[:, None]
+            gate = torch.exp(torch.minimum(gc[:, None] - gc[None, :], zero))
+            intra = ((qc @ kc.T) * gate * causal) @ vf[t0 : t0 + chunk, hh, :]
+            out[t0 : t0 + chunk, hh, :] = inter + intra
+    return out
+
+
 _INPUTS: dict = {}
 
 
 def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
-    """The chain this stage consumes, run here rather than shared with the other stages.
-
-    Memoised so the several specs that draw from it pay for it once.
-    """
-    import torch
-
-    import reference
-
+    """The chain this stage consumes, memoised so the several specs pay for it once."""
     key = (t, h, d, chunk, hg)
     if key not in _INPUTS:
-        st = reference.make_inputs(t, h, d, hg)
-        st["g_sum"] = reference.cumsum(st["g"], chunk)
-        a16 = reference.kkt(st["k"], st["beta"], st["g_sum"], chunk).to(torch.float16)
-        a_inv16 = reference.solve_tril(a16, chunk).to(torch.float16)
-        w, u = reference.wy_fast(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], chunk)
-        state, v_new, _ = reference.chunk_h(st["k"], w.to(torch.float16), u.to(torch.float16),
-        st["g_sum"], chunk)
+        st = make_inputs(t, h, d, hg)
+        st["g_sum"] = cumsum_ref(st["g"], chunk)
+        a16 = kkt_ref(st["k"], st["beta"], st["g_sum"], chunk).to(torch.float16)
+        a_inv16 = solve_tril_ref(a16, chunk).to(torch.float16)
+        w, u = wy_fast_ref(st["k"], st["v"], st["beta"], a_inv16, st["g_sum"], chunk)
+        w16 = w.to(torch.float16)
+        u16 = u.to(torch.float16)
+        state, v_new, _ = chunk_h_ref(st["k"], w16, u16, st["g_sum"], chunk)
         st["state"] = state
         st["v_new16"] = v_new.to(torch.float16)
         _INPUTS[key] = st
@@ -128,10 +156,7 @@ def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
 
 def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG):
-    import torch
     from golden import TensorSpec
-
-    import reference
 
     def draw(key, transform=None):
         def make():
@@ -155,30 +180,26 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = 
         TensorSpec("v", [t, h, d], torch.float16,
                    init_value=draw("v_new16")),
         TensorSpec("state", [nc * h * d, d], torch.float16,
-                   init_value=draw("state", reference.flat_state)),
+                   init_value=draw("state", flat_state)),
         TensorSpec("g_sum", [h, t], torch.float32,
-                   init_value=draw("g_sum", reference.to_hT)),
+                   init_value=draw("g_sum", to_hT)),
         TensorSpec("mask", [chunk, chunk], torch.float32, init_value=init_mask),
         TensorSpec("o_out", [t, h, d], torch.float16),
     ]
 
 
 def golden_gdn_chunk_o(tensors):
-    import reference
-
     t, _, d = tensors["q"].shape          # q and k have Hg heads under GQA
     h = tensors["v"].shape[1]             # V, O and the state are per value head
     chunk = tensors["mask"].shape[0]
     state = tensors["state"].reshape(t // chunk, h, d, d)
-    o = reference.chunk_o(tensors["q"], tensors["k"], tensors["v"], state, tensors["g_sum"].t(), chunk)
+    o = chunk_o_ref(tensors["q"], tensors["k"], tensors["v"], state, tensors["g_sum"].t(), chunk)
     tensors["o_out"].copy_(o)
 
 
 def _stats_ok(actual, expected, **_kwargs):
     """Relative Frobenius norm against the float64 golden, with the peak reported."""
-    import reference
-
-    ok, detail = reference.stats_ok(actual, expected, chunk=CHUNK_TILE)
+    ok, detail = stats_ok(actual, expected, chunk=CHUNK_TILE)
     print(f"[stats] {detail}", flush=True)
     return ok, detail
 

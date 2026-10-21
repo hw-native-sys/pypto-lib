@@ -9,8 +9,10 @@
 """Gated DeltaNet chunk_cumsum: chunk-local prefix sum of the gate logits,
 g_sum[t, h] = sum over i <= t within the chunk of g[i, h]."""
 import pypto.language as pl
+import torch
 
 from config import QWEN3_8_27B
+from reference import REF_DTYPE, make_inputs, to_hT
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -53,30 +55,30 @@ gdn_chunk_cumsum = pl.jit.inline(_gdn_chunk_cumsum)
 gdn_chunk_cumsum_test = pl.jit(_gdn_chunk_cumsum)
 
 
+def cumsum_ref(g: torch.Tensor, chunk: int) -> torch.Tensor:
+    """S1: chunk-local prefix sum of the gate logits. [T, H] -> [T, H]."""
+    out = torch.zeros_like(g, dtype=REF_DTYPE)
+    gf = g.to(REF_DTYPE)
+    for t0 in range(0, g.shape[0], chunk):
+        out[t0 : t0 + chunk] = gf[t0 : t0 + chunk].cumsum(dim=0)
+    return out
+
+
 _INPUTS: dict = {}
 
 
 def _inputs(t: int, h: int, d: int, chunk: int, hg: int) -> dict:
-    """The chain this stage consumes, run here rather than shared with the other stages.
-
-    Memoised so the several specs that draw from it pay for it once.
-    """
-
-    import reference
-
+    """The chain this stage consumes, memoised so the several specs pay for it once."""
     key = (t, h, d, chunk, hg)
     if key not in _INPUTS:
-        st = reference.make_inputs(t, h, d, hg)
-        _INPUTS[key] = st
+        _INPUTS[key] = make_inputs(t, h, d, hg)
     return _INPUTS[key]
 
 
 def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        hg: int = HG):
     # hg only picks which reference chain to draw from; this stage reads no q or k.
-    import torch
     from golden import TensorSpec
-
 
     def draw(key, transform=None):
         def make():
@@ -98,12 +100,10 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = 
 
 
 def golden_gdn_chunk_cumsum(tensors):
-    import reference
-
     g = tensors["g"]
     out = tensors["g_sum"]
     chunk = tensors["tril"].shape[0]
-    out.copy_(reference.to_hT(reference.cumsum(g, chunk)))
+    out.copy_(to_hT(cumsum_ref(g, chunk)))
 
 
 if __name__ == "__main__":
