@@ -14,7 +14,10 @@
 import torch
 
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
-from quant import golden_mxfp8_linear, grouped_mxfp8_linear, mx_projection, mxfp8_linear
+from quant import (
+    golden_mxfp8_linear, grouped_mxfp8_linear, mxfp8_linear,
+    MX_M_TILE, mx_projection, mx_projection_from_mx, mx_projection_from_mx_to_mx,
+)
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -42,6 +45,7 @@ O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 # tiling
 M_TILE = 32
 N_TILE = 128
+O_A_N_TILE = 256
 K_TILE = 256
 D_TILE = 512
 GROUPED_WORKER_TILE = 4096
@@ -185,11 +189,91 @@ def grouped_output(
         mx_projection(
             x, weight, scale, output, num_tokens,
             O_GROUP_IN, O_LORA, "attention_grouped_o_a", "attention_grouped_o_a_quant",
-            N_TILE, K_TILE, False, True, LOCAL_O_GROUPS,
+            O_A_N_TILE, K_TILE, False, True, LOCAL_O_GROUPS,
         )
     else:
         _grouped_output_inline_quant(x, weight, scale, output, num_tokens, max_workers)
     return output
+
+
+@pl.jit.inline(auto_scope=False)
+def _grouped_output_rope_to_mx(
+    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    output: pl.Tensor,
+    output_scale: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Apply inverse RoPE and grouped O-A with floor input and upward output MX quantization."""
+    weight_flat = pl.reshape(weight, [LOCAL_O_GROUPS * O_GROUP_IN, O_LORA])
+    for group in pl.parallel(LOCAL_O_GROUPS):
+        payload = pl.create_tensor([MX_M_TILE, O_GROUP_IN], dtype=pl.FP8E4M3FN)
+        scale_backing = pl.create_tensor([1, MX_M_TILE * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
+        for block in pl.spmd(O_GROUP_IN // (2 * K_TILE), name_hint="attention_grouped_o_a_rope_quant"):
+            rows = pl.min(MX_M_TILE, num_tokens)
+            cosine = pl.load(cos, [0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+            cosine = pl.fillpad(cosine, pad_value=pl.PadValue.zero)
+            cosine = pl.set_validshape(cosine, MX_M_TILE, ROPE_DIM // 2)
+            sine = pl.load(sin, [0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+            sine = pl.fillpad(sine, pad_value=pl.PadValue.zero)
+            sine = pl.mul(pl.set_validshape(sine, MX_M_TILE, ROPE_DIM // 2), -1.0)
+            for chunk in pl.unroll(2):
+                k0 = (chunk * (O_GROUP_IN // (2 * K_TILE)) + block) * K_TILE
+                input_n = group * O_GROUP_IN + k0
+                raw_source = pl.load(attended, [0, input_n], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
+                if block % (HEAD_DIM // K_TILE) == HEAD_DIM // K_TILE - 1:
+                    tail = pl.cast(raw_source[:, K_TILE - ROPE_DIM:K_TILE], pl.FP32)
+                    even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+                    odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+                    re = pl.sub(pl.mul(even, cosine), pl.mul(odd, sine))
+                    im = pl.add(pl.mul(even, sine), pl.mul(odd, cosine))
+                    real_lanes = pl.tile.full([MX_M_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+                    real_lanes = pl.tile.scatter_mask(real_lanes, re, mask_pattern=pl.tile.MaskPattern.P0101)
+                    imag_lanes = pl.tile.full([MX_M_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+                    imag_lanes = pl.tile.scatter_mask(imag_lanes, im, mask_pattern=pl.tile.MaskPattern.P1010)
+                    real_bits = pl.reinterpret_view(real_lanes, pl.UINT32)
+                    imag_bits = pl.reinterpret_view(imag_lanes, pl.UINT32)
+                    rotated = pl.reinterpret_view(pl.or_(real_bits, imag_bits), pl.FP32)
+                    rotated = pl.cast(rotated, pl.BF16, mode="rint")
+                    valid_rotated = pl.set_validshape(rotated, rows, ROPE_DIM)
+                    assembled_source = pl.tile.assemble(raw_source, valid_rotated, [0, K_TILE - ROPE_DIM])
+                    valid_source = pl.set_validshape(assembled_source, rows, K_TILE)
+                else:
+                    valid_source = raw_source
+                padded_source = pl.fillpad(valid_source, pad_value=pl.PadValue.zero)
+                source = pl.set_validshape(padded_source, MX_M_TILE, K_TILE)
+                groups = pl.reshape(pl.cast(source, pl.FP32), [MX_M_TILE * (K_TILE // 32), 32])
+                reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
+                maximum = pl.row_max(pl.abs(groups), tmp_tile=reduce_tmp)
+                bits = pl.reinterpret_view(maximum, pl.INT32)
+                exponent = pl.maximum(pl.sub(pl.shrs(bits, 23), 8), 0)
+                divisor = pl.reinterpret_view(pl.shls(pl.maximum(exponent, 1), 23), pl.FP32)
+                normalized = pl.row_expand_div(groups, divisor)
+                floor_mask = pl.cast(pl.minimum(exponent, 1), pl.FP32)
+                normalized = pl.row_expand_mul(normalized, floor_mask)
+                normalized = pl.minimum(pl.maximum(normalized, -448.0), 448.0)
+                quantized = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
+                quantized_tile = pl.reshape(quantized, [MX_M_TILE, K_TILE])
+                payload = pl.store(quantized_tile, [0, k0], payload)
+                signed = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
+                codes = pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
+                flat = pl.reshape(codes, [1, MX_M_TILE * (K_TILE // 32)])
+                pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+                packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8)
+                packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
+                scale_offset = k0 // K_TILE * MX_M_TILE * (K_TILE // 32)
+                packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (K_TILE // 32)])
+                scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
+        output, output_scale = mx_projection_from_mx_to_mx(
+            payload, scale_backing, weight_flat, scale, output, output_scale,
+            num_tokens, group, O_GROUP_IN, O_LORA, "attention_grouped_o_a",
+            O_A_N_TILE, K_TILE, LOCAL_O_GROUPS, 8,
+        )
+    return output, output_scale
+
 
 
 @pl.jit.inline(auto_scope=False)
@@ -207,24 +291,36 @@ def o_proj(
 ):
     """Project attention output with native MXFP8 GEMM."""
     tokens = pl.tensor.dim(attended, 0)
-    unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    _rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens, 64, "attention_o_rope")
-    latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
-    grouped_output(
-        unrotated, wo_a, wo_a_scale, latent, num_tokens, max_workers=grouped_max_workers,
-    )
-    if TP_SIZE == 1 and num_tokens <= 16:
-        mx_projection(
-            latent, wo_b, wo_b_scale, output, num_tokens,
-            LOCAL_O_WIDTH, D, "attention_o_b", "attention_o_b_quant", 128, K_TILE,
-            True, False, 1,
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16 and grouped_max_workers >= O_GROUP_IN // K_TILE:
+        latent_payload = pl.create_tensor([16, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
+        latent_scale_backing = pl.create_tensor([1, 16 * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
+        latent_payload, latent_scale_backing = _grouped_output_rope_to_mx(
+            attended, rope_cos, rope_sin, wo_a, wo_a_scale,
+            latent_payload, latent_scale_backing, num_tokens,
+        )
+        mx_projection_from_mx(
+            latent_payload, latent_scale_backing, wo_b, wo_b_scale, output, num_tokens, 0, 0, 0,
+            LOCAL_O_WIDTH, D, "attention_o_b", 128, K_TILE, True, 1,
         )
     else:
-        mxfp8_gemm(
-            latent, wo_b, wo_b_scale, output, num_tokens,
-            width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
-            n_tile=128, name_hint="attention_o_b",
+        unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        _rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens, 64, "attention_o_rope")
+        latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
+        grouped_output(
+            unrotated, wo_a, wo_a_scale, latent, num_tokens, max_workers=grouped_max_workers,
         )
+        if TP_SIZE == 1 and num_tokens <= 16:
+            mx_projection(
+                latent, wo_b, wo_b_scale, output, num_tokens,
+                LOCAL_O_WIDTH, D, "attention_o_b", "attention_o_b_quant", 128, K_TILE,
+                True, False, 1,
+            )
+        else:
+            mxfp8_gemm(
+                latent, wo_b, wo_b_scale, output, num_tokens,
+                width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
+                n_tile=128, name_hint="attention_o_b",
+            )
     return output
 
 

@@ -37,7 +37,7 @@ from o_proj import o_proj
 from hc import hc_pre, zero_bf16_padding, golden_hc_pre
 from hc import golden_mhc_mixes, hc_mixes
 from rmsnorm import golden_rms_norm, rms_norm_tiled
-from hc import golden_hc_post, hc_post
+from hc import golden_hc_post, hc_post, _hc_post_from_partial
 
 
 # model config
@@ -124,14 +124,17 @@ def decode_swa(
         partial, num_tokens, grouped_max_workers=4096,
     )
     output_rows = pl.tensor.dim(attention_output, 0)
-    for row in pl.spmd(output_rows, name_hint="swa_output_cast"):
-        for col in pl.range(0, D, 512):
-            value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
-            if row < num_tokens:
-                partial_tile = pl.load(partial, [row, col], [1, 512])
-                value = pl.cast(partial_tile, pl.BF16, mode="rint")
-            attention_output = pl.store(value, [row, col], attention_output)
-    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
+        _hc_post_from_partial(partial, attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens)
+    else:
+        for row in pl.spmd(output_rows, name_hint="swa_output_cast"):
+            for col in pl.range(0, D, 512):
+                value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                if row < num_tokens:
+                    partial_tile = pl.load(partial, [row, col], [1, 512])
+                    value = pl.cast(partial_tile, pl.BF16, mode="rint")
+                attention_output = pl.store(value, [row, col], attention_output)
+        hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
     return attention_hidden, attention_pre_mix
 
 

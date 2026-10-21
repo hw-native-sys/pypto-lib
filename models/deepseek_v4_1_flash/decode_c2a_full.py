@@ -23,7 +23,7 @@ from config import (
 from compressor import publish_c2a_compressed, STATE_WIDTH, project_ratio2, compressor_ratio2, golden_compressor_ratio2_paged
 from hc import hc_mixes, golden_mhc_mixes
 from hc import hc_pre, golden_hc_pre
-from hc import hc_post, golden_hc_post
+from hc import hc_post, golden_hc_post, _hc_post_from_partial
 from rmsnorm import rms_norm_tiled, golden_rms_norm
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope, golden_rope_tail, golden_qkv_proj_rope
 from sparse_attention import (
@@ -194,15 +194,18 @@ def decode_c2a_full(
         partial, num_tokens, grouped_max_workers=4096,
     )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    with pl.spmd(tokens, name_hint="c2a_output_cast"):
-        row = pl.tile.get_block_idx()
-        for col in pl.range(0, D, 512):
-            value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
-            if row < num_tokens:
-                partial_tile = pl.load(partial, [row, col], [1, 512])
-                value = pl.cast(partial_tile, pl.BF16, mode="rint")
-            pl.store(value, [row, col], attn_out)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output)
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
+        _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
+    else:
+        with pl.spmd(tokens, name_hint="c2a_output_cast"):
+            row = pl.tile.get_block_idx()
+            for col in pl.range(0, D, 512):
+                value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                if row < num_tokens:
+                    partial_tile = pl.load(partial, [row, col], [1, 512])
+                    value = pl.cast(partial_tile, pl.BF16, mode="rint")
+                pl.store(value, [row, col], attn_out)
+        hc_post(attn_out, x_hc, post_mix, residual_mix, output)
     return output, next_pre_mix
 
 

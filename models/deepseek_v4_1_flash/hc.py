@@ -41,6 +41,7 @@ D_TILE = 2560
 OUT_TILE = 2
 D_TILES = D // D_TILE
 POST_SPMD_BLOCKS = 64
+CAST_POST_D_TILE = 1280
 
 
 @pl.jit.inline
@@ -261,6 +262,49 @@ def hc_post(
                     pl.cast(value, target_type=pl.BF16, mode="rint"),
                     target_type=pl.FP32,
                 )
+    return output
+
+
+@pl.jit.inline
+def _hc_post_from_partial(
+    partial: pl.Tensor,
+    sublayer: pl.Tensor,
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Publish the BF16 sublayer and expand four residual streams in one task."""
+    t_dim = pl.tensor.dim(sublayer, 0)
+    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
+    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
+    output_flat = pl.reshape(output, [t_dim, HC_DIM])
+    total_work = t_dim * (D // CAST_POST_D_TILE)
+    workers = pl.min(total_work, POST_SPMD_BLOCKS)
+    for worker in pl.spmd(workers, name_hint="hc_post_cast"):
+        for block in pl.range(worker, total_work, POST_SPMD_BLOCKS):
+            t = block // (D // CAST_POST_D_TILE)
+            d0 = (block % (D // CAST_POST_D_TILE)) * CAST_POST_D_TILE
+            sublayer_tile = pl.tile.full([1, CAST_POST_D_TILE], dtype=pl.BF16, value=0.0)
+            if t < num_tokens:
+                partial_tile = pl.load(partial, [t, d0], [1, CAST_POST_D_TILE])
+                sublayer_tile = pl.cast(partial_tile, pl.BF16, mode="rint")
+            pl.store(sublayer_tile, [t, d0], sublayer)
+            x_tile = pl.cast(sublayer_tile, target_type=pl.FP32)
+            residual0 = pl.load(residual_flat, [t, d0], [1, CAST_POST_D_TILE])
+            residual1 = pl.load(residual_flat, [t, D + d0], [1, CAST_POST_D_TILE])
+            residual2 = pl.load(residual_flat, [t, 2 * D + d0], [1, CAST_POST_D_TILE])
+            residual3 = pl.load(residual_flat, [t, 3 * D + d0], [1, CAST_POST_D_TILE])
+            for out_h in pl.unroll(HC_MULT):
+                value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
+                value = pl.add(value, pl.mul(residual0, pl.read(residual_mix_flat, [t, out_h])))
+                value = pl.add(value, pl.mul(residual1, pl.read(residual_mix_flat, [t, HC_MULT + out_h])))
+                value = pl.add(value, pl.mul(residual2, pl.read(residual_mix_flat, [t, 2 * HC_MULT + out_h])))
+                value = pl.add(value, pl.mul(residual3, pl.read(residual_mix_flat, [t, 3 * HC_MULT + out_h])))
+                output_bf16 = pl.cast(value, target_type=pl.BF16, mode="rint")
+                output_tile = pl.cast(output_bf16, target_type=pl.FP32)
+                pl.store(output_tile, [t, out_h * D + d0], output_flat)
     return output
 
 

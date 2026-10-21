@@ -68,7 +68,7 @@ from config import (
 
 
 from hc import golden_mhc_mixes, hc_mixes
-from hc import golden_hc_post, hc_post
+from hc import golden_hc_post, hc_post, _hc_post_from_partial
 from rmsnorm import golden_rms_norm, rms_norm, rms_norm_tiled
 
 
@@ -235,15 +235,18 @@ def decode_c1a_full(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, grouped_max_workers=64,
     )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    with pl.spmd(tokens, name_hint="c1a_output_cast"):
-        row = pl.tile.get_block_idx()
-        for col in pl.range(0, D, 512):
-            value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
-            if row < num_tokens:
-                partial_tile = pl.load(partial, [row, col], [1, 512])
-                value = pl.cast(partial_tile, pl.BF16, mode="rint")
-            pl.store(value, [row, col], attn_out)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output)
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
+        _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
+    else:
+        with pl.spmd(tokens, name_hint="c1a_output_cast"):
+            row = pl.tile.get_block_idx()
+            for col in pl.range(0, D, 512):
+                value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                if row < num_tokens:
+                    partial_tile = pl.load(partial, [row, col], [1, 512])
+                    value = pl.cast(partial_tile, pl.BF16, mode="rint")
+                pl.store(value, [row, col], attn_out)
+        hc_post(attn_out, x_hc, post_mix, residual_mix, output)
     return output
 
 
