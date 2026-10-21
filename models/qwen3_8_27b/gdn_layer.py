@@ -40,11 +40,11 @@ VAL_WIDTH = H * D
 # validation
 BENCH_SEQ = 8192        # prefill tokens, this entry's default case
 
-# A, A_inv, W, U, the state snapshots and V_new are all [T, H, *] and live at once:
-# about 600 MiB at T = 8192, H = 48, against the runtime's default 256 MiB per ring.
-# Without this the layer fails with orch_error_code=2 HEAP_RING_DEADLOCK. The same
-# thing happens to models/deepseek_v4_pro/prefill_layer.py, at the same value.
-LAYER_RING_HEAP = 1024 * 1024 * 1024
+# Bytes per ring, one entry per scope depth, 0 leaving a ring at its default. The stage
+# scopes allocate on ring 1, the only ring the default cannot hold at BENCH_SEQ; a scalar
+# here would reserve the same bytes on all four. The floor grows with the token count, so a
+# longer --seq-len needs a larger entry.
+LAYER_RING_HEAP = [0, 1024 * 1024 * 1024, 0, 0]
 
 
 def run_config(backend_type: str = "a2a3", sim: bool = False, device: int = 0, swimlane: int = 0) -> dict:
