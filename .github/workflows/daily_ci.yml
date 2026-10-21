@@ -2,7 +2,7 @@ name: Daily CI
 
 on:
   schedule:
-    - cron: '51 20 * * *'  # UTC 20:51 = Shanghai 04:51
+    - cron: '51 18 * * *'  # UTC 18:51 = Shanghai 02:51
   workflow_dispatch:
     inputs:
       performance_only:
