@@ -2298,6 +2298,10 @@ def golden_swa_attention(
     window_indices: torch.Tensor,
     window_cache: torch.Tensor,
     window_cache_scale: torch.Tensor,
+    *,
+    attention_fn: Callable | None = None,
+    output_dtype: torch.dtype | None = None,
+    sequential_query: bool = False,
 ) -> AttentionGoldenResult:
     """Evaluate SWA and publish the current token KV rows."""
     query, window_kv, _ = qkv_proj_rope(
@@ -2312,6 +2316,7 @@ def golden_swa_attention(
         kv_norm_weight,
         rope_cos,
         rope_sin,
+        sequential_query=sequential_query,
     )
     window_payload, updated_window_scale = _publish_quantized_cache(
         window_cache,
@@ -2321,10 +2326,14 @@ def golden_swa_attention(
         quantize_mxfp8_cache,
     )
     quantized_window = dequantize_mxfp8_cache(window_payload, updated_window_scale).to(query.dtype)
-    window_stats = golden_paged_sparse_attention_stats(query, quantized_window, window_indices)
-    attended = golden_merge_attention_stats((window_stats,), attn_sink).to(query.dtype)
+    if attention_fn is None:
+        window_stats = golden_paged_sparse_attention_stats(query, quantized_window, window_indices)
+        attended = golden_merge_attention_stats((window_stats,), attn_sink).to(query.dtype)
+    else:
+        attended = attention_fn(query, quantized_window, window_indices, attn_sink).to(query.dtype)
     output = golden_o_proj(
-        attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale, wo_a_scale=wo_a_scale,
+        attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale,
+        wo_a_scale=wo_a_scale, output_dtype=output_dtype, sequential_projection=sequential_query,
     )
     return AttentionGoldenResult(
         output, window_payload, updated_window_scale, None, None, None, None, None, None, None

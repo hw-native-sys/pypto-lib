@@ -12,7 +12,7 @@
 import pypto.language as pl
 
 from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, ORI_BLOCKS_DYN, TP_SIZE, T_DYN
-from o_proj import o_proj
+from o_proj import GROUPED_WORKER_TILE, o_proj
 from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
 from sparse_attention import publish_window_row
 
@@ -146,7 +146,7 @@ def dspark_attention(
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens, max_workers=2147483647)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
@@ -154,7 +154,10 @@ def dspark_attention(
     gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens,
+        grouped_max_workers=GROUPED_WORKER_TILE,
+    )
     return output, window_cache, window_cache_scale
 
 
@@ -198,6 +201,35 @@ def dspark_attention_test(
     )
 
 
+def golden_attend_dspark_window(query, cache, indices, sink):
+    """Apply 64-key online softmax with BF16 weights and FP32 statistics."""
+    import torch
+
+    flat_cache = cache.flatten(0, 1).squeeze(-2)
+    selected = flat_cache[indices.clamp_min(0).long()].float()
+    maximum = torch.full(query.shape[:2], -1e30, dtype=torch.float32)
+    denominator = torch.zeros_like(maximum)
+    numerator = torch.zeros_like(query, dtype=torch.float32)
+    for start in range(0, indices.shape[-1], 64):
+        keys = selected[:, start:start + 64]
+        scores = torch.einsum("thd,tkd->thk", query.float(), keys) * SOFTMAX_SCALE
+        valid = (indices[:, start:start + 64] >= 0).unsqueeze(1)
+        scores = scores + (~valid).float() * -1e30
+        next_max = torch.maximum(maximum, scores.amax(dim=-1))
+        correction = torch.exp(maximum - next_max)
+        probabilities = torch.exp(scores - next_max.unsqueeze(-1)) * valid
+        denominator = denominator * correction + probabilities.sum(dim=-1)
+        weights = probabilities.to(torch.bfloat16).float()
+        weighted = torch.einsum("thk,tkd->thd", weights, keys)
+        numerator = numerator * correction.unsqueeze(-1) + weighted
+        maximum = next_max
+    sinks = sink.float().unsqueeze(0)
+    final_max = torch.maximum(maximum, sinks)
+    correction = torch.exp(maximum - final_max)
+    denominator = denominator * correction + torch.exp(sinks - final_max)
+    return (numerator * (correction / denominator).unsqueeze(-1)).to(query.dtype)
+
+
 def make_attention_inputs(seed: int = 43):
     """Prepare five queries sharing history and all current KV rows."""
     import torch
@@ -236,7 +268,10 @@ if __name__ == "__main__":
     values = make_attention_inputs()
 
     def golden(tensors):
-        result = golden_swa_attention(*(tensors[name] for name in SWA_INPUT_NAMES))
+        result = golden_swa_attention(
+            *(tensors[name] for name in SWA_INPUT_NAMES), attention_fn=golden_attend_dspark_window,
+            output_dtype=torch.float32, sequential_query=True,
+        )
         tensors["output"].copy_(result.output)
         tensors["window_cache"].copy_(result.window_cache)
         tensors["window_cache_scale"].copy_(result.window_cache_scale)
