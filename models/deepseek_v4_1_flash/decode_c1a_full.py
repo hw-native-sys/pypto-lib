@@ -233,6 +233,7 @@ def decode_c1a_full(
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
     o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, grouped_max_workers=64,
+        round_bf16=True,
     )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:

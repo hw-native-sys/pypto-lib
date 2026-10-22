@@ -144,6 +144,7 @@ def mx_projection_from_mx(
     scale_row: pl.Scalar[pl.INDEX],
     payload_row: pl.Scalar[pl.INDEX],
     m_tile: pl.constexpr,
+    round_bf16: pl.constexpr = False,
 ):
     """Project one prequantized row tile into BF16 or FP32 output."""
     scale_slice = activation_scale_backing[scale_row:scale_row + 1, :]
@@ -176,7 +177,11 @@ def mx_projection_from_mx(
                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                 output_n = output_col + n0
                 if fp32_output:
-                    value_fp32 = pl.mul(acc, 1.0)
+                    if round_bf16:
+                        rounded = pl.cast(acc, pl.BF16, mode="rint")
+                        value_fp32 = pl.cast(rounded, pl.FP32)
+                    else:
+                        value_fp32 = pl.mul(acc, 1.0)
                     valid_fp32 = pl.set_validshape(value_fp32, rows, n_tile)
                     output = pl.store(valid_fp32, [t0, output_n], output)
                 else:
@@ -286,6 +291,7 @@ def mx_projection(
     k_tile: pl.constexpr,
     fp32_output: pl.constexpr = False,
     group_count: pl.constexpr = 1,
+    round_bf16: pl.constexpr = False,
 ):
     """Quantize activation tiles once, then run separate MX projection tasks."""
     weight_flat = pl.reshape(weight, [group_count * width, output_width])
@@ -313,6 +319,7 @@ def mx_projection(
                 payload, scale_backing, weight_flat, scale, output, num_tokens,
                 t0, group * width, group * output_width,
                 width, output_width, name_hint, n_tile, k_tile, fp32_output, group_count, 0, 0, MX_M_TILE,
+                round_bf16=round_bf16,
             )
     return output
 
@@ -330,6 +337,7 @@ def mxfp8_gemm(
     fp32_output: pl.constexpr,
     n_tile: pl.constexpr,
     name_hint: pl.constexpr,
+    round_bf16: pl.constexpr = False,
 ):
     """Compute native M32 MXFP8 products with in-task activation quantization."""
     for mt in pl.parallel((num_tokens + 31) // 32):
@@ -348,7 +356,12 @@ def mxfp8_gemm(
                 sb = pl.load(scale, [k0 // 32, n0], [MX_K_TILE // 32, n_tile])
                 acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
             if fp32_output:
-                output = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile), [t0, n0], output)
+                if round_bf16:
+                    rounded = pl.cast(acc, pl.BF16, mode="rint")
+                    value_fp32 = pl.cast(rounded, pl.FP32)
+                else:
+                    value_fp32 = pl.mul(acc, 1.0)
+                output = pl.store(pl.set_validshape(value_fp32, rows, n_tile), [t0, n0], output)
             else:
                 value = pl.cast(acc, target_type=pl.BF16, mode="rint")
                 output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)

@@ -192,6 +192,7 @@ def decode_c2a_full(
         attended, wo_a, wo_a_scale, wo_b,
         wo_b_scale, rope_cos, rope_sin,
         partial, num_tokens, grouped_max_workers=4096,
+        round_bf16=True,
     )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
@@ -529,6 +530,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     output = golden_o_proj(
         attended, t["rope_cos"], t["rope_sin"], t["wo_a"], t["wo_b"], t["wo_b_scale"],
         wo_a_scale=t["wo_a_scale"], output_dtype=torch.float32 if fp32_output else None, sequential_projection=True,
+        round_bf16=True,
     )
 
     return {
@@ -875,6 +877,7 @@ def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     output = golden_o_proj(
         attended, t["rope_cos"], t["rope_sin"], t["wo_a"], t["wo_b"], t["wo_b_scale"],
         wo_a_scale=t["wo_a_scale"], output_dtype=torch.float32 if fp32_output else None, sequential_projection=True,
+        round_bf16=True,
     )
 
     return {

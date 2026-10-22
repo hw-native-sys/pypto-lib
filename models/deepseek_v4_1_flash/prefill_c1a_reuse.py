@@ -121,6 +121,7 @@ def prefill_c1a_reuse_attention(
             attended, wo_a, wo_a_scale, wo_b,
             wo_b_scale, rope_cos, rope_sin,
             partial, num_tokens, grouped_max_workers=4096,
+            round_bf16=False,
         )
     if scatter_output:
         prefill_sp_output_reduce_scatter(

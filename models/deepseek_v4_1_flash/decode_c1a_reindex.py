@@ -163,6 +163,7 @@ def decode_c1a_reindex(
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
     o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, grouped_max_workers=64,
+        round_bf16=True,
     )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd(tokens, name_hint="c1a_output_cast"):

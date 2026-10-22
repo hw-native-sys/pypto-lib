@@ -189,6 +189,7 @@ def grouped_output(
             x, weight, scale, output, num_tokens,
             O_GROUP_IN, O_LORA, "attention_grouped_o_a", "attention_grouped_o_a_quant",
             O_A_N_TILE, K_TILE, False, LOCAL_O_GROUPS,
+            round_bf16=False,
         )
     else:
         _grouped_output_inline_quant(x, weight, scale, output, num_tokens, max_workers)
@@ -287,8 +288,9 @@ def o_proj(
     output: pl.Tensor[[T_DYN, D], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     grouped_max_workers: pl.constexpr = GROUPED_WORKER_TILE,
+    round_bf16: pl.constexpr = False,
 ):
-    """Project attention output with native MXFP8 GEMM."""
+    """Project attention output, optionally rounding O_b to BF16 in FP32 storage."""
     tokens = pl.tensor.dim(attended, 0)
     if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16 and grouped_max_workers >= O_GROUP_IN // K_TILE:
         latent_payload = pl.create_tensor([16, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
@@ -300,6 +302,7 @@ def o_proj(
         mx_projection_from_mx(
             latent_payload, latent_scale_backing, wo_b, wo_b_scale, output, num_tokens, 0, 0, 0,
             LOCAL_O_WIDTH, D, "attention_o_b", 128, K_TILE, True, 1, 0, 0, MX_M_TILE,
+            round_bf16=round_bf16,
         )
     else:
         unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
@@ -312,13 +315,13 @@ def o_proj(
             mx_projection(
                 latent, wo_b, wo_b_scale, output, num_tokens,
                 LOCAL_O_WIDTH, D, "attention_o_b", "attention_o_b_quant", 128, K_TILE,
-                True, 1,
+                True, 1, round_bf16=round_bf16,
             )
         else:
             mxfp8_gemm(
                 latent, wo_b, wo_b_scale, output, num_tokens,
                 width=LOCAL_O_WIDTH, output_width=D, fp32_output=True,
-                n_tile=128, name_hint="attention_o_b",
+                n_tile=128, name_hint="attention_o_b", round_bf16=round_bf16,
             )
     return output
 
@@ -341,6 +344,7 @@ def golden_o_proj(
     wo_a_scale: torch.Tensor,
     output_dtype: torch.dtype | None = None,
     sequential_projection: bool = False,
+    round_bf16: bool = False,
 ) -> torch.Tensor:
     rope_dim = cos.shape[-1] * 2
     tail = rope_interleave(attended[..., -rope_dim:], cos, sin, inverse=True)
@@ -348,9 +352,12 @@ def golden_o_proj(
     groups = wo_a.shape[0]
     grouped = attended.flatten(-2).unflatten(-1, (groups, -1))
     latent = golden_grouped_output(grouped, wo_a, wo_a_scale)
+    gemm_dtype = torch.bfloat16 if round_bf16 else output_dtype
     if sequential_projection and wo_b_scale is not None:
-        return golden_mxfp8_linear(latent.flatten(-2), wo_b, wo_b_scale, fp32=output_dtype == torch.float32)
-    return mxfp8_linear(latent.flatten(-2), wo_b, wo_b_scale, output_dtype=output_dtype)
+        result = golden_mxfp8_linear(latent.flatten(-2), wo_b, wo_b_scale, fp32=gemm_dtype == torch.float32)
+    else:
+        result = mxfp8_linear(latent.flatten(-2), wo_b, wo_b_scale, output_dtype=gemm_dtype)
+    return result.to(output_dtype or latent.dtype)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -499,7 +506,7 @@ def prefill_tp_output_all_reduce(
     return output
 
 
-def build_o_proj_validation(grouped_max_workers: int):
+def build_o_proj_validation(grouped_max_workers: int, *, round_bf16: bool = True):
     """Build the production output projection with a fixed grouped worker limit."""
     @pl.jit
     def o_proj_validation(
@@ -519,7 +526,7 @@ def build_o_proj_validation(grouped_max_workers: int):
         output.bind_dynamic(0, T_DYN)
         o_proj(
             attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-            output, num_tokens, grouped_max_workers=grouped_max_workers,
+            output, num_tokens, grouped_max_workers=grouped_max_workers, round_bf16=round_bf16,
         )
         return output
 
@@ -531,7 +538,7 @@ def build_o_proj_specs(active_tokens: int):
     from golden import ScalarSpec, TensorSpec
     from quant import golden_mxfp8_quantize, pack_mx_b_scale, quantize_grouped_mxfp8_weight
 
-    tokens = (active_tokens + 15) // 16 * 16
+    tokens = max(16, (active_tokens + 15) // 16 * 16)
     values = {}
 
     def inputs():
@@ -570,19 +577,22 @@ def build_o_proj_specs(active_tokens: int):
     ]
 
 
-def golden_o_proj_validation(tensors):
+def golden_o_proj_validation(tensors, *, round_bf16: bool = True):
     """Apply the existing projection reference only to active rows."""
     active = int(tensors["num_tokens"])
+    if active == 0:
+        return
     attended = tensors["attended"][:active].unflatten(-1, (LOCAL_H, HEAD_DIM))
     result = golden_o_proj(
         attended, tensors["rope_cos"][:active], tensors["rope_sin"][:active],
         tensors["wo_a"], tensors["wo_b"], tensors["wo_b_scale"],
         wo_a_scale=tensors["wo_a_scale"], output_dtype=torch.float32, sequential_projection=True,
+        round_bf16=round_bf16,
     )
     tensors["output"][:active].copy_(result)
 
 
-if __name__ == "__main__":
+def main():
     import argparse
 
     from golden import ratio_allclose, run
@@ -591,11 +601,17 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--case", choices=["all", "fast", "low-workers", "tail"], default="all")
+    parser.add_argument("--case", choices=["all", "empty", "single", "fast", "full", "low-workers", "tail", "max"], default="all")
+    parser.add_argument("--phase", choices=["decode", "prefill"], default="decode")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     args = parser.parse_args()
-    cases = (("fast", 12, GROUPED_WORKER_TILE), ("low-workers", 12, 8), ("tail", 17, GROUPED_WORKER_TILE))
+    cases = (
+        ("empty", 0, GROUPED_WORKER_TILE), ("single", 1, GROUPED_WORKER_TILE),
+        ("fast", 12, GROUPED_WORKER_TILE), ("full", 16, GROUPED_WORKER_TILE),
+        ("low-workers", 12, 8), ("tail", 17, GROUPED_WORKER_TILE), ("max", 72, GROUPED_WORKER_TILE),
+    )
+    round_bf16 = args.phase == "decode"
     for name, active, workers in cases:
         if args.case not in ("all", name):
             continue
@@ -603,14 +619,16 @@ if __name__ == "__main__":
         active_compare = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
 
         def compare(actual, expected, **kwargs):
-            passed, detail = active_compare(actual[:active], expected[:active], **kwargs)
+            passed, detail = active_compare(actual[:active], expected[:active], **kwargs) if active else (True, "empty")
+            rounded_ok = not round_bf16 or torch.equal(actual[:active], actual[:active].bfloat16().float())
             inactive_ok = torch.equal(actual[active:], expected[active:])
-            return passed and inactive_ok, f"{detail}; inactive rows unchanged={inactive_ok}"
+            detail = f"{detail}; BF16 boundary={rounded_ok}; inactive rows unchanged={inactive_ok}"
+            return passed and rounded_ok and inactive_ok, detail
 
         result = run(
-            fn=build_o_proj_validation(workers),
+            fn=build_o_proj_validation(workers, round_bf16=round_bf16),
             specs=build_o_proj_specs(active),
-            golden_fn=golden_o_proj_validation,
+            golden_fn=lambda tensors: golden_o_proj_validation(tensors, round_bf16=round_bf16),
             compare_fn={"output": compare},
             config={
                 "backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device,
@@ -620,3 +638,7 @@ if __name__ == "__main__":
         )
         if not result.passed:
             raise SystemExit(result.error or 1)
+
+
+if __name__ == "__main__":
+    main()
