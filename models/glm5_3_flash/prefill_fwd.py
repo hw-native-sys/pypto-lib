@@ -227,7 +227,7 @@ RANKS = EP_SIZE
 
 def _prefill_model():
     overrides = json.loads(os.environ.get("GLM53_PREFILL_MODEL", "{}"))
-    return dataclasses.replace(C.FLASH, **overrides)
+    return dataclasses.replace(C.FLASH, **overrides) if overrides else C.FLASH
 
 
 MODEL = _prefill_model()
