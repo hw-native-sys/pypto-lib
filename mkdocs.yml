@@ -99,6 +99,7 @@ nav:
           - Model overview: models/deepseek_v4_1_flash/index.md
           - Vision encoder and visual aligner: models/deepseek_v4_1_flash/vision.md
       - GLM-5.3-Flash: models/glm5_3_flash/index.md
+      - Qwen3.8-27B (GDN): models/qwen3_8_27b/index.md
   - Debug and Tune:
       - Overview: debug-and-tune/index.md
       - Debugging: debug-and-tune/debugging.md
