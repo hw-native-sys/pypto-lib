@@ -204,7 +204,7 @@ __all__ = (
     "_PARAM_TO_STACK", "_STACK_TO_PARAM", "_alloc_name_of", "_l3_arg_arity",
     "_step_key", "compile_production", "l3_prefill_head_rows",
     "l3_prefill_layer_diff_dsa_attn_rt", "l3_prefill_layer_diff_kda_attn_rt",
-    "l3_prefill_layer_diff_kda_dense_rt", "l3_prefill_layer_diff_moe_ffn_rt",
+    "l3_prefill_layer_diff_kda_dense_rt", "ResidentPrefillSession", "l3_prefill_layer_diff_moe_ffn_rt",
     "l3_prefill_seed", "load_production", "prepare_step_inputs", "prefill_head_rows",
     "prefill_layer_diff_dsa_attn_rt", "prefill_layer_diff_kda_attn_rt",
     "prefill_layer_diff_kda_dense_rt", "prefill_layer_diff_moe_ffn_rt",
@@ -2507,6 +2507,239 @@ def _render_prompt(prompt: str, chat_template: str | None) -> str:
         print("GLM_CHAT_TEMPLATE_FALLBACK", repr(error), flush=True)
         return f"<|user|>\n{prompt}<|assistant|>\n"
 
+class ResidentPrefillSession:
+    """Resident weights and six-program worker for full-prefix GLM forwards."""
+
+    def __init__(
+        self, checkpoint: Checkpoint, programs: dict, device_ids: list[int],
+        *, platform: str = "a2a3", run_config: RunConfig | None = None,
+    ):
+        self.checkpoint = checkpoint
+        self.programs = programs
+        self.device_ids = list(device_ids)
+        self.platform = platform
+        self.run_config = run_config
+        self.runtime = None
+        self._context = None
+        self.calls = 0
+        self.guard_events: list[str] = []
+        plan = production_launch_plan()
+        if set(programs) != set(RT_PROGRAMS):
+            raise ValueError(
+                f"programs must cover exactly the consolidated set {list(RT_PROGRAMS)} "
+                f"(got {sorted(programs)})"
+            )
+        # Signature names come from the entries, never from the compiled artifacts:
+        # the persisted param metadata carries post-SSA spellings (x_hc__ssa_v0).
+        # Every step dispatches its consolidated program by kind, with the layer
+        # riding the dispatch as trailing ordinal scalars.
+        arity = {program: _l3_arg_arity(production_program_entry(program))
+                 for program in RT_PROGRAMS}
+        step_program = {step: production_program_of_step(step) for step in plan}
+        # Reject a different rank/capacity compile before loading any payload: the
+        # seed entry leads with embedding_rows [RANKS, CAPACITY, D].
+        seed_params = programs["seed"]._get_metadata()[0]
+        if list(seed_params[0].shape) != [RANKS, CAPACITY, D]:
+            raise ValueError(
+                "--runtime-dir must contain glm prefill compiled for TP16/EP16 with the same capacity"
+            )
+        if len(device_ids) != RANKS or len(set(device_ids)) != RANKS:
+            raise ValueError(f"prefill needs {RANKS} distinct devices")
+
+        self.plan, self.arity, self.step_program = plan, arity, step_program
+
+    def __enter__(self):
+        if self._context is not None:
+            raise RuntimeError("the resident prefill session is already open")
+        checkpoint, programs, device_ids = self.checkpoint, self.programs, self.device_ids
+        platform = self.platform
+        plan, arity, step_program = self.plan, self.arity, self.step_program
+        weights = ResidentPrefillWeights.load(
+            checkpoint, tp_size=TP_SIZE, ep_size=EP_SIZE, model=_prefill_model()
+        )
+        final_norm_w = _load_final_norm(checkpoint)
+        lm_head = weights.lm_head()
+        config = self.run_config or RunConfig(
+            platform=platform, ring_heap=2 * 1024**3,
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+        )
+
+        print("GLM_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
+        primary, extras = programs["seed"], [programs[name] for name in RT_PROGRAMS[1:]]
+        context = primary.prepare(config, extra_compiled=extras, persistent=True)
+        runtime = context.__enter__()
+        try:
+            inputs = prepare_step_inputs(weights, [[0] for _ in range(BATCH)])
+            per_rank = [{} for _ in device_ids]
+            for rank in range(RANKS):
+                tensors = per_rank[rank]
+                for name in GLM_TENSORS:
+                    stack = _PARAM_TO_STACK.get(name)
+                    if stack is not None:
+                        shape, dtype = weights.tensor_layouts[stack]
+                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+                    elif name in OUTPUTS:
+                        shape, dtype = OUTPUTS[name]
+                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+                    elif name in WORKSPACES:
+                        shape, dtype = WORKSPACES[name]
+                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+                    else:
+                        value = inputs[name]
+                        tensors[name] = runtime.alloc_tensor(
+                            value.shape, value.dtype, init=value, worker_id=rank
+                        )
+                # Stacks the graph ABI does not carry (final norm, MTP extras) still need
+                # allocation because weights.upload stages every resident stack.
+                for stack, (shape, dtype) in weights.tensor_layouts.items():
+                    if stack not in _STACK_TO_PARAM and stack not in tensors:
+                        tensors[stack] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+
+            def upload(rank):
+                handles = {
+                    stack: per_rank[rank][_STACK_TO_PARAM.get(stack, stack)]
+                    for stack in weights.tensor_layouts
+                }
+                weights.upload(runtime, rank, handles)
+                print("GLM_RANK_WEIGHTS_READY", rank, flush=True)
+
+            with ThreadPoolExecutor(max_workers=RANKS) as executor:
+                list(executor.map(upload, range(RANKS)))
+            stacked = {
+                name: StackedDeviceTensor(
+                    [rank[name] for rank in per_rank], (RANKS, *per_rank[0][name].shape), tuple(range(RANKS))
+                )
+                for name in GLM_TENSORS
+            }
+            # Per-step parameter -> buffer binding (design S2.1 ping-pong): every
+            # launch's signature names must resolve to exactly one allocated tensor
+            # before any dispatch happens, so a plan/ABI drift fails loudly here
+            # instead of as an opaque dispatch-time shape error.
+            bindings = production_step_bindings(plan)
+            for step in plan:
+                tensor_names, _ = arity[step_program[step]]
+                unbound = [
+                    name for name in tensor_names
+                    if _alloc_name_of(name, bindings[step]) not in stacked
+                ]
+                if unbound:
+                    raise ValueError(f"step {step} parameters have no allocated tensor: {unbound}")
+            head_rows = torch.empty((RANKS, LOGIT_ROWS, D), dtype=torch.bfloat16)
+        except BaseException:
+            context.__exit__(*sys.exc_info())
+            raise
+        self._context = context
+        self.runtime, self.config = runtime, config
+        self.weights, self.final_norm_w, self.lm_head = weights, final_norm_w, lm_head
+        self.per_rank, self.stacked, self.bindings = per_rank, stacked, bindings
+        self.head_rows = head_rows
+        return self
+
+    def __exit__(self, *exc_info):
+        context, self._context = self._context, None
+        self.runtime = None
+        if context is not None:
+            return context.__exit__(*exc_info)
+        return False
+
+    def forward(self, sequences: list[list[int]]) -> torch.Tensor:
+        """Reset scratch caches, run all 45 layers, and return host logits."""
+        if self.runtime is None:
+            raise RuntimeError("open the resident prefill session before forwarding")
+        runtime, config, programs = self.runtime, self.config, self.programs
+        plan, arity, step_program = self.plan, self.arity, self.step_program
+        per_rank, stacked, bindings = self.per_rank, self.stacked, self.bindings
+        head_rows, guard_events = self.head_rows, self.guard_events
+        final_norm_w, lm_head = self.final_norm_w, self.lm_head
+        step = self.calls
+        inputs = prepare_step_inputs(self.weights, sequences)
+        for rank in range(RANKS):
+            for name, value in inputs.items():
+                if name in CONSTANT_STEP_INPUTS or name in _PARAM_TO_STACK:
+                    continue
+                runtime.copy_to(
+                    per_rank[rank][name].data_ptr, value.data_ptr(),
+                    value.numel() * value.element_size(), worker_id=rank,
+                )
+        print("GLM_DEVICE_START", self.calls, flush=True)
+        # The plan-driven loop: every launch dispatches on the ONE shared
+        # multi-program worker via runtime.run (rt(*args) is single-program
+        # only), each with its signature names resolved by the ping-pong
+        # binding -- x_hc/x_hc_mid and out_x_hc_mid/out_x_hc_out alternate
+        # over ws_x_hc_a/ws_x_hc_b, out_* lands in the ws_* workspaces.
+        # The step's ordinal scalars ride the dispatch as trailing INT32s
+        # the runner forwards as-is.
+        for launch in plan:
+            overrides = bindings[launch]
+            key = step_program[launch]
+            tensor_names, scalar_names = arity[key]
+            if TRACE_DISPATCH:
+                label = f"{_step_key(launch)} {key}"
+                print("GLM_DISPATCH", label, flush=True)
+            if scalar_names:
+                ords = production_step_ordinals(launch)
+                runtime.run(
+                    programs[key],
+                    *[stacked[_alloc_name_of(name, overrides)] for name in tensor_names],
+                    *[ords[name] for name in scalar_names],
+                    config=config,
+                )
+            else:
+                runtime.run(
+                    programs[key],
+                    *[stacked[_alloc_name_of(name, overrides)] for name in tensor_names],
+                    config=config,
+                )
+            if VERIFY_X_H_C and launch != ("head",):
+                # The stream buffer this launch wrote (seed: its x_hc Out;
+                # whole-layer/FFN: out_x_hc_out; attention half: out_x_hc_mid)
+                # -- per-step finiteness evidence up to any later stop point.
+                written = overrides.get(
+                    "out_x_hc_out", overrides.get("out_x_hc_mid", overrides.get("x_hc"))
+                )
+                step_rows = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.bfloat16)
+                runtime.copy_stacked_from(stacked[written], step_rows)
+                finite_step = bool(torch.isfinite(step_rows.to(torch.float32)).all())
+                print(
+                    "GLM_XHC_STEP", _step_key(launch), written, "finite=", finite_step,
+                    "absmax=", float(step_rows.to(torch.float32).abs().max()), flush=True,
+                )
+                if not finite_step:
+                    guard_events.append(f"nonfinite {written} after {_step_key(launch)}")
+                    raise FloatingPointError(f"nonfinite {written} after {_step_key(launch)}")
+        runtime.copy_stacked_from(stacked["head_hidden"], head_rows)
+        if VERIFY_X_H_C:
+            print(
+                "GLM_HEAD_HIDDEN finite=", bool(torch.isfinite(head_rows).all()),
+                "absmax=", float(head_rows.to(torch.float32).abs().max()), flush=True,
+            )
+        if not bool(torch.isfinite(head_rows).all()):
+            guard_events.append(f"nonfinite head_hidden at step {step}")
+            raise FloatingPointError(f"nonfinite head_hidden at step {step}")
+        if VERIFY_X_H_C:
+            # The head's x_hc binding IS the last FFN launch's out_x_hc_out
+            # (the ping-pong returns the stream to its entry side), so this
+            # readback is the direct out_x_hc_out finiteness evidence.
+            stream_name = bindings[("head",)]["x_hc"]
+            stream_rows = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.bfloat16)
+            runtime.copy_stacked_from(stacked[stream_name], stream_rows)
+            finite_stream = bool(torch.isfinite(stream_rows.to(torch.float32)).all())
+            print(
+                "GLM_XHC_STREAM", stream_name, "finite=", finite_stream,
+                "absmax=", float(stream_rows.to(torch.float32).abs().max()), flush=True,
+            )
+            if not finite_stream:
+                guard_events.append(f"nonfinite {stream_name} at step {step}")
+                raise FloatingPointError(f"nonfinite {stream_name} at step {step}")
+        # All ranks hold the same restored stream; rank 0's rows are the answer.
+        logits = host_lm_head_logits(head_rows[0], final_norm_w, lm_head)
+        if not bool(torch.isfinite(logits[:BATCH]).all()):
+            guard_events.append(f"nonfinite logits at step {step}")
+            raise FloatingPointError(f"nonfinite last-token logits at step {step}")
+        self.calls += 1
+        return logits[:BATCH]
+
+
 def generate(
     checkpoint: Checkpoint,
     programs: dict,
@@ -2519,50 +2752,11 @@ def generate(
     expect_tokens: dict[int, list[int]] | None = None,
     dump_path: Path | None = None,
 ):
-    """Generate with the resident checkpoint over one packed batch on 16 ranks.
-
-    One full forward = the launch plan dispatched back to back on one shared
-    multi-program L3 worker (``runtime.run``; the ``rt(*args)`` shortcut is
-    single-program only). ``programs`` must be keyed by the six consolidated
-    names (:data:`RT_PROGRAMS`): every step dispatches its kind's ONE program
-    with the layer as trailing INT32 ordinal scalars (host arithmetic, the
-    graph carries none). Step arguments resolve via
-    :func:`production_step_bindings` + :func:`_alloc_name_of`: the carried
-    stream ping-pongs over ``ws_x_hc_a``/``ws_x_hc_b`` (seed writes ``a``,
-    attention moves to the far side, the FFN writes back, the head collapses
-    the final side), every other ``out_*`` answers its ``ws_*`` workspace,
-    ``head_hidden`` is the output alloc. Each forward gets fresh, zeroed
-    caches (full-prefix recompute, the v4.1 pattern) while weights, boundary
-    workspaces and the worker's windows survive across dispatches (windows
-    restored to zero before reuse: every single-call collective at epoch 1,
-    the dense whole-layer's shared tp pair at 1 then 2). The LM head and the
-    embedding gather stay on the host. ``platform`` picks the backend
-    (``a2a3`` in deployment, ``a2a3sim`` for plan-driven proof runs).
-    """
+    """Generate tokens with the shared resident full-prefix forward session."""
     from tokenizers import Tokenizer
 
-    plan = production_launch_plan()
-    if set(programs) != set(RT_PROGRAMS):
-        raise ValueError(
-            f"programs must cover exactly the consolidated set {list(RT_PROGRAMS)} "
-            f"(got {sorted(programs)})"
-        )
-    # Signature names come from the entries, never from the compiled artifacts:
-    # the persisted param metadata carries post-SSA spellings (x_hc__ssa_v0).
-    # Every step dispatches its consolidated program by kind, with the layer
-    # riding the dispatch as trailing ordinal scalars.
-    arity = {program: _l3_arg_arity(production_program_entry(program))
-             for program in RT_PROGRAMS}
-    step_program = {step: production_program_of_step(step) for step in plan}
-    # Reject a different rank/capacity compile before loading any payload: the
-    # seed entry leads with embedding_rows [RANKS, CAPACITY, D].
-    seed_params = programs["seed"]._get_metadata()[0]
-    if list(seed_params[0].shape) != [RANKS, CAPACITY, D]:
-        raise ValueError(
-            "--runtime-dir must contain glm prefill compiled for TP16/EP16 with the same capacity"
-        )
-    if len(device_ids) != RANKS or len(set(device_ids)) != RANKS or len(prompts) != BATCH:
-        raise ValueError(f"prefill needs {RANKS} distinct devices and exactly {BATCH} prompts")
+    if len(prompts) != BATCH:
+        raise ValueError(f"provide exactly {BATCH} prompts")
 
     tokenizer = Tokenizer.from_file(str(checkpoint.root / "tokenizer.json"))
     tokenizer_config_path = checkpoint.root / "tokenizer_config.json"
@@ -2596,174 +2790,14 @@ def generate(
             f"exceeds the compiled capacity {CAPACITY}; compile a larger capacity"
         )
 
-    weights = ResidentPrefillWeights.load(
-        checkpoint, tp_size=TP_SIZE, ep_size=EP_SIZE, model=_prefill_model()
-    )
-    final_norm_w = _load_final_norm(checkpoint)
-    lm_head = weights.lm_head()
-    config = RunConfig(
-        platform=platform, ring_heap=2 * 1024**3,
-        distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-    )
-
     generated: list[list[int]] = [[] for _ in prompts]
     finished = [False] * BATCH
     step_log: list[dict] = []
-    guard_events: list[str] = []
-    print("GLM_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
     start = time.monotonic()
-    # One shared multi-program L3 worker serves every launch-plan step,
-    # prepared with the SIX consolidated programs (seed + the 5 per-kind
-    # entries). Persistent windows are restored to zero before each reuse, so
-    # each dispatch's collectives run at their fresh-window first-call epochs
-    # (every single-call collective at 1; the dense whole-layer's shared tp
-    # pair at 1 then 2).
-    primary, extras = programs["seed"], [programs[name] for name in RT_PROGRAMS[1:]]
-    with primary.prepare(config, extra_compiled=extras, persistent=True) as runtime:
-        per_rank = [{} for _ in device_ids]
-        for rank in range(RANKS):
-            tensors = per_rank[rank]
-            inputs = prepare_step_inputs(weights, sequences)
-            for name in GLM_TENSORS:
-                stack = _PARAM_TO_STACK.get(name)
-                if stack is not None:
-                    shape, dtype = weights.tensor_layouts[stack]
-                    tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                elif name in OUTPUTS:
-                    shape, dtype = OUTPUTS[name]
-                    tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                elif name in WORKSPACES:
-                    shape, dtype = WORKSPACES[name]
-                    tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                else:
-                    value = inputs[name]
-                    tensors[name] = runtime.alloc_tensor(
-                        value.shape, value.dtype, init=value, worker_id=rank
-                    )
-            # Stacks the graph ABI does not carry (final norm, MTP extras) still need
-            # allocation because weights.upload stages every resident stack.
-            for stack, (shape, dtype) in weights.tensor_layouts.items():
-                if stack not in _STACK_TO_PARAM and stack not in tensors:
-                    tensors[stack] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-
-        def upload(rank):
-            handles = {
-                stack: per_rank[rank][_STACK_TO_PARAM.get(stack, stack)]
-                for stack in weights.tensor_layouts
-            }
-            weights.upload(runtime, rank, handles)
-            print("GLM_RANK_WEIGHTS_READY", rank, flush=True)
-
-        with ThreadPoolExecutor(max_workers=RANKS) as executor:
-            list(executor.map(upload, range(RANKS)))
-        stacked = {
-            name: StackedDeviceTensor(
-                [rank[name] for rank in per_rank], (RANKS, *per_rank[0][name].shape), tuple(range(RANKS))
-            )
-            for name in GLM_TENSORS
-        }
-        # Per-step parameter -> buffer binding (design S2.1 ping-pong): every
-        # launch's signature names must resolve to exactly one allocated tensor
-        # before any dispatch happens, so a plan/ABI drift fails loudly here
-        # instead of as an opaque dispatch-time shape error.
-        bindings = production_step_bindings(plan)
-        for step in plan:
-            tensor_names, _ = arity[step_program[step]]
-            unbound = [
-                name for name in tensor_names
-                if _alloc_name_of(name, bindings[step]) not in stacked
-            ]
-            if unbound:
-                raise ValueError(f"step {step} parameters have no allocated tensor: {unbound}")
-        head_rows = torch.empty((RANKS, LOGIT_ROWS, D), dtype=torch.bfloat16)
+    with ResidentPrefillSession(checkpoint, programs, device_ids, platform=platform) as session:
         for step in range(max_new_tokens):
-            if step:
-                for rank in range(RANKS):
-                    tensors = per_rank[rank]
-                    inputs = prepare_step_inputs(weights, sequences)
-                    for name, value in inputs.items():
-                        if name in CONSTANT_STEP_INPUTS or name in _PARAM_TO_STACK:
-                            continue
-                        runtime.copy_to(
-                            tensors[name].data_ptr, value.data_ptr(),
-                            value.numel() * value.element_size(), worker_id=rank,
-                        )
             tick = time.monotonic()
-            print("GLM_DEVICE_START", step, flush=True)
-            # The plan-driven loop: every launch dispatches on the ONE shared
-            # multi-program worker via runtime.run (rt(*args) is single-program
-            # only), each with its signature names resolved by the ping-pong
-            # binding -- x_hc/x_hc_mid and out_x_hc_mid/out_x_hc_out alternate
-            # over ws_x_hc_a/ws_x_hc_b, out_* lands in the ws_* workspaces.
-            # The step's ordinal scalars ride the dispatch as trailing INT32s
-            # the runner forwards as-is.
-            for launch in plan:
-                overrides = bindings[launch]
-                key = step_program[launch]
-                tensor_names, scalar_names = arity[key]
-                if TRACE_DISPATCH:
-                    label = f"{_step_key(launch)} {key}"
-                    print("GLM_DISPATCH", label, flush=True)
-                if scalar_names:
-                    ords = production_step_ordinals(launch)
-                    runtime.run(
-                        programs[key],
-                        *[stacked[_alloc_name_of(name, overrides)] for name in tensor_names],
-                        *[ords[name] for name in scalar_names],
-                        config=config,
-                    )
-                else:
-                    runtime.run(
-                        programs[key],
-                        *[stacked[_alloc_name_of(name, overrides)] for name in tensor_names],
-                        config=config,
-                    )
-                if VERIFY_X_H_C and launch != ("head",):
-                    # The stream buffer this launch wrote (seed: its x_hc Out;
-                    # whole-layer/FFN: out_x_hc_out; attention half: out_x_hc_mid)
-                    # -- per-step finiteness evidence up to any later stop point.
-                    written = overrides.get(
-                        "out_x_hc_out", overrides.get("out_x_hc_mid", overrides.get("x_hc"))
-                    )
-                    step_rows = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.bfloat16)
-                    runtime.copy_stacked_from(stacked[written], step_rows)
-                    finite_step = bool(torch.isfinite(step_rows.to(torch.float32)).all())
-                    print(
-                        "GLM_XHC_STEP", _step_key(launch), written, "finite=", finite_step,
-                        "absmax=", float(step_rows.to(torch.float32).abs().max()), flush=True,
-                    )
-                    if not finite_step:
-                        guard_events.append(f"nonfinite {written} after {_step_key(launch)}")
-                        raise FloatingPointError(f"nonfinite {written} after {_step_key(launch)}")
-            runtime.copy_stacked_from(stacked["head_hidden"], head_rows)
-            if VERIFY_X_H_C:
-                print(
-                    "GLM_HEAD_HIDDEN finite=", bool(torch.isfinite(head_rows).all()),
-                    "absmax=", float(head_rows.to(torch.float32).abs().max()), flush=True,
-                )
-            if not bool(torch.isfinite(head_rows).all()):
-                guard_events.append(f"nonfinite head_hidden at step {step}")
-                raise FloatingPointError(f"nonfinite head_hidden at step {step}")
-            if VERIFY_X_H_C:
-                # The head's x_hc binding IS the last FFN launch's out_x_hc_out
-                # (the ping-pong returns the stream to its entry side), so this
-                # readback is the direct out_x_hc_out finiteness evidence.
-                stream_name = bindings[("head",)]["x_hc"]
-                stream_rows = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.bfloat16)
-                runtime.copy_stacked_from(stacked[stream_name], stream_rows)
-                finite_stream = bool(torch.isfinite(stream_rows.to(torch.float32)).all())
-                print(
-                    "GLM_XHC_STREAM", stream_name, "finite=", finite_stream,
-                    "absmax=", float(stream_rows.to(torch.float32).abs().max()), flush=True,
-                )
-                if not finite_stream:
-                    guard_events.append(f"nonfinite {stream_name} at step {step}")
-                    raise FloatingPointError(f"nonfinite {stream_name} at step {step}")
-            # All ranks hold the same restored stream; rank 0's rows are the answer.
-            logits = host_lm_head_logits(head_rows[0], final_norm_w, lm_head)
-            if not bool(torch.isfinite(logits[:BATCH]).all()):
-                guard_events.append(f"nonfinite logits at step {step}")
-                raise FloatingPointError(f"nonfinite last-token logits at step {step}")
+            logits = session.forward(sequences)
             next_ids = logits[:BATCH].argmax(dim=-1).tolist()
             for request, token in enumerate(next_ids):
                 if not finished[request]:
@@ -2777,6 +2811,8 @@ def generate(
             print("GLM_GENERATION_STEP", json.dumps(step_log[-1], ensure_ascii=False), flush=True)
             if all(finished):
                 break
+        resident_bytes_per_rank = session.weights.bytes_per_rank
+        guard_events = session.guard_events
 
     if dump_path is not None:
         dump_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2799,8 +2835,8 @@ def generate(
         "capacity": CAPACITY, "full_prefix_recomputation": True,
         "layers_per_forward": NUM_LAYERS,
         "launch_mode": "rt",
-        "device_launches_per_rank_per_forward": len(plan),
-        "resident_bytes_per_rank": weights.bytes_per_rank,
+        "device_launches_per_rank_per_forward": len(session.plan),
+        "resident_bytes_per_rank": resident_bytes_per_rank,
         "seconds": time.monotonic() - start, "steps": step_log, "guard_events": guard_events,
         "cases": [
             {
