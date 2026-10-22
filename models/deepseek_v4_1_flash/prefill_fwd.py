@@ -103,7 +103,7 @@ from prefill_c2a_full import prefill_c2a_full_attention
 from prefill_c2a_reuse import prefill_c2a_reuse_attention
 from prefill_c1a_reindex import prefill_c1a_reindex_attention
 from prefill_c1a_reuse import prefill_c1a_reuse_attention
-from quant import build_mxfp4_pair_lut
+from expert_routed import build_mxfp4_pair_lut
 from rmsnorm import rms_norm_tiled
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 
@@ -1253,7 +1253,8 @@ class ResidentPrefillWeights:
 
     def upload(self, runtime, rank: int, handles):
         """Upload one projection at a time into persistent named allocations."""
-        from quant import pack_mx_b_scale, pack_mxfp4_weight_tiles
+        from quant import pack_mx_b_scale
+        from expert_routed import pack_mxfp4_weight_tiles
 
         if rank not in range(self.ranks):
             raise ValueError(f"expert rank must be in [0, {self.ranks})")

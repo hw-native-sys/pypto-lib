@@ -8,13 +8,16 @@
 # -----------------------------------------------------------------------------------------------------------
 """Decode indexer query preparation, key publication, scoring, and TopK."""
 
+from gemm import gemm_bf16_to_bf16_staged
+
 import pypto.language as pl
 import torch
 import torch.nn.functional as F
 
 
 from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
-from quant import dequantize_mxfp4_cache, golden_bf16_gemm, golden_mxfp8_linear, quantize_mxfp4_cache
+from quant import dequantize_mxfp4_cache, quantize_mxfp4_cache
+from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from rmsnorm import make_norm_with_deps, golden_rms_norm
 from config import (
     B_DYN,
@@ -27,9 +30,6 @@ from config import (
     TABLE_DYN,
     T_DYN,
 )
-
-
-from quant import bf16_gemm_staged
 
 
 # model config
@@ -1878,7 +1878,7 @@ def project_index_weights(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    result, completed = bf16_gemm_staged(
+    result, completed = gemm_bf16_to_bf16_staged(
         source, weight, output, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_WEIGHT_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=8, name_hint='c1a_index_weights_projection',
@@ -1948,7 +1948,7 @@ def c2a_project_index_key(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    result, completed = bf16_gemm_staged(
+    result, completed = gemm_bf16_to_bf16_staged(
         source, weight, output, num_tokens, ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=32, name_hint='c2a_index_key_projection',
@@ -2268,7 +2268,7 @@ def golden_c1a_index_scores(a, qr, index_payload, index_scale):
     # Logical page-table score columns.
     width = a["index_block_table"].shape[-1] * 128
     heads = a["index_weights_proj"].shape[-1]
-    iq = golden_mxfp8_linear(qr, a["index_wq_b"], a["index_wq_b_scale"])
+    iq = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, a["index_wq_b"], a["index_wq_b_scale"])
     if iq.shape[-1] % heads:
         raise RuntimeError(f"index query width {iq.shape[-1]} is not divisible by {heads} heads")
     dim = iq.shape[-1] // heads
@@ -2278,7 +2278,7 @@ def golden_c1a_index_scores(a, qr, index_payload, index_scale):
     iq = golden_index_query_fp4(iq)
     keys = dequantize_mxfp4_cache(index_payload, index_scale, 32, "e8m0").to(x.dtype).flatten(0, 1)[:, 0]
     # The device scales the projected head weight in FP32 and rounds it once to BF16.
-    weight = golden_bf16_gemm(x, a["index_weights_proj"]).float() * (dim * heads) ** -0.5
+    weight = ((x).float() @ (a["index_weights_proj"]).float()).to(torch.bfloat16).float() * (dim * heads) ** -0.5
     weight = weight.to(torch.bfloat16).float()
     scores = torch.full((x.shape[0], width), -torch.inf)
     physical = torch.full((x.shape[0], width), -1, dtype=torch.int64)
@@ -2294,7 +2294,7 @@ def golden_c1a_index_scores(a, qr, index_payload, index_scale):
             continue
         # Device order: BF16-cast the dot, ReLU in FP32, multiply by the rounded weight,
         # BF16-cast the product, sum in FP32, BF16-cast the total.
-        dots = golden_bf16_gemm(iq[t], keys[rows.long()].T)
+        dots = ((iq[t]).float() @ (keys[rows.long()].T).float()).to(torch.bfloat16)
         product = dots.float().relu() * weight[t, :, None]
         values = product.to(torch.bfloat16).float().sum(0).to(torch.bfloat16).float()
         scores[t, valid_pos] = values
@@ -2363,10 +2363,10 @@ def golden_c2a_index(t, qr, index_cache, index_cache_scale):
     index_heads = t["index_weights_proj"].shape[-1]
     index_values = dequantize_mxfp4_cache(index_cache, index_cache_scale, INDEX_CACHE_GROUP, "e8m0").flatten(0, -2)
     # Accumulate the index-query projection in sequential group-32 partials.
-    index_q = golden_mxfp8_linear(qr, t["index_wq_b"], t["index_wq_b_scale"]).unflatten(-1, (index_heads, index_dim))
+    index_q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, t["index_wq_b"], t["index_wq_b_scale"]).unflatten(-1, (index_heads, index_dim))
     index_q = golden_rope_tail(index_q, t["rope_cos"], t["rope_sin"])
     index_q = golden_index_query_fp4(index_q)
-    head_weights = golden_bf16_gemm(x, t["index_weights_proj"]).float()
+    head_weights = ((x).float() @ (t["index_weights_proj"]).float()).to(torch.bfloat16).float()
     head_weights = (head_weights * (index_dim * index_heads) ** -0.5).to(torch.bfloat16).float()
     lens = t["compressed_lens"].long()
     score_width = t["index_block_table"].shape[1] * 128
@@ -2387,7 +2387,7 @@ def golden_c2a_index(t, qr, index_cache, index_cache_scale):
         if count <= INDEX_TOPK or not valid_rows.numel():
             continue
         # Round dot, weighted values, and the head sum to BF16.
-        dots = golden_bf16_gemm(index_q[token], index_values[valid_rows].to(torch.bfloat16).T)
+        dots = ((index_q[token]).float() @ (index_values[valid_rows].to(torch.bfloat16).T).float()).to(torch.bfloat16)
         weighted = dots.float().relu() * head_weights[token, :, None]
         weighted = weighted.to(torch.bfloat16).float()
         total = weighted.sum(dim=0).to(torch.bfloat16).float()
@@ -2421,7 +2421,7 @@ def c1a_project_index_key(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    result, completed = bf16_gemm_staged(
+    result, completed = gemm_bf16_to_bf16_staged(
         source, weight, output, num_tokens, ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=8, name_hint='c1a_index_key_projection',

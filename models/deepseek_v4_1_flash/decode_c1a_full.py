@@ -36,14 +36,8 @@ from decode_indexer import (
 )
 from sparse_attention import golden_selected_attention, attend_selected, gather_packed, publish_window_row
 from sparse_attention import GATHER_WORKERS, attend_packed_cohorts
-from quant import (
-    quantize_grouped_mxfp8_weight,
-    _publish_quantized_cache,
-    quantize_mxfp4_cache,
-    quantize_mxfp8_cache,
-    dequantize_mxfp4_cache,
-    dequantize_mxfp8_cache,
-)
+from quant import quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache, dequantize_mxfp4_cache, dequantize_mxfp8_cache
+from utils import _publish_quantized_cache
 from rope_tables import precompute_rope_tables
 from utils import AttentionGoldenResult
 from decode_indexer import index_pool_block_capacity

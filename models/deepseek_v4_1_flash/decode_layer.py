@@ -18,6 +18,8 @@ from enum import IntEnum
 from typing import Any, Mapping
 
 import torch
+
+from quant import decode_e8m0
 import torch.nn.functional as F
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -44,11 +46,7 @@ from decode_moe import (
     AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD,
     clear_moe_signals,
 )
-from quant import (
-    pack_mx_b_scale, unpack_mx_b_scale,
-    quantize_mxfp4_cache, quantize_mxfp4_weight, quantize_mxfp8_cache, quantize_grouped_mxfp8_weight,
-    dequantize_mxfp4, dequantize_mxfp8,
-)
+from quant import pack_mx_b_scale, unpack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp4_weight, quantize_mxfp8_cache, quantize_grouped_mxfp8_weight, dequantize_mxfp4_cache
 from rmsnorm import golden_rms_norm
 from sparse_attention import golden_swa_attention
 from utils import AttentionGoldenResult
@@ -700,6 +698,12 @@ def _sequence_parallel_token_owners(tokens: int, tp_size: int) -> torch.Tensor:
     return torch.div(torch.arange(tokens, dtype=torch.int32), width, rounding_mode="floor")
 
 
+def _dequantize_mxfp8(weight: torch.Tensor, logical_scale_e8m0: torch.Tensor) -> torch.Tensor:
+    """Decode an input-major MXFP8 matrix using logical ``[K/32, N]`` scales."""
+    scales = decode_e8m0(logical_scale_e8m0).repeat_interleave(MX_GROUP, dim=-2)
+    return weight.float() * scales
+
+
 def golden_decode_moe(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -733,12 +737,12 @@ def golden_decode_moe(
             raise ValueError("token_owners must follow the sequence-parallel slab ownership")
 
     normalized = normalized[:active_tokens]
-    routed_w1 = dequantize_mxfp4(routed_w1, routed_w1_scale)
-    routed_w2 = dequantize_mxfp4(routed_w2, routed_w2_scale)
-    routed_w3 = dequantize_mxfp4(routed_w3, routed_w3_scale)
-    shared_w1 = dequantize_mxfp8(shared_w1, unpack_mx_b_scale(shared_w1_scale)).transpose(-2, -1)
-    shared_w2 = dequantize_mxfp8(shared_w2, unpack_mx_b_scale(shared_w2_scale)).transpose(-2, -1)
-    shared_w3 = dequantize_mxfp8(shared_w3, unpack_mx_b_scale(shared_w3_scale)).transpose(-2, -1)
+    routed_w1 = dequantize_mxfp4_cache(routed_w1, routed_w1_scale, 32, "e8m0")
+    routed_w2 = dequantize_mxfp4_cache(routed_w2, routed_w2_scale, 32, "e8m0")
+    routed_w3 = dequantize_mxfp4_cache(routed_w3, routed_w3_scale, 32, "e8m0")
+    shared_w1 = _dequantize_mxfp8(shared_w1, unpack_mx_b_scale(shared_w1_scale)).transpose(-2, -1)
+    shared_w2 = _dequantize_mxfp8(shared_w2, unpack_mx_b_scale(shared_w2_scale)).transpose(-2, -1)
+    shared_w3 = _dequantize_mxfp8(shared_w3, unpack_mx_b_scale(shared_w3_scale)).transpose(-2, -1)
     route_weights, expert_indices = gate(normalized, gate_weight, correction_bias)
     output = _golden_expert(normalized, shared_w1, shared_w2, shared_w3)
     for expert_id in range(routed_w1.shape[0]):

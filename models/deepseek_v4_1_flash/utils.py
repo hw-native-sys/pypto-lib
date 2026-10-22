@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Metadata lowering and shared validation helpers for prefill and decode."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -155,3 +156,28 @@ def token_shards(value, local_tokens):
     padded = value.new_zeros(TP_SIZE * local_tokens, *value.shape[1:])
     padded[:value.shape[0]].copy_(value)
     return padded.reshape(TP_SIZE, local_tokens, *value.shape[1:])
+
+
+def _copy_cache_rows(destination: torch.Tensor, source: torch.Tensor, rows: torch.Tensor) -> None:
+    destination_rows = destination.flatten(0, 1).view(torch.uint8)
+    source_rows = source.contiguous().view(torch.uint8).reshape_as(destination_rows[rows])
+    destination_rows[rows] = source_rows
+
+
+def _publish_quantized_cache(
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    values: torch.Tensor,
+    slots: torch.Tensor,
+    quantize: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize and replace only mapped rows in a packed cache pair."""
+    updated_payload = payload.clone()
+    updated_scale = scale.clone()
+    valid = slots >= 0
+    rows = slots[valid].to(torch.int64)
+    if rows.numel():
+        row_payload, row_scale = quantize(values[valid])
+        _copy_cache_rows(updated_payload, row_payload, rows)
+        _copy_cache_rows(updated_scale, row_scale, rows)
+    return updated_payload, updated_scale

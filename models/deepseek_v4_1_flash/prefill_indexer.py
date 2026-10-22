@@ -8,16 +8,18 @@
 # -----------------------------------------------------------------------------------------------------------
 """Prefill C1A and C2A index-key preparation, paged scoring, and selection."""
 
+from gemm import gemm_bf16_to_bf16_staged, gemm_bf16_via_mxfp8_to_bf16_fused
+
 import torch
 import torch.nn.functional as F
+
 
 import pypto.language as pl
 
 from config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, T_DYN
 from rmsnorm import EPS, rms_norm, golden_rms_norm
-from quant import (
-    bf16_gemm_staged, mxfp8_gemm, dequantize_mxfp4_cache, golden_mxfp8_linear, quantize_mxfp4_cache,
-)
+from quant import dequantize_mxfp4_cache, quantize_mxfp4_cache
+from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
 
 
@@ -581,7 +583,7 @@ def project_index_weights(
     tokens = pl.tensor.dim(x, 0)
     projected_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
     ready = pl.system.task_dummy(deps=[])
-    projected_result, projected_tid = bf16_gemm_staged(
+    projected_result, projected_tid = gemm_bf16_to_bf16_staged(
         x, weight, projected_weights, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_weights",
@@ -615,9 +617,9 @@ def prepare_prefill_index_query(
     """Project, rotate, and quantize query rows with group-32 scales."""
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    mxfp8_gemm(
+    gemm_bf16_via_mxfp8_to_bf16_fused(
         latent, query_weight, query_weight_scale, projected, num_tokens,
-        width=Q_LORA, output_width=INDEX_H * INDEX_DIM, fp32_output=False,
+        width=Q_LORA, output_width=INDEX_H * INDEX_DIM,
         n_tile=128, name_hint="c1a_mx_projection",
     )
     rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
@@ -1092,7 +1094,7 @@ def prefill_index_key_project(
     tokens = pl.tensor.dim(latent, 0)
     projected = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     projection_ready = pl.system.task_dummy(deps=[])
-    projected_result, projected_tid = bf16_gemm_staged(
+    projected_result, projected_tid = gemm_bf16_to_bf16_staged(
         latent, weight, projected, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_key",
@@ -1125,7 +1127,7 @@ def publish_c1a_index_key(
     tokens = pl.tensor.dim(compressed_latent, 0)
     index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     projection_ready = pl.system.task_dummy(deps=[])
-    projected_result, projected_tid = bf16_gemm_staged(
+    projected_result, projected_tid = gemm_bf16_to_bf16_staged(
         compressed_latent, index_wk, index_projection, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_key",
@@ -1391,7 +1393,7 @@ def golden_prefill_indexer(
     width = int(compressed_lens.max()) if tokens else 0
     scores = torch.full((tokens, width), -torch.inf, dtype=torch.float32)
     selected = torch.full((tokens, topk), -1, dtype=torch.int32)
-    query = golden_mxfp8_linear(qr, wq_b, wq_b_scale).reshape(tokens, INDEX_H, INDEX_DIM)
+    query = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, wq_b, wq_b_scale).reshape(tokens, INDEX_H, INDEX_DIM)
     query = golden_rope_tail(query, cos, sin)
     query = golden_index_query_fp4(query)
     weights = (x.float() @ weights_proj.float()).bfloat16()

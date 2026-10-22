@@ -648,7 +648,8 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
 
     from golden.spec import ScalarSpec, TensorSpec
     from expert_routed import ROUTED_DEQUANT_STD
-    from quant import build_mxfp4_pair_lut, gen_mxfp8_weight_kn_v41
+    from expert_routed import build_mxfp4_pair_lut
+    from quant import generate_mxfp8_weight_kn
 
     counts = _normalise_num_tokens(num_tokens)
     torch.manual_seed(41)
@@ -679,9 +680,9 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
     @cache
     def shared_weights():
         shared_std = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
-        sw1, sw1_s = gen_mxfp8_weight_kn_v41(MOE_INTER, D, shared_std["w1"], chan_cv=0.50, seed=101)
-        sw3, sw3_s = gen_mxfp8_weight_kn_v41(MOE_INTER, D, shared_std["w3"], chan_cv=0.50, seed=102)
-        sw2, sw2_s = gen_mxfp8_weight_kn_v41(D, MOE_INTER, shared_std["w2"], chan_cv=0.33, seed=103)
+        sw1, sw1_s = generate_mxfp8_weight_kn(MOE_INTER, D, shared_std["w1"], chan_cv=0.50, seed=101)
+        sw3, sw3_s = generate_mxfp8_weight_kn(MOE_INTER, D, shared_std["w3"], chan_cv=0.50, seed=102)
+        sw2, sw2_s = generate_mxfp8_weight_kn(D, MOE_INTER, shared_std["w2"], chan_cv=0.33, seed=103)
         return tuple(
             weight.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
             for weight in (sw1, sw1_s, sw3, sw3_s, sw2, sw2_s)

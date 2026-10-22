@@ -101,7 +101,6 @@ def prefill_c1a_reuse_attention(
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
         source_ready = pl.system.task_dummy(deps=[])
-        tokens = pl.tensor.dim(x, 0)
         query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         q_proj_rope(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
         window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)

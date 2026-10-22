@@ -23,17 +23,9 @@ from o_proj import golden_o_proj, golden_grouped_output
 from qkv_proj_rope import golden_rope_tail
 from rmsnorm import golden_rms_norm
 from golden import ScalarSpec, TensorSpec
-from quant import (
-    _publish_quantized_cache,
-    dequantize_mxfp4_cache,
-    dequantize_mxfp8_cache,
-    golden_mxfp8_linear,
-    golden_mxfp8_quantize,
-    quantize_grouped_mxfp8_weight,
-    pack_mx_b_scale,
-    quantize_mxfp4_cache,
-    quantize_mxfp8_cache,
-)
+from utils import _publish_quantized_cache
+from quant import dequantize_mxfp4_cache, dequantize_mxfp8_cache, quantize_mxfp8_upward_reference, quantize_grouped_mxfp8_weight, pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache
+from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from utils import AttentionGoldenResult, window_metadata
 
 from pathlib import Path
@@ -1001,10 +993,10 @@ def swa_official_reference(tensors, *, shared_cache=False, key_tile=128):
     groups = t["wo_a"].shape[0]
     group_in = t["wo_a"].shape[-2]
 
-    qr = golden_rms_norm(golden_mxfp8_linear(t["x"], t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
-    q = golden_mxfp8_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    qr = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(t["x"], t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
+    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
     q = golden_rope_tail(q, t["rope_cos"], t["rope_sin"])
-    kv = golden_rms_norm(golden_mxfp8_linear(t["x"], t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    kv = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(t["x"], t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
     kv = golden_rope_tail(kv, t["rope_cos"], t["rope_sin"])
     payload, scales = quantize_mxfp8_cache(kv)
     cache = t["window_cache"].clone()
@@ -1047,7 +1039,7 @@ def swa_official_reference(tensors, *, shared_cache=False, key_tile=128):
     attended = golden_rope_tail(attended, t["rope_cos"], t["rope_sin"], inverse=True)
     grouped = attended.reshape(-1, groups, group_in)
     latent = golden_grouped_output(grouped, t["wo_a"], t["wo_a_scale"])
-    output = golden_mxfp8_linear(latent.flatten(1), t["wo_b"], t["wo_b_scale"], fp32=True)
+    output = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(latent.flatten(1), t["wo_b"], t["wo_b_scale"]).float()
     return output, cache, cache_scale
 
 
@@ -1057,7 +1049,7 @@ def make_swa_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
     def rand(*shape):
         return torch.randn(*shape, generator=gen)
     def weight(k, n):
-        payload, scales = golden_mxfp8_quantize(rand(n, k) / math.sqrt(k))
+        payload, scales = quantize_mxfp8_upward_reference(rand(n, k) / math.sqrt(k))
         return payload.T.contiguous(), pack_mx_b_scale(scales.T.contiguous()).view(torch.float8_e8m0fnu)
     qa, qas = weight(D, Q_LORA)
     qb, qbs = weight(Q_LORA, LOCAL_H * HEAD_DIM)

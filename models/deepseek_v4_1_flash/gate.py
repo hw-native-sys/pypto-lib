@@ -365,11 +365,11 @@ def _golden_gate_core(tensors, x_norm, scores, biased):
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
-    from quant import host_quant_mxfp8_v41, pack_mx_a_scale
+    from quant import quantize_mxfp8_upward_e8m0, pack_mx_a_scale
 
     def host_mxfp8_activation(value):
         # The released activation quantizer rounds E8M0 scales upward.
-        quantized, codes = host_quant_mxfp8_v41(value, return_e8m0=True)
+        quantized, codes = quantize_mxfp8_upward_e8m0(value)
         packed = pack_mx_a_scale(codes)
         e8m0 = getattr(torch, "float8_e8m0fnu", None)
         if e8m0 is not None:
@@ -644,13 +644,13 @@ def mxfp8_activation_value_compare(actual, expected, *, actual_outputs, expected
     """
     import torch
 
-    from quant import _e8m0_to_fp32, unpack_mx_a_scale
+    from quant import decode_e8m0, unpack_mx_a_scale
 
     def decode(outputs, payload_name):
         payload = outputs[payload_name].cpu().float()
         scale_bytes = outputs["x_norm_scale"].cpu().contiguous().view(torch.uint8)
         scale = unpack_mx_a_scale(scale_bytes.reshape(T_PAD, MX_SCALE_GROUPS))
-        scale = _e8m0_to_fp32(scale).repeat_interleave(MX_GROUP, dim=-1)
+        scale = decode_e8m0(scale).repeat_interleave(MX_GROUP, dim=-1)
         return payload * scale
 
     actual_value = decode(actual_outputs, "x_norm_mx")

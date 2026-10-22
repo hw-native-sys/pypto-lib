@@ -1169,7 +1169,7 @@ def build_tensor_specs():
     """Build the TP1 twelve-request decode smoke fixture."""
     from golden import TensorSpec
     from decode_moe import _route_bias
-    from quant import build_mxfp4_pair_lut
+    from expert_routed import build_mxfp4_pair_lut
 
     if TP_SIZE != 1:
         raise ValueError("decode_fwd fixture requires --tp 1")

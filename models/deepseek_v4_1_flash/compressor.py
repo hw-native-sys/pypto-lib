@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compression projections, rotary embedding, cache publication, and ratio-2 ring state."""
 
+from gemm import gemm_bf16_to_bf16_staged
+
 import pypto.language as pl
 import torch
 
@@ -15,7 +17,6 @@ from config import (
     FLASH as M, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN,
     T_DYN, COMPRESSED_CACHE_GROUP, CMP_BLOCKS_DYN,
 )
-from quant import bf16_gemm_staged
 from rmsnorm import golden_rms_norm
 
 
@@ -451,7 +452,7 @@ def prefill_c1a_compressor_project(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     ready = pl.system.task_dummy(deps=[])
-    result, completed = bf16_gemm_staged(
+    result, completed = gemm_bf16_to_bf16_staged(
         source, weight, output, num_tokens, ready,
         width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
         workers=2147483647, name_hint='prefill_bf16_projection_cube',
@@ -540,7 +541,7 @@ def decode_c1a_compressor_project(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    result, completed = bf16_gemm_staged(
+    result, completed = gemm_bf16_to_bf16_staged(
         source, weight, output, num_tokens, ready,
         width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
         workers=8, name_hint='c1a_compressor_projection',

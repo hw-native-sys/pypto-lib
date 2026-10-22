@@ -400,7 +400,8 @@ def golden_expert_shared(tensors):
     """Reference for MXFP8 W1/W3, SwiGLU requantization, and MXFP8 W2."""
     import torch
 
-    from quant import decode_e8m0_codes_v41 as decode_e8m0_codes, host_quant_mxfp8_v41 as host_quant_mxfp8, matmul_mx_golden_v41 as matmul_mx_golden
+    from quant import unpack_mx_scale_codes as decode_e8m0_codes, quantize_mxfp8_upward_e8m0 as host_quant_mxfp8
+    from gemm import golden_gemm_mxfp8_to_fp32_dequantized as matmul_mx_golden
 
     x_fp8 = tensors["x_local"][:T]
     x_scale = decode_e8m0_codes(
@@ -419,7 +420,7 @@ def golden_expert_shared(tensors):
         sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
     sh_h = (F.silu(sh_gate) * sh_up).bfloat16().float()
-    sh_h_fp8, sh_h_scale = host_quant_mxfp8(sh_h, return_e8m0=True)
+    sh_h_fp8, sh_h_scale = host_quant_mxfp8(sh_h)
     sh = matmul_mx_golden(sh_h_fp8, sh_h_scale, w2_fp8, w2_scale)
 
     tensors["sh"][:] = sh.to(torch.bfloat16)
@@ -428,12 +429,12 @@ def golden_expert_shared(tensors):
 def build_tensor_specs():
     import torch
     from golden.spec import TensorSpec
-    from quant import gen_mxfp8_weight_kn_v41 as gen_mxfp8_weight_kn_device, host_quant_mxfp8_v41 as host_mxfp8_activation
+    from quant import generate_mxfp8_weight_kn as gen_mxfp8_weight_kn_device, quantize_mxfp8_upward_e8m0 as host_mxfp8_activation
 
     x_local_bf16 = torch.randn(T_PAD, D, dtype=torch.bfloat16)
     if T < T_PAD:
         x_local_bf16[T:, :] = 0
-    x_local_fp8, x_local_scale_codes = host_mxfp8_activation(x_local_bf16, return_e8m0=True)
+    x_local_fp8, x_local_scale_codes = host_mxfp8_activation(x_local_bf16)
     # matmul_mx expects the physical MX_A_ZZ scale order.
     from quant import pack_mx_a_scale
     x_local_scale_codes = pack_mx_a_scale(x_local_scale_codes)

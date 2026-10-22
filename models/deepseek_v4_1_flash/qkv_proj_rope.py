@@ -8,11 +8,14 @@
 # -----------------------------------------------------------------------------------------------------------
 """Shared V4.1 Q/KV projection, normalization, and RoPE stages."""
 
+
+from gemm import gemm_bf16_via_mxfp8_to_bf16_staged
+
 import pypto.language as pl
 import torch
 
 from config import FLASH as M, T_DYN, TP_SIZE
-from quant import golden_mxfp8_linear, mx_projection, mxfp8_linear
+from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum
 from rmsnorm import golden_rms_norm, rms_norm
 
 
@@ -74,9 +77,9 @@ def q_proj_qr(
 ):
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    mx_projection(
+    gemm_bf16_via_mxfp8_to_bf16_staged(
         x, wq_a, wq_a_scale, projected, num_tokens,
-        D, Q_LORA, "attention_q_a", "attention_q_a_quant", Q_A_N_TILE, Q_A_K_TILE, False, 1,
+        D, Q_LORA, "attention_q_a", "attention_q_a_quant", Q_A_N_TILE, Q_A_K_TILE,  1,
     )
     norm_blocks = (num_tokens + 7) // 8
     for norm_worker in pl.spmd(norm_blocks, name_hint="attention_q_norm"):
@@ -97,9 +100,9 @@ def q_proj_rope(
 ):
     tokens = pl.tensor.dim(query_latent, 0)
     expanded = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    mx_projection(
+    gemm_bf16_via_mxfp8_to_bf16_staged(
         query_latent, wq_b, wq_b_scale, expanded, num_tokens,
-        Q_LORA, LOCAL_H * HEAD_DIM, "attention_q_b", "attention_q_b_quant", N_TILE, K_TILE, False, 1,
+        Q_LORA, LOCAL_H * HEAD_DIM, "attention_q_b", "attention_q_b_quant", N_TILE, K_TILE,  1,
     )
     rope(expanded, rope_cos, rope_sin, query, num_tokens, LOCAL_H, "attention_q_rope", max_workers)
     return query
@@ -118,10 +121,10 @@ def kv_proj_rope(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x, 0)
-    mx_projection(
+    gemm_bf16_via_mxfp8_to_bf16_staged(
         x, wkv, wkv_scale, projected,
         num_tokens,
-        D, HEAD_DIM, "attention_kv", "attention_kv_quant", N_TILE, K_TILE, False, 1,
+        D, HEAD_DIM, "attention_kv", "attention_kv_quant", N_TILE, K_TILE,  1,
     )
     normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8
@@ -179,13 +182,13 @@ def golden_qkv_proj_rope(
     """Project normalized query latent and shared KV, then rotate their RoPE tails."""
     def project(value, weight, scale):
         if sequential_query and scale is not None:
-            return golden_mxfp8_linear(value, weight, scale)
-        return mxfp8_linear(value, weight, scale)
+            return golden_gemm_bf16_via_mxfp8_to_bf16_sequential(value, weight, scale)
+        return golden_mxfp8_linear_grouped_sum(value, weight, scale)
 
     if wq_a_scale is not None:
-        projected = golden_mxfp8_linear(x, wq_a, wq_a_scale)
+        projected = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, wq_a, wq_a_scale)
     else:
-        projected = mxfp8_linear(x, wq_a, wq_a_scale)
+        projected = golden_mxfp8_linear_grouped_sum(x, wq_a, wq_a_scale)
     qr = golden_rms_norm(projected, q_norm_weight)
     head_dim = wkv.shape[-1]
     num_heads = wq_b.shape[-1] // head_dim

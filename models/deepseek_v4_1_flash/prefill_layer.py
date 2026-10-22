@@ -76,7 +76,7 @@ from prefill_c2a_full import (
     golden_reference_c2a, make_attention_inputs, reference_attention,
 )
 from prefill_c2a_reuse import prefill_c2a_reuse, golden_reference_c2a_reuse, make_c2a_reuse_inputs
-from quant import build_mxfp4_pair_lut
+from expert_routed import build_mxfp4_pair_lut
 from rmsnorm import golden_rms_norm
 
 
@@ -421,13 +421,13 @@ def make_ffn_hc_inputs(seed):
 def make_moe_replicated_inputs(seed):
     """Gate and shared-expert weights at the deployment magnitudes, identical on every rank."""
     from prefill_moe import _route_bias
-    from quant import gen_mxfp8_weight_kn_v41
+    from quant import generate_mxfp8_weight_kn
 
     gen = torch.Generator().manual_seed(seed)
     shared_std = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
-    shared_w1, shared_w1_scale = gen_mxfp8_weight_kn_v41(MOE_INTER, D, shared_std["w1"], chan_cv=0.50, seed=seed + 1)
-    shared_w3, shared_w3_scale = gen_mxfp8_weight_kn_v41(MOE_INTER, D, shared_std["w3"], chan_cv=0.50, seed=seed + 2)
-    shared_w2, shared_w2_scale = gen_mxfp8_weight_kn_v41(D, MOE_INTER, shared_std["w2"], chan_cv=0.33, seed=seed + 3)
+    shared_w1, shared_w1_scale = generate_mxfp8_weight_kn(MOE_INTER, D, shared_std["w1"], chan_cv=0.50, seed=seed + 1)
+    shared_w3, shared_w3_scale = generate_mxfp8_weight_kn(MOE_INTER, D, shared_std["w3"], chan_cv=0.50, seed=seed + 2)
+    shared_w2, shared_w2_scale = generate_mxfp8_weight_kn(D, MOE_INTER, shared_std["w2"], chan_cv=0.33, seed=seed + 3)
     return {
         "gate_weight": torch.randn(N_EXPERTS, D, generator=gen) / D ** 0.5,
         # Separate expert routing scores with correction-bias offsets.

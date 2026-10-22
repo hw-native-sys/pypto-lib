@@ -45,10 +45,8 @@ from hc import golden_hc_pre, golden_hc_post, golden_mhc_mixes, prefill_sp_post
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables
 from qkv_proj_rope import golden_rope_tail, q_proj_qr, q_proj_rope, kv_proj_rope
-from quant import (
-    dequantize_mxfp4_cache, golden_bf16_gemm, golden_mxfp8_linear, golden_mxfp8_quantize, pack_mx_b_scale,
-    quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache,
-)
+from quant import dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
+from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import paged_slots, token_shards, window_metadata
 from sparse_attention import (
@@ -368,10 +366,10 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     index_heads = t["index_weights_proj"].shape[-1]
 
     # a. Query/KV projection and rotary embedding.
-    qr = golden_rms_norm(golden_mxfp8_linear(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
-    q = golden_mxfp8_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    qr = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
+    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
     q = golden_rope_tail(q, t["rope_cos"], t["rope_sin"])
-    kv = golden_rms_norm(golden_mxfp8_linear(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    kv = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
     kv = golden_rope_tail(kv, t["rope_cos"], t["rope_sin"])
 
     # b. Sliding-window cache: MXFP8, group 32, BF16 scales; addressed rows only.
@@ -432,7 +430,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     # e. Index keys come from the UNROTATED latent; packed FP4, group 32, E8M0, same slots.
     index_cache = t["index_cache"].clone()
     index_cache_scale = t["index_cache_scale"].clone()
-    index_key = golden_rms_norm(golden_bf16_gemm(latent, t["index_wk"]), t["index_norm_weight"])
+    index_key = golden_rms_norm(((latent).float() @ (t["index_wk"]).float()).to(torch.bfloat16), t["index_norm_weight"])
     index_key = golden_rope_tail(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
     if compressed_rows.numel():
         payload, scale = quantize_mxfp4_cache(index_key[compressed_valid], IDX_GROUP, "e8m0")
@@ -537,7 +535,7 @@ _PREFIXES = {
 
 def _weight(gen, k, n):
     """MXFP8 input-major weight with Cube-ordered MX_B_NN scales."""
-    payload, codes = golden_mxfp8_quantize(torch.randn(n, k, generator=gen) / math.sqrt(k))
+    payload, codes = quantize_mxfp8_upward_reference(torch.randn(n, k, generator=gen) / math.sqrt(k))
     return payload.T.contiguous(), pack_mx_b_scale(codes.T.contiguous()).view(E8M0)
 
 def _plan(tokens, requests, case, mode, start_pos=None):

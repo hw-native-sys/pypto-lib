@@ -14,7 +14,8 @@ import torch
 
 from config import DSPARK_QUERY_WIDTH, FLASH, ORI_BLOCKS_DYN, T_DYN
 from qkv_proj_rope import golden_rope_interleave, kv_proj_rope
-from quant import mxfp8_linear, quantize_mxfp8_cache
+from gemm import golden_mxfp8_linear_grouped_sum
+from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm
 from sparse_attention import publish_window_row
 
@@ -49,7 +50,7 @@ def golden_context_kv_cache(
     updated_cache = cache.clone()
     updated_scale = cache_scale.clone()
     if rows.numel():
-        projected = golden_rms_norm(mxfp8_linear(main_x, weight, weight_scale), norm_weight)
+        projected = golden_rms_norm(golden_mxfp8_linear_grouped_sum(main_x, weight, weight_scale), norm_weight)
         rope_dim = cos.shape[-1] * 2
         kv = torch.cat(
             (projected[..., :-rope_dim], golden_rope_interleave(projected[..., -rope_dim:], cos, sin)),

@@ -35,11 +35,7 @@ from decode_indexer import decode_c2a_indexer, golden_c2a_index
 from o_proj import o_proj, golden_o_proj
 from golden import TensorSpec, ScalarSpec, ratio_allclose, mapped_pool_ratio_allclose, run
 from utils import AttentionGoldenResult, paged_slots, window_metadata
-from quant import (
-    quantize_grouped_mxfp8_weight,
-    dequantize_mxfp4_cache, golden_bf16_gemm, golden_mxfp8_quantize,
-    pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache,
-)
+from quant import quantize_grouped_mxfp8_weight, dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache
 from rope_tables import precompute_rope_tables
 
 from compressor import decode_c2a_compressor_rope
@@ -505,7 +501,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     # Publish RNE E2M1 index keys with group-32 E8M0 scales.
     index_cache = t["index_cache"].clone()
     index_cache_scale = t["index_cache_scale"].clone()
-    index_key = golden_rms_norm(golden_bf16_gemm(latent, t["index_wk"]), t["index_norm_weight"])
+    index_key = golden_rms_norm(((latent).float() @ (t["index_wk"]).float()).to(torch.bfloat16), t["index_norm_weight"])
     index_key = golden_rope_tail(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
     if compressed_rows.numel():
         payload, scale = quantize_mxfp4_cache(index_key[compressed_valid], IDX_GROUP, "e8m0", round_to_even=True)
@@ -601,7 +597,7 @@ _PREFIXES = {
 
 def _weight(gen, k, n):
     """MXFP8 input-major weight with Cube-ordered MX_B_NN scales."""
-    payload, codes = golden_mxfp8_quantize(torch.randn(n, k, generator=gen) / math.sqrt(k))
+    payload, codes = quantize_mxfp8_upward_reference(torch.randn(n, k, generator=gen) / math.sqrt(k))
     return payload.T.contiguous(), pack_mx_b_scale(codes.T.contiguous()).view(E8M0)
 
 
