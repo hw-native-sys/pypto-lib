@@ -54,7 +54,6 @@ MX_PACKED_LANE_COLS = MX_MM_INTER_TILE // 2
 MX_W1_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W3_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * MX_PACKED_LANE_ROWS
-ROUTE_D_OUT_TILE = 1024
 ACT_INTER_TILE = 256
 QUANT_TILE = 768
 
@@ -166,8 +165,9 @@ def expert_routed_scatter(
                         valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
                         with pl.scope():
-                            gate_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
-                            up_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+                            # GMM1 accumulators drain to BF16 through the fix-pipe.
+                            gate_tile_bf16 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.BF16)
+                            up_tile_bf16 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.BF16)
 
                             with pl.spmd(MOE_INTER // GATE_UP_TASK_TILE, name_hint='exp_gate_up_mxfp4_aic', deps=[gate_mxfp4_aiv_tid, up_mxfp4_aiv_tid, input_ready]) as gate_up_mxfp4_aic_tid:
                                 nb_idx = pl.tile.get_block_idx()
@@ -200,8 +200,8 @@ def expert_routed_scatter(
                                         else:
                                             gate_acc = pl.matmul_mx_acc(gate_acc, xs_k, xs_scale_k, w1_tile, w1_scale_k)
                                             up_acc = pl.matmul_mx_acc(up_acc, xs_k, xs_scale_k, w3_tile, w3_scale_k)
-                                    gate_tile_fp32 = pl.store(gate_acc, [0, n0], gate_tile_fp32)
-                                    up_tile_fp32 = pl.store(up_acc, [0, n0], up_tile_fp32)
+                                    gate_tile_bf16 = pl.store(gate_acc, [0, n0], gate_tile_bf16)
+                                    up_tile_bf16 = pl.store(up_acc, [0, n0], up_tile_bf16)
 
                             h_tile_mx = h_mx[flat_t0 : flat_t0 + RECV_TILE]
                             h_tile_scale_backing = h_scale_backing[:, flat_t0 * H_SCALE:(flat_t0 + RECV_TILE) * H_SCALE]
@@ -217,13 +217,12 @@ def expert_routed_scatter(
                                     for ag in pl.pipeline((QUANT_TILE // ACT_INTER_TILE), stage=2):
                                         a0 = a_base + ag * ACT_INTER_TILE
                                         h_a0 = ag * ACT_INTER_TILE
-                                        gate_2d = pl.load(gate_tile_fp32, [act_t0, a0], [ACT_T_TILE, ACT_INTER_TILE])
-                                        up_2d = pl.load(up_tile_fp32, [act_t0, a0], [ACT_T_TILE, ACT_INTER_TILE])
-                                        # BF16 W1/W3 rounding before SwiGLU.
-                                        gate_2d_cast = pl.cast(gate_2d, pl.BF16, mode='rint')
-                                        gate_2d = pl.cast(gate_2d_cast, pl.FP32)
-                                        up_2d_cast = pl.cast(up_2d, pl.BF16, mode='rint')
-                                        up_2d = pl.cast(up_2d_cast, pl.FP32)
+                                        # The fix-pipe drain already applied the
+                                        # pre-SwiGLU BF16 rint; widen to FP32.
+                                        gate_2d_bf16 = pl.load(gate_tile_bf16, [act_t0, a0], [ACT_T_TILE, ACT_INTER_TILE])
+                                        up_2d_bf16 = pl.load(up_tile_bf16, [act_t0, a0], [ACT_T_TILE, ACT_INTER_TILE])
+                                        gate_2d = pl.cast(gate_2d_bf16, pl.FP32)
+                                        up_2d = pl.cast(up_2d_bf16, pl.FP32)
                                         if SWIGLU_LIMIT > 0.0:
                                             gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
                                             up_2d_minimum = pl.minimum(up_2d, SWIGLU_LIMIT)
@@ -325,7 +324,9 @@ def expert_routed_scatter(
                                 :, flat_tt0 * H_SCALE : (flat_tt0 + RECV_TILE) * H_SCALE
                             ]
                             h_tile_scale_mx = pl.tensor.view(h_tile_scale_backing, [RECV_TILE, H_SCALE], layout=pl.MX_A_ZZ)
-                            recv_y_tile_fp32 = pl.create_tensor([RECV_TILE, D], dtype=pl.FP32)
+                            # GMM2 accumulators drain to BF16 through the fix-pipe
+                            # (the golden rint); the scatter reads them directly.
+                            recv_y_tile_bf16 = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
                             with pl.spmd(D // MX_W2_TASK_TILE, name_hint='exp_w2_mxfp4_aic', deps=[w2_mxfp4_aiv_tid, hidden_completion_tids[local_e]]) as w2_mxfp4_aic_tid:
                                 wb_idx = pl.tile.get_block_idx()
                                 d_base = wb_idx * MX_W2_TASK_TILE
@@ -349,19 +350,9 @@ def expert_routed_scatter(
                                             y_acc = pl.matmul_mx(h_k, h_scale_k, w2_tile, w2_scale_k)
                                         else:
                                             y_acc = pl.matmul_mx_acc(y_acc, h_k, h_scale_k, w2_tile, w2_scale_k)
-                                    recv_y_tile_fp32 = pl.store(y_acc, [0, d0], recv_y_tile_fp32)
+                                    recv_y_tile_bf16 = pl.store(y_acc, [0, d0], recv_y_tile_bf16)
 
-                            recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
                             with pl.at(level=pl.Level.CORE_GROUP, name_hint='expert_tile_scatter', deps=[w2_mxfp4_aic_tid], no_dep_args=[routed_output]) as scatter_tid:
-                                for out_t0 in pl.range(0, valid_rows, ACT_T_TILE):
-                                    out_rows_max = pl.max(valid_rows - out_t0, 0)
-                                    out_rows = pl.min(ACT_T_TILE, out_rows_max)
-                                    for d0 in pl.range(0, D, ROUTE_D_OUT_TILE):
-                                        y_fp32 = pl.load(recv_y_tile_fp32, [out_t0, d0], [ACT_T_TILE, ROUTE_D_OUT_TILE])
-                                        y_valid = pl.set_validshape(y_fp32, out_rows, ROUTE_D_OUT_TILE)
-                                        y_padded = pl.fillpad(y_valid, pad_value=pl.PadValue.zero)
-                                        recv_y_tile_cast = pl.cast(y_padded, target_type=pl.BF16, mode='rint')
-                                        recv_y_tile = pl.store(recv_y_tile_cast, [out_t0, d0], recv_y_tile)
                                 tile_end = tt0 + valid_rows
                                 source_begin = pl.cast(0, pl.INDEX)
                                 for src in pl.range(EP_WORLD_SIZE):
@@ -373,7 +364,7 @@ def expert_routed_scatter(
                                     for compact_row in pl.range(scatter_begin, scatter_end):
                                         route_read = pl.read(recv_route, [local_e, compact_row])
                                         route = pl.cast(route_read, pl.INDEX)
-                                        pld.tensor.put(dst=routed_output, peer=src, src=recv_y_tile, dst_offsets=[route, 0], src_offsets=[compact_row - tt0, 0], shape=[1, D])
+                                        pld.tensor.put(dst=routed_output, peer=src, src=recv_y_tile_bf16, dst_offsets=[route, 0], src_offsets=[compact_row - tt0, 0], shape=[1, D])
                                     source_begin = source_end
                             tile_completion_tids[tt] = scatter_tid
                 expert_completion_tids[local_e] = pl.system.task_dummy(deps=[tile_completion_tids])
