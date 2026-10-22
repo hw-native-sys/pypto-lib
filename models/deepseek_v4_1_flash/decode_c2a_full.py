@@ -126,7 +126,7 @@ def decode_c2a_full(
     x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_pre(x_hc, pre_mix, x_attn)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    with pl.spmd((tokens + 7) // 8, name_hint="c2a_input_norm") as cache_ready:
+    with pl.spmd((tokens + 7) // 8, name_hint="norm_in") as cache_ready:
         worker = pl.tile.get_block_idx()
         rms_norm_tiled(x_attn, attn_norm_weight, x_norm, worker, tokens, output_fp32=False)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
@@ -171,6 +171,7 @@ def decode_c2a_full(
         chunk_done = attend_packed_cohorts(
             query, window_indices, window_cache, window_cache_scale, topk_indices,
             compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
+            gather_name="c2a_gather", attn_name="c2a_sparse_attn",
         )
     else:
         selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
@@ -181,7 +182,10 @@ def decode_c2a_full(
                 window_cache, window_cache_scale, window_indices, compressed_cache,
                 compressed_cache_scale, topk_indices, selected, combined, start, active, chunk_done,
             )
-            chunk_done = attend_c2a_chunk(query, selected, combined, attn_sink, attended, start, active, gather_tid)
+            chunk_done = attend_c2a_chunk(
+                query, selected, combined, attn_sink, attended, start, active, gather_tid,
+                name_hint="c2a_sparse_attn",
+            )
 
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
     o_proj(
@@ -193,7 +197,7 @@ def decode_c2a_full(
     if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
         _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
     else:
-        with pl.spmd(tokens, name_hint="c2a_output_cast"):
+        with pl.spmd(tokens, name_hint="cast_out"):
             row = pl.tile.get_block_idx()
             for col in pl.range(0, D, 512):
                 value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)

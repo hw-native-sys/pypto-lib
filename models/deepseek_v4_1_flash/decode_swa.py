@@ -102,7 +102,7 @@ def decode_swa(
     )
     hc_pre(x_hc, incoming_pre_mix, x_attn)
     norm_tokens = pl.tensor.dim(x_attn, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
+    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="norm_in"):
         rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_block, norm_tokens, output_fp32=False)
     zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
@@ -127,7 +127,7 @@ def decode_swa(
     if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
         _hc_post_from_partial(partial, attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens)
     else:
-        for row in pl.spmd(output_rows, name_hint="swa_output_cast"):
+        for row in pl.spmd(output_rows, name_hint="cast_out"):
             for col in pl.range(0, D, 512):
                 value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
                 if row < num_tokens:

@@ -110,7 +110,7 @@ def hc_mixes(
     scale2 = pl.read(scale, [2])
     sinkhorn_tasks = (t_dim + COMB_T_TILE - 1) // COMB_T_TILE
     sinkhorn_workers = pl.min(sinkhorn_tasks, sinkhorn_blocks)
-    with pl.spmd(sinkhorn_workers, name_hint="mhc_split_sinkhorn") as mixes_ready:
+    with pl.spmd(sinkhorn_workers, name_hint="mhc_sinkhorn") as mixes_ready:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, sinkhorn_tasks, sinkhorn_workers):
             t0 = block * COMB_T_TILE

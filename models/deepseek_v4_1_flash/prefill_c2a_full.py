@@ -190,7 +190,7 @@ def prefill_c2a_full_attention(
             compressed_cache_scale, topk_indices, selected, combined, start, active, chunk_done,
         )
         chunk_done = prefill_attend_sparse(
-            query, selected, combined, attn_sink, attended, start, active, gather_tid
+            query, selected, combined, attn_sink, attended, start, active, gather_tid, name_hint="c2a_sparse_attn",
         )
 
     o_proj(

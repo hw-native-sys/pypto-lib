@@ -256,6 +256,7 @@ def gemm_bf16_to_bf16_staged(
     k_tile: pl.constexpr,
     workers: pl.constexpr,
     name_hint: pl.constexpr,
+    cast_name: pl.constexpr,
 ):
     """Stage FP32 GEMM results before the separate BF16 rounding task."""
     tokens = pl.tensor.dim(source, 0)
@@ -279,7 +280,7 @@ def gemm_bf16_to_bf16_staged(
                 acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
             value = pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile)
             accumulated[row:row + 16, col:col + n_tile] = value
-    with pl.spmd(task_workers, name_hint="bf16_projection_cast", deps=[cube_tid]) as cast_tid:
+    with pl.spmd(task_workers, name_hint=cast_name, deps=[cube_tid]) as cast_tid:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, task_workers):
             row = block // (output_width // n_tile) * 16

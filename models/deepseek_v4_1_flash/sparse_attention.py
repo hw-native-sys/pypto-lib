@@ -108,7 +108,7 @@ def prefill_publish_window(
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
-    with pl.spmd(num_tokens, name_hint="c1a_cache_publish", deps=[cache_ready]) as publish_tid:
+    with pl.spmd(num_tokens, name_hint="pub_win", deps=[cache_ready]) as publish_tid:
         t = pl.tile.get_block_idx()
         _publish_window_row(kv, slots, cache, scales, t)
     return publish_tid
@@ -176,7 +176,7 @@ def publish_window_row(
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    for t in pl.spmd(num_tokens, name_hint="swa_cache_publish"):
+    for t in pl.spmd(num_tokens, name_hint="pub_win"):
         _publish_window_row(kv, slots, cache, scales, t)
     return cache, scales
 
@@ -196,7 +196,7 @@ def gather_window_batched(
     dst_rows = tokens * SWA_WINDOW
     dst = pl.reshape(selected, [dst_rows, HEAD_DIM])
     workers = pl.max(1, pl.min(num_tokens * (SWA_WINDOW // SWA_SELECTED_GATHER_TILE), SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_batched_gather", allow_early_resolve=True) as gathered:
+    with pl.spmd(workers, name_hint="swa_gather", allow_early_resolve=True) as gathered:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, num_tokens * (SWA_WINDOW // SWA_SELECTED_GATHER_TILE), workers):
             token = block // (SWA_WINDOW // SWA_SELECTED_GATHER_TILE)
@@ -279,7 +279,7 @@ def gather_window_packed544(
     dst_rows = tokens * SWA_WINDOW
     dst = pl.reshape(selected, [dst_rows, HEAD_DIM])
     workers = pl.max(1, pl.min(num_tokens * (SWA_WINDOW // SWA_SELECTED_GATHER_TILE), SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_packed544_gather", allow_early_resolve=True) as gathered:
+    with pl.spmd(workers, name_hint="swa_gather_packed", allow_early_resolve=True) as gathered:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, num_tokens * (SWA_WINDOW // SWA_SELECTED_GATHER_TILE), workers):
             token = block // (SWA_WINDOW // SWA_SELECTED_GATHER_TILE)
@@ -372,7 +372,7 @@ def attend_window_tiled(
     head_blocks = (LOCAL_H + SWA_HEAD_TILE - 1) // SWA_HEAD_TILE
     workers = pl.max(1, pl.min(num_tokens * head_blocks, SWA_WORKER_TILE))
     with pl.spmd(
-        workers, name_hint="swa_tiled_attention", deps=[ready],
+        workers, name_hint="swa_attn", deps=[ready],
         optimizations=[pl.cross_core_slot(slot_num=1)],
     ) as attention_done:
         worker = pl.tile.get_block_idx()
@@ -458,7 +458,7 @@ def decode_shared_cache(
     # Physical pages are a multiple of 128 rows; GATHER_TILE=32 has no tail.
     # Decode each physical row once with contiguous transfers.
     workers = pl.max(1, pl.min(rows // SWA_GATHER_TILE, SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_shared_cache_decode") as ready:
+    with pl.spmd(workers, name_hint="swa_decode_cache") as ready:
         worker = pl.tile.get_block_idx()
         if worker == 0:
             value_full = pl.tile.full([32, HEAD_DIM], dtype=pl.BF16, value=0.0)
@@ -489,7 +489,7 @@ def decode_shared_cache_packed(
     # Physical pages are a multiple of 128 rows; GATHER_TILE=32 has no tail.
     # Decode each physical row once with contiguous transfers.
     workers = pl.max(1, pl.min(rows // SWA_GATHER_TILE, SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_shared_packed_decode") as ready:
+    with pl.spmd(workers, name_hint="swa_decode_packed") as ready:
         worker = pl.tile.get_block_idx()
         if worker == 0:
             value_full = pl.tile.full([32, HEAD_DIM], dtype=pl.BF16, value=0.0)
@@ -530,7 +530,7 @@ def analyze_index_runs(
     descriptor_rows = tokens * SWA_RUN_PARTS
     descriptor_flat = pl.reshape(descriptors, [descriptor_rows, SWA_RUN_DESCRIPTOR_WIDTH])
     workers = pl.max(1, pl.min(num_tokens * SWA_RUN_PARTS, SWA_WORKER_TILE * 2))
-    with pl.spmd(workers, name_hint="swa_index_run_analysis") as ready:
+    with pl.spmd(workers, name_hint="swa_plan_runs") as ready:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, num_tokens * SWA_RUN_PARTS, workers):
             token = block // SWA_RUN_PARTS
@@ -584,7 +584,7 @@ def decode_shared_cache_after_publish(
     # Physical pages are a multiple of 128 rows; GATHER_TILE=32 has no tail.
     # Decode each physical row once with contiguous transfers.
     workers = pl.max(1, pl.min(rows // SWA_GATHER_TILE, SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_shared_cache_decode", deps=[publish_ready]) as ready:
+    with pl.spmd(workers, name_hint="swa_decode_cache", deps=[publish_ready]) as ready:
         worker = pl.tile.get_block_idx()
         if worker == 0:
             value_full = pl.tile.full([32, HEAD_DIM], dtype=pl.BF16, value=0.0)
@@ -628,7 +628,7 @@ def attend_shared_cache(
     sink_row = pl.reshape(sink, [1, LOCAL_H])
     workers = pl.max(1, pl.min(num_tokens, SWA_WORKER_TILE))
     with pl.spmd(
-        workers, name_hint="swa_shared_cache_mat_attention", deps=[ready, index_ready],
+        workers, name_hint="swa_attn_shared", deps=[ready, index_ready],
         optimizations=[pl.cross_core_slot(slot_num=SWA_CROSS_CORE_SLOT_TILE)],
     ) as attention_done:
         worker = pl.tile.get_block_idx()
@@ -747,7 +747,7 @@ def attend_shared_cache_plain(
     sink_row = pl.reshape(sink, [1, LOCAL_H])
     workers = pl.max(1, pl.min(num_tokens, SWA_WORKER_TILE))
     with pl.spmd(
-        workers, name_hint="swa_shared_cache_mat_attention", deps=[ready],
+        workers, name_hint="swa_attn_shared", deps=[ready],
         optimizations=[pl.cross_core_slot(slot_num=SWA_CROSS_CORE_SLOT_TILE)],
     ) as attention_done:
         worker = pl.tile.get_block_idx()
@@ -1400,6 +1400,7 @@ def gather_packed(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
     max_workers: pl.constexpr,
+    name_hint: pl.constexpr,
 ):
     """Gather packed cache rows and dequantize them once for all query heads."""
     window_rows = pl.tensor.dim(window, 0) * 128
@@ -1411,7 +1412,7 @@ def gather_packed(
     selected_rows = pl.tensor.dim(selected, 0) * SELECTED_KEYS
     dst = pl.reshape(selected, [selected_rows, HEAD_DIM])
     workers = pl.max(1, pl.min(num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), max_workers))
-    with pl.spmd(workers, name_hint="sparse_packed_gather", deps=[ready]) as gathered:
+    with pl.spmd(workers, name_hint=name_hint, deps=[ready]) as gathered:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), workers):
             token = block // (SELECTED_KEYS // GATHER_KEY_TILE)
@@ -1488,6 +1489,7 @@ def gather_packed_chunk(
     selected, combined, gathered = gather_packed(
         window_cache, window_scales, compressed_cache, compressed_scales,
         window_chunk, compressed_chunk, selected, combined, active, chunk_done, max_workers=GATHER_WORKERS,
+        name_hint="c2a_gather",
     )
     return gathered
 
@@ -1504,6 +1506,7 @@ def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY
         chunk_start: pl.Scalar[pl.INT32],
         active: pl.Scalar[pl.INT32],
         gather_ready: pl.Scalar[pl.TASK_ID],
+        name_hint: pl.constexpr,
     ):
         """Attend one chunk over the window and compressed rows under a single sink."""
         tokens = pl.tensor.dim(query, 0)
@@ -1516,7 +1519,7 @@ def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY
         if TP_SIZE == 1:
             workers = pl.min(attend_tasks, 32)
         with pl.spmd(
-            workers, name_hint="c2a_sparse_attention", deps=[gather_ready],
+            workers, name_hint=name_hint, deps=[gather_ready],
             optimizations=[pl.cross_core_slot(slot_num=PACKED_ATTEND_SLOT_TILE)],
         ) as attend_tid:
             worker = pl.tile.get_block_idx()
@@ -1925,6 +1928,7 @@ def _attend_packed_block(
     selected, indices, gathered = gather_packed(
         window, window_scale, compressed, compressed_scale,
         window_indices, compressed_indices, selected, indices, num_tokens, query_ready, max_workers=GATHER_WORKERS,
+        name_hint="c2a_gather",
     )
     attended = attend_selected(query, selected, indices, sink, output, num_tokens, gathered)
     return attended
@@ -1964,6 +1968,7 @@ def attend_packed(
             ready = attend_packed_cohorts(
                 query, window_indices, window, window_scale, compressed_indices,
                 compressed, compressed_scale, sink, output, num_tokens, ready,
+                gather_name="c2a_gather", attn_name="c2a_sparse_attn",
             )
         else:
             capacity = pl.max(1, pl.min(TOKEN_TILE, num_tokens))
@@ -2047,6 +2052,8 @@ def attend_packed_cohorts(
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     rows: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
+    gather_name: pl.constexpr,
+    attn_name: pl.constexpr,
 ):
     selected_a = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
     selected_b = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
@@ -2063,10 +2070,10 @@ def attend_packed_cohorts(
         output_a = pl.slice(output, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
         selected_a, combined_a, gathered_a = gather_packed(
             window, window_scale, compressed, compressed_scale,
-            wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32,
+            wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32, name_hint=gather_name,
         )
         done_a = _attend_cohort(
-            query_a, selected_a, combined_a, sink, output_a, 0, active_a, gathered_a,
+            query_a, selected_a, combined_a, sink, output_a, 0, active_a, gathered_a, name_hint=attn_name,
         )
         if start + width < rows:
             active_b = pl.min(PACKED_COHORT_TILE, rows - start - width)
@@ -2076,10 +2083,10 @@ def attend_packed_cohorts(
             output_b = pl.slice(output, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
             selected_b, combined_b, gathered_b = gather_packed(
                 window, window_scale, compressed, compressed_scale,
-                wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32,
+                wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32, name_hint=gather_name,
             )
             done_b = _attend_cohort(
-                query_b, selected_b, combined_b, sink, output_b, 0, active_b, gathered_b,
+                query_b, selected_b, combined_b, sink, output_b, 0, active_b, gathered_b, name_hint=attn_name,
             )
     complete = pl.system.task_dummy(deps=[done_a, done_b])
     return complete
@@ -2106,6 +2113,7 @@ def l2_c2a_attention(
         done = attend_packed_cohorts(
             query, window_indices, window, window_scale, compressed_indices,
             compressed, compressed_scale, sink, output, rows, source_ready,
+            gather_name="c2a_gather", attn_name="c2a_sparse_attn",
         )
     else:
         selected = pl.create_tensor([PACKED_QUERY_TILE, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
@@ -2117,7 +2125,9 @@ def l2_c2a_attention(
                 window, window_scale, window_indices, compressed, compressed_scale,
                 compressed_indices, selected, combined, start, active, done,
             )
-            done = attend_c2a_chunk(query, selected, combined, sink, output, start, active, gathered)
+            done = attend_c2a_chunk(
+                query, selected, combined, sink, output, start, active, gathered, name_hint="c2a_sparse_attn",
+            )
     return output
 
 

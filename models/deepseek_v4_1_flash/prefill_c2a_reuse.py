@@ -120,7 +120,7 @@ def prefill_c2a_reuse_attention(
             chunk_done,
         )
         chunk_done = prefill_attend_sparse(
-            query, selected, combined, attn_sink, attended, start, active, gather_tid
+            query, selected, combined, attn_sink, attended, start, active, gather_tid, name_hint="c2a_sparse_attn",
         )
 
     o_proj(

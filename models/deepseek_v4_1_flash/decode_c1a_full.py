@@ -93,8 +93,8 @@ OUTPUT_RTOL = 1e-2
 OUTPUT_MAX_ERROR_RATIO = 0.01
 
 
-publish_compressed = make_fp4_publish(HEAD_DIM, 16, pl.BF16, CMP_BLOCKS_DYN)
-publish_index = make_fp4_publish(INDEX_DIM, 32, pl.FP8E8M0, INDEX_BLOCKS_DYN)
+publish_compressed = make_fp4_publish(HEAD_DIM, 16, pl.BF16, CMP_BLOCKS_DYN, name_hint="pub_cmp")
+publish_index = make_fp4_publish(INDEX_DIM, 32, pl.FP8E8M0, INDEX_BLOCKS_DYN, name_hint="pub_idx")
 
 
 @pl.jit.inline(auto_scope=False)
@@ -157,13 +157,13 @@ def decode_c1a_full(
     x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_pre(x_hc, pre_mix, x_attn)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    with pl.spmd((tokens + 7) // 8, name_hint="c1a_input_norm") as x_ready:
+    with pl.spmd((tokens + 7) // 8, name_hint="norm_in") as x_ready:
         norm_worker = pl.tile.get_block_idx()
         rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_worker, tokens, output_fp32=False)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=64)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=32)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
@@ -172,14 +172,14 @@ def decode_c1a_full(
     pc_tid = decode_c1a_compressor_project(x_norm, compressor_wkv, projected, num_tokens, x_ready)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8
-    with pl.spmd(norm_blocks, name_hint="c1a_compressor_rmsnorm", deps=[pc_tid]) as nc_tid:
+    with pl.spmd(norm_blocks, name_hint="norm_cmp", deps=[pc_tid]) as nc_tid:
         norm_worker = pl.tile.get_block_idx()
         rms_norm(projected, compressor_norm_weight, latent, norm_worker, num_tokens, width=HEAD_DIM)
     projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     pk_tid = c1a_project_index_key(latent, index_wk, projected_key, num_tokens, nc_tid)
     normalized_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8
-    with pl.spmd(norm_blocks, name_hint="c1a_index_key_rmsnorm", deps=[pk_tid]) as nk_tid:
+    with pl.spmd(norm_blocks, name_hint="norm_idx_k", deps=[pk_tid]) as nk_tid:
         norm_worker = pl.tile.get_block_idx()
         rms_norm(projected_key, index_norm_weight, normalized_key, norm_worker, num_tokens, width=INDEX_DIM)
     index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
@@ -215,13 +215,15 @@ def decode_c1a_full(
         attend_packed_cohorts(
             query, window_indices, window_cache, window_cache_scale, topk_indices,
             compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, selection_ready,
+            gather_name="c1a_gather", attn_name="c1a_sparse_attn",
         )
     else:
         selected = pl.create_tensor([tokens, 640, HEAD_DIM], dtype=pl.BF16)
         indices = pl.create_tensor([tokens, 640], dtype=pl.INT32)
         selected_ret, indices_ret, gather_tid = gather_packed(
             window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-            window_indices, topk_indices, selected, indices, num_tokens, selection_ready, max_workers=GATHER_WORKERS,
+            window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
+            max_workers=GATHER_WORKERS, name_hint="c1a_gather",
         )
         attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
@@ -232,7 +234,7 @@ def decode_c1a_full(
     if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
         _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
     else:
-        with pl.spmd(tokens, name_hint="c1a_output_cast"):
+        with pl.spmd(tokens, name_hint="cast_out"):
             row = pl.tile.get_block_idx()
             for col in pl.range(0, D, 512):
                 value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)

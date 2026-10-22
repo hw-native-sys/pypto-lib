@@ -106,7 +106,7 @@ def _grouped_output_inline_quant(
         )
         for nb in pl.parallel(O_LORA // N_TILE):
             local_n = nb * N_TILE
-            with pl.spmd(group_workers, name_hint="attention_grouped_o_a_cube") as cube_tid:
+            with pl.spmd(group_workers, name_hint="proj_o_a_cube") as cube_tid:
                 worker = pl.tile.get_block_idx()
                 for block in pl.range(worker, group_blocks, max_workers):
                     t0 = block * M_TILE
@@ -163,7 +163,7 @@ def _grouped_output_inline_quant(
 
                     accumulated = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE), [t0, output_n], accumulated)
             cube_tids[group * (O_LORA // N_TILE) + nb] = cube_tid
-    with pl.spmd(workers, name_hint="attention_grouped_o_a_cast", deps=[cube_tids]):
+    with pl.spmd(workers, name_hint="cast_o_a", deps=[cube_tids]):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, max_workers):
             t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
@@ -186,7 +186,7 @@ def grouped_output(
     if TP_SIZE == 1 and num_tokens <= 16 and max_workers >= O_GROUP_IN // K_TILE:
         gemm_bf16_via_mxfp8_to_bf16_staged(
             x, weight, scale, output, num_tokens,
-            O_GROUP_IN, O_LORA, "attention_grouped_o_a", "attention_grouped_o_a_quant",
+            O_GROUP_IN, O_LORA, "proj_o_a", "quant_o_a",
             O_A_N_TILE, K_TILE,  LOCAL_O_GROUPS,
         )
     else:
@@ -210,7 +210,7 @@ def _grouped_output_rope_to_mx(
     for group in pl.parallel(LOCAL_O_GROUPS):
         payload = pl.create_tensor([MX_M_TILE, O_GROUP_IN], dtype=pl.FP8E4M3FN)
         scale_backing = pl.create_tensor([1, MX_M_TILE * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
-        for block in pl.spmd(O_GROUP_IN // (2 * K_TILE), name_hint="attention_grouped_o_a_rope_quant"):
+        for block in pl.spmd(O_GROUP_IN // (2 * K_TILE), name_hint="rope_quant_o"):
             rows = pl.min(MX_M_TILE, num_tokens)
             cosine = pl.load(cos, [0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
             cosine = pl.fillpad(cosine, pad_value=pl.PadValue.zero)
@@ -267,7 +267,7 @@ def _grouped_output_rope_to_mx(
                 scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
         output, output_scale = gemm_mxfp8_to_mxfp8(
             payload, scale_backing, weight_flat, scale, output, output_scale,
-            num_tokens, group, O_GROUP_IN, O_LORA, "attention_grouped_o_a",
+            num_tokens, group, O_GROUP_IN, O_LORA, "proj_o_a",
             O_A_N_TILE, K_TILE, LOCAL_O_GROUPS, 8,
         )
     return output, output_scale
@@ -298,11 +298,11 @@ def o_proj(
         )
         gemm_mxfp8_to_bf16(
             latent_payload, latent_scale_backing, wo_b, wo_b_scale, projected, num_tokens, 0, 0, 0,
-            LOCAL_O_WIDTH, D, "attention_o_b", 128, K_TILE,  1, 0, 0, MX_M_TILE,
+            LOCAL_O_WIDTH, D, "proj_o_b", 128, K_TILE,  1, 0, 0, MX_M_TILE,
         )
     else:
         unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        _rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens, 64, "attention_o_rope")
+        _rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens, 64, "rope_o")
         latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
         grouped_output(
             unrotated, wo_a, wo_a_scale, latent, num_tokens, max_workers=grouped_max_workers,
@@ -310,11 +310,11 @@ def o_proj(
         gemm_bf16_via_mxfp8_to_bf16_fused(
             latent, wo_b, wo_b_scale, projected, num_tokens,
             width=LOCAL_O_WIDTH, output_width=D,
-            n_tile=128, name_hint="attention_o_b",
+            n_tile=128, name_hint="proj_o_b",
         )
     export_blocks = (num_tokens + MX_M_TILE - 1) // MX_M_TILE
     export_workers = pl.max(pl.min(export_blocks, 64), 1)
-    for worker in pl.spmd(export_workers, name_hint="attention_o_b_export"):
+    for worker in pl.spmd(export_workers, name_hint="export_o_b"):
         for block in pl.range(worker, export_blocks, export_workers):
             t0 = block * MX_M_TILE
             rows = pl.min(MX_M_TILE, num_tokens - t0)

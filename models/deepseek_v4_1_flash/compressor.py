@@ -85,7 +85,7 @@ def project_ratio2_weights(
     tail_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
     split_blocks = D // COMPRESSOR_K_TILE * (HEAD_DIM // N_TILE)
     split_workers = pl.min(split_blocks, 64)
-    with pl.spmd(split_workers, name_hint="c2a_compressor_split") as split_tid:
+    with pl.spmd(split_workers, name_hint="split_cmp") as split_tid:
         split_worker = pl.tile.get_block_idx()
         for split_block in pl.range(split_worker, split_blocks, split_workers):
             split_k0 = split_block // (HEAD_DIM // N_TILE) * COMPRESSOR_K_TILE
@@ -110,7 +110,7 @@ def project_ratio2_weights(
             blocks = output_blocks * COMPRESSOR_SEGMENTS
             # The synchronous mixed cohort must fit the available runtime clusters.
             workers = pl.min(pl.min(blocks, 16), pl.system.available_cluster_count())
-            with pl.spmd(workers, name_hint="c2a_compressor_cube", deps=[completion[0]], sync_start=True) as cube_tid:
+            with pl.spmd(workers, name_hint="proj_cmp", deps=[completion[0]], sync_start=True) as cube_tid:
                 cube_worker = pl.tile.get_block_idx()
                 for cube_block in pl.range(cube_worker, blocks, workers):
                     cube_segment = cube_block % COMPRESSOR_SEGMENTS
@@ -131,7 +131,7 @@ def project_ratio2_weights(
                         residual_acc = pl.matmul_acc(residual_acc, a, tail)
                     high_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(high_acc, 1.0), cube_rows, N_TILE)
                     residual_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(residual_acc, 1.0), cube_rows, N_TILE)
-            with pl.spmd(pl.min(output_blocks, 16), name_hint="c2a_compressor_sum", deps=[cube_tid]) as sum_tid:
+            with pl.spmd(pl.min(output_blocks, 16), name_hint="sum_cmp", deps=[cube_tid]) as sum_tid:
                 sum_worker = pl.tile.get_block_idx()
                 for sum_block in pl.range(sum_worker, output_blocks, pl.min(output_blocks, 16)):
                     sum_t0 = sum_block // (HEAD_DIM // N_TILE) * M_TILE
@@ -186,7 +186,7 @@ def publish_compressed_cache(
     cache_rows = pl.tensor.dim(cache, 0) * 128
     cache_flat = pl.reshape(cache, [cache_rows, HEAD_DIM // 2])
     scale_flat = pl.reshape(scales, [cache_rows, HEAD_DIM // COMPRESSED_CACHE_GROUP])
-    with pl.spmd(num_tokens, name_hint="c1a_compressed_publish") as publish_tid:
+    with pl.spmd(num_tokens, name_hint="pub_cmp") as publish_tid:
         token = pl.tile.get_block_idx()
         slot_i64 = pl.read(slots, [token])
         if slot_i64 >= 0:
@@ -322,7 +322,7 @@ def compressor_pool(
     """Assemble partners and pool eight rows before updating ring state."""
     state_rows = num_state_blocks * STATE_CAPACITY
     flat = pl.reshape(state_cache, [state_rows, STATE_WIDTH])
-    with pl.spmd(pl.max((num_tokens + 7) // 8, 1), name_hint="c2a_compressor_pool", deps=[pair_ready]) as pool_tid:
+    with pl.spmd(pl.max((num_tokens + 7) // 8, 1), name_hint="pool_cmp", deps=[pair_ready]) as pool_tid:
         group = pl.tile.get_block_idx()
         t = group * 8
         if t < num_tokens:
@@ -399,7 +399,7 @@ def compressor_state_write(
     blocks = pl.tensor.dim(state_cache, 0)
     state_rows = blocks * STATE_CAPACITY
     flat = pl.reshape(state_cache, [state_rows, STATE_WIDTH])
-    with pl.spmd(pl.max(num_tokens, 1), name_hint="c2a_compressor_state", deps=[pair_ready]) as state_tid:
+    with pl.spmd(pl.max(num_tokens, 1), name_hint="state_cmp", deps=[pair_ready]) as state_tid:
         t = pl.tile.get_block_idx()
         if t < num_tokens:
             request = pl.cast(pl.read(token_to_req_indices, [t]), pl.INDEX)
@@ -456,6 +456,7 @@ def prefill_c1a_compressor_project(
         source, weight, output, num_tokens, ready,
         width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
         workers=2147483647, name_hint='prefill_bf16_projection_cube',
+        cast_name="bf16_projection_cast",
     )
     return result
 
@@ -491,7 +492,7 @@ def publish_c2a_compressed(
     cache_rows = blocks * 128
     flat = pl.reshape(cache, [cache_rows, (HEAD_DIM // 2)])
     scale_flat = pl.reshape(scales, [cache_rows, (HEAD_DIM // 16)])
-    with pl.spmd(num_tokens, name_hint="c2a_compressed_publish", deps=[cache_ready, latent_ready]) as publish_tid:
+    with pl.spmd(num_tokens, name_hint="pub_cmp", deps=[cache_ready, latent_ready]) as publish_tid:
         t = pl.tile.get_block_idx()
         slot_i64 = pl.read(slots, [t])
         if slot_i64 >= 0:
@@ -544,7 +545,7 @@ def decode_c1a_compressor_project(
     result, completed = gemm_bf16_to_bf16_staged(
         source, weight, output, num_tokens, ready,
         width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
-        workers=8, name_hint='c1a_compressor_projection',
+        workers=8, name_hint='proj_cmp', cast_name='cast_cmp',
     )
     return completed
 
@@ -560,7 +561,7 @@ def decode_c1a_compressor_rope(
 ):
     blocks = num_tokens
     workers = pl.min(blocks, 2147483647)
-    with pl.spmd(workers, name_hint='c1a_compressor_rope', deps=[ready]) as rope_tid:
+    with pl.spmd(workers, name_hint='rope_cmp', deps=[ready]) as rope_tid:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
             _compressed_rope_block(x, cos, sin, output, block)
@@ -578,7 +579,7 @@ def decode_c2a_compressor_rope(
 ):
     blocks = num_tokens
     workers = pl.min(blocks, 2147483647)
-    with pl.spmd(workers, name_hint='c2a_compressed_rope', deps=[ready]) as rope_tid:
+    with pl.spmd(workers, name_hint='rope_cmp', deps=[ready]) as rope_tid:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
             _compressed_rope_block(x, cos, sin, output, block)

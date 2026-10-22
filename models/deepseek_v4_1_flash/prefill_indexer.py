@@ -587,6 +587,7 @@ def project_index_weights(
         x, weight, projected_weights, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_weights",
+        cast_name="bf16_projection_cast",
     )
     with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights_scale") as weights_tid:
         block = pl.tile.get_block_idx()
@@ -1098,6 +1099,7 @@ def prefill_index_key_project(
         latent, weight, projected, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_key",
+        cast_name="bf16_projection_cast",
     )
     norm_blocks = (num_tokens + M_TILE - 1) // M_TILE
     with pl.spmd(norm_blocks, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
@@ -1131,6 +1133,7 @@ def publish_c1a_index_key(
         compressed_latent, index_wk, index_projection, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_key",
+        cast_name="bf16_projection_cast",
     )
     index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8
