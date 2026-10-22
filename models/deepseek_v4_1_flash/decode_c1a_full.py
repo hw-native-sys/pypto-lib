@@ -19,19 +19,16 @@ from compressor import golden_compressor_ratio1
 from qkv_proj_rope import (
     golden_qkv_proj_rope,
     golden_rope_tail,
-    q_proj_qr,
-    q_proj_rope,
-    kv_proj_rope,
+    qkv_proj_rope,
 )
-from o_proj import o_proj, golden_o_proj
+from o_proj import o_proj, o_proj_hc_post, golden_o_proj
 from decode_indexer import (
     golden_index_key, golden_select_candidate_block_pool, select_candidate_block_pool,
-    c1a_index,
+    c1a_index, use_pretransposed_index_query, score_full_pretransposed,
     golden_c1a_index_scores,
     golden_pool_index_scores,
     golden_c1a_index_topk,
     make_fp4_publish,
-    score_full,
     select_index_topk,
 )
 from sparse_attention import golden_selected_attention, attend_selected, gather_packed, publish_window_row
@@ -161,12 +158,15 @@ def decode_c1a_full(
         norm_worker = pl.tile.get_block_idx()
         rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_worker, tokens, output_fp32=False)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=32)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
+    qkv_proj_rope(
+        x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
+        qr, query, kv_projection, kv, num_tokens, max_workers=32,
+        fuse_qnorm=False, q_b_n_tile=128,
+    )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     pc_tid = decode_c1a_compressor_project(x_norm, compressor_wkv, projected, num_tokens, x_ready)
@@ -196,14 +196,19 @@ def decode_c1a_full(
     )
     # Logical index score capacity.
     score_width = pl.tensor.dim(index_block_table, 1) * 128
+    private_route = use_pretransposed_index_query(
+        request_ids, compressed_lens, num_tokens, score_width, skip_short=False,
+    )
+    private_query = pl.create_tensor([16, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
     (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
         x_norm, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
-        num_tokens, score_width, x_ready,
+        num_tokens, score_width, x_ready, private_query, private_route, pretransposed=True,
     )
-    scores_tid = score_full(
-        index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
-        index_block_table, request_ids, compressed_lens,
-        scores, num_tokens, index_ready, query_tid, weights_tid,
+    scores_tid = score_full_pretransposed(
+        index_query, index_query_scale, index_weights,
+        index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
+        scores,
+        num_tokens, index_ready, query_tid, weights_tid, private_query, private_route,
     )
     topk_tid = select_index_topk(scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid)
     pool_tid = select_candidate_block_pool(
@@ -226,23 +231,30 @@ def decode_c1a_full(
             max_workers=GATHER_WORKERS, name_hint="c1a_gather",
         )
         attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
-    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, grouped_max_workers=64,
-    )
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
-        _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
+        attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+        o_proj_hc_post(
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            attn_out, x_hc, post_mix, residual_mix, output, num_tokens,
+        )
     else:
-        with pl.spmd(tokens, name_hint="cast_out"):
-            row = pl.tile.get_block_idx()
-            for col in pl.range(0, D, 512):
-                value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
-                if row < num_tokens:
-                    partial_tile = pl.load(partial, [row, col], [1, 512])
-                    value = pl.cast(partial_tile, pl.BF16, mode="rint")
-                pl.store(value, [row, col], attn_out)
-        hc_post(attn_out, x_hc, post_mix, residual_mix, output)
+        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        o_proj(
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, grouped_max_workers=64,
+        )
+        attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+        if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
+            _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
+        else:
+            with pl.spmd(tokens, name_hint="cast_out"):
+                row = pl.tile.get_block_idx()
+                for col in pl.range(0, D, 512):
+                    value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                    if row < num_tokens:
+                        partial_tile = pl.load(partial, [row, col], [1, 512])
+                        value = pl.cast(partial_tile, pl.BF16, mode="rint")
+                    pl.store(value, [row, col], attn_out)
+            hc_post(attn_out, x_hc, post_mix, residual_mix, output)
     return output
 
 

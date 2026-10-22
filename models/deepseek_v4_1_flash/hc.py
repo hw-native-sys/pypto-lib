@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from config import FLASH as M, SP_T_DYN, T_DYN
+from rmsnorm import NORM_D_TILE
 
 
 # model config
@@ -216,6 +217,66 @@ def hc_pre(
 
 
 @pl.jit.inline
+def _hc_pre_norm(
+    x_hc: pl.Tensor,
+    pre_mix: pl.Tensor,
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor,
+):
+    """Collapse four streams and normalize one BF16 row per worker."""
+    tokens = pl.tensor.dim(x_hc, 0)
+    x_flat = pl.reshape(x_hc, [tokens, HC_DIM])
+    weight_flat = pl.reshape(norm_weight, [1, D])
+    with pl.spmd(tokens, name_hint="hc_pre_norm") as norm_ready:
+        token = pl.tile.get_block_idx()
+        pre0 = pl.read(pre_mix, [token, 0])
+        pre1 = pl.read(pre_mix, [token, 1])
+        pre2 = pl.read(pre_mix, [token, 2])
+        pre3 = pl.read(pre_mix, [token, 3])
+        x0 = pl.load(x_flat, [token, 0], [1, D])
+        y0 = pl.mul(x0, pre0)
+        x1 = pl.load(x_flat, [token, D], [1, D])
+        y1 = pl.mul(x1, pre1)
+        first_pair = pl.add(y0, y1)
+        x2 = pl.load(x_flat, [token, 2 * D], [1, D])
+        y2 = pl.mul(x2, pre2)
+        x3 = pl.load(x_flat, [token, 3 * D], [1, D])
+        y3 = pl.mul(x3, pre3)
+        second_pair = pl.add(y2, y3)
+        collapsed_fp32 = pl.add(first_pair, second_pair)
+        collapsed = pl.cast(collapsed_fp32, pl.BF16, mode="rint")
+        sq_sum = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
+        reduction_input = pl.tile.full([8, NORM_D_TILE], dtype=pl.FP32, value=0.0)
+        reduction_tmp = pl.create_tile([8, NORM_D_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
+            k0 = kb * NORM_D_TILE
+            source = pl.tile.slice(collapsed, [1, NORM_D_TILE], [0, k0])
+            value = pl.cast(source, pl.FP32)
+            squared = pl.mul(value, value)
+            padded = pl.tile.assemble(reduction_input, squared, [0, 0])
+            one_row = pl.set_validshape(padded, 1, NORM_D_TILE)
+            reduced = pl.row_sum(one_row, tmp_tile=reduction_tmp)
+            partial = pl.reshape(reduced, [1, 8])
+            sq_sum = pl.add(sq_sum, partial)
+        mean_square = pl.mul(sq_sum, 1.0 / D)
+        rms_argument = pl.add(mean_square, NORM_EPS)
+        rsqrt_tmp = pl.create_tile([1, 8], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        inv_rms = pl.tile.rsqrt(rms_argument, tmp=rsqrt_tmp)
+        inv_scalar = pl.tile.read(inv_rms, [0, 0])
+        for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
+            k0 = kb * NORM_D_TILE
+            source = pl.tile.slice(collapsed, [1, NORM_D_TILE], [0, k0])
+            value = pl.cast(source, pl.FP32)
+            weight = pl.load(weight_flat, [0, k0], [1, NORM_D_TILE])
+            gamma = pl.cast(weight, pl.FP32)
+            scaled = pl.mul(value, inv_scalar)
+            normalized = pl.col_expand_mul(scaled, gamma)
+            result = pl.cast(normalized, pl.BF16, mode="rint")
+            pl.store(result, [token, k0], output)
+    return norm_ready
+
+
+@pl.jit.inline
 def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
     """Clear physical rows that belong to an empty or partial TP slab.
 
@@ -225,7 +286,7 @@ def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
     from publishing uninitialized data.
     """
     tokens = pl.tensor.dim(x, 0)
-    if tokens > 0:
+    if tokens > 0 and valid_rows < tokens:
         for row in pl.spmd(tokens, name_hint="decode_sp_zero_padding"):
             if row >= valid_rows:
                 x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)

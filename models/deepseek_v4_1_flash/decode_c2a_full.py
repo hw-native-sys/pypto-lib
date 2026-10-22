@@ -25,14 +25,14 @@ from hc import hc_mixes, golden_mhc_mixes
 from hc import hc_pre, golden_hc_pre
 from hc import hc_post, golden_hc_post, _hc_post_from_partial
 from rmsnorm import rms_norm_tiled, golden_rms_norm
-from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope, golden_rope_tail, golden_qkv_proj_rope
+from qkv_proj_rope import qkv_proj_rope, golden_rope_tail, golden_qkv_proj_rope
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH,
     gather_packed_chunk, attend_c2a_chunk, publish_window_row, attend_packed_cohorts,
     golden_selected_attention,
 )
 from decode_indexer import decode_c2a_indexer, golden_c2a_index
-from o_proj import o_proj, golden_o_proj
+from o_proj import o_proj, o_proj_hc_post, golden_o_proj
 from golden import TensorSpec, ScalarSpec, ratio_allclose, mapped_pool_ratio_allclose, run
 from utils import AttentionGoldenResult, paged_slots, window_metadata
 from quant import quantize_grouped_mxfp8_weight, dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache
@@ -132,13 +132,14 @@ def decode_c2a_full(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(
-        qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens,
-        max_workers=64 if TP_SIZE == 1 else 2147483647,
-    )
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
+    qkv_proj_rope(
+        x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
+        qr, query, kv_projection, window_kv, num_tokens,
+        max_workers=64 if TP_SIZE == 1 else 2147483647,
+        fuse_qnorm=False, q_b_n_tile=128,
+    )
     publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
@@ -187,25 +188,32 @@ def decode_c2a_full(
                 name_hint="c2a_sparse_attn",
             )
 
-    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b,
-        wo_b_scale, rope_cos, rope_sin,
-        partial, num_tokens, grouped_max_workers=4096,
-    )
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
-        _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
+        attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+        o_proj_hc_post(
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            attn_out, x_hc, post_mix, residual_mix, output, num_tokens,
+        )
     else:
-        with pl.spmd(tokens, name_hint="cast_out"):
-            row = pl.tile.get_block_idx()
-            for col in pl.range(0, D, 512):
-                value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
-                if row < num_tokens:
-                    partial_tile = pl.load(partial, [row, col], [1, 512])
-                    value = pl.cast(partial_tile, pl.BF16, mode="rint")
-                pl.store(value, [row, col], attn_out)
-        hc_post(attn_out, x_hc, post_mix, residual_mix, output)
+        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        o_proj(
+            attended, wo_a, wo_a_scale, wo_b,
+            wo_b_scale, rope_cos, rope_sin,
+            partial, num_tokens, grouped_max_workers=4096,
+        )
+        attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+        if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
+            _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
+        else:
+            with pl.spmd(tokens, name_hint="cast_out"):
+                row = pl.tile.get_block_idx()
+                for col in pl.range(0, D, 512):
+                    value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                    if row < num_tokens:
+                        partial_tile = pl.load(partial, [row, col], [1, 512])
+                        value = pl.cast(partial_tile, pl.BF16, mode="rint")
+                    pl.store(value, [row, col], attn_out)
+            hc_post(attn_out, x_hc, post_mix, residual_mix, output)
     return output, next_pre_mix
 
 

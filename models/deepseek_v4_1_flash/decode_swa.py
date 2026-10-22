@@ -31,10 +31,10 @@ from golden import ratio_allclose
 # PyPTO resolves inline calls and JIT-body constants only from direct names.
 from config import LOCAL_T_DYN
 from sparse_attention import publish_window_row
-from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
+from qkv_proj_rope import qkv_proj_rope
 from sparse_attention import swa_attention_partial
-from o_proj import o_proj
-from hc import hc_pre, zero_bf16_padding, golden_hc_pre
+from o_proj import o_proj, o_proj_hc_post
+from hc import hc_pre, _hc_pre_norm, zero_bf16_padding, golden_hc_pre
 from hc import golden_mhc_mixes, hc_mixes
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from hc import golden_hc_post, hc_post, _hc_post_from_partial
@@ -93,48 +93,61 @@ def decode_swa(
 ):
     """Run one SWA attention sublayer and emit the staggered mix for the next sublayer."""
     tokens = pl.tensor.dim(x_hc, 0)
-    x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_mixes(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
     )
-    hc_pre(x_hc, incoming_pre_mix, x_attn)
-    norm_tokens = pl.tensor.dim(x_attn, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="norm_in"):
-        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_block, norm_tokens, output_fp32=False)
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16 and tokens == num_tokens:
+        _hc_pre_norm(x_hc, incoming_pre_mix, attn_norm_weight, x_norm)
+    else:
+        x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
+        hc_pre(x_hc, incoming_pre_mix, x_attn)
+        norm_tokens = pl.tensor.dim(x_attn, 0)
+        for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="norm_in"):
+            rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_block, norm_tokens, output_fp32=False)
+
     zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens, max_workers=Q_ROPE_WORKER_TILE)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
+    qkv_proj_rope(
+        x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
+        qr, q, kv_projection, kv, num_tokens, max_workers=Q_ROPE_WORKER_TILE,
+        fuse_qnorm=True, q_b_n_tile=256,
+    )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     swa_attention_partial(
         q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens,
     )
-    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b,
-        wo_b_scale, rope_cos, rope_sin,
-        partial, num_tokens, grouped_max_workers=4096,
-    )
-    output_rows = pl.tensor.dim(attention_output, 0)
-    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
-        _hc_post_from_partial(partial, attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens)
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
+        o_proj_hc_post(
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
+        )
     else:
-        for row in pl.spmd(output_rows, name_hint="cast_out"):
-            for col in pl.range(0, D, 512):
-                value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
-                if row < num_tokens:
-                    partial_tile = pl.load(partial, [row, col], [1, 512])
-                    value = pl.cast(partial_tile, pl.BF16, mode="rint")
-                attention_output = pl.store(value, [row, col], attention_output)
-        hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
+        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        o_proj(
+            attended, wo_a, wo_a_scale, wo_b,
+            wo_b_scale, rope_cos, rope_sin,
+            partial, num_tokens, grouped_max_workers=4096,
+        )
+        output_rows = pl.tensor.dim(attention_output, 0)
+        if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
+            _hc_post_from_partial(partial, attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens)
+        else:
+            for row in pl.spmd(output_rows, name_hint="cast_out"):
+                for col in pl.range(0, D, 512):
+                    value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                    if row < num_tokens:
+                        partial_tile = pl.load(partial, [row, col], [1, 512])
+                        value = pl.cast(partial_tile, pl.BF16, mode="rint")
+                    attention_output = pl.store(value, [row, col], attention_output)
+            hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
     return attention_hidden, attention_pre_mix
 
 
