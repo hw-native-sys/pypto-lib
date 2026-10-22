@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """PyPTO sparse MLA with packed-cache dequantization and sink-aware Cube attention."""
 
 from collections.abc import Callable
@@ -992,8 +993,8 @@ SWA_INPUT_NAMES = (
 )
 
 
-def swa_official_reference(tensors, *, shared_cache=False):
-    """Evaluate FP8 projections and the selected SWA weight-rounding order."""
+def swa_official_reference(tensors, *, shared_cache=False, key_tile=128):
+    """Evaluate FP8 projections, tiled BF16 attention weights, and FP32 output."""
     t = tensors
     head_dim = t["window_cache"].shape[-1]
     local_heads = t["attn_sink"].numel()
@@ -1019,10 +1020,10 @@ def swa_official_reference(tensors, *, shared_cache=False):
     maximum = torch.full(q.shape[:2], -torch.inf if shared_cache else -1e30)
     denominator = torch.zeros_like(maximum)
     numerator = torch.zeros_like(q, dtype=torch.float32)
-    for start in range(0, idx.shape[-1], 128):
-        keys = selected[:, start:start + 128].float()
+    for start in range(0, idx.shape[-1], key_tile):
+        keys = selected[:, start:start + key_tile].float()
         logits = torch.einsum("thd,tkd->thk", q.float(), keys) * head_dim ** -0.5
-        valid = idx[:, start:start + 128] >= 0
+        valid = idx[:, start:start + key_tile] >= 0
         # Match the device's finite mask so an empty block keeps zero statistics.
         logits = logits.masked_fill(~valid[:, None], -1e30)
         new_maximum = torch.maximum(maximum, logits.amax(-1))

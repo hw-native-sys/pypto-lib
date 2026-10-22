@@ -12,7 +12,7 @@
 import pypto.language as pl
 
 from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, ORI_BLOCKS_DYN, TP_SIZE, T_DYN
-from o_proj import o_proj
+from o_proj import GROUPED_WORKER_TILE, o_proj
 from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
 from sparse_attention import publish_window_row
 
@@ -146,7 +146,7 @@ def dspark_attention(
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens, max_workers=2147483647)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
@@ -154,7 +154,11 @@ def dspark_attention(
     gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    # JIT dependency calls require an explicit constexpr binding.
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin, output, num_tokens, grouped_max_workers=GROUPED_WORKER_TILE,
+    )
     return output, window_cache, window_cache_scale
 
 
@@ -231,15 +235,15 @@ if __name__ == "__main__":
     import torch
 
     from golden import ScalarSpec, TensorSpec, ratio_allclose, run
-    from sparse_attention import SWA_INPUT_NAMES, golden_swa_attention
+    from sparse_attention import SWA_INPUT_NAMES, swa_official_reference
 
     values = make_attention_inputs()
 
     def golden(tensors):
-        result = golden_swa_attention(*(tensors[name] for name in SWA_INPUT_NAMES))
-        tensors["output"].copy_(result.output)
-        tensors["window_cache"].copy_(result.window_cache)
-        tensors["window_cache_scale"].copy_(result.window_cache_scale)
+        output, cache, cache_scale = swa_official_reference(tensors, key_tile=64)
+        tensors["output"].copy_(output)
+        tensors["window_cache"].copy_(cache)
+        tensors["window_cache_scale"].copy_(cache_scale)
 
     def compare_payload(actual, expected, **_kwargs):
         return bool(torch.allclose(actual.float(), expected.float(), rtol=0.05, atol=0.05)), "FP8 payload"

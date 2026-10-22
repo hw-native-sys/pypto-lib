@@ -27,7 +27,7 @@ from expert_routed import (
 )
 from input_pack import pack_x_hc
 from utils import paged_slots
-from moe import AUX_WIDTH, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
+from prefill_moe import AUX_WIDTH, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, prefill_moe
 
 from dspark_attention import dspark_attention
 from dspark_context_kv import dspark_context_kv
@@ -385,7 +385,7 @@ def draft_layer(
     zero_bf16_padding(attention_output, num_tokens)
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
-    moe(
+    prefill_moe(
         attention_hidden,
         attention_pre_mix,
         hc_ffn_fn,
