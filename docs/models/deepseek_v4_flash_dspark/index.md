@@ -23,7 +23,8 @@ below the presets.
 | Decode context length | up to 1,048,576 positions, paged in **32-token** pages (`max_position_embeddings`, `BLOCK_SIZE`) |
 | Prefill shape | one packed request stream per CP group, `PREFILL_SEQ = 512` tokens per dispatch; longer prompts arrive as chunks against a resident prefix |
 | Platform | Ascend A2/A3, single node |
-| Tensor parallelism | `--tp 1/2/4`; the deployment point is TP 4 — the grouped output projection and the LM head are vocab/group-sharded over it |
+| Attention tensor parallelism | `--tp 1/2/4`; the deployment point is TP 4, including the grouped output projection and DSA-CP token split |
+| LM-head tensor parallelism | `--lm-head-tp 1/2/4/8/16`, defaulting to `--tp`; independent vocabulary shards for both target and Markov sampling |
 | Context parallelism | DSA-CP reuses that same physical TP group: each rank owns a slice of the step's token rows, and the attention KV stream is replicated rank-major across the group |
 | Expert parallelism | `--ep 2/4/8/16`; the deployment point is EP 16, and each rank holds `256 / ep` routed experts |
 | Data parallelism | `DP = 4` groups per node, so the deployment point is 16 cards (`TP * DP`) |
@@ -208,12 +209,31 @@ its shapes do not move with `--tp`; only the DSA-CP group width does.
 [decode_fwd_dspark.py](../../../models/deepseek_v4_flash_dspark/decode_fwd_dspark.py)
 composes the whole recurrent step — prepare, target forward, accept, drafter,
 Markov sampler, state commit — into one L2, and runs it end to end without a
-golden.
+golden. The fused step and three-layer drafter accept `--tp 1/2/4`. At TP1,
+each EP rank owns an independent attention/cache group; EP MoE communication
+still spans the selected world. The per-rank 128-token MoE slab and maximum
+16-request drafter batch do not grow when TP decreases.
+
+The fused target takes zero-copy views of the padded metadata: compressor
+tables and group RoPE cover `TP * 16` requests and `TP * 128` tokens, while
+attention cache tables and sequence lengths cover 16 rank-local requests.
+Each request therefore retains the K7 width of eight tokens for TP1/2/4;
+the outer metadata ABI and resident cache allocations do not change.
+
+For attention TP1 / EP16, `--lm-head-tp 4` keeps the head's BF16 NZ weight
+vocabulary-sharded without changing the attention/cache layout. As in MTP,
+rank `r` joins head group `r // head_tp`, owns shard `r % head_tp`, and receives
+its own full-vocabulary logits. Idle attention owners still participate in
+the head collective. Target, drafter/Markov and bootstrap share this grouping;
+the draft attention and request-state publication retain the attention TP.
+The head TP must divide the model world. A full-vocabulary TP1 head remains
+subject to the toolchain's NZ GM burst-gap limit; the independent TP4 head
+avoids that layout without changing the SDK or using ND weights.
 
 ## Status
 
-Under development, and not wired into `pypto-serving`. Every executable file
-carries its own Golden Harness fixture; the
+These entries validate library kernels, not a serving deployment. Every executable
+file carries its own Golden Harness fixture; the
 `decode_fwd` / `prefill_fwd` / `decode_layer` / `prefill_layer` compositions and
 the distributed communication oracles are device-only and do not run on a
 simulator. Most kernels are a plain function exposed twice — as the
@@ -226,9 +246,11 @@ python models/deepseek_v4_flash_dspark/decode_layer.py -p a2a3 --tp 2 --ep 2 -d 
 python models/deepseek_v4_flash_dspark/decode_fwd.py -p a2a3 --tp 2 --ep 2 -d 0,1
 python models/deepseek_v4_flash_dspark/dspark_drafter.py -p a2a3 --tp 2 --ep 2 -d 0,1
 python models/deepseek_v4_flash_dspark/decode_fwd_dspark.py -p a2a3 --tp 2 --ep 2 -d 0,1
+# Independent attention TP1 and LM-head TP4, with EP16.
+python models/deepseek_v4_flash_dspark/decode_fwd_dspark.py -p a2a3 --tp 1 --lm-head-tp 4 --ep 16 -d 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 ```
 
-`--tp` and `--ep` are read at import time, because the shapes they derive
+`--tp`, `--lm-head-tp` and `--ep` are read at import time, because the shapes they derive
 freeze before the kernels are traced; passing a value the module did not import
 with is rejected rather than silently ignored.
 

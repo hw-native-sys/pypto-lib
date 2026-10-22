@@ -729,7 +729,7 @@ def l3_distributed_markov_sample(
         )
 
 
-def build_tensor_specs(batch: int, *, distributed: bool = False):
+def build_tensor_specs(batch: int, *, distributed: bool = False, world_size: int = WORLD_SIZE):
     """Build a deterministic nonzero Markov validation case."""
     import torch
     from golden import TensorSpec
@@ -737,6 +737,8 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
 
     if batch not in DSPARK_SUPPORTED_BATCHES:
         raise ValueError(f"unsupported DSpark batch {batch}; expected one of {DSPARK_SUPPORTED_BATCHES}")
+    if distributed and (world_size < TP_SIZE or world_size % TP_SIZE):
+        raise ValueError(f"world size {world_size} must be a positive multiple of TP={TP_SIZE}")
 
     def init_head_hidden():
         hidden = torch.ones(batch, DSPARK_QUERY_WIDTH, D, dtype=torch.bfloat16)
@@ -747,7 +749,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
             # Every TP rank owns a distinct SP request slice. A rank-specific
             # one-hot feature makes the fused SP-gather/TP-vocab path observable.
             rank_hidden = []
-            for rank in range(WORLD_SIZE):
+            for rank in range(world_size):
                 group_hidden = hidden.clone()
                 group_hidden[:, :, 1] = 1.0 + (rank // TP_SIZE) / 8.0
                 group_hidden[:, :, 2 : 2 + TP_SIZE] = 0.0
@@ -759,12 +761,12 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
     def init_lm_head_weight():
         if distributed:
             weight = torch.zeros(
-                WORLD_SIZE,
+                world_size,
                 VOCAB_PER_TP,
                 D,
                 dtype=torch.bfloat16,
             )
-            for rank in range(WORLD_SIZE):
+            for rank in range(world_size):
                 if rank % TP_SIZE == 0:
                     # Rows 4+owner_tp have no Markov bias. Distinct winners for
                     # the SP owners prove their hidden rows are not duplicated.
@@ -805,12 +807,12 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
     def replicate(init_fn):
         value = init_fn()
         if distributed:
-            return torch.stack([value] * WORLD_SIZE)
+            return torch.stack([value] * world_size)
         return value
 
     def with_world(*shape):
         if distributed:
-            return [WORLD_SIZE, *shape]
+            return [world_size, *shape]
         return list(shape)
 
     specs = [
@@ -830,7 +832,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
         ),
         TensorSpec(
             "lm_head_weight",
-            [WORLD_SIZE, VOCAB_PER_TP, D] if distributed else [VOCAB, D],
+            [world_size, VOCAB_PER_TP, D] if distributed else [VOCAB, D],
             torch.bfloat16,
             init_value=init_lm_head_weight,
             **({"resident": "stacked"} if distributed else {}),
@@ -841,7 +843,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
 
         def init_logit_row_indices():
             indices = torch.full(
-                (WORLD_SIZE, MAX_LOGIT_ROWS),
+                (world_size, MAX_LOGIT_ROWS),
                 -1,
                 dtype=torch.int32,
             )
@@ -854,7 +856,7 @@ def build_tensor_specs(batch: int, *, distributed: bool = False):
         specs.append(
             TensorSpec(
                 "logit_row_indices",
-                [WORLD_SIZE, MAX_LOGIT_ROWS],
+                [world_size, MAX_LOGIT_ROWS],
                 torch.int32,
                 init_value=init_logit_row_indices,
             )
@@ -1004,7 +1006,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--distributed", action="store_true")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[2, 4, 8, 16])
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4, 8, 16])
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2, 4, 8, 16])
     parser.add_argument("-d", "--device", default="0")
     parser.add_argument("--compile-only", action="store_true")

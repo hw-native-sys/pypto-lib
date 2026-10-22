@@ -44,11 +44,17 @@ def _parse_int_argv(name, default=None):
     return default
 
 
-TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
-# --dp sizes the standalone fixture: DP groups of TP ranks each; the
-# kernel carries no DP extent.
-DP_SIZE: int = _parse_int_argv("--dp") or 1
-WORLD_SIZE = TP_SIZE * DP_SIZE
+# Vocabulary sharding and owner groups use an independent head TP.
+TP_SIZE: int = _parse_int_argv("--lm-head-tp", _parse_int_argv("--tp", _TP_DEFAULT))
+DP_SIZE: int = _parse_int_argv("--dp", 1)
+# --dp describes the standalone head fixture; --ep is the composed model world.
+WORLD_SIZE = _parse_int_argv("--ep", TP_SIZE * DP_SIZE)
+if TP_SIZE not in _TP_CHOICES:
+    raise ValueError(f"LM-head TP must be one of {_TP_CHOICES}, got {TP_SIZE}")
+if WORLD_SIZE <= 0 or WORLD_SIZE % TP_SIZE:
+    raise ValueError(f"world size {WORLD_SIZE} must be a positive multiple of LM-head TP={TP_SIZE}")
+if VOCAB % TP_SIZE:
+    raise ValueError(f"vocab size {VOCAB} must be divisible by LM-head TP={TP_SIZE}")
 VOCAB_PER_TP = VOCAB // TP_SIZE
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card

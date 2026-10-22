@@ -108,7 +108,6 @@ MAIN_HIDDEN_DIM = len(TARGET_LAYER_IDS) * D
 HC_MULT = swa.HC_MULT
 HC_DIM = swa.HC_DIM
 LM_HEAD_COMM_EPOCH = 1
-LOGITS_ZERO_TILE = 256
 MIX_HC = swa.MIX_HC
 Q_LORA = swa.Q_LORA
 H = swa.H
@@ -183,10 +182,8 @@ def _validate_import_contract():
         range(MAIN_LAYER_COUNT - len(TARGET_LAYER_IDS), MAIN_LAYER_COUNT)
     ):
         raise ValueError(f"D-Spark target layers must be the final three layers: {TARGET_LAYER_IDS}")
-    if MODEL_CONFIG.vocab_size % TP_SIZE:
-        raise ValueError(f"vocab size {MODEL_CONFIG.vocab_size} must be divisible by TP={TP_SIZE}")
-    if LM_HEAD_TP_SIZE != TP_SIZE:
-        raise ValueError(f"LM-head TP={LM_HEAD_TP_SIZE} does not match forward TP={TP_SIZE}")
+    if N_RANKS % LM_HEAD_TP_SIZE:
+        raise ValueError(f"world size {N_RANKS} must be divisible by LM-head TP={LM_HEAD_TP_SIZE}")
     if LM_HEAD_VOCAB != MODEL_CONFIG.vocab_size:
         raise ValueError(f"LM-head vocab={LM_HEAD_VOCAB} does not match model vocab={MODEL_CONFIG.vocab_size}")
     if MAX_LOGIT_ROWS != MOE_TOKENS:
@@ -1149,34 +1146,24 @@ def _decode_fwd(
                 dspark_target_hidden[token : token + 1, 2 * D : 3 * D] = pl.cast(
                     target_hidden_l42, pl.BF16, mode="rint",
                 )
-        hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
-        final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
-        lm_head(
-            x_out,
-            lm_head_weight,
-            logit_row_indices,
-            logits,
-            lm_head_hidden_window,
-            lm_head_hidden_done,
-            lm_head_logits_window,
-            lm_head_logits_done,
-            group_base,
-            tp_rank,
-            pl.const(LM_HEAD_COMM_EPOCH, pl.INT32),
-            final_norm_tid,
-        )
-        greedy_sample(logits, logit_row_indices, grammar_mask, sampled_ids)
     else:
-        for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="decode_fwd_inactive_sample_rows"):
-            for col in pl.range(LM_HEAD_VOCAB // LOGITS_ZERO_TILE):
-                col_begin = col * LOGITS_ZERO_TILE
-                zero_logits_tile = pl.full([1, LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0)
-                logits[row : row + 1, col_begin : col_begin + LOGITS_ZERO_TILE] = zero_logits_tile
-            if LM_HEAD_VOCAB % LOGITS_ZERO_TILE != 0:
-                zero_logits_tail = pl.full([1, LM_HEAD_VOCAB % LOGITS_ZERO_TILE], dtype=pl.FP32, value=0.0)
-                logits[row : row + 1, LM_HEAD_VOCAB // LOGITS_ZERO_TILE * LOGITS_ZERO_TILE :] = zero_logits_tail
-            unset_ids_row = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=-1)
-            sampled_ids[row : row + 1, :] = unset_ids_row
+        for token in pl.spmd(local_t, name_hint="decode_fwd_inactive_target_hidden"):
+            for head in pl.range(MAIN_HIDDEN_DIM // D):
+                dspark_target_hidden[token : token + 1, head * D : (head + 1) * D] = pl.full(
+                    [1, D], dtype=pl.BF16, value=0.0,
+                )
+
+    # Every rank, including an idle attention owner, joins its head collective.
+    hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, hidden_workspace)
+    final_norm_tid = rms_norm(hidden_workspace, final_norm_w, x_out)
+    lm_head(
+        x_out, lm_head_weight, logit_row_indices, logits,
+        lm_head_hidden_window, lm_head_hidden_done,
+        lm_head_logits_window, lm_head_logits_done,
+        my_rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, my_rank % LM_HEAD_TP_SIZE,
+        pl.const(LM_HEAD_COMM_EPOCH, pl.INT32), final_norm_tid,
+    )
+    greedy_sample(logits, logit_row_indices, grammar_mask, sampled_ids)
     return x_out
 
 
@@ -2024,6 +2011,7 @@ def main():
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=_TP_CHOICES)
+    parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=(1, 2, 4, 8, 16))
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=_EP_CHOICES)
     parser.add_argument(
         "--experts-per-rank", type=int, default=moe_module.EXPERTS_PER_RANK,
@@ -2061,8 +2049,10 @@ def main():
     parser.add_argument("--log-level", type=str, default=None)
     args = parser.parse_args()
 
-    if args.tp != TP_SIZE or args.ep != EP_SIZE:
-        parser.error(f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}")
+    if args.tp != TP_SIZE or args.ep != EP_SIZE or args.lm_head_tp != LM_HEAD_TP_SIZE:
+        parser.error(
+            f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}, LM-head TP={LM_HEAD_TP_SIZE}"
+        )
     start_pos = _parse_start_pos(args.start_pos)
     num_tokens_per_owner = _parse_num_tokens_per_owner(args.num_tokens_per_owner)
     weight_bank_size = args.weight_bank_size

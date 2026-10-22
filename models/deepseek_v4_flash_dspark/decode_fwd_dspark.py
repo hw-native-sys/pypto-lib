@@ -15,8 +15,8 @@ import pypto.language.distributed as pld
 
 import decode_fwd as decode
 
-if decode.TP_SIZE not in (2, 4):
-    raise ValueError(f"the fused DSpark one-L2 decode path supports --tp=2 or 4, got --tp={decode.TP_SIZE}")
+if decode.TP_SIZE not in (1, 2, 4):
+    raise ValueError(f"the fused DSpark one-L2 decode path supports --tp=1, 2 or 4, got --tp={decode.TP_SIZE}")
 
 import decode_prepare as prepare
 import dspark_drafter as dspark
@@ -133,6 +133,7 @@ DRAFT_DSPARK_DRAFT_LAYERS = dspark.DSPARK_DRAFT_LAYERS
 DRAFT_DSPARK_MARKOV_RANK = markov.DSPARK_MARKOV_RANK
 DRAFT_DSPARK_QUERY_WIDTH = dspark.DSPARK_QUERY_WIDTH
 DRAFT_GROUP_LOGIT_ROWS = lmhead.GROUP_LOGIT_ROWS
+DRAFT_LM_HEAD_TP_SIZE = markov.TP_SIZE
 DRAFT_H = dspark.H
 DRAFT_HC_DIM = dspark.HC_DIM
 DRAFT_HC_MULT = dspark.HC_MULT
@@ -359,9 +360,9 @@ def l2_decode_fwd_dspark(
     draft_draft_token_ids: pl.Out[pl.Tensor[[B_DYN, DRAFT_DSPARK_QUERY_WIDTH], pl.INT32]],
     draft_confidence_probs: pl.Out[pl.Tensor[[B_DYN, DRAFT_DSPARK_QUERY_WIDTH], pl.FP32]],
     draft_markov_hidden_window: pld.DistributedTensor[[DRAFT_GROUP_LOGIT_ROWS, DRAFT_D], pl.BF16],
-    draft_markov_hidden_done: pld.DistributedTensor[[DRAFT_TP_SIZE, 1], pl.INT32],
+    draft_markov_hidden_done: pld.DistributedTensor[[DRAFT_LM_HEAD_TP_SIZE, 1], pl.INT32],
     draft_markov_logits_window: pld.DistributedTensor[[DRAFT_MAX_LOGIT_ROWS, DRAFT_VOCAB], pl.FP32],
-    draft_markov_logits_done: pld.DistributedTensor[[DRAFT_TP_SIZE, 1], pl.INT32],
+    draft_markov_logits_done: pld.DistributedTensor[[DRAFT_LM_HEAD_TP_SIZE, 1], pl.INT32],
     draft_bridge_metadata_window: pld.DistributedTensor[[BRIDGE_GROUP_METADATA_ROWS, BRIDGE_METADATA_WIDTH], pl.INT64],
     draft_bridge_metadata_signal: pld.DistributedTensor[[DRAFT_DSPARK_CP_SIZE, 1], pl.INT32],
     draft_bridge_rope_cos_window: pld.DistributedTensor[[BRIDGE_GROUP_METADATA_ROWS, DRAFT_ROPE_DIM], pl.BF16],
@@ -507,31 +508,55 @@ def l2_decode_fwd_dspark(
             tp_rank,
         )
         target_accept_ready = pl.create_tensor([1], dtype=pl.INT32)
+        # Target compressors consume the TP group's requests; attention consumes
+        # only this rank's requests. The outer metadata keeps its padded ABI.
+        target_group_batch = TP_SIZE * LOCAL_DECODE_BATCH
+        target_group_tokens = TP_SIZE * LOCAL_DECODE_TOKENS
+        target_swa_slot_mapping = prepared_swa_slot_mapping[:target_group_tokens]
+        target_position_ids = prepared_position_ids[:target_group_tokens]
+        target_csa_cmp_freqs_cos = prepared_csa_cmp_freqs_cos[:target_group_tokens, :]
+        target_csa_cmp_freqs_sin = prepared_csa_cmp_freqs_sin[:target_group_tokens, :]
+        target_csa_state_table = prepared_csa_compress_state_block_table[:target_group_batch, :]
+        target_csa_inner_state_table = prepared_csa_inner_compress_state_block_table[:target_group_batch, :]
+        target_csa_cmp_table = csa_cmp_block_table[:LOCAL_DECODE_BATCH, :]
+        target_csa_idx_table = csa_idx_block_table[:LOCAL_DECODE_BATCH, :]
+        target_csa_ori_slots = prepared_csa_ori_slot_mapping[:target_group_tokens]
+        target_csa_cmp_slots = prepared_csa_cmp_slot_mapping[:target_group_tokens]
+        target_csa_idx_slots = prepared_csa_idx_slot_mapping[:target_group_tokens]
+        target_csa_state_slots = prepared_csa_state_slot_mapping[:target_group_tokens]
+        target_csa_inner_state_slots = prepared_csa_inner_state_slot_mapping[:target_group_tokens]
+        target_hca_cmp_freqs_cos = prepared_hca_cmp_freqs_cos[:target_group_batch, :]
+        target_hca_cmp_freqs_sin = prepared_hca_cmp_freqs_sin[:target_group_batch, :]
+        target_hca_state_table = prepared_hca_compress_state_block_table[:target_group_batch, :]
+        target_hca_cmp_table = hca_cmp_block_table[:LOCAL_DECODE_BATCH, :]
+        target_hca_ori_slots = prepared_hca_ori_slot_mapping[:target_group_tokens]
+        target_hca_cmp_slots = prepared_hca_cmp_slot_mapping[:target_group_tokens]
+        target_hca_state_slots = prepared_hca_state_slot_mapping[:target_group_tokens]
         decode_fwd(
             embed_weight, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b,
             wq_b_scale, wkv, gamma_cq, gamma_ckv, raw_kv_pool,
             prepared_freqs_cos, prepared_freqs_sin,
             prepared_compressed_freqs_cos, prepared_compressed_freqs_sin,
-            prepared_swa_slot_mapping, prepared_swa_indices, prepared_swa_lens,
-            prepared_position_ids_local, prepared_position_ids,
-            prepared_csa_cmp_freqs_cos, prepared_csa_cmp_freqs_sin, csa_cmp_wkv,
+            target_swa_slot_mapping, prepared_swa_indices, prepared_swa_lens,
+            prepared_position_ids_local, target_position_ids,
+            target_csa_cmp_freqs_cos, target_csa_cmp_freqs_sin, csa_cmp_wkv,
             csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w, csa_compress_state,
-            prepared_csa_compress_state_block_table,
+            target_csa_state_table,
             csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj,
             csa_hadamard_idx, csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
-            csa_inner_compress_state, prepared_csa_inner_compress_state_block_table, csa_cmp_kv,
-            csa_cmp_block_table, csa_idx_kv_cache, csa_idx_kv_scale, csa_idx_block_table,
-            prepared_csa_ori_slot_mapping,
+            csa_inner_compress_state, target_csa_inner_state_table, csa_cmp_kv,
+            target_csa_cmp_table, csa_idx_kv_cache, csa_idx_kv_scale, target_csa_idx_table,
+            target_csa_ori_slots,
             prepared_csa_window_swa_indices, prepared_csa_window_swa_lens,
-            prepared_csa_cmp_slot_mapping, prepared_csa_idx_slot_mapping,
-            prepared_csa_state_slot_mapping, prepared_csa_inner_state_slot_mapping,
+            target_csa_cmp_slots, target_csa_idx_slots,
+            target_csa_state_slots, target_csa_inner_state_slots,
             prepared_csa_kv_seq_lens,
-            prepared_hca_cmp_freqs_cos, prepared_hca_cmp_freqs_sin,
+            target_hca_cmp_freqs_cos, target_hca_cmp_freqs_sin,
             hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w, hca_compress_state,
-            prepared_hca_compress_state_block_table,
-            hca_cmp_kv, hca_cmp_block_table, prepared_hca_ori_slot_mapping,
+            target_hca_state_table,
+            hca_cmp_kv, target_hca_cmp_table, target_hca_ori_slots,
             prepared_hca_window_swa_indices, prepared_hca_window_swa_lens,
-            prepared_hca_cmp_slot_mapping, prepared_hca_state_slot_mapping,
+            target_hca_cmp_slots, target_hca_state_slots,
             prepared_hca_kv_seq_lens, attn_sink, wo_a, wo_b, wo_b_scale, hc_ffn_fn,
             hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid,
             prepared_input_ids,
@@ -623,7 +648,7 @@ def l2_decode_fwd_dspark(
             draft_confidence_head_weight, draft_draft_token_ids, draft_confidence_probs,
             draft_markov_hidden_window, draft_markov_hidden_done,
             draft_markov_logits_window, draft_markov_logits_done,
-            group_base, tp_rank,
+            my_rank // DRAFT_LM_HEAD_TP_SIZE * DRAFT_LM_HEAD_TP_SIZE, my_rank % DRAFT_LM_HEAD_TP_SIZE,
         )
     with pl.scope():
         state_tokens, state_meta = commit_drafts_to_device_state(
@@ -863,8 +888,8 @@ def l3_decode_fwd_dspark(
     draft_combine_buf = pld.alloc_window_buffer([DRAFT_N_RANKS, 1], dtype=pl.INT32)
     draft_markov_hidden_buf = pld.alloc_window_buffer(DRAFT_GROUP_LOGIT_ROWS * DRAFT_D * 2)
     draft_markov_logits_buf = pld.alloc_window_buffer(DRAFT_MAX_LOGIT_ROWS * DRAFT_VOCAB * 4)
-    draft_markov_hidden_done_buf = pld.alloc_window_buffer(DRAFT_TP_SIZE * 4)
-    draft_markov_logits_done_buf = pld.alloc_window_buffer(DRAFT_TP_SIZE * 4)
+    draft_markov_hidden_done_buf = pld.alloc_window_buffer(DRAFT_LM_HEAD_TP_SIZE * 4)
+    draft_markov_logits_done_buf = pld.alloc_window_buffer(DRAFT_LM_HEAD_TP_SIZE * 4)
     draft_bridge_metadata_buf = pld.alloc_window_buffer(BRIDGE_GROUP_METADATA_ROWS * BRIDGE_METADATA_WIDTH * 8)
     draft_bridge_metadata_signal_buf = pld.alloc_window_buffer(DRAFT_DSPARK_CP_SIZE * 4)
     draft_bridge_rope_cos_buf = pld.alloc_window_buffer(BRIDGE_GROUP_METADATA_ROWS * DRAFT_ROPE_DIM * 2)
@@ -907,9 +932,9 @@ def l3_decode_fwd_dspark(
         draft_routed_y_window = pld.window(draft_routed_y_buf, [DRAFT_N_ROUTES, DRAFT_D], dtype=pl.BF16)
         draft_combine_window = pld.window(draft_combine_buf, [DRAFT_N_RANKS, 1], dtype=pl.INT32)
         draft_markov_hidden_window = pld.window(draft_markov_hidden_buf, [DRAFT_GROUP_LOGIT_ROWS, DRAFT_D], dtype=pl.BF16)
-        draft_markov_hidden_done = pld.window(draft_markov_hidden_done_buf, [DRAFT_TP_SIZE, 1], dtype=pl.INT32)
+        draft_markov_hidden_done = pld.window(draft_markov_hidden_done_buf, [DRAFT_LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         draft_markov_logits_window = pld.window(draft_markov_logits_buf, [DRAFT_MAX_LOGIT_ROWS, DRAFT_VOCAB], dtype=pl.FP32)
-        draft_markov_logits_done = pld.window(draft_markov_logits_done_buf, [DRAFT_TP_SIZE, 1], dtype=pl.INT32)
+        draft_markov_logits_done = pld.window(draft_markov_logits_done_buf, [DRAFT_LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         draft_bridge_metadata_window = pld.window(draft_bridge_metadata_buf, [BRIDGE_GROUP_METADATA_ROWS, BRIDGE_METADATA_WIDTH], dtype=pl.INT64)
         draft_bridge_metadata_signal = pld.window(draft_bridge_metadata_signal_buf, [DRAFT_DSPARK_CP_SIZE, 1], dtype=pl.INT32)
         draft_bridge_rope_cos_window = pld.window(draft_bridge_rope_cos_buf, [BRIDGE_GROUP_METADATA_ROWS, DRAFT_ROPE_DIM], dtype=pl.BF16)
@@ -1059,7 +1084,7 @@ def build_tensor_specs():
     specs = {spec.name: spec for spec in decode.build_tensor_specs()}
     for spec in dspark.build_tensor_specs(dspark.DSPARK_MAX_BATCH):
         specs.setdefault("draft_" + spec.name, rename("draft_" + spec.name, spec))
-    for spec in markov.build_tensor_specs(dspark.DSPARK_MAX_BATCH, distributed=True):
+    for spec in markov.build_tensor_specs(dspark.DSPARK_MAX_BATCH, distributed=True, world_size=N_RANKS):
         specs.setdefault("draft_" + spec.name, rename("draft_" + spec.name, spec))
 
     bindings = _fixture_dyn_bindings(specs)
@@ -1116,7 +1141,8 @@ def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 D-Spark fused decode, drafter, and sampler")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=(2, 4))
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=(1, 2, 4))
+    parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=(1, 2, 4, 8, 16))
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=(2, 4, 8, 16))
     parser.add_argument(
         "-d", "--device", type=str, default=None,
@@ -1131,8 +1157,10 @@ def main():
     parser.add_argument("--log-level", type=str, default=None)
     args = parser.parse_args()
 
-    if args.tp != TP_SIZE or args.ep != EP_SIZE:
-        parser.error(f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}")
+    if args.tp != TP_SIZE or args.ep != EP_SIZE or args.lm_head_tp != LM_HEAD_TP_SIZE:
+        parser.error(
+            f"parallel sizes froze at import as TP={TP_SIZE}, EP={EP_SIZE}, LM-head TP={LM_HEAD_TP_SIZE}"
+        )
 
     if args.device is None:
         args.device = ",".join(str(rank) for rank in range(EP_SIZE))

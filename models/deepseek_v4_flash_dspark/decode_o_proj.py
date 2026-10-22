@@ -517,40 +517,41 @@ def o_group_a2a(
         core_num=ATTENTION_PUBLISH_WORKERS, deps=[wait_tid],
     )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_group_a2a_complete", deps=[gather_tid], no_dep_args=[exchange_signal]):
-        completion_anchor = pl.read(local_groups_out, [0, 0])
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=exchange_signal,
-                    peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+    if TP_SIZE > 1:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="o_group_a2a_complete", deps=[gather_tid], no_dep_args=[exchange_signal]):
+            completion_anchor = pl.read(local_groups_out, [0, 0])
+            for peer_tp in pl.range(TP_SIZE):
+                if peer_tp != tp_rank:
+                    pld.system.notify(
+                        target=exchange_signal,
+                        peer=group_base + peer_tp,
+                        offsets=[tp_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
 
-        completion_expected = pl.cast(publish_count + 1, pl.INT32)
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=exchange_signal,
-                    offsets=[source_tp, 0],
-                    expected=completion_expected,
-                    cmp=pld.WaitCmp.Ge,
-                )
+            completion_expected = pl.cast(publish_count + 1, pl.INT32)
+            for source_tp in pl.range(TP_SIZE):
+                if source_tp != tp_rank:
+                    pld.system.wait(
+                        signal=exchange_signal,
+                        offsets=[source_tp, 0],
+                        expected=completion_expected,
+                        cmp=pld.WaitCmp.Ge,
+                    )
 
-        reset_value = pl.cast(-completion_expected, pl.INT32)
-        self_rank = group_base + tp_rank
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.notify(
-                    target=exchange_signal,
-                    peer=self_rank,
-                    offsets=[source_tp, 0],
-                    value=reset_value,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        pl.write(local_groups_out, [0, 0], completion_anchor)
+            reset_value = pl.cast(-completion_expected, pl.INT32)
+            self_rank = group_base + tp_rank
+            for source_tp in pl.range(TP_SIZE):
+                if source_tp != tp_rank:
+                    pld.system.notify(
+                        target=exchange_signal,
+                        peer=self_rank,
+                        offsets=[source_tp, 0],
+                        value=reset_value,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            pl.write(local_groups_out, [0, 0], completion_anchor)
     return local_groups_out, exchange_signal
 
 
@@ -899,40 +900,41 @@ def o_proj_reduce_scatter(
         core_num=O_RS_REDUCE_WORKERS, deps=[wait_tid],
     )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_rs_complete", deps=[reduce_tid], no_dep_args=[reduce_signal]):
-        completion_anchor = pl.read(local_out, [0, 0])
-        for peer_tp in pl.range(TP_SIZE):
-            if peer_tp != tp_rank:
-                pld.system.notify(
-                    target=reduce_signal,
-                    peer=group_base + peer_tp,
-                    offsets=[tp_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+    if TP_SIZE > 1:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_o_rs_complete", deps=[reduce_tid], no_dep_args=[reduce_signal]):
+            completion_anchor = pl.read(local_out, [0, 0])
+            for peer_tp in pl.range(TP_SIZE):
+                if peer_tp != tp_rank:
+                    pld.system.notify(
+                        target=reduce_signal,
+                        peer=group_base + peer_tp,
+                        offsets=[tp_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
 
-        completion_expected = pl.cast(O_RS_PUBLISH_WORKERS + 1, pl.INT32)
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.wait(
-                    signal=reduce_signal,
-                    offsets=[source_tp, 0],
-                    expected=completion_expected,
-                    cmp=pld.WaitCmp.Ge,
-                )
+            completion_expected = pl.cast(O_RS_PUBLISH_WORKERS + 1, pl.INT32)
+            for source_tp in pl.range(TP_SIZE):
+                if source_tp != tp_rank:
+                    pld.system.wait(
+                        signal=reduce_signal,
+                        offsets=[source_tp, 0],
+                        expected=completion_expected,
+                        cmp=pld.WaitCmp.Ge,
+                    )
 
-        reset_value = pl.cast(-(O_RS_PUBLISH_WORKERS + 1), pl.INT32)
-        self_rank = group_base + tp_rank
-        for source_tp in pl.range(TP_SIZE):
-            if source_tp != tp_rank:
-                pld.system.notify(
-                    target=reduce_signal,
-                    peer=self_rank,
-                    offsets=[source_tp, 0],
-                    value=reset_value,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        pl.write(local_out, [0, 0], completion_anchor)
+            reset_value = pl.cast(-(O_RS_PUBLISH_WORKERS + 1), pl.INT32)
+            self_rank = group_base + tp_rank
+            for source_tp in pl.range(TP_SIZE):
+                if source_tp != tp_rank:
+                    pld.system.notify(
+                        target=reduce_signal,
+                        peer=self_rank,
+                        offsets=[source_tp, 0],
+                        value=reset_value,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            pl.write(local_out, [0, 0], completion_anchor)
     return local_out, reduce_signal
 
 

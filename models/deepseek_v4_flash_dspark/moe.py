@@ -132,9 +132,9 @@ def clear_prefill_moe_signals(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-):
+) -> pl.Scalar[pl.TASK_ID]:
     """Clear retained prefill-MoE epochs after the final wave completes."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_signal_clear"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_moe_signal_clear") as cleared_tid:
         # Read the wave-barrier epoch: orders the clear after the final wave.
         # The always-true guard keeps the read as a dependency edge.
         completed_epoch = pl.read(stage_token, [0])
@@ -145,6 +145,7 @@ def clear_prefill_moe_signals(
                 pl.write(data_arrived, [src, 0], zero)
                 pl.write(combine_arrived, [src, 0], zero)
                 pl.write(stage_done, [src, 0], zero)
+    return cleared_tid
 
 
 # === Dispatch ================================================================

@@ -14,7 +14,7 @@ import sys
 import config
 
 
-_TP_CHOICES = (2, 4)
+_TP_CHOICES = (1, 2, 4)
 _EP_CHOICES = (2, 4, 8, 16)
 _TP_DEFAULT = 2
 _EP_DEFAULT = 2
@@ -420,7 +420,7 @@ def draft_layer(
     )
     attention_grouped = pl.reshape(o_packed_heads, [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN])
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
-    # DSA-CP reuses the same physical four-rank group as TP-sharded O projection.
+    # DSA-CP and O projection use the same TP group, including a singleton.
     tp_rank = dsa_cp_rank
     with pl.spmd(
         ATTENTION_PUBLISH_WORKERS,
