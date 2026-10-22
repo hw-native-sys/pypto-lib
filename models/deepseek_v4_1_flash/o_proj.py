@@ -300,7 +300,7 @@ def o_proj(
         )
         gemm_mxfp8_to_bf16(
             latent_payload, latent_scale_backing, wo_b, wo_b_scale, projected, num_tokens, 0, 0, 0,
-            LOCAL_O_WIDTH, D, "proj_o_b", 128, K_TILE,  1, 0, 0, MX_M_TILE,
+            LOCAL_O_WIDTH, D, "proj_o_b", 256, K_TILE,  1, 0, 0, MX_M_TILE,
         )
     else:
         unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
