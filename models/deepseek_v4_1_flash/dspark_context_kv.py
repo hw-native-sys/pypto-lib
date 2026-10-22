@@ -152,8 +152,14 @@ def _compare_context_cache(
     )
 
 
-def run_context_case(*, platform: str = "a5sim", device_id: int = 0, compile_only: bool = False):
-    """Compile or numerically validate one draft layer's context publication."""
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="V4.1 DSpark context KV validation")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
     from golden import ScalarSpec, TensorSpec, run
     from quant import pack_mx_b_scale
 
@@ -200,25 +206,14 @@ def run_context_case(*, platform: str = "a5sim", device_id: int = 0, compile_onl
         ScalarSpec("num_tokens", torch.int32, tokens, compile_runtime=True),
     ]
     compare = {name: _compare_context_cache for name in ("window_cache", "window_cache_scale")}
-    return run(
+    result = run(
         fn=dspark_context_kv_test,
         specs=specs,
         golden_fn=golden,
         compare_fn=compare,
-        config={"platform": platform, "device_id": device_id},
-        compile_only=compile_only,
+        config={"platform": args.platform, "device_id": args.device},
+        compile_only=args.compile_only,
     )
-
-
-if __name__ == "__" + "main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="V4.1 DSpark context KV validation")
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
-    result = run_context_case(platform=args.platform, device_id=args.device, compile_only=args.compile_only)
     print(result)
     if not result.passed:
         raise SystemExit(1)

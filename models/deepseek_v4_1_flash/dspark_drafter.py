@@ -202,44 +202,6 @@ def dspark_proj_test(
     return dspark_proj(target_hidden, main_proj_weight, main_norm_weight, main_x, num_tokens)
 
 
-def run_projection_case(*, platform: str = "a5sim", device_id: int = 0, compile_only: bool = False):
-    """Compile or validate the BF16 projection with six active draft rows."""
-    import torch
-
-    from golden import ScalarSpec, TensorSpec, run
-
-    torch.manual_seed(41)
-    tokens = 6
-    hidden = torch.randn(tokens, MAIN_IN, dtype=torch.bfloat16) * 0.1
-    weight = (torch.randn(MAIN_IN, D) * 0.01).to(torch.bfloat16)
-
-    def golden(values):
-        values["main_x"].copy_(
-            golden_main_projection(
-                values["target_hidden"].reshape(tokens, DSPARK_DRAFT_LAYERS, D),
-                values["main_proj_weight"],
-                values["main_norm_weight"],
-            )
-        )
-
-    specs = [
-        TensorSpec("target_hidden", [tokens, MAIN_IN], torch.bfloat16, init_value=hidden),
-        TensorSpec("main_proj_weight", [MAIN_IN, D], torch.bfloat16, init_value=weight),
-        TensorSpec("main_norm_weight", [D], torch.bfloat16, init_value=1.0),
-        TensorSpec("main_x", [tokens, D], torch.bfloat16),
-        ScalarSpec("num_tokens", torch.int32, tokens, compile_runtime=True),
-    ]
-    return run(
-        fn=dspark_proj_test,
-        specs=specs,
-        golden_fn=golden,
-        config={"platform": platform, "device_id": device_id},
-        rtol=0.05,
-        atol=0.05,
-        compile_only=compile_only,
-    )
-
-
 @pl.jit.inline(auto_scope=False)
 def dspark_metadata(
     anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
@@ -991,66 +953,100 @@ def dspark_metadata_test(
     )
 
 
-def run_metadata_case(*, platform: str = "a5sim", device_id: int = 0, compile_only: bool = False):
-    """Compare all published metadata against the paged Torch reference."""
-    import torch
-
-    from golden import TensorSpec, run
-
-    batch = 1
-    tokens = batch * DSPARK_QUERY_WIDTH
-    anchors = torch.tensor([7], dtype=torch.int64)
-    positions = torch.tensor([125], dtype=torch.int32)
-    tables = torch.tensor(
-        [[[4, 5]], [[14, 15]], [[24, 25]]],
-        dtype=torch.int32,
-    )
-
-    def golden(values):
-        expected = golden_query_metadata(
-            values["anchor_ids"],
-            values["first_query_positions"],
-            values["block_tables"],
-            DSPARK_NOISE_TOKEN_ID,
-        )
-        values["query_ids"].copy_(expected.token_ids.reshape(-1))
-        values["query_positions"].copy_(expected.positions.reshape(-1))
-        values["query_slots"].copy_(expected.query_slots.reshape(DSPARK_DRAFT_LAYERS, tokens))
-        values["window_indices"].copy_(
-            expected.window_indices.reshape(DSPARK_DRAFT_LAYERS, tokens, DSPARK_SWA_INDEX_WIDTH)
-        )
-        values["window_lens"].copy_(expected.window_lens)
-
-    specs = [
-        TensorSpec("anchor_ids", [batch], torch.int64, init_value=anchors),
-        TensorSpec("first_query_positions", [batch], torch.int32, init_value=positions),
-        TensorSpec("block_tables", [DSPARK_DRAFT_LAYERS, batch, 2], torch.int32, init_value=tables),
-        TensorSpec("query_ids", [tokens], torch.int64),
-        TensorSpec("query_positions", [tokens], torch.int32),
-        TensorSpec("query_slots", [DSPARK_DRAFT_LAYERS, tokens], torch.int64),
-        TensorSpec("window_indices", [DSPARK_DRAFT_LAYERS, tokens, DSPARK_SWA_INDEX_WIDTH], torch.int32),
-        TensorSpec("window_lens", [DSPARK_DRAFT_LAYERS, batch], torch.int32),
-    ]
-    return run(
-        fn=dspark_metadata_test,
-        specs=specs,
-        golden_fn=golden,
-        config={"platform": platform, "device_id": device_id},
-        compile_only=compile_only,
-    )
-
-
-if __name__ == "__" + "main__":
+if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark drafter validation")
-    parser.add_argument("--mode", choices=("projection", "metadata"), required=True)
+    parser.add_argument("--mode", choices=("projection", "metadata", "all"), default="all")
     parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
-    run_case = run_projection_case if args.mode == "projection" else run_metadata_case
-    result = run_case(platform=args.platform, device_id=args.device, compile_only=args.compile_only)
-    print(result)
-    if not result.passed:
-        raise SystemExit(1)
+    if args.mode in ("projection", "all"):
+        import torch
+
+        from golden import ScalarSpec, TensorSpec, run
+
+        torch.manual_seed(41)
+        tokens = 6
+        hidden = torch.randn(tokens, MAIN_IN, dtype=torch.bfloat16) * 0.1
+        weight = (torch.randn(MAIN_IN, D) * 0.01).to(torch.bfloat16)
+
+        def golden(values):
+            values["main_x"].copy_(
+                golden_main_projection(
+                    values["target_hidden"].reshape(tokens, DSPARK_DRAFT_LAYERS, D),
+                    values["main_proj_weight"],
+                    values["main_norm_weight"],
+                )
+            )
+
+        specs = [
+            TensorSpec("target_hidden", [tokens, MAIN_IN], torch.bfloat16, init_value=hidden),
+            TensorSpec("main_proj_weight", [MAIN_IN, D], torch.bfloat16, init_value=weight),
+            TensorSpec("main_norm_weight", [D], torch.bfloat16, init_value=1.0),
+            TensorSpec("main_x", [tokens, D], torch.bfloat16),
+            ScalarSpec("num_tokens", torch.int32, tokens, compile_runtime=True),
+        ]
+        result = run(
+            fn=dspark_proj_test,
+            specs=specs,
+            golden_fn=golden,
+            config={"platform": args.platform, "device_id": args.device},
+            rtol=0.05,
+            atol=0.05,
+            compile_only=args.compile_only,
+        )
+        print(result)
+        if not result.passed:
+            raise SystemExit(1)
+
+    if args.mode in ("metadata", "all"):
+        import torch
+
+        from golden import TensorSpec, run
+
+        batch = 1
+        tokens = batch * DSPARK_QUERY_WIDTH
+        anchors = torch.tensor([7], dtype=torch.int64)
+        positions = torch.tensor([125], dtype=torch.int32)
+        tables = torch.tensor(
+            [[[4, 5]], [[14, 15]], [[24, 25]]],
+            dtype=torch.int32,
+        )
+
+        def golden(values):
+            expected = golden_query_metadata(
+                values["anchor_ids"],
+                values["first_query_positions"],
+                values["block_tables"],
+                DSPARK_NOISE_TOKEN_ID,
+            )
+            values["query_ids"].copy_(expected.token_ids.reshape(-1))
+            values["query_positions"].copy_(expected.positions.reshape(-1))
+            values["query_slots"].copy_(expected.query_slots.reshape(DSPARK_DRAFT_LAYERS, tokens))
+            values["window_indices"].copy_(
+                expected.window_indices.reshape(DSPARK_DRAFT_LAYERS, tokens, DSPARK_SWA_INDEX_WIDTH)
+            )
+            values["window_lens"].copy_(expected.window_lens)
+
+        specs = [
+            TensorSpec("anchor_ids", [batch], torch.int64, init_value=anchors),
+            TensorSpec("first_query_positions", [batch], torch.int32, init_value=positions),
+            TensorSpec("block_tables", [DSPARK_DRAFT_LAYERS, batch, 2], torch.int32, init_value=tables),
+            TensorSpec("query_ids", [tokens], torch.int64),
+            TensorSpec("query_positions", [tokens], torch.int32),
+            TensorSpec("query_slots", [DSPARK_DRAFT_LAYERS, tokens], torch.int64),
+            TensorSpec("window_indices", [DSPARK_DRAFT_LAYERS, tokens, DSPARK_SWA_INDEX_WIDTH], torch.int32),
+            TensorSpec("window_lens", [DSPARK_DRAFT_LAYERS, batch], torch.int32),
+        ]
+        result = run(
+            fn=dspark_metadata_test,
+            specs=specs,
+            golden_fn=golden,
+            config={"platform": args.platform, "device_id": args.device},
+            compile_only=args.compile_only,
+        )
+        print(result)
+        if not result.passed:
+            raise SystemExit(1)

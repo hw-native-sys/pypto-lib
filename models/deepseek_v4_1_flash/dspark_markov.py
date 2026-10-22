@@ -451,13 +451,14 @@ def l3_markov_sample_from_hidden(
         )
 
 
-def run_markov_case(
-    *,
-    platform: str = "a5sim",
-    device_id: int = 0,
-    compile_only: bool = False,
-):
-    """Validate the complete five-token Markov recurrence."""
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="V4.1 DSpark Markov validation")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
     from golden import TensorSpec, run
 
     previous = torch.tensor([7], dtype=torch.int64)
@@ -499,30 +500,15 @@ def run_markov_case(
         TensorSpec("draft_ids", [1, DSPARK_QUERY_WIDTH], torch.int32),
         TensorSpec("confidences", [1, DSPARK_QUERY_WIDTH], torch.float32),
     ]
-    return run(
+    result = run(
         fn=markov_sample,
         specs=specs,
         golden_fn=golden,
         compare_fn={"draft_ids": exact_ids},
-        config={"platform": platform, "device_id": device_id},
-        compile_only=compile_only,
+        config={"platform": args.platform, "device_id": args.device},
+        compile_only=args.compile_only,
         rtol=1e-3,
         atol=1e-3,
-    )
-
-
-if __name__ == "__" + "main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="V4.1 DSpark Markov validation")
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
-    result = run_markov_case(
-        platform=args.platform,
-        device_id=args.device,
-        compile_only=args.compile_only,
     )
     print(result)
     if not result.passed:

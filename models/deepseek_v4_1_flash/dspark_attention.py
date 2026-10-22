@@ -220,8 +220,14 @@ def make_attention_inputs(seed: int = 43):
     return values
 
 
-def run_attention_case(*, platform: str = "a5sim", device_id: int = 0, compile_only: bool = False):
-    """Validate non-causal five-row SWA and its mapped MXFP8 cache writes."""
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="V4.1 DSpark non-causal SWA validation")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
     import torch
 
     from golden import ScalarSpec, TensorSpec, ratio_allclose, run
@@ -244,7 +250,7 @@ def run_attention_case(*, platform: str = "a5sim", device_id: int = 0, compile_o
         TensorSpec("output", [DSPARK_QUERY_WIDTH, D], torch.float32),
         ScalarSpec("num_tokens", torch.int32, DSPARK_QUERY_WIDTH, compile_runtime=True),
     ]
-    return run(
+    result = run(
         fn=dspark_attention_test,
         specs=specs,
         golden_fn=golden,
@@ -252,20 +258,9 @@ def run_attention_case(*, platform: str = "a5sim", device_id: int = 0, compile_o
             "window_cache": compare_payload,
             "output": ratio_allclose(atol=0.03, rtol=0.03, max_error_ratio=0.0),
         },
-        config={"platform": platform, "device_id": device_id},
-        compile_only=compile_only,
+        config={"platform": args.platform, "device_id": args.device},
+        compile_only=args.compile_only,
     )
-
-
-if __name__ == "__" + "main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="V4.1 DSpark non-causal SWA validation")
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--compile-only", action="store_true")
-    args = parser.parse_args()
-    result = run_attention_case(platform=args.platform, device_id=args.device, compile_only=args.compile_only)
     print(result)
     if not result.passed:
         raise SystemExit(1)

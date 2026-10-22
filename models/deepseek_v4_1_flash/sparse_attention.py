@@ -7,7 +7,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """PyPTO sparse MLA with packed-cache dequantization and sink-aware Cube attention."""
-# ci: no-sim
 
 from collections.abc import Callable
 import math
