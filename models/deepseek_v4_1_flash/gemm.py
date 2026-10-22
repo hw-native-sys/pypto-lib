@@ -43,6 +43,7 @@ def gemm_mxfp8_to_bf16(
     scale_row: pl.Scalar[pl.INDEX],
     payload_row: pl.Scalar[pl.INDEX],
     m_tile: pl.constexpr,
+    max_workers: pl.constexpr = 2147483647,
 ):
     """Project one prequantized row tile into BF16 output."""
     scale_slice = activation_scale_backing[scale_row:scale_row + 1, :]
@@ -54,7 +55,7 @@ def gemm_mxfp8_to_bf16(
     scale_group_backing = scale_backing_flat[0:1, scale_group_offset:scale_group_end]
     scale_group = pl.tensor.view(scale_group_backing, [width // 32, output_width], layout=pl.MX_B_NN)
     available_clusters = pl.system.available_cluster_count()
-    workers = pl.min(output_width // n_tile, available_clusters)
+    workers = pl.min(pl.min(output_width // n_tile, max_workers), available_clusters)
     for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
         block_num = pl.tile.get_block_num()
         for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
@@ -179,6 +180,7 @@ def gemm_bf16_via_mxfp8_to_bf16_staged(
     n_tile: pl.constexpr,
     k_tile: pl.constexpr,
     group_count: pl.constexpr = 1,
+    max_workers: pl.constexpr = 2147483647,
 ):
     """Quantize activation tiles once, then run separate MX projection tasks."""
     weight_flat = pl.reshape(weight, [group_count * width, output_width])
@@ -205,7 +207,7 @@ def gemm_bf16_via_mxfp8_to_bf16_staged(
             output = gemm_mxfp8_to_bf16(
                 payload, scale_backing, weight_flat, scale, output, num_tokens,
                 t0, group * width, group * output_width,
-                width, output_width, name_hint, n_tile, k_tile,  group_count, 0, 0, MX_M_TILE,
+                width, output_width, name_hint, n_tile, k_tile,  group_count, 0, 0, MX_M_TILE, max_workers,
             )
     return output
 

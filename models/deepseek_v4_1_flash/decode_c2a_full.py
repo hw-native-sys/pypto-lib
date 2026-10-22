@@ -138,7 +138,7 @@ def decode_c2a_full(
         wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
         qr, query, kv_projection, window_kv, num_tokens,
         max_workers=64 if TP_SIZE == 1 else 2147483647,
-        fuse_qnorm=False, q_b_n_tile=128,
+        fuse_qnorm=False, q_b_n_tile=128, q_b_max_workers=2147483647,
     )
     publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
 

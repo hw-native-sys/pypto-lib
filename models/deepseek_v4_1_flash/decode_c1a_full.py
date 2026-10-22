@@ -84,6 +84,11 @@ INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
 
 
+# tiling
+Q_B_WORKERS = 24 if TP_SIZE == 1 else 2147483647
+INDEX_QUERY_WORKERS = 8 if TP_SIZE == 1 else 2147483647
+
+
 # Validation.
 OUTPUT_ATOL = 1e-2
 OUTPUT_RTOL = 1e-2
@@ -165,7 +170,7 @@ def decode_c1a_full(
         x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
         qr, query, kv_projection, kv, num_tokens, max_workers=32,
-        fuse_qnorm=False, q_b_n_tile=128,
+        fuse_qnorm=False, q_b_n_tile=128, q_b_max_workers=Q_B_WORKERS,
     )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -202,7 +207,8 @@ def decode_c1a_full(
     private_query = pl.create_tensor([16, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
     (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
         x_norm, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
-        num_tokens, score_width, x_ready, private_query, private_route, pretransposed=True,
+        num_tokens, score_width, x_ready, private_query, private_route,
+        pretransposed=True, query_max_workers=INDEX_QUERY_WORKERS,
     )
     scores_tid = score_full_pretransposed(
         index_query, index_query_scale, index_weights,

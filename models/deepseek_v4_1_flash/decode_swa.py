@@ -117,7 +117,7 @@ def decode_swa(
         x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
         qr, q, kv_projection, kv, num_tokens, max_workers=Q_ROPE_WORKER_TILE,
-        fuse_qnorm=True, q_b_n_tile=256,
+        fuse_qnorm=True, q_b_n_tile=256, q_b_max_workers=2147483647,
     )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)

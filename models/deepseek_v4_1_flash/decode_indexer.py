@@ -2094,13 +2094,14 @@ def c1a_index(
     private_query: pl.Tensor,
     private_route: pl.Scalar[pl.INT32],
     pretransposed: pl.constexpr,
+    query_max_workers: pl.constexpr = 2147483647,
 ):
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
     gemm_bf16_via_mxfp8_to_bf16_staged(
         qr, index_wq_b, index_wq_b_scale, projected, num_tokens,
         Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", "quant_idx_q",
-        INDEX_PROJ_N_TILE, INDEX_PROJ_K_TILE, 1,
+        INDEX_PROJ_N_TILE, INDEX_PROJ_K_TILE, 1, query_max_workers,
     )
     rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
     rotated_tid = rotate_index_query(projected, cos, sin, rotated, num_tokens, entry_ready)
@@ -2474,7 +2475,7 @@ def decode_c2a_indexer(
         index_wq_b, index_wq_b_scale, index_weights_proj,
         rope_cos, rope_sin,
         num_tokens, score_width,
-        cache_ready, index_wq_b, 0, pretransposed=False,
+        cache_ready, index_wq_b, 0, pretransposed=False, query_max_workers=2147483647,
     )
     return _score_select_c2a_groups(
         query, query_scale, raw_weights, index_cache, index_cache_scale,

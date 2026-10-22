@@ -117,7 +117,7 @@ def q_proj_qr(
     projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     gemm_bf16_via_mxfp8_to_bf16_staged(
         x, wq_a, wq_a_scale, projected, num_tokens,
-        D, Q_LORA, "proj_q_a", "quant_q_a", Q_A_N_TILE, Q_A_K_TILE, 1,
+        D, Q_LORA, "proj_q_a", "quant_q_a", Q_A_N_TILE, Q_A_K_TILE, 1, 2147483647,
     )
     _q_normalize(projected, q_norm_weight, query_latent, num_tokens)
     return query_latent
@@ -134,12 +134,14 @@ def _q_proj_rope_from_mx(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     q_b_n_tile: pl.constexpr,
+    max_workers: pl.constexpr = 2147483647,
 ):
     """Project a prequantized query latent and apply trailing RoPE."""
     activation_scale = pl.tensor.view(scale_backing, [MX_M_TILE, Q_LORA // 32], layout=pl.MX_A_ZZ)
     weight_scale_bytes = pl.tensor.view(wq_b_scale, [1, Q_LORA // 32 * LOCAL_H * HEAD_DIM], layout=pl.ND)
     weight_scale = pl.tensor.view(weight_scale_bytes, [Q_LORA // 32, LOCAL_H * HEAD_DIM], layout=pl.MX_B_NN)
-    workers = pl.min(LOCAL_H * HEAD_DIM // q_b_n_tile, pl.system.available_cluster_count())
+    workers = pl.min(LOCAL_H * HEAD_DIM // q_b_n_tile, max_workers)
+    workers = pl.min(workers, pl.system.available_cluster_count())
     for worker in pl.spmd(workers, name_hint='attention_q_b_rope', sync_start=True):
         block_num = pl.tile.get_block_num()
         for wave in pl.range((LOCAL_H * HEAD_DIM // q_b_n_tile + block_num - 1) // block_num):
@@ -208,14 +210,14 @@ def q_proj_rope(
         )
         _q_proj_rope_from_mx(
             payload, scale_backing, wq_b, wq_b_scale, rope_cos, rope_sin,
-            query, num_tokens, N_TILE,
+            query, num_tokens, N_TILE, 2147483647,
         )
     else:
         tokens = pl.tensor.dim(query_latent, 0)
         expanded = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         gemm_bf16_via_mxfp8_to_bf16_staged(
             query_latent, wq_b, wq_b_scale, expanded, num_tokens,
-            Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", "quant_q_b", N_TILE, K_TILE, 1,
+            Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", "quant_q_b", N_TILE, K_TILE, 1, 2147483647,
         )
         rope(expanded, rope_cos, rope_sin, query, num_tokens, LOCAL_H, "rope_q", max_workers)
 
@@ -255,7 +257,7 @@ def kv_proj_rope(
     gemm_bf16_via_mxfp8_to_bf16_staged(
         x, wkv, wkv_scale, projected,
         num_tokens,
-        D, HEAD_DIM, "proj_kv", "quant_kv", N_TILE, K_TILE, 1,
+        D, HEAD_DIM, "proj_kv", "quant_kv", N_TILE, K_TILE, 1, 2147483647,
     )
     _kv_normalize_rope(projected, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens)
     return window_kv
@@ -362,6 +364,7 @@ def qkv_proj_rope(
     max_workers: pl.constexpr = 2147483647,
     fuse_qnorm: pl.constexpr = True,
     q_b_n_tile: pl.constexpr = N_TILE,
+    q_b_max_workers: pl.constexpr = 2147483647,
 ):
     """Project Q and KV with one shared small-row input quantization."""
     if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= MX_M_TILE:
@@ -375,7 +378,7 @@ def qkv_proj_rope(
         gemm_mxfp8_to_bf16(
             payload, scale_backing, wq_a, wq_a_scale, projected,
             num_tokens, 0, 0, 0,
-            D, Q_LORA, "proj_q_a", Q_A_N_TILE, Q_A_K_TILE, 1, 0, 0, MX_M_TILE,
+            D, Q_LORA, "proj_q_a", Q_A_N_TILE, Q_A_K_TILE, 1, 0, 0, MX_M_TILE, 2147483647,
         )
         if fuse_qnorm:
             qb_payload = pl.create_tensor([MX_M_TILE, Q_LORA], dtype=pl.FP8E4M3FN)
@@ -383,7 +386,7 @@ def qkv_proj_rope(
             _q_normalize_to_mx(projected, q_norm_weight, query_latent, qb_payload, qb_scales, num_tokens, 5)
             _q_proj_rope_from_mx(
                 qb_payload, qb_scales, wq_b, wq_b_scale, rope_cos, rope_sin,
-                query, num_tokens, q_b_n_tile,
+                query, num_tokens, q_b_n_tile, q_b_max_workers,
             )
         else:
             _q_normalize(projected, q_norm_weight, query_latent, num_tokens)
@@ -394,12 +397,12 @@ def qkv_proj_rope(
             )
             _q_proj_rope_from_mx(
                 qb_payload, qb_scales, wq_b, wq_b_scale, rope_cos, rope_sin,
-                query, num_tokens, q_b_n_tile,
+                query, num_tokens, q_b_n_tile, q_b_max_workers,
             )
         gemm_mxfp8_to_bf16(
             payload, scale_backing, wkv, wkv_scale, kv_projection,
             num_tokens, 0, 0, 0,
-            D, HEAD_DIM, "proj_kv", N_TILE, K_TILE, 1, 0, 0, MX_M_TILE,
+            D, HEAD_DIM, "proj_kv", N_TILE, K_TILE, 1, 0, 0, MX_M_TILE, 2147483647,
         )
         _kv_normalize_rope(kv_projection, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens)
     else:
