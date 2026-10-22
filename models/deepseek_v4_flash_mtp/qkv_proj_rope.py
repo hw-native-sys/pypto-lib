@@ -1396,6 +1396,7 @@ def build_tensor_specs(B, S):
 
 if __name__ == "__main__":
     import argparse
+    import torch
     from golden import ratio_allclose, run
 
     MODES = { "decode":  (DECODE_BATCH, DECODE_SEQ), "prefill": (PREFILL_BATCH, PREFILL_SEQ), }
@@ -1404,6 +1405,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for each validation mode.")
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
                         help="Use decode or prefill batch sizes, or 'all' to test both.")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -1416,6 +1418,7 @@ if __name__ == "__main__":
     modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
 
     for mode_name in modes_to_run:
+        torch.manual_seed(args.seed)
         B, S = MODES[mode_name]
         print(f"--- qkv_proj_rope {mode_name}: B={B}, S={S} ---")
         result = run(
