@@ -214,9 +214,9 @@ def mla_prolog(
                 w_tile = w_q_b[n0 : n0 + QB_N_TILE, k0 : k0 + QB_K_TILE]
                 acc = pl.matmul_acc(acc, q_tile, w_tile, b_trans=True, init_cond=(kb == 0))
             query_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            query_flat = pl.assemble(
-                query_flat, pl.set_validshape(query_bf16, valid_rows, QB_N_TILE), [t0, n0]
-            )
+            # Write the GM view in place, without a loop-carried tensor alias.
+            query_valid = pl.set_validshape(query_bf16, valid_rows, QB_N_TILE)
+            pl.assemble(query_flat, query_valid, [t0, n0])
 
     kv_a_fp32 = pl.create_tensor([t_mm, KV_LORA], dtype=pl.FP32)
     for kv_idx in pl.spmd(KV_LORA // KVA_N_TILE, name_hint="mla_kv_a_proj"):
@@ -461,11 +461,9 @@ def absorb_query(
                 )
                 acc = pl.matmul_acc(acc, q_tile, w_tile, init_cond=(kb == 0))
             absorbed_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            absorbed_flat = pl.assemble(
-                absorbed_flat,
-                pl.set_validshape(absorbed_bf16, valid_rows, ABSORB_N_TILE),
-                [t0, head * KV_LORA + n0],
-            )
+            # Write the GM view in place, without a loop-carried tensor alias.
+            absorbed_valid = pl.set_validshape(absorbed_bf16, valid_rows, ABSORB_N_TILE)
+            pl.assemble(absorbed_flat, absorbed_valid, [t0, head * KV_LORA + n0])
     return absorbed
 
 

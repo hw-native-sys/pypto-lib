@@ -66,13 +66,12 @@ NEG_INF = -1.0e20       # finite floor; a true -inf would make an all-masked row
 ATTN_K_TILE = 128       # selected rows per sparse block
 NUM_QK_CORES = 24       # qk_pv dispatch lanes = a2a3 AIC count
 H_TILE = min(LOCAL_H, 16)
-if H_TILE != LOCAL_H:
-    raise ValueError(f"sparse MLA attention needs TP >= 4 (LOCAL_H={LOCAL_H} > 16 heads per tile)")
+HEAD_BLOCKS = (LOCAL_H + H_TILE - 1) // H_TILE
 H_PAD = ((H_TILE + 15) // 16) * 16
 SPARSE_BLOCKS = (TOPK_INDEX_WIDTH + ATTN_K_TILE - 1) // ATTN_K_TILE
 
 
-def golden_decode_sparse_attn(
+def _golden_decode_sparse_attn_math(
     absorbed_query: torch.Tensor,
     latent_cache: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -116,16 +115,17 @@ def golden_decode_sparse_attn(
     return torch.einsum("thw,twk->thk", weights, latent).to(absorbed_query.dtype)
 
 
-def _golden_decode_sparse_attn_impl(
+def golden_decode_sparse_attn(
     absorbed_query: torch.Tensor,
     latent_cache: torch.Tensor,
     topk_indices: torch.Tensor,
     block_table: torch.Tensor,
     request_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Emulate blockwise FP32 statistics and BF16 exponential PV operands.
+    """Use FP32 block statistics and BF16 exponential operands for PV.
 
-    The mathematical reference remains :func:`golden_decode_sparse_attn`.
+    The BF16 cast precedes each block's PV product; the denominator keeps the
+    FP32 exponentials. The FP32 mathematical reference is a separate diagnostic.
     """
     output = torch.zeros_like(absorbed_query)
     query_fp32 = absorbed_query.float()
@@ -206,39 +206,41 @@ def decode_sparse_attn(
     several decode rows behind one gather is not the answer, since each row carries its
     own index list.
 
+    Block statistics use in-place ``pl.assemble`` writes with discarded return
+    values, so the per-core loop carries no GM tensor aliases.
+
     Returns the attention output so the caller can chain it.
     """
     t_dim = pl.tensor.dim(absorbed_query, 0)
     q_flat = pl.reshape(absorbed_query, [t_dim * LOCAL_H, KV_LORA])
     out_flat = pl.reshape(output, [t_dim * LOCAL_H, KV_LORA])
 
-    blk_mi = pl.create_tensor([t_dim * SPARSE_BLOCKS * H_PAD, 1], dtype=pl.FP32)
-    blk_li = pl.create_tensor([t_dim * SPARSE_BLOCKS * H_PAD, 1], dtype=pl.FP32)
-    blk_oi = pl.create_tensor([t_dim * SPARSE_BLOCKS * H_PAD, KV_LORA], dtype=pl.FP32)
+    blk_mi = pl.create_tensor([t_dim * HEAD_BLOCKS * SPARSE_BLOCKS * H_PAD, 1], dtype=pl.FP32)
+    blk_li = pl.create_tensor([t_dim * HEAD_BLOCKS * SPARSE_BLOCKS * H_PAD, 1], dtype=pl.FP32)
+    blk_oi = pl.create_tensor([t_dim * HEAD_BLOCKS * SPARSE_BLOCKS * H_PAD, KV_LORA], dtype=pl.FP32)
     with pl.spmd(NUM_QK_CORES, name_hint="mla_decode_qk_pv") as qk_tid:
         lane = pl.tile.get_block_idx()
-        items = t_dim * SPARSE_BLOCKS
+        items = t_dim * HEAD_BLOCKS * SPARSE_BLOCKS
         for it in pl.range((items - lane + NUM_QK_CORES - 1) // NUM_QK_CORES):
             item = lane + it * NUM_QK_CORES
-            token = item // SPARSE_BLOCKS
-            sb = item - token * SPARSE_BLOCKS
+            token = item // (HEAD_BLOCKS * SPARSE_BLOCKS)
+            head = (item // SPARSE_BLOCKS) % HEAD_BLOCKS
+            sb = item % SPARSE_BLOCKS
             w0 = sb * ATTN_K_TILE
             request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
-            blk_row = (token * SPARSE_BLOCKS + sb) * H_PAD
-            # Lane 0 is -1 only when the whole block is padding.
+            blk_row = ((token * HEAD_BLOCKS + head) * SPARSE_BLOCKS + sb) * H_PAD
+            # The first selection is -1 only when the whole block is padding.
             if pl.read(topk_indices, [token, w0]) < 0:
-                blk_mi[blk_row : blk_row + H_PAD, 0:1] = pl.reshape(
-                    pl.full([1, H_PAD], dtype=pl.FP32, value=NEG_INF), [H_PAD, 1]
-                )
-                blk_li[blk_row : blk_row + H_PAD, 0:1] = pl.reshape(
-                    pl.full([1, H_PAD], dtype=pl.FP32, value=0.0), [H_PAD, 1]
-                )
-                blk_oi[blk_row : blk_row + H_PAD, 0:KV_LORA] = pl.full(
-                    [H_PAD, KV_LORA], dtype=pl.FP32, value=0.0
-                )
+                for empty_aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    if empty_aiv_id == 0:
+                        empty_m = pl.reshape(pl.full([1, H_PAD], dtype=pl.FP32, value=NEG_INF), [H_PAD, 1])
+                        empty_l = pl.reshape(pl.full([1, H_PAD], dtype=pl.FP32, value=0.0), [H_PAD, 1])
+                        empty_o = pl.full([H_PAD, KV_LORA], dtype=pl.FP32, value=0.0)
+                        pl.assemble(blk_mi, empty_m, [blk_row, 0])
+                        pl.assemble(blk_li, empty_l, [blk_row, 0])
+                        pl.assemble(blk_oi, empty_o, [blk_row, 0])
             else:
                 kv_tile = pl.create_l1([ATTN_K_TILE, KV_LORA], pl.BF16)
-                bias_row = pl.full([1, ATTN_K_TILE], dtype=pl.FP32, value=NEG_INF)
                 for r in pl.range(ATTN_K_TILE):
                     if w0 + r < TOPK_INDEX_WIDTH:
                         position = pl.read(topk_indices, [token, w0 + r])
@@ -251,7 +253,6 @@ def decode_sparse_attn(
                             kv_tile = pl.gather_row(
                                 kv_tile, latent_cache, [r, 0], [source, 0], [1, KV_LORA]
                             )
-                            pl.write(bias_row, [0, r], 0.0)
                         else:
                             kv_tile = pl.gather_row(
                                 kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA]
@@ -259,29 +260,42 @@ def decode_sparse_attn(
                     else:
                         kv_tile = pl.gather_row(kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA])
 
-                q_tile = pl.fillpad(
-                    pl.slice(
-                        q_flat,
-                        [H_PAD, KV_LORA],
-                        [token * LOCAL_H, 0],
-                        valid_shape=[H_TILE, KV_LORA],
-                    ),
-                    pad_value=pl.PadValue.zero,
-                )
+                for q_aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    q0 = q_aiv_id * (H_PAD // 2)
+                    q_valid = pl.max(0, pl.min(H_PAD // 2, H_TILE - q0))
+                    q_start = token * LOCAL_H + head * H_TILE + q0
+                    q_part = pl.slice(q_flat, [H_PAD // 2, KV_LORA], [q_start, 0],
+                                      valid_shape=[q_valid, KV_LORA])
+                    q_padded = pl.fillpad(q_part, pad_value=pl.PadValue.zero)
+                    q_tile = pl.aic_gather(q_padded)
                 raw = pl.matmul(q_tile, kv_tile, b_trans=True, out_dtype=pl.FP32)
-                scores = pl.col_expand_add(pl.mul(raw, SOFTMAX_SCALE), bias_row)
-                mi = pl.row_max(scores)
-                weights = pl.exp(pl.row_expand_sub(scores, mi))
-                li = pl.row_sum(weights)
-                weights_bf16 = pl.cast(weights, target_type=pl.BF16, mode="rint")
-                oi = pl.matmul(weights_bf16, kv_tile, out_dtype=pl.FP32)
-                blk_mi[blk_row : blk_row + H_PAD, 0:1] = mi
-                blk_li[blk_row : blk_row + H_PAD, 0:1] = li
-                blk_oi[blk_row : blk_row + H_PAD, 0:KV_LORA] = oi
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    raw_part = pl.aiv_shard(raw)
+                    bias_row = pl.full([1, ATTN_K_TILE], dtype=pl.FP32, value=NEG_INF)
+                    for r in pl.range(ATTN_K_TILE):
+                        if w0 + r < TOPK_INDEX_WIDTH:
+                            if pl.read(topk_indices, [token, w0 + r]) >= 0:
+                                pl.write(bias_row, [0, r], 0.0)
+                    scores = pl.col_expand_add(pl.mul(raw_part, SOFTMAX_SCALE), bias_row)
+                    mi = pl.row_max(scores)
+                    weights = pl.exp(pl.row_expand_sub(scores, mi))
+                    li = pl.row_sum(weights)
+                    weights_bf16 = pl.cast(weights, target_type=pl.BF16, mode="rint")
+                    weights_mat = pl.aic_gather(weights_bf16)
+                    row0 = blk_row + aiv_id * (H_PAD // 2)
+                    pl.assemble(blk_mi, mi, [row0, 0])
+                    pl.assemble(blk_li, li, [row0, 0])
+                oi = pl.matmul(weights_mat, kv_tile, out_dtype=pl.FP32)
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    oi_part = pl.aiv_shard(oi)
+                    row0 = blk_row + aiv_id * (H_PAD // 2)
+                    pl.assemble(blk_oi, oi_part, [row0, 0])
 
-    with pl.spmd(t_dim, name_hint="mla_decode_merge", deps=[qk_tid]):
-        token = pl.tile.get_block_idx()
-        base = (token * SPARSE_BLOCKS) * H_PAD
+    with pl.spmd(t_dim * HEAD_BLOCKS, name_hint="mla_decode_merge", deps=[qk_tid]):
+        task = pl.tile.get_block_idx()
+        token = task // HEAD_BLOCKS
+        head = task % HEAD_BLOCKS
+        base = ((token * HEAD_BLOCKS + head) * SPARSE_BLOCKS) * H_PAD
         merged_mi = blk_mi[base : base + H_PAD, 0:1]
         merged_li = blk_li[base : base + H_PAD, 0:1]
         merged_oi = blk_oi[base : base + H_PAD, 0:KV_LORA]
@@ -303,11 +317,11 @@ def decode_sparse_attn(
         if pl.read(topk_indices, [token, 0]) >= 0:
             normalized = pl.row_expand_div(merged_oi, merged_li)
             out_bf16 = pl.cast(normalized, target_type=pl.BF16, mode="rint")
-            out_flat[token * LOCAL_H : token * LOCAL_H + H_TILE, 0:KV_LORA] = out_bf16[
+            out_flat[token * LOCAL_H + head * H_TILE : token * LOCAL_H + (head + 1) * H_TILE, 0:KV_LORA] = out_bf16[
                 0:H_TILE, 0:KV_LORA
             ]
         else:
-            out_flat[token * LOCAL_H : token * LOCAL_H + H_TILE, 0:KV_LORA] = pl.full(
+            out_flat[token * LOCAL_H + head * H_TILE : token * LOCAL_H + (head + 1) * H_TILE, 0:KV_LORA] = pl.full(
                 [H_TILE, KV_LORA], dtype=pl.BF16, value=0.0
             )
     return output
@@ -396,8 +410,8 @@ def build_decode_sparse_attn_specs(requests: int = 2, pages_per_request: int = 4
 
 
 def golden_decode_sparse_attn_case(tensors):
-    """Fill the implementation reference for :func:`build_decode_sparse_attn_specs`."""
-    tensors["output"][:] = _golden_decode_sparse_attn_impl(
+    """Fill the CPU reference for :func:`build_decode_sparse_attn_specs`."""
+    tensors["output"][:] = golden_decode_sparse_attn(
         tensors["absorbed_query"],
         tensors["latent_cache"],
         tensors["topk_indices"],
@@ -417,7 +431,7 @@ def main():
     from golden import ratio_allclose, run
     from models.glm5_3_flash._golden_smoke import run_decode_sparse_attn_golden
 
-    run_decode_sparse_attn_golden(golden_decode_sparse_attn, _golden_decode_sparse_attn_impl)
+    run_decode_sparse_attn_golden(_golden_decode_sparse_attn_math, golden_decode_sparse_attn)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")

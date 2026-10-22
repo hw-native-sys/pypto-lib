@@ -9,11 +9,11 @@
 """The kpool DSA indexer, decode path: one continuous-batch step, end to end.
 
 Decode runs the same per-query math as prefill, so the kernels live in
-:mod:`models.glm5_3_flash.prefill_indexer` and this file contributes the
+:mod:`models.glm5_3_flash.indexer` and this file contributes the
 composition: one dispatch of ``DECODE_ROWS_PER_REQUEST`` = 4 packed rows per
 request (one live token plus three MTP spec tokens) drives the whole pipeline,
 
-1. :func:`~models.glm5_3_flash.prefill_indexer.indexer_proj` projects the 4
+1. :func:`~models.glm5_3_flash.indexer.indexer_proj` projects the 4
    rows' queries, keys, head weights and gate scores;
 2. :func:`~models.glm5_3_flash.indexer_cache.indexer_cache_write` scatters the
    raw ``[key, gate]`` rows into the support table;
@@ -23,11 +23,11 @@ request (one live token plus three MTP spec tokens) drives the whole pipeline,
    table grows by exactly one row per request per step and the incomplete tail
    pool is never stored (``index_kpool_always_select_tail`` force-selects its
    raw positions in the expansion);
-4. :func:`~models.glm5_3_flash.prefill_indexer.indexer_score` scores the
+4. :func:`~models.glm5_3_flash.indexer.indexer_score` scores the
    queries against the pooled table, this time including the just-closed row;
-5. :func:`~models.glm5_3_flash.prefill_indexer.indexer_topk` selects the top
+5. :func:`~models.glm5_3_flash.indexer.indexer_topk` selects the top
    512 pools per query row;
-6. :func:`~models.glm5_3_flash.prefill_indexer.indexer_expand` emits the
+6. :func:`~models.glm5_3_flash.indexer.indexer_expand` emits the
    front-packed 2051-wide index list both sparse attention kernels consume.
 
 The four rows of one request share nothing below the selection:
@@ -40,8 +40,8 @@ expands independently.
 Everything the composition needs beyond the tensors is host-lowered metadata —
 physical cache rows and segment offsets per :mod:`models.glm5_3_flash.metadata`
 — the same way the standalone kernel tests consume it. The projection stage
-needs a token count that is a multiple of 64 (``PROJ_T_TILE``), which a decode
-batch reaches by padding to whole 16-request groups (4 rows per request);
+needs a token count that is a multiple of 16 (``PROJ_T_TILE``), which a decode
+batch reaches by padding to whole 4-request groups (4 rows per request);
 padded rows carry ordinary metadata and simply compute selections nobody
 gathers.
 """
@@ -64,12 +64,12 @@ from models.glm5_3_flash.decode_sparse_attn import golden_decode_sparse_attn_cas
 from models.glm5_3_flash.indexer_cache import POOL_SCALE_WIDTH
 from models.glm5_3_flash.indexer_cache import POOL_VALID_WIDTH
 from models.glm5_3_flash.indexer_cache import indexer_cache_write, indexer_pool_write
-from models.glm5_3_flash.prefill_indexer import LEAF
-from models.glm5_3_flash.prefill_indexer import golden_indexer_expand, golden_indexer_proj
-from models.glm5_3_flash.prefill_indexer import golden_indexer_score, golden_indexer_topk
-from models.glm5_3_flash.prefill_indexer import indexer_expand, indexer_proj
-from models.glm5_3_flash.prefill_indexer import indexer_score_token, indexer_topk
-from models.glm5_3_flash.prefill_indexer import sylvester_hadamard
+from models.glm5_3_flash.indexer import LEAF
+from models.glm5_3_flash.indexer import golden_indexer_expand, golden_indexer_proj
+from models.glm5_3_flash.indexer import golden_indexer_score, golden_indexer_topk
+from models.glm5_3_flash.indexer import indexer_expand, indexer_proj
+from models.glm5_3_flash.indexer import indexer_score_token, indexer_topk
+from models.glm5_3_flash.indexer_cache import sylvester_hadamard
 from models.glm5_3_flash.indexer_cache import golden_indexer_cache_write, golden_indexer_pool_write
 from models.glm5_3_flash.quantization import quantize_per_token_int8
 

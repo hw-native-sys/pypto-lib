@@ -305,26 +305,33 @@ def indexer_pool_write(
         # INT8 dot product computes (qH)·(kH) = q·k — the reference score. The
         # BF16 round mirrors the query side's BF16 ABI (and the donor's
         # rotate-then-quantize chain).
-        staged_rot = pl.matmul(pl.cast(staged, pl.BF16, mode="rint"), hadamard, out_dtype=pl.FP32)
-        staged_abs = pl.maximum(staged_rot, pl.neg(staged_rot))
-        amax = pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        amax = pl.maximum(amax, pl.reshape(pl.row_max(staged_abs), [1, POOL_QUANT_TILE]))
-        scale_quant_row = pl.div(pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), amax)
-        staged_scaled = pl.row_expand_mul(staged_rot, pl.reshape(scale_quant_row, [POOL_QUANT_TILE, 1]))
-        staged_i32 = pl.cast(staged_scaled, target_type=pl.INT32, mode="rint")
-        staged_half = pl.cast(staged_i32, target_type=pl.FP16, mode="round")
-        staged_i8 = pl.cast(staged_half, target_type=pl.INT8, mode="trunc")
-        scale_dq_col = pl.reshape(pl.recip(scale_quant_row), [POOL_QUANT_TILE, 1])
-        scale_pad = pl.row_expand_mul(
-            pl.full([POOL_QUANT_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32, value=1.0), scale_dq_col
-        )
-        for e in pl.range(POOL_QUANT_TILE):
-            ei = pl.cast(e, pl.INT32)
-            if e0 + ei < events:
-                ei_idx = pl.cast(ei, pl.INDEX)
-                dest = pl.cast(pl.read(pool_slots, [e0 + ei]), pl.INDEX)
-                pool_cache[dest : dest + 1, :] = staged_i8[ei_idx : ei_idx + 1, :]
-                pool_scale[dest : dest + 1, :] = scale_pad[ei_idx : ei_idx + 1, :]
+        # Both lanes transport the same BF16 input; only lane 0 quantizes and stores.
+        for _ in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            staged_bf16 = pl.cast(staged, pl.BF16, mode="rint")
+            staged_mat = pl.aic_gather(staged_bf16)
+        staged_rot = pl.matmul(staged_mat, hadamard, out_dtype=pl.FP32)
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            rotated = pl.aiv_shard(staged_rot)
+            if aiv_id == 0:
+                staged_abs = pl.maximum(rotated, pl.neg(rotated))
+                amax = pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                amax = pl.maximum(amax, pl.reshape(pl.row_max(staged_abs), [1, POOL_QUANT_TILE]))
+                scale_quant_row = pl.div(pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), amax)
+                staged_scaled = pl.row_expand_mul(rotated, pl.reshape(scale_quant_row, [POOL_QUANT_TILE, 1]))
+                staged_i32 = pl.cast(staged_scaled, target_type=pl.INT32, mode="rint")
+                staged_half = pl.cast(staged_i32, target_type=pl.FP16, mode="round")
+                staged_i8 = pl.cast(staged_half, target_type=pl.INT8, mode="trunc")
+                scale_dq_col = pl.reshape(pl.recip(scale_quant_row), [POOL_QUANT_TILE, 1])
+                scale_pad = pl.row_expand_mul(
+                    pl.full([POOL_QUANT_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32, value=1.0), scale_dq_col
+                )
+                for e in pl.range(POOL_QUANT_TILE):
+                    ei = pl.cast(e, pl.INT32)
+                    if e0 + ei < events:
+                        ei_idx = pl.cast(ei, pl.INDEX)
+                        dest = pl.cast(pl.read(pool_slots, [e0 + ei]), pl.INDEX)
+                        pool_cache[dest : dest + 1, :] = staged_i8[ei_idx : ei_idx + 1, :]
+                        pool_scale[dest : dest + 1, :] = scale_pad[ei_idx : ei_idx + 1, :]
     return pool_tid
 
 
