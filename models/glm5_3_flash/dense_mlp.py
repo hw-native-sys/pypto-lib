@@ -15,7 +15,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import FLASH, T_DYN, TP_SIZE, D
-from models.glm5_3_flash.golden import _sigmoid_fp32_reference, expert
+from models.glm5_3_flash.golden import expert
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
 from models.glm5_3_flash.linear import bf16_linear
 
@@ -283,7 +283,7 @@ def golden_dense_mlp_fn(tensors):
     if SWIGLU_LIMIT > 0:
         gate_v = gate_v.clamp(max=SWIGLU_LIMIT)
         up_v = up_v.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-    sigmoid = _sigmoid_fp32_reference(gate_v)
+    sigmoid = torch.reciprocal(1.0 + torch.exp(-gate_v.float()))
     h = (gate_v * sigmoid) * up_v
     h_i8, h_sd = quantize_per_token_int8(h)
     out_i = h_i8.to(torch.int32) @ w_down_i8.T

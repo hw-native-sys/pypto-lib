@@ -48,7 +48,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import KDA_DIM, KDA_STATE_DYN, LOCAL_KDA_H, T_DYN
-from models.glm5_3_flash.golden import _exp_fp32_reference, _sum_fp32_reference, l2norm
+from models.glm5_3_flash.golden import l2norm
 from models.glm5_3_flash.kda_projection import BETA_PAD
 
 L2_EPS = 1e-6
@@ -84,12 +84,12 @@ def golden_decode_kda(
             v = value[t, h].float()  # [V]
             g = decay[t, h].float()  # [K]
             b = float(beta[t, h])
-            s = state[row, h] * _exp_fp32_reference(g).unsqueeze(0)  # [V, K]
-            kv_mem = _sum_fp32_reference(s * k.unsqueeze(0), keepdim=False)  # [V]
+            s = state[row, h] * torch.exp(g.float()).unsqueeze(0)  # [V, K]
+            kv_mem = (s * k.unsqueeze(0)).sum(dim=-1)  # [V]
             delta = (v - kv_mem) * b  # [V]
             s = s + delta.unsqueeze(-1) * k.unsqueeze(0)
             state[row, h] = s
-            out[t, h] = _sum_fp32_reference(s * q.unsqueeze(0), keepdim=False)
+            out[t, h] = (s * q.unsqueeze(0)).sum(dim=-1)
     return out.to(query.dtype), state.to(recurrent_state.dtype)
 
 

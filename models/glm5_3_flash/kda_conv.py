@@ -65,7 +65,6 @@ from models.glm5_3_flash.config import (
     Q_START_DYN,
     T_DYN,
 )
-from models.glm5_3_flash.golden import _silu_fp32_reference
 
 CONV_DIM = 3 * LOCAL_KDA_QKV_DIM
 STATE_LEN = KDA_CONV_K - 1
@@ -88,7 +87,8 @@ def _conv_reference(
     out = torch.zeros(length, stream.shape[1], dtype=torch.float32)
     for j in range(KDA_CONV_K):
         out += full[j : j + length] * weight[j].float()
-    return _silu_fp32_reference(out), full[length : length + STATE_LEN]
+    activated = out.float() * torch.reciprocal(1.0 + torch.exp(-out.float()))
+    return activated, full[length : length + STATE_LEN]
 
 
 def golden_kda_conv_prefill(

@@ -54,7 +54,6 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import KDA_DIM, KDA_GATE_LOWER_BOUND, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, T_DYN, D
-from models.glm5_3_flash.golden import _exp_fp32_reference, _linear_fp32_reference, _sigmoid_fp32_reference
 from models.glm5_3_flash.linear import bf16_linear
 
 # tiling
@@ -86,8 +85,8 @@ def golden_kda_projection(
     xf = x.float()
 
     def linear_bf16(inp: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        # Accurately rounded FP32 dot products, then BF16 output.
-        return _linear_fp32_reference(inp, weight).to(torch.bfloat16)
+        # FP32 dot products followed by the BF16 projection boundary.
+        return (inp.float() @ weight.float().t()).to(torch.bfloat16)
 
     q = linear_bf16(x, w_q)
     k = linear_bf16(x, w_k)
@@ -96,16 +95,15 @@ def golden_kda_projection(
 
     f_a = linear_bf16(x, w_f_a)
     g_raw = linear_bf16(f_a, w_f_b).float().view(tokens, LOCAL_KDA_H, KDA_DIM)
-    decay_rate = _exp_fp32_reference(a_log.float()).view(1, LOCAL_KDA_H, 1)
-    decay = KDA_GATE_LOWER_BOUND * _sigmoid_fp32_reference(
-        decay_rate * (g_raw + dt_bias.float().view(1, LOCAL_KDA_H, KDA_DIM))
-    )
+    decay_rate = torch.exp(a_log.float()).view(1, LOCAL_KDA_H, 1)
+    decay_logits = decay_rate * (g_raw + dt_bias.float().view(1, LOCAL_KDA_H, KDA_DIM))
+    decay = KDA_GATE_LOWER_BOUND * torch.reciprocal(1.0 + torch.exp(-decay_logits))
 
     # beta carries the cube's 16-column padding. The padded rows of b_proj are zero,
     # so their gate is sigmoid(0) = 0.5 rather than 0; the reference reproduces that
     # instead of leaving a mismatch the caller would have to know to ignore.
     beta = torch.full((tokens, BETA_PAD), 0.5, dtype=torch.float32)
-    beta[:, :LOCAL_KDA_H] = _sigmoid_fp32_reference(linear_bf16(x, w_b).float())
+    beta[:, :LOCAL_KDA_H] = torch.reciprocal(1.0 + torch.exp(-linear_bf16(x, w_b).float()))
 
     g_a = linear_bf16(x, w_g_a)
     out_gate = linear_bf16(g_a, w_g_b).view(tokens, LOCAL_KDA_H, KDA_DIM)

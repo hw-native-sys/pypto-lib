@@ -44,7 +44,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import FLASH, KDA_DIM, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, T_DYN, D
-from models.glm5_3_flash.golden import _linear_fp32_reference, rms_norm_gated
+from models.glm5_3_flash.golden import rms_norm_gated
 from models.glm5_3_flash.linear import bf16_linear
 
 EPS = FLASH.rms_norm_eps
@@ -66,7 +66,7 @@ def golden_kda_output(
     flattened = normalized.reshape(*normalized.shape[:-2], -1)
     # Match the BF16 local linear output before TP reduction. FP32 is only
     # the exchange dtype; it carries the widened BF16 result.
-    return _linear_fp32_reference(flattened, w_o).to(torch.bfloat16).float()
+    return (flattened.float() @ w_o.float().t()).to(torch.bfloat16).float()
 
 
 @pl.jit.inline

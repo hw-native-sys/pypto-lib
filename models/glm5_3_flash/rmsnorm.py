@@ -35,7 +35,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import FLASH, T_DYN, D
-from models.glm5_3_flash.golden import _rsqrt_fp32_reference, _sum_fp32_reference, rms_norm
+from models.glm5_3_flash.golden import rms_norm
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
 
 NORM_T_TILE = 8
@@ -55,7 +55,11 @@ def golden_rmsnorm_quant(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Emit BF16 RMSNorm and the FP32-source deferred-normalization INT8 view."""
     value = x.float()
-    inverse = _rsqrt_fp32_reference(_sum_fp32_reference(value.square()) / value.shape[-1] + EPS)
+    squares = value.square().split(NORM_REDUCE_TILE, dim=-1)
+    square_sum = squares[0].sum(dim=-1, keepdim=True)
+    for tile in squares[1:]:
+        square_sum = square_sum + tile.sum(dim=-1, keepdim=True)
+    inverse = torch.rsqrt(square_sum / value.shape[-1] + EPS)
     normalized = (value * inverse) * weight.float()
     quant_source = value * weight.float()
     quantized, _scale = quantize_per_token_int8(quant_source)

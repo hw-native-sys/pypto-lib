@@ -23,48 +23,55 @@ from models.glm5_3_flash.config import FLASH
 
 
 def _rsqrt_fp32_reference(value: torch.Tensor) -> torch.Tensor:
-    """Round an accurate reciprocal square root to FP32 for host references.
+    """Use the FP32 reciprocal square root consumed by the NPU kernels.
 
-    CPU torch.rsqrt(FP32) can differ by one ULP from the device high-precision
-    path. Keep the argument and result FP32; evaluate the unary operation in
-    FP64 so a host approximation does not flip a later BF16 rounding boundary.
-    This is an accuracy reference, not a bit-exact device approximation.
+    Evaluating this unary operation in FP64 can cross a BF16 rounding midpoint
+    even when the FP32 argument and all preceding reductions match the device.
+    The CPU and NPU instructions may still differ by a last FP32 bit.
     """
-    return torch.rsqrt(value.double()).float()
+    return torch.rsqrt(value.float())
 
 
-
-def _sum_fp32_reference(value: torch.Tensor, dim: int = -1, keepdim: bool = True) -> torch.Tensor:
-    """Evaluate an FP32 reduction accurately and round its result to FP32."""
-    return value.double().sum(dim=dim, keepdim=keepdim).float()
+def _sum_fp32_reference(
+    value: torch.Tensor, dim: int = -1, keepdim: bool = True, tile_size: int | None = None,
+) -> torch.Tensor:
+    """Match inter-tile FP32 accumulation; CPU and device may reduce within a tile differently."""
+    if tile_size is None:
+        return value.float().sum(dim=dim, keepdim=keepdim)
+    total = None
+    for tile in value.split(tile_size, dim=dim):
+        partial = tile.float().sum(dim=dim, keepdim=True)
+        total = partial if total is None else total + partial
+    return total if keepdim else total.squeeze(dim)
 
 
 def _exp_fp32_reference(value: torch.Tensor) -> torch.Tensor:
-    """Evaluate an exponential accurately at the original FP32 boundary."""
-    return torch.exp(value.double()).float()
+    """Evaluate the exponential in FP32."""
+    return torch.exp(value.float())
 
 
 def _sigmoid_fp32_reference(value: torch.Tensor) -> torch.Tensor:
-    """Evaluate a sigmoid accurately at the original FP32 boundary."""
-    return torch.sigmoid(value.double()).float()
+    """Evaluate the device sigmoid expression in FP32."""
+    return torch.reciprocal(1.0 + torch.exp(-value.float()))
 
 
 def _silu_fp32_reference(value: torch.Tensor) -> torch.Tensor:
-    """Evaluate SiLU accurately at the original FP32 boundary."""
-    wide = value.double()
-    return (wide * torch.sigmoid(wide)).float()
+    """Multiply the FP32 input by its FP32 sigmoid."""
+    value = value.float()
+    return value * _sigmoid_fp32_reference(value)
 
 
 def _linear_fp32_reference(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Evaluate BF16 dot products accurately and round their outputs to FP32."""
-    return (value.double() @ weight.double().t()).float()
+    """Accumulate the projection in FP32 before the caller applies its output cast."""
+    return value.float() @ weight.float().t()
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = FLASH.rms_norm_eps) -> torch.Tensor:
     """Apply RMSNorm in FP32 and restore the activation dtype."""
     dtype = x.dtype
     value = x.float()
-    value = value * _rsqrt_fp32_reference(_sum_fp32_reference(value.square()) / value.shape[-1] + eps)
+    square_sum = _sum_fp32_reference(value.square(), tile_size=128)
+    value = value * _rsqrt_fp32_reference(square_sum / value.shape[-1] + eps)
     return (value * weight.float()).to(dtype)
 
 
@@ -92,8 +99,9 @@ def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     Note the ``+ eps`` inside the square root rather than ``max(norm, eps)``; the
     reference is explicit that this differs from ``F.normalize``.
     """
-    inverse = _rsqrt_fp32_reference(_sum_fp32_reference(x.square()) + eps)
-    return (x * inverse).to(x.dtype)
+    value = x.float()
+    norm = torch.sqrt(_sum_fp32_reference(value.square()) + eps)
+    return (value / norm).to(x.dtype)
 
 
 def swiglu(gate_value: torch.Tensor, up_value: torch.Tensor) -> torch.Tensor:
@@ -162,16 +170,17 @@ def hc_mixes(
     base: torch.Tensor,
     iterations: int = FLASH.hc_sinkhorn_iters,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute FP32 mHC mixes with accurately evaluated dots, unaries and reductions."""
+    """Compute mHC mixes with FP32 projections, unaries and reductions."""
     flat = x.flatten(-2).float()
-    inv = torch.rsqrt((_sum_fp32_reference(flat.square()) / flat.shape[-1] + FLASH.rms_norm_eps).double()).float()
-    mixes = (flat.double() @ function.double().t()).float() * inv
+    square_sum = _sum_fp32_reference(flat.square(), tile_size=512)
+    inv = _rsqrt_fp32_reference(square_sum / flat.shape[-1] + FLASH.rms_norm_eps)
+    mixes = _linear_fp32_reference(flat, function) * inv
     hc = FLASH.hc_mult
     (p, q, r) = mixes.split((hc, hc, hc * hc), -1)
-    pre = torch.sigmoid((p * scale[0] + base[:hc]).double()).float() + FLASH.hc_eps
-    post = 2 * torch.sigmoid((q * scale[1] + base[hc:2 * hc]).double()).float()
+    pre = _sigmoid_fp32_reference(p * scale[0] + base[:hc]) + FLASH.hc_eps
+    post = 2 * _sigmoid_fp32_reference(q * scale[1] + base[hc:2 * hc])
     logits = r.unflatten(-1, (hc, hc)) * scale[2] + base[2 * hc:].unflatten(-1, (hc, hc))
-    exps = torch.exp((logits - logits.amax(-1, keepdim=True)).double()).float()
+    exps = _exp_fp32_reference(logits - logits.amax(-1, keepdim=True))
     residual = exps / _sum_fp32_reference(exps) + FLASH.hc_eps
     residual = residual / (_sum_fp32_reference(residual, -2) + FLASH.hc_eps)
     for _ in range(iterations - 1):
