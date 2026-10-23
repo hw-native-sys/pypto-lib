@@ -192,12 +192,12 @@ def decode_c1a_full(
         normalized_key, compressed_rope_cos, compressed_rope_sin, index_key, num_tokens, nk_tid,
     )
     index_ready = publish_index(
-        index_key, compressed_slots, index_cache, index_cache_scale, num_tokens, x_ready, ik_tid,
+        index_key, compressed_slots, index_cache, index_cache_scale, num_tokens, ik_tid, ik_tid,
     )
     rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     rc_tid = decode_c1a_compressor_rope(latent, compressed_rope_cos, compressed_rope_sin, rotated, num_tokens, nc_tid)
     compressed_ready = publish_compressed(
-        rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens, x_ready, rc_tid,
+        rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens, rc_tid, rc_tid,
     )
     # Logical index score capacity.
     score_width = pl.tensor.dim(index_block_table, 1) * 128
@@ -217,10 +217,10 @@ def decode_c1a_full(
         num_tokens, index_ready, query_tid, weights_tid, private_query, private_route,
     )
     topk_tid = select_index_topk(scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid)
-    pool_tid = select_candidate_block_pool(
+    select_candidate_block_pool(
         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
     )
-    selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_ready])
+    selection_ready = pl.system.task_dummy(deps=[topk_tid, compressed_ready])
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     if TP_SIZE == 1 and num_tokens <= 12:
         attend_packed_cohorts(

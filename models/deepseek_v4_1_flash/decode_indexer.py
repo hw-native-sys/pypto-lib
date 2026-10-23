@@ -2066,11 +2066,10 @@ def rotate_index_query(
     sin: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    ready: pl.Scalar[pl.TASK_ID],
 ):
     blocks = num_tokens * INDEX_H
     workers = pl.min(blocks, 32)
-    with pl.spmd(workers, name_hint='rope_idx_q', deps=[ready]) as rope_tid:
+    with pl.spmd(workers, name_hint='rope_idx_q') as rope_tid:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
             _index_query_rope_block(x, cos, sin, output, block)
@@ -2104,7 +2103,7 @@ def c1a_index(
         INDEX_PROJ_N_TILE, INDEX_PROJ_K_TILE, 1, query_max_workers,
     )
     rotated = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    rotated_tid = rotate_index_query(projected, cos, sin, rotated, num_tokens, entry_ready)
+    rotated_tid = rotate_index_query(projected, cos, sin, rotated, num_tokens)
     query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
     query_scale = pl.create_tensor(
         [tokens, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0
