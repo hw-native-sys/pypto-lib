@@ -124,7 +124,8 @@ def decode_swa(
     swa_attention_partial(
         q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens,
     )
-    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
+    fused_output_rows = tokens <= 16 or num_tokens == tokens
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 80 and fused_output_rows:
         o_proj_hc_post(
             attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens,

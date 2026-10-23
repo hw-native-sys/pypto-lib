@@ -26,6 +26,7 @@ from hc import hc_pre, golden_hc_pre
 from hc import hc_post, golden_hc_post, _hc_post_from_partial
 from rmsnorm import rms_norm_tiled, golden_rms_norm
 from qkv_proj_rope import qkv_proj_rope, golden_rope_tail, golden_qkv_proj_rope
+from sparse_attention import _attend_packed_cohorts16
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH,
     gather_packed_chunk, attend_c2a_chunk, publish_window_row, attend_packed_cohorts,
@@ -174,6 +175,12 @@ def decode_c2a_full(
             compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
             gather_name="c2a_gather", attn_name="c2a_sparse_attn",
         )
+    elif TP_SIZE == 1 and num_tokens <= 80:
+        chunk_done = _attend_packed_cohorts16(
+            query, window_indices, window_cache, window_cache_scale, topk_indices,
+            compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
+            gather_name="c2a_gather", attn_name="c2a_sparse_attn",
+        )
     else:
         selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
         combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
@@ -188,7 +195,8 @@ def decode_c2a_full(
                 name_hint="c2a_sparse_attn",
             )
 
-    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
+    fused_output_rows = tokens <= 16 or num_tokens == tokens
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 80 and fused_output_rows:
         attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
         o_proj_hc_post(
             attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
