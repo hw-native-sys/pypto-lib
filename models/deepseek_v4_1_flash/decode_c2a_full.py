@@ -806,13 +806,11 @@ CACHE_PAYLOADS = {
 
 
 def cache_compare(world_size, tokens, names=None):
-    """Mapped rows must match byte for byte, except a derived scale allows a one-code mismatch.
+    """Compare written window payloads at FP8 precision and unwritten rows exactly.
 
-    An E8M0 scale is a bare exponent, coarse enough that device and CPU agree exactly, and so
-    does every payload here. A BF16 scale (``compressed_cache_scale``) is a derived quantity
-    (amax over a group), so the device and the CPU golden can differ by a ULP and flip one
-    code at a quantization boundary the same way a payload can; every other mapped row stays
-    unchanged.
+    Projection accumulation can shift a BF16 result across an FP8 rounding boundary.
+    Other payloads and E8M0 scales stay exact; compressed BF16 scales retain their
+    existing one-percent mismatch budget.
     """
     options = dict(
         mapping_shape=(world_size, tokens),
@@ -825,7 +823,7 @@ def cache_compare(world_size, tokens, names=None):
         scale_name for scale_name, _, scale_format in CACHE_PAYLOADS.values()
         if scale_format not in (None, "e8m0")
     }
-    return {
+    compare = {
         name: mapped_pool_ratio_allclose(
             CACHE_SLOTS[name],
             pool_name=name,
@@ -834,6 +832,12 @@ def cache_compare(world_size, tokens, names=None):
         )
         for name in (CACHE_SLOTS if names is None else names)
     }
+    if "window_cache" in compare:
+        window_options = {**options, "atol": 2 ** -9, "rtol": 2 ** -3}
+        compare["window_cache"] = mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window_cache", max_error_ratio=0.0, **window_options,
+        )
+    return compare
 
 
 REUSE_INPUT_NAMES = (

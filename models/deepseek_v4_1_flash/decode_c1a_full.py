@@ -767,8 +767,10 @@ CACHE_SLOTS = {
 
 
 def cache_compare(world_size, tokens, mode):
-    """Mapped rows must match byte for byte and every other cache row must stay unchanged.
+    """Compare published window rows at FP8/BF16 precision and other cache rows exactly.
 
+    Projection accumulation can shift BF16 values and derived scales across FP8 rounding
+    boundaries. Written window rows allow format-sized errors with no outlier budget.
     Only FULL publishes the compressor and index caches: REINDEX and REUSE read them, so the
     reference hands those back unmodified and they stay an exact byte contract.
     """
@@ -785,6 +787,12 @@ def cache_compare(world_size, tokens, mode):
         for name, slots in CACHE_SLOTS.items()
         if mode == "full" or name.startswith("window")
     }
+    window_options = {**options, "atol": 2 ** -9, "rtol": 2 ** -3}
+    scale_options = {**options, "rtol": 2 ** -7}
+    compare["window_cache"] = mapped_pool_ratio_allclose("window_slots", pool_name="window_cache", **window_options)
+    compare["window_cache_scale"] = mapped_pool_ratio_allclose(
+        "window_slots", pool_name="window_cache_scale", **scale_options,
+    )
     if mode != "full":
         for name in ("compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale"):
             compare[name] = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
