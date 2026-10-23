@@ -90,40 +90,41 @@ def gemm_mxfp8_to_mxfp8(
     output: pl.Tensor,
     output_scale: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    group: pl.Scalar[pl.INDEX],
+    group_start: pl.Scalar[pl.INDEX],
     width: pl.constexpr,
     output_width: pl.constexpr,
     name_hint: pl.constexpr,
     n_tile: pl.constexpr,
     k_tile: pl.constexpr,
     group_count: pl.constexpr,
+    batch_group_count: pl.constexpr,
     pack_cols: pl.constexpr,
 ):
-    """Project a prequantized M16 group, round to BF16, and quantize its MX output."""
-    activation_scale = pl.tensor.view(scale_backing, [MX_M_TILE, width // 32], layout=pl.MX_A_ZZ)
-    scale_group_size = (width // 32) * output_width
-    scale_backing_flat = pl.tensor.view(scale, [1, group_count * scale_group_size], layout=pl.ND)
-    scale_group_offset = (group * width) // 32 * output_width
-    scale_group_backing = pl.tensor.slice(scale_backing_flat, [1, scale_group_size], [0, scale_group_offset])
-    scale_group = pl.tensor.view(scale_group_backing, [width // 32, output_width], layout=pl.MX_B_NN)
-    workers = pl.min(output_width // n_tile, pl.system.available_cluster_count())
+    """Project prequantized M16 groups, round to BF16, and quantize their MX output."""
+    activation_scale = pl.tensor.view(scale_backing, [batch_group_count * MX_M_TILE, width // 32], layout=pl.MX_A_ZZ)
+    weight_scale = pl.tensor.view(scale, [width // 32, group_count * output_width], layout=pl.MX_B_NN)
+    workers = pl.min(batch_group_count * (output_width // n_tile), pl.system.available_cluster_count())
     for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
         block_num = pl.tile.get_block_num()
-        for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
+        for wave in pl.range((batch_group_count * (output_width // n_tile) + block_num - 1) // block_num):
             block = wave * block_num + worker
-            if block < output_width // n_tile:
-                n0 = block * n_tile
+            if block < batch_group_count * (output_width // n_tile):
+                local_group = block // (output_width // n_tile)
+                group = group_start + local_group
+                n0 = block % (output_width // n_tile) * n_tile
+                payload_row = local_group * MX_M_TILE
+                output_n = group_start * output_width + block * n_tile
                 rows = pl.min(MX_M_TILE, num_tokens)
-                a0 = pl.load(payload, [0, 0], [MX_M_TILE, k_tile])
-                sa0 = pl.load(activation_scale, [0, 0], [MX_M_TILE, k_tile // 32])
+                a0 = pl.load(payload, [payload_row, 0], [MX_M_TILE, k_tile])
+                sa0 = pl.load(activation_scale, [payload_row, 0], [MX_M_TILE, k_tile // 32])
                 b0 = pl.load(weight_flat, [(group * width), n0], [k_tile, n_tile])
-                sb0 = pl.load(scale_group, [0, n0], [k_tile // 32, n_tile])
+                sb0 = pl.load(weight_scale, [0, output_n], [k_tile // 32, n_tile])
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
                 for k0 in pl.pipeline(k_tile, width, k_tile, stage=2):
-                    a = pl.load(payload, [0, k0], [MX_M_TILE, k_tile])
-                    sa = pl.load(activation_scale, [0, k0 // 32], [MX_M_TILE, k_tile // 32])
+                    a = pl.load(payload, [payload_row, k0], [MX_M_TILE, k_tile])
+                    sa = pl.load(activation_scale, [payload_row, k0 // 32], [MX_M_TILE, k_tile // 32])
                     b = pl.load(weight_flat, [(group * width) + k0, n0], [k_tile, n_tile])
-                    sb = pl.load(scale_group, [k0 // 32, n0], [k_tile // 32, n_tile])
+                    sb = pl.load(weight_scale, [k0 // 32, output_n], [k_tile // 32, n_tile])
                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                 rounded_value = pl.cast(acc, pl.BF16, mode="rint")
                 rounded = pl.set_validshape(rounded_value, rows, n_tile)
@@ -149,7 +150,6 @@ def gemm_mxfp8_to_mxfp8(
                 normalized = pl.minimum(normalized, 448.0)
                 payload_fp8 = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
                 quantized_tile = pl.reshape(payload_fp8, [MX_M_TILE, n_tile])
-                output_n = group * output_width + n0
                 output = pl.store(quantized_tile, [0, output_n], output)
                 sign_bit = pl.shrs(exponent, 7)
                 sign_offset = pl.mul(sign_bit, 256)
