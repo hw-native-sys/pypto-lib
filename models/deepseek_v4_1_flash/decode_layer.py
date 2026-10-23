@@ -1173,8 +1173,7 @@ def make_decode_layer_golden_inputs(layer_id: int) -> dict:
 
 
 if __name__ == "__main__":
-    from golden import ratio_allclose, ratio_reldiff, run
-    from decode_swa import window_cache_compare
+    from golden import mapped_pool_ratio_allclose, ratio_allclose, ratio_reldiff, run
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -1273,9 +1272,15 @@ if __name__ == "__main__":
         ),
         compare_fn={
             # Window-cache payload and scale tolerances on mapped attention rows.
-            **window_cache_compare(
-                EP_SIZE, DECODE_MAX_TOKENS, payload_atol=2 ** -9, payload_rtol=2 ** -3,
-                payload_error_ratio=0.01, scale_rtol=0.02, scale_error_ratio=0.01,
+            "window_cache": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window cache", mapping_shape=(EP_SIZE, DECODE_MAX_TOKENS),
+                block_size=128, leading_rank_axis=True,
+                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.01,
+            ),
+            "window_cache_scale": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window cache scale", mapping_shape=(EP_SIZE, DECODE_MAX_TOKENS),
+                block_size=128, leading_rank_axis=True,
+                atol=0.0, rtol=0.02, max_error_ratio=0.01,
             ),
             "compressed_cache": exact,
             "compressed_cache_scale": exact,

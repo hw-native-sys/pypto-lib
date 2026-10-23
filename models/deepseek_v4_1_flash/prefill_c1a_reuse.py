@@ -12,9 +12,9 @@ import math
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
-from golden import ScalarSpec, TensorSpec, ratio_allclose, run
+from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
 from config import (
-    FLASH as M, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, PREFILL_MAX_TOKENS,
+    FLASH as M, BLOCK_SIZE, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, PREFILL_MAX_TOKENS,
     WINDOW_CACHE_GROUP, SP_T_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN, INDEX_POOL_BLOCKS_DYN, INDEX_CACHE_GROUP,
     AttentionMode,
 )
@@ -32,7 +32,6 @@ from sparse_attention import (
     attend_packed, golden_compressed_attention, golden_prefill_c1a_attention, prefill_publish_window,
 )
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
-from prefill_c1a_full import cache_compare
 
 
 # model config
@@ -733,7 +732,18 @@ if __name__ == "__main__":
             "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "attn_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
-            **cache_compare(len(devices), fixture_token_count(args.tokens, args.case), ("window_cache", "window_cache_scale")),
+            "window_cache": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window_cache",
+                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "window_cache_scale": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window_cache_scale",
+                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
         },
     )
     if not result.passed:

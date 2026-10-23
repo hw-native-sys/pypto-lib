@@ -387,49 +387,6 @@ def golden_decode_swa(tensors):
         tensors["attention_hidden"][0, :active].copy_(hidden)
 
 
-def comparisons(args, devices):
-    leaf = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
-    compare = {
-        "attention_hidden": leaf,
-        "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
-    }
-    compare.update(
-        {
-            "attention_output": leaf,
-            # Composed rows can flip one FP8 code at a quantization boundary: allow one
-            # subnormal step (2**-9) plus one relative step (2**-3) on the payload, and less
-            # than 1% of mapped rows to miss even that.
-            **window_cache_compare(
-                len(devices), args.tokens, payload_atol=2 ** -9, payload_rtol=2 ** -3,
-                payload_error_ratio=0.01,
-            ),
-        }
-    )
-    return compare
-
-
-def window_cache_compare(
-    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
-    scale_rtol=0.0, scale_error_ratio=0.0,
-):
-    """Compare the mapped window rows and require every other row to stay unchanged."""
-    options = dict(
-        mapping_shape=(world_size, tokens),
-        block_size=128,
-        leading_rank_axis=True,
-    )
-    return {
-        "window_cache": mapped_pool_ratio_allclose(
-            "window_slots", pool_name="window cache",
-            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
-        ),
-        "window_cache_scale": mapped_pool_ratio_allclose(
-            "window_slots", pool_name="window cache scale",
-            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
-        ),
-    }
-
-
 if __name__ == "__main__":
     from utils import configure_decode_workload, parse_decode_query_lens, parse_decode_startpos
 
@@ -463,7 +420,21 @@ if __name__ == "__main__":
         fn=l3_decode_swa,
         specs=build_specs(args),
         golden_fn=golden_decode_swa,
-        compare_fn=comparisons(args, devices),
+        compare_fn={
+            "attention_hidden": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
+            "attention_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "window_cache": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window cache", mapping_shape=(len(devices), args.tokens),
+                block_size=128, leading_rank_axis=True,
+                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.01,
+            ),
+            "window_cache_scale": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window cache scale", mapping_shape=(len(devices), args.tokens),
+                block_size=128, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+        },
         config={
             "backend_type": args.backend_type, "execution_mode": args.execution_mode,
             "enable_chip_swimlane": args.enable_chip_swimlane,

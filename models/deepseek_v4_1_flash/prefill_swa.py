@@ -550,28 +550,6 @@ def golden_prefill_swa_case(tensors):
         tensors["output"][group].copy_(token_shards(output, local_tokens))
 
 
-def window_cache_compare(
-    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
-    scale_rtol=0.0, scale_error_ratio=0.0,
-):
-    """Compare the mapped window rows and require every other row to stay unchanged."""
-    options = dict(
-        mapping_shape=(world_size, tokens),
-        block_size=128,
-        leading_rank_axis=True,
-    )
-    return {
-        "window_cache": mapped_pool_ratio_allclose(
-            "window_slots", pool_name="window cache",
-            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
-        ),
-        "window_cache_scale": mapped_pool_ratio_allclose(
-            "window_slots", pool_name="window cache scale",
-            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
-        ),
-    }
-
-
 if __name__ == "__main__":
     import argparse
     import os
@@ -643,7 +621,18 @@ if __name__ == "__main__":
                 if args.case in ("masked", "zero", "sink") else ratio_allclose(atol=1e-2, rtol=1.0 / 128)
             ),
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
-            **window_cache_compare(len(devices), args.tokens),
+            "window_cache": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window cache",
+                mapping_shape=(len(devices), args.tokens),
+                block_size=128, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "window_cache_scale": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window cache scale",
+                mapping_shape=(len(devices), args.tokens),
+                block_size=128, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
         },
     )
     if args.compile_only and result.passed:

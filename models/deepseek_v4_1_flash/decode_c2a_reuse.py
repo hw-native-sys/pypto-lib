@@ -338,28 +338,6 @@ def golden_decode_c2a_reuse_case(tensors):
     golden_c2a_hc_case(tensors, golden_decode_attn_c2a_reuse)
 
 
-def c2a_reuse_window_cache_compare(
-    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
-    scale_rtol=0.0, scale_error_ratio=0.0,
-):
-    """Compare the mapped window rows and require every other row to stay unchanged."""
-    options = dict(
-        mapping_shape=(world_size, tokens),
-        block_size=128,
-        leading_rank_axis=True,
-    )
-    return {
-        "window_cache": mapped_pool_ratio_allclose(
-            "window_slots", pool_name="window cache",
-            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
-        ),
-        "window_cache_scale": mapped_pool_ratio_allclose(
-            "window_slots", pool_name="window cache scale",
-            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
-        ),
-    }
-
-
 if __name__ == "__main__":
     from utils import configure_decode_workload, parse_decode_query_lens, parse_decode_startpos
 
@@ -395,18 +373,24 @@ if __name__ == "__main__":
         for name in host.param_names if name != "num_tokens"
     ]
     specs.append(ScalarSpec("num_tokens", torch.int32, args.tokens))
-    comparisons = {
-        "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
-        "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-    }
-    comparisons.update(c2a_reuse_window_cache_compare(
-        1, args.tokens, payload_atol=2 ** -9, payload_rtol=2 ** -3,
-    ))
     result = run(
         fn=host,
         specs=specs,
         golden_fn=golden_decode_c2a_reuse_case,
-        compare_fn=comparisons,
+        compare_fn={
+            "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "window_cache": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window cache", mapping_shape=(1, args.tokens),
+                block_size=128, leading_rank_axis=True,
+                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+            ),
+            "window_cache_scale": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window cache scale", mapping_shape=(1, args.tokens),
+                block_size=128, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+        },
         compile_only=args.compile_only,
         save_data=args.save_data,
         golden_data=args.golden_data,

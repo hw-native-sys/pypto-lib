@@ -89,12 +89,6 @@ Q_B_WORKERS = 24 if TP_SIZE == 1 else 2147483647
 INDEX_QUERY_WORKERS = 8 if TP_SIZE == 1 else 2147483647
 
 
-# Validation.
-OUTPUT_ATOL = 1e-2
-OUTPUT_RTOL = 1e-2
-OUTPUT_MAX_ERROR_RATIO = 0.01
-
-
 publish_compressed = make_fp4_publish(HEAD_DIM, 16, pl.BF16, CMP_BLOCKS_DYN, name_hint="pub_cmp")
 publish_index = make_fp4_publish(INDEX_DIM, 32, pl.FP8E8M0, INDEX_BLOCKS_DYN, name_hint="pub_idx")
 
@@ -756,49 +750,6 @@ def build_validation_values(
     return values
 
 
-CACHE_SLOTS = {
-    "window_cache": "window_slots",
-    "window_cache_scale": "window_slots",
-    "compressed_cache": "compressed_slots",
-    "compressed_cache_scale": "compressed_slots",
-    "index_cache": "compressed_slots",
-    "index_cache_scale": "compressed_slots",
-}
-
-
-def cache_compare(world_size, tokens, mode):
-    """Compare published window rows at FP8/BF16 precision and other cache rows exactly.
-
-    Projection accumulation can shift BF16 values and derived scales across FP8 rounding
-    boundaries. Written window rows allow format-sized errors with no outlier budget.
-    Only FULL publishes the compressor and index caches: REINDEX and REUSE read them, so the
-    reference hands those back unmodified and they stay an exact byte contract.
-    """
-    options = dict(
-        mapping_shape=(world_size, tokens),
-        block_size=BLOCK_SIZE,
-        leading_rank_axis=True,
-        atol=0.0,
-        rtol=0.0,
-        max_error_ratio=0.0,
-    )
-    compare = {
-        name: mapped_pool_ratio_allclose(slots, pool_name=name, **options)
-        for name, slots in CACHE_SLOTS.items()
-        if mode == "full" or name.startswith("window")
-    }
-    window_options = {**options, "atol": 2 ** -9, "rtol": 2 ** -3}
-    scale_options = {**options, "rtol": 2 ** -7}
-    compare["window_cache"] = mapped_pool_ratio_allclose("window_slots", pool_name="window_cache", **window_options)
-    compare["window_cache_scale"] = mapped_pool_ratio_allclose(
-        "window_slots", pool_name="window_cache_scale", **scale_options,
-    )
-    if mode != "full":
-        for name in ("compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale"):
-            compare[name] = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
-    return compare
-
-
 def build_hc_validation_values(
     mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None, query_lens=None,
 ):
@@ -910,15 +861,6 @@ if __name__ == "__main__":
 
     specs.append(ScalarSpec("num_tokens", torch.int32, args.tokens))
 
-    output_budget = ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO)
-    comparisons = {
-        "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-        "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-        "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-        "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-        "output": output_budget,
-        **cache_compare(1, args.tokens, "full"),
-    }
     result = run(
         fn=host,
         specs=specs,
@@ -936,7 +878,49 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn=comparisons,
+        compare_fn={
+            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+            "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
+            "window_cache": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window_cache",
+                mapping_shape=(1, args.tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+            ),
+            "window_cache_scale": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window_cache_scale",
+                mapping_shape=(1, args.tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+            ),
+            "compressed_cache": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="compressed_cache",
+                mapping_shape=(1, args.tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "compressed_cache_scale": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="compressed_cache_scale",
+                mapping_shape=(1, args.tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "index_cache": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="index_cache",
+                mapping_shape=(1, args.tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+            "index_cache_scale": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="index_cache_scale",
+                mapping_shape=(1, args.tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+        },
     )
     if not result.passed:
         raise SystemExit(result.error or 1)

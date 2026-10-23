@@ -746,51 +746,6 @@ MUTABLE_NAMES = (
 
 SHARDED_NAMES = ("wq_b", "wq_b_scale", "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale")
 
-CACHE_SLOTS = {
-    "window_cache": "window_slots",
-    "window_cache_scale": "window_slots",
-    "compressed_cache": "compressed_slots",
-    "compressed_cache_scale": "compressed_slots",
-    "index_cache": "compressed_slots",
-    "index_cache_scale": "compressed_slots",
-}
-
-
-def cache_compare(world_size, tokens, names=None, payload_error_ratio=0.01):
-    """Scales stored as E8M0 match exactly; everything else allows a one-code mismatch.
-
-    An E8M0 scale is a bare exponent, coarse enough that device and CPU agree exactly. A
-    BF16 scale (``compressed_cache_scale``) is a derived quantity (amax over a group), so
-    the device and the CPU golden can differ by a ULP; it shares the payload's boundary-flip
-    tolerance instead of the exact scale budget. Mapped rows elsewhere stay unchanged.
-    """
-    options = dict(
-        mapping_shape=(world_size, tokens),
-        block_size=BLOCK_SIZE,
-        leading_rank_axis=True,
-        atol=0.0,
-        rtol=0.0,
-    )
-    exact_scales = {
-        scale_name for scale_name, _, scale_format in CACHE_PAYLOADS.values()
-        if scale_format in (None, "e8m0")
-    }
-    return {
-        name: mapped_pool_ratio_allclose(
-            CACHE_SLOTS[name],
-            pool_name=name,
-            max_error_ratio=0.0 if name in exact_scales else payload_error_ratio,
-            **options,
-        )
-        for name in (CACHE_SLOTS if names is None else names)
-    }
-
-CACHE_PAYLOADS = {
-    "window_cache": ("window_cache_scale", None, None),
-    "compressed_cache": ("compressed_cache_scale", 16, "bf16"),
-    "index_cache": ("index_cache_scale", 32, "e8m0"),
-}
-
 REUSE_INPUT_NAMES = (
     "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
     "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
@@ -978,13 +933,48 @@ def make_compare(mode, world_size, tokens):
         "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
         "attn_output": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
         "x_hc_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+        "window_cache": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window_cache",
+            mapping_shape=(world_size, tokens),
+            block_size=BLOCK_SIZE, leading_rank_axis=True,
+            atol=0.0, rtol=0.0, max_error_ratio=0.01,
+        ),
+        "window_cache_scale": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window_cache_scale",
+            mapping_shape=(world_size, tokens),
+            block_size=BLOCK_SIZE, leading_rank_axis=True,
+            atol=0.0, rtol=0.0, max_error_ratio=0.0,
+        ),
     }
     if mode == "full":
         compare["topk_indices"] = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02)
         compare["state_cache"] = ratio_allclose(atol=1e-3, rtol=1e-3)
-        compare.update(cache_compare(world_size, tokens))
-    else:
-        compare.update(cache_compare(world_size, tokens, REUSE_MUTABLE_NAMES))
+        compare.update({
+            "compressed_cache": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="compressed_cache",
+                mapping_shape=(world_size, tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.01,
+            ),
+            "compressed_cache_scale": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="compressed_cache_scale",
+                mapping_shape=(world_size, tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.01,
+            ),
+            "index_cache": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="index_cache",
+                mapping_shape=(world_size, tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.01,
+            ),
+            "index_cache_scale": mapped_pool_ratio_allclose(
+                "compressed_slots", pool_name="index_cache_scale",
+                mapping_shape=(world_size, tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            ),
+        })
     return compare
 
 

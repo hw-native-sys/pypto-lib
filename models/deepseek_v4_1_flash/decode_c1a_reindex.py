@@ -13,6 +13,7 @@ import torch
 
 from config import (
     AttentionMode,
+    BLOCK_SIZE,
     COMPRESSED_CACHE_GROUP,
     INDEX_CACHE_GROUP,
     WINDOW_CACHE_GROUP,
@@ -32,14 +33,10 @@ from config import (
 from decode_c1a_full import (
     golden_c1a_hc_case,
     build_hc_validation_values,
-    OUTPUT_ATOL,
-    OUTPUT_RTOL,
-    OUTPUT_MAX_ERROR_RATIO,
-    cache_compare,
     golden_c1a_attention,
 )
 from utils import AttentionGoldenResult
-from golden import ScalarSpec, TensorSpec, ratio_allclose, run
+from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
 from hc import hc_pre
 from decode_indexer import c1a_index, score_reindex, select_pool_index_topk
 from hc import hc_mixes
@@ -438,15 +435,6 @@ if __name__ == "__main__":
 
     specs.append(ScalarSpec("num_tokens", torch.int32, args.tokens))
 
-    output_budget = ratio_allclose(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, max_error_ratio=OUTPUT_MAX_ERROR_RATIO)
-    comparisons = {
-        "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-        "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-        "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-        "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-        "output": output_budget,
-        **cache_compare(1, args.tokens, "reindex"),
-    }
     result = run(
         fn=host,
         specs=specs,
@@ -464,7 +452,29 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn=comparisons,
+        compare_fn={
+            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+            "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
+            "window_cache": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window_cache",
+                mapping_shape=(1, args.tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+            ),
+            "window_cache_scale": mapped_pool_ratio_allclose(
+                "window_slots", pool_name="window_cache_scale",
+                mapping_shape=(1, args.tokens),
+                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+            ),
+            "compressed_cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "compressed_cache_scale": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "index_cache": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "index_cache_scale": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+        },
     )
     if not result.passed:
         raise SystemExit(result.error or 1)

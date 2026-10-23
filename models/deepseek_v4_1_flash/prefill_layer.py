@@ -42,7 +42,7 @@ if not any(argument == "--ep" or argument.startswith("--ep=") for argument in sy
 
 
 from config import (
-    FLASH as M, TP_SIZE, MAX_BATCH_PER_DP, PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP,
+    FLASH as M, BLOCK_SIZE, TP_SIZE, MAX_BATCH_PER_DP, PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP,
     CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, ROUTE_T_DYN,
     set_moe_tokens,
 )
@@ -58,7 +58,7 @@ from expert_routed import (
     ROUTED_DEQUANT_STD, gen_routed_mxfp4_weights,
 )
 from gate import golden_gate_reference as gate
-from golden import ScalarSpec, TensorSpec, ratio_allclose, run
+from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_allclose, run
 from golden.validation import ratio_reldiff
 from hc import (
     HC_INPUT_NAMES, make_hc_inputs,
@@ -71,8 +71,8 @@ from prefill_moe import (
 from o_proj import retire_prefill_signals
 from prefill_moe import prefill_moe_sublayer, prefill_ffn_restore
 from prefill_c2a_full import (
-    ATTENTION_STATE, CMP_PACKED, CMP_SCALES, MODES, REUSE_MUTABLE_NAMES,
-    StagedAttentionReference, _report as report_stage, cache_compare,
+    ATTENTION_STATE, CMP_PACKED, CMP_SCALES, MODES,
+    StagedAttentionReference, _report as report_stage,
     golden_reference_c2a, make_attention_inputs, reference_attention,
 )
 from prefill_c2a_reuse import prefill_c2a_reuse, golden_reference_c2a_reuse, make_c2a_reuse_inputs
@@ -103,9 +103,6 @@ MOE_INTER = M.moe_intermediate_size
 TOKENS = MOE_TOKENS
 
 ROUTE_ROWS = MOE_TOKENS * TOPK
-# Validation defaults.
-CHAIN_BUDGET = 0.15
-
 LAYER_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 
@@ -722,7 +719,7 @@ def compare_ffn_output(staged, tokens):
                 actual[base, :tokens], forced[base, :tokens],
                 inputs=inputs, actual_outputs=actual_outputs, expected_outputs=expected_outputs, **kwargs
             )
-            passed &= valid and end_to_end <= CHAIN_BUDGET
+            passed &= valid and end_to_end <= 0.15
         return passed, "routed rows within the MoE budget of the forced reference; replicas identical"
 
     return compare
@@ -746,10 +743,20 @@ def make_layer_compare(mode, tokens, initial_state, world_size):
         "ffn_owned": compare_ffn_owned(moe, tokens),
         "ffn_output": compare_ffn_output(moe, tokens),
         # MoE residual-stream precision budget.
-        "x_hc_out": compare_expanded_stream("x_hc_out", "ffn_output", "x_hc_mid", "hc_ffn", CHAIN_BUDGET),
+        "x_hc_out": compare_expanded_stream("x_hc_out", "ffn_output", "x_hc_mid", "hc_ffn", 0.15),
+        "window_cache": attention.compare("window_cache", mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window_cache",
+            mapping_shape=(world_size, tokens),
+            block_size=BLOCK_SIZE, leading_rank_axis=True,
+            atol=0.0, rtol=0.0, max_error_ratio=0.01,
+        )),
+        "window_cache_scale": attention.compare("window_cache_scale", mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window_cache_scale",
+            mapping_shape=(world_size, tokens),
+            block_size=BLOCK_SIZE, leading_rank_axis=True,
+            atol=0.0, rtol=0.0, max_error_ratio=0.0,
+        )),
     }
-    for name, check in cache_compare(world_size, tokens, REUSE_MUTABLE_NAMES).items():
-        compare[name] = attention.compare(name, check)
     return compare
 
 
