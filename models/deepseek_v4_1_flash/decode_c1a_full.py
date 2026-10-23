@@ -24,12 +24,11 @@ from qkv_proj_rope import (
 from o_proj import o_proj, o_proj_hc_post, golden_o_proj
 from decode_indexer import (
     golden_index_key, golden_select_candidate_block_pool, select_candidate_block_pool,
-    c1a_index, use_pretransposed_index_query, score_full_pretransposed,
+    c1a_index, use_pretransposed_index_query, score_select_c1a_groups,
     golden_c1a_index_scores,
     golden_pool_index_scores,
     golden_c1a_index_topk,
     make_fp4_publish,
-    select_index_topk,
 )
 from sparse_attention import golden_selected_attention, attend_selected, gather_packed, publish_window_row
 from sparse_attention import GATHER_WORKERS, attend_packed_cohorts
@@ -204,13 +203,13 @@ def decode_c1a_full(
         num_tokens, score_width, x_ready, private_query, private_route,
         pretransposed=True, query_max_workers=INDEX_QUERY_WORKERS,
     )
-    scores_tid = score_full_pretransposed(
+    topk_tid, scores_tid = score_select_c1a_groups(
         index_query, index_query_scale, index_weights,
         index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
-        scores,
+        scores, topk_indices,
         num_tokens, index_ready, query_tid, weights_tid, private_query, private_route,
+        pl.tensor.dim(pool_block_ids, 1),
     )
-    topk_tid = select_index_topk(scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid)
     pool_tid = select_candidate_block_pool(
         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
     )
@@ -231,7 +230,8 @@ def decode_c1a_full(
             max_workers=GATHER_WORKERS, name_hint="c1a_gather",
         )
         attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
-    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
+    fused_output_rows = tokens <= 16 or num_tokens == tokens
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 80 and fused_output_rows:
         attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
         o_proj_hc_post(
             attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,

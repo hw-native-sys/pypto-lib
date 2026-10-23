@@ -438,16 +438,30 @@ def o_proj_hc_post(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Compose existing O-A with the TP1 O-B and HC post mixed epilogue."""
-    latent_payload = pl.create_tensor([16, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
-    latent_scale_backing = pl.create_tensor([1, 16 * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-    latent_payload, latent_scale_backing = _grouped_output_rope_to_mx(
-        attended, rope_cos, rope_sin, wo_a, wo_a_scale, latent_payload, latent_scale_backing, num_tokens,
-    )
-    _ob_hc_post_from_mx(
-        latent_payload, latent_scale_backing, wo_b, wo_b_scale,
-        sublayer, residual, post_mix, residual_mix, output, num_tokens,
-    )
+    """Compose O-A and the TP1 O-B/HC epilogue in private M16 row tiles."""
+    capacity = pl.tensor.dim(attended, 0)
+    for mt in pl.parallel((capacity + MX_M_TILE - 1) // MX_M_TILE):
+        t0 = mt * MX_M_TILE
+        rows = pl.min(MX_M_TILE, capacity - t0)
+        active = pl.min(rows, num_tokens - t0)
+        attended_rows = pl.slice(attended, [rows, LOCAL_H * HEAD_DIM], [t0, 0])
+        cos_rows = pl.slice(rope_cos, [rows, ROPE_DIM // 2], [t0, 0])
+        sin_rows = pl.slice(rope_sin, [rows, ROPE_DIM // 2], [t0, 0])
+        sublayer_rows = pl.slice(sublayer, [rows, D], [t0, 0])
+        residual_rows = pl.slice(residual, [rows, HC_MULT, D], [t0, 0, 0])
+        post_rows = pl.slice(post_mix, [rows, HC_MULT], [t0, 0])
+        mix_rows = pl.slice(residual_mix, [rows, HC_MULT, HC_MULT], [t0, 0, 0])
+        output_rows = pl.slice(output, [rows, HC_MULT, D], [t0, 0, 0])
+        latent_payload = pl.create_tensor([MX_M_TILE, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
+        scale_size = MX_M_TILE * (LOCAL_O_WIDTH // 32)
+        latent_scale_backing = pl.create_tensor([1, scale_size], dtype=pl.FP8E8M0)
+        latent_payload, latent_scale_backing = _grouped_output_rope_to_mx(
+            attended_rows, cos_rows, sin_rows, wo_a, wo_a_scale, latent_payload, latent_scale_backing, active,
+        )
+        _ob_hc_post_from_mx(
+            latent_payload, latent_scale_backing, wo_b, wo_b_scale,
+            sublayer_rows, residual_rows, post_rows, mix_rows, output_rows, active,
+        )
     return sublayer, output
 
 
