@@ -25,7 +25,7 @@ from golden import ScalarSpec, TensorSpec
 from utils import _publish_quantized_cache
 from quant import dequantize_mxfp4_cache, dequantize_mxfp8_cache, quantize_mxfp8_upward_reference, quantize_grouped_mxfp8_weight, pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
-from utils import AttentionGoldenResult, window_metadata
+from utils import AttentionGoldenResult, packed_query_lengths, window_metadata
 
 from pathlib import Path
 
@@ -1078,14 +1078,13 @@ def make_swa_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
     return dict(zip(SWA_INPUT_NAMES, values))
 
 
-def make_packed_swa_inputs(tokens=257, requests=4, seed=17, case="mixed", start_pos=None):
+def make_packed_swa_inputs(tokens=257, requests=4, seed=17, case="mixed", start_pos=None, query_lens=None):
     if not 1 <= requests <= min(MAX_BATCH_PER_DP, tokens):
         raise ValueError(f"requests must be in [1, min({MAX_BATCH_PER_DP}, tokens)]")
     values = make_swa_inputs(1, seed=seed)
     gen = torch.Generator().manual_seed(seed + 1000)
-    lengths = torch.full((requests,), tokens // requests, dtype=torch.int64)
-    lengths[:tokens % requests] += 1
-    if requests > 1 and lengths[-1] > 16:
+    lengths = torch.tensor(packed_query_lengths(tokens, requests, query_lens), dtype=torch.int64)
+    if query_lens is None and requests > 1 and lengths[-1] > 16:
         lengths[0] += 7
         lengths[-1] -= 7
     prefixes = torch.zeros(requests, dtype=torch.int64)
@@ -1147,8 +1146,9 @@ def build_swa_leaf_specs(args, mode):
     packed = (getattr(args, "start_pos", None) is not None or mode == "prefill" or args.tokens > MAX_BATCH_PER_DP
               or args.requests != args.tokens or args.case in ("prefix", "shuffle"))
     if packed:
-        lengths = [args.tokens // args.requests + (r < args.tokens % args.requests) for r in range(args.requests)]
-        if args.requests > 1 and lengths[-1] > 16:
+        query_lens = getattr(args, "query_lens", None)
+        lengths = packed_query_lengths(args.tokens, args.requests, query_lens)
+        if query_lens is None and args.requests > 1 and lengths[-1] > 16:
             lengths[0] += 7
             lengths[-1] -= 7
         prefixes = ([127, 128, 511, 1048000] * 8)[:args.requests] if args.case == "prefix" else [0] * args.requests
@@ -1178,7 +1178,8 @@ def build_swa_leaf_specs(args, mode):
                 seed = args.seed + rank
                 if packed:
                     value = make_packed_swa_inputs(
-                        args.tokens, args.requests, seed, args.case, getattr(args, 'start_pos', None),
+                        args.tokens, args.requests, seed, args.case,
+                        start_pos=getattr(args, 'start_pos', None), query_lens=getattr(args, 'query_lens', None),
                     )
                 else:
                     value = make_swa_inputs(args.tokens, seed)

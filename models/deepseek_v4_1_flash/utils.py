@@ -20,19 +20,61 @@ from golden import ScalarSpec
 
 
 def parse_decode_startpos(value):
-    """Parse one absolute decode position per request."""
+    """Parse one absolute starting position per request."""
     import argparse
 
     try:
         positions = [int(item) for item in value.split(",")]
     except ValueError as error:
-        raise argparse.ArgumentTypeError("startpos must be a comma-separated list of integers") from error
+        raise argparse.ArgumentTypeError("start-pos must be a comma-separated list of integers") from error
     limit = min(C.MAX_BATCH_PER_DP, C.DECODE_MAX_TOKENS)
     if not 1 <= len(positions) <= limit:
-        raise argparse.ArgumentTypeError(f"startpos must contain between 1 and {limit} positions")
-    if any(position < 0 or position >= M.max_position_embeddings for position in positions):
-        raise argparse.ArgumentTypeError(f"positions must be in [0, {M.max_position_embeddings})")
+        raise argparse.ArgumentTypeError(f"start-pos must contain between 1 and {limit} positions")
+    max_start = M.max_position_embeddings - 1
+    if any(position < 0 or position > max_start for position in positions):
+        raise argparse.ArgumentTypeError(f"positions must be in [0, {max_start}]")
     return positions
+
+
+def parse_decode_query_lens(value):
+    """Parse positive query lengths in request order."""
+    import argparse
+
+    try:
+        lengths = [int(item) for item in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("query-lens must be a comma-separated list of integers") from error
+    if any(length <= 0 for length in lengths):
+        raise argparse.ArgumentTypeError("query-lens must contain positive lengths")
+    return lengths
+
+
+def configure_decode_workload(args, parser):
+    """Resolve query lengths, packed token count, and absolute position bounds."""
+    if args.startpos is None:
+        if args.query_lens is not None:
+            parser.error("--query-lens requires --start-pos")
+        return
+    args.requests = len(args.startpos)
+    if args.query_lens is None:
+        args.query_lens = [C.DECODE_ROWS_PER_REQUEST] * args.requests
+    if len(args.query_lens) != args.requests:
+        parser.error("--query-lens must contain one length per --start-pos value")
+    args.tokens = sum(args.query_lens)
+    if args.tokens > C.DECODE_MAX_TOKENS:
+        parser.error(f"total query tokens must not exceed {C.DECODE_MAX_TOKENS}")
+    ends = [pos + length for pos, length in zip(args.startpos, args.query_lens)]
+    if max(ends) > M.max_position_embeddings:
+        parser.error("a query block exceeds max_position_embeddings")
+
+
+def packed_query_lengths(tokens, requests, query_lens=None):
+    """Use explicit request lengths or a balanced packed token split."""
+    if query_lens is None:
+        return [tokens // requests + (index < tokens % requests) for index in range(requests)]
+    if len(query_lens) != requests or sum(query_lens) != tokens or any(length <= 0 for length in query_lens):
+        raise ValueError("query_lens must contain one positive length per request and sum to tokens")
+    return list(query_lens)
 
 
 def paged_slots(

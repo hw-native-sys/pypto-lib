@@ -397,7 +397,7 @@ def golden_decode_c1a_reindex_case(tensors):
 
 
 if __name__ == "__main__":
-    from utils import parse_decode_startpos
+    from utils import configure_decode_workload, parse_decode_query_lens, parse_decode_startpos
 
     import argparse
 
@@ -407,8 +407,10 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    startpos_help = "one position per request; omitted: default validation workload"
-    parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
+    startpos_help = "one starting position per request; omitted: default validation workload"
+    parser.add_argument("--start-pos", "--startpos", dest="startpos", type=parse_decode_startpos, help=startpos_help)
+    query_help = "one query length per start-pos; omitted: config.DECODE_ROWS_PER_REQUEST each"
+    parser.add_argument("--query-lens", type=parse_decode_query_lens, help=query_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -419,13 +421,14 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.set_defaults(tokens=1, requests=1, pages=8)
     args = parser.parse_args()
+    configure_decode_workload(args, parser)
     if args.startpos is not None:
-        args.tokens = args.requests = len(args.startpos)
-        args.pages = (max(args.startpos) + 128) // 128
+        max_end = max(pos + length for pos, length in zip(args.startpos, args.query_lens))
+        args.pages = (max_end + 127) // 128
     host = l3_decode_c1a_reindex
     values = build_hc_validation_values(
         "reindex", args.tokens, args.pages, args.requests, args.seed, args.case,
-        start_pos=args.startpos,
+        start_pos=args.startpos, query_lens=args.query_lens,
     )
     # Independent initial storage for each harness allocation.
     specs = [

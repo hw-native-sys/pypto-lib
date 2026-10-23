@@ -361,7 +361,7 @@ def c2a_reuse_window_cache_compare(
 
 
 if __name__ == "__main__":
-    from utils import parse_decode_startpos
+    from utils import configure_decode_workload, parse_decode_query_lens, parse_decode_startpos
 
     import argparse
     from pypto.ir import DistributedConfig
@@ -370,8 +370,10 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    startpos_help = "one position per request; omitted: default validation workload"
-    parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
+    startpos_help = "one starting position per request; omitted: default validation workload"
+    parser.add_argument("--start-pos", "--startpos", dest="startpos", type=parse_decode_startpos, help=startpos_help)
+    query_help = "one query length per start-pos; omitted: config.DECODE_ROWS_PER_REQUEST each"
+    parser.add_argument("--query-lens", type=parse_decode_query_lens, help=query_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["mixed", "long", "masked", "zero"], default="mixed")
     parser.add_argument("--compile-only", action="store_true")
@@ -382,9 +384,11 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.set_defaults(tokens=32, requests=6)
     args = parser.parse_args()
-    if args.startpos is not None:
-        args.tokens = args.requests = len(args.startpos)
-    values = build_hc_validation_values("reuse", args.tokens, args.requests, args.seed, args.case, start_pos=args.startpos)
+    configure_decode_workload(args, parser)
+    values = build_hc_validation_values(
+        "reuse", args.tokens, args.requests, args.seed, args.case,
+        start_pos=args.startpos, query_lens=args.query_lens,
+    )
     host = l3_decode_c2a_reuse
     specs = [
         TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=lambda name=name: values[name].clone())

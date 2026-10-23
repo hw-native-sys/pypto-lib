@@ -36,7 +36,7 @@ from sparse_attention import GATHER_WORKERS, attend_packed_cohorts
 from quant import quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache, dequantize_mxfp4_cache, dequantize_mxfp8_cache
 from utils import _publish_quantized_cache
 from rope_tables import precompute_rope_tables
-from utils import AttentionGoldenResult
+from utils import AttentionGoldenResult, packed_query_lengths
 from decode_indexer import index_pool_block_capacity
 
 from hc import golden_hc_pre, hc_pre
@@ -567,7 +567,9 @@ def golden_decode_attn_c1a_full(
     )
 
 
-def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None):
+def build_validation_values(
+    mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None, query_lens=None,
+):
     """Deterministic synthetic tensors at released model dimensions."""
     import math
 
@@ -580,10 +582,8 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
 
     cache_pages = PAGES * REQUESTS if start_pos is not None else PAGES
     torch.manual_seed(seed)
-    # Balanced token-to-request split. Every request carries the same page
-    # permutation, so the page-addressable caches stay conflict-free while the
-    # operator still routes TOKENS tokens through REQUESTS table rows.
-    lengths = [TOKENS // REQUESTS + (1 if index < TOKENS % REQUESTS else 0) for index in range(REQUESTS)]
+    # Packed token-to-request split.
+    lengths = packed_query_lengths(TOKENS, REQUESTS, query_lens)
     token_to_req = torch.repeat_interleave(
         torch.arange(REQUESTS), torch.tensor(lengths)
     ).to(torch.int32)
@@ -610,7 +610,7 @@ def build_validation_values(mode, tokens, pages, requests=1, seed=17, case="rand
     values["wo_a"], values["wo_a_scale"] = quantize_grouped_mxfp8_weight(values["wo_a"])
     positions = torch.arange(PAGES * 128 - 1, PAGES * 128 - TOKENS - 1, -1)
     if start_pos is not None:
-        positions = torch.tensor(start_pos, dtype=torch.int64)
+        positions = torch.cat([torch.arange(pos, pos + length) for pos, length in zip(start_pos, lengths)])
     freqs_cos, freqs_sin = precompute_rope_tables(PAGES * 128, compressed_attention=True)
     values["rope_cos"] = freqs_cos[positions].unsqueeze(0).expand(RANKS, -1, -1).contiguous()
     values["rope_sin"] = freqs_sin[positions].unsqueeze(0).expand(RANKS, -1, -1).contiguous()
@@ -791,11 +791,15 @@ def cache_compare(world_size, tokens, mode):
     return compare
 
 
-def build_hc_validation_values(mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None):
+def build_hc_validation_values(
+    mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None, query_lens=None,
+):
     """Create local HC token slabs and full-range attention operands."""
     import math
 
-    values = build_validation_values(mode, tokens, pages, requests, seed, case, start_pos=start_pos)
+    values = build_validation_values(
+        mode, tokens, pages, requests, seed, case, start_pos=start_pos, query_lens=query_lens,
+    )
     del values["x"]
     generator = torch.Generator().manual_seed(seed)
     local_tokens = (tokens + TP_SIZE - 1) // TP_SIZE
@@ -857,7 +861,7 @@ def golden_decode_c1a_full_case(tensors):
 
 
 if __name__ == "__main__":
-    from utils import parse_decode_startpos
+    from utils import configure_decode_workload, parse_decode_query_lens, parse_decode_startpos
 
     import argparse
 
@@ -867,8 +871,10 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    startpos_help = "one position per request; omitted: default validation workload"
-    parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
+    startpos_help = "one starting position per request; omitted: default validation workload"
+    parser.add_argument("--start-pos", "--startpos", dest="startpos", type=parse_decode_startpos, help=startpos_help)
+    query_help = "one query length per start-pos; omitted: config.DECODE_ROWS_PER_REQUEST each"
+    parser.add_argument("--query-lens", type=parse_decode_query_lens, help=query_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -879,13 +885,14 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.set_defaults(tokens=1, requests=1, pages=8)
     args = parser.parse_args()
+    configure_decode_workload(args, parser)
     if args.startpos is not None:
-        args.tokens = args.requests = len(args.startpos)
-        args.pages = (max(args.startpos) + 128) // 128
+        max_end = max(pos + length for pos, length in zip(args.startpos, args.query_lens))
+        args.pages = (max_end + 127) // 128
     host = l3_decode_c1a_full
     values = build_hc_validation_values(
         "full", args.tokens, args.pages, args.requests, args.seed, args.case,
-        start_pos=args.startpos,
+        start_pos=args.startpos, query_lens=args.query_lens,
     )
     # Independent initial storage for each harness allocation.
     specs = [

@@ -34,7 +34,7 @@ from sparse_attention import (
 from decode_indexer import decode_c2a_indexer, golden_c2a_index
 from o_proj import o_proj, o_proj_hc_post, golden_o_proj
 from golden import TensorSpec, ScalarSpec, ratio_allclose, mapped_pool_ratio_allclose, run
-from utils import AttentionGoldenResult, paged_slots, window_metadata
+from utils import AttentionGoldenResult, packed_query_lengths, paged_slots, window_metadata
 from quant import quantize_grouped_mxfp8_weight, dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache
 from rope_tables import precompute_rope_tables
 
@@ -621,7 +621,7 @@ def _plan(tokens, requests, case):
     return lengths, prefixes
 
 
-def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None):
+def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None, query_lens=None):
     """Deterministic inputs for ``golden_decode_attn_c2a_full``.
 
     case: "mixed" keeps contexts short so every causal position is selected, "long" pushes
@@ -635,8 +635,12 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None
     gen = torch.Generator().manual_seed(seed)
 
     lengths, prefixes = _plan(tokens, requests, case)
+    if query_lens is not None:
+        lengths = packed_query_lengths(tokens, requests, query_lens)
     if start_pos is not None:
-        lengths, prefixes = [1] * requests, list(start_pos)
+        if len(start_pos) != requests:
+            raise ValueError("start_pos must contain one prefix per request")
+        prefixes = list(start_pos)
     token_to_req_indices = torch.repeat_interleave(torch.arange(requests), torch.tensor(lengths))
     positions = torch.cat(
         [torch.arange(prefix, prefix + length) for prefix, length in zip(prefixes, lengths)]
@@ -892,14 +896,16 @@ def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     }
 
 
-def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed", start_pos=None):
+def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed", start_pos=None, query_lens=None):
     """Inputs for a reuse layer, taken from what a full layer actually published.
 
     The compressed pool and the Top-K row list come from running the full-mode
     reference on the same batch, so the fixture exercises the real Full-to-Reuse
     hand-off rather than a synthetic selection.
     """
-    source = make_c2a_inputs(tokens=tokens, requests=requests, seed=seed, case=case, start_pos=start_pos)
+    source = make_c2a_inputs(
+        tokens=tokens, requests=requests, seed=seed, case=case, start_pos=start_pos, query_lens=query_lens,
+    )
     published = golden_reference_c2a(source)
     values = {name: source[name] for name in REUSE_INPUT_NAMES if name != "compressed_indices"}
     values["compressed_cache"] = published["compressed_cache"]
@@ -914,10 +920,12 @@ def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed", start_po
     return values
 
 
-def build_hc_validation_values(mode, tokens=24, requests=6, seed=17, case="mixed", start_pos=None):
+def build_hc_validation_values(
+    mode, tokens=24, requests=6, seed=17, case="mixed", start_pos=None, query_lens=None,
+):
     """Build TP1 C2A weights, cache state, and mHC inputs."""
     values = (make_c2a_inputs if mode == "full" else make_c2a_reuse_inputs)(
-        tokens=tokens, requests=requests, seed=seed, case=case, start_pos=start_pos,
+        tokens=tokens, requests=requests, seed=seed, case=case, start_pos=start_pos, query_lens=query_lens,
     )
     del values["x"]
     values = {name: value.unsqueeze(0) for name, value in values.items()}
@@ -978,7 +986,7 @@ def golden_decode_c2a_full_case(tensors):
 
 
 if __name__ == "__main__":
-    from utils import parse_decode_startpos
+    from utils import configure_decode_workload, parse_decode_query_lens, parse_decode_startpos
 
     import argparse
     from pypto.ir import DistributedConfig
@@ -987,8 +995,10 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    startpos_help = "one position per request; omitted: default validation workload"
-    parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
+    startpos_help = "one starting position per request; omitted: default validation workload"
+    parser.add_argument("--start-pos", "--startpos", dest="startpos", type=parse_decode_startpos, help=startpos_help)
+    query_help = "one query length per start-pos; omitted: config.DECODE_ROWS_PER_REQUEST each"
+    parser.add_argument("--query-lens", type=parse_decode_query_lens, help=query_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["mixed", "long", "masked", "zero"], default="mixed")
     parser.add_argument("--compile-only", action="store_true")
@@ -999,9 +1009,11 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.set_defaults(tokens=24, requests=6)
     args = parser.parse_args()
-    if args.startpos is not None:
-        args.tokens = args.requests = len(args.startpos)
-    values = build_hc_validation_values("full", args.tokens, args.requests, args.seed, args.case, start_pos=args.startpos)
+    configure_decode_workload(args, parser)
+    values = build_hc_validation_values(
+        "full", args.tokens, args.requests, args.seed, args.case,
+        start_pos=args.startpos, query_lens=args.query_lens,
+    )
     host = l3_decode_c2a_full
     specs = [
         TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=lambda name=name: values[name].clone())
