@@ -10,19 +10,9 @@
 
 import sys
 from dataclasses import dataclass
-from enum import Enum
 from typing import Literal, Optional, Tuple
 
 import pypto.language as pl
-
-
-class AttentionMode(str, Enum):
-    """Static attention implementation selected for one backbone layer."""
-
-    SWA = "swa"
-    FULL = "full"
-    REINDEX = "reindex"
-    REUSE = "reuse"
 
 
 @dataclass(frozen=True)
@@ -34,7 +24,7 @@ class DeepSeekV41LayerConfig:
     kv_source_layer_id: Optional[int]
     index_source_layer_id: Optional[int]
     is_kv_source: bool
-    mode: AttentionMode
+    mode: str
 
 
 @dataclass(frozen=True)
@@ -121,13 +111,13 @@ class DeepSeekV41Config:
         kv_source = self._active_source(layer_id, ratio, self.kv_source_layer_ids)
         index_source = self._active_source(layer_id, ratio, self.index_source_layer_ids)
         if ratio == 0:
-            mode = AttentionMode.SWA
+            mode = "swa"
         elif layer_id in self.kv_source_layer_ids:
-            mode = AttentionMode.FULL
+            mode = "full"
         elif layer_id in self.index_source_layer_ids:
-            mode = AttentionMode.REINDEX
+            mode = "reindex"
         else:
-            mode = AttentionMode.REUSE
+            mode = "reuse"
         return DeepSeekV41LayerConfig(
             layer_id=layer_id,
             compression_ratio=ratio,
@@ -324,8 +314,7 @@ def set_moe_tokens(tokens: int) -> None:
 # Shared MoE deployment dimensions
 EP_SIZE = get_ep_size()
 N_LOCAL_EXPERTS = FLASH.n_routed_experts // EP_SIZE
-LOCAL_DECODE_TOKENS = (DECODE_MAX_TOKENS + TP_SIZE - 1) // TP_SIZE
-MOE_TOKENS = (LOCAL_DECODE_TOKENS + 15) // 16 * 16
+MOE_TOKENS = (DECODE_MAX_TOKENS + 15) // 16 * 16
 MOE_RECV_MAX = EP_SIZE * MOE_TOKENS
 # Input gather publishes each rank's complete padded physical slab.
 DECODE_INPUT_MAX_TOKENS = max(DECODE_MAX_TOKENS, MOE_TOKENS)

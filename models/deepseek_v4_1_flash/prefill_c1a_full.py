@@ -23,7 +23,7 @@ from pypto.ir import DistributedConfig
 from config import (
     FLASH as M, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
     INDEX_POOL_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, PREFILL_MAX_TOKENS, SP_T_DYN,
-    WINDOW_CACHE_GROUP, AttentionMode, BLOCK_SIZE,
+    WINDOW_CACHE_GROUP, BLOCK_SIZE,
 )
 from hc import golden_mhc_mixes, hc_mixes
 from hc import golden_hc_post, hc_post, prefill_sp_post
@@ -34,7 +34,7 @@ from sparse_attention import (
     prefill_publish_window,
 )
 from hc import HC_INPUT_NAMES, make_hc_inputs
-from utils import token_shards, AttentionGoldenResult
+from utils import token_shards
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
@@ -345,31 +345,31 @@ def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, 
                 value = value[:active_tokens]
             kwargs[name] = value
         results.append(golden_fn(**kwargs))
-    reduced = _reduce_tp_partials([result.output for result in results])
+    reduced = _reduce_tp_partials([result["output"] for result in results])
     if active_tokens is None:
         tensors['output'][:] = reduced.unsqueeze(0)
     else:
         tensors['output'][:, :active_tokens] = reduced.unsqueeze(0)
     for rank, result in enumerate(results):
-        tensors['window_cache'][rank].copy_(result.window_cache)
-        _copy_storage(tensors['window_cache_scale'][rank], result.window_cache_scale)
+        tensors['window_cache'][rank].copy_(result["window_cache"])
+        _copy_storage(tensors['window_cache_scale'][rank], result["window_cache_scale"])
         if mode == 'full':
-            tensors['compressed_cache'][rank].copy_(result.compressed_cache)
-            tensors['compressed_cache_scale'][rank].copy_(result.compressed_cache_scale)
-            tensors['index_cache'][rank].copy_(result.index_cache)
-            _copy_storage(tensors['index_cache_scale'][rank], result.index_cache_scale)
+            tensors['compressed_cache'][rank].copy_(result["compressed_cache"])
+            tensors['compressed_cache_scale'][rank].copy_(result["compressed_cache_scale"])
+            tensors['index_cache'][rank].copy_(result["index_cache"])
+            _copy_storage(tensors['index_cache_scale'][rank], result["index_cache_scale"])
             ids = tensors['pool_block_ids'][rank]
             counts = tensors['pool_block_counts'][rank]
             ids.fill_(-1)
             counts.zero_()
-            rows = result.pool_block_ids.shape[0]
-            ids[:rows].copy_(result.pool_block_ids)
-            counts[:rows].copy_(result.pool_block_counts)
+            rows = result["pool_block_ids"].shape[0]
+            ids[:rows].copy_(result["pool_block_ids"])
+            counts[:rows].copy_(result["pool_block_counts"])
         if mode in ('full', 'reindex'):
             if active_tokens is None:
-                tensors['topk_indices'][rank].copy_(result.topk_indices)
+                tensors['topk_indices'][rank].copy_(result["topk_indices"])
             else:
-                tensors['topk_indices'][rank, :active_tokens].copy_(result.topk_indices)
+                tensors['topk_indices'][rank, :active_tokens].copy_(result["topk_indices"])
 
 
 def _physical_to_logical(inputs: dict[str, torch.Tensor], rank: int, token: int) -> dict[int, int]:
@@ -498,10 +498,10 @@ def golden_prefill_attn_c1a_full(
     index_wq_b: torch.Tensor,
     index_wq_b_scale: torch.Tensor,
     index_weights_proj: torch.Tensor,
-) -> AttentionGoldenResult:
+) -> dict:
     """Return one rank's FP32 partial output and reference cache state."""
     return golden_compressed_attention(
-        mode=AttentionMode.FULL, ratio=1,
+        mode='full', ratio=1,
         x=x,
         wq_a=wq_a, wq_a_scale=wq_a_scale, q_norm_weight=q_norm_weight, wq_b=wq_b, wq_b_scale=wq_b_scale,
         wkv=wkv, wkv_scale=wkv_scale, kv_norm_weight=kv_norm_weight, attn_sink=attn_sink,
@@ -826,14 +826,14 @@ def c1a_sp_reference_attention(mode, tensors, x, ranks, *, reference):
             result['pool_block_counts'].zero_()
         if active:
             computed = reference(**values)
-            partial[:active] = computed.output
+            partial[:active] = computed["output"]
             for name in STATE_NAMES[mode]:
                 if name == 'topk_indices':
-                    result[name][:active] = computed.topk_indices
+                    result[name][:active] = computed["topk_indices"]
                 elif name in ('pool_block_ids', 'pool_block_counts'):
-                    result[name][:active] = getattr(computed, name)
+                    result[name][:active] = computed[name]
                 else:
-                    result[name] = getattr(computed, name)
+                    result[name] = computed[name]
         partials.append(partial)
         results.append(result)
     return (sum(partials).bfloat16(), results)

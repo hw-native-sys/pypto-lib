@@ -18,7 +18,7 @@ from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_all
 from config import (
     FLASH as M, BLOCK_SIZE, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
     INDEX_POOL_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP,
-    SP_T_DYN, AttentionMode,
+    SP_T_DYN,
 )
 from hc import golden_mhc_mixes, hc_mixes
 from hc import golden_hc_post, hc_post, prefill_sp_post
@@ -31,7 +31,6 @@ from sparse_attention import (
 from prefill_c1a_full import (
     CASE_DEFAULT, CASE_MAX_TOKENS, CASE_NAMES, apply_distributed_golden, fixture_token_count, make_fixture_values, topk_indices_compare, wrap_attention_compare, COMMON_INPUT_NAMES,
 )
-from utils import AttentionGoldenResult
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
@@ -204,10 +203,10 @@ def golden_prefill_attn_c1a_reindex(
     index_wq_b: torch.Tensor,
     index_wq_b_scale: torch.Tensor,
     index_weights_proj: torch.Tensor,
-) -> AttentionGoldenResult:
+) -> dict:
     """Return one rank's FP32 partial output and reference cache state."""
     return golden_compressed_attention(
-        mode=AttentionMode.REINDEX, ratio=1,
+        mode='reindex', ratio=1,
         x=x,
         wq_a=wq_a, wq_a_scale=wq_a_scale, q_norm_weight=q_norm_weight, wq_b=wq_b, wq_b_scale=wq_b_scale,
         wkv=wkv, wkv_scale=wkv_scale, kv_norm_weight=kv_norm_weight, attn_sink=attn_sink,

@@ -6,38 +6,27 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""C2A Reuse decode Attention half-layer composition entry."""
+"""C2A reuse decode attention with mHC."""
 
 
 import pypto.language as pl
-import torch
-from golden import mapped_pool_ratio_allclose
-
-from decode_c2a_full import (
-    build_hc_validation_values, golden_c2a_hc_case, golden_reference_c2a_reuse,
-)
-
 from config import (
-    FLASH as M, LOCAL_T_DYN, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN,
-    COMPRESSED_CACHE_GROUP, WINDOW_CACHE_GROUP,
+    FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, COMPRESSED_CACHE_GROUP,
+    WINDOW_CACHE_GROUP,
 )
-from hc import hc_mixes
-from hc import hc_pre
-from hc import hc_post
+from hc import hc_mixes, hc_pre, hc_post
 from rmsnorm import rms_norm_tiled
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
 from sparse_attention import (
-    PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH,
-    gather_packed_chunk, attend_c2a_chunk, publish_window_row, attend_packed_cohorts,
+    PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk, attend_c2a_chunk,
+    publish_window_row, attend_packed_cohorts,
 )
 from o_proj import o_proj
-from golden import TensorSpec, ScalarSpec, ratio_allclose, run
-from utils import AttentionGoldenResult
 
 # model config
-LOCAL_H = M.num_attention_heads // TP_SIZE
-LOCAL_O_GROUPS = M.o_groups // TP_SIZE
-LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+LOCAL_H = M.num_attention_heads
+LOCAL_O_GROUPS = M.o_groups
+LOCAL_O_WIDTH = M.o_groups * M.o_lora_rank
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -97,20 +86,19 @@ def decode_c2a_reuse(
         rms_norm_tiled(x_attn, attn_norm_weight, x_norm, worker, tokens, output_fp32=False)
 
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(
-        qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens,
-        max_workers=64 if TP_SIZE == 1 else 2147483647,
-    )
+
+    query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=64)
+    window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
     publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
 
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     chunk_done = cache_ready
-    if TP_SIZE == 1 and num_tokens <= 12:
+
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    if num_tokens <= 12:
         chunk_done = attend_packed_cohorts(
             query, window_indices, window_cache, window_cache_scale, compressed_indices,
             compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
@@ -187,158 +175,87 @@ def l2_decode_c2a_reuse(
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     return decode_c2a_reuse(
-        x_hc,
-        pre_mix,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
+        x_hc, pre_mix,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_weight,
-        wq_a,
-        wq_a_scale,
-        q_norm_weight,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        wkv_scale,
-        kv_norm_weight,
+        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight,
         attn_sink,
-        wo_a, wo_a_scale,
-        wo_b,
-        wo_b_scale,
-        rope_cos,
-        rope_sin,
-        window_slots,
-        window_indices,
-        window_cache,
-        window_cache_scale,
-        compressed_cache,
-        compressed_cache_scale,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin,
+        window_slots, window_indices,
+        window_cache, window_cache_scale,
+        compressed_cache, compressed_cache_scale,
         compressed_indices,
-        output,
-        next_pre_mix,
+        output, next_pre_mix,
         num_tokens,
     )
 
 
 @pl.jit.host
 def l3_decode_c2a_reuse(
-    x_hc: pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32],
-    hc_attn_fn: pl.Tensor[[TP_SIZE, MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[TP_SIZE, 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[TP_SIZE, MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[TP_SIZE, D], pl.BF16],
-    wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[TP_SIZE, D // MX_GROUP, Q_LORA], pl.FP8E8M0],
-    q_norm_weight: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[TP_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-    wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[TP_SIZE, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
-    kv_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[TP_SIZE, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
-    rope_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[TP_SIZE, T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[TP_SIZE, T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.Tensor[[TP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[TP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
-    compressed_indices: pl.Tensor[[TP_SIZE, T_DYN, INDEX_TOPK], pl.INT32],
-    output: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    next_pre_mix: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    output: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_hc.bind_dynamic(1, LOCAL_T_DYN)
-    window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
-    compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
-    wq_a_scale_mx: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[0]
-    wq_b_scale_mx: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[0]
-    wkv_scale_mx: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[0]
-    wo_b_scale_mx: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[0]
+    x_hc.bind_dynamic(0, LOCAL_T_DYN)
+    window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
+    wq_a_scale_mx: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale
+    wq_b_scale_mx: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale
+    wkv_scale_mx: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale
+    wo_b_scale_mx: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale
     l2_decode_c2a_reuse(
-        x_hc[0],
-        pre_mix[0],
-        hc_attn_fn[0],
-        hc_attn_scale[0],
-        hc_attn_base[0],
-        attn_norm_weight[0],
-        wq_a[0],
-        wq_a_scale_mx,
-        q_norm_weight[0],
-        wq_b[0],
-        wq_b_scale_mx,
-        wkv[0],
-        wkv_scale_mx,
-        kv_norm_weight[0],
-        attn_sink[0],
-        wo_a[0], wo_a_scale[0],
-        wo_b[0],
-        wo_b_scale_mx,
-        rope_cos[0],
-        rope_sin[0],
-        window_slots[0],
-        window_indices[0],
-        window_cache[0],
-        window_cache_scale[0],
-        compressed_cache[0],
-        compressed_cache_scale[0],
-        compressed_indices[0],
-        output[0],
-        next_pre_mix[0],
-        num_tokens,
-        device=0,
+        x_hc, pre_mix,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_weight,
+        wq_a, wq_a_scale_mx, q_norm_weight, wq_b, wq_b_scale_mx,
+        wkv, wkv_scale_mx, kv_norm_weight,
+        attn_sink,
+        wo_a, wo_a_scale, wo_b, wo_b_scale_mx,
+        rope_cos, rope_sin,
+        window_slots, window_indices,
+        window_cache, window_cache_scale,
+        compressed_cache, compressed_cache_scale,
+        compressed_indices,
+        output, next_pre_mix,
+        num_tokens, device=0,
     )
-
-
-def golden_decode_attn_c2a_reuse(
-    x: "torch.Tensor",
-    wq_a: "torch.Tensor",
-    wq_a_scale: "torch.Tensor",
-    q_norm_weight: "torch.Tensor",
-    wq_b: "torch.Tensor",
-    wq_b_scale: "torch.Tensor",
-    wkv: "torch.Tensor",
-    wkv_scale: "torch.Tensor",
-    kv_norm_weight: "torch.Tensor",
-    attn_sink: "torch.Tensor",
-    wo_a: "torch.Tensor",
-    wo_a_scale: "torch.Tensor",
-    wo_b: "torch.Tensor",
-    wo_b_scale: "torch.Tensor",
-    rope_cos: "torch.Tensor",
-    rope_sin: "torch.Tensor",
-    window_slots: "torch.Tensor",
-    window_indices: "torch.Tensor",
-    window_cache: "torch.Tensor",
-    window_cache_scale: "torch.Tensor",
-    compressed_cache: "torch.Tensor",
-    compressed_cache_scale: "torch.Tensor",
-    compressed_indices: "torch.Tensor",
-) -> "AttentionGoldenResult":
-    """Evaluate C2A decode reuse against published compressed cache rows."""
-    result = golden_reference_c2a_reuse(locals())
-    return AttentionGoldenResult(
-        **result,
-        compressed_cache=compressed_cache,
-        compressed_cache_scale=compressed_cache_scale,
-        index_cache=None,
-        index_cache_scale=None,
-        state_cache=None,
-        topk_indices=compressed_indices,
-    )
-
-
-def golden_decode_c2a_reuse_case(tensors):
-    golden_c2a_hc_case(tensors, golden_decode_attn_c2a_reuse)
 
 
 if __name__ == "__main__":
+    from golden import mapped_pool_ratio_allclose, ratio_allclose, run
+    from decode_c2a_full import build_c2a_specs, golden_c2a
+    from functools import partial
+
     from utils import configure_decode_workload, parse_decode_query_lens, parse_decode_startpos
 
     import argparse
@@ -363,31 +280,26 @@ if __name__ == "__main__":
     parser.set_defaults(tokens=32, requests=6)
     args = parser.parse_args()
     configure_decode_workload(args, parser)
-    values = build_hc_validation_values(
-        "reuse", args.tokens, args.requests, args.seed, args.case,
-        start_pos=args.startpos, query_lens=args.query_lens,
-    )
     host = l3_decode_c2a_reuse
-    specs = [
-        TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=lambda name=name: values[name].clone())
-        for name in host.param_names if name != "num_tokens"
-    ]
-    specs.append(ScalarSpec("num_tokens", torch.int32, args.tokens))
+    specs = build_c2a_specs(
+        "reuse", args.tokens, args.requests, args.seed, args.case,
+        start_pos=args.startpos, query_lens=args.query_lens, param_names=host.param_names,
+    )
     result = run(
         fn=host,
         specs=specs,
-        golden_fn=golden_decode_c2a_reuse_case,
+        golden_fn=partial(golden_c2a, mode="reuse"),
         compare_fn={
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "window_cache": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window cache", mapping_shape=(1, args.tokens),
-                block_size=128, leading_rank_axis=True,
+                "window_slots", pool_name="window cache", mapping_shape=(args.tokens,),
+                block_size=128, leading_rank_axis=False,
                 atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
             ),
             "window_cache_scale": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window cache scale", mapping_shape=(1, args.tokens),
-                block_size=128, leading_rank_axis=True,
+                "window_slots", pool_name="window cache scale", mapping_shape=(args.tokens,),
+                block_size=128, leading_rank_axis=False,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
         },

@@ -11,51 +11,30 @@
 """DeepSeek-V4.1 decode attention and MoE block."""
 
 
-import argparse
-import inspect
-from dataclasses import dataclass
-from enum import IntEnum
-from typing import Any, Mapping
-
-import torch
-
-from quant import decode_e8m0
-import torch.nn.functional as F
 import pypto.language as pl
 import pypto.language.distributed as pld
-
 from config import (
-    FLASH as M, AttentionMode,
-    DECODE_MAX_TOKENS, MOE_TOKENS, TP_SIZE, SUPPORTED_EP_SIZES,
-    B_DYN, T_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, TABLE_DYN,
-    ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, STATE_BLOCKS_DYN,
-    COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
+    FLASH as M, MOE_TOKENS, B_DYN, T_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, TABLE_DYN, ORI_BLOCKS_DYN,
+    CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, STATE_BLOCKS_DYN, COMPRESSED_CACHE_GROUP,
+    INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
 )
 from compressor import STATE_WIDTH
-from decode_c1a_full import decode_c1a_full, golden_decode_attn_c1a_full
-from decode_c1a_reindex import decode_c1a_reindex, golden_decode_attn_c1a_reindex
-from decode_c1a_reuse import decode_c1a_reuse, golden_decode_attn_c1a_reuse
-from decode_c2a_full import decode_c2a_full, golden_decode_attn_c2a_full
-from decode_c2a_reuse import decode_c2a_reuse, golden_decode_attn_c2a_reuse
+from decode_c1a_full import decode_c1a_full
+from decode_c1a_reindex import decode_c1a_reindex
+from decode_c1a_reuse import decode_c1a_reuse
+from decode_c2a_full import decode_c2a_full
+from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
-from gate import golden_gate_reference as gate
-from hc import golden_mhc_mixes, golden_hc_post, golden_hc_pre
-from decode_moe import moe
 from decode_moe import (
-    AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD,
-    clear_moe_signals,
+    moe, AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals,
 )
-from quant import pack_mx_b_scale, unpack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp4_weight, quantize_mxfp8_cache, quantize_grouped_mxfp8_weight, dequantize_mxfp4_cache
-from rmsnorm import golden_rms_norm
-from sparse_attention import golden_swa_attention
-from utils import AttentionGoldenResult
 
 
 # model config
-LOCAL_H = M.num_attention_heads // TP_SIZE
-LOCAL_O_GROUPS = M.o_groups // TP_SIZE
-LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+LOCAL_H = M.num_attention_heads
+LOCAL_O_GROUPS = M.o_groups
+LOCAL_O_WIDTH = M.o_groups * M.o_lora_rank
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -501,6 +480,28 @@ def l3_decode_layer(
             moe_num_tokens, layer_id, rank, attention_num_tokens, moe_epoch,
             device=rank,
         )
+
+
+import inspect
+import torch
+import torch.nn.functional as F
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import Any, Mapping
+from quant import (
+    decode_e8m0, pack_mx_b_scale, unpack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp4_weight,
+    quantize_mxfp8_cache, quantize_grouped_mxfp8_weight, dequantize_mxfp4_cache,
+)
+from config import DECODE_MAX_TOKENS
+from decode_c1a_full import golden_c1a
+from decode_c2a_full import golden_c2a
+from decode_swa import golden_swa
+from gate import golden_gate_reference as gate
+from hc import golden_mhc_mixes, golden_hc_post, golden_hc_pre
+from rmsnorm import golden_rms_norm
+from sparse_attention import golden_swa_attention
+
+
 class DecodeLayerKind(IntEnum):
     """Attention branch used by one decode Block."""
 
@@ -525,19 +526,19 @@ REPRESENTATIVE_LAYER_IDS = {
 def decode_layer_kind(layer_id: int) -> DecodeLayerKind:
     """Map the checkpoint-backed layer schedule to one decode branch."""
     layer = M.layer_config(layer_id)
-    if layer.mode == AttentionMode.SWA:
+    if layer.mode == 'swa':
         return DecodeLayerKind.SWA
-    if layer.compression_ratio == 2 and layer.mode == AttentionMode.FULL:
+    if layer.compression_ratio == 2 and layer.mode == 'full':
         return DecodeLayerKind.C2A_FULL
-    if layer.compression_ratio == 2 and layer.mode == AttentionMode.REUSE:
+    if layer.compression_ratio == 2 and layer.mode == 'reuse':
         return DecodeLayerKind.C2A_REUSE
-    if layer.compression_ratio == 1 and layer.mode == AttentionMode.FULL:
+    if layer.compression_ratio == 1 and layer.mode == 'full':
         return DecodeLayerKind.C1A_FULL
-    if layer.compression_ratio == 1 and layer.mode == AttentionMode.REINDEX:
+    if layer.compression_ratio == 1 and layer.mode == 'reindex':
         return DecodeLayerKind.C1A_REINDEX
-    if layer.compression_ratio == 1 and layer.mode == AttentionMode.REUSE:
+    if layer.compression_ratio == 1 and layer.mode == 'reuse':
         return DecodeLayerKind.C1A_REUSE
-    raise ValueError(f"unsupported decode layer {layer_id}: ratio={layer.compression_ratio}, mode={layer.mode.value}" )
+    raise ValueError(f"unsupported decode layer {layer_id}: ratio={layer.compression_ratio}, mode={layer.mode}" )
 
 
 @dataclass(frozen=True)
@@ -551,122 +552,7 @@ class DecodeLayerGoldenResult:
     attention_hidden: torch.Tensor
     ffn_input: torch.Tensor
     ffn_output: torch.Tensor
-    attention: AttentionGoldenResult
-
-
-@dataclass(frozen=True)
-class DecodeTokenShard:
-    """One TP rank's fixed-capacity token slab and its request metadata."""
-
-    hidden: torch.Tensor
-    token_ids: torch.Tensor
-    position_ids: torch.Tensor
-    valid_mask: torch.Tensor
-
-
-def sequence_parallel_bounds(
-    num_tokens: int, tp_size: int, tp_rank: int, capacity: int | None = None
-) -> tuple[int, int, int]:
-    """Return ``(first, count, width)`` for one contiguous TP slab.
-
-    Physical slab width uses capacity, including padding and idle ranks.
-    """
-    if num_tokens < 0:
-        raise ValueError("num_tokens must be non-negative")
-    if tp_size <= 0:
-        raise ValueError("tp_size must be positive")
-    if not 0 <= tp_rank < tp_size:
-        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
-    physical = num_tokens if capacity is None else capacity
-    if physical < num_tokens:
-        raise ValueError(f"capacity {physical} cannot be smaller than {num_tokens} active tokens")
-    width = (physical + tp_size - 1) // tp_size if physical else 0
-    first = min(tp_rank * width, num_tokens)
-    count = max(0, min(width, num_tokens - first))
-    return first, count, width
-
-
-def shard_decode_batch(
-    hidden: torch.Tensor,
-    token_ids: torch.Tensor,
-    position_ids: torch.Tensor,
-    valid_mask: torch.Tensor | None = None,
-    *,
-    tp_size: int,
-    capacity: int | None = None,
-) -> tuple[DecodeTokenShard, ...]:
-    """Split global token rows into TP slabs with token_id=-1 and valid_mask=False padding."""
-    if hidden.ndim < 1:
-        raise ValueError("hidden must have a token dimension")
-    num_tokens = hidden.shape[0]
-    if token_ids.shape != (num_tokens,) or position_ids.shape != (num_tokens,):
-        raise ValueError("token_ids and position_ids must have one entry per token")
-    if valid_mask is None:
-        valid_mask = torch.ones(num_tokens, dtype=torch.bool, device=hidden.device)
-    if valid_mask.shape != (num_tokens,) or valid_mask.dtype is not torch.bool:
-        raise ValueError("valid_mask must be a bool vector with one entry per token")
-    if not bool(valid_mask.all()):
-        raise ValueError("sequence-parallel ownership requires a contiguous valid token prefix")
-
-    shards: list[DecodeTokenShard] = []
-    for rank in range(tp_size):
-        first, count, width = sequence_parallel_bounds(num_tokens, tp_size, rank, capacity)
-        local_hidden = hidden.new_zeros((width, *hidden.shape[1:]))
-        local_tokens = torch.full((width,), -1, dtype=token_ids.dtype, device=token_ids.device)
-        local_positions = torch.full((width,), -1, dtype=position_ids.dtype, device=position_ids.device)
-        local_valid = torch.zeros(width, dtype=torch.bool, device=hidden.device)
-        if count:
-            local_hidden[:count].copy_(hidden[first : first + count])
-            local_tokens[:count].copy_(token_ids[first : first + count])
-            local_positions[:count].copy_(position_ids[first : first + count])
-            local_valid[:count] = True
-        shards.append(DecodeTokenShard(local_hidden, local_tokens, local_positions, local_valid))
-    return tuple(shards)
-
-
-def gather_decode_batch(shards: tuple[DecodeTokenShard, ...] | list[DecodeTokenShard], num_tokens: int) -> DecodeTokenShard:
-    """Restore global token order from TP slabs using their physical width."""
-    if not shards:
-        raise ValueError("at least one TP shard is required")
-    tp_size = len(shards)
-    slab_width = shards[0].hidden.shape[0]
-    pieces = []
-    token_pieces = []
-    position_pieces = []
-    mask_pieces = []
-    for rank, shard in enumerate(shards):
-        if shard.hidden.shape[0] != slab_width:
-            raise ValueError(f"rank {rank} has slab width {shard.hidden.shape[0]}, expected {slab_width}" )
-        first, count, _ = sequence_parallel_bounds(num_tokens, tp_size, rank, capacity=slab_width * tp_size )
-        if count:
-            pieces.append(shard.hidden[:count])
-            token_pieces.append(shard.token_ids[:count])
-            position_pieces.append(shard.position_ids[:count])
-            mask_pieces.append(shard.valid_mask[:count])
-    if pieces:
-        hidden = torch.cat(pieces, dim=0)
-        token_ids = torch.cat(token_pieces, dim=0)
-        position_ids = torch.cat(position_pieces, dim=0)
-        valid_mask = torch.cat(mask_pieces, dim=0)
-    else:
-        template = shards[0].hidden
-        hidden = template[:0]
-        token_ids = shards[0].token_ids[:0]
-        position_ids = shards[0].position_ids[:0]
-        valid_mask = shards[0].valid_mask[:0]
-    if hidden.shape[0] != num_tokens or not bool(valid_mask.all()):
-        raise RuntimeError("sequence-parallel gather did not restore every active token")
-    return DecodeTokenShard(hidden, token_ids, position_ids, valid_mask)
-
-
-ATTENTION_GOLDENS = {
-    DecodeLayerKind.SWA: golden_swa_attention,
-    DecodeLayerKind.C2A_FULL: golden_decode_attn_c2a_full,
-    DecodeLayerKind.C2A_REUSE: golden_decode_attn_c2a_reuse,
-    DecodeLayerKind.C1A_FULL: golden_decode_attn_c1a_full,
-    DecodeLayerKind.C1A_REINDEX: golden_decode_attn_c1a_reindex,
-    DecodeLayerKind.C1A_REUSE: golden_decode_attn_c1a_reuse,
-}
+    attention: dict
 
 
 def _select_inputs(function, values: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -687,15 +573,6 @@ def _golden_expert(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, w3: torc
     gate_value = F.linear(x.float(), w1.float()).clamp(max=M.swiglu_limit)
     up_value = F.linear(x.float(), w3.float()).clamp(-M.swiglu_limit, M.swiglu_limit)
     return F.linear(F.silu(gate_value) * up_value, w2.float())
-
-
-def _sequence_parallel_token_owners(tokens: int, tp_size: int) -> torch.Tensor:
-    if tp_size <= 0:
-        raise ValueError("tp_size must be positive")
-    width = (tokens + tp_size - 1) // tp_size if tokens else 0
-    if width == 0:
-        return torch.empty(0, dtype=torch.int32)
-    return torch.div(torch.arange(tokens, dtype=torch.int32), width, rounding_mode="floor")
 
 
 def _dequantize_mxfp8(weight: torch.Tensor, logical_scale_e8m0: torch.Tensor) -> torch.Tensor:
@@ -721,8 +598,6 @@ def golden_decode_moe(
     shared_w2_scale: torch.Tensor,
     shared_w3: torch.Tensor,
     shared_w3_scale: torch.Tensor,
-    token_owners: torch.Tensor | None = None,
-    tp_size: int = 1,
     num_tokens: int | None = None,
 ) -> torch.Tensor:
     """Evaluate one rank's dense MoE math without the EP transport harness."""
@@ -731,11 +606,6 @@ def golden_decode_moe(
     active_tokens = normalized.shape[0] if num_tokens is None else num_tokens
     if not 0 <= active_tokens <= normalized.shape[0]:
         raise ValueError("num_tokens must fit the local decode capacity")
-    if token_owners is not None:
-        expected = _sequence_parallel_token_owners(normalized.shape[0], tp_size)
-        if token_owners.shape != expected.shape or not torch.equal(token_owners.cpu(), expected):
-            raise ValueError("token_owners must follow the sequence-parallel slab ownership")
-
     normalized = normalized[:active_tokens]
     routed_w1 = dequantize_mxfp4_cache(routed_w1, routed_w1_scale, 32, "e8m0")
     routed_w2 = dequantize_mxfp4_cache(routed_w2, routed_w2_scale, 32, "e8m0")
@@ -778,14 +648,47 @@ def golden_decode_layer(
     """Evaluate the mHC-Attention-mHC-MoE-mHC Block order."""
     if num_tokens is not None and num_tokens != x_hc.shape[0]:
         raise ValueError("Block golden currently requires all capacity rows to be active")
-    attention_golden = ATTENTION_GOLDENS[decode_layer_kind(layer_id)]
-    attn_pre, attn_post, attn_residual = golden_mhc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base)
-    attention_input = golden_hc_pre(x_hc, incoming_pre_mix).to(torch.bfloat16)
-    normalized_attention = golden_rms_norm(attention_input, attn_norm_weight)
-    attention_kwargs = _select_inputs(attention_golden, attention_inputs, {"x": normalized_attention})
-    attention = attention_golden(**attention_kwargs)
-    attention_hidden = golden_hc_post(attention.output, x_hc, attn_post, attn_residual).to(torch.float32)
-
+    layer = M.layer_config(layer_id)
+    attention_tensors = {
+        name: value.clone() for name, value in attention_inputs.items()
+        if isinstance(value, torch.Tensor)
+    }
+    attention_tensors.update({
+        "x_hc": x_hc, "pre_mix": incoming_pre_mix,
+        "hc_attn_fn": hc_attn_fn, "hc_attn_scale": hc_attn_scale,
+        "hc_attn_base": hc_attn_base, "attn_norm_weight": attn_norm_weight,
+        "output": torch.empty_like(x_hc),
+        "next_pre_mix": torch.empty_like(incoming_pre_mix),
+    })
+    if layer.mode == "swa":
+        attention_tensors.update({
+            "incoming_pre_mix": attention_tensors["pre_mix"],
+            "attention_hidden": attention_tensors["output"],
+            "attention_pre_mix": attention_tensors["next_pre_mix"],
+            "attention_output": torch.empty_like(x_hc[:, 0], dtype=torch.bfloat16),
+            "num_tokens": x_hc.shape[0],
+        })
+        golden_swa(attention_tensors, reference=golden_swa_attention)
+        for name in (
+            "compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale", "state_cache",
+            "topk_indices", "candidate_mask", "pool_block_ids", "pool_block_counts",
+        ):
+            attention_tensors[name] = None
+    else:
+        golden = golden_c1a if layer.compression_ratio == 1 else golden_c2a
+        golden(attention_tensors, mode=layer.mode)
+    attention = {
+        name: attention_tensors[name] if isinstance(attention_tensors[name], torch.Tensor) else None
+        for name in (
+            "window_cache", "window_cache_scale", "compressed_cache", "compressed_cache_scale",
+            "index_cache", "index_cache_scale", "state_cache", "topk_indices", "candidate_mask",
+            "pool_block_ids", "pool_block_counts",
+        )
+    }
+    attention["output"] = attention_tensors["attention_output"]
+    attention_hidden = attention_tensors["output"]
+    attn_pre = attention_tensors["next_pre_mix"]
+    attention_input = attention_tensors["attention_input"]
     next_pre_mix, ffn_post, ffn_residual = golden_mhc_mixes(attention_hidden, hc_ffn_fn, hc_ffn_scale, hc_ffn_base)
     ffn_input = golden_hc_pre(attention_hidden, attn_pre).to(torch.bfloat16)
     moe_overrides = {"x": ffn_input, "norm_weight": ffn_norm_weight}
@@ -796,7 +699,7 @@ def golden_decode_layer(
     output = golden_hc_post(ffn_output, attention_hidden, ffn_post, ffn_residual).to(torch.float32)
     return DecodeLayerGoldenResult(
         output=output, next_pre_mix=next_pre_mix,
-        attention_input=attention_input, attention_output=attention.output, attention_hidden=attention_hidden,
+        attention_input=attention_input, attention_output=attention["output"], attention_hidden=attention_hidden,
         ffn_input=ffn_input, ffn_output=ffn_output,
         attention=attention,
     )
@@ -842,38 +745,31 @@ def build_tensor_specs(layer_id=0, seed=0):
 
     from golden import ScalarSpec, TensorSpec
     import decode_swa
-    from decode_moe import build_tensor_specs as build_moe_specs
+    from decode_moe import build_moe_specs
 
     global_tokens = DECODE_MAX_TOKENS
     args = SimpleNamespace(
         tokens=global_tokens, active_tokens=global_tokens, local_tokens=MOE_TOKENS,
-        requests=min(global_tokens, 8), tp=TP_SIZE, dp=EP_SIZE // TP_SIZE,
+        requests=min(global_tokens, 8), dp=1,
         seed=seed, epochs=1, bench=False, pages=1, case="mixed",
     )
-    attention_specs = decode_swa.build_specs(args)
+    rank_specs = [
+        {spec.name: spec for spec in decode_swa.build_swa_specs(SimpleNamespace(**dict(vars(args), seed=seed + rank)))}
+        for rank in range(EP_SIZE)
+    ]
     by_name = {}
-    groups = EP_SIZE // TP_SIZE
-    attention_outputs = {
-        "attention_output", "attention_hidden", "attention_pre_mix",
-        "num_tokens",
-    }
-    for spec in attention_specs:
-        if not isinstance(spec, TensorSpec) or spec.name in attention_outputs:
+    attention_outputs = {"attention_output", "attention_hidden", "attention_pre_mix", "num_tokens"}
+    boundary_inputs = {"x_hc", "incoming_pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight"}
+    for name, spec in rank_specs[0].items():
+        if not isinstance(spec, TensorSpec) or name in attention_outputs:
             continue
+        sources = [spec] * EP_SIZE if name in boundary_inputs else [rank[name] for rank in rank_specs]
 
-        rank_extent = spec.shape[0]
-        if rank_extent not in {TP_SIZE, EP_SIZE}:
-            raise ValueError(f"attention tensor {spec.name} has unsupported rank extent {rank_extent}" )
+        def grouped_init(sources=sources):
+            values = [source.create_tensor().clone() for source in sources]
+            return torch.stack([value.view(torch.uint8) for value in values]).view(values[0].dtype)
 
-        def grouped_init(spec=spec, rank_extent=rank_extent):
-            value = spec.init_value() if callable(spec.init_value) else spec.init_value
-            if rank_extent == EP_SIZE:
-                return value.clone()
-            return torch.cat([value.clone() for _ in range(groups)], dim=0)
-
-        shape = list(spec.shape)
-        shape[0] = EP_SIZE
-        by_name[spec.name] = replace(spec, shape=shape, init_value=grouped_init)
+        by_name[name] = replace(spec, shape=[EP_SIZE, *spec.shape], init_value=grouped_init, resident="stacked")
 
     moe_aliases = {
         "norm_weight": "ffn_norm_weight",
@@ -942,7 +838,7 @@ def build_tensor_specs(layer_id=0, seed=0):
 def _fixture_moe_counts():
     """Count valid decode rows in each rank's padded physical slab."""
     return torch.tensor(
-        [max(0, min(MOE_TOKENS, DECODE_MAX_TOKENS - (rank % TP_SIZE) * MOE_TOKENS)) for rank in range(EP_SIZE)],
+        [max(0, min(MOE_TOKENS, DECODE_MAX_TOKENS)) for rank in range(EP_SIZE)],
         dtype=torch.int32,
     )
 
@@ -955,18 +851,18 @@ def golden_l3_decode_layer(tensors):
     global_tokens = int(tensors["attention_num_tokens"])
     attention_hidden = tensors["attention_hidden"]
     attention_pre_mix = tensors["attention_pre_mix"]
-    for group_base in range(0, EP_SIZE, TP_SIZE):
+    for group_base in range(EP_SIZE):
         group = {}
         for name, value in tensors.items():
             if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == EP_SIZE:
-                group[name] = value[group_base : group_base + TP_SIZE]
+                group[name] = value[group_base]
             else:
                 group[name] = value
-        group["attention_output"] = tensors["attention_output"][group_base : group_base + TP_SIZE]
-        group["attention_hidden"] = attention_hidden[group_base : group_base + TP_SIZE]
-        group["attention_pre_mix"] = attention_pre_mix[group_base : group_base + TP_SIZE]
+        group["attention_output"] = tensors["attention_output"][group_base]
+        group["attention_hidden"] = attention_hidden[group_base]
+        group["attention_pre_mix"] = attention_pre_mix[group_base]
         group["num_tokens"] = global_tokens
-        decode_swa.golden_decode_swa(group)
+        decode_swa.golden_swa(group)
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = attention_hidden
@@ -1150,8 +1046,6 @@ def make_decode_layer_golden_inputs(layer_id: int) -> dict:
         "shared_w2_scale": shared_scale,
         "shared_w3": torch.randn(64, 64).to(torch.float8_e4m3fn),
         "shared_w3_scale": shared_scale,
-        "token_owners": torch.tensor([0, 1], dtype=torch.int32),
-        "tp_size": 4,
     }
     incoming_pre_mix = torch.zeros(2, 4)
     incoming_pre_mix[:, 0] = 1.0
@@ -1173,13 +1067,15 @@ def make_decode_layer_golden_inputs(layer_id: int) -> dict:
 
 
 if __name__ == "__main__":
+    import argparse
+    from config import SUPPORTED_EP_SIZES
+
     from golden import mapped_pool_ratio_allclose, ratio_allclose, ratio_reldiff, run
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1])
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=list(SUPPORTED_EP_SIZES))
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--layer-id", type=int, default=0)
@@ -1207,33 +1103,10 @@ if __name__ == "__main__":
         first_inputs = make_decode_layer_golden_inputs(0)
         first = golden_decode_layer(**first_inputs)
         tokens = first.output.shape[0]
-        token_ids = torch.arange(1000, 1000 + tokens, dtype=torch.int64)
-        position_ids = torch.arange(7, 7 + tokens, dtype=torch.int32)
-
-        hidden_slabs = shard_decode_batch(first.output, token_ids, position_ids, tp_size=4)
-        pre_mix_slabs = shard_decode_batch(first.next_pre_mix, token_ids, position_ids, tp_size=4)
-        for rank, (hidden_slab, pre_mix_slab) in enumerate(zip(hidden_slabs, pre_mix_slabs)):
-            first_row, count, width = sequence_parallel_bounds(tokens, 4, rank)
-            if hidden_slab.hidden.shape[0] != width or pre_mix_slab.hidden.shape[0] != width:
-                raise RuntimeError(f"rank {rank} slab width does not match the ownership rule")
-            if not torch.equal(hidden_slab.hidden[:count], first.output[first_row : first_row + count]):
-                raise RuntimeError(f"rank {rank} owns the wrong residual rows")
-            if not torch.equal(pre_mix_slab.hidden[:count], first.next_pre_mix[first_row : first_row + count]):
-                raise RuntimeError(f"rank {rank} owns the wrong delayed mHC rows")
-            if count < width and not bool((hidden_slab.hidden[count:] == 0).all()):
-                raise RuntimeError(f"rank {rank} leaves non-zero residual padding")
-
-        gathered = gather_decode_batch(hidden_slabs, tokens)
-        gathered_pre_mix = gather_decode_batch(pre_mix_slabs, tokens)
-        if not torch.equal(gathered.hidden, first.output) or not torch.equal(
-            gathered_pre_mix.hidden, first.next_pre_mix
-        ):
-            raise RuntimeError("the Attention boundary changed the residual stream or the delayed mHC rows")
-
         # Restore the next layer's residual stream and delayed pre-mix.
         second_inputs = make_decode_layer_golden_inputs(2)
-        second_inputs["x_hc"] = gathered.hidden
-        second_inputs["incoming_pre_mix"] = gathered_pre_mix.hidden
+        second_inputs["x_hc"] = first.output
+        second_inputs["incoming_pre_mix"] = first.next_pre_mix
         second = golden_decode_layer(**second_inputs)
 
         if second.output.shape != first.output.shape or second.next_pre_mix.shape != first.next_pre_mix.shape:
@@ -1241,12 +1114,12 @@ if __name__ == "__main__":
         if not bool(torch.isfinite(second.output).all()):
             raise RuntimeError("the second Decode layer produced non-finite hidden state")
         print(
-            f"[GOLDEN] PASS decode_layer chain layers=(0,2) TP=4 "
+            f"[GOLDEN] PASS decode_layer chain layers=(0,2) TP=1 "
             f"output={tuple(second.output.shape)} tokens={tokens}"
         )
         raise SystemExit(0)
-    if args.tp != TP_SIZE or args.ep != EP_SIZE:
-        parser.error("--tp/--ep are import-time configuration; pass them on the Python command line")
+    if args.ep != EP_SIZE:
+        parser.error("--ep is import-time configuration; pass it on the Python command line")
     devices = [int(device) for device in args.device.split(",") if device]
     if len(devices) != EP_SIZE:
         parser.error(f"need exactly {EP_SIZE} devices, got {devices}")

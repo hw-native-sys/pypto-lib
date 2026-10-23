@@ -13,7 +13,7 @@ import math
 
 import torch
 
-from config import AttentionMode
+
 from compressor import golden_compressor_ratio1 as compressor_ratio1
 from compressor import golden_compressor_ratio2_paged as compressor_ratio2_paged
 from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
@@ -21,11 +21,11 @@ from qkv_proj_rope import golden_rope_interleave as rope_interleave
 from o_proj import golden_o_proj, golden_grouped_output
 from qkv_proj_rope import golden_rope_tail
 from rmsnorm import golden_rms_norm
-from golden import ScalarSpec, TensorSpec
+from golden import TensorSpec
 from utils import _publish_quantized_cache
 from quant import dequantize_mxfp4_cache, dequantize_mxfp8_cache, quantize_mxfp8_upward_reference, quantize_grouped_mxfp8_weight, pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
-from utils import AttentionGoldenResult, packed_query_lengths, window_metadata
+from utils import packed_query_lengths, window_metadata
 
 from pathlib import Path
 
@@ -83,8 +83,6 @@ PACKED_ATTEND_SLOT_TILE = 1 if TP_SIZE == 1 else 2
 PACKED_KEY_PARTS = SELECTED_KEYS // PACKED_KEY_TILE
 
 
-
-
 # SWA tiling.
 SWA_HEAD_TILE = min(64, max(16, LOCAL_H)) if TP_SIZE == 1 else 32
 # Leave Vector space for the value-preserving query startup before QK.
@@ -113,7 +111,6 @@ def prefill_publish_window(
     return publish_tid
 
 
-
 @pl.jit.inline
 def prefill_publish_window_batched(
     kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
@@ -128,7 +125,6 @@ def prefill_publish_window_batched(
         for t in pl.range(worker, num_tokens, 64):
             _publish_window_row(kv, slots, cache, scales, t)
     return publish_tid
-
 
 
 @pl.jit.inline
@@ -264,7 +260,6 @@ def gather_window_batched(
     return gathered
 
 
-
 @pl.jit.inline(auto_scope=False)
 def gather_window_packed544(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
@@ -347,7 +342,6 @@ def gather_window_packed544(
                     if pl.tile.read(ids, [0, lane]) < 0:
                         pl.tile.store(zero, [token * SWA_WINDOW + column + lane, 0], dst)
     return gathered
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -442,7 +436,6 @@ def attend_window_tiled(
     return attention_done
 
 
-
 @pl.jit.inline(auto_scope=False)
 def decode_shared_cache(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
@@ -473,7 +466,6 @@ def decode_shared_cache(
             decoded = pl.reshape(decoded_bf16, [SWA_GATHER_TILE, HEAD_DIM])
             pl.tile.store(decoded, [row, 0], decoded_flat)
     return ready
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -514,7 +506,6 @@ def decode_shared_cache_packed(
             decoded = pl.reshape(decoded_bf16, [SWA_GATHER_TILE, HEAD_DIM])
             pl.tile.store(decoded, [row, 0], decoded_flat)
     return ready
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -567,7 +558,6 @@ def analyze_index_runs(
     return ready
 
 
-
 @pl.jit.inline(auto_scope=False)
 def decode_shared_cache_after_publish(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
@@ -599,7 +589,6 @@ def decode_shared_cache_after_publish(
             decoded = pl.reshape(decoded_bf16, [SWA_GATHER_TILE, HEAD_DIM])
             pl.tile.store(decoded, [row, 0], decoded_flat)
     return ready
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -724,7 +713,6 @@ def attend_shared_cache(
     return attention_done
 
 
-
 @pl.jit.inline(auto_scope=False)
 def attend_shared_cache_plain(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -827,7 +815,6 @@ def attend_shared_cache_plain(
     return attention_done
 
 
-
 @pl.jit.inline(auto_scope=False)
 def swa_attention_partial(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -873,7 +860,6 @@ def swa_attention_partial(
     return cache_consumed
 
 
-
 @pl.jit.inline(auto_scope=False)
 def swa_attention(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -887,7 +873,6 @@ def swa_attention(
     """Attend the active query prefix; leave caller-owned inactive rows untouched."""
     swa_attention_partial(query, cache, scales, indices, sink, output, num_tokens)
     return output
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -934,7 +919,6 @@ def _swa_attention_packed_partial(
     return cache_consumed
 
 
-
 @pl.jit.inline(auto_scope=False)
 def swa_attention_packed(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -974,7 +958,6 @@ def l2_sparse_attention_swa_packed(
 ):
     output = swa_attention_packed(query, cache, indices, sink, output, num_tokens)
     return output
-
 
 
 SWA_INPUT_NAMES = (
@@ -1140,118 +1123,6 @@ def make_packed_swa_inputs(tokens=257, requests=4, seed=17, case="mixed", start_
     return values
 
 
-def build_swa_leaf_specs(args, mode):
-    """Build shape-only specs; replay and compile-only never generate random weights."""
-    world_size = TP_SIZE * args.dp
-    packed = (getattr(args, "start_pos", None) is not None or mode == "prefill" or args.tokens > MAX_BATCH_PER_DP
-              or args.requests != args.tokens or args.case in ("prefix", "shuffle"))
-    if packed:
-        query_lens = getattr(args, "query_lens", None)
-        lengths = packed_query_lengths(args.tokens, args.requests, query_lens)
-        if query_lens is None and args.requests > 1 and lengths[-1] > 16:
-            lengths[0] += 7
-            lengths[-1] -= 7
-        prefixes = ([127, 128, 511, 1048000] * 8)[:args.requests] if args.case == "prefix" else [0] * args.requests
-        if getattr(args, "start_pos", None) is not None:
-            prefixes = args.start_pos
-        pages = 1 + sum((p + n + 128) // 128 - max(0, p - 127) // 128 + 1 for p, n in zip(prefixes, lengths))
-    else:
-        pages = args.tokens + 1
-    shapes = (
-        [args.tokens, D], [D, Q_LORA], [D // 32, Q_LORA], [Q_LORA],
-        [Q_LORA, LOCAL_H * HEAD_DIM], [Q_LORA // 32, LOCAL_H * HEAD_DIM],
-        [D, HEAD_DIM], [D // 32, HEAD_DIM], [HEAD_DIM], [LOCAL_H],
-        [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA],
-        [LOCAL_O_WIDTH, D], [LOCAL_O_WIDTH // 32, D],
-        [args.tokens, ROPE_DIM // 2], [args.tokens, ROPE_DIM // 2], [args.tokens], [args.tokens, 128],
-        [pages, 128, 1, HEAD_DIM], [pages, 128, 1, HEAD_DIM // 32],
-    )
-    bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
-    dtypes = (bf, fp, mx, bf, fp, mx, fp, mx, bf, torch.float32, fp, mx, fp, mx,
-              torch.float32, torch.float32, torch.int64, torch.int32, fp, bf)
-    values = {}
-
-    def initialize(name):
-        if not values:
-            ranks = []
-            for rank in range(world_size):
-                seed = args.seed + rank
-                if packed:
-                    value = make_packed_swa_inputs(
-                        args.tokens, args.requests, seed, args.case,
-                        start_pos=getattr(args, 'start_pos', None), query_lens=getattr(args, 'query_lens', None),
-                    )
-                else:
-                    value = make_swa_inputs(args.tokens, seed)
-                if not packed:
-                    if args.case == "masked":
-                        value["window_slots"].fill_(-1)
-                        value["window_indices"].fill_(-1)
-                    elif args.case == "zero":
-                        value["x"].zero_()
-                        value["window_cache"].view(torch.uint8).zero_()
-                    elif args.case == "sink":
-                        value["attn_sink"].fill_(1000)
-                ranks.append(value)
-            replicated = ("x", "wq_a", "wq_a_scale", "q_norm_weight", "wkv", "wkv_scale",
-                          "kv_norm_weight", "rope_cos", "rope_sin", "window_slots", "window_indices",
-                          "window_cache", "window_cache_scale")
-            for rank, value in enumerate(ranks):
-                for key in replicated:
-                    value[key] = ranks[rank // TP_SIZE * TP_SIZE][key]
-            for key in SWA_INPUT_NAMES:
-                dtype = ranks[0][key].dtype
-                shards = [r[key].view(torch.uint8) if dtype in (fp, mx) else r[key] for r in ranks]
-                values[key] = torch.stack(shards).view(dtype)
-        return values[name]
-
-    specs = [
-        TensorSpec(name, [world_size, *shape], dtype, init_value=lambda n=name: initialize(n), resident="stacked")
-        for name, shape, dtype in zip(SWA_INPUT_NAMES, shapes, dtypes)
-    ]
-    swa_benchmark_step = 1 if args.bench else None
-    output_tokens = (args.tokens + TP_SIZE - 1) // TP_SIZE if mode == "decode" else args.tokens
-    specs += [
-        TensorSpec("output", [world_size, output_tokens, D], bf, resident="stacked"),
-        ScalarSpec("num_tokens", torch.int32, args.tokens),
-        ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=swa_benchmark_step),
-    ]
-    return specs
-
-
-def golden_swa_leaf(tensors, sharded=False, *, mode="decode"):
-    """Reference each TP shard independently, then perform the FP32 TP reduction.
-
-    With ``sharded`` the summed rows are handed out as the contiguous token slabs
-    the kernel ReduceScatter produces, one per rank.
-    """
-    world_size = tensors["x"].shape[0]
-    active = int(tensors["num_tokens"])
-    for base in range(0, world_size, TP_SIZE):
-        partials = []
-        for rank in range(base, base + TP_SIZE):
-            inputs = {name: tensors[name][rank] for name in SWA_INPUT_NAMES}
-            cache_rows = inputs["window_cache"].shape[0] * 128
-            shared_cache = mode == "prefill" or (active >= 32 and cache_rows <= active * 128)
-            partial, cache, scale = swa_official_reference(inputs, shared_cache=shared_cache)
-            partials.append(partial)
-            tensors["window_cache"][rank].copy_(cache)
-            tensors["window_cache_scale"][rank].copy_(scale)
-        reduced = sum(partials).bfloat16()
-        if sharded:
-            # Ownership follows the fixed physical slab, so the active count only
-            # masks its suffix and T < TP keeps the AllGather row mapping.
-            width = tensors["output"].shape[1]
-            for offset in range(TP_SIZE):
-                first = min(offset * width, active)
-                count = max(0, min(width, active - first))
-                tensors["output"][base + offset].zero_()
-                if count:
-                    tensors["output"][base + offset][:count].copy_(reduced[first : first + count])
-        else:
-            tensors["output"][base:base + TP_SIZE].copy_(reduced.unsqueeze(0).expand(TP_SIZE, -1, -1))
-
-
 GOLDEN_SELECTED_KEY_TILE = 64
 GOLDEN_PREFILL_KEY_TILE = 128
 
@@ -1289,7 +1160,6 @@ def golden_selected_attention(q, window_value, window_indices, compressed_value,
     correction = torch.exp(maximum - final_maximum)
     denominator = denominator * correction + torch.exp(sink_value - final_maximum)
     return (numerator * (correction / denominator).unsqueeze(-1)).to(q.dtype)
-
 
 
 def golden_prefill_c1a_attention(
@@ -2277,9 +2147,6 @@ def validate_swa_core(args):
     return records
 
 
-
-
-
 def golden_swa_attention(
     x: torch.Tensor,
     wq_a: torch.Tensor,
@@ -2301,7 +2168,7 @@ def golden_swa_attention(
     window_indices: torch.Tensor,
     window_cache: torch.Tensor,
     window_cache_scale: torch.Tensor,
-) -> AttentionGoldenResult:
+) -> dict:
     """Evaluate SWA and publish the current token KV rows."""
     query, window_kv, _ = qkv_proj_rope(
         x,
@@ -2329,13 +2196,24 @@ def golden_swa_attention(
     output = golden_o_proj(
         attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale, wo_a_scale=wo_a_scale,
     )
-    return AttentionGoldenResult(
-        output, window_payload, updated_window_scale, None, None, None, None, None, None, None
-    )
+    return {
+        'output': output,
+        'window_cache': window_payload,
+        'window_cache_scale': updated_window_scale,
+        'compressed_cache': None,
+        'compressed_cache_scale': None,
+        'index_cache': None,
+        'index_cache_scale': None,
+        'state_cache': None,
+        'topk_indices': None,
+        'candidate_mask': None,
+        'pool_block_ids': None,
+        'pool_block_counts': None,
+    }
 
 
 def golden_compressed_attention(
-    mode: AttentionMode,
+    mode: str,
     ratio: int,
     x: torch.Tensor,
     wq_a: torch.Tensor,
@@ -2388,7 +2266,7 @@ def golden_compressed_attention(
     indexer_fn: Callable | None = None,
     index_key_fn: Callable | None = None,
     pool_selector_fn: Callable | None = None,
-) -> AttentionGoldenResult:
+) -> dict:
     """Evaluate C2A/C1A full, reindex, or reuse with paged cache state."""
     query, window_kv, query_latent = qkv_proj_rope(
         x,
@@ -2430,7 +2308,7 @@ def golden_compressed_attention(
     pool_ids = None
     pool_counts = None
 
-    if mode is AttentionMode.FULL:
+    if mode == 'full':
         if compressor_wkv is None or compressor_norm_weight is None or compressed_slots is None:
             raise ValueError("full mode requires compressor weights and compressed slots")
         if compressed_rope_cos is None or compressed_rope_sin is None or quantized_index is None:
@@ -2503,7 +2381,7 @@ def golden_compressed_attention(
             scale_format="e8m0",
         ).to(query.dtype)
 
-    if mode in (AttentionMode.FULL, AttentionMode.REINDEX):
+    if mode in ('full', 'reindex'):
         if index_wq_b is None or index_weights_proj is None:
             raise ValueError("indexing modes require query and score weights")
         if (
@@ -2520,7 +2398,7 @@ def golden_compressed_attention(
             index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
         )
         scores, topk_indices = indexer_fn(*index_args, topk=M.index_topk)
-        if ratio == 1 and mode is AttentionMode.FULL:
+        if ratio == 1 and mode == 'full':
             if pool_selector_fn is None:
                 raise ValueError("C1A Full requires a candidate-pool reference")
             pool_width = index_block_table.shape[-1] * 128
@@ -2537,26 +2415,23 @@ def golden_compressed_attention(
         attended, rope_cos, rope_sin, wo_a, wo_b, wo_b_scale,
         wo_a_scale=wo_a_scale, output_dtype=output_dtype, sequential_projection=sequential_query,
     )
-    return AttentionGoldenResult(
-        output,
-        window_payload,
-        updated_window_scale,
-        compressed_payload,
-        updated_compressed_scale,
-        index_payload,
-        updated_index_scale,
-        updated_state,
-        topk_indices,
-        candidates,
-        pool_ids,
-        pool_counts,
-    )
-
-
+    return {
+        'output': output,
+        'window_cache': window_payload,
+        'window_cache_scale': updated_window_scale,
+        'compressed_cache': compressed_payload,
+        'compressed_cache_scale': updated_compressed_scale,
+        'index_cache': index_payload,
+        'index_cache_scale': updated_index_scale,
+        'state_cache': updated_state,
+        'topk_indices': topk_indices,
+        'candidate_mask': candidates,
+        'pool_block_ids': pool_ids,
+        'pool_block_counts': pool_counts,
+    }
 
 
 prefill_attend_sparse = make_attend_selected_chunk(vector_query=True)
-
 
 
 if __name__ == "__main__":

@@ -6,44 +6,32 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""C2A Full decode Attention half-layer composition entry."""
+"""C2A full decode attention with mHC."""
 
-import inspect
-import math
 
 import pypto.language as pl
-import torch
-
 from config import (
-    FLASH as M, LOCAL_T_DYN, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN,
-    INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN, Q_START_DYN, STATE_BLOCKS_DYN,
-    COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
-    MAX_BATCH_PER_DP, BLOCK_SIZE,
+    FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
+    Q_START_DYN, STATE_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, STATE_CAPACITY,
+    WINDOW_CACHE_GROUP,
 )
-from compressor import publish_c2a_compressed, STATE_WIDTH, project_ratio2, compressor_ratio2, golden_compressor_ratio2_paged
-from hc import hc_mixes, golden_mhc_mixes
-from hc import hc_pre, golden_hc_pre
-from hc import hc_post, golden_hc_post, _hc_post_from_partial
-from rmsnorm import rms_norm_tiled, golden_rms_norm
-from qkv_proj_rope import qkv_proj_rope, golden_rope_tail, golden_qkv_proj_rope
+from compressor import (
+    publish_c2a_compressed, STATE_WIDTH, project_ratio2, compressor_ratio2, decode_c2a_compressor_rope,
+)
+from hc import hc_mixes, hc_pre, hc_post, _hc_post_from_partial
+from rmsnorm import rms_norm_tiled
+from qkv_proj_rope import qkv_proj_rope
 from sparse_attention import (
-    PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH,
-    gather_packed_chunk, attend_c2a_chunk, publish_window_row, attend_packed_cohorts,
-    golden_selected_attention,
+    PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk, attend_c2a_chunk,
+    publish_window_row, attend_packed_cohorts,
 )
-from decode_indexer import decode_c2a_indexer, golden_c2a_index
-from o_proj import o_proj, o_proj_hc_post, golden_o_proj
-from golden import TensorSpec, ScalarSpec, ratio_allclose, mapped_pool_ratio_allclose, run
-from utils import AttentionGoldenResult, packed_query_lengths, paged_slots, window_metadata
-from quant import quantize_grouped_mxfp8_weight, dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache
-from rope_tables import precompute_rope_tables
-
-from compressor import decode_c2a_compressor_rope
+from decode_indexer import decode_c2a_indexer
+from o_proj import o_proj, o_proj_hc_post
 
 # model config
-LOCAL_H = M.num_attention_heads // TP_SIZE
-LOCAL_O_GROUPS = M.o_groups // TP_SIZE
-LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+LOCAL_H = M.num_attention_heads
+LOCAL_O_GROUPS = M.o_groups
+LOCAL_O_WIDTH = M.o_groups * M.o_lora_rank
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -61,8 +49,6 @@ MX_GROUP = M.weight_block_size[0]
 IDX_GROUP = INDEX_CACHE_GROUP
 CMP_GROUP = COMPRESSED_CACHE_GROUP
 RATIO = 2
-E8M0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -137,7 +123,7 @@ def decode_c2a_full(
         x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
         qr, query, kv_projection, window_kv, num_tokens,
-        max_workers=64 if TP_SIZE == 1 else 2147483647,
+        max_workers=64,
         fuse_qnorm=False, q_b_n_tile=128, q_b_max_workers=2147483647,
     )
     publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
@@ -166,9 +152,10 @@ def decode_c2a_full(
         num_tokens, cache_ready, rotated_tid,
     )
 
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     chunk_done = pl.system.task_dummy(deps=[select_tid, state_tid, compressed_publish_tid])
-    if TP_SIZE == 1 and num_tokens <= 12:
+
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    if num_tokens <= 12:
         chunk_done = attend_packed_cohorts(
             query, window_indices, window_cache, window_cache_scale, topk_indices,
             compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
@@ -188,7 +175,7 @@ def decode_c2a_full(
                 name_hint="c2a_sparse_attn",
             )
 
-    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
+    if num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
         attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
         o_proj_hc_post(
             attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
@@ -202,7 +189,7 @@ def decode_c2a_full(
             partial, num_tokens, grouped_max_workers=4096,
         )
         attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-        if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
+        if num_tokens > 0 and num_tokens <= 16:
             _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
         else:
             with pl.spmd(tokens, name_hint="cast_out"):
@@ -280,361 +267,268 @@ def l2_decode_c2a_full(
     query_start_loc.bind_dynamic(0, Q_START_DYN)
     state_cache.bind_dynamic(0, STATE_BLOCKS_DYN)
     return decode_c2a_full(
-        x_hc,
-        pre_mix,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
+        x_hc, pre_mix,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_weight,
-        wq_a,
-        wq_a_scale,
-        q_norm_weight,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        wkv_scale,
-        kv_norm_weight,
+        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight,
         attn_sink,
-        wo_a, wo_a_scale,
-        wo_b,
-        wo_b_scale,
-        rope_cos,
-        rope_sin,
-        window_slots,
-        window_indices,
-        window_cache,
-        window_cache_scale,
-        compressed_cache,
-        compressed_cache_scale,
-        token_to_req_indices,
-        compressed_lens,
-        index_cache,
-        index_cache_scale,
-        index_block_table,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin,
+        window_slots, window_indices,
+        window_cache, window_cache_scale,
+        compressed_cache, compressed_cache_scale,
+        token_to_req_indices, compressed_lens,
+        index_cache, index_cache_scale, index_block_table,
         position_ids,
-        compressed_rope_cos,
-        compressed_rope_sin,
-        compressor_wkv,
-        compressor_wgate,
-        query_start_loc,
-        state_block_table,
-        state_cache,
+        compressed_rope_cos, compressed_rope_sin,
+        compressor_wkv, compressor_wgate,
+        query_start_loc, state_block_table, state_cache,
         compressor_norm_weight,
         compressed_slots,
-        index_wk,
-        index_norm_weight,
-        index_wq_b,
-        index_wq_b_scale,
-        index_weights_proj,
+        index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj,
         topk_indices,
-        output,
-        next_pre_mix,
+        output, next_pre_mix,
         num_tokens,
     )
 
 
 @pl.jit.host
 def l3_decode_c2a_full(
-    x_hc: pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32],
-    hc_attn_fn: pl.Tensor[[TP_SIZE, MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[TP_SIZE, 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[TP_SIZE, MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[TP_SIZE, D], pl.BF16],
-    wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[TP_SIZE, D // MX_GROUP, Q_LORA], pl.FP8E8M0],
-    q_norm_weight: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[TP_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-    wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[TP_SIZE, D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
-    kv_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[TP_SIZE, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[TP_SIZE, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
-    rope_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[TP_SIZE, T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[TP_SIZE, T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[TP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.InOut[pl.Tensor[[TP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[pl.Tensor[[TP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    token_to_req_indices: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
-    compressed_lens: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
-    index_cache: pl.InOut[pl.Tensor[[TP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
-    index_cache_scale: pl.InOut[pl.Tensor[[TP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
-    index_block_table: pl.Tensor[[TP_SIZE, B_DYN, TABLE_DYN], pl.INT32],
-    position_ids: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
-    compressed_rope_cos: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressed_rope_sin: pl.Tensor[[TP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressor_wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.FP32],
-    compressor_wgate: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.FP32],
-    query_start_loc: pl.Tensor[[TP_SIZE, Q_START_DYN], pl.INT32],
-    state_block_table: pl.Tensor[[TP_SIZE, B_DYN, 1], pl.INT32],
-    state_cache: pl.InOut[pl.Tensor[[TP_SIZE, STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
-    compressor_norm_weight: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
-    compressed_slots: pl.Tensor[[TP_SIZE, T_DYN], pl.INT64],
-    index_wk: pl.Tensor[[TP_SIZE, HEAD_DIM, INDEX_DIM], pl.BF16],
-    index_norm_weight: pl.Tensor[[TP_SIZE, INDEX_DIM], pl.BF16],
-    index_wq_b: pl.Tensor[[TP_SIZE, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
-    index_wq_b_scale: pl.Tensor[[TP_SIZE, Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0],
-    index_weights_proj: pl.Tensor[[TP_SIZE, D, INDEX_H], pl.BF16],
-    topk_indices: pl.InOut[pl.Tensor[[TP_SIZE, T_DYN, INDEX_TOPK], pl.INT32]],
-    output: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    next_pre_mix: pl.Out[pl.Tensor[[TP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
+    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
+    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
+    state_cache: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
+    compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    topk_indices: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
+    output: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_hc.bind_dynamic(1, LOCAL_T_DYN)
-    window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
-    compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
-    index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
-    index_block_table.bind_dynamic(1, B_DYN)
-    index_block_table.bind_dynamic(2, TABLE_DYN)
-    query_start_loc.bind_dynamic(1, Q_START_DYN)
-    state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
-    wq_a_scale_mx: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[0]
-    wq_b_scale_mx: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[0]
-    wkv_scale_mx: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[0]
-    wo_b_scale_mx: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[0]
-    index_wq_b_scale_mx: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = index_wq_b_scale[0]
+    x_hc.bind_dynamic(0, LOCAL_T_DYN)
+    window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
+    compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
+    index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
+    index_block_table.bind_dynamic(0, B_DYN)
+    index_block_table.bind_dynamic(1, TABLE_DYN)
+    query_start_loc.bind_dynamic(0, Q_START_DYN)
+    state_cache.bind_dynamic(0, STATE_BLOCKS_DYN)
+    wq_a_scale_mx: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale
+    wq_b_scale_mx: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale
+    wkv_scale_mx: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale
+    wo_b_scale_mx: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale
+    index_wq_b_scale_mx: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = index_wq_b_scale
     l2_decode_c2a_full(
-        x_hc[0],
-        pre_mix[0],
-        hc_attn_fn[0],
-        hc_attn_scale[0],
-        hc_attn_base[0],
-        attn_norm_weight[0],
-        wq_a[0],
-        wq_a_scale_mx,
-        q_norm_weight[0],
-        wq_b[0],
-        wq_b_scale_mx,
-        wkv[0],
-        wkv_scale_mx,
-        kv_norm_weight[0],
-        attn_sink[0],
-        wo_a[0], wo_a_scale[0],
-        wo_b[0],
-        wo_b_scale_mx,
-        rope_cos[0],
-        rope_sin[0],
-        window_slots[0],
-        window_indices[0],
-        window_cache[0],
-        window_cache_scale[0],
-        compressed_cache[0],
-        compressed_cache_scale[0],
-        token_to_req_indices[0],
-        compressed_lens[0],
-        index_cache[0],
-        index_cache_scale[0],
-        index_block_table[0],
-        position_ids[0],
-        compressed_rope_cos[0],
-        compressed_rope_sin[0],
-        compressor_wkv[0],
-        compressor_wgate[0],
-        query_start_loc[0],
-        state_block_table[0],
-        state_cache[0],
-        compressor_norm_weight[0],
-        compressed_slots[0],
-        index_wk[0],
-        index_norm_weight[0],
-        index_wq_b[0],
-        index_wq_b_scale_mx,
-        index_weights_proj[0],
-        topk_indices[0],
-        output[0],
-        next_pre_mix[0],
-        num_tokens,
-        device=0,
+        x_hc, pre_mix,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_weight,
+        wq_a, wq_a_scale_mx, q_norm_weight, wq_b, wq_b_scale_mx,
+        wkv, wkv_scale_mx, kv_norm_weight,
+        attn_sink,
+        wo_a, wo_a_scale, wo_b, wo_b_scale_mx,
+        rope_cos, rope_sin,
+        window_slots, window_indices,
+        window_cache, window_cache_scale,
+        compressed_cache, compressed_cache_scale,
+        token_to_req_indices, compressed_lens,
+        index_cache, index_cache_scale, index_block_table,
+        position_ids,
+        compressed_rope_cos, compressed_rope_sin,
+        compressor_wkv, compressor_wgate,
+        query_start_loc, state_block_table, state_cache,
+        compressor_norm_weight,
+        compressed_slots,
+        index_wk, index_norm_weight, index_wq_b, index_wq_b_scale_mx, index_weights_proj,
+        topk_indices,
+        output, next_pre_mix,
+        num_tokens, device=0,
     )
 
 
-def _write_rows(cache, rows, payload, width):
-    """Rewrite only ``rows`` of a paged cache, leaving every other byte alone."""
-    cache.view(torch.uint8).reshape(-1, width)[rows] = payload.contiguous().view(torch.uint8).reshape(-1, width)
+def golden_c2a(tensors, mode="full"):
+    """Compute mHC pre, C2A attention, cache updates, and mHC post."""
+    import torch
+    from compressor import golden_compressor_ratio2_paged
+    from hc import golden_mhc_mixes, golden_hc_pre, golden_hc_post
+    from rmsnorm import golden_rms_norm
+    from qkv_proj_rope import golden_qkv_proj_rope, golden_rope_tail
+    from decode_indexer import golden_c2a_index
+    from sparse_attention import golden_selected_attention
+    from o_proj import golden_o_proj
+    from functools import partial
+    from quant import quantize_mxfp8_cache, quantize_mxfp4_cache, dequantize_mxfp4_cache
+    from utils import _publish_quantized_cache
 
-
-def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
-    """Ratio-2 compressed sparse attention; publishes only the addressed cache rows."""
-    t = inputs
-    x = t["x"]
-    tokens = x.shape[0]
-    index_dim = t["index_norm_weight"].numel()
+    t = dict(tensors)
+    if "x_hc" in t:
+        x_hc = t["x_hc"]
+        next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
+            x_hc, t["hc_attn_fn"], t["hc_attn_scale"], t["hc_attn_base"],
+        )
+        attention_input = golden_hc_pre(x_hc, t["pre_mix"]).to(torch.bfloat16)
+        x = golden_rms_norm(attention_input, t["attn_norm_weight"])
+    else:
+        x = t["x"]
+    t["x"] = x
     head_dim = t["window_cache"].shape[-1]
 
-    # a. Query/KV projection and rotary embedding.
+    # Query/KV projection and rotary embedding.
     q, kv, qr = golden_qkv_proj_rope(
         x, t["wq_a"], t["wq_a_scale"], t["q_norm_weight"], t["wq_b"], t["wq_b_scale"],
         t["wkv"], t["wkv_scale"], t["kv_norm_weight"], t["rope_cos"], t["rope_sin"],
         sequential_query=True,
     )
 
-    # b. Sliding-window cache: MXFP8, group 32, BF16 scales; addressed rows only.
-    window_cache = t["window_cache"].clone()
-    window_cache_scale = t["window_cache_scale"].clone()
-    window_payload, window_scales = quantize_mxfp8_cache(kv)
-    window_slots = t["window_slots"].long()
-    window_valid = window_slots >= 0
-    window_rows = window_slots[window_valid]
-    # Boolean indexing of Float8 on CPU requires an exact FP32 roundtrip.
-    visible_payload = window_payload.float()[window_valid].to(window_payload.dtype)
-    _write_rows(window_cache, window_rows, visible_payload, head_dim)
-    window_cache_scale.reshape(-1, head_dim // MX_GROUP)[window_rows] = window_scales[window_valid]
-
-    # c. Ratio-2 compressor: per-channel two-way softmax over the pair, pooled row rounded to
-    #    BF16 before RMSNorm, published exactly when position_ids % 2 == 1. Ring rows
-    #    contain the KV projection followed by the gate score.
-    state_cache = t["state_cache"].clone()
-    latent, publish = golden_compressor_ratio2_paged(
-        x, t["query_start_loc"], t["position_ids"], t["token_to_req_indices"],
-        t["state_block_table"], state_cache, t["compressor_wkv"], t["compressor_wgate"],
-        t["compressor_norm_weight"],
+    # Sliding-window cache publication.
+    window_cache, window_cache_scale = _publish_quantized_cache(
+        t["window_cache"], t["window_cache_scale"], kv, t["window_slots"], quantize_mxfp8_cache,
     )
-    # d. Compressed KV: rotate the latent tail, then packed FP4 with group-16 BF16 scales.
-    compressed_cache = t["compressed_cache"].clone()
-    compressed_cache_scale = t["compressed_cache_scale"].clone()
-    rotated = golden_rope_tail(latent, t["compressed_rope_cos"], t["compressed_rope_sin"])
-    compressed_slots = t["compressed_slots"].long()
-    compressed_valid = (compressed_slots >= 0) & publish
-    compressed_rows = compressed_slots[compressed_valid]
-    if compressed_rows.numel():
-        payload, scale = quantize_mxfp4_cache(rotated[compressed_valid], CMP_GROUP, "bf16")
-        _write_rows(compressed_cache, compressed_rows, payload, head_dim // 2)
-        # BF16 scales are 2 bytes/element; _write_rows' width is in bytes, so the
-        # group-16 scale row (head_dim // CMP_GROUP elements) is twice that in bytes.
-        _write_rows(compressed_cache_scale, compressed_rows, scale, (head_dim // CMP_GROUP) * 2)
 
-    # Publish RNE E2M1 index keys with group-32 E8M0 scales.
-    index_cache = t["index_cache"].clone()
-    index_cache_scale = t["index_cache_scale"].clone()
-    index_key = golden_rms_norm(((latent).float() @ (t["index_wk"]).float()).to(torch.bfloat16), t["index_norm_weight"])
-    index_key = golden_rope_tail(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
-    if compressed_rows.numel():
-        payload, scale = quantize_mxfp4_cache(index_key[compressed_valid], IDX_GROUP, "e8m0", round_to_even=True)
-        _write_rows(index_cache, compressed_rows, payload, index_dim // 2)
-        _write_rows(index_cache_scale, compressed_rows, scale, index_dim // IDX_GROUP)
+    if mode == "full":
+        # Ratio-2 compressor and ring-state update.
+        state_cache = t["state_cache"].clone()
+        latent, publish = golden_compressor_ratio2_paged(
+            x, t["query_start_loc"], t["position_ids"], t["token_to_req_indices"],
+            t["state_block_table"], state_cache, t["compressor_wkv"], t["compressor_wgate"],
+            t["compressor_norm_weight"],
+        )
+        # Compressed KV publication.
+        rotated = golden_rope_tail(latent, t["compressed_rope_cos"], t["compressed_rope_sin"])
+        compressed_slots = t["compressed_slots"].masked_fill(~publish, -1)
+        compressed_quantize = partial(quantize_mxfp4_cache, group_size=CMP_GROUP, scale_format="bf16")
+        compressed_cache, compressed_cache_scale = _publish_quantized_cache(
+            t["compressed_cache"], t["compressed_cache_scale"], rotated, compressed_slots, compressed_quantize,
+        )
 
-    # Score FP4 queries in original coordinate order with the shared BF16 epilogue.
-    topk_indices = golden_c2a_index(t, qr, index_cache, index_cache_scale)
+        # Publish RNE E2M1 index keys with group-32 E8M0 scales.
+        index_projection = latent.float() @ t["index_wk"].float()
+        index_projection = index_projection.to(torch.bfloat16)
+        index_key = golden_rms_norm(index_projection, t["index_norm_weight"])
+        index_key = golden_rope_tail(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
+        index_quantize = partial(quantize_mxfp4_cache, group_size=IDX_GROUP, scale_format="e8m0", round_to_even=True)
+        index_cache, index_cache_scale = _publish_quantized_cache(
+            t["index_cache"], t["index_cache_scale"], index_key, compressed_slots, index_quantize,
+        )
 
-    # g. Sparse attention: one online softmax over window rows plus selected compressed rows.
-    window_values = (
-        window_cache.float() * window_cache_scale.float().repeat_interleave(MX_GROUP, -1)
-    ).reshape(-1, head_dim)
-    compressed_values = dequantize_mxfp4_cache(compressed_cache, compressed_cache_scale, CMP_GROUP, "bf16").flatten(0, -2)
+        # Score FP4 queries in original coordinate order with the shared BF16 epilogue.
+        topk_indices = golden_c2a_index(t, qr, index_cache, index_cache_scale)
+
+    else:
+        compressed_cache = t["compressed_cache"]
+        compressed_cache_scale = t["compressed_cache_scale"]
+        index_cache = index_cache_scale = state_cache = None
+        topk_indices = t["compressed_indices"]
+
+    # Sparse attention over window and compressed rows.
+    window_values = window_cache.float()
+    window_scales = window_cache_scale.float().repeat_interleave(MX_GROUP, -1)
+    window_values = (window_values * window_scales).reshape(-1, head_dim)
+    compressed_values = dequantize_mxfp4_cache(compressed_cache, compressed_cache_scale, CMP_GROUP, "bf16")
+    compressed_values = compressed_values.flatten(0, -2)
     attended = golden_selected_attention(
         q, window_values.reshape(-1, 1, 1, head_dim), t["window_indices"],
         compressed_values.reshape(-1, 1, 1, head_dim), topk_indices, t["attn_sink"],
     )
 
-    # h. Inverse RoPE, grouped low-rank output projection, per-rank partial.
+    # Inverse RoPE and output projection.
     output = golden_o_proj(
         attended, t["rope_cos"], t["rope_sin"], t["wo_a"], t["wo_b"], t["wo_b_scale"],
-        wo_a_scale=t["wo_a_scale"], output_dtype=torch.float32 if fp32_output else None, sequential_projection=True,
+        wo_a_scale=t["wo_a_scale"], sequential_projection=True,
     )
 
-    return {
-        "output": output,
-        "window_cache": window_cache,
-        "window_cache_scale": window_cache_scale,
-        "compressed_cache": compressed_cache,
-        "compressed_cache_scale": compressed_cache_scale,
-        "index_cache": index_cache,
-        "index_cache_scale": index_cache_scale,
-        "state_cache": state_cache,
-        "topk_indices": topk_indices,
-    }
+    for name, value in (
+        ("window_cache", window_cache), ("window_cache_scale", window_cache_scale),
+        ("compressed_cache", compressed_cache), ("compressed_cache_scale", compressed_cache_scale),
+        ("index_cache", index_cache), ("index_cache_scale", index_cache_scale),
+        ("state_cache", state_cache), ("topk_indices", topk_indices), ("candidate_mask", None),
+        ("pool_block_ids", None), ("pool_block_counts", None),
+    ):
+        if value is None:
+            tensors[name] = None
+        elif name in tensors and isinstance(tensors[name], torch.Tensor):
+            tensors[name].view(torch.uint8).copy_(value.contiguous().view(torch.uint8))
+        else:
+            tensors[name] = value
+    if "x_hc" in t:
+        hidden = golden_hc_post(output.bfloat16(), x_hc, post_mix, residual_mix).to(torch.float32)
+        tensors["output"].copy_(hidden)
+        tensors["next_pre_mix"].copy_(next_pre_mix)
+        tensors["attention_input"] = attention_input
+    else:
+        tensors["output"] = output
+    tensors["attention_output"] = output
 
 
-def golden_decode_attn_c2a_full(
-    x: torch.Tensor,
-    wq_a: torch.Tensor,
-    wq_a_scale: torch.Tensor,
-    q_norm_weight: torch.Tensor,
-    wq_b: torch.Tensor,
-    wq_b_scale: torch.Tensor,
-    wkv: torch.Tensor,
-    wkv_scale: torch.Tensor,
-    kv_norm_weight: torch.Tensor,
-    attn_sink: torch.Tensor,
-    wo_a: torch.Tensor,
-    wo_a_scale: torch.Tensor,
-    wo_b: torch.Tensor,
-    wo_b_scale: torch.Tensor,
-    rope_cos: torch.Tensor,
-    rope_sin: torch.Tensor,
-    window_slots: torch.Tensor,
-    window_indices: torch.Tensor,
-    window_cache: torch.Tensor,
-    window_cache_scale: torch.Tensor,
-    compressed_cache: torch.Tensor,
-    compressed_cache_scale: torch.Tensor,
-    token_to_req_indices: torch.Tensor,
-    compressed_lens: torch.Tensor,
-    index_cache: torch.Tensor,
-    index_cache_scale: torch.Tensor,
-    index_block_table: torch.Tensor,
-    position_ids: torch.Tensor,
-    compressed_rope_cos: torch.Tensor,
-    compressed_rope_sin: torch.Tensor,
-    compressor_wkv: torch.Tensor,
-    compressor_wgate: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    state_block_table: torch.Tensor,
-    state_cache: torch.Tensor,
-    compressor_norm_weight: torch.Tensor,
-    compressed_slots: torch.Tensor,
-    index_wk: torch.Tensor,
-    index_norm_weight: torch.Tensor,
-    index_wq_b: torch.Tensor,
-    index_wq_b_scale: torch.Tensor,
-    index_weights_proj: torch.Tensor,
-) -> AttentionGoldenResult:
-    """Evaluate C2A decode with request-owned ring state and paged caches."""
-    inputs = locals()
-    return AttentionGoldenResult(**golden_reference_c2a(inputs))
+def build_c2a_specs(
+    mode, tokens=24, requests=6, seed=17, case="mixed", start_pos=None, query_lens=None, *, param_names=None,
+):
+    """Build C2A mHC, attention, cache, and runtime specifications."""
+    import torch
+    import math
+    from config import MAX_BATCH_PER_DP, BLOCK_SIZE
+    from utils import packed_query_lengths, paged_slots, window_metadata
+    from quant import (
+        quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache,
+        quantize_mxfp8_upward_reference, pack_mx_b_scale,
+    )
+    from rope_tables import precompute_rope_tables
 
+    from functools import partial
+    from golden import ScalarSpec, TensorSpec
 
-_PREFIXES = {
-    "mixed": (1, 63, 128, 255, 0, 511, 129, 256),
-    "long": (1024, 1027, 1290, 63, 1535, 128, 2048, 255),
-}
-
-
-def _weight(gen, k, n):
-    """MXFP8 input-major weight with Cube-ordered MX_B_NN scales."""
-    payload, codes = quantize_mxfp8_upward_reference(torch.randn(n, k, generator=gen) / math.sqrt(k))
-    return payload.T.contiguous(), pack_mx_b_scale(codes.T.contiguous()).view(E8M0)
-
-
-def _plan(tokens, requests, case):
-    """Ragged query lengths and per-request KV prefixes."""
-    lengths = [tokens // requests + (index < tokens % requests) for index in range(requests)]
-    pattern = _PREFIXES[case if case == "long" else "mixed"]
-    prefixes = [pattern[index % len(pattern)] for index in range(requests)]
-    return lengths, prefixes
-
-
-def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None, query_lens=None):
-    """Deterministic inputs for ``golden_decode_attn_c2a_full``.
-
-    case: "mixed" keeps contexts short so every causal position is selected, "long" pushes
-    part of the batch past index_topk so the scored Top-K path runs, "masked" clears every
-    slot and index, "zero" zeroes activations and all three cache payloads.
-    """
     if case not in ("mixed", "long", "masked", "zero"):
         raise ValueError(f"unsupported case {case!r}")
     if not 1 <= requests <= min(MAX_BATCH_PER_DP, tokens):
         raise ValueError(f"requests must be in [1, min({MAX_BATCH_PER_DP}, tokens)]")
     gen = torch.Generator().manual_seed(seed)
 
-    lengths, prefixes = _plan(tokens, requests, case)
+    lengths = [tokens // requests + (index < tokens % requests) for index in range(requests)]
+    prefix_pattern = (1, 63, 128, 255, 0, 511, 129, 256)
+    if case == "long":
+        prefix_pattern = (1024, 1027, 1290, 63, 1535, 128, 2048, 255)
+    prefixes = [prefix_pattern[index % len(prefix_pattern)] for index in range(requests)]
     if query_lens is not None:
         lengths = packed_query_lengths(tokens, requests, query_lens)
     if start_pos is not None:
@@ -642,28 +536,24 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None
             raise ValueError("start_pos must contain one prefix per request")
         prefixes = list(start_pos)
     token_to_req_indices = torch.repeat_interleave(torch.arange(requests), torch.tensor(lengths))
-    positions = torch.cat(
-        [torch.arange(prefix, prefix + length) for prefix, length in zip(prefixes, lengths)]
-    )
+    positions = torch.cat([torch.arange(prefix, prefix + length) for prefix, length in zip(prefixes, lengths)])
     maximum = int(positions.max())
     window_columns = maximum // BLOCK_SIZE + 1
     compressed_columns = max(4, (maximum // RATIO) // BLOCK_SIZE + 1)
 
-    # One spare page per cache is never mapped: a control row for untouched-byte checks.
+    # One unmapped control page per cache.
     window_pages = requests * window_columns + 1
     compressed_pages = requests * compressed_columns + 1
-    def table(pages, columns):
-        rows = torch.randperm(pages, generator=gen)[: requests * columns]
-        return rows.reshape(requests, columns).to(torch.int32)
-
-    window_table = table(window_pages, window_columns)
-    index_block_table = table(compressed_pages, compressed_columns)
+    window_rows = torch.randperm(window_pages, generator=gen)[: requests * window_columns]
+    window_table = window_rows.reshape(requests, window_columns).to(torch.int32)
+    index_rows = torch.randperm(compressed_pages, generator=gen)[: requests * compressed_columns]
+    index_block_table = index_rows.reshape(requests, compressed_columns).to(torch.int32)
 
     window_slots, window_indices, _ = window_metadata(positions, token_to_req_indices, window_table)
     compressed_slots = paged_slots(positions, token_to_req_indices, index_block_table, BLOCK_SIZE, RATIO, True)
     compressed_lens = torch.div(positions + 1, RATIO, rounding_mode="floor").to(torch.int32)
 
-    # Fixture initialization only: production callers retain these full tables.
+    # Token-local rotary tables.
     table_rows = int(positions.max()) + 1
     freqs_cos, freqs_sin = precompute_rope_tables(table_rows, compressed_attention=True)
     compressed_freqs_cos, compressed_freqs_sin = freqs_cos, freqs_sin
@@ -673,16 +563,24 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None
     compressed_rope_cos = compressed_freqs_cos[pair_start.clamp_min(0)].masked_fill(~complete[:, None], 1.0)
     compressed_rope_sin = compressed_freqs_sin[pair_start.clamp_min(0)].masked_fill(~complete[:, None], 0.0)
 
-    wq_a, wq_a_scale = _weight(gen, D, Q_LORA)
-    wq_b, wq_b_scale = _weight(gen, Q_LORA, LOCAL_H * HEAD_DIM)
-    wkv, wkv_scale = _weight(gen, D, HEAD_DIM)
-    wo_b, wo_b_scale = _weight(gen, LOCAL_O_WIDTH, D)
-    index_wq_b, index_wq_b_scale = _weight(gen, Q_LORA, INDEX_H * INDEX_DIM)
+    weights = {}
+    shapes = {
+        "wq_a": (D, Q_LORA),
+        "wq_b": (Q_LORA, LOCAL_H * HEAD_DIM),
+        "wkv": (D, HEAD_DIM),
+        "wo_b": (LOCAL_O_WIDTH, D),
+        "index_wq_b": (Q_LORA, INDEX_H * INDEX_DIM),
+    }
+    for name, (k, n) in shapes.items():
+        weight = torch.randn(n, k, generator=gen) / math.sqrt(k)
+        payload, codes = quantize_mxfp8_upward_reference(weight)
+        weights[name] = payload.T.contiguous()
+        weights[name + "_scale"] = pack_mx_b_scale(codes.T.contiguous()).view(torch.float8_e8m0fnu)
 
     compressor_wkv = torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)
     compressor_wgate = torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)
     wo_a_values = torch.randn(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, generator=gen)
-    # Seed each request's predecessor projections in its physical ring block.
+    # Predecessor projections in each request's ring block.
     pending = torch.randn(MAX_BATCH_PER_DP, D, generator=gen).bfloat16().float()
     state_cache = torch.zeros(MAX_BATCH_PER_DP + 1, STATE_CAPACITY, STATE_WIDTH)
     state_block_table = torch.arange(requests - 1, -1, -1, dtype=torch.int32).unsqueeze(1) + 1
@@ -694,34 +592,27 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None
             state_cache[block, slot, HEAD_DIM:] = pending[request] @ compressor_wgate
     query_start_loc = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
 
-    window_cache, window_cache_scales = quantize_mxfp8_cache(
-        torch.randn(window_pages, BLOCK_SIZE, 1, HEAD_DIM, generator=gen).bfloat16()
-    )
-    compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(
-        torch.randn(compressed_pages, BLOCK_SIZE, 1, HEAD_DIM, generator=gen).bfloat16(),
-        CMP_GROUP,
-        "bf16",
-    )
-    index_cache, index_cache_codes = quantize_mxfp4_cache(
-        torch.randn(compressed_pages, BLOCK_SIZE, 1, INDEX_DIM, generator=gen).bfloat16(),
-        IDX_GROUP,
-        "e8m0",
-    )
+    window_values = torch.randn(window_pages, BLOCK_SIZE, 1, HEAD_DIM, generator=gen).bfloat16()
+    window_cache, window_cache_scales = quantize_mxfp8_cache(window_values)
+    compressed_values = torch.randn(compressed_pages, BLOCK_SIZE, 1, HEAD_DIM, generator=gen).bfloat16()
+    compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(compressed_values, CMP_GROUP, "bf16")
+    index_values = torch.randn(compressed_pages, BLOCK_SIZE, 1, INDEX_DIM, generator=gen).bfloat16()
+    index_cache, index_cache_codes = quantize_mxfp4_cache(index_values, IDX_GROUP, "e8m0")
 
     values = {
         "x": torch.randn(tokens, D, generator=gen).bfloat16(),
-        "wq_a": wq_a,
-        "wq_a_scale": wq_a_scale,
+        "wq_a": weights["wq_a"],
+        "wq_a_scale": weights["wq_a_scale"],
         "q_norm_weight": (torch.randn(Q_LORA, generator=gen) * 0.1 + 1).bfloat16(),
-        "wq_b": wq_b,
-        "wq_b_scale": wq_b_scale,
-        "wkv": wkv,
-        "wkv_scale": wkv_scale,
+        "wq_b": weights["wq_b"],
+        "wq_b_scale": weights["wq_b_scale"],
+        "wkv": weights["wkv"],
+        "wkv_scale": weights["wkv_scale"],
         "kv_norm_weight": (torch.randn(HEAD_DIM, generator=gen) * 0.1 + 1).bfloat16(),
         "attn_sink": torch.randn(LOCAL_H, generator=gen) * 2,
         "wo_a": (wo_a_values / math.sqrt(O_GROUP_IN)).bfloat16(),
-        "wo_b": wo_b,
-        "wo_b_scale": wo_b_scale,
+        "wo_b": weights["wo_b"],
+        "wo_b_scale": weights["wo_b_scale"],
         "rope_cos": rope_cos,
         "rope_sin": rope_sin,
         "window_slots": window_slots,
@@ -733,7 +624,7 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None
         "token_to_req_indices": token_to_req_indices.to(torch.int32),
         "compressed_lens": compressed_lens,
         "index_cache": index_cache,
-        "index_cache_scale": index_cache_codes.view(E8M0),
+        "index_cache_scale": index_cache_codes.view(torch.float8_e8m0fnu),
         "index_block_table": index_block_table,
         "position_ids": positions.to(torch.int32),
         "compressed_rope_cos": compressed_rope_cos,
@@ -747,8 +638,8 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None
         "compressed_slots": compressed_slots,
         "index_wk": (torch.randn(HEAD_DIM, INDEX_DIM, generator=gen) / math.sqrt(HEAD_DIM)).bfloat16(),
         "index_norm_weight": (torch.randn(INDEX_DIM, generator=gen) * 0.1 + 1).bfloat16(),
-        "index_wq_b": index_wq_b,
-        "index_wq_b_scale": index_wq_b_scale,
+        "index_wq_b": weights["index_wq_b"],
+        "index_wq_b_scale": weights["index_wq_b_scale"],
         "index_weights_proj": (torch.randn(D, INDEX_H, generator=gen) / math.sqrt(D)).bfloat16(),
     }
 
@@ -774,113 +665,20 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", start_pos=None
         f"window_pages={window_pages} compressed_pages={compressed_pages} "
         f"index_block_table={tuple(index_block_table.shape)}"
     )
-    return values
-
-
-MUTABLE_NAMES = (
-    "window_cache",
-    "window_cache_scale",
-    "compressed_cache",
-    "compressed_cache_scale",
-    "index_cache",
-    "index_cache_scale",
-    "state_cache",
-)
-
-
-REUSE_INPUT_NAMES = (
-    "x", "wq_a", "wq_a_scale", "q_norm_weight", "wq_b", "wq_b_scale", "wkv", "wkv_scale",
-    "kv_norm_weight", "attn_sink", "wo_a", "wo_a_scale", "wo_b", "wo_b_scale", "rope_cos", "rope_sin",
-    "window_slots", "window_indices", "window_cache", "window_cache_scale", "compressed_cache",
-    "compressed_cache_scale", "compressed_indices",
-)
-
-
-def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
-    """Ratio-2 reuse attention; publishes only the addressed sliding-window rows.
-
-    Same transcription as the full-mode reference, with the compressor, the index-key
-    publication and the indexer removed: the selection arrives as an input and the
-    compressed pool is read-only.
-    """
-    t = inputs
-    x = t["x"]
-    tokens = x.shape[0]
-    head_dim = t["window_cache"].shape[-1]
-
-    q, kv, qr = golden_qkv_proj_rope(
-        x, t["wq_a"], t["wq_a_scale"], t["q_norm_weight"], t["wq_b"], t["wq_b_scale"],
-        t["wkv"], t["wkv_scale"], t["kv_norm_weight"], t["rope_cos"], t["rope_sin"],
-        sequential_query=True,
-    )
-
-    window_cache = t["window_cache"].clone()
-    window_cache_scale = t["window_cache_scale"].clone()
-    window_payload, window_scales = quantize_mxfp8_cache(kv)
-    window_slots = t["window_slots"].long()
-    window_valid = window_slots >= 0
-    window_rows = window_slots[window_valid]
-    # Boolean indexing of Float8 on CPU requires an exact FP32 roundtrip.
-    visible_payload = window_payload.float()[window_valid].to(window_payload.dtype)
-    _write_rows(window_cache, window_rows, visible_payload, head_dim)
-    window_cache_scale.reshape(-1, head_dim // MX_GROUP)[window_rows] = window_scales[window_valid]
-
-    window_values = (
-        window_cache.float() * window_cache_scale.float().repeat_interleave(MX_GROUP, -1)
-    ).reshape(-1, head_dim)
-    compressed_values = dequantize_mxfp4_cache(
-        t["compressed_cache"], t["compressed_cache_scale"], CMP_GROUP, "bf16"
-    ).flatten(0, -2)
-    attended = golden_selected_attention(
-        q, window_values.reshape(-1, 1, 1, head_dim), t["window_indices"],
-        compressed_values.reshape(-1, 1, 1, head_dim), t["compressed_indices"], t["attn_sink"],
-    )
-
-    output = golden_o_proj(
-        attended, t["rope_cos"], t["rope_sin"], t["wo_a"], t["wo_b"], t["wo_b_scale"],
-        wo_a_scale=t["wo_a_scale"], output_dtype=torch.float32 if fp32_output else None, sequential_projection=True,
-    )
-
-    return {
-        "output": output,
-        "window_cache": window_cache,
-        "window_cache_scale": window_cache_scale,
-    }
-
-
-def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed", start_pos=None, query_lens=None):
-    """Inputs for a reuse layer, taken from what a full layer actually published.
-
-    The compressed pool and the Top-K row list come from running the full-mode
-    reference on the same batch, so the fixture exercises the real Full-to-Reuse
-    hand-off rather than a synthetic selection.
-    """
-    source = make_c2a_inputs(
-        tokens=tokens, requests=requests, seed=seed, case=case, start_pos=start_pos, query_lens=query_lens,
-    )
-    published = golden_reference_c2a(source)
-    values = {name: source[name] for name in REUSE_INPUT_NAMES if name != "compressed_indices"}
-    values["compressed_cache"] = published["compressed_cache"]
-    values["compressed_cache_scale"] = published["compressed_cache_scale"]
-    values["compressed_indices"] = published["topk_indices"]
-    reachable = int((published["topk_indices"] >= 0).sum())
-    print(
-        f"[FIXTURE] c2a reuse tokens={tokens} requests={requests} case={case} "
-        f"selected_rows={reachable} source_published_rows="
-        f"{int((source['compressed_slots'] >= 0).sum())}"
-    )
-    return values
-
-
-def build_hc_validation_values(
-    mode, tokens=24, requests=6, seed=17, case="mixed", start_pos=None, query_lens=None,
-):
-    """Build TP1 C2A weights, cache state, and mHC inputs."""
-    values = (make_c2a_inputs if mode == "full" else make_c2a_reuse_inputs)(
-        tokens=tokens, requests=requests, seed=seed, case=case, start_pos=start_pos, query_lens=query_lens,
-    )
+    if mode == "reuse":
+        source = values
+        published = {name: value.clone() for name, value in source.items()}
+        golden_c2a(published)
+        values["compressed_cache"] = published["compressed_cache"]
+        values["compressed_cache_scale"] = published["compressed_cache_scale"]
+        values["compressed_indices"] = published["topk_indices"]
+        reachable = int((published["topk_indices"] >= 0).sum())
+        print(
+            f"[FIXTURE] c2a reuse tokens={tokens} requests={requests} case={case} "
+            f"selected_rows={reachable} source_published_rows="
+            f"{int((source['compressed_slots'] >= 0).sum())}"
+        )
     del values["x"]
-    values = {name: value.unsqueeze(0) for name, value in values.items()}
     generator = torch.Generator().manual_seed(seed + 1000)
     shapes = {
         "x_hc": [tokens, HC_MULT, D],
@@ -897,47 +695,28 @@ def build_hc_validation_values(
         elif name == "attn_norm_weight":
             value = torch.ones(shape, dtype=torch.bfloat16)
         if name in ("x_hc", "pre_mix"):
-            value = torch.randn([1, *shape], generator=generator)
+            value = torch.randn(shape, generator=generator)
             if name == "pre_mix":
                 value = torch.softmax(value, dim=-1)
-        else:
-            value = value.unsqueeze(0)
         values[name] = value
     if mode == "full":
-        values["topk_indices"] = torch.full((1, tokens, INDEX_TOPK), -1, dtype=torch.int32)
-    values["output"] = torch.zeros(1, tokens, HC_MULT, D)
-    values["next_pre_mix"] = torch.zeros(1, tokens, HC_MULT)
-    return values
-
-
-CACHE_STATE_NAMES = (*MUTABLE_NAMES, "topk_indices")
-
-
-def golden_c2a_hc_case(tensors, attn_reference):
-    """Compose TP1 mHC, C2A attention, cache publication, and mHC post."""
-    x_hc = tensors["x_hc"][0]
-    pre_mix, post_mix, residual_mix = golden_mhc_mixes(
-        x_hc, tensors["hc_attn_fn"][0], tensors["hc_attn_scale"][0], tensors["hc_attn_base"][0],
-    )
-    tensors["next_pre_mix"][0].copy_(pre_mix)
-    x_attn = golden_hc_pre(x_hc, tensors["pre_mix"][0]).to(torch.bfloat16)
-    x_norm = golden_rms_norm(x_attn, tensors["attn_norm_weight"][0])
-    names = inspect.signature(attn_reference).parameters
-    inputs = {name: tensors[name][0] for name in names if name != "x"}
-    result = attn_reference(x=x_norm, **inputs)
-    for name in CACHE_STATE_NAMES:
-        value = getattr(result, name, None)
-        if value is not None and name in tensors:
-            tensors[name][0].view(torch.uint8).copy_(value.contiguous().view(torch.uint8))
-    sublayer = result.output.bfloat16()
-    tensors["output"][0].copy_(golden_hc_post(sublayer, x_hc, post_mix, residual_mix).to(torch.float32))
-
-
-def golden_decode_c2a_full_case(tensors):
-    golden_c2a_hc_case(tensors, golden_decode_attn_c2a_full)
+        values["topk_indices"] = torch.full((tokens, INDEX_TOPK), -1, dtype=torch.int32)
+    values["output"] = torch.zeros(tokens, HC_MULT, D)
+    values["next_pre_mix"] = torch.zeros(tokens, HC_MULT)
+    names = l3_decode_c2a_full.param_names if param_names is None else param_names
+    specs = [
+        TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=partial(torch.clone, values[name]))
+        for name in names if name != "num_tokens"
+    ]
+    specs.append(ScalarSpec("num_tokens", torch.int32, tokens))
+    return specs
 
 
 if __name__ == "__main__":
+    from config import BLOCK_SIZE
+
+    from golden import ratio_allclose, mapped_pool_ratio_allclose, run
+
     from utils import configure_decode_workload, parse_decode_query_lens, parse_decode_startpos
 
     import argparse
@@ -962,57 +741,52 @@ if __name__ == "__main__":
     parser.set_defaults(tokens=24, requests=6)
     args = parser.parse_args()
     configure_decode_workload(args, parser)
-    values = build_hc_validation_values(
-        "full", args.tokens, args.requests, args.seed, args.case,
-        start_pos=args.startpos, query_lens=args.query_lens,
-    )
     host = l3_decode_c2a_full
-    specs = [
-        TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=lambda name=name: values[name].clone())
-        for name in host.param_names if name != "num_tokens"
-    ]
-    specs.append(ScalarSpec("num_tokens", torch.int32, args.tokens))
+    specs = build_c2a_specs(
+        "full", args.tokens, args.requests, args.seed, args.case,
+        start_pos=args.startpos, query_lens=args.query_lens, param_names=host.param_names,
+    )
     result = run(
         fn=host,
         specs=specs,
-        golden_fn=golden_decode_c2a_full_case,
+        golden_fn=golden_c2a,
         compare_fn={
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "window_cache": mapped_pool_ratio_allclose(
                 "window_slots", pool_name="window_cache",
-                mapping_shape=(1, args.tokens),
-                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                mapping_shape=(args.tokens,),
+                block_size=BLOCK_SIZE, leading_rank_axis=False,
                 atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
             ),
             "window_cache_scale": mapped_pool_ratio_allclose(
                 "window_slots", pool_name="window_cache_scale",
-                mapping_shape=(1, args.tokens),
-                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                mapping_shape=(args.tokens,),
+                block_size=BLOCK_SIZE, leading_rank_axis=False,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
             "compressed_cache": mapped_pool_ratio_allclose(
                 "compressed_slots", pool_name="compressed_cache",
-                mapping_shape=(1, args.tokens),
-                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                mapping_shape=(args.tokens,),
+                block_size=BLOCK_SIZE, leading_rank_axis=False,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
             "compressed_cache_scale": mapped_pool_ratio_allclose(
                 "compressed_slots", pool_name="compressed_cache_scale",
-                mapping_shape=(1, args.tokens),
-                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                mapping_shape=(args.tokens,),
+                block_size=BLOCK_SIZE, leading_rank_axis=False,
                 atol=0.0, rtol=0.0, max_error_ratio=0.01,
             ),
             "index_cache": mapped_pool_ratio_allclose(
                 "compressed_slots", pool_name="index_cache",
-                mapping_shape=(1, args.tokens),
-                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                mapping_shape=(args.tokens,),
+                block_size=BLOCK_SIZE, leading_rank_axis=False,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
             "index_cache_scale": mapped_pool_ratio_allclose(
                 "compressed_slots", pool_name="index_cache_scale",
-                mapping_shape=(1, args.tokens),
-                block_size=BLOCK_SIZE, leading_rank_axis=True,
+                mapping_shape=(args.tokens,),
+                block_size=BLOCK_SIZE, leading_rank_axis=False,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
             "state_cache": ratio_allclose(atol=1e-3, rtol=1e-3),

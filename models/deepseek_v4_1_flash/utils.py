@@ -9,7 +9,6 @@
 """Metadata lowering and shared validation helpers for prefill and decode."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
 
 import torch
 
@@ -173,24 +172,6 @@ def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload
                 runtime.copy_to(handle.data_ptr, upload_buffer.data_ptr(), size, dst_offset=offset, worker_id=rank)
         arguments.append(StackedDeviceTensor(shards, tuple(spec.shape), tuple(range(ranks))))
     return arguments
-
-
-@dataclass(frozen=True)
-class AttentionGoldenResult:
-    """Attention output and every mutable or published state produced by a mode."""
-
-    output: torch.Tensor
-    window_cache: torch.Tensor
-    window_cache_scale: torch.Tensor
-    compressed_cache: torch.Tensor | None
-    compressed_cache_scale: torch.Tensor | None
-    index_cache: torch.Tensor | None
-    index_cache_scale: torch.Tensor | None
-    state_cache: torch.Tensor | None
-    topk_indices: torch.Tensor | None
-    candidate_mask: torch.Tensor | None = None
-    pool_block_ids: torch.Tensor | None = None
-    pool_block_counts: torch.Tensor | None = None
 
 
 def token_shards(value, local_tokens):

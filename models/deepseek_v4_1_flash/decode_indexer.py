@@ -9,27 +9,11 @@
 """Decode indexer query preparation, key publication, scoring, and TopK."""
 
 from gemm import gemm_bf16_to_bf16_staged, gemm_bf16_via_mxfp8_to_bf16_staged
-
 import pypto.language as pl
-import torch
-import torch.nn.functional as F
-
-
-from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
-from quant import dequantize_mxfp4_cache, quantize_mxfp4_cache
-from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
-from rmsnorm import make_norm_with_deps, golden_rms_norm
+from rmsnorm import make_norm_with_deps
 from config import (
-    B_DYN,
-    CMP_POSITIONS_DYN,
-    FLASH,
-    INDEX_BLOCKS_DYN,
-    INDEX_CACHE_GROUP,
-    INDEX_POOL_BLOCKS_DYN,
-    INDEX_POOL_POSITIONS_DYN,
-    TABLE_DYN,
-    T_DYN,
-    TP_SIZE,
+    B_DYN, CMP_POSITIONS_DYN, FLASH, INDEX_BLOCKS_DYN, INDEX_CACHE_GROUP, INDEX_POOL_BLOCKS_DYN,
+    INDEX_POOL_POSITIONS_DYN, TABLE_DYN, T_DYN,
 )
 
 
@@ -1292,7 +1276,7 @@ def use_pretransposed_index_query(
     skip_short: pl.constexpr,
 ):
     eligible = pl.cast(0, pl.INT32)
-    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16 and num_tokens % 2 == 0 and width >= 4096:
+    if num_tokens > 0 and num_tokens <= 16 and num_tokens % 2 == 0 and width >= 4096:
         eligible = pl.cast(1, pl.INT32)
         for token in pl.range(1, num_tokens):
             if pl.read(request_ids, [token - 1]) == pl.read(request_ids, [token]):
@@ -2377,7 +2361,7 @@ def _score_select_c2a_groups(
     """Select C2A rows with two six-query score and TopK groups."""
     width = pl.tensor.dim(scores, 1)
     grouped = 0
-    if TP_SIZE == 1 and num_tokens == 12 and width == 4224:
+    if num_tokens == 12 and width == 4224:
         grouped = 1
         for token in pl.range(12):
             if pl.read(lengths, [token]) <= INDEX_TOPK:
@@ -2482,6 +2466,14 @@ def decode_c2a_indexer(
         index_block_table, token_to_req_indices, compressed_lens, scores, topk_indices,
         num_tokens, index_publish_tid, query_tid, weights_tid,
     )
+
+
+import torch
+import torch.nn.functional as F
+from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
+from quant import dequantize_mxfp4_cache, quantize_mxfp4_cache
+from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
+from rmsnorm import golden_rms_norm
 
 
 def golden_index_query_fp4(value: torch.Tensor) -> torch.Tensor:

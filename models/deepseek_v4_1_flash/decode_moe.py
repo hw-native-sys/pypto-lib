@@ -10,16 +10,9 @@
 """DeepSeek-V4.1 decode MoE with mHC and expert parallelism."""
 
 from dataclasses import replace
-import math
 import sys
-
 import pypto.language as pl
 import pypto.language.distributed as pld
-from pypto.ir import DistributedConfig
-# Packed MXFP4/MXFP8 validation requires the A5 device backend.
-import torch
-
-
 import config
 
 
@@ -41,22 +34,13 @@ config.FLASH = replace(config.FLASH, n_routed_experts=_test_experts)
 config.N_LOCAL_EXPERTS = _experts_per_rank
 
 
-from config import FLASH as M
-from config import EP_SIZE, TP_SIZE, SUPPORTED_EP_SIZES
-from config import MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
+from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
 from gate import gate
 from expert_shared import expert_shared
 from expert_routed import (
-    MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
-    expert_routed_scatter,
+    MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
 )
-from hc import golden_mhc_mixes, golden_hc_pre, golden_hc_post
 from hc import hc_mixes, hc_pre, hc_post_after
-from rmsnorm import golden_rms_norm_tiled
-
-
-if EP_SIZE % TP_SIZE:
-    raise ValueError(f"EP{EP_SIZE} must be divisible by TP{TP_SIZE}")
 
 
 # model config
@@ -589,22 +573,10 @@ def l3_moe(
         )
 
 
-def _gen_routed_mx_weights_fixture(n_experts, dequant_std, seed_base=0):
-    """Generate the packed FP4 device ABI used by the routed kernel."""
-    from expert_routed import gen_routed_mxfp4_weights
-    return gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base)
-
-
-def _fp8_dtype():
-    return torch.float8_e4m3fn
-
-
-def _e8m0_dtype():
-    return getattr(torch, "float8_e8m0fnu", torch.uint8)
-
-
 def _normalise_num_tokens(value):
     """Return validated local-token counts for every EP source rank."""
+    import torch
+
     counts = torch.as_tensor(value, dtype=torch.int32).reshape(-1)
     if counts.numel() == 1:
         counts = counts.repeat(EP_SIZE)
@@ -618,8 +590,10 @@ def _normalise_num_tokens(value):
     return counts.contiguous()
 
 
-def _route_bias() -> torch.Tensor:
-    # Fixed TopK expert ids spread across ranks.
+def _route_bias():
+    """Build correction biases for TopK expert ids spread across ranks."""
+    import torch
+
     selected = (torch.arange(TOPK, dtype=torch.int64) * max(1, N_EXPERTS // TOPK))
     selected = torch.remainder(selected, N_EXPERTS)
     bias = torch.full((N_EXPERTS,), -1.0, dtype=torch.float32)
@@ -627,9 +601,83 @@ def _route_bias() -> torch.Tensor:
     return bias
 
 
-def _build_force_topk(counts):
-    """Build CANN-style round-robin expert ids on the host."""
-    indices = torch.zeros(EP_SIZE, MOE_TOKENS, TOPK, dtype=torch.int32)
+def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
+    """Build mHC, expert weights, EP outputs, and runtime specifications."""
+    import math
+    import torch
+    from functools import partial
+    from golden import ScalarSpec, TensorSpec
+    from expert_routed import ROUTED_DEQUANT_STD, gen_routed_mxfp4_weights, build_mxfp4_pair_lut
+    from quant import generate_mxfp8_weight_kn
+
+    counts = _normalise_num_tokens(num_tokens)
+    torch.manual_seed(41)
+    x = (torch.randn(EP_SIZE, MOE_TOKENS, D) * 0.25).to(torch.bfloat16)
+    norm_weight = torch.ones(EP_SIZE, D, dtype=torch.bfloat16)
+    gate_weight = torch.randn(N_EXPERTS, D) / D ** 0.5
+    gate_weight = gate_weight.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
+    correction_bias = _route_bias().unsqueeze(0).expand(EP_SIZE, -1).contiguous()
+
+    shapes = {
+        "norm_weight": [EP_SIZE, D],
+        "gate_weight": [EP_SIZE, N_EXPERTS, D],
+        "correction_bias": [EP_SIZE, N_EXPERTS],
+        "routed_w1": [EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        "routed_w1_scale": [EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER],
+        "routed_w2": [EP_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        "routed_w2_scale": [EP_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D],
+        "routed_w3": [EP_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
+        "routed_w3_scale": [EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER],
+        "mxfp4_pair_lut": [EP_SIZE, 2, 256],
+        "shared_w1": [EP_SIZE, D, MOE_INTER],
+        "shared_w1_scale": [EP_SIZE, D // MX_GROUP, MOE_INTER],
+        "shared_w2": [EP_SIZE, MOE_INTER, D],
+        "shared_w2_scale": [EP_SIZE, MOE_INTER // MX_GROUP, D],
+        "shared_w3": [EP_SIZE, D, MOE_INTER],
+        "shared_w3_scale": [EP_SIZE, D // MX_GROUP, MOE_INTER],
+        "x_hc": [EP_SIZE, MOE_TOKENS, HC_MULT, D],
+        "pre_mix": [EP_SIZE, MOE_TOKENS, HC_MULT],
+        "hc_ffn_fn": [EP_SIZE, MIX_HC, HC_DIM],
+        "hc_ffn_scale": [EP_SIZE, 3],
+        "hc_ffn_base": [EP_SIZE, MIX_HC],
+        "next_pre_mix": [EP_SIZE, MOE_TOKENS, HC_MULT],
+        "x_mixed": [EP_SIZE, MOE_TOKENS, D],
+        "x_next": [EP_SIZE, MOE_TOKENS, HC_MULT, D],
+        "num_tokens": [EP_SIZE],
+        "force_topk": [EP_SIZE, MOE_TOKENS, TOPK],
+    }
+    values = {"norm_weight": norm_weight, "gate_weight": gate_weight, "correction_bias": correction_bias}
+    values["mxfp4_pair_lut"] = build_mxfp4_pair_lut().unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
+    if initialize:
+        shards = [
+            gen_routed_mxfp4_weights(N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=rank * N_LOCAL_EXPERTS * 3)
+            for rank in range(EP_SIZE)
+        ]
+        routed_names = ("routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale", "routed_w2", "routed_w2_scale")
+        for index, name in enumerate(routed_names):
+            values[name] = torch.stack([shard[index] for shard in shards])
+        for name, out_dim, in_dim, std, chan_cv, seed in (
+            ("shared_w1", MOE_INTER, D, 1.71e-2, 0.50, 101),
+            ("shared_w3", MOE_INTER, D, 1.70e-2, 0.50, 102),
+            ("shared_w2", D, MOE_INTER, 1.68e-2, 0.33, 103),
+        ):
+            weight, scale = generate_mxfp8_weight_kn(out_dim, in_dim, std, chan_cv=chan_cv, seed=seed)
+            values[name] = weight.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
+            values[name + "_scale"] = scale.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
+
+    generator = torch.Generator().manual_seed(3)
+    magnitudes = (0.5 + torch.arange(MOE_TOKENS) % 4).reshape(1, -1, 1, 1)
+    x_hc = torch.randn(EP_SIZE, MOE_TOKENS, HC_MULT, D, generator=generator) * magnitudes
+    values["x_hc"] = x_hc.bfloat16().float()
+    values["pre_mix"] = torch.sigmoid(torch.randn(EP_SIZE, MOE_TOKENS, HC_MULT, generator=generator)) + M.hc_eps
+    hc_ffn_fn = torch.randn(MIX_HC, HC_DIM, generator=generator) / math.sqrt(HC_DIM)
+    hc_ffn_scale = torch.randn(3, generator=generator)
+    hc_ffn_base = torch.randn(MIX_HC, generator=generator)
+    values["hc_ffn_fn"] = hc_ffn_fn.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
+    values["hc_ffn_scale"] = hc_ffn_scale.unsqueeze(0).expand(EP_SIZE, -1).contiguous()
+    values["hc_ffn_base"] = hc_ffn_base.unsqueeze(0).expand(EP_SIZE, -1).contiguous()
+    values["num_tokens"] = counts
+    force_topk = torch.zeros(EP_SIZE, MOE_TOKENS, TOPK, dtype=torch.int32)
     for rank in range(EP_SIZE):
         active = int(counts[rank])
         expanded = active * TOPK
@@ -637,148 +685,66 @@ def _build_force_topk(counts):
         offsets = slots + expanded * rank + rank
         dst = offsets % EP_SIZE
         local_expert = offsets // EP_SIZE % N_LOCAL_EXPERTS
-        indices[rank, :active] = (dst * N_LOCAL_EXPERTS + local_expert).reshape(active, TOPK)
-    return indices
+        force_topk[rank, :active] = (dst * N_LOCAL_EXPERTS + local_expert).reshape(active, TOPK)
+    values["force_topk"] = force_topk
 
-
-def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
-    from functools import cache
-
-    import torch
-
-    from golden.spec import ScalarSpec, TensorSpec
-    from expert_routed import ROUTED_DEQUANT_STD
-    from expert_routed import build_mxfp4_pair_lut
-    from quant import generate_mxfp8_weight_kn
-
-    counts = _normalise_num_tokens(num_tokens)
-    torch.manual_seed(41)
-
-    x = (torch.randn(EP_SIZE, MOE_TOKENS, D) * 0.25).to(torch.bfloat16)
-    norm_weight = torch.ones(EP_SIZE, D, dtype=torch.bfloat16)
-    gate_weight = (torch.randn(N_EXPERTS, D) / D ** 0.5)
-    gate_weight = gate_weight.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
-    correction_bias = _route_bias().unsqueeze(0).expand(EP_SIZE, -1).contiguous()
-
-    routed_w1_shape = (EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS)
-    routed_w1_scale_shape = (EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER)
-    routed_w2_shape = (EP_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS)
-    routed_w2_scale_shape = (EP_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D)
-    routed_w3_shape = routed_w1_shape
-    routed_w3_scale_shape = routed_w1_scale_shape
-
-    # Cache packed weights and matching scales.
-    @cache
-    def routed_weights():
-        # Tuple order: w1, w1_scale, w3, w3_scale, w2, w2_scale.
-        shards = [
-            _gen_routed_mx_weights_fixture(N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=rank * N_LOCAL_EXPERTS * 3)
-            for rank in range(EP_SIZE)
-        ]
-        return tuple(torch.stack([shard[index] for shard in shards]) for index in range(6))
-
-    @cache
-    def shared_weights():
-        shared_std = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
-        sw1, sw1_s = generate_mxfp8_weight_kn(MOE_INTER, D, shared_std["w1"], chan_cv=0.50, seed=101)
-        sw3, sw3_s = generate_mxfp8_weight_kn(MOE_INTER, D, shared_std["w3"], chan_cv=0.50, seed=102)
-        sw2, sw2_s = generate_mxfp8_weight_kn(D, MOE_INTER, shared_std["w2"], chan_cv=0.33, seed=103)
-        return tuple(
-            weight.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
-            for weight in (sw1, sw1_s, sw3, sw3_s, sw2, sw2_s)
-        )
-
-    mxfp4_pair_lut = build_mxfp4_pair_lut().unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
-
-    fp8 = _fp8_dtype()
-    e8m0 = _e8m0_dtype()
-    specs = [
-        TensorSpec("x", [EP_SIZE, MOE_TOKENS, D], torch.bfloat16, init_value=lambda: x),
-        TensorSpec("norm_weight", [EP_SIZE, D], torch.bfloat16, init_value=lambda: norm_weight),
-        TensorSpec("gate_weight", [EP_SIZE, N_EXPERTS, D], torch.float32, init_value=lambda: gate_weight),
-        TensorSpec("correction_bias", [EP_SIZE, N_EXPERTS], torch.float32, init_value=lambda: correction_bias),
-        TensorSpec("routed_w1", list(routed_w1_shape), torch.uint8, init_value=lambda: routed_weights()[0]),
-        TensorSpec("routed_w1_scale", list(routed_w1_scale_shape), e8m0, init_value=lambda: routed_weights()[1]),
-        TensorSpec("routed_w2", list(routed_w2_shape), torch.uint8, init_value=lambda: routed_weights()[4]),
-        TensorSpec("routed_w2_scale", list(routed_w2_scale_shape), e8m0, init_value=lambda: routed_weights()[5]),
-        TensorSpec("routed_w3", list(routed_w3_shape), torch.uint8, init_value=lambda: routed_weights()[2]),
-        TensorSpec("routed_w3_scale", list(routed_w3_scale_shape), e8m0, init_value=lambda: routed_weights()[3]),
-        TensorSpec('mxfp4_pair_lut', [EP_SIZE, 2, 256], torch.int16, init_value=lambda: mxfp4_pair_lut),
-        TensorSpec("shared_w1", [EP_SIZE, D, MOE_INTER], fp8, init_value=lambda: shared_weights()[0]),
-        TensorSpec("shared_w1_scale", [EP_SIZE, D // MX_GROUP, MOE_INTER], e8m0, init_value=lambda: shared_weights()[1]),
-        TensorSpec("shared_w2", [EP_SIZE, MOE_INTER, D], fp8, init_value=lambda: shared_weights()[4]),
-        TensorSpec("shared_w2_scale", [EP_SIZE, MOE_INTER // MX_GROUP, D], e8m0, init_value=lambda: shared_weights()[5]),
-        TensorSpec("shared_w3", [EP_SIZE, D, MOE_INTER], fp8, init_value=lambda: shared_weights()[2]),
-        TensorSpec("shared_w3_scale", [EP_SIZE, D // MX_GROUP, MOE_INTER], e8m0, init_value=lambda: shared_weights()[3]),
-        TensorSpec("output", [EP_SIZE, MOE_TOKENS, D], torch.bfloat16),
-        TensorSpec('num_tokens', [EP_SIZE], torch.int32, init_value=lambda: counts),
-        ScalarSpec("moe_epoch", torch.int32, 1, compile_runtime=True),
-        TensorSpec("force_topk", [EP_SIZE, MOE_TOKENS, TOPK], torch.int32, init_value=lambda: _build_force_topk(counts)),
-    ]
-
-    for spec in specs:
-        if spec.name not in {"x", "output", "num_tokens", "moe_epoch"}:
-            spec.resident = "stacked"
+    fp8 = torch.float8_e4m3fn
+    e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
+    nonresident = {"x_hc", "pre_mix", "next_pre_mix", "x_mixed", "x_next", "num_tokens"}
+    specs = []
+    for name in l3_moe.param_names:
+        if name == "moe_epoch":
+            specs.append(ScalarSpec(name, torch.int32, 1, compile_runtime=True))
+            continue
+        dtype = torch.float32
+        if name == "norm_weight" or name == "x_mixed":
+            dtype = torch.bfloat16
+        elif name == "num_tokens" or name == "force_topk":
+            dtype = torch.int32
+        elif name == "mxfp4_pair_lut":
+            dtype = torch.int16
+        elif name.startswith("routed_"):
+            dtype = e8m0 if name.endswith("_scale") else torch.uint8
+        elif name.startswith("shared_"):
+            dtype = e8m0 if name.endswith("_scale") else fp8
+        value = values.get(name)
+        init = None if value is None else partial(torch.clone, value)
+        resident = None if name in nonresident else "stacked"
+        specs.append(TensorSpec(name, shapes[name], dtype, init_value=init, resident=resident))
     return specs
 
 
-def build_tensor_specs(num_tokens: int = MOE_TOKENS):
-    """Build the default mHC+MoE integration fixture."""
+def golden_moe(tensors):
+    """Compose the validated mHC references around the MoE reference."""
     import torch
-    from golden.spec import TensorSpec
-
-    base_specs = _build_moe_tensor_specs(num_tokens)
-    common_specs = [
-        spec for spec in base_specs
-        if spec.name not in {"x", "output", "num_tokens", "moe_epoch", "force_topk"}
-    ]
-    runtime_specs = [
-        spec for spec in base_specs
-        if spec.name in {"num_tokens", "moe_epoch", "force_topk"}
-    ]
-
-    generator = torch.Generator().manual_seed(3)
-    magnitudes = (0.5 + torch.arange(MOE_TOKENS) % 4).reshape(1, -1, 1, 1)
-    # BF16 residual values stored in FP32 with per-token magnitudes.
-    x_hc = (torch.randn(EP_SIZE, MOE_TOKENS, HC_MULT, D, generator=generator) * magnitudes).bfloat16().float()
-    pre_mix = torch.sigmoid(torch.randn(EP_SIZE, MOE_TOKENS, HC_MULT, generator=generator)) + M.hc_eps
-    hc_ffn_fn = torch.randn(MIX_HC, HC_DIM, generator=generator) / math.sqrt(HC_DIM)
-    hc_ffn_scale = torch.randn(3, generator=generator)
-    hc_ffn_base = torch.randn(MIX_HC, generator=generator)
-    hc_ffn_fn = hc_ffn_fn.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
-    hc_ffn_scale = hc_ffn_scale.unsqueeze(0).expand(EP_SIZE, -1).contiguous()
-    hc_ffn_base = hc_ffn_base.unsqueeze(0).expand(EP_SIZE, -1).contiguous()
-
-    mhc_specs = [
-        TensorSpec('x_hc', [EP_SIZE, MOE_TOKENS, HC_MULT, D], torch.float32, init_value=lambda: x_hc),
-        TensorSpec('pre_mix', [EP_SIZE, MOE_TOKENS, HC_MULT], torch.float32, init_value=lambda: pre_mix),
-        TensorSpec('hc_ffn_fn', [EP_SIZE, MIX_HC, HC_DIM], torch.float32, init_value=lambda: hc_ffn_fn),
-        TensorSpec('hc_ffn_scale', [EP_SIZE, 3], torch.float32, init_value=lambda: hc_ffn_scale),
-        TensorSpec('hc_ffn_base', [EP_SIZE, MIX_HC], torch.float32, init_value=lambda: hc_ffn_base),
-    ]
-    next_pre_mix_spec = TensorSpec('next_pre_mix', [EP_SIZE, MOE_TOKENS, HC_MULT], torch.float32)
-    x_mixed_spec = TensorSpec('x_mixed', [EP_SIZE, MOE_TOKENS, D], torch.bfloat16)
-    x_next_spec = TensorSpec('x_next', [EP_SIZE, MOE_TOKENS, HC_MULT, D], torch.float32)
-    # MoE ABI order: mHC inputs, weights, outputs, runtime inputs.
-    output_specs = [next_pre_mix_spec, x_mixed_spec, x_next_spec]
-    specs = mhc_specs + common_specs + output_specs + runtime_specs
-    for spec in specs:
-        if spec.name in {'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base'}:
-            spec.resident = "stacked"
-    return specs
-
-
-def _golden_moe_core(tensors):
-    import torch
-
+    from hc import golden_mhc_mixes, golden_hc_pre, golden_hc_post
+    from rmsnorm import golden_rms_norm_tiled
     from gate import golden_gate_normalized_core
     from expert_shared import golden_expert_shared
     from expert_routed import golden_expert_routed
     from quant import pack_mx_a_scale, unpack_mx_a_scale
 
+    x_hc = tensors["x_hc"]
+    next_pre_mix = torch.zeros(EP_SIZE, MOE_TOKENS, HC_MULT, dtype=torch.float32)
+    post_mix = torch.zeros_like(next_pre_mix)
+    residual_mix = torch.zeros(EP_SIZE, MOE_TOKENS, HC_MULT, HC_MULT, dtype=torch.float32)
+    x_mixed = torch.zeros(EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16)
+    for rank in range(EP_SIZE):
+        pre, post, residual = golden_mhc_mixes(
+            x_hc[rank],
+            tensors['hc_ffn_fn'][rank], tensors['hc_ffn_scale'][rank], tensors['hc_ffn_base'][rank],
+        )
+        next_pre_mix[rank] = pre
+        post_mix[rank] = post
+        residual_mix[rank] = residual
+        x_mixed[rank] = golden_hc_pre(x_hc[rank], tensors['pre_mix'][rank]).to(torch.bfloat16)
+
+    tensors["next_pre_mix"][:] = next_pre_mix
+    tensors["x_mixed"][:] = x_mixed
+
     counts = _normalise_num_tokens(tensors.get("num_tokens", MOE_TOKENS))
-    fp8 = _fp8_dtype()
-    e8m0 = _e8m0_dtype()
+    fp8 = torch.float8_e4m3fn
+    e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
     all_indices = []
     all_weights = []
@@ -797,7 +763,7 @@ def _golden_moe_core(tensors):
         indices = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.int32)
         weights = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.float32)
         golden_gate_normalized_core({
-            "x_normed": golden_rms_norm_tiled(tensors['x'][src], tensors['norm_weight'][src]),
+            "x_normed": golden_rms_norm_tiled(x_mixed[src], tensors['norm_weight'][src]),
             "gate_w": tensors["gate_weight"][src],
             "gate_bias": tensors["correction_bias"][src],
             "layer_id": 0,
@@ -901,37 +867,7 @@ def _golden_moe_core(tensors):
                 acc = acc + routed[t * TOPK + k].float()
             output[src, t] = acc.to(torch.bfloat16)
 
-    tensors["output"][:] = output
-
-
-def golden_moe(tensors):
-    """Compose the validated mHC references around the MoE reference."""
-    import torch
-
-    x_hc = tensors["x_hc"]
-    next_pre_mix = torch.zeros(EP_SIZE, MOE_TOKENS, HC_MULT, dtype=torch.float32)
-    post_mix = torch.zeros_like(next_pre_mix)
-    residual_mix = torch.zeros(EP_SIZE, MOE_TOKENS, HC_MULT, HC_MULT, dtype=torch.float32)
-    x_mixed = torch.zeros(EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16)
-    for rank in range(EP_SIZE):
-        pre, post, residual = golden_mhc_mixes(
-            x_hc[rank],
-            tensors['hc_ffn_fn'][rank], tensors['hc_ffn_scale'][rank], tensors['hc_ffn_base'][rank],
-        )
-        next_pre_mix[rank] = pre
-        post_mix[rank] = post
-        residual_mix[rank] = residual
-        x_mixed[rank] = golden_hc_pre(x_hc[rank], tensors['pre_mix'][rank]).to(torch.bfloat16)
-
-    tensors["next_pre_mix"][:] = next_pre_mix
-    tensors["x_mixed"][:] = x_mixed
-
-    # MoE reference with mHC inputs and outputs.
-    moe_tensors = dict(tensors)
-    moe_tensors["x"] = x_mixed
-    sublayer = torch.zeros(EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16)
-    moe_tensors["output"] = sublayer
-    _golden_moe_core(moe_tensors)
+    sublayer = output
 
     x_next = torch.zeros(EP_SIZE, MOE_TOKENS, HC_MULT, D, dtype=torch.float32)
     for rank in range(EP_SIZE):
@@ -941,6 +877,7 @@ def golden_moe(tensors):
 
 def _local_mhc_compare(num_tokens):
     """Compare the complete local-token output for every EP rank."""
+    import torch
     from golden.validation import ratio_reldiff
 
     counts = _normalise_num_tokens(num_tokens)
@@ -1011,6 +948,10 @@ def _local_mhc_compare(num_tokens):
 
 
 if __name__ == "__main__":
+    import torch
+    from pypto.ir import DistributedConfig
+    from config import SUPPORTED_EP_SIZES
+
     import argparse
 
     from golden import ratio_allclose, run
@@ -1058,7 +999,7 @@ if __name__ == "__main__":
         counts = _normalise_num_tokens(count_value)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    specs = build_tensor_specs(counts)
+    specs = build_moe_specs(counts, initialize=not (args.compile_only or args.golden_data))
     golden_fn = golden_moe
     compare_fn = {
         "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
