@@ -45,6 +45,7 @@ from config import (
 )
 
 from config import MOE_TOKENS
+from config import DSPARK_DRAFT_LAYERS, DSPARK_TARGET_LAYER_IDS
 from compressor import STATE_WIDTH
 from config import TP_SIZE
 
@@ -82,6 +83,7 @@ LOCAL_H = M.num_attention_heads // TP_SIZE
 LOCAL_O_GROUPS = M.o_groups // TP_SIZE
 LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
 D = M.hidden_size
+DSPARK_MAIN_IN = DSPARK_DRAFT_LAYERS * D
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 Q_LORA = M.q_lora_rank
@@ -419,6 +421,7 @@ def decode_encoder(
 def decode_decoder(
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, DSPARK_MAIN_IN], pl.BF16]],
     hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
@@ -507,6 +510,7 @@ def decode_decoder(
     attention_count = pl.read(attention_num_tokens, [rank])
     x_hc.bind_dynamic(0, LOCAL_T_DYN)
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
+    dspark_target_hidden.bind_dynamic(0, LOCAL_T_DYN)
     window_cache_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
@@ -688,6 +692,14 @@ def decode_decoder(
                 local_moe_tokens, rank, layer + 1,
                 force_topk,
             )
+        if layer >= DSPARK_TARGET_LAYER_IDS[0]:
+            target_column = (layer - DSPARK_TARGET_LAYER_IDS[0]) * D
+            for token in pl.spmd(MOE_TOKENS, name_hint="decode_dspark_target_hidden"):
+                if token < local_moe_tokens:
+                    hc_row = x_hc[token : token + 1, 0:HC_MULT, 0:D]
+                    hc_mean = pl.mul(pl.col_sum(pl.reshape(hc_row, [HC_MULT, D])), 1.0 / HC_MULT)
+                    target_bf16 = pl.cast(hc_mean, pl.BF16, mode="rint")
+                    dspark_target_hidden[token : token + 1, target_column : target_column + D] = target_bf16
     clear_moe_signals(x_hc, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_hc
 
@@ -696,6 +708,7 @@ def decode_decoder(
 def l2_decode_fwd(
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, DSPARK_MAIN_IN], pl.BF16]],
     hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
@@ -829,7 +842,7 @@ def l2_decode_fwd(
         shared_w1_scale, shared_w2_scale, shared_w3_scale,
     )
     result = decode_decoder(
-        encoder_hidden, encoder_pre_mix,
+        encoder_hidden, encoder_pre_mix, dspark_target_hidden,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_weight,
         wq_a, q_norm_weight, wq_b,
@@ -874,6 +887,7 @@ def l2_decode_fwd(
 def l3_decode_fwd(
     x_hc: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, DSPARK_MAIN_IN], pl.BF16]],
     hc_attn_fn: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[EP_SIZE, N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC], pl.FP32],
@@ -1018,16 +1032,18 @@ def l3_decode_fwd(
     RMSNorm feed the TP-sharded LM head and greedy sampler. logit_row_indices
     selects up to MAX_LOGIT_ROWS rank-local rows; -1 produces zero logits and
     sampled ID zero, which the caller ignores, including on idle ranks.
-    x_hc/pre_mix retain the final layer state; logits and sampled_ids are outputs.
+    x_hc/pre_mix retain the final layer state; logits, sampled_ids and the three
+    DSpark target-layer hidden states are outputs.
 
     Retain cache allocations and page ownership until runtime completion, then
     commit lengths before the next call. Completed forwards clear MoE signals;
     use persistent=True with reset_persistent_windows=False for serialized calls.
     Reset a reused request slot in all C2A sources after its users complete. Restore or reset mutated state before retrying failed
-    calls. Engram, vision and DSpark require no inputs here.
+    calls. Engram and vision require no inputs here.
     """
     x_hc.bind_dynamic(1, LOCAL_T_DYN)
     pre_mix.bind_dynamic(1, LOCAL_T_DYN)
+    dspark_target_hidden.bind_dynamic(1, LOCAL_T_DYN)
     window_cache_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(1, FWD_CMP_BLOCKS_DYN)
@@ -1088,7 +1104,7 @@ def l3_decode_fwd(
         head_logits = pld.window(head_logits_buffer, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
         head_logits_done = pld.window(head_logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         l2_decode_fwd(
-            x_hc[rank], pre_mix[rank],
+            x_hc[rank], pre_mix[rank], dspark_target_hidden[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank],
             wq_a[rank], q_norm_weight[rank], wq_b[rank],
@@ -1125,7 +1141,7 @@ def l3_decode_fwd(
             head_hidden, head_hidden_done, head_logits, head_logits_done,
             device=rank,
         )
-    return logits, sampled_ids
+    return logits, sampled_ids, dspark_target_hidden
 
 
 def _torch_dtype(dtype):

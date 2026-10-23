@@ -43,7 +43,7 @@ from pypto.ir import DistributedConfig
 
 # Standalone LM-head validation defaults to TP2/DP1.
 
-from config import FLASH as M, TP_SIZE as CONFIG_TP_SIZE
+from config import DP_SIZE as CONFIG_DP_SIZE, FLASH as M, TP_SIZE as CONFIG_TP_SIZE
 from hc import hc_head, golden_hc_pre
 from rmsnorm import rms_norm_tiled_compensated, golden_rms_norm_tiled
 
@@ -74,7 +74,7 @@ def _parse_int_argv(name, default=None):
 
 TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
 # DP groups built by the l3_lm_head fixture; the kernel carries no DP extent.
-DP_SIZE: int = _parse_int_argv("--dp") or 1
+DP_SIZE: int = _parse_int_argv("--dp") or (1 if __name__ == "__main__" else CONFIG_DP_SIZE)
 WORLD_SIZE = TP_SIZE * DP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 

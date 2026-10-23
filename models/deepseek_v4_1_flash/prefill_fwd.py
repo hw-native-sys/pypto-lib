@@ -84,6 +84,8 @@ from config import (
     STATE_CAPACITY,
     MOE_TOKENS,
     ROUTE_T_DYN,
+    DSPARK_DRAFT_LAYERS,
+    DSPARK_TARGET_LAYER_IDS,
 )
 
 from hc import hc_mixes
@@ -109,6 +111,7 @@ from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_R
 
 RANKS = C.EP_SIZE
 D = M.hidden_size
+DSPARK_MAIN_IN = DSPARK_DRAFT_LAYERS * D
 HC_MULT = M.hc_mult
 VOCAB = M.vocab_size
 PAGES = pl.dynamic("V41_PREFILL_HISTORY_PAGES")
@@ -497,6 +500,7 @@ def l2_prefill_fwd(
     logit_rows: pl.Tensor[[16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
     logits: pl.Out[pl.Tensor[[16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[16, 8], pl.INT32]],
     recv_meta: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS], pl.INT32],
@@ -709,6 +713,17 @@ def l2_prefill_fwd(
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
             moe_ready, active, rank, layer + 1,
         )
+        if layer >= DSPARK_TARGET_LAYER_IDS[0]:
+            target_column = (layer - DSPARK_TARGET_LAYER_IDS[0]) * D
+            for core in pl.spmd(48, name_hint="prefill_dspark_target_hidden", deps=[moe_ready]):
+                for token in pl.range(core, CAPACITY, 48):
+                    if token < active:
+                        hc_row = next_hidden[token : token + 1, 0:HC_MULT, 0:D]
+                        hc_mean = pl.mul(pl.col_sum(pl.reshape(hc_row, [HC_MULT, D])), 1.0 / HC_MULT)
+                        target_bf16 = pl.cast(hc_mean, pl.BF16, mode="rint")
+                    else:
+                        target_bf16 = pl.full([1, D], dtype=pl.BF16, value=0.0)
+                    dspark_target_hidden[token : token + 1, target_column : target_column + D] = target_bf16
     final_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [2 * CAPACITY, 0, 0])
     final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [2 * CAPACITY, 0])
     source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
@@ -803,6 +818,7 @@ def l3_prefill_fwd(
     logit_rows: pl.Tensor[[RANKS, 16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[RANKS, CAPACITY, DSPARK_MAIN_IN], pl.BF16]],
     logits: pl.Out[pl.Tensor[[RANKS, 16, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[RANKS, 16, 8], pl.INT32]],
 ):
@@ -841,7 +857,9 @@ def l3_prefill_fwd(
 
     Preserve all seven InOut cache tensors across chunks and decode. Their
     source/page dimensions can be flattened into decode pool views.
-    Residual/pre-mix outputs describe these rows after layer 39. New tokens
+    Residual/pre-mix outputs describe these rows after layer 39. The DSpark
+    output packs HC-mean hidden states from layers 37, 38 and 39 per row.
+    New tokens
     start from their own embedding and identity pre-mix; historical mHC state
     is represented by the committed KV/index/compressor caches.
 
@@ -851,7 +869,7 @@ def l3_prefill_fwd(
     reset_persistent_windows=False; signals are retired at forward completion.
     After request completion, release pages and reset the request slot in all C2A sources before
     assigning them to another request; failed calls require cache restoration
-    or reset before retry. Engram, vision and DSpark have no inputs here.
+    or reset before retry. Engram and vision have no inputs here.
     """
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
@@ -940,7 +958,7 @@ def l3_prefill_fwd(
             final_norm_weight[rank],
             lm_head_weight[rank],
             logit_rows[rank],
-            x_hc_out[rank], pre_mix_out[rank],
+            x_hc_out[rank], pre_mix_out[rank], dspark_target_hidden[rank],
             logits[rank],
             sampled_ids[rank],
             recv_meta,
@@ -1004,7 +1022,7 @@ PREFILL_TENSORS = (
     "final_norm_weight",
     "lm_head_weight",
     "logit_rows",
-    "x_hc_out", "pre_mix_out",
+    "x_hc_out", "pre_mix_out", "dspark_target_hidden",
     "logits",
     "sampled_ids",
 )
@@ -1537,6 +1555,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     outputs = {
         "x_hc_out": ((CAPACITY, HC_MULT, D), torch.float32),
         "pre_mix_out": ((CAPACITY, HC_MULT), torch.float32),
+        "dspark_target_hidden": ((CAPACITY, DSPARK_MAIN_IN), torch.bfloat16),
         "logits": ((16, VOCAB), torch.float32),
         "sampled_ids": ((16, 8), torch.int32),
     }
@@ -1666,11 +1685,18 @@ def build_tensor_specs():
     outputs = {
         "x_hc_out": ([RANKS, CAPACITY, HC_MULT, D], torch.float32),
         "pre_mix_out": ([RANKS, CAPACITY, HC_MULT], torch.float32),
+        "dspark_target_hidden": ([RANKS, CAPACITY, DSPARK_MAIN_IN], torch.bfloat16),
         "logits": ([RANKS, 16, VOCAB], torch.float32),
         "sampled_ids": ([RANKS, 16, 8], torch.int32),
     }
-    values = prepare_prefill_inputs(torch.zeros((CAPACITY, D), dtype=torch.bfloat16), CAPACITY)
-    values["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
+    active_rows = [CAPACITY, CAPACITY // 2, *([0] * (RANKS - 2))]
+    lut = build_mxfp4_pair_lut()
+    rank_values = []
+    for count in active_rows:
+        embedding = torch.full((count, D), 0.125, dtype=torch.bfloat16)
+        values = prepare_prefill_inputs(embedding, CAPACITY)
+        values["mxfp4_pair_lut"] = lut
+        rank_values.append(values)
     specs = []
     for name in PREFILL_TENSORS:
         if name in weight_layouts:
@@ -1683,8 +1709,7 @@ def build_tensor_specs():
             shape, dtype = outputs[name]
             value = None
         else:
-            tensor = values[name]
-            value = tensor.unsqueeze(0).repeat(RANKS, *([1] * tensor.ndim))
+            value = torch.stack([values[name] for values in rank_values])
             shape, dtype = list(value.shape), value.dtype
         specs.append(TensorSpec(name, shape, dtype, init_value=value))
     return specs
@@ -1887,6 +1912,24 @@ if __name__ == "__main__":
                 parameters = compiled._get_metadata()[0]
                 arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
                 runtime(*arguments, config=cfg)
-            print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)
+                target_hidden = torch.empty((RANKS, CAPACITY, DSPARK_MAIN_IN), dtype=torch.bfloat16)
+                final_hc = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.float32)
+                runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("dspark_target_hidden")], target_hidden)
+                runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("x_hc_out")], final_hc)
+            final_tap = target_hidden[:, :, 2 * D : 3 * D]
+            expected_final_tap = final_hc.mean(dim=2).to(torch.bfloat16)
+            if not torch.isfinite(target_hidden.float()).all():
+                raise AssertionError("DSpark prefill target hidden contains non-finite values")
+            expected_tap = torch.zeros((RANKS, CAPACITY, D), dtype=torch.bfloat16)
+            active_rows = specs[PREFILL_TENSORS.index("counts")].init_value[:, 1].tolist()
+            for rank, count in enumerate(active_rows):
+                expected_tap[rank, :count] = 0.125
+            for tap, layer in enumerate(DSPARK_TARGET_LAYER_IDS):
+                tap_rows = target_hidden[:, :, tap * D : (tap + 1) * D]
+                if not torch.equal(tap_rows, expected_tap):
+                    raise AssertionError(f"DSpark prefill layer {layer} tap differs from the zero-weight reference")
+            if not torch.equal(final_tap, expected_final_tap):
+                raise AssertionError("DSpark prefill final tap does not match final HC state")
+            print("[FWD] Execution and all DSpark taps passed the zero-weight reference; full numerical accuracy was not validated.", flush=True)
         if not result.passed:
             raise SystemExit(result.error or 1)
