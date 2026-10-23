@@ -46,6 +46,8 @@ HC_DIM = M.hc_dim
 M_TILE = 32
 N_TILE = 128
 O_A_N_TILE = 256
+O_A_GROUP_TILE = 2
+O_B_N_TILE = 256
 K_TILE = 256
 D_TILE = 512
 GROUPED_WORKER_TILE = 4096
@@ -209,10 +211,13 @@ def _grouped_output_rope_to_mx(
 ):
     """Apply inverse RoPE and grouped O-A with OCP input and output MX quantization."""
     weight_flat = pl.reshape(weight, [LOCAL_O_GROUPS * O_GROUP_IN, O_LORA])
-    for group in pl.parallel(LOCAL_O_GROUPS):
-        payload = pl.create_tensor([MX_M_TILE, O_GROUP_IN], dtype=pl.FP8E4M3FN)
-        scale_backing = pl.create_tensor([1, MX_M_TILE * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
-        for block in pl.spmd(O_GROUP_IN // (2 * K_TILE), name_hint="rope_quant_o"):
+    for group_start in pl.parallel(0, LOCAL_O_GROUPS, O_A_GROUP_TILE):
+        payload = pl.create_tensor([O_A_GROUP_TILE * MX_M_TILE, O_GROUP_IN], dtype=pl.FP8E4M3FN)
+        scale_backing = pl.create_tensor([O_A_GROUP_TILE, MX_M_TILE * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
+        for worker in pl.spmd(O_A_GROUP_TILE * (O_GROUP_IN // (2 * K_TILE)), name_hint="rope_quant_o"):
+            local_group = worker // (O_GROUP_IN // (2 * K_TILE))
+            group = group_start + local_group
+            block = worker % (O_GROUP_IN // (2 * K_TILE))
             rows = pl.min(MX_M_TILE, num_tokens)
             cosine = pl.load(cos, [0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
             cosine = pl.fillpad(cosine, pad_value=pl.PadValue.zero)
@@ -257,7 +262,7 @@ def _grouped_output_rope_to_mx(
                 normalized = pl.minimum(pl.maximum(normalized, -448.0), 448.0)
                 quantized = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
                 quantized_tile = pl.reshape(quantized, [MX_M_TILE, K_TILE])
-                payload = pl.store(quantized_tile, [0, k0], payload)
+                payload = pl.store(quantized_tile, [local_group * MX_M_TILE, k0], payload)
                 signed = pl.sub(exponent, pl.mul(pl.shrs(exponent, 7), 256))
                 codes = pl.reinterpret_view(pl.cast(signed, pl.INT8), pl.UINT8)
                 flat = pl.reshape(codes, [1, MX_M_TILE * (K_TILE // 32)])
@@ -266,11 +271,11 @@ def _grouped_output_rope_to_mx(
                 packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
                 scale_offset = k0 // K_TILE * MX_M_TILE * (K_TILE // 32)
                 packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (K_TILE // 32)])
-                scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
+                scale_backing = pl.store(packed_flat, [local_group, scale_offset], scale_backing)
         output, output_scale = gemm_mxfp8_to_mxfp8(
             payload, scale_backing, weight_flat, scale, output, output_scale,
-            num_tokens, group, O_GROUP_IN, O_LORA, "proj_o_a",
-            O_A_N_TILE, K_TILE, LOCAL_O_GROUPS, 8,
+            num_tokens, group_start, O_GROUP_IN, O_LORA, "proj_o_a",
+            O_A_N_TILE, K_TILE, LOCAL_O_GROUPS, O_A_GROUP_TILE, 8,
         )
     return output, output_scale
 
@@ -349,7 +354,7 @@ def _ob_hc_post_from_mx(
     scale_backing_flat = pl.tensor.view(weight_scale, [1, scale_group_size], layout=pl.ND)
     scale_group_backing = pl.tensor.slice(scale_backing_flat, [1, scale_group_size], [0, 0])
     scale_group = pl.tensor.view(scale_group_backing, [LOCAL_O_WIDTH // 32, D], layout=pl.MX_B_NN)
-    workers = pl.min(D // N_TILE, pl.system.available_cluster_count())
+    workers = pl.min(D // O_B_N_TILE, pl.system.available_cluster_count())
     for worker in pl.spmd(workers, name_hint="attention_o_b_hc_post", sync_start=True):
         post_rows = pl.load(post_mix, [0, 0], [MX_M_TILE, 8], valid_shape=[capacity, HC_MULT])
         post_rows = pl.fillpad(post_rows, pad_value=pl.PadValue.zero)
@@ -368,37 +373,37 @@ def _ob_hc_post_from_mx(
         mix_dense = pl.reinterpret_view(mix_dense_bits, pl.FP32)
         mix_transposed = pl.tile.transpose(mix_dense, 0, 1)
         block_num = pl.tile.get_block_num()
-        for wave in pl.range((D // N_TILE + block_num - 1) // block_num):
+        for wave in pl.range((D // O_B_N_TILE + block_num - 1) // block_num):
             block = wave * block_num + worker
-            if block < D // N_TILE:
-                n0 = block * N_TILE
+            if block < D // O_B_N_TILE:
+                n0 = block * O_B_N_TILE
                 rows = pl.min(MX_M_TILE, num_tokens)
                 a0 = pl.load(payload, [0, 0], [MX_M_TILE, K_TILE])
                 sa0 = pl.load(activation_scale, [0, 0], [MX_M_TILE, K_TILE // 32])
-                b0 = pl.load(weight, [0, n0], [K_TILE, N_TILE])
-                sb0 = pl.load(scale_group, [0, n0], [K_TILE // 32, N_TILE])
+                b0 = pl.load(weight, [0, n0], [K_TILE, O_B_N_TILE])
+                sb0 = pl.load(scale_group, [0, n0], [K_TILE // 32, O_B_N_TILE])
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
                 for k0 in pl.pipeline(K_TILE, LOCAL_O_WIDTH, K_TILE, stage=2):
                     a = pl.load(payload, [0, k0], [MX_M_TILE, K_TILE])
                     sa = pl.load(activation_scale, [0, k0 // 32], [MX_M_TILE, K_TILE // 32])
-                    b = pl.load(weight, [k0, n0], [K_TILE, N_TILE])
-                    sb = pl.load(scale_group, [k0 // 32, n0], [K_TILE // 32, N_TILE])
+                    b = pl.load(weight, [k0, n0], [K_TILE, O_B_N_TILE])
+                    sb = pl.load(scale_group, [k0 // 32, n0], [K_TILE // 32, O_B_N_TILE])
                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                 rounded_sublayer = pl.cast(acc, pl.BF16, mode="rint")
-                active_sublayer = pl.set_validshape(rounded_sublayer, rows, N_TILE)
+                active_sublayer = pl.set_validshape(rounded_sublayer, rows, O_B_N_TILE)
                 padded_sublayer = pl.fillpad(active_sublayer, pad_value=pl.PadValue.zero)
-                sublayer_tile = pl.set_validshape(padded_sublayer, MX_M_TILE, N_TILE)
-                valid_sublayer = pl.set_validshape(sublayer_tile, capacity, N_TILE)
+                sublayer_tile = pl.set_validshape(padded_sublayer, MX_M_TILE, O_B_N_TILE)
+                valid_sublayer = pl.set_validshape(sublayer_tile, capacity, O_B_N_TILE)
                 pl.store(valid_sublayer, [0, n0], sublayer)
                 x_tile = pl.cast(sublayer_tile, pl.FP32)
-                residual0 = pl.load(residual_flat, [0, n0], [MX_M_TILE, N_TILE], valid_shape=[capacity, N_TILE])
-                residual1 = pl.load(residual_flat, [0, D + n0], [MX_M_TILE, N_TILE], valid_shape=[capacity, N_TILE])
-                residual2 = pl.load(residual_flat, [0, 2 * D + n0], [MX_M_TILE, N_TILE], valid_shape=[capacity, N_TILE])
-                residual3 = pl.load(residual_flat, [0, 3 * D + n0], [MX_M_TILE, N_TILE], valid_shape=[capacity, N_TILE])
-                residual0 = pl.set_validshape(pl.fillpad(residual0, pad_value=pl.PadValue.zero), MX_M_TILE, N_TILE)
-                residual1 = pl.set_validshape(pl.fillpad(residual1, pad_value=pl.PadValue.zero), MX_M_TILE, N_TILE)
-                residual2 = pl.set_validshape(pl.fillpad(residual2, pad_value=pl.PadValue.zero), MX_M_TILE, N_TILE)
-                residual3 = pl.set_validshape(pl.fillpad(residual3, pad_value=pl.PadValue.zero), MX_M_TILE, N_TILE)
+                residual0 = pl.load(residual_flat, [0, n0], [MX_M_TILE, O_B_N_TILE], valid_shape=[capacity, O_B_N_TILE])
+                residual1 = pl.load(residual_flat, [0, D + n0], [MX_M_TILE, O_B_N_TILE], valid_shape=[capacity, O_B_N_TILE])
+                residual2 = pl.load(residual_flat, [0, 2 * D + n0], [MX_M_TILE, O_B_N_TILE], valid_shape=[capacity, O_B_N_TILE])
+                residual3 = pl.load(residual_flat, [0, 3 * D + n0], [MX_M_TILE, O_B_N_TILE], valid_shape=[capacity, O_B_N_TILE])
+                residual0 = pl.set_validshape(pl.fillpad(residual0, pad_value=pl.PadValue.zero), MX_M_TILE, O_B_N_TILE)
+                residual1 = pl.set_validshape(pl.fillpad(residual1, pad_value=pl.PadValue.zero), MX_M_TILE, O_B_N_TILE)
+                residual2 = pl.set_validshape(pl.fillpad(residual2, pad_value=pl.PadValue.zero), MX_M_TILE, O_B_N_TILE)
+                residual3 = pl.set_validshape(pl.fillpad(residual3, pad_value=pl.PadValue.zero), MX_M_TILE, O_B_N_TILE)
                 for out_h in pl.unroll(HC_MULT):
                     post_row = pl.tile.slice(post_transposed, [1, MX_M_TILE], [out_h, 0])
                     post_col = pl.reshape(post_row, [MX_M_TILE, 1])
@@ -417,7 +422,7 @@ def _ob_hc_post_from_mx(
                     value = pl.add(value, pl.row_expand_mul(residual3, mix3_col))
                     output_bf16 = pl.cast(value, pl.BF16, mode="rint")
                     output_tile = pl.cast(output_bf16, pl.FP32)
-                    valid_output = pl.set_validshape(output_tile, capacity, N_TILE)
+                    valid_output = pl.set_validshape(output_tile, capacity, O_B_N_TILE)
                     pl.store(valid_output, [0, out_h * D + n0], output_flat)
     return sublayer, output
 
