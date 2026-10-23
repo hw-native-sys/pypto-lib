@@ -2583,8 +2583,6 @@ if __name__ == "__main__":
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--runtime-dir", type=str)
     args = parser.parse_args()
-    if args.execution_mode:
-        parser.error("this entry requires hardware; --sim is unsupported")
     if args.tp != TP_SIZE:
         raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
     if args.mode == "c2a" and TP_SIZE != 1:
