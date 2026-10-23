@@ -153,8 +153,13 @@ def _q_proj_rope_from_mx(
                 sa0 = pl.load(activation_scale, [0, 0], [MX_M_TILE, K_TILE // 32])
                 b0 = pl.load(wq_b, [0, n0], [K_TILE, q_b_n_tile])
                 sb0 = pl.load(weight_scale, [0, n0], [K_TILE // 32, q_b_n_tile])
+                a1 = pl.load(payload, [0, K_TILE], [MX_M_TILE, K_TILE])
+                sa1 = pl.load(activation_scale, [0, K_TILE // 32], [MX_M_TILE, K_TILE // 32])
+                b1 = pl.load(wq_b, [K_TILE, n0], [K_TILE, q_b_n_tile])
+                sb1 = pl.load(weight_scale, [K_TILE // 32, n0], [K_TILE // 32, q_b_n_tile])
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                for k0 in pl.pipeline(K_TILE, Q_LORA, K_TILE, stage=2):
+                acc = pl.matmul_mx_acc(acc, a1, sa1, b1, sb1)
+                for k0 in pl.pipeline(2 * K_TILE, Q_LORA, K_TILE, stage=2):
                     a = pl.load(payload, [0, k0], [MX_M_TILE, K_TILE])
                     sa = pl.load(activation_scale, [0, k0 // 32], [MX_M_TILE, K_TILE // 32])
                     b = pl.load(wq_b, [k0, n0], [K_TILE, q_b_n_tile])
