@@ -82,7 +82,6 @@ def golden_kda_projection(
     the delta rule exponentiates it, this function does not.
     """
     tokens = x.shape[0]
-    xf = x.float()
 
     def linear_bf16(inp: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         # FP32 dot products followed by the BF16 projection boundary.
@@ -108,7 +107,6 @@ def golden_kda_projection(
     g_a = linear_bf16(x, w_g_a)
     out_gate = linear_bf16(g_a, w_g_b).view(tokens, LOCAL_KDA_H, KDA_DIM)
 
-    del xf
     return mixed_qkv, decay.float(), beta, out_gate
 
 

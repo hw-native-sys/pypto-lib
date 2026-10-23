@@ -198,11 +198,6 @@ def prefill_sparse_attn(
     would have been ``T x SPARSE_BLOCKS x H_TILE x KV_LORA`` FP32, which is why the
     decode scope's split-and-merge shape is not reused here.
 
-    Vector phases explicitly shard the padded head rows between the two AIV lanes.
-    Each block loads and transfers its query again, releasing that pipe slot before
-    the PV weights enter the same FIFO. This adds query traffic relative to retaining
-    the query across the block loop; device performance has not been characterized.
-
     Gather, ``-1`` masking, the ``NEG_INF`` floor and the padding of head rows to
     ``H_PAD`` = 16 all follow :mod:`models.glm5_3_flash.decode_sparse_attn`; causality
     and request padding are already folded into the index list.
@@ -236,15 +231,24 @@ def prefill_sparse_attn(
         with pl.spmd(t_dim, name_hint="prefill_sparse_flash") as flash_tid:
             token = pl.tile.get_block_idx()
             request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
-            for _ in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                running_m = pl.reshape(pl.full([1, H_PAD // 2], dtype=pl.FP32, value=NEG_INF), [H_PAD // 2, 1])
-                running_l = pl.reshape(pl.full([1, H_PAD // 2], dtype=pl.FP32, value=0.0), [H_PAD // 2, 1])
-                running_o = pl.full([H_PAD // 2, KV_LORA], dtype=pl.FP32, value=0.0)
+            q_tile = pl.fillpad(
+                pl.slice(
+                    absorbed_rows,
+                    [H_PAD, KV_LORA],
+                    [token * LOCAL_H, 0],
+                    valid_shape=[H_TILE, KV_LORA],
+                ),
+                pad_value=pl.PadValue.zero,
+            )
+            running_m = pl.reshape(pl.full([1, H_PAD], dtype=pl.FP32, value=NEG_INF), [H_PAD, 1])
+            running_l = pl.reshape(pl.full([1, H_PAD], dtype=pl.FP32, value=0.0), [H_PAD, 1])
+            running_o = pl.full([H_PAD, KV_LORA], dtype=pl.FP32, value=0.0)
             for sb, (m_iter, l_iter, o_iter) in pl.range(
                 SPARSE_BLOCKS, init_values=(running_m, running_l, running_o)
             ):
                 w0 = sb * ATTN_K_TILE
                 kv_tile = pl.create_l1([ATTN_K_TILE, KV_LORA], pl.BF16)
+                bias_row = pl.full([1, ATTN_K_TILE], dtype=pl.FP32, value=NEG_INF)
                 # Lane 0 is -1 only when the whole block is padding.
                 if pl.read(topk_indices, [token, w0]) >= 0:
                     for r in pl.range(ATTN_K_TILE):
@@ -259,6 +263,7 @@ def prefill_sparse_attn(
                                 kv_tile = pl.gather_row(
                                     kv_tile, latent_cache, [r, 0], [source, 0], [1, KV_LORA]
                                 )
+                                pl.write(bias_row, [0, r], 0.0)
                             else:
                                 kv_tile = pl.gather_row(
                                     kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA]
@@ -272,55 +277,38 @@ def prefill_sparse_attn(
                         kv_tile, latent_cache, [0, 0], [0, 0], [ATTN_K_TILE, KV_LORA]
                     )
 
-                # Release the query pipe slot before the PV weights use the same FIFO.
-                for q_aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                    q0 = q_aiv_id * (H_PAD // 2)
-                    q_valid = pl.max(0, pl.min(H_PAD // 2, H_TILE - q0))
-                    q_start = token * LOCAL_H + q0
-                    q_part = pl.slice(absorbed_rows, [H_PAD // 2, KV_LORA], [q_start, 0],
-                                      valid_shape=[q_valid, KV_LORA])
-                    q_padded = pl.fillpad(q_part, pad_value=pl.PadValue.zero)
-                    q_tile = pl.aic_gather(q_padded)
                 raw = pl.matmul(q_tile, kv_tile, b_trans=True, out_dtype=pl.FP32)
-                for _ in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                    raw_part = pl.aiv_shard(raw)
-                    bias_row = pl.full([1, ATTN_K_TILE], dtype=pl.FP32, value=NEG_INF)
-                    for r in pl.range(ATTN_K_TILE):
-                        if w0 + r < TOPK_INDEX_WIDTH:
-                            if pl.read(topk_indices, [token, w0 + r]) >= 0:
-                                pl.write(bias_row, [0, r], 0.0)
-                    scores = pl.col_expand_add(pl.mul(raw_part, SOFTMAX_SCALE), bias_row)
-                    block_m = pl.row_max(scores)
-                    weights = pl.exp(pl.row_expand_sub(scores, block_m))
-                    block_l = pl.row_sum(weights)
-                    weights_bf16 = pl.cast(weights, target_type=pl.BF16, mode="rint")
-                    weights_mat = pl.aic_gather(weights_bf16)
-                block_o = pl.matmul(weights_mat, kv_tile, out_dtype=pl.FP32)
-                for _ in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                    block_o_part = pl.aiv_shard(block_o)
-                    next_m = pl.maximum(m_iter, block_m)
-                    alpha = pl.exp(pl.sub(m_iter, next_m))
-                    beta = pl.exp(pl.sub(block_m, next_m))
-                    next_l = pl.add(pl.mul(alpha, l_iter), pl.mul(beta, block_l))
-                    next_o = pl.add(pl.row_expand_mul(o_iter, alpha), pl.row_expand_mul(block_o_part, beta))
+                scores = pl.col_expand_add(pl.mul(raw, SOFTMAX_SCALE), bias_row)
+                block_m = pl.row_max(scores)
+                weights = pl.exp(pl.row_expand_sub(scores, block_m))
+                block_l = pl.row_sum(weights)
+                block_o = pl.matmul(
+                    pl.cast(weights, target_type=pl.BF16, mode="rint"),
+                    kv_tile,
+                    out_dtype=pl.FP32,
+                )
+                next_m = pl.maximum(m_iter, block_m)
+                alpha = pl.exp(pl.sub(m_iter, next_m))
+                beta = pl.exp(pl.sub(block_m, next_m))
+                next_l = pl.add(pl.mul(alpha, l_iter), pl.mul(beta, block_l))
+                next_o = pl.add(
+                    pl.row_expand_mul(o_iter, alpha), pl.row_expand_mul(block_o, beta)
+                )
                 running_m, running_l, running_o = pl.yield_(next_m, next_l, next_o)
 
-            for output_aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                # Each lane writes only its real head rows.
-                if pl.read(topk_indices, [token, 0]) >= 0:
-                    normalized = pl.cast(pl.row_expand_div(running_o, running_l), pl.BF16, mode="rint")
-                    for local_head in pl.unroll(H_PAD // 2):
-                        head = output_aiv_id * (H_PAD // 2) + local_head
-                        if head < H_TILE:
-                            ctx_row = head * t_dim + token
-                            context[ctx_row:ctx_row + 1, :] = normalized[local_head:local_head + 1, :]
-                else:
-                    empty_row = pl.full([1, KV_LORA], dtype=pl.BF16, value=0.0)
-                    for local_head in pl.unroll(H_PAD // 2):
-                        head = output_aiv_id * (H_PAD // 2) + local_head
-                        if head < H_TILE:
-                            ctx_row = head * t_dim + token
-                            context[ctx_row:ctx_row + 1, :] = empty_row
+            # Lane 0 of the row is -1 only when the row selects nothing at all.
+            if pl.read(topk_indices, [token, 0]) >= 0:
+                normalized = pl.cast(
+                    pl.row_expand_div(running_o, running_l), target_type=pl.BF16, mode="rint"
+                )
+                for head in pl.unroll(H_TILE):
+                    ctx_row = head * t_dim + token
+                    context[ctx_row : ctx_row + 1, 0:KV_LORA] = normalized[head : head + 1, 0:KV_LORA]
+            else:
+                empty_row = pl.full([1, KV_LORA], dtype=pl.BF16, value=0.0)
+                for head in pl.unroll(H_TILE):
+                    ctx_row = head * t_dim + token
+                    context[ctx_row : ctx_row + 1, 0:KV_LORA] = empty_row
 
         output_flat = pl.reshape(output, [t_dim, LOCAL_H * V_DIM])
         w_v_flat = pl.reshape(w_v, [LOCAL_H * V_DIM, KV_LORA])

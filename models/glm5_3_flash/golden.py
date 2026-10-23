@@ -22,16 +22,6 @@ import torch.nn.functional as F
 from models.glm5_3_flash.config import FLASH
 
 
-def _rsqrt_fp32_reference(value: torch.Tensor) -> torch.Tensor:
-    """Use the FP32 reciprocal square root consumed by the NPU kernels.
-
-    Evaluating this unary operation in FP64 can cross a BF16 rounding midpoint
-    even when the FP32 argument and all preceding reductions match the device.
-    The CPU and NPU instructions may still differ by a last FP32 bit.
-    """
-    return torch.rsqrt(value.float())
-
-
 def _sum_fp32_reference(
     value: torch.Tensor, dim: int = -1, keepdim: bool = True, tile_size: int | None = None,
 ) -> torch.Tensor:
@@ -45,33 +35,12 @@ def _sum_fp32_reference(
     return total if keepdim else total.squeeze(dim)
 
 
-def _exp_fp32_reference(value: torch.Tensor) -> torch.Tensor:
-    """Evaluate the exponential in FP32."""
-    return torch.exp(value.float())
-
-
-def _sigmoid_fp32_reference(value: torch.Tensor) -> torch.Tensor:
-    """Evaluate the device sigmoid expression in FP32."""
-    return torch.reciprocal(1.0 + torch.exp(-value.float()))
-
-
-def _silu_fp32_reference(value: torch.Tensor) -> torch.Tensor:
-    """Multiply the FP32 input by its FP32 sigmoid."""
-    value = value.float()
-    return value * _sigmoid_fp32_reference(value)
-
-
-def _linear_fp32_reference(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Accumulate the projection in FP32 before the caller applies its output cast."""
-    return value.float() @ weight.float().t()
-
-
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = FLASH.rms_norm_eps) -> torch.Tensor:
     """Apply RMSNorm in FP32 and restore the activation dtype."""
     dtype = x.dtype
     value = x.float()
     square_sum = _sum_fp32_reference(value.square(), tile_size=128)
-    value = value * _rsqrt_fp32_reference(square_sum / value.shape[-1] + eps)
+    value = value * torch.rsqrt(square_sum / value.shape[-1] + eps)
     return (value * weight.float()).to(dtype)
 
 
@@ -88,9 +57,10 @@ def rms_norm_gated(
     """
     dtype = x.dtype
     value = x.float()
-    value = value * _rsqrt_fp32_reference(_sum_fp32_reference(value.square()) / value.shape[-1] + eps)
+    value = value * torch.rsqrt(_sum_fp32_reference(value.square()) / value.shape[-1] + eps)
     value = weight.float() * value
-    return (value * _sigmoid_fp32_reference(gate.float())).to(dtype)
+    sigmoid = torch.reciprocal(1.0 + torch.exp(-gate.float()))
+    return (value * sigmoid).to(dtype)
 
 
 def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -173,14 +143,16 @@ def hc_mixes(
     """Compute mHC mixes with FP32 projections, unaries and reductions."""
     flat = x.flatten(-2).float()
     square_sum = _sum_fp32_reference(flat.square(), tile_size=512)
-    inv = _rsqrt_fp32_reference(square_sum / flat.shape[-1] + FLASH.rms_norm_eps)
-    mixes = _linear_fp32_reference(flat, function) * inv
+    inv = torch.rsqrt(square_sum / flat.shape[-1] + FLASH.rms_norm_eps)
+    mixes = (flat @ function.float().t()) * inv
     hc = FLASH.hc_mult
     (p, q, r) = mixes.split((hc, hc, hc * hc), -1)
-    pre = _sigmoid_fp32_reference(p * scale[0] + base[:hc]) + FLASH.hc_eps
-    post = 2 * _sigmoid_fp32_reference(q * scale[1] + base[hc:2 * hc])
+    pre_logits = p * scale[0] + base[:hc]
+    post_logits = q * scale[1] + base[hc:2 * hc]
+    pre = torch.reciprocal(1.0 + torch.exp(-pre_logits)) + FLASH.hc_eps
+    post = 2 * torch.reciprocal(1.0 + torch.exp(-post_logits))
     logits = r.unflatten(-1, (hc, hc)) * scale[2] + base[2 * hc:].unflatten(-1, (hc, hc))
-    exps = _exp_fp32_reference(logits - logits.amax(-1, keepdim=True))
+    exps = torch.exp(logits - logits.amax(-1, keepdim=True))
     residual = exps / _sum_fp32_reference(exps) + FLASH.hc_eps
     residual = residual / (_sum_fp32_reference(residual, -2) + FLASH.hc_eps)
     for _ in range(iterations - 1):
@@ -239,12 +211,10 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    from models.glm5_3_flash._golden_smoke import (
-        run_expert_golden,
-        run_moe_gate_golden,
-        run_norm_goldens,
-        run_swiglu_golden,
-    )
+    from models.glm5_3_flash._golden_smoke import run_expert_golden
+    from models.glm5_3_flash._golden_smoke import run_moe_gate_golden
+    from models.glm5_3_flash._golden_smoke import run_norm_goldens
+    from models.glm5_3_flash._golden_smoke import run_swiglu_golden
 
     run_norm_goldens(rms_norm, rms_norm_gated, l2norm)
     run_swiglu_golden(swiglu)

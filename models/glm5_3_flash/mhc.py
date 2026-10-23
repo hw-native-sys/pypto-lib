@@ -61,14 +61,11 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import FLASH, HC_DIM, HC_MULT, MIX_HC, T_DYN, D
+from models.glm5_3_flash.config import D, FLASH, HC_DIM, HC_MULT, MIX_HC, T_DYN
 from models.glm5_3_flash.golden import hc_head, hc_mixes, hc_post, hc_pre
 
-HC_DIM_INV = 1.0 / HC_DIM
-LINEAR_K_TILE = 256
-LINEAR_OK = 4
-LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 MIX_D_TILE = 256  # D-wise tile of the three stream-collapse scopes
+HC_DIM_INV = 1.0 / HC_DIM
 HC_SINKHORN_ITER = FLASH.hc_sinkhorn_iters
 HC_EPS = FLASH.hc_eps
 NORM_EPS = FLASH.rms_norm_eps
@@ -76,7 +73,11 @@ MIX_PAD = 32  # MIX_HC = 24 padded to the cube's N granularity
 HC_PAD = 8  # HC_MULT = 4 padded so an FP32 row is 32 bytes
 RMS_T_TILE = 8  # token tile of the sum-of-squares scope
 LINEAR_T_TILE = 16  # cube M tile; below 16 the matmul is not L0 split
+COMB_T_TILE = 8  # token tile of the softmax / Sinkhorn scope
 RMS_K_TILE = 512  # HC_DIM reduction chunk of the sum of squares
+LINEAR_K_TILE = 256  # HC_DIM reduction chunk of the projection
+LINEAR_OK = 4  # split-K fan-out of the projection
+LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 
 
 def golden_mhc_mixes(
