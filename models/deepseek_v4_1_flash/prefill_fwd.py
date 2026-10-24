@@ -14,7 +14,7 @@ CI uses TP1/EP2/DP2 with 128 experts. Checkpoint generation uses 384 experts
 with EP4/DP4 (default) or EP8/DP8. Each rank owns one prompt and a shard of
 routed experts; attention weights are replicated. Original MXFP8/MXFP4
 weights remain resident. Calls append current rows to caller-owned native caches.
-Engram is disabled, including host hashes, table lookup and weight preparation.
+Engram consumes host-gathered rows at layers 1 and 14.
 """
 
 import struct
@@ -91,7 +91,8 @@ from hc import hc_post
 from hc import hc_pre, zero_bf16_padding
 from input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
-from utils import paged_slots, window_metadata
+from utils import HostEngram, paged_slots, window_metadata
+from engram import ENGRAM_K, KV_OUT, engram_from_rows
 from lm_head import final_output
 from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals
 from prefill_moe import prefill_moe
@@ -423,6 +424,10 @@ def _prefill_moe(
 @pl.jit(auto_scope=False)
 def l2_prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
+    engram_lookup: pl.Tensor[[2, CAPACITY, ENGRAM_K], pl.BF16],
+    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
+    engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
     embedding_ids: pl.Tensor[[CAPACITY], pl.INT64],
     initial_pre: pl.Tensor[[CAPACITY, HC_MULT], pl.FP32],
     identity_rows: pl.Tensor[[CAPACITY], pl.INT32],
@@ -653,6 +658,13 @@ def l2_prefill_fwd(
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
                 gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready)
                 gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready)
+        if layer == 1 or layer == 14:
+            engram_slot = layer // 14
+            layer_engram_scale = pl.slice(engram_wkv_scale, [ENGRAM_K // 32, KV_OUT], [engram_slot * (ENGRAM_K // 32), 0])
+            engram_from_rows(
+                engram_lookup[engram_slot], engram_wkv[engram_slot], layer_engram_scale,
+                engram_weight[engram_slot], hidden, hidden,
+            )
         with pl.scope():
             attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
             attn_residual = pl.create_tensor([CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -729,6 +741,10 @@ def l2_prefill_fwd(
 @pl.jit.host
 def l3_prefill_fwd(
     embedding: pl.Tensor[[RANKS, CAPACITY, D], pl.BF16],
+    engram_lookup: pl.Tensor[[RANKS, 2, CAPACITY, ENGRAM_K], pl.BF16],
+    engram_wkv: pl.Tensor[[RANKS, 2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[RANKS, 2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
+    engram_weight: pl.Tensor[[RANKS, 2, HC_MULT, D], pl.FP32],
     embedding_ids: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
     initial_pre: pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32],
     identity_rows: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
@@ -851,7 +867,7 @@ def l3_prefill_fwd(
     reset_persistent_windows=False; signals are retired at forward completion.
     After request completion, release pages and reset the request slot in all C2A sources before
     assigning them to another request; failed calls require cache restoration
-    or reset before retry. Engram, vision and DSpark have no inputs here.
+    or reset before retry. Engram consumes host lookup rows; vision and DSpark have no inputs here.
     """
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
@@ -896,6 +912,7 @@ def l3_prefill_fwd(
         head_logits_done = pld.window(head_logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         l2_prefill_fwd(
             embedding[rank],
+            engram_lookup[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             embedding_ids[rank],
             initial_pre[rank],
             identity_rows[rank],
@@ -964,6 +981,7 @@ def l3_prefill_fwd(
 
 PREFILL_TENSORS = (
     "embedding",
+    "engram_lookup", "engram_wkv", "engram_wkv_scale", "engram_weight",
     "embedding_ids",
     "initial_pre",
     "identity_rows",
@@ -1037,6 +1055,14 @@ class PrefillCheckpoint:
             "sliding_window": M.sliding_window,
             "kv_source_layer_ids": list(M.kv_source_layer_ids),
             "index_source_layer_ids": list(M.index_source_layer_ids),
+            "engram_layer_ids": list(M.engram_layer_ids),
+            "engram_num_embeddings": list(M.engram_num_embeddings),
+            "engram_max_ngram_size": M.engram_max_ngram_size,
+            "engram_n_heads": M.engram_n_heads,
+            "engram_head_dim": M.engram_head_dim,
+            "engram_compressed_vocab_size": M.engram_compressed_vocab_size,
+            "engram_vocab_size": M.engram_vocab_size,
+            "engram_pad_token_id": M.engram_pad_token_id,
         }
         for name, expected in required.items():
             if text.get(name) != expected:
@@ -1133,6 +1159,9 @@ def forward_weight_layouts(local_experts: int):
     index_sources = len(M.index_source_layer_ids)
     c2a_sources = sum(M.compress_ratios[source] == 2 for source in M.kv_source_layer_ids)
     return {
+        "engram_wkv": ((2, ENGRAM_K, KV_OUT), torch.float8_e4m3fn),
+        "engram_wkv_scale": ((2 * (ENGRAM_K // 32), KV_OUT), torch.float8_e8m0fnu),
+        "engram_weight": ((2, M.hc_mult, d), torch.float32),
         "hc_attn_fn": ((layers * M.mix_hc, M.hc_dim), torch.float32),
         "hc_attn_scale": ((layers * 3,), torch.float32),
         "hc_attn_base": ((layers * M.mix_hc,), torch.float32),
@@ -1238,6 +1267,11 @@ class ResidentPrefillWeights:
             ("final_norm_weight", "norm.weight", 0, 1, "plain"),
             ("lm_head_weight", "head.weight", 0, 1, "plain"),
         ))
+        for slot, layer in enumerate(M.engram_layer_ids):
+            self.entries.append(("engram_wkv", f"layers.{layer}.engram.wkv", slot, 2, "fp8"))
+            self.entries.append(("engram_weight", f"layers.{layer}.engram.q_weight", slot, 2, "engram_gate"))
+            if f"layers.{layer}.engram.k_weight" not in checkpoint.weight_map:
+                raise ValueError(f"checkpoint is missing layer {layer} Engram gate weights")
         for target, name, slot, slots, kind in self.entries:
             optional = (target in ("index_wk", "index_norm_weight")
                         and M.index_source_layer_ids[slot] not in M.kv_source_layer_ids)
@@ -1304,6 +1338,8 @@ class ResidentPrefillWeights:
                     value = value.to(dtype)
                     if kind == "transpose":
                         value = value.t()
+                    elif kind == "engram_gate":
+                        value = value * checkpoint.tensor(name.replace("q_weight", "k_weight")).float()
                 copy(target, value, slot, slots)
         for layer in range(M.num_hidden_layers):
             for projection in ("w1", "w2", "w3"):
@@ -1340,7 +1376,7 @@ def prepare_prefill_inputs(
     cache_state: Mapping[str, torch.Tensor] | None = None,
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Prepare one TP1 rank's next embedding chunk with Engram disabled.
+    """Prepare one TP1 rank's next embedding chunk and native cache metadata.
 
     ``capacity`` bounds current rows, independently of ``max_seq_len``, which
     sizes the retained history. Reuse rope_tables across calls; their full
@@ -1416,6 +1452,7 @@ def prepare_prefill_inputs(
 
     values = {
         "embedding": pad(embedding),
+        "engram_lookup": torch.zeros((2, capacity, ENGRAM_K), dtype=torch.bfloat16),
         "embedding_ids": torch.arange(capacity, dtype=torch.int64),
         "initial_pre": initial_pre,
         "identity_rows": pad(torch.arange(count, dtype=torch.int32), -1),
@@ -1463,6 +1500,8 @@ def prepare_resident_inputs(
     max_seq_len: int | None = None,
     cache_state: Mapping[str, torch.Tensor] | None = None,
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
+    engram: HostEngram,
+    request_id: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Prepare checkpoint embeddings and causal replay for one prefill rank."""
     ids = torch.as_tensor(token_ids, device="cpu")
@@ -1482,24 +1521,38 @@ def prepare_resident_inputs(
         embedding, capacity, start_pos=start_pos, max_seq_len=max_seq_len,
         cache_state=cache_state, rope_tables=rope_tables,
     )
+    values["engram_lookup"] = engram.lookup(ids, capacity, start_pos, request_id=request_id)
     return values
 
 
-def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk_size=None):
+def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk_size=None, decode_compiled=None):
     """Generate one independent continuation per rank using resident checkpoint weights.
 
     Prefill and subsequent one-token calls retain native device caches. Only
     current-token metadata is uploaded; completed history is never recomputed.
-    This example uses the prefill composition for one-token continuation too;
-    l3_decode_fwd can consume the same cache storage by flattening source/page dimensions.
+    With decode_compiled, continuation uses decode_fwd with shared resident
+    weights and cache pools. Otherwise, one-token calls use the prefill composition.
     """
     from tokenizers import Tokenizer
+    from pypto.runtime import DeviceTensor
+    from utils import DECODE_CACHE_NAMES, decode_cache_views, prepare_decode_inputs
 
-    # Reject a different rank/capacity or the old Engram ABI before loading weights.
+    # Validate the host-row Engram ABI and compilation shapes.
     parameters = compiled._get_metadata()[0]
     if (len(parameters) != len(PREFILL_TENSORS)
             or parameters[0].shape != [RANKS, CAPACITY, D]):
-        raise ValueError("--runtime-dir must contain prefill compiled for the same EP and capacity with Engram disabled")
+        raise ValueError("--runtime-dir must contain prefill compiled for the same EP and capacity with host Engram rows")
+    decode_names = []
+    if decode_compiled is not None:
+        decode_parameters = decode_compiled._get_metadata()[0]
+        decode_names = [parameter.name.removesuffix("__ssa_v0") for parameter in decode_parameters]
+        if decode_names[:4] != ["engram_lookup", "engram_wkv", "engram_wkv_scale", "engram_weight"]:
+            raise ValueError("decode artifact must use the host-row Engram ABI")
+        decode_shape = decode_parameters[0].shape
+        decode_rows = C.DECODE_INPUT_MAX_TOKENS
+        if (decode_shape[:2] != [RANKS, 2] or decode_shape[2] not in (-1, decode_rows)
+                or decode_shape[3] != ENGRAM_K):
+            raise ValueError("decode artifact must match EP and the configured decode capacity")
     if len(device_ids) != RANKS or len(set(device_ids)) != RANKS or len(prompts) != RANKS:
         raise ValueError(f"prefill requires {RANKS} distinct devices and one prompt per rank")
 
@@ -1530,6 +1583,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     if eos_id is None:
         raise ValueError("checkpoint EOS token is missing from its tokenizer")
     weights = ResidentPrefillWeights(checkpoint, ep_size=RANKS)
+    engram = HostEngram(checkpoint, tokenizer)
     config = RunConfig(
         backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, ring_heap=2 * 1024**3,
         distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
@@ -1549,10 +1603,19 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     constants.update(("freqs_cos", "freqs_sin"))
     generated = [[] for _ in prompts]
     finished = [False] * RANKS
+    # Host control tensors must be shared and registered before the chip-worker fork.
+    decode_counts = {
+        name: torch.zeros(RANKS, dtype=torch.int32).share_memory_()
+        for name in ("moe_num_tokens", "attention_num_tokens")
+    }
     print("CED_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
     start = time.monotonic()
     # Completed forwards retire signals; native cache allocations persist.
-    with compiled.prepare(config, persistent=True, reset_persistent_windows=False) as runtime:
+    extra = [] if decode_compiled is None else [decode_compiled]
+    with compiled.prepare(
+        config, extra_compiled=extra, persistent=True, reset_persistent_windows=False,
+        inherited_host_tensors=list(decode_counts.values()),
+    ) as runtime:
         per_rank = [{} for _ in device_ids]
         host_cache = []
         rope_tables = None
@@ -1560,6 +1623,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             inputs = prepare_resident_inputs(
                 weights, sequences[rank][:chunk_size], CAPACITY,
                 max_seq_len=max_seq_len, rope_tables=rope_tables,
+                engram=engram, request_id=rank,
             )
             rope_tables = inputs["freqs_cos"], inputs["freqs_sin"]
             host_cache.append({name: inputs[name] for name in cache_names})
@@ -1593,22 +1657,62 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         last_logits = torch.empty((RANKS, VOCAB), dtype=torch.float32)
         last_ids = [0] * RANKS
 
-        def run_rows(rows):
-            for rank, (tensors, token_ids) in enumerate(zip(per_rank, rows)):
+        decode_rank = [{} for _ in device_ids]
+        decode_stacked = {}
+        if decode_compiled is not None:
+            for rank, tensors in enumerate(decode_rank):
+                values = prepare_resident_inputs(
+                    weights, [], decode_rows, start_pos=0, max_seq_len=max_seq_len,
+                    cache_state=host_cache[rank], rope_tables=rope_tables, engram=engram, request_id=rank,
+                )
+                values = prepare_decode_inputs(values)
+                cache_views = decode_cache_views(host_cache[rank])
+                for name in decode_names:
+                    if name in decode_counts:
+                        continue
+                    if name in DECODE_CACHE_NAMES:
+                        source = per_rank[rank][DECODE_CACHE_NAMES[name]]
+                        tensors[name] = DeviceTensor(source.data_ptr, cache_views[name].shape, source.dtype,
+                                                     buffer=source.buffer)
+                    elif name in constants or name in ("logits", "sampled_ids"):
+                        tensors[name] = per_rank[rank][name]
+                    else:
+                        value = values[name]
+                        tensors[name] = runtime.alloc_tensor(value.shape, value.dtype, init=value, worker_id=rank)
+            decode_stacked = {
+                name: StackedDeviceTensor(
+                    [rank[name] for rank in decode_rank], (RANKS, *decode_rank[0][name].shape), tuple(range(RANKS)),
+                )
+                for name in decode_names if name not in decode_counts
+            }
+            decode_stacked.update(decode_counts)
+
+        def run_rows(rows, *, decode=False):
+            rank_tensors = decode_rank if decode else per_rank
+            capacity = decode_rows if decode else CAPACITY
+            for rank, (tensors, token_ids) in enumerate(zip(rank_tensors, rows)):
                 inputs = prepare_resident_inputs(
-                    weights, token_ids, CAPACITY,
+                    weights, token_ids, capacity,
                     start_pos=committed[rank], max_seq_len=max_seq_len,
                     cache_state=host_cache[rank], rope_tables=rope_tables,
+                    engram=engram, request_id=rank,
                 )
+                if decode:
+                    inputs = prepare_decode_inputs(inputs)
+                    for counts in decode_counts.values():
+                        counts[rank] = len(token_ids)
                 for name, value in inputs.items():
                     if name not in constants:
                         runtime.copy_to(
                             tensors[name].data_ptr, value.data_ptr(), value.numel() * value.element_size(),
                             worker_id=rank,
                         )
-            runtime(*[stacked[name] for name in PREFILL_TENSORS], config=config)
-            runtime.copy_stacked_from(stacked["logits"], logits)
-            runtime.copy_stacked_from(stacked["sampled_ids"], sampled_ids)
+            program = decode_compiled if decode else compiled
+            arguments = decode_stacked if decode else stacked
+            names = decode_names if decode else PREFILL_TENSORS
+            runtime.run(program, *[arguments[name] for name in names], config=config)
+            runtime.copy_stacked_from(arguments["logits"], logits)
+            runtime.copy_stacked_from(arguments["sampled_ids"], sampled_ids)
             for rank, token_ids in enumerate(rows):
                 if not token_ids:
                     continue
@@ -1630,7 +1734,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             tick = time.monotonic()
             if step:
                 run_rows([[tokens[-1]] if not finished[rank] else []
-                          for rank, tokens in enumerate(generated)])
+                          for rank, tokens in enumerate(generated)], decode=decode_compiled is not None)
             for rank, token in enumerate(last_ids):
                 if not finished[rank]:
                     generated[rank].append(token)
@@ -1643,10 +1747,12 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             if all(finished):
                 break
     return {
-        "platform": "a5", "tp": 1, "ep": RANKS, "dp": RANKS,
+        "platform": "a5", "devices": device_ids, "tp": 1, "ep": RANKS, "dp": RANKS,
         "precision": "official_bf16_mxfp8_mxfp4", "checkpoint": str(checkpoint.root),
         "capacity": CAPACITY, "chunk_size": chunk_size, "history_capacity": max_seq_len,
-        "full_prefix_recomputation": False, "engram_enabled": False,
+        "full_prefix_recomputation": False, "engram_enabled": True, "engram_lookup_device": "host",
+        "continuation_forward": "decode_fwd" if decode_compiled is not None else "prefill_fwd",
+        "shared_resident_weights": decode_compiled is not None,
         "layers_per_forward": 40, "l2_invocations_per_rank_per_forward": 1,
         "seconds": time.monotonic() - start,
         "cases": [
@@ -1788,7 +1894,8 @@ if __name__ == "__main__":
 
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--checkpoint", type=Path, required=True)
-        parser.add_argument("--runtime-dir", type=Path, required=True, help="previously compiled L3 artifact")
+        parser.add_argument("--runtime-dir", type=Path, required=True, help="compiled host-row Engram prefill")
+        parser.add_argument("--decode-runtime-dir", type=Path, help="compiled host-row Engram decode for continuation")
         parser.add_argument("--devices", default=os.environ.get("TASK_DEVICE"))
         parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1])
         parser.add_argument("--ep", type=int, default=RANKS, choices=[4, 8])
@@ -1824,8 +1931,15 @@ if __name__ == "__main__":
             options.runtime_dir, backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
         )
+        decode_compiled = None
+        if options.decode_runtime_dir:
+            decode_compiled = DistributedCompiledProgram.from_dir(
+                options.decode_runtime_dir, backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD,
+                distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            )
         report = generate(
-            checkpoint, compiled, device_ids, prompts, options.max_new_tokens, chunk_size=options.chunk_size,
+            checkpoint, compiled, device_ids, prompts, options.max_new_tokens,
+            chunk_size=options.chunk_size, decode_compiled=decode_compiled,
         )
         if options.report:
             options.report.parent.mkdir(parents=True, exist_ok=True)

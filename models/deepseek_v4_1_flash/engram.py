@@ -6,34 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4.1-Flash Engram block: gated n-gram lookup into the residual stream.
-
-Single-rank mirror of the released ``inference/model.py`` ``Engram.forward``
-(world_size == 1). The n-gram hashing runs host-side; this kernel starts from
-the precomputed per-position table row ids and evaluates, per token tile,
-
-    rows  = engram_table[hash_ids]                 # 24 gathered rows of 256
-    kv    = flatten(rows) @ wkv_weight             # [T,6144] @ [6144, 25600]
-    key, value = split(kv, [HC_MULT*D, D])         # key per hc copy, one value
-    dot   = sum(x * weight * key, -1) * rms(x) * rms(key) * D**-0.5
-    gate  = sigmoid(sign(dot) * sqrt(max(|dot|, clamp)))
-    out   = x + gate * value                       # value shared across copies
-
-``weight`` is the precomputed per-channel scale ``q_weight * k_weight`` from the
-released module (folded host-side into a single FP32 tensor so the kernel does
-not pay a BF16 rounding on the gate path). ``token_mask`` is a no-op here
-(text-only, no image spans), so the gate is never forced to zero. The table
-stays BF16 (a stand-in for the released FP8 rows; the golden reference
-dequantizes the same BF16 values, and the acceptance budget covers the
-FP8-vs-BF16 gap).
-
-Tensor-parallel mode (``--tp P``): the table is row-sharded across ``P`` ranks
-(``ParallelEmbedding`` style, ``ROWS_PER_RANK = NUM_EMBEDDINGS // P`` rows per
-rank). Every rank gathers the full hash-id set against its own shard, writes
-zeros for off-shard rows, publishes the partial lookup to its HCCL window, and
-all-reduces it chunk-wise inside the projection loop, so every rank produces
-the full output locally.
-"""
+"""V4.1 Engram projection and residual gating from host rows or device-sharded lookup tables."""
 
 import math
 import sys
@@ -43,6 +16,7 @@ import pypto.language.distributed as pld
 import torch
 
 from config import FLASH as M, T_DYN
+from gemm import gemm_bf16_via_mxfp8_to_bf16_staged
 
 
 # model config
@@ -90,85 +64,92 @@ TP_MAX_TOKENS = 256
 
 
 @pl.jit.inline
+def engram_cast_to_fp32(source: pl.Tensor, output: pl.Tensor):
+    """Widen a BF16 matrix into FP32 tiles."""
+    rows = pl.tensor.dim(source, 0)
+    width = pl.tensor.dim(source, 1)
+    for block in pl.spmd(((rows + T_TILE - 1) // T_TILE) * (width // N_TILE), name_hint="engram_widen"):
+        t0 = block // (width // N_TILE) * T_TILE
+        n0 = block % (width // N_TILE) * N_TILE
+        valid_rows = pl.min(T_TILE, rows - t0)
+        value = pl.slice(source, [T_TILE, N_TILE], [t0, n0], valid_shape=[valid_rows, N_TILE])
+        widened = pl.cast(value, pl.FP32)
+        output[t0:t0 + T_TILE, n0:n0 + N_TILE] = pl.set_validshape(widened, valid_rows, N_TILE)
+    return output
+
+
+@pl.jit.inline
 def engram_gate(
-    kv: pl.Tensor[[T_DYN, KV_OUT], pl.FP32],
+    kv: pl.Tensor,
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    x: pl.Tensor,
+    out: pl.Tensor,
+    output_fp32: pl.constexpr,
 ):
-    """Per (token block, hc copy) gate and residual add on a projected kv."""
+    """Gate projected keys and values into each residual stream copy."""
     t_dim = pl.tensor.dim(kv, 0)
     x_flat = pl.reshape(x, [t_dim, HC_MULT * D])
     out_flat = pl.reshape(out, [t_dim, HC_MULT * D])
     t_blocks = (t_dim + T_TILE - 1) // T_TILE
-
     for block in pl.spmd(t_blocks * HC_MULT, name_hint="engram_gate"):
         t0 = (block // HC_MULT) * T_TILE
         c = block % HC_MULT
         valid_rows = pl.min(T_TILE, t_dim - t0)
-
-        # Pass A: walk D in D_TILE chunks, accumulate sq_x / sq_k / dot.
-        # Row-byte alignment: a [T_TILE, 1] fp32 tile has a 4-byte row and the
-        # allocator requires 32; keep accumulators as [1, T_TILE] instead.
-        sq_x = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        sq_k = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        dot = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        reduction_tmp = pl.create_tile([T_TILE, D_TILE], dtype=pl.FP32)
+        # Reduction accumulators have 32-byte aligned rows.
+        sq_x = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        sq_k = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        dot = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for d0 in pl.range(0, D, D_TILE):
-            x_d = pl.cast(
-                pl.slice(
-                    x_flat,
-                    [T_TILE, D_TILE],
-                    [t0, c * D + d0],
-                    valid_shape=[valid_rows, D_TILE],
-                ),
-                target_type=pl.FP32,
-            )
-            key_d = pl.slice(
-                kv,
-                [T_TILE, D_TILE],
-                [t0, c * D + d0],
-                valid_shape=[valid_rows, D_TILE],
-            )
-            sq_x = pl.add(sq_x, pl.reshape(pl.row_sum(pl.mul(x_d, x_d)), [1, T_TILE]))
-            sq_k = pl.add(sq_k, pl.reshape(pl.row_sum(pl.mul(key_d, key_d)), [1, T_TILE]))
-            w_d = pl.slice(weight, [1, D_TILE], [c, d0])
+            x_raw = pl.load(x_flat, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
+            key_raw = pl.load(kv, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
+            key_d = pl.set_validshape(pl.fillpad(key_raw, pad_value=pl.PadValue.zero), T_TILE, D_TILE)
+            x_d = pl.set_validshape(pl.fillpad(x_raw, pad_value=pl.PadValue.zero), T_TILE, D_TILE)
+            sq_x = pl.add(sq_x, pl.reshape(pl.row_sum(pl.mul(x_d, x_d), reduction_tmp), [1, T_TILE]))
+            sq_k = pl.add(sq_k, pl.reshape(pl.row_sum(pl.mul(key_d, key_d), reduction_tmp), [1, T_TILE]))
+            w_d = pl.load(weight, [c, d0], [1, D_TILE])
             xw_d = pl.col_expand_mul(x_d, w_d)
-            dot = pl.add(dot, pl.reshape(pl.row_sum(pl.mul(xw_d, key_d)), [1, T_TILE]))
-
-        # gate = sigmoid(sign(dot) * sqrt(max(|dot|, clamp)))
-        # sign(dot)*sqrt(|dot|) == dot / sqrt(|dot|); the clamp keeps the
-        # denominator positive, matching copysign(sqrt(|dot|), dot).
+            dot = pl.add(dot, pl.reshape(pl.row_sum(pl.mul(xw_d, key_d), reduction_tmp), [1, T_TILE]))
         inv_x = pl.rsqrt(pl.add(pl.mul(sq_x, D_INV), NORM_EPS))
         inv_k = pl.rsqrt(pl.add(pl.mul(sq_k, D_INV), NORM_EPS))
         dot = pl.mul(pl.mul(pl.mul(dot, inv_x), inv_k), DOT_SCALE)
-        mag = pl.maximum(pl.abs(dot), CLAMP)
-        signed = pl.div(dot, pl.sqrt(mag))
-        gate = pl.reshape(
-            pl.recip(pl.add(pl.exp(pl.neg(signed)), 1.0)), [T_TILE, 1]
-        )
-
-        # Pass B: walk D again, compute y = x + gate * value
+        root = pl.sqrt(pl.maximum(pl.abs(dot), CLAMP))
+        nonnegative = pl.cmps(dot, 0.0, cmp_type=5)
+        signed = pl.tile.select(nonnegative, root, pl.neg(root))
+        gate = pl.reshape(pl.recip(pl.add(pl.exp(pl.neg(signed)), 1.0)), [T_TILE, 1])
         for d0 in pl.range(0, D, D_TILE):
-            x_d = pl.cast(
-                pl.slice(
-                    x_flat,
-                    [T_TILE, D_TILE],
-                    [t0, c * D + d0],
-                    valid_shape=[valid_rows, D_TILE],
-                ),
-                target_type=pl.FP32,
-            )
-            value_d = pl.slice(
-                kv,
-                [T_TILE, D_TILE],
-                [t0, HC_MULT * D + d0],
-                valid_shape=[valid_rows, D_TILE],
-            )
-            gated = pl.row_expand_mul(value_d, gate)
-            y = pl.cast(pl.add(x_d, gated), target_type=pl.BF16, mode="rint")
-            out_flat[t0 : t0 + T_TILE, c * D + d0 : c * D + d0 + D_TILE] = (
-                pl.set_validshape(y, valid_rows, D_TILE)
-            )
+            output_source = pl.load(x_flat, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
+            output_value = pl.load(kv, [t0, HC_MULT * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
+            gated = pl.row_expand_mul(output_value, gate)
+            y = pl.add(output_source, gated)
+            y_bf16 = pl.cast(y, target_type=pl.BF16, mode="rint")
+            if output_fp32:
+                y_rounded = pl.cast(y_bf16, pl.FP32)
+                pl.store(pl.set_validshape(y_rounded, valid_rows, D_TILE), [t0, c * D + d0], out_flat)
+            else:
+                pl.store(pl.set_validshape(y_bf16, valid_rows, D_TILE), [t0, c * D + d0], out_flat)
+    return out
+
+
+@pl.jit.inline(auto_scope=False)
+def engram_from_rows(
+    lookup: pl.Tensor,
+    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.Tensor,
+    out: pl.Tensor,
+):
+    """Project host-gathered BF16 rows and gate the FP32 residual stream."""
+    tokens = pl.tensor.dim(x, 0)
+    kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
+    gemm_bf16_via_mxfp8_to_bf16_staged(
+        lookup, wkv_weight, wkv_scale, kv, tokens,
+        ENGRAM_K, KV_OUT, "engram_projection", "engram_quant", N_TILE, 256, 1, 2147483647,
+    )
+    kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
+    engram_cast_to_fp32(kv, kv_fp32)
+    engram_gate(kv_fp32, weight, x, out, output_fp32=True)
     return out
 
 
@@ -219,7 +200,9 @@ def engram(
         kv[t0 : t0 + T_TILE, n0 : n0 + N_TILE] = pl.set_validshape(acc, valid_rows, N_TILE)
 
     # ---- Stage 2: per (token block, hc copy) gate and residual add
-    engram_gate(kv, weight, x, out)
+    x_fp32 = pl.create_tensor([t_dim, HC_MULT * D], dtype=pl.FP32)
+    engram_cast_to_fp32(pl.reshape(x, [t_dim, HC_MULT * D]), x_fp32)
+    engram_gate(kv, weight, pl.reshape(x_fp32, [t_dim, HC_MULT, D]), out, output_fp32=False)
     return out
 
 
@@ -422,7 +405,9 @@ def engram_tp(
         pl.write(kv, [0, 0], anchor)
 
     # Gate and residual add after signal retirement.
-    engram_gate(kv, weight, x, out)
+    x_fp32 = pl.create_tensor([t_dim, HC_MULT * D], dtype=pl.FP32)
+    engram_cast_to_fp32(pl.reshape(x, [t_dim, HC_MULT * D]), x_fp32)
+    engram_gate(kv, weight, pl.reshape(x_fp32, [t_dim, HC_MULT, D]), out, output_fp32=False)
     return out
 
 
