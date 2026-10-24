@@ -1740,8 +1740,8 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
         token_local_rope,
     )
 
-    if tp_size != 2:
-        raise ValueError(f"ragged2 requires tp_size=2, got {tp_size}")
+    if tp_size not in (2, 4):
+        raise ValueError(f"ragged2 requires tp_size=2 or 4, got {tp_size}")
 
     token_count = 8
     request_starts = (126, 30)
@@ -1943,12 +1943,21 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--case", choices=["b1", "ragged2"], default="b1",
-        help="Fixture case; ragged2 is the fixed two-request TP2 boundary case.",
+        help="Fixture case; ragged2 is the fixed two-request TP2/TP4 boundary case.",
     )
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--seed", type=int, default=20261023)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--ring-heap-mib", type=int, default=None)
     args = parser.parse_args()
+
+    import torch
+
+    torch.manual_seed(args.seed)
 
     # High-prefix sparse-attention tolerance.
     x_out_diff_thd, x_out_max_diff = (8e-3, 2) if args.start_pos or args.case == "ragged2" else (5e-3, 1)
@@ -1967,8 +1976,8 @@ if __name__ == "__main__":
     device_ids = [int(device) for device in args.device.split(",")]
     if len(device_ids) != TP_SIZE:
         parser.error(f"need exactly {TP_SIZE} devices, got {device_ids}")
-    if args.case == "ragged2" and TP_SIZE != 2:
-        parser.error("--case ragged2 requires --tp 2")
+    if args.case == "ragged2" and TP_SIZE not in (2, 4):
+        parser.error("--case ragged2 requires --tp 2 or 4")
     if args.case == "ragged2" and args.start_pos != 0:
         parser.error("--case ragged2 has fixed request starts and requires --start-pos 0")
     if args.token_count is None:
@@ -1992,6 +2001,9 @@ if __name__ == "__main__":
                 enable_dep_gen=args.enable_dep_gen,
             ),
             compile_only=args.compile_only,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
             rtol=1e-2,
             atol=1e-2,
             compare_fn={
@@ -2022,9 +2034,12 @@ if __name__ == "__main__":
                 distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
                 backend_type=args.backend_type,
                 execution_mode=args.execution_mode,
-                ring_heap=PREFILL_RING_HEAP,
+                ring_heap=PREFILL_RING_HEAP if args.ring_heap_mib is None else (args.ring_heap_mib * 1024 * 1024,) * 4,
             ),
             compile_only=args.compile_only,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
             rtol=1e-2,
             atol=1e-2,
             compare_fn={

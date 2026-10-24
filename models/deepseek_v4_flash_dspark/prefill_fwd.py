@@ -19,19 +19,15 @@ from golden import run
 from pypto.ir import DistributedConfig
 
 from moe import (
-    AUX_PAD,
     D,
     EXPERTS_PER_RANK,
     HC_DIM,
     HC_MULT,
-    IDX_PAD,
     MIX_HC,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
     N_RANKS,
-    N_ROUTES,
-    RECV_MAX,
     T,
     TOPK,
     VOCAB,
@@ -39,6 +35,7 @@ from moe import (
     clear_prefill_moe_signals,
     prefill_moe,
 )
+from prefill_moe_tile import PREFILL_MOE_SCALE_PAD, PREFILL_MOE_TOTAL_CAP
 from config import FLASH as MODEL_CONFIG
 from prefill_swa import (
     build_cp_tensor_specs as build_swa_attention_tensor_specs,
@@ -366,12 +363,11 @@ def prefill_fwd(
     grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    routed_y_buf: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     gather_window: pld.DistributedTensor[[PREFILL_GROUP_CAP, D], pl.BF16],
@@ -515,7 +511,7 @@ def prefill_fwd(
                 shared_w1_l0, shared_w1_scale_l0, shared_w3_l0, shared_w3_scale_l0,
                 shared_w2_l0, shared_w2_scale_l0,
                 x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
-                recv_meta, recv_x, recv_aux, recv_route,
+                recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 gather_window, gather_signal,
@@ -607,7 +603,7 @@ def prefill_fwd(
                 shared_w1_l1, shared_w1_scale_l1, shared_w3_l1, shared_w3_scale_l1,
                 shared_w2_l1, shared_w2_scale_l1,
                 x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
-                recv_meta, recv_x, recv_aux, recv_route,
+                recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 gather_window, gather_signal,
@@ -771,7 +767,7 @@ def prefill_fwd(
                     shared_w1_csa, shared_w1_scale_csa, shared_w3_csa, shared_w3_scale_csa,
                     shared_w2_csa, shared_w2_scale_csa,
                     x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
-                    recv_meta, recv_x, recv_aux, recv_route,
+                    recv_meta, recv_x, recv_aux,
                     arrived, data_arrived, routed_y_buf, combine_arrived,
                     stage_done, stage_token, layer_completion,
                     gather_window, gather_signal,
@@ -902,7 +898,7 @@ def prefill_fwd(
                     shared_w1_hca, shared_w1_scale_hca, shared_w3_hca, shared_w3_scale_hca,
                     shared_w2_hca, shared_w2_scale_hca,
                     x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
-                    recv_meta, recv_x, recv_aux, recv_route,
+                    recv_meta, recv_x, recv_aux,
                     arrived, data_arrived, routed_y_buf, combine_arrived,
                     stage_done, stage_token, layer_completion,
                     gather_window, gather_signal,
@@ -1071,7 +1067,7 @@ def prefill_fwd(
                 shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
                 shared_w2_last, shared_w2_scale_last,
                 x_hc, x_mixed, post_ffn, comb_ffn, ffn_out,
-                recv_meta, recv_x, recv_aux, recv_route,
+                recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
                 stage_done, stage_token, layer_completion,
                 gather_window, gather_signal,
@@ -1287,12 +1283,11 @@ def l3_prefill_fwd(
     csa_inner_state_slot_mapping_full.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
 
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-    recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+    recv_aux_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
+    routed_y_buf_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     stage_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     gather_window_buf = pld.alloc_window_buffer([PREFILL_GROUP_CAP, D], dtype=pl.BF16)
@@ -1308,12 +1303,11 @@ def l3_prefill_fwd(
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+        recv_aux = pld.window(recv_aux_buf, [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
         arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        routed_y_buf = pld.window(routed_y_buf_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         stage_done = pld.window(stage_done_buf, [N_RANKS, 1], dtype=pl.INT32)
         gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
@@ -1376,7 +1370,7 @@ def l3_prefill_fwd(
             final_norm_w[r], lm_head_weight[r], logit_row_indices[r],
             dspark_target_hidden[r],
             x_out[r], logits[r], grammar_mask[r], sampled_ids[r],
-            recv_meta, recv_x, recv_aux, recv_route,
+            recv_meta, recv_x, recv_aux,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             stage_done,
             gather_window, gather_signal,
@@ -2028,8 +2022,8 @@ def golden_prefill_fwd(_tensors):
     """Prefill forward is a topology/liveness witness; layer math is gated by prefill_layer."""
 
 
-def finite_tensor_compare(actual, expected, *, preserve_inactive=False, **kwargs):
-    """Check active results and preserve inactive input/output state."""
+def finite_tensor_compare(actual, expected, *, preserve_inactive=False, zero_inactive=False, **kwargs):
+    """Check active results and preserved or zeroed inactive state."""
     import torch
 
     if actual.numel() == 0:
@@ -2037,6 +2031,8 @@ def finite_tensor_compare(actual, expected, *, preserve_inactive=False, **kwargs
     query_start_loc = kwargs.get("inputs", {}).get("query_start_loc")
     for rank in range(actual.shape[0]):
         if query_start_loc is not None and int(query_start_loc[rank, -1]) == 0:
+            if zero_inactive and bool(torch.count_nonzero(actual[rank])):
+                return False, f"    inactive rank {rank} output is not zero"
             if preserve_inactive and not torch.equal(actual[rank], expected[rank]):
                 return False, f"    inactive rank {rank} output was modified"
             continue
@@ -2202,8 +2198,9 @@ def compare_functions():
     }
     compare = {name: finite_tensor_compare for name in finite_names}
     compare["dspark_target_hidden"] = dspark_target_hidden_compare
-    for name in CACHE_NAMES | {"x_hc", "attn_stage"}:
+    for name in CACHE_NAMES | {"attn_stage"}:
         compare[name] = partial(finite_tensor_compare, preserve_inactive=True)
+    compare["x_hc"] = partial(finite_tensor_compare, zero_inactive=True)
     compare["x_out"] = x_out_compare
     compare["logits"] = logits_compare
     compare["sampled_ids"] = sampled_ids_compare
@@ -2259,6 +2256,9 @@ def main():
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--ring-heap-mib", type=int, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
     if args.execution_mode:
         parser.error("this entry requires hardware; --sim is unsupported")
@@ -2306,7 +2306,8 @@ def main():
         golden_fn=golden_prefill_fwd,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        save_data=False,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
@@ -2314,7 +2315,7 @@ def main():
             execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
-            ring_heap=PREFILL_RING_HEAP,
+            ring_heap=PREFILL_RING_HEAP if args.ring_heap_mib is None else (args.ring_heap_mib * 1024 * 1024,) * 4,
         ),
         compare_fn=compare_functions(),
     )
