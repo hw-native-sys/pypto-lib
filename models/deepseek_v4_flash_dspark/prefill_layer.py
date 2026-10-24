@@ -12,6 +12,7 @@
 
 import argparse
 import os
+import sys
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -19,18 +20,15 @@ from golden import ScalarSpec, TensorSpec, ratio_allclose, ratio_reldiff, run
 from pypto.ir import DistributedConfig
 
 from moe import (
-    AUX_PAD,
     D,
+    EXPERTS_PER_RANK,
     HC_DIM,
     HC_MULT,
-    IDX_PAD,
     MIX_HC,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
     N_RANKS,
-    N_ROUTES,
-    RECV_MAX,
     T,
     TOPK,
     VOCAB,
@@ -38,6 +36,7 @@ from moe import (
     golden_moe,
     prefill_moe,
 )
+from prefill_moe_tile import PREFILL_MOE_SCALE_PAD, PREFILL_MOE_TOTAL_CAP
 from prefill_csa import (
     BLOCK_SIZE,
     CSA_CMP_BLOCK_NUM,
@@ -113,6 +112,7 @@ PREFILL_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 # fixture
 SUPPORTED_LAYERS = (0, 2, 3)
+MOE_ONLY = "--moe-only" in sys.argv
 
 if GROUP_TOKENS > PREFILL_GROUP_CAP:
     raise ValueError("single-layer TP group exceeds the prefill communication capacity")
@@ -347,12 +347,11 @@ def prefill_layer_moe(
     ffn_out: pl.Out[pl.Tensor[[FWD_TOKENS_DYN, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    routed_y_buf: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     epoch_init_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -378,11 +377,10 @@ def prefill_layer_moe(
     local_rows = pl.tensor.dim(ffn_out, 0)
     num_waves = (local_rows + T - 1) // T
     epoch_base = layer_i32 * pl.cast(num_waves, pl.INT32)
-    expert_epoch_base = epoch_base * pl.const(N_LOCAL, pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_moe_epoch_seed") as seed_tid:
         for src in pl.range(N_RANKS):
             pl.write(arrived, [src, 0], epoch_base)
-            pl.write(data_arrived, [src, 0], expert_epoch_base)
+            pl.write(data_arrived, [src, 0], epoch_base)
             pl.write(combine_arrived, [src, 0], epoch_base)
             pl.write(stage_done, [src, 0], epoch_base)
         for peer in pl.range(N_RANKS):
@@ -413,7 +411,7 @@ def prefill_layer_moe(
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
         x_next, x_mixed, post_ffn, comb_ffn, ffn_out,
-        recv_meta, recv_x, recv_aux, recv_route,
+        recv_meta, recv_x, recv_aux,
         arrived, data_arrived, routed_y_buf, combine_arrived,
         stage_done, stage_token, layer_completion,
         gather_window, gather_signal,
@@ -562,84 +560,83 @@ def l3_prefill_layer(
     ffn_out.bind_dynamic(1, FWD_TOKENS_DYN)
     x_next.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-    recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+    recv_aux_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
+    routed_y_buf_buf = pld.alloc_window_buffer([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     stage_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     epoch_init_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     gather_window_buf = pld.alloc_window_buffer([PREFILL_GROUP_CAP, D], dtype=pl.BF16)
     gather_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    o_proj_wo_a_window_buf = pld.alloc_window_buffer([O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], dtype=pl.BF16)
-    o_proj_wo_b_window_buf = pld.alloc_window_buffer([O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], dtype=pl.INT8)
-    o_proj_weight_ready_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    o_proj_weight_consumed_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    if not MOE_ONLY:
+        o_proj_wo_a_window_buf = pld.alloc_window_buffer([O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], dtype=pl.BF16)
+        o_proj_wo_b_window_buf = pld.alloc_window_buffer([O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], dtype=pl.INT8)
+        o_proj_weight_ready_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+        o_proj_weight_consumed_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
-    for rank in pl.range(pld.world_size()):
-        gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
-        gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        o_proj_wo_a_window = pld.window(
-            o_proj_wo_a_window_buf, [O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], dtype=pl.BF16,
-        )
-        o_proj_wo_b_window = pld.window(
-            o_proj_wo_b_window_buf, [O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], dtype=pl.INT8,
-        )
-        o_proj_weight_ready = pld.window(o_proj_weight_ready_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        o_proj_weight_consumed = pld.window(o_proj_weight_consumed_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        group_base = rank // TP_SIZE * TP_SIZE
-        tp_rank = rank % TP_SIZE
-        prefill_layer_attention(
-            x_hc[rank],
-            query_start_loc[rank],
-            hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
-            attn_norm_w[rank],
-            wq_a[rank], wq_b[rank], wq_b_scale[rank],
-            wkv[rank], gamma_cq[rank], gamma_ckv[rank],
-            swa_freqs_cos[rank], swa_freqs_sin[rank],
-            compressed_freqs_cos[rank], compressed_freqs_sin[rank],
-            hca_cmp_freqs_cos[rank], hca_cmp_freqs_sin[rank],
-            csa_cmp_freqs_cos[rank], csa_cmp_freqs_sin[rank],
-            hca_cmp_wkv[rank], hca_cmp_wgate[rank], hca_cmp_ape[rank],
-            hca_cmp_norm_w[rank],
-            hca_compress_state[rank], hca_compress_state_block_table[rank],
-            csa_cmp_wkv[rank], csa_cmp_wgate[rank], csa_cmp_ape[rank],
-            csa_cmp_norm_w[rank],
-            csa_compress_state[rank], csa_compress_state_block_table[rank],
-            csa_hadamard_idx[rank], csa_idx_wq_b[rank], csa_idx_wq_b_scale[rank],
-            csa_weights_proj[rank],
-            csa_inner_wkv[rank], csa_inner_wgate[rank], csa_inner_ape[rank],
-            csa_inner_norm_w[rank],
-            csa_inner_compress_state[rank], csa_inner_compress_state_block_table[rank],
-            kv_cache[rank], ori_block_table[rank], ori_slot_mapping_full[rank],
-            hca_cmp_kv[rank], csa_cmp_kv[rank],
-            hca_cmp_block_table[rank], csa_cmp_block_table[rank],
-            idx_kv_cache[rank], idx_kv_scale[rank], idx_block_table[rank],
-            position_ids_local[rank], position_ids_full[rank],
-            hca_cmp_slot_mapping_full[rank], hca_state_slot_mapping_full[rank],
-            csa_cmp_slot_mapping_full[rank], csa_idx_slot_mapping_full[rank], csa_state_slot_mapping_full[rank],
-            csa_inner_state_slot_mapping_full[rank],
-            attn_sink[rank],
-            wo_a[rank], wo_b[rank], wo_b_scale[rank],
-            attn_stage[rank],
-            gather_window, gather_signal,
-            o_proj_wo_a_window, o_proj_wo_b_window,
-            o_proj_weight_ready, o_proj_weight_consumed,
-            group_base, tp_rank,
-            layer_id,
-            device=rank,
-        )
+        for rank in pl.range(pld.world_size()):
+            gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
+            gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+            o_proj_wo_a_window = pld.window(
+                o_proj_wo_a_window_buf, [O_PROJ_WO_A_WINDOW_ROWS, O_PROJ_WO_A_WINDOW_COLS], dtype=pl.BF16,
+            )
+            o_proj_wo_b_window = pld.window(
+                o_proj_wo_b_window_buf, [O_PROJ_WO_B_WINDOW_ROWS, O_PROJ_WO_B_WINDOW_COLS], dtype=pl.INT8,
+            )
+            o_proj_weight_ready = pld.window(o_proj_weight_ready_buf, [TP_SIZE, 1], dtype=pl.INT32)
+            o_proj_weight_consumed = pld.window(o_proj_weight_consumed_buf, [TP_SIZE, 1], dtype=pl.INT32)
+            group_base = rank // TP_SIZE * TP_SIZE
+            tp_rank = rank % TP_SIZE
+            prefill_layer_attention(
+                x_hc[rank],
+                query_start_loc[rank],
+                hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
+                attn_norm_w[rank],
+                wq_a[rank], wq_b[rank], wq_b_scale[rank],
+                wkv[rank], gamma_cq[rank], gamma_ckv[rank],
+                swa_freqs_cos[rank], swa_freqs_sin[rank],
+                compressed_freqs_cos[rank], compressed_freqs_sin[rank],
+                hca_cmp_freqs_cos[rank], hca_cmp_freqs_sin[rank],
+                csa_cmp_freqs_cos[rank], csa_cmp_freqs_sin[rank],
+                hca_cmp_wkv[rank], hca_cmp_wgate[rank], hca_cmp_ape[rank],
+                hca_cmp_norm_w[rank],
+                hca_compress_state[rank], hca_compress_state_block_table[rank],
+                csa_cmp_wkv[rank], csa_cmp_wgate[rank], csa_cmp_ape[rank],
+                csa_cmp_norm_w[rank],
+                csa_compress_state[rank], csa_compress_state_block_table[rank],
+                csa_hadamard_idx[rank], csa_idx_wq_b[rank], csa_idx_wq_b_scale[rank],
+                csa_weights_proj[rank],
+                csa_inner_wkv[rank], csa_inner_wgate[rank], csa_inner_ape[rank],
+                csa_inner_norm_w[rank],
+                csa_inner_compress_state[rank], csa_inner_compress_state_block_table[rank],
+                kv_cache[rank], ori_block_table[rank], ori_slot_mapping_full[rank],
+                hca_cmp_kv[rank], csa_cmp_kv[rank],
+                hca_cmp_block_table[rank], csa_cmp_block_table[rank],
+                idx_kv_cache[rank], idx_kv_scale[rank], idx_block_table[rank],
+                position_ids_local[rank], position_ids_full[rank],
+                hca_cmp_slot_mapping_full[rank], hca_state_slot_mapping_full[rank],
+                csa_cmp_slot_mapping_full[rank], csa_idx_slot_mapping_full[rank], csa_state_slot_mapping_full[rank],
+                csa_inner_state_slot_mapping_full[rank],
+                attn_sink[rank],
+                wo_a[rank], wo_b[rank], wo_b_scale[rank],
+                attn_stage[rank],
+                gather_window, gather_signal,
+                o_proj_wo_a_window, o_proj_wo_b_window,
+                o_proj_weight_ready, o_proj_weight_consumed,
+                group_base, tp_rank,
+                layer_id,
+                device=rank,
+            )
 
     for rank in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
+        recv_aux = pld.window(recv_aux_buf, [PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], dtype=pl.FP32)
         arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        routed_y_buf = pld.window(routed_y_buf_buf, [PREFILL_MOE_TOTAL_CAP, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         stage_done = pld.window(stage_done_buf, [N_RANKS, 1], dtype=pl.INT32)
         epoch_init_done = pld.window(epoch_init_done_buf, [N_RANKS, 1], dtype=pl.INT32)
@@ -660,7 +657,7 @@ def l3_prefill_layer(
             shared_w3[rank], shared_w3_scale[rank],
             shared_w2[rank], shared_w2_scale[rank],
             x_mixed[rank], post_ffn[rank], comb_ffn[rank], ffn_out[rank], x_next[rank],
-            recv_meta, recv_x, recv_aux, recv_route,
+            recv_meta, recv_x, recv_aux,
             arrived, data_arrived, routed_y_buf, combine_arrived,
             stage_done, epoch_init_done,
             gather_window, gather_signal,
@@ -808,6 +805,8 @@ def build_tensor_specs(layer_id=0, start_pos=0, token_count=GROUP_TOKENS):
         )
 
     def init_attn_stage():
+        if MOE_ONLY:
+            return init_full_x()
         return torch.zeros(N_RANKS, physical_tokens, HC_MULT, D, dtype=torch.float32)
 
     stage_specs = [
@@ -945,15 +944,16 @@ def golden_prefill_layer(tensors):
     group_tokens = tensors["x_hc"].shape[1]
     local_tokens = tensors["position_ids_local"].shape[1]
 
-    for group_base in range(0, N_RANKS, TP_SIZE):
-        full_attn = torch.zeros(group_tokens, HC_MULT, D, dtype=torch.float32)
-        attention_tensors = _attention_golden_tensors(tensors, group_base, layer_id, full_attn)
-        attention_golden(attention_tensors)
-        full_attn = attention_tensors["x_out"]
-        for rank in range(group_base, group_base + TP_SIZE):
-            tensors["attn_stage"][rank].copy_(full_attn)
-            for name in cache_outputs:
-                tensors[name][rank].copy_(tensors[name][group_base])
+    if not MOE_ONLY:
+        for group_base in range(0, N_RANKS, TP_SIZE):
+            full_attn = torch.zeros(group_tokens, HC_MULT, D, dtype=torch.float32)
+            attention_tensors = _attention_golden_tensors(tensors, group_base, layer_id, full_attn)
+            attention_golden(attention_tensors)
+            full_attn = attention_tensors["x_out"]
+            for rank in range(group_base, group_base + TP_SIZE):
+                tensors["attn_stage"][rank].copy_(full_attn)
+                for name in cache_outputs:
+                    tensors[name][rank].copy_(tensors[name][group_base])
 
     local_attn = torch.empty(N_RANKS, local_tokens, HC_MULT, D, dtype=torch.float32)
     for rank in range(N_RANKS):
@@ -1048,6 +1048,10 @@ def main():
         default=os.environ.get("TASK_DEVICE", ",".join(str(index) for index in range(N_RANKS))),
     )
     parser.add_argument("--seed", type=int, default=20260825)
+    parser.add_argument("--moe-only", action="store_true", help="validate only the production prefill MoE stage")
+    parser.add_argument("--experts-per-rank", type=int, default=EXPERTS_PER_RANK)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--runtime-dir", default=None)
@@ -1076,7 +1080,8 @@ def main():
         golden_fn=golden_prefill_layer,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        save_data=False,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(

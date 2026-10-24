@@ -94,7 +94,12 @@ nav:
       - DeepSeek V4-Flash (MTP):
           - Model overview: models/deepseek_v4_flash_mtp/index.md
           - Decode optimization: models/deepseek_v4_flash_mtp/decode_optimization.md
-      - DeepSeek V4-Flash (DSpark): models/deepseek_v4_flash_dspark/index.md
+      - DeepSeek V4-Flash (DSpark):
+          - Model overview: models/deepseek_v4_flash_dspark/index.md
+          - Prefill migration progress: models/deepseek_v4_flash_dspark/prefill-migration-progress.md
+          - Prefill M0 baseline: models/deepseek_v4_flash_dspark/prefill-migration-m0.md
+          - Prefill M1 evaluation: models/deepseek_v4_flash_dspark/prefill-migration-m1.md
+          - Prefill M2 evaluation: models/deepseek_v4_flash_dspark/prefill-migration-m2.md
       - DeepSeek V4.1-Flash:
           - Model overview: models/deepseek_v4_1_flash/index.md
           - Vision encoder and visual aligner: models/deepseek_v4_1_flash/vision.md

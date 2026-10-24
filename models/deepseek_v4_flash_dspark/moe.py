@@ -54,6 +54,7 @@ from config import FLASH as M, MOE_TOKENS, RECV_MAX
 from expert_routed import RECV_TILE, TILES_PER_EXPERT, expert_routed_tile
 from expert_shared import expert_shared
 from gate import gate
+from prefill_moe_tile import PREFILL_MOE_SCALE_PAD, PREFILL_MOE_TOTAL_CAP, prefill_moe_tile
 from hc_post import hc_post
 from hc_pre import hc_pre
 from prefill_cp_token_allgather import (
@@ -627,12 +628,11 @@ def prefill_moe(
     comb_ffn: pl.Tensor[[PREFILL_GROUP_T_DYN, HC_MULT * HC_MULT], pl.FP32],
     ffn_out: pl.Tensor[[PREFILL_LOCAL_T_DYN, D], pl.BF16],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    recv_x: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_SCALE_PAD], pl.FP32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    routed_y_buf: pld.DistributedTensor[[PREFILL_MOE_TOTAL_CAP, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     stage_token: pl.Tensor[[1], pl.INT32],
@@ -661,6 +661,7 @@ def prefill_moe(
         wave_i32 = pl.cast(wave, pl.INT32)
         moe_epoch = layer_id * num_waves_i32 + wave_i32 + pl.const(1, pl.INT32)
         with pl.scope():
+            ffn_out_step = ffn_out
             local_wave_base = wave_i32 * T
             # Physical rows in the fixed-capacity wave.
             wave_rows = pl.min(T, local_rows - local_wave_base)
@@ -670,7 +671,8 @@ def prefill_moe(
             full_wave_base = tp_rank * local_rows + local_wave_base
 
             x_mixed_wave = pl.create_tensor([T, D], dtype=pl.BF16)
-            for token in pl.spmd(T, name_hint="prefill_moe_hidden_stage"):
+            with pl.spmd(T, name_hint="prefill_moe_hidden_stage") as wave_ready_tid:
+                token = pl.tile.get_block_idx()
                 completed_epoch = pl.read(stage_token, [0])
                 if completed_epoch >= 0:
                     if token < wave_rows:
@@ -702,8 +704,11 @@ def prefill_moe(
                         pl.write(input_ids_wave_rows, [token, 0], input_id)
             input_ids_wave = pl.reshape(input_ids_wave_rows, [T])
 
-            ffn_wave = pl.create_tensor([T, D], dtype=pl.BF16)
-            completion_tid = _moe_tile(
+            if wave_rows == T:
+                ffn_wave = ffn_out_step[local_wave_base : local_wave_base + T, :]
+            else:
+                ffn_wave = pl.create_tensor([T, D], dtype=pl.BF16)
+            completion_tid = prefill_moe_tile(
                 x_mixed_wave,
                 norm_w, gate_w, gate_bias, tid2eid, input_ids_wave,
                 routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
@@ -711,15 +716,20 @@ def prefill_moe(
                 shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
                 shared_w2, shared_w2_scale,
                 ffn_wave,
-                recv_meta, recv_x, recv_aux, recv_route,
+                recv_meta, recv_x, recv_aux,
                 arrived, data_arrived, routed_y_buf, combine_arrived,
-                layer_id, wave_rows_i32, my_rank, moe_epoch,
+                wave_ready_tid, layer_id, wave_rows_i32, my_rank, moe_epoch,
             )
-            with pl.spmd(T, name_hint="prefill_moe_output_store", deps=[completion_tid]) as output_store_tid:
-                token = pl.tile.get_block_idx()
-                if token < wave_rows:
-                    local_token = local_wave_base + token
-                    ffn_out[local_token : local_token + 1, :] = ffn_wave[token : token + 1, :]
+            output_tids = pl.array.create(1, pl.TASK_ID)
+            output_tids[0] = completion_tid
+            if wave_rows < T:
+                with pl.spmd(T, name_hint="prefill_moe_output_store_tail", deps=[completion_tid]) as output_store_tail_tid:
+                    token = pl.tile.get_block_idx()
+                    if token < wave_rows:
+                        local_token = local_wave_base + token
+                        ffn_out_step[local_token : local_token + 1, :] = ffn_wave[token : token + 1, :]
+                output_tids[0] = output_store_tail_tid
+            output_store_tid = pl.system.task_dummy(deps=[output_tids])
             # Publish one globally complete wave before the windows are reused.
             with pl.at(
                 level=pl.Level.CORE_GROUP,
