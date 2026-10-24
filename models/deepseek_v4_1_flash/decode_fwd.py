@@ -39,6 +39,7 @@ from decode_swa import decode_swa
 from input_pack import prepare_compressed_lens
 from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, final_output
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
+from engram import ENGRAM_K, KV_OUT, engram_from_rows
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from decode_moe import (
     moe, SIGNAL_PAD, clear_moe_signals, AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH,
@@ -93,6 +94,10 @@ FWD_C1A_TABLE_DYN = pl.dynamic("V41_FWD_C1A_TABLE_DYN")
 
 @pl.jit.inline(auto_scope=False)
 def decode_encoder(
+    engram_lookup: pl.Tensor[[2, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
+    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
+    engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
@@ -233,6 +238,13 @@ def decode_encoder(
     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
     for layer in pl.range(0, 20):
+        if layer == 1 or layer == 14:
+            engram_slot = layer // 14
+            layer_engram_scale = pl.slice(engram_wkv_scale, [ENGRAM_K // 32, KV_OUT], [engram_slot * (ENGRAM_K // 32), 0])
+            engram_from_rows(
+                engram_lookup[engram_slot], engram_wkv[engram_slot], layer_engram_scale,
+                engram_weight[engram_slot], x_hc, x_hc,
+            )
         with pl.scope():
             layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [layer * window_blocks_per_layer, 0, 0, 0])
             layer_window_cache_scale = pl.slice(window_cache_scale_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], [layer * window_blocks_per_layer, 0, 0, 0])
@@ -662,6 +674,10 @@ def decode_decoder(
 
 @pl.jit(auto_scope=False)
 def l2_decode_fwd(
+    engram_lookup: pl.Tensor[[2, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
+    engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
+    engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
@@ -763,6 +779,7 @@ def l2_decode_fwd(
     compressed_token_rope_cos = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_token_rope_sin = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     encoder_hidden, encoder_pre_mix, token_cos, token_sin = decode_encoder(
+        engram_lookup, engram_wkv, engram_wkv_scale, engram_weight,
         x_hc, pre_mix,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_weight,
@@ -840,6 +857,10 @@ def l2_decode_fwd(
 
 @pl.jit.host
 def l3_decode_fwd(
+    engram_lookup: pl.Tensor[[EP_SIZE, 2, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
+    engram_wkv: pl.Tensor[[EP_SIZE, 2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[EP_SIZE, 2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
+    engram_weight: pl.Tensor[[EP_SIZE, 2, HC_MULT, D], pl.FP32],
     x_hc: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
     hc_attn_fn: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
@@ -992,7 +1013,7 @@ def l3_decode_fwd(
     commit lengths before the next call. Completed forwards clear MoE signals;
     use persistent=True with reset_persistent_windows=False for serialized calls.
     Reset a reused request slot in all C2A sources after its users complete. Restore or reset mutated state before retrying failed
-    calls. Engram, vision and DSpark require no inputs here.
+    calls. Engram consumes host lookup rows; vision and DSpark require no inputs here.
     """
     x_hc.bind_dynamic(1, LOCAL_T_DYN)
     pre_mix.bind_dynamic(1, LOCAL_T_DYN)
@@ -1056,6 +1077,7 @@ def l3_decode_fwd(
         head_logits = pld.window(head_logits_buffer, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
         head_logits_done = pld.window(head_logits_done_buffer, [1, 1], dtype=pl.INT32)
         l2_decode_fwd(
+            engram_lookup[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             x_hc[rank], pre_mix[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank],

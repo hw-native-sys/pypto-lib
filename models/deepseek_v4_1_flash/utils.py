@@ -9,6 +9,7 @@
 """Metadata lowering and shared validation helpers for prefill and decode."""
 
 from collections.abc import Callable
+import math
 
 import torch
 
@@ -204,3 +205,143 @@ def _publish_quantized_cache(
         _copy_cache_rows(updated_payload, row_payload, rows)
         _copy_cache_rows(updated_scale, row_scale, rows)
     return updated_payload, updated_scale
+
+
+class HostEngram:
+    """Hash text history and read selected FP8 checkpoint table rows on the CPU.
+
+    Reuse one instance across prefill chunks and decode calls. Each request_id
+    owns its compressed-token history; start_pos=0 resets that request, and
+    continuation requires the preceding history. Image-token masking is unsupported.
+    """
+
+    def __init__(self, checkpoint, tokenizer):
+        import numpy as np
+        from tokenizers import Regex, normalizers
+
+        self.checkpoint = checkpoint
+        sentinel = "\ue000"
+        normalizer = normalizers.Sequence([
+            normalizers.NFKC(), normalizers.NFD(), normalizers.StripAccents(), normalizers.Lowercase(),
+            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "), normalizers.Replace(Regex(r"^ $"), sentinel),
+            normalizers.Strip(), normalizers.Replace(sentinel, " "),
+        ])
+        keys = {}
+        token_map = []
+        for token in range(tokenizer.get_vocab_size(with_added_tokens=True)):
+            text = tokenizer.decode([token], skip_special_tokens=False)
+            key = tokenizer.id_to_token(token) if "\ufffd" in text else normalizer.normalize_str(text) or text
+            token_map.append(keys.setdefault(key, len(keys)))
+        if len(keys) != M.engram_compressed_vocab_size:
+            raise ValueError(f"Engram compressed vocabulary has {len(keys)} entries")
+        self.token_map = torch.tensor(token_map, dtype=torch.int64)
+        self.pad_id = token_map[M.engram_pad_token_id]
+        self.history = {}
+        primes, seen = [], set()
+        for layer in M.engram_layer_ids:
+            buckets = []
+            for _ in range(M.engram_max_ngram_size - 1):
+                candidate = M.engram_vocab_size - 1
+                for _ in range(M.engram_n_heads):
+                    candidate += 1
+                    while candidate in seen or any(candidate % d == 0 for d in range(2, math.isqrt(candidate) + 1)):
+                        candidate += 1
+                    seen.add(candidate)
+                    buckets.append(candidate)
+            primes.append(buckets)
+        if tuple(map(sum, primes)) != M.engram_num_embeddings:
+            raise ValueError("Engram prime buckets do not match checkpoint table sizes")
+        self.primes = torch.tensor(primes, dtype=torch.int64)
+        self.offsets = self.primes.cumsum(-1) - self.primes
+        bound = max(1, (np.iinfo(np.int64).max // len(keys)) // 2)
+        self.multipliers = torch.stack([
+            torch.from_numpy(np.random.default_rng(10007 * layer).integers(
+                0, bound, size=M.engram_max_ngram_size, dtype=np.int64,
+            ) * 2 + 1)
+            for layer in M.engram_layer_ids
+        ])
+
+    def hash_ids(self, token_ids, start_pos=0, *, request_id=0):
+        """Return [layer, token, hash column] IDs and commit the current text history."""
+        ids = torch.as_tensor(token_ids, device="cpu")
+        if ids.numel() and ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Engram token IDs must have an integer dtype")
+        ids = ids.long()
+        if ids.ndim != 1 or bool(((ids < 0) | (ids >= self.token_map.numel())).any()):
+            raise ValueError("Engram requires a one-dimensional sequence of valid token IDs")
+        history = self.history.get(request_id, torch.empty(0, dtype=torch.int64))
+        if isinstance(start_pos, bool) or not isinstance(start_pos, int) or not 0 <= start_pos <= history.numel():
+            raise ValueError("Engram continuation requires all preceding token history")
+        compressed = torch.cat((history[:start_pos], self.token_map[ids]))
+        positions = torch.arange(start_pos, compressed.numel())
+        lookback = []
+        for shift in range(M.engram_max_ngram_size):
+            source = (positions - shift).clamp_min(0)
+            values = compressed[source]
+            lookback.append(torch.where(positions >= shift, values, self.pad_id))
+        tokens = torch.stack(lookback, dim=-1)
+        products = tokens.unsqueeze(0) * self.multipliers.unsqueeze(1)
+        rolling, hashes = products[..., 0], []
+        for shift in range(1, M.engram_max_ngram_size):
+            rolling = torch.bitwise_xor(rolling, products[..., shift])
+            begin = (shift - 1) * M.engram_n_heads
+            primes = self.primes[:, begin:begin + M.engram_n_heads].unsqueeze(1)
+            hashes.append(rolling.unsqueeze(-1) % primes)
+        self.history[request_id] = compressed
+        return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
+
+    def lookup(self, token_ids, capacity, start_pos=0, *, request_id=0):
+        """Read current rows and group-32 E8M0 scales into [2, capacity, 6144] BF16.
+
+        Tables stay in host checkpoint files; only selected rows are read.
+        Unused token rows are zero-padded.
+        """
+        from quant import decode_e8m0
+
+        if len(token_ids) > capacity or capacity <= 0:
+            raise ValueError("Engram rows must fit the current-token capacity")
+        hashes = self.hash_ids(token_ids, start_pos, request_id=request_id)
+        layers = len(M.engram_layer_ids)
+        width = self.primes.shape[1] * M.engram_head_dim
+        result = torch.zeros((layers, capacity, width), dtype=torch.bfloat16)
+        for slot, layer in enumerate(M.engram_layer_ids):
+            prefix = f"layers.{layer}.engram.embed."
+            rows = self.checkpoint.tensor_rows(prefix + "weight", hashes[slot])
+            scales = self.checkpoint.tensor_rows(prefix + "scale", hashes[slot])
+            if rows.dtype != torch.float8_e4m3fn or rows.shape[-1] != M.engram_head_dim:
+                raise ValueError(f"unsupported native Engram table layout: {prefix}weight")
+            if scales.dtype != torch.float8_e8m0fnu or scales.shape[-1] != M.engram_head_dim // 32:
+                raise ValueError(f"unsupported native Engram table scales: {prefix}scale")
+            values = rows.float() * decode_e8m0(scales).repeat_interleave(32, dim=-1)
+            result[slot, :len(token_ids)] = values.flatten(1).to(torch.bfloat16)
+        return result
+
+
+DECODE_CACHE_NAMES = {
+    "window_cache_pool": "window_cache", "window_cache_scale_pool": "window_scales",
+    "compressed_cache_pool": "compressed_cache", "compressed_cache_scale_pool": "compressed_scales",
+    "index_cache_pool": "index_cache", "index_cache_scale_pool": "index_scales",
+    "state_cache_pool": "state_cache",
+}
+
+
+def decode_cache_views(cache_state):
+    """Alias contiguous prefill storage as decode pools by flattening source/page axes."""
+    return {target: cache_state[source].flatten(0, 1) for target, source in DECODE_CACHE_NAMES.items()}
+
+
+def prepare_decode_inputs(values):
+    """Lower one request's current prefill metadata to the TP1 decode input contract."""
+    embedding = values["embedding"].float()
+    result = {
+        "x_hc": embedding[:, None, :].expand(-1, M.hc_mult, -1).contiguous(),
+        "pre_mix": values["initial_pre"], "engram_lookup": values["engram_lookup"],
+        "logit_row_indices": values["logit_rows"],
+    }
+    # Prefill metadata has encoder/decoder stages; decode starts from encoder rows.
+    for name in ("window_slots", "window_indices", "token_to_req_indices", "position_ids", "query_start_loc"):
+        result[name] = values[name][0].contiguous()
+    for name in ("freqs_cos", "freqs_sin", "c2a_compressed_slots", "c1a_compressed_slots",
+                 "c2a_index_block_table", "c1a_index_block_table", "state_block_table"):
+        result[name] = values[name]
+    return result
