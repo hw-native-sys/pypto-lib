@@ -4,7 +4,7 @@
 [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (`glm5_next`,
 `Glm5NextForConditionalGeneration`) on **Ascend a2a3**. It includes component
 kernels, Torch goldens, W8A8 checkpoint staging, and composed MoE FFN entries.
-Complete prefill/decode forward composition is a separate integration step.
+The bounded decode backbone entry and its validation are described below.
 
 ## Why W8A8, and why a2a3 forces it
 
@@ -167,6 +167,65 @@ Use `--case tp_reduce` for the collective alone, or a local case such as
 ```bash
 python models/glm5_3_flash/lm_head.py -p a2a3 -d 0,1 --compile-only
 ```
+
+## Decode backbone validation
+
+`models/glm5_3_flash/decode_fwd.py` composes prepared BF16 embeddings into
+normalized hidden states. Layers 0–2 use KDA and Dense MLP; layer 3 uses DSA
+and MoE. Each sublayer has mHC processing and TP reduction. MoE dispatches the
+replicated batch from rank 0, runs EP experts, and restores replicated outputs.
+Embedding lookup, LM head, sampling, MTP and serving integration are outside
+this entry's scope.
+
+The fixture has 16 requests, four available layers, two decode steps and
+TP2/EP2. The default runs layer 0 only. State-row mappings vary between steps;
+cache pages use non-identity mappings. Convolution, recurrent and indexer state
+persist across the two steps. Four-layer validation remains outside CI and
+has not passed the independent CPU golden. A full 45-layer decode stack has
+not been validated.
+
+Run with two allocated devices from the repository root:
+
+```bash
+# Default: one layer, two steps, independent CPU golden.
+PYTHONPATH=. python models/glm5_3_flash/decode_fwd.py -p a2a3 -d 0,1 --tp 2 --ep 2
+
+# Explicit four-layer propagation; currently a known precision failure.
+PYTHONPATH=. python models/glm5_3_flash/decode_fwd.py -p a2a3 -d 0,1 --tp 2 --ep 2 --end-layer 4
+
+# Isolate the DSA/MoE layer using the prepared input fixture.
+PYTHONPATH=. python models/glm5_3_flash/decode_fwd.py -p a2a3 -d 0,1 --tp 2 --ep 2 --start-layer 3 --end-layer 4
+```
+
+`--start-layer` does not execute the omitted prefix. `--compile-only` compiles
+without using devices. `--dense-dtype bf16` selects the optional BF16 Dense
+path; the default uses dynamic W8A8 Dense and MoE operations.
+
+The independent CPU golden preserves BF16 activation boundaries, INT8
+activation quantization, INT32 accumulation and persistent state updates.
+It uses ordinary FP32 arithmetic without software precision compensation.
+RMSNorm follows the kernel's tiled sum-of-squares order. Sparse attention
+rounds each block's exponential weights to BF16 before PV while keeping the
+softmax denominator in FP32. CPU and device accumulation may still differ.
+
+`--validate-boundaries` additionally supports local diagnosis using captured
+sublayer inputs. It checks the surrounding mHC edges, final normalization,
+written cache rows and KDA states. TP replicas and untouched state rows must
+match exactly. This mode does not establish independent multilayer accuracy.
+The four trace fields are Attention output, FFN output, FFN input and normalized
+Attention input. Their buffers are separate to preserve asynchronous reads.
+
+The latest independent four-layer official-weight CPU replay still exceeds
+the existing acceptance criteria after the fourth-layer MoE. Local KDA and
+FFN replays with recorded inputs pass their checks; this does not imply that
+independent propagation passes. Re-run on hardware after kernel changes.
+
+Shared indexer kernels live in `indexer.py`; `decode_indexer.py` and
+`prefill_indexer.py` own their respective composition and validation. Decode's
+empty-owner path retains communication dependencies while skipping empty
+normalization and quantization work. GM view writes in MLA and sparse
+attention avoid loop-carried aliases. These changes are required by the
+composed execution path.
 
 ## What is quantized
 

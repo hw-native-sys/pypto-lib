@@ -6,22 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""The dense clamped-SwiGLU MLP of layers 0, 1 and 2.
-
-``first_k_dense_replace = 3``, so the first three layers have no router and no
-experts: a single MLP at ``intermediate_size = 12288``, six times wider than one
-routed expert. All three of these layers are KDA attention layers.
-
-W8A8 with the same per-channel weight scales and per-token activation scales as the
-experts; the intermediate is TP-sharded, so each rank owns 12288 / 16 = 768
-channels at TP16 and the ``down_proj`` result needs the layer's TP all-reduce.
-
-Like the shared expert (``expert_shared.py``), the kernel consumes fused
-``w_gate_up [2 * LOCAL_DENSE_INTER, D]``. The loader packs gate rows into
-``[0, LOCAL_DENSE_INTER)`` and up rows into ``[LOCAL_DENSE_INTER, 2 * LOCAL_DENSE_INTER)``,
-with a single per-channel scale vector. The output is FP32 — the dense MLP joins
-the same FP32 residual path as the MoE layers.
-"""
+"""Dense clamped-SwiGLU MLP with W8A8 or BF16 weights and TP-local outputs."""
 
 import sys
 from pathlib import Path
@@ -29,9 +14,10 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import D, FLASH, T_DYN, TP_SIZE
+from models.glm5_3_flash.config import FLASH, T_DYN, TP_SIZE, D
 from models.glm5_3_flash.golden import expert
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.glm5_3_flash.linear import bf16_linear
 
 # This directory owns a ``golden.py`` reference module, so the repository-root
 # ``golden`` harness package must come first on the path before any harness import.
@@ -46,13 +32,16 @@ DN_ROW_PAD = 8
 DN_ROWS_PER_BLOCK = 2
 K_TILE = 256             # gate/up K tile over D = 4096 (right-buffer bound)
 MM_INTER_TILE = 128      # gate/up N tile; 2 * LOCAL_DENSE_INTER must be a multiple
-ACT_INTER_TILE = min(384, LOCAL_DENSE_INTER)  # 768 = 2*384; smaller TP keeps it aligned
+ACT_INTER_TILE = min(128, LOCAL_DENSE_INTER)  # 768 = 2*384; smaller TP keeps it aligned
 QUANT_TILE = min(384, LOCAL_DENSE_INTER)
 INTER_K = min(128, LOCAL_DENSE_INTER)  # w2 K tile (= local intermediate)
 D_OUT_TILE = 128         # w2 N tile over D
 D_OUT_TILE_ACT = 512
 W2_ACT_INNER = 8
 SWIGLU_LIMIT = FLASH.swiglu_limit
+BF16_M_TILE = 16
+BF16_N_TILE = 128
+BF16_ACT_M_TILE = 8
 
 assert (2 * LOCAL_DENSE_INTER) % MM_INTER_TILE == 0
 assert LOCAL_DENSE_INTER % ACT_INTER_TILE == 0
@@ -84,25 +73,15 @@ def dense_mlp(
     for mt in pl.parallel((token_rows + DN_M_TILE - 1) // DN_M_TILE):
         ts0 = mt * DN_M_TILE
         valid_rows = pl.min(pl.cast(DN_M_TILE, pl.INDEX), token_rows - ts0)
-
-        # Fused gate/up cube matmul: w_gate_up rows [0, 2*LOCAL) contract the same
-        # INT8 x rows, so one K-loop fills both halves of the INT32 accumulator.
         gate_up_i32 = pl.create_tensor([DN_M_TILE, 2 * LOCAL_DENSE_INTER], dtype=pl.INT32)
-        for nb in pl.spmd((2 * LOCAL_DENSE_INTER) // MM_INTER_TILE, name_hint="dn_gate_up_mm", allow_early_resolve=True):
+        for nb in pl.spmd(2 * LOCAL_DENSE_INTER // MM_INTER_TILE, name_hint='dn_gate_up_mm', allow_early_resolve=True):
             n0 = nb * MM_INTER_TILE
             acc = pl.create_tensor([DN_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
                 xs_k = pl.slice(x_int8, [DN_M_TILE, K_TILE], [ts0, k0], valid_shape=[valid_rows, K_TILE])
-                w_k = w_gate_up[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                acc = pl.matmul_acc(acc, xs_k, w_k, b_trans=True, init_cond=(k0 == 0))
-            gate_up_i32[:, n0 : n0 + MM_INTER_TILE] = acc
-
-        # Activation epilogue: dequant (per-token x scale x per-channel weight
-        # scale), clamped SwiGLU, per-row amax, and INT8 requant for w2.
-        # The activation/quant walk covers DN_ROWS_PER_BLOCK rows per block. A
-        # trailing odd row runs in one extra block whose second row reads past
-        # ``valid_rows`` and is never written back: the w2 epilogue masks every
-        # row at or beyond ``valid_rows``.
+                w_k = w_gate_up[n0:n0 + MM_INTER_TILE, k0:k0 + K_TILE]
+                acc = pl.matmul_acc(acc, xs_k, w_k, b_trans=True, init_cond=k0 == 0)
+            gate_up_i32[:, n0:n0 + MM_INTER_TILE] = acc
         h_fp32 = pl.create_tensor([DN_M_TILE, LOCAL_DENSE_INTER], dtype=pl.FP32)
         h_i8 = pl.create_tensor([DN_M_TILE, LOCAL_DENSE_INTER], dtype=pl.INT8)
         h_scale_dq = pl.create_tensor([DN_M_TILE, DN_ROW_PAD], dtype=pl.FP32, manual_dep=True)
@@ -112,66 +91,57 @@ def dense_mlp(
                 zero_i8 = pl.cast(zero_fp16, target_type=pl.INT8, mode="trunc")
                 h_i8[:, init_k0 : init_k0 + QUANT_TILE] = zero_i8
         n_act_blocks = (valid_rows + DN_ROWS_PER_BLOCK - 1) // DN_ROWS_PER_BLOCK
-        for row_block in pl.spmd(n_act_blocks, name_hint="dn_gate_up_act_q"):
+        for row_block in pl.spmd(n_act_blocks, name_hint='dn_gate_up_act_q'):
             row0 = row_block * DN_ROWS_PER_BLOCK
             blk_rows = pl.min(pl.cast(DN_ROWS_PER_BLOCK, pl.INDEX), valid_rows - row0)
             x_scale_blk = pl.slice(x_scale, [DN_ROW_PAD, 1], [ts0 + row0, 0], valid_shape=[blk_rows, 1])
             row_amax = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
             for part in pl.pipeline(LOCAL_DENSE_INTER // ACT_INTER_TILE, stage=1):
                 n0 = part * ACT_INTER_TILE
-                gate_chunk_i32 = pl.slice(
-                    gate_up_i32, [DN_ROW_PAD, ACT_INTER_TILE], [row0, n0],
-                    valid_shape=[DN_ROWS_PER_BLOCK, ACT_INTER_TILE],
-                )
-                up_chunk_i32 = pl.slice(
-                    gate_up_i32, [DN_ROW_PAD, ACT_INTER_TILE], [row0, LOCAL_DENSE_INTER + n0],
-                    valid_shape=[DN_ROWS_PER_BLOCK, ACT_INTER_TILE],
-                )
-                gate_w_scale = pl.reshape(
-                    w_gate_up_scale[n0 : n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE]
-                )
-                up_w_scale = pl.reshape(
-                    w_gate_up_scale[LOCAL_DENSE_INTER + n0 : LOCAL_DENSE_INTER + n0 + ACT_INTER_TILE],
-                    [1, ACT_INTER_TILE],
-                )
-                gate_fp32 = pl.cast(gate_chunk_i32, target_type=pl.FP32, mode="none")
-                up_fp32 = pl.cast(up_chunk_i32, target_type=pl.FP32, mode="none")
+                gate_chunk_i32 = pl.slice(gate_up_i32, [DN_ROW_PAD, ACT_INTER_TILE], [row0, n0], valid_shape=[DN_ROWS_PER_BLOCK, ACT_INTER_TILE])
+                up_chunk_i32 = pl.slice(gate_up_i32, [DN_ROW_PAD, ACT_INTER_TILE], [row0, LOCAL_DENSE_INTER + n0], valid_shape=[DN_ROWS_PER_BLOCK, ACT_INTER_TILE])
+                gate_w_scale = pl.reshape(w_gate_up_scale[n0:n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                up_w_scale = pl.reshape(w_gate_up_scale[LOCAL_DENSE_INTER + n0:LOCAL_DENSE_INTER + n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                gate_fp32 = pl.cast(gate_chunk_i32, target_type=pl.FP32, mode='none')
+                up_fp32 = pl.cast(up_chunk_i32, target_type=pl.FP32, mode='none')
                 gate_fp32 = pl.col_expand_mul(pl.row_expand_mul(gate_fp32, x_scale_blk), gate_w_scale)
                 up_fp32 = pl.col_expand_mul(pl.row_expand_mul(up_fp32, x_scale_blk), up_w_scale)
                 if SWIGLU_LIMIT > 0.0:
                     gate_fp32 = pl.minimum(gate_fp32, SWIGLU_LIMIT)
                     up_fp32 = pl.maximum(pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_fp32)), 1.0))
+                gate_buffer = pl.create_tensor([DN_ROW_PAD, ACT_INTER_TILE], dtype=pl.FP32)
+                gate_buffer[:, :] = pl.set_validshape(gate_fp32, DN_ROW_PAD, ACT_INTER_TILE)
+                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_buffer)), 1.0))
                 gated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
-                # A 1-row trailing block reads one scale row; re-widen its dummy
-                # second row so the store keeps its static slice. That row is
-                # masked at the w2 output.
                 gated = pl.set_validshape(gated, DN_ROWS_PER_BLOCK, ACT_INTER_TILE)
                 chunk_amax = pl.reshape(pl.row_max(pl.abs(gated)), [1, DN_ROW_PAD])
                 row_amax = pl.maximum(row_amax, chunk_amax)
-                h_fp32[row0 : row0 + DN_ROWS_PER_BLOCK, n0 : n0 + ACT_INTER_TILE] = gated[0:DN_ROWS_PER_BLOCK, :]
-
-            row_scale_q = pl.div(pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
+                h_fp32[row0:row0 + DN_ROWS_PER_BLOCK, n0:n0 + ACT_INTER_TILE] = gated[0:DN_ROWS_PER_BLOCK, :]
+            amax_buffer = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
+            numerator = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
+            amax_buffer[:, :] = row_amax
+            numerator[:, :] = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
+            row_scale_q_buffer = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
+            row_scale_q_buffer[:, :] = pl.div(numerator, amax_buffer)
+            row_scale_q = row_scale_q_buffer
             row_scale_q_col = pl.reshape(row_scale_q, [DN_ROW_PAD, 1])
-            row_scale_dq_col = pl.reshape(pl.recip(row_scale_q), [DN_ROW_PAD, 1])
-            row_scale_dq = pl.row_expand(pl.full([DN_ROW_PAD, DN_ROW_PAD], dtype=pl.FP32, value=0.0), row_scale_dq_col)
-            h_scale_dq[row0 : row0 + DN_ROWS_PER_BLOCK, :] = row_scale_dq[0:DN_ROWS_PER_BLOCK, :]
+            one_buffer = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
+            one_buffer[:, :] = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=1.0)
+            dequant = pl.div(one_buffer, row_scale_q_buffer)
+            row_scale_dq_col = pl.reshape(dequant, [DN_ROW_PAD, 1])
+            row_scale_dq_v1 = pl.full([DN_ROW_PAD, DN_ROW_PAD], dtype=pl.FP32, value=0.0)
+            row_scale_dq = pl.row_expand(row_scale_dq_v1, row_scale_dq_col)
+            h_scale_dq[row0:row0 + DN_ROWS_PER_BLOCK, :] = row_scale_dq[0:DN_ROWS_PER_BLOCK, :]
             for q_idx in pl.pipeline(0, LOCAL_DENSE_INTER // QUANT_TILE, stage=1):
                 k0 = q_idx * QUANT_TILE
-                h_fp32_slice = pl.slice(
-                    h_fp32, [DN_ROW_PAD, QUANT_TILE], [row0, k0],
-                    valid_shape=[DN_ROWS_PER_BLOCK, QUANT_TILE],
-                )
+                h_fp32_slice = pl.slice(h_fp32, [DN_ROW_PAD, QUANT_TILE], [row0, k0], valid_shape=[DN_ROWS_PER_BLOCK, QUANT_TILE])
                 h_scaled = pl.row_expand_mul(h_fp32_slice, row_scale_q_col)
-                h_i32 = pl.cast(h_scaled, target_type=pl.INT32, mode="rint")
-                h_fp16 = pl.cast(h_i32, target_type=pl.FP16, mode="round")
-                h_i8[row0 : row0 + DN_ROWS_PER_BLOCK, k0 : k0 + QUANT_TILE] = pl.cast(
-                    h_fp16, target_type=pl.INT8, mode="trunc"
-                )[0:DN_ROWS_PER_BLOCK, :]
-
-        # w2 (down) cube matmul: [rows, LOCAL] INT8 x [D, LOCAL] INT8 -> INT32.
+                h_i32 = pl.cast(h_scaled, target_type=pl.INT32, mode='rint')
+                h_fp16 = pl.cast(h_i32, target_type=pl.FP16, mode='round')
+                part_v2 = pl.cast(h_fp16, target_type=pl.INT8, mode='trunc')
+                h_i8[row0:row0 + DN_ROWS_PER_BLOCK, k0:k0 + QUANT_TILE] = part_v2[0:DN_ROWS_PER_BLOCK, :]
         y_i32 = pl.create_tensor([DN_M_TILE, D], dtype=pl.INT32)
-        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="dn_w2_mm"):
+        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint='dn_w2_mm'):
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([DN_M_TILE, D_OUT_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, LOCAL_DENSE_INTER, INTER_K, stage=2):
@@ -194,13 +164,80 @@ def dense_mlp(
             h_scale = pl.row_max(h_scale_dq[:, :])
             for dg in pl.pipeline(W2_ACT_INNER, stage=2):
                 d0 = d_base + dg * D_OUT_TILE_ACT
-                y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
-                w2_scale_chunk = pl.reshape(w_down_scale[d0 : d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
-                y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
+                y_2d_i32 = y_i32[:, d0:d0 + D_OUT_TILE_ACT]
+                w2_scale_chunk = pl.reshape(w_down_scale[d0:d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
+                y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode='none')
                 y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk)
                 y_valid = pl.set_validshape(y_2d, valid_rows, D_OUT_TILE_ACT)
                 output = pl.assemble(output, y_valid, [ts0, d0])
+    return output
 
+
+@pl.jit.inline
+def dense_mlp_bf16(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    w_gate_up: pl.Tensor[[2 * LOCAL_DENSE_INTER, D], pl.BF16],
+    w_down: pl.Tensor[[D, LOCAL_DENSE_INTER], pl.BF16],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Run BF16 gate/up, clamped SwiGLU and a BF16 local down projection."""
+    tokens = pl.tensor.dim(x, 0)
+    row_tiles = (tokens + BF16_M_TILE - 1) // BF16_M_TILE
+    gate_up = pl.create_tensor([tokens, 2 * LOCAL_DENSE_INTER], dtype=pl.BF16)
+    for task in pl.spmd(row_tiles * (2 * LOCAL_DENSE_INTER // BF16_N_TILE),
+                        name_hint="dense_bf16_gate_up"):
+        t0 = task // (2 * LOCAL_DENSE_INTER // BF16_N_TILE) * BF16_M_TILE
+        n0 = task % (2 * LOCAL_DENSE_INTER // BF16_N_TILE) * BF16_N_TILE
+        rows = pl.min(BF16_M_TILE, tokens - t0)
+        columns = pl.cast(BF16_N_TILE, pl.INDEX)
+        projected = bf16_linear(x, w_gate_up, t0, n0, rows, columns, BF16_M_TILE, BF16_N_TILE, D)
+        projected_bf16 = pl.cast(projected, pl.BF16, mode="rint")
+        gate_up[t0:t0 + BF16_M_TILE, n0:n0 + BF16_N_TILE] = pl.set_validshape(projected_bf16, rows, BF16_N_TILE)
+
+    activated = pl.create_tensor([tokens, LOCAL_DENSE_INTER], dtype=pl.BF16)
+    activation_tiles = (tokens + BF16_ACT_M_TILE - 1) // BF16_ACT_M_TILE
+    for task in pl.spmd(activation_tiles * (LOCAL_DENSE_INTER // BF16_N_TILE),
+                        name_hint="dense_bf16_swiglu"):
+        t0 = task // (LOCAL_DENSE_INTER // BF16_N_TILE) * BF16_ACT_M_TILE
+        n0 = task % (LOCAL_DENSE_INTER // BF16_N_TILE) * BF16_N_TILE
+        u0 = LOCAL_DENSE_INTER + n0
+        rows = pl.min(BF16_ACT_M_TILE, tokens - t0)
+        gate_tile = pl.slice(gate_up, [BF16_ACT_M_TILE, BF16_N_TILE], [t0, n0], valid_shape=[rows, BF16_N_TILE])
+        up_tile = pl.slice(gate_up, [BF16_ACT_M_TILE, BF16_N_TILE], [t0, u0], valid_shape=[rows, BF16_N_TILE])
+        gate = pl.cast(gate_tile, pl.FP32)
+        up = pl.cast(up_tile, pl.FP32)
+        if SWIGLU_LIMIT > 0.0:
+            gate = pl.minimum(gate, SWIGLU_LIMIT)
+            up = pl.maximum(pl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+        denominator = pl.add(pl.exp(pl.neg(gate)), 1.0)
+        sigmoid = pl.recip(denominator)
+        silu = pl.mul(gate, sigmoid)
+        product = pl.mul(silu, up)
+        product_bf16 = pl.cast(product, pl.BF16, mode="rint")
+        activated[t0:t0 + BF16_ACT_M_TILE, n0:n0 + BF16_N_TILE] = pl.set_validshape(product_bf16, rows, BF16_N_TILE)
+
+    for task in pl.spmd(row_tiles * (D // BF16_N_TILE), name_hint="dense_bf16_down"):
+        t0 = task // (D // BF16_N_TILE) * BF16_M_TILE
+        d0 = task % (D // BF16_N_TILE) * BF16_N_TILE
+        rows = pl.min(BF16_M_TILE, tokens - t0)
+        columns = pl.cast(BF16_N_TILE, pl.INDEX)
+        projected = bf16_linear(activated, w_down, t0, d0, rows, columns,
+                                       BF16_M_TILE, BF16_N_TILE, LOCAL_DENSE_INTER)
+        projected_bf16 = pl.cast(projected, pl.BF16, mode="rint")
+        output[t0:t0 + BF16_M_TILE, d0:d0 + BF16_N_TILE] = pl.set_validshape(projected_bf16, rows, BF16_N_TILE)
+    return output
+
+
+@pl.jit
+def dense_mlp_bf16_test(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    w_gate_up: pl.Tensor[[2 * LOCAL_DENSE_INTER, D], pl.BF16],
+    w_down: pl.Tensor[[D, LOCAL_DENSE_INTER], pl.BF16],
+    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+):
+    x.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, T_DYN)
+    dense_mlp_bf16(x, w_gate_up, w_down, output)
     return output
 
 
@@ -246,7 +283,7 @@ def golden_dense_mlp_fn(tensors):
     if SWIGLU_LIMIT > 0:
         gate_v = gate_v.clamp(max=SWIGLU_LIMIT)
         up_v = up_v.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-    sigmoid = torch.reciprocal(torch.exp(-gate_v) + 1.0)
+    sigmoid = torch.reciprocal(1.0 + torch.exp(-gate_v.float()))
     h = (gate_v * sigmoid) * up_v
     h_i8, h_sd = quantize_per_token_int8(h)
     out_i = h_i8.to(torch.int32) @ w_down_i8.T
@@ -255,10 +292,11 @@ def golden_dense_mlp_fn(tensors):
     tensors["output"][:] = out.to(torch.float32)
 
 
-def gen_dense_weight(shape, dequant_std, chan_cv):
+def gen_dense_weight(shape, dequant_std, chan_cv, *, generator=None):
     """Synthesize an INT8 weight + per-channel FP32 scale with a realistic
     per-channel magnitude spread (see the DeepSeek-V4 sibling for the grid)."""
-    W = torch.randn(*shape) * torch.exp(chan_cv * torch.randn(*shape[:-1], 1))
+    channel_gain = torch.exp(chan_cv * torch.randn(*shape[:-1], 1, generator=generator))
+    W = torch.randn(*shape, generator=generator) * channel_gain
     amax = W.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
     scale = amax / INT8_SCALE_MAX
     w_i8 = torch.round(W / scale).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
@@ -269,10 +307,71 @@ def gen_dense_weight(shape, dequant_std, chan_cv):
 T_DYN_TEST = 64
 
 
+def golden_dense_mlp_bf16(x: torch.Tensor, w_gate_up: torch.Tensor, w_down: torch.Tensor) -> torch.Tensor:
+    """Apply the BF16 linear and activation boundaries of the dense FFN."""
+    projected = torch.nn.functional.linear(x.float(), w_gate_up.float()).bfloat16()
+    gate, up = projected.float().chunk(2, dim=-1)
+    if SWIGLU_LIMIT > 0:
+        gate = gate.clamp(max=SWIGLU_LIMIT)
+        up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+    activated = (torch.nn.functional.silu(gate) * up).bfloat16()
+    return torch.nn.functional.linear(activated.float(), w_down.float()).bfloat16()
+
+
+def golden_dense_mlp_bf16_fn(tensors):
+    tensors["output"].copy_(golden_dense_mlp_bf16(tensors["x"], tensors["w_gate_up"], tensors["w_down"]))
+
+
+def build_bf16_tensor_specs(num_tokens=17, *, weights=None, tp_rank=0):
+    """Build deterministic BF16 inputs and optionally use resolved TP weight slices."""
+    from golden import TensorSpec
+
+    if num_tokens < 1:
+        raise ValueError("num_tokens must be positive")
+    generator = torch.Generator().manual_seed(533)
+
+    def init_x():
+        value = (2 * torch.randn(num_tokens, D, generator=generator)).bfloat16()
+        if num_tokens > 1:
+            value[0] = 0
+            value[1] *= 4
+        return value
+
+    def init_gate_up():
+        return (torch.randn(2 * LOCAL_DENSE_INTER, D, generator=generator) / D**0.5).bfloat16()
+
+    def init_down():
+        return (torch.randn(D, LOCAL_DENSE_INTER, generator=generator) / LOCAL_DENSE_INTER**0.5).bfloat16()
+
+    gate_up_init, down_init = init_gate_up, init_down
+    if weights is not None:
+        if not 0 <= tp_rank < TP_SIZE:
+            raise ValueError(f"tp_rank must be in [0, {TP_SIZE})")
+        resolved = torch.load(weights, map_location="cpu", weights_only=True, mmap=True)
+        gate_up_init, down_init = resolved["w_gate_up"][tp_rank], resolved["w_down"][tp_rank]
+        if gate_up_init.dtype != torch.bfloat16 or down_init.dtype != torch.bfloat16:
+            raise ValueError("resolved FFN weights must be BF16")
+        if tuple(gate_up_init.shape) != (2 * LOCAL_DENSE_INTER, D):
+            raise ValueError("resolved gate/up shape does not match the selected TP size")
+        if tuple(down_init.shape) != (D, LOCAL_DENSE_INTER):
+            raise ValueError("resolved down shape does not match the selected TP size")
+
+    return [
+        TensorSpec("x", [num_tokens, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("w_gate_up", [2 * LOCAL_DENSE_INTER, D], torch.bfloat16, init_value=gate_up_init),
+        TensorSpec("w_down", [D, LOCAL_DENSE_INTER], torch.bfloat16, init_value=down_init),
+        TensorSpec("output", [num_tokens, D], torch.bfloat16),
+    ]
+
+
 def build_tensor_specs(num_tokens=T_DYN_TEST):
     from golden import TensorSpec
 
-    x_bf16 = torch.randn(num_tokens, D, dtype=torch.bfloat16)
+    generator = torch.Generator().manual_seed(533)
+    x_bf16 = torch.randn(num_tokens, D, generator=generator).bfloat16()
+    if num_tokens > 1:
+        x_bf16[0] = 0
+        x_bf16[-1] *= 8
 
     def init_x_int8():
         from models.glm5_3_flash.quantization import quantize_per_token_int8
@@ -286,10 +385,10 @@ def build_tensor_specs(num_tokens=T_DYN_TEST):
 
     DENSE_DEQUANT_STD = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
     dw_gu_i8, dw_gu_s = gen_dense_weight(
-        (2 * LOCAL_DENSE_INTER, D), DENSE_DEQUANT_STD["w1"], chan_cv=0.50
+        (2 * LOCAL_DENSE_INTER, D), DENSE_DEQUANT_STD["w1"], chan_cv=0.50, generator=generator
     )
     dw2_i8, dw2_s = gen_dense_weight(
-        (D, LOCAL_DENSE_INTER), DENSE_DEQUANT_STD["w2"], chan_cv=0.33
+        (D, LOCAL_DENSE_INTER), DENSE_DEQUANT_STD["w2"], chan_cv=0.33, generator=generator
     )
 
     return [
@@ -306,43 +405,76 @@ def build_tensor_specs(num_tokens=T_DYN_TEST):
 if __name__ == "__main__":
     import argparse
 
-    from golden import ratio_reldiff, run
+    from golden import ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--num-tokens", type=int, default=T_DYN_TEST)
+    parser.add_argument("--num-tokens", type=int)
+    parser.add_argument("--dtype", choices=["int8", "bf16"], default="int8")
+    parser.add_argument("--case", choices=["all", "single", "ragged", "aligned"], default="all")
+    parser.add_argument("--weights", type=Path, help="resolved BF16 TP weights with w_gate_up and w_down entries")
+    parser.add_argument("--tp-rank", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        fn=dense_mlp_test,
-        specs=build_tensor_specs(args.num_tokens),
-        golden_fn=golden_dense_mlp_fn,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            # Deterministic INT8 golden: 3e-3 per point, 1% of points.
-            "output": ratio_reldiff(diff_thd=3e-3, pct_thd=0.01),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    if args.weights is not None and args.dtype != "bf16":
+        parser.error("--weights requires --dtype bf16")
+    if args.num_tokens is not None and args.num_tokens < 1:
+        parser.error("--num-tokens must be positive")
+    if args.dtype == "bf16":
+        cases = {"single": 1, "ragged": 17, "aligned": 16}
+        selected = (args.case,) if args.case != "all" else ("single", "ragged")
+        counts = [args.num_tokens] if args.num_tokens is not None else [cases[name] for name in selected]
+        for count in counts:
+            result = run(
+                fn=dense_mlp_bf16_test,
+                specs=build_bf16_tensor_specs(count, weights=args.weights, tp_rank=args.tp_rank),
+                golden_fn=golden_dense_mlp_bf16_fn,
+                config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device, dump_passes=args.dump_passes),
+                compile_only=args.compile_only,
+                compare_fn={"output": ratio_allclose(atol=0.02, rtol=0.02, max_error_ratio=0)},
+            )
+            print(result)
+            if not result.passed:
+                raise SystemExit(result.error or 1)
+        raise SystemExit(0)
+
+    cases = {"single": 1, "ragged": 17, "aligned": 16}
+    selected = (args.case,) if args.case != "all" else tuple(cases)
+    counts = [args.num_tokens] if args.num_tokens is not None else [cases[name] for name in selected]
+    for count in counts:
+        result = run(
+            fn=dense_mlp_test,
+            specs=build_tensor_specs(count),
+            golden_fn=golden_dense_mlp_fn,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type, execution_mode=args.execution_mode,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            compile_only=args.compile_only,
+            compare_fn={
+                # Deterministic INT8 golden: 3e-3 per point, 1% of points.
+                "output": ratio_reldiff(diff_thd=3e-3, pct_thd=0.01),
+            },
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
 
 
 __all__ = [
     "LOCAL_DENSE_INTER",
     "dense_mlp",
+    "dense_mlp_bf16",
     "golden_dense_mlp",
+    "golden_dense_mlp_bf16",
 ]

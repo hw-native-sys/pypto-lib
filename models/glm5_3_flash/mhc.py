@@ -14,7 +14,7 @@ MLP (``hc_ffn_*``) — for 90 sites over 45 layers. The MTP layer has no ``hc_*`
 weights and uses a plain residual instead.
 
 ``Glm5NextTextHyperConnection`` subclasses ``DeepseekV4HyperConnection`` with no
-changes, so the coefficient algebra is the same as ``models/deepseek_v4_1_flash/mhc.py``.
+changes, so the coefficient algebra is the same as ``models/deepseek_v4_1_flash/hc.py``.
 Two things differ and both change the ABI:
 
 * **The stream is BF16, not FP32.** It is seeded by replicating the BF16 embedding
@@ -44,7 +44,7 @@ reference rather than code.
 lines), ``hc_post.py`` (237) and ``hc_head.py`` (288) are implemented, belong to an
 a2a3 directory in the CI platform configuration — and are the ones to port.
 ``models/deepseek_v4_flash_dspark/`` has a second implemented set (573 / 239 / 386)
-for the larger batch. ``models/deepseek_v4_1_flash/mhc.py`` (559 lines, landed as
+for the larger batch. ``models/deepseek_v4_1_flash/hc.py`` (559 lines, landed as
 #1247) consolidates the four into one file and is the cleanest read, **but it is
 a5-only** (its directory targets A5 in the CI platform configuration), so take its structure, not its tiling.
 
@@ -166,7 +166,9 @@ def mhc_mixes(
                 [0, k0],
                 valid_shape=[MIX_HC, LINEAR_K_TILE],
             )
-            acc = pl.matmul_acc(acc, linear_x_tile, w_tile, b_trans=True, init_cond=(kb == 0))
+            linear_x_fp32 = pl.cast(linear_x_tile, pl.FP32)
+            linear_w_fp32 = pl.cast(w_tile, pl.FP32)
+            acc = pl.matmul_acc(acc, linear_x_fp32, linear_w_fp32, b_trans=True, init_cond=(kb == 0))
         partial = split * t_linear + t0
         mixes_partials[partial : partial + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
@@ -235,11 +237,12 @@ def mhc_pre(
     The stream is BF16 here where DeepSeek-V4 keeps it FP32, so every stream tile is
     widened before the multiply and only the result is rounded back.
 
-    Returns the collapsed rows so the caller can chain them.
+    Returns the collapsed rows and their task ID for downstream ordering.
     """
     t_dim = pl.tensor.dim(x_hc, 0)
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
-    for t in pl.spmd(t_dim, name_hint="mhc_pre"):
+    with pl.spmd(t_dim, name_hint="mhc_pre") as pre_tid:
+        t = pl.tile.get_block_idx()
         for d0 in pl.pipeline(0, D, MIX_D_TILE, stage=2):
             value = pl.mul(
                 pl.cast(x_flat[t : t + 1, d0 : d0 + MIX_D_TILE], target_type=pl.FP32),
@@ -253,7 +256,7 @@ def mhc_pre(
                     pl.mul(pl.cast(tile, target_type=pl.FP32), pl.read(pre_mix, [t, head])),
                 )
             output[t : t + 1, d0 : d0 + MIX_D_TILE] = pl.cast(value, target_type=pl.BF16, mode="rint")
-    return output
+    return output, pre_tid
 
 
 @pl.jit.inline

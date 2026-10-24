@@ -43,16 +43,17 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import D, FLASH, KDA_DIM, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, T_DYN
+from models.glm5_3_flash.config import FLASH, KDA_DIM, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, T_DYN, D
 from models.glm5_3_flash.golden import rms_norm_gated
+from models.glm5_3_flash.linear import bf16_linear
 
 EPS = FLASH.rms_norm_eps
 KDA_DIM_INV = 1.0 / KDA_DIM
 
 # tiling
 T_TILE = 16  # tokens per task; the norm pass handles T_TILE * LOCAL_KDA_H rows
-D_TILE = 128  # output columns per projection task: a [128, 512] BF16 weight tile is
-# 128 KiB, and the pipeline double-buffers it inside L1's usable 448 KiB
+NORM_ROWS_TILE = 8
+D_TILE = 128  # output columns per projection task
 
 
 def golden_kda_output(
@@ -63,9 +64,9 @@ def golden_kda_output(
 ) -> torch.Tensor:
     normalized = rms_norm_gated(core_attn_out, norm_weight, out_gate)
     flattened = normalized.reshape(*normalized.shape[:-2], -1)
-    # The kernel emits an FP32 partial for attention_tp to reduce, so the golden
-    # accumulates in FP32 rather than returning the BF16 input dtype.
-    return torch.nn.functional.linear(flattened.float(), w_o.float())
+    # Match the BF16 local linear output before TP reduction. FP32 is only
+    # the exchange dtype; it carries the widened BF16 result.
+    return (flattened.float() @ w_o.float().t()).to(torch.bfloat16).float()
 
 
 @pl.jit.inline
@@ -78,65 +79,47 @@ def kda_output(
 ):
     t_dim = pl.tensor.dim(core_attn_out, 0)
     tiles = (t_dim + T_TILE - 1) // T_TILE
-    t_pad = tiles * T_TILE
-
-    # One row per head, so the RMS reduction is a row sum over KDA_DIM.
     core_rows = pl.reshape(core_attn_out, [t_dim * LOCAL_KDA_H, KDA_DIM])
     gate_rows = pl.reshape(out_gate, [t_dim * LOCAL_KDA_H, KDA_DIM])
     weight_row = pl.reshape(norm_weight, [1, KDA_DIM])
-
-    # Parked in GM at the padded token count so the projection can re-read it as
-    # [T, LOCAL_KDA_QKV_DIM] without reshaping a tile on chip.
-    gated_rows = pl.create_tensor([t_pad * LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
-
-    ROW_TILE = T_TILE * LOCAL_KDA_H
-    with pl.spmd(tiles, name_hint="kda_output_norm"):
+    gated = pl.create_tensor([t_dim, LOCAL_KDA_QKV_DIM], dtype=pl.BF16)
+    gated_rows = pl.reshape(gated, [t_dim * LOCAL_KDA_H, KDA_DIM])
+    with pl.spmd((t_dim * LOCAL_KDA_H + NORM_ROWS_TILE - 1) // NORM_ROWS_TILE, name_hint='kda_output_norm'):
         task = pl.tile.get_block_idx()
-        r0 = task * ROW_TILE
-        rows = pl.min(ROW_TILE, t_dim * LOCAL_KDA_H - r0)
-        value = pl.cast(
-            pl.slice(core_rows, [ROW_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM]),
-            pl.FP32,
-        )
-        # Strict FP32: the gamma is not downcast, and eps is rms_norm_eps.
-        inv_rms = pl.rsqrt(
-            pl.add(pl.mul(pl.row_sum(pl.mul(value, value)), KDA_DIM_INV), EPS),
-            high_precision=True,
-        )
-        normed = pl.col_expand_mul(
-            pl.row_expand_mul(value, inv_rms), pl.cast(weight_row[0:1, 0:KDA_DIM], pl.FP32)
-        )
-        gate = pl.cast(
-            pl.slice(gate_rows, [ROW_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM]),
-            pl.FP32,
-        )
-        # sigmoid, spelled out: the traced body takes only pl.* calls.
-        activated = pl.mul(normed, pl.recip(pl.add(pl.exp(pl.neg(gate)), 1.0)))
-        gated_rows[r0 : r0 + ROW_TILE, 0:KDA_DIM] = pl.cast(activated, pl.BF16, mode="rint")
-
-    # The padded tail rows need no separate zero pass. The norm loop runs one task per
-    # token tile over the padded count, and each task stores a full ROW_TILE, so the
-    # whole allocation is written; the rows past t_dim load through valid_shape, which
-    # zero-fills them. A second store would begin at t_dim * LOCAL_KDA_H and run a
-    # ROW_TILE past the end of the allocation.
-
-    gated = pl.reshape(gated_rows, [t_pad, LOCAL_KDA_QKV_DIM])
-
-    with pl.spmd(tiles * (D // D_TILE), name_hint="kda_output_proj"):
+        r0 = task * NORM_ROWS_TILE
+        rows = pl.max(0, pl.min(NORM_ROWS_TILE, t_dim * LOCAL_KDA_H - r0))
+        value_v1 = pl.slice(core_rows, [NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
+        value = pl.cast(value_v1, pl.FP32)
+        square_buffer = pl.create_tensor([NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+        square_buffer[:, :] = pl.mul(value, value)
+        square_sum = pl.row_sum(square_buffer)
+        norm_argument = pl.create_tensor([1, NORM_ROWS_TILE], dtype=pl.FP32)
+        part_v3 = pl.mul(square_sum, KDA_DIM_INV)
+        part_v4 = pl.add(part_v3, EPS)
+        norm_argument[:, :] = pl.reshape(part_v4, [1, NORM_ROWS_TILE])
+        inverse = pl.rsqrt(norm_argument, high_precision=True)
+        inv_rms = pl.reshape(inverse, [NORM_ROWS_TILE, 1])
+        normed_v5 = pl.row_expand_mul(value, inv_rms)
+        normed_v6 = pl.cast(weight_row[0:1, 0:KDA_DIM], pl.FP32)
+        normed = pl.col_expand_mul(normed_v5, normed_v6)
+        gate_v7 = pl.slice(gate_rows, [NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
+        gate = pl.cast(gate_v7, pl.FP32)
+        gate_buffer = pl.create_tensor([NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+        gate_buffer[:, :] = gate
+        gate_sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_buffer)), 1.0))
+        activated = pl.mul(normed, gate_sigmoid)
+        activated_bf16 = pl.cast(activated, pl.BF16, mode='rint')
+        gated_rows[r0:r0 + NORM_ROWS_TILE, 0:KDA_DIM] = pl.set_validshape(activated_bf16, rows, KDA_DIM)
+    with pl.spmd(tiles * (D // D_TILE), name_hint='kda_output_proj'):
         task = pl.tile.get_block_idx()
-        t0 = (task // (D // D_TILE)) * T_TILE
-        d0 = (task % (D // D_TILE)) * D_TILE
+        t0 = task // (D // D_TILE) * T_TILE
+        d0 = task % (D // D_TILE) * D_TILE
         rows = pl.min(T_TILE, t_dim - t0)
-        # K is only LOCAL_KDA_QKV_DIM wide, so the whole contraction is one matmul and
-        # no accumulator has to be seeded compact.
-        partial = pl.matmul(
-            gated[t0 : t0 + T_TILE, 0:LOCAL_KDA_QKV_DIM],
-            w_o[d0 : d0 + D_TILE, 0:LOCAL_KDA_QKV_DIM],
-            pl.FP32,
-            b_trans=True,
-        )
-        output[t0 : t0 + T_TILE, d0 : d0 + D_TILE] = pl.set_validshape(partial, rows, D_TILE)
-
+        partial_v8 = pl.cast(D_TILE, pl.INDEX)
+        partial = bf16_linear(gated, w_o, t0, d0, rows, partial_v8, T_TILE, D_TILE, LOCAL_KDA_QKV_DIM)
+        local_bf16 = pl.cast(partial, pl.BF16, mode="rint")
+        exchange_value = pl.cast(local_bf16, pl.FP32)
+        output[t0:t0 + T_TILE, d0:d0 + D_TILE] = pl.set_validshape(exchange_value, rows, D_TILE)
     return output
 
 
@@ -157,6 +140,16 @@ def golden_kda_output_tensors(tensors) -> None:
     tensors["output"][:] = golden_kda_output(
         tensors["core_attn_out"], tensors["norm_weight"], tensors["out_gate"], tensors["w_o"]
     )
+
+
+
+def compare_kda_output(actual, expected, **kwargs):
+    """Require a BF16 local result carried through the FP32 exchange buffer."""
+    from golden import ratio_allclose
+
+    if not torch.equal(actual, actual.to(torch.bfloat16).float()):
+        return False, "local projection was not rounded to BF16 before TP exchange"
+    return ratio_allclose(max_error_ratio=0)(actual, expected, **kwargs)
 
 
 def build_tensor_specs(tokens: int = 67):
@@ -201,6 +194,7 @@ if __name__ == "__main__":
         fn=kda_output_test,
         specs=build_tensor_specs(tokens),
         golden_fn=golden_kda_output_tensors,
+        compare_fn={"output": compare_kda_output},
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=2e-2,
         atol=2e-2,

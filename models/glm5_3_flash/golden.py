@@ -22,11 +22,25 @@ import torch.nn.functional as F
 from models.glm5_3_flash.config import FLASH
 
 
+def _sum_fp32_reference(
+    value: torch.Tensor, dim: int = -1, keepdim: bool = True, tile_size: int | None = None,
+) -> torch.Tensor:
+    """Match inter-tile FP32 accumulation; CPU and device may reduce within a tile differently."""
+    if tile_size is None:
+        return value.float().sum(dim=dim, keepdim=keepdim)
+    total = None
+    for tile in value.split(tile_size, dim=dim):
+        partial = tile.float().sum(dim=dim, keepdim=True)
+        total = partial if total is None else total + partial
+    return total if keepdim else total.squeeze(dim)
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = FLASH.rms_norm_eps) -> torch.Tensor:
     """Apply RMSNorm in FP32 and restore the activation dtype."""
     dtype = x.dtype
     value = x.float()
-    value = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + eps)
+    square_sum = _sum_fp32_reference(value.square(), tile_size=128)
+    value = value * torch.rsqrt(square_sum / value.shape[-1] + eps)
     return (value * weight.float()).to(dtype)
 
 
@@ -43,9 +57,10 @@ def rms_norm_gated(
     """
     dtype = x.dtype
     value = x.float()
-    value = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + eps)
+    value = value * torch.rsqrt(_sum_fp32_reference(value.square()) / value.shape[-1] + eps)
     value = weight.float() * value
-    return (value * torch.sigmoid(gate.float())).to(dtype)
+    sigmoid = torch.reciprocal(1.0 + torch.exp(-gate.float()))
+    return (value * sigmoid).to(dtype)
 
 
 def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -54,7 +69,9 @@ def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     Note the ``+ eps`` inside the square root rather than ``max(norm, eps)``; the
     reference is explicit that this differs from ``F.normalize``.
     """
-    return x / torch.sqrt(x.square().sum(dim=-1, keepdim=True) + eps)
+    value = x.float()
+    norm = torch.sqrt(_sum_fp32_reference(value.square()) + eps)
+    return (value / norm).to(x.dtype)
 
 
 def swiglu(gate_value: torch.Tensor, up_value: torch.Tensor) -> torch.Tensor:
@@ -123,28 +140,25 @@ def hc_mixes(
     base: torch.Tensor,
     iterations: int = FLASH.hc_sinkhorn_iters,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Project one HC stream into pre, post, and doubly-stochastic residual mixes.
-
-    ``Glm5NextTextHyperConnection`` subclasses ``DeepseekV4HyperConnection`` with no
-    changes, so this is the DeepSeek-V4 reference verbatim. The checkpoint supplies
-    ``function`` as ``hc_{attn,ffn}_fn``, ``scale`` as ``hc_{attn,ffn}_scale`` and
-    ``base`` as ``hc_{attn,ffn}_base``, once per site and twice per layer.
-    """
+    """Compute mHC mixes with FP32 projections, unaries and reductions."""
     flat = x.flatten(-2).float()
-    inverse_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + FLASH.rms_norm_eps)
-    mixes = F.linear(flat, function.float()) * inverse_rms
+    square_sum = _sum_fp32_reference(flat.square(), tile_size=512)
+    inv = torch.rsqrt(square_sum / flat.shape[-1] + FLASH.rms_norm_eps)
+    mixes = (flat @ function.float().t()) * inv
     hc = FLASH.hc_mult
-    pre_raw, post_raw, residual_raw = mixes.split((hc, hc, hc * hc), dim=-1)
-    pre = torch.sigmoid(pre_raw * scale[0] + base[:hc]) + FLASH.hc_eps
-    post = 2 * torch.sigmoid(post_raw * scale[1] + base[hc : 2 * hc])
-    residual_base = base[2 * hc :].unflatten(-1, (hc, hc))
-    residual = (residual_raw.unflatten(-1, (hc, hc)) * scale[2] + residual_base).softmax(dim=-1)
-    residual = residual + FLASH.hc_eps
-    residual = residual / (residual.sum(dim=-2, keepdim=True) + FLASH.hc_eps)
+    (p, q, r) = mixes.split((hc, hc, hc * hc), -1)
+    pre_logits = p * scale[0] + base[:hc]
+    post_logits = q * scale[1] + base[hc:2 * hc]
+    pre = torch.reciprocal(1.0 + torch.exp(-pre_logits)) + FLASH.hc_eps
+    post = 2 * torch.reciprocal(1.0 + torch.exp(-post_logits))
+    logits = r.unflatten(-1, (hc, hc)) * scale[2] + base[2 * hc:].unflatten(-1, (hc, hc))
+    exps = torch.exp(logits - logits.amax(-1, keepdim=True))
+    residual = exps / _sum_fp32_reference(exps) + FLASH.hc_eps
+    residual = residual / (_sum_fp32_reference(residual, -2) + FLASH.hc_eps)
     for _ in range(iterations - 1):
-        residual = residual / (residual.sum(dim=-1, keepdim=True) + FLASH.hc_eps)
-        residual = residual / (residual.sum(dim=-2, keepdim=True) + FLASH.hc_eps)
-    return pre, post, residual
+        residual = residual / (_sum_fp32_reference(residual) + FLASH.hc_eps)
+        residual = residual / (_sum_fp32_reference(residual, -2) + FLASH.hc_eps)
+    return (pre, post, residual)
 
 
 def hc_post(
@@ -161,10 +175,14 @@ def hc_post(
     accumulates in FP32 and rounds once, which is what a kernel with an FP32
     accumulator produces; a bit-exact comparison against HuggingFace needs the
     all-BF16 variant instead.
+    Residual contributions follow the sublayer update in stream order.
     """
-    update = post_mix.unsqueeze(-1) * sublayer.unsqueeze(-2)
-    skip = (residual_mix.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=-3)
-    return (update.float() + skip.float()).to(sublayer.dtype)
+    update = post_mix.float().unsqueeze(-1) * sublayer.float().unsqueeze(-2)
+    for stream in range(residual.shape[-2]):
+        coefficient = residual_mix[..., stream, :].float().unsqueeze(-1)
+        source = residual[..., stream, :].float().unsqueeze(-2)
+        update = update + coefficient * source
+    return update.to(sublayer.dtype)
 
 
 def hc_head(x: torch.Tensor) -> torch.Tensor:

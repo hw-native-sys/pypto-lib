@@ -105,8 +105,8 @@ def moe_layer_add(
     return y
 
 
-@pl.jit(auto_scope=False)
-def l2_decode_layer(
+@pl.jit.inline(auto_scope=False)
+def decode_mlp(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
@@ -119,7 +119,7 @@ def l2_decode_layer(
     shared_w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
     shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w_down_scale: pl.Tensor[[D], pl.FP32],
-    y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
+    y: pl.Tensor[[T, D], pl.FP32],
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
@@ -130,6 +130,7 @@ def l2_decode_layer(
     num_ranks: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
+    input_tid: pl.Scalar[pl.TASK_ID],
 ):
     """Run MoE for this rank's token batch with EP routed and complete shared weights."""
     arrive_x = pl.create_tensor([LANE_ROWS, D], dtype=pl.INT8)
@@ -165,6 +166,8 @@ def l2_decode_layer(
         lane_x, lane_aux, lane_count, lane_ready,
         num_tokens, num_ranks, my_rank,
     )
+    # Empty owners must still finish the preceding TP stage before waiting for EP.
+    pack_tid = pl.system.task_dummy(deps=[pack_tid, input_tid])
     moe_arrive(
         lane_x, lane_aux, lane_count, lane_ready,
         arrive_x, arrive_scale, arrive_weight, arrive_route, arrive_expert, arrive_src,
@@ -197,6 +200,46 @@ def l2_decode_layer(
         shared_out,
     )
     moe_layer_add(routed, shared_out, y, num_tokens)
+    return y
+
+
+
+@pl.jit(auto_scope=False)
+def l2_decode_layer(
+    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    w_gate_up: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    shared_w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8],
+    shared_w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w_down_scale: pl.Tensor[[D], pl.FP32],
+    y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
+    lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+):
+    """Run MoE for this rank's token batch with EP routed and complete shared weights."""
+    input_tid = pl.system.task_dummy(deps=[])
+    decode_mlp(
+        x_mixed, norm_weight, gate_weight, correction_bias,
+        w_gate_up, w_gate_up_scale, w_down, w_down_scale,
+        shared_w_gate_up, shared_w_gate_up_scale, shared_w_down, shared_w_down_scale,
+        y, lane_x, lane_aux, lane_count,
+        lane_ready, slot_out, return_ready, num_tokens,
+        num_ranks, my_rank, epoch, input_tid,
+    )
     return y
 
 

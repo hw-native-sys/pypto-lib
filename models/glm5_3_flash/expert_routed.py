@@ -207,7 +207,7 @@ def expert_routed_test(
     w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     expert_offsets: pl.Tensor[[N_LOCAL_EXPERTS + 1], pl.INT32],
     route_weights: pl.Tensor[[RECV_DYN, 1], pl.FP32],
-    output: pl.Tensor[[RECV_DYN, D], pl.FP32],
+    output: pl.Out[pl.Tensor[[RECV_DYN, D], pl.FP32]],
 ):
     x_int8.bind_dynamic(0, RECV_DYN)
     x_scale.bind_dynamic(0, RECV_DYN)
