@@ -14,7 +14,7 @@ CI uses TP1/EP2/DP2 with 128 experts. Checkpoint generation uses 384 experts
 with EP4/DP4 (default) or EP8/DP8. Each rank owns one prompt and a shard of
 routed experts; attention weights are replicated. Original MXFP8/MXFP4
 weights remain resident. Calls append current rows to caller-owned native caches.
-Engram is disabled, including host hashes, table lookup and weight preparation.
+Device Engram hashing and sharded lookup prepare rows for encoder layers 1 and 14.
 """
 
 import struct
@@ -45,6 +45,7 @@ import torch
 
 import config as C
 
+
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--checkpoint")
 _shape_parser.add_argument("--ep", type=int, choices=[2, 4, 8])
@@ -65,6 +66,9 @@ if not 16 <= CAPACITY <= _MAX_CHUNK_TOKENS or CAPACITY % 16:
     _shape_parser.error("--capacity must be between 16 and 4096 and a multiple of 16")
 # Keep MoE scratch bounded independently of the current-row capacity.
 C.set_moe_tokens(min(CAPACITY, C.MOE_TOKENS))
+
+from engram import ENGRAM_K, ENGRAM_LAYERS, KV_OUT, engram
+from engram import CAPACITY as ENGRAM_CAPACITY, MAP_ROWS, TABLE_ROWS, SLOTS as ENGRAM_SLOTS, SHARDS as ENGRAM_SHARDS, prepare_engram, build_engram_fixture, validate_forward_engram, write_engram_contract, check_engram_contract
 
 from config import (
     FLASH as M,
@@ -91,6 +95,7 @@ from hc import hc_post
 from hc import hc_pre, zero_bf16_padding
 from input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
+from engram import EngramDeviceTables, EngramLookup, engram_weight_layouts, load_engram_gate_weight
 from utils import paged_slots, window_metadata
 from lm_head import final_output
 from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals
@@ -108,6 +113,8 @@ from rmsnorm import rms_norm_tiled
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 
 RANKS = C.EP_SIZE
+if CAPACITY > ENGRAM_CAPACITY:
+    raise ValueError("Engram request capacity must cover the prefill physical capacity")
 D = M.hidden_size
 HC_MULT = M.hc_mult
 VOCAB = M.vocab_size
@@ -426,6 +433,28 @@ def l2_prefill_fwd(
     embedding_ids: pl.Tensor[[CAPACITY], pl.INT64],
     initial_pre: pl.Tensor[[CAPACITY, HC_MULT], pl.FP32],
     identity_rows: pl.Tensor[[CAPACITY], pl.INT32],
+    engram_rows: pl.Out[pl.Tensor[[ENGRAM_LAYERS, CAPACITY, ENGRAM_K], pl.BF16]],
+    engram_context: pl.Tensor[[CAPACITY, 4], pl.INT32],
+    engram_token_map: pl.Tensor[[M.vocab_size], pl.INT32],
+    engram_multipliers: pl.Tensor[[ENGRAM_LAYERS, 4], pl.INT64],
+    engram_primes: pl.Tensor[[ENGRAM_LAYERS, 24], pl.INT32],
+    engram_offsets: pl.Tensor[[ENGRAM_LAYERS, 24], pl.INT32],
+    engram_table: pl.Tensor[[ENGRAM_LAYERS, TABLE_ROWS, 256], pl.FP8E4M3FN],
+    engram_scale: pl.Tensor[[ENGRAM_LAYERS, TABLE_ROWS, 8], pl.FP8E8M0],
+    engram_row_ids: pl.Tensor[[ENGRAM_LAYERS, MAP_ROWS], pl.INT32],
+    engram_hash_ids: pl.Out[pl.Tensor[[ENGRAM_LAYERS, ENGRAM_CAPACITY, 24], pl.INT32]],
+    engram_missing: pl.Out[pl.Tensor[[2 * ENGRAM_CAPACITY * 24, 16], pl.INT32]],
+    engram_counts: pl.Tensor[[RANKS], pl.INT32],
+    engram_mask: pl.Tensor[[CAPACITY], pl.INT32],
+    engram_wkv: pl.Tensor[[ENGRAM_LAYERS, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[ENGRAM_LAYERS, ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    engram_gate_weight: pl.Tensor[[ENGRAM_LAYERS, HC_MULT, D], pl.FP32],
+    engram_requests: pld.DistributedTensor[[RANKS * ENGRAM_SLOTS, 16], pl.INT32],
+    engram_request_done: pld.DistributedTensor[[RANKS, 16], pl.INT32],
+    engram_responses: pld.DistributedTensor[[ENGRAM_SLOTS, 256], pl.BF16],
+    engram_status: pld.DistributedTensor[[ENGRAM_SLOTS, 16], pl.INT32],
+    engram_response_done: pld.DistributedTensor[[ENGRAM_SHARDS, 16], pl.INT32],
+    engram_readers_done: pld.DistributedTensor[[RANKS, 16], pl.INT32],
     hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
@@ -516,7 +545,18 @@ def l2_prefill_fwd(
     head_logits_done: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
 ):
-    """Run both CED stages and retire communication signals after the decoder."""
+    """Prepare Engram rows, run both CED stages and retire communication signals."""
+    engram_table.bind_dynamic(1, TABLE_ROWS)
+    engram_scale.bind_dynamic(1, TABLE_ROWS)
+    engram_row_ids.bind_dynamic(1, MAP_ROWS)
+    with pl.scope():
+        prepare_engram(
+            engram_context, engram_token_map, engram_multipliers, engram_primes, engram_offsets,
+            engram_hash_ids, engram_mask, engram_table, engram_scale, engram_row_ids,
+            engram_rows, engram_missing, engram_counts,
+            engram_requests, engram_request_done, engram_responses, engram_status,
+            engram_response_done, engram_readers_done, rank, True,
+        )
     compressed_cache.bind_dynamic(1, PAGES)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     state_block_table.bind_dynamic(0, B_DYN)
@@ -653,6 +693,14 @@ def l2_prefill_fwd(
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
                 gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready)
                 gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready)
+        if layer == 1 or layer == 14:
+            engram_slot = 0
+            if layer == 14:
+                engram_slot = 1
+            engram(
+                engram_rows[engram_slot], engram_wkv[engram_slot], engram_wkv_scale[engram_slot],
+                engram_gate_weight[engram_slot], engram_mask, hidden, hidden, active,
+            )
         with pl.scope():
             attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
             attn_residual = pl.create_tensor([CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -732,6 +780,22 @@ def l3_prefill_fwd(
     embedding_ids: pl.Tensor[[RANKS, CAPACITY], pl.INT64],
     initial_pre: pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32],
     identity_rows: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    engram_rows: pl.Out[pl.Tensor[[RANKS, ENGRAM_LAYERS, CAPACITY, ENGRAM_K], pl.BF16]],
+    engram_context: pl.Tensor[[RANKS, CAPACITY, 4], pl.INT32],
+    engram_token_map: pl.Tensor[[RANKS, M.vocab_size], pl.INT32],
+    engram_multipliers: pl.Tensor[[RANKS, ENGRAM_LAYERS, 4], pl.INT64],
+    engram_primes: pl.Tensor[[RANKS, ENGRAM_LAYERS, 24], pl.INT32],
+    engram_offsets: pl.Tensor[[RANKS, ENGRAM_LAYERS, 24], pl.INT32],
+    engram_table: pl.Tensor[[RANKS, ENGRAM_LAYERS, TABLE_ROWS, 256], pl.FP8E4M3FN],
+    engram_scale: pl.Tensor[[RANKS, ENGRAM_LAYERS, TABLE_ROWS, 8], pl.FP8E8M0],
+    engram_row_ids: pl.Tensor[[RANKS, ENGRAM_LAYERS, MAP_ROWS], pl.INT32],
+    engram_hash_ids: pl.Out[pl.Tensor[[RANKS, ENGRAM_LAYERS, ENGRAM_CAPACITY, 24], pl.INT32]],
+    engram_missing: pl.Out[pl.Tensor[[RANKS, 2 * ENGRAM_CAPACITY * 24, 16], pl.INT32]],
+    engram_counts: pl.Tensor[[RANKS], pl.INT32],
+    engram_mask: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    engram_wkv: pl.Tensor[[RANKS, ENGRAM_LAYERS, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[RANKS, ENGRAM_LAYERS, ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    engram_gate_weight: pl.Tensor[[RANKS, ENGRAM_LAYERS, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[RANKS, N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[RANKS, N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[RANKS, N_LAYERS * MIX_HC], pl.FP32],
@@ -851,7 +915,9 @@ def l3_prefill_fwd(
     reset_persistent_windows=False; signals are retired at forward completion.
     After request completion, release pages and reset the request slot in all C2A sources before
     assigning them to another request; failed calls require cache restoration
-    or reset before retry. Engram, vision and DSpark have no inputs here.
+    or reset before retry. Raw Engram token contexts follow encoder token order;
+    device hashing and sharded lookup prepare both layers before the backbone.
+    The mask excludes padding and non-text rows. Vision and DSpark have no inputs here.
     """
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
@@ -863,6 +929,15 @@ def l3_prefill_fwd(
     c1a_index_block_table.bind_dynamic(1, B_DYN)
     c1a_index_block_table.bind_dynamic(2, C1A_TABLE_DYN)
     query_start_loc.bind_dynamic(2, Q_START_DYN)
+    engram_table.bind_dynamic(2, TABLE_ROWS)
+    engram_scale.bind_dynamic(2, TABLE_ROWS)
+    engram_row_ids.bind_dynamic(2, MAP_ROWS)
+    engram_request_buffer = pld.alloc_window_buffer([RANKS * ENGRAM_SLOTS, 16], dtype=pl.INT32)
+    engram_request_signal = pld.alloc_window_buffer([RANKS, 16], dtype=pl.INT32)
+    engram_response_buffer = pld.alloc_window_buffer([ENGRAM_SLOTS, 256], dtype=pl.BF16)
+    engram_status_buffer = pld.alloc_window_buffer([ENGRAM_SLOTS, 16], dtype=pl.INT32)
+    engram_response_signal = pld.alloc_window_buffer([ENGRAM_SHARDS, 16], dtype=pl.INT32)
+    engram_readers_signal = pld.alloc_window_buffer([RANKS, 16], dtype=pl.INT32)
     recv_meta_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
@@ -879,6 +954,13 @@ def l3_prefill_fwd(
     head_logits_buffer = pld.alloc_window_buffer([16, VOCAB], dtype=pl.FP32)
     head_logits_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
+        engram_requests = pld.window(engram_request_buffer, [RANKS * ENGRAM_SLOTS, 16], dtype=pl.INT32)
+        engram_request_done = pld.window(engram_request_signal, [RANKS, 16], dtype=pl.INT32)
+        engram_responses = pld.window(engram_response_buffer, [ENGRAM_SLOTS, 256], dtype=pl.BF16)
+        engram_status = pld.window(engram_status_buffer, [ENGRAM_SLOTS, 16], dtype=pl.INT32)
+        engram_response_done = pld.window(engram_response_signal, [ENGRAM_SHARDS, 16], dtype=pl.INT32)
+        engram_readers_done = pld.window(engram_readers_signal, [RANKS, 16], dtype=pl.INT32)
+
         recv_meta = pld.window(recv_meta_buffer, [RANKS, LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
         recv_scale = pld.window(recv_scale_buffer, [LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
@@ -899,6 +981,14 @@ def l3_prefill_fwd(
             embedding_ids[rank],
             initial_pre[rank],
             identity_rows[rank],
+            engram_rows[rank], engram_context[rank], engram_token_map[rank],
+            engram_multipliers[rank], engram_primes[rank], engram_offsets[rank],
+            engram_table[rank], engram_scale[rank], engram_row_ids[rank],
+            engram_hash_ids[rank], engram_missing[rank],
+            engram_counts,
+            engram_mask[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_gate_weight[rank],
+            engram_requests, engram_request_done, engram_responses, engram_status,
+            engram_response_done, engram_readers_done,
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank],
             wq_a[rank], wq_a_scale[rank], q_norm_weight[rank],
@@ -967,6 +1057,8 @@ PREFILL_TENSORS = (
     "embedding_ids",
     "initial_pre",
     "identity_rows",
+    "engram_rows", "engram_context", "engram_token_map", "engram_multipliers", "engram_primes", "engram_offsets",
+    "engram_table", "engram_scale", "engram_row_ids", "engram_hash_ids", "engram_missing", "engram_counts", "engram_mask", "engram_wkv", "engram_wkv_scale", "engram_gate_weight",
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
     "attn_norm_weight",
     "wq_a", "wq_a_scale", "q_norm_weight",
@@ -1037,6 +1129,14 @@ class PrefillCheckpoint:
             "sliding_window": M.sliding_window,
             "kv_source_layer_ids": list(M.kv_source_layer_ids),
             "index_source_layer_ids": list(M.index_source_layer_ids),
+            "engram_layer_ids": list(M.engram_layer_ids),
+            "engram_num_embeddings": list(M.engram_num_embeddings),
+            "engram_max_ngram_size": M.engram_max_ngram_size,
+            "engram_vocab_size": M.engram_vocab_size,
+            "engram_n_heads": M.engram_n_heads,
+            "engram_head_dim": M.engram_head_dim,
+            "engram_pad_token_id": M.engram_pad_token_id,
+            "engram_compressed_vocab_size": M.engram_compressed_vocab_size,
         }
         for name, expected in required.items():
             if text.get(name) != expected:
@@ -1133,6 +1233,7 @@ def forward_weight_layouts(local_experts: int):
     index_sources = len(M.index_source_layer_ids)
     c2a_sources = sum(M.compress_ratios[source] == 2 for source in M.kv_source_layer_ids)
     return {
+        **engram_weight_layouts(),
         "hc_attn_fn": ((layers * M.mix_hc, M.hc_dim), torch.float32),
         "hc_attn_scale": ((layers * 3,), torch.float32),
         "hc_attn_base": ((layers * M.mix_hc,), torch.float32),
@@ -1216,6 +1317,13 @@ class ResidentPrefillWeights:
                 self.entries.append((target, f"layers.{layer}.{suffix}", layer, M.num_hidden_layers, "fp8"))
             for target, suffix in self.layer_projections:
                 self.entries.append((target, f"layers.{layer}.{suffix}", layer, M.num_hidden_layers, "plain"))
+        for slot, layer in enumerate(M.engram_layer_ids):
+            prefix = f"layers.{layer}.engram"
+            self.entries.append(("engram_wkv", prefix + ".wkv", slot, ENGRAM_LAYERS, "fp8"))
+            self.entries.append(("engram_gate_weight", prefix, slot, ENGRAM_LAYERS, "engram_gate"))
+            for suffix in ("embed.weight", "embed.scale"):
+                if prefix + "." + suffix not in checkpoint.weight_map:
+                    raise ValueError(f"checkpoint is missing required Engram table: {prefix}.{suffix}")
         for slot, layer in enumerate(M.kv_source_layer_ids):
             self.entries.append(("compressor_norm_weight", f"layers.{layer}.attn.compressor.norm.weight",
                                  slot, len(M.kv_source_layer_ids), "plain"))
@@ -1242,6 +1350,8 @@ class ResidentPrefillWeights:
             optional = (target in ("index_wk", "index_norm_weight")
                         and M.index_source_layer_ids[slot] not in M.kv_source_layer_ids)
             required = (name + ".weight", name + ".scale") if kind == "fp8" else (name,)
+            if kind == "engram_gate":
+                required = (name + ".q_weight", name + ".k_weight")
             for key in required:
                 if key not in checkpoint.weight_map and not optional:
                     raise ValueError(f"checkpoint is missing required forward weight: {key}")
@@ -1270,7 +1380,9 @@ class ResidentPrefillWeights:
                             dst_offset=slot * elements * data.element_size(), worker_id=rank)
 
         for target, name, slot, slots, kind in self.entries:
-            if kind == "fp8":
+            if kind == "engram_gate":
+                copy(target, load_engram_gate_weight(checkpoint, name), slot, slots)
+            elif kind == "fp8":
                 shape, dtype = self.tensor_layouts[target]
                 weight = checkpoint.tensor(name + ".weight")
                 scale = checkpoint.tensor(name + ".scale")
@@ -1335,12 +1447,14 @@ def prepare_prefill_inputs(
     embedding: torch.Tensor,
     capacity: int,
     *,
+    engram_rows: torch.Tensor,
+    engram_mask: torch.Tensor | None = None,
     start_pos: int = 0,
     max_seq_len: int | None = None,
     cache_state: Mapping[str, torch.Tensor] | None = None,
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Prepare one TP1 rank's next embedding chunk with Engram disabled.
+    """Prepare one TP1 rank's next embedding chunk and caller-gathered Engram rows.
 
     ``capacity`` bounds current rows, independently of ``max_seq_len``, which
     sizes the retained history. Reuse rope_tables across calls; their full
@@ -1355,6 +1469,16 @@ def prepare_prefill_inputs(
     if not isinstance(capacity, Integral) or isinstance(capacity, bool) or capacity < 16 or capacity % 16:
         raise ValueError("prefill capacity must be an integer multiple of 16")
     count = embedding.shape[0]
+    if engram_rows.shape != (ENGRAM_LAYERS, count, ENGRAM_K) or engram_rows.dtype != torch.bfloat16:
+        raise ValueError("engram_rows must be BF16 [Engram layers, current tokens, 6144]")
+    if engram_rows.device.type != "cpu":
+        raise ValueError("prefill preparation requires CPU Engram rows")
+    if engram_mask is None:
+        engram_mask = torch.ones(count, dtype=torch.int32)
+    if engram_mask.shape != (count,) or engram_mask.dtype not in (torch.bool, torch.int32):
+        raise ValueError("engram_mask must be a bool/int32 vector over current tokens")
+    if engram_mask.device.type != "cpu" or bool(((engram_mask != 0) & (engram_mask != 1)).any()):
+        raise ValueError("engram_mask must contain CPU zero/one values")
     if not 0 <= count <= capacity <= C.PREFILL_MAX_TOKENS:
         raise ValueError("current rows must fit the configured prefill capacity")
     if isinstance(start_pos, bool) or not isinstance(start_pos, Integral) or start_pos < 0:
@@ -1414,7 +1538,11 @@ def prepare_prefill_inputs(
             return torch.full(shape, float(fill), dtype=dtype)
         return torch.full(shape, fill, dtype=torch.uint8).view(dtype)
 
+    padded_engram_rows = torch.zeros((ENGRAM_LAYERS, capacity, ENGRAM_K), dtype=torch.bfloat16)
+    padded_engram_rows[:, :count] = engram_rows
     values = {
+        "engram_rows": padded_engram_rows,
+        "engram_mask": pad(engram_mask.to(torch.int32)),
         "embedding": pad(embedding),
         "embedding_ids": torch.arange(capacity, dtype=torch.int64),
         "initial_pre": initial_pre,
@@ -1459,6 +1587,8 @@ def prepare_resident_inputs(
     token_ids: torch.Tensor | Sequence[int],
     capacity: int,
     *,
+    engram_rows: torch.Tensor,
+    engram_mask: torch.Tensor | None = None,
     start_pos: int = 0,
     max_seq_len: int | None = None,
     cache_state: Mapping[str, torch.Tensor] | None = None,
@@ -1479,13 +1609,15 @@ def prepare_resident_inputs(
     embedding = weights.lookup_rows(ids)
 
     values = prepare_prefill_inputs(
-        embedding, capacity, start_pos=start_pos, max_seq_len=max_seq_len,
+        embedding, capacity, engram_rows=engram_rows, engram_mask=engram_mask,
+        start_pos=start_pos, max_seq_len=max_seq_len,
         cache_state=cache_state, rope_tables=rope_tables,
     )
     return values
 
 
-def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk_size=None):
+def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk_size=None,
+             engram_shards, compact_hashes=None):
     """Generate one independent continuation per rank using resident checkpoint weights.
 
     Prefill and subsequent one-token calls retain native device caches. Only
@@ -1495,14 +1627,19 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     """
     from tokenizers import Tokenizer
 
-    # Reject a different rank/capacity or the old Engram ABI before loading weights.
+    # Validate the complete Engram forward ABI and rank capacity.
     parameters = compiled._get_metadata()[0]
-    if (len(parameters) != len(PREFILL_TENSORS)
-            or parameters[0].shape != [RANKS, CAPACITY, D]):
-        raise ValueError("--runtime-dir must contain prefill compiled for the same EP and capacity with Engram disabled")
+    expected_rows = [RANKS, ENGRAM_LAYERS, CAPACITY, ENGRAM_K]
+    valid_abi = len(parameters) == len(PREFILL_TENSORS)
+    if valid_abi:
+        valid_abi = parameters[0].shape == [RANKS, CAPACITY, D]
+        valid_abi = valid_abi and parameters[PREFILL_TENSORS.index("engram_rows")].shape == expected_rows
+    if not valid_abi:
+        raise ValueError("--runtime-dir must match the current prefill rank, capacity and device Engram ABI")
     if len(device_ids) != RANKS or len(set(device_ids)) != RANKS or len(prompts) != RANKS:
         raise ValueError(f"prefill requires {RANKS} distinct devices and one prompt per rank")
 
+    check_engram_contract(compiled, engram_shards, compact_hashes is not None)
     tokenizer = Tokenizer.from_file(str(checkpoint.root / "tokenizer.json"))
     spec = importlib.util.spec_from_file_location(
         "v41_checkpoint_encoding", checkpoint.root / "encoding/encoding.py"
@@ -1529,9 +1666,15 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     eos_id = tokenizer.token_to_id(eos["content"] if isinstance(eos, dict) else eos)
     if eos_id is None:
         raise ValueError("checkpoint EOS token is missing from its tokenizer")
+    if RANKS == 4 and compact_hashes is None:
+        raise ValueError("full-table EP4 exceeds 96 GB per card; four-card generation requires a compact real-row manifest")
     weights = ResidentPrefillWeights(checkpoint, ep_size=RANKS)
+    engram_lookup = EngramLookup(checkpoint, tokenizer)
+    engram_tables = EngramDeviceTables(checkpoint, engram_shards, RANKS, compact_hashes)
+    lookup_counts = torch.zeros(RANKS, dtype=torch.int32).share_memory_()
     config = RunConfig(
-        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, ring_heap=2 * 1024**3,
+        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD,
+        ring_heap=(2 * 1024**3,) * 4, ring_dep_pool=131072,
         distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
     )
     outputs = {
@@ -1547,24 +1690,54 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     }
     constants.update(cache_names)
     constants.update(("freqs_cos", "freqs_sin"))
+    consumed_tokens = [[] for _ in prompts]
+
+    def prepare_engram_context(rank, token_ids, start_pos):
+        ids = torch.as_tensor(token_ids, dtype=torch.int64)
+        positions = torch.arange(start_pos, start_pos + ids.numel(), dtype=torch.int32)
+        starts = torch.tensor([0, ids.numel()], dtype=torch.int32)
+        previous = list(reversed(consumed_tokens[rank][-engram_lookup.depth:]))
+        previous += [-1] * (engram_lookup.depth - len(previous))
+        lookback = torch.tensor([previous], dtype=torch.int64)
+        context = engram_lookup.prepare_context(ids, positions, starts, lookback)
+        if engram_tables.compact:
+            engram_tables.check_hashes(engram_lookup.hash_ids(ids, positions, starts, lookback))
+        return context
+
     generated = [[] for _ in prompts]
     finished = [False] * RANKS
     print("CED_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
     start = time.monotonic()
     # Completed forwards retire signals; native cache allocations persist.
-    with compiled.prepare(config, persistent=True, reset_persistent_windows=False) as runtime:
+    with compiled.prepare(config, inherited_host_tensors=[lookup_counts],
+                          persistent=True, reset_persistent_windows=False) as runtime:
         per_rank = [{} for _ in device_ids]
         host_cache = []
         rope_tables = None
+        native_constants = {
+            "engram_token_map": engram_lookup.token_map.to(torch.int32),
+            "engram_multipliers": torch.stack(engram_lookup.multipliers),
+            "engram_primes": torch.stack(engram_lookup.primes).to(torch.int32),
+            "engram_offsets": torch.stack(engram_lookup.offsets).to(torch.int32),
+        }
         for rank, tensors in enumerate(per_rank):
+            native = engram_tables.allocate(runtime, rank)
+            tensors.update({"engram_" + name: handle for name, handle in native.items()})
             inputs = prepare_resident_inputs(
                 weights, sequences[rank][:chunk_size], CAPACITY,
+                engram_rows=torch.zeros((ENGRAM_LAYERS, min(len(sequences[rank]), chunk_size), ENGRAM_K), dtype=torch.bfloat16),
                 max_seq_len=max_seq_len, rope_tables=rope_tables,
             )
             rope_tables = inputs["freqs_cos"], inputs["freqs_sin"]
             host_cache.append({name: inputs[name] for name in cache_names})
             inputs["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
+            inputs.update(native_constants)
+            inputs["engram_context"] = torch.full((CAPACITY, 4), -1, dtype=torch.int32)
+            inputs["engram_hash_ids"] = torch.empty((2, ENGRAM_CAPACITY, 24), dtype=torch.int32)
+            inputs["engram_missing"] = torch.empty((2 * ENGRAM_CAPACITY * 24, 16), dtype=torch.int32)
             for name in PREFILL_TENSORS:
+                if name == "engram_counts" or name in tensors:
+                    continue
                 if name in weights.tensor_layouts:
                     shape, dtype = weights.tensor_layouts[name]
                     tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
@@ -1577,6 +1750,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
 
         def upload(rank):
             weights.upload(runtime, rank, per_rank[rank])
+            native = {name: per_rank[rank]["engram_" + name] for name in ("table", "scale", "row_ids")}
+            engram_tables.upload(runtime, rank, native)
             print("CED_RANK_WEIGHTS_READY", rank, flush=True)
 
         with ThreadPoolExecutor(max_workers=RANKS) as executor:
@@ -1585,8 +1760,9 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             name: StackedDeviceTensor(
                 [rank[name] for rank in per_rank], (RANKS, *per_rank[0][name].shape), tuple(range(RANKS))
             )
-            for name in PREFILL_TENSORS
+            for name in PREFILL_TENSORS if name != "engram_counts"
         }
+        stacked["engram_counts"] = lookup_counts
         logits = torch.empty((RANKS, 16, VOCAB), dtype=torch.float32)
         sampled_ids = torch.empty((RANKS, 16, 8), dtype=torch.int32)
         committed = [0] * RANKS
@@ -1594,19 +1770,29 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         last_ids = [0] * RANKS
 
         def run_rows(rows):
+            contexts = [prepare_engram_context(rank, ids, committed[rank]) for rank, ids in enumerate(rows)]
+            lookup_counts.copy_(torch.tensor([len(ids) for ids in rows], dtype=torch.int32))
             for rank, (tensors, token_ids) in enumerate(zip(per_rank, rows)):
                 inputs = prepare_resident_inputs(
                     weights, token_ids, CAPACITY,
+                    engram_rows=torch.zeros((ENGRAM_LAYERS, len(token_ids), ENGRAM_K), dtype=torch.bfloat16),
                     start_pos=committed[rank], max_seq_len=max_seq_len,
                     cache_state=host_cache[rank], rope_tables=rope_tables,
                 )
+                context = torch.full((CAPACITY, 4), -1, dtype=torch.int32)
+                context[:len(token_ids)] = contexts[rank]
+                inputs["engram_context"] = context
                 for name, value in inputs.items():
-                    if name not in constants:
+                    if name not in constants and name != "engram_rows":
                         runtime.copy_to(
                             tensors[name].data_ptr, value.data_ptr(), value.numel() * value.element_size(),
                             worker_id=rank,
                         )
-            runtime(*[stacked[name] for name in PREFILL_TENSORS], config=config)
+            runtime.run(compiled, *[stacked[name] for name in PREFILL_TENSORS], config=config)
+            errors = torch.empty((RANKS, 2 * ENGRAM_CAPACITY * 24, 16), dtype=torch.int32)
+            runtime.copy_stacked_from(stacked["engram_missing"], errors)
+            if bool(errors.any()):
+                raise ValueError("device Engram table lookup missed a required original row ID")
             runtime.copy_stacked_from(stacked["logits"], logits)
             runtime.copy_stacked_from(stacked["sampled_ids"], sampled_ids)
             for rank, token_ids in enumerate(rows):
@@ -1619,6 +1805,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                     raise AssertionError("device greedy sampling disagrees with copied logits")
                 last_logits[rank].copy_(logits[rank, 0])
                 last_ids[rank] = token
+                consumed_tokens[rank].extend(token_ids)
                 committed[rank] += len(token_ids)
 
         while any(committed[rank] < len(sequence) for rank, sequence in enumerate(sequences)):
@@ -1646,7 +1833,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         "platform": "a5", "tp": 1, "ep": RANKS, "dp": RANKS,
         "precision": "official_bf16_mxfp8_mxfp4", "checkpoint": str(checkpoint.root),
         "capacity": CAPACITY, "chunk_size": chunk_size, "history_capacity": max_seq_len,
-        "full_prefix_recomputation": False, "engram_enabled": False,
+        "full_prefix_recomputation": False, "engram_enabled": True,
+        "engram_device_shards": engram_shards, "engram_compact_real_tables": engram_tables.compact,
         "layers_per_forward": 40, "l2_invocations_per_rank_per_forward": 1,
         "seconds": time.monotonic() - start,
         "cases": [
@@ -1669,11 +1857,17 @@ def build_tensor_specs():
         "logits": ([RANKS, 16, VOCAB], torch.float32),
         "sampled_ids": ([RANKS, 16, 8], torch.int32),
     }
-    values = prepare_prefill_inputs(torch.zeros((CAPACITY, D), dtype=torch.bfloat16), CAPACITY)
+    embedding = torch.zeros((CAPACITY, D), dtype=torch.bfloat16)
+    rows = torch.zeros((ENGRAM_LAYERS, CAPACITY, ENGRAM_K), dtype=torch.bfloat16)
+    values = prepare_prefill_inputs(embedding, CAPACITY, engram_rows=rows)
     values["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
+    engram_values = build_engram_fixture(RANKS, CAPACITY, CAPACITY)
     specs = []
     for name in PREFILL_TENSORS:
-        if name in weight_layouts:
+        if name in engram_values:
+            value = engram_values[name]
+            shape, dtype = list(value.shape), value.dtype
+        elif name in weight_layouts:
             rank_shape, dtype = weight_layouts[name]
             shape = [RANKS, *rank_shape]
             value = 1.0 if dtype == torch.float8_e8m0fnu or name == "final_norm_weight" else 0.0
@@ -1789,6 +1983,10 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--checkpoint", type=Path, required=True)
         parser.add_argument("--runtime-dir", type=Path, required=True, help="previously compiled L3 artifact")
+        parser.add_argument("--engram-shards", type=int, default=RANKS)
+        parser.add_argument("--engram-compact", action="store_true")
+        parser.add_argument("--lookup-capacity", type=int, default=ENGRAM_CAPACITY)
+        parser.add_argument("--engram-row-manifest", type=Path, help="closed compact-table original hashes for validation")
         parser.add_argument("--devices", default=os.environ.get("TASK_DEVICE"))
         parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1])
         parser.add_argument("--ep", type=int, default=RANKS, choices=[4, 8])
@@ -1824,8 +2022,12 @@ if __name__ == "__main__":
             options.runtime_dir, backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
         )
+        manifest = None
+        if options.engram_row_manifest:
+            manifest = torch.load(options.engram_row_manifest, map_location="cpu", weights_only=True)
         report = generate(
             checkpoint, compiled, device_ids, prompts, options.max_new_tokens, chunk_size=options.chunk_size,
+            engram_shards=options.engram_shards, compact_hashes=manifest,
         )
         if options.report:
             options.report.parent.mkdir(parents=True, exist_ok=True)
@@ -1845,6 +2047,9 @@ if __name__ == "__main__":
         parser.add_argument("--experts-per-rank", type=int, default=LOCAL_EXPERTS, help="routed experts on each EP rank")
         parser.add_argument("--capacity", type=int, default=CAPACITY)
         parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(RANKS)))
+        parser.add_argument("--engram-shards", type=int, default=ENGRAM_SHARDS)
+        parser.add_argument("--lookup-capacity", type=int, default=ENGRAM_CAPACITY)
+        parser.add_argument("--engram-compact", action="store_true")
         parser.add_argument("--compile-only", action="store_true")
         parser.add_argument("--dump-passes", action="store_true")
         parser.add_argument("--enable-scope-stats", action="store_true")
@@ -1874,19 +2079,24 @@ if __name__ == "__main__":
             config=config,
             compile_only=True,
         )
+        if result.passed:
+            write_engram_contract(result.work_dir)
         if result.passed and not args.compile_only:
             cfg = normalize_config(config)
             compiled = DistributedCompiledProgram.from_dir(
                 result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
                 distributed_config=cfg.distributed_config,
             )
-            host_inputs = {}
+            host_inputs = {"engram_counts": torch.full((RANKS,), CAPACITY, dtype=torch.int32).share_memory_()}
             upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
             inherited = [*host_inputs.values(), upload_buffer]
             with compiled.prepare(cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=inherited) as runtime:
                 parameters = compiled._get_metadata()[0]
                 arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
                 runtime(*arguments, config=cfg)
-            print("[FWD] Execution passed; numerical accuracy was not validated.", flush=True)
+                handles = dict(zip([spec.name for spec in specs], arguments, strict=True))
+                fixture = build_engram_fixture(RANKS, CAPACITY, CAPACITY)
+                validate_forward_engram(runtime, handles, fixture, torch.ones((RANKS, CAPACITY), dtype=torch.int32), [CAPACITY] * RANKS)
+            print("[FWD] Execution and exact Engram hash/rows checks passed; backbone numerical accuracy was not validated.", flush=True)
         if not result.passed:
             raise SystemExit(result.error or 1)
