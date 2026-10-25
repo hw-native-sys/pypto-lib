@@ -1,0 +1,22 @@
+{
+  "run_id": 40176210246,
+  "head_sha": "3b3e2f5a6ef72d17cb1930e3d93f1ed6ecb7678b",
+  "artifact_id": 12591854965,
+  "artifact_name": "e79-afe8177-x86-cpu-fixtures-40176210246-1",
+  "artifact_sha256": "81272fc9b25ebd7ae6fc829c6521d61b0f836d7b02b66595c7cc0d54f0b49a08",
+  "source_digest": "9f0dbb5730c04b2a26c84c30dde63ee0a00ab62c0c0425579c88a73458a232dd",
+  "entries": {
+    "c1a": {
+      "host_sha256": "f25af885cd383eff77897035885c26304e98f51eff8040e012a7961f05df80bc",
+      "summary_sha256": "4dbf614ea637f333489cfddfb8e68105abd3089e3c5eba678ef6be9882b87a09",
+      "directory": "02-l3_decode_c1a_full-72",
+      "manifest_sha256": "fa23c4b8435dc03a5d58316d40f6d3743a79a612d55839d8dbc4ba29004dfc6e"
+    },
+    "c2a": {
+      "host_sha256": "1f3b7ae5f5ab801016f7945ee8fb0dd2d8c8b76059267fa3451729e669aa00fe",
+      "summary_sha256": "2e417dc2de993560914678e920de6fb126b3d3c0ac6b779ab865ea4e0fb59d83",
+      "directory": "02-l3_decode_c2a_full-72",
+      "manifest_sha256": "b177fe947dbeb8cd98b919bdc40b1f64df024d123245ade78047f93c453a124b"
+    }
+  }
+}

@@ -1,17 +1,18 @@
-name: CI CPU fixture diagnostic
+name: CI CPU stage diagnostic
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: ci-cpu-fixtures-${{ github.ref }}
+  group: ci-cpu-stages-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  export-fixtures:
+  export-stages:
     runs-on: [self-hosted, linux, x64, cpu]
     timeout-minutes: 60
     defaults:
@@ -44,7 +45,35 @@ jobs:
           torch-version: 'torch==2.10.0'
           pypto-ref: afe81773c33ef041d97f81e473c06618b961ecda
 
-      - name: Export original inputs and CPU goldens
+      - name: Verify the original artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PYCODE'
+          import json, os, urllib.request
+          request = urllib.request.Request(
+              'https://api.github.com/repos/hw-native-sys/pypto-lib/actions/artifacts/12591854965',
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(request) as response:
+              value = json.load(response)
+          assert value['id'] == 12591854965 and not value['expired']
+          assert value['digest'] == 'sha256:81272fc9b25ebd7ae6fc829c6521d61b0f836d7b02b66595c7cc0d54f0b49a08'
+          assert value['workflow_run']['id'] == 40176210246
+          assert value['workflow_run']['head_sha'] == '3b3e2f5a6ef72d17cb1930e3d93f1ed6ecb7678b'
+          assert value['name'] == 'e79-afe8177-x86-cpu-fixtures-40176210246-1'
+          with open('original-artifact.json', 'w') as stream:
+              json.dump(value, stream, indent=2)
+          PYCODE
+
+      - name: Download the original inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: e79-afe8177-x86-cpu-fixtures-40176210246-1
+          run-id: 40176210246
+          github-token: ${{ github.token }}
+          path: checkout/prior-fixtures
+
+      - name: Capture unchanged golden stages on the frozen inputs
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/checkout
@@ -52,25 +81,29 @@ jobs:
           source activate.sh
           test "$(uname -m)" = x86_64
           test -z "${TASK_DEVICE:-}"
-          destination="fixture-export-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          destination="stage-export-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           test ! -e "$destination"
           mkdir "$destination"
+          cp original-artifact.json "$destination/"
           failed=0
-          for entry in c1a c2a sparse; do
-            if ! python .github/scripts/export_ci_fixtures.py --entry "$entry" \
-                --output "$destination/$entry" >"$destination/$entry.log" 2>&1; then
+          for entry in c1a c2a; do
+            if ! python .github/scripts/export_cpu_stages.py --entry "$entry" \
+                --fixtures prior-fixtures --output "$destination/$entry" \
+                --pypto-source "$PYPTO_SRC" --expected-machine x86_64 \
+                --expected-pypto afe81773c33ef041d97f81e473c06618b961ecda \
+                >"$destination/$entry.log" 2>&1; then
               failed=1
-              echo "::error::CPU fixture export failed: $entry"
+              echo "::error::CPU stage export failed: $entry"
             fi
           done
           exit "$failed"
 
-      - name: Upload synthetic fixtures and metadata
+      - name: Upload stage tensors and metadata
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e79-afe8177-x86-cpu-fixtures-${{ github.run_id }}-${{ github.run_attempt }}
-          path: checkout/fixture-export-${{ github.run_id }}-${{ github.run_attempt }}/
+          name: e79-x86-cpu-stages-${{ github.run_id }}-${{ github.run_attempt }}
+          path: checkout/stage-export-${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
           retention-days: 3
           compression-level: 1
