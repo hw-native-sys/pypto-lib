@@ -230,6 +230,78 @@ def _project_ratio2_weights_consumer(
 
 
 @pl.jit.inline
+def _project_ratio2_weights_reuse_rows(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Reuse each decomposed K64 weight panel across independent M16 row tiles."""
+    chunk_rows = pl.cast(num_tokens, pl.INDEX)
+    high_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
+    residual_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
+    panel_blocks = (HEAD_DIM // N_TILE) * COMPRESSOR_SEGMENTS
+    workers = pl.min(pl.min(panel_blocks, 16), pl.system.available_cluster_count())
+    with pl.spmd(workers, name_hint="c2a_compressor_reuse_rows", sync_start=True) as cube_tid:
+        cube_worker = pl.tile.get_block_idx()
+        for panel_block in pl.range(cube_worker, panel_blocks, workers):
+            cube_segment = panel_block % COMPRESSOR_SEGMENTS
+            cube_n0 = panel_block // COMPRESSOR_SEGMENTS * N_TILE
+            cube_k0 = cube_segment * COMPRESSOR_K_TILE
+            value = pl.load(weight, [cube_k0, cube_n0], [COMPRESSOR_K_TILE, N_TILE], target_memory=pl.MemorySpace.Vec)
+            high = pl.cast(value, pl.BF16, mode="rint")
+            high_fp32 = pl.cast(high, pl.FP32)
+            residual = pl.sub(value, high_fp32)
+            low = pl.cast(residual, pl.BF16, mode="rint")
+            low_fp32 = pl.cast(low, pl.FP32)
+            tail_fp32 = pl.sub(residual, low_fp32)
+            tail = pl.cast(tail_fp32, pl.BF16, mode="rint")
+            high_mat = pl.tile.move(
+                high, target_memory=pl.MemorySpace.Mat,
+                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
+            )
+            high_right = pl.tile.move(high_mat, target_memory=pl.MemorySpace.Right)
+            low_mat = pl.tile.move(
+                low, target_memory=pl.MemorySpace.Mat,
+                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
+            )
+            low_right = pl.tile.move(low_mat, target_memory=pl.MemorySpace.Right)
+            tail_mat = pl.tile.move(
+                tail, target_memory=pl.MemorySpace.Mat,
+                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
+            )
+            tail_right = pl.tile.move(tail_mat, target_memory=pl.MemorySpace.Right)
+            for cube_t0 in pl.range(0, chunk_rows, M_TILE):
+                cube_rows = pl.min(M_TILE, chunk_rows - cube_t0)
+                a = pl.load(x, [cube_t0, cube_k0], [M_TILE, COMPRESSOR_K_TILE], valid_shape=[cube_rows, COMPRESSOR_K_TILE], target_memory=pl.MemorySpace.Vec)
+                a_fp32 = pl.cast(a, pl.FP32)
+                a = pl.cast(a_fp32, pl.BF16, mode="rint")
+                high_acc = pl.tile.create([M_TILE, N_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
+                residual_acc = pl.tile.create([M_TILE, N_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
+                high_acc = pl.matmul_acc(high_acc, a, high_right, init_cond=True)
+                residual_acc = pl.matmul_acc(residual_acc, a, low_right, init_cond=True)
+                residual_acc = pl.matmul_acc(residual_acc, a, tail_right)
+                high_value = pl.mul(high_acc, 1.0)
+                high_value = pl.set_validshape(high_value, cube_rows, N_TILE)
+                high_product = pl.store(high_value, [cube_segment * chunk_rows + cube_t0, cube_n0], high_product)
+                residual_value = pl.mul(residual_acc, 1.0)
+                residual_value = pl.set_validshape(residual_value, cube_rows, N_TILE)
+                residual_product = pl.store(residual_value, [cube_segment * chunk_rows + cube_t0, cube_n0], residual_product)
+    output_blocks = (chunk_rows + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
+    with pl.spmd(pl.min(output_blocks, 16), name_hint="c2a_compressor_reuse_sum", deps=[cube_tid]) as sum_tid:
+        sum_worker = pl.tile.get_block_idx()
+        for sum_block in pl.range(sum_worker, output_blocks, pl.min(output_blocks, 16)):
+            sum_t0 = sum_block // (HEAD_DIM // N_TILE) * M_TILE
+            sum_n0 = sum_block % (HEAD_DIM // N_TILE) * N_TILE
+            sum_rows = pl.min(M_TILE, chunk_rows - sum_t0)
+            _sum_ratio2_segments(
+                high_product, residual_product, output,
+                chunk_rows, 0, sum_t0, sum_n0, sum_rows,
+            )
+    return output
+
+
+@pl.jit.inline
 def project_ratio2_weights(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
@@ -238,6 +310,8 @@ def project_ratio2_weights(
 ):
     if num_tokens > 0 and num_tokens <= M_TILE:
         _project_ratio2_weights_consumer(x, weight, output, num_tokens)
+    elif num_tokens > M_TILE and num_tokens <= 80 and pl.tensor.dim(x, 0) == num_tokens and COMPRESSOR_K_CHUNK == COMPRESSOR_K_TILE:
+        _project_ratio2_weights_reuse_rows(x, weight, output, num_tokens)
     else:
         _project_ratio2_weights_staged(x, weight, output, num_tokens)
     return output

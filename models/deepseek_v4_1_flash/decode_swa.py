@@ -10,10 +10,10 @@
 
 
 import pypto.language as pl
-from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
+from config import FLASH as M, TP_SIZE, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from sparse_attention import publish_window_row, swa_attention_partial
 from qkv_proj_rope import qkv_proj_rope
-from o_proj import o_proj
+from o_proj import o_proj, o_proj_hc_post
 from hc import hc_pre, zero_bf16_padding, hc_post
 from rmsnorm import rms_norm_tiled
 
@@ -96,13 +96,20 @@ def decode_swa(
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     swa_attention_partial(q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens)
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b,
-        wo_b_scale, rope_cos, rope_sin,
-        attention_output, num_tokens, grouped_max_workers=4096,
-    )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps)
+    fused_output_rows = tokens <= 16 or num_tokens == tokens
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 80 and fused_output_rows:
+        o_proj_hc_post(
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
+        )
+    else:
+        o_proj(
+            attended, wo_a, wo_a_scale, wo_b,
+            wo_b_scale, rope_cos, rope_sin,
+            attention_output, num_tokens, grouped_max_workers=4096,
+        )
+        hc_post_deps = pl.array.create(2, pl.TASK_ID)
+        hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps)
     return attention_hidden, attention_pre_mix
 
 
