@@ -1,535 +1,76 @@
-name: CI
+name: CI CPU fixture diagnostic
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-cpu-fixtures-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  pre-commit:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-      - uses: pre-commit/action@v3.0.0
-        with:
-          extra_args: --all-files
-
-  unit-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-unit-tests
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Run unit tests
-        run: pytest tests -v
-
-  detect-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      sim_matrix: ${{ steps.check.outputs.sim_matrix }}
-      a2a3_files: ${{ steps.check.outputs.a2a3_files }}
-      device_matrix: ${{ steps.check.outputs.device_matrix }}
-      a2a3sim_files: ${{ steps.check.outputs.a2a3sim_files }}
-      a5sim_files: ${{ steps.check.outputs.a5sim_files }}
-      run_qwen_serving_tests: ${{ steps.check.outputs.run_qwen_serving_tests }}
-      run_deepseek_serving_tests: ${{ steps.check.outputs.run_deepseek_serving_tests }}
-      run_dspark_serving_tests: ${{ steps.check.outputs.run_dspark_serving_tests }}
-      a5_files: ${{ steps.check.outputs.a5_files }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-      - id: check
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
-          echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
-          echo "run_dspark_serving_tests=false" >> "$GITHUB_OUTPUT"
-          select_all=false
-          if [ "${{ github.event_name }}" = "push" ] ||
-             [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            select_all=true
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            DIFF_RANGE="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
-          else
-            BEFORE="${{ github.event.before }}"
-            if [ -z "$BEFORE" ] ||
-               [ "$BEFORE" = "0000000000000000000000000000000000000000" ] ||
-               ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null ||
-               ! git merge-base --is-ancestor "$BEFORE" "${{ github.sha }}"; then
-              select_all=true
-            else
-              DIFF_RANGE="$BEFORE..${{ github.sha }}"
-            fi
-          fi
-
-          CHANGED_FILES=""
-          if [ "$select_all" = "false" ]; then
-            CHANGED_FILES=$(git diff --name-only "$DIFF_RANGE")
-
-          fi
-
-          # Device and simulator entries share platform ownership; simulator
-          # selection additionally honors file-level exclusions such as no-sim.
-          SIM_PLATFORMS=()
-          DEVICE_PLATFORMS=()
-          for platform in a2a3 a2a3sim a5 a5sim; do
-            # Main pushes run the full examples suite on A2/A3 and both
-            # simulators; A5 device coverage stays in PR and daily CI.
-            if [ "${{ github.event_name }}" = "push" ] && [ "$platform" = "a5" ]; then
-              FILES=""
-            elif [ "$select_all" = "true" ]; then
-              FILES=$(python .github/scripts/detect_changes.py --all --root examples --platform "$platform")
-            else
-              FILES=$(printf '%s\n' "$CHANGED_FILES" | python .github/scripts/detect_changes.py --platform "$platform")
-            fi
-            echo "${platform}_files=$FILES" >> "$GITHUB_OUTPUT"
-            if [[ "$platform" = *sim ]] && [ -n "$FILES" ]; then
-              SIM_PLATFORMS+=("$platform")
-            elif [ -n "$FILES" ]; then
-              DEVICE_PLATFORMS+=("$platform")
-            fi
-            echo "Selected $platform files: $FILES"
-          done
-          SIM_MATRIX=$(python -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${SIM_PLATFORMS[@]}")
-          echo "sim_matrix=$SIM_MATRIX" >> "$GITHUB_OUTPUT"
-          DEVICE_MATRIX=$(python -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "${DEVICE_PLATFORMS[@]}")
-          echo "device_matrix=$DEVICE_MATRIX" >> "$GITHUB_OUTPUT"
-
-          # Serving e2e jobs are model-specific and expensive. CI-infra edits
-          # (.github/**) must not trigger them.
-          if [ "${{ github.event_name }}" = "pull_request" ] &&
-             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/qwen3_14b/'; then
-            echo "run_qwen_serving_tests=true" >> "$GITHUB_OUTPUT"
-          fi
-          if [ "${{ github.event_name }}" = "pull_request" ] &&
-             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_mtp/'; then
-            echo "run_deepseek_serving_tests=true" >> "$GITHUB_OUTPUT"
-          fi
-          if [ "${{ github.event_name }}" = "pull_request" ] &&
-             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_dspark/'; then
-            echo "run_dspark_serving_tests=true" >> "$GITHUB_OUTPUT"
-          fi
-
-  sim:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.sim_matrix != '[]'
-    # Simulator job: no device needed, so it runs on the CPU runner — but on the
-    # host, through the same setup-ci-job composite as the a2a3 device job (same
-    # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
-    # the only difference: no Ascend env, which the simulator does not use.
+  export-fixtures:
     runs-on: [self-hosted, linux, cpu]
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ${{ fromJSON(needs.detect-changes.outputs.sim_matrix) }}
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: checkout
     env:
       PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      MAX_JOBS: 2
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the a2a3 job; 000 keeps cache files mutually writable. Both
-      # jobs now run as ci-runner (no container root), but the dir still holds
-      # root-owned entries from the container era, so keep the umask.
-      # The cache *paths* are exported by setup-ci-job from the runner config's
-      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
       CCACHE_UMASK: '000'
-
     steps:
-      - name: Fetch composite action definitions
-        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./checkout — sparse-fetch just
-        # the action defs at the workspace root first (clean: false leaves sibling
-        # subdir checkouts on this persistent runner untouched).
+      - name: Fetch unchanged setup action
         uses: actions/checkout@v4
         with:
           sparse-checkout: .github/actions
           clean: false
           persist-credentials: false
 
-      - name: Setup CI job
+      - name: Setup pinned CPU job
         uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: checkout
           needs-device: 'false'
-          build-namespace: ${{ matrix.platform }}
-          pip-cache-name: pip-sim
+          build-namespace: fixture-export-afe8177
+          pip-cache-name: pip-fixture-export
           toolchain: bundle
-          # A5 simulation uses the MXFP8 scale dtype torch.float8_e8m0fnu.
-          torch-version: ${{ matrix.platform == 'a5sim' && 'torch==2.10.0' || 'torch==2.6.0' }}
+          torch-version: 'torch==2.10.0'
+          pypto-ref: afe81773c33ef041d97f81e473c06618b961ecda
 
-      - name: Run ${{ matrix.platform }} tests
+      - name: Export original inputs and CPU goldens
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/checkout
-          # Match tile-memory capacities to the requested simulator target.
-          PTO_CPU_SIM_ARCH: ${{ matrix.platform == 'a5sim' && 'a5' || 'a2a3' }}
         run: |
           source activate.sh
-          set +e
-          FILES="${{ needs.detect-changes.outputs[format('{0}_files', matrix.platform)] }}"
-          if [ -z "$FILES" ]; then
-            echo "No runnable changed files; nothing to test."
-            exit 0
-          fi
-          failed=()
-          target="${{ matrix.platform }}"
-          target_args=(-p "${target%sim}")
-          if [[ "$target" == *sim ]]; then target_args+=(--sim); fi
-          for f in $FILES; do
-            echo "::group::$f"
-            # Files marked `# ci: no-sim` (full multi-layer / multi-card
-            # forwards) are device-only and would just reject --sim.
-            if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
-              echo "skip (no-sim): $f"
-              echo "::endgroup::"
-              continue
+          test "$(uname -m)" = x86_64
+          test -z "${TASK_DEVICE:-}"
+          destination="fixture-export-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$destination"
+          mkdir "$destination"
+          failed=0
+          for entry in c1a c2a sparse; do
+            if ! python .github/scripts/export_ci_fixtures.py --entry "$entry" \
+                --output "$destination/$entry" >"$destination/$entry.log" 2>&1; then
+              failed=1
+              echo "::error::CPU fixture export failed: $entry"
             fi
-            if ! python "$f" "${target_args[@]}"; then
-              failed+=("$f")
-              echo "::error file=${f}::FAIL"
-            fi
-            echo "::endgroup::"
           done
-          if [ ${#failed[@]} -ne 0 ]; then
-            printf 'FAILED: %s\n' "${failed[@]}"
-            exit 1
-          fi
-          echo "All selected files passed."
+          exit "$failed"
 
-      - name: Clean up build artifacts
+      - name: Upload synthetic fixtures and metadata
         if: always()
-        run: rm -rf build_output
-
-  device:
-    name: device (${{ matrix.platform }})
-    needs: detect-changes
-    if: needs.detect-changes.outputs.device_matrix != '[]'
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ${{ fromJSON(needs.detect-changes.outputs.device_matrix) }}
-    runs-on: ${{ fromJSON(matrix.platform == 'a5' && '["self-hosted", "linux", "npu-a5"]' || '["self-hosted", "linux", "npu", "a3"]') }}
-    # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
-    # --max-time 600 run), or the job dies before task-submit's own timeout can
-    # ever fire — and the first queued case would eat the whole job budget.
-    timeout-minutes: 120
-    defaults:
-      run:
-        working-directory: checkout
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_MAXSIZE: 30G
-      # Shared with the sim job via the same ci-cache dir; 000 keeps cache files
-      # mutually writable. Both jobs now run as ci-runner, but the dir still holds
-      # root-owned entries from the container era, so keep the umask.
-      # The cache *paths* are exported by setup-ci-job from the runner config's
-      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
-      CCACHE_UMASK: '000'
-
-    steps:
-      - name: Fetch composite action definitions
-        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./checkout — sparse-fetch just
-        # the action defs at the workspace root first (clean: false leaves sibling
-        # subdir checkouts on this persistent runner untouched).
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: checkout
-          needs-device: 'true'
-          build-namespace: ${{ matrix.platform }}-ci
-          pip-cache-name: pip-${{ matrix.platform }}
-          toolchain: bundle
-          torch-version: 'torch==2.10.0'
-
-      - name: Run ${{ matrix.platform }} tests (via task-submit)
-        shell: bash
-        env:
-          CI_PLATFORM: ${{ matrix.platform }}
-          CI_ENTRIES: ${{ needs.detect-changes.outputs[format('{0}_files', matrix.platform)] }}
-        run: |
-          source activate.sh
-          failed=()
-          for f in $CI_ENTRIES; do
-            echo "::group::$f"
-            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
-            ndev=${ndev:-1}
-            device_flags=()
-            if [ "$ndev" -gt 1 ]; then
-              device_flags+=(--device-num "$ndev" --ignore-whitelist)
-            fi
-            if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 600 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE"; then
-              status=pass
-            else
-              status=fail
-              failed+=("$f")
-              echo "::error file=${f}::FAIL"
-            fi
-            echo "[device][$CI_PLATFORM] $f: $status"
-            echo "::endgroup::"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            printf 'FAILED: %s\n' "${failed[@]}"
-            exit 1
-          fi
-          echo "All selected files passed."
-
-      - name: Upload failure diagnostics
-        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform }}-failure-diagnostics
-          retention-days: 7
-          if-no-files-found: ignore
-          path: |
-            checkout/build_output/**/report/codegen_errors.txt
-            checkout/build_output/**/*.pto
-
-      - name: Kill orphaned task-submit tasks
-        if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
-        with:
-          checkout-path: checkout
-
-      - name: Clean up build artifacts
-        if: always()
-        working-directory: checkout
-        run: rm -rf build_output
-
-  serving-qwen:
-    needs: detect-changes
-    # PR-only, qwen3-14b (single card). The 8-card DeepSeek V4 run is split into
-    # its own job (serving-deepseek) so the two models schedule independently and
-    # the expensive 8-card borrow does not serialize behind the single-card run.
-    if: >-
-      github.event_name == 'pull_request' &&
-      needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
-    runs-on: [self-hosted, linux, npu, a3]
-    # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
-    # plus setup/build headroom.
-    timeout-minutes: 120
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_MAXSIZE: 30G
-      # The cache paths are exported by setup-ci-job from the runner config's
-      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
-      CCACHE_UMASK: '000'
-
-    steps:
-      - name: Fetch composite action definitions
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: checkout
-          needs-device: 'true'
-          build-namespace: serving
-          toolchain: bundle
-          # pypto-serving's NPU runners call torch.npu.mem_get_info.
-          install-torch-npu: 'true'
-          # Own ccache: serving's churn must not LRU-evict the a2a3/sim entries.
-          ccache-name: ccache-serving
-          pip-cache-name: pip-serving
-
-      - name: Run pypto-serving Qwen3-14B tests
-        uses: ./.github/actions/pypto-serving-tests
-        with:
-          pypto-lib-checkout-path: checkout
-          pypto-serving-checkout-path: serving-checkout
-          model-name: qwen3-14b
-
-      - name: Kill orphaned task-submit tasks
-        if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
-        with:
-          checkout-path: checkout
-
-      - name: Clean up build artifacts
-        if: always()
-        run: rm -rf serving-checkout/build_output
-
-  serving-deepseek:
-    needs: detect-changes
-    # PR-only, DeepSeek V4 — the 8-card (--device-num 8) serving run, split out
-    # of `serving-qwen` so the 8-card borrow schedules independently of the
-    # single-card run. Same setup contract; gated by its own model guard.
-    if: >-
-      github.event_name == 'pull_request' &&
-      needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
-    runs-on: [self-hosted, linux, npu, a3]
-    # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
-    # plus setup/build headroom.
-    timeout-minutes: 120
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_MAXSIZE: 30G
-      # The cache paths are exported by setup-ci-job from the runner config's
-      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
-      CCACHE_UMASK: '000'
-
-    steps:
-      - name: Fetch composite action definitions
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: checkout
-          needs-device: 'true'
-          build-namespace: serving
-          toolchain: bundle
-          # pypto-serving's NPU runners call torch.npu.mem_get_info.
-          install-torch-npu: 'true'
-          # Share serving's dedicated ccache so a2a3/sim entries are not evicted.
-          ccache-name: ccache-serving
-          pip-cache-name: pip-serving
-
-      - name: Run pypto-serving DeepSeek V4 tests
-        uses: ./.github/actions/pypto-serving-tests
-        with:
-          pypto-lib-checkout-path: checkout
-          pypto-serving-checkout-path: serving-checkout
-          model-name: deepseek-v4
-          # Only the fused K=1 case runs on device: the k3-s4-b4 case starts a
-          # second 8-card server for the same gate.
-          deepseek-mtp-cases: k1
-
-      - name: Kill orphaned task-submit tasks
-        if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
-        with:
-          checkout-path: checkout
-
-      - name: Clean up build artifacts
-        if: always()
-        run: rm -rf serving-checkout/build_output
-
-  serving-dspark:
-    needs: detect-changes
-    # PR-only, DSpark (deepseek_v4_flash_dspark) — the 8-card EP8 (--device-num 8)
-    # serving run of the one-server speculative K=7 case (greedy generation plus
-    # grouped prefix cache on a single caching-enabled server), split out like
-    # serving-deepseek so the expensive 8-card borrow schedules independently.
-    # Same setup contract; gated by its own model guard.
-    if: >-
-      github.event_name == 'pull_request' &&
-      needs.detect-changes.outputs.run_dspark_serving_tests == 'true'
-    runs-on: [self-hosted, linux, npu, a3]
-    # One task-submit worst case: --timeout 3600 queue + --max-time 2400 run
-    # (the K=7 boot compiles the fused one-L2 decode entry on top of the weight
-    # upload), plus setup/build headroom.
-    timeout-minutes: 135
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_MAXSIZE: 30G
-      # The cache paths are exported by setup-ci-job from the runner config's
-      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
-      CCACHE_UMASK: '000'
-
-    steps:
-      - name: Fetch composite action definitions
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: checkout
-          needs-device: 'true'
-          build-namespace: serving
-          toolchain: bundle
-          # pypto-serving's NPU runners call torch.npu.mem_get_info.
-          install-torch-npu: 'true'
-          # Share serving's dedicated ccache so a2a3/sim entries are not evicted.
-          ccache-name: ccache-serving
-          pip-cache-name: pip-serving
-
-      - name: Run pypto-serving DSpark tests
-        uses: ./.github/actions/pypto-serving-tests
-        with:
-          pypto-lib-checkout-path: checkout
-          pypto-serving-checkout-path: serving-checkout
-          model-name: deepseek-dspark
-          # Only the K=7 case runs on device: the K=0 case starts a second
-          # 8-card server for the same gate.
-          deepseek-dspark-cases: k7
-
-      - name: Kill orphaned task-submit tasks
-        if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
-        with:
-          checkout-path: checkout
-
-      - name: Clean up build artifacts
-        if: always()
-        run: rm -rf serving-checkout/build_output
+          name: e79-afe8177-x86-cpu-fixtures-${{ github.run_id }}-${{ github.run_attempt }}
+          path: checkout/fixture-export-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 1
