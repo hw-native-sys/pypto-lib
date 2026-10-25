@@ -13,15 +13,15 @@ import pypto.language as pl
 from qkv_proj_rope import qkv_proj_rope
 from o_proj import o_proj, o_proj_hc_post
 from decode_indexer import (
-    select_candidate_block_pool, c1a_index, use_pretransposed_index_query, score_full_pretransposed,
-    make_fp4_publish, select_index_topk, c1a_project_index_key, c1a_rotate_index_key,
+    select_candidate_block_pool, c1a_index, use_pretransposed_index_query, score_select_c1a_groups,
+    make_fp4_publish, c1a_project_index_key, c1a_rotate_index_key,
 )
 from sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE, attend_packed_cohorts,
 )
 from hc import hc_pre, hc_mixes, hc_post, _hc_post_from_partial
 from config import (
-    LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
+    TP_SIZE, LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
 )
 from rmsnorm import rms_norm, rms_norm_tiled
@@ -161,13 +161,13 @@ def decode_c1a_full(
         num_tokens, score_width, x_ready, private_query, private_route,
         pretransposed=True, query_max_workers=INDEX_QUERY_WORKER_TILE,
     )
-    scores_tid = score_full_pretransposed(
+    topk_tid, scores_tid = score_select_c1a_groups(
         index_query, index_query_scale, index_weights,
         index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
-        scores,
+        scores, topk_indices,
         num_tokens, index_ready, query_tid, weights_tid, private_query, private_route,
+        pl.tensor.dim(pool_block_ids, 1),
     )
-    topk_tid = select_index_topk(scores, index_block_table, request_ids, topk_indices, num_tokens, scores_tid)
     pool_tid = select_candidate_block_pool(
         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
     )
@@ -188,7 +188,8 @@ def decode_c1a_full(
             max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather",
         )
         attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
-    if num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
+    fused_output_rows = tokens <= 16 or num_tokens == tokens
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= tokens and tokens <= 80 and fused_output_rows:
         attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
         o_proj_hc_post(
             attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
@@ -668,7 +669,8 @@ if __name__ == "__main__":
     query_help = "one query length per start-pos; omitted: config.DECODE_ROWS_PER_REQUEST each"
     parser.add_argument("--query-lens", type=parse_decode_query_lens, help=query_help)
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
+    case_help = "single fixture variant; omitted: bounded default cases"
+    parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], help=case_help)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
@@ -677,76 +679,85 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.set_defaults(tokens=1, requests=1, pages=8)
     args = parser.parse_args()
-    configure_decode_workload(args, parser)
-    if args.startpos is not None:
-        max_end = max(pos + length for pos, length in zip(args.startpos, args.query_lens))
-        args.pages = (max_end + 127) // 128
-    host = l3_decode_c1a_full
-    specs = build_c1a_specs(
-        "full", args.tokens, args.pages, args.requests, args.seed, args.case,
-        start_pos=args.startpos, query_lens=args.query_lens, param_names=host.param_names,
-    )
+    cases = [args]
+    if args.startpos is None and args.query_lens is None and args.case is None:
+        if args.runtime_dir is None and args.golden_data is None and not args.enable_chip_swimlane:
+            grouped = argparse.Namespace(**vars(args))
+            grouped.startpos = [8192] * 12
+            grouped.query_lens = [6] * 12
+            cases.append(grouped)
+    for args in cases:
+        args.case = args.case or "random"
+        configure_decode_workload(args, parser)
+        if args.startpos is not None:
+            max_end = max(pos + length for pos, length in zip(args.startpos, args.query_lens))
+            args.pages = (max_end + 127) // 128
+        host = l3_decode_c1a_full
+        specs = build_c1a_specs(
+            "full", args.tokens, args.pages, args.requests, args.seed, args.case,
+            start_pos=args.startpos, query_lens=args.query_lens, param_names=host.param_names,
+        )
 
-    result = run(
-        fn=host,
-        specs=specs,
-        golden_fn=golden_c1a,
-        compile_only=args.compile_only,
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            dump_passes=args.dump_passes,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-            "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-            "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
-            "window_cache": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+        result = run(
+            fn=host,
+            specs=specs,
+            golden_fn=golden_c1a,
+            compile_only=args.compile_only,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                dump_passes=args.dump_passes,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+                distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),
             ),
-            "window_cache_scale": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
-            ),
-            "compressed_cache": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="compressed_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
-            "compressed_cache_scale": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="compressed_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
-            "index_cache": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="index_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
-            "index_cache_scale": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="index_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
-        },
-    )
-    if not result.passed:
-        raise SystemExit(result.error or 1)
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn={
+                "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+                "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+                "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
+                "window_cache": mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window_cache",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+                ),
+                "window_cache_scale": mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window_cache_scale",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                ),
+                "compressed_cache": mapped_pool_ratio_allclose(
+                    "compressed_slots", pool_name="compressed_cache",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.0,
+                ),
+                "compressed_cache_scale": mapped_pool_ratio_allclose(
+                    "compressed_slots", pool_name="compressed_cache_scale",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.0,
+                ),
+                "index_cache": mapped_pool_ratio_allclose(
+                    "compressed_slots", pool_name="index_cache",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.0,
+                ),
+                "index_cache_scale": mapped_pool_ratio_allclose(
+                    "compressed_slots", pool_name="index_cache_scale",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.0,
+                ),
+            },
+        )
+        if not result.passed:
+            raise SystemExit(result.error or 1)

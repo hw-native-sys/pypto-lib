@@ -1364,7 +1364,7 @@ def gather_packed_chunk(
     return gathered
 
 
-def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY_TILE):
+def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY_TILE, max_workers=32):
     """Build chunked sink attention with an optional Vector query startup."""
     @pl.jit.inline
     def attend_selected_chunk(
@@ -1387,7 +1387,7 @@ def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY
         attend_tasks = active * (LOCAL_H // PACKED_HEAD_TILE)
         workers = attend_tasks
         if TP_SIZE == 1:
-            workers = pl.min(attend_tasks, 32)
+            workers = pl.min(attend_tasks, max_workers)
         with pl.spmd(
             workers, name_hint=name_hint, deps=[gather_ready],
             optimizations=[pl.cross_core_slot(slot_num=PACKED_ATTEND_SLOT_TILE)],
@@ -1560,7 +1560,6 @@ def _attend_padded(
 
 attend_selected = _attend_cube if LOCAL_H >= 16 else _attend_padded
 attend_c2a_chunk = make_attend_selected_chunk(vector_query=TP_SIZE != 1)
-_attend_cohort = make_attend_selected_chunk(vector_query=TP_SIZE != 1, selected_rows=PACKED_COHORT_TILE)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1909,58 +1908,70 @@ def l2_sparse_attention(
     return output
 
 
-@pl.jit.inline(auto_scope=False)
-def attend_packed_cohorts(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    rows: pl.Scalar[pl.INT32],
-    source_ready: pl.Scalar[pl.TASK_ID],
-    gather_name: pl.constexpr,
-    attn_name: pl.constexpr,
-):
-    selected_a = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
-    selected_b = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
-    combined_a = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS], dtype=pl.INT32)
-    combined_b = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS], dtype=pl.INT32)
-    done_a = source_ready
-    done_b = source_ready
-    for start in pl.range(0, rows, 2 * PACKED_COHORT_TILE):
-        width = pl.min(PACKED_COHORT_TILE, (rows - start + 1) // 2)
-        active_a = width
-        wi_a = pl.slice(window_indices, [active_a, WINDOW_KEYS], [start, 0])
-        ci_a = pl.slice(compressed_indices, [active_a, INDEX_TOPK], [start, 0])
-        query_a = pl.slice(query, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
-        output_a = pl.slice(output, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
-        selected_a, combined_a, gathered_a = gather_packed(
-            window, window_scale, compressed, compressed_scale,
-            wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32, name_hint=gather_name,
-        )
-        done_a = _attend_cohort(
-            query_a, selected_a, combined_a, sink, output_a, 0, active_a, gathered_a, name_hint=attn_name,
-        )
-        if start + width < rows:
-            active_b = pl.min(PACKED_COHORT_TILE, rows - start - width)
-            wi_b = pl.slice(window_indices, [active_b, WINDOW_KEYS], [start + width, 0])
-            ci_b = pl.slice(compressed_indices, [active_b, INDEX_TOPK], [start + width, 0])
-            query_b = pl.slice(query, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
-            output_b = pl.slice(output, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
-            selected_b, combined_b, gathered_b = gather_packed(
-                window, window_scale, compressed, compressed_scale,
-                wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32, name_hint=gather_name,
-            )
-            done_b = _attend_cohort(
-                query_b, selected_b, combined_b, sink, output_b, 0, active_b, gathered_b, name_hint=attn_name,
-            )
-    complete = pl.system.task_dummy(deps=[done_a, done_b])
-    return complete
+def _make_attend_packed_cohorts(cohort_rows=PACKED_COHORT_TILE, max_attend_workers=32):
+    attend_cohort = make_attend_selected_chunk(
+        vector_query=TP_SIZE != 1, selected_rows=cohort_rows, max_workers=max_attend_workers,
+    )
 
+    @pl.jit.inline(auto_scope=False)
+    def attend_packed_cohorts(
+        query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+        window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+        window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+        compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+        compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+        compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+        sink: pl.Tensor[[LOCAL_H], pl.FP32],
+        output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+        rows: pl.Scalar[pl.INT32],
+        source_ready: pl.Scalar[pl.TASK_ID],
+        gather_name: pl.constexpr,
+        attn_name: pl.constexpr,
+    ):
+        selected_a = pl.create_tensor([cohort_rows, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
+        selected_b = pl.create_tensor([cohort_rows, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
+        combined_a = pl.create_tensor([cohort_rows, SELECTED_KEYS], dtype=pl.INT32)
+        combined_b = pl.create_tensor([cohort_rows, SELECTED_KEYS], dtype=pl.INT32)
+        done_a = source_ready
+        done_b = source_ready
+        for start in pl.range(0, rows, 2 * cohort_rows):
+            width = pl.min(cohort_rows, (rows - start + 1) // 2)
+            active_a = width
+            wi_a = pl.slice(window_indices, [active_a, WINDOW_KEYS], [start, 0])
+            ci_a = pl.slice(compressed_indices, [active_a, INDEX_TOPK], [start, 0])
+            query_a = pl.slice(query, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
+            output_a = pl.slice(output, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
+            selected_a, combined_a, gathered_a = gather_packed(
+                window, window_scale, compressed, compressed_scale,
+                wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32, name_hint=gather_name,
+            )
+            done_a = attend_cohort(
+                query_a, selected_a, combined_a, sink, output_a, 0, active_a, gathered_a, name_hint=attn_name,
+            )
+            if start + width < rows:
+                active_b = pl.min(cohort_rows, rows - start - width)
+                wi_b = pl.slice(window_indices, [active_b, WINDOW_KEYS], [start + width, 0])
+                ci_b = pl.slice(compressed_indices, [active_b, INDEX_TOPK], [start + width, 0])
+                query_b = pl.slice(query, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
+                output_b = pl.slice(output, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
+                selected_b, combined_b, gathered_b = gather_packed(
+                    window, window_scale, compressed, compressed_scale,
+                    wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32, name_hint=gather_name,
+                )
+                done_b = attend_cohort(
+                    query_b, selected_b, combined_b, sink, output_b, 0, active_b, gathered_b, name_hint=attn_name,
+                )
+        complete = pl.system.task_dummy(deps=[done_a, done_b])
+        return complete
+
+
+    return attend_packed_cohorts
+
+
+attend_packed_cohorts = _make_attend_packed_cohorts()
+_attend_packed_cohorts16 = _make_attend_packed_cohorts(cohort_rows=16, max_attend_workers=16)
+_attend_packed_cohorts24 = _make_attend_packed_cohorts(cohort_rows=24, max_attend_workers=16)
 
 @pl.jit(auto_scope=False)
 def l2_c2a_attention(
@@ -1981,6 +1992,20 @@ def l2_c2a_attention(
     if TP_SIZE == 1 and rows <= 12:
         source_ready = pl.system.task_dummy(deps=[])
         done = attend_packed_cohorts(
+            query, window_indices, window, window_scale, compressed_indices,
+            compressed, compressed_scale, sink, output, rows, source_ready,
+            gather_name="c2a_gather", attn_name="c2a_sparse_attn",
+        )
+    elif TP_SIZE == 1 and rows > 32 and rows <= 80:
+        source_ready = pl.system.task_dummy(deps=[])
+        done = _attend_packed_cohorts24(
+            query, window_indices, window, window_scale, compressed_indices,
+            compressed, compressed_scale, sink, output, rows, source_ready,
+            gather_name="c2a_gather", attn_name="c2a_sparse_attn",
+        )
+    elif TP_SIZE == 1 and rows <= 80:
+        source_ready = pl.system.task_dummy(deps=[])
+        done = _attend_packed_cohorts16(
             query, window_indices, window, window_scale, compressed_indices,
             compressed, compressed_scale, sink, output, rows, source_ready,
             gather_name="c2a_gather", attn_name="c2a_sparse_attn",
@@ -2450,7 +2475,7 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4, 8])
-    rows_help = "single sparse MLA row count (default: 1, 7, 12, 13; fixture/runtime replay: 7)"
+    rows_help = "single row count (default: 1, 7, 12, 13; TP1 C2A also 32, 33, 80; fixture/runtime replay: 7)"
     parser.add_argument("--rows", type=int, help=rows_help)
     mode_choices = ["packed", "bf16", "both", "c2a", "swa", "swa-packed", "swa-both", "all"]
     parser.add_argument("--mode", default="all", choices=mode_choices)
@@ -2473,10 +2498,13 @@ if __name__ == "__main__":
         _main_results = validate_swa_core(args)
     else:
         row_cases = [1, 7, 12, 13]
+        cohort_cases = (32, 33, 80)
         if args.rows is not None:
             row_cases = [args.rows]
         elif args.fixture or args.runtime_dir:
             row_cases = [7]
+        elif args.mode in ("all", "c2a") and TP_SIZE == 1:
+            row_cases.extend(cohort_cases)
         records = []
         for rows in row_cases:
             fixture = torch.load(args.fixture, weights_only=True) if args.fixture else None
@@ -2508,6 +2536,8 @@ if __name__ == "__main__":
             modes = ["packed", "bf16"] if args.mode in ("both", "all") else [args.mode]
             if args.mode == "all" and TP_SIZE == 1:
                 modes.append("c2a")
+            if args.rows is None and rows in cohort_cases:
+                modes = ["c2a"]
             for mode in modes:
                 reference_mode = "packed" if mode == "c2a" else mode
                 if fixture is None:
