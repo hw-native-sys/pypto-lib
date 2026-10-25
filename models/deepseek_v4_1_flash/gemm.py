@@ -167,6 +167,96 @@ def gemm_mxfp8_to_mxfp8(
 
 
 @pl.jit.inline(auto_scope=False)
+def gemm_mxfp8_to_mxfp8_m80_dual(
+    payload: pl.Tensor,
+    scale_backing: pl.Tensor,
+    weight_flat: pl.Tensor,
+    scale: pl.Tensor,
+    output: pl.Tensor,
+    output_scale: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    group: pl.Scalar[pl.INDEX],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    group_count: pl.constexpr,
+    pack_cols: pl.constexpr,
+):
+    """Project 80 rows and quantize M16/N128 shards on two AIVs."""
+    activation_scale = pl.tensor.view(scale_backing, [80, width // 32], layout=pl.MX_A_ZZ)
+    scale_group_size = (width // 32) * output_width
+    scale_backing_flat = pl.tensor.view(scale, [1, group_count * scale_group_size], layout=pl.ND)
+    scale_group_offset = (group * width) // 32 * output_width
+    scale_group_backing = pl.tensor.slice(scale_backing_flat, [1, scale_group_size], [0, scale_group_offset])
+    scale_group = pl.tensor.view(scale_group_backing, [width // 32, output_width], layout=pl.MX_B_NN)
+    blocks = output_width // n_tile
+    workers = pl.min(blocks, pl.system.available_cluster_count())
+    for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
+        block_num = pl.tile.get_block_num()
+        for ni in pl.range(0, output_width // n_tile):
+            if ni % block_num == worker:
+                n0 = ni * n_tile
+                a0 = pl.load(payload, [0, 0], [80, k_tile])
+                sa0 = pl.load(activation_scale, [0, 0], [80, k_tile // 32])
+                b0 = pl.load(weight_flat, [(group * width), n0], [k_tile, n_tile])
+                sb0 = pl.load(scale_group, [0, n0], [k_tile // 32, n_tile])
+                acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                for k0 in pl.pipeline(k_tile, width, k_tile, stage=2):
+                    a = pl.load(payload, [0, k0], [80, k_tile])
+                    sa = pl.load(activation_scale, [0, k0 // 32], [80, k_tile // 32])
+                    b = pl.load(weight_flat, [(group * width) + k0, n0], [k_tile, n_tile])
+                    sb = pl.load(scale_group, [k0 // 32, n0], [k_tile // 32, n_tile])
+                    acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                for shard_lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                    full_vector = pl.aiv_shard(acc)
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    for t0 in pl.range(0, 80, MX_M_TILE):
+                        rows = pl.min(MX_M_TILE, num_tokens - t0)
+                        acc_rows = pl.tile.slice(full_vector, [MX_M_TILE, 128], [t0, 0])
+                        rounded_value = pl.cast(acc_rows, pl.BF16, mode="rint")
+                        rounded = pl.set_validshape(rounded_value, rows, 128)
+                        source = pl.fillpad(rounded, pad_value=pl.PadValue.zero)
+                        source = pl.set_validshape(source, MX_M_TILE, 128)
+                        source_fp32 = pl.cast(source, pl.FP32)
+                        groups = pl.reshape(source_fp32, [MX_M_TILE * (128 // 32), 32])
+                        reduce_tmp = pl.create_tile([MX_M_TILE * (128 // 32), 32], dtype=pl.FP32)
+                        magnitude = pl.abs(groups)
+                        maximum = pl.row_max(magnitude, tmp_tile=reduce_tmp)
+                        bits = pl.reinterpret_view(maximum, pl.INT32)
+                        biased_exponent = pl.shrs(bits, 23)
+                        scale_exponent = pl.sub(biased_exponent, 8)
+                        exponent = pl.maximum(scale_exponent, 0)
+                        negative_exponent = pl.mul(exponent, -1)
+                        reciprocal_exponent = pl.add(negative_exponent, 254)
+                        nonzero_exponent = pl.minimum(exponent, 1)
+                        reciprocal_code = pl.mul(reciprocal_exponent, nonzero_exponent)
+                        reciprocal_bits = pl.shls(reciprocal_code, 23)
+                        reciprocal = pl.reinterpret_view(reciprocal_bits, pl.FP32)
+                        normalized = pl.row_expand_mul(groups, reciprocal)
+                        normalized = pl.maximum(normalized, -448.0)
+                        normalized = pl.minimum(normalized, 448.0)
+                        payload_fp8 = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
+                        quantized_tile = pl.reshape(payload_fp8, [MX_M_TILE, 128])
+                        output_n = group * output_width + n0 + lane * 128
+                        output = pl.store(quantized_tile, [t0, output_n], output)
+                        sign_bit = pl.shrs(exponent, 7)
+                        sign_offset = pl.mul(sign_bit, 256)
+                        signed = pl.sub(exponent, sign_offset)
+                        signed_codes = pl.cast(signed, pl.INT8)
+                        codes = pl.reinterpret_view(signed_codes, pl.UINT8)
+                        flat = pl.reshape(codes, [1, MX_M_TILE * (128 // 32)])
+                        pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
+                        packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=pack_cols)
+                        packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
+                        packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (128 // 32)])
+                        scale_offset = t0 * (group_count * output_width // 32) + output_n // 32 * MX_M_TILE
+                        output_scale = pl.store(packed_flat, [0, scale_offset], output_scale)
+    return output, output_scale
+
+
+@pl.jit.inline(auto_scope=False)
 def gemm_bf16_via_mxfp8_to_bf16_staged(
     x: pl.Tensor,
     weight: pl.Tensor,
