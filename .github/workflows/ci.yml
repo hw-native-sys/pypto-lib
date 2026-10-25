@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   export-fixtures:
-    runs-on: [self-hosted, linux, cpu]
+    runs-on: [self-hosted, linux, x64, cpu]
     timeout-minutes: 60
     defaults:
       run:
