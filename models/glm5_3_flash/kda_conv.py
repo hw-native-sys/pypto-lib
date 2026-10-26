@@ -55,6 +55,8 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
+from models.glm5_3_flash.elementwise import accurate_silu
+
 from models.glm5_3_flash.config import B_DYN, KDA_CONV_K, KDA_DIM, KDA_STATE_DYN
 from models.glm5_3_flash.config import LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, Q_START_DYN, T_DYN
 
@@ -63,12 +65,8 @@ STATE_LEN = KDA_CONV_K - 1
 
 # tiling
 T_TILE = 16  # tokens per bulk task
-C_TILE = 512  # channels per bulk task: [16, 512] FP32 is 32 KiB, and four taps plus
-# the accumulator stay well inside UB
-
-
-def _silu_torch(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.sigmoid(x)
+C_TILE = 128  # Bounds the corrected SiLU working set alongside the FP32 tap sum
+DECODE_C_TILE = 128  # channels per decode convolution task
 
 
 def _conv_reference(
@@ -84,7 +82,10 @@ def _conv_reference(
     out = torch.zeros(length, stream.shape[1], dtype=torch.float32)
     for j in range(KDA_CONV_K):
         out += full[j : j + length] * weight[j].float()
-    return _silu_torch(out), full[length : length + STATE_LEN]
+    # causal_conv1d applies SiLU as one FP32 division before the BF16 output.
+    denominator = 1.0 + torch.exp(-out.double()).float()
+    activated = (out.double() / denominator.double()).float()
+    return activated, full[length : length + STATE_LEN]
 
 
 def golden_kda_conv_prefill(
@@ -183,8 +184,9 @@ def kda_conv_prefill(
                 acc = pl.add(acc, pl.col_expand_mul(pl.cast(tap, pl.FP32),
                                                     pl.cast(weight[j : j + 1, c0 : c0 + C_TILE],
                                                             pl.FP32)))
-            # SiLU, spelled out: the traced body takes only pl.* calls.
-            activated = pl.mul(acc, pl.recip(pl.add(pl.exp(pl.neg(acc)), 1.0)))
+            activation_input = pl.create_tensor([T_TILE, C_TILE], dtype=pl.FP32)
+            activation_input[:, :] = acc
+            activated = accurate_silu(activation_input, T_TILE, C_TILE)
             out_tile = pl.set_validshape(pl.cast(activated, pl.BF16, mode="rint"), rows, C_TILE)
             if c0 < LOCAL_KDA_QKV_DIM:
                 q_flat[p0 : p0 + T_TILE, c0 : c0 + C_TILE] = out_tile
@@ -257,9 +259,15 @@ def kda_conv_prefill(
 
             # SiLU and the masked stores, one row at a time. A request shorter than the
             # window leaves the later rows with zero valid rows, so nothing is written.
-            act0 = pl.mul(acc0, pl.recip(pl.add(pl.exp(pl.neg(acc0)), 1.0)))
-            act1 = pl.mul(acc1, pl.recip(pl.add(pl.exp(pl.neg(acc1)), 1.0)))
-            act2 = pl.mul(acc2, pl.recip(pl.add(pl.exp(pl.neg(acc2)), 1.0)))
+            input0 = pl.create_tensor([1, C_TILE], dtype=pl.FP32)
+            input1 = pl.create_tensor([1, C_TILE], dtype=pl.FP32)
+            input2 = pl.create_tensor([1, C_TILE], dtype=pl.FP32)
+            input0[:, :] = acc0
+            input1[:, :] = acc1
+            input2[:, :] = acc2
+            act0 = accurate_silu(input0, 1, C_TILE)
+            act1 = accurate_silu(input1, 1, C_TILE)
+            act2 = accurate_silu(input2, 1, C_TILE)
             v0 = pl.min(pl.max(length, 0), 1)
             v1 = pl.min(pl.max(length - 1, 0), 1)
             v2 = pl.min(pl.max(length - 2, 0), 1)
@@ -334,56 +342,43 @@ def kda_conv_decode(
     q_flat = pl.reshape(query, [t_dim, LOCAL_KDA_QKV_DIM])
     k_flat = pl.reshape(key, [t_dim, LOCAL_KDA_QKV_DIM])
     v_flat = pl.reshape(value, [t_dim, LOCAL_KDA_QKV_DIM])
-
-    # One token per row, so the window is the whole state plus this token and every
-    # index is a trace-time constant.
-    # A store whose source is a tile reshaped to two leading unit axes lowers to a
-    # tile with a single-element row, which ptoas rejects on its 32-byte row
-    # alignment. Addressing the pool through a flat view of the same buffer keeps
-    # the stored tile the shape the arithmetic already produced.
     cs2 = pl.reshape(conv_state, [pl.tensor.dim(conv_state, 0) * STATE_LEN, CONV_DIM])
-
-    with pl.spmd(t_dim * (CONV_DIM // C_TILE), name_hint="kda_conv_decode"):
+    with pl.spmd(t_dim * (CONV_DIM // DECODE_C_TILE), name_hint='kda_conv_decode'):
         task = pl.tile.get_block_idx()
-        lanes = CONV_DIM // C_TILE
+        lanes = CONV_DIM // DECODE_C_TILE
         t = task // lanes
-        c0 = (task % lanes) * C_TILE
+        c0 = task % lanes * DECODE_C_TILE
         row = pl.cast(pl.read(state_rows, [t]), pl.INDEX)
         srow = row * STATE_LEN
-
-        # Straight-line taps: a pl iterator's index is a Scalar, so it cannot drive
-        # the trace-time choice between the conv state and the incoming token.
-        st0 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 0, c0]), pl.FP32)
-        st1 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 1, c0]), pl.FP32)
-        st2 = pl.cast(pl.slice(cs2, [1, C_TILE], [srow + 2, c0]), pl.FP32)
-        xt = pl.cast(pl.slice(mixed_qkv, [1, C_TILE], [t, c0]), pl.FP32)
-        # Keep the same tap order as prefill's bulk/head paths and the golden.
-        w0 = pl.cast(weight[0:1, c0 : c0 + C_TILE], pl.FP32)
-        w1 = pl.cast(weight[1:2, c0 : c0 + C_TILE], pl.FP32)
-        w2 = pl.cast(weight[2:3, c0 : c0 + C_TILE], pl.FP32)
-        w3 = pl.cast(weight[3:4, c0 : c0 + C_TILE], pl.FP32)
-        p0 = pl.mul(st0, w0)
-        p1 = pl.mul(st1, w1)
-        p2 = pl.mul(st2, w2)
-        p3 = pl.mul(xt, w3)
-        acc = pl.add(p0, p1)
-        acc = pl.add(acc, p2)
-        acc = pl.add(acc, p3)
-        activated = pl.mul(acc, pl.recip(pl.add(pl.exp(pl.neg(acc)), 1.0)))
-        out_tile = pl.cast(activated, pl.BF16, mode="rint")
+        st0 = pl.cast(pl.slice(cs2, [1, DECODE_C_TILE], [srow + 0, c0]), pl.FP32)
+        st1 = pl.cast(pl.slice(cs2, [1, DECODE_C_TILE], [srow + 1, c0]), pl.FP32)
+        st2 = pl.cast(pl.slice(cs2, [1, DECODE_C_TILE], [srow + 2, c0]), pl.FP32)
+        xt = pl.cast(pl.slice(mixed_qkv, [1, DECODE_C_TILE], [t, c0]), pl.FP32)
+        acc_v1 = pl.cast(weight[0:1, c0:c0 + DECODE_C_TILE], pl.FP32)
+        acc_v2 = pl.mul(st0, acc_v1)
+        acc_v3 = pl.cast(weight[1:2, c0:c0 + DECODE_C_TILE], pl.FP32)
+        acc_v4 = pl.mul(st1, acc_v3)
+        acc_v5 = pl.add(acc_v2, acc_v4)
+        acc_v6 = pl.cast(weight[2:3, c0:c0 + DECODE_C_TILE], pl.FP32)
+        acc_v7 = pl.mul(st2, acc_v6)
+        acc_v8 = pl.cast(weight[3:4, c0:c0 + DECODE_C_TILE], pl.FP32)
+        acc_v9 = pl.mul(xt, acc_v8)
+        acc_v10 = pl.add(acc_v5, acc_v7)
+        acc = pl.add(acc_v10, acc_v9)
+        activation_arg_activated = pl.create_tensor([1, DECODE_C_TILE], dtype=pl.FP32)
+        activation_arg_activated[:, :] = acc
+        activated = accurate_silu(activation_arg_activated, 1, DECODE_C_TILE)
+        out_tile = pl.cast(activated, pl.BF16, mode='rint')
         if c0 < LOCAL_KDA_QKV_DIM:
-            q_flat[t : t + 1, c0 : c0 + C_TILE] = out_tile
+            q_flat[t:t + 1, c0:c0 + DECODE_C_TILE] = out_tile
         elif c0 < 2 * LOCAL_KDA_QKV_DIM:
-            k_flat[t : t + 1, c0 - LOCAL_KDA_QKV_DIM : c0 - LOCAL_KDA_QKV_DIM + C_TILE] = out_tile
+            k_flat[t:t + 1, c0 - LOCAL_KDA_QKV_DIM:c0 - LOCAL_KDA_QKV_DIM + DECODE_C_TILE] = out_tile
         else:
-            v_flat[t : t + 1, c0 - 2 * LOCAL_KDA_QKV_DIM : c0 - 2 * LOCAL_KDA_QKV_DIM + C_TILE] = out_tile
-
-        # Shift the window: every source row is read above, before any is overwritten.
-        cs2[srow : srow + 1, c0 : c0 + C_TILE] = pl.cast(st1, pl.BF16, mode="rint")
-        cs2[srow + 1 : srow + 2, c0 : c0 + C_TILE] = pl.cast(st2, pl.BF16, mode="rint")
-        cs2[srow + 2 : srow + 3, c0 : c0 + C_TILE] = pl.slice(mixed_qkv, [1, C_TILE], [t, c0])
-
-    return query, key, value, conv_state
+            v_flat[t:t + 1, c0 - 2 * LOCAL_KDA_QKV_DIM:c0 - 2 * LOCAL_KDA_QKV_DIM + DECODE_C_TILE] = out_tile
+        cs2[srow:srow + 1, c0:c0 + DECODE_C_TILE] = pl.cast(st1, pl.BF16, mode='rint')
+        cs2[srow + 1:srow + 2, c0:c0 + DECODE_C_TILE] = pl.cast(st2, pl.BF16, mode='rint')
+        cs2[srow + 2:srow + 3, c0:c0 + DECODE_C_TILE] = pl.slice(mixed_qkv, [1, DECODE_C_TILE], [t, c0])
+    return (query, key, value, conv_state)
 
 
 __all__ = [

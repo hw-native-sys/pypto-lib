@@ -55,24 +55,17 @@ if __package__ in (None, ""):
 
 import pypto.language as pl
 import torch
-import torch.nn.functional as F
 
-from models.glm5_3_flash.config import D, FLASH, KV_LORA, LOCAL_H, QK_DIM, Q_LORA, T_DYN, V_DIM
+from models.glm5_3_flash.config import D, KV_LORA, LOCAL_H, QK_DIM, Q_LORA, T_DYN, V_DIM
+from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
 from models.glm5_3_flash.golden import rms_norm
-
-EPS = FLASH.rms_norm_eps
+from models.glm5_3_flash.rmsnorm import rmsnorm
 
 MM_T_TILE = 16          # cube M tile; rows are a 16-row boxed tile
-RMS_T_TILE = 8          # rms-norm token tile
-RMS_K_TILE = 256        # rms-norm reduction chunk
 QA_N_TILE = 128         # q_a_proj output-column tile
-QA_K_TILE = 256         # q_a_proj D reduction tile
 KVA_N_TILE = 128        # kv_a_proj output-column tile
-KVA_K_TILE = 256        # kv_a_proj D reduction tile
 QB_N_TILE = 128         # q_b_proj output-column tile
-QB_K_TILE = 256         # q_b_proj Q_LORA reduction tile
 ABSORB_N_TILE = 128     # absorb_query output-column tile
-ABSORB_K_TILE = 128     # absorb_query QK_DIM reduction tile
 
 
 def golden_mla_prolog(
@@ -90,10 +83,8 @@ def golden_mla_prolog(
 
     ``query`` is projected from the **rounded** ``q_resid`` rather than from an FP32
     intermediate: ``q_resid`` is also published to the indexer, and both consumers must
-    see the same rows. Each matmul accumulates in FP32 and rounds once, which is what a
-    kernel with an FP32 accumulator produces; a bit-exact comparison against
-    HuggingFace, which carries the activation in BF16 throughout, needs an all-BF16
-    variant instead.
+    see the same rows. The down-projections round to BF16 before RMSNorm,
+    and normalization preserves the BF16 boundary before the gamma product.
 
     Args:
         x: ``[T, D]`` packed hidden states.
@@ -109,10 +100,12 @@ def golden_mla_prolog(
         ``[T, KV_LORA]``, all in ``x``'s dtype.
     """
     dtype = x.dtype
-    q_resid = rms_norm(F.linear(x.float(), w_q_a.float()), q_a_norm_weight).to(dtype)
+    q_a = golden_bf16_linear(x, w_q_a).to(dtype)
+    kv_a = golden_bf16_linear(x, w_kv_a).to(dtype)
+    q_resid = rms_norm(q_a, q_a_norm_weight)
+    kv_latent = rms_norm(kv_a, kv_a_norm_weight)
     heads = w_q_b.shape[0] // QK_DIM
-    query = F.linear(q_resid.float(), w_q_b.float()).unflatten(-1, (heads, QK_DIM)).to(dtype)
-    kv_latent = rms_norm(F.linear(x.float(), w_kv_a.float()), kv_a_norm_weight).to(dtype)
+    query = golden_bf16_linear(q_resid, w_q_b).to(dtype).unflatten(-1, (heads, QK_DIM))
     return q_resid, query, kv_latent
 
 
@@ -130,146 +123,52 @@ def mla_prolog(
 ):
     """Project one packed token batch into ``q_resid``, ``query`` and ``kv_latent``.
 
-    Five scopes: ``q_a_proj`` and ``kv_a_proj`` reduce over D, their norms fold the
-    FP32 accumulation down to BF16, and ``q_b_proj`` reads the published ``q_resid``
+    The down-projections reduce over D and publish BF16 before their norms.
+    ``q_b_proj`` reads the published ``q_resid``
     back so the indexer and the attention see the same rounded rows.
 
-    Every weight is stored ``[out, in]`` and consumed with ``b_trans=True``, so the
-    GM->L1 load of each ``[N_TILE, K_TILE]`` fragment is K-contiguous.
-
-    The token (M) loop sits inside each block so a weight fragment is read once per
-    block. No split-K: ``Q_LORA // QA_N_TILE`` is 12 blocks against 24 AIC, and the
-    seeded atomic-add that a split would need costs a full zeroing pass over the
-    FP32 intermediate. Raising occupancy — split-K here, or a prefill-specific M
-    tile — is the first tuning lever once a profile exists.
+    Every weight is stored ``[out, in]`` and consumed with ``b_trans=True``.
+    Compensated FP32 dot products preserve the BF16 projection rounding before
+    normalization and before the query is published.
 
     Returns the three outputs so the caller can chain them.
     """
     t_dim = pl.tensor.dim(x, 0)
     t_mm = ((t_dim + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
-
-    q_a_fp32 = pl.create_tensor([t_mm, Q_LORA], dtype=pl.FP32)
+    q_a = pl.create_tensor([t_dim, Q_LORA], dtype=pl.BF16)
     for qa_idx in pl.spmd(Q_LORA // QA_N_TILE, name_hint="mla_q_a_proj"):
         n0 = qa_idx * QA_N_TILE
         for tc in pl.range(t_mm // MM_T_TILE):
             t0 = tc * MM_T_TILE
-            valid_rows = pl.min(MM_T_TILE, t_dim - t0)
-            acc = pl.create_tensor([MM_T_TILE, QA_N_TILE], dtype=pl.FP32)
-            for kb in pl.pipeline(D // QA_K_TILE, stage=2):
-                k0 = kb * QA_K_TILE
-                x_tile = pl.slice(
-                    x, [MM_T_TILE, QA_K_TILE], [t0, k0], valid_shape=[valid_rows, QA_K_TILE]
-                )
-                w_tile = w_q_a[n0 : n0 + QA_N_TILE, k0 : k0 + QA_K_TILE]
-                acc = pl.matmul_acc(acc, x_tile, w_tile, b_trans=True, init_cond=(kb == 0))
-            q_a_fp32[t0 : t0 + MM_T_TILE, n0 : n0 + QA_N_TILE] = acc
-
-    for qn_idx in pl.spmd((t_dim + RMS_T_TILE - 1) // RMS_T_TILE, name_hint="mla_q_a_norm"):
-        t0 = qn_idx * RMS_T_TILE
-        valid_rows = pl.min(RMS_T_TILE, t_dim - t0)
-        sq_sum = pl.tile.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
-        rms_tmp = pl.create_tile(
-            [RMS_T_TILE, RMS_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
-        )
-        for kb in pl.pipeline(Q_LORA // RMS_K_TILE, stage=2):
-            k0 = kb * RMS_K_TILE
-            chunk = pl.load(
-                q_a_fp32,
-                [t0, k0],
-                [RMS_T_TILE, RMS_K_TILE],
-                valid_shape=[valid_rows, RMS_K_TILE],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(chunk, chunk), rms_tmp), [1, RMS_T_TILE]))
-        rsqrt_tmp = pl.create_tile([1, RMS_T_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-        inv_rms = pl.tile.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / Q_LORA), EPS), rsqrt_tmp)
-        inv_rms_t = pl.reshape(inv_rms, [RMS_T_TILE, 1])
-        for kb in pl.pipeline(Q_LORA // RMS_K_TILE, stage=2):
-            k0 = kb * RMS_K_TILE
-            chunk = pl.load(
-                q_a_fp32,
-                [t0, k0],
-                [RMS_T_TILE, RMS_K_TILE],
-                valid_shape=[valid_rows, RMS_K_TILE],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            gamma_bf16 = pl.load(q_a_norm_weight, [k0], [RMS_K_TILE], target_memory=pl.MemorySpace.Vec)
-            gamma = pl.reshape(pl.cast(gamma_bf16, target_type=pl.FP32), [1, RMS_K_TILE])
-            normed = pl.col_expand_mul(pl.row_expand_mul(chunk, inv_rms_t), gamma)
-            normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
-            pl.store(pl.set_validshape(normed_bf16, valid_rows, RMS_K_TILE), [t0, k0], q_resid)
+            rows = pl.min(MM_T_TILE, t_dim - t0)
+            acc = bf16_linear(x, w_q_a, t0, n0, rows, pl.cast(QA_N_TILE, pl.INDEX), MM_T_TILE, QA_N_TILE, D, True)
+            pl.assemble(q_a, pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, QA_N_TILE), [t0, n0])
+    rmsnorm(q_a, q_a_norm_weight, q_resid)
 
     query_flat = pl.reshape(query, [t_dim, LOCAL_H * QK_DIM])
     for qb_idx in pl.spmd((LOCAL_H * QK_DIM) // QB_N_TILE, name_hint="mla_q_b_proj"):
         n0 = qb_idx * QB_N_TILE
         for tc in pl.range(t_mm // MM_T_TILE):
             t0 = tc * MM_T_TILE
-            valid_rows = pl.min(MM_T_TILE, t_dim - t0)
-            acc = pl.create_tensor([MM_T_TILE, QB_N_TILE], dtype=pl.FP32)
-            for kb in pl.pipeline(Q_LORA // QB_K_TILE, stage=2):
-                k0 = kb * QB_K_TILE
-                q_tile = pl.slice(
-                    q_resid, [MM_T_TILE, QB_K_TILE], [t0, k0], valid_shape=[valid_rows, QB_K_TILE]
-                )
-                w_tile = w_q_b[n0 : n0 + QB_N_TILE, k0 : k0 + QB_K_TILE]
-                acc = pl.matmul_acc(acc, q_tile, w_tile, b_trans=True, init_cond=(kb == 0))
-            query_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            query_flat = pl.assemble(
-                query_flat, pl.set_validshape(query_bf16, valid_rows, QB_N_TILE), [t0, n0]
+            rows = pl.min(MM_T_TILE, t_dim - t0)
+            acc = bf16_linear(
+                q_resid, w_q_b, t0, n0, rows,
+                pl.cast(QB_N_TILE, pl.INDEX), MM_T_TILE, QB_N_TILE, Q_LORA, True,
             )
+            value = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, QB_N_TILE)
+            pl.assemble(query_flat, value, [t0, n0])
 
-    kv_a_fp32 = pl.create_tensor([t_mm, KV_LORA], dtype=pl.FP32)
+    kv_a = pl.create_tensor([t_dim, KV_LORA], dtype=pl.BF16)
     for kv_idx in pl.spmd(KV_LORA // KVA_N_TILE, name_hint="mla_kv_a_proj"):
         n0 = kv_idx * KVA_N_TILE
         for tc in pl.range(t_mm // MM_T_TILE):
             t0 = tc * MM_T_TILE
-            valid_rows = pl.min(MM_T_TILE, t_dim - t0)
-            acc = pl.create_tensor([MM_T_TILE, KVA_N_TILE], dtype=pl.FP32)
-            for kb in pl.pipeline(D // KVA_K_TILE, stage=2):
-                k0 = kb * KVA_K_TILE
-                x_tile = pl.slice(
-                    x, [MM_T_TILE, KVA_K_TILE], [t0, k0], valid_shape=[valid_rows, KVA_K_TILE]
-                )
-                w_tile = w_kv_a[n0 : n0 + KVA_N_TILE, k0 : k0 + KVA_K_TILE]
-                acc = pl.matmul_acc(acc, x_tile, w_tile, b_trans=True, init_cond=(kb == 0))
-            kv_a_fp32[t0 : t0 + MM_T_TILE, n0 : n0 + KVA_N_TILE] = acc
-
-    for kvn_idx in pl.spmd((t_dim + RMS_T_TILE - 1) // RMS_T_TILE, name_hint="mla_kv_a_norm"):
-        t0 = kvn_idx * RMS_T_TILE
-        valid_rows = pl.min(RMS_T_TILE, t_dim - t0)
-        sq_sum = pl.tile.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
-        rms_tmp = pl.create_tile(
-            [RMS_T_TILE, RMS_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
-        )
-        for kb in pl.pipeline(KV_LORA // RMS_K_TILE, stage=2):
-            k0 = kb * RMS_K_TILE
-            chunk = pl.load(
-                kv_a_fp32,
-                [t0, k0],
-                [RMS_T_TILE, RMS_K_TILE],
-                valid_shape=[valid_rows, RMS_K_TILE],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(chunk, chunk), rms_tmp), [1, RMS_T_TILE]))
-        rsqrt_tmp = pl.create_tile([1, RMS_T_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-        inv_rms = pl.tile.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / KV_LORA), EPS), rsqrt_tmp)
-        inv_rms_t = pl.reshape(inv_rms, [RMS_T_TILE, 1])
-        for kb in pl.pipeline(KV_LORA // RMS_K_TILE, stage=2):
-            k0 = kb * RMS_K_TILE
-            chunk = pl.load(
-                kv_a_fp32,
-                [t0, k0],
-                [RMS_T_TILE, RMS_K_TILE],
-                valid_shape=[valid_rows, RMS_K_TILE],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            gamma_bf16 = pl.load(kv_a_norm_weight, [k0], [RMS_K_TILE], target_memory=pl.MemorySpace.Vec)
-            gamma = pl.reshape(pl.cast(gamma_bf16, target_type=pl.FP32), [1, RMS_K_TILE])
-            normed = pl.col_expand_mul(pl.row_expand_mul(chunk, inv_rms_t), gamma)
-            normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
-            pl.store(pl.set_validshape(normed_bf16, valid_rows, RMS_K_TILE), [t0, k0], kv_latent)
-
+            rows = pl.min(MM_T_TILE, t_dim - t0)
+            acc = bf16_linear(x, w_kv_a, t0, n0, rows, pl.cast(KVA_N_TILE, pl.INDEX), MM_T_TILE, KVA_N_TILE, D, True)
+            pl.assemble(kv_a, pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, KVA_N_TILE), [t0, n0])
+    rmsnorm(kv_a, kv_a_norm_weight, kv_latent)
     return q_resid, query, kv_latent
+
 
 
 @pl.jit
@@ -436,37 +335,36 @@ def absorb_query(
     """
     t_dim = pl.tensor.dim(query, 0)
     t_mm = ((t_dim + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
-    query_flat = pl.reshape(query, [t_dim, LOCAL_H * QK_DIM])
-    w_k_flat = pl.reshape(w_k, [LOCAL_H * QK_DIM, KV_LORA])
     absorbed_flat = pl.reshape(absorbed, [t_dim, LOCAL_H * KV_LORA])
-    for ab_idx in pl.spmd(LOCAL_H * (KV_LORA // ABSORB_N_TILE), name_hint="mla_absorb_query"):
-        head = ab_idx // (KV_LORA // ABSORB_N_TILE)
-        n0 = (ab_idx % (KV_LORA // ABSORB_N_TILE)) * ABSORB_N_TILE
-        for tc in pl.range(t_mm // MM_T_TILE):
-            t0 = tc * MM_T_TILE
-            valid_rows = pl.min(MM_T_TILE, t_dim - t0)
-            acc = pl.create_tensor([MM_T_TILE, ABSORB_N_TILE], dtype=pl.FP32)
-            for kb in pl.pipeline(QK_DIM // ABSORB_K_TILE, stage=2):
-                k0 = kb * ABSORB_K_TILE
-                q_tile = pl.slice(
-                    query_flat,
-                    [MM_T_TILE, ABSORB_K_TILE],
-                    [t0, head * QK_DIM + k0],
-                    valid_shape=[valid_rows, ABSORB_K_TILE],
-                )
-                w_tile = pl.slice(
-                    w_k_flat,
-                    [ABSORB_K_TILE, ABSORB_N_TILE],
-                    [head * QK_DIM + k0, n0],
-                )
-                acc = pl.matmul_acc(acc, q_tile, w_tile, init_cond=(kb == 0))
-            absorbed_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            absorbed_flat = pl.assemble(
-                absorbed_flat,
-                pl.set_validshape(absorbed_bf16, valid_rows, ABSORB_N_TILE),
-                [t0, head * KV_LORA + n0],
+    for head in pl.range(LOCAL_H):
+        query_head = pl.create_tensor([t_dim, QK_DIM], dtype=pl.BF16)
+        weight_head = pl.create_tensor([QK_DIM, KV_LORA], dtype=pl.BF16)
+        for block in pl.spmd(t_mm // MM_T_TILE, name_hint="mla_query_head"):
+            t0 = block * MM_T_TILE
+            rows = pl.min(MM_T_TILE, t_dim - t0)
+            part = pl.slice(
+                query, [MM_T_TILE, 1, QK_DIM], [t0, head, 0],
+                valid_shape=[rows, 1, QK_DIM], drop_dims=[1],
             )
+            query_head[t0:t0 + MM_T_TILE, :] = part
+        for block in pl.spmd((QK_DIM // 128) * (KV_LORA // 128), name_hint="mla_key_head"):
+            k0 = (block // (KV_LORA // 128)) * 128
+            n0 = (block % (KV_LORA // 128)) * 128
+            weight_part = pl.slice(w_k, [1, 128, 128], [head, k0, n0], drop_dims=[0])
+            weight_head[k0:k0 + 128, n0:n0 + 128] = weight_part
+        for block in pl.spmd(KV_LORA // ABSORB_N_TILE, name_hint="mla_absorb_query"):
+            n0 = block * ABSORB_N_TILE
+            for tc in pl.range(t_mm // MM_T_TILE):
+                t0 = tc * MM_T_TILE
+                rows = pl.min(MM_T_TILE, t_dim - t0)
+                acc = bf16_linear(
+                    query_head, weight_head, t0, n0, rows,
+                    pl.cast(ABSORB_N_TILE, pl.INDEX), MM_T_TILE, ABSORB_N_TILE, QK_DIM, False,
+                )
+                value = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, ABSORB_N_TILE)
+                pl.assemble(absorbed_flat, value, [t0, head * KV_LORA + n0])
     return absorbed
+
 
 
 @pl.jit
@@ -524,7 +422,8 @@ def golden_absorb_query(query: torch.Tensor, w_k: torch.Tensor) -> torch.Tensor:
     """Fold the key half into the query so it attends against the raw latent.
 
     The exact identity ``q . K^T = (q @ w_k) . latent^T`` uses
-    ``K = latent @ w_k^T``. This reference multiplies in FP32, then rounds the absorbed
+    ``K = latent @ w_k^T``. This reference rounds an independent wide product to FP32,
+    then rounds the absorbed
     query to the input dtype. BF16 inputs therefore introduce an intermediate BF16
     rounding compared with an expanded FP32 key computation.
 
@@ -535,7 +434,7 @@ def golden_absorb_query(query: torch.Tensor, w_k: torch.Tensor) -> torch.Tensor:
     Returns:
         ``[T, H, KV_LORA]`` query in latent space, in ``query``'s dtype.
     """
-    absorbed = torch.einsum("thd,hdk->thk", query.float(), w_k.float())
+    absorbed = torch.einsum("thd,hdk->thk", query.double(), w_k.double()).float()
     return absorbed.to(query.dtype)
 
 

@@ -29,10 +29,10 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import D, KV_LORA, LOCAL_H, T_DYN, V_DIM
+from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
 
 MM_T_TILE = 16          # cube M tile; rows are a 16-row boxed tile
 O_N_TILE = 256          # o_proj output-column tile over D
-O_K_TILE = 256          # o_proj head-space reduction tile
 
 
 def golden_mla_epilog_prefill(
@@ -41,7 +41,7 @@ def golden_mla_epilog_prefill(
 ) -> torch.Tensor:
     """Head-space projection with the loader's prepared BF16 ``o_proj``."""
     flattened = attn_out.reshape(*attn_out.shape[:-2], -1)
-    return torch.nn.functional.linear(flattened.float(), w_o.float())
+    return golden_bf16_linear(flattened, w_o)
 
 
 def golden_mla_epilog_decode(
@@ -50,7 +50,7 @@ def golden_mla_epilog_decode(
 ) -> torch.Tensor:
     """The absorbed path: ``kv_b_proj``'s value half is folded in, so BF16."""
     flattened = attn_out.reshape(*attn_out.shape[:-2], -1)
-    return torch.nn.functional.linear(flattened.float(), w_o_absorbed.float())
+    return golden_bf16_linear(flattened, w_o_absorbed)
 
 
 @pl.jit.inline
@@ -79,14 +79,8 @@ def mla_epilog_prefill(
         for tc in pl.range(t_mm // MM_T_TILE):
             t0 = tc * MM_T_TILE
             valid_rows = pl.min(MM_T_TILE, t_dim - t0)
-            acc = pl.create_tensor([MM_T_TILE, O_N_TILE], dtype=pl.FP32)
-            for kb in pl.pipeline((LOCAL_H * V_DIM) // O_K_TILE, stage=2):
-                k0 = kb * O_K_TILE
-                attn_tile = pl.slice(
-                    attn_flat, [MM_T_TILE, O_K_TILE], [t0, k0], valid_shape=[valid_rows, O_K_TILE]
-                )
-                w_tile = w_o[n0 : n0 + O_N_TILE, k0 : k0 + O_K_TILE]
-                acc = pl.matmul_acc(acc, attn_tile, w_tile, b_trans=True, init_cond=(kb == 0))
+            acc = bf16_linear(attn_flat, w_o, t0, n0, valid_rows,
+                              pl.cast(O_N_TILE, pl.INDEX), MM_T_TILE, O_N_TILE, LOCAL_H * V_DIM, True)
             output = pl.assemble(output, pl.set_validshape(acc, valid_rows, O_N_TILE), [t0, n0])
     return output
 
@@ -115,14 +109,8 @@ def mla_epilog_decode(
         for tc in pl.range(t_mm // MM_T_TILE):
             t0 = tc * MM_T_TILE
             valid_rows = pl.min(MM_T_TILE, t_dim - t0)
-            acc = pl.create_tensor([MM_T_TILE, O_N_TILE], dtype=pl.FP32)
-            for kb in pl.pipeline((LOCAL_H * KV_LORA) // O_K_TILE, stage=2):
-                k0 = kb * O_K_TILE
-                attn_tile = pl.slice(
-                    attn_flat, [MM_T_TILE, O_K_TILE], [t0, k0], valid_shape=[valid_rows, O_K_TILE]
-                )
-                w_tile = w_o_absorbed[n0 : n0 + O_N_TILE, k0 : k0 + O_K_TILE]
-                acc = pl.matmul_acc(acc, attn_tile, w_tile, b_trans=True, init_cond=(kb == 0))
+            acc = bf16_linear(attn_flat, w_o_absorbed, t0, n0, valid_rows,
+                              pl.cast(O_N_TILE, pl.INDEX), MM_T_TILE, O_N_TILE, LOCAL_H * KV_LORA, True)
             output = pl.assemble(output, pl.set_validshape(acc, valid_rows, O_N_TILE), [t0, n0])
     return output
 

@@ -83,7 +83,7 @@ def golden_tp_all_reduce(partials: torch.Tensor) -> torch.Tensor:
     """
     if partials.shape[0] != TP_SIZE:
         raise ValueError(f"expected {TP_SIZE} partials, got {partials.shape[0]}")
-    return partials.float().sum(dim=0).to(torch.bfloat16)
+    return partials.double().sum(dim=0).float().to(torch.bfloat16)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -143,12 +143,17 @@ def tp_all_reduce(
             row = tile // (D // TP_CHUNK)
             col = tile % (D // TP_CHUNK) * TP_CHUNK
             acc = pl.tile.full([1, TP_CHUNK], dtype=pl.FP32, value=0.0)
+            correction = pl.tile.full([1, TP_CHUNK], dtype=pl.FP32, value=0.0)
             for peer in pl.range(EP_SIZE):
                 peer_value = pld.tile.remote_load(
                     exchange, peer=group_base + peer, offsets=[row, col], shape=[1, TP_CHUNK],
                 )
-                acc = pl.add(acc, peer_value)
-            output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
+                updated = pl.add(acc, peer_value)
+                recovered = pl.sub(updated, acc)
+                error = pl.add(pl.sub(acc, pl.sub(updated, recovered)), pl.sub(peer_value, recovered))
+                correction = pl.add(correction, error)
+                acc = updated
+            output = pl.store(pl.cast(pl.add(acc, correction), pl.BF16, mode="rint"), [row, col], output)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_release", deps=[reduce_tid]) as release_tid:
         for peer in pl.range(EP_SIZE):
@@ -256,7 +261,7 @@ if __name__ == "__main__":
     torch.manual_seed(17)
     partials = torch.randn(TP_SIZE, 7, 5)
     reduced = golden_tp_all_reduce(partials)
-    torch.testing.assert_close(reduced, partials.float().sum(dim=0).to(torch.bfloat16))
+    torch.testing.assert_close(reduced, partials.double().sum(dim=0).float().to(torch.bfloat16))
 
     result = run(
         fn=l3_tp_all_reduce,

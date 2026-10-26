@@ -452,6 +452,35 @@ def _ordered_args(
     return args
 
 
+def _l3_host_layout_views(
+    compiled: Any,
+    specs: list[TensorSpec | ScalarSpec],
+    tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Expose packed NZ host buffers in the shape used by host orchestration.
+
+    Keep the logical tensors for the golden and validation. These views alias
+    their storage, so writes through an Out/InOut view still reach that tensor.
+    """
+    metadata_getter = getattr(compiled, "_get_metadata", None)
+    if not callable(metadata_getter):
+        return {}
+    metadata = metadata_getter()
+    if not isinstance(metadata, tuple) or len(metadata) != 3:
+        return {}
+    from pypto.ir.param_info import arg_shape_as_declared
+
+    param_infos, _, _ = metadata
+    views = {}
+    for spec, info in zip(specs, param_infos, strict=True):
+        if isinstance(spec, TensorSpec) and not spec.is_resident and getattr(info, "layout", None) == "NZ":
+            value = tensors[spec.name]
+            if info.shape is not None and _matches_abi_shape(info.shape, value.shape):
+                continue
+            views[spec.name] = value.view(arg_shape_as_declared(value.shape, info))
+    return views
+
+
 def _dispatch(
     compiled: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -466,8 +495,10 @@ def _dispatch(
     differ only in scalar marshalling — L3 reads args through the fork-inherited
     shared mapping and takes Python scalars, L2 takes ctypes.
     """
+    l3 = _is_l3(compiled)
     ordered = _ordered_args(
-        specs, tensors, scalar_specs_eff, ctypes_scalars=not _is_l3(compiled)
+        specs, tensors, scalar_specs_eff, ctypes_scalars=not l3,
+        overrides=_l3_host_layout_views(compiled, specs, tensors) if l3 else None,
     )
     compiled(*ordered, config=cfg)
 
@@ -628,7 +659,10 @@ def _benchmark_and_report(
         # The forked workers read these buffers through the inherited mapping;
         # validation (already done) read the device outputs back from them.
         _share_in_place(tensors)
-    ordered = _ordered_args(specs, tensors, scalar_specs_eff, ctypes_scalars=not l3)
+    ordered = _ordered_args(
+        specs, tensors, scalar_specs_eff, ctypes_scalars=not l3,
+        overrides=_l3_host_layout_views(compiled, specs, tensors) if l3 else None,
+    )
     # Benchmarks model serving's steady-state dispatch: retain CommDomains
     # across rounds and let kernels clear their own signal windows.
     persistent = {"persistent": True, "reset_persistent_windows": False} if l3 else {}
@@ -951,6 +985,14 @@ def _abi_error(details: list[str]) -> ValueError:
     )
 
 
+def _matches_abi_shape(declared: Sequence[int], provided: Sequence[int]) -> bool:
+    """Match every declared dimension, with only -1 treated as dynamic."""
+    return len(declared) == len(provided) and all(
+        actual == -1 or actual == expected
+        for actual, expected in zip(declared, provided, strict=True)
+    )
+
+
 def _check_param_abi(param_infos: Any, specs: list[TensorSpec | ScalarSpec]) -> None:
     """Reject any drift between the artifact's parameters and *specs*.
 
@@ -1002,14 +1044,19 @@ def _check_param_abi(param_infos: Any, specs: list[TensorSpec | ScalarSpec]) -> 
                 )
         else:
             expected_shape = tuple(spec.shape)
+            # Metadata can retain the logical declaration or record lowered NZ.
+            # Preserve a logical match before translating to the blocked ABI.
+            if (
+                getattr(info, "layout", None) == "NZ"
+                and artifact_shape is not None
+                and not _matches_abi_shape(artifact_shape, expected_shape)
+            ):
+                from pypto.ir.param_info import arg_shape_as_declared
+
+                expected_shape = tuple(arg_shape_as_declared(spec.shape, info))
             if artifact_shape is None:
                 mismatches.append(f"{name}: expected tensor shape={expected_shape}, artifact is scalar")
-            elif len(artifact_shape) != len(expected_shape) or any(
-                artifact_dim != -1 and artifact_dim != expected_dim
-                for artifact_dim, expected_dim in zip(
-                    artifact_shape, expected_shape, strict=True
-                )
-            ):
+            elif not _matches_abi_shape(artifact_shape, expected_shape):
                 mismatches.append(
                     f"{name}: shape spec={expected_shape} artifact={artifact_shape}"
                 )
@@ -1257,7 +1304,8 @@ def _run_l3_resident(
                         resident_handles.append((s.name, handle, False, wid))
                 # Resident weights replace their host buffer in the arg list;
                 # everything else stays per-call IO / scalars.
-                resident_args = {name: handle for name, handle, _, _ in resident_handles}
+                resident_args = _l3_host_layout_views(compiled, specs, tensors)
+                resident_args.update({name: handle for name, handle, _, _ in resident_handles})
 
                 def _dispatch_args(benchmark_dispatch_index: int | None) -> list[Any]:
                     return _ordered_args(

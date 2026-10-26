@@ -252,7 +252,7 @@ def run_mla_prolog_goldens(golden_prolog, golden_split, golden_absorb_query, gol
     for name, value in (("q_resid", q_resid), ("query", query), ("kv_latent", kv_latent)):
         _check(value.dtype is torch.bfloat16, f"{name} dtype {value.dtype}")
     # The query must be the projection of the published q_resid.
-    replayed = torch.nn.functional.linear(q_resid.float(), w_q_b.float())
+    replayed = (q_resid.double() @ w_q_b.double().t()).float()
     replayed = replayed.unflatten(-1, (heads, qk)).to(torch.bfloat16)
     _check(torch.equal(query, replayed), "query must be projected from the published q_resid")
 

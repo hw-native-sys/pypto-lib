@@ -31,6 +31,8 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 
+from models.glm5_3_flash.elementwise import accurate_sigmoid, accurate_divide
+
 from models.glm5_3_flash.config import D, FLASH, T_DYN
 from models.glm5_3_flash.golden import expert
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
@@ -147,7 +149,9 @@ def expert_shared(
                 if SWIGLU_LIMIT > 0.0:
                     gate_fp32 = pl.minimum(gate_fp32, SWIGLU_LIMIT)
                     up_fp32 = pl.maximum(pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_fp32)), 1.0))
+                gate_buffer = pl.create_tensor([SH_ROW_PAD, ACT_INTER_TILE], dtype=pl.FP32)
+                gate_buffer[:, :] = gate_fp32
+                sigmoid = accurate_sigmoid(gate_buffer, SH_ROW_PAD, ACT_INTER_TILE)
                 gated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
                 # A 1-row trailing block reads one scale row; re-widen its dummy
                 # second row so the store keeps its static slice. That row is
@@ -157,9 +161,18 @@ def expert_shared(
                 row_amax = pl.maximum(row_amax, chunk_amax)
                 h_fp32[row0 : row0 + SH_ROWS_PER_BLOCK, n0 : n0 + ACT_INTER_TILE] = gated[0:SH_ROWS_PER_BLOCK, :]
 
-            row_scale_q = pl.div(pl.full([1, SH_ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
+            amax_buffer = pl.create_tensor([1, SH_ROW_PAD], dtype=pl.FP32)
+            amax_buffer[:, :] = row_amax
+            numerator = pl.create_tensor([1, SH_ROW_PAD], dtype=pl.FP32)
+            numerator[:, :] = pl.full([1, SH_ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
+            row_scale_q = pl.create_tensor([1, SH_ROW_PAD], dtype=pl.FP32)
+            row_scale_q[:, :] = accurate_divide(numerator, amax_buffer)
+            one = pl.create_tensor([1, SH_ROW_PAD], dtype=pl.FP32)
+            one[:, :] = pl.full([1, SH_ROW_PAD], dtype=pl.FP32, value=1.0)
+            scale_dq_buffer = pl.create_tensor([1, SH_ROW_PAD], dtype=pl.FP32)
+            scale_dq_buffer[:, :] = accurate_divide(one, row_scale_q)
             row_scale_q_col = pl.reshape(row_scale_q, [SH_ROW_PAD, 1])
-            row_scale_dq_col = pl.reshape(pl.recip(row_scale_q), [SH_ROW_PAD, 1])
+            row_scale_dq_col = pl.reshape(scale_dq_buffer, [SH_ROW_PAD, 1])
             row_scale_dq = pl.row_expand(pl.full([SH_ROW_PAD, SH_ROW_PAD], dtype=pl.FP32, value=0.0), row_scale_dq_col)
             h_scale_dq[row0 : row0 + SH_ROWS_PER_BLOCK, :] = row_scale_dq[0:SH_ROWS_PER_BLOCK, :]
             for q_idx in pl.pipeline(0, MOE_INTER // QUANT_TILE, stage=1):
@@ -243,7 +256,7 @@ def golden_expert_shared_fn(tensors):
     if SWIGLU_LIMIT > 0:
         gate_v = gate_v.clamp(max=SWIGLU_LIMIT)
         up_v = up_v.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-    sigmoid = torch.reciprocal(torch.exp(-gate_v) + 1.0)
+    sigmoid = (1.0 / (torch.exp(-gate_v.double()).float() + 1.0).double()).float()
     h = (gate_v * sigmoid) * up_v
     h_i8, h_sd = quantize_per_token_int8(h)
     out_i = h_i8.to(torch.int32) @ w_down_i8.T

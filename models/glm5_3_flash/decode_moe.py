@@ -384,11 +384,17 @@ def moe_combine(
     with pl.spmd(T, name_hint="moe_ep_combine", deps=[wait_tid]) as _combine_tid:
         t = pl.tile.get_block_idx()
         acc = pl.full([1, D], dtype=pl.FP32, value=0.0)
+        correction = pl.full([1, D], dtype=pl.FP32, value=0.0)
         if t < active:
             for k in pl.range(TOPK):
                 slot = t * TOPK + k
-                acc = pl.add(acc, slot_out[slot : slot + 1, :])
-        y[t : t + 1, :] = acc
+                value = slot_out[slot : slot + 1, :]
+                updated = pl.add(acc, value)
+                recovered = pl.sub(updated, acc)
+                error = pl.add(pl.sub(acc, pl.sub(updated, recovered)), pl.sub(value, recovered))
+                correction = pl.add(correction, error)
+                acc = updated
+        y[t : t + 1, :] = pl.add(acc, correction)
 
     return y
 
@@ -590,7 +596,7 @@ def golden_routed_ep(tensors):
     # Stage 6: token sum of the TOPK slots.
     for r in range(N_RANKS):
         for t in range(num_tokens):
-            x_next[r, t] = slot_out[r, t * TOPK : (t + 1) * TOPK].sum(dim=0)
+            x_next[r, t] = slot_out[r, t * TOPK : (t + 1) * TOPK].double().sum(dim=0).float()
 
     return x_next
 

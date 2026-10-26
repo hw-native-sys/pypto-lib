@@ -37,8 +37,7 @@ Two details decide whether this matches the deployment numerics:
 
 ``beta`` leaves this kernel already sigmoided in FP32. vLLM-Ascend carries the raw
 logit into its recurrent kernel and sigmoids it there, but pre-computes the FP32
-sigmoid for its chunked path; doing it once here gives both paths the more accurate
-FP32 form and costs nothing.
+sigmoid for its chunked path. Both paths here consume the same FP32 beta values.
 """
 
 import sys
@@ -53,32 +52,15 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import D, KDA_DIM, KDA_GATE_LOWER_BOUND, LOCAL_KDA_H
-from models.glm5_3_flash.config import LOCAL_KDA_QKV_DIM, T_DYN
+from models.glm5_3_flash.config import KDA_DIM, KDA_GATE_LOWER_BOUND, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, T_DYN, D
+from models.glm5_3_flash.elementwise import accurate_exp, accurate_sigmoid
+from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
 
 # tiling
 T_TILE = 16  # tokens per task
-N_TILE = min(512, LOCAL_KDA_QKV_DIM)  # projected channels per task
-# L1 holds 512 KiB with the first 64 KiB reserved for the cross-core ring, and a
-# weight tile is double-buffered by the pipeline. At K_TILE 128 one [512, 128] BF16
-# tile is 128 KiB, so a single 512-wide lane fits with room to spare; three lanes in
-# one pipeline, or K_TILE 512, do not. q/k/v therefore run as three separate
-# pipelines, and the three narrow projections share a fourth.
-K_TILE = 128
-# beta is one value per head: 4 at TP16 and 8 at TP8. Both the cube's N axis
-# and the store path want 16, so beta carries that padding in its own shape rather
-# than being narrowed on the way out: narrowing a wider tile down to four FP32
-# columns does not work here in any of its spellings -- a slice's valid_shape, a
-# pl.set_validshape and pl.store's explicit extent all leave the store writing the
-# tile's full row, which spills each token's gate into the next three. Columns at and
-# above LOCAL_KDA_H are unused; at TP4, where LOCAL_KDA_H is already 16, there is no
-# padding at all.
-BETA_PAD = 16
-# Padding rows to zero. Kept for the archived probe kit (logs_t16/relay_j.py
-# imports it); since the pad rows moved into one unrolled task this count no
-# longer sizes a region: at TP4, where LOCAL_KDA_H already reaches BETA_PAD,
-# the unrolled loop simply writes no zero rows.
-B_ZERO_TASKS = max(BETA_PAD - LOCAL_KDA_H, 1)
+# Per-head gates use cube-aligned storage at every supported TP degree.
+BETA_PAD = ((LOCAL_KDA_H + 15) // 16) * 16
+N_TILE = min(256, LOCAL_KDA_QKV_DIM)
 
 
 def golden_kda_projection(
@@ -100,11 +82,10 @@ def golden_kda_projection(
     the delta rule exponentiates it, this function does not.
     """
     tokens = x.shape[0]
-    xf = x.float()
 
     def linear_bf16(inp: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        # BF16 nn.Linear: FP32 accumulate, BF16 result.
-        return (inp.float() @ weight.float().t()).to(torch.bfloat16)
+        # FP32 dot products followed by the BF16 projection boundary.
+        return golden_bf16_linear(inp, weight).to(torch.bfloat16)
 
     q = linear_bf16(x, w_q)
     k = linear_bf16(x, w_k)
@@ -113,21 +94,19 @@ def golden_kda_projection(
 
     f_a = linear_bf16(x, w_f_a)
     g_raw = linear_bf16(f_a, w_f_b).float().view(tokens, LOCAL_KDA_H, KDA_DIM)
-    decay_rate = torch.exp(a_log.float()).view(1, LOCAL_KDA_H, 1)
-    decay = KDA_GATE_LOWER_BOUND * torch.sigmoid(
-        decay_rate * (g_raw + dt_bias.float().view(1, LOCAL_KDA_H, KDA_DIM))
-    )
+    decay_rate = torch.exp(a_log.double()).float().view(1, LOCAL_KDA_H, 1)
+    decay_logits = decay_rate * (g_raw + dt_bias.float().view(1, LOCAL_KDA_H, KDA_DIM))
+    decay = KDA_GATE_LOWER_BOUND * torch.reciprocal(1.0 + torch.exp(-decay_logits.double()).float())
 
     # beta carries the cube's 16-column padding. The padded rows of b_proj are zero,
     # so their gate is sigmoid(0) = 0.5 rather than 0; the reference reproduces that
     # instead of leaving a mismatch the caller would have to know to ignore.
     beta = torch.full((tokens, BETA_PAD), 0.5, dtype=torch.float32)
-    beta[:, :LOCAL_KDA_H] = torch.sigmoid(linear_bf16(x, w_b).float())
+    beta[:, :LOCAL_KDA_H] = torch.reciprocal(1.0 + torch.exp(-linear_bf16(x, w_b).double()).float())
 
     g_a = linear_bf16(x, w_g_a)
     out_gate = linear_bf16(g_a, w_g_b).view(tokens, LOCAL_KDA_H, KDA_DIM)
 
-    del xf
     return mixed_qkv, decay.float(), beta, out_gate
 
 
@@ -150,15 +129,15 @@ def kda_projection(
     out_gate: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x, 0)
+    tiles = (t_dim + T_TILE - 1) // T_TILE
+    t_pad = tiles * T_TILE
+    f_a_gm = pl.create_tensor([t_pad, KDA_DIM], dtype=pl.BF16)
+    g_a_gm = pl.create_tensor([t_pad, KDA_DIM], dtype=pl.BF16)
+    b_raw_gm = pl.create_tensor([t_pad, BETA_PAD], dtype=pl.BF16)
+    g_raw_gm = pl.create_tensor([t_pad, LOCAL_KDA_QKV_DIM], dtype=pl.BF16)
     decay_flat = pl.reshape(decay, [t_dim, LOCAL_KDA_QKV_DIM])
     out_gate_flat = pl.reshape(out_gate, [t_dim, LOCAL_KDA_QKV_DIM])
     dt_bias_row = pl.reshape(dt_bias, [1, LOCAL_KDA_QKV_DIM])
-
-    # b_proj emits one value per head, four at TP16, and the cube's N axis wants 16.
-    # Padding it with valid_shape is not enough: the accumulator then carries a valid
-    # width of 4 and is read back at that pitch, so each token's gates land four
-    # columns further along than they should. Materialising a zero-padded weight makes
-    # all 16 accumulator columns real, and the store is width-matched.
     w_b_pad = pl.create_tensor([BETA_PAD, D], dtype=pl.BF16)
     # composition-compat store form, numerics unchanged: one task builds every pad
     # row inside a pl.unroll body, so each w_b load carries a constant row offset.
@@ -167,7 +146,7 @@ def kda_projection(
     # poisons, s05/s12/s13 unrolled form is clean); kda_conv's unrolled weight
     # taps are the in-tree precedent. Rows at and above LOCAL_KDA_H take the same
     # zeros the b_zero pass used to write.
-    with pl.spmd(1, name_hint="kda_projection_b_pad") as b_pad_tid:
+    with pl.spmd(1, name_hint="kda_projection_b_pad") as pad_tid:
         zero = pl.tile.get_block_idx() * 0  # single task, block index zero
         for r in pl.unroll(BETA_PAD):
             if r < LOCAL_KDA_H + zero:
@@ -175,107 +154,74 @@ def kda_projection(
             else:
                 w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
-    tiles = (t_dim + T_TILE - 1) // T_TILE
-
-    with pl.spmd(tiles * (LOCAL_KDA_QKV_DIM // N_TILE), name_hint="kda_projection", deps=[b_pad_tid]):
+    with pl.spmd(tiles * (LOCAL_KDA_QKV_DIM // N_TILE), name_hint='kda_projection_qkv'):
         task = pl.tile.get_block_idx()
-        t0 = (task // (LOCAL_KDA_QKV_DIM // N_TILE)) * T_TILE
-        n0 = (task % (LOCAL_KDA_QKV_DIM // N_TILE)) * N_TILE
-        # The last block spills past t_dim; valid_shape zero-fills what it reads and
-        # set_validshape keeps the write inside the tensor.
+        t0 = task // (LOCAL_KDA_QKV_DIM // N_TILE) * T_TILE
+        n0 = task % (LOCAL_KDA_QKV_DIM // N_TILE) * N_TILE
         rows = pl.min(T_TILE, t_dim - t0)
-
-        # --- q | k | v: one pipeline each, so only one 512-wide weight is in flight ---
-        # Each lane seeds with pl.matmul rather than matmul_acc into a create_tensor.
-        # With a narrowed valid row count and N above one 16-wide fractal, mad writes
-        # at a pitch of ceil(rows/16)*16 while a non-compact accumulator is read back
-        # at its physical height, which skews every fractal past the first. Seeding
-        # with pl.matmul stamps the accumulator compact and keeps the two agreed.
-        x_head = pl.slice(x, [T_TILE, K_TILE], [t0, 0], valid_shape=[rows, K_TILE])
-
-        acc_q = pl.matmul(x_head, w_q[n0 : n0 + N_TILE, 0:K_TILE], pl.FP32, b_trans=True)
-        for kb in pl.pipeline(1, D // K_TILE, stage=2):
-            k0 = kb * K_TILE
-            acc_q = pl.matmul_acc(
-                acc_q, pl.slice(x, [T_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE]),
-                w_q[n0 : n0 + N_TILE, k0 : k0 + K_TILE], b_trans=True)
-        mixed_qkv[t0 : t0 + T_TILE, n0 : n0 + N_TILE] = pl.set_validshape(
-            pl.cast(acc_q, pl.BF16, mode="rint"), rows, N_TILE)
-
-        acc_k = pl.matmul(x_head, w_k[n0 : n0 + N_TILE, 0:K_TILE], pl.FP32, b_trans=True)
-        for kb in pl.pipeline(1, D // K_TILE, stage=2):
-            k0 = kb * K_TILE
-            acc_k = pl.matmul_acc(
-                acc_k, pl.slice(x, [T_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE]),
-                w_k[n0 : n0 + N_TILE, k0 : k0 + K_TILE], b_trans=True)
-        k_out = LOCAL_KDA_QKV_DIM + n0
-        mixed_qkv[t0 : t0 + T_TILE, k_out : k_out + N_TILE] = pl.set_validshape(
-            pl.cast(acc_k, pl.BF16, mode="rint"), rows, N_TILE)
-
-        acc_v = pl.matmul(x_head, w_v[n0 : n0 + N_TILE, 0:K_TILE], pl.FP32, b_trans=True)
-        for kb in pl.pipeline(1, D // K_TILE, stage=2):
-            k0 = kb * K_TILE
-            acc_v = pl.matmul_acc(
-                acc_v, pl.slice(x, [T_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE]),
-                w_v[n0 : n0 + N_TILE, k0 : k0 + K_TILE], b_trans=True)
-        v_out = 2 * LOCAL_KDA_QKV_DIM + n0
-        mixed_qkv[t0 : t0 + T_TILE, v_out : v_out + N_TILE] = pl.set_validshape(
-            pl.cast(acc_v, pl.BF16, mode="rint"), rows, N_TILE)
-
-        # --- the three narrow projections: both 128-wide bottlenecks and b_proj ---
-        f_a = pl.matmul(x_head, w_f_a[0:KDA_DIM, 0:K_TILE], pl.FP32, b_trans=True)
-        g_a = pl.matmul(x_head, w_g_a[0:KDA_DIM, 0:K_TILE], pl.FP32, b_trans=True)
-        acc_b = pl.matmul(x_head, w_b_pad[0:BETA_PAD, 0:K_TILE], pl.FP32, b_trans=True)
-        for kb in pl.pipeline(1, D // K_TILE, stage=2):
-            k0 = kb * K_TILE
-            x_slice = pl.slice(x, [T_TILE, K_TILE], [t0, k0], valid_shape=[rows, K_TILE])
-            f_a = pl.matmul_acc(f_a, x_slice, w_f_a[0:KDA_DIM, k0 : k0 + K_TILE], b_trans=True)
-            g_a = pl.matmul_acc(g_a, x_slice, w_g_a[0:KDA_DIM, k0 : k0 + K_TILE], b_trans=True)
-            acc_b = pl.matmul_acc(acc_b, x_slice, w_b_pad[0:BETA_PAD, k0 : k0 + K_TILE],
-                                  b_trans=True)
-
-        # Both bottlenecks are BF16 Linears upstream: round here, not after the second GEMM.
-        f_a_bf = pl.cast(f_a, pl.BF16, mode="rint")
-        g_a_bf = pl.cast(g_a, pl.BF16, mode="rint")
-
-        # --- forget gate: -5.0 * sigmoid(exp(A_log) * (f_b(f_a) + dt_bias)) ---
-        g_raw = pl.matmul(f_a_bf, w_f_b[n0 : n0 + N_TILE, 0:KDA_DIM], pl.FP32, b_trans=True)
-        # dt_bias is per channel, so it broadcasts down the token axis.
-        biased = pl.col_expand_add(pl.cast(pl.cast(g_raw, pl.BF16, mode="rint"), pl.FP32),
-                                   dt_bias_row[0:1, n0 : n0 + N_TILE])
-        # exp(A_log) is per head, so it scales a contiguous 128-channel block.
-        for h in pl.unroll(N_TILE // KDA_DIM):
-            c0 = h * KDA_DIM
-            head = n0 // KDA_DIM + h
-            # An explicit slice: `biased` carries `rows` valid rows, so a plain
-            # subview asking for T_TILE contradicts the inferred valid_row.
-            biased_h = pl.slice(biased, [T_TILE, KDA_DIM], [0, c0], valid_shape=[rows, KDA_DIM])
-            # exp(A_log[h]) as a tile. A_log has one value per head, and four FP32
-            # columns is a 16-byte tile row ptoas rejects -- widening the load past the
-            # tensor's 4 elements is rejected too, and pl.exp takes no Scalar. Multiply
-            # by zero and add the scalar to fill a correctly shaped tile instead.
-            a_fill = pl.add(pl.mul(biased_h, 0.0), pl.read(a_log, [head]))
-            scaled = pl.mul(biased_h, pl.exp(a_fill))
-            # sigmoid, spelled out: the traced body takes only pl.* calls.
-            gate_h = pl.recip(pl.add(pl.exp(pl.neg(scaled)), 1.0))
-            decay_col = n0 + c0
-            decay_flat[t0 : t0 + T_TILE, decay_col : decay_col + KDA_DIM] = pl.set_validshape(
-                pl.mul(gate_h, KDA_GATE_LOWER_BOUND), rows, KDA_DIM
-            )
-
-        # --- output gate: the raw g_b(g_a) logit; o_norm applies the sigmoid ---
-        out_raw = pl.matmul(g_a_bf, w_g_b[n0 : n0 + N_TILE, 0:KDA_DIM], pl.FP32, b_trans=True)
-        out_gate_flat[t0 : t0 + T_TILE, n0 : n0 + N_TILE] = pl.set_validshape(
-            pl.cast(out_raw, pl.BF16, mode="rint"), rows, N_TILE
-        )
-
-        # --- input gate: sigmoid(b_proj(x)), one value per head ---
-        # The upstream b_proj is a BF16 Linear, so its output rounds before the gate.
-        if n0 == 0:
-            logits = pl.cast(pl.cast(acc_b, pl.BF16, mode="rint"), pl.FP32)
-            beta[t0 : t0 + T_TILE, 0:BETA_PAD] = pl.set_validshape(
-                pl.recip(pl.add(pl.exp(pl.neg(logits)), 1.0)), rows, BETA_PAD)
-    return mixed_qkv, decay, beta, out_gate
+        acc_q = bf16_linear(x, w_q, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), T_TILE, N_TILE, D, True)
+        part_v1 = pl.cast(acc_q, pl.BF16, mode='rint')
+        mixed_qkv[t0:t0 + T_TILE, n0:n0 + N_TILE] = pl.set_validshape(part_v1, rows, N_TILE)
+        acc_k = bf16_linear(x, w_k, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), T_TILE, N_TILE, D, True)
+        part_v2 = pl.cast(acc_k, pl.BF16, mode='rint')
+        mixed_qkv[t0:t0 + T_TILE, LOCAL_KDA_QKV_DIM + n0:LOCAL_KDA_QKV_DIM + n0 + N_TILE] = pl.set_validshape(part_v2, rows, N_TILE)
+        acc_v = bf16_linear(x, w_v, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), T_TILE, N_TILE, D, True)
+        part_v3 = pl.cast(acc_v, pl.BF16, mode='rint')
+        mixed_qkv[t0:t0 + T_TILE, 2 * LOCAL_KDA_QKV_DIM + n0:2 * LOCAL_KDA_QKV_DIM + n0 + N_TILE] = pl.set_validshape(part_v3, rows, N_TILE)
+    with pl.spmd(tiles, name_hint='kda_projection_bottleneck', deps=[pad_tid]) as bottleneck_tid:
+        t0 = pl.tile.get_block_idx() * T_TILE
+        rows = pl.min(T_TILE, t_dim - t0)
+        f_a_v4 = pl.cast(0, pl.INDEX)
+        f_a_v5 = pl.cast(KDA_DIM, pl.INDEX)
+        f_a = bf16_linear(x, w_f_a, t0, f_a_v4, rows, f_a_v5, T_TILE, KDA_DIM, D, True)
+        f_a_gm[t0:t0 + T_TILE, :] = pl.set_validshape(pl.cast(f_a, pl.BF16, mode='rint'), rows, KDA_DIM)
+        g_a_v6 = pl.cast(0, pl.INDEX)
+        g_a_v7 = pl.cast(KDA_DIM, pl.INDEX)
+        g_a = bf16_linear(x, w_g_a, t0, g_a_v6, rows, g_a_v7, T_TILE, KDA_DIM, D, True)
+        g_a_gm[t0:t0 + T_TILE, :] = pl.set_validshape(pl.cast(g_a, pl.BF16, mode='rint'), rows, KDA_DIM)
+        b_raw_v8 = pl.cast(0, pl.INDEX)
+        b_raw_v9 = pl.cast(BETA_PAD, pl.INDEX)
+        b_raw = bf16_linear(x, w_b_pad, t0, b_raw_v8, rows, b_raw_v9, T_TILE, BETA_PAD, D, True)
+        part_v10 = pl.cast(b_raw, pl.BF16, mode='rint')
+        b_raw_gm[t0:t0 + T_TILE, :] = pl.set_validshape(part_v10, rows, BETA_PAD)
+    with pl.spmd(tiles * (LOCAL_KDA_QKV_DIM // N_TILE), name_hint='kda_projection_output', deps=[bottleneck_tid]) as output_tid:
+        task = pl.tile.get_block_idx()
+        t0 = task // (LOCAL_KDA_QKV_DIM // N_TILE) * T_TILE
+        n0 = task % (LOCAL_KDA_QKV_DIM // N_TILE) * N_TILE
+        rows = pl.min(T_TILE, t_dim - t0)
+        g_raw_v11 = pl.cast(N_TILE, pl.INDEX)
+        g_raw = bf16_linear(f_a_gm, w_f_b, t0, n0, rows, g_raw_v11, T_TILE, N_TILE, KDA_DIM, True)
+        part_v12 = pl.cast(g_raw, pl.BF16, mode='rint')
+        g_raw_gm[t0:t0 + T_TILE, n0:n0 + N_TILE] = pl.set_validshape(part_v12, rows, N_TILE)
+        out_raw_v13 = pl.cast(N_TILE, pl.INDEX)
+        out_raw = bf16_linear(g_a_gm, w_g_b, t0, n0, rows, out_raw_v13, T_TILE, N_TILE, KDA_DIM, True)
+        part_v14 = pl.cast(out_raw, pl.BF16, mode='rint')
+        out_gate_flat[t0:t0 + T_TILE, n0:n0 + N_TILE] = pl.set_validshape(part_v14, rows, N_TILE)
+    with pl.spmd((t_dim + 3) // 4 * (LOCAL_KDA_QKV_DIM // KDA_DIM), name_hint='kda_projection_decay', deps=[output_tid]):
+        task = pl.tile.get_block_idx()
+        t0 = task // (LOCAL_KDA_QKV_DIM // KDA_DIM) * 4
+        n0 = task % (LOCAL_KDA_QKV_DIM // KDA_DIM) * KDA_DIM
+        rows = pl.min(4, t_dim - t0)
+        g_part_v15 = pl.slice(g_raw_gm, [4, KDA_DIM], [t0, n0], valid_shape=[rows, KDA_DIM])
+        g_part = pl.cast(g_part_v15, pl.FP32)
+        biased = pl.col_expand_add(g_part, dt_bias_row[0:1, n0:n0 + KDA_DIM])
+        a_fill = pl.create_tensor([4, KDA_DIM], dtype=pl.FP32)
+        a_fill[:, :] = pl.add(pl.mul(biased, 0.0), pl.read(a_log, [n0 // KDA_DIM]))
+        rate = accurate_exp(a_fill)
+        scaled = pl.create_tensor([4, KDA_DIM], dtype=pl.FP32)
+        scaled[:, :] = pl.mul(biased, rate)
+        gate_h = accurate_sigmoid(scaled, 4, KDA_DIM)
+        part_v16 = pl.mul(gate_h, KDA_GATE_LOWER_BOUND)
+        decay_flat[t0:t0 + 4, n0:n0 + KDA_DIM] = pl.set_validshape(part_v16, rows, KDA_DIM)
+    with pl.spmd((t_dim + 7) // 8, name_hint='kda_projection_beta', deps=[bottleneck_tid]):
+        t0 = pl.tile.get_block_idx() * 8
+        rows = pl.min(8, t_dim - t0)
+        logits = pl.create_tensor([8, BETA_PAD], dtype=pl.FP32)
+        part_v17 = pl.slice(b_raw_gm, [8, BETA_PAD], [t0, 0], valid_shape=[rows, BETA_PAD])
+        logits[:, :] = pl.cast(part_v17, pl.FP32)
+        sigmoid = accurate_sigmoid(logits, 8, BETA_PAD)
+        beta[t0:t0 + 8, :] = pl.set_validshape(sigmoid, rows, BETA_PAD)
+    return (mixed_qkv, decay, beta, out_gate)
 
 
 __all__ = [

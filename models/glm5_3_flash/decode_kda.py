@@ -48,14 +48,15 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import KDA_DIM, KDA_STATE_DYN, LOCAL_KDA_H, T_DYN
-from models.glm5_3_flash.kda_projection import BETA_PAD
+from models.glm5_3_flash.elementwise import accurate_exp, accurate_sqrt, accurate_divide, accurate_row_sum
 from models.glm5_3_flash.golden import l2norm
+from models.glm5_3_flash.kda_projection import BETA_PAD
 
 L2_EPS = 1e-6
 Q_SCALE = KDA_DIM ** -0.5
 
 # tiling
-V_TILE = 64  # value rows per task: a [64, 128] FP32 slice is 32 KiB
+V_TILE = 16  # value rows per state-update task
 NORM_ROWS = 16  # (token, head) rows per normalisation task
 COL_REP = 16  # replication width used to turn a row into a legal column
 
@@ -84,12 +85,12 @@ def golden_decode_kda(
             v = value[t, h].float()  # [V]
             g = decay[t, h].float()  # [K]
             b = float(beta[t, h])
-            s = state[row, h] * torch.exp(g).unsqueeze(0)  # [V, K]
-            kv_mem = (s * k.unsqueeze(0)).sum(dim=-1)  # [V]
+            s = state[row, h] * torch.exp(g.double()).float().unsqueeze(0)  # [V, K]
+            kv_mem = (s * k.unsqueeze(0)).double().sum(dim=-1).float()  # [V]
             delta = (v - kv_mem) * b  # [V]
             s = s + delta.unsqueeze(-1) * k.unsqueeze(0)
             state[row, h] = s
-            out[t, h] = (s * q.unsqueeze(0)).sum(dim=-1)
+            out[t, h] = (s * q.unsqueeze(0)).double().sum(dim=-1).float()
     return out.to(query.dtype), state.to(recurrent_state.dtype)
 
 
@@ -106,96 +107,91 @@ def decode_kda(
 ):
     t_dim = pl.tensor.dim(query, 0)
     lanes = KDA_DIM // V_TILE
-    # A matmul result is logically one row but physically a whole M fractal, so it
-    # cannot be reshaped into the output's rank-3 view. Writing through a 2D view of
-    # the output keeps the store a plain 2D assignment, with the valid row declared.
     out_rows = pl.reshape(output, [t_dim, LOCAL_KDA_H * KDA_DIM])
     tasks = t_dim * LOCAL_KDA_H * lanes
-
-    # q and k are L2-normalised first, over a tall view with one row per (token, head).
-    # Doing it inside the main task would reduce a single [1, 128] row, and the [1, 1]
-    # result is a column of one FP32 -- four bytes, which is not a legal tile column.
-    # The taller tile also computes each norm once instead of once per value block.
     rows_total = t_dim * LOCAL_KDA_H
     norm_tiles = (rows_total + NORM_ROWS - 1) // NORM_ROWS
     q_rows = pl.reshape(query, [rows_total, KDA_DIM])
     k_rows = pl.reshape(key, [rows_total, KDA_DIM])
     qn_gm = pl.create_tensor([norm_tiles * NORM_ROWS, KDA_DIM], dtype=pl.FP32)
     kn_gm = pl.create_tensor([norm_tiles * NORM_ROWS, KDA_DIM], dtype=pl.FP32)
-    with pl.spmd(norm_tiles, name_hint="decode_kda_l2norm") as norm_tid:
+    with pl.spmd(norm_tiles, name_hint='decode_kda_l2norm') as norm_tid:
         r0 = pl.tile.get_block_idx() * NORM_ROWS
         rows = pl.min(NORM_ROWS, rows_total - r0)
-        qt = pl.cast(pl.slice(q_rows, [NORM_ROWS, KDA_DIM], [r0, 0],
-                              valid_shape=[rows, KDA_DIM]), pl.FP32)
-        kt = pl.cast(pl.slice(k_rows, [NORM_ROWS, KDA_DIM], [r0, 0],
-                              valid_shape=[rows, KDA_DIM]), pl.FP32)
-        # FLA adds eps inside the square root rather than clamping, and the a2a3
-        # reference uses rsqrt; both are matched here. q takes the 1/sqrt(d) scale.
-        qn_gm[r0 : r0 + NORM_ROWS, 0:KDA_DIM] = pl.mul(
-            pl.row_expand_mul(qt, pl.rsqrt(pl.add(pl.row_sum(pl.mul(qt, qt)), L2_EPS),
-                                           high_precision=True)), Q_SCALE)
-        kn_gm[r0 : r0 + NORM_ROWS, 0:KDA_DIM] = pl.row_expand_mul(
-            kt, pl.rsqrt(pl.add(pl.row_sum(pl.mul(kt, kt)), L2_EPS), high_precision=True))
-
-    # A store whose source is a tile reshaped to two leading unit axes lowers to a
-    # tile with a single-element row, which ptoas rejects on its 32-byte row
-    # alignment. Addressing the pool through a flat view of the same buffer keeps
-    # the stored tile the shape the arithmetic already produced.
-    state_2d = pl.reshape(
-        recurrent_state,
-        [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
-
-    with pl.spmd(tasks, name_hint="decode_kda", deps=[norm_tid]):
+        qt_v1 = pl.slice(q_rows, [NORM_ROWS, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
+        qt = pl.cast(qt_v1, pl.FP32)
+        kt_v2 = pl.slice(k_rows, [NORM_ROWS, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
+        kt = pl.cast(kt_v2, pl.FP32)
+        q_buffer = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
+        k_buffer = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
+        q_buffer[:, :] = qt
+        k_buffer[:, :] = kt
+        q_squared_norm = pl.create_tensor([NORM_ROWS, 1], dtype=pl.FP32)
+        k_squared_norm = pl.create_tensor([NORM_ROWS, 1], dtype=pl.FP32)
+        q_square = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
+        k_square = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
+        q_square[:, :] = pl.mul(q_buffer, q_buffer)
+        k_square[:, :] = pl.mul(k_buffer, k_buffer)
+        q_sum = accurate_row_sum(q_square)
+        k_sum = accurate_row_sum(k_square)
+        q_squared_norm[:, :] = pl.add(q_sum, L2_EPS)
+        k_squared_norm[:, :] = pl.add(k_sum, L2_EPS)
+        q_root = accurate_sqrt(q_squared_norm)
+        k_root = accurate_sqrt(k_squared_norm)
+        q_denominator = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
+        k_denominator = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
+        ones = pl.full([NORM_ROWS, KDA_DIM], dtype=pl.FP32, value=1.0)
+        q_denominator[:, :] = pl.row_expand_mul(ones, q_root)
+        k_denominator[:, :] = pl.row_expand_mul(ones, k_root)
+        q_unit = accurate_divide(q_buffer, q_denominator)
+        k_unit = accurate_divide(k_buffer, k_denominator)
+        qn_gm[r0:r0 + NORM_ROWS, :] = pl.mul(q_unit, Q_SCALE)
+        kn_gm[r0:r0 + NORM_ROWS, :] = k_unit
+    state_2d = pl.reshape(recurrent_state, [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
+    with pl.spmd(tasks, name_hint='decode_kda', deps=[norm_tid]):
         task = pl.tile.get_block_idx()
         t = task // (LOCAL_KDA_H * lanes)
-        h = (task // lanes) % LOCAL_KDA_H
-        v0 = (task % lanes) * V_TILE
+        h = task // lanes % LOCAL_KDA_H
+        v0 = task % lanes * V_TILE
         row = pl.cast(pl.read(state_rows, [t]), pl.INDEX)
-
         qk_row = t * LOCAL_KDA_H + h
-        q_row = qn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
-        k_row = kn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
-        # decay holds the log decay; the recurrence exponentiates it.
-        g_row = pl.exp(pl.reshape(
-            pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0]), [1, KDA_DIM]))
+        q_row = qn_gm[qk_row:qk_row + 1, 0:KDA_DIM]
+        k_row = kn_gm[qk_row:qk_row + 1, 0:KDA_DIM]
+        exp_buffer = pl.create_tensor([1, KDA_DIM], dtype=pl.FP32)
+        part_v3 = pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0])
+        exp_buffer[:, :] = pl.reshape(part_v3, [1, KDA_DIM])
+        g_row = accurate_exp(exp_buffer)
         beta_s = pl.read(beta, [t, h])
-
-        # This task owns value rows [v0, v0 + V_TILE) of one head's state.
         srow = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
         state_tile = pl.slice(state_2d, [V_TILE, KDA_DIM], [srow, 0])
-        # kv_mem is built as a column by a reduction, which is the shape the delta and
-        # the rank-1 update both want. A matmul would give it as a row, but a matmul
-        # result is logically one row and physically a whole M fractal, and that
-        # physical shape propagates into every op that touches it -- including through
-        # a GM round trip, which the compiler forwards.
         decayed = pl.col_expand_mul(state_tile, g_row)
-        kv_col = pl.row_sum(pl.col_expand_mul(decayed, k_row))  # [V_TILE, 1]
-        v_row = pl.cast(
-            pl.reshape(pl.slice(value, [1, 1, V_TILE], [t, h, v0], drop_dims=[0]),
-                       [1, V_TILE]), pl.FP32)
-        # value arrives as a row and is needed as a column. Transposing a row into a
-        # column is not expressible -- the result is row-major with a four-byte row --
-        # but a column is legal when a reduction produces it, so the row is broadcast
-        # down COL_REP rows, transposed the legal way round, summed and scaled back.
-        v_col = pl.mul(pl.row_sum(pl.transpose(pl.col_expand_mul(
-            pl.full([COL_REP, V_TILE], dtype=pl.FP32, value=1.0), v_row), 0, 1)),
-            1.0 / COL_REP)
-        delta_col = pl.mul(pl.sub(v_col, kv_col), beta_s)  # [V_TILE, 1]
-        # The rank-1 update delta (x) k, from the two broadcasts: a width-one cube
-        # contraction is not addressable.
-        updated = pl.add(decayed, pl.col_expand_mul(
-            pl.row_expand_mul(pl.full([V_TILE, KDA_DIM], dtype=pl.FP32, value=1.0), delta_col),
-            k_row))
-        state_2d[srow : srow + V_TILE, 0:KDA_DIM] = updated
-
-        # The output is the one place a matmul is right: its result feeds a store, so
-        # the fractal padding never reaches another operand.
-        out_row = pl.matmul(q_row, updated, pl.FP32, b_trans=True)  # [1, V_TILE]
+        kv_buffer = pl.create_tensor([V_TILE, KDA_DIM], dtype=pl.FP32)
+        kv_buffer[:, :] = pl.col_expand_mul(decayed, k_row)
+        kv_col = accurate_row_sum(kv_buffer)
+        v_row_v4 = pl.slice(value, [1, 1, V_TILE], [t, h, v0], drop_dims=[0])
+        v_row_v5 = pl.reshape(v_row_v4, [1, V_TILE])
+        v_row = pl.cast(v_row_v5, pl.FP32)
+        v_col_v6 = pl.full([COL_REP, V_TILE], dtype=pl.FP32, value=1.0)
+        v_col_v7 = pl.col_expand_mul(v_col_v6, v_row)
+        v_col_v8 = pl.transpose(v_col_v7, 0, 1)
+        v_col_v9 = pl.row_sum(v_col_v8)
+        v_col = pl.mul(v_col_v9, 1.0 / COL_REP)
+        delta_col = pl.mul(pl.sub(v_col, kv_col), beta_s)
+        updated_v10 = pl.full([V_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
+        updated_v11 = pl.row_expand_mul(updated_v10, delta_col)
+        updated_v12 = pl.col_expand_mul(updated_v11, k_row)
+        updated = pl.add(decayed, updated_v12)
+        state_2d[srow:srow + V_TILE, 0:KDA_DIM] = updated
+        # Keep the state/query dot product in the same FP32 reduction domain
+        # as the recurrent update.
+        out_products = pl.create_tensor([V_TILE, KDA_DIM], dtype=pl.FP32)
+        out_products[:, :] = pl.col_expand_mul(updated, q_row)
+        out_sum = accurate_row_sum(out_products)
+        out_row = pl.reshape(out_sum, [1, V_TILE])
         ocol = h * KDA_DIM + v0
-        out_rows[t : t + 1, ocol : ocol + V_TILE] = pl.set_validshape(
-            pl.cast(out_row, pl.BF16, mode="rint"), 1, V_TILE)
-
-    return output, recurrent_state
+        part_v13 = pl.cast(out_row, pl.BF16, mode='rint')
+        out_rows[t:t + 1, ocol:ocol + V_TILE] = pl.set_validshape(part_v13, 1, V_TILE)
+    return (output, recurrent_state)
 
 
 __all__ = [

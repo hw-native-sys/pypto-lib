@@ -4,7 +4,7 @@
 [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (`glm5_next`,
 `Glm5NextForConditionalGeneration`) on **Ascend a2a3**. It includes component
 kernels, Torch goldens, W8A8 checkpoint staging, composed MoE FFN entries,
-and resident prefill and incremental decode forwards.
+resident prefill and incremental decode forwards, and bounded decode validation.
 
 ## Why W8A8, and why a2a3 forces it
 
@@ -50,7 +50,7 @@ matches the published 320 B total, so the reconstruction above is complete.
 ## What differs from DeepSeek-V4, which is the nearest port in this repo
 
 `Glm5NextTextHyperConnection` subclasses `DeepseekV4HyperConnection` unchanged, so
-the mHC coefficient algebra is identical to `models/deepseek_v4_1_flash/mhc.py`.
+the mHC coefficient algebra is identical to `models/deepseek_v4_1_flash/hc.py`.
 Three things are not:
 
 - **The hyper-connection stream is BF16.** It is seeded by replicating the BF16
@@ -417,6 +417,82 @@ Use `--case tp_reduce` for the collective alone, or a local case such as
 python models/glm5_3_flash/lm_head.py -p a2a3 -d 0,1 --compile-only
 ```
 
+## Decode backbone validation
+
+`models/glm5_3_flash/decode_fwd.py` composes prepared BF16 embeddings into
+normalized hidden states. Layers 0–2 use KDA and Dense MLP; layer 3 uses DSA
+and MoE. Each sublayer has mHC processing and TP reduction. MoE dispatches the
+replicated batch from rank 0, runs EP experts, and restores replicated outputs.
+Embedding lookup, LM head, sampling, MTP and serving integration are outside
+this entry's scope.
+
+The fixture has 16 requests, four available layers, two decode steps and
+TP2/EP2. The default runs layer 0 only. State-row mappings vary between steps;
+cache pages use non-identity mappings. Convolution, recurrent and indexer state
+persist across the steps. Real-weight validation remains outside CI. The
+four-layer/four-step TP2/EP2 and 45-layer/two-step TP16/EP16 fixtures pass the
+independent propagated CPU golden on a2a3 hardware.
+
+Run with two allocated devices from the repository root:
+
+```bash
+# Default: one layer, two steps, independent CPU golden.
+PYTHONPATH=. python models/glm5_3_flash/decode_fwd.py -p a2a3 -d 0,1 --tp 2 --ep 2
+
+# Explicit four-layer propagation.
+PYTHONPATH=. python models/glm5_3_flash/decode_fwd.py -p a2a3 -d 0,1 --tp 2 --ep 2 --end-layer 4
+
+# Isolate the DSA/MoE layer using the prepared input fixture.
+PYTHONPATH=. python models/glm5_3_flash/decode_fwd.py -p a2a3 -d 0,1 --tp 2 --ep 2 --start-layer 3 --end-layer 4
+```
+
+`--start-layer` does not execute the omitted prefix. `--compile-only` compiles
+without using devices. `--dense-dtype bf16` selects the optional BF16 Dense
+path; the default uses dynamic W8A8 Dense and MoE operations.
+
+`--checkpoint /path/to/checkpoint` stages the published indexed W8A8 weights
+and checkpoint embeddings for token IDs starting at 2000. This fixture starts
+with empty caches and recurrent state and keeps each request's state row fixed
+across decode steps. It retains the independent reference and all existing
+precision gates. Use `--steps 4 --end-layer 4` to include pooled-cache writes
+in the real-weight fixture. `--golden-data` replays a saved input/reference
+snapshot, and `--runtime-dir` selects a compatible compiled artifact.
+
+The independent CPU golden preserves BF16 activation boundaries, INT8
+activation quantization, INT32 accumulation and persistent state updates.
+The reference rounds independent FP64 reductions, BF16 dot products and
+selected unaries to their FP32 operation boundaries. Device kernels use
+compensated FP32 arithmetic for KDA, MLA, mHC, TP and MoE reductions, then
+preserve the official BF16 activation boundaries. KDA convolution evaluates
+SiLU with one FP32 division before BF16 conversion. Dynamic quantization
+consumes the BF16 RMSNorm result. Sparse attention rounds each block's
+exponential weights to BF16 before PV while keeping the softmax denominator
+in FP32. CPU and device accumulation may still differ.
+
+`--validate-boundaries` additionally supports local diagnosis using captured
+sublayer inputs. It checks the surrounding mHC edges, final normalization,
+written cache rows and KDA states. TP replicas and untouched state rows must
+match exactly. This mode does not establish independent multilayer accuracy.
+The four trace fields are Attention output, FFN output, FFN input and normalized
+Attention input. Their buffers are separate to preserve asynchronous reads.
+
+The published-W8A8 fixture passes all nine output groups on a2a3 with 16
+requests: 45 layers and two continuous steps at TP16/EP16, and four layers
+and four continuous steps at TP2/EP2. The final-hidden outlier ratio is 0%
+at every tested step, below the unchanged 5% limit at `atol=rtol=0.02`.
+State/cache gates, untouched rows and replica equality also pass; the
+four-step case includes nonzero pooled-cache payload and scale writes.
+Dense and MoE retain native INT8 weights and INT32 GEMMs; attention weights
+are staged as BF16. These are correctness results; the compensated
+arithmetic has not been performance-benchmarked.
+
+Shared indexer kernels live in `indexer.py`; `decode_indexer.py` and
+`prefill_indexer.py` own their respective composition and validation. Decode's
+empty-owner path retains communication dependencies while skipping empty
+normalization and quantization work. GM view writes in MLA and sparse
+attention avoid loop-carried aliases. These changes are required by the
+composed execution path.
+
 ## What is quantized
 
 Activations are quantized **dynamically per token** the way the a2a3 W8A8 sibling
@@ -649,7 +725,7 @@ python models/glm5_3_flash/prefill_sparse_attn.py # [GOLDEN] PASS + device spars
 python models/glm5_3_flash/decode_sparse_attn.py  # [GOLDEN] PASS + device sparse decode
 ```
 
-`models/deepseek_v4_1_flash/mhc.py` is the worked example of a finished item: a
+`models/deepseek_v4_1_flash/hc.py` is the worked example of a finished item: a
 golden, the four kernel bodies, a `@pl.jit` test entry, `build_mhc_tensor_specs`
 and a precision comparison, in 559 lines. Read it for the shape, not for the
 kernels — its directory targets A5 in `.github/ci_platforms.json`, and

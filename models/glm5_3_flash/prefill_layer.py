@@ -46,7 +46,6 @@ if __name__ == "__main__" and not any(tok == "--ep" or tok.startswith("--ep=") f
 from models.glm5_3_flash.config import (
     D,
     EP_SIZE,
-    FLASH,
     HC_DIM,
     MIX_HC,
     N_EXPERTS,
@@ -244,8 +243,8 @@ def golden_prefill_layer(tensors):
     complete, so different ranks' token outputs are never summed together.
     """
     from models.glm5_3_flash.expert_shared import golden_expert_shared_fn
-    from models.glm5_3_flash.golden import gate as gate_ref, rms_norm
-    from models.glm5_3_flash.quantization import quantize_per_token_int8
+    from models.glm5_3_flash.golden import gate as gate_ref
+    from models.glm5_3_flash.rmsnorm import golden_rmsnorm_quant
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
@@ -255,20 +254,10 @@ def golden_prefill_layer(tensors):
     x_int8 = torch.zeros(N_RANKS, T, D, dtype=torch.int8)
     x_scale = torch.zeros(N_RANKS, T, 1, dtype=torch.float32)
     for r in range(N_RANKS):
-        x_norm = rms_norm(tensors["x_mixed"][r], tensors["norm_weight"][r])
+        x_norm, quantized, scale = golden_rmsnorm_quant(tensors["x_mixed"][r], tensors["norm_weight"][r])
         weights, indices = gate_ref(x_norm, tensors["gate_weight"][r], tensors["correction_bias"][r])
         route_weights[r], route_indices[r] = weights, indices
-        # Kernel-faithful INT8 view: gate.py quantizes ``xg = x * gamma`` in FP32
-        # (the deferred norm rides the dequant scale), while the natural reference
-        # quantizes the BF16-rounded normalized activation. The two differ by
-        # +/-1 LSB on rounding boundaries — the gate test tolerates that, but a
-        # composed ``y`` comparison amplifies it. Mirror the kernel so this test
-        # isolates the composition, not the quant boundary.
-        x_f = tensors["x_mixed"][r].float()
-        xg = x_f * tensors["norm_weight"][r].float()
-        inverse_rms = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + FLASH.rms_norm_eps)
-        x_i8, dequant = quantize_per_token_int8(xg)
-        x_int8[r], x_scale[r] = x_i8, dequant * inverse_rms
+        x_int8[r], x_scale[r] = quantized, scale
     if num_tokens < T:
         route_weights[:, num_tokens:] = 0
         route_indices[:, num_tokens:] = 0

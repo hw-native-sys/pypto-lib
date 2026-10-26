@@ -27,6 +27,7 @@ from golden.runner import (
     RunResult,
     _bench_loop_sizes,
     _format_stale_paths,
+    _l3_host_layout_views,
     normalize_config,
     _ordered_args,
     _prepare_inputs,
@@ -657,6 +658,61 @@ class TestCompileOnly:
 
 
 class TestJitCompilePath:
+    def test_l3_nz_host_view_preserves_golden_shape_and_output_storage(self, build_dir):
+        info = _l3_info("weight", shape=[2, 1, 2, 16, 32], dtype=torch.int8)
+        info.layout = "NZ"
+        spec = TensorSpec("weight", [2, 32, 32], torch.int8)
+        value = torch.zeros(spec.shape, dtype=spec.dtype)
+        module = types.ModuleType("pypto.ir.param_info")
+        module.arg_shape_as_declared = MagicMock(return_value=info.shape)
+        with patch.dict(sys.modules, {"pypto.ir.param_info": module}):
+            views = _l3_host_layout_views(_artifact(build_dir, info), [spec], {"weight": value})
+        assert tuple(views["weight"].shape) == tuple(info.shape)
+        views["weight"].fill_(7)
+        assert tuple(value.shape) == tuple(spec.shape)
+        assert torch.equal(value, torch.full(spec.shape, 7, dtype=spec.dtype))
+
+    def test_l3_nz_logical_metadata_keeps_host_shape(self, build_dir):
+        info = _l3_info("weight", shape=[2, 32, 32], dtype=torch.int8)
+        info.layout = "NZ"
+        spec = TensorSpec("weight", [2, 32, 32], torch.int8)
+        value = torch.zeros(spec.shape, dtype=spec.dtype)
+        module = types.ModuleType("pypto.ir.param_info")
+        module.arg_shape_as_declared = MagicMock()
+        with patch.dict(sys.modules, {"pypto.ir.param_info": module}):
+            views = _l3_host_layout_views(_artifact(build_dir, info), [spec], {"weight": value})
+        assert views == {}
+        module.arg_shape_as_declared.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("layout", "spec_shape", "artifact_shape", "accepted"),
+        [
+            ("NZ", [2, 1, 4096, 4096], [2, 128, 256, 16, 32], True),
+            ("NZ", [2, 1, 4096, 4096], [2, 64, 256, 16, 32], False),
+            (None, [2, 1, 4096, 4096], [2, 128, 256, 16, 32], False),
+            ("NZ", [4096, 4096], [4096, 4096], True),
+            ("NZ", [2, 1, 4096, 4096], [2, 1, 4096, 4096], True),
+            ("NZ", [2, 4096, 4096], [-1, 4096, 4096], True),
+        ],
+    )
+    def test_nz_abi_uses_declared_layout_normalization(self, build_dir, layout, spec_shape, artifact_shape, accepted):
+        info = _l3_info("weight", shape=artifact_shape, dtype=torch.int8)
+        info.layout = layout
+        specs = [TensorSpec("weight", spec_shape, torch.int8)]
+        normalized = MagicMock(return_value=[2, 128, 256, 16, 32])
+        module = types.ModuleType("pypto.ir.param_info")
+        module.arg_shape_as_declared = normalized
+        with _l3_abi_environment(), patch.dict(sys.modules, {"pypto.ir.param_info": module}):
+            if accepted:
+                _validate_compiled_spec_abi(_artifact(build_dir, info), specs)
+            else:
+                with pytest.raises(ValueError, match="compiled parameter ABI mismatch"):
+                    _validate_compiled_spec_abi(_artifact(build_dir, info), specs)
+        if layout == "NZ" and len(artifact_shape) == 5:
+            normalized.assert_called_once_with(specs[0].shape, info)
+        else:
+            normalized.assert_not_called()
+
     def test_marked_scalar_uses_signature_mode_and_runtime_marker(self, build_dir):
         compiled = _FakeCompiled(build_dir)
         fn = types.SimpleNamespace(compile=MagicMock(return_value=compiled))
@@ -1270,9 +1326,11 @@ class TestPlatformResolution:
         ],
     )
     def test_known_platforms(self, platform, expected_name):
+        from pypto.backend import BackendType
+
         cfg = normalize_config({"platform": platform})
         assert cfg.platform == platform
-        assert cfg.backend_type.name == expected_name
+        assert cfg.backend_type == getattr(BackendType, expected_name)
 
     def test_unknown_platform_raises_valueerror(self):
         with pytest.raises(ValueError, match="Invalid platform"):

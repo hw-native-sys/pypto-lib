@@ -53,7 +53,7 @@ if __name__ == "__main__" and not any(
 ):
     sys.argv += ["--ep", "2"]
 
-from models.glm5_3_flash.config import D, EP_SIZE, FLASH, HC_DIM, MIX_HC, N_EXPERTS, TOPK
+from models.glm5_3_flash.config import D, EP_SIZE, HC_DIM, MIX_HC, N_EXPERTS, TOPK
 from models.glm5_3_flash.gate import make_correction_bias, moe_gate
 from models.glm5_3_flash.decode_moe import (
     AUX_PAD,
@@ -105,8 +105,8 @@ def moe_layer_add(
     return y
 
 
-@pl.jit(auto_scope=False)
-def l2_decode_layer(
+@pl.jit.inline(auto_scope=False)
+def decode_mlp(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
@@ -119,7 +119,7 @@ def l2_decode_layer(
     shared_w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
     shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w_down_scale: pl.Tensor[[D], pl.FP32],
-    y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
+    y: pl.Tensor[[T, D], pl.FP32],
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
@@ -130,6 +130,7 @@ def l2_decode_layer(
     num_ranks: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
+    input_tid: pl.Scalar[pl.TASK_ID],
 ):
     """Run MoE for this rank's token batch with EP routed and complete shared weights."""
     arrive_x = pl.create_tensor([LANE_ROWS, D], dtype=pl.INT8)
@@ -165,6 +166,8 @@ def l2_decode_layer(
         lane_x, lane_aux, lane_count, lane_ready,
         num_tokens, num_ranks, my_rank,
     )
+    # Empty owners must still finish the preceding TP stage before waiting for EP.
+    pack_tid = pl.system.task_dummy(deps=[pack_tid, input_tid])
     moe_arrive(
         lane_x, lane_aux, lane_count, lane_ready,
         arrive_x, arrive_scale, arrive_weight, arrive_route, arrive_expert, arrive_src,
@@ -200,6 +203,46 @@ def l2_decode_layer(
     return y
 
 
+
+@pl.jit(auto_scope=False)
+def l2_decode_layer(
+    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    w_gate_up: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    shared_w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
+    shared_w_down_scale: pl.Tensor[[D], pl.FP32],
+    y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
+    lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+):
+    """Run MoE for this rank's token batch with EP routed and complete shared weights."""
+    input_tid = pl.system.task_dummy(deps=[])
+    decode_mlp(
+        x_mixed, norm_weight, gate_weight, correction_bias,
+        w_gate_up, w_gate_up_scale, w_down, w_down_scale,
+        shared_w_gate_up, shared_w_gate_up_scale, shared_w_down, shared_w_down_scale,
+        y, lane_x, lane_aux, lane_count,
+        lane_ready, slot_out, return_ready, num_tokens,
+        num_ranks, my_rank, epoch, input_tid,
+    )
+    return y
+
+
 @pl.jit.host
 def l3_decode_layer(
     x_mixed: pl.Tensor[[N_RANKS, T, D], pl.BF16],
@@ -210,9 +253,9 @@ def l3_decode_layer(
     w_gate_up_scale: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     w_down: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_w_gate_up: pl.Tensor[[N_RANKS, 2 * MOE_INTER, D], pl.INT8],
+    shared_w_gate_up: pl.Tensor[[N_RANKS, 2 * MOE_INTER, D], pl.INT8, pl.NZ],
     shared_w_gate_up_scale: pl.Tensor[[N_RANKS, 2 * MOE_INTER], pl.FP32],
-    shared_w_down: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
+    shared_w_down: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8, pl.NZ],
     shared_w_down_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     y: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
@@ -250,8 +293,8 @@ def golden_decode_layer(tensors):
     """Add the EP routed output to the full shared output for each rank's tokens."""
     from models.glm5_3_flash.decode_moe import golden_routed_ep
     from models.glm5_3_flash.expert_shared import golden_expert_shared_fn
-    from models.glm5_3_flash.golden import gate as gate_ref, rms_norm
-    from models.glm5_3_flash.quantization import quantize_per_token_int8
+    from models.glm5_3_flash.golden import gate as gate_ref
+    from models.glm5_3_flash.rmsnorm import golden_rmsnorm_quant
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
@@ -261,20 +304,10 @@ def golden_decode_layer(tensors):
     x_int8 = torch.zeros(N_RANKS, T, D, dtype=torch.int8)
     x_scale = torch.zeros(N_RANKS, T, 1, dtype=torch.float32)
     for r in range(N_RANKS):
-        x_norm = rms_norm(tensors["x_mixed"][r], tensors["norm_weight"][r])
+        x_norm, quantized, scale = golden_rmsnorm_quant(tensors["x_mixed"][r], tensors["norm_weight"][r])
         weights, indices = gate_ref(x_norm, tensors["gate_weight"][r], tensors["correction_bias"][r])
         route_weights[r], route_indices[r] = weights, indices
-        # Kernel-faithful INT8 view: gate.py quantizes ``xg = x * gamma`` in FP32
-        # (the deferred norm rides the dequant scale), while the natural reference
-        # quantizes the BF16-rounded normalized activation. The two differ by
-        # +/-1 LSB on rounding boundaries — the gate test tolerates that, but a
-        # composed ``y`` comparison amplifies it. Mirror the kernel so this test
-        # isolates the composition, not the quant boundary.
-        x_f = tensors["x_mixed"][r].float()
-        xg = x_f * tensors["norm_weight"][r].float()
-        inverse_rms = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + FLASH.rms_norm_eps)
-        x_i8, dequant = quantize_per_token_int8(xg)
-        x_int8[r], x_scale[r] = x_i8, dequant * inverse_rms
+        x_int8[r], x_scale[r] = quantized, scale
     if num_tokens < T:
         route_weights[:, num_tokens:] = 0
         route_indices[:, num_tokens:] = 0

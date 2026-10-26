@@ -71,6 +71,9 @@ from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
 from models.glm5_3_flash.quantization import quantize_per_token_int8
 
 
+# Padded staging rows may exceed the number of pool-close events.
+POOL_STAGE_DYN = pl.dynamic("GLM53_POOL_STAGE_DYN")
+
 # The per-event validity flag is one INT32 lane padded to the 32-byte minimum of
 # an a2a3 vector tile; the flag sits in column 0 and columns 1-7 stay zero.
 POOL_VALID_WIDTH = 8
@@ -157,8 +160,8 @@ def golden_indexer_pool_write(
 
     The pooled key is rotated into the scorer's Hadamard basis (with the same
     BF16 round the kernel's operand takes) and quantized to INT8 plus a per-row
-    dequant scale at write time, exactly the chain the kernel runs, so both
-    outputs compare exactly.
+    dequant scale at write time. FP32 softmax and reduction use ordinary PyTorch
+    operations; device rounding can differ at quantization boundaries.
 
     Args:
         pool_cache: ``[POOL_TABLE * INDEX_STATE_BLOCK_SIZE, INDEX_DIM]`` INT8
@@ -203,7 +206,7 @@ def _indexer_pool_write_event(
     raw_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     pool_token_slots: pl.Tensor[[POOL_EVENTS_DYN, INDEX_KPOOL], pl.INT32],
-    pool_stage: pl.Tensor[[POOL_EVENTS_DYN, INDEX_DIM], pl.FP32],
+    pool_stage: pl.Tensor[[POOL_STAGE_DYN, INDEX_DIM], pl.FP32],
     pool_valid: pl.Tensor[[POOL_EVENTS_DYN, POOL_VALID_WIDTH], pl.INT32],
 ) -> None:
     """Close one pool event; the caller gives this scope one block per event.
@@ -305,26 +308,33 @@ def indexer_pool_write(
         # INT8 dot product computes (qH)·(kH) = q·k — the reference score. The
         # BF16 round mirrors the query side's BF16 ABI (and the donor's
         # rotate-then-quantize chain).
-        staged_rot = pl.matmul(pl.cast(staged, pl.BF16, mode="rint"), hadamard, out_dtype=pl.FP32)
-        staged_abs = pl.maximum(staged_rot, pl.neg(staged_rot))
-        amax = pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        amax = pl.maximum(amax, pl.reshape(pl.row_max(staged_abs), [1, POOL_QUANT_TILE]))
-        scale_quant_row = pl.div(pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), amax)
-        staged_scaled = pl.row_expand_mul(staged_rot, pl.reshape(scale_quant_row, [POOL_QUANT_TILE, 1]))
-        staged_i32 = pl.cast(staged_scaled, target_type=pl.INT32, mode="rint")
-        staged_half = pl.cast(staged_i32, target_type=pl.FP16, mode="round")
-        staged_i8 = pl.cast(staged_half, target_type=pl.INT8, mode="trunc")
-        scale_dq_col = pl.reshape(pl.recip(scale_quant_row), [POOL_QUANT_TILE, 1])
-        scale_pad = pl.row_expand_mul(
-            pl.full([POOL_QUANT_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32, value=1.0), scale_dq_col
-        )
-        for e in pl.range(POOL_QUANT_TILE):
-            ei = pl.cast(e, pl.INT32)
-            if e0 + ei < events:
-                ei_idx = pl.cast(ei, pl.INDEX)
-                dest = pl.cast(pl.read(pool_slots, [e0 + ei]), pl.INDEX)
-                pool_cache[dest : dest + 1, :] = staged_i8[ei_idx : ei_idx + 1, :]
-                pool_scale[dest : dest + 1, :] = scale_pad[ei_idx : ei_idx + 1, :]
+        # Both lanes transport the same BF16 input; only lane 0 quantizes and stores.
+        for _ in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            staged_bf16 = pl.cast(staged, pl.BF16, mode="rint")
+            staged_mat = pl.aic_gather(staged_bf16)
+        staged_rot = pl.matmul(staged_mat, hadamard, out_dtype=pl.FP32)
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            rotated = pl.aiv_shard(staged_rot)
+            if aiv_id == 0:
+                staged_abs = pl.maximum(rotated, pl.neg(rotated))
+                amax = pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                amax = pl.maximum(amax, pl.reshape(pl.row_max(staged_abs), [1, POOL_QUANT_TILE]))
+                scale_quant_row = pl.div(pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), amax)
+                staged_scaled = pl.row_expand_mul(rotated, pl.reshape(scale_quant_row, [POOL_QUANT_TILE, 1]))
+                staged_i32 = pl.cast(staged_scaled, target_type=pl.INT32, mode="rint")
+                staged_half = pl.cast(staged_i32, target_type=pl.FP16, mode="round")
+                staged_i8 = pl.cast(staged_half, target_type=pl.INT8, mode="trunc")
+                scale_dq_col = pl.reshape(pl.recip(scale_quant_row), [POOL_QUANT_TILE, 1])
+                scale_pad = pl.row_expand_mul(
+                    pl.full([POOL_QUANT_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32, value=1.0), scale_dq_col
+                )
+                for e in pl.range(POOL_QUANT_TILE):
+                    ei = pl.cast(e, pl.INT32)
+                    if e0 + ei < events:
+                        ei_idx = pl.cast(ei, pl.INDEX)
+                        dest = pl.cast(pl.read(pool_slots, [e0 + ei]), pl.INDEX)
+                        pool_cache[dest : dest + 1, :] = staged_i8[ei_idx : ei_idx + 1, :]
+                        pool_scale[dest : dest + 1, :] = scale_pad[ei_idx : ei_idx + 1, :]
     return pool_tid
 
 
@@ -504,9 +514,10 @@ def _self_check() -> None:
     Kept local rather than in ``_golden_smoke.py`` because that module is shared
     across the whole model directory.
     """
-    cache = torch.randn(4 * BLOCK_SIZE, INDEX_STATE_WIDTH)
-    index_k = torch.randn(8, INDEX_DIM).bfloat16()
-    gates = torch.randn(8, INDEX_DIM)
+    generator = torch.Generator().manual_seed(53)
+    cache = torch.randn(4 * BLOCK_SIZE, INDEX_STATE_WIDTH, generator=generator)
+    index_k = torch.randn(8, INDEX_DIM, generator=generator).bfloat16()
+    gates = torch.randn(8, INDEX_DIM, generator=generator)
     slots = torch.tensor([5, 0, -1, 11, 300, 128, 257, 3], dtype=torch.int32)
     updated = golden_indexer_cache_write(cache, index_k, gates, slots)
     for row, slot in enumerate(slots.tolist()):
@@ -515,18 +526,18 @@ def _self_check() -> None:
             assert torch.equal(updated[slot], expected), f"slot {slot} did not receive its row"
     assert torch.equal(updated[-1], cache[-1]), "a -1 slot wrapped into the last row"
 
-    pool_i8, pool_scale_col = quantize_per_token_int8(torch.randn(8, INDEX_DIM))
+    pool_i8, pool_scale_col = quantize_per_token_int8(torch.randn(8, INDEX_DIM, generator=generator))
     pool_cache = pool_i8
     pool_scale = torch.zeros(8, POOL_SCALE_WIDTH)
     pool_scale[:, 0] = pool_scale_col[:, 0]
     raw_cache = torch.cat(
         [
-            torch.randn(32, INDEX_DIM).bfloat16().float(),
-            torch.randn(32, INDEX_DIM),
+            torch.randn(32, INDEX_DIM, generator=generator).bfloat16().float(),
+            torch.randn(32, INDEX_DIM, generator=generator),
         ],
         dim=-1,
     )
-    ape = torch.randn(INDEX_KPOOL, INDEX_DIM).bfloat16()
+    ape = torch.randn(INDEX_KPOOL, INDEX_DIM, generator=generator).bfloat16()
     hadamard = sylvester_hadamard()
     pool_token_slots = torch.tensor(
         [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, -1, 15], [16, 17, 18, 19]],
