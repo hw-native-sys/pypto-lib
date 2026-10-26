@@ -13,9 +13,8 @@ import pypto.language as pl
 from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from sparse_attention import publish_window_row, swa_attention_partial
 from qkv_proj_rope import qkv_proj_rope
-from o_proj import decode_o_proj
-from hc import hc_pre, zero_bf16_padding, hc_post
-from rmsnorm import rms_norm_tiled
+from o_proj import o_proj_hc_post
+from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
 
 
 # model config
@@ -73,14 +72,8 @@ def decode_swa(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_pre(
-        x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        x_attn, attention_pre_mix, post_mix, residual_mix,
-    )
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    for norm_block in pl.spmd((tokens + 7) // 8, name_hint="norm_in"):
-        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_block, tokens, output_fp32=False)
+    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, x_norm)
 
     zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
@@ -92,17 +85,17 @@ def decode_swa(
         wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
         qr, q, kv_projection, kv, num_tokens, max_workers=Q_ROPE_WORKER_TILE,
         fuse_qnorm=True, q_b_n_tile=256, q_b_max_workers=2147483647,
+        fuse_kv_norm_rope=False,
     )
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
+    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=32)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     swa_attention_partial(q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens)
-    decode_o_proj(
-        attended, wo_a, wo_a_scale, wo_b,
-        wo_b_scale, rope_cos, rope_sin,
-        attention_output, num_tokens,
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
+    o_proj_hc_post(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
     )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps)
     return attention_hidden, attention_pre_mix
 
 

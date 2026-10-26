@@ -30,6 +30,7 @@ STATE_WIDTH = 2 * M.head_dim
 # tiling
 M_TILE = 16
 N_TILE = 128
+COMPRESSOR_M_TILE = 80
 COMPRESSOR_K_TILE = 64
 COMPRESSOR_QUERY_TILE = 128
 # Limit Cube rounding before the compensated Vector accumulation.
@@ -140,15 +141,15 @@ def project_ratio2_weights(
                     blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
                 )
                 tail_right = pl.tile.move(tail_mat, target_memory=pl.MemorySpace.Right)
-                for cube_t0 in pl.range(0, chunk_rows, M_TILE):
-                    cube_rows = pl.min(M_TILE, chunk_rows - cube_t0)
-                    a = pl.load(x, [begin + cube_t0, cube_k0], [M_TILE, COMPRESSOR_K_TILE], valid_shape=[cube_rows, COMPRESSOR_K_TILE], target_memory=pl.MemorySpace.Vec)
+                for cube_t0 in pl.range(0, chunk_rows, COMPRESSOR_M_TILE):
+                    cube_rows = pl.min(COMPRESSOR_M_TILE, chunk_rows - cube_t0)
+                    a = pl.load(x, [begin + cube_t0, cube_k0], [COMPRESSOR_M_TILE, COMPRESSOR_K_TILE], valid_shape=[cube_rows, COMPRESSOR_K_TILE], target_memory=pl.MemorySpace.Vec)
+                    a = pl.fillpad(a, pad_value=pl.PadValue.zero)
+                    a = pl.set_validshape(a, COMPRESSOR_M_TILE, COMPRESSOR_K_TILE)
                     a_fp32 = pl.cast(a, pl.FP32)
                     a = pl.cast(a_fp32, pl.BF16, mode="rint")
-                    high_acc = pl.tile.create([M_TILE, N_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
-                    residual_acc = pl.tile.create([M_TILE, N_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
-                    high_acc = pl.matmul_acc(high_acc, a, high_right, init_cond=True)
-                    residual_acc = pl.matmul_acc(residual_acc, a, low_right, init_cond=True)
+                    high_acc = pl.matmul(a, high_right)
+                    residual_acc = pl.matmul(a, low_right)
                     residual_acc = pl.matmul_acc(residual_acc, a, tail_right)
                     high_value = pl.mul(high_acc, 1.0)
                     high_value = pl.set_validshape(high_value, cube_rows, N_TILE)
@@ -413,9 +414,10 @@ def compressor_state_write(
     blocks = pl.tensor.dim(state_cache, 0)
     state_rows = blocks * STATE_CAPACITY
     flat = pl.reshape(state_cache, [state_rows, STATE_WIDTH])
-    with pl.spmd(pl.max(num_tokens, 1), name_hint="state_cmp", deps=[pair_ready]) as state_tid:
-        t = pl.tile.get_block_idx()
-        if t < num_tokens:
+    workers = pl.max(pl.min(num_tokens, 16), 1)
+    with pl.spmd(workers, name_hint="state_cmp", deps=[pair_ready]) as state_tid:
+        worker = pl.tile.get_block_idx()
+        for t in pl.range(worker, num_tokens, workers):
             request = pl.cast(pl.read(token_to_req_indices, [t]), pl.INDEX)
             if request >= 0 and request < pl.tensor.dim(state_block_table, 0):
                 block = pl.cast(pl.read(state_block_table, [request, 0]), pl.INDEX)

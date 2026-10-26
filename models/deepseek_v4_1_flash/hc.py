@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from config import FLASH as M, SP_T_DYN, T_DYN
+from rmsnorm import NORM_D_TILE
 
 
 # model config
@@ -255,6 +256,72 @@ def hc_head(
                 y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
                 pl.store(y_bf16, [t, d0], output)
     return output
+
+
+@pl.jit.inline
+def hc_head_norm(
+    x_hc: pl.Tensor,
+    pre_mix: pl.Tensor,
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    output: pl.Tensor,
+):
+    """Collapse and normalize eight BF16 rows with ordered 512-column sums."""
+    tokens = pl.tensor.dim(x_hc, 0)
+    x_flat = pl.reshape(x_hc, [tokens, HC_DIM])
+    weight_flat = pl.reshape(norm_weight, [1, D])
+    with pl.spmd((tokens + 7) // 8, name_hint="hc_collapse_norm") as norm_ready:
+        t0 = pl.tile.get_block_idx() * 8
+        rows = pl.min(8, tokens - t0)
+        mix = pl.load(pre_mix, [t0, 0], [8, 8], valid_shape=[rows, HC_MULT])
+        mix = pl.fillpad(mix, pad_value=pl.PadValue.zero)
+        mix = pl.set_validshape(mix, 8, 8)
+        mix_bits = pl.reinterpret_view(mix, pl.INT32)
+        mix_zero = pl.tile.full([8, 8], dtype=pl.INT32, value=0)
+        mix_dense_bits = pl.add(mix_zero, mix_bits)
+        mix_dense = pl.reinterpret_view(mix_dense_bits, pl.FP32)
+        transposed = pl.tile.transpose(mix_dense, 0, 1)
+        pre0 = pl.reshape(pl.slice(transposed, [1, 8], [0, 0]), [8, 1])
+        pre1 = pl.reshape(pl.slice(transposed, [1, 8], [1, 0]), [8, 1])
+        pre2 = pl.reshape(pl.slice(transposed, [1, 8], [2, 0]), [8, 1])
+        pre3 = pl.reshape(pl.slice(transposed, [1, 8], [3, 0]), [8, 1])
+        collapsed = pl.create_tile([8, D], dtype=pl.BF16)
+        sq_sum = pl.tile.full([1, 8], dtype=pl.FP32, value=0.0)
+        reduce_tmp = pl.create_tile([8, NORM_D_TILE], dtype=pl.FP32)
+        for k0 in pl.pipeline(0, D, NORM_D_TILE, stage=2):
+            x0 = pl.load(x_flat, [t0, k0], [8, NORM_D_TILE], valid_shape=[rows, NORM_D_TILE])
+            x1 = pl.load(x_flat, [t0, D + k0], [8, NORM_D_TILE], valid_shape=[rows, NORM_D_TILE])
+            x2 = pl.load(x_flat, [t0, 2 * D + k0], [8, NORM_D_TILE], valid_shape=[rows, NORM_D_TILE])
+            x3 = pl.load(x_flat, [t0, 3 * D + k0], [8, NORM_D_TILE], valid_shape=[rows, NORM_D_TILE])
+            y0 = pl.row_expand_mul(x0, pre0)
+            y1 = pl.row_expand_mul(x1, pre1)
+            y2 = pl.row_expand_mul(x2, pre2)
+            y3 = pl.row_expand_mul(x3, pre3)
+            first_pair = pl.add(y0, y1)
+            second_pair = pl.add(y2, y3)
+            value_fp32 = pl.add(first_pair, second_pair)
+            rounded = pl.cast(value_fp32, pl.BF16, mode="rint")
+            collapsed = pl.tile.assemble(collapsed, rounded, [0, k0])
+            padded = pl.set_validshape(pl.fillpad(rounded, pad_value=pl.PadValue.zero), 8, NORM_D_TILE)
+            value = pl.cast(padded, pl.FP32)
+            squared = pl.mul(value, value)
+            partial = pl.reshape(pl.row_sum(squared, tmp_tile=reduce_tmp), [1, 8])
+            sq_sum = pl.add(sq_sum, partial)
+        mean_square = pl.mul(sq_sum, 1.0 / D)
+        rms_argument = pl.add(mean_square, NORM_EPS)
+        rsqrt_tmp = pl.create_tile([1, 8], dtype=pl.FP32)
+        inv_rms = pl.tile.rsqrt(rms_argument, tmp=rsqrt_tmp)
+        inverse = pl.reshape(inv_rms, [8, 1])
+        for k0 in pl.pipeline(0, D, NORM_D_TILE, stage=2):
+            source = pl.tile.slice(collapsed, [8, NORM_D_TILE], [0, k0])
+            norm_value = pl.cast(source, pl.FP32)
+            weight = pl.load(weight_flat, [0, k0], [1, NORM_D_TILE])
+            gamma = pl.cast(weight, pl.FP32)
+            scaled = pl.row_expand_mul(norm_value, inverse)
+            normalized = pl.col_expand_mul(scaled, gamma)
+            result = pl.cast(normalized, pl.BF16, mode="rint")
+            result = pl.set_validshape(result, rows, NORM_D_TILE)
+            pl.store(result, [t0, k0], output)
+    return norm_ready
 
 
 @pl.jit.inline

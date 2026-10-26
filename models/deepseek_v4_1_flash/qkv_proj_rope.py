@@ -226,6 +226,56 @@ def q_proj_rope(
 
 
 @pl.jit.inline(auto_scope=False)
+def _kv_norm_rope_fused(
+    projected: pl.Tensor,
+    weight: pl.Tensor,
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    weight_flat = pl.reshape(weight, [1, HEAD_DIM])
+    for block in pl.spmd((num_tokens + 7) // 8, name_hint="kv_norm_rope_fused"):
+        t0 = block * 8
+        rows = pl.min(8, num_tokens - t0)
+        source = pl.load(projected, [t0, 0], [8, HEAD_DIM], valid_shape=[rows, HEAD_DIM])
+        source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, HEAD_DIM)
+        value = pl.cast(source, pl.FP32)
+        reduce_tmp = pl.create_tile([8, HEAD_DIM], dtype=pl.FP32)
+        squares = pl.mul(value, value)
+        sq_sum = pl.reshape(pl.row_sum(squares, tmp_tile=reduce_tmp), [1, 8])
+        mean_square = pl.mul(sq_sum, 1.0 / HEAD_DIM)
+        argument = pl.add(mean_square, EPS)
+        rsqrt_tmp = pl.create_tile([1, 8], dtype=pl.FP32)
+        inverse = pl.reshape(pl.tile.rsqrt(argument, tmp=rsqrt_tmp), [8, 1])
+        gamma = pl.cast(pl.load(weight_flat, [0, 0], [1, HEAD_DIM]), pl.FP32)
+        normalized = pl.col_expand_mul(pl.row_expand_mul(value, inverse), gamma)
+        rounded = pl.cast(normalized, pl.BF16, mode="rint")
+        prefix = pl.tile.slice(rounded, [8, HEAD_DIM - ROPE_DIM], [0, 0], valid_shape=[rows, HEAD_DIM - ROPE_DIM])
+        pl.store(prefix, [t0, 0], output)
+        tail = pl.cast(pl.tile.slice(rounded, [8, ROPE_DIM], [0, HEAD_DIM - ROPE_DIM]), pl.FP32)
+        even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+        odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+        c = pl.load(cosine, [t0, 0], [8, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+        c = pl.set_validshape(pl.fillpad(c, pad_value=pl.PadValue.zero), 8, ROPE_DIM // 2)
+        s = pl.load(sine, [t0, 0], [8, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+        s = pl.set_validshape(pl.fillpad(s, pad_value=pl.PadValue.zero), 8, ROPE_DIM // 2)
+        s = pl.mul(s, 1.0)
+        real = pl.sub(pl.mul(even, c), pl.mul(odd, s))
+        imag = pl.add(pl.mul(even, s), pl.mul(odd, c))
+        real_lanes = pl.tile.full([8, ROPE_DIM], dtype=pl.FP32, value=0.0)
+        real_lanes = pl.tile.scatter_mask(real_lanes, real, mask_pattern=pl.tile.MaskPattern.P0101)
+        imag_lanes = pl.tile.full([8, ROPE_DIM], dtype=pl.FP32, value=0.0)
+        imag_lanes = pl.tile.scatter_mask(imag_lanes, imag, mask_pattern=pl.tile.MaskPattern.P1010)
+        real_bits = pl.reinterpret_view(real_lanes, pl.UINT32)
+        imag_bits = pl.reinterpret_view(imag_lanes, pl.UINT32)
+        rotated = pl.reinterpret_view(pl.or_(real_bits, imag_bits), pl.FP32)
+        result = pl.set_validshape(pl.cast(rotated, pl.BF16, mode="rint"), rows, ROPE_DIM)
+        pl.store(result, [t0, HEAD_DIM - ROPE_DIM], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def _kv_normalize_rope(
     projected: pl.Tensor,
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
@@ -365,8 +415,9 @@ def _qa_kv_ragged_group(
     group_start: pl.Scalar[pl.INDEX],
     m_tile: pl.constexpr,
     fuse_qnorm: pl.constexpr,
+    fuse_kv_norm_rope: pl.constexpr,
 ):
-    """Project one Q-A/KV row group with M16 normalization and RoPE epilogues."""
+    """Project one Q-A/KV row group and apply normalization and RoPE epilogues."""
     group_rows = pl.max(pl.min(m_tile, num_tokens - group_start), 0)
     group_payload = pl.tensor.slice(payload_all, [m_tile, D], [group_start, 0])
     group_scales = pl.tensor.slice(
@@ -404,17 +455,25 @@ def _qa_kv_ragged_group(
         group_rows, 0, 0, 0,
         D, HEAD_DIM, "proj_kv_ragged", N_TILE, K_TILE, 1, 0, 0, m_tile, 2147483647,
     )
-    for kv_mt in pl.parallel(m_tile // MX_M_TILE):
-        kv_local = kv_mt * MX_M_TILE
-        kv_start = group_start + kv_local
-        kv_rows = pl.max(pl.min(MX_M_TILE, group_rows - kv_local), 0)
-        projection_tile = pl.slice(kv_projection, [kv_rows, HEAD_DIM], [kv_start, 0])
-        window_tile = pl.slice(window_kv, [kv_rows, HEAD_DIM], [kv_start, 0])
-        cosine_tile = pl.slice(rope_cos, [kv_rows, ROPE_DIM // 2], [kv_start, 0])
-        sine_tile = pl.slice(rope_sin, [kv_rows, ROPE_DIM // 2], [kv_start, 0])
-        _kv_normalize_rope(
-            projection_tile, kv_norm_weight, cosine_tile, sine_tile, window_tile, kv_rows,
+    if fuse_kv_norm_rope:
+        window_group = pl.slice(window_kv, [group_rows, HEAD_DIM], [group_start, 0])
+        cosine_group = pl.slice(rope_cos, [group_rows, ROPE_DIM // 2], [group_start, 0])
+        sine_group = pl.slice(rope_sin, [group_rows, ROPE_DIM // 2], [group_start, 0])
+        _kv_norm_rope_fused(
+            projection_group, kv_norm_weight, cosine_group, sine_group, window_group, group_rows,
         )
+    else:
+        for kv_mt in pl.parallel(m_tile // MX_M_TILE):
+            kv_local = kv_mt * MX_M_TILE
+            kv_start = group_start + kv_local
+            kv_rows = pl.max(pl.min(MX_M_TILE, group_rows - kv_local), 0)
+            projection_tile = pl.slice(kv_projection, [kv_rows, HEAD_DIM], [kv_start, 0])
+            window_tile = pl.slice(window_kv, [kv_rows, HEAD_DIM], [kv_start, 0])
+            cosine_tile = pl.slice(rope_cos, [kv_rows, ROPE_DIM // 2], [kv_start, 0])
+            sine_tile = pl.slice(rope_sin, [kv_rows, ROPE_DIM // 2], [kv_start, 0])
+            _kv_normalize_rope(
+                projection_tile, kv_norm_weight, cosine_tile, sine_tile, window_tile, kv_rows,
+            )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -439,6 +498,7 @@ def qkv_proj_rope(
     fuse_qnorm: pl.constexpr = True,
     q_b_n_tile: pl.constexpr = N_TILE,
     q_b_max_workers: pl.constexpr = 2147483647,
+    fuse_kv_norm_rope: pl.constexpr = False,
 ):
     """Project 72 active decode rows with shared M80 input quantization."""
     input_payload_all = pl.create_tensor([80, D], dtype=pl.FP8E4M3FN)
@@ -462,7 +522,7 @@ def qkv_proj_rope(
         input_payload_all, input_scales_all, wq_a, wq_a_scale, q_norm_weight,
         wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
         query_latent, kv_projection, window_kv, qb_payload_all, qb_scales_all,
-        num_tokens, 0, 80, fuse_qnorm,
+        num_tokens, 0, 80, fuse_qnorm, fuse_kv_norm_rope,
     )
     _q_proj_rope_from_mx_m80(
         qb_payload_all, qb_scales_all, wq_b, wq_b_scale, rope_cos, rope_sin,

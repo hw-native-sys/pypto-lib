@@ -170,9 +170,17 @@ def publish_window_row(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
+    max_workers: pl.constexpr = 2147483647,
 ):
-    for t in pl.spmd(num_tokens, name_hint="pub_win"):
-        _publish_window_row(kv, slots, cache, scales, t)
+    if max_workers == 2147483647:
+        for t in pl.spmd(num_tokens, name_hint="pub_win"):
+            _publish_window_row(kv, slots, cache, scales, t)
+    else:
+        workers = pl.min(num_tokens, max_workers)
+        step = pl.max(1, workers)
+        for worker in pl.spmd(workers, name_hint="pub_win"):
+            for t in pl.range(worker, num_tokens, step):
+                _publish_window_row(kv, slots, cache, scales, t)
     return cache, scales
 
 

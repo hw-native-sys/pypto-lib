@@ -14,14 +14,10 @@ from config import (
     FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, COMPRESSED_CACHE_GROUP,
     WINDOW_CACHE_GROUP,
 )
-from hc import hc_pre, hc_post
-from rmsnorm import rms_norm_tiled
-from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
-from sparse_attention import (
-    PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk, attend_c2a_chunk,
-    publish_window_row, attend_packed_cohorts,
-)
-from o_proj import o_proj
+from hc import hc_head_norm, hc_project, hc_sinkhorn
+from qkv_proj_rope import qkv_proj_rope
+from sparse_attention import publish_window_row, attend_packed_cohorts
+from o_proj import o_proj_hc_post
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -77,57 +73,39 @@ def decode_c2a_reuse(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_pre(
-        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        x_attn, next_pre_mix, post_mix, residual_mix,
-    )
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    with pl.spmd((tokens + 7) // 8, name_hint="norm_in") as cache_ready:
-        worker = pl.tile.get_block_idx()
-        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, worker, tokens, output_fp32=False)
+    cache_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm)
 
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=64)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
-    publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
+    qkv_proj_rope(
+        x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
+        qr, query, kv_projection, window_kv, num_tokens,
+        max_workers=64,
+        fuse_qnorm=True, q_b_n_tile=256, q_b_max_workers=2147483647,
+        fuse_kv_norm_rope=False,
+    )
+    publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
 
     chunk_done = cache_ready
 
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    if num_tokens <= 12:
-        chunk_done = attend_packed_cohorts(
-            query, window_indices, window_cache, window_cache_scale, compressed_indices,
-            compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
-            gather_name="c2a_gather", attn_name="c2a_sparse_attn",
-        )
-    else:
-        selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
-        combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
-        for start in pl.range(0, num_tokens, QUERY_TILE):
-            active = pl.min(QUERY_TILE, num_tokens - start)
-            gather_tid = gather_packed_chunk(
-                window_cache, window_cache_scale, window_indices, compressed_cache,
-                compressed_cache_scale, compressed_indices, selected, combined, start, active,
-                chunk_done,
-            )
-            chunk_done = attend_c2a_chunk(
-                query, selected, combined, attn_sink, attended, start, active, gather_tid, name_hint="c2a_sparse_attn",
-            )
-
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b,
-        wo_b_scale, rope_cos, rope_sin,
-        attn_out, num_tokens, grouped_max_workers=4096,
+    chunk_done = attend_packed_cohorts(
+        query, window_indices, window_cache, window_cache_scale, compressed_indices,
+        compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
+        gather_name="c2a_gather", attn_name="c2a_sparse_attn",
     )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
+
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    o_proj_hc_post(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        attn_out, x_hc, post_mix, residual_mix, output, num_tokens,
+    )
     return output, next_pre_mix
 
 

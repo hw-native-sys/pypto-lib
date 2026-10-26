@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 from qkv_proj_rope import qkv_proj_rope
-from o_proj import decode_o_proj
+from o_proj import o_proj_hc_post
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, use_pretransposed_index_query, score_select_c1a_groups,
     make_fp4_publish, c1a_project_index_key, c1a_rotate_index_key,
@@ -19,7 +19,7 @@ from decode_indexer import (
 from sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
 )
-from hc import hc_pre, hc_post
+from hc import hc_pre
 from config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
@@ -126,8 +126,9 @@ def decode_c1a_full(
         wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
         qr, query, kv_projection, kv, num_tokens, max_workers=32,
         fuse_qnorm=False, q_b_n_tile=128, q_b_max_workers=Q_B_WORKER_TILE,
+        fuse_kv_norm_rope=False,
     )
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
+    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     pc_tid = decode_c1a_compressor_project(x_norm, compressor_wkv, projected, num_tokens, x_ready)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -184,12 +185,10 @@ def decode_c1a_full(
     )
     attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    decode_o_proj(
+    o_proj_hc_post(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        attn_out, num_tokens,
+        attn_out, x_hc, post_mix, residual_mix, output, num_tokens,
     )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output
 
 

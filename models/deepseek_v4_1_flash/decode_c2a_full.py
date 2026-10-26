@@ -18,14 +18,14 @@ from config import (
 from compressor import (
     publish_c2a_compressed, STATE_WIDTH, project_ratio2, compressor_ratio2, decode_c2a_compressor_rope,
 )
-from hc import hc_pre, hc_post
+from hc import hc_pre
 from rmsnorm import rms_norm_tiled
 from qkv_proj_rope import qkv_proj_rope
 from sparse_attention import (
     publish_window_row, attend_packed_cohorts,
 )
 from decode_indexer import decode_c2a_indexer
-from o_proj import decode_o_proj
+from o_proj import o_proj_hc_post
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -126,8 +126,9 @@ def decode_c2a_full(
         qr, query, kv_projection, window_kv, num_tokens,
         max_workers=64,
         fuse_qnorm=False, q_b_n_tile=128, q_b_max_workers=2147483647,
+        fuse_kv_norm_rope=True,
     )
-    publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
+    publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
@@ -163,13 +164,10 @@ def decode_c2a_full(
     )
 
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    decode_o_proj(
-        attended, wo_a, wo_a_scale, wo_b,
-        wo_b_scale, rope_cos, rope_sin,
-        attn_out, num_tokens,
+    o_proj_hc_post(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        attn_out, x_hc, post_mix, residual_mix, output, num_tokens,
     )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output, next_pre_mix
 
 

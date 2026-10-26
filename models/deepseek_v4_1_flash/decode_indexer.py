@@ -74,7 +74,8 @@ def _index_key_decode_lut():
 @pl.jit.inline
 def _index_key_packed_decode_lut():
     """Expand each packed FP4 byte to two exact FP8 carrier bytes."""
-    lut_codes = pl.tile.arange(0, [1, 256], dtype=pl.INT32)
+    index_tmp = pl.create_tile([1, 192], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+    lut_codes = pl.tile.arange(0, [1, 256], dtype=pl.INT32, tmp=index_tmp)
     lut_low = pl.ands(lut_codes, 7)
     lut_low_shifted = pl.shls(lut_low, 2)
     lut_low_bits = pl.add(lut_low_shifted, 48)
@@ -195,7 +196,8 @@ def _make_materialize_index_topk():
         pages = pl.tile.fillpad(raw_pages, pad_value=pl.PadValue.zero)
         pl.store(pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1), [token, 0], output)
         ones = pl.tile.full([1, 256], dtype=pl.FP32, value=1.0)
-        lanes = pl.tile.arange(0, [1, 256], dtype=pl.INT32)
+        index_tmp = pl.create_tile([1, 192], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        lanes = pl.tile.arange(0, [1, 256], dtype=pl.INT32, tmp=index_tmp)
         lane_origin = pl.tile.full([1, 256], dtype=pl.INT32, value=256)
         # Unique integer lane keys: selected=256-lane, discarded=0.
         priority_fp32 = pl.cast(pl.sub(lane_origin, lanes), pl.FP32)
@@ -1273,7 +1275,8 @@ def _make_request_block_index_scores(skip_short=False, workers=32):
                                                         pl.cast(pl.col_sum(weighted), pl.BF16, mode="rint"),
                                                         pl.FP32,
                                                     )
-                                                    lanes = pl.tile.arange(0, [1, _PAGE_SIZE], dtype=pl.INT32)
+                                                    index_tmp = pl.create_tile([1, 192], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                                                    lanes = pl.tile.arange(0, [1, _PAGE_SIZE], dtype=pl.INT32, tmp=index_tmp)
                                                     in_range = pl.tile.cmps(lanes, pl.cast(valid_count, pl.INT32), cmp_type=2)
                                                     masked = pl.tile.select(in_range, total, masked)
                                             masked_valid = pl.set_validshape(masked, 1, output_count)
@@ -1787,7 +1790,9 @@ def _make_index_topk_pairs(query_rows=False):
         raw = pl.load(scores, [token, logical_begin], [1, _TOPK_LEAF_TILE], valid_shape=[1, valid_count])
         padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
         values = pl.maximum(padded, pl.tile.full([1, _TOPK_LEAF_TILE], dtype=pl.FP32, value=_TOPK_SORT_FLOOR))
-        indices = pl.add(pl.tile.arange(0, [1, _TOPK_LEAF_TILE], dtype=pl.INT32), pl.cast(logical_begin, pl.INT32))
+        index_tmp = pl.create_tile([1, 192], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        lane_indices = pl.tile.arange(0, [1, _TOPK_LEAF_TILE], dtype=pl.INT32, tmp=index_tmp)
+        indices = pl.add(lane_indices, pl.cast(logical_begin, pl.INT32))
         pairs = pl.tile.sort32(values, pl.reinterpret_view(indices, pl.UINT32))
         pairs = pl.tile.mrgsort(pairs, block_len=64)
         pairs = pl.tile.mrgsort(pairs, block_len=256)
@@ -2569,7 +2574,7 @@ def decode_c2a_indexer(
         index_wq_b, index_wq_b_scale, index_weights_proj,
         rope_cos, rope_sin,
         num_tokens, score_width,
-        cache_ready, index_wq_b, 0, pretransposed=False, query_max_workers=2147483647,
+        cache_ready, index_wq_b, 0, pretransposed=False, query_max_workers=8,
     )
     return _score_select_c2a_groups(
         query, query_scale, raw_weights, index_cache, index_cache_scale,
