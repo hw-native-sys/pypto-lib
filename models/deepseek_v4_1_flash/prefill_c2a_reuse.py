@@ -15,7 +15,6 @@ import functools
 import torch
 
 from hc import hc_pre
-from hc import hc_mixes
 from config import (
     FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, COMPRESSED_CACHE_GROUP, PREFILL_MAX_TOKENS,
     WINDOW_CACHE_GROUP, SP_T_DYN,
@@ -84,7 +83,7 @@ def prefill_c2a_reuse_attention(
     ],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    partial: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
@@ -165,7 +164,7 @@ def prefill_c2a_reuse_sp(
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     attn_input: pl.Tensor[[T_DYN, D], pl.BF16],
     attn_output: pl.Tensor[[SP_T_DYN, D], pl.BF16],
@@ -181,11 +180,11 @@ def prefill_c2a_reuse_sp(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
-    )
     hc_collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_pre(x_hc, pre_mix, hc_collapsed)
+    hc_pre(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+        hc_collapsed, next_pre_mix, post_mix, residual_mix,
+    )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
         rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
@@ -194,7 +193,7 @@ def prefill_c2a_reuse_sp(
         group_base, tp_rank, num_tokens, attention_epoch,
     )
     group_tokens = pl.tensor.dim(attn_input, 0)
-    partial = pl.create_tensor([group_tokens, D], dtype=pl.FP32)
+    partial = pl.create_tensor([group_tokens, D], dtype=pl.BF16)
     if num_tokens > 0:
         prefill_c2a_reuse_attention(
             attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b,
@@ -246,7 +245,7 @@ def prefill_c2a_reuse(
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
     ],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     attn_input: pl.Tensor[[T_DYN, D], pl.BF16],
     attn_output: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -261,16 +260,16 @@ def prefill_c2a_reuse(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
-    )
     hc_collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_pre(x_hc, pre_mix, hc_collapsed)
+    hc_pre(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+        hc_collapsed, next_pre_mix, post_mix, residual_mix,
+    )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
         rms_norm_tiled(hc_collapsed, attn_norm_weight, attn_input, hc_norm_block, hc_norm_tokens, output_fp32=False)
     attention_tokens = pl.tensor.dim(attn_input, 0)
-    attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.FP32)
+    attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
     prefill_c2a_reuse_attention(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b,
         wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
@@ -282,7 +281,8 @@ def prefill_c2a_reuse(
     prefill_tp_output_all_reduce(
         attention_partial, output_window, output_arrived, attn_output, group_base, tp_rank, num_tokens, attention_epoch,
     )
-    hc_post(attn_output, x_hc, post_mix, residual_mix, x_hc_out)
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post(attn_output, x_hc, post_mix, residual_mix, x_hc_out, deps=hc_post_deps)
     return x_hc_out
 
 
@@ -327,7 +327,7 @@ def l2_prefill_c2a_reuse(
     x_hc_out: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32]],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Tensor[[1], pl.INT32],
@@ -400,12 +400,12 @@ def l3_prefill_c2a_reuse(
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
     input_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    data_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    data_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         input_data = pld.window(input_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         input_signal = pld.window(input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        data = pld.window(data_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        data = pld.window(data_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         signal = pld.window(signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         # Each rank consumes packed MX_B_NN scale rows.
         wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]

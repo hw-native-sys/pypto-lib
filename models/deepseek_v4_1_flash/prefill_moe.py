@@ -47,8 +47,8 @@ from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
     expert_routed_scatter,
 )
-from hc import golden_mhc_mixes, golden_hc_pre, golden_hc_post
-from hc import hc_mixes, hc_pre, hc_post_after, hc_post
+from hc import golden_mhc_mixes, golden_hc_collapse, golden_hc_post
+from hc import hc_pre, hc_post
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
 from o_proj import prefill_tp_output_all_reduce
 
@@ -423,11 +423,10 @@ def prefill_moe(
     t = MOE_TOKENS
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
-    mixes_ready = hc_mixes(
-        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
+    mixes_ready = hc_pre(
+        x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        x_mixed, next_pre_mix, post_mix, residual_mix,
     )
-    hc_pre(x_hc, pre_mix, x_mixed)
     ffn_input = pl.create_tensor([t, D], dtype=pl.BF16)
     norm_tokens = pl.tensor.dim(x_mixed, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
@@ -501,7 +500,10 @@ def prefill_moe(
                         signal=combine_arrived, offsets=[peer, 1, 0],
                         expected=moe_epoch, cmp=pld.WaitCmp.Ge,
                     )
-        hc_post_after(sublayer, x_hc, post_mix, residual_mix, x_next, round_ready, mixes_ready)
+        hc_post_deps = pl.array.create(2, pl.TASK_ID)
+        hc_post_deps[0] = round_ready
+        hc_post_deps[1] = mixes_ready
+        hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps)
     return x_next
 
 
@@ -643,37 +645,6 @@ def l3_prefill_moe(
 
 
 @pl.jit.inline
-def moe_hc_pre(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
-    ffn_input: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    """Derive FFN mHC coefficients and collapse the residual stream to BF16."""
-    hc_mixes(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64)
-    hc_pre(x_hc, pre_mix, ffn_input)
-    return ffn_input
-
-
-@pl.jit.inline
-def widen_to_fp32(
-    source: pl.Tensor[[T_DYN, D], pl.BF16],
-    output: pl.Tensor[[T_DYN, D], pl.FP32],
-):
-    """Widen a routed result to the FP32 partial layout the TP reduction consumes."""
-    t_dim = pl.tensor.dim(source, 0)
-    for row in pl.spmd(t_dim, name_hint="ffn_partial_widen"):
-        for d0 in pl.pipeline(0, D, 512, stage=2):
-            output[row : row + 1, d0 : d0 + 512] = pl.cast(source[row : row + 1, d0 : d0 + 512], target_type=pl.FP32)
-    return output
-
-
-@pl.jit.inline
 def _local_token_count(num_tokens: pl.Scalar[pl.INT32], tp_rank: pl.Scalar[pl.INT32]):
     """Map the replicated TP token prefix to this rank's compact local prefix."""
     # Native INDEX scalar for local row counts and addresses.
@@ -766,7 +737,10 @@ def prefill_moe_sublayer(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
-    moe_hc_pre(x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix, ffn_input)
+    hc_pre(
+        x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        ffn_input, next_pre_mix, post_mix, residual_mix,
+    )
     # Compact interleaved TP owner rows for the EP local-token ABI.
     local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
     _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
@@ -856,7 +830,7 @@ def prefill_ffn_restore(
     ffn_owned: pl.Tensor[[T_DYN, D], pl.BF16],
     post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
-    ffn_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    ffn_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     ffn_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     ffn_output: pl.Tensor[[T_DYN, D], pl.BF16],
     x_hc_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
@@ -866,13 +840,11 @@ def prefill_ffn_restore(
     ffn_epoch: pl.Scalar[pl.INT32],
 ):
     """Sum TP routed partials and expand the residual stream with mHC."""
-    tokens = pl.tensor.dim(x_hc, 0)
-    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    widen_to_fp32(ffn_owned, partial)
     prefill_tp_output_all_reduce(
-        partial, ffn_window, ffn_arrived, ffn_output, group_base, tp_rank, num_tokens, ffn_epoch,
+        ffn_owned, ffn_window, ffn_arrived, ffn_output, group_base, tp_rank, num_tokens, ffn_epoch,
     )
-    hc_post(ffn_output, x_hc, post_mix, residual_mix, x_hc_out)
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post(ffn_output, x_hc, post_mix, residual_mix, x_hc_out, deps=hc_post_deps)
     return x_hc_out
 
 
@@ -1227,7 +1199,7 @@ def golden_moe(tensors):
         next_pre_mix[rank] = pre
         post_mix[rank] = post
         residual_mix[rank] = residual
-        x_mixed[rank] = golden_hc_pre(x_hc[rank], tensors['pre_mix'][rank]).to(torch.bfloat16)
+        x_mixed[rank] = golden_hc_collapse(x_hc[rank], tensors['pre_mix'][rank]).to(torch.bfloat16)
 
     tensors["next_pre_mix"][:] = next_pre_mix
     tensors["x_mixed"][:] = x_mixed

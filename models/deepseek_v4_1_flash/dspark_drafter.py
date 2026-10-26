@@ -17,7 +17,7 @@ import config as C
 from config import BLOCK_SIZE, B_DYN, FLASH, TP_SIZE, T_DYN, TABLE_DYN
 from o_proj import prefill_tp_output_all_reduce
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
-from hc import hc_head, hc_mixes, hc_post, hc_pre, zero_bf16_padding
+from hc import hc_head, hc_post, hc_pre, zero_bf16_padding
 from expert_routed import (
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
@@ -312,7 +312,7 @@ def draft_layer(
     next_pre_mix: pl.Tensor,
     x_mixed: pl.Tensor,
     x_next: pl.Tensor,
-    attention_output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.FP32],
+    attention_output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.BF16],
     attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     recv_meta: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
@@ -335,15 +335,14 @@ def draft_layer(
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attention_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
+    hc_pre(
+        x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attention_input, attention_pre_mix, post_mix, residual_mix,
     )
-    hc_pre(x_hc, incoming_pre_mix, attention_input)
     for block in pl.spmd((tokens + 7) // 8, name_hint="dspark_attn_norm"):
         rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, tokens, output_fp32=False)
     zero_bf16_padding(normalized_attention, num_tokens)
-    attention_partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+    attention_partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
     dspark_attention(
         normalized_attention,
         wq_a,
@@ -383,7 +382,8 @@ def draft_layer(
     )
     zero_bf16_padding(attention_output, num_tokens)
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
-    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps)
     prefill_moe(
         attention_hidden,
         attention_pre_mix,
@@ -497,7 +497,7 @@ def _dspark_drafter(
     shared_w3: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     head_hidden: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16]],
-    attention_output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.FP32],
+    attention_output_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.BF16],
     attention_output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     recv_meta: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
@@ -823,7 +823,7 @@ def l3_dspark_drafter(
     window_cache_scale.bind_dynamic(2, C.ORI_BLOCKS_DYN)
     head_hidden.bind_dynamic(1, B_DYN)
 
-    attention_output_buf = pld.alloc_window_buffer([C.PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    attention_output_buf = pld.alloc_window_buffer([C.PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     attention_arrived_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     recv_meta_buf = pld.alloc_window_buffer([C.EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
@@ -835,7 +835,7 @@ def l3_dspark_drafter(
     routed_output_buf = pld.alloc_window_buffer([C.MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        attention_output = pld.window(attention_output_buf, [C.PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        attention_output = pld.window(attention_output_buf, [C.PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         attention_arrived = pld.window(attention_arrived_buf, [TP_SIZE, 1], dtype=pl.INT32)
         recv_meta = pld.window(recv_meta_buf, [C.EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)

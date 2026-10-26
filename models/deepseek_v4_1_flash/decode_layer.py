@@ -497,7 +497,7 @@ from decode_c1a_full import golden_c1a
 from decode_c2a_full import golden_c2a
 from decode_swa import golden_swa
 from gate import golden_gate_reference as gate
-from hc import golden_mhc_mixes, golden_hc_post, golden_hc_pre
+from hc import golden_mhc_mixes, golden_hc_post, golden_hc_collapse
 from rmsnorm import golden_rms_norm
 from sparse_attention import golden_swa_attention
 
@@ -690,7 +690,7 @@ def golden_decode_layer(
     attn_pre = attention_tensors["next_pre_mix"]
     attention_input = attention_tensors["attention_input"]
     next_pre_mix, ffn_post, ffn_residual = golden_mhc_mixes(attention_hidden, hc_ffn_fn, hc_ffn_scale, hc_ffn_base)
-    ffn_input = golden_hc_pre(attention_hidden, attn_pre).to(torch.bfloat16)
+    ffn_input = golden_hc_collapse(attention_hidden, attn_pre).to(torch.bfloat16)
     moe_overrides = {"x": ffn_input, "norm_weight": ffn_norm_weight}
     if num_tokens is not None:
         moe_overrides["num_tokens"] = num_tokens

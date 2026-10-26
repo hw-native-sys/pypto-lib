@@ -25,9 +25,9 @@ from config import (
     MAX_BATCH_PER_DP, WINDOW_CACHE_GROUP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, PREFILL_MAX_TOKENS,
     SP_T_DYN,
 )
-from hc import golden_mhc_mixes, hc_mixes
+from hc import golden_mhc_mixes
 from hc import golden_hc_post, prefill_sp_post
-from hc import golden_hc_pre, hc_pre, zero_bf16_padding
+from hc import golden_hc_collapse, hc_pre, zero_bf16_padding
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
 from o_proj import retire_prefill_signals, o_proj, prefill_sp_output_reduce_scatter
@@ -82,11 +82,11 @@ def prefill_swa_attention(
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    partial: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    """Write FP32 head-TP partials for packed causal SWA; write slots must be unique."""
+    """Write BF16 head-TP partials for packed causal SWA; write slots must be unique."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_prefill_previous_epoch", allow_early_resolve=False) as cache_ready:
         for peer in pl.range(TP_SIZE):
             previous_epoch = (attention_epoch - 1) * 2
@@ -117,7 +117,7 @@ def prefill_swa_attention(
     q = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     descriptors = pl.create_tensor([QUERY_TILE, RUN_PARTS, RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
     attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.FP32)
+    chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
 
     for start in pl.range(0, num_tokens, QUERY_TILE):
         active = pl.min(QUERY_TILE, num_tokens - start)
@@ -182,7 +182,7 @@ def prefill_swa(
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     hidden: pl.Tensor[[T_DYN, D], pl.BF16],
     attn_out: pl.Tensor[[SP_T_DYN, D], pl.BF16],
@@ -199,10 +199,10 @@ def prefill_swa(
     local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
+    hc_pre(
+        x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+        collapsed, next_pre_mix, post_mix, residual_mix,
     )
-    hc_pre(x_hc, incoming_pre_mix, collapsed)
     norm_tokens = pl.tensor.dim(collapsed, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
         rms_norm_tiled(collapsed, attn_norm_weight, local_hidden, norm_block, norm_tokens, output_fp32=False)
@@ -212,7 +212,7 @@ def prefill_swa(
         group_base, tp_rank, num_tokens, attention_epoch,
     )
     group_tokens = pl.tensor.dim(hidden, 0)
-    partial = pl.create_tensor([group_tokens, D], dtype=pl.FP32)
+    partial = pl.create_tensor([group_tokens, D], dtype=pl.BF16)
     if num_tokens > 0:
         prefill_swa_attention(
             hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
@@ -315,7 +315,7 @@ def l2_prefill_swa(
     attn_out: pl.Out[pl.Tensor[[SP_T_DYN, D], pl.BF16]],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     num_tokens: pl.Tensor[[1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -380,12 +380,12 @@ def l3_prefill_swa(
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
     input_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     input_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    data_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    data_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         input_data = pld.window(input_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         input_signal = pld.window(input_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        data = pld.window(data_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        data = pld.window(data_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         signal = pld.window(signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         # The rank takes these scales as MX_B_NN; a bare slice is ND, so annotate it.
         wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
@@ -536,7 +536,7 @@ def golden_prefill_swa_case(tensors):
             tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base],
         )
         incoming = tensors["incoming_pre_mix"][group].flatten(0, 1)[:tokens]
-        hidden = golden_rms_norm(golden_hc_pre(x_hc, incoming).to(torch.bfloat16), tensors["attn_norm_weight"][base])
+        hidden = golden_rms_norm(golden_hc_collapse(x_hc, incoming).to(torch.bfloat16), tensors["attn_norm_weight"][base])
         pre_mix[active:] = 0
         tensors["next_pre_mix"][group].copy_(token_shards(pre_mix, local_tokens))
         reduced, caches = reference_attention(tensors, hidden, base)

@@ -137,7 +137,7 @@ def dspark_attention(
     window_indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    output: pl.Tensor[[T_DYN, D], pl.FP32],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x, 0)
@@ -183,7 +183,7 @@ def dspark_attention_test(
     window_indices: pl.Tensor[[T_DYN, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16]],
-    output: pl.Out[pl.Tensor[[T_DYN, D], pl.FP32]],
+    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     x.bind_dynamic(0, T_DYN)
@@ -250,7 +250,7 @@ if __name__ == "__main__":
     specs = [TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=values[name])
              for name in SWA_INPUT_NAMES]
     specs += [
-        TensorSpec("output", [DSPARK_QUERY_WIDTH, D], torch.float32),
+        TensorSpec("output", [DSPARK_QUERY_WIDTH, D], torch.bfloat16),
         ScalarSpec("num_tokens", torch.int32, DSPARK_QUERY_WIDTH, compile_runtime=True),
     ]
     result = run(

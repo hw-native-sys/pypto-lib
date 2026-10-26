@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 from qkv_proj_rope import qkv_proj_rope
-from o_proj import o_proj, o_proj_hc_post
+from o_proj import o_proj
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, use_pretransposed_index_query, score_full_pretransposed,
     make_fp4_publish, select_index_topk, c1a_project_index_key, c1a_rotate_index_key,
@@ -19,7 +19,7 @@ from decode_indexer import (
 from sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE, attend_packed_cohorts,
 )
-from hc import hc_pre, hc_mixes, hc_post, _hc_post_from_partial
+from hc import hc_pre, hc_post
 from config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
@@ -108,9 +108,11 @@ def decode_c1a_full(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64)
     x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_pre(x_hc, pre_mix, x_attn)
+    hc_pre(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+        x_attn, next_pre_mix, post_mix, residual_mix,
+    )
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd((tokens + 7) // 8, name_hint="norm_in") as x_ready:
         norm_worker = pl.tile.get_block_idx()
@@ -188,31 +190,13 @@ def decode_c1a_full(
             max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather",
         )
         attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
-    if num_tokens > 0 and num_tokens <= tokens and tokens <= 16:
-        attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-        o_proj_hc_post(
-            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-            attn_out, x_hc, post_mix, residual_mix, output, num_tokens,
-        )
-    else:
-        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-        o_proj(
-            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-            partial, num_tokens, grouped_max_workers=64,
-        )
-        attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-        if num_tokens > 0 and num_tokens <= 16:
-            _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
-        else:
-            with pl.spmd(tokens, name_hint="cast_out"):
-                row = pl.tile.get_block_idx()
-                for col in pl.range(0, D, 512):
-                    value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
-                    if row < num_tokens:
-                        partial_tile = pl.load(partial, [row, col], [1, 512])
-                        value = pl.cast(partial_tile, pl.BF16, mode="rint")
-                    pl.store(value, [row, col], attn_out)
-            hc_post(attn_out, x_hc, post_mix, residual_mix, output)
+    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        attn_out, num_tokens, grouped_max_workers=64,
+    )
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output
 
 
@@ -405,7 +389,7 @@ def golden_c1a(tensors, mode="full"):
     )
     from utils import _publish_quantized_cache
 
-    from hc import golden_mhc_mixes, golden_hc_pre, golden_hc_post
+    from hc import golden_mhc_mixes, golden_hc_collapse, golden_hc_post
     from rmsnorm import golden_rms_norm
 
     a = dict(tensors)
@@ -413,7 +397,7 @@ def golden_c1a(tensors, mode="full"):
     next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
         x_hc, a["hc_attn_fn"], a["hc_attn_scale"], a["hc_attn_base"],
     )
-    attention_input = golden_hc_pre(x_hc, a["pre_mix"]).to(torch.bfloat16)
+    attention_input = golden_hc_collapse(x_hc, a["pre_mix"]).to(torch.bfloat16)
     x = golden_rms_norm(attention_input, a["attn_norm_weight"])
     a["x"] = x
     q, kv, qr = golden_qkv_proj_rope(

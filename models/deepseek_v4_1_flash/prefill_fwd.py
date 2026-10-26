@@ -86,9 +86,8 @@ from config import (
     ROUTE_T_DYN,
 )
 
-from hc import hc_mixes
 from hc import hc_post
-from hc import hc_pre, zero_bf16_padding
+from hc import hc_head, hc_pre, zero_bf16_padding
 from input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
 from utils import paged_slots, window_metadata
@@ -194,7 +193,7 @@ def prefill_attention(
     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
     group_base: pl.Scalar[pl.INT32],
@@ -205,7 +204,7 @@ def prefill_attention(
 ):
     if mode == 0:
         tokens = pl.tensor.dim(x, 0)
-        partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+        partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
         prefill_swa_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
             wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
@@ -217,7 +216,7 @@ def prefill_attention(
         )
     elif mode == 1:
         attention_tokens = pl.tensor.dim(x, 0)
-        attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.FP32)
+        attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
         prefill_c2a_full_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
@@ -235,7 +234,7 @@ def prefill_attention(
         )
     elif mode == 2:
         attention_tokens = pl.tensor.dim(x, 0)
-        attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.FP32)
+        attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
         prefill_c2a_reuse_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
@@ -508,7 +507,7 @@ def l2_prefill_fwd(
     data_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
     routed_output: pld.DistributedTensor[[MOE_TOKENS * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
-    attention_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.FP32],
+    attention_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.BF16],
     attention_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
     head_hidden: pld.DistributedTensor[[16, D], pl.BF16],
     head_hidden_done: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
@@ -636,7 +635,7 @@ def l2_prefill_fwd(
                 encoder_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [0, 0])
                 encoder_collapsed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
                 encoder_normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-                hc_pre(encoder_hidden, encoder_pre, encoder_collapsed)
+                hc_head(encoder_hidden, encoder_pre, encoder_collapsed)
                 norm_tokens = pl.tensor.dim(encoder_collapsed, 0)
                 for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
                     rms_norm_tiled(
@@ -660,11 +659,10 @@ def l2_prefill_fwd(
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             attn_output = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             zero_bf16_padding(attn_output, pl.cast(0, pl.INT32))
-            hc_mixes(
-                hidden, layer_attn_fn, layer_attn_scale, layer_attn_base,
-                attn_pre, attn_post, attn_residual, sinkhorn_blocks=64,
+            hc_pre(
+                hidden, delayed_pre, layer_attn_fn, layer_attn_scale, layer_attn_base,
+                collapsed, attn_pre, attn_post, attn_residual,
             )
-            hc_pre(hidden, delayed_pre, collapsed)
             norm_tokens = pl.tensor.dim(collapsed, 0)
             for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
                 rms_norm_tiled(collapsed, layer_attn_norm, normalized, norm_block, norm_tokens, output_fp32=False)
@@ -699,7 +697,8 @@ def l2_prefill_fwd(
                     layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
                     attn_output, rank, 0, active, layer + 1, mode,
                 )
-            hc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden)
+            hc_post_deps = pl.array.create(2, pl.TASK_ID)
+            hc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden, deps=hc_post_deps)
         moe_ready = _prefill_moe(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
@@ -872,7 +871,7 @@ def l3_prefill_fwd(
     data_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
     routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
-    attention_window_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    attention_window_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     attention_arrived_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     head_hidden_buffer = pld.alloc_window_buffer([16, D], dtype=pl.BF16)
     head_hidden_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
@@ -888,7 +887,7 @@ def l3_prefill_fwd(
         data_arrived = pld.window(data_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
         routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
-        attention_window = pld.window(attention_window_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        attention_window = pld.window(attention_window_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         attention_arrived = pld.window(attention_arrived_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         head_hidden = pld.window(head_hidden_buffer, [16, D], dtype=pl.BF16)
         head_hidden_done = pld.window(head_hidden_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)

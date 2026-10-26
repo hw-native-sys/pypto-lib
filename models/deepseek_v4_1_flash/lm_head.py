@@ -44,7 +44,7 @@ from pypto.ir import DistributedConfig
 # Standalone LM-head validation defaults to TP2/DP1.
 
 from config import FLASH as M, TP_SIZE as CONFIG_TP_SIZE
-from hc import hc_head, golden_hc_pre
+from hc import hc_head, golden_hc_collapse
 from rmsnorm import rms_norm_tiled_compensated, golden_rms_norm_tiled
 
 
@@ -627,7 +627,7 @@ def golden_final_output(tensors):
 
     hidden = []
     for rank in range(WORLD_SIZE):
-        collapsed = golden_hc_pre(tensors["x_hc"][rank], tensors["pre_mix"][rank]).to(torch.bfloat16)
+        collapsed = golden_hc_collapse(tensors["x_hc"][rank], tensors["pre_mix"][rank]).to(torch.bfloat16)
         normalized = golden_rms_norm_tiled(collapsed, tensors["final_norm_weight"][rank])
         hidden.append(normalized.to(torch.bfloat16))
     golden_lm_head({**tensors, "hidden_states": torch.stack(hidden)})

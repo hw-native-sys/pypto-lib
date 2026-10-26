@@ -40,7 +40,7 @@ from expert_shared import expert_shared
 from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
 )
-from hc import hc_mixes, hc_pre, hc_post_after
+from hc import hc_pre, hc_post
 
 
 # model config
@@ -376,11 +376,10 @@ def moe(
     t = MOE_TOKENS
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
-    mixes_ready = hc_mixes(
-        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=16,
+    mixes_ready = hc_pre(
+        x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        x_mixed, next_pre_mix, post_mix, residual_mix,
     )
-    hc_pre(x_hc, pre_mix, x_mixed)
 
     # MoE transport and routed-result scope.
     with pl.scope():
@@ -436,7 +435,10 @@ def moe(
             scatter_done,
             num_tokens, ep_rank, moe_epoch,
         )
-        hc_post_after(sublayer, x_hc, post_mix, residual_mix, x_next, output_ready, mixes_ready)
+        hc_post_deps = pl.array.create(2, pl.TASK_ID)
+        hc_post_deps[0] = output_ready
+        hc_post_deps[1] = mixes_ready
+        hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps)
     return x_next
 
 
@@ -717,7 +719,7 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
 def golden_moe(tensors):
     """Compose the validated mHC references around the MoE reference."""
     import torch
-    from hc import golden_mhc_mixes, golden_hc_pre, golden_hc_post
+    from hc import golden_mhc_mixes, golden_hc_collapse, golden_hc_post
     from rmsnorm import golden_rms_norm_tiled
     from gate import golden_gate_normalized_core
     from expert_shared import golden_expert_shared
@@ -737,7 +739,7 @@ def golden_moe(tensors):
         next_pre_mix[rank] = pre
         post_mix[rank] = post
         residual_mix[rank] = residual
-        x_mixed[rank] = golden_hc_pre(x_hc[rank], tensors['pre_mix'][rank]).to(torch.bfloat16)
+        x_mixed[rank] = golden_hc_collapse(x_hc[rank], tensors['pre_mix'][rank]).to(torch.bfloat16)
 
     tensors["next_pre_mix"][:] = next_pre_mix
     tensors["x_mixed"][:] = x_mixed

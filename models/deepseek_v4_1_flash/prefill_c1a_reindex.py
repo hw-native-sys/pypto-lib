@@ -20,9 +20,9 @@ from config import (
     INDEX_POOL_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP,
     SP_T_DYN,
 )
-from hc import golden_mhc_mixes, hc_mixes
+from hc import golden_mhc_mixes
 from hc import golden_hc_post, hc_post, prefill_sp_post
-from hc import golden_hc_pre, hc_pre
+from hc import golden_hc_collapse, hc_pre
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from sparse_attention import (
     attend_packed, golden_compressed_attention, golden_prefill_c1a_attention,
@@ -113,7 +113,7 @@ def prefill_c1a_reindex_attention(
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output: pl.Tensor,
     group_base: pl.Scalar[pl.INT32],
@@ -125,7 +125,7 @@ def prefill_c1a_reindex_attention(
 ):
     """Refresh ratio-1 Top-K rows inside a supplied candidate set."""
     tokens = pl.tensor.dim(x, 0)
-    partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
+    partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
     if num_tokens > 0:
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
@@ -282,7 +282,7 @@ def l2_prefill_c1a_reindex_sharded(
     x_hc_out: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32]],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     num_tokens: pl.Tensor[[1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -322,11 +322,11 @@ def l2_prefill_c1a_reindex_sharded(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
-    )
     hc_collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_pre(x_hc, pre_mix, hc_collapsed)
+    hc_pre(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+        hc_collapsed, next_pre_mix, post_mix, residual_mix,
+    )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
         rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
@@ -439,12 +439,12 @@ def l3_prefill_c1a_reindex_sharded(
     x_hc_out.bind_dynamic(1, SP_T_DYN)
     input_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    output_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    output_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     output_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         input_window = pld.window(input_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         input_arrived = pld.window(input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        output_window = pld.window(output_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        output_window = pld.window(output_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         output_arrived = pld.window(output_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
         wq_b_scale_r: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
@@ -515,7 +515,7 @@ def prefill_c1a_reindex(
     ],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     hidden: pl.Tensor[[T_DYN, D], pl.BF16],
     attn_input: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -531,8 +531,10 @@ def prefill_c1a_reindex(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64)
-    hc_pre(x_hc, pre_mix, hidden)
+    hc_pre(
+        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
+        hidden, next_pre_mix, post_mix, residual_mix,
+    )
     norm_tokens = pl.tensor.dim(hidden, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
         rms_norm_tiled(hidden, attn_norm_weight, attn_input, norm_block, norm_tokens, output_fp32=False)
@@ -547,7 +549,8 @@ def prefill_c1a_reindex(
         group_base, tp_rank, num_tokens, attention_epoch,
         scatter_output=False, use_candidates=True,
     )
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output)
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output
 
 
@@ -599,7 +602,7 @@ def l2_prefill_c1a_reindex(
     ],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.Out[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
@@ -689,10 +692,10 @@ def l3_prefill_c1a_reindex(
     output: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    output_window_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    output_window_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     output_arrived_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        output_window = pld.window(output_window_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        output_window = pld.window(output_window_buf, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         output_arrived = pld.window(output_arrived_buf, [TP_SIZE, 1], dtype=pl.INT32)
         wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
         wq_b_scale_r: pl.Tensor[
@@ -770,7 +773,7 @@ def golden_prefill_c1a_reindex_case(tensors):
         tensors["x_hc"][0], tensors["hc_attn_fn"][0],
         tensors["hc_attn_scale"][0], tensors["hc_attn_base"][0],
     )
-    hidden = golden_hc_pre(tensors["x_hc"][0], tensors["pre_mix"][0]).to(torch.bfloat16)
+    hidden = golden_hc_collapse(tensors["x_hc"][0], tensors["pre_mix"][0]).to(torch.bfloat16)
     attn_input = golden_rms_norm(hidden.to(torch.bfloat16), tensors["attn_norm_weight"][0])
     active = int(tensors["num_tokens"])
     output = tensors["output"]

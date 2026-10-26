@@ -62,7 +62,7 @@ from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_all
 from golden.validation import ratio_reldiff
 from hc import (
     HC_INPUT_NAMES, make_hc_inputs,
-    golden_mhc_mixes, golden_hc_post, golden_hc_pre,
+    golden_mhc_mixes, golden_hc_post, golden_hc_collapse,
 )
 from prefill_moe import (
     AUX_WIDTH, EP_SIZE, MX_GROUP, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD,
@@ -140,7 +140,7 @@ def l2_prefill_layer_attention(
     attn_output: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
     attn_pre_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT], pl.FP32]],
     x_hc_mid: pl.Out[pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32]],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -226,7 +226,7 @@ def l2_prefill_layer_restore(
     ffn_residual_mix: pl.Tensor[[TOKENS, HC_MULT, HC_MULT], pl.FP32],
     ffn_output: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
     x_hc_out: pl.Out[pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32]],
-    ffn_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.FP32],
+    ffn_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     ffn_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -310,10 +310,10 @@ def l3_prefill_layer(
     """Allocate the TP and EP communication windows and launch both sublayers per device."""
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
-    attention_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    attention_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     attention_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        attention_data = pld.window(attention_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        attention_data = pld.window(attention_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         attention_signal = pld.window(attention_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         # Each rank consumes packed MX_B_NN scale rows; a bare slice is ND.
         wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
@@ -370,10 +370,10 @@ def l3_prefill_layer(
             rank, num_tokens, layer_epoch, device=rank,
         )
 
-    ffn_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+    ffn_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     ffn_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        ffn_data = pld.window(ffn_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.FP32)
+        ffn_data = pld.window(ffn_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         ffn_signal = pld.window(ffn_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         l2_prefill_layer_restore(
             x_hc_mid[rank], ffn_owned[rank], ffn_post_mix[rank], ffn_residual_mix[rank],
@@ -470,7 +470,7 @@ def golden_moe_sublayer(tensors, x_hc_mid, attn_pre_mix, tokens):
         pre, post, comb = golden_mhc_mixes(
             mid, tensors["hc_ffn_fn"][base], tensors["hc_ffn_scale"][base], tensors["hc_ffn_base"][base]
         )
-        hidden = golden_hc_pre(mid, attn_pre_mix[base]).to(torch.bfloat16)
+        hidden = golden_hc_collapse(mid, attn_pre_mix[base]).to(torch.bfloat16)
         for rank in range(base, base + TP_SIZE):
             ffn_input[rank] = hidden
         mixes[base] = (pre, post, comb)
@@ -546,7 +546,7 @@ def make_layer_golden(mode):
             pre, post, comb = golden_mhc_mixes(
                 x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
             )
-            collapsed = golden_hc_pre(x_hc, tensors["pre_mix"][base]).to(torch.bfloat16)
+            collapsed = golden_hc_collapse(x_hc, tensors["pre_mix"][base]).to(torch.bfloat16)
             x = golden_rms_norm(collapsed, tensors["attn_norm_weight"][base])
             reference = golden_reference_c2a_reuse if mode == "reuse" else golden_reference_c2a
             attention, results = reference_attention(mode, tensors, x, ranks, reference=reference)
@@ -604,7 +604,7 @@ def compare_ffn_input(actual, expected, *, inputs, actual_outputs, **kwargs):
     check = ratio_allclose(atol=1e-4, rtol=2**-8, max_error_ratio=0.002)
     passed = True
     for base in range(0, actual.shape[0], TP_SIZE):
-        replay = golden_hc_pre(actual_outputs["x_hc_mid"][base], actual_outputs["attn_pre_mix"][base]).to(torch.bfloat16)
+        replay = golden_hc_collapse(actual_outputs["x_hc_mid"][base], actual_outputs["attn_pre_mix"][base]).to(torch.bfloat16)
         valid, _ = check(actual[base], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
         passed &= valid
         passed &= report_stage("ffn_input(end-to-end)", actual[base], expected[base])[0] <= 0.01
