@@ -124,7 +124,6 @@ def decode_c2a_full(
         x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
         qr, query, kv_projection, window_kv, num_tokens,
-        max_workers=64,
         fuse_qnorm=False, q_b_n_tile=128, q_b_max_workers=2147483647,
         fuse_kv_norm_rope=True,
     )

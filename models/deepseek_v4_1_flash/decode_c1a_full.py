@@ -124,7 +124,7 @@ def decode_c1a_full(
     qkv_proj_rope(
         x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
-        qr, query, kv_projection, kv, num_tokens, max_workers=32,
+        qr, query, kv_projection, kv, num_tokens,
         fuse_qnorm=False, q_b_n_tile=128, q_b_max_workers=Q_B_WORKER_TILE,
         fuse_kv_norm_rope=False,
     )

@@ -32,10 +32,6 @@ HC_DIM = M.hc_dim
 MIX_HC = M.mix_hc
 MX_GROUP = M.weight_block_size[0]
 
-# tiling
-Q_ROPE_WORKER_TILE = 64
-
-
 @pl.jit.inline(auto_scope=False)
 def decode_swa(
     x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
@@ -83,7 +79,7 @@ def decode_swa(
     qkv_proj_rope(
         x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
-        qr, q, kv_projection, kv, num_tokens, max_workers=Q_ROPE_WORKER_TILE,
+        qr, q, kv_projection, kv, num_tokens,
         fuse_qnorm=True, q_b_n_tile=256, q_b_max_workers=2147483647,
         fuse_kv_norm_rope=False,
     )
