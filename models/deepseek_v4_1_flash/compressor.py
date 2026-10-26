@@ -34,7 +34,6 @@ COMPRESSOR_K_TILE = 64
 COMPRESSOR_QUERY_TILE = 128
 # Limit Cube rounding before the compensated Vector accumulation.
 COMPRESSOR_SEGMENTS = D // COMPRESSOR_K_TILE
-COMPRESSOR_K_CHUNK = D // COMPRESSOR_SEGMENTS
 COMPRESSOR_PROJ_N_TILE = 128
 COMPRESSOR_PROJ_K_TILE = 256
 
@@ -97,223 +96,78 @@ def _sum_ratio2_segments(
 
 
 @pl.jit.inline
-def _project_ratio2_weights_staged(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Retain FP32 weight residuals through high and residual accumulators.
-
-    Three BF16 weight terms preserve FP32 weights. Bound each Cube reduction
-    to one K chunk, then compensate the Vector sum of the staged GM products
-    to reduce accumulation error near pooled BF16 rounding boundaries.
-    Mixed producers use Vector startup and FP32 Vector stores.
-    """
-    high_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
-    low_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
-    tail_weight = pl.create_tensor([D, HEAD_DIM], dtype=pl.BF16)
-    split_blocks = D // COMPRESSOR_K_TILE * (HEAD_DIM // N_TILE)
-    split_workers = pl.min(split_blocks, 64)
-    with pl.spmd(split_workers, name_hint="split_cmp") as split_tid:
-        split_worker = pl.tile.get_block_idx()
-        for split_block in pl.range(split_worker, split_blocks, split_workers):
-            split_k0 = split_block // (HEAD_DIM // N_TILE) * COMPRESSOR_K_TILE
-            split_n0 = split_block % (HEAD_DIM // N_TILE) * N_TILE
-            value = weight[split_k0 : split_k0 + COMPRESSOR_K_TILE, split_n0 : split_n0 + N_TILE]
-            high = pl.cast(value, pl.BF16, mode="rint")
-            residual = pl.sub(value, pl.cast(high, pl.FP32))
-            low = pl.cast(residual, pl.BF16, mode="rint")
-            tail = pl.cast(pl.sub(residual, pl.cast(low, pl.FP32)), pl.BF16, mode="rint")
-            high_weight[split_k0 : split_k0 + COMPRESSOR_K_TILE, split_n0 : split_n0 + N_TILE] = high
-            low_weight[split_k0 : split_k0 + COMPRESSOR_K_TILE, split_n0 : split_n0 + N_TILE] = low
-            tail_weight[split_k0 : split_k0 + COMPRESSOR_K_TILE, split_n0 : split_n0 + N_TILE] = tail
-    completion = pl.array.create(1, pl.TASK_ID)
-    completion[0] = split_tid
-    if num_tokens > 0:
-        chunk_rows = pl.min(pl.cast(num_tokens, pl.INDEX), COMPRESSOR_QUERY_TILE)
-        high_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
-        residual_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
-        for begin in pl.range(0, num_tokens, chunk_rows):
-            chunk_active = pl.min(chunk_rows, num_tokens - begin)
-            output_blocks = (chunk_active + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
-            blocks = output_blocks * COMPRESSOR_SEGMENTS
-            # The synchronous mixed cohort must fit the available runtime clusters.
-            workers = pl.min(pl.min(blocks, 16), pl.system.available_cluster_count())
-            with pl.spmd(workers, name_hint="proj_cmp", deps=[completion[0]], sync_start=True) as cube_tid:
-                cube_worker = pl.tile.get_block_idx()
-                for cube_block in pl.range(cube_worker, blocks, workers):
-                    cube_segment = cube_block % COMPRESSOR_SEGMENTS
-                    cube_tile_block = cube_block // COMPRESSOR_SEGMENTS
-                    cube_t0 = cube_tile_block // (HEAD_DIM // N_TILE) * M_TILE
-                    cube_n0 = cube_tile_block % (HEAD_DIM // N_TILE) * N_TILE
-                    cube_rows = pl.min(M_TILE, chunk_active - cube_t0)
-                    high_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-                    residual_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-                    for cube_k0 in pl.range(cube_segment * COMPRESSOR_K_CHUNK, (cube_segment + 1) * COMPRESSOR_K_CHUNK, COMPRESSOR_K_TILE):
-                        a = pl.slice(x, [M_TILE, COMPRESSOR_K_TILE], [begin + cube_t0, cube_k0], valid_shape=[cube_rows, COMPRESSOR_K_TILE])
-                        a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
-                        high = high_weight[cube_k0 : cube_k0 + COMPRESSOR_K_TILE, cube_n0 : cube_n0 + N_TILE]
-                        low = low_weight[cube_k0 : cube_k0 + COMPRESSOR_K_TILE, cube_n0 : cube_n0 + N_TILE]
-                        tail = tail_weight[cube_k0 : cube_k0 + COMPRESSOR_K_TILE, cube_n0 : cube_n0 + N_TILE]
-                        high_acc = pl.matmul_acc(high_acc, a, high, init_cond=(cube_k0 == cube_segment * COMPRESSOR_K_CHUNK))
-                        residual_acc = pl.matmul_acc(residual_acc, a, low, init_cond=(cube_k0 == cube_segment * COMPRESSOR_K_CHUNK))
-                        residual_acc = pl.matmul_acc(residual_acc, a, tail)
-                    high_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(high_acc, 1.0), cube_rows, N_TILE)
-                    residual_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(residual_acc, 1.0), cube_rows, N_TILE)
-            with pl.spmd(pl.min(output_blocks, 16), name_hint="sum_cmp", deps=[cube_tid]) as sum_tid:
-                sum_worker = pl.tile.get_block_idx()
-                for sum_block in pl.range(sum_worker, output_blocks, pl.min(output_blocks, 16)):
-                    sum_t0 = sum_block // (HEAD_DIM // N_TILE) * M_TILE
-                    sum_n0 = sum_block % (HEAD_DIM // N_TILE) * N_TILE
-                    sum_rows = pl.min(M_TILE, chunk_active - sum_t0)
-                    _sum_ratio2_segments(
-                        high_product, residual_product, output,
-                        chunk_rows, begin, sum_t0, sum_n0, sum_rows,
-                    )
-            completion[0] = sum_tid
-    return output
-
-
-@pl.jit.inline
-def _project_ratio2_weights_consumer(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Project one M16 query tile with three BF16 weight terms and compensated segment sums."""
-    if num_tokens > 0:
-        chunk_rows = pl.min(pl.cast(num_tokens, pl.INDEX), COMPRESSOR_QUERY_TILE)
-        high_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
-        residual_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
-        for begin in pl.range(0, num_tokens, chunk_rows):
-            chunk_active = pl.min(chunk_rows, num_tokens - begin)
-            output_blocks = (chunk_active + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
-            blocks = output_blocks * COMPRESSOR_SEGMENTS
-            # The synchronous mixed cohort must fit the available runtime clusters.
-            workers = pl.min(pl.min(blocks, 16), pl.system.available_cluster_count())
-            with pl.spmd(workers, name_hint="c2a_compressor_consumer", sync_start=True) as cube_tid:
-                cube_worker = pl.tile.get_block_idx()
-                for cube_block in pl.range(cube_worker, blocks, workers):
-                    cube_segment = cube_block % COMPRESSOR_SEGMENTS
-                    cube_tile_block = cube_block // COMPRESSOR_SEGMENTS
-                    cube_t0 = cube_tile_block // (HEAD_DIM // N_TILE) * M_TILE
-                    cube_n0 = cube_tile_block % (HEAD_DIM // N_TILE) * N_TILE
-                    cube_rows = pl.min(M_TILE, chunk_active - cube_t0)
-                    high_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-                    residual_acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
-                    for cube_k0 in pl.range(cube_segment * COMPRESSOR_K_CHUNK, (cube_segment + 1) * COMPRESSOR_K_CHUNK, COMPRESSOR_K_TILE):
-                        a = pl.slice(x, [M_TILE, COMPRESSOR_K_TILE], [begin + cube_t0, cube_k0], valid_shape=[cube_rows, COMPRESSOR_K_TILE])
-                        a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
-                        value = weight[cube_k0 : cube_k0 + COMPRESSOR_K_TILE, cube_n0 : cube_n0 + N_TILE]
-                        high = pl.cast(value, pl.BF16, mode="rint")
-                        residual = pl.sub(value, pl.cast(high, pl.FP32))
-                        low = pl.cast(residual, pl.BF16, mode="rint")
-                        tail = pl.cast(pl.sub(residual, pl.cast(low, pl.FP32)), pl.BF16, mode="rint")
-                        high_acc = pl.matmul_acc(high_acc, a, high, init_cond=(cube_k0 == cube_segment * COMPRESSOR_K_CHUNK))
-                        residual_acc = pl.matmul_acc(residual_acc, a, low, init_cond=(cube_k0 == cube_segment * COMPRESSOR_K_CHUNK))
-                        residual_acc = pl.matmul_acc(residual_acc, a, tail)
-                    high_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(high_acc, 1.0), cube_rows, N_TILE)
-                    residual_product[cube_segment * chunk_rows + cube_t0 : cube_segment * chunk_rows + cube_t0 + M_TILE, cube_n0 : cube_n0 + N_TILE] = pl.set_validshape(pl.mul(residual_acc, 1.0), cube_rows, N_TILE)
-            with pl.spmd(pl.min(output_blocks, 16), name_hint="c2a_compressor_sum", deps=[cube_tid]) as sum_tid:
-                sum_worker = pl.tile.get_block_idx()
-                for sum_block in pl.range(sum_worker, output_blocks, pl.min(output_blocks, 16)):
-                    sum_t0 = sum_block // (HEAD_DIM // N_TILE) * M_TILE
-                    sum_n0 = sum_block % (HEAD_DIM // N_TILE) * N_TILE
-                    sum_rows = pl.min(M_TILE, chunk_active - sum_t0)
-                    _sum_ratio2_segments(
-                        high_product, residual_product, output,
-                        chunk_rows, begin, sum_t0, sum_n0, sum_rows,
-                    )
-    return output
-
-
-@pl.jit.inline
-def _project_ratio2_weights_reuse_rows(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Reuse each decomposed K64 weight panel across independent M16 row tiles."""
-    chunk_rows = pl.cast(num_tokens, pl.INDEX)
-    high_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
-    residual_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
-    panel_blocks = (HEAD_DIM // N_TILE) * COMPRESSOR_SEGMENTS
-    workers = pl.min(pl.min(panel_blocks, 16), pl.system.available_cluster_count())
-    with pl.spmd(workers, name_hint="c2a_compressor_reuse_rows", sync_start=True) as cube_tid:
-        cube_worker = pl.tile.get_block_idx()
-        for panel_block in pl.range(cube_worker, panel_blocks, workers):
-            cube_segment = panel_block % COMPRESSOR_SEGMENTS
-            cube_n0 = panel_block // COMPRESSOR_SEGMENTS * N_TILE
-            cube_k0 = cube_segment * COMPRESSOR_K_TILE
-            value = pl.load(weight, [cube_k0, cube_n0], [COMPRESSOR_K_TILE, N_TILE], target_memory=pl.MemorySpace.Vec)
-            high = pl.cast(value, pl.BF16, mode="rint")
-            high_fp32 = pl.cast(high, pl.FP32)
-            residual = pl.sub(value, high_fp32)
-            low = pl.cast(residual, pl.BF16, mode="rint")
-            low_fp32 = pl.cast(low, pl.FP32)
-            tail_fp32 = pl.sub(residual, low_fp32)
-            tail = pl.cast(tail_fp32, pl.BF16, mode="rint")
-            high_mat = pl.tile.move(
-                high, target_memory=pl.MemorySpace.Mat,
-                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
-            )
-            high_right = pl.tile.move(high_mat, target_memory=pl.MemorySpace.Right)
-            low_mat = pl.tile.move(
-                low, target_memory=pl.MemorySpace.Mat,
-                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
-            )
-            low_right = pl.tile.move(low_mat, target_memory=pl.MemorySpace.Right)
-            tail_mat = pl.tile.move(
-                tail, target_memory=pl.MemorySpace.Mat,
-                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
-            )
-            tail_right = pl.tile.move(tail_mat, target_memory=pl.MemorySpace.Right)
-            for cube_t0 in pl.range(0, chunk_rows, M_TILE):
-                cube_rows = pl.min(M_TILE, chunk_rows - cube_t0)
-                a = pl.load(x, [cube_t0, cube_k0], [M_TILE, COMPRESSOR_K_TILE], valid_shape=[cube_rows, COMPRESSOR_K_TILE], target_memory=pl.MemorySpace.Vec)
-                a_fp32 = pl.cast(a, pl.FP32)
-                a = pl.cast(a_fp32, pl.BF16, mode="rint")
-                high_acc = pl.tile.create([M_TILE, N_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
-                residual_acc = pl.tile.create([M_TILE, N_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
-                high_acc = pl.matmul_acc(high_acc, a, high_right, init_cond=True)
-                residual_acc = pl.matmul_acc(residual_acc, a, low_right, init_cond=True)
-                residual_acc = pl.matmul_acc(residual_acc, a, tail_right)
-                high_value = pl.mul(high_acc, 1.0)
-                high_value = pl.set_validshape(high_value, cube_rows, N_TILE)
-                high_product = pl.store(high_value, [cube_segment * chunk_rows + cube_t0, cube_n0], high_product)
-                residual_value = pl.mul(residual_acc, 1.0)
-                residual_value = pl.set_validshape(residual_value, cube_rows, N_TILE)
-                residual_product = pl.store(residual_value, [cube_segment * chunk_rows + cube_t0, cube_n0], residual_product)
-    output_blocks = (chunk_rows + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
-    with pl.spmd(pl.min(output_blocks, 16), name_hint="c2a_compressor_reuse_sum", deps=[cube_tid]) as sum_tid:
-        sum_worker = pl.tile.get_block_idx()
-        for sum_block in pl.range(sum_worker, output_blocks, pl.min(output_blocks, 16)):
-            sum_t0 = sum_block // (HEAD_DIM // N_TILE) * M_TILE
-            sum_n0 = sum_block % (HEAD_DIM // N_TILE) * N_TILE
-            sum_rows = pl.min(M_TILE, chunk_rows - sum_t0)
-            _sum_ratio2_segments(
-                high_product, residual_product, output,
-                chunk_rows, 0, sum_t0, sum_n0, sum_rows,
-            )
-    return output
-
-
-@pl.jit.inline
 def project_ratio2_weights(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     weight: pl.Tensor[[D, HEAD_DIM], pl.FP32],
     output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    if num_tokens > 0 and num_tokens <= M_TILE:
-        _project_ratio2_weights_consumer(x, weight, output, num_tokens)
-    elif num_tokens > M_TILE and num_tokens <= 80 and pl.tensor.dim(x, 0) == num_tokens and COMPRESSOR_K_CHUNK == COMPRESSOR_K_TILE:
-        _project_ratio2_weights_reuse_rows(x, weight, output, num_tokens)
-    else:
-        _project_ratio2_weights_staged(x, weight, output, num_tokens)
+    """Reuse decomposed weight panels with bounded compensated row staging."""
+    completion = pl.array.create(1, pl.TASK_ID)
+    completion[0] = pl.system.task_dummy(deps=[])
+    for begin in pl.range(0, num_tokens, COMPRESSOR_QUERY_TILE):
+        chunk_rows = pl.min(pl.cast(num_tokens, pl.INDEX) - begin, COMPRESSOR_QUERY_TILE)
+        high_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
+        residual_product = pl.create_tensor([COMPRESSOR_SEGMENTS * chunk_rows, HEAD_DIM], dtype=pl.FP32)
+        panel_blocks = (HEAD_DIM // N_TILE) * COMPRESSOR_SEGMENTS
+        workers = pl.min(pl.min(panel_blocks, 16), pl.system.available_cluster_count())
+        with pl.spmd(workers, name_hint="c2a_compressor_reuse_rows", deps=[completion[0]], sync_start=True) as cube_tid:
+            cube_worker = pl.tile.get_block_idx()
+            for panel_block in pl.range(cube_worker, panel_blocks, workers):
+                cube_segment = panel_block % COMPRESSOR_SEGMENTS
+                cube_n0 = panel_block // COMPRESSOR_SEGMENTS * N_TILE
+                cube_k0 = cube_segment * COMPRESSOR_K_TILE
+                value = pl.load(weight, [cube_k0, cube_n0], [COMPRESSOR_K_TILE, N_TILE], target_memory=pl.MemorySpace.Vec)
+                high = pl.cast(value, pl.BF16, mode="rint")
+                high_fp32 = pl.cast(high, pl.FP32)
+                residual = pl.sub(value, high_fp32)
+                low = pl.cast(residual, pl.BF16, mode="rint")
+                low_fp32 = pl.cast(low, pl.FP32)
+                tail_fp32 = pl.sub(residual, low_fp32)
+                tail = pl.cast(tail_fp32, pl.BF16, mode="rint")
+                high_mat = pl.tile.move(
+                    high, target_memory=pl.MemorySpace.Mat,
+                    blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
+                )
+                high_right = pl.tile.move(high_mat, target_memory=pl.MemorySpace.Right)
+                low_mat = pl.tile.move(
+                    low, target_memory=pl.MemorySpace.Mat,
+                    blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
+                )
+                low_right = pl.tile.move(low_mat, target_memory=pl.MemorySpace.Right)
+                tail_mat = pl.tile.move(
+                    tail, target_memory=pl.MemorySpace.Mat,
+                    blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
+                )
+                tail_right = pl.tile.move(tail_mat, target_memory=pl.MemorySpace.Right)
+                for cube_t0 in pl.range(0, chunk_rows, M_TILE):
+                    cube_rows = pl.min(M_TILE, chunk_rows - cube_t0)
+                    a = pl.load(x, [begin + cube_t0, cube_k0], [M_TILE, COMPRESSOR_K_TILE], valid_shape=[cube_rows, COMPRESSOR_K_TILE], target_memory=pl.MemorySpace.Vec)
+                    a_fp32 = pl.cast(a, pl.FP32)
+                    a = pl.cast(a_fp32, pl.BF16, mode="rint")
+                    high_acc = pl.tile.create([M_TILE, N_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
+                    residual_acc = pl.tile.create([M_TILE, N_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc)
+                    high_acc = pl.matmul_acc(high_acc, a, high_right, init_cond=True)
+                    residual_acc = pl.matmul_acc(residual_acc, a, low_right, init_cond=True)
+                    residual_acc = pl.matmul_acc(residual_acc, a, tail_right)
+                    high_value = pl.mul(high_acc, 1.0)
+                    high_value = pl.set_validshape(high_value, cube_rows, N_TILE)
+                    high_product = pl.store(high_value, [cube_segment * chunk_rows + cube_t0, cube_n0], high_product)
+                    residual_value = pl.mul(residual_acc, 1.0)
+                    residual_value = pl.set_validshape(residual_value, cube_rows, N_TILE)
+                    residual_product = pl.store(residual_value, [cube_segment * chunk_rows + cube_t0, cube_n0], residual_product)
+        output_blocks = (chunk_rows + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
+        with pl.spmd(pl.min(output_blocks, 16), name_hint="c2a_compressor_reuse_sum", deps=[cube_tid]) as sum_tid:
+            sum_worker = pl.tile.get_block_idx()
+            for sum_block in pl.range(sum_worker, output_blocks, pl.min(output_blocks, 16)):
+                sum_t0 = sum_block // (HEAD_DIM // N_TILE) * M_TILE
+                sum_n0 = sum_block % (HEAD_DIM // N_TILE) * N_TILE
+                sum_rows = pl.min(M_TILE, chunk_rows - sum_t0)
+                _sum_ratio2_segments(
+                    high_product, residual_product, output,
+                    chunk_rows, begin, sum_t0, sum_n0, sum_rows,
+                )
+        completion[0] = sum_tid
     return output
 
 

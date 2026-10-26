@@ -13,7 +13,7 @@ import pypto.language as pl
 from rmsnorm import make_norm_with_deps
 from config import (
     B_DYN, CMP_POSITIONS_DYN, FLASH, INDEX_BLOCKS_DYN, INDEX_CACHE_GROUP, INDEX_POOL_BLOCKS_DYN,
-    INDEX_POOL_POSITIONS_DYN, TABLE_DYN, T_DYN, TP_SIZE,
+    INDEX_POOL_POSITIONS_DYN, TABLE_DYN, T_DYN,
 )
 
 
@@ -53,6 +53,10 @@ CANDIDATE_LEAF_TILE = 8192
 CANDIDATE_SHORT_LEAF_TILE = 2048
 CANDIDATE_MAX_LEAVES = (FLASH.max_position_embeddings // CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_LEAF_TILE + 1
 INDEX_SCORE_POSITIONS_DYN = pl.dynamic("V41_INDEX_SCORE_POSITIONS_DYN")
+
+# Request-group score capacities for the 8192-start-position workloads.
+C1A_REQUEST_GROUP_SCORE_WIDTH = 8320
+C2A_REQUEST_GROUP_SCORE_WIDTH = 4224
 
 
 @pl.jit.inline
@@ -1478,9 +1482,8 @@ def _use_request_groups(
     skip_short: pl.constexpr,
 ):
     grouped = pl.cast(0, pl.INT32)
-    capacity = pl.tensor.dim(request_ids, 0)
-    if TP_SIZE == 1 and num_tokens >= 32 and num_tokens <= 80 and num_tokens % 2 == 0 and capacity == num_tokens and width == expected_width:
-        middle = pl.cast(num_tokens // 2, pl.INDEX)
+    middle = pl.cast(num_tokens // 2, pl.INDEX)
+    if width == expected_width and middle > 0:
         if pl.read(request_ids, [middle - 1]) != pl.read(request_ids, [middle]):
             grouped = pl.cast(1, pl.INT32)
         if skip_short:
@@ -1929,7 +1932,7 @@ def score_select_c1a_groups(
 ):
     """Score and select two request-aligned query groups or the full score arena."""
     width = pl.tensor.dim(scores, 1)
-    grouped = _use_request_groups(request_ids, lengths, num_tokens, width, 8320, False)
+    grouped = _use_request_groups(request_ids, lengths, num_tokens, width, C1A_REQUEST_GROUP_SCORE_WIDTH, False)
     block_count = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
     # Grouped scoring leaves the caller's scores arena unwritten. Keep grouping
     # disabled when the pool selector needs those scores to rank excess blocks.
@@ -1938,9 +1941,10 @@ def score_select_c1a_groups(
     completion = pl.array.create(2, pl.TASK_ID)
     if grouped != 0:
         group_done = pl.array.create(2, pl.TASK_ID)
-        group_rows = pl.cast(num_tokens, pl.INDEX) // 2
+        split_rows = pl.cast(num_tokens, pl.INDEX) // 2
         for group in pl.unroll(2):
-            begin = group * group_rows
+            begin = group * split_rows
+            group_rows = split_rows + group * (pl.cast(num_tokens, pl.INDEX) % 2)
             group_query = pl.slice(query, [group_rows, INDEX_H * INDEX_DIM], [begin, 0])
             group_scale = pl.slice(query_scale, [group_rows, INDEX_H * _SCALE_COUNT], [begin, 0])
             group_weights = pl.slice(weights, [group_rows, INDEX_H], [begin, 0])
@@ -2461,10 +2465,7 @@ def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False)
 
 
 select_c2a_index_topk = _make_select_c2a_index_topk()
-_select_c2a_group6_topk = _make_select_c2a_index_topk(leaf_workers=18, row_workers=6, all_long=True)
 _select_c2a_request_group_topk = _make_select_c2a_index_topk(leaf_workers=16, row_workers=16, all_long=True)
-
-_score_c2a_group6 = _make_query_interval_index_scores(8, skip_short=True, workers=30)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2486,21 +2487,13 @@ def _score_select_c2a_groups(
 ):
     """Select C2A rows with independent score and TopK groups."""
     width = pl.tensor.dim(scores, 1)
-    request_grouped = _use_request_groups(request_ids, lengths, num_tokens, width, 4224, True)
-    grouped = 0
-    if num_tokens == 12 and width == 4224:
-        grouped = 1
-        for token in pl.range(12):
-            if pl.read(lengths, [token]) <= INDEX_TOPK:
-                grouped = 0
-        for token in pl.range(1, 12):
-            if pl.read(request_ids, [token - 1]) == pl.read(request_ids, [token]):
-                grouped = 0
+    request_grouped = _use_request_groups(request_ids, lengths, num_tokens, width, C2A_REQUEST_GROUP_SCORE_WIDTH, True)
     if request_grouped != 0:
         group_done = pl.array.create(2, pl.TASK_ID)
-        group_rows = pl.cast(num_tokens, pl.INDEX) // 2
+        split_rows = pl.cast(num_tokens, pl.INDEX) // 2
         for group in pl.unroll(2):
-            begin = group * group_rows
+            begin = group * split_rows
+            group_rows = split_rows + group * (pl.cast(num_tokens, pl.INDEX) % 2)
             group_query = pl.slice(query, [group_rows, INDEX_H * INDEX_DIM], [begin, 0])
             group_scale = pl.slice(query_scale, [group_rows, INDEX_H * _SCALE_COUNT], [begin, 0])
             group_weights = pl.slice(weights, [group_rows, INDEX_H], [begin, 0])
@@ -2518,38 +2511,6 @@ def _score_select_c2a_groups(
             )
             group_done[group] = selected
         result = pl.system.task_dummy(deps=[group_done[0], group_done[1]])
-    elif grouped != 0:
-        query_first = query[0:6, :]
-        scale_first = query_scale[0:6, :]
-        weights_first = weights[0:6, :]
-        requests_first = request_ids[0:6]
-        lengths_first = lengths[0:6]
-        scores_first = pl.create_tensor([6, width], dtype=pl.FP32)
-        score_first_tid = _score_c2a_group6(
-            query_first, scale_first, weights_first, index_cache, index_cache_scale,
-            block_table, requests_first, lengths_first, scores_first,
-            6, cache_ready, query_ready, weights_ready,
-        )
-        topk_first = output[0:6, :]
-        order_first_tid = _select_c2a_group6_topk(
-            scores_first, block_table, requests_first, lengths_first, topk_first, 6, score_first_tid,
-        )
-        query_second = query[6:12, :]
-        scale_second = query_scale[6:12, :]
-        weights_second = weights[6:12, :]
-        requests_second = request_ids[6:12]
-        lengths_second = lengths[6:12]
-        scores_second = pl.create_tensor([6, width], dtype=pl.FP32)
-        score_second_tid = _score_c2a_group6(
-            query_second, scale_second, weights_second, index_cache, index_cache_scale,
-            block_table, requests_second, lengths_second, scores_second,
-            6, cache_ready, query_ready, weights_ready,
-        )
-        topk_second = output[6:12, :]
-        order_second_tid = _select_c2a_group6_topk(
-            scores_second, block_table, requests_second, lengths_second, topk_second, 6, score_second_tid,
-        )
-        result = pl.system.task_dummy(deps=[order_first_tid, order_second_tid])
     else:
         scores_tid = score_c2a_full(
             query, query_scale, weights, index_cache, index_cache_scale,
