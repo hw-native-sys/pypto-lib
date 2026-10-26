@@ -35,6 +35,8 @@ MX_GROUP = 32
 K_SCALE = D // MX_GROUP
 H_SCALE = MOE_INTER // MX_GROUP
 EXPECTED_EXPERT_ROWS = (RECV_MAX * M.num_experts_per_tok + M.n_routed_experts - 1) // M.n_routed_experts
+TOPK = M.num_experts_per_tok
+ROUTE_ROWS = B * S * TOPK
 
 # Routed-expert across-layer mean dequantization standard deviations.
 ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
@@ -60,9 +62,9 @@ MX_W3_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * M
 MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * MX_PACKED_LANE_ROWS
 ACT_INTER_TILE = 256
 QUANT_TILE = 768
-
-SWIGLU_SCALE_COL_TILE = QUANT_TILE // 32
-SWIGLU_SCALE_TMP_TILE = ((64 + (ACT_T_TILE // 16) * (QUANT_TILE // 32) + 31) // 32) * 32
+# Rows per routed-output copy task.
+# 16 BF16 rows x D stays well under UB.
+COPY_TILE = max(tile for tile in (16, 12, 8, 6, 4, 3, 2, 1) if ROUTE_ROWS % tile == 0)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -243,33 +245,9 @@ def expert_routed_scatter(
                                         h_fp32[0:ACT_T_TILE, h_a0:h_a0 + ACT_INTER_TILE] = gated
                                     h_fp32_valid = pl.set_validshape(h_fp32, act_rows, QUANT_TILE)
                                     h_fp32_padded = pl.fillpad(h_fp32_valid, pad_value=pl.PadValue.zero)
-                                    # Upward-rounded group scales.
-                                    sq_input = pl.set_validshape(h_fp32_padded, ACT_T_TILE, QUANT_TILE)
-                                    sq_values = pl.reshape(sq_input, [ACT_T_TILE * (QUANT_TILE // 32), 32])
-                                    sq_reduce_tmp = pl.create_tile([ACT_T_TILE * (QUANT_TILE // 32), 32], dtype=pl.FP32)
-                                    sq_maximum_abs = pl.abs(sq_values)
-                                    sq_maximum_row_max = pl.row_max(sq_maximum_abs, tmp_tile=sq_reduce_tmp)
-                                    sq_maximum = pl.maximum(sq_maximum_row_max, 0.0001)
-                                    sq_bits_mul = pl.mul(sq_maximum, 1.0 / 448.0)
-                                    sq_bits = pl.reinterpret_view(sq_bits_mul, pl.INT32)
-                                    sq_exponent_add = pl.add(sq_bits, 8388607)
-                                    sq_exponent = pl.shrs(sq_exponent_add, 23)
-                                    sq_scale_shls = pl.shls(sq_exponent, 23)
-                                    sq_scale = pl.reinterpret_view(sq_scale_shls, pl.FP32)
-                                    sq_normalized = pl.row_expand_div(sq_values, sq_scale)
-                                    sq_clipped_maximum = pl.maximum(sq_normalized, -448.0)
-                                    sq_clipped = pl.minimum(sq_clipped_maximum, 448.0)
-                                    sq_quantized = pl.cast(sq_clipped, pl.FP8E4M3FN, mode="rint")
-                                    h_quant = pl.reshape(sq_quantized, [ACT_T_TILE, QUANT_TILE])
-                                    sq_signed_exponent_shrs = pl.shrs(sq_exponent, 7)
-                                    sq_signed_exponent_mul = pl.mul(sq_signed_exponent_shrs, 256)
-                                    sq_signed_exponent = pl.sub(sq_exponent, sq_signed_exponent_mul)
-                                    sq_codes_cast = pl.cast(sq_signed_exponent, pl.INT8)
-                                    sq_codes = pl.reinterpret_view(sq_codes_cast, pl.UINT8)
-                                    sq_flat = pl.reshape(sq_codes, [1, ACT_T_TILE * (QUANT_TILE // 32)])
-                                    sq_temporary = pl.create_tile([1, SWIGLU_SCALE_TMP_TILE], dtype=pl.UINT8)
-                                    sq_packed = pl.tmov_x2zz(sq_flat, sq_temporary, group_axis=1, dst_rows=ACT_T_TILE, dst_cols=SWIGLU_SCALE_COL_TILE)
-                                    h_scale = pl.reinterpret_view(sq_packed, pl.FP8E8M0)
+                                    # Hardware MXFP8 block-32 quant; nv = upward E8M0
+                                    # exponent, scale returned in A-side ZZ order.
+                                    h_quant, h_scale = pl.quant_mx(h_fp32_padded, group_axis=1, quant_scale_alg="nv")
                                     h_tile_mx = pl.store(h_quant, [act_t0, a_base], h_tile_mx)
                                     scale_offset = act_t0 * H_SCALE + ab_idx * ACT_T_TILE * (QUANT_TILE // MX_GROUP)
                                     h_tile_scale_backing_reshape = pl.reshape(h_scale, [1, ACT_T_TILE * (QUANT_TILE // MX_GROUP)])
@@ -555,8 +533,6 @@ def gen_routed_mxfp4_weights(n_experts, dequant_std, seed_base=0):
 
 # Single-device validation with local scatter destinations.
 WORLD_SIZE = 1
-TOPK = M.num_experts_per_tok
-ROUTE_ROWS = B * S * TOPK
 
 
 @pl.jit(auto_scope=False)
@@ -586,10 +562,9 @@ def l2_expert_routed(
         mxfp4_pair_lut, recv_route, recv_meta,
         routed_output, input_ready,
     )
-    with pl.spmd(ROUTE_ROWS, name_hint="routed_output_copy", deps=[scatter_done]):
-        row = pl.tile.get_block_idx()
-        value = pl.load(routed_output, [row, 0], [1, D])
-        routed_y = pl.store(value, [row, 0], routed_y)
+    with pl.spmd(ROUTE_ROWS // COPY_TILE, name_hint="routed_output_copy", deps=[scatter_done]):
+        row0 = pl.tile.get_block_idx() * COPY_TILE
+        routed_y[row0 : row0 + COPY_TILE, 0:D] = routed_output[row0 : row0 + COPY_TILE, 0:D]
     return routed_y
 
 
