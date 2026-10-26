@@ -488,7 +488,7 @@ def golden_moe_sublayer(tensors, x_hc_mid, attn_pre_mix, tokens):
         pre, post, comb = mixes[base]
         # Sum TP owner partials into complete routed rows.
         group = ffn_owned[base : base + TP_SIZE].float().sum(dim=0).to(torch.bfloat16)
-        expanded = golden_hc_post(group, x_hc_mid[base], post, comb).float()
+        expanded = golden_hc_post(group, x_hc_mid[base], post, comb)
         for rank in range(base, base + TP_SIZE):
             outputs["ffn_output"][rank] = group
             outputs["next_pre_mix"][rank] = pre
@@ -553,7 +553,7 @@ def make_layer_golden(mode):
             for rank, result in zip(ranks, results):
                 for name in ATTENTION_STATE[mode]:
                     tensors[name][rank].copy_(result[name])
-            mid = golden_hc_post(attention, x_hc, post, comb).float()
+            mid = golden_hc_post(attention, x_hc, post, comb)
             for rank in ranks:
                 attn_input[rank] = x
                 attn_output[rank] = attention
@@ -644,7 +644,7 @@ def compare_expanded_stream(name, sublayer_name, source_name, weight_prefix, end
                 stream, inputs[f"{weight_prefix}_fn"][base], inputs[f"{weight_prefix}_scale"][base],
                 inputs[f"{weight_prefix}_base"][base],
             )
-            replay = golden_hc_post(actual_outputs[sublayer_name][base], stream, post, comb).float()
+            replay = golden_hc_post(actual_outputs[sublayer_name][base], stream, post, comb)
             valid, _ = check(actual[base], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
             passed &= valid
             passed &= report_stage(f"{name}(end-to-end)", actual[base], expected[base])[0] <= end_to_end_bound

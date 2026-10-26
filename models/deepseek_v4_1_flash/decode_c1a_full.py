@@ -441,7 +441,7 @@ def golden_c1a(tensors, mode="full"):
         attended, a["rope_cos"], a["rope_sin"], a["wo_a"], a["wo_b"], a["wo_b_scale"],
         wo_a_scale=a["wo_a_scale"], sequential_projection=True,
     )
-    hidden = golden_hc_post(output.to(torch.bfloat16), x_hc, post_mix, residual_mix).to(torch.float32)
+    hidden = golden_hc_post(output.to(torch.bfloat16), x_hc, post_mix, residual_mix)
     tensors["next_pre_mix"].copy_(next_pre_mix)
     for name, value in (
         ("window_cache", window), ("window_cache_scale", window_scale),

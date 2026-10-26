@@ -461,7 +461,7 @@ def golden_c2a(tensors, mode="full"):
         else:
             tensors[name] = value
     if "x_hc" in t:
-        hidden = golden_hc_post(output.bfloat16(), x_hc, post_mix, residual_mix).to(torch.float32)
+        hidden = golden_hc_post(output.bfloat16(), x_hc, post_mix, residual_mix)
         tensors["output"].copy_(hidden)
         tensors["next_pre_mix"].copy_(next_pre_mix)
         tensors["attention_input"] = attention_input

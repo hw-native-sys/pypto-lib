@@ -840,7 +840,7 @@ def golden_prefill_c2a(tensors, *, mode="full", reference=golden_reference_c2a):
         for rank, result in zip(ranks, results):
             for name in ATTENTION_STATE[mode]:
                 tensors[name][rank].copy_(result[name])
-        output = golden_hc_post(attention, x_hc, post, comb).float()
+        output = golden_hc_post(attention, x_hc, post, comb)
         output[active:] = 0
         pre[active:] = 0
         tensors["attn_input"][group].copy_(x.expand_as(tensors["attn_input"][group]))

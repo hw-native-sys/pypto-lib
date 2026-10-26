@@ -348,7 +348,7 @@ def golden_swa(tensors, *, reference=None):
         hidden = golden_hc_post(
             tensors["attention_output"][:active], tensors["x_hc"][:active],
             post_mix[:active], residual_mix[:active],
-        ).to(torch.float32)
+        )
         tensors["attention_hidden"][:active].copy_(hidden)
     tensors["attention_input"] = collapsed
 

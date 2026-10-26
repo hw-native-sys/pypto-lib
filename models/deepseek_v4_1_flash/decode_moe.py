@@ -873,7 +873,7 @@ def golden_moe(tensors):
 
     x_next = torch.zeros(EP_SIZE, MOE_TOKENS, HC_MULT, D, dtype=torch.float32)
     for rank in range(EP_SIZE):
-        x_next[rank] = golden_hc_post(sublayer[rank], x_hc[rank], post_mix[rank], residual_mix[rank]).to(torch.float32)
+        x_next[rank] = golden_hc_post(sublayer[rank], x_hc[rank], post_mix[rank], residual_mix[rank])
     tensors["x_next"][:] = x_next
 
 

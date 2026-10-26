@@ -543,7 +543,7 @@ def golden_prefill_swa_case(tensors):
         for rank, (cache, scale) in enumerate(caches, base):
             tensors["window_cache"][rank].copy_(cache)
             tensors["window_cache_scale"][rank].copy_(scale)
-        output = golden_hc_post(reduced, x_hc, post_mix, residual_mix).to(torch.float32)
+        output = golden_hc_post(reduced, x_hc, post_mix, residual_mix)
         output[active:] = 0
         tensors["hidden"][group].copy_(hidden.unsqueeze(0).expand(TP_SIZE, -1, -1))
         tensors["attn_out"][group].copy_(token_shards(reduced, local_tokens))

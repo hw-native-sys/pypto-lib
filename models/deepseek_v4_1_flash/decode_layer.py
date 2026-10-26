@@ -696,7 +696,7 @@ def golden_decode_layer(
         moe_overrides["num_tokens"] = num_tokens
     moe_kwargs = _select_inputs(golden_decode_moe, moe_inputs, moe_overrides)
     ffn_output = golden_decode_moe(**moe_kwargs)
-    output = golden_hc_post(ffn_output, attention_hidden, ffn_post, ffn_residual).to(torch.float32)
+    output = golden_hc_post(ffn_output, attention_hidden, ffn_post, ffn_residual)
     return DecodeLayerGoldenResult(
         output=output, next_pre_mix=next_pre_mix,
         attention_input=attention_input, attention_output=attention["output"], attention_hidden=attention_hidden,

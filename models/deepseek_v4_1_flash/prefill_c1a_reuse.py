@@ -662,7 +662,7 @@ def golden_prefill_c1a_reuse_case(tensors):
     apply_distributed_golden("reuse", golden_prefill_attn_c1a_reuse, tensors, active)
     tensors["attn_out"][:, active:].zero_()
     tensors["attn_input"][:] = attn_input.unsqueeze(0)
-    hc_output = golden_hc_post(tensors["attn_out"][0], tensors["x_hc"][0], post_mix, residual_mix).to(torch.float32)
+    hc_output = golden_hc_post(tensors["attn_out"][0], tensors["x_hc"][0], post_mix, residual_mix)
     tensors["output"] = output
     tensors["next_pre_mix"][:] = next_pre_mix.unsqueeze(0)
     tensors["hidden"][:] = hidden.unsqueeze(0)

@@ -1003,7 +1003,7 @@ def golden_c1a_sp(tensors, *, mode, reference):
         for rank, result in zip(ranks, results):
             for name in STATE_NAMES[mode]:
                 tensors[name][rank].copy_(result[name])
-        output = golden_hc_post(attention, x_hc, post, comb).float()
+        output = golden_hc_post(attention, x_hc, post, comb)
         output[active:] = 0
         pre[active:] = 0
         tensors["attn_input"][group].copy_(x.expand_as(tensors["attn_input"][group]))
@@ -1401,7 +1401,7 @@ def golden_prefill_c1a_full_case(tensors):
     apply_distributed_golden("full", golden_prefill_attn_c1a_full, tensors, active)
     tensors["attn_out"][:, active:].zero_()
     tensors["attn_input"][:] = attn_input.unsqueeze(0)
-    hc_output = golden_hc_post(tensors["attn_out"][0], tensors["x_hc"][0], post_mix, residual_mix).to(torch.float32)
+    hc_output = golden_hc_post(tensors["attn_out"][0], tensors["x_hc"][0], post_mix, residual_mix)
     tensors["output"] = output
     tensors["next_pre_mix"][:] = next_pre_mix.unsqueeze(0)
     tensors["hidden"][:] = hidden.unsqueeze(0)

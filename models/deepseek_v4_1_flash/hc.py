@@ -321,8 +321,7 @@ def hc_post_block(
         value = pl.add(value, term2)
         term3 = pl.mul(residual3, pl.read(residual_mix_flat, [t, 3 * HC_MULT + out_h]))
         value = pl.add(value, term3)
-        rounded = pl.cast(value, pl.BF16, mode="rint")
-        output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + D_TILE] = pl.cast(rounded, pl.FP32)
+        output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + D_TILE] = value
     return output_flat
 
 
@@ -371,7 +370,7 @@ def prefill_sp_post(
 
     A later pure-output clear is not an ordering edge for the post task. Each
     residual element is instead written exactly once, with hc_post's FP32
-    accumulation order and single BF16 rounding boundary.
+    accumulation order and FP32 output.
     """
     tokens = pl.tensor.dim(residual, 0)
     residual_flat = pl.reshape(residual, [tokens, HC_MULT * D])
@@ -388,9 +387,7 @@ def prefill_sp_post(
                 for in_h in pl.unroll(HC_MULT):
                     lane = residual_flat[row:row + 1, in_h * D + col:in_h * D + col + 256]
                     value = pl.add(value, pl.mul(lane, pl.read(mix_flat, [row, in_h * HC_MULT + out_h])))
-            output_flat[row:row + 1, out_h * D + col:out_h * D + col + 256] = pl.cast(
-                pl.cast(value, pl.BF16, mode="rint"), pl.FP32,
-            )
+            output_flat[row:row + 1, out_h * D + col:out_h * D + col + 256] = value
     for row in pl.spmd(tokens, name_hint="sp_mix_zero_padding"):
         if tp_rank * tokens + row >= num_tokens:
             zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
@@ -437,10 +434,10 @@ def golden_hc_post(
     post_mix: torch.Tensor,
     residual_mix: torch.Tensor,
 ) -> torch.Tensor:
-    """Expand a sublayer result and mix the four residual streams."""
+    """Expand a sublayer result and mix the four residual streams in FP32."""
     update = post_mix.unsqueeze(-1) * sublayer.unsqueeze(-2)
     skip = (residual_mix.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=-3)
-    return (update.float() + skip.float()).to(sublayer.dtype)
+    return update.float() + skip.float()
 
 
 def golden_l2_hc_pre(tensors):
@@ -456,10 +453,10 @@ def golden_l2_hc_pre(tensors):
 
 
 def golden_l2_hc_post(tensors):
-    """Fill the expanded residual stream with BF16 rounding and FP32 storage."""
+    """Fill the expanded residual stream with FP32 accumulation and storage."""
     tensors["output"][:] = golden_hc_post(
         tensors["sublayer"], tensors["residual"], tensors["post_mix"], tensors["residual_mix"],
-    ).float()
+    )
 
 
 def golden_l2_hc_head(tensors):
@@ -474,7 +471,6 @@ def make_hc_inputs(tokens, seed, case):
     """mHC inputs with distinct per-token magnitudes so both RMS statistics stay observable."""
     gen = torch.Generator().manual_seed(seed)
     magnitudes = (0.5 + torch.arange(tokens) % 4).reshape(-1, 1, 1)
-    # The residual stream holds BF16 values; FP32 storage only keeps hc_post's single rounding.
     x_hc = (torch.randn(tokens, HC_MULT, D, generator=gen) * magnitudes).bfloat16().float()
     values = {
         "x_hc": x_hc,
@@ -578,7 +574,7 @@ def build_l2_hc_post_specs(batch: int = 33, sequence: int = 1):
         return torch.randn(tokens, D, generator=generator).bfloat16()
 
     def init_residual():
-        return torch.randn(tokens, HC_MULT, D, generator=generator).bfloat16().float()
+        return torch.randn(tokens, HC_MULT, D, generator=generator)
 
     def init_post_mix():
         return 2 * torch.sigmoid(torch.randn(tokens, HC_MULT, generator=generator))
@@ -670,6 +666,8 @@ if __name__ == "__main__":
                 "residual_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             }
             compare_fn["output"] = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
+        elif name == "post":
+            compare_fn = {"output": ratio_allclose(atol=1e-6, rtol=1e-5)}
         else:
             compare_fn = {"output": ratio_allclose(atol=1e-4, rtol=1.0 / 128)}
         config = {"backend_type": args.backend_type, "execution_mode": args.execution_mode}
