@@ -375,6 +375,7 @@ if __name__ == "__main__":
     parser.add_argument("--case", choices=("mixed", "shuffle", "prefix"), default="mixed")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.set_defaults(tokens=72, requests=12, startpos=[8192] * 12)
     args = parser.parse_args()
@@ -412,6 +413,7 @@ if __name__ == "__main__":
         },
         compile_only=args.compile_only,
         save_data=args.save_data,
+        golden_data=args.golden_data,
     )
     if not result.passed:
         raise SystemExit(result.error or 1)

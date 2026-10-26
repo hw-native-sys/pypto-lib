@@ -40,6 +40,7 @@ LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 D_TILE = 2560
 PRE_T_TILE = 2
+HEAD_D_TILE = 5120
 POST_WORKER_TILE = 64
 
 
@@ -234,15 +235,16 @@ def hc_head(
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     for block in pl.spmd((t_dim + PRE_T_TILE - 1) // PRE_T_TILE, name_hint="hc_collapse", allow_early_resolve=True):
         for t in pl.range(block * PRE_T_TILE, pl.min((block + 1) * PRE_T_TILE, t_dim)):
-            pre0 = pl.read(pre_mix, [t, 0])
-            pre1 = pl.read(pre_mix, [t, 1])
-            pre2 = pl.read(pre_mix, [t, 2])
-            pre3 = pl.read(pre_mix, [t, 3])
-            for d0 in pl.pipeline(0, D, D_TILE, stage=2):
-                x0 = pl.load(x_flat, [t, d0], [1, D_TILE])
-                x1 = pl.load(x_flat, [t, D + d0], [1, D_TILE])
-                x2 = pl.load(x_flat, [t, 2 * D + d0], [1, D_TILE])
-                x3 = pl.load(x_flat, [t, 3 * D + d0], [1, D_TILE])
+            pre_tile = pl.load(pre_mix, [t, 0], [1, HC_PAD], valid_shape=[1, HC_MULT])
+            pre0 = pl.tile.read(pre_tile, [0, 0])
+            pre1 = pl.tile.read(pre_tile, [0, 1])
+            pre2 = pl.tile.read(pre_tile, [0, 2])
+            pre3 = pl.tile.read(pre_tile, [0, 3])
+            for d0 in pl.pipeline(0, D, HEAD_D_TILE, stage=2):
+                x0 = pl.load(x_flat, [t, d0], [1, HEAD_D_TILE])
+                x1 = pl.load(x_flat, [t, D + d0], [1, HEAD_D_TILE])
+                x2 = pl.load(x_flat, [t, 2 * D + d0], [1, HEAD_D_TILE])
+                x3 = pl.load(x_flat, [t, 3 * D + d0], [1, HEAD_D_TILE])
                 y0 = pl.mul(x0, pre0)
                 y1 = pl.mul(x1, pre1)
                 y2 = pl.mul(x2, pre2)
