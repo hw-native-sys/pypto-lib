@@ -19,12 +19,12 @@ from decode_indexer import (
 from sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
 )
-from hc import hc_pre, hc_post
+from hc import hc_project, hc_sinkhorn, hc_head_norm, hc_post
 from config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
 )
-from rmsnorm import rms_norm, rms_norm_tiled
+from rmsnorm import rms_norm
 from compressor import decode_c1a_compressor_project, decode_c1a_compressor_rope
 
 # model config
@@ -107,15 +107,10 @@ def decode_c1a_full(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_pre(
-        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        x_attn, next_pre_mix, post_mix, residual_mix,
-    )
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    with pl.spmd((tokens + 7) // 8, name_hint="norm_in") as x_ready:
-        norm_worker = pl.tile.get_block_idx()
-        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_worker, tokens, output_fp32=False)
+    x_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
