@@ -37,7 +37,7 @@ from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import token_shards
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
-from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from compressor import prefill_c1a_compressor_project, prefill_c1a_compressor_rope, publish_compressed_cache
 from prefill_indexer import (
     prefill_indexer, publish_c1a_index_key, golden_prefill_indexer,
@@ -154,6 +154,8 @@ def prefill_c1a_full_attention(
     tokens = pl.tensor.dim(x, 0)
     partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
     query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
+    query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
     publication = pl.array.create(1, pl.TASK_ID)
     publication[0] = pl.system.task_dummy(deps=[])
     if num_tokens > 0:
@@ -162,7 +164,14 @@ def prefill_c1a_full_attention(
             compressed_rope_cos, compressed_rope_sin, compressed_slots,
             compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, num_tokens,
         )
-        q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
+        q_proj_rope(
+            proj_payload, proj_scales,
+            wq_a, wq_a_scale, q_norm_weight,
+            wq_b, wq_b_scale,
+            rope_cos, rope_sin,
+            query_latent, query,
+            num_tokens, 256, 2147483647,
+        )
         publication[0] = published
     publication_ready = publication[0]
     indexer_completion = prefill_indexer(
@@ -172,11 +181,15 @@ def prefill_c1a_full_attention(
     )
     if num_tokens > 0:
         source_ready = pl.system.task_dummy(deps=[publication_ready, indexer_completion])
-        query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        q_proj_rope(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
         window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
+        kv_proj_rope(
+            proj_payload, proj_scales,
+            wkv, wkv_scale, kv_norm_weight,
+            rope_cos, rope_sin,
+            kv_projection, window_kv,
+            num_tokens,
+        )
         window_ready = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, source_ready)
 
         attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)

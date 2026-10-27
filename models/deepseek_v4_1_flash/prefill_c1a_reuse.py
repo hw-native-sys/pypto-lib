@@ -29,7 +29,7 @@ from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_p
 from sparse_attention import (
     attend_packed, golden_compressed_attention, golden_prefill_c1a_attention, prefill_publish_window,
 )
-from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 
 
 # model config
@@ -96,13 +96,26 @@ def prefill_c1a_reuse_attention(
     partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
     if num_tokens > 0:
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, query_latent, num_tokens)
-        source_ready = pl.system.task_dummy(deps=[])
         query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        q_proj_rope(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
+        proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
+        q_proj_rope(
+            proj_payload, proj_scales,
+            wq_a, wq_a_scale, q_norm_weight,
+            wq_b, wq_b_scale,
+            rope_cos, rope_sin,
+            query_latent, query,
+            num_tokens, 256, 2147483647,
+        )
+        source_ready = pl.system.task_dummy(deps=[])
         window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
+        kv_proj_rope(
+            proj_payload, proj_scales,
+            wkv, wkv_scale, kv_norm_weight,
+            rope_cos, rope_sin,
+            kv_projection, window_kv,
+            num_tokens,
+        )
         window_ready = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, source_ready)
 
         attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)

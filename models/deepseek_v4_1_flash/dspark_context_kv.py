@@ -12,7 +12,7 @@ import pypto.language as pl
 import torch
 
 from config import DSPARK_QUERY_WIDTH, FLASH, ORI_BLOCKS_DYN, T_DYN
-from qkv_proj_rope import golden_rope_interleave, kv_proj_rope
+from qkv_proj_rope import golden_rope_interleave, quantize_projection_input, kv_proj_rope
 from gemm import golden_mxfp8_linear_grouped_sum
 from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm
@@ -78,7 +78,14 @@ def dspark_context_kv(
     tokens = pl.tensor.dim(main_x, 0)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(main_x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, projected, rotated, num_tokens)
+    kv_input_payload, kv_input_scales = quantize_projection_input(main_x, num_tokens)
+    kv_proj_rope(
+        kv_input_payload, kv_input_scales,
+        wkv, wkv_scale, kv_norm_weight,
+        rope_cos, rope_sin,
+        projected, rotated,
+        num_tokens,
+    )
     publish_window_row(rotated, context_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
     return window_cache, window_cache_scale
 

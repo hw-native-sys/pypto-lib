@@ -29,7 +29,7 @@ from hc import golden_mhc_mixes
 from hc import golden_hc_post, prefill_sp_post
 from hc import golden_hc_collapse, hc_pre, zero_bf16_padding
 from rmsnorm import golden_rms_norm, rms_norm_tiled
-from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from o_proj import retire_prefill_signals, o_proj, prefill_sp_output_reduce_scatter
 from prefill_cp_allgather import make_prefill_sp_input_allgather
 
@@ -99,7 +99,14 @@ def prefill_swa_attention(
         for row in pl.range(worker, num_tokens, WORKER_TILE):
             kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
+    kv_input_payload, kv_input_scales = quantize_projection_input(x, num_tokens)
+    kv_proj_rope(
+        kv_input_payload, kv_input_scales,
+        wkv, wkv_scale, kv_norm_weight,
+        rope_cos, rope_sin,
+        kv_projection, kv,
+        num_tokens,
+    )
     chunk_done = prefill_publish_window_batched(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
     cache_blocks = pl.tensor.dim(window_cache, 0)
     cache_rows = cache_blocks * 128
@@ -131,8 +138,15 @@ def prefill_swa_attention(
                 chunk_cos[row:row + 1, :] = rope_cos[source_row:source_row + 1, :]
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
-        q_proj_qr(chunk_x, wq_a, wq_a_scale, q_norm_weight, qr, active)
-        q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active, max_workers=2147483647)
+        q_input_payload, q_input_scales = quantize_projection_input(chunk_x, active)
+        q_proj_rope(
+            q_input_payload, q_input_scales,
+            wq_a, wq_a_scale, q_norm_weight,
+            wq_b, wq_b_scale,
+            chunk_cos, chunk_sin,
+            qr, q,
+            active, 256, 2147483647,
+        )
         index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
         attend_shared_cache(
             q, decoded_cache, zero_row,

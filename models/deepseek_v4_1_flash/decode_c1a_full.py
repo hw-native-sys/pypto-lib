@@ -10,7 +10,7 @@
 
 
 import pypto.language as pl
-from qkv_proj_rope import qkv_proj_rope
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from o_proj import o_proj_hc_post
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, use_pretransposed_index_query, score_select_c1a_groups,
@@ -121,12 +121,21 @@ def decode_c1a_full(
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    qkv_proj_rope(
-        x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
-        qr, query, kv_projection, kv, num_tokens, max_workers=32,
-        fuse_qnorm=False, q_b_n_tile=128, q_b_max_workers=Q_B_WORKER_TILE,
-        fuse_kv_norm_rope=False,
+    proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
+    q_proj_rope(
+        proj_payload, proj_scales,
+        wq_a, wq_a_scale, q_norm_weight,
+        wq_b, wq_b_scale,
+        rope_cos, rope_sin,
+        qr, query,
+        num_tokens, 128, Q_B_WORKER_TILE,
+    )
+    kv_proj_rope(
+        proj_payload, proj_scales,
+        wkv, wkv_scale, kv_norm_weight,
+        rope_cos, rope_sin,
+        kv_projection, kv,
+        num_tokens,
     )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)

@@ -12,7 +12,7 @@
 import pypto.language as pl
 from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
 from sparse_attention import publish_window_row, swa_attention_partial
-from qkv_proj_rope import qkv_proj_rope
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from o_proj import o_proj_hc_post
 from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
 
@@ -33,7 +33,6 @@ MIX_HC = M.mix_hc
 MX_GROUP = M.weight_block_size[0]
 
 # tiling
-Q_ROPE_WORKER_TILE = 64
 
 
 @pl.jit.inline(auto_scope=False)
@@ -80,12 +79,21 @@ def decode_swa(
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    qkv_proj_rope(
-        x_norm, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
-        qr, q, kv_projection, kv, num_tokens, max_workers=Q_ROPE_WORKER_TILE,
-        fuse_qnorm=True, q_b_n_tile=256, q_b_max_workers=2147483647,
-        fuse_kv_norm_rope=False,
+    proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
+    q_proj_rope(
+        proj_payload, proj_scales,
+        wq_a, wq_a_scale, q_norm_weight,
+        wq_b, wq_b_scale,
+        rope_cos, rope_sin,
+        qr, q,
+        num_tokens, 256, 2147483647,
+    )
+    kv_proj_rope(
+        proj_payload, proj_scales,
+        wkv, wkv_scale, kv_norm_weight,
+        rope_cos, rope_sin,
+        kv_projection, kv,
+        num_tokens,
     )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=32)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)

@@ -244,23 +244,28 @@ def gemm_bf16_via_mxfp8_to_bf16_fused(
     name_hint: pl.constexpr,
 ):
     """Compute native M32 MXFP8 products with in-task activation quantization."""
+    workers = pl.min(output_width // n_tile, pl.system.available_cluster_count())
     for mt in pl.parallel((num_tokens + 31) // 32):
-        for block in pl.spmd(output_width // n_tile, name_hint=name_hint):
-            t0 = mt * 32
-            n0 = block * n_tile
-            rows = pl.min(32, num_tokens - t0)
-            a0, sa0 = quantize_bf16_to_mxfp8(x, t0, 0, rows, 32)
-            b0 = pl.load(weight, [0, n0], [MX_K_TILE, n_tile])
-            sb0 = pl.load(scale, [0, n0], [MX_K_TILE // 32, n_tile])
-            acc = pl.matmul_mx(a0, sa0, b0, sb0)
-            for kb in pl.range(1, width // MX_K_TILE):
-                k0 = kb * MX_K_TILE
-                a, sa = quantize_bf16_to_mxfp8(x, t0, k0, rows, 32)
-                b = pl.load(weight, [k0, n0], [MX_K_TILE, n_tile])
-                sb = pl.load(scale, [k0 // 32, n0], [MX_K_TILE // 32, n_tile])
-                acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-            value = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
+        for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
+            block_num = pl.tile.get_block_num()
+            for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
+                block = wave * block_num + worker
+                if block < output_width // n_tile:
+                    t0 = mt * 32
+                    n0 = block * n_tile
+                    rows = pl.min(32, num_tokens - t0)
+                    a0, sa0 = quantize_bf16_to_mxfp8(x, t0, 0, rows, 32)
+                    b0 = pl.load(weight, [0, n0], [MX_K_TILE, n_tile])
+                    sb0 = pl.load(scale, [0, n0], [MX_K_TILE // 32, n_tile])
+                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                    for kb in pl.range(1, width // MX_K_TILE):
+                        k0 = kb * MX_K_TILE
+                        a, sa = quantize_bf16_to_mxfp8(x, t0, k0, rows, 32)
+                        b = pl.load(weight, [k0, n0], [MX_K_TILE, n_tile])
+                        sb = pl.load(scale, [k0 // 32, n0], [MX_K_TILE // 32, n_tile])
+                        acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                    value = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                    output = pl.store(pl.set_validshape(value, rows, n_tile), [t0, n0], output)
     return output
 
 
@@ -279,7 +284,7 @@ def gemm_bf16_to_bf16_staged(
     name_hint: pl.constexpr,
     cast_name: pl.constexpr,
 ):
-    """Stage FP32 GEMM results before the separate BF16 rounding task."""
+    """Write Cube FP32 products to GM before the separate BF16 rounding task."""
     tokens = pl.tensor.dim(source, 0)
     accumulated = pl.create_tensor([tokens, output_width], dtype=pl.FP32)
     blocks = (num_tokens + 16 - 1) // 16 * (output_width // n_tile)
@@ -295,11 +300,9 @@ def gemm_bf16_to_bf16_staged(
             acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
             for k in pl.range(0, width, k_tile):
                 a = pl.slice(source, [16, k_tile], [row, k], valid_shape=[rows, k_tile])
-                # Establish Vector startup before the local Cube result transfer (#2829).
-                a = pl.cast(pl.cast(a, pl.FP32), pl.BF16, mode="rint")
                 w = pl.slice(weight, [k_tile, n_tile], [k, col])
                 acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
-            value = pl.set_validshape(pl.mul(acc, 1.0), rows, n_tile)
+            value = pl.set_validshape(acc, rows, n_tile)
             accumulated[row:row + 16, col:col + n_tile] = value
     with pl.spmd(task_workers, name_hint=cast_name, deps=[cube_tid]) as cast_tid:
         worker = pl.tile.get_block_idx()

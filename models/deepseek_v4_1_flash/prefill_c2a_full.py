@@ -43,7 +43,7 @@ from o_proj import (
 from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes, prefill_sp_post
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables
-from qkv_proj_rope import golden_rope_tail, q_proj_qr, q_proj_rope, kv_proj_rope
+from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj_rope
 from quant import dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from hc import HC_INPUT_NAMES, make_hc_inputs
@@ -146,9 +146,22 @@ def prefill_c2a_full_attention(
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
-    kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
+    proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
+    q_proj_rope(
+        proj_payload, proj_scales,
+        wq_a, wq_a_scale, q_norm_weight,
+        wq_b, wq_b_scale,
+        rope_cos, rope_sin,
+        qr, query,
+        num_tokens, 256, 2147483647,
+    )
+    kv_proj_rope(
+        proj_payload, proj_scales,
+        wkv, wkv_scale, kv_norm_weight,
+        rope_cos, rope_sin,
+        kv_projection, window_kv,
+        num_tokens,
+    )
     window_publish_tid = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)

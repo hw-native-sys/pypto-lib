@@ -12,10 +12,10 @@
 import pypto.language as pl
 import torch
 
-from config import FLASH as M, T_DYN, TP_SIZE
+from config import FLASH as M, TP_SIZE
 from gemm import (
     MX_M_TILE, MX_K_TILE,
-    gemm_bf16_via_mxfp8_to_bf16_staged, gemm_mxfp8_to_bf16,
+    gemm_mxfp8_to_bf16,
     golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum,
 )
 from quant import QUANT_SCALE_TILE, quantize_bf16_to_mxfp8
@@ -35,125 +35,58 @@ N_TILE = 128
 K_TILE = 256
 Q_A_N_TILE = 128
 Q_A_K_TILE = 256
+PROJ_M_TILE = 80
 
 
-@pl.jit.inline
-def rope(
+@pl.jit.inline(auto_scope=False)
+def quantize_projection_input(
     x: pl.Tensor,
-    cos: pl.Tensor,
-    sin: pl.Tensor,
-    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Quantize shared Q/KV input into M80-padded payload and M16-packed scales."""
+    capacity = pl.tensor.dim(x, 0)
+    padded_rows = ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
+    payload = pl.create_tensor([padded_rows, D], dtype=pl.FP8E4M3FN)
+    scales = pl.create_tensor([1, padded_rows * (D // 32)], dtype=pl.FP8E8M0)
+    quant_blocks = (padded_rows // MX_M_TILE) * (D // MX_K_TILE)
+    workers = pl.min(pl.min(quant_blocks, 64), 2 * pl.system.available_cluster_count())
+    for worker in pl.spmd(workers, name_hint="attention_qkv_input_quant_pooled"):
+        for work in pl.range(worker, quant_blocks, workers):
+            t0 = (work // (D // MX_K_TILE)) * MX_M_TILE
+            k0 = (work % (D // MX_K_TILE)) * MX_K_TILE
+            rows = pl.max(pl.min(MX_M_TILE, num_tokens - t0), 0)
+            quantized_tile, packed_scale = quantize_bf16_to_mxfp8(x, t0, k0, rows, MX_M_TILE)
+            payload = pl.store(quantized_tile, [t0, k0], payload)
+            scale_offset = t0 * (D // 32) + k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32)
+            packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
+            scales = pl.store(packed_flat, [0, scale_offset], scales)
+    return payload, scales
+
+
+@pl.jit.inline(auto_scope=False)
+def _rope_inplace(
+    query: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    row_start: pl.Scalar[pl.INDEX],
     num_tokens: pl.Scalar[pl.INT32],
     heads: pl.constexpr,
     name_hint: pl.constexpr,
-    max_workers: pl.constexpr,
 ):
-    blocks = num_tokens * heads
-    workers = pl.min(blocks, max_workers)
-    for worker in pl.spmd(workers, name_hint=name_hint):
-        for block in pl.range(worker, blocks, workers):
-            t = block // heads
-            h = block % heads
-            base = h * HEAD_DIM
-            output[t : t + 1, base : base + (HEAD_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (HEAD_DIM - ROPE_DIM)]
-            tail = pl.cast(x[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM], pl.FP32)
-            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-            c = cos[t : t + 1, :]
-            s = pl.mul(sin[t : t + 1, :], 1.0)
-            re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-            im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-            rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-            rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-            output[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM] = pl.cast(rotated, pl.BF16, mode="rint")
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def _quantize_projection_input(
-    x: pl.Tensor,
-    payload: pl.Tensor,
-    scale_backing: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    width: pl.constexpr,
-    name_hint: pl.constexpr,
-):
-    """Quantize one M16 projection input into shared MX payload and packed scales."""
-    for block in pl.spmd(width // MX_K_TILE, name_hint=name_hint):
-        k0 = block * MX_K_TILE
-        rows = pl.min(MX_M_TILE, num_tokens)
-        quantized_tile, packed_scale = quantize_bf16_to_mxfp8(x, 0, k0, rows, MX_M_TILE)
-        payload = pl.store(quantized_tile, [0, k0], payload)
-        scale_offset = block * MX_M_TILE * (MX_K_TILE // 32)
-        packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
-        scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
-    return payload, scale_backing
-
-
-@pl.jit.inline(auto_scope=False)
-def _q_normalize(
-    projected: pl.Tensor,
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    query_latent: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    norm_blocks = (num_tokens + 7) // 8
-    for norm_worker in pl.spmd(norm_blocks, name_hint="norm_q"):
-        rms_norm(projected, q_norm_weight, query_latent, norm_worker, num_tokens, width=Q_LORA)
-    return query_latent
-
-
-@pl.jit.inline(auto_scope=False)
-def q_proj_qr(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    tokens = pl.tensor.dim(x, 0)
-    projected = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-    gemm_bf16_via_mxfp8_to_bf16_staged(
-        x, wq_a, wq_a_scale, projected, num_tokens,
-        D, Q_LORA, "proj_q_a", "quant_q_a", Q_A_N_TILE, Q_A_K_TILE, 1, 2147483647,
-    )
-    _q_normalize(projected, q_norm_weight, query_latent, num_tokens)
-    return query_latent
-
-
-@pl.jit.inline(auto_scope=False)
-def _q_proj_rope_from_mx_m80(
-    payload: pl.Tensor,
-    scale_backing: pl.Tensor,
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    q_b_n_tile: pl.constexpr,
-    max_workers: pl.constexpr = 2147483647,
-):
-    """Project 80 Q-B rows and apply M16 RoPE epilogues."""
-    gemm_mxfp8_to_bf16(
-        payload, scale_backing, wq_b, wq_b_scale, query,
-        num_tokens, 0, 0, 0, Q_LORA, LOCAL_H * HEAD_DIM,
-        "proj_q_b_ragged", q_b_n_tile, K_TILE, 1, 0, 0, 80, max_workers, 4,
-    )
-    rope_workers = 2 * pl.system.available_cluster_count()
-    for worker in pl.spmd(rope_workers, name_hint="attention_q_rope"):
-        for block in pl.range(worker, (80 // MX_M_TILE) * LOCAL_H, rope_workers):
-            t0 = block // LOCAL_H * MX_M_TILE
-            n0 = block % LOCAL_H * HEAD_DIM
+    """Rotate M16 tails in one M80 row group in place."""
+    rope_workers = pl.min((PROJ_M_TILE // MX_M_TILE) * heads, 2 * pl.system.available_cluster_count())
+    for worker in pl.spmd(rope_workers, name_hint=name_hint):
+        for block in pl.range(worker, (PROJ_M_TILE // MX_M_TILE) * heads, rope_workers):
+            t0 = block // heads * MX_M_TILE
+            output_t0 = row_start + t0
+            n0 = block % heads * HEAD_DIM
             rows = pl.max(pl.min(MX_M_TILE, num_tokens - t0), 0)
-            tail_bf16 = pl.load(query, [t0, n0 + HEAD_DIM - ROPE_DIM], [MX_M_TILE, ROPE_DIM], valid_shape=[rows, ROPE_DIM])
+            tail_bf16 = pl.load(query, [output_t0, n0 + HEAD_DIM - ROPE_DIM], [MX_M_TILE, ROPE_DIM], valid_shape=[rows, ROPE_DIM])
             tail = pl.cast(tail_bf16, pl.FP32)
             even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
             odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-            cosine = pl.load(rope_cos, [t0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
-            sine = pl.load(rope_sin, [t0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+            cosine = pl.load(rope_cos, [output_t0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+            sine = pl.load(rope_sin, [output_t0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
             cosine = pl.fillpad(cosine, pad_value=pl.PadValue.zero)
             cosine = pl.set_validshape(cosine, MX_M_TILE, ROPE_DIM // 2)
             sine = pl.fillpad(sine, pad_value=pl.PadValue.zero)
@@ -175,119 +108,8 @@ def _q_proj_rope_from_mx_m80(
             rotated = pl.reinterpret_view(rotated_bits, pl.FP32)
             rounded = pl.cast(rotated, pl.BF16, mode="rint")
             valid = pl.set_validshape(rounded, rows, ROPE_DIM)
-            query = pl.store(valid, [t0, n0 + HEAD_DIM - ROPE_DIM], query)
+            query = pl.store(valid, [output_t0, n0 + HEAD_DIM - ROPE_DIM], query)
     return query
-
-
-@pl.jit.inline(auto_scope=False)
-def q_proj_rope(
-    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    max_workers: pl.constexpr = 2147483647,
-):
-    tokens = pl.tensor.dim(query_latent, 0)
-    expanded = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    gemm_bf16_via_mxfp8_to_bf16_staged(
-        query_latent, wq_b, wq_b_scale, expanded, num_tokens,
-        Q_LORA, LOCAL_H * HEAD_DIM, "proj_q_b", "quant_q_b", N_TILE, K_TILE, 1, 2147483647,
-    )
-    rope(expanded, rope_cos, rope_sin, query, num_tokens, LOCAL_H, "rope_q", max_workers)
-
-    return query
-
-
-@pl.jit.inline(auto_scope=False)
-def _kv_norm_rope_fused(
-    projected: pl.Tensor,
-    weight: pl.Tensor,
-    cosine: pl.Tensor,
-    sine: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    weight_flat = pl.reshape(weight, [1, HEAD_DIM])
-    for block in pl.spmd((num_tokens + 7) // 8, name_hint="kv_norm_rope_fused"):
-        t0 = block * 8
-        rows = pl.min(8, num_tokens - t0)
-        source = pl.load(projected, [t0, 0], [8, HEAD_DIM], valid_shape=[rows, HEAD_DIM])
-        source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 8, HEAD_DIM)
-        value = pl.cast(source, pl.FP32)
-        reduce_tmp = pl.create_tile([8, HEAD_DIM], dtype=pl.FP32)
-        squares = pl.mul(value, value)
-        sq_sum = pl.reshape(pl.row_sum(squares, tmp_tile=reduce_tmp), [1, 8])
-        mean_square = pl.mul(sq_sum, 1.0 / HEAD_DIM)
-        argument = pl.add(mean_square, EPS)
-        rsqrt_tmp = pl.create_tile([1, 8], dtype=pl.FP32)
-        inverse = pl.reshape(pl.tile.rsqrt(argument, tmp=rsqrt_tmp), [8, 1])
-        gamma = pl.cast(pl.load(weight_flat, [0, 0], [1, HEAD_DIM]), pl.FP32)
-        normalized = pl.col_expand_mul(pl.row_expand_mul(value, inverse), gamma)
-        rounded = pl.cast(normalized, pl.BF16, mode="rint")
-        prefix = pl.tile.slice(rounded, [8, HEAD_DIM - ROPE_DIM], [0, 0], valid_shape=[rows, HEAD_DIM - ROPE_DIM])
-        pl.store(prefix, [t0, 0], output)
-        tail = pl.cast(pl.tile.slice(rounded, [8, ROPE_DIM], [0, HEAD_DIM - ROPE_DIM]), pl.FP32)
-        even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-        odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-        c = pl.load(cosine, [t0, 0], [8, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
-        c = pl.set_validshape(pl.fillpad(c, pad_value=pl.PadValue.zero), 8, ROPE_DIM // 2)
-        s = pl.load(sine, [t0, 0], [8, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
-        s = pl.set_validshape(pl.fillpad(s, pad_value=pl.PadValue.zero), 8, ROPE_DIM // 2)
-        s = pl.mul(s, 1.0)
-        real = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-        imag = pl.add(pl.mul(even, s), pl.mul(odd, c))
-        real_lanes = pl.tile.full([8, ROPE_DIM], dtype=pl.FP32, value=0.0)
-        real_lanes = pl.tile.scatter_mask(real_lanes, real, mask_pattern=pl.tile.MaskPattern.P0101)
-        imag_lanes = pl.tile.full([8, ROPE_DIM], dtype=pl.FP32, value=0.0)
-        imag_lanes = pl.tile.scatter_mask(imag_lanes, imag, mask_pattern=pl.tile.MaskPattern.P1010)
-        real_bits = pl.reinterpret_view(real_lanes, pl.UINT32)
-        imag_bits = pl.reinterpret_view(imag_lanes, pl.UINT32)
-        rotated = pl.reinterpret_view(pl.or_(real_bits, imag_bits), pl.FP32)
-        result = pl.set_validshape(pl.cast(rotated, pl.BF16, mode="rint"), rows, ROPE_DIM)
-        pl.store(result, [t0, HEAD_DIM - ROPE_DIM], output)
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def _kv_normalize_rope(
-    projected: pl.Tensor,
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor,
-    rope_sin: pl.Tensor,
-    window_kv: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    tokens = pl.tensor.dim(projected, 0)
-    normalized = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    norm_blocks = (num_tokens + 7) // 8
-    for norm_worker in pl.spmd(norm_blocks, name_hint="norm_kv"):
-        rms_norm(projected, kv_norm_weight, normalized, norm_worker, num_tokens, width=HEAD_DIM)
-    rope(normalized, rope_cos, rope_sin, window_kv, num_tokens, 1, "rope_kv", 2147483647)
-    return window_kv
-
-
-@pl.jit.inline(auto_scope=False)
-def kv_proj_rope(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    projected: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    gemm_bf16_via_mxfp8_to_bf16_staged(
-        x, wkv, wkv_scale, projected,
-        num_tokens,
-        D, HEAD_DIM, "proj_kv", "quant_kv", N_TILE, K_TILE, 1, 2147483647,
-    )
-    _kv_normalize_rope(projected, kv_norm_weight, rope_cos, rope_sin, window_kv, num_tokens)
-    return window_kv
 
 
 @pl.jit.inline(auto_scope=False)
@@ -371,140 +193,91 @@ def _q_normalize_to_mx(
 
 
 @pl.jit.inline(auto_scope=False)
-def _qa_kv_ragged_group(
-    payload_all: pl.Tensor,
-    scales_all: pl.Tensor,
+def q_proj_rope(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
     wq_a: pl.Tensor,
     wq_a_scale: pl.Tensor,
     q_norm_weight: pl.Tensor,
+    wq_b: pl.Tensor,
+    wq_b_scale: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    query_latent: pl.Tensor,
+    query: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    q_b_n_tile: pl.constexpr = 256,
+    q_b_max_workers: pl.constexpr = 2147483647,
+):
+    """Project QA, normalize and quantize the latent, then project QB and rotate Q."""
+    for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
+        group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
+        group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
+        scale_start = group_start * (D // 32)
+        group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
+        projected = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.BF16)
+        gemm_mxfp8_to_bf16(
+            group_payload, group_scales, wq_a, wq_a_scale, projected,
+            group_rows, 0, 0, 0,
+            D, Q_LORA, "proj_q_a", Q_A_N_TILE, Q_A_K_TILE, 1, 0, 0, PROJ_M_TILE, 2147483647, 2,
+        )
+        qb_payload = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.FP8E4M3FN)
+        qb_scales = pl.create_tensor([1, PROJ_M_TILE * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+        for q_mt in pl.parallel(PROJ_M_TILE // MX_M_TILE):
+            q_local = q_mt * MX_M_TILE
+            q_start = group_start + pl.min(q_local, group_rows)
+            q_rows = pl.max(pl.min(MX_M_TILE, group_rows - q_local), 0)
+            projected_tile = pl.slice(projected, [q_rows, Q_LORA], [q_local, 0])
+            latent_tile = pl.slice(query_latent, [q_rows, Q_LORA], [q_start, 0])
+            qb_payload_tile = pl.tensor.slice(qb_payload, [MX_M_TILE, Q_LORA], [q_local, 0])
+            qb_scale_start = q_local * (Q_LORA // 32)
+            qb_scales_tile = pl.tensor.slice(qb_scales, [1, MX_M_TILE * (Q_LORA // 32)], [0, qb_scale_start])
+            _q_normalize_to_mx(
+                projected_tile, q_norm_weight, latent_tile,
+                qb_payload_tile, qb_scales_tile, q_rows, 5,
+            )
+        query_group = pl.slice(query, [group_rows, LOCAL_H * HEAD_DIM], [group_start, 0])
+        group_tokens = pl.cast(group_rows, pl.INT32)
+        gemm_mxfp8_to_bf16(
+            qb_payload, qb_scales, wq_b, wq_b_scale, query_group,
+            group_tokens, 0, 0, 0, Q_LORA, LOCAL_H * HEAD_DIM,
+            "proj_q_b", q_b_n_tile, K_TILE, 1, 0, 0, PROJ_M_TILE, q_b_max_workers, 4,
+        )
+        _rope_inplace(query, rope_cos, rope_sin, group_start, group_tokens, LOCAL_H, "attention_q_rope")
+    return query_latent, query
+
+
+@pl.jit.inline(auto_scope=False)
+def kv_proj_rope(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
     wkv: pl.Tensor,
     wkv_scale: pl.Tensor,
     kv_norm_weight: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    query_latent: pl.Tensor,
     kv_projection: pl.Tensor,
     window_kv: pl.Tensor,
-    qb_payload_all: pl.Tensor,
-    qb_scales_all: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    group_start: pl.Scalar[pl.INDEX],
-    m_tile: pl.constexpr,
-    fuse_qnorm: pl.constexpr,
-    fuse_kv_norm_rope: pl.constexpr,
 ):
-    """Project one Q-A/KV row group and apply normalization and RoPE epilogues."""
-    group_rows = pl.max(pl.min(m_tile, num_tokens - group_start), 0)
-    group_payload = pl.tensor.slice(payload_all, [m_tile, D], [group_start, 0])
-    group_scales = pl.tensor.slice(
-        scales_all, [1, m_tile * (D // 32)], [0, group_start * (D // 32)],
-    )
-    projected = pl.create_tensor([m_tile, Q_LORA], dtype=pl.BF16)
-    gemm_mxfp8_to_bf16(
-        group_payload, group_scales, wq_a, wq_a_scale, projected,
-        group_rows, 0, 0, 0,
-        D, Q_LORA, "proj_q_a_ragged", Q_A_N_TILE, Q_A_K_TILE, 1, 0, 0, m_tile, 2147483647, 2,
-    )
-    for q_mt in pl.parallel(m_tile // MX_M_TILE):
-        q_local = q_mt * MX_M_TILE
-        q_start = group_start + q_local
-        q_rows = pl.max(pl.min(MX_M_TILE, group_rows - q_local), 0)
-        projected_tile = pl.slice(projected, [q_rows, Q_LORA], [q_local, 0])
-        latent_tile = pl.slice(query_latent, [q_rows, Q_LORA], [q_start, 0])
-        qb_payload_tile = pl.tensor.slice(qb_payload_all, [MX_M_TILE, Q_LORA], [q_start, 0])
-        qb_scales_tile = pl.tensor.slice(
-            qb_scales_all, [1, MX_M_TILE * (Q_LORA // 32)], [0, q_start * (Q_LORA // 32)],
+    """Project KV, normalize to BF16, and rotate its RoPE tail in M80 groups."""
+    for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
+        group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
+        group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
+        scale_start = group_start * (D // 32)
+        group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
+        projection_group = pl.slice(kv_projection, [group_rows, HEAD_DIM], [group_start, 0])
+        gemm_mxfp8_to_bf16(
+            group_payload, group_scales, wkv, wkv_scale, projection_group,
+            group_rows, 0, 0, 0,
+            D, HEAD_DIM, "proj_kv", N_TILE, K_TILE, 1, 0, 0, PROJ_M_TILE, 2147483647, 2,
         )
-        if fuse_qnorm:
-            _q_normalize_to_mx(
-                projected_tile, q_norm_weight, latent_tile,
-                qb_payload_tile, qb_scales_tile, q_rows, 5,
-            )
-        else:
-            _q_normalize(projected_tile, q_norm_weight, latent_tile, q_rows)
-            qb_payload_tile, qb_scales_tile = _quantize_projection_input(
-                latent_tile, qb_payload_tile, qb_scales_tile, q_rows, Q_LORA, "quant_q_b",
-            )
-    projection_group = pl.slice(kv_projection, [group_rows, HEAD_DIM], [group_start, 0])
-    gemm_mxfp8_to_bf16(
-        group_payload, group_scales, wkv, wkv_scale, projection_group,
-        group_rows, 0, 0, 0,
-        D, HEAD_DIM, "proj_kv_ragged", N_TILE, K_TILE, 1, 0, 0, m_tile, 2147483647, 2,
-    )
-    if fuse_kv_norm_rope:
-        window_group = pl.slice(window_kv, [group_rows, HEAD_DIM], [group_start, 0])
-        cosine_group = pl.slice(rope_cos, [group_rows, ROPE_DIM // 2], [group_start, 0])
-        sine_group = pl.slice(rope_sin, [group_rows, ROPE_DIM // 2], [group_start, 0])
-        _kv_norm_rope_fused(
-            projection_group, kv_norm_weight, cosine_group, sine_group, window_group, group_rows,
-        )
-    else:
-        for kv_mt in pl.parallel(m_tile // MX_M_TILE):
-            kv_local = kv_mt * MX_M_TILE
-            kv_start = group_start + kv_local
-            kv_rows = pl.max(pl.min(MX_M_TILE, group_rows - kv_local), 0)
-            projection_tile = pl.slice(kv_projection, [kv_rows, HEAD_DIM], [kv_start, 0])
-            window_tile = pl.slice(window_kv, [kv_rows, HEAD_DIM], [kv_start, 0])
-            cosine_tile = pl.slice(rope_cos, [kv_rows, ROPE_DIM // 2], [kv_start, 0])
-            sine_tile = pl.slice(rope_sin, [kv_rows, ROPE_DIM // 2], [kv_start, 0])
-            _kv_normalize_rope(
-                projection_tile, kv_norm_weight, cosine_tile, sine_tile, window_tile, kv_rows,
-            )
-
-
-@pl.jit.inline(auto_scope=False)
-def qkv_proj_rope(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    query_latent: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    kv_projection: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    window_kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    max_workers: pl.constexpr = 2147483647,
-    fuse_qnorm: pl.constexpr = True,
-    q_b_n_tile: pl.constexpr = N_TILE,
-    q_b_max_workers: pl.constexpr = 2147483647,
-    fuse_kv_norm_rope: pl.constexpr = False,
-):
-    """Project 72 active decode rows with shared M80 input quantization."""
-    input_payload_all = pl.create_tensor([80, D], dtype=pl.FP8E4M3FN)
-    input_scales_all = pl.create_tensor([1, 80 * (D // 32)], dtype=pl.FP8E8M0)
-    qb_payload_all = pl.create_tensor([80, Q_LORA], dtype=pl.FP8E4M3FN)
-    qb_scales_all = pl.create_tensor([1, 80 * (Q_LORA // 32)], dtype=pl.FP8E8M0)
-    quant_blocks = (80 // MX_M_TILE) * (D // MX_K_TILE)
-    quant_workers = pl.min(pl.min(quant_blocks, 64), 2 * pl.system.available_cluster_count())
-    for worker in pl.spmd(quant_workers, name_hint="attention_qkv_input_quant_pooled"):
-        for work in pl.range(worker, quant_blocks, quant_workers):
-            t0 = (work // (D // MX_K_TILE)) * MX_M_TILE
-            kt = work % (D // MX_K_TILE)
-            k0 = kt * MX_K_TILE
-            rows = pl.max(pl.min(MX_M_TILE, num_tokens - t0), 0)
-            quantized_tile, packed_scale = quantize_bf16_to_mxfp8(x, t0, k0, rows, MX_M_TILE)
-            input_payload_all = pl.store(quantized_tile, [t0, k0], input_payload_all)
-            scale_offset = t0 * (D // 32) + kt * MX_M_TILE * (MX_K_TILE // 32)
-            packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
-            input_scales_all = pl.store(packed_flat, [0, scale_offset], input_scales_all)
-    _qa_kv_ragged_group(
-        input_payload_all, input_scales_all, wq_a, wq_a_scale, q_norm_weight,
-        wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin,
-        query_latent, kv_projection, window_kv, qb_payload_all, qb_scales_all,
-        num_tokens, 0, 80, fuse_qnorm, fuse_kv_norm_rope,
-    )
-    _q_proj_rope_from_mx_m80(
-        qb_payload_all, qb_scales_all, wq_b, wq_b_scale, rope_cos, rope_sin,
-        query, num_tokens, q_b_n_tile, q_b_max_workers,
-    )
-    return query_latent, query, kv_projection, window_kv
+        normalized_group = pl.slice(window_kv, [group_rows, HEAD_DIM], [group_start, 0])
+        group_tokens = pl.cast(group_rows, pl.INT32)
+        for norm_worker in pl.spmd((group_tokens + 7) // 8, name_hint="norm_kv"):
+            rms_norm(projection_group, kv_norm_weight, normalized_group, norm_worker, group_tokens, width=HEAD_DIM)
+        _rope_inplace(window_kv, rope_cos, rope_sin, group_start, group_tokens, 1, "rope_kv")
+    return kv_projection, window_kv
 
 
 def golden_rope_interleave(
