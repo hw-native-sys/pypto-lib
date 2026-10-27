@@ -11,6 +11,23 @@ Existing code is not a template when it conflicts with these rules.
 All new or modified model code, including kernels, goldens, and validation
 entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL.md).
 
+## Development priorities
+
+- Before developing or reviewing a model, read its
+  `docs/models/<model>/index.md`. Use the `Development priorities` fields
+  (`Performance target`, `Deferred performance work`, and
+  `Compatibility requirements`) to guide implementation tradeoffs. Do not
+  infer deferred work or reduced compatibility when these fields are absent.
+- Apply optimizations to the existing shared implementation and adapt all
+  affected callers. Do not add configuration branches, specialized entry
+  points, or parallel implementations, or retain an old path, solely to
+  preserve performance for configurations whose optimization is deferred.
+  Reconsider performance-driven branches or file splits when those
+  configurations become active targets and measurements justify the split.
+- Deferred performance work does not waive correctness or interface contracts
+  for supported paths. Check new branches and implementation variants against
+  the model's priorities during review.
+
 ## File ownership
 
 - Operator files own their kernels, corresponding Torch goldens, and validation
@@ -43,8 +60,9 @@ entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL
   dependency, output cast, fixed argument, or compile-time variant alone does
   not justify a new entry point.
 - Separate implementations require a concrete semantic, dependency, or measured
-  performance need that the existing implementation cannot meet. New files
-  and entry points require an actual consumer and a distinct responsibility.
+  performance need within the model's development priorities that the existing
+  implementation cannot meet. New files and entry points require an actual
+  consumer and a distinct responsibility.
 - When replacing an implementation or interface, update affected callers,
   including drafts, and remove obsolete code, parameters, exports, validation
   entries, and documentation in the same change. Keep compatibility wrappers
