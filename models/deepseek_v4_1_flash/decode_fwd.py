@@ -15,6 +15,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import config as C
 
+
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) else 64
 _shape_parser.add_argument("--experts-per-rank", type=int, default=_default_experts)
@@ -23,6 +24,9 @@ if _shape_options.experts_per_rank <= 0 or C.EP_SIZE * _shape_options.experts_pe
     _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
 C.N_LOCAL_EXPERTS = _shape_options.experts_per_rank
 
+
+from engram import ENGRAM_K, ENGRAM_LAYERS, KV_OUT, engram
+from engram import CAPACITY as ENGRAM_CAPACITY, MAP_ROWS, TABLE_ROWS, SLOTS as ENGRAM_SLOTS, SHARDS as ENGRAM_SHARDS, prepare_engram, build_engram_fixture, validate_forward_engram, write_engram_contract
 
 from config import (
     FLASH as M, B_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, COMPRESSED_CACHE_GROUP,
@@ -91,10 +95,19 @@ FWD_C2A_TABLE_DYN = pl.dynamic("V41_FWD_C2A_TABLE_DYN")
 FWD_C1A_TABLE_DYN = pl.dynamic("V41_FWD_C1A_TABLE_DYN")
 
 
+if MOE_TOKENS > ENGRAM_CAPACITY:
+    raise ValueError("Engram request capacity must cover the decode physical capacity")
+
+
 @pl.jit.inline(auto_scope=False)
 def decode_encoder(
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    engram_rows: pl.Tensor[[ENGRAM_LAYERS, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
+    engram_mask: pl.Tensor[[LOCAL_T_DYN], pl.INT32],
+    engram_wkv: pl.Tensor[[ENGRAM_LAYERS, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[ENGRAM_LAYERS, ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    engram_gate_weight: pl.Tensor[[ENGRAM_LAYERS, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
@@ -234,6 +247,14 @@ def decode_encoder(
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
     for layer in pl.range(0, 20):
         with pl.scope():
+            if layer == 1 or layer == 14:
+                engram_slot = 0
+                if layer == 14:
+                    engram_slot = 1
+                engram(
+                    engram_rows[engram_slot], engram_wkv[engram_slot], engram_wkv_scale[engram_slot],
+                    engram_gate_weight[engram_slot], engram_mask, x_hc, x_hc, attention_count,
+                )
             layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [layer * window_blocks_per_layer, 0, 0, 0])
             layer_window_cache_scale = pl.slice(window_cache_scale_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], [layer * window_blocks_per_layer, 0, 0, 0])
             layer_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [layer * MIX_HC, 0])
@@ -664,6 +685,27 @@ def decode_decoder(
 def l2_decode_fwd(
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    engram_rows: pl.Out[pl.Tensor[[ENGRAM_LAYERS, LOCAL_T_DYN, ENGRAM_K], pl.BF16]],
+    engram_context: pl.Tensor[[LOCAL_T_DYN, 4], pl.INT32],
+    engram_token_map: pl.Tensor[[M.vocab_size], pl.INT32],
+    engram_multipliers: pl.Tensor[[ENGRAM_LAYERS, 4], pl.INT64],
+    engram_primes: pl.Tensor[[ENGRAM_LAYERS, 24], pl.INT32],
+    engram_offsets: pl.Tensor[[ENGRAM_LAYERS, 24], pl.INT32],
+    engram_table: pl.Tensor[[ENGRAM_LAYERS, TABLE_ROWS, 256], pl.FP8E4M3FN],
+    engram_scale: pl.Tensor[[ENGRAM_LAYERS, TABLE_ROWS, 8], pl.FP8E8M0],
+    engram_row_ids: pl.Tensor[[ENGRAM_LAYERS, MAP_ROWS], pl.INT32],
+    engram_hash_ids: pl.Out[pl.Tensor[[ENGRAM_LAYERS, ENGRAM_CAPACITY, 24], pl.INT32]],
+    engram_missing: pl.Out[pl.Tensor[[2 * ENGRAM_CAPACITY * 24, 16], pl.INT32]],
+    engram_mask: pl.Tensor[[LOCAL_T_DYN], pl.INT32],
+    engram_wkv: pl.Tensor[[ENGRAM_LAYERS, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[ENGRAM_LAYERS, ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    engram_gate_weight: pl.Tensor[[ENGRAM_LAYERS, HC_MULT, D], pl.FP32],
+    engram_requests: pld.DistributedTensor[[EP_SIZE * ENGRAM_SLOTS, 16], pl.INT32],
+    engram_request_done: pld.DistributedTensor[[EP_SIZE, 16], pl.INT32],
+    engram_responses: pld.DistributedTensor[[ENGRAM_SLOTS, 256], pl.BF16],
+    engram_status: pld.DistributedTensor[[ENGRAM_SLOTS, 16], pl.INT32],
+    engram_response_done: pld.DistributedTensor[[ENGRAM_SHARDS, 16], pl.INT32],
+    engram_readers_done: pld.DistributedTensor[[EP_SIZE, 16], pl.INT32],
     hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
@@ -760,10 +802,25 @@ def l2_decode_fwd(
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
     logits_done: pld.DistributedTensor[[1, 1], pl.INT32],
 ):
+    engram_rows.bind_dynamic(1, LOCAL_T_DYN)
+    engram_context.bind_dynamic(0, LOCAL_T_DYN)
+    engram_mask.bind_dynamic(0, LOCAL_T_DYN)
+    engram_table.bind_dynamic(1, TABLE_ROWS)
+    engram_scale.bind_dynamic(1, TABLE_ROWS)
+    engram_row_ids.bind_dynamic(1, MAP_ROWS)
+    with pl.scope():
+        prepare_engram(
+            engram_context, engram_token_map, engram_multipliers, engram_primes, engram_offsets,
+            engram_hash_ids, engram_mask, engram_table, engram_scale, engram_row_ids,
+            engram_rows, engram_missing, attention_num_tokens,
+            engram_requests, engram_request_done, engram_responses, engram_status,
+            engram_response_done, engram_readers_done, rank, True,
+        )
     compressed_token_rope_cos = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_token_rope_sin = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     encoder_hidden, encoder_pre_mix, token_cos, token_sin = decode_encoder(
         x_hc, pre_mix,
+        engram_rows, engram_mask, engram_wkv, engram_wkv_scale, engram_gate_weight,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_weight,
         wq_a, q_norm_weight, wq_b,
@@ -842,6 +899,21 @@ def l2_decode_fwd(
 def l3_decode_fwd(
     x_hc: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    engram_rows: pl.Out[pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, LOCAL_T_DYN, ENGRAM_K], pl.BF16]],
+    engram_context: pl.Tensor[[EP_SIZE, LOCAL_T_DYN, 4], pl.INT32],
+    engram_token_map: pl.Tensor[[EP_SIZE, M.vocab_size], pl.INT32],
+    engram_multipliers: pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, 4], pl.INT64],
+    engram_primes: pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, 24], pl.INT32],
+    engram_offsets: pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, 24], pl.INT32],
+    engram_table: pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, TABLE_ROWS, 256], pl.FP8E4M3FN],
+    engram_scale: pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, TABLE_ROWS, 8], pl.FP8E8M0],
+    engram_row_ids: pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, MAP_ROWS], pl.INT32],
+    engram_hash_ids: pl.Out[pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, ENGRAM_CAPACITY, 24], pl.INT32]],
+    engram_missing: pl.Out[pl.Tensor[[EP_SIZE, 2 * ENGRAM_CAPACITY * 24, 16], pl.INT32]],
+    engram_mask: pl.Tensor[[EP_SIZE, LOCAL_T_DYN], pl.INT32],
+    engram_wkv: pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
+    engram_wkv_scale: pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, ENGRAM_K // 32, KV_OUT], pl.FP8E8M0],
+    engram_gate_weight: pl.Tensor[[EP_SIZE, ENGRAM_LAYERS, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[EP_SIZE, N_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC], pl.FP32],
@@ -992,10 +1064,15 @@ def l3_decode_fwd(
     commit lengths before the next call. Completed forwards clear MoE signals;
     use persistent=True with reset_persistent_windows=False for serialized calls.
     Reset a reused request slot in all C2A sources after its users complete. Restore or reset mutated state before retrying failed
-    calls. Engram, vision and DSpark require no inputs here.
+    calls. Raw Engram contexts and masks follow rank-local x_hc row order.
+    Device hashing and sharded lookup prepare both layers before the backbone;
+    WKV weights are native MXFP8. Check engram_missing before accepting outputs.
+    Vision and DSpark require no inputs here.
     """
     x_hc.bind_dynamic(1, LOCAL_T_DYN)
     pre_mix.bind_dynamic(1, LOCAL_T_DYN)
+    engram_rows.bind_dynamic(2, LOCAL_T_DYN)
+    engram_mask.bind_dynamic(1, LOCAL_T_DYN)
     window_cache_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(1, FWD_CMP_BLOCKS_DYN)
@@ -1012,6 +1089,16 @@ def l3_decode_fwd(
     position_ids.bind_dynamic(1, T_DYN)
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
+    engram_context.bind_dynamic(1, LOCAL_T_DYN)
+    engram_table.bind_dynamic(2, TABLE_ROWS)
+    engram_scale.bind_dynamic(2, TABLE_ROWS)
+    engram_row_ids.bind_dynamic(2, MAP_ROWS)
+    engram_request_buffer = pld.alloc_window_buffer([EP_SIZE * ENGRAM_SLOTS, 16], dtype=pl.INT32)
+    engram_request_signal = pld.alloc_window_buffer([EP_SIZE, 16], dtype=pl.INT32)
+    engram_response_buffer = pld.alloc_window_buffer([ENGRAM_SLOTS, 256], dtype=pl.BF16)
+    engram_status_buffer = pld.alloc_window_buffer([ENGRAM_SLOTS, 16], dtype=pl.INT32)
+    engram_response_signal = pld.alloc_window_buffer([ENGRAM_SHARDS, 16], dtype=pl.INT32)
+    engram_readers_signal = pld.alloc_window_buffer([EP_SIZE, 16], dtype=pl.INT32)
     recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
@@ -1030,6 +1117,13 @@ def l3_decode_fwd(
     head_logits_buffer = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
     head_logits_done_buffer = pld.alloc_window_buffer([1, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
+        engram_requests = pld.window(engram_request_buffer, [EP_SIZE * ENGRAM_SLOTS, 16], dtype=pl.INT32)
+        engram_request_done = pld.window(engram_request_signal, [EP_SIZE, 16], dtype=pl.INT32)
+        engram_responses = pld.window(engram_response_buffer, [ENGRAM_SLOTS, 256], dtype=pl.BF16)
+        engram_status = pld.window(engram_status_buffer, [ENGRAM_SLOTS, 16], dtype=pl.INT32)
+        engram_response_done = pld.window(engram_response_signal, [ENGRAM_SHARDS, 16], dtype=pl.INT32)
+        engram_readers_done = pld.window(engram_readers_signal, [EP_SIZE, 16], dtype=pl.INT32)
+
         recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
         recv_scale = pld.window(
@@ -1057,6 +1151,13 @@ def l3_decode_fwd(
         head_logits_done = pld.window(head_logits_done_buffer, [1, 1], dtype=pl.INT32)
         l2_decode_fwd(
             x_hc[rank], pre_mix[rank],
+            engram_rows[rank], engram_context[rank], engram_token_map[rank],
+            engram_multipliers[rank], engram_primes[rank], engram_offsets[rank],
+            engram_table[rank], engram_scale[rank], engram_row_ids[rank],
+            engram_hash_ids[rank], engram_missing[rank],
+            engram_mask[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_gate_weight[rank],
+            engram_requests, engram_request_done, engram_responses, engram_status,
+            engram_response_done, engram_readers_done,
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank],
             wq_a[rank], q_norm_weight[rank], wq_b[rank],
@@ -1121,6 +1222,8 @@ def _fixture_extent(dim):
         return dim
     name = repr(dim)
     extents = {
+        "ENGRAM_TABLE_ROWS": (24 * 17 + ENGRAM_SHARDS - 1) // ENGRAM_SHARDS,
+        "ENGRAM_MAP_ROWS": (24 * 17 + ENGRAM_SHARDS - 1) // ENGRAM_SHARDS,
         "ROPE_ROWS_DYN": FIXTURE_SEQUENCE,
         "LOCAL_T_DYN": MOE_TOKENS,
         "Q_START_DYN": FIXTURE_BATCH + 1,
@@ -1161,12 +1264,16 @@ def build_tensor_specs():
         slots = paged_slots(position_ids, request_ids, table, BLOCK_SIZE, ratio, True)
         metadata_rows[family + "_compressed_slots"] = slots
         metadata_rows[family + "_index_block_table"] = table
+    engram_values = build_engram_fixture(EP_SIZE, MOE_TOKENS, FIXTURE_TOKENS, sequence=FIXTURE_SEQUENCE)
     for name in l3_decode_fwd.param_names:
         annotation = signature.parameters[name].annotation
         shape = [_fixture_extent(dim) for dim in annotation.shape]
         dtype = _torch_dtype(annotation.dtype)
         init_value = None
-        if name == "token_to_req_indices":
+        if name in engram_values:
+            init_value = engram_values[name]
+            shape = list(init_value.shape)
+        elif name == "token_to_req_indices":
             init_value = request_ids.repeat(EP_SIZE, 1)
         elif name == "position_ids":
             init_value = position_ids.repeat(EP_SIZE, 1)
@@ -1212,6 +1319,9 @@ if __name__ == "__main__":
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--experts-per-rank", type=int, default=N_LOCAL_EXPERTS, help="routed experts on each EP rank")
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
+    parser.add_argument("--engram-shards", type=int, default=ENGRAM_SHARDS)
+    parser.add_argument("--lookup-capacity", type=int, default=ENGRAM_CAPACITY)
+    parser.add_argument("--engram-compact", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
     parser.add_argument("--enable-scope-stats", action="store_true")
@@ -1244,6 +1354,8 @@ if __name__ == "__main__":
         config=config,
         compile_only=True,
     )
+    if result.passed:
+        write_engram_contract(result.work_dir)
     if result.passed and not args.compile_only:
         cfg = normalize_config(config)
         compiled = DistributedCompiledProgram.from_dir(
@@ -1260,6 +1372,9 @@ if __name__ == "__main__":
             parameters = compiled._get_metadata()[0]
             arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
             runtime(*arguments, config=cfg)
+            handles = dict(zip([spec.name for spec in specs], arguments, strict=True))
+            fixture = build_engram_fixture(EP_SIZE, MOE_TOKENS, FIXTURE_TOKENS, sequence=FIXTURE_SEQUENCE)
+            validate_forward_engram(runtime, handles, fixture, torch.ones((EP_SIZE, MOE_TOKENS), dtype=torch.int32), [FIXTURE_TOKENS] * EP_SIZE)
             stacked = dict(zip((spec.name for spec in specs), arguments, strict=True))
             for name, tensor in host_outputs.items():
                 runtime.copy_stacked_from(stacked[name], tensor)
@@ -1271,6 +1386,6 @@ if __name__ == "__main__":
             raise RuntimeError("inactive decode sampled-id rows must be zero")
         if torch.count_nonzero(host_outputs["sampled_ids"][:, :, 1:]).item():
             raise RuntimeError("decode sampled-id padding must be zero")
-        print("[FWD] Execution and head output checks passed; numerical accuracy was not validated.", flush=True)
+        print("[FWD] Execution, head and exact Engram hash/rows checks passed; backbone numerical accuracy was not validated.", flush=True)
     if not result.passed:
         raise SystemExit(result.error or 1)
