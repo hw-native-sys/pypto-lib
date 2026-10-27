@@ -14,6 +14,41 @@ import torch
 from models.glm5_3_flash.config import D, EP_SIZE, FLASH, MOE_INTER, N_EXPERTS, N_LOCAL_EXPERTS
 
 
+def component_options(description, *, tokens=17, layers=None):
+    """Parse the common standalone component and checkpoint validation options."""
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("-p", "--platform", dest="backend_type", default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--hidden-input", type=Path)
+    parser.add_argument("--tokens", type=int, default=tokens)
+    parser.add_argument("--compile-only", action="store_true")
+    if layers is not None:
+        parser.add_argument("--layer", type=int, default=0)
+    options = parser.parse_args()
+    if options.tokens < 1:
+        parser.error("--tokens must be positive")
+    if layers is not None and not 0 <= options.layer < layers:
+        parser.error(f"--layer must be in [0, {layers})")
+    return options
+
+
+def component_hidden(options, width, generator):
+    """Load captured component input or construct deterministic finite BF16 rows."""
+    if options.hidden_input is None:
+        return torch.randn(options.tokens, width, generator=generator).bfloat16()
+    value = torch.load(options.hidden_input, map_location="cpu", weights_only=True)
+    if not isinstance(value, torch.Tensor) or tuple(value.shape) != (options.tokens, width):
+        raise ValueError("--hidden-input must have shape [tokens, input_width]")
+    if not torch.isfinite(value).all():
+        raise ValueError("--hidden-input must contain finite values")
+    return value.bfloat16().contiguous()
+
+
 def build_checkpoint_moe_specs(checkpoint, layer_id, *, capacity, num_tokens, num_ranks, hidden=None):
     """Stage real FFN weights and synthetic or supplied pre-norm MoE activations.
 
@@ -95,4 +130,4 @@ def build_checkpoint_moe_specs(checkpoint, layer_id, *, capacity, num_tokens, nu
     return specs
 
 
-__all__ = ["build_checkpoint_moe_specs"]
+__all__ = ["build_checkpoint_moe_specs", "component_hidden", "component_options"]

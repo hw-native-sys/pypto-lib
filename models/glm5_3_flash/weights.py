@@ -10,6 +10,7 @@
 
 import json
 import sys
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
@@ -27,7 +28,8 @@ from models.glm5_3_flash.config import (
     TP_SIZE,
 )
 from models.glm5_3_flash.indexer_cache import sylvester_hadamard
-from models.glm5_3_flash.mla_prolog import golden_absorb_output
+from models.glm5_3_flash.golden import golden_absorb_output
+import models.glm5_3_flash.vision.config as V
 
 # This directory owns a ``golden.py`` reference module, so the repository-root
 # ``golden`` harness package must come first on the path before any harness import.
@@ -37,6 +39,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # INT8 FRACTAL_NZ storage: 16 rows and one 32-byte C0 line per inner block.
 _NZ_ROWS = 16
 _NZ_INT8_C0 = 32
+
+
+def vision_weight_layouts() -> dict[str, tuple[int, ...]]:
+    """Return the complete released BF16 vision-tower tensor layout."""
+    depth, hidden, intermediate = V.VISION_DEPTH, V.VISION_HIDDEN, V.VISION_INTER
+    return {
+        "patch_weight": (hidden, V.VISION_PATCH_IN), "patch_bias": (hidden,),
+        "norm1_weight": (depth, hidden), "qkv_weight": (depth, 3 * hidden, hidden),
+        "qkv_bias": (depth, 3 * hidden), "q_norm_weight": (depth, V.VISION_HEAD_DIM),
+        "k_norm_weight": (depth, V.VISION_HEAD_DIM), "out_weight": (depth, hidden, hidden),
+        "out_bias": (depth, hidden), "norm2_weight": (depth, hidden),
+        "gate_weight": (depth, intermediate, hidden), "gate_bias": (depth, intermediate),
+        "up_weight": (depth, intermediate, hidden), "up_bias": (depth, intermediate),
+        "down_weight": (depth, hidden, intermediate), "down_bias": (depth, hidden),
+        "post_norm_weight": (hidden,), "downsample_weight": (D, V.VISION_MERGE ** 2 * hidden),
+        "downsample_bias": (D,), "merger_proj_weight": (D, D), "merger_norm_weight": (D,),
+        "merger_norm_bias": (D,), "merger_gate_weight": (V.VISION_PROJ_INTER, D),
+        "merger_up_weight": (V.VISION_PROJ_INTER, D), "merger_down_weight": (D, V.VISION_PROJ_INTER),
+    }
 
 
 def pack_int8_nz(logical: torch.Tensor) -> torch.Tensor:
@@ -545,6 +566,67 @@ class Checkpoint(Mapping[str, torch.Tensor]):
         self.used.add(key)
         return value.contiguous()
 
+    def vision_tensor(self, suffix: str, shape: Sequence[int]) -> torch.Tensor:
+        """Load one unquantized vision tensor from either supported checkpoint root."""
+        candidates = [root + suffix for root in ("model.visual.", "visual.")]
+        names = [name for name in candidates if name in self]
+        if len(names) != 1:
+            raise ValueError(f"vision tensor must resolve exactly once: {suffix}")
+        value = self.read(names[0])
+        if tuple(value.shape) != tuple(shape) or value.dtype != torch.bfloat16:
+            raise ValueError(f"vision {suffix} must have BF16 shape {tuple(shape)}")
+        if not torch.isfinite(value).all():
+            raise ValueError(f"vision tensor contains nonfinite values: {suffix}")
+        return value
+
+    def vision_weights(self) -> dict[str, torch.Tensor]:
+        """Stage all 24 vision blocks and the spatial merger without quantization."""
+        config = self._json("config.json").get("vision_config", {})
+        required = {
+            "depth": V.VISION_DEPTH, "hidden_size": V.VISION_HIDDEN, "num_heads": V.VISION_HEADS,
+            "intermediate_size": V.VISION_INTER, "out_hidden_size": D, "patch_size": V.VISION_PATCH,
+            "temporal_patch_size": V.VISION_TEMPORAL_PATCH, "spatial_merge_size": V.VISION_MERGE,
+            "projection_intermediate_size": V.VISION_PROJ_INTER, "rms_norm_eps": V.VISION_RMS_NORM_EPS,
+            "swiglu_limit": V.VISION_SWIGLU_LIMIT, "attention_bias": True,
+        }
+        for name, expected in required.items():
+            if config.get(name) != expected:
+                raise ValueError(f"vision_config.{name} must be {expected!r}")
+        blocks = {
+            "norm1_weight": "norm1.weight", "qkv_weight": "attn.qkv.weight",
+            "qkv_bias": "attn.qkv.bias", "q_norm_weight": "attn.q_norm.weight",
+            "k_norm_weight": "attn.k_norm.weight", "out_weight": "attn.proj.weight",
+            "out_bias": "attn.proj.bias", "norm2_weight": "norm2.weight",
+            "gate_weight": "mlp.gate_proj.weight", "gate_bias": "mlp.gate_proj.bias",
+            "up_weight": "mlp.up_proj.weight", "up_bias": "mlp.up_proj.bias",
+            "down_weight": "mlp.down_proj.weight", "down_bias": "mlp.down_proj.bias",
+        }
+        singles = {
+            "patch_weight": "patch_embed.proj.weight", "patch_bias": "patch_embed.proj.bias",
+            "post_norm_weight": "post_layernorm.weight", "downsample_weight": "downsample.weight",
+            "downsample_bias": "downsample.bias", "merger_proj_weight": "merger.proj.weight",
+            "merger_norm_weight": "merger.post_projection_norm.weight",
+            "merger_norm_bias": "merger.post_projection_norm.bias",
+            "merger_gate_weight": "merger.gate_proj.weight", "merger_up_weight": "merger.up_proj.weight",
+            "merger_down_weight": "merger.down_proj.weight",
+        }
+        values = {}
+        for name, shape in vision_weight_layouts().items():
+            if name in blocks:
+                values[name] = torch.stack([
+                    self.vision_tensor(f"blocks.{layer}.{blocks[name]}", shape[1:])
+                    for layer in range(V.VISION_DEPTH)
+                ])
+            else:
+                source_shape = shape
+                if name == "patch_weight":
+                    source_shape = (V.VISION_HIDDEN, V.VISION_IN_CHANNELS, V.VISION_TEMPORAL_PATCH,
+                                    V.VISION_PATCH, V.VISION_PATCH)
+                elif name == "downsample_weight":
+                    source_shape = (D, V.VISION_HIDDEN, V.VISION_MERGE, V.VISION_MERGE)
+                values[name] = self.vision_tensor(singles[name], source_shape).reshape(shape)
+        return values
+
     def layer_key(self, layer: int, suffix: str) -> str:
         """Resolve a tensor name in a text-backbone layer, excluding the MTP layer."""
         if not 0 <= layer < FLASH.num_hidden_layers:
@@ -1031,7 +1113,7 @@ def split_kv_b(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Split ``kv_b_proj`` into its key/value halves and keep one TP rank's heads.
 
-    Mirrors ``golden_split_kv_b`` (``mla_prolog.py``): the checkpoint stores
+    Mirrors ``golden_split_kv_b`` (``golden.py``): the checkpoint stores
     ``[H * (QK_DIM + V_DIM), KV_LORA]``; the halves come back per head as
     ``[LOCAL_H, QK_DIM, KV_LORA]`` and ``[LOCAL_H, V_DIM, KV_LORA]`` — reduction
     dim first, the layout ``absorb_query`` consumes without a transpose. The
@@ -1136,7 +1218,7 @@ class ResidentPrefillWeights:
     TP1/EP16 collapses to tp_rank 0 for every rank.
     """
 
-    def __init__(self, checkpoint, *, tp_size: int, ep_size: int, model: Glm53FlashConfig | None = None):
+    def __init__(self, checkpoint, *, tp_size: int, ep_size: int, model: Glm53FlashConfig | None = None, mla_mode: str = "bf16"):
         model = FLASH if model is None else model
         if isinstance(checkpoint, Checkpoint) and model is not FLASH:
             raise ValueError("Checkpoint validates the deployment geometry; pass model only for fixtures")
@@ -1154,6 +1236,19 @@ class ResidentPrefillWeights:
             raise ValueError(f"{model.intermediate_size} dense channels do not divide TP{tp_size}")
         if model.n_routed_experts % ep_size:
             raise ValueError(f"{model.n_routed_experts} routed experts do not divide EP{ep_size}")
+        if mla_mode not in ("bf16", "native"):
+            raise ValueError("mla_mode must be bf16 or native")
+        self.mla_mode = mla_mode
+        self._family_members = dict(_FAMILY_MEMBERS)
+        if mla_mode == "native":
+            native = []
+            for spec in _MLA_MEMBERS:
+                if spec.member in ("w_q_a", "w_q_b", "w_kv_a", "w_o"):
+                    native.append(dataclasses.replace(spec, dtype=torch.int8))
+                    native.append(dataclasses.replace(spec, member=spec.member + "_scale", dtype=torch.float32))
+                else:
+                    native.append(spec)
+            self._family_members["mla"] = tuple(native)
         self.checkpoint = checkpoint
         self.model = model
         self.tp_size = tp_size
@@ -1185,9 +1280,10 @@ class ResidentPrefillWeights:
     @classmethod
     def load(
         cls, checkpoint, *, tp_size: int = 16, ep_size: int = 16, model: Glm53FlashConfig | None = None,
+        mla_mode: str = "bf16",
     ) -> "ResidentPrefillWeights":
         """Build the full stack plan from checkpoint headers, reading no payloads."""
-        self = cls(checkpoint, tp_size=tp_size, ep_size=ep_size, model=model)
+        self = cls(checkpoint, tp_size=tp_size, ep_size=ep_size, model=model, mla_mode=mla_mode)
         self._resolve_sources()
         self._build_stacks()
         return self
@@ -1208,7 +1304,7 @@ class ResidentPrefillWeights:
     def _resolve_sources(self) -> None:
         """Resolve and header-validate every stack member's source tensor."""
         model = self.model
-        for family, members in _FAMILY_MEMBERS.items():
+        for family, members in self._family_members.items():
             prefix = _FAMILY_PREFIX[family]
             for layer in self._family_layers[family]:
                 for spec in members:
@@ -1219,12 +1315,18 @@ class ResidentPrefillWeights:
                     ]
                     name = self._resolve(candidates, f"{family}.{spec.member} on layer {layer}")
                     self._source[(f"{family}.{spec.member}", layer)] = name
-                    self._validate_member_header(name, _source_shape(model, family, spec.member), spec.dtype)
+                    member = spec.member.removesuffix("_scale") if family == "mla" else spec.member
+                    native = family == "mla" and self.mla_mode == "native" and member in ("w_q_a", "w_q_b", "w_kv_a", "w_o")
+                    if native and self._label(name) != "W8A8_DYNAMIC":
+                        raise ValueError(f"native MLA projection must be W8A8_DYNAMIC: {name}")
+                    dtype = torch.bfloat16 if native else spec.dtype
+                    self._validate_member_header(name, _source_shape(model, family, member), dtype)
         hidden = model.hidden_size
         for member, suffix, shape in (
             ("eh_proj", "eh_proj.weight", (hidden, 2 * hidden)),
             ("enorm", "enorm.weight", (hidden,)),
             ("hnorm", "hnorm.weight", (hidden,)),
+            ("final_norm", "shared_head.norm.weight", (hidden,)),
         ):
             candidates = [root + f"{self._mtp_layer}." + suffix for root in TEXT_LAYER_ROOTS]
             name = self._resolve(candidates, f"mtp.{member}")
@@ -1265,7 +1367,7 @@ class ResidentPrefillWeights:
         model = self.model
         hidden = model.hidden_size
         stacks: dict[str, StackPlan] = {}
-        for family, members in _FAMILY_MEMBERS.items():
+        for family, members in self._family_members.items():
             layers = self._family_layers[family]
             for spec in members:
                 name = f"{family}.{spec.member}"
@@ -1300,6 +1402,7 @@ class ResidentPrefillWeights:
             ("mtp.eh_proj", "mtp", (hidden, 2 * hidden)),
             ("mtp.enorm", "mtp", (hidden,)),
             ("mtp.hnorm", "mtp", (hidden,)),
+            ("mtp.final_norm", "mtp", (hidden,)),
             ("hadamard", "single", (model.index_head_dim, model.index_head_dim)),
         ):
             layers = (self._mtp_layer,) if family == "mtp" else ()
@@ -1349,6 +1452,8 @@ class ResidentPrefillWeights:
             shapes = {"input_norm": (hidden,), "post_norm": (hidden,)}
         else:
             shapes = {"gate_w": (model.n_routed_experts, hidden), "gate_bias": (model.n_routed_experts,)}
+        if family == "mla" and spec.member.endswith("_scale"):
+            return (shapes[spec.member.removesuffix("_scale")][0],)
         return shapes[spec.member]
 
     # -- public interface --------------------------------------------------------------
@@ -1367,9 +1472,8 @@ class ResidentPrefillWeights:
     def host_bytes(self) -> int:
         """Host-side table bytes: the full LM head plus the embedding table.
 
-        The head is read once and cached; embedding rows are gathered per prompt,
-        so the full table is the steady-state ceiling rather than a fixed cost.
-        MTP duplicates of either table alias them and add nothing.
+        The backbone head is cached and embedding rows are gathered per prompt.
+        MTP rows and head shards are read separately without retaining full tables.
         """
         return 2 * self.model.vocab_size * self.model.hidden_size * 2
 
@@ -1388,14 +1492,27 @@ class ResidentPrefillWeights:
             host_tables=("embed_tokens", "lm_head"),
         )
 
-    def lookup_rows(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def lookup_rows(self, token_ids: torch.Tensor, *, mtp: bool = False) -> torch.Tensor:
         """Gather one prompt's BF16 embedding rows from the host table."""
         ids = torch.as_tensor(token_ids, device="cpu")
         if ids.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
             raise ValueError("token ids must have an integer dtype")
         if bool(((ids < 0) | (ids >= self.model.vocab_size)).any()):
             raise ValueError("token id is outside the checkpoint vocabulary")
-        return gather_rows(self.checkpoint, self._embed_name, ids).to(torch.bfloat16)
+        name = self._embed_name
+        if mtp:
+            name = self._resolve([root + f"{self._mtp_layer}.embed_tokens.weight" for root in TEXT_LAYER_ROOTS],
+                                 "MTP embedding")
+        return gather_rows(self.checkpoint, name, ids).to(torch.bfloat16)
+
+    def mtp_head_shard(self, rank: int) -> torch.Tensor:
+        """Read the MTP-owned vocabulary shard without assuming tied tables."""
+        if rank not in range(self.tp_size):
+            raise ValueError("MTP head rank is outside the TP group")
+        name = self._resolve([root + f"{self._mtp_layer}.shared_head.head.weight" for root in TEXT_LAYER_ROOTS],
+                             "MTP shared head")
+        width = self.model.vocab_size // self.tp_size
+        return self.checkpoint.read(name, slice(rank * width, (rank + 1) * width)).bfloat16()
 
     def lm_head(self) -> torch.Tensor:
         """The full ``[vocab, hidden]`` BF16 head matrix, read once and cached."""
@@ -1406,25 +1523,6 @@ class ResidentPrefillWeights:
                 raise ValueError(f"lm_head has shape {tuple(head.shape)}, expected {expected}")
             self._lm_head_cache = head.to(torch.bfloat16).contiguous()
         return self._lm_head_cache
-
-    def verify_host_aliases(self, sample_rows: int = 16) -> None:
-        """MTP duplicates of the host tables must equal the top-level tables."""
-        checkpoint = self.checkpoint
-        stride = max(1, self.model.vocab_size // sample_rows)
-        rows = torch.arange(0, self.model.vocab_size, stride)
-        for top, duplicate in self._mtp_duplicate_names():
-            if duplicate in checkpoint and not torch.equal(
-                gather_rows(checkpoint, top, rows), gather_rows(checkpoint, duplicate, rows)
-            ):
-                raise ValueError(f"MTP duplicate {duplicate} disagrees with {top} on sampled rows")
-
-    def _mtp_duplicate_names(self) -> list[tuple[str, str]]:
-        mtp = self._mtp_layer
-        duplicates = []
-        for root in TEXT_LAYER_ROOTS:
-            duplicates.append((self._embed_name, root + f"{mtp}.embed_tokens.weight"))
-            duplicates.append((self._lm_head_name, root + f"{mtp}.shared_head.head.weight"))
-        return duplicates
 
     # -- materialization ----------------------------------------------------------------
 
@@ -1467,8 +1565,17 @@ class ResidentPrefillWeights:
         """One MLA layer's eight rank slices; ``kv_b_proj`` is read once."""
         out: dict[str, torch.Tensor] = {}
         kv_b = None
-        for spec in _MLA_MEMBERS:
-            if spec.transform in ("split_k", "split_v"):
+        for spec in self._family_members["mla"]:
+            if spec.member.endswith("_scale"):
+                continue
+            if spec.dtype == torch.int8:
+                name = self._source[(f"mla.{spec.member}", layer)]
+                weight, scale = _read_quant(self.checkpoint, name)
+                out[spec.member] = self._shard(weight, spec.shard, tp_rank).contiguous()
+                if spec.shard == "rows":
+                    scale = self._shard(scale, "rows", tp_rank)
+                out[spec.member + "_scale"] = scale.contiguous()
+            elif spec.transform in ("split_k", "split_v"):
                 if kv_b is None:
                     kv_b = self._read_source(self._source[("mla.w_k", layer)], torch.bfloat16)
                 key, value = split_kv_b(
@@ -1483,14 +1590,14 @@ class ResidentPrefillWeights:
 
     def _stack_family(self, family: str, tp_rank: int) -> dict[str, torch.Tensor]:
         """Materialize one non-FFN family as its stacked rank tensor per member."""
-        collected: dict[str, list[torch.Tensor]] = {spec.member: [] for spec in _FAMILY_MEMBERS[family]}
+        collected: dict[str, list[torch.Tensor]] = {spec.member: [] for spec in self._family_members[family]}
         for layer in self._family_layers[family]:
             per_layer = (
                 self._mla_layer(layer, tp_rank)
                 if family == "mla"
                 else {
                     spec.member: self._member_tensor(family, spec, layer, tp_rank)
-                    for spec in _FAMILY_MEMBERS[family]
+                    for spec in self._family_members[family]
                 }
             )
             for member, tensor in per_layer.items():
@@ -1553,6 +1660,7 @@ class ResidentPrefillWeights:
             "mtp.eh_proj": self._read_source(self._source[("mtp.eh_proj", self._mtp_layer)], torch.bfloat16),
             "mtp.enorm": self._read_source(self._source[("mtp.enorm", self._mtp_layer)], torch.bfloat16),
             "mtp.hnorm": self._read_source(self._source[("mtp.hnorm", self._mtp_layer)], torch.bfloat16),
+            "mtp.final_norm": self._read_source(self._source[("mtp.final_norm", self._mtp_layer)], torch.bfloat16),
             "hadamard": hadamard.contiguous(),
         }
 
@@ -1606,7 +1714,7 @@ class ResidentPrefillWeights:
                     if family == "mla"
                     else {
                         spec.member: self._member_tensor(family, spec, layer, tp_rank)
-                        for spec in _FAMILY_MEMBERS[family]
+                        for spec in self._family_members[family]
                     }
                 )
                 for member, value in per_layer.items():
@@ -1845,7 +1953,7 @@ if __name__ == "__main__":
     import ctypes  # noqa: PLC0415
 
     from models.glm5_3_flash.indexer_cache import sylvester_hadamard  # noqa: PLC0415
-    from models.glm5_3_flash.mla_prolog import golden_split_kv_b  # noqa: PLC0415
+    from models.glm5_3_flash.golden import golden_split_kv_b  # noqa: PLC0415
 
     TINY = Glm53FlashConfig(
         name="glm5_3_flash_tiny", vocab_size=128, hidden_size=64, num_hidden_layers=4,
@@ -2152,7 +2260,7 @@ if __name__ == "__main__":
 
     # Resident test 5: the kv_b halves land reduction-first ([QK, KV_LORA]),
     # match the inline split sliced per head, and the full-geometry helper is
-    # bit-equal to the mla_prolog golden with complete head coverage.
+    # bit-equal to the shared projection golden with complete head coverage.
     kv_source = checkpoint["model.language_model.layers.3.self_attn.kv_b_proj.weight"]
     reshaped = kv_source.reshape(
         TINY.num_attention_heads, TINY.qk_head_dim + TINY.v_head_dim, TINY.kv_lora_rank
@@ -2210,24 +2318,22 @@ if __name__ == "__main__":
                 indexer_stack[member][index], source, f"indexer {member} passthrough layer {layer}"
             )
 
-    # Resident test 8: the host tables are counted once, no device stack
-    # carries them, and the MTP duplicates must alias them.
+    # Resident test 8: backbone tables and independently addressed MTP tables.
     assert weights.host_bytes == 2 * TINY.vocab_size * TINY.hidden_size * 2
     assert not any("embed" in name or "head" in name for name in weights.tensor_layouts)
-    weights.verify_host_aliases()
 
     def nudge_mtp_embed(tensors, labels):
         tensors["model.language_model.layers.4.embed_tokens.weight"][0].add_(1.0)
+        tensors["model.language_model.layers.4.shared_head.head.weight"][0].add_(2.0)
 
-    broken_weights = ResidentPrefillWeights.load(
+    untied_weights = ResidentPrefillWeights.load(
         build_tiny_fixture(mutate=nudge_mtp_embed), tp_size=2, ep_size=2, model=TINY
     )
-    try:
-        broken_weights.verify_host_aliases()
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("an unequal MTP embed duplicate should have been rejected")
+    mtp_rows = untied_weights.lookup_rows(torch.tensor([0]), mtp=True)
+    backbone_rows = untied_weights.lookup_rows(torch.tensor([0]))
+    assert_close(mtp_rows, backbone_rows + 1, "MTP keeps its untied embedding values")
+    mtp_head = untied_weights.mtp_head_shard(0)
+    assert_close(mtp_head[0], untied_weights.lm_head()[0] + 2, "MTP keeps its untied head values")
     rows = weights.lookup_rows(torch.tensor([[3, 0], [127, 5]]))
     assert rows.shape == (2, 2, TINY.hidden_size) and rows.dtype == torch.bfloat16
     embed_table = checkpoint["model.language_model.embed_tokens.weight"]
@@ -2405,7 +2511,7 @@ if __name__ == "__main__":
                         names[base + expert_base + part + ".weight_offset"] = "W8A8_DYNAMIC"
             mtp = f"model.layers.{model.mtp_layer_id}."
             for stem in ("eh_proj.weight", "enorm.weight", "hnorm.weight", "embed_tokens.weight",
-                         "shared_head.head.weight"):
+                         "shared_head.head.weight", "shared_head.norm.weight"):
                 names[mtp + stem] = "FLOAT"
             names["model.language_model.norm.weight"] = "FLOAT"
             names["model.language_model.embed_tokens.weight"] = "FLOAT"
@@ -2448,11 +2554,11 @@ if __name__ == "__main__":
     TP16_COMPONENTS = {
         "kda": 652_252_192, "mla": 364_953_600, "indexer": 179_324_928, "mhc": 70_788_600,
         "norm": 753_664, "router": 101_499_264, "routed": 19_503_710_208, "shared": 1_083_539_456,
-        "dense": 28_379_136, "mtp": 67_125_248, "single": 40_960,
+        "dense": 28_379_136, "mtp": 67_133_440, "single": 40_960,
     }
-    TP16_TOTAL = 22_052_367_256   # 22.05 GB per rank, the design's headline
+    TP16_TOTAL = 22_052_375_448   # 22.05 GB per rank, the design's headline
     TP1_OVERRIDES = {"kda": 9_366_356_992, "mla": 2_818_621_440, "dense": 453_328_896}
-    TP1_TOTAL = 33_645_089_656
+    TP1_TOTAL = 33_645_097_848
     for tp_size, overrides, total in ((16, {}, TP16_TOTAL), (1, TP1_OVERRIDES, TP1_TOTAL)):
         resident = ResidentPrefillWeights.load(_FullGeometryCheckpoint(), tp_size=tp_size, ep_size=16)
         components = {**TP16_COMPONENTS, **overrides}

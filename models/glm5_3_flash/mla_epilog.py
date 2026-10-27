@@ -28,8 +28,8 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import D, KV_LORA, LOCAL_H, T_DYN, V_DIM
-from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
+from models.glm5_3_flash.config import D, KV_LORA, LOCAL_H, T_DYN, TP_SIZE, V_DIM
+from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear, w8a8_projection_fp32
 
 MM_T_TILE = 16          # cube M tile; rows are a 16-row boxed tile
 O_N_TILE = 256          # o_proj output-column tile over D
@@ -86,6 +86,20 @@ def mla_epilog_prefill(
 
 
 @pl.jit.inline
+def mla_epilog_w8a8(
+    attn_out: pl.Tensor[[T_DYN, LOCAL_H, V_DIM], pl.BF16],
+    w_o: pl.Tensor[[D, LOCAL_H * V_DIM], pl.INT8],
+    w_o_scale: pl.Tensor[[D], pl.FP32],
+    output: pl.Tensor[[T_DYN, D], pl.FP32],
+):
+    """Publish the native W8A8 output projection's row-parallel FP32 partial."""
+    rows = pl.tensor.dim(attn_out, 0)
+    attn_flat = pl.reshape(attn_out, [rows, LOCAL_H * V_DIM])
+    w8a8_projection_fp32(attn_flat, w_o, w_o_scale, output, LOCAL_H * V_DIM, D)
+    return output
+
+
+@pl.jit.inline
 def mla_epilog_decode(
     attn_out: pl.Tensor[[T_DYN, LOCAL_H, KV_LORA], pl.BF16],
     w_o_absorbed: pl.Tensor[[D, LOCAL_H * KV_LORA], pl.BF16],
@@ -95,7 +109,7 @@ def mla_epilog_decode(
 
     Structurally the prefill epilog with a wider reduction: the context rows are
     ``KV_LORA`` = 512 instead of ``V_DIM`` = 256, because
-    :func:`models.glm5_3_flash.mla_prolog.golden_absorb_output` folded ``kv_b_proj``'s
+    :func:`models.glm5_3_flash.golden.golden_absorb_output` folded ``kv_b_proj``'s
     value half into the weight, so the value expansion never happens per token. Same
     FP32 partial-sum contract.
 
@@ -113,6 +127,65 @@ def mla_epilog_decode(
                               pl.cast(O_N_TILE, pl.INDEX), MM_T_TILE, O_N_TILE, LOCAL_H * KV_LORA, True)
             output = pl.assemble(output, pl.set_validshape(acc, valid_rows, O_N_TILE), [t0, n0])
     return output
+
+
+@pl.jit
+def mla_epilog_w8a8_test(
+    attn_out: pl.Tensor[[T_DYN, LOCAL_H, V_DIM], pl.BF16],
+    w_o: pl.Tensor[[D, LOCAL_H * V_DIM], pl.INT8],
+    w_o_scale: pl.Tensor[[D], pl.FP32],
+    output: pl.Out[pl.Tensor[[T_DYN, D], pl.FP32]],
+):
+    attn_out.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, T_DYN)
+    mla_epilog_w8a8(attn_out, w_o, w_o_scale, output)
+    return output
+
+
+def run_native_case(options):
+    from functools import lru_cache
+
+    from golden import TensorSpec, ratio_allclose, run
+    from models.glm5_3_flash.quantization import quantize_per_token_int8
+    from models.glm5_3_flash.utils import component_hidden
+    from models.glm5_3_flash.weights import Checkpoint
+
+    @lru_cache(maxsize=1)
+    def inputs():
+        generator = torch.Generator().manual_seed(5358)
+        hidden = component_hidden(options, LOCAL_H * V_DIM, generator)
+        values = {"attn_out": hidden.reshape(options.tokens, LOCAL_H, V_DIM)}
+        if options.checkpoint is not None:
+            attention = Checkpoint(options.checkpoint).attention(options.layer, tp=TP_SIZE, mla_mode="native")
+            values.update(w_o=attention["w_o"], w_o_scale=attention["w_o_scale"].reshape(-1))
+        else:
+            values["w_o"] = torch.randint(-128, 128, (D, LOCAL_H * V_DIM), generator=generator, dtype=torch.int8)
+            values["w_o_scale"] = torch.rand(D, generator=generator) * 0.001 + 0.0001
+        return values
+
+    specs = [
+        TensorSpec("attn_out", (options.tokens, LOCAL_H, V_DIM), torch.bfloat16, init_value=lambda: inputs()["attn_out"]),
+        TensorSpec("w_o", (D, LOCAL_H * V_DIM), torch.int8, init_value=lambda: inputs()["w_o"]),
+        TensorSpec("w_o_scale", (D,), torch.float32, init_value=lambda: inputs()["w_o_scale"]),
+        TensorSpec("output", (options.tokens, D), torch.float32),
+    ]
+
+    def golden(values):
+        quantized, scales = quantize_per_token_int8(values["attn_out"].flatten(1))
+        products = quantized.int() @ values["w_o"].int().t()
+        values["output"].copy_(products.float() * scales * values["w_o_scale"])
+
+    result = run(
+        fn=mla_epilog_w8a8_test,
+        specs=specs,
+        golden_fn=golden,
+        config=dict(backend_type=options.backend_type, execution_mode=options.execution_mode, device_id=options.device),
+        compare_fn={"output": ratio_allclose(atol=1e-5, rtol=1e-5, max_error_ratio=0)},
+        compile_only=options.compile_only,
+    )
+    print(result)
+    if not result.passed:
+        raise SystemExit(result.error or 1)
 
 
 @pl.jit
@@ -201,7 +274,20 @@ def main():
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tokens", type=int, default=20)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--mode", choices=["all", "bf16", "native"], default="all")
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--hidden-input", type=Path)
+    parser.add_argument("--layer", type=int, default=3)
     args = parser.parse_args()
+    if args.tokens < 1:
+        parser.error("--tokens must be positive")
+    if args.checkpoint is not None or args.hidden_input is not None:
+        if args.mode != "native":
+            parser.error("--checkpoint and --hidden-input require --mode native")
+    if args.mode in ("all", "native"):
+        run_native_case(args)
+        if args.mode == "native":
+            return
 
     compare = ratio_allclose(atol=1e-4, rtol=1e-3)
     cases = (
@@ -237,6 +323,8 @@ __all__ = [
     "mla_epilog_decode_test",
     "mla_epilog_prefill",
     "mla_epilog_prefill_test",
+    "mla_epilog_w8a8",
+    "mla_epilog_w8a8_test",
 ]
 
 

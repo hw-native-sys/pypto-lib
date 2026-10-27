@@ -4,7 +4,8 @@
 [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (`glm5_next`,
 `Glm5NextForConditionalGeneration`) on **Ascend a2a3**. It includes component
 kernels, Torch goldens, W8A8 checkpoint staging, composed MoE FFN entries,
-resident prefill and incremental decode forwards, and bounded decode validation.
+resident chunked generation, MTP proposals with greedy verification, and a
+24-block vision tower with image/video preprocessing.
 
 ## Why W8A8, and why a2a3 forces it
 
@@ -60,7 +61,7 @@ Three things are not:
   At width 4 this is 32 KB of live residual per token instead of 64 KB.
 - **The final collapse is an unweighted mean**, not a learned head applying the
   last layer's delayed pre-mix, so `mhc_head` takes no mix input.
-- **There is no RoPE anywhere.** `qk_rope_head_dim` is 0 and the config validator
+- **The text backbone has no RoPE.** `qk_rope_head_dim` is 0 and the config validator
   rejects any other value, so the rope/nope split disappears from the main
   attention — and the indexer has none either, despite `indexer_rope_interleave`
   being set in `config.json`. That field is inherited from the GLM-MoE-DSA base and
@@ -105,7 +106,7 @@ bring-up shapes remain available through `--tp` and `--ep`.
 | MLA heads / KDA heads | 8 / 8 | 4 / 4 |
 | Dense intermediate width | 1,536 | 768 |
 | Routed experts | 36 | 18 |
-| Resident weight plan | 39.42 GiB | 20.54 GiB |
+| Native resident weight plan | 39.20 GiB | 20.38 GiB |
 | MoE padded owner rows at packed capacity 576 | 80 | 48 |
 
 The packed batch has 16 stable request slots for either device count. Each MoE source
@@ -146,13 +147,14 @@ unaligned descriptors are rejected. A copy failure poisons the Session and
 requires close/reopen. Serving owns snapshot admission, in-flight leases,
 worker acknowledgement and eviction.
 
-The two banks retain 57.625 MiB per rank at TP8/context 512 or about 40.03 MiB
+The two banks retain 59.664 MiB per rank at TP8/context 512 or about 42.066 MiB
 at TP16/context 512, without reducing the sixteen live slots. The constructor
 checks the full payload against `prefix_snapshot_max_bytes` before allocation
 (default 128 MiB per rank); runtime overhead is additional. Larger contexts
 need an explicit budget and their own memory/numerical validation. Snapshot
 copies use an auxiliary typed program registered before worker preparation;
-the six production programs and layout manifest version 3 remain unchanged.
+the six production programs and auxiliary programs are recorded in layout
+manifest version 6. Earlier manifests require recompilation.
 
 The resident session defaults to NPU final RMSNorm and full-vocabulary
 projection for its 16 returned rows. BF16 hidden rows and final norm weights
@@ -186,11 +188,21 @@ All 25 saved request outputs remain bitwise identical.
 
 The query `--capacity` and per-request `--max-seq-len` are independent compiled
 dimensions. Query capacity bounds the sum of new chunk tokens; context capacity
-sizes private per-request cache segments. Indexer pool-close events include
+bounds logical request lengths. `--cache-tokens` independently bounds the
+shared physical page pool, aligned to 128 tokens. Its default is the smaller
+of sixteen full request contexts and 1,048,576 aggregate tokens. A request may
+grow to the configured context limit only while physical pages remain free.
+Allocation fails atomically when the shared pool is exhausted. Reset clears
+owned payloads and scales before releasing pages for another request. Indexer pool-close events include
 only newly completed pools and may read members written by earlier chunks.
 Saved artifacts include both dimensions and must be recompiled when either
-changes. The `forward()` and `generate()` full-prefix interfaces remain available
-for independent offline batches.
+changes. `forward()` resets an independent batch; `generate()` chunks prompt
+tokens and then appends only new decode tokens for 1–16 requests.
+
+The shared page allocator updates `block_table` and `pool_blocks` on each
+query batch. KDA request rows and the KDA constants remain fixed for the
+session. Prefix capture copies logical rows through the page table; restore
+reserves destination pages before copying the immutable snapshot.
 
 The standalone `generate()` report preserves its timing boundaries: total
 `seconds` starts at runtime preparation, after CPU checkpoint setup; each
@@ -223,13 +235,10 @@ runs with fixed inputs and private pool segments. The per-query path preserves
 the original score formula, quantization, TopK ordering and owning numerical
 checks; changing attention index order would not correct those score values.
 
-### Serving optimization sequence
+### Earlier Serving measurements
 
-Fixed physical request-slot maps (`block_table`, `kda_state_rows` and
-`pool_blocks`) are uploaded once per session, alongside the KDA constants.
-Dynamic step uploads drop from 17 to 14 per rank; metadata values, kernels
-and request-cache ownership are unchanged. A future physical page allocator
-must revisit this fixed-map contract.
+The measurements below predate native MLA activation quantization and the
+shared physical page allocator. They do not measure the current native path.
 
 Measure one persistent Serving engine with the published checkpoint, fixed
 prompt/output lengths, explicit chunk boundaries and prefix sharing disabled.
@@ -509,7 +518,7 @@ stored dtype agree.
 | Tensor | Format |
 | --- | --- |
 | Routed/shared/dense FFN `gate_proj`, `up_proj`, `down_proj` | INT8 with per-output-channel scales; staged as INT8 plus flattened FP32 scales |
-| MLA `q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`, `o_proj` | W8A8 INT8 in these checkpoints; explicitly dequantized to BF16 for the current attention kernels |
+| MLA `q_a_proj`, `q_b_proj`, `kv_a_proj_with_mqa`, `o_proj` | INT8 plus FP32 scales in the resident production path; activations dynamically quantized at each projection |
 | MLA `kv_b_proj`, KDA/indexer projections, norms, router, embedding and LM head | BF16 |
 | mHC function, scale and base; router correction bias | Source BF16; the function stays BF16, while scale, base and correction bias are staged as FP32 to match the kernels |
 | MLA 512-latent cache | BF16 |
@@ -523,10 +532,11 @@ vocabulary shard as exactly widened FP32 values with zero-padded rows.
 The loader requires `W8A8_DYNAMIC` with `group_size: 0`. For every requested
 quantized weight it checks INT8 storage, positive finite scales, and zero offsets.
 It rejects incompatible formats rather than casting FP8 or BF16 values to INT8.
-MLA's BF16 adaptation is `BF16(FP32(weight) * scale)`; it does not reproduce a
-native W8A8 attention path with runtime activation quantization. `mla_mode="native"`
-keeps the INT8/scale pairs for consumers that implement that path, and does not
-produce a BF16 absorbed output weight.
+The resident path explicitly selects `mla_mode="native"`, retains all four
+INT8 MLA projection matrices and their scales, and quantizes BF16 activations
+per row before INT32 cube products. `kv_b_proj` remains BF16. The separate
+BF16 adaptation remains available for existing absorbed decode fixtures; it
+is not the resident production path.
 
 ### Rotation assets
 
@@ -535,7 +545,10 @@ rotation map. The loader preserves that metadata and exposes the indexed
 `rot.weight` through `Checkpoint.rotation()` on request. Optional files need not
 be loaded to stage the 45-layer text backbone. Converted weights are used as
 stored; no additional global rotation is applied to the backbone activations.
-MTP and vision weights are outside this loader's full-model assembly.
+The MTP `eh_proj` already contains the conversion's block-diagonal rotation;
+its input is not rotated again. MTP embedding and vocabulary head tensors
+are read independently, including checkpoints whose tables differ from the
+backbone. `Checkpoint.vision_weights()` loads the complete BF16 visual tower.
 
 The indexer's Hadamard-128 is a separate transform. The loader supplies the same
 matrix as the indexer golden; it is not the checkpoint's hidden-size rotation.
@@ -579,7 +592,7 @@ logical ND, and shared FP32 scales, routed expert weights and Dense weights rema
 ND. The 43 stored MoE slices include the reserved MTP tail; the backbone executes
 42 MoE layers. Standalone/default/checkpoint FFN fixtures pack the same shared
 inputs, and their goldens only undo the layout before the existing reference math.
-Runtime manifest version 3 records the shared INT8 NZ contract; recompile older
+Runtime manifest version 6 records the shared INT8 NZ and native MLA contracts; recompile older
 runtime directories before using these uploaded weights.
 
 On A3, frozen shared-expert cases with 16 and 17 rows retained bitwise-identical
@@ -693,255 +706,72 @@ Each of these was a compile or simulator failure, not a guess:
 - **A script-entry file must put the repository root first on `sys.path`**, or
   `from golden import run` resolves to this directory's own `golden.py`.
 
-## How this directory is organised for parallel work
+## MTP proposals and visual inputs
 
-The remaining planning sections preserve the original implementation roadmap
-and donor inventory. The deployment, loading and serving sections above
-describe the current execution interfaces.
+`ResidentPrefillSession(..., enable_mtp=True)` prepares checkpoint layer 45.
+After each target chunk, call `update_mtp(next_token_ids)` with the next input
+for each active request. It shifts the query token IDs left within each
+request while retaining target positions, uses post-final-norm target
+feedback, and zeros the position-zero embedding. The plain residual block
+uses its own MLA, MoE, embedding, shared-head norm and vocabulary head.
 
-Every operator has one ownership file. Each file carries the exact maths in its
-module docstring, a `golden_*` Torch reference, and a typed `@pl.jit.inline` ABI
-whose body raises `NotImplementedError` until its owner lands it. Shapes come
-from `config.py`, so two engineers working on neighbouring operators agree on the
-interface without talking to each other.
+`propose_mtp(request_slots, count)` returns one to three draft IDs per request.
+The first proposal computes its own indexer TopK; later steps reuse that
+request's selection and recompute K/gate writes and tail expansion. Recycled
+feedback uses the MTP shared-head norm exactly once. Speculative cache lengths
+roll back before target verification. `generate(..., spec_tokens=3)` verifies
+each draft against the target greedy token and discards the remaining queue
+on rejection. Verification is sequential: the target KDA state advances only
+through confirmed tokens. This mode does not claim speculative speedup.
 
-A file has **no script-entry guard until its golden is real**. The a2a3 daily CI
-selects a case purely by grepping for that guard, so adding one to a file whose
-golden still raises would put an unimplementable operator into the sweep. Today
-`config.py`, `golden.py`, `quantization.py`, `metadata.py`, `mhc.py`, `rmsnorm.py`
-and all five stream-B MLA files carry real references. RMSNorm and embedding
-lookup are library operators without standalone validation entry points. The
-remaining validation commands include:
+`VisionProcessor.image()` accepts an RGB uint8 tensor, Pillow image or file.
+`video()` accepts sampled RGB frames with timestamps; `video_file()` samples
+with FFmpeg/ffprobe at the configured rate in stored frame orientation,
+ignoring rotation metadata. Pillow is required for image files. Preprocessing preserves the checkpoint's resize budget, CLIP
+normalization, temporal patch pairing and spatial merge-group order.
+`VisionEncoder` executes patch embedding, all 24 noncausal frame-segmented
+attention/MLP blocks, downsampling and the merger on an allocated NPU.
+Position-only FP32 RoPE constants are prepared with the input metadata and
+gathered on device. The attention reference rounds independent FP64
+exponentials, sums and reciprocals at the FP32 boundaries; compensated
+reductions retain those boundaries in the device implementation.
+`generate(..., visual_inputs={0: [visual]})` expands image/video markers and
+replaces the corresponding embedding rows before seeding all four streams.
+
+The production CLI accepts `--spec-tokens`, `--image`, `--video` and repeated
+`--video-frame` inputs. Visual inputs attach to prompt zero; the Python API
+supports multiple requests and ordered visual inputs. `--vision-runtime-dir`
+loads a separately compiled single-rank vision artifact. Build CPU artifacts
+before scheduling NPU execution, following the
+[compile/runtime workflow](../../run-and-validate/compile-runtime-workflow.md).
 
 ```bash
-source .venv/bin/activate
-python models/glm5_3_flash/golden.py              # [GOLDEN] PASS norms / swiglu / moe_gate
-python models/glm5_3_flash/quantization.py        # [GOLDEN] PASS quantization
-python models/glm5_3_flash/mhc.py                 # [GOLDEN] PASS mhc
-python models/glm5_3_flash/mla_prolog.py          # [GOLDEN] PASS mla_prolog + prolog/absorb
-python models/glm5_3_flash/mla_cache.py           # [GOLDEN] PASS mla_cache + device scatter
-python models/glm5_3_flash/mla_epilog.py          # [GOLDEN] PASS mla_epilog + both paths
-python models/glm5_3_flash/prefill_sparse_attn.py # [GOLDEN] PASS + device sparse prefill
-python models/glm5_3_flash/decode_sparse_attn.py  # [GOLDEN] PASS + device sparse decode
+python models/glm5_3_flash/prefill_fwd.py --compile-only \
+  --tp 16 --ep 16 --capacity 2048 --max-seq-len 1048576 \
+  --cache-tokens 1048576 --runtime-dir /path/to/runtime
+
+# Run inside the matching device allocation.
+python models/glm5_3_flash/prefill_fwd.py --tp 16 --ep 16 \
+  --capacity 2048 --max-seq-len 1048576 --cache-tokens 1048576 \
+  --runtime-dir /path/to/runtime --checkpoint /path/to/checkpoint \
+  --prompt "Describe the image." --image /path/to/image.png \
+  --vision-runtime-dir /path/to/vision-runtime --spec-tokens 3
 ```
 
-`models/deepseek_v4_1_flash/hc.py` is the worked example of a finished item: a
-golden, the four kernel bodies, a `@pl.jit` test entry, `build_mhc_tensor_specs`
-and a precision comparison, in 559 lines. Read it for the shape, not for the
-kernels — its directory targets A5 in `.github/ci_platforms.json`, and
-`# ci: no-sim` excludes device-only entries from simulator runs.
+Component entries retain generated inputs by default and accept checkpoint
+weights through the same kernels and independent Torch references:
 
-For kernels you actually intend to run here, prefer the a2a3 files:
-`models/deepseek_v4_flash_mtp/` has implemented `hc_pre.py`, `hc_post.py` and
-`hc_head.py`, `gate.py`, `expert_routed.py`, `expert_shared.py`, `decode_indexer.py`,
-`prefill_indexer.py` and `decode_sparse_attn_csa.py`, all of which the a2a3 daily
-sweep runs today.
-## Five streams, five owners
+```bash
+python models/glm5_3_flash/mla_prolog.py --mode native --checkpoint /path/to/checkpoint
+python models/glm5_3_flash/mla_epilog.py --mode native --checkpoint /path/to/checkpoint
+python models/glm5_3_flash/mtp_projection.py --checkpoint /path/to/checkpoint
+python models/glm5_3_flash/lm_head.py --case fp32 --checkpoint /path/to/checkpoint
+python models/glm5_3_flash/lm_head.py --case mtp_fp32 --checkpoint /path/to/checkpoint
+python models/glm5_3_flash/vision/forward.py --checkpoint /path/to/checkpoint
+```
 
-The work divides into five self-contained streams. Each owns a disjoint set of
-files, so two owners never edit the same file, and they meet only at the ABIs that
-`config.py` and the `@pl.jit.inline` signatures already fix. Stream E owns those
-contracts and publishes them first.
-
-
-| Stream | Owns | Files | Items | Days | Long pole |
-| --- | --- | ---: | ---: | ---: | --- |
-| **A** | KDA linear attention — 34 of the 45 backbone layers | 5 | 10 | 50-82 | `kda_chunk_delta_prefill` — the chunked delta rule, 20-32 days on its own |
-| **B** | NoPE MLA sparse attention — 11 sparse layers + the MTP layer | 5 | 6 | 45-72 | `mla_sparse_attn_prefill` — gather-and-attend over 2051 selected rows, 15-25 days |
-| **C** | kpool DSA indexer and mHC — 12 indexer instances; mHC on all 45 layers | 4 | 11 | 38-60 | `indexer_cache` — it blocks five downstream items, so land it in week one |
-| **D** | MoE, primitives, output head, MTP — 43 sparse layers, 3 dense layers, the draft step | 12 | 14 | 61-100 | `moe_dispatch_ep16` — the 16-rank all-to-all, 14-22 days |
-| **E** | Runtime, weight loading, composition — the whole model | 9 | 6 | 76-120 | `layer_composition` — 40-60 days, and by definition it lands last |
-| *(staged)* | Vision tower — prefill of multimodal requests only | 5 | 6 | 23-35 | `vision_attention` — non-causal varlen attention, no donor in this repo |
-
-Phase one is streams A-E: **269-434 engineer-days** across five owners, before any tuning. The vision tower is staged out — the A3 recipe serves this checkpoint text-only unless `--limit-mm-per-prompt` is set, and the tower is 0.53 G parameters against the text model's 320 G.
-
-### Stream A — KDA linear attention
-
-*34 of the 45 backbone layers · 5 files · 10 work items · 50-82 engineer-days*
-
-**Files.** `kda_projection.py`, `kda_conv.py`, `prefill_kda.py`, `decode_kda.py`, `kda_output.py`
-
-**Where to start.** No donor in pypto-lib. The `pl`-adjacent reference is the tuned Ascend910B3 `chunk_kda_impl.py` / `fused_recurrent_kda_impl.py` in cann-recipes, plus its design doc.
-
-| Work item | Verdict | Size | Days | Depends on |
-| --- | --- | --- | ---: | --- |
-| `kda_chunk_delta_prefill` | SPLIT | XL | 20-32 | `kda_qkv_proj` |
-| `kda_recurrent_decode` | ADAPT | L | 8-13 | — |
-| `kda_conv1d_prefill` | NEW | M | 4-7 | `kda_qkv_proj`, `kda_conv1d_decode` |
-| `kda_out_proj` | ADAPT | M | 4-7 | `mhc_post` |
-| `kda_conv1d_decode` | NEW | M | 3-5 | `kda_state_cache`, `kda_qkv_proj` |
-| `kda_state_cache` | NEW | M | 3-5 | — |
-| `kda_gates` | NEW | S | 2-4 | `kda_qkv_proj` |
-| `kda_qkv_proj` | ADAPT | S | 2-3 | — |
-| `kda_l2norm_qk` | ADAPT | S | 1.5-3 | — |
-| `kda_out_gated_norm` | ADAPT | S | 2-3 | — |
-
-### Stream B — NoPE MLA sparse attention
-
-*11 sparse layers + the MTP layer · 5 files · 6 work items · 45-72 engineer-days*
-
-**Files.** `mla_prolog.py`, `mla_cache.py`, `prefill_sparse_attn.py`, `decode_sparse_attn.py`, `mla_epilog.py`
-
-**Where to start.** `deepseek_v4_flash_mtp/qkv_proj_rope.py`, `prefill_sparse_attn.py` and `decode_sparse_attn_csa.py`. Same 512-wide KV row; delete the sliding window, the ratio-4 slot rewrite, the attention sink and all of the RoPE.
-
-| Work item | Verdict | Size | Days | Depends on |
-| --- | --- | --- | ---: | --- |
-| `mla_sparse_attn_prefill` | ADAPT | XL | 15-25 | — |
-| `mla_sparse_attn_decode` | ADAPT | L | 9-14 | — |
-| `mla_epilog_o_proj` | SPLIT | L | 8-13 | — |
-| `mla_prolog_nope` | ADAPT | M | 6-9 | — |
-| `mla_kv_absorb` | ADAPT | M | 4-6 | — |
-| `mla_latent_cache` | ADAPT | S | 3-5 | — |
-
-### Stream C — kpool DSA indexer and mHC
-
-*12 indexer instances; mHC on all 45 layers · 4 files · 11 work items · 38-60 engineer-days*
-
-**Files.** `prefill_indexer.py`, `decode_indexer.py`, `indexer_cache.py`, `mhc.py`
-
-**Where to start.** `deepseek_v4_flash_mtp/{prefill,decode}_indexer.py` for the selection pipeline (its `_cp_topk512_query` is the same K over the same candidate cap), and `hc_{pre,post,head}.py` for mHC. The k-pooling stage has no donor anywhere.
-
-| Work item | Verdict | Size | Days | Depends on |
-| --- | --- | --- | ---: | --- |
-| `indexer_cache` | SPLIT | L | 7-10 | — |
-| `indexer_score` | ADAPT | L | 6-9 | `indexer_cache` |
-| `indexer_kpool_compress` | ADAPT | M | 5-8 | `indexer_cache` |
-| `indexer_topk512` | ADAPT | M | 4-6 | `indexer_score`, `indexer_cache` |
-| `indexer_qk_proj` | NEW | M | 3-5 | — |
-| `indexer_share_mtp` | NEW | M | 3-5 | `indexer_score`, `indexer_cache` |
-| `mhc_pre` | ADAPT | M | 3-5 | `mhc_post` |
-| `mhc_mixes` | ADAPT | S | 2-4 | — |
-| `indexer_expand_tail` | NEW | S | 2-3 | — |
-| `mhc_post` | ADAPT | S | 1.5-3 | `mhc_pre`, `mhc_mixes` |
-| `mhc_head` | ADAPT | S | 1-2 | `mhc_post` |
-
-### Stream D — MoE, primitives, output head, MTP
-
-*43 sparse layers, 3 dense layers, the draft step · 12 files · 14 work items · 61-100 engineer-days*
-
-**Files.** `gate.py`, `expert_routed.py`, `expert_shared.py`, `dense_mlp.py`, `(new) prefill_moe.py`, `(new) decode_moe.py`, `rmsnorm.py`, `quantization.py`, `lookup_embedding.py`, `lm_head.py`, `mtp_projection.py`, `(new) decode_mtp.py`
-
-**Where to start.** Almost every file has a same-named donor in `deepseek_v4_flash_mtp` that the a2a3 sweep already runs. This is the most port-like stream in the model.
-
-| Work item | Verdict | Size | Days | Depends on |
-| --- | --- | --- | ---: | --- |
-| `moe_dispatch_ep16` | SPLIT | XL | 14-22 | `moe_gate` |
-| `mtp_draft_loop` | SPLIT | L | 12-18 | `indexer_score`, `indexer_cache` |
-| `moe_expert_routed_w8a8` | ADAPT | M | 5-8 | `moe_dispatch_ep16`, `moe_gate`, `moe_combine_ep16` |
-| `moe_combine_ep16` | ADAPT | L | 5-8 | `moe_dispatch_ep16`, `moe_gate`, `moe_expert_routed_w8a8` |
-| `lm_head_tp16` | ADAPT | M | 4-7 | `mhc_head` |
-| `dense_mlp_w8a8` | ADAPT | M | 4-6 | `moe_shared_expert_w8a8` |
-| `moe_gate` | ADAPT | M | 3-5 | — |
-| `moe_shared_expert_w8a8` | ADAPT | S | 3-5 | `moe_gate`, `w8a8_weight_loader` |
-| `embed_tokens` | ADAPT | M | 3-5 | — |
-| `swiglu_clamp_quant` | ADAPT | S | 2-4 | — |
-| `mtp_eh_proj` | ADAPT | S | 2-4 | `rms_norm` |
-| `w8a8_linear` | SPLIT | S | 1.5-3 | — |
-| `rms_norm` | ADAPT | S | 1.5-2.5 | — |
-| `quant_per_token_int8` | ADAPT | S | 1-2 | `moe_gate` |
-
-### Stream E — Runtime, weight loading, composition
-
-*the whole model · 9 files · 6 work items · 76-120 engineer-days*
-
-**Files.** `config.py`, `metadata.py`, `(new) weights.py`, `(new) cache_manager.py`, `attention_tp.py`, `(new) prefill_layer.py`, `(new) decode_layer.py`, `(new) prefill_fwd.py`, `(new) decode_fwd.py`
-
-**Where to start.** `deepseek_v4_flash_mtp/{prefill,decode}_{layer,fwd}.py`, about 8,600 lines of donor. The 3:1 KDA/DSA schedule replaces its SWA/CSA/HCA schedule.
-
-| Work item | Verdict | Size | Days | Depends on |
-| --- | --- | --- | ---: | --- |
-| `layer_composition` | SPLIT | XL | 40-60 | `mhc_head`, `mhc_post`, `mhc_mixes` |
-| `tp16_collectives` | SPLIT | L | 15-27 | `forward_metadata` |
-| `w8a8_weight_loader` | SPLIT | L | 8-12 | `indexer_score` |
-| `hybrid_kv_cache` | ADAPT | L | 6-9 | `indexer_cache` |
-| `forward_metadata` | ADAPT | M | 5-8 | — |
-| `graph_capture` | ADAPT | S | 2-4 | — |
-
-### Stream V — Vision tower (staged)
-
-*prefill of multimodal requests only · 5 files · 6 work items · 23-35 engineer-days*
-
-**Files.** `vision/patch_embed.py`, `vision/attention.py`, `vision/mlp.py`, `vision/merger.py`, `vision/fusion.py`
-
-**Where to start.** No donor in this repo.
-
-| Work item | Verdict | Size | Days | Depends on |
-| --- | --- | --- | ---: | --- |
-| `vision_attention` | NEW | L | 8-12 | `vision_patch_embed` |
-| `vision_mlp` | SPLIT | M | 5-7 | `vision_patch_embed`, `vision_attention` |
-| `vision_rope_qkv_norm` | ADAPT | M | 4-6 | `vision_patch_embed`, `vision_attention` |
-| `vision_merger` | NEW | M | 3-5 | `vision_patch_embed`, `vision_attention`, `vision_mlp` |
-| `mm_fusion` | NEW | S | 2-3 | `vision_merger` |
-| `vision_patch_embed` | ADAPT | S | 1-2 | — |
-
-## Sequencing
-
-Three items block the most downstream work and should go out in week one:
-`indexer_cache` (blocks five), `moe_gate` (blocks five) and `kda_qkv_proj` (blocks
-four). Stream E's contract work — `forward_metadata`, `w8a8_weight_loader`,
-`tp16_collectives`, `hybrid_kv_cache` — is the other week-one batch, because
-streams A through D cannot run anything on device without it.
-
-That gives stream E a bookend shape: about 36-60 days of shared contracts up front,
-then `layer_composition` at the end. It is the integration role, and it is also the
-natural reviewer for the other four.
-
-## Where each file's donor lives
-
-`models/deepseek_v4_flash_mtp/` is the a2a3 W8A8 sibling, and almost every GLM file
-has a same-shaped counterpart there that the a2a3 daily sweep already runs. The
-port is, in one sentence: take that model, delete the compressor / sliding-window /
-RoPE machinery, and add the KDA family and the kpool indexer.
-
-| GLM file | a2a3 donor | What changes |
-| --- | --- | --- |
-| `mhc.py` | `hc_pre.py`, `hc_post.py`, `hc_head.py` | FP32 stream becomes BF16; the learned head becomes an unweighted mean |
-| `rmsnorm.py` | `rmsnorm.py` | Add the INT8-emitting variant for the three dense layers |
-| `gate.py` | `gate.py` | `sqrt(softplus(.))` becomes `sigmoid`; `SCORE_PAD` 256 to 512; drop hash routing and the group mask |
-| `expert_routed.py`, `expert_shared.py` | same names | 288/8 instead of 256/6, `moe_intermediate_size` 2048 |
-| `lookup_embedding.py`, `lm_head.py` | same names | Vocabulary 154,880; the embedding also seeds the four HC streams |
-| `mtp_projection.py` | `mtp_projection.py` | Same `enorm` / `hnorm` / `eh_proj` shape |
-| `mla_prolog.py` | `qkv_proj_rope.py` | Delete the whole RoPE half; add the `kv_b_proj` absorption |
-| `prefill_sparse_attn.py`, `decode_sparse_attn.py` | `prefill_sparse_attn.py`, `decode_sparse_attn_csa.py` | Delete the sliding-window gather, the ratio-4 slot rewrite, the attention sink and the inverse RoPE |
-| `prefill_indexer.py`, `decode_indexer.py` | same names | Delete the INT8/Hadamard half and the compressor; add the k-pooling stage |
-| `(new) prefill_moe.py`, `decode_moe.py` | same names | EP16 instead of EP8; 18 local experts |
-| `(new) prefill_fwd.py`, `decode_fwd.py` | same names | The 3:1 KDA/DSA schedule replaces the SWA/CSA/HCA schedule |
-| `kda_*.py`, the k-pooling stage | **no donor in this repo** | See the prior-art table above |
-
-## What already exists in the directory
-
-| File | State |
-| --- | --- |
-| `config.py` | Complete. Layer schedule, derived per-rank shapes, TP/EP validation, W8A8 metadata |
-| `golden.py` | Complete for the shared transforms: RMSNorm, gated RMSNorm, L2 norm, clamped SwiGLU, the expert body, the sigmoid `noaux_tc` router, and the four mHC references |
-| `quantization.py` | Complete. Per-channel and per-token INT8 with the repo's exact rounding, the dynamic W8A8 linear, and the fused dequant-SwiGLU-requant epilogue |
-| `weights.py` | Indexed W8A8 CPU loading for all 45 backbone layers, TP vocabulary shards and final norm. Includes dense TP, complete EP experts, replicated shared experts, KDA, MLA BF16 adaptation, indexer and mHC |
-| `decode_layer.py`, `prefill_layer.py`, `utils.py` | Composed MoE FFN validation with generated weights by default and optional checkpoint weights/hidden inputs; full attention-plus-FFN forward composition remains separate |
-| `metadata.py` | Complete. Packed-batch lowering, the three distinct slot mappings (latent, per-token indexer state, pooled state), TP token ownership, and the indexer's pool and tail derivation |
-| `_golden_smoke.py` | Complete. Deterministic CPU fixtures behind every golden that exists |
-| `rmsnorm.py` | Plain BF16 RMSNorm, INT8-emitting per-token RMSNorm, and fused residual-add RMSNorm. Each has a colocated Torch golden; validation is exercised through consuming operators rather than a standalone CLI |
-| `mla_prolog.py` | Goldens, the prolog body (three `b_trans` matmuls and two rms-norm scopes, no split-K yet), the per-token `absorb_query` body, and a device test entry per case. `absorb_output` is weight-time and belongs to the loader. Passes `a2a3sim` and a2a3 |
-| `mla_cache.py` | Golden, kernel body (`pl.spmd` scatter, one block per row), device test entry and specs. Passes `a2a3sim` and a2a3 |
-| `mla_epilog.py` | Goldens, both kernel bodies (row-parallel `b_trans` projection over D, FP32 partial sum for the TP16 all-reduce) and a device test entry per path. Passes `a2a3sim` and a2a3 |
-| `prefill_sparse_attn.py` | Golden, kernel body (one item per token, `pl.yield_`-carried online softmax, value expansion after the block loop) and a device test entry. **Attends in latent space**: absorbing keeps the two expansions out of the per-token block loop, at the cost of two BF16 roundings against the expanded reference. An all-padding block is filled by one wide gather and merged with `beta` = 0 rather than skipped, so no branch carries the online-softmax state. Requires the front-packed `topk_indices` ABI. Passes `a2a3sim` and a2a3 |
-| `decode_sparse_attn.py` | Golden, kernel body (24 lanes over (token, sparse block), L1 gather, flash partials, alpha/beta merge, empty-block skip) and a device test entry. Requires the front-packed `topk_indices` ABI. Passes `a2a3sim` and a2a3 |
-| `attention_tp.py` | ABI only, but it is the one shared consumer: `kda_output`, both `mla_epilog` entries and `dense_mlp` all emit an FP32 row-parallel partial, and this is what adds the 16 of them |
-| everything else | ABI and docstring only; the golden and the kernel body are the assignment |
-
-## Open questions an owner will hit
-
-- **Whether the MTP layer owes `rot.weight`.** `is_rot_used: true` and the tensor's
-  presence in the index argue yes; `Glm5NextMTP` dropping it argues no, or argues
-  the reference port has a gap. Stream D settles it before implementing MTP.
-- **How the indexer cache is laid out.** vLLM Ascend splits it into an index-K
-  cache and a separate FP32 pooled-state page class with a page of four tokens;
-  storing the raw row instead is simpler but larger. Stream C decides, stream E's
-  cache manager implements.
-- **MLA precision against native W8A8 inference.** The current loader dequantizes
-  MLA weights to BF16 and absorbs the value projection into the output weight.
-  Component golden agreement does not establish equivalence to a deployment
-  runtime that also quantizes MLA activations.
-- **The cache budget.** At about 18 KB per token per rank the hybrid cache holds
-  roughly 1.5 M tokens per node once weights are placed, so the recipe's
-  `--max-model-len 133120` and `--max-num-seqs 32` cannot both be satisfied at
-  full length.
+The full-logits head reference preserves FP32 normalization boundaries and
+rounds independent FP64 dot products to FP32. Its all-element acceptance gate
+remains `atol=rtol=1e-5`; CPU FP32 GEMM reduction error is not used as the
+expected value. Whole-model generation and long-context capacity require
+separate device validation in the intended topology and memory budget.

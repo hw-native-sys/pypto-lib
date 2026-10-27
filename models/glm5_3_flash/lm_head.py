@@ -145,6 +145,28 @@ def lm_head_test(
 
 
 @pl.jit.inline
+def lm_head_project_fp32(
+    x: pl.Tensor[[T_DYN, D], pl.FP32],
+    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Tensor[[T_DYN, FP32_HEAD_VOCAB_PAD], pl.FP32],
+):
+    """Project FP32 activations without imposing another normalization boundary."""
+    rows = pl.tensor.dim(x, 0)
+    for row0 in pl.parallel(0, rows, LM_ROW_TILE):
+        for block in pl.spmd(FP32_HEAD_VOCAB_PAD // FP32_HEAD_N_TILE, name_hint="lm_head_fp32_projection"):
+            vocab0 = block * FP32_HEAD_N_TILE
+            valid_rows = pl.min(LM_ROW_TILE, rows - row0)
+            accum = pl.create_tensor([LM_ROW_TILE, FP32_HEAD_N_TILE], dtype=pl.FP32)
+            for k0 in pl.pipeline(0, D, FP32_HEAD_K_TILE, stage=2):
+                projection_hidden = pl.slice(x, [LM_ROW_TILE, FP32_HEAD_K_TILE], [row0, k0], valid_shape=[valid_rows, FP32_HEAD_K_TILE])
+                projection_vocab = weight[vocab0 : vocab0 + FP32_HEAD_N_TILE, k0 : k0 + FP32_HEAD_K_TILE]
+                accum = pl.matmul_acc(accum, projection_hidden, projection_vocab, b_trans=True, init_cond=(k0 == 0))
+            accum = pl.set_validshape(accum, valid_rows, FP32_HEAD_N_TILE)
+            logits[row0 : row0 + LM_ROW_TILE, vocab0 : vocab0 + FP32_HEAD_N_TILE] = accum
+    return logits
+
+
+@pl.jit.inline
 def lm_head_logits(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_weight: pl.Tensor[[D], pl.BF16],
@@ -179,17 +201,41 @@ def lm_head_logits(
         normalized_row = pl.mul(scaled, gamma)
         normalized[row : row + 1, 0:D] = normalized_row
 
-    for row0 in pl.parallel(0, rows, LM_ROW_TILE):
-        for block in pl.spmd(FP32_HEAD_VOCAB_PAD // FP32_HEAD_N_TILE, name_hint="lm_head_fp32_projection"):
-            vocab0 = block * FP32_HEAD_N_TILE
-            valid_rows = pl.min(LM_ROW_TILE, rows - row0)
-            accum = pl.create_tensor([LM_ROW_TILE, FP32_HEAD_N_TILE], dtype=pl.FP32)
-            for k0 in pl.pipeline(0, D, FP32_HEAD_K_TILE, stage=2):
-                projection_hidden = pl.slice(normalized, [LM_ROW_TILE, FP32_HEAD_K_TILE], [row0, k0], valid_shape=[valid_rows, FP32_HEAD_K_TILE])
-                projection_vocab = weight[vocab0 : vocab0 + FP32_HEAD_N_TILE, k0 : k0 + FP32_HEAD_K_TILE]
-                accum = pl.matmul_acc(accum, projection_hidden, projection_vocab, b_trans=True, init_cond=(k0 == 0))
-            accum = pl.set_validshape(accum, valid_rows, FP32_HEAD_N_TILE)
-            logits[row0 : row0 + LM_ROW_TILE, vocab0 : vocab0 + FP32_HEAD_N_TILE] = accum
+    lm_head_project_fp32(normalized, weight, logits)
+    return logits
+
+@pl.jit.inline
+def lm_head_mtp_logits(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Tensor[[T_DYN, FP32_HEAD_VOCAB_PAD], pl.FP32],
+):
+    """Apply the MTP shared head's BF16 norm once, then project in FP32."""
+    rows = pl.tensor.dim(x, 0)
+    normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
+    rmsnorm(x, norm_weight, normalized)
+    widened = pl.create_tensor([rows, D], dtype=pl.FP32)
+    for block in pl.spmd(((rows + 7) // 8) * (D // 128), name_hint="mtp_head_widen"):
+        row0 = block // (D // 128) * 8
+        col0 = block % (D // 128) * 128
+        valid = pl.min(8, rows - row0)
+        source = pl.slice(normalized, [8, 128], [row0, col0], valid_shape=[valid, 128])
+        widened[row0:row0 + 8, col0:col0 + 128] = pl.cast(source, pl.FP32)
+    lm_head_project_fp32(widened, weight, logits)
+    return logits
+
+
+@pl.jit
+def lm_head_mtp_logits_test(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Out[pl.Tensor[[T_DYN, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+):
+    x.bind_dynamic(0, T_DYN)
+    logits.bind_dynamic(0, T_DYN)
+    lm_head_mtp_logits(x, norm_weight, weight, logits)
     return logits
 
 
@@ -347,12 +393,81 @@ def l3_lm_head_tp_reduce_test(
             )
 
 
-def golden_lm_head_logits(tensors):
-    """Fill full FP32 logits with the production host normalization boundary."""
-    hidden = tensors["x"].to(torch.float32)
+def reference_lm_head_logits(x, norm_weight, weight, *, vocab_block=4096):
+    """Keep FP32 normalization boundaries and round independent FP64 dots to FP32.
+
+    CPU FP32 GEMM can itself exceed the all-element 1e-5 acceptance gate near
+    cancellation. The wide dot product avoids using its reduction error as an
+    expected value. This does not change the gate or the device calculation.
+    """
+    hidden = x.float()
     inverse_rms = torch.rsqrt(hidden.square().mean(dim=-1, keepdim=True) + FP32_HEAD_EPS)
-    normalized = hidden * inverse_rms * tensors["norm_weight"].to(torch.float32)
-    tensors["logits"].copy_(normalized @ tensors["weight"].to(torch.float32).t())
+    normalized = (hidden * inverse_rms * norm_weight.float()).double()
+    output = torch.empty((hidden.shape[0], weight.shape[0]), dtype=torch.float32)
+    for begin in range(0, weight.shape[0], vocab_block):
+        end = min(begin + vocab_block, weight.shape[0])
+        output[:, begin:end] = (normalized @ weight[begin:end].double().t()).float()
+    return output
+
+
+def golden_lm_head_logits(tensors):
+    tensors["logits"].copy_(reference_lm_head_logits(tensors["x"], tensors["norm_weight"], tensors["weight"]))
+
+
+def run_fp32_case(options, device_id):
+    from functools import lru_cache
+
+    from golden import TensorSpec, ratio_allclose, run
+    from models.glm5_3_flash.utils import component_hidden
+    from models.glm5_3_flash.weights import Checkpoint
+
+    if not 0 <= options.shard < TP_SIZE:
+        raise ValueError(f"--shard must be in [0, {TP_SIZE})")
+
+    @lru_cache(maxsize=1)
+    def inputs():
+        generator = torch.Generator().manual_seed(5357)
+        x = component_hidden(options, D, generator)
+        weight = torch.zeros(FP32_HEAD_VOCAB_PAD, D, dtype=torch.float32)
+        if options.checkpoint is None:
+            weight[:LOCAL_VOCAB] = (torch.randn(LOCAL_VOCAB, D, generator=generator) * 0.02).bfloat16().float()
+            norm = torch.ones(D, dtype=torch.bfloat16)
+        else:
+            checkpoint = Checkpoint(options.checkpoint)
+            rows = slice(options.shard * LOCAL_VOCAB, (options.shard + 1) * LOCAL_VOCAB)
+            head_name = 'lm_head.weight'
+            norm_names = ('model.language_model.norm.weight', 'model.norm.weight')
+            if options.case == 'mtp_fp32':
+                layer = FLASH.mtp_layer_id
+                norm_names = (f'model.language_model.layers.{layer}.shared_head.norm.weight',
+                              f'model.layers.{layer}.shared_head.norm.weight')
+                head_name = next(name.replace('norm.weight', 'head.weight') for name in norm_names if name in checkpoint)
+            weight[:LOCAL_VOCAB] = checkpoint.read(head_name, (rows, slice(None))).float()
+            names = [name for name in norm_names if name in checkpoint]
+            if len(names) != 1:
+                raise ValueError('checkpoint final norm must resolve exactly once')
+            norm = checkpoint.read(names[0])
+        return {'x': x, 'norm_weight': norm, 'weight': weight}
+
+    specs = [TensorSpec('x', (options.tokens, D), torch.bfloat16, init_value=lambda: inputs()['x']),
+             TensorSpec('norm_weight', (D,), torch.bfloat16, init_value=lambda: inputs()['norm_weight']),
+             TensorSpec('weight', (FP32_HEAD_VOCAB_PAD, D), torch.float32, init_value=lambda: inputs()['weight']),
+             TensorSpec('logits', (options.tokens, FP32_HEAD_VOCAB_PAD), torch.float32)]
+    def golden(values):
+        if options.case == 'mtp_fp32':
+            normalized = golden_rmsnorm(values['x'], values['norm_weight']).double()
+            values['logits'].copy_((normalized @ values['weight'].double().t()).float())
+        else:
+            golden_lm_head_logits(values)
+
+    fn = lm_head_mtp_logits_test if options.case == 'mtp_fp32' else lm_head_logits_test
+    result = run(fn=fn, specs=specs, golden_fn=golden,
+                 config=dict(backend_type=options.backend_type, execution_mode=options.execution_mode, device_id=device_id),
+                 compare_fn={'logits': ratio_allclose(atol=1e-5, rtol=1e-5, max_error_ratio=0)},
+                 compile_only=options.compile_only)
+    print(result)
+    if not result.passed:
+        raise SystemExit(result.error or 1)
 
 
 def golden_lm_head(
@@ -530,27 +645,42 @@ def main():
     from pypto.ir import DistributedConfig
 
     cases = ("decode", "selection", "ties", "negative_tail", "padding")
+    fp32_cases = ("fp32", "mtp_fp32")
     parser = argparse.ArgumentParser(description="GLM-5.3-Flash local LM-head and TP reduction validation")
     parser.add_argument("-p", "--platform", dest="backend_type", default="a2a3", choices=["a2a3"])
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(EP_SIZE)))
     parser.add_argument("--tp", type=int, default=TP_SIZE)
     parser.add_argument("--ep", type=int, default=EP_SIZE)
-    parser.add_argument("--case", choices=("all", *cases, "tp_reduce"), default="all")
+    parser.add_argument("--case", choices=("all", *cases, "tp_reduce", *fp32_cases), default="all")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--hidden-input', type=Path)
+    parser.add_argument('--tokens', type=int, default=17)
+    parser.add_argument('--shard', type=int, default=0)
     args = parser.parse_args()
     device_ids = [int(device) for device in args.device.split(",")]
+    if args.checkpoint is not None or args.hidden_input is not None:
+        if args.case not in fp32_cases:
+            parser.error("--checkpoint and --hidden-input require --case fp32 or mtp_fp32")
+    if args.tokens < 1:
+        parser.error("--tokens must be positive")
+    if args.case in fp32_cases:
+        run_fp32_case(args, device_ids[0])
+        return
     if args.case in ("all", "tp_reduce") and len(device_ids) != args.ep:
         parser.error(f"TP validation needs exactly {args.ep} devices")
     if args.case == "all":
         # Separate processes own the single-device and distributed runtime lifetimes.
-        for case in (*cases, "tp_reduce"):
+        for case in (*cases, *fp32_cases, "tp_reduce"):
             devices = args.device if case == "tp_reduce" else str(device_ids[0])
             command = [
                 sys.executable, str(Path(__file__).resolve()),
                 "-p", args.backend_type, "-d", devices,
                 "--tp", str(args.tp), "--ep", str(args.ep), "--case", case,
             ]
+            if case in fp32_cases:
+                command.extend(("--tokens", str(args.tokens), "--shard", str(args.shard)))
             if args.execution_mode:
                 command.append("--sim")
             if args.compile_only:

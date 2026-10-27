@@ -149,7 +149,7 @@ def decode_indexer_step_test(
         index_q,
         index_k,
         head_weights,
-        gate_scores,
+        gate_scores, pl.cast(0, pl.INT32),
     )
     indexer_cache_write(index_k, gate_scores, index_slots, raw_cache)
     indexer_pool_write(

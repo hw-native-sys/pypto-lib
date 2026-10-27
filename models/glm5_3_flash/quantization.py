@@ -28,15 +28,67 @@ applying offline smoothing or rotation a second time. Static activation
 quantization is not supported by this path.
 """
 
+import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import INT8_K_ALIGN
+from models.glm5_3_flash.elementwise import accurate_divide, accurate_reciprocal
 
 
 # Shared with models/deepseek_v4_flash_mtp/config.py:282-283, the a2a3 W8A8 sibling
 # port. The amax floor avoids 127/0 on an all-zero row.
 INT8_SCALE_MAX = 127.0
 INT8_AMAX_EPS = 1e-4
+
+QUANT_ROWS = pl.dynamic("GLM53_QUANT_ROWS")
+QUANT_WIDTH = pl.dynamic("GLM53_QUANT_WIDTH")
+QUANT_M_TILE = 8
+QUANT_N_TILE = 128
+
+
+@pl.jit.inline
+def quantize_bf16_rows(
+    x: pl.Tensor[[QUANT_ROWS, QUANT_WIDTH], pl.BF16],
+    quantized: pl.Tensor[[QUANT_ROWS, QUANT_WIDTH], pl.INT8],
+    scales: pl.Tensor[[QUANT_ROWS, 8], pl.FP32],
+):
+    """Quantize finite BF16 rows and replicate each dequant scale across eight lanes."""
+    rows = pl.tensor.dim(x, 0)
+    width = pl.tensor.dim(x, 1)
+    for block in pl.spmd((rows + QUANT_M_TILE - 1) // QUANT_M_TILE, name_hint="glm53_dynamic_quant"):
+        row0 = block * QUANT_M_TILE
+        valid_rows = pl.min(QUANT_M_TILE, rows - row0)
+        maximum = pl.full([1, QUANT_M_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        for col0 in pl.range(0, width, QUANT_N_TILE):
+            valid_columns = pl.min(QUANT_N_TILE, width - col0)
+            source = pl.slice(x, [QUANT_M_TILE, QUANT_N_TILE], [row0, col0], valid_shape=[valid_rows, valid_columns])
+            padded = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), QUANT_M_TILE, QUANT_N_TILE)
+            value = pl.cast(padded, pl.FP32)
+            part_maximum = pl.reshape(pl.row_max(pl.abs(value)), [1, QUANT_M_TILE])
+            maximum = pl.maximum(maximum, part_maximum)
+        numerator = pl.create_tensor([1, QUANT_M_TILE], dtype=pl.FP32)
+        denominator = pl.create_tensor([1, QUANT_M_TILE], dtype=pl.FP32)
+        scale_buffer = pl.create_tensor([1, QUANT_M_TILE], dtype=pl.FP32)
+        numerator[:, :] = pl.full([1, QUANT_M_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+        denominator[:, :] = maximum
+        scale_buffer[:, :] = accurate_divide(numerator, denominator)
+        inverse_scale = accurate_reciprocal(scale_buffer)
+        inverse_column = pl.reshape(inverse_scale, [QUANT_M_TILE, 1])
+        scale_column = pl.reshape(scale_buffer, [QUANT_M_TILE, 1])
+        scale_lanes = pl.full([QUANT_M_TILE, 8], dtype=pl.FP32, value=0.0)
+        scale_values = pl.row_expand(scale_lanes, inverse_column)
+        scales[row0:row0 + QUANT_M_TILE, :] = pl.set_validshape(scale_values, valid_rows, 8)
+        for col0 in pl.range(0, width, QUANT_N_TILE):
+            valid_columns = pl.min(QUANT_N_TILE, width - col0)
+            source = pl.slice(x, [QUANT_M_TILE, QUANT_N_TILE], [row0, col0], valid_shape=[valid_rows, valid_columns])
+            value = pl.cast(source, pl.FP32)
+            scaled = pl.row_expand_mul(value, scale_column)
+            integer = pl.cast(scaled, pl.INT32, mode="rint")
+            bounded = pl.minimum(pl.maximum(integer, -127), 127)
+            half = pl.cast(bounded, pl.FP16, mode="rint")
+            result = pl.cast(half, pl.INT8, mode="trunc")
+            quantized[row0:row0 + QUANT_M_TILE, col0:col0 + QUANT_N_TILE] = pl.set_validshape(result, valid_rows, valid_columns)
+    return quantized, scales
 
 
 def _round_to_int8(scaled: torch.Tensor) -> torch.Tensor:

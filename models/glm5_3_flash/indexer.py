@@ -185,6 +185,7 @@ def indexer_proj(
     index_k: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
     head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
     gate_scores: pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32],
+    skip_query: pl.Scalar[pl.INT32],
 ):
     """Project one dispatch's rows: queries, biased LayerNorm keys, both gates.
 
@@ -194,23 +195,24 @@ def indexer_proj(
     out concurrently.
     """
     t_dim = pl.tensor.dim(x, 0)
-    q_flat = pl.reshape(index_q, [t_dim, INDEX_H * INDEX_DIM])
-    q_blocks = (INDEX_H * INDEX_DIM) // Q_OUT_TILE
+    if skip_query == 0:
+        q_flat = pl.reshape(index_q, [t_dim, INDEX_H * INDEX_DIM])
+        q_blocks = (INDEX_H * INDEX_DIM) // Q_OUT_TILE
 
-    for idx in pl.spmd((t_dim // PROJ_T_TILE) * q_blocks, name_hint="indexer_q_proj"):
-        t_block = idx // q_blocks
-        t0 = t_block * PROJ_T_TILE
-        o0 = (idx - t_block * q_blocks) * Q_OUT_TILE
-        q_acc = pl.create_tensor([PROJ_T_TILE, Q_OUT_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, Q_LORA // PROJ_K_TILE, stage=2):
-            k0 = kb * PROJ_K_TILE
-            q_acc = pl.matmul_acc(
-                q_acc,
-                q_resid[t0 : t0 + PROJ_T_TILE, k0 : k0 + PROJ_K_TILE],
-                w_q_b[k0 : k0 + PROJ_K_TILE, o0 : o0 + Q_OUT_TILE],
-                init_cond=(k0 == 0),
-            )
-        q_flat[t0 : t0 + PROJ_T_TILE, o0 : o0 + Q_OUT_TILE] = pl.cast(q_acc, pl.BF16, mode="rint")
+        for idx in pl.spmd((t_dim // PROJ_T_TILE) * q_blocks, name_hint="indexer_q_proj"):
+            t_block = idx // q_blocks
+            t0 = t_block * PROJ_T_TILE
+            o0 = (idx - t_block * q_blocks) * Q_OUT_TILE
+            q_acc = pl.create_tensor([PROJ_T_TILE, Q_OUT_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(0, Q_LORA // PROJ_K_TILE, stage=2):
+                k0 = kb * PROJ_K_TILE
+                q_acc = pl.matmul_acc(
+                    q_acc,
+                    q_resid[t0 : t0 + PROJ_T_TILE, k0 : k0 + PROJ_K_TILE],
+                    w_q_b[k0 : k0 + PROJ_K_TILE, o0 : o0 + Q_OUT_TILE],
+                    init_cond=(k0 == 0),
+                )
+            q_flat[t0 : t0 + PROJ_T_TILE, o0 : o0 + Q_OUT_TILE] = pl.cast(q_acc, pl.BF16, mode="rint")
 
     for idx in pl.spmd(t_dim // PROJ_T_TILE, name_hint="indexer_k_proj"):
         t0 = idx * PROJ_T_TILE
@@ -238,18 +240,19 @@ def indexer_proj(
             mode="rint",
         )
 
-    for idx in pl.spmd(t_dim // PROJ_T_TILE, name_hint="indexer_weights_proj"):
-        t0 = idx * PROJ_T_TILE
-        w_acc = pl.create_tensor([PROJ_T_TILE, INDEX_H], dtype=pl.FP32)
-        for db in pl.pipeline(0, D // PROJ_K_TILE, stage=2):
-            d0 = db * PROJ_K_TILE
-            w_acc = pl.matmul_acc(
-                w_acc,
-                x[t0 : t0 + PROJ_T_TILE, d0 : d0 + PROJ_K_TILE],
-                w_weights[d0 : d0 + PROJ_K_TILE, 0:INDEX_H],
-                init_cond=(d0 == 0),
-            )
-        head_weights[t0 : t0 + PROJ_T_TILE, 0:INDEX_H] = pl.mul(w_acc, WEIGHTS_SCALE)
+    if skip_query == 0:
+        for idx in pl.spmd(t_dim // PROJ_T_TILE, name_hint="indexer_weights_proj"):
+            t0 = idx * PROJ_T_TILE
+            w_acc = pl.create_tensor([PROJ_T_TILE, INDEX_H], dtype=pl.FP32)
+            for db in pl.pipeline(0, D // PROJ_K_TILE, stage=2):
+                d0 = db * PROJ_K_TILE
+                w_acc = pl.matmul_acc(
+                    w_acc,
+                    x[t0 : t0 + PROJ_T_TILE, d0 : d0 + PROJ_K_TILE],
+                    w_weights[d0 : d0 + PROJ_K_TILE, 0:INDEX_H],
+                    init_cond=(d0 == 0),
+                )
+            head_weights[t0 : t0 + PROJ_T_TILE, 0:INDEX_H] = pl.mul(w_acc, WEIGHTS_SCALE)
 
     for idx in pl.spmd(t_dim // PROJ_T_TILE, name_hint="indexer_gate_proj"):
         t0 = idx * PROJ_T_TILE
@@ -263,6 +266,8 @@ def indexer_proj(
                 init_cond=(d0 == 0),
             )
         gate_scores[t0 : t0 + PROJ_T_TILE, 0:INDEX_DIM] = g_acc
+
+    return index_q, index_k, head_weights, gate_scores
 
 
 def golden_indexer_score(
@@ -552,8 +557,8 @@ def indexer_topk(
     proposal computed on step 0 — per request, not per row — with the query
     projection, scoring and this selection skipped on those steps. The
     expansion is *not* shareable and is rebuilt per row by
-    :func:`indexer_expand`. The sharing path (``indexer_share_mtp``) is out
-    of scope for this phase: every row here is selected independently.
+    :func:`indexer_expand`. The resident MTP scheduler retains the selection
+    per request and skips this entry on recycled proposal steps.
 
     Returns the region's TaskId so the expansion can order against it.
     """

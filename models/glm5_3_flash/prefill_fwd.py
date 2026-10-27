@@ -7,48 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""GLM-5.3-Flash device composition, persistent chunk sessions and generation.
-
-Single-file form (PR #1497 round 3, committer feedback): the device
-composition -- the frozen extents, the per-sublayer L2/L3 entries, the six
-consolidated runtime-ordinal programs and their compile/load/dispatch
-machinery -- and the host runner (``generate()`` over one packed 16-request batch
-plus the CLI) live in this one module. The CI fixture case (design S9) ships
-as a follow-up PR; the per-layer constexpr path is retired (git tag
-``glm53-pretrim-baseline``). Design of record ``prefill_fwd_arch_1015.md``;
-size review ``size_review_1016.md``.
-
-* ``ResidentPrefillSession.forward_chunks()``: new-token batches with request-local
-  MLA, Indexer and KDA state retained across chunks and decode steps. Cache slots
-  are cleared on release/reuse; callers manage optional prefix-state snapshots.
-* ``generate()``: tokenizer, resident stacked weights
-  (:mod:`models.glm5_3_flash.weights`), ``--runtime-dir`` compile reuse, and a
-  full-prefix-recompute generation loop over one packed 16-request batch with EOS
-  tracking, isfinite guards, an NPU FP32 vocabulary head and a JSON report. Dispatch:
-  ``production_launch_plan`` walks the 89 steps (seed, 3 dense layers, 42
-  sublayer pairs, head) on ONE shared multi-program L3 worker prepared with
-  the six main programs (``RT_PROGRAMS``) and the auxiliary vocabulary head; the BF16 ``x_hc``
-  four-stream ping-pongs over ``ws_x_hc_a``/``ws_x_hc_b``.
-* ``main()``: the production generate() mode (``--checkpoint`` required).
-
-Import-order contract: ``config`` and ``prefill_moe`` freeze kernel extents
-from argv at import time, so this module parses query ``--capacity``/``--tokens``
-and persistent-cache ``--max-seq-len``
-itself before the first kernel import. Production parallel modes are
-**TP8/EP8/DP1** and **TP16/EP16/DP1**. The packed request count stays 16
-at both widths. TP2/EP2 is legal only as a CI fixture's marker-pinned rung
-(the follow-up CI entry).
-
-Communication windows persist per prepared program. The resident session advances
-each program's collective epochs across layers, chunks and request-slot reuse;
-dense dispatches consume two TP epochs, attention one, and MoE one TP plus one
-MoE epoch. Host submissions keep at most two pending completion handles. Runtime
-FIFO execution completes each dispatch on all ranks before its successor runs.
-Epoch counters commit only after successful completion. TP publish/release/consumed
-fences remain active, and a failed dispatch invalidates the session until its
-runtime is closed and reopened. Fresh one-shot validation uses dispatch_index=0
-with freshly zeroed windows.
-"""
+"""GLM-5.3-Flash resident chunked generation, MTP verification and visual input composition."""
 
 import argparse
 from collections import deque
@@ -56,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import inspect
 import json
+import math
 from math import gcd
 import os
 from pathlib import Path
@@ -73,9 +33,14 @@ import models.glm5_3_flash.config as C
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _shape_parser.add_argument("--capacity", type=int, default=2048)
 _shape_parser.add_argument("--max-seq-len", type=int)
+_shape_parser.add_argument("--cache-tokens", type=int)
 _shape_options = _shape_parser.parse_known_args()[0]
 CAPACITY = _shape_options.capacity
 MAX_SEQ_LEN = CAPACITY if _shape_options.max_seq_len is None else _shape_options.max_seq_len
+_default_cache_tokens = min(16 * ((MAX_SEQ_LEN + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE) * C.BLOCK_SIZE, C.FLASH.max_position_embeddings)
+CACHE_TOKENS = _default_cache_tokens if _shape_options.cache_tokens is None else _shape_options.cache_tokens
+if CACHE_TOKENS <= 0 or CACHE_TOKENS % C.BLOCK_SIZE:
+    raise ValueError(f"--cache-tokens must be positive and aligned to {C.BLOCK_SIZE}")
 T_MOE = ((CAPACITY + C.TP_SIZE * 16 - 1) // (C.TP_SIZE * 16)) * 16
 if not any(tok == "--tokens" or tok.startswith("--tokens=") for tok in sys.argv):
     sys.argv += ["--tokens", str(T_MOE)]
@@ -137,8 +102,8 @@ if not 16 <= CAPACITY <= PREFILL_MAX_TOKENS or CAPACITY % 16:
 # capacity straight in, so the capacity itself must be 64-aligned (design said 16).
 if CAPACITY % 64:
     raise ValueError(f"--capacity must be a multiple of 64 for indexer_proj, got {CAPACITY}")
-if not 1 <= MAX_SEQ_LEN <= PREFILL_MAX_TOKENS:
-    raise ValueError(f"--max-seq-len must be 1..{PREFILL_MAX_TOKENS}, got {MAX_SEQ_LEN}")
+if not 1 <= MAX_SEQ_LEN <= FLASH.max_position_embeddings:
+    raise ValueError(f"--max-seq-len must be 1..{FLASH.max_position_embeddings}, got {MAX_SEQ_LEN}")
 
 from models.glm5_3_flash.attention_tp import tp_all_reduce
 from models.glm5_3_flash.dense_mlp import dense_mlp
@@ -154,12 +119,13 @@ from models.glm5_3_flash.indexer_cache import (
 from models.glm5_3_flash.kda_conv import CONV_DIM, STATE_LEN, kda_conv_prefill
 from models.glm5_3_flash.kda_output import kda_output
 from models.glm5_3_flash.kda_projection import BETA_PAD, kda_projection
-from models.glm5_3_flash.lm_head import FP32_HEAD_VOCAB_PAD, lm_head_logits
-from models.glm5_3_flash.metadata import build_forward_metadata, build_indexer_chunk_metadata
-from models.glm5_3_flash.mhc import mhc_head, mhc_mixes, mhc_post, mhc_pre
+from models.glm5_3_flash.lm_head import reference_lm_head_logits, FP32_HEAD_VOCAB_PAD, lm_head_logits, lm_head_mtp_logits
+from models.glm5_3_flash.metadata import SharedCachePages, build_forward_metadata, build_indexer_chunk_metadata
+from models.glm5_3_flash.mhc import plain_residual_pre, plain_residual_post, mhc_head, mhc_mixes, mhc_post, mhc_pre
 from models.glm5_3_flash.mla_cache import mla_cache_write
-from models.glm5_3_flash.mla_epilog import mla_epilog_prefill
-from models.glm5_3_flash.mla_prolog import mla_prolog
+from models.glm5_3_flash.mla_epilog import mla_epilog_w8a8
+from models.glm5_3_flash.mla_prolog import mla_prolog_w8a8
+from models.glm5_3_flash.mtp_projection import mtp_projection
 from models.glm5_3_flash.prefill_indexer import (
     KPOOL_SELECT_K,
     LEAF,
@@ -233,10 +199,8 @@ def _prefill_model():
 MODEL = _prefill_model()
 NUM_LAYERS = MODEL.num_hidden_layers      # backbone layers; the loop bound and nothing else
 KDA_NUM_LAYERS = len(MODEL.kda_layer_ids)  # linear-attention stack depth
-DSA_NUM_LAYERS = max(1, len(MODEL.dsa_layer_ids))  # sparse-attention cache stack depth
-# (clamped to one layer: a depth-reduced model without DSA layers still
-# allocates valid -- unused -- latent/indexer pools, because the runtime
-# rejects zero-extent allocations; the 45-layer deployment depth is 11 either way)
+DSA_NUM_LAYERS = len(MODEL.dsa_layer_ids) + 1  # sparse-attention cache stack depth
+# Includes the MTP layer's private latent and indexer state.
 DENSE_NUM_LAYERS = MODEL.first_k_dense_replace  # dense-MLP stack depth
 MOE_NUM_LAYERS = NUM_LAYERS - DENSE_NUM_LAYERS  # MoE layers on the backbone
 # Loader stack depths: weights.py carries the MTP layer one entry past the backbone
@@ -252,7 +216,7 @@ LOCAL_DENSE_INTER = DENSE_INTER // TP_SIZE
 
 # --- derived cache geometry (design S3.3), all static capacity-bound -------------
 TABLE_MAX = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
-LATENT_BLOCKS = BATCH * TABLE_MAX
+LATENT_BLOCKS = CACHE_TOKENS // BLOCK_SIZE
 LATENT_ROWS = LATENT_BLOCKS * BLOCK_SIZE
 # Each request owns a page-aligned pooled-key segment. The score window includes
 # one full LEAF of slack for the scorer and top-k tile stores.
@@ -260,8 +224,8 @@ POOL_STRIDE = (
     ((MAX_SEQ_LEN + INDEX_KPOOL - 1) // INDEX_KPOOL + INDEX_STATE_BLOCK_SIZE - 1)
     // INDEX_STATE_BLOCK_SIZE * INDEX_STATE_BLOCK_SIZE
 )
-POOL_AXIS = ((max(BATCH * POOL_STRIDE, CAPACITY // INDEX_KPOOL + BATCH) + 2 * LEAF - 2) // LEAF) * LEAF
-POOL_TABLE_ROWS = POOL_AXIS * INDEX_STATE_BLOCK_SIZE   # physical pooled-table rows
+POOL_AXIS = ((max(LATENT_ROWS // INDEX_KPOOL, CAPACITY // INDEX_KPOOL + BATCH) + 2 * LEAF - 2) // LEAF) * LEAF
+POOL_TABLE_ROWS = LATENT_ROWS // INDEX_KPOOL + BLOCK_SIZE // INDEX_KPOOL  # final raw-page span is scratch
 KDA_ROWS = MAX_BATCH_PER_DP                      # per-request state pool depth (32)
 # max logical pool pages per request: pools of INDEX_KPOOL tokens, paged at
 # INDEX_STATE_BLOCK_SIZE pool rows (the field is only used by build_forward_metadata)
@@ -279,13 +243,9 @@ _RESET_RECURRENT_ELEMENTS = LOCAL_KDA_H * KDA_DIM * KDA_DIM
 
 # Cache reset tiling.
 _RESET_MLA_TILE = gcd(4096, _RESET_MLA_ELEMENTS)
-_RESET_MLA_LANE_TILE = min(4, _RESET_MLA_ELEMENTS // _RESET_MLA_TILE)
 _RESET_RAW_TILE = gcd(4096, _RESET_RAW_ELEMENTS)
-_RESET_RAW_LANE_TILE = min(4, _RESET_RAW_ELEMENTS // _RESET_RAW_TILE)
 _RESET_POOL_TILE = gcd(4096, _RESET_POOL_ELEMENTS)
-_RESET_POOL_LANE_TILE = min(4, _RESET_POOL_ELEMENTS // _RESET_POOL_TILE)
-_RESET_SCALE_TILE = gcd(4096, _RESET_SCALE_ELEMENTS)
-_RESET_SCALE_LANE_TILE = min(4, _RESET_SCALE_ELEMENTS // _RESET_SCALE_TILE)
+_RESET_SCALE_TILE = gcd(BLOCK_SIZE // INDEX_KPOOL * POOL_SCALE_WIDTH, _RESET_SCALE_ELEMENTS)
 _RESET_CONV_TILE = gcd(4096, _RESET_CONV_ELEMENTS)
 _RESET_CONV_LANE_TILE = min(4, _RESET_CONV_ELEMENTS // _RESET_CONV_TILE)
 _RESET_RECURRENT_TILE = gcd(4096, _RESET_RECURRENT_ELEMENTS)
@@ -460,14 +420,18 @@ def gather_head_rows(
 @pl.jit.inline
 def dsa_attention_sublayer(
     normed: pl.Tensor[[CAPACITY, D], pl.BF16],
-    w_q_a: pl.Tensor[[Q_LORA, D], pl.BF16],
+    w_q_a: pl.Tensor[[Q_LORA, D], pl.INT8],
+    w_q_a_scale: pl.Tensor[[Q_LORA], pl.FP32],
     q_a_norm: pl.Tensor[[Q_LORA], pl.BF16],
-    w_q_b: pl.Tensor[[LOCAL_H * QK_DIM, Q_LORA], pl.BF16],
-    w_kv_a: pl.Tensor[[KV_LORA, D], pl.BF16],
+    w_q_b: pl.Tensor[[LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    w_q_b_scale: pl.Tensor[[LOCAL_H * QK_DIM], pl.FP32],
+    w_kv_a: pl.Tensor[[KV_LORA, D], pl.INT8],
+    w_kv_a_scale: pl.Tensor[[KV_LORA], pl.FP32],
     kv_a_norm: pl.Tensor[[KV_LORA], pl.BF16],
     w_k: pl.Tensor[[LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
     w_v: pl.Tensor[[LOCAL_H, V_DIM, KV_LORA], pl.BF16],
-    w_o: pl.Tensor[[D, LOCAL_H * V_DIM], pl.BF16],
+    w_o: pl.Tensor[[D, LOCAL_H * V_DIM], pl.INT8],
+    w_o_scale: pl.Tensor[[D], pl.FP32],
     idx_w_q_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
     idx_w_k: pl.Tensor[[D, INDEX_DIM], pl.BF16],
     idx_k_norm_w: pl.Tensor[[INDEX_DIM], pl.BF16],
@@ -506,6 +470,7 @@ def dsa_attention_sublayer(
     topk_indices: pl.Tensor[[CAPACITY, TOPK_INDEX_WIDTH], pl.INT32],
     pool_valid: pl.Tensor[[POOL_AXIS, POOL_VALID_WIDTH], pl.INT32],
     attn_partial: pl.Tensor[[CAPACITY, D], pl.FP32],
+    skip_topk: pl.Scalar[pl.INT32],
 ):
     """MLA NoPE projection -> latent cache publish -> kpool indexer chain -> sparse
     attention -> head projection, leaving the row-parallel FP32 partial.
@@ -514,25 +479,26 @@ def dsa_attention_sublayer(
     the cache and pool writes must precede the sparse attention because the
     always-appended tail reads this dispatch's own rows.
     """
-    mla_prolog(normed, w_q_a, q_a_norm, w_q_b, w_kv_a, kv_a_norm, q_resid, query, kv_latent)
+    mla_prolog_w8a8(normed, w_q_a, w_q_a_scale, q_a_norm, w_q_b, w_q_b_scale, w_kv_a, w_kv_a_scale, kv_a_norm, q_resid, query, kv_latent)
     mla_cache_write(kv_latent, mla_slots, latent_cache)
     indexer_proj(
         normed, q_resid, idx_w_q_b, idx_w_k, idx_k_norm_w, idx_k_norm_b,
-        idx_w_weights, idx_w_compress_gate, index_q, index_k, head_weights, gate_scores,
+        idx_w_weights, idx_w_compress_gate, index_q, index_k, head_weights, gate_scores, skip_topk,
     )
     indexer_cache_write(index_k, gate_scores, index_slots, raw_cache)
     indexer_pool_write(
         raw_cache, compress_ape, hadamard, pool_token_slots, pool_slots,
         pool_cache, pool_scale, pool_valid,
     )
-    indexer_score(
-        index_q, hadamard, pool_cache, pool_scale, pool_blocks, head_weights,
-        seg_start, pool_count_tok, index_scores,
-    )
-    indexer_topk(index_scores, seg_start, pool_count_tok, selected_pools, selected_valid)
+    if skip_topk == 0:
+        indexer_score(
+            index_q, hadamard, pool_cache, pool_scale, pool_blocks, head_weights,
+            seg_start, pool_count_tok, index_scores,
+        )
+        indexer_topk(index_scores, seg_start, pool_count_tok, selected_pools, selected_valid)
     indexer_expand(selected_pools, selected_valid, tail_start, tail_count, kv_len_tok, topk_indices)
     prefill_sparse_attn(query, latent_cache, block_table, request_ids, w_k, w_v, topk_indices, attn_out)
-    mla_epilog_prefill(attn_out, w_o, attn_partial)
+    mla_epilog_w8a8(attn_out, w_o, w_o_scale, attn_partial)
 
 
 @pl.jit.inline
@@ -723,6 +689,7 @@ PREFIX_SNAPSHOT_BYTES = sum(
 # Prefix snapshot copy tiling.
 _PREFIX_COPY_TILE = 1024
 _PREFIX_COPY_LANE_TILE = 16
+_PREFIX_SCALE_TILE = min(_PREFIX_COPY_TILE, BLOCK_SIZE // INDEX_KPOOL * POOL_SCALE_WIDTH)
 
 
 @pl.jit(auto_scope=False)
@@ -739,6 +706,8 @@ def copy_request_snapshot(
     bank_index_pool_scale: pl.InOut[pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_SCALE_ELEMENTS], pl.FP32]],
     bank_kda_conv_state: pl.InOut[pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS], pl.BF16]],
     bank_kda_recurrent_state: pl.InOut[pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_RECURRENT_ELEMENTS], pl.FP32]],
+    block_table: pl.Tensor[[BATCH, TABLE_MAX], pl.INT32],
+    snapshot_length: pl.Scalar[pl.INT32],
     request_slot: pl.Scalar[pl.INT32],
     bank_id: pl.Scalar[pl.INT32],
     restore: pl.Scalar[pl.INT32],
@@ -749,9 +718,11 @@ def copy_request_snapshot(
     for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_mla_latent_cache"):
         layer = block // _PREFIX_COPY_LANE_TILE
         lane = block % _PREFIX_COPY_LANE_TILE
-        for offset in pl.range(lane * _PREFIX_COPY_TILE, _RESET_MLA_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
-            valid = pl.min(_PREFIX_COPY_TILE, _RESET_MLA_ELEMENTS - offset)
-            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_MLA_ELEMENTS + offset
+        for offset in pl.range(lane * _PREFIX_COPY_TILE, (snapshot_length) * KV_LORA, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
+            valid = pl.min(_PREFIX_COPY_TILE, (snapshot_length) * KV_LORA - offset)
+            logical_page = offset // ((BLOCK_SIZE) * KV_LORA)
+            physical_page = pl.cast(pl.read(block_table, [request_slot, logical_page]), pl.INDEX)
+            source_offset = physical_page * (BLOCK_SIZE) * KV_LORA + offset % ((BLOCK_SIZE) * KV_LORA)
             bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
             if restore != 0:
                 data = pl.slice(bank_latent_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
@@ -767,9 +738,11 @@ def copy_request_snapshot(
     for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_index_raw_cache"):
         layer = block // _PREFIX_COPY_LANE_TILE
         lane = block % _PREFIX_COPY_LANE_TILE
-        for offset in pl.range(lane * _PREFIX_COPY_TILE, _RESET_RAW_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
-            valid = pl.min(_PREFIX_COPY_TILE, _RESET_RAW_ELEMENTS - offset)
-            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_RAW_ELEMENTS + offset
+        for offset in pl.range(lane * _PREFIX_COPY_TILE, (snapshot_length) * INDEX_STATE_WIDTH, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
+            valid = pl.min(_PREFIX_COPY_TILE, (snapshot_length) * INDEX_STATE_WIDTH - offset)
+            logical_page = offset // ((BLOCK_SIZE) * INDEX_STATE_WIDTH)
+            physical_page = pl.cast(pl.read(block_table, [request_slot, logical_page]), pl.INDEX)
+            source_offset = physical_page * (BLOCK_SIZE) * INDEX_STATE_WIDTH + offset % ((BLOCK_SIZE) * INDEX_STATE_WIDTH)
             bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
             if restore != 0:
                 data = pl.slice(bank_raw_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
@@ -785,9 +758,11 @@ def copy_request_snapshot(
     for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_index_pool_cache"):
         layer = block // _PREFIX_COPY_LANE_TILE
         lane = block % _PREFIX_COPY_LANE_TILE
-        for offset in pl.range(lane * _PREFIX_COPY_TILE, _RESET_POOL_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
-            valid = pl.min(_PREFIX_COPY_TILE, _RESET_POOL_ELEMENTS - offset)
-            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_POOL_ELEMENTS + offset
+        for offset in pl.range(lane * _PREFIX_COPY_TILE, (snapshot_length // INDEX_KPOOL) * INDEX_DIM, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
+            valid = pl.min(_PREFIX_COPY_TILE, (snapshot_length // INDEX_KPOOL) * INDEX_DIM - offset)
+            logical_page = offset // ((BLOCK_SIZE // INDEX_KPOOL) * INDEX_DIM)
+            physical_page = pl.cast(pl.read(block_table, [request_slot, logical_page]), pl.INDEX)
+            source_offset = physical_page * (BLOCK_SIZE // INDEX_KPOOL) * INDEX_DIM + offset % ((BLOCK_SIZE // INDEX_KPOOL) * INDEX_DIM)
             bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
             if restore != 0:
                 data = pl.slice(bank_pool_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
@@ -803,18 +778,20 @@ def copy_request_snapshot(
     for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_index_pool_scale"):
         layer = block // _PREFIX_COPY_LANE_TILE
         lane = block % _PREFIX_COPY_LANE_TILE
-        for offset in pl.range(lane * _PREFIX_COPY_TILE, _RESET_SCALE_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE):
-            valid = pl.min(_PREFIX_COPY_TILE, _RESET_SCALE_ELEMENTS - offset)
-            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_SCALE_ELEMENTS + offset
+        for offset in pl.range(lane * _PREFIX_SCALE_TILE, (snapshot_length // INDEX_KPOOL) * POOL_SCALE_WIDTH, _PREFIX_COPY_LANE_TILE * _PREFIX_SCALE_TILE):
+            valid = pl.min(_PREFIX_SCALE_TILE, (snapshot_length // INDEX_KPOOL) * POOL_SCALE_WIDTH - offset)
+            logical_page = offset // ((BLOCK_SIZE // INDEX_KPOOL) * POOL_SCALE_WIDTH)
+            physical_page = pl.cast(pl.read(block_table, [request_slot, logical_page]), pl.INDEX)
+            source_offset = physical_page * (BLOCK_SIZE // INDEX_KPOOL) * POOL_SCALE_WIDTH + offset % ((BLOCK_SIZE // INDEX_KPOOL) * POOL_SCALE_WIDTH)
             bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
             if restore != 0:
-                data = pl.slice(bank_scale_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
+                data = pl.slice(bank_scale_flat, [1, _PREFIX_SCALE_TILE], [bank_row, offset], valid_shape=[1, valid])
                 data = pl.set_validshape(data, 1, valid)
-                scale_flat[layer:layer + 1, source_offset:source_offset + _PREFIX_COPY_TILE] = data
+                scale_flat[layer:layer + 1, source_offset:source_offset + _PREFIX_SCALE_TILE] = data
             else:
-                data = pl.slice(scale_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
+                data = pl.slice(scale_flat, [1, _PREFIX_SCALE_TILE], [layer, source_offset], valid_shape=[1, valid])
                 data = pl.set_validshape(data, 1, valid)
-                bank_scale_flat[bank_row:bank_row + 1, offset:offset + _PREFIX_COPY_TILE] = data
+                bank_scale_flat[bank_row:bank_row + 1, offset:offset + _PREFIX_SCALE_TILE] = data
 
     conv_flat = pl.reshape(kda_conv_state, [KDA_NUM_LAYERS, KDA_ROWS * STATE_LEN * CONV_DIM])
     bank_conv_flat = pl.reshape(bank_kda_conv_state, [PREFIX_SNAPSHOT_ENTRIES * KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS])
@@ -873,6 +850,8 @@ def l3_copy_request_snapshot(
     bank_index_pool_scale: pl.InOut[pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_SCALE_ELEMENTS], pl.FP32]],
     bank_kda_conv_state: pl.InOut[pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS], pl.BF16]],
     bank_kda_recurrent_state: pl.InOut[pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_RECURRENT_ELEMENTS], pl.FP32]],
+    block_table: pl.Tensor[[RANKS, BATCH, TABLE_MAX], pl.INT32],
+    snapshot_length: pl.Scalar[pl.INT32],
     request_slot: pl.Scalar[pl.INT32],
     bank_id: pl.Scalar[pl.INT32],
     restore: pl.Scalar[pl.INT32],
@@ -884,7 +863,7 @@ def l3_copy_request_snapshot(
             index_pool_scale[rank], kda_conv_state[rank], kda_recurrent_state[rank],
             bank_mla_latent_cache[rank], bank_index_raw_cache[rank], bank_index_pool_cache[rank],
             bank_index_pool_scale[rank], bank_kda_conv_state[rank], bank_kda_recurrent_state[rank],
-            request_slot, bank_id, restore, device=rank,
+            block_table[rank], snapshot_length, request_slot, bank_id, restore, device=rank,
         )
 
 
@@ -896,87 +875,79 @@ def reset_request_caches(
     index_pool_scale: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
     kda_conv_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
     kda_recurrent_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    cache_page_owners: pl.Tensor[[LATENT_BLOCKS], pl.INT32],
     slot_mask: pl.Scalar[pl.INT32],
 ):
     """Zero selected private segments, or all physical cache rows for a full reset."""
-    mla_layer_tiles = LATENT_ROWS * KV_LORA // _RESET_MLA_TILE
-    mla_slot_tiles = _RESET_MLA_ELEMENTS // _RESET_MLA_TILE
-    mla_flat_rows = DSA_NUM_LAYERS * mla_layer_tiles
-    mla_flat = pl.reshape(mla_latent_cache, [mla_flat_rows, _RESET_MLA_TILE])
-    for block in pl.spmd(DSA_NUM_LAYERS * _RESET_MLA_LANE_TILE, name_hint="reset_mla"):
-        layer = block // _RESET_MLA_LANE_TILE
-        lane = block % _RESET_MLA_LANE_TILE
+    mla_flat = pl.reshape(mla_latent_cache, [DSA_NUM_LAYERS, LATENT_ROWS * KV_LORA])
+    for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_mla"):
+        layer = block // 4
+        lane = block % 4
         mla_zero = pl.tile.full([1, _RESET_MLA_TILE], dtype=pl.BF16, value=0)
-        if slot_mask == (1 << BATCH) - 1:
-            for chunk in pl.range(lane, mla_layer_tiles, _RESET_MLA_LANE_TILE):
-                offset = layer * mla_layer_tiles + chunk
-                pl.tile.store(mla_zero, [offset, 0], mla_flat)
-        else:
-            for slot in pl.range(BATCH):
-                selected = (slot_mask >> pl.cast(slot, pl.INT32)) & 1
-                if selected != 0:
-                    for chunk in pl.range(lane, mla_slot_tiles, _RESET_MLA_LANE_TILE):
-                        offset = layer * mla_layer_tiles + slot * mla_slot_tiles + chunk
-                        pl.tile.store(mla_zero, [offset, 0], mla_flat)
-    raw_layer_tiles = LATENT_ROWS * INDEX_STATE_WIDTH // _RESET_RAW_TILE
-    raw_slot_tiles = _RESET_RAW_ELEMENTS // _RESET_RAW_TILE
-    raw_flat_rows = DSA_NUM_LAYERS * raw_layer_tiles
-    raw_flat = pl.reshape(index_raw_cache, [raw_flat_rows, _RESET_RAW_TILE])
-    for block in pl.spmd(DSA_NUM_LAYERS * _RESET_RAW_LANE_TILE, name_hint="reset_raw"):
-        layer = block // _RESET_RAW_LANE_TILE
-        lane = block % _RESET_RAW_LANE_TILE
+        for page in pl.range(LATENT_BLOCKS):
+            page_selected = pl.cast(0, pl.INT32)
+            if slot_mask == (1 << BATCH) - 1:
+                page_selected = pl.cast(1, pl.INT32)
+            elif page < LATENT_BLOCKS:
+                owner = pl.read(cache_page_owners, [page])
+                if owner >= 0:
+                    page_selected = pl.cast((slot_mask >> owner) & 1, pl.INT32)
+            if page_selected != 0:
+                for chunk in pl.range(lane, (BLOCK_SIZE) * KV_LORA // _RESET_MLA_TILE, 4):
+                    offset = page * (BLOCK_SIZE) * KV_LORA + chunk * _RESET_MLA_TILE
+                    pl.tile.store(mla_zero, [layer, offset], mla_flat)
+    raw_flat = pl.reshape(index_raw_cache, [DSA_NUM_LAYERS, LATENT_ROWS * INDEX_STATE_WIDTH])
+    for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_raw"):
+        layer = block // 4
+        lane = block % 4
         raw_zero = pl.tile.full([1, _RESET_RAW_TILE], dtype=pl.FP32, value=0)
-        if slot_mask == (1 << BATCH) - 1:
-            for chunk in pl.range(lane, raw_layer_tiles, _RESET_RAW_LANE_TILE):
-                offset = layer * raw_layer_tiles + chunk
-                pl.tile.store(raw_zero, [offset, 0], raw_flat)
-        else:
-            for slot in pl.range(BATCH):
-                selected = (slot_mask >> pl.cast(slot, pl.INT32)) & 1
-                if selected != 0:
-                    for chunk in pl.range(lane, raw_slot_tiles, _RESET_RAW_LANE_TILE):
-                        offset = layer * raw_layer_tiles + slot * raw_slot_tiles + chunk
-                        pl.tile.store(raw_zero, [offset, 0], raw_flat)
-    pool_layer_tiles = POOL_TABLE_ROWS * INDEX_DIM // _RESET_POOL_TILE
-    pool_slot_tiles = _RESET_POOL_ELEMENTS // _RESET_POOL_TILE
-    pool_flat_rows = DSA_NUM_LAYERS * pool_layer_tiles
-    pool_flat = pl.reshape(index_pool_cache, [pool_flat_rows, _RESET_POOL_TILE])
-    for block in pl.spmd(DSA_NUM_LAYERS * _RESET_POOL_LANE_TILE, name_hint="reset_pool"):
-        layer = block // _RESET_POOL_LANE_TILE
-        lane = block % _RESET_POOL_LANE_TILE
-        # A2/A3 has no INT8 tile fill; narrow an INT16 zero tile.
-        pool_zero_i16 = pl.tile.full([1, _RESET_POOL_TILE], dtype=pl.INT16, value=0)
-        pool_zero = pl.cast(pool_zero_i16, pl.INT8)
-        if slot_mask == (1 << BATCH) - 1:
-            for chunk in pl.range(lane, pool_layer_tiles, _RESET_POOL_LANE_TILE):
-                offset = layer * pool_layer_tiles + chunk
-                pl.tile.store(pool_zero, [offset, 0], pool_flat)
-        else:
-            for slot in pl.range(BATCH):
-                selected = (slot_mask >> pl.cast(slot, pl.INT32)) & 1
-                if selected != 0:
-                    for chunk in pl.range(lane, pool_slot_tiles, _RESET_POOL_LANE_TILE):
-                        offset = layer * pool_layer_tiles + slot * pool_slot_tiles + chunk
-                        pl.tile.store(pool_zero, [offset, 0], pool_flat)
-    scale_layer_tiles = POOL_TABLE_ROWS * POOL_SCALE_WIDTH // _RESET_SCALE_TILE
-    scale_slot_tiles = _RESET_SCALE_ELEMENTS // _RESET_SCALE_TILE
-    scale_flat_rows = DSA_NUM_LAYERS * scale_layer_tiles
-    scale_flat = pl.reshape(index_pool_scale, [scale_flat_rows, _RESET_SCALE_TILE])
-    for block in pl.spmd(DSA_NUM_LAYERS * _RESET_SCALE_LANE_TILE, name_hint="reset_scale"):
-        layer = block // _RESET_SCALE_LANE_TILE
-        lane = block % _RESET_SCALE_LANE_TILE
+        for page in pl.range(LATENT_BLOCKS):
+            page_selected = pl.cast(0, pl.INT32)
+            if slot_mask == (1 << BATCH) - 1:
+                page_selected = pl.cast(1, pl.INT32)
+            elif page < LATENT_BLOCKS:
+                owner = pl.read(cache_page_owners, [page])
+                if owner >= 0:
+                    page_selected = pl.cast((slot_mask >> owner) & 1, pl.INT32)
+            if page_selected != 0:
+                for chunk in pl.range(lane, (BLOCK_SIZE) * INDEX_STATE_WIDTH // _RESET_RAW_TILE, 4):
+                    offset = page * (BLOCK_SIZE) * INDEX_STATE_WIDTH + chunk * _RESET_RAW_TILE
+                    pl.tile.store(raw_zero, [layer, offset], raw_flat)
+    pool_flat = pl.reshape(index_pool_cache, [DSA_NUM_LAYERS, POOL_TABLE_ROWS * INDEX_DIM])
+    for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_pool"):
+        layer = block // 4
+        lane = block % 4
+        zero_i16 = pl.tile.full([1, _RESET_POOL_TILE], dtype=pl.INT16, value=0)
+        pool_zero = pl.cast(zero_i16, pl.INT8)
+        for page in pl.range(LATENT_BLOCKS + 1):
+            page_selected = pl.cast(0, pl.INT32)
+            if slot_mask == (1 << BATCH) - 1:
+                page_selected = pl.cast(1, pl.INT32)
+            elif page < LATENT_BLOCKS:
+                owner = pl.read(cache_page_owners, [page])
+                if owner >= 0:
+                    page_selected = pl.cast((slot_mask >> owner) & 1, pl.INT32)
+            if page_selected != 0:
+                for chunk in pl.range(lane, (BLOCK_SIZE // INDEX_KPOOL) * INDEX_DIM // _RESET_POOL_TILE, 4):
+                    offset = page * (BLOCK_SIZE // INDEX_KPOOL) * INDEX_DIM + chunk * _RESET_POOL_TILE
+                    pl.tile.store(pool_zero, [layer, offset], pool_flat)
+    scale_flat = pl.reshape(index_pool_scale, [DSA_NUM_LAYERS, POOL_TABLE_ROWS * POOL_SCALE_WIDTH])
+    for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_scale"):
+        layer = block // 4
+        lane = block % 4
         scale_zero = pl.tile.full([1, _RESET_SCALE_TILE], dtype=pl.FP32, value=0)
-        if slot_mask == (1 << BATCH) - 1:
-            for chunk in pl.range(lane, scale_layer_tiles, _RESET_SCALE_LANE_TILE):
-                offset = layer * scale_layer_tiles + chunk
-                pl.tile.store(scale_zero, [offset, 0], scale_flat)
-        else:
-            for slot in pl.range(BATCH):
-                selected = (slot_mask >> pl.cast(slot, pl.INT32)) & 1
-                if selected != 0:
-                    for chunk in pl.range(lane, scale_slot_tiles, _RESET_SCALE_LANE_TILE):
-                        offset = layer * scale_layer_tiles + slot * scale_slot_tiles + chunk
-                        pl.tile.store(scale_zero, [offset, 0], scale_flat)
+        for page in pl.range(LATENT_BLOCKS + 1):
+            page_selected = pl.cast(0, pl.INT32)
+            if slot_mask == (1 << BATCH) - 1:
+                page_selected = pl.cast(1, pl.INT32)
+            elif page < LATENT_BLOCKS:
+                owner = pl.read(cache_page_owners, [page])
+                if owner >= 0:
+                    page_selected = pl.cast((slot_mask >> owner) & 1, pl.INT32)
+            if page_selected != 0:
+                for chunk in pl.range(lane, (BLOCK_SIZE // INDEX_KPOOL) * POOL_SCALE_WIDTH // _RESET_SCALE_TILE, 4):
+                    offset = page * (BLOCK_SIZE // INDEX_KPOOL) * POOL_SCALE_WIDTH + chunk * _RESET_SCALE_TILE
+                    pl.tile.store(scale_zero, [layer, offset], scale_flat)
     conv_layer_tiles = KDA_ROWS * STATE_LEN * CONV_DIM // _RESET_CONV_TILE
     conv_slot_tiles = _RESET_CONV_ELEMENTS // _RESET_CONV_TILE
     conv_flat_rows = KDA_NUM_LAYERS * conv_layer_tiles
@@ -1029,6 +1000,7 @@ def l3_reset_request_caches(
     index_pool_scale: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
     kda_conv_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
     kda_recurrent_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    cache_page_owners: pl.Tensor[[RANKS, LATENT_BLOCKS], pl.INT32],
     slot_mask: pl.Scalar[pl.INT32],
 ):
     """Clear the same selected request slots on every resident rank."""
@@ -1036,7 +1008,7 @@ def l3_reset_request_caches(
         reset_request_caches(
             mla_latent_cache[rank], index_raw_cache[rank],
             index_pool_cache[rank], index_pool_scale[rank],
-            kda_conv_state[rank], kda_recurrent_state[rank], slot_mask, device=rank,
+            kda_conv_state[rank], kda_recurrent_state[rank], cache_page_owners[rank], slot_mask, device=rank,
         )
 
 
@@ -1309,9 +1281,6 @@ def prefill_layer_diff_moe_ffn_rt(
     shared_out = pl.create_tensor([T_MOE, D], dtype=pl.FP32)
     y_local = pl.create_tensor([T_MOE, D], dtype=pl.FP32)
 
-    ffn_fn_l: pl.Tensor[[MIX_HC, HC_DIM], pl.BF16] = mhc_ffn_fn[bb_ord]
-    ffn_scale_l: pl.Tensor[[3], pl.FP32] = mhc_ffn_scale[bb_ord]
-    ffn_base_l: pl.Tensor[[MIX_HC], pl.FP32] = mhc_ffn_base[bb_ord]
     post_norm_l: pl.Tensor[[D], pl.BF16] = norm_post_norm[bb_ord]
     router_gate_w_l: pl.Tensor[[N_EXPERTS, D], pl.BF16] = router_gate_w[moe_ord]
     router_gate_bias_l: pl.Tensor[[N_EXPERTS], pl.FP32] = router_gate_bias[moe_ord]
@@ -1325,9 +1294,15 @@ def prefill_layer_diff_moe_ffn_rt(
     moe_shared_w_down_scale_l: pl.Tensor[[D], pl.FP32] = moe_shared_w_down_scale[moe_ord]
 
     with pl.scope():
-        mhc_mixes(x_hc_mid, ffn_fn_l, ffn_scale_l, ffn_base_l,
-                  out_ffn_pre, out_ffn_post, out_ffn_res)
-        mhc_pre(x_hc_mid, out_ffn_pre, out_ffn_input)
+        if bb_ord == NUM_LAYERS:
+            plain_residual_pre(x_hc_mid, out_ffn_input, out_ffn_pre, out_ffn_post, out_ffn_res)
+        else:
+            ffn_fn_l: pl.Tensor[[MIX_HC, HC_DIM], pl.BF16] = mhc_ffn_fn[bb_ord]
+            ffn_scale_l: pl.Tensor[[3], pl.FP32] = mhc_ffn_scale[bb_ord]
+            ffn_base_l: pl.Tensor[[MIX_HC], pl.FP32] = mhc_ffn_base[bb_ord]
+            mhc_mixes(x_hc_mid, ffn_fn_l, ffn_scale_l, ffn_base_l,
+                      out_ffn_pre, out_ffn_post, out_ffn_res)
+            mhc_pre(x_hc_mid, out_ffn_pre, out_ffn_input)
         moe_ffn_sublayer(
             out_ffn_input, post_norm_l,
             router_gate_w_l, router_gate_bias_l,
@@ -1347,7 +1322,10 @@ def prefill_layer_diff_moe_ffn_rt(
         tp_all_reduce(out_ffn_partial, tp_partial, tp_arrived, out_ffn_out,
                       num_tokens, my_rank, 0, ffn_epoch)
         zero_bf16_padding_rows(out_ffn_out, num_tokens)
-        mhc_post(out_ffn_out, x_hc_mid, out_ffn_post, out_ffn_res, out_x_hc_out)
+        if bb_ord == NUM_LAYERS:
+            plain_residual_post(out_ffn_out, x_hc_mid, out_x_hc_out)
+        else:
+            mhc_post(out_ffn_out, x_hc_mid, out_ffn_post, out_ffn_res, out_x_hc_out)
 
     return (
         out_ffn_pre, out_ffn_post, out_ffn_res, out_ffn_input, out_ffn_partial,
@@ -1570,14 +1548,18 @@ def prefill_layer_diff_dsa_attn_rt(
     block_table: pl.Tensor[[BATCH, TABLE_MAX], pl.INT32],
     active_tokens: pl.Tensor[[1], pl.INT32],
     # -- resident weight stacks (the attention half's own families) ------------------
-    mla_w_q_a: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, D], pl.BF16],
+    mla_w_q_a: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, D], pl.INT8],
+    mla_w_q_a_scale: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.FP32],
     mla_q_a_norm: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.BF16],
-    mla_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM, Q_LORA], pl.BF16],
-    mla_w_kv_a: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA, D], pl.BF16],
+    mla_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    mla_w_q_b_scale: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM], pl.FP32],
+    mla_w_kv_a: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA, D], pl.INT8],
+    mla_w_kv_a_scale: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA], pl.FP32],
     mla_kv_a_norm: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA], pl.BF16],
     mla_w_k: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
     mla_w_v: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H, V_DIM, KV_LORA], pl.BF16],
-    mla_w_o: pl.Tensor[[MLA_STACK_LAYERS, D, LOCAL_H * V_DIM], pl.BF16],
+    mla_w_o: pl.Tensor[[MLA_STACK_LAYERS, D, LOCAL_H * V_DIM], pl.INT8],
+    mla_w_o_scale: pl.Tensor[[MLA_STACK_LAYERS, D], pl.FP32],
     idx_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
     idx_w_k: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
     idx_k_norm_w: pl.Tensor[[MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
@@ -1613,12 +1595,14 @@ def prefill_layer_diff_dsa_attn_rt(
     index_k: pl.InOut[pl.Tensor[[CAPACITY, INDEX_DIM], pl.BF16]],
     index_scores: pl.InOut[pl.Tensor[[CAPACITY, POOL_AXIS], pl.FP32]],
     selected_pools: pl.InOut[pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.InOut[pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32]],
     # -- scalars last: the ordinals are dispatch-time runtime scalars computed by
     #    the HOST (never layer arithmetic inside the graph) ---------------------------
     bb_ord: pl.Scalar[pl.INT32],
     dsa_ord: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     attn_epoch: pl.Scalar[pl.INT32],
+    skip_topk: pl.Scalar[pl.INT32],
 ):
     """Runtime-ordinal DSA-attention entry (t30; the retired constexpr twin
     is recoverable at git tag ``glm53-pretrim-baseline``).
@@ -1640,22 +1624,22 @@ def prefill_layer_diff_dsa_attn_rt(
     kv_latent = pl.create_tensor([t_tokens, KV_LORA], dtype=pl.BF16)
     head_weights = pl.create_tensor([t_tokens, INDEX_H], dtype=pl.FP32)
     gate_scores = pl.create_tensor([t_tokens, INDEX_DIM], dtype=pl.FP32)
-    selected_valid = pl.create_tensor([t_tokens, KPOOL_SELECT_K], dtype=pl.INT32)
     topk_indices = pl.create_tensor([t_tokens, TOPK_INDEX_WIDTH], dtype=pl.INT32)
     pool_valid = pl.create_tensor([pools_axis, POOL_VALID_WIDTH], dtype=pl.INT32)
 
-    attn_fn_l: pl.Tensor[[MIX_HC, HC_DIM], pl.BF16] = mhc_attn_fn[bb_ord]
-    attn_scale_l: pl.Tensor[[3], pl.FP32] = mhc_attn_scale[bb_ord]
-    attn_base_l: pl.Tensor[[MIX_HC], pl.FP32] = mhc_attn_base[bb_ord]
     input_norm_l: pl.Tensor[[D], pl.BF16] = norm_input_norm[bb_ord]
-    mla_w_q_a_l: pl.Tensor[[Q_LORA, D], pl.BF16] = mla_w_q_a[dsa_ord]
+    mla_w_q_a_l: pl.Tensor[[Q_LORA, D], pl.INT8] = mla_w_q_a[dsa_ord]
+    mla_w_q_a_scale_l: pl.Tensor[[Q_LORA], pl.FP32] = mla_w_q_a_scale[dsa_ord]
     mla_q_a_norm_l: pl.Tensor[[Q_LORA], pl.BF16] = mla_q_a_norm[dsa_ord]
-    mla_w_q_b_l: pl.Tensor[[LOCAL_H * QK_DIM, Q_LORA], pl.BF16] = mla_w_q_b[dsa_ord]
-    mla_w_kv_a_l: pl.Tensor[[KV_LORA, D], pl.BF16] = mla_w_kv_a[dsa_ord]
+    mla_w_q_b_l: pl.Tensor[[LOCAL_H * QK_DIM, Q_LORA], pl.INT8] = mla_w_q_b[dsa_ord]
+    mla_w_q_b_scale_l: pl.Tensor[[LOCAL_H * QK_DIM], pl.FP32] = mla_w_q_b_scale[dsa_ord]
+    mla_w_kv_a_l: pl.Tensor[[KV_LORA, D], pl.INT8] = mla_w_kv_a[dsa_ord]
+    mla_w_kv_a_scale_l: pl.Tensor[[KV_LORA], pl.FP32] = mla_w_kv_a_scale[dsa_ord]
     mla_kv_a_norm_l: pl.Tensor[[KV_LORA], pl.BF16] = mla_kv_a_norm[dsa_ord]
     mla_w_k_l: pl.Tensor[[LOCAL_H, QK_DIM, KV_LORA], pl.BF16] = mla_w_k[dsa_ord]
     mla_w_v_l: pl.Tensor[[LOCAL_H, V_DIM, KV_LORA], pl.BF16] = mla_w_v[dsa_ord]
-    mla_w_o_l: pl.Tensor[[D, LOCAL_H * V_DIM], pl.BF16] = mla_w_o[dsa_ord]
+    mla_w_o_l: pl.Tensor[[D, LOCAL_H * V_DIM], pl.INT8] = mla_w_o[dsa_ord]
+    mla_w_o_scale_l: pl.Tensor[[D], pl.FP32] = mla_w_o_scale[dsa_ord]
     idx_w_q_b_l: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.BF16] = idx_w_q_b[dsa_ord]
     idx_w_k_l: pl.Tensor[[D, INDEX_DIM], pl.BF16] = idx_w_k[dsa_ord]
     idx_k_norm_w_l: pl.Tensor[[INDEX_DIM], pl.BF16] = idx_k_norm_w[dsa_ord]
@@ -1669,15 +1653,21 @@ def prefill_layer_diff_dsa_attn_rt(
     pool_scale_l = index_pool_scale[dsa_ord]
 
     with pl.scope():
-        mhc_mixes(x_hc, attn_fn_l, attn_scale_l, attn_base_l,
-                  out_attn_pre, out_attn_post, out_attn_res)
-        mhc_pre(x_hc, out_attn_pre, out_collapsed)
+        if bb_ord == NUM_LAYERS:
+            plain_residual_pre(x_hc, out_collapsed, out_attn_pre, out_attn_post, out_attn_res)
+        else:
+            attn_fn_l: pl.Tensor[[MIX_HC, HC_DIM], pl.BF16] = mhc_attn_fn[bb_ord]
+            attn_scale_l: pl.Tensor[[3], pl.FP32] = mhc_attn_scale[bb_ord]
+            attn_base_l: pl.Tensor[[MIX_HC], pl.FP32] = mhc_attn_base[bb_ord]
+            mhc_mixes(x_hc, attn_fn_l, attn_scale_l, attn_base_l,
+                      out_attn_pre, out_attn_post, out_attn_res)
+            mhc_pre(x_hc, out_attn_pre, out_collapsed)
         rmsnorm(out_collapsed, input_norm_l, out_normed)
         dsa_attention_sublayer(
             out_normed,
-            mla_w_q_a_l, mla_q_a_norm_l, mla_w_q_b_l,
-            mla_w_kv_a_l, mla_kv_a_norm_l,
-            mla_w_k_l, mla_w_v_l, mla_w_o_l,
+            mla_w_q_a_l, mla_w_q_a_scale_l, mla_q_a_norm_l, mla_w_q_b_l, mla_w_q_b_scale_l,
+            mla_w_kv_a_l, mla_w_kv_a_scale_l, mla_kv_a_norm_l,
+            mla_w_k_l, mla_w_v_l, mla_w_o_l, mla_w_o_scale_l,
             idx_w_q_b_l, idx_w_k_l, idx_k_norm_w_l,
             idx_k_norm_b_l, idx_w_weights_l,
             idx_w_compress_gate_l, idx_compress_ape_l, hadamard,
@@ -1689,12 +1679,15 @@ def prefill_layer_diff_dsa_attn_rt(
             q_resid, dsa_query, kv_latent, attn_out,
             index_q, index_k, head_weights, gate_scores, index_scores,
             selected_pools, selected_valid, topk_indices, pool_valid,
-            out_attn_partial,
+            out_attn_partial, skip_topk,
         )
         tp_all_reduce(out_attn_partial, tp_partial, tp_arrived, out_sublayer_out,
                       num_tokens, my_rank, 0, attn_epoch)
         zero_bf16_padding_rows(out_sublayer_out, num_tokens)
-        mhc_post(out_sublayer_out, x_hc, out_attn_post, out_attn_res, out_x_hc_mid)
+        if bb_ord == NUM_LAYERS:
+            plain_residual_post(out_sublayer_out, x_hc, out_x_hc_mid)
+        else:
+            mhc_post(out_sublayer_out, x_hc, out_attn_post, out_attn_res, out_x_hc_mid)
 
     return (
         out_attn_pre, out_attn_post, out_attn_res, out_collapsed, out_normed,
@@ -1981,14 +1974,18 @@ def l3_prefill_layer_diff_dsa_attn_rt(
     pool_blocks: pl.Tensor[[RANKS, POOL_AXIS], pl.INT32],
     block_table: pl.Tensor[[RANKS, BATCH, TABLE_MAX], pl.INT32],
     active_tokens: pl.Tensor[[RANKS, 1], pl.INT32],
-    mla_w_q_a: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA, D], pl.BF16],
+    mla_w_q_a: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA, D], pl.INT8],
+    mla_w_q_a_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA], pl.FP32],
     mla_q_a_norm: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA], pl.BF16],
-    mla_w_q_b: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H * QK_DIM, Q_LORA], pl.BF16],
-    mla_w_kv_a: pl.Tensor[[RANKS, MLA_STACK_LAYERS, KV_LORA, D], pl.BF16],
+    mla_w_q_b: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    mla_w_q_b_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H * QK_DIM], pl.FP32],
+    mla_w_kv_a: pl.Tensor[[RANKS, MLA_STACK_LAYERS, KV_LORA, D], pl.INT8],
+    mla_w_kv_a_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, KV_LORA], pl.FP32],
     mla_kv_a_norm: pl.Tensor[[RANKS, MLA_STACK_LAYERS, KV_LORA], pl.BF16],
     mla_w_k: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
     mla_w_v: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H, V_DIM, KV_LORA], pl.BF16],
-    mla_w_o: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, LOCAL_H * V_DIM], pl.BF16],
+    mla_w_o: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, LOCAL_H * V_DIM], pl.INT8],
+    mla_w_o_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D], pl.FP32],
     idx_w_q_b: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
     idx_w_k: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
     idx_k_norm_w: pl.Tensor[[RANKS, MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
@@ -2023,9 +2020,11 @@ def l3_prefill_layer_diff_dsa_attn_rt(
     index_k: pl.InOut[pl.Tensor[[RANKS, CAPACITY, INDEX_DIM], pl.BF16]],
     index_scores: pl.InOut[pl.Tensor[[RANKS, CAPACITY, POOL_AXIS], pl.FP32]],
     selected_pools: pl.InOut[pl.Tensor[[RANKS, CAPACITY, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.InOut[pl.Tensor[[RANKS, CAPACITY, KPOOL_SELECT_K], pl.INT32]],
     bb_ord: pl.Scalar[pl.INT32],
     dsa_ord: pl.Scalar[pl.INT32],
     attn_epoch: pl.Scalar[pl.INT32],
+    skip_topk: pl.Scalar[pl.INT32],
 ):
     """Launch one DSA attention half at the caller's per-program TP epoch."""
     tp_partial_buffer = pld.alloc_window_buffer([CAPACITY, D], dtype=pl.FP32)
@@ -2040,9 +2039,9 @@ def l3_prefill_layer_diff_dsa_attn_rt(
             tail_start[rank], tail_count[rank], kv_len_tok[rank],
             pool_token_slots[rank], pool_slots[rank], pool_blocks[rank],
             block_table[rank], active_tokens[rank],
-            mla_w_q_a[rank], mla_q_a_norm[rank], mla_w_q_b[rank],
-            mla_w_kv_a[rank], mla_kv_a_norm[rank],
-            mla_w_k[rank], mla_w_v[rank], mla_w_o[rank],
+            mla_w_q_a[rank], mla_w_q_a_scale[rank], mla_q_a_norm[rank], mla_w_q_b[rank], mla_w_q_b_scale[rank],
+            mla_w_kv_a[rank], mla_w_kv_a_scale[rank], mla_kv_a_norm[rank],
+            mla_w_k[rank], mla_w_v[rank], mla_w_o[rank], mla_w_o_scale[rank],
             idx_w_q_b[rank], idx_w_k[rank], idx_k_norm_w[rank], idx_k_norm_b[rank],
             idx_w_weights[rank], idx_w_compress_gate[rank], idx_compress_ape[rank],
             mhc_attn_fn[rank], mhc_attn_scale[rank], mhc_attn_base[rank],
@@ -2054,8 +2053,8 @@ def l3_prefill_layer_diff_dsa_attn_rt(
             out_collapsed[rank], out_normed[rank],
             out_attn_partial[rank], out_sublayer_out[rank], out_x_hc_mid[rank],
             dsa_query[rank], attn_out[rank], index_q[rank], index_k[rank],
-            index_scores[rank], selected_pools[rank],
-            bb_ord, dsa_ord, rank, attn_epoch, device=rank,
+            index_scores[rank], selected_pools[rank], selected_valid[rank],
+            bb_ord, dsa_ord, rank, attn_epoch, skip_topk, device=rank,
         )
 
 
@@ -2103,6 +2102,116 @@ def l3_prefill_lm_head_logits(
     """Normalize the gathered rows and project each rank's vocabulary shard."""
     for rank in pl.unroll(RANKS):
         prefill_lm_head_logits(head_hidden[rank], final_norm[rank], weight[rank], logits[rank], device=rank)
+
+
+@pl.jit
+def prefill_mtp_prepare(
+    target_streams: pl.Tensor[[CAPACITY, HC_MULT, D], pl.BF16],
+    embedding_rows: pl.Tensor[[CAPACITY, D], pl.BF16],
+    feedback_norm: pl.Tensor[[D], pl.BF16],
+    enorm: pl.Tensor[[D], pl.BF16],
+    hnorm: pl.Tensor[[D], pl.BF16],
+    eh_proj: pl.Tensor[[D, 2 * D], pl.BF16],
+    request_ids: pl.Tensor[[CAPACITY], pl.INT32],
+    cached_hidden: pl.Tensor[[BATCH, D], pl.BF16],
+    cached_pools: pl.Tensor[[BATCH, KPOOL_SELECT_K], pl.INT32],
+    cached_valid: pl.Tensor[[BATCH, KPOOL_SELECT_K], pl.INT32],
+    selected_pools: pl.InOut[pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.InOut[pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32]],
+    x_hc: pl.Out[pl.Tensor[[CAPACITY, HC_MULT, D], pl.BF16]],
+    recycle: pl.Scalar[pl.INT32],
+):
+    """Project target or recycled MTP feedback and restore request-local proposal selections."""
+    collapsed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
+    if recycle == 0:
+        mhc_head(target_streams, collapsed)
+    else:
+        for row in pl.spmd(CAPACITY, name_hint="mtp_feedback_gather"):
+            request = pl.read(request_ids, [row])
+            value = pl.full([1, D], dtype=pl.BF16, value=0.0)
+            pools = pl.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=-1)
+            valid = pl.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=0)
+            if request >= 0:
+                value = cached_hidden[request:request + 1, :]
+                pools = cached_pools[request:request + 1, :]
+                valid = cached_valid[request:request + 1, :]
+            collapsed[row:row + 1, :] = value
+            selected_pools[row:row + 1, :] = pools
+            selected_valid[row:row + 1, :] = valid
+    feedback = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
+    rmsnorm(collapsed, feedback_norm, feedback)
+    projected = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
+    mtp_projection(embedding_rows, feedback, enorm, hnorm, eh_proj, projected)
+    seed_hc_streams(projected, x_hc)
+    return x_hc, selected_pools, selected_valid
+
+
+@pl.jit.host
+def l3_prefill_mtp_prepare(
+    target_streams: pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.BF16],
+    embedding_rows: pl.Tensor[[RANKS, CAPACITY, D], pl.BF16],
+    feedback_norm: pl.Tensor[[RANKS, D], pl.BF16],
+    enorm: pl.Tensor[[RANKS, D], pl.BF16],
+    hnorm: pl.Tensor[[RANKS, D], pl.BF16],
+    eh_proj: pl.Tensor[[RANKS, D, 2 * D], pl.BF16],
+    request_ids: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    cached_hidden: pl.Tensor[[RANKS, BATCH, D], pl.BF16],
+    cached_pools: pl.Tensor[[RANKS, BATCH, KPOOL_SELECT_K], pl.INT32],
+    cached_valid: pl.Tensor[[RANKS, BATCH, KPOOL_SELECT_K], pl.INT32],
+    selected_pools: pl.InOut[pl.Tensor[[RANKS, CAPACITY, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.InOut[pl.Tensor[[RANKS, CAPACITY, KPOOL_SELECT_K], pl.INT32]],
+    x_hc: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.BF16]],
+    recycle: pl.Scalar[pl.INT32],
+):
+    for rank in pl.unroll(RANKS):
+        prefill_mtp_prepare(target_streams[rank], embedding_rows[rank], feedback_norm[rank],
+                            enorm[rank], hnorm[rank], eh_proj[rank], request_ids[rank],
+                            cached_hidden[rank], cached_pools[rank], cached_valid[rank],
+                            selected_pools[rank], selected_valid[rank], x_hc[rank], recycle, device=rank)
+
+
+@pl.jit
+def prefill_mtp_head(
+    head_hidden: pl.Tensor[[LOGIT_ROWS, D], pl.BF16],
+    final_norm: pl.Tensor[[D], pl.BF16],
+    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    selected_pools: pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32],
+    selected_valid: pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32],
+    query_start_loc: pl.Tensor[[BATCH + 1], pl.INT32],
+    cached_hidden: pl.InOut[pl.Tensor[[BATCH, D], pl.BF16]],
+    cached_pools: pl.InOut[pl.Tensor[[BATCH, KPOOL_SELECT_K], pl.INT32]],
+    cached_valid: pl.InOut[pl.Tensor[[BATCH, KPOOL_SELECT_K], pl.INT32]],
+    logits: pl.Out[pl.Tensor[[BATCH, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+):
+    for request in pl.spmd(BATCH, name_hint="mtp_feedback_commit"):
+        begin = pl.read(query_start_loc, [request])
+        end = pl.read(query_start_loc, [request + 1])
+        if end > begin:
+            cached_hidden[request:request + 1, :] = head_hidden[request:request + 1, :]
+            cached_pools[request:request + 1, :] = selected_pools[end - 1:end, :]
+            cached_valid[request:request + 1, :] = selected_valid[end - 1:end, :]
+    selected = head_hidden[0:BATCH, 0:D]
+    lm_head_mtp_logits(selected, final_norm, weight, logits)
+    return cached_hidden, cached_pools, cached_valid, logits
+
+
+@pl.jit.host
+def l3_prefill_mtp_head(
+    head_hidden: pl.Tensor[[RANKS, LOGIT_ROWS, D], pl.BF16],
+    final_norm: pl.Tensor[[RANKS, D], pl.BF16],
+    weight: pl.Tensor[[RANKS, FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    selected_pools: pl.Tensor[[RANKS, CAPACITY, KPOOL_SELECT_K], pl.INT32],
+    selected_valid: pl.Tensor[[RANKS, CAPACITY, KPOOL_SELECT_K], pl.INT32],
+    query_start_loc: pl.Tensor[[RANKS, BATCH + 1], pl.INT32],
+    cached_hidden: pl.InOut[pl.Tensor[[RANKS, BATCH, D], pl.BF16]],
+    cached_pools: pl.InOut[pl.Tensor[[RANKS, BATCH, KPOOL_SELECT_K], pl.INT32]],
+    cached_valid: pl.InOut[pl.Tensor[[RANKS, BATCH, KPOOL_SELECT_K], pl.INT32]],
+    logits: pl.Out[pl.Tensor[[RANKS, BATCH, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+):
+    for rank in pl.unroll(RANKS):
+        prefill_mtp_head(head_hidden[rank], final_norm[rank], weight[rank],
+                         selected_pools[rank], selected_valid[rank], query_start_loc[rank],
+                         cached_hidden[rank], cached_pools[rank], cached_valid[rank], logits[rank], device=rank)
 
 
 def production_launch_plan() -> tuple[tuple, ...]:
@@ -2195,6 +2304,7 @@ def production_step_ordinals(step: tuple, *, dispatch_index: int = 0) -> dict[st
     layer = step[0]
     ordinals = {
         "bb_ord": layer,
+        "skip_topk": 0,
         "kda_ord": layer - layer // 4,
         "dsa_ord": layer // 4,
         "dense_ord": layer % DENSE_NUM_LAYERS,
@@ -2298,7 +2408,7 @@ def _alloc_name_of(param: str, overrides: dict[str, str]) -> str:
 def _production_geometry() -> dict[str, int]:
     """Import-frozen query/cache dimensions, collective ABI and shared weight layout."""
     return {
-        "version": 3, "shared_int8_nz": 1, "tp": TP_SIZE, "ep": EP_SIZE, "capacity": CAPACITY,
+        "version": 6, "mtp_cache": 1, "cache_tokens": CACHE_TOKENS, "native_mla_int8": 1, "shared_int8_nz": 1, "tp": TP_SIZE, "ep": EP_SIZE, "capacity": CAPACITY,
         "max_seq_len": MAX_SEQ_LEN, "batch": BATCH, "latent_rows": LATENT_ROWS,
         "pool_axis": POOL_AXIS,
     }
@@ -2307,6 +2417,7 @@ def _production_geometry() -> dict[str, int]:
 def compile_production(
     runtime_dir: Path, device_ids: list[int], *, platform: str = "a2a3", mode: str = "rt",
     programs: tuple[str, ...] | None = None,
+    auxiliaries: bool = True,
 ) -> dict:
     """Compile the production programs and record the artifact manifest.
 
@@ -2343,6 +2454,14 @@ def compile_production(
             "(logs_t29/, logs_t30/README.md); recover it from git tag "
             "glm53-pretrim-baseline and recompile there"
         )
+    if auxiliaries:
+        auxiliary = {}
+        for name, entry in (("reset", l3_reset_request_caches), ("head_logits", l3_prefill_lm_head_logits),
+                            ("snapshot", l3_copy_request_snapshot), ("mtp_prepare", l3_prefill_mtp_prepare),
+                            ("mtp_head", l3_prefill_mtp_head)):
+            compiled = entry.compile(config=config)
+            auxiliary[name] = str(compiled.output_dir)
+        manifest["_auxiliary"] = auxiliary
     (runtime_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return load_production(runtime_dir, device_ids, platform=platform)
 
@@ -2370,19 +2489,27 @@ def load_production(runtime_dir: Path, device_ids: list[int], *, platform: str =
     if manifest.get("_geometry") != _production_geometry():
         raise ValueError(
             "runtime query/cache geometry, collective ABI or shared weight layout differs; recompile "
-            "with matching --tp, --ep, --capacity and --max-seq-len"
+            "with matching --tp, --ep, --capacity, --max-seq-len and --cache-tokens"
         )
     programs_present = [key for key in manifest if not key.startswith("_")]
     unknown = [key for key in programs_present if key not in RT_PROGRAMS]
     if unknown:
         raise ValueError(f"rt manifest carries unknown programs {unknown}")
-    return {
+    result = {
         program: DistributedCompiledProgram.from_dir(
             manifest[program], platform=platform,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
         )
         for program in programs_present
     }
+    if "_auxiliary" in manifest:
+        result["_auxiliary"] = {
+            name: DistributedCompiledProgram.from_dir(path, platform=platform,
+                  distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0))
+            for name, path in manifest["_auxiliary"].items()
+        }
+    return result
+
 
 GLM_TENSORS = (
     "embedding_rows",
@@ -2400,6 +2527,7 @@ GLM_TENSORS = (
     "pool_slots",
     "pool_blocks",
     "block_table",
+    "cache_page_owners",
     "logit_row_indices",
     "active_tokens",
     "kda_tri_incl",
@@ -2422,13 +2550,17 @@ GLM_TENSORS = (
     "kda_o_norm",
     "kda_w_o",
     "mla_w_q_a",
+    "mla_w_q_a_scale",
     "mla_q_a_norm",
     "mla_w_q_b",
+    "mla_w_q_b_scale",
     "mla_w_kv_a",
+    "mla_w_kv_a_scale",
     "mla_kv_a_norm",
     "mla_w_k",
     "mla_w_v",
     "mla_w_o",
+    "mla_w_o_scale",
     "idx_w_q_b",
     "idx_w_k",
     "idx_k_norm_w",
@@ -2487,6 +2619,7 @@ GLM_TENSORS = (
     "index_k",
     "index_scores",
     "selected_pools",
+    "selected_valid",
     "mixed_qkv",
     "decay",
     "beta",
@@ -2517,13 +2650,17 @@ GLM_WEIGHT_STACKS = (
     ("kda_o_norm", "kda.o_norm"),
     ("kda_w_o", "kda.w_o"),
     ("mla_w_q_a", "mla.w_q_a"),
+    ("mla_w_q_a_scale", "mla.w_q_a_scale"),
     ("mla_q_a_norm", "mla.q_a_norm"),
     ("mla_w_q_b", "mla.w_q_b"),
+    ("mla_w_q_b_scale", "mla.w_q_b_scale"),
     ("mla_w_kv_a", "mla.w_kv_a"),
+    ("mla_w_kv_a_scale", "mla.w_kv_a_scale"),
     ("mla_kv_a_norm", "mla.kv_a_norm"),
     ("mla_w_k", "mla.w_k"),
     ("mla_w_v", "mla.w_v"),
     ("mla_w_o", "mla.w_o"),
+    ("mla_w_o_scale", "mla.w_o_scale"),
     ("idx_w_q_b", "indexer.w_q_b"),
     ("idx_w_k", "indexer.w_k"),
     ("idx_k_norm_w", "indexer.k_norm_w"),
@@ -2588,6 +2725,7 @@ WORKSPACES = {
     "index_k": ((CAPACITY, INDEX_DIM), torch.bfloat16),
     "index_scores": ((CAPACITY, POOL_AXIS), torch.float32),
     "selected_pools": ((CAPACITY, KPOOL_SELECT_K), torch.int32),
+    "selected_valid": ((CAPACITY, KPOOL_SELECT_K), torch.int32),
     "mixed_qkv": ((CAPACITY, 3 * LOCAL_KDA_QKV_DIM), torch.bfloat16),
     "decay": ((CAPACITY, LOCAL_KDA_H, KDA_DIM), torch.float32),
     "beta": ((CAPACITY, BETA_PAD), torch.float32),
@@ -2599,11 +2737,11 @@ WORKSPACES = {
 
 OUTPUTS = {"head_hidden": ((LOGIT_ROWS, D), torch.bfloat16)}
 
-# Resident stacks, KDA tables and fixed request-slot maps survive every dispatch.
+# Resident stacks, KDA tables and stable KDA request rows survive every dispatch.
 # Request caches are initialized once and cleared only by reset_requests().
 CONSTANT_STEP_INPUTS = {
     "kda_tri_incl", "kda_tri_strict", "kda_head_onehot", "kda_eye_wide",
-    "block_table", "kda_state_rows", "pool_blocks",
+    "kda_state_rows",
 }
 
 # =====================================================================================
@@ -2634,33 +2772,27 @@ def kda_host_constants() -> dict[str, torch.Tensor]:
     }
 
 
+CACHE_LAYOUTS = {
+    "mla_latent_cache": ((DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA), torch.bfloat16),
+    "index_raw_cache": ((DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH), torch.float32),
+    "index_pool_cache": ((DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM), torch.int8),
+    "index_pool_scale": ((DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH), torch.float32),
+    "kda_conv_state": ((KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM), torch.bfloat16),
+    "kda_recurrent_state": ((KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM), torch.float32),
+}
+
+
 def zeroed_caches() -> dict[str, torch.Tensor]:
-    """Fresh zero pools for session initialization or a complete request reset."""
-    return {
-        "mla_latent_cache": torch.zeros(
-            DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA, dtype=torch.bfloat16
-        ),
-        "index_raw_cache": torch.zeros(
-            DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH, dtype=torch.float32
-        ),
-        "index_pool_cache": torch.zeros(
-            DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM, dtype=torch.int8
-        ),
-        "index_pool_scale": torch.zeros(
-            DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH, dtype=torch.float32
-        ),
-        "kda_conv_state": torch.zeros(
-            KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM, dtype=torch.bfloat16
-        ),
-        "kda_recurrent_state": torch.zeros(
-            KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM, dtype=torch.float32
-        ),
-    }
+    """Build bounded host fixtures; production clears its device allocations directly."""
+    return {name: torch.zeros(shape, dtype=dtype) for name, (shape, dtype) in CACHE_LAYOUTS.items()}
 
 
 def prepare_step_inputs(
     weights: ResidentPrefillWeights, sequences: list[list[int]],
     *, kv_seq_lens: torch.Tensor | None = None,
+    visual_features: dict[int, torch.Tensor] | None = None,
+    cache_pages: SharedCachePages | None = None,
+    mtp: bool = False,
 ) -> dict:
     """Pack only new query tokens into stable request-owned cache slots."""
     if len(sequences) != BATCH:
@@ -2678,12 +2810,38 @@ def prepare_step_inputs(
     embedding_rows = torch.zeros(CAPACITY, D, dtype=torch.bfloat16)
     if total:
         ids = torch.tensor([token for seq in sequences for token in seq], dtype=torch.int64)
-        embedding_rows[:total] = weights.lookup_rows(ids)
+        embedding_rows[:total] = weights.lookup_rows(ids, mtp=mtp)
+    if visual_features:
+        from models.glm5_3_flash.vision.config import IMAGE_TOKEN_ID
+
+        offset = 0
+        if any(type(slot) is not int or slot not in range(BATCH) for slot in visual_features):
+            raise ValueError("visual feature keys must be request slots")
+        for slot, sequence in enumerate(sequences):
+            if slot in visual_features:
+                features = visual_features[slot]
+                indices = torch.tensor([row + offset for row, token in enumerate(sequence) if token == IMAGE_TOKEN_ID])
+                if features.dtype != torch.bfloat16 or tuple(features.shape) != (indices.numel(), D):
+                    raise ValueError("visual features must be BF16 [image_placeholder_count, hidden_size]")
+                if not torch.isfinite(features).all():
+                    raise ValueError("visual features must be finite")
+                embedding_rows[indices.long()] = features.cpu()
+            offset += len(sequence)
     query_start_loc = torch.cumsum(
         torch.cat([torch.zeros(1, dtype=torch.int64), lengths]), 0
     ).to(torch.int32)
-    block_table = torch.arange(BATCH * TABLE_MAX, dtype=torch.int32).reshape(BATCH, TABLE_MAX)
-    pool_table = torch.arange(BATCH * POOL_TABLE_MAX, dtype=torch.int32).reshape(BATCH, POOL_TABLE_MAX)
+    if cache_pages is None:
+        if CACHE_TOKENS < BATCH * TABLE_MAX * BLOCK_SIZE:
+            raise ValueError("a bounded shared cache requires caller-owned SharedCachePages")
+        block_table = torch.arange(BATCH * TABLE_MAX, dtype=torch.int32).reshape(BATCH, TABLE_MAX)
+        pool_table = torch.arange(BATCH * POOL_TABLE_MAX, dtype=torch.int32).reshape(BATCH, POOL_TABLE_MAX)
+        pool_offsets = torch.arange(BATCH, dtype=torch.int32) * POOL_STRIDE
+        owners = torch.arange(LATENT_BLOCKS, dtype=torch.int32) // TABLE_MAX
+    else:
+        block_table = cache_pages.table.clone()
+        pool_table = cache_pages.pool_table()
+        pool_offsets = cache_pages.pool_offsets()
+        owners = cache_pages.owners.clone()
     metadata = build_forward_metadata(
         query_start_loc, kv_seq_lens=previous,
         mla_block_table=block_table, index_block_table=block_table,
@@ -2691,8 +2849,8 @@ def prepare_step_inputs(
         tp_size=TP_SIZE,
     )
     step = build_indexer_chunk_metadata(
-        metadata, block_table, torch.arange(BATCH, dtype=torch.int32) * POOL_STRIDE,
-        pools_cap=POOL_AXIS, pool_rows=POOL_TABLE_ROWS,
+        metadata, block_table, pool_offsets,
+        pools_cap=POOL_AXIS, pool_rows=POOL_TABLE_ROWS, pool_block_table=pool_table,
     )
     for name in ("seg_start", "pool_count_tok", "tail_start", "tail_count", "kv_len_tok"):
         step[name] = _pad_to(step[name], CAPACITY, 0)
@@ -2705,6 +2863,7 @@ def prepare_step_inputs(
         "index_slots": _pad_to(metadata.index_slots, CAPACITY, -1),
         "kda_state_rows": metadata.kda_state_rows,
         "block_table": block_table,
+        "cache_page_owners": owners,
         "logit_row_indices": _pad_to(logit_rows, LOGIT_ROWS, 0),
         "active_tokens": torch.tensor([total], dtype=torch.int32),
         **step,
@@ -2738,10 +2897,7 @@ def host_lm_head_logits(
     ``head_rows`` is ``[rows, D]`` BF16; the result is FP32 ``[rows, VOCAB]`` with
     no BF16 rounding between normalization and projection.
     """
-    hidden = head_rows.to(torch.float32)
-    inverse_rms = torch.rsqrt(hidden.square().mean(dim=-1, keepdim=True) + FLASH.rms_norm_eps)
-    normalized = hidden * inverse_rms * final_norm_w.to(torch.float32)
-    return normalized @ lm_head.to(torch.float32).t()
+    return reference_lm_head_logits(head_rows, final_norm_w, lm_head)
 
 
 def _load_final_norm(checkpoint: Checkpoint) -> torch.Tensor:
@@ -2815,6 +2971,7 @@ class ResidentPrefillSession:
         host_num_threads: int | None = None,
         prefix_snapshot_entries: int = 0, prefix_snapshot_max_bytes: int = 128 * 1024**2,
         lm_head_backend: str | None = None,
+        enable_mtp: bool = False,
     ):
         if host_num_threads is not None and (type(host_num_threads) is not int or host_num_threads <= 0):
             raise ValueError("host_num_threads must be a positive integer or None")
@@ -2831,13 +2988,23 @@ class ResidentPrefillSession:
         self._host_num_threads = host_num_threads
         self._previous_host_num_threads = None
         self.checkpoint = checkpoint
-        self.programs = programs
+        self.auxiliary_programs = programs.get("_auxiliary", {})
+        self.programs = {name: value for name, value in programs.items() if not name.startswith("_")}
+        programs = self.programs
+        self.enable_mtp = bool(enable_mtp)
+        self._mtp_lengths = torch.zeros(BATCH, dtype=torch.int32)
+        self._mtp_ready = set()
+        self._mtp_logits = torch.empty((BATCH, FLASH.vocab_size), dtype=torch.float32)
+        self._last_chunk_sequences = None
+        self._last_chunk_slots = None
+        self.mtp_stats = {"proposed": 0, "accepted": 0, "rejected": 0, "rounds": 0}
         self.device_ids = list(device_ids)
         self.platform = platform
         self.run_config = run_config
         self.runtime = None
         self._lm_head_program = None
         self._device_lm_head = None
+        self._device_mtp_head = None
         self._device_final_norm = None
         self._device_logits = None
         self._host_logits_shards = None
@@ -2845,10 +3012,15 @@ class ResidentPrefillSession:
         self.lm_head_backend = (
             os.environ.get("GLM53_LM_HEAD_BACKEND", "npu") if lm_head_backend is None else lm_head_backend
         )
+        if self.enable_mtp and self.lm_head_backend != "npu":
+            raise ValueError("MTP requires the NPU LM head")
+        self._mtp_prepare_program = None
+        self._mtp_head_program = None
         self._context = None
         self.calls = 0
         self.guard_events: list[str] = []
         self._seq_lens = torch.zeros(BATCH, dtype=torch.int32)
+        self.cache_pages = SharedCachePages(BATCH, MAX_SEQ_LEN, CACHE_TOKENS)
         self._invalid_slots: set[int] = set()
         self._reset_program = None
         self._dispatch_error: BaseException | None = None
@@ -2912,12 +3084,16 @@ class ResidentPrefillSession:
             raise RuntimeError("the resident prefill session is already open")
         if self.run_config is not None and self.run_config.enable_chip_swimlane:
             raise ValueError("resident chunk sessions cannot replay two-pass swimlane dispatches")
+        self.cache_pages = SharedCachePages(BATCH, MAX_SEQ_LEN, CACHE_TOKENS)
+        self._mtp_lengths.zero_()
+        self._mtp_ready.clear()
+        self._last_chunk_sequences = None
         checkpoint_start = time.monotonic()
         checkpoint, programs, device_ids = self.checkpoint, self.programs, self.device_ids
         platform = self.platform
         plan, arity, step_program = self.plan, self.arity, self.step_program
         weights = ResidentPrefillWeights.load(
-            checkpoint, tp_size=TP_SIZE, ep_size=EP_SIZE, model=_prefill_model()
+            checkpoint, tp_size=TP_SIZE, ep_size=EP_SIZE, model=_prefill_model(), mla_mode="native"
         )
         final_norm_w = _load_final_norm(checkpoint)
         lm_head = weights.lm_head().to(torch.float32) if self.lm_head_backend == "cpu" else None
@@ -2931,23 +3107,28 @@ class ResidentPrefillSession:
         self.checkpoint_setup_seconds = self.runtime_started_at - checkpoint_start
         print("GLM_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
         # Auxiliary cache maintenance shares the prepared worker, outside the forward manifest.
-        reset_program = l3_reset_request_caches.compile(config=config)
+        reset_program = self.auxiliary_programs.get("reset") or l3_reset_request_caches.compile(config=config)
         primary, extras = programs["seed"], [programs[name] for name in RT_PROGRAMS[1:]]
         extras.append(reset_program)
         lm_head_program = None
         if self.lm_head_backend == "npu":
-            lm_head_program = l3_prefill_lm_head_logits.compile(config=config)
+            lm_head_program = self.auxiliary_programs.get("head_logits") or l3_prefill_lm_head_logits.compile(config=config)
             extras.append(lm_head_program)
         snapshot_program = None
         if self._prefix_snapshot_entries:
-            snapshot_program = l3_copy_request_snapshot.compile(config=config)
+            snapshot_program = self.auxiliary_programs.get("snapshot") or l3_copy_request_snapshot.compile(config=config)
             extras.append(snapshot_program)
+        mtp_prepare_program = mtp_head_program = None
+        if self.enable_mtp:
+            mtp_prepare_program = self.auxiliary_programs.get("mtp_prepare") or l3_prefill_mtp_prepare.compile(config=config)
+            mtp_head_program = self.auxiliary_programs.get("mtp_head") or l3_prefill_mtp_head.compile(config=config)
+            extras.extend((mtp_prepare_program, mtp_head_program))
         context = primary.prepare(
             config, extra_compiled=extras, persistent=True, reset_persistent_windows=False,
         )
         runtime = context.__enter__()
         try:
-            inputs = {**prepare_step_inputs(weights, [[] for _ in range(BATCH)]), **zeroed_caches()}
+            inputs = prepare_step_inputs(weights, [[] for _ in range(BATCH)], cache_pages=self.cache_pages)
             per_rank = [{} for _ in device_ids]
             for rank in range(RANKS):
                 tensors = per_rank[rank]
@@ -2955,6 +3136,9 @@ class ResidentPrefillSession:
                     stack = _PARAM_TO_STACK.get(name)
                     if stack is not None:
                         shape, dtype = weights.tensor_layouts[stack]
+                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
+                    elif name in CACHE_LAYOUTS:
+                        shape, dtype = CACHE_LAYOUTS[name]
                         tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
                     elif name in OUTPUTS:
                         shape, dtype = OUTPUTS[name]
@@ -2989,6 +3173,10 @@ class ResidentPrefillSession:
                 )
                 for name in GLM_TENSORS
             }
+            runtime.run(reset_program, stacked["mla_latent_cache"], stacked["index_raw_cache"],
+                        stacked["index_pool_cache"], stacked["index_pool_scale"], stacked["kda_conv_state"],
+                        stacked["kda_recurrent_state"], stacked["cache_page_owners"], (1 << BATCH) - 1,
+                        config=config)
             # Per-step parameter -> buffer binding (design S2.1 ping-pong): every
             # launch's signature names must resolve to exactly one allocated tensor
             # before any dispatch happens, so a plan/ABI drift fails loudly here
@@ -3002,19 +3190,44 @@ class ResidentPrefillSession:
                 ]
                 if unbound:
                     raise ValueError(f"step {step} parameters have no allocated tensor: {unbound}")
+            for name, (shape, dtype) in weights.tensor_layouts.items():
+                if name not in _STACK_TO_PARAM:
+                    stacked[name] = StackedDeviceTensor([rank[name] for rank in per_rank],
+                                   (RANKS, *shape), tuple(range(RANKS)))
+            if self.enable_mtp:
+                mtp_layouts = {
+                    "mtp_cached_hidden": ((BATCH, D), torch.bfloat16, 0),
+                    "mtp_cached_pools": ((BATCH, KPOOL_SELECT_K), torch.int32, -1),
+                    "mtp_cached_valid": ((BATCH, KPOOL_SELECT_K), torch.int32, 0),
+                    "mtp_selected_pools": ((CAPACITY, KPOOL_SELECT_K), torch.int32, -1),
+                    "mtp_selected_valid": ((CAPACITY, KPOOL_SELECT_K), torch.int32, 0),
+                }
+                for name, (shape, dtype, fill) in mtp_layouts.items():
+                    value = torch.full(shape, fill, dtype=dtype)
+                    for rank in range(RANKS):
+                        per_rank[rank][name] = runtime.alloc_tensor(shape, dtype, init=value, worker_id=rank)
+                    stacked[name] = StackedDeviceTensor([rank[name] for rank in per_rank],
+                                   (RANKS, *shape), tuple(range(RANKS)))
             head_rows = torch.empty((RANKS, LOGIT_ROWS, D), dtype=torch.bfloat16)
             device_lm_head, device_final_norm, device_logits, host_logits_shards = None, None, None, None
+            device_mtp_head = None
             if lm_head_program is not None:
-                head_weights, head_outputs = [], []
+                head_weights, mtp_head_weights, head_outputs = [], [], []
                 head = weights.lm_head()
                 for rank in range(RANKS):
                     shard = torch.zeros((FP32_HEAD_VOCAB_PAD, D), dtype=torch.float32)
                     shard[:LOCAL_VOCAB].copy_(head[rank * LOCAL_VOCAB : (rank + 1) * LOCAL_VOCAB])
                     head_weights.append(runtime.alloc_tensor(shard.shape, shard.dtype, init=shard, worker_id=rank))
+                    if self.enable_mtp:
+                        shard.zero_()
+                        shard[:LOCAL_VOCAB].copy_(weights.mtp_head_shard(rank))
+                        mtp_head_weights.append(runtime.alloc_tensor(shard.shape, shard.dtype, init=shard, worker_id=rank))
                     output_shape = (BATCH, FP32_HEAD_VOCAB_PAD)
                     head_outputs.append(runtime.alloc_tensor(output_shape, torch.float32, worker_id=rank))
                 workers = tuple(range(RANKS))
                 device_lm_head = StackedDeviceTensor(head_weights, (RANKS, FP32_HEAD_VOCAB_PAD, D), workers)
+                if self.enable_mtp:
+                    device_mtp_head = StackedDeviceTensor(mtp_head_weights, (RANKS, FP32_HEAD_VOCAB_PAD, D), workers)
                 device_final_norm = StackedDeviceTensor(
                     [rank["norm.final_norm"] for rank in per_rank], (RANKS, D), workers,
                 )
@@ -3028,9 +3241,12 @@ class ResidentPrefillSession:
         self.runtime, self.config = runtime, config
         self._lm_head_program = lm_head_program
         self._device_lm_head, self._device_final_norm = device_lm_head, device_final_norm
+        self._device_mtp_head = device_mtp_head
         self._device_logits, self._host_logits_shards = device_logits, host_logits_shards
         self._reset_program = reset_program
         self._snapshot_program = snapshot_program
+        self._mtp_prepare_program = mtp_prepare_program
+        self._mtp_head_program = mtp_head_program
         self._snapshot_generations = [0] * self._prefix_snapshot_entries
         if self._prefix_snapshot_entries:
             try:
@@ -3064,6 +3280,7 @@ class ResidentPrefillSession:
         self._snapshot_program = None
         self._lm_head_program = None
         self._device_lm_head = None
+        self._device_mtp_head = None
         self._device_final_norm = None
         self._device_logits = None
         self._host_logits_shards = None
@@ -3101,14 +3318,19 @@ class ResidentPrefillSession:
             raise ValueError("prefix snapshot length must preserve the KDA recurrence boundary")
         return bank, generation, length
 
-    def _copy_snapshot(self, slot: int, bank: int, *, restore: bool) -> None:
+    def _copy_snapshot(self, slot: int, bank: int, length: int, *, restore: bool) -> None:
         self._require_healthy_runtime()
         if self._snapshot_program is None or type(slot) is not int or not 0 <= slot < BATCH:
             raise ValueError("prefix snapshots are disabled or the request slot is invalid")
         arguments = [self.stacked[name] for name in PREFIX_CACHE_FAMILIES]
         arguments.extend(self._snapshot_banks[name] for name in PREFIX_CACHE_FAMILIES)
+        table = self.cache_pages.table.contiguous()
+        for rank in range(RANKS):
+            self.runtime.copy_to(self.per_rank[rank]["block_table"].data_ptr, table.data_ptr(),
+                                 table.numel() * table.element_size(), worker_id=rank)
         try:
-            self.runtime.run(self._snapshot_program, *arguments, slot, bank, int(restore), config=self.config)
+            self.runtime.run(self._snapshot_program, *arguments, self.stacked["block_table"],
+                             length, slot, bank, int(restore), config=self.config)
         except BaseException as error:
             self._dispatch_error = error
             raise
@@ -3121,10 +3343,12 @@ class ResidentPrefillSession:
             raise ValueError("prefix capture requires a valid active request slot")
         if generation <= self._snapshot_generations[bank] or int(self._seq_lens[slot]) != length:
             raise ValueError("prefix capture generation or committed boundary is stale")
+        if self.enable_mtp and int(self._mtp_lengths[slot]) != length:
+            raise ValueError("MTP prefix capture requires refreshed target feedback")
         self._snapshot_descriptors[bank] = None
         self._snapshot_generations[bank] = generation
         try:
-            self._copy_snapshot(slot, bank, restore=False)
+            self._copy_snapshot(slot, bank, length, restore=False)
         except BaseException:
             self._invalid_slots.add(slot)
             raise
@@ -3138,9 +3362,14 @@ class ResidentPrefillSession:
             raise ValueError("prefix snapshot generation or length is stale")
         if type(slot) is not int or not 0 <= slot < BATCH or int(self._seq_lens[slot]) != 0:
             raise ValueError("prefix restore requires a reset request slot")
+        lengths = self._seq_lens.clone()
+        lengths[slot] = length
+        self.cache_pages.reserve(lengths)
         self._invalid_slots.add(slot)
-        self._copy_snapshot(slot, bank, restore=True)
+        self._copy_snapshot(slot, bank, length, restore=True)
         self._seq_lens[slot] = length
+        self._mtp_lengths[slot] = length if self.enable_mtp else 0
+        self._mtp_ready.discard(slot)
         self._invalid_slots.discard(slot)
 
     def reset_requests(self, request_slots: list[int]) -> None:
@@ -3154,19 +3383,37 @@ class ResidentPrefillSession:
         # Mark requested slots invalid through the distributed clear.
         self._invalid_slots.update(slots)
         slot_mask = sum(1 << slot for slot in slots)
+        owners = self.cache_pages.owners.contiguous()
+        for rank in range(RANKS):
+            self.runtime.copy_to(self.per_rank[rank]["cache_page_owners"].data_ptr, owners.data_ptr(),
+                                 owners.numel() * owners.element_size(), worker_id=rank)
         self.runtime.run(
             self._reset_program,
             self.stacked["mla_latent_cache"], self.stacked["index_raw_cache"],
             self.stacked["index_pool_cache"], self.stacked["index_pool_scale"],
             self.stacked["kda_conv_state"], self.stacked["kda_recurrent_state"],
-            slot_mask, config=self.config,
+            self.stacked["cache_page_owners"], slot_mask, config=self.config,
         )
         self._seq_lens[slots] = 0
+        self.cache_pages.release(slots)
+        self._mtp_lengths[slots] = 0
+        self._mtp_ready.difference_update(slots)
+        if self.enable_mtp:
+            for name, width, dtype, fill in (("mtp_cached_hidden", D, torch.bfloat16, 0),
+                                            ("mtp_cached_pools", KPOOL_SELECT_K, torch.int32, -1),
+                                            ("mtp_cached_valid", KPOOL_SELECT_K, torch.int32, 0)):
+                row = torch.full((1, width), fill, dtype=dtype)
+                for rank in range(RANKS):
+                    for slot in slots:
+                        self.runtime.copy_to(self.per_rank[rank][name].data_ptr, row.data_ptr(),
+                                             row.numel() * row.element_size(), dst_offset=slot * row.numel() * row.element_size(),
+                                             worker_id=rank)
         self._invalid_slots.difference_update(slots)
 
     def forward_chunks(
         self, token_sequences: list[list[int]], request_slots: list[int],
         kv_seq_lens: list[int] | None = None,
+        *, visual_features: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Append only new query tokens to the selected persistent request slots."""
         self._require_healthy_runtime()
@@ -3185,7 +3432,16 @@ class ResidentPrefillSession:
         sequences = [[] for _ in range(BATCH)]
         for slot, tokens in zip(slots, token_sequences, strict=True):
             sequences[slot] = list(tokens)
-        inputs = prepare_step_inputs(self.weights, sequences, kv_seq_lens=self._seq_lens)
+        if visual_features is not None and set(visual_features) - set(slots):
+            raise ValueError("visual features must belong to active request slots")
+        new_lengths = self._seq_lens + torch.tensor([len(tokens) for tokens in sequences], dtype=torch.int32)
+        reservation = self.cache_pages.reserve(new_lengths)
+        try:
+            inputs = prepare_step_inputs(self.weights, sequences, kv_seq_lens=self._seq_lens,
+                                         visual_features=visual_features, cache_pages=self.cache_pages)
+        except BaseException:
+            self.cache_pages.cancel_reservation(reservation)
+            raise
         try:
             logits = self._run_step(inputs)
         except BaseException:
@@ -3194,6 +3450,119 @@ class ResidentPrefillSession:
             raise
         for slot, tokens in zip(slots, token_sequences, strict=True):
             self._seq_lens[slot] += len(tokens)
+        self._last_chunk_sequences = [list(tokens) for tokens in token_sequences]
+        self._last_chunk_slots = slots
+        return logits[slots]
+
+    def update_mtp(self, next_token_ids: list[int]) -> torch.Tensor:
+        """Refresh the MTP prefix with true target feedback and one shifted token per query row."""
+        if not self.enable_mtp or self._last_chunk_sequences is None:
+            raise RuntimeError("MTP needs an enabled session and a completed target chunk")
+        slots = self._last_chunk_slots
+        sequences = self._last_chunk_sequences
+        if len(next_token_ids) != len(slots):
+            raise ValueError("MTP needs one next token per target request")
+        expected = [int(self._seq_lens[slot]) - len(tokens) for slot, tokens in zip(slots, sequences)]
+        if self._mtp_lengths[slots].tolist() != expected:
+            raise RuntimeError("MTP cache must be refreshed after every target chunk")
+        shifted = [tokens[1:] + [int(next_token)] for tokens, next_token in zip(sequences, next_token_ids)]
+        logits = self._run_mtp(shifted, slots, recycle=False)
+        self._mtp_ready.update(slots)
+        self._last_chunk_sequences = None
+        return logits
+
+    def propose_mtp(self, request_slots: list[int], count: int) -> dict[int, list[int]]:
+        """Draft with one MTP-owned TopK and roll speculative cache visibility back afterward."""
+        slots = list(request_slots)
+        if not self.enable_mtp or count not in range(1, C.MTP_SPEC_TOKENS + 1):
+            raise ValueError(f"MTP proposal count must be in 1..{C.MTP_SPEC_TOKENS}")
+        if len(set(slots)) != len(slots) or not slots or not set(slots) <= self._mtp_ready:
+            raise ValueError("MTP proposal slots need fresh target feedback")
+        if bool((self._mtp_lengths[slots] + count - 1 > MAX_SEQ_LEN).any()):
+            raise ValueError("MTP proposal exceeds the context limit")
+        base_lengths = self._mtp_lengths.clone()
+        proposed = {slot: [] for slot in slots}
+        for step in range(count):
+            next_ids = self._mtp_logits[slots].argmax(dim=-1).tolist()
+            for slot, token in zip(slots, next_ids):
+                proposed[slot].append(int(token))
+            if step + 1 < count:
+                self._run_mtp([[int(token)] for token in next_ids], slots, recycle=True)
+        # The target verifier consumes only confirmed input tokens. Its KDA states
+        # never advance through a rejected draft. Uncommitted MTP payloads remain
+        # owned but are invisible until a later true-feedback write replaces them.
+        self._mtp_lengths.copy_(base_lengths)
+        self._mtp_ready.difference_update(slots)
+        self.mtp_stats["rounds"] += 1
+        self.mtp_stats["proposed"] += count * len(slots)
+        return proposed
+
+    def _run_mtp(self, token_sequences, slots, *, recycle):
+        self._require_healthy_runtime()
+        sequences = [[] for _ in range(BATCH)]
+        for slot, tokens in zip(slots, token_sequences):
+            sequences[slot] = list(tokens)
+        lengths = self._mtp_lengths + torch.tensor([len(tokens) for tokens in sequences], dtype=torch.int32)
+        reservation = self.cache_pages.reserve(lengths)
+        try:
+            inputs = prepare_step_inputs(self.weights, sequences, kv_seq_lens=self._mtp_lengths,
+                                         cache_pages=self.cache_pages, mtp=True)
+            for slot in slots:
+                if int(self._mtp_lengths[slot]) == 0:
+                    row = int(inputs["query_start_loc"][slot])
+                    inputs["embedding_rows"][row].zero_()
+        except BaseException:
+            self.cache_pages.cancel_reservation(reservation)
+            raise
+        runtime, config, stacked = self.runtime, self.config, self.stacked
+        try:
+            for rank in range(RANKS):
+                for name, value in inputs.items():
+                    runtime.copy_to(self.per_rank[rank][name].data_ptr, value.data_ptr(),
+                                    value.numel() * value.element_size(), worker_id=rank)
+            feedback_norm = stacked["mtp.final_norm"] if recycle else self._device_final_norm
+            runtime.run(self._mtp_prepare_program, stacked["ws_x_hc_a"], stacked["embedding_rows"],
+                        feedback_norm, stacked["mtp.enorm"], stacked["mtp.hnorm"], stacked["mtp.eh_proj"],
+                        stacked["request_ids"], stacked["mtp_cached_hidden"], stacked["mtp_cached_pools"],
+                        stacked["mtp_cached_valid"], stacked["mtp_selected_pools"], stacked["mtp_selected_valid"],
+                        stacked["ws_x_hc_b"], int(recycle), config=config)
+            for program, overrides in (
+                ("dsa_attn", {"x_hc": "ws_x_hc_b", "out_x_hc_mid": "ws_x_hc_a"}),
+                ("moe_ffn", {"x_hc_mid": "ws_x_hc_a", "out_x_hc_out": "ws_x_hc_b"}),
+                ("head", {"x_hc": "ws_x_hc_b"}),
+            ):
+                tensor_names, scalar_names = self.arity[program]
+                index = self._collective_dispatches.get(program, 0)
+                epoch = index + 1
+                if epoch > (2**31 - 1) // 2:
+                    raise OverflowError("collective epochs exhausted; reopen the session")
+                scalars = dict(bb_ord=NUM_LAYERS, dsa_ord=MLA_STACK_LAYERS - 1,
+                               moe_ord=MOE_STACK_LAYERS - 1, attn_epoch=epoch,
+                               moe_epoch=epoch, ffn_epoch=epoch, skip_topk=int(recycle))
+                arguments = []
+                for name in tensor_names:
+                    allocation = _alloc_name_of(name, overrides)
+                    if name in ("selected_pools", "selected_valid"):
+                        allocation = "mtp_" + name
+                    arguments.append(stacked[allocation])
+                arguments.extend(scalars[name] for name in scalar_names)
+                runtime.run(self.programs[program], *arguments, config=config)
+                if program in self._collective_dispatches:
+                    self._collective_dispatches[program] = epoch
+            runtime.run(self._mtp_head_program, stacked["head_hidden"], stacked["mtp.final_norm"],
+                        self._device_mtp_head, stacked["mtp_selected_pools"], stacked["mtp_selected_valid"],
+                        stacked["query_start_loc"], stacked["mtp_cached_hidden"], stacked["mtp_cached_pools"],
+                        stacked["mtp_cached_valid"], self._device_logits, config=config)
+            runtime.copy_stacked_from(self._device_logits, self._host_logits_shards)
+            logits = torch.cat(tuple(shard[:, :LOCAL_VOCAB] for shard in self._host_logits_shards.unbind(0)), dim=1)
+            if not torch.isfinite(logits[slots]).all():
+                raise FloatingPointError("MTP produced nonfinite logits")
+        except BaseException as error:
+            self._dispatch_error = error
+            self._invalid_slots.update(slots)
+            raise
+        self._mtp_lengths.copy_(lengths)
+        self._mtp_logits[slots] = logits[slots]
         return logits[slots]
 
     def forward(self, sequences: list[list[int]]) -> torch.Tensor:
@@ -3330,8 +3699,10 @@ def generate(
     platform: str = "a2a3",
     expect_tokens: dict[int, list[int]] | None = None,
     dump_path: Path | None = None,
+    visual_inputs: dict[int, list] | None = None,
+    spec_tokens: int = 0,
 ):
-    """Generate tokens with the shared resident full-prefix forward session.
+    """Generate incrementally with resident caches and optional MTP verification.
 
     Report legacy ``seconds`` from runtime preparation and step ``seconds`` from
     dispatch, plus separate checkpoint/input setup and end-to-end wall times.
@@ -3339,8 +3710,12 @@ def generate(
     end_to_end_start = time.monotonic()
     from tokenizers import Tokenizer
 
-    if len(prompts) != BATCH:
-        raise ValueError(f"provide exactly {BATCH} prompts")
+    if type(spec_tokens) is not int or spec_tokens not in range(C.MTP_SPEC_TOKENS + 1):
+        raise ValueError(f"spec_tokens must be in 0..{C.MTP_SPEC_TOKENS}")
+    if type(max_new_tokens) is not int or max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be a positive integer")
+    if not 1 <= len(prompts) <= BATCH:
+        raise ValueError(f"provide between 1 and {BATCH} prompts")
 
     tokenizer = Tokenizer.from_file(str(checkpoint.root / "tokenizer.json"))
     tokenizer_config_path = checkpoint.root / "tokenizer_config.json"
@@ -3355,6 +3730,47 @@ def generate(
             chat_template = template_path.read_text()
     eos_ids = _resolve_eos_ids(checkpoint, tokenizer, tokenizer_config)
 
+    visual_features = {}
+    if visual_inputs:
+        from models.glm5_3_flash.vision.forward import VisionEncoder
+        from models.glm5_3_flash.vision.processor import VisualInput
+
+        prompts = list(prompts)
+        packed_visuals = []
+        for request, visuals in visual_inputs.items():
+            if type(request) is not int or request not in range(len(prompts)) or not visuals:
+                raise ValueError("visual inputs need a nonempty list for a valid prompt index")
+            for visual in visuals:
+                if not isinstance(visual, VisualInput):
+                    raise ValueError("visual inputs must be produced by VisionProcessor")
+                packed_visuals.append((request, visual))
+            remainder = prompts[request]
+            expanded = []
+            if "<|image|>" not in remainder and "<|video|>" not in remainder:
+                prompts[request] = "\n".join(visual.prompt_fragment for visual in visuals) + "\n" + remainder
+            else:
+                for visual in visuals:
+                    candidates = [(remainder.find(marker), marker) for marker in ("<|image|>", "<|video|>")
+                                  if marker in remainder]
+                    if not candidates or min(candidates)[1] != visual.marker:
+                        raise ValueError("prompt visual markers must match the supplied visual input order")
+                    before, remainder = remainder.split(visual.marker, 1)
+                    expanded.extend((before, visual.prompt_fragment))
+                if "<|image|>" in remainder or "<|video|>" in remainder:
+                    raise ValueError("each prompt visual marker needs one visual input")
+                prompts[request] = "".join(expanded) + remainder
+        pixels = torch.cat([visual.pixel_values for _, visual in packed_visuals])
+        grid = torch.cat([visual.grid_thw for _, visual in packed_visuals])
+        encoder = VisionEncoder(checkpoint, device_ids[0], platform=platform, compiled=programs.get("_vision"))
+        encoded = encoder(pixels, grid)
+        offset = 0
+        for request, visual in packed_visuals:
+            count = int(visual.grid_thw.prod(dim=-1).sum()) // 4
+            part = encoded[offset:offset + count]
+            visual_features[request] = torch.cat((visual_features[request], part)) if request in visual_features else part
+            offset += count
+        del encoder
+
     sequences = [
         tokenizer.encode(
             prompt if raw_prompts else _render_prompt(prompt, chat_template),
@@ -3362,36 +3778,80 @@ def generate(
         ).ids
         for prompt in prompts
     ]
-    # CAPACITY bounds the PACKED batch (every prompt's rows share it, and each
-    # generated token adds one row per request under full-prefix recompute), so
-    # the guard must sum the whole batch -- a per-sequence check would pass here
-    # and fail mid-generation when the packed total crosses the compiled bound.
-    packed_rows = sum(len(sequence) for sequence in sequences) + max_new_tokens * len(sequences)
-    if packed_rows > CAPACITY:
-        raise ValueError(
-            f"packed prompt rows ({sum(len(sequence) for sequence in sequences)}) plus "
-            f"{max_new_tokens} tokens x {len(sequences)} requests = {packed_rows} rows "
-            f"exceeds the compiled capacity {CAPACITY}; compile a larger capacity"
-        )
+    if any(not sequence for sequence in sequences):
+        raise ValueError("prompts must contain at least one token")
+    if any(len(sequence) + max_new_tokens > MAX_SEQ_LEN for sequence in sequences):
+        raise ValueError(f"prompt and generation exceed the compiled context limit {MAX_SEQ_LEN}")
 
     generated: list[list[int]] = [[] for _ in prompts]
-    finished = [False] * BATCH
+    finished = [False] * len(prompts)
     step_log: list[dict] = []
-    with ResidentPrefillSession(checkpoint, programs, device_ids, platform=platform) as session:
+    with ResidentPrefillSession(checkpoint, programs, device_ids, platform=platform, enable_mtp=bool(spec_tokens)) as session:
         start = session.runtime_started_at
+        logits = torch.empty(len(prompts), FLASH.vocab_size, dtype=torch.float32)
+        remaining = [list(sequence) for sequence in sequences]
+        feature_offsets = [0] * len(prompts)
+        draft_queues = [[] for _ in prompts]
         for step in range(max_new_tokens):
             tick = time.monotonic()
-            logits = session.forward(sequences)
-            next_ids = logits[:BATCH].argmax(dim=-1).tolist()
+            dispatch_seconds = input_setup_seconds = 0.0
+            while any(remaining):
+                budget, slots, chunks, features = CAPACITY, [], [], {}
+                for request, tokens in enumerate(remaining):
+                    if not tokens or budget == 0:
+                        continue
+                    count = min(len(tokens), budget)
+                    if count < len(tokens):
+                        count -= count % CHUNK
+                    if count == 0:
+                        continue
+                    chunk, remaining[request] = tokens[:count], tokens[count:]
+                    slots.append(request)
+                    chunks.append(chunk)
+                    if request in visual_features:
+                        from models.glm5_3_flash.vision.config import IMAGE_TOKEN_ID
+
+                        count_visual = chunk.count(IMAGE_TOKEN_ID)
+                        begin = feature_offsets[request]
+                        if count_visual:
+                            features[request] = visual_features[request][begin:begin + count_visual]
+                            feature_offsets[request] += count_visual
+                    budget -= count
+                dispatch_start = time.monotonic()
+                partial = session.forward_chunks(chunks, slots, visual_features=features)
+                dispatch_seconds += time.monotonic() - session.last_dispatch_started_at
+                input_setup_seconds += session.last_dispatch_started_at - dispatch_start
+                logits[slots] = partial
+                if spec_tokens:
+                    next_tokens = [remaining[slot][0] if remaining[slot] else int(partial[index].argmax())
+                                   for index, slot in enumerate(slots)]
+                    session.update_mtp(next_tokens)
+            next_ids = logits.argmax(dim=-1).tolist()
             for request, token in enumerate(next_ids):
                 if not finished[request]:
+                    if draft_queues[request]:
+                        candidate = draft_queues[request].pop(0)
+                        if candidate == int(token):
+                            session.mtp_stats["accepted"] += 1
+                        else:
+                            session.mtp_stats["rejected"] += 1
+                            draft_queues[request].clear()
                     generated[request].append(int(token))
                     sequences[request].append(int(token))
                     finished[request] = int(token) in eos_ids
+                    if not finished[request]:
+                        remaining[request] = [int(token)]
+            if spec_tokens and step + 1 < max_new_tokens:
+                draft_slots = [request for request in range(len(prompts))
+                               if not finished[request] and not draft_queues[request]]
+                if draft_slots:
+                    count = min(spec_tokens, max_new_tokens - step - 1)
+                    for slot, proposed in session.propose_mtp(draft_slots, count).items():
+                        draft_queues[slot] = proposed
             step_end = time.monotonic()
             step_log.append({
-                "step": step, "seconds": step_end - session.last_dispatch_started_at,
-                "input_setup_seconds": session.last_dispatch_started_at - tick,
+                "step": step, "seconds": dispatch_seconds,
+                "input_setup_seconds": input_setup_seconds,
                 "end_to_end_seconds": step_end - tick, "token_ids": next_ids,
                 "text": [tokenizer.decode(tokens, skip_special_tokens=False) for tokens in generated],
             })
@@ -3419,7 +3879,9 @@ def generate(
     return {
         "platform": "a2a3", "tp": TP_SIZE, "ep": EP_SIZE, "dp": DP_SIZE,
         "precision": "official_bf16_w8a8", "checkpoint": str(checkpoint.root),
-        "capacity": CAPACITY, "full_prefix_recomputation": True,
+        "capacity": CAPACITY, "max_seq_len": MAX_SEQ_LEN, "cache_tokens": CACHE_TOKENS,
+        "full_prefix_recomputation": False,
+        "mtp": {"tokens": spec_tokens, "verification": "sequential_greedy", **session.mtp_stats},
         "layers_per_forward": NUM_LAYERS,
         "launch_mode": "rt",
         "device_launches_per_rank_per_forward": len(session.plan),
@@ -3489,7 +3951,15 @@ def main(argv=None):
     parser.add_argument("--ep", type=int, default=RANKS, choices=[16, 8, 2])
     parser.add_argument("--capacity", type=int, default=CAPACITY)
     parser.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN)
-    parser.add_argument("--prompt", action="append", help=f"one prompt of the packed batch; provide exactly {BATCH}")
+    parser.add_argument("--cache-tokens", type=int, default=CACHE_TOKENS)
+    parser.add_argument("--prompt", action="append", help=f"one prompt of the packed batch; provide between 1 and {BATCH}")
+    parser.add_argument("--compile-only", action="store_true", help="build all programs without allocating NPU devices")
+    parser.add_argument("--spec-tokens", type=int, choices=range(C.MTP_SPEC_TOKENS + 1), default=0)
+    parser.add_argument("--image", action="append", type=Path, help="image for prompt zero; repeat for multiple images")
+    parser.add_argument("--video", action="append", type=Path, help="video file for prompt zero; decoded with FFmpeg")
+    parser.add_argument("--vision-runtime-dir", type=Path, help="precompiled single-rank vision artifact")
+    parser.add_argument("--video-frame", action="append", type=Path, help="sampled video frame for prompt zero")
+    parser.add_argument("--video-frame-fps", type=float, default=2.0)
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--raw", action="store_true", help="encode prompts verbatim, no chat template")
@@ -3499,6 +3969,13 @@ def main(argv=None):
     )
     parser.add_argument("--dump-tokens", type=Path, help="write the produced token ids as JSON")
     options, unknown = parser.parse_known_args(argv)
+    if options.compile_only:
+        if unknown:
+            parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+        if options.runtime_dir is None:
+            parser.error("--compile-only requires --runtime-dir")
+        compile_production(options.runtime_dir, list(range(RANKS)))
+        return
     if options.checkpoint is None:
         # Bare runs are the CI fixture case, which ships in the follow-up CI
         # PR (the prefill_fwd_ci entry); production mode needs --checkpoint.
@@ -3513,6 +3990,8 @@ def main(argv=None):
         raise ValueError(
             f"--capacity must match compilation ({CAPACITY}); recompile to change it"
         )
+    if options.cache_tokens != CACHE_TOKENS:
+        raise ValueError(f"--cache-tokens must match compilation ({CACHE_TOKENS})")
     if options.max_seq_len != MAX_SEQ_LEN:
         raise ValueError(f"--max-seq-len must match compilation ({MAX_SEQ_LEN})")
     if (options.tp, options.ep) != (C.TP_SIZE, RANKS):
@@ -3523,8 +4002,8 @@ def main(argv=None):
     if len(device_ids) != RANKS or len(set(device_ids)) != RANKS:
         raise ValueError(f"provide {RANKS} distinct task-allocated a2a3 devices")
     prompts = list(options.prompt or DEFAULT_PROMPTS)
-    if len(prompts) != BATCH or options.max_new_tokens <= 0:
-        raise ValueError(f"provide exactly {BATCH} prompts and a positive --max-new-tokens")
+    if not 1 <= len(prompts) <= BATCH or options.max_new_tokens <= 0:
+        raise ValueError(f"provide 1..{BATCH} prompts and a positive --max-new-tokens")
 
     expect_tokens = None
     if options.expect_tokens is not None:
@@ -3539,11 +4018,31 @@ def main(argv=None):
         programs = load_production(options.runtime_dir, device_ids)
     else:
         programs = compile_production(options.runtime_dir, device_ids)
+    visual_inputs = None
+    if options.image or options.video or options.video_frame:
+        from models.glm5_3_flash.vision.processor import VisionProcessor
+
+        processor = VisionProcessor(checkpoint)
+        visuals = [processor.image(image) for image in options.image or []]
+        visuals.extend(processor.video_file(video) for video in options.video or [])
+        if options.video_frame:
+            if not math.isfinite(options.video_frame_fps) or options.video_frame_fps <= 0:
+                raise ValueError("--video-frame-fps must be positive and finite")
+            times = [index / options.video_frame_fps for index in range(len(options.video_frame))]
+            visuals.append(processor.video(options.video_frame, times))
+        visual_inputs = {0: visuals}
+    if options.vision_runtime_dir is not None:
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+
+        programs["_vision"] = DistributedCompiledProgram.from_dir(options.vision_runtime_dir, platform="a2a3",
+                              distributed_config=DistributedConfig(device_ids=[device_ids[0]], num_sub_workers=0))
     report = generate(
         checkpoint, programs, device_ids, prompts, options.max_new_tokens,
         raw_prompts=options.raw,
         expect_tokens=expect_tokens,
         dump_path=options.dump_tokens,
+        visual_inputs=visual_inputs,
+        spec_tokens=options.spec_tokens,
     )
     if options.report:
         options.report.parent.mkdir(parents=True, exist_ok=True)

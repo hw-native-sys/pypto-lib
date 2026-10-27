@@ -56,9 +56,10 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import D, KV_LORA, LOCAL_H, QK_DIM, Q_LORA, T_DYN, V_DIM
-from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
-from models.glm5_3_flash.golden import rms_norm
+from models.glm5_3_flash.config import D, KV_LORA, LOCAL_H, QK_DIM, Q_LORA, T_DYN
+from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear, w8a8_projection_bf16
+from models.glm5_3_flash.quantization import w8a8_dynamic_linear
+from models.glm5_3_flash.golden import golden_absorb_output, golden_split_kv_b, rms_norm
 from models.glm5_3_flash.rmsnorm import rmsnorm
 
 MM_T_TILE = 16          # cube M tile; rows are a 16-row boxed tile
@@ -171,6 +172,119 @@ def mla_prolog(
 
 
 
+@pl.jit.inline
+def mla_prolog_w8a8(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    w_q_a: pl.Tensor[[Q_LORA, D], pl.INT8],
+    w_q_a_scale: pl.Tensor[[Q_LORA], pl.FP32],
+    q_a_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    w_q_b: pl.Tensor[[LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    w_q_b_scale: pl.Tensor[[LOCAL_H * QK_DIM], pl.FP32],
+    w_kv_a: pl.Tensor[[KV_LORA, D], pl.INT8],
+    w_kv_a_scale: pl.Tensor[[KV_LORA], pl.FP32],
+    kv_a_norm_weight: pl.Tensor[[KV_LORA], pl.BF16],
+    q_resid: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+    query: pl.Tensor[[T_DYN, LOCAL_H, QK_DIM], pl.BF16],
+    kv_latent: pl.Tensor[[T_DYN, KV_LORA], pl.BF16],
+):
+    """Run all three MLA projections with native INT8 weights and dynamic activations."""
+    rows = pl.tensor.dim(x, 0)
+    q_a = pl.create_tensor([rows, Q_LORA], dtype=pl.BF16)
+    w8a8_projection_bf16(x, w_q_a, w_q_a_scale, q_a, D, Q_LORA)
+    rmsnorm(q_a, q_a_norm_weight, q_resid)
+    query_flat = pl.reshape(query, [rows, LOCAL_H * QK_DIM])
+    w8a8_projection_bf16(q_resid, w_q_b, w_q_b_scale, query_flat, Q_LORA, LOCAL_H * QK_DIM)
+    kv_a = pl.create_tensor([rows, KV_LORA], dtype=pl.BF16)
+    w8a8_projection_bf16(x, w_kv_a, w_kv_a_scale, kv_a, D, KV_LORA)
+    rmsnorm(kv_a, kv_a_norm_weight, kv_latent)
+    return q_resid, query, kv_latent
+
+
+@pl.jit
+def mla_prolog_w8a8_test(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    w_q_a: pl.Tensor[[Q_LORA, D], pl.INT8],
+    w_q_a_scale: pl.Tensor[[Q_LORA], pl.FP32],
+    q_a_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    w_q_b: pl.Tensor[[LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    w_q_b_scale: pl.Tensor[[LOCAL_H * QK_DIM], pl.FP32],
+    w_kv_a: pl.Tensor[[KV_LORA, D], pl.INT8],
+    w_kv_a_scale: pl.Tensor[[KV_LORA], pl.FP32],
+    kv_a_norm_weight: pl.Tensor[[KV_LORA], pl.BF16],
+    q_resid: pl.Out[pl.Tensor[[T_DYN, Q_LORA], pl.BF16]],
+    query: pl.Out[pl.Tensor[[T_DYN, LOCAL_H, QK_DIM], pl.BF16]],
+    kv_latent: pl.Out[pl.Tensor[[T_DYN, KV_LORA], pl.BF16]],
+):
+    x.bind_dynamic(0, T_DYN)
+    q_resid.bind_dynamic(0, T_DYN)
+    query.bind_dynamic(0, T_DYN)
+    kv_latent.bind_dynamic(0, T_DYN)
+    mla_prolog_w8a8(x, w_q_a, w_q_a_scale, q_a_norm_weight, w_q_b, w_q_b_scale,
+                    w_kv_a, w_kv_a_scale, kv_a_norm_weight, q_resid, query, kv_latent)
+    return q_resid, query, kv_latent
+
+
+def golden_mla_prolog_w8a8(values):
+    q_a = w8a8_dynamic_linear(values['x'], values['w_q_a'], values['w_q_a_scale'])
+    q_resid = rms_norm(q_a, values['q_a_norm_weight'])
+    query = w8a8_dynamic_linear(q_resid, values['w_q_b'], values['w_q_b_scale'])
+    kv_a = w8a8_dynamic_linear(values['x'], values['w_kv_a'], values['w_kv_a_scale'])
+    values['q_resid'].copy_(q_resid)
+    values['query'].copy_(query.reshape(-1, LOCAL_H, QK_DIM))
+    values['kv_latent'].copy_(rms_norm(kv_a, values['kv_a_norm_weight']))
+
+
+def run_native_case(options):
+    from functools import lru_cache
+
+    from golden import TensorSpec, ratio_allclose, run
+    from models.glm5_3_flash.config import TP_SIZE
+    from models.glm5_3_flash.utils import component_hidden
+    from models.glm5_3_flash.weights import Checkpoint
+
+    layouts = {
+        'x': ((options.tokens, D), torch.bfloat16),
+        'w_q_a': ((Q_LORA, D), torch.int8), 'w_q_a_scale': ((Q_LORA,), torch.float32),
+        'q_a_norm_weight': ((Q_LORA,), torch.bfloat16),
+        'w_q_b': ((LOCAL_H * QK_DIM, Q_LORA), torch.int8),
+        'w_q_b_scale': ((LOCAL_H * QK_DIM,), torch.float32),
+        'w_kv_a': ((KV_LORA, D), torch.int8), 'w_kv_a_scale': ((KV_LORA,), torch.float32),
+        'kv_a_norm_weight': ((KV_LORA,), torch.bfloat16),
+    }
+
+    @lru_cache(maxsize=1)
+    def inputs():
+        generator = torch.Generator().manual_seed(5356)
+        values = {'x': component_hidden(options, D, generator)}
+        if options.checkpoint is not None:
+            values.update(Checkpoint(options.checkpoint).attention(options.layer, tp=TP_SIZE, mla_mode='native'))
+        else:
+            for name, (shape, dtype) in layouts.items():
+                if name == 'x':
+                    continue
+                if dtype == torch.int8:
+                    values[name] = torch.randint(-128, 128, shape, generator=generator, dtype=dtype)
+                elif dtype == torch.float32:
+                    values[name] = torch.rand(shape, generator=generator) * 0.001 + 0.0001
+                else:
+                    values[name] = torch.ones(shape, dtype=dtype)
+        return values
+
+    specs = [TensorSpec(name, shape, dtype, init_value=lambda key=name: inputs()[key])
+             for name, (shape, dtype) in layouts.items()]
+    for name, shape in (('q_resid', (options.tokens, Q_LORA)),
+                        ('query', (options.tokens, LOCAL_H, QK_DIM)),
+                        ('kv_latent', (options.tokens, KV_LORA))):
+        specs.append(TensorSpec(name, shape, torch.bfloat16))
+    result = run(fn=mla_prolog_w8a8_test, specs=specs, golden_fn=golden_mla_prolog_w8a8,
+                 config=dict(backend_type=options.backend_type, execution_mode=options.execution_mode, device_id=options.device),
+                 compare_fn={name: ratio_allclose(atol=0.01, rtol=0.01, max_error_ratio=0)
+                             for name in ('q_resid', 'query', 'kv_latent')}, compile_only=options.compile_only)
+    print(result)
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
 @pl.jit
 def mla_prolog_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -281,7 +395,20 @@ def main():
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tokens", type=int, default=20)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument('--mode', choices=['all', 'bf16', 'native'], default='all')
+    parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--hidden-input', type=Path)
+    parser.add_argument('--layer', type=int, default=3)
     args = parser.parse_args()
+    if args.checkpoint is not None or args.hidden_input is not None:
+        if args.mode != "native":
+            parser.error("--checkpoint and --hidden-input require --mode native")
+    if args.tokens < 1:
+        parser.error("--tokens must be positive")
+    if args.mode in ("all", "native"):
+        run_native_case(args)
+        if args.mode == "native":
+            return
 
     compare = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
     result = run(
@@ -404,20 +531,6 @@ def golden_mla_absorb_case(tensors):
     tensors["absorbed"][:] = golden_absorb_query(tensors["query"], tensors["w_k"])
 
 
-def golden_split_kv_b(w_kv_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split ``kv_b_proj`` into its key and value halves.
-
-    Args:
-        w_kv_b: ``[H * (QK_DIM + V_DIM), KV_LORA]`` as stored in the checkpoint.
-
-    Returns:
-        ``w_k`` of ``[H, QK_DIM, KV_LORA]`` and ``w_v`` of ``[H, V_DIM, KV_LORA]``.
-    """
-    heads = w_kv_b.shape[0] // (QK_DIM + V_DIM)
-    reshaped = w_kv_b.reshape(heads, QK_DIM + V_DIM, KV_LORA)
-    return reshaped[:, :QK_DIM], reshaped[:, QK_DIM:]
-
-
 def golden_absorb_query(query: torch.Tensor, w_k: torch.Tensor) -> torch.Tensor:
     """Fold the key half into the query so it attends against the raw latent.
 
@@ -438,31 +551,6 @@ def golden_absorb_query(query: torch.Tensor, w_k: torch.Tensor) -> torch.Tensor:
     return absorbed.to(query.dtype)
 
 
-def golden_absorb_output(w_v: torch.Tensor, w_o: torch.Tensor) -> torch.Tensor:
-    """Fold the value half into ``o_proj``; returns ``[D, H * KV_LORA]``.
-
-    Decode attends in latent space, so its context rows are ``[H, KV_LORA]`` and the
-    value expansion never has to happen per token: ``o_proj @ (ctx @ w_v^T)`` equals
-    ``(o_proj folded with w_v) @ ctx``. This is a weight-time transform, and both
-    operands have been prepared as BF16 by the loader, so nothing is requantized.
-
-    Args:
-        w_v: ``[H, V_DIM, KV_LORA]`` value half from :func:`golden_split_kv_b`.
-        w_o: ``[D, H * V_DIM]`` head-space output projection.
-
-    There is no kernel for this: it runs once per layer when the weights are staged,
-    so it belongs to the weight loader rather than to any per-token scope. Only the
-    query half (:func:`absorb_query`) is per-token.
-
-    Returns:
-        ``[D, H * KV_LORA]`` absorbed output projection, in ``w_o``'s dtype.
-    """
-    heads, v_dim, kv_lora = w_v.shape
-    per_head = w_o.float().unflatten(-1, (heads, v_dim))
-    absorbed = torch.einsum("dhv,hvk->dhk", per_head, w_v.float())
-    return absorbed.reshape(w_o.shape[0], heads * kv_lora).to(w_o.dtype)
-
-
 __all__ = [
     "absorb_query",
     "build_mla_absorb_tensor_specs",
@@ -476,6 +564,8 @@ __all__ = [
     "mla_absorb_query_test",
     "mla_prolog",
     "mla_prolog_test",
+    "mla_prolog_w8a8",
+    "mla_prolog_w8a8_test",
 ]
 
 

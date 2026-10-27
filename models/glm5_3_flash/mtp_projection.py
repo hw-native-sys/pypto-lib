@@ -6,54 +6,20 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""The MTP layer's embedding/hidden fusion (checkpoint layer 45).
+"""MTP embedding and hidden RMSNorm followed by the concatenated BF16 projection."""
 
-    h = eh_proj(concat(enorm(embedding), hnorm(hidden)))        [T, 2D] -> [T, D]
+import sys
+from pathlib import Path
 
-``enorm``, ``hnorm`` and ``eh_proj`` are unique to the MTP layer; everything after
-the fusion is an ordinary MLA + indexer + sparse-MoE layer. The layer also ships its
-**own** ``embed_tokens.weight`` and ``shared_head.head.weight`` as distinct index
-entries rather than reusing the target's — whether the values are tied is
-UNVERIFIED, but the loader has to handle two more tensors than the name
-"shared_head" suggests.
-
-Two things separate this layer from the backbone: it has **no** ``hc_*`` weights, so
-it uses a plain residual rather than the four-stream mHC, and
-``index_share_for_mtp_iteration`` gates an index-sharing scheme whose settled
-semantics (issue #1267) differ from a casual reading: the MTP layer computes
-its **own** top-k on step 0 of each proposal and reuses that selection per
-request for the proposal's later draft steps — it never consumes the target
-step's indices. On the reuse steps the K/gate projections and the cache/pool
-writes still run; only the query projection, scoring and Top-K are skipped.
-Each new proposal recomputes, and a rejected draft restores the cache
-metadata to the accepted length.
-
-``num_speculative_tokens`` is 3 in the A3 recipe, and that recipe also sets
-``enforce_eager: true`` because GLM-5.3-Flash does not support graph-mode
-speculative decoding.
-
-**Unresolved: ``rot.weight``.** The deployment checkpoint sets ``is_rot_used: true``
-and ships a top-level ``rot.weight``, BF16 ``[4096, 4096]``, the only tensor in the
-weight index with no entry in ``quant_model_description.json``. vLLM Ascend's
-``AscendDeepSeekMTP`` consumes exactly this name and flag, applying it to the
-previous hidden state **before** ``hnorm``; but GLM routes to ``Glm5NextMTP``
-instead, which has no ``rot`` and silently drops the tensor. So either this layer
-owes a ``[D, D]`` GEMM that the reference port is missing, or ``eh_proj`` subsumes
-it. Settle that before implementing, because it cannot be folded away: ``hnorm`` is
-a non-linear RMSNorm sitting between ``rot`` and ``eh_proj``, so only the constant
-factor would absorb.
-
-Measured, if it is needed: ``rot.weight`` is not a rotation. It is symmetric with
-``R[i,j] = g(i XOR j)`` — verified bit-exact on 11 rows spanning the full index
-range — i.e. a per-channel diagonal scaling in the Hadamard basis, determined
-entirely by its 4096-element first row. A Walsh-Hadamard transform, a scale, and a
-second transform costs about 340x fewer operations than the dense GEMM.
-"""
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import D, T_DYN
+from models.glm5_3_flash.config import D, FLASH, T_DYN
+from models.glm5_3_flash.linear import bf16_projection, golden_bf16_linear
+from models.glm5_3_flash.rmsnorm import golden_rmsnorm, rmsnorm
 
 
 def golden_mtp_projection(
@@ -63,7 +29,10 @@ def golden_mtp_projection(
     hnorm_weight: torch.Tensor,
     w_eh: torch.Tensor,
 ) -> torch.Tensor:
-    raise NotImplementedError("MTP projection golden is assigned with the kernel")
+    normalized_embedding = golden_rmsnorm(embedding, enorm_weight)
+    normalized_hidden = golden_rmsnorm(hidden, hnorm_weight)
+    combined = torch.cat((normalized_embedding, normalized_hidden), dim=-1)
+    return golden_bf16_linear(combined, w_eh).bfloat16()
 
 
 @pl.jit.inline
@@ -75,10 +44,115 @@ def mtp_projection(
     w_eh: pl.Tensor[[D, 2 * D], pl.BF16],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
-    raise NotImplementedError("MTP projection kernel body is assigned independently")
+    rows = pl.tensor.dim(embedding, 0)
+    embedding_norm = pl.create_tensor([rows, D], dtype=pl.BF16)
+    hidden_norm = pl.create_tensor([rows, D], dtype=pl.BF16)
+    rmsnorm(embedding, enorm_weight, embedding_norm)
+    rmsnorm(hidden, hnorm_weight, hidden_norm)
+    combined = pl.create_tensor([rows, 2 * D], dtype=pl.BF16)
+    for block in pl.spmd(((rows + 7) // 8) * (D // 128), name_hint="mtp_projection_concat"):
+        row0 = block // (D // 128) * 8
+        col0 = block % (D // 128) * 128
+        valid_rows = pl.min(8, rows - row0)
+        embedding_tile = pl.slice(embedding_norm, [8, 128], [row0, col0], valid_shape=[valid_rows, 128])
+        hidden_tile = pl.slice(hidden_norm, [8, 128], [row0, col0], valid_shape=[valid_rows, 128])
+        combined[row0:row0 + 8, col0:col0 + 128] = embedding_tile
+        combined[row0:row0 + 8, D + col0:D + col0 + 128] = hidden_tile
+    bf16_projection(combined, w_eh, enorm_weight, output, 2 * D, D, False)
+    return output
 
 
-__all__ = [
-    "golden_mtp_projection",
-    "mtp_projection",
-]
+@pl.jit
+def mtp_projection_test(
+    embedding: pl.Tensor[[T_DYN, D], pl.BF16],
+    hidden: pl.Tensor[[T_DYN, D], pl.BF16],
+    enorm_weight: pl.Tensor[[D], pl.BF16],
+    hnorm_weight: pl.Tensor[[D], pl.BF16],
+    w_eh: pl.Tensor[[D, 2 * D], pl.BF16],
+    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+):
+    embedding.bind_dynamic(0, T_DYN)
+    hidden.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, T_DYN)
+    mtp_projection(embedding, hidden, enorm_weight, hnorm_weight, w_eh, output)
+    return output
+
+
+def main():
+    import argparse
+    from functools import lru_cache
+
+    from golden import TensorSpec, ratio_allclose, run
+    from models.glm5_3_flash.weights import Checkpoint
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-p", "--platform", dest="backend_type", default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--hidden-input", type=Path)
+    parser.add_argument("--tokens", type=int, default=17)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
+    if args.tokens < 1:
+        parser.error("--tokens must be positive")
+
+    @lru_cache(maxsize=1)
+    def inputs():
+        generator = torch.Generator().manual_seed(5345)
+        embedding = torch.randn(args.tokens, D, generator=generator).bfloat16()
+        hidden = torch.randn(args.tokens, D, generator=generator).bfloat16()
+        if args.checkpoint is None:
+            values = {
+                "embedding": embedding, "hidden": hidden,
+                "enorm_weight": torch.ones(D, dtype=torch.bfloat16),
+                "hnorm_weight": torch.ones(D, dtype=torch.bfloat16),
+                "w_eh": (torch.randn(D, 2 * D, generator=generator) / (2 * D) ** 0.5).bfloat16(),
+            }
+        else:
+            checkpoint = Checkpoint(args.checkpoint)
+            prefix = f"model.language_model.layers.{FLASH.mtp_layer_id}."
+            values = {name: checkpoint.read(prefix + suffix).bfloat16() for name, suffix in (
+                ("enorm_weight", "enorm.weight"), ("hnorm_weight", "hnorm.weight"), ("w_eh", "eh_proj.weight"),
+            )}
+            embedding_name = prefix + "embed_tokens.weight"
+            values["embedding"] = checkpoint.read(embedding_name, slice(2000, 2000 + args.tokens)).bfloat16()
+            values["hidden"] = hidden
+        if args.hidden_input is not None:
+            value = torch.load(args.hidden_input, map_location="cpu", weights_only=True)
+            if value.shape != (args.tokens, D) or not torch.isfinite(value).all():
+                raise ValueError("--hidden-input must contain finite [tokens, hidden_size] rows")
+            values["hidden"] = value.bfloat16()
+        values["embedding"][0].zero_()
+        return values
+
+    shapes = {
+        "embedding": [args.tokens, D], "hidden": [args.tokens, D],
+        "enorm_weight": [D], "hnorm_weight": [D], "w_eh": [D, 2 * D],
+    }
+    specs = [TensorSpec(name, shape, torch.bfloat16, init_value=lambda key=name: inputs()[key])
+             for name, shape in shapes.items()]
+    specs.append(TensorSpec("output", [args.tokens, D], torch.bfloat16))
+
+    def golden(values):
+        result = golden_mtp_projection(*(values[name] for name in shapes))
+        values["output"].copy_(result)
+
+    result = run(
+        fn=mtp_projection_test,
+        specs=specs,
+        golden_fn=golden,
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+        compare_fn={"output": ratio_allclose(atol=0.01, rtol=0.01, max_error_ratio=0)},
+        compile_only=args.compile_only,
+    )
+    print(result)
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
+__all__ = ["golden_mtp_projection", "mtp_projection"]
+
+
+if __name__ == "__main__":
+    main()

@@ -273,7 +273,7 @@ def decode_fwd(
                 gate_scores = pl.create_tensor([T, INDEX_DIM], dtype=pl.FP32)
                 indexer_proj(normed, q_resid, index_w_q_b[sparse_layer], index_w_k[sparse_layer],
                              index_norm[sparse_layer], index_bias[sparse_layer], index_weights[sparse_layer],
-                             index_gate[sparse_layer], index_q, index_k, head_weights, gate_scores)
+                             index_gate[sparse_layer], index_q, index_k, head_weights, gate_scores, pl.cast(0, pl.INT32))
                 indexer_cache_write(index_k, gate_scores, kv_slots[step], raw_cache[sparse_layer])
                 pool_valid = pl.create_tensor([T, POOL_VALID_WIDTH], dtype=pl.INT32)
                 indexer_pool_write(raw_cache[sparse_layer], compress_ape[sparse_layer], hadamard,

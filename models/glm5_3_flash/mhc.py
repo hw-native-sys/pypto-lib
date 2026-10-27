@@ -376,6 +376,56 @@ def mhc_head(
     return output
 
 
+@pl.jit.inline
+def plain_residual_pre(
+    streams: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    pre: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    residual: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
+):
+    """Read a replicated plain residual stream and clear unused mHC diagnostics."""
+    rows = pl.tensor.dim(streams, 0)
+    coefficient_elements = rows * HC_MULT
+    pre_flat = pl.reshape(pre, [1, coefficient_elements])
+    post_flat = pl.reshape(post, [1, coefficient_elements])
+    residual_flat = pl.reshape(residual, [rows, HC_MULT * HC_MULT])
+    for block in pl.spmd(((rows + 7) // 8) * (D // 128), name_hint="plain_residual_pre"):
+        row0 = block // (D // 128) * 8
+        col0 = block % (D // 128) * 128
+        valid = pl.min(8, rows - row0)
+        source = pl.slice(streams, [8, 1, 128], [row0, 0, col0], valid_shape=[valid, 1, 128])
+        output[row0:row0 + 8, col0:col0 + 128] = pl.reshape(source, [8, 128])
+        if col0 == 0:
+            zeros = pl.full([1, 8 * HC_MULT], dtype=pl.FP32, value=0.0)
+            pre_flat[:, row0 * HC_MULT:(row0 + 8) * HC_MULT] = pl.set_validshape(zeros, 1, valid * HC_MULT)
+            post_flat[:, row0 * HC_MULT:(row0 + 8) * HC_MULT] = pl.set_validshape(zeros, 1, valid * HC_MULT)
+            residual_zero = pl.full([8, HC_MULT * HC_MULT], dtype=pl.FP32, value=0.0)
+            residual_flat[row0:row0 + 8, :] = pl.set_validshape(residual_zero, valid, HC_MULT * HC_MULT)
+    return output
+
+
+@pl.jit.inline
+def plain_residual_post(
+    update: pl.Tensor[[T_DYN, D], pl.BF16],
+    streams: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    output: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+):
+    """Add one BF16 sublayer result to the plain residual and replicate its lanes."""
+    rows = pl.tensor.dim(streams, 0)
+    for block in pl.spmd(rows * (D // 128), name_hint="plain_residual_post"):
+        row = block // (D // 128)
+        col0 = block % (D // 128) * 128
+        residual = pl.cast(streams[row:row + 1, 0:1, col0:col0 + 128], pl.FP32)
+        residual_row = pl.reshape(residual, [1, 128])
+        value = pl.cast(update[row:row + 1, col0:col0 + 128], pl.FP32)
+        combined = pl.cast(pl.add(residual_row, value), pl.BF16, mode="rint")
+        expanded = pl.reshape(combined, [1, 1, 128])
+        for lane in pl.unroll(HC_MULT):
+            output[row:row + 1, lane:lane + 1, col0:col0 + 128] = expanded
+    return output
+
+
 @pl.jit
 def mhc_pre_test(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],

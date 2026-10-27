@@ -84,7 +84,7 @@ def rmsnorm(
     weight: pl.Tensor[[NORM_WIDTH], pl.BF16],
     output: pl.Tensor[[T_DYN, NORM_WIDTH], pl.BF16],
 ):
-    """Normalize 128-aligned widths, up to eight tokens per task."""
+    """Normalize 64-aligned widths, up to eight tokens per task."""
     t_dim = pl.tensor.dim(x, 0)
     width = pl.tensor.dim(x, 1)
     for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint='glm53_rmsnorm'):
@@ -93,9 +93,11 @@ def rmsnorm(
         square_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
         square_error = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
         for norm_k in pl.pipeline(0, width, NORM_D_TILE, stage=1):
-            norm_part = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, norm_k], valid_shape=[valid_rows, NORM_D_TILE])
+            norm_columns = pl.min(NORM_D_TILE, width - norm_k)
+            norm_part = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, norm_k], valid_shape=[valid_rows, norm_columns])
             norm_value = pl.cast(norm_part, pl.FP32)
             norm_square = pl.create_tensor([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32)
+            norm_square[:, :] = pl.full([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32, value=0.0)
             norm_square[:, :] = pl.mul(norm_value, norm_value)
             part_high, part_low = accurate_row_sum_parts(norm_square)
             part_sum = pl.reshape(part_high, [1, NORM_T_TILE])
@@ -116,18 +118,23 @@ def rmsnorm(
         norm_argument[:, :] = pl.add(mean, EPS)
         inverse = accurate_rsqrt(norm_argument)
         inv_rms = pl.reshape(inverse, [NORM_T_TILE, 1])
-        for kb in pl.pipeline(width // NORM_D_TILE, stage=2):
-            k0 = kb * NORM_D_TILE
-            source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
+        for k0 in pl.pipeline(0, width, NORM_D_TILE, stage=2):
+            norm_columns = pl.min(NORM_D_TILE, width - k0)
+            source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, norm_columns])
             source_v1 = pl.fillpad(source, pad_value=pl.PadValue.zero)
             source = pl.set_validshape(source_v1, NORM_T_TILE, NORM_D_TILE)
             value = pl.cast(source, pl.FP32)
-            gamma = pl.reshape(pl.cast(weight[k0:k0 + NORM_D_TILE], pl.FP32), [1, NORM_D_TILE])
+            gamma_values = pl.slice(weight, [NORM_D_TILE], [k0], valid_shape=[norm_columns])
+            gamma_row = pl.reshape(gamma_values, [1, NORM_D_TILE])
+            gamma_buffer = pl.create_tensor([1, NORM_D_TILE], dtype=pl.BF16)
+            gamma_buffer[:, :] = pl.full([1, NORM_D_TILE], dtype=pl.BF16, value=0.0)
+            gamma_buffer[:, :] = gamma_row
+            gamma = pl.cast(gamma_buffer[:, :], pl.FP32)
             unit = pl.row_expand_mul(value, inv_rms)
             unit_bf16 = pl.cast(unit, pl.BF16, mode="rint")
             normalized = pl.col_expand_mul(pl.cast(unit_bf16, pl.FP32), gamma)
             part_v2 = pl.cast(normalized, pl.BF16, mode='rint')
-            output[t0:t0 + NORM_T_TILE, k0:k0 + NORM_D_TILE] = pl.set_validshape(part_v2, valid_rows, NORM_D_TILE)
+            output[t0:t0 + NORM_T_TILE, k0:k0 + NORM_D_TILE] = pl.set_validshape(part_v2, valid_rows, norm_columns)
     return output
 
 
