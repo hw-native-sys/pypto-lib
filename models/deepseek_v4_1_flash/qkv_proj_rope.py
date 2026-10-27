@@ -137,69 +137,45 @@ def _q_proj_rope_from_mx_m80(
     max_workers: pl.constexpr = 2147483647,
 ):
     """Project 80 Q-B rows and apply M16 RoPE epilogues."""
-    activation_scale = pl.tensor.view(scale_backing, [80, Q_LORA // 32], layout=pl.MX_A_ZZ)
-    weight_scale_bytes = pl.tensor.view(wq_b_scale, [1, Q_LORA // 32 * LOCAL_H * HEAD_DIM], layout=pl.ND)
-    weight_scale = pl.tensor.view(weight_scale_bytes, [Q_LORA // 32, LOCAL_H * HEAD_DIM], layout=pl.MX_B_NN)
-    workers = pl.min(LOCAL_H * HEAD_DIM // q_b_n_tile, max_workers)
-    workers = pl.min(workers, pl.system.available_cluster_count())
-    for worker in pl.spmd(workers, name_hint='attention_q_b_rope', sync_start=True):
-        block_num = pl.tile.get_block_num()
-        for wave in pl.range((LOCAL_H * HEAD_DIM // q_b_n_tile + block_num - 1) // block_num):
-            block = wave * block_num + worker
-            if block < LOCAL_H * HEAD_DIM // q_b_n_tile:
-                n0 = block * q_b_n_tile
-                a0 = pl.load(payload, [0, 0], [80, K_TILE])
-                sa0 = pl.load(activation_scale, [0, 0], [80, K_TILE // 32])
-                b0 = pl.load(wq_b, [0, n0], [K_TILE, q_b_n_tile])
-                sb0 = pl.load(weight_scale, [0, n0], [K_TILE // 32, q_b_n_tile])
-                acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                for k0 in pl.pipeline(K_TILE, Q_LORA, K_TILE, stage=2):
-                    a = pl.load(payload, [0, k0], [80, K_TILE])
-                    sa = pl.load(activation_scale, [0, k0 // 32], [80, K_TILE // 32])
-                    b = pl.load(wq_b, [k0, n0], [K_TILE, q_b_n_tile])
-                    sb = pl.load(weight_scale, [k0 // 32, n0], [K_TILE // 32, q_b_n_tile])
-                    acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-                full_vector = pl.tile.move(
-                    acc, target_memory=pl.MemorySpace.Vec,
-                    blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box,
-                )
-                for t0 in pl.range(0, 80, MX_M_TILE):
-                    rows = pl.max(pl.min(MX_M_TILE, num_tokens - t0), 0)
-                    acc_rows = pl.tile.slice(full_vector, [MX_M_TILE, q_b_n_tile], [t0, 0])
-                    value = pl.cast(acc_rows, pl.BF16, mode='rint')
-                    if block % (HEAD_DIM // q_b_n_tile) == HEAD_DIM // q_b_n_tile - 1:
-                        valid_prefix = pl.tile.slice(value, [MX_M_TILE, q_b_n_tile - ROPE_DIM], [0, 0], valid_shape=[rows, q_b_n_tile - ROPE_DIM])
-                        query = pl.store(valid_prefix, [t0, n0], query)
-                        tail = pl.cast(value[:, q_b_n_tile - ROPE_DIM:q_b_n_tile], pl.FP32)
-                        even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-                        odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-                        cosine = pl.load(rope_cos, [t0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
-                        sine = pl.load(rope_sin, [t0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
-                        cosine = pl.fillpad(cosine, pad_value=pl.PadValue.zero)
-                        cosine = pl.set_validshape(cosine, MX_M_TILE, ROPE_DIM // 2)
-                        sine = pl.fillpad(sine, pad_value=pl.PadValue.zero)
-                        sine = pl.set_validshape(sine, MX_M_TILE, ROPE_DIM // 2)
-                        sine = pl.mul(sine, 1.0)
-                        rope_even_cos = pl.mul(even, cosine)
-                        rope_odd_sin = pl.mul(odd, sine)
-                        re = pl.sub(rope_even_cos, rope_odd_sin)
-                        rope_even_sin = pl.mul(even, sine)
-                        rope_odd_cos = pl.mul(odd, cosine)
-                        im = pl.add(rope_even_sin, rope_odd_cos)
-                        real_lanes = pl.tile.full([MX_M_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                        real_lanes = pl.tile.scatter_mask(real_lanes, re, mask_pattern=pl.tile.MaskPattern.P0101)
-                        imag_lanes = pl.tile.full([MX_M_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                        imag_lanes = pl.tile.scatter_mask(imag_lanes, im, mask_pattern=pl.tile.MaskPattern.P1010)
-                        real_bits = pl.reinterpret_view(real_lanes, pl.UINT32)
-                        imag_bits = pl.reinterpret_view(imag_lanes, pl.UINT32)
-                        rotated_bits = pl.or_(real_bits, imag_bits)
-                        rotated = pl.reinterpret_view(rotated_bits, pl.FP32)
-                        rounded = pl.cast(rotated, pl.BF16, mode='rint')
-                        valid_rotated = pl.set_validshape(rounded, rows, ROPE_DIM)
-                        query = pl.store(valid_rotated, [t0, n0 + q_b_n_tile - ROPE_DIM], query)
-                    else:
-                        valid_value = pl.set_validshape(value, rows, q_b_n_tile)
-                        query = pl.store(valid_value, [t0, n0], query)
+    gemm_mxfp8_to_bf16(
+        payload, scale_backing, wq_b, wq_b_scale, query,
+        num_tokens, 0, 0, 0, Q_LORA, LOCAL_H * HEAD_DIM,
+        "proj_q_b_ragged", q_b_n_tile, K_TILE, 1, 0, 0, 80, max_workers, 4,
+    )
+    rope_workers = 2 * pl.system.available_cluster_count()
+    for worker in pl.spmd(rope_workers, name_hint="attention_q_rope"):
+        for block in pl.range(worker, (80 // MX_M_TILE) * LOCAL_H, rope_workers):
+            t0 = block // LOCAL_H * MX_M_TILE
+            n0 = block % LOCAL_H * HEAD_DIM
+            rows = pl.max(pl.min(MX_M_TILE, num_tokens - t0), 0)
+            tail_bf16 = pl.load(query, [t0, n0 + HEAD_DIM - ROPE_DIM], [MX_M_TILE, ROPE_DIM], valid_shape=[rows, ROPE_DIM])
+            tail = pl.cast(tail_bf16, pl.FP32)
+            even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+            cosine = pl.load(rope_cos, [t0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+            sine = pl.load(rope_sin, [t0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
+            cosine = pl.fillpad(cosine, pad_value=pl.PadValue.zero)
+            cosine = pl.set_validshape(cosine, MX_M_TILE, ROPE_DIM // 2)
+            sine = pl.fillpad(sine, pad_value=pl.PadValue.zero)
+            sine = pl.set_validshape(sine, MX_M_TILE, ROPE_DIM // 2)
+            sine = pl.mul(sine, 1.0)
+            rope_even_cos = pl.mul(even, cosine)
+            rope_odd_sin = pl.mul(odd, sine)
+            re = pl.sub(rope_even_cos, rope_odd_sin)
+            rope_even_sin = pl.mul(even, sine)
+            rope_odd_cos = pl.mul(odd, cosine)
+            im = pl.add(rope_even_sin, rope_odd_cos)
+            real_lanes = pl.tile.full([MX_M_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            real_lanes = pl.tile.scatter_mask(real_lanes, re, mask_pattern=pl.tile.MaskPattern.P0101)
+            imag_lanes = pl.tile.full([MX_M_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            imag_lanes = pl.tile.scatter_mask(imag_lanes, im, mask_pattern=pl.tile.MaskPattern.P1010)
+            real_bits = pl.reinterpret_view(real_lanes, pl.UINT32)
+            imag_bits = pl.reinterpret_view(imag_lanes, pl.UINT32)
+            rotated_bits = pl.or_(real_bits, imag_bits)
+            rotated = pl.reinterpret_view(rotated_bits, pl.FP32)
+            rounded = pl.cast(rotated, pl.BF16, mode="rint")
+            valid = pl.set_validshape(rounded, rows, ROPE_DIM)
+            query = pl.store(valid, [t0, n0 + HEAD_DIM - ROPE_DIM], query)
     return query
 
 
@@ -427,7 +403,7 @@ def _qa_kv_ragged_group(
     gemm_mxfp8_to_bf16(
         group_payload, group_scales, wq_a, wq_a_scale, projected,
         group_rows, 0, 0, 0,
-        D, Q_LORA, "proj_q_a_ragged", Q_A_N_TILE, Q_A_K_TILE, 1, 0, 0, m_tile, 2147483647,
+        D, Q_LORA, "proj_q_a_ragged", Q_A_N_TILE, Q_A_K_TILE, 1, 0, 0, m_tile, 2147483647, 2,
     )
     for q_mt in pl.parallel(m_tile // MX_M_TILE):
         q_local = q_mt * MX_M_TILE
@@ -453,7 +429,7 @@ def _qa_kv_ragged_group(
     gemm_mxfp8_to_bf16(
         group_payload, group_scales, wkv, wkv_scale, projection_group,
         group_rows, 0, 0, 0,
-        D, HEAD_DIM, "proj_kv_ragged", N_TILE, K_TILE, 1, 0, 0, m_tile, 2147483647,
+        D, HEAD_DIM, "proj_kv_ragged", N_TILE, K_TILE, 1, 0, 0, m_tile, 2147483647, 2,
     )
     if fuse_kv_norm_rope:
         window_group = pl.slice(window_kv, [group_rows, HEAD_DIM], [group_start, 0])

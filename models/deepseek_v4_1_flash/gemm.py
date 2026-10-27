@@ -44,6 +44,7 @@ def gemm_mxfp8_to_bf16(
     payload_row: pl.Scalar[pl.INDEX],
     m_tile: pl.constexpr,
     max_workers: pl.constexpr = 2147483647,
+    k_stages: pl.constexpr = 2,
 ):
     """Project one prequantized row tile into BF16 output."""
     scale_slice = activation_scale_backing[scale_row:scale_row + 1, :]
@@ -57,27 +58,38 @@ def gemm_mxfp8_to_bf16(
     available_clusters = pl.system.available_cluster_count()
     workers = pl.min(pl.min(output_width // n_tile, max_workers), available_clusters)
     for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
+        full_a = pl.load(payload, [payload_row, 0], [m_tile, width], target_memory=pl.MemorySpace.Mat)
         block_num = pl.tile.get_block_num()
         for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
             block = wave * block_num + worker
             if block < output_width // n_tile:
                 n0 = block * n_tile
                 rows = pl.min(m_tile, num_tokens - t0)
-                a0 = pl.load(payload, [payload_row, 0], [m_tile, k_tile])
+                if m_tile == 80:
+                    a0 = full_a[:, :k_tile]
+                else:
+                    a0 = pl.load(payload, [payload_row, 0], [m_tile, k_tile])
                 sa0 = pl.load(activation_scale, [0, 0], [m_tile, k_tile // 32])
                 b0 = pl.load(weight, [weight_row, n0], [k_tile, n_tile])
                 sb0 = pl.load(scale_group, [0, n0], [k_tile // 32, n_tile])
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                for k0 in pl.pipeline(k_tile, width, k_tile, stage=2):
-                    a = pl.load(payload, [payload_row, k0], [m_tile, k_tile])
+                for k0 in pl.pipeline(k_tile, width, k_tile, stage=k_stages):
+                    if m_tile == 80:
+                        a = pl.tile.slice(full_a, [m_tile, k_tile], [0, k0])
+                    else:
+                        a = pl.load(payload, [payload_row, k0], [m_tile, k_tile])
                     sa = pl.load(activation_scale, [0, k0 // 32], [m_tile, k_tile // 32])
                     b = pl.load(weight, [weight_row + k0, n0], [k_tile, n_tile])
                     sb = pl.load(scale_group, [k0 // 32, n0], [k_tile // 32, n_tile])
                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                 output_n = output_col + n0
-                value = pl.cast(acc, pl.BF16, mode="rint")
-                valid_bf16 = pl.set_validshape(value, rows, n_tile)
-                output = pl.store(valid_bf16, [t0, output_n], output)
+                if m_tile == 80:
+                    valid_acc = pl.set_validshape(acc, rows, n_tile)
+                    output = pl.store(valid_acc, [t0, output_n], output)
+                else:
+                    value = pl.cast(acc, pl.BF16, mode="rint")
+                    valid_bf16 = pl.set_validshape(value, rows, n_tile)
+                    output = pl.store(valid_bf16, [t0, output_n], output)
     return output
 
 
@@ -109,17 +121,18 @@ def gemm_mxfp8_to_mxfp8_m80_dual(
     blocks = output_width // n_tile
     workers = pl.min(blocks, pl.system.available_cluster_count())
     for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
+        full_a = pl.load(payload, [0, 0], [80, width], target_memory=pl.MemorySpace.Mat)
         block_num = pl.tile.get_block_num()
         for ni in pl.range(0, output_width // n_tile):
             if ni % block_num == worker:
                 n0 = ni * n_tile
-                a0 = pl.load(payload, [0, 0], [80, k_tile])
+                a0 = full_a[:, :k_tile]
                 sa0 = pl.load(activation_scale, [0, 0], [80, k_tile // 32])
                 b0 = pl.load(weight_flat, [(group * width), n0], [k_tile, n_tile])
                 sb0 = pl.load(scale_group, [0, n0], [k_tile // 32, n_tile])
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
                 for k0 in pl.pipeline(k_tile, width, k_tile, stage=2):
-                    a = pl.load(payload, [0, k0], [80, k_tile])
+                    a = pl.tile.slice(full_a, [80, k_tile], [0, k0])
                     sa = pl.load(activation_scale, [0, k0 // 32], [80, k_tile // 32])
                     b = pl.load(weight_flat, [(group * width) + k0, n0], [k_tile, n_tile])
                     sb = pl.load(scale_group, [k0 // 32, n0], [k_tile // 32, n_tile])
@@ -213,7 +226,7 @@ def gemm_bf16_via_mxfp8_to_bf16_staged(
             output = gemm_mxfp8_to_bf16(
                 payload, scale_backing, weight_flat, scale, output, num_tokens,
                 t0, group * width, group * output_width,
-                width, output_width, name_hint, n_tile, k_tile,  group_count, 0, 0, MX_M_TILE, max_workers,
+                width, output_width, name_hint, n_tile, k_tile,  group_count, 0, 0, MX_M_TILE, max_workers, 2,
             )
     return output
 

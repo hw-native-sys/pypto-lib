@@ -49,6 +49,10 @@ HC_DIM = M.hc_dim
 M_TILE = 32
 N_TILE = 128
 O_A_N_TILE = 256
+O_B_N_TILE = 256
+O_B_K_TILE = 256
+O_B_L1_K_TILE = 512
+O_B_VEC_N_TILE = O_B_N_TILE // 2
 K_TILE = 256
 D_TILE = 512
 GROUPED_WORKER_TILE = 4096
@@ -340,7 +344,7 @@ def o_proj_hc_post(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Project bounded decode row groups and mix the HC residual streams in FP32."""
+    """Project bounded decode row groups and mix FP32 HC streams on two AIVs."""
     total_rows = pl.tensor.dim(sublayer, 0)
     for group_start in pl.parallel(0, total_rows, 80):
         group_rows = pl.min(80, total_rows - group_start)
@@ -367,88 +371,99 @@ def o_proj_hc_post(
         scale_backing_flat = pl.tensor.view(wo_b_scale, [1, scale_group_size], layout=pl.ND)
         scale_group_backing = pl.tensor.slice(scale_backing_flat, [1, scale_group_size], [0, 0])
         scale_group = pl.tensor.view(scale_group_backing, [LOCAL_O_WIDTH // 32, D], layout=pl.MX_B_NN)
-        workers = pl.min(D // N_TILE, pl.system.available_cluster_count())
+        workers = pl.min(D // O_B_N_TILE, pl.system.available_cluster_count())
         for worker in pl.spmd(workers, name_hint="attention_o_b_hc_post", sync_start=True):
             block_num = pl.tile.get_block_num()
-            for ni in pl.range(0, D // N_TILE):
+            for ni in pl.range(0, D // O_B_N_TILE):
                 if ni % block_num == worker:
-                    n0 = ni * N_TILE
-                    a0 = pl.load(payload, [0, 0], [80, K_TILE])
-                    sa0 = pl.load(activation_scale, [0, 0], [80, K_TILE // 32])
-                    b0 = pl.load(wo_b, [0, n0], [K_TILE, N_TILE])
-                    sb0 = pl.load(scale_group, [0, n0], [K_TILE // 32, N_TILE])
+                    n0 = ni * O_B_N_TILE
+                    a_first = pl.load(payload, [0, 0], [80, O_B_L1_K_TILE], target_memory=pl.MemorySpace.Mat)
+                    b_first = pl.load(wo_b, [0, n0], [O_B_L1_K_TILE, O_B_N_TILE], target_memory=pl.MemorySpace.Mat)
+                    a0 = a_first[:, :O_B_K_TILE]
+                    sa0 = pl.load(activation_scale, [0, 0], [80, O_B_K_TILE // 32])
+                    b0 = pl.tile.extract(b_first, 0, 0, [O_B_K_TILE, O_B_N_TILE], target_memory=pl.MemorySpace.Right)
+                    sb0 = pl.load(scale_group, [0, n0], [O_B_K_TILE // 32, O_B_N_TILE])
                     acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                    for k0 in pl.pipeline(K_TILE, LOCAL_O_WIDTH, K_TILE, stage=2):
-                        a = pl.load(payload, [0, k0], [80, K_TILE])
-                        sa = pl.load(activation_scale, [0, k0 // 32], [80, K_TILE // 32])
-                        b = pl.load(wo_b, [k0, n0], [K_TILE, N_TILE])
-                        sb = pl.load(scale_group, [k0 // 32, n0], [K_TILE // 32, N_TILE])
-                        acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-                    full_vector = pl.tile.move(
-                        acc, target_memory=pl.MemorySpace.Vec,
-                        blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box,
-                    )
-                    for t0 in pl.range(0, capacity, MX_M_TILE):
-                        capacity_rows = pl.min(MX_M_TILE, capacity - t0)
-                        rows = pl.max(pl.min(MX_M_TILE, active_rows - t0), 0)
-                        post_rows = pl.load(post_group, [t0, 0], [MX_M_TILE, 8], valid_shape=[capacity_rows, HC_MULT])
-                        post_rows = pl.fillpad(post_rows, pad_value=pl.PadValue.zero)
-                        post_rows = pl.set_validshape(post_rows, MX_M_TILE, 8)
-                        post_bits = pl.reinterpret_view(post_rows, pl.INT32)
-                        post_zero = pl.tile.full([MX_M_TILE, 8], dtype=pl.INT32, value=0)
-                        post_dense_bits = pl.add(post_zero, post_bits)
-                        post_dense = pl.reinterpret_view(post_dense_bits, pl.FP32)
-                        post_transposed = pl.tile.transpose(post_dense, 0, 1)
-                        mix_rows = pl.load(residual_mix_flat, [t0, 0], [MX_M_TILE, HC_MULT * HC_MULT], valid_shape=[capacity_rows, HC_MULT * HC_MULT])
-                        mix_rows = pl.fillpad(mix_rows, pad_value=pl.PadValue.zero)
-                        mix_rows = pl.set_validshape(mix_rows, MX_M_TILE, HC_MULT * HC_MULT)
-                        mix_bits = pl.reinterpret_view(mix_rows, pl.INT32)
-                        mix_zero = pl.tile.full([MX_M_TILE, HC_MULT * HC_MULT], dtype=pl.INT32, value=0)
-                        mix_dense_bits = pl.add(mix_zero, mix_bits)
-                        mix_dense = pl.reinterpret_view(mix_dense_bits, pl.FP32)
-                        mix_transposed = pl.tile.transpose(mix_dense, 0, 1)
-                        acc_rows = pl.tile.slice(full_vector, [MX_M_TILE, N_TILE], [t0, 0])
-                        rounded_sublayer = pl.cast(acc_rows, pl.BF16, mode="rint")
-                        active_sublayer = pl.set_validshape(rounded_sublayer, rows, N_TILE)
-                        padded_sublayer = pl.fillpad(active_sublayer, pad_value=pl.PadValue.zero)
-                        sublayer_tile = pl.set_validshape(padded_sublayer, MX_M_TILE, N_TILE)
-                        valid_sublayer = pl.set_validshape(sublayer_tile, capacity_rows, N_TILE)
-                        pl.store(valid_sublayer, [t0, n0], sublayer_group)
-                        x_tile = pl.cast(sublayer_tile, pl.FP32)
-                        residual0 = pl.load(residual_flat, [t0, n0], [MX_M_TILE, N_TILE], valid_shape=[capacity_rows, N_TILE])
-                        residual1 = pl.load(residual_flat, [t0, D + n0], [MX_M_TILE, N_TILE], valid_shape=[capacity_rows, N_TILE])
-                        residual2 = pl.load(residual_flat, [t0, 2 * D + n0], [MX_M_TILE, N_TILE], valid_shape=[capacity_rows, N_TILE])
-                        residual3 = pl.load(residual_flat, [t0, 3 * D + n0], [MX_M_TILE, N_TILE], valid_shape=[capacity_rows, N_TILE])
-                        padded_residual0 = pl.fillpad(residual0, pad_value=pl.PadValue.zero)
-                        residual0 = pl.set_validshape(padded_residual0, MX_M_TILE, N_TILE)
-                        padded_residual1 = pl.fillpad(residual1, pad_value=pl.PadValue.zero)
-                        residual1 = pl.set_validshape(padded_residual1, MX_M_TILE, N_TILE)
-                        padded_residual2 = pl.fillpad(residual2, pad_value=pl.PadValue.zero)
-                        residual2 = pl.set_validshape(padded_residual2, MX_M_TILE, N_TILE)
-                        padded_residual3 = pl.fillpad(residual3, pad_value=pl.PadValue.zero)
-                        residual3 = pl.set_validshape(padded_residual3, MX_M_TILE, N_TILE)
-                        for out_h in pl.unroll(HC_MULT):
-                            post_row = pl.tile.slice(post_transposed, [1, MX_M_TILE], [out_h, 0])
-                            post_col = pl.reshape(post_row, [MX_M_TILE, 1])
-                            mix0_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [out_h, 0])
-                            mix1_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [HC_MULT + out_h, 0])
-                            mix2_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [2 * HC_MULT + out_h, 0])
-                            mix3_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [3 * HC_MULT + out_h, 0])
-                            mix0_col = pl.reshape(mix0_row, [MX_M_TILE, 1])
-                            mix1_col = pl.reshape(mix1_row, [MX_M_TILE, 1])
-                            mix2_col = pl.reshape(mix2_row, [MX_M_TILE, 1])
-                            mix3_col = pl.reshape(mix3_row, [MX_M_TILE, 1])
-                            value = pl.row_expand_mul(x_tile, post_col)
-                            mixed_residual0 = pl.row_expand_mul(residual0, mix0_col)
-                            value = pl.add(value, mixed_residual0)
-                            mixed_residual1 = pl.row_expand_mul(residual1, mix1_col)
-                            value = pl.add(value, mixed_residual1)
-                            mixed_residual2 = pl.row_expand_mul(residual2, mix2_col)
-                            value = pl.add(value, mixed_residual2)
-                            mixed_residual3 = pl.row_expand_mul(residual3, mix3_col)
-                            value = pl.add(value, mixed_residual3)
-                            valid_output = pl.set_validshape(value, capacity_rows, N_TILE)
-                            pl.store(valid_output, [t0, out_h * D + n0], output_flat)
+                    for inner_k in pl.range(O_B_K_TILE, O_B_L1_K_TILE, O_B_K_TILE):
+                        a1 = pl.tile.slice(a_first, [80, O_B_K_TILE], [0, inner_k])
+                        sa1 = pl.load(activation_scale, [0, inner_k // 32], [80, O_B_K_TILE // 32])
+                        b1 = pl.tile.extract(b_first, inner_k, 0, [O_B_K_TILE, O_B_N_TILE], target_memory=pl.MemorySpace.Right)
+                        sb1 = pl.load(scale_group, [inner_k // 32, n0], [O_B_K_TILE // 32, O_B_N_TILE])
+                        acc = pl.matmul_mx_acc(acc, a1, sa1, b1, sb1)
+                    for k0 in pl.pipeline(O_B_L1_K_TILE, LOCAL_O_WIDTH, O_B_L1_K_TILE, stage=2):
+                        a_next = pl.load(payload, [0, k0], [80, O_B_L1_K_TILE], target_memory=pl.MemorySpace.Mat)
+                        b_next = pl.load(wo_b, [k0, n0], [O_B_L1_K_TILE, O_B_N_TILE], target_memory=pl.MemorySpace.Mat)
+                        for inner_k in pl.range(0, O_B_L1_K_TILE, O_B_K_TILE):
+                            a = pl.tile.slice(a_next, [80, O_B_K_TILE], [0, inner_k])
+                            sa = pl.load(activation_scale, [0, (k0 + inner_k) // 32], [80, O_B_K_TILE // 32])
+                            b = pl.tile.extract(b_next, inner_k, 0, [O_B_K_TILE, O_B_N_TILE], target_memory=pl.MemorySpace.Right)
+                            sb = pl.load(scale_group, [(k0 + inner_k) // 32, n0], [O_B_K_TILE // 32, O_B_N_TILE])
+                            acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                    for _shard_lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
+                        full_vector = pl.aiv_shard(acc)
+                    for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                        output_n = n0 + lane * O_B_VEC_N_TILE
+                        for t0 in pl.range(0, capacity, MX_M_TILE):
+                            capacity_rows = pl.min(MX_M_TILE, capacity - t0)
+                            rows = pl.max(pl.min(MX_M_TILE, active_rows - t0), 0)
+                            post_rows = pl.load(post_group, [t0, 0], [MX_M_TILE, 8], valid_shape=[capacity_rows, HC_MULT])
+                            post_rows = pl.fillpad(post_rows, pad_value=pl.PadValue.zero)
+                            post_rows = pl.set_validshape(post_rows, MX_M_TILE, 8)
+                            post_bits = pl.reinterpret_view(post_rows, pl.INT32)
+                            post_zero = pl.tile.full([MX_M_TILE, 8], dtype=pl.INT32, value=0)
+                            post_dense_bits = pl.add(post_zero, post_bits)
+                            post_dense = pl.reinterpret_view(post_dense_bits, pl.FP32)
+                            post_transposed = pl.tile.transpose(post_dense, 0, 1)
+                            mix_rows = pl.load(residual_mix_flat, [t0, 0], [MX_M_TILE, HC_MULT * HC_MULT], valid_shape=[capacity_rows, HC_MULT * HC_MULT])
+                            mix_rows = pl.fillpad(mix_rows, pad_value=pl.PadValue.zero)
+                            mix_rows = pl.set_validshape(mix_rows, MX_M_TILE, HC_MULT * HC_MULT)
+                            mix_bits = pl.reinterpret_view(mix_rows, pl.INT32)
+                            mix_zero = pl.tile.full([MX_M_TILE, HC_MULT * HC_MULT], dtype=pl.INT32, value=0)
+                            mix_dense_bits = pl.add(mix_zero, mix_bits)
+                            mix_dense = pl.reinterpret_view(mix_dense_bits, pl.FP32)
+                            mix_transposed = pl.tile.transpose(mix_dense, 0, 1)
+                            acc_rows = pl.tile.slice(full_vector, [MX_M_TILE, O_B_VEC_N_TILE], [t0, 0])
+                            rounded_sublayer = pl.cast(acc_rows, pl.BF16, mode="rint")
+                            active_sublayer = pl.set_validshape(rounded_sublayer, rows, O_B_VEC_N_TILE)
+                            padded_sublayer = pl.fillpad(active_sublayer, pad_value=pl.PadValue.zero)
+                            sublayer_tile = pl.set_validshape(padded_sublayer, MX_M_TILE, O_B_VEC_N_TILE)
+                            valid_sublayer = pl.set_validshape(sublayer_tile, capacity_rows, O_B_VEC_N_TILE)
+                            pl.store(valid_sublayer, [t0, output_n], sublayer_group)
+                            x_tile = pl.cast(sublayer_tile, pl.FP32)
+                            residual0 = pl.load(residual_flat, [t0, output_n], [MX_M_TILE, O_B_VEC_N_TILE], valid_shape=[capacity_rows, O_B_VEC_N_TILE])
+                            residual1 = pl.load(residual_flat, [t0, D + output_n], [MX_M_TILE, O_B_VEC_N_TILE], valid_shape=[capacity_rows, O_B_VEC_N_TILE])
+                            residual2 = pl.load(residual_flat, [t0, 2 * D + output_n], [MX_M_TILE, O_B_VEC_N_TILE], valid_shape=[capacity_rows, O_B_VEC_N_TILE])
+                            residual3 = pl.load(residual_flat, [t0, 3 * D + output_n], [MX_M_TILE, O_B_VEC_N_TILE], valid_shape=[capacity_rows, O_B_VEC_N_TILE])
+                            padded_residual0 = pl.fillpad(residual0, pad_value=pl.PadValue.zero)
+                            residual0 = pl.set_validshape(padded_residual0, MX_M_TILE, O_B_VEC_N_TILE)
+                            padded_residual1 = pl.fillpad(residual1, pad_value=pl.PadValue.zero)
+                            residual1 = pl.set_validshape(padded_residual1, MX_M_TILE, O_B_VEC_N_TILE)
+                            padded_residual2 = pl.fillpad(residual2, pad_value=pl.PadValue.zero)
+                            residual2 = pl.set_validshape(padded_residual2, MX_M_TILE, O_B_VEC_N_TILE)
+                            padded_residual3 = pl.fillpad(residual3, pad_value=pl.PadValue.zero)
+                            residual3 = pl.set_validshape(padded_residual3, MX_M_TILE, O_B_VEC_N_TILE)
+                            for out_h in pl.unroll(HC_MULT):
+                                post_row = pl.tile.slice(post_transposed, [1, MX_M_TILE], [out_h, 0])
+                                post_col = pl.reshape(post_row, [MX_M_TILE, 1])
+                                mix0_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [out_h, 0])
+                                mix1_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [HC_MULT + out_h, 0])
+                                mix2_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [2 * HC_MULT + out_h, 0])
+                                mix3_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [3 * HC_MULT + out_h, 0])
+                                mix0_col = pl.reshape(mix0_row, [MX_M_TILE, 1])
+                                mix1_col = pl.reshape(mix1_row, [MX_M_TILE, 1])
+                                mix2_col = pl.reshape(mix2_row, [MX_M_TILE, 1])
+                                mix3_col = pl.reshape(mix3_row, [MX_M_TILE, 1])
+                                value = pl.row_expand_mul(x_tile, post_col)
+                                mixed_residual0 = pl.row_expand_mul(residual0, mix0_col)
+                                value = pl.add(value, mixed_residual0)
+                                mixed_residual1 = pl.row_expand_mul(residual1, mix1_col)
+                                value = pl.add(value, mixed_residual1)
+                                mixed_residual2 = pl.row_expand_mul(residual2, mix2_col)
+                                value = pl.add(value, mixed_residual2)
+                                mixed_residual3 = pl.row_expand_mul(residual3, mix3_col)
+                                value = pl.add(value, mixed_residual3)
+                                valid_output = pl.set_validshape(value, capacity_rows, O_B_VEC_N_TILE)
+                                pl.store(valid_output, [t0, out_h * D + output_n], output_flat)
     return sublayer, output
 
 
