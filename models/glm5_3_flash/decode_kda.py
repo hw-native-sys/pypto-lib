@@ -48,7 +48,6 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import KDA_DIM, KDA_STATE_DYN, LOCAL_KDA_H, T_DYN
-from models.glm5_3_flash.elementwise import accurate_exp, accurate_sqrt, accurate_divide, accurate_row_sum
 from models.glm5_3_flash.golden import l2norm
 from models.glm5_3_flash.kda_projection import BETA_PAD
 
@@ -85,12 +84,12 @@ def golden_decode_kda(
             v = value[t, h].float()  # [V]
             g = decay[t, h].float()  # [K]
             b = float(beta[t, h])
-            s = state[row, h] * torch.exp(g.double()).float().unsqueeze(0)  # [V, K]
-            kv_mem = (s * k.unsqueeze(0)).double().sum(dim=-1).float()  # [V]
+            s = state[row, h] * torch.exp(g.float()).unsqueeze(0)  # [V, K]
+            kv_mem = (s * k.unsqueeze(0)).sum(dim=-1)  # [V]
             delta = (v - kv_mem) * b  # [V]
             s = s + delta.unsqueeze(-1) * k.unsqueeze(0)
             state[row, h] = s
-            out[t, h] = (s * q.unsqueeze(0)).double().sum(dim=-1).float()
+            out[t, h] = (s * q.unsqueeze(0)).sum(dim=-1)
     return out.to(query.dtype), state.to(recurrent_state.dtype)
 
 
@@ -126,27 +125,12 @@ def decode_kda(
         k_buffer = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
         q_buffer[:, :] = qt
         k_buffer[:, :] = kt
-        q_squared_norm = pl.create_tensor([NORM_ROWS, 1], dtype=pl.FP32)
-        k_squared_norm = pl.create_tensor([NORM_ROWS, 1], dtype=pl.FP32)
-        q_square = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
-        k_square = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
-        q_square[:, :] = pl.mul(q_buffer, q_buffer)
-        k_square[:, :] = pl.mul(k_buffer, k_buffer)
-        q_sum = accurate_row_sum(q_square)
-        k_sum = accurate_row_sum(k_square)
-        q_squared_norm[:, :] = pl.add(q_sum, L2_EPS)
-        k_squared_norm[:, :] = pl.add(k_sum, L2_EPS)
-        q_root = accurate_sqrt(q_squared_norm)
-        k_root = accurate_sqrt(k_squared_norm)
-        q_denominator = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
-        k_denominator = pl.create_tensor([NORM_ROWS, KDA_DIM], dtype=pl.FP32)
-        ones = pl.full([NORM_ROWS, KDA_DIM], dtype=pl.FP32, value=1.0)
-        q_denominator[:, :] = pl.row_expand_mul(ones, q_root)
-        k_denominator[:, :] = pl.row_expand_mul(ones, k_root)
-        q_unit = accurate_divide(q_buffer, q_denominator)
-        k_unit = accurate_divide(k_buffer, k_denominator)
-        qn_gm[r0:r0 + NORM_ROWS, :] = pl.mul(q_unit, Q_SCALE)
-        kn_gm[r0:r0 + NORM_ROWS, :] = k_unit
+        q_squared_norm = pl.add(pl.row_sum(pl.mul(q_buffer, q_buffer)), L2_EPS)
+        k_squared_norm = pl.add(pl.row_sum(pl.mul(k_buffer, k_buffer)), L2_EPS)
+        q_inverse = pl.rsqrt(q_squared_norm, high_precision=True)
+        k_inverse = pl.rsqrt(k_squared_norm, high_precision=True)
+        qn_gm[r0:r0 + NORM_ROWS, :] = pl.mul(pl.row_expand_mul(qt, q_inverse), Q_SCALE)
+        kn_gm[r0:r0 + NORM_ROWS, :] = pl.row_expand_mul(kt, k_inverse)
     state_2d = pl.reshape(recurrent_state, [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
     with pl.spmd(tasks, name_hint='decode_kda', deps=[norm_tid]):
         task = pl.tile.get_block_idx()
@@ -160,14 +144,14 @@ def decode_kda(
         exp_buffer = pl.create_tensor([1, KDA_DIM], dtype=pl.FP32)
         part_v3 = pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0])
         exp_buffer[:, :] = pl.reshape(part_v3, [1, KDA_DIM])
-        g_row = accurate_exp(exp_buffer)
+        g_row = pl.exp(exp_buffer)
         beta_s = pl.read(beta, [t, h])
         srow = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
         state_tile = pl.slice(state_2d, [V_TILE, KDA_DIM], [srow, 0])
         decayed = pl.col_expand_mul(state_tile, g_row)
         kv_buffer = pl.create_tensor([V_TILE, KDA_DIM], dtype=pl.FP32)
         kv_buffer[:, :] = pl.col_expand_mul(decayed, k_row)
-        kv_col = accurate_row_sum(kv_buffer)
+        kv_col = pl.row_sum(kv_buffer)
         v_row_v4 = pl.slice(value, [1, 1, V_TILE], [t, h, v0], drop_dims=[0])
         v_row_v5 = pl.reshape(v_row_v4, [1, V_TILE])
         v_row = pl.cast(v_row_v5, pl.FP32)
@@ -182,12 +166,7 @@ def decode_kda(
         updated_v12 = pl.col_expand_mul(updated_v11, k_row)
         updated = pl.add(decayed, updated_v12)
         state_2d[srow:srow + V_TILE, 0:KDA_DIM] = updated
-        # Keep the state/query dot product in the same FP32 reduction domain
-        # as the recurrent update.
-        out_products = pl.create_tensor([V_TILE, KDA_DIM], dtype=pl.FP32)
-        out_products[:, :] = pl.col_expand_mul(updated, q_row)
-        out_sum = accurate_row_sum(out_products)
-        out_row = pl.reshape(out_sum, [1, V_TILE])
+        out_row = pl.matmul(q_row, updated, pl.FP32, b_trans=True)
         ocol = h * KDA_DIM + v0
         part_v13 = pl.cast(out_row, pl.BF16, mode='rint')
         out_rows[t:t + 1, ocol:ocol + V_TILE] = pl.set_validshape(part_v13, 1, V_TILE)

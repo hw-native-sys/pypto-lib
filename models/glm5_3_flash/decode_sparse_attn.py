@@ -60,7 +60,6 @@ import torch
 from models.glm5_3_flash.config import BLOCK_SIZE, B_DYN, KV_LORA, LOCAL_H, QK_DIM
 from models.glm5_3_flash.config import BLOCK_TABLE_DYN, TABLE_DYN, TOPK_INDEX_WIDTH, T_DYN
 from models.glm5_3_flash.metadata import paged_slots
-from models.glm5_3_flash.elementwise import accurate_divide, accurate_exp, accurate_row_sum_parts
 
 SOFTMAX_SCALE = QK_DIM**-0.5
 NEG_INF = -1.0e20       # finite floor; a true -inf would make an all-masked row NaN
@@ -145,20 +144,20 @@ def golden_decode_sparse_attn(
             latent = latent_cache[0].float().expand(ATTN_K_TILE, width).clone()
             rows = paged_slots(positions[valid].long(), request_ids[token].long(), block_table)
             latent[valid] = latent_cache[rows].float()
-            scores = (query_fp32[token].double() @ latent.double().T).float() * SOFTMAX_SCALE
+            scores = query_fp32[token] @ latent.T * SOFTMAX_SCALE
             scores = scores + (~valid).float().unsqueeze(0) * NEG_INF
             block_maximum = scores.amax(dim=-1, keepdim=True)
-            exponentials = torch.exp((scores - block_maximum).double()).float()
-            block_sum = exponentials.double().sum(dim=-1, keepdim=True).float()
-            block_output = (exponentials.bfloat16().double() @ latent.double()).float()
+            exponentials = torch.exp(scores - block_maximum)
+            block_sum = exponentials.sum(dim=-1, keepdim=True)
+            block_output = exponentials.bfloat16().float() @ latent
             next_maximum = torch.maximum(maximum, block_maximum)
-            alpha = torch.exp((maximum - next_maximum).double()).float()
-            beta = torch.exp((block_maximum - next_maximum).double()).float()
+            alpha = torch.exp(maximum - next_maximum)
+            beta = torch.exp(block_maximum - next_maximum)
             denominator = alpha * denominator + beta * block_sum
             numerator = alpha * numerator + beta * block_output
             maximum = next_maximum
         if topk_indices.shape[1] and topk_indices[token, 0] >= 0:
-            output[token] = (numerator.double() / denominator.double()).float().to(absorbed_query.dtype)
+            output[token] = (numerator / denominator).to(absorbed_query.dtype)
     return output
 
 
@@ -173,13 +172,13 @@ def decode_sparse_attn(
 ):
     """Flash-decode over the indexer's selected latent rows.
 
-    Compensated FP32 reductions of BF16 products publish the QK scores first.
-    The mixed Cube/vector stage gathers ``ATTN_K_TILE`` selected rows into L1
-    and emits the block's ``(max, sum, weighted rows)`` partial. Subsequent
-    scopes merge the blocks and normalize column tiles with corrected division.
+    One work item per (token, sparse block) across ``NUM_QK_CORES`` lanes, each item
+    gathering ``ATTN_K_TILE`` selected rows into L1 and emitting that block's
+    ``(max, sum, weighted rows)`` partial; a second scope merges the
+    ``SPARSE_BLOCKS`` partials per token with the usual alpha/beta rescale.
 
     The absorbed query makes the cached row serve as both key and value, so the same
-    L1 tile feeds the BF16-probability PV matmul.
+    L1 tile feeds the QK matmul and the PV matmul and the gather happens once.
 
     Selected positions are **logical and per-request**, so each row costs two scalar
     reads — the index, then its page in ``block_table``. A ``-1`` lane gathers row 0
@@ -198,7 +197,7 @@ def decode_sparse_attn(
 
     When every block of a row is skipped, the merge emits a zero output row.
 
-    Head rows are padded to ``H_PAD`` = 16. The PV matmul is only split into L0
+    Head rows are padded to ``H_PAD`` = 16. The QK/PV matmuls are only split into L0
     tiles once M reaches the 16-row cube minimum — below it the 128x512 KV operand stays
     whole and overflows the 64 KB right buffer — and 16 FP32 rows also give the 32-byte
     column alignment the merge's reductions need. The padded query rows are zero-filled
@@ -219,50 +218,7 @@ def decode_sparse_attn(
     blk_mi = pl.create_tensor([t_dim * HEAD_BLOCKS * SPARSE_BLOCKS * H_PAD, 1], dtype=pl.FP32)
     blk_li = pl.create_tensor([t_dim * HEAD_BLOCKS * SPARSE_BLOCKS * H_PAD, 1], dtype=pl.FP32)
     blk_oi = pl.create_tensor([t_dim * HEAD_BLOCKS * SPARSE_BLOCKS * H_PAD, KV_LORA], dtype=pl.FP32)
-    merged_numerators = pl.create_tensor([t_dim * HEAD_BLOCKS * H_PAD, KV_LORA], dtype=pl.FP32)
-    merged_denominators = pl.create_tensor([t_dim * HEAD_BLOCKS * H_PAD, 1], dtype=pl.FP32)
-    raw_scores = pl.create_tensor([t_dim * HEAD_BLOCKS * H_PAD, TOPK_INDEX_WIDTH], dtype=pl.FP32)
-    with pl.spmd(t_dim * HEAD_BLOCKS * SPARSE_BLOCKS, name_hint="mla_decode_scores") as scores_tid:
-        item = pl.tile.get_block_idx()
-        token = item // (HEAD_BLOCKS * SPARSE_BLOCKS)
-        head = (item // SPARSE_BLOCKS) % HEAD_BLOCKS
-        sb = item % SPARSE_BLOCKS
-        w0 = sb * ATTN_K_TILE
-        if pl.read(topk_indices, [token, w0]) >= 0:
-            request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
-            score_block = pl.full([H_PAD, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
-            for selected in pl.range(ATTN_K_TILE):
-                position = pl.read(topk_indices, [token, w0 + selected])
-                if position >= 0:
-                    logical = pl.cast(position, pl.INDEX)
-                    page = pl.cast(pl.read(block_table, [request, logical // BLOCK_SIZE]), pl.INDEX)
-                    source = page * BLOCK_SIZE + logical % BLOCK_SIZE
-                    total = pl.full([1, H_PAD], dtype=pl.FP32, value=0.0)
-                    correction = pl.full([1, H_PAD], dtype=pl.FP32, value=0.0)
-                    for k0 in pl.pipeline(0, KV_LORA, 128, stage=1):
-                        query_part = pl.slice(
-                            q_flat, [H_TILE, 128], [token * LOCAL_H + head * H_TILE, k0],
-                        )
-                        query_value = pl.create_tensor([H_PAD, 128], dtype=pl.FP32)
-                        query_value[:, :] = pl.full([H_PAD, 128], dtype=pl.FP32, value=0.0)
-                        query_value[0:H_TILE, :] = pl.cast(query_part, pl.FP32)
-                        key_value = pl.cast(pl.slice(latent_cache, [1, 128], [source, k0]), pl.FP32)
-                        products = pl.create_tensor([H_PAD, 128], dtype=pl.FP32)
-                        products[:, :] = pl.col_expand_mul(query_value, key_value)
-                        high, low = accurate_row_sum_parts(products)
-                        part_sum = pl.reshape(high, [1, H_PAD])
-                        tail = pl.reshape(low, [1, H_PAD])
-                        updated = pl.add(total, part_sum)
-                        recovered = pl.sub(updated, total)
-                        error = pl.add(pl.sub(total, pl.sub(updated, recovered)), pl.sub(part_sum, recovered))
-                        correction = pl.add(correction, pl.add(error, tail))
-                        total = updated
-                    dot = pl.add(total, correction)
-                    for h in pl.range(H_PAD):
-                        pl.write(score_block, [h, selected], pl.read(dot, [0, h]))
-            pl.assemble(raw_scores, score_block, [(token * HEAD_BLOCKS + head) * H_PAD, w0])
-
-    with pl.spmd(NUM_QK_CORES, name_hint="mla_decode_qk_pv", deps=[scores_tid]) as qk_tid:
+    with pl.spmd(NUM_QK_CORES, name_hint="mla_decode_qk_pv") as qk_tid:
         lane = pl.tile.get_block_idx()
         items = t_dim * HEAD_BLOCKS * SPARSE_BLOCKS
         for it in pl.range((items - lane + NUM_QK_CORES - 1) // NUM_QK_CORES):
@@ -304,11 +260,17 @@ def decode_sparse_attn(
                     else:
                         kv_tile = pl.gather_row(kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA])
 
+                for q_aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    q0 = q_aiv_id * (H_PAD // 2)
+                    q_valid = pl.max(0, pl.min(H_PAD // 2, H_TILE - q0))
+                    q_start = token * LOCAL_H + head * H_TILE + q0
+                    q_part = pl.slice(q_flat, [H_PAD // 2, KV_LORA], [q_start, 0],
+                                      valid_shape=[q_valid, KV_LORA])
+                    q_padded = pl.fillpad(q_part, pad_value=pl.PadValue.zero)
+                    q_tile = pl.aic_gather(q_padded)
+                raw = pl.matmul(q_tile, kv_tile, b_trans=True, out_dtype=pl.FP32)
                 for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                    raw_part = pl.slice(
-                        raw_scores, [H_PAD // 2, ATTN_K_TILE],
-                        [(token * HEAD_BLOCKS + head) * H_PAD + aiv_id * (H_PAD // 2), w0],
-                    )
+                    raw_part = pl.aiv_shard(raw)
                     bias_row = pl.full([1, ATTN_K_TILE], dtype=pl.FP32, value=NEG_INF)
                     for r in pl.range(ATTN_K_TILE):
                         if w0 + r < TOPK_INDEX_WIDTH:
@@ -316,10 +278,7 @@ def decode_sparse_attn(
                                 pl.write(bias_row, [0, r], 0.0)
                     scores = pl.col_expand_add(pl.mul(raw_part, SOFTMAX_SCALE), bias_row)
                     mi = pl.row_max(scores)
-                    shifted = pl.create_tensor([H_PAD // 2, ATTN_K_TILE], dtype=pl.FP32)
-                    shifted[:, :] = pl.row_expand_sub(scores, mi)
-                    weights = accurate_exp(shifted)
-                    weights = pl.col_expand_mul(weights, pl.cmp(bias_row, 0.0, cmp_type=0))
+                    weights = pl.exp(pl.row_expand_sub(scores, mi))
                     li = pl.row_sum(weights)
                     weights_bf16 = pl.cast(weights, target_type=pl.BF16, mode="rint")
                     weights_mat = pl.aic_gather(weights_bf16)
@@ -332,7 +291,7 @@ def decode_sparse_attn(
                     row0 = blk_row + aiv_id * (H_PAD // 2)
                     pl.assemble(blk_oi, oi_part, [row0, 0])
 
-    with pl.spmd(t_dim * HEAD_BLOCKS, name_hint="mla_decode_merge", deps=[qk_tid]) as merge_tid:
+    with pl.spmd(t_dim * HEAD_BLOCKS, name_hint="mla_decode_merge", deps=[qk_tid]):
         task = pl.tile.get_block_idx()
         token = task // HEAD_BLOCKS
         head = task % HEAD_BLOCKS
@@ -353,33 +312,17 @@ def decode_sparse_attn(
                 pl.row_expand_mul(merged_oi, alpha), pl.row_expand_mul(cur_oi, beta)
             )
             merged_mi = new_mi
-        pl.assemble(merged_numerators, merged_oi, [task * H_PAD, 0])
-        pl.assemble(merged_denominators, merged_li, [task * H_PAD, 0])
-
-    # A separate column-tiled normalization bounds the compensated division's
-    # vector working set while retaining the FP32 merged numerator.
-    with pl.spmd(t_dim * HEAD_BLOCKS * (KV_LORA // 128), name_hint="mla_decode_normalize", deps=[merge_tid]):
-        part = pl.tile.get_block_idx()
-        task = part // (KV_LORA // 128)
-        col = part % (KV_LORA // 128) * 128
-        token = task // HEAD_BLOCKS
-        head = task % HEAD_BLOCKS
         # Lane 0 of the row is -1 only when the row selects nothing at all; every block
         # is then neutral and ``merged_li`` is zero, which a division would turn to NaN.
         if pl.read(topk_indices, [token, 0]) >= 0:
-            numerator = pl.create_tensor([H_PAD, 128], dtype=pl.FP32)
-            numerator[:, :] = pl.slice(merged_numerators, [H_PAD, 128], [task * H_PAD, col])
-            denominator = pl.create_tensor([H_PAD, 128], dtype=pl.FP32)
-            denominator[:, :] = pl.row_expand_mul(
-                pl.full([H_PAD, 128], dtype=pl.FP32, value=1.0),
-                pl.slice(merged_denominators, [H_PAD, 1], [task * H_PAD, 0]))
-            normalized = accurate_divide(numerator, denominator)
+            normalized = pl.row_expand_div(merged_oi, merged_li)
             out_bf16 = pl.cast(normalized, target_type=pl.BF16, mode="rint")
-            pl.assemble(out_flat, out_bf16[0:H_TILE, :], [token * LOCAL_H + head * H_TILE, col])
+            out_flat[token * LOCAL_H + head * H_TILE : token * LOCAL_H + (head + 1) * H_TILE, 0:KV_LORA] = out_bf16[
+                0:H_TILE, 0:KV_LORA
+            ]
         else:
-            pl.assemble(
-                out_flat, pl.full([H_TILE, 128], dtype=pl.BF16, value=0.0),
-                [token * LOCAL_H + head * H_TILE, col],
+            out_flat[token * LOCAL_H + head * H_TILE : token * LOCAL_H + (head + 1) * H_TILE, 0:KV_LORA] = pl.full(
+                [H_TILE, KV_LORA], dtype=pl.BF16, value=0.0
             )
     return output
 

@@ -38,8 +38,6 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.elementwise import accurate_sigmoid, accurate_divide
-
 from models.glm5_3_flash.config import D, FLASH, N_LOCAL_EXPERTS, RECV_DYN, RECV_MAX
 from models.glm5_3_flash.golden import expert
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
@@ -56,7 +54,7 @@ SWIGLU_LIMIT = FLASH.swiglu_limit
 RECV_TILE = 16           # expert row tile: matmul rows must be a multiple of 16
 K_TILE = 512             # gate/up K tile over D = 4096
 MM_INTER_TILE = 256      # gate/up N tile; 2 * MOE_INTER must be a multiple
-ACT_INTER_TILE = 128     # Bounds the compensated sigmoid working set
+ACT_INTER_TILE = 256     # SwiGLU activation tile over the full intermediate
 QUANT_TILE = 512         # per-row requant tile
 INTER_K = 512            # w2 K tile (= moe_intermediate_size)
 D_OUT_TILE = 256         # w2 N tile over D
@@ -150,9 +148,7 @@ def expert_routed(
                 if SWIGLU_LIMIT > 0.0:
                     gate_fp32 = pl.minimum(gate_fp32, SWIGLU_LIMIT)
                     up_fp32 = pl.maximum(pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                gate_buffer = pl.create_tensor([RECV_TILE, ACT_INTER_TILE], dtype=pl.FP32)
-                gate_buffer[:, :] = gate_fp32
-                sigmoid = accurate_sigmoid(gate_buffer, RECV_TILE, ACT_INTER_TILE)
+                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_fp32)), 1.0))
                 gated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
                 h_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated
 
@@ -162,17 +158,8 @@ def expert_routed(
                     h_chunk = h_fp32[:, k0 : k0 + QUANT_TILE]
                     chunk_amax = pl.reshape(pl.row_max(pl.abs(h_chunk)), [1, RECV_TILE])
                     row_amax = pl.maximum(row_amax, chunk_amax)
-                amax_buffer = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
-                amax_buffer[:, :] = row_amax
-                numerator = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
-                numerator[:, :] = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
-                row_scale_q = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
-                row_scale_q[:, :] = accurate_divide(numerator, amax_buffer)
-                one = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
-                one[:, :] = pl.full([1, RECV_TILE], dtype=pl.FP32, value=1.0)
-                row_scale_dq = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
-                row_scale_dq[:, :] = accurate_divide(one, row_scale_q)
-                h_scale_dq[:, :] = pl.reshape(row_scale_dq, [RECV_TILE, 1])
+                row_scale_q = pl.div(pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
+                h_scale_dq[:, :] = pl.reshape(pl.recip(row_scale_q), [RECV_TILE, 1])
                 row_scale_q_col = pl.reshape(row_scale_q, [RECV_TILE, 1])
                 for q_idx in pl.pipeline(0, MOE_INTER // QUANT_TILE, stage=2):
                     k0 = q_idx * QUANT_TILE
@@ -192,18 +179,18 @@ def expert_routed(
                     y_acc = pl.matmul_acc(y_acc, hs_k, w2_k, b_trans=True, init_cond=(k0 == 0))
                 y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
 
-            # Dequantize w2 before applying the routing weight. Combining the
-            # scales first changes FP32 rounding before the owner sums slots.
+            # Dequant w2 output and fold the routing weight into the row: the
+            # per-row h scale x per-token route weight x per-channel w2 scale.
             for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="exp_w2_act", allow_early_resolve=True):
                 d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
                 w_row_blk = pl.slice(route_weights, [RECV_TILE, 1], [flat_row, 0], valid_shape=[valid_rows, 1])
+                row_scale_blk = pl.mul(h_scale_dq, w_row_blk)
                 for dg in pl.pipeline(W2_ACT_INNER, stage=2):
                     d0 = d_base + dg * D_OUT_TILE_ACT
                     y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
                     w2_scale_chunk = pl.reshape(w_down_scale[local_e, d0 : d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
                     y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
-                    y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_scale_dq), w2_scale_chunk)
-                    y_2d = pl.row_expand_mul(y_2d, w_row_blk)
+                    y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
                     y_valid = pl.set_validshape(y_2d, valid_rows, D_OUT_TILE_ACT)
                     output = pl.assemble(output, y_valid, [flat_row, d0])
 
@@ -271,7 +258,7 @@ def golden_expert_routed_fn(tensors):
         if SWIGLU_LIMIT > 0:
             gate_v = gate_v.clamp(max=SWIGLU_LIMIT)
             up_v = up_v.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-        sigmoid = (1.0 / (torch.exp(-gate_v.double()).float() + 1.0).double()).float()
+        sigmoid = torch.reciprocal(torch.exp(-gate_v) + 1.0)
         h = (gate_v * sigmoid) * up_v
         h_i8, h_sd = quantize_per_token_int8(h)
         out_i = h_i8.to(torch.int32) @ w_down_i8[e].T

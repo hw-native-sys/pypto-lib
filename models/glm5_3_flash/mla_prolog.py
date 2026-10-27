@@ -57,7 +57,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import D, KV_LORA, LOCAL_H, QK_DIM, Q_LORA, T_DYN, V_DIM
-from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
+from models.glm5_3_flash.linear import bf16_linear
 from models.glm5_3_flash.golden import rms_norm
 from models.glm5_3_flash.rmsnorm import rmsnorm
 
@@ -66,6 +66,7 @@ QA_N_TILE = 128         # q_a_proj output-column tile
 KVA_N_TILE = 128        # kv_a_proj output-column tile
 QB_N_TILE = 128         # q_b_proj output-column tile
 ABSORB_N_TILE = 128     # absorb_query output-column tile
+ABSORB_K_TILE = 128     # absorb_query QK_DIM reduction tile
 
 
 def golden_mla_prolog(
@@ -100,12 +101,12 @@ def golden_mla_prolog(
         ``[T, KV_LORA]``, all in ``x``'s dtype.
     """
     dtype = x.dtype
-    q_a = golden_bf16_linear(x, w_q_a).to(dtype)
-    kv_a = golden_bf16_linear(x, w_kv_a).to(dtype)
+    q_a = (x.float() @ w_q_a.float().t()).to(dtype)
+    kv_a = (x.float() @ w_kv_a.float().t()).to(dtype)
     q_resid = rms_norm(q_a, q_a_norm_weight)
     kv_latent = rms_norm(kv_a, kv_a_norm_weight)
     heads = w_q_b.shape[0] // QK_DIM
-    query = golden_bf16_linear(q_resid, w_q_b).to(dtype).unflatten(-1, (heads, QK_DIM))
+    query = (q_resid.float() @ w_q_b.float().t()).to(dtype).unflatten(-1, (heads, QK_DIM))
     return q_resid, query, kv_latent
 
 
@@ -128,7 +129,7 @@ def mla_prolog(
     back so the indexer and the attention see the same rounded rows.
 
     Every weight is stored ``[out, in]`` and consumed with ``b_trans=True``.
-    Compensated FP32 dot products preserve the BF16 projection rounding before
+    Native FP32 accumulation preserves the BF16 projection rounding before
     normalization and before the query is published.
 
     Returns the three outputs so the caller can chain them.
@@ -141,7 +142,7 @@ def mla_prolog(
         for tc in pl.range(t_mm // MM_T_TILE):
             t0 = tc * MM_T_TILE
             rows = pl.min(MM_T_TILE, t_dim - t0)
-            acc = bf16_linear(x, w_q_a, t0, n0, rows, pl.cast(QA_N_TILE, pl.INDEX), MM_T_TILE, QA_N_TILE, D, True)
+            acc = bf16_linear(x, w_q_a, t0, n0, rows, pl.cast(QA_N_TILE, pl.INDEX), MM_T_TILE, QA_N_TILE, D)
             pl.assemble(q_a, pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, QA_N_TILE), [t0, n0])
     rmsnorm(q_a, q_a_norm_weight, q_resid)
 
@@ -153,7 +154,7 @@ def mla_prolog(
             rows = pl.min(MM_T_TILE, t_dim - t0)
             acc = bf16_linear(
                 q_resid, w_q_b, t0, n0, rows,
-                pl.cast(QB_N_TILE, pl.INDEX), MM_T_TILE, QB_N_TILE, Q_LORA, True,
+                pl.cast(QB_N_TILE, pl.INDEX), MM_T_TILE, QB_N_TILE, Q_LORA,
             )
             value = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, QB_N_TILE)
             pl.assemble(query_flat, value, [t0, n0])
@@ -164,7 +165,7 @@ def mla_prolog(
         for tc in pl.range(t_mm // MM_T_TILE):
             t0 = tc * MM_T_TILE
             rows = pl.min(MM_T_TILE, t_dim - t0)
-            acc = bf16_linear(x, w_kv_a, t0, n0, rows, pl.cast(KVA_N_TILE, pl.INDEX), MM_T_TILE, KVA_N_TILE, D, True)
+            acc = bf16_linear(x, w_kv_a, t0, n0, rows, pl.cast(KVA_N_TILE, pl.INDEX), MM_T_TILE, KVA_N_TILE, D)
             pl.assemble(kv_a, pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, KVA_N_TILE), [t0, n0])
     rmsnorm(kv_a, kv_a_norm_weight, kv_latent)
     return q_resid, query, kv_latent
@@ -335,34 +336,34 @@ def absorb_query(
     """
     t_dim = pl.tensor.dim(query, 0)
     t_mm = ((t_dim + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
+    query_flat = pl.reshape(query, [t_dim, LOCAL_H * QK_DIM])
+    w_k_flat = pl.reshape(w_k, [LOCAL_H * QK_DIM, KV_LORA])
     absorbed_flat = pl.reshape(absorbed, [t_dim, LOCAL_H * KV_LORA])
-    for head in pl.range(LOCAL_H):
-        query_head = pl.create_tensor([t_dim, QK_DIM], dtype=pl.BF16)
-        weight_head = pl.create_tensor([QK_DIM, KV_LORA], dtype=pl.BF16)
-        for block in pl.spmd(t_mm // MM_T_TILE, name_hint="mla_query_head"):
-            t0 = block * MM_T_TILE
-            rows = pl.min(MM_T_TILE, t_dim - t0)
-            part = pl.slice(
-                query, [MM_T_TILE, 1, QK_DIM], [t0, head, 0],
-                valid_shape=[rows, 1, QK_DIM], drop_dims=[1],
-            )
-            query_head[t0:t0 + MM_T_TILE, :] = part
-        for block in pl.spmd((QK_DIM // 128) * (KV_LORA // 128), name_hint="mla_key_head"):
-            k0 = (block // (KV_LORA // 128)) * 128
-            n0 = (block % (KV_LORA // 128)) * 128
-            weight_part = pl.slice(w_k, [1, 128, 128], [head, k0, n0], drop_dims=[0])
-            weight_head[k0:k0 + 128, n0:n0 + 128] = weight_part
-        for block in pl.spmd(KV_LORA // ABSORB_N_TILE, name_hint="mla_absorb_query"):
-            n0 = block * ABSORB_N_TILE
-            for tc in pl.range(t_mm // MM_T_TILE):
-                t0 = tc * MM_T_TILE
-                rows = pl.min(MM_T_TILE, t_dim - t0)
-                acc = bf16_linear(
-                    query_head, weight_head, t0, n0, rows,
-                    pl.cast(ABSORB_N_TILE, pl.INDEX), MM_T_TILE, ABSORB_N_TILE, QK_DIM, False,
+    for ab_idx in pl.spmd(LOCAL_H * (KV_LORA // ABSORB_N_TILE), name_hint="mla_absorb_query"):
+        head = ab_idx // (KV_LORA // ABSORB_N_TILE)
+        n0 = (ab_idx % (KV_LORA // ABSORB_N_TILE)) * ABSORB_N_TILE
+        for tc in pl.range(t_mm // MM_T_TILE):
+            t0 = tc * MM_T_TILE
+            valid_rows = pl.min(MM_T_TILE, t_dim - t0)
+            acc = pl.create_tensor([MM_T_TILE, ABSORB_N_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(QK_DIM // ABSORB_K_TILE, stage=2):
+                k0 = kb * ABSORB_K_TILE
+                q_tile = pl.slice(
+                    query_flat,
+                    [MM_T_TILE, ABSORB_K_TILE],
+                    [t0, head * QK_DIM + k0],
+                    valid_shape=[valid_rows, ABSORB_K_TILE],
                 )
-                value = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, ABSORB_N_TILE)
-                pl.assemble(absorbed_flat, value, [t0, head * KV_LORA + n0])
+                w_tile = pl.slice(
+                    w_k_flat,
+                    [ABSORB_K_TILE, ABSORB_N_TILE],
+                    [head * QK_DIM + k0, n0],
+                )
+                acc = pl.matmul_acc(acc, q_tile, w_tile, init_cond=(kb == 0))
+            absorbed_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            # Write the GM view in place, without a loop-carried tensor alias.
+            absorbed_valid = pl.set_validshape(absorbed_bf16, valid_rows, ABSORB_N_TILE)
+            pl.assemble(absorbed_flat, absorbed_valid, [t0, head * KV_LORA + n0])
     return absorbed
 
 
@@ -434,7 +435,7 @@ def golden_absorb_query(query: torch.Tensor, w_k: torch.Tensor) -> torch.Tensor:
     Returns:
         ``[T, H, KV_LORA]`` query in latent space, in ``query``'s dtype.
     """
-    absorbed = torch.einsum("thd,hdk->thk", query.double(), w_k.double()).float()
+    absorbed = torch.einsum("thd,hdk->thk", query.float(), w_k.float()).float()
     return absorbed.to(query.dtype)
 
 

@@ -53,8 +53,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import KDA_DIM, KDA_GATE_LOWER_BOUND, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, T_DYN, D
-from models.glm5_3_flash.elementwise import accurate_exp, accurate_sigmoid
-from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
+from models.glm5_3_flash.linear import bf16_linear
 
 # tiling
 T_TILE = 16  # tokens per task
@@ -85,7 +84,7 @@ def golden_kda_projection(
 
     def linear_bf16(inp: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         # FP32 dot products followed by the BF16 projection boundary.
-        return golden_bf16_linear(inp, weight).to(torch.bfloat16)
+        return (inp.float() @ weight.float().t()).to(torch.bfloat16)
 
     q = linear_bf16(x, w_q)
     k = linear_bf16(x, w_k)
@@ -94,15 +93,15 @@ def golden_kda_projection(
 
     f_a = linear_bf16(x, w_f_a)
     g_raw = linear_bf16(f_a, w_f_b).float().view(tokens, LOCAL_KDA_H, KDA_DIM)
-    decay_rate = torch.exp(a_log.double()).float().view(1, LOCAL_KDA_H, 1)
+    decay_rate = torch.exp(a_log.float()).view(1, LOCAL_KDA_H, 1)
     decay_logits = decay_rate * (g_raw + dt_bias.float().view(1, LOCAL_KDA_H, KDA_DIM))
-    decay = KDA_GATE_LOWER_BOUND * torch.reciprocal(1.0 + torch.exp(-decay_logits.double()).float())
+    decay = KDA_GATE_LOWER_BOUND * torch.reciprocal(1.0 + torch.exp(-decay_logits))
 
     # beta carries the cube's 16-column padding. The padded rows of b_proj are zero,
     # so their gate is sigmoid(0) = 0.5 rather than 0; the reference reproduces that
     # instead of leaving a mismatch the caller would have to know to ignore.
     beta = torch.full((tokens, BETA_PAD), 0.5, dtype=torch.float32)
-    beta[:, :LOCAL_KDA_H] = torch.reciprocal(1.0 + torch.exp(-linear_bf16(x, w_b).double()).float())
+    beta[:, :LOCAL_KDA_H] = torch.reciprocal(1.0 + torch.exp(-linear_bf16(x, w_b).float()))
 
     g_a = linear_bf16(x, w_g_a)
     out_gate = linear_bf16(g_a, w_g_b).view(tokens, LOCAL_KDA_H, KDA_DIM)
@@ -159,13 +158,13 @@ def kda_projection(
         t0 = task // (LOCAL_KDA_QKV_DIM // N_TILE) * T_TILE
         n0 = task % (LOCAL_KDA_QKV_DIM // N_TILE) * N_TILE
         rows = pl.min(T_TILE, t_dim - t0)
-        acc_q = bf16_linear(x, w_q, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), T_TILE, N_TILE, D, True)
+        acc_q = bf16_linear(x, w_q, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), T_TILE, N_TILE, D)
         part_v1 = pl.cast(acc_q, pl.BF16, mode='rint')
         mixed_qkv[t0:t0 + T_TILE, n0:n0 + N_TILE] = pl.set_validshape(part_v1, rows, N_TILE)
-        acc_k = bf16_linear(x, w_k, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), T_TILE, N_TILE, D, True)
+        acc_k = bf16_linear(x, w_k, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), T_TILE, N_TILE, D)
         part_v2 = pl.cast(acc_k, pl.BF16, mode='rint')
         mixed_qkv[t0:t0 + T_TILE, LOCAL_KDA_QKV_DIM + n0:LOCAL_KDA_QKV_DIM + n0 + N_TILE] = pl.set_validshape(part_v2, rows, N_TILE)
-        acc_v = bf16_linear(x, w_v, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), T_TILE, N_TILE, D, True)
+        acc_v = bf16_linear(x, w_v, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), T_TILE, N_TILE, D)
         part_v3 = pl.cast(acc_v, pl.BF16, mode='rint')
         mixed_qkv[t0:t0 + T_TILE, 2 * LOCAL_KDA_QKV_DIM + n0:2 * LOCAL_KDA_QKV_DIM + n0 + N_TILE] = pl.set_validshape(part_v3, rows, N_TILE)
     with pl.spmd(tiles, name_hint='kda_projection_bottleneck', deps=[pad_tid]) as bottleneck_tid:
@@ -173,15 +172,15 @@ def kda_projection(
         rows = pl.min(T_TILE, t_dim - t0)
         f_a_v4 = pl.cast(0, pl.INDEX)
         f_a_v5 = pl.cast(KDA_DIM, pl.INDEX)
-        f_a = bf16_linear(x, w_f_a, t0, f_a_v4, rows, f_a_v5, T_TILE, KDA_DIM, D, True)
+        f_a = bf16_linear(x, w_f_a, t0, f_a_v4, rows, f_a_v5, T_TILE, KDA_DIM, D)
         f_a_gm[t0:t0 + T_TILE, :] = pl.set_validshape(pl.cast(f_a, pl.BF16, mode='rint'), rows, KDA_DIM)
         g_a_v6 = pl.cast(0, pl.INDEX)
         g_a_v7 = pl.cast(KDA_DIM, pl.INDEX)
-        g_a = bf16_linear(x, w_g_a, t0, g_a_v6, rows, g_a_v7, T_TILE, KDA_DIM, D, True)
+        g_a = bf16_linear(x, w_g_a, t0, g_a_v6, rows, g_a_v7, T_TILE, KDA_DIM, D)
         g_a_gm[t0:t0 + T_TILE, :] = pl.set_validshape(pl.cast(g_a, pl.BF16, mode='rint'), rows, KDA_DIM)
         b_raw_v8 = pl.cast(0, pl.INDEX)
         b_raw_v9 = pl.cast(BETA_PAD, pl.INDEX)
-        b_raw = bf16_linear(x, w_b_pad, t0, b_raw_v8, rows, b_raw_v9, T_TILE, BETA_PAD, D, True)
+        b_raw = bf16_linear(x, w_b_pad, t0, b_raw_v8, rows, b_raw_v9, T_TILE, BETA_PAD, D)
         part_v10 = pl.cast(b_raw, pl.BF16, mode='rint')
         b_raw_gm[t0:t0 + T_TILE, :] = pl.set_validshape(part_v10, rows, BETA_PAD)
     with pl.spmd(tiles * (LOCAL_KDA_QKV_DIM // N_TILE), name_hint='kda_projection_output', deps=[bottleneck_tid]) as output_tid:
@@ -190,11 +189,11 @@ def kda_projection(
         n0 = task % (LOCAL_KDA_QKV_DIM // N_TILE) * N_TILE
         rows = pl.min(T_TILE, t_dim - t0)
         g_raw_v11 = pl.cast(N_TILE, pl.INDEX)
-        g_raw = bf16_linear(f_a_gm, w_f_b, t0, n0, rows, g_raw_v11, T_TILE, N_TILE, KDA_DIM, True)
+        g_raw = bf16_linear(f_a_gm, w_f_b, t0, n0, rows, g_raw_v11, T_TILE, N_TILE, KDA_DIM)
         part_v12 = pl.cast(g_raw, pl.BF16, mode='rint')
         g_raw_gm[t0:t0 + T_TILE, n0:n0 + N_TILE] = pl.set_validshape(part_v12, rows, N_TILE)
         out_raw_v13 = pl.cast(N_TILE, pl.INDEX)
-        out_raw = bf16_linear(g_a_gm, w_g_b, t0, n0, rows, out_raw_v13, T_TILE, N_TILE, KDA_DIM, True)
+        out_raw = bf16_linear(g_a_gm, w_g_b, t0, n0, rows, out_raw_v13, T_TILE, N_TILE, KDA_DIM)
         part_v14 = pl.cast(out_raw, pl.BF16, mode='rint')
         out_gate_flat[t0:t0 + T_TILE, n0:n0 + N_TILE] = pl.set_validshape(part_v14, rows, N_TILE)
     with pl.spmd((t_dim + 3) // 4 * (LOCAL_KDA_QKV_DIM // KDA_DIM), name_hint='kda_projection_decay', deps=[output_tid]):
@@ -207,10 +206,10 @@ def kda_projection(
         biased = pl.col_expand_add(g_part, dt_bias_row[0:1, n0:n0 + KDA_DIM])
         a_fill = pl.create_tensor([4, KDA_DIM], dtype=pl.FP32)
         a_fill[:, :] = pl.add(pl.mul(biased, 0.0), pl.read(a_log, [n0 // KDA_DIM]))
-        rate = accurate_exp(a_fill)
+        rate = pl.exp(a_fill)
         scaled = pl.create_tensor([4, KDA_DIM], dtype=pl.FP32)
         scaled[:, :] = pl.mul(biased, rate)
-        gate_h = accurate_sigmoid(scaled, 4, KDA_DIM)
+        gate_h = pl.recip(pl.add(pl.exp(pl.neg(scaled)), 1.0))
         part_v16 = pl.mul(gate_h, KDA_GATE_LOWER_BOUND)
         decay_flat[t0:t0 + 4, n0:n0 + KDA_DIM] = pl.set_validshape(part_v16, rows, KDA_DIM)
     with pl.spmd((t_dim + 7) // 8, name_hint='kda_projection_beta', deps=[bottleneck_tid]):
@@ -219,7 +218,7 @@ def kda_projection(
         logits = pl.create_tensor([8, BETA_PAD], dtype=pl.FP32)
         part_v17 = pl.slice(b_raw_gm, [8, BETA_PAD], [t0, 0], valid_shape=[rows, BETA_PAD])
         logits[:, :] = pl.cast(part_v17, pl.FP32)
-        sigmoid = accurate_sigmoid(logits, 8, BETA_PAD)
+        sigmoid = pl.recip(pl.add(pl.exp(pl.neg(logits)), 1.0))
         beta[t0:t0 + 8, :] = pl.set_validshape(sigmoid, rows, BETA_PAD)
     return (mixed_qkv, decay, beta, out_gate)
 

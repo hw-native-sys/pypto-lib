@@ -18,25 +18,14 @@ import pypto.language as pl
 import torch
 
 DOT_M = pl.dynamic("DOT_M")
+DOT_N = pl.dynamic("DOT_N")
 DOT_K = pl.dynamic("DOT_K")
-DOT_W0 = pl.dynamic("DOT_W0")
-DOT_W1 = pl.dynamic("DOT_W1")
-DOT_K_TILE = 16
-
-
-def golden_bf16_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Reference BF16 products without CPU GEMM accumulation error at BF16 ties.
-
-    Round the independent FP64 dot product to the FP32 accumulator domain;
-    callers retain ownership of their BF16 projection boundaries.
-    """
-    return (x.double() @ weight.double().t()).float()
 
 
 @pl.jit.inline
 def bf16_linear(
     x: pl.Tensor[[DOT_M, DOT_K], pl.BF16],
-    weight: pl.Tensor[[DOT_W0, DOT_W1], pl.BF16],
+    weight: pl.Tensor[[DOT_N, DOT_K], pl.BF16],
     x_start: pl.Scalar[pl.INDEX],
     w_start: pl.Scalar[pl.INDEX],
     valid_rows: pl.Scalar[pl.INDEX],
@@ -44,29 +33,18 @@ def bf16_linear(
     M_TILE: pl.constexpr,
     N_TILE: pl.constexpr,
     K_DIM: pl.constexpr,
-    B_TRANS: pl.constexpr,
 ):
-    """Accumulate BF16 dot-product blocks with compensated FP32 sums."""
-    total = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-    correction = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-    for k0 in pl.pipeline(0, K_DIM, 1, stage=1):
-        x_part = pl.slice(x, [M_TILE, DOT_K_TILE], [x_start, k0], valid_shape=[valid_rows, 1])
-        x_full = pl.set_validshape(pl.fillpad(x_part, pad_value=pl.PadValue.zero), M_TILE, DOT_K_TILE)
-        if B_TRANS:
-            w_part = pl.slice(weight, [N_TILE, DOT_K_TILE], [w_start, k0], valid_shape=[weight_rows, 1])
-            w_full = pl.set_validshape(pl.fillpad(w_part, pad_value=pl.PadValue.zero), N_TILE, DOT_K_TILE)
-            partial = pl.matmul(x_full, w_full, out_dtype=pl.FP32, b_trans=True)
-        else:
-            w_forward = pl.slice(weight, [DOT_K_TILE, N_TILE], [k0, w_start], valid_shape=[1, weight_rows])
-            w_forward_full = pl.set_validshape(pl.fillpad(w_forward, pad_value=pl.PadValue.zero), DOT_K_TILE, N_TILE)
-            partial = pl.matmul(x_full, w_forward_full, out_dtype=pl.FP32)
-        updated = pl.add(total, partial)
-        recovered = pl.sub(updated, total)
-        left_error = pl.sub(total, pl.sub(updated, recovered))
-        right_error = pl.sub(partial, recovered)
-        correction = pl.add(correction, pl.add(left_error, right_error))
-        total = updated
-    return pl.add(total, correction)
+    """Accumulate BF16 products with native FP32 matmul accumulation."""
+    x_head = pl.slice(x, [M_TILE, 64], [x_start, 0], valid_shape=[valid_rows, 64])
+    w_head = pl.slice(weight, [N_TILE, 64], [w_start, 0], valid_shape=[weight_rows, 64])
+    w_first = pl.set_validshape(pl.fillpad(w_head, pad_value=pl.PadValue.zero), N_TILE, 64)
+    total = pl.matmul(x_head, w_first, out_dtype=pl.FP32, b_trans=True)
+    for k0 in pl.pipeline(64, K_DIM, 64, stage=1):
+        x_part = pl.slice(x, [M_TILE, 64], [x_start, k0], valid_shape=[valid_rows, 64])
+        w_part = pl.slice(weight, [N_TILE, 64], [w_start, k0], valid_shape=[weight_rows, 64])
+        w_full = pl.set_validshape(pl.fillpad(w_part, pad_value=pl.PadValue.zero), N_TILE, 64)
+        total = pl.matmul_acc(total, x_part, w_full, b_trans=True)
+    return total
 
 
 @pl.jit(auto_scope=False)
@@ -80,7 +58,7 @@ def linear_test(
         zero = pl.cast(0, pl.INDEX)
         rows = pl.cast(16, pl.INDEX)
         cols = pl.cast(128, pl.INDEX)
-        result = bf16_linear(x, weight, zero, zero, rows, cols, 16, 128, 4096, True)
+        result = bf16_linear(x, weight, zero, zero, rows, cols, 16, 128, 4096)
         output[:, :] = result
         narrowed[:, :] = pl.cast(result, pl.BF16, mode="rint")
     return (output, narrowed)
@@ -89,8 +67,8 @@ def linear_test(
 def golden_linear(
     tensors,
 ):
-    """Reference BF16 operands against an independent high-precision dot product."""
-    result = golden_bf16_linear(tensors["x"], tensors["weight"])
+    """Reference BF16 operands with native CPU FP32 accumulation."""
+    result = tensors["x"].float() @ tensors["weight"].float().t()
     tensors["output"].copy_(result)
     tensors["narrowed"].copy_(result.bfloat16())
 

@@ -203,7 +203,6 @@ def decode_mlp(
     return y
 
 
-
 @pl.jit(auto_scope=False)
 def l2_decode_layer(
     x_mixed: pl.Tensor[[T, D], pl.BF16],

@@ -163,7 +163,7 @@ def golden_indexer_proj(
     mean = projected.mean(dim=-1, keepdim=True)
     centered = projected - mean
     variance = centered.square().mean(dim=-1, keepdim=True)
-    normalized = centered * (1.0 / torch.sqrt(variance + K_NORM_EPS))
+    normalized = centered * torch.rsqrt(variance + K_NORM_EPS)
     index_k = (normalized * k_norm_weight.float() + k_norm_bias.float()).to(torch.bfloat16)
 
     head_weights = torch.nn.functional.linear(x.float(), w_weights.t().float()) * WEIGHTS_SCALE
@@ -298,7 +298,7 @@ def golden_indexer_score(
         INDEX_STATE_BLOCK_SIZE
     ).repeat(pool_blocks.shape[0])
     k_i8 = pool_cache[gathered]
-    k_scale = pool_scale[gathered].sum(dim=-1, keepdim=True) * (0.125 * SOFTMAX_SCALE)
+    k_scale = pool_scale[gathered, 0:1]
     for token in range(tokens):
         visible = int(pool_count[token])
         if visible <= 0:
@@ -309,9 +309,9 @@ def golden_indexer_score(
             k_i8[seg0 : seg0 + visible].to(torch.int32),
             q_i8[q_rows].to(torch.int32).t(),
         ).float()
-        dots = torch.relu(dots * k_scale[seg0 : seg0 + visible])
-        query_weights = q_scale[q_rows].t() * head_weights[token]
-        scores[token, seg0 : seg0 + visible] = (dots * query_weights).sum(dim=1)
+        dots = dots * k_scale[seg0 : seg0 + visible] * q_scale[q_rows].t()
+        dots = torch.relu(dots * SOFTMAX_SCALE)
+        scores[token, seg0 : seg0 + visible] = (dots * head_weights[token]).sum(dim=1)
     return scores
 
 

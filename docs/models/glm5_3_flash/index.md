@@ -429,9 +429,9 @@ this entry's scope.
 The fixture has 16 requests, four available layers, two decode steps and
 TP2/EP2. The default runs layer 0 only. State-row mappings vary between steps;
 cache pages use non-identity mappings. Convolution, recurrent and indexer state
-persist across the steps. Real-weight validation remains outside CI. The
-four-layer/four-step TP2/EP2 and 45-layer/two-step TP16/EP16 fixtures pass the
-independent propagated CPU golden on a2a3 hardware.
+persist across the steps. Real-weight and multilayer validation remain outside CI.
+Four-layer independent propagation currently exceeds the existing precision gates;
+a passing single-layer case does not establish multilayer accuracy.
 
 Run with two allocated devices from the repository root:
 
@@ -460,11 +460,7 @@ snapshot, and `--runtime-dir` selects a compatible compiled artifact.
 
 The independent CPU golden preserves BF16 activation boundaries, INT8
 activation quantization, INT32 accumulation and persistent state updates.
-The reference rounds independent FP64 reductions, BF16 dot products and
-selected unaries to their FP32 operation boundaries. Device kernels use
-compensated FP32 arithmetic for KDA, MLA, mHC, TP and MoE reductions, then
-preserve the official BF16 activation boundaries. KDA convolution evaluates
-SiLU with one FP32 division before BF16 conversion. Dynamic quantization
+Reference and device kernels use ordinary FP32 arithmetic. Dynamic quantization
 consumes the BF16 RMSNorm result. Sparse attention rounds each block's
 exponential weights to BF16 before PV while keeping the softmax denominator
 in FP32. CPU and device accumulation may still differ.
@@ -475,16 +471,6 @@ written cache rows and KDA states. TP replicas and untouched state rows must
 match exactly. This mode does not establish independent multilayer accuracy.
 The four trace fields are Attention output, FFN output, FFN input and normalized
 Attention input. Their buffers are separate to preserve asynchronous reads.
-
-The published-W8A8 fixture passes all nine output groups on a2a3 with 16
-requests: 45 layers and two continuous steps at TP16/EP16, and four layers
-and four continuous steps at TP2/EP2. The final-hidden outlier ratio is 0%
-at every tested step, below the unchanged 5% limit at `atol=rtol=0.02`.
-State/cache gates, untouched rows and replica equality also pass; the
-four-step case includes nonzero pooled-cache payload and scale writes.
-Dense and MoE retain native INT8 weights and INT32 GEMMs; attention weights
-are staged as BF16. These are correctness results; the compensated
-arithmetic has not been performance-benchmarked.
 
 Shared indexer kernels live in `indexer.py`; `decode_indexer.py` and
 `prefill_indexer.py` own their respective composition and validation. Decode's

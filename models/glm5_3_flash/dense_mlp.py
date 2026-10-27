@@ -16,9 +16,8 @@ import torch
 
 from models.glm5_3_flash.config import FLASH, T_DYN, TP_SIZE, D
 from models.glm5_3_flash.golden import expert
-from models.glm5_3_flash.elementwise import accurate_exp, accurate_divide
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
-from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
+from models.glm5_3_flash.linear import bf16_linear
 
 # This directory owns a ``golden.py`` reference module, so the repository-root
 # ``golden`` harness package must come first on the path before any harness import.
@@ -112,14 +111,8 @@ def dense_mlp(
                 if SWIGLU_LIMIT > 0.0:
                     gate_fp32 = pl.minimum(gate_fp32, SWIGLU_LIMIT)
                     up_fp32 = pl.maximum(pl.minimum(up_fp32, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                gate_buffer = pl.create_tensor([DN_ROW_PAD, ACT_INTER_TILE], dtype=pl.FP32)
-                gate_buffer[:, :] = pl.set_validshape(gate_fp32, DN_ROW_PAD, ACT_INTER_TILE)
-                exp_argument = pl.create_tensor([DN_ROW_PAD, ACT_INTER_TILE], dtype=pl.FP32)
-                exp_argument[:, :] = pl.neg(gate_buffer)
-                exponential = accurate_exp(exp_argument)
-                denominator = pl.create_tensor([DN_ROW_PAD, ACT_INTER_TILE], dtype=pl.FP32)
-                denominator[:, :] = pl.add(exponential, 1.0)
-                silu_value = accurate_divide(gate_buffer, denominator)
+                denominator = pl.add(pl.exp(pl.neg(gate_fp32)), 1.0)
+                silu_value = pl.div(gate_fp32, denominator)
                 silu = pl.cast(silu_value, pl.BF16, mode="rint")
                 product = pl.mul(pl.cast(silu, pl.FP32), up_fp32)
                 gated = pl.cast(pl.cast(product, pl.BF16, mode="rint"), pl.FP32)
@@ -127,19 +120,9 @@ def dense_mlp(
                 chunk_amax = pl.reshape(pl.row_max(pl.abs(gated)), [1, DN_ROW_PAD])
                 row_amax = pl.maximum(row_amax, chunk_amax)
                 h_fp32[row0:row0 + DN_ROWS_PER_BLOCK, n0:n0 + ACT_INTER_TILE] = gated[0:DN_ROWS_PER_BLOCK, :]
-            amax_buffer = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
-            numerator = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
-            amax_buffer[:, :] = row_amax
-            numerator[:, :] = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
-            row_scale_q_buffer = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
-            quantization_scale = accurate_divide(numerator, amax_buffer)
-            row_scale_q_buffer[:, :] = quantization_scale
-            row_scale_q = row_scale_q_buffer
+            row_scale_q = pl.div(pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX), row_amax)
             row_scale_q_col = pl.reshape(row_scale_q, [DN_ROW_PAD, 1])
-            one_buffer = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
-            one_buffer[:, :] = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=1.0)
-            dequant = accurate_divide(one_buffer, row_scale_q_buffer)
-            row_scale_dq_col = pl.reshape(dequant, [DN_ROW_PAD, 1])
+            row_scale_dq_col = pl.reshape(pl.recip(row_scale_q), [DN_ROW_PAD, 1])
             row_scale_dq_v1 = pl.full([DN_ROW_PAD, DN_ROW_PAD], dtype=pl.FP32, value=0.0)
             row_scale_dq = pl.row_expand(row_scale_dq_v1, row_scale_dq_col)
             h_scale_dq[row0:row0 + DN_ROWS_PER_BLOCK, :] = row_scale_dq[0:DN_ROWS_PER_BLOCK, :]
@@ -202,7 +185,7 @@ def dense_mlp_bf16(
         n0 = task % (2 * LOCAL_DENSE_INTER // BF16_N_TILE) * BF16_N_TILE
         rows = pl.min(BF16_M_TILE, tokens - t0)
         columns = pl.cast(BF16_N_TILE, pl.INDEX)
-        projected = bf16_linear(x, w_gate_up, t0, n0, rows, columns, BF16_M_TILE, BF16_N_TILE, D, True)
+        projected = bf16_linear(x, w_gate_up, t0, n0, rows, columns, BF16_M_TILE, BF16_N_TILE, D)
         projected_bf16 = pl.cast(projected, pl.BF16, mode="rint")
         gate_up[t0:t0 + BF16_M_TILE, n0:n0 + BF16_N_TILE] = pl.set_validshape(projected_bf16, rows, BF16_N_TILE)
 
@@ -221,14 +204,8 @@ def dense_mlp_bf16(
         if SWIGLU_LIMIT > 0.0:
             gate = pl.minimum(gate, SWIGLU_LIMIT)
             up = pl.maximum(pl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-        gate_buffer = pl.create_tensor([BF16_ACT_M_TILE, BF16_N_TILE], dtype=pl.FP32)
-        gate_buffer[:, :] = gate
-        exp_argument = pl.create_tensor([BF16_ACT_M_TILE, BF16_N_TILE], dtype=pl.FP32)
-        exp_argument[:, :] = pl.neg(gate)
-        exponential = accurate_exp(exp_argument)
-        denominator = pl.create_tensor([BF16_ACT_M_TILE, BF16_N_TILE], dtype=pl.FP32)
-        denominator[:, :] = pl.add(exponential, 1.0)
-        silu_value = accurate_divide(gate_buffer, denominator)
+        denominator = pl.add(pl.exp(pl.neg(gate)), 1.0)
+        silu_value = pl.div(gate, denominator)
         silu = pl.cast(silu_value, pl.BF16, mode="rint")
         product = pl.mul(pl.cast(silu, pl.FP32), up)
         product_bf16 = pl.cast(product, pl.BF16, mode="rint")
@@ -240,7 +217,7 @@ def dense_mlp_bf16(
         rows = pl.min(BF16_M_TILE, tokens - t0)
         columns = pl.cast(BF16_N_TILE, pl.INDEX)
         projected = bf16_linear(activated, w_down, t0, d0, rows, columns,
-                                       BF16_M_TILE, BF16_N_TILE, LOCAL_DENSE_INTER, True)
+                                       BF16_M_TILE, BF16_N_TILE, LOCAL_DENSE_INTER)
         projected_bf16 = pl.cast(projected, pl.BF16, mode="rint")
         output[t0:t0 + BF16_M_TILE, d0:d0 + BF16_N_TILE] = pl.set_validshape(projected_bf16, rows, BF16_N_TILE)
     return output
@@ -303,7 +280,7 @@ def golden_dense_mlp_fn(tensors):
     if SWIGLU_LIMIT > 0:
         gate_v = gate_v.clamp(max=SWIGLU_LIMIT)
         up_v = up_v.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-    silu = (gate_v.double() / (1.0 + torch.exp(-gate_v.double()).float()).double()).float().bfloat16().float()
+    silu = torch.nn.functional.silu(gate_v).bfloat16().float()
     h = (silu * up_v).bfloat16()
     h_i8, h_sd = quantize_per_token_int8(h)
     out_i = h_i8.to(torch.int32) @ w_down_i8.T
@@ -329,14 +306,14 @@ T_DYN_TEST = 64
 
 def golden_dense_mlp_bf16(x: torch.Tensor, w_gate_up: torch.Tensor, w_down: torch.Tensor) -> torch.Tensor:
     """Apply the BF16 linear and activation boundaries of the dense FFN."""
-    projected = golden_bf16_linear(x, w_gate_up).bfloat16()
+    projected = (x.float() @ w_gate_up.float().t()).bfloat16()
     gate, up = projected.float().chunk(2, dim=-1)
     if SWIGLU_LIMIT > 0:
         gate = gate.clamp(max=SWIGLU_LIMIT)
         up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-    silu = (gate.double() / (1.0 + torch.exp(-gate.double()).float()).double()).float().bfloat16().float()
+    silu = torch.nn.functional.silu(gate).bfloat16().float()
     activated = (silu * up).bfloat16()
-    return golden_bf16_linear(activated, w_down).bfloat16()
+    return (activated.float() @ w_down.float().t()).bfloat16()
 
 
 def golden_dense_mlp_bf16_fn(tensors):

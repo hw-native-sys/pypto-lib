@@ -63,8 +63,6 @@ import torch
 
 from models.glm5_3_flash.config import D, FLASH, HC_DIM, HC_MULT, MIX_HC, T_DYN
 from models.glm5_3_flash.golden import hc_head, hc_mixes, hc_post, hc_pre
-from models.glm5_3_flash.linear import bf16_linear
-from models.glm5_3_flash.elementwise import accurate_exp, accurate_sigmoid, accurate_rsqrt, accurate_row_sum, accurate_row_sum_parts, accurate_divide
 
 MIX_D_TILE = 256  # D-wise tile of the three stream-collapse scopes
 HC_DIM_INV = 1.0 / HC_DIM
@@ -77,7 +75,10 @@ RMS_T_TILE = 8  # token tile of the sum-of-squares scope
 LINEAR_T_TILE = 16  # cube M tile; below 16 the matmul is not L0 split
 COMB_T_TILE = 8  # token tile of the softmax / Sinkhorn scope
 POST_COEFF_TILE = 16  # minimum 32-byte BF16 vector row
-RMS_K_TILE = 128  # HC_DIM reduction chunk of the sum of squares
+RMS_K_TILE = 512  # HC_DIM reduction chunk of the sum of squares
+LINEAR_K_TILE = 256  # HC_DIM reduction chunk of the projection
+LINEAR_OK = 4  # split-K fan-out of the projection
+LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 
 
 def golden_mhc_mixes(
@@ -107,30 +108,6 @@ def golden_mhc_head(x_hc: torch.Tensor) -> torch.Tensor:
 
 
 @pl.jit.inline
-def sinkhorn_normalize(
-    values: pl.Tensor[[HC_PAD, HC_PAD], pl.FP32],
-    COLUMNS: pl.constexpr,
-    EPS: pl.constexpr,
-):
-    rows = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
-    if COLUMNS:
-        rows[:, :] = pl.transpose(values, 0, 1)
-    else:
-        rows[:, :] = values
-    totals = accurate_row_sum(rows)
-    denominator = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
-    ones = pl.full([HC_PAD, HC_PAD], dtype=pl.FP32, value=1.0)
-    denominator[:, :] = pl.row_expand_mul(ones, pl.add(pl.mul(totals, 0.5), EPS))
-    normalized = accurate_divide(rows, denominator)
-    result = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
-    if COLUMNS:
-        result[:, :] = pl.transpose(normalized, 0, 1)
-    else:
-        result[:, :] = normalized
-    return result
-
-
-@pl.jit.inline
 def mhc_mixes(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
     function: pl.Tensor[[MIX_HC, HC_DIM], pl.BF16],
@@ -149,7 +126,6 @@ def mhc_mixes(
         t0 = block * RMS_T_TILE
         valid_rows = pl.min(RMS_T_TILE, t_dim - t0)
         sq_sum = pl.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
-        sq_error = pl.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_K_TILE, stage=4):
             k0 = kb * RMS_K_TILE
             rms_x_tile = pl.slice(
@@ -158,30 +134,51 @@ def mhc_mixes(
                 [t0, k0],
                 valid_shape=[valid_rows, RMS_K_TILE],
             )
-            rms_value = pl.cast(rms_x_tile, pl.FP32)
-            rms_square = pl.create_tensor([RMS_T_TILE, RMS_K_TILE], dtype=pl.FP32)
-            rms_square[:, :] = pl.mul(rms_value, rms_value)
-            part_high, part_low = accurate_row_sum_parts(rms_square)
-            sq_part = pl.reshape(part_high, [1, RMS_T_TILE])
-            part_error = pl.reshape(part_low, [1, RMS_T_TILE])
-            sq_updated = pl.add(sq_sum, sq_part)
-            recovered = pl.sub(sq_updated, sq_sum)
-            error = pl.add(pl.sub(sq_sum, pl.sub(sq_updated, recovered)), pl.sub(sq_part, recovered))
-            sq_error = pl.add(sq_error, pl.add(error, part_error))
-            sq_sum = sq_updated
-        rms_arg = pl.create_tensor([1, RMS_T_TILE], dtype=pl.FP32)
-        rms_arg[:, :] = pl.add(pl.mul(pl.add(sq_sum, sq_error), HC_DIM_INV), NORM_EPS)
-        inverse = accurate_rsqrt(rms_arg)
-        inv_rms[t0 : t0 + RMS_T_TILE, 0:1] = pl.reshape(inverse, [RMS_T_TILE, 1])
+            sq_sum = pl.add(
+                sq_sum,
+                pl.reshape(
+                    pl.row_sum(pl.mul(pl.cast(rms_x_tile, pl.FP32), pl.cast(rms_x_tile, pl.FP32))),
+                    [1, RMS_T_TILE],
+                ),
+            )
+        rms_arg = pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)
+        inv_rms[t0 : t0 + RMS_T_TILE, 0:1] = pl.reshape(
+            pl.rsqrt(rms_arg, high_precision=True), [RMS_T_TILE, 1]
+        )
+
+    mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
+    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="mhc_linear"):
+        t0 = (task // LINEAR_OK) * LINEAR_T_TILE
+        split = task % LINEAR_OK
+        k_base = split * LINEAR_K_PER_SPLIT
+        valid_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+        acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
+        for kb in pl.pipeline(LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
+            k0 = k_base + kb * LINEAR_K_TILE
+            linear_x_tile = pl.slice(
+                x_flat,
+                [LINEAR_T_TILE, LINEAR_K_TILE],
+                [t0, k0],
+                valid_shape=[valid_rows, LINEAR_K_TILE],
+            )
+            w_tile = pl.slice(
+                function,
+                [MIX_PAD, LINEAR_K_TILE],
+                [0, k0],
+                valid_shape=[MIX_HC, LINEAR_K_TILE],
+            )
+            acc = pl.matmul_acc(acc, linear_x_tile, w_tile, b_trans=True, init_cond=(kb == 0))
+        partial = split * t_linear + t0
+        mixes_partials[partial : partial + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
-    for block in pl.spmd(t_linear // LINEAR_T_TILE, name_hint="mhc_linear"):
+    for block in pl.spmd(t_linear // LINEAR_T_TILE, name_hint="mhc_linear_reduce"):
         t0 = block * LINEAR_T_TILE
-        valid_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
-        zero = pl.cast(0, pl.INDEX)
-        columns = pl.cast(MIX_HC, pl.INDEX)
-        raw = bf16_linear(x_flat, function, t0, zero, valid_rows, columns, LINEAR_T_TILE, MIX_PAD, HC_DIM, True)
-        mixes_raw[t0 : t0 + LINEAR_T_TILE, 0:MIX_PAD] = raw
+        total = mixes_partials[t0 : t0 + LINEAR_T_TILE, 0:MIX_PAD]
+        for split in pl.range(1, LINEAR_OK):
+            partial = split * t_linear + t0
+            total = pl.add(total, mixes_partials[partial : partial + LINEAR_T_TILE, 0:MIX_PAD])
+        mixes_raw[t0 : t0 + LINEAR_T_TILE, 0:MIX_PAD] = total
 
     residual_flat = pl.reshape(residual_mix, [t_dim * HC_MULT, HC_MULT])
     for t in pl.spmd(t_dim, name_hint="mhc_coefficients"):
@@ -189,52 +186,37 @@ def mhc_mixes(
         s0 = pl.read(scale, [0])
         s1 = pl.read(scale, [1])
         s2 = pl.read(scale, [2])
-        pre_raw = pl.create_tensor([1, HC_PAD], dtype=pl.FP32)
-        post_raw = pl.create_tensor([1, HC_PAD], dtype=pl.FP32)
-        pre_base = pl.create_tensor([1, HC_PAD], dtype=pl.FP32)
-        post_base = pl.create_tensor([1, HC_PAD], dtype=pl.FP32)
+        pre_logits = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
+        post_logits = pl.tile.full([1, HC_PAD], dtype=pl.FP32, value=0.0)
         for j in pl.unroll(HC_PAD):
             h = j % HC_MULT
-            pl.write(pre_raw, [0, j], pl.read(mixes_raw, [t, h]))
-            pl.write(post_raw, [0, j], pl.read(mixes_raw, [t, HC_MULT + h]))
-            pl.write(pre_base, [0, j], pl.read(base, [h]))
-            pl.write(post_base, [0, j], pl.read(base, [HC_MULT + h]))
-        pre_logits = pl.create_tensor([1, HC_PAD], dtype=pl.FP32)
-        post_logits = pl.create_tensor([1, HC_PAD], dtype=pl.FP32)
-        pre_logits[:, :] = pl.add(pl.mul(pl.mul(pre_raw, inv), s0), pre_base)
-        post_logits[:, :] = pl.add(pl.mul(pl.mul(post_raw, inv), s1), post_base)
-        pre_sigmoid = accurate_sigmoid(pre_logits, 1, HC_PAD)
-        post_sigmoid = accurate_sigmoid(post_logits, 1, HC_PAD)
-        pre = pl.add(pre_sigmoid, HC_EPS)
-        post = pl.mul(post_sigmoid, 2.0)
-        pre_mix[t:t + 1, :] = pl.set_validshape(pre, 1, HC_MULT)
-        post_mix[t:t + 1, :] = pl.set_validshape(post, 1, HC_MULT)
+            pl.tile.write(pre_logits, [0, j], pl.read(mixes_raw, [t, h]) * inv * s0 + pl.read(base, [h]))
+            pl.tile.write(
+                post_logits,
+                [0, j],
+                pl.read(mixes_raw, [t, HC_MULT + h]) * inv * s1 + pl.read(base, [HC_MULT + h]),
+            )
+        pre = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0)), HC_EPS)
+        post = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
+        pl.store(pl.set_validshape(pre, 1, HC_MULT), [t, 0], pre_mix)
+        pl.store(pl.set_validshape(post, 1, HC_MULT), [t, 0], post_mix)
 
         # Four identical quadrants; each reduction counts its logical axis twice.
-        comb_raw = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
-        biases = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
+        logits = pl.tile.full([HC_PAD, HC_PAD], dtype=pl.FP32, value=0.0)
         for i in pl.unroll(HC_PAD):
             for j in pl.unroll(HC_PAD):
                 lane = 2 * HC_MULT + (i % HC_MULT) * HC_MULT + j % HC_MULT
-                pl.write(comb_raw, [i, j], pl.read(mixes_raw, [t, lane]))
-                pl.write(biases, [i, j], pl.read(base, [lane]))
-        logits = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
-        logits[:, :] = pl.add(pl.mul(pl.mul(comb_raw, inv), s2), biases)
-        exp_argument = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
-        exp_argument[:, :] = pl.row_expand_sub(logits, pl.row_max(logits))
-        exps_value = accurate_exp(exp_argument)
-        values = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
-        values[:, :] = exps_value
-        normalized = sinkhorn_normalize(values, False, 0.0)
-        values[:, :] = pl.add(normalized, HC_EPS)
-        normalized = sinkhorn_normalize(values, True, HC_EPS)
-        values[:, :] = normalized
+                pl.tile.write(
+                    logits, [i, j], pl.read(mixes_raw, [t, lane]) * inv * s2 + pl.read(base, [lane])
+                )
+        tmp = pl.create_tile([HC_PAD, HC_PAD], dtype=pl.FP32)
+        exps = pl.exp(pl.row_expand_sub(logits, pl.row_max(logits, tmp)))
+        rows = pl.add(pl.row_expand_div(exps, pl.mul(pl.row_sum(exps, tmp), 0.5)), HC_EPS)
+        rows = pl.col_expand_div(rows, pl.add(pl.mul(pl.col_sum(rows), 0.5), HC_EPS))
         for iteration in pl.range(HC_SINKHORN_ITER - 1):
-            normalized = sinkhorn_normalize(values, False, HC_EPS)
-            values[:, :] = normalized
-            normalized = sinkhorn_normalize(values, True, HC_EPS)
-            values[:, :] = normalized
-        residual_flat[t * HC_MULT:t * HC_MULT + HC_MULT, :] = pl.set_validshape(values, HC_MULT, HC_MULT)
+            rows = pl.row_expand_div(rows, pl.add(pl.mul(pl.row_sum(rows, tmp), 0.5), HC_EPS))
+            rows = pl.col_expand_div(rows, pl.add(pl.mul(pl.col_sum(rows), 0.5), HC_EPS))
+        pl.store(pl.set_validshape(rows, HC_MULT, HC_MULT), [t * HC_MULT, 0], residual_flat)
     return pre_mix, post_mix, residual_mix
 
 
@@ -265,17 +247,14 @@ def mhc_pre(
                 pl.cast(x_flat[t : t + 1, d0 : d0 + MIX_D_TILE], target_type=pl.FP32),
                 pl.read(pre_mix, [t, 0]),
             )
-            correction = pl.full([1, MIX_D_TILE], dtype=pl.FP32, value=0.0)
             for stream in pl.unroll(HC_MULT - 1):
                 head = stream + 1
                 tile = x_flat[t : t + 1, head * D + d0 : head * D + d0 + MIX_D_TILE]
-                partial = pl.mul(pl.cast(tile, target_type=pl.FP32), pl.read(pre_mix, [t, head]))
-                updated = pl.add(value, partial)
-                recovered = pl.sub(updated, value)
-                error = pl.add(pl.sub(value, pl.sub(updated, recovered)), pl.sub(partial, recovered))
-                correction = pl.add(correction, error)
-                value = updated
-            output[t : t + 1, d0 : d0 + MIX_D_TILE] = pl.cast(pl.add(value, correction), target_type=pl.BF16, mode="rint")
+                value = pl.add(
+                    value,
+                    pl.mul(pl.cast(tile, target_type=pl.FP32), pl.read(pre_mix, [t, head])),
+                )
+            output[t : t + 1, d0 : d0 + MIX_D_TILE] = pl.cast(value, target_type=pl.BF16, mode="rint")
     return output, pre_tid
 
 
@@ -320,19 +299,14 @@ def mhc_post(
             x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + MIX_D_TILE], target_type=pl.FP32)
             update = pl.cast(pl.mul(x_tile, pl.read(post_rounded, [t, out_h])), pl.BF16, mode="rint")
             value = pl.full([1, MIX_D_TILE], dtype=pl.FP32, value=0.0)
-            correction = pl.full([1, MIX_D_TILE], dtype=pl.FP32, value=0.0)
             for in_h in pl.unroll(HC_MULT):
                 residual_tile = residual_flat[t : t + 1, in_h * D + d0 : in_h * D + d0 + MIX_D_TILE]
                 partial = pl.mul(
                     pl.cast(residual_tile, target_type=pl.FP32),
                     pl.read(residual_rounded, [t, in_h * HC_MULT + out_h]),
                 )
-                updated = pl.add(value, partial)
-                recovered = pl.sub(updated, value)
-                error = pl.add(pl.sub(value, pl.sub(updated, recovered)), pl.sub(partial, recovered))
-                correction = pl.add(correction, error)
-                value = updated
-            residual_bf16 = pl.cast(pl.add(value, correction), pl.BF16, mode="rint")
+                value = pl.add(value, partial)
+            residual_bf16 = pl.cast(value, pl.BF16, mode="rint")
             combined = pl.add(pl.cast(update, pl.FP32), pl.cast(residual_bf16, pl.FP32))
             output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + MIX_D_TILE] = pl.cast(
                 combined, target_type=pl.BF16, mode="rint"
@@ -360,18 +334,12 @@ def mhc_head(
     for t in pl.spmd(t_dim, name_hint="mhc_head"):
         for d0 in pl.pipeline(0, D, MIX_D_TILE, stage=2):
             value = pl.cast(x_flat[t : t + 1, d0 : d0 + MIX_D_TILE], target_type=pl.FP32)
-            correction = pl.full([1, MIX_D_TILE], dtype=pl.FP32, value=0.0)
             for stream in pl.unroll(HC_MULT - 1):
                 head = stream + 1
                 tile = x_flat[t : t + 1, head * D + d0 : head * D + d0 + MIX_D_TILE]
-                partial = pl.cast(tile, target_type=pl.FP32)
-                updated = pl.add(value, partial)
-                recovered = pl.sub(updated, value)
-                error = pl.add(pl.sub(value, pl.sub(updated, recovered)), pl.sub(partial, recovered))
-                correction = pl.add(correction, error)
-                value = updated
+                value = pl.add(value, pl.cast(tile, target_type=pl.FP32))
             output[t : t + 1, d0 : d0 + MIX_D_TILE] = pl.cast(
-                pl.mul(pl.add(value, correction), 1.0 / HC_MULT), target_type=pl.BF16, mode="rint"
+                pl.mul(value, 1.0 / HC_MULT), target_type=pl.BF16, mode="rint"
             )
     return output
 

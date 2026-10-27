@@ -36,12 +36,11 @@ import torch
 
 from models.glm5_3_flash.config import FLASH, T_DYN, D
 from models.glm5_3_flash.golden import rms_norm
-from models.glm5_3_flash.elementwise import accurate_divide_parts, accurate_row_sum_parts, accurate_rsqrt
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
 
 NORM_WIDTH = pl.dynamic("GLM53_NORM_WIDTH")
 NORM_T_TILE = 8
-NORM_D_TILE = 128
+NORM_D_TILE = 512
 QUANT_D_TILE = D // NORM_T_TILE
 EPS = FLASH.rms_norm_eps
 assert D % NORM_D_TILE == 0
@@ -57,8 +56,8 @@ def golden_rmsnorm_quant(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Emit BF16 RMSNorm and its dynamically quantized INT8 view."""
     value = x.float()
-    square_mean = value.double().square().mean(dim=-1, keepdim=True).float()
-    inverse = torch.rsqrt((square_mean + EPS).double()).float()
+    square_mean = value.square().mean(dim=-1, keepdim=True)
+    inverse = torch.rsqrt(square_mean + EPS)
     unit = (value * inverse).to(x.dtype).float()
     normalized = (unit * weight.to(x.dtype).float()).to(x.dtype)
     quant_source = normalized.float()
@@ -84,37 +83,21 @@ def rmsnorm(
     weight: pl.Tensor[[NORM_WIDTH], pl.BF16],
     output: pl.Tensor[[T_DYN, NORM_WIDTH], pl.BF16],
 ):
-    """Normalize 128-aligned widths, up to eight tokens per task."""
+    """Normalize 512-aligned widths, up to eight tokens per task."""
     t_dim = pl.tensor.dim(x, 0)
     width = pl.tensor.dim(x, 1)
     for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint='glm53_rmsnorm'):
         t0 = block * NORM_T_TILE
         valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
         square_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
-        square_error = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
         for norm_k in pl.pipeline(0, width, NORM_D_TILE, stage=1):
             norm_part = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, norm_k], valid_shape=[valid_rows, NORM_D_TILE])
             norm_value = pl.cast(norm_part, pl.FP32)
-            norm_square = pl.create_tensor([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32)
-            norm_square[:, :] = pl.mul(norm_value, norm_value)
-            part_high, part_low = accurate_row_sum_parts(norm_square)
-            part_sum = pl.reshape(part_high, [1, NORM_T_TILE])
-            part_error = pl.reshape(part_low, [1, NORM_T_TILE])
-            updated_sum = pl.add(square_sum, part_sum)
-            recovered = pl.sub(updated_sum, square_sum)
-            error = pl.add(pl.sub(square_sum, pl.sub(updated_sum, recovered)), pl.sub(part_sum, recovered))
-            square_error = pl.add(square_error, pl.add(error, part_error))
-            square_sum = updated_sum
-        sum_high = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
-        sum_low = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
-        denominator = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
-        sum_high[:, :] = square_sum
-        sum_low[:, :] = square_error
-        denominator[:, :] = pl.add(pl.mul(square_sum, 0.0), pl.cast(pl.cast(width, pl.INT32), pl.FP32))
-        mean = accurate_divide_parts(sum_high, sum_low, denominator, 1, NORM_T_TILE)
-        norm_argument = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
-        norm_argument[:, :] = pl.add(mean, EPS)
-        inverse = accurate_rsqrt(norm_argument)
+            norm_square = pl.mul(norm_value, norm_value)
+            part_sum = pl.reshape(pl.row_sum(norm_square), [1, NORM_T_TILE])
+            square_sum = pl.add(square_sum, part_sum)
+        norm_argument = pl.add(pl.div(square_sum, pl.cast(pl.cast(width, pl.INT32), pl.FP32)), EPS)
+        inverse = pl.rsqrt(norm_argument, high_precision=True)
         inv_rms = pl.reshape(inverse, [NORM_T_TILE, 1])
         for kb in pl.pipeline(width // NORM_D_TILE, stage=2):
             k0 = kb * NORM_D_TILE
@@ -152,23 +135,14 @@ def rmsnorm_quant(
         t0 = block * NORM_T_TILE
         valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
         square_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
-        square_error = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
         for norm_k in pl.pipeline(0, D, NORM_D_TILE, stage=1):
             norm_part = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, norm_k], valid_shape=[valid_rows, NORM_D_TILE])
             norm_value = pl.cast(norm_part, pl.FP32)
-            norm_square = pl.create_tensor([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32)
-            norm_square[:, :] = pl.mul(norm_value, norm_value)
-            part_high, part_low = accurate_row_sum_parts(norm_square)
-            part_sum = pl.reshape(part_high, [1, NORM_T_TILE])
-            part_error = pl.reshape(part_low, [1, NORM_T_TILE])
-            updated_sum = pl.add(square_sum, part_sum)
-            recovered = pl.sub(updated_sum, square_sum)
-            error = pl.add(pl.sub(square_sum, pl.sub(updated_sum, recovered)), pl.sub(part_sum, recovered))
-            square_error = pl.add(square_error, pl.add(error, part_error))
-            square_sum = updated_sum
-        norm_argument = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
-        norm_argument[:, :] = pl.add(pl.mul(pl.add(square_sum, square_error), 1.0 / D), EPS)
-        inverse = accurate_rsqrt(norm_argument)
+            norm_square = pl.mul(norm_value, norm_value)
+            part_sum = pl.reshape(pl.row_sum(norm_square), [1, NORM_T_TILE])
+            square_sum = pl.add(square_sum, part_sum)
+        norm_argument = pl.add(pl.mul(square_sum, 1.0 / D), EPS)
+        inverse = pl.rsqrt(norm_argument, high_precision=True)
         inv_rms = pl.reshape(inverse, [NORM_T_TILE, 1])
         for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
             k0 = kb * NORM_D_TILE

@@ -626,7 +626,7 @@ def golden_decode_fwd(tensors, *, observed=None):
             else:
                 for rank in range(EP_SIZE):
                     partials.append(golden_sparse_step(tensors, normed, rank, layer // 4, step))
-            reduced = torch.stack(partials).double().sum(0).float().to(torch.bfloat16)
+            reduced = torch.stack(partials).sum(0).to(torch.bfloat16)
             tensors["layer_outputs"][:, step, layer, 0].copy_(reduced)
             if observed is not None:
                 reduced = observed["layer_outputs"][0, step, layer, 0]
@@ -645,7 +645,7 @@ def golden_decode_fwd(tensors, *, observed=None):
                     partials = [golden_dense_mlp_bf16(
                         dense_input, tensors["dense_gate_up"][rank, layer], tensors["dense_down"][rank, layer]
                     ).float() for rank in range(EP_SIZE)]
-                    reduced = torch.stack(partials).double().sum(0).float().to(torch.bfloat16)
+                    reduced = torch.stack(partials).sum(0).to(torch.bfloat16)
                 else:
                     _, x_int8, x_scale = golden_rmsnorm_quant(mixed, tensors["norm_weight"][0, layer, 1])
                     partials = []
@@ -656,7 +656,7 @@ def golden_decode_fwd(tensors, *, observed=None):
                             case[dst] = tensors[src][rank, layer]
                         golden_dense_mlp_fn(case)
                         partials.append(case["output"])
-                    reduced = torch.stack(partials).double().sum(0).float().to(torch.bfloat16)
+                    reduced = torch.stack(partials).sum(0).to(torch.bfloat16)
             else:
                 from models.glm5_3_flash.decode_layer import golden_decode_layer
 

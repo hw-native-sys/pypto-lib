@@ -1270,11 +1270,9 @@ class TestPlatformResolution:
         ],
     )
     def test_known_platforms(self, platform, expected_name):
-        from pypto.backend import BackendType
-
         cfg = normalize_config({"platform": platform})
         assert cfg.platform == platform
-        assert cfg.backend_type == getattr(BackendType, expected_name)
+        assert cfg.backend_type.name == expected_name
 
     def test_unknown_platform_raises_valueerror(self):
         with pytest.raises(ValueError, match="Invalid platform"):

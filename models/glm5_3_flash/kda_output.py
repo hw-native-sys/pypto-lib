@@ -45,8 +45,7 @@ import torch
 
 from models.glm5_3_flash.config import FLASH, KDA_DIM, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, T_DYN, D
 from models.glm5_3_flash.golden import rms_norm_gated
-from models.glm5_3_flash.elementwise import accurate_sigmoid, accurate_rsqrt, accurate_row_sum
-from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
+from models.glm5_3_flash.linear import bf16_linear
 
 EPS = FLASH.rms_norm_eps
 KDA_DIM_INV = 1.0 / KDA_DIM
@@ -67,7 +66,7 @@ def golden_kda_output(
     flattened = normalized.reshape(*normalized.shape[:-2], -1)
     # Match the BF16 local linear output before TP reduction. FP32 is only
     # the exchange dtype; it carries the widened BF16 result.
-    return golden_bf16_linear(flattened, w_o).to(torch.bfloat16).float()
+    return (flattened.float() @ w_o.float().t()).to(torch.bfloat16).float()
 
 
 @pl.jit.inline
@@ -93,12 +92,12 @@ def kda_output(
         value = pl.cast(value_v1, pl.FP32)
         square_buffer = pl.create_tensor([NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
         square_buffer[:, :] = pl.mul(value, value)
-        square_sum = accurate_row_sum(square_buffer)
+        square_sum = pl.row_sum(square_buffer)
         norm_argument = pl.create_tensor([1, NORM_ROWS_TILE], dtype=pl.FP32)
         part_v3 = pl.mul(square_sum, KDA_DIM_INV)
         part_v4 = pl.add(part_v3, EPS)
         norm_argument[:, :] = pl.reshape(part_v4, [1, NORM_ROWS_TILE])
-        inverse = accurate_rsqrt(norm_argument)
+        inverse = pl.rsqrt(norm_argument, high_precision=True)
         inv_rms = pl.reshape(inverse, [NORM_ROWS_TILE, 1])
         normed_v5 = pl.row_expand_mul(value, inv_rms)
         normed_v6 = pl.cast(weight_row[0:1, 0:KDA_DIM], pl.FP32)
@@ -107,7 +106,7 @@ def kda_output(
         gate = pl.cast(gate_v7, pl.FP32)
         gate_buffer = pl.create_tensor([NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
         gate_buffer[:, :] = gate
-        gate_sigmoid = accurate_sigmoid(gate_buffer, NORM_ROWS_TILE, KDA_DIM)
+        gate_sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_buffer)), 1.0))
         activated = pl.mul(normed, gate_sigmoid)
         activated_bf16 = pl.cast(activated, pl.BF16, mode='rint')
         gated_rows[r0:r0 + NORM_ROWS_TILE, 0:KDA_DIM] = pl.set_validshape(activated_bf16, rows, KDA_DIM)
@@ -117,7 +116,7 @@ def kda_output(
         d0 = task % (D // D_TILE) * D_TILE
         rows = pl.min(T_TILE, t_dim - t0)
         partial_v8 = pl.cast(D_TILE, pl.INDEX)
-        partial = bf16_linear(gated, w_o, t0, d0, rows, partial_v8, T_TILE, D_TILE, LOCAL_KDA_QKV_DIM, True)
+        partial = bf16_linear(gated, w_o, t0, d0, rows, partial_v8, T_TILE, D_TILE, LOCAL_KDA_QKV_DIM)
         local_bf16 = pl.cast(partial, pl.BF16, mode="rint")
         exchange_value = pl.cast(local_bf16, pl.FP32)
         output[t0:t0 + T_TILE, d0:d0 + D_TILE] = pl.set_validshape(exchange_value, rows, D_TILE)
