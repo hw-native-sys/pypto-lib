@@ -122,7 +122,7 @@ def decode_c1a_full(
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
-    q_proj_rope(
+    qr, query, qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
@@ -171,6 +171,7 @@ def decode_c1a_full(
     (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
         x_norm, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
         num_tokens, score_width, x_ready, private_query, private_route,
+        qb_payload, qb_scales, reuse_projection_input=True,
         pretransposed=True, query_max_workers=INDEX_QUERY_WORKER_TILE,
     )
     topk_tid, scores_tid = score_select_c1a_groups(

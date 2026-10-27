@@ -210,6 +210,9 @@ def q_proj_rope(
     q_b_max_workers: pl.constexpr = 2147483647,
 ):
     """Project QA, normalize and quantize the latent, then project QB and rotate Q."""
+    payload_rows = pl.tensor.dim(payload, 0)
+    qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
         group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
         group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
@@ -221,17 +224,18 @@ def q_proj_rope(
             group_rows, 0, 0, 0,
             D, Q_LORA, "proj_q_a", Q_A_N_TILE, Q_A_K_TILE, 1, 0, 0, PROJ_M_TILE, 2147483647, 2,
         )
-        qb_payload = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.FP8E4M3FN)
-        qb_scales = pl.create_tensor([1, PROJ_M_TILE * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+        qb_payload_group = pl.tensor.slice(qb_payload, [PROJ_M_TILE, Q_LORA], [group_start, 0])
+        qb_scale_start = group_start * (Q_LORA // 32)
+        qb_scales_group = pl.tensor.slice(qb_scales, [1, PROJ_M_TILE * (Q_LORA // 32)], [0, qb_scale_start])
         for q_mt in pl.parallel(PROJ_M_TILE // MX_M_TILE):
             q_local = q_mt * MX_M_TILE
             q_start = group_start + pl.min(q_local, group_rows)
             q_rows = pl.max(pl.min(MX_M_TILE, group_rows - q_local), 0)
             projected_tile = pl.slice(projected, [q_rows, Q_LORA], [q_local, 0])
             latent_tile = pl.slice(query_latent, [q_rows, Q_LORA], [q_start, 0])
-            qb_payload_tile = pl.tensor.slice(qb_payload, [MX_M_TILE, Q_LORA], [q_local, 0])
-            qb_scale_start = q_local * (Q_LORA // 32)
-            qb_scales_tile = pl.tensor.slice(qb_scales, [1, MX_M_TILE * (Q_LORA // 32)], [0, qb_scale_start])
+            qb_payload_tile = pl.tensor.slice(qb_payload_group, [MX_M_TILE, Q_LORA], [q_local, 0])
+            qb_scale_offset = q_local * (Q_LORA // 32)
+            qb_scales_tile = pl.tensor.slice(qb_scales_group, [1, MX_M_TILE * (Q_LORA // 32)], [0, qb_scale_offset])
             _q_normalize_to_mx(
                 projected_tile, q_norm_weight, latent_tile,
                 qb_payload_tile, qb_scales_tile, q_rows, 5,
@@ -239,12 +243,12 @@ def q_proj_rope(
         query_group = pl.slice(query, [group_rows, LOCAL_H * HEAD_DIM], [group_start, 0])
         group_tokens = pl.cast(group_rows, pl.INT32)
         gemm_mxfp8_to_bf16(
-            qb_payload, qb_scales, wq_b, wq_b_scale, query_group,
+            qb_payload_group, qb_scales_group, wq_b, wq_b_scale, query_group,
             group_tokens, 0, 0, 0, Q_LORA, LOCAL_H * HEAD_DIM,
             "proj_q_b", q_b_n_tile, K_TILE, 1, 0, 0, PROJ_M_TILE, q_b_max_workers, 4,
         )
         _rope_inplace(query, rope_cos, rope_sin, group_start, group_tokens, LOCAL_H, "attention_q_rope")
-    return query_latent, query
+    return query_latent, query, qb_payload, qb_scales
 
 
 @pl.jit.inline(auto_scope=False)

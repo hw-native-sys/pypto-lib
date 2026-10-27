@@ -47,7 +47,13 @@ def gemm_mxfp8_to_bf16(
     k_stages: pl.constexpr = 2,
 ):
     """Project one prequantized row tile into BF16 output."""
-    scale_slice = activation_scale_backing[scale_row:scale_row + 1, :]
+    backing_rows = pl.tensor.dim(activation_scale_backing, 0)
+    backing_width = pl.tensor.dim(activation_scale_backing, 1)
+    backing_size = backing_rows * backing_width
+    activation_scales_nd = pl.tensor.view(activation_scale_backing, [1, backing_size], layout=pl.ND)
+    scale_offset = scale_row * backing_width
+    scale_end = scale_offset + m_tile * (width // 32)
+    scale_slice = activation_scales_nd[0:1, scale_offset:scale_end]
     activation_scale = pl.tensor.view(scale_slice, [m_tile, width // 32], layout=pl.MX_A_ZZ)
     scale_group_size = (width // 32) * output_width
     scale_backing_flat = pl.tensor.view(weight_scale, [1, group_count * scale_group_size], layout=pl.ND)
