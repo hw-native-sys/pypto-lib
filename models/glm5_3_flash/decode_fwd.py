@@ -394,9 +394,9 @@ def l3_decode_fwd(
     expert_gate_up_scale: pl.Tensor[[EP_SIZE, N_MOE, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     expert_down: pl.Tensor[[EP_SIZE, N_MOE, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     expert_down_scale: pl.Tensor[[EP_SIZE, N_MOE, N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_gate_up: pl.Tensor[[EP_SIZE, N_MOE, 2 * MOE_INTER, D], pl.INT8, pl.NZ],
+    shared_gate_up: pl.Tensor[[EP_SIZE, N_MOE, 2 * MOE_INTER, D], pl.INT8],
     shared_gate_up_scale: pl.Tensor[[EP_SIZE, N_MOE, 2 * MOE_INTER], pl.FP32],
-    shared_down: pl.Tensor[[EP_SIZE, N_MOE, D, MOE_INTER], pl.INT8, pl.NZ],
+    shared_down: pl.Tensor[[EP_SIZE, N_MOE, D, MOE_INTER], pl.INT8],
     shared_down_scale: pl.Tensor[[EP_SIZE, N_MOE, D], pl.FP32],
     kv_slots: pl.Tensor[[EP_SIZE, STEPS, T], pl.INT32],
     pool_token_slots: pl.Tensor[[EP_SIZE, STEPS, T, INDEX_KPOOL], pl.INT32],
@@ -814,10 +814,7 @@ def build_tensor_specs(checkpoint=None):
                 value = (torch.randn(full_shape, generator=gen) * std).to(dtype)
             value = value.expand(EP_SIZE, *shape).contiguous()
             return pack_int8_nz(value) if name in ("shared_gate_up", "shared_down") else value
-        # NZ rank slicing retains a singleton axis in host orchestration;
-        # StackedDeviceTensor currently requires an integer leading index.
-        resident = None if name in ("shared_gate_up", "shared_down") else "stacked"
-        specs.append(TensorSpec(name, [EP_SIZE, *shape], dtype, init_value=init, resident=resident))
+        specs.append(TensorSpec(name, [EP_SIZE, *shape], dtype, init_value=init, resident="stacked"))
     if checkpoint is not None:
         pending = {}
 
