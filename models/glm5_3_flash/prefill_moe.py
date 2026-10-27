@@ -7,61 +7,97 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-"""The sparse layer's routed half at prefill scale: pack -> exchange -> experts -> scatter back.
-
-Capacity model. ``--tokens`` is this rank's token capacity ``T``. Routing is
-dropless, so one source may legally send all ``T * TOPK`` of its routes to a
-single destination: every peer lane is sized ``T * TOPK`` rows, and a rank's
-receive windows hold ``N_RANKS`` such lanes. Only live rows cross the wire; the
-static capacity is the dropless upper bound and is never computed over.
-
-This is the prefill counterpart of ``decode_moe.py`` — same six stages (pack,
-arrive, regroup, experts, return, combine), but the decode entry's serial
-per-destination pack scan is replaced by a count/prefix pass with parallel
-payload movement, and the transports are capacity-sized:
-
-* ``prefill_moe_dispatch`` counts each route's ``(destination, local expert)``
-  lane once in a single InCore task (concurrent INT32 count updates would drop
-  cache lines, and one writer gives the pack stable expert-major slots), packs
-  every token's INT8 row plus a 4-wide aux row (dequant scale, routing weight,
-  route id, source) into the source's contiguous send buffer, exchanges the
-  per-destination count rows, pushes the payload in four disjoint row streams
-  per destination, and re-sorts each local expert's received rows source-major
-  into the slab ``expert_routed`` consumes (expert slabs are ROW_TILE-aligned,
-  so the resort's per-field scalar writes own whole cache lines).
-* ``expert_routed`` runs the local experts over the slab; its ``expert_offsets``
-  are the prefix sums of the exchanged expert counts.
-* ``prefill_moe_return`` scatters every live expert row back to the rank that
-  routed it (slot ``token * TOPK + k``) and sums the TOPK slots per token.
-
-The barriers are epoch-keyed ``AtomicAdd(1)`` notifies: every rank notifies
-each peer exactly once per phase per call, so ``signal[src] >= epoch`` identifies
-the current phase without clearing the windows. Each rank completes combine
-before starting its next dispatch. The L3 entry repeats the same inputs twice
-to exercise window reuse with successive epochs.
-
-Run (EP2, two ranks)::
-
-    python models/glm5_3_flash/prefill_moe.py -p a2a3 --sim -d 0,1 --ep 2
-    python models/glm5_3_flash/prefill_moe.py -p a2a3    -d 0,1 --ep 2
-"""
+"""GLM-5.3-Flash prefill expert dispatch, execution and combination."""
 
 import sys
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+if __name__ == "__main__" and not any(tok == "--ep" or tok.startswith("--ep=") for tok in sys.argv):
+    sys.argv += ["--ep", "2"]
+
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-# Config freezes the EP shapes at import time. Standalone CI runs use EP2;
-# imports leave argv untouched so the surrounding application owns deployment.
-if __name__ == "__main__" and not any(tok == "--ep" or tok.startswith("--ep=") for tok in sys.argv):
-    sys.argv += ["--ep", "2"]
+from models.glm5_3_flash.config import EP_SIZE, MOE_INTER, N_LOCAL_EXPERTS, TOPK, D
+from models.glm5_3_flash.expert_routed import RECV_TILE, expert_routed, golden_expert_routed_fn
+from models.glm5_3_flash.quantization import quantize_per_token_int8
+from models.glm5_3_flash.utils import gen_routed_weight
 
-from models.glm5_3_flash.config import D, EP_SIZE, FLASH, N_LOCAL_EXPERTS, TOPK
-from models.glm5_3_flash.expert_routed import RECV_TILE as EXPERT_RECV_TILE, expert_routed
+T_DYN = pl.dynamic('GLM53_T_DYN')
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+LANE_ROWS_DYN = pl.dynamic("GLM53_MOE_LANE_ROWS")
+EXPERT_ROWS_DYN = pl.dynamic("GLM53_MOE_EXPERT_ROWS")
+ROUTE_ROWS_DYN = pl.dynamic("GLM53_MOE_ROUTE_ROWS")
+N_RANKS = EP_SIZE
+
+
+@pl.jit.inline
+def prefill_moe_return(
+    expert_y: pl.Tensor[[EXPERT_ROWS_DYN, D], pl.FP32],
+    slab_route: pl.Tensor[[EXPERT_ROWS_DYN, 1], pl.INT32],
+    slab_src: pl.Tensor[[EXPERT_ROWS_DYN, 1], pl.INT32],
+    expert_offsets: pl.Tensor[[N_LOCAL_EXPERTS + 1], pl.INT32],
+    expert_counts: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    routed: pl.Out[pl.Tensor[[T_DYN, D], pl.FP32]],
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+    dispatch_tid: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Scatter every live expert row to its source's route slot, then sum TOPK."""
+    token_capacity = pl.tensor.dim(routed, 0)
+    with pl.spmd(N_LOCAL_EXPERTS * RETURN_STREAMS, name_hint="prefill_return_put", deps=[dispatch_tid], allow_early_resolve=False) as return_tid:
+        return_block = pl.tile.get_block_idx()
+        local_e = return_block // RETURN_STREAMS
+        stream = return_block % RETURN_STREAMS
+        base = pl.cast(pl.read(expert_offsets, [local_e]), pl.INDEX)
+        n_rows = pl.cast(pl.read(expert_counts, [local_e, 0]), pl.INDEX)
+        for row in pl.range(stream, n_rows, RETURN_STREAMS):
+            src = pl.read(slab_src, [base + row, 0])
+            slot = pl.cast(pl.read(slab_route, [base + row, 0]), pl.INDEX)
+            pld.tensor.put(
+                dst=slot_out, peer=src, src=expert_y, dst_offsets=[slot, 0], src_offsets=[base + row, 0],
+                shape=[1, D],
+            )
+
+    # Return barrier, then the local TOPK sum. The per-destination route scans
+    # the decode entry runs are gone: the payload carries its own route id, so
+    # each expert row is scattered straight to ``token * TOPK + k``.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_return_signal", deps=[return_tid]) as synced_tid:
+        for peer in pl.range(N_RANKS):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=return_ready, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(N_RANKS):
+            if src != my_rank:
+                pld.system.wait(signal=return_ready, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+
+    active = pl.cast(num_tokens, pl.INDEX)
+    if active < 0:
+        active = pl.cast(0, pl.INDEX)
+    if active > token_capacity:
+        active = pl.cast(token_capacity, pl.INDEX)
+    with pl.spmd((token_capacity + COMBINE_TILE - 1) // COMBINE_TILE, name_hint="prefill_combine", deps=[synced_tid]) as combine_tid:
+        t0 = pl.tile.get_block_idx() * COMBINE_TILE
+        for lane in pl.range(COMBINE_TILE):
+            token = t0 + lane
+            if token < token_capacity:
+                acc = pl.full([1, D], dtype=pl.FP32, value=0.0)
+                if token < active:
+                    for k in pl.range(TOPK):
+                        slot = token * TOPK + k
+                        acc = pl.add(acc, slot_out[slot : slot + 1, :])
+                routed[token : token + 1, :] = acc
+
+    return combine_tid
 
 
 def _parse_argv_int(flag: str, default: int) -> int:
@@ -73,77 +109,60 @@ def _parse_argv_int(flag: str, default: int) -> int:
     return default
 
 
-N_RANKS = EP_SIZE
-MOE_INTER = FLASH.moe_intermediate_size
 T = _parse_argv_int("--tokens", 64)
 ROUTES_PER_SRC = T * TOPK
-PEER_CAP = ROUTES_PER_SRC          # a source may send every route to one peer
-TOTAL_CAP = N_RANKS * PEER_CAP     # dropless per-rank receive capacity
-
-# tiling
+PEER_CAP = ROUTES_PER_SRC  # a source may send every route to one peer
+TOTAL_CAP = N_RANKS * PEER_CAP  # dropless per-rank receive capacity
 AUX_SCALE, AUX_W, AUX_ROUTE, AUX_SRC = 0, 1, 2, 3
-AUX_PAD = 16              # one 64-byte FP32 line per packed row
-# One line-padded INT32 row per (destination, source): the count exchange moves
-# this rank's per-local-expert counts, so the row width is the padded local
-# expert count, and every source's row owns whole 64-byte cache lines.
+AUX_PAD = 16  # one 64-byte FP32 line per packed row
 COUNT_PAD = ((N_LOCAL_EXPERTS + 15) // 16) * 16
-PACK_BLOCKS = 48          # source-side token pack width
-ROW_TILE = 16             # bulk transfer / resort row tile
-PUT_STREAMS = 4           # disjoint row streams per destination
+PACK_T_TILE = 48  # source-side token pack width
+ROW_TILE = 16  # bulk transfer / resort row tile
+PUT_STREAMS = 4  # disjoint row streams per destination
 RESORT_BLOCKS_PER_EXPERT = 1
-RETURN_STREAMS = 4        # disjoint row streams per local expert on the way back
+RETURN_STREAMS = 4  # disjoint row streams per local expert on the way back
 COMBINE_TILE = 16
-
-# Every local expert's slab starts on a ROW_TILE boundary. The resort's
-# per-field scalar writes (scale, weight, route, source) then own whole 64-byte
-# cache lines per expert, so two blocks can never lose each other's stores to a
-# shared line; the alignment pad rows the expert kernel computes are zeroed and
-# never returned.
 GROUPED_CAP = TOTAL_CAP + N_LOCAL_EXPERTS * (ROW_TILE - 1)
-
-assert N_RANKS >= 1
-assert T > 0 and T % COMBINE_TILE == 0
-assert PEER_CAP >= 1
 
 
 @pl.jit.inline
 def prefill_moe_dispatch(
-    route_indices: pl.Tensor[[T, TOPK], pl.INT32],
-    route_weights: pl.Tensor[[T, TOPK], pl.FP32],
-    x_int8: pl.Tensor[[T, D], pl.INT8],
-    x_scale: pl.Tensor[[T, 1], pl.FP32],
+    route_indices: pl.Tensor[[T_DYN, TOPK], pl.INT32],
+    route_weights: pl.Tensor[[T_DYN, TOPK], pl.FP32],
+    x_int8: pl.Tensor[[T_DYN, D], pl.INT8],
+    x_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     send_counts: pl.Tensor[[N_RANKS, 1], pl.INT32],
     recv_expert_counts: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS], pl.INT32],
     expert_counts: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     expert_offsets: pl.Tensor[[N_LOCAL_EXPERTS + 1], pl.INT32],
-    lane_x: pld.DistributedTensor[[TOTAL_CAP, D], pl.INT8],
-    lane_aux: pld.DistributedTensor[[TOTAL_CAP, AUX_PAD], pl.FP32],
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
     count_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     x_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    slab_x: pl.Tensor[[GROUPED_CAP, D], pl.INT8],
-    slab_scale: pl.Tensor[[GROUPED_CAP, 1], pl.FP32],
-    slab_weight: pl.Tensor[[GROUPED_CAP, 1], pl.FP32],
-    slab_route: pl.Tensor[[GROUPED_CAP, 1], pl.INT32],
-    slab_src: pl.Tensor[[GROUPED_CAP, 1], pl.INT32],
+    slab_x: pl.Tensor[[EXPERT_ROWS_DYN, D], pl.INT8],
+    slab_scale: pl.Tensor[[EXPERT_ROWS_DYN, 1], pl.FP32],
+    slab_weight: pl.Tensor[[EXPERT_ROWS_DYN, 1], pl.FP32],
+    slab_route: pl.Tensor[[EXPERT_ROWS_DYN, 1], pl.INT32],
+    slab_src: pl.Tensor[[EXPERT_ROWS_DYN, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Count/pack this rank's routes, exchange them, and regroup by local expert."""
-    x_send = pl.create_tensor([ROUTES_PER_SRC, D], dtype=pl.INT8, manual_dep=True)
-    aux_send = pl.create_tensor([ROUTES_PER_SRC, AUX_PAD], dtype=pl.FP32, manual_dep=True)
-    slot_map = pl.create_tensor([ROUTES_PER_SRC, 1], dtype=pl.INT32, manual_dep=True)
-    send_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL_EXPERTS], dtype=pl.INT32, manual_dep=True)
+    token_capacity = pl.tensor.dim(route_indices, 0)
+    route_capacity = token_capacity * TOPK
 
     active = pl.cast(num_tokens, pl.INDEX)
     if active < 0:
         active = pl.cast(0, pl.INDEX)
-    if active > T:
-        active = pl.cast(T, pl.INDEX)
+    if active > token_capacity:
+        active = pl.cast(token_capacity, pl.INDEX)
 
     # Count once in a single InCore task: concurrent INT32 count updates would
     # drop cache lines, and one writer gives the pack stable expert-major slots.
+    send_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL_EXPERTS], dtype=pl.INT32, manual_dep=True)
+    slot_map = pl.create_tensor([route_capacity, 1], dtype=pl.INT32, manual_dep=True)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_dispatch_count") as count_tid:
         counts = pl.array.create(N_RANKS * N_LOCAL_EXPERTS, pl.INT32)
         for lane in pl.range(N_RANKS * N_LOCAL_EXPERTS):
@@ -177,11 +196,11 @@ def prefill_moe_dispatch(
     # Pack every token's INT8 row into its routes' slots. The aux row carries
     # the dequant scale, the routing weight, the route id and the source, so the
     # expert side needs no route metadata from the wire structure.
-    with pl.spmd(
-        PACK_BLOCKS, name_hint="prefill_dispatch_pack", deps=[count_tid], allow_early_resolve=True
-    ) as pack_tid:
+    aux_send = pl.create_tensor([route_capacity, AUX_PAD], dtype=pl.FP32, manual_dep=True)
+    x_send = pl.create_tensor([route_capacity, D], dtype=pl.INT8, manual_dep=True)
+    with pl.spmd(PACK_T_TILE, name_hint="prefill_dispatch_pack", deps=[count_tid], allow_early_resolve=True) as pack_tid:
         pack_block = pl.tile.get_block_idx()
-        for token in pl.range(pack_block, active, PACK_BLOCKS):
+        for token in pl.range(pack_block, active, PACK_T_TILE):
             hidden_row = x_int8[token : token + 1, :]
             token_scale = pl.read(x_scale, [token, 0])
             for k in pl.range(TOPK):
@@ -199,9 +218,7 @@ def prefill_moe_dispatch(
     # Exchange the per-destination count rows: each destination learns how many
     # rows every source sent for each of its local experts, and this rank's own
     # receive counts, expert totals and offsets come out of the same task.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="prefill_dispatch_count_exchange", deps=[count_tid]
-    ) as count_exchange_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_dispatch_count_exchange", deps=[count_tid]) as count_exchange_tid:
         for dest in pl.range(N_RANKS):
             count_row = pl.tile.full([1, COUNT_PAD], dtype=pl.INT32, value=0)
             for e in pl.range(N_LOCAL_EXPERTS):
@@ -209,17 +226,11 @@ def prefill_moe_dispatch(
             pld.tile.remote_store(count_row, target=lane_count, peer=dest, offsets=[my_rank, 0])
             if dest != my_rank:
                 pld.system.notify(
-                    target=count_ready,
-                    peer=dest,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
+                    target=count_ready, peer=dest, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
                 )
         for src in pl.range(N_RANKS):
             if src != my_rank:
-                pld.system.wait(
-                    signal=count_ready, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge
-                )
+                pld.system.wait(signal=count_ready, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
         for e in pl.range(N_LOCAL_EXPERTS):
             expert_total = pl.const(0, pl.INT32)
             for src in pl.range(N_RANKS):
@@ -237,74 +248,50 @@ def prefill_moe_dispatch(
 
     # Push each destination its contiguous packed range in four disjoint row
     # streams; the aux rail rides the same rows and the same completion notify.
-    with pl.spmd(
-        N_RANKS * PUT_STREAMS,
-        name_hint="prefill_dispatch_put",
-        deps=[pack_tid, count_exchange_tid],
-        allow_early_resolve=False,
-    ) as put_tid:
+    with pl.spmd(N_RANKS * PUT_STREAMS, name_hint="prefill_dispatch_put", deps=[pack_tid, count_exchange_tid], allow_early_resolve=False) as put_tid:
         put_block = pl.tile.get_block_idx()
         dest = put_block // PUT_STREAMS
         stream = put_block % PUT_STREAMS
         n_rows = pl.cast(pl.read(send_counts, [dest, 0]), pl.INDEX)
         if n_rows < 0:
             n_rows = pl.cast(0, pl.INDEX)
-        if n_rows > PEER_CAP:
-            n_rows = pl.cast(PEER_CAP, pl.INDEX)
+        if n_rows > route_capacity:
+            n_rows = pl.cast(route_capacity, pl.INDEX)
         src_base = pl.cast(0, pl.INDEX)
         for prior in pl.range(dest):
             src_base = src_base + pl.cast(pl.read(send_counts, [prior, 0]), pl.INDEX)
-        dst_base = pl.cast(my_rank, pl.INDEX) * PEER_CAP
+        dst_base = pl.cast(my_rank, pl.INDEX) * route_capacity
         bulk = (n_rows // ROW_TILE) * ROW_TILE
         for row in pl.range(stream * ROW_TILE, bulk, PUT_STREAMS * ROW_TILE):
             pld.tensor.put(
-                dst=lane_x, peer=dest, src=x_send,
-                dst_offsets=[dst_base + row, 0], src_offsets=[src_base + row, 0],
-                shape=[ROW_TILE, D],
+                dst=lane_x, peer=dest, src=x_send, dst_offsets=[dst_base + row, 0],
+                src_offsets=[src_base + row, 0], shape=[ROW_TILE, D],
             )
             pld.tensor.put(
-                dst=lane_aux, peer=dest, src=aux_send,
-                dst_offsets=[dst_base + row, 0], src_offsets=[src_base + row, 0],
-                shape=[ROW_TILE, AUX_PAD],
+                dst=lane_aux, peer=dest, src=aux_send, dst_offsets=[dst_base + row, 0],
+                src_offsets=[src_base + row, 0], shape=[ROW_TILE, AUX_PAD],
             )
         for row in pl.range(bulk + stream, n_rows, PUT_STREAMS):
             pld.tensor.put(
-                dst=lane_x, peer=dest, src=x_send,
-                dst_offsets=[dst_base + row, 0], src_offsets=[src_base + row, 0],
-                shape=[1, D],
+                dst=lane_x, peer=dest, src=x_send, dst_offsets=[dst_base + row, 0],
+                src_offsets=[src_base + row, 0], shape=[1, D],
             )
             pld.tensor.put(
-                dst=lane_aux, peer=dest, src=aux_send,
-                dst_offsets=[dst_base + row, 0], src_offsets=[src_base + row, 0],
-                shape=[1, AUX_PAD],
+                dst=lane_aux, peer=dest, src=aux_send, dst_offsets=[dst_base + row, 0],
+                src_offsets=[src_base + row, 0], shape=[1, AUX_PAD],
             )
 
-    # Payload barrier: the counts retired before the payload, so a receiver's
-    # count-driven copies can trim every source lane before reading it.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="prefill_dispatch_signal", deps=[put_tid]
-    ) as payload_signal_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_dispatch_signal", deps=[put_tid]) as payload_signal_tid:
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
-                pld.system.notify(
-                    target=x_ready,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
+                pld.system.notify(target=x_ready, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(signal=x_ready, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
 
     # Re-sort each local expert's received rows source-major into the slab the
     # expert kernel consumes; the aux fields move with their payload row.
-    with pl.spmd(
-        N_LOCAL_EXPERTS * RESORT_BLOCKS_PER_EXPERT,
-        name_hint="prefill_dispatch_resort",
-        deps=[count_exchange_tid, payload_signal_tid],
-        allow_early_resolve=False,
-    ) as resort_tid:
+    with pl.spmd(N_LOCAL_EXPERTS * RESORT_BLOCKS_PER_EXPERT, name_hint="prefill_dispatch_resort", deps=[count_exchange_tid, payload_signal_tid], allow_early_resolve=False) as resort_tid:
         resort_block = pl.tile.get_block_idx()
         local_e = resort_block // RESORT_BLOCKS_PER_EXPERT
         stream = resort_block % RESORT_BLOCKS_PER_EXPERT
@@ -316,10 +303,8 @@ def prefill_moe_dispatch(
                 n_rows = pl.cast(pl.read(recv_expert_counts, [src, local_e]), pl.INDEX)
                 src_expert_base = pl.cast(0, pl.INDEX)
                 for prior_e in pl.range(local_e):
-                    src_expert_base = src_expert_base + pl.cast(
-                        pl.read(recv_expert_counts, [src, prior_e]), pl.INDEX
-                    )
-                input_base = src * PEER_CAP + src_expert_base
+                    src_expert_base = src_expert_base + pl.cast(pl.read(recv_expert_counts, [src, prior_e]), pl.INDEX)
+                input_base = src * route_capacity + src_expert_base
                 output_base = expert_base + source_prefix
                 bulk = (n_rows // ROW_TILE) * ROW_TILE
                 for row in pl.range(stream * ROW_TILE, bulk, RESORT_BLOCKS_PER_EXPERT * ROW_TILE):
@@ -335,28 +320,16 @@ def prefill_moe_dispatch(
                         row_in = input_base + row + inner
                         pl.write(slab_scale, [row_out, 0], pl.read(lane_aux, [row_in, AUX_SCALE]))
                         pl.write(slab_weight, [row_out, 0], pl.read(lane_aux, [row_in, AUX_W]))
-                        pl.write(
-                            slab_route, [row_out, 0],
-                            pl.cast(pl.read(lane_aux, [row_in, AUX_ROUTE]), pl.INT32),
-                        )
-                        pl.write(
-                            slab_src, [row_out, 0],
-                            pl.cast(pl.read(lane_aux, [row_in, AUX_SRC]), pl.INT32),
-                        )
+                        pl.write(slab_route, [row_out, 0], pl.cast(pl.read(lane_aux, [row_in, AUX_ROUTE]), pl.INT32))
+                        pl.write(slab_src, [row_out, 0], pl.cast(pl.read(lane_aux, [row_in, AUX_SRC]), pl.INT32))
                 for row in pl.range(bulk + stream, n_rows, RESORT_BLOCKS_PER_EXPERT):
                     row_out = output_base + row
                     row_in = input_base + row
                     slab_x[row_out : row_out + 1, :] = lane_x[row_in : row_in + 1, :]
                     pl.write(slab_scale, [row_out, 0], pl.read(lane_aux, [row_in, AUX_SCALE]))
                     pl.write(slab_weight, [row_out, 0], pl.read(lane_aux, [row_in, AUX_W]))
-                    pl.write(
-                        slab_route, [row_out, 0],
-                        pl.cast(pl.read(lane_aux, [row_in, AUX_ROUTE]), pl.INT32),
-                    )
-                    pl.write(
-                        slab_src, [row_out, 0],
-                        pl.cast(pl.read(lane_aux, [row_in, AUX_SRC]), pl.INT32),
-                    )
+                    pl.write(slab_route, [row_out, 0], pl.cast(pl.read(lane_aux, [row_in, AUX_ROUTE]), pl.INT32))
+                    pl.write(slab_src, [row_out, 0], pl.cast(pl.read(lane_aux, [row_in, AUX_SRC]), pl.INT32))
                 source_prefix = source_prefix + n_rows
             # Zero the expert's alignment pad: the expert kernel computes these
             # rows through zero scales, and their cache lines belong to this
@@ -369,82 +342,6 @@ def prefill_moe_dispatch(
                 pl.write(slab_src, [row, 0], pl.cast(0, pl.INT32))
 
     return resort_tid
-
-
-@pl.jit.inline
-def prefill_moe_return(
-    expert_y: pl.Tensor[[GROUPED_CAP, D], pl.FP32],
-    slab_route: pl.Tensor[[GROUPED_CAP, 1], pl.INT32],
-    slab_src: pl.Tensor[[GROUPED_CAP, 1], pl.INT32],
-    expert_offsets: pl.Tensor[[N_LOCAL_EXPERTS + 1], pl.INT32],
-    expert_counts: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    routed: pl.Out[pl.Tensor[[T, D], pl.FP32]],
-    slot_out: pld.DistributedTensor[[ROUTES_PER_SRC, D], pl.FP32],
-    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-    epoch: pl.Scalar[pl.INT32],
-    dispatch_tid: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    """Scatter every live expert row to its source's route slot, then sum TOPK."""
-    with pl.spmd(
-        N_LOCAL_EXPERTS * RETURN_STREAMS,
-        name_hint="prefill_return_put",
-        deps=[dispatch_tid],
-        allow_early_resolve=False,
-    ) as return_tid:
-        return_block = pl.tile.get_block_idx()
-        local_e = return_block // RETURN_STREAMS
-        stream = return_block % RETURN_STREAMS
-        base = pl.cast(pl.read(expert_offsets, [local_e]), pl.INDEX)
-        n_rows = pl.cast(pl.read(expert_counts, [local_e, 0]), pl.INDEX)
-        for row in pl.range(stream, n_rows, RETURN_STREAMS):
-            src = pl.read(slab_src, [base + row, 0])
-            slot = pl.cast(pl.read(slab_route, [base + row, 0]), pl.INDEX)
-            pld.tensor.put(
-                dst=slot_out, peer=src, src=expert_y,
-                dst_offsets=[slot, 0], src_offsets=[base + row, 0],
-                shape=[1, D],
-            )
-
-    # Return barrier, then the local TOPK sum. The per-destination route scans
-    # the decode entry runs are gone: the payload carries its own route id, so
-    # each expert row is scattered straight to ``token * TOPK + k``.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="prefill_return_signal", deps=[return_tid]
-    ) as synced_tid:
-        for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=return_ready,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        for src in pl.range(N_RANKS):
-            if src != my_rank:
-                pld.system.wait(
-                    signal=return_ready, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge
-                )
-
-    active = pl.cast(num_tokens, pl.INDEX)
-    if active < 0:
-        active = pl.cast(0, pl.INDEX)
-    if active > T:
-        active = pl.cast(T, pl.INDEX)
-    with pl.spmd(T // COMBINE_TILE, name_hint="prefill_combine", deps=[synced_tid]) as combine_tid:
-        t0 = pl.tile.get_block_idx() * COMBINE_TILE
-        for lane in pl.range(COMBINE_TILE):
-            token = t0 + lane
-            acc = pl.full([1, D], dtype=pl.FP32, value=0.0)
-            if token < active:
-                for k in pl.range(TOPK):
-                    slot = token * TOPK + k
-                    acc = pl.add(acc, slot_out[slot : slot + 1, :])
-            routed[token : token + 1, :] = acc
-
-    return combine_tid
 
 
 @pl.jit(auto_scope=False)
@@ -470,35 +367,28 @@ def l2_prefill_moe(
     epoch: pl.Scalar[pl.INT32],
 ):
     """One rank's orchestration of the three stages."""
-    send_counts = pl.create_tensor([N_RANKS, 1], dtype=pl.INT32)
-    recv_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    expert_counts = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
-    expert_offsets = pl.create_tensor([N_LOCAL_EXPERTS + 1], dtype=pl.INT32)
-    slab_x = pl.create_tensor([GROUPED_CAP, D], dtype=pl.INT8)
-    slab_scale = pl.create_tensor([GROUPED_CAP, 1], dtype=pl.FP32)
-    slab_weight = pl.create_tensor([GROUPED_CAP, 1], dtype=pl.FP32)
-    slab_route = pl.create_tensor([GROUPED_CAP, 1], dtype=pl.INT32)
-    slab_src = pl.create_tensor([GROUPED_CAP, 1], dtype=pl.INT32)
-    expert_y = pl.create_tensor([GROUPED_CAP, D], dtype=pl.FP32)
 
+    slab_src = pl.create_tensor([GROUPED_CAP, 1], dtype=pl.INT32)
+    slab_route = pl.create_tensor([GROUPED_CAP, 1], dtype=pl.INT32)
+    slab_weight = pl.create_tensor([GROUPED_CAP, 1], dtype=pl.FP32)
+    slab_scale = pl.create_tensor([GROUPED_CAP, 1], dtype=pl.FP32)
+    slab_x = pl.create_tensor([GROUPED_CAP, D], dtype=pl.INT8)
+    expert_offsets = pl.create_tensor([N_LOCAL_EXPERTS + 1], dtype=pl.INT32)
+    expert_counts = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
+    recv_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL_EXPERTS], dtype=pl.INT32)
+    send_counts = pl.create_tensor([N_RANKS, 1], dtype=pl.INT32)
     dispatch_tid = prefill_moe_dispatch(
-        route_indices, route_weights, x_int8, x_scale,
-        send_counts, recv_expert_counts, expert_counts, expert_offsets,
-        lane_x, lane_aux, lane_count, count_ready, x_ready,
-        slab_x, slab_scale, slab_weight, slab_route, slab_src,
-        num_tokens, my_rank, epoch,
+        route_indices, route_weights, x_int8, x_scale, send_counts, recv_expert_counts, expert_counts,
+        expert_offsets, lane_x, lane_aux, lane_count, count_ready, x_ready, slab_x, slab_scale, slab_weight,
+        slab_route, slab_src, num_tokens, my_rank, epoch,
     )
+    expert_y = pl.create_tensor([GROUPED_CAP, D], dtype=pl.FP32)
     expert_routed(
-        slab_x, slab_scale,
-        w_gate_up, w_gate_up_scale,
-        w_down, w_down_scale,
-        expert_offsets,
-        slab_weight,
-        expert_y,
+        slab_x, slab_scale, w_gate_up, w_gate_up_scale,
+        w_down, w_down_scale, expert_offsets, slab_weight, expert_y,
     )
     prefill_moe_return(
-        expert_y, slab_route, slab_src, expert_offsets, expert_counts,
-        routed, slot_out, return_ready,
+        expert_y, slab_route, slab_src, expert_offsets, expert_counts, routed, slot_out, return_ready,
         num_tokens, my_rank, epoch, dispatch_tid,
     )
     return routed
@@ -539,12 +429,9 @@ def l3_prefill_moe(
             slot_out = pld.window(slot_out_buf, [ROUTES_PER_SRC, D], dtype=pl.FP32)
             return_ready = pld.window(return_ready_buf, [N_RANKS, 1], dtype=pl.INT32)
             l2_prefill_moe(
-                route_indices[r], route_weights[r], x_int8[r], x_scale[r],
-                w_gate_up[r], w_gate_up_scale[r], w_down[r], w_down_scale[r],
-                routed[r],
-                lane_x, lane_aux, lane_count, count_ready, x_ready, slot_out, return_ready,
-                num_tokens, r, pl.cast(call + 1, pl.INT32),
-                device=r,
+                route_indices[r], route_weights[r], x_int8[r], x_scale[r], w_gate_up[r], w_gate_up_scale[r],
+                w_down[r], w_down_scale[r], routed[r], lane_x, lane_aux, lane_count, count_ready, x_ready,
+                slot_out, return_ready, num_tokens, r, pl.cast(call + 1, pl.INT32), device=r,
             )
 
 
@@ -557,7 +444,6 @@ def golden_prefill_moe(tensors):
     expert maths is deferred to ``expert_routed``'s golden so the reference is
     single-sourced.
     """
-    from models.glm5_3_flash.expert_routed import golden_expert_routed_fn
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
     x_next = torch.zeros(N_RANKS, T, D, dtype=torch.float32)
@@ -626,7 +512,6 @@ def golden_prefill_moe(tensors):
 
 def build_tensor_specs(num_tokens=T):
     from golden import ScalarSpec, TensorSpec
-    from models.glm5_3_flash.decode_moe import gen_routed_weight
 
     num_tokens = max(0, min(T, int(num_tokens)))
 
@@ -634,51 +519,32 @@ def build_tensor_specs(num_tokens=T):
         # Global expert ids across the whole EP world; every local expert of the
         # EP2 layout is exercised, and both directions of the exchange carry.
         generator = torch.Generator().manual_seed(7)
-        return torch.randint(0, N_RANKS * N_LOCAL_EXPERTS, (N_RANKS, T, TOPK), generator=generator).to(
-            torch.int32
-        )
+        return torch.randint(0, N_RANKS * N_LOCAL_EXPERTS, (N_RANKS, T, TOPK), generator=generator).to(torch.int32)
 
     x_bf16 = torch.randn(N_RANKS, T, D, dtype=torch.bfloat16)
 
     def init_x_int8():
-        from models.glm5_3_flash.quantization import quantize_per_token_int8
 
         x_i8, _ = quantize_per_token_int8(x_bf16.reshape(N_RANKS * T, D))
         return x_i8.reshape(N_RANKS, T, D)
 
     def init_x_scale():
-        from models.glm5_3_flash.quantization import quantize_per_token_int8
 
         _, x_sd = quantize_per_token_int8(x_bf16.reshape(N_RANKS * T, D))
         return x_sd.reshape(N_RANKS, T, 1)
 
     ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2}
-    w_gu_i8, w_gu_s = gen_routed_weight(
-        (N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D), ROUTED_DEQUANT_STD["w1"]
-    )
-    w2_i8, w2_s = gen_routed_weight(
-        (N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"]
-    )
+    (w_gu_i8, w_gu_s) = gen_routed_weight((N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
+    w2_i8, w2_s = gen_routed_weight((N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
 
     return [
         TensorSpec("route_indices", [N_RANKS, T, TOPK], torch.int32, init_value=init_route_indices),
-        TensorSpec(
-            "route_weights", [N_RANKS, T, TOPK], torch.float32,
-            init_value=lambda: torch.rand(N_RANKS, T, TOPK),
-        ),
+        TensorSpec("route_weights", [N_RANKS, T, TOPK], torch.float32, init_value=lambda : torch.rand(N_RANKS, T, TOPK)),
         TensorSpec("x_int8", [N_RANKS, T, D], torch.int8, init_value=init_x_int8),
         TensorSpec("x_scale", [N_RANKS, T, 1], torch.float32, init_value=init_x_scale),
-        TensorSpec(
-            "w_gate_up", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8,
-            init_value=lambda: w_gu_i8,
-        ),
-        TensorSpec(
-            "w_gate_up_scale", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32,
-            init_value=lambda: w_gu_s,
-        ),
-        TensorSpec(
-            "w_down", [N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8
-        ),
+        TensorSpec("w_gate_up", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8, init_value=lambda : w_gu_i8),
+        TensorSpec("w_gate_up_scale", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda : w_gu_s),
+        TensorSpec("w_down", [N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
         TensorSpec("w_down_scale", [N_RANKS, N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
         TensorSpec("routed", [N_RANKS, T, D], torch.float32),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
@@ -688,7 +554,7 @@ def build_tensor_specs(num_tokens=T):
 
 def prefill_ring_heap(*, additional_bytes=0):
     """Size ring zero for routed scratch plus the enclosing entry's allocations."""
-    expert_rows = ((GROUPED_CAP + EXPERT_RECV_TILE - 1) // EXPERT_RECV_TILE) * EXPERT_RECV_TILE
+    expert_rows = ((GROUPED_CAP + RECV_TILE - 1) // RECV_TILE) * RECV_TILE
     routed_bytes = GROUPED_CAP * (5 * D + 16)
     expert_bytes = expert_rows * (13 * MOE_INTER + 4 * D + 4)
     send_bytes = ROUTES_PER_SRC * (D + 4 * AUX_PAD + 4)
@@ -703,15 +569,16 @@ def prefill_ring_heap(*, additional_bytes=0):
 if __name__ == "__main__":
     import argparse
 
-    from golden import ratio_reldiff, run
     from pypto.ir import DistributedConfig
+
+    from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--ep", type=int, default=2, help="expert-parallel size / rank count")
     parser.add_argument(
-        "-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
+        "-d", "--device", type=str, default=",".join((str(i) for i in range(N_RANKS))),
         help=f"comma-separated device ids (need {N_RANKS})",
     )
     parser.add_argument("--tokens", type=int, default=T, help="per-rank token capacity (module level)")
@@ -730,31 +597,17 @@ if __name__ == "__main__":
         golden_fn=golden_prefill_moe,
         config=dict(
             dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
+            backend_type=args.backend_type, execution_mode=args.execution_mode,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
             enable_chip_swimlane=args.enable_chip_swimlane,
             ring_heap=prefill_ring_heap(),
         ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            # Deterministic INT8 golden: 3e-3 per point, 1% of points.
-            "routed": ratio_reldiff(diff_thd=3e-3, pct_thd=0.01),
-        },
+        rtol=0.001,
+        atol=0.001,
+        compare_fn={"routed": ratio_reldiff(diff_thd=0.003, pct_thd=0.01)},
         compile_only=args.compile_only,
     )
     if not result.passed:
         if result.error:
             print(result.error)
         raise SystemExit(1)
-
-
-__all__ = [
-    "golden_prefill_moe",
-    "l2_prefill_moe",
-    "l3_prefill_moe",
-    "prefill_moe_dispatch",
-    "prefill_moe_return",
-    "prefill_ring_heap",
-]

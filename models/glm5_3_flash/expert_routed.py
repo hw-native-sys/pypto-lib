@@ -6,80 +6,43 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""W8A8 grouped expert FFN over the ``N_LOCAL_EXPERTS`` experts this EP rank owns.
-
-Per expert: ``down(silu(clamp(gate(x), max=10)) * clamp(up(x), -10, 10))`` with
-``moe_intermediate_size = 2048``. Both matmuls accumulate INT32 on the cube; the
-gate/up epilogue dequantises by ``per-token scale x per-channel weight scale``,
-applies the clamped SwiGLU and requantises per row for ``down_proj``. The routing
-weight is folded into the output row rather than applied after the combine.
-
-At EP16 each rank owns 288 / 16 = 18 experts, and the routed weights are the bulk
-of the model: 43 sparse layers x 288 experts x 3 matrices is 311.7 G parameters,
-so 19.5 GB per rank in INT8 out of a ~21.6 GB per-rank weight budget.
-
-Layout notes vs the DeepSeek-V4 sibling:
-
-- ``x_int8`` / ``x_scale`` / ``route_weights`` are **flat** ``[RECV_DYN, ...]``
-  token-major rows, split per expert by ``expert_offsets`` (``[E + 1]``
-  cumulative row starts), not the sibling's ``[E, RECV_MAX, ...]`` per-expert
-  slabs. The EP gather writes this flat layout, so no per-expert copy is needed.
-- The W8A8 checkpoint stores one fused ``w_gate_up [E, 2 * MOE_INTER, D]``: the
-  gate rows occupy ``[0, MOE_INTER)`` and the up rows ``[MOE_INTER, 2 * MOE_INTER)``
-  with a single per-channel scale vector. One cube matmul produces both halves
-  and the SwiGLU epilogue slices them apart.
-- The output is FP32; the routed experts join the FP32 reduction alongside the
-  shared expert.
-"""
+"""GLM-5.3-Flash routed W8A8 SwiGLU experts."""
 
 import sys
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.elementwise import accurate_sigmoid, accurate_divide
+from models.glm5_3_flash.config import (
+    EP_SIZE, FLASH, MOE_INTER, N_EXPERTS, N_LOCAL_EXPERTS, D, Glm53FlashConfig,
+)
+from models.glm5_3_flash.dense_mlp import DenseTensors, dense_mlp_forward, swiglu_limited
+from models.glm5_3_flash.elementwise import accurate_divide, accurate_sigmoid
+from models.glm5_3_flash.gate import RouterTensors, router_forward
+from models.glm5_3_flash.mhc import hc_mixes, hc_pre, hc_seed
+from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, expert, quantize_per_token_int8
+from models.glm5_3_flash.utils import (
+    _FF_DOWN, _FF_FUSED, _FF_GATE, _FF_UP, TEXT_LAYER_ROOTS, Checkpoint, _resolve_name, pack_int8_nz,
+    read_reference_float,
+)
 
-from models.glm5_3_flash.config import D, FLASH, N_LOCAL_EXPERTS, RECV_DYN, RECV_MAX
-from models.glm5_3_flash.golden import expert
-from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
+RECV_DYN = pl.dynamic('GLM53_RECV_DYN')
 
-# This directory owns a ``golden.py`` reference module, so the repository-root
-# ``golden`` harness package must come first on the path before any harness import.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-
-MOE_INTER = FLASH.moe_intermediate_size
 SWIGLU_LIMIT = FLASH.swiglu_limit
-
-# tiling
-RECV_TILE = 16           # expert row tile: matmul rows must be a multiple of 16
-K_TILE = 512             # gate/up K tile over D = 4096
-MM_INTER_TILE = 256      # gate/up N tile; 2 * MOE_INTER must be a multiple
-ACT_INTER_TILE = 128     # Bounds the compensated sigmoid working set
-QUANT_TILE = 512         # per-row requant tile
-INTER_K = 512            # w2 K tile (= moe_intermediate_size)
-D_OUT_TILE = 256         # w2 N tile over D
-D_OUT_TILE_ACT = 512
-W2_ACT_INNER = 8
-
-assert (2 * MOE_INTER) % MM_INTER_TILE == 0
-assert MOE_INTER % ACT_INTER_TILE == 0
-assert MOE_INTER % QUANT_TILE == 0
-assert MOE_INTER % INTER_K == 0
-assert D % D_OUT_TILE == 0
-assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
-
-
-def golden_expert_routed(
-    x: torch.Tensor,
-    w_gate: torch.Tensor,
-    w_up: torch.Tensor,
-    w_down: torch.Tensor,
-    route_weight: torch.Tensor,
-) -> torch.Tensor:
-    """``route_weight`` is ``[tokens, 1]``, matching the kernel ABI."""
-    return expert(x, w_gate, w_up, w_down, route_weight)
+RECV_TILE = 16  # expert row tile: matmul rows must be a multiple of 16
+K_TILE = 512  # gate/up K tile over D = 4096
+MM_INTER_TILE = 256  # gate/up N tile; 2 * MOE_INTER must be a multiple
+ACT_INTER_TILE = 128  # Bounds the compensated sigmoid working set
+QUANT_TILE = 512  # per-row requant tile
+INTER_K_TILE = 512  # w2 K tile (= moe_intermediate_size)
+D_OUT_TILE = 256  # w2 N tile over D
+D_ACT_TILE = 512
+W2_GROUP_TILE = 8
+T_DYN_TEST = 64
 
 
 @pl.jit.inline
@@ -111,7 +74,7 @@ def expert_routed(
             # the same INT8 x rows, so one K-loop fills both halves of the INT32
             # accumulator. w_k is the per-expert [1, N, K] slice.
             gate_up_i32 = pl.create_tensor([RECV_TILE, 2 * MOE_INTER], dtype=pl.INT32)
-            for nb in pl.spmd((2 * MOE_INTER) // MM_INTER_TILE, name_hint="exp_gate_up_mm", allow_early_resolve=True):
+            for nb in pl.spmd(2 * MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_mm", allow_early_resolve=True):
                 n0 = nb * MM_INTER_TILE
                 acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                 for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -128,23 +91,15 @@ def expert_routed(
             h_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             h_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_i8_init"):
-                h_i8[:, :] = pl.cast(
-                    pl.full([RECV_TILE, MOE_INTER], dtype=pl.FP16, value=0.0),
-                    target_type=pl.INT8,
-                    mode="trunc",
-                )
+                h_i8_value_full = pl.full([RECV_TILE, MOE_INTER], dtype=pl.FP16, value=0.0)
+                h_i8[:, :] = pl.cast(h_i8_value_full, target_type=pl.INT8, mode="trunc")
             for act_blk in pl.spmd(MOE_INTER // ACT_INTER_TILE, name_hint="exp_gate_up_act"):
                 a0 = act_blk * ACT_INTER_TILE
                 x_scale_col = pl.slice(x_scale, [RECV_TILE, 1], [flat_row, 0], valid_shape=[valid_rows, 1])
-                gate_w_scale = pl.reshape(
-                    w_gate_up_scale[local_e, a0 : a0 + ACT_INTER_TILE], [1, ACT_INTER_TILE]
-                )
-                up_w_scale = pl.reshape(
-                    w_gate_up_scale[local_e, MOE_INTER + a0 : MOE_INTER + a0 + ACT_INTER_TILE],
-                    [1, ACT_INTER_TILE],
-                )
-                gate_fp32 = pl.cast(gate_up_i32[:, a0 : a0 + ACT_INTER_TILE], target_type=pl.FP32, mode="none")
-                up_fp32 = pl.cast(gate_up_i32[:, MOE_INTER + a0 : MOE_INTER + a0 + ACT_INTER_TILE], target_type=pl.FP32, mode="none")
+                gate_w_scale = pl.reshape(w_gate_up_scale[local_e, a0:a0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                up_w_scale = pl.reshape(w_gate_up_scale[local_e, MOE_INTER + a0:MOE_INTER + a0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                gate_fp32 = pl.cast(gate_up_i32[:, a0:a0 + ACT_INTER_TILE], target_type=pl.FP32, mode="none")
+                up_fp32 = pl.cast(gate_up_i32[:, MOE_INTER + a0:MOE_INTER + a0 + ACT_INTER_TILE], target_type=pl.FP32, mode="none")
                 gate_fp32 = pl.col_expand_mul(pl.row_expand_mul(gate_fp32, x_scale_col), gate_w_scale)
                 up_fp32 = pl.col_expand_mul(pl.row_expand_mul(up_fp32, x_scale_col), up_w_scale)
                 if SWIGLU_LIMIT > 0.0:
@@ -186,26 +141,26 @@ def expert_routed(
             for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="exp_w2_mm"):
                 d0 = db_idx * D_OUT_TILE
                 y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
-                    hs_k = h_i8[:, k0 : k0 + INTER_K]
-                    w2_k = w_down[local_e : local_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                for k0 in pl.pipeline(0, MOE_INTER, INTER_K_TILE, stage=2):
+                    hs_k = h_i8[:, k0 : k0 + INTER_K_TILE]
+                    w2_k = w_down[local_e : local_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K_TILE]
                     y_acc = pl.matmul_acc(y_acc, hs_k, w2_k, b_trans=True, init_cond=(k0 == 0))
                 y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
 
             # Dequantize w2 before applying the routing weight. Combining the
             # scales first changes FP32 rounding before the owner sums slots.
-            for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="exp_w2_act", allow_early_resolve=True):
-                d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
+            for db_idx in pl.spmd(D // (W2_GROUP_TILE * D_ACT_TILE), name_hint="exp_w2_act", allow_early_resolve=True):
+                d_base = db_idx * (W2_GROUP_TILE * D_ACT_TILE)
                 w_row_blk = pl.slice(route_weights, [RECV_TILE, 1], [flat_row, 0], valid_shape=[valid_rows, 1])
-                for dg in pl.pipeline(W2_ACT_INNER, stage=2):
-                    d0 = d_base + dg * D_OUT_TILE_ACT
-                    y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
-                    w2_scale_chunk = pl.reshape(w_down_scale[local_e, d0 : d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
+                for dg in pl.pipeline(W2_GROUP_TILE, stage=2):
+                    d0 = d_base + dg * D_ACT_TILE
+                    y_2d_i32 = y_i32[:, d0 : d0 + D_ACT_TILE]
+                    w2_scale_chunk = pl.reshape(w_down_scale[local_e, d0:d0 + D_ACT_TILE], [1, D_ACT_TILE])
                     y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                     y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_scale_dq), w2_scale_chunk)
                     y_2d = pl.row_expand_mul(y_2d, w_row_blk)
-                    y_valid = pl.set_validshape(y_2d, valid_rows, D_OUT_TILE_ACT)
-                    output = pl.assemble(output, y_valid, [flat_row, d0])
+                    y_valid = pl.set_validshape(y_2d, valid_rows, D_ACT_TILE)
+                    output[flat_row:flat_row + RECV_TILE, d0:d0 + D_ACT_TILE] = y_valid
 
     return output
 
@@ -228,14 +183,139 @@ def expert_routed_test(
     output.bind_dynamic(0, RECV_DYN)
 
     expert_routed(
-        x_int8, x_scale,
-        w_gate_up, w_gate_up_scale,
-        w_down, w_down_scale,
-        expert_offsets,
-        route_weights,
-        output,
+        x_int8, x_scale, w_gate_up, w_gate_up_scale,
+        w_down, w_down_scale, expert_offsets, route_weights, output,
     )
     return output
+
+
+class ExpertProvider:
+    """Routed-expert weight source: one expert's FP32 matrices at a time.
+
+    The streaming contract that bounds host memory: the provider materializes a
+    single expert per call and the caller releases it before the next. The
+    synthetic provider keeps one shared base and re-scales it per expert, so
+    every expert is distinct without 15 GB of random tensors.
+    """
+
+    def gate_up(self, expert: int) -> torch.Tensor:
+        """``[2 * moe_inter, D]`` with gate rows first, then up rows."""
+        raise NotImplementedError
+
+    def down(self, expert: int) -> torch.Tensor:
+        """``[D, moe_inter]``."""
+        raise NotImplementedError
+
+
+class CheckpointExpertProvider(ExpertProvider):
+    """Lazy per-expert dequant reads straight from the checkpoint."""
+
+    def __init__(self, checkpoint: Checkpoint, layer: int):
+        self._checkpoint = checkpoint
+        self._layer = layer
+        self._names: dict[int, tuple[str, str | None, str]] = {}
+
+    def _resolve(self, expert: int) -> tuple[str, str | None, str]:
+        if expert not in self._names:
+            base = f"mlp.experts.{expert}."
+            # Fused spelling first: _resolve_name raises when a spelling is
+            # absent, so a fused-only checkpoint would fail on gate_proj
+            # before the fused branch is ever considered.
+            fused = next(
+                (f"{root}{self._layer}.{base}{s}" for root in TEXT_LAYER_ROOTS for s in _FF_FUSED if f"{root}{self._layer}.{base}{s}" in self._checkpoint),
+                None,
+            )
+            if fused is None:
+                gate = _resolve_name(self._checkpoint, self._layer, base, _FF_GATE)
+                up = _resolve_name(self._checkpoint, self._layer, base, _FF_UP)
+            else:
+                gate, up = fused, None
+            down = _resolve_name(self._checkpoint, self._layer, base, _FF_DOWN)
+            self._names[expert] = (gate, up, down)
+        return self._names[expert]
+
+    def gate_up(self, expert: int) -> torch.Tensor:
+        gate_or_fused, up, _ = self._resolve(expert)
+        if up is None:
+            return read_reference_float(self._checkpoint, gate_or_fused).contiguous()
+        gate = read_reference_float(self._checkpoint, gate_or_fused)
+        up_w = read_reference_float(self._checkpoint, up)
+        return torch.cat([gate, up_w], dim=0)
+
+    def down(self, expert: int) -> torch.Tensor:
+        return read_reference_float(self._checkpoint, self._resolve(expert)[2]).contiguous()
+
+
+class SyntheticExpertProvider(ExpertProvider):
+    """Deterministic synthetic experts: shared base scaled per expert id."""
+
+    def __init__(self, model: Glm53FlashConfig, seed: int):
+        generator = torch.Generator().manual_seed(seed)
+        inter, hidden = model.moe_intermediate_size, model.hidden_size
+        self._base_gate_up = torch.randn(2 * inter, hidden, generator=generator) * 0.02
+        self._base_down = torch.randn(hidden, inter, generator=generator) * 0.02
+        self._gate_up_buf = torch.empty_like(self._base_gate_up)
+        self._down_buf = torch.empty_like(self._base_down)
+
+    def gate_up(self, expert: int) -> torch.Tensor:
+        torch.mul(self._base_gate_up, 1.0 + expert * 1e-3, out=self._gate_up_buf)
+        return self._gate_up_buf
+
+    def down(self, expert: int) -> torch.Tensor:
+        torch.mul(self._base_down, 1.0 + expert * 1e-3, out=self._down_buf)
+        return self._down_buf
+
+
+def moe_forward(
+    x: torch.Tensor,
+    router: RouterTensors,
+    experts: ExpertProvider,
+    shared: DenseTensors,
+    model: Glm53FlashConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Sparse MoE (ports of ``Glm5NextTextMoE``/``TextExperts``) with expert_id streaming.
+
+    Only experts the router actually hit are read from the provider, one at a
+    time; shared experts run on the un-routed input. Returns
+    ``(output [B, S, D], internals)``.
+    """
+    orig_shape = x.shape
+    flat = x.reshape(-1, x.shape[-1])
+    topk_weights, topk_indices = router_forward(flat, router, model)
+
+    routed = torch.zeros_like(flat)
+    hit = torch.unique(topk_indices)
+    for expert_id in hit.tolist():
+        rows, positions = torch.where(topk_indices == expert_id)
+        gate_up = experts.gate_up(expert_id)
+        gate, up = (flat[rows] @ gate_up.t()).chunk(2, dim=-1)
+        hidden_act = swiglu_limited(gate, up, model.swiglu_limit)
+        del gate_up
+        down = experts.down(expert_id)
+        contribution = (hidden_act @ down.t()) * topk_weights[rows, positions][:, None]
+        del down
+        routed.index_add_(0, rows, contribution)
+
+    shared_out = dense_mlp_forward(x, shared, model)
+    output = routed.view(*orig_shape) + shared_out
+    internals = {
+        "router_topk_weights": topk_weights,
+        "router_topk_indices": topk_indices,
+        "moe_routed": routed.view(*orig_shape),
+        "moe_shared": shared_out,
+    }
+    return output, internals
+
+
+def golden_expert_routed(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    w_down: torch.Tensor,
+    route_weight: torch.Tensor,
+) -> torch.Tensor:
+    """``route_weight`` is ``[tokens, 1]``, matching the kernel ABI."""
+    return expert(x, w_gate, w_up, w_down, route_weight)
 
 
 def golden_expert_routed_fn(tensors):
@@ -245,7 +325,6 @@ def golden_expert_routed_fn(tensors):
     the clamped SwiGLU with per-token x scale, requantized per row, then the w2
     output is scaled by the per-token route weight (folded, matching the kernel).
     """
-    from models.glm5_3_flash.quantization import quantize_per_token_int8
 
     x_int8 = tensors["x_int8"].to(torch.int32)
     x_scale = tensors["x_scale"].float()
@@ -295,12 +374,12 @@ def gen_routed_weight(shape, dequant_std):
     n_lead = 1
     for dim in lead:
         n_lead *= dim
-    CHUNK_ELEMS = 1 << 25  # elements per pass, matching the DeepSeek-V4 sibling
+    WEIGHT_ELEMENT_TILE = 1 << 25  # elements per pass, matching the DeepSeek-V4 sibling
 
     W = torch.randn(*shape).reshape(n_lead, out, inn)
     w_i8 = torch.empty(n_lead, out, inn, dtype=torch.int8)
     scale = torch.empty(n_lead, out, 1, dtype=torch.float32)
-    step = max(1, CHUNK_ELEMS // (out * inn))
+    step = max(1, WEIGHT_ELEMENT_TILE // (out * inn))
     for i0 in range(0, n_lead, step):
         w = W[i0 : i0 + step]
         amax = w.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
@@ -310,9 +389,6 @@ def gen_routed_weight(shape, dequant_std):
     del W
     scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
     return w_i8.reshape(*shape), scale.reshape(*lead, out)
-
-
-T_DYN_TEST = 64
 
 
 def build_tensor_specs(num_tokens=T_DYN_TEST):
@@ -334,34 +410,115 @@ def build_tensor_specs(num_tokens=T_DYN_TEST):
     x_bf16 = torch.randn(total, D, dtype=torch.bfloat16)
 
     def init_x_int8():
-        from models.glm5_3_flash.quantization import quantize_per_token_int8
+
         x_i8, _ = quantize_per_token_int8(x_bf16)
         return x_i8
 
     def init_x_scale():
-        from models.glm5_3_flash.quantization import quantize_per_token_int8
+
         _, x_sd = quantize_per_token_int8(x_bf16)
         return x_sd
 
     ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
-    w_gu_i8, w_gu_s = gen_routed_weight(
-        (N_LOCAL_EXPERTS, 2 * MOE_INTER, D), ROUTED_DEQUANT_STD["w1"]
-    )
-    w2_i8, w2_s = gen_routed_weight(
-        (N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"]
-    )
+    w_gu_i8, w_gu_s = gen_routed_weight((N_LOCAL_EXPERTS, 2 * MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
+    w2_i8, w2_s = gen_routed_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
 
     return [
         TensorSpec("x_int8", [total, D], torch.int8, init_value=init_x_int8),
         TensorSpec("x_scale", [total, 1], torch.float32, init_value=init_x_scale),
         TensorSpec("w_gate_up", [N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8, init_value=lambda: w_gu_i8),
-        TensorSpec("w_gate_up_scale", [N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda: w_gu_s),
+        TensorSpec("w_gate_up_scale", [N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda : w_gu_s),
         TensorSpec("w_down", [N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
         TensorSpec("w_down_scale", [N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
         TensorSpec("expert_offsets", [N_LOCAL_EXPERTS + 1], torch.int32, init_value=lambda: offsets),
         TensorSpec("route_weights", [total, 1], torch.float32, init_value=lambda: torch.rand(total, 1)),
         TensorSpec("output", [total, D], torch.float32, init_value=torch.zeros),
     ]
+
+
+def build_checkpoint_moe_specs(checkpoint, layer_id, *, capacity, num_tokens, num_ranks, hidden=None):
+    """Stage real FFN weights and synthetic or supplied pre-norm MoE activations.
+
+    ``hidden`` is BF16 ``[num_ranks, num_tokens, D]`` after mHC pre mixing.
+    Without it, random embeddings are folded with the checkpoint's FFN mHC
+    weights. This fixture does not execute the preceding Transformer layers.
+    """
+    from golden import ScalarSpec, TensorSpec
+
+    if num_ranks != EP_SIZE:
+        raise ValueError(f"checkpoint fixture requires the compiled EP size {EP_SIZE}, got {num_ranks}")
+    if not 0 <= num_tokens <= capacity:
+        raise ValueError(f"num_tokens must be between 0 and capacity {capacity}, got {num_tokens}")
+    if hidden is not None:
+        expected = (num_ranks, num_tokens, D)
+        if (
+            not isinstance(hidden, torch.Tensor)
+            or hidden.dtype != torch.bfloat16
+            or tuple(hidden.shape) != expected
+        ):
+            raise ValueError(f"hidden must be a BF16 tensor with shape {expected}")
+        if hidden.device.type != "cpu":
+            raise ValueError("hidden must be a CPU tensor")
+
+    checkpoint = Checkpoint(checkpoint) if not isinstance(checkpoint, Checkpoint) else checkpoint
+    if not FLASH.first_k_dense_replace <= layer_id < FLASH.num_hidden_layers:
+        raise ValueError("the layer entries require a sparse FFN layer in the text backbone")
+
+    x_mixed = torch.zeros(num_ranks, capacity, D, dtype=torch.bfloat16)
+    if hidden is None:
+
+        generator = torch.Generator().manual_seed(7)
+        embeddings = torch.randn(num_ranks, capacity, D, generator=generator).bfloat16()
+        mhc = checkpoint.mhc(layer_id, "ffn")
+        with torch.no_grad():
+            for rank in range(num_ranks):
+                stream = hc_seed(embeddings[rank])
+                mix = hc_mixes(stream, mhc["function"], mhc["scale"], mhc["base"])[0]
+                x_mixed[rank, :num_tokens] = hc_pre(stream, mix)[:num_tokens]
+    else:
+        x_mixed[:, :num_tokens] = hidden
+
+    # Ordered local shapes match the L3 decode/prefill MoE ABI.
+    layout = {
+        "norm_weight": ((D,), torch.bfloat16),
+        "gate_weight": ((N_EXPERTS, D), torch.bfloat16),
+        "correction_bias": ((N_EXPERTS,), torch.float32),
+        "w_gate_up": ((N_LOCAL_EXPERTS, 2 * MOE_INTER, D), torch.int8),
+        "w_gate_up_scale": ((N_LOCAL_EXPERTS, 2 * MOE_INTER), torch.float32),
+        "w_down": ((N_LOCAL_EXPERTS, D, MOE_INTER), torch.int8),
+        "w_down_scale": ((N_LOCAL_EXPERTS, D), torch.float32),
+        "shared_w_gate_up": ((2 * MOE_INTER, D), torch.int8),
+        "shared_w_gate_up_scale": ((2 * MOE_INTER,), torch.float32),
+        "shared_w_down": ((D, MOE_INTER), torch.int8),
+        "shared_w_down_scale": ((D,), torch.float32),
+    }
+    weights = {}
+    for rank in range(num_ranks):
+        local = checkpoint.ffn(layer_id, ep_rank=rank, ep=num_ranks)
+        if local.keys() != layout.keys():
+            raise ValueError("checkpoint FFN tensors differ from the composed MoE input names")
+        for name, (shape, dtype) in layout.items():
+            value = local[name]
+            if tuple(value.shape) != shape or value.dtype != dtype:
+                raise ValueError(f"{name}: expected {shape} {dtype}, got {tuple(value.shape)} {value.dtype}")
+            if rank == 0:
+                weights[name] = torch.empty((num_ranks, *shape), dtype=dtype)
+            weights[name][rank].copy_(value)
+        del local, value
+
+    for name in ("shared_w_gate_up", "shared_w_down"):
+        weights[name] = pack_int8_nz(weights[name])
+
+    specs = [TensorSpec("x_mixed", list(x_mixed.shape), x_mixed.dtype, init_value=x_mixed)]
+    specs += [
+        TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in weights.items()
+    ]
+    specs += [
+        TensorSpec("y", [num_ranks, capacity, D], torch.float32),
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
+        ScalarSpec("num_ranks", torch.int32, num_ranks),
+    ]
+    return specs
 
 
 if __name__ == "__main__":
@@ -382,27 +539,12 @@ if __name__ == "__main__":
         fn=expert_routed_test,
         specs=build_tensor_specs(args.num_tokens),
         golden_fn=golden_expert_routed_fn,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            # Deterministic INT8 golden: 3e-3 per point, 1% of points.
-            "output": ratio_reldiff(diff_thd=3e-3, pct_thd=0.01),
-        },
+        config=dict(dump_passes=args.dump_passes, backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane),
+        rtol=0.001,
+        atol=0.001,
+        compare_fn={"output": ratio_reldiff(diff_thd=0.003, pct_thd=0.01)},
     )
     if not result.passed:
         if result.error:
             print(result.error)
         raise SystemExit(1)
-
-
-__all__ = [
-    "expert_routed",
-    "golden_expert_routed",
-]

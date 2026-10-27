@@ -6,24 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""RMSNorm and the fused residual-add RMSNorm used across the backbone.
-
-Every layer applies ``input_layernorm`` before attention and
-``post_attention_layernorm`` before the MLP; both read a stream that mHC has
-already collapsed, so the kernel sees a plain ``[T, D]`` row. The gamma vectors
-stay BF16 and are never quantized (``modules_to_not_convert`` lists every
-``*_layernorm`` and ``*_norm``).
-
-The fused add-and-norm form serves callers that explicitly update a residual
-before normalization. The mHC backbone and the model tail use plain RMSNorm.
-
-``rmsnorm_quant`` covers the three **dense** layers (0, 1 and 2). On a sparse layer
-the router kernel in :mod:`models.glm5_3_flash.gate` owns the norm and
-produces the per-token INT8 view; a dense layer has no router, so without this
-variant the K = 4096 activation feeding ``dense_mlp`` would have no owner at all.
-The INT8 source is the BF16 normalized output, preserving the activation
-boundary before dynamic quantization.
-"""
+"""GLM-5.3-Flash RMSNorm, residual normalization and activation quantization."""
 
 import sys
 from pathlib import Path
@@ -34,48 +17,20 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import FLASH, T_DYN, D
-from models.glm5_3_flash.golden import rms_norm
-from models.glm5_3_flash.elementwise import accurate_divide_parts, accurate_row_sum_parts, accurate_rsqrt
+from models.glm5_3_flash.config import FLASH, D
+from models.glm5_3_flash.elementwise import (
+    _sum_fp32_reference, accurate_divide_parts, accurate_row_sum_parts, accurate_rsqrt,
+)
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
+from models.glm5_3_flash.utils import _check, _report
+
+T_DYN = pl.dynamic('GLM53_T_DYN')
 
 NORM_WIDTH = pl.dynamic("GLM53_NORM_WIDTH")
+EPS = FLASH.rms_norm_eps
 NORM_T_TILE = 8
 NORM_D_TILE = 128
 QUANT_D_TILE = D // NORM_T_TILE
-EPS = FLASH.rms_norm_eps
-assert D % NORM_D_TILE == 0
-
-
-def golden_rmsnorm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return rms_norm(x, weight)
-
-
-def golden_rmsnorm_quant(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Emit BF16 RMSNorm and its dynamically quantized INT8 view."""
-    value = x.float()
-    square_mean = value.double().square().mean(dim=-1, keepdim=True).float()
-    inverse = torch.rsqrt((square_mean + EPS).double()).float()
-    unit = (value * inverse).to(x.dtype).float()
-    normalized = (unit * weight.to(x.dtype).float()).to(x.dtype)
-    quant_source = normalized.float()
-    quantized, _scale = quantize_per_token_int8(quant_source)
-    amax = quant_source.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale = amax / INT8_SCALE_MAX
-    return normalized.to(x.dtype), quantized, scale
-
-
-def golden_add_rmsnorm(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the normalised activation and the updated residual."""
-    updated = x.float() + residual.float()
-    return rms_norm(updated.to(x.dtype), weight), updated.to(x.dtype)
 
 
 @pl.jit.inline
@@ -87,7 +42,7 @@ def rmsnorm(
     """Normalize 64-aligned widths, up to eight tokens per task."""
     t_dim = pl.tensor.dim(x, 0)
     width = pl.tensor.dim(x, 1)
-    for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint='glm53_rmsnorm'):
+    for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="glm53_rmsnorm"):
         t0 = block * NORM_T_TILE
         valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
         square_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
@@ -121,8 +76,8 @@ def rmsnorm(
         for k0 in pl.pipeline(0, width, NORM_D_TILE, stage=2):
             norm_columns = pl.min(NORM_D_TILE, width - k0)
             source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, norm_columns])
-            source_v1 = pl.fillpad(source, pad_value=pl.PadValue.zero)
-            source = pl.set_validshape(source_v1, NORM_T_TILE, NORM_D_TILE)
+            source_fillpad = pl.fillpad(source, pad_value=pl.PadValue.zero)
+            source = pl.set_validshape(source_fillpad, NORM_T_TILE, NORM_D_TILE)
             value = pl.cast(source, pl.FP32)
             gamma_values = pl.slice(weight, [NORM_D_TILE], [k0], valid_shape=[norm_columns])
             gamma_row = pl.reshape(gamma_values, [1, NORM_D_TILE])
@@ -133,8 +88,8 @@ def rmsnorm(
             unit = pl.row_expand_mul(value, inv_rms)
             unit_bf16 = pl.cast(unit, pl.BF16, mode="rint")
             normalized = pl.col_expand_mul(pl.cast(unit_bf16, pl.FP32), gamma)
-            part_v2 = pl.cast(normalized, pl.BF16, mode='rint')
-            output[t0:t0 + NORM_T_TILE, k0:k0 + NORM_D_TILE] = pl.set_validshape(part_v2, valid_rows, norm_columns)
+            normalized_bf16 = pl.cast(normalized, pl.BF16, mode="rint")
+            output[t0:t0 + NORM_T_TILE, k0:k0 + NORM_D_TILE] = pl.set_validshape(normalized_bf16, valid_rows, norm_columns)
     return output
 
 
@@ -155,7 +110,7 @@ def rmsnorm_quant(
     if active_tokens > t_dim:
         active_tokens = t_dim
     quant_source_fp32 = pl.create_tensor([t_dim, D], dtype=pl.FP32)
-    for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint='glm53_rmsnorm_quant'):
+    for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="glm53_rmsnorm_quant"):
         t0 = block * NORM_T_TILE
         valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
         square_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
@@ -180,14 +135,14 @@ def rmsnorm_quant(
         for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
             k0 = kb * NORM_D_TILE
             source = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
-            source_v1 = pl.fillpad(source, pad_value=pl.PadValue.zero)
-            source = pl.set_validshape(source_v1, NORM_T_TILE, NORM_D_TILE)
+            source_fillpad = pl.fillpad(source, pad_value=pl.PadValue.zero)
+            source = pl.set_validshape(source_fillpad, NORM_T_TILE, NORM_D_TILE)
             value = pl.cast(source, pl.FP32)
-            gamma = pl.reshape(pl.cast(weight[k0:k0 + NORM_D_TILE], pl.FP32), [1, NORM_D_TILE])
+            gamma = pl.reshape(pl.cast(weight[k0 : k0 + NORM_D_TILE], pl.FP32), [1, NORM_D_TILE])
             unit = pl.row_expand_mul(value, inv_rms)
             unit_bf16 = pl.cast(unit, pl.BF16, mode="rint")
             normalized = pl.col_expand_mul(pl.cast(unit_bf16, pl.FP32), gamma)
-            normalized_bf16 = pl.cast(normalized, pl.BF16, mode='rint')
+            normalized_bf16 = pl.cast(normalized, pl.BF16, mode="rint")
             quant_source = pl.cast(normalized_bf16, pl.FP32)
             quant_source_fp32[t0:t0 + NORM_T_TILE, k0:k0 + NORM_D_TILE] = pl.set_validshape(quant_source, valid_rows, NORM_D_TILE)
             output[t0:t0 + NORM_T_TILE, k0:k0 + NORM_D_TILE] = pl.set_validshape(normalized_bf16, valid_rows, NORM_D_TILE)
@@ -214,17 +169,17 @@ def rmsnorm_quant(
                     scale_dequant = amax_scalar / INT8_SCALE_MAX
                     scale = scale_dequant
                     scaled = pl.mul(quant_row_fp32, scale_quant)
-                    rounded = pl.cast(scaled, pl.INT32, mode='rint')
-                    rounded_v2 = pl.maximum(rounded, pl.tile.full([1, D], dtype=pl.INT32, value=-127))
-                    rounded = pl.minimum(rounded_v2, pl.tile.full([1, D], dtype=pl.INT32, value=127))
-                    quantized = pl.cast(pl.cast(rounded, pl.FP16, mode='round'), pl.INT8, mode='trunc')
+                    rounded = pl.cast(scaled, pl.INT32, mode="rint")
+                    rounded_maximum = pl.maximum(rounded, pl.tile.full([1, D], dtype=pl.INT32, value=-127))
+                    rounded = pl.minimum(rounded_maximum, pl.tile.full([1, D], dtype=pl.INT32, value=127))
+                    quantized = pl.cast(pl.cast(rounded, pl.FP16, mode="round"), pl.INT8, mode="trunc")
                     pl.tile.store(quantized, [t, 0], output_int8, shapes=[1, D])
                     scale_tile = pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
                     pl.tile.write(scale_tile, [0, 0], scale)
                     scale_tile = pl.set_validshape(scale_tile, 1, 1)
                     pl.tile.store(scale_tile, [t, 0], output_scale, shapes=[1, 1])
                 else:
-                    zero_int8 = pl.cast(pl.tile.full([1, D], dtype=pl.FP16, value=0.0), pl.INT8, mode='trunc')
+                    zero_int8 = pl.cast(pl.tile.full([1, D], dtype=pl.FP16, value=0.0), pl.INT8, mode="trunc")
                     pl.tile.store(zero_int8, [t, 0], output_int8, shapes=[1, D])
                     zero_scale = pl.set_validshape(pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0), 1, 1)
                     pl.tile.store(zero_scale, [t, 0], output_scale, shapes=[1, 1])
@@ -241,21 +196,21 @@ def add_rmsnorm(
 ):
     """Fuse the BF16 residual update and the subsequent RMSNorm."""
     t_dim = pl.tensor.dim(x, 0)
-    for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint='glm53_add_residual'):
+    for block in pl.spmd((t_dim + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="glm53_add_residual"):
         t0 = block * NORM_T_TILE
         valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
         for kb in pl.pipeline(D // NORM_D_TILE, stage=2):
             k0 = kb * NORM_D_TILE
             x_tile = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
-            x_tile_v1 = pl.fillpad(x_tile, pad_value=pl.PadValue.zero)
-            x_tile = pl.set_validshape(x_tile_v1, NORM_T_TILE, NORM_D_TILE)
+            x_tile_fillpad = pl.fillpad(x_tile, pad_value=pl.PadValue.zero)
+            x_tile = pl.set_validshape(x_tile_fillpad, NORM_T_TILE, NORM_D_TILE)
             residual_tile = pl.slice(residual, [NORM_T_TILE, NORM_D_TILE], [t0, k0], valid_shape=[valid_rows, NORM_D_TILE])
-            residual_tile_v2 = pl.fillpad(residual_tile, pad_value=pl.PadValue.zero)
-            residual_tile = pl.set_validshape(residual_tile_v2, NORM_T_TILE, NORM_D_TILE)
-            updated_v3 = pl.cast(x_tile, pl.FP32)
-            updated_v4 = pl.cast(residual_tile, pl.FP32)
-            updated_v5 = pl.add(updated_v3, updated_v4)
-            updated = pl.cast(updated_v5, pl.BF16, mode='rint')
+            residual_tile_fillpad = pl.fillpad(residual_tile, pad_value=pl.PadValue.zero)
+            residual_tile = pl.set_validshape(residual_tile_fillpad, NORM_T_TILE, NORM_D_TILE)
+            x_tile_fp32 = pl.cast(x_tile, pl.FP32)
+            residual_tile_fp32 = pl.cast(residual_tile, pl.FP32)
+            updated_add = pl.add(x_tile_fp32, residual_tile_fp32)
+            updated = pl.cast(updated_add, pl.BF16, mode="rint")
             updated_residual[t0:t0 + NORM_T_TILE, k0:k0 + NORM_D_TILE] = pl.set_validshape(updated, valid_rows, NORM_D_TILE)
     rmsnorm(updated_residual, weight, output)
     return (output, updated_residual)
@@ -306,6 +261,61 @@ def add_rmsnorm_test(
     return output
 
 
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = FLASH.rms_norm_eps) -> torch.Tensor:
+    """Apply RMSNorm in FP32 and restore the activation dtype."""
+    dtype = x.dtype
+    value = x.float()
+    square_mean = value.double().square().mean(dim=-1, keepdim=True).float()
+    value = value * torch.rsqrt((square_mean + eps).double()).float()
+    return (weight.to(dtype).float() * value.to(dtype).float()).to(dtype)
+
+
+def rms_norm_gated(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = FLASH.rms_norm_eps,
+) -> torch.Tensor:
+    """KDA output norm: strict FP32 RMSNorm over ``linear_head_dim``, then a sigmoid gate.
+
+    Mirrors ``Glm5NextTextRMSNormGated``: the weights are *not* downcast, and the
+    gate is applied after the norm, in FP32.
+    """
+    dtype = x.dtype
+    value = x.float()
+    value = value * torch.rsqrt((_sum_fp32_reference(value.square()) / value.shape[-1] + eps).double()).float()
+    value = weight.float() * value
+    sigmoid = torch.reciprocal(1.0 + torch.exp(-gate.double()).float())
+    return (value * sigmoid).to(dtype)
+
+
+def golden_rmsnorm_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Emit BF16 RMSNorm and its dynamically quantized INT8 view."""
+    value = x.float()
+    square_mean = value.double().square().mean(dim=-1, keepdim=True).float()
+    inverse = torch.rsqrt((square_mean + EPS).double()).float()
+    unit = (value * inverse).to(x.dtype).float()
+    normalized = (unit * weight.to(x.dtype).float()).to(x.dtype)
+    quant_source = normalized.float()
+    quantized, _scale = quantize_per_token_int8(quant_source)
+    amax = quant_source.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    scale = amax / INT8_SCALE_MAX
+    return normalized.to(x.dtype), quantized, scale
+
+
+def golden_add_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the normalised activation and the updated residual."""
+    updated = x.float() + residual.float()
+    return rms_norm(updated.to(x.dtype), weight), updated.to(x.dtype)
+
+
 def build_rmsnorm_tensor_specs(case: str, tokens: int = 5, *, fixture: str = "random"):
     """Exercise decode, unaligned token counts, and inactive quantization rows."""
     from golden import ScalarSpec, TensorSpec
@@ -336,11 +346,7 @@ def build_rmsnorm_tensor_specs(case: str, tokens: int = 5, *, fixture: str = "ra
     specs.append(TensorSpec("output", [tokens, D], torch.bfloat16))
     if case == "quant":
         specs.extend(
-            [
-                TensorSpec("output_int8", [tokens, D], torch.int8),
-                TensorSpec("output_scale", [tokens, 1], torch.float32),
-                ScalarSpec("num_tokens", torch.int32, tokens - 1 if tokens > 1 else 1),
-            ]
+            [TensorSpec("output_int8", [tokens, D], torch.int8), TensorSpec("output_scale", [tokens, 1], torch.float32), ScalarSpec("num_tokens", torch.int32, tokens - 1 if tokens > 1 else 1)],
         )
     if case == "add":
         specs.append(TensorSpec("updated_residual", [tokens, D], torch.bfloat16))
@@ -348,7 +354,7 @@ def build_rmsnorm_tensor_specs(case: str, tokens: int = 5, *, fixture: str = "ra
 
 
 def golden_rmsnorm_case(tensors):
-    tensors["output"][:] = golden_rmsnorm(tensors["x"], tensors["weight"])
+    tensors["output"][:] = rms_norm(tensors["x"], tensors["weight"])
 
 
 def golden_rmsnorm_quant_case(tensors):
@@ -381,7 +387,65 @@ def compare_quantized(actual, expected, *, actual_outputs, inputs, **_kwargs):
     return True, ""
 
 
+def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """FLA-compatible L2 normalisation used on the KDA query and key.
+
+    Note the ``+ eps`` inside the square root rather than ``max(norm, eps)``; the
+    reference is explicit that this differs from ``F.normalize``.
+    """
+    value = x.float()
+    norm = torch.sqrt((_sum_fp32_reference(value.square()) + eps).double()).float()
+    return (value / norm).to(x.dtype)
+
+
+def run_norm_goldens(golden_rms_norm, golden_rms_norm_gated, golden_l2norm) -> None:
+    """Exercise the three normalisations the backbone shares."""
+    torch.manual_seed(19)
+    tokens, hidden = 5, 64
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    weight = torch.randn(hidden, dtype=torch.bfloat16)
+
+    normalized = golden_rms_norm(x, weight)
+    _check(normalized.shape == x.shape, f"rms_norm shape {tuple(normalized.shape)}")
+    _check(normalized.dtype is x.dtype, f"rms_norm dtype {normalized.dtype}")
+
+    heads, head_dim = 4, 16
+    value = torch.randn(tokens, heads, head_dim)
+    gate_value = torch.randn(tokens, heads, head_dim)
+    gated = golden_rms_norm_gated(value, torch.ones(head_dim), gate_value)
+    _check(gated.shape == value.shape, f"rms_norm_gated shape {tuple(gated.shape)}")
+    ungated = golden_rms_norm_gated(value, torch.ones(head_dim), torch.full_like(gate_value, 1e9))
+    _check(
+        torch.allclose(gated, ungated * torch.sigmoid(gate_value), atol=0.0001),
+        "rms_norm_gated must apply a sigmoid gate after the norm",
+    )
+
+    unit = golden_l2norm(torch.randn(tokens, head_dim))
+    _check((unit.square().sum(dim=-1) - 1.0).abs().max() < 0.0001, "l2norm must return unit rows")
+
+    _report("norms")
+
+
+def reference_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Glm5NextTextRMSNorm: FP32 variance, weight applied after the inverse cast."""
+    variance = x.pow(2).mean(-1, keepdim=True)
+    normalized = x * torch.rsqrt(variance + eps)
+    return weight * normalized
+
+
+def unweighted_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """Glm5NextTextUnweightedRMSNorm (mHC stream-norm), no learned weight."""
+    return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+
+
+def reference_l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """FLA-style l2norm: ``eps`` added inside the sqrt (intentionally not max(...))."""
+    inv_norm = torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x / inv_norm
+
+
 def main():
+    run_norm_goldens(rms_norm, rms_norm_gated, l2norm)
     import argparse
 
     from golden import ratio_allclose, run
@@ -403,7 +467,7 @@ def main():
         ("quant", rmsnorm_quant_test, golden_rmsnorm_quant_case),
         ("add", add_rmsnorm_test, golden_add_rmsnorm_case),
     )
-    for tokens in ([args.tokens] if args.tokens is not None else [5, 16]):
+    for tokens in [args.tokens] if args.tokens is not None else [5, 16]:
         for name, fn, golden_fn in cases:
             if args.case not in ("all", name):
                 continue
@@ -412,13 +476,7 @@ def main():
                 specs=build_rmsnorm_tensor_specs(name, tokens, fixture=args.fixture),
                 golden_fn=golden_fn,
                 config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-                compare_fn={
-                    "output": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-                    "output_int8": compare_quantized,
-                    # FP32 tiled reduction and rsqrt need not round like torch.mean/rsqrt.
-                    # Keep every scale within 1 ppm; zero scales still compare exactly.
-                    "output_scale": ratio_allclose(atol=0, rtol=1e-6, max_error_ratio=0),
-                },
+                compare_fn={"output": ratio_allclose(atol=0.0001, rtol=1.0 / 128), "output_int8": compare_quantized, "output_scale": ratio_allclose(atol=0, rtol=1e-06, max_error_ratio=0)},
                 compile_only=args.compile_only,
             )
             if not result.passed:
@@ -426,16 +484,6 @@ def main():
                     print(result.error)
                 raise SystemExit(1)
             print(f"[GOLDEN] PASS rmsnorm {name}")
-
-
-__all__ = [
-    "add_rmsnorm",
-    "golden_add_rmsnorm",
-    "golden_rmsnorm",
-    "golden_rmsnorm_quant",
-    "rmsnorm",
-    "rmsnorm_quant",
-]
 
 
 if __name__ == "__main__":

@@ -6,73 +6,38 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""The single shared expert, evaluated for every token on every sparse layer.
-
-Same clamped SwiGLU as a routed expert at ``moe_intermediate_size = 2048``
-(``n_shared_experts = 1``), but with no routing weight and no dispatch: it runs on
-the rank's token rows while the routed half is still in flight, which is what
-hides part of the all-to-all latency.
-
-Every EP rank holds the complete shared expert and computes all ``MOE_INTER``
-channels for its own token rows. Its FP32 output is added to the routed output
-returned to the same token owner. There is no shared-expert cross-rank reduction.
-
-Unlike the DeepSeek-V4 sibling (separate ``w1``/``w3`` tensors), this kernel
-consumes one fused ``w_gate_up [2 * MOE_INTER, D]``: the gate
-rows occupy ``[0, MOE_INTER)`` and the up rows ``[MOE_INTER, 2 * MOE_INTER)``,
-with a single per-channel scale vector in the same order. One cube matmul produces
-both halves, and the SwiGLU epilogue slices them apart. The output is FP32: the
-shared expert joins the local routed output in FP32 before the residual.
-"""
+"""GLM-5.3-Flash shared W8A8 SwiGLU expert and FFN branch addition."""
 
 import sys
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.elementwise import accurate_sigmoid, accurate_divide
+from models.glm5_3_flash.config import FLASH, D
+from models.glm5_3_flash.elementwise import accurate_divide, accurate_sigmoid
+from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, expert, quantize_per_token_int8
+from models.glm5_3_flash.utils import pack_int8_nz, unpack_int8_nz
 
-from models.glm5_3_flash.config import D, FLASH, T_DYN
-from models.glm5_3_flash.golden import expert
-from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
-from models.glm5_3_flash.weights import pack_int8_nz, unpack_int8_nz
-
-# This directory owns a ``golden.py`` reference module, so the repository-root
-# ``golden`` harness package must come first on the path before any harness import.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+T_DYN = pl.dynamic('GLM53_T_DYN')
 
 MOE_INTER = FLASH.moe_intermediate_size
-
-# tiling
-SH_M_TILE = 16           # cube M-tile: matmul rows must be a multiple of 16 (fractal)
+SWIGLU_LIMIT = FLASH.swiglu_limit
+SH_M_TILE = 16  # cube M-tile: matmul rows must be a multiple of 16 (fractal)
 SH_ROW_PAD = 8
-SH_ROWS_PER_BLOCK = 2
-K_TILE = 512             # gate/up K tile over D = 4096
-MM_INTER_TILE = 128      # gate/up N tile; 2 * MOE_INTER must be a multiple
+SH_ROW_TILE = 2
+K_TILE = 512  # gate/up K tile over D = 4096
+MM_INTER_TILE = 128  # gate/up N tile; 2 * MOE_INTER must be a multiple
 ACT_INTER_TILE = 256
 QUANT_TILE = 256
-INTER_K = 128            # w2 K tile over the complete intermediate axis
-D_OUT_TILE = 256         # w2 N tile over D
-D_OUT_TILE_ACT = 512
-W2_ACT_INNER = 8
-SWIGLU_LIMIT = FLASH.swiglu_limit
-
-assert (2 * MOE_INTER) % MM_INTER_TILE == 0
-assert MOE_INTER % ACT_INTER_TILE == 0
-assert MOE_INTER % QUANT_TILE == 0
-assert MOE_INTER % INTER_K == 0
-assert D % D_OUT_TILE == 0
-
-
-def golden_expert_shared(
-    x: torch.Tensor,
-    w_gate: torch.Tensor,
-    w_up: torch.Tensor,
-    w_down: torch.Tensor,
-) -> torch.Tensor:
-    return expert(x, w_gate, w_up, w_down)
+INTER_K_TILE = 128  # w2 K tile over the complete intermediate axis
+D_OUT_TILE = 256  # w2 N tile over D
+D_ACT_TILE = 512
+W2_GROUP_TILE = 8
+T_DYN_TEST = 64
 
 
 @pl.jit.inline
@@ -93,7 +58,7 @@ def expert_shared(
         # Fused gate/up cube matmul: w_gate_up rows [0, 2*MOE_INTER) contract the same
         # INT8 x rows, so one K-loop fills both halves of the INT32 accumulator.
         gate_up_i32 = pl.create_tensor([SH_M_TILE, 2 * MOE_INTER], dtype=pl.INT32)
-        for nb in pl.spmd((2 * MOE_INTER) // MM_INTER_TILE, name_hint="sh_gate_up_mm", allow_early_resolve=True):
+        for nb in pl.spmd(2 * MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_up_mm", allow_early_resolve=True):
             n0 = nb * MM_INTER_TILE
             acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, D, K_TILE, stage=2):
@@ -106,7 +71,7 @@ def expert_shared(
         # scale), clamped SwiGLU, per-row amax, and INT8 requant for w2. Each
         # AIV block owns two rows across the full intermediate axis, so
         # this stage can start alongside the EP dispatch.
-        # The activation/quant walk covers SH_ROWS_PER_BLOCK rows per block. A
+        # The activation/quant walk covers SH_ROW_TILE rows per block. A
         # trailing odd row runs in one extra block whose second row reads past
         # ``valid_rows`` and is never written back: the w2 epilogue masks every
         # row at or beyond ``valid_rows``.
@@ -114,34 +79,20 @@ def expert_shared(
         h_i8 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT8)
         h_scale_dq = pl.create_tensor([SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_h_i8_init"):
-            h_i8[:, :] = pl.cast(
-                pl.full([SH_M_TILE, MOE_INTER], dtype=pl.FP16, value=0.0),
-                target_type=pl.INT8,
-                mode="trunc",
-            )
-        n_act_blocks = (valid_rows + SH_ROWS_PER_BLOCK - 1) // SH_ROWS_PER_BLOCK
+            h_i8_value_full = pl.full([SH_M_TILE, MOE_INTER], dtype=pl.FP16, value=0.0)
+            h_i8[:, :] = pl.cast(h_i8_value_full, target_type=pl.INT8, mode="trunc")
+        n_act_blocks = (valid_rows + SH_ROW_TILE - 1) // SH_ROW_TILE
         for row_block in pl.spmd(n_act_blocks, name_hint="sh_gate_up_act_q"):
-            row0 = row_block * SH_ROWS_PER_BLOCK
-            blk_rows = pl.min(pl.cast(SH_ROWS_PER_BLOCK, pl.INDEX), valid_rows - row0)
+            row0 = row_block * SH_ROW_TILE
+            blk_rows = pl.min(pl.cast(SH_ROW_TILE, pl.INDEX), valid_rows - row0)
             x_scale_blk = pl.slice(x_scale, [SH_ROW_PAD, 1], [ts0 + row0, 0], valid_shape=[blk_rows, 1])
             row_amax = pl.full([1, SH_ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
             for part in pl.pipeline(MOE_INTER // ACT_INTER_TILE, stage=1):
                 n0 = part * ACT_INTER_TILE
-                gate_chunk_i32 = pl.slice(
-                    gate_up_i32, [SH_ROW_PAD, ACT_INTER_TILE], [row0, n0],
-                    valid_shape=[SH_ROWS_PER_BLOCK, ACT_INTER_TILE],
-                )
-                up_chunk_i32 = pl.slice(
-                    gate_up_i32, [SH_ROW_PAD, ACT_INTER_TILE], [row0, MOE_INTER + n0],
-                    valid_shape=[SH_ROWS_PER_BLOCK, ACT_INTER_TILE],
-                )
-                gate_w_scale = pl.reshape(
-                    w_gate_up_scale[n0 : n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE]
-                )
-                up_w_scale = pl.reshape(
-                    w_gate_up_scale[MOE_INTER + n0 : MOE_INTER + n0 + ACT_INTER_TILE],
-                    [1, ACT_INTER_TILE],
-                )
+                gate_chunk_i32 = pl.slice(gate_up_i32, [SH_ROW_PAD, ACT_INTER_TILE], [row0, n0], valid_shape=[SH_ROW_TILE, ACT_INTER_TILE])
+                up_chunk_i32 = pl.slice(gate_up_i32, [SH_ROW_PAD, ACT_INTER_TILE], [row0, MOE_INTER + n0], valid_shape=[SH_ROW_TILE, ACT_INTER_TILE])
+                gate_w_scale = pl.reshape(w_gate_up_scale[n0 : n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                up_w_scale = pl.reshape(w_gate_up_scale[MOE_INTER + n0:MOE_INTER + n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
                 gate_fp32 = pl.cast(gate_chunk_i32, target_type=pl.FP32, mode="none")
                 up_fp32 = pl.cast(up_chunk_i32, target_type=pl.FP32, mode="none")
                 gate_fp32 = pl.col_expand_mul(pl.row_expand_mul(gate_fp32, x_scale_blk), gate_w_scale)
@@ -156,10 +107,10 @@ def expert_shared(
                 # A 1-row trailing block reads one scale row; re-widen its dummy
                 # second row so the store keeps its static slice. That row is
                 # masked at the w2 output.
-                gated = pl.set_validshape(gated, SH_ROWS_PER_BLOCK, ACT_INTER_TILE)
+                gated = pl.set_validshape(gated, SH_ROW_TILE, ACT_INTER_TILE)
                 chunk_amax = pl.reshape(pl.row_max(pl.abs(gated)), [1, SH_ROW_PAD])
                 row_amax = pl.maximum(row_amax, chunk_amax)
-                h_fp32[row0 : row0 + SH_ROWS_PER_BLOCK, n0 : n0 + ACT_INTER_TILE] = gated[0:SH_ROWS_PER_BLOCK, :]
+                h_fp32[row0:row0 + SH_ROW_TILE, n0:n0 + ACT_INTER_TILE] = gated[0:SH_ROW_TILE, :]
 
             amax_buffer = pl.create_tensor([1, SH_ROW_PAD], dtype=pl.FP32)
             amax_buffer[:, :] = row_amax
@@ -174,43 +125,40 @@ def expert_shared(
             row_scale_q_col = pl.reshape(row_scale_q, [SH_ROW_PAD, 1])
             row_scale_dq_col = pl.reshape(scale_dq_buffer, [SH_ROW_PAD, 1])
             row_scale_dq = pl.row_expand(pl.full([SH_ROW_PAD, SH_ROW_PAD], dtype=pl.FP32, value=0.0), row_scale_dq_col)
-            h_scale_dq[row0 : row0 + SH_ROWS_PER_BLOCK, :] = row_scale_dq[0:SH_ROWS_PER_BLOCK, :]
+            h_scale_dq[row0 : row0 + SH_ROW_TILE, :] = row_scale_dq[0:SH_ROW_TILE, :]
             for q_idx in pl.pipeline(0, MOE_INTER // QUANT_TILE, stage=1):
                 k0 = q_idx * QUANT_TILE
-                h_fp32_slice = pl.slice(
-                    h_fp32, [SH_ROW_PAD, QUANT_TILE], [row0, k0],
-                    valid_shape=[SH_ROWS_PER_BLOCK, QUANT_TILE],
-                )
+                h_fp32_slice = pl.slice(h_fp32, [SH_ROW_PAD, QUANT_TILE], [row0, k0], valid_shape=[SH_ROW_TILE, QUANT_TILE])
                 h_scaled = pl.row_expand_mul(h_fp32_slice, row_scale_q_col)
                 h_i32 = pl.cast(h_scaled, target_type=pl.INT32, mode="rint")
                 h_fp16 = pl.cast(h_i32, target_type=pl.FP16, mode="round")
-                h_i8[row0 : row0 + SH_ROWS_PER_BLOCK, k0 : k0 + QUANT_TILE] = pl.cast(
+                h_i8[row0 : row0 + SH_ROW_TILE, k0 : k0 + QUANT_TILE] = pl.cast(
                     h_fp16, target_type=pl.INT8, mode="trunc"
-                )[0:SH_ROWS_PER_BLOCK, :]
+                )[0:SH_ROW_TILE, :]
 
         # w2 (down) cube matmul: [rows, MOE_INTER] x [D, MOE_INTER] -> INT32.
         y_i32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.INT32)
         for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm"):
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
-            for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
-                hs_k = h_i8[:, k0 : k0 + INTER_K]
-                sw2_k = w_down[d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+            for k0 in pl.pipeline(0, MOE_INTER, INTER_K_TILE, stage=2):
+                hs_k = h_i8[:, k0 : k0 + INTER_K_TILE]
+                sw2_k = w_down[d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K_TILE]
                 y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True, init_cond=(k0 == 0))
             y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
 
         # Dequant w2 output (per-row h scale x per-channel w2 scale) -> FP32.
-        for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="sh_w2_act", allow_early_resolve=True):
-            d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
+        for db_idx in pl.spmd(D // (W2_GROUP_TILE * D_ACT_TILE), name_hint="sh_w2_act", allow_early_resolve=True):
+            d_base = db_idx * (W2_GROUP_TILE * D_ACT_TILE)
             h_scale = pl.row_max(h_scale_dq[:, :])
-            for dg in pl.pipeline(W2_ACT_INNER, stage=2):
-                d0 = d_base + dg * D_OUT_TILE_ACT
-                y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
-                w2_scale_chunk = pl.reshape(w_down_scale[d0 : d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
+            for dg in pl.pipeline(W2_GROUP_TILE, stage=2):
+                d0 = d_base + dg * D_ACT_TILE
+                y_2d_i32 = y_i32[:, d0 : d0 + D_ACT_TILE]
+                w2_scale_chunk = pl.reshape(w_down_scale[d0 : d0 + D_ACT_TILE], [1, D_ACT_TILE])
                 y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                 y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk)
-                y_valid = pl.set_validshape(y_2d, valid_rows, D_OUT_TILE_ACT)
-                output = pl.assemble(output, y_valid, [ts0, d0])
+                y_valid = pl.set_validshape(y_2d, valid_rows, D_ACT_TILE)
+                output[ts0:ts0 + SH_M_TILE, d0:d0 + D_ACT_TILE] = y_valid
 
     return output
 
@@ -229,18 +177,46 @@ def expert_shared_test(
     x_scale.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
 
-    expert_shared(
-        x_int8, x_scale,
-        w_gate_up, w_gate_up_scale,
-        w_down, w_down_scale,
-        output,
-    )
+    expert_shared(x_int8, x_scale, w_gate_up, w_gate_up_scale, w_down, w_down_scale, output)
     return output
+
+
+@pl.jit.inline
+def moe_layer_add(
+    routed: pl.Tensor[[T_DYN, D], pl.FP32],
+    shared: pl.Tensor[[T_DYN, D], pl.FP32],
+    y: pl.Out[pl.Tensor[[T_DYN, D], pl.FP32]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Add both complete local branches and zero inactive capacity rows."""
+    t_dim = pl.tensor.dim(routed, 0)
+    active = pl.cast(num_tokens, pl.INDEX)
+    if active < 0:
+        active = pl.cast(0, pl.INDEX)
+    if active > t_dim:
+        active = pl.cast(t_dim, pl.INDEX)
+
+    with pl.spmd(t_dim, name_hint="moe_layer_add") as _add_tid:
+        t = pl.tile.get_block_idx()
+        acc = pl.full([1, D], dtype=pl.FP32, value=0.0)
+        if t < active:
+            acc = pl.add(routed[t : t + 1, :], shared[t : t + 1, :])
+        y[t : t + 1, :] = acc
+
+    return y
+
+
+def golden_expert_shared(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    w_down: torch.Tensor,
+) -> torch.Tensor:
+    return expert(x, w_gate, w_up, w_down)
 
 
 def golden_expert_shared_fn(tensors):
     """Decode NZ INT8 weights, then evaluate the unchanged fused gate/up reference."""
-    from models.glm5_3_flash.quantization import quantize_per_token_int8
 
     x_int8 = tensors["x_int8"].to(torch.int32)
     x_scale = tensors["x_scale"].float()
@@ -276,31 +252,24 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     return w_i8, scale
 
 
-T_DYN_TEST = 64
-
-
 def build_tensor_specs(num_tokens=T_DYN_TEST):
     from golden import TensorSpec
 
     x_bf16 = torch.randn(num_tokens, D, dtype=torch.bfloat16)
 
     def init_x_int8():
-        from models.glm5_3_flash.quantization import quantize_per_token_int8
+
         x_i8, x_sd = quantize_per_token_int8(x_bf16)
         return x_i8
 
     def init_x_scale():
-        from models.glm5_3_flash.quantization import quantize_per_token_int8
+
         _, x_sd = quantize_per_token_int8(x_bf16)
         return x_sd
 
     SHARED_DEQUANT_STD = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
-    sw_gu_i8, sw_gu_s = gen_shared_weight(
-        (2 * MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50
-    )
-    sw2_i8, sw2_s = gen_shared_weight(
-        (D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33
-    )
+    sw_gu_i8, sw_gu_s = gen_shared_weight((2 * MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50)
+    sw2_i8, sw2_s = gen_shared_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33)
 
     return [
         TensorSpec("x_int8", [num_tokens, D], torch.int8, init_value=init_x_int8),
@@ -331,28 +300,12 @@ if __name__ == "__main__":
         fn=expert_shared_test,
         specs=build_tensor_specs(args.num_tokens),
         golden_fn=golden_expert_shared_fn,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            # Deterministic INT8 golden: 3e-3 per point, 1% of points.
-            "output": ratio_reldiff(diff_thd=3e-3, pct_thd=0.01),
-        },
+        config=dict(dump_passes=args.dump_passes, backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane),
+        rtol=0.001,
+        atol=0.001,
+        compare_fn={"output": ratio_reldiff(diff_thd=0.003, pct_thd=0.01)},
     )
     if not result.passed:
         if result.error:
             print(result.error)
         raise SystemExit(1)
-
-
-__all__ = [
-    "MOE_INTER",
-    "expert_shared",
-    "golden_expert_shared",
-]

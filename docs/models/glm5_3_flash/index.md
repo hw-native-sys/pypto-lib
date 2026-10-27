@@ -7,6 +7,20 @@ kernels, Torch goldens, W8A8 checkpoint staging, composed MoE FFN entries,
 resident chunked generation, MTP proposals with greedy verification, and a
 24-block vision tower with image/video preprocessing.
 
+Each core component owns its kernels, cache operations, Torch references and
+validation: `kda.py`, `attention.py`, `indexer.py`, `mtp.py`, and `vision.py`.
+The MoE, expert, normalization and mHC operators compose into `decode_layer.py`
+and `prefill_layer.py`. `prefill_fwd.py` owns resident weight staging, cache
+lifecycle, runtime dispatch and generation. `config.py` contains model
+configuration; `utils.py` contains checkpoint reading and shared host helpers.
+Symbolic tensor dimensions are declared alongside the kernels that use them.
+
+The component entries run their bounded cases by default. Use `--component`
+to select a stage, such as `kda.py --component convolution` or
+`attention.py --component prefill`; existing case and checkpoint options apply
+to that stage. `prefill_fwd.py` runs CPU weight checks without a checkpoint;
+`--check reference` runs the independent CPU backbone checks.
+
 ## Why W8A8, and why a2a3 forces it
 
 The released checkpoint is FP8 blockwise (`e4m3`, 128x128, dynamic activations).
@@ -555,14 +569,14 @@ matrix as the indexer golden; it is not the checkpoint's hidden-size rotation.
 
 ## Loading weights
 
-`models/glm5_3_flash/weights.py` provides an indexed CPU reader. It opens only
+`models/glm5_3_flash/utils.py` provides an indexed CPU reader. It opens only
 requested tensors and TP slices instead of materializing all checkpoint shards.
 The checkpoint configuration must match the compiled GLM dimensions and layer
 schedule. Quantization metadata, shapes, dtypes and topology are checked before
 the returned weights reach a kernel.
 
 ```python
-from models.glm5_3_flash.weights import Checkpoint
+from models.glm5_3_flash.utils import Checkpoint
 
 checkpoint = Checkpoint("/path/to/vllm-ascend-a3-w8a8")
 layer = checkpoint.layer(3, tp_rank=0, tp=16, ep_rank=0, ep=16)
@@ -703,8 +717,8 @@ Each of these was a compile or simulator failure, not a guess:
   `kernels/aic/*.cpp` carries no vector op between `#if defined(__DAV_CUBE__)` and its
   `#endif` (`TMUL` there is address arithmetic and is expected).
 - **`pl.spmd` takes a Var, not a call.** Bind `pl.tensor.dim(...)` to a name first.
-- **A script-entry file must put the repository root first on `sys.path`**, or
-  `from golden import run` resolves to this directory's own `golden.py`.
+- **Script entries put the repository root first on `sys.path`** to resolve
+  model imports and the shared `golden` harness when invoked by file path.
 
 ## MTP proposals and visual inputs
 
@@ -762,12 +776,12 @@ Component entries retain generated inputs by default and accept checkpoint
 weights through the same kernels and independent Torch references:
 
 ```bash
-python models/glm5_3_flash/mla_prolog.py --mode native --checkpoint /path/to/checkpoint
-python models/glm5_3_flash/mla_epilog.py --mode native --checkpoint /path/to/checkpoint
-python models/glm5_3_flash/mtp_projection.py --checkpoint /path/to/checkpoint
+python models/glm5_3_flash/attention.py --component projection --mode native --checkpoint /path/to/checkpoint
+python models/glm5_3_flash/attention.py --component output --mode native --checkpoint /path/to/checkpoint
+python models/glm5_3_flash/mtp.py --checkpoint /path/to/checkpoint
 python models/glm5_3_flash/lm_head.py --case fp32 --checkpoint /path/to/checkpoint
 python models/glm5_3_flash/lm_head.py --case mtp_fp32 --checkpoint /path/to/checkpoint
-python models/glm5_3_flash/vision/forward.py --checkpoint /path/to/checkpoint
+python models/glm5_3_flash/vision.py --component forward --checkpoint /path/to/checkpoint
 ```
 
 The full-logits head reference preserves FP32 normalization boundaries and

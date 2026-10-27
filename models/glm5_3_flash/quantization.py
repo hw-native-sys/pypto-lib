@@ -6,40 +6,25 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Torch references for the W8A8 checkpoint format used on a2a3.
+"""GLM-5.3-Flash dynamic INT8 quantization and W8A8 references."""
 
-The a2a3 cube has no fp8 or MX ``mmad`` — ``Intrinsic_mmad`` in
-``Ascend910_9392.ini`` lists only ``s32s8s8`` / ``u32u8u8`` / ``u8s8`` and the
-fp16/fp32 forms — so the released FP8-blockwise checkpoint cannot execute here and
-int8 is the only quantized path. The deployment weights are therefore the
-msmodelslim W8A8 conversion that vLLM Ascend serves on a 16-card A3 node.
+import sys
+from pathlib import Path
 
-The deployment checkpoint is ``Eco-Tech/GLM-5.3-Flash-w8a8`` and its
-``quant_model_description.json`` declares one scheme and one only:
-
-    {"group_size": 0, "model_quant_type": "W8A8_DYNAMIC", "is_rot_used": true}
-
-So there is a single flavour: int8 weights with an FP32 per-output-channel
-``weight_scale``, and the activation quantized per token at run time. ``group_size:
-0`` means per-channel rather than grouped. The loader requires positive finite
-scales and checks each requested weight's ``weight_offset`` is zero before using
-the symmetric quantization path. It preserves the converted weights without
-applying offline smoothing or rotation a second time. Static activation
-quantization is not supported by this path.
-"""
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pypto.language as pl
 import torch
+import torch.nn.functional as F
 
-from models.glm5_3_flash.config import INT8_K_ALIGN
+from models.glm5_3_flash.config import FLASH
 from models.glm5_3_flash.elementwise import accurate_divide, accurate_reciprocal
+from models.glm5_3_flash.utils import _check, _report
 
-
-# Shared with models/deepseek_v4_flash_mtp/config.py:282-283, the a2a3 W8A8 sibling
-# port. The amax floor avoids 127/0 on an all-zero row.
+INT8_K_ALIGN = 32
 INT8_SCALE_MAX = 127.0
 INT8_AMAX_EPS = 1e-4
-
 QUANT_ROWS = pl.dynamic("GLM53_QUANT_ROWS")
 QUANT_WIDTH = pl.dynamic("GLM53_QUANT_WIDTH")
 QUANT_M_TILE = 8
@@ -77,7 +62,7 @@ def quantize_bf16_rows(
         scale_column = pl.reshape(scale_buffer, [QUANT_M_TILE, 1])
         scale_lanes = pl.full([QUANT_M_TILE, 8], dtype=pl.FP32, value=0.0)
         scale_values = pl.row_expand(scale_lanes, inverse_column)
-        scales[row0:row0 + QUANT_M_TILE, :] = pl.set_validshape(scale_values, valid_rows, 8)
+        scales[row0 : row0 + QUANT_M_TILE, :] = pl.set_validshape(scale_values, valid_rows, 8)
         for col0 in pl.range(0, width, QUANT_N_TILE):
             valid_columns = pl.min(QUANT_N_TILE, width - col0)
             source = pl.slice(x, [QUANT_M_TILE, QUANT_N_TILE], [row0, col0], valid_shape=[valid_rows, valid_columns])
@@ -143,7 +128,6 @@ def quantize_per_token_int8(
     return _round_to_int8(value * scale_quant), 1.0 / scale_quant
 
 
-
 def int8_matmul(x_int8: torch.Tensor, weight_int8: torch.Tensor) -> torch.Tensor:
     """``[..., K] x [N, K] -> [..., N]`` int8 matmul accumulating in int32.
 
@@ -151,9 +135,7 @@ def int8_matmul(x_int8: torch.Tensor, weight_int8: torch.Tensor) -> torch.Tensor
     multiple of :data:`INT8_K_ALIGN`; the reference itself is layout-free.
     """
     if x_int8.shape[-1] % INT8_K_ALIGN:
-        raise ValueError(
-            f"the a2a3 int8 cube needs K aligned to {INT8_K_ALIGN}, got {x_int8.shape[-1]}"
-        )
+        raise ValueError(f"the a2a3 int8 cube needs K aligned to {INT8_K_ALIGN}, got {x_int8.shape[-1]}")
     return torch.matmul(x_int8.to(torch.int32), weight_int8.to(torch.int32).transpose(-2, -1))
 
 
@@ -181,8 +163,6 @@ def w8a8_dynamic_linear(
     if bias is not None:
         result = result + bias.float()
     return result.to(out_dtype)
-
-
 
 
 def dequant_swiglu_quant(
@@ -216,20 +196,114 @@ def dequant_swiglu_quant(
     return quantize_per_token_int8(hidden, down_smooth_scale)
 
 
-__all__ = [
-    "INT8_AMAX_EPS",
-    "INT8_SCALE_MAX",
-    "dequant_swiglu_quant",
-    "int8_matmul",
-    "quantize_per_channel_int8",
-    "quantize_per_token_int8",
-    "w8a8_dynamic_linear",
-]
+def swiglu(gate_value: torch.Tensor, up_value: torch.Tensor) -> torch.Tensor:
+    """Clamp-stabilised SwiGLU shared by the dense MLP, shared expert and routed experts.
+
+    ``gate`` is clamped from above only; ``up`` is clamped on both sides.
+    """
+    limit = FLASH.swiglu_limit
+    gate_value = gate_value.float().clamp(max=limit)
+    up_value = up_value.float().clamp(-limit, limit)
+    return F.silu(gate_value) * up_value
+
+
+def expert(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    w_down: torch.Tensor,
+    route_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Evaluate one clamp-stabilised SwiGLU expert (routed, shared, or dense)."""
+    hidden = swiglu(F.linear(x, w_gate), F.linear(x, w_up))
+    if route_weight is not None:
+        hidden = hidden * route_weight
+    return F.linear(hidden.to(x.dtype), w_down)
+
+
+def run_swiglu_golden(golden_swiglu) -> None:
+    """Check the clamped SwiGLU's saturation behaviour at the configured limit."""
+    torch.manual_seed(17)
+    limit = FLASH.swiglu_limit
+    gate_value = torch.tensor([[-100.0, 0.0, 100.0]])
+    up_value = torch.tensor([[-100.0, 1.0, 100.0]])
+
+    hidden = golden_swiglu(gate_value, up_value)
+    _check(hidden.shape == gate_value.shape, f"swiglu shape {tuple(hidden.shape)}")
+    # `up` is clamped on both sides, `gate` only from above.
+    expected_high = torch.nn.functional.silu(torch.tensor(limit)) * limit
+    _check(
+        torch.allclose(hidden[0, 2], expected_high, atol=1e-05),
+        f"swiglu did not clamp the upper tail: {hidden[0, 2]} vs {expected_high}",
+    )
+    expected_low = torch.nn.functional.silu(torch.tensor(-100.0)) * -limit
+    _check(
+        torch.allclose(hidden[0, 0], expected_low, atol=1e-05),
+        f"swiglu clamped the gate from below: {hidden[0, 0]} vs {expected_low}",
+    )
+
+    _report("swiglu")
+
+
+def run_expert_golden(golden_expert) -> None:
+    """Check one clamped-SwiGLU expert FFN: routed, shared and dense share it."""
+    torch.manual_seed(29)
+    tokens, hidden, inter = 6, 64, 128
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    w_gate = torch.randn(inter, hidden, dtype=torch.bfloat16)
+    w_up = torch.randn(inter, hidden, dtype=torch.bfloat16)
+    w_down = torch.randn(hidden, inter, dtype=torch.bfloat16)
+
+    out = golden_expert(x, w_gate, w_up, w_down)
+    _check(out.shape == (tokens, hidden), f"expert output shape {tuple(out.shape)}")
+
+    route_weight = torch.rand(tokens, 1, dtype=torch.bfloat16)
+    out_routed = golden_expert(x, w_gate, w_up, w_down, route_weight)
+    _check(out_routed.shape == out.shape, f"routed expert output shape {tuple(out_routed.shape)}")
+    # The routing weight is folded into the BF16 hidden before ``down``, so the
+    # comparison to ``out * weight`` carries a few BF16 ULPs of requant noise
+    # amplified by the down projection. A per-row relative check admits that.
+    expected = out.float() * route_weight.float()
+    row_denom = expected.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+    row_reldiff = (out_routed.float() - expected).abs().amax(dim=-1) / row_denom.squeeze(-1)
+    _check(
+        bool((row_reldiff < 0.01).all()),
+        f"routed expert must fold the per-row weight into its output (max row reldiff {row_reldiff.max().item():.5f})",
+    )
+    # The plain path must reproduce the same maths with a unit weight.
+    _check(
+        torch.allclose(golden_expert(x, w_gate, w_up, w_down, torch.ones(tokens, 1)).float(), out.float(), atol=0.001),
+        "expert must be invariant to a unit routing weight",
+    )
+
+    _report("expert")
+
+
+def run_quantization_goldens(quantize_per_channel, quantize_per_token, dynamic_linear) -> None:
+    """Check the W8A8 references reconstruct a float matmul within int8 error."""
+    torch.manual_seed(23)
+    tokens, in_features, out_features = 6, 128, 64
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
+    weight = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+
+    weight_int8, weight_scale = quantize_per_channel(weight)
+    _check(weight_int8.dtype is torch.int8, f"weight dtype {weight_int8.dtype}")
+    _check(weight_scale.shape == (out_features, 1), f"per-channel scale shape {tuple(weight_scale.shape)}")
+
+    x_int8, token_scale = quantize_per_token(x)
+    _check(x_int8.dtype is torch.int8, f"activation dtype {x_int8.dtype}")
+    _check(token_scale.shape == (tokens, 1), f"per-token scale shape {tuple(token_scale.shape)}")
+
+    reference = torch.nn.functional.linear(x.float(), weight.float())
+    quantized = dynamic_linear(x, weight_int8, weight_scale, out_dtype=torch.float32)
+    error = (quantized - reference).abs().max() / reference.abs().max()
+    _check(float(error) < 0.05, f"W8A8 reconstruction error is too large: {float(error)}")
+
+    _report("quantization")
 
 
 if __name__ == "__main__":
-    from models.glm5_3_flash._golden_smoke import run_quantization_goldens
+    run_swiglu_golden(swiglu)
+    run_expert_golden(expert)
 
-    run_quantization_goldens(
-        quantize_per_channel_int8, quantize_per_token_int8, w8a8_dynamic_linear
-    )
+    run_quantization_goldens(quantize_per_channel_int8, quantize_per_token_int8, w8a8_dynamic_linear)

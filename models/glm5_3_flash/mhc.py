@@ -6,51 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""mHC coefficient generation, stream collapse, residual expansion, and final collapse.
-
-GLM-5.3-Flash carries **two** hyper-connection sites per backbone layer — one around
-attention (``hc_attn_fn`` / ``hc_attn_scale`` / ``hc_attn_base``) and one around the
-MLP (``hc_ffn_*``) — for 90 sites over 45 layers. The MTP layer has no ``hc_*``
-weights and uses a plain residual instead.
-
-``Glm5NextTextHyperConnection`` subclasses ``DeepseekV4HyperConnection`` with no
-changes, so the coefficient algebra is the same as ``models/deepseek_v4_1_flash/hc.py``.
-Two things differ and both change the ABI:
-
-* **The stream is BF16, not FP32.** It is seeded by replicating the BF16 embedding
-  (``inputs_embeds.unsqueeze(2).expand(-1, -1, hc_mult, -1)``) and the decoder layer
-  casts the mixes into the stream dtype. DeepSeek-V4 keeps its HC stream in FP32, so
-  a kernel cannot be lifted across without changing the tile dtypes. At width 4 this
-  is 32 KB of live residual per token instead of 64 KB.
-* **The head is an unweighted mean** (``Glm5NextTextHyperHead``), where DeepSeek-V4
-  applies the last layer's delayed pre-mix, so ``mhc_head`` takes no mix input. The
-  model tail is ``norm(hc_head(streams))``.
-
-The coefficients themselves stay FP32: the projection accumulates in FP32 and the
-two sigmoids, the softmax and all 20 Sinkhorn iterations must not be computed in
-BF16. All three weights are stored BF16 in the deployment checkpoint, read from the
-shard headers: ``fn`` ``[24, 16384]``, ``base`` ``[24]`` and ``scale`` ``[3]``, so
-the loader upcasts ``scale`` and ``base`` before the coefficient maths. Note the
-checkpoint spells them ``layers.N.attn_hc.*`` and ``layers.N.ffn_hc.*``, not the
-``hc_attn_*`` / ``hc_ffn_*`` parameter names the reference implementation uses.
-
-**Prior art.** ``ops/pypto_python/impl/hc_pre_pypto.py`` in cann-recipes-infer is a
-pypto implementation of the hyper-connection pre-collapse on this hardware
-generation. It targets the older ``pypto.Tensor`` / ``pypto_impl`` frontend, which
-this repo's pinned pypto does not export, so treat it as an algorithm and tiling
-reference rather than code.
-
-**Donors, in the right order.** ``models/deepseek_v4_flash_mtp/hc_pre.py`` (434
-lines), ``hc_post.py`` (237) and ``hc_head.py`` (288) are implemented, belong to an
-a2a3 directory in the CI platform configuration — and are the ones to port.
-``models/deepseek_v4_flash_dspark/`` has a second implemented set (573 / 239 / 386)
-for the larger batch. ``models/deepseek_v4_1_flash/hc.py`` (559 lines, landed as
-#1247) consolidates the four into one file and is the cleanest read, **but it is
-a5-only** (its directory targets A5 in the CI platform configuration), so take its structure, not its tiling.
-
-Against any of them the port is: the FP32 stream becomes BF16, the learned head
-becomes an unweighted mean, and the router-side scoring is unrelated.
-"""
+"""GLM-5.3-Flash BF16 hyper-connection mixing and stream collapse."""
 
 import sys
 from pathlib import Path
@@ -58,19 +14,27 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from dataclasses import dataclass
+
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import D, FLASH, HC_DIM, HC_MULT, MIX_HC, T_DYN
-from models.glm5_3_flash.golden import hc_head, hc_mixes, hc_post, hc_pre
+from models.glm5_3_flash.config import FLASH, HC_DIM, HC_MULT, MIX_HC, D, Glm53FlashConfig
+from models.glm5_3_flash.elementwise import (
+    _sum_fp32_reference, accurate_divide, accurate_exp, accurate_row_sum, accurate_row_sum_parts,
+    accurate_rsqrt, accurate_sigmoid,
+)
 from models.glm5_3_flash.linear import bf16_linear
-from models.glm5_3_flash.elementwise import accurate_exp, accurate_sigmoid, accurate_rsqrt, accurate_row_sum, accurate_row_sum_parts, accurate_divide
+from models.glm5_3_flash.rmsnorm import unweighted_rms_norm
+from models.glm5_3_flash.utils import _assert_close, _check, _randn, _report
 
-MIX_D_TILE = 256  # D-wise tile of the three stream-collapse scopes
+T_DYN = pl.dynamic('GLM53_T_DYN')
+
 HC_DIM_INV = 1.0 / HC_DIM
 HC_SINKHORN_ITER = FLASH.hc_sinkhorn_iters
 HC_EPS = FLASH.hc_eps
 NORM_EPS = FLASH.rms_norm_eps
+MIX_D_TILE = 256
 MIX_PAD = 32  # MIX_HC = 24 padded to the cube's N granularity
 HC_PAD = 8  # HC_MULT = 4 padded so an FP32 row is 32 bytes
 RMS_T_TILE = 8  # token tile of the sum-of-squares scope
@@ -78,32 +42,6 @@ LINEAR_T_TILE = 16  # cube M tile; below 16 the matmul is not L0 split
 COMB_T_TILE = 8  # token tile of the softmax / Sinkhorn scope
 POST_COEFF_TILE = 16  # minimum 32-byte BF16 vector row
 RMS_K_TILE = 128  # HC_DIM reduction chunk of the sum of squares
-
-
-def golden_mhc_mixes(
-    x_hc: torch.Tensor,
-    function: torch.Tensor,
-    scale: torch.Tensor,
-    base: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return hc_mixes(x_hc, function, scale, base)
-
-
-def golden_mhc_pre(x_hc: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-    return hc_pre(x_hc, pre_mix).to(torch.bfloat16)
-
-
-def golden_mhc_post(
-    sublayer: torch.Tensor,
-    residual: torch.Tensor,
-    post_mix: torch.Tensor,
-    residual_mix: torch.Tensor,
-) -> torch.Tensor:
-    return hc_post(sublayer, residual, post_mix, residual_mix).to(torch.bfloat16)
-
-
-def golden_mhc_head(x_hc: torch.Tensor) -> torch.Tensor:
-    return hc_head(x_hc)
 
 
 @pl.jit.inline
@@ -118,8 +56,8 @@ def sinkhorn_normalize(
     else:
         rows[:, :] = values
     totals = accurate_row_sum(rows)
-    denominator = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
     ones = pl.full([HC_PAD, HC_PAD], dtype=pl.FP32, value=1.0)
+    denominator = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
     denominator[:, :] = pl.row_expand_mul(ones, pl.add(pl.mul(totals, 0.5), EPS))
     normalized = accurate_divide(rows, denominator)
     result = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
@@ -142,9 +80,9 @@ def mhc_mixes(
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
-    x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
 
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
+    x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     for block in pl.spmd((t_dim + RMS_T_TILE - 1) // RMS_T_TILE, name_hint="mhc_rms"):
         t0 = block * RMS_T_TILE
         valid_rows = pl.min(RMS_T_TILE, t_dim - t0)
@@ -152,12 +90,7 @@ def mhc_mixes(
         sq_error = pl.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_K_TILE, stage=4):
             k0 = kb * RMS_K_TILE
-            rms_x_tile = pl.slice(
-                x_flat,
-                [RMS_T_TILE, RMS_K_TILE],
-                [t0, k0],
-                valid_shape=[valid_rows, RMS_K_TILE],
-            )
+            rms_x_tile = pl.slice(x_flat, [RMS_T_TILE, RMS_K_TILE], [t0, k0], valid_shape=[valid_rows, RMS_K_TILE])
             rms_value = pl.cast(rms_x_tile, pl.FP32)
             rms_square = pl.create_tensor([RMS_T_TILE, RMS_K_TILE], dtype=pl.FP32)
             rms_square[:, :] = pl.mul(rms_value, rms_value)
@@ -207,8 +140,8 @@ def mhc_mixes(
         post_sigmoid = accurate_sigmoid(post_logits, 1, HC_PAD)
         pre = pl.add(pre_sigmoid, HC_EPS)
         post = pl.mul(post_sigmoid, 2.0)
-        pre_mix[t:t + 1, :] = pl.set_validshape(pre, 1, HC_MULT)
-        post_mix[t:t + 1, :] = pl.set_validshape(post, 1, HC_MULT)
+        pre_mix[t : t + 1, :] = pl.set_validshape(pre, 1, HC_MULT)
+        post_mix[t : t + 1, :] = pl.set_validshape(post, 1, HC_MULT)
 
         # Four identical quadrants; each reduction counts its logical axis twice.
         comb_raw = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
@@ -234,7 +167,7 @@ def mhc_mixes(
             values[:, :] = normalized
             normalized = sinkhorn_normalize(values, True, HC_EPS)
             values[:, :] = normalized
-        residual_flat[t * HC_MULT:t * HC_MULT + HC_MULT, :] = pl.set_validshape(values, HC_MULT, HC_MULT)
+        residual_flat[t * HC_MULT : t * HC_MULT + HC_MULT, :] = pl.set_validshape(values, HC_MULT, HC_MULT)
     return pre_mix, post_mix, residual_mix
 
 
@@ -261,10 +194,7 @@ def mhc_pre(
     with pl.spmd(t_dim, name_hint="mhc_pre") as pre_tid:
         t = pl.tile.get_block_idx()
         for d0 in pl.pipeline(0, D, MIX_D_TILE, stage=2):
-            value = pl.mul(
-                pl.cast(x_flat[t : t + 1, d0 : d0 + MIX_D_TILE], target_type=pl.FP32),
-                pl.read(pre_mix, [t, 0]),
-            )
+            value = pl.mul(pl.cast(x_flat[t:t + 1, d0:d0 + MIX_D_TILE], target_type=pl.FP32), pl.read(pre_mix, [t, 0]))
             correction = pl.full([1, MIX_D_TILE], dtype=pl.FP32, value=0.0)
             for stream in pl.unroll(HC_MULT - 1):
                 head = stream + 1
@@ -275,7 +205,7 @@ def mhc_pre(
                 error = pl.add(pl.sub(value, pl.sub(updated, recovered)), pl.sub(partial, recovered))
                 correction = pl.add(correction, error)
                 value = updated
-            output[t : t + 1, d0 : d0 + MIX_D_TILE] = pl.cast(pl.add(value, correction), target_type=pl.BF16, mode="rint")
+            output[t:t + 1, d0:d0 + MIX_D_TILE] = pl.cast(pl.add(value, correction), target_type=pl.BF16, mode="rint")
     return output, pre_tid
 
 
@@ -301,18 +231,18 @@ def mhc_post(
     Returns the mixed streams so the caller can chain them.
     """
     t_dim = pl.tensor.dim(sublayer, 0)
-    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
-    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
-    output_flat = pl.reshape(output, [t_dim, HC_DIM])
-    post_rounded = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     residual_rounded = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
+    post_rounded = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
+    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
     for t in pl.spmd(t_dim, name_hint="mhc_post_coefficients"):
         post_tile = pl.slice(post_mix, [1, POST_COEFF_TILE], [t, 0], valid_shape=[1, HC_MULT])
         post_bf16 = pl.cast(post_tile, pl.BF16, mode="rint")
-        post_rounded[t:t + 1, :] = pl.set_validshape(pl.cast(post_bf16, pl.FP32), 1, HC_MULT)
-        comb_tile = residual_mix_flat[t:t + 1, :]
+        post_rounded[t : t + 1, :] = pl.set_validshape(pl.cast(post_bf16, pl.FP32), 1, HC_MULT)
+        comb_tile = residual_mix_flat[t : t + 1, :]
         comb_bf16 = pl.cast(comb_tile, pl.BF16, mode="rint")
-        residual_rounded[t:t + 1, :] = pl.cast(comb_bf16, pl.FP32)
+        residual_rounded[t : t + 1, :] = pl.cast(comb_bf16, pl.FP32)
+    output_flat = pl.reshape(output, [t_dim, HC_DIM])
+    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
     for block in pl.spmd(t_dim * HC_MULT, name_hint="mhc_post"):
         t = block // HC_MULT
         out_h = block % HC_MULT
@@ -323,10 +253,9 @@ def mhc_post(
             correction = pl.full([1, MIX_D_TILE], dtype=pl.FP32, value=0.0)
             for in_h in pl.unroll(HC_MULT):
                 residual_tile = residual_flat[t : t + 1, in_h * D + d0 : in_h * D + d0 + MIX_D_TILE]
-                partial = pl.mul(
-                    pl.cast(residual_tile, target_type=pl.FP32),
-                    pl.read(residual_rounded, [t, in_h * HC_MULT + out_h]),
-                )
+                partial_cast = pl.cast(residual_tile, target_type=pl.FP32)
+                partial_read = pl.read(residual_rounded, [t, in_h * HC_MULT + out_h])
+                partial = pl.mul(partial_cast, partial_read)
                 updated = pl.add(value, partial)
                 recovered = pl.sub(updated, value)
                 error = pl.add(pl.sub(value, pl.sub(updated, recovered)), pl.sub(partial, recovered))
@@ -334,9 +263,7 @@ def mhc_post(
                 value = updated
             residual_bf16 = pl.cast(pl.add(value, correction), pl.BF16, mode="rint")
             combined = pl.add(pl.cast(update, pl.FP32), pl.cast(residual_bf16, pl.FP32))
-            output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + MIX_D_TILE] = pl.cast(
-                combined, target_type=pl.BF16, mode="rint"
-            )
+            output_flat[t:t + 1, out_h * D + d0:out_h * D + d0 + MIX_D_TILE] = pl.cast(combined, target_type=pl.BF16, mode="rint")
     return output
 
 
@@ -345,16 +272,7 @@ def mhc_head(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
-    """Collapse the final streams by an unweighted mean, one block per token.
-
-    This is where GLM is cheapest against DeepSeek-V4: ``Glm5NextTextHyperHead`` is
-    ``hidden_streams.mean(dim=2)``, so there is no delayed pre-mix to compute and the
-    donor's coefficient machinery — its own rms, projection and sigmoid — has no
-    counterpart here. The kernel is :func:`mhc_pre` with the mixes replaced by the
-    constant ``1 / HC_MULT``, folded in after the FP32 sum so the division rounds once.
-
-    Returns the collapsed rows so the caller can chain them.
-    """
+    """Collapse the final streams by an unweighted mean, one block per token."""
     t_dim = pl.tensor.dim(x_hc, 0)
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     for t in pl.spmd(t_dim, name_hint="mhc_head"):
@@ -370,9 +288,9 @@ def mhc_head(
                 error = pl.add(pl.sub(value, pl.sub(updated, recovered)), pl.sub(partial, recovered))
                 correction = pl.add(correction, error)
                 value = updated
-            output[t : t + 1, d0 : d0 + MIX_D_TILE] = pl.cast(
-                pl.mul(pl.add(value, correction), 1.0 / HC_MULT), target_type=pl.BF16, mode="rint"
-            )
+            output_value_add = pl.add(value, correction)
+            output_value_mul = pl.mul(output_value_add, 1.0 / HC_MULT)
+            output[t:t + 1, d0:d0 + MIX_D_TILE] = pl.cast(output_value_mul, target_type=pl.BF16, mode="rint")
     return output
 
 
@@ -387,21 +305,21 @@ def plain_residual_pre(
     """Read a replicated plain residual stream and clear unused mHC diagnostics."""
     rows = pl.tensor.dim(streams, 0)
     coefficient_elements = rows * HC_MULT
-    pre_flat = pl.reshape(pre, [1, coefficient_elements])
-    post_flat = pl.reshape(post, [1, coefficient_elements])
     residual_flat = pl.reshape(residual, [rows, HC_MULT * HC_MULT])
+    post_flat = pl.reshape(post, [1, coefficient_elements])
+    pre_flat = pl.reshape(pre, [1, coefficient_elements])
     for block in pl.spmd(((rows + 7) // 8) * (D // 128), name_hint="plain_residual_pre"):
         row0 = block // (D // 128) * 8
         col0 = block % (D // 128) * 128
         valid = pl.min(8, rows - row0)
         source = pl.slice(streams, [8, 1, 128], [row0, 0, col0], valid_shape=[valid, 1, 128])
-        output[row0:row0 + 8, col0:col0 + 128] = pl.reshape(source, [8, 128])
+        output[row0 : row0 + 8, col0 : col0 + 128] = pl.reshape(source, [8, 128])
         if col0 == 0:
             zeros = pl.full([1, 8 * HC_MULT], dtype=pl.FP32, value=0.0)
-            pre_flat[:, row0 * HC_MULT:(row0 + 8) * HC_MULT] = pl.set_validshape(zeros, 1, valid * HC_MULT)
-            post_flat[:, row0 * HC_MULT:(row0 + 8) * HC_MULT] = pl.set_validshape(zeros, 1, valid * HC_MULT)
+            pre_flat[:, row0 * HC_MULT : (row0 + 8) * HC_MULT] = pl.set_validshape(zeros, 1, valid * HC_MULT)
+            post_flat[:, row0 * HC_MULT : (row0 + 8) * HC_MULT] = pl.set_validshape(zeros, 1, valid * HC_MULT)
             residual_zero = pl.full([8, HC_MULT * HC_MULT], dtype=pl.FP32, value=0.0)
-            residual_flat[row0:row0 + 8, :] = pl.set_validshape(residual_zero, valid, HC_MULT * HC_MULT)
+            residual_flat[row0 : row0 + 8, :] = pl.set_validshape(residual_zero, valid, HC_MULT * HC_MULT)
     return output
 
 
@@ -416,13 +334,13 @@ def plain_residual_post(
     for block in pl.spmd(rows * (D // 128), name_hint="plain_residual_post"):
         row = block // (D // 128)
         col0 = block % (D // 128) * 128
-        residual = pl.cast(streams[row:row + 1, 0:1, col0:col0 + 128], pl.FP32)
+        residual = pl.cast(streams[row : row + 1, 0:1, col0 : col0 + 128], pl.FP32)
         residual_row = pl.reshape(residual, [1, 128])
-        value = pl.cast(update[row:row + 1, col0:col0 + 128], pl.FP32)
+        value = pl.cast(update[row : row + 1, col0 : col0 + 128], pl.FP32)
         combined = pl.cast(pl.add(residual_row, value), pl.BF16, mode="rint")
         expanded = pl.reshape(combined, [1, 1, 128])
         for lane in pl.unroll(HC_MULT):
-            output[row:row + 1, lane:lane + 1, col0:col0 + 128] = expanded
+            output[row : row + 1, lane : lane + 1, col0 : col0 + 128] = expanded
     return output
 
 
@@ -470,15 +388,133 @@ def mhc_head_test(
     return output
 
 
-def _mix_generator(seed: int):
-    return torch.Generator().manual_seed(seed)
+@pl.jit
+def mhc_mixes_test(
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    function: pl.Tensor[[MIX_HC, HC_DIM], pl.BF16],
+    scale: pl.Tensor[[3], pl.FP32],
+    base: pl.Tensor[[MIX_HC], pl.FP32],
+    pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    post_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    residual_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32]],
+):
+    """Run mHC coefficient generation for standalone validation."""
+    x_hc.bind_dynamic(0, T_DYN)
+    pre_mix.bind_dynamic(0, T_DYN)
+    post_mix.bind_dynamic(0, T_DYN)
+    residual_mix.bind_dynamic(0, T_DYN)
+    mhc_mixes(x_hc, function, scale, base, pre_mix, post_mix, residual_mix)
+    return residual_mix
+
+
+@pl.jit.inline
+def seed_hc_streams(
+    embedding_rows: pl.Tensor[[T_DYN, D], pl.BF16],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+):
+    """Broadcast each BF16 embedding row into the hyper-connection streams."""
+    rows = pl.tensor.dim(embedding_rows, 0)
+    x_flat = pl.reshape(x_hc, [rows, HC_DIM])
+    with pl.spmd((rows + 15) // 16, name_hint="seed_hc_streams"):
+        t0 = pl.tile.get_block_idx() * 16
+        for row in pl.unroll(16):
+            t = t0 + row
+            embedded = pl.tile.load(embedding_rows, [t, 0], [1, D])
+            for stream in pl.unroll(HC_MULT):
+                pl.tile.store(embedded, [t, stream * D], x_flat)
+
+
+def hc_pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+    """Collapse the four hyper-connection streams into one sublayer input."""
+    return (x.float() * pre_mix.float().unsqueeze(-1)).double().sum(dim=-2).float().to(x.dtype)
+
+
+def hc_seed(inputs_embeds: torch.Tensor, hc_mult: int = FLASH.hc_mult) -> torch.Tensor:
+    """Seed the hyper-connection stream by replicating the embedding.
+
+    ``Glm5NextTextModel.forward`` does
+    ``inputs_embeds.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()``, so the
+    stream inherits the embedding's dtype: **BF16, not FP32**. DeepSeek-V4 carries
+    its HC stream in FP32, so the ABIs are not interchangeable.
+    """
+    return inputs_embeds.unsqueeze(-2).expand(*inputs_embeds.shape[:-1], hc_mult, -1).contiguous()
+
+
+def hc_mixes(
+    x: torch.Tensor,
+    function: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    iterations: int = FLASH.hc_sinkhorn_iters,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute mHC mixes with FP32 projections, unaries and reductions."""
+    flat = x.flatten(-2).float()
+    square_sum = flat.double().square().sum(dim=-1, keepdim=True).float()
+    inv = torch.rsqrt((square_sum / flat.shape[-1] + FLASH.rms_norm_eps).double()).float()
+    mixes = (flat.double() @ function.double().t()).float() * inv
+    hc = FLASH.hc_mult
+    (p, q, r) = mixes.split((hc, hc, hc * hc), -1)
+    pre_logits = p * scale[0] + base[:hc]
+    post_logits = q * scale[1] + base[hc : 2 * hc]
+    pre = (1.0 / (1.0 + torch.exp(-pre_logits.double()).float()).double()).float() + FLASH.hc_eps
+    post = 2 * (1.0 / (1.0 + torch.exp(-post_logits.double()).float()).double()).float()
+    logits = r.unflatten(-1, (hc, hc)) * scale[2] + base[2 * hc :].unflatten(-1, (hc, hc))
+    exps = torch.exp((logits - logits.amax(-1, keepdim=True)).double()).float()
+    residual = (exps.double() / _sum_fp32_reference(exps).double()).float() + FLASH.hc_eps
+    residual = (residual.double() / (_sum_fp32_reference(residual, -2) + FLASH.hc_eps).double()).float()
+    for _ in range(iterations - 1):
+        residual = (residual.double() / (_sum_fp32_reference(residual) + FLASH.hc_eps).double()).float()
+        residual = (residual.double() / (_sum_fp32_reference(residual, -2) + FLASH.hc_eps).double()).float()
+    return (pre, post, residual)
+
+
+def hc_post(
+    sublayer: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    residual_mix: torch.Tensor,
+) -> torch.Tensor:
+    """Expand a sublayer result and mix the four residual streams.
+
+    Preserve the official decoder's stream-dtype coefficient, multiplication,
+    matmul-output and addition boundaries.
+    """
+    dtype = residual.dtype
+    post = post_mix.to(dtype).float().unsqueeze(-1)
+    update = (post * sublayer.to(dtype).float().unsqueeze(-2)).to(dtype)
+    coefficients = residual_mix.to(dtype).double().transpose(-1, -2)
+    mixed_residual = (coefficients @ residual.double()).float().to(dtype)
+    return (update.float() + mixed_residual.float()).to(dtype)
+
+
+def hc_head(x: torch.Tensor) -> torch.Tensor:
+    """Collapse the final HC streams.
+
+    Unlike DeepSeek-V4, which applies the last layer's delayed pre-mix, GLM-5.3-Flash
+    uses an unweighted mean (``Glm5NextTextHyperHead.forward`` is
+    ``hidden_streams.mean(dim=2)``).
+    """
+    return x.double().mean(dim=-2).float().to(torch.bfloat16)
+
+
+def golden_mhc_pre(x_hc: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+    return hc_pre(x_hc, pre_mix).to(torch.bfloat16)
+
+
+def golden_mhc_post(
+    sublayer: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    residual_mix: torch.Tensor,
+) -> torch.Tensor:
+    return hc_post(sublayer, residual, post_mix, residual_mix).to(torch.bfloat16)
 
 
 def build_mhc_pre_tensor_specs(tokens: int = 20):
     """Build one deterministic stream collapse at the real hidden size."""
     from golden import TensorSpec
 
-    generator = _mix_generator(97)
+    generator = torch.Generator().manual_seed(97)
 
     def init_x_hc():
         return torch.randn(tokens, HC_MULT, D, generator=generator).bfloat16()
@@ -498,12 +534,12 @@ def build_mhc_post_tensor_specs(tokens: int = 20):
     """Build one deterministic residual expansion at the real hidden size.
 
     ``residual_mix`` is drawn doubly stochastic, which is what the 20 Sinkhorn
-    iterations in :func:`golden_mhc_mixes` produce, so the fixture exercises the
+    iterations in :func:`hc_mixes` produce, so the fixture exercises the
     magnitudes the kernel actually sees.
     """
     from golden import TensorSpec
 
-    generator = _mix_generator(101)
+    generator = torch.Generator().manual_seed(101)
 
     def init_sublayer():
         return torch.randn(tokens, D, generator=generator).bfloat16()
@@ -525,12 +561,7 @@ def build_mhc_post_tensor_specs(tokens: int = 20):
         TensorSpec("sublayer", [tokens, D], torch.bfloat16, init_value=init_sublayer),
         TensorSpec("residual", [tokens, HC_MULT, D], torch.bfloat16, init_value=init_residual),
         TensorSpec("post_mix", [tokens, HC_MULT], torch.float32, init_value=init_post_mix),
-        TensorSpec(
-            "residual_mix",
-            [tokens, HC_MULT, HC_MULT],
-            torch.float32,
-            init_value=init_residual_mix,
-        ),
+        TensorSpec("residual_mix", [tokens, HC_MULT, HC_MULT], torch.float32, init_value=init_residual_mix),
         TensorSpec("output", [tokens, HC_MULT, D], torch.bfloat16),
     ]
 
@@ -539,7 +570,7 @@ def build_mhc_head_tensor_specs(tokens: int = 20):
     """Build one deterministic final collapse at the real hidden size."""
     from golden import TensorSpec
 
-    generator = _mix_generator(103)
+    generator = torch.Generator().manual_seed(103)
 
     def init_x_hc():
         return torch.randn(tokens, HC_MULT, D, generator=generator).bfloat16()
@@ -558,35 +589,13 @@ def golden_mhc_pre_case(tensors):
 def golden_mhc_post_case(tensors):
     """Fill the expected streams for :func:`build_mhc_post_tensor_specs`."""
     tensors["output"][:] = golden_mhc_post(
-        tensors["sublayer"],
-        tensors["residual"],
-        tensors["post_mix"],
-        tensors["residual_mix"],
+        tensors["sublayer"], tensors["residual"], tensors["post_mix"], tensors["residual_mix"],
     )
 
 
 def golden_mhc_head_case(tensors):
     """Fill the expected collapse for :func:`build_mhc_head_tensor_specs`."""
-    tensors["output"][:] = golden_mhc_head(tensors["x_hc"])
-
-
-@pl.jit
-def mhc_mixes_test(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    function: pl.Tensor[[MIX_HC, HC_DIM], pl.BF16],
-    scale: pl.Tensor[[3], pl.FP32],
-    base: pl.Tensor[[MIX_HC], pl.FP32],
-    pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
-    post_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
-    residual_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32]],
-):
-    """Run mHC coefficient generation for standalone validation."""
-    x_hc.bind_dynamic(0, T_DYN)
-    pre_mix.bind_dynamic(0, T_DYN)
-    post_mix.bind_dynamic(0, T_DYN)
-    residual_mix.bind_dynamic(0, T_DYN)
-    mhc_mixes(x_hc, function, scale, base, pre_mix, post_mix, residual_mix)
-    return residual_mix
+    tensors["output"][:] = hc_head(tensors["x_hc"])
 
 
 def build_mhc_mixes_tensor_specs(tokens: int = 20):
@@ -620,8 +629,8 @@ def build_mhc_mixes_tensor_specs(tokens: int = 20):
 
 def golden_mhc_mixes_case(tensors):
     """Fill the expected coefficient outputs."""
-    pre_mix, post_mix, residual_mix = golden_mhc_mixes(
-        tensors["x_hc"], tensors["function"], tensors["scale"], tensors["base"]
+    (pre_mix, post_mix, residual_mix) = hc_mixes(
+        tensors["x_hc"], tensors["function"], tensors["scale"], tensors["base"],
     )
     tensors["pre_mix"][:] = pre_mix
     tensors["post_mix"][:] = post_mix
@@ -647,7 +656,7 @@ def _check_mhc_replicated_quadrants_equal_four_by_four_sinkhorn():
 
 def _check_mhc_zero_input_coefficients():
     (pre, post, residual) = hc_mixes(
-        torch.zeros(2, 4, 4096).bfloat16(), torch.zeros(24, 16384).bfloat16(), torch.ones(3), torch.zeros(24)
+        torch.zeros(2, 4, 4096).bfloat16(), torch.zeros(24, 16384).bfloat16(), torch.ones(3), torch.zeros(24),
     )
     torch.testing.assert_close(pre, torch.full_like(pre, 0.5 + FLASH.hc_eps))
     torch.testing.assert_close(post, torch.ones_like(post))
@@ -661,6 +670,127 @@ def run_mhc_boundary_goldens():
     print("[GOLDEN] PASS mhc boundary checks")
 
 
+def run_mhc_goldens(golden_mixes, golden_pre, golden_post, golden_head) -> None:
+    """Exercise the four mHC references on one reduced hyper-connection site."""
+    torch.manual_seed(11)
+    tokens, width = 6, FLASH.hc_mult
+    hidden = 64
+    hc_dim = width * hidden
+    mix_hc = FLASH.mix_hc
+
+    x_hc = torch.randn(tokens, width, hidden, dtype=torch.bfloat16)
+    function = torch.randn(mix_hc, hc_dim) * 0.02
+    scale = torch.randn(3)
+    base = torch.randn(mix_hc) * 0.1
+
+    pre_mix, post_mix, residual_mix = golden_mixes(x_hc, function, scale, base)
+    _check(pre_mix.shape == (tokens, width), f"pre_mix shape {tuple(pre_mix.shape)}")
+    _check(post_mix.shape == (tokens, width), f"post_mix shape {tuple(post_mix.shape)}")
+    _check(residual_mix.shape == (tokens, width, width), f"residual_mix shape {tuple(residual_mix.shape)}")
+    # Sinkhorn must leave the residual mix doubly stochastic.
+    for axis in (-1, -2):
+        deviation = (residual_mix.sum(dim=axis) - 1.0).abs().max()
+        _check(deviation < 1e-3, f"residual_mix is not doubly stochastic on axis {axis}: {deviation}")
+    _check(bool((pre_mix > 0).all()), "pre_mix must be positive")
+
+    sublayer_input = golden_pre(x_hc, pre_mix)
+    _check(sublayer_input.shape == (tokens, hidden), f"mhc_pre shape {tuple(sublayer_input.shape)}")
+    _check(sublayer_input.dtype is torch.bfloat16, f"mhc_pre dtype {sublayer_input.dtype}")
+
+    streams = golden_post(sublayer_input, x_hc, post_mix, residual_mix)
+    _check(streams.shape == x_hc.shape, f"mhc_post shape {tuple(streams.shape)}")
+    _check(streams.dtype is torch.bfloat16, f"mhc_post dtype {streams.dtype}")
+
+    collapsed = golden_head(x_hc)
+    _check(collapsed.shape == (tokens, hidden), f"mhc_head shape {tuple(collapsed.shape)}")
+    _check(collapsed.dtype is torch.bfloat16, f"mhc_head dtype {collapsed.dtype}")
+    # GLM-5.3-Flash collapses with an unweighted mean, not a learned head.
+    expected = x_hc.float().mean(dim=-2).to(torch.bfloat16)
+    _check(torch.equal(collapsed, expected), "mhc_head must be the unweighted stream mean")
+
+    _report("mhc")
+
+
+@dataclass
+class MhcTensors:
+    """One hyper-connection site's mapping parameters (``attn_hc`` or ``ffn_hc``)."""
+
+    fn: torch.Tensor  # [mix_hc, hc_mult * D]
+    base: torch.Tensor  # [mix_hc] FP32
+    scale: torch.Tensor  # [3] FP32
+
+
+def mhc_mapping(
+    streams: torch.Tensor, weights: MhcTensors, model: Glm53FlashConfig
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """mHC mapping: ``pre``, ``post``, Sinkhorn-``comb``, and the collapsed stream.
+
+    Port of ``Glm5NextTextHyperConnection.forward``. ``comb`` gets one initial
+    column normalization then ``iters - 1`` row/column passes; ``pre`` collapses
+    the ``hc_mult`` streams into the sub-layer input.
+    """
+    hc = model.hc_mult
+    flat = unweighted_rms_norm(streams.flatten(start_dim=2), model.rms_norm_eps)
+    logits = flat @ weights.fn.t()
+    pre_w, post_w, comb_w = logits.split([hc, hc, hc * hc], dim=-1)
+    pre_b, post_b, comb_b = weights.base.split([hc, hc, hc * hc])
+    pre_scale, post_scale, comb_scale = weights.scale.unbind(0)
+
+    pre = torch.sigmoid(pre_w * pre_scale + pre_b) + model.hc_eps
+    post = 2 * torch.sigmoid(post_w * post_scale + post_b)
+    comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
+    comb = torch.softmax(comb_logits, dim=-1) + model.hc_eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + model.hc_eps)
+    for _ in range(model.hc_sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + model.hc_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + model.hc_eps)
+    collapsed = (pre.unsqueeze(-1) * streams).sum(dim=2)
+    return pre, post, comb, collapsed
+
+
+def combine_streams(
+    post: torch.Tensor, comb: torch.Tensor, sublayer_out: torch.Tensor, residual: torch.Tensor
+) -> torch.Tensor:
+    """Decoder-layer combine: ``post * sublayer_out + comb^T @ residual`` (HF eq.)."""
+    return post.unsqueeze(-1) * sublayer_out.unsqueeze(-2) + comb.transpose(-1, -2) @ residual
+
+
+def synthetic_mhc(model: Glm53FlashConfig, generator: torch.Generator) -> MhcTensors:
+    """mHC mapping parameters at the HF init distribution (fn~N(0,0.02), base 0, scale 1)."""
+    return MhcTensors(
+        fn=_randn((model.mix_hc, model.hc_dim), generator), base=torch.zeros(model.mix_hc),
+        scale=torch.ones(3),
+    )
+
+
+def _test_mhc(model: Glm53FlashConfig) -> None:
+    torch.manual_seed(11)
+    hc, hidden = model.hc_mult, model.hidden_size
+    streams = torch.randn(2, 5, hc, hidden) * 0.5
+    weights = synthetic_mhc(model, torch.Generator().manual_seed(7))
+    pre, post, comb, collapsed = mhc_mapping(streams, weights, model)
+
+    assert pre.shape == (2, 5, hc) and post.shape == (2, 5, hc)
+    assert comb.shape == (2, 5, hc, hc) and collapsed.shape == (2, 5, hidden)
+    assert float(pre.min()) >= model.hc_eps and float(pre.max()) <= 1.0 + model.hc_eps + 1e-5
+    assert 0.0 <= float(post.min()) and float(post.max()) <= 2.0 + 1e-5
+    # Sinkhorn: columns are exact by construction (final op normalizes them);
+    # rows only converge linearly, and the shipped 20 iterations on a 4x4 leave
+    # O(1e-2) row deviation — verified against the verbatim HF snippet.
+    row_error = (comb.sum(-1) - 1).abs().max()
+    col_error = (comb.sum(-2) - 1).abs().max()
+    assert float(row_error) < 0.05 and float(col_error) < 1e-3, (float(row_error), float(col_error))
+    _assert_close(collapsed, torch.einsum("bsh,bshd->bsd", pre, streams), "mHC collapse")
+    # Combine against a per-stream loop: out_h = post_h * sublayer + sum_k comb[k,h] * res_k.
+    sublayer = torch.randn(2, 5, hidden)
+    manual = torch.stack(
+        [post[..., h, None] * sublayer + sum((comb[..., k, h, None] * streams[..., k, :] for k in range(hc))) for h in range(hc)],
+        dim=2,
+    )
+    _assert_close(combine_streams(post, comb, sublayer, streams), manual, "mHC combine formula")
+    print(f"  mHC mapping: shapes, ranges, sinkhorn rows {float(row_error):.2e}")
+
+
 def main():
     """Prove the goldens on CPU, then validate the three stream scopes on device.
 
@@ -670,9 +800,8 @@ def main():
     import argparse
 
     from golden import ratio_allclose, run
-    from models.glm5_3_flash._golden_smoke import run_mhc_goldens
 
-    run_mhc_goldens(golden_mhc_mixes, golden_mhc_pre, golden_mhc_post, golden_mhc_head)
+    run_mhc_goldens(hc_mixes, golden_mhc_pre, golden_mhc_post, hc_head)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
@@ -703,41 +832,13 @@ def main():
             golden_fn=golden_fn,
             config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
             rtol=1.0 / 128,
-            atol=1e-4,
-            compare_fn=(
-                {key: ratio_allclose(atol=1e-5, rtol=1e-3) for key in ("pre_mix", "post_mix", "residual_mix")}
-                if name == "mixes"
-                else {"output": compare}
-            ),
+            atol=0.0001,
+            compare_fn={key: ratio_allclose(atol=1e-05, rtol=0.001) for key in ("pre_mix", "post_mix", "residual_mix")} if name == "mixes" else {"output": compare},
             compile_only=args.compile_only,
         )
         print(f"{name}: {result}")
         if not result.passed:
             raise SystemExit(result.error or 1)
-
-
-__all__ = [
-    "build_mhc_mixes_tensor_specs",
-    "golden_mhc_mixes_case",
-    "mhc_mixes_test",
-    "build_mhc_head_tensor_specs",
-    "build_mhc_post_tensor_specs",
-    "build_mhc_pre_tensor_specs",
-    "golden_mhc_head",
-    "golden_mhc_head_case",
-    "golden_mhc_post_case",
-    "golden_mhc_pre_case",
-    "mhc_head_test",
-    "mhc_post_test",
-    "mhc_pre_test",
-    "golden_mhc_mixes",
-    "golden_mhc_post",
-    "golden_mhc_pre",
-    "mhc_head",
-    "mhc_mixes",
-    "mhc_post",
-    "mhc_pre",
-]
 
 
 if __name__ == "__main__":

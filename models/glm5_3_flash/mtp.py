@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""MTP embedding and hidden RMSNorm followed by the concatenated BF16 projection."""
+"""GLM-5.3-Flash multi-token prediction input projection."""
 
 import sys
 from pathlib import Path
@@ -14,25 +14,16 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import D, FLASH, T_DYN
+from models.glm5_3_flash.config import FLASH, D
 from models.glm5_3_flash.linear import bf16_projection, golden_bf16_linear
-from models.glm5_3_flash.rmsnorm import golden_rmsnorm, rmsnorm
+from models.glm5_3_flash.rmsnorm import rms_norm, rmsnorm
+from models.glm5_3_flash.utils import Checkpoint
 
-
-def golden_mtp_projection(
-    embedding: torch.Tensor,
-    hidden: torch.Tensor,
-    enorm_weight: torch.Tensor,
-    hnorm_weight: torch.Tensor,
-    w_eh: torch.Tensor,
-) -> torch.Tensor:
-    normalized_embedding = golden_rmsnorm(embedding, enorm_weight)
-    normalized_hidden = golden_rmsnorm(hidden, hnorm_weight)
-    combined = torch.cat((normalized_embedding, normalized_hidden), dim=-1)
-    return golden_bf16_linear(combined, w_eh).bfloat16()
+T_DYN = pl.dynamic('GLM53_T_DYN')
 
 
 @pl.jit.inline
@@ -46,8 +37,8 @@ def mtp_projection(
 ):
     rows = pl.tensor.dim(embedding, 0)
     embedding_norm = pl.create_tensor([rows, D], dtype=pl.BF16)
-    hidden_norm = pl.create_tensor([rows, D], dtype=pl.BF16)
     rmsnorm(embedding, enorm_weight, embedding_norm)
+    hidden_norm = pl.create_tensor([rows, D], dtype=pl.BF16)
     rmsnorm(hidden, hnorm_weight, hidden_norm)
     combined = pl.create_tensor([rows, 2 * D], dtype=pl.BF16)
     for block in pl.spmd(((rows + 7) // 8) * (D // 128), name_hint="mtp_projection_concat"):
@@ -56,8 +47,8 @@ def mtp_projection(
         valid_rows = pl.min(8, rows - row0)
         embedding_tile = pl.slice(embedding_norm, [8, 128], [row0, col0], valid_shape=[valid_rows, 128])
         hidden_tile = pl.slice(hidden_norm, [8, 128], [row0, col0], valid_shape=[valid_rows, 128])
-        combined[row0:row0 + 8, col0:col0 + 128] = embedding_tile
-        combined[row0:row0 + 8, D + col0:D + col0 + 128] = hidden_tile
+        combined[row0 : row0 + 8, col0 : col0 + 128] = embedding_tile
+        combined[row0 : row0 + 8, D + col0 : D + col0 + 128] = hidden_tile
     bf16_projection(combined, w_eh, enorm_weight, output, 2 * D, D, False)
     return output
 
@@ -78,12 +69,24 @@ def mtp_projection_test(
     return output
 
 
+def golden_mtp_projection(
+    embedding: torch.Tensor,
+    hidden: torch.Tensor,
+    enorm_weight: torch.Tensor,
+    hnorm_weight: torch.Tensor,
+    w_eh: torch.Tensor,
+) -> torch.Tensor:
+    normalized_embedding = rms_norm(embedding, enorm_weight)
+    normalized_hidden = rms_norm(hidden, hnorm_weight)
+    combined = torch.cat((normalized_embedding, normalized_hidden), dim=-1)
+    return golden_bf16_linear(combined, w_eh).bfloat16()
+
+
 def main():
     import argparse
     from functools import lru_cache
 
     from golden import TensorSpec, ratio_allclose, run
-    from models.glm5_3_flash.weights import Checkpoint
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", dest="backend_type", default="a2a3", choices=["a2a3", "a5"])
@@ -104,7 +107,8 @@ def main():
         hidden = torch.randn(args.tokens, D, generator=generator).bfloat16()
         if args.checkpoint is None:
             values = {
-                "embedding": embedding, "hidden": hidden,
+                "embedding": embedding,
+                "hidden": hidden,
                 "enorm_weight": torch.ones(D, dtype=torch.bfloat16),
                 "hnorm_weight": torch.ones(D, dtype=torch.bfloat16),
                 "w_eh": (torch.randn(D, 2 * D, generator=generator) / (2 * D) ** 0.5).bfloat16(),
@@ -112,9 +116,14 @@ def main():
         else:
             checkpoint = Checkpoint(args.checkpoint)
             prefix = f"model.language_model.layers.{FLASH.mtp_layer_id}."
-            values = {name: checkpoint.read(prefix + suffix).bfloat16() for name, suffix in (
-                ("enorm_weight", "enorm.weight"), ("hnorm_weight", "hnorm.weight"), ("w_eh", "eh_proj.weight"),
-            )}
+            values = {
+                name: checkpoint.read(prefix + suffix).bfloat16()
+                for name, suffix in (
+                    ("enorm_weight", "enorm.weight"),
+                    ("hnorm_weight", "hnorm.weight"),
+                    ("w_eh", "eh_proj.weight"),
+                )
+            }
             embedding_name = prefix + "embed_tokens.weight"
             values["embedding"] = checkpoint.read(embedding_name, slice(2000, 2000 + args.tokens)).bfloat16()
             values["hidden"] = hidden
@@ -127,11 +136,16 @@ def main():
         return values
 
     shapes = {
-        "embedding": [args.tokens, D], "hidden": [args.tokens, D],
-        "enorm_weight": [D], "hnorm_weight": [D], "w_eh": [D, 2 * D],
+        "embedding": [args.tokens, D],
+        "hidden": [args.tokens, D],
+        "enorm_weight": [D],
+        "hnorm_weight": [D],
+        "w_eh": [D, 2 * D],
     }
-    specs = [TensorSpec(name, shape, torch.bfloat16, init_value=lambda key=name: inputs()[key])
-             for name, shape in shapes.items()]
+    specs = [
+        TensorSpec(name, shape, torch.bfloat16, init_value=lambda key=name: inputs()[key])
+        for name, shape in shapes.items()
+    ]
     specs.append(TensorSpec("output", [args.tokens, D], torch.bfloat16))
 
     def golden(values):
@@ -149,9 +163,6 @@ def main():
     print(result)
     if not result.passed:
         raise SystemExit(result.error or 1)
-
-
-__all__ = ["golden_mtp_projection", "mtp_projection"]
 
 
 if __name__ == "__main__":
