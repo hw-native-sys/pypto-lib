@@ -128,6 +128,46 @@ def act_quant(
 
 
 @pl.jit.inline(auto_scope=False)
+def act_quant_experts(
+    gate: pl.Tensor,
+    up: pl.Tensor,
+    route_weight: pl.Tensor,
+    counts: pl.Tensor,
+    h: pl.Out[pl.Tensor],
+    h_scale: pl.Out[pl.Tensor],
+    gate_ready: pl.Scalar[pl.TASK_ID],
+    up_ready: pl.Scalar[pl.TASK_ID],
+    experts: pl.constexpr,
+    row_stride: pl.constexpr,
+    width: pl.constexpr,
+):
+    """Quantize active fixed-capacity expert rows with zero-padded 16-row tails."""
+    with pl.spmd(64, name_hint="ffn_expert_act_quant", deps=[gate_ready, up_ready]) as done:
+        core = pl.tile.get_block_idx()
+        for expert in pl.range(experts):
+            count_read = pl.read(counts, [expert, 0])
+            count = pl.cast(count_read, pl.INDEX)
+            for work in pl.range(core, ((count + ROW_TILE - 1) // ROW_TILE) * (width // QUANT_TILE), 64):
+                local_row = work // (width // QUANT_TILE) * ROW_TILE
+                row = expert * row_stride + local_row
+                col = work % (width // QUANT_TILE) * QUANT_TILE
+                valid_rows = pl.min(ROW_TILE, count - local_row)
+                gate_tile = pl.load(gate, [row, col], [ROW_TILE, ACT_TILE])
+                up_tile = pl.load(up, [row, col], [ROW_TILE, ACT_TILE])
+                weights = pl.load(route_weight, [row, 0], [ROW_TILE, 1])
+                hidden_raw = _weighted_swiglu(gate_tile, up_tile, weights)
+                hidden_valid = pl.set_validshape(hidden_raw, valid_rows, ACT_TILE)
+                hidden_padded = pl.fillpad(hidden_valid, pad_value=pl.PadValue.zero)
+                hidden = pl.set_validshape(hidden_padded, ROW_TILE, ACT_TILE)
+                payload, scale = _quantize_upward(hidden)
+                h = pl.store(payload, [row, col], h)
+                scale_offset = row * (width // 32) + (col // QUANT_TILE) * ROW_TILE * (QUANT_TILE // 32)
+                scale_flat = pl.reshape(scale, [1, ROW_TILE * (QUANT_TILE // 32)])
+                h_scale = pl.store(scale_flat, [0, scale_offset], h_scale)
+    return h, h_scale, done
+
+
+@pl.jit.inline(auto_scope=False)
 def local_restore(
     y_chunk: pl.Tensor,
     chunks: pl.Tensor,

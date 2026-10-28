@@ -348,7 +348,6 @@ def moe(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
     routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
@@ -424,7 +423,7 @@ def moe(
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_count_local,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-            routed_w2, routed_w2_scale, mxfp4_pair_lut,
+            routed_w2, routed_w2_scale,
             recv_route_local, recv_meta_local,
             routed_output, input_ready,
         )
@@ -458,7 +457,6 @@ def l2_moe(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
     routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
@@ -492,7 +490,7 @@ def l2_moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_weight, gate_weight, correction_bias,
         routed_w1, routed_w1_scale, routed_w2, routed_w2_scale,
-        routed_w3, routed_w3_scale, mxfp4_pair_lut, shared_w1, shared_w1_scale,
+        routed_w3, routed_w3_scale, shared_w1, shared_w1_scale,
         shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
         next_pre_mix, x_mixed, x_next,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
@@ -519,7 +517,6 @@ def l3_moe(
     routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    mxfp4_pair_lut: pl.Tensor[[EP_SIZE, 2, 256], pl.INT16],
     shared_w1: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[EP_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
@@ -566,7 +563,7 @@ def l3_moe(
             x_hc[r], pre_mix[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_weight[r], gate_weight[r], correction_bias[r],
             routed_w1[r], routed_w1_scale_r, routed_w2[r], routed_w2_scale_r,
-            routed_w3[r], routed_w3_scale_r, mxfp4_pair_lut[r], shared_w1[r], shared_w1_scale_r,
+            routed_w3[r], routed_w3_scale_r, shared_w1[r], shared_w1_scale_r,
             shared_w2[r], shared_w2_scale_r, shared_w3[r], shared_w3_scale_r,
             next_pre_mix[r], x_mixed[r], x_next[r],
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
@@ -609,7 +606,7 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
     import torch
     from functools import partial
     from golden import ScalarSpec, TensorSpec
-    from expert_routed import ROUTED_DEQUANT_STD, gen_routed_mxfp4_weights, build_mxfp4_pair_lut
+    from expert_routed import ROUTED_DEQUANT_STD, gen_routed_mxfp4_weights
     from quant import generate_mxfp8_weight_kn
 
     counts = _normalise_num_tokens(num_tokens)
@@ -630,7 +627,6 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
         "routed_w2_scale": [EP_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D],
         "routed_w3": [EP_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS],
         "routed_w3_scale": [EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER],
-        "mxfp4_pair_lut": [EP_SIZE, 2, 256],
         "shared_w1": [EP_SIZE, D, MOE_INTER],
         "shared_w1_scale": [EP_SIZE, D // MX_GROUP, MOE_INTER],
         "shared_w2": [EP_SIZE, MOE_INTER, D],
@@ -649,7 +645,6 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
         "force_topk": [EP_SIZE, MOE_TOKENS, TOPK],
     }
     values = {"norm_weight": norm_weight, "gate_weight": gate_weight, "correction_bias": correction_bias}
-    values["mxfp4_pair_lut"] = build_mxfp4_pair_lut().unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()
     if initialize:
         shards = [
             gen_routed_mxfp4_weights(N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=rank * N_LOCAL_EXPERTS * 3)
@@ -703,8 +698,6 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
             dtype = torch.bfloat16
         elif name == "num_tokens" or name == "force_topk":
             dtype = torch.int32
-        elif name == "mxfp4_pair_lut":
-            dtype = torch.int16
         elif name.startswith("routed_"):
             dtype = e8m0 if name.endswith("_scale") else torch.uint8
         elif name.startswith("shared_"):
@@ -846,7 +839,6 @@ def golden_moe(tensors):
             "routed_w3_scale": tensors["routed_w3_scale"][dst],
             "routed_w2_packed": tensors["routed_w2"][dst],
             "routed_w2_scale": tensors["routed_w2_scale"][dst],
-            "mxfp4_pair_lut": tensors["mxfp4_pair_lut"][dst],
             "recv_y": recv_y,
         })
         dst_recv_y.append(recv_y)
@@ -959,7 +951,7 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a5")
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=list(SUPPORTED_EP_SIZES))
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(EP_SIZE)))

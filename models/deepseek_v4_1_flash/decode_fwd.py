@@ -155,7 +155,6 @@ def decode_encoder(
     routed_w1: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
@@ -381,7 +380,6 @@ def decode_encoder(
                 ffn_routed_w1, ffn_routed_w1_scale,
                 ffn_routed_w2, ffn_routed_w2_scale,
                 ffn_routed_w3, ffn_routed_w3_scale,
-                mxfp4_pair_lut,
                 ffn_shared_w1, ffn_shared_w1_scale,
                 ffn_shared_w2, ffn_shared_w2_scale,
                 ffn_shared_w3, ffn_shared_w3_scale,
@@ -453,7 +451,6 @@ def decode_decoder(
     routed_w1: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
@@ -657,7 +654,6 @@ def decode_decoder(
                 ffn_routed_w1, ffn_routed_w1_scale,
                 ffn_routed_w2, ffn_routed_w2_scale,
                 ffn_routed_w3, ffn_routed_w3_scale,
-                mxfp4_pair_lut,
                 ffn_shared_w1, ffn_shared_w1_scale,
                 ffn_shared_w2, ffn_shared_w2_scale,
                 ffn_shared_w3, ffn_shared_w3_scale,
@@ -736,7 +732,6 @@ def l2_decode_fwd(
     routed_w1: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
     shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
@@ -804,7 +799,7 @@ def l2_decode_fwd(
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         ffn_norm_weight,
         gate_weight, correction_bias,
-        routed_w1, routed_w2, routed_w3, mxfp4_pair_lut,
+        routed_w1, routed_w2, routed_w3,
         shared_w1, shared_w2, shared_w3,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         arrived, data_arrived, routed_output, combine_arrived,
@@ -837,7 +832,7 @@ def l2_decode_fwd(
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         ffn_norm_weight,
         gate_weight, correction_bias,
-        routed_w1, routed_w2, routed_w3, mxfp4_pair_lut,
+        routed_w1, routed_w2, routed_w3,
         shared_w1, shared_w2, shared_w3,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         arrived, data_arrived, routed_output, combine_arrived,
@@ -951,7 +946,6 @@ def l3_decode_fwd(
     routed_w3_scale: pl.Tensor[
         [EP_SIZE, N_LAYERS * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0
     ],
-    mxfp4_pair_lut: pl.Tensor[[EP_SIZE, 2, 256], pl.INT16],
     shared_w1: pl.Tensor[[EP_SIZE, N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[EP_SIZE, N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
@@ -1101,7 +1095,7 @@ def l3_decode_fwd(
             hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
             ffn_norm_weight[rank],
             gate_weight[rank], correction_bias[rank],
-            routed_w1[rank], routed_w2[rank], routed_w3[rank], mxfp4_pair_lut[rank],
+            routed_w1[rank], routed_w2[rank], routed_w3[rank],
             shared_w1[rank], shared_w2[rank], shared_w3[rank],
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
             arrived, data_arrived, routed_output, combine_arrived,
@@ -1166,7 +1160,6 @@ def build_tensor_specs():
     """Build the TP1 twelve-request decode smoke fixture."""
     from golden import TensorSpec
     from decode_moe import _route_bias
-    from expert_routed import build_mxfp4_pair_lut
 
     signature = inspect.signature(l3_decode_fwd._func)
     specs = []
@@ -1215,8 +1208,6 @@ def build_tensor_specs():
             init_value = 1.0
         elif name == "correction_bias":
             init_value = _route_bias().repeat(EP_SIZE, N_LAYERS)
-        elif name == "mxfp4_pair_lut":
-            init_value = build_mxfp4_pair_lut().repeat(EP_SIZE, 1, 1)
         elif name.endswith("_scale"):
             init_value = 1.0
         specs.append(TensorSpec(name, shape, dtype, init_value=init_value))

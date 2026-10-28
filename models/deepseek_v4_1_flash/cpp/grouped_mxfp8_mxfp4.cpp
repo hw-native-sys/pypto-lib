@@ -20,6 +20,7 @@ using namespace pto;
 namespace {
 
 constexpr uint32_t M_TILE = 64;
+constexpr uint32_t EXPERT_M_TILE = 16;
 constexpr uint32_t N_TILE = 128;
 constexpr uint32_t K_TILE = 256;
 constexpr uint32_t SCALE_K_TILE = K_TILE / 32;
@@ -67,6 +68,7 @@ AICORE inline __gm__ T* tensorData(__gm__ int64_t* args, uint32_t index)
 struct Chunk {
     int64_t expert;
     int64_t stageRow;
+    int64_t validRows;
 };
 
 AICORE inline Chunk acquireChunk(__gm__ int32_t* chunks, int64_t index)
@@ -74,7 +76,14 @@ AICORE inline Chunk acquireChunk(__gm__ int32_t* chunks, int64_t index)
     auto* descriptor = chunks + index * 4;
     dcci(descriptor, SINGLE_CACHE_LINE);
     dcci(descriptor + 3, SINGLE_CACHE_LINE);
-    return {descriptor[0], descriptor[1]};
+    return {descriptor[0], descriptor[1], M_TILE};
+}
+
+AICORE inline int64_t acquireCount(__gm__ int32_t* counts, int64_t expert)
+{
+    auto* count = counts + expert;
+    dcci(count, SINGLE_CACHE_LINE);
+    return *count;
 }
 
 #ifdef __DAV_VEC__
@@ -136,30 +145,32 @@ AICORE inline void produceWeight(__gm__ uint8_t* weight, int64_t k, int64_t n,
 #endif
 
 #ifdef __DAV_CUBE__
+template <uint32_t M>
 AICORE inline void consumeWeight(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0_t* xScale,
                                 __gm__ float8_e8m0_t* weightScale, __gm__ bfloat16_t* out,
                                 int64_t k, int64_t n, int64_t experts, int64_t rows, Chunk chunk, int64_t n0)
 {
-    using MatA = Tile<TileType::Mat, float8_e4m3_t, M_TILE, K_TILE, BLayout::ColMajor,
-                      M_TILE, K_TILE, SLayout::RowMajor, 512>;
+    constexpr int VALID_M = M == EXPERT_M_TILE ? DYNAMIC : static_cast<int>(M);
+    using MatA = Tile<TileType::Mat, float8_e4m3_t, M, K_TILE, BLayout::ColMajor,
+                      VALID_M, K_TILE, SLayout::RowMajor, 512>;
     using MatB = Tile<TileType::Mat, float8_e4m3_t, K_TILE, N_TILE, BLayout::ColMajor,
                       K_TILE, N_TILE, SLayout::RowMajor, 512>;
-    using MatAScale = Tile<TileType::Mat, float8_e8m0_t, M_TILE, SCALE_K_TILE, BLayout::RowMajor,
-                           M_TILE, SCALE_K_TILE, SLayout::RowMajor, 32>;
+    using MatAScale = Tile<TileType::Mat, float8_e8m0_t, M, SCALE_K_TILE, BLayout::RowMajor,
+                           M, SCALE_K_TILE, SLayout::RowMajor, 32>;
     using MatBScale = Tile<TileType::Mat, float8_e8m0_t, SCALE_K_TILE, N_TILE, BLayout::ColMajor,
                            SCALE_K_TILE, N_TILE, SLayout::ColMajor, 32>;
-    using Left = TileLeft<float8_e4m3_t, M_TILE, K_TILE>;
+    using Left = TileLeft<float8_e4m3_t, M, K_TILE, VALID_M>;
     using Right = TileRight<float8_e4m3_t, K_TILE, N_TILE>;
-    using LeftScale = TileLeftScale<float8_e8m0_t, M_TILE, SCALE_K_TILE>;
+    using LeftScale = TileLeftScale<float8_e8m0_t, M, SCALE_K_TILE>;
     using RightScale = TileRightScale<float8_e8m0_t, SCALE_K_TILE, N_TILE>;
-    using Acc = TileAcc<float, M_TILE, N_TILE>;
-    using GlobalA = GlobalTensor<float8_e4m3_t, Shape<1, 1, 1, M_TILE, K_TILE>,
+    using Acc = TileAcc<float, M, N_TILE, VALID_M>;
+    using GlobalA = GlobalTensor<float8_e4m3_t, Shape<1, 1, 1, VALID_M, K_TILE>,
                                  pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
-    using GlobalAScale = GlobalTensor<float8_e8m0_t, TileShape2D<float8_e8m0_t, M_TILE, SCALE_K_TILE, Layout::MX_A_ZZ>,
+    using GlobalAScale = GlobalTensor<float8_e8m0_t, TileShape2D<float8_e8m0_t, M, SCALE_K_TILE, Layout::MX_A_ZZ>,
                                       BaseShape2D<float8_e8m0_t, DYNAMIC, DYNAMIC, Layout::MX_A_ZZ>, Layout::MX_A_ZZ>;
     using GlobalBScale = GlobalTensor<float8_e8m0_t, TileShape2D<float8_e8m0_t, SCALE_K_TILE, N_TILE, Layout::MX_B_NN>,
                                       BaseShape2D<float8_e8m0_t, DYNAMIC, DYNAMIC, Layout::MX_B_NN>, Layout::MX_B_NN>;
-    using GlobalOut = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M_TILE, N_TILE>,
+    using GlobalOut = GlobalTensor<bfloat16_t, Shape<1, 1, 1, VALID_M, N_TILE>,
                                    pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
 
     MatA aMat[2];
@@ -171,6 +182,13 @@ AICORE inline void consumeWeight(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0_t* 
     LeftScale aScale[2];
     RightScale bScale[2];
     Acc acc;
+    if constexpr (M == EXPERT_M_TILE) {
+        aMat[0].SetValidRow(chunk.validRows);
+        aMat[1].SetValidRow(chunk.validRows);
+        a[0].SetValidRow(chunk.validRows);
+        a[1].SetValidRow(chunk.validRows);
+        acc.SetValidRow(chunk.validRows);
+    }
     // L1: A [0, 0x8000), A scales [0x8000, 0x8400), B scales [0x8400, 0x8c00).
     // The two L1 slots occupy [0x10000, 0x20000).
     TASSIGN(aMat[0], 0x0000);
@@ -201,11 +219,13 @@ AICORE inline void consumeWeight(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0_t* 
     for (int64_t k0 = 0; k0 < k; k0 += K_TILE) {
         const uint32_t slot = (k0 / K_TILE) % 2;
         const auto event = static_cast<event_t>(slot);
-        GlobalA globalA(x + chunk.stageRow * k + k0, GlobalA::Shape(),
-                        GlobalA::Stride(rows * k, rows * k, rows * k, k, 1));
+        GlobalA globalA(x + chunk.stageRow * k + k0, typename GlobalA::Shape(1, 1, 1, chunk.validRows, K_TILE),
+                        typename GlobalA::Stride(rows * k, rows * k, rows * k, k, 1));
+        // Packed MX scales retain their complete 16-row physical block, inside expert capacity.
+        // Only valid A rows are loaded and only valid result rows are stored in expert mode.
         // MX_A_ZZ: [row/16, q/2, 16, 2], with q covering all K groups.
         const int64_t aScaleOffset = chunk.stageRow * q + (k0 / 32) * 16;
-        GlobalAScale globalAScale(xScale + aScaleOffset, GlobalAScale::Shape(), GlobalAScale::Stride(rows, q));
+        GlobalAScale globalAScale(xScale + aScaleOffset, typename GlobalAScale::Shape(), typename GlobalAScale::Stride(rows, q));
         // MX_B_NN: [n/16, global_q/2, 16, 2], with experts flattened into global_q.
         const int64_t bScaleOffset = n0 * globalQ + (chunk.expert * q + k0 / 32) * 16;
         GlobalBScale globalBScale(weightScale + bScaleOffset, GlobalBScale::Shape(), GlobalBScale::Stride(globalQ, n));
@@ -236,8 +256,8 @@ AICORE inline void consumeWeight(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0_t* 
     }
     set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-    GlobalOut globalOut(out + chunk.stageRow * n + n0, GlobalOut::Shape(),
-                        GlobalOut::Stride(rows * n, rows * n, rows * n, n, 1));
+    GlobalOut globalOut(out + chunk.stageRow * n + n0, typename GlobalOut::Shape(1, 1, 1, chunk.validRows, N_TILE),
+                        typename GlobalOut::Stride(rows * n, rows * n, rows * n, n, 1));
     TSTORE(globalOut, acc);
     set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
@@ -255,11 +275,13 @@ AICORE inline void consumeWeight(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0_t* 
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {
-    // Tensor slots: x, x_scale, weight, weight_scale, chunks, out. Scalar slots: K, N, G, C.
+    // Tensor slots: x, x_scale, weight, weight_scale, metadata, out. Scalars: K, N, E, C, row_stride.
     auto* chunks = tensorData<int32_t>(args, 4);
     const int64_t k = args[6];
     const int64_t n = args[7];
+    const int64_t experts = args[8];
     const int64_t chunkCount = args[9];
+    const int64_t rowStride = args[10];
     const int64_t block = get_block_idx(args);
     const int64_t blocks = get_block_num(args);
     const int64_t nTiles = n / N_TILE;
@@ -267,12 +289,36 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     auto* weight = tensorData<uint8_t>(args, 2);
 #endif
 #ifdef __DAV_CUBE__
-    const int64_t experts = args[8];
     auto* x = tensorData<float8_e4m3_t>(args, 0);
     auto* xScale = tensorData<float8_e8m0_t>(args, 1);
     auto* weightScale = tensorData<float8_e8m0_t>(args, 3);
     auto* out = tensorData<bfloat16_t>(args, 5);
 #endif
+    if (rowStride > 0) {
+        // Counts are immutable after input_ready; AIC and both AIV lanes acquire the same work list.
+        int64_t workBase = 0;
+        for (int64_t expert = 0; expert < experts; ++expert) {
+            const int64_t count = acquireCount(chunks, expert);
+            const int64_t workCount = ((count + EXPERT_M_TILE - 1) / EXPERT_M_TILE) * nTiles;
+            const int64_t firstWork = (block + blocks - workBase % blocks) % blocks;
+            for (int64_t work = firstWork; work < workCount; work += blocks) {
+                const int64_t expertRow = (work / nTiles) * EXPERT_M_TILE;
+                const int64_t remaining = count - expertRow;
+                const int64_t validRows = remaining < EXPERT_M_TILE ? remaining : EXPERT_M_TILE;
+                const Chunk chunk = {expert, expert * rowStride + expertRow, validRows};
+                const int64_t n0 = (work % nTiles) * N_TILE;
+#ifdef __DAV_VEC__
+                produceWeight(weight, k, n, chunk.expert, n0);
+#endif
+#ifdef __DAV_CUBE__
+                consumeWeight<EXPERT_M_TILE>(x, xScale, weightScale, out, k, n, experts,
+                                            experts * rowStride, chunk, n0);
+#endif
+            }
+            workBase += workCount;
+        }
+        return;
+    }
     for (int64_t work = block; work < chunkCount * nTiles; work += blocks) {
         const Chunk chunk = acquireChunk(chunks, work / nTiles);
         const int64_t n0 = (work % nTiles) * N_TILE;
@@ -280,7 +326,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
         produceWeight(weight, k, n, chunk.expert, n0);
 #endif
 #ifdef __DAV_CUBE__
-        consumeWeight(x, xScale, weightScale, out, k, n, experts, chunkCount * M_TILE, chunk, n0);
+        consumeWeight<M_TILE>(x, xScale, weightScale, out, k, n, experts, chunkCount * M_TILE, chunk, n0);
 #endif
     }
 }

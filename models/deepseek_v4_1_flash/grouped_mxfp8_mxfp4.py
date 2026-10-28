@@ -57,6 +57,7 @@ def grouped_mxfp8_mxfp4_extern(
     n: pl.Scalar[pl.INDEX],
     experts: pl.Scalar[pl.INDEX],
     chunk_count: pl.Scalar[pl.INDEX],
+    row_stride: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     ...
 
@@ -86,7 +87,37 @@ def grouped_mxfp8_mxfp4(
         # Keep the explicit Out buffer: generic extern return inference caches the first call's shape.
         _extern_result = grouped_mxfp8_mxfp4_extern(
             x, x_scale, weight, weight_scale, chunks, out,
-            k, n, experts, chunk_count,
+            k, n, experts, chunk_count, 0,
+        )
+    return out, done
+
+
+@pl.jit.inline(auto_scope=False)
+def grouped_mxfp8_mxfp4_experts(
+    x: pl.Tensor,
+    x_scale: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    counts: pl.Tensor,
+    out: pl.Tensor,
+    ready: pl.Scalar[pl.TASK_ID],
+    k: pl.constexpr,
+    n: pl.constexpr,
+    experts: pl.constexpr,
+    row_stride: pl.constexpr,
+):
+    """Project active expert rows in fixed-capacity buffers with 16-row tiles.
+
+    Counts are INT32 [experts, 1], immutable after ready, and within [0, row_stride].
+    Input and output are row-major [experts * row_stride, k/n], with positive row_stride % 16 == 0.
+    K/N are positive multiples of 256; scales retain global MX_A_ZZ/MX_B_NN packing.
+    Rows outside each count are invalid and remain untouched; consumers must mask them by count.
+    """
+    with pl.spmd(32, name_hint="grouped_fp4_experts", deps=[ready]) as done:
+        # Preserve the supplied Out buffer across projections with different shapes.
+        _extern_result = grouped_mxfp8_mxfp4_extern(
+            x, x_scale, weight, weight_scale, counts, out,
+            k, n, experts, 0, row_stride,
         )
     return out, done
 
@@ -257,7 +288,7 @@ def build_route_fixture(scenario="decode", *, seed=20261028, shard_rank=0):
 @lru_cache(maxsize=3)
 def generate_projection_weights(experts, k, n, *, projection="w1", seed_base=0):
     """Generate one selected projection with the existing per-expert RNG and tiled/NN packing."""
-    from expert_routed import pack_mxfp4_weight_tiles
+    from quant import pack_mxfp4_weight_tiles
 
     if projection not in ROUTED_DEQUANT_STD:
         raise ValueError("projection must be w1, w3, or w2")
@@ -302,7 +333,7 @@ def build_smoke_fixture(*, seed=20261028):
 
 def golden_grouped(tensors):
     """Decode global NN scales and tiled weights one active expert at a time."""
-    from expert_routed import unpack_mxfp4_weight_tiles
+    from quant import unpack_mxfp4_weight_tiles
     from gemm import golden_gemm_mxfp8_to_fp32_dequantized
 
     k = tensors["x"].shape[1]

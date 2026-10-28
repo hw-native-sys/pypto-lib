@@ -302,7 +302,6 @@ def draft_layer(
     routed_w2_scale: pl.Tensor,
     routed_w3: pl.Tensor,
     routed_w3_scale: pl.Tensor,
-    mxfp4_pair_lut: pl.Tensor,
     shared_w1: pl.Tensor,
     shared_w1_scale: pl.Tensor,
     shared_w2: pl.Tensor,
@@ -399,7 +398,6 @@ def draft_layer(
         routed_w2_scale,
         routed_w3,
         routed_w3_scale,
-        mxfp4_pair_lut,
         shared_w1,
         shared_w1_scale,
         shared_w2,
@@ -490,7 +488,6 @@ def _dspark_drafter(
     routed_w3_scale: pl.Tensor[
         [DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0
     ],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[DSPARK_DRAFT_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
@@ -687,7 +684,6 @@ def _dspark_drafter(
                 layer_routed_w2_scale,
                 routed_w3[layer],
                 layer_routed_w3_scale,
-                mxfp4_pair_lut,
                 shared_w1[layer],
                 layer_shared_w1_scale,
                 shared_w2[layer],
@@ -797,7 +793,6 @@ def l3_dspark_drafter(
     routed_w3_scale: pl.Tensor[
         [C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0
     ],
-    mxfp4_pair_lut: pl.Tensor[[C.EP_SIZE, 2, 256], pl.INT16],
     shared_w1: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
@@ -895,7 +890,6 @@ def l3_dspark_drafter(
             routed_w2_scale[rank],
             routed_w3[rank],
             routed_w3_scale[rank],
-            mxfp4_pair_lut[rank],
             shared_w1[rank],
             shared_w1_scale[rank],
             shared_w2[rank],
