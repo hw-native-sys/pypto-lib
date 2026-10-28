@@ -1144,7 +1144,10 @@ GOLDEN_SELECTED_KEY_TILE = 64
 GOLDEN_PREFILL_KEY_TILE = 128
 
 
-def golden_selected_attention(q, window_value, window_indices, compressed_value, compressed_indices, sink):
+def golden_selected_attention(
+    q, window_value, window_indices, compressed_value, compressed_indices, sink,
+    *, key_tile=GOLDEN_SELECTED_KEY_TILE,
+):
     """Attend selected paged KV rows with BF16 probability tiles and one sink."""
     tokens, heads, head_dim = q.shape
     gathered = torch.cat(
@@ -1159,9 +1162,9 @@ def golden_selected_attention(q, window_value, window_indices, compressed_value,
     maximum = torch.full((tokens, heads), -1e30)
     denominator = torch.zeros_like(maximum)
     numerator = torch.zeros(tokens, heads, head_dim, dtype=torch.float32)
-    for start in range(0, gathered.shape[-2], GOLDEN_SELECTED_KEY_TILE):
-        tile = gathered[:, start : start + GOLDEN_SELECTED_KEY_TILE]
-        tile_visible = visible[:, None, start : start + GOLDEN_SELECTED_KEY_TILE]
+    for start in range(0, gathered.shape[-2], key_tile):
+        tile = gathered[:, start : start + key_tile]
+        tile_visible = visible[:, None, start : start + key_tile]
         logits = torch.einsum("thd,tkd->thk", q.float(), tile) * head_dim**-0.5
         logits = logits.masked_fill(~tile_visible, -1e30)
         next_maximum = torch.maximum(maximum, logits.amax(-1))

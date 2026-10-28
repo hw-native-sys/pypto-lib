@@ -372,7 +372,7 @@ def golden_c2a(tensors, mode="full"):
     from rmsnorm import golden_rms_norm
     from qkv_proj_rope import golden_qkv_proj_rope, golden_rope_tail
     from decode_indexer import golden_c2a_index
-    from sparse_attention import golden_selected_attention
+    from sparse_attention import golden_selected_attention, KEY_TILE, PACKED_KEY_TILE
     from o_proj import golden_o_proj
     from functools import partial
     from quant import quantize_mxfp8_cache, quantize_mxfp4_cache, dequantize_mxfp4_cache, unpack_bf16_nz
@@ -447,6 +447,7 @@ def golden_c2a(tensors, mode="full"):
     attended = golden_selected_attention(
         q, window_values.reshape(-1, 1, 1, head_dim), t["window_indices"],
         compressed_values.reshape(-1, 1, 1, head_dim), topk_indices, t["attn_sink"],
+        key_tile=KEY_TILE if q.shape[0] > 12 else PACKED_KEY_TILE,
     )
 
     # Inverse RoPE and output projection.
