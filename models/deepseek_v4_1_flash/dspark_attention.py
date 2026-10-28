@@ -11,7 +11,7 @@
 import pypto.language as pl
 
 from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, ORI_BLOCKS_DYN, TP_SIZE, T_DYN
-from o_proj import GROUPED_WORKER_TILE, o_proj
+from o_proj import o_proj
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from sparse_attention import publish_window_row
 
@@ -166,10 +166,9 @@ def dspark_attention(
     gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
-    # JIT dependency calls require an explicit constexpr binding.
     o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale,
-        rope_cos, rope_sin, output, num_tokens, grouped_max_workers=GROUPED_WORKER_TILE,
+        rope_cos, rope_sin, output, num_tokens,
     )
     return output, window_cache, window_cache_scale
 

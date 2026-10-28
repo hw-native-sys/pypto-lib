@@ -14,10 +14,10 @@ from config import (
     FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, COMPRESSED_CACHE_GROUP,
     WINDOW_CACHE_GROUP,
 )
-from hc import hc_head_norm, hc_project, hc_sinkhorn
+from hc import hc_head_norm, hc_project, hc_sinkhorn, hc_post
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from sparse_attention import publish_window_row, attend_packed_cohorts
-from o_proj import o_proj_hc_post
+from o_proj import o_proj
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -110,10 +110,12 @@ def decode_c2a_reuse(
     inv_rms, partials = hc_project(x_hc, hc_attn_fn)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    o_proj_hc_post(
+    o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        attn_out, x_hc, post_mix, residual_mix, output, num_tokens,
+        attn_out, num_tokens,
     )
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output, next_pre_mix
 
 

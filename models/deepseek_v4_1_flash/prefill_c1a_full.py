@@ -203,7 +203,7 @@ def prefill_c1a_full_attention(
         o_proj(
             attended, wo_a, wo_a_scale, wo_b,
             wo_b_scale, rope_cos, rope_sin,
-            partial, num_tokens, grouped_max_workers=4096,
+            partial, num_tokens,
         )
     if scatter_output:
         prefill_sp_output_reduce_scatter(
@@ -295,7 +295,7 @@ def fixture_token_count(token_count: int, case_name: str) -> int:
 def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Tensor]:
     import torch
     from config import TP_SIZE, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP
-    from quant import quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
+    from quant import pack_fp8_nz, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
     torch.manual_seed(41)
     request_ids, compressed_lens, block_table, slots, window_indices, compressed_indices, candidate_mask = _case_metadata(token_count, case_name)
     token_count = request_ids.numel()
@@ -304,6 +304,7 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
     wq_b, wq_b_scale = _ranked_fp8_weight(Q_LORA, LOCAL_H * HEAD_DIM, shared=False)
     wkv, wkv_scale = _ranked_fp8_weight(D, HEAD_DIM, shared=True)
     wo_b, wo_b_scale = _ranked_fp8_weight(LOCAL_O_WIDTH, D, shared=False)
+    wo_b = pack_fp8_nz(wo_b)
     index_wq_b, index_wq_b_scale = _ranked_fp8_weight(Q_LORA, INDEX_H * INDEX_DIM, shared=True)
     window_value = torch.randn(cache_blocks, CASE_PAGE, 1, HEAD_DIM).mul_(0.05)
     window_cache, window_cache_scale = quantize_mxfp8_cache(window_value)

@@ -11,6 +11,7 @@
 from collections.abc import Callable
 import math
 
+
 import torch
 
 
@@ -977,6 +978,7 @@ SWA_INPUT_NAMES = (
 
 def swa_official_reference(tensors, *, shared_cache=False, key_tile=128):
     """Evaluate FP8 projections, tiled BF16 attention weights, and FP32 output."""
+    from quant import unpack_fp8_nz
     t = tensors
     head_dim = t["window_cache"].shape[-1]
     local_heads = t["attn_sink"].numel()
@@ -1029,12 +1031,13 @@ def swa_official_reference(tensors, *, shared_cache=False, key_tile=128):
     attended = golden_rope_tail(attended, t["rope_cos"], t["rope_sin"], inverse=True)
     grouped = attended.reshape(-1, groups, group_in)
     latent = golden_grouped_output(grouped, t["wo_a"], t["wo_a_scale"])
-    output = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(latent.flatten(1), t["wo_b"], t["wo_b_scale"]).float()
+    output = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(latent.flatten(1), unpack_fp8_nz(t["wo_b"]), t["wo_b_scale"]).float()
     return output, cache, cache_scale
 
 
 def make_swa_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
     """Distinct request pages, ragged visibility, nontrivial scales and rotary phases."""
+    from quant import pack_fp8_nz
     gen = torch.Generator().manual_seed(seed)
     def rand(*shape):
         return torch.randn(*shape, generator=gen)
@@ -1045,6 +1048,7 @@ def make_swa_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
     qb, qbs = weight(Q_LORA, LOCAL_H * HEAD_DIM)
     kv, kvs = weight(D, HEAD_DIM)
     ob, obs = weight(LOCAL_O_WIDTH, D)
+    ob = pack_fp8_nz(ob)
     positions = torch.full((batch,), position, dtype=torch.int64)
     if batch > 1:
         positions[:min(batch, 6)] = torch.tensor([0, 1, 63, 127, 128, 1048575])[:min(batch, 6)]

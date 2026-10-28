@@ -10,20 +10,21 @@
 # https://github.com/hw-native-sys/pto-isa/issues/357
 """V4.1 inverse RoPE, grouped W8A8 MXFP8 output projection, and TP reductions."""
 
-from gemm import (
-    MX_M_TILE, gemm_mxfp8_to_mxfp8_m80_dual,
-    gemm_bf16_via_mxfp8_to_bf16_fused,
-)
+from pathlib import Path
+
+from gemm import MX_M_TILE
 
 import torch
 
-from quant import MX_GROUP, _quantize_mxfp8_activation, decode_e8m0, unpack_mx_b_scale
+from quant import quantize_bf16_to_mxfp8, MX_GROUP, _quantize_mxfp8_activation, decode_e8m0, unpack_mx_b_scale
 
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum
 
 
 import pypto.language as pl
+from pypto.runtime import pto_isa_include_dir
+from hc import hc_post
 import pypto.language.distributed as pld
 
 from config import (
@@ -46,141 +47,38 @@ HC_DIM = M.hc_dim
 
 
 # tiling
-M_TILE = 32
-N_TILE = 128
 O_A_N_TILE = 256
 O_B_N_TILE = 256
-O_B_K_TILE = 256
-O_B_L1_K_TILE = 512
-O_B_VEC_N_TILE = O_B_N_TILE // 2
 K_TILE = 256
 D_TILE = 512
-GROUPED_WORKER_TILE = 4096
 
 
-@pl.jit.inline(auto_scope=False)
-def _rotate_output(
-    x: pl.Tensor,
-    cos: pl.Tensor,
-    sin: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    max_workers: pl.constexpr,
-    name_hint: pl.constexpr,
-):
-    blocks = num_tokens * LOCAL_H
-    workers = pl.max(pl.min(blocks, max_workers), 1)
-    with pl.spmd(workers, name_hint=name_hint):
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, workers):
-            t = block // LOCAL_H
-            h = block % LOCAL_H
-            base = h * HEAD_DIM
-            output[t : t + 1, base : base + (HEAD_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (HEAD_DIM - ROPE_DIM)]
-            tail = pl.cast(x[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM], pl.FP32)
-            even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-            c = cos[t : t + 1, :]
-            s = pl.mul(sin[t : t + 1, :], -1.0)
-            re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-            im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-            rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-            rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-            rotated = pl.cast(rotated, pl.BF16, mode="rint")
-            output[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM] = rotated
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def grouped_output(
-    x: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "o_proj_a.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _o_proj_a(
+    payload: pl.Tensor[[LOCAL_O_GROUPS * 80, O_GROUP_IN], pl.FP8E4M3FN],
     weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    output: pl.Tensor[[T_DYN, LOCAL_O_WIDTH], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    max_workers: pl.constexpr = GROUPED_WORKER_TILE,
-):
-    tokens = pl.tensor.dim(x, 0)
-    accumulated = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.FP32)
-    blocks = (num_tokens + M_TILE - 1) // M_TILE * (LOCAL_O_WIDTH // N_TILE)
-    workers = pl.max(pl.min(blocks, max_workers), 1)
-    cube_tids = pl.array.create(LOCAL_O_GROUPS * (O_LORA // N_TILE), pl.TASK_ID)
-    group_blocks = (num_tokens + M_TILE - 1) // M_TILE
-    group_workers = pl.max(pl.min(group_blocks, max_workers), 1)
-    for group in pl.parallel(LOCAL_O_GROUPS):
-        weight_group = pl.reshape(weight[group:group + 1, :, :], [O_GROUP_IN, O_LORA])
-        scale_mx: pl.Tensor[[O_GROUP_IN // 32, O_LORA], pl.FP8E8M0, pl.MX_B_NN] = pl.reshape(
-            scale[group:group + 1, :, :], [O_GROUP_IN // 32, O_LORA]
-        )
-        for nb in pl.parallel(O_LORA // N_TILE):
-            local_n = nb * N_TILE
-            with pl.spmd(group_workers, name_hint="proj_o_a_cube") as cube_tid:
-                worker = pl.tile.get_block_idx()
-                for block in pl.range(worker, group_blocks, max_workers):
-                    t0 = block * M_TILE
-                    output_n = group * O_LORA + local_n
-                    rows = pl.min(M_TILE, num_tokens - t0)
-                    first = pl.load(x, [t0, group * O_GROUP_IN], [M_TILE, K_TILE], valid_shape=[rows, K_TILE])
-                    first = pl.set_validshape(pl.fillpad(first, pad_value=pl.PadValue.zero), M_TILE, K_TILE)
-                    fq = pl.reshape(pl.cast(first, pl.FP32), [M_TILE * (K_TILE // 32), 32])
-                    fq_tmp = pl.create_tile([M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
-                    fq_max = pl.row_max(pl.abs(fq), tmp_tile=fq_tmp)
-                    fq_bits = pl.reinterpret_view(fq_max, pl.INT32)
-                    fq_exp = pl.maximum(pl.sub(pl.shrs(fq_bits, 23), 8), 0)
-                    # Use a normal divisor for scale code zero, whose payload is zero.
-                    fq_scale = pl.reinterpret_view(pl.shls(pl.maximum(fq_exp, 1), 23), pl.FP32)
-                    fq_normalized = pl.row_expand_div(fq, fq_scale)
-                    fq_normalized = pl.row_expand_mul(fq_normalized, pl.cast(pl.minimum(fq_exp, 1), pl.FP32))
-                    fq_normalized = pl.minimum(pl.maximum(fq_normalized, -448.0), 448.0)
-                    a = pl.reshape(pl.cast(fq_normalized, pl.FP8E4M3FN, mode="rint"), [M_TILE, K_TILE])
-                    fq_se = pl.sub(fq_exp, pl.mul(pl.shrs(fq_exp, 7), 256))
-                    fq_codes = pl.reinterpret_view(pl.cast(fq_se, pl.INT8), pl.UINT8)
-                    fq_flat = pl.reshape(fq_codes, [1, M_TILE * (K_TILE // 32)])
-                    fq_packed = pl.tmov_x2zz(
-                        fq_flat, pl.create_tile([1, 96], dtype=pl.UINT8), group_axis=1, dst_rows=M_TILE, dst_cols=8
-                    )
-                    sa = pl.reinterpret_view(fq_packed, pl.FP8E8M0)
-                    b = pl.load(weight_group, [0, local_n], [K_TILE, N_TILE])
-                    sb = pl.load(scale_mx, [0, local_n], [K_TILE // 32, N_TILE])
-                    acc = pl.matmul_mx(a, sa, b, sb)
+    activation_scale: pl.Tensor[[LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], pl.FP8E8M0],
+    weight_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    output: pl.Out[pl.Tensor[[80, LOCAL_O_WIDTH], pl.BF16]],
+    output_width: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project grouped NZ weights and MX scales into concatenated BF16 columns."""
+    ...
 
-                    for kb in pl.range(1, O_GROUP_IN // K_TILE):
-                        k0 = kb * K_TILE
-                        values = pl.load(x, [t0, group * O_GROUP_IN + k0], [M_TILE, K_TILE], valid_shape=[rows, K_TILE])
-                        values = pl.set_validshape(pl.fillpad(values, pad_value=pl.PadValue.zero), M_TILE, K_TILE)
-                        q = pl.reshape(pl.cast(values, pl.FP32), [M_TILE * (K_TILE // 32), 32])
-                        q_tmp = pl.create_tile([M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
-                        q_max = pl.row_max(pl.abs(q), tmp_tile=q_tmp)
-                        q_bits = pl.reinterpret_view(q_max, pl.INT32)
-                        q_exp = pl.maximum(pl.sub(pl.shrs(q_bits, 23), 8), 0)
-                        q_scale = pl.reinterpret_view(pl.shls(pl.maximum(q_exp, 1), 23), pl.FP32)
-                        q_normalized = pl.row_expand_div(q, q_scale)
-                        q_normalized = pl.row_expand_mul(q_normalized, pl.cast(pl.minimum(q_exp, 1), pl.FP32))
-                        q_normalized = pl.minimum(pl.maximum(q_normalized, -448.0), 448.0)
-                        a = pl.reshape(pl.cast(q_normalized, pl.FP8E4M3FN, mode="rint"), [M_TILE, K_TILE])
-                        q_se = pl.sub(q_exp, pl.mul(pl.shrs(q_exp, 7), 256))
-                        q_codes = pl.reinterpret_view(pl.cast(q_se, pl.INT8), pl.UINT8)
-                        q_flat = pl.reshape(q_codes, [1, M_TILE * (K_TILE // 32)])
-                        q_packed = pl.tmov_x2zz(
-                            q_flat, pl.create_tile([1, 96], dtype=pl.UINT8), group_axis=1, dst_rows=M_TILE, dst_cols=8
-                        )
-                        sa = pl.reinterpret_view(q_packed, pl.FP8E8M0)
-                        b = pl.load(weight_group, [k0, local_n], [K_TILE, N_TILE])
-                        sb = pl.load(scale_mx, [k0 // 32, local_n], [K_TILE // 32, N_TILE])
-                        acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
 
-                    accumulated = pl.store(pl.set_validshape(pl.mul(acc, 1.0), rows, N_TILE), [t0, output_n], accumulated)
-            cube_tids[group * (O_LORA // N_TILE) + nb] = cube_tid
-    with pl.spmd(workers, name_hint="cast_o_a", deps=[cube_tids]):
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, max_workers):
-            t0 = block // (LOCAL_O_WIDTH // N_TILE) * M_TILE
-            n0 = block % (LOCAL_O_WIDTH // N_TILE) * N_TILE
-            rows = pl.min(M_TILE, num_tokens - t0)
-            value = pl.slice(accumulated, [M_TILE, N_TILE], [t0, n0], valid_shape=[rows, N_TILE])
-            output[t0:t0 + M_TILE, n0:n0 + N_TILE] = pl.cast(value, pl.BF16, mode="rint")
-    return output
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "o_proj_b.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _o_proj_b(
+    payload: pl.Tensor[[80, LOCAL_O_WIDTH], pl.FP8E4M3FN],
+    weight: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    activation_scale: pl.Tensor[[1, 80 * (LOCAL_O_WIDTH // 32)], pl.FP8E8M0],
+    weight_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    rows: pl.Scalar[pl.INDEX], reduction: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project an 80-row group; scales contain MX_A_ZZ and MX_B_NN bytes."""
+    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -194,27 +92,26 @@ def o_proj(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     output: pl.Tensor[[T_DYN, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
-    grouped_max_workers: pl.constexpr = GROUPED_WORKER_TILE,
 ):
-    """Project attention output to BF16 with native MXFP8 GEMM and zero inactive rows."""
-    tokens = pl.tensor.dim(attended, 0)
-    unrotated = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    _rotate_output(attended, rope_cos, rope_sin, unrotated, num_tokens, 64, "rope_o")
-    latent = pl.create_tensor([tokens, LOCAL_O_WIDTH], dtype=pl.BF16)
-    grouped_output(
-        unrotated, wo_a, wo_a_scale, latent, num_tokens, max_workers=grouped_max_workers,
-    )
-    gemm_bf16_via_mxfp8_to_bf16_fused(
-        latent, wo_b, wo_b_scale, output, num_tokens,
-        width=LOCAL_O_WIDTH, output_width=D,
-        n_tile=128, name_hint="proj_o_b",
-    )
-    output_rows = pl.tensor.dim(output, 0)
-    if num_tokens < output_rows:
-        for row_offset in pl.spmd(output_rows - num_tokens, name_hint="o_proj_zero_pad"):
-            row = num_tokens + row_offset
-            for col in pl.range(0, D, D_TILE):
-                output[row:row + 1, col:col + D_TILE] = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
+    """Project row groups to BF16; both weights hold NZ bytes in logical [K, N] shapes."""
+    total_rows = pl.tensor.dim(output, 0)
+    for group_start in pl.parallel(0, total_rows, 80):
+        group_rows = pl.min(80, total_rows - group_start)
+        active_rows = pl.max(pl.min(group_rows, num_tokens - group_start), 0)
+        attended_group = pl.tensor.slice(attended, [group_rows, LOCAL_H * HEAD_DIM], [group_start, 0])
+        cosine_group = pl.tensor.slice(rope_cos, [group_rows, ROPE_DIM // 2], [group_start, 0])
+        sine_group = pl.tensor.slice(rope_sin, [group_rows, ROPE_DIM // 2], [group_start, 0])
+        output_group = pl.tensor.slice(output, [group_rows, D], [group_start, 0])
+        payload = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
+        activation_scale_backing = pl.create_tensor([1, 80 * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
+        payload, activation_scale_backing = _grouped_output_rope_to_mx_m80(
+            attended_group, cosine_group, sine_group, wo_a, wo_a_scale, payload, activation_scale_backing, active_rows,
+        )
+        capacity = pl.tensor.dim(output_group, 0)
+        with pl.spmd(D // O_B_N_TILE, name_hint="proj_o_b", sync_start=True):
+            output_group = _o_proj_b(
+                payload, wo_b, activation_scale_backing, wo_b_scale, output_group, capacity, LOCAL_O_WIDTH,
+            )
     return output
 
 
@@ -229,11 +126,10 @@ def _grouped_output_rope_to_mx_m80(
     output_scale: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Pool M16 RoPE/quantization work and project eight O-A groups."""
+    """Apply pooled RoPE, grouped Cube O-A, then independent Vector quantization."""
     padded_rows = 80
     row_tiles = padded_rows // MX_M_TILE
     last_input_row = pl.max(pl.tensor.dim(attended, 0) - 1, 0)
-    weight_flat = pl.reshape(weight, [LOCAL_O_GROUPS * O_GROUP_IN, O_LORA])
     payload_all = pl.create_tensor([LOCAL_O_GROUPS * padded_rows, O_GROUP_IN], dtype=pl.FP8E4M3FN)
     scales_all = pl.create_tensor([LOCAL_O_GROUPS, padded_rows * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
     group_quant_blocks = row_tiles * (O_GROUP_IN // (2 * K_TILE))
@@ -317,154 +213,23 @@ def _grouped_output_rope_to_mx_m80(
                 scale_offset = t0 * (O_GROUP_IN // 32) + k0 // K_TILE * MX_M_TILE * (K_TILE // 32)
                 packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (K_TILE // 32)])
                 scales_all = pl.store(packed_flat, [quant_group, scale_offset], scales_all)
-    for group in pl.parallel(LOCAL_O_GROUPS):
-        payload = pl.tensor.slice(payload_all, [padded_rows, O_GROUP_IN], [group * padded_rows, 0])
-        scale_backing = pl.tensor.slice(scales_all, [1, padded_rows * (O_GROUP_IN // 32)], [group, 0])
-        output, output_scale = gemm_mxfp8_to_mxfp8_m80_dual(
-            payload, scale_backing, weight_flat, scale, output, output_scale,
-            num_tokens, group, O_GROUP_IN, O_LORA, "proj_o_a",
-            O_A_N_TILE, K_TILE, LOCAL_O_GROUPS, 4,
-        )
+    projected = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.BF16)
+    with pl.spmd(LOCAL_O_GROUPS * (O_LORA // O_A_N_TILE), name_hint="proj_o_a", sync_start=True):
+        projected = _o_proj_a(payload_all, weight, scales_all, scale, projected, LOCAL_O_WIDTH)
+    output_blocks = row_tiles * (LOCAL_O_WIDTH // K_TILE)
+    output_workers = pl.min(pl.min(output_blocks, 64), 2 * pl.system.available_cluster_count())
+    for worker in pl.spmd(output_workers, name_hint="quant_o_a"):
+        for work in pl.range(worker, output_blocks, output_workers):
+            t0 = work // (LOCAL_O_WIDTH // K_TILE) * MX_M_TILE
+            k0 = work % (LOCAL_O_WIDTH // K_TILE) * K_TILE
+            rows = pl.max(pl.min(MX_M_TILE, num_tokens - t0), 0)
+            output_quantized, output_packed_scale = quantize_bf16_to_mxfp8(projected, t0, k0, rows, MX_M_TILE)
+            output = pl.store(output_quantized, [t0, k0], output)
+            scale_offset = t0 * (LOCAL_O_WIDTH // 32) + k0 // K_TILE * MX_M_TILE * (K_TILE // 32)
+            output_packed_flat = pl.reshape(output_packed_scale, [1, MX_M_TILE * (K_TILE // 32)])
+            output_scale = pl.store(output_packed_flat, [0, scale_offset], output_scale)
     return output, output_scale
 
-
-@pl.jit.inline(auto_scope=False)
-def o_proj_hc_post(
-    attended: pl.Tensor,
-    wo_a: pl.Tensor,
-    wo_a_scale: pl.Tensor,
-    wo_b: pl.Tensor,
-    wo_b_scale: pl.Tensor,
-    rope_cos: pl.Tensor,
-    rope_sin: pl.Tensor,
-    sublayer: pl.Tensor,
-    residual: pl.Tensor,
-    post_mix: pl.Tensor,
-    residual_mix: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Project bounded decode row groups and mix FP32 HC streams on two AIVs."""
-    total_rows = pl.tensor.dim(sublayer, 0)
-    for group_start in pl.parallel(0, total_rows, 80):
-        group_rows = pl.min(80, total_rows - group_start)
-        active_rows = pl.max(pl.min(group_rows, num_tokens - group_start), 0)
-        attended_group = pl.tensor.slice(attended, [group_rows, LOCAL_H * HEAD_DIM], [group_start, 0])
-        cosine_group = pl.tensor.slice(rope_cos, [group_rows, ROPE_DIM // 2], [group_start, 0])
-        sine_group = pl.tensor.slice(rope_sin, [group_rows, ROPE_DIM // 2], [group_start, 0])
-        sublayer_group = pl.tensor.slice(sublayer, [group_rows, D], [group_start, 0])
-        residual_group = pl.tensor.slice(residual, [group_rows, HC_MULT, D], [group_start, 0, 0])
-        post_group = pl.tensor.slice(post_mix, [group_rows, HC_MULT], [group_start, 0])
-        mix_group = pl.tensor.slice(residual_mix, [group_rows, HC_MULT, HC_MULT], [group_start, 0, 0])
-        output_group = pl.tensor.slice(output, [group_rows, HC_MULT, D], [group_start, 0, 0])
-        payload = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
-        activation_scale_backing = pl.create_tensor([1, 80 * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-        payload, activation_scale_backing = _grouped_output_rope_to_mx_m80(
-            attended_group, cosine_group, sine_group, wo_a, wo_a_scale, payload, activation_scale_backing, active_rows,
-        )
-        capacity = pl.tensor.dim(sublayer_group, 0)
-        residual_flat = pl.reshape(residual_group, [capacity, HC_DIM])
-        residual_mix_flat = pl.reshape(mix_group, [capacity, HC_MULT * HC_MULT])
-        output_flat = pl.reshape(output_group, [capacity, HC_DIM])
-        activation_scale = pl.tensor.view(activation_scale_backing, [80, LOCAL_O_WIDTH // 32], layout=pl.MX_A_ZZ)
-        scale_group_size = (LOCAL_O_WIDTH // 32) * D
-        scale_backing_flat = pl.tensor.view(wo_b_scale, [1, scale_group_size], layout=pl.ND)
-        scale_group_backing = pl.tensor.slice(scale_backing_flat, [1, scale_group_size], [0, 0])
-        scale_group = pl.tensor.view(scale_group_backing, [LOCAL_O_WIDTH // 32, D], layout=pl.MX_B_NN)
-        workers = pl.min(D // O_B_N_TILE, pl.system.available_cluster_count())
-        for worker in pl.spmd(workers, name_hint="attention_o_b_hc_post", sync_start=True):
-            block_num = pl.tile.get_block_num()
-            for ni in pl.range(0, D // O_B_N_TILE):
-                if ni % block_num == worker:
-                    n0 = ni * O_B_N_TILE
-                    a_first = pl.load(payload, [0, 0], [80, O_B_L1_K_TILE], target_memory=pl.MemorySpace.Mat)
-                    b_first = pl.load(wo_b, [0, n0], [O_B_L1_K_TILE, O_B_N_TILE], target_memory=pl.MemorySpace.Mat)
-                    a0 = a_first[:, :O_B_K_TILE]
-                    sa0 = pl.load(activation_scale, [0, 0], [80, O_B_K_TILE // 32])
-                    b0 = pl.tile.extract(b_first, 0, 0, [O_B_K_TILE, O_B_N_TILE], target_memory=pl.MemorySpace.Right)
-                    sb0 = pl.load(scale_group, [0, n0], [O_B_K_TILE // 32, O_B_N_TILE])
-                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                    for inner_k in pl.range(O_B_K_TILE, O_B_L1_K_TILE, O_B_K_TILE):
-                        a1 = pl.tile.slice(a_first, [80, O_B_K_TILE], [0, inner_k])
-                        sa1 = pl.load(activation_scale, [0, inner_k // 32], [80, O_B_K_TILE // 32])
-                        b1 = pl.tile.extract(b_first, inner_k, 0, [O_B_K_TILE, O_B_N_TILE], target_memory=pl.MemorySpace.Right)
-                        sb1 = pl.load(scale_group, [inner_k // 32, n0], [O_B_K_TILE // 32, O_B_N_TILE])
-                        acc = pl.matmul_mx_acc(acc, a1, sa1, b1, sb1)
-                    for k0 in pl.pipeline(O_B_L1_K_TILE, LOCAL_O_WIDTH, O_B_L1_K_TILE, stage=2):
-                        a_next = pl.load(payload, [0, k0], [80, O_B_L1_K_TILE], target_memory=pl.MemorySpace.Mat)
-                        b_next = pl.load(wo_b, [k0, n0], [O_B_L1_K_TILE, O_B_N_TILE], target_memory=pl.MemorySpace.Mat)
-                        for inner_k in pl.range(0, O_B_L1_K_TILE, O_B_K_TILE):
-                            a = pl.tile.slice(a_next, [80, O_B_K_TILE], [0, inner_k])
-                            sa = pl.load(activation_scale, [0, (k0 + inner_k) // 32], [80, O_B_K_TILE // 32])
-                            b = pl.tile.extract(b_next, inner_k, 0, [O_B_K_TILE, O_B_N_TILE], target_memory=pl.MemorySpace.Right)
-                            sb = pl.load(scale_group, [(k0 + inner_k) // 32, n0], [O_B_K_TILE // 32, O_B_N_TILE])
-                            acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-                    for _shard_lane in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
-                        full_vector = pl.aiv_shard(acc)
-                    for lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                        output_n = n0 + lane * O_B_VEC_N_TILE
-                        for t0 in pl.range(0, capacity, MX_M_TILE):
-                            capacity_rows = pl.min(MX_M_TILE, capacity - t0)
-                            rows = pl.max(pl.min(MX_M_TILE, active_rows - t0), 0)
-                            post_rows = pl.load(post_group, [t0, 0], [MX_M_TILE, 8], valid_shape=[capacity_rows, HC_MULT])
-                            post_rows = pl.fillpad(post_rows, pad_value=pl.PadValue.zero)
-                            post_rows = pl.set_validshape(post_rows, MX_M_TILE, 8)
-                            post_bits = pl.reinterpret_view(post_rows, pl.INT32)
-                            post_zero = pl.tile.full([MX_M_TILE, 8], dtype=pl.INT32, value=0)
-                            post_dense_bits = pl.add(post_zero, post_bits)
-                            post_dense = pl.reinterpret_view(post_dense_bits, pl.FP32)
-                            post_transposed = pl.tile.transpose(post_dense, 0, 1)
-                            mix_rows = pl.load(residual_mix_flat, [t0, 0], [MX_M_TILE, HC_MULT * HC_MULT], valid_shape=[capacity_rows, HC_MULT * HC_MULT])
-                            mix_rows = pl.fillpad(mix_rows, pad_value=pl.PadValue.zero)
-                            mix_rows = pl.set_validshape(mix_rows, MX_M_TILE, HC_MULT * HC_MULT)
-                            mix_bits = pl.reinterpret_view(mix_rows, pl.INT32)
-                            mix_zero = pl.tile.full([MX_M_TILE, HC_MULT * HC_MULT], dtype=pl.INT32, value=0)
-                            mix_dense_bits = pl.add(mix_zero, mix_bits)
-                            mix_dense = pl.reinterpret_view(mix_dense_bits, pl.FP32)
-                            mix_transposed = pl.tile.transpose(mix_dense, 0, 1)
-                            acc_rows = pl.tile.slice(full_vector, [MX_M_TILE, O_B_VEC_N_TILE], [t0, 0])
-                            rounded_sublayer = pl.cast(acc_rows, pl.BF16, mode="rint")
-                            active_sublayer = pl.set_validshape(rounded_sublayer, rows, O_B_VEC_N_TILE)
-                            padded_sublayer = pl.fillpad(active_sublayer, pad_value=pl.PadValue.zero)
-                            sublayer_tile = pl.set_validshape(padded_sublayer, MX_M_TILE, O_B_VEC_N_TILE)
-                            valid_sublayer = pl.set_validshape(sublayer_tile, capacity_rows, O_B_VEC_N_TILE)
-                            pl.store(valid_sublayer, [t0, output_n], sublayer_group)
-                            x_tile = pl.cast(sublayer_tile, pl.FP32)
-                            residual0 = pl.load(residual_flat, [t0, output_n], [MX_M_TILE, O_B_VEC_N_TILE], valid_shape=[capacity_rows, O_B_VEC_N_TILE])
-                            residual1 = pl.load(residual_flat, [t0, D + output_n], [MX_M_TILE, O_B_VEC_N_TILE], valid_shape=[capacity_rows, O_B_VEC_N_TILE])
-                            residual2 = pl.load(residual_flat, [t0, 2 * D + output_n], [MX_M_TILE, O_B_VEC_N_TILE], valid_shape=[capacity_rows, O_B_VEC_N_TILE])
-                            residual3 = pl.load(residual_flat, [t0, 3 * D + output_n], [MX_M_TILE, O_B_VEC_N_TILE], valid_shape=[capacity_rows, O_B_VEC_N_TILE])
-                            padded_residual0 = pl.fillpad(residual0, pad_value=pl.PadValue.zero)
-                            residual0 = pl.set_validshape(padded_residual0, MX_M_TILE, O_B_VEC_N_TILE)
-                            padded_residual1 = pl.fillpad(residual1, pad_value=pl.PadValue.zero)
-                            residual1 = pl.set_validshape(padded_residual1, MX_M_TILE, O_B_VEC_N_TILE)
-                            padded_residual2 = pl.fillpad(residual2, pad_value=pl.PadValue.zero)
-                            residual2 = pl.set_validshape(padded_residual2, MX_M_TILE, O_B_VEC_N_TILE)
-                            padded_residual3 = pl.fillpad(residual3, pad_value=pl.PadValue.zero)
-                            residual3 = pl.set_validshape(padded_residual3, MX_M_TILE, O_B_VEC_N_TILE)
-                            for out_h in pl.unroll(HC_MULT):
-                                post_row = pl.tile.slice(post_transposed, [1, MX_M_TILE], [out_h, 0])
-                                post_col = pl.reshape(post_row, [MX_M_TILE, 1])
-                                mix0_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [out_h, 0])
-                                mix1_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [HC_MULT + out_h, 0])
-                                mix2_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [2 * HC_MULT + out_h, 0])
-                                mix3_row = pl.tile.slice(mix_transposed, [1, MX_M_TILE], [3 * HC_MULT + out_h, 0])
-                                mix0_col = pl.reshape(mix0_row, [MX_M_TILE, 1])
-                                mix1_col = pl.reshape(mix1_row, [MX_M_TILE, 1])
-                                mix2_col = pl.reshape(mix2_row, [MX_M_TILE, 1])
-                                mix3_col = pl.reshape(mix3_row, [MX_M_TILE, 1])
-                                value = pl.row_expand_mul(x_tile, post_col)
-                                mixed_residual0 = pl.row_expand_mul(residual0, mix0_col)
-                                value = pl.add(value, mixed_residual0)
-                                mixed_residual1 = pl.row_expand_mul(residual1, mix1_col)
-                                value = pl.add(value, mixed_residual1)
-                                mixed_residual2 = pl.row_expand_mul(residual2, mix2_col)
-                                value = pl.add(value, mixed_residual2)
-                                mixed_residual3 = pl.row_expand_mul(residual3, mix3_col)
-                                value = pl.add(value, mixed_residual3)
-                                valid_output = pl.set_validshape(value, capacity_rows, O_B_VEC_N_TILE)
-                                pl.store(valid_output, [t0, out_h * D + output_n], output_flat)
-    return sublayer, output
 
 
 def grouped_mxfp8_linear(
@@ -474,7 +239,10 @@ def grouped_mxfp8_linear(
     *,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Evaluate grouped W8A8 MXFP8 with [G, K, N] weights and MX_B_NN scales."""
+    """Evaluate grouped W8A8 MXFP8 with NZ weights and MX_B_NN scales."""
+    from quant import unpack_fp8_nz
+
+    wo_a = unpack_fp8_nz(wo_a)
     activation, activation_scale = _quantize_mxfp8_activation(grouped, scale_alg=0)
     weight_scale = decode_e8m0(unpack_mx_b_scale(wo_a_scale))
     weight_groups = wo_a.float().unflatten(-2, (-1, MX_GROUP))
@@ -501,6 +269,9 @@ def golden_o_proj(
     output_dtype: torch.dtype | None = None,
     sequential_projection: bool = False,
 ) -> torch.Tensor:
+    from quant import unpack_fp8_nz
+
+    wo_b = unpack_fp8_nz(wo_b)
     rope_dim = cos.shape[-1] * 2
     tail = rope_interleave(attended[..., -rope_dim:], cos, sin, inverse=True)
     attended = torch.cat((attended[..., :-rope_dim], tail), dim=-1)
@@ -660,35 +431,30 @@ def prefill_tp_output_all_reduce(
     return output
 
 
-def build_o_proj_validation(grouped_max_workers: int):
-    """Build the production output projection with a fixed grouped worker limit."""
-    @pl.jit
-    def o_proj_validation(
-        attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-        wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-        wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-        wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-        rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-        output: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        attended.bind_dynamic(0, T_DYN)
-        rope_cos.bind_dynamic(0, T_DYN)
-        rope_sin.bind_dynamic(0, T_DYN)
-        output.bind_dynamic(0, T_DYN)
-        o_proj(
-            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-            output, num_tokens, grouped_max_workers=grouped_max_workers,
-        )
-        return output
-
-    return o_proj_validation
-
+@pl.jit
+def o_proj_validation(
+    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    output: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    attended.bind_dynamic(0, T_DYN)
+    rope_cos.bind_dynamic(0, T_DYN)
+    rope_sin.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, T_DYN)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        output, num_tokens,
+    )
+    return output
 
 @pl.jit
-def o_proj_hc_post_validation(
+def o_proj_with_hc_validation(
     attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
@@ -711,17 +477,19 @@ def o_proj_hc_post_validation(
     post_mix.bind_dynamic(0, T_DYN)
     residual_mix.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
-    o_proj_hc_post(
+    o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        sublayer, residual, post_mix, residual_mix, output, num_tokens,
+        sublayer, num_tokens,
     )
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps)
     return sublayer, output
 
 
 def build_o_proj_specs(active_tokens: int, *, pad_to_tile: bool = True):
     """Build deterministic output-projection fixtures with padded inactive rows."""
     from golden import ScalarSpec, TensorSpec
-    from quant import quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight
+    from quant import pack_fp8_nz, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight
 
     tokens = max(16, (active_tokens + 15) // 16 * 16) if pad_to_tile else active_tokens
     values = {}
@@ -739,7 +507,7 @@ def build_o_proj_specs(active_tokens: int, *, pad_to_tile: bool = True):
             angles = torch.arange(tokens).float()[:, None] * frequencies
             values.update(
                 attended=attended, wo_a=wo_a, wo_a_scale=wo_a_scale,
-                wo_b=wo_b.T.contiguous(),
+                wo_b=pack_fp8_nz(wo_b.T.contiguous()),
                 wo_b_scale=pack_mx_b_scale(wo_b_scale.T.contiguous()).view(torch.float8_e8m0fnu),
                 rope_cos=angles.cos(), rope_sin=angles.sin(),
             )
@@ -832,15 +600,16 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--case", choices=["all", "empty", "fast", "low-workers", "tail", "fused"], default="all")
+    parser.add_argument("--tp", type=int, choices=[1, 2, 4, 8], default=TP_SIZE)
+    parser.add_argument("--case", choices=["all", "empty", "fast", "tail", "hc-post"], default="all")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     args = parser.parse_args()
-    cases = (("empty", 0, GROUPED_WORKER_TILE), ("fast", 12, GROUPED_WORKER_TILE), ("low-workers", 12, 8), ("tail", 17, GROUPED_WORKER_TILE))
-    for name, active, workers in cases:
+    cases = (("empty", 0), ("fast", 12), ("tail", 17))
+    for name, active in cases:
         if args.case not in ("all", name):
             continue
-        print(f"[O_PROJ] {name}: active={active}, grouped_max_workers={workers}", flush=True)
+        print(f"[O_PROJ] {name}: active={active}", flush=True)
         active_compare = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
 
         def compare(actual, expected, **kwargs):
@@ -852,7 +621,7 @@ if __name__ == "__main__":
             return passed and inactive_ok, f"{detail}; inactive rows zeroed={inactive_ok}"
 
         result = run(
-            fn=build_o_proj_validation(workers),
+            fn=o_proj_validation,
             specs=build_o_proj_specs(active),
             golden_fn=golden_o_proj_validation,
             compare_fn={"output": compare},
@@ -864,11 +633,11 @@ if __name__ == "__main__":
         )
         if not result.passed:
             raise SystemExit(result.error or 1)
-    if args.case in ("all", "fused"):
+    if args.case in ("all", "hc-post"):
         for active, padded in ((72, False), (17, True), (0, True), (81, True)):
-            print(f"[O_PROJ] fused: active={active}, padded={padded}, FP32 HC post", flush=True)
+            print(f"[O_PROJ] hc-post: active={active}, padded={padded}, FP32 HC post", flush=True)
             result = run(
-                fn=o_proj_hc_post_validation,
+                fn=o_proj_with_hc_validation,
                 specs=build_o_proj_hc_post_specs(active, pad_to_tile=padded),
                 golden_fn=golden_o_proj_hc_post_validation,
                 compare_fn={

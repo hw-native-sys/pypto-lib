@@ -18,14 +18,14 @@ from config import (
 from compressor import (
     publish_c2a_compressed, STATE_WIDTH, project_ratio2, compressor_ratio2, decode_c2a_compressor_rope,
 )
-from hc import hc_pre
+from hc import hc_pre, hc_post
 from rmsnorm import rms_norm_tiled
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from sparse_attention import (
     publish_window_row, attend_packed_cohorts,
 )
 from decode_indexer import decode_c2a_indexer
-from o_proj import o_proj_hc_post
+from o_proj import o_proj
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -172,10 +172,12 @@ def decode_c2a_full(
     )
 
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    o_proj_hc_post(
+    o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        attn_out, x_hc, post_mix, residual_mix, output, num_tokens,
+        attn_out, num_tokens,
     )
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output, next_pre_mix
 
 
@@ -485,6 +487,7 @@ def build_c2a_specs(
     from config import MAX_BATCH_PER_DP, BLOCK_SIZE
     from utils import packed_query_lengths, paged_slots, window_metadata
     from quant import (
+        pack_fp8_nz,
         quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache,
         quantize_mxfp8_upward_reference, pack_mx_b_scale,
     )
@@ -550,6 +553,8 @@ def build_c2a_specs(
         weight = torch.randn(n, k, generator=gen) / math.sqrt(k)
         payload, codes = quantize_mxfp8_upward_reference(weight)
         weights[name] = payload.T.contiguous()
+        if name == "wo_b":
+            weights[name] = pack_fp8_nz(weights[name])
         weights[name + "_scale"] = pack_mx_b_scale(codes.T.contiguous()).view(torch.float8_e8m0fnu)
 
     compressor_wkv = torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)

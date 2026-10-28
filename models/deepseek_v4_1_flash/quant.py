@@ -93,6 +93,20 @@ def encode_e8m0(scale: torch.Tensor) -> torch.Tensor:
     return (exponent + 127).to(torch.uint8)
 
 
+def pack_fp8_nz(weight: torch.Tensor) -> torch.Tensor:
+    """Pack FP8 [..., K, N] weights into NZ bytes with the same logical shape."""
+    *leading, k, n = weight.shape
+    blocked = weight.reshape(*leading, k // 16, 16, n // 32, 32)
+    return blocked.movedim(-2, -4).contiguous().reshape(weight.shape)
+
+
+def unpack_fp8_nz(weight: torch.Tensor) -> torch.Tensor:
+    """Restore NZ FP8 bytes to logical [..., K, N] weights."""
+    *leading, k, n = weight.shape
+    blocked = weight.reshape(*leading, n // 32, k // 16, 16, 32)
+    return blocked.movedim(-4, -2).contiguous().reshape(weight.shape)
+
+
 def pack_mx_b_scale(scale: torch.Tensor) -> torch.Tensor:
     """Pack logical ``[..., K/32, N]`` scales into the MX_B_NN physical order."""
     *leading, k_groups, output_dim = scale.shape
@@ -256,11 +270,11 @@ def quantize_mxfp8_upward_reference(value):
 
 
 def quantize_grouped_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize output-major grouped fixtures into [G, K, N] MXFP8 storage."""
+    """Quantize grouped fixtures into NZ bytes with logical [..., G, K, N] shape."""
     payload, scale = _quantize_mxfp8_activation(weight)
     payload = payload.flatten(-2).transpose(-1, -2).contiguous()
     codes = encode_e8m0(scale).transpose(-1, -2).contiguous()
-    return payload, pack_mx_b_scale(codes).view(torch.float8_e8m0fnu)
+    return pack_fp8_nz(payload), pack_mx_b_scale(codes).view(torch.float8_e8m0fnu)
 
 
 # E8M0 has no native dtype in some PyTorch versions, so it is always carried as uint8.

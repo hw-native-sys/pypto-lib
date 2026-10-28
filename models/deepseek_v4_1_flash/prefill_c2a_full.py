@@ -208,7 +208,7 @@ def prefill_c2a_full_attention(
     o_proj(
         attended, wo_a, wo_a_scale, wo_b,
         wo_b_scale, rope_cos, rope_sin,
-        partial, num_tokens, grouped_max_workers=4096,
+        partial, num_tokens,
     )
     return partial
 
@@ -640,6 +640,8 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
     wq_b, wq_b_scale = _weight(gen, Q_LORA, LOCAL_H * HEAD_DIM)
     wkv, wkv_scale = _weight(gen, D, HEAD_DIM)
     wo_b, wo_b_scale = _weight(gen, LOCAL_O_WIDTH, D)
+    from quant import pack_fp8_nz
+    wo_b = pack_fp8_nz(wo_b)
     index_wq_b, index_wq_b_scale = _weight(gen, Q_LORA, INDEX_H * INDEX_DIM)
 
     compressor_wkv = torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)

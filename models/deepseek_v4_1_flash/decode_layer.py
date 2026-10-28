@@ -952,11 +952,14 @@ def _mxfp8_weight(input_dim: int, output_dim: int) -> tuple[torch.Tensor, torch.
 
 def _attention_values() -> dict[str, torch.Tensor | None]:
     """Build small deterministic inputs for all attention golden modes."""
+    from quant import pack_fp8_nz
+
     torch.manual_seed(7)
     wq_a, wq_a_scale = _mxfp8_weight(64, 64)
     wq_b, wq_b_scale = _mxfp8_weight(64, 128)
     wkv, wkv_scale = _mxfp8_weight(64, 64)
     wo_b, wo_b_scale = _mxfp8_weight(64, 64)
+    wo_b = pack_fp8_nz(wo_b)
     index_wq_b, index_wq_b_scale = _mxfp8_weight(64, 64)
     window_cache, window_cache_scale = quantize_mxfp8_cache(torch.zeros(1, 128, 1, 64))
     compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(

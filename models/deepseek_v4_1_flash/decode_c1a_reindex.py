@@ -13,14 +13,14 @@ from config import (
     COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN, CMP_BLOCKS_DYN,
     INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN, LOCAL_T_DYN,
 )
-from hc import hc_pre
+from hc import hc_pre, hc_post
 from decode_indexer import c1a_index, score_reindex, select_pool_index_topk
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from sparse_attention import (
     gather_packed, attend_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE, attend_packed_cohorts,
 )
 from rmsnorm import rms_norm_tiled
-from o_proj import o_proj_hc_post
+from o_proj import o_proj
 
 
 # model config
@@ -151,10 +151,12 @@ def decode_c1a_reindex(
         )
         attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    o_proj_hc_post(
+    o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        attn_out, x_hc, post_mix, residual_mix, output, num_tokens,
+        attn_out, num_tokens,
     )
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output
 
 

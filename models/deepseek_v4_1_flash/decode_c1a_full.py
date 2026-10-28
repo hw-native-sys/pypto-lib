@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 from qkv_proj_rope import quantize_projection_input, q_proj_rope_retain, kv_proj_rope
-from o_proj import o_proj_hc_post
+from o_proj import o_proj
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, use_pretransposed_index_query, score_select_c1a_groups,
     make_fp4_publish, c1a_project_index_key, c1a_rotate_index_key,
@@ -19,7 +19,7 @@ from decode_indexer import (
 from sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
 )
-from hc import hc_pre
+from hc import hc_pre, hc_post
 from config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
@@ -195,10 +195,12 @@ def decode_c1a_full(
     )
     attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    o_proj_hc_post(
+    o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        attn_out, x_hc, post_mix, residual_mix, output, num_tokens,
+        attn_out, num_tokens,
     )
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output
 
 
@@ -485,7 +487,7 @@ def build_c1a_specs(
     import math
 
     TOKENS, PAGES, REQUESTS = tokens, pages, requests
-    from quant import pack_mx_b_scale
+    from quant import pack_fp8_nz, pack_mx_b_scale
 
     cache_pages = PAGES * REQUESTS if start_pos is not None else PAGES
     torch.manual_seed(seed)
@@ -501,6 +503,8 @@ def build_c1a_specs(
     }
     for name, (k, n) in shapes.items():
         values[name] = torch.randn(k, n).to(torch.float8_e4m3fn)
+        if name == "wo_b":
+            values[name] = pack_fp8_nz(values[name])
         exponent = round(127 - math.log2(k) / 2)
         weight_scale_codes = torch.full((k // 32, n), exponent, dtype=torch.uint8)
         values[name + "_scale"] = pack_mx_b_scale(weight_scale_codes).view(torch.float8_e8m0fnu)

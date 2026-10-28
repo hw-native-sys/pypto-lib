@@ -1287,7 +1287,7 @@ class ResidentPrefillWeights:
 
     def upload(self, runtime, rank: int, handles):
         """Upload one projection at a time into persistent named allocations."""
-        from quant import pack_mx_b_scale
+        from quant import pack_fp8_nz, pack_mx_b_scale
         from expert_routed import pack_mxfp4_weight_tiles
 
         if rank not in range(self.ranks):
@@ -1321,6 +1321,8 @@ class ResidentPrefillWeights:
                     logical_scale = logical_scale.reshape(k // 32, M.o_groups, M.o_lora_rank).permute(1, 0, 2)
                 else:
                     weight = weight.t()
+                if target in ("wo_a", "wo_b"):
+                    weight = pack_fp8_nz(weight)
                 copy(target, weight, slot, slots)
                 packed_scale = pack_mx_b_scale(logical_scale).view(torch.float8_e8m0fnu)
                 copy(target + "_scale", packed_scale, slot, slots)
