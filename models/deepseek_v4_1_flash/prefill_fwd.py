@@ -449,7 +449,7 @@ def l2_prefill_fwd(
     wo_b_scale: pl.Tensor[[N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
     c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
     c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
-    c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     compressor_norm_weight: pl.Tensor[[KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
     index_wk: pl.Tensor[[INDEX_SOURCE_COUNT * HEAD_DIM, INDEX_DIM], pl.BF16],
     index_norm_weight: pl.Tensor[[INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
@@ -1263,7 +1263,7 @@ class ResidentPrefillWeights:
                 self.entries.append(("c2a_compressor_" + projection, name, slot, len(c2a_sources), "transpose"))
         c1a_source = next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == 1)
         self.entries.extend((
-            ("c1a_compressor_wkv", f"layers.{c1a_source}.attn.compressor.wkv.weight", 0, 1, "transpose"),
+            ("c1a_compressor_wkv", f"layers.{c1a_source}.attn.compressor.wkv.weight", 0, 1, "bf16_nz"),
             ("final_norm_weight", "norm.weight", 0, 1, "plain"),
             ("lm_head_weight", "head.weight", 0, 1, "plain"),
         ))
@@ -1287,7 +1287,7 @@ class ResidentPrefillWeights:
 
     def upload(self, runtime, rank: int, handles):
         """Upload one projection at a time into persistent named allocations."""
-        from quant import pack_fp8_nz, pack_mx_b_scale
+        from quant import pack_bf16_nz, pack_fp8_nz, pack_mx_b_scale
         from expert_routed import pack_mxfp4_weight_tiles
 
         if rank not in range(self.ranks):
@@ -1338,10 +1338,12 @@ class ResidentPrefillWeights:
                     if target == "lm_head_weight" and not valid_head:
                         raise ValueError("the native LM head requires the released BF16 checkpoint matrix")
                     value = value.to(dtype)
-                    if kind == "transpose":
+                    if kind in ("transpose", "bf16_nz"):
                         value = value.t()
                     elif kind == "engram_gate":
                         value = value * checkpoint.tensor(name.replace("q_weight", "k_weight")).float()
+                if kind == "bf16_nz":
+                    value = pack_bf16_nz(value.reshape(shape[-2:]))
                 copy(target, value, slot, slots)
         for layer in range(M.num_hidden_layers):
             for projection in ("w1", "w2", "w3"):

@@ -93,7 +93,7 @@ def l2_decode_layer(
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
     compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
@@ -1025,11 +1025,13 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
 def make_decode_layer_golden_inputs(layer_id: int) -> dict:
     """Build a deterministic small Block fixture for one representative layer."""
     torch.manual_seed(17 + layer_id)
+    from quant import pack_bf16_nz
+
     attention = _attention_values()
     if layer_id >= 20:
         attention["compressed_lens"] = torch.tensor([1, 2], dtype=torch.int32)
         attention["compressed_slots"] = torch.tensor([0, 1], dtype=torch.int64)
-        attention["compressor_wkv"] = attention["compressor_wkv"].to(torch.bfloat16)
+        attention["compressor_wkv"] = pack_bf16_nz(attention["compressor_wkv"].to(torch.bfloat16))
     if layer_id in (3, 21):
         attention["compressed_indices"] = torch.tensor([[0, -1], [0, 1]], dtype=torch.int32)
 

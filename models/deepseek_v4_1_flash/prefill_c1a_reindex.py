@@ -277,7 +277,7 @@ def l2_prefill_c1a_reindex_sharded(
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
     index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],

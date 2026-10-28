@@ -107,6 +107,20 @@ def unpack_fp8_nz(weight: torch.Tensor) -> torch.Tensor:
     return blocked.movedim(-4, -2).contiguous().reshape(weight.shape)
 
 
+def pack_bf16_nz(weight: torch.Tensor) -> torch.Tensor:
+    """Pack BF16 [..., K, N] weights into NZ bytes with the same logical shape."""
+    *leading, k, n = weight.shape
+    blocked = weight.reshape(*leading, k // 16, 16, n // 16, 16)
+    return blocked.movedim(-2, -4).contiguous().reshape(weight.shape)
+
+
+def unpack_bf16_nz(weight: torch.Tensor) -> torch.Tensor:
+    """Restore NZ BF16 bytes to logical [..., K, N] weights."""
+    *leading, k, n = weight.shape
+    blocked = weight.reshape(*leading, n // 16, k // 16, 16, 16)
+    return blocked.movedim(-4, -2).contiguous().reshape(weight.shape)
+
+
 def pack_mx_b_scale(scale: torch.Tensor) -> torch.Tensor:
     """Pack logical ``[..., K/32, N]`` scales into the MX_B_NN physical order."""
     *leading, k_groups, output_dim = scale.shape

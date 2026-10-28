@@ -89,7 +89,7 @@ def decode_c1a_full(
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
     index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
@@ -133,7 +133,7 @@ def decode_c1a_full(
     )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    pc_tid = decode_c1a_compressor_project(x_norm, compressor_wkv, projected, num_tokens, x_ready)
+    projected, pc_tid = decode_c1a_compressor_project(x_norm, compressor_wkv, projected, num_tokens, x_ready)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     with pl.spmd((num_tokens + 7) // 8, name_hint="norm_cmp", deps=[pc_tid]) as nc_tid:
         norm_worker = pl.tile.get_block_idx()
@@ -234,7 +234,7 @@ def l2_decode_c1a_full(
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
     index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
@@ -481,7 +481,7 @@ def build_c1a_specs(
     import math
 
     TOKENS, PAGES, REQUESTS = tokens, pages, requests
-    from quant import pack_fp8_nz, pack_mx_b_scale
+    from quant import pack_bf16_nz, pack_fp8_nz, pack_mx_b_scale
 
     cache_pages = PAGES * REQUESTS if start_pos is not None else PAGES
     torch.manual_seed(seed)
@@ -556,7 +556,7 @@ def build_c1a_specs(
     if mode == "full":
         values["compressed_rope_cos"] = values["rope_cos"].clone()
         values["compressed_rope_sin"] = values["rope_sin"].clone()
-        values["compressor_wkv"] = (torch.randn(D, HEAD_DIM) / math.sqrt(D)).to(torch.bfloat16)
+        values["compressor_wkv"] = pack_bf16_nz((torch.randn(D, HEAD_DIM) / math.sqrt(D)).to(torch.bfloat16))
         values["compressor_norm_weight"] = torch.ones(HEAD_DIM, dtype=torch.bfloat16)
         values["index_wk"] = (torch.randn(HEAD_DIM, INDEX_DIM) / math.sqrt(HEAD_DIM)).to(torch.bfloat16)
         # Quiet published index keys.

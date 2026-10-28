@@ -8,8 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compression projections, rotary embedding, cache publication, and ratio-2 ring state."""
 
-from gemm import gemm_bf16_to_bf16_staged
-
 import pypto.language as pl
 import torch
 
@@ -17,6 +15,7 @@ from config import (
     FLASH as M, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN,
     T_DYN, COMPRESSED_CACHE_GROUP, CMP_BLOCKS_DYN,
 )
+from quant import unpack_bf16_nz
 from rmsnorm import golden_rms_norm
 
 
@@ -35,8 +34,9 @@ COMPRESSOR_K_TILE = 64
 COMPRESSOR_QUERY_TILE = 128
 # Limit Cube rounding before the compensated Vector accumulation.
 COMPRESSOR_SEGMENTS = D // COMPRESSOR_K_TILE
-COMPRESSOR_PROJ_N_TILE = 128
-COMPRESSOR_PROJ_K_TILE = 256
+C1A_PROJ_M_TILE = 48
+C1A_PROJ_N_TILE = 64
+C1A_PROJ_K_TILE = 512
 
 
 @pl.jit.inline
@@ -260,8 +260,8 @@ def golden_compressor_ratio1(
     wkv: torch.Tensor,
     norm_weight: torch.Tensor,
 ) -> torch.Tensor:
-    """Reference the ratio-1 compressor: projection followed by RMSNorm."""
-    projected = torch.matmul(x.float(), wkv.float()).to(x.dtype)
+    """Reference the ratio-1 NZ-weight projection followed by RMSNorm."""
+    projected = torch.matmul(x.float(), unpack_bf16_nz(wkv).float()).to(x.dtype)
     return golden_rms_norm(projected, norm_weight)
 
 
@@ -463,18 +463,15 @@ def compressor_ratio2(
 @pl.jit.inline(auto_scope=False)
 def prefill_c1a_compressor_project(
     source: pl.Tensor,
-    weight: pl.Tensor,
+    weight: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    ready = pl.system.task_dummy(deps=[])
-    result, completed = gemm_bf16_to_bf16_staged(
-        source, weight, output, num_tokens, ready,
-        width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
-        workers=2147483647, name_hint='prefill_bf16_projection_cube',
-        cast_name="bf16_projection_cast",
-    )
-    return result
+    blocks = (num_tokens + C1A_PROJ_M_TILE - 1) // C1A_PROJ_M_TILE * (HEAD_DIM // C1A_PROJ_N_TILE)
+    workers = pl.max(blocks, 1)
+    with pl.spmd(workers, name_hint="prefill_proj_cmp"):
+        output = _project_c1a_block(source, weight, output, num_tokens)
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -551,19 +548,45 @@ def publish_c2a_compressed(
 
 
 @pl.jit.inline(auto_scope=False)
+def _project_c1a_block(
+    source: pl.Tensor,
+    weight: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Project a full-height Cube tile and store only its active rows."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        block = pl.tile.get_block_idx()
+        row = block // (HEAD_DIM // C1A_PROJ_N_TILE) * C1A_PROJ_M_TILE
+        col = block % (HEAD_DIM // C1A_PROJ_N_TILE) * C1A_PROJ_N_TILE
+        rows = pl.max(pl.min(C1A_PROJ_M_TILE, num_tokens - row), 0)
+        a = pl.load(source, [row, 0], [C1A_PROJ_M_TILE, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+        b = pl.load(weight, [0, col], [C1A_PROJ_K_TILE, C1A_PROJ_N_TILE], target_memory=pl.Mem.Mat)
+        full_a = pl.set_validshape(a, C1A_PROJ_M_TILE, C1A_PROJ_K_TILE)
+        acc = pl.matmul(full_a, b)
+        for k in pl.pipeline(C1A_PROJ_K_TILE, D, C1A_PROJ_K_TILE, stage=2):
+            a = pl.load(source, [row, k], [C1A_PROJ_M_TILE, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+            b = pl.load(weight, [k, col], [C1A_PROJ_K_TILE, C1A_PROJ_N_TILE], target_memory=pl.Mem.Mat)
+            full_a = pl.set_validshape(a, C1A_PROJ_M_TILE, C1A_PROJ_K_TILE)
+            acc = pl.matmul_acc(acc, full_a, b)
+        value = pl.set_validshape(acc, rows, C1A_PROJ_N_TILE)
+        output = pl.store(value, [row, col], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
 def decode_c1a_compressor_project(
     source: pl.Tensor,
-    weight: pl.Tensor,
+    weight: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    result, completed = gemm_bf16_to_bf16_staged(
-        source, weight, output, num_tokens, ready,
-        width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
-        workers=8, name_hint='proj_cmp', cast_name='cast_cmp',
-    )
-    return completed
+    blocks = (num_tokens + C1A_PROJ_M_TILE - 1) // C1A_PROJ_M_TILE * (HEAD_DIM // C1A_PROJ_N_TILE)
+    workers = pl.max(blocks, 1)
+    with pl.spmd(workers, name_hint="proj_cmp", deps=[ready]) as completed:
+        output = _project_c1a_block(source, weight, output, num_tokens)
+    return output, completed
 
 
 @pl.jit.inline(auto_scope=False)
