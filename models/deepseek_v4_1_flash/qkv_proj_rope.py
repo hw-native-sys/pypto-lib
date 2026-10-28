@@ -37,6 +37,7 @@ Q_A_N_TILE = 64
 Q_B_N_TILE = 256
 KV_N_TILE = 64
 PROJ_M_TILE = 80
+ROPE_WORKER_TILE = 32
 
 
 @pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_a.cpp",
@@ -120,7 +121,8 @@ def _rope_inplace(
     name_hint: pl.constexpr,
 ):
     """Rotate M16 tails in one M80 row group in place."""
-    rope_workers = pl.min((PROJ_M_TILE // MX_M_TILE) * heads, 2 * pl.system.available_cluster_count())
+    rope_blocks = (PROJ_M_TILE // MX_M_TILE) * heads
+    rope_workers = pl.min(pl.min(rope_blocks, ROPE_WORKER_TILE), 2 * pl.system.available_cluster_count())
     for worker in pl.spmd(rope_workers, name_hint=name_hint):
         for block in pl.range(worker, (PROJ_M_TILE // MX_M_TILE) * heads, rope_workers):
             t0 = block // heads * MX_M_TILE

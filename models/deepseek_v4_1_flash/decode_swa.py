@@ -95,7 +95,7 @@ def decode_swa(
         kv_projection, kv,
         num_tokens,
     )
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=32)
+    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     swa_attention_partial(q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens)
     inv_rms, partials = hc_project(x_hc, hc_attn_fn)

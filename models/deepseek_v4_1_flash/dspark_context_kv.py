@@ -90,7 +90,7 @@ def dspark_context_kv(
         projected, rotated,
         num_tokens,
     )
-    publish_window_row(rotated, context_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
+    publish_window_row(rotated, context_slots, window_cache, window_cache_scale, num_tokens)
     return window_cache, window_cache_scale
 
 

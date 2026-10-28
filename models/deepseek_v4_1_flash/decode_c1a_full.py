@@ -14,7 +14,7 @@ from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from o_proj import o_proj
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, use_pretransposed_index_query, score_select_c1a_groups,
-    make_index_publish, c1a_project_index_key, c1a_rotate_index_key,
+    publish_index_rows, c1a_project_index_key, c1a_rotate_index_key,
 )
 from sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
@@ -43,9 +43,6 @@ MIX_HC = M.mix_hc
 INDEX_H = M.index_n_heads
 INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
-
-
-publish_index = make_index_publish(INDEX_DIM, 32, INDEX_BLOCKS_DYN, name_hint="pub_idx")
 
 
 @pl.jit.inline(auto_scope=False)
@@ -126,7 +123,7 @@ def decode_c1a_full(
         kv_projection, kv,
         num_tokens,
     )
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
+    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     projected, pc_tid = c1a_compressor_project(x_norm, compressor_wkv, projected, num_tokens, x_ready)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -143,13 +140,15 @@ def decode_c1a_full(
     ik_tid = c1a_rotate_index_key(
         normalized_key, compressed_rope_cos, compressed_rope_sin, index_key, num_tokens, nk_tid,
     )
-    index_ready = publish_index(
+    index_ready = publish_index_rows(
         index_key, compressed_slots, index_cache, index_cache_scale, num_tokens, x_ready, ik_tid,
     )
-    rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    rotated = compressor_rope(latent, compressed_rope_cos, compressed_rope_sin, rotated, num_tokens)
+    compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    compressed_rotated = compressor_rope(
+        latent, compressed_rope_cos, compressed_rope_sin, compressed_rotated, num_tokens,
+    )
     compressed_ready = c1a_compressor_publish(
-        rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens, x_ready,
+        compressed_rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens, x_ready,
     )
     # Logical index score capacity.
     score_width = pl.tensor.dim(index_block_table, 1) * 128

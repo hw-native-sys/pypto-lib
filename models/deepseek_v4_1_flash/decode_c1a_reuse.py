@@ -97,7 +97,7 @@ def decode_c1a_reuse(
         kv_projection, kv,
         num_tokens,
     )
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
+    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     if num_tokens <= 12:
         attend_packed_cohorts(

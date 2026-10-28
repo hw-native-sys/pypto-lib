@@ -54,9 +54,6 @@ from sparse_attention import (
 )
 from prefill_indexer import prefill_indexer, publish_c2a_index_key
 
-
-from compressor import compressor_rope
-
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
 LOCAL_O_GROUPS = M.o_groups // TP_SIZE
@@ -178,11 +175,9 @@ def prefill_c2a_full_attention(
         latent, index_wk, index_norm_weight, compressed_rope_cos, compressed_rope_sin,
         compressed_slots, index_cache, index_cache_scale, num_tokens, pool_tid, cache_ready,
     )
-    rotated_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    rotated_latent = compressor_rope(latent, compressed_rope_cos, compressed_rope_sin, rotated_latent, num_tokens)
     compressed_publish_tid = c2a_compressor_publish(
-        rotated_latent, compressed_slots, compressed_cache, compressed_cache_scale,
-        num_tokens, cache_ready,
+        latent, compressed_rope_cos, compressed_rope_sin, compressed_slots,
+        compressed_cache, compressed_cache_scale, num_tokens, cache_ready, pool_tid, max_workers=64,
     )
 
     select_tid = prefill_indexer(

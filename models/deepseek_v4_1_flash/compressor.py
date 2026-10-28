@@ -30,7 +30,6 @@ STATE_WIDTH = 2 * M.head_dim
 C1A_PROJ_M_TILE = 48
 C1A_PROJ_N_TILE = 64
 C1A_PROJ_K_TILE = 512
-C1A_PUBLISH_D_TILE = max(HEAD_DIM, 32 * COMPRESSED_CACHE_GROUP)
 C2A_PROJ_M_TILE = 80
 C2A_PROJ_N_TILE = 64
 C2A_PROJ_K_TILE = 256
@@ -45,20 +44,31 @@ def _compressor_rope_block(
     block: pl.Scalar[pl.INT32],
 ):
     t = block
-    base = 0
-    output[t : t + 1, base : base + (HEAD_DIM - ROPE_DIM)] = x[t : t + 1, base : base + (HEAD_DIM - ROPE_DIM)]
-    tail = pl.cast(x[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM], pl.FP32)
-    even = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-    odd = pl.gather(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-    c = cos[t : t + 1, :]
-    s = pl.mul(sin[t : t + 1, :], 1.0)
-    re = pl.sub(pl.mul(even, c), pl.mul(odd, s))
-    im = pl.add(pl.mul(even, s), pl.mul(odd, c))
-    rotated = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
-    rotated = pl.tensor.scatter(re, mask_pattern=pl.tile.MaskPattern.P0101, dst=rotated)
-    rotated = pl.tensor.scatter(im, mask_pattern=pl.tile.MaskPattern.P1010, dst=rotated)
-    rotated_bf16 = pl.cast(rotated, pl.BF16, mode="rint")
-    output[t : t + 1, base + (HEAD_DIM - ROPE_DIM) : base + HEAD_DIM] = rotated_bf16
+    row = pl.tile.load(x, [t, 0], [1, HEAD_DIM])
+    tail_bf16 = pl.tile.slice(row, [1, ROPE_DIM], [0, HEAD_DIM - ROPE_DIM])
+    tail = pl.cast(tail_bf16, pl.FP32)
+    even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+    odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+    c = pl.tile.load(cos, [t, 0], [1, ROPE_DIM // 2])
+    sine = pl.tile.load(sin, [t, 0], [1, ROPE_DIM // 2])
+    s = pl.mul(sine, 1.0)
+    even_cos = pl.mul(even, c)
+    odd_sin = pl.mul(odd, s)
+    re = pl.sub(even_cos, odd_sin)
+    even_sin = pl.mul(even, s)
+    odd_cos = pl.mul(odd, c)
+    im = pl.add(even_sin, odd_cos)
+    real_lanes = pl.tile.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
+    real_lanes = pl.tile.scatter_mask(real_lanes, re, mask_pattern=pl.tile.MaskPattern.P0101)
+    imag_lanes = pl.tile.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
+    imag_lanes = pl.tile.scatter_mask(imag_lanes, im, mask_pattern=pl.tile.MaskPattern.P1010)
+    real_bits = pl.reinterpret_view(real_lanes, pl.UINT32)
+    imag_bits = pl.reinterpret_view(imag_lanes, pl.UINT32)
+    rotated_bits = pl.or_(real_bits, imag_bits)
+    rotated = pl.reinterpret_view(rotated_bits, pl.FP32)
+    rounded = pl.cast(rotated, pl.BF16, mode="rint")
+    row = pl.tile.assemble(row, rounded, [0, HEAD_DIM - ROPE_DIM])
+    pl.tile.store(row, [block, 0], output)
     return output
 
 
@@ -71,7 +81,7 @@ def compressor_rope(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     blocks = num_tokens
-    workers = pl.min(blocks, 2147483647)
+    workers = pl.min(blocks, 12)
     with pl.spmd(workers, name_hint="rope_cmp"):
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, blocks, workers):
@@ -124,90 +134,61 @@ def c1a_compressor_publish(
     flat = pl.reshape(cache, [cache_rows, HEAD_DIM // 2])
     flat_scale = pl.reshape(scales, [cache_rows, HEAD_DIM // COMPRESSED_CACHE_GROUP])
     # Each physical cache page has one publishing worker.
-    workers = pl.min(num_tokens, 4)
+    workers = pl.min(num_tokens, 8)
     with pl.spmd(workers, name_hint="pub_cmp", deps=[cache_ready]) as published:
         worker = pl.tile.get_block_idx()
         for t in pl.range(num_tokens):
             slot = pl.read(slots, [t])
             if slot >= 0 and (slot // 128) % workers == worker:
                 physical = pl.cast(slot, pl.INDEX)
-                raw = pl.load(source, [t, 0], [1, C1A_PUBLISH_D_TILE], valid_shape=[1, HEAD_DIM])
-                raw = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 1, C1A_PUBLISH_D_TILE)
-                raw_fp32 = pl.cast(raw, pl.FP32)
-                values = pl.reshape(raw_fp32, [C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP])
-                temporary = pl.tile.create(
-                    [C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP],
-                    dtype=pl.FP32,
-                )
+                row = pl.tile.load(source, [t, 0], [1, HEAD_DIM])
+                values = pl.reshape(pl.cast(row, pl.FP32), [HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP])
+                temporary = pl.tile.create([HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP], dtype=pl.FP32)
                 amax = pl.row_max(pl.abs(values), tmp_tile=temporary)
                 factors_raw = pl.maximum(pl.mul(amax, 1.0 / 6.0), 0.001953125)
                 stored_scale = pl.cast(factors_raw, pl.BF16, mode="rint")
                 factors = pl.cast(stored_scale, pl.FP32)
                 normalized = pl.minimum(pl.maximum(pl.row_expand_div(values, factors), -6.0), 6.0)
                 magnitude = pl.abs(normalized)
-                rounded = pl.tile.full(
-                    [C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP],
-                    dtype=pl.FP32, value=0.0,
-                )
+                rounded = pl.tile.full([HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP], dtype=pl.FP32, value=0.0)
                 select_tmp = pl.tile.create([1, 16], dtype=pl.UINT32)
                 predicate = pl.tile.cmps(magnitude, 0.25, cmp_type=4)
-                level = pl.tile.full(
-                    [C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP],
-                    dtype=pl.FP32, value=0.5,
-                )
+                level = pl.tile.full([HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP], dtype=pl.FP32, value=0.5)
                 rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
                 predicate = pl.tile.cmps(magnitude, 0.75, cmp_type=5)
-                level = pl.tile.full(
-                    [C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP],
-                    dtype=pl.FP32, value=1.0,
-                )
+                level = pl.tile.full([HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP], dtype=pl.FP32, value=1.0)
                 rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
                 predicate = pl.tile.cmps(magnitude, 1.25, cmp_type=4)
-                level = pl.tile.full(
-                    [C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP],
-                    dtype=pl.FP32, value=1.5,
-                )
+                level = pl.tile.full([HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP], dtype=pl.FP32, value=1.5)
                 rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
                 predicate = pl.tile.cmps(magnitude, 1.75, cmp_type=5)
-                level = pl.tile.full(
-                    [C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP],
-                    dtype=pl.FP32, value=2.0,
-                )
+                level = pl.tile.full([HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP], dtype=pl.FP32, value=2.0)
                 rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
                 predicate = pl.tile.cmps(magnitude, 2.5, cmp_type=4)
-                level = pl.tile.full(
-                    [C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP],
-                    dtype=pl.FP32, value=3.0,
-                )
+                level = pl.tile.full([HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP], dtype=pl.FP32, value=3.0)
                 rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
                 predicate = pl.tile.cmps(magnitude, 3.5, cmp_type=5)
-                level = pl.tile.full(
-                    [C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP],
-                    dtype=pl.FP32, value=4.0,
-                )
+                level = pl.tile.full([HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP], dtype=pl.FP32, value=4.0)
                 rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
                 predicate = pl.tile.cmps(magnitude, 5.0, cmp_type=4)
-                level = pl.tile.full(
-                    [C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP],
-                    dtype=pl.FP32, value=6.0,
-                )
+                level = pl.tile.full([HEAD_DIM // COMPRESSED_CACHE_GROUP, COMPRESSED_CACHE_GROUP], dtype=pl.FP32, value=6.0)
                 rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
                 # Convert the exact RNE levels to E2M1 codes, then pack adjacent lanes.
-                codes_base = pl.minimum(pl.mul(rounded, 2.0), 4.0)
-                codes_extra = pl.minimum(pl.maximum(pl.sub(rounded, 2.0), 0.0), 3.0)
-                codes = pl.add(codes_base, codes_extra)
+                lower_codes = pl.minimum(pl.mul(rounded, 2.0), 4.0)
+                upper_codes = pl.minimum(pl.maximum(pl.sub(rounded, 2.0), 0.0), 3.0)
+                codes = pl.add(lower_codes, upper_codes)
                 sign = pl.ands(pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 28), 8)
-                codes = pl.reshape(pl.or_(pl.cast(codes, pl.INT32), sign), [1, C1A_PUBLISH_D_TILE])
+                codes = pl.reshape(pl.or_(pl.cast(codes, pl.INT32), sign), [1, HEAD_DIM])
                 low = pl.tile.gather_mask(codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32)
                 high = pl.tile.gather_mask(codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                 packed = pl.add(low, pl.mul(high, 16))
                 signed_bytes = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
                 payload_bytes = pl.reinterpret_view(pl.cast(signed_bytes, pl.INT8), pl.UINT8)
                 payload = pl.set_validshape(payload_bytes, 1, HEAD_DIM // 2)
-                scale_row = pl.reshape(stored_scale, [1, C1A_PUBLISH_D_TILE // COMPRESSED_CACHE_GROUP])
+                scale_row = pl.reshape(stored_scale, [1, HEAD_DIM // COMPRESSED_CACHE_GROUP])
                 encoded = pl.set_validshape(scale_row, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP)
-                pl.store(payload, [physical, 0], flat)
-                pl.store(encoded, [physical, 0], flat_scale)
+                pl.tile.store(payload, [physical, 0], flat)
+                pl.tile.store(encoded, [physical, 0], flat_scale)
     return published
 
 
@@ -401,64 +382,95 @@ def c2a_compressor_pool_state(
     return pool_tid, state_tid
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def c2a_compressor_publish(
     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    cos: pl.Tensor,
+    sin: pl.Tensor,
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, (HEAD_DIM // 2)], pl.UINT8],
     scales: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, (HEAD_DIM // 16)], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
+    source_ready: pl.Scalar[pl.TASK_ID],
+    max_workers: pl.constexpr,
 ):
-    """Publish rotated compressed KV rows as packed E2M1 with group-16 BF16 scales."""
+    """Rotate and publish compressed rows with one worker per physical page."""
     blocks = pl.tensor.dim(cache, 0)
     cache_rows = blocks * 128
     flat = pl.reshape(cache, [cache_rows, (HEAD_DIM // 2)])
     scale_flat = pl.reshape(scales, [cache_rows, (HEAD_DIM // 16)])
-    with pl.spmd(num_tokens, name_hint="pub_cmp", deps=[cache_ready]) as publish_tid:
-        t = pl.tile.get_block_idx()
-        slot_i64 = pl.read(slots, [t])
-        if slot_i64 >= 0:
-            slot = pl.cast(slot_i64, pl.INDEX)
-            source = pl.slice(latent, [1, HEAD_DIM * 2], [t, 0], valid_shape=[1, HEAD_DIM])
-            source = pl.set_validshape(pl.fillpad(source, pad_value=pl.PadValue.zero), 1, HEAD_DIM * 2)
-            groups = pl.reshape(pl.cast(source, pl.FP32), [HEAD_DIM * 2 // 16, 16])
-            amax = pl.row_max(pl.abs(groups))
-            stored = pl.cast(pl.maximum(pl.mul(amax, (1.0 / 6.0)), (2.0**-9)), pl.BF16, mode="rint")
-            scale = pl.cast(stored, pl.FP32)
-            scaled = pl.row_expand_div(groups, scale)
-            clamped = pl.maximum(scaled, -6.0)
-            normalized = pl.minimum(clamped, 6.0)
-            magnitude = pl.abs(normalized)
-            # Nearest E2M1 magnitude, with exact midpoints rounded toward zero.
-            delta0 = pl.reinterpret_view(pl.sub(magnitude, 0.25), pl.INT32)
-            step0 = pl.shrs(pl.sub(delta0, 1), 31)
-            delta1 = pl.reinterpret_view(pl.sub(magnitude, 0.75), pl.INT32)
-            step1 = pl.shrs(pl.sub(delta1, 1), 31)
-            delta2 = pl.reinterpret_view(pl.sub(magnitude, 1.25), pl.INT32)
-            step2 = pl.shrs(pl.sub(delta2, 1), 31)
-            delta3 = pl.reinterpret_view(pl.sub(magnitude, 1.75), pl.INT32)
-            step3 = pl.shrs(pl.sub(delta3, 1), 31)
-            delta4 = pl.reinterpret_view(pl.sub(magnitude, 2.5), pl.INT32)
-            step4 = pl.shrs(pl.sub(delta4, 1), 31)
-            delta5 = pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32)
-            step5 = pl.shrs(pl.sub(delta5, 1), 31)
-            delta6 = pl.reinterpret_view(pl.sub(magnitude, 5.0), pl.INT32)
-            step6 = pl.shrs(pl.sub(delta6, 1), 31)
-            lower = pl.add(pl.add(step0, step1), pl.add(step2, step3))
-            upper = pl.add(pl.add(step4, step5), pl.add(step6, 7))
-            index = pl.add(lower, upper)
-            sign = pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 31)
-            codes = pl.reshape(pl.sub(index, pl.mul(sign, 8)), [1, HEAD_DIM * 2])
-            low = pl.gather(codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32)
-            high = pl.gather(codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            packed = pl.add(low, pl.mul(high, 16))
-            signed = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
-            signed_bytes = pl.cast(signed, pl.INT8)
-            payload_bytes = pl.reinterpret_view(signed_bytes, pl.UINT8)
-            flat[slot : slot + 1, :] = pl.set_validshape(payload_bytes, 1, HEAD_DIM // 2)
-            scale_row = pl.reshape(stored, [1, HEAD_DIM * 2 // 16])
-            scale_flat[slot : slot + 1, :] = pl.set_validshape(scale_row, 1, HEAD_DIM // 16)
+    workers = pl.min(num_tokens, max_workers)
+    with pl.spmd(workers, name_hint="rope_pub_cmp", deps=[cache_ready, source_ready]) as publish_tid:
+        worker = pl.tile.get_block_idx()
+        for t in pl.range(num_tokens):
+            slot_i64 = pl.read(slots, [t])
+            if slot_i64 >= 0 and (slot_i64 // 128) % workers == worker:
+                slot = pl.cast(slot_i64, pl.INDEX)
+                row = pl.tile.load(latent, [t, 0], [1, HEAD_DIM])
+                tail_bf16 = pl.tile.slice(row, [1, ROPE_DIM], [0, HEAD_DIM - ROPE_DIM])
+                tail = pl.cast(tail_bf16, pl.FP32)
+                even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
+                odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
+                c = pl.tile.load(cos, [t, 0], [1, ROPE_DIM // 2])
+                sine = pl.tile.load(sin, [t, 0], [1, ROPE_DIM // 2])
+                s = pl.mul(sine, 1.0)
+                even_cos = pl.mul(even, c)
+                odd_sin = pl.mul(odd, s)
+                re = pl.sub(even_cos, odd_sin)
+                even_sin = pl.mul(even, s)
+                odd_cos = pl.mul(odd, c)
+                im = pl.add(even_sin, odd_cos)
+                real_lanes = pl.tile.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
+                real_lanes = pl.tile.scatter_mask(real_lanes, re, mask_pattern=pl.tile.MaskPattern.P0101)
+                imag_lanes = pl.tile.full([1, ROPE_DIM], dtype=pl.FP32, value=0.0)
+                imag_lanes = pl.tile.scatter_mask(imag_lanes, im, mask_pattern=pl.tile.MaskPattern.P1010)
+                real_bits = pl.reinterpret_view(real_lanes, pl.UINT32)
+                imag_bits = pl.reinterpret_view(imag_lanes, pl.UINT32)
+                rotated_bits = pl.or_(real_bits, imag_bits)
+                rotated = pl.reinterpret_view(rotated_bits, pl.FP32)
+                rounded = pl.cast(rotated, pl.BF16, mode="rint")
+                row = pl.tile.assemble(row, rounded, [0, HEAD_DIM - ROPE_DIM])
+                source = pl.tile.full([1, HEAD_DIM * 2], dtype=pl.BF16, value=0.0)
+                source = pl.tile.assemble(source, row, [0, 0])
+                groups = pl.reshape(pl.cast(source, pl.FP32), [HEAD_DIM * 2 // 16, 16])
+                scratch = pl.tile.create([HEAD_DIM * 2 // 16, 16], dtype=pl.FP32)
+                amax = pl.tile.row_max(pl.abs(groups), tmp_tile=scratch)
+                stored = pl.cast(pl.maximum(pl.mul(amax, (1.0 / 6.0)), (2.0**-9)), pl.BF16, mode="rint")
+                scale = pl.cast(stored, pl.FP32)
+                scaled = pl.row_expand_div(groups, scale)
+                clamped = pl.maximum(scaled, -6.0)
+                normalized = pl.minimum(clamped, 6.0)
+                magnitude = pl.abs(normalized)
+                # Nearest E2M1 magnitude, with exact midpoints rounded toward zero.
+                delta0 = pl.reinterpret_view(pl.sub(magnitude, 0.25), pl.INT32)
+                step0 = pl.shrs(pl.sub(delta0, 1), 31)
+                delta1 = pl.reinterpret_view(pl.sub(magnitude, 0.75), pl.INT32)
+                step1 = pl.shrs(pl.sub(delta1, 1), 31)
+                delta2 = pl.reinterpret_view(pl.sub(magnitude, 1.25), pl.INT32)
+                step2 = pl.shrs(pl.sub(delta2, 1), 31)
+                delta3 = pl.reinterpret_view(pl.sub(magnitude, 1.75), pl.INT32)
+                step3 = pl.shrs(pl.sub(delta3, 1), 31)
+                delta4 = pl.reinterpret_view(pl.sub(magnitude, 2.5), pl.INT32)
+                step4 = pl.shrs(pl.sub(delta4, 1), 31)
+                delta5 = pl.reinterpret_view(pl.sub(magnitude, 3.5), pl.INT32)
+                step5 = pl.shrs(pl.sub(delta5, 1), 31)
+                delta6 = pl.reinterpret_view(pl.sub(magnitude, 5.0), pl.INT32)
+                step6 = pl.shrs(pl.sub(delta6, 1), 31)
+                lower = pl.add(pl.add(step0, step1), pl.add(step2, step3))
+                upper = pl.add(pl.add(step4, step5), pl.add(step6, 7))
+                index = pl.add(lower, upper)
+                sign = pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 31)
+                codes = pl.reshape(pl.sub(index, pl.mul(sign, 8)), [1, HEAD_DIM * 2])
+                low = pl.tile.gather_mask(codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32)
+                high = pl.tile.gather_mask(codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                packed = pl.add(low, pl.mul(high, 16))
+                signed = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
+                signed_bytes = pl.cast(signed, pl.INT8)
+                payload_bytes = pl.reinterpret_view(signed_bytes, pl.UINT8)
+                pl.tile.store(pl.set_validshape(payload_bytes, 1, HEAD_DIM // 2), [slot, 0], flat)
+                scale_row = pl.reshape(stored, [1, HEAD_DIM * 2 // 16])
+                pl.tile.store(pl.set_validshape(scale_row, 1, HEAD_DIM // 16), [slot, 0], scale_flat)
     return publish_tid
 
 
