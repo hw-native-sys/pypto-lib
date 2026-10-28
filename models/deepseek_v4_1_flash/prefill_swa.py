@@ -216,6 +216,7 @@ def prefill_swa(
     hc_pre(
         x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         collapsed, next_pre_mix, post_mix, residual_mix,
+        hf32=False,
     )
     norm_tokens = pl.tensor.dim(collapsed, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):

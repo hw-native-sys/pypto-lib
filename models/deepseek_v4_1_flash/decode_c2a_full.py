@@ -111,6 +111,7 @@ def decode_c2a_full(
     hc_pre(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         x_attn, next_pre_mix, post_mix, residual_mix,
+        hf32=True,
     )
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd((tokens + 7) // 8, name_hint="norm_in") as cache_ready:
@@ -381,6 +382,7 @@ def golden_c2a(tensors, mode="full"):
         x_hc = t["x_hc"]
         next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
             x_hc, t["hc_attn_fn"], t["hc_attn_scale"], t["hc_attn_base"],
+            hf32=True,
         )
         attention_input = golden_hc_collapse(x_hc, t["pre_mix"]).to(torch.bfloat16)
         x = golden_rms_norm(attention_input, t["attn_norm_weight"])
