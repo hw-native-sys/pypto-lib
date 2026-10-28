@@ -288,7 +288,10 @@ def q_proj_rope(
                 qb_payload_tile, qb_scales_tile, q_rows, 5,
             )
         group_tokens = pl.cast(group_rows, pl.INT32)
-        with pl.spmd(pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE), name_hint="proj_q_b", sync_start=True):
+        qb_workers = pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE)
+        qb_workers = pl.min(qb_workers, pl.system.available_cluster_count())
+        qb_workers = pl.max(1, qb_workers)
+        with pl.spmd(qb_workers, name_hint="proj_q_b", sync_start=True):
             query = _proj_q_b(
                 qb_payload_group, wq_b, qb_scales_group, wq_b_scale,
                 query, group_rows, LOCAL_H * HEAD_DIM, group_start,

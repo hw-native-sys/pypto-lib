@@ -191,7 +191,9 @@ def o_proj(
                     scales_all = pl.store(packed_flat, [quant_group, scale_offset], scales_all)
         # O-A projection.
         projected = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.BF16)
-        with pl.spmd(LOCAL_O_GROUPS * (O_LORA // O_A_N_TILE), name_hint="proj_o_a", sync_start=True):
+        oa_workers = pl.min(LOCAL_O_GROUPS * (O_LORA // O_A_N_TILE), pl.system.available_cluster_count())
+        oa_workers = pl.max(1, oa_workers)
+        with pl.spmd(oa_workers, name_hint="proj_o_a", sync_start=True):
             projected = _o_proj_a(payload_all, wo_a, scales_all, wo_a_scale, projected, LOCAL_O_WIDTH)
         # Quantize the O-A result for O-B.
         payload = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)

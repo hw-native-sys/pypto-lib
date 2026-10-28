@@ -12,12 +12,14 @@
 using namespace mxfp8_projection;
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    int block = get_block_idx(args);
-    int group = block / 4;
-    project<4096, 1024>(
-        data<F>(args, 0) + group * 80 * 4096,
-        data<F>(args, 1) + group * 4096 * 1024,
-        data<S>(args, 2) + group * 80 * 128,
-        data<S>(args, 3) + group * 128 * 1024,
-        data<bfloat16_t>(args, 4) + group * 1024, 80, args[5], block % 4 * 256);
+    int workers = get_block_num(args);
+    for (int tile = get_block_idx(args); tile < args[5] / 256; tile += workers) {
+        int group = tile / 4;
+        project<4096, 1024>(
+            data<F>(args, 0) + group * 80 * 4096,
+            data<F>(args, 1) + group * 4096 * 1024,
+            data<S>(args, 2) + group * 80 * 128,
+            data<S>(args, 3) + group * 128 * 1024,
+            data<bfloat16_t>(args, 4) + group * 1024, 80, args[5], tile % 4 * 256);
+    }
 }
