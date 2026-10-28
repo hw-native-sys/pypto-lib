@@ -56,7 +56,7 @@ def hc_sinkhorn(
     post_mix: pl.Tensor,
     residual_mix: pl.Tensor,
 ):
-    """Normalize two independent HC matrices in the diagonal blocks of one 8x8 tile."""
+    """Prepare only the two owned rows and normalize their independent HC matrices."""
     tokens = pl.tensor.dim(pre_mix, 0)
     linear_tokens = pl.tensor.dim(inv_rms, 0)
     base_row = pl.reshape(base, [1, MIX_HC])
@@ -71,16 +71,24 @@ def hc_sinkhorn(
         valid_rows = pl.min(SINKHORN_T_TILE, tokens - t0)
         load_t0 = t0 // SINKHORN_LOAD_T_TILE * SINKHORN_LOAD_T_TILE
         local_t0 = t0 - load_t0
-        total = pl.tile.full([SINKHORN_LOAD_T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
+        total = pl.tile.full([SINKHORN_T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
         for split in pl.unroll(LINEAR_OK):
-            offset = split * linear_tokens + load_t0
-            part = pl.load(partials, [offset, 0], [SINKHORN_LOAD_T_TILE, MIX_PAD])
+            offset = split * linear_tokens + t0
+            part = pl.load(partials, [offset, 0], [SINKHORN_T_TILE, MIX_PAD])
             total = pl.add(total, part)
-        inverse = pl.load(inv_rms, [load_t0, 0], [SINKHORN_LOAD_T_TILE, 1])
-        normalized = pl.row_expand_mul(total, inverse)
+        inverse_group = pl.load(inv_rms, [load_t0, 0], [SINKHORN_LOAD_T_TILE, 1])
+        inverse0 = pl.tile.read(inverse_group, [local_t0, 0])
+        inverse1 = pl.tile.read(inverse_group, [local_t0 + 1, 0])
+        row0 = pl.tile.slice(total, [1, MIX_PAD], [0, 0])
+        row1 = pl.tile.slice(total, [1, MIX_PAD], [1, 0])
+        normalized0 = pl.mul(row0, inverse0)
+        normalized1 = pl.mul(row1, inverse1)
+        normalized = pl.create_tile([SINKHORN_T_TILE, MIX_PAD], dtype=pl.FP32)
+        normalized = pl.tile.assemble(normalized, normalized0, [0, 0])
+        normalized = pl.tile.assemble(normalized, normalized1, [1, 0])
         bias = pl.load(base_row, [0, 0], [1, MIX_PAD], valid_shape=[1, MIX_HC])
         bias = pl.fillpad(bias, pad_value=pl.PadValue.zero)
-        pre_raw = pl.slice(normalized, [SINKHORN_LOAD_T_TILE, HC_PAD], [0, 0])
+        pre_raw = pl.slice(normalized, [SINKHORN_T_TILE, HC_PAD], [0, 0])
         pre_bias = pl.slice(bias, [1, HC_PAD], [0, 0])
         pre_scaled = pl.mul(pre_raw, scale0)
         pre_logits = pl.col_expand_add(pre_scaled, pre_bias)
@@ -89,11 +97,11 @@ def hc_sinkhorn(
         pre_denominator = pl.add(pre_exp, 1.0)
         pre = pl.recip(pre_denominator)
         pre = pl.add(pre, HC_EPS)
-        pre = pl.slice(pre, [SINKHORN_T_TILE, HC_PAD], [local_t0, 0])
+        pre = pl.slice(pre, [SINKHORN_T_TILE, HC_PAD], [0, 0])
         pre = pl.mul(pre, 1.0)
         pre = pl.set_validshape(pre, valid_rows, HC_MULT)
         pl.store(pre, [t0, 0], pre_mix)
-        post_raw = pl.slice(normalized, [SINKHORN_LOAD_T_TILE, HC_PAD], [0, HC_MULT])
+        post_raw = pl.slice(normalized, [SINKHORN_T_TILE, HC_PAD], [0, HC_MULT])
         post_bias = pl.slice(bias, [1, HC_PAD], [0, HC_MULT])
         post_scaled = pl.mul(post_raw, scale1)
         post_logits = pl.col_expand_add(post_scaled, post_bias)
@@ -102,13 +110,13 @@ def hc_sinkhorn(
         post_denominator = pl.add(post_exp, 1.0)
         post = pl.recip(post_denominator)
         post = pl.mul(post, 2.0)
-        post = pl.slice(post, [SINKHORN_T_TILE, HC_PAD], [local_t0, 0])
+        post = pl.slice(post, [SINKHORN_T_TILE, HC_PAD], [0, 0])
         post = pl.mul(post, 1.0)
         post = pl.set_validshape(post, valid_rows, HC_MULT)
         pl.store(post, [t0, 0], post_mix)
         comb_scaled = pl.mul(normalized, scale2)
         comb_logits = pl.col_expand_add(comb_scaled, bias)
-        comb_logits = pl.slice(comb_logits, [SINKHORN_T_TILE, MIX_PAD], [local_t0, 0])
+        comb_logits = pl.slice(comb_logits, [SINKHORN_T_TILE, MIX_PAD], [0, 0])
         comb_logits = pl.mul(comb_logits, 1.0)
         comb_logits = pl.set_validshape(comb_logits, valid_rows, MIX_HC)
         comb_logits = pl.fillpad(comb_logits, pad_value=pl.PadValue.zero)
