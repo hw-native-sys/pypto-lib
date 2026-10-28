@@ -418,6 +418,7 @@ def prefill_moe(
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
+    hf32: pl.constexpr = False,
 ) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
     """Run delayed mHC pre-mix, MoE, and residual expansion."""
     t = MOE_TOKENS
@@ -426,6 +427,7 @@ def prefill_moe(
     mixes_ready = hc_pre(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         x_mixed, next_pre_mix, post_mix, residual_mix,
+        hf32=hf32,
     )
     ffn_input = pl.create_tensor([t, D], dtype=pl.BF16)
     norm_tokens = pl.tensor.dim(x_mixed, 0)
@@ -562,6 +564,7 @@ def l2_prefill_moe(
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         arrived, data_arrived, routed_output, combine_arrived,
         local_num_tokens, ep_rank, moe_epoch,
+        hf32=False,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_next
@@ -740,6 +743,7 @@ def prefill_moe_sublayer(
     hc_pre(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         ffn_input, next_pre_mix, post_mix, residual_mix,
+        hf32=False,
     )
     # Compact interleaved TP owner rows for the EP local-token ABI.
     local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)

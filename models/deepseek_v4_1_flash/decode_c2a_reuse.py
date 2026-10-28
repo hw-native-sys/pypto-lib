@@ -107,7 +107,7 @@ def decode_c2a_reuse(
         gather_name="c2a_gather", attn_name="c2a_sparse_attn",
     )
 
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     o_proj_hc_post(

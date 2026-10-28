@@ -398,6 +398,7 @@ def _prefill_moe(
                 round_next, round_mixed, round_output,
                 recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
                 routed_output, combine_arrived, active, ep_rank, epoch,
+                hf32=False,
             )
             with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
                 worker = pl.tile.get_block_idx()
@@ -675,6 +676,7 @@ def l2_prefill_fwd(
             hc_pre(
                 hidden, delayed_pre, layer_attn_fn, layer_attn_scale, layer_attn_base,
                 collapsed, attn_pre, attn_post, attn_residual,
+                hf32=False,
             )
             norm_tokens = pl.tensor.dim(collapsed, 0)
             for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):

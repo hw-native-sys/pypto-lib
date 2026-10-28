@@ -172,7 +172,7 @@ def hc_sinkhorn(
 
 
 @pl.jit.inline
-def hc_project(x_hc: pl.Tensor, function: pl.Tensor):
+def hc_project(x_hc: pl.Tensor, function: pl.Tensor, hf32: pl.constexpr = False):
     """Compute the inverse RMS and split-K coefficient projection."""
     t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
@@ -218,7 +218,13 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor):
                 [0, k0],
                 valid_shape=[MIX_HC, LINEAR_K_TILE],
             )
-            acc = pl.matmul_acc(acc, linear_x_tile, w_tile, b_trans=True, init_cond=(kb == 0))
+            if hf32:
+                acc = pl.matmul_acc(
+                    acc, linear_x_tile, w_tile,
+                    b_trans=True, init_cond=(kb == 0), tf32_mode="round_away",
+                )
+            else:
+                acc = pl.matmul_acc(acc, linear_x_tile, w_tile, b_trans=True, init_cond=(kb == 0))
         partial = split * t_linear + t0
         mixes_partials[partial : partial + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
@@ -335,9 +341,10 @@ def hc_pre(
     next_pre_mix: pl.Tensor,
     post_mix: pl.Tensor,
     residual_mix: pl.Tensor,
+    hf32: pl.constexpr = False,
 ):
     """Generate delayed HC coefficients and collapse the incoming streams."""
-    inv_rms, partials = hc_project(x_hc, function)
+    inv_rms, partials = hc_project(x_hc, function, hf32=hf32)
     mixes_ready = hc_sinkhorn(inv_rms, partials, scale, base, next_pre_mix, post_mix, residual_mix)
     hc_head(x_hc, incoming_pre_mix, output)
     return mixes_ready
@@ -464,17 +471,27 @@ def prefill_sp_post(
     return output, next_pre_mix
 
 
+def _round_hf32(value: torch.Tensor) -> torch.Tensor:
+    """Round FP32 inputs to ten fraction bits, with ties away from zero."""
+    bits = value.contiguous().view(torch.int32)
+    rounded = ((bits + 4096) & -8192).view(torch.float32)
+    return torch.where(torch.isfinite(value), rounded, value)
+
+
 def golden_mhc_mixes(
     x_hc: torch.Tensor,
     function: torch.Tensor,
     scale: torch.Tensor,
     base: torch.Tensor,
     iterations: int = M.hc_sinkhorn_iters,
+    hf32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project one HC stream into pre, post, and doubly-stochastic residual mixes."""
     flat = x_hc.flatten(-2).float()
     inverse_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + M.rms_norm_eps)
-    mixes = F.linear(flat, function.float()) * inverse_rms
+    projection_input = _round_hf32(flat) if hf32 else flat
+    projection_weight = _round_hf32(function.float()) if hf32 else function.float()
+    mixes = F.linear(projection_input, projection_weight) * inverse_rms
     hc = M.hc_mult
     pre_raw, post_raw, residual_raw = mixes.split((hc, hc, hc * hc), dim=-1)
     pre = torch.sigmoid(pre_raw * scale[0] + base[:hc]) + M.hc_eps
@@ -509,10 +526,11 @@ def golden_hc_post(
     return update.float() + skip.float()
 
 
-def golden_l2_hc_pre(tensors):
+def golden_l2_hc_pre(tensors, hf32: bool = True):
     """Compute the four outputs with the incoming mix independent of the next mix."""
     pre_mix, post_mix, residual_mix = golden_mhc_mixes(
         tensors["x_hc"], tensors["function"], tensors["scale"], tensors["base"],
+        hf32=hf32,
     )
     tensors["pre_mix"][:] = pre_mix
     tensors["post_mix"][:] = post_mix
@@ -554,27 +572,37 @@ def make_hc_inputs(tokens, seed, case):
     return values
 
 
-@pl.jit
-def l2_hc_pre(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    function: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    scale: pl.Tensor[[3], pl.FP32],
-    base: pl.Tensor[[MIX_HC], pl.FP32],
-    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
-    post_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
-    residual_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32]],
-):
-    """Validate the shared HcPre computation."""
-    x_hc.bind_dynamic(0, T_DYN)
-    incoming_pre_mix.bind_dynamic(0, T_DYN)
-    output.bind_dynamic(0, T_DYN)
-    pre_mix.bind_dynamic(0, T_DYN)
-    post_mix.bind_dynamic(0, T_DYN)
-    residual_mix.bind_dynamic(0, T_DYN)
-    hc_pre(x_hc, incoming_pre_mix, function, scale, base, output, pre_mix, post_mix, residual_mix)
-    return output
+def make_l2_hc_pre(hf32: bool):
+    """Specialize standalone HC-pre validation for decode or prefill precision."""
+    @pl.jit
+    def l2_hc_pre(
+        x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+        incoming_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+        function: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+        scale: pl.Tensor[[3], pl.FP32],
+        base: pl.Tensor[[MIX_HC], pl.FP32],
+        output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+        pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+        post_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+        residual_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32]],
+    ):
+        """Validate the shared HcPre computation."""
+        x_hc.bind_dynamic(0, T_DYN)
+        incoming_pre_mix.bind_dynamic(0, T_DYN)
+        output.bind_dynamic(0, T_DYN)
+        pre_mix.bind_dynamic(0, T_DYN)
+        post_mix.bind_dynamic(0, T_DYN)
+        residual_mix.bind_dynamic(0, T_DYN)
+        hc_pre(
+            x_hc, incoming_pre_mix, function, scale, base, output, pre_mix, post_mix, residual_mix,
+            hf32=hf32,
+        )
+        return output
+
+    return l2_hc_pre
+
+
+l2_hc_pre = make_l2_hc_pre(hf32=True)
 
 
 def build_l2_hc_pre_specs(batch: int = 33, sequence: int = 1):
@@ -700,6 +728,7 @@ def build_l2_hc_head_specs(batch: int = 33, sequence: int = 1):
 
 if __name__ == "__main__":
     import argparse
+    from functools import partial
 
     from golden import ratio_allclose, run
 
@@ -710,6 +739,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=33)
     parser.add_argument("--sequence", type=int, default=1)
     parser.add_argument("--op", choices=["pre", "post", "head", "all"], default="all")
+    parser.add_argument("--pre-precision", choices=["fp32", "hf32", "both"], default="both")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--golden-data")
@@ -718,17 +748,23 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.op == "all" and (args.golden_data or args.runtime_dir):
         parser.error("replay requires selecting one --op")
+    if args.op == "pre" and args.pre_precision == "both" and (args.golden_data or args.runtime_dir):
+        parser.error("HC-pre replay requires selecting one --pre-precision")
     cases = [
-        ("pre", l2_hc_pre, build_l2_hc_pre_specs, golden_l2_hc_pre),
         ("post", l2_hc_post, build_l2_hc_post_specs, golden_l2_hc_post),
         ("head", l2_hc_head, build_l2_hc_head_specs, golden_l2_hc_head),
     ]
+    cases = [case for case in cases if args.op in ("all", case[0])]
+    if args.op in ("all", "pre"):
+        for precision in ("fp32", "hf32"):
+            if args.pre_precision in ("both", precision):
+                hf32 = precision == "hf32"
+                cases.append((f"pre-{precision}", make_l2_hc_pre(hf32), build_l2_hc_pre_specs,
+                              partial(golden_l2_hc_pre, hf32=hf32)))
     failures = []
     for name, fn, build_specs, golden_fn in cases:
-        if args.op != "all" and args.op != name:
-            continue
         print(f"[HC] {name}", flush=True)
-        if name == "pre":
+        if name.startswith("pre-"):
             compare_fn = {
                 "pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
                 "post_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
