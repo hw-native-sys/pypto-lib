@@ -18,7 +18,6 @@ from config import (
 from compressor import (
     c2a_compressor_publish, STATE_WIDTH, c2a_compressor_project, c2a_compressor_pool_state, compressor_rope,
 )
-from quant import pack_bf16_nz
 from hc import hc_pre, hc_post
 from rmsnorm import rms_norm_tiled
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
@@ -95,11 +94,11 @@ def decode_c2a_full(
     state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     next_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
@@ -122,7 +121,7 @@ def decode_c2a_full(
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
-    q_proj_rope(
+    qr, query, qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
@@ -149,7 +148,7 @@ def decode_c2a_full(
     )
 
     select_tid = decode_c2a_indexer(
-        x_norm, qr, latent, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
+        x_norm, qb_payload, qb_scales, latent, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
         index_weights_proj, rope_cos, rope_sin, compressed_rope_cos, compressed_rope_sin,
         compressed_slots, index_cache, index_cache_scale, index_block_table, token_to_req_indices,
         compressed_lens, topk_indices, num_tokens, cache_ready, pool_tid,
@@ -226,11 +225,11 @@ def l2_decode_c2a_full(
     state_cache: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
     output: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
@@ -376,7 +375,7 @@ def golden_c2a(tensors, mode="full"):
     from sparse_attention import golden_selected_attention
     from o_proj import golden_o_proj
     from functools import partial
-    from quant import quantize_mxfp8_cache, quantize_mxfp4_cache, dequantize_mxfp4_cache
+    from quant import quantize_mxfp8_cache, quantize_mxfp4_cache, dequantize_mxfp4_cache, unpack_bf16_nz
     from utils import _publish_quantized_cache
 
     t = dict(tensors)
@@ -421,7 +420,7 @@ def golden_c2a(tensors, mode="full"):
         )
 
         # Publish RNE E2M1 index keys with group-32 E8M0 scales.
-        index_projection = latent.float() @ t["index_wk"].float()
+        index_projection = latent.float() @ unpack_bf16_nz(t["index_wk"]).float()
         index_projection = index_projection.to(torch.bfloat16)
         index_key = golden_rms_norm(index_projection, t["index_norm_weight"])
         index_key = golden_rope_tail(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
@@ -488,7 +487,7 @@ def build_c2a_specs(
     from config import MAX_BATCH_PER_DP, BLOCK_SIZE
     from utils import packed_query_lengths, paged_slots, window_metadata
     from quant import (
-        pack_fp8_nz,
+        pack_bf16_nz, pack_fp8_nz,
         quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache,
         quantize_mxfp8_upward_reference, pack_mx_b_scale,
     )
@@ -554,7 +553,7 @@ def build_c2a_specs(
         weight = torch.randn(n, k, generator=gen) / math.sqrt(k)
         payload, codes = quantize_mxfp8_upward_reference(weight)
         weights[name] = payload.T.contiguous()
-        if name in ("wq_a", "wq_b", "wkv", "wo_b"):
+        if name in ("wq_a", "wq_b", "wkv", "wo_b", "index_wq_b"):
             weights[name] = pack_fp8_nz(weights[name])
         weights[name + "_scale"] = pack_mx_b_scale(codes.T.contiguous()).view(torch.float8_e8m0fnu)
 
@@ -625,6 +624,9 @@ def build_c2a_specs(
     }
 
     values["wo_a"], values["wo_a_scale"] = quantize_grouped_mxfp8_weight(values["wo_a"])
+
+    for name in ("index_wk", "index_weights_proj"):
+        values[name] = pack_bf16_nz(values[name])
 
     if case == "masked":
         values["window_slots"] = torch.full_like(window_slots, -1)

@@ -45,10 +45,6 @@ INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
 
 
-# tiling
-INDEX_QUERY_WORKER_TILE = 8
-
-
 publish_index = make_index_publish(INDEX_DIM, 32, INDEX_BLOCKS_DYN, name_hint="pub_idx")
 
 
@@ -91,11 +87,11 @@ def decode_c1a_full(
     compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
@@ -162,10 +158,10 @@ def decode_c1a_full(
     )
     private_query = pl.create_tensor([16, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
     (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
-        x_norm, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
+        x_norm, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
         num_tokens, score_width, x_ready, private_query, private_route,
-        qb_payload, qb_scales, reuse_projection_input=True,
-        pretransposed=True, query_max_workers=INDEX_QUERY_WORKER_TILE,
+        qb_payload, qb_scales,
+        pretransposed=True,
     )
     topk_tid, scores_tid = score_select_c1a_groups(
         index_query, index_query_scale, index_weights,
@@ -236,11 +232,11 @@ def l2_decode_c1a_full(
     compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.Out[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
     pool_block_ids: pl.Out[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
     pool_block_counts: pl.Out[pl.Tensor[[T_DYN], pl.INT32]],
@@ -522,11 +518,11 @@ def build_c1a_specs(
     values["window_cache"], values["window_cache_scale"] = wc, ws
     values["compressed_cache"], values["compressed_cache_scale"] = cc, cs
     values["output"] = torch.zeros(TOKENS, D, dtype=torch.bfloat16)
-    values["index_wq_b"] = torch.randn(Q_LORA, INDEX_H * INDEX_DIM).to(torch.float8_e4m3fn)
+    values["index_wq_b"] = pack_fp8_nz(torch.randn(Q_LORA, INDEX_H * INDEX_DIM).to(torch.float8_e4m3fn))
     index_weight_scale_codes = torch.full((Q_LORA // 32, INDEX_H * INDEX_DIM), 122, dtype=torch.uint8)
     values["index_wq_b_scale"] = pack_mx_b_scale(index_weight_scale_codes).view(torch.float8_e8m0fnu)
     # Non-negative index head weights.
-    values["index_weights_proj"] = (torch.rand(D, INDEX_H) / math.sqrt(D)).to(torch.bfloat16)
+    values["index_weights_proj"] = pack_bf16_nz((torch.rand(D, INDEX_H) / math.sqrt(D)).to(torch.bfloat16))
     values["request_ids"] = token_to_req
     values["compressed_lens"] = torch.tensor([PAGES * 128 - t for t in range(TOKENS)], dtype=torch.int32)
     values["index_block_table"] = torch.randperm(PAGES).int().view(1, PAGES).expand(REQUESTS, -1).contiguous()
@@ -557,7 +553,7 @@ def build_c1a_specs(
         values["compressed_rope_sin"] = values["rope_sin"].clone()
         values["compressor_wkv"] = pack_bf16_nz((torch.randn(D, HEAD_DIM) / math.sqrt(D)).to(torch.bfloat16))
         values["compressor_norm_weight"] = torch.ones(HEAD_DIM, dtype=torch.bfloat16)
-        values["index_wk"] = (torch.randn(HEAD_DIM, INDEX_DIM) / math.sqrt(HEAD_DIM)).to(torch.bfloat16)
+        values["index_wk"] = pack_bf16_nz((torch.randn(HEAD_DIM, INDEX_DIM) / math.sqrt(HEAD_DIM)).to(torch.bfloat16))
         # Quiet published index keys.
         values["index_norm_weight"] = torch.full((INDEX_DIM,), 2.0**-10, dtype=torch.bfloat16)
         positions = values["compressed_lens"].long() - 1

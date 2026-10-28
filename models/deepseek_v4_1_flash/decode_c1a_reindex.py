@@ -79,7 +79,7 @@ def decode_c1a_reindex(
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     next_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
@@ -102,7 +102,7 @@ def decode_c1a_reindex(
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
-    q_proj_rope(
+    qr, query, qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
@@ -120,10 +120,10 @@ def decode_c1a_reindex(
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
     score_width = pl.tensor.dim(pool_block_ids, 1) * 8
     index_query, index_query_scale, index_weights, scores, query_tid, weights_tid = c1a_index(
-        x_norm, qr, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
+        x_norm, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
         num_tokens, score_width, x_ready, index_wq_b, 0,
-        index_wq_b, index_wq_b_scale, reuse_projection_input=False,
-        pretransposed=False, query_max_workers=8,
+        qb_payload, qb_scales,
+        pretransposed=False,
     )
     scores_tid = score_reindex(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
@@ -198,7 +198,7 @@ def l2_decode_c1a_reindex(
     pool_block_counts: pl.InOut[pl.Tensor[[T_DYN], pl.INT32]],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.Out[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
     output: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],

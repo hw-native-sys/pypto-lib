@@ -163,13 +163,13 @@ def gemm_bf16_via_mxfp8_to_bf16_fused(
                     n0 = block * n_tile
                     rows = pl.min(32, num_tokens - t0)
                     a0, sa0 = quantize_bf16_to_mxfp8(x, t0, 0, rows, 32)
-                    b0 = pl.load(weight, [0, n0], [MX_K_TILE, n_tile])
+                    b0 = pl.load(weight, [0, n0], [MX_K_TILE, n_tile], target_memory=pl.MemorySpace.Mat)
                     sb0 = pl.load(scale, [0, n0], [MX_K_TILE // 32, n_tile])
                     acc = pl.matmul_mx(a0, sa0, b0, sb0)
                     for kb in pl.range(1, width // MX_K_TILE):
                         k0 = kb * MX_K_TILE
                         a, sa = quantize_bf16_to_mxfp8(x, t0, k0, rows, 32)
-                        b = pl.load(weight, [k0, n0], [MX_K_TILE, n_tile])
+                        b = pl.load(weight, [k0, n0], [MX_K_TILE, n_tile], target_memory=pl.MemorySpace.Mat)
                         sb = pl.load(scale, [k0 // 32, n0], [MX_K_TILE // 32, n_tile])
                         acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                     value = pl.cast(acc, target_type=pl.BF16, mode="rint")
@@ -178,7 +178,7 @@ def gemm_bf16_via_mxfp8_to_bf16_fused(
 
 
 @pl.jit.inline(auto_scope=False)
-def gemm_bf16_to_bf16_staged(
+def gemm_bf16_to_bf16(
     source: pl.Tensor,
     weight: pl.Tensor,
     output: pl.Tensor,
@@ -190,11 +190,8 @@ def gemm_bf16_to_bf16_staged(
     k_tile: pl.constexpr,
     workers: pl.constexpr,
     name_hint: pl.constexpr,
-    cast_name: pl.constexpr,
 ):
-    """Write Cube FP32 products to GM before the separate BF16 rounding task."""
-    tokens = pl.tensor.dim(source, 0)
-    accumulated = pl.create_tensor([tokens, output_width], dtype=pl.FP32)
+    """Project ND activations with NZ weights and store BF16 through Fixpipe."""
     blocks = (num_tokens + 16 - 1) // 16 * (output_width // n_tile)
     task_workers = pl.max(pl.min(blocks, workers), 1)
     entry_deps = pl.array.create(1, pl.TASK_ID)
@@ -205,22 +202,14 @@ def gemm_bf16_to_bf16_staged(
             row = block // (output_width // n_tile) * 16
             col = block % (output_width // n_tile) * n_tile
             rows = pl.min(16, num_tokens - row)
-            acc = pl.create_tensor([16, n_tile], dtype=pl.FP32)
+            acc = pl.tile.create([16, n_tile], dtype=pl.FP32)
             for k in pl.range(0, width, k_tile):
-                a = pl.slice(source, [16, k_tile], [row, k], valid_shape=[rows, k_tile])
-                w = pl.slice(weight, [k_tile, n_tile], [k, col])
+                a = pl.load(source, [row, k], [16, k_tile], valid_shape=[rows, k_tile])
+                w = pl.load(weight, [k, col], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
                 acc = pl.matmul_acc(acc, a, w, init_cond=(k == 0))
             value = pl.set_validshape(acc, rows, n_tile)
-            accumulated[row:row + 16, col:col + n_tile] = value
-    with pl.spmd(task_workers, name_hint=cast_name, deps=[cube_tid]) as cast_tid:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, task_workers):
-            row = block // (output_width // n_tile) * 16
-            col = block % (output_width // n_tile) * n_tile
-            rows = pl.min(16, num_tokens - row)
-            value = pl.slice(accumulated, [16, n_tile], [row, col], valid_shape=[rows, n_tile])
-            output[row:row + 16, col:col + n_tile] = pl.cast(value, pl.BF16, mode="rint")
-    return output, cast_tid
+            output = pl.store(value, [row, col], output)
+    return output, cube_tid
 
 
 def golden_mxfp8_linear_grouped_sum(

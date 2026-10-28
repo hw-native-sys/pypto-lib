@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Prefill C1A and C2A index-key preparation, paged scoring, and selection."""
 
-from gemm import gemm_bf16_to_bf16_staged, gemm_bf16_via_mxfp8_to_bf16_fused
+from gemm import gemm_bf16_to_bf16, gemm_bf16_via_mxfp8_to_bf16_fused
 
 import torch
 import torch.nn.functional as F
@@ -575,7 +575,7 @@ def _index_rope(
 @pl.jit.inline
 def project_index_weights(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D, INDEX_H], pl.BF16],
+    weight: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     output: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -583,11 +583,10 @@ def project_index_weights(
     tokens = pl.tensor.dim(x, 0)
     projected_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
     ready = pl.system.task_dummy(deps=[])
-    projected_result, projected_tid = gemm_bf16_to_bf16_staged(
+    projected_result, projected_tid = gemm_bf16_to_bf16(
         x, weight, projected_weights, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_weights",
-        cast_name="bf16_projection_cast",
     )
     with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights_scale") as weights_tid:
         block = pl.tile.get_block_idx()
@@ -604,9 +603,9 @@ def project_index_weights(
 def prepare_prefill_index_query(
     x: pl.Tensor,
     latent: pl.Tensor,
-    query_weight: pl.Tensor,
+    query_weight: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN, pl.NZ],
     query_weight_scale: pl.Tensor,
-    weight_projection: pl.Tensor,
+    weight_projection: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     cos: pl.Tensor,
     sin: pl.Tensor,
     query: pl.Tensor,
@@ -1085,7 +1084,7 @@ def publish_index_key(
 @pl.jit.inline
 def prefill_index_key_project(
     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    weight: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    weight: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     output: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
@@ -1095,11 +1094,10 @@ def prefill_index_key_project(
     tokens = pl.tensor.dim(latent, 0)
     projected = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     projection_ready = pl.system.task_dummy(deps=[])
-    projected_result, projected_tid = gemm_bf16_to_bf16_staged(
+    projected_result, projected_tid = gemm_bf16_to_bf16(
         latent, weight, projected, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_key",
-        cast_name="bf16_projection_cast",
     )
     norm_blocks = (num_tokens + M_TILE - 1) // M_TILE
     with pl.spmd(norm_blocks, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
@@ -1117,7 +1115,7 @@ def prefill_index_key_project(
 @pl.jit.inline(auto_scope=False)
 def publish_c1a_index_key(
     compressed_latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -1129,11 +1127,10 @@ def publish_c1a_index_key(
     tokens = pl.tensor.dim(compressed_latent, 0)
     index_projection = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     projection_ready = pl.system.task_dummy(deps=[])
-    projected_result, projected_tid = gemm_bf16_to_bf16_staged(
+    projected_result, projected_tid = gemm_bf16_to_bf16(
         compressed_latent, index_wk, index_projection, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_key",
-        cast_name="bf16_projection_cast",
     )
     index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8
@@ -1154,7 +1151,7 @@ def publish_c1a_index_key(
 @pl.jit.inline(auto_scope=False)
 def publish_c2a_index_key(
     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -1214,9 +1211,9 @@ def prefill_indexer(
     table: pl.Tensor,
     cos: pl.Tensor,
     sin: pl.Tensor,
-    query_weight: pl.Tensor,
+    query_weight: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN, pl.NZ],
     query_weight_scale: pl.Tensor,
-    weight_projection: pl.Tensor,
+    weight_projection: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     pool_ids: pl.Tensor,
     pool_counts: pl.Tensor,
     output: pl.Tensor,
@@ -1330,7 +1327,9 @@ def golden_index_key(
     sin: torch.Tensor,
 ) -> torch.Tensor:
     """Project an unrotated compressor latent into a rotated index key."""
-    projected = torch.matmul(latent.float(), wk.float()).to(latent.dtype)
+    from quant import unpack_bf16_nz
+
+    projected = torch.matmul(latent.float(), unpack_bf16_nz(wk).float()).to(latent.dtype)
     key = golden_rms_norm(projected, norm_weight)
     rd = cos.shape[-1] * 2
     return torch.cat((key[..., :-rd], golden_rope_interleave(key[..., -rd:], cos, sin)), dim=-1)
@@ -1392,14 +1391,16 @@ def golden_prefill_indexer(
     pool_block_ids=None, pool_block_counts=None, c2a=False, topk=INDEX_TOPK,
 ):
     """Reference logical FP4 queries, BF16 rounding, and sparse physical-row selection."""
+    from quant import unpack_bf16_nz, unpack_fp8_nz
+
     tokens = x.shape[0]
     width = int(compressed_lens.max()) if tokens else 0
     scores = torch.full((tokens, width), -torch.inf, dtype=torch.float32)
     selected = torch.full((tokens, topk), -1, dtype=torch.int32)
-    query = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, wq_b, wq_b_scale).reshape(tokens, INDEX_H, INDEX_DIM)
+    query = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, unpack_fp8_nz(wq_b), wq_b_scale).reshape(tokens, INDEX_H, INDEX_DIM)
     query = golden_rope_tail(query, cos, sin)
     query = golden_index_query_fp4(query)
-    weights = (x.float() @ weights_proj.float()).bfloat16()
+    weights = (x.float() @ unpack_bf16_nz(weights_proj).float()).bfloat16()
     weights = (weights.float() * INDEX_SCORE_SCALE).bfloat16()
     keys = index_cache.flatten(0, 1).squeeze(-2)
     for token in range(tokens):

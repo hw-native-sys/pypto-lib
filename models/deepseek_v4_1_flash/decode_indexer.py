@@ -8,10 +8,11 @@
 # -----------------------------------------------------------------------------------------------------------
 """Decode indexer query preparation, key publication, scoring, and TopK."""
 
-from gemm import (
-    gemm_bf16_to_bf16_staged,
-    gemm_bf16_via_mxfp8_to_bf16_staged,
-)
+from pathlib import Path
+
+from pypto.runtime import pto_isa_include_dir
+
+from gemm import gemm_bf16_to_bf16
 import pypto.language as pl
 from rmsnorm import make_norm_with_deps
 from config import (
@@ -47,7 +48,8 @@ _PAIR_M_TILE = INDEX_H * 2
 
 
 INDEX_PROJ_N_TILE = 128
-INDEX_WEIGHT_N_TILE = min(128, INDEX_H)
+INDEX_WEIGHT_K_SPLIT_TILE = 4
+INDEX_WEIGHT_K_TILE = 256
 INDEX_PROJ_K_TILE = 256
 
 
@@ -60,6 +62,23 @@ INDEX_SCORE_POSITIONS_DYN = pl.dynamic("V41_INDEX_SCORE_POSITIONS_DYN")
 # Request-group score capacities for the 8192-start-position workloads.
 C1A_REQUEST_GROUP_SCORE_WIDTH = 8320
 C2A_REQUEST_GROUP_SCORE_WIDTH = 4224
+
+
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_idx_q.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _proj_idx_q(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INDEX],
+    output_width: pl.Scalar[pl.INDEX],
+    row_start: pl.Scalar[pl.INDEX],
+    input_row_start: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project NZ index-query weights with resident MX scales."""
+    ...
 
 
 @pl.jit.inline
@@ -2070,28 +2089,55 @@ def select_pool_index_topk(
 @pl.jit.inline(auto_scope=False)
 def project_index_weights(
     source: pl.Tensor,
-    weight: pl.Tensor,
+    weight: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    result, completed = gemm_bf16_to_bf16_staged(
-        source, weight, output, num_tokens, ready,
-        width=D, output_width=INDEX_H, n_tile=INDEX_WEIGHT_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=8, name_hint='proj_idx_w', cast_name='cast_idx_w',
-    )
+    tokens = pl.tensor.dim(source, 0)
+    partials = pl.create_tensor([INDEX_WEIGHT_K_SPLIT_TILE * tokens, INDEX_H], dtype=pl.FP32)
+    blocks = (num_tokens + 79) // 80
+    with pl.spmd(INDEX_WEIGHT_K_SPLIT_TILE, name_hint="proj_idx_w", deps=[ready]) as cube_tid:
+        split = pl.tile.get_block_idx()
+        begin = split * (D // INDEX_WEIGHT_K_SPLIT_TILE)
+        for block in pl.range(blocks):
+            row = block * 80
+            rows = pl.min(80, num_tokens - row)
+            a = pl.load(source, [row, begin], [80, INDEX_WEIGHT_K_TILE], valid_shape=[rows, INDEX_WEIGHT_K_TILE], target_memory=pl.MemorySpace.Mat)
+            w = pl.load(weight, [begin, 0], [INDEX_WEIGHT_K_TILE, INDEX_H], target_memory=pl.MemorySpace.Mat)
+            full_a = pl.set_validshape(a, 80, INDEX_WEIGHT_K_TILE)
+            acc = pl.matmul(full_a, w)
+            k_begin = begin + INDEX_WEIGHT_K_TILE
+            k_end = begin + D // INDEX_WEIGHT_K_SPLIT_TILE
+            for k in pl.pipeline(k_begin, k_end, INDEX_WEIGHT_K_TILE, stage=2):
+                a = pl.load(source, [row, k], [80, INDEX_WEIGHT_K_TILE], valid_shape=[rows, INDEX_WEIGHT_K_TILE], target_memory=pl.MemorySpace.Mat)
+                w = pl.load(weight, [k, 0], [INDEX_WEIGHT_K_TILE, INDEX_H], target_memory=pl.MemorySpace.Mat)
+                full_a = pl.set_validshape(a, 80, INDEX_WEIGHT_K_TILE)
+                acc = pl.matmul_acc(acc, full_a, w)
+            value = pl.set_validshape(acc, rows, INDEX_H)
+            partials = pl.store(value, [split * tokens + row, 0], partials)
+    with pl.spmd(pl.max(pl.min((num_tokens + 15) // 16, 8), 1), name_hint="reduce_idx_w", deps=[cube_tid]) as completed:
+        worker = pl.tile.get_block_idx()
+        workers = pl.tile.get_block_num()
+        for row in pl.range(worker * 16, num_tokens, workers * 16):
+            rows = pl.min(16, num_tokens - row)
+            reduced = pl.load(partials, [row, 0], [16, INDEX_H], valid_shape=[rows, INDEX_H])
+            for split in pl.range(1, INDEX_WEIGHT_K_SPLIT_TILE):
+                partial_value = pl.load(partials, [split * tokens + row, 0], [16, INDEX_H], valid_shape=[rows, INDEX_H])
+                reduced = pl.add(reduced, partial_value)
+            rounded = pl.cast(reduced, pl.BF16, mode="rint")
+            output = pl.store(rounded, [row, 0], output)
     return completed
 
 
 @pl.jit.inline(auto_scope=False)
 def c1a_index(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    qr: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[
         [Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN
     ],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -2101,77 +2147,17 @@ def c1a_index(
     private_route: pl.Scalar[pl.INT32],
     projection_payload: pl.Tensor,
     projection_scale_backing: pl.Tensor,
-    reuse_projection_input: pl.constexpr,
     pretransposed: pl.constexpr,
-    query_max_workers: pl.constexpr = 2147483647,
 ):
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
-    if reuse_projection_input:
-        scales_per_token = Q_LORA // 32
-        for group_start in pl.parallel(0, num_tokens, 80):
-            projection_payload_m80 = pl.tensor.slice(projection_payload, [80, Q_LORA], [group_start, 0])
-            scale_start = group_start * scales_per_token
-            backing_size = pl.tensor.dim(projection_scale_backing, 0) * pl.tensor.dim(projection_scale_backing, 1)
-            activation_scales_nd = pl.tensor.view(projection_scale_backing, [1, backing_size], layout=pl.ND)
-            scale_end = scale_start + 80 * scales_per_token
-            activation_scales = activation_scales_nd[0:1, scale_start:scale_end]
-            activation_scale = pl.tensor.view(activation_scales, [80, scales_per_token], layout=pl.MX_A_ZZ)
-            scale_group_size = (Q_LORA // 32) * INDEX_QUERY_WIDTH
-            index_scale_flat = pl.tensor.view(
-                index_wq_b_scale, [1, scale_group_size], layout=pl.ND,
+    for group_start in pl.parallel(0, num_tokens, 80):
+        rows = pl.min(80, num_tokens - group_start)
+        with pl.spmd(16, name_hint="proj_idx_q", sync_start=True):
+            projected = _proj_idx_q(
+                projection_payload, index_wq_b, projection_scale_backing, index_wq_b_scale,
+                projected, rows, INDEX_QUERY_WIDTH, group_start, group_start,
             )
-            index_scale_group = pl.tensor.view(
-                index_scale_flat[0:1, 0:scale_group_size], [Q_LORA // 32, INDEX_QUERY_WIDTH], layout=pl.MX_B_NN,
-            )
-            available_clusters = pl.system.available_cluster_count()
-            workers = pl.min(
-                pl.min(INDEX_QUERY_WIDTH // INDEX_PROJ_N_TILE, query_max_workers), available_clusters,
-            )
-            for worker in pl.spmd(workers, name_hint="proj_idx_q", sync_start=True):
-                full_a = pl.load(
-                    projection_payload_m80, [0, 0], [80, Q_LORA], target_memory=pl.MemorySpace.Mat,
-                )
-                block_num = pl.tile.get_block_num()
-                for wave in pl.range(
-                    (INDEX_QUERY_WIDTH // INDEX_PROJ_N_TILE + block_num - 1) // block_num,
-                ):
-                    block = wave * block_num + worker
-                    if block < INDEX_QUERY_WIDTH // INDEX_PROJ_N_TILE:
-                        n0 = block * INDEX_PROJ_N_TILE
-                        rows = pl.min(80, num_tokens - group_start)
-                        a0 = full_a[:, :INDEX_PROJ_K_TILE]
-                        sa0 = pl.load(
-                            activation_scale, [0, 0], [80, INDEX_PROJ_K_TILE // 32],
-                        )
-                        b0 = pl.load(
-                            index_wq_b, [0, n0], [INDEX_PROJ_K_TILE, INDEX_PROJ_N_TILE],
-                        )
-                        sb0 = pl.load(
-                            index_scale_group, [0, n0], [INDEX_PROJ_K_TILE // 32, INDEX_PROJ_N_TILE],
-                        )
-                        acc = pl.matmul_mx(a0, sa0, b0, sb0)
-                        for k0 in pl.pipeline(INDEX_PROJ_K_TILE, Q_LORA, INDEX_PROJ_K_TILE, stage=2):
-                            a = pl.tile.slice(full_a, [80, INDEX_PROJ_K_TILE], [0, k0])
-                            sa = pl.load(
-                                activation_scale, [0, k0 // 32], [80, INDEX_PROJ_K_TILE // 32],
-                            )
-                            b = pl.load(
-                                index_wq_b, [k0, n0], [INDEX_PROJ_K_TILE, INDEX_PROJ_N_TILE],
-                            )
-                            sb = pl.load(
-                                index_scale_group, [k0 // 32, n0],
-                                [INDEX_PROJ_K_TILE // 32, INDEX_PROJ_N_TILE],
-                            )
-                            acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
-                        valid_acc = pl.set_validshape(acc, rows, INDEX_PROJ_N_TILE)
-                        projected = pl.store(valid_acc, [group_start, n0], projected)
-    else:
-        gemm_bf16_via_mxfp8_to_bf16_staged(
-            qr, index_wq_b, index_wq_b_scale, projected, num_tokens,
-            Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", "quant_idx_q",
-            INDEX_PROJ_N_TILE, INDEX_PROJ_K_TILE, 1, query_max_workers,
-        )
     query = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
     query_scale = pl.create_tensor(
         [tokens, INDEX_H * (INDEX_DIM // INDEX_CACHE_GROUP)], dtype=pl.FP8E8M0
@@ -2203,15 +2189,15 @@ def c1a_index(
 @pl.jit.inline(auto_scope=False)
 def c2a_project_index_key(
     source: pl.Tensor,
-    weight: pl.Tensor,
+    weight: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    result, completed = gemm_bf16_to_bf16_staged(
+    result, completed = gemm_bf16_to_bf16(
         source, weight, output, num_tokens, ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=32, name_hint='proj_idx_k', cast_name='cast_idx_k',
+        workers=32, name_hint='proj_idx_k',
     )
     return completed
 
@@ -2239,7 +2225,7 @@ def c2a_rotate_index_key(
 @pl.jit.inline(auto_scope=False)
 def prepare_c2a_index_key(
     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -2483,13 +2469,14 @@ publish_c2a_index = make_index_publish(INDEX_DIM, INDEX_CACHE_GROUP, INDEX_BLOCK
 @pl.jit.inline(auto_scope=False)
 def decode_c2a_indexer(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    qr: pl.Tensor[[T_DYN, Q_LORA], pl.BF16],
+    projection_payload: pl.Tensor,
+    projection_scales: pl.Tensor,
     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -2519,13 +2506,13 @@ def decode_c2a_indexer(
     # The dense arena follows logical page-table capacity, never allocated cache pages.
     score_width = pl.tensor.dim(index_block_table, 1) * 128
     query, query_scale, raw_weights, scores, query_tid, weights_tid = c1a_index(
-        x, qr,
+        x,
         index_wq_b, index_wq_b_scale, index_weights_proj,
         rope_cos, rope_sin,
         num_tokens, score_width,
         cache_ready, index_wq_b, 0,
-        index_wq_b, index_wq_b_scale, reuse_projection_input=False,
-        pretransposed=False, query_max_workers=8,
+        projection_payload, projection_scales,
+        pretransposed=False,
     )
     return _score_select_c2a_groups(
         query, query_scale, raw_weights, index_cache, index_cache_scale,
@@ -2602,7 +2589,9 @@ def golden_index_key(
     sin: torch.Tensor,
 ) -> torch.Tensor:
     """Project an unrotated compressor latent into a rotated index key."""
-    projected = torch.matmul(latent.float(), wk.float()).to(latent.dtype)
+    from quant import unpack_bf16_nz
+
+    projected = torch.matmul(latent.float(), unpack_bf16_nz(wk).float()).to(latent.dtype)
     key = golden_rms_norm(projected, norm_weight)
     rd = cos.shape[-1] * 2
     return torch.cat((key[..., :-rd], golden_rope_interleave(key[..., -rd:], cos, sin)), dim=-1)
@@ -2661,14 +2650,14 @@ def golden_select_candidate_block_pool(
 def golden_c1a_index_scores(a, qr, index_payload, index_scale):
     """Rebuild the per-token index scores and the physical row behind every logical column."""
     from qkv_proj_rope import golden_rope_interleave as rope_interleave
-    from quant import dequantize_mxfp4_cache
+    from quant import dequantize_mxfp4_cache, unpack_bf16_nz, unpack_fp8_nz
 
     x = a["x"]
     lengths = a["compressed_lens"]
     # Logical page-table score columns.
     width = a["index_block_table"].shape[-1] * 128
     heads = a["index_weights_proj"].shape[-1]
-    iq = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, a["index_wq_b"], a["index_wq_b_scale"])
+    iq = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, unpack_fp8_nz(a["index_wq_b"]), a["index_wq_b_scale"])
     if iq.shape[-1] % heads:
         raise RuntimeError(f"index query width {iq.shape[-1]} is not divisible by {heads} heads")
     dim = iq.shape[-1] // heads
@@ -2678,7 +2667,7 @@ def golden_c1a_index_scores(a, qr, index_payload, index_scale):
     iq = golden_index_query_fp4(iq)
     keys = dequantize_mxfp4_cache(index_payload, index_scale, 32, "e8m0").to(x.dtype).flatten(0, 1)[:, 0]
     # The device scales the projected head weight in FP32 and rounds it once to BF16.
-    weight = ((x).float() @ (a["index_weights_proj"]).float()).to(torch.bfloat16).float() * (dim * heads) ** -0.5
+    weight = ((x).float() @ unpack_bf16_nz(a["index_weights_proj"]).float()).to(torch.bfloat16).float() * (dim * heads) ** -0.5
     weight = weight.to(torch.bfloat16).float()
     scores = torch.full((x.shape[0], width), -torch.inf)
     physical = torch.full((x.shape[0], width), -1, dtype=torch.int64)
@@ -2757,16 +2746,18 @@ def _select_shared_c2a_topk(scores, physical_rows, lengths):
 
 def golden_c2a_index(t, qr, index_cache, index_cache_scale):
     """Score and select C2A paged history with BF16 head reduction."""
+    from quant import unpack_bf16_nz, unpack_fp8_nz
+
     x = t["x"]
     tokens = x.shape[0]
     index_dim = t["index_norm_weight"].numel()
     index_heads = t["index_weights_proj"].shape[-1]
     index_values = dequantize_mxfp4_cache(index_cache, index_cache_scale, INDEX_CACHE_GROUP, "e8m0").flatten(0, -2)
     # Accumulate the index-query projection in sequential group-32 partials.
-    index_q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, t["index_wq_b"], t["index_wq_b_scale"]).unflatten(-1, (index_heads, index_dim))
+    index_q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, unpack_fp8_nz(t["index_wq_b"]), t["index_wq_b_scale"]).unflatten(-1, (index_heads, index_dim))
     index_q = golden_rope_tail(index_q, t["rope_cos"], t["rope_sin"])
     index_q = golden_index_query_fp4(index_q)
-    head_weights = ((x).float() @ (t["index_weights_proj"]).float()).to(torch.bfloat16).float()
+    head_weights = ((x).float() @ unpack_bf16_nz(t["index_weights_proj"]).float()).to(torch.bfloat16).float()
     head_weights = (head_weights * (index_dim * index_heads) ** -0.5).to(torch.bfloat16).float()
     lens = t["compressed_lens"].long()
     score_width = t["index_block_table"].shape[1] * 128
@@ -2818,15 +2809,15 @@ __all__ = [
 @pl.jit.inline(auto_scope=False)
 def c1a_project_index_key(
     source: pl.Tensor,
-    weight: pl.Tensor,
+    weight: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    result, completed = gemm_bf16_to_bf16_staged(
+    result, completed = gemm_bf16_to_bf16(
         source, weight, output, num_tokens, ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=8, name_hint='proj_idx_k', cast_name='cast_idx_k',
+        workers=8, name_hint='proj_idx_k',
     )
     return completed
 

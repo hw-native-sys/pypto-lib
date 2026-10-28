@@ -44,7 +44,7 @@ from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes, prefill_sp_
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables
 from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj_rope
-from quant import pack_bf16_nz, unpack_bf16_nz, dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
+from quant import dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import paged_slots, token_shards, window_metadata
@@ -120,11 +120,11 @@ def prefill_c2a_full_attention(
     state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
-    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN, pl.NZ],
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     partial: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -261,11 +261,11 @@ def prefill_c2a_full_sp(
     state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
-    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN, pl.NZ],
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -369,7 +369,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     Returns the per-rank partial output (before TP reduction) plus every mutated state: the
     three paged caches with scales, the compressor state, and the physical Top-K rows.
     """
-    from quant import unpack_fp8_nz
+    from quant import unpack_bf16_nz, unpack_fp8_nz
     t = inputs
     x = t["x"]
     tokens = x.shape[0]
@@ -449,7 +449,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     # e. Index keys come from the UNROTATED latent; packed FP4, group 32, E8M0, same slots.
     index_cache = t["index_cache"].clone()
     index_cache_scale = t["index_cache_scale"].clone()
-    index_key = golden_rms_norm(((latent).float() @ (t["index_wk"]).float()).to(torch.bfloat16), t["index_norm_weight"])
+    index_key = golden_rms_norm(((latent).float() @ unpack_bf16_nz(t["index_wk"]).float()).to(torch.bfloat16), t["index_norm_weight"])
     index_key = golden_rope_tail(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
     if compressed_rows.numel():
         payload, scale = quantize_mxfp4_cache(index_key[compressed_valid], IDX_GROUP, "e8m0")
@@ -647,12 +647,13 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
     wq_b, wq_b_scale = _weight(gen, Q_LORA, LOCAL_H * HEAD_DIM)
     wkv, wkv_scale = _weight(gen, D, HEAD_DIM)
     wo_b, wo_b_scale = _weight(gen, LOCAL_O_WIDTH, D)
-    from quant import pack_fp8_nz
+    from quant import pack_bf16_nz, pack_fp8_nz
     wq_a = pack_fp8_nz(wq_a)
     wq_b = pack_fp8_nz(wq_b)
     wkv = pack_fp8_nz(wkv)
     wo_b = pack_fp8_nz(wo_b)
     index_wq_b, index_wq_b_scale = _weight(gen, Q_LORA, INDEX_H * INDEX_DIM)
+    index_wq_b = pack_fp8_nz(index_wq_b)
 
     compressor_wkv = (torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)).bfloat16()
     compressor_wgate = (torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)).bfloat16()
@@ -728,6 +729,9 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
         "index_wq_b_scale": index_wq_b_scale,
         "index_weights_proj": (torch.randn(D, INDEX_H, generator=gen) / math.sqrt(D)).bfloat16(),
     }
+
+    for name in ("index_wk", "index_weights_proj"):
+        values[name] = pack_bf16_nz(values[name])
 
     if case == "masked":
         values["window_slots"] = torch.full_like(window_slots, -1)
@@ -1052,11 +1056,11 @@ def l2_prefill_c2a_full(
     state_cache: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
-    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN, pl.NZ],
     index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.Out[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
     attn_input: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     attn_output: pl.Out[pl.Tensor[[SP_T_DYN, D], pl.BF16]],

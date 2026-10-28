@@ -99,11 +99,11 @@ def l2_decode_layer(
     state_cache: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     compressor_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     compressed_slots: pl.Tensor[[T_DYN], pl.INT64],
-    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
     index_norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
     pool_block_ids: pl.InOut[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
     pool_block_counts: pl.InOut[pl.Tensor[[T_DYN], pl.INT32]],
@@ -952,7 +952,7 @@ def _mxfp8_weight(input_dim: int, output_dim: int) -> tuple[torch.Tensor, torch.
 
 def _attention_values() -> dict[str, torch.Tensor | None]:
     """Build small deterministic inputs for all attention golden modes."""
-    from quant import pack_fp8_nz
+    from quant import pack_bf16_nz, pack_fp8_nz
 
     torch.manual_seed(7)
     wq_a, wq_a_scale = _mxfp8_weight(64, 64)
@@ -963,7 +963,8 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
     wq_b = pack_fp8_nz(wq_b)
     wkv = pack_fp8_nz(wkv)
     wo_b = pack_fp8_nz(wo_b)
-    index_wq_b, index_wq_b_scale = _mxfp8_weight(64, 64)
+    index_wq_b, index_wq_b_scale = _mxfp8_weight(64, 16 * 32)
+    index_wq_b = pack_fp8_nz(index_wq_b)
     window_cache, window_cache_scale = quantize_mxfp8_cache(torch.zeros(1, 128, 1, 64))
     compressed_cache, compressed_cache_scale = quantize_mxfp4_cache(
         torch.randn(1, 128, 1, 64), group_size=16, scale_format="bf16"
@@ -1012,11 +1013,11 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
         "state_cache": torch.zeros(2, 4, 128),
         "compressor_norm_weight": torch.ones(64, dtype=torch.bfloat16),
         "compressed_slots": torch.tensor([-1, 0]),
-        "index_wk": torch.randn(64, 32, dtype=torch.bfloat16),
+        "index_wk": pack_bf16_nz(torch.randn(64, 32, dtype=torch.bfloat16)),
         "index_norm_weight": torch.ones(32, dtype=torch.bfloat16),
         "index_wq_b": index_wq_b,
         "index_wq_b_scale": index_wq_b_scale,
-        "index_weights_proj": torch.randn(64, 2, dtype=torch.bfloat16),
+        "index_weights_proj": pack_bf16_nz(torch.randn(64, 16, dtype=torch.bfloat16)),
     }
     values["wo_a"], values["wo_a_scale"] = quantize_grouped_mxfp8_weight(values["wo_a"])
     return values
