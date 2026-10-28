@@ -9,6 +9,7 @@
 """Shared BF16 and MXFP8 GEMM kernels and Torch references."""
 
 import torch
+from config import FLASH as M, T_DYN
 
 from quant import (
     MX_GROUP, QUANT_K_TILE, _quantize_mxfp8_activation, decode_e8m0,
@@ -40,7 +41,7 @@ def gemm_mxfp8_to_bf16(
     n_tile: pl.constexpr,
     k_tile: pl.constexpr,
     group_count: pl.constexpr,
-    scale_row: pl.Scalar[pl.INDEX],
+    scale_offset: pl.Scalar[pl.INDEX],
     payload_row: pl.Scalar[pl.INDEX],
     m_tile: pl.constexpr,
     max_workers: pl.constexpr = 2147483647,
@@ -51,7 +52,6 @@ def gemm_mxfp8_to_bf16(
     backing_width = pl.tensor.dim(activation_scale_backing, 1)
     backing_size = backing_rows * backing_width
     activation_scales_nd = pl.tensor.view(activation_scale_backing, [1, backing_size], layout=pl.ND)
-    scale_offset = scale_row * backing_width
     scale_end = scale_offset + m_tile * (width // 32)
     scale_slice = activation_scales_nd[0:1, scale_offset:scale_end]
     activation_scale = pl.tensor.view(scale_slice, [m_tile, width // 32], layout=pl.MX_A_ZZ)
@@ -96,6 +96,68 @@ def gemm_mxfp8_to_bf16(
                     value = pl.cast(acc, pl.BF16, mode="rint")
                     valid_bf16 = pl.set_validshape(value, rows, n_tile)
                     output = pl.store(valid_bf16, [t0, output_n], output)
+    return output
+
+
+@pl.jit.inline(auto_scope=False)
+def gemm_mxfp8_to_bf16_m80(
+    payload: pl.Tensor,
+    activation_scale_backing: pl.Tensor[[1, T_DYN * (M.q_lora_rank // 32)], pl.FP8E8M0, pl.ND],
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    t0: pl.Scalar[pl.INDEX],
+    weight_row: pl.Scalar[pl.INDEX],
+    output_col: pl.Scalar[pl.INDEX],
+    width: pl.constexpr,
+    output_width: pl.constexpr,
+    name_hint: pl.constexpr,
+    n_tile: pl.constexpr,
+    k_tile: pl.constexpr,
+    group_count: pl.constexpr,
+    scale_offset: pl.Scalar[pl.INDEX],
+    payload_row: pl.Scalar[pl.INDEX],
+    max_workers: pl.constexpr = 2147483647,
+    k_stages: pl.constexpr = 2,
+):
+    """Project one 80-row prequantized activation tile into BF16 output."""
+    backing_rows = pl.tensor.dim(activation_scale_backing, 0)
+    backing_width = pl.tensor.dim(activation_scale_backing, 1)
+    backing_size = backing_rows * backing_width
+    activation_scales_nd = pl.tensor.view(activation_scale_backing, [1, backing_size], layout=pl.ND)
+    scale_end = scale_offset + 80 * (width // 32)
+    activation_scales = activation_scales_nd[0:1, scale_offset:scale_end]
+    activation_scale = pl.tensor.view(activation_scales, [80, width // 32], layout=pl.MX_A_ZZ)
+    scale_group_size = (width // 32) * output_width
+    scale_backing_flat = pl.tensor.view(weight_scale, [1, group_count * scale_group_size], layout=pl.ND)
+    scale_group_offset = weight_row // 32 * output_width
+    scale_group_end = scale_group_offset + scale_group_size
+    scale_group_backing = scale_backing_flat[0:1, scale_group_offset:scale_group_end]
+    scale_group = pl.tensor.view(scale_group_backing, [width // 32, output_width], layout=pl.MX_B_NN)
+    available_clusters = pl.system.available_cluster_count()
+    workers = pl.min(pl.min(output_width // n_tile, max_workers), available_clusters)
+    for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
+        full_a = pl.load(payload, [payload_row, 0], [80, width], target_memory=pl.MemorySpace.Mat)
+        block_num = pl.tile.get_block_num()
+        for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
+            block = wave * block_num + worker
+            if block < output_width // n_tile:
+                n0 = block * n_tile
+                rows = pl.min(80, num_tokens - t0)
+                a0 = full_a[:, :k_tile]
+                sa0 = pl.load(activation_scale, [0, 0], [80, k_tile // 32])
+                b0 = pl.load(weight, [weight_row, n0], [k_tile, n_tile])
+                sb0 = pl.load(scale_group, [0, n0], [k_tile // 32, n_tile])
+                acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                for k0 in pl.pipeline(k_tile, width, k_tile, stage=k_stages):
+                    a = pl.tile.slice(full_a, [80, k_tile], [0, k0])
+                    sa = pl.load(activation_scale, [0, k0 // 32], [80, k_tile // 32])
+                    b = pl.load(weight, [weight_row + k0, n0], [k_tile, n_tile])
+                    sb = pl.load(scale_group, [k0 // 32, n0], [k_tile // 32, n_tile])
+                    acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                valid_acc = pl.set_validshape(acc, rows, n_tile)
+                output = pl.store(valid_acc, [t0, output_col + n0], output)
     return output
 
 

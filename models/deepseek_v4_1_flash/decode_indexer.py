@@ -8,7 +8,11 @@
 # -----------------------------------------------------------------------------------------------------------
 """Decode indexer query preparation, key publication, scoring, and TopK."""
 
-from gemm import gemm_bf16_to_bf16_staged, gemm_bf16_via_mxfp8_to_bf16_staged, gemm_mxfp8_to_bf16
+from gemm import (
+    gemm_bf16_to_bf16_staged,
+    gemm_bf16_via_mxfp8_to_bf16_staged,
+    gemm_mxfp8_to_bf16_m80,
+)
 import pypto.language as pl
 from rmsnorm import make_norm_with_deps
 from config import (
@@ -2198,12 +2202,15 @@ def c1a_index(
     tokens = pl.tensor.dim(x, 0)
     projected = pl.create_tensor([tokens, INDEX_H * INDEX_DIM], dtype=pl.BF16)
     if reuse_projection_input:
-        projection_payload_m80 = pl.tensor.slice(projection_payload, [80, Q_LORA], [0, 0])
-        gemm_mxfp8_to_bf16(
-            projection_payload_m80, projection_scale_backing, index_wq_b, index_wq_b_scale, projected, num_tokens,
-            0, 0, 0, Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q", INDEX_PROJ_N_TILE, INDEX_PROJ_K_TILE,
-            1, 0, 0, 80, query_max_workers, 2,
-        )
+        scales_per_token = Q_LORA // 32
+        for group_start in pl.parallel(0, num_tokens, 80):
+            projection_payload_m80 = pl.tensor.slice(projection_payload, [80, Q_LORA], [group_start, 0])
+            scale_start = group_start * scales_per_token
+            gemm_mxfp8_to_bf16_m80(
+                projection_payload_m80, projection_scale_backing, index_wq_b, index_wq_b_scale, projected,
+                num_tokens, group_start, 0, 0, Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q",
+                INDEX_PROJ_N_TILE, INDEX_PROJ_K_TILE, 1, scale_start, 0, query_max_workers, 2,
+            )
     else:
         gemm_bf16_via_mxfp8_to_bf16_staged(
             qr, index_wq_b, index_wq_b_scale, projected, num_tokens,
