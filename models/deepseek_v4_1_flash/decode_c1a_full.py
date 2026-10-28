@@ -10,7 +10,7 @@
 
 
 import pypto.language as pl
-from qkv_proj_rope import quantize_projection_input, q_proj_rope_retain, kv_proj_rope
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from o_proj import o_proj
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, use_pretransposed_index_query, score_select_c1a_groups,
@@ -46,7 +46,6 @@ INDEX_TOPK = M.index_topk
 
 
 # tiling
-Q_B_WORKER_TILE = 24
 INDEX_QUERY_WORKER_TILE = 8
 
 
@@ -122,13 +121,13 @@ def decode_c1a_full(
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
-    qr, query, qb_payload, qb_scales = q_proj_rope_retain(
+    qr, query, qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens, 128, Q_B_WORKER_TILE,
+        num_tokens,
     )
     kv_proj_rope(
         proj_payload, proj_scales,
@@ -503,7 +502,7 @@ def build_c1a_specs(
     }
     for name, (k, n) in shapes.items():
         values[name] = torch.randn(k, n).to(torch.float8_e4m3fn)
-        if name == "wo_b":
+        if name in ("wq_a", "wq_b", "wkv", "wo_b"):
             values[name] = pack_fp8_nz(values[name])
         exponent = round(127 - math.log2(k) / 2)
         weight_scale_codes = torch.full((k // 32, n), exponent, dtype=torch.uint8)

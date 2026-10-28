@@ -7,9 +7,9 @@
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
 // O-B: MXFP8 [80, K] x [K, 5120], with a bounded BF16 output row count.
-#include "output_projection.hpp"
+#include "mxfp8_projection.hpp"
 
-using namespace output_projection;
+using namespace mxfp8_projection;
 
 template <int K>
 __aicore__ inline void project_ob(__gm__ int64_t* args) {

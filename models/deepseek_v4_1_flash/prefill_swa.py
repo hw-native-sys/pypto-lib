@@ -145,7 +145,7 @@ def prefill_swa_attention(
             wq_b, wq_b_scale,
             chunk_cos, chunk_sin,
             qr, q,
-            active, 256, 2147483647,
+            active,
         )
         index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
         attend_shared_cache(

@@ -108,7 +108,7 @@ def decode_c1a_reindex(
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens, 128, 24,
+        num_tokens,
     )
     kv_proj_rope(
         proj_payload, proj_scales,

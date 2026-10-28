@@ -127,7 +127,7 @@ def decode_c2a_full(
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens, 128, 2147483647,
+        num_tokens,
     )
     kv_proj_rope(
         proj_payload, proj_scales,
@@ -553,7 +553,7 @@ def build_c2a_specs(
         weight = torch.randn(n, k, generator=gen) / math.sqrt(k)
         payload, codes = quantize_mxfp8_upward_reference(weight)
         weights[name] = payload.T.contiguous()
-        if name == "wo_b":
+        if name in ("wq_a", "wq_b", "wkv", "wo_b"):
             weights[name] = pack_fp8_nz(weights[name])
         weights[name + "_scale"] = pack_mx_b_scale(codes.T.contiguous()).view(torch.float8_e8m0fnu)
 

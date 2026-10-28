@@ -170,7 +170,7 @@ def prefill_c1a_full_attention(
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
             query_latent, query,
-            num_tokens, 256, 2147483647,
+            num_tokens,
         )
         publication[0] = published
     publication_ready = publication[0]
@@ -304,6 +304,9 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
     wq_b, wq_b_scale = _ranked_fp8_weight(Q_LORA, LOCAL_H * HEAD_DIM, shared=False)
     wkv, wkv_scale = _ranked_fp8_weight(D, HEAD_DIM, shared=True)
     wo_b, wo_b_scale = _ranked_fp8_weight(LOCAL_O_WIDTH, D, shared=False)
+    wq_a = pack_fp8_nz(wq_a)
+    wq_b = pack_fp8_nz(wq_b)
+    wkv = pack_fp8_nz(wkv)
     wo_b = pack_fp8_nz(wo_b)
     index_wq_b, index_wq_b_scale = _ranked_fp8_weight(Q_LORA, INDEX_H * INDEX_DIM, shared=True)
     window_value = torch.randn(cache_blocks, CASE_PAGE, 1, HEAD_DIM).mul_(0.05)

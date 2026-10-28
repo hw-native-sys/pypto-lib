@@ -1321,7 +1321,7 @@ class ResidentPrefillWeights:
                     logical_scale = logical_scale.reshape(k // 32, M.o_groups, M.o_lora_rank).permute(1, 0, 2)
                 else:
                     weight = weight.t()
-                if target in ("wo_a", "wo_b"):
+                if target in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
                     weight = pack_fp8_nz(weight)
                 copy(target, weight, slot, slots)
                 packed_scale = pack_mx_b_scale(logical_scale).view(torch.float8_e8m0fnu)

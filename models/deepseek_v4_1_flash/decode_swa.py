@@ -86,7 +86,7 @@ def decode_swa(
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, q,
-        num_tokens, 256, 2147483647,
+        num_tokens,
     )
     kv_proj_rope(
         proj_payload, proj_scales,

@@ -9,13 +9,15 @@
 """Shared V4.1 Q/KV projection, normalization, and RoPE stages."""
 
 
+from pathlib import Path
+
 import pypto.language as pl
+from pypto.runtime import pto_isa_include_dir
 import torch
 
 from config import FLASH as M, TP_SIZE
 from gemm import (
     MX_M_TILE, MX_K_TILE,
-    gemm_mxfp8_to_bf16,
     golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum,
 )
 from quant import QUANT_SCALE_TILE, quantize_bf16_to_mxfp8
@@ -31,11 +33,55 @@ Q_LORA = M.q_lora_rank
 EPS = M.rms_norm_eps
 
 # tiling
-N_TILE = 128
-K_TILE = 256
-Q_A_N_TILE = 128
-Q_A_K_TILE = 256
+Q_A_N_TILE = 64
+Q_B_N_TILE = 256
+KV_N_TILE = 64
 PROJ_M_TILE = 80
+
+
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_a.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _proj_q_a(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project ND activations and NZ weights with packed MX scales."""
+    ...
+
+
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_b.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _proj_q_b(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INDEX],
+    output_width: pl.Scalar[pl.INDEX],
+    row_start: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project ND activations and NZ weights with packed MX scales."""
+    ...
+
+
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_kv.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _proj_kv(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INDEX],
+    row_start: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project ND activations and NZ weights with packed MX scales."""
+    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -206,65 +252,8 @@ def q_proj_rope(
     query_latent: pl.Tensor,
     query: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    q_b_n_tile: pl.constexpr = 256,
-    q_b_max_workers: pl.constexpr = 2147483647,
 ):
-    """Project QA, normalize and quantize the latent, then project QB and rotate Q."""
-    for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
-        group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
-        group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
-        scale_start = group_start * (D // 32)
-        group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
-        projected = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.BF16)
-        gemm_mxfp8_to_bf16(
-            group_payload, group_scales, wq_a, wq_a_scale, projected,
-            group_rows, 0, 0, 0,
-            D, Q_LORA, "proj_q_a", Q_A_N_TILE, Q_A_K_TILE, 1, 0, 0, PROJ_M_TILE, 2147483647, 2,
-        )
-        qb_payload = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.FP8E4M3FN)
-        qb_scales = pl.create_tensor([1, PROJ_M_TILE * (Q_LORA // 32)], dtype=pl.FP8E8M0)
-        for q_mt in pl.parallel(PROJ_M_TILE // MX_M_TILE):
-            q_local = q_mt * MX_M_TILE
-            q_start = group_start + pl.min(q_local, group_rows)
-            q_rows = pl.max(pl.min(MX_M_TILE, group_rows - q_local), 0)
-            projected_tile = pl.slice(projected, [q_rows, Q_LORA], [q_local, 0])
-            latent_tile = pl.slice(query_latent, [q_rows, Q_LORA], [q_start, 0])
-            qb_payload_tile = pl.tensor.slice(qb_payload, [MX_M_TILE, Q_LORA], [q_local, 0])
-            qb_scale_start = q_local * (Q_LORA // 32)
-            qb_scales_tile = pl.tensor.slice(qb_scales, [1, MX_M_TILE * (Q_LORA // 32)], [0, qb_scale_start])
-            _q_normalize_to_mx(
-                projected_tile, q_norm_weight, latent_tile,
-                qb_payload_tile, qb_scales_tile, q_rows, 5,
-            )
-        query_group = pl.slice(query, [group_rows, LOCAL_H * HEAD_DIM], [group_start, 0])
-        group_tokens = pl.cast(group_rows, pl.INT32)
-        gemm_mxfp8_to_bf16(
-            qb_payload, qb_scales, wq_b, wq_b_scale, query_group,
-            group_tokens, 0, 0, 0, Q_LORA, LOCAL_H * HEAD_DIM,
-            "proj_q_b", q_b_n_tile, K_TILE, 1, 0, 0, PROJ_M_TILE, q_b_max_workers, 4,
-        )
-        _rope_inplace(query, rope_cos, rope_sin, group_start, group_tokens, LOCAL_H, "attention_q_rope")
-    return query_latent, query
-
-
-@pl.jit.inline(auto_scope=False)
-def q_proj_rope_retain(
-    payload: pl.Tensor,
-    scales: pl.Tensor,
-    wq_a: pl.Tensor,
-    wq_a_scale: pl.Tensor,
-    q_norm_weight: pl.Tensor,
-    wq_b: pl.Tensor,
-    wq_b_scale: pl.Tensor,
-    rope_cos: pl.Tensor,
-    rope_sin: pl.Tensor,
-    query_latent: pl.Tensor,
-    query: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    q_b_n_tile: pl.constexpr = 256,
-    q_b_max_workers: pl.constexpr = 2147483647,
-):
-    """Project Q and retain the M80 Q-B payload/scales for Index-Q reuse."""
+    """Project NZ QA/QB weights, rotate Q, and retain M80 QB input for Index-Q."""
     payload_rows = pl.tensor.dim(payload, 0)
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
@@ -274,11 +263,8 @@ def q_proj_rope_retain(
         scale_start = group_start * (D // 32)
         group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
         projected = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.BF16)
-        gemm_mxfp8_to_bf16(
-            group_payload, group_scales, wq_a, wq_a_scale, projected,
-            group_rows, 0, 0, 0,
-            D, Q_LORA, "proj_q_a", Q_A_N_TILE, Q_A_K_TILE, 1, 0, 0, PROJ_M_TILE, 2147483647, 2,
-        )
+        with pl.spmd(Q_LORA // Q_A_N_TILE, name_hint="proj_q_a", sync_start=True):
+            projected = _proj_q_a(group_payload, wq_a, group_scales, wq_a_scale, projected, group_rows)
         qb_payload_group = pl.tensor.slice(qb_payload, [PROJ_M_TILE, Q_LORA], [group_start, 0])
         qb_scale_start = group_start * (Q_LORA // 32)
         qb_scales_group = pl.tensor.slice(
@@ -299,13 +285,12 @@ def q_proj_rope_retain(
                 projected_tile, q_norm_weight, latent_tile,
                 qb_payload_tile, qb_scales_tile, q_rows, 5,
             )
-        query_group = pl.slice(query, [group_rows, LOCAL_H * HEAD_DIM], [group_start, 0])
         group_tokens = pl.cast(group_rows, pl.INT32)
-        gemm_mxfp8_to_bf16(
-            qb_payload_group, qb_scales_group, wq_b, wq_b_scale, query_group,
-            group_tokens, 0, 0, 0, Q_LORA, LOCAL_H * HEAD_DIM,
-            "proj_q_b", q_b_n_tile, K_TILE, 1, 0, 0, PROJ_M_TILE, q_b_max_workers, 4,
-        )
+        with pl.spmd(pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE), name_hint="proj_q_b", sync_start=True):
+            query = _proj_q_b(
+                qb_payload_group, wq_b, qb_scales_group, wq_b_scale,
+                query, group_rows, LOCAL_H * HEAD_DIM, group_start,
+            )
         _rope_inplace(query, rope_cos, rope_sin, group_start, group_tokens, LOCAL_H, "attention_q_rope")
     return query_latent, query, qb_payload, qb_scales
 
@@ -323,18 +308,17 @@ def kv_proj_rope(
     window_kv: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Project KV, normalize to BF16, and rotate its RoPE tail in M80 groups."""
+    """Project NZ KV weights, normalize to BF16, and rotate the RoPE tail in M80 groups."""
     for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
         group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
         group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
         scale_start = group_start * (D // 32)
         group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
+        with pl.spmd(HEAD_DIM // KV_N_TILE, name_hint="proj_kv", sync_start=True):
+            kv_projection = _proj_kv(
+                group_payload, wkv, group_scales, wkv_scale, kv_projection, group_rows, group_start,
+            )
         projection_group = pl.slice(kv_projection, [group_rows, HEAD_DIM], [group_start, 0])
-        gemm_mxfp8_to_bf16(
-            group_payload, group_scales, wkv, wkv_scale, projection_group,
-            group_rows, 0, 0, 0,
-            D, HEAD_DIM, "proj_kv", N_TILE, K_TILE, 1, 0, 0, PROJ_M_TILE, 2147483647, 2,
-        )
         normalized_group = pl.slice(window_kv, [group_rows, HEAD_DIM], [group_start, 0])
         group_tokens = pl.cast(group_rows, pl.INT32)
         for norm_worker in pl.spmd((group_tokens + 7) // 8, name_hint="norm_kv"):
@@ -389,6 +373,15 @@ def golden_qkv_proj_rope(
     sequential_query: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project normalized query latent and shared KV, then rotate their RoPE tails."""
+    from quant import unpack_fp8_nz
+
+    if wq_a.dtype == torch.float8_e4m3fn:
+        wq_a = unpack_fp8_nz(wq_a)
+    if wq_b.dtype == torch.float8_e4m3fn:
+        wq_b = unpack_fp8_nz(wq_b)
+    if wkv.dtype == torch.float8_e4m3fn:
+        wkv = unpack_fp8_nz(wkv)
+
     def project(value, weight, scale):
         if sequential_query and scale is not None:
             return golden_gemm_bf16_via_mxfp8_to_bf16_sequential(value, weight, scale)

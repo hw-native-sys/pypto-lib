@@ -151,7 +151,7 @@ def dspark_attention(
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, q,
-        num_tokens, 256, 2147483647,
+        num_tokens,
     )
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(

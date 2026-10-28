@@ -88,7 +88,7 @@ def decode_c1a_reuse(
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens, 256, 24,
+        num_tokens,
     )
     kv_proj_rope(
         proj_payload, proj_scales,

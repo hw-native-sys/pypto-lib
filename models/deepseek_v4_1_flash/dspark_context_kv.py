@@ -36,6 +36,10 @@ def golden_context_kv_cache(
     cache_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Publish one draft layer's context KV into its own MXFP8 SWA cache."""
+    from quant import unpack_fp8_nz
+
+    if weight.dtype == torch.float8_e4m3fn:
+        weight = unpack_fp8_nz(weight)
     if slots.shape != main_x.shape[:1]:
         raise ValueError("context slots must have one entry per token")
     if cache.shape[:-1] != cache_scale.shape[:-1] or cache.shape[-1] != cache_scale.shape[-1] * 32:
@@ -169,12 +173,13 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     from golden import ScalarSpec, TensorSpec, run
-    from quant import pack_mx_b_scale
+    from quant import pack_fp8_nz, pack_mx_b_scale
 
     torch.manual_seed(42)
     tokens = DSPARK_QUERY_WIDTH
     main_x = torch.randn(tokens, D, dtype=torch.bfloat16) * 0.1
     weight = (torch.randn(D, HEAD_DIM) * 0.01).to(torch.float8_e4m3fn)
+    weight = pack_fp8_nz(weight)
     weight_scale = pack_mx_b_scale(torch.full((D // 32, HEAD_DIM), 127, dtype=torch.uint8))
     weight_scale = weight_scale.view(torch.float8_e8m0fnu)
     cos = torch.ones(tokens, ROPE_DIM // 2)

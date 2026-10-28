@@ -136,7 +136,7 @@ def prefill_c1a_reindex_attention(
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
             query_latent, query,
-            num_tokens, 256, 2147483647,
+            num_tokens,
         )
         cache_ready = pl.system.task_dummy(deps=[])
         indexer_completion = prefill_indexer(

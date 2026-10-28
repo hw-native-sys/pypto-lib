@@ -109,7 +109,7 @@ def prefill_c2a_reuse_attention(
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens, 256, 2147483647,
+        num_tokens,
     )
     kv_proj_rope(
         proj_payload, proj_scales,
@@ -444,16 +444,23 @@ def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     publication and the indexer removed: the selection arrives as an input and the
     compressed pool is read-only.
     """
+    from quant import unpack_fp8_nz
     t = inputs
     x = t["x"]
     tokens = x.shape[0]
     head_dim = t["window_cache"].shape[-1]
     local_heads = t["attn_sink"].numel()
 
-    qr = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
-    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    qa_weight = unpack_fp8_nz(t["wq_a"])
+    qb_weight = unpack_fp8_nz(t["wq_b"])
+    kv_weight = unpack_fp8_nz(t["wkv"])
+    projected = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, qa_weight, t["wq_a_scale"])
+    qr = golden_rms_norm(projected, t["q_norm_weight"])
+    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, qb_weight, t["wq_b_scale"])
+    q = q.unflatten(-1, (local_heads, head_dim))
     q = golden_rope_tail(q, t["rope_cos"], t["rope_sin"])
-    kv = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    projected_kv = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, kv_weight, t["wkv_scale"])
+    kv = golden_rms_norm(projected_kv, t["kv_norm_weight"])
     kv = golden_rope_tail(kv, t["rope_cos"], t["rope_sin"])
 
     window_cache = t["window_cache"].clone()

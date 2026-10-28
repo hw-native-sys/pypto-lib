@@ -985,10 +985,16 @@ def swa_official_reference(tensors, *, shared_cache=False, key_tile=128):
     groups = t["wo_a"].shape[0]
     group_in = t["wo_a"].shape[-2]
 
-    qr = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(t["x"], t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
-    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    qa_weight = unpack_fp8_nz(t["wq_a"])
+    qb_weight = unpack_fp8_nz(t["wq_b"])
+    kv_weight = unpack_fp8_nz(t["wkv"])
+    projected = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(t["x"], qa_weight, t["wq_a_scale"])
+    qr = golden_rms_norm(projected, t["q_norm_weight"])
+    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, qb_weight, t["wq_b_scale"])
+    q = q.unflatten(-1, (local_heads, head_dim))
     q = golden_rope_tail(q, t["rope_cos"], t["rope_sin"])
-    kv = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(t["x"], t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    projected_kv = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(t["x"], kv_weight, t["wkv_scale"])
+    kv = golden_rms_norm(projected_kv, t["kv_norm_weight"])
     kv = golden_rope_tail(kv, t["rope_cos"], t["rope_sin"])
     payload, scales = quantize_mxfp8_cache(kv)
     cache = t["window_cache"].clone()
@@ -1048,6 +1054,9 @@ def make_swa_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
     qb, qbs = weight(Q_LORA, LOCAL_H * HEAD_DIM)
     kv, kvs = weight(D, HEAD_DIM)
     ob, obs = weight(LOCAL_O_WIDTH, D)
+    qa = pack_fp8_nz(qa)
+    qb = pack_fp8_nz(qb)
+    kv = pack_fp8_nz(kv)
     ob = pack_fp8_nz(ob)
     positions = torch.full((batch,), position, dtype=torch.int64)
     if batch > 1:

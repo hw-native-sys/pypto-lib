@@ -153,7 +153,7 @@ def prefill_c2a_full_attention(
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens, 256, 2147483647,
+        num_tokens,
     )
     kv_proj_rope(
         proj_payload, proj_scales,
@@ -369,6 +369,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     Returns the per-rank partial output (before TP reduction) plus every mutated state: the
     three paged caches with scales, the compressor state, and the physical Top-K rows.
     """
+    from quant import unpack_fp8_nz
     t = inputs
     x = t["x"]
     tokens = x.shape[0]
@@ -378,10 +379,16 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     index_heads = t["index_weights_proj"].shape[-1]
 
     # a. Query/KV projection and rotary embedding.
-    qr = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
-    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    qa_weight = unpack_fp8_nz(t["wq_a"])
+    qb_weight = unpack_fp8_nz(t["wq_b"])
+    kv_weight = unpack_fp8_nz(t["wkv"])
+    projected = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, qa_weight, t["wq_a_scale"])
+    qr = golden_rms_norm(projected, t["q_norm_weight"])
+    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, qb_weight, t["wq_b_scale"])
+    q = q.unflatten(-1, (local_heads, head_dim))
     q = golden_rope_tail(q, t["rope_cos"], t["rope_sin"])
-    kv = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    projected_kv = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, kv_weight, t["wkv_scale"])
+    kv = golden_rms_norm(projected_kv, t["kv_norm_weight"])
     kv = golden_rope_tail(kv, t["rope_cos"], t["rope_sin"])
 
     # b. Sliding-window cache: MXFP8, group 32, BF16 scales; addressed rows only.
@@ -641,6 +648,9 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
     wkv, wkv_scale = _weight(gen, D, HEAD_DIM)
     wo_b, wo_b_scale = _weight(gen, LOCAL_O_WIDTH, D)
     from quant import pack_fp8_nz
+    wq_a = pack_fp8_nz(wq_a)
+    wq_b = pack_fp8_nz(wq_b)
+    wkv = pack_fp8_nz(wkv)
     wo_b = pack_fp8_nz(wo_b)
     index_wq_b, index_wq_b_scale = _weight(gen, Q_LORA, INDEX_H * INDEX_DIM)
 

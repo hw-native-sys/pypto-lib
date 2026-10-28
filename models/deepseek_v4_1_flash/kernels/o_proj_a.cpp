@@ -7,9 +7,9 @@
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
 // O-A: grouped MXFP8 [80, 4096] x [4096, 1024] to concatenated BF16 columns.
-#include "output_projection.hpp"
+#include "mxfp8_projection.hpp"
 
-using namespace output_projection;
+using namespace mxfp8_projection;
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     int block = get_block_idx(args);

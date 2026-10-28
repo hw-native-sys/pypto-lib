@@ -104,7 +104,7 @@ def prefill_c1a_reuse_attention(
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
             query_latent, query,
-            num_tokens, 256, 2147483647,
+            num_tokens,
         )
         source_ready = pl.system.task_dummy(deps=[])
         window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
