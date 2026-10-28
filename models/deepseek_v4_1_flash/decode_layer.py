@@ -91,8 +91,8 @@ def l2_decode_layer(
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
+    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
@@ -349,8 +349,8 @@ def l3_decode_layer(
     index_block_table: pl.Tensor[[EP_SIZE, B_DYN, TABLE_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressor_wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.FP32],
-    compressor_wgate: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.FP32],
+    compressor_wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.BF16],
+    compressor_wgate: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.BF16],
     c1a_compressor_wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.BF16],
     query_start_loc: pl.Tensor[[EP_SIZE, Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[EP_SIZE, B_DYN, 1], pl.INT32],
@@ -1028,10 +1028,11 @@ def make_decode_layer_golden_inputs(layer_id: int) -> dict:
     from quant import pack_bf16_nz
 
     attention = _attention_values()
+    attention["compressor_wkv"] = pack_bf16_nz(attention["compressor_wkv"].to(torch.bfloat16))
+    attention["compressor_wgate"] = pack_bf16_nz(attention["compressor_wgate"].to(torch.bfloat16))
     if layer_id >= 20:
         attention["compressed_lens"] = torch.tensor([1, 2], dtype=torch.int32)
         attention["compressed_slots"] = torch.tensor([0, 1], dtype=torch.int64)
-        attention["compressor_wkv"] = pack_bf16_nz(attention["compressor_wkv"].to(torch.bfloat16))
     if layer_id in (3, 21):
         attention["compressed_indices"] = torch.tensor([[0, -1], [0, 1]], dtype=torch.int32)
 

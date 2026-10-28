@@ -134,8 +134,8 @@ def decode_encoder(
         pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
     c2a_index_block_table: pl.Tensor[[B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
-    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
-    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
+    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
+    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
@@ -294,8 +294,8 @@ def decode_encoder(
                 full_index_cache_scale = pl.slice(index_cache_scale_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], [full_source_id * index_blocks_per_source, 0, 0, 0])
                 full_state_cache = pl.slice(state_cache_pool, [state_blocks_per_source, STATE_CAPACITY, STATE_WIDTH], [full_source_id * state_blocks_per_source, 0, 0])
                 full_index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(index_wq_b_scale, [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], [(layer - 2) // 6 * (Q_LORA // MX_GROUP), 0])
-                full_c2a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32] = c2a_compressor_wkv[full_source_id]
-                full_c2a_compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32] = c2a_compressor_wgate[full_source_id]
+                full_c2a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ] = c2a_compressor_wkv[full_source_id]
+                full_c2a_compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ] = c2a_compressor_wgate[full_source_id]
                 full_compressor_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(compressor_norm_weight, [HEAD_DIM], [full_source_id * HEAD_DIM])
                 full_index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16] = pl.slice(index_wk, [HEAD_DIM, INDEX_DIM], [full_source_id * HEAD_DIM, 0])
                 full_index_norm: pl.Tensor[[INDEX_DIM], pl.BF16] = pl.slice(index_norm_weight, [INDEX_DIM], [full_source_id * INDEX_DIM])
@@ -432,8 +432,8 @@ def decode_decoder(
         pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]
     ],
     c1a_index_block_table: pl.Tensor[[B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
-    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
-    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
+    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
+    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
@@ -714,8 +714,8 @@ def l2_decode_fwd(
     ],
     c2a_index_block_table: pl.Tensor[[B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
-    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
-    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
+    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
+    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
@@ -909,8 +909,8 @@ def l3_decode_fwd(
     ],
     c2a_index_block_table: pl.Tensor[[EP_SIZE, B_DYN, FWD_C2A_TABLE_DYN], pl.INT32],
     c1a_index_block_table: pl.Tensor[[EP_SIZE, B_DYN, FWD_C1A_TABLE_DYN], pl.INT32],
-    c2a_compressor_wkv: pl.Tensor[[EP_SIZE, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
-    c2a_compressor_wgate: pl.Tensor[[EP_SIZE, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
+    c2a_compressor_wkv: pl.Tensor[[EP_SIZE, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16],
+    c2a_compressor_wgate: pl.Tensor[[EP_SIZE, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16],
     c1a_compressor_wkv: pl.Tensor[[EP_SIZE, D, HEAD_DIM], pl.BF16],
     query_start_loc: pl.Tensor[[EP_SIZE, Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[EP_SIZE, B_DYN, 1], pl.INT32],

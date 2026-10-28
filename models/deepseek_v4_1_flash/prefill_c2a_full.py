@@ -34,7 +34,7 @@ from config import (
     STATE_BLOCKS_DYN, TP_SIZE, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, MAX_BATCH_PER_DP,
     PREFILL_MAX_TOKENS, STATE_CAPACITY, WINDOW_CACHE_GROUP, SP_T_DYN, BLOCK_SIZE,
 )
-from compressor import STATE_WIDTH, project_ratio2, compressor_ratio2, publish_c2a_compressed
+from compressor import STATE_WIDTH, c2a_compressor_project, c2a_compressor_pool_state, c2a_compressor_publish
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import (
     retire_prefill_signals,
@@ -44,7 +44,7 @@ from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes, prefill_sp_
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables
 from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj_rope
-from quant import dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
+from quant import pack_bf16_nz, unpack_bf16_nz, dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import paged_slots, token_shards, window_metadata
@@ -55,7 +55,7 @@ from sparse_attention import (
 from prefill_indexer import prefill_indexer, publish_c2a_index_key
 
 
-from compressor import prefill_c2a_compressed_rope
+from compressor import compressor_rope
 
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
@@ -113,8 +113,8 @@ def prefill_c2a_full_attention(
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
+    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
@@ -166,9 +166,9 @@ def prefill_c2a_full_attention(
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
-    project_ratio2(x, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens)
+    c2a_compressor_project(x, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    pool_tid, state_tid = compressor_ratio2(
+    pool_tid, state_tid = c2a_compressor_pool_state(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
         state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
     )
@@ -179,10 +179,10 @@ def prefill_c2a_full_attention(
         compressed_slots, index_cache, index_cache_scale, num_tokens, pool_tid, cache_ready,
     )
     rotated_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    prefill_c2a_compressed_rope(latent, compressed_rope_cos, compressed_rope_sin, rotated_latent, num_tokens)
-    compressed_publish_tid = publish_c2a_compressed(
+    rotated_latent = compressor_rope(latent, compressed_rope_cos, compressed_rope_sin, rotated_latent, num_tokens)
+    compressed_publish_tid = c2a_compressor_publish(
         rotated_latent, compressed_slots, compressed_cache, compressed_cache_scale,
-        num_tokens, cache_ready, pool_tid,
+        num_tokens, cache_ready,
     )
 
     select_tid = prefill_indexer(
@@ -254,8 +254,8 @@ def prefill_c2a_full_sp(
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
+    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
@@ -407,8 +407,8 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     #    BF16 before RMSNorm, published exactly when position_ids % 2 == 1. Ring rows
     #    contain the KV projection followed by the gate score.
     state_cache = t["state_cache"].clone()
-    pending_kv = x.float() @ t["compressor_wkv"].float()
-    pending_score = x.float() @ t["compressor_wgate"].float()
+    pending_kv = x.float() @ unpack_bf16_nz(t["compressor_wkv"]).float()
+    pending_score = x.float() @ unpack_bf16_nz(t["compressor_wgate"]).float()
     position_ids = t["position_ids"].long()
     latent = torch.zeros(tokens, head_dim, dtype=torch.bfloat16)
     publish = torch.zeros(tokens, dtype=torch.bool)
@@ -654,8 +654,8 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
     wo_b = pack_fp8_nz(wo_b)
     index_wq_b, index_wq_b_scale = _weight(gen, Q_LORA, INDEX_H * INDEX_DIM)
 
-    compressor_wkv = torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)
-    compressor_wgate = torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)
+    compressor_wkv = (torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)).bfloat16()
+    compressor_wgate = (torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)).bfloat16()
     wo_a_values = torch.randn(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, generator=gen)
     wo_a, wo_a_scale = quantize_grouped_mxfp8_weight((wo_a_values / math.sqrt(O_GROUP_IN)).bfloat16())
     # Seed each request's predecessor projections in its physical ring block.
@@ -666,8 +666,8 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
         if prefix:
             block = int(state_block_table[request, 0])
             slot = (prefix - 1) % STATE_CAPACITY
-            state_cache[block, slot, :HEAD_DIM] = pending[request] @ compressor_wkv
-            state_cache[block, slot, HEAD_DIM:] = pending[request] @ compressor_wgate
+            state_cache[block, slot, :HEAD_DIM] = pending[request] @ compressor_wkv.float()
+            state_cache[block, slot, HEAD_DIM:] = pending[request] @ compressor_wgate.float()
     query_start_loc = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
 
     window_cache, window_cache_scales = quantize_mxfp8_cache(
@@ -715,8 +715,8 @@ def make_c2a_inputs(tokens=24, requests=6, seed=17, case="mixed", mode="decode",
         "position_ids": positions.to(torch.int32),
         "compressed_rope_cos": compressed_rope_cos,
         "compressed_rope_sin": compressed_rope_sin,
-        "compressor_wkv": compressor_wkv,
-        "compressor_wgate": compressor_wgate,
+        "compressor_wkv": pack_bf16_nz(compressor_wkv),
+        "compressor_wgate": pack_bf16_nz(compressor_wgate),
         "query_start_loc": query_start_loc,
         "state_block_table": state_block_table,
         "state_cache": state_cache,
@@ -1045,8 +1045,8 @@ def l2_prefill_c2a_full(
     compressed_freqs_cos: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_positions: pl.Tensor[[T_DYN], pl.INT32],
-    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
+    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.InOut[pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
@@ -1157,8 +1157,8 @@ def l3_prefill_c2a_full(
     compressed_freqs_cos: pl.Tensor[[RANKS_DYN, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_freqs_sin: pl.Tensor[[RANKS_DYN, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_positions: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
-    compressor_wkv: pl.Tensor[[RANKS_DYN, D, HEAD_DIM], pl.FP32],
-    compressor_wgate: pl.Tensor[[RANKS_DYN, D, HEAD_DIM], pl.FP32],
+    compressor_wkv: pl.Tensor[[RANKS_DYN, D, HEAD_DIM], pl.BF16],
+    compressor_wgate: pl.Tensor[[RANKS_DYN, D, HEAD_DIM], pl.BF16],
     query_start_loc: pl.Tensor[[RANKS_DYN, Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[RANKS_DYN, B_DYN, 1], pl.INT32],
     state_cache: pl.InOut[

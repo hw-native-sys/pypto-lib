@@ -530,101 +530,8 @@ def _index_key_rope_block(
     return output
 
 
-def make_fp4_publish(width, group, scale_dtype, cache_dim, name_hint="pub_idx"):
-    """Build an FP4 cache-publish kernel for one scale dtype.
-
-    The BF16 (compressed) and E8M0 (index) encodings store different scale
-    dtypes, so the two variants must be separate traced functions: PyPTO traces
-    both arms of a Python ``if`` on a closure value and rejects the resulting
-    dtype-divergent assignment.  This factory only dispatches between them.
-    """
-    if scale_dtype == pl.FP8E8M0:
-        return _make_fp4_publish_e8m0(width, group, cache_dim, name_hint)
-    return _make_fp4_publish_bf16(width, group, cache_dim, name_hint)
-
-
-def _make_fp4_publish_bf16(width, group, cache_dim, name_hint):
-    padded_width = max(width, 32 * group)
-
-    @pl.jit.inline(auto_scope=False)
-    def publish(
-        source: pl.Tensor[[T_DYN, width], pl.BF16],
-        slots: pl.Tensor[[T_DYN], pl.INT64],
-        cache: pl.Tensor[[cache_dim, 128, 1, width // 2], pl.UINT8],
-        scales: pl.Tensor[[cache_dim, 128, 1, width // group], pl.BF16],
-        num_tokens: pl.Scalar[pl.INT32],
-        cache_ready: pl.Scalar[pl.TASK_ID],
-        kv_ready: pl.Scalar[pl.TASK_ID],
-    ):
-        cache_rows = pl.tensor.dim(cache, 0) * 128
-        flat = pl.reshape(cache, [cache_rows, width // 2])
-        flat_scale = pl.reshape(scales, [cache_rows, width // group])
-        # Each physical cache page has one publishing worker.
-        workers = pl.min(num_tokens, 4)
-        with pl.spmd(workers, name_hint=name_hint, deps=[cache_ready, kv_ready]) as published:
-            worker = pl.tile.get_block_idx()
-            for t in pl.range(num_tokens):
-                slot = pl.read(slots, [t])
-                if slot >= 0 and (slot // 128) % workers == worker:
-                    physical = pl.cast(slot, pl.INDEX)
-                    raw = pl.load(source, [t, 0], [1, padded_width], valid_shape=[1, width])
-                    raw = pl.set_validshape(pl.fillpad(raw, pad_value=pl.PadValue.zero), 1, padded_width)
-                    values = pl.reshape(pl.cast(raw, pl.FP32), [padded_width // group, group])
-                    temporary = pl.tile.create([padded_width // group, group], dtype=pl.FP32)
-                    amax = pl.row_max(pl.abs(values), tmp_tile=temporary)
-                    factors_raw = pl.maximum(pl.mul(amax, 1.0 / 6.0), 0.001953125)
-                    stored_scale = pl.cast(factors_raw, pl.BF16, mode="rint")
-                    factors = pl.cast(stored_scale, pl.FP32)
-                    normalized = pl.minimum(pl.maximum(pl.row_expand_div(values, factors), -6.0), 6.0)
-                    magnitude = pl.abs(normalized)
-                    rounded = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=0.0)
-                    select_tmp = pl.tile.create([1, 16], dtype=pl.UINT32)
-                    predicate = pl.tile.cmps(magnitude, 0.25, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=0.5)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 0.75, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=1.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 1.25, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=1.5)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 1.75, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=2.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 2.5, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=3.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 3.5, cmp_type=5)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=4.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    predicate = pl.tile.cmps(magnitude, 5.0, cmp_type=4)
-                    level = pl.tile.full([padded_width // group, group], dtype=pl.FP32, value=6.0)
-                    rounded = pl.tile.sel(predicate, level, rounded, select_tmp)
-                    # Convert the exact RNE levels to E2M1 codes, then pack adjacent lanes.
-                    codes = pl.add(pl.minimum(pl.mul(rounded, 2.0), 4.0),
-                                   pl.minimum(pl.maximum(pl.sub(rounded, 2.0), 0.0), 3.0))
-                    sign = pl.ands(pl.shrs(pl.reinterpret_view(normalized, pl.INT32), 28), 8)
-                    codes = pl.reshape(pl.or_(pl.cast(codes, pl.INT32), sign), [1, padded_width])
-                    low = pl.tile.gather_mask(
-                        codes, mask_pattern=pl.tile.MaskPattern.P0101, output_dtype=pl.INT32
-                    )
-                    high = pl.tile.gather_mask(
-                        codes, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-                    )
-                    packed = pl.add(low, pl.mul(high, 16))
-                    signed_bytes = pl.sub(packed, pl.mul(pl.shrs(packed, 7), 256))
-                    payload_bytes = pl.reinterpret_view(pl.cast(signed_bytes, pl.INT8), pl.UINT8)
-                    payload = pl.set_validshape(payload_bytes, 1, width // 2)
-                    encoded = pl.set_validshape(pl.reshape(stored_scale, [1, padded_width // group]),
-                                                1, width // group)
-                    pl.store(payload, [physical, 0], flat)
-                    pl.store(encoded, [physical, 0], flat_scale)
-        return published
-
-    return publish
-
-
-def _make_fp4_publish_e8m0(width, group, cache_dim, name_hint):
+def make_index_publish(width, group, cache_dim, name_hint="pub_idx"):
+    """Build an index-cache publisher with E8M0 scales."""
     token_tile = 8
     padded_width = token_tile * width
 
@@ -2570,7 +2477,7 @@ def _score_select_c2a_groups(
     return result
 
 
-publish_c2a_index = make_fp4_publish(INDEX_DIM, INDEX_CACHE_GROUP, pl.FP8E8M0, INDEX_BLOCKS_DYN)
+publish_c2a_index = make_index_publish(INDEX_DIM, INDEX_CACHE_GROUP, INDEX_BLOCKS_DYN)
 
 
 @pl.jit.inline(auto_scope=False)

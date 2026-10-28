@@ -179,8 +179,8 @@ def prefill_attention(
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     compressed_rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     compressed_rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32],
-    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32],
+    compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
+    compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
     state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
@@ -447,8 +447,8 @@ def l2_prefill_fwd(
     wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
-    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
-    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
+    c2a_compressor_wkv: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
+    c2a_compressor_wgate: pl.Tensor[[C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16, pl.NZ],
     c1a_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     compressor_norm_weight: pl.Tensor[[KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
     index_wk: pl.Tensor[[INDEX_SOURCE_COUNT * HEAD_DIM, INDEX_DIM], pl.BF16],
@@ -617,8 +617,8 @@ def l2_prefill_fwd(
         layer_attn_sink: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(attn_sink, [LOCAL_H], [layer * LOCAL_H])
         layer_wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
         layer_wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
-        layer_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP32] = c2a_compressor_wkv[c2a_source]
-        layer_compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.FP32] = c2a_compressor_wgate[c2a_source]
+        layer_compressor_wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ] = c2a_compressor_wkv[c2a_source]
+        layer_compressor_wgate: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ] = c2a_compressor_wgate[c2a_source]
         layer_compressor_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(compressor_norm_weight, [HEAD_DIM], [kv_source * HEAD_DIM])
         layer_index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16] = pl.slice(index_wk, [HEAD_DIM, INDEX_DIM], [index_source * HEAD_DIM, 0])
         layer_index_norm: pl.Tensor[[INDEX_DIM], pl.BF16] = pl.slice(index_norm_weight, [INDEX_DIM], [index_source * INDEX_DIM])
@@ -765,8 +765,8 @@ def l3_prefill_fwd(
     wo_a_scale: pl.Tensor[[RANKS, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[RANKS, N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
-    c2a_compressor_wkv: pl.Tensor[[RANKS, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
-    c2a_compressor_wgate: pl.Tensor[[RANKS, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.FP32],
+    c2a_compressor_wkv: pl.Tensor[[RANKS, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16],
+    c2a_compressor_wgate: pl.Tensor[[RANKS, C2A_SOURCE_COUNT, D, HEAD_DIM], pl.BF16],
     c1a_compressor_wkv: pl.Tensor[[RANKS, D, HEAD_DIM], pl.BF16],
     compressor_norm_weight: pl.Tensor[[RANKS, KV_SOURCE_COUNT * HEAD_DIM], pl.BF16],
     index_wk: pl.Tensor[[RANKS, INDEX_SOURCE_COUNT * HEAD_DIM, INDEX_DIM], pl.BF16],
@@ -1179,8 +1179,8 @@ def forward_weight_layouts(local_experts: int):
         "wo_a_scale": ((layers * local_groups, o_group_in // 32, M.o_lora_rank), torch.float8_e8m0fnu),
         "wo_b": ((layers, o_width, d), torch.float8_e4m3fn),
         "wo_b_scale": ((layers * (o_width // 32), d), torch.float8_e8m0fnu),
-        "c2a_compressor_wkv": ((c2a_sources, d, M.head_dim), torch.float32),
-        "c2a_compressor_wgate": ((c2a_sources, d, M.head_dim), torch.float32),
+        "c2a_compressor_wkv": ((c2a_sources, d, M.head_dim), torch.bfloat16),
+        "c2a_compressor_wgate": ((c2a_sources, d, M.head_dim), torch.bfloat16),
         "c1a_compressor_wkv": ((d, M.head_dim), torch.bfloat16),
         "compressor_norm_weight": ((kv_sources * M.head_dim,), torch.bfloat16),
         "index_wk": ((index_sources * M.head_dim, M.index_head_dim), torch.bfloat16),
@@ -1260,7 +1260,7 @@ class ResidentPrefillWeights:
         for slot, layer in enumerate(c2a_sources):
             for projection in ("wkv", "wgate"):
                 name = f"layers.{layer}.attn.compressor.{projection}.weight"
-                self.entries.append(("c2a_compressor_" + projection, name, slot, len(c2a_sources), "transpose"))
+                self.entries.append(("c2a_compressor_" + projection, name, slot, len(c2a_sources), "bf16_nz"))
         c1a_source = next(source for source in M.kv_source_layer_ids if M.compress_ratios[source] == 1)
         self.entries.extend((
             ("c1a_compressor_wkv", f"layers.{c1a_source}.attn.compressor.wkv.weight", 0, 1, "bf16_nz"),

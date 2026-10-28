@@ -38,7 +38,7 @@ from utils import token_shards
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
-from compressor import c1a_compressor_project, prefill_c1a_compressor_rope, publish_compressed_cache
+from compressor import c1a_compressor_project, compressor_rope, c1a_compressor_publish
 from prefill_indexer import (
     prefill_indexer, publish_c1a_index_key, golden_prefill_indexer,
     golden_index_key, golden_select_candidate_block_pool,
@@ -570,10 +570,13 @@ def prefill_publish_decoder(
         if norm_worker < norm_blocks:
             rms_norm(compressed_projection, compressor_norm_weight, compressed_latent, norm_worker, num_tokens, width=HEAD_DIM)
     compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    prefill_c1a_compressor_rope(
+    compressed_rotated = compressor_rope(
         compressed_latent, compressed_rope_cos, compressed_rope_sin, compressed_rotated, num_tokens,
     )
-    compressed_ready = publish_compressed_cache(compressed_rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens)
+    compressed_ready = c1a_compressor_publish(
+        compressed_rotated, compressed_slots, compressed_cache, compressed_cache_scale,
+        num_tokens, projection_ready,
+    )
     index_ready = publish_c1a_index_key(
         compressed_latent, index_wk, index_norm_weight, compressed_rope_cos, compressed_rope_sin,
         compressed_slots, index_cache, index_cache_scale, num_tokens,

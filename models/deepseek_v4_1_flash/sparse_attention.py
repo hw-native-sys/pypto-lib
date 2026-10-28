@@ -15,8 +15,8 @@ import math
 import torch
 
 
-from compressor import golden_compressor_ratio1 as compressor_ratio1
-from compressor import golden_compressor_ratio2_paged as compressor_ratio2_paged
+from compressor import golden_c1a_compressor
+from compressor import golden_c2a_compressor
 from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
 from o_proj import golden_o_proj, golden_grouped_output
@@ -2331,14 +2331,14 @@ def golden_compressed_attention(
         if compressed_rope_cos is None or compressed_rope_sin is None or quantized_index is None:
             raise ValueError("full mode requires compressed RoPE rows and an index cache")
         if ratio == 1:
-            latent = compressor_ratio1(x, compressor_wkv, compressor_norm_weight)
+            latent = golden_c1a_compressor(x, compressor_wkv, compressor_norm_weight)
             publish_mask = compressed_slots >= 0
         elif ratio == 2:
             if compressor_wgate is None or state_block_table is None or updated_state is None:
                 raise ValueError("ratio-2 full mode requires gate weights and recurrent state")
             if position_ids is None or query_start_loc is None or request_ids is None:
                 raise ValueError("ratio-2 full mode requires positions, query starts and token-to-request indices")
-            latent, publish_mask = compressor_ratio2_paged(
+            latent, publish_mask = golden_c2a_compressor(
                 x,
                 query_start_loc,
                 position_ids,

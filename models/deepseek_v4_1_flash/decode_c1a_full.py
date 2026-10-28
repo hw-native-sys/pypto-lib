@@ -14,7 +14,7 @@ from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from o_proj import o_proj
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, use_pretransposed_index_query, score_select_c1a_groups,
-    make_fp4_publish, c1a_project_index_key, c1a_rotate_index_key,
+    make_index_publish, c1a_project_index_key, c1a_rotate_index_key,
 )
 from sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
@@ -25,7 +25,7 @@ from config import (
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
 )
 from rmsnorm import rms_norm
-from compressor import c1a_compressor_project, decode_c1a_compressor_rope
+from compressor import c1a_compressor_project, compressor_rope, c1a_compressor_publish
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -49,8 +49,7 @@ INDEX_TOPK = M.index_topk
 INDEX_QUERY_WORKER_TILE = 8
 
 
-publish_compressed = make_fp4_publish(HEAD_DIM, 16, pl.BF16, CMP_BLOCKS_DYN, name_hint="pub_cmp")
-publish_index = make_fp4_publish(INDEX_DIM, 32, pl.FP8E8M0, INDEX_BLOCKS_DYN, name_hint="pub_idx")
+publish_index = make_index_publish(INDEX_DIM, 32, INDEX_BLOCKS_DYN, name_hint="pub_idx")
 
 
 @pl.jit.inline(auto_scope=False)
@@ -152,9 +151,9 @@ def decode_c1a_full(
         index_key, compressed_slots, index_cache, index_cache_scale, num_tokens, x_ready, ik_tid,
     )
     rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    rc_tid = decode_c1a_compressor_rope(latent, compressed_rope_cos, compressed_rope_sin, rotated, num_tokens, nc_tid)
-    compressed_ready = publish_compressed(
-        rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens, x_ready, rc_tid,
+    rotated = compressor_rope(latent, compressed_rope_cos, compressed_rope_sin, rotated, num_tokens)
+    compressed_ready = c1a_compressor_publish(
+        rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens, x_ready,
     )
     # Logical index score capacity.
     score_width = pl.tensor.dim(index_block_table, 1) * 128
@@ -374,7 +373,7 @@ def golden_c1a(tensors, mode="full"):
     """Compute mHC pre, C1A attention, cache updates, and mHC post."""
     import torch
 
-    from compressor import golden_compressor_ratio1
+    from compressor import golden_c1a_compressor
     from qkv_proj_rope import golden_qkv_proj_rope, golden_rope_tail
     from o_proj import golden_o_proj
     from decode_indexer import (
@@ -413,7 +412,7 @@ def golden_c1a(tensors, mode="full"):
         index = index.view(torch.uint8).clone()
         index_scale = index_scale.view(torch.uint8).clone()
     if mode == "full":
-        latent = golden_compressor_ratio1(x, a["compressor_wkv"], a["compressor_norm_weight"])
+        latent = golden_c1a_compressor(x, a["compressor_wkv"], a["compressor_norm_weight"])
         key = golden_index_key(
             latent, a["index_wk"], a["index_norm_weight"], a["compressed_rope_cos"], a["compressed_rope_sin"],
         )
