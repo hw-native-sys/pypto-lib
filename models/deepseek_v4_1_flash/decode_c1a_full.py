@@ -25,7 +25,7 @@ from config import (
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
 )
 from rmsnorm import rms_norm
-from compressor import decode_c1a_compressor_project, decode_c1a_compressor_rope
+from compressor import c1a_compressor_project, decode_c1a_compressor_rope
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -133,7 +133,7 @@ def decode_c1a_full(
     )
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens, max_workers=2147483647)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    projected, pc_tid = decode_c1a_compressor_project(x_norm, compressor_wkv, projected, num_tokens, x_ready)
+    projected, pc_tid = c1a_compressor_project(x_norm, compressor_wkv, projected, num_tokens, x_ready)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     with pl.spmd((num_tokens + 7) // 8, name_hint="norm_cmp", deps=[pc_tid]) as nc_tid:
         norm_worker = pl.tile.get_block_idx()

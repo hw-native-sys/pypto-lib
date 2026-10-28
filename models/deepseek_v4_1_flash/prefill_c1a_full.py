@@ -38,7 +38,7 @@ from utils import token_shards
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
-from compressor import prefill_c1a_compressor_project, prefill_c1a_compressor_rope, publish_compressed_cache
+from compressor import c1a_compressor_project, prefill_c1a_compressor_rope, publish_compressed_cache
 from prefill_indexer import (
     prefill_indexer, publish_c1a_index_key, golden_prefill_indexer,
     golden_index_key, golden_select_candidate_block_pool,
@@ -560,10 +560,13 @@ def prefill_publish_decoder(
 ):
     tokens = pl.tensor.dim(x, 0)
     compressed_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    compressed_projection = prefill_c1a_compressor_project(x, compressor_wkv, compressed_projection, num_tokens)
+    projection_ready = pl.system.task_dummy(deps=[])
+    compressed_projection, projection_done = c1a_compressor_project(
+        x, compressor_wkv, compressed_projection, num_tokens, projection_ready,
+    )
     compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8
-    for norm_worker in pl.spmd(pl.max(1, norm_blocks), name_hint="attention_rmsnorm"):
+    for norm_worker in pl.spmd(pl.max(1, norm_blocks), name_hint="attention_rmsnorm", deps=[projection_done]):
         if norm_worker < norm_blocks:
             rms_norm(compressed_projection, compressor_norm_weight, compressed_latent, norm_worker, num_tokens, width=HEAD_DIM)
     compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)

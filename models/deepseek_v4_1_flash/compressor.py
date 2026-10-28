@@ -461,20 +461,6 @@ def compressor_ratio2(
 
 
 @pl.jit.inline(auto_scope=False)
-def prefill_c1a_compressor_project(
-    source: pl.Tensor,
-    weight: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    blocks = (num_tokens + C1A_PROJ_M_TILE - 1) // C1A_PROJ_M_TILE * (HEAD_DIM // C1A_PROJ_N_TILE)
-    workers = pl.max(blocks, 1)
-    with pl.spmd(workers, name_hint="prefill_proj_cmp"):
-        output = _project_c1a_block(source, weight, output, num_tokens)
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
 def prefill_c1a_compressor_rope(
     x: pl.Tensor,
     cos: pl.Tensor,
@@ -548,44 +534,33 @@ def publish_c2a_compressed(
 
 
 @pl.jit.inline(auto_scope=False)
-def _project_c1a_block(
-    source: pl.Tensor,
-    weight: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Project a full-height Cube tile and store only its active rows."""
-    with pl.at(level=pl.Level.CORE_GROUP):
-        block = pl.tile.get_block_idx()
-        row = block // (HEAD_DIM // C1A_PROJ_N_TILE) * C1A_PROJ_M_TILE
-        col = block % (HEAD_DIM // C1A_PROJ_N_TILE) * C1A_PROJ_N_TILE
-        rows = pl.max(pl.min(C1A_PROJ_M_TILE, num_tokens - row), 0)
-        a = pl.load(source, [row, 0], [C1A_PROJ_M_TILE, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
-        b = pl.load(weight, [0, col], [C1A_PROJ_K_TILE, C1A_PROJ_N_TILE], target_memory=pl.Mem.Mat)
-        full_a = pl.set_validshape(a, C1A_PROJ_M_TILE, C1A_PROJ_K_TILE)
-        acc = pl.matmul(full_a, b)
-        for k in pl.pipeline(C1A_PROJ_K_TILE, D, C1A_PROJ_K_TILE, stage=2):
-            a = pl.load(source, [row, k], [C1A_PROJ_M_TILE, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
-            b = pl.load(weight, [k, col], [C1A_PROJ_K_TILE, C1A_PROJ_N_TILE], target_memory=pl.Mem.Mat)
-            full_a = pl.set_validshape(a, C1A_PROJ_M_TILE, C1A_PROJ_K_TILE)
-            acc = pl.matmul_acc(acc, full_a, b)
-        value = pl.set_validshape(acc, rows, C1A_PROJ_N_TILE)
-        output = pl.store(value, [row, col], output)
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def decode_c1a_compressor_project(
+def c1a_compressor_project(
     source: pl.Tensor,
     weight: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
+    """Project NZ weights with full-height Cube tiles and store active rows."""
     blocks = (num_tokens + C1A_PROJ_M_TILE - 1) // C1A_PROJ_M_TILE * (HEAD_DIM // C1A_PROJ_N_TILE)
     workers = pl.max(blocks, 1)
     with pl.spmd(workers, name_hint="proj_cmp", deps=[ready]) as completed:
-        output = _project_c1a_block(source, weight, output, num_tokens)
+        with pl.at(level=pl.Level.CORE_GROUP):
+            block = pl.tile.get_block_idx()
+            row = block // (HEAD_DIM // C1A_PROJ_N_TILE) * C1A_PROJ_M_TILE
+            col = block % (HEAD_DIM // C1A_PROJ_N_TILE) * C1A_PROJ_N_TILE
+            rows = pl.max(pl.min(C1A_PROJ_M_TILE, num_tokens - row), 0)
+            a = pl.load(source, [row, 0], [C1A_PROJ_M_TILE, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+            b = pl.load(weight, [0, col], [C1A_PROJ_K_TILE, C1A_PROJ_N_TILE], target_memory=pl.Mem.Mat)
+            full_a = pl.set_validshape(a, C1A_PROJ_M_TILE, C1A_PROJ_K_TILE)
+            acc = pl.matmul(full_a, b)
+            for k in pl.pipeline(C1A_PROJ_K_TILE, D, C1A_PROJ_K_TILE, stage=2):
+                a = pl.load(source, [row, k], [C1A_PROJ_M_TILE, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                b = pl.load(weight, [k, col], [C1A_PROJ_K_TILE, C1A_PROJ_N_TILE], target_memory=pl.Mem.Mat)
+                full_a = pl.set_validshape(a, C1A_PROJ_M_TILE, C1A_PROJ_K_TILE)
+                acc = pl.matmul_acc(acc, full_a, b)
+            value = pl.set_validshape(acc, rows, C1A_PROJ_N_TILE)
+            output = pl.store(value, [row, col], output)
     return output, completed
 
 
