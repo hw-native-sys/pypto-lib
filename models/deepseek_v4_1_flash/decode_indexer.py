@@ -11,7 +11,6 @@
 from gemm import (
     gemm_bf16_to_bf16_staged,
     gemm_bf16_via_mxfp8_to_bf16_staged,
-    gemm_mxfp8_to_bf16_m80,
 )
 import pypto.language as pl
 from rmsnorm import make_norm_with_deps
@@ -2206,11 +2205,60 @@ def c1a_index(
         for group_start in pl.parallel(0, num_tokens, 80):
             projection_payload_m80 = pl.tensor.slice(projection_payload, [80, Q_LORA], [group_start, 0])
             scale_start = group_start * scales_per_token
-            gemm_mxfp8_to_bf16_m80(
-                projection_payload_m80, projection_scale_backing, index_wq_b, index_wq_b_scale, projected,
-                num_tokens, group_start, 0, 0, Q_LORA, INDEX_QUERY_WIDTH, "proj_idx_q",
-                INDEX_PROJ_N_TILE, INDEX_PROJ_K_TILE, 1, scale_start, 0, query_max_workers, 2,
+            backing_size = pl.tensor.dim(projection_scale_backing, 0) * pl.tensor.dim(projection_scale_backing, 1)
+            activation_scales_nd = pl.tensor.view(projection_scale_backing, [1, backing_size], layout=pl.ND)
+            scale_end = scale_start + 80 * scales_per_token
+            activation_scales = activation_scales_nd[0:1, scale_start:scale_end]
+            activation_scale = pl.tensor.view(activation_scales, [80, scales_per_token], layout=pl.MX_A_ZZ)
+            scale_group_size = (Q_LORA // 32) * INDEX_QUERY_WIDTH
+            index_scale_flat = pl.tensor.view(
+                index_wq_b_scale, [1, scale_group_size], layout=pl.ND,
             )
+            index_scale_group = pl.tensor.view(
+                index_scale_flat[0:1, 0:scale_group_size], [Q_LORA // 32, INDEX_QUERY_WIDTH], layout=pl.MX_B_NN,
+            )
+            available_clusters = pl.system.available_cluster_count()
+            workers = pl.min(
+                pl.min(INDEX_QUERY_WIDTH // INDEX_PROJ_N_TILE, query_max_workers), available_clusters,
+            )
+            for worker in pl.spmd(workers, name_hint="proj_idx_q", sync_start=True):
+                full_a = pl.load(
+                    projection_payload_m80, [0, 0], [80, Q_LORA], target_memory=pl.MemorySpace.Mat,
+                )
+                block_num = pl.tile.get_block_num()
+                for wave in pl.range(
+                    (INDEX_QUERY_WIDTH // INDEX_PROJ_N_TILE + block_num - 1) // block_num,
+                ):
+                    block = wave * block_num + worker
+                    if block < INDEX_QUERY_WIDTH // INDEX_PROJ_N_TILE:
+                        n0 = block * INDEX_PROJ_N_TILE
+                        rows = pl.min(80, num_tokens - group_start)
+                        a0 = full_a[:, :INDEX_PROJ_K_TILE]
+                        sa0 = pl.load(
+                            activation_scale, [0, 0], [80, INDEX_PROJ_K_TILE // 32],
+                        )
+                        b0 = pl.load(
+                            index_wq_b, [0, n0], [INDEX_PROJ_K_TILE, INDEX_PROJ_N_TILE],
+                        )
+                        sb0 = pl.load(
+                            index_scale_group, [0, n0], [INDEX_PROJ_K_TILE // 32, INDEX_PROJ_N_TILE],
+                        )
+                        acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                        for k0 in pl.pipeline(INDEX_PROJ_K_TILE, Q_LORA, INDEX_PROJ_K_TILE, stage=2):
+                            a = pl.tile.slice(full_a, [80, INDEX_PROJ_K_TILE], [0, k0])
+                            sa = pl.load(
+                                activation_scale, [0, k0 // 32], [80, INDEX_PROJ_K_TILE // 32],
+                            )
+                            b = pl.load(
+                                index_wq_b, [k0, n0], [INDEX_PROJ_K_TILE, INDEX_PROJ_N_TILE],
+                            )
+                            sb = pl.load(
+                                index_scale_group, [k0 // 32, n0],
+                                [INDEX_PROJ_K_TILE // 32, INDEX_PROJ_N_TILE],
+                            )
+                            acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
+                        valid_acc = pl.set_validshape(acc, rows, INDEX_PROJ_N_TILE)
+                        projected = pl.store(valid_acc, [group_start, n0], projected)
     else:
         gemm_bf16_via_mxfp8_to_bf16_staged(
             qr, index_wq_b, index_wq_b_scale, projected, num_tokens,
