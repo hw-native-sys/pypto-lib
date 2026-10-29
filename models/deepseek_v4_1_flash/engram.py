@@ -525,6 +525,10 @@ class HostEngram:
             for layer in M.engram_layer_ids
         ])
 
+    def release_request(self, request_id=0):
+        """Release the compressed token history retained for one request."""
+        self.history.pop(request_id, None)
+
     def hash_ids(self, token_ids, start_pos=0, *, request_id=0):
         """Return [layer, token, hash column] IDs and commit the current text history."""
         ids = torch.as_tensor(token_ids, device="cpu")
