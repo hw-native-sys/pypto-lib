@@ -24,7 +24,6 @@ import pypto.language as pl
 import torch
 import torch.nn.functional as F
 from pypto.ir import DistributedConfig
-from pypto.runtime import RunConfig
 
 from models.glm5_3_flash.config import (
     HC_MULT, VISION_DEPTH, VISION_HEAD_DIM, VISION_HEADS, VISION_HIDDEN, VISION_INTER, VISION_MERGE,
@@ -1135,56 +1134,6 @@ def golden_vision_forward(values):
     golden_vision_single(inner)
 
 
-class VisionEncoder:
-    """Execute the checkpoint's BF16 vision tower on one allocated device."""
-
-    def __init__(self, checkpoint, device_id, *, platform="a2a3", compiled=None):
-        self.checkpoint = checkpoint if isinstance(checkpoint, Checkpoint) else Checkpoint(checkpoint)
-        self.weights = self.checkpoint.vision_weights()
-        self.config = RunConfig(
-            platform=platform,
-            distributed_config=DistributedConfig(device_ids=[device_id], num_sub_workers=0),
-        )
-        self.program = vision_forward.compile(config=self.config) if compiled is None else compiled
-        config = self.checkpoint._json("config.json")["vision_config"]
-        rope = config.get("rope_parameters") or {"rope_type": "axial", "rope_theta": 10000.0}
-        if rope.get("rope_type") != "axial" or float(rope.get("rope_theta", 0)) <= 0:
-            raise ValueError("vision RoPE must use an axial positive-frequency base")
-        powers = torch.arange(VISION_HEAD_DIM // 4).float() * 4 / VISION_HEAD_DIM
-        self.inv_freq = float(rope["rope_theta"]) ** (-powers)
-
-    def __call__(self, pixel_values, grid_thw):
-        positions, starts = vision_metadata(grid_thw)
-        if tuple(pixel_values.shape) != (positions.shape[0], VISION_PATCH_IN):
-            raise ValueError("pixel_values rows must match grid_thw and the flattened patch width")
-        if not torch.isfinite(pixel_values).all():
-            raise ValueError("pixel_values must be finite")
-        patches = pixel_values.cpu().bfloat16().contiguous()
-        features = torch.empty((patches.shape[0] // VISION_MERGE**2, D), dtype=torch.bfloat16)
-        rows = patches.shape[0]
-        workspace_a = torch.zeros((1, rows, VISION_HIDDEN), dtype=torch.bfloat16)
-        workspace_b = torch.zeros_like(workspace_a)
-        cosine = torch.empty((1, rows, VISION_HEAD_DIM), dtype=torch.float32)
-        sine = torch.empty_like(cosine)
-        cosine_table, sine_table = vision_rope_tables(positions, self.inv_freq)
-        arguments = [
-            patches.unsqueeze(0),
-            *(self.weights[name].unsqueeze(0) for name in vision_weight_layouts()),
-            positions.unsqueeze(0),
-            starts.unsqueeze(0),
-            cosine_table.unsqueeze(0),
-            sine_table.unsqueeze(0),
-            features.unsqueeze(0),
-            workspace_a,
-            workspace_b,
-            cosine,
-            sine,
-            torch.tensor(VISION_DEPTH, dtype=torch.int32),
-        ]
-        self.program(*arguments, config=self.config)
-        if not torch.isfinite(features).all():
-            raise FloatingPointError("vision encoder produced nonfinite features")
-        return features
 
 
 def golden_vision_merger(

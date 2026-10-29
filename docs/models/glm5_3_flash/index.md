@@ -4,15 +4,18 @@
 [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) (`glm5_next`,
 `Glm5NextForConditionalGeneration`) on **Ascend a2a3**. It includes component
 kernels, Torch goldens, W8A8 checkpoint staging, composed MoE FFN entries,
-resident chunked generation, MTP proposals with greedy verification, and a
-24-block vision tower with image/video preprocessing.
+chunk-capable forward kernels, MTP computation, and a 24-block vision tower
+with image/video preprocessing. PyPTO Serving owns resident generation,
+request lifecycle and greedy MTP verification.
 
 Each core component owns its kernels, cache operations, Torch references and
 validation: `kda.py`, `attention.py`, `indexer.py`, `mtp.py`, and `vision.py`.
 The MoE, expert, normalization and mHC operators compose into `decode_layer.py`
-and `prefill_layer.py`. `prefill_fwd.py` owns resident weight staging, cache
-lifecycle, runtime dispatch and generation. `config.py` contains model
-configuration; `utils.py` contains checkpoint reading and shared host helpers.
+and `prefill_layer.py`. `prefill_fwd.py` exports the forward programs, cache-maintenance kernels,
+tensor layouts, CPU weight payload planning and independent reference checks.
+The serving runner owns device allocation, cache lifecycle, runtime dispatch
+and generation. `config.py` contains model configuration; `utils.py` contains
+checkpoint reading and shared host helpers.
 Symbolic tensor dimensions are declared alongside the kernels that use them.
 
 The component entries run their bounded cases by default. Use `--component`
@@ -140,8 +143,9 @@ larger capacities require their own memory and numerical validation.
 
 ### Chunked prefill and incremental requests
 
-`ResidentPrefillSession.forward_chunks()` consumes only the new tokens for each
-participating request. Callers pass stable request slots and their committed
+`pypto_serving.model.glm53.npu_runner.Glm53ModelRunner.forward_chunks()`
+consumes only the new tokens for each participating request. Callers pass
+stable request slots and their committed
 prefix lengths; returned logits follow the caller's request order. MLA latent
 cache, raw/pooled Indexer cache, KDA convolution state and KDA recurrent state
 remain resident between chunks. `reset_requests()` clears only the selected
@@ -151,13 +155,13 @@ If a dispatch or partial cache reset fails, the affected slots require a
 successful reset before another chunk can use them. Host sequence lengths
 commit only after a successful forward.
 
-`ResidentPrefillSession(..., prefix_snapshot_entries=2)` enables two immutable
+`Glm53ModelRunner(..., prefix_snapshot_entries=2)` enables two immutable
 device snapshot banks; the default 0 allocates none. `capture_prefix(slot,
 (bank, generation, length))` copies all six request-cache families after an
 aligned prompt boundary completes. `restore_prefix()` copies a confirmed
 descriptor into a reset slot and publishes its committed length only after
 successful completion. Generations must increase on capture; stale or
-unaligned descriptors are rejected. A copy failure poisons the Session and
+unaligned descriptors are rejected. A copy failure poisons runner execution and
 requires close/reopen. Serving owns snapshot admission, in-flight leases,
 worker acknowledgement and eviction.
 
@@ -168,9 +172,10 @@ checks the full payload against `prefix_snapshot_max_bytes` before allocation
 need an explicit budget and their own memory/numerical validation. Snapshot
 copies use an auxiliary typed program registered before worker preparation;
 the six production programs and auxiliary programs are recorded in layout
-manifest version 6. Earlier manifests require recompilation.
+manifest version 6 by the standalone serving command. Earlier manifests
+require recompilation.
 
-The resident session defaults to NPU final RMSNorm and full-vocabulary
+The serving runner defaults to NPU final RMSNorm and full-vocabulary
 projection for its 16 returned rows. BF16 hidden rows and final norm weights
 are widened to FP32; normalized activations, projection weights and logits
 remain FP32. Each rank owns a vocabulary shard, padded with zero weights to a
@@ -179,7 +184,7 @@ multiple of 64 rows: 19,392 rows at TP8 and 9,728 at TP16. The additional device
 TP16, excluding workspace and runtime overhead. The host strips each shard's
 padding before concatenating the complete logits in vocabulary order.
 
-`ResidentPrefillSession(..., lm_head_backend="cpu")` or
+`Glm53ModelRunner(..., lm_head_backend="cpu")` or
 `GLM53_LM_HEAD_BACKEND=cpu` selects the CPU reference. That backend retains
 the complete widened FP32 head, adding 2,537,553,920 bytes (about 2.36 GiB) of
 host RAM alongside the loader's BF16 table. Embedding lookup remains on the
@@ -187,12 +192,12 @@ CPU. Both head backends retain the full 32-row readback and finiteness checks
 on every rank. The selected backend and device weight allocation are logged
 as `GLM_LM_HEAD_BACKEND` and `GLM_DEVICE_LM_HEAD_BYTES_PER_RANK`.
 
-An optional `ResidentPrefillSession(..., host_num_threads=16)` sets the
+An optional `Glm53ModelRunner(..., host_num_threads=16)` sets the
 dedicated owner process's PyTorch CPU thread count after all weight uploads
 complete. Startup and rank workers retain their initial setting. Close and
 entry-error cleanup restore the previous owner count. The default `None`
 preserves the existing setting. The process-wide option assumes one exclusive
-owner session; it does not configure device AICPU threads.
+owner runner; it does not configure device AICPU threads.
 
 Under the frozen TP8/EP8 A3 workload (128 input tokens, eight output tokens,
 32-token chunks, one warmup and three timed groups), selecting sixteen owner
@@ -210,16 +215,20 @@ Allocation fails atomically when the shared pool is exhausted. Reset clears
 owned payloads and scales before releasing pages for another request. Indexer pool-close events include
 only newly completed pools and may read members written by earlier chunks.
 Saved artifacts include both dimensions and must be recompiled when either
-changes. `forward()` resets an independent batch; `generate()` chunks prompt
-tokens and then appends only new decode tokens for 1–16 requests.
+changes. Serving's `Glm53ModelRunner.forward()` resets an independent batch
+of sixteen nonempty requests.
+`pypto_serving.model.glm53.generation.generate()` chunks prompt tokens and
+then appends only new decode tokens for 1–16 requests.
 
 The shared page allocator updates `block_table` and `pool_blocks` on each
 query batch. KDA request rows and the KDA constants remain fixed for the
-session. Prefix capture copies logical rows through the page table; restore
-reserves destination pages before copying the immutable snapshot.
+serving runner's open lifetime. Prefix capture copies logical rows through
+the page table; restore reserves destination pages before copying the
+immutable snapshot.
 
-The standalone `generate()` report preserves its timing boundaries: total
-`seconds` starts at runtime preparation, after CPU checkpoint setup; each
+The report returned by `pypto_serving.model.glm53.generation.generate()`
+preserves its timing boundaries: total `seconds` starts at runtime
+preparation, after CPU checkpoint setup; each
 step's `seconds` starts after input preparation and H2D copies. Separate
 `checkpoint_setup_seconds`, step `input_setup_seconds`, and total/step
 `end_to_end_seconds` retain the excluded setup costs. These are host wall times,
@@ -260,9 +269,10 @@ Report startup separately from warm TTFT, inter-token latency and total output
 tokens per second. Host dispatch spans include runtime and synchronization
 overhead and must not be presented as device-only kernel times.
 
-The resident session clears selected request caches with one distributed
-device operation. It preserves unselected slots byte for byte; resetting all
-sixteen slots also clears unused physical KDA rows and pooled Indexer scratch.
+Serving's `Glm53ModelRunner.reset_requests()` clears selected request caches
+with one distributed device operation. It preserves unselected slots byte
+for byte; resetting all sixteen slots also clears unused physical KDA rows
+and pooled Indexer scratch.
 Lengths commit only after the clear completes, and failed clears leave the
 touched slots invalid until a successful reset.
 
@@ -290,14 +300,16 @@ Host submissions retain at most two pending handles through the public
 `DistributedWorker.submit()` API. Native FIFO execution orders the programs,
 and existing reader fences remain active. Collective counters commit only
 after successful completion; all pending handles drain before the vocabulary
-head and output readback. Errors drain returned handles and invalidate the session.
+head and output readback. Errors drain returned handles and invalidate
+runner execution.
 This removes repeated whole-window zero restoration.
 It does not change expert sharding or add TP slices to shared experts.
 
-A failed dispatch invalidates the communication state for the whole session.
-Close and reopen the runtime before further forwards or request resets.
+A failed dispatch invalidates the communication state for the whole
+`Glm53ModelRunner`. Close and reopen the serving runner before further
+forwards or request resets.
 Old scalar ABIs and exhausted INT32 notification counters are rejected.
-Two-pass chip-swimlane replay is also rejected for these stateful sessions.
+Two-pass chip-swimlane replay is also rejected for these stateful runners.
 Real-weight TP8 and TP16 chunk/decode/reuse checks pass; the TP8 disposal probe
 additionally completes one MoE dispatch, injects a host failure before epoch
 publication, and verifies that all later state operations stop before native
@@ -322,9 +334,8 @@ Serving has 11 of 12,390,400. Independent FP64 diagnostics pass all native
 values at the same numeric limits. Acceptance remains pending a reference
 decision; the CPU gate has not been relaxed and opt38 is not recorded as accepted.
 
-The following groups describe reference mechanisms. Current execution order,
-completed trials and per-item measurements are maintained in PyPTO Serving's
-single report, `docs/models/glm53-optimization.md`.
+The following groups describe reference mechanisms and their numerical
+acceptance requirements.
 
 | Group | GLM work | DeepSeek reference | Acceptance |
 |---|---|---|---|
@@ -569,6 +580,14 @@ matrix as the indexer golden; it is not the checkpoint's hidden-size rotation.
 
 ## Loading weights
 
+`ResidentPrefillWeights.iter_rank_uploads(rank)` yields
+`(stack_name, cpu_tensor, byte_offset)` payloads. Layered norm, mHC, router,
+KDA, MLA, Indexer and MoE stacks arrive one layer slice at a time. Dense
+stacks and unstacked residents (`norm.final_norm`, `mtp.*` and `hadamard`)
+each arrive as a whole payload at offset 0. The serving runner allocates
+the destination tensors and performs device copies; the lib payload planner
+opens no device worker or execution context.
+
 `models/glm5_3_flash/utils.py` provides an indexed CPU reader. It opens only
 requested tensors and TP slices instead of materializing all checkpoint shards.
 The checkpoint configuration must match the compiled GLM dimensions and layer
@@ -722,7 +741,13 @@ Each of these was a compile or simulator failure, not a guess:
 
 ## MTP proposals and visual inputs
 
-`ResidentPrefillSession(..., enable_mtp=True)` prepares checkpoint layer 45.
+Execution is provided by `pypto-serving`; install that package and set
+`PYPTO_LIB_ROOT` to this checkout. The standalone command uses the same
+`Glm53ModelRunner` and compiled-kernel preparation as the serving worker.
+`prefill_fwd.py --check weights` and `--check reference` remain independent
+CPU checks in this repository.
+
+`Glm53ModelRunner(..., enable_mtp=True)` prepares checkpoint layer 45.
 After each target chunk, call `update_mtp(next_token_ids)` with the next input
 for each active request. It shifts the query token IDs left within each
 request while retaining target positions, uses post-final-norm target
@@ -733,7 +758,8 @@ uses its own MLA, MoE, embedding, shared-head norm and vocabulary head.
 The first proposal computes its own indexer TopK; later steps reuse that
 request's selection and recompute K/gate writes and tail expansion. Recycled
 feedback uses the MTP shared-head norm exactly once. Speculative cache lengths
-roll back before target verification. `generate(..., spec_tokens=3)` verifies
+roll back before target verification.
+`pypto_serving.model.glm53.generation.generate(..., spec_tokens=3)` verifies
 each draft against the target greedy token and discards the remaining queue
 on rejection. Verification is sequential: the target KDA state advances only
 through confirmed tokens. This mode does not claim speculative speedup.
@@ -743,29 +769,31 @@ through confirmed tokens. This mode does not claim speculative speedup.
 with FFmpeg/ffprobe at the configured rate in stored frame orientation,
 ignoring rotation metadata. Pillow is required for image files. Preprocessing preserves the checkpoint's resize budget, CLIP
 normalization, temporal patch pairing and spatial merge-group order.
-`VisionEncoder` executes patch embedding, all 24 noncausal frame-segmented
-attention/MLP blocks, downsampling and the merger on an allocated NPU.
+The standalone serving command executes patch embedding, all 24 noncausal
+frame-segmented attention/MLP blocks, downsampling and the merger on an
+allocated NPU.
 Position-only FP32 RoPE constants are prepared with the input metadata and
 gathered on device. The attention reference rounds independent FP64
 exponentials, sums and reciprocals at the FP32 boundaries; compensated
 reductions retain those boundaries in the device implementation.
-`generate(..., visual_inputs={0: [visual]})` expands image/video markers and
-replaces the corresponding embedding rows before seeding all four streams.
+`pypto_serving.model.glm53.generation.generate(..., visual_inputs={0: [visual]})`
+expands image/video markers and replaces the corresponding embedding rows
+before seeding all four streams.
 
-The production CLI accepts `--spec-tokens`, `--image`, `--video` and repeated
-`--video-frame` inputs. Visual inputs attach to prompt zero; the Python API
+The `pypto-serving` standalone generation CLI accepts `--spec-tokens`,
+`--image`, `--video` and repeated `--video-frame` inputs. Visual inputs attach to prompt zero; the Python API
 supports multiple requests and ordered visual inputs. `--vision-runtime-dir`
 loads a separately compiled single-rank vision artifact. Build CPU artifacts
 before scheduling NPU execution, following the
 [compile/runtime workflow](../../run-and-validate/compile-runtime-workflow.md).
 
 ```bash
-python models/glm5_3_flash/prefill_fwd.py --compile-only \
+python -m pypto_serving.model.glm53.generation --compile-only \
   --tp 16 --ep 16 --capacity 2048 --max-seq-len 1048576 \
   --cache-tokens 1048576 --runtime-dir /path/to/runtime
 
 # Run inside the matching device allocation.
-python models/glm5_3_flash/prefill_fwd.py --tp 16 --ep 16 \
+python -m pypto_serving.model.glm53.generation --tp 16 --ep 16 \
   --capacity 2048 --max-seq-len 1048576 --cache-tokens 1048576 \
   --runtime-dir /path/to/runtime --checkpoint /path/to/checkpoint \
   --prompt "Describe the image." --image /path/to/image.png \

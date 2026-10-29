@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""GLM-5.3-Flash resident forward execution and generation."""
+"""GLM-5.3-Flash forward kernels, tensor contracts and CPU weight validation."""
 
 import sys
 from pathlib import Path
@@ -21,24 +21,19 @@ import json
 import math
 import os
 import tempfile
-import time
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from math import gcd
 from typing import Mapping, Sequence
 
 import pypto.language as pl
 import torch
-from pypto.ir import DistributedConfig
-from pypto.runtime import RunConfig, StackedDeviceTensor
 
 import models.glm5_3_flash.config as C
 from models.glm5_3_flash.attention import MlaTensors
 from models.glm5_3_flash.config import (
-    BLOCK_SIZE, DENSE_INTER, DP_SIZE, EP_SIZE, FLASH, HC_MULT, IMAGE_TOKEN_ID, INDEX_DIM, INDEX_H,
+    BLOCK_SIZE, DENSE_INTER, DP_SIZE as DP_SIZE, EP_SIZE, FLASH, HC_MULT, IMAGE_TOKEN_ID, INDEX_DIM, INDEX_H,
     INDEX_KPOOL, INDEX_STATE_WIDTH, KDA_DIM, KPOOL_SELECT_K, KV_LORA, LOCAL_H, LOCAL_KDA_H,
-    LOCAL_KDA_QKV_DIM, LOCAL_VOCAB, N_EXPERTS, QK_DIM, SUPPORTED_EP_SIZES, SUPPORTED_TP_SIZES, TP_SIZE,
+    LOCAL_KDA_QKV_DIM, LOCAL_VOCAB as LOCAL_VOCAB, N_EXPERTS, QK_DIM, SUPPORTED_EP_SIZES, SUPPORTED_TP_SIZES, TP_SIZE,
     V_DIM, AttentionKind, D, Glm53FlashConfig, MlpKind,
 )
 from models.glm5_3_flash.dense_mlp import DenseTensors, _test_dense_mlp
@@ -46,30 +41,29 @@ from models.glm5_3_flash.expert_routed import CheckpointExpertProvider
 from models.glm5_3_flash.gate import RouterTensors
 from models.glm5_3_flash.indexer import POOL_SCALE_WIDTH, IndexerTensors, _test_indexer
 from models.glm5_3_flash.kda import (
-    BETA_PAD, CHUNK_TILE, CONV_DIM, STATE_LEN, KdaTensors, _test_kda_cores, kda_host_constants,
+    BETA_PAD, CHUNK_TILE as CHUNK_TILE, CONV_DIM, STATE_LEN, KdaTensors, _test_kda_cores, kda_host_constants,
 )
-from models.glm5_3_flash.lm_head import FP32_HEAD_VOCAB_PAD, reference_lm_head_logits
+from models.glm5_3_flash.lm_head import FP32_HEAD_VOCAB_PAD as FP32_HEAD_VOCAB_PAD, reference_lm_head_logits as reference_lm_head_logits
 from models.glm5_3_flash.mhc import MhcTensors, _test_mhc, combine_streams
 from models.glm5_3_flash.prefill_layer import (
     BATCH, CACHE_LAYOUTS, CACHE_TOKENS, CAPACITY, DENSE_NUM_LAYERS, DSA_NUM_LAYERS, KDA_NUM_LAYERS,
-    KDA_ROWS, LATENT_BLOCKS, LATENT_ROWS, LOGIT_ROWS, MAX_SEQ_LEN, MLA_STACK_LAYERS, MOE_STACK_LAYERS,
+    KDA_ROWS, LATENT_BLOCKS, LATENT_ROWS, LOGIT_ROWS, MAX_SEQ_LEN, MLA_STACK_LAYERS as MLA_STACK_LAYERS, MOE_STACK_LAYERS as MOE_STACK_LAYERS,
     NUM_LAYERS, POOL_AXIS, POOL_STRIDE, POOL_TABLE_MAX, POOL_TABLE_ROWS, PREFILL_MAX_TOKENS, RANKS, T_MOE,
     TABLE_MAX, LayerRefWeights, _shape_options, _test_mla, _test_router_and_moe, l3_prefill_dense_layer,
-    l3_prefill_head_rows, l3_prefill_kda_attention, l3_prefill_lm_head_logits, l3_prefill_moe_layer,
-    l3_prefill_mtp_head, l3_prefill_mtp_prepare, l3_prefill_seed, l3_prefill_sparse_attention,
+    l3_prefill_head_rows, l3_prefill_kda_attention, l3_prefill_lm_head_logits as l3_prefill_lm_head_logits, l3_prefill_moe_layer,
+    l3_prefill_mtp_head as l3_prefill_mtp_head, l3_prefill_mtp_prepare as l3_prefill_mtp_prepare, l3_prefill_seed, l3_prefill_sparse_attention,
     reference_layer_forward, synthetic_layer,
 )
 from models.glm5_3_flash.rmsnorm import reference_rms_norm
 from models.glm5_3_flash.utils import (
     _FF_DOWN, _FF_FUSED, _FF_GATE, _FF_UP, ROLES, TEXT_LAYER_ROOTS, Checkpoint, QuantDescription,
-    SharedCachePages, _as_batch_seqs, _assert_close, _find, _pad_to, _prefill_model, _prefixed,
+    SharedCachePages, _as_batch_seqs, _assert_close, _find, _pad_to, _prefill_model as _prefill_model, _prefixed,
     _read_quant, _resolve_name, _resolve_top_name, _scale_of, _try_find, _weight_shape,
     build_forward_metadata, build_indexer_chunk_metadata, check_ffn_scales, fuse_gate_up, gather_rows,
     golden_split_kv_b, layer_prefix, layer_prefixes, layer_router, load_shared_expert, load_tensors,
     pack_int8_nz, read_reference_float, scaled_model_from_config, shard_dense_mlp, shard_routed_experts,
     split_kv_b, sylvester_hadamard, unpack_int8_nz,
 )
-from models.glm5_3_flash.vision import VisionEncoder, VisionProcessor, VisualInput
 
 if CACHE_TOKENS <= 0 or CACHE_TOKENS % C.BLOCK_SIZE:
     raise ValueError(f"--cache-tokens must be positive and aligned to {C.BLOCK_SIZE}")
@@ -325,27 +319,6 @@ PREFIX_SNAPSHOT_BYTES = sum(
 )
 VERIFY_X_H_C = os.environ.get("GLM53_PREFILL_VERIFY_XHC", "") == "1"
 TRACE_DISPATCH = os.environ.get("GLM53_PREFILL_TRACE_DISPATCH", "") == "1"
-DEFAULT_CHAT_TEMPLATE = (
-    "{% for message in messages %}{{ '<|user|>\n' + message['content'] + '<|assistant|>\n' }}{% endfor %}"
-)
-DEFAULT_PROMPTS = (
-    "What is 2 + 3? Reply with just the number.",
-    "What is the capital of France? Reply with just the city name.",
-    "Translate 'hello' into Chinese. Reply with only the translation.",
-    "Continue the sequence with three numbers: 1, 2, 3,",
-    "Name the largest planet in the solar system. One word.",
-    "What is 7 times 8? Reply with just the number.",
-    "Which continent is Egypt in? One word.",
-    "Spell the word 'computer'. Reply with only the spelling.",
-    "What color do you get mixing blue and yellow? One word.",
-    "How many days are in a leap year? Reply with just the number.",
-    "Name the ocean between Europe and America. One word.",
-    "What is the square root of 81? Reply with just the number.",
-    "In what language is 'bonjour' a greeting? One word.",
-    "Count from one to three in Spanish. Only the numbers.",
-    "What is the chemical symbol for gold? Reply with only the symbol.",
-    "Finish the proverb: 'An apple a day...'",
-)
 
 
 @pl.jit(auto_scope=False)
@@ -961,8 +934,8 @@ class ResidentPrefillWeights:
     resolves every stack member's source name (both layer-root spellings, fused
     or separate gate/up, nested or flat mHC/KDA-gate spellings), validates the
     header shapes against the geometry, and builds the full stack plan. Payloads
-    move only in :meth:`upload`, one staged layer-slice at a time, so host
-    staging never exceeds a single layer of one family.
+    are yielded by :meth:`iter_rank_uploads`: layered stacks arrive one layer
+    slice at a time, while dense stacks and unstacked residents arrive whole.
 
     Rank mapping: ranks are EP ranks; the TP rank is ``rank % tp_size``. In the
     deployment topology (TP16/EP16/DP1) the two coincide with the rank id, and
@@ -1452,47 +1425,34 @@ class ResidentPrefillWeights:
             "hadamard": hadamard.contiguous(),
         }
 
-    # -- staged upload --------------------------------------------------------------------
+    def iter_rank_uploads(self, rank: int):
+        """Yield ``(stack_name, cpu_tensor, byte_offset)`` upload payloads.
 
-    def upload(self, runtime, rank: int, handles) -> None:
-        """Stage one rank's resident stacks to its preallocated device tensors.
-
-        Every stacked family stages one layer-slice at a time: the member
-        slice is host-materialized, copied at its layer offset and dropped
-        before the next layer, so peak host memory is one layer of one family
-        (about 20 MB for a KDA layer at TP16, 280 MB at TP1) or one MoE
-        layer-slice (the model's largest single buffer), never the whole
-        stacked family doubled while ``torch.stack`` assembled it. Each
-        per-layer ``put`` at ``layer_index`` preserves the logical layer slice
-        ``torch.stack`` produced before. The two shared INT8
-        matrices use NZ bytes; checkpoint-reader tensors and all other stacks
-        retain logical row-major order.
-        ``handles`` maps every layout name from :attr:`tensor_layouts` to a
-        device handle carrying ``data_ptr``.
+        Layered norm, mHC, router, KDA, MLA, Indexer and MoE stacks arrive one
+        layer slice at a time. Dense stacks and unstacked residents each arrive
+        as a whole payload at byte offset zero.
+        Consumers own device allocation and transfers. Shared INT8 matrices use
+        NZ bytes; the other stacks retain their logical row-major layout.
         """
         if rank not in range(self.ranks):
             raise ValueError(f"rank must be in [0, {self.ranks}), got {rank}")
-        missing = [name for name in self.stacks if name not in handles]
-        if missing:
-            raise ValueError(f"handles are missing the stacks {missing}")
         tp_rank = rank % self.tp_size
 
-        def put(name: str, data: torch.Tensor, layer_index: int | None = None) -> None:
+        def payload(name: str, data: torch.Tensor, layer_index: int | None = None):
             plan = self.stacks[name]
             if name in ("moe.shared_w_gate_up", "moe.shared_w_down"):
                 data = pack_int8_nz(data)
             data = data.contiguous()
             expected = plan.shape if layer_index is None else plan.shape[1:]
             if tuple(data.shape) != expected or data.dtype != plan.dtype:
-                raise ValueError(f"staged {name} is {tuple(data.shape)}/{data.dtype}, planned {expected}/{plan.dtype}")
+                raise ValueError(
+                    f"staged {name} is {tuple(data.shape)}/{data.dtype}, planned {expected}/{plan.dtype}"
+                )
             offset = 0 if layer_index is None else layer_index * data.numel() * data.element_size()
-            runtime.copy_to(
-                handles[name].data_ptr, data.data_ptr(), data.numel() * data.element_size(),
-                dst_offset=offset, worker_id=rank,
-            )
+            return name, data, offset
 
         for name, value in self._single_tensors().items():
-            put(name, value)
+            yield payload(name, value)
         for family in ("norm", "mhc", "router", "kda", "mla", "indexer"):
             for index, layer in enumerate(self._family_layers[family]):
                 per_layer = (
@@ -1504,12 +1464,12 @@ class ResidentPrefillWeights:
                     }
                 )
                 for member, value in per_layer.items():
-                    put(f"{family}.{member}", value, layer_index=index)
+                    yield payload(f"{family}.{member}", value, layer_index=index)
         for member, stack in self._stack_dense(tp_rank).items():
-            put(f"dense.{member}", stack)
+            yield payload(f"dense.{member}", stack)
         for index, layer in enumerate(self._family_layers["moe"]):
             for member, value in self._moe_layer(layer, rank).items():
-                put(f"moe.{member}", value, layer_index=index)
+                yield payload(f"moe.{member}", value, layer_index=index)
 
 
 def prepare_step_inputs(
@@ -1756,87 +1716,8 @@ def _production_geometry() -> dict[str, int]:
     }
 
 
-def compile_production(
-    runtime_dir: Path,
-    device_ids: list[int],
-    *,
-    platform: str = "a2a3",
-    mode: str = "rt",
-    programs: tuple[str, ...] | None = None,
-    auxiliaries: bool = True,
-) -> dict:
-    """Compile the production programs and record the artifact manifest."""
-    config = RunConfig(
-        platform=platform, distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-    )
-    runtime_dir = Path(runtime_dir)
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {"_mode": mode, "_geometry": _production_geometry()}
-    if mode == "rt":
-        for program in programs if programs is not None else RT_PROGRAMS:
-            if program not in RT_PROGRAMS:
-                raise ValueError(f"unknown consolidated program {program!r}")
-            compiled = production_program_entry(program).compile(config=config)
-            out_dir = getattr(compiled, "output_dir", None) or getattr(compiled, "work_dir")
-            if out_dir is None:
-                raise RuntimeError(f"no artifact directory for program {program}")
-            manifest[program] = str(out_dir)
-            print("GLM_PROD_COMPILED", program, out_dir, flush=True)
-    elif mode != "rt":
-        raise ValueError(f"mode must be 'rt', got {mode!r}")
-    if auxiliaries:
-        auxiliary = {}
-        for name, entry in (
-            ("reset", l3_reset_request_caches),
-            ("head_logits", l3_prefill_lm_head_logits),
-            ("snapshot", l3_copy_request_snapshot),
-            ("mtp_prepare", l3_prefill_mtp_prepare),
-            ("mtp_head", l3_prefill_mtp_head),
-        ):
-            compiled = entry.compile(config=config)
-            auxiliary[name] = str(compiled.output_dir)
-        manifest["_auxiliary"] = auxiliary
-    (runtime_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    return load_production(runtime_dir, device_ids, platform=platform)
 
 
-def load_production(runtime_dir: Path, device_ids: list[int], *, platform: str = "a2a3") -> dict:
-    """Load the production programs from a manifest runtime dir."""
-    from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-
-    manifest = json.loads((Path(runtime_dir) / "manifest.json").read_text())
-    if manifest.get("_mode") != "rt":
-        raise ValueError(
-            f"{runtime_dir}/manifest.json has unsupported mode {manifest.get('_mode')!r}; "
-            "recompile with compile_production(mode='rt')"
-        )
-    if manifest.get("_geometry") != _production_geometry():
-        raise ValueError(
-            "runtime query/cache geometry, collective ABI or shared weight layout differs; recompile "
-            "with matching --tp, --ep, --capacity, --max-seq-len and --cache-tokens"
-        )
-    programs_present = [key for key in manifest if not key.startswith("_")]
-    unknown = [key for key in programs_present if key not in RT_PROGRAMS]
-    if unknown:
-        raise ValueError(f"rt manifest carries unknown programs {unknown}")
-    result = {
-        program: DistributedCompiledProgram.from_dir(
-            manifest[program],
-            platform=platform,
-            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-        )
-        for program in programs_present
-    }
-    if "_auxiliary" in manifest:
-        result["_auxiliary"] = {
-            name: DistributedCompiledProgram.from_dir(
-                path,
-                platform=platform,
-                distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-            )
-            for name, path in manifest["_auxiliary"].items()
-        }
-    return result
 
 
 def _read_ffn(
@@ -2340,1035 +2221,12 @@ def _load_final_norm(checkpoint: Checkpoint) -> torch.Tensor:
     raise ValueError("checkpoint is missing the final norm (model.language_model.norm.weight)")
 
 
-def _resolve_eos_ids(checkpoint: Checkpoint, tokenizer, tokenizer_config: dict) -> set[int]:
-    """Every generation-stop token id the checkpoint declares.
-
-    ``generation_config.json``'s ``eos_token_id`` wins (the GLM-5.3-Flash snapshot
-    ships the list ``[154820, 154827, 154829]``); a checkpoint without one falls
-    back to the ``tokenizer_config.json`` ``eos_token`` spelling mapped through
-    the tokenizer.
-    """
-    generation_path = checkpoint.root / "generation_config.json"
-    value = None
-    if generation_path.exists():
-        value = json.loads(generation_path.read_text()).get("eos_token_id")
-    ids = [int(token_id) for token_id in (value if isinstance(value, list) else [value] if value is not None else [])]
-    if not ids:
-        eos = tokenizer_config.get("eos_token")
-        token_id = None if eos is None else tokenizer.token_to_id(eos["content"] if isinstance(eos, dict) else eos)
-        if token_id is None:
-            raise ValueError("checkpoint EOS token is missing from its tokenizer")
-        ids = [int(token_id)]
-    return set(ids)
 
 
-def _render_prompt(prompt: str, chat_template: str | None) -> str:
-    """Wrap one user prompt for encoding: the checkpoint template, else ChatML.
-
-    Rendering follows the transformers convention: ``add_generation_prompt=True``
-    lets the template append its assistant header (the GLM-5.3-Flash template
-    gates ``<|assistant|>`` on that flag). Any template error falls back to the
-    verbatim ChatML wrap.
-    """
-    template = chat_template if chat_template else DEFAULT_CHAT_TEMPLATE
-    try:
-        from jinja2.sandbox import ImmutableSandboxedEnvironment
-
-        # loopcontrols: the GLM-5.3-Flash template breaks out of loops; without
-        # the extension jinja rejects the template and the verbatim fallback
-        # would silently mask it.
-        environment = ImmutableSandboxedEnvironment(
-            trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"],
-        )
-        return environment.from_string(template).render(
-            messages=[{"role": "user", "content": prompt}], add_generation_prompt=True,
-        )
-    except Exception as error:  # noqa: BLE001 -- fall back verbatim on any template error
-        print("GLM_CHAT_TEMPLATE_FALLBACK", repr(error), flush=True)
-        return f"<|user|>\n{prompt}<|assistant|>\n"
 
 
-class ResidentPrefillSession:
-    """Resident weights and request-local caches for chunked GLM forwards."""
-
-    def __init__(
-        self,
-        checkpoint: Checkpoint,
-        programs: dict,
-        device_ids: list[int],
-        *,
-        platform: str = "a2a3",
-        run_config: RunConfig | None = None,
-        host_num_threads: int | None = None,
-        prefix_snapshot_entries: int = 0,
-        prefix_snapshot_max_bytes: int = 128 * 1024**2,
-        lm_head_backend: str | None = None,
-        enable_mtp: bool = False,
-    ):
-        if host_num_threads is not None and (type(host_num_threads) is not int or host_num_threads <= 0):
-            raise ValueError("host_num_threads must be a positive integer or None")
-        if type(prefix_snapshot_entries) is not int or prefix_snapshot_entries not in (
-            0,
-            PREFIX_SNAPSHOT_ENTRIES,
-        ):
-            raise ValueError("prefix_snapshot_entries must be zero or two")
-        required = prefix_snapshot_entries * PREFIX_SNAPSHOT_BYTES
-        if type(prefix_snapshot_max_bytes) is not int or prefix_snapshot_max_bytes < required:
-            raise ValueError(f"prefix snapshot allocation requires {required} bytes per rank")
-        self._prefix_snapshot_entries = prefix_snapshot_entries
-        self._snapshot_program = None
-        self._snapshot_banks = {}
-        self._snapshot_descriptors = [None] * prefix_snapshot_entries
-        self._snapshot_generations = [0] * prefix_snapshot_entries
-        self._host_num_threads = host_num_threads
-        self._previous_host_num_threads = None
-        self.checkpoint = checkpoint
-        self.auxiliary_programs = programs.get("_auxiliary", {})
-        self.programs = {name: value for name, value in programs.items() if not name.startswith("_")}
-        programs = self.programs
-        self.enable_mtp = bool(enable_mtp)
-        self._mtp_lengths = torch.zeros(BATCH, dtype=torch.int32)
-        self._mtp_ready = set()
-        self._mtp_logits = torch.empty((BATCH, FLASH.vocab_size), dtype=torch.float32)
-        self._last_chunk_sequences = None
-        self._last_chunk_slots = None
-        self.mtp_stats = {"proposed": 0, "accepted": 0, "rejected": 0, "rounds": 0}
-        self.device_ids = list(device_ids)
-        self.platform = platform
-        self.run_config = run_config
-        self.runtime = None
-        self._lm_head_program = None
-        self._device_lm_head = None
-        self._device_mtp_head = None
-        self._device_final_norm = None
-        self._device_logits = None
-        self._host_logits_shards = None
-        self.lm_head = None
-        self.lm_head_backend = (
-            os.environ.get("GLM53_LM_HEAD_BACKEND", "npu") if lm_head_backend is None else lm_head_backend
-        )
-        if self.enable_mtp and self.lm_head_backend != "npu":
-            raise ValueError("MTP requires the NPU LM head")
-        self._mtp_prepare_program = None
-        self._mtp_head_program = None
-        self._context = None
-        self.calls = 0
-        self.guard_events: list[str] = []
-        self._seq_lens = torch.zeros(BATCH, dtype=torch.int32)
-        self.cache_pages = SharedCachePages(BATCH, MAX_SEQ_LEN, CACHE_TOKENS)
-        self._invalid_slots: set[int] = set()
-        self._reset_program = None
-        self._dispatch_error: BaseException | None = None
-        self._collective_dispatches = {program: 0 for program in RT_PROGRAMS if program not in ("seed", "head")}
-        plan = production_launch_plan()
-        if set(programs) != set(RT_PROGRAMS):
-            raise ValueError(
-                f"programs must cover exactly the consolidated set {list(RT_PROGRAMS)} "
-                f"(got {sorted(programs)})"
-            )
-        # Signature names come from the entries, never from the compiled artifacts:
-        # the persisted param metadata carries post-SSA spellings (x_hc__ssa_v0).
-        # Every step dispatches its consolidated program by kind, with the layer
-        # riding the dispatch as trailing ordinal scalars.
-        arity = {program: _l3_arg_arity(production_program_entry(program)) for program in RT_PROGRAMS}
-        step_program = {step: production_program_of_step(step) for step in plan}
-        for program, (tensor_names, scalar_names) in arity.items():
-            metadata = programs[program]._get_metadata()[0]
-            expected = [False] * len(tensor_names) + [True] * len(scalar_names)
-            if [info.shape is None for info in metadata] != expected:
-                raise ValueError(f"compiled {program} has a stale collective ABI; recompile --runtime-dir")
-        # Reject a different rank/capacity compile before loading any payload: the
-        # seed entry leads with embedding_rows [RANKS, CAPACITY, D].
-        seed_params = programs["seed"]._get_metadata()[0]
-        if list(seed_params[0].shape) != [RANKS, CAPACITY, D]:
-            raise ValueError(
-                f"--runtime-dir must contain glm prefill compiled for "
-                f"TP{TP_SIZE}/EP{EP_SIZE} with capacity {CAPACITY}"
-            )
-        if len(device_ids) != RANKS or len(set(device_ids)) != RANKS:
-            raise ValueError(f"prefill needs {RANKS} distinct devices")
-        dsa_params = programs["dsa_attn"]._get_metadata()[0]
-        dsa_names = arity["dsa_attn"][0]
-        expected_cache = [RANKS, DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA]
-        if list(dsa_params[dsa_names.index("mla_latent_cache")].shape) != expected_cache:
-            raise ValueError("compiled request-cache shape differs; recompile for --max-seq-len")
-
-        self.plan, self.arity, self.step_program = plan, arity, step_program
-
-    @property
-    def lm_head_backend(self) -> str:
-        """Select full FP32 logits on the NPU or the CPU reference."""
-        return self._lm_head_backend
-
-    @lm_head_backend.setter
-    def lm_head_backend(self, value: str) -> None:
-        if value not in ("npu", "cpu"):
-            raise ValueError("lm_head_backend must be 'npu' or 'cpu'")
-        if self.runtime is not None:
-            if value == "npu" and self._lm_head_program is None:
-                raise ValueError("open the session with lm_head_backend='npu' to prepare the device head")
-            if value == "cpu" and self.lm_head is None:
-                self.lm_head = self.weights.lm_head().to(torch.float32)
-        self._lm_head_backend = value
-
-    def __enter__(self):
-        if self._context is not None:
-            raise RuntimeError("the resident prefill session is already open")
-        if self.run_config is not None and self.run_config.enable_chip_swimlane:
-            raise ValueError("resident chunk sessions cannot replay two-pass swimlane dispatches")
-        self.cache_pages = SharedCachePages(BATCH, MAX_SEQ_LEN, CACHE_TOKENS)
-        self._mtp_lengths.zero_()
-        self._mtp_ready.clear()
-        self._last_chunk_sequences = None
-        checkpoint_start = time.monotonic()
-        checkpoint, programs, device_ids = self.checkpoint, self.programs, self.device_ids
-        platform = self.platform
-        plan, arity, step_program = self.plan, self.arity, self.step_program
-        weights = ResidentPrefillWeights.load(
-            checkpoint, tp_size=TP_SIZE, ep_size=EP_SIZE, model=_prefill_model(), mla_mode="native",
-        )
-        final_norm_w = _load_final_norm(checkpoint)
-        lm_head = weights.lm_head().to(torch.float32) if self.lm_head_backend == "cpu" else None
-        print("GLM_LM_HEAD_BACKEND", self.lm_head_backend, flush=True)
-        config = self.run_config or RunConfig(
-            platform=platform,
-            ring_heap=2 * 1024**3,
-            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-        )
-
-        self.runtime_started_at = time.monotonic()
-        self.checkpoint_setup_seconds = self.runtime_started_at - checkpoint_start
-        print("GLM_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
-        # Auxiliary cache maintenance shares the prepared worker, outside the forward manifest.
-        reset_program = self.auxiliary_programs.get("reset") or l3_reset_request_caches.compile(config=config)
-        primary, extras = programs["seed"], [programs[name] for name in RT_PROGRAMS[1:]]
-        extras.append(reset_program)
-        lm_head_program = None
-        if self.lm_head_backend == "npu":
-            lm_head_program = self.auxiliary_programs.get("head_logits") or l3_prefill_lm_head_logits.compile(
-                config=config
-            )
-            extras.append(lm_head_program)
-        snapshot_program = None
-        if self._prefix_snapshot_entries:
-            snapshot_program = self.auxiliary_programs.get("snapshot") or l3_copy_request_snapshot.compile(
-                config=config
-            )
-            extras.append(snapshot_program)
-        mtp_prepare_program = mtp_head_program = None
-        if self.enable_mtp:
-            mtp_prepare_program = self.auxiliary_programs.get(
-                "mtp_prepare"
-            ) or l3_prefill_mtp_prepare.compile(config=config)
-            mtp_head_program = self.auxiliary_programs.get("mtp_head") or l3_prefill_mtp_head.compile(config=config)
-            extras.extend((mtp_prepare_program, mtp_head_program))
-        context = primary.prepare(config, extra_compiled=extras, persistent=True, reset_persistent_windows=False)
-        runtime = context.__enter__()
-        try:
-            inputs = prepare_step_inputs(weights, [[] for _ in range(BATCH)], cache_pages=self.cache_pages)
-            per_rank = [{} for _ in device_ids]
-            for rank in range(RANKS):
-                tensors = per_rank[rank]
-                for name in GLM_TENSORS:
-                    stack = _PARAM_TO_STACK.get(name)
-                    if stack is not None:
-                        shape, dtype = weights.tensor_layouts[stack]
-                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                    elif name in CACHE_LAYOUTS:
-                        shape, dtype = CACHE_LAYOUTS[name]
-                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                    elif name in OUTPUTS:
-                        shape, dtype = OUTPUTS[name]
-                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                    elif name in WORKSPACES:
-                        shape, dtype = WORKSPACES[name]
-                        tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-                    else:
-                        value = inputs[name]
-                        tensors[name] = runtime.alloc_tensor(value.shape, value.dtype, init=value, worker_id=rank)
-                # Stacks the graph ABI does not carry (final norm, MTP extras) still need
-                # allocation because weights.upload stages every resident stack.
-                for stack, (shape, dtype) in weights.tensor_layouts.items():
-                    if stack not in _STACK_TO_PARAM and stack not in tensors:
-                        tensors[stack] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
-
-            def upload(rank):
-                handles = {stack: per_rank[rank][_STACK_TO_PARAM.get(stack, stack)] for stack in weights.tensor_layouts}
-                weights.upload(runtime, rank, handles)
-                print("GLM_RANK_WEIGHTS_READY", rank, flush=True)
-
-            with ThreadPoolExecutor(max_workers=RANKS) as executor:
-                list(executor.map(upload, range(RANKS)))
-            stacked = {
-                name: StackedDeviceTensor(
-                    [rank[name] for rank in per_rank], (RANKS, *per_rank[0][name].shape), tuple(range(RANKS))
-                )
-                for name in GLM_TENSORS
-            }
-            runtime.run(
-                reset_program, stacked["mla_latent_cache"], stacked["index_raw_cache"],
-                stacked["index_pool_cache"], stacked["index_pool_scale"], stacked["kda_conv_state"],
-                stacked["kda_recurrent_state"], stacked["cache_page_owners"], (1 << BATCH) - 1, config=config,
-            )
-            bindings = production_step_bindings(plan)
-            for step in plan:
-                tensor_names, _ = arity[step_program[step]]
-                unbound = [name for name in tensor_names if _alloc_name_of(name, bindings[step]) not in stacked]
-                if unbound:
-                    raise ValueError(f"step {step} parameters have no allocated tensor: {unbound}")
-            for name, (shape, dtype) in weights.tensor_layouts.items():
-                if name not in _STACK_TO_PARAM:
-                    stacked[name] = StackedDeviceTensor(
-                        [rank[name] for rank in per_rank], (RANKS, *shape), tuple(range(RANKS)),
-                    )
-            if self.enable_mtp:
-                mtp_layouts = {
-                    "mtp_cached_hidden": ((BATCH, D), torch.bfloat16, 0),
-                    "mtp_cached_pools": ((BATCH, KPOOL_SELECT_K), torch.int32, -1),
-                    "mtp_cached_valid": ((BATCH, KPOOL_SELECT_K), torch.int32, 0),
-                    "mtp_selected_pools": ((CAPACITY, KPOOL_SELECT_K), torch.int32, -1),
-                    "mtp_selected_valid": ((CAPACITY, KPOOL_SELECT_K), torch.int32, 0),
-                }
-                for name, (shape, dtype, fill) in mtp_layouts.items():
-                    value = torch.full(shape, fill, dtype=dtype)
-                    for rank in range(RANKS):
-                        per_rank[rank][name] = runtime.alloc_tensor(shape, dtype, init=value, worker_id=rank)
-                    stacked[name] = StackedDeviceTensor(
-                        [rank[name] for rank in per_rank], (RANKS, *shape), tuple(range(RANKS)),
-                    )
-            head_rows = torch.empty((RANKS, LOGIT_ROWS, D), dtype=torch.bfloat16)
-            device_lm_head, device_final_norm, device_logits, host_logits_shards = None, None, None, None
-            device_mtp_head = None
-            if lm_head_program is not None:
-                head_weights, mtp_head_weights, head_outputs = [], [], []
-                head = weights.lm_head()
-                for rank in range(RANKS):
-                    shard = torch.zeros((FP32_HEAD_VOCAB_PAD, D), dtype=torch.float32)
-                    shard[:LOCAL_VOCAB].copy_(head[rank * LOCAL_VOCAB : (rank + 1) * LOCAL_VOCAB])
-                    head_weights.append(runtime.alloc_tensor(shard.shape, shard.dtype, init=shard, worker_id=rank))
-                    if self.enable_mtp:
-                        shard.zero_()
-                        shard[:LOCAL_VOCAB].copy_(weights.mtp_head_shard(rank))
-                        mtp_head_weights.append(
-                            runtime.alloc_tensor(shard.shape, shard.dtype, init=shard, worker_id=rank),
-                        )
-                    output_shape = (BATCH, FP32_HEAD_VOCAB_PAD)
-                    head_outputs.append(runtime.alloc_tensor(output_shape, torch.float32, worker_id=rank))
-                workers = tuple(range(RANKS))
-                device_lm_head = StackedDeviceTensor(head_weights, (RANKS, FP32_HEAD_VOCAB_PAD, D), workers)
-                if self.enable_mtp:
-                    device_mtp_head = StackedDeviceTensor(mtp_head_weights, (RANKS, FP32_HEAD_VOCAB_PAD, D), workers)
-                device_final_norm = StackedDeviceTensor(
-                    [rank["norm.final_norm"] for rank in per_rank], (RANKS, D), workers,
-                )
-                device_logits = StackedDeviceTensor(head_outputs, (RANKS, BATCH, FP32_HEAD_VOCAB_PAD), workers)
-                host_logits_shards = torch.empty((RANKS, BATCH, FP32_HEAD_VOCAB_PAD), dtype=torch.float32)
-                print("GLM_DEVICE_LM_HEAD_BYTES_PER_RANK", FP32_HEAD_VOCAB_PAD * D * 4, flush=True)
-        except BaseException:
-            context.__exit__(*sys.exc_info())
-            raise
-        self._context = context
-        self.runtime, self.config = runtime, config
-        self._lm_head_program = lm_head_program
-        self._device_lm_head, self._device_final_norm = device_lm_head, device_final_norm
-        self._device_mtp_head = device_mtp_head
-        self._device_logits, self._host_logits_shards = device_logits, host_logits_shards
-        self._reset_program = reset_program
-        self._snapshot_program = snapshot_program
-        self._mtp_prepare_program = mtp_prepare_program
-        self._mtp_head_program = mtp_head_program
-        self._snapshot_generations = [0] * self._prefix_snapshot_entries
-        if self._prefix_snapshot_entries:
-            try:
-                for name, (shape, dtype) in PREFIX_SNAPSHOT_LAYOUTS.items():
-                    shards = [runtime.alloc_tensor(shape, dtype, worker_id=rank) for rank in range(RANKS)]
-                    self._snapshot_banks[name] = StackedDeviceTensor(shards, (RANKS, *shape), tuple(range(RANKS)))
-            except BaseException:
-                self.__exit__(*sys.exc_info())
-                raise
-        self.weights, self.final_norm_w, self.lm_head = weights, final_norm_w, lm_head
-        self.per_rank, self.stacked, self.bindings = per_rank, stacked, bindings
-        self.head_rows = head_rows
-        self._seq_lens.zero_()
-        self._invalid_slots.clear()
-        self._dispatch_error = None
-        for program in self._collective_dispatches:
-            self._collective_dispatches[program] = 0
-        try:
-            if self._host_num_threads is not None:
-                self._previous_host_num_threads = torch.get_num_threads()
-                torch.set_num_threads(self._host_num_threads)
-        except BaseException:
-            self.__exit__(*sys.exc_info())
-            raise
-        return self
-
-    def __exit__(self, *exc_info):
-        context, self._context = self._context, None
-        self.runtime = None
-        self._reset_program = None
-        self._snapshot_program = None
-        self._lm_head_program = None
-        self._device_lm_head = None
-        self._device_mtp_head = None
-        self._device_final_norm = None
-        self._device_logits = None
-        self._host_logits_shards = None
-        self._snapshot_banks.clear()
-        self._snapshot_descriptors = [None] * self._prefix_snapshot_entries
-        self.lm_head = None
-        try:
-            if context is not None:
-                return context.__exit__(*exc_info)
-            return False
-        finally:
-            self._restore_host_num_threads()
-
-    def _restore_host_num_threads(self) -> None:
-        previous, self._previous_host_num_threads = self._previous_host_num_threads, None
-        if previous is not None:
-            torch.set_num_threads(previous)
-
-    def _require_healthy_runtime(self) -> None:
-        """Require an open runtime with valid per-program communication state."""
-        if self.runtime is None:
-            raise RuntimeError("open the resident session before accessing request state")
-        if self._dispatch_error is not None:
-            raise RuntimeError("a dispatch failed; close and reopen the resident session") from self._dispatch_error
-
-    def _snapshot_descriptor(self, descriptor):
-        if not isinstance(descriptor, (tuple, list)) or len(descriptor) != 3:
-            raise ValueError("prefix snapshot descriptor must contain bank, generation and length")
-        bank, generation, length = descriptor
-        if any(type(value) is not int for value in descriptor):
-            raise ValueError("prefix snapshot descriptor fields must be integers")
-        if not 0 <= bank < self._prefix_snapshot_entries or generation <= 0:
-            raise ValueError("prefix snapshot bank or generation is invalid")
-        if not 0 < length <= MAX_SEQ_LEN or length % CHUNK_TILE:
-            raise ValueError("prefix snapshot length must preserve the KDA recurrence boundary")
-        return bank, generation, length
-
-    def _copy_snapshot(self, slot: int, bank: int, length: int, *, restore: bool) -> None:
-        self._require_healthy_runtime()
-        if self._snapshot_program is None or type(slot) is not int or not 0 <= slot < BATCH:
-            raise ValueError("prefix snapshots are disabled or the request slot is invalid")
-        arguments = [self.stacked[name] for name in PREFIX_CACHE_FAMILIES]
-        arguments.extend(self._snapshot_banks[name] for name in PREFIX_CACHE_FAMILIES)
-        table = self.cache_pages.table.contiguous()
-        for rank in range(RANKS):
-            self.runtime.copy_to(
-                self.per_rank[rank]["block_table"].data_ptr, table.data_ptr(),
-                table.numel() * table.element_size(), worker_id=rank,
-            )
-        try:
-            self.runtime.run(
-                self._snapshot_program, *arguments, self.stacked["block_table"], length, slot, bank,
-                int(restore), config=self.config,
-            )
-        except BaseException as error:
-            self._dispatch_error = error
-            raise
-
-    def capture_prefix(self, slot: int, descriptor) -> None:
-        """Capture a confirmed aligned prompt boundary into a new generation."""
-        self._require_healthy_runtime()
-        bank, generation, length = self._snapshot_descriptor(descriptor)
-        if type(slot) is not int or not 0 <= slot < BATCH or slot in self._invalid_slots:
-            raise ValueError("prefix capture requires a valid active request slot")
-        if generation <= self._snapshot_generations[bank] or int(self._seq_lens[slot]) != length:
-            raise ValueError("prefix capture generation or committed boundary is stale")
-        if self.enable_mtp and int(self._mtp_lengths[slot]) != length:
-            raise ValueError("MTP prefix capture requires refreshed target feedback")
-        self._snapshot_descriptors[bank] = None
-        self._snapshot_generations[bank] = generation
-        try:
-            self._copy_snapshot(slot, bank, length, restore=False)
-        except BaseException:
-            self._invalid_slots.add(slot)
-            raise
-        self._snapshot_descriptors[bank] = (bank, generation, length)
-
-    def restore_prefix(self, slot: int, descriptor) -> None:
-        """Restore immutable state into a reset request slot and commit its length."""
-        self._require_healthy_runtime()
-        bank, generation, length = self._snapshot_descriptor(descriptor)
-        if self._snapshot_descriptors[bank] != (bank, generation, length):
-            raise ValueError("prefix snapshot generation or length is stale")
-        if type(slot) is not int or not 0 <= slot < BATCH or int(self._seq_lens[slot]) != 0:
-            raise ValueError("prefix restore requires a reset request slot")
-        lengths = self._seq_lens.clone()
-        lengths[slot] = length
-        self.cache_pages.reserve(lengths)
-        self._invalid_slots.add(slot)
-        self._copy_snapshot(slot, bank, length, restore=True)
-        self._seq_lens[slot] = length
-        self._mtp_lengths[slot] = length if self.enable_mtp else 0
-        self._mtp_ready.discard(slot)
-        self._invalid_slots.discard(slot)
-
-    def reset_requests(self, request_slots: list[int]) -> None:
-        """Clear request-owned state and cache rows before releasing or reusing slots."""
-        self._require_healthy_runtime()
-        slots = list(request_slots)
-        if len(set(slots)) != len(slots) or any(slot < 0 or slot >= BATCH for slot in slots):
-            raise ValueError(f"request slots must be unique integers in 0..{BATCH - 1}")
-        if not slots:
-            return
-        # Mark requested slots invalid through the distributed clear.
-        self._invalid_slots.update(slots)
-        slot_mask = sum(1 << slot for slot in slots)
-        owners = self.cache_pages.owners.contiguous()
-        for rank in range(RANKS):
-            self.runtime.copy_to(
-                self.per_rank[rank]["cache_page_owners"].data_ptr, owners.data_ptr(),
-                owners.numel() * owners.element_size(), worker_id=rank,
-            )
-        self.runtime.run(
-            self._reset_program, self.stacked["mla_latent_cache"], self.stacked["index_raw_cache"],
-            self.stacked["index_pool_cache"], self.stacked["index_pool_scale"],
-            self.stacked["kda_conv_state"], self.stacked["kda_recurrent_state"],
-            self.stacked["cache_page_owners"], slot_mask, config=self.config,
-        )
-        self._seq_lens[slots] = 0
-        self.cache_pages.release(slots)
-        self._mtp_lengths[slots] = 0
-        self._mtp_ready.difference_update(slots)
-        if self.enable_mtp:
-            for name, width, dtype, fill in (
-                ("mtp_cached_hidden", D, torch.bfloat16, 0),
-                ("mtp_cached_pools", KPOOL_SELECT_K, torch.int32, -1),
-                ("mtp_cached_valid", KPOOL_SELECT_K, torch.int32, 0),
-            ):
-                row = torch.full((1, width), fill, dtype=dtype)
-                for rank in range(RANKS):
-                    for slot in slots:
-                        self.runtime.copy_to(
-                            self.per_rank[rank][name].data_ptr, row.data_ptr(),
-                            row.numel() * row.element_size(),
-                            dst_offset=slot * row.numel() * row.element_size(), worker_id=rank,
-                        )
-        self._invalid_slots.difference_update(slots)
-
-    def forward_chunks(
-        self,
-        token_sequences: list[list[int]],
-        request_slots: list[int],
-        kv_seq_lens: list[int] | None = None,
-        *,
-        visual_features: dict[int, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        """Append only new query tokens to the selected persistent request slots."""
-        self._require_healthy_runtime()
-        slots = list(request_slots)
-        if len(token_sequences) != len(slots) or not slots:
-            raise ValueError("each nonempty query sequence needs one request slot")
-        if len(set(slots)) != len(slots) or any(slot < 0 or slot >= BATCH for slot in slots):
-            raise ValueError(f"request slots must be unique integers in 0..{BATCH - 1}")
-        if any(not tokens for tokens in token_sequences):
-            raise ValueError("active chunk sequences must contain at least one token")
-        if self._invalid_slots.intersection(slots):
-            raise RuntimeError("reset request slots after a failed dispatch before reusing their cache state")
-        previous = self._seq_lens[slots].tolist()
-        if kv_seq_lens is not None and list(kv_seq_lens) != previous:
-            raise ValueError("chunk prefix lengths disagree with committed request cache state")
-        sequences = [[] for _ in range(BATCH)]
-        for slot, tokens in zip(slots, token_sequences, strict=True):
-            sequences[slot] = list(tokens)
-        if visual_features is not None and set(visual_features) - set(slots):
-            raise ValueError("visual features must belong to active request slots")
-        new_lengths = self._seq_lens + torch.tensor([len(tokens) for tokens in sequences], dtype=torch.int32)
-        reservation = self.cache_pages.reserve(new_lengths)
-        try:
-            inputs = prepare_step_inputs(
-                self.weights, sequences, kv_seq_lens=self._seq_lens, visual_features=visual_features,
-                cache_pages=self.cache_pages,
-            )
-        except BaseException:
-            self.cache_pages.cancel_reservation(reservation)
-            raise
-        try:
-            logits = self._run_step(inputs)
-        except BaseException:
-            # Device caches may have advanced even when the host call did not commit its lengths.
-            self._invalid_slots.update(slots)
-            raise
-        for slot, tokens in zip(slots, token_sequences, strict=True):
-            self._seq_lens[slot] += len(tokens)
-        self._last_chunk_sequences = [list(tokens) for tokens in token_sequences]
-        self._last_chunk_slots = slots
-        return logits[slots]
-
-    def update_mtp(self, next_token_ids: list[int]) -> torch.Tensor:
-        """Refresh the MTP prefix with true target feedback and one shifted token per query row."""
-        if not self.enable_mtp or self._last_chunk_sequences is None:
-            raise RuntimeError("MTP needs an enabled session and a completed target chunk")
-        slots = self._last_chunk_slots
-        sequences = self._last_chunk_sequences
-        if len(next_token_ids) != len(slots):
-            raise ValueError("MTP needs one next token per target request")
-        expected = [int(self._seq_lens[slot]) - len(tokens) for slot, tokens in zip(slots, sequences)]
-        if self._mtp_lengths[slots].tolist() != expected:
-            raise RuntimeError("MTP cache must be refreshed after every target chunk")
-        shifted = [tokens[1:] + [int(next_token)] for tokens, next_token in zip(sequences, next_token_ids)]
-        logits = self._run_mtp(shifted, slots, recycle=False)
-        self._mtp_ready.update(slots)
-        self._last_chunk_sequences = None
-        return logits
-
-    def propose_mtp(self, request_slots: list[int], count: int) -> dict[int, list[int]]:
-        """Draft with one MTP-owned TopK and roll speculative cache visibility back afterward."""
-        slots = list(request_slots)
-        if not self.enable_mtp or count not in range(1, MTP_SPEC_TOKENS + 1):
-            raise ValueError(f"MTP proposal count must be in 1..{MTP_SPEC_TOKENS}")
-        if len(set(slots)) != len(slots) or not slots or not set(slots) <= self._mtp_ready:
-            raise ValueError("MTP proposal slots need fresh target feedback")
-        if bool((self._mtp_lengths[slots] + count - 1 > MAX_SEQ_LEN).any()):
-            raise ValueError("MTP proposal exceeds the context limit")
-        base_lengths = self._mtp_lengths.clone()
-        proposed = {slot: [] for slot in slots}
-        for step in range(count):
-            next_ids = self._mtp_logits[slots].argmax(dim=-1).tolist()
-            for slot, token in zip(slots, next_ids):
-                proposed[slot].append(int(token))
-            if step + 1 < count:
-                self._run_mtp([[int(token)] for token in next_ids], slots, recycle=True)
-        # The target verifier consumes only confirmed input tokens. Its KDA states
-        # never advance through a rejected draft. Uncommitted MTP payloads remain
-        # owned but are invisible until a later true-feedback write replaces them.
-        self._mtp_lengths.copy_(base_lengths)
-        self._mtp_ready.difference_update(slots)
-        self.mtp_stats["rounds"] += 1
-        self.mtp_stats["proposed"] += count * len(slots)
-        return proposed
-
-    def _run_mtp(self, token_sequences, slots, *, recycle):
-        self._require_healthy_runtime()
-        sequences = [[] for _ in range(BATCH)]
-        for slot, tokens in zip(slots, token_sequences):
-            sequences[slot] = list(tokens)
-        lengths = self._mtp_lengths + torch.tensor([len(tokens) for tokens in sequences], dtype=torch.int32)
-        reservation = self.cache_pages.reserve(lengths)
-        try:
-            inputs = prepare_step_inputs(
-                self.weights, sequences, kv_seq_lens=self._mtp_lengths, cache_pages=self.cache_pages,
-                mtp=True,
-            )
-            for slot in slots:
-                if int(self._mtp_lengths[slot]) == 0:
-                    row = int(inputs["query_start_loc"][slot])
-                    inputs["embedding_rows"][row].zero_()
-        except BaseException:
-            self.cache_pages.cancel_reservation(reservation)
-            raise
-        runtime, config, stacked = self.runtime, self.config, self.stacked
-        try:
-            for rank in range(RANKS):
-                for name, value in inputs.items():
-                    runtime.copy_to(
-                        self.per_rank[rank][name].data_ptr, value.data_ptr(),
-                        value.numel() * value.element_size(), worker_id=rank,
-                    )
-            feedback_norm = stacked["mtp.final_norm"] if recycle else self._device_final_norm
-            runtime.run(
-                self._mtp_prepare_program, stacked["ws_x_hc_a"], stacked["embedding_rows"], feedback_norm,
-                stacked["mtp.enorm"], stacked["mtp.hnorm"], stacked["mtp.eh_proj"], stacked["request_ids"],
-                stacked["mtp_cached_hidden"], stacked["mtp_cached_pools"], stacked["mtp_cached_valid"],
-                stacked["mtp_selected_pools"], stacked["mtp_selected_valid"], stacked["ws_x_hc_b"],
-                int(recycle), config=config,
-            )
-            for program, overrides in (
-                ("dsa_attn", {"x_hc": "ws_x_hc_b", "out_x_hc_mid": "ws_x_hc_a"}),
-                ("moe_ffn", {"x_hc_mid": "ws_x_hc_a", "out_x_hc_out": "ws_x_hc_b"}),
-                ("head", {"x_hc": "ws_x_hc_b"}),
-            ):
-                tensor_names, scalar_names = self.arity[program]
-                index = self._collective_dispatches.get(program, 0)
-                epoch = index + 1
-                if epoch > (2**31 - 1) // 2:
-                    raise OverflowError("collective epochs exhausted; reopen the session")
-                scalars = dict(
-                    bb_ord=NUM_LAYERS, dsa_ord=MLA_STACK_LAYERS - 1, moe_ord=MOE_STACK_LAYERS - 1,
-                    attn_epoch=epoch, moe_epoch=epoch, ffn_epoch=epoch, skip_topk=int(recycle),
-                )
-                arguments = []
-                for name in tensor_names:
-                    allocation = _alloc_name_of(name, overrides)
-                    if name in ("selected_pools", "selected_valid"):
-                        allocation = "mtp_" + name
-                    arguments.append(stacked[allocation])
-                arguments.extend(scalars[name] for name in scalar_names)
-                runtime.run(self.programs[program], *arguments, config=config)
-                if program in self._collective_dispatches:
-                    self._collective_dispatches[program] = epoch
-            runtime.run(
-                self._mtp_head_program, stacked["head_hidden"], stacked["mtp.final_norm"],
-                self._device_mtp_head, stacked["mtp_selected_pools"], stacked["mtp_selected_valid"],
-                stacked["query_start_loc"], stacked["mtp_cached_hidden"], stacked["mtp_cached_pools"],
-                stacked["mtp_cached_valid"], self._device_logits, config=config,
-            )
-            runtime.copy_stacked_from(self._device_logits, self._host_logits_shards)
-            logits = torch.cat(tuple((shard[:, :LOCAL_VOCAB] for shard in self._host_logits_shards.unbind(0))), dim=1)
-            if not torch.isfinite(logits[slots]).all():
-                raise FloatingPointError("MTP produced nonfinite logits")
-        except BaseException as error:
-            self._dispatch_error = error
-            self._invalid_slots.update(slots)
-            raise
-        self._mtp_lengths.copy_(lengths)
-        self._mtp_logits[slots] = logits[slots]
-        return logits[slots]
-
-    def forward(self, sequences: list[list[int]]) -> torch.Tensor:
-        """Run an independent full-prefix batch through the chunk-capable session."""
-        if len(sequences) != BATCH or any(not tokens for tokens in sequences):
-            raise ValueError(f"full-prefix forward requires {BATCH} nonempty sequences")
-        self.reset_requests(list(range(BATCH)))
-        return self.forward_chunks(sequences, list(range(BATCH)), [0] * BATCH)
-
-    def _run_step(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Upload this query batch and dispatch the full backbone once."""
-        self._require_healthy_runtime()
-        runtime, config, programs = self.runtime, self.config, self.programs
-        plan, arity, step_program = self.plan, self.arity, self.step_program
-        per_rank, stacked, bindings = self.per_rank, self.stacked, self.bindings
-        head_rows, guard_events = self.head_rows, self.guard_events
-        final_norm_w, lm_head = self.final_norm_w, self.lm_head
-        step = self.calls
-        for rank in range(RANKS):
-            for name, value in inputs.items():
-                if name in CONSTANT_STEP_INPUTS or name in _PARAM_TO_STACK:
-                    continue
-                runtime.copy_to(
-                    per_rank[rank][name].data_ptr, value.data_ptr(), value.numel() * value.element_size(),
-                    worker_id=rank,
-                )
-        self.last_dispatch_started_at = time.monotonic()
-        print("GLM_DEVICE_START", self.calls, flush=True)
-        pending = deque()
-        next_dispatches = dict(self._collective_dispatches)
-
-        def complete_oldest():
-            handle, key, dispatch_index = pending[0]
-            handle.result()
-            pending.popleft()
-            if key in self._collective_dispatches:
-                self._collective_dispatches[key] = dispatch_index + 1
-
-        try:
-            for launch in plan:
-                if len(pending) == 2:
-                    complete_oldest()
-                overrides = bindings[launch]
-                key = step_program[launch]
-                tensor_names, scalar_names = arity[key]
-                if TRACE_DISPATCH:
-                    label = f"{_step_key(launch)} {key}"
-                    print("GLM_DISPATCH", label, flush=True)
-                dispatch_index = next_dispatches.get(key, 0)
-                ords = production_step_ordinals(launch, dispatch_index=dispatch_index)
-                arguments = [stacked[_alloc_name_of(name, overrides)] for name in tensor_names]
-                arguments.extend(ords[name] for name in scalar_names)
-                handle = runtime.submit(programs[key], *arguments, config=config)
-                pending.append((handle, key, dispatch_index))
-                if key in next_dispatches:
-                    next_dispatches[key] = dispatch_index + 1
-                if VERIFY_X_H_C and launch != ("head",):
-                    while pending:
-                        complete_oldest()
-                    written = overrides.get("out_x_hc_out", overrides.get("out_x_hc_mid", overrides.get("x_hc")))
-                    step_rows = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.bfloat16)
-                    runtime.copy_stacked_from(stacked[written], step_rows)
-                    finite_step = bool(torch.isfinite(step_rows.to(torch.float32)).all())
-                    print(
-                        "GLM_XHC_STEP", _step_key(launch), written, "finite=", finite_step, "absmax=",
-                        float(step_rows.to(torch.float32).abs().max()), flush=True,
-                    )
-                    if not finite_step:
-                        guard_events.append(f"nonfinite {written} after {_step_key(launch)}")
-                        raise FloatingPointError(f"nonfinite {written} after {_step_key(launch)}")
-            while pending:
-                complete_oldest()
-            if self.lm_head_backend == "npu":
-                runtime.run(
-                    self._lm_head_program, stacked["head_hidden"], self._device_final_norm,
-                    self._device_lm_head, self._device_logits, config=config,
-                )
-                runtime.copy_stacked_from(self._device_logits, self._host_logits_shards)
-            runtime.copy_stacked_from(stacked["head_hidden"], head_rows)
-        except BaseException as error:
-            self._dispatch_error = error
-            for handle, _, _ in pending:
-                try:
-                    handle.result()
-                except BaseException:
-                    pass
-            raise
-        if VERIFY_X_H_C:
-            print(
-                "GLM_HEAD_HIDDEN finite=", bool(torch.isfinite(head_rows).all()), "absmax=",
-                float(head_rows.to(torch.float32).abs().max()), flush=True,
-            )
-        if not bool(torch.isfinite(head_rows).all()):
-            guard_events.append(f"nonfinite head_hidden at step {step}")
-            raise FloatingPointError(f"nonfinite head_hidden at step {step}")
-        if VERIFY_X_H_C:
-            # The head's x_hc binding IS the last FFN launch's out_x_hc_out
-            # (the ping-pong returns the stream to its entry side), so this
-            # readback is the direct out_x_hc_out finiteness evidence.
-            stream_name = bindings[("head",)]["x_hc"]
-            stream_rows = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.bfloat16)
-            runtime.copy_stacked_from(stacked[stream_name], stream_rows)
-            finite_stream = bool(torch.isfinite(stream_rows.to(torch.float32)).all())
-            print(
-                "GLM_XHC_STREAM", stream_name, "finite=", finite_stream, "absmax=",
-                float(stream_rows.to(torch.float32).abs().max()), flush=True,
-            )
-            if not finite_stream:
-                guard_events.append(f"nonfinite {stream_name} at step {step}")
-                raise FloatingPointError(f"nonfinite {stream_name} at step {step}")
-        if self.lm_head_backend == "npu":
-            shards = (shard[:, :LOCAL_VOCAB] for shard in self._host_logits_shards.unbind(dim=0))
-            logits = torch.cat(tuple(shards), dim=1)
-        else:
-            # All ranks hold the same restored stream; rank 0's rows are the answer.
-            logits = reference_lm_head_logits(head_rows[0, :BATCH], final_norm_w, lm_head)
-        if not bool(torch.isfinite(logits[:BATCH]).all()):
-            guard_events.append(f"nonfinite logits at step {step}")
-            raise FloatingPointError(f"nonfinite last-token logits at step {step}")
-        self.calls += 1
-        return logits[:BATCH]
 
 
-def generate(
-    checkpoint: Checkpoint,
-    programs: dict,
-    device_ids: list[int],
-    prompts: list[str],
-    max_new_tokens: int,
-    *,
-    raw_prompts: bool = False,
-    platform: str = "a2a3",
-    expect_tokens: dict[int, list[int]] | None = None,
-    dump_path: Path | None = None,
-    visual_inputs: dict[int, list] | None = None,
-    spec_tokens: int = 0,
-):
-    """Generate incrementally with resident caches and optional MTP verification.
-
-    Report legacy ``seconds`` from runtime preparation and step ``seconds`` from
-    dispatch, plus separate checkpoint/input setup and end-to-end wall times.
-    """
-    end_to_end_start = time.monotonic()
-    from tokenizers import Tokenizer
-
-    if type(spec_tokens) is not int or spec_tokens not in range(MTP_SPEC_TOKENS + 1):
-        raise ValueError(f"spec_tokens must be in 0..{MTP_SPEC_TOKENS}")
-    if type(max_new_tokens) is not int or max_new_tokens <= 0:
-        raise ValueError("max_new_tokens must be a positive integer")
-    if not 1 <= len(prompts) <= BATCH:
-        raise ValueError(f"provide between 1 and {BATCH} prompts")
-
-    tokenizer = Tokenizer.from_file(str(checkpoint.root / "tokenizer.json"))
-    tokenizer_config_path = checkpoint.root / "tokenizer_config.json"
-    tokenizer_config = json.loads(tokenizer_config_path.read_text()) if tokenizer_config_path.exists() else {}
-    # The transformers convention: an inline tokenizer_config chat_template wins,
-    # else the checkpoint's own chat_template.jinja beside the weights (the
-    # GLM-5.3-Flash snapshot ships the file and no inline field).
-    chat_template = tokenizer_config.get("chat_template")
-    if not chat_template:
-        template_path = checkpoint.root / "chat_template.jinja"
-        if template_path.exists():
-            chat_template = template_path.read_text()
-    eos_ids = _resolve_eos_ids(checkpoint, tokenizer, tokenizer_config)
-
-    visual_features = {}
-    if visual_inputs:
-
-        prompts = list(prompts)
-        packed_visuals = []
-        for request, visuals in visual_inputs.items():
-            if type(request) is not int or request not in range(len(prompts)) or not visuals:
-                raise ValueError("visual inputs need a nonempty list for a valid prompt index")
-            for visual in visuals:
-                if not isinstance(visual, VisualInput):
-                    raise ValueError("visual inputs must be produced by VisionProcessor")
-                packed_visuals.append((request, visual))
-            remainder = prompts[request]
-            expanded = []
-            if "<|image|>" not in remainder and "<|video|>" not in remainder:
-                prompts[request] = "\n".join(visual.prompt_fragment for visual in visuals) + "\n" + remainder
-            else:
-                for visual in visuals:
-                    candidates = [
-                        (remainder.find(marker), marker)
-                        for marker in ("<|image|>", "<|video|>")
-                        if marker in remainder
-                    ]
-                    if not candidates or min(candidates)[1] != visual.marker:
-                        raise ValueError("prompt visual markers must match the supplied visual input order")
-                    before, remainder = remainder.split(visual.marker, 1)
-                    expanded.extend((before, visual.prompt_fragment))
-                if "<|image|>" in remainder or "<|video|>" in remainder:
-                    raise ValueError("each prompt visual marker needs one visual input")
-                prompts[request] = "".join(expanded) + remainder
-        pixels = torch.cat([visual.pixel_values for _, visual in packed_visuals])
-        grid = torch.cat([visual.grid_thw for _, visual in packed_visuals])
-        encoder = VisionEncoder(checkpoint, device_ids[0], platform=platform, compiled=programs.get("_vision"))
-        encoded = encoder(pixels, grid)
-        offset = 0
-        for request, visual in packed_visuals:
-            count = int(visual.grid_thw.prod(dim=-1).sum()) // 4
-            part = encoded[offset : offset + count]
-            visual_features[request] = (
-                torch.cat((visual_features[request], part)) if request in visual_features else part
-            )
-            offset += count
-        del encoder
-
-    sequences = [
-        tokenizer.encode(
-            prompt if raw_prompts else _render_prompt(prompt, chat_template),
-            add_special_tokens=False,
-        ).ids
-        for prompt in prompts
-    ]
-    if any(not sequence for sequence in sequences):
-        raise ValueError("prompts must contain at least one token")
-    if any(len(sequence) + max_new_tokens > MAX_SEQ_LEN for sequence in sequences):
-        raise ValueError(f"prompt and generation exceed the compiled context limit {MAX_SEQ_LEN}")
-
-    generated: list[list[int]] = [[] for _ in prompts]
-    finished = [False] * len(prompts)
-    step_log: list[dict] = []
-    with ResidentPrefillSession(
-        checkpoint, programs, device_ids, platform=platform, enable_mtp=bool(spec_tokens)
-    ) as session:
-        start = session.runtime_started_at
-        logits = torch.empty(len(prompts), FLASH.vocab_size, dtype=torch.float32)
-        remaining = [list(sequence) for sequence in sequences]
-        feature_offsets = [0] * len(prompts)
-        draft_queues = [[] for _ in prompts]
-        for step in range(max_new_tokens):
-            tick = time.monotonic()
-            dispatch_seconds = input_setup_seconds = 0.0
-            while any(remaining):
-                budget, slots, chunks, features = CAPACITY, [], [], {}
-                for request, tokens in enumerate(remaining):
-                    if not tokens or budget == 0:
-                        continue
-                    count = min(len(tokens), budget)
-                    if count < len(tokens):
-                        count -= count % CHUNK_TILE
-                    if count == 0:
-                        continue
-                    chunk, remaining[request] = tokens[:count], tokens[count:]
-                    slots.append(request)
-                    chunks.append(chunk)
-                    if request in visual_features:
-
-                        count_visual = chunk.count(IMAGE_TOKEN_ID)
-                        begin = feature_offsets[request]
-                        if count_visual:
-                            features[request] = visual_features[request][begin : begin + count_visual]
-                            feature_offsets[request] += count_visual
-                    budget -= count
-                dispatch_start = time.monotonic()
-                partial = session.forward_chunks(chunks, slots, visual_features=features)
-                dispatch_seconds += time.monotonic() - session.last_dispatch_started_at
-                input_setup_seconds += session.last_dispatch_started_at - dispatch_start
-                logits[slots] = partial
-                if spec_tokens:
-                    next_tokens = [
-                        remaining[slot][0] if remaining[slot] else int(partial[index].argmax())
-                        for index, slot in enumerate(slots)
-                    ]
-                    session.update_mtp(next_tokens)
-            next_ids = logits.argmax(dim=-1).tolist()
-            for request, token in enumerate(next_ids):
-                if not finished[request]:
-                    if draft_queues[request]:
-                        candidate = draft_queues[request].pop(0)
-                        if candidate == int(token):
-                            session.mtp_stats["accepted"] += 1
-                        else:
-                            session.mtp_stats["rejected"] += 1
-                            draft_queues[request].clear()
-                    generated[request].append(int(token))
-                    sequences[request].append(int(token))
-                    finished[request] = int(token) in eos_ids
-                    if not finished[request]:
-                        remaining[request] = [int(token)]
-            if spec_tokens and step + 1 < max_new_tokens:
-                draft_slots = [
-                    request
-                    for request in range(len(prompts))
-                    if not finished[request] and not draft_queues[request]
-                ]
-                if draft_slots:
-                    count = min(spec_tokens, max_new_tokens - step - 1)
-                    for slot, proposed in session.propose_mtp(draft_slots, count).items():
-                        draft_queues[slot] = proposed
-            step_end = time.monotonic()
-            step_log.append(
-                {
-                    "step": step,
-                    "seconds": dispatch_seconds,
-                    "input_setup_seconds": input_setup_seconds,
-                    "end_to_end_seconds": step_end - tick,
-                    "token_ids": next_ids,
-                    "text": [tokenizer.decode(tokens, skip_special_tokens=False) for tokens in generated],
-                },
-            )
-            print("GLM_GENERATION_STEP", json.dumps(step_log[-1], ensure_ascii=False), flush=True)
-            if all(finished):
-                break
-        resident_bytes_per_rank = session.weights.bytes_per_rank
-        guard_events = session.guard_events
-
-    if dump_path is not None:
-        dump_path.parent.mkdir(parents=True, exist_ok=True)
-        dump_path.write_text(json.dumps(generated, indent=2) + "\n")
-    if expect_tokens:
-        for request, expected in expect_tokens.items():
-            produced = generated[request][: len(expected)]
-            if produced != list(expected):
-                raise AssertionError(f"prompt {request}: expected top-1 prefix {list(expected)}, got {produced}")
-
-    def _truncate_at_eos(tokens: list[int]) -> list[int]:
-        stops = [index for index, token in enumerate(tokens) if token in eos_ids]
-        return tokens[: stops[0]] if stops else tokens
-
-    return {
-        "platform": "a2a3",
-        "tp": TP_SIZE,
-        "ep": EP_SIZE,
-        "dp": DP_SIZE,
-        "precision": "official_bf16_w8a8",
-        "checkpoint": str(checkpoint.root),
-        "capacity": CAPACITY,
-        "max_seq_len": MAX_SEQ_LEN,
-        "cache_tokens": CACHE_TOKENS,
-        "full_prefix_recomputation": False,
-        "mtp": {"tokens": spec_tokens, "verification": "sequential_greedy", **session.mtp_stats},
-        "layers_per_forward": NUM_LAYERS,
-        "launch_mode": "rt",
-        "device_launches_per_rank_per_forward": len(session.plan),
-        "resident_bytes_per_rank": resident_bytes_per_rank,
-        "seconds": time.monotonic() - start,
-        "steps": step_log,
-        "guard_events": guard_events,
-        "checkpoint_setup_seconds": session.checkpoint_setup_seconds,
-        "end_to_end_seconds": time.monotonic() - end_to_end_start,
-        "cases": [
-            {
-                "prompt": prompt,
-                "token_ids": _truncate_at_eos(tokens),
-                "text": tokenizer.decode(_truncate_at_eos(tokens), skip_special_tokens=False),
-                "eos_reached": done,
-            }
-            for prompt, tokens, done in zip(prompts, generated, finished)
-        ],
-    }
 
 
 def run_weight_checks(argv=None):
@@ -3590,7 +2448,6 @@ def run_weight_checks(argv=None):
     # and metadata validation are covered by the loader tests above; these cases
     # cover the staging itself - resolution, fusion, sharding, splitting,
     # stacking and the staged upload.
-    import ctypes  # noqa: PLC0415
 
     TINY = Glm53FlashConfig(
         name="glm5_3_flash_tiny", vocab_size=128, hidden_size=64, num_hidden_layers=4,
@@ -3965,27 +2822,19 @@ def run_weight_checks(argv=None):
     else:
         raise AssertionError("an out-of-vocabulary token id should have been rejected")
 
-    # Resident test 10: the staged upload - order, per-layer MoE staging, byte
-    # coverage, and rank tagging - against a recording runtime.
-    class _Handle:
-        def __init__(self, pointer: int):
-            self.data_ptr = pointer
+    # Rank payload order, layer offsets and byte coverage are pure CPU contracts.
+    def raw_bytes(tensor: torch.Tensor) -> bytes:
+        return bytes(tensor.contiguous().flatten().view(torch.uint8).numpy())
 
-    class _RecordingRuntime:
-        def __init__(self):
-            self.copies = []
-
-        def copy_to(self, dst, src, nbytes, dst_offset=0, worker_id=None):
-            self.copies.append((dst, dst_offset, nbytes, worker_id))
-
-    runtime = _RecordingRuntime()
-    handles = {name: _Handle(index) for index, name in enumerate(weights.tensor_layouts)}
-    weights.upload(runtime, rank=1, handles=handles)
-    names_by_pointer = {index: name for index, name in enumerate(weights.tensor_layouts)}
     per_name: dict[str, list[tuple[int, int]]] = {}
-    for dst, offset, nbytes, worker in runtime.copies:
-        assert worker == 1, "every copy must be tagged with the uploading rank"
-        per_name.setdefault(names_by_pointer[dst], []).append((offset, nbytes))
+    blobs: dict[str, bytearray] = {}
+    upload_order = []
+    for name, data, offset in weights.iter_rank_uploads(rank=1):
+        nbytes = data.numel() * data.element_size()
+        upload_order.append(name)
+        per_name.setdefault(name, []).append((offset, nbytes))
+        blob = blobs.setdefault(name, bytearray(weights.stacks[name].bytes))
+        blob[offset:offset + nbytes] = raw_bytes(data)
     for name, plan in weights.stacks.items():
         copies = per_name.get(name, [])
         if not copies:
@@ -3999,37 +2848,14 @@ def run_weight_checks(argv=None):
                 raise AssertionError(f"stack {name} was not staged one layer at a time in order")
             if any(nbytes != layer_bytes for _, nbytes in copies):
                 raise AssertionError(f"stack {name} staged a partial layer slice")
-        else:
-            if copies != [(0, plan.bytes)]:
-                raise AssertionError(f"unstacked resident {name} must be one whole copy")
-    first_seen = list(
-        dict.fromkeys((name.split(".")[0] for name in (names_by_pointer[dst] for (dst, _, _, _) in runtime.copies))),
-    )
+        elif copies != [(0, plan.bytes)]:
+            raise AssertionError(f"unstacked resident {name} must be one whole payload")
+    first_seen = list(dict.fromkeys(name.split(".")[0] for name in upload_order))
     expected_order = ["norm", "mtp", "hadamard", "mhc", "router", "kda", "mla", "indexer", "dense", "moe"]
     if first_seen != expected_order:
         raise AssertionError(f"staging order {first_seen} != {expected_order}")
 
-    # Logical byte parity of per-layer staging versus whole-stack materialization:
-    # decode the two shared NZ stacks before comparing to the logical
-    # ``torch.stack`` reference. All other staged bytes stay unchanged.
-    class _ByteRuntime(_RecordingRuntime):
-        """Capture the staged source bytes at copy time (pointer valid there)."""
-
-        def __init__(self):
-            super().__init__()
-            self.blobs: dict[str, bytearray] = {}
-
-        def copy_to(self, dst, src, nbytes, dst_offset=0, worker_id=None):
-            super().copy_to(dst, src, nbytes, dst_offset, worker_id)
-            name = names_by_pointer[dst]
-            blob = self.blobs.setdefault(name, bytearray(weights.stacks[name].bytes))
-            blob[dst_offset : dst_offset + nbytes] = ctypes.string_at(src, nbytes)
-
-    def raw_bytes(tensor: torch.Tensor) -> bytes:
-        return bytes(tensor.contiguous().flatten().view(torch.uint8).numpy())
-
-    byte_runtime = _ByteRuntime()
-    weights.upload(byte_runtime, rank=1, handles=handles)
+    # Compare streamed bytes with independently materialized whole stacks.
     reference: dict[str, torch.Tensor] = {}
     for family in ("norm", "mhc", "router", "kda", "mla", "indexer"):
         for member, stack in weights._stack_family(family, tp_rank=1).items():
@@ -4051,32 +2877,25 @@ def run_weight_checks(argv=None):
         )
     for name, tensor in weights._single_tensors().items():
         reference[name] = tensor
-    if set(reference) != set(byte_runtime.blobs):
+    if set(reference) != set(blobs):
         raise AssertionError("the parity reference and the staged stacks disagree on names")
     for name, tensor in reference.items():
-        staged = bytes(byte_runtime.blobs[name])
+        staged = bytes(blobs[name])
         if name in ("moe.shared_w_gate_up", "moe.shared_w_down"):
-            physical = torch.frombuffer(byte_runtime.blobs[name], dtype=tensor.dtype).reshape(tensor.shape)
+            physical = torch.frombuffer(blobs[name], dtype=tensor.dtype).reshape(tensor.shape)
             staged = raw_bytes(unpack_int8_nz(physical))
         if staged != raw_bytes(tensor):
             raise AssertionError(f"per-layer staging of {name} is not byte-identical to the stack")
     print(f"[GOLDEN] PASS weights upload byte parity ({len(reference)} stacks, rank 1 of TP2/EP2)")
 
-    fresh = _RecordingRuntime()
     try:
-        weights.upload(fresh, rank=0, handles={})
+        list(weights.iter_rank_uploads(rank=2))
     except ValueError:
         pass
     else:
-        raise AssertionError("upload with missing handles should have been rejected")
-    try:
-        weights.upload(fresh, rank=2, handles=handles)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("upload with an out-of-range rank should have been rejected")
-    copies = len(runtime.copies)
-    message = f"[GOLDEN] PASS weights resident loader (tiny checkpoint, TP1-4/EP1-16, {copies} copies)"
+        raise AssertionError("payload iteration with an out-of-range rank should have been rejected")
+    copies = len(upload_order)
+    message = f"[GOLDEN] PASS weights resident loader (tiny checkpoint, TP1-4/EP1-16, {copies} payloads)"
     print(message)
 
     class _FullGeometryCheckpoint(Mapping[str, torch.Tensor]):
@@ -4233,127 +3052,16 @@ def run_reference_checks_cli(argv=None) -> None:
     run_self_tests(checkpoint_root=args.checkpoint)
 
 
+
+
 def main(argv=None):
-    checks = argparse.ArgumentParser(add_help=False)
-    checks.add_argument("--check", choices=["reference", "weights"])
-    selected, argv = checks.parse_known_args(argv)
+    """Run bounded CPU contracts; generation is owned by pypto-serving."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--check", choices=["reference", "weights"], default="weights")
+    selected, remaining = parser.parse_known_args(argv)
     if selected.check == "reference":
-        return run_reference_checks_cli(argv)
-    if selected.check == "weights":
-        return run_weight_checks(argv)
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-p", "--platform", choices=["a2a3"], default="a2a3")
-    parser.add_argument("--sim", action="store_true", help="accepted by the default CPU weight checks")
-    parser.add_argument(
-        "--checkpoint", type=Path, default=None,
-        help="resident W8A8 checkpoint root (required for generation)",
-    )
-    parser.add_argument("--runtime-dir", type=Path, default=None, help="manifest dir of the launch plan artifacts; compiled on first use")
-    parser.add_argument(
-        "-d", "--device", default=os.environ.get("TASK_DEVICE"),
-        help="comma-separated device ids (accepted, ignored under --checkpoint)",
-    )
-    parser.add_argument("--tokens", type=int, default=T_MOE, help=argparse.SUPPRESS)
-    parser.add_argument("--devices", default=os.environ.get("TASK_DEVICE"), help=argparse.SUPPRESS)
-    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[16, 8, 2])
-    parser.add_argument("--ep", type=int, default=RANKS, choices=[16, 8, 2])
-    parser.add_argument("--capacity", type=int, default=CAPACITY)
-    parser.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN)
-    parser.add_argument("--cache-tokens", type=int, default=CACHE_TOKENS)
-    parser.add_argument("--prompt", action="append", help=f"one prompt of the packed batch; provide between 1 and {BATCH}")
-    parser.add_argument("--compile-only", action="store_true", help="build all programs without allocating NPU devices")
-    parser.add_argument("--spec-tokens", type=int, choices=range(MTP_SPEC_TOKENS + 1), default=0)
-    parser.add_argument("--image", action="append", type=Path, help="image for prompt zero; repeat for multiple images")
-    parser.add_argument("--video", action="append", type=Path, help="video file for prompt zero; decoded with FFmpeg")
-    parser.add_argument("--vision-runtime-dir", type=Path, help="precompiled single-rank vision artifact")
-    parser.add_argument("--video-frame", action="append", type=Path, help="sampled video frame for prompt zero")
-    parser.add_argument("--video-frame-fps", type=float, default=2.0)
-    parser.add_argument("--max-new-tokens", type=int, default=16)
-    parser.add_argument("--report", type=Path)
-    parser.add_argument("--raw", action="store_true", help="encode prompts verbatim, no chat template")
-    parser.add_argument("--expect-tokens", type=Path, help="JSON mapping prompt index to the expected top-1 token-id prefix")
-    parser.add_argument("--dump-tokens", type=Path, help="write the produced token ids as JSON")
-    options, unknown = parser.parse_known_args(argv)
-    if options.checkpoint is None and options.runtime_dir is None and not options.compile_only:
-        if options.prompt or options.image or options.video or options.video_frame or unknown:
-            parser.error("generation requires --checkpoint and --runtime-dir")
-        return run_weight_checks(["--tp", str(options.tp), "--ep", str(options.ep)])
-    if options.sim:
-        parser.error("resident generation requires a2a3 devices")
-    if options.compile_only:
-        if unknown:
-            parser.error(f"unrecognized arguments: {' '.join(unknown)}")
-        if options.runtime_dir is None:
-            parser.error("--compile-only requires --runtime-dir")
-        compile_production(options.runtime_dir, list(range(RANKS)))
-        return
-    if options.checkpoint is None:
-        if options.prompt:
-            raise ValueError("--prompt needs the generate() mode (--checkpoint)")
-        parser.error("generation requires --checkpoint")
-    if unknown:
-        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
-    if options.capacity != CAPACITY:
-        raise ValueError(f"--capacity must match compilation ({CAPACITY}); recompile to change it")
-    if options.cache_tokens != CACHE_TOKENS:
-        raise ValueError(f"--cache-tokens must match compilation ({CACHE_TOKENS})")
-    if options.max_seq_len != MAX_SEQ_LEN:
-        raise ValueError(f"--max-seq-len must match compilation ({MAX_SEQ_LEN})")
-    if (options.tp, options.ep) != (C.TP_SIZE, RANKS):
-        raise ValueError(f"parallel sizes must match compilation: TP{C.TP_SIZE}/EP{RANKS}")
-    if options.runtime_dir is None:
-        raise ValueError("the generate() mode needs --runtime-dir")
-    device_ids = [int(value) for value in (options.devices or "").split(",") if value]
-    if len(device_ids) != RANKS or len(set(device_ids)) != RANKS:
-        raise ValueError(f"provide {RANKS} distinct task-allocated a2a3 devices")
-    prompts = list(options.prompt or DEFAULT_PROMPTS)
-    if not 1 <= len(prompts) <= BATCH or options.max_new_tokens <= 0:
-        raise ValueError(f"provide 1..{BATCH} prompts and a positive --max-new-tokens")
-
-    expect_tokens = None
-    if options.expect_tokens is not None:
-        raw = json.loads(options.expect_tokens.read_text())
-        expect_tokens = (
-            {int(key): value for key, value in raw.items()}
-            if isinstance(raw, dict)
-            else {index: value for index, value in enumerate(raw)}
-        )
-    torch.set_num_threads(8)
-    checkpoint = Checkpoint(options.checkpoint)
-    if (options.runtime_dir / "manifest.json").exists():
-        programs = load_production(options.runtime_dir, device_ids)
-    else:
-        programs = compile_production(options.runtime_dir, device_ids)
-    visual_inputs = None
-    if options.image or options.video or options.video_frame:
-
-        processor = VisionProcessor(checkpoint)
-        visuals = [processor.image(image) for image in options.image or []]
-        visuals.extend(processor.video_file(video) for video in options.video or [])
-        if options.video_frame:
-            if not math.isfinite(options.video_frame_fps) or options.video_frame_fps <= 0:
-                raise ValueError("--video-frame-fps must be positive and finite")
-            times = [index / options.video_frame_fps for index in range(len(options.video_frame))]
-            visuals.append(processor.video(options.video_frame, times))
-        visual_inputs = {0: visuals}
-    if options.vision_runtime_dir is not None:
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-
-        programs["_vision"] = DistributedCompiledProgram.from_dir(
-            options.vision_runtime_dir, platform="a2a3",
-            distributed_config=DistributedConfig(device_ids=[device_ids[0]], num_sub_workers=0),
-        )
-    report = generate(
-        checkpoint, programs, device_ids, prompts, options.max_new_tokens, raw_prompts=options.raw,
-        expect_tokens=expect_tokens, dump_path=options.dump_tokens, visual_inputs=visual_inputs,
-        spec_tokens=options.spec_tokens,
-    )
-    if options.report:
-        options.report.parent.mkdir(parents=True, exist_ok=True)
-        options.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-    print("GLM_GENERATION_COMPLETE", json.dumps(report, ensure_ascii=False), flush=True)
-    return report
+        return run_reference_checks_cli(remaining)
+    return run_weight_checks(remaining)
 
 
 if __name__ == "__main__":
