@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ruff: noqa: F401,F403,F405,F821
 """DeepSeek-V4 Hyper-Connections head projection."""
 
 import pypto.language as pl
@@ -38,6 +37,7 @@ LINEAR_K_TILE = 256
 D_TILE = 512
 D_SPMD = 512
 LINEAR_OK = 16
+PARTIAL_ROWS_TILE = LINEAR_OK * LINEAR_T_TILE
 RMS_OK = 16
 
 
@@ -50,57 +50,68 @@ def hc_head(
     y: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x_hc, 0)
-    t_linear = pl.max(t_dim, LINEAR_T_TILE)
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
+    t_vector = ((t_dim + T_TILE - 1) // T_TILE) * T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, D])
     # rms: split-K sum-of-squares, fanned over (token-tile x K-slice)
-    sq_part = pl.create_tensor([RMS_OK, t_dim], dtype=pl.FP32)
-    for task in pl.spmd((t_dim // T_TILE) * RMS_OK, name_hint="hc_head_rms", allow_early_resolve=True):
+    sq_part = pl.create_tensor([RMS_OK, t_vector], dtype=pl.FP32)
+    for task in pl.spmd(((t_dim + T_TILE - 1) // T_TILE) * RMS_OK, name_hint="hc_head_rms", allow_early_resolve=True):
         t0 = (task // RMS_OK) * T_TILE
+        rms_rows = pl.min(T_TILE, t_dim - t0)
         ok = task % RMS_OK
         k_base = ok * (HC_DIM // RMS_OK)
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_OK // RMS_K_TILE, stage=4):
             k0 = k_base + kb * RMS_K_TILE
-            x_rms = x_flat[t0 : t0 + T_TILE, k0 : k0 + RMS_K_TILE]
+            x_rms = pl.slice(x_flat, [T_TILE, RMS_K_TILE], [t0, k0], valid_shape=[rms_rows, RMS_K_TILE])
             sq_col = pl.row_sum(pl.mul(x_rms, x_rms))
             sq_sum = pl.add(sq_sum, pl.reshape(sq_col, [1, T_TILE]))
         sq_part = pl.assemble(sq_part, sq_sum, [ok, t0])
 
-    # linear: split-K head projection, fanned over (row-block x K-slice); each task
-    # atomic-adds its [LINEAR_T_TILE, HC_PAD] FP32 partial into the kernel-zeroed mixes_raw
-    mixes_raw = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    with pl.spmd(
-        t_linear // LINEAR_T_TILE, name_hint="hc_head_linear_seed", allow_early_resolve=True
-    ) as linear_seed_tid:
-        seed_block = pl.tile.get_block_idx()
-        seed_t0 = seed_block * LINEAR_T_TILE
-        zeros = pl.full([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32, value=0.0)
-        mixes_raw[seed_t0 : seed_t0 + LINEAR_T_TILE, 0:HC_PAD] = zeros
-    with pl.spmd(
-        (t_linear // LINEAR_T_TILE) * LINEAR_OK,
-        name_hint="hc_head_linear",
-        allow_early_resolve=True,
-        deps=[linear_seed_tid],
-    ):
+    # M-major FP32 partials: [M block, K split, row, HC column].
+    partial_rows = LINEAR_OK * t_linear
+    mixes_partials = pl.create_tensor([partial_rows, HC_PAD], dtype=pl.FP32)
+    linear_tasks = (t_linear // LINEAR_T_TILE) * LINEAR_OK
+    with pl.spmd(linear_tasks, name_hint="hc_head_partial", allow_early_resolve=True) as linear_tid:
         task = pl.tile.get_block_idx()
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
+        linear_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
         k_base = (task % LINEAR_OK) * (HC_DIM // LINEAR_OK)
         acc = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, HC_DIM // LINEAR_OK // LINEAR_K_TILE, stage=2):
             k0 = k_base + kb * LINEAR_K_TILE
-            x_lin = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_TILE]
+            x_lin = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k0], valid_shape=[linear_rows, LINEAR_K_TILE])
             w = pl.slice(hc_head_fn, [HC_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[HC_MULT, LINEAR_K_TILE])
             acc = pl.matmul_acc(acc, x_lin, w, b_trans=True, init_cond=(kb == 0))
-        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+        partial_t0 = task * LINEAR_T_TILE
+        partial = pl.set_validshape(acc, LINEAR_T_TILE, HC_PAD)
+        mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:HC_PAD] = partial
+
+    # One 16 KiB load per M block, then positive-zero + K slots 0..15.
+    mixes_raw = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
+    bulk_tasks = t_linear // LINEAR_T_TILE
+    with pl.spmd(bulk_tasks, name_hint="hc_head_ordered_bulk", deps=[linear_tid], allow_early_resolve=True) as bulk_tid:
+        block = pl.tile.get_block_idx()
+        partial_t0 = block * LINEAR_OK * LINEAR_T_TILE
+        partials = pl.load(mixes_partials, [partial_t0, 0], [PARTIAL_ROWS_TILE, HC_PAD], target_memory=pl.MemorySpace.Vec)
+        total = pl.tile.full([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32, value=0.0)
+        for split in pl.range(LINEAR_OK):
+            split_t0 = split * LINEAR_T_TILE
+            next_partial = pl.tile.slice(partials, [LINEAR_T_TILE, HC_PAD], [split_t0, 0])
+            total = pl.add(total, next_partial)
+        output_t0 = block * LINEAR_T_TILE
+        pl.store(total, [output_t0, 0], mixes_raw)
 
     # reduce: gate + hc mix, fanned over (token-tile x D-slice). The rsqrt/sigmoid gate is
     # recomputed per task instead of being published by its own scope.
     for blk in pl.spmd(
-        (t_dim // T_TILE) * (D // D_SPMD), name_hint="hc_head_reduce", allow_early_resolve=True
+        ((t_dim + T_TILE - 1) // T_TILE) * (D // D_SPMD),
+        name_hint="hc_head_reduce", deps=[bulk_tid], allow_early_resolve=True
     ):
         t0 = (blk // (D // D_SPMD)) * T_TILE
         d_base = (blk % (D // D_SPMD)) * D_SPMD
+        output_rows = pl.min(T_TILE, t_dim - t0)
         scale = pl.read(hc_head_scale, [0])
         base = pl.reshape(pl.slice(hc_head_base, [HC_VPAD], [0], valid_shape=[HC_MULT]), [1, HC_VPAD])
         # sq_part is [RMS_OK, T], so the per-token total is a column sum; transposing the
@@ -117,32 +128,38 @@ def hc_head(
         pre_val = pl.set_validshape(pre_val, T_TILE, HC_VPAD)
         pre_tile_t = pl.transpose(pre_val, axis1=0, axis2=1)
         pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
+        pre0 = pl.set_validshape(pre0, output_rows, 1)
         pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
+        pre1 = pl.set_validshape(pre1, output_rows, 1)
         pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
+        pre2 = pl.set_validshape(pre2, output_rows, 1)
         pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
+        pre3 = pl.set_validshape(pre3, output_rows, 1)
         for db in pl.pipeline(D_SPMD // D_TILE, stage=2):
             d0 = d_base + db * D_TILE
-            x_h0 = x_flat[t0 : t0 + T_TILE, 0 * D + d0 : 0 * D + d0 + D_TILE]
-            x_h1 = x_flat[t0 : t0 + T_TILE, 1 * D + d0 : 1 * D + d0 + D_TILE]
-            x_h2 = x_flat[t0 : t0 + T_TILE, 2 * D + d0 : 2 * D + d0 + D_TILE]
-            x_h3 = x_flat[t0 : t0 + T_TILE, 3 * D + d0 : 3 * D + d0 + D_TILE]
+            x_h0 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 0 * D + d0], valid_shape=[output_rows, D_TILE])
+            x_h1 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 1 * D + d0], valid_shape=[output_rows, D_TILE])
+            x_h2 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 2 * D + d0], valid_shape=[output_rows, D_TILE])
+            x_h3 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 3 * D + d0], valid_shape=[output_rows, D_TILE])
             y01 = pl.add(pl.row_expand_mul(x_h0, pre0), pl.row_expand_mul(x_h1, pre1))
             y23 = pl.add(pl.row_expand_mul(x_h2, pre2), pl.row_expand_mul(x_h3, pre3))
             y_tile = pl.add(y01, y23)
-            y_flat[t0 : t0 + T_TILE, d0 : d0 + D_TILE] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+            y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+            y_flat[t0 : t0 + T_TILE, d0 : d0 + D_TILE] = pl.set_validshape(y_bf16, output_rows, D_TILE)
 
-    y = pl.reshape(y_flat, [t_dim, D])
     return y
 
 
 @pl.jit
 def hc_head_test(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    y: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
+    x_hc.bind_dynamic(0, T_DYN)
+    y.bind_dynamic(0, T_DYN)
     y = hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, y)
     return y
 
@@ -152,10 +169,11 @@ def golden_hc_head(tensors):
 
     x = tensors["x_hc"]
     shape = x.shape
-    x_flat_2d = x.reshape(T, HC_DIM).float()
+    t_dim = shape[0]
+    x_flat_2d = x.reshape(t_dim, HC_DIM).float()
     hc_head_fn = tensors["hc_head_fn"].float()
 
-    sq_sum = torch.zeros(T, 1, dtype=torch.float32)
+    sq_sum = torch.zeros(t_dim, 1, dtype=torch.float32)
     for k0 in range(0, HC_DIM, RMS_K_TILE):
         x_chunk = x_flat_2d[:, k0 : k0 + RMS_K_TILE]
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
@@ -163,13 +181,13 @@ def golden_hc_head(tensors):
 
     mix_cols = []
     for h in range(HC_MULT):
-        mix_col = torch.zeros(T, 1, dtype=torch.float32)
+        mix_col = torch.zeros(t_dim, 1, dtype=torch.float32)
         for k0 in range(0, HC_DIM, LINEAR_K_TILE):
             x_chunk = x_flat_2d[:, k0 : k0 + LINEAR_K_TILE]
             w_chunk = hc_head_fn[h : h + 1, k0 : k0 + LINEAR_K_TILE]
             mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
         mix_cols.append(mix_col * rsqrt)
-    mixes = torch.cat(mix_cols, dim=1).reshape(T, HC_MULT)
+    mixes = torch.cat(mix_cols, dim=1).reshape(t_dim, HC_MULT)
 
     pre = torch.sigmoid(mixes * tensors["hc_head_scale"].float() + tensors["hc_head_base"].float()) + HC_EPS
     x_view = x.float().view(shape)
@@ -178,7 +196,7 @@ def golden_hc_head(tensors):
             x_view[:, 2, :] * pre[:, 2:3] + x_view[:, 3, :] * pre[:, 3:4]
         )
     else:
-        y = torch.zeros(T, D, dtype=torch.float32)
+        y = torch.zeros(t_dim, D, dtype=torch.float32)
         for h in range(HC_MULT):
             y += x_view[:, h, :] * pre[:, h : h + 1]
 
@@ -186,18 +204,18 @@ def golden_hc_head(tensors):
     tensors["y"][:] = y.to(torch.bfloat16)
 
 
-def build_tensor_specs():
+def build_tensor_specs(t_dim=T):
     import torch
     from golden import TensorSpec
 
     def init_x_hc():
-        return torch.randn(T, HC_MULT, D) * 0.05
+        return torch.randn(t_dim, HC_MULT, D) * 0.05
 
     def init_hc_head_fn():
         return torch.randn(HC_MULT, HC_DIM) * 0.0519
 
     return [
-        TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
+        TensorSpec("x_hc", [t_dim, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("hc_head_fn", [HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
         TensorSpec("hc_head_scale", [1], torch.float32, init_value=lambda: torch.tensor([0.076099])),
         TensorSpec(
@@ -206,49 +224,53 @@ def build_tensor_specs():
             torch.float32,
             init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124]),
         ),
-        TensorSpec("y", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("y", [t_dim, D], torch.bfloat16),
     ]
 
 
 if __name__ == "__main__":
     import argparse
+    from pathlib import Path
+
     import torch
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
-    )
+    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
-    # Int mode (0=off; 1=timing only, most accurate; 2=timing + dep graph, two runs).
-    # `nargs="?"` so a bare `--enable-chip-swimlane` -> mode 1 (int, not bool True).
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
-    parser.add_argument("--dump-passes", action="store_true", default=False)
-    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--tokens", type=int, nargs="+", default=[1, 6, 8, 17])
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--dump-passes", action="store_true")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
-    torch.manual_seed(args.seed)
+    if any(tokens <= 0 for tokens in args.tokens):
+        parser.error("--tokens values must be positive")
 
-    result = run_jit(
-        compile_only=args.compile_only,
-        fn=hc_head_test,
-        specs=build_tensor_specs(),
-        golden_fn=golden_hc_head,
-        compile_cfg=dict(
-            dump_passes=args.dump_passes,
-        ),
-        runtime_cfg=dict(
-            platform=args.platform,
+    for tokens in args.tokens:
+        torch.manual_seed(args.seed)
+        config = dict(
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.sim or args.platform.endswith("sim"),
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            "y": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+            dump_passes=args.dump_passes,
+        )
+        if args.output_dir is not None:
+            config["save_kernels_dir"] = str(args.output_dir / f"T{tokens}")
+        result = run(
+            fn=hc_head_test,
+            specs=build_tensor_specs(tokens),
+            golden_fn=golden_hc_head,
+            config=config,
+            compile_only=args.compile_only,
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn={"y": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
