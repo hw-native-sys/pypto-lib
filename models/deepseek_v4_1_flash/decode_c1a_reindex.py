@@ -66,7 +66,7 @@ def decode_c1a_reindex(
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
     compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
@@ -112,7 +112,7 @@ def decode_c1a_reindex(
     )
     selection_ready = score_select_reindex(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
-        index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,
+        index_block_table, token_to_req_indices, compressed_lens, pool_block_ids, pool_block_counts,
         scores, topk_indices, num_tokens, x_ready, query_tid, weights_tid, x_ready,
     )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
@@ -158,7 +158,7 @@ def l2_decode_c1a_reindex(
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -192,7 +192,7 @@ def l2_decode_c1a_reindex(
         rope_cos, rope_sin,
         window_slots, window_indices,
         window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-        request_ids, compressed_lens,
+        token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         pool_block_ids, pool_block_counts,
         index_wq_b, index_wq_b_scale, index_weights_proj,
@@ -231,7 +231,7 @@ def l3_decode_c1a_reindex(
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -272,7 +272,7 @@ def l3_decode_c1a_reindex(
         rope_cos, rope_sin,
         window_slots, window_indices,
         window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-        request_ids, compressed_lens,
+        token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         pool_block_ids, pool_block_counts,
         index_wq_b, index_wq_b_scale_r, index_weights_proj,

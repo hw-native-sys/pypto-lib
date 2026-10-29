@@ -76,6 +76,7 @@ def decode_c2a_full(
     compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
@@ -137,7 +138,7 @@ def decode_c2a_full(
     select_tid = decode_c2a_indexer(
         x_norm, qb_payload, qb_scales, latent, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
         index_weights_proj, rope_cos, rope_sin, compressed_rope_cos, compressed_rope_sin,
-        compressed_slots, index_cache, index_cache_scale, index_block_table, token_to_req_indices,
+        compressed_slots, index_cache, index_cache_scale, index_block_table, token_to_req_indices, host_token_to_req_indices,
         compressed_lens, topk_indices, num_tokens, cache_ready, compressed_publish_tid,
     )
 
@@ -188,6 +189,7 @@ def l2_decode_c2a_full(
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -232,7 +234,7 @@ def l2_decode_c2a_full(
         window_slots, window_indices,
         window_cache, window_cache_scale,
         compressed_cache, compressed_cache_scale,
-        token_to_req_indices, compressed_lens,
+        token_to_req_indices, host_token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         position_ids,
         compressed_rope_cos, compressed_rope_sin,
@@ -277,6 +279,7 @@ def l3_decode_c2a_full(
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -326,7 +329,7 @@ def l3_decode_c2a_full(
         window_slots, window_indices,
         window_cache, window_cache_scale,
         compressed_cache, compressed_cache_scale,
-        token_to_req_indices, compressed_lens,
+        token_to_req_indices, host_token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         position_ids,
         compressed_rope_cos, compressed_rope_sin,
@@ -356,6 +359,11 @@ def golden_c2a(tensors, mode="full"):
     from utils import _publish_quantized_cache
 
     t = dict(tensors)
+    if mode == "full":
+        from utils import validate_request_id_tensors
+
+        active = int(t.get("num_tokens", t["token_to_req_indices"].shape[0]))
+        validate_request_id_tensors(t["host_token_to_req_indices"], t["token_to_req_indices"], active)
     if "x_hc" in t:
         x_hc = t["x_hc"]
         next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
@@ -580,6 +588,7 @@ def build_c2a_specs(
         "compressed_cache": compressed_cache,
         "compressed_cache_scale": compressed_cache_scale,
         "token_to_req_indices": token_to_req_indices.to(torch.int32),
+        "host_token_to_req_indices": token_to_req_indices.to(torch.int32).clone(),
         "compressed_lens": compressed_lens,
         "index_cache": index_cache,
         "index_cache_scale": index_cache_codes.view(torch.float8_e8m0fnu),

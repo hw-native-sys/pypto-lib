@@ -236,7 +236,7 @@ def quantize_index_query(
 def materialize_index_topk(
     scores: pl.Tensor,
     block_table: pl.Tensor,
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     pool_ids: pl.Tensor,
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     token: pl.Scalar[pl.INDEX],
@@ -246,7 +246,7 @@ def materialize_index_topk(
     pool: pl.constexpr,
 ):
     """Compact winners in logical order and gather physical pages from UB."""
-    request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+    request = pl.cast(pl.read(token_to_req_indices, [token]), pl.INDEX)
     table_width = pl.tensor.dim(block_table, 1)
     valid_pages = pl.min(table_width, TOPK_CACHED_PAGES)
     raw_pages = pl.load(block_table, [request, 0], [1, TOPK_CACHED_PAGES], valid_shape=[1, valid_pages])
@@ -637,7 +637,7 @@ def _prefill_index_scores(
     cache: pl.Tensor,
     cache_scale: pl.Tensor,
     block_table: pl.Tensor,
-    request_ids: pl.Tensor,
+    token_to_req_indices: pl.Tensor,
     lengths: pl.Tensor,
     pool_ids: pl.Tensor,
     pool_counts: pl.Tensor,
@@ -711,7 +711,7 @@ def _prefill_index_scores(
             token = lower * query_tile
             macro = work - pl.read(prefix, [lower])
             begin = macro * tile_n
-            request = pl.read(request_ids, [token])
+            request = pl.read(token_to_req_indices, [token])
             maximum_visible = pl.cast(0, pl.INDEX)
             for row in pl.unroll(query_tile):
                 if token + row < num_tokens:
@@ -1204,7 +1204,7 @@ def _clear_inactive_pool(
 def prefill_indexer(
     x: pl.Tensor,
     latent: pl.Tensor,
-    request_ids: pl.Tensor,
+    token_to_req_indices: pl.Tensor,
     lengths: pl.Tensor,
     cache: pl.Tensor,
     cache_scale: pl.Tensor,
@@ -1243,7 +1243,7 @@ def prefill_indexer(
                 count = pl.cast(rows, pl.INT32)
                 chunk_x = pl.slice(x, [rows, D], [begin, 0])
                 chunk_latent = pl.slice(latent, [rows, Q_LORA], [begin, 0])
-                chunk_requests = pl.slice(request_ids, [rows], [begin])
+                chunk_requests = pl.slice(token_to_req_indices, [rows], [begin])
                 chunk_lengths = pl.slice(lengths, [rows], [begin])
                 chunk_cos = pl.slice(cos, [rows, ROPE_DIM // 2], [begin, 0])
                 chunk_sin = pl.slice(sin, [rows, ROPE_DIM // 2], [begin, 0])
@@ -1255,17 +1255,12 @@ def prefill_indexer(
                 query = pl.create_tensor([rows, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
                 query_scale = pl.create_tensor([rows, INDEX_H * 4], dtype=pl.FP8E8M0)
                 weights = pl.create_tensor([rows, INDEX_H], dtype=pl.BF16)
-                maximum_visible = pl.cast(0, pl.INDEX)
+                # Route selection must not inspect runtime-produced request
+                # maps or lengths while constructing the host graph.  Use the
+                # general one-row scorer; the device short-row selector still
+                # overwrites C2A short histories after scoring.
+                maximum_visible = pl.cast(width, pl.INDEX)
                 paired = pl.cast(0, pl.INT32)
-                if not pool:
-                    if width >= 256:
-                        paired = pl.cast(rows % 2 == 0, pl.INT32)
-                    for token in pl.range(rows):
-                        if c2a:
-                            maximum_visible = pl.max(maximum_visible, pl.read(chunk_lengths, [token]))
-                        if token % 2 == 1:
-                            if pl.read(chunk_requests, [token]) != pl.read(chunk_requests, [token - 1]):
-                                paired = pl.cast(0, pl.INT32)
                 chunk_ready = completion[0]
                 scoring = pl.array.create(1, pl.TASK_ID)
                 scoring[0] = chunk_ready
@@ -1386,7 +1381,7 @@ def golden_select_candidate_block_pool(
 
 
 def golden_prefill_indexer(
-    x, qr, request_ids, index_cache, block_table, compressed_lens,
+    x, qr, token_to_req_indices, index_cache, block_table, compressed_lens,
     wq_b, wq_b_scale, weights_proj, cos, sin, *,
     pool_block_ids=None, pool_block_counts=None, c2a=False, topk=INDEX_TOPK,
 ):
@@ -1412,7 +1407,7 @@ def golden_prefill_indexer(
             positions = positions[(positions >= 0) & (positions < length)]
         if not positions.numel():
             continue
-        pages = block_table[int(request_ids[token]), positions // 128]
+        pages = block_table[int(token_to_req_indices[token]), positions // 128]
         present = (pages >= 0) & (pages < index_cache.shape[0])
         positions, pages = positions[present], pages[present]
         physical = pages.long() * 128 + positions % 128
@@ -1445,7 +1440,7 @@ def golden_prefill_index_scores(mode, rank, cache_outputs, inputs):
     )
     pool = {} if mode == "full" else {name: inputs[name][rank] for name in ("pool_block_ids", "pool_block_counts")}
     scores, _ = golden_prefill_indexer(
-        inputs["x"][rank], latent, inputs["request_ids"][rank], keys, inputs["index_block_table"][rank],
+        inputs["x"][rank], latent, inputs["token_to_req_indices"][rank], keys, inputs["index_block_table"][rank],
         inputs["compressed_lens"][rank], inputs["index_wq_b"][rank], inputs["index_wq_b_scale"][rank],
         inputs["index_weights_proj"][rank], inputs["rope_cos"][rank], inputs["rope_sin"][rank], **pool,
     )
