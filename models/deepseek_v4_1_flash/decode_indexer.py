@@ -41,10 +41,6 @@ _SCALE_COUNT = INDEX_DIM // INDEX_CACHE_GROUP
 _SCORE_SCALE = (INDEX_DIM * INDEX_H) ** -0.5
 
 # tiling
-_SCORE_N_TILE = 256
-_SCORE_MACRO_N_TILE = 512
-_SCORE_QUERY_TILE = 6
-_SCORE_QUERY_M_TILE = INDEX_H * _SCORE_QUERY_TILE
 _KEY_DECODE_TILE = 64
 _PAIR_M_TILE = INDEX_H * 2
 
@@ -86,6 +82,29 @@ def _proj_idx_q(
     ...
 
 
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "index_scores.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "index_scores.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _request_index_scores(
+    query: pl.Tensor,
+    query_scale: pl.Tensor,
+    weights: pl.Tensor,
+    index_cache: pl.Tensor,
+    index_cache_scale: pl.Tensor,
+    block_table: pl.Tensor,
+    request_ids: pl.Tensor,
+    lengths: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    runs: pl.Tensor,
+    width: pl.Scalar[pl.INDEX],
+    run_stride: pl.Scalar[pl.INDEX],
+    table_width: pl.Scalar[pl.INDEX],
+    skip_threshold: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Score request groups with native packed FP4 operands."""
+    ...
+
+
 @pl.jit.inline
 def _index_key_decode_lut():
     """Map packed FP4 nibbles to exact FP8 carrier bits."""
@@ -96,39 +115,6 @@ def _index_key_decode_lut():
     values = pl.tile.select(pl.tile.cmps(magnitude, 1, cmp_type=0), 48, values)
     values = pl.or_(values, pl.shls(pl.ands(codes, 8), 4))
     return pl.cast(values, pl.INT16)
-
-
-@pl.jit.inline
-def _index_key_packed_decode_lut():
-    """Expand each packed FP4 byte to two exact FP8 carrier bytes."""
-    index_tmp = pl.create_tile([1, 192], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-    lut_codes = pl.tile.arange(0, [1, 256], dtype=pl.INT32, tmp=index_tmp)
-    lut_low = pl.ands(lut_codes, 7)
-    lut_low_shifted = pl.shls(lut_low, 2)
-    lut_low_bits = pl.add(lut_low_shifted, 48)
-    lut_low_is_0 = pl.tile.cmps(lut_low, 0, cmp_type=0)
-    lut_low_bits = pl.tile.select(lut_low_is_0, 0, lut_low_bits)
-    lut_low_is_1 = pl.tile.cmps(lut_low, 1, cmp_type=0)
-    lut_low_bits = pl.tile.select(lut_low_is_1, 48, lut_low_bits)
-    lut_low_sign = pl.ands(lut_codes, 8)
-    lut_low_sign_bits = pl.shls(lut_low_sign, 4)
-    lut_low_bits = pl.or_(lut_low_bits, lut_low_sign_bits)
-    lut_high_nibble = pl.shrs(lut_codes, 4)
-    lut_high = pl.ands(lut_high_nibble, 7)
-    lut_high_shifted = pl.shls(lut_high, 2)
-    lut_high_bits = pl.add(lut_high_shifted, 48)
-    lut_high_is_0 = pl.tile.cmps(lut_high, 0, cmp_type=0)
-    lut_high_bits = pl.tile.select(lut_high_is_0, 0, lut_high_bits)
-    lut_high_is_1 = pl.tile.cmps(lut_high, 1, cmp_type=0)
-    lut_high_bits = pl.tile.select(lut_high_is_1, 48, lut_high_bits)
-    lut_high_sign_bits = pl.ands(lut_codes, 128)
-    lut_high_bits = pl.or_(lut_high_bits, lut_high_sign_bits)
-    lut_high_word = pl.shls(lut_high_bits, 8)
-    lut_words = pl.or_(lut_low_bits, lut_high_word)
-    lut_high_signed = pl.tile.cmps(lut_codes, 128, cmp_type=5)
-    lut_negative_words = pl.sub(lut_words, 65536)
-    lut_signed_words = pl.tile.select(lut_high_signed, lut_negative_words, lut_words)
-    return pl.cast(lut_signed_words, pl.INT16)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1009,8 +995,8 @@ def _make_page_index_scores(workers, skip_short=False):
 
 
 def _make_request_block_index_scores(skip_short=False, workers=32):
-    """Reuse local K across each contiguous request run and independent query dots."""
-    packed_width = INDEX_DIM // 2
+    """Compute request-group scores with native packed FP4 operands."""
+    skip_threshold = INDEX_TOPK if skip_short else 0
 
     @pl.jit.inline
     def score(
@@ -1030,208 +1016,20 @@ def _make_request_block_index_scores(skip_short=False, workers=32):
         plan_ready: pl.Scalar[pl.TASK_ID],
     ):
         width = pl.tensor.dim(output, 1)
-        cache_rows = pl.tensor.dim(index_cache, 0) * _PAGE_SIZE
-        cache_flat = pl.reshape(index_cache, [cache_rows, packed_width])
-        scale_flat = pl.reshape(index_cache_scale, [1, cache_rows * _SCALE_COUNT])
-        query_rows = pl.tensor.dim(query, 0) * INDEX_H
-        query_flat = pl.reshape(query, [query_rows, INDEX_DIM])
-        macro_tiles = (width + _SCORE_MACRO_N_TILE - 1) // _SCORE_MACRO_N_TILE
-
+        run_stride = pl.tensor.dim(runs, 1)
+        table_width = pl.tensor.dim(block_table, 1)
+        launch_workers = pl.max(1, pl.min(workers, pl.system.available_cluster_count()))
         with pl.spmd(
-            workers,
+            launch_workers,
             name_hint="idx_score_req",
+            sync_start=True,
             deps=[cache_ready, query_ready, weights_ready, plan_ready],
-            optimizations=[pl.cross_core_slot(slot_num=2)],
         ) as score_tid:
-            worker = pl.tile.get_block_idx()
-            decode_lut = _index_key_packed_decode_lut()
-            decode_tmp = pl.create_tile([1, 32], dtype=pl.INT16)
-            work_items = pl.read(runs, [3, 0]) * macro_tiles
-
-            for work in pl.range(worker, work_items, workers):
-                run = work // macro_tiles
-                run_begin = pl.read(runs, [0, run])
-                run_end = pl.read(runs, [1, run])
-                macro_index = work % macro_tiles
-                logical_begin = macro_index * _SCORE_MACRO_N_TILE
-                first_request = pl.read(request_ids, [run_begin])
-                maximum_visible = pl.read(runs, [2, run])
-
-                for group_begin in pl.range(run_begin, run_end, _SCORE_QUERY_TILE):
-                    group_end = pl.min(run_end, group_begin + _SCORE_QUERY_TILE)
-                    group_rows = group_end - group_begin
-                    group_pairs = (group_rows + 1) // 2
-                    group_head_begin = group_begin * INDEX_H
-                    group_head_rows = group_rows * INDEX_H
-                    group_query = pl.load(
-                        query_flat, [group_head_begin, 0], [_SCORE_QUERY_M_TILE, INDEX_DIM],
-                        valid_shape=[group_head_rows, INDEX_DIM], target_memory=pl.MemorySpace.Mat,
-                    )
-                    group_scale_raw = pl.load(
-                        query_scale, [group_begin, 0], [_SCORE_QUERY_TILE, INDEX_H * _SCALE_COUNT],
-                        valid_shape=[group_rows, INDEX_H * _SCALE_COUNT], target_memory=pl.MemorySpace.Vec,
-                    )
-                    group_scale_bytes = pl.reinterpret_view(group_scale_raw, pl.UINT8)
-                    group_scale_padded = pl.fillpad(group_scale_bytes, pad_value=pl.PadValue.zero)
-                    group_scale_full = pl.set_validshape(group_scale_padded, _SCORE_QUERY_TILE, INDEX_H * _SCALE_COUNT)
-                    group_scale_flat = pl.reshape(group_scale_full, [1, _SCORE_QUERY_M_TILE * _SCALE_COUNT])
-                    group_scale_tmp = pl.create_tile([1, 128], dtype=pl.UINT8)
-                    group_scale_zz = pl.tmov_x2zz(
-                        group_scale_flat, group_scale_tmp, group_axis=1,
-                        dst_rows=_SCORE_QUERY_M_TILE, dst_cols=_SCALE_COUNT,
-                    )
-                    group_scale_mx = pl.reinterpret_view(group_scale_zz, pl.FP8E8M0)
-                    for half_index in pl.unroll(2):
-                        half_begin = logical_begin + half_index * _SCORE_N_TILE
-                        if half_begin < maximum_visible:
-                            packed = pl.tile.full([_SCORE_N_TILE, packed_width], dtype=pl.INT8, value=0)
-                            raw_scale = pl.tile.full([1, _SCORE_N_TILE * _SCALE_COUNT], dtype=pl.INT8, value=127)
-                            for page_offset in pl.unroll(2):
-                                page_begin = half_begin + page_offset * _PAGE_SIZE
-                                if page_begin < maximum_visible:
-                                    page_id = pl.read(
-                                        block_table,
-                                        [pl.cast(first_request, pl.INDEX), page_begin // _PAGE_SIZE],
-                                    )
-                                    if page_id >= 0:
-                                        page_row = pl.cast(page_id, pl.INDEX) * _PAGE_SIZE
-                                        page_packed = pl.reinterpret_view(
-                                            pl.load(
-                                                cache_flat,
-                                                [page_row, 0],
-                                                [_PAGE_SIZE, packed_width],
-                                                target_memory=pl.MemorySpace.Vec,
-                                            ),
-                                            pl.INT8,
-                                        )
-                                        packed = pl.tile.assemble(packed, page_packed, [page_offset * _PAGE_SIZE, 0])
-                                        page_scale = pl.reinterpret_view(
-                                            pl.reinterpret_view(
-                                                pl.load(
-                                                    scale_flat,
-                                                    [0, page_row * _SCALE_COUNT],
-                                                    [1, _PAGE_SIZE * _SCALE_COUNT],
-                                                    target_memory=pl.MemorySpace.Vec,
-                                                ),
-                                                pl.UINT8,
-                                            ),
-                                            pl.INT8,
-                                        )
-                                        raw_scale = pl.tile.assemble(
-                                            raw_scale,
-                                            page_scale,
-                                            [0, page_offset * _PAGE_SIZE * _SCALE_COUNT],
-                                        )
-
-                            packed_flat = pl.reshape(packed, [1, _SCORE_N_TILE * packed_width])
-                            packed_u8 = pl.reinterpret_view(packed_flat, pl.UINT8)
-                            byte_values = pl.cast(packed_u8, pl.UINT16)
-                            byte_indices = pl.reinterpret_view(byte_values, pl.INT16)
-                            decoded_words = pl.tile.gather(decode_lut, byte_indices, decode_tmp)
-                            key_bytes = pl.reinterpret_view(decoded_words, pl.INT8, shape=[_SCORE_N_TILE, INDEX_DIM])
-                            key_scale_tmp = pl.create_tile([1, 128], dtype=pl.UINT8)
-                            key_scale_zz = pl.reinterpret_view(
-                                pl.tmov_x2zz(
-                                    pl.reinterpret_view(raw_scale, pl.UINT8),
-                                    key_scale_tmp,
-                                    group_axis=1,
-                                    dst_rows=_SCORE_N_TILE,
-                                    dst_cols=_SCALE_COUNT,
-                                ),
-                                pl.FP8E8M0,
-                            )
-                            key_scale_nn = pl.tile.transpose_view(key_scale_zz)
-                            keys_kn = pl.reinterpret_view(pl.tile.transpose(key_bytes, 0, 1), pl.FP8E4M3FN)
-                            key_mat = pl.tile.move(
-                                keys_kn, target_memory=pl.MemorySpace.Mat,
-                                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major,
-                            )
-                            key_right = pl.tile.move(key_mat, target_memory=pl.MemorySpace.Right)
-                            key_scale_mat = pl.tile.move(
-                                key_scale_nn, target_memory=pl.MemorySpace.Mat,
-                                blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.col_major,
-                            )
-                            key_scale_right = pl.tile.move(key_scale_mat, target_memory=pl.MemorySpace.RightScale)
-                            group_scale_mat = pl.tile.move(
-                                group_scale_mx, target_memory=pl.MemorySpace.Mat,
-                                blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.row_major,
-                            )
-                            for shared_pair in pl.range(group_pairs):
-                                first_token = group_begin + shared_pair * 2
-                                pair_head_begin = shared_pair * _PAIR_M_TILE
-                                query_left = pl.tile.extract(
-                                    group_query, pair_head_begin, 0, [_PAIR_M_TILE, INDEX_DIM],
-                                    target_memory=pl.MemorySpace.Left,
-                                )
-                                pair_scale_mat = pl.tile.slice(
-                                    group_scale_mat, [_PAIR_M_TILE, _SCALE_COUNT], [pair_head_begin, 0],
-                                )
-                                pair_scale_left = pl.tile.move(pair_scale_mat, target_memory=pl.MemorySpace.LeftScale)
-
-                                dot = pl.matmul_mx(query_left, pair_scale_left, key_right, key_scale_right)
-                                dot_bf16 = pl.cast(dot, pl.BF16, mode="rint")
-                                for pair_offset in pl.unroll(2):
-                                    token = first_token + pair_offset
-                                    if token < group_end:
-                                        visible = pl.min(pl.read(lengths, [token]), width)
-                                        if skip_short:
-                                            if visible <= INDEX_TOPK:
-                                                visible = 0
-                                        head_weight = pl.load(weights, [token, 0], [1, INDEX_H], target_memory=pl.MemorySpace.Vec)
-                                        head_weight_fp32 = pl.cast(head_weight, pl.FP32)
-                                        scaled_weight = pl.mul(head_weight_fp32, _SCORE_SCALE)
-                                        rounded_weight_bf16 = pl.cast(scaled_weight, pl.BF16, mode="rint")
-                                        rounded_weight = pl.cast(rounded_weight_bf16, pl.FP32)
-                                        weight_column = pl.reshape(rounded_weight, [INDEX_H, 1])
-                                        total_bf16 = pl.tile.full([1, _SCORE_N_TILE], dtype=pl.BF16, value=0)
-                                        if half_begin < visible:
-                                            head_begin = pair_offset * INDEX_H
-                                            head_dot = pl.tile.slice(
-                                                dot_bf16, [INDEX_H, _SCORE_N_TILE], [head_begin, 0],
-                                                valid_shape=[INDEX_H, _SCORE_N_TILE],
-                                            )
-                                            head_dot_fp32 = pl.cast(head_dot, pl.FP32)
-                                            relu = pl.maximum(head_dot_fp32, 0.0)
-                                            weighted = pl.row_expand_mul(relu, weight_column)
-                                            weighted_bf16 = pl.cast(weighted, pl.BF16, mode="rint")
-                                            weighted_fp32 = pl.cast(weighted_bf16, pl.FP32)
-                                            head_sum = pl.col_sum(weighted_fp32)
-                                            total_bf16 = pl.cast(head_sum, pl.BF16, mode="rint")
-                                        for panel_index in pl.unroll(2):
-                                            output_begin = half_begin + panel_index * _PAGE_SIZE
-                                            if output_begin < width:
-                                                output_count = pl.min(_PAGE_SIZE, width - output_begin)
-                                                negative_bits = pl.tile.full([1, _PAGE_SIZE], dtype=pl.INT32, value=-8388608)
-                                                masked = pl.reinterpret_view(negative_bits, pl.FP32)
-                                                if output_begin < visible:
-                                                    valid_count = pl.min(_PAGE_SIZE, visible - output_begin)
-                                                    page_column = output_begin // _PAGE_SIZE
-                                                    page_request = pl.cast(first_request, pl.INDEX)
-                                                    page_id = pl.read(block_table, [page_request, page_column])
-                                                    if page_id >= 0:
-                                                        panel_begin = panel_index * _PAGE_SIZE
-                                                        panel_bf16 = pl.tile.slice(total_bf16, [1, _PAGE_SIZE], [0, panel_begin])
-                                                        panel_total = pl.cast(panel_bf16, pl.FP32)
-                                                        index_tmp = pl.create_tile([1, 192], dtype=pl.FP32)
-                                                        lanes = pl.tile.arange(0, [1, _PAGE_SIZE], dtype=pl.INT32, tmp=index_tmp)
-                                                        in_range = pl.tile.cmps(lanes, pl.cast(valid_count, pl.INT32), cmp_type=2)
-                                                        masked = pl.tile.select(in_range, panel_total, masked)
-                                                masked_valid = pl.set_validshape(masked, 1, output_count)
-                                                pl.store(masked_valid, [token, output_begin], output)
-                        else:
-                            for shared_pair in pl.range(group_pairs):
-                                first_token = group_begin + shared_pair * 2
-                                for panel_index in pl.unroll(2):
-                                    output_begin = half_begin + panel_index * _PAGE_SIZE
-                                    if output_begin < width:
-                                        output_count = pl.min(_PAGE_SIZE, width - output_begin)
-                                        for pair_offset in pl.unroll(2):
-                                            token = first_token + pair_offset
-                                            if token < group_end:
-                                                negative_bits = pl.tile.full([1, _PAGE_SIZE], dtype=pl.INT32, value=-8388608)
-                                                negative = pl.reinterpret_view(negative_bits, pl.FP32)
-                                                negative_valid = pl.set_validshape(negative, 1, output_count)
-                                                pl.store(negative_valid, [token, output_begin], output)
+            _request_index_scores(
+                query, query_scale, weights, index_cache, index_cache_scale,
+                block_table, request_ids, lengths, output, runs,
+                width, run_stride, table_width, pl.cast(skip_threshold, pl.INT32),
+            )
         return score_tid
 
     return score
