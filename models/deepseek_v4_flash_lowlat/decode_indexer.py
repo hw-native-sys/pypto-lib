@@ -469,35 +469,41 @@ def indexer(
             )
             if visible_len_t > 0:
                 offset_i32 = pl.cast(offset, target_type=pl.INT32)
-                score_full_raw = score_flat[t : t + 1, 0:SCORE_LEN]
-                score_full = pl.fillpad(
-                    pl.set_validshape(score_full_raw, 1, visible_len_t),
-                    pad_value=pl.PadValue.min,
-                )
-                score_full = pl.maximum(score_full, FP32_NEG_INF)
-                idx_init = pl.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
-                sorted_full = pl.sort32(score_full, idx_init)
-                sorted_full = pl.mrgsort(sorted_full, block_len=64)
-                sorted_full = pl.mrgsort(sorted_full, block_len=256)
-                sorted_full = pl.mrgsort(sorted_full, block_len=1024)
+                if visible_len_t <= IDX_TOPK:
+                    topk_visible = pl.arange(0, [1, IDX_TOPK], dtype=pl.INT32)
+                    topk_valid = pl.set_validshape(topk_visible, 1, visible_len_t)
+                    topk_offset = pl.add(topk_valid, offset_i32)
+                    topk_idxs_flat[t : t + 1, 0:IDX_TOPK] = topk_offset
+                else:
+                    score_full_raw = score_flat[t : t + 1, 0:SCORE_LEN]
+                    score_full = pl.fillpad(
+                        pl.set_validshape(score_full_raw, 1, visible_len_t),
+                        pad_value=pl.PadValue.min,
+                    )
+                    score_full = pl.maximum(score_full, FP32_NEG_INF)
+                    idx_init = pl.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
+                    sorted_full = pl.sort32(score_full, idx_init)
+                    sorted_full = pl.mrgsort(sorted_full, block_len=64)
+                    sorted_full = pl.mrgsort(sorted_full, block_len=256)
+                    sorted_full = pl.mrgsort(sorted_full, block_len=1024)
 
-                # After the 1024 merge, the 4096-score row is two sorted 2048-score
-                # runs. sort32/mrgsort keeps score/index pairs interleaved, so the
-                # second 2048-score run starts at pair-lane offset 2 * 2048.
-                half0_candidates = sorted_full[:, 0:TOPK_PAIR_WIDTH]
-                half1_candidates = sorted_full[
-                    :, TOPK_HALF_PAIR_OFFSET : TOPK_HALF_PAIR_OFFSET + TOPK_PAIR_WIDTH
-                ]
-                merged_candidates = pl.mrgsort(half0_candidates, half1_candidates)
-                topk_pairs = merged_candidates[:, 0:TOPK_PAIR_WIDTH]
-                topk_idxs_tile = pl.gather(
-                    topk_pairs,
-                    mask_pattern=pl.tile.MaskPattern.P1010,
-                    output_dtype=pl.INT32,
-                )
-                valid_topk = pl.min(IDX_TOPK, visible_len_t)
-                topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
-                topk_idxs_flat[t : t + 1, 0:IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
+                    # After the 1024 merge, the 4096-score row is two sorted 2048-score
+                    # runs. sort32/mrgsort keeps score/index pairs interleaved, so the
+                    # second 2048-score run starts at pair-lane offset 2 * 2048.
+                    half0_candidates = sorted_full[:, 0:TOPK_PAIR_WIDTH]
+                    half1_candidates = sorted_full[
+                        :, TOPK_HALF_PAIR_OFFSET : TOPK_HALF_PAIR_OFFSET + TOPK_PAIR_WIDTH
+                    ]
+                    merged_candidates = pl.mrgsort(half0_candidates, half1_candidates)
+                    topk_pairs = merged_candidates[:, 0:TOPK_PAIR_WIDTH]
+                    topk_idxs_tile = pl.gather(
+                        topk_pairs,
+                        mask_pattern=pl.tile.MaskPattern.P1010,
+                        output_dtype=pl.INT32,
+                    )
+                    valid_topk = pl.min(IDX_TOPK, visible_len_t)
+                    topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
+                    topk_idxs_flat[t : t + 1, 0:IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
     else:
         topk_leaf_pairs = pl.create_tensor([TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32)
         with pl.at(
@@ -559,30 +565,36 @@ def indexer(
             )
             if visible_len_t > 0:
                 offset_i32 = pl.cast(offset, target_type=pl.INT32)
-                leaf_count = (visible_len_t + TOPK_LEAF_LEN - 1) // TOPK_LEAF_LEN
-                merge_steps = (leaf_count + TOPK_MERGE_FANIN - 2) // TOPK_MERGE_FANIN
-                # The last step's missing inputs are most-negative lists.
-                pad_pairs = pl.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
-                for pad_row in pl.range(leaf_count, 1 + merge_steps * TOPK_MERGE_FANIN):
-                    topk_leaf_pairs[pad_row : pad_row + 1, 0:TOPK_PAIR_WIDTH] = pad_pairs
-                for step in pl.range(merge_steps):
-                    row0 = 1 + step * TOPK_MERGE_FANIN
-                    step_merged = pl.mrgsort(
-                        topk_leaf_pairs[0:1, 0:TOPK_PAIR_WIDTH],
-                        topk_leaf_pairs[row0 : row0 + 1, 0:TOPK_PAIR_WIDTH],
-                        topk_leaf_pairs[row0 + 1 : row0 + 2, 0:TOPK_PAIR_WIDTH],
-                        topk_leaf_pairs[row0 + 2 : row0 + 3, 0:TOPK_PAIR_WIDTH],
+                if visible_len_t <= IDX_TOPK:
+                    merge_visible = pl.arange(0, [1, IDX_TOPK], dtype=pl.INT32)
+                    merge_valid = pl.set_validshape(merge_visible, 1, visible_len_t)
+                    merge_offset = pl.add(merge_valid, offset_i32)
+                    topk_idxs_flat[t : t + 1, 0:IDX_TOPK] = merge_offset
+                else:
+                    leaf_count = (visible_len_t + TOPK_LEAF_LEN - 1) // TOPK_LEAF_LEN
+                    merge_steps = (leaf_count + TOPK_MERGE_FANIN - 2) // TOPK_MERGE_FANIN
+                    # The last step's missing inputs are most-negative lists.
+                    pad_pairs = pl.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=FP32_NEG_INF)
+                    for pad_row in pl.range(leaf_count, 1 + merge_steps * TOPK_MERGE_FANIN):
+                        topk_leaf_pairs[pad_row : pad_row + 1, 0:TOPK_PAIR_WIDTH] = pad_pairs
+                    for step in pl.range(merge_steps):
+                        row0 = 1 + step * TOPK_MERGE_FANIN
+                        step_merged = pl.mrgsort(
+                            topk_leaf_pairs[0:1, 0:TOPK_PAIR_WIDTH],
+                            topk_leaf_pairs[row0 : row0 + 1, 0:TOPK_PAIR_WIDTH],
+                            topk_leaf_pairs[row0 + 1 : row0 + 2, 0:TOPK_PAIR_WIDTH],
+                            topk_leaf_pairs[row0 + 2 : row0 + 3, 0:TOPK_PAIR_WIDTH],
+                        )
+                        topk_leaf_pairs[0:1, 0:TOPK_PAIR_WIDTH] = step_merged[:, 0:TOPK_PAIR_WIDTH]
+                    final_pairs = topk_leaf_pairs[0:1, 0:TOPK_PAIR_WIDTH]
+                    topk_idxs_tile = pl.gather(
+                        final_pairs,
+                        mask_pattern=pl.tile.MaskPattern.P1010,
+                        output_dtype=pl.INT32,
                     )
-                    topk_leaf_pairs[0:1, 0:TOPK_PAIR_WIDTH] = step_merged[:, 0:TOPK_PAIR_WIDTH]
-                final_pairs = topk_leaf_pairs[0:1, 0:TOPK_PAIR_WIDTH]
-                topk_idxs_tile = pl.gather(
-                    final_pairs,
-                    mask_pattern=pl.tile.MaskPattern.P1010,
-                    output_dtype=pl.INT32,
-                )
-                valid_topk = pl.min(IDX_TOPK, visible_len_t)
-                topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
-                topk_idxs_flat[t : t + 1, 0:IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
+                    valid_topk = pl.min(IDX_TOPK, visible_len_t)
+                    topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
+                    topk_idxs_flat[t : t + 1, 0:IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
 
     return score, topk_idxs
 
@@ -820,7 +832,10 @@ def golden_indexer(tensors):
                 continue
             score_full[b, s, :visible_len] = score[s, :visible_len].to(torch.float32)
             k = min(IDX_TOPK, visible_len)
-            _, idx = score[s, :visible_len].topk(k, dim=-1)
+            if visible_len <= IDX_TOPK:
+                idx = torch.arange(k, dtype=torch.int32)
+            else:
+                _, idx = score[s, :visible_len].topk(k, dim=-1)
             topk_idxs[b, s, :k] = idx.to(torch.int32)
             topk_idxs[b, s, :k] += offset
 
@@ -1063,14 +1078,12 @@ def build_tensor_specs(start_pos=None):
             [IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM],
             torch.int8,
             init_value=lambda: idx_kv_i8,
-            is_output=True,
         ),
         TensorSpec(
             "idx_kv_scale",
             [IDX_CACHE_BLOCK_NUM, IDX_STORAGE_BLOCK_SIZE, 1, 1],
             torch.float32,
             init_value=lambda: idx_kv_sc,
-            is_output=True,
         ),
         TensorSpec(
             "idx_block_table",
@@ -1079,8 +1092,8 @@ def build_tensor_specs(start_pos=None):
             init_value=init_idx_block_table,
         ),
         # Outputs are fixed to SCORE_LEN; positions past cache_len are -inf for score and -1 for topk_idxs.
-        TensorSpec("score", [B, S, SCORE_LEN], torch.float32, is_output=True),
-        TensorSpec("topk_idxs", [B, S, SCORE_LEN], torch.int32, is_output=True),
+        TensorSpec("score", [B, S, SCORE_LEN], torch.float32),
+        TensorSpec("topk_idxs", [B, S, SCORE_LEN], torch.int32),
         TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
         TensorSpec(
             "idx_slot_mapping", [B, S], torch.int64, init_value=init_idx_slot_mapping
@@ -1099,7 +1112,7 @@ def build_tensor_specs(start_pos=None):
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import ratio_allclose, run_jit, topk_pair_compare
+    from golden import ratio_allclose, run, topk_pair_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1145,6 +1158,22 @@ if __name__ == "__main__":
         e_top = expected[..., :IDX_TOPK]
         a_orig = (a_top.long() - OFFSET).clamp(min=0, max=score.shape[-1] - 1)
         paired = torch.gather(score, dim=-1, index=a_orig)
+        cache_len = inputs["kv_seq_lens"].cpu().to(torch.int64).reshape(B, 1) // COMPRESS_RATIO
+        position_len = (inputs["position_ids"].cpu().to(torch.int64) + 1) // COMPRESS_RATIO
+        visible = torch.minimum(cache_len, position_len).clamp(max=SCORE_LEN)
+        all_visible = visible <= IDX_TOPK
+        if all_visible.any():
+            exact, message = ratio_allclose(atol=0, rtol=0)(
+                a_top[all_visible], e_top[all_visible], actual_outputs=actual_outputs,
+                expected_outputs=expected_outputs, inputs=inputs, rtol=0, atol=0,
+            )
+            if not exact:
+                return False, message
+        if all_visible.all():
+            return True, ""
+        a_top = a_top[~all_visible]
+        e_top = e_top[~all_visible]
+        paired = paired[~all_visible]
         synth_actual = {**actual_outputs, "_topk_paired_scores": paired}
         return topk_pair_compare("_topk_paired_scores")(
             a_top,
@@ -1176,15 +1205,16 @@ if __name__ == "__main__":
 
     score_valid_compare.__name__ = "score_valid_region_compare"
 
-    result = run_jit(
+    result = run(
         compile_only=args.compile_only,
         fn=indexer_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_indexer_test,
         runtime_dir=args.runtime_dir,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
-            platform=args.platform,
+        config=dict(
+            dump_passes=args.dump_passes,
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.platform.endswith("sim"),
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
