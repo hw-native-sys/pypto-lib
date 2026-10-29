@@ -19,7 +19,8 @@ using F4 = float4_e2m1x2_t;
 using F8 = float8_e4m3_t;
 using S = float8_e8m0_t;
 using QueryPipe = TPipe<4, Direction::DIR_V2C, 16384, 2, 2, true>;
-using ScorePipe = TPipe<0, Direction::DIR_C2V, 32768, 2, 2, true>;
+using ScorePipe = TPipe<0, Direction::DIR_C2V, 16384, 2, 2, true>;
+using ScoreCast = FixpipeParams<LayoutMode_t::NZ2ND, QuantMode_t::F322BF16, ReluPreMode::NormalRelu>;
 
 template <typename T, int R, int C, int BR, int BC, Layout L = Layout::ND>
 using GM = GlobalTensor<T, TileShape2D<T, R, C, L>, BaseShape2D<T, BR, BC, L>, L>;
@@ -45,6 +46,54 @@ __aicore__ inline int read(__gm__ int32_t* ptr) {
 __aicore__ inline int minimum(int a, int b) { return a < b ? a : b; }
 
 #if defined(__DAV_VEC__)
+using HeadDotTile = Vec<bfloat16_t, 32, 128>;
+using WeightColumn = Tile<TileType::Vec, float, 32, 1, BLayout::ColMajor>;
+using ReducedTile = Vec<bfloat16_t, 1, 128>;
+
+__aicore__ inline void weighted_head(RegTensor<float>& result, __ubuf__ bfloat16_t* src,
+                                    __ubuf__ float* weights, uint16_t head, uint16_t column, MaskReg& mask) {
+    RegTensor<bfloat16_t> dot16, rounded;
+    RegTensor<float> dot, weight;
+    vlds(dot16, src + head * 128, column, UNPK_B16);
+    vcvt(dot, dot16, mask, PART_EVEN);
+    vlds(weight, weights, head, BRC_B32);
+    vmul(dot, dot, weight, mask, MODE_ZEROING);
+    vcvt(rounded, dot, mask, ROUND_R, RS_DISABLE, PART_EVEN);
+    vcvt(result, rounded, mask, PART_EVEN);
+}
+
+__tf__ __aicore__ inline void reduce_weighted(
+    ReducedTile::TileDType __out__ result, HeadDotTile::TileDType __in__ dots,
+    WeightColumn::TileDType __in__ head_weights) {
+    __ubuf__ bfloat16_t* src = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(dots);
+    __ubuf__ float* weights = (__ubuf__ float*)__cce_get_tile_ptr(head_weights);
+    __ubuf__ bfloat16_t* dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(result);
+    constexpr auto store_mode = std::integral_constant<::DistVST,
+        static_cast<::DistVST>(GetDistVst<bfloat16_t, pto::DistVST::DIST_NORM>())>();
+    __VEC_SCOPE__ {
+        RegTensor<bfloat16_t> reduced;
+        RegTensor<float> sum, a, b, pair_sum;
+        MaskReg full = pset_b32(PAT_ALL);
+        MaskReg packed;
+        for (uint16_t column = 0; column < 128; column += 64) {
+            weighted_head(sum, src, weights, 0, column, full);
+            for (uint16_t head_pair = 0; head_pair < 15; ++head_pair) {
+                uint16_t head = 1 + 2 * head_pair;
+                weighted_head(a, src, weights, head, column, full);
+                weighted_head(b, src, weights, head + 1, column, full);
+                vadd(pair_sum, a, b, full, MODE_ZEROING);
+                vadd(sum, sum, pair_sum, full, MODE_ZEROING);
+            }
+            weighted_head(a, src, weights, 31, column, full);
+            vadd(sum, sum, a, full, MODE_ZEROING);
+            vcvt(reduced, sum, full, ROUND_R, RS_DISABLE, PART_EVEN);
+            vpack((RegTensor<uint16_t>&)reduced, (RegTensor<uint32_t>&)reduced, LOWER);
+            ppack(packed, full, LOWER);
+            vsts(reduced, dst, column, store_mode, packed);
+        }
+    }
+}
+
 __aicore__ inline void prepare_query(__gm__ int64_t* args, int begin, int count, QueryPipe& pipe) {
     Tile<TileType::Vec, F8, 192, 128, BLayout::RowMajor, DYNAMIC, 128> input(count * 32);
     Vec<F8, 192, 128> full_input;
@@ -111,22 +160,12 @@ __aicore__ inline void store_score(__gm__ int64_t* args, int token, int group_of
     TASSIGN(total, 110592);
     if (valid > 0) {
         Vec<bfloat16_t, 32, 128> heads;
-        Vec<float, 32, 128> work;
-        Vec<bfloat16_t, 32, 128> rounded;
-        Tile<TileType::Vec, float, 32, 1, BLayout::ColMajor> weight;
+        WeightColumn weight;
         Vec<bfloat16_t, 1, 128> reduced;
         TASSIGN(heads, reinterpret_cast<uint64_t>(dot.data()) + pair_offset * 8192);
-        TASSIGN(work, 86016);
-        TASSIGN(rounded, 102400);
         TASSIGN(weight, 67328 + group_offset * 128);
         TASSIGN(reduced, 111104);
-        TCVT(work, heads, RoundMode::CAST_RINT);
-        TMAXS(work, work, 0.0f);
-        TROWEXPANDMUL(work, work, weight);
-        TCVT(rounded, work, RoundMode::CAST_RINT);
-        TCVT(work, rounded, RoundMode::CAST_RINT);
-        TCOLSUM(total, work);
-        TCVT(reduced, total, RoundMode::CAST_RINT);
+        reduce_weighted(reduced.data(), heads.data(), weight.data());
         TCVT(total, reduced, RoundMode::CAST_RINT);
     } else {
         TEXPANDS(total, -__builtin_inff());
@@ -229,7 +268,7 @@ __aicore__ inline void score(__gm__ int64_t* args) {
                         TMATMUL_MX(dot, left, left_scale, right, right_scale);
                         set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
                         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-                        TPUSH<ScorePipe, decltype(dot), TileSplitAxis::TILE_NO_SPLIT>(score_pipe, dot);
+                        TPUSH<ScorePipe, decltype(dot), ScoreCast>(score_pipe, dot);
                         pipe_barrier(PIPE_ALL);
                     }
                 }
@@ -238,16 +277,14 @@ __aicore__ inline void score(__gm__ int64_t* args) {
                     Vec<bfloat16_t, 64, 128> rounded;
                     TASSIGN(rounded, 69632);
                     if (have_dot) {
-                        Vec<float, 64, 128> dot;
-                        TPOP<ScorePipe, decltype(dot), TileSplitAxis::TILE_NO_SPLIT>(score_pipe, dot);
-                        TCVT(rounded, dot, RoundMode::CAST_RINT);
-                        TFREE<ScorePipe, TileSplitAxis::TILE_NO_SPLIT>(score_pipe);
+                        TPOP<ScorePipe, decltype(rounded), TileSplitAxis::TILE_NO_SPLIT>(score_pipe, rounded);
                     }
                     for (int offset = 0; offset < 2 && pair * 2 + offset < count; ++offset) {
                         int group_offset = pair * 2 + offset;
                         store_score(args, group + group_offset, group_offset, logical, page,
                                     rounded, offset, have_dot);
                     }
+                    if (have_dot) TFREE<ScorePipe, TileSplitAxis::TILE_NO_SPLIT>(score_pipe);
                 }
 #endif
             }
