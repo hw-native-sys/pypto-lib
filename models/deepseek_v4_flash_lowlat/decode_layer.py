@@ -13,9 +13,8 @@ Each rank owns a local decode micro-batch for the selected attention stage.
 The resulting per-rank hidden states feed the N-rank EP MoE path. The EP world
 size is chosen with --ep (2/4/8, default 2), inherited from moe; see __main__.
 
-Attention is replicated except for the CSA stage's output projection, which is
-sharded one group per card and all-reduced; SWA and HCA still run the replicated
-grouped projection.
+Attention uses head-group sharding, CSA token sharding, and an all-reduced
+output projection. Each rank receives the same public decode input rows.
 """
 
 import pypto.language as pl

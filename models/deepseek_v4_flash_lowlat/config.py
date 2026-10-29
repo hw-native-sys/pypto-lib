@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 Flash low-latency configuration: B = 1, S = 8, world 8, TP MoE and vocab, replicated attention."""
+"""DeepSeek-V4 Flash batch-one decode with TP MoE/vocab and sharded attention."""
 
 import os
 import sys
@@ -260,8 +260,8 @@ DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
 
 # Parallelism constants. TP shards the MoE intermediate dim and the embedding /
-# LM-head vocab; attention is replicated, so every card carries the whole decode
-# step and the token count a rank sees is DECODE_TOKENS at every degree.
+# LM-head vocab. Attention uses head-group sharding and CSA token sharding;
+# its public per-rank decode inputs still contain DECODE_TOKENS rows.
 TP = _parse_int_argv("--tp", 8)
 WORLD_SIZE = TP
 DP = WORLD_SIZE
