@@ -30,7 +30,9 @@ from models.glm5_3_flash.config import (
 )
 from models.glm5_3_flash.elementwise import FP32_NEG_INF
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
-from models.glm5_3_flash.utils import _FLOAT32_MIN, _randn, sylvester_hadamard
+from models.glm5_3_flash.utils import (
+    _FLOAT32_MIN, _randn, build_forward_metadata, build_indexer_chunk_metadata, sylvester_hadamard,
+)
 
 INDEX_BLOCKS_DYN = pl.dynamic("GLM53_INDEX_BLOCKS_DYN")
 POOLS_DYN = pl.dynamic("GLM53_POOLS_DYN")
@@ -51,11 +53,25 @@ QH_MM_TILE = 64
 SCORE_C_TILE = 64
 EXPAND_W_TILE = 256
 EXPAND_TAIL_TILE = 8  # covers the last lanes in one aligned tile
+EXPAND_TOKEN_TILE = 4
+TOPK_QUERY_WORKERS = 48
+POOL_GATHER_PAGE_TILE = 16
+POOL_GATHER_ROW_TILE = POOL_GATHER_PAGE_TILE * INDEX_STATE_BLOCK_SIZE
+POOL_GATHER_WORKERS = 48
+POOL_SCALE_WORKERS = 48
+# Batches at or below this token count take the decode-shaped dispatch:
+# persistent workers own pool-gather chunks and scale blocks. Larger prefill
+# chunks dispatch one task per chunk/block instead. The threshold matches the
+# resident decode batch of 32 requests of ``DECODE_ROWS_PER_REQUEST`` rows.
+INDEXER_PERSISTENT_MAX_TOKENS = 32 * DECODE_ROWS_PER_REQUEST
 
 POOL_STAGE_DYN = pl.dynamic("GLM53_POOL_STAGE_DYN")
 POOL_VALID_WIDTH = 8
 POOL_SCALE_WIDTH = 8
 POOL_QUANT_TILE = 64
+# Rows per cache-write block: the key half loads as one wide BF16 tile and
+# widens to FP32 once, then each row scatters by its own slot.
+CACHE_WRITE_TILE = 8
 
 
 @pl.jit
@@ -414,6 +430,63 @@ def indexer_proj(
 
 
 @pl.jit.inline
+def _indexer_pool_gather_chunk(
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
+    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
+    pool_blocks: pl.Tensor[[POOL_PAGES_DYN], pl.INT32],
+    pool_i8: pl.Tensor[[POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE + SCORE_C_TILE, INDEX_DIM], pl.INT8],
+    pool_scale_g: pl.Tensor[[POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE + SCORE_C_TILE, POOL_SCALE_WIDTH], pl.FP32],
+    chunk: pl.Scalar[pl.INDEX],
+    page_count: pl.Scalar[pl.INDEX],
+):
+    """Gather one 16-page chunk into contiguous score scratch."""
+    chunk_base = pl.cast(chunk, pl.INT32) * POOL_GATHER_PAGE_TILE
+    chunk_ok = 1
+    for j in pl.range(1, POOL_GATHER_PAGE_TILE):
+        step = chunk_base + j
+        cur = pl.read(pool_blocks, [pl.min(step, page_count - 1)])
+        prv = pl.read(pool_blocks, [pl.max(pl.min(step, page_count - 1) - 1, 0)])
+        good = pl.cast(cur == pl.add(prv, INDEX_STATE_BLOCK_SIZE), pl.INT32)
+        good = good * pl.cast(step < page_count, pl.INT32)
+        chunk_ok = chunk_ok * good
+    if chunk_ok == 1:
+        p0_idx = pl.cast(chunk_base, pl.INDEX) * INDEX_STATE_BLOCK_SIZE
+        base_idx = pl.cast(pl.read(pool_blocks, [chunk_base]), pl.INDEX)
+        pool_i8[p0_idx : p0_idx + POOL_GATHER_ROW_TILE, :] = pool_cache[
+            base_idx : base_idx + POOL_GATHER_ROW_TILE, :
+        ]
+        pool_scale_g[p0_idx : p0_idx + POOL_GATHER_ROW_TILE, :] = pool_scale[
+            base_idx : base_idx + POOL_GATHER_ROW_TILE, :
+        ]
+    else:
+        for j in pl.range(POOL_GATHER_PAGE_TILE):
+            page_i = chunk_base + j
+            if page_i < page_count:
+                p0_idx = pl.cast(page_i, pl.INDEX) * INDEX_STATE_BLOCK_SIZE
+                base_idx = pl.cast(pl.read(pool_blocks, [page_i]), pl.INDEX)
+                pool_i8[p0_idx : p0_idx + INDEX_STATE_BLOCK_SIZE, :] = pool_cache[
+                    base_idx : base_idx + INDEX_STATE_BLOCK_SIZE, :
+                ]
+                pool_scale_g[p0_idx : p0_idx + INDEX_STATE_BLOCK_SIZE, :] = pool_scale[
+                    base_idx : base_idx + INDEX_STATE_BLOCK_SIZE, :
+                ]
+
+
+@pl.jit.inline
+def _indexer_pool_scale_block(
+    pool_scale_g: pl.Tensor[[POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE + SCORE_C_TILE, POOL_SCALE_WIDTH], pl.FP32],
+    pool_scale_col: pl.Tensor[[POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE + SCORE_C_TILE, 1], pl.FP32],
+    scale_block: pl.Scalar[pl.INDEX],
+):
+    """Pack one 64-row scale block and apply the score scale."""
+    c0 = pl.cast(scale_block, pl.INT32) * SCORE_C_TILE
+    c0_idx = pl.cast(c0, pl.INDEX)
+    sc8 = pool_scale_g[c0_idx : c0_idx + SCORE_C_TILE, :]
+    summed = pl.reshape(pl.row_sum(sc8), [SCORE_C_TILE, 1])
+    pool_scale_col[c0_idx : c0_idx + SCORE_C_TILE, :] = pl.mul(summed, 0.125 * SOFTMAX_SCALE)
+
+
+@pl.jit.inline
 def _indexer_score_prepare(
     index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
@@ -459,11 +532,25 @@ def _indexer_score_prepare(
 
     pool_scale_g = pl.create_tensor([pools + SCORE_C_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32)
     pool_i8 = pl.create_tensor([pools + SCORE_C_TILE, INDEX_DIM], dtype=pl.INT8)
-    for page in pl.spmd(page_count, name_hint="indexer_pool_gather"):
-        p0_idx = pl.cast(page, pl.INDEX) * INDEX_STATE_BLOCK_SIZE
-        base = pl.cast(pl.read(pool_blocks, [page]), pl.INDEX)
-        pool_i8[p0_idx:p0_idx + INDEX_STATE_BLOCK_SIZE, :] = pool_cache[base:base + INDEX_STATE_BLOCK_SIZE, :]
-        pool_scale_g[p0_idx:p0_idx + INDEX_STATE_BLOCK_SIZE, :] = pool_scale[base:base + INDEX_STATE_BLOCK_SIZE, :]
+    if t_dim <= INDEXER_PERSISTENT_MAX_TOKENS:
+        # Persistent workers own 16-page chunks. A contiguous chunk is copied once
+        # as 64 rows; a scattered chunk retains per-page moves with identical bytes.
+        chunk_count = (page_count + POOL_GATHER_PAGE_TILE - 1) // POOL_GATHER_PAGE_TILE
+        gather_workers = pl.max(pl.min(chunk_count, POOL_GATHER_WORKERS), 1)
+        with pl.spmd(gather_workers, name_hint="indexer_pool_gather"):
+            worker = pl.tile.get_block_idx()
+            for chunk in pl.range(worker, chunk_count, POOL_GATHER_WORKERS):
+                _indexer_pool_gather_chunk(
+                    pool_cache, pool_scale, pool_blocks, pool_i8, pool_scale_g, chunk, page_count
+                )
+    else:
+        # Larger prefill batches dispatch one task per 16-page chunk with the
+        # same contiguous and scattered copy paths.
+        prefill_chunk_count = (page_count + POOL_GATHER_PAGE_TILE - 1) // POOL_GATHER_PAGE_TILE
+        for prefill_chunk in pl.spmd(prefill_chunk_count, name_hint="indexer_pool_gather"):
+            _indexer_pool_gather_chunk(
+                pool_cache, pool_scale, pool_blocks, pool_i8, pool_scale_g, prefill_chunk, page_count
+            )
     # Collapse the replicated scale lanes once, width-proportional work outside
     # the per-token loop: a strided lane-0 column read is not a legal TLOAD, and
     # reducing inside the score loop costs ~40-70 ns per (token, tile) step.
@@ -477,12 +564,16 @@ def _indexer_score_prepare(
     # clamped-by-valid-shape contract as the score matrix, and the scratch
     # slack above covers every reader's widest tile, so the tail reads in
     # bounds.
-    for c_block in pl.spmd((pools + SCORE_C_TILE - 1) // SCORE_C_TILE, name_hint="indexer_pool_scale_pack"):
-        c0 = pl.cast(c_block, pl.INT32) * SCORE_C_TILE
-        c0_idx = pl.cast(c0, pl.INDEX)
-        sc8 = pool_scale_g[c0_idx : c0_idx + SCORE_C_TILE, :]
-        summed = pl.reshape(pl.row_sum(sc8), [SCORE_C_TILE, 1])
-        pool_scale_col[c0_idx : c0_idx + SCORE_C_TILE, :] = pl.mul(summed, 0.125 * SOFTMAX_SCALE)
+    scale_blocks = (pools + SCORE_C_TILE - 1) // SCORE_C_TILE
+    if t_dim <= INDEXER_PERSISTENT_MAX_TOKENS:
+        scale_workers = pl.max(pl.min(scale_blocks, POOL_SCALE_WORKERS), 1)
+        with pl.spmd(scale_workers, name_hint="indexer_pool_scale_pack"):
+            worker = pl.tile.get_block_idx()
+            for scale_block in pl.range(worker, scale_blocks, POOL_SCALE_WORKERS):
+                _indexer_pool_scale_block(pool_scale_g, pool_scale_col, scale_block)
+    else:
+        for c_block in pl.spmd(scale_blocks, name_hint="indexer_pool_scale_pack"):
+            _indexer_pool_scale_block(pool_scale_g, pool_scale_col, c_block)
     return q_i8, q_scale_dq, pool_i8, pool_scale_col
 
 
@@ -533,48 +624,19 @@ def _indexer_topk_query(
     index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
     seg_start: pl.Tensor[[T_DYN], pl.INT32],
     pool_count: pl.Tensor[[T_DYN], pl.INT32],
-    running_pairs: pl.Tensor[[T_DYN, PAIR_WIDTH], pl.FP32],
     selected_pools: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
     selected_valid: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
 ) -> None:
-    """Select one query's top visible pools, one sort leaf at a time."""
-    query = pl.tile.get_block_idx()
-    pl.store(pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=-1), [query, 0], selected_pools)
-    pl.store(pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=0), [query, 0], selected_valid)
-    visible_count = pl.max(pl.read(pool_count, [query]), 0)
-    if visible_count > 0:
-        seg0 = pl.read(seg_start, [query])
-        leaf_count = (visible_count + SORT_TILE - 1) // SORT_TILE
-        for leaf in pl.range(leaf_count):
-            leaf0 = leaf * SORT_TILE
-            leaf_valid = pl.min(SORT_TILE, visible_count - leaf0)
-            row_raw = pl.load(index_scores, [query, seg0 + leaf0], [1, SORT_TILE], valid_shape=[1, leaf_valid])
-            row = pl.tile.fillpad(row_raw, pad_value=pl.PadValue.min)
-            row = pl.maximum(row, pl.tile.full([1, SORT_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
-            index_ramp = pl.tile.arange(0, [1, SORT_TILE], dtype=pl.INT32)
-            leaf_indices = pl.tile.add(index_ramp, pl.cast(leaf0, pl.INT32))
-            leaf_pairs = pl.tile.sort32(row, pl.reinterpret_view(leaf_indices, pl.UINT32))
-            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=64)
-            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=256)
-            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=1024)
-            leaf_pairs = pl.tile.slice(leaf_pairs, [1, PAIR_WIDTH], [0, 0])
-            if leaf == 0:
-                pl.store(leaf_pairs, [query, 0], running_pairs)
-            else:
-                pairs = pl.load(running_pairs, [query, 0], [1, PAIR_WIDTH])
-                merge_tmp = pl.tile.create([1, 2 * PAIR_WIDTH], dtype=pl.FP32)
-                merged = pl.tile.mrgsort(pairs, leaf_pairs, tmp=merge_tmp)
-                pl.store(pl.tile.slice(merged, [1, PAIR_WIDTH], [0, 0]), [query, 0], running_pairs)
-        pairs = pl.load(running_pairs, [query, 0], [1, PAIR_WIDTH])
-        picked = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-        valid_topk = pl.min(visible_count, KPOOL_SELECT_K)
-        indices_out = pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=-1)
-        validity_out = pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=0)
-        for lane in pl.range(valid_topk):
-            pl.tile.write(indices_out, [0, lane], pl.tile.read(picked, [0, lane]))
-            pl.tile.write(validity_out, [0, lane], pl.const(1, pl.INT32))
-        pl.store(indices_out, [query, 0], selected_pools)
-        pl.store(validity_out, [query, 0], selected_valid)
+    """Stripe queries round-robin over the dispatched workers.
+
+    ``min(t_dim, TOPK_QUERY_WORKERS)`` blocks are dispatched. Worker ``w``
+    processes ``w, w + TOPK_QUERY_WORKERS, ...`` while the query is below
+    ``t_dim``.
+    """
+    worker = pl.tile.get_block_idx()
+    t_dim = pl.tensor.dim(index_scores, 0)
+    for query in pl.range(worker, t_dim, TOPK_QUERY_WORKERS):
+        _indexer_topk_one_query(index_scores, seg_start, pool_count, selected_pools, selected_valid, query)
 
 
 @pl.jit.inline
@@ -585,11 +647,17 @@ def indexer_topk(
     selected_pools: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
     selected_valid: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
 ):
-    """Exact top-512 over each query's visible window, one block per query.
+    """Top-512 over each query's visible window, persistent-worker dispatch.
+
+    ``min(t_dim, TOPK_QUERY_WORKERS)`` blocks stripe the queries. A window of
+    at most ``KPOOL_SELECT_K`` pools selects every visible pool in compact id
+    order; larger windows take the exact sorted path.
 
     Selections are segment-local pool ids: the sort payload carries the offset
     from ``seg_start``, so ``indexer_expand`` can map pool ``j`` to raw
     positions ``4j .. 4j+3`` without any batch knowledge.
+
+    The sorted path's running top pairs live in a loop-carried on-chip tile.
 
     **Sharing ABI** (``index_share_for_mtp_iteration``, settled in issue
     #1267): ``selected_pools``/``selected_valid`` are the shareable selection
@@ -603,9 +671,10 @@ def indexer_topk(
     Returns the region's TaskId so the expansion can order against it.
     """
     t_dim = pl.tensor.dim(index_scores, 0)
-    running_pairs = pl.create_tensor([t_dim, PAIR_WIDTH], dtype=pl.FP32)
-    with pl.spmd(t_dim, name_hint="indexer_topk") as topk_tid:
-        _indexer_topk_query(index_scores, seg_start, pool_count, running_pairs, selected_pools, selected_valid)
+    with pl.spmd(
+        pl.min(t_dim, TOPK_QUERY_WORKERS), name_hint="indexer_topk"
+    ) as topk_tid:
+        _indexer_topk_query(index_scores, seg_start, pool_count, selected_pools, selected_valid)
     return topk_tid
 
 
@@ -642,70 +711,75 @@ def indexer_expand(
     tails, and the front-packed row bakes its own tail in.
     """
     t_dim = pl.tensor.dim(selected_pools, 0)
-    with pl.spmd(t_dim, name_hint="indexer_expand") as expand_tid:
-        token = pl.tile.get_block_idx()
-        # Scalar bookkeeping stays INT32: pl.read preserves the tensor dtype but
-        # pl.min promotes to index, which scalar instructions reject.
-        groups = pl.cast(pl.min(pl.read(kv_len, [token]) // INDEX_KPOOL, KPOOL_SELECT_K), pl.INT32)
-        hist_len = pl.cast(groups * INDEX_KPOOL, pl.INT32)
-        base = pl.cast(pl.read(tail_start, [token]), pl.INT32)
-        tail = pl.cast(pl.read(tail_count, [token]), pl.INT32)
-        for w0 in pl.unroll(0, TOPK_INDEX_WIDTH - (INDEX_KPOOL - 1), EXPAND_W_TILE):
-            lane = pl.arange(pl.cast(w0, pl.INT32), [1, EXPAND_W_TILE], dtype=pl.INT32)
-            pool_raw = pl.cast(pl.mul(pl.cast(lane, pl.FP32, mode="none"), 1.0 / INDEX_KPOOL), pl.INT32, mode="trunc")
-            pool_id = pl.minimum(pool_raw, KPOOL_SELECT_K - 1)
-            sel_row = pl.gather(selected_pools[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_id)
-            sel_validity = pl.gather(selected_valid[token:token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_id)
-            hist_slack = pl.neg(pl.sub(lane, hist_len))
-            hist_mask = pl.minimum(pl.maximum(hist_slack, 0), 1)
-            hist_active = pl.mul(hist_mask, pl.minimum(sel_validity, 1))
-            tail_offset = pl.sub(lane, hist_len)
-            tail_in_range = pl.minimum(pl.maximum(pl.neg(pl.sub(tail_offset, tail)), 0), 1)
-            tail_ge_zero = pl.minimum(pl.maximum(pl.add(tail_offset, 1), 0), 1)
-            tail_active = pl.mul(tail_in_range, tail_ge_zero)
-            # Position math in FP32 for the float-constant multiplies, rounded
-            # once at the store.
-            lane_f = pl.cast(lane, pl.FP32, mode="none")
-            pool_f = pl.cast(pool_raw, pl.FP32, mode="none")
-            rem_f = pl.sub(lane_f, pl.mul(pool_f, 4.0))
-            hist_pos_f = pl.add(pl.mul(pl.cast(sel_row, pl.FP32, mode="none"), 4.0), rem_f)
-            tail_pos_f = pl.cast(pl.add(pl.add(tail_offset, base), 1), pl.FP32, mode="none")
-            positions_f_cast = pl.cast(hist_active, pl.FP32, mode="none")
-            positions_f_add = pl.add(hist_pos_f, 1.0)
-            positions_f_mul = pl.mul(positions_f_cast, positions_f_add)
-            positions_f_cast_2 = pl.cast(tail_active, pl.FP32, mode="none")
-            positions_f_mul_2 = pl.mul(positions_f_cast_2, tail_pos_f)
-            positions_f_add_2 = pl.add(positions_f_mul, positions_f_mul_2)
-            positions_f = pl.sub(positions_f_add_2, 1.0)
-            topk_indices[token:token + 1, w0:w0 + EXPAND_W_TILE] = pl.cast(positions_f, pl.INT32, mode="none")
-        # The odd 2051-wide row cannot end on an aligned tile, so the last chunk
-        # is an eight-lane tile starting five lanes early; the overlap is written
-        # twice with identical values, which keeps every store on the MTE3 path.
-        lane_t = pl.arange(pl.const(2043, pl.INT32), [1, EXPAND_TAIL_TILE], dtype=pl.INT32)
-        pool_t = pl.cast(pl.mul(pl.cast(lane_t, pl.FP32, mode="none"), 1.0 / INDEX_KPOOL), pl.INT32, mode="trunc")
-        pool_t = pl.minimum(pool_t, KPOOL_SELECT_K - 1)
-        sel_t = pl.gather(selected_pools[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_t)
-        valid_t = pl.gather(selected_valid[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_t)
-        hslack_t = pl.neg(pl.sub(lane_t, hist_len))
-        hmask_t = pl.minimum(pl.maximum(hslack_t, 0), 1)
-        hactive_t = pl.mul(hmask_t, pl.minimum(valid_t, 1))
-        offset_t = pl.sub(lane_t, hist_len)
-        trange_t = pl.minimum(pl.maximum(pl.neg(pl.sub(offset_t, tail)), 0), 1)
-        tge_t = pl.minimum(pl.maximum(pl.add(offset_t, 1), 0), 1)
-        tactive_t = pl.mul(trange_t, tge_t)
-        lane_tf = pl.cast(lane_t, pl.FP32, mode="none")
-        pool_tf = pl.cast(pool_t, pl.FP32, mode="none")
-        rem_tf = pl.sub(lane_tf, pl.mul(pool_tf, 4.0))
-        hpos_tf = pl.add(pl.mul(pl.cast(sel_t, pl.FP32, mode="none"), 4.0), rem_tf)
-        tpos_tf = pl.cast(pl.add(pl.add(offset_t, base), 1), pl.FP32, mode="none")
-        pos_tf_cast = pl.cast(hactive_t, pl.FP32, mode="none")
-        pos_tf_add = pl.add(hpos_tf, 1.0)
-        pos_tf_mul = pl.mul(pos_tf_cast, pos_tf_add)
-        pos_tf_cast_2 = pl.cast(tactive_t, pl.FP32, mode="none")
-        pos_tf_mul_2 = pl.mul(pos_tf_cast_2, tpos_tf)
-        pos_tf_add_2 = pl.add(pos_tf_mul, pos_tf_mul_2)
-        pos_tf = pl.sub(pos_tf_add_2, 1.0)
-        topk_indices[token:token + 1, TOPK_INDEX_WIDTH - EXPAND_TAIL_TILE:TOPK_INDEX_WIDTH] = pl.cast(pos_tf, pl.INT32, mode="none")
+    with pl.spmd(
+        (t_dim + EXPAND_TOKEN_TILE - 1) // EXPAND_TOKEN_TILE, name_hint="indexer_expand"
+    ) as expand_tid:
+        tok_blk = pl.tile.get_block_idx()
+        for tk_i in pl.range(EXPAND_TOKEN_TILE):
+            token = tok_blk * EXPAND_TOKEN_TILE + tk_i
+            if token < t_dim:
+                # Scalar bookkeeping stays INT32: pl.read preserves the tensor dtype but
+                # pl.min promotes to index, which scalar instructions reject.
+                groups = pl.cast(pl.min(pl.read(kv_len, [token]) // INDEX_KPOOL, KPOOL_SELECT_K), pl.INT32)
+                hist_len = pl.cast(groups * INDEX_KPOOL, pl.INT32)
+                base = pl.cast(pl.read(tail_start, [token]), pl.INT32)
+                tail = pl.cast(pl.read(tail_count, [token]), pl.INT32)
+                for w0 in pl.unroll(0, TOPK_INDEX_WIDTH - (INDEX_KPOOL - 1), EXPAND_W_TILE):
+                    lane = pl.arange(pl.cast(w0, pl.INT32), [1, EXPAND_W_TILE], dtype=pl.INT32)
+                    pool_raw = pl.cast(pl.mul(pl.cast(lane, pl.FP32, mode="none"), 1.0 / INDEX_KPOOL), pl.INT32, mode="trunc")
+                    pool_id = pl.minimum(pool_raw, KPOOL_SELECT_K - 1)
+                    sel_row = pl.gather(selected_pools[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_id)
+                    sel_validity = pl.gather(selected_valid[token:token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_id)
+                    hist_slack = pl.neg(pl.sub(lane, hist_len))
+                    hist_mask = pl.minimum(pl.maximum(hist_slack, 0), 1)
+                    hist_active = pl.mul(hist_mask, pl.minimum(sel_validity, 1))
+                    tail_offset = pl.sub(lane, hist_len)
+                    tail_in_range = pl.minimum(pl.maximum(pl.neg(pl.sub(tail_offset, tail)), 0), 1)
+                    tail_ge_zero = pl.minimum(pl.maximum(pl.add(tail_offset, 1), 0), 1)
+                    tail_active = pl.mul(tail_in_range, tail_ge_zero)
+                    # Position math in FP32 for the float-constant multiplies, rounded
+                    # once at the store.
+                    lane_f = pl.cast(lane, pl.FP32, mode="none")
+                    pool_f = pl.cast(pool_raw, pl.FP32, mode="none")
+                    rem_f = pl.sub(lane_f, pl.mul(pool_f, 4.0))
+                    hist_pos_f = pl.add(pl.mul(pl.cast(sel_row, pl.FP32, mode="none"), 4.0), rem_f)
+                    tail_pos_f = pl.cast(pl.add(pl.add(tail_offset, base), 1), pl.FP32, mode="none")
+                    positions_f_cast = pl.cast(hist_active, pl.FP32, mode="none")
+                    positions_f_add = pl.add(hist_pos_f, 1.0)
+                    positions_f_mul = pl.mul(positions_f_cast, positions_f_add)
+                    positions_f_cast_2 = pl.cast(tail_active, pl.FP32, mode="none")
+                    positions_f_mul_2 = pl.mul(positions_f_cast_2, tail_pos_f)
+                    positions_f_add_2 = pl.add(positions_f_mul, positions_f_mul_2)
+                    positions_f = pl.sub(positions_f_add_2, 1.0)
+                    topk_indices[token:token + 1, w0:w0 + EXPAND_W_TILE] = pl.cast(positions_f, pl.INT32, mode="none")
+                # The odd 2051-wide row cannot end on an aligned tile, so the last chunk
+                # is an eight-lane tile starting five lanes early; the overlap is written
+                # twice with identical values, which keeps every store on the MTE3 path.
+                lane_t = pl.arange(pl.const(2043, pl.INT32), [1, EXPAND_TAIL_TILE], dtype=pl.INT32)
+                pool_t = pl.cast(pl.mul(pl.cast(lane_t, pl.FP32, mode="none"), 1.0 / INDEX_KPOOL), pl.INT32, mode="trunc")
+                pool_t = pl.minimum(pool_t, KPOOL_SELECT_K - 1)
+                sel_t = pl.gather(selected_pools[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_t)
+                valid_t = pl.gather(selected_valid[token : token + 1, 0:KPOOL_SELECT_K], dim=-1, index=pool_t)
+                hslack_t = pl.neg(pl.sub(lane_t, hist_len))
+                hmask_t = pl.minimum(pl.maximum(hslack_t, 0), 1)
+                hactive_t = pl.mul(hmask_t, pl.minimum(valid_t, 1))
+                offset_t = pl.sub(lane_t, hist_len)
+                trange_t = pl.minimum(pl.maximum(pl.neg(pl.sub(offset_t, tail)), 0), 1)
+                tge_t = pl.minimum(pl.maximum(pl.add(offset_t, 1), 0), 1)
+                tactive_t = pl.mul(trange_t, tge_t)
+                lane_tf = pl.cast(lane_t, pl.FP32, mode="none")
+                pool_tf = pl.cast(pool_t, pl.FP32, mode="none")
+                rem_tf = pl.sub(lane_tf, pl.mul(pool_tf, 4.0))
+                hpos_tf = pl.add(pl.mul(pl.cast(sel_t, pl.FP32, mode="none"), 4.0), rem_tf)
+                tpos_tf = pl.cast(pl.add(pl.add(offset_t, base), 1), pl.FP32, mode="none")
+                pos_tf_cast = pl.cast(hactive_t, pl.FP32, mode="none")
+                pos_tf_add = pl.add(hpos_tf, 1.0)
+                pos_tf_mul = pl.mul(pos_tf_cast, pos_tf_add)
+                pos_tf_cast_2 = pl.cast(tactive_t, pl.FP32, mode="none")
+                pos_tf_mul_2 = pl.mul(pos_tf_cast_2, tpos_tf)
+                pos_tf_add_2 = pl.add(pos_tf_mul, pos_tf_mul_2)
+                pos_tf = pl.sub(pos_tf_add_2, 1.0)
+                topk_indices[token:token + 1, TOPK_INDEX_WIDTH - EXPAND_TAIL_TILE:TOPK_INDEX_WIDTH] = pl.cast(pos_tf, pl.INT32, mode="none")
     return expand_tid
 
 
@@ -716,26 +790,115 @@ def indexer_cache_write(
     slots: pl.Tensor[[T_DYN], pl.INT32],
     cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
 ):
-    """Scatter one step's raw indexer rows into the paged pool, one block per row.
+    """Scatter one step's raw indexer rows into the paged pool, eight rows a block.
 
     A slot of ``-1`` marks a row that owns no cache position — a padded row in a
     packed batch — and is skipped, so a negative slot cannot wrap into the tail of
     the pool. The key half is widened to FP32 on the way in: the pooled-table writer
-    re-reads these rows in FP32, and the storage ABI is FP32 end to end.
+    re-reads these rows in FP32, and the storage ABI is FP32 end to end. One block
+    moves :data:`CACHE_WRITE_TILE` rows: a single ``[tile, dim]`` key load and one
+    widening cast feed the per-row slot scatters. A tail block with fewer rows
+    than the tile clamps its load to the table's edge and skips the rows past the
+    token count, so any token count is legal.
 
     Returns the region's TaskId so a later reader can order against the write.
     """
     tokens = pl.tensor.dim(index_k, 0)
-    with pl.spmd(tokens, name_hint="indexer_cache_write") as write_tid:
-        token = pl.tile.get_block_idx()
-        slot_i32 = pl.read(slots, [token])
-        if slot_i32 >= 0:
-            slot = pl.cast(slot_i32, pl.INDEX)
-            key_f32 = pl.cast(pl.load(index_k, [token, 0], [1, INDEX_DIM]), pl.FP32, mode="none")
-            pl.store(key_f32, [slot, 0], cache)
-            gate_f32 = pl.load(gate_scores, [token, 0], [1, INDEX_DIM])
-            pl.store(gate_f32, [slot, INDEX_DIM], cache)
+    with pl.spmd(
+        (tokens + CACHE_WRITE_TILE - 1) // CACHE_WRITE_TILE, name_hint="indexer_cache_write"
+    ) as write_tid:
+        base = pl.tile.get_block_idx() * CACHE_WRITE_TILE
+        # clamp=True cuts the tail block's window back to the table's last row
+        # and fillpad restores the tile to full width with zeros; the per-row
+        # bounds check below drops the window's phantom rows from the slot read
+        # and both stores. Full blocks are unaffected.
+        keys_f32 = pl.tile.fillpad(
+            pl.cast(pl.load(index_k, [base, 0], [CACHE_WRITE_TILE, INDEX_DIM], clamp=True), pl.FP32, mode="none")
+        )
+        gates = pl.tile.fillpad(pl.load(gate_scores, [base, 0], [CACHE_WRITE_TILE, INDEX_DIM], clamp=True))
+        for row in pl.unroll(0, CACHE_WRITE_TILE):
+            if base + row < tokens:
+                slot_i32 = pl.read(slots, [base + row])
+                if slot_i32 >= 0:
+                    slot = pl.cast(slot_i32, pl.INDEX)
+                    pl.store(pl.tile.slice(keys_f32, [1, INDEX_DIM], [row, 0]), [slot, 0], cache)
+                    pl.store(pl.tile.slice(gates, [1, INDEX_DIM], [row, 0]), [slot, INDEX_DIM], cache)
     return write_tid
+
+
+@pl.jit.inline
+def _indexer_topk_one_query(
+    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
+    seg_start: pl.Tensor[[T_DYN], pl.INT32],
+    pool_count: pl.Tensor[[T_DYN], pl.INT32],
+    selected_pools: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
+    selected_valid: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
+    query: pl.Scalar[pl.INDEX],
+) -> None:
+    """Select one query's top visible pools (the per-query sort pipeline)."""
+    pl.store(pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=-1), [query, 0], selected_pools)
+    pl.store(pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=0), [query, 0], selected_valid)
+    visible_count = pl.max(pl.read(pool_count, [query]), 0)
+    if visible_count > 0:
+        seg0 = pl.read(seg_start, [query])
+        if visible_count <= KPOOL_SELECT_K:
+            # At or below the select width, materialize every visible pool
+            # directly from the compact id ramp without reading scores or
+            # sorting. The selection prefix order is ABI-free.
+            valid_topk = pl.cast(visible_count, pl.INT32)
+            lane = pl.tile.arange(0, [1, KPOOL_SELECT_K], dtype=pl.INT32)
+            keep = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, valid_topk)), 0), 1)
+            indices_out = pl.sub(pl.add(pl.mul(lane, keep), keep), 1)
+            pl.store(indices_out, [query, 0], selected_pools)
+            pl.store(keep, [query, 0], selected_valid)
+        else:
+            # Carry a pad-free root tile across the leaf loop. Extract each
+            # leaf's sorted top pairs and merge them into the root with
+            # assemble; a re-sliced merge result is a view whose pad-carrying
+            # type is rejected as a loop iter-arg. A one-leaf window publishes
+            # directly from the seeded root.
+            leaf_valid = pl.min(SORT_TILE, visible_count)
+            row_raw = pl.load(index_scores, [query, seg0], [1, SORT_TILE], valid_shape=[1, leaf_valid])
+            row = pl.tile.fillpad(row_raw, pad_value=pl.PadValue.min)
+            row = pl.maximum(row, pl.tile.full([1, SORT_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
+            index_ramp = pl.tile.arange(0, [1, SORT_TILE], dtype=pl.INT32)
+            leaf_pairs = pl.tile.sort32(row, pl.reinterpret_view(index_ramp, pl.UINT32))
+            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=64)
+            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=256)
+            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=1024)
+            root = pl.tile.create([1, PAIR_WIDTH], dtype=pl.FP32)
+            seed = pl.tile.extract(leaf_pairs, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
+            root = pl.tile.assemble(root, seed, [0, 0])
+            leaf_count = (visible_count + SORT_TILE - 1) // SORT_TILE
+            for leaf in pl.range(1, leaf_count):
+                leaf0 = leaf * SORT_TILE
+                lv = pl.min(SORT_TILE, visible_count - leaf0)
+                row2_raw = pl.load(index_scores, [query, seg0 + leaf0], [1, SORT_TILE], valid_shape=[1, lv])
+                row2 = pl.tile.fillpad(row2_raw, pad_value=pl.PadValue.min)
+                row2 = pl.maximum(row2, pl.tile.full([1, SORT_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
+                ramp2 = pl.tile.arange(0, [1, SORT_TILE], dtype=pl.INT32)
+                lp2 = pl.tile.sort32(row2, pl.reinterpret_view(pl.tile.add(ramp2, pl.cast(leaf0, pl.INT32)), pl.UINT32))
+                lp2 = pl.tile.mrgsort(lp2, block_len=64)
+                lp2 = pl.tile.mrgsort(lp2, block_len=256)
+                lp2 = pl.tile.mrgsort(lp2, block_len=1024)
+                lp2_top = pl.tile.extract(lp2, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
+                old_root = pl.tile.extract(root, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
+                merge_tmp = pl.tile.create([1, 2 * PAIR_WIDTH], dtype=pl.FP32)
+                merged = pl.tile.mrgsort(old_root, lp2_top, tmp=merge_tmp)
+                next_root = pl.tile.extract(merged, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
+                root = pl.tile.assemble(root, next_root, [0, 0])
+            pairs = pl.tile.extract(root, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
+            picked = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            valid_topk = pl.cast(pl.min(visible_count, KPOOL_SELECT_K), pl.INT32)
+            # Materialize the picked payload in one integer lane pass. keep is
+            # the 0/1 window mask: picked*keep + keep - 1 maps valid lanes to
+            # picked ids and padding lanes to -1, while keep is the validity
+            # output. fillpad cannot emit the arbitrary integer -1 pad.
+            lane = pl.tile.arange(0, [1, KPOOL_SELECT_K], dtype=pl.INT32)
+            keep = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, valid_topk)), 0), 1)
+            indices_out = pl.sub(pl.add(pl.mul(picked, keep), keep), 1)
+            pl.store(indices_out, [query, 0], selected_pools)
+            pl.store(keep, [query, 0], selected_valid)
 
 
 @pl.jit.incore
@@ -1401,18 +1564,91 @@ def build_indexer_proj_specs(tokens: int = 64):
     ]
 
 
-def _pool_batch(tokens: int, counts: tuple[int, ...], positions: tuple[int, ...], *, pad_pages: bool = True):
-    """Derive the packed score/topk batch geometry from per-request pool counts.
+def _pool_axis_width(
+    tokens: int,
+    counts: tuple[int, ...],
+    *,
+    pool_stride: int | None = None,
+    request_slots: int | None = None,
+):
+    """Return the leaf-padded score width for compact or stable-slot pools."""
+    if pool_stride is None:
+        axis = sum(counts)
+    else:
+        slots = len(counts) if request_slots is None else request_slots
+        if slots < len(counts):
+            raise ValueError("request_slots must cover every active request")
+        if pool_stride <= 0 or pool_stride % INDEX_STATE_BLOCK_SIZE:
+            raise ValueError("pool_stride must be a positive multiple of the pool page rows")
+        if any(count < 0 or count > pool_stride for count in counts):
+            raise ValueError("a request pool count exceeds pool_stride")
+        axis = max(slots * pool_stride, tokens // INDEX_KPOOL + slots)
+    return ((axis + 2 * SORT_TILE - 2) // SORT_TILE) * SORT_TILE
 
-    Returns the compacted width (leaf-aligned with slack), the pooled-table row
-    count, the per-query ``seg_start`` and causally clamped ``pool_count``, and
-    the pool row indirection. ``positions`` is each query's request-local
-    position. ``pad_pages=False`` ends the page table at the last live page —
-    the production contract — so the gathered row count is not a multiple of
-    the score tile and the pack loop's final tile is partial.
+
+def _resident_default_tables(request_slots: int, table_max: int, pool_stride: int):
+    """Return the resident forward's default ``cache_pages=None`` tables.
+
+    ``block_table``/``pool_block_table`` are the explicit page tables the
+    resident caller builds when it owns the whole shared cache, ``pool_offsets``
+    the per-slot stable strides, and ``pool_rows`` the physical pooled-cache
+    rows the resident ``POOL_TABLE_ROWS`` formula derives from the raw extent
+    (the final raw-page span is the shared scratch). Passing these tables to
+    :func:`models.glm5_3_flash.utils.build_indexer_chunk_metadata` reproduces
+    the exact production lowering the resident forward runs on every chunk.
     """
+    if request_slots <= 0:
+        raise ValueError("resident fixtures need a positive request slot count")
+    if table_max is None or table_max <= 0:
+        raise ValueError("resident fixtures need a positive resident table_max")
+    if pool_stride <= 0 or pool_stride % INDEX_STATE_BLOCK_SIZE:
+        raise ValueError("pool_stride must be a positive multiple of the pool page rows")
+    raw_rows = request_slots * table_max * BLOCK_SIZE
+    pool_rows = raw_rows // INDEX_KPOOL + BLOCK_SIZE // INDEX_KPOOL
+    block_table = torch.arange(request_slots * table_max, dtype=torch.int32).reshape(request_slots, table_max)
+    pool_block_table = torch.arange(
+        request_slots * (pool_stride // INDEX_STATE_BLOCK_SIZE), dtype=torch.int32,
+    ).reshape(request_slots, pool_stride // INDEX_STATE_BLOCK_SIZE)
+    pool_offsets = torch.arange(request_slots, dtype=torch.int32) * pool_stride
+    return block_table, pool_block_table, pool_offsets, pool_rows
+
+
+def _pool_batch(
+    tokens: int,
+    counts: tuple[int, ...],
+    positions: tuple[int, ...],
+    *,
+    pad_pages: bool = True,
+    page_map: str | None = None,
+    pool_stride: int | None = None,
+    request_slots: int | None = None,
+    table_max: int | None = None,
+):
+    """Derive the score/topk batch geometry from per-request pool counts.
+
+    Returns the leaf-aligned width, pooled-table row count, leaf-padded draw
+    row count, per-query segment metadata, and pool row indirection. ``positions``
+    contains request-local query positions. ``pool_stride`` places request
+    segments at fixed stable slot offsets and sizes the full resident pool
+    axis; without it, segments are compacted. ``pad_pages=False`` ends the
+    page table at the last live page. ``page_map`` selects the page table's
+    physical layout: the default resolves per layout — stable-slot batches
+    lower the current resident explicit ``pool_block_table`` through the
+    production metadata path (live pages mapped per slot, every unused entry
+    aliasing the shared scratch page and the pooled cache sized by the
+    resident row formula), while compact batches keep ``'perm'`` — and
+    ``'perm'``/``'identity'`` remain bench-only diagnostics for either layout
+    (a scattered permutation and the fully contiguous identity
+    table, not the production layout).
+    """
+    if page_map is None:
+        # Stable-slot batches default to the resident production layout; the
+        # compact batch uses the scattered perm diagnostic.
+        page_map = "resident" if pool_stride is not None else "perm"
     pools_true = sum(counts)
-    width = ((pools_true + 2 * SORT_TILE - 2) // SORT_TILE) * SORT_TILE
+    width = _pool_axis_width(
+        tokens, counts, pool_stride=pool_stride, request_slots=request_slots
+    )
     per_request = tokens // len(counts)
     if len(positions) != tokens or per_request * len(counts) != tokens:
         raise ValueError("positions must cover every token; counts must tile the batch")
@@ -1421,23 +1657,65 @@ def _pool_batch(tokens: int, counts: tuple[int, ...], positions: tuple[int, ...]
     for index, count in enumerate(counts):
         for row in range(per_request):
             token = index * per_request + row
-            seg_start[token] = sum(counts[:index])
+            seg_start[token] = index * pool_stride if pool_stride is not None else sum(counts[:index])
             pool_count[token] = min((positions[token] + 1) // INDEX_KPOOL, count)
+    if page_map == "resident":
+        # Stable-slot default: derive the page table from the production
+        # resident lowering rather than a hand-rolled layout. Every slot owns
+        # explicit pooled pages, each active request's live pages map through
+        # its table row, and every unused entry aliases the shared scratch
+        # page — the layout the resident forward passes on every chunk. The
+        # pooled cache carries the resident physical row count, not one page
+        # per score-axis entry.
+        if pool_stride is None:
+            raise ValueError("the resident page map needs the stable-slot pool layout")
+        slots = len(counts) if request_slots is None else request_slots
+        (block_table, pool_block_table, pool_offsets, pool_table_rows) = _resident_default_tables(
+            slots, table_max, pool_stride
+        )
+        lengths = torch.tensor(
+            [count * INDEX_KPOOL for count in counts] + [0] * (slots - len(counts)), dtype=torch.int64,
+        )
+        query_start_loc = torch.cumsum(torch.cat([torch.zeros(1, dtype=torch.int64), lengths]), 0)
+        metadata = build_forward_metadata(
+            query_start_loc, kv_seq_lens=torch.zeros(slots, dtype=torch.int32),
+            mla_block_table=block_table, index_block_table=block_table,
+            pool_block_table=pool_block_table, kda_state_rows=torch.arange(slots, dtype=torch.int32),
+        )
+        lowered = build_indexer_chunk_metadata(
+            metadata, block_table, pool_offsets, pools_cap=width, pool_rows=pool_table_rows,
+            pool_block_table=pool_block_table,
+        )
+        # Draw enough rows for both the leaf-padded table and resident cache;
+        # return the draw extent alongside the resident storage extent.
+        legacy_pages = width if pad_pages else (pools_true + INDEX_STATE_BLOCK_SIZE - 1) // INDEX_STATE_BLOCK_SIZE
+        legacy_table_rows = max(pool_table_rows, legacy_pages * INDEX_STATE_BLOCK_SIZE)
+        return width, pool_table_rows, legacy_table_rows, seg_start, pool_count, lowered["pool_blocks"]
     # The pooled table is paged at INDEX_STATE_BLOCK_SIZE rows, the metadata
     # module's granularity: each compacted page lands at its own physical base
-    # row, so the scorer's gather walks one entry per page. The page permutation
-    # makes a compacted span physically discontinuous — the gather's real
-    # workload. Table rows are therefore page-aligned. The default pads the
-    # table to the leaf-aligned width; the production page table instead ends
-    # at the last live page (``pad_pages=False``).
+    # row, so the scorer's gather walks one entry per page. The default
+    # permutation makes a compacted span physically discontinuous — the
+    # gather's scattered worst case; ``page_map`` above picks the layout. Table
+    # rows are therefore page-aligned. The default pads the table to the
+    # leaf-aligned width; the production page table instead ends at the last
+    # live page (``pad_pages=False``).
     if pad_pages:
-        pages = width // INDEX_STATE_BLOCK_SIZE
+        pages = width if pool_stride is not None else width // INDEX_STATE_BLOCK_SIZE
     else:
         pages = (pools_true + INDEX_STATE_BLOCK_SIZE - 1) // INDEX_STATE_BLOCK_SIZE
     pool_table_rows = pages * INDEX_STATE_BLOCK_SIZE
-    generator = torch.Generator().manual_seed(71)
-    pool_blocks = torch.randperm(pages, generator=generator).to(torch.int32) * INDEX_STATE_BLOCK_SIZE
-    return width, pool_table_rows, seg_start, pool_count, pool_blocks
+    if page_map == "perm":
+        generator = torch.Generator().manual_seed(71)
+        pool_blocks = torch.randperm(pages, generator=generator).to(torch.int32) * INDEX_STATE_BLOCK_SIZE
+    elif page_map == "identity":
+        pool_blocks = torch.arange(pages, dtype=torch.int32) * INDEX_STATE_BLOCK_SIZE
+    elif page_map == "runs":
+        pool_blocks = torch.arange(pages, dtype=torch.int32) * INDEX_STATE_BLOCK_SIZE
+        if pages > 10:
+            pool_blocks[[5, 9]] = pool_blocks[[9, 5]]
+    else:
+        raise ValueError(f"unknown page map {page_map!r}")
+    return width, pool_table_rows, pool_table_rows, seg_start, pool_count, pool_blocks
 
 
 def build_indexer_score_specs(
@@ -1446,6 +1724,10 @@ def build_indexer_score_specs(
     positions: tuple[int, ...] | None = None,
     *,
     pad_pages: bool = True,
+    page_map: str | None = None,
+    pool_stride: int | None = None,
+    request_slots: int | None = None,
+    table_max: int | None = None,
 ):
     """Build one deterministic two-request score batch.
 
@@ -1456,13 +1738,25 @@ def build_indexer_score_specs(
     business-shape benchmark points: one request whose positions are the
     ``history`` ramp in front of the measured chunk. ``pad_pages=False`` ends
     the pooled page table at the last live page instead of the leaf boundary.
+    ``page_map`` selects the page table's physical layout (see
+    :func:`_pool_batch`; the default is the resident table for stable-slot
+    batches and ``'perm'`` for compact ones) and with ``pool_stride`` the
+    resident layout also needs the resident ``table_max`` (raw block-table
+    pages per request slot) to size the shared pooled cache.
     """
     from golden import TensorSpec
 
     counts = (3000, 140) if counts is None else counts
     positions = (2, 6, 5000, 11999, 3, 7, 500, 559) if positions is None else positions
-    (width, pool_table_rows, seg_start, pool_count, pool_blocks) = _pool_batch(
-        tokens, counts, positions, pad_pages=pad_pages,
+    (width, pool_table_rows, prior_draw_rows, seg_start, pool_count, pool_blocks) = _pool_batch(
+        tokens,
+        counts,
+        positions,
+        pad_pages=pad_pages,
+        page_map=page_map,
+        pool_stride=pool_stride,
+        request_slots=request_slots,
+        table_max=table_max,
     )
 
     generator = torch.Generator().manual_seed(73)
@@ -1470,12 +1764,14 @@ def build_indexer_score_specs(
     def init_index_q():
         return torch.randn(tokens, INDEX_H, INDEX_DIM, generator=generator).bfloat16()
 
-    # One draw feeds both tables so every INT8 row and its scale stay paired;
-    # the rows read as already Hadamard-rotated prior state, the way earlier
-    # pool writes would have left them.
+    # One leaf-padded draw supplies paired INT8 keys and dequant scales in
+    # the Hadamard basis; the resident cache retains its row prefix.
     (prior_i8, prior_scale_col) = quantize_per_token_int8(
-        torch.randn(pool_table_rows, INDEX_DIM, generator=generator, dtype=torch.float32),
+        torch.randn(prior_draw_rows, INDEX_DIM, generator=generator, dtype=torch.float32),
     )
+    if prior_draw_rows > pool_table_rows:
+        prior_i8 = prior_i8[:pool_table_rows]
+        prior_scale_col = prior_scale_col[:pool_table_rows]
 
     def init_pool_cache():
         return prior_i8
@@ -1494,7 +1790,7 @@ def build_indexer_score_specs(
         TensorSpec("hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard),
         TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.int8, init_value=init_pool_cache),
         TensorSpec("pool_scale", [pool_table_rows, POOL_SCALE_WIDTH], torch.float32, init_value=init_pool_scale),
-        TensorSpec("pool_blocks", [width // INDEX_STATE_BLOCK_SIZE], torch.int32, init_value=lambda : pool_blocks),
+        TensorSpec("pool_blocks", [len(pool_blocks)], torch.int32, init_value=lambda : pool_blocks),
         TensorSpec("head_weights", [tokens, INDEX_H], torch.float32, init_value=init_head_weights),
         TensorSpec("seg_start", [tokens], torch.int32, init_value=lambda: seg_start),
         TensorSpec("pool_count", [tokens], torch.int32, init_value=lambda: pool_count),
@@ -1514,10 +1810,28 @@ def build_indexer_score_tail_specs():
     return build_indexer_score_specs(8, (132,), (1, 3, 7, 15, 31, 63, 255, 527), pad_pages=False)
 
 
+def build_indexer_score_run_specs():
+    """Score batch whose page table is mostly one physical run.
+
+    A ``pool_block_table=None`` metadata lowering is the identity map
+    (:func:`models.glm5_3_flash.utils.build_indexer_chunk_metadata`), so
+    whole-table contiguity is that path's common case; the fixtures above
+    permute pages instead and never exercise a run longer than one page. This
+    batch keeps the default two-request geometry but swaps two interior pages
+    of an identity table: two short runs, two break fallbacks, then one long
+    run spanning several gather chunks — every branch of the gather's run
+    merge under the same window/golden contract.
+    """
+    return build_indexer_score_specs(page_map="runs")
+
+
 def build_indexer_topk_specs(
     tokens: int = 8,
     counts: tuple[int, ...] | None = None,
     positions: tuple[int, ...] | None = None,
+    *,
+    pool_stride: int | None = None,
+    request_slots: int | None = None,
 ):
     """Score-and-select on one batch: synthetic scores, real windows.
 
@@ -1531,7 +1845,16 @@ def build_indexer_topk_specs(
 
     counts = (3000, 140) if counts is None else counts
     positions = (2, 6, 5000, 11999, 3, 7, 500, 559) if positions is None else positions
-    width, _, seg_start, pool_count, _ = _pool_batch(tokens, counts, positions)
+    # Synthetic-score batches use the permuted page-map geometry without a
+    # resident raw block-table extent.
+    width, _, _, seg_start, pool_count, _ = _pool_batch(
+        tokens,
+        counts,
+        positions,
+        page_map="perm",
+        pool_stride=pool_stride,
+        request_slots=request_slots,
+    )
 
     generator = torch.Generator().manual_seed(79)
 
@@ -1623,7 +1946,8 @@ def golden_indexer_score_case(tensors):
     )
     scores = tensors["index_scores"]
     scores[:] = FP32_NEG_INF
-    scores[:, : expected.shape[1]] = expected
+    width = min(expected.shape[1], scores.shape[1])
+    scores[:, :width] = expected[:, :width]
 
 
 def golden_indexer_topk_case(tensors):
@@ -1641,68 +1965,187 @@ def golden_indexer_expand_case(tensors):
     )
 
 
-def build_indexer_step_specs(tokens: int = 64, history: int = 0):
-    """Build one deterministic single-request prefill chunk, end to end.
+def build_indexer_step_specs(
+    tokens: int = 64,
+    history: int = 0,
+    requests: int = 1,
+    *,
+    pool_stride: int | None = None,
+    request_slots: int | None = None,
+    table_max: int | None = None,
+    page_map: str = "resident",
+):
+    """Build one deterministic packed prefill chunk, end to end.
 
-    One request holding ``history`` prior tokens receives a ``tokens``-row
-    chunk: the chunk's rows scatter into the raw support table through a paged
-    row map, every pool the chunk completes closes into the block-paged pooled
-    table, and each chunk query scores the request's whole visible segment
-    before the expansion. ``history=0`` is a fresh request's first chunk;
-    otherwise the first closing pool mixes cached rows with fresh ones and the
-    pooled table starts with the prior pools' rows — the checkpointed-chunk
-    shape. ``tokens``/``history`` drive the business-shape benchmark points the
-    same way the standalone cases' overrides do.
+    Equal requests divide the history and chunk rows. With ``pool_stride``,
+    request segments use stable slot offsets and the full resident pool axis,
+    matching ``build_indexer_chunk_metadata``; otherwise they use compact
+    offsets. Per-token lengths and causal windows remain request-local. The
+    stable-slot default (``page_map='resident'``) lowers the batch through the
+    production ``build_forward_metadata`` + ``build_indexer_chunk_metadata(
+    ..., pool_block_table=...)`` pair, so the pooled page table carries the
+    resident explicit per-slot live pages with every unused entry aliasing the
+    shared scratch page and the pooled cache keeps the resident physical row
+    count. The generator consumes one raw-page permutation followed by a
+    leaf-padded prior-pool draw. ``page_map='identity'`` uses a contiguous
+    identity table as an explicit non-production diagnostic. The compact
+    (``pool_stride=None``) layout ignores ``page_map``.
     """
     from golden import TensorSpec
 
     if tokens % PROJ_T_TILE:
         raise ValueError(f"the projection stage needs a token count that is a multiple of {PROJ_T_TILE}")
-    total = history + tokens
-    prior_pools = history // INDEX_KPOOL
-    pools_true = total // INDEX_KPOOL
-    events = pools_true - prior_pools
-    width = ((pools_true + 2 * SORT_TILE - 2) // SORT_TILE) * SORT_TILE
+    if requests < 1:
+        raise ValueError("requests must be >= 1")
+    if page_map not in ("resident", "identity"):
+        raise ValueError(f"unknown page map {page_map!r}")
+    per_tokens = tokens // requests if tokens % requests == 0 else None
+    per_history = history // requests if history % requests == 0 else None
+    if per_tokens is None or per_history is None:
+        raise ValueError("requests must divide tokens and history evenly")
+    per_total = per_history + per_tokens
+    if requests > 1 and per_total % INDEX_KPOOL:
+        raise ValueError(
+            "the multi-request geometry needs each request's span to be a multiple of "
+            f"{INDEX_KPOOL} so the packed pool count matches the single-request batch"
+        )
+    prior_pools = per_history // INDEX_KPOOL
+    pools_per_request = per_total // INDEX_KPOOL
+    actual_events = (pools_per_request - prior_pools) * requests
+    width = _pool_axis_width(
+        tokens,
+        (pools_per_request,) * requests,
+        pool_stride=pool_stride,
+        request_slots=request_slots,
+    )
+    events = width if pool_stride is not None else actual_events
+    if pool_stride is not None and (table_max is None or table_max <= 0):
+        raise ValueError("stable-slot fixtures need a positive resident table_max")
 
     generator = torch.Generator().manual_seed(97)
 
-    # Paged raw rows for every logical position, past and new, the way the
-    # metadata module hands them out: unordered pages, in-order rows.
-    needed_pages = (total + BLOCK_SIZE - 1) // BLOCK_SIZE + 1
-    pages = torch.randperm(max(8, needed_pages + 3), generator=generator)[:needed_pages]
+    if pool_stride is not None and page_map == "resident":
+        # Lower the batch through the production resident metadata path: the
+        # explicit pool_block_table maps each active slot's live pooled pages,
+        # every unused entry aliases the shared scratch page, the pooled cache
+        # carries the resident physical row count, and padded events target
+        # the scratch row with -1 members — exactly what the metadata module
+        # emits for the capacity the score axis reserves.
+        #
+        # Advance the shared generator by one raw-page permutation, then
+        # draw the leaf-padded prior-pool rows before the spec inputs.
+        total = history + tokens
+        needed_pages = (total + BLOCK_SIZE - 1) // BLOCK_SIZE + 1
+        torch.randperm(max(8, needed_pages + 3), generator=generator)[:needed_pages]
+        slots = requests if request_slots is None else request_slots
+        (block_table, pool_block_table, pool_offsets, pool_table_rows) = _resident_default_tables(
+            slots, table_max, pool_stride
+        )
+        prior_draw_rows = max(pool_table_rows, width * INDEX_STATE_BLOCK_SIZE)
+        lengths = torch.tensor(
+            [per_tokens if request < requests else 0 for request in range(slots)], dtype=torch.int64,
+        )
+        previous = torch.tensor(
+            [per_history if request < requests else 0 for request in range(slots)], dtype=torch.int64,
+        )
+        query_start_loc = torch.cumsum(torch.cat([torch.zeros(1, dtype=torch.int64), lengths]), 0)
+        metadata = build_forward_metadata(
+            query_start_loc, kv_seq_lens=previous, mla_block_table=block_table,
+            index_block_table=block_table, pool_block_table=pool_block_table,
+            kda_state_rows=torch.arange(slots, dtype=torch.int32),
+        )
+        lowered = build_indexer_chunk_metadata(
+            metadata, block_table, pool_offsets, pools_cap=width, pool_rows=pool_table_rows,
+            pool_block_table=pool_block_table,
+        )
+        index_slots = metadata.index_slots
+        pool_token_slots = lowered["pool_token_slots"]
+        pool_slots = lowered["pool_slots"]
+        page_bases = lowered["pool_blocks"]
+        seg_start = lowered["seg_start"]
+        pool_count = lowered["pool_count_tok"]
+        tail_start = lowered["tail_start"]
+        tail_count = lowered["tail_count"]
+        kv_len = lowered["kv_len_tok"]
+        pages = width
+    else:
+        # Paged raw rows for every logical position of every request, past and
+        # new, the way the metadata module hands them out: unordered pages,
+        # in-order rows. Each request owns a contiguous span of logical
+        # positions (its own prior tokens plus its chunk), mirroring
+        # production's per-request sequential physical block assignment.
+        total = history + tokens
+        needed_pages = (total + BLOCK_SIZE - 1) // BLOCK_SIZE + 1
+        pages = torch.randperm(max(8, needed_pages + 3), generator=generator)[:needed_pages]
 
-    def row_of(position):
-        return int(pages[position // BLOCK_SIZE]) * BLOCK_SIZE + position % BLOCK_SIZE
+        def row_of(request, position):
+            if pool_stride is None:
+                position += request * per_total
+            logical_page = position // BLOCK_SIZE
+            if pool_stride is not None:
+                if logical_page >= table_max:
+                    raise ValueError("request position exceeds the resident block table")
+                return (request * table_max + logical_page) * BLOCK_SIZE + position % BLOCK_SIZE
+            return int(pages[logical_page]) * BLOCK_SIZE + position % BLOCK_SIZE
 
-    index_slots = torch.tensor([row_of(history + t) for t in range(tokens)], dtype=torch.int32)
-    pool_token_slots = torch.tensor(
-        [[row_of(INDEX_KPOOL * pool + k) for k in range(INDEX_KPOOL)] for pool in range(prior_pools, pools_true)],
-        dtype=torch.int32,
-    )
+        index_slots = torch.tensor(
+            [
+                row_of(request, per_history + row)
+                for request in range(requests)
+                for row in range(per_tokens)
+            ],
+            dtype=torch.int32,
+        )
+        pool_token_slots = torch.full((events, INDEX_KPOOL), -1, dtype=torch.int32)
+        pool_token_slots[:actual_events] = torch.tensor(
+            [
+                [row_of(request, INDEX_KPOOL * pool + k) for k in range(INDEX_KPOOL)]
+                for request in range(requests)
+                for pool in range(prior_pools, pools_per_request)
+            ],
+            dtype=torch.int32,
+        )
 
-    # The pooled table is paged at INDEX_STATE_BLOCK_SIZE rows like the
-    # standalone fixtures: each compacted page lands at its own physical base,
-    # and a pool's physical row derives from its compacted id.
-    pages = width // INDEX_STATE_BLOCK_SIZE
-    pool_table_rows = pages * INDEX_STATE_BLOCK_SIZE
-    page_bases = torch.randperm(pages, generator=generator).to(torch.int32) * INDEX_STATE_BLOCK_SIZE
+        # The pooled table is paged at INDEX_STATE_BLOCK_SIZE rows like the
+        # standalone fixtures: each compacted page lands at its own physical
+        # base, and a pool's physical row derives from its compacted id. The
+        # stable-slot identity branch uses a contiguous diagnostic layout.
+        pages = width if pool_stride is not None else width // INDEX_STATE_BLOCK_SIZE
+        pool_table_rows = pages * INDEX_STATE_BLOCK_SIZE
+        prior_draw_rows = pool_table_rows
+        if pool_stride is None:
+            page_bases = torch.randperm(pages, generator=generator).to(torch.int32) * INDEX_STATE_BLOCK_SIZE
+        else:
+            page_bases = torch.arange(pages, dtype=torch.int32) * INDEX_STATE_BLOCK_SIZE
 
-    def pool_row_of(compacted):
-        return int(page_bases[compacted // INDEX_STATE_BLOCK_SIZE]) + compacted % INDEX_STATE_BLOCK_SIZE
+        def pool_row_of(compacted):
+            return int(page_bases[compacted // INDEX_STATE_BLOCK_SIZE]) + compacted % INDEX_STATE_BLOCK_SIZE
 
-    pool_slots = torch.tensor([pool_row_of(pool) for pool in range(prior_pools, pools_true)], dtype=torch.int32)
+        pool_slots = torch.full((events,), pool_table_rows - 1, dtype=torch.int32)
+        pool_slots[:actual_events] = torch.tensor(
+            [
+                pool_row_of(
+                    (request * pool_stride if pool_stride is not None else request * pools_per_request) + pool
+                )
+                for request in range(requests)
+                for pool in range(prior_pools, pools_per_request)
+            ],
+            dtype=torch.int32,
+        )
 
-    seg_start = torch.zeros(tokens, dtype=torch.int32)
-    pool_count = torch.zeros(tokens, dtype=torch.int32)
-    tail_start = torch.zeros(tokens, dtype=torch.int32)
-    tail_count = torch.zeros(tokens, dtype=torch.int32)
-    kv_len = torch.zeros(tokens, dtype=torch.int32)
-    for t in range(tokens):
-        length = history + t + 1
-        tail_count[t] = length % INDEX_KPOOL
-        tail_start[t] = length - int(tail_count[t])
-        pool_count[t] = min(length // INDEX_KPOOL, pools_true)
-        kv_len[t] = length
+        seg_start = torch.zeros(tokens, dtype=torch.int32)
+        pool_count = torch.zeros(tokens, dtype=torch.int32)
+        tail_start = torch.zeros(tokens, dtype=torch.int32)
+        tail_count = torch.zeros(tokens, dtype=torch.int32)
+        kv_len = torch.zeros(tokens, dtype=torch.int32)
+        for t in range(tokens):
+            request, row = divmod(t, per_tokens)
+            length = per_history + row + 1
+            tail_count[t] = length % INDEX_KPOOL
+            tail_start[t] = length - int(tail_count[t])
+            seg_start[t] = request * pool_stride if pool_stride is not None else request * pools_per_request
+            pool_count[t] = min(length // INDEX_KPOOL, pools_per_request)
+            kv_len[t] = length
 
     shapes = {
         "w_q_b": (Q_LORA, INDEX_H * INDEX_DIM),
@@ -1717,7 +2160,11 @@ def build_indexer_step_specs(tokens: int = 64, history: int = 0):
 
         return build
 
-    raw_rows = int(max(index_slots.max(), pool_token_slots.max())) + 1
+    if pool_stride is None:
+        raw_rows = int(max(index_slots.max(), pool_token_slots.max())) + 1
+    else:
+        raw_slots = requests if request_slots is None else request_slots
+        raw_rows = raw_slots * table_max * BLOCK_SIZE
 
     def init_raw_cache():
         # History rows arrive as earlier steps left them: BF16-projected keys
@@ -1726,13 +2173,14 @@ def build_indexer_step_specs(tokens: int = 64, history: int = 0):
         cache[:, :INDEX_DIM] = cache[:, :INDEX_DIM].bfloat16().float()
         return cache
 
-    # The pooled table starts as the quantized form earlier steps would have
-    # left behind: INT8 rows already rotated into the Hadamard basis, paired
-    # with their dequant scales, one draw feeding both so the pairs stay
-    # consistent.
+    # One leaf-padded draw supplies paired INT8 keys and dequant scales in
+    # the Hadamard basis; the resident cache retains its row prefix.
     (prior_i8, prior_scale_col) = quantize_per_token_int8(
-        torch.randn(pool_table_rows, INDEX_DIM, generator=generator, dtype=torch.float32),
+        torch.randn(prior_draw_rows, INDEX_DIM, generator=generator, dtype=torch.float32),
     )
+    if prior_draw_rows > pool_table_rows:
+        prior_i8 = prior_i8[:pool_table_rows]
+        prior_scale_col = prior_scale_col[:pool_table_rows]
 
     def init_pool_scale():
         # The writer replicates the scale across all POOL_SCALE_WIDTH lanes and
@@ -1797,10 +2245,12 @@ def golden_indexer_prefill_step_case(tensors):
     tensors["pool_cache"][:] = pool_cache
     tensors["pool_scale"][:] = pool_scale
     tensors["pool_valid"][:] = pool_valid
-    tensors["index_scores"][:] = golden_indexer_score(
+    expected_scores = golden_indexer_score(
         tensors["index_q"], tensors["hadamard"], tensors["pool_cache"], tensors["pool_scale"],
         tensors["pool_blocks"], tensors["head_weights"], tensors["seg_start"], tensors["pool_count"],
     )
+    score_width = tensors["index_scores"].shape[1]
+    tensors["index_scores"][:] = expected_scores[:, :score_width]
     (selected, valid) = golden_indexer_topk(tensors["index_scores"], tensors["seg_start"], tensors["pool_count"])
     tensors["selected_pools"][:] = selected
     tensors["selected_valid"][:] = valid
@@ -1943,16 +2393,26 @@ def golden_indexer_topk(
     seg_start: torch.Tensor,
     pool_count: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the selected segment-local pool ids and which of them are real."""
+    """Return the selected segment-local pool ids and which of them are real.
+
+    A window at or below ``KPOOL_SELECT_K`` pools takes the kernel's short
+    route: every visible pool is selected, materialized in compact id order.
+    The order inside the prefix is ABI-free (the consumer is a permutation-
+    invariant softmax), so this golden adopts the same identity convention and
+    the selection compares exactly against the short route.
+    """
     tokens = index_scores.shape[0]
     selected = torch.full((tokens, KPOOL_SELECT_K), -1, dtype=torch.int32)
     valid = torch.zeros(tokens, KPOOL_SELECT_K, dtype=torch.int32)
     for token in range(tokens):
         visible = max(int(pool_count[token]), 0)
         if visible > 0:
-            seg0 = int(seg_start[token])
             keep = min(KPOOL_SELECT_K, visible)
-            picked = torch.topk(index_scores[token, seg0 : seg0 + visible], keep).indices
+            if visible <= KPOOL_SELECT_K:
+                picked = torch.arange(keep)
+            else:
+                seg0 = int(seg_start[token])
+                picked = torch.topk(index_scores[token, seg0 : seg0 + visible], keep).indices
             selected[token, :keep] = picked.to(torch.int32)
             valid[token, :keep] = 1
     return selected, valid
@@ -2516,7 +2976,44 @@ def run_prefill_case(argv=None):
         help="run the case at a business shape without golden validation; the shape comes from --tokens/--history, timing from PYPTO_BENCH=1",
     )
     parser.add_argument("--history", type=int, default=0, help="history tokens in front of the --tokens chunk; defines the bench geometry")
+    parser.add_argument(
+        "--bench-requests",
+        dest="bench_requests",
+        type=int,
+        default=1,
+        metavar="N",
+        help="pack the bench as N equal active requests in the resident stable-slot "
+        "pool layout: request segments use fixed strides and the score/step fixtures "
+        "carry the current resident explicit pool_block_table with shared scratch "
+        "aliases (default 1 keeps the frozen shapes)",
+    )
+    parser.add_argument(
+        "--bench-page-map",
+        dest="bench_page_map",
+        choices=["resident", "perm", "identity"],
+        default=None,
+        help="bench-only pool page table for --case score: 'resident' lowers the current "
+        "resident explicit pool_block_table (live pages per slot, shared scratch aliases) "
+        "and is the multi-request default; 'identity' is the fully contiguous pre-rebase "
+        "diagnostic, NOT the production layout; 'perm' is the scattered diagnostic. "
+        "Single-request benches default to 'perm'",
+    )
     args = parser.parse_args(argv)
+
+    bench_pool_stride = None
+    bench_request_slots = None
+    bench_table_max = None
+    if args.bench_requests > 1:
+        if args.bench_requests > 16:
+            parser.error("--bench-requests cannot exceed the resident batch's 16 request slots")
+        per_request_span = (args.tokens + args.history) // args.bench_requests
+        max_seq_len = max(args.tokens, per_request_span)
+        bench_table_max = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        pool_pages_per_request = (max_seq_len + INDEX_KPOOL - 1) // INDEX_KPOOL
+        bench_pool_stride = (
+            (pool_pages_per_request + INDEX_STATE_BLOCK_SIZE - 1) // INDEX_STATE_BLOCK_SIZE
+        ) * INDEX_STATE_BLOCK_SIZE
+        bench_request_slots = 16
 
     def print_bench(label: str, result) -> None:
         stats = result.bench
@@ -2527,21 +3024,81 @@ def run_prefill_case(argv=None):
             f"[BENCH] {label}: device_us median={stats.device_us_median:.1f} min={stats.device_us_min:.1f} mean={stats.device_us_mean:.1f} max={stats.device_us_max:.1f} rounds={stats.rounds}",
         )
 
-    def bench_label(name: str, pools: int = 0) -> str:
+    def bench_label(name: str, pools: int = 0, width: int = 0) -> str:
         label = f"{name} T={args.tokens} history={args.history}"
+        if args.bench_requests > 1:
+            label += f" reqs={args.bench_requests}"
         if pools:
-            width = ((pools + 2 * SORT_TILE - 2) // SORT_TILE) * SORT_TILE
+            width = width or ((pools + 2 * SORT_TILE - 2) // SORT_TILE) * SORT_TILE
             label += f" pools={pools} width={width}"
         return label
 
     bench_counts = None
     bench_positions = None
     if args.bench:
-        pools = (args.tokens + args.history) // INDEX_KPOOL
-        bench_counts = (pools,)
-        bench_positions = tuple(range(args.history, args.history + args.tokens))
-        if args.tokens % 64:
-            parser.error("--bench needs a token count that is a multiple of 64")
+        if args.tokens % PROJ_T_TILE:
+            parser.error(f"--bench needs a token count that is a multiple of {PROJ_T_TILE}")
+        requests = args.bench_requests
+        if requests < 1:
+            parser.error("--bench-requests must be >= 1")
+        if requests > 1 and args.case in ("proj", "expand"):
+            parser.error(
+                f"--case {args.case} has no pool-space geometry (its shape follows "
+                "--tokens/--history alone); --bench-requests only packs the "
+                "score/topk/step batches"
+            )
+        span = args.tokens + args.history
+        if requests == 1:
+            bench_counts = (span // INDEX_KPOOL,)
+            bench_positions = tuple(range(args.history, args.history + args.tokens))
+        else:
+            # Resident multi-request packing: N active requests divide the
+            # tokens and history evenly. Each request has request-local
+            # metadata and a fixed pool stride in one of 16 stable slots;
+            # the explicit raw/pool block tables retain the unused-slot
+            # extents, with unused pooled entries aliasing the shared
+            # scratch page as in the resident metadata lowering.
+            if args.tokens % requests or args.history % requests or span // requests % INDEX_KPOOL:
+                parser.error(
+                    "--bench-requests must divide --tokens and --history evenly, with "
+                    "each request's span a multiple of the pool size "
+                    f"({INDEX_KPOOL}), so every resident request has whole-pool metadata"
+                )
+            per_tokens = args.tokens // requests
+            per_history = args.history // requests
+            per_pools = (per_tokens + per_history) // INDEX_KPOOL
+            bench_counts = (per_pools,) * requests
+            bench_positions = tuple(
+                position
+                for request in range(requests)
+                for position in range(per_history, per_history + per_tokens)
+            )
+        bench_width = _pool_axis_width(
+            args.tokens,
+            bench_counts,
+            pool_stride=bench_pool_stride,
+            request_slots=bench_request_slots,
+        )
+        # Pool-preparation cases use one block per 16 pages for large T and at
+        # most 48 persistent workers for small T. Other cases have no pool
+        # gather or scale-pack launch.
+        if args.case in ("score", "step", "all"):
+            bench_pages = bench_width if bench_pool_stride is not None else bench_width // INDEX_STATE_BLOCK_SIZE
+            bench_pool_chunks = (bench_pages + POOL_GATHER_PAGE_TILE - 1) // POOL_GATHER_PAGE_TILE
+            if args.tokens <= INDEXER_PERSISTENT_MAX_TOKENS:
+                bench_pool_blocks = min(bench_pool_chunks, POOL_GATHER_WORKERS)
+            else:
+                bench_pool_blocks = bench_pool_chunks
+            if bench_pool_blocks > 32256:
+                parser.error(
+                    f"bench pool table width {bench_width} needs {bench_pool_blocks} pool-preparation blocks, "
+                    "past the runtime int16 set_block_num limit (blocks ≤ 32256)"
+                )
+        if args.case in ("step", "all") and bench_pool_stride is not None and bench_width > 32256:
+            parser.error(
+                f"bench pool table width {bench_width} launches {bench_width} pool-write blocks, "
+                "past the runtime int16 set_block_num limit (blocks ≤ 32256)"
+            )
 
     def _paired_selected_scores(scores, seg0, selected):
         """Gather each row's selected scores; padding lanes read as ``-inf``."""
@@ -2669,9 +3226,27 @@ def run_prefill_case(argv=None):
             print_bench(label, results[-1])
     if args.case in ("score", "all"):
         if args.bench:
-            specs = build_indexer_score_specs(args.tokens, bench_counts, bench_positions)
+            if args.bench_page_map is not None and args.case == "all":
+                parser.error("--bench-page-map needs --case score (the probe measures the score stage alone)")
+            page_map = args.bench_page_map or ("resident" if requests > 1 else "perm")
+            if page_map == "resident" and requests < 2:
+                parser.error(
+                    "--bench-page-map resident needs --bench-requests > 1 "
+                    "(the resident explicit table lives in the stable-slot layout)"
+                )
+            specs = build_indexer_score_specs(
+                args.tokens,
+                bench_counts,
+                bench_positions,
+                page_map=page_map,
+                pool_stride=bench_pool_stride,
+                request_slots=bench_request_slots,
+                table_max=bench_table_max,
+            )
             extra = dict(golden_fn=None)
-            label = bench_label("score", bench_counts[0])
+            label = bench_label("score", sum(bench_counts), bench_width)
+            if requests > 1 or args.bench_page_map is not None:
+                label += f" pages={page_map}"
         else:
             specs = build_indexer_score_specs()
             extra = dict(
@@ -2705,6 +3280,23 @@ def run_prefill_case(argv=None):
                     compile_only=args.compile_only,
                 ),
             )
+            # Mostly-identity page table: the gather's run-merge branches (wide
+            # copies, break fallbacks, chunked long runs) need a contiguous
+            # table the permuted fixtures never produce.
+            results.append(
+                run(
+                    fn=indexer_score_test,
+                    specs=build_indexer_score_run_specs(),
+                    golden_fn=golden_indexer_score_case,
+                    rtol=1.0 / 128,
+                    atol=1e-4,
+                    compare_fn={
+                        "index_scores": score_window_compare,
+                    },
+                    config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                    compile_only=args.compile_only,
+                )
+            )
             # Stable request slots can leave a large leading pooled-key gap.
             # Only sixteen queries are live in this capacity-192 batch.
             sparse_specs = build_indexer_score_specs(192, (388,), (0,) * 192)
@@ -2728,9 +3320,15 @@ def run_prefill_case(argv=None):
             )
     if args.case in ("topk", "all"):
         if args.bench:
-            specs = build_indexer_topk_specs(args.tokens, bench_counts, bench_positions)
+            specs = build_indexer_topk_specs(
+                args.tokens,
+                bench_counts,
+                bench_positions,
+                pool_stride=bench_pool_stride,
+                request_slots=bench_request_slots,
+            )
             extra = dict(golden_fn=None)
-            label = bench_label("topk", bench_counts[0])
+            label = bench_label("topk", sum(bench_counts), bench_width)
         else:
             specs = build_indexer_topk_specs()
             extra = dict(
@@ -2788,17 +3386,25 @@ def run_prefill_case(argv=None):
         }
         # Two validation geometries: the request's first chunk, then a
         # checkpointed chunk whose first closing pool mixes two cached rows
-        # with two fresh ones (history not a multiple of the pool size).
-        if args.bench or args.history:
+        # with two fresh ones (history not a multiple of the pool size). An
+        # explicit multi-request geometry replaces the ramp with one tier.
+        if args.bench or args.history or args.bench_requests > 1:
             tiers = [(args.tokens, args.history)]
         else:
             tiers = [(args.tokens, 0), (args.tokens, 4 * args.tokens - 6)]
         for tier_tokens, tier_history in tiers:
-            specs = build_indexer_step_specs(tier_tokens, tier_history)
+            specs = build_indexer_step_specs(
+                tier_tokens,
+                tier_history,
+                requests=args.bench_requests,
+                pool_stride=bench_pool_stride,
+                request_slots=bench_request_slots,
+                table_max=bench_table_max,
+            )
             if args.bench:
                 pools = (tier_tokens + tier_history) // INDEX_KPOOL
                 extra = dict(golden_fn=None)
-                label = bench_label("step", pools)
+                label = bench_label("step", pools, bench_width)
             else:
                 extra = dict(
                     golden_fn=golden_indexer_prefill_step_case, rtol=1.0 / 64, atol=0.001,

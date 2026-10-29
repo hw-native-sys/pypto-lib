@@ -550,7 +550,14 @@ def decode_sparse_attn(
     NEG_INF must remain finite for rows whose every block is skipped."""
     t_dim = pl.tensor.dim(absorbed_query, 0)
 
-    raw_scores = pl.create_tensor([t_dim * ((LOCAL_H + DECODE_H_TILE - 1) // DECODE_H_TILE) * DECODE_H_PAD, TOPK_INDEX_WIDTH], dtype=pl.FP32)
+    # Allocate the full final tile, including the padding after TOPK_INDEX_WIDTH.
+    raw_scores = pl.create_tensor(
+        [
+            t_dim * ((LOCAL_H + DECODE_H_TILE - 1) // DECODE_H_TILE) * DECODE_H_PAD,
+            ((TOPK_INDEX_WIDTH + DECODE_ATTN_K_TILE - 1) // DECODE_ATTN_K_TILE) * DECODE_ATTN_K_TILE,
+        ],
+        dtype=pl.FP32,
+    )
     q_flat = pl.reshape(absorbed_query, [t_dim * LOCAL_H, KV_LORA])
     with pl.spmd(t_dim * ((LOCAL_H + DECODE_H_TILE - 1) // DECODE_H_TILE) * ((TOPK_INDEX_WIDTH + DECODE_ATTN_K_TILE - 1) // DECODE_ATTN_K_TILE), name_hint="mla_decode_scores") as scores_tid:
         item = pl.tile.get_block_idx()
@@ -562,32 +569,33 @@ def decode_sparse_attn(
             request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
             score_block = pl.full([DECODE_H_PAD, DECODE_ATTN_K_TILE], dtype=pl.FP32, value=0.0)
             for selected in pl.range(DECODE_ATTN_K_TILE):
-                position = pl.read(topk_indices, [token, w0 + selected])
-                if position >= 0:
-                    logical = pl.cast(position, pl.INDEX)
-                    page = pl.cast(pl.read(block_table, [request, logical // BLOCK_SIZE]), pl.INDEX)
-                    source = page * BLOCK_SIZE + logical % BLOCK_SIZE
-                    total = pl.full([1, DECODE_H_PAD], dtype=pl.FP32, value=0.0)
-                    correction = pl.full([1, DECODE_H_PAD], dtype=pl.FP32, value=0.0)
-                    for k0 in pl.pipeline(0, KV_LORA, 128, stage=1):
-                        query_part = q_flat[token * LOCAL_H + head * DECODE_H_TILE:token * LOCAL_H + head * DECODE_H_TILE + DECODE_H_TILE, k0:k0 + 128]
-                        query_value = pl.create_tensor([DECODE_H_PAD, 128], dtype=pl.FP32)
-                        query_value[:, :] = pl.full([DECODE_H_PAD, 128], dtype=pl.FP32, value=0.0)
-                        query_value[0:DECODE_H_TILE, :] = pl.cast(query_part, pl.FP32)
-                        key_value = pl.cast(latent_cache[source:source + 1, k0:k0 + 128], pl.FP32)
-                        products = pl.create_tensor([DECODE_H_PAD, 128], dtype=pl.FP32)
-                        products[:, :] = pl.col_expand_mul(query_value, key_value)
-                        high, low = accurate_row_sum_parts(products)
-                        part_sum = pl.reshape(high, [1, DECODE_H_PAD])
-                        tail = pl.reshape(low, [1, DECODE_H_PAD])
-                        updated = pl.add(total, part_sum)
-                        recovered = pl.sub(updated, total)
-                        error = pl.add(pl.sub(total, pl.sub(updated, recovered)), pl.sub(part_sum, recovered))
-                        correction = pl.add(correction, pl.add(error, tail))
-                        total = updated
-                    dot = pl.add(total, correction)
-                    for h in pl.range(DECODE_H_PAD):
-                        pl.write(score_block, [h, selected], pl.read(dot, [0, h]))
+                if w0 + selected < TOPK_INDEX_WIDTH:
+                    position = pl.read(topk_indices, [token, w0 + selected])
+                    if position >= 0:
+                        logical = pl.cast(position, pl.INDEX)
+                        page = pl.cast(pl.read(block_table, [request, logical // BLOCK_SIZE]), pl.INDEX)
+                        source = page * BLOCK_SIZE + logical % BLOCK_SIZE
+                        total = pl.full([1, DECODE_H_PAD], dtype=pl.FP32, value=0.0)
+                        correction = pl.full([1, DECODE_H_PAD], dtype=pl.FP32, value=0.0)
+                        for k0 in pl.pipeline(0, KV_LORA, 128, stage=1):
+                            query_part = q_flat[token * LOCAL_H + head * DECODE_H_TILE:token * LOCAL_H + head * DECODE_H_TILE + DECODE_H_TILE, k0:k0 + 128]
+                            query_value = pl.create_tensor([DECODE_H_PAD, 128], dtype=pl.FP32)
+                            query_value[:, :] = pl.full([DECODE_H_PAD, 128], dtype=pl.FP32, value=0.0)
+                            query_value[0:DECODE_H_TILE, :] = pl.cast(query_part, pl.FP32)
+                            key_value = pl.cast(latent_cache[source:source + 1, k0:k0 + 128], pl.FP32)
+                            products = pl.create_tensor([DECODE_H_PAD, 128], dtype=pl.FP32)
+                            products[:, :] = pl.col_expand_mul(query_value, key_value)
+                            high, low = accurate_row_sum_parts(products)
+                            part_sum = pl.reshape(high, [1, DECODE_H_PAD])
+                            tail = pl.reshape(low, [1, DECODE_H_PAD])
+                            updated = pl.add(total, part_sum)
+                            recovered = pl.sub(updated, total)
+                            error = pl.add(pl.sub(total, pl.sub(updated, recovered)), pl.sub(part_sum, recovered))
+                            correction = pl.add(correction, pl.add(error, tail))
+                            total = updated
+                        dot = pl.add(total, correction)
+                        for h in pl.range(DECODE_H_PAD):
+                            pl.write(score_block, [h, selected], pl.read(dot, [0, h]))
             score_row = (token * ((LOCAL_H + DECODE_H_TILE - 1) // DECODE_H_TILE) + head) * DECODE_H_PAD
             raw_scores[score_row:score_row + DECODE_H_PAD, w0:w0 + DECODE_ATTN_K_TILE] = score_block
 
