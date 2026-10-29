@@ -124,6 +124,7 @@ SCALE_WINDOW_ROWS = 2 * SCALE_LANE_ROWS
 DEQUANT_N_TILE = 1024  # D // this = 4 dequant blocks
 REDUCE_D_TILE = 1024  # D // this = 4 reduce blocks
 FIRST_EPOCH = 1
+QUANT_ROW_TILE = max(8, T)
 
 assert O_GROUPS == N_RANKS, f"TP-by-group needs one group per rank: O_GROUPS={O_GROUPS}, TP={N_RANKS}"
 
@@ -162,24 +163,25 @@ def _quant(
     with pl.spmd(QUANT_CHUNKS, name_hint="quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
         qb = pl.tile.get_block_idx()
         q0 = qb * QUANT_COL_TILE
-        g_amax = pl.full([1, T], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        g_amax = pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for pc in pl.unroll(QUANT_CHUNKS):
             p0 = pc * QUANT_COL_TILE
-            p_abs = pl.abs(o_r_pad[0:T, p0 : p0 + QUANT_COL_TILE])
-            g_amax = pl.maximum(g_amax, pl.reshape(pl.row_max(p_abs), [1, T]))
-        g_scale_num = pl.full([1, T], dtype=pl.FP32, value=INT8_SCALE_MAX)
+            p_abs = pl.abs(o_r_pad[0:QUANT_ROW_TILE, p0 : p0 + QUANT_COL_TILE])
+            g_amax = pl.maximum(g_amax, pl.reshape(pl.row_max(p_abs), [1, QUANT_ROW_TILE]))
+        g_scale_num = pl.full([1, QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
         g_sq_row = pl.div(g_scale_num, g_amax)
         # Every block folds to the same scale; one block records it.
         if qb == 0:
             sc_row = pl.recip(g_sq_row)
-            act_scale_col[0:T, 0:1] = pl.reshape(sc_row, [T, 1])
-        g_sq_col = pl.reshape(g_sq_row, [T, 1])
-        oc_q = o_r_pad[0:T, q0 : q0 + QUANT_COL_TILE]
+            scale_carrier = pl.reshape(sc_row, [QUANT_ROW_TILE, 1])
+            act_scale_col[0:T, 0:1] = pl.set_validshape(scale_carrier, T, 1)
+        g_sq_col = pl.reshape(g_sq_row, [QUANT_ROW_TILE, 1])
+        oc_q = o_r_pad[0:QUANT_ROW_TILE, q0 : q0 + QUANT_COL_TILE]
         oq_scaled = pl.row_expand_mul(oc_q, g_sq_col)
         oq_i32 = pl.cast(oq_scaled, target_type=pl.INT32, mode="rint")
         oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
         oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc", saturation_mode="on")
-        o_r_i8_pad[0:T, q0 : q0 + QUANT_COL_TILE] = oq_i8
+        o_r_i8_pad[0:T, q0 : q0 + QUANT_COL_TILE] = pl.set_validshape(oq_i8, T, QUANT_COL_TILE)
     return q_tid
 
 
@@ -332,10 +334,18 @@ def o_proj_tp_core(
         ) as dq_tid:
             dq0 = pl.tile.get_block_idx() * DEQUANT_N_TILE
             p_f32 = pl.cast(partial[0:T, dq0 : dq0 + DEQUANT_N_TILE], target_type=pl.FP32, mode="none")
-            p_act = pl.row_expand_mul(p_f32, act_scale_col[0:T, 0:1])
-            part_f32[0:T, dq0 : dq0 + DEQUANT_N_TILE] = pl.col_expand_mul(
-                p_act, wo_b_scale_2d[0:1, dq0 : dq0 + DEQUANT_N_TILE]
-            )
+            if T < 8:
+                for row in pl.range(T):
+                    p_scale = pl.read(act_scale_col, [row, 0])
+                    partial_row = p_f32[row : row + 1, :]
+                    scaled_row = pl.mul(partial_row, p_scale)
+                    channel_row = pl.col_expand_mul(scaled_row, wo_b_scale_2d[0:1, dq0 : dq0 + DEQUANT_N_TILE])
+                    part_f32[row : row + 1, dq0 : dq0 + DEQUANT_N_TILE] = channel_row
+            else:
+                p_act = pl.row_expand_mul(p_f32, act_scale_col[0:T, 0:1])
+                part_f32[0:T, dq0 : dq0 + DEQUANT_N_TILE] = pl.col_expand_mul(
+                    p_act, wo_b_scale_2d[0:1, dq0 : dq0 + DEQUANT_N_TILE]
+                )
 
         with pl.spmd(N_RANKS, name_hint="oproj_publish", deps=[dq_tid]) as publish_tid:
             peer = pl.tile.get_block_idx()
