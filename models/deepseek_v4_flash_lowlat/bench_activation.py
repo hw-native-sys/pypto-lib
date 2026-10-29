@@ -13,7 +13,7 @@ case the pre-task exists for: the raw grid-stride can land two live experts on
 one core while others idle.
 """
 import argparse, importlib, torch
-from golden import TensorSpec, ratio_reldiff, run_jit
+from golden import TensorSpec, ratio_reldiff, run
 from utils import int8_quant_per_row
 from expert_routed import (D, IDX_PAD, MOE_INTER, N_BANK, N_EXPERTS, N_SLOTS,
                            N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT,
@@ -63,7 +63,7 @@ w3, w3s = bank((MOE_INTER, D), 2.46e-2)
 w2, w2s = bank((D, MOE_INTER), 2.44e-2)
 
 fn = getattr(mod, a.variant + "_test")
-r = run_jit(
+r = run(
     fn=fn,
     specs=[
         TensorSpec("recv_x", [n_slots, RECV_MAX, D], torch.int8, init_value=lambda: xi),
@@ -77,10 +77,10 @@ r = run_jit(
         TensorSpec("routed_w3_scale", [n_bank, MOE_INTER], torch.float32, init_value=lambda: w3s),
         TensorSpec("routed_w2", [n_bank, D, MOE_INTER], torch.int8, init_value=lambda: w2),
         TensorSpec("routed_w2_scale", [n_bank, D], torch.float32, init_value=lambda: w2s),
-        TensorSpec("recv_y", [n_slots, RECV_MAX, D], torch.bfloat16, is_output=True),
+        TensorSpec("recv_y", [n_slots, RECV_MAX, D], torch.bfloat16),
     ],
     golden_fn=golden_expert_routed,
-    runtime_cfg=dict(platform="a2a3", device_id=a.device),
+    config=dict(backend_type='a2a3', execution_mode=False, device_id=a.device),
     rtol=1e-3, atol=1e-3,
     compare_fn={"recv_y": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01)},
 )

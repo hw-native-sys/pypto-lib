@@ -376,15 +376,15 @@ def build_tensor_specs(B, S):
         TensorSpec("hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
         TensorSpec("hc_scale", [3], torch.float32, init_value=init_hc_scale),
         TensorSpec("hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
-        TensorSpec("x_mixed", [T, D], torch.bfloat16, is_output=True),
-        TensorSpec("post", [T, HC_MULT], torch.float32, is_output=True),
-        TensorSpec("comb", [T, HC_MULT * HC_MULT], torch.float32, is_output=True),
+        TensorSpec("x_mixed", [T, D], torch.bfloat16),
+        TensorSpec("post", [T, HC_MULT], torch.float32),
+        TensorSpec("comb", [T, HC_MULT * HC_MULT], torch.float32),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
 
     MODES = {"decode": (DECODE_BATCH, DECODE_SEQ)}
 
@@ -404,15 +404,16 @@ if __name__ == "__main__":
     for mode_name in modes_to_run:
         B, S = MODES[mode_name]
         print(f"--- hc_pre {mode_name}: B={B}, S={S} ---")
-        result = run_jit(
+        result = run(
             fn=hc_pre_test,
             specs=build_tensor_specs(B, S),
             golden_fn=golden_hc_pre,
             runtime_dir=args.runtime_dir,
             golden_data=args.golden_data,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
-                platform=args.platform,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.platform.removesuffix("sim"),
+                execution_mode=args.platform.endswith("sim"),
                 device_id=args.device,
                 enable_chip_swimlane=args.enable_chip_swimlane,
             ),

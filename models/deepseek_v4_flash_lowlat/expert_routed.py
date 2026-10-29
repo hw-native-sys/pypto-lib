@@ -542,13 +542,13 @@ def build_tensor_specs(merged=False):
         TensorSpec("routed_w3_scale", [n_bank, MOE_INTER], torch.float32, init_value=lambda: w3_s),
         TensorSpec("routed_w2", [n_bank, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
         TensorSpec("routed_w2_scale", [n_bank, D], torch.float32, init_value=lambda: w2_s),
-        TensorSpec("recv_y", [n_slots, RECV_MAX, D], torch.bfloat16, is_output=True),
+        TensorSpec("recv_y", [n_slots, RECV_MAX, D], torch.bfloat16),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -575,16 +575,17 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         compile_only=args.compile_only,
         fn=expert_routed_test,
         specs=build_tensor_specs(),
         golden_fn=golden_expert_routed,
         golden_data=args.golden_data,
         save_data=args.save_data,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
-            platform=args.platform,
+        config=dict(
+            dump_passes=args.dump_passes,
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.platform.endswith("sim"),
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

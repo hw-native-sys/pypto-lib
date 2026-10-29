@@ -120,13 +120,13 @@ def build_tensor_specs(B, S):
         TensorSpec("residual", [T, HC_MULT, D],           torch.float32,  init_value=init_residual),
         TensorSpec("post",     [T, HC_MULT],              torch.float32,  init_value=init_post),
         TensorSpec("comb",     [T, HC_MULT * HC_MULT],    torch.float32,  init_value=init_comb),
-        TensorSpec("y",        [T, HC_MULT, D],           torch.float32,  is_output=True),
+        TensorSpec("y",        [T, HC_MULT, D],           torch.float32),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import run
 
     MODES = {"decode": (DECODE_BATCH, DECODE_SEQ)}
 
@@ -145,13 +145,14 @@ if __name__ == "__main__":
     for mode_name in modes_to_run:
         B, S = MODES[mode_name]
         print(f"--- hc_post {mode_name}: B={B}, S={S} ---")
-        result = run_jit(
+        result = run(
             fn=hc_post_test,
             specs=build_tensor_specs(B, S),
             golden_fn=golden_hc_post,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
-                platform=args.platform,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.platform.removesuffix("sim"),
+                execution_mode=args.platform.endswith("sim"),
                 device_id=args.device,
                 enable_chip_swimlane=args.enable_chip_swimlane,
             ),

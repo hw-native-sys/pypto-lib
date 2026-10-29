@@ -204,7 +204,7 @@ def build_tensor_specs():
     specs = [
         TensorSpec("input_ids", [N_RANKS, T], torch.int64, init_value=init_input_ids),
         TensorSpec("embed_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_embed_weight),
-        TensorSpec("hidden_states", [N_RANKS, T, D], torch.bfloat16, is_output=True),
+        TensorSpec("hidden_states", [N_RANKS, T, D], torch.bfloat16),
     ]
     for spec in specs:
         if spec.name == "embed_weight":
@@ -215,7 +215,7 @@ def build_tensor_specs():
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import run
 
     parser = argparse.ArgumentParser(description="DeepSeek-V4 Flash TP vocab-sharded embedding.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -230,19 +230,17 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
 
-    result = run_jit(
+    result = run(
         fn=l3_tp_embedding,
         specs=build_tensor_specs(),
         golden_fn=golden_tp_embedding,
         compile_only=args.compile_only,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids,
-                num_sub_workers=0,
-            ),
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.platform.endswith("sim"),
         ),
-        runtime_cfg=dict(platform=args.platform),
         rtol=0.0,
         atol=0.0,
     )

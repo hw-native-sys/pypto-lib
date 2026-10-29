@@ -708,7 +708,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
         TensorSpec("routed_w3_scale",  [N_RANKS, N_BANK, MOE_INTER],    torch.float32, init_value=lambda: rw3_s),
         TensorSpec("routed_w2",        [N_RANKS, N_BANK, D, MOE_INTER], torch.int8,    init_value=lambda: rw2_i8),
         TensorSpec("routed_w2_scale",  [N_RANKS, N_BANK, D],            torch.float32, init_value=lambda: rw2_s),
-        TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.float32, is_output=True),
+        TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.float32),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
         ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
     ]
@@ -734,7 +734,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
 if __name__ == "__main__":
     import argparse
 
-    from golden import ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -762,7 +762,7 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
 
-    result = run_jit(
+    result = run(
         fn=l3_moe,
         specs=build_tensor_specs(layer_id=args.layer_id, num_tokens=args.num_tokens),
         golden_fn=golden_moe,
@@ -770,15 +770,11 @@ if __name__ == "__main__":
         save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids,
-                num_sub_workers=0,
-            ),
-        ),
-        runtime_cfg=dict(
-            platform=args.platform,
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.platform.endswith("sim"),
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_pmu=args.enable_pmu,
             log_level=args.log_level,

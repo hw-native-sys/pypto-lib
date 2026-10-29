@@ -604,7 +604,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
+        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("swa_slot_mapping", [T], torch.int64, init_value=init_swa_slot_mapping),
         TensorSpec("swa_indices", [T, WIN], torch.int32, init_value=init_swa_indices),
         TensorSpec("swa_lens", [T], torch.int32, init_value=init_swa_lens),
@@ -613,14 +613,14 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [T, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_out", [T, HC_MULT, D], torch.float32),
     ]
 
 
 def build_l3_tensor_specs(start_pos=None):
     """The single-card SWA fixture, replicated per rank, with the o-proj weights sharded.
 
-    `run_jit` binds specs positionally, so the two shards must sit exactly where
+    `run` binds specs positionally, so the two shards must sit exactly where
     `wo_a` / `wo_b` sat in the replicated list.
     """
     import torch
@@ -633,10 +633,6 @@ def build_l3_tensor_specs(start_pos=None):
     def ranked(spec):
         init = spec.init_value
         stacked = None if init is None else (lambda f=init: torch.stack([f()] * OPROJ_N_RANKS, dim=0))
-        if spec.is_output:
-            # An in-out (kv_cache) keeps its seed as well as its output role.
-            return TensorSpec(spec.name, [OPROJ_N_RANKS] + list(spec.shape), spec.dtype,
-                              init_value=stacked, is_output=True)
         return TensorSpec(
             spec.name, [OPROJ_N_RANKS] + list(spec.shape), spec.dtype,
             init_value=stacked, resident=spec.resident)
@@ -681,7 +677,7 @@ def golden_attention_swa_l3(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, ratio_reldiff, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -703,20 +699,18 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= OPROJ_N_RANKS, f"need at least {OPROJ_N_RANKS} devices, got {device_ids}"
 
-    result = run_jit(
+    result = run(
         compile_only=args.compile_only,
         fn=l3_attention_swa,
         specs=build_l3_tensor_specs(args.start_pos),
         golden_fn=golden_attention_swa_l3,
         runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:OPROJ_N_RANKS], num_sub_workers=0),
-        ),
-        runtime_cfg=dict(
-            platform=args.platform,
+            distributed_config=DistributedConfig(device_ids=device_ids[:OPROJ_N_RANKS], num_sub_workers=0),
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.platform.endswith("sim"),
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         rtol=1e-2,

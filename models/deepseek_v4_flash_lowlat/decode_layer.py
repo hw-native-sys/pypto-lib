@@ -896,7 +896,6 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
             [N_RANKS, *spec.shape],
             spec.dtype,
             init_value=_ranked_init(spec, replicated=True),
-            is_output=name == "kv_cache",
         )
         for name, spec in attention_specs
     ]
@@ -956,9 +955,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     # exactly ``replicated_attention`` (every attention param that is not a
     # KV/state cache or per-step metadata); the MoE set adds the FFN/gate/expert
     # weights and the static tid2eid route table. The KV/state caches
-    # (RESIDENT_CACHE_NAMES) are kept resident too — the written kv_cache is also
-    # is_output=True (line above) and read back once at the end for validation;
-    # the others are read-only inputs. NOT resident: the per-step slot mappings /
+    # (RESIDENT_CACHE_NAMES) are kept resident too. The signature declares
+    # kv_cache InOut for final validation readback. NOT resident: the per-step slot mappings /
     # block tables / ids / position_ids / kv_seq_lens, the input activation
     # (x_hc), and the output (x_next), which change per token.
     RESIDENT_WEIGHT_NAMES = replicated_attention | {
@@ -977,7 +975,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
             spec.resident = "stacked"
 
     specs.extend([
-        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32),
         ScalarSpec("layer_id", torch.int32, layer_id),
     ])
     return specs
@@ -985,7 +983,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, ratio_reldiff, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1017,7 +1015,7 @@ if __name__ == "__main__":
     host_fn = l3_decode_layer
     golden_fn = golden_decode_layer_auto
 
-    result = run_jit(
+    result = run(
         fn=host_fn,
         specs=build_tensor_specs(
             start_pos=args.start_pos,
@@ -1028,15 +1026,11 @@ if __name__ == "__main__":
         save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:N_RANKS],
-                num_sub_workers=0,
-            ),
-        ),
-        runtime_cfg=dict(
-            platform=args.platform,
+            distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.platform.endswith("sim"),
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         rtol=1e-3,

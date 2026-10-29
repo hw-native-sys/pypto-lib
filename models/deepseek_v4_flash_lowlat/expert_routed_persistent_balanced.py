@@ -272,7 +272,7 @@ def expert_routed_persistent_balanced_test(
 if __name__ == "__main__":
     import argparse
     from config import TP
-    from golden import ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -288,16 +288,17 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
+    result = run(
         compile_only=args.compile_only,
         fn=expert_routed_persistent_balanced_test,
         specs=build_tensor_specs(merged=True),
         golden_fn=golden_expert_routed,
         golden_data=args.golden_data,
         save_data=args.save_data,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
-            platform=args.platform,
+        config=dict(
+            dump_passes=args.dump_passes,
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.platform.endswith("sim"),
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
