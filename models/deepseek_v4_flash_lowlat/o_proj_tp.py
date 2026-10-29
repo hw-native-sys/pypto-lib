@@ -7,29 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=8  # CI: 8-card TP run; the deployment world size, borrowed via task-submit --device-num
-"""DeepSeek-V4 grouped output projection, sharded one group per card.
-
-The projection is `attn_out = sum_g dequant(quant(o_packed[g] @ wo_a[g]) @ wo_b[:, g])`.
-`O_GROUPS == TP == 8`, so the group axis is a shard axis with no input collective:
-group g is heads [8g, 8g+8), whose `o_packed` rows every card already produced.
-
-Card r runs chain r only, then all-reduces its partial across the eight cards.
-
-The all-reduce is the window summing itself. Each rank dequantizes its own partial
-locally -- `cast * act_scale * wo_b_scale`, both scales folded in, the per-channel
-one legally because it is shared and so distributes over the cross-rank sum -- and
-then ATOMIC-ADDs the FP32 result into one shared band that every rank targets. What
-comes back is finished, so `oproj_reduce` only narrows it to BF16 and zeroes the
-lane for its next use.
-
-Two consequences worth knowing before touching this. The band must start at zero and
-`alloc_window_buffer` does not promise that, so the first call of a dispatch zeroes
-both lanes and barriers (`oproj_band_init`); every later call is covered by the
-reduce's zero-back. And the cross-rank sum order is now whatever the atomics land
-in, so the result is no longer bit-reproducible run to run, nor term-for-term equal
-to a single card's `g` loop -- it stays well inside tolerance, but a bit-exact
-comparison against the replicated form will not hold.
-"""
+"""DeepSeek-V4 grouped output projection with rank-ordered FP32 reduction."""
 
 import sys as _sys
 
@@ -130,7 +108,7 @@ PRE_SYNC_PEERS = N_RANKS if PRE_SYNC else 0
 # every peer published e-1, hence finished reading e-2. A layer stack calls this
 # projection once per CSA layer off one window, so the lanes are what make the
 # reuse safe.
-REDUCE_LANE_ROWS = T_PAD  # one shared band every rank adds into, not a slot per rank
+REDUCE_LANE_ROWS = N_RANKS * T_PAD
 REDUCE_WINDOW_ROWS = 2 * REDUCE_LANE_ROWS
 # One contiguous [T, 1] block per rank, so a peer reads its carrier with a
 # direct ND2ND load and no reshape.
@@ -145,10 +123,6 @@ SCALE_WINDOW_ROWS = 2 * SCALE_LANE_ROWS
 # 64.4 / 63.7 / 64.1 at 8 / 4 / 2 reduce blocks.
 DEQUANT_N_TILE = 1024  # D // this = 4 dequant blocks
 REDUCE_D_TILE = 1024  # D // this = 4 reduce blocks
-# The band init writes both lanes, so it moves 8x the reduce's bytes. 1024 is both
-# its optimum and its ceiling: 2048 needs a [2 * T_PAD, 2048] FP32 tile and fails
-# with `Vec buffer usage (262144 bytes) exceeds platform limit (188416 bytes)`.
-BAND_INIT_D_TILE = 1024
 FIRST_EPOCH = 1
 
 assert O_GROUPS == N_RANKS, f"TP-by-group needs one group per rank: O_GROUPS={O_GROUPS}, TP={N_RANKS}"
@@ -300,39 +274,16 @@ def o_proj_tp_core(
 
     lane_base = pl.cast(((oproj_epoch - 1) % 2) * REDUCE_LANE_ROWS, pl.INDEX)
     scale_lane_base = pl.cast(((oproj_epoch - 1) % 2) * SCALE_LANE_ROWS, pl.INDEX)
-    my_row = lane_base  # every rank adds into the same band
+    my_row = lane_base + pl.cast(my_rank, pl.INDEX) * T_PAD
     my_scale_row = scale_lane_base + pl.cast(my_rank, pl.INDEX) * T
     row_base_o = pl.cast(my_rank, pl.INDEX) * T
     wo_b_scale_2d = pl.reshape(wo_b_scale, [1, D])
 
-    # An accumulation band is only correct when it starts at zero, and
-    # `alloc_window_buffer` does not promise zeroed memory. `oproj_reduce` zeroes the
-    # lane it read, which covers every later call; the first call of a dispatch has no
-    # predecessor to have done that, so it zeroes both lanes here. The trip count is 1
-    # only at FIRST_EPOCH, and the task depends on nothing in the projection, so a
-    # layer stack pays it once per dispatch and the scheduler is free to overlap it
-    # with whatever ran before the projection.
-    band_init_trips = FIRST_EPOCH + 1 - oproj_epoch
-    with pl.spmd(D // BAND_INIT_D_TILE, name_hint="oproj_band_init", allow_early_resolve=True) as band_tid:
-        bi0 = pl.tile.get_block_idx() * BAND_INIT_D_TILE
-        for _ in pl.range(band_init_trips):
-            reduce_window[0:REDUCE_WINDOW_ROWS, bi0 : bi0 + BAND_INIT_D_TILE] = pl.full(
-                [REDUCE_WINDOW_ROWS, BAND_INIT_D_TILE], dtype=pl.FP32, value=0.0
-            )
-
     with pl.manual_scope():
-        # Anchor the chain on a read of the local attention output, so proj_a
-        # carries a real edge instead of being ready at submit.
-        # Leading barrier. Emitted unconditionally so both variants carry the
-        # same graph shape; --pre-sync only changes the trip count from 0 to
-        # N_RANKS. With it on, host dispatch skew is absorbed here and the reduce
-        # barrier below measures protocol cost instead of rank start spread.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="oproj_pre_sync", deps=[band_tid]) as _sync_tid:
+        # Optional leading barrier, anchored on the actual attention producer.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="oproj_pre_sync", deps=[upstream]) as _sync_tid:
             _sync_anchor = pl.read(o_packed, [0, 0])
-            # The barrier is what makes the band init safe -- without it a fast peer
-            # could add its first contribution before this rank has zeroed -- so it
-            # runs whenever the init does, and --pre-sync forces it on every call.
-            sync_peers = pl.max(PRE_SYNC_PEERS, band_init_trips * N_RANKS)
+            sync_peers = PRE_SYNC_PEERS
             for peer in pl.range(sync_peers):
                 pld.system.notify(
                     target=sync_signal,
@@ -395,7 +346,6 @@ def o_proj_tp_core(
                 dst_offsets=[my_row, 0],
                 src_offsets=[0, 0],
                 shape=[T, D],
-                atomic=pld.AtomicType.Add,
                 chunk_rows=T,
                 chunk_cols=PUT_CHUNK_COLS,
                 pipeline=PUT_PIPELINE,
@@ -424,11 +374,7 @@ def o_proj_tp_core(
                     cmp=pld.WaitCmp.Ge,
                 )
 
-        # Sum the rank slots in rank order -- the same term order a single card's
-        # g loop uses -- then apply the per-channel weight scale and narrow to
-        # BF16. Peer slots are addressed by a loop variable, so the window is
-        # read through pl.load; the weight scale is loaded the same way to keep
-        # both multiply operands at tile level.
+        # Carry the all-peer completion fence outside the manual scope.
         barrier_out[0] = barrier_tid
 
     # The reduce is the sole attn_out writer and must sit OUTSIDE the manual scope:
@@ -442,16 +388,13 @@ def o_proj_tp_core(
         D // REDUCE_D_TILE, name_hint="oproj_reduce", deps=[barrier_out[0]], allow_early_resolve=True
     ) as _reduce_tid:
         d0 = pl.tile.get_block_idx() * REDUCE_D_TILE
-        # The band summed itself on the way in, so this only narrows it -- then it
-        # zeroes what it just read, which is what leaves the lane at zero for its next
-        # use. Safe two epochs out: a peer cannot publish epoch e+2 before its epoch
-        # e+1 reduce, which waits on this rank's epoch e+1 notify, which this store
-        # precedes.
-        acc = pl.load(reduce_window, [lane_base, d0], [T, REDUCE_D_TILE])
-        pl.store(pl.cast(acc, target_type=pl.BF16, mode="rint"), [0, d0], attn_out)
-        reduce_window[lane_base : lane_base + T, d0 : d0 + REDUCE_D_TILE] = pl.full(
-            [T, REDUCE_D_TILE], dtype=pl.FP32, value=0.0
-        )
+        acc = pl.tile.full([T, REDUCE_D_TILE], dtype=pl.FP32, value=0.0)
+        for source_rank in pl.range(N_RANKS):
+            source_row = lane_base + source_rank * T_PAD
+            partial_rank = pl.load(reduce_window, [source_row, d0], [T, REDUCE_D_TILE])
+            acc = pl.add(acc, partial_rank)
+        narrowed = pl.cast(acc, target_type=pl.BF16, mode="rint")
+        pl.store(narrowed, [0, d0], attn_out)
 
     return attn_out
 
@@ -679,14 +622,14 @@ def build_tensor_specs():
             init_value=lambda: torch.zeros(N_RANKS, EVICT_BLOCKS, EVICT_CHUNK, dtype=torch.int8),
             resident="stacked",
         ),
-        TensorSpec("attn_out", [N_RANKS, T, D], torch.bfloat16, is_output=True),
+        TensorSpec("attn_out", [N_RANKS, T, D], torch.bfloat16),
     ]
     return specs
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run
     from pypto.ir.distributed_compiled_program import DistributedConfig
 
     parser = argparse.ArgumentParser()
@@ -739,22 +682,18 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
-    result = run_jit(
+    result = run(
         fn=l3_o_proj_tp,
         specs=build_tensor_specs(),
         golden_fn=golden_tp,
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
-        compile_cfg=dict(
+        config=dict(
             dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:N_RANKS],
-                num_sub_workers=0,
-            ),
-        ),
-        runtime_cfg=dict(
-            platform=args.platform,
+            distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
+            backend_type=args.platform.removesuffix("sim"),
+            execution_mode=args.platform.endswith("sim"),
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_pmu=args.enable_pmu,
         ),
