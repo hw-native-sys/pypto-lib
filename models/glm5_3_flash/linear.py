@@ -139,7 +139,8 @@ def w8a8_projection_fp32(
     rows = pl.tensor.dim(x, 0)
     token_scale = pl.create_tensor([rows, 8], dtype=pl.FP32)
     quantized = pl.create_tensor([rows, K_DIM], dtype=pl.INT8)
-    quantize_bf16_rows(x, quantized, token_scale)
+    x_rows = pl.reshape(x, [rows, K_DIM])
+    quantize_bf16_rows(x_rows, quantized, token_scale)
     for block in pl.spmd(((rows + 15) // 16) * ((N_DIM + 127) // 128), name_hint="w8a8_projection"):
         row0 = block // ((N_DIM + 127) // 128) * 16
         col0 = block % ((N_DIM + 127) // 128) * 128
