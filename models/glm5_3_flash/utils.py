@@ -105,7 +105,7 @@ class ForwardMetadata:
         pool_slots: ``[tokens]`` flattened physical row of the **pooled** state this
             token belongs to, one row per ``index_kpool`` tokens. Tokens inside the
             same pool share a row, and the row is only complete once the pool closes.
-        kda_state_rows: ``[requests]`` row in the KDA conv and recurrent state pools.
+        kda_state_rows: seed/working rows and two checkpoint offset/row pairs per request.
         pool_count: ``[requests]`` number of complete indexer pools.
         tail_start: ``[requests]`` first raw index of the incomplete tail pool.
         tail_count: ``[requests]`` tokens in that tail (``0 .. index_kpool - 1``).
@@ -128,59 +128,14 @@ class ForwardMetadata:
     tail_count: torch.Tensor
 
 
-class SharedCachePages:
-    """Own a bounded pool of raw/latent pages shared by persistent request slots."""
+class CacheTables:
+    """Lower scheduler-owned attention pages into GLM cache tables."""
 
-    def __init__(self, requests: int, max_context: int, cache_tokens: int):
-        if min(requests, max_context, cache_tokens) <= 0 or cache_tokens % BLOCK_SIZE:
-            raise ValueError("cache geometry must be positive with a page-aligned token budget")
+    def __init__(self, requests: int, max_context: int):
+        if min(requests, max_context) <= 0:
+            raise ValueError("cache table geometry must be positive")
         self.max_context = max_context
         self.table = torch.full((requests, (max_context + BLOCK_SIZE - 1) // BLOCK_SIZE), -1, dtype=torch.int32)
-        self.owners = torch.full((cache_tokens // BLOCK_SIZE,), -1, dtype=torch.int32)
-
-    def reserve(self, lengths: torch.Tensor) -> list[tuple[int, int, int]]:
-        """Reserve all extensions atomically; keep pages owned after a failed device dispatch."""
-        lengths = torch.as_tensor(lengths, dtype=torch.int64)
-        if lengths.shape != self.table.shape[:1] or ((lengths < 0) | (lengths > self.max_context)).any():
-            raise ValueError("request lengths must fit the configured context limit")
-        required = (lengths + BLOCK_SIZE - 1) // BLOCK_SIZE
-        allocated = (self.table >= 0).sum(dim=1)
-        missing = (required - allocated).clamp_min(0)
-        free = torch.nonzero(self.owners < 0, as_tuple=False).flatten().tolist()
-        if int(missing.sum()) > len(free):
-            raise MemoryError(
-                "shared cache token budget exhausted; reset completed requests or increase --cache-tokens"
-            )
-        reservations = []
-        cursor = 0
-        for request, count in enumerate(missing.tolist()):
-            for logical in range(int(allocated[request]), int(allocated[request]) + count):
-                physical = free[cursor]
-                cursor += 1
-                self.table[request, logical] = physical
-                self.owners[physical] = request
-                reservations.append((request, logical, physical))
-        return reservations
-
-    def cancel_reservation(self, reservations: list[tuple[int, int, int]]) -> None:
-        """Cancel extensions only before any device write can have occurred."""
-        for request, logical, physical in reversed(reservations):
-            if int(self.table[request, logical]) != physical or int(self.owners[physical]) != request:
-                raise ValueError("cache reservation no longer belongs to its request")
-            self.table[request, logical] = -1
-            self.owners[physical] = -1
-
-    def release(self, requests: list[int]) -> None:
-        """Release pages after the caller has cleared their device payloads and scales."""
-        if len(set(requests)) != len(requests) or any(
-            type(slot) is not int or slot not in range(self.table.shape[0]) for slot in requests
-        ):
-            raise ValueError("cache release needs unique valid request slots")
-        for request in requests:
-            physical = self.table[request]
-            physical = physical[physical >= 0].long()
-            self.owners[physical] = -1
-            self.table[request].fill_(-1)
 
     def pool_table(self) -> torch.Tensor:
         """Map each logical four-pool page onto its raw page's pooled-key storage."""
@@ -197,12 +152,6 @@ class SharedCachePages:
         """Pack score segments in request order, retaining page-aligned private visibility."""
         spans = (self.table >= 0).sum(dim=1) * (BLOCK_SIZE // INDEX_KPOOL)
         return torch.cat((torch.zeros(1, dtype=torch.int64), spans.cumsum(0)[:-1])).int()
-
-
-def request_ids_from_starts(query_start_loc: torch.Tensor) -> torch.Tensor:
-    """Expand packed cumulative query lengths into one request id per token."""
-    lengths = query_start_loc[1:].to(torch.int64) - query_start_loc[:-1].to(torch.int64)
-    return torch.repeat_interleave(torch.arange(lengths.numel(), device=lengths.device), lengths).to(torch.int32)
 
 
 def tp_token_owners(
@@ -264,8 +213,10 @@ def build_forward_metadata(
 ) -> ForwardMetadata:
     """Lower a scheduler batch into the canonical token-major metadata."""
     device = query_start_loc.device
-    query_lens = (query_start_loc[1:].to(torch.int64) - query_start_loc[:-1].to(torch.int64)).to(torch.int32)
-    request_ids = request_ids_from_starts(query_start_loc)
+    query_lengths = query_start_loc[1:].to(torch.int64) - query_start_loc[:-1].to(torch.int64)
+    query_lens = query_lengths.to(torch.int32)
+    request_rows = torch.arange(query_lengths.numel(), device=device)
+    request_ids = torch.repeat_interleave(request_rows, query_lengths).to(torch.int32)
     num_tokens = int(request_ids.numel())
 
     local_positions = torch.arange(num_tokens, device=device, dtype=torch.int64) - query_start_loc[

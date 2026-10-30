@@ -237,12 +237,14 @@ def mla_prolog_w8a8(
     rows = pl.tensor.dim(x, 0)
     q_a = pl.create_tensor([rows, Q_LORA], dtype=pl.BF16)
     w8a8_projection_bf16(x, w_q_a, w_q_a_scale, q_a, D, Q_LORA)
-    rmsnorm(q_a, q_a_norm_weight, q_resid)
+    q_resid_rows = pl.reshape(q_resid, [rows, Q_LORA])
+    rmsnorm(q_a, q_a_norm_weight, q_resid_rows)
     query_flat = pl.reshape(query, [rows, LOCAL_H * QK_DIM])
     w8a8_projection_bf16(q_resid, w_q_b, w_q_b_scale, query_flat, Q_LORA, LOCAL_H * QK_DIM)
     kv_a = pl.create_tensor([rows, KV_LORA], dtype=pl.BF16)
     w8a8_projection_bf16(x, w_kv_a, w_kv_a_scale, kv_a, D, KV_LORA)
-    rmsnorm(kv_a, kv_a_norm_weight, kv_latent)
+    kv_latent_rows = pl.reshape(kv_latent, [rows, KV_LORA])
+    rmsnorm(kv_a, kv_a_norm_weight, kv_latent_rows)
     return q_resid, query, kv_latent
 
 
@@ -301,9 +303,13 @@ def absorb_query(
     query: pl.Tensor[[T_DYN, LOCAL_H, QK_DIM], pl.BF16],
     w_k: pl.Tensor[[LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
     absorbed: pl.Tensor[[T_DYN, LOCAL_H, KV_LORA], pl.BF16],
+    query_extent: pl.constexpr = 0,
 ):
     """Multiply each query head by the BF16 key projection into latent space."""
-    t_dim = pl.tensor.dim(query, 0)
+    if query_extent > 0:
+        t_dim = query_extent
+    else:
+        t_dim = pl.tensor.dim(query, 0)
     t_mm = ((t_dim + PROJECTION_MM_T_TILE - 1) // PROJECTION_MM_T_TILE) * PROJECTION_MM_T_TILE
     absorbed_flat = pl.reshape(absorbed, [t_dim, LOCAL_H * KV_LORA])
     for head in pl.range(LOCAL_H):
@@ -343,7 +349,7 @@ def mla_absorb_query_test(
     """Run one query absorption for golden.run validation."""
     query.bind_dynamic(0, T_DYN)
     absorbed.bind_dynamic(0, T_DYN)
-    absorb_query(query, w_k, absorbed)
+    absorb_query(query, w_k, absorbed, 0)
     return absorbed
 
 
@@ -357,11 +363,15 @@ def prefill_sparse_attn(
     w_v: pl.Tensor[[LOCAL_H, V_DIM, KV_LORA], pl.BF16],
     topk_indices: pl.Tensor[[T_DYN, TOPK_INDEX_WIDTH], pl.INT32],
     output: pl.Tensor[[T_DYN, LOCAL_H, V_DIM], pl.BF16],
+    query_extent: pl.constexpr = 0,
 ):
     """Sparse attention over the selected latent rows, prefill path."""
-    t_dim = pl.tensor.dim(query, 0)
+    if query_extent > 0:
+        t_dim = query_extent
+    else:
+        t_dim = pl.tensor.dim(query, 0)
     absorbed = pl.create_tensor([t_dim, LOCAL_H, KV_LORA], dtype=pl.BF16)
-    absorb_query(query, w_k, absorbed)
+    absorb_query(query, w_k, absorbed, query_extent)
 
     # Head-major: the value expansion needs its M rows contiguous per head.
     context = pl.create_tensor([LOCAL_H * t_dim, KV_LORA], dtype=pl.BF16)
@@ -494,7 +504,7 @@ def prefill_sparse_attn_test(
     topk_indices.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
     block_table.bind_dynamic(1, BLOCK_TABLE_DYN)
-    prefill_sparse_attn(query, latent_cache, block_table, request_ids, w_k, w_v, topk_indices, output)
+    prefill_sparse_attn(query, latent_cache, block_table, request_ids, w_k, w_v, topk_indices, output, 0)
     return output
 
 
@@ -742,22 +752,13 @@ def decode_sparse_attn_test(
     return output
 
 
-def golden_mla_epilog_prefill(
+def golden_mla_epilog(
     attn_out: torch.Tensor,
     w_o: torch.Tensor,
 ) -> torch.Tensor:
-    """Head-space projection with the loader's prepared BF16 ``o_proj``."""
+    """Project flattened attention rows with a prepared BF16 output weight."""
     flattened = attn_out.reshape(*attn_out.shape[:-2], -1)
     return golden_bf16_linear(flattened, w_o)
-
-
-def golden_mla_epilog_decode(
-    attn_out: torch.Tensor,
-    w_o_absorbed: torch.Tensor,
-) -> torch.Tensor:
-    """The absorbed path: ``kv_b_proj``'s value half is folded in, so BF16."""
-    flattened = attn_out.reshape(*attn_out.shape[:-2], -1)
-    return golden_bf16_linear(flattened, w_o_absorbed)
 
 
 def output_run_native_case(options):
@@ -834,15 +835,15 @@ def build_mla_epilog_decode_specs(tokens: int = 20):
 
 def golden_mla_epilog_prefill_case(tensors):
     """Fill the expected partial sum for :func:`build_mla_epilog_prefill_specs`."""
-    tensors["output"][:] = golden_mla_epilog_prefill(tensors["attn_out"], tensors["w_o"])
+    tensors["output"][:] = golden_mla_epilog(tensors["attn_out"], tensors["w_o"])
 
 
 def golden_mla_epilog_decode_case(tensors):
     """Fill the expected partial sum for :func:`build_mla_epilog_decode_specs`."""
-    tensors["output"][:] = golden_mla_epilog_decode(tensors["attn_out"], tensors["w_o_absorbed"])
+    tensors["output"][:] = golden_mla_epilog(tensors["attn_out"], tensors["w_o_absorbed"])
 
 
-def run_mla_epilog_goldens(golden_epilog_prefill, golden_epilog_decode) -> None:
+def run_mla_epilog_goldens() -> None:
     """Check both output projections keep their row-parallel FP32 partial-sum contract."""
     torch.manual_seed(41)
     tokens, heads, model_dim = 4, 2, 32
@@ -850,7 +851,7 @@ def run_mla_epilog_goldens(golden_epilog_prefill, golden_epilog_decode) -> None:
 
     attn_out = torch.randn(tokens, heads, v_dim, dtype=torch.bfloat16)
     w_o = torch.randn(model_dim, heads * v_dim, dtype=torch.bfloat16) * 0.05
-    prefill = golden_epilog_prefill(attn_out, w_o)
+    prefill = golden_mla_epilog(attn_out, w_o)
     _check(prefill.shape == (tokens, model_dim), f"prefill epilog shape {tuple(prefill.shape)}")
     _check(prefill.dtype is torch.float32, f"prefill epilog dtype {prefill.dtype}")
     expected = torch.nn.functional.linear(attn_out.float().flatten(-2), w_o.float())
@@ -858,7 +859,7 @@ def run_mla_epilog_goldens(golden_epilog_prefill, golden_epilog_decode) -> None:
 
     latent_out = torch.randn(tokens, heads, kv_lora, dtype=torch.bfloat16)
     w_o_absorbed = torch.randn(model_dim, heads * kv_lora, dtype=torch.bfloat16) * 0.05
-    decode = golden_epilog_decode(latent_out, w_o_absorbed)
+    decode = golden_mla_epilog(latent_out, w_o_absorbed)
     _check(decode.shape == (tokens, model_dim), f"decode epilog shape {tuple(decode.shape)}")
     _check(decode.dtype is torch.float32, f"decode epilog dtype {decode.dtype}")
 
@@ -1646,7 +1647,7 @@ def run_output_case(argv=None):
 
     from golden import ratio_allclose, run
 
-    run_mla_epilog_goldens(golden_mla_epilog_prefill, golden_mla_epilog_decode)
+    run_mla_epilog_goldens()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
