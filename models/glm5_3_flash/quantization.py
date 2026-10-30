@@ -165,37 +165,6 @@ def w8a8_dynamic_linear(
     return result.to(out_dtype)
 
 
-def dequant_swiglu_quant(
-    gate_up_accumulator: torch.Tensor,
-    gate_up_scale: torch.Tensor,
-    token_scale: torch.Tensor,
-    swiglu_limit: float,
-    down_smooth_scale: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fuse the expert epilogue: dequant, clamped SwiGLU, then re-quantize for ``down_proj``.
-
-    This is the reference for ``torch_npu.npu_dequant_swiglu_quant``, which the
-    Ascend-native GLM-5.2 recipe calls between the two grouped matmuls so the
-    ``2 * moe_intermediate_size`` intermediate never materialises in BF16.
-
-    Args:
-        gate_up_accumulator: ``[tokens, 2 * moe_intermediate_size]`` int32 from the
-            fused gate/up matmul, gate first.
-        gate_up_scale: ``[2 * moe_intermediate_size]`` per-channel weight scale.
-        token_scale: ``[tokens, 1]`` per-token activation scale.
-        down_smooth_scale: optional SmoothQuant vector for the ``down_proj`` input.
-
-    Returns:
-        The int8 activation for ``down_proj`` and its ``[tokens, 1]`` FP32 scale.
-    """
-    value = gate_up_accumulator.float() * token_scale * gate_up_scale.float()
-    gate_value, up_value = value.chunk(2, dim=-1)
-    gate_value = gate_value.clamp(max=swiglu_limit)
-    up_value = up_value.clamp(-swiglu_limit, swiglu_limit)
-    hidden = torch.nn.functional.silu(gate_value) * up_value
-    return quantize_per_token_int8(hidden, down_smooth_scale)
-
-
 def swiglu(gate_value: torch.Tensor, up_value: torch.Tensor) -> torch.Tensor:
     """Clamp-stabilised SwiGLU shared by the dense MLP, shared expert and routed experts.
 

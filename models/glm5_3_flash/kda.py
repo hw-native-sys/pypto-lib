@@ -34,6 +34,7 @@ from models.glm5_3_flash.utils import _assert_close, _randn
 
 B_DYN = pl.dynamic("GLM53_B_DYN")
 KDA_STATE_DYN = pl.dynamic("GLM53_KDA_STATE_DYN")
+KDA_METADATA_DYN = pl.dynamic("GLM53_KDA_METADATA_DYN")
 Q_START_DYN = pl.dynamic("GLM53_Q_START_DYN")
 T_DYN = pl.dynamic("GLM53_T_DYN")
 
@@ -42,7 +43,7 @@ STATE_LEN = KDA_CONV_K - 1
 CONV_T_TILE = 16  # tokens per bulk task
 C_TILE = 128  # Bounds the corrected SiLU working set alongside the FP32 tap sum
 DECODE_C_TILE = 128  # channels per decode convolution task
-_PREFILL_LENGTHS = {"ragged": [5, 1, 9, 2, 0], "single": [1], "long": [40]}
+_PREFILL_LENGTHS = {"ragged": [5, 1, 9, 2, 0], "single": [1], "long": [40], "paged": [32, 1]}
 CONV_POOL_ROWS = 6
 
 PROJECTION_T_TILE = 16  # tokens per task
@@ -69,7 +70,7 @@ PREFILL_L2_EPS = 1e-6
 PREFILL_Q_SCALE = KDA_DIM**-0.5
 PREFILL_V_TILE = 64  # value columns per scan task: the carried state slice is [128, 64] FP32
 PREFILL_POOL_ROWS = 6
-_LENGTHS = {"ragged": [140, 7, 64], "single": [3], "aligned": [64], "zerostate": [3], "nobeta": [70]}
+_LENGTHS = {"ragged": [140, 7, 64], "single": [3], "aligned": [64], "zerostate": [3], "nobeta": [70], "paged": [32, 1]}
 
 
 @pl.jit.inline
@@ -78,7 +79,7 @@ def kda_conv_prefill(
     weight: pl.Tensor[[KDA_CONV_K, CONV_DIM], pl.BF16],
     conv_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, STATE_LEN, CONV_DIM], pl.BF16]],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
-    state_rows: pl.Tensor[[B_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
     query: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     key: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     value: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
@@ -136,7 +137,7 @@ def kda_conv_prefill(
         c0 = (task % lanes) * C_TILE
         s = pl.cast(pl.read(query_start_loc, [b]), pl.INDEX)
         e = pl.cast(pl.read(query_start_loc, [b + 1]), pl.INDEX)
-        row = pl.cast(pl.read(state_rows, [b]), pl.INDEX)
+        row = pl.cast(pl.read(state_rows, [b, 0]), pl.INDEX)
         srow = row * STATE_LEN
         length = e - s
         # An empty request is legal: query_start_loc is cumulative, and equal adjacent
@@ -222,18 +223,27 @@ def kda_conv_prefill(
                 v_flat[s + 1 : s + 2, vc0 : vc0 + C_TILE] = o1
                 v_flat[s + 2 : s + 3, vc0 : vc0 + C_TILE] = o2
 
-            for i in pl.unroll(STATE_LEN - 1):
-                old_idx = pl.min(length + i, STATE_LEN - 1)
-                new_idx = pl.max(e - STATE_LEN + i, s)
-                keep_old = pl.min(pl.max(STATE_LEN - length - i, 0), 1)
-                take_new = pl.min(pl.max(length + i - STATE_LEN + 1, 0), 1)
-                old_row = cs2[srow + old_idx:srow + old_idx + 1, c0:c0 + C_TILE]
-                new_row = mixed_qkv[new_idx:new_idx + 1, c0:c0 + C_TILE]
-                cs2[srow + i : srow + i + 1, c0 : c0 + C_TILE] = pl.set_validshape(old_row, keep_old, C_TILE)
-                cs2[srow + i : srow + i + 1, c0 : c0 + C_TILE] = pl.set_validshape(new_row, take_new, C_TILE)
-            last = srow + STATE_LEN - 1
-            final_row = pl.max(e - 1, s)
-            cs2[last : last + 1, c0 : c0 + C_TILE] = mixed_qkv[final_row:final_row + 1, c0:c0 + C_TILE]
+            # Write the private working tail and the retained prefix boundaries.
+            for checkpoint in pl.range(0, length + CHUNK_TILE, CHUNK_TILE):
+                endpoint = length
+                destination = pl.cast(pl.read(state_rows, [b, 1]), pl.INDEX)
+                if checkpoint < length:
+                    endpoint = pl.min(checkpoint + CHUNK_TILE, length)
+                    destination = pl.cast(pl.read(state_rows, [b, 2 + checkpoint // CHUNK_TILE]), pl.INDEX)
+                if destination >= 0:
+                    dst_row = destination * STATE_LEN
+                    for i in pl.unroll(STATE_LEN - 1):
+                        old_idx = pl.min(endpoint + i, STATE_LEN - 1)
+                        new_idx = pl.max(s + endpoint - STATE_LEN + i, s)
+                        keep_old = pl.min(pl.max(STATE_LEN - endpoint - i, 0), 1)
+                        take_new = pl.min(pl.max(endpoint + i - STATE_LEN + 1, 0), 1)
+                        old_row = cs2[srow + old_idx:srow + old_idx + 1, c0:c0 + C_TILE]
+                        new_row = mixed_qkv[new_idx:new_idx + 1, c0:c0 + C_TILE]
+                        cs2[dst_row + i:dst_row + i + 1, c0:c0 + C_TILE] = pl.set_validshape(old_row, keep_old, C_TILE)
+                        cs2[dst_row + i:dst_row + i + 1, c0:c0 + C_TILE] = pl.set_validshape(new_row, take_new, C_TILE)
+                    last = dst_row + STATE_LEN - 1
+                    final_row = s + endpoint - 1
+                    cs2[last:last + 1, c0:c0 + C_TILE] = mixed_qkv[final_row:final_row + 1, c0:c0 + C_TILE]
 
     return query, key, value, conv_state
 
@@ -297,7 +307,7 @@ def kda_conv_prefill_test(
     weight: pl.Tensor[[KDA_CONV_K, CONV_DIM], pl.BF16],
     conv_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, STATE_LEN, CONV_DIM], pl.BF16]],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
-    state_rows: pl.Tensor[[B_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
     query: pl.Out[pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
     key: pl.Out[pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
     value: pl.Out[pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
@@ -643,15 +653,25 @@ def prefill_kda(
     beta: pl.Tensor[[T_DYN, BETA_PAD], pl.FP32],
     recurrent_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
-    state_rows: pl.Tensor[[B_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
     tri_incl: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
     tri_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
     head_onehot: pl.Tensor[[LOCAL_KDA_H, BETA_PAD], pl.FP32],
     eye_wide: pl.Tensor[[CHUNK_TILE, KDA_DIM], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    query_extent: pl.constexpr = 0,
+    request_extent: pl.constexpr = 0,
+    state_extent: pl.constexpr = 0,
 ):
-    t_dim = pl.tensor.dim(query, 0)
-    requests = pl.tensor.dim(query_start_loc, 0) - 1
+    """Apply chunked KDA with compiled query, request and state-pool bounds."""
+    if query_extent > 0:
+        t_dim = query_extent
+    else:
+        t_dim = pl.tensor.dim(query, 0)
+    if request_extent > 0:
+        requests = request_extent
+    else:
+        requests = pl.tensor.dim(query_start_loc, 0) - 1
     # Flattened head-major, not token-major: with one row per (token, head) the tokens
     # of one head would sit LOCAL_KDA_H rows apart and a chunk slice would straddle
     # heads. Keeping the row axis as tokens makes a head a contiguous column range.
@@ -975,7 +995,11 @@ def prefill_kda(
     # returns uninitialised memory -- which is exactly the NaN a multi-chunk sequence
     # produced while a single-chunk one passed.
     state_gm = pl.create_tensor([LOCAL_KDA_H * requests * lanes * 2 * PREFILL_V_TILE, KDA_DIM], dtype=pl.FP32)
-    state_2d = pl.reshape(recurrent_state, [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
+    if state_extent > 0:
+        state_pool_rows = state_extent
+    else:
+        state_pool_rows = pl.tensor.dim(recurrent_state, 0)
+    state_2d = pl.reshape(recurrent_state, [state_pool_rows * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
     out_rows = pl.reshape(output, [t_dim, head_width])
     with pl.spmd(LOCAL_KDA_H * requests * lanes, name_hint="prefill_kda_scan", deps=[wu_tid]):
         task = pl.tile.get_block_idx()
@@ -985,7 +1009,7 @@ def prefill_kda(
         bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
         eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
         length = eos - bos
-        row = pl.cast(pl.read(state_rows, [n]), pl.INDEX)
+        row = pl.cast(pl.read(state_rows, [n, 0]), pl.INDEX)
 
         # The scan runs in the pool's own [V, K] orientation. The recurrence is natural
         # in [K, V], but every re-orientation it needs is a matmul operand flag, and
@@ -1032,11 +1056,20 @@ def prefill_kda(
             state_gm_value_matmul = pl.matmul(vi_bf, kdec_c, pl.FP32, a_trans=True)
             state_gm[d_row:d_row + PREFILL_V_TILE, 0:KDA_DIM] = pl.add(state_gm_value_col_expand_mul, state_gm_value_matmul)
 
-        # Flush. The last chunk wrote the slot with the parity of the chunk count.
+            state_row = pl.cast(pl.read(state_rows, [n, 2 + s_idx // CHUNK_TILE]), pl.INDEX)
+            if state_row >= 0:
+                checkpoint_row = (state_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+                chunk_state = state_gm[d_row:d_row + PREFILL_V_TILE, 0:KDA_DIM]
+                state_2d[checkpoint_row:checkpoint_row + PREFILL_V_TILE, 0:KDA_DIM] = chunk_state
+
+        # Flush the private working row.
         chunks = (length + CHUNK_TILE - 1) // CHUNK_TILE
         last = chunks % 2
         final = state_gm[(task * 2 + last) * PREFILL_V_TILE:(task * 2 + last) * PREFILL_V_TILE + PREFILL_V_TILE, 0:KDA_DIM]
-        state_2d[pool_row : pool_row + PREFILL_V_TILE, 0:KDA_DIM] = final
+        if length > 0:
+            working_row = pl.cast(pl.read(state_rows, [n, 1]), pl.INDEX)
+            output_row = (working_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+            state_2d[output_row:output_row + PREFILL_V_TILE, 0:KDA_DIM] = final
 
     return output, recurrent_state
 
@@ -1050,7 +1083,7 @@ def prefill_kda_test(
     beta: pl.Tensor[[T_DYN, BETA_PAD], pl.FP32],
     recurrent_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
-    state_rows: pl.Tensor[[B_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
     tri_incl: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
     tri_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
     head_onehot: pl.Tensor[[LOCAL_KDA_H, BETA_PAD], pl.FP32],
@@ -1060,6 +1093,7 @@ def prefill_kda_test(
     (output, recurrent_state) = prefill_kda(
         query, key, value, decay, beta, recurrent_state, query_start_loc, state_rows, tri_incl, tri_strict,
         head_onehot, eye_wide, output,
+        0, 0, PREFILL_POOL_ROWS,
     )
     return output, recurrent_state
 
@@ -1130,10 +1164,15 @@ def golden_kda_conv_prefill(
         e = int(query_start_loc[b + 1])
         if e <= s:
             continue
-        row = int(state_rows[b])
-        conv_out, tail = _conv_reference(mixed_qkv[s:e], conv_state[row], weight)
+        source, destination = map(int, state_rows[b, :2])
+        conv_out, tail = _conv_reference(mixed_qkv[s:e], conv_state[source], weight)
         out[s:e] = conv_out
-        new_state[row] = tail.to(conv_state.dtype)
+        for chunk, row in enumerate(state_rows[b, 2:].tolist()):
+            if row >= 0:
+                offset = min((chunk + 1) * CHUNK_TILE, e - s)
+                _, checkpoint_tail = _conv_reference(mixed_qkv[s:s + offset], conv_state[source], weight)
+                new_state[row] = checkpoint_tail.to(conv_state.dtype)
+        new_state[destination] = tail.to(conv_state.dtype)
     shaped = out.to(mixed_qkv.dtype).view(tokens, 3, LOCAL_KDA_H, KDA_DIM)
     return shaped[:, 0], shaped[:, 1], shaped[:, 2], new_state
 
@@ -1209,9 +1248,15 @@ def conv_build_tensor_specs(case: str = "ragged", decode: bool = False):
         starts.append(starts[-1] + length)
     tokens = starts[-1]
     rows = torch.tensor([4, 1, 5, 0, 2][: len(lengths)], dtype=torch.int32)
+    state_metadata = torch.full((len(lengths), 2 + (max(lengths) + CHUNK_TILE - 1) // CHUNK_TILE), -1, dtype=i32)
+    state_metadata[:, :2] = rows.unsqueeze(1)
+    if case == "paged":
+        state_metadata[:, 1] = torch.tensor([0, 2], dtype=i32)
+        state_metadata[0, 2:4] = torch.tensor([3, 5], dtype=i32)
+
     return common(tokens) + [
         TensorSpec("query_start_loc", [len(starts)], i32, init_value=lambda : torch.tensor(starts, dtype=torch.int32)),
-        TensorSpec("state_rows", [len(lengths)], i32, init_value=lambda: rows),
+        TensorSpec("state_rows", list(state_metadata.shape), i32, init_value=state_metadata),
         TensorSpec("query", [tokens, LOCAL_KDA_H, KDA_DIM], bf),
         TensorSpec("key", [tokens, LOCAL_KDA_H, KDA_DIM], bf),
         TensorSpec("value", [tokens, LOCAL_KDA_H, KDA_DIM], bf),
@@ -1251,8 +1296,9 @@ def build_boundary_tensor_specs(decode: bool = False):
             TensorSpec("query_start_loc", [3], torch.int32, init_value=torch.tensor([0, 4, 5], dtype=torch.int32)),
         )
     rows = torch.tensor([1] if decode else [0, 1], dtype=torch.int32)
+    metadata = rows if decode else torch.stack((rows, rows, torch.full_like(rows, -1)), dim=1)
     return specs + [
-        TensorSpec("state_rows", list(rows.shape), rows.dtype, init_value=rows),
+        TensorSpec("state_rows", list(metadata.shape), metadata.dtype, init_value=metadata),
         TensorSpec("query", [tokens, LOCAL_KDA_H, KDA_DIM], torch.bfloat16),
         TensorSpec("key", [tokens, LOCAL_KDA_H, KDA_DIM], torch.bfloat16),
         TensorSpec("value", [tokens, LOCAL_KDA_H, KDA_DIM], torch.bfloat16),
@@ -1761,7 +1807,9 @@ def golden_prefill_kda_fp32(
     for b in range(requests):
         s = int(query_start_loc[b])
         e = int(query_start_loc[b + 1])
-        row = int(state_rows[b])
+        row, destination = map(int, state_rows[b, :2])
+        if e <= s:
+            continue
         for h in range(LOCAL_KDA_H):
             sh = state[row, h]  # [V, K]
             for t in range(s, e):
@@ -1775,7 +1823,11 @@ def golden_prefill_kda_fp32(
                 delta = (v - kv_mem) * bta
                 sh = sh + delta.unsqueeze(-1) * k.unsqueeze(0)
                 out[t, h] = (sh * q.unsqueeze(0)).sum(dim=-1)
-            state[row, h] = sh
+                if (t + 1 - s) % CHUNK_TILE == 0 or t + 1 == e:
+                    checkpoint_row = int(state_rows[b, 2 + (t - s) // CHUNK_TILE])
+                    if checkpoint_row >= 0:
+                        state[checkpoint_row, h] = sh
+            state[destination, h] = sh
     return out.to(query.dtype), state.to(recurrent_state.dtype)
 
 
@@ -1809,8 +1861,8 @@ def golden_prefill_kda_mixed_precision(
     for request in range(query_start_loc.numel() - 1):
         begin = int(query_start_loc[request])
         end = int(query_start_loc[request + 1])
-        row = int(state_rows[request])
-        carried = state[row]
+        row, destination = map(int, state_rows[request, :2])
+        carried = state[row].clone()
         for start in range(begin, end, CHUNK_TILE):
             stop = min(start + CHUNK_TILE, end)
             count = stop - start
@@ -1852,7 +1904,11 @@ def golden_prefill_kda_mixed_precision(
             result = qg @ carried_bf16.transpose(-1, -2) + a2 @ vi
             out[start:stop] = result[:, :count].transpose(0, 1)
             carried = carried * cumulative[:, -1:].exp() + vi.transpose(-1, -2) @ kdec
-        state[row] = carried
+            checkpoint_row = int(state_rows[request, 2 + (start - begin) // CHUNK_TILE])
+            if checkpoint_row >= 0:
+                state[checkpoint_row] = carried
+        if end > begin:
+            state[destination] = carried
     return out.to(query.dtype), state.to(recurrent_state.dtype)
 
 
@@ -1877,6 +1933,12 @@ def prefill_build_tensor_specs(case: str = "ragged"):
     tokens = starts[-1]
     rows = torch.tensor([4, 1, 5][: len(lengths)], dtype=torch.int32)
 
+    state_metadata = torch.full((len(lengths), 2 + (max(lengths) + CHUNK_TILE - 1) // CHUNK_TILE), -1, dtype=i32)
+    state_metadata[:, :2] = rows.unsqueeze(1)
+    if case == "paged":
+        state_metadata[:, 1] = torch.tensor([0, 2], dtype=i32)
+        state_metadata[0, 2:4] = torch.tensor([3, 5], dtype=i32)
+
     return [
         TensorSpec("query", [tokens, LOCAL_KDA_H, KDA_DIM], bf, init_value=lambda : torch.randn(tokens, LOCAL_KDA_H, KDA_DIM).to(bf)),
         # Keys share a per-head direction. Independent random keys are near-orthogonal
@@ -1896,7 +1958,7 @@ def prefill_build_tensor_specs(case: str = "ragged"):
         # Non-zero, so a dropped carry or a transposed seed is visible.
         TensorSpec("recurrent_state", [PREFILL_POOL_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], f32, init_value=(lambda : torch.zeros(PREFILL_POOL_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM)) if case == "zerostate" else lambda : torch.randn(PREFILL_POOL_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM) * 0.1),
         TensorSpec("query_start_loc", [len(starts)], i32, init_value=lambda : torch.tensor(starts, dtype=torch.int32)),
-        TensorSpec("state_rows", [len(lengths)], i32, init_value=lambda: rows),
+        TensorSpec("state_rows", list(state_metadata.shape), i32, init_value=state_metadata),
         TensorSpec("tri_incl", [CHUNK_TILE, CHUNK_TILE], f32, init_value=lambda : torch.tril(torch.ones(CHUNK_TILE, CHUNK_TILE))),
         TensorSpec("tri_strict", [CHUNK_TILE, CHUNK_TILE], f32, init_value=lambda : torch.tril(torch.ones(CHUNK_TILE, CHUNK_TILE), diagonal=-1)),
         # Row h selects head h out of beta's padded 16-wide row.
@@ -1919,7 +1981,7 @@ def run_convolution_case(argv=None):
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "single", "long", "decode", "decode-single"])
+    parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "single", "long", "paged", "decode", "decode-single"])
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
@@ -2061,7 +2123,7 @@ def run_prefill_case(argv=None):
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "single", "aligned", "zerostate", "nobeta"])
+    parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "single", "aligned", "zerostate", "nobeta", "paged"])
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
