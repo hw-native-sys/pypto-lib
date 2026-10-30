@@ -373,7 +373,8 @@ def c2a_compressor_pool_state(
     blocks = pl.cast(pl.tensor.dim(state_cache, 0), pl.INT32)
     pool_tid = c2a_compressor_pool(
         kv_proj, score_proj, state_cache, position_ids, norm_weight, latent,
-        num_tokens, query_start_loc, token_to_req_indices, state_block_table, blocks, state_ready,
+        num_tokens, query_start_loc, token_to_req_indices,
+        state_block_table, blocks, state_ready,
     )
     state_tid = c2a_compressor_state_write(
         kv_proj, score_proj, query_start_loc, position_ids, token_to_req_indices,

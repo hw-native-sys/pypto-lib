@@ -476,6 +476,7 @@ def l2_prefill_fwd(
     shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     counts: pl.Tensor[[2], pl.INT32],
+    host_counts: pl.Tensor[[2], pl.INT32],
     replay_rows: pl.Tensor[[CAPACITY], pl.INT32],
     position_ids: pl.Tensor[[2, CAPACITY], pl.INT32],
     freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, 32], pl.FP32],
@@ -535,8 +536,8 @@ def l2_prefill_fwd(
     rope_sin = pl.create_tensor([3, CAPACITY, 32], dtype=pl.FP32)
     compressed_cos = pl.create_tensor([CAPACITY, 32], dtype=pl.FP32)
     compressed_sin = pl.create_tensor([CAPACITY, 32], dtype=pl.FP32)
-    encoder_count = pl.read(counts, [0])
-    decoder_count = pl.read(counts, [1])
+    encoder_count = pl.read(host_counts, [0])
+    decoder_count = pl.read(host_counts, [1])
     materialize_rope_rows(
         freqs_cos[0], freqs_sin[0], position_ids[0], encoder_count, rope_cos[0], rope_sin[0], False,
     )
@@ -576,7 +577,9 @@ def l2_prefill_fwd(
     moe_ready = pl.system.task_dummy(deps=[])
     for layer in pl.range(N_LAYERS):
         stage = layer // 20
-        active = pl.read(counts, [stage])
+        active = encoder_count
+        if stage != 0:
+            active = decoder_count
         current_slot = (2 * stage + layer % 2) * CAPACITY
         next_slot = (2 * stage + (layer + 1) % 2) * CAPACITY
         hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [current_slot, 0, 0])
@@ -651,7 +654,7 @@ def l2_prefill_fwd(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
                     compressed_cache[3], compressed_scales[3], index_cache[3], index_scales[3],
-                    pl.read(counts, [0]),
+                    encoder_count,
                 )
                 gathered_hidden = pl.reshape(hidden, [CAPACITY, HC_DIM])
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
@@ -794,6 +797,7 @@ def l3_prefill_fwd(
     shared_w3_scale: pl.Tensor[[RANKS, N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     mxfp4_pair_lut: pl.Tensor[[RANKS, 2, 256], pl.INT16],
     counts: pl.Tensor[[RANKS, 2], pl.INT32],
+    host_counts: pl.Tensor[[RANKS, 2], pl.INT32],
     replay_rows: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
     position_ids: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT32],
     freqs_cos: pl.Tensor[[RANKS, 2, ROPE_ROWS_DYN, 32], pl.FP32],
@@ -936,6 +940,7 @@ def l3_prefill_fwd(
             shared_w3[rank], shared_w3_scale[rank],
             mxfp4_pair_lut[rank],
             counts[rank],
+            host_counts[rank],
             replay_rows[rank],
             position_ids[rank],
             freqs_cos[rank], freqs_sin[rank],
@@ -1001,6 +1006,7 @@ PREFILL_TENSORS = (
     "shared_w1", "shared_w1_scale", "shared_w2", "shared_w2_scale", "shared_w3", "shared_w3_scale",
     "mxfp4_pair_lut",
     "counts",
+    "host_counts",
     "replay_rows",
     "position_ids",
     "freqs_cos", "freqs_sin",
@@ -1425,11 +1431,11 @@ def prepare_prefill_inputs(
         if M.compress_ratios[source] == 2
     }
     query_starts = torch.tensor([0, count], dtype=torch.int32)
-    request_ids = torch.zeros(count, dtype=torch.int32)
+    token_to_req_indices = torch.zeros(count, dtype=torch.int32)
     positions = torch.arange(start_pos, start_pos + count, dtype=torch.int32)
-    window_slots, window_indices, _ = window_metadata(positions, request_ids, table)
-    c2a_slots = paged_slots(positions, request_ids, c2a_table, C.BLOCK_SIZE, 2, True)
-    c1a_slots = paged_slots(positions, request_ids, table)
+    window_slots, window_indices, _ = window_metadata(positions, token_to_req_indices, table)
+    c2a_slots = paged_slots(positions, token_to_req_indices, c2a_table, C.BLOCK_SIZE, 2, True)
+    c1a_slots = paged_slots(positions, token_to_req_indices, table)
     freqs_cos, freqs_sin = prepare_forward_rope_tables(max_seq_len, rope_tables)
 
     def pad(value, fill=0):
@@ -1463,6 +1469,7 @@ def prepare_prefill_inputs(
         "initial_pre": initial_pre,
         "identity_rows": pad(torch.arange(count, dtype=torch.int32), -1),
         "counts": torch.tensor([count, count], dtype=torch.int32),
+        "host_counts": torch.tensor([count, count], dtype=torch.int32),
         "replay_rows": pad(torch.arange(count, dtype=torch.int32), -1),
         "position_ids": pad(positions, -1).repeat(2, 1),
         "freqs_cos": freqs_cos,
@@ -1471,7 +1478,7 @@ def prepare_prefill_inputs(
         "window_indices": pad(window_indices, -1).repeat(2, 1, 1),
         "c2a_compressed_slots": pad(c2a_slots, -1),
         "c1a_compressed_slots": pad(c1a_slots, -1),
-        "token_to_req_indices": pad(request_ids, -1).repeat(2, 1),
+        "token_to_req_indices": pad(token_to_req_indices, -1).repeat(2, 1),
         "query_start_loc": query_starts.repeat(2, 1),
         "c2a_index_block_table": c2a_table,
         "c1a_index_block_table": table,
@@ -1614,6 +1621,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         name: torch.zeros(RANKS, dtype=torch.int32).share_memory_()
         for name in ("moe_num_tokens", "attention_num_tokens")
     }
+    prefill_host_counts = torch.zeros((RANKS, 2), dtype=torch.int32).share_memory_()
     print("CED_RESIDENT_BYTES_PER_RANK", weights.bytes_per_rank, flush=True)
     start = time.monotonic()
     # Completed forwards retire signals; native cache allocations persist.
@@ -1635,6 +1643,8 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             host_cache.append({name: inputs[name] for name in cache_names})
             inputs["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
             for name in PREFILL_TENSORS:
+                if name == "host_counts":
+                    continue
                 if name in weights.tensor_layouts:
                     shape, dtype = weights.tensor_layouts[name]
                     tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
@@ -1655,8 +1665,9 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             name: StackedDeviceTensor(
                 [rank[name] for rank in per_rank], (RANKS, *per_rank[0][name].shape), tuple(range(RANKS))
             )
-            for name in PREFILL_TENSORS
+            for name in PREFILL_TENSORS if name != "host_counts"
         }
+        stacked["host_counts"] = prefill_host_counts
         logits = torch.empty((RANKS, 16, VOCAB), dtype=torch.float32)
         sampled_ids = torch.empty((RANKS, 16, 8), dtype=torch.int32)
         committed = [0] * RANKS
@@ -1708,6 +1719,9 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                     for counts in decode_counts.values():
                         counts[rank] = len(token_ids)
                 for name, value in inputs.items():
+                    if not decode and name == "host_counts":
+                        prefill_host_counts[rank].copy_(value)
+                        continue
                     if name not in constants:
                         runtime.copy_to(
                             tensors[name].data_ptr, value.data_ptr(), value.numel() * value.element_size(),

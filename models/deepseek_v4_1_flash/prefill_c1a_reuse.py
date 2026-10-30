@@ -183,7 +183,7 @@ def golden_prefill_attn_c1a_reuse(
         state_block_table=None, state_cache=None,
         compressed_slots=None, position_ids=None, compressed_lens=None, compressed_rope_cos=None, compressed_rope_sin=None,
         index_wk=None, index_norm_weight=None, index_wq_b=None, index_wq_b_scale=None, index_weights_proj=None,
-        index_cache=None, index_cache_scale=None, index_block_table=None, request_ids=None, candidate_mask=None,
+        index_cache=None, index_cache_scale=None, index_block_table=None, token_to_req_indices=None, candidate_mask=None,
         attention_fn=golden_prefill_c1a_attention, sequential_query=True, round_cache_to_even=True, output_dtype=torch.float32,
     )
 
@@ -220,7 +220,7 @@ def l2_prefill_c1a_reuse_sharded(
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -261,7 +261,7 @@ def l2_prefill_c1a_reuse_sharded(
     window_cache_scale.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     compressed_cache_scale.bind_dynamic(0, CMP_BLOCKS_DYN)
-    request_ids.bind_dynamic(0, T_DYN)
+    token_to_req_indices.bind_dynamic(0, T_DYN)
     compressed_lens.bind_dynamic(0, T_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_cache_scale.bind_dynamic(0, INDEX_BLOCKS_DYN)
@@ -339,7 +339,7 @@ def l3_prefill_c1a_reuse_sharded(
     window_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -376,7 +376,7 @@ def l3_prefill_c1a_reuse_sharded(
     window_cache_scale.bind_dynamic(1, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
     compressed_cache_scale.bind_dynamic(1, CMP_BLOCKS_DYN)
-    request_ids.bind_dynamic(1, T_DYN)
+    token_to_req_indices.bind_dynamic(1, T_DYN)
     compressed_lens.bind_dynamic(1, T_DYN)
     index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
     index_cache_scale.bind_dynamic(1, INDEX_BLOCKS_DYN)
@@ -414,7 +414,7 @@ def l3_prefill_c1a_reuse_sharded(
             wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank],
             wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank], window_indices[rank],
             window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
-            request_ids[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
+            token_to_req_indices[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
             index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank],
             compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
             index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r, index_weights_proj[rank],

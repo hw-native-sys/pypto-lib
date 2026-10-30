@@ -62,7 +62,7 @@ PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 
 REINDEX_INPUT_NAMES = COMMON_INPUT_NAMES + (
-    "request_ids",
+    "token_to_req_indices",
     "compressed_lens",
     "index_cache",
     "index_cache_scale",
@@ -100,7 +100,7 @@ def prefill_c1a_reindex_attention(
     compressed_cache_scale: pl.Tensor[
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
     ],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[
@@ -140,7 +140,7 @@ def prefill_c1a_reindex_attention(
         )
         cache_ready = pl.system.task_dummy(deps=[])
         indexer_completion = prefill_indexer(
-            x, query_latent, request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table,
+            x, query_latent, token_to_req_indices, compressed_lens, index_cache, index_cache_scale, index_block_table,
             rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
             pool_block_ids, pool_block_counts, topk_indices, num_tokens, cache_ready, pool=use_candidates, c2a=False,
         )
@@ -206,7 +206,7 @@ def golden_prefill_attn_c1a_reindex(
     window_cache_scale: torch.Tensor,
     compressed_cache: torch.Tensor,
     compressed_cache_scale: torch.Tensor,
-    request_ids: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
     compressed_lens: torch.Tensor,
     index_cache: torch.Tensor,
     index_cache_scale: torch.Tensor,
@@ -231,7 +231,7 @@ def golden_prefill_attn_c1a_reindex(
         state_block_table=None, state_cache=None,
         compressed_slots=None, position_ids=None, compressed_lens=compressed_lens, compressed_rope_cos=None, compressed_rope_sin=None,
         index_wk=None, index_norm_weight=None, index_wq_b=index_wq_b, index_wq_b_scale=index_wq_b_scale, index_weights_proj=index_weights_proj,
-        index_cache=index_cache, index_cache_scale=index_cache_scale, index_block_table=index_block_table, request_ids=request_ids, candidate_mask=None,
+        index_cache=index_cache, index_cache_scale=index_cache_scale, index_block_table=index_block_table, token_to_req_indices=token_to_req_indices, candidate_mask=None,
         indexer_fn=partial(golden_prefill_indexer, pool_block_ids=pool_block_ids,
                            pool_block_counts=pool_block_counts),
         attention_fn=golden_prefill_c1a_attention, sequential_query=True, round_cache_to_even=True, output_dtype=torch.float32,
@@ -270,7 +270,7 @@ def l2_prefill_c1a_reindex_sharded(
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -311,7 +311,7 @@ def l2_prefill_c1a_reindex_sharded(
     window_cache_scale.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     compressed_cache_scale.bind_dynamic(0, CMP_BLOCKS_DYN)
-    request_ids.bind_dynamic(0, T_DYN)
+    token_to_req_indices.bind_dynamic(0, T_DYN)
     compressed_lens.bind_dynamic(0, T_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_cache_scale.bind_dynamic(0, INDEX_BLOCKS_DYN)
@@ -353,7 +353,7 @@ def l2_prefill_c1a_reindex_sharded(
     prefill_c1a_reindex_attention(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
         attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
-        window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
+        window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table, pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale,
         index_weights_proj, topk_indices, output_window, output_arrived, attn_output,
         rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, attention_epoch,
@@ -395,7 +395,7 @@ def l3_prefill_c1a_reindex_sharded(
     window_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -432,7 +432,7 @@ def l3_prefill_c1a_reindex_sharded(
     window_cache_scale.bind_dynamic(1, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
     compressed_cache_scale.bind_dynamic(1, CMP_BLOCKS_DYN)
-    request_ids.bind_dynamic(1, T_DYN)
+    token_to_req_indices.bind_dynamic(1, T_DYN)
     compressed_lens.bind_dynamic(1, T_DYN)
     index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
     index_cache_scale.bind_dynamic(1, INDEX_BLOCKS_DYN)
@@ -470,7 +470,7 @@ def l3_prefill_c1a_reindex_sharded(
             wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank],
             wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank], window_indices[rank],
             window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
-            request_ids[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
+            token_to_req_indices[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
             index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank],
             compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
             index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r, index_weights_proj[rank],
@@ -513,7 +513,7 @@ def prefill_c1a_reindex(
     compressed_cache_scale: pl.Tensor[
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
     ],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[
@@ -555,7 +555,7 @@ def prefill_c1a_reindex(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
+        compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table, pool_block_ids, pool_block_counts,
         index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices,
         output_window, output_arrived, attn_out,
@@ -600,7 +600,7 @@ def l2_prefill_c1a_reindex(
     compressed_cache_scale: pl.Tensor[
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
     ],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[
@@ -634,7 +634,7 @@ def l2_prefill_c1a_reindex(
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
+        compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table, pool_block_ids, pool_block_counts,
         index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices,
         output_window, output_arrived, hidden, attn_input, attn_out, output, next_pre_mix,
@@ -681,7 +681,7 @@ def l3_prefill_c1a_reindex(
     compressed_cache_scale: pl.Tensor[
         [TP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
     ],
-    request_ids: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
     index_cache: pl.Tensor[
         [TP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8
@@ -726,7 +726,7 @@ def l3_prefill_c1a_reindex(
             wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_a_scale[rank],
             wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank],
             window_indices[rank], window_cache[rank], window_cache_scale[rank],
-            compressed_cache[rank], compressed_cache_scale[rank], request_ids[rank],
+            compressed_cache[rank], compressed_cache_scale[rank], token_to_req_indices[rank],
             compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
             index_block_table[rank], pool_block_ids[rank], pool_block_counts[rank], index_wq_b[rank],
             index_wq_b_scale_r, index_weights_proj[rank], topk_indices[rank],

@@ -152,8 +152,8 @@ def golden_query_metadata(
                 max(0, prefix_end - window_size), prefix_end, device=positions.device
             )
             visible_positions = torch.cat((context_positions, positions[request]))
-            request_ids = torch.full_like(visible_positions, request)
-            visible_slots = paged_slots(visible_positions, request_ids, table)
+            token_to_req_indices = torch.full_like(visible_positions, request)
+            visible_slots = paged_slots(visible_positions, token_to_req_indices, table)
             window_lens[layer, request] = visible_slots.numel()
             window_indices[layer, request, :, : visible_slots.numel()] = visible_slots.to(torch.int32)
             query_slots[layer, request] = visible_slots[-width:]

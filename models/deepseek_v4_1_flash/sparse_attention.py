@@ -2272,7 +2272,7 @@ def golden_compressed_attention(
     index_cache: torch.Tensor | None,
     index_cache_scale: torch.Tensor | None,
     index_block_table: torch.Tensor | None,
-    request_ids: torch.Tensor | None,
+    token_to_req_indices: torch.Tensor | None,
     candidate_mask: torch.Tensor | None,
     attention_fn: Callable | None = None,
     output_dtype: torch.dtype | None = None,
@@ -2335,13 +2335,13 @@ def golden_compressed_attention(
         elif ratio == 2:
             if compressor_wgate is None or state_block_table is None or updated_state is None:
                 raise ValueError("ratio-2 full mode requires gate weights and recurrent state")
-            if position_ids is None or query_start_loc is None or request_ids is None:
+            if position_ids is None or query_start_loc is None or token_to_req_indices is None:
                 raise ValueError("ratio-2 full mode requires positions, query starts and token-to-request indices")
             latent, publish_mask = golden_c2a_compressor(
                 x,
                 query_start_loc,
                 position_ids,
-                request_ids,
+                token_to_req_indices,
                 state_block_table,
                 updated_state,
                 compressor_wkv,
@@ -2403,14 +2403,14 @@ def golden_compressed_attention(
         if (
             quantized_index is None
             or index_block_table is None
-            or request_ids is None
+            or token_to_req_indices is None
             or compressed_lens is None
         ):
             raise ValueError("indexing modes require cache addressing and causal compressed lengths")
         if indexer_fn is None:
             raise ValueError("indexing modes require an indexer reference")
         index_args = (
-            x, query_latent, request_ids, quantized_index, index_block_table, compressed_lens,
+            x, query_latent, token_to_req_indices, quantized_index, index_block_table, compressed_lens,
             index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
         )
         scores, topk_indices = indexer_fn(*index_args, topk=M.index_topk)

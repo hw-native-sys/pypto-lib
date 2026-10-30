@@ -128,6 +128,7 @@ def decode_encoder(
         pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
     ],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[
@@ -317,7 +318,7 @@ def decode_encoder(
                     window_slots, window_indices,
                     layer_window_cache, layer_window_cache_scale,
                     full_compressed_cache, full_compressed_cache_scale,
-                    token_to_req_indices, c2a_compressed_lens,
+                    token_to_req_indices, host_token_to_req_indices, c2a_compressed_lens,
                     full_index_cache, full_index_cache_scale,
                     c2a_index_block_table, position_ids,
                     c2a_rope_cos, c2a_rope_sin,
@@ -425,6 +426,7 @@ def decode_decoder(
     compressed_cache_scale_pool: pl.InOut[
         pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
     ],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -567,7 +569,7 @@ def decode_decoder(
                     window_slots, window_indices,
                     layer_window_cache, layer_window_cache_scale,
                     layer_compressed_cache, layer_compressed_cache_scale,
-                    token_to_req_indices, c1a_compressed_lens,
+                    host_token_to_req_indices, token_to_req_indices, c1a_compressed_lens,
                     full_index_cache, full_index_cache_scale,
                     c1a_index_block_table,
                     compressed_token_rope_cos, compressed_token_rope_sin,
@@ -706,6 +708,7 @@ def l2_decode_fwd(
     compressed_cache_scale_pool: pl.InOut[
         pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
     ],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -793,7 +796,7 @@ def l2_decode_fwd(
         window_slots, window_indices,
         window_cache_pool, window_cache_scale_pool,
         compressed_cache_pool, compressed_cache_scale_pool,
-        token_to_req_indices, position_ids,
+        token_to_req_indices, host_token_to_req_indices, position_ids,
         index_cache_pool, index_cache_scale_pool,
         c2a_index_block_table,
         c2a_compressor_wkv, c2a_compressor_wgate, c1a_compressor_wkv,
@@ -826,7 +829,7 @@ def l2_decode_fwd(
         window_slots, window_indices,
         window_cache_pool, window_cache_scale_pool,
         compressed_cache_pool, compressed_cache_scale_pool,
-        token_to_req_indices, position_ids,
+        host_token_to_req_indices, token_to_req_indices, position_ids,
         index_cache_pool, index_cache_scale_pool,
         c1a_index_block_table,
         c2a_compressor_wkv, c2a_compressor_wgate, c1a_compressor_wkv,
@@ -899,6 +902,7 @@ def l3_decode_fwd(
             [EP_SIZE, FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
         ]
     ],
+    host_token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     position_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[
@@ -986,7 +990,10 @@ def l3_decode_fwd(
     across layers. Host paging helpers lower allocator tables into slots
     without allocating physical pages.
 
-    token_to_req_indices is the single token-to-request map for both families.
+    token_to_req_indices is the device token-to-request map for both families.
+    host_token_to_req_indices is its separate CPU INT32 snapshot for C1A graph construction.
+    Keep both snapshots unchanged until the call completes. Rebuild the HBG graph
+    when request-run boundaries change; captured graphs cannot update that topology.
     query_start_loc contains packed request offsets. Padding uses -1 for
     positions, request IDs and physical rows, and zero for visible lengths.
     Prefill uses the same named family tables and slots and derives lengths
@@ -1090,7 +1097,7 @@ def l3_decode_fwd(
             window_slots[rank], window_indices[rank],
             window_cache_pool[rank], window_cache_scale_pool[rank],
             compressed_cache_pool[rank], compressed_cache_scale_pool[rank],
-            token_to_req_indices[rank], position_ids[rank],
+            host_token_to_req_indices[rank], token_to_req_indices[rank], position_ids[rank],
             index_cache_pool[rank], index_cache_scale_pool[rank],
             c2a_index_block_table[rank], c1a_index_block_table[rank],
             c2a_compressor_wkv[rank], c2a_compressor_wgate[rank], c1a_compressor_wkv[rank],
@@ -1170,7 +1177,7 @@ def build_tensor_specs():
 
     signature = inspect.signature(l3_decode_fwd._func)
     specs = []
-    request_ids = torch.arange(FIXTURE_BATCH, dtype=torch.int32).repeat_interleave(FIXTURE_SEQUENCE)
+    token_to_req_indices = torch.arange(FIXTURE_BATCH, dtype=torch.int32).repeat_interleave(FIXTURE_SEQUENCE)
     position_ids = torch.arange(FIXTURE_SEQUENCE, dtype=torch.int32).repeat(FIXTURE_BATCH)
     query_starts = torch.arange(0, FIXTURE_TOKENS + 1, FIXTURE_SEQUENCE, dtype=torch.int32)
     freqs_cos, freqs_sin = prepare_forward_rope_tables(FIXTURE_SEQUENCE)
@@ -1178,10 +1185,10 @@ def build_tensor_specs():
     window_table = torch.arange(FIXTURE_BATCH, dtype=torch.int32).reshape(FIXTURE_BATCH, 1)
     c2a_table = window_table.flip(0)
     c1a_table = torch.cat((window_table, torch.full_like(window_table, -1)), dim=1)
-    window_slots, window_indices, _ = window_metadata(position_ids, request_ids, window_table)
+    window_slots, window_indices, _ = window_metadata(position_ids, token_to_req_indices, window_table)
     metadata_rows = {"window_slots": window_slots, "window_indices": window_indices}
     for family, ratio, table in (("c2a", 2, c2a_table), ("c1a", 1, c1a_table)):
-        slots = paged_slots(position_ids, request_ids, table, BLOCK_SIZE, ratio, True)
+        slots = paged_slots(position_ids, token_to_req_indices, table, BLOCK_SIZE, ratio, True)
         metadata_rows[family + "_compressed_slots"] = slots
         metadata_rows[family + "_index_block_table"] = table
     for name in l3_decode_fwd.param_names:
@@ -1189,8 +1196,8 @@ def build_tensor_specs():
         shape = [_fixture_extent(dim) for dim in annotation.shape]
         dtype = _torch_dtype(annotation.dtype)
         init_value = None
-        if name == "token_to_req_indices":
-            init_value = request_ids.repeat(EP_SIZE, 1)
+        if name in ("host_token_to_req_indices", "token_to_req_indices"):
+            init_value = token_to_req_indices.repeat(EP_SIZE, 1)
         elif name == "position_ids":
             init_value = position_ids.repeat(EP_SIZE, 1)
         elif name in rope_tables:
@@ -1273,7 +1280,7 @@ if __name__ == "__main__":
             result.work_dir, backend_type=cfg.backend_type, execution_mode=cfg.execution_mode,
             distributed_config=cfg.distributed_config,
         )
-        replicated = ('moe_num_tokens', 'attention_num_tokens')
+        replicated = ('moe_num_tokens', 'attention_num_tokens', 'host_token_to_req_indices')
         host_inputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in replicated}
         output_names = ("logits", "sampled_ids")
         host_outputs = {spec.name: spec.create_tensor().share_memory_() for spec in specs if spec.name in output_names}

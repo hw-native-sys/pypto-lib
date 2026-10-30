@@ -100,7 +100,12 @@ def expert_routed_scatter(
             routed_w1_packed_e = routed_w1_packed[local_i, :, :]
             routed_w3_packed_e = routed_w3_packed[local_i, :, :]
 
-            n_rows = pl.read(recv_expert_count, [local_i, 0])
+            # Keep the dispatch count in device tasks only.  Reading this
+            # runtime-produced tensor while building the host graph makes the
+            # tensor both host and device visible, which HBG rejects.  The
+            # scatter stage still uses recv_meta to limit externally visible
+            # rows, so processing the fixed receive capacity is safe here.
+            n_rows = RECV_MAX
             if n_rows > 0:
                 n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
                 with pl.scope():
@@ -262,7 +267,7 @@ def expert_routed_scatter(
                 e_flat_base = local_e * RECV_MAX
                 routed_w2_packed_e = routed_w2_packed[local_e, :, :]
 
-                e_rows = pl.read(recv_expert_count, [local_e, 0])
+                e_rows = RECV_MAX
                 if e_rows > 0:
                     e_tiles = (e_rows + RECV_TILE - 1) // RECV_TILE
                     with pl.scope():

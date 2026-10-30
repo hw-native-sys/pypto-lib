@@ -232,7 +232,7 @@ def _make_materialize_index_topk():
     def materialize(
         scores: pl.Tensor,
         block_table: pl.Tensor,
-        request_ids: pl.Tensor,
+        token_to_req_indices: pl.Tensor,
         output: pl.Tensor,
         token: pl.Scalar[pl.INDEX],
         width: pl.Scalar[pl.INDEX],
@@ -240,7 +240,7 @@ def _make_materialize_index_topk():
         tie_quota: pl.Scalar[pl.INDEX],
     ):
         """Compact winners in logical order and gather physical pages from UB."""
-        request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+        request = pl.cast(pl.read(token_to_req_indices, [token]), pl.INDEX)
         table_width = pl.tensor.dim(block_table, 1)
         valid_pages = pl.min(table_width, TOPK_CACHED_PAGES)
         raw_pages = pl.load(block_table, [request, 0], [1, TOPK_CACHED_PAGES], valid_shape=[1, valid_pages])
@@ -675,7 +675,7 @@ def _make_query_interval_index_scores(interval_pages, skip_short=False, workers=
         index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
         index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, _SCALE_COUNT], pl.FP8E8M0],
         block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        request_ids: pl.Tensor[[T_DYN], pl.INT32],
+        token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
         lengths: pl.Tensor[[T_DYN], pl.INT32],
         output: pl.Tensor,
         num_tokens: pl.Scalar[pl.INT32],
@@ -704,7 +704,7 @@ def _make_query_interval_index_scores(interval_pages, skip_short=False, workers=
                 token = work // intervals
                 panel_begin = (work % intervals) * interval_pages
                 panel_end = pl.min(panels, panel_begin + interval_pages)
-                request = pl.read(request_ids, [token])
+                request = pl.read(token_to_req_indices, [token])
                 visible = pl.min(pl.read(lengths, [token]), width)
                 if skip_short:
                     if visible <= INDEX_TOPK:
@@ -794,7 +794,7 @@ def _make_page_index_scores(workers, skip_short=False):
         index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
         index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
         block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        request_ids: pl.Tensor[[T_DYN], pl.INT32],
+        token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
         lengths: pl.Tensor[[T_DYN], pl.INT32],
         output: pl.Tensor,
         num_tokens: pl.Scalar[pl.INT32],
@@ -822,14 +822,14 @@ def _make_page_index_scores(workers, skip_short=False):
                 panel = work % tiles
                 logical_begin = panel * tile_n
                 output_count = pl.min(tile_n, width - logical_begin)
-                first_request = pl.read(request_ids, [first_token])
+                first_request = pl.read(token_to_req_indices, [first_token])
                 second_token = pl.min(first_token + 1, num_tokens - 1)
-                second_request = pl.read(request_ids, [second_token])
+                second_request = pl.read(token_to_req_indices, [second_token])
                 for anchor_offset in pl.range(2):
                     anchor = first_token + anchor_offset
                     if anchor < num_tokens:
                         if anchor_offset == 0 or first_request != second_request:
-                            anchor_request = pl.read(request_ids, [anchor])
+                            anchor_request = pl.read(token_to_req_indices, [anchor])
                             maximum_visible = pl.min(pl.read(lengths, [anchor]), width)
                             if skip_short:
                                 if maximum_visible <= INDEX_TOPK:
@@ -926,7 +926,7 @@ def _make_page_index_scores(workers, skip_short=False):
                                         for query_offset in pl.range(2):
                                             token = first_token + query_offset
                                             if token < num_tokens:
-                                                query_request = pl.read(request_ids, [token])
+                                                query_request = pl.read(token_to_req_indices, [token])
                                                 if query_request == anchor_request:
                                                     negative_bits = pl.tile.full([1, tile_n], dtype=pl.INT32, value=-8388608)
                                                     masked = pl.reinterpret_view(negative_bits, pl.FP32)
@@ -981,7 +981,7 @@ def _make_page_index_scores(workers, skip_short=False):
                                     for query_offset in pl.range(2):
                                         token = first_token + query_offset
                                         if token < num_tokens:
-                                            query_request = pl.read(request_ids, [token])
+                                            query_request = pl.read(token_to_req_indices, [token])
                                             if query_request == anchor_request:
                                                 negative_bits = pl.tile.full([1, tile_n], dtype=pl.INT32, value=-8388608)
                                                 masked = pl.reinterpret_view(negative_bits, pl.FP32)
@@ -994,7 +994,7 @@ def _make_page_index_scores(workers, skip_short=False):
                                 for query_offset in pl.range(2):
                                     token = first_token + query_offset
                                     if token < num_tokens:
-                                        query_request = pl.read(request_ids, [token])
+                                        query_request = pl.read(token_to_req_indices, [token])
                                         if query_request == anchor_request:
                                             negative_bits = pl.tile.full([1, tile_n], dtype=pl.INT32, value=-8388608)
                                             masked = pl.reinterpret_view(negative_bits, pl.FP32)
@@ -1020,7 +1020,7 @@ def _make_request_block_index_scores(skip_short=False, workers=32):
         index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, _PAGE_SIZE, 1, INDEX_DIM // 2], pl.UINT8],
         index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, _PAGE_SIZE, 1, _SCALE_COUNT], pl.FP8E8M0],
         block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        request_ids: pl.Tensor[[T_DYN], pl.INT32],
+        token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
         lengths: pl.Tensor[[T_DYN], pl.INT32],
         output: pl.Tensor,
         runs: pl.Tensor,
@@ -1054,7 +1054,7 @@ def _make_request_block_index_scores(skip_short=False, workers=32):
                 run_end = pl.read(runs, [1, run])
                 macro_index = work % macro_tiles
                 logical_begin = macro_index * _SCORE_MACRO_N_TILE
-                first_request = pl.read(request_ids, [run_begin])
+                first_request = pl.read(token_to_req_indices, [run_begin])
                 maximum_visible = pl.read(runs, [2, run])
 
                 for group_begin in pl.range(run_begin, run_end, _SCORE_QUERY_TILE):
@@ -1239,7 +1239,7 @@ def _make_request_block_index_scores(skip_short=False, workers=32):
 
 @pl.jit.inline
 def use_pretransposed_index_query(
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     lengths: pl.Tensor[[T_DYN], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     width: pl.Scalar[pl.INDEX],
@@ -1249,7 +1249,7 @@ def use_pretransposed_index_query(
     if num_tokens > 0 and num_tokens <= 16 and num_tokens % 2 == 0 and width >= 4096:
         eligible = pl.cast(1, pl.INT32)
         for token in pl.range(1, num_tokens):
-            if pl.read(request_ids, [token - 1]) == pl.read(request_ids, [token]):
+            if pl.read(host_token_to_req_indices, [token - 1]) == pl.read(host_token_to_req_indices, [token]):
                 eligible = pl.cast(0, pl.INT32)
         if skip_short:
             long_rows = pl.cast(0, pl.INT32)
@@ -1259,6 +1259,24 @@ def use_pretransposed_index_query(
             if long_rows == 0:
                 eligible = pl.cast(0, pl.INT32)
     return eligible
+
+
+@pl.jit.inline
+def _use_request_block_scores(host_token_to_req_indices: pl.Tensor, num_tokens: pl.Scalar[pl.INT32]):
+    """Select request-block scoring from contiguous request-run lengths."""
+    run_count = pl.cast(1, pl.INT32)
+    run_start = pl.cast(0, pl.INT32)
+    maximum_queries = pl.cast(0, pl.INT32)
+    for token in pl.range(1, num_tokens):
+        if pl.read(host_token_to_req_indices, [token - 1]) != pl.read(host_token_to_req_indices, [token]):
+            maximum_queries = pl.max(maximum_queries, pl.cast(token - run_start, pl.INT32))
+            run_count = run_count + pl.cast(1, pl.INT32)
+            run_start = pl.cast(token, pl.INT32)
+    maximum_queries = pl.max(maximum_queries, num_tokens - run_start)
+    use_request = pl.cast(1, pl.INT32)
+    if maximum_queries <= 2 and num_tokens < 2 * run_count:
+        use_request = pl.cast(0, pl.INT32)
+    return use_request
 
 
 def make_index_scores(skip_short=False, pretransposed=False, request_workers=32):
@@ -1277,7 +1295,8 @@ def make_index_scores(skip_short=False, pretransposed=False, request_workers=32)
         index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
         index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
         block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        request_ids: pl.Tensor[[T_DYN], pl.INT32],
+        token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+        host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
         lengths: pl.Tensor[[T_DYN], pl.INT32],
         output: pl.Tensor,
         num_tokens: pl.Scalar[pl.INT32],
@@ -1294,14 +1313,14 @@ def make_index_scores(skip_short=False, pretransposed=False, request_workers=32)
             query_interval_route = private_route
         else:
             query_interval_route = use_pretransposed_index_query(
-                request_ids, lengths, num_tokens, width, skip_short=False,
+                host_token_to_req_indices, lengths, num_tokens, width, skip_short=False,
             )
         long_rows = pl.cast(num_tokens, pl.INT32)
         if skip_short:
-            long_rows = pl.cast(0, pl.INT32)
-            for token in pl.range(num_tokens):
-                if pl.read(lengths, [token]) > INDEX_TOPK:
-                    long_rows = long_rows + pl.cast(1, pl.INT32)
+            # Keep the route decision independent of graph-time reads from
+            # the runtime-owned compressed-length tensor.  Short rows are
+            # overwritten by the device short-topk stage after scoring.
+            long_rows = pl.cast(num_tokens, pl.INT32)
         if long_rows == 0:
             result = pl.system.task_dummy(deps=[cache_ready, query_ready, weights_ready])
         elif query_interval_route != 0:
@@ -1314,26 +1333,26 @@ def make_index_scores(skip_short=False, pretransposed=False, request_workers=32)
                 if pretransposed:
                     result = query_intervals8(
                         private_query, query_scale, weights, index_cache, index_cache_scale,
-                        block_table, request_ids, lengths, output,
+                        block_table, token_to_req_indices, lengths, output,
                         num_tokens, cache_ready, query_ready, weights_ready,
                     )
                 else:
                     result = query_intervals8(
                         query, query_scale, weights, index_cache, index_cache_scale,
-                        block_table, request_ids, lengths, output,
+                        block_table, token_to_req_indices, lengths, output,
                         num_tokens, cache_ready, query_ready, weights_ready,
                     )
             else:
                 if pretransposed:
                     result = query_intervals4(
                         private_query, query_scale, weights, index_cache, index_cache_scale,
-                        block_table, request_ids, lengths, output,
+                        block_table, token_to_req_indices, lengths, output,
                         num_tokens, cache_ready, query_ready, weights_ready,
                     )
                 else:
                     result = query_intervals4(
                         query, query_scale, weights, index_cache, index_cache_scale,
-                        block_table, request_ids, lengths, output,
+                        block_table, token_to_req_indices, lengths, output,
                         num_tokens, cache_ready, query_ready, weights_ready,
                     )
         elif width >= 4096:
@@ -1344,15 +1363,13 @@ def make_index_scores(skip_short=False, pretransposed=False, request_workers=32)
                 run_start = pl.cast(0, pl.INT32)
                 previous_request = pl.cast(-1, pl.INT32)
                 maximum_visible = pl.cast(0, pl.INT32)
-                maximum_queries = pl.cast(0, pl.INT32)
                 for token in pl.range(num_tokens):
-                    request = pl.read(request_ids, [token])
+                    request = pl.read(token_to_req_indices, [token])
                     if token > 0:
                         if request != previous_request:
                             pl.write(runs, [0, run_count], run_start)
                             pl.write(runs, [1, run_count], pl.cast(token, pl.INT32))
                             pl.write(runs, [2, run_count], maximum_visible)
-                            maximum_queries = pl.max(maximum_queries, pl.cast(token - run_start, pl.INT32))
                             run_count = run_count + pl.cast(1, pl.INT32)
                             run_start = pl.cast(token, pl.INT32)
                             maximum_visible = pl.cast(0, pl.INT32)
@@ -1365,56 +1382,82 @@ def make_index_scores(skip_short=False, pretransposed=False, request_workers=32)
                 pl.write(runs, [0, run_count], run_start)
                 pl.write(runs, [1, run_count], pl.cast(num_tokens, pl.INT32))
                 pl.write(runs, [2, run_count], maximum_visible)
-                maximum_queries = pl.max(maximum_queries, num_tokens - run_start)
                 run_count = run_count + pl.cast(1, pl.INT32)
-                use_request = pl.cast(1, pl.INT32)
-                # Mixed single queries and pairs have no cross-pair K reuse to
-                # justify padded M64 dots. Complete pairs still use the wider tile.
-                if maximum_queries <= 2:
-                    if num_tokens < 2 * run_count:
-                        use_request = pl.cast(0, pl.INT32)
                 pl.write(runs, [3, 0], run_count)
-                pl.write(runs, [3, 1], use_request)
-            if pl.read(runs, [3, 1]) == 0:
+            use_request = _use_request_block_scores(host_token_to_req_indices, num_tokens)
+            if use_request == 0:
                 ready = pl.system.task_dummy(deps=[cache_ready, query_ready, weights_ready, plan_tid])
                 result = general(
                     query, query_scale, weights, index_cache, index_cache_scale,
-                    block_table, request_ids, lengths, output,
+                    block_table, token_to_req_indices, lengths, output,
                     num_tokens, ready, ready, ready,
                 )
             else:
                 result = request_blocks(
                     query, query_scale, weights, index_cache, index_cache_scale,
-                    block_table, request_ids, lengths, output,
+                    block_table, token_to_req_indices, lengths, output,
                     runs, cache_ready, query_ready, weights_ready, plan_tid,
                 )
         elif paired_panels <= 16:
             result = general_small(
                 query, query_scale, weights, index_cache, index_cache_scale,
-                block_table, request_ids, lengths, output,
+                block_table, token_to_req_indices, lengths, output,
                 num_tokens, cache_ready, query_ready, weights_ready,
             )
         else:
             result = general(
                 query, query_scale, weights, index_cache, index_cache_scale,
-                block_table, request_ids, lengths, output,
+                block_table, token_to_req_indices, lengths, output,
                 num_tokens, cache_ready, query_ready, weights_ready,
             )
         return result
 
-    return score
+    @pl.jit.inline
+    def score_fixed_route(
+        query: pl.Tensor[[T_DYN, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+        query_scale: pl.Tensor[[T_DYN, INDEX_H * 4], pl.FP8E8M0],
+        weights: pl.Tensor[[T_DYN, INDEX_H], pl.BF16],
+        index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+        index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
+        block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+        token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+        lengths: pl.Tensor[[T_DYN], pl.INT32],
+        output: pl.Tensor,
+        num_tokens: pl.Scalar[pl.INT32],
+        cache_ready: pl.Scalar[pl.TASK_ID],
+        query_ready: pl.Scalar[pl.TASK_ID],
+        weights_ready: pl.Scalar[pl.TASK_ID],
+    ):
+        """Score a reindex pool without graph-time request-map access."""
+        width = pl.tensor.dim(output, 1)
+        panels = (width + _PAGE_SIZE - 1) // _PAGE_SIZE
+        paired_panels = ((num_tokens + 1) // 2) * panels
+        result = general(
+            query, query_scale, weights, index_cache, index_cache_scale,
+            block_table, token_to_req_indices, lengths, output,
+            num_tokens, cache_ready, query_ready, weights_ready,
+        )
+        if paired_panels <= 16:
+            result = general_small(
+                query, query_scale, weights, index_cache, index_cache_scale,
+                block_table, token_to_req_indices, lengths, output,
+                num_tokens, cache_ready, query_ready, weights_ready,
+            )
+        return result
 
+    return score, score_fixed_route
 
-score_full = make_index_scores()
-score_full_pretransposed = make_index_scores(pretransposed=True)
-score_c2a_full = make_index_scores(skip_short=True)
-_score_c1a_request_group = make_index_scores(request_workers=16)
-_score_c2a_request_group = make_index_scores(skip_short=True, request_workers=16)
+score_full, _ = make_index_scores()
+score_full_pretransposed, _ = make_index_scores(pretransposed=True)
+score_c2a_full, _ = make_index_scores(skip_short=True)
+_score_c1a_request_group, _ = make_index_scores(request_workers=16)
+_score_c2a_request_group, _ = make_index_scores(skip_short=True, request_workers=16)
+score_reindex_dense = make_index_scores()[1]
 
 
 @pl.jit.inline
 def _use_request_groups(
-    request_ids: pl.Tensor,
+    host_token_to_req_indices: pl.Tensor,
     lengths: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     width: pl.Scalar[pl.INDEX],
@@ -1424,12 +1467,12 @@ def _use_request_groups(
     grouped = pl.cast(0, pl.INT32)
     middle = pl.cast(num_tokens // 2, pl.INDEX)
     if width == expected_width and middle > 0:
-        if pl.read(request_ids, [middle - 1]) != pl.read(request_ids, [middle]):
+        if pl.read(host_token_to_req_indices, [middle - 1]) != pl.read(host_token_to_req_indices, [middle]):
             grouped = pl.cast(1, pl.INT32)
         if skip_short:
-            for token in pl.range(num_tokens):
-                if pl.read(lengths, [token]) <= INDEX_TOPK:
-                    grouped = pl.cast(0, pl.INT32)
+            # The short-row decision is made by device top-k tasks.  Avoid
+            # reading runtime lengths while constructing the host graph.
+            grouped = pl.cast(0, pl.INT32)
     return grouped
 
 
@@ -1447,7 +1490,7 @@ def _make_pool_index_scores(tile_n, panels_per_task, workers):
         index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
         index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, _SCALE_COUNT], pl.FP8E8M0],
         block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        request_ids: pl.Tensor[[T_DYN], pl.INT32],
+        token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
         lengths: pl.Tensor[[T_DYN], pl.INT32],
         pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
         pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
@@ -1486,7 +1529,7 @@ def _make_pool_index_scores(tile_n, panels_per_task, workers):
                 macro = work - pl.read(prefix, [prefix_row, token])
                 first_slot = macro * blocks_per_task
                 count = pl.max(0, pl.min(pl.read(pool_block_counts, [token]), capacity))
-                request = pl.read(request_ids, [token])
+                request = pl.read(token_to_req_indices, [token])
                 visible = pl.max(0, pl.read(lengths, [token]))
                 query_panel = pl.load(query_flat, [token * INDEX_H, 0], [INDEX_H, INDEX_DIM])
                 query_scale_raw = pl.reinterpret_view(
@@ -1592,7 +1635,7 @@ def score_reindex(
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, _SCALE_COUNT], pl.FP8E8M0],
     block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     lengths: pl.Tensor[[T_DYN], pl.INT32],
     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
@@ -1627,7 +1670,7 @@ def score_reindex(
         for token in pl.range(begin, end):
             count = pl.max(0, pl.min(pl.read(pool_block_counts, [token]), capacity))
             visible = pl.max(0, pl.read(lengths, [token]))
-            request = pl.read(request_ids, [token])
+            request = pl.read(token_to_req_indices, [token])
             if request < 0 or request >= pl.tensor.dim(block_table, 0):
                 dense = pl.cast(0, pl.INT32)
             if count != (visible + 7) // 8 or visible > pl.tensor.dim(block_table, 1) * 128:
@@ -1699,36 +1742,14 @@ def score_reindex(
             invalid = pl.reinterpret_view(pl.tile.full([1, 128], dtype=pl.INT32, value=-8388608), pl.FP32)
             pl.store(pl.set_validshape(invalid, 1, pl.min(128, width - begin)), [token, begin], output)
     ready = pl.system.task_dummy(deps=[cache_ready, query_ready, weights_ready, plan_tid, clear_tid])
-    small = pl.read(route, [0, 0])
-    block = pl.read(route, [0, 1])
-    macro = pl.read(route, [0, 2])
-    wide = 0
-    if 2 * block == small:
-        if macro >= 32:
-            wide = 2
-        elif block >= 32:
-            wide = 1
-    dense = pl.read(route, [0, 3])
-    if small == 0:
-        result = ready
-    elif dense == 1:
-        result = score_full(
-            query, query_scale, weights, index_cache, index_cache_scale,
-            block_table, request_ids, lengths, output, num_tokens, ready, ready, ready, query, 0,
-        )
-    elif wide == 2:
-        result = _pool_macro(query, query_scale, weights, index_cache, index_cache_scale, block_table,
-                             request_ids, lengths, pool_block_ids, pool_block_counts, prefix, output, num_tokens, ready)
-    elif wide == 1:
-        result = _pool_block(query, query_scale, weights, index_cache, index_cache_scale, block_table,
-                             request_ids, lengths, pool_block_ids, pool_block_counts, prefix, output, num_tokens, ready)
-    elif small <= 16:
-        result = _pool_page_small(query, query_scale, weights, index_cache, index_cache_scale, block_table,
-                                  request_ids, lengths, pool_block_ids, pool_block_counts, prefix, output, num_tokens, ready)
-    else:
-        result = _pool_page(query, query_scale, weights, index_cache, index_cache_scale, block_table,
-                            request_ids, lengths, pool_block_ids, pool_block_counts, prefix, output, num_tokens, ready)
-    return result
+    # Keep route selection device-side.  The pool page scorer handles dense,
+    # block, and macro candidate pools and avoids reading the runtime route
+    # tensor while building the host graph.
+    return _pool_page(
+        query, query_scale, weights, index_cache, index_cache_scale, block_table,
+        token_to_req_indices, lengths, pool_block_ids, pool_block_counts, prefix, output,
+        num_tokens, ready,
+    )
 
 
 _TOPK_PAGE = 128
@@ -1804,7 +1825,7 @@ def _make_select_index_topk(leaf_workers=32, row_workers=32):
     def select_index_topk(
         index_scores: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.FP32],
         block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        request_ids: pl.Tensor[[T_DYN], pl.INT32],
+        token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
         output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
         num_tokens: pl.Scalar[pl.INT32],
         scores_ready: pl.Scalar[pl.TASK_ID],
@@ -1819,7 +1840,7 @@ def _make_select_index_topk(leaf_workers=32, row_workers=32):
                     invalid_bits = pl.tile.full([1, 8], dtype=pl.INT32, value=_TOPK_INVALID_SCORE_BITS)
                     invalid_score = pl.tile.read(pl.reinterpret_view(invalid_bits, pl.FP32), [0, 0])
                     materialize(
-                        index_scores, block_table, request_ids, output,
+                        index_scores, block_table, token_to_req_indices, output,
                         token, width, invalid_score, pl.cast(0, pl.INDEX),
                     )
             topk_tid = pl.yield_(short_tid)
@@ -1867,7 +1888,7 @@ def _make_select_index_topk(leaf_workers=32, row_workers=32):
                         partial = pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
                         above = above + pl.cast(partial, pl.INDEX)
                     materialize(
-                        index_scores, block_table, request_ids, output,
+                        index_scores, block_table, token_to_req_indices, output,
                         token, width, cutoff, INDEX_TOPK - above,
                     )
             topk_tid = pl.yield_(merge_tid)
@@ -1889,7 +1910,8 @@ def score_select_c1a_groups(
     index_cache: pl.Tensor,
     index_cache_scale: pl.Tensor,
     block_table: pl.Tensor,
-    request_ids: pl.Tensor,
+    token_to_req_indices: pl.Tensor,
+    host_token_to_req_indices: pl.Tensor,
     lengths: pl.Tensor,
     scores: pl.Tensor,
     output: pl.Tensor,
@@ -1903,7 +1925,7 @@ def score_select_c1a_groups(
 ):
     """Score and select two request-aligned query groups or the full score arena."""
     width = pl.tensor.dim(scores, 1)
-    grouped = _use_request_groups(request_ids, lengths, num_tokens, width, C1A_REQUEST_GROUP_SCORE_WIDTH, False)
+    grouped = _use_request_groups(host_token_to_req_indices, lengths, num_tokens, width, C1A_REQUEST_GROUP_SCORE_WIDTH, False)
     block_count = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
     # Grouped scoring leaves the caller's scores arena unwritten. Keep grouping
     # disabled when the pool selector needs those scores to rank excess blocks.
@@ -1919,12 +1941,13 @@ def score_select_c1a_groups(
             group_query = pl.slice(query, [group_rows, INDEX_H * INDEX_DIM], [begin, 0])
             group_scale = pl.slice(query_scale, [group_rows, INDEX_H * _SCALE_COUNT], [begin, 0])
             group_weights = pl.slice(weights, [group_rows, INDEX_H], [begin, 0])
-            group_requests = pl.slice(request_ids, [group_rows], [begin])
+            group_requests = pl.slice(token_to_req_indices, [group_rows], [begin])
+            group_host_requests = pl.slice(host_token_to_req_indices, [group_rows], [begin])
             group_lengths = pl.slice(lengths, [group_rows], [begin])
             group_scores = pl.create_tensor([group_rows, width], dtype=pl.FP32)
             score_tid = _score_c1a_request_group(
                 group_query, group_scale, group_weights, index_cache, index_cache_scale,
-                block_table, group_requests, group_lengths, group_scores,
+                block_table, group_requests, group_host_requests, group_lengths, group_scores,
                 pl.cast(group_rows, pl.INT32), cache_ready, query_ready, weights_ready, group_query, 0,
             )
             group_output = pl.slice(output, [group_rows, INDEX_TOPK], [begin, 0])
@@ -1938,10 +1961,10 @@ def score_select_c1a_groups(
     else:
         scores_tid = score_full_pretransposed(
             query, query_scale, weights, index_cache, index_cache_scale,
-            block_table, request_ids, lengths, scores,
+            block_table, token_to_req_indices, host_token_to_req_indices, lengths, scores,
             num_tokens, cache_ready, query_ready, weights_ready, private_query, private_route,
         )
-        selected = select_index_topk(scores, block_table, request_ids, output, num_tokens, scores_tid)
+        selected = select_index_topk(scores, block_table, token_to_req_indices, output, num_tokens, scores_tid)
         completion[0] = selected
         completion[1] = scores_tid
     return completion[0], completion[1]
@@ -1952,7 +1975,7 @@ def _materialize_pool_index_topk(
     scores: pl.Tensor[[T_DYN, INDEX_POOL_POSITIONS_DYN], pl.FP32],
     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
     block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     token: pl.Scalar[pl.INDEX],
     width: pl.Scalar[pl.INDEX],
@@ -1960,7 +1983,7 @@ def _materialize_pool_index_topk(
     tie_quota: pl.Scalar[pl.INDEX],
 ):
     """Map compact winners through candidate block IDs before looking up pages."""
-    request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+    request = pl.cast(pl.read(token_to_req_indices, [token]), pl.INDEX)
     pl.store(pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1), [token, 0], output)
     if request >= 0 and request < pl.tensor.dim(block_table, 0) and pl.tensor.dim(block_table, 1) > 0:
         capacity = pl.tensor.dim(pool_block_ids, 1)
@@ -2057,7 +2080,7 @@ def select_pool_index_topk(
     pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
     block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     lengths: pl.Tensor[[T_DYN], pl.INT32],
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -2073,7 +2096,7 @@ def select_pool_index_topk(
                 invalid_bits = pl.tile.full([1, 8], dtype=pl.INT32, value=_TOPK_INVALID_SCORE_BITS)
                 invalid_score = pl.tile.read(pl.reinterpret_view(invalid_bits, pl.FP32), [0, 0])
                 _materialize_pool_index_topk(
-                    index_scores, pool_block_ids, block_table, request_ids, output,
+                    index_scores, pool_block_ids, block_table, token_to_req_indices, output,
                     token, width, invalid_score, pl.cast(0, pl.INDEX),
                 )
         result = pl.yield_(short_tid)
@@ -2121,7 +2144,7 @@ def select_pool_index_topk(
                     partial = pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
                     above = above + pl.cast(partial, pl.INDEX)
                 _materialize_pool_index_topk(
-                    index_scores, pool_block_ids, block_table, request_ids, output,
+                    index_scores, pool_block_ids, block_table, token_to_req_indices, output,
                     token, width, cutoff, INDEX_TOPK - above,
                 )
         result = pl.yield_(merge_tid)
@@ -2293,14 +2316,14 @@ def prepare_c2a_index_key(
 @pl.jit.inline
 def _write_c2a_short_topk(
     block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    request_ids: pl.Tensor,
+    token_to_req_indices: pl.Tensor,
     lengths: pl.Tensor,
     output: pl.Tensor,
     token: pl.Scalar[pl.INDEX],
 ):
     """Map an unscored C2A history of at most TopK positions to physical rows."""
     length = pl.read(lengths, [token])
-    request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+    request = pl.cast(pl.read(token_to_req_indices, [token]), pl.INDEX)
     lanes = pl.tile.arange(0, [1, _TOPK_PAGE], dtype=pl.INT32)
     invalid = pl.tile.full([1, _TOPK_PAGE], dtype=pl.INT32, value=-1)
     for start in pl.range(0, INDEX_TOPK, _TOPK_PAGE):
@@ -2339,7 +2362,7 @@ def _sort_c2a_long_topk_physical(
 @pl.jit.inline(auto_scope=False)
 def _c2a_topk_all_long_ready(
     block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    request_ids: pl.Tensor,
+    token_to_req_indices: pl.Tensor,
     lengths: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
@@ -2352,7 +2375,7 @@ def _make_c2a_short_topk(row_workers):
     @pl.jit.inline(auto_scope=False)
     def short_stage(
         block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        request_ids: pl.Tensor,
+        token_to_req_indices: pl.Tensor,
         lengths: pl.Tensor,
         output: pl.Tensor,
         num_tokens: pl.Scalar[pl.INT32],
@@ -2362,7 +2385,7 @@ def _make_c2a_short_topk(row_workers):
             worker = pl.tile.get_block_idx()
             for token in pl.range(worker, num_tokens, row_workers):
                 if pl.read(lengths, [token]) <= INDEX_TOPK:
-                    _write_c2a_short_topk(block_table, request_ids, lengths, output, token)
+                    _write_c2a_short_topk(block_table, token_to_req_indices, lengths, output, token)
         return short_tid
 
     return short_stage
@@ -2376,7 +2399,7 @@ def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False)
     def select_c2a_index_topk(
         index_scores: pl.Tensor,
         block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-        request_ids: pl.Tensor,
+        token_to_req_indices: pl.Tensor,
         lengths: pl.Tensor,
         output: pl.Tensor,
         num_tokens: pl.Scalar[pl.INT32],
@@ -2389,7 +2412,7 @@ def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False)
         # Preserve a directly visible query dimension in each generated wrapper.
         pair_storage = pl.create_tensor([tokens, leaf_count * _TOPK_PAIR_WIDTH], dtype=pl.FP32)
 
-        short_tid = short_stage(block_table, request_ids, lengths, output, num_tokens, scores_ready)
+        short_tid = short_stage(block_table, token_to_req_indices, lengths, output, num_tokens, scores_ready)
 
         total_leaves = pl.cast(num_tokens, pl.INDEX) * leaf_count
         with pl.spmd(leaf_workers, name_hint="idx_topk_leaf", deps=[scores_ready]) as leaf_tid:
@@ -2432,7 +2455,7 @@ def _make_select_c2a_index_topk(leaf_workers=32, row_workers=32, all_long=False)
                     for lane in pl.unroll(8):
                         above = above + pl.cast(pl.tile.read(sums8, [0, lane]), pl.INT32)
                     materialize(
-                        index_scores, block_table, request_ids, output,
+                        index_scores, block_table, token_to_req_indices, output,
                         token, width, cutoff, INDEX_TOPK - above,
                     )
 
@@ -2458,7 +2481,8 @@ def _score_select_c2a_groups(
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, _SCALE_COUNT], pl.FP8E8M0],
     block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     lengths: pl.Tensor[[T_DYN], pl.INT32],
     scores: pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.FP32],
     output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
@@ -2469,7 +2493,7 @@ def _score_select_c2a_groups(
 ):
     """Select C2A rows with independent score and TopK groups."""
     width = pl.tensor.dim(scores, 1)
-    request_grouped = _use_request_groups(request_ids, lengths, num_tokens, width, C2A_REQUEST_GROUP_SCORE_WIDTH, True)
+    request_grouped = _use_request_groups(host_token_to_req_indices, lengths, num_tokens, width, C2A_REQUEST_GROUP_SCORE_WIDTH, True)
     if request_grouped != 0:
         group_done = pl.array.create(2, pl.TASK_ID)
         split_rows = pl.cast(num_tokens, pl.INDEX) // 2
@@ -2479,12 +2503,13 @@ def _score_select_c2a_groups(
             group_query = pl.slice(query, [group_rows, INDEX_H * INDEX_DIM], [begin, 0])
             group_scale = pl.slice(query_scale, [group_rows, INDEX_H * _SCALE_COUNT], [begin, 0])
             group_weights = pl.slice(weights, [group_rows, INDEX_H], [begin, 0])
-            group_requests = pl.slice(request_ids, [group_rows], [begin])
+            group_requests = pl.slice(token_to_req_indices, [group_rows], [begin])
+            group_host_requests = pl.slice(host_token_to_req_indices, [group_rows], [begin])
             group_lengths = pl.slice(lengths, [group_rows], [begin])
             group_scores = pl.create_tensor([group_rows, width], dtype=pl.FP32)
             score_tid = _score_c2a_request_group(
                 group_query, group_scale, group_weights, index_cache, index_cache_scale,
-                block_table, group_requests, group_lengths, group_scores,
+                block_table, group_requests, group_host_requests, group_lengths, group_scores,
                 pl.cast(group_rows, pl.INT32), cache_ready, query_ready, weights_ready, group_query, 0,
             )
             group_output = pl.slice(output, [group_rows, INDEX_TOPK], [begin, 0])
@@ -2496,11 +2521,11 @@ def _score_select_c2a_groups(
     else:
         scores_tid = score_c2a_full(
             query, query_scale, weights, index_cache, index_cache_scale,
-            block_table, request_ids, lengths, scores,
+            block_table, token_to_req_indices, host_token_to_req_indices, lengths, scores,
             num_tokens, cache_ready, query_ready, weights_ready, query, 0,
         )
         result = select_c2a_index_topk(
-            scores, block_table, request_ids, lengths, output, num_tokens, scores_tid,
+            scores, block_table, token_to_req_indices, lengths, output, num_tokens, scores_tid,
         )
     return result
 
@@ -2525,6 +2550,7 @@ def decode_c2a_indexer(
     index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, (INDEX_DIM // INDEX_CACHE_GROUP)], pl.FP8E8M0],
     index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -2555,7 +2581,7 @@ def decode_c2a_indexer(
     )
     return _score_select_c2a_groups(
         query, query_scale, raw_weights, index_cache, index_cache_scale,
-        index_block_table, token_to_req_indices, compressed_lens, scores, topk_indices,
+        index_block_table, token_to_req_indices, host_token_to_req_indices, compressed_lens, scores, topk_indices,
         num_tokens, index_publish_tid, query_tid, weights_tid,
     )
 
@@ -2713,7 +2739,7 @@ def golden_c1a_index_scores(a, qr, index_payload, index_scale):
     for t in range(x.shape[0]):
         count = max(0, min(int(lengths[t]), width))
         pos = torch.arange(count)
-        pages = a["index_block_table"][a["request_ids"][t].long(), pos // 128]
+        pages = a["index_block_table"][a["token_to_req_indices"][t].long(), pos // 128]
         valid = pages >= 0
         valid_pos = pos[valid]
         rows = pages[valid] * 128 + valid_pos % 128

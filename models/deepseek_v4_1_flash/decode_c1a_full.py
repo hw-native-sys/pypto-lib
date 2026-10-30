@@ -74,7 +74,8 @@ def decode_c1a_full(
     window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
     compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    device_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
@@ -96,6 +97,14 @@ def decode_c1a_full(
     next_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
+    """Run C1A with separate graph-control and device request mappings.
+
+    host_token_to_req_indices is a CPU INT32 tensor under HBG. device_token_to_req_indices is
+    the identical token-to-batch-row mapping consumed by device tasks. Both
+    come from one scheduling snapshot and remain valid until completion.
+    Ordinary HBG calls rebuild routing for each snapshot. External graph
+    capture must recapture when request-run boundaries or shapes change.
+    """
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -153,7 +162,7 @@ def decode_c1a_full(
     # Logical index score capacity.
     score_width = pl.tensor.dim(index_block_table, 1) * 128
     private_route = use_pretransposed_index_query(
-        request_ids, compressed_lens, num_tokens, score_width, skip_short=False,
+        host_token_to_req_indices, compressed_lens, num_tokens, score_width, skip_short=False,
     )
     private_query = pl.create_tensor([16, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
     (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
@@ -164,7 +173,7 @@ def decode_c1a_full(
     )
     topk_tid, scores_tid = score_select_c1a_groups(
         index_query, index_query_scale, index_weights,
-        index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
+        index_cache, index_cache_scale, index_block_table, device_token_to_req_indices, host_token_to_req_indices, compressed_lens,
         scores, topk_indices,
         num_tokens, index_ready, query_tid, weights_tid, private_query, private_route,
         pl.tensor.dim(pool_block_ids, 1),
@@ -221,7 +230,8 @@ def l2_decode_c1a_full(
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    device_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -262,7 +272,7 @@ def l2_decode_c1a_full(
         rope_cos, rope_sin,
         window_slots, window_indices,
         window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-        request_ids, compressed_lens,
+        host_token_to_req_indices, device_token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         compressed_rope_cos, compressed_rope_sin,
         compressor_wkv, compressor_norm_weight, compressed_slots,
@@ -303,7 +313,8 @@ def l3_decode_c1a_full(
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
+    device_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -351,7 +362,7 @@ def l3_decode_c1a_full(
         rope_cos, rope_sin,
         window_slots, window_indices,
         window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-        request_ids, compressed_lens,
+        host_token_to_req_indices, device_token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         compressed_rope_cos, compressed_rope_sin,
         compressor_wkv, compressor_norm_weight, compressed_slots,
@@ -385,6 +396,12 @@ def golden_c1a(tensors, mode="full"):
     from rmsnorm import golden_rms_norm
 
     a = dict(tensors)
+    if mode == "full":
+        from utils import validate_request_id_tensors
+
+        active_tokens = int(a.get("num_tokens", a["device_token_to_req_indices"].shape[0]))
+        validate_request_id_tensors(a["host_token_to_req_indices"], a["device_token_to_req_indices"], active_tokens)
+        a["token_to_req_indices"] = a["device_token_to_req_indices"]
     x_hc = a["x_hc"]
     next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
         x_hc, a["hc_attn_fn"], a["hc_attn_scale"], a["hc_attn_base"],
@@ -461,7 +478,8 @@ def golden_c1a(tensors, mode="full"):
 
 
 def build_c1a_specs(
-    mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None, query_lens=None, *, param_names=None,
+    mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None, query_lens=None, *,
+    param_names=None, request_order=None,
 ):
     """Build C1A mHC, attention, cache, and runtime tensor specifications."""
     import torch
@@ -481,7 +499,11 @@ def build_c1a_specs(
     torch.manual_seed(seed)
     # Packed token-to-request split.
     lengths = packed_query_lengths(TOKENS, REQUESTS, query_lens)
-    token_to_req = torch.repeat_interleave(torch.arange(REQUESTS), torch.tensor(lengths)).to(torch.int32)
+    order = list(range(REQUESTS)) if request_order is None else list(request_order)
+    if sorted(order) != list(range(REQUESTS)):
+        raise ValueError("request_order must be a permutation of the batch request rows")
+    ordered_lengths = torch.tensor([lengths[request] for request in order])
+    token_to_req = torch.repeat_interleave(torch.tensor(order), ordered_lengths).to(torch.int32)
     values = {}
     shapes = {
         "wq_a": (D, Q_LORA),
@@ -504,7 +526,7 @@ def build_c1a_specs(
     values["wo_a"], values["wo_a_scale"] = quantize_grouped_mxfp8_weight(values["wo_a"])
     positions = torch.arange(PAGES * 128 - 1, PAGES * 128 - TOKENS - 1, -1)
     if start_pos is not None:
-        positions = torch.cat([torch.arange(pos, pos + length) for pos, length in zip(start_pos, lengths)])
+        positions = torch.cat([torch.arange(start_pos[request], start_pos[request] + lengths[request]) for request in order])
     freqs_cos, freqs_sin = precompute_rope_tables(PAGES * 128, compressed_attention=True)
     values["rope_cos"] = freqs_cos[positions]
     values["rope_sin"] = freqs_sin[positions]
@@ -522,7 +544,9 @@ def build_c1a_specs(
     values["index_wq_b_scale"] = pack_mx_b_scale(index_weight_scale_codes).view(torch.float8_e8m0fnu)
     # Non-negative index head weights.
     values["index_weights_proj"] = pack_bf16_nz((torch.rand(D, INDEX_H) / math.sqrt(D)).to(torch.bfloat16))
-    values["request_ids"] = token_to_req
+    values["token_to_req_indices"] = token_to_req
+    values["host_token_to_req_indices"] = token_to_req.clone()
+    values["device_token_to_req_indices"] = token_to_req.clone()
     values["compressed_lens"] = torch.tensor([PAGES * 128 - t for t in range(TOKENS)], dtype=torch.int32)
     values["index_block_table"] = torch.randperm(PAGES).int().view(1, PAGES).expand(REQUESTS, -1).contiguous()
     if start_pos is not None:
@@ -556,7 +580,7 @@ def build_c1a_specs(
         # Quiet published index keys.
         values["index_norm_weight"] = torch.full((INDEX_DIM,), 2.0**-10, dtype=torch.bfloat16)
         positions = values["compressed_lens"].long() - 1
-        request_rows = values["request_ids"][:, None].long().expand(-1, PAGES)
+        request_rows = values["token_to_req_indices"][:, None].long().expand(-1, PAGES)
         token_tables = values["index_block_table"].gather(0, request_rows)
         physical_pages = token_tables.gather(1, (positions // 128)[:, None]).squeeze(-1).long()
         values["compressed_slots"] = physical_pages * 128 + positions % 128
@@ -571,7 +595,7 @@ def build_c1a_specs(
         if mode == "full":
             positions = values["compressed_lens"].long() - 1
             safe = positions.clamp_min(0)
-            request_rows = values["request_ids"][:, None].long().expand(-1, PAGES)
+            request_rows = values["token_to_req_indices"][:, None].long().expand(-1, PAGES)
             token_tables = values["index_block_table"].gather(0, request_rows)
             physical_pages = token_tables.gather(1, (safe // 128)[:, None]).squeeze(-1).long()
             values["compressed_slots"] = physical_pages * 128 + safe % 128
@@ -623,8 +647,31 @@ def build_c1a_specs(
         TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=partial(torch.clone, values[name]))
         for name in names if name != "num_tokens"
     ]
-    specs.append(ScalarSpec("num_tokens", torch.int32, tokens))
+    specs.append(ScalarSpec("num_tokens", torch.int32, tokens, compile_runtime=True))
     return specs
+
+
+def validate_request_metadata():
+    """Validate reordered, ragged and padded Host/Device mapping snapshots."""
+    import torch
+
+    from utils import validate_request_id_tensors
+
+    host = torch.tensor([2, 0, 0, 1, 1, 1, -1], dtype=torch.int32)
+    device = host.clone()
+    validate_request_id_tensors(host, device, 6)
+    device[-1] = 9
+    validate_request_id_tensors(host, device, 6)
+    invalid = device.clone()
+    invalid[2] = 2
+    cases = ((host, invalid, 6), (host.long(), device, 6), (host, device[:-1], 6), (host, device, 8))
+    for control, snapshot, active in cases:
+        try:
+            validate_request_id_tensors(control, snapshot, active)
+        except ValueError:
+            continue
+        raise RuntimeError("invalid request metadata was accepted")
+    print("[REQUEST_METADATA] PASS: ragged/reordered mapping, inactive padding and four rejection cases")
 
 
 if __name__ == "__main__":
@@ -636,6 +683,7 @@ if __name__ == "__main__":
 
     import argparse
 
+    from pypto import passes
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="TP1 A5 mHC C1A full validation")
@@ -649,6 +697,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--check-request-metadata", action="store_true", help="run CPU mapping contract checks")
+    parser.add_argument("--runtime", choices=["host_build_graph", "tensormap_and_ringbuffer"], default="tensormap_and_ringbuffer")
+    parser.add_argument("--request-order", type=lambda value: [int(item) for item in value.split(",")])
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -656,6 +707,9 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.set_defaults(tokens=72, requests=12, pages=8, startpos=[8192] * 12)
     args = parser.parse_args()
+    if args.check_request_metadata:
+        validate_request_metadata()
+        raise SystemExit(0)
     configure_decode_workload(args, parser)
     if args.tokens != 72:
         parser.error("this decode entry requires 72 query tokens")
@@ -666,68 +720,71 @@ if __name__ == "__main__":
     specs = build_c1a_specs(
         "full", args.tokens, args.pages, args.requests, args.seed, args.case,
         start_pos=args.startpos, query_lens=args.query_lens, param_names=host.param_names,
+        request_order=args.request_order,
     )
 
-    result = run(
-        fn=host,
-        specs=specs,
-        golden_fn=golden_c1a,
-        compile_only=args.compile_only,
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            dump_passes=args.dump_passes,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-            "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-            "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
-            "window_cache": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+    runtime = getattr(passes.RuntimeKind, args.runtime.upper())
+    with passes.PassContext([], runtime=runtime):
+        result = run(
+            fn=host,
+            specs=specs,
+            golden_fn=golden_c1a,
+            compile_only=args.compile_only,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                dump_passes=args.dump_passes,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+                distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),
             ),
-            "window_cache_scale": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
-            ),
-            "compressed_cache": mapped_fp4_cache_compare(
-                "compressed_slots", pool_name="compressed_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                max_error_ratio=0.005,
-            ),
-            "compressed_cache_scale": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="compressed_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
-            ),
-            "index_cache": mapped_fp4_cache_compare(
-                "compressed_slots", pool_name="index_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                max_error_ratio=0.005,
-            ),
-            "index_cache_scale": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="index_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
-        },
-    )
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn={
+                "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+                "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+                "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
+                "window_cache": mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window_cache",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+                ),
+                "window_cache_scale": mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window_cache_scale",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                ),
+                "compressed_cache": mapped_fp4_cache_compare(
+                    "compressed_slots", pool_name="compressed_cache",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    max_error_ratio=0.005,
+                ),
+                "compressed_cache_scale": mapped_pool_ratio_allclose(
+                    "compressed_slots", pool_name="compressed_cache_scale",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                ),
+                "index_cache": mapped_fp4_cache_compare(
+                    "compressed_slots", pool_name="index_cache",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    max_error_ratio=0.005,
+                ),
+                "index_cache_scale": mapped_pool_ratio_allclose(
+                    "compressed_slots", pool_name="index_cache_scale",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.0,
+                ),
+            },
+        )
     if not result.passed:
         raise SystemExit(result.error or 1)

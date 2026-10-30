@@ -74,10 +74,10 @@ INDEX_TOPK = M.index_topk
 PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
 
 
-LEAF_NAMES = ('wq_a', 'wq_a_scale', 'q_norm_weight', 'wq_b', 'wq_b_scale', 'wkv', 'wkv_scale', 'kv_norm_weight', 'attn_sink', 'wo_a', 'wo_a_scale', 'wo_b', 'wo_b_scale', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'window_cache', 'window_cache_scale', 'compressed_cache', 'compressed_cache_scale', 'request_ids', 'compressed_lens', 'index_cache', 'index_cache_scale', 'index_block_table', 'compressed_rope_cos', 'compressed_rope_sin', 'compressor_wkv', 'compressor_norm_weight', 'compressed_slots', 'index_wk', 'index_norm_weight', 'index_wq_b', 'index_wq_b_scale', 'index_weights_proj', 'topk_indices', "pool_block_ids", "pool_block_counts", 'compressed_indices')
+LEAF_NAMES = ('wq_a', 'wq_a_scale', 'q_norm_weight', 'wq_b', 'wq_b_scale', 'wkv', 'wkv_scale', 'kv_norm_weight', 'attn_sink', 'wo_a', 'wo_a_scale', 'wo_b', 'wo_b_scale', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'window_cache', 'window_cache_scale', 'compressed_cache', 'compressed_cache_scale', 'token_to_req_indices', 'compressed_lens', 'index_cache', 'index_cache_scale', 'index_block_table', 'compressed_rope_cos', 'compressed_rope_sin', 'compressor_wkv', 'compressor_norm_weight', 'compressed_slots', 'index_wk', 'index_norm_weight', 'index_wq_b', 'index_wq_b_scale', 'index_weights_proj', 'topk_indices', "pool_block_ids", "pool_block_counts", 'compressed_indices')
 
 FULL_INPUT_NAMES = COMMON_INPUT_NAMES + (
-    "request_ids",
+    "token_to_req_indices",
     "compressed_lens",
     "index_cache",
     "index_cache_scale",
@@ -121,7 +121,7 @@ def prefill_c1a_full_attention(
     compressed_cache_scale: pl.Tensor[
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
     ],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[
@@ -175,7 +175,7 @@ def prefill_c1a_full_attention(
         publication[0] = published
     publication_ready = publication[0]
     indexer_completion = prefill_indexer(
-        x, query_latent, request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table,
+        x, query_latent, token_to_req_indices, compressed_lens, index_cache, index_cache_scale, index_block_table,
         rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
         pool_block_ids, pool_block_counts, topk_indices, num_tokens, publication_ready, pool=False, c2a=False,
     )
@@ -249,33 +249,33 @@ def _ranked_fp8_weight(input_width: int, output_width: int, shared: bool) -> tup
 def _case_metadata(token_count: int, case_name: str) -> tuple[torch.Tensor, ...]:
     import torch
     if case_name == CASE_DEFAULT:
-        request_ids = torch.arange(3, dtype=torch.int32)
+        token_to_req_indices = torch.arange(3, dtype=torch.int32)
         compressed_lens = torch.full((3,), 1024, dtype=torch.int32)
     elif case_name == 'causal':
         if not 1 <= token_count <= CASE_MAX_TOKENS:
             raise ValueError(f'token_count must be in [1, {CASE_MAX_TOKENS}], got {token_count}')
-        request_ids = torch.zeros(token_count, dtype=torch.int32)
+        token_to_req_indices = torch.zeros(token_count, dtype=torch.int32)
         compressed_lens = torch.arange(1, token_count + 1, dtype=torch.int32)
     elif case_name == 'mixed':
-        request_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2], dtype=torch.int32)
+        token_to_req_indices = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2], dtype=torch.int32)
         compressed_lens = torch.tensor([1, 2, 3, 127, 128, 511, 512, 513], dtype=torch.int32)
     elif case_name == 'long':
-        request_ids = torch.arange(3, dtype=torch.int32)
+        token_to_req_indices = torch.arange(3, dtype=torch.int32)
         compressed_lens = torch.tensor([1024, 4096, 8192], dtype=torch.int32)
     else:
         raise ValueError(f'unknown case {case_name!r}; expected one of {CASE_NAMES}')
-    request_count = int(request_ids.max().item()) + 1
+    request_count = int(token_to_req_indices.max().item()) + 1
     table_pages = (int(compressed_lens.max().item()) + CASE_PAGE - 1) // CASE_PAGE
     block_table = torch.arange(request_count * table_pages, dtype=torch.int32).reshape(request_count, table_pages)
     positions = compressed_lens.to(torch.int64) - 1
     pages = torch.div(positions, CASE_PAGE, rounding_mode='floor')
     offsets = positions.remainder(CASE_PAGE)
-    slots = block_table[request_ids.to(torch.long), pages] * CASE_PAGE + offsets
-    window_indices = torch.full((request_ids.numel(), CASE_PAGE), -1, dtype=torch.int32)
-    compressed_indices = torch.full((request_ids.numel(), INDEX_TOPK), -1, dtype=torch.int32)
-    candidate_mask = torch.zeros(request_ids.numel(), table_pages * CASE_PAGE, dtype=torch.uint8)
-    for token in range(request_ids.numel()):
-        request = int(request_ids[token])
+    slots = block_table[token_to_req_indices.to(torch.long), pages] * CASE_PAGE + offsets
+    window_indices = torch.full((token_to_req_indices.numel(), CASE_PAGE), -1, dtype=torch.int32)
+    compressed_indices = torch.full((token_to_req_indices.numel(), INDEX_TOPK), -1, dtype=torch.int32)
+    candidate_mask = torch.zeros(token_to_req_indices.numel(), table_pages * CASE_PAGE, dtype=torch.uint8)
+    for token in range(token_to_req_indices.numel()):
+        request = int(token_to_req_indices[token])
         visible = int(compressed_lens[token])
         logical = torch.arange(visible, dtype=torch.int64)
         physical = block_table[request, logical // CASE_PAGE] * CASE_PAGE + logical % CASE_PAGE
@@ -284,7 +284,7 @@ def _case_metadata(token_count: int, case_name: str) -> tuple[torch.Tensor, ...]
         compressed_count = min(visible, INDEX_TOPK)
         compressed_indices[token, :compressed_count] = physical[:compressed_count].to(torch.int32)
         candidate_mask[token, :visible] = 1
-    return (request_ids, compressed_lens, block_table, slots.to(torch.int64), window_indices, compressed_indices, candidate_mask)
+    return (token_to_req_indices, compressed_lens, block_table, slots.to(torch.int64), window_indices, compressed_indices, candidate_mask)
 
 
 def fixture_token_count(token_count: int, case_name: str) -> int:
@@ -297,8 +297,8 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
     from config import TP_SIZE, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP
     from quant import pack_bf16_nz, pack_fp8_nz, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
     torch.manual_seed(41)
-    request_ids, compressed_lens, block_table, slots, window_indices, compressed_indices, candidate_mask = _case_metadata(token_count, case_name)
-    token_count = request_ids.numel()
+    token_to_req_indices, compressed_lens, block_table, slots, window_indices, compressed_indices, candidate_mask = _case_metadata(token_count, case_name)
+    token_count = token_to_req_indices.numel()
     cache_blocks = block_table.numel()
     wq_a, wq_a_scale = _ranked_fp8_weight(D, Q_LORA, shared=True)
     wq_b, wq_b_scale = _ranked_fp8_weight(Q_LORA, LOCAL_H * HEAD_DIM, shared=False)
@@ -319,7 +319,7 @@ def make_fixture_values(token_count: int, case_name: str) -> dict[str, torch.Ten
     index_cache_scale = index_cache_scale.view(torch.float8_e8m0fnu)
     angles = (compressed_lens - 1).to(torch.float32).unsqueeze(1)
     angles = angles * torch.arange(ROPE_DIM // 2, dtype=torch.float32).unsqueeze(0) * 0.001
-    values = {'x': _ranked(torch.randn(token_count, D).to(torch.bfloat16)), 'wq_a': wq_a, 'wq_a_scale': wq_a_scale, 'q_norm_weight': _ranked(torch.ones(Q_LORA, dtype=torch.bfloat16)), 'wq_b': wq_b, 'wq_b_scale': wq_b_scale, 'wkv': wkv, 'wkv_scale': wkv_scale, 'kv_norm_weight': _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)), 'attn_sink': torch.zeros(TP_SIZE, LOCAL_H, dtype=torch.float32), 'wo_a': torch.randn(TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16).mul_(O_GROUP_IN ** (-0.5)), 'wo_b': wo_b, 'wo_b_scale': wo_b_scale, 'rope_cos': _ranked(torch.cos(angles)), 'rope_sin': _ranked(torch.sin(angles)), 'window_slots': _ranked(slots), 'window_indices': _ranked(window_indices), 'window_cache': _ranked(window_cache), 'window_cache_scale': _ranked(window_cache_scale), 'compressed_cache': _ranked(compressed_cache), 'compressed_cache_scale': _ranked(compressed_cache_scale), 'compressed_indices': _ranked(compressed_indices), 'request_ids': _ranked(request_ids), 'compressed_lens': _ranked(compressed_lens), 'index_cache': _ranked(index_cache), 'index_cache_scale': _ranked(index_cache_scale), 'index_block_table': _ranked(block_table), 'candidate_mask': _ranked(candidate_mask), 'compressed_rope_cos': _ranked(torch.cos(angles)), 'compressed_rope_sin': _ranked(torch.sin(angles)), 'compressor_wkv': _ranked(torch.randn(D, HEAD_DIM).mul_(D ** (-0.5)).to(torch.bfloat16)), 'compressor_norm_weight': _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)), 'compressed_slots': _ranked(slots), 'index_wk': _ranked(torch.randn(HEAD_DIM, INDEX_DIM).mul_(HEAD_DIM ** (-0.5)).to(torch.bfloat16)), 'index_norm_weight': _ranked(torch.ones(INDEX_DIM, dtype=torch.bfloat16)), 'index_wq_b': index_wq_b, 'index_wq_b_scale': index_wq_b_scale, 'index_weights_proj': _ranked(torch.randn(D, INDEX_H).mul_(D ** (-0.5)).to(torch.bfloat16))}
+    values = {'x': _ranked(torch.randn(token_count, D).to(torch.bfloat16)), 'wq_a': wq_a, 'wq_a_scale': wq_a_scale, 'q_norm_weight': _ranked(torch.ones(Q_LORA, dtype=torch.bfloat16)), 'wq_b': wq_b, 'wq_b_scale': wq_b_scale, 'wkv': wkv, 'wkv_scale': wkv_scale, 'kv_norm_weight': _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)), 'attn_sink': torch.zeros(TP_SIZE, LOCAL_H, dtype=torch.float32), 'wo_a': torch.randn(TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16).mul_(O_GROUP_IN ** (-0.5)), 'wo_b': wo_b, 'wo_b_scale': wo_b_scale, 'rope_cos': _ranked(torch.cos(angles)), 'rope_sin': _ranked(torch.sin(angles)), 'window_slots': _ranked(slots), 'window_indices': _ranked(window_indices), 'window_cache': _ranked(window_cache), 'window_cache_scale': _ranked(window_cache_scale), 'compressed_cache': _ranked(compressed_cache), 'compressed_cache_scale': _ranked(compressed_cache_scale), 'compressed_indices': _ranked(compressed_indices), 'token_to_req_indices': _ranked(token_to_req_indices), 'compressed_lens': _ranked(compressed_lens), 'index_cache': _ranked(index_cache), 'index_cache_scale': _ranked(index_cache_scale), 'index_block_table': _ranked(block_table), 'candidate_mask': _ranked(candidate_mask), 'compressed_rope_cos': _ranked(torch.cos(angles)), 'compressed_rope_sin': _ranked(torch.sin(angles)), 'compressor_wkv': _ranked(torch.randn(D, HEAD_DIM).mul_(D ** (-0.5)).to(torch.bfloat16)), 'compressor_norm_weight': _ranked(torch.ones(HEAD_DIM, dtype=torch.bfloat16)), 'compressed_slots': _ranked(slots), 'index_wk': _ranked(torch.randn(HEAD_DIM, INDEX_DIM).mul_(HEAD_DIM ** (-0.5)).to(torch.bfloat16)), 'index_norm_weight': _ranked(torch.ones(INDEX_DIM, dtype=torch.bfloat16)), 'index_wq_b': index_wq_b, 'index_wq_b_scale': index_wq_b_scale, 'index_weights_proj': _ranked(torch.randn(D, INDEX_H).mul_(D ** (-0.5)).to(torch.bfloat16))}
     for name in ("compressor_wkv", "index_wk", "index_weights_proj"):
         values[name] = pack_bf16_nz(values[name])
     values['attn_norm_weight'] = _ranked(torch.randn(D).mul_(0.1).add_(1).to(torch.bfloat16))
@@ -355,7 +355,7 @@ def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, 
     from config import TP_SIZE
     parameter_names = tuple(name for name, parameter in inspect.signature(golden_fn).parameters.items()
                             if parameter.default is inspect.Parameter.empty)
-    token_input_names = {'x', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'request_ids', 'compressed_lens', 'compressed_rope_cos', 'compressed_rope_sin', 'compressed_slots', 'pool_block_ids', 'pool_block_counts', 'compressed_indices'}
+    token_input_names = {'x', 'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'token_to_req_indices', 'compressed_lens', 'compressed_rope_cos', 'compressed_rope_sin', 'compressed_slots', 'pool_block_ids', 'pool_block_counts', 'compressed_indices'}
     results = []
     for rank in range(TP_SIZE):
         kwargs = {}
@@ -394,7 +394,7 @@ def apply_distributed_golden(mode: str, golden_fn: Callable, tensors: dict[str, 
 
 def _physical_to_logical(inputs: dict[str, torch.Tensor], rank: int, token: int) -> dict[int, int]:
     import torch
-    request = int(inputs['request_ids'][rank, token])
+    request = int(inputs['token_to_req_indices'][rank, token])
     visible = int(inputs['compressed_lens'][rank, token])
     logical = torch.arange(visible, dtype=torch.int64)
     table = inputs['index_block_table'][rank, request]
@@ -503,7 +503,7 @@ def golden_prefill_attn_c1a_full(
     window_cache_scale: torch.Tensor,
     compressed_cache: torch.Tensor,
     compressed_cache_scale: torch.Tensor,
-    request_ids: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
     compressed_lens: torch.Tensor,
     index_cache: torch.Tensor,
     index_cache_scale: torch.Tensor,
@@ -533,7 +533,7 @@ def golden_prefill_attn_c1a_full(
         state_block_table=None, state_cache=None,
         compressed_slots=compressed_slots, position_ids=None, compressed_lens=compressed_lens, compressed_rope_cos=compressed_rope_cos, compressed_rope_sin=compressed_rope_sin,
         index_wk=index_wk, index_norm_weight=index_norm_weight, index_wq_b=index_wq_b, index_wq_b_scale=index_wq_b_scale, index_weights_proj=index_weights_proj,
-        index_cache=index_cache, index_cache_scale=index_cache_scale, index_block_table=index_block_table, request_ids=request_ids, candidate_mask=None,
+        index_cache=index_cache, index_cache_scale=index_cache_scale, index_block_table=index_block_table, token_to_req_indices=token_to_req_indices, candidate_mask=None,
         indexer_fn=golden_prefill_indexer, index_key_fn=golden_index_key,
         pool_selector_fn=golden_select_candidate_block_pool,
         attention_fn=golden_prefill_c1a_attention, sequential_query=True, round_cache_to_even=True, output_dtype=torch.float32,
@@ -619,7 +619,7 @@ def l2_prefill_c1a_full_sharded(
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -660,7 +660,7 @@ def l2_prefill_c1a_full_sharded(
     window_cache_scale.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     compressed_cache_scale.bind_dynamic(0, CMP_BLOCKS_DYN)
-    request_ids.bind_dynamic(0, T_DYN)
+    token_to_req_indices.bind_dynamic(0, T_DYN)
     compressed_lens.bind_dynamic(0, T_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
     index_cache_scale.bind_dynamic(0, INDEX_BLOCKS_DYN)
@@ -702,7 +702,7 @@ def l2_prefill_c1a_full_sharded(
     prefill_c1a_full_attention(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
         attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache,
-        window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
+        window_cache_scale, compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos, compressed_rope_sin,
         compressor_wkv, compressor_norm_weight, compressed_slots, index_wk, index_norm_weight, index_wq_b,
         index_wq_b_scale, index_weights_proj, topk_indices, pool_block_ids, pool_block_counts, output_window, output_arrived,
@@ -744,7 +744,7 @@ def l3_prefill_c1a_full_sharded(
     window_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
@@ -781,7 +781,7 @@ def l3_prefill_c1a_full_sharded(
     window_cache_scale.bind_dynamic(1, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
     compressed_cache_scale.bind_dynamic(1, CMP_BLOCKS_DYN)
-    request_ids.bind_dynamic(1, T_DYN)
+    token_to_req_indices.bind_dynamic(1, T_DYN)
     compressed_lens.bind_dynamic(1, T_DYN)
     index_cache.bind_dynamic(1, INDEX_BLOCKS_DYN)
     index_cache_scale.bind_dynamic(1, INDEX_BLOCKS_DYN)
@@ -819,7 +819,7 @@ def l3_prefill_c1a_full_sharded(
             wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank],
             wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank], window_indices[rank],
             window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
-            request_ids[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
+            token_to_req_indices[rank], compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
             index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank],
             compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
             index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r, index_weights_proj[rank],
@@ -831,7 +831,7 @@ def l3_prefill_c1a_full_sharded(
 
 STATE_NAMES = {'full': ('window_cache', 'window_cache_scale', 'compressed_cache', 'compressed_cache_scale', 'index_cache', 'index_cache_scale', 'topk_indices', "pool_block_ids", "pool_block_counts"), 'reindex': ('window_cache', 'window_cache_scale', 'topk_indices'), 'reuse': ('window_cache', 'window_cache_scale')}
 
-TOKEN_NAMES = {'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'compressed_indices', 'request_ids', 'compressed_lens', "pool_block_ids", "pool_block_counts", 'compressed_rope_cos', 'compressed_rope_sin', 'compressed_slots'}
+TOKEN_NAMES = {'rope_cos', 'rope_sin', 'window_slots', 'window_indices', 'compressed_indices', 'token_to_req_indices', 'compressed_lens', "pool_block_ids", "pool_block_counts", 'compressed_rope_cos', 'compressed_rope_sin', 'compressed_slots'}
 
 def c1a_sp_reference_attention(mode, tensors, x, ranks, *, reference):
     """Run the independent C1A reference in full token order before sharding."""
@@ -1102,7 +1102,7 @@ def prefill_c1a_full(
     compressed_cache_scale: pl.Tensor[
         [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
     ],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
     index_cache_scale: pl.Tensor[
@@ -1151,7 +1151,7 @@ def prefill_c1a_full(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
+        compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos,
         compressed_rope_sin, compressor_wkv, compressor_norm_weight, compressed_slots,
         index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj,
@@ -1201,7 +1201,7 @@ def l2_prefill_c1a_full(
             [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
         ]
     ],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[
         pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]
@@ -1246,7 +1246,7 @@ def l2_prefill_c1a_full(
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale, request_ids, compressed_lens,
+        compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos,
         compressed_rope_sin, compressor_wkv, compressor_norm_weight, compressed_slots,
         index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj,
@@ -1296,7 +1296,7 @@ def l3_prefill_c1a_full(
             [TP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
         ]
     ],
-    request_ids: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
+    token_to_req_indices: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[TP_SIZE, T_DYN], pl.INT32],
     index_cache: pl.InOut[
         pl.Tensor[[TP_SIZE, INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]
@@ -1354,7 +1354,7 @@ def l3_prefill_c1a_full(
             wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_a_scale[rank],
             wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank], window_slots[rank],
             window_indices[rank], window_cache[rank], window_cache_scale[rank],
-            compressed_cache[rank], compressed_cache_scale[rank], request_ids[rank],
+            compressed_cache[rank], compressed_cache_scale[rank], token_to_req_indices[rank],
             compressed_lens[rank], index_cache[rank], index_cache_scale[rank],
             index_block_table[rank], compressed_rope_cos[rank], compressed_rope_sin[rank],
             compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank],

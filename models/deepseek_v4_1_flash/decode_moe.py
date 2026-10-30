@@ -247,9 +247,11 @@ def dispatch(
         gather_tile_tids = pl.array.create(((RECV_MAX + RECV_TILE - 1) // RECV_TILE), pl.TASK_ID)
         for tile in pl.range(((RECV_MAX + RECV_TILE - 1) // RECV_TILE)):
             gather_tile_tids[tile] = pl.system.task_dummy(deps=[])
-        expert_count = pl.read(recv_count_out, [e, 0])
-        expert_rows = pl.cast(expert_count, pl.INDEX)
-        expert_tiles = (expert_rows + RECV_TILE - 1) // RECV_TILE
+        # recv_count_out is produced by a device task.  Keep graph
+        # construction independent of that runtime value; source metadata
+        # below still bounds the actual rows copied into the local buffer.
+        expert_rows = pl.cast(RECV_MAX, pl.INDEX)
+        expert_tiles = (RECV_MAX + RECV_TILE - 1) // RECV_TILE
         for tile in pl.parallel(expert_tiles):
             tile_row = tile * RECV_TILE
             tile_end = pl.min(tile_row + RECV_TILE, expert_rows)

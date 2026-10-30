@@ -82,7 +82,7 @@ def l2_decode_layer(
     window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
@@ -236,7 +236,7 @@ def l2_decode_layer(
             rope_cos, rope_sin,
             window_slots, window_indices,
             window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-            request_ids, compressed_lens,
+            host_token_to_req_indices, token_to_req_indices, compressed_lens,
             index_cache, index_cache_scale, index_block_table,
             compressed_rope_cos, compressed_rope_sin,
             c1a_compressor_wkv,
@@ -261,7 +261,7 @@ def l2_decode_layer(
             rope_cos, rope_sin,
             window_slots, window_indices,
             window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-            request_ids, compressed_lens,
+            token_to_req_indices, compressed_lens,
             index_cache, index_cache_scale, index_block_table,
             pool_block_ids, pool_block_counts,
             index_wq_b, index_wq_b_scale, index_weights_proj,
@@ -340,7 +340,7 @@ def l3_decode_layer(
     window_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
     compressed_cache: pl.InOut[pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
     compressed_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
-    request_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
+    host_token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     position_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
@@ -450,7 +450,8 @@ def l3_decode_layer(
             rope_cos[rank], rope_sin[rank],
             window_slots[rank], window_indices[rank],
             window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
-            request_ids[rank], token_to_req_indices[rank], position_ids[rank], compressed_lens[rank],
+            host_token_to_req_indices[rank], token_to_req_indices[rank],
+            position_ids[rank], compressed_lens[rank],
             index_cache[rank], index_cache_scale[rank], index_block_table[rank],
             compressed_rope_cos[rank], compressed_rope_sin[rank],
             compressor_wkv[rank],
@@ -675,6 +676,8 @@ def golden_decode_layer(
         ):
             attention_tensors[name] = None
     else:
+        if layer.compression_ratio == 1 and layer.mode == "full":
+            attention_tensors["device_token_to_req_indices"] = attention_tensors["token_to_req_indices"]
         golden = golden_c1a if layer.compression_ratio == 1 else golden_c2a
         golden(attention_tensors, mode=layer.mode)
     attention = {
@@ -832,6 +835,10 @@ def build_tensor_specs(layer_id=0, seed=0):
                     init_value=lambda shape=shape, dtype=dtype: torch.zeros(shape, dtype=dtype),
                 )
             )
+    device_requests = next(spec for spec in specs if spec.name == "token_to_req_indices")
+    for index, spec in enumerate(specs):
+        if spec.name == "host_token_to_req_indices":
+            specs[index] = replace(device_requests, name="host_token_to_req_indices", resident=None)
     return specs
 
 
@@ -995,7 +1002,8 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
         "compressed_cache": compressed_cache,
         "compressed_cache_scale": compressed_cache_scale,
         "compressed_indices": torch.tensor([[-1, -1], [0, -1]], dtype=torch.int32),
-        "request_ids": torch.tensor([0, 0], dtype=torch.int32),
+        "host_token_to_req_indices": torch.tensor([0, 0], dtype=torch.int32),
+        "token_to_req_indices": torch.tensor([0, 0], dtype=torch.int32),
         "position_ids": torch.tensor([0, 1], dtype=torch.int32),
         "compressed_lens": torch.tensor([0, 1], dtype=torch.int32),
         "compressed_rope_cos": torch.ones(2, 1),
@@ -1008,7 +1016,6 @@ def _attention_values() -> dict[str, torch.Tensor | None]:
         "compressor_wkv": torch.randn(64, 64),
         "compressor_wgate": torch.randn(64, 64),
         "query_start_loc": torch.tensor([0, 2], dtype=torch.int32),
-        "token_to_req_indices": torch.tensor([0, 0], dtype=torch.int32),
         "state_block_table": torch.tensor([[1]], dtype=torch.int32),
         "state_cache": torch.zeros(2, 4, 128),
         "compressor_norm_weight": torch.ones(64, dtype=torch.bfloat16),
