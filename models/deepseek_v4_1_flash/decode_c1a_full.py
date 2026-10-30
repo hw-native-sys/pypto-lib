@@ -99,7 +99,7 @@ def decode_c1a_full(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
     x_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm)
@@ -387,7 +387,7 @@ def golden_c1a(tensors, mode="full"):
     a = dict(tensors)
     x_hc = a["x_hc"]
     next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
-        x_hc, a["hc_attn_fn"], a["hc_attn_scale"], a["hc_attn_base"],
+        x_hc, a["hc_attn_fn"], a["hc_attn_scale"], a["hc_attn_base"], hf32=True,
     )
     attention_input = golden_hc_collapse(x_hc, a["pre_mix"]).to(torch.bfloat16)
     x = golden_rms_norm(attention_input, a["attn_norm_weight"])

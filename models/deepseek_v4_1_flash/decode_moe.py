@@ -378,7 +378,7 @@ def moe(
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
     mixes_ready = hc_pre(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, next_pre_mix, post_mix, residual_mix,
+        x_mixed, next_pre_mix, post_mix, residual_mix, hf32=True,
     )
 
     # MoE transport and routed-result scope.
@@ -734,7 +734,7 @@ def golden_moe(tensors):
     for rank in range(EP_SIZE):
         pre, post, residual = golden_mhc_mixes(
             x_hc[rank],
-            tensors['hc_ffn_fn'][rank], tensors['hc_ffn_scale'][rank], tensors['hc_ffn_base'][rank],
+            tensors['hc_ffn_fn'][rank], tensors['hc_ffn_scale'][rank], tensors['hc_ffn_base'][rank], hf32=True,
         )
         next_pre_mix[rank] = pre
         post_mix[rank] = post

@@ -337,7 +337,7 @@ def draft_layer(
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_pre(
         x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attention_input, attention_pre_mix, post_mix, residual_mix,
+        attention_input, attention_pre_mix, post_mix, residual_mix, hf32=True,
     )
     for block in pl.spmd((tokens + 7) // 8, name_hint="dspark_attn_norm"):
         rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, tokens, output_fp32=False)
@@ -421,6 +421,7 @@ def draft_layer(
         num_tokens,
         rank,
         moe_epoch,
+        hf32=True,
     )
     return x_next, next_pre_mix
 

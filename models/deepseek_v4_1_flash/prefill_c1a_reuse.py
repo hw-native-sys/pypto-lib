@@ -289,6 +289,7 @@ def l2_prefill_c1a_reuse_sharded(
     hc_pre(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         hc_collapsed, next_pre_mix, post_mix, residual_mix,
+        hf32=False,
     )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
@@ -471,6 +472,7 @@ def prefill_c1a_reuse(
     hc_pre(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         hidden, next_pre_mix, post_mix, residual_mix,
+        hf32=False,
     )
     norm_tokens = pl.tensor.dim(hidden, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):

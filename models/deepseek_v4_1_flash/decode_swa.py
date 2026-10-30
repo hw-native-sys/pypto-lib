@@ -98,7 +98,7 @@ def decode_swa(
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     swa_attention_partial(q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens)
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
     o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
@@ -323,7 +323,7 @@ def golden_swa(tensors, *, reference=None):
     active = int(tensors["num_tokens"])
     pre_mix, post_mix, residual_mix = golden_mhc_mixes(
         tensors["x_hc"],
-        tensors["hc_attn_fn"], tensors["hc_attn_scale"], tensors["hc_attn_base"],
+        tensors["hc_attn_fn"], tensors["hc_attn_scale"], tensors["hc_attn_base"], hf32=True,
     )
     tensors["attention_pre_mix"].copy_(pre_mix)
     collapsed = golden_hc_collapse(tensors["x_hc"], tensors["incoming_pre_mix"]).to(torch.bfloat16)

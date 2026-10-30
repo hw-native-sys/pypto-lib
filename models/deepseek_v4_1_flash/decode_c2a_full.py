@@ -169,7 +169,7 @@ def decode_c2a_full(
         )
         attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
 
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     o_proj(
@@ -382,7 +382,7 @@ def golden_c2a(tensors, mode="full"):
     if "x_hc" in t:
         x_hc = t["x_hc"]
         next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
-            x_hc, t["hc_attn_fn"], t["hc_attn_scale"], t["hc_attn_base"],
+            x_hc, t["hc_attn_fn"], t["hc_attn_scale"], t["hc_attn_base"], hf32=True,
         )
         attention_input = golden_hc_collapse(x_hc, t["pre_mix"]).to(torch.bfloat16)
         x = golden_rms_norm(attention_input, t["attn_norm_weight"])

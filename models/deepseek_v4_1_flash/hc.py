@@ -9,10 +9,12 @@
 """V4.1 HC coefficient generation, stream collapse, residual expansion, and final collapse."""
 
 import math
+from pathlib import Path
 
 import pypto.language as pl
 import torch
 import torch.nn.functional as F
+from pypto.runtime import pto_isa_include_dir
 
 from config import FLASH as M, SP_T_DYN, T_DYN
 
@@ -32,6 +34,7 @@ MIX_PAD = 32
 HC_PAD = 8
 T_TILE = 8
 LINEAR_T_TILE = 16
+HF32_LINEAR_T_TILE = 80  # Matches M_TILE in kernels/hc_linear.cpp.
 SINKHORN_LOAD_T_TILE = 8
 SINKHORN_T_TILE = 2
 SINKHORN_WORKER_TILE = 12
@@ -45,6 +48,19 @@ HEAD_D_TILE = 5120
 PRE_NORM_T_TILE = 8
 PRE_NORM_D_TILE = 512
 POST_WORKER_TILE = 64
+
+
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "hc_linear.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _hc_linear(
+    x: pl.Tensor,
+    weight: pl.Tensor,
+    partials: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INDEX],
+    padded_rows: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project FP32 HC operands with nearest-away HF32 and FP32 accumulation."""
+    ...
 
 
 @pl.jit.inline
@@ -184,8 +200,8 @@ def hc_sinkhorn(
 
 
 @pl.jit.inline
-def hc_project(x_hc: pl.Tensor, function: pl.Tensor):
-    """Compute the inverse RMS and split-K coefficient projection."""
+def hc_project(x_hc: pl.Tensor, function: pl.Tensor, hf32: pl.constexpr):
+    """Compute FP32 inverse RMS and split-K coefficients, using HF32 for decode."""
     t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
@@ -210,29 +226,35 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor):
         )
 
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
-    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="mhc_linear"):
-        t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-        split = task % LINEAR_OK
-        k_base = split * LINEAR_K_PER_SPLIT
-        valid_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
-        acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
-        for kb in pl.pipeline(LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
-            k0 = k_base + kb * LINEAR_K_TILE
-            linear_x_tile = pl.slice(
-                x_flat,
-                [LINEAR_T_TILE, LINEAR_K_TILE],
-                [t0, k0],
-                valid_shape=[valid_rows, LINEAR_K_TILE],
-            )
-            w_tile = pl.slice(
-                function,
-                [MIX_PAD, LINEAR_K_TILE],
-                [0, k0],
-                valid_shape=[MIX_HC, LINEAR_K_TILE],
-            )
-            acc = pl.matmul_acc(acc, linear_x_tile, w_tile, b_trans=True, init_cond=(kb == 0))
-        partial = split * t_linear + t0
-        mixes_partials[partial : partial + LINEAR_T_TILE, 0:MIX_PAD] = acc
+    if hf32:
+        tasks = ((t_dim + HF32_LINEAR_T_TILE - 1) // HF32_LINEAR_T_TILE) * LINEAR_OK
+        workers = pl.min(tasks, pl.system.available_cluster_count())
+        with pl.spmd(workers, name_hint="mhc_linear"):
+            _hc_linear(x_flat, function, mixes_partials, t_dim, t_linear)
+    else:
+        for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="mhc_linear"):
+            t0 = (task // LINEAR_OK) * LINEAR_T_TILE
+            split = task % LINEAR_OK
+            k_base = split * LINEAR_K_PER_SPLIT
+            valid_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+            acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
+            for kb in pl.pipeline(LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
+                k0 = k_base + kb * LINEAR_K_TILE
+                linear_x_tile = pl.slice(
+                    x_flat,
+                    [LINEAR_T_TILE, LINEAR_K_TILE],
+                    [t0, k0],
+                    valid_shape=[valid_rows, LINEAR_K_TILE],
+                )
+                w_tile = pl.slice(
+                    function,
+                    [MIX_PAD, LINEAR_K_TILE],
+                    [0, k0],
+                    valid_shape=[MIX_HC, LINEAR_K_TILE],
+                )
+                acc = pl.matmul_acc(acc, linear_x_tile, w_tile, b_trans=True, init_cond=(kb == 0))
+            partial = split * t_linear + t0
+            mixes_partials[partial : partial + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
     return inv_rms, mixes_partials
 
@@ -345,9 +367,10 @@ def hc_pre(
     next_pre_mix: pl.Tensor,
     post_mix: pl.Tensor,
     residual_mix: pl.Tensor,
+    hf32: pl.constexpr,
 ):
     """Generate delayed HC coefficients and collapse the incoming streams."""
-    inv_rms, partials = hc_project(x_hc, function)
+    inv_rms, partials = hc_project(x_hc, function, hf32=hf32)
     mixes_ready = hc_sinkhorn(inv_rms, partials, scale, base, next_pre_mix, post_mix, residual_mix)
     hc_head(x_hc, incoming_pre_mix, output)
     return mixes_ready
@@ -474,17 +497,27 @@ def prefill_sp_post(
     return output, next_pre_mix
 
 
+def _round_hf32(value: torch.Tensor) -> torch.Tensor:
+    """Round finite FP32 values to E8M10, with halfway values away from zero."""
+    bits = value.contiguous().view(torch.int32)
+    rounded = ((bits + 4096) & -8192).view(torch.float32)
+    return torch.where(torch.isfinite(value), rounded, value)
+
+
 def golden_mhc_mixes(
     x_hc: torch.Tensor,
     function: torch.Tensor,
     scale: torch.Tensor,
     base: torch.Tensor,
     iterations: int = M.hc_sinkhorn_iters,
+    hf32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project one HC stream into pre, post, and doubly-stochastic residual mixes."""
     flat = x_hc.flatten(-2).float()
     inverse_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + M.rms_norm_eps)
-    mixes = F.linear(flat, function.float()) * inverse_rms
+    projection_input = _round_hf32(flat) if hf32 else flat
+    projection_weight = _round_hf32(function.float()) if hf32 else function.float()
+    mixes = F.linear(projection_input, projection_weight) * inverse_rms
     hc = M.hc_mult
     pre_raw, post_raw, residual_raw = mixes.split((hc, hc, hc * hc), dim=-1)
     pre = torch.sigmoid(pre_raw * scale[0] + base[:hc]) + M.hc_eps
@@ -523,6 +556,7 @@ def golden_l2_hc_pre(tensors):
     """Compute the four outputs with the incoming mix independent of the next mix."""
     pre_mix, post_mix, residual_mix = golden_mhc_mixes(
         tensors["x_hc"], tensors["function"], tensors["scale"], tensors["base"],
+        hf32=True,
     )
     tensors["pre_mix"][:] = pre_mix
     tensors["post_mix"][:] = post_mix
@@ -583,7 +617,7 @@ def l2_hc_pre(
     pre_mix.bind_dynamic(0, T_DYN)
     post_mix.bind_dynamic(0, T_DYN)
     residual_mix.bind_dynamic(0, T_DYN)
-    hc_pre(x_hc, incoming_pre_mix, function, scale, base, output, pre_mix, post_mix, residual_mix)
+    hc_pre(x_hc, incoming_pre_mix, function, scale, base, output, pre_mix, post_mix, residual_mix, hf32=True)
     return output
 
 
