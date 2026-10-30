@@ -13,7 +13,7 @@ import pypto.language as pl
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from o_proj import o_proj
 from decode_indexer import (
-    select_candidate_block_pool, c1a_index, use_pretransposed_index_query, score_select_c1a_groups,
+    select_candidate_block_pool, c1a_index, score_select_c1a_groups,
     publish_index_rows, c1a_project_index_key, c1a_rotate_index_key,
 )
 from sparse_attention import (
@@ -152,21 +152,16 @@ def decode_c1a_full(
     )
     # Logical index score capacity.
     score_width = pl.tensor.dim(index_block_table, 1) * 128
-    private_route = use_pretransposed_index_query(
-        request_ids, compressed_lens, num_tokens, score_width, skip_short=False,
-    )
-    private_query = pl.create_tensor([16, INDEX_H * INDEX_DIM], dtype=pl.FP8E4M3FN)
     (index_query, index_query_scale, index_weights, scores, query_tid, weights_tid) = c1a_index(
         x_norm, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,
-        num_tokens, score_width, x_ready, private_query, private_route,
+        num_tokens, score_width, x_ready,
         qb_payload, qb_scales,
-        pretransposed=True,
     )
     topk_tid, scores_tid = score_select_c1a_groups(
         index_query, index_query_scale, index_weights,
         index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
         scores, topk_indices,
-        num_tokens, index_ready, query_tid, weights_tid, private_query, private_route,
+        num_tokens, index_ready, query_tid, weights_tid,
         pl.tensor.dim(pool_block_ids, 1),
     )
     pool_tid = select_candidate_block_pool(

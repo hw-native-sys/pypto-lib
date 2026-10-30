@@ -6,7 +6,7 @@
 // INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
-// Request-group index scores with packed FP4 Cube operands.
+// Paged and gathered index scores with packed FP4 Cube operands.
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
@@ -16,7 +16,6 @@ using namespace pto;
 
 namespace {
 using F4 = float4_e2m1x2_t;
-using F8 = float8_e4m3_t;
 using S = float8_e8m0_t;
 using QueryPipe = TPipe<4, Direction::DIR_V2C, 16384, 2, 2, true>;
 using ScorePipe = TPipe<0, Direction::DIR_C2V, 16384, 2, 2, true>;
@@ -95,27 +94,18 @@ __tf__ __aicore__ inline void reduce_weighted(
 }
 
 __aicore__ inline void prepare_query(__gm__ int64_t* args, int begin, int count, QueryPipe& pipe) {
-    Tile<TileType::Vec, F8, 192, 128, BLayout::RowMajor, DYNAMIC, 128> input(count * 32);
-    Vec<F8, 192, 128> full_input;
-    Vec<float, 192, 128> fp32;
-    Vec<bfloat16_t, 192, 128> bf16;
+    Tile<TileType::Vec, uint8_t, 192, 64, BLayout::RowMajor, DYNAMIC, 64> input(count * 32);
     Vec<F4, 192, 128> packed;
     QueryVec nz;
     TASSIGN(input, 131072);
-    TASSIGN(full_input, 131072);
-    TASSIGN(fp32, 155648);
-    TASSIGN(bf16, 65536);
     TASSIGN(packed, 131072);
     TASSIGN(nz, 143360);
-    GM<F8, DYNAMIC, 128, DYNAMIC, 128> gm(data<F8>(args, 0) + begin * 4096,
-                                        TileShape2D<F8, DYNAMIC, 128>(count * 32, 128),
-                                        BaseShape2D<F8, DYNAMIC, 128>(count * 32, 128));
+    GM<uint8_t, DYNAMIC, 64, DYNAMIC, 64> gm(data<uint8_t>(args, 0) + begin * 2048,
+        TileShape2D<uint8_t, DYNAMIC, 64>(count * 32, 64),
+        BaseShape2D<uint8_t, DYNAMIC, 64>(count * 32, 64));
     TLOAD(input, gm);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    TCVT(fp32, full_input, RoundMode::CAST_RINT);
-    TCVT(bf16, fp32, RoundMode::CAST_RINT);
-    TCVT(packed, bf16, RoundMode::CAST_RINT);
     TMOV(nz, packed);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -135,7 +125,7 @@ __aicore__ inline void prepare_query(__gm__ int64_t* args, int begin, int count,
     TASSIGN(result, 67328);
     GM<bfloat16_t, DYNAMIC, 32, DYNAMIC, 32> wg(data<bfloat16_t>(args, 2) + begin * 32,
         TileShape2D<bfloat16_t, DYNAMIC, 32>(count, 32), BaseShape2D<bfloat16_t, DYNAMIC, 32>(count, 32));
-    // Complete query conversion before the weight DMA reuses its UB storage.
+    // Complete query layout conversion before loading weights.
     set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     TLOAD(weight, wg);
@@ -150,10 +140,11 @@ __aicore__ inline void prepare_query(__gm__ int64_t* args, int begin, int count,
 __aicore__ inline void store_score(__gm__ int64_t* args, int token, int group_offset,
                                   int logical, int page, Vec<bfloat16_t, 64, 128>& dot,
                                   int pair_offset, bool have_dot) {
-    int width = args[10];
+    int width = args[11];
+    int gathered_rows = args[15];
     int output_count = minimum(128, width - logical);
-    int visible = minimum(read(data<int32_t>(args, 7) + token), width);
-    if (visible <= args[13]) visible = 0;
+    int visible = gathered_rows ? width : minimum(read(data<int32_t>(args, 7) + token), width);
+    if (visible <= args[14]) visible = 0;
     int valid = have_dot && page >= 0 ? minimum(128, visible - logical) : 0;
     if (valid < 0) valid = 0;
     Vec<float, 1, 128> total;
@@ -170,7 +161,7 @@ __aicore__ inline void store_score(__gm__ int64_t* args, int token, int group_of
     } else {
         TEXPANDS(total, -__builtin_inff());
     }
-    if (valid < output_count && valid > 0) {
+    if (gathered_rows || (valid < output_count && valid > 0)) {
         Vec<int32_t, 1, 128> indices;
         Tile<TileType::Vec, uint8_t, 1, 32, BLayout::RowMajor, 1, 16> mask;
         Vec<uint8_t, 1, 32> tmp;
@@ -180,8 +171,19 @@ __aicore__ inline void store_score(__gm__ int64_t* args, int token, int group_of
         TASSIGN(tmp, 112128);
         TASSIGN(negative, 112384);
         TEXPANDS(negative, -__builtin_inff());
-        TCI<decltype(indices), int32_t, 0>(indices, 0);
-        TCMPS(mask, indices, valid, CmpMode::LT);
+        if (gathered_rows) {
+            GM<int32_t, 1, 128, 1, 128> vg(data<int32_t>(args, 10) + token * gathered_rows + logical);
+            // Finish the previous panel's comparison before reusing its validity buffer.
+            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+            TLOAD(indices, vg);
+            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+            TCMPS(mask, indices, 1, CmpMode::EQ);
+        } else {
+            TCI<decltype(indices), int32_t, 0>(indices, 0);
+            TCMPS(mask, indices, valid, CmpMode::LT);
+        }
         TSEL(total, mask, total, negative, tmp);
     }
     Tile<TileType::Vec, float, 1, 128, BLayout::RowMajor, 1, DYNAMIC> output(output_count);
@@ -201,19 +203,24 @@ __aicore__ inline void store_score(__gm__ int64_t* args, int token, int group_of
 __aicore__ inline void score(__gm__ int64_t* args) {
     QueryPipe query_pipe(nullptr, 0, 0);
     ScorePipe score_pipe(nullptr, 0, 0);
-    int width = args[10];
-    int run_stride = args[11];
-    int table_width = args[12];
+    // ABI: eleven tensors, then width/run-stride/table-width/threshold/row-stride/token-count.
+    int width = args[11];
+    int run_stride = args[12];
+    int table_width = args[13];
+    int gathered_rows = args[15];
     int macro_tiles = (width + 511) / 512;
-    int run_count = read(data<int32_t>(args, 9) + 3 * run_stride);
+    int run_count = gathered_rows ? args[16] : read(data<int32_t>(args, 9) + 3 * run_stride);
     int block = get_block_idx(args);
     int workers = get_block_num(args);
     for (int work = block; work < run_count * macro_tiles; work += workers) {
         int run = work / macro_tiles;
         int logical_begin = work % macro_tiles * 512;
-        int begin = read(data<int32_t>(args, 9) + run);
-        int end = read(data<int32_t>(args, 9) + run_stride + run);
-        int maximum = read(data<int32_t>(args, 9) + 2 * run_stride + run);
+        int begin = gathered_rows ? run : read(data<int32_t>(args, 9) + run);
+        int end = gathered_rows ? run + 1 : read(data<int32_t>(args, 9) + run_stride + run);
+        int maximum = gathered_rows ? minimum(width / 8, read(data<int32_t>(args, 9) + run)) * 8
+                                    : read(data<int32_t>(args, 9) + 2 * run_stride + run);
+        // Sparse scores outside the active candidate prefix were cleared by the caller.
+        if (gathered_rows && logical_begin >= maximum) continue;
         int request = read(data<int32_t>(args, 6) + begin);
         for (int group = begin; group < end; group += 6) {
             int count = minimum(6, end - group);
@@ -232,9 +239,12 @@ __aicore__ inline void score(__gm__ int64_t* args) {
 #endif
             for (int panel = 0; panel < 4; ++panel) {
                 int logical = logical_begin + panel * 128;
-                if (logical >= width) continue;
+                if (logical >= width || (gathered_rows && logical >= maximum)) continue;
                 int page = -1;
-                if (logical < maximum) page = read(data<int32_t>(args, 5) + request * table_width + logical / 128);
+                if (logical < maximum) {
+                    page = gathered_rows ? (group * gathered_rows + logical) / 128
+                                         : read(data<int32_t>(args, 5) + request * table_width + logical / 128);
+                }
                 bool have_dot = logical < maximum && page >= 0;
 #if defined(__DAV_CUBE__)
                 if (have_dot) {
