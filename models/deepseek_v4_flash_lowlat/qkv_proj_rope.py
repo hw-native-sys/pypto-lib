@@ -420,8 +420,8 @@ def qkv_proj_rope_test(
     # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
     late_dep = pl.system.task_dummy(deps=[])
     # One card's head shard. The kernel is head-sharded and writes only
-    # q[:, q_head_base : q_head_base + Q_HEADS_LOCAL]; this entry models group 0,
-    # and the golden leaves the other groups' heads at their zero init.
+    # q[:, q_head_base : q_head_base + Q_HEADS_LOCAL]; this entry models group 0.
+    # Other heads are unproduced Out values, so validation excludes them.
     t_dim = pl.tensor.dim(x, 0)
     q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
@@ -450,7 +450,7 @@ def qkv_proj_rope_test(
 def golden_qkv_proj_rope(tensors):
     """Torch reference: Q/KV LoRA + RoPE for an already attention-normalized input."""
     import torch
-    from utils import int8_quant_per_row
+    from utils import bf16_matmul_fp32, int8_quant_per_row
 
     x = tensors["x"].float()
     wq_a = tensors["wq_a"].float()
@@ -465,11 +465,6 @@ def golden_qkv_proj_rope(tensors):
     def rms_norm(x, gamma, eps=EPS):
         inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
         return x * inv * gamma
-
-    def matmul_bf16_input_fp32(a, b):
-        a_fp32 = a.to(torch.bfloat16).float()
-        b_fp32 = b.to(torch.bfloat16).float()
-        return torch.matmul(a_fp32, b_fp32).float()
 
     def apply_rope(x_rope, cos, sin):
         # x_rope: [T, ..., ROPE_DIM] with interleaved even/odd rotary pairs.
@@ -488,10 +483,10 @@ def golden_qkv_proj_rope(tensors):
     token_x = x.view(t_dim, D)
 
     # Q path
-    qr_out = rms_norm(matmul_bf16_input_fp32(token_x, wq_a), gamma_cq)   # [T, Q_LORA]
+    qr_out = rms_norm(bf16_matmul_fp32(token_x, wq_a, split_k=QR_OK), gamma_cq)   # [T, Q_LORA]
     # W8A8C16: wq_b W8 per-output-channel int8; qr_out A8 per-token int8.
     # flash: also quantizes wq_a/wkv to fp8 (default Linear dtype).
-    qr_i8, qr_scale = int8_quant_per_row(qr_out.float())
+    qr_i8, qr_scale = int8_quant_per_row(qr_out.float(), direct_div=True)
     q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32))
     q_full = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(t_dim, H, HEAD_DIM)
     inv = torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
@@ -501,7 +496,7 @@ def golden_qkv_proj_rope(tensors):
     q_out = torch.cat([q_nope, q_rope], dim=-1)
 
     # KV path
-    kv_full = rms_norm(matmul_bf16_input_fp32(token_x, wkv), gamma_ckv)  # [T, HEAD_DIM]
+    kv_full = rms_norm(bf16_matmul_fp32(token_x, wkv, split_k=KV_OK), gamma_ckv)  # [T, HEAD_DIM]
     kv_nope = kv_full[..., :NOPE_DIM]
     kv_rope_in = kv_full[..., NOPE_DIM:].unsqueeze(1)               # add a pseudo head dim
     kv_rope = apply_rope(kv_rope_in, rope_cos, rope_sin).squeeze(1)
@@ -513,16 +508,6 @@ def golden_qkv_proj_rope(tensors):
     tensors["qr_scale"][:] = qr_scale
 
 
-def golden_qkv_proj_rope_test(tensors):
-    """Torch reference for the standalone entry: all heads, then keep one head group."""
-    import torch
-
-    golden_qkv_proj_rope(tensors)
-    # The kernel writes one head group only; the rest of q keeps its zero init.
-    h0 = TEST_Q_HEAD_BASE
-    q_group = tensors["q"][:, h0 : h0 + Q_HEADS_LOCAL].clone()
-    tensors["q"][:] = torch.zeros_like(tensors["q"])
-    tensors["q"][:, h0 : h0 + Q_HEADS_LOCAL] = q_group
 
 
 def build_tensor_specs(B, S):
@@ -607,14 +592,14 @@ if __name__ == "__main__":
         result = run(
             fn=qkv_proj_rope_test,
             specs=build_tensor_specs(B, S),
-            golden_fn=golden_qkv_proj_rope_test,
+            golden_fn=golden_qkv_proj_rope,
             # W8A8C16 q_proj adds INT8 quant/dequant round-off before per-head RMSNorm.
             rtol=5e-3,
             atol=5e-3,
             # Precision reference: pypto mla_prolog —
             # cann-recipes-infer/ops/pypto_python/example/test_mla_prolog_pypto.py
             compare_fn={
-                "q":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "q":        ratio_allclose(atol=1e-4, rtol=1.0 / 128, valid_rows=Q_HEADS_LOCAL, valid_axis=1),
                 "kv":       ratio_allclose(atol=1e-4, rtol=1.0 / 128),
                 "qr":       ratio_allclose(atol=1, rtol=0, max_error_ratio=0),
                 "qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
