@@ -1,0 +1,121 @@
+name: Run simulator tests
+description: Run selected SIM entries with shared deadlines, results, logs, and cleanup.
+
+inputs:
+  platform:
+    description: a2a3sim or a5sim.
+    required: true
+  files:
+    description: Space-separated entry paths from detect_changes.py; empty runs no cases.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Run selected cases
+      id: run
+      shell: bash
+      working-directory: checkout
+      env:
+        FILES: ${{ inputs.files }}
+        PLATFORM: ${{ inputs.platform }}
+        PYTHONPATH: ${{ github.workspace }}/checkout
+        PYPTO_LOG_LEVEL: error
+        PYPTO_WARNING_LEVEL: none
+        PYPTO_RUNTIME_LOG: error
+      run: |
+        source activate.sh
+        case "$PLATFORM" in a2a3sim|a5sim) ;; *) exit 1 ;; esac
+        export PTO_CPU_SIM_ARCH="${PLATFORM%sim}"
+        # CPU simulation needs a longer no-progress window than device execution.
+        # Both budgets apply to every entry on both CPU architectures.
+        export SIMPLER_SCHEDULER_TIMEOUT_MS=120000
+        result_dir="sim-results-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${PLATFORM}"
+        mkdir "$result_dir"
+        echo "result_dir=$result_dir" >> "$GITHUB_OUTPUT"
+        : > "$result_dir/results.tsv"
+        printf 'case\texit_code\treason\tcomparison_failure\n' > "$result_dir/details.tsv"
+        files=()
+        set -f
+        for file in $FILES; do
+          test -f "$file"
+          files+=("$file")
+          # Preserve the full denominator if the job is cancelled mid-sweep.
+          printf '%s\tmissing\n' "$file" >> "$result_dir/results.tsv"
+        done
+        failed=0
+        for file in "${files[@]}"; do
+          echo "::group::$file"
+          # Each entry owns its build output, including partial compilation.
+          rm -rf build_output
+          log="$result_dir/${file//\//__}.log"
+          # A surviving worker must not hold open a log pipe after timeout.
+          set +e
+          timeout --kill-after=10s 600s python -u "$file" -p "${PLATFORM%sim}" --sim > "$log" 2>&1
+          rc=$?
+          cat "$log"
+          log_rc=$?
+          set -e
+          status=fail
+          case "$rc" in
+            0) status=pass; reason=completed ;;
+            124) reason=process_timeout ;;
+            137) reason=killed ;;
+            *) reason=process_error ;;
+          esac
+          if [ "$reason" = process_error ]; then
+            if grep -qE 'sched_error_code=100([[:space:]]|$)|error detail:.* SCHEDULER_TIMEOUT' "$log"; then
+              reason=scheduler_timeout
+            elif grep -qE 'orch_error_code=8([[:space:]]|$)|PTO_CPU_SIM_TWAIT_TIMEOUT:' "$log"; then
+              reason=tensor_wait_timeout
+            fi
+          fi
+          comparison_failure=false
+          if grep -qE "^\[RUN\]   '.*' FAIL" "$log"; then
+            status=fail
+            comparison_failure=true
+            if [[ "$reason" = completed || "$reason" = process_error ]]; then
+              reason=numerical_mismatch
+            fi
+          fi
+          if [ "$log_rc" -ne 0 ]; then
+            status=fail
+            reason=log_error
+          fi
+          printf '%s\t%s\t%s\t%s\n' "$file" "$rc" "$reason" "$comparison_failure" >> "$result_dir/details.tsv"
+          awk -F '\t' -v file="$file" -v status="$status" 'BEGIN {OFS="\t"} $1==file {$2=status} {print}' \
+            "$result_dir/results.tsv" > "$result_dir/results.tmp"
+          mv "$result_dir/results.tmp" "$result_dir/results.tsv"
+          if [ "$status" != pass ]; then
+            failed=1
+            echo "::error file=${file}::${reason} (exit ${rc})"
+            if [ -d build_output ]; then
+              # Keep at most 128 text diagnostics below 512 KiB each, including
+              # files produced before a compiler exception. Exclude tensors,
+              # binaries, and symlinks; record the candidate list as well.
+              if ! find build_output -type f -size -512k \( -name '*.pto' -o -name '*.mlir' \
+                -o -name '*.cpp' -o -name '*.h' -o -name '*.json' -o -name '*.log' \) \
+                -print0 > "$log.diagnostics" ||
+                ! head -z -n 128 "$log.diagnostics" > "$log.retained" ||
+                ! tar --null -T "$log.retained" -czf "$log.diagnostics.tar.gz"; then
+                echo "::warning file=${file}::Failed to retain compiler diagnostics"
+              fi
+            fi
+          fi
+          echo "::endgroup::"
+        done
+        exit "$failed"
+
+    - name: Upload simulator results
+      if: ${{ always() && steps.run.outputs.result_dir != '' }}
+      uses: ./.github/actions/upload-results
+      with:
+        name: results-${{ inputs.platform }}
+        path: checkout/${{ steps.run.outputs.result_dir }}
+        if-no-files-found: error
+
+    - name: Clean up build artifacts
+      if: always()
+      shell: bash
+      working-directory: checkout
+      run: rm -rf build_output
