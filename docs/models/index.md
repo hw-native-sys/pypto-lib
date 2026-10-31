@@ -11,6 +11,7 @@ tracked runnable set.
 | [deepseek_v4_flash_dspark](deepseek_v4_flash_dspark/index.md) | The same V4-Flash checkpoint at batch 64 per card and S = 8 DSpark speculation, with TP-sharded DSA-CP attention; under development | Not supported |
 | [deepseek_v4_flash_lowlat](deepseek_v4_flash_lowlat/index.md) | Batch-one decode configuration, normalization, hyper-connections, sharded projection and embedding primitives; under development | Not supported |
 | [deepseek_v4_1_flash](deepseek_v4_1_flash/index.md) | DeepSeek V4.1 Flash TP4/DP2/EP8 scaffold with low-bit SWA/C2A/C1A caches, hierarchical indexer, mHC, and MoE | Not supported |
+| [deepseek_v4_1_flash_a2](deepseek_v4_1_flash_a2/index.md) | A2 independent single-layer Prefill operators, W8A8/BF16 projections, native attention boundaries, mHC, Engram and MoE; historical precision scope documented | Not supported |
 | [glm5_3_flash](glm5_3_flash/index.md) | GLM-5.3-Flash on a2a3 at TP16/EP16 with W8A8 INT8: the hybrid KDA + NoPE-MLA backbone, the kpool DSA indexer, mHC and MoE. Staging area — configuration, goldens and kernel ABIs only | Not supported |
 
 Each page covers that directory's deployment configuration and how its files
