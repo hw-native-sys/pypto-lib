@@ -81,7 +81,7 @@ K_TILE = 512
 OUT_TILE = 64
 HEAD_TILE = 64
 B_TILE = 8
-MM_B_TILE = 128
+MM_B_TILE = 64
 # Token tiles handled sequentially inside one kv_score_proj block. The grid is
 # (token group, output tile); every token tile in a group shares the same o0, so
 # the [OUT_TILE, K_TILE] weight tiles are fetched once per group instead of once

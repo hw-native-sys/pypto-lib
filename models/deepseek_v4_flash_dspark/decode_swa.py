@@ -62,7 +62,7 @@ from decode_o_proj import (
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    decode_o_proj_tp1,
+    decode_o_proj_tp1_hc,
     o_group_a2a,
     o_proj_reduce_scatter,
 )
@@ -517,14 +517,13 @@ def _decode_swa_tp1(
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
-    for v_blk in pl.spmd(bias_blocks, name_hint="swa_valid_bias"):
+    for v_blk in pl.spmd(bias_blocks, name_hint="swa_valid_bias", allow_early_resolve=True):
         v_t0 = v_blk * BIAS_T_TILE
         v_col = pl.cast(pl.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)
         v_col_m = pl.col_expand(pl.full([BIAS_T_TILE, WIN], dtype=pl.FP32, value=0.0), v_col)
         v_lens = pl.cast(pl.reshape(swa_lens[v_t0 : v_t0 + BIAS_T_TILE], [BIAS_T_TILE, 1]), target_type=pl.FP32)
         v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
         sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
-    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
     o_packed_heads, heads_dep = sparse_attn_swa_tp1(
         q, kv_cache, swa_indices, swa_lens, sparse_bias,
@@ -532,9 +531,9 @@ def _decode_swa_tp1(
         o_packed_heads,
     )
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
-    attn_out = decode_o_proj_tp1(o_packed, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
-
-    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+    decode_o_proj_tp1_hc(
+        o_packed, wo_a, wo_b, wo_b_scale, x_hc, post_t, comb_t, x_out, heads_dep,
+    )
     return x_out
 
 

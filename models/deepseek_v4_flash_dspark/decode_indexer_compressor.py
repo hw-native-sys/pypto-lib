@@ -70,7 +70,7 @@ K_TILE = 512
 OUT_TILE = 64
 PROJ_OUT_TILE = 32
 assert PROJ_OUT_TILE % 16 == 0, "cube tile cols must be a multiple of 16"
-MM_B_TILE = 16
+MM_B_TILE = 32
 KV_SCORE_WORKERS = 24  # KV-score projection workers
 POOL_WORKERS = 16  # Pool workers
 RMS_WORKERS = 2  # RMSNorm + RoPE workers
@@ -107,20 +107,42 @@ def indexer_compressor_project(
         for idx in pl.range(kv_worker, t_matmul * OUT_DIM // (MM_B_TILE * PROJ_OUT_TILE), KV_SCORE_WORKERS):
             global_row0 = (idx // (OUT_DIM // PROJ_OUT_TILE)) * MM_B_TILE
             o0 = (idx % (OUT_DIM // PROJ_OUT_TILE)) * PROJ_OUT_TILE
-            kv_acc = pl.create_tensor([MM_B_TILE, PROJ_OUT_TILE], dtype=pl.FP32)
-            score_acc = pl.create_tensor([MM_B_TILE, PROJ_OUT_TILE], dtype=pl.FP32)
-            for kb in pl.pipeline(0, D // K_TILE, stage=2):
-                k0 = kb * K_TILE
-                x_rows = pl.min(MM_B_TILE, bs - global_row0)
-                x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[x_rows, K_TILE])
-                # Transposed [OUT_DIM, D] projection weights.
-                wkv_tile = wkv[o0 : o0 + PROJ_OUT_TILE, k0 : k0 + K_TILE]
-                wgate_tile = wgate[o0 : o0 + PROJ_OUT_TILE, k0 : k0 + K_TILE]
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True, init_cond=(k0 == 0))
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True, init_cond=(k0 == 0))
+            x_rows = pl.min(MM_B_TILE, bs - global_row0)
+            if x_rows == MM_B_TILE:
+                # Joined [value, score] output columns in on-chip Mat storage.
+                x_first = pl.load(x_flat, [global_row0, 0], [MM_B_TILE, K_TILE], valid_shape=[x_rows, K_TILE], target_memory=pl.Mem.Mat)
+                w_first = pl.create_tile([2 * PROJ_OUT_TILE, K_TILE], pl.BF16, target_memory=pl.Mem.Mat)
+                w_first = pl.gather_row(w_first, wkv, [0, 0], [o0, 0], [PROJ_OUT_TILE, K_TILE])
+                w_first = pl.gather_row(w_first, wgate, [PROJ_OUT_TILE, 0], [o0, 0], [PROJ_OUT_TILE, K_TILE])
+                joint_acc = pl.matmul(x_first, pl.tile.transpose_view(w_first), out_dtype=pl.FP32)
+                for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
+                    x_tile = pl.load(x_flat, [global_row0, k0], [MM_B_TILE, K_TILE], valid_shape=[x_rows, K_TILE], target_memory=pl.Mem.Mat)
+                    w_tile = pl.create_tile([2 * PROJ_OUT_TILE, K_TILE], pl.BF16, target_memory=pl.Mem.Mat)
+                    w_tile = pl.gather_row(w_tile, wkv, [0, 0], [o0, k0], [PROJ_OUT_TILE, K_TILE])
+                    w_tile = pl.gather_row(w_tile, wgate, [PROJ_OUT_TILE, 0], [o0, k0], [PROJ_OUT_TILE, K_TILE])
+                    joint_acc = pl.matmul_acc(joint_acc, x_tile, pl.tile.transpose_view(w_tile))
 
-            kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + PROJ_OUT_TILE] = kv_acc
-            score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + PROJ_OUT_TILE] = score_acc
+                kv_acc = pl.tile.slice(joint_acc, [MM_B_TILE, PROJ_OUT_TILE], [0, 0], valid_shape=[x_rows, PROJ_OUT_TILE])
+                score_acc = pl.tile.slice(joint_acc, [MM_B_TILE, PROJ_OUT_TILE], [0, PROJ_OUT_TILE], valid_shape=[x_rows, PROJ_OUT_TILE])
+                pl.store(kv_acc, [global_row0, o0], kv_proj_pad)
+                pl.store(score_acc, [global_row0, o0], score_proj_pad)
+            else:
+                # Partial rows retain their compact accumulator pitch.
+                tail_x_first = pl.load(x_flat, [global_row0, 0], [MM_B_TILE, K_TILE], valid_shape=[x_rows, K_TILE], target_memory=pl.Mem.Mat)
+                tail_wkv_first = pl.load(wkv, [o0, 0], [PROJ_OUT_TILE, K_TILE], target_memory=pl.Mem.Mat)
+                tail_wgate_first = pl.load(wgate, [o0, 0], [PROJ_OUT_TILE, K_TILE], target_memory=pl.Mem.Mat)
+                tail_kv_acc = pl.matmul(tail_x_first, pl.tile.transpose_view(tail_wkv_first), out_dtype=pl.FP32)
+                tail_score_acc = pl.matmul(tail_x_first, pl.tile.transpose_view(tail_wgate_first), out_dtype=pl.FP32)
+                for tail_k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
+                    tail_x = pl.load(x_flat, [global_row0, tail_k0], [MM_B_TILE, K_TILE], valid_shape=[x_rows, K_TILE], target_memory=pl.Mem.Mat)
+                    tail_wkv = pl.load(wkv, [o0, tail_k0], [PROJ_OUT_TILE, K_TILE], target_memory=pl.Mem.Mat)
+                    tail_wgate = pl.load(wgate, [o0, tail_k0], [PROJ_OUT_TILE, K_TILE], target_memory=pl.Mem.Mat)
+                    tail_kv_acc = pl.matmul_acc(tail_kv_acc, tail_x, pl.tile.transpose_view(tail_wkv))
+                    tail_score_acc = pl.matmul_acc(tail_score_acc, tail_x, pl.tile.transpose_view(tail_wgate))
+                tail_kv_valid = pl.set_validshape(tail_kv_acc, x_rows, PROJ_OUT_TILE)
+                tail_score_valid = pl.set_validshape(tail_score_acc, x_rows, PROJ_OUT_TILE)
+                pl.store(tail_kv_valid, [global_row0, o0], kv_proj_pad)
+                pl.store(tail_score_valid, [global_row0, o0], score_proj_pad)
 
     return _kv_score_tid
 

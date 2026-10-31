@@ -73,7 +73,7 @@ from decode_o_proj import (
     LOCAL_T,
     LOCAL_T_PAD,
     O_WINDOW_ROWS,
-    decode_o_proj_tp1,
+    decode_o_proj_tp1_hc,
     o_group_a2a,
     o_proj_reduce_scatter,
 )
@@ -680,7 +680,6 @@ def _decode_hca_tp1(
         late_dep, cmp_rope_ready_tid,
     )
 
-    attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
     with pl.scope():
         o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
         o_packed_heads, heads_dep = sparse_attn_hca_tp1(
@@ -691,8 +690,9 @@ def _decode_hca_tp1(
             o_packed_heads, ori_cache_write_tid, cmp_cache_write_tid,
         )
         with pl.scope():
-            attn_out = decode_o_proj_tp1(o_packed_heads, wo_a, wo_b, wo_b_scale, attn_out, heads_dep)
-            hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+            decode_o_proj_tp1_hc(
+                o_packed_heads, wo_a, wo_b, wo_b_scale, x_hc, post_t, comb_t, x_out, heads_dep,
+            )
     return x_out
 
 

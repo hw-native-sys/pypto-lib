@@ -19,6 +19,9 @@ from rmsnorm import rms_norm_apply, rms_norm_inverse
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+HC_LINEAR_T_DYN = pl.dynamic("HC_LINEAR_T_DYN")
+HC_SPLIT_T_DYN = pl.dynamic("HC_SPLIT_T_DYN")
+HC_MIX_T_DYN = pl.dynamic("HC_MIX_T_DYN")
 
 # model config
 D = M.hidden_size
@@ -43,32 +46,22 @@ D_TILE = 256
 D_SPMD = gcd(4096, D)
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
-LINEAR_WORKERS = 24  # hc_pre_linear workers, one per AIC
+LINEAR_WORKERS = 16  # bounded hc_pre_linear workers
 
 # pre0..pre3 / row0..row3 are hand-unrolled over the hc lanes.
 assert HC_MULT == 4, f"hc_pre is specialized to HC_MULT == 4, got {HC_MULT}"
 
 
 @pl.jit.inline
-def hc_pre_gates(
+def _hc_pre_statistics(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_scale: pl.Tensor[[3], pl.FP32],
-    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    pre_val_store: pl.Tensor[[T_DYN, HC_PAD], pl.FP32],
-    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    row_recip: pl.Scalar[pl.BOOL],
 ):
-    """Compute pre/post gates and Sinkhorn combinations with padded linear intermediates."""
+    """Compute HC input inverse RMS and split-K linear partials."""
     t_dim = pl.tensor.dim(x, 0)
     token_tiles = (t_dim + T_TILE - 1) // T_TILE
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
-    scale0 = pl.read(hc_scale, [0])
-    scale1 = pl.read(hc_scale, [1])
-    scale2 = pl.read(hc_scale, [2])
-    hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])  # for per-group comb base loads in comb_sinkhorn
 
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
 
@@ -99,8 +92,6 @@ def hc_pre_gates(
     linear_units = (t_linear // LINEAR_T_TILE) * LINEAR_OK
     linear_workers = pl.min(linear_units, LINEAR_WORKERS)
     for linear_worker in pl.spmd(linear_workers, name_hint="hc_pre_linear", allow_early_resolve=True):
-        # Weight reads bypass L2.
-        pl.set_cache_policy(hc_fn, pl.CachePolicy.BYPASS)
         for task in pl.range(linear_worker, linear_units, linear_workers):
             t0 = (task // LINEAR_OK) * LINEAR_T_TILE
             linear_split = task % LINEAR_OK
@@ -114,17 +105,73 @@ def hc_pre_gates(
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True, init_cond=(kb == 0))
             partial_row0 = linear_split * t_linear + t0
             mixes_partials[partial_row0 : partial_row0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
+    return inv_rms, mixes_partials
 
-    # Partials are reduced in ascending K order.
+
+@pl.jit.inline(auto_scope=False)
+def _hc_pre_gate_values(
+    mixes_partials: pl.Tensor[[HC_SPLIT_T_DYN, MIX_PAD], pl.FP32],
+    inv_rms: pl.Tensor[[HC_LINEAR_T_DYN, 1], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    t0: pl.Scalar[pl.INDEX],
+    t_linear: pl.Scalar[pl.INDEX],
+    scale0: pl.Scalar[pl.FP32],
+    scale1: pl.Scalar[pl.FP32],
+):
+    """Reduce split-K partials and compute one eight-row HC gate tile."""
+    mix_cols_i32 = pl.tile.arange(HC_MULT, [1, HC_PAD], dtype=pl.INT32)
+    mix_cols_f32 = pl.cast(mix_cols_i32, target_type=pl.FP32)
+    mix_ones = pl.tile.full([T_TILE, HC_PAD], dtype=pl.FP32, value=1.0)
+    mix_grid = pl.col_expand_mul(mix_ones, mix_cols_f32)
+    mix_rows_i32 = pl.tile.arange(0, [1, T_TILE], dtype=pl.INT32)
+    mix_rows_f32 = pl.cast(mix_rows_i32, target_type=pl.FP32)
+    mix_row_offsets = pl.reshape(pl.mul(mix_rows_f32, MIX_PAD), [T_TILE, 1])
+    mix_indices = pl.cast(pl.row_expand_add(mix_grid, mix_row_offsets), target_type=pl.INT32)
+    mix_gather_tmp = pl.create_tile([T_TILE, HC_PAD], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec)
+    mixes_total = pl.load(mixes_partials, [t0, 0], [T_TILE, MIX_PAD], target_memory=pl.MemorySpace.Vec)
+    for linear_split in pl.unroll(1, LINEAR_OK):
+        partial_t0 = linear_split * t_linear + t0
+        partial_tile = pl.load(mixes_partials, [partial_t0, 0], [T_TILE, MIX_PAD], target_memory=pl.MemorySpace.Vec)
+        mixes_total = pl.add(mixes_total, partial_tile)
+    pre_mix = pl.tile.slice(mixes_total, [T_TILE, HC_PAD], [0, 0])
+    post_mix = pl.tile.gather(mixes_total, mix_indices, mix_gather_tmp)
+    inv_col = pl.load(inv_rms, [t0, 0], [T_TILE, 1], target_memory=pl.MemorySpace.Vec)
+    pre_base_vec = pl.load(hc_base, [0], [HC_PAD], target_memory=pl.MemorySpace.Vec)
+    pre_base = pl.reshape(pre_base_vec, [1, HC_PAD])
+    pre_scaled = pl.mul(pl.row_expand_mul(pre_mix, inv_col), scale0)
+    pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
+    pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
+    pre_val = pl.add(pre_sig, HC_EPS)
+    post_base_vec = pl.load(hc_base, [HC_MULT], [HC_PAD], target_memory=pl.MemorySpace.Vec)
+    post_base = pl.reshape(post_base_vec, [1, HC_PAD])
+    post_scaled = pl.mul(pl.row_expand_mul(post_mix, inv_col), scale1)
+    post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
+    post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
+    post_pad = pl.mul(post_sig, 2.0)
+    return pre_val, post_pad, mixes_total
+
+
+@pl.jit.inline
+def hc_pre_gates(
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    pre_val_store: pl.Tensor[[T_DYN, HC_PAD], pl.FP32],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    row_recip: pl.Scalar[pl.BOOL],
+):
+    """Compute pre/post gates and Sinkhorn combinations with padded linear intermediates."""
+    t_dim = pl.tensor.dim(x, 0)
+    token_tiles = (t_dim + T_TILE - 1) // T_TILE
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
+    inv_rms, mixes_partials = _hc_pre_statistics(x, hc_fn)
+    scale0 = pl.read(hc_scale, [0])
+    scale1 = pl.read(hc_scale, [1])
+    scale2 = pl.read(hc_scale, [2])
+
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
-    for linear_block in pl.spmd(t_linear // LINEAR_T_TILE, name_hint="hc_pre_linear_reduce", allow_early_resolve=True):
-        linear_t0 = linear_block * LINEAR_T_TILE
-        mixes_total = mixes_partials[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD]
-        for linear_split in pl.range(1, LINEAR_OK):
-            partial_t0 = linear_split * t_linear + linear_t0
-            partial_tile = mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:MIX_PAD]
-            mixes_total = pl.add(mixes_total, partial_tile)
-        mixes_raw[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD] = mixes_total
 
     # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
     # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
@@ -136,27 +183,36 @@ def hc_pre_gates(
         for ob in pl.range(ob_worker, token_tiles, pl.min(token_tiles, PRE_POST_WORKERS)):
             t0 = ob * T_TILE
             valid_rows = pl.min(T_TILE, t_dim - t0)
-            inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
-
-            pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
-            pre_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, 0:HC_PAD], inv_col), scale0)
-            pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
-            pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
-            pre_val = pl.add(pre_sig, HC_EPS)
-            pre_val_store[t0:t0 + T_TILE, 0:HC_PAD] = pre_val
-
-            post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
-            post_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], inv_col), scale1)
-            post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
-            post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
-            post_pad = pl.mul(post_sig, 2.0)
+            pre_val, post_pad, mixes_total = _hc_pre_gate_values(
+                mixes_partials, inv_rms, hc_base, t0, t_linear, scale0, scale1,
+            )
+            pl.store(mixes_total, [t0, 0], mixes_raw)
+            pl.store(pre_val, [t0, 0], pre_val_store)
             if valid_rows == T_TILE:
-                post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[T_TILE, HC_MULT])
+                post_full_tile = pl.set_validshape(post_pad, T_TILE, HC_MULT)
+                pl.store(post_full_tile, [t0, 0], post)
             else:
-                post_tail_store[0:T_TILE, 0:HC_PAD] = post_pad
+                pl.store(post_pad, [0, 0], post_tail_store)
                 post_tile = pl.load(post_tail_store, [0, 0], [T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
                 pl.store(post_tile, [t0, 0], post)
 
+    _hc_pre_combinations(mixes_raw, inv_rms, hc_base, comb, t_dim, scale2, row_recip)
+    return pre_val_store
+
+
+@pl.jit.inline
+def _hc_pre_combinations(
+    mixes_raw: pl.Tensor[[HC_MIX_T_DYN, MIX_PAD], pl.FP32],
+    inv_rms: pl.Tensor[[HC_LINEAR_T_DYN, 1], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+    t_dim: pl.Scalar[pl.INDEX],
+    scale2: pl.Scalar[pl.FP32],
+    row_recip: pl.Scalar[pl.BOOL],
+):
+    """Compute the HC comb softmax and Sinkhorn normalization."""
+    token_tiles = (t_dim + COMB_T_TILE - 1) // COMB_T_TILE
+    hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])
     # comb_sinkhorn: comb gate from mixes_raw cols 8/12/16/20, softmax, then a
     # column-first 20-iteration Sinkhorn -> comb.
     comb_tail_store = pl.create_tensor([COMB_T_TILE, HC_PAD * HC_MULT], dtype=pl.FP32)
@@ -281,7 +337,7 @@ def hc_pre_gates(
             pl.store(row2_tail, [t0, 2 * HC_MULT], comb)
             pl.store(row3_tail, [t0, 3 * HC_MULT], comb)
 
-    return pre_val_store
+    return comb
 
 
 def _hc_pre(
@@ -357,13 +413,24 @@ def hc_pre_norm(
     t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, row_recip)
+    inv_rms, mixes_partials = _hc_pre_statistics(x, hc_fn)
+    mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    scale0 = pl.read(hc_scale, [0])
+    scale1 = pl.read(hc_scale, [1])
+    scale2 = pl.read(hc_scale, [2])
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
     x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
 
     # The RMS statistic includes the intermediate BF16 rounding.
     with pl.spmd(t_dim // T_TILE, name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
         t0 = pl.tile.get_block_idx() * T_TILE
+        pre_val, post_pad, mixes_total = _hc_pre_gate_values(
+            mixes_partials, inv_rms, hc_base, t0, t_linear, scale0, scale1,
+        )
+        pl.store(mixes_total, [t0, 0], mixes_raw)
+        pl.store(pre_val, [t0, 0], pre_val_store)
+        post_valid = pl.set_validshape(post_pad, T_TILE, HC_MULT)
+        pl.store(post_valid, [t0, 0], post)
         pre_tile = pre_val_store[t0:t0 + T_TILE, 0:HC_PAD]
         pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
         pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
@@ -403,6 +470,7 @@ def hc_pre_norm(
             norm_w_row = pl.reshape(norm_w_input, [1, D_TILE])
             normed_bf16 = rms_norm_apply(mixed_input, norm_w_row, y_inv)
             x_normed[t0:t0 + T_TILE, d0:d0 + D_TILE] = normed_bf16
+    _hc_pre_combinations(mixes_raw, inv_rms, hc_base, comb, t_dim, scale2, row_recip)
     return mixed_tid
 
 
