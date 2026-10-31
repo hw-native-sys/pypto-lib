@@ -106,7 +106,7 @@ def grouped_mxfp8_mxfp4_experts(
     experts: pl.constexpr,
     row_stride: pl.constexpr,
 ):
-    """Project active expert rows in fixed-capacity buffers with 16-row tiles.
+    """Project active expert rows in fixed-capacity buffers with up to 64 rows per tile.
 
     Counts are INT32 [experts, 1], immutable after ready, and within [0, row_stride].
     Input and output are row-major [experts * row_stride, k/n], with positive row_stride % 16 == 0.
