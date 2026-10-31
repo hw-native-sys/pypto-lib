@@ -160,7 +160,8 @@ jobs:
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
     # the only difference: no Ascend env, which the simulator does not use.
-    runs-on: [self-hosted, linux, cpu]
+    # Use CPU hosts with working GitCode access for this isolated experiment.
+    runs-on: [self-hosted, linux, cpu, ARM64]
     timeout-minutes: 45
     strategy:
       fail-fast: false
