@@ -429,6 +429,31 @@ runs:
           echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
         } >> "$GITHUB_ENV"
 
+    - name: Cache and verify the experimental ISA revision
+      shell: bash
+      run: |
+        set -euo pipefail
+        isa_cache=$(mktemp -d "$RUNNER_TEMP/pr898-isa-XXXXXX")
+        git init -q "$isa_cache"
+        isa_remote=https://gitcode.com/guoliwei/pto-isa.git
+        # Fetch one revision, not the complete repository history. Try a direct
+        # GitCode connection before using the host's configured proxy.
+        if ! timeout 120 env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+          git -c http.proxy= -C "$isa_cache" fetch --depth=1 --no-tags "$isa_remote" refs/heads/ci/pr898-merged-only; then
+          timeout 120 git -C "$isa_cache" fetch --depth=1 --no-tags "$isa_remote" refs/heads/ci/pr898-merged-only
+        fi
+        git -C "$isa_cache" checkout -B pr898-isa-cache FETCH_HEAD
+        test "$(git -C "$isa_cache" rev-parse HEAD)" = "$PTO_ISA_COMMIT"
+        test -z "$(git -C "$isa_cache" status --porcelain)"
+        # Both the source build and installed wheel retain their own managed
+        # checkouts. Feed their normal clone path from this verified local copy.
+        isa_config_count=${GIT_CONFIG_COUNT:-0}
+        {
+          echo "GIT_CONFIG_KEY_${isa_config_count}=url.file://${isa_cache}.insteadOf"
+          echo "GIT_CONFIG_VALUE_${isa_config_count}=$isa_remote"
+          echo "GIT_CONFIG_COUNT=$((isa_config_count + 1))"
+        } >> "$GITHUB_ENV"
+
     # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
     # stale objects compiled against the old ISA headers (see issue #1139):
     # a different commit hashes to a different key, forcing a real recompile.
@@ -1082,6 +1107,13 @@ runs:
                          f"this job's venv ({sorted(roots)}) - an outside copy "
                          "is shadowing the revision the pin chain selected")
         print("env OK:", pypto.__file__)
+        import subprocess
+        from pypto.runtime import ensure_pto_isa_root
+        isa_root = ensure_pto_isa_root()
+        actual = subprocess.check_output(["git", "-C", isa_root, "rev-parse", "HEAD"], text=True).strip()
+        assert actual == os.environ["PTO_ISA_COMMIT"], (actual, os.environ["PTO_ISA_COMMIT"])
+        assert not subprocess.check_output(["git", "-C", isa_root, "status", "--porcelain"], text=True).strip()
+        print("managed ISA verified:", actual, isa_root)
         PYCHECK
 
     - name: Install runner dependencies
