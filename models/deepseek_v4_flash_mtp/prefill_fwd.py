@@ -1404,7 +1404,7 @@ def prefill_fwd(
         # final MoE and before the next HOST dispatch can reuse the windows.
         tail_completed = pl.cast(FWD_NUM_LAYERS, pl.INT32)
         hca_completed = pl.cast(HCA_NUM_LAYERS, pl.INT32)
-        csa_completed = pl.cast(CSA_NUM_LAYERS, pl.INT32)
+        csa_completed = pl.cast(2 * CSA_NUM_LAYERS, pl.INT32)
         retire_prefix = pl.read(segment_starts_t, [0])
         if retire_prefix > 0:
             # Each SWA adds one raw-history phase. Each compressed layer adds
@@ -1415,7 +1415,7 @@ def prefill_fwd(
                 pl.INT32,
             )
             csa_completed = pl.cast(
-                CSA_NUM_LAYERS * (2 + (retire_prefix // CSA_COMPRESS_RATIO + RECORDS_PER_WINDOW - 1) // RECORDS_PER_WINDOW),
+                2 * CSA_NUM_LAYERS * (2 + (retire_prefix // CSA_COMPRESS_RATIO + RECORDS_PER_WINDOW - 1) // RECORDS_PER_WINDOW),
                 pl.INT32,
             )
         _clear_prefill_cp_exchange_signals(publish_anchor, tail_ready, tail_consumed, tail_completed, my_rank)

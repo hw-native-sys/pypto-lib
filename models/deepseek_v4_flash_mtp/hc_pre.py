@@ -137,14 +137,18 @@ def hc_pre_gates(
             mixes_partials[partial_row0 : partial_row0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
 
     # Partials are reduced in ascending K order.
-    for linear_block in pl.spmd(t_linear // LINEAR_T_TILE, name_hint="hc_pre_linear_reduce", allow_early_resolve=True):
-        linear_t0 = linear_block * LINEAR_T_TILE
-        mixes_total = mixes_partials[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD]
-        for linear_split in pl.range(1, LINEAR_OK):
-            partial_t0 = linear_split * t_linear + linear_t0
-            partial_tile = mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:MIX_PAD]
-            mixes_total = pl.add(mixes_total, partial_tile)
-        mixes_raw[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD] = mixes_total
+    reduce_workers = pl.min(t_linear // LINEAR_T_TILE, 4)
+    if not emit_split:
+        reduce_workers = pl.min(t_linear // LINEAR_T_TILE, 2)
+    for reduce_worker in pl.spmd(reduce_workers, name_hint="hc_pre_linear_reduce", allow_early_resolve=True):
+        for linear_block in pl.range(reduce_worker, t_linear // LINEAR_T_TILE, reduce_workers):
+            linear_t0 = linear_block * LINEAR_T_TILE
+            mixes_total = mixes_partials[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD]
+            for linear_split in pl.range(1, LINEAR_OK):
+                partial_t0 = linear_split * t_linear + linear_t0
+                partial_tile = mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:MIX_PAD]
+                mixes_total = pl.add(mixes_total, partial_tile)
+            mixes_raw[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD] = mixes_total
 
     # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
     # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
@@ -331,8 +335,8 @@ def hc_pre_norm(
 ):
     """Prefill HC-pre with mix_x fused into the attention RMSNorm.
 
-    One block owns a T_TILE-row tile across all of D, so the scheduler sees one
-    block per tile instead of D // D_SPMD mix_x blocks plus an rms_norm block.
+    Each worker processes strided T_TILE-row tiles across all of D, with at
+    most sixteen workers instead of one block per token tile.
     The square sum accumulates RMS_D_TILE chunks of the BF16-rounded mix in the
     same order as ``rmsnorm.rms_norm``, so the result is bit-identical to
     ``hc_pre`` followed by ``rms_norm``.
@@ -346,58 +350,59 @@ def hc_pre_norm(
     gate_mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
     gate_inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     hc_pre_gates(x, hc_fn, hc_scale, hc_base, pre_val_store, post, comb, gate_mixes_raw, gate_inv_rms, False)
-    with pl.spmd(t_dim // T_TILE, name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
-        t0 = pl.tile.get_block_idx() * T_TILE
-        # Pre/post gates folded in from split_pre_post: same arithmetic, one task
-        # fewer on the critical path.
-        gate_inv_col = gate_inv_rms[t0:t0 + T_TILE, 0:1]
-        gate_pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
-        gate_pre_norm = pl.row_expand_mul(gate_mixes_raw[t0:t0 + T_TILE, 0:HC_PAD], gate_inv_col)
-        gate_pre_scaled = pl.mul(gate_pre_norm, scale0)
-        gate_pre_logits = pl.add(gate_pre_scaled, pl.col_expand(gate_pre_scaled, gate_pre_base))
-        gate_pre_sig = pl.recip(pl.add(pl.exp(pl.neg(gate_pre_logits)), 1.0))
-        gate_pre_val = pl.add(gate_pre_sig, HC_EPS)
-        gate_post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
-        gate_post_norm = pl.row_expand_mul(gate_mixes_raw[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], gate_inv_col)
-        gate_post_scaled = pl.mul(gate_post_norm, scale1)
-        gate_post_logits = pl.add(gate_post_scaled, pl.col_expand(gate_post_scaled, gate_post_base))
-        gate_post_sig = pl.recip(pl.add(pl.exp(pl.neg(gate_post_logits)), 1.0))
-        gate_post_pad = pl.mul(gate_post_sig, 2.0)
-        post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(gate_post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[T_TILE, HC_MULT])
-        # Keep the transpose reading the same GM slice as before: only the task
-        # boundary is removed, the data path through pre_val_store is unchanged.
-        pre_val_store[t0:t0 + T_TILE, 0:HC_PAD] = gate_pre_val
-        pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
-        pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
-        pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
-        pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
-        pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
-        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for db in pl.pipeline(D // D_TILE, stage=2):
-            d0 = db * D_TILE
-            x0 = x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_TILE]
-            x1 = x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_TILE]
-            x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_TILE]
-            x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_TILE]
-            y0 = pl.row_expand_mul(x0, pre0)
-            y1 = pl.row_expand_mul(x1, pre1)
-            y2 = pl.row_expand_mul(x2, pre2)
-            y3 = pl.row_expand_mul(x3, pre3)
-            y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
-            y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-            x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
-            for half in pl.unroll(D_TILE // RMS_D_TILE):
-                h0 = half * RMS_D_TILE
-                y_rounded = pl.cast(y_bf16[:, h0:h0 + RMS_D_TILE], target_type=pl.FP32)
-                sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(y_rounded, y_rounded)), [1, T_TILE]))
-        inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS), high_precision=True)
-        inv_rms_t = pl.reshape(inv_rms, [T_TILE, 1])
-        for apply_db in pl.pipeline(D // RMS_D_TILE, stage=2):
-            apply_d0 = apply_db * RMS_D_TILE
-            apply_x = pl.cast(x_mixed[t0:t0 + T_TILE, apply_d0:apply_d0 + RMS_D_TILE], target_type=pl.FP32)
-            norm_w_chunk = pl.cast(pl.reshape(norm_w[apply_d0:apply_d0 + RMS_D_TILE], [1, RMS_D_TILE]), pl.FP32)
-            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x, inv_rms_t), norm_w_chunk)
-            x_normed[t0:t0 + T_TILE, apply_d0:apply_d0 + RMS_D_TILE] = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
+    mixed_tiles = t_dim // T_TILE
+    mixed_workers = pl.min(mixed_tiles, 16)
+    with pl.spmd(mixed_workers, name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
+        for mixed_tile in pl.range(pl.tile.get_block_idx(), mixed_tiles, mixed_workers):
+            t0 = mixed_tile * T_TILE
+            # Compute the pre/post gates in the normalization task.
+            gate_inv_col = gate_inv_rms[t0:t0 + T_TILE, 0:1]
+            gate_pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
+            gate_pre_norm = pl.row_expand_mul(gate_mixes_raw[t0:t0 + T_TILE, 0:HC_PAD], gate_inv_col)
+            gate_pre_scaled = pl.mul(gate_pre_norm, scale0)
+            gate_pre_logits = pl.add(gate_pre_scaled, pl.col_expand(gate_pre_scaled, gate_pre_base))
+            gate_pre_sig = pl.recip(pl.add(pl.exp(pl.neg(gate_pre_logits)), 1.0))
+            gate_pre_val = pl.add(gate_pre_sig, HC_EPS)
+            gate_post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
+            gate_post_norm = pl.row_expand_mul(gate_mixes_raw[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], gate_inv_col)
+            gate_post_scaled = pl.mul(gate_post_norm, scale1)
+            gate_post_logits = pl.add(gate_post_scaled, pl.col_expand(gate_post_scaled, gate_post_base))
+            gate_post_sig = pl.recip(pl.add(pl.exp(pl.neg(gate_post_logits)), 1.0))
+            gate_post_pad = pl.mul(gate_post_sig, 2.0)
+            post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(gate_post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[T_TILE, HC_MULT])
+            # Transpose the pre gates through pre_val_store.
+            pre_val_store[t0:t0 + T_TILE, 0:HC_PAD] = gate_pre_val
+            pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
+            pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
+            pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
+            pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
+            pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
+            sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+            for db in pl.pipeline(D // D_TILE, stage=2):
+                d0 = db * D_TILE
+                x0 = x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_TILE]
+                x1 = x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_TILE]
+                x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_TILE]
+                x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_TILE]
+                y0 = pl.row_expand_mul(x0, pre0)
+                y1 = pl.row_expand_mul(x1, pre1)
+                y2 = pl.row_expand_mul(x2, pre2)
+                y3 = pl.row_expand_mul(x3, pre3)
+                y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
+                y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+                x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = y_bf16
+                for half in pl.unroll(D_TILE // RMS_D_TILE):
+                    h0 = half * RMS_D_TILE
+                    y_rounded = pl.cast(y_bf16[:, h0:h0 + RMS_D_TILE], target_type=pl.FP32)
+                    sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(y_rounded, y_rounded)), [1, T_TILE]))
+            inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS), high_precision=True)
+            inv_rms_t = pl.reshape(inv_rms, [T_TILE, 1])
+            for apply_db in pl.pipeline(D // RMS_D_TILE, stage=2):
+                apply_d0 = apply_db * RMS_D_TILE
+                apply_x = pl.cast(x_mixed[t0:t0 + T_TILE, apply_d0:apply_d0 + RMS_D_TILE], target_type=pl.FP32)
+                norm_w_chunk = pl.cast(pl.reshape(norm_w[apply_d0:apply_d0 + RMS_D_TILE], [1, RMS_D_TILE]), pl.FP32)
+                normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x, inv_rms_t), norm_w_chunk)
+                x_normed[t0:t0 + T_TILE, apply_d0:apply_d0 + RMS_D_TILE] = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
     return mixed_tid
 
 

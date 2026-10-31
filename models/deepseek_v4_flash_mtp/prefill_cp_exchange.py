@@ -73,7 +73,7 @@ IDX_TOPK = M.index_topk
 
 # CP exchange layout
 LOCAL_PARTS = 2
-TAIL_GATHER_SPLIT = 4  # row-slice blocks per segment in cp_hidden_tail_gather
+TAIL_GATHER_SPLIT = 1  # row-slice blocks per segment in cp_hidden_tail_gather
 NUM_LOCAL_TILES = LOCAL_PARTS * MAX_SEGMENT_TILES
 LOCAL_ROWS = NUM_LOCAL_TILES * TAIL_ROWS
 LOCAL_SPARSE_ROWS = LOCAL_ROWS * PREFILL_SPARSE_PAD
@@ -361,7 +361,6 @@ def _clear_prefill_cp_exchange_signals(
 def _prefill_cp_hidden_tail_exchange_wave(
     local_hidden_tail: pl.Tensor[[EPOCHS * LOCAL_PARTS * TAIL_ROWS, D], pl.BF16],
     reverse_index: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
-    owner_rank_table: pl.Tensor[[NUM_SEGMENTS], pl.INT32],
     hidden_window: pld.DistributedTensor[[CP_TAIL_WINDOW_ROWS, D], pl.BF16],
     ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
@@ -401,15 +400,23 @@ def _prefill_cp_hidden_tail_exchange_wave(
                 value=1, op=pld.NotifyOp.AtomicAdd,
             )
 
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="cp_hidden_tail_ready",
+        deps=[publish_tid], allow_early_resolve=False,
+    ) as ready_tid:
+        for ready_peer in pl.range(CP_SIZE):
+            if ready_peer != cp_rank:
+                pld.system.defer_wait(
+                    signal=ready, offsets=[ready_peer, 0],
+                    expected=epoch_value, cmp=pld.WaitCmp.Ge,
+                )
+
     # Each segment's tail is copied by TAIL_GATHER_SPLIT blocks, one row slice each.
-    with pl.spmd(NUM_SEGMENTS * TAIL_GATHER_SPLIT, name_hint="cp_hidden_tail_gather", deps=[publish_tid]) as gather_tid:
+    with pl.spmd(NUM_SEGMENTS * TAIL_GATHER_SPLIT, name_hint="cp_hidden_tail_gather", deps=[ready_tid]) as gather_tid:
         gather_block = pl.tile.get_block_idx()
         seg = gather_block // TAIL_GATHER_SPLIT
         slice_row0 = (gather_block % TAIL_GATHER_SPLIT) * (TAIL_ROWS // TAIL_GATHER_SPLIT)
         gather_pos = reverse_index[seg]
-        owner = owner_rank_table[seg]
-        if owner != cp_rank:
-            pld.system.wait(signal=ready, offsets=[owner, 0], expected=epoch_value, cmp=pld.WaitCmp.Ge)
         gather_src_row = gather_pos * TAIL_ROWS
         gather_dst_row = payload_epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS
         for t0 in pl.range(slice_row0, slice_row0 + TAIL_ROWS // TAIL_GATHER_SPLIT, ROW_TILE):
@@ -727,25 +734,17 @@ def _prefill_cp_csa_compact_transport_wave(
     payload_epoch: pl.Scalar[pl.INT32],
     comm_epoch: pl.Scalar[pl.INT32],
     history_ready_tid: pl.Scalar[pl.TASK_ID],
-) -> pl.Scalar[pl.TASK_ID]:
-    with pl.spmd(CP_SIZE, name_hint="cp_csa_compact_transport", deps=[history_ready_tid], allow_early_resolve=False) as transport_tid:
+) -> tuple[pl.Scalar[pl.TASK_ID], pl.Scalar[pl.TASK_ID]]:
+    # Index records become visible independently of main KV and final states.
+    with pl.spmd(CP_SIZE, name_hint="cp_csa_indexer_transport", deps=[history_ready_tid], allow_early_resolve=False) as index_publish_tid:
         peer = pl.tile.get_block_idx()
         cp_rank = my_rank % CP_SIZE
         cp_group_base = my_rank - cp_rank
         comm_i32 = pl.cast(comm_epoch, pl.INT32)
-        ready_expected = pl.cast(comm_i32 + 1, pl.INT32)
         if peer != cp_rank:
             pld.system.wait(signal=consumed, offsets=[peer, 0], expected=comm_i32, cmp=pld.WaitCmp.Ge)
-
         payload_row = payload_epoch * ROWS_PER_RANK
-        state_row = payload_epoch * STATE_ROWS_PER_RANK
         destination_row = cp_rank * ROWS_PER_RANK
-        destination_state_row = cp_rank * STATE_ROWS_PER_RANK
-        pld.tensor.put(
-            dst=main_window, peer=cp_group_base + peer, src=main_payload,
-            dst_offsets=[destination_row, 0], src_offsets=[payload_row, 0], shape=[ROWS_PER_RANK, MAIN_HEAD_DIM],
-            chunk_rows=8, chunk_cols=MAIN_HEAD_DIM, pipeline=True,
-        )
         pld.tensor.put(
             dst=idx_window, peer=cp_group_base + peer, src=idx_payload,
             dst_offsets=[destination_row, 0], src_offsets=[payload_row, 0], shape=[ROWS_PER_RANK, INNER_HEAD_DIM],
@@ -760,6 +759,37 @@ def _prefill_cp_csa_compact_transport_wave(
             dst=record_window, peer=cp_group_base + peer, src=record_meta,
             dst_offsets=[destination_row, 0], src_offsets=[payload_row, 0], shape=[ROWS_PER_RANK, META_DIM],
             chunk_rows=8, chunk_cols=META_DIM, pipeline=True,
+        )
+        if peer != cp_rank:
+            pld.system.notify(
+                target=ready, peer=cp_group_base + peer, offsets=[cp_rank, 0],
+                value=1, op=pld.NotifyOp.AtomicAdd,
+            )
+    # A completed ready body registers the wait; logical completion releases the indexer.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_indexer_transport_ready", deps=[index_publish_tid], allow_early_resolve=False) as index_ready_tid:
+        cp_rank = my_rank % CP_SIZE
+        index_ready_expected = pl.cast(comm_epoch + 1, pl.INT32)
+        for ready_peer in pl.range(CP_SIZE):
+            if ready_peer != cp_rank:
+                pld.system.defer_wait(signal=ready, offsets=[ready_peer, 0], expected=index_ready_expected, cmp=pld.WaitCmp.Ge)
+
+    with pl.spmd(CP_SIZE, name_hint="cp_csa_compact_transport", deps=[history_ready_tid, index_publish_tid], allow_early_resolve=False) as transport_tid:
+        peer = pl.tile.get_block_idx()
+        cp_rank = my_rank % CP_SIZE
+        cp_group_base = my_rank - cp_rank
+        comm_i32 = pl.cast(comm_epoch, pl.INT32)
+        ready_expected = pl.cast(comm_i32 + 2, pl.INT32)
+        if peer != cp_rank:
+            pld.system.wait(signal=consumed, offsets=[peer, 0], expected=comm_i32, cmp=pld.WaitCmp.Ge)
+
+        payload_row = payload_epoch * ROWS_PER_RANK
+        state_row = payload_epoch * STATE_ROWS_PER_RANK
+        destination_row = cp_rank * ROWS_PER_RANK
+        destination_state_row = cp_rank * STATE_ROWS_PER_RANK
+        pld.tensor.put(
+            dst=main_window, peer=cp_group_base + peer, src=main_payload,
+            dst_offsets=[destination_row, 0], src_offsets=[payload_row, 0], shape=[ROWS_PER_RANK, MAIN_HEAD_DIM],
+            chunk_rows=8, chunk_cols=MAIN_HEAD_DIM, pipeline=True,
         )
         pld.tensor.put(
             dst=main_state_window, peer=cp_group_base + peer, src=main_state_payload,
@@ -793,7 +823,7 @@ def _prefill_cp_csa_compact_transport_wave(
             )
         if peer != cp_rank:
             pld.system.wait(signal=ready, offsets=[peer, 0], expected=ready_expected, cmp=pld.WaitCmp.Ge)
-    return transport_tid
+    return transport_tid, index_ready_tid
 
 
 @pl.jit.inline
@@ -807,7 +837,7 @@ def _prefill_cp_csa_compact_finish_wave(
         if peer != cp_rank:
             pld.system.notify(
                 target=consumed, peer=cp_group_base + peer, offsets=[cp_rank, 0],
-                value=1, op=pld.NotifyOp.AtomicAdd,
+                value=2, op=pld.NotifyOp.AtomicAdd,
             )
 
 
