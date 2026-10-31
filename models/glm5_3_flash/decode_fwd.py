@@ -6,1146 +6,596 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=2
-# ci: no-sim
-"""GLM-5.3-Flash multi-layer decode and persistent-state validation."""
-
-import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-if __name__ == "__main__" and not any(a == "--ep" or a.startswith("--ep=") for a in sys.argv):
-    sys.argv += ["--ep", "2"]
-
-import argparse
+"""GLM-5.3-Flash complete decode with the device vocabulary head."""
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-import torch
 
-from models.glm5_3_flash.all_reduce import tp_all_reduce
-from models.glm5_3_flash.attention import (
-    absorb_query, decode_sparse_attn, golden_absorb_query, golden_decode_sparse_attn,
-    golden_mla_cache_write, golden_mla_epilog_decode, golden_mla_prolog, mla_cache_write,
-    mla_epilog_decode, mla_prolog,
+from models.glm5_3_flash.layer import (
+    AUX_PAD, BATCH, BETA_PAD, CACHE_TOKENS as CACHE_TOKENS, CAPACITY as CAPACITY, CHUNK_TILE, CONV_DIM,
+    COUNT_PAD, D, DENSE_NUM_LAYERS, DSA_NUM_LAYERS, EP_SIZE as EP_SIZE,
+    FORWARD_ABI_VERSION as FORWARD_ABI_VERSION, FORWARD_PROGRAMS as FORWARD_PROGRAMS, FP32_HEAD_VOCAB_PAD,
+    HC_DIM, HC_MULT, INDEX_DIM, INDEX_H, INDEX_KPOOL, INDEX_STATE_WIDTH, KDA_CONV_K, KDA_DIM, KDA_NUM_LAYERS,
+    KDA_ROWS, KDA_STATE_COLUMNS, KPOOL_SELECT_K, KV_LORA, LATENT_ROWS, LOCAL_DENSE_INTER, LOCAL_H, LOCAL_KDA_H,
+    LOCAL_KDA_QKV_DIM, LOGIT_ROWS, MAX_SEQ_LEN as MAX_SEQ_LEN, MIX_HC, MLA_STACK_LAYERS, MOE_INTER,
+    MOE_STACK_LAYERS, NORM_STACK_LAYERS, NUM_LAYERS, N_EXPERTS, N_LOCAL_EXPERTS, N_RANKS, POOL_AXIS,
+    POOL_SCALE_WIDTH, POOL_TABLE_ROWS, QK_DIM, QUERY_ROWS_DYN, Q_LORA, RANKS as RANKS,
+    RESIDENT_ROUTES_PER_SRC, RESIDENT_TOTAL_CAP, ROUTER_STACK_LAYERS, STATE_LEN, TABLE_MAX,
+    TP_SIZE as TP_SIZE, V_DIM, _complete_forward_stage, forward_epoch_guard as forward_epoch_guard,
+    forward_geometry as forward_geometry, forward_parameter_names as forward_parameter_names,
+    forward_query_tensor_names as forward_query_tensor_names,
+    forward_tensor_layouts as forward_tensor_layouts, prefill_dense_layer, prefill_head_rows,
+    prefill_kda_attention, prefill_lm_head_logits, prefill_moe_layer, prefill_seed, prefill_sparse_attention,
 )
-from models.glm5_3_flash.config import (
-    BLOCK_SIZE, EP_SIZE, HC_DIM, HC_MULT, INDEX_DIM, INDEX_H, INDEX_KPOOL, INDEX_STATE_WIDTH, KDA_CONV_K,
-    KDA_DIM, KPOOL_SELECT_K, KV_LORA, LOCAL_H, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, MIX_HC, MOE_INTER,
-    N_EXPERTS, N_LOCAL_EXPERTS, Q_LORA, QK_DIM, TOPK_INDEX_WIDTH, TP_SIZE, D,
-)
-from models.glm5_3_flash.decode_layer import decode_mlp, golden_decode_layer
-from models.glm5_3_flash.decode_moe import AUX_PAD, COUNT_PAD, LANE_ROWS, N_ROUTES
-from models.glm5_3_flash.dense_mlp import (
-    LOCAL_DENSE_INTER, dense_mlp, dense_mlp_bf16, golden_dense_mlp_bf16, golden_dense_mlp_fn,
-)
-from models.glm5_3_flash.gate import make_correction_bias
-from models.glm5_3_flash.indexer import (
-    POOL_SCALE_WIDTH, POOL_VALID_WIDTH, golden_indexer_cache_write, golden_indexer_expand,
-    golden_indexer_pool_write, golden_indexer_proj, golden_indexer_score, golden_indexer_topk,
-    indexer_cache_write, indexer_expand, indexer_pool_write, indexer_proj, indexer_score, indexer_topk,
-)
-from models.glm5_3_flash.kda import (
-    BETA_PAD, CONV_DIM, STATE_LEN, decode_kda, golden_decode_kda, golden_kda_conv_decode,
-    golden_kda_output, golden_kda_projection, kda_conv_decode, kda_output, kda_projection,
-)
-from models.glm5_3_flash.mhc import (
-    golden_mhc_post, golden_mhc_pre, hc_head, hc_mixes, mhc_head, mhc_mixes, mhc_post, mhc_pre,
-)
-from models.glm5_3_flash.rmsnorm import golden_rmsnorm_quant, rms_norm, rmsnorm, rmsnorm_quant
-from models.glm5_3_flash.utils import Checkpoint, pack_int8_nz, sylvester_hadamard
 
-_shape_parser = argparse.ArgumentParser(add_help=False)
-_shape_parser.add_argument("--layers", type=int, default=4)
-_shape_parser.add_argument("--start-layer", type=int, default=0)
-_shape_parser.add_argument("--end-layer", type=int)
-_shape_parser.add_argument("--steps", type=int, default=2)
-_shape_parser.add_argument("--dense-dtype", choices=["int8", "bf16"], default="int8")
-_shape_args = _shape_parser.parse_known_args()[0]
-N_LAYERS = _shape_args.layers
-START_LAYER = _shape_args.start_layer
-END_LAYER = START_LAYER + 1 if _shape_args.end_layer is None else _shape_args.end_layer
-STEPS = _shape_args.steps
-DENSE_BF16 = _shape_args.dense_dtype == "bf16"
-DENSE_PL_DTYPE = pl.BF16 if DENSE_BF16 else pl.INT8
-DENSE_TORCH_DTYPE = torch.bfloat16 if DENSE_BF16 else torch.int8
-T = 16
-TRACE_PHASES = 4
-STATE_ROWS = T + 4
-N_KDA = N_LAYERS - N_LAYERS // 4
-N_DSA = max(1, N_LAYERS // 4)
-N_DENSE = min(3, N_LAYERS)
-N_MOE = max(1, N_LAYERS - 3)
-MOE_FIRST_LAYER = max(START_LAYER, 3)
-MOE_CALLS_PER_STEP = max(0, END_LAYER - MOE_FIRST_LAYER)
-RAW_ROWS = T * BLOCK_SIZE
-POOL_ROWS = 2048
-if not 0 <= START_LAYER < END_LAYER <= N_LAYERS <= 45 or not 1 <= STEPS <= 8:
-    raise ValueError("decode requires 0 <= start < end <= layers <= 45 and 1-8 validation steps")
-if TP_SIZE != EP_SIZE:
-    raise ValueError("decode forward currently requires TP_SIZE == EP_SIZE")
-if DENSE_BF16:
+_inline_prefill_seed = pl.jit.inline(auto_scope=False)(prefill_seed._func)
 
-    @pl.jit.inline
-    def dense_input_norm(
-        mixed: pl.Tensor[[T, D], pl.BF16],
-        norm_weight: pl.Tensor[[D], pl.BF16],
-        normalized: pl.Tensor[[T, D], pl.BF16],
-        dense_input: pl.Tensor[[T, D], pl.INT8],
-        input_scale: pl.Tensor[[T, 1], pl.FP32],
-        num_tokens: pl.Scalar[pl.INT32],
-    ):
-        """Return BF16 normalized inputs through the shared forward input ABI."""
-        rmsnorm(mixed, norm_weight, normalized)
-        return normalized, normalized, input_scale
+_inline_prefill_dense_layer = pl.jit.inline(auto_scope=False)(prefill_dense_layer._func)
 
-    @pl.jit.inline
-    def dense_forward(
-        dense_input: pl.Tensor[[T, D], DENSE_PL_DTYPE],
-        input_scale: pl.Tensor[[T, 1], pl.FP32],
-        dense_gate_up: pl.Tensor[[2 * LOCAL_DENSE_INTER, D], DENSE_PL_DTYPE],
-        dense_gate_up_scale: pl.Tensor[[2 * LOCAL_DENSE_INTER], pl.FP32],
-        dense_down: pl.Tensor[[D, LOCAL_DENSE_INTER], DENSE_PL_DTYPE],
-        dense_down_scale: pl.Tensor[[D], pl.FP32],
-        partial: pl.Tensor[[T, D], pl.FP32],
-    ):
-        bf16_mlp_local = pl.create_tensor([T, D], dtype=pl.BF16)
-        dense_mlp_bf16(dense_input, dense_gate_up, dense_down, bf16_mlp_local)
-        for row in pl.spmd(T, name_hint="dense_bf16_exchange_input"):
-            for col in pl.range(0, D, 512):
-                bf16_mlp_tile = bf16_mlp_local[row : row + 1, col : col + 512]
-                partial[row : row + 1, col : col + 512] = pl.cast(bf16_mlp_tile, pl.FP32)
-        return partial
+_inline_prefill_kda_attention = pl.jit.inline(auto_scope=False)(prefill_kda_attention._func)
 
-else:
-    dense_input_norm = rmsnorm_quant
-    dense_forward = dense_mlp
-_WEIGHT_LAYOUTS = [
-    ("hc_function", [N_LAYERS, 2, MIX_HC, HC_DIM], torch.bfloat16),
-    ("hc_scale", [N_LAYERS, 2, 3], torch.float32),
-    ("hc_base", [N_LAYERS, 2, MIX_HC], torch.float32),
-    ("norm_weight", [N_LAYERS, 2, D], torch.bfloat16),
-    ("w_q", [N_KDA, LOCAL_KDA_QKV_DIM, D], torch.bfloat16),
-    ("w_k", [N_KDA, LOCAL_KDA_QKV_DIM, D], torch.bfloat16),
-    ("w_v", [N_KDA, LOCAL_KDA_QKV_DIM, D], torch.bfloat16),
-    ("w_f_a", [N_KDA, KDA_DIM, D], torch.bfloat16),
-    ("w_f_b", [N_KDA, LOCAL_KDA_QKV_DIM, KDA_DIM], torch.bfloat16),
-    ("dt_bias", [N_KDA, LOCAL_KDA_QKV_DIM], torch.float32),
-    ("a_log", [N_KDA, LOCAL_KDA_H], torch.float32),
-    ("w_b", [N_KDA, LOCAL_KDA_H, D], torch.bfloat16),
-    ("w_g_a", [N_KDA, KDA_DIM, D], torch.bfloat16),
-    ("w_g_b", [N_KDA, LOCAL_KDA_QKV_DIM, KDA_DIM], torch.bfloat16),
-    ("conv_weight", [N_KDA, KDA_CONV_K, CONV_DIM], torch.bfloat16),
-    ("out_norm", [N_KDA, KDA_DIM], torch.bfloat16),
-    ("w_o", [N_KDA, D, LOCAL_KDA_QKV_DIM], torch.bfloat16),
-    ("dense_gate_up", [N_DENSE, 2 * LOCAL_DENSE_INTER, D], DENSE_TORCH_DTYPE),
-    ("dense_gate_up_scale", [N_DENSE, 2 * LOCAL_DENSE_INTER], torch.float32),
-    ("dense_down", [N_DENSE, D, LOCAL_DENSE_INTER], DENSE_TORCH_DTYPE),
-    ("dense_down_scale", [N_DENSE, D], torch.float32),
-    ("final_norm", [D], torch.bfloat16),
-    ("mla_w_q_a", [N_DSA, Q_LORA, D], torch.bfloat16),
-    ("mla_q_norm", [N_DSA, Q_LORA], torch.bfloat16),
-    ("mla_w_q_b", [N_DSA, LOCAL_H * QK_DIM, Q_LORA], torch.bfloat16),
-    ("mla_w_kv_a", [N_DSA, KV_LORA, D], torch.bfloat16),
-    ("mla_kv_norm", [N_DSA, KV_LORA], torch.bfloat16),
-    ("mla_w_k", [N_DSA, LOCAL_H, QK_DIM, KV_LORA], torch.bfloat16),
-    ("mla_w_o", [N_DSA, D, LOCAL_H * KV_LORA], torch.bfloat16),
-    ("index_w_q_b", [N_DSA, Q_LORA, INDEX_H * INDEX_DIM], torch.bfloat16),
-    ("index_w_k", [N_DSA, D, INDEX_DIM], torch.bfloat16),
-    ("index_norm", [N_DSA, INDEX_DIM], torch.bfloat16),
-    ("index_bias", [N_DSA, INDEX_DIM], torch.bfloat16),
-    ("index_weights", [N_DSA, D, INDEX_H], torch.bfloat16),
-    ("index_gate", [N_DSA, D, INDEX_DIM], torch.bfloat16),
-    ("compress_ape", [N_DSA, INDEX_KPOOL, INDEX_DIM], torch.bfloat16),
-    ("hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16),
-    ("gate_weight", [N_MOE, N_EXPERTS, D], torch.bfloat16),
-    ("correction_bias", [N_MOE, N_EXPERTS], torch.float32),
-    ("expert_gate_up", [N_MOE, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8),
-    ("expert_gate_up_scale", [N_MOE, N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32),
-    ("expert_down", [N_MOE, N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8),
-    ("expert_down_scale", [N_MOE, N_LOCAL_EXPERTS, D], torch.float32),
-    ("shared_gate_up", [N_MOE, 2 * MOE_INTER, D], torch.int8),
-    ("shared_gate_up_scale", [N_MOE, 2 * MOE_INTER], torch.float32),
-    ("shared_down", [N_MOE, D, MOE_INTER], torch.int8),
-    ("shared_down_scale", [N_MOE, D], torch.float32),
-]
-_METADATA_LAYOUTS = [
-    ("kv_slots", [STEPS, T], torch.int32),
-    ("pool_token_slots", [STEPS, T, INDEX_KPOOL], torch.int32),
-    ("pool_slots", [STEPS, T], torch.int32),
-    ("pool_blocks", [POOL_ROWS], torch.int32),
-    ("seg_start", [T], torch.int32),
-    ("pool_count", [STEPS, T], torch.int32),
-    ("tail_start", [STEPS, T], torch.int32),
-    ("tail_count", [STEPS, T], torch.int32),
-    ("kv_len", [STEPS, T], torch.int32),
-    ("block_table", [T, 1], torch.int32),
-    ("request_ids", [T], torch.int32),
-]
-_CACHE_LAYOUTS = [
-    ("latent_cache", [N_DSA, RAW_ROWS, KV_LORA], torch.bfloat16),
-    ("raw_cache", [N_DSA, RAW_ROWS, INDEX_STATE_WIDTH], torch.float32),
-    ("pool_cache", [N_DSA, POOL_ROWS, INDEX_DIM], torch.int8),
-    ("pool_scale", [N_DSA, POOL_ROWS, POOL_SCALE_WIDTH], torch.float32),
-]
+_inline_prefill_sparse_attention = pl.jit.inline(auto_scope=False)(prefill_sparse_attention._func)
+
+_inline_prefill_moe_layer = pl.jit.inline(auto_scope=False)(prefill_moe_layer._func)
+
+_inline_prefill_head_rows = pl.jit.inline(auto_scope=False)(prefill_head_rows._func)
+
+_inline_prefill_lm_head_logits = pl.jit.inline(auto_scope=False)(prefill_lm_head_logits._func)
+
+
+@pl.jit(auto_scope=False)
+def decode_hidden_fwd(
+    embedding_rows: pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[BATCH + 1], pl.INT32],
+    kda_state_rows: pl.Tensor[[BATCH, KDA_STATE_COLUMNS], pl.INT32],
+    active_tokens: pl.Tensor[[1], pl.INT32],
+    kda_tri_incl: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_tri_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_head_onehot: pl.Tensor[[LOCAL_KDA_H, BETA_PAD], pl.FP32],
+    kda_eye_wide: pl.Tensor[[CHUNK_TILE, KDA_DIM], pl.FP32],
+    kda_w_q: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_k: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_v: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_conv_q: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_k: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_v: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_w_f_a: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_f_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_g_a: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_g_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_H, D], pl.BF16],
+    kda_dt_bias: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM], pl.FP32],
+    kda_a_log: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_H], pl.FP32],
+    kda_o_norm: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM], pl.BF16],
+    kda_w_o: pl.Tensor[[KDA_NUM_LAYERS, D, LOCAL_KDA_QKV_DIM], pl.BF16],
+    mhc_attn_fn: pl.Tensor[[NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_attn_scale: pl.Tensor[[NUM_LAYERS, 3], pl.FP32],
+    mhc_attn_base: pl.Tensor[[NUM_LAYERS, MIX_HC], pl.FP32],
+    mhc_ffn_fn: pl.Tensor[[NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_ffn_scale: pl.Tensor[[NUM_LAYERS, 3], pl.FP32],
+    mhc_ffn_base: pl.Tensor[[NUM_LAYERS, MIX_HC], pl.FP32],
+    norm_input_norm: pl.Tensor[[NORM_STACK_LAYERS, D], pl.BF16],
+    norm_post_norm: pl.Tensor[[NORM_STACK_LAYERS, D], pl.BF16],
+    dense_w_gate_up: pl.Tensor[[DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER, D], pl.INT8],
+    dense_w_gate_up_scale: pl.Tensor[[DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER], pl.FP32],
+    dense_w_down: pl.Tensor[[DENSE_NUM_LAYERS, D, LOCAL_DENSE_INTER], pl.INT8],
+    dense_w_down_scale: pl.Tensor[[DENSE_NUM_LAYERS, D], pl.FP32],
+    kda_conv_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
+    kda_recurrent_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    ws_attn_pre: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT], pl.FP32]],
+    ws_attn_post: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT], pl.FP32]],
+    ws_attn_res: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT, HC_MULT], pl.FP32]],
+    ws_collapsed: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16]],
+    ws_normed: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16]],
+    ws_attn_partial: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.FP32]],
+    ws_sublayer_out: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16]],
+    ws_x_hc_mid: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT, D], pl.BF16]],
+    ws_ffn_pre: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT], pl.FP32]],
+    ws_ffn_post: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT], pl.FP32]],
+    ws_ffn_res: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT, HC_MULT], pl.FP32]],
+    ws_ffn_input: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16]],
+    ws_ffn_partial: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.FP32]],
+    ws_ffn_out: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16]],
+    kda_out: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    mixed_qkv: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, 3 * LOCAL_KDA_QKV_DIM], pl.BF16]],
+    decay: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_KDA_H, KDA_DIM], pl.FP32]],
+    beta: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, BETA_PAD], pl.FP32]],
+    kda_q: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_k: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_v: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    dense_x_int8: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.INT8]],
+    request_ids: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    mla_slots: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    index_slots: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    seg_start: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    pool_count_tok: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    tail_start: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    tail_count: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    kv_len_tok: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    pool_token_slots: pl.Tensor[[POOL_AXIS, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[POOL_AXIS], pl.INT32],
+    pool_blocks: pl.Tensor[[POOL_AXIS], pl.INT32],
+    block_table: pl.Tensor[[BATCH, TABLE_MAX], pl.INT32],
+    mla_w_q_a: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, D], pl.INT8],
+    mla_w_q_a_scale: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.FP32],
+    mla_q_a_norm: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.BF16],
+    mla_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    mla_w_q_b_scale: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM], pl.FP32],
+    mla_w_kv_a: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA, D], pl.INT8],
+    mla_w_kv_a_scale: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA], pl.FP32],
+    mla_kv_a_norm: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA], pl.BF16],
+    mla_w_k: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
+    mla_w_v: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H, V_DIM, KV_LORA], pl.BF16],
+    mla_w_o: pl.Tensor[[MLA_STACK_LAYERS, D, LOCAL_H * V_DIM], pl.INT8],
+    mla_w_o_scale: pl.Tensor[[MLA_STACK_LAYERS, D], pl.FP32],
+    idx_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
+    idx_w_k: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_k_norm_w: pl.Tensor[[MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_k_norm_b: pl.Tensor[[MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_w_weights: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_H], pl.BF16],
+    idx_w_compress_gate: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_compress_ape: pl.Tensor[[MLA_STACK_LAYERS, INDEX_KPOOL, INDEX_DIM], pl.BF16],
+    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
+    mla_latent_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
+    index_raw_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
+    index_pool_scale: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
+    dsa_query: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_H, QK_DIM], pl.BF16]],
+    attn_out: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_H, V_DIM], pl.BF16]],
+    index_q: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, INDEX_H, INDEX_DIM], pl.BF16]],
+    index_k: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, INDEX_DIM], pl.BF16]],
+    index_scores: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, POOL_AXIS], pl.FP32]],
+    selected_pools: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, KPOOL_SELECT_K], pl.INT32]],
+    router_gate_w: pl.Tensor[[ROUTER_STACK_LAYERS, N_EXPERTS, D], pl.BF16],
+    router_gate_bias: pl.Tensor[[ROUTER_STACK_LAYERS, N_EXPERTS], pl.FP32],
+    moe_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    moe_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    moe_w_down: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    moe_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D], pl.FP32],
+    moe_shared_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER, D], pl.INT8, pl.NZ],
+    moe_shared_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER], pl.FP32],
+    moe_shared_w_down: pl.Tensor[[MOE_STACK_LAYERS, D, MOE_INTER], pl.INT8, pl.NZ],
+    moe_shared_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, D], pl.FP32],
+    logit_row_indices: pl.Tensor[[LOGIT_ROWS], pl.INT32],
+    head_hidden: pl.Out[pl.Tensor[[LOGIT_ROWS, D], pl.BF16]],
+    ws_x_hc_pair: pl.InOut[pl.Tensor[[2 * CAPACITY, HC_MULT, D], pl.BF16]],
+    tp_partial: pld.DistributedTensor[[QUERY_ROWS_DYN, D], pl.FP32],
+    tp_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_x: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    count_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    x_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[RESIDENT_ROUTES_PER_SRC, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    forward_epoch: pl.Scalar[pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+):
+    """Run the complete decode backbone and gather request-final hidden rows."""
+    current = pl.slice(ws_x_hc_pair, [BATCH, HC_MULT, D], [0, 0, 0])
+    _inline_prefill_seed(
+        embedding_rows, current,
+    )
+    for layer in pl.range(NUM_LAYERS):
+        current_offset = (layer % 2) * CAPACITY
+        following_offset = ((layer + 1) % 2) * CAPACITY
+        current = pl.slice(ws_x_hc_pair, [BATCH, HC_MULT, D], [current_offset, 0, 0])
+        following = pl.slice(ws_x_hc_pair, [BATCH, HC_MULT, D], [following_offset, 0, 0])
+        bb_ord = pl.cast(layer, pl.INT32)
+        kda_ord = pl.cast(layer - layer // 4, pl.INT32)
+        dsa_ord = pl.cast(layer // 4, pl.INT32)
+        dense_ord = pl.cast(layer, pl.INT32)
+        moe_ord = pl.cast(layer - DENSE_NUM_LAYERS, pl.INT32)
+        attn_epoch = forward_epoch * (2 * NUM_LAYERS) + 2 * bb_ord + 1
+        ffn_epoch = attn_epoch + 1
+        moe_epoch = forward_epoch * (NUM_LAYERS - DENSE_NUM_LAYERS) + moe_ord + 1
+        skip_topk = pl.cast(0, pl.INT32)
+        if layer < DENSE_NUM_LAYERS:
+            _inline_prefill_dense_layer(
+                current, query_start_loc, kda_state_rows, active_tokens, kda_tri_incl,
+                kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
+                kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
+                kda_w_f_b, kda_w_g_a, kda_w_g_b, kda_w_b, kda_dt_bias,
+                kda_a_log, kda_o_norm, kda_w_o, mhc_attn_fn, mhc_attn_scale,
+                mhc_attn_base, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base, norm_input_norm,
+                norm_post_norm, dense_w_gate_up, dense_w_gate_up_scale, dense_w_down, dense_w_down_scale,
+                kda_conv_state, kda_recurrent_state, tp_partial, tp_arrived, ws_attn_pre,
+                ws_attn_post, ws_attn_res, ws_collapsed, ws_normed, ws_attn_partial,
+                ws_sublayer_out, ws_x_hc_mid, ws_ffn_pre, ws_ffn_post, ws_ffn_res,
+                ws_ffn_input, ws_ffn_partial, ws_ffn_out, following, kda_out,
+                mixed_qkv, decay, beta, kda_q, kda_k,
+                kda_v, dense_x_int8, bb_ord, kda_ord, dense_ord,
+                rank, attn_epoch, ffn_epoch, BATCH,
+            )
+        else:
+            if layer % 4 == 3:
+                _inline_prefill_sparse_attention(
+                    current, request_ids, mla_slots, index_slots, seg_start,
+                    pool_count_tok, tail_start, tail_count, kv_len_tok, pool_token_slots,
+                    pool_slots, pool_blocks, block_table, active_tokens, mla_w_q_a,
+                    mla_w_q_a_scale, mla_q_a_norm, mla_w_q_b, mla_w_q_b_scale, mla_w_kv_a,
+                    mla_w_kv_a_scale, mla_kv_a_norm, mla_w_k, mla_w_v, mla_w_o,
+                    mla_w_o_scale, idx_w_q_b, idx_w_k, idx_k_norm_w, idx_k_norm_b,
+                    idx_w_weights, idx_w_compress_gate, idx_compress_ape, mhc_attn_fn, mhc_attn_scale,
+                    mhc_attn_base, norm_input_norm, hadamard, mla_latent_cache, index_raw_cache,
+                    index_pool_cache, index_pool_scale, tp_partial, tp_arrived, ws_attn_pre,
+                    ws_attn_post, ws_attn_res, ws_collapsed, ws_normed, ws_attn_partial,
+                    ws_sublayer_out, ws_x_hc_mid, dsa_query, attn_out, index_q,
+                    index_k, index_scores, selected_pools, selected_valid, bb_ord,
+                    dsa_ord, rank, attn_epoch, skip_topk, BATCH,
+                )
+            else:
+                _inline_prefill_kda_attention(
+                    current, query_start_loc, kda_state_rows, active_tokens, kda_tri_incl,
+                    kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
+                    kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
+                    kda_w_f_b, kda_w_g_a, kda_w_g_b, kda_w_b, kda_dt_bias,
+                    kda_a_log, kda_o_norm, kda_w_o, mhc_attn_fn, mhc_attn_scale,
+                    mhc_attn_base, norm_input_norm, kda_conv_state, kda_recurrent_state, tp_partial,
+                    tp_arrived, ws_attn_pre, ws_attn_post, ws_attn_res, ws_collapsed,
+                    ws_normed, ws_attn_partial, ws_sublayer_out, ws_x_hc_mid, kda_out,
+                    mixed_qkv, decay, beta, kda_q, kda_k,
+                    kda_v, bb_ord, kda_ord, rank, attn_epoch,
+                    BATCH,
+                )
+            _complete_forward_stage(ws_x_hc_mid)
+            _inline_prefill_moe_layer(
+                ws_x_hc_mid, active_tokens, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base,
+                norm_post_norm, router_gate_w, router_gate_bias, moe_w_gate_up, moe_w_gate_up_scale,
+                moe_w_down, moe_w_down_scale, moe_shared_w_gate_up, moe_shared_w_gate_up_scale, moe_shared_w_down,
+                moe_shared_w_down_scale, lane_x, lane_aux, lane_count, count_ready,
+                x_ready, slot_out, return_ready, tp_partial, tp_arrived,
+                ws_ffn_pre, ws_ffn_post, ws_ffn_res, ws_ffn_input, ws_ffn_partial,
+                ws_ffn_out, following, bb_ord, moe_ord, rank,
+                moe_epoch, ffn_epoch,
+            )
+        _complete_forward_stage(following)
+    current = pl.slice(ws_x_hc_pair, [BATCH, HC_MULT, D], [(NUM_LAYERS % 2) * CAPACITY, 0, 0])
+    _inline_prefill_head_rows(
+        current, logit_row_indices, head_hidden,
+    )
+    return head_hidden
+
+
+
+_inline_decode_hidden_fwd = pl.jit.inline(auto_scope=False)(decode_hidden_fwd._func)
 
 
 @pl.jit(auto_scope=False)
 def decode_fwd(
-    inputs_embeds: pl.Tensor[[STEPS, T, D], pl.BF16],
-    state_rows: pl.Tensor[[STEPS, T], pl.INT32],
-    hc_function: pl.Tensor[[N_LAYERS, 2, MIX_HC, HC_DIM], pl.BF16],
-    hc_scale: pl.Tensor[[N_LAYERS, 2, 3], pl.FP32],
-    hc_base: pl.Tensor[[N_LAYERS, 2, MIX_HC], pl.FP32],
-    norm_weight: pl.Tensor[[N_LAYERS, 2, D], pl.BF16],
-    w_q: pl.Tensor[[N_KDA, LOCAL_KDA_QKV_DIM, D], pl.BF16],
-    w_k: pl.Tensor[[N_KDA, LOCAL_KDA_QKV_DIM, D], pl.BF16],
-    w_v: pl.Tensor[[N_KDA, LOCAL_KDA_QKV_DIM, D], pl.BF16],
-    w_f_a: pl.Tensor[[N_KDA, KDA_DIM, D], pl.BF16],
-    w_f_b: pl.Tensor[[N_KDA, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
-    dt_bias: pl.Tensor[[N_KDA, LOCAL_KDA_QKV_DIM], pl.FP32],
-    a_log: pl.Tensor[[N_KDA, LOCAL_KDA_H], pl.FP32],
-    w_b: pl.Tensor[[N_KDA, LOCAL_KDA_H, D], pl.BF16],
-    w_g_a: pl.Tensor[[N_KDA, KDA_DIM, D], pl.BF16],
-    w_g_b: pl.Tensor[[N_KDA, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
-    conv_weight: pl.Tensor[[N_KDA, KDA_CONV_K, CONV_DIM], pl.BF16],
-    out_norm: pl.Tensor[[N_KDA, KDA_DIM], pl.BF16],
-    w_o: pl.Tensor[[N_KDA, D, LOCAL_KDA_QKV_DIM], pl.BF16],
-    dense_gate_up: pl.Tensor[[N_DENSE, 2 * LOCAL_DENSE_INTER, D], DENSE_PL_DTYPE],
-    dense_gate_up_scale: pl.Tensor[[N_DENSE, 2 * LOCAL_DENSE_INTER], pl.FP32],
-    dense_down: pl.Tensor[[N_DENSE, D, LOCAL_DENSE_INTER], DENSE_PL_DTYPE],
-    dense_down_scale: pl.Tensor[[N_DENSE, D], pl.FP32],
-    final_norm: pl.Tensor[[D], pl.BF16],
-    mla_w_q_a: pl.Tensor[[N_DSA, Q_LORA, D], pl.BF16],
-    mla_q_norm: pl.Tensor[[N_DSA, Q_LORA], pl.BF16],
-    mla_w_q_b: pl.Tensor[[N_DSA, LOCAL_H * QK_DIM, Q_LORA], pl.BF16],
-    mla_w_kv_a: pl.Tensor[[N_DSA, KV_LORA, D], pl.BF16],
-    mla_kv_norm: pl.Tensor[[N_DSA, KV_LORA], pl.BF16],
-    mla_w_k: pl.Tensor[[N_DSA, LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
-    mla_w_o: pl.Tensor[[N_DSA, D, LOCAL_H * KV_LORA], pl.BF16],
-    index_w_q_b: pl.Tensor[[N_DSA, Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
-    index_w_k: pl.Tensor[[N_DSA, D, INDEX_DIM], pl.BF16],
-    index_norm: pl.Tensor[[N_DSA, INDEX_DIM], pl.BF16],
-    index_bias: pl.Tensor[[N_DSA, INDEX_DIM], pl.BF16],
-    index_weights: pl.Tensor[[N_DSA, D, INDEX_H], pl.BF16],
-    index_gate: pl.Tensor[[N_DSA, D, INDEX_DIM], pl.BF16],
-    compress_ape: pl.Tensor[[N_DSA, INDEX_KPOOL, INDEX_DIM], pl.BF16],
+    embedding_rows: pl.Tensor[[BATCH, D], pl.BF16],
+    query_start_loc: pl.Tensor[[BATCH + 1], pl.INT32],
+    kda_state_rows: pl.Tensor[[BATCH, KDA_STATE_COLUMNS], pl.INT32],
+    active_tokens: pl.Tensor[[1], pl.INT32],
+    kda_tri_incl: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_tri_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_head_onehot: pl.Tensor[[LOCAL_KDA_H, BETA_PAD], pl.FP32],
+    kda_eye_wide: pl.Tensor[[CHUNK_TILE, KDA_DIM], pl.FP32],
+    kda_w_q: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_k: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_v: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_conv_q: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_k: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_v: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_w_f_a: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_f_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_g_a: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_g_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_H, D], pl.BF16],
+    kda_dt_bias: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM], pl.FP32],
+    kda_a_log: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_H], pl.FP32],
+    kda_o_norm: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM], pl.BF16],
+    kda_w_o: pl.Tensor[[KDA_NUM_LAYERS, D, LOCAL_KDA_QKV_DIM], pl.BF16],
+    mhc_attn_fn: pl.Tensor[[NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_attn_scale: pl.Tensor[[NUM_LAYERS, 3], pl.FP32],
+    mhc_attn_base: pl.Tensor[[NUM_LAYERS, MIX_HC], pl.FP32],
+    mhc_ffn_fn: pl.Tensor[[NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_ffn_scale: pl.Tensor[[NUM_LAYERS, 3], pl.FP32],
+    mhc_ffn_base: pl.Tensor[[NUM_LAYERS, MIX_HC], pl.FP32],
+    norm_input_norm: pl.Tensor[[NORM_STACK_LAYERS, D], pl.BF16],
+    norm_post_norm: pl.Tensor[[NORM_STACK_LAYERS, D], pl.BF16],
+    dense_w_gate_up: pl.Tensor[[DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER, D], pl.INT8],
+    dense_w_gate_up_scale: pl.Tensor[[DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER], pl.FP32],
+    dense_w_down: pl.Tensor[[DENSE_NUM_LAYERS, D, LOCAL_DENSE_INTER], pl.INT8],
+    dense_w_down_scale: pl.Tensor[[DENSE_NUM_LAYERS, D], pl.FP32],
+    kda_conv_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
+    kda_recurrent_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    ws_attn_pre: pl.InOut[pl.Tensor[[BATCH, HC_MULT], pl.FP32]],
+    ws_attn_post: pl.InOut[pl.Tensor[[BATCH, HC_MULT], pl.FP32]],
+    ws_attn_res: pl.InOut[pl.Tensor[[BATCH, HC_MULT, HC_MULT], pl.FP32]],
+    ws_collapsed: pl.InOut[pl.Tensor[[BATCH, D], pl.BF16]],
+    ws_normed: pl.InOut[pl.Tensor[[BATCH, D], pl.BF16]],
+    ws_attn_partial: pl.InOut[pl.Tensor[[BATCH, D], pl.FP32]],
+    ws_sublayer_out: pl.InOut[pl.Tensor[[BATCH, D], pl.BF16]],
+    ws_x_hc_mid: pl.InOut[pl.Tensor[[BATCH, HC_MULT, D], pl.BF16]],
+    ws_ffn_pre: pl.InOut[pl.Tensor[[BATCH, HC_MULT], pl.FP32]],
+    ws_ffn_post: pl.InOut[pl.Tensor[[BATCH, HC_MULT], pl.FP32]],
+    ws_ffn_res: pl.InOut[pl.Tensor[[BATCH, HC_MULT, HC_MULT], pl.FP32]],
+    ws_ffn_input: pl.InOut[pl.Tensor[[BATCH, D], pl.BF16]],
+    ws_ffn_partial: pl.InOut[pl.Tensor[[BATCH, D], pl.FP32]],
+    ws_ffn_out: pl.InOut[pl.Tensor[[BATCH, D], pl.BF16]],
+    kda_out: pl.InOut[pl.Tensor[[BATCH, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    mixed_qkv: pl.InOut[pl.Tensor[[BATCH, 3 * LOCAL_KDA_QKV_DIM], pl.BF16]],
+    decay: pl.InOut[pl.Tensor[[BATCH, LOCAL_KDA_H, KDA_DIM], pl.FP32]],
+    beta: pl.InOut[pl.Tensor[[BATCH, BETA_PAD], pl.FP32]],
+    kda_q: pl.InOut[pl.Tensor[[BATCH, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_k: pl.InOut[pl.Tensor[[BATCH, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_v: pl.InOut[pl.Tensor[[BATCH, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    dense_x_int8: pl.InOut[pl.Tensor[[BATCH, D], pl.INT8]],
+    request_ids: pl.Tensor[[BATCH], pl.INT32],
+    mla_slots: pl.Tensor[[BATCH], pl.INT32],
+    index_slots: pl.Tensor[[BATCH], pl.INT32],
+    seg_start: pl.Tensor[[BATCH], pl.INT32],
+    pool_count_tok: pl.Tensor[[BATCH], pl.INT32],
+    tail_start: pl.Tensor[[BATCH], pl.INT32],
+    tail_count: pl.Tensor[[BATCH], pl.INT32],
+    kv_len_tok: pl.Tensor[[BATCH], pl.INT32],
+    pool_token_slots: pl.Tensor[[POOL_AXIS, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[POOL_AXIS], pl.INT32],
+    pool_blocks: pl.Tensor[[POOL_AXIS], pl.INT32],
+    block_table: pl.Tensor[[BATCH, TABLE_MAX], pl.INT32],
+    mla_w_q_a: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, D], pl.INT8],
+    mla_w_q_a_scale: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.FP32],
+    mla_q_a_norm: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.BF16],
+    mla_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    mla_w_q_b_scale: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM], pl.FP32],
+    mla_w_kv_a: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA, D], pl.INT8],
+    mla_w_kv_a_scale: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA], pl.FP32],
+    mla_kv_a_norm: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA], pl.BF16],
+    mla_w_k: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
+    mla_w_v: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H, V_DIM, KV_LORA], pl.BF16],
+    mla_w_o: pl.Tensor[[MLA_STACK_LAYERS, D, LOCAL_H * V_DIM], pl.INT8],
+    mla_w_o_scale: pl.Tensor[[MLA_STACK_LAYERS, D], pl.FP32],
+    idx_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
+    idx_w_k: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_k_norm_w: pl.Tensor[[MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_k_norm_b: pl.Tensor[[MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_w_weights: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_H], pl.BF16],
+    idx_w_compress_gate: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_compress_ape: pl.Tensor[[MLA_STACK_LAYERS, INDEX_KPOOL, INDEX_DIM], pl.BF16],
     hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    gate_weight: pl.Tensor[[N_MOE, N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_MOE, N_EXPERTS], pl.FP32],
-    expert_gate_up: pl.Tensor[[N_MOE, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
-    expert_gate_up_scale: pl.Tensor[[N_MOE, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
-    expert_down: pl.Tensor[[N_MOE, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    expert_down_scale: pl.Tensor[[N_MOE, N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_gate_up: pl.Tensor[[N_MOE, 2 * MOE_INTER, D], pl.INT8, pl.NZ],
-    shared_gate_up_scale: pl.Tensor[[N_MOE, 2 * MOE_INTER], pl.FP32],
-    shared_down: pl.Tensor[[N_MOE, D, MOE_INTER], pl.INT8, pl.NZ],
-    shared_down_scale: pl.Tensor[[N_MOE, D], pl.FP32],
-    kv_slots: pl.Tensor[[STEPS, T], pl.INT32],
-    pool_token_slots: pl.Tensor[[STEPS, T, INDEX_KPOOL], pl.INT32],
-    pool_slots: pl.Tensor[[STEPS, T], pl.INT32],
-    pool_blocks: pl.Tensor[[POOL_ROWS], pl.INT32],
-    seg_start: pl.Tensor[[T], pl.INT32],
-    pool_count: pl.Tensor[[STEPS, T], pl.INT32],
-    tail_start: pl.Tensor[[STEPS, T], pl.INT32],
-    tail_count: pl.Tensor[[STEPS, T], pl.INT32],
-    kv_len: pl.Tensor[[STEPS, T], pl.INT32],
-    block_table: pl.Tensor[[T, 1], pl.INT32],
-    request_ids: pl.Tensor[[T], pl.INT32],
-    latent_cache: pl.InOut[pl.Tensor[[N_DSA, RAW_ROWS, KV_LORA], pl.BF16]],
-    raw_cache: pl.InOut[pl.Tensor[[N_DSA, RAW_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
-    pool_cache: pl.InOut[pl.Tensor[[N_DSA, POOL_ROWS, INDEX_DIM], pl.INT8]],
-    pool_scale: pl.InOut[pl.Tensor[[N_DSA, POOL_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
-    conv_state: pl.InOut[pl.Tensor[[N_KDA, STATE_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
-    recurrent_state: pl.InOut[pl.Tensor[[N_KDA, STATE_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
-    layer_outputs: pl.InOut[pl.Tensor[[STEPS, N_LAYERS, TRACE_PHASES, T, D], pl.BF16]],
-    streams: pl.Out[pl.Tensor[[STEPS, T, HC_MULT, D], pl.BF16]],
-    hidden: pl.Out[pl.Tensor[[STEPS, T, D], pl.BF16]],
-    lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
-    lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
-    lane_count: pld.DistributedTensor[[EP_SIZE, COUNT_PAD], pl.INT32],
-    lane_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-    slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
-    return_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
-    exchange: pld.DistributedTensor[[T, D], pl.FP32],
-    arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    mla_latent_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
+    index_raw_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
+    index_pool_scale: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
+    dsa_query: pl.InOut[pl.Tensor[[BATCH, LOCAL_H, QK_DIM], pl.BF16]],
+    attn_out: pl.InOut[pl.Tensor[[BATCH, LOCAL_H, V_DIM], pl.BF16]],
+    index_q: pl.InOut[pl.Tensor[[BATCH, INDEX_H, INDEX_DIM], pl.BF16]],
+    index_k: pl.InOut[pl.Tensor[[BATCH, INDEX_DIM], pl.BF16]],
+    index_scores: pl.InOut[pl.Tensor[[BATCH, POOL_AXIS], pl.FP32]],
+    selected_pools: pl.InOut[pl.Tensor[[BATCH, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.InOut[pl.Tensor[[BATCH, KPOOL_SELECT_K], pl.INT32]],
+    router_gate_w: pl.Tensor[[ROUTER_STACK_LAYERS, N_EXPERTS, D], pl.BF16],
+    router_gate_bias: pl.Tensor[[ROUTER_STACK_LAYERS, N_EXPERTS], pl.FP32],
+    moe_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    moe_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    moe_w_down: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    moe_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D], pl.FP32],
+    moe_shared_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER, D], pl.INT8, pl.NZ],
+    moe_shared_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER], pl.FP32],
+    moe_shared_w_down: pl.Tensor[[MOE_STACK_LAYERS, D, MOE_INTER], pl.INT8, pl.NZ],
+    moe_shared_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, D], pl.FP32],
+    logit_row_indices: pl.Tensor[[LOGIT_ROWS], pl.INT32],
+    head_hidden: pl.Out[pl.Tensor[[LOGIT_ROWS, D], pl.BF16]],
+    ws_x_hc_pair: pl.InOut[pl.Tensor[[2 * CAPACITY, HC_MULT, D], pl.BF16]],
+    final_norm: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Out[pl.Tensor[[BATCH, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+    tp_partial: pld.DistributedTensor[[QUERY_ROWS_DYN, D], pl.FP32],
+    tp_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_x: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    count_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    x_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[RESIDENT_ROUTES_PER_SRC, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    forward_epoch: pl.Scalar[pl.INT32],
     rank: pl.Scalar[pl.INT32],
-    step: pl.Scalar[pl.INT32],
 ):
-    inputs_embeds_step = inputs_embeds[step]
-    state_rows_step = state_rows[step]
-    streams_step = streams[step]
-    hidden_step = hidden[step]
-    x_hc = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    x_flat = pl.reshape(x_hc, [T, HC_DIM])
-    for t in pl.spmd(T, name_hint="decode_seed"):
-        for h in pl.unroll(HC_MULT):
-            x_flat[t : t + 1, h * D : (h + 1) * D] = inputs_embeds_step[t : t + 1, :]
-    for layer in pl.range(START_LAYER, END_LAYER):
-        with pl.scope():
-            pre_mix = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
-            post_mix = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
-            residual_mix = pl.create_tensor([T, HC_MULT, HC_MULT], dtype=pl.FP32)
-            mixed = pl.create_tensor([T, D], dtype=pl.BF16)
-            normed = pl.create_tensor([T, D], dtype=pl.BF16)
-            mhc_mixes(
-                x_hc, hc_function[layer, 0], hc_scale[layer, 0], hc_base[layer, 0], pre_mix,
-                post_mix,
-                residual_mix,
-            )
-            mhc_pre(x_hc, pre_mix, mixed)
-            rmsnorm(mixed, norm_weight[layer, 0], normed)
-            norm_trace = layer_outputs[step, layer, 3]
-            for row in pl.spmd(T, name_hint="attention_input_trace"):
-                norm_trace[row : row + 1, :] = normed[row : row + 1, :]
-            partial = pl.create_tensor([T, D], dtype=pl.FP32)
-            if END_LAYER <= 3 or layer % 4 != 3:
-                linear_layer = layer - layer // 4
-                qkv = pl.create_tensor([T, CONV_DIM], dtype=pl.BF16)
-                decay = pl.create_tensor([T, LOCAL_KDA_H, KDA_DIM], dtype=pl.FP32)
-                beta = pl.create_tensor([T, BETA_PAD], dtype=pl.FP32)
-                out_gate = pl.create_tensor([T, LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
-                kda_projection(
-                    normed,
-                    w_q[linear_layer], w_k[linear_layer], w_v[linear_layer], w_f_a[linear_layer],
-                    w_f_b[linear_layer], dt_bias[linear_layer], a_log[linear_layer], w_b[linear_layer],
-                    w_g_a[linear_layer], w_g_b[linear_layer], qkv, decay, beta, out_gate,
-                )
-                query = pl.create_tensor([T, LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
-                key = pl.create_tensor([T, LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
-                value = pl.create_tensor([T, LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
-                kda_conv_decode(
-                    qkv, conv_weight[linear_layer], conv_state[linear_layer], state_rows_step, query, key,
-                    value,
-                )
-                core_out = pl.create_tensor([T, LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
-                decode_kda(query, key, value, decay, beta, recurrent_state[linear_layer], state_rows_step, core_out)
-                kda_output(core_out, out_norm[linear_layer], out_gate, w_o[linear_layer], partial)
-            else:
-                sparse_layer = layer // 4
-                q_resid = pl.create_tensor([T, Q_LORA], dtype=pl.BF16)
-                mla_query = pl.create_tensor([T, LOCAL_H, QK_DIM], dtype=pl.BF16)
-                latent = pl.create_tensor([T, KV_LORA], dtype=pl.BF16)
-                mla_prolog(
-                    normed,
-                    mla_w_q_a[sparse_layer], mla_q_norm[sparse_layer], mla_w_q_b[sparse_layer],
-                    mla_w_kv_a[sparse_layer], mla_kv_norm[sparse_layer], q_resid, mla_query, latent,
-                )
-                mla_cache_write(latent, kv_slots[step], latent_cache[sparse_layer])
-                index_q = pl.create_tensor([T, INDEX_H, INDEX_DIM], dtype=pl.BF16)
-                index_k = pl.create_tensor([T, INDEX_DIM], dtype=pl.BF16)
-                head_weights = pl.create_tensor([T, INDEX_H], dtype=pl.FP32)
-                gate_scores = pl.create_tensor([T, INDEX_DIM], dtype=pl.FP32)
-                indexer_proj(
-                    normed, q_resid, index_w_q_b[sparse_layer], index_w_k[sparse_layer],
-                    index_norm[sparse_layer], index_bias[sparse_layer], index_weights[sparse_layer],
-                    index_gate[sparse_layer], index_q, index_k, head_weights, gate_scores,
-                    pl.cast(0, pl.INT32),
-                )
-                indexer_cache_write(index_k, gate_scores, kv_slots[step], raw_cache[sparse_layer])
-                pool_valid = pl.create_tensor([T, POOL_VALID_WIDTH], dtype=pl.INT32)
-                indexer_pool_write(
-                    raw_cache[sparse_layer], compress_ape[sparse_layer], hadamard, pool_token_slots[step],
-                    pool_slots[step], pool_cache[sparse_layer], pool_scale[sparse_layer], pool_valid,
-                )
-                scores = pl.create_tensor([T, POOL_ROWS], dtype=pl.FP32)
-                indexer_score(
-                    index_q, hadamard, pool_cache[sparse_layer], pool_scale[sparse_layer], pool_blocks,
-                    head_weights, seg_start, pool_count[step], scores,
-                )
-                selected = pl.create_tensor([T, KPOOL_SELECT_K], dtype=pl.INT32)
-                valid = pl.create_tensor([T, KPOOL_SELECT_K], dtype=pl.INT32)
-                indices = pl.create_tensor([T, TOPK_INDEX_WIDTH], dtype=pl.INT32)
-                indexer_topk(scores, seg_start, pool_count[step], selected, valid)
-                indexer_expand(selected, valid, tail_start[step], tail_count[step], kv_len[step], indices)
-                absorbed = pl.create_tensor([T, LOCAL_H, KV_LORA], dtype=pl.BF16)
-                absorb_query(mla_query, mla_w_k[sparse_layer], absorbed)
-                context = pl.create_tensor([T, LOCAL_H, KV_LORA], dtype=pl.BF16)
-                decode_sparse_attn(absorbed, latent_cache[sparse_layer], block_table, request_ids, indices, context)
-                mla_epilog_decode(context, mla_w_o[sparse_layer], partial)
-            reduced = pl.create_tensor([T, D], dtype=pl.BF16)
-            epoch = pl.cast(step * (2 * (END_LAYER - START_LAYER)) + 2 * (layer - START_LAYER) + 1, pl.INT32)
-            tp_all_reduce(partial, exchange, arrived, reduced, T, rank, 0, epoch)
-            attention_trace = layer_outputs[step, layer, 0]
-            for row in pl.spmd(T, name_hint="attention_trace"):
-                attention_trace[row : row + 1, :] = reduced[row : row + 1, :]
-            after_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-            mhc_post(reduced, x_hc, post_mix, residual_mix, after_attn)
-
-            mhc_mixes(
-                after_attn, hc_function[layer, 1], hc_scale[layer, 1], hc_base[layer, 1], pre_mix,
-                post_mix,
-                residual_mix,
-            )
-            mixed, mlp_input_tid = mhc_pre(after_attn, pre_mix, mixed)
-            input_trace = layer_outputs[step, layer, 2]
-            for row in pl.spmd(T, name_hint="mlp_input_trace"):
-                input_trace[row : row + 1, :] = mixed[row : row + 1, :]
-            if END_LAYER <= 3 or layer < 3:
-                x_int8 = pl.create_tensor([T, D], dtype=pl.INT8)
-                input_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-                mlp_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-                (mlp_normed, dense_input, input_scale) = dense_input_norm(
-                    mixed, norm_weight[layer, 1], mlp_normed, x_int8, input_scale, T,
-                )
-                dense_forward(
-                    dense_input, input_scale, dense_gate_up[layer], dense_gate_up_scale[layer],
-                    dense_down[layer], dense_down_scale[layer], partial,
-                )
-            else:
-                expert_layer = layer - 3
-                owned = pl.cast(0, pl.INT32)
-                if rank == 0:
-                    owned = pl.cast(T, pl.INT32)
-                moe_epoch = pl.cast(step * MOE_CALLS_PER_STEP + layer - MOE_FIRST_LAYER + 1, pl.INT32)
-                decode_mlp(
-                    mixed, norm_weight[layer, 1], gate_weight[expert_layer], correction_bias[expert_layer],
-                    expert_gate_up[expert_layer], expert_gate_up_scale[expert_layer],
-                    expert_down[expert_layer], expert_down_scale[expert_layer], shared_gate_up[expert_layer],
-                    shared_gate_up_scale[expert_layer], shared_down[expert_layer],
-                    shared_down_scale[expert_layer], partial, lane_x, lane_aux, lane_count, lane_ready,
-                    slot_out, return_ready, owned, EP_SIZE, rank, moe_epoch, mlp_input_tid,
-                )
-            mlp_reduced = pl.create_tensor([T, D], dtype=pl.BF16)
-            tp_all_reduce(partial, exchange, arrived, mlp_reduced, T, rank, 0, epoch + 1)
-            mlp_trace = layer_outputs[step, layer, 1]
-            for row in pl.spmd(T, name_hint="mlp_trace"):
-                mlp_trace[row : row + 1, :] = mlp_reduced[row : row + 1, :]
-            mhc_post(mlp_reduced, after_attn, post_mix, residual_mix, x_hc)
-    out_flat = pl.reshape(streams_step, [T, HC_DIM])
-    for row in pl.spmd(T, name_hint="decode_stream_output"):
-        for col in pl.range(0, HC_DIM, D):
-            out_flat[row : row + 1, col : col + D] = x_flat[row : row + 1, col : col + D]
-    collapsed = pl.create_tensor([T, D], dtype=pl.BF16)
-    mhc_head(x_hc, collapsed)
-    rmsnorm(collapsed, final_norm, hidden_step)
-    return streams_step, hidden_step, conv_state, recurrent_state
+    """Run a complete decode step with device logits."""
+    _inline_decode_hidden_fwd(
+        embedding_rows, query_start_loc, kda_state_rows, active_tokens, kda_tri_incl,
+        kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
+        kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
+        kda_w_f_b, kda_w_g_a, kda_w_g_b, kda_w_b, kda_dt_bias,
+        kda_a_log, kda_o_norm, kda_w_o, mhc_attn_fn, mhc_attn_scale,
+        mhc_attn_base, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base, norm_input_norm,
+        norm_post_norm, dense_w_gate_up, dense_w_gate_up_scale, dense_w_down, dense_w_down_scale,
+        kda_conv_state, kda_recurrent_state, ws_attn_pre, ws_attn_post, ws_attn_res,
+        ws_collapsed, ws_normed, ws_attn_partial, ws_sublayer_out, ws_x_hc_mid,
+        ws_ffn_pre, ws_ffn_post, ws_ffn_res, ws_ffn_input, ws_ffn_partial,
+        ws_ffn_out, kda_out, mixed_qkv, decay, beta,
+        kda_q, kda_k, kda_v, dense_x_int8, request_ids,
+        mla_slots, index_slots, seg_start, pool_count_tok, tail_start,
+        tail_count, kv_len_tok, pool_token_slots, pool_slots, pool_blocks,
+        block_table, mla_w_q_a, mla_w_q_a_scale, mla_q_a_norm, mla_w_q_b,
+        mla_w_q_b_scale, mla_w_kv_a, mla_w_kv_a_scale, mla_kv_a_norm, mla_w_k,
+        mla_w_v, mla_w_o, mla_w_o_scale, idx_w_q_b, idx_w_k,
+        idx_k_norm_w, idx_k_norm_b, idx_w_weights, idx_w_compress_gate, idx_compress_ape,
+        hadamard, mla_latent_cache, index_raw_cache, index_pool_cache, index_pool_scale,
+        dsa_query, attn_out, index_q, index_k, index_scores,
+        selected_pools, selected_valid, router_gate_w, router_gate_bias, moe_w_gate_up,
+        moe_w_gate_up_scale, moe_w_down, moe_w_down_scale, moe_shared_w_gate_up, moe_shared_w_gate_up_scale,
+        moe_shared_w_down, moe_shared_w_down_scale, logit_row_indices, head_hidden, ws_x_hc_pair,
+        tp_partial, tp_arrived, lane_x, lane_aux, lane_count,
+        count_ready, x_ready, slot_out, return_ready, forward_epoch,
+        rank,
+    )
+    _inline_prefill_lm_head_logits(
+        head_hidden, final_norm, lm_head_weight, logits,
+    )
+    return logits
 
 
 @pl.jit.host
 def l3_decode_fwd(
-    inputs_embeds: pl.Tensor[[EP_SIZE, STEPS, T, D], pl.BF16],
-    state_rows: pl.Tensor[[EP_SIZE, STEPS, T], pl.INT32],
-    hc_function: pl.Tensor[[EP_SIZE, N_LAYERS, 2, MIX_HC, HC_DIM], pl.BF16],
-    hc_scale: pl.Tensor[[EP_SIZE, N_LAYERS, 2, 3], pl.FP32],
-    hc_base: pl.Tensor[[EP_SIZE, N_LAYERS, 2, MIX_HC], pl.FP32],
-    norm_weight: pl.Tensor[[EP_SIZE, N_LAYERS, 2, D], pl.BF16],
-    w_q: pl.Tensor[[EP_SIZE, N_KDA, LOCAL_KDA_QKV_DIM, D], pl.BF16],
-    w_k: pl.Tensor[[EP_SIZE, N_KDA, LOCAL_KDA_QKV_DIM, D], pl.BF16],
-    w_v: pl.Tensor[[EP_SIZE, N_KDA, LOCAL_KDA_QKV_DIM, D], pl.BF16],
-    w_f_a: pl.Tensor[[EP_SIZE, N_KDA, KDA_DIM, D], pl.BF16],
-    w_f_b: pl.Tensor[[EP_SIZE, N_KDA, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
-    dt_bias: pl.Tensor[[EP_SIZE, N_KDA, LOCAL_KDA_QKV_DIM], pl.FP32],
-    a_log: pl.Tensor[[EP_SIZE, N_KDA, LOCAL_KDA_H], pl.FP32],
-    w_b: pl.Tensor[[EP_SIZE, N_KDA, LOCAL_KDA_H, D], pl.BF16],
-    w_g_a: pl.Tensor[[EP_SIZE, N_KDA, KDA_DIM, D], pl.BF16],
-    w_g_b: pl.Tensor[[EP_SIZE, N_KDA, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
-    conv_weight: pl.Tensor[[EP_SIZE, N_KDA, KDA_CONV_K, CONV_DIM], pl.BF16],
-    out_norm: pl.Tensor[[EP_SIZE, N_KDA, KDA_DIM], pl.BF16],
-    w_o: pl.Tensor[[EP_SIZE, N_KDA, D, LOCAL_KDA_QKV_DIM], pl.BF16],
-    dense_gate_up: pl.Tensor[[EP_SIZE, N_DENSE, 2 * LOCAL_DENSE_INTER, D], DENSE_PL_DTYPE],
-    dense_gate_up_scale: pl.Tensor[[EP_SIZE, N_DENSE, 2 * LOCAL_DENSE_INTER], pl.FP32],
-    dense_down: pl.Tensor[[EP_SIZE, N_DENSE, D, LOCAL_DENSE_INTER], DENSE_PL_DTYPE],
-    dense_down_scale: pl.Tensor[[EP_SIZE, N_DENSE, D], pl.FP32],
-    final_norm: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    mla_w_q_a: pl.Tensor[[EP_SIZE, N_DSA, Q_LORA, D], pl.BF16],
-    mla_q_norm: pl.Tensor[[EP_SIZE, N_DSA, Q_LORA], pl.BF16],
-    mla_w_q_b: pl.Tensor[[EP_SIZE, N_DSA, LOCAL_H * QK_DIM, Q_LORA], pl.BF16],
-    mla_w_kv_a: pl.Tensor[[EP_SIZE, N_DSA, KV_LORA, D], pl.BF16],
-    mla_kv_norm: pl.Tensor[[EP_SIZE, N_DSA, KV_LORA], pl.BF16],
-    mla_w_k: pl.Tensor[[EP_SIZE, N_DSA, LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
-    mla_w_o: pl.Tensor[[EP_SIZE, N_DSA, D, LOCAL_H * KV_LORA], pl.BF16],
-    index_w_q_b: pl.Tensor[[EP_SIZE, N_DSA, Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
-    index_w_k: pl.Tensor[[EP_SIZE, N_DSA, D, INDEX_DIM], pl.BF16],
-    index_norm: pl.Tensor[[EP_SIZE, N_DSA, INDEX_DIM], pl.BF16],
-    index_bias: pl.Tensor[[EP_SIZE, N_DSA, INDEX_DIM], pl.BF16],
-    index_weights: pl.Tensor[[EP_SIZE, N_DSA, D, INDEX_H], pl.BF16],
-    index_gate: pl.Tensor[[EP_SIZE, N_DSA, D, INDEX_DIM], pl.BF16],
-    compress_ape: pl.Tensor[[EP_SIZE, N_DSA, INDEX_KPOOL, INDEX_DIM], pl.BF16],
-    hadamard: pl.Tensor[[EP_SIZE, INDEX_DIM, INDEX_DIM], pl.BF16],
-    gate_weight: pl.Tensor[[EP_SIZE, N_MOE, N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[EP_SIZE, N_MOE, N_EXPERTS], pl.FP32],
-    expert_gate_up: pl.Tensor[[EP_SIZE, N_MOE, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
-    expert_gate_up_scale: pl.Tensor[[EP_SIZE, N_MOE, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
-    expert_down: pl.Tensor[[EP_SIZE, N_MOE, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    expert_down_scale: pl.Tensor[[EP_SIZE, N_MOE, N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_gate_up: pl.Tensor[[EP_SIZE, N_MOE, 2 * MOE_INTER, D], pl.INT8],
-    shared_gate_up_scale: pl.Tensor[[EP_SIZE, N_MOE, 2 * MOE_INTER], pl.FP32],
-    shared_down: pl.Tensor[[EP_SIZE, N_MOE, D, MOE_INTER], pl.INT8],
-    shared_down_scale: pl.Tensor[[EP_SIZE, N_MOE, D], pl.FP32],
-    kv_slots: pl.Tensor[[EP_SIZE, STEPS, T], pl.INT32],
-    pool_token_slots: pl.Tensor[[EP_SIZE, STEPS, T, INDEX_KPOOL], pl.INT32],
-    pool_slots: pl.Tensor[[EP_SIZE, STEPS, T], pl.INT32],
-    pool_blocks: pl.Tensor[[EP_SIZE, POOL_ROWS], pl.INT32],
-    seg_start: pl.Tensor[[EP_SIZE, T], pl.INT32],
-    pool_count: pl.Tensor[[EP_SIZE, STEPS, T], pl.INT32],
-    tail_start: pl.Tensor[[EP_SIZE, STEPS, T], pl.INT32],
-    tail_count: pl.Tensor[[EP_SIZE, STEPS, T], pl.INT32],
-    kv_len: pl.Tensor[[EP_SIZE, STEPS, T], pl.INT32],
-    block_table: pl.Tensor[[EP_SIZE, T, 1], pl.INT32],
-    request_ids: pl.Tensor[[EP_SIZE, T], pl.INT32],
-    latent_cache: pl.InOut[pl.Tensor[[EP_SIZE, N_DSA, RAW_ROWS, KV_LORA], pl.BF16]],
-    raw_cache: pl.InOut[pl.Tensor[[EP_SIZE, N_DSA, RAW_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
-    pool_cache: pl.InOut[pl.Tensor[[EP_SIZE, N_DSA, POOL_ROWS, INDEX_DIM], pl.INT8]],
-    pool_scale: pl.InOut[pl.Tensor[[EP_SIZE, N_DSA, POOL_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
-    conv_state: pl.InOut[pl.Tensor[[EP_SIZE, N_KDA, STATE_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
-    recurrent_state: pl.InOut[
-        pl.Tensor[[EP_SIZE, N_KDA, STATE_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]
-    ],
-    layer_outputs: pl.InOut[pl.Tensor[[EP_SIZE, STEPS, N_LAYERS, TRACE_PHASES, T, D], pl.BF16]],
-    streams: pl.Out[pl.Tensor[[EP_SIZE, STEPS, T, HC_MULT, D], pl.BF16]],
-    hidden: pl.Out[pl.Tensor[[EP_SIZE, STEPS, T, D], pl.BF16]],
+    embedding_rows: pl.Tensor[[RANKS, BATCH, D], pl.BF16],
+    query_start_loc: pl.Tensor[[RANKS, BATCH + 1], pl.INT32],
+    kda_state_rows: pl.Tensor[[RANKS, BATCH, KDA_STATE_COLUMNS], pl.INT32],
+    active_tokens: pl.Tensor[[RANKS, 1], pl.INT32],
+    kda_tri_incl: pl.Tensor[[RANKS, CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_tri_strict: pl.Tensor[[RANKS, CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_head_onehot: pl.Tensor[[RANKS, LOCAL_KDA_H, BETA_PAD], pl.FP32],
+    kda_eye_wide: pl.Tensor[[RANKS, CHUNK_TILE, KDA_DIM], pl.FP32],
+    kda_w_q: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_k: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_v: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_conv_q: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_k: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_v: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_w_f_a: pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_f_b: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_g_a: pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_g_b: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_b: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_H, D], pl.BF16],
+    kda_dt_bias: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM], pl.FP32],
+    kda_a_log: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_H], pl.FP32],
+    kda_o_norm: pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_DIM], pl.BF16],
+    kda_w_o: pl.Tensor[[RANKS, KDA_NUM_LAYERS, D, LOCAL_KDA_QKV_DIM], pl.BF16],
+    mhc_attn_fn: pl.Tensor[[RANKS, NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_attn_scale: pl.Tensor[[RANKS, NUM_LAYERS, 3], pl.FP32],
+    mhc_attn_base: pl.Tensor[[RANKS, NUM_LAYERS, MIX_HC], pl.FP32],
+    mhc_ffn_fn: pl.Tensor[[RANKS, NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_ffn_scale: pl.Tensor[[RANKS, NUM_LAYERS, 3], pl.FP32],
+    mhc_ffn_base: pl.Tensor[[RANKS, NUM_LAYERS, MIX_HC], pl.FP32],
+    norm_input_norm: pl.Tensor[[RANKS, NORM_STACK_LAYERS, D], pl.BF16],
+    norm_post_norm: pl.Tensor[[RANKS, NORM_STACK_LAYERS, D], pl.BF16],
+    dense_w_gate_up: pl.Tensor[[RANKS, DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER, D], pl.INT8],
+    dense_w_gate_up_scale: pl.Tensor[[RANKS, DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER], pl.FP32],
+    dense_w_down: pl.Tensor[[RANKS, DENSE_NUM_LAYERS, D, LOCAL_DENSE_INTER], pl.INT8],
+    dense_w_down_scale: pl.Tensor[[RANKS, DENSE_NUM_LAYERS, D], pl.FP32],
+    kda_conv_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
+    kda_recurrent_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    ws_attn_pre: pl.InOut[pl.Tensor[[RANKS, BATCH, HC_MULT], pl.FP32]],
+    ws_attn_post: pl.InOut[pl.Tensor[[RANKS, BATCH, HC_MULT], pl.FP32]],
+    ws_attn_res: pl.InOut[pl.Tensor[[RANKS, BATCH, HC_MULT, HC_MULT], pl.FP32]],
+    ws_collapsed: pl.InOut[pl.Tensor[[RANKS, BATCH, D], pl.BF16]],
+    ws_normed: pl.InOut[pl.Tensor[[RANKS, BATCH, D], pl.BF16]],
+    ws_attn_partial: pl.InOut[pl.Tensor[[RANKS, BATCH, D], pl.FP32]],
+    ws_sublayer_out: pl.InOut[pl.Tensor[[RANKS, BATCH, D], pl.BF16]],
+    ws_x_hc_mid: pl.InOut[pl.Tensor[[RANKS, BATCH, HC_MULT, D], pl.BF16]],
+    ws_ffn_pre: pl.InOut[pl.Tensor[[RANKS, BATCH, HC_MULT], pl.FP32]],
+    ws_ffn_post: pl.InOut[pl.Tensor[[RANKS, BATCH, HC_MULT], pl.FP32]],
+    ws_ffn_res: pl.InOut[pl.Tensor[[RANKS, BATCH, HC_MULT, HC_MULT], pl.FP32]],
+    ws_ffn_input: pl.InOut[pl.Tensor[[RANKS, BATCH, D], pl.BF16]],
+    ws_ffn_partial: pl.InOut[pl.Tensor[[RANKS, BATCH, D], pl.FP32]],
+    ws_ffn_out: pl.InOut[pl.Tensor[[RANKS, BATCH, D], pl.BF16]],
+    kda_out: pl.InOut[pl.Tensor[[RANKS, BATCH, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    mixed_qkv: pl.InOut[pl.Tensor[[RANKS, BATCH, 3 * LOCAL_KDA_QKV_DIM], pl.BF16]],
+    decay: pl.InOut[pl.Tensor[[RANKS, BATCH, LOCAL_KDA_H, KDA_DIM], pl.FP32]],
+    beta: pl.InOut[pl.Tensor[[RANKS, BATCH, BETA_PAD], pl.FP32]],
+    kda_q: pl.InOut[pl.Tensor[[RANKS, BATCH, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_k: pl.InOut[pl.Tensor[[RANKS, BATCH, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_v: pl.InOut[pl.Tensor[[RANKS, BATCH, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    dense_x_int8: pl.InOut[pl.Tensor[[RANKS, BATCH, D], pl.INT8]],
+    request_ids: pl.Tensor[[RANKS, BATCH], pl.INT32],
+    mla_slots: pl.Tensor[[RANKS, BATCH], pl.INT32],
+    index_slots: pl.Tensor[[RANKS, BATCH], pl.INT32],
+    seg_start: pl.Tensor[[RANKS, BATCH], pl.INT32],
+    pool_count_tok: pl.Tensor[[RANKS, BATCH], pl.INT32],
+    tail_start: pl.Tensor[[RANKS, BATCH], pl.INT32],
+    tail_count: pl.Tensor[[RANKS, BATCH], pl.INT32],
+    kv_len_tok: pl.Tensor[[RANKS, BATCH], pl.INT32],
+    pool_token_slots: pl.Tensor[[RANKS, POOL_AXIS, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[RANKS, POOL_AXIS], pl.INT32],
+    pool_blocks: pl.Tensor[[RANKS, POOL_AXIS], pl.INT32],
+    block_table: pl.Tensor[[RANKS, BATCH, TABLE_MAX], pl.INT32],
+    mla_w_q_a: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA, D], pl.INT8],
+    mla_w_q_a_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA], pl.FP32],
+    mla_q_a_norm: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA], pl.BF16],
+    mla_w_q_b: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    mla_w_q_b_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H * QK_DIM], pl.FP32],
+    mla_w_kv_a: pl.Tensor[[RANKS, MLA_STACK_LAYERS, KV_LORA, D], pl.INT8],
+    mla_w_kv_a_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, KV_LORA], pl.FP32],
+    mla_kv_a_norm: pl.Tensor[[RANKS, MLA_STACK_LAYERS, KV_LORA], pl.BF16],
+    mla_w_k: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
+    mla_w_v: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H, V_DIM, KV_LORA], pl.BF16],
+    mla_w_o: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, LOCAL_H * V_DIM], pl.INT8],
+    mla_w_o_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D], pl.FP32],
+    idx_w_q_b: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
+    idx_w_k: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_k_norm_w: pl.Tensor[[RANKS, MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_k_norm_b: pl.Tensor[[RANKS, MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_w_weights: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, INDEX_H], pl.BF16],
+    idx_w_compress_gate: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_compress_ape: pl.Tensor[[RANKS, MLA_STACK_LAYERS, INDEX_KPOOL, INDEX_DIM], pl.BF16],
+    hadamard: pl.Tensor[[RANKS, INDEX_DIM, INDEX_DIM], pl.BF16],
+    mla_latent_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
+    index_raw_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
+    index_pool_scale: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
+    dsa_query: pl.InOut[pl.Tensor[[RANKS, BATCH, LOCAL_H, QK_DIM], pl.BF16]],
+    attn_out: pl.InOut[pl.Tensor[[RANKS, BATCH, LOCAL_H, V_DIM], pl.BF16]],
+    index_q: pl.InOut[pl.Tensor[[RANKS, BATCH, INDEX_H, INDEX_DIM], pl.BF16]],
+    index_k: pl.InOut[pl.Tensor[[RANKS, BATCH, INDEX_DIM], pl.BF16]],
+    index_scores: pl.InOut[pl.Tensor[[RANKS, BATCH, POOL_AXIS], pl.FP32]],
+    selected_pools: pl.InOut[pl.Tensor[[RANKS, BATCH, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.InOut[pl.Tensor[[RANKS, BATCH, KPOOL_SELECT_K], pl.INT32]],
+    router_gate_w: pl.Tensor[[RANKS, ROUTER_STACK_LAYERS, N_EXPERTS, D], pl.BF16],
+    router_gate_bias: pl.Tensor[[RANKS, ROUTER_STACK_LAYERS, N_EXPERTS], pl.FP32],
+    moe_w_gate_up: pl.Tensor[[RANKS, MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    moe_w_gate_up_scale: pl.Tensor[[RANKS, MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    moe_w_down: pl.Tensor[[RANKS, MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    moe_w_down_scale: pl.Tensor[[RANKS, MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D], pl.FP32],
+    moe_shared_w_gate_up: pl.Tensor[[RANKS, MOE_STACK_LAYERS, 2 * MOE_INTER, D], pl.INT8],
+    moe_shared_w_gate_up_scale: pl.Tensor[[RANKS, MOE_STACK_LAYERS, 2 * MOE_INTER], pl.FP32],
+    moe_shared_w_down: pl.Tensor[[RANKS, MOE_STACK_LAYERS, D, MOE_INTER], pl.INT8],
+    moe_shared_w_down_scale: pl.Tensor[[RANKS, MOE_STACK_LAYERS, D], pl.FP32],
+    logit_row_indices: pl.Tensor[[RANKS, LOGIT_ROWS], pl.INT32],
+    head_hidden: pl.Out[pl.Tensor[[RANKS, LOGIT_ROWS, D], pl.BF16]],
+    ws_x_hc_pair: pl.InOut[pl.Tensor[[RANKS, 2 * CAPACITY, HC_MULT, D], pl.BF16]],
+    final_norm: pl.Tensor[[RANKS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[RANKS, FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Out[pl.Tensor[[RANKS, BATCH, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+    forward_epoch: pl.Scalar[pl.INT32],
 ):
-    lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, D], dtype=pl.INT8)
-    lane_aux_buf = pld.alloc_window_buffer([LANE_ROWS, AUX_PAD], dtype=pl.FP32)
-    lane_count_buf = pld.alloc_window_buffer([EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-    lane_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
-    slot_out_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.FP32)
-    return_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
-    exchange_buf = pld.alloc_window_buffer([T, D], dtype=pl.FP32)
-    arrived_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
-    for step in pl.range(STEPS):
-        for rank in pl.range(pld.world_size()):
-            lane_x = pld.window(lane_x_buf, [LANE_ROWS, D], dtype=pl.INT8)
-            lane_aux = pld.window(lane_aux_buf, [LANE_ROWS, AUX_PAD], dtype=pl.FP32)
-            lane_count = pld.window(lane_count_buf, [EP_SIZE, COUNT_PAD], dtype=pl.INT32)
-            lane_ready = pld.window(lane_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
-            slot_out = pld.window(slot_out_buf, [N_ROUTES, D], dtype=pl.FP32)
-            return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
-            exchange = pld.window(exchange_buf, [T, D], dtype=pl.FP32)
-            arrived = pld.window(arrived_buf, [EP_SIZE, 1], dtype=pl.INT32)
-            decode_fwd(
-                inputs_embeds[rank], state_rows[rank], hc_function[rank], hc_scale[rank], hc_base[rank],
-                norm_weight[rank],
-                w_q[rank], w_k[rank], w_v[rank], w_f_a[rank], w_f_b[rank], dt_bias[rank], a_log[rank],
-                w_b[rank], w_g_a[rank], w_g_b[rank], conv_weight[rank], out_norm[rank], w_o[rank],
-                dense_gate_up[rank], dense_gate_up_scale[rank], dense_down[rank], dense_down_scale[rank],
-                final_norm[rank], mla_w_q_a[rank], mla_q_norm[rank], mla_w_q_b[rank], mla_w_kv_a[rank],
-                mla_kv_norm[rank], mla_w_k[rank], mla_w_o[rank],
-                index_w_q_b[rank], index_w_k[rank], index_norm[rank], index_bias[rank], index_weights[rank],
-                index_gate[rank], compress_ape[rank], hadamard[rank], gate_weight[rank],
-                correction_bias[rank], expert_gate_up[rank], expert_gate_up_scale[rank], expert_down[rank],
-                expert_down_scale[rank], shared_gate_up[rank], shared_gate_up_scale[rank], shared_down[rank],
-                shared_down_scale[rank], kv_slots[rank], pool_token_slots[rank], pool_slots[rank],
-                pool_blocks[rank], seg_start[rank], pool_count[rank], tail_start[rank], tail_count[rank],
-                kv_len[rank], block_table[rank], request_ids[rank], latent_cache[rank], raw_cache[rank],
-                pool_cache[rank], pool_scale[rank], conv_state[rank], recurrent_state[rank],
-                layer_outputs[rank], streams[rank], hidden[rank], lane_x, lane_aux, lane_count, lane_ready,
-                slot_out, return_ready, exchange, arrived, rank, pl.cast(step, pl.INT32), device=rank,
-            )
-
-
-def golden_sparse_step(tensors, normed, rank, layer, step):
-
-    weights = [tensors[n][rank, layer] for n in ("mla_w_q_a", "mla_q_norm", "mla_w_q_b", "mla_w_kv_a", "mla_kv_norm")]
-    q_resid, query, latent = golden_mla_prolog(normed, *weights)
-    slots = tensors["kv_slots"][rank, step]
-    cache = tensors["latent_cache"][rank, layer]
-    cache.copy_(golden_mla_cache_write(cache, latent, slots))
-    weights = [
-        tensors[n][rank, layer]
-        for n in (
-            "index_w_q_b",
-            "index_w_k",
-            "index_norm",
-            "index_bias",
-            "index_weights",
-            "index_gate",
+    """Launch one complete decode orchestration per rank."""
+    tp_partial_buffer = pld.alloc_window_buffer([BATCH, D], dtype=pl.FP32)
+    tp_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    lane_x_buffer = pld.alloc_window_buffer([RESIDENT_TOTAL_CAP, D], dtype=pl.INT8)
+    lane_aux_buffer = pld.alloc_window_buffer([RESIDENT_TOTAL_CAP, AUX_PAD], dtype=pl.FP32)
+    lane_count_buffer = pld.alloc_window_buffer([N_RANKS, COUNT_PAD], dtype=pl.INT32)
+    count_ready_buffer = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    x_ready_buffer = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    slot_out_buffer = pld.alloc_window_buffer([RESIDENT_ROUTES_PER_SRC, D], dtype=pl.FP32)
+    return_ready_buffer = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    for rank in pl.range(pld.world_size()):
+        tp_partial = pld.window(tp_partial_buffer, [BATCH, D], dtype=pl.FP32)
+        tp_arrived = pld.window(tp_arrived_buffer, [EP_SIZE, 1], dtype=pl.INT32)
+        lane_x = pld.window(lane_x_buffer, [RESIDENT_TOTAL_CAP, D], dtype=pl.INT8)
+        lane_aux = pld.window(lane_aux_buffer, [RESIDENT_TOTAL_CAP, AUX_PAD], dtype=pl.FP32)
+        lane_count = pld.window(lane_count_buffer, [N_RANKS, COUNT_PAD], dtype=pl.INT32)
+        count_ready = pld.window(count_ready_buffer, [N_RANKS, 1], dtype=pl.INT32)
+        x_ready = pld.window(x_ready_buffer, [N_RANKS, 1], dtype=pl.INT32)
+        slot_out = pld.window(slot_out_buffer, [RESIDENT_ROUTES_PER_SRC, D], dtype=pl.FP32)
+        return_ready = pld.window(return_ready_buffer, [N_RANKS, 1], dtype=pl.INT32)
+        decode_fwd(
+            embedding_rows[rank], query_start_loc[rank], kda_state_rows[rank], active_tokens[rank], kda_tri_incl[rank],
+            kda_tri_strict[rank], kda_head_onehot[rank], kda_eye_wide[rank], kda_w_q[rank], kda_w_k[rank],
+            kda_w_v[rank], kda_conv_q[rank], kda_conv_k[rank], kda_conv_v[rank], kda_w_f_a[rank],
+            kda_w_f_b[rank], kda_w_g_a[rank], kda_w_g_b[rank], kda_w_b[rank], kda_dt_bias[rank],
+            kda_a_log[rank], kda_o_norm[rank], kda_w_o[rank], mhc_attn_fn[rank], mhc_attn_scale[rank],
+            mhc_attn_base[rank], mhc_ffn_fn[rank], mhc_ffn_scale[rank], mhc_ffn_base[rank], norm_input_norm[rank],
+            norm_post_norm[rank], dense_w_gate_up[rank], dense_w_gate_up_scale[rank], dense_w_down[rank], dense_w_down_scale[rank],
+            kda_conv_state[rank], kda_recurrent_state[rank], ws_attn_pre[rank], ws_attn_post[rank], ws_attn_res[rank],
+            ws_collapsed[rank], ws_normed[rank], ws_attn_partial[rank], ws_sublayer_out[rank], ws_x_hc_mid[rank],
+            ws_ffn_pre[rank], ws_ffn_post[rank], ws_ffn_res[rank], ws_ffn_input[rank], ws_ffn_partial[rank],
+            ws_ffn_out[rank], kda_out[rank], mixed_qkv[rank], decay[rank], beta[rank],
+            kda_q[rank], kda_k[rank], kda_v[rank], dense_x_int8[rank], request_ids[rank],
+            mla_slots[rank], index_slots[rank], seg_start[rank], pool_count_tok[rank], tail_start[rank],
+            tail_count[rank], kv_len_tok[rank], pool_token_slots[rank], pool_slots[rank], pool_blocks[rank],
+            block_table[rank], mla_w_q_a[rank], mla_w_q_a_scale[rank], mla_q_a_norm[rank], mla_w_q_b[rank],
+            mla_w_q_b_scale[rank], mla_w_kv_a[rank], mla_w_kv_a_scale[rank], mla_kv_a_norm[rank], mla_w_k[rank],
+            mla_w_v[rank], mla_w_o[rank], mla_w_o_scale[rank], idx_w_q_b[rank], idx_w_k[rank],
+            idx_k_norm_w[rank], idx_k_norm_b[rank], idx_w_weights[rank], idx_w_compress_gate[rank], idx_compress_ape[rank],
+            hadamard[rank], mla_latent_cache[rank], index_raw_cache[rank], index_pool_cache[rank], index_pool_scale[rank],
+            dsa_query[rank], attn_out[rank], index_q[rank], index_k[rank], index_scores[rank],
+            selected_pools[rank], selected_valid[rank], router_gate_w[rank], router_gate_bias[rank], moe_w_gate_up[rank],
+            moe_w_gate_up_scale[rank], moe_w_down[rank], moe_w_down_scale[rank], moe_shared_w_gate_up[rank], moe_shared_w_gate_up_scale[rank],
+            moe_shared_w_down[rank], moe_shared_w_down_scale[rank], logit_row_indices[rank], head_hidden[rank], ws_x_hc_pair[rank],
+            final_norm[rank], lm_head_weight[rank], logits[rank], tp_partial, tp_arrived,
+            lane_x, lane_aux, lane_count, count_ready, x_ready,
+            slot_out, return_ready, forward_epoch, rank, device=rank,
         )
-    ]
-    iq, ik, hw, gs = golden_indexer_proj(normed, q_resid, *weights)
-    raw = tensors["raw_cache"][rank, layer]
-    raw.copy_(golden_indexer_cache_write(raw, ik, gs, slots))
-    pc = tensors["pool_cache"][rank, layer]
-    ps = tensors["pool_scale"][rank, layer]
-    (updated, scales, _) = golden_indexer_pool_write(
-        pc, ps, raw, tensors["compress_ape"][rank, layer], tensors["hadamard"][rank],
-        tensors["pool_token_slots"][rank, step], tensors["pool_slots"][rank, step],
-    )
-    pc.copy_(updated)
-    ps.copy_(scales)
-    scores = golden_indexer_score(
-        iq, tensors["hadamard"][rank], pc, ps, tensors["pool_blocks"][rank], hw, tensors["seg_start"][rank],
-        tensors["pool_count"][rank, step],
-    )
-    (selected, valid) = golden_indexer_topk(scores, tensors["seg_start"][rank], tensors["pool_count"][rank, step])
-    indices = golden_indexer_expand(
-        selected, valid, tensors["tail_start"][rank, step], tensors["tail_count"][rank, step],
-        tensors["kv_len"][rank, step],
-    )
-    absorbed = golden_absorb_query(query, tensors["mla_w_k"][rank, layer])
-    context = golden_decode_sparse_attn(
-        absorbed, cache, indices, tensors["block_table"][rank], tensors["request_ids"][rank],
-    )
-    return golden_mla_epilog_decode(context, tensors["mla_w_o"][rank, layer])
-
-
-def golden_decode_fwd(tensors, *, observed=None):
-    """Compose child goldens, optionally checking boundaries with captured inputs.
-
-    The default is an independent end-to-end reference. Boundary validation uses
-    the recorded attention/MLP inputs for the child goldens and the recorded
-    sublayer outputs for the surrounding mHC edges. Each recorded input is also
-    checked against the preceding edge, so the reference covers the composition.
-    """
-
-    for step in range(STEPS):
-        x = tensors["inputs_embeds"][0, step, :, None, :].expand(T, HC_MULT, D).clone()
-        for layer in range(START_LAYER, END_LAYER):
-            (pre, post, residual) = hc_mixes(
-                x, tensors["hc_function"][0, layer, 0], tensors["hc_scale"][0, layer, 0],
-                tensors["hc_base"][0, layer, 0],
-            )
-            mixed = golden_mhc_pre(x, pre)
-            normed = rms_norm(mixed, tensors["norm_weight"][0, layer, 0])
-            tensors["layer_outputs"][:, step, layer, 3].copy_(normed)
-            if observed is not None:
-                normed = observed["layer_outputs"][0, step, layer, 3]
-            partials = []
-            if layer % 4 != 3:
-                linear_layer = layer - layer // 4
-                for rank in range(EP_SIZE):
-                    weights = [
-                        tensors[n][rank, linear_layer]
-                        for n in (
-                            "w_q",
-                            "w_k",
-                            "w_v",
-                            "w_f_a",
-                            "w_f_b",
-                            "dt_bias",
-                            "a_log",
-                            "w_b",
-                            "w_g_a",
-                            "w_g_b",
-                        )
-                    ]
-                    qkv, decay, beta, out_gate = golden_kda_projection(normed, *weights)
-                    rows = tensors["state_rows"][rank, step]
-                    (q, k, v, conv) = golden_kda_conv_decode(
-                        qkv,
-                        tensors["conv_weight"][rank, linear_layer], tensors["conv_state"][rank, linear_layer],
-                        rows,
-                    )
-                    tensors["conv_state"][rank, linear_layer].copy_(conv)
-                    (core, state) = golden_decode_kda(
-                        q, k, v, decay, beta, tensors["recurrent_state"][rank, linear_layer], rows,
-                    )
-                    tensors["recurrent_state"][rank, linear_layer].copy_(state)
-                    partials.append(
-                        golden_kda_output(core, tensors["out_norm"][rank, linear_layer], out_gate, tensors["w_o"][rank, linear_layer]),
-                    )
-            else:
-                for rank in range(EP_SIZE):
-                    partials.append(golden_sparse_step(tensors, normed, rank, layer // 4, step))
-            reduced = torch.stack(partials).double().sum(0).float().to(torch.bfloat16)
-            tensors["layer_outputs"][:, step, layer, 0].copy_(reduced)
-            if observed is not None:
-                reduced = observed["layer_outputs"][0, step, layer, 0]
-            x = golden_mhc_post(reduced, x, post, residual)
-            (pre, post, residual) = hc_mixes(
-                x, tensors["hc_function"][0, layer, 1], tensors["hc_scale"][0, layer, 1],
-                tensors["hc_base"][0, layer, 1],
-            )
-            mixed = golden_mhc_pre(x, pre)
-            tensors["layer_outputs"][:, step, layer, 2].copy_(mixed)
-            if observed is not None:
-                mixed = observed["layer_outputs"][0, step, layer, 2]
-            if layer < 3:
-                if DENSE_BF16:
-                    dense_input = rms_norm(mixed, tensors["norm_weight"][0, layer, 1])
-                    partials = [
-                        golden_dense_mlp_bf16(
-                            dense_input,
-                            tensors["dense_gate_up"][rank, layer],
-                            tensors["dense_down"][rank, layer],
-                        ).float()
-                        for rank in range(EP_SIZE)
-                    ]
-                    reduced = torch.stack(partials).double().sum(0).float().to(torch.bfloat16)
-                else:
-                    _, x_int8, x_scale = golden_rmsnorm_quant(mixed, tensors["norm_weight"][0, layer, 1])
-                    partials = []
-                    for rank in range(EP_SIZE):
-                        case = {"x_int8": x_int8, "x_scale": x_scale, "output": torch.empty(T, D)}
-                        for dst, src in (
-                            ("w_gate_up", "dense_gate_up"),
-                            ("w_gate_up_scale", "dense_gate_up_scale"),
-                            ("w_down", "dense_down"),
-                            ("w_down_scale", "dense_down_scale"),
-                        ):
-                            case[dst] = tensors[src][rank, layer]
-                        golden_dense_mlp_fn(case)
-                        partials.append(case["output"])
-                    reduced = torch.stack(partials).double().sum(0).float().to(torch.bfloat16)
-            else:
-
-                m = layer - 3
-                case = {
-                    "x_mixed": mixed.unsqueeze(0).expand(EP_SIZE, -1, -1),
-                    "norm_weight": tensors["norm_weight"][:, layer, 1],
-                    "y": torch.empty(EP_SIZE, T, D),
-                }
-                for dest, source in (
-                    ("gate_weight", "gate_weight"),
-                    ("correction_bias", "correction_bias"),
-                    ("w_gate_up", "expert_gate_up"),
-                    ("w_gate_up_scale", "expert_gate_up_scale"),
-                    ("w_down", "expert_down"),
-                    ("w_down_scale", "expert_down_scale"),
-                    ("shared_w_gate_up", "shared_gate_up"),
-                    ("shared_w_gate_up_scale", "shared_gate_up_scale"),
-                    ("shared_w_down", "shared_down"),
-                    ("shared_w_down_scale", "shared_down_scale"),
-                ):
-                    case[dest] = tensors[source][:, m]
-                golden_decode_layer(case)
-                reduced = case["y"][0].to(torch.bfloat16)
-            tensors["layer_outputs"][:, step, layer, 1].copy_(reduced)
-            if observed is not None:
-                reduced = observed["layer_outputs"][0, step, layer, 1]
-            x = golden_mhc_post(reduced, x, post, residual)
-        head_input = x if observed is None else observed["streams"][0, step]
-        hidden = rms_norm(hc_head(head_input), tensors["final_norm"][0])
-        tensors["streams"][:, step].copy_(x)
-        tensors["hidden"][:, step].copy_(hidden)
-
-
-def build_forward_metadata(*, cold_start=False):
-    request = torch.arange(T, dtype=torch.int32)
-    pages = T - 1 - request
-    prior = torch.zeros_like(request) if cold_start else 3 + request % 4
-    length = prior[None] + torch.arange(1, STEPS + 1, dtype=torch.int32)[:, None]
-    positions = length - 1
-    meta = {
-        "kv_slots": pages[None] * BLOCK_SIZE + positions,
-        "pool_blocks": torch.cat(
-            [
-                torch.arange(0, POOL_ROWS, 4, dtype=torch.int32),
-                torch.zeros(POOL_ROWS * 3 // 4, dtype=torch.int32),
-            ]
-        ),
-        "seg_start": request * 64,
-        "pool_count": length // 4,
-        "tail_start": length // 4 * 4,
-        "tail_count": length % 4,
-        "kv_len": length,
-        "block_table": pages[:, None],
-        "request_ids": request,
-    }
-    closes = length % 4 == 0
-    members = pages[None, :, None] * BLOCK_SIZE + length[:, :, None] - 4 + torch.arange(4)[None, None]
-    meta["pool_token_slots"] = torch.where(closes[:, :, None], members, -1).to(torch.int32)
-    meta["pool_slots"] = torch.where(closes, request[None] * 64 + length // 4 - 1, request[None] * 64 + 63).to(
-        torch.int32,
-    )
-    return meta
-
-
-def build_checkpoint_weights(checkpoint):
-    """Stage the checkpoint's TP attention/Dense and EP MoE weight stacks."""
-
-    final_names = ("model.norm.weight", "model.language_model.norm.weight")
-    final_name = next((name for name in final_names if name in checkpoint), None)
-    if final_name is None:
-        raise ValueError(f"checkpoint final norm weight is missing: expected one of {final_names}")
-    values = {name: torch.zeros([EP_SIZE, *shape], dtype=dtype) for name, shape, dtype in _WEIGHT_LAYOUTS}
-    for rank in range(EP_SIZE):
-        values["hadamard"][rank].copy_(sylvester_hadamard())
-        for layer in range(N_LAYERS):
-            print(f"[decode_fwd] checkpoint rank={rank}, layer={layer}", flush=True)
-            weights = checkpoint.layer(layer, tp_rank=rank, tp=TP_SIZE, ep_rank=rank, ep=EP_SIZE)
-            for side, name in enumerate(("attn_hc", "ffn_hc")):
-                for target, source in (
-                    ("hc_function", "function"),
-                    ("hc_scale", "scale"),
-                    ("hc_base", "base"),
-                ):
-                    values[target][rank, layer, side].copy_(weights[name][source])
-            values["norm_weight"][rank, layer, 0].copy_(weights["input_norm"])
-            values["norm_weight"][rank, layer, 1].copy_(weights["ffn"]["norm_weight"])
-            attention = weights["attention"]
-            if layer % 4 != 3:
-                index = layer - layer // 4
-                for name in (
-                    "w_q",
-                    "w_k",
-                    "w_v",
-                    "w_f_a",
-                    "w_f_b",
-                    "dt_bias",
-                    "a_log",
-                    "w_b",
-                    "w_g_a",
-                    "w_g_b",
-                    "w_o",
-                ):
-                    values[name][rank, index].copy_(attention[name])
-                values["conv_weight"][rank, index].copy_(attention["weight"])
-                values["out_norm"][rank, index].copy_(attention["norm_weight"])
-            else:
-                index = layer // 4
-                for target, source in (
-                    ("mla_w_q_a", "w_q_a"),
-                    ("mla_q_norm", "q_a_norm_weight"),
-                    ("mla_w_q_b", "w_q_b"),
-                    ("mla_w_kv_a", "w_kv_a"),
-                    ("mla_kv_norm", "kv_a_norm_weight"),
-                    ("mla_w_k", "w_k"),
-                    ("mla_w_o", "w_o_absorbed"),
-                ):
-                    values[target][rank, index].copy_(attention[source])
-                for target, source in (
-                    ("index_w_q_b", "w_q_b"),
-                    ("index_w_k", "w_k"),
-                    ("index_norm", "k_norm_weight"),
-                    ("index_bias", "k_norm_bias"),
-                    ("index_weights", "w_weights"),
-                    ("index_gate", "w_compress_gate"),
-                    ("compress_ape", "compress_ape"),
-                ):
-                    values[target][rank, index].copy_(weights["indexer"][source])
-            ffn = weights["ffn"]
-            if layer < 3:
-                for target, source in (
-                    ("dense_gate_up", "w_gate_up"),
-                    ("dense_gate_up_scale", "w_gate_up_scale"),
-                    ("dense_down", "w_down"),
-                    ("dense_down_scale", "w_down_scale"),
-                ):
-                    value = ffn[source]
-                    if DENSE_BF16 and value.dtype == torch.int8:
-                        value = (value.float() * ffn[source + "_scale"][:, None]).bfloat16()
-                    values[target][rank, layer].copy_(value)
-            else:
-                for target, source in (
-                    ("gate_weight", "gate_weight"),
-                    ("correction_bias", "correction_bias"),
-                    ("expert_gate_up", "w_gate_up"),
-                    ("expert_gate_up_scale", "w_gate_up_scale"),
-                    ("expert_down", "w_down"),
-                    ("expert_down_scale", "w_down_scale"),
-                    ("shared_gate_up", "shared_w_gate_up"),
-                    ("shared_gate_up_scale", "shared_w_gate_up_scale"),
-                    ("shared_down", "shared_w_down"),
-                    ("shared_down_scale", "shared_w_down_scale"),
-                ):
-                    values[target][rank, layer - 3].copy_(ffn[source])
-    values["final_norm"].copy_(checkpoint[final_name].bfloat16())
-    for name in ("shared_gate_up", "shared_down"):
-        values[name] = pack_int8_nz(values[name])
-    return values
-
-
-def build_tensor_specs(checkpoint=None):
-    from golden import TensorSpec
-
-    specs = []
-    generator = torch.Generator().manual_seed(533)
-    embeds = torch.randn(STEPS, T, D, generator=generator).to(torch.bfloat16)
-    if checkpoint is not None:
-        checkpoint = Checkpoint(checkpoint)
-        token_ids = torch.arange(2000, 2000 + STEPS * T, dtype=torch.int64)
-        embeds = checkpoint.embedding(token_ids).reshape(STEPS, T, D)
-    mappings = torch.stack(
-        [torch.arange(T) if checkpoint is not None else (torch.arange(T) + 2 * step + 1) % STATE_ROWS for step in range(STEPS)],
-    )
-    specs.append(
-        TensorSpec("inputs_embeds", [EP_SIZE, STEPS, T, D], torch.bfloat16, init_value=lambda : embeds.unsqueeze(0).expand(EP_SIZE, -1, -1, -1).clone(), resident="stacked"),
-    )
-    specs.append(
-        TensorSpec("state_rows", [EP_SIZE, STEPS, T], torch.int32, init_value=lambda : mappings.unsqueeze(0).expand(EP_SIZE, -1, -1).clone(), resident="stacked"),
-    )
-    replicas = {
-        "hc_function",
-        "hc_scale",
-        "hc_base",
-        "norm_weight",
-        "final_norm",
-        "w_f_a",
-        "w_g_a",
-        "mla_w_q_a",
-        "mla_q_norm",
-        "mla_w_kv_a",
-        "mla_kv_norm",
-        "index_w_q_b",
-        "index_w_k",
-        "index_norm",
-        "index_bias",
-        "index_weights",
-        "index_gate",
-        "compress_ape",
-        "hadamard",
-        "gate_weight",
-        "correction_bias",
-        "shared_gate_up",
-        "shared_gate_up_scale",
-        "shared_down",
-        "shared_down_scale",
-    }
-    for index, (name, shape, dtype) in enumerate(_WEIGHT_LAYOUTS):
-
-        def init(name=name, shape=shape, dtype=dtype, seed=1000 + index):
-            gen = torch.Generator().manual_seed(seed)
-            rank_count = 1 if name in replicas else EP_SIZE
-            full_shape = [rank_count, *shape]
-            if name == "hadamard":
-
-                value = sylvester_hadamard().to(dtype).unsqueeze(0)
-            elif name == "correction_bias":
-
-                value = make_correction_bias(EP_SIZE, N_EXPERTS, 8)[:1, None].expand(1, N_MOE, N_EXPERTS)
-            elif dtype == torch.int8:
-                value = torch.randint(-16, 17, full_shape, dtype=dtype, generator=gen)
-            elif "norm" in name:
-                value = (1 + 0.03 * torch.randn(full_shape, generator=gen)).to(dtype)
-            elif name.endswith("_scale") and name != "hc_scale":
-                value = torch.full(full_shape, 0.002, dtype=dtype)
-            elif name == "hc_scale":
-                value = torch.full(full_shape, 0.1, dtype=dtype)
-            else:
-                std = 0.15 if name in ("conv_weight", "hc_base", "dt_bias", "a_log") else shape[-1] ** -0.5
-                value = (torch.randn(full_shape, generator=gen) * std).to(dtype)
-            value = value.expand(EP_SIZE, *shape).contiguous()
-            return pack_int8_nz(value) if name in ("shared_gate_up", "shared_down") else value
-
-        specs.append(TensorSpec(name, [EP_SIZE, *shape], dtype, init_value=init, resident="stacked"))
-    if checkpoint is not None:
-        pending = {}
-
-        def checkpoint_weight(name):
-            if not pending:
-                pending.update(build_checkpoint_weights(checkpoint))
-            return pending.pop(name)
-
-        names = {name for name, _shape, _dtype in _WEIGHT_LAYOUTS}
-        for spec in specs:
-            if spec.name in names:
-                spec.init_value = lambda name=spec.name: checkpoint_weight(name)
-    meta = build_forward_metadata(cold_start=checkpoint is not None)
-    for name, shape, dtype in _METADATA_LAYOUTS:
-
-        def init_metadata(name=name, shape=shape):
-            return meta[name].unsqueeze(0).expand(EP_SIZE, *shape).contiguous()
-
-        specs.append(TensorSpec(name, [EP_SIZE, *shape], dtype, init_value=init_metadata, resident="stacked"))
-    for index, (name, shape, dtype) in enumerate(_CACHE_LAYOUTS):
-
-        def init_cache(name=name, shape=shape, dtype=dtype, seed=3000 + index):
-            gen = torch.Generator().manual_seed(seed)
-            if checkpoint is not None:
-                value = torch.zeros(shape, dtype=dtype)
-            elif dtype == torch.int8:
-                value = torch.randint(-16, 17, shape, generator=gen, dtype=dtype)
-            elif name == "pool_scale":
-                value = (0.01 + torch.rand(shape, generator=gen) * 0.02).to(dtype)
-                # Preserve lane 0 while satisfying the replicated-scale cache ABI.
-                value = value[..., :1].expand_as(value).contiguous()
-            else:
-                value = (torch.randn(shape, generator=gen) * 0.02).to(dtype)
-            return value.unsqueeze(0).expand(EP_SIZE, *shape).contiguous()
-
-        specs.append(TensorSpec(name, [EP_SIZE, *shape], dtype, init_value=init_cache, resident="stacked"))
-    for name, shape, dtype in (
-        ("conv_state", [EP_SIZE, N_KDA, STATE_ROWS, STATE_LEN, CONV_DIM], torch.bfloat16),
-        ("recurrent_state", [EP_SIZE, N_KDA, STATE_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], torch.float32),
-    ):
-
-        def init_state(shape=shape, dtype=dtype):
-            if checkpoint is not None:
-                return torch.zeros(shape, dtype=dtype)
-            gen = torch.Generator().manual_seed(2001)
-            return (torch.randn(shape, generator=gen) * 0.02).to(dtype)
-
-        specs.append(TensorSpec(name, shape, dtype, init_value=init_state, resident="stacked"))
-    specs.append(
-        TensorSpec("layer_outputs", [EP_SIZE, STEPS, N_LAYERS, TRACE_PHASES, T, D], torch.bfloat16, resident="stacked"),
-    )
-    specs.append(TensorSpec("streams", [EP_SIZE, STEPS, T, HC_MULT, D], torch.bfloat16, resident="stacked"))
-    specs.append(TensorSpec("hidden", [EP_SIZE, STEPS, T, D], torch.bfloat16, resident="stacked"))
-    return specs
-
-
-def compare_replicated(actual, expected, **kwargs):
-    from golden import ratio_allclose
-
-    if not torch.equal(actual, actual[:1].expand_as(actual)):
-        return False, "TP replicas diverged"
-    compare = ratio_allclose(max_error_ratio=0.05)
-    if actual.ndim == 6:
-        if not torch.equal(actual[:, :, :START_LAYER], expected[:, :, :START_LAYER]):
-            return False, "an unexecuted layer trace changed"
-        if not torch.equal(actual[:, :, END_LAYER:], expected[:, :, END_LAYER:]):
-            return False, "an unexecuted layer trace changed"
-        for step in range(STEPS):
-            for layer in range(START_LAYER, END_LAYER):
-                for phase in range(TRACE_PHASES):
-                    (ok, detail) = compare(actual[:, step, layer, phase], expected[:, step, layer, phase], **kwargs)
-                    if not ok:
-                        return False, f"step={step}, layer={layer}, phase={phase}: {detail}"
-        return True, ""
-    for step in range(STEPS):
-        ok, detail = compare(actual[:, step], expected[:, step], **kwargs)
-        if not ok:
-            return False, f"step={step}: {detail}"
-    return True, ""
-
-
-def compare_state(actual, expected, *, inputs, **kwargs):
-    from golden import ratio_allclose
-
-    for rank in range(EP_SIZE):
-        used = inputs["state_rows"][rank].flatten().long().unique()
-        untouched = torch.ones(STATE_ROWS, dtype=torch.bool)
-        untouched[used] = False
-        if not torch.equal(actual[rank, :, untouched], expected[rank, :, untouched]):
-            return False, "an untouched state slot changed"
-    return ratio_allclose(max_error_ratio=0)(actual, expected, inputs=inputs, **kwargs)
-
-
-def compare_cache_slots(slot_name, *, atol=None, rtol=None, max_error_ratio=0):
-    """Require exact preservation of cache rows outside this decode update."""
-    from golden import ratio_allclose
-
-    def compare(actual, expected, *, inputs, **kwargs):
-        numeric = ratio_allclose(atol=atol, rtol=rtol, max_error_ratio=max_error_ratio)
-        for rank in range(EP_SIZE):
-            used = inputs[slot_name][rank].flatten().long().unique()
-            untouched = torch.ones(actual.shape[2], dtype=torch.bool)
-            untouched[used] = False
-            if not torch.equal(actual[rank, :, untouched], expected[rank, :, untouched]):
-                return False, "an untouched cache slot changed"
-            for layer in range(actual.shape[1]):
-                got = actual[rank, layer, used]
-                want = expected[rank, layer, used]
-                ok, detail = numeric(got, want, inputs=inputs, **kwargs)
-                if not ok:
-                    return False, f"rank={rank}, cache_layer={layer}: {detail}"
-        return True, ""
-
-    return compare
-
-
-def build_comparators(*, validate_boundaries=False, initial_states=None):
-    """Build the selected validation gate; cache one boundary replay per run."""
-    comparators = {
-        "latent_cache": compare_cache_slots("kv_slots"),
-        "raw_cache": compare_cache_slots("kv_slots"),
-        "pool_cache": compare_cache_slots("pool_slots"),
-        "pool_scale": compare_cache_slots("pool_slots"),
-        "conv_state": compare_state,
-        "recurrent_state": compare_state,
-        "layer_outputs": compare_replicated,
-        "streams": compare_replicated,
-        "hidden": compare_replicated,
-    }
-    if not validate_boundaries:
-        return comparators
-
-    if initial_states is None:
-        raise ValueError("boundary validation requires snapshots of the initial mutable tensors")
-
-    # Written index-cache rows retain the local INT8 rounding tolerance.
-    comparators["pool_cache"] = compare_cache_slots("pool_slots", atol=1.0, rtol=0.0, max_error_ratio=0.005)
-    references = {}
-
-    def bind(name, compare):
-        def boundary_compare(actual, expected, *, actual_outputs, inputs, **kwargs):
-            if not references:
-                replay = dict(inputs)
-                for output_name, value in actual_outputs.items():
-                    initial = initial_states.get(output_name)
-                    replay[output_name] = torch.zeros_like(value) if initial is None else initial.clone()
-                golden_decode_fwd(replay, observed=actual_outputs)
-                references.update({key: replay[key] for key in actual_outputs})
-            if name == "hidden":
-                from golden import error_distribution
-
-                (independent_ok, _detail) = compare_replicated(
-                    actual, expected, actual_outputs=actual_outputs, inputs=inputs, **kwargs,
-                )
-                status = "PASS" if independent_ok else "FAIL"
-                print(f"[decode_fwd] independent end-to-end hidden gate: {status}", flush=True)
-                error_distribution()(actual, expected, actual_outputs=actual_outputs, inputs=inputs, **kwargs)
-            return compare(actual, references[name], actual_outputs=actual_outputs, inputs=inputs, **kwargs)
-
-        boundary_compare.__name__ = "boundary_" + name
-        return boundary_compare
-
-    return {name: bind(name, compare) for name, compare in comparators.items()}
-
-
-def main():
-    from pypto.ir import DistributedConfig
-
-    from golden import run
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-p", "--platform", dest="backend_type", default="a2a3", choices=["a2a3"])
-    parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("-d", "--device", default="0,1")
-    parser.add_argument("--ep", type=int, default=EP_SIZE)
-    parser.add_argument("--tp", type=int, default=TP_SIZE)
-    parser.add_argument("--layers", type=int, default=N_LAYERS)
-    parser.add_argument("--start-layer", type=int, default=START_LAYER)
-    parser.add_argument(
-        "--end-layer", type=int, default=END_LAYER,
-        help="exclusive execution end (default: start + 1); keep fixture layers fixed",
-    )
-    parser.add_argument("--steps", type=int, default=STEPS)
-    parser.add_argument("--dense-dtype", choices=["int8", "bf16"], default=_shape_args.dense_dtype)
-    parser.add_argument("--dump-passes", action="store_true")
-    parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--checkpoint", type=Path, help="indexed W8A8 checkpoint for real weights and embeddings")
-    parser.add_argument("--golden-data", type=Path, help="replay saved inputs and independent reference outputs")
-    parser.add_argument("--runtime-dir", type=Path, help="reuse a compiled artifact with the same parameter ABI")
-    parser.add_argument(
-        "--validate-boundaries", action="store_true",
-        help="check sublayers, mHC edges and state updates using recorded sublayer inputs",
-    )
-    args = parser.parse_args()
-    if args.golden_data is not None and args.validate_boundaries:
-        parser.error(
-            "--golden-data replays independent outputs; boundary diagnostics require fresh initial-state snapshots",
-        )
-    devices = [int(v) for v in args.device.split(",")]
-    if len(devices) != EP_SIZE or len(set(devices)) != EP_SIZE:
-        parser.error(f"need {EP_SIZE} distinct devices")
-    torch.set_num_threads(8)
-    initial_states = {}
-
-    def golden_with_snapshots(tensors):
-        if args.validate_boundaries:
-            names = [name for name, _shape, _dtype in _CACHE_LAYOUTS]
-            names += ["conv_state", "recurrent_state", "layer_outputs"]
-            initial_states.update({name: tensors[name].clone() for name in names})
-        golden_decode_fwd(tensors)
-
-    validation = "boundary correctness" if args.validate_boundaries else "independent end-to-end reference"
-    print(f"[decode_fwd] validation: {validation}", flush=True)
-    result = run(
-        fn=l3_decode_fwd,
-        specs=build_tensor_specs(checkpoint=args.checkpoint),
-        golden_fn=golden_with_snapshots,
-        config=dict(
-            backend_type=args.backend_type, execution_mode=args.execution_mode,
-            dump_passes=args.dump_passes, ring_heap=[0, 512 * 1024 * 1024, 0, 0],
-            enable_scope_stats=True,
-            distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
-        ),
-        compile_only=args.compile_only,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        compare_fn=build_comparators(validate_boundaries=args.validate_boundaries, initial_states=initial_states),
-        rtol=0.02,
-        atol=0.02,
-    )
-    print(result)
-    if not result.passed:
-        raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()

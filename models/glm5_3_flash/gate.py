@@ -23,7 +23,6 @@ from models.glm5_3_flash.config import FLASH, N_EXPERTS, TOPK, D, Glm53FlashConf
 from models.glm5_3_flash.elementwise import FP32_NEG_INF, accurate_divide, accurate_sigmoid
 from models.glm5_3_flash.linear import bf16_linear
 from models.glm5_3_flash.rmsnorm import golden_rmsnorm_quant, rms_norm, rmsnorm_quant
-from models.glm5_3_flash.utils import _check, _report
 
 T_DYN = pl.dynamic('GLM53_T_DYN')
 
@@ -356,29 +355,6 @@ def build_tensor_specs(num_tokens=T_DYN_TEST):
         TensorSpec("x_int8", [num_tokens, D], torch.int8),
         TensorSpec("x_scale", [num_tokens, 1], torch.float32),
     ]
-
-
-def run_moe_gate_golden(golden_gate) -> None:
-    """Exercise the sigmoid ``noaux_tc`` router on a reduced expert count."""
-    torch.manual_seed(13)
-    tokens, hidden, experts = 8, 64, 32
-    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
-    weight = torch.randn(experts, hidden)
-    correction_bias = torch.randn(experts)
-
-    weights, indices = golden_gate(x, weight, correction_bias)
-    topk = FLASH.num_experts_per_tok
-    _check(weights.shape == (tokens, topk), f"router weight shape {tuple(weights.shape)}")
-    _check(indices.shape == (tokens, topk), f"router index shape {tuple(indices.shape)}")
-    _check(indices.dtype is torch.int32, f"router index dtype {indices.dtype}")
-    _check(bool((indices >= 0).all() and (indices < experts).all()), "router index out of range")
-    for row in indices.tolist():
-        _check(len(set(row)) == topk, f"router selected a duplicate expert: {row}")
-    if FLASH.norm_topk_prob:
-        total = weights.sum(dim=-1) / FLASH.routed_scaling_factor
-        _check((total - 1.0).abs().max() < 1e-4, f"router weights are not normalised: {total}")
-
-    _report("moe_gate")
 
 
 if __name__ == "__main__":

@@ -26,12 +26,34 @@ from math import gcd
 from typing import Mapping, Sequence
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import torch
 
 import models.glm5_3_flash.config as C
+from models.glm5_3_flash.layer import (
+    AUX_PAD, BATCH, CACHE_LAYOUTS as CACHE_LAYOUTS, CACHE_TOKENS, CAPACITY, COUNT_PAD,
+    DENSE_NUM_LAYERS, DSA_NUM_LAYERS,
+    FORWARD_ABI_VERSION as FORWARD_ABI_VERSION, FORWARD_PROGRAMS as FORWARD_PROGRAMS, HC_DIM, KDA_CONV_K,
+    KDA_NUM_LAYERS, KDA_ROWS, KDA_STATE_BLOCKS as KDA_STATE_BLOCKS, KDA_STATE_COLUMNS,
+    LATENT_ROWS, LOCAL_DENSE_INTER, LOGIT_ROWS, LayerRefWeights,
+    MAX_SEQ_LEN, MIX_HC, MLA_STACK_LAYERS as MLA_STACK_LAYERS, MOE_INTER,
+    MOE_STACK_LAYERS as MOE_STACK_LAYERS, NORM_STACK_LAYERS, NUM_LAYERS as NUM_LAYERS, N_LOCAL_EXPERTS,
+    N_RANKS, POOL_AXIS, POOL_STRIDE, POOL_TABLE_MAX, POOL_TABLE_ROWS, PREFILL_MAX_TOKENS, QUERY_ROWS_DYN,
+    Q_LORA, RANKS, RESIDENT_ROUTES_PER_SRC, RESIDENT_TOTAL_CAP, ROUTER_STACK_LAYERS, TABLE_MAX, T_MOE,
+    _complete_forward_stage, _shape_options, _test_mla, _test_router_and_moe,
+    forward_epoch_guard as forward_epoch_guard, forward_geometry as forward_geometry,
+    forward_parameter_names as forward_parameter_names,
+    forward_query_tensor_names as forward_query_tensor_names,
+    forward_tensor_layouts as forward_tensor_layouts, l3_prefill_head_rows,
+    l3_prefill_lm_head_logits as l3_prefill_lm_head_logits, l3_prefill_moe_layer,
+    l3_prefill_mtp_head as l3_prefill_mtp_head, l3_prefill_mtp_prepare as l3_prefill_mtp_prepare,
+    l3_prefill_sparse_attention, prefill_dense_layer, prefill_head_rows,
+    prefill_kda_attention, prefill_lm_head_logits, prefill_moe_layer, prefill_seed, prefill_sparse_attention,
+    reference_layer_forward, synthetic_layer,
+)
 from models.glm5_3_flash.attention import MlaTensors
 from models.glm5_3_flash.config import (
-    BLOCK_SIZE, DENSE_INTER, DP_SIZE as DP_SIZE, EP_SIZE, FLASH, HC_MULT, IMAGE_TOKEN_ID, INDEX_DIM, INDEX_H,
+    BLOCK_SIZE, DENSE_INTER, DP_SIZE as DP_SIZE, EP_SIZE as EP_SIZE, FLASH, HC_MULT, IMAGE_TOKEN_ID, INDEX_DIM, INDEX_H,
     INDEX_KPOOL, INDEX_STATE_WIDTH, KDA_DIM, KPOOL_SELECT_K, KV_LORA, LOCAL_H, LOCAL_KDA_H,
     LOCAL_KDA_QKV_DIM, LOCAL_VOCAB as LOCAL_VOCAB, N_EXPERTS, QK_DIM, SUPPORTED_EP_SIZES, SUPPORTED_TP_SIZES, TP_SIZE,
     V_DIM, AttentionKind, D, Glm53FlashConfig, MlpKind,
@@ -43,27 +65,590 @@ from models.glm5_3_flash.indexer import POOL_SCALE_WIDTH, IndexerTensors, _test_
 from models.glm5_3_flash.kda import (
     BETA_PAD, CHUNK_TILE as CHUNK_TILE, CONV_DIM, STATE_LEN, KdaTensors, _test_kda_cores, kda_host_constants,
 )
-from models.glm5_3_flash.lm_head import FP32_HEAD_VOCAB_PAD as FP32_HEAD_VOCAB_PAD, reference_lm_head_logits as reference_lm_head_logits
+from models.glm5_3_flash.lm_head import FP32_HEAD_VOCAB_PAD as FP32_HEAD_VOCAB_PAD
 from models.glm5_3_flash.mhc import MhcTensors, _test_mhc, combine_streams
-from models.glm5_3_flash.prefill_layer import (
-    BATCH, CACHE_LAYOUTS, CACHE_TOKENS, CAPACITY, DENSE_NUM_LAYERS, DSA_NUM_LAYERS, KDA_NUM_LAYERS,
-    KDA_ROWS, LATENT_BLOCKS, LATENT_ROWS, LOGIT_ROWS, MAX_SEQ_LEN, MLA_STACK_LAYERS as MLA_STACK_LAYERS, MOE_STACK_LAYERS as MOE_STACK_LAYERS,
-    NUM_LAYERS, POOL_AXIS, POOL_STRIDE, POOL_TABLE_MAX, POOL_TABLE_ROWS, PREFILL_MAX_TOKENS, RANKS, T_MOE,
-    TABLE_MAX, LayerRefWeights, _shape_options, _test_mla, _test_router_and_moe, l3_prefill_dense_layer,
-    l3_prefill_head_rows, l3_prefill_kda_attention, l3_prefill_lm_head_logits as l3_prefill_lm_head_logits, l3_prefill_moe_layer,
-    l3_prefill_mtp_head as l3_prefill_mtp_head, l3_prefill_mtp_prepare as l3_prefill_mtp_prepare, l3_prefill_seed, l3_prefill_sparse_attention,
-    reference_layer_forward, synthetic_layer,
-)
 from models.glm5_3_flash.rmsnorm import reference_rms_norm
 from models.glm5_3_flash.utils import (
     _FF_DOWN, _FF_FUSED, _FF_GATE, _FF_UP, ROLES, TEXT_LAYER_ROOTS, Checkpoint, QuantDescription,
-    SharedCachePages, _as_batch_seqs, _assert_close, _find, _pad_to, _prefill_model as _prefill_model, _prefixed,
+    CacheTables, _as_batch_seqs, _assert_close, _find, _pad_to, _prefill_model as _prefill_model, _prefixed,
     _read_quant, _resolve_name, _resolve_top_name, _scale_of, _try_find, _weight_shape,
     build_forward_metadata, build_indexer_chunk_metadata, check_ffn_scales, fuse_gate_up, gather_rows,
     golden_split_kv_b, layer_prefix, layer_prefixes, layer_router, load_shared_expert, load_tensors,
     pack_int8_nz, read_reference_float, scaled_model_from_config, shard_dense_mlp, shard_routed_experts,
     split_kv_b, sylvester_hadamard, unpack_int8_nz,
 )
+
+_inline_prefill_seed = pl.jit.inline(auto_scope=False)(prefill_seed._func)
+
+_inline_prefill_dense_layer = pl.jit.inline(auto_scope=False)(prefill_dense_layer._func)
+
+_inline_prefill_kda_attention = pl.jit.inline(auto_scope=False)(prefill_kda_attention._func)
+
+_inline_prefill_sparse_attention = pl.jit.inline(auto_scope=False)(prefill_sparse_attention._func)
+
+_inline_prefill_moe_layer = pl.jit.inline(auto_scope=False)(prefill_moe_layer._func)
+
+_inline_prefill_head_rows = pl.jit.inline(auto_scope=False)(prefill_head_rows._func)
+
+_inline_prefill_lm_head_logits = pl.jit.inline(auto_scope=False)(prefill_lm_head_logits._func)
+
+
+@pl.jit(auto_scope=False)
+def prefill_hidden_fwd(
+    embedding_rows: pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[BATCH + 1], pl.INT32],
+    kda_state_rows: pl.Tensor[[BATCH, KDA_STATE_COLUMNS], pl.INT32],
+    active_tokens: pl.Tensor[[1], pl.INT32],
+    kda_tri_incl: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_tri_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_head_onehot: pl.Tensor[[LOCAL_KDA_H, BETA_PAD], pl.FP32],
+    kda_eye_wide: pl.Tensor[[CHUNK_TILE, KDA_DIM], pl.FP32],
+    kda_w_q: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_k: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_v: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_conv_q: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_k: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_v: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_w_f_a: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_f_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_g_a: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_g_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_H, D], pl.BF16],
+    kda_dt_bias: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM], pl.FP32],
+    kda_a_log: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_H], pl.FP32],
+    kda_o_norm: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM], pl.BF16],
+    kda_w_o: pl.Tensor[[KDA_NUM_LAYERS, D, LOCAL_KDA_QKV_DIM], pl.BF16],
+    mhc_attn_fn: pl.Tensor[[NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_attn_scale: pl.Tensor[[NUM_LAYERS, 3], pl.FP32],
+    mhc_attn_base: pl.Tensor[[NUM_LAYERS, MIX_HC], pl.FP32],
+    mhc_ffn_fn: pl.Tensor[[NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_ffn_scale: pl.Tensor[[NUM_LAYERS, 3], pl.FP32],
+    mhc_ffn_base: pl.Tensor[[NUM_LAYERS, MIX_HC], pl.FP32],
+    norm_input_norm: pl.Tensor[[NORM_STACK_LAYERS, D], pl.BF16],
+    norm_post_norm: pl.Tensor[[NORM_STACK_LAYERS, D], pl.BF16],
+    dense_w_gate_up: pl.Tensor[[DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER, D], pl.INT8],
+    dense_w_gate_up_scale: pl.Tensor[[DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER], pl.FP32],
+    dense_w_down: pl.Tensor[[DENSE_NUM_LAYERS, D, LOCAL_DENSE_INTER], pl.INT8],
+    dense_w_down_scale: pl.Tensor[[DENSE_NUM_LAYERS, D], pl.FP32],
+    kda_conv_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
+    kda_recurrent_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    ws_attn_pre: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT], pl.FP32]],
+    ws_attn_post: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT], pl.FP32]],
+    ws_attn_res: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT, HC_MULT], pl.FP32]],
+    ws_collapsed: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16]],
+    ws_normed: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16]],
+    ws_attn_partial: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.FP32]],
+    ws_sublayer_out: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16]],
+    ws_x_hc_mid: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT, D], pl.BF16]],
+    ws_ffn_pre: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT], pl.FP32]],
+    ws_ffn_post: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT], pl.FP32]],
+    ws_ffn_res: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, HC_MULT, HC_MULT], pl.FP32]],
+    ws_ffn_input: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16]],
+    ws_ffn_partial: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.FP32]],
+    ws_ffn_out: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.BF16]],
+    kda_out: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    mixed_qkv: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, 3 * LOCAL_KDA_QKV_DIM], pl.BF16]],
+    decay: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_KDA_H, KDA_DIM], pl.FP32]],
+    beta: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, BETA_PAD], pl.FP32]],
+    kda_q: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_k: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_v: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    dense_x_int8: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, D], pl.INT8]],
+    request_ids: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    mla_slots: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    index_slots: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    seg_start: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    pool_count_tok: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    tail_start: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    tail_count: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    kv_len_tok: pl.Tensor[[QUERY_ROWS_DYN], pl.INT32],
+    pool_token_slots: pl.Tensor[[POOL_AXIS, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[POOL_AXIS], pl.INT32],
+    pool_blocks: pl.Tensor[[POOL_AXIS], pl.INT32],
+    block_table: pl.Tensor[[BATCH, TABLE_MAX], pl.INT32],
+    mla_w_q_a: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, D], pl.INT8],
+    mla_w_q_a_scale: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.FP32],
+    mla_q_a_norm: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.BF16],
+    mla_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    mla_w_q_b_scale: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM], pl.FP32],
+    mla_w_kv_a: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA, D], pl.INT8],
+    mla_w_kv_a_scale: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA], pl.FP32],
+    mla_kv_a_norm: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA], pl.BF16],
+    mla_w_k: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
+    mla_w_v: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H, V_DIM, KV_LORA], pl.BF16],
+    mla_w_o: pl.Tensor[[MLA_STACK_LAYERS, D, LOCAL_H * V_DIM], pl.INT8],
+    mla_w_o_scale: pl.Tensor[[MLA_STACK_LAYERS, D], pl.FP32],
+    idx_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
+    idx_w_k: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_k_norm_w: pl.Tensor[[MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_k_norm_b: pl.Tensor[[MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_w_weights: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_H], pl.BF16],
+    idx_w_compress_gate: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_compress_ape: pl.Tensor[[MLA_STACK_LAYERS, INDEX_KPOOL, INDEX_DIM], pl.BF16],
+    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
+    mla_latent_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
+    index_raw_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
+    index_pool_scale: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
+    dsa_query: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_H, QK_DIM], pl.BF16]],
+    attn_out: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, LOCAL_H, V_DIM], pl.BF16]],
+    index_q: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, INDEX_H, INDEX_DIM], pl.BF16]],
+    index_k: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, INDEX_DIM], pl.BF16]],
+    index_scores: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, POOL_AXIS], pl.FP32]],
+    selected_pools: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.InOut[pl.Tensor[[QUERY_ROWS_DYN, KPOOL_SELECT_K], pl.INT32]],
+    router_gate_w: pl.Tensor[[ROUTER_STACK_LAYERS, N_EXPERTS, D], pl.BF16],
+    router_gate_bias: pl.Tensor[[ROUTER_STACK_LAYERS, N_EXPERTS], pl.FP32],
+    moe_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    moe_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    moe_w_down: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    moe_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D], pl.FP32],
+    moe_shared_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER, D], pl.INT8, pl.NZ],
+    moe_shared_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER], pl.FP32],
+    moe_shared_w_down: pl.Tensor[[MOE_STACK_LAYERS, D, MOE_INTER], pl.INT8, pl.NZ],
+    moe_shared_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, D], pl.FP32],
+    logit_row_indices: pl.Tensor[[LOGIT_ROWS], pl.INT32],
+    head_hidden: pl.Out[pl.Tensor[[LOGIT_ROWS, D], pl.BF16]],
+    ws_x_hc_pair: pl.InOut[pl.Tensor[[2 * CAPACITY, HC_MULT, D], pl.BF16]],
+    tp_partial: pld.DistributedTensor[[QUERY_ROWS_DYN, D], pl.FP32],
+    tp_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_x: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    count_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    x_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[RESIDENT_ROUTES_PER_SRC, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    forward_epoch: pl.Scalar[pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+):
+    """Run the complete prefill backbone and gather request-final hidden rows."""
+    current = pl.slice(ws_x_hc_pair, [CAPACITY, HC_MULT, D], [0, 0, 0])
+    _inline_prefill_seed(
+        embedding_rows, current,
+    )
+    for layer in pl.range(NUM_LAYERS):
+        current_offset = (layer % 2) * CAPACITY
+        following_offset = ((layer + 1) % 2) * CAPACITY
+        current = pl.slice(ws_x_hc_pair, [CAPACITY, HC_MULT, D], [current_offset, 0, 0])
+        following = pl.slice(ws_x_hc_pair, [CAPACITY, HC_MULT, D], [following_offset, 0, 0])
+        bb_ord = pl.cast(layer, pl.INT32)
+        kda_ord = pl.cast(layer - layer // 4, pl.INT32)
+        dsa_ord = pl.cast(layer // 4, pl.INT32)
+        dense_ord = pl.cast(layer, pl.INT32)
+        moe_ord = pl.cast(layer - DENSE_NUM_LAYERS, pl.INT32)
+        attn_epoch = forward_epoch * (2 * NUM_LAYERS) + 2 * bb_ord + 1
+        ffn_epoch = attn_epoch + 1
+        moe_epoch = forward_epoch * (NUM_LAYERS - DENSE_NUM_LAYERS) + moe_ord + 1
+        skip_topk = pl.cast(0, pl.INT32)
+        if layer < DENSE_NUM_LAYERS:
+            _inline_prefill_dense_layer(
+                current, query_start_loc, kda_state_rows, active_tokens, kda_tri_incl,
+                kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
+                kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
+                kda_w_f_b, kda_w_g_a, kda_w_g_b, kda_w_b, kda_dt_bias,
+                kda_a_log, kda_o_norm, kda_w_o, mhc_attn_fn, mhc_attn_scale,
+                mhc_attn_base, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base, norm_input_norm,
+                norm_post_norm, dense_w_gate_up, dense_w_gate_up_scale, dense_w_down, dense_w_down_scale,
+                kda_conv_state, kda_recurrent_state, tp_partial, tp_arrived, ws_attn_pre,
+                ws_attn_post, ws_attn_res, ws_collapsed, ws_normed, ws_attn_partial,
+                ws_sublayer_out, ws_x_hc_mid, ws_ffn_pre, ws_ffn_post, ws_ffn_res,
+                ws_ffn_input, ws_ffn_partial, ws_ffn_out, following, kda_out,
+                mixed_qkv, decay, beta, kda_q, kda_k,
+                kda_v, dense_x_int8, bb_ord, kda_ord, dense_ord,
+                rank, attn_epoch, ffn_epoch, CAPACITY,
+            )
+        else:
+            if layer % 4 == 3:
+                _inline_prefill_sparse_attention(
+                    current, request_ids, mla_slots, index_slots, seg_start,
+                    pool_count_tok, tail_start, tail_count, kv_len_tok, pool_token_slots,
+                    pool_slots, pool_blocks, block_table, active_tokens, mla_w_q_a,
+                    mla_w_q_a_scale, mla_q_a_norm, mla_w_q_b, mla_w_q_b_scale, mla_w_kv_a,
+                    mla_w_kv_a_scale, mla_kv_a_norm, mla_w_k, mla_w_v, mla_w_o,
+                    mla_w_o_scale, idx_w_q_b, idx_w_k, idx_k_norm_w, idx_k_norm_b,
+                    idx_w_weights, idx_w_compress_gate, idx_compress_ape, mhc_attn_fn, mhc_attn_scale,
+                    mhc_attn_base, norm_input_norm, hadamard, mla_latent_cache, index_raw_cache,
+                    index_pool_cache, index_pool_scale, tp_partial, tp_arrived, ws_attn_pre,
+                    ws_attn_post, ws_attn_res, ws_collapsed, ws_normed, ws_attn_partial,
+                    ws_sublayer_out, ws_x_hc_mid, dsa_query, attn_out, index_q,
+                    index_k, index_scores, selected_pools, selected_valid, bb_ord,
+                    dsa_ord, rank, attn_epoch, skip_topk, CAPACITY,
+                )
+            else:
+                _inline_prefill_kda_attention(
+                    current, query_start_loc, kda_state_rows, active_tokens, kda_tri_incl,
+                    kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
+                    kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
+                    kda_w_f_b, kda_w_g_a, kda_w_g_b, kda_w_b, kda_dt_bias,
+                    kda_a_log, kda_o_norm, kda_w_o, mhc_attn_fn, mhc_attn_scale,
+                    mhc_attn_base, norm_input_norm, kda_conv_state, kda_recurrent_state, tp_partial,
+                    tp_arrived, ws_attn_pre, ws_attn_post, ws_attn_res, ws_collapsed,
+                    ws_normed, ws_attn_partial, ws_sublayer_out, ws_x_hc_mid, kda_out,
+                    mixed_qkv, decay, beta, kda_q, kda_k,
+                    kda_v, bb_ord, kda_ord, rank, attn_epoch,
+                    CAPACITY,
+                )
+            _complete_forward_stage(ws_x_hc_mid)
+            _inline_prefill_moe_layer(
+                ws_x_hc_mid, active_tokens, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base,
+                norm_post_norm, router_gate_w, router_gate_bias, moe_w_gate_up, moe_w_gate_up_scale,
+                moe_w_down, moe_w_down_scale, moe_shared_w_gate_up, moe_shared_w_gate_up_scale, moe_shared_w_down,
+                moe_shared_w_down_scale, lane_x, lane_aux, lane_count, count_ready,
+                x_ready, slot_out, return_ready, tp_partial, tp_arrived,
+                ws_ffn_pre, ws_ffn_post, ws_ffn_res, ws_ffn_input, ws_ffn_partial,
+                ws_ffn_out, following, bb_ord, moe_ord, rank,
+                moe_epoch, ffn_epoch,
+            )
+        _complete_forward_stage(following)
+    current = pl.slice(ws_x_hc_pair, [CAPACITY, HC_MULT, D], [(NUM_LAYERS % 2) * CAPACITY, 0, 0])
+    _inline_prefill_head_rows(
+        current, logit_row_indices, head_hidden,
+    )
+    return head_hidden
+
+
+_inline_prefill_hidden_fwd = pl.jit.inline(auto_scope=False)(prefill_hidden_fwd._func)
+
+
+@pl.jit(auto_scope=False)
+def prefill_fwd(
+    embedding_rows: pl.Tensor[[CAPACITY, D], pl.BF16],
+    query_start_loc: pl.Tensor[[BATCH + 1], pl.INT32],
+    kda_state_rows: pl.Tensor[[BATCH, KDA_STATE_COLUMNS], pl.INT32],
+    active_tokens: pl.Tensor[[1], pl.INT32],
+    kda_tri_incl: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_tri_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_head_onehot: pl.Tensor[[LOCAL_KDA_H, BETA_PAD], pl.FP32],
+    kda_eye_wide: pl.Tensor[[CHUNK_TILE, KDA_DIM], pl.FP32],
+    kda_w_q: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_k: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_v: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_conv_q: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_k: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_v: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_w_f_a: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_f_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_g_a: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_g_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_b: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_H, D], pl.BF16],
+    kda_dt_bias: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM], pl.FP32],
+    kda_a_log: pl.Tensor[[KDA_NUM_LAYERS, LOCAL_KDA_H], pl.FP32],
+    kda_o_norm: pl.Tensor[[KDA_NUM_LAYERS, KDA_DIM], pl.BF16],
+    kda_w_o: pl.Tensor[[KDA_NUM_LAYERS, D, LOCAL_KDA_QKV_DIM], pl.BF16],
+    mhc_attn_fn: pl.Tensor[[NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_attn_scale: pl.Tensor[[NUM_LAYERS, 3], pl.FP32],
+    mhc_attn_base: pl.Tensor[[NUM_LAYERS, MIX_HC], pl.FP32],
+    mhc_ffn_fn: pl.Tensor[[NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_ffn_scale: pl.Tensor[[NUM_LAYERS, 3], pl.FP32],
+    mhc_ffn_base: pl.Tensor[[NUM_LAYERS, MIX_HC], pl.FP32],
+    norm_input_norm: pl.Tensor[[NORM_STACK_LAYERS, D], pl.BF16],
+    norm_post_norm: pl.Tensor[[NORM_STACK_LAYERS, D], pl.BF16],
+    dense_w_gate_up: pl.Tensor[[DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER, D], pl.INT8],
+    dense_w_gate_up_scale: pl.Tensor[[DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER], pl.FP32],
+    dense_w_down: pl.Tensor[[DENSE_NUM_LAYERS, D, LOCAL_DENSE_INTER], pl.INT8],
+    dense_w_down_scale: pl.Tensor[[DENSE_NUM_LAYERS, D], pl.FP32],
+    kda_conv_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
+    kda_recurrent_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    ws_attn_pre: pl.InOut[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
+    ws_attn_post: pl.InOut[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
+    ws_attn_res: pl.InOut[pl.Tensor[[CAPACITY, HC_MULT, HC_MULT], pl.FP32]],
+    ws_collapsed: pl.InOut[pl.Tensor[[CAPACITY, D], pl.BF16]],
+    ws_normed: pl.InOut[pl.Tensor[[CAPACITY, D], pl.BF16]],
+    ws_attn_partial: pl.InOut[pl.Tensor[[CAPACITY, D], pl.FP32]],
+    ws_sublayer_out: pl.InOut[pl.Tensor[[CAPACITY, D], pl.BF16]],
+    ws_x_hc_mid: pl.InOut[pl.Tensor[[CAPACITY, HC_MULT, D], pl.BF16]],
+    ws_ffn_pre: pl.InOut[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
+    ws_ffn_post: pl.InOut[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
+    ws_ffn_res: pl.InOut[pl.Tensor[[CAPACITY, HC_MULT, HC_MULT], pl.FP32]],
+    ws_ffn_input: pl.InOut[pl.Tensor[[CAPACITY, D], pl.BF16]],
+    ws_ffn_partial: pl.InOut[pl.Tensor[[CAPACITY, D], pl.FP32]],
+    ws_ffn_out: pl.InOut[pl.Tensor[[CAPACITY, D], pl.BF16]],
+    kda_out: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    mixed_qkv: pl.InOut[pl.Tensor[[CAPACITY, 3 * LOCAL_KDA_QKV_DIM], pl.BF16]],
+    decay: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.FP32]],
+    beta: pl.InOut[pl.Tensor[[CAPACITY, BETA_PAD], pl.FP32]],
+    kda_q: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_k: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_v: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    dense_x_int8: pl.InOut[pl.Tensor[[CAPACITY, D], pl.INT8]],
+    request_ids: pl.Tensor[[CAPACITY], pl.INT32],
+    mla_slots: pl.Tensor[[CAPACITY], pl.INT32],
+    index_slots: pl.Tensor[[CAPACITY], pl.INT32],
+    seg_start: pl.Tensor[[CAPACITY], pl.INT32],
+    pool_count_tok: pl.Tensor[[CAPACITY], pl.INT32],
+    tail_start: pl.Tensor[[CAPACITY], pl.INT32],
+    tail_count: pl.Tensor[[CAPACITY], pl.INT32],
+    kv_len_tok: pl.Tensor[[CAPACITY], pl.INT32],
+    pool_token_slots: pl.Tensor[[POOL_AXIS, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[POOL_AXIS], pl.INT32],
+    pool_blocks: pl.Tensor[[POOL_AXIS], pl.INT32],
+    block_table: pl.Tensor[[BATCH, TABLE_MAX], pl.INT32],
+    mla_w_q_a: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, D], pl.INT8],
+    mla_w_q_a_scale: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.FP32],
+    mla_q_a_norm: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.BF16],
+    mla_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    mla_w_q_b_scale: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H * QK_DIM], pl.FP32],
+    mla_w_kv_a: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA, D], pl.INT8],
+    mla_w_kv_a_scale: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA], pl.FP32],
+    mla_kv_a_norm: pl.Tensor[[MLA_STACK_LAYERS, KV_LORA], pl.BF16],
+    mla_w_k: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
+    mla_w_v: pl.Tensor[[MLA_STACK_LAYERS, LOCAL_H, V_DIM, KV_LORA], pl.BF16],
+    mla_w_o: pl.Tensor[[MLA_STACK_LAYERS, D, LOCAL_H * V_DIM], pl.INT8],
+    mla_w_o_scale: pl.Tensor[[MLA_STACK_LAYERS, D], pl.FP32],
+    idx_w_q_b: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
+    idx_w_k: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_k_norm_w: pl.Tensor[[MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_k_norm_b: pl.Tensor[[MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_w_weights: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_H], pl.BF16],
+    idx_w_compress_gate: pl.Tensor[[MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_compress_ape: pl.Tensor[[MLA_STACK_LAYERS, INDEX_KPOOL, INDEX_DIM], pl.BF16],
+    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
+    mla_latent_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
+    index_raw_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
+    index_pool_scale: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
+    dsa_query: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_H, QK_DIM], pl.BF16]],
+    attn_out: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_H, V_DIM], pl.BF16]],
+    index_q: pl.InOut[pl.Tensor[[CAPACITY, INDEX_H, INDEX_DIM], pl.BF16]],
+    index_k: pl.InOut[pl.Tensor[[CAPACITY, INDEX_DIM], pl.BF16]],
+    index_scores: pl.InOut[pl.Tensor[[CAPACITY, POOL_AXIS], pl.FP32]],
+    selected_pools: pl.InOut[pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.InOut[pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32]],
+    router_gate_w: pl.Tensor[[ROUTER_STACK_LAYERS, N_EXPERTS, D], pl.BF16],
+    router_gate_bias: pl.Tensor[[ROUTER_STACK_LAYERS, N_EXPERTS], pl.FP32],
+    moe_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    moe_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    moe_w_down: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    moe_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D], pl.FP32],
+    moe_shared_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER, D], pl.INT8, pl.NZ],
+    moe_shared_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER], pl.FP32],
+    moe_shared_w_down: pl.Tensor[[MOE_STACK_LAYERS, D, MOE_INTER], pl.INT8, pl.NZ],
+    moe_shared_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, D], pl.FP32],
+    logit_row_indices: pl.Tensor[[LOGIT_ROWS], pl.INT32],
+    head_hidden: pl.Out[pl.Tensor[[LOGIT_ROWS, D], pl.BF16]],
+    ws_x_hc_pair: pl.InOut[pl.Tensor[[2 * CAPACITY, HC_MULT, D], pl.BF16]],
+    final_norm: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Out[pl.Tensor[[BATCH, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+    tp_partial: pld.DistributedTensor[[QUERY_ROWS_DYN, D], pl.FP32],
+    tp_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    lane_x: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    count_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    x_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[RESIDENT_ROUTES_PER_SRC, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    forward_epoch: pl.Scalar[pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+):
+    """Run a complete prefill step with device logits."""
+    _inline_prefill_hidden_fwd(
+        embedding_rows, query_start_loc, kda_state_rows, active_tokens, kda_tri_incl,
+        kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
+        kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
+        kda_w_f_b, kda_w_g_a, kda_w_g_b, kda_w_b, kda_dt_bias,
+        kda_a_log, kda_o_norm, kda_w_o, mhc_attn_fn, mhc_attn_scale,
+        mhc_attn_base, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base, norm_input_norm,
+        norm_post_norm, dense_w_gate_up, dense_w_gate_up_scale, dense_w_down, dense_w_down_scale,
+        kda_conv_state, kda_recurrent_state, ws_attn_pre, ws_attn_post, ws_attn_res,
+        ws_collapsed, ws_normed, ws_attn_partial, ws_sublayer_out, ws_x_hc_mid,
+        ws_ffn_pre, ws_ffn_post, ws_ffn_res, ws_ffn_input, ws_ffn_partial,
+        ws_ffn_out, kda_out, mixed_qkv, decay, beta,
+        kda_q, kda_k, kda_v, dense_x_int8, request_ids,
+        mla_slots, index_slots, seg_start, pool_count_tok, tail_start,
+        tail_count, kv_len_tok, pool_token_slots, pool_slots, pool_blocks,
+        block_table, mla_w_q_a, mla_w_q_a_scale, mla_q_a_norm, mla_w_q_b,
+        mla_w_q_b_scale, mla_w_kv_a, mla_w_kv_a_scale, mla_kv_a_norm, mla_w_k,
+        mla_w_v, mla_w_o, mla_w_o_scale, idx_w_q_b, idx_w_k,
+        idx_k_norm_w, idx_k_norm_b, idx_w_weights, idx_w_compress_gate, idx_compress_ape,
+        hadamard, mla_latent_cache, index_raw_cache, index_pool_cache, index_pool_scale,
+        dsa_query, attn_out, index_q, index_k, index_scores,
+        selected_pools, selected_valid, router_gate_w, router_gate_bias, moe_w_gate_up,
+        moe_w_gate_up_scale, moe_w_down, moe_w_down_scale, moe_shared_w_gate_up, moe_shared_w_gate_up_scale,
+        moe_shared_w_down, moe_shared_w_down_scale, logit_row_indices, head_hidden, ws_x_hc_pair,
+        tp_partial, tp_arrived, lane_x, lane_aux, lane_count,
+        count_ready, x_ready, slot_out, return_ready, forward_epoch,
+        rank,
+    )
+    _inline_prefill_lm_head_logits(
+        head_hidden, final_norm, lm_head_weight, logits,
+    )
+    return logits
+
+
+@pl.jit.host
+def l3_prefill_fwd(
+    embedding_rows: pl.Tensor[[RANKS, CAPACITY, D], pl.BF16],
+    query_start_loc: pl.Tensor[[RANKS, BATCH + 1], pl.INT32],
+    kda_state_rows: pl.Tensor[[RANKS, BATCH, KDA_STATE_COLUMNS], pl.INT32],
+    active_tokens: pl.Tensor[[RANKS, 1], pl.INT32],
+    kda_tri_incl: pl.Tensor[[RANKS, CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_tri_strict: pl.Tensor[[RANKS, CHUNK_TILE, CHUNK_TILE], pl.FP32],
+    kda_head_onehot: pl.Tensor[[RANKS, LOCAL_KDA_H, BETA_PAD], pl.FP32],
+    kda_eye_wide: pl.Tensor[[RANKS, CHUNK_TILE, KDA_DIM], pl.FP32],
+    kda_w_q: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_k: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_w_v: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, D], pl.BF16],
+    kda_conv_q: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_k: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_conv_v: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, 1, KDA_CONV_K], pl.BF16],
+    kda_w_f_a: pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_f_b: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_g_a: pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_DIM, D], pl.BF16],
+    kda_w_g_b: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM, KDA_DIM], pl.BF16],
+    kda_w_b: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_H, D], pl.BF16],
+    kda_dt_bias: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_QKV_DIM], pl.FP32],
+    kda_a_log: pl.Tensor[[RANKS, KDA_NUM_LAYERS, LOCAL_KDA_H], pl.FP32],
+    kda_o_norm: pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_DIM], pl.BF16],
+    kda_w_o: pl.Tensor[[RANKS, KDA_NUM_LAYERS, D, LOCAL_KDA_QKV_DIM], pl.BF16],
+    mhc_attn_fn: pl.Tensor[[RANKS, NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_attn_scale: pl.Tensor[[RANKS, NUM_LAYERS, 3], pl.FP32],
+    mhc_attn_base: pl.Tensor[[RANKS, NUM_LAYERS, MIX_HC], pl.FP32],
+    mhc_ffn_fn: pl.Tensor[[RANKS, NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
+    mhc_ffn_scale: pl.Tensor[[RANKS, NUM_LAYERS, 3], pl.FP32],
+    mhc_ffn_base: pl.Tensor[[RANKS, NUM_LAYERS, MIX_HC], pl.FP32],
+    norm_input_norm: pl.Tensor[[RANKS, NORM_STACK_LAYERS, D], pl.BF16],
+    norm_post_norm: pl.Tensor[[RANKS, NORM_STACK_LAYERS, D], pl.BF16],
+    dense_w_gate_up: pl.Tensor[[RANKS, DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER, D], pl.INT8],
+    dense_w_gate_up_scale: pl.Tensor[[RANKS, DENSE_NUM_LAYERS, 2 * LOCAL_DENSE_INTER], pl.FP32],
+    dense_w_down: pl.Tensor[[RANKS, DENSE_NUM_LAYERS, D, LOCAL_DENSE_INTER], pl.INT8],
+    dense_w_down_scale: pl.Tensor[[RANKS, DENSE_NUM_LAYERS, D], pl.FP32],
+    kda_conv_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
+    kda_recurrent_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    ws_attn_pre: pl.InOut[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
+    ws_attn_post: pl.InOut[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
+    ws_attn_res: pl.InOut[pl.Tensor[[RANKS, CAPACITY, HC_MULT, HC_MULT], pl.FP32]],
+    ws_collapsed: pl.InOut[pl.Tensor[[RANKS, CAPACITY, D], pl.BF16]],
+    ws_normed: pl.InOut[pl.Tensor[[RANKS, CAPACITY, D], pl.BF16]],
+    ws_attn_partial: pl.InOut[pl.Tensor[[RANKS, CAPACITY, D], pl.FP32]],
+    ws_sublayer_out: pl.InOut[pl.Tensor[[RANKS, CAPACITY, D], pl.BF16]],
+    ws_x_hc_mid: pl.InOut[pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.BF16]],
+    ws_ffn_pre: pl.InOut[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
+    ws_ffn_post: pl.InOut[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
+    ws_ffn_res: pl.InOut[pl.Tensor[[RANKS, CAPACITY, HC_MULT, HC_MULT], pl.FP32]],
+    ws_ffn_input: pl.InOut[pl.Tensor[[RANKS, CAPACITY, D], pl.BF16]],
+    ws_ffn_partial: pl.InOut[pl.Tensor[[RANKS, CAPACITY, D], pl.FP32]],
+    ws_ffn_out: pl.InOut[pl.Tensor[[RANKS, CAPACITY, D], pl.BF16]],
+    kda_out: pl.InOut[pl.Tensor[[RANKS, CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    mixed_qkv: pl.InOut[pl.Tensor[[RANKS, CAPACITY, 3 * LOCAL_KDA_QKV_DIM], pl.BF16]],
+    decay: pl.InOut[pl.Tensor[[RANKS, CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.FP32]],
+    beta: pl.InOut[pl.Tensor[[RANKS, CAPACITY, BETA_PAD], pl.FP32]],
+    kda_q: pl.InOut[pl.Tensor[[RANKS, CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_k: pl.InOut[pl.Tensor[[RANKS, CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    kda_v: pl.InOut[pl.Tensor[[RANKS, CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    dense_x_int8: pl.InOut[pl.Tensor[[RANKS, CAPACITY, D], pl.INT8]],
+    request_ids: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    mla_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    index_slots: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    seg_start: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    pool_count_tok: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    tail_start: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    tail_count: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    kv_len_tok: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
+    pool_token_slots: pl.Tensor[[RANKS, POOL_AXIS, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[RANKS, POOL_AXIS], pl.INT32],
+    pool_blocks: pl.Tensor[[RANKS, POOL_AXIS], pl.INT32],
+    block_table: pl.Tensor[[RANKS, BATCH, TABLE_MAX], pl.INT32],
+    mla_w_q_a: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA, D], pl.INT8],
+    mla_w_q_a_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA], pl.FP32],
+    mla_q_a_norm: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA], pl.BF16],
+    mla_w_q_b: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H * QK_DIM, Q_LORA], pl.INT8],
+    mla_w_q_b_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H * QK_DIM], pl.FP32],
+    mla_w_kv_a: pl.Tensor[[RANKS, MLA_STACK_LAYERS, KV_LORA, D], pl.INT8],
+    mla_w_kv_a_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, KV_LORA], pl.FP32],
+    mla_kv_a_norm: pl.Tensor[[RANKS, MLA_STACK_LAYERS, KV_LORA], pl.BF16],
+    mla_w_k: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
+    mla_w_v: pl.Tensor[[RANKS, MLA_STACK_LAYERS, LOCAL_H, V_DIM, KV_LORA], pl.BF16],
+    mla_w_o: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, LOCAL_H * V_DIM], pl.INT8],
+    mla_w_o_scale: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D], pl.FP32],
+    idx_w_q_b: pl.Tensor[[RANKS, MLA_STACK_LAYERS, Q_LORA, INDEX_H * INDEX_DIM], pl.BF16],
+    idx_w_k: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_k_norm_w: pl.Tensor[[RANKS, MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_k_norm_b: pl.Tensor[[RANKS, MLA_STACK_LAYERS, INDEX_DIM], pl.BF16],
+    idx_w_weights: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, INDEX_H], pl.BF16],
+    idx_w_compress_gate: pl.Tensor[[RANKS, MLA_STACK_LAYERS, D, INDEX_DIM], pl.BF16],
+    idx_compress_ape: pl.Tensor[[RANKS, MLA_STACK_LAYERS, INDEX_KPOOL, INDEX_DIM], pl.BF16],
+    hadamard: pl.Tensor[[RANKS, INDEX_DIM, INDEX_DIM], pl.BF16],
+    mla_latent_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
+    index_raw_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
+    index_pool_scale: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
+    dsa_query: pl.InOut[pl.Tensor[[RANKS, CAPACITY, LOCAL_H, QK_DIM], pl.BF16]],
+    attn_out: pl.InOut[pl.Tensor[[RANKS, CAPACITY, LOCAL_H, V_DIM], pl.BF16]],
+    index_q: pl.InOut[pl.Tensor[[RANKS, CAPACITY, INDEX_H, INDEX_DIM], pl.BF16]],
+    index_k: pl.InOut[pl.Tensor[[RANKS, CAPACITY, INDEX_DIM], pl.BF16]],
+    index_scores: pl.InOut[pl.Tensor[[RANKS, CAPACITY, POOL_AXIS], pl.FP32]],
+    selected_pools: pl.InOut[pl.Tensor[[RANKS, CAPACITY, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.InOut[pl.Tensor[[RANKS, CAPACITY, KPOOL_SELECT_K], pl.INT32]],
+    router_gate_w: pl.Tensor[[RANKS, ROUTER_STACK_LAYERS, N_EXPERTS, D], pl.BF16],
+    router_gate_bias: pl.Tensor[[RANKS, ROUTER_STACK_LAYERS, N_EXPERTS], pl.FP32],
+    moe_w_gate_up: pl.Tensor[[RANKS, MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    moe_w_gate_up_scale: pl.Tensor[[RANKS, MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    moe_w_down: pl.Tensor[[RANKS, MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    moe_w_down_scale: pl.Tensor[[RANKS, MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D], pl.FP32],
+    moe_shared_w_gate_up: pl.Tensor[[RANKS, MOE_STACK_LAYERS, 2 * MOE_INTER, D], pl.INT8],
+    moe_shared_w_gate_up_scale: pl.Tensor[[RANKS, MOE_STACK_LAYERS, 2 * MOE_INTER], pl.FP32],
+    moe_shared_w_down: pl.Tensor[[RANKS, MOE_STACK_LAYERS, D, MOE_INTER], pl.INT8],
+    moe_shared_w_down_scale: pl.Tensor[[RANKS, MOE_STACK_LAYERS, D], pl.FP32],
+    logit_row_indices: pl.Tensor[[RANKS, LOGIT_ROWS], pl.INT32],
+    head_hidden: pl.Out[pl.Tensor[[RANKS, LOGIT_ROWS, D], pl.BF16]],
+    ws_x_hc_pair: pl.InOut[pl.Tensor[[RANKS, 2 * CAPACITY, HC_MULT, D], pl.BF16]],
+    final_norm: pl.Tensor[[RANKS, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[RANKS, FP32_HEAD_VOCAB_PAD, D], pl.FP32],
+    logits: pl.Out[pl.Tensor[[RANKS, BATCH, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+    forward_epoch: pl.Scalar[pl.INT32],
+):
+    """Launch one complete prefill orchestration per rank."""
+    tp_partial_buffer = pld.alloc_window_buffer([CAPACITY, D], dtype=pl.FP32)
+    tp_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    lane_x_buffer = pld.alloc_window_buffer([RESIDENT_TOTAL_CAP, D], dtype=pl.INT8)
+    lane_aux_buffer = pld.alloc_window_buffer([RESIDENT_TOTAL_CAP, AUX_PAD], dtype=pl.FP32)
+    lane_count_buffer = pld.alloc_window_buffer([N_RANKS, COUNT_PAD], dtype=pl.INT32)
+    count_ready_buffer = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    x_ready_buffer = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    slot_out_buffer = pld.alloc_window_buffer([RESIDENT_ROUTES_PER_SRC, D], dtype=pl.FP32)
+    return_ready_buffer = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    for rank in pl.range(pld.world_size()):
+        tp_partial = pld.window(tp_partial_buffer, [CAPACITY, D], dtype=pl.FP32)
+        tp_arrived = pld.window(tp_arrived_buffer, [EP_SIZE, 1], dtype=pl.INT32)
+        lane_x = pld.window(lane_x_buffer, [RESIDENT_TOTAL_CAP, D], dtype=pl.INT8)
+        lane_aux = pld.window(lane_aux_buffer, [RESIDENT_TOTAL_CAP, AUX_PAD], dtype=pl.FP32)
+        lane_count = pld.window(lane_count_buffer, [N_RANKS, COUNT_PAD], dtype=pl.INT32)
+        count_ready = pld.window(count_ready_buffer, [N_RANKS, 1], dtype=pl.INT32)
+        x_ready = pld.window(x_ready_buffer, [N_RANKS, 1], dtype=pl.INT32)
+        slot_out = pld.window(slot_out_buffer, [RESIDENT_ROUTES_PER_SRC, D], dtype=pl.FP32)
+        return_ready = pld.window(return_ready_buffer, [N_RANKS, 1], dtype=pl.INT32)
+        prefill_fwd(
+            embedding_rows[rank], query_start_loc[rank], kda_state_rows[rank], active_tokens[rank], kda_tri_incl[rank],
+            kda_tri_strict[rank], kda_head_onehot[rank], kda_eye_wide[rank], kda_w_q[rank], kda_w_k[rank],
+            kda_w_v[rank], kda_conv_q[rank], kda_conv_k[rank], kda_conv_v[rank], kda_w_f_a[rank],
+            kda_w_f_b[rank], kda_w_g_a[rank], kda_w_g_b[rank], kda_w_b[rank], kda_dt_bias[rank],
+            kda_a_log[rank], kda_o_norm[rank], kda_w_o[rank], mhc_attn_fn[rank], mhc_attn_scale[rank],
+            mhc_attn_base[rank], mhc_ffn_fn[rank], mhc_ffn_scale[rank], mhc_ffn_base[rank], norm_input_norm[rank],
+            norm_post_norm[rank], dense_w_gate_up[rank], dense_w_gate_up_scale[rank], dense_w_down[rank], dense_w_down_scale[rank],
+            kda_conv_state[rank], kda_recurrent_state[rank], ws_attn_pre[rank], ws_attn_post[rank], ws_attn_res[rank],
+            ws_collapsed[rank], ws_normed[rank], ws_attn_partial[rank], ws_sublayer_out[rank], ws_x_hc_mid[rank],
+            ws_ffn_pre[rank], ws_ffn_post[rank], ws_ffn_res[rank], ws_ffn_input[rank], ws_ffn_partial[rank],
+            ws_ffn_out[rank], kda_out[rank], mixed_qkv[rank], decay[rank], beta[rank],
+            kda_q[rank], kda_k[rank], kda_v[rank], dense_x_int8[rank], request_ids[rank],
+            mla_slots[rank], index_slots[rank], seg_start[rank], pool_count_tok[rank], tail_start[rank],
+            tail_count[rank], kv_len_tok[rank], pool_token_slots[rank], pool_slots[rank], pool_blocks[rank],
+            block_table[rank], mla_w_q_a[rank], mla_w_q_a_scale[rank], mla_q_a_norm[rank], mla_w_q_b[rank],
+            mla_w_q_b_scale[rank], mla_w_kv_a[rank], mla_w_kv_a_scale[rank], mla_kv_a_norm[rank], mla_w_k[rank],
+            mla_w_v[rank], mla_w_o[rank], mla_w_o_scale[rank], idx_w_q_b[rank], idx_w_k[rank],
+            idx_k_norm_w[rank], idx_k_norm_b[rank], idx_w_weights[rank], idx_w_compress_gate[rank], idx_compress_ape[rank],
+            hadamard[rank], mla_latent_cache[rank], index_raw_cache[rank], index_pool_cache[rank], index_pool_scale[rank],
+            dsa_query[rank], attn_out[rank], index_q[rank], index_k[rank], index_scores[rank],
+            selected_pools[rank], selected_valid[rank], router_gate_w[rank], router_gate_bias[rank], moe_w_gate_up[rank],
+            moe_w_gate_up_scale[rank], moe_w_down[rank], moe_w_down_scale[rank], moe_shared_w_gate_up[rank], moe_shared_w_gate_up_scale[rank],
+            moe_shared_w_down[rank], moe_shared_w_down_scale[rank], logit_row_indices[rank], head_hidden[rank], ws_x_hc_pair[rank],
+            final_norm[rank], lm_head_weight[rank], logits[rank], tp_partial, tp_arrived,
+            lane_x, lane_aux, lane_count, count_ready, x_ready,
+            slot_out, return_ready, forward_epoch, rank, device=rank,
+        )
+
 
 if CACHE_TOKENS <= 0 or CACHE_TOKENS % C.BLOCK_SIZE:
     raise ValueError(f"--cache-tokens must be positive and aligned to {C.BLOCK_SIZE}")
@@ -98,11 +683,7 @@ _RESET_CONV_TILE = gcd(4096, _RESET_CONV_ELEMENTS)
 _RESET_CONV_LANE_TILE = min(4, _RESET_CONV_ELEMENTS // _RESET_CONV_TILE)
 _RESET_RECURRENT_TILE = gcd(4096, _RESET_RECURRENT_ELEMENTS)
 _RESET_RECURRENT_LANE_TILE = min(4, _RESET_RECURRENT_ELEMENTS // _RESET_RECURRENT_TILE)
-PREFIX_SNAPSHOT_ENTRIES = 2
-_PREFIX_COPY_TILE = 1024
-_PREFIX_COPY_LANE_TILE = 16
-_PREFIX_SCALE_TILE = min(_PREFIX_COPY_TILE, BLOCK_SIZE // INDEX_KPOOL * POOL_SCALE_WIDTH)
-CONSTANT_STEP_INPUTS = {"kda_tri_incl", "kda_tri_strict", "kda_head_onehot", "kda_eye_wide", "kda_state_rows"}
+CONSTANT_STEP_INPUTS = {"kda_tri_incl", "kda_tri_strict", "kda_head_onehot", "kda_eye_wide"}
 
 _FAMILY_PREFIX = {
     "kda": "self_attn.",
@@ -113,38 +694,6 @@ _FAMILY_PREFIX = {
     "router": "mlp.",
 }
 
-RT_PROGRAMS = (
-    "seed", "dense", "kda_attn", "dsa_attn", "moe_ffn",
-    "head",
-)
-X_H_PINGPONG = ("ws_x_hc_a", "ws_x_hc_b")
-GLM_TENSORS = (
-    "embedding_rows", "query_start_loc", "request_ids",
-    "mla_slots", "index_slots", "kda_state_rows", "seg_start",
-    "pool_count_tok", "tail_start", "tail_count", "kv_len_tok",
-    "pool_token_slots", "pool_slots", "pool_blocks",
-    "block_table", "cache_page_owners", "logit_row_indices",
-    "active_tokens", "kda_tri_incl", "kda_tri_strict", "kda_head_onehot", "kda_eye_wide", "kda_w_q",
-    "kda_w_k", "kda_w_v", "kda_conv_q", "kda_conv_k", "kda_conv_v", "kda_w_f_a", "kda_w_f_b", "kda_w_g_a",
-    "kda_w_g_b", "kda_w_b", "kda_dt_bias", "kda_a_log", "kda_o_norm", "kda_w_o",
-    "mla_w_q_a", "mla_w_q_a_scale", "mla_q_a_norm", "mla_w_q_b", "mla_w_q_b_scale", "mla_w_kv_a",
-    "mla_w_kv_a_scale", "mla_kv_a_norm", "mla_w_k", "mla_w_v", "mla_w_o", "mla_w_o_scale",
-    "idx_w_q_b", "idx_w_k", "idx_k_norm_w", "idx_k_norm_b", "idx_w_weights", "idx_w_compress_gate",
-    "idx_compress_ape", "mhc_attn_fn", "mhc_attn_scale", "mhc_attn_base", "mhc_ffn_fn", "mhc_ffn_scale",
-    "mhc_ffn_base", "norm_input_norm", "norm_post_norm",
-    "router_gate_w", "router_gate_bias", "moe_w_gate_up", "moe_w_gate_up_scale", "moe_w_down",
-    "moe_w_down_scale", "moe_shared_w_gate_up", "moe_shared_w_gate_up_scale", "moe_shared_w_down",
-    "moe_shared_w_down_scale", "dense_w_gate_up", "dense_w_gate_up_scale", "dense_w_down",
-    "dense_w_down_scale", "hadamard", "mla_latent_cache",
-    "index_raw_cache", "index_pool_cache", "index_pool_scale",
-    "kda_conv_state", "kda_recurrent_state", "ws_attn_pre", "ws_attn_post", "ws_attn_res", "ws_collapsed",
-    "ws_normed", "ws_attn_partial", "ws_sublayer_out", "ws_ffn_pre", "ws_ffn_post", "ws_ffn_res",
-    "ws_ffn_input", "ws_ffn_partial", "ws_ffn_out", "ws_x_hc_a", "ws_x_hc_b",
-    "kda_out", "dsa_query", "attn_out", "index_q", "index_k", "index_scores",
-    "selected_pools", "selected_valid", "mixed_qkv",
-    "decay", "beta", "kda_q", "kda_k", "kda_v", "dense_x_int8",
-    "head_hidden",
-)
 GLM_WEIGHT_STACKS = (
     ("kda_w_q", "kda.w_q"),
     ("kda_w_k", "kda.w_k"),
@@ -299,262 +848,8 @@ INTERNAL_DUMP_KEYS = (
 )
 
 MTP_SPEC_TOKENS = 3
-PREFIX_CACHE_FAMILIES = (
-    "mla_latent_cache", "index_raw_cache", "index_pool_cache", "index_pool_scale",
-    "kda_conv_state", "kda_recurrent_state",
-)
-PREFIX_SNAPSHOT_LAYOUTS = {
-    "mla_latent_cache": ((PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_MLA_ELEMENTS), torch.bfloat16),
-    "index_raw_cache": ((PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_RAW_ELEMENTS), torch.float32),
-    "index_pool_cache": ((PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_POOL_ELEMENTS), torch.int8),
-    "index_pool_scale": ((PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_SCALE_ELEMENTS), torch.float32),
-    "kda_conv_state": ((PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS), torch.bfloat16),
-    "kda_recurrent_state": (
-        (PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_RECURRENT_ELEMENTS),
-        torch.float32,
-    ),
-}
-PREFIX_SNAPSHOT_BYTES = sum(
-    (shape[1] * shape[2] * torch.empty((), dtype=dtype).element_size() for (shape, dtype) in PREFIX_SNAPSHOT_LAYOUTS.values()),
-)
 VERIFY_X_H_C = os.environ.get("GLM53_PREFILL_VERIFY_XHC", "") == "1"
 TRACE_DISPATCH = os.environ.get("GLM53_PREFILL_TRACE_DISPATCH", "") == "1"
-
-
-@pl.jit(auto_scope=False)
-def copy_request_snapshot(
-    mla_latent_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
-    index_raw_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
-    index_pool_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
-    index_pool_scale: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
-    kda_conv_state: pl.InOut[pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
-    kda_recurrent_state: pl.InOut[
-        pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]
-    ],
-    bank_mla_latent_cache: pl.InOut[
-        pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_MLA_ELEMENTS], pl.BF16]
-    ],
-    bank_index_raw_cache: pl.InOut[
-        pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_RAW_ELEMENTS], pl.FP32]
-    ],
-    bank_index_pool_cache: pl.InOut[
-        pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_POOL_ELEMENTS], pl.INT8]
-    ],
-    bank_index_pool_scale: pl.InOut[
-        pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_SCALE_ELEMENTS], pl.FP32]
-    ],
-    bank_kda_conv_state: pl.InOut[
-        pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS], pl.BF16]
-    ],
-    bank_kda_recurrent_state: pl.InOut[
-        pl.Tensor[[PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_RECURRENT_ELEMENTS], pl.FP32]
-    ],
-    block_table: pl.Tensor[[BATCH, TABLE_MAX], pl.INT32],
-    snapshot_length: pl.Scalar[pl.INT32],
-    request_slot: pl.Scalar[pl.INT32],
-    bank_id: pl.Scalar[pl.INT32],
-    restore: pl.Scalar[pl.INT32],
-):
-    """Copy all private request-cache bytes to or from one immutable bank."""
-    bank_latent_flat = pl.reshape(bank_mla_latent_cache, [PREFIX_SNAPSHOT_ENTRIES * DSA_NUM_LAYERS, _RESET_MLA_ELEMENTS])
-    latent_flat = pl.reshape(mla_latent_cache, [DSA_NUM_LAYERS, LATENT_ROWS * KV_LORA])
-    for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_mla_latent_cache"):
-        layer = block // _PREFIX_COPY_LANE_TILE
-        lane = block % _PREFIX_COPY_LANE_TILE
-        for offset in pl.range(
-            lane * _PREFIX_COPY_TILE, (snapshot_length) * KV_LORA, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE
-        ):
-            valid = pl.min(_PREFIX_COPY_TILE, (snapshot_length) * KV_LORA - offset)
-            logical_page = offset // ((BLOCK_SIZE) * KV_LORA)
-            physical_page = pl.cast(pl.read(block_table, [request_slot, logical_page]), pl.INDEX)
-            source_offset = physical_page * (BLOCK_SIZE) * KV_LORA + offset % ((BLOCK_SIZE) * KV_LORA)
-            bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
-            if restore != 0:
-                data = pl.slice(bank_latent_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                latent_flat[layer : layer + 1, source_offset : source_offset + _PREFIX_COPY_TILE] = data
-            else:
-                data = pl.slice(latent_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                bank_latent_flat[bank_row : bank_row + 1, offset : offset + _PREFIX_COPY_TILE] = data
-
-    bank_raw_flat = pl.reshape(bank_index_raw_cache, [PREFIX_SNAPSHOT_ENTRIES * DSA_NUM_LAYERS, _RESET_RAW_ELEMENTS])
-    raw_flat = pl.reshape(index_raw_cache, [DSA_NUM_LAYERS, LATENT_ROWS * INDEX_STATE_WIDTH])
-    for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_index_raw_cache"):
-        layer = block // _PREFIX_COPY_LANE_TILE
-        lane = block % _PREFIX_COPY_LANE_TILE
-        for offset in pl.range(
-            lane * _PREFIX_COPY_TILE,
-            (snapshot_length) * INDEX_STATE_WIDTH,
-            _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE,
-        ):
-            valid = pl.min(_PREFIX_COPY_TILE, (snapshot_length) * INDEX_STATE_WIDTH - offset)
-            logical_page = offset // ((BLOCK_SIZE) * INDEX_STATE_WIDTH)
-            physical_page = pl.cast(pl.read(block_table, [request_slot, logical_page]), pl.INDEX)
-            source_offset = physical_page * BLOCK_SIZE * INDEX_STATE_WIDTH + offset % (BLOCK_SIZE * INDEX_STATE_WIDTH)
-            bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
-            if restore != 0:
-                data = pl.slice(bank_raw_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                raw_flat[layer : layer + 1, source_offset : source_offset + _PREFIX_COPY_TILE] = data
-            else:
-                data = pl.slice(raw_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                bank_raw_flat[bank_row : bank_row + 1, offset : offset + _PREFIX_COPY_TILE] = data
-
-    bank_pool_flat = pl.reshape(bank_index_pool_cache, [PREFIX_SNAPSHOT_ENTRIES * DSA_NUM_LAYERS, _RESET_POOL_ELEMENTS])
-    pool_flat = pl.reshape(index_pool_cache, [DSA_NUM_LAYERS, POOL_TABLE_ROWS * INDEX_DIM])
-    for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_index_pool_cache"):
-        layer = block // _PREFIX_COPY_LANE_TILE
-        lane = block % _PREFIX_COPY_LANE_TILE
-        for offset in pl.range(
-            lane * _PREFIX_COPY_TILE,
-            (snapshot_length // INDEX_KPOOL) * INDEX_DIM,
-            _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE,
-        ):
-            valid = pl.min(_PREFIX_COPY_TILE, (snapshot_length // INDEX_KPOOL) * INDEX_DIM - offset)
-            logical_page = offset // ((BLOCK_SIZE // INDEX_KPOOL) * INDEX_DIM)
-            physical_page = pl.cast(pl.read(block_table, [request_slot, logical_page]), pl.INDEX)
-            source_offset = physical_page * (BLOCK_SIZE // INDEX_KPOOL) * INDEX_DIM + offset % (
-                (BLOCK_SIZE // INDEX_KPOOL) * INDEX_DIM
-            )
-            bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
-            if restore != 0:
-                data = pl.slice(bank_pool_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                pool_flat[layer : layer + 1, source_offset : source_offset + _PREFIX_COPY_TILE] = data
-            else:
-                data = pl.slice(pool_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                bank_pool_flat[bank_row : bank_row + 1, offset : offset + _PREFIX_COPY_TILE] = data
-
-    bank_scale_flat = pl.reshape(bank_index_pool_scale, [PREFIX_SNAPSHOT_ENTRIES * DSA_NUM_LAYERS, _RESET_SCALE_ELEMENTS])
-    scale_flat = pl.reshape(index_pool_scale, [DSA_NUM_LAYERS, POOL_TABLE_ROWS * POOL_SCALE_WIDTH])
-    for block in pl.spmd(DSA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_index_pool_scale"):
-        layer = block // _PREFIX_COPY_LANE_TILE
-        lane = block % _PREFIX_COPY_LANE_TILE
-        for offset in pl.range(
-            lane * _PREFIX_SCALE_TILE,
-            (snapshot_length // INDEX_KPOOL) * POOL_SCALE_WIDTH,
-            _PREFIX_COPY_LANE_TILE * _PREFIX_SCALE_TILE,
-        ):
-            valid = pl.min(_PREFIX_SCALE_TILE, (snapshot_length // INDEX_KPOOL) * POOL_SCALE_WIDTH - offset)
-            logical_page = offset // ((BLOCK_SIZE // INDEX_KPOOL) * POOL_SCALE_WIDTH)
-            physical_page = pl.cast(pl.read(block_table, [request_slot, logical_page]), pl.INDEX)
-            source_offset = physical_page * (BLOCK_SIZE // INDEX_KPOOL) * POOL_SCALE_WIDTH + offset % (
-                (BLOCK_SIZE // INDEX_KPOOL) * POOL_SCALE_WIDTH
-            )
-            bank_row = pl.cast(bank_id, pl.INDEX) * DSA_NUM_LAYERS + layer
-            if restore != 0:
-                data = pl.slice(bank_scale_flat, [1, _PREFIX_SCALE_TILE], [bank_row, offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                scale_flat[layer : layer + 1, source_offset : source_offset + _PREFIX_SCALE_TILE] = data
-            else:
-                data = pl.slice(scale_flat, [1, _PREFIX_SCALE_TILE], [layer, source_offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                bank_scale_flat[bank_row : bank_row + 1, offset : offset + _PREFIX_SCALE_TILE] = data
-
-    bank_conv_flat = pl.reshape(bank_kda_conv_state, [PREFIX_SNAPSHOT_ENTRIES * KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS])
-    conv_flat = pl.reshape(kda_conv_state, [KDA_NUM_LAYERS, KDA_ROWS * STATE_LEN * CONV_DIM])
-    for block in pl.spmd(KDA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_kda_conv_state"):
-        layer = block // _PREFIX_COPY_LANE_TILE
-        lane = block % _PREFIX_COPY_LANE_TILE
-        for offset in pl.range(
-            lane * _PREFIX_COPY_TILE, _RESET_CONV_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE
-        ):
-            valid = pl.min(_PREFIX_COPY_TILE, _RESET_CONV_ELEMENTS - offset)
-            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_CONV_ELEMENTS + offset
-            bank_row = pl.cast(bank_id, pl.INDEX) * KDA_NUM_LAYERS + layer
-            if restore != 0:
-                data = pl.slice(bank_conv_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                conv_flat[layer : layer + 1, source_offset : source_offset + _PREFIX_COPY_TILE] = data
-            else:
-                data = pl.slice(conv_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                bank_conv_flat[bank_row : bank_row + 1, offset : offset + _PREFIX_COPY_TILE] = data
-
-    bank_recurrent_flat = pl.reshape(bank_kda_recurrent_state, [PREFIX_SNAPSHOT_ENTRIES * KDA_NUM_LAYERS, _RESET_RECURRENT_ELEMENTS])
-    recurrent_flat = pl.reshape(kda_recurrent_state, [KDA_NUM_LAYERS, KDA_ROWS * LOCAL_KDA_H * KDA_DIM * KDA_DIM])
-    for block in pl.spmd(KDA_NUM_LAYERS * _PREFIX_COPY_LANE_TILE, name_hint="snapshot_kda_recurrent_state"):
-        layer = block // _PREFIX_COPY_LANE_TILE
-        lane = block % _PREFIX_COPY_LANE_TILE
-        for offset in pl.range(
-            lane * _PREFIX_COPY_TILE, _RESET_RECURRENT_ELEMENTS, _PREFIX_COPY_LANE_TILE * _PREFIX_COPY_TILE
-        ):
-            valid = pl.min(_PREFIX_COPY_TILE, _RESET_RECURRENT_ELEMENTS - offset)
-            source_offset = pl.cast(request_slot, pl.INDEX) * _RESET_RECURRENT_ELEMENTS + offset
-            bank_row = pl.cast(bank_id, pl.INDEX) * KDA_NUM_LAYERS + layer
-            if restore != 0:
-                data = pl.slice(bank_recurrent_flat, [1, _PREFIX_COPY_TILE], [bank_row, offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                recurrent_flat[layer : layer + 1, source_offset : source_offset + _PREFIX_COPY_TILE] = data
-            else:
-                data = pl.slice(recurrent_flat, [1, _PREFIX_COPY_TILE], [layer, source_offset], valid_shape=[1, valid])
-                data = pl.set_validshape(data, 1, valid)
-                bank_recurrent_flat[bank_row : bank_row + 1, offset : offset + _PREFIX_COPY_TILE] = data
-    return (
-        mla_latent_cache,
-        index_raw_cache,
-        index_pool_cache,
-        index_pool_scale,
-        kda_conv_state,
-        kda_recurrent_state,
-        bank_mla_latent_cache,
-        bank_index_raw_cache,
-        bank_index_pool_cache,
-        bank_index_pool_scale,
-        bank_kda_conv_state,
-        bank_kda_recurrent_state,
-    )
-
-
-@pl.jit.host
-def l3_copy_request_snapshot(
-    mla_latent_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
-    index_raw_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
-    index_pool_cache: pl.InOut[pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
-    index_pool_scale: pl.InOut[
-        pl.Tensor[[RANKS, DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]
-    ],
-    kda_conv_state: pl.InOut[pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM], pl.BF16]],
-    kda_recurrent_state: pl.InOut[
-        pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]
-    ],
-    bank_mla_latent_cache: pl.InOut[
-        pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_MLA_ELEMENTS], pl.BF16]
-    ],
-    bank_index_raw_cache: pl.InOut[
-        pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_RAW_ELEMENTS], pl.FP32]
-    ],
-    bank_index_pool_cache: pl.InOut[
-        pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_POOL_ELEMENTS], pl.INT8]
-    ],
-    bank_index_pool_scale: pl.InOut[
-        pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, DSA_NUM_LAYERS, _RESET_SCALE_ELEMENTS], pl.FP32]
-    ],
-    bank_kda_conv_state: pl.InOut[
-        pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_CONV_ELEMENTS], pl.BF16]
-    ],
-    bank_kda_recurrent_state: pl.InOut[
-        pl.Tensor[[RANKS, PREFIX_SNAPSHOT_ENTRIES, KDA_NUM_LAYERS, _RESET_RECURRENT_ELEMENTS], pl.FP32]
-    ],
-    block_table: pl.Tensor[[RANKS, BATCH, TABLE_MAX], pl.INT32],
-    snapshot_length: pl.Scalar[pl.INT32],
-    request_slot: pl.Scalar[pl.INT32],
-    bank_id: pl.Scalar[pl.INT32],
-    restore: pl.Scalar[pl.INT32],
-):
-    """Copy the same request state on every resident TP/EP rank."""
-    for rank in pl.unroll(RANKS):
-        copy_request_snapshot(
-            mla_latent_cache[rank],
-            index_raw_cache[rank], index_pool_cache[rank], index_pool_scale[rank],
-            kda_conv_state[rank], kda_recurrent_state[rank], bank_mla_latent_cache[rank],
-            bank_index_raw_cache[rank], bank_index_pool_cache[rank], bank_index_pool_scale[rank],
-            bank_kda_conv_state[rank], bank_kda_recurrent_state[rank], block_table[rank], snapshot_length,
-            request_slot, bank_id, restore, device=rank,
-        )
 
 
 @pl.jit(auto_scope=False)
@@ -567,81 +862,40 @@ def reset_request_caches(
     kda_recurrent_state: pl.InOut[
         pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]
     ],
-    cache_page_owners: pl.Tensor[[LATENT_BLOCKS], pl.INT32],
     slot_mask: pl.Scalar[pl.INT32],
 ):
-    """Zero selected private segments, or all physical cache rows for a full reset."""
-    mla_flat = pl.reshape(mla_latent_cache, [DSA_NUM_LAYERS, LATENT_ROWS * KV_LORA])
-    for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_mla"):
-        layer = block // 4
-        lane = block % 4
-        mla_zero = pl.tile.full([1, _RESET_MLA_TILE], dtype=pl.BF16, value=0)
-        for page in pl.range(LATENT_BLOCKS):
-            page_selected = pl.cast(0, pl.INT32)
-            if slot_mask == (1 << BATCH) - 1:
-                page_selected = pl.cast(1, pl.INT32)
-            elif page < LATENT_BLOCKS:
-                owner = pl.read(cache_page_owners, [page])
-                if owner >= 0:
-                    page_selected = pl.cast((slot_mask >> owner) & 1, pl.INT32)
-            if page_selected != 0:
-                for chunk in pl.range(lane, (BLOCK_SIZE) * KV_LORA // _RESET_MLA_TILE, 4):
-                    offset = page * (BLOCK_SIZE) * KV_LORA + chunk * _RESET_MLA_TILE
-                    pl.tile.store(mla_zero, [layer, offset], mla_flat)
-    raw_flat = pl.reshape(index_raw_cache, [DSA_NUM_LAYERS, LATENT_ROWS * INDEX_STATE_WIDTH])
-    for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_raw"):
-        layer = block // 4
-        lane = block % 4
-        raw_zero = pl.tile.full([1, _RESET_RAW_TILE], dtype=pl.FP32, value=0)
-        for page in pl.range(LATENT_BLOCKS):
-            page_selected = pl.cast(0, pl.INT32)
-            if slot_mask == (1 << BATCH) - 1:
-                page_selected = pl.cast(1, pl.INT32)
-            elif page < LATENT_BLOCKS:
-                owner = pl.read(cache_page_owners, [page])
-                if owner >= 0:
-                    page_selected = pl.cast((slot_mask >> owner) & 1, pl.INT32)
-            if page_selected != 0:
-                for chunk in pl.range(lane, (BLOCK_SIZE) * INDEX_STATE_WIDTH // _RESET_RAW_TILE, 4):
-                    offset = page * (BLOCK_SIZE) * INDEX_STATE_WIDTH + chunk * _RESET_RAW_TILE
-                    pl.tile.store(raw_zero, [layer, offset], raw_flat)
-    pool_flat = pl.reshape(index_pool_cache, [DSA_NUM_LAYERS, POOL_TABLE_ROWS * INDEX_DIM])
-    for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_pool"):
-        layer = block // 4
-        lane = block % 4
-        zero_i16 = pl.tile.full([1, _RESET_POOL_TILE], dtype=pl.INT16, value=0)
-        pool_zero = pl.cast(zero_i16, pl.INT8)
-        for page in pl.range(LATENT_BLOCKS + 1):
-            page_selected = pl.cast(0, pl.INT32)
-            if slot_mask == (1 << BATCH) - 1:
-                page_selected = pl.cast(1, pl.INT32)
-            elif page < LATENT_BLOCKS:
-                owner = pl.read(cache_page_owners, [page])
-                if owner >= 0:
-                    page_selected = pl.cast((slot_mask >> owner) & 1, pl.INT32)
-            if page_selected != 0:
-                for chunk in pl.range(lane, (BLOCK_SIZE // INDEX_KPOOL) * INDEX_DIM // _RESET_POOL_TILE, 4):
-                    offset = page * (BLOCK_SIZE // INDEX_KPOOL) * INDEX_DIM + chunk * _RESET_POOL_TILE
-                    pl.tile.store(pool_zero, [layer, offset], pool_flat)
-    scale_flat = pl.reshape(index_pool_scale, [DSA_NUM_LAYERS, POOL_TABLE_ROWS * POOL_SCALE_WIDTH])
-    for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_scale"):
-        layer = block // 4
-        lane = block % 4
-        scale_zero = pl.tile.full([1, _RESET_SCALE_TILE], dtype=pl.FP32, value=0)
-        for page in pl.range(LATENT_BLOCKS + 1):
-            page_selected = pl.cast(0, pl.INT32)
-            if slot_mask == (1 << BATCH) - 1:
-                page_selected = pl.cast(1, pl.INT32)
-            elif page < LATENT_BLOCKS:
-                owner = pl.read(cache_page_owners, [page])
-                if owner >= 0:
-                    page_selected = pl.cast((slot_mask >> owner) & 1, pl.INT32)
-            if page_selected != 0:
-                for chunk in pl.range(
-                    lane, (BLOCK_SIZE // INDEX_KPOOL) * POOL_SCALE_WIDTH // _RESET_SCALE_TILE, 4
-                ):
-                    offset = page * (BLOCK_SIZE // INDEX_KPOOL) * POOL_SCALE_WIDTH + chunk * _RESET_SCALE_TILE
-                    pl.tile.store(scale_zero, [layer, offset], scale_flat)
+    """Clear private working rows; mask -1 initializes all physical storage."""
+    if slot_mask == -1:
+        mla_flat = pl.reshape(mla_latent_cache, [DSA_NUM_LAYERS, LATENT_ROWS * KV_LORA])
+        for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_mla"):
+            layer = block // 4
+            lane = block % 4
+            mla_zero = pl.tile.full([1, _RESET_MLA_TILE], dtype=pl.BF16, value=0)
+            for offset in pl.range(lane * _RESET_MLA_TILE, LATENT_ROWS * KV_LORA, 4 * _RESET_MLA_TILE):
+                pl.tile.store(mla_zero, [layer, offset], mla_flat)
+        raw_flat = pl.reshape(index_raw_cache, [DSA_NUM_LAYERS, LATENT_ROWS * INDEX_STATE_WIDTH])
+        for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_raw"):
+            layer = block // 4
+            lane = block % 4
+            raw_zero = pl.tile.full([1, _RESET_RAW_TILE], dtype=pl.FP32, value=0)
+            for offset in pl.range(lane * _RESET_RAW_TILE, LATENT_ROWS * INDEX_STATE_WIDTH, 4 * _RESET_RAW_TILE):
+                pl.tile.store(raw_zero, [layer, offset], raw_flat)
+        pool_flat = pl.reshape(index_pool_cache, [DSA_NUM_LAYERS, POOL_TABLE_ROWS * INDEX_DIM])
+        for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_pool"):
+            layer = block // 4
+            lane = block % 4
+            zero_i16 = pl.tile.full([1, _RESET_POOL_TILE], dtype=pl.INT16, value=0)
+            pool_zero = pl.cast(zero_i16, pl.INT8)
+            for offset in pl.range(lane * _RESET_POOL_TILE, POOL_TABLE_ROWS * INDEX_DIM, 4 * _RESET_POOL_TILE):
+                pl.tile.store(pool_zero, [layer, offset], pool_flat)
+        scale_flat = pl.reshape(index_pool_scale, [DSA_NUM_LAYERS, POOL_TABLE_ROWS * POOL_SCALE_WIDTH])
+        for block in pl.spmd(DSA_NUM_LAYERS * 4, name_hint="reset_scale"):
+            layer = block // 4
+            lane = block % 4
+            scale_zero = pl.tile.full([1, _RESET_SCALE_TILE], dtype=pl.FP32, value=0)
+            scale_elements = POOL_TABLE_ROWS * POOL_SCALE_WIDTH
+            for offset in pl.range(lane * _RESET_SCALE_TILE, scale_elements, 4 * _RESET_SCALE_TILE):
+                pl.tile.store(scale_zero, [layer, offset], scale_flat)
     conv_layer_tiles = KDA_ROWS * STATE_LEN * CONV_DIM // _RESET_CONV_TILE
     conv_slot_tiles = _RESET_CONV_ELEMENTS // _RESET_CONV_TILE
     conv_flat_rows = KDA_NUM_LAYERS * conv_layer_tiles
@@ -650,7 +904,7 @@ def reset_request_caches(
         layer = block // _RESET_CONV_LANE_TILE
         lane = block % _RESET_CONV_LANE_TILE
         conv_zero = pl.tile.full([1, _RESET_CONV_TILE], dtype=pl.BF16, value=0)
-        if slot_mask == (1 << BATCH) - 1:
+        if slot_mask == -1:
             for chunk in pl.range(lane, conv_layer_tiles, _RESET_CONV_LANE_TILE):
                 offset = layer * conv_layer_tiles + chunk
                 pl.tile.store(conv_zero, [offset, 0], conv_flat)
@@ -669,7 +923,7 @@ def reset_request_caches(
         layer = block // _RESET_RECURRENT_LANE_TILE
         lane = block % _RESET_RECURRENT_LANE_TILE
         recurrent_zero = pl.tile.full([1, _RESET_RECURRENT_TILE], dtype=pl.FP32, value=0)
-        if slot_mask == (1 << BATCH) - 1:
+        if slot_mask == -1:
             for chunk in pl.range(lane, recurrent_layer_tiles, _RESET_RECURRENT_LANE_TILE):
                 offset = layer * recurrent_layer_tiles + chunk
                 pl.tile.store(recurrent_zero, [offset, 0], recurrent_flat)
@@ -695,7 +949,6 @@ def l3_reset_request_caches(
     kda_recurrent_state: pl.InOut[
         pl.Tensor[[RANKS, KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]
     ],
-    cache_page_owners: pl.Tensor[[RANKS, LATENT_BLOCKS], pl.INT32],
     slot_mask: pl.Scalar[pl.INT32],
 ):
     """Clear the same selected request slots on every resident rank."""
@@ -704,13 +957,8 @@ def l3_reset_request_caches(
             mla_latent_cache[rank],
             index_raw_cache[rank], index_pool_cache[rank], index_pool_scale[rank],
             kda_conv_state[rank], kda_recurrent_state[rank],
-            cache_page_owners[rank], slot_mask, device=rank,
+            slot_mask, device=rank,
         )
-
-
-def zeroed_caches() -> dict[str, torch.Tensor]:
-    """Build bounded host fixtures; production clears its device allocations directly."""
-    return {name: torch.zeros(shape, dtype=dtype) for name, (shape, dtype) in CACHE_LAYOUTS.items()}
 
 
 @dataclass(frozen=True)
@@ -1478,8 +1726,9 @@ def prepare_step_inputs(
     *,
     kv_seq_lens: torch.Tensor | None = None,
     visual_features: dict[int, torch.Tensor] | None = None,
-    cache_pages: SharedCachePages | None = None,
+    cache_pages: CacheTables | None = None,
     mtp: bool = False,
+    kda_state_rows: torch.Tensor | None = None,
 ) -> dict:
     """Pack only new query tokens into stable request-owned cache slots."""
     if len(sequences) != BATCH:
@@ -1518,21 +1767,22 @@ def prepare_step_inputs(
     query_start_loc = torch.cumsum(torch.cat([torch.zeros(1, dtype=torch.int64), lengths]), 0).to(torch.int32)
     if cache_pages is None:
         if CACHE_TOKENS < BATCH * TABLE_MAX * BLOCK_SIZE:
-            raise ValueError("a bounded shared cache requires caller-owned SharedCachePages")
+            raise ValueError("a bounded shared cache requires caller-owned CacheTables")
         block_table = torch.arange(BATCH * TABLE_MAX, dtype=torch.int32).reshape(BATCH, TABLE_MAX)
         pool_table = torch.arange(BATCH * POOL_TABLE_MAX, dtype=torch.int32).reshape(BATCH, POOL_TABLE_MAX)
         pool_offsets = torch.arange(BATCH, dtype=torch.int32) * POOL_STRIDE
-        owners = torch.arange(LATENT_BLOCKS, dtype=torch.int32) // TABLE_MAX
     else:
         block_table = cache_pages.table.clone()
         pool_table = cache_pages.pool_table()
         pool_offsets = cache_pages.pool_offsets()
-        owners = cache_pages.owners.clone()
     metadata = build_forward_metadata(
         query_start_loc, kv_seq_lens=previous, mla_block_table=block_table,
         index_block_table=block_table,
         pool_block_table=pool_table,
-        kda_state_rows=torch.arange(BATCH, dtype=torch.int32), tp_size=TP_SIZE,
+        kda_state_rows=(
+            torch.tensor([[row, row, *[-1] * (KDA_STATE_COLUMNS - 2)] for row in range(BATCH)], dtype=torch.int32)
+            if kda_state_rows is None else kda_state_rows
+        ), tp_size=TP_SIZE,
     )
     step = build_indexer_chunk_metadata(
         metadata, block_table, pool_offsets, pools_cap=POOL_AXIS, pool_rows=POOL_TABLE_ROWS,
@@ -1549,7 +1799,6 @@ def prepare_step_inputs(
         "index_slots": _pad_to(metadata.index_slots, CAPACITY, -1),
         "kda_state_rows": metadata.kda_state_rows,
         "block_table": block_table,
-        "cache_page_owners": owners,
         "logit_row_indices": _pad_to(logit_rows, LOGIT_ROWS, 0),
         "active_tokens": torch.tensor([total], dtype=torch.int32),
         **step,
@@ -1557,27 +1806,8 @@ def prepare_step_inputs(
     }
 
 
-def production_launch_plan() -> tuple[tuple, ...]:
-    """The dispatch sequence of one full forward."""
-    steps: list[tuple] = [("seed",)]
-    for layer in range(NUM_LAYERS):
-        if layer < DENSE_NUM_LAYERS:
-            steps.append((layer, "layer"))
-        else:
-            steps.append((layer, "attn"))
-            steps.append((layer, "ffn"))
-    steps.append(("head",))
-    return tuple(steps)
-
-
 def production_program_entry(program: str):
-    """The L3 entry one consolidated runtime-ordinal program compiles."""
-    if program == "seed":
-        return l3_prefill_seed
-    if program == "dense":
-        return l3_prefill_dense_layer
-    if program == "kda_attn":
-        return l3_prefill_kda_attention
+    """Select an auxiliary single-stage L3 entry for MTP execution."""
     if program == "dsa_attn":
         return l3_prefill_sparse_attention
     if program == "moe_ffn":
@@ -1585,57 +1815,6 @@ def production_program_entry(program: str):
     if program == "head":
         return l3_prefill_head_rows
     raise ValueError(f"unknown consolidated program {program!r}")
-
-
-def production_program_of_step(step: tuple) -> str:
-    """Select the resident program for one dense layer or attention/FFN step."""
-    if step in (("seed",), ("head",)):
-        return step[0]
-    layer, sublayer = step
-    if sublayer == "layer":
-        return "dense"
-    if sublayer == "attn":
-        return "dsa_attn" if layer % 4 == 3 else "kda_attn"
-    if sublayer == "ffn":
-        return "moe_ffn"
-    raise ValueError(f"unknown sublayer {sublayer!r} in step {step}")
-
-
-def production_step_ordinals(step: tuple, *, dispatch_index: int = 0) -> dict[str, int]:
-    """Return layer ordinals and collective epochs for one program invocation.
-
-    ``dispatch_index`` counts completed invocations of this prepared program,
-    independent of other programs and request-cache slots. Zero selects a fresh
-    window set for standalone validation. TP counters receive two notifications
-    per epoch and must remain within signed INT32 range.
-    """
-    if type(dispatch_index) is not int or dispatch_index < 0:
-        raise ValueError("dispatch_index must be a nonnegative integer")
-    program = production_program_of_step(step)
-    if program in ("seed", "head"):
-        return {}
-    layer = step[0]
-    ordinals = {
-        "bb_ord": layer,
-        "skip_topk": 0,
-        "kda_ord": layer - layer // 4,
-        "dsa_ord": layer // 4,
-        "dense_ord": layer % DENSE_NUM_LAYERS,
-        "moe_ord": layer - DENSE_NUM_LAYERS,
-    }
-    epoch = dispatch_index + 1
-    if program == "dense":
-        ordinals.update(attn_epoch=2 * epoch - 1, ffn_epoch=2 * epoch)
-        final_tp_epoch = 2 * epoch
-    elif program == "moe_ffn":
-        ordinals.update(moe_epoch=epoch, ffn_epoch=epoch)
-        final_tp_epoch = epoch
-    else:
-        ordinals["attn_epoch"] = epoch
-        final_tp_epoch = epoch
-    if final_tp_epoch > (2**31 - 1) // 2:
-        raise OverflowError("collective epochs exhausted; close and reopen the resident session")
-    return ordinals
 
 
 def _l3_arg_arity(entry) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -1649,37 +1828,6 @@ def _l3_arg_arity(entry) -> tuple[tuple[str, ...], tuple[str, ...]]:
         else:
             tensors.append(name)
     return tuple(tensors), tuple(scalars)
-
-
-def _step_key(step: tuple) -> str:
-    """Manifest key of one launch-plan step (``seed`` / ``L4:attn`` / ``head``)."""
-    if len(step) == 1:
-        return step[0]
-    layer, sublayer = step
-    return f"L{layer}:{sublayer}"
-
-
-def production_step_bindings(plan: tuple[tuple, ...] | None = None) -> dict[tuple, dict[str, str]]:
-    """One launch-plan step's stream overrides: signature name -> workspace."""
-    if plan is None:
-        plan = production_launch_plan()
-    bindings: dict[tuple, dict[str, str]] = {}
-    side = 0  # X_H_PINGPONG index holding the stream after the previous step
-    for step in plan:
-        current, other = X_H_PINGPONG[side], X_H_PINGPONG[1 - side]
-        if step in (("seed",), ("head",)):
-            bindings[step] = {"x_hc": current}
-        else:
-            sublayer = step[1]
-            if sublayer == "layer":  # dense whole-layer entry: mid parks, final returns
-                bindings[step] = {"x_hc": current, "out_x_hc_mid": other, "out_x_hc_out": current}
-            elif sublayer == "attn":  # moves the stream to the other side
-                bindings[step] = {"x_hc": current, "out_x_hc_mid": other}
-                side = 1 - side
-            else:  # "ffn": returns the stream to the side the attention half read
-                bindings[step] = {"x_hc_mid": current, "out_x_hc_out": other}
-                side = 1 - side
-    return bindings
 
 
 def _alloc_name_of(param: str, overrides: dict[str, str]) -> str:
@@ -1696,28 +1844,6 @@ def _alloc_name_of(param: str, overrides: dict[str, str]) -> str:
         if workspace in WORKSPACES:
             return workspace
     return param
-
-
-def _production_geometry() -> dict[str, int]:
-    """Import-frozen query/cache dimensions, collective ABI and shared weight layout."""
-    return {
-        "version": 6,
-        "mtp_cache": 1,
-        "cache_tokens": CACHE_TOKENS,
-        "native_mla_int8": 1,
-        "shared_int8_nz": 1,
-        "tp": TP_SIZE,
-        "ep": EP_SIZE,
-        "capacity": CAPACITY,
-        "max_seq_len": MAX_SEQ_LEN,
-        "batch": BATCH,
-        "latent_rows": LATENT_ROWS,
-        "pool_axis": POOL_AXIS,
-    }
-
-
-
-
 
 
 def _read_ffn(
@@ -2004,10 +2130,11 @@ class PrefillReferenceDriver:
                 {"layer": layer_id, **{key: float(boundaries[key].abs().max()) for key in ("x_hc_in", "attn_out", "x_hc_mid", "ffn_out", "x_hc_out")}},
             )
             if dump_dir_path is not None and (dump_layers is None or layer_id in dump_layers):
+                layer_config = model.layer_config(layer_id)
                 payload: dict[str, object] = {
                     "layer_id": layer_id,
-                    "attention_kind": _attention_kind_name(layer_id, model),
-                    "mlp_kind": _mlp_kind_name(layer_id, model),
+                    "attention_kind": layer_config.attention_kind.value,
+                    "mlp_kind": layer_config.mlp_kind.value,
                 }
                 payload.update({key: boundaries[key].to(dump_dtype) for key in keys if key in boundaries})
                 path = dump_dir_path / f"layer_{layer_id:02d}.pt"
@@ -2026,14 +2153,6 @@ class PrefillReferenceDriver:
                     result.final_dump_path,
                 )
         return result
-
-
-def _attention_kind_name(layer_id: int, model: Glm53FlashConfig) -> str:
-    return model.layer_config(layer_id).attention_kind.value
-
-
-def _mlp_kind_name(layer_id: int, model: Glm53FlashConfig) -> str:
-    return model.layer_config(layer_id).mlp_kind.value
 
 
 def _test_layers_end_to_end(model: Glm53FlashConfig, tmp_root: Path) -> None:
@@ -2211,22 +2330,6 @@ def run_self_tests(model: Glm53FlashConfig = FLASH, checkpoint_root: str | None 
         print(f"real-checkpoint smoke: {checkpoint_root}")
         _real_checkpoint_smoke(checkpoint_root)
     print("prefill reference self-test: ALL PASS")
-
-
-def _load_final_norm(checkpoint: Checkpoint) -> torch.Tensor:
-    """The backbone final norm weight, resolving both checkpoint root spellings."""
-    for name in ("model.language_model.norm.weight", "model.norm.weight"):
-        if name in checkpoint:
-            return checkpoint.read(name).to(torch.bfloat16).reshape(-1)
-    raise ValueError("checkpoint is missing the final norm (model.language_model.norm.weight)")
-
-
-
-
-
-
-
-
 
 
 def run_weight_checks(argv=None):
@@ -3050,8 +3153,6 @@ def run_reference_checks_cli(argv=None) -> None:
     # host defaults to 320); cap the self-test only, library imports stay pure.
     torch.set_num_threads(min(32, torch.get_num_threads()))
     run_self_tests(checkpoint_root=args.checkpoint)
-
-
 
 
 def main(argv=None):
