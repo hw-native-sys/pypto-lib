@@ -31,6 +31,7 @@ from utils import packed_query_lengths, window_metadata
 from pathlib import Path
 
 import pypto.language as pl
+from pypto.runtime import pto_isa_include_dir
 
 from config import (
     FLASH as M, CMP_BLOCKS_DYN, MAX_BATCH_PER_DP, ORI_BLOCKS_DYN, T_DYN, TP_SIZE,
@@ -1277,6 +1278,23 @@ def golden_merge_attention_stats(
     return numerator / denominator.unsqueeze(-1)
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "gather_packed.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _gather_packed_rows(
+    window: pl.Tensor,
+    window_scale: pl.Tensor,
+    compressed: pl.Tensor,
+    compressed_scale: pl.Tensor,
+    window_indices: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    selected: pl.Out[pl.Tensor],
+    indices: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Gather packed FP8/FP4 cache rows into BF16 attention operands."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def gather_packed(
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
@@ -1293,69 +1311,11 @@ def gather_packed(
     name_hint: pl.constexpr,
 ):
     """Gather packed cache rows and dequantize them once for all query heads."""
-    window_rows = pl.tensor.dim(window, 0) * 128
-    compressed_rows = pl.tensor.dim(compressed, 0) * 128
-    w = pl.reshape(window, [window_rows, HEAD_DIM])
-    ws = pl.reshape(window_scale, [window_rows, HEAD_DIM // 32])
-    c = pl.reshape(compressed, [compressed_rows, HEAD_DIM // 2])
-    cs = pl.reshape(compressed_scale, [compressed_rows, HEAD_DIM // 16])
-    selected_rows = pl.tensor.dim(selected, 0) * SELECTED_KEYS
-    dst = pl.reshape(selected, [selected_rows, HEAD_DIM])
     workers = pl.max(1, pl.min(num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), max_workers))
     with pl.spmd(workers, name_hint=name_hint, deps=[ready]) as gathered:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), workers):
-            token = block // (SELECTED_KEYS // GATHER_KEY_TILE)
-            column = block % (SELECTED_KEYS // GATHER_KEY_TILE) * GATHER_KEY_TILE
-            if column < 128:
-                ids = pl.tile.load(wi, [token, column], [1, GATHER_KEY_TILE])
-                safe_ids = pl.maximum(ids, 0)
-                w_payload = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM], dtype=pl.FP8E4M3FN)
-                w_factors = pl.tile.create([GATHER_KEY_TILE, 32], dtype=pl.BF16)
-                for lane in pl.range(GATHER_KEY_TILE):
-                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    w_payload = pl.tile.gather_row(w_payload, w, [lane, 0], [physical, 0], [1, HEAD_DIM])
-                    w_factors = pl.tile.gather_row(w_factors, ws, [lane, 0], [physical, 0], [1, HEAD_DIM // 32])
-                w_scales = pl.cast(w_factors, pl.FP32)
-                # Compact sixteen scale values from each padded 32-wide row.
-                w_columns = pl.tile.arange(0, [1, GATHER_KEY_TILE * (HEAD_DIM // 32)], dtype=pl.INT32)
-                w_row_ids = pl.shrs(w_columns, 4)
-                w_row_bias = pl.shls(w_row_ids, 4)
-                w_order = pl.add(w_columns, w_row_bias)
-                w_scale_bits = pl.reinterpret_view(w_scales, pl.INT32)
-                w_gather_tmp = pl.tile.create([1, GATHER_KEY_TILE * (HEAD_DIM // 32)], dtype=pl.INT32)
-                w_valid_bits = pl.tile.gather(w_scale_bits, w_order, w_gather_tmp)
-                w_scales = pl.reinterpret_view(w_valid_bits, pl.FP32)
-                w_scale_column = pl.reshape(w_scales, [GATHER_KEY_TILE * (HEAD_DIM // 32), 1])
-                w_values = pl.cast(w_payload, pl.FP32)
-                w_grouped = pl.reshape(w_values, [GATHER_KEY_TILE * (HEAD_DIM // 32), 32])
-                w_scaled = pl.row_expand_mul(w_grouped, w_scale_column)
-                w_decoded = pl.cast(w_scaled, pl.BF16, mode="rint")
-                decoded = pl.reshape(w_decoded, [GATHER_KEY_TILE, HEAD_DIM])
-            else:
-                ids = pl.tile.load(ci, [token, column - 128], [1, GATHER_KEY_TILE])
-                safe_ids = pl.maximum(ids, 0)
-                c_payload = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM // 2], dtype=pl.UINT8)
-                c_factors = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM // 16], dtype=pl.BF16)
-                for lane in pl.range(GATHER_KEY_TILE):
-                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    c_payload = pl.tile.gather_row(c_payload, c, [lane, 0], [physical, 0], [1, HEAD_DIM // 2])
-                    c_factors = pl.tile.gather_row(c_factors, cs, [lane, 0], [physical, 0], [1, HEAD_DIM // 16])
-                c_fp4 = pl.reinterpret_view(c_payload, pl.FP4E2M1X2)
-                c_values = pl.cast(c_fp4, pl.BF16)
-                c_grouped = pl.reshape(c_values, [GATHER_KEY_TILE * (HEAD_DIM // 16), 16])
-                # BF16 scales can exceed the FP16 range; multiply in FP32.
-                c_scales = pl.cast(c_factors, pl.FP32)
-                c_scale_column = pl.reshape(c_scales, [GATHER_KEY_TILE * (HEAD_DIM // 16), 1])
-                c_scaled = pl.row_expand_mul(pl.cast(c_grouped, pl.FP32), c_scale_column)
-                c_decoded = pl.cast(c_scaled, pl.BF16, mode="rint")
-                decoded = pl.reshape(c_decoded, [GATHER_KEY_TILE, HEAD_DIM])
-            pl.tile.store(decoded, [token * SELECTED_KEYS + column, 0], dst)
-            zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            for lane in pl.range(GATHER_KEY_TILE):
-                if pl.tile.read(ids, [0, lane]) < 0:
-                    pl.tile.store(zero, [token * SELECTED_KEYS + column + lane, 0], dst)
-            pl.tile.store(ids, [token, column], indices)
+        selected = _gather_packed_rows(
+            window, window_scale, compressed, compressed_scale, wi, ci, selected, indices, num_tokens,
+        )
     return selected, indices, gathered
 
 
@@ -2018,6 +1978,29 @@ def l2_c2a_attention(
 
 
 @pl.jit(auto_scope=False)
+def l2_gather_packed(
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    wi: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
+    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    selected: pl.InOut[pl.Tensor[[T_DYN, SELECTED_KEYS, HEAD_DIM], pl.BF16]],
+    indices: pl.InOut[pl.Tensor[[T_DYN, SELECTED_KEYS], pl.INT32]],
+    num_tokens: pl.Scalar[pl.INT32],
+    start: pl.Scalar[pl.INT32],
+):
+    window_part = pl.slice(wi, [num_tokens, WINDOW_KEYS], [start, 0])
+    compressed_part = pl.slice(ci, [num_tokens, INDEX_TOPK], [start, 0])
+    ready = pl.system.task_dummy(deps=[])
+    selected_ret, indices_ret, gathered = gather_packed(
+        window, window_scale, compressed, compressed_scale, window_part, compressed_part,
+        selected, indices, num_tokens, ready, max_workers=GATHER_WORKERS, name_hint="gather_packed",
+    )
+    return selected, indices
+
+
+@pl.jit(auto_scope=False)
 def l2_sparse_attention_bf16(
     query: pl.Tensor[[T_DYN, LOCAL_H, HEAD_DIM], pl.FP32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, HEAD_DIM], pl.FP32],
@@ -2030,6 +2013,74 @@ def l2_sparse_attention_bf16(
 ):
     output = attend_bf16(query, window, window_indices, compressed, compressed_indices, sink, extents, output)
     return output
+
+
+def golden_gather_packed(tensors, *, active, start):
+    """Gather decoded BF16 rows and preserve the inactive output suffix."""
+    window = dequantize_mxfp8_cache(tensors["window"], tensors["window_scale"])
+    window = window.bfloat16().reshape(-1, HEAD_DIM)
+    compressed = dequantize_mxfp4_cache(tensors["compressed"], tensors["compressed_scale"], 16, "bf16")
+    compressed = compressed.bfloat16().reshape(-1, HEAD_DIM)
+    wi = tensors["wi"][start:start + active]
+    ci = tensors["ci"][start:start + active]
+    ids = torch.cat((wi, ci), dim=1)
+    values = torch.cat((window[wi.clamp_min(0).long()], compressed[ci.clamp_min(0).long()]), dim=1)
+    values = values.masked_fill((ids < 0).unsqueeze(-1), 0)
+    tensors["selected"][:active].copy_(values)
+    tensors["indices"][:active].copy_(ids)
+
+
+def validate_gather_packed(args):
+    """Validate packed cache codes, scales, index masks and output boundaries."""
+    from functools import partial
+
+    from golden import ScalarSpec, ratio_allclose, run
+
+    cases = [(13, 0, 0), (13, 1, 0), (13, 7, 3), (73, 72, 1)]
+    if args.rows is not None:
+        cases = [(args.rows + 1, args.rows, 1)]
+    records = []
+    for rows, active, start in cases:
+        generator = torch.Generator().manual_seed(128 + rows + active)
+        window = torch.linspace(-448, 448, 128 * HEAD_DIM).reshape(1, 128, 1, HEAD_DIM)
+        window = window.to(torch.float8_e4m3fn)
+        physical_rows = torch.arange(128).reshape(128, 1)
+        packed = torch.arange(128 * (HEAD_DIM // 2)).reshape(128, HEAD_DIM // 2)
+        packed = (packed * 37 + physical_rows * 13).remainder(256)
+        compressed = packed.to(torch.uint8).reshape(1, 128, 1, HEAD_DIM // 2)
+        scales = torch.tensor([0.0, 0.125, 1.0, 131072.0], dtype=torch.bfloat16)
+        window_scale = scales.repeat(128 * (HEAD_DIM // 32) // 4).reshape(128, HEAD_DIM // 32)
+        compressed_scale = scales.repeat(128 * (HEAD_DIM // 16) // 4).reshape(128, HEAD_DIM // 16)
+        row_scale = (2.0 ** (physical_rows.remainder(5) - 2)).bfloat16()
+        window_scale = (window_scale * row_scale).reshape(1, 128, 1, HEAD_DIM // 32)
+        compressed_scale = (compressed_scale * row_scale).reshape(1, 128, 1, HEAD_DIM // 16)
+        wi = torch.randint(0, 128, (rows, WINDOW_KEYS), generator=generator, dtype=torch.int32)
+        ci = torch.randint(0, 128, (rows, INDEX_TOPK), generator=generator, dtype=torch.int32)
+        wi[:, ::13] = -2
+        ci[:, ::19] = -2147483648
+        wi[start] = -1
+        ci[start] = -1
+        ci[-1] = 0
+        selected = torch.full((rows, SELECTED_KEYS, HEAD_DIM), 0.5, dtype=torch.bfloat16)
+        indices = torch.full((rows, SELECTED_KEYS), -1024, dtype=torch.int32)
+        inputs = dict(window=window, window_scale=window_scale, compressed=compressed,
+                      compressed_scale=compressed_scale, wi=wi, ci=ci, selected=selected, indices=indices)
+        specs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in inputs.items()]
+        specs += [ScalarSpec("num_tokens", torch.int32, active), ScalarSpec("start", torch.int32, start)]
+        exact = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
+        result = run(
+            l2_gather_packed, specs,
+            golden_fn=partial(golden_gather_packed, active=active, start=start),
+            compare_fn={"selected": exact, "indices": exact},
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            raise RuntimeError(result.error)
+        records.append(dict(mode="gather", rows=rows, active=active, start=start, passed=result.passed))
+        status = "COMPILE_ONLY" if args.compile_only else "DEVICE_VALIDATED"
+        print(status, "gather", f"rows={rows} active={active} start={start}", result.work_dir)
+    return records
 
 
 def swa_core_reference(inputs):
@@ -2466,9 +2517,9 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4, 8])
-    rows_help = "single row count (default: 1, 7, 12, 13; TP1 C2A also 32, 33, 80; fixture/runtime replay: 7)"
+    rows_help = "single row count; gather defaults to boundary cases, sparse MLA to 72"
     parser.add_argument("--rows", type=int, help=rows_help)
-    mode_choices = ["packed", "bf16", "both", "c2a", "swa", "swa-packed", "swa-both", "all"]
+    mode_choices = ["gather", "packed", "bf16", "both", "c2a", "swa", "swa-packed", "swa-both", "all"]
     parser.add_argument("--mode", default="all", choices=mode_choices)
     parser.add_argument("--swa-case", default="all", choices=["gather", "plain", "runs", "all"])
     parser.add_argument("--compile-only", action="store_true")
@@ -2483,9 +2534,13 @@ if __name__ == "__main__":
         raise ValueError("--fixture and --runtime-dir require a sparse MLA mode: packed, bf16 or c2a")
     if args.runtime_dir and args.mode == "both":
         raise ValueError("--runtime-dir requires one --mode")
+    if args.mode == "gather" and (args.fixture or args.runtime_dir):
+        raise ValueError("Gather validation generates its own boundary fixtures")
     if args.rows is not None and args.rows < 1:
         raise ValueError("--rows must be positive")
-    if args.mode.startswith("swa"):
+    if args.mode == "gather":
+        _main_results = validate_gather_packed(args)
+    elif args.mode.startswith("swa"):
         _main_results = validate_swa_core(args)
     else:
         row_cases = [72]
@@ -2573,5 +2628,6 @@ if __name__ == "__main__":
                 status = "COMPILE_ONLY" if args.compile_only else "DEVICE_VALIDATED"
                 print(status, mode, f"rows={rows}", result.work_dir)
         if args.mode == "all":
+            records.extend(validate_gather_packed(args))
             records.extend(validate_swa_core(args))
         _main_results = records
