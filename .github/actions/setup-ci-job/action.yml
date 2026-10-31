@@ -391,6 +391,20 @@ runs:
         git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
         echo "pypto at $(git -C "$PYPTO_SRC" rev-parse HEAD)"
+        # PR 898 experiment: current pins plus only the merged CPU TPipe fix.
+        # This GitCode backport has the same production patch as cann/pto-isa!2023.
+        printf '%s\n' f142b930068c849dafcd783f0e5d77d7a29e34e8 > "$PYPTO_SRC/runtime/pto_isa.pin"
+        python3 - "$PYPTO_SRC/runtime/simpler_setup/pto_isa.py" <<'PY'
+        import pathlib, sys
+        path = pathlib.Path(sys.argv[1])
+        source = path.read_text()
+        original = '_PTO_ISA_GITHUB_HTTPS = "https://github.com/hw-native-sys/pto-isa.git"'
+        assert source.count(original) == 1, "unexpected runtime ISA source"
+        source = source.replace(original, '_PTO_ISA_GITHUB_HTTPS = "https://gitcode.com/guoliwei/pto-isa.git"')
+        path.write_text(source)
+        PY
+        git -C "$PYPTO_SRC/runtime" add pto_isa.pin simpler_setup/pto_isa.py
+        git -C "$PYPTO_SRC/runtime" diff --cached --stat
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
         # PTOAS ships one wheel per arch, with a matching PTOAS_SHA256_<ARCH> in
         # versions.env — so the arch is detected here rather than pinned, and only
@@ -869,7 +883,7 @@ runs:
         # the resolve step synced and the pins were read from — because that, not
         # this checkout, is what gets built here.
         pypto_tree="$(git -C "$PYPTO_SRC" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
-        simpler_tree="$(git -C "$PYPTO_SRC/runtime" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+        simpler_tree="$(git -C "$PYPTO_SRC/runtime" write-tree 2>/dev/null || true)"
         # ...and the set of runtimes the build host could actually produce.
         # Installing simpler runs simpler_setup/build_runtimes.py, which asks what
         # the toolchain supports: gcc alone yields the a2a3sim / a5sim runtimes,
@@ -912,7 +926,7 @@ runs:
           echo "::warning::this uv cannot build wheels — wheel cache disabled"
           cache_ready=false
         fi
-        pypto_key="pypto-${pypto_tree}-${abi_tag}-${toolchain_id}-b${build_inputs_id}-e${cache_epoch}"
+        pypto_key="pypto-${pypto_tree}-${PTO_ISA_COMMIT}-${abi_tag}-${toolchain_id}-b${build_inputs_id}-e${cache_epoch}"
         simpler_key="simpler-${simpler_tree}-${PTO_ISA_COMMIT:-none}-${abi_tag}-${toolchain_id}-${simpler_rt}-b${build_inputs_id}-e${cache_epoch}"
 
         # 0 = slot is complete, 1 = cache unusable (build in place instead),
