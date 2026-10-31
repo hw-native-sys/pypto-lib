@@ -45,8 +45,7 @@ if __name__ == "__main__":
 from config import FLASH as M
 from config import EP_SIZE as EP_WORLD_SIZE, MOE_RECV_MAX as RECV_MAX
 from config import ROUTE_T_DYN, N_LOCAL_EXPERTS
-from grouped_mxfp8_mxfp4 import grouped_mxfp8_mxfp4_experts
-from moe_ffn import act_quant_experts
+from moe_ffn import moe_ffn_experts
 from quant import pack_mxfp4_weight_tiles, unpack_mxfp4_weight_tiles
 
 
@@ -70,6 +69,7 @@ MX_PACKED_LANE_COLS = MX_MM_INTER_TILE // 2
 MX_W1_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W3_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * MX_PACKED_LANE_ROWS
+ROUTED_ROW_CAPACITY = min(N_LOCAL_EXPERTS, M.num_experts_per_tok) * RECV_MAX
 
 
 @pl.jit.inline(auto_scope=False)
@@ -86,33 +86,16 @@ def expert_routed_compute(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
     recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.BF16]],
     input_ready: pl.Scalar[pl.TASK_ID],
+    partial_rows: pl.constexpr,
 ):
     """Project, activate, and down-project the active fixed-capacity expert rows."""
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    gate = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.BF16)
-    gate, gate_ready = grouped_mxfp8_mxfp4_experts(
-        recv_x_flat, recv_mx_scale, routed_w1_packed, routed_w1_scale,
-        recv_expert_count, gate, input_ready,
-        D, MOE_INTER, N_LOCAL_EXPERTS, RECV_MAX,
-    )
-    up = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.BF16)
-    up, up_ready = grouped_mxfp8_mxfp4_experts(
-        recv_x_flat, recv_mx_scale, routed_w3_packed, routed_w3_scale,
-        recv_expert_count, up, input_ready,
-        D, MOE_INTER, N_LOCAL_EXPERTS, RECV_MAX,
-    )
     route_weights = pl.reshape(recv_weights, [N_LOCAL_EXPERTS * RECV_MAX, 1])
-    h = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.FP8E4M3FN)
-    h_scale = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * H_SCALE], dtype=pl.FP8E8M0)
-    h, h_scale, act_ready = act_quant_experts(
-        gate, up, route_weights, recv_expert_count,
-        h, h_scale, gate_ready, up_ready,
-        N_LOCAL_EXPERTS, RECV_MAX, MOE_INTER,
-    )
-    recv_y, down_ready = grouped_mxfp8_mxfp4_experts(
-        h, h_scale, routed_w2_packed, routed_w2_scale,
-        recv_expert_count, recv_y, act_ready,
-        MOE_INTER, D, N_LOCAL_EXPERTS, RECV_MAX,
+    recv_y, down_ready = moe_ffn_experts(
+        recv_x_flat, recv_mx_scale, route_weights, recv_expert_count,
+        routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
+        routed_w2_packed, routed_w2_scale, recv_y, input_ready,
+        N_LOCAL_EXPERTS, RECV_MAX, D, MOE_INTER, partial_rows,
     )
     return recv_y, down_ready
 
@@ -141,7 +124,7 @@ def expert_routed_scatter(
         routed_w1_packed, routed_w1_scale,
         routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale,
-        recv_y, input_ready,
+        recv_y, input_ready, partial_rows=ROUTED_ROW_CAPACITY,
     )
     scatter_tids = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
     for local_e in pl.parallel(N_LOCAL_EXPERTS):
@@ -184,7 +167,7 @@ def local_compute_test(
         routed_w1_packed, routed_w1_scale,
         routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale,
-        routed_y, input_ready,
+        routed_y, input_ready, partial_rows=N_LOCAL_EXPERTS * RECV_MAX,
     )
     return routed_y
 
@@ -229,12 +212,12 @@ def golden_expert_routed(tensors):
         )
         w2_fp8 = unpack_mxfp4_weight_tiles(w2_packed, MOE_INTER, D, MX_K_TILE, MX_W2_D_OUT_TILE)
 
-        gate = matmul_mx_golden(x_sub, x_scale, w1_fp8, w1_scale[e]).to(torch.bfloat16).float()
-        up = matmul_mx_golden(x_sub, x_scale, w3_fp8, w3_scale[e]).to(torch.bfloat16).float()
+        gate = matmul_mx_golden(x_sub, x_scale, w1_fp8, w1_scale[e])
+        up = matmul_mx_golden(x_sub, x_scale, w3_fp8, w3_scale[e])
         if SWIGLU_LIMIT > 0:
             gate = gate.clamp(max=SWIGLU_LIMIT)
             up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-        h = (F.silu(gate) * up * w_per_row).bfloat16().float()
+        h = F.silu(gate) * up * w_per_row
         h_fp8, h_scale_codes = quantize_mxfp8_upward_e8m0(h)
         y = matmul_mx_golden(h_fp8, h_scale_codes, w2_fp8, w2_scale[e]).to(torch.bfloat16).float()
         recv_y[e, :n_rows, :] = y

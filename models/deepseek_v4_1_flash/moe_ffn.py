@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import pypto.language as pl
+from pypto.runtime import pto_isa_include_dir
 
 from config import FLASH as M
 from grouped_mxfp8_mxfp4 import LOCAL_EXPERTS, build_route_fixture, build_smoke_fixture
@@ -35,6 +36,72 @@ ACT_TILE = 256
 QUANT_TILE = 256
 QUANT_SCALE_TMP = ((64 + ACT_TILE // 32 + 31) // 32) * 32
 RESTORE_TILE = 256
+
+
+
+@pl.jit.extern(
+    core_type="mixed", aic_source="cpp/moe_ffn.cpp", aiv_source="cpp/moe_ffn.cpp",
+    dual_aiv_dispatch=True, include_dirs=[str(pto_isa_include_dir())],
+)
+def moe_ffn_extern(
+    x: pl.Tensor, x_scale: pl.Tensor, weights: pl.Tensor, counts: pl.Tensor,
+    w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor,
+    w2: pl.Tensor, w2_scale: pl.Tensor, partial: pl.Out[pl.Tensor],
+    experts: pl.Scalar[pl.INDEX], stride: pl.Scalar[pl.INDEX], width: pl.Scalar[pl.INDEX],
+    hidden: pl.Scalar[pl.INDEX], parts: pl.Scalar[pl.INDEX], partial_stride: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    ...
+
+
+@pl.jit.inline(auto_scope=False)
+def moe_ffn_experts(
+    x: pl.Tensor, x_scale: pl.Tensor, weights: pl.Tensor, counts: pl.Tensor,
+    w1: pl.Tensor, w1_scale: pl.Tensor, w3: pl.Tensor, w3_scale: pl.Tensor,
+    w2: pl.Tensor, w2_scale: pl.Tensor, out: pl.Tensor,
+    input_ready: pl.Scalar[pl.TASK_ID], experts: pl.constexpr, stride: pl.constexpr,
+    width: pl.constexpr, hidden: pl.constexpr, partial_rows: pl.constexpr,
+):
+    """Keep FP32 W13 and quantized hidden slices on-chip, then sum FP32 W2 partials.
+
+    Counts are immutable after input_ready, lie in [0, stride], and sum to at
+    most partial_rows. Stride is divisible by 16; width and hidden are divisible
+    by 256. Each of the two
+    hidden slices must fit 1280 columns and contain at least one 256-column
+    tile. Payloads/scales retain the grouped projection input layout. Only
+    active output rows are written. The final output is BF16; SwiGLU and its
+    route weighting use FP32 without an intermediate BF16 rounding boundary.
+    """
+    # Each compact partial includes one guard tile for masked tail loads.
+    partial_stride = ((partial_rows + ROW_TILE - 1) // ROW_TILE + 1) * ROW_TILE
+    partial = pl.create_tensor([2 * ((partial_rows + ROW_TILE - 1) // ROW_TILE + 1) * ROW_TILE, width], dtype=pl.FP32)
+    with pl.spmd(32, name_hint="fused_expert_ffn", deps=[input_ready]) as ready:
+        partial = moe_ffn_extern(
+            x, x_scale, weights, counts, w1, w1_scale, w3, w3_scale, w2, w2_scale,
+            partial, experts, stride, width, hidden, 2, partial_stride,
+        )
+    with pl.spmd(64, name_hint="ffn_reduce", deps=[ready]) as done:
+        core = pl.tile.get_block_idx()
+        work_base = 0
+        compact_base = 0
+        for expert in pl.range(experts):
+            count_read = pl.read(counts, [expert, 0])
+            count = pl.cast(count_read, pl.INDEX)
+            work_count = ((count + ROW_TILE - 1) // ROW_TILE) * (width // RESTORE_TILE)
+            first = (core + 64 - work_base % 64) % 64
+            for work in pl.range(first, work_count, 64):
+                local_row = work // (width // RESTORE_TILE) * ROW_TILE
+                col = work % (width // RESTORE_TILE) * RESTORE_TILE
+                row = compact_base + local_row
+                left = pl.load(partial, [row, col], [ROW_TILE, RESTORE_TILE])
+                right = pl.load(partial, [row + partial_stride, col], [ROW_TILE, RESTORE_TILE])
+                total = pl.add(left, right)
+                result = pl.cast(total, pl.BF16, mode="rint")
+                valid = pl.min(ROW_TILE, count - local_row)
+                masked = pl.set_validshape(result, valid, RESTORE_TILE)
+                out = pl.store(masked, [expert * stride + local_row, col], out)
+            work_base = work_base + work_count
+            compact_base = compact_base + count
+    return out, done
 
 
 @pl.jit.inline(auto_scope=False)
@@ -124,46 +191,6 @@ def act_quant(
             scale_offset = row * (width // 32) + (col // QUANT_TILE) * ROW_TILE * (QUANT_TILE // 32)
             scale_flat = pl.reshape(scale, [1, ROW_TILE * (QUANT_TILE // 32)])
             h_scale = pl.store(scale_flat, [0, scale_offset], h_scale)
-    return h, h_scale, done
-
-
-@pl.jit.inline(auto_scope=False)
-def act_quant_experts(
-    gate: pl.Tensor,
-    up: pl.Tensor,
-    route_weight: pl.Tensor,
-    counts: pl.Tensor,
-    h: pl.Out[pl.Tensor],
-    h_scale: pl.Out[pl.Tensor],
-    gate_ready: pl.Scalar[pl.TASK_ID],
-    up_ready: pl.Scalar[pl.TASK_ID],
-    experts: pl.constexpr,
-    row_stride: pl.constexpr,
-    width: pl.constexpr,
-):
-    """Quantize active fixed-capacity expert rows with zero-padded 16-row tails."""
-    with pl.spmd(64, name_hint="ffn_expert_act_quant", deps=[gate_ready, up_ready]) as done:
-        core = pl.tile.get_block_idx()
-        for expert in pl.range(experts):
-            count_read = pl.read(counts, [expert, 0])
-            count = pl.cast(count_read, pl.INDEX)
-            for work in pl.range(core, ((count + ROW_TILE - 1) // ROW_TILE) * (width // QUANT_TILE), 64):
-                local_row = work // (width // QUANT_TILE) * ROW_TILE
-                row = expert * row_stride + local_row
-                col = work % (width // QUANT_TILE) * QUANT_TILE
-                valid_rows = pl.min(ROW_TILE, count - local_row)
-                gate_tile = pl.load(gate, [row, col], [ROW_TILE, ACT_TILE])
-                up_tile = pl.load(up, [row, col], [ROW_TILE, ACT_TILE])
-                weights = pl.load(route_weight, [row, 0], [ROW_TILE, 1])
-                hidden_raw = _weighted_swiglu(gate_tile, up_tile, weights)
-                hidden_valid = pl.set_validshape(hidden_raw, valid_rows, ACT_TILE)
-                hidden_padded = pl.fillpad(hidden_valid, pad_value=pl.PadValue.zero)
-                hidden = pl.set_validshape(hidden_padded, ROW_TILE, ACT_TILE)
-                payload, scale = _quantize_upward(hidden)
-                h = pl.store(payload, [row, col], h)
-                scale_offset = row * (width // 32) + (col // QUANT_TILE) * ROW_TILE * (QUANT_TILE // 32)
-                scale_flat = pl.reshape(scale, [1, ROW_TILE * (QUANT_TILE // 32)])
-                h_scale = pl.store(scale_flat, [0, scale_offset], h_scale)
     return h, h_scale, done
 
 
