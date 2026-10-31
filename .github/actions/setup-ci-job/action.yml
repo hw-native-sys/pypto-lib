@@ -372,24 +372,34 @@ runs:
             sleep $((attempt * 10))
           done
         }
+        clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
         if [ -d "$PYPTO_SRC/.git" ]; then
           echo "Cache hit — reusing pypto checkout"
         else
           echo "Cache miss — cloning pypto"
           mkdir -p "$(dirname "$PYPTO_SRC")"
           # rm before each attempt so a retried clone never hits a partial dir.
-          clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
           retry clone_pypto || exit 1
         fi
         # pypto-ref is a full commit sha (via this step's env), fetched directly
         # so cache hit and cache miss land on the same revision; an empty value
         # follows origin's default branch (HEAD). Still --depth=1: a pin needs
         # one commit, not the history behind it.
-        retry git -C "$PYPTO_SRC" fetch --depth=1 origin "${PYPTO_REF:-HEAD}" || exit 1
-        git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
-        git -C "$PYPTO_SRC" clean -ffdx
-        git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
-        retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
+        sync_pypto() {
+          retry git -C "$PYPTO_SRC" fetch --depth=1 origin "${PYPTO_REF:-HEAD}" || return 1
+          git -C "$PYPTO_SRC" reset --hard FETCH_HEAD || return 1
+          git -C "$PYPTO_SRC" clean -ffdx || return 1
+          git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
+          retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1
+        }
+        if ! sync_pypto; then
+          # A cached submodule with an invalid HEAD cannot be repaired by
+          # repeating update. Recreate this job's disposable source cache once,
+          # then resolve the same requested revision and its pins again.
+          echo "::warning::Recreating the PyPTO source cache after sync failure"
+          retry clone_pypto || exit 1
+          sync_pypto || exit 1
+        fi
         echo "pypto at $(git -C "$PYPTO_SRC" rev-parse HEAD)"
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
         # PTOAS ships one wheel per arch, with a matching PTOAS_SHA256_<ARCH> in
