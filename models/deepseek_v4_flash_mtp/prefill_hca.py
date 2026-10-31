@@ -66,7 +66,7 @@ from prefill_sparse_attn import (
     hca_attn,
     build_tensor_specs as build_sparse_attn_tensor_specs,
 )
-from qkv_proj_rope import build_tensor_specs as build_qkv_tensor_specs, rope_prepare
+from qkv_proj_rope import KV_PREFILL_RMS_T_TILE, build_tensor_specs as build_qkv_tensor_specs, rope_prepare
 from utils import build_rope_tables
 
 import pypto.language as pl
@@ -579,7 +579,11 @@ def prefill_attention_hca(
         cos_tile = pl.slice(rope_cos_flat, [TAIL_ROWS, ROPE_HEAD_DIM], [row0, 0])
         sin_tile = pl.slice(rope_sin_flat, [TAIL_ROWS, ROPE_HEAD_DIM], [row0, 0])
         active = pl.read(overlay_active_lengths, [tile // MAX_SEGMENT_TILES, tile % MAX_SEGMENT_TILES, 1])
-        materialize_rope_rows(freqs_cos, freqs_sin, position_tile, active, cos_tile, sin_tile)
+        materialize_rope_rows(
+            freqs_cos, freqs_sin, position_tile, active,
+            cos_tile, sin_tile,
+            row_tiles_per_worker=1,
+        )
     prefill_attention_prolog(
         x_flat, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
         wq_a, wq_b, wq_b_scale, gamma_cq, rope_cos_flat, rope_sin_flat,
@@ -610,7 +614,7 @@ def prefill_attention_hca(
     logical_hidden = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
     tail_exchange_tid = _prefill_cp_hidden_tail_exchange_wave(
         local_hidden_tail,
-        reverse_index, owner_rank_table,
+        reverse_index,
         hidden_tail_window, tail_ready, tail_consumed,
         logical_hidden,
         my_rank, pl.cast(0, pl.INT32), tail_comm_epoch,
@@ -706,11 +710,9 @@ def prefill_attention_hca(
     augmented_rope_swap_idx = pl.create_tensor([LOCAL_AUGMENTED_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
     augmented_kv = pl.create_tensor([LOCAL_AUGMENTED_ROWS, HEAD_DIM], dtype=pl.BF16)
     materialize_rope_rows(
-        freqs_cos, freqs_sin,
-        leaf_positions,
-        pl.const(LOCAL_AUGMENTED_ROWS, pl.INT32),
-        augmented_rope_cos,
-        augmented_rope_sin,
+        freqs_cos, freqs_sin, leaf_positions, pl.const(LOCAL_AUGMENTED_ROWS, pl.INT32),
+        augmented_rope_cos, augmented_rope_sin,
+        row_tiles_per_worker=1,
     )
     rope_prepare(
         augmented_rope_cos,
@@ -728,6 +730,7 @@ def prefill_attention_hca(
         augmented_rope_swap_idx,
         augmented_kv,
         leaf_lowering_tid,
+        KV_PREFILL_RMS_T_TILE,
     )
 
     # A continued chunk's first segment has no in-chunk predecessor: its window
@@ -798,11 +801,9 @@ def prefill_attention_hca(
     final_rope_swap_idx = pl.create_tensor([TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
     final_kv = pl.create_tensor([TAIL_ROWS, HEAD_DIM], dtype=pl.BF16)
     materialize_rope_rows(
-        freqs_cos, freqs_sin,
-        final_positions,
-        pl.const(TAIL_ROWS, pl.INT32),
-        final_rope_cos,
-        final_rope_sin,
+        freqs_cos, freqs_sin, final_positions, pl.const(TAIL_ROWS, pl.INT32),
+        final_rope_cos, final_rope_sin,
+        row_tiles_per_worker=1,
     )
     rope_prepare(final_rope_cos, final_rope_sin, final_rope_cos_il, final_rope_sin_signed, final_rope_swap_idx)
     kv_proj_rope(
@@ -814,6 +815,7 @@ def prefill_attention_hca(
         final_rope_swap_idx,
         final_kv,
         final_hidden_tid,
+        KV_PREFILL_RMS_T_TILE,
     )
 
     scratch_state = pl.create_tensor(
@@ -825,11 +827,11 @@ def prefill_attention_hca(
         dtype=pl.FP32,
     )
     scratch_state_flat = pl.reshape(scratch_state, [LOCAL_PARTS * state_rows, COMPRESS_STATE_DIM])
-    with pl.spmd(48, name_hint="cp_hca_init_state", allow_early_resolve=True) as state_init_done:
+    with pl.spmd(8, name_hint="cp_hca_init_state", allow_early_resolve=True) as state_init_done:
         init_worker_id = pl.tile.get_block_idx()
         for part in pl.range(LOCAL_PARTS):
             segment = pl.read(owner_segments_t, [part])
-            for state_row in pl.range(init_worker_id, state_rows, 48):
+            for state_row in pl.range(init_worker_id, state_rows, 8):
                 destination = part * state_rows + state_row
                 scratch_state_flat[
                     destination : destination + 1, :
@@ -841,7 +843,7 @@ def prefill_attention_hca(
                         history_state_block = pl.read(compress_state_block_table, [history_position // HCA_STATE_BLOCK_SIZE])
                         history_state_row = history_state_block * HCA_STATE_BLOCK_SIZE + history_position % HCA_STATE_BLOCK_SIZE
                         # Each worker restores only the state rows it cleared.
-                        if history_state_block >= 0 and history_state_row < state_rows and history_state_row % 48 == init_worker_id:
+                        if history_state_block >= 0 and history_state_row < state_rows and history_state_row % 8 == init_worker_id:
                             history_destination_row = part * state_rows + history_state_row
                             scratch_state_flat[history_destination_row:history_destination_row + 1, :] = history_state[row:row + 1, :]
 
