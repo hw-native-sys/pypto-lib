@@ -80,7 +80,8 @@ jobs:
           echo "run_dspark_serving_tests=false" >> "$GITHUB_OUTPUT"
           select_all=false
           if [ "${{ github.event_name }}" = "push" ] ||
-             [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+             [ "${{ github.event_name }}" = "workflow_dispatch" ] ||
+             [ "${{ github.event.pull_request.number }}" = "898" ]; then
             select_all=true
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
             DIFF_RANGE="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
@@ -109,12 +110,20 @@ jobs:
           for platform in a2a3 a2a3sim a5 a5sim; do
             # Main pushes run the full examples suite on A2/A3 and both
             # simulators; A5 device coverage stays in PR and daily CI.
-            if [ "${{ github.event_name }}" = "push" ] && [ "$platform" = "a5" ]; then
+            if { [ "${{ github.event_name }}" = "push" ] ||
+                 [ "${{ github.event.pull_request.number }}" = "898" ]; } && [ "$platform" = "a5" ]; then
               FILES=""
             elif [ "$select_all" = "true" ]; then
               FILES=$(python .github/scripts/detect_changes.py --all --root examples --platform "$platform")
             else
               FILES=$(printf '%s\n' "$CHANGED_FILES" | python .github/scripts/detect_changes.py --platform "$platform")
+            fi
+            if [ "${{ github.event.pull_request.number }}" = "898" ] &&
+               { [ "$platform" = "a5sim" ] || [ "$platform" = "a5" ]; }; then
+              # Include the native FP4 index-score path and its decode consumers.
+              MODEL_FILES=$(printf '%s\n' models/deepseek_v4_1_flash/decode_indexer.py |
+                python .github/scripts/detect_changes.py --platform "$platform")
+              FILES="$FILES $MODEL_FILES"
             fi
             echo "${platform}_files=$FILES" >> "$GITHUB_OUTPUT"
             if [[ "$platform" = *sim ]] && [ -n "$FILES" ]; then
@@ -151,7 +160,8 @@ jobs:
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
     # the only difference: no Ascend env, which the simulator does not use.
-    runs-on: [self-hosted, linux, cpu]
+    # Use CPU hosts with working GitCode access for this isolated experiment.
+    runs-on: [self-hosted, linux, cpu, ARM64]
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -189,6 +199,7 @@ jobs:
         uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: checkout
+          pypto-ref: f9b7d5d8446957e8e78ea8cd2cfad3b3b6f3b5be
           needs-device: 'false'
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
@@ -284,6 +295,7 @@ jobs:
         uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: checkout
+          pypto-ref: f9b7d5d8446957e8e78ea8cd2cfad3b3b6f3b5be
           needs-device: 'true'
           build-namespace: ${{ matrix.platform }}-ci
           pip-cache-name: pip-${{ matrix.platform }}
@@ -379,6 +391,7 @@ jobs:
         uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: checkout
+          pypto-ref: f9b7d5d8446957e8e78ea8cd2cfad3b3b6f3b5be
           needs-device: 'true'
           build-namespace: serving
           toolchain: bundle
@@ -441,6 +454,7 @@ jobs:
         uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: checkout
+          pypto-ref: f9b7d5d8446957e8e78ea8cd2cfad3b3b6f3b5be
           needs-device: 'true'
           build-namespace: serving
           toolchain: bundle
@@ -509,6 +523,7 @@ jobs:
         uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: checkout
+          pypto-ref: f9b7d5d8446957e8e78ea8cd2cfad3b3b6f3b5be
           needs-device: 'true'
           build-namespace: serving
           toolchain: bundle

@@ -391,6 +391,20 @@ runs:
         git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
         echo "pypto at $(git -C "$PYPTO_SRC" rev-parse HEAD)"
+        # PR 898 experiment: current pins plus only the merged CPU TPipe fix.
+        # This GitCode backport has the same production patch as cann/pto-isa!2023.
+        printf '%s\n' f142b930068c849dafcd783f0e5d77d7a29e34e8 > "$PYPTO_SRC/runtime/pto_isa.pin"
+        python3 - "$PYPTO_SRC/runtime/simpler_setup/pto_isa.py" <<'PY'
+        import pathlib, sys
+        path = pathlib.Path(sys.argv[1])
+        source = path.read_text()
+        original = '_PTO_ISA_GITHUB_HTTPS = "https://github.com/hw-native-sys/pto-isa.git"'
+        assert source.count(original) == 1, "unexpected runtime ISA source"
+        source = source.replace(original, '_PTO_ISA_GITHUB_HTTPS = "https://gitcode.com/guoliwei/pto-isa.git"')
+        path.write_text(source)
+        PY
+        git -C "$PYPTO_SRC/runtime" add pto_isa.pin simpler_setup/pto_isa.py
+        git -C "$PYPTO_SRC/runtime" diff --cached --stat
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
         # PTOAS ships one wheel per arch, with a matching PTOAS_SHA256_<ARCH> in
         # versions.env — so the arch is detected here rather than pinned, and only
@@ -413,6 +427,31 @@ runs:
           echo "PTOAS_ARCH=$PTOAS_ARCH"
           echo "PTOAS_SHA256=$PTOAS_SHA256"
           echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
+        } >> "$GITHUB_ENV"
+
+    - name: Cache and verify the experimental ISA revision
+      shell: bash
+      run: |
+        set -euo pipefail
+        isa_cache=$(mktemp -d "$RUNNER_TEMP/pr898-isa-XXXXXX")
+        git init -q "$isa_cache"
+        isa_remote=https://gitcode.com/guoliwei/pto-isa.git
+        # Fetch one revision, not the complete repository history. Try a direct
+        # GitCode connection before using the host's configured proxy.
+        if ! timeout 120 env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+          git -c http.proxy= -C "$isa_cache" fetch --depth=1 --no-tags "$isa_remote" refs/heads/ci/pr898-merged-only; then
+          timeout 120 git -C "$isa_cache" fetch --depth=1 --no-tags "$isa_remote" refs/heads/ci/pr898-merged-only
+        fi
+        git -C "$isa_cache" checkout -B pr898-isa-cache FETCH_HEAD
+        test "$(git -C "$isa_cache" rev-parse HEAD)" = "$PTO_ISA_COMMIT"
+        test -z "$(git -C "$isa_cache" status --porcelain)"
+        # Both the source build and installed wheel retain their own managed
+        # checkouts. Feed their normal clone path from this verified local copy.
+        isa_config_count=${GIT_CONFIG_COUNT:-0}
+        {
+          echo "GIT_CONFIG_KEY_${isa_config_count}=url.file://${isa_cache}.insteadOf"
+          echo "GIT_CONFIG_VALUE_${isa_config_count}=$isa_remote"
+          echo "GIT_CONFIG_COUNT=$((isa_config_count + 1))"
         } >> "$GITHUB_ENV"
 
     # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
@@ -869,7 +908,7 @@ runs:
         # the resolve step synced and the pins were read from — because that, not
         # this checkout, is what gets built here.
         pypto_tree="$(git -C "$PYPTO_SRC" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
-        simpler_tree="$(git -C "$PYPTO_SRC/runtime" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+        simpler_tree="$(git -C "$PYPTO_SRC/runtime" write-tree 2>/dev/null || true)"
         # ...and the set of runtimes the build host could actually produce.
         # Installing simpler runs simpler_setup/build_runtimes.py, which asks what
         # the toolchain supports: gcc alone yields the a2a3sim / a5sim runtimes,
@@ -912,7 +951,7 @@ runs:
           echo "::warning::this uv cannot build wheels — wheel cache disabled"
           cache_ready=false
         fi
-        pypto_key="pypto-${pypto_tree}-${abi_tag}-${toolchain_id}-b${build_inputs_id}-e${cache_epoch}"
+        pypto_key="pypto-${pypto_tree}-${PTO_ISA_COMMIT}-${abi_tag}-${toolchain_id}-b${build_inputs_id}-e${cache_epoch}"
         simpler_key="simpler-${simpler_tree}-${PTO_ISA_COMMIT:-none}-${abi_tag}-${toolchain_id}-${simpler_rt}-b${build_inputs_id}-e${cache_epoch}"
 
         # 0 = slot is complete, 1 = cache unusable (build in place instead),
@@ -1068,6 +1107,13 @@ runs:
                          f"this job's venv ({sorted(roots)}) - an outside copy "
                          "is shadowing the revision the pin chain selected")
         print("env OK:", pypto.__file__)
+        import subprocess
+        from pypto.runtime import ensure_pto_isa_root
+        isa_root = ensure_pto_isa_root()
+        actual = subprocess.check_output(["git", "-C", isa_root, "rev-parse", "HEAD"], text=True).strip()
+        assert actual == os.environ["PTO_ISA_COMMIT"], (actual, os.environ["PTO_ISA_COMMIT"])
+        assert not subprocess.check_output(["git", "-C", isa_root, "status", "--porcelain"], text=True).strip()
+        print("managed ISA verified:", actual, isa_root)
         PYCHECK
 
     - name: Install runner dependencies
