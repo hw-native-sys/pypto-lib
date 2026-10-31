@@ -152,7 +152,7 @@ jobs:
     # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
     # the only difference: no Ascend env, which the simulator does not use.
     runs-on: [self-hosted, linux, cpu]
-    timeout-minutes: 45
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -196,48 +196,11 @@ jobs:
           # A5 simulation uses the MXFP8 scale dtype torch.float8_e8m0fnu.
           torch-version: ${{ matrix.platform == 'a5sim' && 'torch==2.10.0' || 'torch==2.6.0' }}
 
-      - name: Run ${{ matrix.platform }} tests
-        shell: bash
-        env:
-          PYTHONPATH: ${{ github.workspace }}/checkout
-          # Match tile-memory capacities to the requested simulator target.
-          PTO_CPU_SIM_ARCH: ${{ matrix.platform == 'a5sim' && 'a5' || 'a2a3' }}
-        run: |
-          source activate.sh
-          set +e
-          FILES="${{ needs.detect-changes.outputs[format('{0}_files', matrix.platform)] }}"
-          if [ -z "$FILES" ]; then
-            echo "No runnable changed files; nothing to test."
-            exit 0
-          fi
-          failed=()
-          target="${{ matrix.platform }}"
-          target_args=(-p "${target%sim}")
-          if [[ "$target" == *sim ]]; then target_args+=(--sim); fi
-          for f in $FILES; do
-            echo "::group::$f"
-            # Files marked `# ci: no-sim` (full multi-layer / multi-card
-            # forwards) are device-only and would just reject --sim.
-            if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
-              echo "skip (no-sim): $f"
-              echo "::endgroup::"
-              continue
-            fi
-            if ! python "$f" "${target_args[@]}"; then
-              failed+=("$f")
-              echo "::error file=${f}::FAIL"
-            fi
-            echo "::endgroup::"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            printf 'FAILED: %s\n' "${failed[@]}"
-            exit 1
-          fi
-          echo "All selected files passed."
-
-      - name: Clean up build artifacts
-        if: always()
-        run: rm -rf build_output
+      - name: Run simulator tests
+        uses: ./.github/actions/run-sim-tests
+        with:
+          platform: ${{ matrix.platform }}
+          files: ${{ needs.detect-changes.outputs[format('{0}_files', matrix.platform)] }}
 
   device:
     name: device (${{ matrix.platform }})
