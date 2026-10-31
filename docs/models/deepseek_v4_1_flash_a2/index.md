@@ -10,8 +10,8 @@ independent layer alignment.
 
 | Field | Current priority |
 | --- | --- |
-| Performance target | Correct independent single-layer Prefill with the original full-width operands and numerical boundaries. |
-| Deferred performance work | Whole-network execution, Decode, serving, multi-card execution, and performance tuning. These paths have no acceptance claim in this directory. |
+| Performance target | Correct independent single-layer Prefill and A2/A3 decoder paths with the original full-width operands and numerical boundaries. |
+| Deferred performance work | Whole-network execution, serving, multi-card execution, and performance tuning. Decoder operators are included for independent layer validation; whole-network serving remains outside this directory. |
 | Compatibility requirements | Preserve the frozen operators' dtypes, quantization boundaries, page layouts, request controls, source ownership, readonly inputs, inactive rows, and untouched cache regions. |
 
 ## Construction and ownership
@@ -154,3 +154,25 @@ use the existing [Golden Harness](../../run-and-validate/golden-harness.md)
 with the same compute implementation, checkpoint operands and comparison
 policy. Native boundary reports verify identity and interface integrity;
 they do not replace numerical comparison against an independent reference.
+
+## Decoder operators
+
+The A2/A3 decoder adaptation is integrated into this same flat package. The
+decoder contract is shared through `config.py`, `engram.py`, and
+`sparse_attention.py`; W8A8 quantization and GEMM live in `quant.py` and
+`gemm.py`. Layer-14 source and layer-15 reuse stages are in `layer14_15.py`.
+The CPU references and bounded PyPTO validators are direct modules in this
+directory, with no nested `verifier` package.
+
+The decoder validator suite can be run without a device:
+
+```bash
+python -m pytest models/deepseek_v4_1_flash_a2/test_operators.py -q
+python -m models.deepseek_v4_1_flash_a2.validate_layer14 --sim
+python -m models.deepseek_v4_1_flash_a2.validate_layer15 --sim
+```
+
+The validators retain the A2/A3 ABI: BF16 hidden and cache rows, INT8 weights
+and index payloads, FP32 W8A8 scales, FP16 index-cache scales, and INT32 GEMM
+accumulation. Prefill callers continue to use the existing `prefill.py`,
+`attention.py`, and cache modules unchanged.

@@ -11,6 +11,7 @@
 The caller supplies resident table rows and their indices. Host hashing,
 large-table offload and cross-rank gathers remain outside this kernel.
 """
+import torch
 import pypto.language as pl
 
 D, HC, COLS, ROW_WIDTH = 5120, 4, 24, 256
@@ -90,3 +91,108 @@ def make_engram(capacity, table_rows):
         return lookup, kv, output
 
     return engram
+
+
+# Decoder aliases retain the standalone A2/A3 contract names while sharing
+# the same dimensions as the prefill Engram implementation above.
+HIDDEN, HASH_COLS, HEAD_DIM = D, COLS, ROW_WIDTH
+LOOKUP_WIDTH, KV_WIDTH = K, N
+M_TILE, GATE_TILE = TILE, DT
+
+
+def engram_reference(
+    hash_ids: torch.Tensor,
+    table: torch.Tensor,
+    wkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    hidden: torch.Tensor,
+    token_mask: torch.Tensor,
+    eps: float = 1.0e-20,
+) -> dict[str, torch.Tensor]:
+    """CPU reference mirroring vLLM-Ascend's unrotated decoder Engram path."""
+
+    lookup = table[hash_ids.long()].reshape(hash_ids.shape[0], LOOKUP_WIDTH)
+    kv = torch.matmul(lookup.float(), wkv.float()).to(torch.bfloat16)
+    key = kv[:, :HC * HIDDEN].reshape(kv.shape[0], HC, HIDDEN).float()
+    value = kv[:, HC * HIDDEN:]
+    source = hidden.float()
+    channel_weight = q_weight.float() * k_weight.float()
+    source_rstd = torch.rsqrt(source.square().mean(-1, keepdim=True) + eps)
+    key_rstd = torch.rsqrt(key.square().mean(-1, keepdim=True) + eps)
+    dot = (source * channel_weight.reshape(1, HC, HIDDEN) * key).sum(-1, keepdim=True)
+    dot = dot * source_rstd * key_rstd * (HIDDEN ** -0.5)
+    signed_root = torch.copysign(dot.abs().clamp_min(1.0e-6).sqrt(), dot)
+    gate = torch.sigmoid(signed_root) * token_mask.reshape(-1, 1, 1).float()
+    output = (source + gate * value.float().unsqueeze(1)).to(torch.bfloat16)
+    return {"lookup": lookup, "kv": kv, "output": output}
+
+
+def make_lookup(capacity: int, table_rows: int):
+    @pl.jit
+    def lookup(
+        hash_ids: pl.Tensor[[capacity, HASH_COLS], pl.INT32],
+        table: pl.Tensor[[table_rows, HEAD_DIM], pl.BF16],
+        output: pl.InOut[pl.Tensor[[capacity, LOOKUP_WIDTH], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for token in pl.spmd(capacity, name_hint="dsv41_a2a3_engram_lookup"):
+            if token < active:
+                for column in pl.range(HASH_COLS):
+                    row = pl.read(hash_ids, [token, column])
+                    output[token:token + 1, column * HEAD_DIM:(column + 1) * HEAD_DIM] = table[
+                        row:row + 1, :
+                    ]
+        return output
+
+    return lookup
+
+
+def make_gate(capacity: int, eps: float = 1.0e-20):
+    @pl.jit
+    def gate(
+        hidden: pl.Tensor[[capacity, HC, HIDDEN], pl.BF16],
+        kv: pl.Tensor[[capacity, KV_WIDTH], pl.BF16],
+        channel_weight: pl.Tensor[[HC, HIDDEN], pl.FP32],
+        token_mask: pl.Tensor[[capacity], pl.INT32],
+        output: pl.InOut[pl.Tensor[[capacity, HC, HIDDEN], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        hidden_flat = pl.reshape(hidden, [capacity, HC * HIDDEN])
+        output_flat = pl.reshape(output, [capacity, HC * HIDDEN])
+        mask_flat = pl.reshape(token_mask, [1, capacity])
+        for block in pl.spmd(((active + M_TILE - 1) // M_TILE) * HC,
+                             name_hint="dsv41_a2a3_engram_gate"):
+            token = (block // HC) * M_TILE
+            copy = block % HC
+            rows = pl.min(M_TILE, active - token)
+            source_rms = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
+            key_rms = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
+            dot = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
+            for d0 in pl.range(0, HIDDEN, GATE_TILE):
+                x = pl.cast(pl.slice(hidden_flat, [M_TILE, GATE_TILE], [token, copy * HIDDEN + d0], valid_shape=[rows, GATE_TILE]), pl.FP32)
+                key = pl.cast(pl.slice(kv, [M_TILE, GATE_TILE], [token, copy * HIDDEN + d0], valid_shape=[rows, GATE_TILE]), pl.FP32)
+                weight = channel_weight[copy:copy + 1, d0:d0 + GATE_TILE]
+                source_rms = pl.add(source_rms, pl.reshape(pl.row_sum(pl.mul(x, x)), [1, M_TILE]))
+                key_rms = pl.add(key_rms, pl.reshape(pl.row_sum(pl.mul(key, key)), [1, M_TILE]))
+                dot = pl.add(dot, pl.reshape(pl.row_sum(pl.col_expand_mul(pl.mul(x, key), weight)), [1, M_TILE]))
+            inv = pl.mul(
+                pl.rsqrt(pl.add(pl.mul(source_rms, 1.0 / HIDDEN), eps)),
+                pl.rsqrt(pl.add(pl.mul(key_rms, 1.0 / HIDDEN), eps)),
+            )
+            dot = pl.mul(pl.mul(dot, inv), HIDDEN ** -0.5)
+            magnitude = pl.sqrt(pl.maximum(pl.abs(dot), 1.0e-6))
+            bits = pl.cast(pl.reinterpret_view(dot, pl.INT32), pl.FP32)
+            negative = pl.maximum(pl.minimum(bits, 0.0), -1.0)
+            signed = pl.mul(magnitude, pl.add(pl.mul(negative, 2.0), 1.0))
+            gate_value = pl.recip(pl.add(pl.exp(pl.neg(signed)), 1.0))
+            mask = pl.cast(pl.slice(mask_flat, [1, M_TILE], [0, token], valid_shape=[1, rows]), pl.FP32)
+            gate_value = pl.reshape(pl.mul(gate_value, pl.reshape(mask, [1, M_TILE])), [M_TILE, 1])
+            for d0 in pl.range(0, HIDDEN, GATE_TILE):
+                x = pl.cast(pl.slice(hidden_flat, [M_TILE, GATE_TILE], [token, copy * HIDDEN + d0], valid_shape=[rows, GATE_TILE]), pl.FP32)
+                value = pl.cast(pl.slice(kv, [M_TILE, GATE_TILE], [token, HC * HIDDEN + d0], valid_shape=[rows, GATE_TILE]), pl.FP32)
+                result = pl.cast(pl.add(x, pl.row_expand_mul(value, gate_value)), pl.BF16, mode="rint")
+                output_flat[token:token + M_TILE, copy * HIDDEN + d0:copy * HIDDEN + d0 + GATE_TILE] = pl.set_validshape(result, rows, GATE_TILE)
+        return output
+
+    return gate

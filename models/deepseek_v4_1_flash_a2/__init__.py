@@ -1,0 +1,127 @@
+"""DeepSeek V4.1 Flash A2 prefill and A2/A3 decoder operators."""
+
+from .config import A2A3_DTYPE_CONTRACT, A2A3OperatorConfig
+from .precision import ErrorMetrics, compare_tensors
+from .quant import (
+    dequantize_int32,
+    int8_matmul,
+    quantize_per_channel_int8,
+    quantize_per_token_int8,
+    w8a8_linear,
+)
+from .weights import (
+    load_layer0_output,
+    load_layer0_qkv,
+    load_layer0_router,
+    load_layer0_shared_expert,
+    load_tensor_bundle,
+    open_layer0_moe,
+)
+from .qkv import QKVShape, make_qkv_w8a8, qkv_reference, qkv_shape
+from .moe import make_routed_expert_w8a8, make_shared_expert_w8a8
+from .layer0 import layer0_reference, route_reference
+from .engram import engram_reference, make_gate, make_lookup
+from .staged import (
+    make_bf16_linear,
+    make_fp32_linear,
+    make_grouped_wo_a,
+    make_index_quantize,
+    make_linear,
+    make_norm,
+    make_rope_kernel,
+    make_swa,
+    make_swiglu,
+)
+from .sparse_attention import make_sparse_attention, sparse_attention_reference
+from .indexer_query import (
+    indexer_query_reference,
+    make_indexer_query_quantize,
+    make_l3_indexer_query,
+    quantize_indexer_query_reference,
+)
+from .indexer_select import indexer_select_reference, make_indexer_select
+from .indexer_prepare import make_indexer_prepare, prepare_indexer_indices_reference
+from .layer14_15 import (
+    LAYER14,
+    LAYER15,
+    Layer14A2A3Contract,
+    Layer15A2A3Contract,
+    index_key_reference,
+    dequantize_engram_rows_reference,
+    engram_a2a3_reference,
+    layer14_source_reference,
+    layer15_reuse_reference,
+    load_a2a3_layer14_15_bundle,
+    make_layer14_stages,
+    make_layer15_stages,
+    make_ratio2_projection,
+    quantize_engram_rows_reference,
+    ratio2_pool_reference,
+    update_ratio2_state_reference,
+    validate_layer14_15_contract,
+)
+
+__all__ = [
+    "A2A3OperatorConfig",
+    "A2A3_DTYPE_CONTRACT",
+    "ErrorMetrics",
+    "compare_tensors",
+    "dequantize_int32",
+    "int8_matmul",
+    "quantize_per_channel_int8",
+    "quantize_per_token_int8",
+    "w8a8_linear",
+    "load_layer0_qkv",
+    "load_layer0_output",
+    "load_layer0_router",
+    "load_layer0_shared_expert",
+    "load_tensor_bundle",
+    "open_layer0_moe",
+    "QKVShape",
+    "make_qkv_w8a8",
+    "qkv_reference",
+    "qkv_shape",
+    "make_routed_expert_w8a8",
+    "make_shared_expert_w8a8",
+    "layer0_reference",
+    "route_reference",
+    "engram_reference",
+    "make_gate",
+    "make_lookup",
+    "make_bf16_linear",
+    "make_fp32_linear",
+    "make_grouped_wo_a",
+    "make_index_quantize",
+    "make_linear",
+    "make_norm",
+    "make_rope_kernel",
+    "make_swa",
+    "make_swiglu",
+    "make_sparse_attention",
+    "sparse_attention_reference",
+    "indexer_query_reference",
+    "make_indexer_query_quantize",
+    "make_l3_indexer_query",
+    "quantize_indexer_query_reference",
+    "indexer_select_reference",
+    "make_indexer_select",
+    "make_indexer_prepare",
+    "prepare_indexer_indices_reference",
+    "LAYER14",
+    "LAYER15",
+    "Layer14A2A3Contract",
+    "Layer15A2A3Contract",
+    "index_key_reference",
+    "dequantize_engram_rows_reference",
+    "engram_a2a3_reference",
+    "layer14_source_reference",
+    "layer15_reuse_reference",
+    "load_a2a3_layer14_15_bundle",
+    "make_layer14_stages",
+    "make_layer15_stages",
+    "make_ratio2_projection",
+    "quantize_engram_rows_reference",
+    "ratio2_pool_reference",
+    "update_ratio2_state_reference",
+    "validate_layer14_15_contract",
+]

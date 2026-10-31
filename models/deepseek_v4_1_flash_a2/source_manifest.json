@@ -244,7 +244,7 @@
       "preserved_definition_ast_sha256": {
         "make_engram": "6ef710c4c163ccc8bfae6911997e71d0972667cda9d8a346dd8eb6bb70470a64"
       },
-      "migrated_sha256": "047c6b50bb79972e496ac44a741538fd17a71cf097e9f90d9ca4500e208fc797",
+      "migrated_sha256": "966036a8dd9c3a4773d3371134598fd82570c6ce4e48afe5d4200c83f6b1cdaf",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -690,7 +690,7 @@
         "DeepSeekV41Config": "94f4bb3ab2ac513d5fb64ffa5efa55373cb2e1513b4b5a73e9eedc0f37bf5990",
         "_parse_parallel_size": "551bba2aa1b2da64c2b95a0c8a22bc91884f43084931e043899f7d960b1e0ea7"
       },
-      "migrated_sha256": "ab953d0da83cb71f4b57f5533ae929604bac9cf9f4fe2d95848952a4fe2b96a5",
+      "migrated_sha256": "9762c0e893ffc6d3877e2498db0f27d1b43018bce512f27d7d0830b5403faba7",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -766,7 +766,7 @@
         "_attend_bf16_block": "15dc287c0d4b3684c3b3a463d0fcebd5cbacb55bc6a553d2c40c63de1640aca4",
         "attend_bf16": "ad04f3d10d20c801b2cb02067f4249c8ef7d0ed223d066afcfa07ceda7b966ab"
       },
-      "migrated_sha256": "1f88b11213f785e58f6620f843d50121ea4a1ae635ab692a28268f3c06a7c076",
+      "migrated_sha256": "e010da0ef231ef87d7a823c56a8021cd5cd732886ac855c530b3f5ba6e235b95",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },

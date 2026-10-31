@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """A2 single-layer dependencies extracted from the shared model operators."""
 
+import torch
 import pypto.language as pl
 from .config import FLASH as M, T_DYN, TP_SIZE
 
@@ -277,3 +278,179 @@ def attend_bf16(
         out = pl.slice(output, [count, heads, HEAD_DIM], [offset, 0, 0])
         ready = _attend_bf16_block(q, window, widx, compressed, cidx, sink, limits, out, ready)
     return output
+
+
+def sparse_attention_reference(
+    query: torch.Tensor,
+    window: torch.Tensor,
+    window_indices: torch.Tensor,
+    compressed: torch.Tensor,
+    compressed_indices: torch.Tensor,
+    sink: torch.Tensor,
+    *,
+    active: int | None = None,
+) -> torch.Tensor:
+    """CPU reference for decoder ratio-2 sparse attention."""
+
+    if query.ndim != 3:
+        raise ValueError("query must have shape [T, H, D]")
+    tokens, heads, head_dim = query.shape
+    if window.shape != (tokens, window_indices.shape[1], head_dim):
+        raise ValueError("window and window_indices shapes do not match query")
+    if compressed.shape != (tokens, compressed_indices.shape[1], head_dim):
+        raise ValueError("compressed and compressed_indices shapes do not match query")
+    if sink.shape != (heads,):
+        raise ValueError(f"sink must have shape {(heads,)}, got {tuple(sink.shape)}")
+    count = tokens if active is None else int(active)
+    if not 0 <= count <= tokens:
+        raise ValueError("active must be within query rows")
+
+    output = torch.zeros_like(query)
+    if count == 0:
+        return output
+    keys = torch.cat((window[:count], compressed[:count]), dim=1).float()
+    indices = torch.cat((window_indices[:count], compressed_indices[:count]), dim=1)
+    valid = indices.ge(0)
+    scores = torch.einsum("thd,tkd->thk", query[:count].float(), keys)
+    scores.mul_(head_dim**-0.5)
+    scores.masked_fill_(~valid[:, None, :], float("-inf"))
+    sink_scores = sink.float().view(1, heads, 1).expand(count, -1, -1)
+    probabilities = torch.softmax(torch.cat((scores, sink_scores), dim=-1), dim=-1)
+    output[:count] = torch.einsum("thk,tkd->thd", probabilities[..., :-1], keys).to(torch.bfloat16)
+    return output
+
+
+def make_sparse_attention(
+    capacity: int,
+    heads: int,
+    head_dim: int,
+    window: int = 128,
+    compressed_topk: int = 512,
+    value_padding: int = 16,
+):
+    """Build a BF16 decoder ratio-2 sparse attention kernel."""
+
+    if capacity <= 0 or capacity % 16:
+        raise ValueError("capacity must be a positive multiple of 16")
+    if heads <= 0 or heads % 16:
+        raise ValueError("heads must be a positive multiple of 16")
+    if head_dim <= 0 or head_dim % 16:
+        raise ValueError("head_dim must be a positive multiple of 16")
+    if window <= 0 or compressed_topk <= 0:
+        raise ValueError("cache widths must be positive")
+    if window % 32 or compressed_topk % 32:
+        raise ValueError("cache widths must be divisible by the 32-key streaming tile")
+    if value_padding <= 0 or value_padding % 16:
+        raise ValueError("value_padding must be a positive multiple of 16")
+
+    head_tile = 16
+    key_tile = 32
+    value_dim = head_dim + value_padding
+    scale = head_dim**-0.5
+
+    @pl.jit
+    def attend(
+        query: pl.Tensor[[capacity, heads, head_dim], pl.BF16],
+        window_rows: pl.Tensor[[capacity, window, value_dim], pl.BF16],
+        window_indices: pl.Tensor[[capacity, window], pl.INT32],
+        compressed_rows: pl.Tensor[[capacity, compressed_topk, value_dim], pl.BF16],
+        compressed_indices: pl.Tensor[[capacity, compressed_topk], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        output: pl.InOut[pl.Tensor[[capacity, heads, value_dim], pl.BF16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        for block in pl.spmd(active * (heads // head_tile),
+                             name_hint="dsv41_a2a3_ratio2_sparse_attention"):
+            token = block // (heads // head_tile)
+            head = (block % (heads // head_tile)) * head_tile
+            q = pl.reshape(query[token:token + 1, head:head + head_tile, :], [head_tile, head_dim])
+            q_padded = pl.concat(
+                pl.full([head_tile, value_padding], dtype=pl.BF16, value=0.0), q
+            )
+            running_m = pl.full([1, head_tile], dtype=pl.FP32, value=-1.0e30)
+            running_l = pl.full([1, head_tile], dtype=pl.FP32, value=0.0)
+            running_o = pl.full([value_dim, head_tile], dtype=pl.FP32, value=0.0)
+            for chunk, (running_m, running_l, running_o) in pl.range(
+                window // key_tile, init_values=(running_m, running_l, running_o)
+            ):
+                offset = chunk * key_tile
+                keys_padded = pl.reshape(
+                    window_rows[token:token + 1, offset:offset + key_tile, :], [key_tile, value_dim]
+                )
+                key_indices = window_indices[token:token + 1, offset:offset + key_tile]
+                scores = pl.mul(pl.matmul(q_padded, keys_padded, b_trans=True, out_dtype=pl.FP32), scale)
+                valid = pl.minimum(pl.maximum(pl.add(pl.cast(key_indices, pl.FP32), 1.0), 0.0), 1.0)
+                scores = pl.col_expand_add(scores, pl.mul(pl.sub(valid, 1.0), 1.0e30))
+                block_m = pl.reshape(pl.row_max(scores), [1, head_tile])
+                probabilities = pl.col_expand_mul(
+                    pl.exp(pl.row_expand_sub(scores, pl.reshape(block_m, [head_tile, 1]))), valid
+                )
+                block_l = pl.reshape(pl.row_sum(probabilities), [1, head_tile])
+                block_o = pl.matmul(
+                    keys_padded,
+                    pl.cast(probabilities, pl.BF16, mode="rint"),
+                    out_dtype=pl.FP32,
+                    a_trans=True,
+                    b_trans=True,
+                )
+                next_m = pl.maximum(running_m, block_m)
+                alpha = pl.exp(pl.sub(running_m, next_m))
+                beta = pl.exp(pl.sub(block_m, next_m))
+                running_l = pl.add(pl.mul(alpha, running_l), pl.mul(beta, block_l))
+                running_o = pl.add(
+                    pl.col_expand_mul(running_o, alpha),
+                    pl.col_expand_mul(block_o, beta),
+                )
+                running_m, running_l, running_o = pl.yield_(next_m, running_l, running_o)
+            for chunk, (running_m, running_l, running_o) in pl.range(
+                compressed_topk // key_tile, init_values=(running_m, running_l, running_o)
+            ):
+                offset = chunk * key_tile
+                keys_padded = pl.reshape(
+                    compressed_rows[token:token + 1, offset:offset + key_tile, :], [key_tile, value_dim]
+                )
+                key_indices = compressed_indices[token:token + 1, offset:offset + key_tile]
+                scores = pl.mul(pl.matmul(q_padded, keys_padded, b_trans=True, out_dtype=pl.FP32), scale)
+                valid = pl.minimum(pl.maximum(pl.add(pl.cast(key_indices, pl.FP32), 1.0), 0.0), 1.0)
+                scores = pl.col_expand_add(scores, pl.mul(pl.sub(valid, 1.0), 1.0e30))
+                block_m = pl.reshape(pl.row_max(scores), [1, head_tile])
+                probabilities = pl.col_expand_mul(
+                    pl.exp(pl.row_expand_sub(scores, pl.reshape(block_m, [head_tile, 1]))), valid
+                )
+                block_l = pl.reshape(pl.row_sum(probabilities), [1, head_tile])
+                block_o = pl.matmul(
+                    keys_padded,
+                    pl.cast(probabilities, pl.BF16, mode="rint"),
+                    out_dtype=pl.FP32,
+                    a_trans=True,
+                    b_trans=True,
+                )
+                next_m = pl.maximum(running_m, block_m)
+                alpha = pl.exp(pl.sub(running_m, next_m))
+                beta = pl.exp(pl.sub(block_m, next_m))
+                running_l = pl.add(pl.mul(alpha, running_l), pl.mul(beta, block_l))
+                running_o = pl.add(
+                    pl.col_expand_mul(running_o, alpha),
+                    pl.col_expand_mul(block_o, beta),
+                )
+                running_m, running_l, running_o = pl.yield_(next_m, running_l, running_o)
+            sink_score = pl.reshape(sink[head:head + head_tile], [1, head_tile])
+            final_max = pl.maximum(running_m, sink_score)
+            correction = pl.exp(pl.sub(running_m, final_max))
+            denominator = pl.add(
+                pl.mul(running_l, correction),
+                pl.exp(pl.sub(sink_score, final_max)),
+            )
+            correction = pl.div(correction, denominator)
+            result = pl.transpose(
+                pl.col_expand_mul(running_o, correction), axis1=0, axis2=1
+            )
+            output[token:token + 1, head:head + head_tile, :] = pl.cast(
+                pl.reshape(result, [1, head_tile, value_dim]), pl.BF16, mode="rint"
+            )
+            output[token:token + 1, head:head + head_tile, :value_padding] = pl.full(
+                [1, head_tile, value_padding], dtype=pl.BF16, value=0.0
+            )
+        return output
+
+    return attend
