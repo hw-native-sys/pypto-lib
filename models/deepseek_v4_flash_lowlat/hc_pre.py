@@ -297,36 +297,10 @@ def hc_pre_test(
     return x_mixed
 
 
-def _golden_a2a3_cube_linear(x_flat_2d, hc_fn):
-    """Emulate the A2/A3 f32 Cube MAD reduction used by the HC projection."""
-    import torch
-
-    cube_acc_k = 4
-    group_block = 64
-    assert LINEAR_K_PER_SPLIT % cube_acc_k == 0
-    groups_per_split = LINEAR_K_PER_SPLIT // cube_acc_k
-
-    t_dim = x_flat_2d.shape[0]
-    x_groups = x_flat_2d.reshape(t_dim, 1, LINEAR_OK, groups_per_split, cube_acc_k)
-    w_groups = hc_fn.reshape(1, MIX_HC, LINEAR_OK, groups_per_split, cube_acc_k)
-    split_mixes = torch.zeros(t_dim, MIX_HC, LINEAR_OK, dtype=torch.float32)
-    for group0 in range(0, groups_per_split, group_block):
-        x_block = x_groups[..., group0:group0 + group_block, :].double()
-        w_block = w_groups[..., group0:group0 + group_block, :].double()
-        group_dots = (x_block * w_block).sum(dim=-1)
-        for group in range(group_dots.shape[-1]):
-            split_mixes = (split_mixes.double() + group_dots[..., group]).float()
-
-    # Match the kernel's ascending split order.
-    mixes = torch.zeros(t_dim, MIX_HC, dtype=torch.float32)
-    for split in range(LINEAR_OK):
-        mixes += split_mixes[..., split]
-    return mixes
-
-
 def golden_hc_pre(tensors):
     """Torch reference matching the target HC-pre reduction and nonlinearities."""
     import torch
+    from utils import fp32_matmul_fp32
 
     x = tensors["x"].float()  # [T, hc, D]
     hc_fn = tensors["hc_fn"].float()  # [mix_hc, hc*D]
@@ -342,7 +316,7 @@ def golden_hc_pre(tensors):
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + NORM_EPS)
 
-    mixes = _golden_a2a3_cube_linear(x_flat_2d, hc_fn)
+    mixes = fp32_matmul_fp32(x_flat_2d, hc_fn.t(), split_k=LINEAR_OK)
     mixes *= rsqrt
 
     pre = torch.sigmoid(mixes[..., :HC_MULT] * hc_scale[0] + hc_base[:HC_MULT]) + HC_EPS

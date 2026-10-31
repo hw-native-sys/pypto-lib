@@ -508,16 +508,101 @@ def materialize_half_rope_tables(
     return cos[:, :half_dim].float().contiguous(), sin[:, :half_dim].float().contiguous()
 
 
+# --- Cube projection references. ---
+def fp32_matmul_fp32(a: torch.Tensor, b: torch.Tensor, *, split_k=1) -> torch.Tensor:
+    """CPU FP32 Cube reference with FP32 K4 partials and batched lhs rows.
+
+    Float64 evaluates each FP32 product group plus the incoming accumulator
+    before one FP32 rounding. Split partials are added in ascending K order.
+    Output columns are chunked independently to bound the product buffer.
+    """
+    if a.ndim < 2 or b.ndim != 2 or a.shape[-1] != b.shape[0]:
+        raise ValueError("FP32 projection requires lhs rows and a compatible two-dimensional rhs")
+    if not isinstance(split_k, int) or split_k < 1 or a.shape[-1] % (4 * split_k):
+        raise ValueError("Projection K must be divisible by 4 times split_k")
+    rows, k_dim = a.flatten(0, -2).shape
+    cols = b.shape[1]
+    groups = k_dim // split_k // 4
+    lhs = a.float().reshape(rows, 1, split_k, groups, 4)
+    result = torch.zeros(rows, cols, dtype=torch.float32, device=a.device)
+    for col0 in range(0, cols, 1024):
+        col1 = min(col0 + 1024, cols)
+        width = col1 - col0
+        rhs = b[:, col0:col1].float().reshape(split_k, groups, 4, width)
+        rhs = rhs.permute(3, 0, 1, 2).unsqueeze(0)
+        partials = torch.zeros(rows, width, split_k, dtype=torch.float32, device=a.device)
+        for group0 in range(0, groups, 16):
+            dots = (lhs[..., group0:group0 + 16, :].double()
+                    * rhs[..., group0:group0 + 16, :].double()).sum(dim=-1)
+            for group in range(dots.shape[-1]):
+                partials = (partials.double() + dots[..., group]).float()
+        column_result = torch.zeros(rows, width, dtype=torch.float32, device=a.device)
+        for split in range(split_k):
+            column_result = column_result + partials[..., split]
+        result[:, col0:col1] = column_result
+    return result.reshape(*a.shape[:-1], cols)
+
+
+def bf16_matmul_fp32(a: torch.Tensor, b: torch.Tensor, *, split_k=1) -> torch.Tensor:
+    """CPU BF16 Cube reference with FP32 K16 partials and batched lhs rows.
+
+    Float64 evaluates each BF16 product group plus the incoming accumulator
+    before one FP32 rounding. Split partials are added in ascending K order.
+    Output columns are chunked independently to bound the product buffer.
+    """
+    if a.ndim < 2 or b.ndim != 2 or a.shape[-1] != b.shape[0]:
+        raise ValueError("BF16 projection requires lhs rows and a compatible two-dimensional rhs")
+    if not isinstance(split_k, int) or split_k < 1 or a.shape[-1] % (16 * split_k):
+        raise ValueError("Projection K must be divisible by 16 times split_k")
+    rows, k_dim = a.flatten(0, -2).shape
+    cols = b.shape[1]
+    groups = k_dim // split_k // 16
+    lhs = a.to(torch.bfloat16).float().reshape(rows, 1, split_k, groups, 16)
+    result = torch.zeros(rows, cols, dtype=torch.float32, device=a.device)
+    for col0 in range(0, cols, 1024):
+        col1 = min(col0 + 1024, cols)
+        width = col1 - col0
+        rhs = b[:, col0:col1].to(torch.bfloat16).float().reshape(split_k, groups, 16, width)
+        rhs = rhs.permute(3, 0, 1, 2).unsqueeze(0)
+        partials = torch.zeros(rows, width, split_k, dtype=torch.float32, device=a.device)
+        for group0 in range(0, groups, 16):
+            dots = (lhs[..., group0:group0 + 16, :].double()
+                    * rhs[..., group0:group0 + 16, :].double()).sum(dim=-1)
+            for group in range(dots.shape[-1]):
+                partials = (partials.double() + dots[..., group]).float()
+        column_result = torch.zeros(rows, width, dtype=torch.float32, device=a.device)
+        for split in range(split_k):
+            column_result = column_result + partials[..., split]
+        result[:, col0:col1] = column_result
+    return result.reshape(*a.shape[:-1], cols)
+
+
+def grouped_bf16_matmul_fp32(a: torch.Tensor, weight: torch.Tensor, *, split_k=1) -> torch.Tensor:
+    """Independent BF16 groups [..., G, K] times weights [G, R, K]."""
+    if a.ndim < 2 or weight.ndim != 3 or a.shape[-2] != weight.shape[0]:
+        raise ValueError("Grouped BF16 projection requires matching group axes")
+    if a.shape[-1] != weight.shape[-1] or weight.shape[0] < 1:
+        raise ValueError("Grouped BF16 projection requires compatible K and nonempty groups")
+    outputs = []
+    for group in range(weight.shape[0]):
+        lhs = a[..., group, :].unsqueeze(-2)
+        projected = bf16_matmul_fp32(lhs, weight[group].t(), split_k=split_k)
+        outputs.append(projected.squeeze(-2))
+    return torch.stack(outputs, dim=-2)
+
+
 # --- INT8 quantization. ---
-def int8_quant_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def int8_quant_per_row(x: torch.Tensor, *, direct_div=False) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row INT8 symmetric quant matching the runtime W8A8C16 activation path.
 
     Rounds to int8 through fp16 to match the device rounding; returns the
-    per-row dequant scale (``1 / scale_quant``).
+    per-row dequant scale (``1 / scale_quant``). ``direct_div`` selects a
+    single FP32 division; the default retains existing fixture generation.
     """
     rows = x.float().reshape(-1, x.shape[-1])
     amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
+    numerator = torch.full_like(amax, INT8_SCALE_MAX)
+    scale_quant = torch.div(numerator, amax) if direct_div else INT8_SCALE_MAX / amax
     scaled = rows * scale_quant
     out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dequant = 1.0 / scale_quant
