@@ -115,6 +115,24 @@ __tf__ __aicore__ inline void pool_rows(
 #endif
 }
 
+__aicore__ inline int read_metadata(__gm__ int32_t* ptr) {
+    dcci((__gm__ void*)ptr, cache_line_t::SINGLE_CACHE_LINE);
+    return *ptr;
+}
+
+__aicore__ inline bool can_publish(__gm__ int64_t* args, int token) {
+    int requests = reinterpret_cast<__gm__ Tensor*>(args[8])->shapes[0];
+    int request = read_metadata(data<int32_t>(args, 7) + token);
+    if (request < 0 || request >= requests) return false;
+    int block = read_metadata(data<int32_t>(args, 8) + request);
+    if (block < 0 || block >= args[15]) return false;
+    int position = read_metadata(data<int32_t>(args, 3) + token);
+    if (position < 0 || position % 2 == 0) return false;
+    int start = read_metadata(data<int32_t>(args, 6) + request);
+    int end = read_metadata(data<int32_t>(args, 6) + request + 1);
+    return token >= start && token < end;
+}
+
 __aicore__ inline void flush(__gm__ int64_t* args, int rows, uint16_t active,
                             Vec<int64_t, 8>& targets, Vec<int32_t, 8>& tokens) {
     Batch<float, 512> current_kv, current_score, previous_kv, previous_score;
@@ -137,7 +155,7 @@ __aicore__ inline void flush(__gm__ int64_t* args, int rows, uint16_t active,
     TASSIGN(packed, 79552);
     TASSIGN(scales, 81600);
     TASSIGN(quant_scratch, 82112);
-    // Only the final occurrence of a cache slot writes it across state owners.
+    // Only the final eligible occurrence of a cache slot writes it across state owners.
     using Slots = Tile<TileType::Vec, int64_t, 1, 128, BLayout::RowMajor, 1, DYNAMIC>;
     using SlotGM = GlobalTensor<int64_t, TileShape2D<int64_t, 1, DYNAMIC>, BaseShape2D<int64_t, 1, 128>>;
     Slots future(128);
@@ -160,7 +178,7 @@ __aicore__ inline void flush(__gm__ int64_t* args, int rows, uint16_t active,
             int start = tokens.GetValue(row) + 1 - base;
             if (start < 0) start = 0;
             for (int lane = start; lane < count; ++lane) {
-                if (future.GetValue(lane) == slot) {
+                if (future.GetValue(lane) == slot && can_publish(args, base + lane)) {
                     targets.SetValue(row, -1);
                     break;
                 }
@@ -289,7 +307,7 @@ __aicore__ inline void run(__gm__ int64_t* args) {
                         continue;
                     }
                     tokens.SetValue(pending, token);
-                    targets.SetValue(pending, slots.GetValue(lane));
+                    targets.SetValue(pending, valid && position % 2 ? slots.GetValue(lane) : int64_t(-1));
                     Vec<float, 32> cosine, sine;
                     TASSIGN(cosine, 77504 + pending * 128);
                     TASSIGN(sine, 78528 + pending * 128);
