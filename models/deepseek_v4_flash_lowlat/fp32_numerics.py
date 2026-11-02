@@ -16,7 +16,12 @@ from __future__ import annotations
 import pypto.language as pl
 
 @pl.jit.inline(auto_scope=False)
-def two_sum(a: pl.Tensor, b: pl.Tensor, rows: pl.constexpr, cols: pl.constexpr) -> tuple[pl.Tensor, pl.Tensor]:
+def two_sum(
+    a: pl.Tensor,
+    b: pl.Tensor,
+    rows: pl.constexpr,
+    cols: pl.constexpr,
+) -> tuple[pl.Tensor, pl.Tensor]:
     total = a
     error = a
     total = pl.add(a, b)
@@ -28,7 +33,12 @@ def two_sum(a: pl.Tensor, b: pl.Tensor, rows: pl.constexpr, cols: pl.constexpr) 
     return (total, error)
 
 @pl.jit.inline(auto_scope=False)
-def two_product(a: pl.Tensor, b: pl.Tensor, rows: pl.constexpr, cols: pl.constexpr) -> tuple[pl.Tensor, pl.Tensor]:
+def two_product(
+    a: pl.Tensor,
+    b: pl.Tensor,
+    rows: pl.constexpr,
+    cols: pl.constexpr,
+) -> tuple[pl.Tensor, pl.Tensor]:
     product = a
     error = a
     a_split = pl.mul(a, 4097.0)
@@ -51,7 +61,14 @@ def two_product(a: pl.Tensor, b: pl.Tensor, rows: pl.constexpr, cols: pl.constex
     return (product, error)
 
 @pl.jit.inline(auto_scope=False)
-def ds_add(ah: pl.Tensor, al: pl.Tensor, bh: pl.Tensor, bl: pl.Tensor, rows: pl.constexpr, cols: pl.constexpr) -> tuple[pl.Tensor, pl.Tensor]:
+def ds_add(
+    ah: pl.Tensor,
+    al: pl.Tensor,
+    bh: pl.Tensor,
+    bl: pl.Tensor,
+    rows: pl.constexpr,
+    cols: pl.constexpr,
+) -> tuple[pl.Tensor, pl.Tensor]:
     ssa1_total, ssa1_error = two_sum(ah, bh, rows, cols)
     low = al
     low = pl.add(al, bl)
@@ -61,7 +78,14 @@ def ds_add(ah: pl.Tensor, al: pl.Tensor, bh: pl.Tensor, bl: pl.Tensor, rows: pl.
     return (ssa2_high, ssa2_low)
 
 @pl.jit.inline(auto_scope=False)
-def ds_multiply(ah: pl.Tensor, al: pl.Tensor, bh: pl.Tensor, bl: pl.Tensor, rows: pl.constexpr, cols: pl.constexpr) -> tuple[pl.Tensor, pl.Tensor]:
+def ds_multiply(
+    ah: pl.Tensor,
+    al: pl.Tensor,
+    bh: pl.Tensor,
+    bl: pl.Tensor,
+    rows: pl.constexpr,
+    cols: pl.constexpr,
+) -> tuple[pl.Tensor, pl.Tensor]:
     ssa1_high, ssa1_error = two_product(ah, bh, rows, cols)
     cross1 = pl.mul(ah, bl)
     cross2 = pl.mul(al, bh)
@@ -74,9 +98,21 @@ def ds_multiply(ah: pl.Tensor, al: pl.Tensor, bh: pl.Tensor, bl: pl.Tensor, rows
     return (ssa2_high, ssa2_low)
 
 @pl.jit.inline(auto_scope=False)
-def exp_reduced(x: pl.Tensor, zero: pl.Tensor, one: pl.Tensor, rows: pl.constexpr, cols: pl.constexpr, round_first: pl.constexpr) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
+def exp_reduced(
+    x: pl.Tensor,
+    zero: pl.Tensor,
+    one: pl.Tensor,
+    rows: pl.constexpr,
+    cols: pl.constexpr,
+    round_first: pl.constexpr,
+    positive: pl.constexpr,
+    late_unit: pl.constexpr,
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor]:
     safe = x
-    safe = pl.maximum(x, -80.0)
+    if positive:
+        safe = pl.minimum(pl.maximum(x, -80.0), 80.0)
+    else:
+        safe = pl.maximum(x, -80.0)
     scaled = pl.mul(safe, 1.4426950216293335)
     n_i32 = pl.cast(scaled, target_type=pl.INT32, mode='rint')
     n = x
@@ -201,6 +237,8 @@ def exp_reduced(x: pl.Tensor, zero: pl.Tensor, one: pl.Tensor, rows: pl.constexp
     reduced = ssa37_ch
     if round_first:
         reduced = pl.add(ssa37_ch, ssa37_cl)
+    if late_unit:
+        one = pl.add(zero, 1.0)
     remaining = pl.neg(n)
     power = one
     take64 = pl.sub(remaining, 63.0)
@@ -266,7 +304,37 @@ def exp_reduced(x: pl.Tensor, zero: pl.Tensor, one: pl.Tensor, rows: pl.constexp
     small1 = pl.mul(take1, 0.5)
     factor1 = pl.add(not1, small1)
     power = pl.mul(power, factor1)
-    return (reduced, ssa37_cl, power)
+    if positive:
+        positive_remaining = n
+        positive_take64 = pl.minimum(pl.maximum(pl.sub(positive_remaining, 63.0), 0.0), 1.0)
+        positive_remaining = pl.sub(positive_remaining, pl.mul(positive_take64, 64.0))
+        positive_factor64 = pl.add(one, pl.mul(positive_take64, 1.8446744073709552e+19))
+        power = pl.mul(power, positive_factor64)
+        positive_take32 = pl.minimum(pl.maximum(pl.sub(positive_remaining, 31.0), 0.0), 1.0)
+        positive_remaining = pl.sub(positive_remaining, pl.mul(positive_take32, 32.0))
+        positive_factor32 = pl.add(one, pl.mul(positive_take32, 4294967295.0))
+        power = pl.mul(power, positive_factor32)
+        positive_take16 = pl.minimum(pl.maximum(pl.sub(positive_remaining, 15.0), 0.0), 1.0)
+        positive_remaining = pl.sub(positive_remaining, pl.mul(positive_take16, 16.0))
+        positive_factor16 = pl.add(one, pl.mul(positive_take16, 65535.0))
+        power = pl.mul(power, positive_factor16)
+        positive_take8 = pl.minimum(pl.maximum(pl.sub(positive_remaining, 7.0), 0.0), 1.0)
+        positive_remaining = pl.sub(positive_remaining, pl.mul(positive_take8, 8.0))
+        positive_factor8 = pl.add(one, pl.mul(positive_take8, 255.0))
+        power = pl.mul(power, positive_factor8)
+        positive_take4 = pl.minimum(pl.maximum(pl.sub(positive_remaining, 3.0), 0.0), 1.0)
+        positive_remaining = pl.sub(positive_remaining, pl.mul(positive_take4, 4.0))
+        positive_factor4 = pl.add(one, pl.mul(positive_take4, 15.0))
+        power = pl.mul(power, positive_factor4)
+        positive_take2 = pl.minimum(pl.maximum(pl.sub(positive_remaining, 1.0), 0.0), 1.0)
+        positive_remaining = pl.sub(positive_remaining, pl.mul(positive_take2, 2.0))
+        positive_factor2 = pl.add(one, pl.mul(positive_take2, 3.0))
+        power = pl.mul(power, positive_factor2)
+        positive_take1 = pl.minimum(pl.maximum(pl.sub(positive_remaining, 0.0), 0.0), 1.0)
+        positive_remaining = pl.sub(positive_remaining, pl.mul(positive_take1, 1.0))
+        positive_factor1 = pl.add(one, pl.mul(positive_take1, 1.0))
+        power = pl.mul(power, positive_factor1)
+    return (reduced, ssa37_cl, power, one)
 
 @pl.jit.inline(auto_scope=False)
 def rne_exp_nonpositive(x: pl.Tensor, rows: pl.constexpr, cols: pl.constexpr) -> pl.Tensor:
@@ -276,7 +344,10 @@ def rne_exp_nonpositive(x: pl.Tensor, rows: pl.constexpr, cols: pl.constexpr) ->
     zero = pl.sub(x, x)
     one = x
     one = pl.add(zero, 1.0)
-    reduced, unused_low, power = exp_reduced(x, zero, one, rows, cols, round_first=True)
+    (reduced, unused_low, power, unused_unit) = exp_reduced(
+        x, zero, one, rows, cols,
+        round_first=True, positive=False, late_unit=False,
+    )
     value = pl.mul(reduced, power)
     shift = pl.sub(x, -80.00000762939453)
     gate = pl.mul(shift, 131072.0)
@@ -298,7 +369,10 @@ def correct_log_seed(x: pl.Tensor, seed: pl.Tensor, rows: pl.constexpr, cols: pl
     negative_seed = pl.neg(seed)
     one = x
     one = pl.add(zero, 1.0)
-    high, low, power = exp_reduced(negative_seed, zero, one, rows, cols, round_first=False)
+    (high, low, power, unused_unit) = exp_reduced(
+        negative_seed, zero, one, rows, cols,
+        round_first=False, positive=False, late_unit=False,
+    )
     exp_hi = x
     exp_lo = x
     exp_hi = pl.mul(high, power)
@@ -320,7 +394,12 @@ def correct_log_seed(x: pl.Tensor, seed: pl.Tensor, rows: pl.constexpr, cols: pl
     return result
 
 @pl.jit.inline(auto_scope=False)
-def newton_sqrt_seed(var: pl.Tensor, raw_sqrt: pl.Tensor, rows: pl.constexpr, cols: pl.constexpr) -> pl.Tensor:
+def newton_sqrt_seed(
+    var: pl.Tensor,
+    raw_sqrt: pl.Tensor,
+    rows: pl.constexpr,
+    cols: pl.constexpr,
+) -> pl.Tensor:
     result = var
     work = pl.mul(var, 0.25)
     z = pl.mul(raw_sqrt, 0.5)
@@ -345,7 +424,12 @@ def newton_sqrt_seed(var: pl.Tensor, raw_sqrt: pl.Tensor, rows: pl.constexpr, co
     return result
 
 @pl.jit.inline(auto_scope=False)
-def midpoint_sqrt_seed(var: pl.Tensor, newton: pl.Tensor, rows: pl.constexpr, cols: pl.constexpr) -> pl.Tensor:
+def midpoint_sqrt_seed(
+    var: pl.Tensor,
+    newton: pl.Tensor,
+    rows: pl.constexpr,
+    cols: pl.constexpr,
+) -> pl.Tensor:
     result = newton
     neighbor_delta = pl.mul(newton, 2.0 ** (-24) + 2.0 ** (-47))
     lower = pl.sub(newton, neighbor_delta)
@@ -493,3 +577,40 @@ def normalize_topk(selected: pl.Tensor, route_scale: pl.constexpr) -> pl.Tensor:
     hd_corrected = pl.add(hd_estimate, hd_correction)
     weights = pl.mul(hd_corrected, route_scale)
     return weights
+
+@pl.jit.inline(auto_scope=False)
+def rne_exp_signed(
+    x: pl.Tensor,
+    rows: pl.constexpr,
+    cols: pl.constexpr,
+    safe_zero: pl.constexpr,
+    negate: pl.constexpr,
+) -> pl.Tensor:
+    argument = x
+    if negate:
+        argument = pl.neg(x)
+    result = argument
+    zero = argument
+    if safe_zero:
+        safe_zero_arg = pl.minimum(pl.maximum(argument, -80.0), 80.0)
+        zero = pl.sub(safe_zero_arg, safe_zero_arg)
+    else:
+        zero = pl.sub(argument, argument)
+    one = argument
+    if negate:
+        one = zero
+    else:
+        one = pl.add(zero, 1.0)
+    (reduced, low, power, one) = exp_reduced(
+        argument, zero, one, rows, cols,
+        round_first=True, positive=True, late_unit=negate,
+    )
+    value = pl.mul(reduced, power)
+    if negate:
+        fallback = pl.exp(pl.neg(x))
+    else:
+        fallback = pl.exp(argument)
+    inside = pl.minimum(pl.maximum(pl.mul(pl.neg(pl.sub(pl.abs(x), 80.00000762939453)), 131072.0), 0.0), 1.0)
+    outside = pl.sub(one, inside)
+    result = pl.add(pl.mul(value, inside), pl.mul(fallback, outside))
+    return result
