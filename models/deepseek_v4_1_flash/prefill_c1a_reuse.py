@@ -119,7 +119,7 @@ def prefill_c1a_reuse_attention(
         window_ready = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, source_ready)
 
         attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        attend_packed(
+        attended = attend_packed(
             query,
             window_indices, window_cache, window_cache_scale,
             compressed_indices, compressed_cache, compressed_cache_scale,

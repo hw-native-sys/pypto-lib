@@ -16,9 +16,7 @@ from decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_c1a_groups,
     publish_index_rows, c1a_project_index_key, c1a_rotate_index_key,
 )
-from sparse_attention import (
-    attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
-)
+from sparse_attention import attend_packed, publish_window_row
 from hc import hc_project, hc_sinkhorn, hc_head_norm, hc_post
 from config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
@@ -169,14 +167,11 @@ def decode_c1a_full(
     )
     selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_ready])
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([tokens, 640, HEAD_DIM], dtype=pl.BF16)
-    indices = pl.create_tensor([tokens, 640], dtype=pl.INT32)
-    selected_ret, indices_ret, gather_tid = gather_packed(
-        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-        window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
-        max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather",
+    attended = attend_packed(
+        query, window_indices, window_cache, window_cache_scale,
+        topk_indices, compressed_cache, compressed_cache_scale,
+        attn_sink, attended, num_tokens, selection_ready,
     )
-    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,

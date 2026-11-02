@@ -42,8 +42,6 @@ SELECTED_ROWS = pl.dynamic("SPARSE_SELECTED_ROWS")
 BF16_HEADS = pl.dynamic("SPARSE_BF16_HEADS")
 BF16_PAGES_W = pl.dynamic("SPARSE_BF16_PAGES_W")
 BF16_PAGES_C = pl.dynamic("SPARSE_BF16_PAGES_C")
-CACHE_WINDOW_ROWS = pl.dynamic("SPARSE_CACHE_WINDOW_ROWS")
-CACHE_COMPRESSED_ROWS = pl.dynamic("SPARSE_CACHE_COMPRESSED_ROWS")
 
 # Model config.
 HEAD_DIM = M.head_dim
@@ -69,21 +67,12 @@ CUBE_HEADS = max(16, LOCAL_H)
 HEAD_TILE = min(32, CUBE_HEADS)
 QUERY_HEAD_TILE = min(16, LOCAL_H)
 KEY_TILE = 320 if TP_SIZE == 1 else 128
+SPARSE_KEY_TILE = 128
 GATHER_KEY_TILE = 32
 TOKEN_TILE = 512
 WORKERS = 32
 GATHER_WORKERS = 64
-SELECTED_GATHER_TILE = 64
-CACHE_WORKERS = 32
 WINDOW_PUBLISH_WORKER_TILE = 12
-SHARED_GATHER_WORKERS = 64
-CACHE_MAX_ROWS = 32768
-PACKED_QUERY_TILE = 32
-PACKED_COHORT_TILE = 24
-PACKED_HEAD_TILE = min(32, CUBE_HEADS) if TP_SIZE == 1 else 16
-PACKED_KEY_TILE = 128 if TP_SIZE == 1 else 64
-PACKED_ATTEND_SLOT_TILE = 1 if TP_SIZE == 1 else 2
-PACKED_KEY_PARTS = SELECTED_KEYS // PACKED_KEY_TILE
 
 
 # SWA tiling.
@@ -1320,112 +1309,6 @@ def gather_packed(
 
 
 @pl.jit.inline(auto_scope=False)
-def gather_packed_chunk(
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scales: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
-    topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    selected: pl.Tensor[[PACKED_QUERY_TILE, SELECTED_KEYS, HEAD_DIM], pl.BF16],
-    combined: pl.Tensor[[PACKED_QUERY_TILE, SELECTED_KEYS], pl.INT32],
-    chunk_start: pl.Scalar[pl.INT32],
-    active: pl.Scalar[pl.INT32],
-    chunk_done: pl.Scalar[pl.TASK_ID],
-):
-    """Gather one query chunk with batched cache decoding."""
-    window_chunk = pl.slice(window_indices, [active, WINDOW_KEYS], [chunk_start, 0])
-    compressed_chunk = pl.slice(topk_indices, [active, INDEX_TOPK], [chunk_start, 0])
-    selected, combined, gathered = gather_packed(
-        window_cache, window_scales, compressed_cache, compressed_scales,
-        window_chunk, compressed_chunk, selected, combined, active, chunk_done, max_workers=GATHER_WORKERS,
-        name_hint="c2a_gather",
-    )
-    return gathered
-
-
-def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY_TILE, max_workers=32):
-    """Build chunked sink attention with an optional Vector query startup."""
-    sync_start = not vector_query
-
-    @pl.jit.inline
-    def attend_selected_chunk(
-        query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        selected: pl.Tensor[[selected_rows, SELECTED_KEYS, HEAD_DIM], pl.BF16],
-        combined: pl.Tensor[[selected_rows, SELECTED_KEYS], pl.INT32],
-        sink: pl.Tensor[[LOCAL_H], pl.FP32],
-        output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-        chunk_start: pl.Scalar[pl.INT32],
-        active: pl.Scalar[pl.INT32],
-        gather_ready: pl.Scalar[pl.TASK_ID],
-        name_hint: pl.constexpr,
-    ):
-        """Attend one chunk over the window and compressed rows under a single sink."""
-        tokens = pl.tensor.dim(query, 0)
-        head_rows = tokens * LOCAL_H
-        query_flat = pl.reshape(query, [head_rows, HEAD_DIM])
-        output_flat = pl.reshape(output, [head_rows, HEAD_DIM])
-        key_flat = pl.reshape(selected, [selected_rows * SELECTED_KEYS, HEAD_DIM])
-        attend_tasks = active * (LOCAL_H // PACKED_HEAD_TILE)
-        workers = attend_tasks
-        if TP_SIZE == 1:
-            workers = pl.min(attend_tasks, max_workers)
-        if sync_start:
-            workers = pl.min(workers, pl.system.available_cluster_count())
-        # Direct-Q Cube transfers require ownership of the paired Vector UB.
-        with pl.spmd(
-            workers, name_hint=name_hint, deps=[gather_ready],
-            sync_start=sync_start,
-            optimizations=[pl.cross_core_slot(slot_num=PACKED_ATTEND_SLOT_TILE)],
-        ) as attend_tid:
-            worker = pl.tile.get_block_idx()
-            for block in pl.range(worker, attend_tasks, workers):
-                r = block // (LOCAL_H // PACKED_HEAD_TILE)
-                h = block % (LOCAL_H // PACKED_HEAD_TILE) * PACKED_HEAD_TILE
-                q0 = (chunk_start + r) * LOCAL_H + h
-                maximum = pl.full([1, PACKED_HEAD_TILE], dtype=pl.FP32, value=-1e30)
-                denominator = pl.full([1, PACKED_HEAD_TILE], dtype=pl.FP32, value=0.0)
-                numerator = pl.full([PACKED_HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                # Reuse the query tile across all sparse KV parts.
-                q = query_flat[q0 : q0 + PACKED_HEAD_TILE, :]
-                if vector_query:
-                    # Vector startup before the first score push.
-                    q = pl.cast(pl.cast(q, pl.FP32), pl.BF16, mode="rint")
-                for part in pl.range(PACKED_KEY_PARTS):
-                    k0 = r * SELECTED_KEYS + part * PACKED_KEY_TILE
-                    kv = key_flat[k0 : k0 + PACKED_KEY_TILE, :]
-                    scores = pl.mul(pl.matmul(q, kv, b_trans=True), SCALE)
-                    index_start = part * PACKED_KEY_TILE
-                    idx = combined[r : r + 1, index_start : index_start + PACKED_KEY_TILE]
-                    idx = pl.cast(idx, pl.FP32)
-                    valid = pl.minimum(pl.maximum(pl.add(idx, 1.0), 0.0), 1.0)
-                    scores = pl.col_expand_add(scores, pl.mul(pl.sub(valid, 1.0), 1e30))
-                    next_max = pl.maximum(maximum, pl.reshape(pl.row_max(scores), [1, PACKED_HEAD_TILE]))
-                    correction = pl.exp(pl.sub(maximum, next_max))
-                    next_max_column = pl.reshape(next_max, [PACKED_HEAD_TILE, 1])
-                    shifted = pl.row_expand_sub(scores, next_max_column)
-                    probabilities = pl.col_expand_mul(pl.exp(shifted), valid)
-                    previous_denominator = pl.mul(denominator, correction)
-                    part_denominator = pl.reshape(pl.row_sum(probabilities), [1, PACKED_HEAD_TILE])
-                    denominator = pl.add(previous_denominator, part_denominator)
-                    weighted = pl.matmul(pl.cast(probabilities, pl.BF16, mode="rint"), kv)
-                    correction_column = pl.reshape(correction, [PACKED_HEAD_TILE, 1])
-                    previous_numerator = pl.row_expand_mul(numerator, correction_column)
-                    numerator = pl.add(previous_numerator, weighted)
-                    maximum = next_max
-                sinks = pl.reshape(sink[h : h + PACKED_HEAD_TILE], [1, PACKED_HEAD_TILE])
-                final_max = pl.maximum(maximum, sinks)
-                correction = pl.exp(pl.sub(maximum, final_max))
-                denominator = pl.add(pl.mul(denominator, correction), pl.exp(pl.sub(sinks, final_max)))
-                multiplier = pl.reshape(pl.div(correction, denominator), [PACKED_HEAD_TILE, 1])
-                result = pl.row_expand_mul(numerator, multiplier)
-                output_flat[q0 : q0 + PACKED_HEAD_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
-        return attend_tid
-
-    return attend_selected_chunk
-
-
-@pl.jit.inline(auto_scope=False)
 def _attend_cube(
     query: pl.Tensor[[T_DYN, CUBE_HEADS * HEAD_DIM], pl.BF16],
     selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
@@ -1545,7 +1428,6 @@ def _attend_padded(
 
 
 attend_selected = _attend_cube if LOCAL_H >= 16 else _attend_padded
-attend_c2a_chunk = make_attend_selected_chunk(vector_query=TP_SIZE != 1)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1621,172 +1503,26 @@ def _attend_bf16_block(
     return converted
 
 
-@pl.jit.inline(auto_scope=False)
-def decode_packed_caches(
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
-    decoded_window: pl.Tensor[[CACHE_WINDOW_ROWS, HEAD_DIM], pl.BF16],
-    decoded_compressed: pl.Tensor[[CACHE_COMPRESSED_ROWS, HEAD_DIM], pl.BF16],
-    ready: pl.Scalar[pl.TASK_ID],
-):
-    window_rows = pl.tensor.dim(window, 0) * 128
-    w = pl.reshape(window, [window_rows, HEAD_DIM])
-    ws = pl.reshape(window_scale, [window_rows, HEAD_DIM // 32])
-    workers = pl.max(1, pl.min(window_rows // GATHER_KEY_TILE, CACHE_WORKERS))
-    with pl.spmd(workers, name_hint="sparse_shared_window_decode", deps=[ready]) as window_ready:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, window_rows // GATHER_KEY_TILE, workers):
-            row = block * GATHER_KEY_TILE
-            w_payload = pl.tile.load(w, [row, 0], [GATHER_KEY_TILE, HEAD_DIM])
-            w_factors = pl.tile.load(ws, [row, 0], [GATHER_KEY_TILE, HEAD_DIM // 32])
-            w_scales = pl.cast(w_factors, pl.FP32)
-            w_scale_column = pl.reshape(w_scales, [GATHER_KEY_TILE * (HEAD_DIM // 32), 1])
-            w_values = pl.cast(w_payload, pl.FP32)
-            w_grouped = pl.reshape(w_values, [GATHER_KEY_TILE * (HEAD_DIM // 32), 32])
-            w_scaled = pl.row_expand_mul(w_grouped, w_scale_column)
-            w_decoded = pl.cast(w_scaled, pl.BF16, mode="rint")
-            decoded = pl.reshape(w_decoded, [GATHER_KEY_TILE, HEAD_DIM])
-            pl.tile.store(decoded, [row, 0], decoded_window)
-
-    compressed_rows = pl.tensor.dim(compressed, 0) * 128
-    c = pl.reshape(compressed, [compressed_rows, HEAD_DIM // 2])
-    cs = pl.reshape(compressed_scale, [compressed_rows, HEAD_DIM // 16])
-    workers = pl.max(1, pl.min(compressed_rows // GATHER_KEY_TILE, CACHE_WORKERS))
-    with pl.spmd(workers, name_hint="sparse_shared_compressed_decode", deps=[ready]) as compressed_ready:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, compressed_rows // GATHER_KEY_TILE, workers):
-            row = block * GATHER_KEY_TILE
-            c_payload = pl.tile.load(c, [row, 0], [GATHER_KEY_TILE, HEAD_DIM // 2])
-            c_factors = pl.tile.load(cs, [row, 0], [GATHER_KEY_TILE, HEAD_DIM // 16])
-            c_fp4 = pl.reinterpret_view(c_payload, pl.FP4E2M1X2)
-            c_values = pl.cast(c_fp4, pl.BF16)
-            c_grouped = pl.reshape(c_values, [GATHER_KEY_TILE * (HEAD_DIM // 16), 16])
-            # BF16 scales can exceed the FP16 range; multiply in FP32.
-            c_scales = pl.cast(c_factors, pl.FP32)
-            c_scale_column = pl.reshape(c_scales, [GATHER_KEY_TILE * (HEAD_DIM // 16), 1])
-            c_values_fp32 = pl.cast(c_grouped, pl.FP32)
-            c_scaled = pl.row_expand_mul(c_values_fp32, c_scale_column)
-            c_decoded = pl.cast(c_scaled, pl.BF16, mode="rint")
-            decoded = pl.reshape(c_decoded, [GATHER_KEY_TILE, HEAD_DIM])
-            pl.tile.store(decoded, [row, 0], decoded_compressed)
-    return window_ready, compressed_ready
+_SPARSE_MLA_FILENAME = "sparse_mla.cpp" if LOCAL_H == 64 else f"sparse_mla_h{LOCAL_H}.cpp"
+_SPARSE_MLA_SOURCE = Path(__file__).parent / "kernels" / _SPARSE_MLA_FILENAME
 
 
-@pl.jit.inline(auto_scope=False)
-def gather_decoded_caches(
-    decoded_window: pl.Tensor[[CACHE_WINDOW_ROWS, HEAD_DIM], pl.BF16],
-    decoded_compressed: pl.Tensor[[CACHE_COMPRESSED_ROWS, HEAD_DIM], pl.BF16],
-    wi: pl.Tensor[[T_DYN, 128], pl.INT32],
-    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
-    indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
+@pl.jit.extern(core_type="mixed", aic_source=_SPARSE_MLA_SOURCE, aiv_source=_SPARSE_MLA_SOURCE,
+               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
+def _sparse_mla(
+    query: pl.Tensor,
+    window: pl.Tensor,
+    window_scale: pl.Tensor,
+    compressed: pl.Tensor,
+    compressed_scale: pl.Tensor,
+    window_indices: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
-    window_ready: pl.Scalar[pl.TASK_ID],
-    compressed_ready: pl.Scalar[pl.TASK_ID],
-    previous: pl.Scalar[pl.TASK_ID],
-):
-    selected_rows = pl.tensor.dim(selected, 0) * SELECTED_KEYS
-    dst = pl.reshape(selected, [selected_rows, HEAD_DIM])
-    workers = pl.max(1, pl.min(num_tokens * (SELECTED_KEYS // SELECTED_GATHER_TILE), SHARED_GATHER_WORKERS))
-    with pl.spmd(
-        workers, name_hint="sparse_shared_cache_gather",
-        deps=[window_ready, compressed_ready, previous],
-    ) as gathered:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, num_tokens * (SELECTED_KEYS // SELECTED_GATHER_TILE), workers):
-            token = block // (SELECTED_KEYS // SELECTED_GATHER_TILE)
-            column = block % (SELECTED_KEYS // SELECTED_GATHER_TILE) * SELECTED_GATHER_TILE
-            values = pl.tile.create([SELECTED_GATHER_TILE, HEAD_DIM], dtype=pl.BF16)
-            if column < 128:
-                ids = pl.tile.load(wi, [token, column], [1, SELECTED_GATHER_TILE])
-                safe_ids = pl.maximum(ids, 0)
-                for lane in pl.range(SELECTED_GATHER_TILE):
-                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    values = pl.tile.gather_row(
-                        values, decoded_window, [lane, 0], [physical, 0], [1, HEAD_DIM]
-                    )
-            else:
-                ids = pl.tile.load(ci, [token, column - 128], [1, SELECTED_GATHER_TILE])
-                safe_ids = pl.maximum(ids, 0)
-                for lane in pl.range(SELECTED_GATHER_TILE):
-                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    values = pl.tile.gather_row(
-                        values, decoded_compressed, [lane, 0], [physical, 0], [1, HEAD_DIM]
-                    )
-            pl.tile.store(values, [token * SELECTED_KEYS + column, 0], dst)
-            zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            for lane in pl.range(SELECTED_GATHER_TILE):
-                if pl.tile.read(ids, [0, lane]) < 0:
-                    pl.tile.store(zero, [token * SELECTED_KEYS + column + lane, 0], dst)
-            pl.tile.store(ids, [token, column], indices)
-    return gathered
-
-
-@pl.jit.inline(auto_scope=False)
-def _attend_cache_shared(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    query_ready: pl.Scalar[pl.TASK_ID],
-):
-    window_rows = pl.tensor.dim(window, 0) * 128
-    compressed_rows = pl.tensor.dim(compressed, 0) * 128
-    decoded_window = pl.create_tensor([window_rows, HEAD_DIM], dtype=pl.BF16)
-    decoded_compressed = pl.create_tensor([compressed_rows, HEAD_DIM], dtype=pl.BF16)
-    window_ready, compressed_ready = decode_packed_caches(
-        window, window_scale, compressed, compressed_scale,
-        decoded_window, decoded_compressed, query_ready,
-    )
-    capacity = pl.max(1, pl.min(TOKEN_TILE, num_tokens))
-    selected = pl.create_tensor([capacity, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
-    indices = pl.create_tensor([capacity, SELECTED_KEYS], dtype=pl.INT32)
-    previous = query_ready
-    for offset in pl.range(0, num_tokens, TOKEN_TILE):
-        count = pl.min(TOKEN_TILE, num_tokens - offset)
-        q = pl.slice(query, [count, LOCAL_H * HEAD_DIM], [offset, 0])
-        wi = pl.slice(window_indices, [count, 128], [offset, 0])
-        ci = pl.slice(compressed_indices, [count, INDEX_TOPK], [offset, 0])
-        out = pl.slice(output, [count, LOCAL_H * HEAD_DIM], [offset, 0])
-        gathered = gather_decoded_caches(
-            decoded_window, decoded_compressed, wi, ci, selected, indices,
-            count, window_ready, compressed_ready, previous,
-        )
-        previous = attend_selected(q, selected, indices, sink, out, count, gathered)
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def _attend_packed_block(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
-    indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    query_ready: pl.Scalar[pl.TASK_ID],
-):
-    selected, indices, gathered = gather_packed(
-        window, window_scale, compressed, compressed_scale,
-        window_indices, compressed_indices, selected, indices, num_tokens, query_ready, max_workers=GATHER_WORKERS,
-        name_hint="c2a_gather",
-    )
-    attended = attend_selected(query, selected, indices, sink, output, num_tokens, gathered)
-    return attended
+) -> pl.Tensor:
+    """Gather packed KV into L1 and compute sink-aware sparse attention."""
+    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1803,43 +1539,12 @@ def attend_packed(
     num_tokens: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
 ):
-    marker = pl.create_tensor([1, 16], dtype=pl.FP32)
-    with pl.spmd(1, name_hint="sparse_query_ready", deps=[source_ready]) as ready:
-        block = pl.tile.get_block_idx()
-        marker[block:block + 1, :] = pl.cast(query[0:1, 0:16], pl.FP32)
-
-    cache_rows = (pl.tensor.dim(window, 0) + pl.tensor.dim(compressed, 0)) * 128
-    use_shared = pl.cast(0, pl.INT32)
-    if cache_rows <= CACHE_MAX_ROWS:
-        if cache_rows < num_tokens * SELECTED_KEYS:
-            use_shared = pl.cast(1, pl.INT32)
-    if use_shared == 1:
-        output = _attend_cache_shared(
-            query, window_indices, window, window_scale, compressed_indices,
-            compressed, compressed_scale, sink, output, num_tokens, ready,
+    workers = pl.max(1, pl.min(num_tokens, pl.system.available_cluster_count()))
+    with pl.spmd(workers, name_hint="sparse_mla", deps=[source_ready], sync_start=True):
+        output = _sparse_mla(
+            query, window, window_scale, compressed, compressed_scale,
+            window_indices, compressed_indices, sink, output, num_tokens,
         )
-    else:
-        if TP_SIZE == 1 and num_tokens <= 12:
-            ready = attend_packed_cohorts(
-                query, window_indices, window, window_scale, compressed_indices,
-                compressed, compressed_scale, sink, output, num_tokens, ready,
-                gather_name="c2a_gather", attn_name="c2a_sparse_attn",
-            )
-        else:
-            capacity = pl.max(1, pl.min(TOKEN_TILE, num_tokens))
-            selected = pl.create_tensor([capacity, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
-            indices = pl.create_tensor([capacity, SELECTED_KEYS], dtype=pl.INT32)
-            for offset in pl.range(0, num_tokens, TOKEN_TILE):
-                count = pl.min(TOKEN_TILE, num_tokens - offset)
-                q = pl.slice(query, [count, LOCAL_H * HEAD_DIM], [offset, 0])
-                wi = pl.slice(window_indices, [count, 128], [offset, 0])
-                ci = pl.slice(compressed_indices, [count, INDEX_TOPK], [offset, 0])
-                out = pl.slice(output, [count, LOCAL_H * HEAD_DIM], [offset, 0])
-                ready = _attend_packed_block(
-                    q, wi, window, window_scale,
-                    ci, compressed, compressed_scale,
-                    sink, out, selected, indices, count, ready,
-                )
     return output
 
 
@@ -1890,89 +1595,6 @@ def l2_sparse_attention(
     output = attend_packed(
         query, window_indices, window, window_scale, compressed_indices,
         compressed, compressed_scale, sink, output, rows, source_ready,
-    )
-    return output
-
-
-_attend_cohort = make_attend_selected_chunk(
-    vector_query=False, selected_rows=PACKED_COHORT_TILE, max_workers=16,
-)
-
-
-@pl.jit.inline(auto_scope=False)
-def attend_packed_cohorts(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    rows: pl.Scalar[pl.INT32],
-    source_ready: pl.Scalar[pl.TASK_ID],
-    gather_name: pl.constexpr,
-    attn_name: pl.constexpr,
-):
-    selected_a = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
-    selected_b = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
-    combined_a = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS], dtype=pl.INT32)
-    combined_b = pl.create_tensor([PACKED_COHORT_TILE, SELECTED_KEYS], dtype=pl.INT32)
-    done_a = source_ready
-    done_b = source_ready
-    for start in pl.range(0, rows, 2 * PACKED_COHORT_TILE):
-        width = pl.min(PACKED_COHORT_TILE, (rows - start + 1) // 2)
-        active_a = width
-        wi_a = pl.slice(window_indices, [active_a, WINDOW_KEYS], [start, 0])
-        ci_a = pl.slice(compressed_indices, [active_a, INDEX_TOPK], [start, 0])
-        query_a = pl.slice(query, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
-        output_a = pl.slice(output, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
-        selected_a, combined_a, gathered_a = gather_packed(
-            window, window_scale, compressed, compressed_scale,
-            wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32, name_hint=gather_name,
-        )
-        done_a = _attend_cohort(
-            query_a, selected_a, combined_a, sink, output_a, 0, active_a, gathered_a, name_hint=attn_name,
-        )
-        if start + width < rows:
-            active_b = pl.min(PACKED_COHORT_TILE, rows - start - width)
-            wi_b = pl.slice(window_indices, [active_b, WINDOW_KEYS], [start + width, 0])
-            ci_b = pl.slice(compressed_indices, [active_b, INDEX_TOPK], [start + width, 0])
-            query_b = pl.slice(query, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
-            output_b = pl.slice(output, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
-            selected_b, combined_b, gathered_b = gather_packed(
-                window, window_scale, compressed, compressed_scale,
-                wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32, name_hint=gather_name,
-            )
-            done_b = _attend_cohort(
-                query_b, selected_b, combined_b, sink, output_b, 0, active_b, gathered_b, name_hint=attn_name,
-            )
-    complete = pl.system.task_dummy(deps=[done_a, done_b])
-    return complete
-
-
-@pl.jit(auto_scope=False)
-def l2_c2a_attention(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Out[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
-):
-    query.bind_dynamic(0, T_DYN)
-    window.bind_dynamic(0, ORI_BLOCKS_DYN)
-    compressed.bind_dynamic(0, CMP_BLOCKS_DYN)
-    rows = pl.tensor.dim(query, 0)
-    source_ready = pl.system.task_dummy(deps=[])
-    done = attend_packed_cohorts(
-        query, window_indices, window, window_scale, compressed_indices,
-        compressed, compressed_scale, sink, output, rows, source_ready,
-        gather_name="c2a_gather", attn_name="c2a_sparse_attn",
     )
     return output
 
@@ -2498,9 +2120,6 @@ def golden_compressed_attention(
     }
 
 
-prefill_attend_sparse = make_attend_selected_chunk(vector_query=True)
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -2525,6 +2144,8 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--runtime-dir", type=str)
+    parser.add_argument("--save-data", action="store_true", help="save inputs and golden outputs for replay")
+    parser.add_argument("--golden-data", type=str, help="replay a directory containing in/ and out/ tensors")
     args = parser.parse_args()
     if args.tp != TP_SIZE:
         raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
@@ -2536,6 +2157,8 @@ if __name__ == "__main__":
         raise ValueError("--runtime-dir requires one --mode")
     if args.mode == "gather" and (args.fixture or args.runtime_dir):
         raise ValueError("Gather validation generates its own boundary fixtures")
+    if (args.save_data or args.golden_data) and args.mode not in ("packed", "bf16", "c2a"):
+        parser.error("golden snapshots require one sparse MLA mode: packed, bf16 or c2a")
     if args.rows is not None and args.rows < 1:
         raise ValueError("--rows must be positive")
     if args.mode == "gather":
@@ -2575,8 +2198,6 @@ if __name__ == "__main__":
                 wp, ws, cp, cs = fixture["wp"], fixture["ws"], fixture["cp"], fixture["cs"]
 
             modes = ["packed", "bf16"] if args.mode in ("both", "all") else [args.mode]
-            if args.mode == "all" and TP_SIZE == 1:
-                modes.append("c2a")
             for mode in modes:
                 reference_mode = "packed" if mode == "c2a" else mode
                 if fixture is None:
@@ -2599,7 +2220,7 @@ if __name__ == "__main__":
                                   compressed_indices=compressed_indices, compressed=cp, compressed_scale=cs, sink=sink)
                     reference = expected.flatten(1)
                     result_dtype = torch.bfloat16
-                    entry = l2_c2a_attention if mode == "c2a" else l2_sparse_attention
+                    entry = l2_sparse_attention
                 else:
                     inputs = dict(query=query.float(), window=window.float().reshape(-1, 128, HEAD_DIM),
                                   window_indices=window_indices, compressed=compressed.float().reshape(-1, 128, HEAD_DIM),
@@ -2621,6 +2242,8 @@ if __name__ == "__main__":
                     config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
                     compile_only=args.compile_only,
                     runtime_dir=args.runtime_dir,
+                    save_data=args.save_data,
+                    golden_data=args.golden_data,
                 )
                 records.append(dict(mode=mode, rows=rows, passed=result.passed, work_dir=str(result.work_dir)))
                 if not result.passed:
