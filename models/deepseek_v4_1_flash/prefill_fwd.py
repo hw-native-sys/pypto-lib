@@ -103,7 +103,6 @@ from prefill_c2a_full import prefill_c2a_full_attention
 from prefill_c2a_reuse import prefill_c2a_reuse_attention
 from prefill_c1a_reindex import prefill_c1a_reindex_attention
 from prefill_c1a_reuse import prefill_c1a_reuse_attention
-from expert_routed import build_mxfp4_pair_lut
 from rmsnorm import rms_norm_tiled
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 
@@ -312,7 +311,6 @@ def _prefill_moe(
         pl.FP8E8M0,
         pl.MX_B_NN,
     ],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[
         [D // 32, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
@@ -393,7 +391,6 @@ def _prefill_moe(
                 round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
                 gate_weight, correction_bias,
                 routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
-                mxfp4_pair_lut,
                 shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
                 round_next, round_mixed, round_output,
                 recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
@@ -475,7 +472,6 @@ def l2_prefill_fwd(
     shared_w2_scale: pl.Tensor[[N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     counts: pl.Tensor[[2], pl.INT32],
     replay_rows: pl.Tensor[[CAPACITY], pl.INT32],
     position_ids: pl.Tensor[[2, CAPACITY], pl.INT32],
@@ -717,7 +713,7 @@ def l2_prefill_fwd(
         moe_ready = _prefill_moe(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
-            mxfp4_pair_lut, layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
+            layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
             layer_shared_w3, layer_shared_w3_scale, next_pre, ffn_mixed, next_hidden,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
@@ -794,7 +790,6 @@ def l3_prefill_fwd(
     shared_w2_scale: pl.Tensor[[RANKS, N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     shared_w3: pl.Tensor[[RANKS, N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[RANKS, N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    mxfp4_pair_lut: pl.Tensor[[RANKS, 2, 256], pl.INT16],
     counts: pl.Tensor[[RANKS, 2], pl.INT32],
     replay_rows: pl.Tensor[[RANKS, CAPACITY], pl.INT32],
     position_ids: pl.Tensor[[RANKS, 2, CAPACITY], pl.INT32],
@@ -936,7 +931,6 @@ def l3_prefill_fwd(
             shared_w1[rank], shared_w1_scale[rank],
             shared_w2[rank], shared_w2_scale[rank],
             shared_w3[rank], shared_w3_scale[rank],
-            mxfp4_pair_lut[rank],
             counts[rank],
             replay_rows[rank],
             position_ids[rank],
@@ -1001,7 +995,6 @@ PREFILL_TENSORS = (
     "ffn_norm_weight", "gate_weight", "correction_bias",
     "routed_w1", "routed_w1_scale", "routed_w2", "routed_w2_scale", "routed_w3", "routed_w3_scale",
     "shared_w1", "shared_w1_scale", "shared_w2", "shared_w2_scale", "shared_w3", "shared_w3_scale",
-    "mxfp4_pair_lut",
     "counts",
     "replay_rows",
     "position_ids",
@@ -1289,8 +1282,7 @@ class ResidentPrefillWeights:
 
     def upload(self, runtime, rank: int, handles):
         """Upload one projection at a time into persistent named allocations."""
-        from quant import pack_bf16_nz, pack_fp8_nz, pack_mx_b_scale
-        from expert_routed import pack_mxfp4_weight_tiles
+        from quant import pack_bf16_nz, pack_fp8_nz, pack_mx_b_scale, pack_mxfp4_weight_tiles
 
         if rank not in range(self.ranks):
             raise ValueError(f"expert rank must be in [0, {self.ranks})")
@@ -1602,7 +1594,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         "logits": ((16, VOCAB), torch.float32),
         "sampled_ids": ((16, 8), torch.int32),
     }
-    constants = {*weights.tensor_layouts, "mxfp4_pair_lut"}
+    constants = set(weights.tensor_layouts)
     cache_names = {
         "window_cache", "window_scales", "compressed_cache", "compressed_scales",
         "index_cache", "index_scales", "state_cache",
@@ -1635,7 +1627,6 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             )
             rope_tables = inputs["freqs_cos"], inputs["freqs_sin"]
             host_cache.append({name: inputs[name] for name in cache_names})
-            inputs["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
             for name in PREFILL_TENSORS:
                 if name in weights.tensor_layouts:
                     shape, dtype = weights.tensor_layouts[name]
@@ -1784,7 +1775,6 @@ def build_tensor_specs():
         "sampled_ids": ([RANKS, 16, 8], torch.int32),
     }
     values = prepare_prefill_inputs(torch.zeros((CAPACITY, D), dtype=torch.bfloat16), CAPACITY)
-    values["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
     specs = []
     for name in PREFILL_TENSORS:
         if name in weight_layouts:

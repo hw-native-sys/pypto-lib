@@ -76,7 +76,6 @@ from prefill_c2a_full import (
     golden_reference_c2a, make_attention_inputs, reference_attention,
 )
 from prefill_c2a_reuse import prefill_c2a_reuse, golden_reference_c2a_reuse, make_c2a_reuse_inputs
-from expert_routed import build_mxfp4_pair_lut
 from rmsnorm import golden_rms_norm
 
 
@@ -178,7 +177,6 @@ def l2_prefill_layer_moe(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
     routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
@@ -208,7 +206,7 @@ def l2_prefill_layer_moe(
         x_hc_mid, attn_pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         ffn_norm_weight, gate_weight, correction_bias,
         routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
-        mxfp4_pair_lut, shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
+        shared_w1, shared_w1_scale, shared_w2, shared_w2_scale,
         shared_w3, shared_w3_scale, recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         arrived, data_arrived, routed_output, combine_arrived,
         ffn_input, ffn_owned, next_pre_mix, ffn_post_mix, ffn_residual_mix,
@@ -285,7 +283,6 @@ def l3_prefill_layer(
     routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    mxfp4_pair_lut: pl.Tensor[[EP_SIZE, 2, 256], pl.INT16],
     shared_w1: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[EP_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
@@ -360,7 +357,7 @@ def l3_prefill_layer(
             x_hc_mid[rank], attn_pre_mix[rank], hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
             ffn_norm_weight[rank], gate_weight[rank], correction_bias[rank],
             routed_w1[rank], routed_w1_scale_r, routed_w2[rank], routed_w2_scale_r,
-            routed_w3[rank], routed_w3_scale_r, mxfp4_pair_lut[rank],
+            routed_w3[rank], routed_w3_scale_r,
             shared_w1[rank], shared_w1_scale_r, shared_w2[rank], shared_w2_scale_r,
             shared_w3[rank], shared_w3_scale_r,
             ffn_input[rank], ffn_owned[rank], next_pre_mix[rank], ffn_post_mix[rank],
@@ -394,7 +391,6 @@ MOE_SHARED_NAMES = (
 )
 MOE_RANK_NAMES = (
     "routed_w1", "routed_w1_scale", "routed_w2", "routed_w2_scale", "routed_w3", "routed_w3_scale",
-    "mxfp4_pair_lut",
 )
 MOE_REPLICATED_NAMES = MOE_GATE_NAMES + MOE_SHARED_NAMES
 
@@ -445,7 +441,6 @@ def make_moe_rank_inputs(rank):
         "routed_w1": w1, "routed_w1_scale": w1_scale,
         "routed_w2": w2, "routed_w2_scale": w2_scale,
         "routed_w3": w3, "routed_w3_scale": w3_scale,
-        "mxfp4_pair_lut": build_mxfp4_pair_lut(),
     }
 
 
@@ -513,7 +508,6 @@ def golden_moe_rows(tensors, ffn_input, tokens):
     moe_tensors = {
         "x": local_input,
         "norm_weight": tensors["ffn_norm_weight"],
-        "mxfp4_pair_lut": tensors["mxfp4_pair_lut"],
         "output": torch.zeros_like(local_input),
         "num_tokens": counts,
     }
@@ -819,7 +813,6 @@ def build_specs(args, mode, initial_state):
     for name, shape in weight_shapes.items():
         dtype = torch.float8_e8m0fnu if name.endswith("_scale") else torch.uint8
         shapes[name] = torch.empty(shape, dtype=dtype, device="meta")
-    shapes["mxfp4_pair_lut"] = build_mxfp4_pair_lut()
     shapes["token_owners"] = make_token_owners(args.tokens, 0)
     # The spec order is the device entry's parameter order.
     input_names = (

@@ -366,3 +366,69 @@ def unpack_mx_scale_codes(scale: torch.Tensor, *, side: str = "a") -> torch.Tens
     if side == "b":
         return unpack_mx_b_scale(codes)
     raise ValueError(f"side must be 'a' or 'b', got {side!r}")
+
+
+def _pack_mxfp4_nibbles_kn_tiles(
+    nibbles_kn: torch.Tensor, k_tile: int, n_tile: int
+) -> torch.Tensor:
+    """Pack a logical [K, N] nibble matrix into Cube lane rows."""
+    k, n = nibbles_kn.shape
+    if k % k_tile or n % n_tile or k_tile % 2 or n_tile % 2:
+        raise ValueError("MXFP4 tile dimensions must divide K/N and be even")
+    k_blocks = k // k_tile
+    n_blocks = n // n_tile
+    blocked = nibbles_kn.reshape(k_blocks, k_tile, n_blocks, n_tile)
+    blocked = blocked.permute(2, 0, 1, 3)
+    lanes = blocked.reshape(n_blocks, k_blocks, 2, k_tile // 2, n_tile)
+    low = lanes[..., 0::2] & 0x0F
+    high = lanes[..., 1::2] & 0x0F
+    packed = low | (high << 4)
+    lane_bytes = k_tile * n_tile // 4
+    return packed.contiguous().reshape(n_blocks * k_blocks * 2, lane_bytes)
+
+
+def pack_mxfp4_weight_tiles(
+    packed_weight_fp4: torch.Tensor, k_tile: int, n_tile: int
+) -> torch.Tensor:
+    """Reorder checkpoint [N, K/2] bytes into Cube FP4 tiles."""
+    payload = packed_weight_fp4.contiguous().view(torch.uint8)
+    *lead, n, half_k = payload.shape
+    k = 2 * half_k
+    matrices = payload.reshape(-1, n, half_k)
+    packed_rows = k * n // n_tile
+    packed_cols = n_tile // 2
+    result = torch.empty(
+        [matrices.shape[0], packed_rows, packed_cols], dtype=torch.uint8
+    )
+    for index, matrix in enumerate(matrices):
+        nibbles = torch.empty([n, k], dtype=torch.uint8)
+        nibbles[:, 0::2] = matrix & 0x0F
+        nibbles[:, 1::2] = matrix >> 4
+        result[index] = _pack_mxfp4_nibbles_kn_tiles(
+            nibbles.t(), k_tile, n_tile
+        ).reshape(packed_rows, packed_cols)
+    return result.reshape(*lead, packed_rows, packed_cols)
+
+
+def unpack_mxfp4_weight_tiles(
+    packed: torch.Tensor, k: int, n: int, k_tile: int, n_tile: int
+) -> torch.Tensor:
+    """Decode Cube FP4 tiles to an FP8 [K, N] reference matrix."""
+    *lead, tile_rows, lane_bytes = packed.shape
+    k_blocks = k // k_tile
+    n_blocks = n // n_tile
+    if tile_rows != n_blocks * k_blocks * 2 or lane_bytes != k_tile * n_tile // 4:
+        raise ValueError("MXFP4 tile payload does not match requested matrix")
+    payloads = packed.contiguous().view(torch.uint8).reshape(-1, tile_rows, lane_bytes)
+    output = torch.empty(payloads.shape[0], k, n, dtype=torch.float8_e4m3fn)
+    for batch in range(payloads.shape[0]):
+        lane_shape = (n_blocks, k_blocks, 2, k_tile // 2, n_tile // 2)
+        lane_bytes_view = payloads[batch].reshape(lane_shape)
+        low = lane_bytes_view & 0x0F
+        high = lane_bytes_view >> 4
+        lanes = torch.stack((low, high), dim=-1)
+        blocked = lanes.reshape(n_blocks, k_blocks, k_tile, n_tile)
+        nibbles_kn = blocked.permute(1, 2, 0, 3).reshape(k, n)
+        codes = FP4_E4M3_CODES.to(torch.uint8)[nibbles_kn.to(torch.long)]
+        output[batch] = codes.view(torch.float8_e4m3fn)
+    return output.reshape(*lead, k, n)
