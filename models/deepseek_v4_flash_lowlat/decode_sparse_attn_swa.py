@@ -16,6 +16,8 @@ variants live in sibling modules.
 
 import pypto.language as pl
 
+from fp32_numerics import rne_exp_nonpositive
+
 from o_proj_grouped import o_proj_grouped
 
 from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
@@ -167,6 +169,7 @@ def sparse_attn_swa_packed(
     sparse_blk_mi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, HEAD_DIM], dtype=pl.FP32)
+    sparse_blk_li_flat = pl.reshape(sparse_blk_li, [1, T * QK_M_BOX * SPARSE_BLOCKS])
 
     with pl.spmd(T, name_hint="qk_pv", allow_early_resolve=True) as qk_tid:
         qk_t = pl.tile.get_block_idx()
@@ -218,8 +221,18 @@ def sparse_attn_swa_packed(
                 qk_mi = pl.row_max(qk_scores)
                 # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
                 # blocks die in the merge alpha/beta -- no mask multiply needed.
-                qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                qk_li = pl.row_sum(qk_exp)
+                qk_delta = pl.create_tensor([QK_M_BOX, ATTN_K_TILE], dtype=pl.FP32)
+                qk_delta = pl.row_expand_sub(qk_scores, qk_mi)
+                qk_exp = rne_exp_nonpositive(qk_delta, rows=QK_M_BOX, cols=ATTN_K_TILE)
+                qk_sum64 = pl.add(qk_exp[0:QK_M_BOX, 0:64], qk_exp[0:QK_M_BOX, 64:128])
+                qk_sum32 = pl.add(qk_sum64[0:QK_M_BOX, 0:32], qk_sum64[0:QK_M_BOX, 32:64])
+                qk_sum16 = pl.add(qk_sum32[0:QK_M_BOX, 0:16], qk_sum32[0:QK_M_BOX, 16:32])
+                qk_sum8 = pl.add(qk_sum16[0:QK_M_BOX, 0:8], qk_sum16[0:QK_M_BOX, 8:16])
+                qk_sum8_t_physical = pl.transpose(qk_sum8, 0, 1)
+                qk_sum8_t = pl.slice(qk_sum8_t_physical, [8, QK_M_BOX], [0, 0], valid_shape=[8, QK_M_TILE])
+                qk_sum4_t = pl.add(qk_sum8_t[0:4, 0:QK_M_BOX], qk_sum8_t[4:8, 0:QK_M_BOX])
+                qk_sum2_t = pl.add(qk_sum4_t[0:2, 0:QK_M_BOX], qk_sum4_t[2:4, 0:QK_M_BOX])
+                qk_sum1_t = pl.add(qk_sum2_t[0:1, 0:QK_M_BOX], qk_sum2_t[1:2, 0:QK_M_BOX])
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
                 qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
                 # One head tile per card, so the whole (valid) accumulator stores
@@ -227,7 +240,7 @@ def sparse_attn_swa_packed(
                 # partial 16x16 box, which has no address.
                 qk_row = qk_token_base + qk_sb * QK_M_BOX
                 sparse_blk_mi[qk_row : qk_row + QK_M_BOX, 0 : 1] = qk_mi
-                sparse_blk_li[qk_row : qk_row + QK_M_BOX, 0 : 1] = qk_li
+                sparse_blk_li_flat[0:1, qk_row : qk_row + QK_M_BOX] = qk_sum1_t
                 sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0 : HEAD_DIM] = qk_oi
 
     # Flatten the one-block SWA merge over token/head tiles into a single
@@ -358,6 +371,9 @@ def sparse_attn_test(
             pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0),
             1.0,
         )
+        v_indices = pl.cast(swa_indices[0:T, 0:ATTN_K_TILE], pl.FP32)
+        v_mapped = pl.minimum(pl.maximum(pl.add(v_indices, 1.0), 0.0), 1.0)
+        v_valid = pl.mul(v_valid, v_mapped)
         sparse_bias[0:T, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     sparse_attn_swa(
         q,
@@ -377,6 +393,7 @@ def sparse_attn_test(
 
 
 def golden_sparse_attn(tensors):
+    import math
     """Torch reference: sparse_attn decode path followed by grouped o_proj."""
     import torch
     from utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
@@ -433,8 +450,16 @@ def golden_sparse_attn(tensors):
             scores = bf16_matmul_fp32(q_t, kv_tile.T) * SOFTMAX_SCALE
             scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
             mi = scores.max(dim=-1, keepdim=True).values
-            exp_scores = torch.exp(scores - mi).masked_fill(~valid_tile.unsqueeze(0), 0.0)
-            li = exp_scores.sum(dim=-1, keepdim=True)
+            exp_values = [math.exp(value) for value in (scores - mi).reshape(-1).tolist()]
+            exp_scores = torch.tensor(exp_values, dtype=torch.float32, device=scores.device).reshape_as(scores)
+            exp_scores = exp_scores.masked_fill(~valid_tile.unsqueeze(0), 0.0)
+            li64 = exp_scores[..., :64] + exp_scores[..., 64:128]
+            li32 = li64[..., :32] + li64[..., 32:64]
+            li16 = li32[..., :16] + li32[..., 16:32]
+            li8 = li16[..., :8] + li16[..., 8:16]
+            li4 = li8[..., :4] + li8[..., 4:8]
+            li2 = li4[..., :2] + li4[..., 2:4]
+            li = li2[..., :1] + li2[..., 1:2]
             oi = bf16_matmul_fp32(exp_scores.to(torch.bfloat16).float(), kv_tile.to(torch.bfloat16).float())
             block_mi.append(mi)
             block_li.append(li)

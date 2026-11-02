@@ -24,6 +24,34 @@ finite denominators. Deferred RMS and dequantization order are unchanged.
 Standalone Q validation checks its produced head group; the other pure-Out
 heads have no initialized-value guarantee.
 
+Gate, QKV and SWA share scope-local FP32 compensation primitives in
+`fp32_numerics.py`; these helpers create no tasks or global-memory buffers.
+The gate's softplus evaluates `log(1 + exp(-abs(x)))` before adding the
+nonnegative part of the input. Its logarithm correction consumes the
+unrounded two-part sum. The square-root correction applies within
+`[2^-40, 2^40]` and retains the original square-root result outside that
+interval. Owning Torch references round double-precision unary results to
+FP32 at the specified boundaries and preserve the explicit reduction order.
+Finite-case validation does not establish correctly rounded results for
+every FP32 input or replace complete-forward validation.
+
+The attention and final RMSNorm references reduce FP32 squared inputs in
+FP64, then round the sum once to FP32. The mean and epsilon addition remain
+FP32; the inverse square root is evaluated in FP64 and rounded to FP32.
+This specifies the reference's statistical precision without changing epsilon,
+activation dtypes, or the numerical comparison thresholds.
+
+RMSNorm compensates its pairwise FP32 square-sum and refines the reciprocal-
+square-root seed with a product-error residual. The compensated reduction
+applies when the original squared sum is at most `2^40`; the inverse correction
+applies for variance at most `2^40`. Larger values retain the original path.
+The reference and comparison thresholds are unchanged. Finite input tests do
+not establish all-domain correctly rounded arithmetic or a performance gain.
+
+Q/KV kernels use
+the existing square-root correction and compensated reciprocal at their
+separately rounded FP32 inverse boundaries.
+
 ## Reproducible reduction order
 
 The output projection publishes each rank's FP32 contribution into a separate
@@ -38,6 +66,18 @@ The HC head similarly stores each split-K projection in its own FP32 slot.
 An ordered reduction adds the splits before the original gate, residual mix,
 and BF16 conversion. The split-local matrix multiplication and RMS arithmetic
 retain their original order.
+
+HC-pre Sinkhorn column sums use the explicit four-row pairing
+`(row0 + row1) + (row2 + row3)` in both implementations.
+
+SWA, HCA, and CSA softmax use a compensated, range-reduced FP32 exponential for finite
+max-subtracted scores in `[-80, 0]`, with the existing exponential outside
+that interval. SWA/HCA use a 128-element denominator tree; CSA uses a
+32-element tree. Each level pairs the two halves with FP32 additions. The independent
+Torch reference evaluates the exponential in double precision before FP32
+rounding and uses the same specified addition order. HCA/CSA compensate their
+final FP32 quotient before the existing BF16 packing. This does not claim
+correct rounding for every FP32 input or complete-forward agreement.
 
 These rules make the reduction order explicit. They do not establish bitwise
 equivalence across different hardware, compiler revisions, or other operations

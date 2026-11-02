@@ -207,6 +207,9 @@ def attention_swa(
             pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0),
             1.0,
         )
+        v_indices = pl.cast(swa_indices[0:T, 0:WIN], pl.FP32)
+        v_mapped = pl.minimum(pl.maximum(pl.add(v_indices, 1.0), 0.0), 1.0)
+        v_valid = pl.mul(v_valid, v_mapped)
         sparse_bias[0:T, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
