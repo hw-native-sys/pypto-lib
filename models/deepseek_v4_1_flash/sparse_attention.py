@@ -1244,7 +1244,12 @@ def gather_sparse_attention(
     output = output[:num_tokens, :]
     window_indices = window_indices[:num_tokens, :]
     compressed_indices = compressed_indices[:num_tokens, :]
-    workers = pl.max(1, pl.min(num_tokens, WORKERS))
+    if compressed_keys == 0:
+        # Use fewer workers without increasing the maximum queries per worker.
+        query_waves = pl.max(1, (num_tokens + WORKERS - 1) // WORKERS)
+        workers = pl.max(1, pl.min(WORKERS, (num_tokens + query_waves - 1) // query_waves))
+    else:
+        workers = pl.max(1, pl.min(num_tokens, WORKERS))
     with pl.spmd(workers, name_hint="sparse_gather_vf", deps=[source_ready]) as attended:
         output = _gather_sparse_vf_rows(
             output, query, sink, window, window_scale, compressed, compressed_scale,
