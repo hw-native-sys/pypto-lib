@@ -14,7 +14,7 @@ from config import (
     INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN, LOCAL_T_DYN,
 )
 from hc import hc_head_norm, hc_project, hc_sinkhorn, hc_post
-from decode_indexer import c1a_index, score_reindex, select_pool_index_topk
+from decode_indexer import c1a_index, score_select_reindex
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from sparse_attention import (
     gather_packed, attend_selected, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE, attend_packed_cohorts,
@@ -116,14 +116,10 @@ def decode_c1a_reindex(
         num_tokens, score_width, x_ready,
         qb_payload, qb_scales,
     )
-    scores_tid = score_reindex(
+    selection_ready = score_select_reindex(
         index_query, index_query_scale, index_weights, index_cache, index_cache_scale,
         index_block_table, request_ids, compressed_lens, pool_block_ids, pool_block_counts,
-        scores, num_tokens, x_ready, query_tid, weights_tid, x_ready,
-    )
-    selection_ready = select_pool_index_topk(
-        scores, pool_block_ids, pool_block_counts, index_block_table, request_ids, compressed_lens,
-        topk_indices, num_tokens, scores_tid,
+        scores, topk_indices, num_tokens, x_ready, query_tid, weights_tid, x_ready,
     )
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     if num_tokens <= 12:

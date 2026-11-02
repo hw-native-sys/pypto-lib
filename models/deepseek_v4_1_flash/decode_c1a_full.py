@@ -13,8 +13,8 @@ import pypto.language as pl
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
 from o_proj import o_proj
 from decode_indexer import (
-    select_candidate_block_pool, c1a_index, score_select_c1a_groups,
-    publish_index_rows, c1a_project_index_key, c1a_rotate_index_key,
+    select_candidate_block_pool, c1a_index, score_select_paged,
+    publish_index_rows, project_index_key, rotate_index_key,
 )
 from sparse_attention import (
     attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
@@ -131,14 +131,14 @@ def decode_c1a_full(
         norm_worker = pl.tile.get_block_idx()
         rms_norm(projected, compressor_norm_weight, latent, norm_worker, num_tokens, width=HEAD_DIM)
     projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    pk_tid = c1a_project_index_key(latent, index_wk, projected_key, num_tokens, nc_tid)
+    pk_tid = project_index_key(latent, index_wk, projected_key, num_tokens, nc_tid, max_workers=8)
     normalized_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     with pl.spmd((num_tokens + 7) // 8, name_hint="norm_idx_k", deps=[pk_tid]) as nk_tid:
         norm_worker = pl.tile.get_block_idx()
         rms_norm(projected_key, index_norm_weight, normalized_key, norm_worker, num_tokens, width=INDEX_DIM)
     index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    ik_tid = c1a_rotate_index_key(
-        normalized_key, compressed_rope_cos, compressed_rope_sin, index_key, num_tokens, nk_tid,
+    ik_tid = rotate_index_key(
+        normalized_key, compressed_rope_cos, compressed_rope_sin, index_key, num_tokens, nk_tid, max_workers=32,
     )
     index_ready = publish_index_rows(
         index_key, compressed_slots, index_cache, index_cache_scale, num_tokens, x_ready, ik_tid,
@@ -157,12 +157,12 @@ def decode_c1a_full(
         num_tokens, score_width, x_ready,
         qb_payload, qb_scales,
     )
-    topk_tid, scores_tid = score_select_c1a_groups(
+    topk_tid, scores_tid = score_select_paged(
         index_query, index_query_scale, index_weights,
         index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
         scores, topk_indices,
         num_tokens, index_ready, query_tid, weights_tid,
-        pl.tensor.dim(pool_block_ids, 1),
+        pl.tensor.dim(pool_block_ids, 1), False,
     )
     pool_tid = select_candidate_block_pool(
         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
