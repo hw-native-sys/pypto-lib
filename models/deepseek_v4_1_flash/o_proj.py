@@ -48,7 +48,7 @@ HC_DIM = M.hc_dim
 
 # tiling
 O_A_N_TILE = 256
-O_B_N_TILE = 256
+O_B_N_TILE = 160
 K_TILE = 256
 D_TILE = 512
 
