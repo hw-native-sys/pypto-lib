@@ -34,7 +34,7 @@ from config import (
     STATE_BLOCKS_DYN, TP_SIZE, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, MAX_BATCH_PER_DP,
     PREFILL_MAX_TOKENS, STATE_CAPACITY, WINDOW_CACHE_GROUP, SP_T_DYN, BLOCK_SIZE,
 )
-from compressor import STATE_WIDTH, c2a_compressor_project, c2a_compressor_pool_state, c2a_compressor_publish
+from compressor import STATE_WIDTH, c2a_compressor_project, c2a_compressor_publish
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import (
     retire_prefill_signals,
@@ -43,14 +43,14 @@ from o_proj import (
 from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes, prefill_sp_post
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables
-from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj_rope
+from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from quant import dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import paged_slots, token_shards, window_metadata
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk,
-    prefill_attend_sparse, prefill_publish_window,
+    prefill_attend_sparse,
 )
 from prefill_indexer import prefill_indexer, publish_c2a_index_key
 
@@ -141,7 +141,6 @@ def prefill_c2a_full_attention(
 
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
     q_proj_rope(
@@ -152,32 +151,27 @@ def prefill_c2a_full_attention(
         qr, query,
         num_tokens,
     )
-    kv_proj_rope(
-        proj_payload, proj_scales,
-        wkv, wkv_scale, kv_norm_weight,
-        rope_cos, rope_sin,
-        kv_projection, window_kv,
-        num_tokens,
+    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    window_publish_tid = window_publish(
+        kv_projection, kv_norm_weight, rope_cos, rope_sin,
+        window_slots, window_cache, window_cache_scale,
+        num_tokens, cache_ready,
     )
-    window_publish_tid = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     c2a_compressor_project(x, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    pool_tid, state_tid = c2a_compressor_pool_state(
+    compressed_publish_tid = c2a_compressor_publish(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
         state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
+        compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache, compressed_cache_scale,
     )
 
     # Index keys come from the unrotated latent; the compressed cache stores the rotated one.
     index_publish_tid = publish_c2a_index_key(
         latent, index_wk, index_norm_weight, compressed_rope_cos, compressed_rope_sin,
-        compressed_slots, index_cache, index_cache_scale, num_tokens, pool_tid, cache_ready,
-    )
-    compressed_publish_tid = c2a_compressor_publish(
-        latent, compressed_rope_cos, compressed_rope_sin, compressed_slots,
-        compressed_cache, compressed_cache_scale, num_tokens, cache_ready, pool_tid, max_workers=64,
+        compressed_slots, index_cache, index_cache_scale, num_tokens, compressed_publish_tid, cache_ready,
     )
 
     select_tid = prefill_indexer(
@@ -189,7 +183,7 @@ def prefill_c2a_full_attention(
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
     combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
-    chunk_done = pl.system.task_dummy(deps=[select_tid, state_tid, window_publish_tid, compressed_publish_tid])
+    chunk_done = pl.system.task_dummy(deps=[select_tid, window_publish_tid, compressed_publish_tid])
     for start in pl.range(0, num_tokens, QUERY_TILE):
         active = pl.min(QUERY_TILE, num_tokens - start)
         gather_tid = gather_packed_chunk(

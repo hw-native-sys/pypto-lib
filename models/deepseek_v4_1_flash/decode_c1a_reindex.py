@@ -15,8 +15,8 @@ from config import (
 )
 from hc import hc_head_norm, hc_project, hc_sinkhorn, hc_post
 from decode_indexer import c1a_index, score_select_reindex
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
-from sparse_attention import attend_packed, publish_window_row
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from sparse_attention import attend_packed
 from o_proj import o_proj
 
 
@@ -89,7 +89,6 @@ def decode_c1a_reindex(
     x_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
     qr, query, qb_payload, qb_scales = q_proj_rope(
@@ -100,14 +99,12 @@ def decode_c1a_reindex(
         qr, query,
         num_tokens,
     )
-    kv_proj_rope(
-        proj_payload, proj_scales,
-        wkv, wkv_scale, kv_norm_weight,
-        rope_cos, rope_sin,
-        kv_projection, kv,
-        num_tokens,
+    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    window_publish(
+        kv_projection, kv_norm_weight, rope_cos, rope_sin,
+        window_slots, window_cache, window_cache_scale,
+        num_tokens, x_ready,
     )
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     score_width = pl.tensor.dim(pool_block_ids, 1) * 8
     index_query, index_query_scale, index_weights, scores, query_tid, weights_tid = c1a_index(
         x_norm, index_wq_b, index_wq_b_scale, index_weights_proj, rope_cos, rope_sin,

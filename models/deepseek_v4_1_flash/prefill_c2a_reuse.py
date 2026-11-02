@@ -29,10 +29,10 @@ from prefill_c2a_full import (
     CMP_PACKED, CMP_SCALES, REUSE_INPUT_NAMES, make_c2a_inputs, golden_reference_c2a,
     _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
 )
-from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj_rope
+from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk,
-    prefill_attend_sparse, prefill_publish_window,
+    prefill_attend_sparse,
 )
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from quant import quantize_mxfp8_cache
@@ -100,7 +100,6 @@ def prefill_c2a_reuse_attention(
 
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
     q_proj_rope(
@@ -111,14 +110,12 @@ def prefill_c2a_reuse_attention(
         qr, query,
         num_tokens,
     )
-    kv_proj_rope(
-        proj_payload, proj_scales,
-        wkv, wkv_scale, kv_norm_weight,
-        rope_cos, rope_sin,
-        kv_projection, window_kv,
-        num_tokens,
+    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    window_publish(
+        kv_projection, kv_norm_weight, rope_cos, rope_sin,
+        window_slots, window_cache, window_cache_scale,
+        num_tokens, cache_ready,
     )
-    prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)

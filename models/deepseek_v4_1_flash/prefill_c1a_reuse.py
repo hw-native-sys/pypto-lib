@@ -27,9 +27,9 @@ from prefill_c1a_full import (
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from sparse_attention import (
-    attend_packed, golden_compressed_attention, golden_prefill_c1a_attention, prefill_publish_window,
+    attend_packed, golden_compressed_attention, golden_prefill_c1a_attention,
 )
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 
 
 # model config
@@ -107,16 +107,13 @@ def prefill_c1a_reuse_attention(
             num_tokens,
         )
         source_ready = pl.system.task_dummy(deps=[])
-        window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        kv_proj_rope(
-            proj_payload, proj_scales,
-            wkv, wkv_scale, kv_norm_weight,
-            rope_cos, rope_sin,
-            kv_projection, window_kv,
-            num_tokens,
+        kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+        window_ready = window_publish(
+            kv_projection, kv_norm_weight, rope_cos, rope_sin,
+            window_slots, window_cache, window_cache_scale,
+            num_tokens, source_ready,
         )
-        window_ready = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, source_ready)
 
         attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         attend_packed(

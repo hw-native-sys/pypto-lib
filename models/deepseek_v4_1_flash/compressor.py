@@ -36,35 +36,6 @@ C1A_PROJ_K_TILE = 512
 C2A_PROJ_M_TILE = 80
 C2A_PROJ_N_TILE = 64
 C2A_PROJ_K_TILE = 256
-STATE_META_TILE = 128
-
-
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "compressor_rope.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _rotate_compressed_rows(
-    source: pl.Tensor,
-    cosine: pl.Tensor,
-    sine: pl.Tensor,
-    output: pl.InOut[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Rotate the final 64 channels of BF16 compressor rows."""
-    ...
-
-
-@pl.jit.inline(auto_scope=False)
-def compressor_rope(
-    x: pl.Tensor,
-    cos: pl.Tensor,
-    sin: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    active_tokens = pl.cast(num_tokens, pl.INT32)
-    workers = pl.min(active_tokens, 12)
-    with pl.spmd(workers, name_hint="rope_cmp"):
-        _rotate_compressed_rows(x, cos, sin, output, active_tokens)
-    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -100,31 +71,40 @@ def c1a_compressor_project(
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "compressor_publish.cpp",
                include_dirs=(pto_isa_include_dir(), str(Path(__file__).parent / "kernels")))
-def _publish_compressed_rows(
+def _c1a_compress(
     source: pl.Tensor,
     slots: pl.Tensor,
     cache: pl.InOut[pl.Tensor],
     scales: pl.InOut[pl.Tensor],
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+    norm_weight: pl.Tensor,
+    latent: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
-    """Quantize group-16 BF16 rows to packed E2M1 and publish cache pages."""
+    """Normalize, retain unrotated latent, and publish nearest-even E2M1 rows."""
     ...
 
 
 @pl.jit.inline(auto_scope=False)
 def c1a_compressor_publish(
     source: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
     scales: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
+    source_ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Publish group-16 MXFP4 with BF16 scales and nearest-even rounding."""
+    """Normalize and publish MXFP4 rows while retaining the unrotated latent."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
-    workers = pl.min(active_tokens, 8)
-    with pl.spmd(workers, name_hint="pub_cmp", deps=[cache_ready]) as published:
-        cache = _publish_compressed_rows(source, slots, cache, scales, active_tokens)
+    workers = pl.max(pl.min(active_tokens, 8), 1)
+    with pl.spmd(workers, name_hint="c1a_compress", deps=[cache_ready, source_ready]) as published:
+        cache = _c1a_compress(source, slots, cache, scales, cosine, sine, norm_weight, latent, active_tokens)
     return published
 
 
@@ -176,97 +156,31 @@ def c2a_compressor_project(
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "compressor_pool.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _pool_compressed_pairs(
+               include_dirs=(pto_isa_include_dir(), str(Path(__file__).parent / "kernels")))
+def _c2a_compress(
     kv_proj: pl.Tensor,
     score_proj: pl.Tensor,
-    state_cache: pl.Tensor,
+    state_cache: pl.InOut[pl.Tensor],
     position_ids: pl.Tensor,
     norm_weight: pl.Tensor,
     latent: pl.InOut[pl.Tensor],
     query_start_loc: pl.Tensor,
     token_to_req_indices: pl.Tensor,
     state_block_table: pl.Tensor,
+    slots: pl.Tensor,
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+    cache: pl.InOut[pl.Tensor],
+    scales: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     num_state_blocks: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
-    """Pool completed pairs and normalize BF16-rounded rows."""
+    """Pool, normalize, publish compressed rows, and update request ring state."""
     ...
 
 
 @pl.jit.inline(auto_scope=False)
-def c2a_compressor_pool(
-    kv_proj: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    score_proj: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
-    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
-    state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
-    num_state_blocks: pl.Scalar[pl.INT32],
-    pair_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Assemble partners and pool eight rows before updating ring state."""
-    active_tokens = pl.cast(num_tokens, pl.INT32)
-    state_blocks = pl.cast(num_state_blocks, pl.INT32)
-    workers = pl.max((active_tokens + 7) // 8, 1)
-    with pl.spmd(workers, name_hint="pool_cmp", deps=[pair_ready]) as pool_tid:
-        _pool_compressed_pairs(
-            kv_proj, score_proj, state_cache, position_ids, norm_weight, latent,
-            query_start_loc, token_to_req_indices, state_block_table, active_tokens, state_blocks,
-        )
-    return pool_tid
-
-
-@pl.jit.inline
-def c2a_compressor_state_write(
-    kv_proj: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    score_proj: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
-    state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
-    state_cache: pl.Tensor[[STATE_BLOCKS_DYN, STATE_CAPACITY, STATE_WIDTH], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-    pair_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Save only the final capacity rows of each chunk after all historical reads."""
-    blocks = pl.tensor.dim(state_cache, 0)
-    state_rows = blocks * STATE_CAPACITY
-    flat = pl.reshape(state_cache, [state_rows, STATE_WIDTH])
-    capacity = pl.tensor.dim(position_ids, 0)
-    positions = pl.reshape(position_ids, [1, capacity])
-    requests = pl.reshape(token_to_req_indices, [1, capacity])
-    workers = pl.max(pl.min(num_tokens, 16), 1)
-    with pl.spmd(workers, name_hint="state_cmp", deps=[pair_ready]) as state_tid:
-        worker = pl.tile.get_block_idx()
-        for base in pl.range(0, num_tokens, STATE_META_TILE):
-            count = pl.min(STATE_META_TILE, num_tokens - base)
-            position_tile = pl.load(positions, [0, base], [1, STATE_META_TILE], valid_shape=[1, count])
-            request_tile = pl.load(requests, [0, base], [1, STATE_META_TILE], valid_shape=[1, count])
-            for lane in pl.range(worker, count, workers):
-                token = base + lane
-                request = pl.cast(pl.tile.read(request_tile, [0, lane]), pl.INDEX)
-                position = pl.tile.read(position_tile, [0, lane])
-                if request >= 0 and request < pl.tensor.dim(state_block_table, 0) and position >= 0:
-                    block = pl.cast(pl.read(state_block_table, [request, 0]), pl.INDEX)
-                    if block >= 0 and block < blocks:
-                        start = pl.read(query_start_loc, [request])
-                        end = pl.min(pl.read(query_start_loc, [request + 1]), num_tokens)
-                        if token >= start and token < end and token >= end - STATE_CAPACITY:
-                            slot = pl.cast(block * STATE_CAPACITY + position % STATE_CAPACITY, pl.INDEX)
-                            kv = kv_proj[token : token + 1, :]
-                            score = score_proj[token : token + 1, :]
-                            flat[slot : slot + 1, :HEAD_DIM] = kv
-                            flat[slot : slot + 1, HEAD_DIM:] = score
-    return state_tid
-
-
-@pl.jit.inline
-def c2a_compressor_pool_state(
+def c2a_compressor_publish(
     kv_proj: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
     score_proj: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
     query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
@@ -278,54 +192,23 @@ def c2a_compressor_pool_state(
     latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     state_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Pool completed pairs and persist request state using a shared prefill/decode ABI."""
-    blocks = pl.cast(pl.tensor.dim(state_cache, 0), pl.INT32)
-    pool_tid = c2a_compressor_pool(
-        kv_proj, score_proj, state_cache, position_ids, norm_weight, latent,
-        num_tokens, query_start_loc, token_to_req_indices, state_block_table, blocks, state_ready,
-    )
-    state_tid = c2a_compressor_state_write(
-        kv_proj, score_proj, query_start_loc, position_ids, token_to_req_indices,
-        state_block_table, state_cache, num_tokens, pool_tid,
-    )
-    return pool_tid, state_tid
-
-
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "compressor_rope_publish.cpp",
-               include_dirs=(pto_isa_include_dir(), str(Path(__file__).parent / "kernels")))
-def _rotate_publish_compressed_rows(
-    source: pl.Tensor,
-    slots: pl.Tensor,
-    cache: pl.InOut[pl.Tensor],
-    scales: pl.InOut[pl.Tensor],
     cosine: pl.Tensor,
     sine: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Rotate, quantize with midpoint-to-zero rounding, and publish cache pages."""
-    ...
-
-
-@pl.jit.inline(auto_scope=False)
-def c2a_compressor_publish(
-    latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    cos: pl.Tensor,
-    sin: pl.Tensor,
     slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, (HEAD_DIM // 2)], pl.UINT8],
-    scales: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, (HEAD_DIM // 16)], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    source_ready: pl.Scalar[pl.TASK_ID],
-    max_workers: pl.constexpr,
+    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    scales: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
 ):
-    """Rotate and publish compressed rows with one worker per physical page."""
+    """Pool and publish rows with state reads and writes owned by physical block."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
-    workers = pl.min(active_tokens, max_workers)
-    with pl.spmd(workers, name_hint="rope_pub_cmp", deps=[cache_ready, source_ready]) as publish_tid:
-        cache = _rotate_publish_compressed_rows(latent, slots, cache, scales, cos, sin, active_tokens)
-    return publish_tid
+    blocks = pl.cast(pl.tensor.dim(state_cache, 0), pl.INT32)
+    workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
+    with pl.spmd(workers, name_hint="c2a_compress", deps=[state_ready]) as completed:
+        _c2a_compress(
+            kv_proj, score_proj, state_cache, position_ids, norm_weight, latent,
+            query_start_loc, token_to_req_indices, state_block_table,
+            slots, cosine, sine, cache, scales, active_tokens, blocks,
+        )
+    return completed
 
 
 def golden_c1a_compressor(

@@ -11,8 +11,8 @@
 
 import pypto.language as pl
 from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
-from sparse_attention import publish_window_row, swa_attention_partial
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
+from sparse_attention import swa_attention_partial
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj
 from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding, hc_post
 
@@ -72,12 +72,11 @@ def decode_swa(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, x_norm)
+    x_ready = hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, x_norm)
 
     zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
     q_proj_rope(
@@ -88,14 +87,12 @@ def decode_swa(
         qr, q,
         num_tokens,
     )
-    kv_proj_rope(
-        proj_payload, proj_scales,
-        wkv, wkv_scale, kv_norm_weight,
-        rope_cos, rope_sin,
-        kv_projection, kv,
-        num_tokens,
+    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    window_publish(
+        kv_projection, kv_norm_weight, rope_cos, rope_sin,
+        window_slots, window_cache, window_cache_scale,
+        num_tokens, x_ready,
     )
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     swa_attention_partial(q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens)
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
