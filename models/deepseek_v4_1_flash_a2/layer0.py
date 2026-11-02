@@ -13,13 +13,13 @@ from collections.abc import Callable, Mapping
 import torch
 import pypto.language as pl
 
-from .decode_swa import swa_attention_reference
 from .gemm import make_fp32_dequantize, make_int8_gemm, make_pack_weight
 from .moe import routed_expert_reference, shared_expert_reference
 from .norm_rope import make_rope, make_rmsnorm
-from .output_proj import output_projection_reference
+from .output_proj import make_output_projection, output_projection_reference
 from .qkv import qkv_reference, qkv_shape
 from .swa_cache import gather_swa_cache_reference, write_swa_cache_reference
+from .swa_attention import make_swa_attention, swa_attention_reference
 from .quant import make_dynamic_int8_quantize
 
 
@@ -210,9 +210,6 @@ def make_l0_attention(capacity: int, config: Mapping[str, object]):
     norm_kv = make_rmsnorm(capacity, head_dim, shape.rms_norm_eps)
     rope_q = make_rope(capacity, heads, head_dim, rope_dim)
     rope_kv = make_rope(capacity, 1, head_dim, rope_dim)
-    from .decode_swa import make_swa_attention
-    from .output_proj import make_output_projection
-
     attend = make_swa_attention(capacity, shape.num_attention_heads, shape.head_dim, int(config["sliding_window"]))
     project = make_output_projection(
         capacity,

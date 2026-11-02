@@ -10,7 +10,9 @@
 
 import torch
 import pypto.language as pl
-from .config import FLASH as M, T_DYN, TP_SIZE
+from .config import FLASH as M
+from .operator_config import T_DYN
+from .runtime_config import TP_SIZE
 
 
 SELECTED_ROWS = pl.dynamic("SPARSE_SELECTED_ROWS")

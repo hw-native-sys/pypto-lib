@@ -19,7 +19,7 @@ from typing import Any, Mapping
 import torch
 import pypto.language as pl
 
-from .config import A2A3_DTYPE_CONTRACT, CONTRACT
+from .operator_config import A2A3_DTYPE_CONTRACT, CONTRACT
 from .engram import HASH_COLS, HEAD_DIM, HC, HIDDEN, LOOKUP_WIDTH, engram_reference
 from .quant import w8a8_linear
 from .sparse_attention import make_sparse_attention, sparse_attention_reference

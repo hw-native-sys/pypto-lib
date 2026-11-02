@@ -9,7 +9,8 @@
 """A2 single-layer dependencies extracted from the shared model operators."""
 
 import pypto.language as pl
-from .config import FLASH as M, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN
+from .config import FLASH as M
+from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN
 
 
 STATE_WIDTH = 2 * M.head_dim

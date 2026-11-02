@@ -11,11 +11,11 @@ from collections.abc import Mapping
 
 import pypto.language as pl
 
-from .decode_swa import make_swa_attention
 from .gemm import make_int8_linear_direct
 from .index_cache import make_index_cache_quantize
 from .norm_rope import make_rope, make_rmsnorm
 from .qkv import qkv_shape
+from .swa_attention import make_swa_attention
 
 ACT_TILE = 256
 

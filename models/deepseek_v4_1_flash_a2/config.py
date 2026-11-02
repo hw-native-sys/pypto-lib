@@ -6,13 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A2 single-layer dependencies extracted from the shared model operators."""
+"""DeepSeek V4.1 Flash model dimensions and layer ownership."""
 
-import sys
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, Optional, Tuple
-import pypto.language as pl
 
 
 class AttentionMode(str, Enum):
@@ -243,65 +241,3 @@ FLASH = DeepSeekV41Config(
     expert_dtype="fp4",
     scale_fmt="ue8m0",
 )
-
-
-T_DYN = pl.dynamic("V41_T_DYN")
-
-
-B_DYN = pl.dynamic("V41_B_DYN")
-
-
-STATE_BLOCKS_DYN = pl.dynamic("V41_STATE_BLOCKS_DYN")
-
-
-Q_START_DYN = pl.dynamic("V41_Q_START_DYN")
-
-
-@dataclass(frozen=True)
-class A2A3OperatorConfig:
-    """Shape and accumulation rules shared by decoder operators."""
-
-    int8_scale_max: float = 127.0
-    int8_amax_epsilon: float = 1.0e-30
-    int8_k_alignment: int = 32
-    gemm_m_tile: int = 16
-    gemm_n_tile: int = 64
-    gemm_k_tile: int = 256
-    rmsnorm_m_tile: int = 8
-    swa_block_size: int = 128
-    index_head_dim: int = 128
-    index_scale_dtype: str = "float16"
-
-
-A2A3_DTYPE_CONTRACT = {
-    "hidden": "bfloat16",
-    "weights": "int8",
-    "activations": "int8",
-    "gemm_accumulator": "int32",
-    "weight_dequant_scale": "float32",
-    "activation_dequant_scale": "float32",
-    "rmsnorm_weight": "bfloat16",
-    "rope_tables": "float32",
-    "swa_cache": "bfloat16",
-    "compressed_kv_cache": "bfloat16",
-    "index_cache": "int8",
-    "index_cache_scale": "float16",
-    "expert_weights": "int8",
-    "expert_scales": "float32",
-}
-
-
-CONTRACT = A2A3OperatorConfig()
-
-
-def _parse_parallel_size(name: str, default: int) -> int:
-    flag = f"--{name}"
-    for index, argument in enumerate(sys.argv):
-        if argument == flag and index + 1 < len(sys.argv):
-            return int(sys.argv[index + 1])
-        if argument.startswith(f"{flag}="):
-            return int(argument.split("=", 1)[1])
-    return default
-
-
-TP_SIZE = _parse_parallel_size("tp", 1)

@@ -52,7 +52,7 @@
         "pool_prefill": "47802bf1269611a06e093a09e579d8bd28b6099f35b5d516450e606d5e33b9dd",
         "compressor_ratio2_prefill": "f3217efb7b35e1a7a89431ddc8cf3c6e16ca639320023c6c91c07c0556f366f2"
       },
-      "migrated_sha256": "e6cdd1cf8b9f984cbdc19a29e3171f96d009dc91854e87556c18358c7a00a71d",
+      "migrated_sha256": "20fb138c6893d73a2fa3ae1786a717e984d64fd79d2523f172f4a1687b5575e3",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -64,7 +64,7 @@
       "preserved_definition_ast_sha256": {
         "pool_projected": "e5176b916ba3bf807f3ada8328cd2ea7c3824fa6bea9d48a647e07d455658d46"
       },
-      "migrated_sha256": "b5bc941526d777a916f13cd3d4cd47ec07040baccee092f64ec333816bb4438b",
+      "migrated_sha256": "2987aaec58f5fdf2fe941311f91f3f962009b7ec24aee285c4eecef82bd6210a",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -81,7 +81,7 @@
         "make_indexer_query_quantize_observed": "15780b5459572c4c7d10844eba27ccb587e36b81c45786bd08e32ef4a70344ab",
         "make_c2_program": "19e97d8dd311abe288bdeeb6428e45a41952179a770580ee9d8e1b4a677cb76d"
       },
-      "migrated_sha256": "77e8f472e2e675ef2e89da62ae12d368bf858063cfde5d516bf42fa3baf6ae65",
+      "migrated_sha256": "0c564a37586c9ed20e5bff8dd7a86a71c1cc3e190a5166706ffc91043918daf0",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -363,7 +363,7 @@
         "make_c2_index_publish_inline": "0c3db094469f1a9f8d37590fc7c014da7c94bb6f1dc5f1fec587849bccbbdd48",
         "make_layer2_c1c2": "37c0927c59927f9f3c4a23a9c6bc78d482fc0f6eda6ae1c06280ca9d31ccfd17"
       },
-      "migrated_sha256": "754cd8f5b3ab68a6d55deed2367a17a5b7d15152d107d30e3c1795056d8a8fa1",
+      "migrated_sha256": "5cbce06b48184944121900d9b1a3157db55c745e270c56ef73e6fc5d4370213a",
       "import_relocation": true
     },
     {
@@ -374,7 +374,7 @@
       "preserved_definition_ast_sha256": {
         "make_layer2_prefill_producer": "1c6a287615f6ea3bcbb43b4c6975c5a7d2b12d7a846d1efd579c57fcf80a6d51"
       },
-      "migrated_sha256": "237bd01e24cd3286eaafa3e087ad9d81653faa9bb330afea6bef7983482fe2f0",
+      "migrated_sha256": "b99685d022d6c6f98ed6f57ddfb5778a92e86da66479aaef01a517c5ba91364f",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -427,7 +427,7 @@
         "gen_routed_weight": "bc94de37d89bb3900b183abc4a0a1d3831f9fd38f148b7524a9b712ce9fa7069",
         "build_tensor_specs": "d6a6f42715fe6966663e5b85dc1a4326cb32e25125fc121c59535240c405d87c"
       },
-      "migrated_sha256": "d0a88a94bd3c62e7b4e34dbe7d65b94860a7c238cb66cf6454d97d80430fa002",
+      "migrated_sha256": "96eb44ee29b1ece3d8542b27b2441ba6b7b62c986f1aa34ca982907039d89290",
       "L20_freeze_source_match": true,
       "import_relocation": true,
       "host_changes": [
@@ -677,20 +677,14 @@
       "source": "models/deepseek_v4_1_flash/config.py",
       "source_sha256": "6c159a9590dd95ad9e03f58dabf2cdbfe4a2d658fc87d0618db5e8556d3d1554",
       "extracted_symbols": [
-        "FLASH",
-        "B_DYN",
-        "Q_START_DYN",
-        "STATE_BLOCKS_DYN",
-        "T_DYN",
-        "TP_SIZE"
+        "FLASH"
       ],
       "preserved_definition_ast_sha256": {
         "AttentionMode": "d730cfeeff6826aef808e1bb08408cda78311e54bd58e23b5f1cf64cbdfd3a01",
         "DeepSeekV41LayerConfig": "ed41a7b8c2d0ed0d73e40bc4f75d3aa93017239aacfe7897fd96b878f9cc3f5d",
-        "DeepSeekV41Config": "94f4bb3ab2ac513d5fb64ffa5efa55373cb2e1513b4b5a73e9eedc0f37bf5990",
-        "_parse_parallel_size": "551bba2aa1b2da64c2b95a0c8a22bc91884f43084931e043899f7d960b1e0ea7"
+        "DeepSeekV41Config": "94f4bb3ab2ac513d5fb64ffa5efa55373cb2e1513b4b5a73e9eedc0f37bf5990"
       },
-      "migrated_sha256": "9762c0e893ffc6d3877e2498db0f27d1b43018bce512f27d7d0830b5403faba7",
+      "migrated_sha256": "5b10b77514e6f4b67da784ac169c6836261b8dfe8b98a77620e527f56a528d3e",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -707,7 +701,7 @@
         "make_rope": "2656ed06dba2ea5d269802fc69548f46d2132859022ec01494d98923f1fb6c82",
         "make_bf16_projection_staged": "34593fc55ff678a176a81e89027f4fbd5591a544664112a6c2a5bd6c038ba8f9"
       },
-      "migrated_sha256": "ca24328353775a13197441835788d72222e2d0057433fe94f56192413300e662",
+      "migrated_sha256": "ad0370c69b478338c5ec7d65fe4bc20e830443066f19a104695e3500ba6b7a94",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -728,7 +722,7 @@
         "compressor_state_write": "f821f7ff47c785022e981eab6f53a9d3a8f66cd424b5fda5c1be175bdfe92292",
         "compressor_ratio2": "621fe77d2ffb6fda1549c1e9a43bd788b4abfa4bf837d0f797735567c477fb48"
       },
-      "migrated_sha256": "70f07df53f5c90f58b696941172a449c07e5652de47679aa80a503ba4cffdbc2",
+      "migrated_sha256": "ad3639747f06a2c5982ed84c5dda52db98980943fcbebcdc16436136df5d29d6",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -766,7 +760,7 @@
         "_attend_bf16_block": "15dc287c0d4b3684c3b3a463d0fcebd5cbacb55bc6a553d2c40c63de1640aca4",
         "attend_bf16": "ad04f3d10d20c801b2cb02067f4249c8ef7d0ed223d066afcfa07ceda7b966ab"
       },
-      "migrated_sha256": "e010da0ef231ef87d7a823c56a8021cd5cd732886ac855c530b3f5ba6e235b95",
+      "migrated_sha256": "49e82e164d815a473e2bd66f589d72f4e7874edf245e6d1f5c06dd4a79f80cc5",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -786,7 +780,7 @@
       "preserved_definition_ast_sha256": {
         "prefill_grouped_output": "11b178ddb33fdb7dee8b48374cf5993b8397b388ae60eacc2dd684f402c154ed"
       },
-      "migrated_sha256": "e34fd9bcddf00f509e8d83bceb1554bab8a614f42be36e6a93fca35b400c1157",
+      "migrated_sha256": "9b9c3ca36c05949e06dda2e5d37a4239b5aba9209ce2a6411465fc34194bb638",
       "L20_freeze_source_match": true,
       "import_relocation": true
     },
@@ -804,7 +798,7 @@
         "unpack_nz": "9d464cdd3d08c87fbfb3ca94f88f22e933fa60331cfc1effe653e97a0ea0a6c2",
         "int8_quant_per_row": "cf4d55bb8f3b48810175626bccbd99e6f3c9621f9cda9394a2181f68d1432f20"
       },
-      "migrated_sha256": "30aef98dc4357f56d8f97ed7ac32a0acde164ffc895205cd6453ad6f809c5dce",
+      "migrated_sha256": "c1c9fd92a9e663c7b95f5632edd1bbcc9cbf967302880f66008e6e72c210ea46",
       "L20_freeze_source_match": true,
       "import_relocation": true,
       "host_changes": [
@@ -939,5 +933,61 @@
       "import_relocation": true
     }
   ],
-  "preserved_definition_count": 154
+  "refactor_files": [
+    {
+      "file": "operator_config.py",
+      "source": "models/deepseek_v4_1_flash_a2/config.py",
+      "migrated_sha256": "15af524c5bdeecf4a57c8023abd99f50c3b3bae454afb21724863b1df918044c",
+      "reason": "Keep A2/A3 operator ABI and dynamic shapes outside model configuration."
+    },
+    {
+      "file": "runtime_config.py",
+      "source": "models/deepseek_v4_1_flash_a2/config.py",
+      "migrated_sha256": "90282ffb600858f595c519cd1399471ba4deaa60a61e346a266908c3a359e974",
+      "reason": "Keep runtime TP sizing outside model configuration."
+    },
+    {
+      "file": "swa_attention.py",
+      "source": "models/deepseek_v4_1_flash_a2/decode_swa.py",
+      "migrated_sha256": "7c9d8ef0e5c302c0889697080d7df37c59146ae407a5b11a5aac58cfe9ee6ce4",
+      "reason": "Share SWA compute between Decode, Prefill, and layer references."
+    },
+    {
+      "file": "decode_swa.py",
+      "source": "models/deepseek_v4_1_flash_a2/decode_swa.py",
+      "migrated_sha256": "4a3cbb4012bf6f9127e30be68bd6053e5fd1f5b98bfe21d9d2e31da5b7bb2f17",
+      "reason": "Retain the existing decoder import as a compatibility export."
+    },
+    {
+      "file": "decode_c2a_full.py",
+      "source": "models/deepseek_v4_1_flash/decode_c2a_full.py",
+      "migrated_sha256": "9b54d8a8de968d5f42f2f9771c4a7d464d67666a32e54d162ab86dc015e7a08b",
+      "reason": "Expose the A2/A3 L14 C2A source path under the A5 decoder filename."
+    },
+    {
+      "file": "decode_c2a_reuse.py",
+      "source": "models/deepseek_v4_1_flash/decode_c2a_reuse.py",
+      "migrated_sha256": "34c71bb2c211dd7c220d2037a54d14bf7d9c9703863f6055df24968eccf5e35a",
+      "reason": "Expose the A2/A3 L15/L19 C2A reuse paths under the A5 decoder filename."
+    },
+    {
+      "file": "decode_c1a_full.py",
+      "source": "models/deepseek_v4_1_flash/decode_c1a_full.py",
+      "migrated_sha256": "42f3e57f9587c8f087f3026adc96913e40b8ff87363fe2e12324dbf2bf7ab6e4",
+      "reason": "Expose the A2/A3 L20 C1A source path under the A5 decoder filename."
+    },
+    {
+      "file": "decode_c1a_reuse.py",
+      "source": "models/deepseek_v4_1_flash/decode_c1a_reuse.py",
+      "migrated_sha256": "af169590295b5a581d1a722a22f4bb207e7d83f43d3a11903e3a0dcfd614f888",
+      "reason": "Expose the A2/A3 L21/L25 C1A reuse paths under the A5 decoder filename."
+    },
+    {
+      "file": "decode_c1a_reindex.py",
+      "source": "models/deepseek_v4_1_flash/decode_c1a_reindex.py",
+      "migrated_sha256": "e9a4ca5e1475dec2b8114b22d5cf012cef99e876ca952d63b0f4d0c331d7fb5b",
+      "reason": "Expose the A2/A3 L24 C1A reindex path under the A5 decoder filename."
+    }
+  ],
+  "preserved_definition_count": 153
 }

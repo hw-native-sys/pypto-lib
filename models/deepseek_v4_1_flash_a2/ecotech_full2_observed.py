@@ -13,7 +13,7 @@ from .c1c2 import make_compressed_cache_publish
 from .ops import VEC_M_TILE, N_TILE, make_norm, make_rope, make_dequantize, make_dot, make_pack_weight, make_quantize
 from .compressor_core import RING_ROWS_DYN
 from .c2_prefill_pool import compressor_ratio2_prefill
-from .config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
+from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
 from .qkv_proj_rope import make_bf16_projection_staged
 from .indexer import INDEX_HEADS, WEIGHT_ROWS_TILE, QUANT_ROWS_TILE
 

@@ -19,7 +19,7 @@ import pypto.language as pl
 from .c1c2 import make_compressed_cache_publish
 from .ops import VEC_M_TILE, make_norm, make_rope
 from .compressor_core import compressor_ratio2, RING_ROWS_DYN
-from .config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN
+from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN
 from .qkv_w8a8 import make_qkv_w8a8_inline
 from .qkv_proj_rope import make_bf16_projection_staged
 

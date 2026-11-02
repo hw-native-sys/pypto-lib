@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import pypto.language as pl
 
-from .config import CONTRACT
+from .operator_config import CONTRACT
 
 
 def rms_norm_reference(value: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import pypto.language as pl
 
-from .config import CONTRACT
+from .operator_config import CONTRACT
 
 
 # ``npu_dynamic_quant`` is nearest rounding for ordinary values, but an exact

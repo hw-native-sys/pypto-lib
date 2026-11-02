@@ -6,6 +6,12 @@ W8A8 and BF16 projections, SWA and compressed-cache stages, mHC, Engram,
 384-expert top-six MoE, and the native operator boundaries used during
 independent layer alignment.
 
+The file-level ownership and migration map against the A5 implementation is
+maintained in [`MODULE_ALIGNMENT.md`](../../../models/deepseek_v4_1_flash_a2/MODULE_ALIGNMENT.md).
+Use it when adding a Decode or Prefill stage: it records the corresponding A5
+semantic entry, the A2 owner, the dtype translation, and whether the stage is
+currently partial or accepted.
+
 ## Development priorities
 
 | Field | Current priority |
@@ -28,7 +34,8 @@ the private orchestration used to obtain the historical acceptance results.
 | `layer2_c1c2.py`, `c2_prefill_pool.py`, `ecotech_full2_*.py` | Ratio-two projection, ring state, pooling, cache publication and index observation. The width-128 index publisher includes the accepted 16-row quantization and reciprocal correction. |
 | `ratio1_prefill.py` | Ratio-one publication starting at an actual BF16 compressor projection. This is a distinct input boundary from the FP32 ratio-two compressor. |
 | `ecotech_prefill_consumer.py`, `indexer.py`, `sparse_consumer_prefill.py` | Consumer projections, causal controls and sparse attention stages. |
-| `layers19_25.py`, `candidate_pool.py`, `raw_checkpoint.py` | L19 C2A reuse, L20 C1A source, L21 C1A reuse, L24 reindex and L25 reuse, with A2/A3 candidate metadata and raw checkpoint loading. |
+| `decode_c2a_full.py`, `decode_c2a_reuse.py`, `decode_c1a_full.py`, `decode_c1a_reuse.py`, `decode_c1a_reindex.py` | A5-shaped A2/A3 decode entry points for L14/L15/L19/L20/L21/L24/L25. `layer14_15.py` and `layers19_25.py` remain aggregate compatibility providers. |
+| `candidate_pool.py`, `raw_checkpoint.py` | A2/A3 candidate metadata and raw checkpoint loading. |
 | `swa_scheduler.py`, `smla_scheduler.py` | Integer-only request, page and causal-selection scheduling. Original and compressed lanes retain separate page tables. |
 | `swa_native.py`, `smla_native.py`, `smla_staging.py` | Registered BF16 SWA/ratio-one SMLA leaves, fresh metadata, and PyPTO dtype boundaries. |
 | `engram_ecotech*.py`, `engram_hash.py`, `engram_offload.py` | INT8 row lookup, BF16 projection, original-basis gating with probability observation, and host row preparation. |
@@ -114,7 +121,8 @@ requires its own precision validation.
 The historical frozen snapshots passed independent same-input complete-block
 checks for layers **0, 1, 2, 3, 14, 15, 19, 20, 21, 24 and 25**. Layer zero
 has six complete calls; each of the other selected layers has twelve.
-`acceptance_manifest.json` records the original evidence digests and limits.
+`/data/disk/sunhaolun/captrue_and_vllm/models/deepseek_v4_1_flash_a2/acceptance_manifest.json`
+records the original evidence digests and limits.
 The most recent L20 gate uses six cases and twelve calls with all 384 experts,
 top-six routing and 64 attention heads. Its floating policy is
 `atol=0.05, rtol=0.05`, with zero violations and nonfinite values; discrete
@@ -128,8 +136,8 @@ original parent model retain their compute definitions in this flat directory.
 The port includes the L14 Engram observation interface, L1 native boundaries,
 and the final L20 index-publication candidate.
 
-The relocated directory has host validation and factory-construction coverage;
-it has not been replayed on an NPU. It makes no claim of a newly validated
+The external capture and validation tree has host validation and
+factory-construction coverage; it has not been replayed on an NPU. It makes no claim of a newly validated
 full-block runner, stacked layers, whole-network dataset score, Decode,
 full-table Engram residency, multi-card execution or serving support. The
 original L25 evidence's missing large-readonly and dispatch-input artifacts
@@ -137,9 +145,11 @@ remain a limitation of that historical record.
 
 ## Checks without a device
 
-Run the source receipt, dependency-closure and prefill-control checks:
+Run the source receipt, dependency-closure and prefill-control checks from the
+external A5-shaped validation tree:
 
 ```bash
+PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
 python -m models.deepseek_v4_1_flash_a2.validate
 ```
 
@@ -147,6 +157,7 @@ With Torch and PyPTO installed, also import every module and construct the
 bounded SWA, Full2, Ratio1, Engram, and L19/L20/L21/L24/L25 decoder entries:
 
 ```bash
+PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m models.deepseek_v4_1_flash_a2.validate --factories
 ```
 
@@ -159,20 +170,26 @@ they do not replace numerical comparison against an independent reference.
 ## Decoder operators
 
 The A2/A3 decoder adaptation is integrated into this same flat package. The
-decoder contract is shared through `config.py`, `engram.py`, and
-`sparse_attention.py`; W8A8 quantization and GEMM live in `quant.py` and
-`gemm.py`. Layer-14 source and layer-15 reuse stages are in `layer14_15.py`;
-L19/L20/L21/L24/L25 stages are in `layers19_25.py`. The CPU references and
+decoder contract is shared through `config.py`, `operator_config.py`,
+`engram.py`, and `sparse_attention.py`; W8A8 quantization and GEMM live in
+`quant.py` and `gemm.py`. The decoder entry points use the A5 file names:
+`decode_c2a_full.py`, `decode_c2a_reuse.py`, `decode_c1a_full.py`,
+`decode_c1a_reuse.py`, and `decode_c1a_reindex.py`. The CPU references and
 bounded PyPTO validators are direct modules in this directory, with no nested
-`verifier` package.
+`verifier` package. The original `layer14_15.py` and `layers19_25.py` imports
+remain available during migration.
 
 The decoder validator suite can be run without a device:
 
 ```bash
-python -m pytest models/deepseek_v4_1_flash_a2/test_operators.py -q
+PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
+python -m pytest /data/disk/sunhaolun/captrue_and_vllm/models/deepseek_v4_1_flash_a2/test_operators.py -q
+PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
 python -m models.deepseek_v4_1_flash_a2.validate_layer14 --sim
+PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
 python -m models.deepseek_v4_1_flash_a2.validate_layer15 --sim
 # Supply the checkpoint through --checkpoint or DSV41_A2_CHECKPOINT.
+PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
 python -m models.deepseek_v4_1_flash_a2.validate_layers19_25 --checkpoint /path/to/checkpoint
 ```
 

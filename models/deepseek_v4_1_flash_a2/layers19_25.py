@@ -29,7 +29,7 @@ from typing import Any, Mapping
 
 import torch
 
-from .config import A2A3_DTYPE_CONTRACT
+from .operator_config import A2A3_DTYPE_CONTRACT
 from .candidate_pool import make_candidate_block_pool
 from .layer14_15 import index_key_reference, make_index_key_publish_rope
 from .sparse_attention import make_sparse_attention, sparse_attention_reference

@@ -11,7 +11,7 @@
 import pypto.language as pl
 
 from .compressor_core import EPS, HEAD_DIM, RING_ROWS_DYN, STATE_WIDTH, compressor_state_write
-from .config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN
+from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN
 
 
 # tiling

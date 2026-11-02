@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import pypto.language as pl
 
-from .config import CONTRACT
+from .operator_config import CONTRACT
 
 BLOCK_SIZE = 128
 

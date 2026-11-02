@@ -10,7 +10,9 @@
 
 import pypto.language as pl
 from .qkv_proj_rope import K_TILE, M_TILE, N_TILE
-from .config import FLASH as M, T_DYN, TP_SIZE
+from .config import FLASH as M
+from .operator_config import T_DYN
+from .runtime_config import TP_SIZE
 
 
 LOCAL_H = M.num_attention_heads // TP_SIZE

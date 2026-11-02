@@ -54,7 +54,8 @@ TILES_PER_EXPERT = RECV_MAX // RECV_TILE
 INT8_SCALE_MAX = 127.0
 INT8_AMAX_EPS = 1e-30
 
-assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
+if RECV_MAX % RECV_TILE:
+    raise ValueError("RECV_MAX must be a whole number of RECV_TILE row-tiles")
 
 
 @pl.jit.inline(auto_scope=False)

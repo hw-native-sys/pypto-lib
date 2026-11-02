@@ -18,7 +18,7 @@ import pypto.language as pl
 from .c1c2 import make_compressed_cache_publish
 from .layer2_c1c2 import HEAD_DIM, make_c2_index_publish_projected_inline, make_fp32_projection
 from .compressor_core import RING_ROWS_DYN
-from .config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
+from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
 from .qkv_w8a8 import make_qkv_w8a8_inline
 
 

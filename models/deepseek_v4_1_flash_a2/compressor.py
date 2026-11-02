@@ -9,7 +9,7 @@
 """A2 entry for the shared C2 projected-pool/state ABI."""
 import pypto.language as pl
 from .compressor_core import compressor_ratio2, RING_ROWS_DYN
-from .config import T_DYN, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
+from .operator_config import T_DYN, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
 
 WIDTH = 512
 

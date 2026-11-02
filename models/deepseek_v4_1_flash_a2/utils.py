@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A2 single-layer dependencies extracted from the shared model operators."""
+"""Host-side NZ packing and per-row INT8 quantization utilities."""
 
 import torch
 
@@ -25,8 +25,10 @@ def pack_nz(logical: torch.Tensor) -> torch.Tensor:
     """Reorder the trailing ``[R, C]`` of a row-major tensor into NZ fractal order."""
     rows, cols = logical.shape[-2:]
     c0 = NZ_C0_BYTES // logical.element_size()
-    assert rows % NZ_FRACTAL_ROWS == 0, f"NZ needs {NZ_FRACTAL_ROWS}-row fractals, got {rows} rows"
-    assert cols % c0 == 0, f"NZ needs whole C0 lines of {c0} elements, got {cols} cols"
+    if rows % NZ_FRACTAL_ROWS:
+        raise ValueError(f"NZ needs {NZ_FRACTAL_ROWS}-row fractals, got {rows} rows")
+    if cols % c0:
+        raise ValueError(f"NZ needs whole C0 lines of {c0} elements, got {cols} cols")
     blocked = logical.reshape(-1, rows // NZ_FRACTAL_ROWS, NZ_FRACTAL_ROWS, cols // c0, c0)
     return blocked.permute(0, 3, 1, 2, 4).contiguous().reshape(logical.shape)
 

@@ -1,169 +1,110 @@
 """DeepSeek V4.1 Flash A2 prefill and A2/A3 decoder operators."""
 
-from .config import A2A3_DTYPE_CONTRACT, A2A3OperatorConfig
-from .candidate_pool import make_candidate_block_pool
-from .precision import ErrorMetrics, compare_tensors
-from .quant import (
-    dequantize_int32,
-    int8_matmul,
-    quantize_per_channel_int8,
-    quantize_per_token_int8,
-    w8a8_linear,
-)
-from .weights import (
-    load_layer0_output,
-    load_layer0_qkv,
-    load_layer0_router,
-    load_layer0_shared_expert,
-    load_tensor_bundle,
-    open_layer0_moe,
-)
-from .qkv import QKVShape, make_qkv_w8a8, qkv_reference, qkv_shape
-from .moe import make_routed_expert_w8a8, make_shared_expert_w8a8
-from .layer0 import layer0_reference, route_reference
-from .engram import engram_reference, make_gate, make_lookup
-from .staged import (
-    make_bf16_linear,
-    make_fp32_linear,
-    make_grouped_wo_a,
-    make_index_quantize,
-    make_linear,
-    make_norm,
-    make_rope_kernel,
-    make_swa,
-    make_swiglu,
-)
-from .sparse_attention import make_sparse_attention, sparse_attention_reference
-from .indexer_query import (
-    indexer_query_reference,
-    make_indexer_query_quantize,
-    make_l3_indexer_query,
-    quantize_indexer_query_reference,
-)
-from .indexer_select import indexer_select_reference, make_indexer_select
-from .indexer_prepare import make_indexer_prepare, prepare_indexer_indices_reference
-from .layer14_15 import (
-    LAYER14,
-    LAYER15,
-    Layer14A2A3Contract,
-    Layer15A2A3Contract,
-    index_key_reference,
-    dequantize_engram_rows_reference,
-    engram_a2a3_reference,
-    layer14_source_reference,
-    layer15_reuse_reference,
-    load_a2a3_layer14_15_bundle,
-    make_layer14_stages,
-    make_layer15_stages,
-    make_ratio2_projection,
-    quantize_engram_rows_reference,
-    ratio2_pool_reference,
-    update_ratio2_state_reference,
-    validate_layer14_15_contract,
-)
-from .raw_checkpoint import (
-    RawCheckpoint,
-    flatten_scale,
-    load_attention_weights,
-    load_decoder_layer_weights,
-)
-from .layers19_25 import (
-    LAYER19,
-    LAYER20,
-    LAYER21,
-    LAYER24,
-    LAYER25,
-    TARGET_LAYERS,
-    c1a_full_reference,
-    c1a_reindex_reference,
-    c1a_reuse_reference,
-    c2a_reuse_reference,
-    layer_contract,
-    make_decoder_layer_stages,
-    select_candidate_block_pool_reference,
-    validate_layer19_20_21_24_25_contracts,
-)
+from importlib import import_module
 
-__all__ = [
-    "A2A3OperatorConfig",
-    "A2A3_DTYPE_CONTRACT",
-    "make_candidate_block_pool",
-    "ErrorMetrics",
-    "compare_tensors",
-    "dequantize_int32",
-    "int8_matmul",
-    "quantize_per_channel_int8",
-    "quantize_per_token_int8",
-    "w8a8_linear",
-    "load_layer0_qkv",
-    "load_layer0_output",
-    "load_layer0_router",
-    "load_layer0_shared_expert",
-    "load_tensor_bundle",
-    "open_layer0_moe",
-    "QKVShape",
-    "make_qkv_w8a8",
-    "qkv_reference",
-    "qkv_shape",
-    "make_routed_expert_w8a8",
-    "make_shared_expert_w8a8",
-    "layer0_reference",
-    "route_reference",
-    "engram_reference",
-    "make_gate",
-    "make_lookup",
-    "make_bf16_linear",
-    "make_fp32_linear",
-    "make_grouped_wo_a",
-    "make_index_quantize",
-    "make_linear",
-    "make_norm",
-    "make_rope_kernel",
-    "make_swa",
-    "make_swiglu",
-    "make_sparse_attention",
-    "sparse_attention_reference",
-    "indexer_query_reference",
-    "make_indexer_query_quantize",
-    "make_l3_indexer_query",
-    "quantize_indexer_query_reference",
-    "indexer_select_reference",
-    "make_indexer_select",
-    "make_indexer_prepare",
-    "prepare_indexer_indices_reference",
-    "LAYER14",
-    "LAYER15",
-    "Layer14A2A3Contract",
-    "Layer15A2A3Contract",
-    "index_key_reference",
-    "dequantize_engram_rows_reference",
-    "engram_a2a3_reference",
-    "layer14_source_reference",
-    "layer15_reuse_reference",
-    "load_a2a3_layer14_15_bundle",
-    "make_layer14_stages",
-    "make_layer15_stages",
-    "make_ratio2_projection",
-    "quantize_engram_rows_reference",
-    "ratio2_pool_reference",
-    "update_ratio2_state_reference",
-    "validate_layer14_15_contract",
-    "RawCheckpoint",
-    "flatten_scale",
-    "load_attention_weights",
-    "load_decoder_layer_weights",
-    "LAYER19",
-    "LAYER20",
-    "LAYER21",
-    "LAYER24",
-    "LAYER25",
-    "TARGET_LAYERS",
-    "c1a_full_reference",
-    "c1a_reindex_reference",
-    "c1a_reuse_reference",
-    "c2a_reuse_reference",
-    "layer_contract",
-    "make_decoder_layer_stages",
-    "select_candidate_block_pool_reference",
-    "validate_layer19_20_21_24_25_contracts",
-]
+
+_EXPORTS = {
+    "A2A3OperatorConfig": ("operator_config", "A2A3OperatorConfig"),
+    "A2A3_DTYPE_CONTRACT": ("operator_config", "A2A3_DTYPE_CONTRACT"),
+    "make_candidate_block_pool": ("candidate_pool", "make_candidate_block_pool"),
+    "dequantize_int32": ("quant", "dequantize_int32"),
+    "int8_matmul": ("quant", "int8_matmul"),
+    "quantize_per_channel_int8": ("quant", "quantize_per_channel_int8"),
+    "quantize_per_token_int8": ("quant", "quantize_per_token_int8"),
+    "w8a8_linear": ("quant", "w8a8_linear"),
+    "load_layer0_qkv": ("weights", "load_layer0_qkv"),
+    "load_layer0_output": ("weights", "load_layer0_output"),
+    "load_layer0_router": ("weights", "load_layer0_router"),
+    "load_layer0_shared_expert": ("weights", "load_layer0_shared_expert"),
+    "load_tensor_bundle": ("weights", "load_tensor_bundle"),
+    "open_layer0_moe": ("weights", "open_layer0_moe"),
+    "QKVShape": ("qkv", "QKVShape"),
+    "make_qkv_w8a8": ("qkv", "make_qkv_w8a8"),
+    "qkv_reference": ("qkv", "qkv_reference"),
+    "qkv_shape": ("qkv", "qkv_shape"),
+    "make_routed_expert_w8a8": ("moe", "make_routed_expert_w8a8"),
+    "make_shared_expert_w8a8": ("moe", "make_shared_expert_w8a8"),
+    "layer0_reference": ("layer0", "layer0_reference"),
+    "route_reference": ("layer0", "route_reference"),
+    "engram_reference": ("engram", "engram_reference"),
+    "make_gate": ("engram", "make_gate"),
+    "make_lookup": ("engram", "make_lookup"),
+    "make_bf16_linear": ("staged", "make_bf16_linear"),
+    "make_fp32_linear": ("staged", "make_fp32_linear"),
+    "make_grouped_wo_a": ("staged", "make_grouped_wo_a"),
+    "make_index_quantize": ("staged", "make_index_quantize"),
+    "make_linear": ("staged", "make_linear"),
+    "make_norm": ("staged", "make_norm"),
+    "make_rope_kernel": ("staged", "make_rope_kernel"),
+    "make_swa": ("staged", "make_swa"),
+    "make_swiglu": ("staged", "make_swiglu"),
+    "make_sparse_attention": ("sparse_attention", "make_sparse_attention"),
+    "sparse_attention_reference": ("sparse_attention", "sparse_attention_reference"),
+    "indexer_query_reference": ("indexer_query", "indexer_query_reference"),
+    "make_indexer_query_quantize": ("indexer_query", "make_indexer_query_quantize"),
+    "make_l3_indexer_query": ("indexer_query", "make_l3_indexer_query"),
+    "quantize_indexer_query_reference": ("indexer_query", "quantize_indexer_query_reference"),
+    "indexer_select_reference": ("indexer_select", "indexer_select_reference"),
+    "make_indexer_select": ("indexer_select", "make_indexer_select"),
+    "make_indexer_prepare": ("indexer_prepare", "make_indexer_prepare"),
+    "prepare_indexer_indices_reference": ("indexer_prepare", "prepare_indexer_indices_reference"),
+    "LAYER14": ("decode_c2a_full", "LAYER14"),
+    "LAYER15": ("decode_c2a_reuse", "LAYER15"),
+    "Layer14A2A3Contract": ("decode_c2a_full", "Layer14A2A3Contract"),
+    "Layer15A2A3Contract": ("decode_c2a_reuse", "Layer15A2A3Contract"),
+    "index_key_reference": ("decode_c2a_full", "index_key_reference"),
+    "dequantize_engram_rows_reference": ("decode_c2a_full", "dequantize_engram_rows_reference"),
+    "engram_a2a3_reference": ("decode_c2a_full", "engram_a2a3_reference"),
+    "layer14_source_reference": ("decode_c2a_full", "layer14_source_reference"),
+    "layer15_reuse_reference": ("decode_c2a_reuse", "layer15_reuse_reference"),
+    "load_a2a3_layer14_15_bundle": ("decode_c2a_full", "load_a2a3_layer14_15_bundle"),
+    "make_layer14_stages": ("decode_c2a_full", "make_layer14_stages"),
+    "make_layer15_stages": ("decode_c2a_reuse", "make_layer15_stages"),
+    "make_ratio2_projection": ("decode_c2a_full", "make_ratio2_projection"),
+    "quantize_engram_rows_reference": ("decode_c2a_full", "quantize_engram_rows_reference"),
+    "ratio2_pool_reference": ("decode_c2a_full", "ratio2_pool_reference"),
+    "update_ratio2_state_reference": ("decode_c2a_full", "update_ratio2_state_reference"),
+    "validate_layer14_15_contract": ("decode_c2a_full", "validate_layer14_15_contract"),
+    "RawCheckpoint": ("raw_checkpoint", "RawCheckpoint"),
+    "flatten_scale": ("raw_checkpoint", "flatten_scale"),
+    "load_attention_weights": ("raw_checkpoint", "load_attention_weights"),
+    "load_decoder_layer_weights": ("raw_checkpoint", "load_decoder_layer_weights"),
+    "LAYER19": ("decode_c2a_reuse", "LAYER19"),
+    "LAYER20": ("decode_c1a_full", "LAYER20"),
+    "LAYER21": ("decode_c1a_reuse", "LAYER21"),
+    "LAYER24": ("decode_c1a_reindex", "LAYER24"),
+    "LAYER25": ("decode_c1a_reuse", "LAYER25"),
+    "TARGET_LAYERS": ("layers19_25", "TARGET_LAYERS"),
+    "c1a_full_reference": ("decode_c1a_full", "c1a_full_reference"),
+    "c1a_reindex_reference": ("decode_c1a_reindex", "c1a_reindex_reference"),
+    "c1a_reuse_reference": ("decode_c1a_reuse", "c1a_reuse_reference"),
+    "c2a_reuse_reference": ("decode_c2a_reuse", "c2a_reuse_reference"),
+    "layer_contract": ("layers19_25", "layer_contract"),
+    "make_decoder_layer_stages": ("layers19_25", "make_decoder_layer_stages"),
+    "select_candidate_block_pool_reference": ("layers19_25", "select_candidate_block_pool_reference"),
+    "validate_layer19_20_21_24_25_contracts": (
+        "layers19_25",
+        "validate_layer19_20_21_24_25_contracts",
+    ),
+}
+
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str):
+    """Load a public operator only when a caller requests it."""
+
+    try:
+        module_name, attribute = _EXPORTS[name]
+    except KeyError as error:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from error
+    value = getattr(import_module(f".{module_name}", __name__), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Return eager package names and lazy public operator names."""
+
+    return sorted(set(globals()) | set(__all__))
