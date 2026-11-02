@@ -75,7 +75,6 @@ WORKERS = 32
 GATHER_WORKERS = 64
 SELECTED_GATHER_TILE = 64
 CACHE_WORKERS = 32
-WINDOW_PUBLISH_WORKER_TILE = 12
 SHARED_GATHER_WORKERS = 64
 CACHE_MAX_ROWS = 32768
 PACKED_QUERY_TILE = 32
@@ -97,89 +96,6 @@ SWA_CROSS_CORE_SLOT_TILE = 1
 SWA_RUN_TILE = 32
 SWA_RUN_PARTS = SWA_WINDOW // SWA_RUN_TILE
 SWA_RUN_DESCRIPTOR_WIDTH = 8
-
-
-@pl.jit.inline
-def prefill_publish_window(
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-):
-    with pl.spmd(num_tokens, name_hint="pub_win", deps=[cache_ready]) as publish_tid:
-        t = pl.tile.get_block_idx()
-        _publish_window_row(kv, slots, cache, scales, t)
-    return publish_tid
-
-
-@pl.jit.inline
-def prefill_publish_window_batched(
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-):
-    with pl.spmd(64, name_hint="prefill_swa_cache_publish", deps=[cache_ready]) as publish_tid:
-        worker = pl.tile.get_block_idx()
-        for t in pl.range(worker, num_tokens, 64):
-            _publish_window_row(kv, slots, cache, scales, t)
-    return publish_tid
-
-
-@pl.jit.inline
-def _publish_window_row(
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    t: pl.Scalar[pl.INT32],
-):
-    blocks = pl.tensor.dim(cache, 0)
-    cache_rows = blocks * 128
-    flat = pl.tensor.view(cache, [cache_rows, HEAD_DIM])
-    scale_flat = pl.tensor.view(scales, [cache_rows, HEAD_DIM // 32])
-    slot_i64 = pl.read(slots, [t])
-    if slot_i64 >= 0:
-        slot = pl.cast(slot_i64, pl.INDEX)
-        source = pl.load(kv, [t, 0], [1, HEAD_DIM * 2], valid_shape=[1, HEAD_DIM])
-        source_padded = pl.fillpad(source, pad_value=pl.PadValue.zero)
-        source = pl.set_validshape(source_padded, 1, HEAD_DIM * 2)
-        source_fp32 = pl.cast(source, pl.FP32)
-        value = pl.reshape(source_fp32, [HEAD_DIM // 16, 32])
-        absolute = pl.abs(value)
-        reduce_tmp = pl.create_tile([HEAD_DIM // 16, 32], dtype=pl.FP32)
-        row_maximum = pl.row_max(absolute, tmp_tile=reduce_tmp)
-        amax = pl.maximum(row_maximum, 1e-4)
-        raw_scale = pl.mul(amax, 1.0 / 448.0)
-        scale = pl.cast(raw_scale, pl.BF16, mode="rint")
-        scale_fp32 = pl.cast(scale, pl.FP32)
-        normalized = pl.row_expand_div(value, scale_fp32)
-        payload = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
-        payload_row = pl.reshape(payload, [1, HEAD_DIM * 2])
-        flat = pl.store(pl.set_validshape(payload_row, 1, HEAD_DIM), [slot, 0], flat)
-        scale_row = pl.reshape(scale, [1, HEAD_DIM // 16])
-        scale_flat = pl.store(pl.set_validshape(scale_row, 1, HEAD_DIM // 32), [slot, 0], scale_flat)
-    return flat, scale_flat
-
-
-@pl.jit.inline(auto_scope=False)
-def publish_window_row(
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    workers = pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE)
-    step = pl.max(1, workers)
-    for worker in pl.spmd(workers, name_hint="pub_win"):
-        for t in pl.range(worker, num_tokens, step):
-            _publish_window_row(kv, slots, cache, scales, t)
-    return cache, scales
 
 
 @pl.jit.inline(auto_scope=False)

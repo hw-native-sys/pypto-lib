@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Shared V4.1 Q/KV projection, normalization, and RoPE stages."""
+"""Shared V4.1 Q/KV projection, normalization, RoPE, and window cache publication."""
 
 
 from pathlib import Path
@@ -21,7 +21,7 @@ from gemm import (
     golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum,
 )
 from quant import QUANT_SCALE_TILE, quantize_bf16_to_mxfp8
-from rmsnorm import golden_rms_norm, rms_norm
+from rmsnorm import golden_rms_norm
 
 
 # model config
@@ -38,6 +38,7 @@ Q_B_N_TILE = 256
 KV_N_TILE = 64
 PROJ_M_TILE = 80
 ROPE_WORKER_TILE = 32
+WINDOW_PUBLISH_WORKER_TILE = 12
 
 
 @pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_a.cpp",
@@ -301,20 +302,32 @@ def q_proj_rope(
     return query_latent, query, qb_payload, qb_scales
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "window_norm_rope_publish.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _norm_rope_publish(
+    source: pl.Tensor,
+    weight: pl.Tensor,
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+    slots: pl.Tensor,
+    cache: pl.InOut[pl.Tensor],
+    scales: pl.InOut[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Normalize and rotate BF16 rows, then quantize and publish group-32 FP8 cache pages."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
-def kv_proj_rope(
+def kv_proj(
     payload: pl.Tensor,
     scales: pl.Tensor,
     wkv: pl.Tensor,
     wkv_scale: pl.Tensor,
-    kv_norm_weight: pl.Tensor,
-    rope_cos: pl.Tensor,
-    rope_sin: pl.Tensor,
     kv_projection: pl.Tensor,
-    window_kv: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    """Project NZ KV weights, normalize to BF16, and rotate the RoPE tail in M80 groups."""
+    """Project NZ KV weights to BF16 rows in M80 groups."""
     for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
         group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
         group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
@@ -324,13 +337,26 @@ def kv_proj_rope(
             kv_projection = _proj_kv(
                 group_payload, wkv, group_scales, wkv_scale, kv_projection, group_rows, group_start,
             )
-        projection_group = pl.slice(kv_projection, [group_rows, HEAD_DIM], [group_start, 0])
-        normalized_group = pl.slice(window_kv, [group_rows, HEAD_DIM], [group_start, 0])
-        group_tokens = pl.cast(group_rows, pl.INT32)
-        for norm_worker in pl.spmd((group_tokens + 7) // 8, name_hint="norm_kv"):
-            rms_norm(projection_group, kv_norm_weight, normalized_group, norm_worker, group_tokens, width=HEAD_DIM)
-        _rope_inplace(window_kv, rope_cos, rope_sin, group_start, group_tokens, 1, "rope_kv")
-    return kv_projection, window_kv
+    return kv_projection
+
+
+@pl.jit.inline(auto_scope=False)
+def window_publish(
+    kv_projection: pl.Tensor,
+    kv_norm_weight: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    slots: pl.Tensor,
+    cache: pl.Tensor,
+    cache_scale: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Fuse RMSNorm, RoPE, group-32 FP8 quantization, and window cache publication."""
+    workers = pl.max(1, pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE))
+    with pl.spmd(workers, name_hint="norm_rope_pub_win", deps=[cache_ready]) as published:
+        cache = _norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, cache_scale, num_tokens)
+    return published
 
 
 def golden_rope_interleave(

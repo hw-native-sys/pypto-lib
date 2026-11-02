@@ -12,11 +12,10 @@ import pypto.language as pl
 import torch
 
 from config import DSPARK_QUERY_WIDTH, FLASH, ORI_BLOCKS_DYN, T_DYN
-from qkv_proj_rope import golden_rope_interleave, quantize_projection_input, kv_proj_rope
+from qkv_proj_rope import golden_rope_interleave, quantize_projection_input, kv_proj, window_publish
 from gemm import golden_mxfp8_linear_grouped_sum
 from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm
-from sparse_attention import publish_window_row
 
 
 D = FLASH.hidden_size
@@ -81,16 +80,14 @@ def dspark_context_kv(
     """Use the draft layer's own WKV, norm, and paged cache mapping."""
     tokens = pl.tensor.dim(main_x, 0)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_input_payload, kv_input_scales = quantize_projection_input(main_x, num_tokens)
-    kv_proj_rope(
-        kv_input_payload, kv_input_scales,
-        wkv, wkv_scale, kv_norm_weight,
-        rope_cos, rope_sin,
-        projected, rotated,
-        num_tokens,
+    window_input_ready = pl.system.task_dummy(deps=[])
+    projected = kv_proj(kv_input_payload, kv_input_scales, wkv, wkv_scale, projected, num_tokens)
+    window_publish(
+        projected, kv_norm_weight, rope_cos, rope_sin,
+        context_slots, window_cache, window_cache_scale,
+        num_tokens, window_input_ready,
     )
-    publish_window_row(rotated, context_slots, window_cache, window_cache_scale, num_tokens)
     return window_cache, window_cache_scale
 
 

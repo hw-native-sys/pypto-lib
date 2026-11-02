@@ -12,8 +12,7 @@ import pypto.language as pl
 
 from config import DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, ORI_BLOCKS_DYN, TP_SIZE, T_DYN
 from o_proj import o_proj
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
-from sparse_attention import publish_window_row
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 
 
 D = FLASH.hidden_size
@@ -143,7 +142,6 @@ def dspark_attention(
     tokens = pl.tensor.dim(x, 0)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
     q_proj_rope(
         proj_payload, proj_scales,
@@ -154,14 +152,13 @@ def dspark_attention(
         num_tokens,
     )
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(
-        proj_payload, proj_scales,
-        wkv, wkv_scale, kv_norm_weight,
-        rope_cos, rope_sin,
-        kv_projection, kv,
-        num_tokens,
+    window_input_ready = pl.system.task_dummy(deps=[])
+    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    window_publish(
+        kv_projection, kv_norm_weight, rope_cos, rope_sin,
+        window_slots, window_cache, window_cache_scale,
+        num_tokens, window_input_ready,
     )
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     selected = pl.create_tensor([tokens, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], dtype=pl.BF16)
     gather_dspark_window(window_cache, window_cache_scale, window_indices, selected, num_tokens)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)

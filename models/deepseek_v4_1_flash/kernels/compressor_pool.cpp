@@ -6,23 +6,17 @@
 // INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
-// Ratio-2 pair pooling, BF16 rounding, and weighted RMS normalization.
-#include <cstdint>
-#include <pto/pto-inst.hpp>
-#include "tensor.h"
-#include "intrinsic.h"
-using namespace pto;
+// Pair pooling, RMS normalization, rotary cache publication, and ring-state update.
+#if defined(__CPU_SIM)
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#endif
+#include "compressor_publish.h"
 namespace {
+#if defined(__DAV_VEC__)
 template <typename T, int R, int C>
 using TileRC = Tile<TileType::Vec, T, R, C>;
-template <typename T, int C>
-using GM = GlobalTensor<T, TileShape2D<T, 1, C>, BaseShape2D<T, 1, C>>;
-template <typename T>
-__aicore__ inline __gm__ T* data(__gm__ int64_t* args, int index) {
-    auto tensor = reinterpret_cast<__gm__ Tensor*>(args[index]);
-    return reinterpret_cast<__gm__ T*>(tensor->buffer.addr) + tensor->start_offset;
-}
-#if defined(__DAV_VEC__)
 __tf__ __aicore__ inline void pool_rows(
     TileRC<bfloat16_t, 8, 512>::TileDType __out__ output,
     TileRC<float, 8, 512>::TileDType __in__ current_kv,
@@ -121,98 +115,226 @@ __tf__ __aicore__ inline void pool_rows(
 #endif
 }
 
-__aicore__ inline void run(__gm__ int64_t* args) {
-    int tokens = args[9];
-    int begin = get_block_idx(args) * 8;
-    int rows = tokens - begin < 8 ? tokens - begin : 8;
-    if (rows <= 0) return;
-    TileRC<float, 8, 512> current_kv, current_score, previous_kv, previous_score;
-    TileRC<bfloat16_t, 8, 512> output;
-    TileRC<bfloat16_t, 1, 512> weight;
-    TileRC<float, 1, 512> scratch;
+__aicore__ inline void flush(__gm__ int64_t* args, int rows, uint16_t active,
+                            Vec<int64_t, 8>& targets, Vec<int32_t, 8>& tokens) {
+    Batch<float, 512> current_kv, current_score, previous_kv, previous_score;
+    Batch<bfloat16_t, 512> output;
+    Vec<bfloat16_t, 512> weight;
+    Vec<float, 512> pool_scratch;
+    Batch<float, 32> cosine, sine;
+    Batch<uint8_t, 256> packed;
+    Batch<bfloat16_t, 32> scales;
+    Vec<float, 32> quant_scratch;
     TASSIGN(current_kv, 0);
     TASSIGN(current_score, 16384);
     TASSIGN(previous_kv, 32768);
     TASSIGN(previous_score, 49152);
     TASSIGN(output, 65536);
     TASSIGN(weight, 73728);
-    TASSIGN(scratch, 74752);
-    using Meta = Tile<TileType::Vec, int32_t, 1, 8, BLayout::RowMajor, 1, DYNAMIC>;
-    Meta positions(rows), requests(rows), boundaries(2), state_blocks(1);
-    TASSIGN(positions, 76800);
-    TASSIGN(requests, 76832);
-    TASSIGN(boundaries, 76864);
-    TASSIGN(state_blocks, 76896);
-    using MetaGM = GlobalTensor<int32_t, TileShape2D<int32_t, 1, DYNAMIC>, BaseShape2D<int32_t, 1, 8>>;
-    MetaGM pos_gm(data<int32_t>(args, 3) + begin, TileShape2D<int32_t, 1, DYNAMIC>(1, rows));
-    MetaGM req_gm(data<int32_t>(args, 7) + begin, TileShape2D<int32_t, 1, DYNAMIC>(1, rows));
-    TLOAD(positions, pos_gm);
-    TLOAD(requests, req_gm);
-    GM<bfloat16_t, 512> weight_gm(data<bfloat16_t>(args, 4));
-    TLOAD(weight, weight_gm);
-    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
-    int request_count = reinterpret_cast<__gm__ Tensor*>(args[8])->shapes[0];
-    int blocks = args[10];
-    uint16_t active = 0;
-    int last_request = -1, start = 0, end = 0, block = -1;
-    for (int row = 0; row < rows; ++row) {
-        int token = begin + row;
-        int request = requests.GetValue(row), position = positions.GetValue(row);
-        if (request < 0 || request >= request_count || position < 0 || !(position % 2)) continue;
-        if (request != last_request) {
-            MetaGM bounds_gm(data<int32_t>(args, 6) + request, TileShape2D<int32_t, 1, DYNAMIC>(1, 2));
-            MetaGM blocks_gm(data<int32_t>(args, 8) + request, TileShape2D<int32_t, 1, DYNAMIC>(1, 1));
-            set_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
-            wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
-            TLOAD(boundaries, bounds_gm);
-            TLOAD(state_blocks, blocks_gm);
-            set_flag(PIPE_MTE2, PIPE_S, EVENT_ID1);
-            wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID1);
-            start = boundaries.GetValue(0);
-            end = boundaries.GetValue(1);
-            block = state_blocks.GetValue(0);
-            last_request = request;
+    TASSIGN(pool_scratch, 74752);
+    TASSIGN(cosine, 77504);
+    TASSIGN(sine, 78528);
+    TASSIGN(packed, 79552);
+    TASSIGN(scales, 81600);
+    TASSIGN(quant_scratch, 82112);
+    // Only the final occurrence of a cache slot writes it across state owners.
+    using Slots = Tile<TileType::Vec, int64_t, 1, 128, BLayout::RowMajor, 1, DYNAMIC>;
+    using SlotGM = GlobalTensor<int64_t, TileShape2D<int64_t, 1, DYNAMIC>, BaseShape2D<int64_t, 1, 128>>;
+    Slots future(128);
+    TASSIGN(future, 82240);
+    int count_tokens = args[14];
+    int first = tokens.GetValue(0);
+    for (int row = 1; row < rows; ++row) {
+        if (tokens.GetValue(row) < first) first = tokens.GetValue(row);
+    }
+    for (int base = first / 128 * 128; base < count_tokens; base += 128) {
+        int count = count_tokens - base < 128 ? count_tokens - base : 128;
+        future.SetValidCol(count);
+        SlotGM slot_gm(data<int64_t>(args, 9) + base, TileShape2D<int64_t, 1, DYNAMIC>(1, count));
+        TLOAD(future, slot_gm);
+        set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+        for (int row = 0; row < rows; ++row) {
+            int64_t slot = targets.GetValue(row);
+            if (slot < 0) continue;
+            int start = tokens.GetValue(row) + 1 - base;
+            if (start < 0) start = 0;
+            for (int lane = start; lane < count; ++lane) {
+                if (future.GetValue(lane) == slot) {
+                    targets.SetValue(row, -1);
+                    break;
+                }
+            }
         }
-        if (block < 0 || block >= blocks || token < start || token >= end) continue;
-        active |= 1u << row;
-        TileRC<float, 1, 512> ck, cs, pk, ps;
-        TASSIGN(ck, row * 2048);
-        TASSIGN(cs, 16384 + row * 2048);
-        TASSIGN(pk, 32768 + row * 2048);
-        TASSIGN(ps, 49152 + row * 2048);
-        GM<float, 512> ck_gm(data<float>(args, 0) + token * 512);
-        GM<float, 512> cs_gm(data<float>(args, 1) + token * 512);
-        __gm__ float* prev_kv;
-        __gm__ float* prev_score;
-        if (token > start) {
-            prev_kv = data<float>(args, 0) + (token - 1) * 512;
-            prev_score = data<float>(args, 1) + (token - 1) * 512;
-        } else {
-            int slot = block * 4 + (position - 1) % 4;
-            prev_kv = data<float>(args, 2) + slot * 1024;
-            prev_score = prev_kv + 512;
-        }
-        GM<float, 512> pk_gm(prev_kv), ps_gm(prev_score);
-        TLOAD(ck, ck_gm);
-        TLOAD(cs, cs_gm);
-        TLOAD(pk, pk_gm);
-        TLOAD(ps, ps_gm);
+        set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
     }
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     pool_rows(output.data(), current_kv.data(), current_score.data(), previous_kv.data(),
-              previous_score.data(), weight.data(), scratch.data(), active, rows);
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    using Output = Tile<TileType::Vec, bfloat16_t, 1, 4096, BLayout::RowMajor, 1, DYNAMIC>;
-    using OutputGM = GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, 1, DYNAMIC>, BaseShape2D<bfloat16_t, 1, 4096>>;
-    Output result(rows * 512);
-    TASSIGN(result, 65536);
-    OutputGM result_gm(data<bfloat16_t>(args, 5) + begin * 512,
-                       TileShape2D<bfloat16_t, 1, DYNAMIC>(1, rows * 512));
-    TSTORE(result_gm, result);
-    pipe_barrier(PIPE_ALL);
+              previous_score.data(), weight.data(), pool_scratch.data(), active, rows);
+    publish_rows<false>(output, cosine, sine, packed, scales, quant_scratch, targets, tokens, rows,
+                        65536, 79552, 81600, data<bfloat16_t>(args, 5), data<uint8_t>(args, 12), data<bfloat16_t>(args, 13));
+}
+
+__aicore__ inline void run(__gm__ int64_t* args) {
+    int count_tokens = args[14], blocks = args[15];
+    int worker = get_block_idx(args), workers = get_block_num(args);
+    int request_count = reinterpret_cast<__gm__ Tensor*>(args[8])->shapes[0];
+    using Meta = Tile<TileType::Vec, int32_t, 1, 32, BLayout::RowMajor, 1, DYNAMIC>;
+    using MetaGM = GlobalTensor<int32_t, TileShape2D<int32_t, 1, DYNAMIC>, BaseShape2D<int32_t, 1, 32>>;
+    using Slots = Tile<TileType::Vec, int64_t, 1, 32, BLayout::RowMajor, 1, DYNAMIC>;
+    using SlotGM = GlobalTensor<int64_t, TileShape2D<int64_t, 1, DYNAMIC>, BaseShape2D<int64_t, 1, 32>>;
+    using Blocks = Tile<TileType::Vec, int32_t, 1, 128, BLayout::RowMajor, 1, DYNAMIC>;
+    using Bounds = Tile<TileType::Vec, int32_t, 1, 136, BLayout::RowMajor, 1, DYNAMIC>;
+    using BlocksGM = GlobalTensor<int32_t, TileShape2D<int32_t, 1, DYNAMIC>, BaseShape2D<int32_t, 1, 128>>;
+    using BoundsGM = GlobalTensor<int32_t, TileShape2D<int32_t, 1, DYNAMIC>, BaseShape2D<int32_t, 1, 136>>;
+    Meta positions(32), requests(32);
+    Blocks state_blocks(128);
+    Bounds boundaries(129);
+    Slots slots(32);
+    Vec<int64_t, 8> targets;
+    Vec<int32_t, 8> tokens;
+    Vec<bfloat16_t, 512> weight;
+    TASSIGN(positions, 76800);
+    TASSIGN(requests, 76928);
+    TASSIGN(slots, 77056);
+    TASSIGN(boundaries, 83776);
+    TASSIGN(state_blocks, 83264);
+    TASSIGN(targets, 77408);
+    TASSIGN(tokens, 77472);
+    TASSIGN(weight, 73728);
+    GM<bfloat16_t, 512> weight_gm(data<bfloat16_t>(args, 4));
+    TLOAD(weight, weight_gm);
+    int cached_base = -1;
+    // A physical state block has one owner; all its historical reads precede writes.
+    for (int phase = 0; phase < 2; ++phase) {
+        int pending = 0;
+        uint16_t active = 0;
+        for (int request = 0; request < request_count + 2; ++request) {
+            int lookup = request < request_count ? request : (request == request_count ? 0 : request_count);
+            int request_base = lookup / 128 * 128;
+            if (cached_base != request_base) {
+                int request_rows = request_count - request_base < 128 ? request_count - request_base : 128;
+                state_blocks.SetValidCol(request_rows);
+                boundaries.SetValidCol(request_rows + 1);
+                BoundsGM bounds_gm(data<int32_t>(args, 6) + request_base,
+                                  TileShape2D<int32_t, 1, DYNAMIC>(1, request_rows + 1));
+                set_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+                wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID1);
+                TLOAD(boundaries, bounds_gm);
+                if (request_rows > 0) {
+                    BlocksGM block_gm(data<int32_t>(args, 8) + request_base,
+                                      TileShape2D<int32_t, 1, DYNAMIC>(1, request_rows));
+                    TLOAD(state_blocks, block_gm);
+                }
+                set_flag(PIPE_MTE2, PIPE_S, EVENT_ID1);
+                wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID1);
+                cached_base = request_base;
+            }
+            int block = request < request_count ? state_blocks.GetValue(request - cached_base) : -1;
+            bool valid_block = block >= 0 && block < blocks;
+            int owner = valid_block ? block % workers : request % workers;
+            if (owner != worker) continue;
+            int start, end;
+            if (request < request_count) {
+                start = boundaries.GetValue(request - cached_base);
+                end = boundaries.GetValue(request - cached_base + 1);
+            } else if (request == request_count) {
+                start = 0;
+                end = boundaries.GetValue(0);
+            } else {
+                start = boundaries.GetValue(request_count - cached_base);
+                end = count_tokens;
+            }
+            if (start < 0) start = 0;
+            if (end > count_tokens) end = count_tokens;
+            if (phase == 1 && !valid_block) continue;
+            int begin = phase == 1 && end - 4 > start ? end - 4 : start;
+            for (int base = begin; base < end; base += 32) {
+                int count = end - base < 32 ? end - base : 32;
+                positions.SetValidCol(count);
+                requests.SetValidCol(count);
+                slots.SetValidCol(count);
+                MetaGM pos_gm(data<int32_t>(args, 3) + base, TileShape2D<int32_t, 1, DYNAMIC>(1, count));
+                MetaGM req_gm(data<int32_t>(args, 7) + base, TileShape2D<int32_t, 1, DYNAMIC>(1, count));
+                TLOAD(positions, pos_gm);
+                TLOAD(requests, req_gm);
+                if (phase == 0) {
+                    SlotGM slot_gm(data<int64_t>(args, 9) + base, TileShape2D<int64_t, 1, DYNAMIC>(1, count));
+                    TLOAD(slots, slot_gm);
+                }
+                set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
+                for (int lane = 0; lane < count; ++lane) {
+                    int token = base + lane, position = positions.GetValue(lane);
+                    bool valid = valid_block && requests.GetValue(lane) == request && position >= 0;
+                    if (phase == 1) {
+                        if (!valid) continue;
+                        Vec<float, 512> kv, score;
+                        TASSIGN(kv, 0);
+                        TASSIGN(score, 16384);
+                        GM<float, 512> kv_gm(data<float>(args, 0) + (int64_t)token * 512);
+                        GM<float, 512> score_gm(data<float>(args, 1) + (int64_t)token * 512);
+                        TLOAD(kv, kv_gm);
+                        TLOAD(score, score_gm);
+                        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+                        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+                        int64_t slot = (int64_t)block * 4 + position % 4;
+                        GM<float, 512> state_kv(data<float>(args, 2) + slot * 1024);
+                        GM<float, 512> state_score(data<float>(args, 2) + slot * 1024 + 512);
+                        TSTORE(state_kv, kv);
+                        TSTORE(state_score, score);
+                        pipe_barrier(PIPE_ALL);
+                        continue;
+                    }
+                    tokens.SetValue(pending, token);
+                    targets.SetValue(pending, slots.GetValue(lane));
+                    Vec<float, 32> cosine, sine;
+                    TASSIGN(cosine, 77504 + pending * 128);
+                    TASSIGN(sine, 78528 + pending * 128);
+                    GM<float, 32> cos_gm(data<float>(args, 10) + (int64_t)token * 32);
+                    GM<float, 32> sin_gm(data<float>(args, 11) + (int64_t)token * 32);
+                    TLOAD(cosine, cos_gm);
+                    TLOAD(sine, sin_gm);
+                    if (valid && position % 2) {
+                        active |= 1u << pending;
+                        Vec<float, 512> ck, cs, pk, ps;
+                        TASSIGN(ck, pending * 2048);
+                        TASSIGN(cs, 16384 + pending * 2048);
+                        TASSIGN(pk, 32768 + pending * 2048);
+                        TASSIGN(ps, 49152 + pending * 2048);
+                        GM<float, 512> ck_gm(data<float>(args, 0) + (int64_t)token * 512);
+                        GM<float, 512> cs_gm(data<float>(args, 1) + (int64_t)token * 512);
+                        __gm__ float* prev_kv;
+                        __gm__ float* prev_score;
+                        if (token > start) {
+                            prev_kv = data<float>(args, 0) + (int64_t)(token - 1) * 512;
+                            prev_score = data<float>(args, 1) + (int64_t)(token - 1) * 512;
+                        } else {
+                            int64_t slot = (int64_t)block * 4 + (position - 1) % 4;
+                            prev_kv = data<float>(args, 2) + slot * 1024;
+                            prev_score = prev_kv + 512;
+                        }
+                        GM<float, 512> pk_gm(prev_kv), ps_gm(prev_score);
+                        TLOAD(ck, ck_gm);
+                        TLOAD(cs, cs_gm);
+                        TLOAD(pk, pk_gm);
+                        TLOAD(ps, ps_gm);
+                    }
+                    if (++pending == 8) {
+                        flush(args, pending, active, targets, tokens);
+                        pending = 0;
+                        active = 0;
+                    }
+                }
+                set_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+                wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID0);
+            }
+        }
+        if (pending > 0) flush(args, pending, active, targets, tokens);
+        pipe_barrier(PIPE_ALL);
+    }
 }
 #endif
 } // namespace

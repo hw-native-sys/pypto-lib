@@ -6,7 +6,7 @@
 // INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
-// Group-16 cache publication with optional fused rotary embedding.
+// Rotary embedding and group-16 cache publication with selectable E2M1 rounding.
 #pragma once
 #include <cstdint>
 #include <pto/pto-inst.hpp>
@@ -197,86 +197,41 @@ __tf__ __aicore__ inline void rotate(
 #endif
 }
 
-template <bool Rotate>
-__aicore__ inline void flush_rows(__gm__ int64_t* args, int rows, Vec<int64_t, 8>& targets) {
-    Batch<bfloat16_t, 512> input;
-    Batch<uint8_t, 256> packed;
-    Batch<bfloat16_t, 32> scales;
-    Vec<float, 32> scratch;
-    TASSIGN(input, 0);
-    TASSIGN(packed, 8192);
-    TASSIGN(scales, 10240);
-    TASSIGN(scratch, 10752);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    if constexpr (Rotate) {
-        Batch<float, 32> cosine, sine;
-        TASSIGN(cosine, 11200);
-        TASSIGN(sine, 12224);
-        rotate(input.data(), input.data(), cosine.data(), sine.data(), rows);
+template <bool RoundEven>
+__aicore__ inline void publish_rows(
+    Batch<bfloat16_t, 512>& input, Batch<float, 32>& cosine, Batch<float, 32>& sine,
+    Batch<uint8_t, 256>& packed, Batch<bfloat16_t, 32>& scales, Vec<float, 32>& scratch,
+    Vec<int64_t, 8>& targets, Vec<int32_t, 8>& tokens, int rows,
+    int input_address, int packed_address, int scales_address,
+    __gm__ bfloat16_t* latent, __gm__ uint8_t* cache, __gm__ bfloat16_t* cache_scales) {
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    for (int row = 0; row < rows; ++row) {
+        Vec<bfloat16_t, 512> value;
+        TASSIGN(value, input_address + row * 1024);
+        GM<bfloat16_t, 512> latent_gm(latent + (int64_t)tokens.GetValue(row) * 512);
+        TSTORE(latent_gm, value);
     }
-    quantize<!Rotate>(packed.data(), scales.data(), input.data(), scratch.data(), rows);
+    // Finish storing the unrotated latent before changing its UB buffer.
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    rotate(input.data(), input.data(), cosine.data(), sine.data(), rows);
+    quantize<RoundEven>(packed.data(), scales.data(), input.data(), scratch.data(), rows);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     for (int row = 0; row < rows; ++row) {
         int64_t slot = targets.GetValue(row);
+        if (slot < 0) continue;
         Vec<uint8_t, 256> payload;
         Vec<bfloat16_t, 32> factor;
-        TASSIGN(payload, 8192 + row * 256);
-        TASSIGN(factor, 10240 + row * 64);
-        GM<uint8_t, 256> output_gm(data<uint8_t>(args, 2) + slot * 256);
-        GM<bfloat16_t, 32> scales_gm(data<bfloat16_t>(args, 3) + slot * 32);
+        TASSIGN(payload, packed_address + row * 256);
+        TASSIGN(factor, scales_address + row * 64);
+        GM<uint8_t, 256> output_gm(cache + slot * 256);
+        GM<bfloat16_t, 32> scales_gm(cache_scales + slot * 32);
         TSTORE(output_gm, payload);
         TSTORE(scales_gm, factor);
-        // Preserve input order for duplicate target slots.
         pipe_barrier(PIPE_MTE3);
     }
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-}
-
-template <bool Rotate>
-__aicore__ inline void publish(__gm__ int64_t* args) {
-    Tile<TileType::Vec, int64_t, 1, 32, BLayout::RowMajor, 1, DYNAMIC> slots(32);
-    Vec<int64_t, 8> targets;
-    TASSIGN(slots, 10880);
-    TASSIGN(targets, 11136);
-    int tokens = args[Rotate ? 6 : 4];
-    int worker = get_block_idx(args);
-    int workers = get_block_num(args);
-    int pending = 0;
-    for (int base = 0; base < tokens; base += 32) {
-        int count = tokens - base < 32 ? tokens - base : 32;
-        slots.SetValidCol(count);
-        using SlotGM = GlobalTensor<int64_t, TileShape2D<int64_t, 1, DYNAMIC>, BaseShape2D<int64_t, 1, 32>>;
-        SlotGM slot_gm(data<int64_t>(args, 1) + base, TileShape2D<int64_t, 1, DYNAMIC>(1, count));
-        TLOAD(slots, slot_gm);
-        set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
-        for (int lane = 0; lane < count; ++lane) {
-            int64_t slot = slots.GetValue(lane);
-            if (slot < 0 || (slot / 128) % workers != worker) continue;
-            targets.SetValue(pending, slot);
-            Vec<bfloat16_t, 512> input;
-            TASSIGN(input, pending * 1024);
-            GM<bfloat16_t, 512> input_gm(data<bfloat16_t>(args, 0) + (int64_t)(base + lane) * 512);
-            TLOAD(input, input_gm);
-            if constexpr (Rotate) {
-                Vec<float, 32> cosine, sine;
-                TASSIGN(cosine, 11200 + pending * 128);
-                TASSIGN(sine, 12224 + pending * 128);
-                GM<float, 32> cos_gm(data<float>(args, 4) + (int64_t)(base + lane) * 32);
-                GM<float, 32> sin_gm(data<float>(args, 5) + (int64_t)(base + lane) * 32);
-                TLOAD(cosine, cos_gm);
-                TLOAD(sine, sin_gm);
-            }
-            if (++pending == 8) {
-                flush_rows<Rotate>(args, pending, targets);
-                pending = 0;
-            }
-        }
-    }
-    if (pending > 0) flush_rows<Rotate>(args, pending, targets);
     pipe_barrier(PIPE_ALL);
 }
 #endif

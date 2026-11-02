@@ -18,7 +18,7 @@ from golden import mapped_pool_ratio_allclose
 from sparse_attention import (
     SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
     analyze_index_runs, attend_shared_cache, decode_shared_cache_after_publish,
-    prefill_publish_window_batched, swa_official_reference as golden_reference,
+    swa_official_reference as golden_reference,
     make_swa_inputs as make_inputs, make_packed_swa_inputs as make_packed_inputs,
 )
 from config import (
@@ -29,7 +29,7 @@ from hc import golden_mhc_mixes
 from hc import golden_hc_post, prefill_sp_post
 from hc import golden_hc_collapse, hc_pre, zero_bf16_padding
 from rmsnorm import golden_rms_norm, rms_norm_tiled
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from o_proj import retire_prefill_signals, o_proj, prefill_sp_output_reduce_scatter
 from prefill_cp_allgather import make_prefill_sp_input_allgather
 
@@ -98,16 +98,13 @@ def prefill_swa_attention(
         worker = pl.tile.get_block_idx()
         for row in pl.range(worker, num_tokens, WORKER_TILE):
             kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_input_payload, kv_input_scales = quantize_projection_input(x, num_tokens)
-    kv_proj_rope(
-        kv_input_payload, kv_input_scales,
-        wkv, wkv_scale, kv_norm_weight,
-        rope_cos, rope_sin,
-        kv_projection, kv,
-        num_tokens,
+    kv_projection = kv_proj(kv_input_payload, kv_input_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    chunk_done = window_publish(
+        kv_projection, kv_norm_weight, rope_cos, rope_sin,
+        window_slots, window_cache, window_cache_scale,
+        num_tokens, cache_ready,
     )
-    chunk_done = prefill_publish_window_batched(kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
     cache_blocks = pl.tensor.dim(window_cache, 0)
     cache_rows = cache_blocks * 128
     decoded_cache = pl.create_tensor([cache_blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)

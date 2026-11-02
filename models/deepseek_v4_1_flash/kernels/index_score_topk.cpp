@@ -461,6 +461,46 @@ namespace {
                 }
             }
         }
+        __tf__ __aicore__ void short_page(__ubuf__ uint32_t* output, int base, int count) {
+            __VEC_SCOPE__ {
+                vector_u32 lane, physical, invalid, result;
+                vector_bool valid;
+                auto full = pset_b32(PAT_ALL);
+                vbr(invalid, 0xffffffffu);
+                for (uint16_t chunk = 0; chunk < 2; ++chunk) {
+                    vci((vector_s32&)lane, int32_t(chunk * 64), INC_ORDER);
+                    vadds(physical, lane, uint32_t(base), full, MODE_ZEROING);
+                    vcmps_lt(valid, (vector_s32&)lane, count, full);
+                    vsel(result, physical, invalid, valid);
+                    vsts(result, output, chunk * 64, NORM_B32, full);
+                }
+            }
+        }
+
+        __aicore__ inline void write_short_topk(__gm__ int64_t* args, int token,
+                                               int length, CandidateIndices& indices) {
+            int table_width = args[17];
+            int cache_pages = reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[0];
+            int request = read(data<int32_t>(args, 6) + token);
+            for (int block = 0; block < 4; ++block) {
+                int count = minimum(128, length - block * 128);
+                int page = -1;
+                if (count > 0 && block < table_width) {
+                    page = read(data<int32_t>(args, 5) + request * table_width + block);
+                }
+                if (page < 0 || page >= cache_pages) {
+                    page = 0;
+                    count = 0;
+                }
+                short_page(indices.data() + block * 128, page * 128, count);
+            }
+            GM<uint32_t, 1, 512, 1, 512> out(data<uint32_t>(args, 8) + token * 512);
+            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            TSTORE(out, indices);
+            pipe_barrier(PIPE_ALL);
+        }
+
         __aicore__ inline void merge(__gm__ int64_t* args) {
             int width = args[15], stride = args[16], table_width = args[17], tokens = args[18];
             int workers = get_block_num(args), worker = get_block_idx(args) * 2 + get_subblockid();
@@ -471,6 +511,13 @@ namespace {
             TASSIGN(selected_keys, 131584);
             TASSIGN(selected_indices, 132608);
             for (int token = worker; token < tokens; token += workers * 2) {
+                if (args[22]) {
+                    int length = read(data<int32_t>(args, 7) + token);
+                    if (length <= 512) {
+                        write_short_topk(args, token, length, selected_indices);
+                        continue;
+                    }
+                }
                 GM<uint32_t, 1, 512, 1, 512> out(data<uint32_t>(args, 8) + token * 512);
                 if (total == 0) {
                     TEXPANDS(selected_indices, 0xffffffffu);

@@ -28,17 +28,16 @@ from config import (
 from hc import golden_mhc_mixes
 from hc import golden_hc_post, hc_post, prefill_sp_post
 from hc import golden_hc_collapse, hc_pre
-from rmsnorm import golden_rms_norm, rms_norm_tiled, rms_norm
+from rmsnorm import golden_rms_norm, rms_norm_tiled
 from sparse_attention import (
     attend_packed, golden_compressed_attention, golden_prefill_c1a_attention,
-    prefill_publish_window,
 )
 from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import token_shards
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
-from compressor import c1a_compressor_project, compressor_rope, c1a_compressor_publish
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from compressor import c1a_compressor_project, c1a_compressor_publish
 from prefill_indexer import (
     prefill_indexer, publish_c1a_index_key, golden_prefill_indexer,
     golden_index_key, golden_select_candidate_block_pool,
@@ -181,16 +180,13 @@ def prefill_c1a_full_attention(
     )
     if num_tokens > 0:
         source_ready = pl.system.task_dummy(deps=[publication_ready, indexer_completion])
-        window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        kv_proj_rope(
-            proj_payload, proj_scales,
-            wkv, wkv_scale, kv_norm_weight,
-            rope_cos, rope_sin,
-            kv_projection, window_kv,
-            num_tokens,
+        kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+        window_ready = window_publish(
+            kv_projection, kv_norm_weight, rope_cos, rope_sin,
+            window_slots, window_cache, window_cache_scale,
+            num_tokens, source_ready,
         )
-        window_ready = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, source_ready)
 
         attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         attend_packed(
@@ -567,17 +563,10 @@ def prefill_publish_decoder(
         x, compressor_wkv, compressed_projection, num_tokens, projection_ready,
     )
     compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    norm_blocks = (num_tokens + 7) // 8
-    for norm_worker in pl.spmd(pl.max(1, norm_blocks), name_hint="attention_rmsnorm", deps=[projection_done]):
-        if norm_worker < norm_blocks:
-            rms_norm(compressed_projection, compressor_norm_weight, compressed_latent, norm_worker, num_tokens, width=HEAD_DIM)
-    compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    compressed_rotated = compressor_rope(
-        compressed_latent, compressed_rope_cos, compressed_rope_sin, compressed_rotated, num_tokens,
-    )
     compressed_ready = c1a_compressor_publish(
-        compressed_rotated, compressed_slots, compressed_cache, compressed_cache_scale,
-        num_tokens, projection_ready,
+        compressed_projection, compressor_norm_weight, compressed_latent, compressed_rope_cos, compressed_rope_sin,
+        compressed_slots, compressed_cache, compressed_cache_scale,
+        num_tokens, projection_ready, projection_done,
     )
     index_ready = publish_c1a_index_key(
         compressed_latent, index_wk, index_norm_weight, compressed_rope_cos, compressed_rope_sin,
