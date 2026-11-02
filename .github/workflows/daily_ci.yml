@@ -75,79 +75,20 @@ jobs:
           # default, which is the version the serving torch_npu pin requires.
           torch-version: ${{ matrix.platform == 'a5sim' && 'torch==2.10.0' || 'torch==2.6.0' }}
 
-      - name: Run model tests (${{ matrix.platform }})
-        id: sweep
-        shell: bash
+      - name: Select all simulator models
+        id: selection
         env:
-          PYTHONPATH: ${{ github.workspace }}/checkout
-          PYPTO_LOG_LEVEL: error
-          PYPTO_WARNING_LEVEL: none
-          # Quiet simpler's runtime logger. On a SIMPLER_PROFILING build every
-          # simpler_run emits its [STRACE] timing tree at the INFO_V9 tier, and
-          # simpler's logger defaults to INFO — so without this the console floods
-          # with markers. PYPTO_LOG_LEVEL/PYPTO_WARNING_LEVEL above drive pypto's
-          # own C++ logger, not simpler's; PYPTO_RUNTIME_LOG is simpler's knob.
-          # benchmark() still reads timing: it raises this to v9 only around its
-          # own fd-captured loop, then restores.
-          PYPTO_RUNTIME_LOG: error
+          PLATFORM: ${{ matrix.platform }}
         run: |
           source activate.sh
-          : > results.tsv
-          failed=()
-          target="${{ matrix.platform }}"
-          target_args=(-p "${target%sim}")
-          if [[ "$target" == *sim ]]; then target_args+=(--sim); fi
-          run_case() {
-            local file="$1" label="$2"; shift 2
-            echo "::group::${label}"
-            if ! timeout --kill-after=10s 300s python "$file" "${target_args[@]}" "$@"; then
-              failed+=("$label")
-              echo "::error file=${file}::FAIL (${label})"
-              printf '%s\tfail\n' "$label" >> results.tsv
-            else
-              printf '%s\tpass\n' "$label" >> results.tsv
-            fi
-            echo "::endgroup::"
-          }
-          # Run every model file once with no extra args. Files marked
-          # `# ci: no-sim` (full multi-layer / multi-card forwards) are
-          # device-only and would just reject --sim, so skip them here.
-          for f in $(python .github/scripts/detect_changes.py --all --root models --platform ${{ matrix.platform }}); do
-            if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
-              echo "::group::${f}"
-              echo "skip (no-sim): ${f}"
-              echo "::endgroup::"
-              continue
-            fi
-            run_case "$f" "$f"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            echo "Failed cases (${#failed[@]}):"
-            printf '  - %s\n' "${failed[@]}"
-            exit 1
-          fi
-          echo "All model tests passed."
+          files=$(python .github/scripts/detect_changes.py --all --root models --platform "$PLATFORM")
+          echo "files=$files" >> "$GITHUB_OUTPUT"
 
-      - name: Clean up build artifacts
-        if: always()
-        run: rm -rf build_output
-
-      - name: Upload results artifact
-        # Not a bare always(): on this persistent runner a results.tsv from a
-        # previous run survives in the checkout dir, so if the job dies before
-        # the sweep (setup failure, checkout failure), an unconditional upload
-        # re-publishes the LEFTOVER table and the summary renders days-old
-        # results as if they were tonight's — with the ":warning: No results
-        # artifact" branch silently defeated. Gate on the sweep step having
-        # actually started: it truncates results.tsv first thing, so anything
-        # it uploads (even from a failed or cancelled sweep) is from this run.
-        if: ${{ always() && steps.sweep.outcome != 'skipped' }}
-        uses: ./.github/actions/upload-results
+      - name: Run simulator tests
+        uses: ./.github/actions/run-sim-tests
         with:
-          name: results-${{ matrix.platform }}
-          # upload-artifact resolves `path` against $GITHUB_WORKSPACE and ignores
-          # defaults.run.working-directory, so name the checkout dir explicitly.
-          path: checkout/results.tsv
+          platform: ${{ matrix.platform }}
+          files: ${{ steps.selection.outputs.files }}
 
   model-tests-device:
     name: Model tests (${{ matrix.platform }})
