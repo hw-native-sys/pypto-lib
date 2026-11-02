@@ -130,21 +130,13 @@ def dispatch(
         x_norm_mx_raw = pl.store(raw_row_i8, [t_begin, 0], x_norm_mx_raw)
         scale_offset = t_begin // 16 * 16 * K_SCALE
         raw_scale = pl.load(x_norm_scale, [0, scale_offset], [1, 16 * K_SCALE])
-        raw_scale_u8 = pl.reinterpret_view(raw_scale, pl.UINT8)
-        raw_scale_i8 = pl.reinterpret_view(raw_scale_u8, pl.INT8)
-        active_tokens = pl.cast(num_tokens, pl.INDEX)
-        if active_tokens < 0:
-            active_tokens = pl.cast(0, pl.INDEX)
-        if active_tokens > T:
-            active_tokens = pl.cast(T, pl.INDEX)
-        # Each block owns whole 64-byte lines in the UINT8 scale buffer.
-        t_end = pl.min(t_begin + DISPATCH_STAGE_TILE, active_tokens)
-        for t in pl.range(t_begin, t_end):
-            for group in pl.range(K_SCALE):
-                scale_index = group // 2 * 32 + t % 16 * 2 + group % 2
-                scale_i8 = pl.tile.read(raw_scale_i8, [0, scale_index])
-                scale = pl.cast(scale_i8, pl.UINT8)
-                pl.write(scale_src, [t, group], scale)
+        scale_raw_bytes = pl.reinterpret_view(raw_scale, pl.UINT8)
+        scale_words = pl.reinterpret_view(scale_raw_bytes, pl.INT16, shape=[K_SCALE // 2, 16])
+        scale_words_nd = pl.transpose(scale_words, 0, 1)
+        scale_bytes_nd = pl.reinterpret_view(scale_words_nd, pl.UINT8, shape=[16, K_SCALE])
+        row_in_pack = t_begin % 16
+        scale_rows = pl.tile.slice(scale_bytes_nd, [DISPATCH_STAGE_TILE, K_SCALE], [row_in_pack, 0])
+        scale_src = pl.store(scale_rows, [t_begin, 0], scale_src)
 
     # Publish per-source route counts.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_publish", allow_early_resolve=True) as _meta_push_tid:
@@ -263,15 +255,18 @@ def dispatch(
                     src_base_row = e_base_row + src * MAX_PER_SRC
                     gather_begin = pl.max(tile_row, source_begin)
                     gather_end = pl.min(tile_end, source_end)
+                    if gather_begin < gather_end:
+                        in_begin = src_base_row + gather_begin - source_begin
+                        out_begin = e_base_row + gather_begin
+                        span_rows = gather_end - gather_begin
+                        recv_x_raw = pl.load(recv_x, [in_begin, 0], [RECV_TILE, D], valid_shape=[span_rows, D])
+                        recv_x_mx = pl.reinterpret_view(recv_x_raw, pl.FP8E4M3FN)
+                        recv_x_out_flat = pl.store(recv_x_mx, [out_begin, 0], recv_x_out_flat)
+                        recv_scale_raw = pl.load(recv_scale, [in_begin, 0], [RECV_TILE, K_SCALE], valid_shape=[span_rows, K_SCALE])
+                        recv_scale_mx = pl.reinterpret_view(recv_scale_raw, pl.FP8E8M0)
+                        recv_scale_nd = pl.store(recv_scale_mx, [out_begin, 0], recv_scale_nd)
                     for out_col in pl.range(gather_begin, gather_end):
                         in_row = src_base_row + out_col - source_begin
-                        out_row = e_base_row + out_col
-                        recv_x_raw = pl.load(recv_x, [in_row, 0], [1, D])
-                        recv_x_mx = pl.reinterpret_view(recv_x_raw, pl.FP8E4M3FN)
-                        recv_x_out_flat = pl.store(recv_x_mx, [out_row, 0], recv_x_out_flat)
-                        recv_scale_raw = pl.load(recv_scale, [in_row, 0], [1, K_SCALE])
-                        recv_scale_mx = pl.reinterpret_view(recv_scale_raw, pl.FP8E8M0)
-                        recv_scale_nd = pl.store(recv_scale_mx, [out_row, 0], recv_scale_nd)
                         recv_weight = pl.read(recv_weights, [in_row, AUX_W])
                         pl.write(recv_weight_out, [e, out_col], recv_weight)
                         recv_route = pl.read(recv_routes, [in_row, 0])

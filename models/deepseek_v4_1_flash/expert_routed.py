@@ -47,11 +47,14 @@ RECV_TILE = min(
     (tile for tile in (16, 32, 48, 64, 80) if RECV_MAX % tile == 0),
     key=lambda tile: ((EXPECTED_EXPERT_ROWS + tile - 1) // tile, tile),
 )
+SMALL_RECV_TILE = 48
 ACT_T_TILE = 16
+# Public FP4 packing remains K256/N256.
 MX_K_TILE = 256
+# K128 keeps two 32 KiB weight panels in Right memory.
+# The split V2C pipe requires the A5 credit fix in PTO-ISA GitCode PR2024.
+MX_COMPUTE_K_TILE = 128
 MX_MM_INTER_TILE = 256
-# Three N fragments per FP4 decoding task.
-MX_MM_TASK_TILE = 768
 GATE_UP_TASK_TILE = 256
 MX_W2_D_OUT_TILE = 256
 MX_W2_TASK_TILE = 1024
@@ -65,6 +68,207 @@ QUANT_TILE = 768
 # Rows per routed-output copy task.
 # 16 BF16 rows x D stays well under UB.
 COPY_TILE = max(tile for tile in (16, 12, 8, 6, 4, 3, 2, 1) if ROUTE_ROWS % tile == 0)
+
+
+@pl.jit.inline(auto_scope=False)
+def _routed_gate_up_tile(
+    recv_x_flat: pl.Tensor,
+    recv_mx_scale: pl.Tensor,
+    recv_weights: pl.Tensor,
+    routed_w1_scale: pl.Tensor,
+    routed_w3_scale: pl.Tensor,
+    w1_packed: pl.Tensor,
+    w3_packed: pl.Tensor,
+    mxfp4_pair_lut: pl.Tensor,
+    h_mx: pl.Tensor,
+    h_scale_backing: pl.Tensor,
+    local_i: pl.Scalar[pl.INDEX],
+    flat_t0: pl.Scalar[pl.INDEX],
+    t0: pl.Scalar[pl.INDEX],
+    valid_rows: pl.Scalar[pl.INDEX],
+    input_ready: pl.Scalar[pl.TASK_ID],
+    m_tile: pl.constexpr,
+):
+    """Compute one receive block's gate/up products and quantized activation."""
+    recv_mx_scale_view = pl.tensor.view(recv_mx_scale, [N_LOCAL_EXPERTS * RECV_MAX, K_SCALE], layout=pl.MX_A_ZZ)
+    # GMM1 accumulators drain to BF16 through the fix-pipe.
+    gate_tile_bf16 = pl.create_tensor([m_tile, MOE_INTER], dtype=pl.BF16)
+    up_tile_bf16 = pl.create_tensor([m_tile, MOE_INTER], dtype=pl.BF16)
+
+    with pl.spmd(MOE_INTER // GATE_UP_TASK_TILE,
+        name_hint='exp_gate_up_onchip', deps=[input_ready],
+        optimizations=[pl.cross_core_slot(slot_num=4)],
+    ) as gate_up_mxfp4_aic_tid:
+        nb_idx = pl.tile.get_block_idx()
+        n_base = nb_idx * GATE_UP_TASK_TILE
+        for ng in pl.range(GATE_UP_TASK_TILE // MX_MM_INTER_TILE):
+            n0 = n_base + ng * MX_MM_INTER_TILE
+            scale_row_base = local_i * K_SCALE
+            gate_acc = pl.create_tile([m_tile, MX_MM_INTER_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+            up_acc = pl.create_tile([m_tile, MX_MM_INTER_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+            for k0 in pl.pipeline(0, D, MX_COMPUTE_K_TILE, stage=2):
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    w1_packed_row = (n0 // MX_MM_INTER_TILE) * D + k0 + lane * (MX_COMPUTE_K_TILE // 2)
+                    w1_packed_tile = pl.load(
+                        w1_packed, [w1_packed_row, 0],
+                        [MX_COMPUTE_K_TILE // 2, MX_PACKED_LANE_COLS], target_memory=pl.Mem.Vec,
+                    )
+                    w1_fp4 = pl.reinterpret_view(w1_packed_tile, pl.FP4E2M1X2)
+                    w1_decoded = pl.cast(w1_fp4, pl.FP8E4M3FN)
+                    w1_tile = pl.aic_gather(w1_decoded)
+                    w3_packed_row = (n0 // MX_MM_INTER_TILE) * D + k0 + lane * (MX_COMPUTE_K_TILE // 2)
+                    w3_packed_tile = pl.load(
+                        w3_packed, [w3_packed_row, 0],
+                        [MX_COMPUTE_K_TILE // 2, MX_PACKED_LANE_COLS], target_memory=pl.Mem.Vec,
+                    )
+                    w3_fp4 = pl.reinterpret_view(w3_packed_tile, pl.FP4E2M1X2)
+                    w3_decoded = pl.cast(w3_fp4, pl.FP8E4M3FN)
+                    w3_tile = pl.aic_gather(w3_decoded)
+                ks = k0 // MX_GROUP
+                xs_k = pl.load(recv_x_flat, [flat_t0, k0], [m_tile, MX_COMPUTE_K_TILE])
+                xs_scale_k = pl.load(
+                    recv_mx_scale_view, [flat_t0, ks], [m_tile, MX_COMPUTE_K_TILE // MX_GROUP],
+                    target_memory=pl.Mem.Mat,
+                )
+                w1_scale_k = pl.load(
+                    routed_w1_scale, [scale_row_base + ks, n0], [MX_COMPUTE_K_TILE // MX_GROUP, MX_MM_INTER_TILE],
+                    target_memory=pl.Mem.Mat,
+                )
+                w3_scale_k = pl.load(
+                    routed_w3_scale, [scale_row_base + ks, n0], [MX_COMPUTE_K_TILE // MX_GROUP, MX_MM_INTER_TILE],
+                    target_memory=pl.Mem.Mat,
+                )
+                if k0 == 0:
+                    gate_acc = pl.matmul_mx(xs_k, xs_scale_k, w1_tile, w1_scale_k)
+                    up_acc = pl.matmul_mx(xs_k, xs_scale_k, w3_tile, w3_scale_k)
+                else:
+                    gate_acc = pl.matmul_mx_acc(gate_acc, xs_k, xs_scale_k, w1_tile, w1_scale_k)
+                    up_acc = pl.matmul_mx_acc(up_acc, xs_k, xs_scale_k, w3_tile, w3_scale_k)
+            gate_tile_bf16 = pl.store(gate_acc, [0, n0], gate_tile_bf16)
+            up_tile_bf16 = pl.store(up_acc, [0, n0], up_tile_bf16)
+
+    h_m_tilex = h_mx[flat_t0 : flat_t0 + m_tile]
+    h_tile_scale_backing = h_scale_backing[:, flat_t0 * H_SCALE:(flat_t0 + m_tile) * H_SCALE]
+    with pl.spmd(MOE_INTER // QUANT_TILE, name_hint='exp_gate_up_act_quant', deps=[gate_up_mxfp4_aic_tid]) as gate_up_act_quant_tid:
+        ab_idx = pl.tile.get_block_idx()
+        a_base = ab_idx * QUANT_TILE
+        for act_t0 in pl.range(0, valid_rows, ACT_T_TILE):
+            act_rows_max = pl.max(valid_rows - act_t0, 0)
+            act_rows = pl.min(ACT_T_TILE, act_rows_max)
+            h_fp32 = pl.tile.full([ACT_T_TILE, QUANT_TILE], dtype=pl.FP32, value=0.0)
+            route_weight = pl.load(recv_weights, [local_i, t0 + act_t0], [1, ACT_T_TILE])
+            route_weight = pl.reshape(route_weight, [ACT_T_TILE, 1])
+            for ag in pl.pipeline((QUANT_TILE // ACT_INTER_TILE), stage=2):
+                a0 = a_base + ag * ACT_INTER_TILE
+                h_a0 = ag * ACT_INTER_TILE
+                # The fix-pipe drain already applied the
+                # pre-SwiGLU BF16 rint; widen to FP32.
+                gate_2d_bf16 = pl.load(gate_tile_bf16, [act_t0, a0], [ACT_T_TILE, ACT_INTER_TILE])
+                up_2d_bf16 = pl.load(up_tile_bf16, [act_t0, a0], [ACT_T_TILE, ACT_INTER_TILE])
+                gate_2d = pl.cast(gate_2d_bf16, pl.FP32)
+                up_2d = pl.cast(up_2d_bf16, pl.FP32)
+                if SWIGLU_LIMIT > 0.0:
+                    gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
+                    up_2d_minimum = pl.minimum(up_2d, SWIGLU_LIMIT)
+                    up_2d = pl.maximum(up_2d_minimum, -SWIGLU_LIMIT)
+                sigmoid_neg = pl.neg(gate_2d)
+                sigmoid_exp = pl.exp(sigmoid_neg)
+                sigmoid_add = pl.add(sigmoid_exp, 1.0)
+                sigmoid = pl.recip(sigmoid_add)
+                silu = pl.mul(gate_2d, sigmoid)
+                gated_mul = pl.mul(silu, up_2d)
+                gated = pl.row_expand_mul(gated_mul, route_weight)
+                gated_cast = pl.cast(gated, pl.BF16, mode='rint')
+                gated = pl.cast(gated_cast, pl.FP32)
+                h_fp32[0:ACT_T_TILE, h_a0:h_a0 + ACT_INTER_TILE] = gated
+            h_fp32_valid = pl.set_validshape(h_fp32, act_rows, QUANT_TILE)
+            h_fp32_padded = pl.fillpad(h_fp32_valid, pad_value=pl.PadValue.zero)
+            # Hardware MXFP8 block-32 quant; nv = upward E8M0
+            # exponent, scale returned in A-side ZZ order.
+            h_quant, h_scale = pl.quant_mx(h_fp32_padded, group_axis=1, quant_scale_alg="nv")
+            h_m_tilex = pl.store(h_quant, [act_t0, a_base], h_m_tilex)
+            scale_offset = act_t0 * H_SCALE + ab_idx * ACT_T_TILE * (QUANT_TILE // MX_GROUP)
+            h_tile_scale_backing_reshape = pl.reshape(h_scale, [1, ACT_T_TILE * (QUANT_TILE // MX_GROUP)])
+            h_tile_scale_backing = pl.store(h_tile_scale_backing_reshape, [0, scale_offset], h_tile_scale_backing)
+    return gate_up_act_quant_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def _routed_down_scatter_tile(
+    h_mx: pl.Tensor,
+    h_scale_backing: pl.Tensor,
+    w2_packed: pl.Tensor,
+    mxfp4_pair_lut: pl.Tensor,
+    routed_w2_scale: pl.Tensor,
+    recv_meta: pl.Tensor,
+    recv_route: pl.Tensor,
+    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+    local_e: pl.Scalar[pl.INDEX],
+    flat_tt0: pl.Scalar[pl.INDEX],
+    tt0: pl.Scalar[pl.INDEX],
+    valid_rows: pl.Scalar[pl.INDEX],
+    hidden_ready: pl.Scalar[pl.TASK_ID],
+    m_tile: pl.constexpr,
+):
+    h_m_tilex = h_mx[flat_tt0 : flat_tt0 + m_tile]
+    h_tile_scale_backing = h_scale_backing[
+        :, flat_tt0 * H_SCALE : (flat_tt0 + m_tile) * H_SCALE
+    ]
+    h_tile_scale_mx = pl.tensor.view(h_tile_scale_backing, [m_tile, H_SCALE], layout=pl.MX_A_ZZ)
+    # GMM2 accumulators drain to BF16 through the fix-pipe
+    # (the golden rint); the scatter reads them directly.
+    recv_y_tile_bf16 = pl.create_tensor([m_tile, D], dtype=pl.BF16)
+    with pl.spmd(D // MX_W2_TASK_TILE,
+        name_hint='exp_w2_onchip', deps=[hidden_ready],
+        optimizations=[pl.cross_core_slot(slot_num=4)],
+    ) as w2_mxfp4_aic_tid:
+        wb_idx = pl.tile.get_block_idx()
+        d_base = wb_idx * MX_W2_TASK_TILE
+        for dg in pl.range(MX_W2_TASK_TILE // MX_W2_D_OUT_TILE):
+            d0 = d_base + dg * MX_W2_D_OUT_TILE
+            w2_scale_row_base = local_e * H_SCALE
+            y_acc = pl.create_tile([m_tile, MX_W2_D_OUT_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+            for k0 in pl.pipeline(0, MOE_INTER, MX_COMPUTE_K_TILE, stage=2):
+                for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    w2_packed_row = (d0 // MX_MM_INTER_TILE) * MOE_INTER + k0 + lane * (MX_COMPUTE_K_TILE // 2)
+                    w2_packed_tile = pl.load(
+                        w2_packed, [w2_packed_row, 0],
+                        [MX_COMPUTE_K_TILE // 2, MX_PACKED_LANE_COLS], target_memory=pl.Mem.Vec,
+                    )
+                    w2_fp4 = pl.reinterpret_view(w2_packed_tile, pl.FP4E2M1X2)
+                    w2_decoded = pl.cast(w2_fp4, pl.FP8E4M3FN)
+                    w2_tile = pl.aic_gather(w2_decoded)
+                ks = k0 // MX_GROUP
+                h_k = pl.load(h_m_tilex, [0, k0], [m_tile, MX_COMPUTE_K_TILE])
+                h_scale_k = pl.load(
+                    h_tile_scale_mx, [0, ks], [m_tile, MX_COMPUTE_K_TILE // MX_GROUP],
+                    target_memory=pl.Mem.Mat,
+                )
+                w2_scale_k = pl.load(
+                    routed_w2_scale, [w2_scale_row_base + ks, d0], [MX_COMPUTE_K_TILE // MX_GROUP, MX_W2_D_OUT_TILE],
+                    target_memory=pl.Mem.Mat,
+                )
+                if k0 == 0:
+                    y_acc = pl.matmul_mx(h_k, h_scale_k, w2_tile, w2_scale_k)
+                else:
+                    y_acc = pl.matmul_mx_acc(y_acc, h_k, h_scale_k, w2_tile, w2_scale_k)
+            recv_y_tile_bf16 = pl.store(y_acc, [0, d0], recv_y_tile_bf16)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint='expert_tile_scatter', deps=[w2_mxfp4_aic_tid], no_dep_args=[routed_output]) as scatter_tid:
+        tile_end = tt0 + valid_rows
+        source_begin = pl.cast(0, pl.INDEX)
+        for src in pl.range(EP_WORLD_SIZE):
+            source_rows_read = pl.read(recv_meta, [src, local_e])
+            source_rows = pl.cast(source_rows_read, pl.INDEX)
+            source_end = source_begin + source_rows
+            scatter_begin = pl.max(tt0, source_begin)
+            scatter_end = pl.min(tile_end, source_end)
+            for compact_row in pl.range(scatter_begin, scatter_end):
+                route_read = pl.read(recv_route, [local_e, compact_row])
+                route = pl.cast(route_read, pl.INDEX)
+                pld.tensor.put(dst=routed_output, peer=src, src=recv_y_tile_bf16, dst_offsets=[route, 0], src_offsets=[compact_row - tt0, 0], shape=[1, D])
+            source_begin = source_end
+    return scatter_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -85,10 +289,8 @@ def expert_routed_scatter(
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
     input_ready: pl.Scalar[pl.TASK_ID],
 ):
-    hidden_completion_tids = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
     expert_completion_tids = pl.array.create(N_LOCAL_EXPERTS, pl.TASK_ID)
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    recv_mx_scale_view = pl.tensor.view(recv_mx_scale, [N_LOCAL_EXPERTS * RECV_MAX, K_SCALE], layout=pl.MX_A_ZZ)
     with pl.scope():
         h_mx = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.FP8E4M3FN)
         h_scale_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * H_SCALE], dtype=pl.FP8E8M0)
@@ -99,260 +301,55 @@ def expert_routed_scatter(
             flat_base = local_i * RECV_MAX
             routed_w1_packed_e = routed_w1_packed[local_i, :, :]
             routed_w3_packed_e = routed_w3_packed[local_i, :, :]
+            routed_w2_packed_e = routed_w2_packed[local_i, :, :]
 
             n_rows = pl.read(recv_expert_count, [local_i, 0])
             if n_rows > 0:
                 n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
                 with pl.scope():
-
-                    w1_mxfp8 = pl.create_tensor([D, MOE_INTER], dtype=pl.FP8E4M3FN)
-                    with pl.spmd(2 * (MOE_INTER // MX_MM_TASK_TILE), name_hint='exp_gate_mxfp4_aiv') as gate_mxfp4_aiv_tid:
-                        block_idx = pl.tile.get_block_idx()
-                        nb_idx = block_idx // 2
-                        w1_lane = block_idx % 2
-                        n_base = nb_idx * MX_MM_TASK_TILE
-                        w1_lut_tile = pl.load(mxfp4_pair_lut, [w1_lane, 0], [1, 256], target_memory=pl.Mem.Vec)
-                        for ng in pl.range(MX_MM_TASK_TILE // MX_MM_INTER_TILE):
-                            n0 = n_base + ng * MX_MM_INTER_TILE
-                            for k0 in pl.pipeline(0, D, MX_K_TILE, stage=2):
-                                w1_tile_id = (
-                                    n0 // MX_MM_INTER_TILE * (D // MX_K_TILE) + k0 // MX_K_TILE
-                                )
-                                w1_packed_row = (
-                                    w1_tile_id * 2 * MX_PACKED_LANE_ROWS + w1_lane * MX_PACKED_LANE_ROWS
-                                )
-                                w1_packed_tile = pl.load(
-                                    routed_w1_packed_e, [w1_packed_row, 0], [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
-                                    target_memory=pl.Mem.Vec,
-                                )
-                                w1_packed_u16 = pl.cast(w1_packed_tile, target_type=pl.UINT16)
-                                w1_packed_indices = pl.reinterpret_view(w1_packed_u16, pl.INT16)
-                                w1_gather_tmp = pl.create_tile(
-                                    [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS], dtype=pl.INT16, target_memory=pl.Mem.Vec,
-                                )
-                                w1_pair_codes = pl.tile.gather(w1_lut_tile, w1_packed_indices, w1_gather_tmp)
-                                w1_bytes = pl.reinterpret_view(w1_pair_codes, pl.INT8, shape=[MX_PACKED_LANE_ROWS, MX_MM_INTER_TILE])
-                                w1_mxfp8_reinterpret_view = pl.reinterpret_view(w1_bytes, pl.FP8E4M3FN)
-                                w1_mxfp8 = pl.store(w1_mxfp8_reinterpret_view, [k0 + w1_lane * MX_PACKED_LANE_ROWS, n0], w1_mxfp8)
-
-                    w3_mxfp8 = pl.create_tensor([D, MOE_INTER], dtype=pl.FP8E4M3FN)
-                    with pl.spmd(2 * (MOE_INTER // MX_MM_TASK_TILE), name_hint='exp_up_mxfp4_aiv') as up_mxfp4_aiv_tid:
-                        block_idx = pl.tile.get_block_idx()
-                        nb_idx = block_idx // 2
-                        w3_lane = block_idx % 2
-                        n_base = nb_idx * MX_MM_TASK_TILE
-                        w3_lut_tile = pl.load(mxfp4_pair_lut, [w3_lane, 0], [1, 256], target_memory=pl.Mem.Vec)
-                        for ng in pl.range(MX_MM_TASK_TILE // MX_MM_INTER_TILE):
-                            n0 = n_base + ng * MX_MM_INTER_TILE
-                            for k0 in pl.pipeline(0, D, MX_K_TILE, stage=2):
-                                w3_tile_id = (
-                                    n0 // MX_MM_INTER_TILE * (D // MX_K_TILE) + k0 // MX_K_TILE
-                                )
-                                w3_packed_row = (
-                                    w3_tile_id * 2 * MX_PACKED_LANE_ROWS + w3_lane * MX_PACKED_LANE_ROWS
-                                )
-                                w3_packed_tile = pl.load(
-                                    routed_w3_packed_e, [w3_packed_row, 0], [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
-                                    target_memory=pl.Mem.Vec,
-                                )
-                                w3_packed_u16 = pl.cast(w3_packed_tile, target_type=pl.UINT16)
-                                w3_packed_indices = pl.reinterpret_view(w3_packed_u16, pl.INT16)
-                                w3_gather_tmp = pl.create_tile(
-                                    [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS], dtype=pl.INT16, target_memory=pl.Mem.Vec,
-                                )
-                                w3_pair_codes = pl.tile.gather(w3_lut_tile, w3_packed_indices, w3_gather_tmp)
-                                w3_bytes = pl.reinterpret_view(w3_pair_codes, pl.INT8, shape=[MX_PACKED_LANE_ROWS, MX_MM_INTER_TILE])
-                                w3_mxfp8_reinterpret_view = pl.reinterpret_view(w3_bytes, pl.FP8E4M3FN)
-                                w3_mxfp8 = pl.store(w3_mxfp8_reinterpret_view, [k0 + w3_lane * MX_PACKED_LANE_ROWS, n0], w3_mxfp8)
-
                     for t in pl.parallel(n_tiles):
                         t0 = t * RECV_TILE
                         flat_t0 = flat_base + t0
                         valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
                         with pl.scope():
-                            # GMM1 accumulators drain to BF16 through the fix-pipe.
-                            gate_tile_bf16 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.BF16)
-                            up_tile_bf16 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.BF16)
-
-                            with pl.spmd(MOE_INTER // GATE_UP_TASK_TILE, name_hint='exp_gate_up_mxfp4_aic', deps=[gate_mxfp4_aiv_tid, up_mxfp4_aiv_tid, input_ready]) as gate_up_mxfp4_aic_tid:
-                                nb_idx = pl.tile.get_block_idx()
-                                n_base = nb_idx * GATE_UP_TASK_TILE
-                                for ng in pl.range(GATE_UP_TASK_TILE // MX_MM_INTER_TILE):
-                                    n0 = n_base + ng * MX_MM_INTER_TILE
-                                    scale_row_base = local_i * K_SCALE
-                                    gate_acc = pl.create_tile([RECV_TILE, MX_MM_INTER_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
-                                    up_acc = pl.create_tile([RECV_TILE, MX_MM_INTER_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
-                                    for k0 in pl.pipeline(0, D, MX_K_TILE, stage=2):
-                                        ks = k0 // MX_GROUP
-                                        xs_k = pl.load(recv_x_flat, [flat_t0, k0], [RECV_TILE, MX_K_TILE])
-                                        xs_scale_k = pl.load(
-                                            recv_mx_scale_view, [flat_t0, ks], [RECV_TILE, MX_K_TILE // MX_GROUP],
-                                            target_memory=pl.Mem.Mat,
-                                        )
-                                        w1_tile = pl.load(w1_mxfp8, [k0, n0], [MX_K_TILE, MX_MM_INTER_TILE], target_memory=pl.Mem.Mat)
-                                        w1_scale_k = pl.load(
-                                            routed_w1_scale, [scale_row_base + ks, n0], [MX_K_TILE // MX_GROUP, MX_MM_INTER_TILE],
-                                            target_memory=pl.Mem.Mat,
-                                        )
-                                        w3_tile = pl.load(w3_mxfp8, [k0, n0], [MX_K_TILE, MX_MM_INTER_TILE], target_memory=pl.Mem.Mat)
-                                        w3_scale_k = pl.load(
-                                            routed_w3_scale, [scale_row_base + ks, n0], [MX_K_TILE // MX_GROUP, MX_MM_INTER_TILE],
-                                            target_memory=pl.Mem.Mat,
-                                        )
-                                        if k0 == 0:
-                                            gate_acc = pl.matmul_mx(xs_k, xs_scale_k, w1_tile, w1_scale_k)
-                                            up_acc = pl.matmul_mx(xs_k, xs_scale_k, w3_tile, w3_scale_k)
-                                        else:
-                                            gate_acc = pl.matmul_mx_acc(gate_acc, xs_k, xs_scale_k, w1_tile, w1_scale_k)
-                                            up_acc = pl.matmul_mx_acc(up_acc, xs_k, xs_scale_k, w3_tile, w3_scale_k)
-                                    gate_tile_bf16 = pl.store(gate_acc, [0, n0], gate_tile_bf16)
-                                    up_tile_bf16 = pl.store(up_acc, [0, n0], up_tile_bf16)
-
-                            h_tile_mx = h_mx[flat_t0 : flat_t0 + RECV_TILE]
-                            h_tile_scale_backing = h_scale_backing[:, flat_t0 * H_SCALE:(flat_t0 + RECV_TILE) * H_SCALE]
-                            with pl.spmd(MOE_INTER // QUANT_TILE, name_hint='exp_gate_up_act_quant', deps=[gate_up_mxfp4_aic_tid]) as gate_up_act_quant_tid:
-                                ab_idx = pl.tile.get_block_idx()
-                                a_base = ab_idx * QUANT_TILE
-                                for act_t0 in pl.range(0, valid_rows, ACT_T_TILE):
-                                    act_rows_max = pl.max(valid_rows - act_t0, 0)
-                                    act_rows = pl.min(ACT_T_TILE, act_rows_max)
-                                    h_fp32 = pl.tile.full([ACT_T_TILE, QUANT_TILE], dtype=pl.FP32, value=0.0)
-                                    route_weight = pl.load(recv_weights, [local_i, t0 + act_t0], [1, ACT_T_TILE])
-                                    route_weight = pl.reshape(route_weight, [ACT_T_TILE, 1])
-                                    for ag in pl.pipeline((QUANT_TILE // ACT_INTER_TILE), stage=2):
-                                        a0 = a_base + ag * ACT_INTER_TILE
-                                        h_a0 = ag * ACT_INTER_TILE
-                                        # The fix-pipe drain already applied the
-                                        # pre-SwiGLU BF16 rint; widen to FP32.
-                                        gate_2d_bf16 = pl.load(gate_tile_bf16, [act_t0, a0], [ACT_T_TILE, ACT_INTER_TILE])
-                                        up_2d_bf16 = pl.load(up_tile_bf16, [act_t0, a0], [ACT_T_TILE, ACT_INTER_TILE])
-                                        gate_2d = pl.cast(gate_2d_bf16, pl.FP32)
-                                        up_2d = pl.cast(up_2d_bf16, pl.FP32)
-                                        if SWIGLU_LIMIT > 0.0:
-                                            gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
-                                            up_2d_minimum = pl.minimum(up_2d, SWIGLU_LIMIT)
-                                            up_2d = pl.maximum(up_2d_minimum, -SWIGLU_LIMIT)
-                                        sigmoid_neg = pl.neg(gate_2d)
-                                        sigmoid_exp = pl.exp(sigmoid_neg)
-                                        sigmoid_add = pl.add(sigmoid_exp, 1.0)
-                                        sigmoid = pl.recip(sigmoid_add)
-                                        silu = pl.mul(gate_2d, sigmoid)
-                                        gated_mul = pl.mul(silu, up_2d)
-                                        gated = pl.row_expand_mul(gated_mul, route_weight)
-                                        gated_cast = pl.cast(gated, pl.BF16, mode='rint')
-                                        gated = pl.cast(gated_cast, pl.FP32)
-                                        h_fp32[0:ACT_T_TILE, h_a0:h_a0 + ACT_INTER_TILE] = gated
-                                    h_fp32_valid = pl.set_validshape(h_fp32, act_rows, QUANT_TILE)
-                                    h_fp32_padded = pl.fillpad(h_fp32_valid, pad_value=pl.PadValue.zero)
-                                    # Hardware MXFP8 block-32 quant; nv = upward E8M0
-                                    # exponent, scale returned in A-side ZZ order.
-                                    h_quant, h_scale = pl.quant_mx(h_fp32_padded, group_axis=1, quant_scale_alg="nv")
-                                    h_tile_mx = pl.store(h_quant, [act_t0, a_base], h_tile_mx)
-                                    scale_offset = act_t0 * H_SCALE + ab_idx * ACT_T_TILE * (QUANT_TILE // MX_GROUP)
-                                    h_tile_scale_backing_reshape = pl.reshape(h_scale, [1, ACT_T_TILE * (QUANT_TILE // MX_GROUP)])
-                                    h_tile_scale_backing = pl.store(h_tile_scale_backing_reshape, [0, scale_offset], h_tile_scale_backing)
-                            tile_completion_tids[t] = gate_up_act_quant_tid
-            hidden_completion_tids[local_i] = pl.system.task_dummy(deps=[tile_completion_tids])
-        with pl.scope():
-            for local_e in pl.parallel(N_LOCAL_EXPERTS):
-                tile_completion_tids = pl.array.create((RECV_MAX // RECV_TILE), pl.TASK_ID)
-                for tile in pl.range((RECV_MAX // RECV_TILE)):
-                    tile_completion_tids[tile] = pl.system.task_dummy(deps=[])
-                e_flat_base = local_e * RECV_MAX
-                routed_w2_packed_e = routed_w2_packed[local_e, :, :]
-
-                e_rows = pl.read(recv_expert_count, [local_e, 0])
-                if e_rows > 0:
-                    e_tiles = (e_rows + RECV_TILE - 1) // RECV_TILE
-                    with pl.scope():
-
-                        w2_mxfp8 = pl.create_tensor([MOE_INTER, D], dtype=pl.FP8E4M3FN)
-                        with pl.spmd(2 * (D // MX_W2_TASK_TILE), name_hint='exp_w2_mxfp4_aiv') as w2_mxfp4_aiv_tid:
-                            block_idx = pl.tile.get_block_idx()
-                            wb_idx = block_idx // 2
-                            w2_lane = block_idx % 2
-                            d_base = wb_idx * MX_W2_TASK_TILE
-                            w2_lut_tile = pl.load(mxfp4_pair_lut, [w2_lane, 0], [1, 256], target_memory=pl.Mem.Vec)
-                            for dg in pl.range(MX_W2_TASK_TILE // MX_W2_D_OUT_TILE):
-                                d0 = d_base + dg * MX_W2_D_OUT_TILE
-                                for k0 in pl.pipeline(0, MOE_INTER, MX_K_TILE, stage=2):
-                                    w2_tile_id = (
-                                        d0 // MX_W2_D_OUT_TILE * (MOE_INTER // MX_K_TILE) + k0 // MX_K_TILE
-                                    )
-                                    w2_packed_row = (
-                                        w2_tile_id * 2 * MX_PACKED_LANE_ROWS + w2_lane * MX_PACKED_LANE_ROWS
-                                    )
-                                    w2_packed_tile = pl.load(
-                                        routed_w2_packed_e, [w2_packed_row, 0], [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS],
-                                        target_memory=pl.Mem.Vec,
-                                    )
-                                    w2_packed_u16 = pl.cast(w2_packed_tile, target_type=pl.UINT16)
-                                    w2_packed_indices = pl.reinterpret_view(w2_packed_u16, pl.INT16)
-                                    w2_gather_tmp = pl.create_tile(
-                                        [MX_PACKED_LANE_ROWS, MX_PACKED_LANE_COLS], dtype=pl.INT16, target_memory=pl.Mem.Vec,
-                                    )
-                                    w2_pair_codes = pl.tile.gather(w2_lut_tile, w2_packed_indices, w2_gather_tmp)
-                                    w2_bytes = pl.reinterpret_view(w2_pair_codes, pl.INT8, shape=[MX_PACKED_LANE_ROWS, MX_W2_D_OUT_TILE])
-                                    w2_mxfp8_reinterpret_view = pl.reinterpret_view(w2_bytes, pl.FP8E4M3FN)
-                                    w2_mxfp8 = pl.store(w2_mxfp8_reinterpret_view, [k0 + w2_lane * MX_PACKED_LANE_ROWS, d0], w2_mxfp8)
-
-                        for tt in pl.parallel(e_tiles):
-                            tt0 = tt * RECV_TILE
-                            flat_tt0 = e_flat_base + tt0
-                            valid_rows = pl.min(RECV_TILE, e_rows - tt0)
-                            h_tile_mx = h_mx[flat_tt0 : flat_tt0 + RECV_TILE]
-                            h_tile_scale_backing = h_scale_backing[
-                                :, flat_tt0 * H_SCALE : (flat_tt0 + RECV_TILE) * H_SCALE
-                            ]
-                            h_tile_scale_mx = pl.tensor.view(h_tile_scale_backing, [RECV_TILE, H_SCALE], layout=pl.MX_A_ZZ)
-                            # GMM2 accumulators drain to BF16 through the fix-pipe
-                            # (the golden rint); the scatter reads them directly.
-                            recv_y_tile_bf16 = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
-                            with pl.spmd(D // MX_W2_TASK_TILE, name_hint='exp_w2_mxfp4_aic', deps=[w2_mxfp4_aiv_tid, hidden_completion_tids[local_e]]) as w2_mxfp4_aic_tid:
-                                wb_idx = pl.tile.get_block_idx()
-                                d_base = wb_idx * MX_W2_TASK_TILE
-                                for dg in pl.range(MX_W2_TASK_TILE // MX_W2_D_OUT_TILE):
-                                    d0 = d_base + dg * MX_W2_D_OUT_TILE
-                                    w2_scale_row_base = local_e * H_SCALE
-                                    y_acc = pl.create_tile([RECV_TILE, MX_W2_D_OUT_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc)
-                                    for k0 in pl.pipeline(0, MOE_INTER, MX_K_TILE, stage=2):
-                                        ks = k0 // MX_GROUP
-                                        w2_tile = pl.load(w2_mxfp8, [k0, d0], [MX_K_TILE, MX_W2_D_OUT_TILE], target_memory=pl.Mem.Mat)
-                                        h_k = pl.load(h_tile_mx, [0, k0], [RECV_TILE, MX_K_TILE])
-                                        h_scale_k = pl.load(
-                                            h_tile_scale_mx, [0, ks], [RECV_TILE, MX_K_TILE // MX_GROUP],
-                                            target_memory=pl.Mem.Mat,
-                                        )
-                                        w2_scale_k = pl.load(
-                                            routed_w2_scale, [w2_scale_row_base + ks, d0], [MX_K_TILE // MX_GROUP, MX_W2_D_OUT_TILE],
-                                            target_memory=pl.Mem.Mat,
-                                        )
-                                        if k0 == 0:
-                                            y_acc = pl.matmul_mx(h_k, h_scale_k, w2_tile, w2_scale_k)
-                                        else:
-                                            y_acc = pl.matmul_mx_acc(y_acc, h_k, h_scale_k, w2_tile, w2_scale_k)
-                                    recv_y_tile_bf16 = pl.store(y_acc, [0, d0], recv_y_tile_bf16)
-
-                            with pl.at(level=pl.Level.CORE_GROUP, name_hint='expert_tile_scatter', deps=[w2_mxfp4_aic_tid], no_dep_args=[routed_output]) as scatter_tid:
-                                tile_end = tt0 + valid_rows
-                                source_begin = pl.cast(0, pl.INDEX)
-                                for src in pl.range(EP_WORLD_SIZE):
-                                    source_rows_read = pl.read(recv_meta, [src, local_e])
-                                    source_rows = pl.cast(source_rows_read, pl.INDEX)
-                                    source_end = source_begin + source_rows
-                                    scatter_begin = pl.max(tt0, source_begin)
-                                    scatter_end = pl.min(tile_end, source_end)
-                                    for compact_row in pl.range(scatter_begin, scatter_end):
-                                        route_read = pl.read(recv_route, [local_e, compact_row])
-                                        route = pl.cast(route_read, pl.INDEX)
-                                        pld.tensor.put(dst=routed_output, peer=src, src=recv_y_tile_bf16, dst_offsets=[route, 0], src_offsets=[compact_row - tt0, 0], shape=[1, D])
-                                    source_begin = source_end
-                            tile_completion_tids[tt] = scatter_tid
-                expert_completion_tids[local_e] = pl.system.task_dummy(deps=[tile_completion_tids])
+                            if RECV_TILE > SMALL_RECV_TILE and valid_rows <= SMALL_RECV_TILE:
+                                hidden_ready = _routed_gate_up_tile(
+                                    recv_x_flat, recv_mx_scale, recv_weights,
+                                    routed_w1_scale, routed_w3_scale,
+                                    routed_w1_packed_e, routed_w3_packed_e, mxfp4_pair_lut,
+                                    h_mx, h_scale_backing,
+                                    local_i, flat_t0, t0, valid_rows,
+                                    input_ready, SMALL_RECV_TILE,
+                                )
+                                tile_completion_tids[t] = _routed_down_scatter_tile(
+                                    h_mx, h_scale_backing, routed_w2_packed_e,
+                                    mxfp4_pair_lut, routed_w2_scale,
+                                    recv_meta, recv_route, routed_output,
+                                    local_i, flat_t0, t0, valid_rows,
+                                    hidden_ready, SMALL_RECV_TILE,
+                                )
+                            else:
+                                hidden_ready = _routed_gate_up_tile(
+                                    recv_x_flat, recv_mx_scale, recv_weights,
+                                    routed_w1_scale, routed_w3_scale,
+                                    routed_w1_packed_e, routed_w3_packed_e, mxfp4_pair_lut,
+                                    h_mx, h_scale_backing,
+                                    local_i, flat_t0, t0, valid_rows,
+                                    input_ready, RECV_TILE,
+                                )
+                                tile_completion_tids[t] = _routed_down_scatter_tile(
+                                    h_mx, h_scale_backing, routed_w2_packed_e,
+                                    mxfp4_pair_lut, routed_w2_scale,
+                                    recv_meta, recv_route, routed_output,
+                                    local_i, flat_t0, t0, valid_rows,
+                                    hidden_ready, RECV_TILE,
+                                )
+            expert_completion_tids[local_i] = pl.system.task_dummy(deps=[tile_completion_tids])
 
     scatter_done = pl.system.task_dummy(deps=[expert_completion_tids[local_e] for local_e in range(N_LOCAL_EXPERTS)])
     return scatter_done
+
 
 
 def build_mxfp4_pair_lut() -> torch.Tensor:
