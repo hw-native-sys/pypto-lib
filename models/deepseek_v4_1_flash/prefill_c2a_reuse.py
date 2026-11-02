@@ -30,10 +30,7 @@ from prefill_c2a_full import (
     _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
 )
 from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj_rope
-from sparse_attention import (
-    PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk,
-    prefill_attend_sparse, prefill_publish_window,
-)
+from sparse_attention import attend_packed, prefill_publish_window
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm, rms_norm_tiled
@@ -121,19 +118,11 @@ def prefill_c2a_reuse_attention(
     prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
-    combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
-    chunk_done = cache_ready
-    for start in pl.range(0, num_tokens, QUERY_TILE):
-        active = pl.min(QUERY_TILE, num_tokens - start)
-        gather_tid = gather_packed_chunk(
-            window_cache, window_cache_scale, window_indices, compressed_cache,
-            compressed_cache_scale, compressed_indices, selected, combined, start, active,
-            chunk_done,
-        )
-        chunk_done = prefill_attend_sparse(
-            query, selected, combined, attn_sink, attended, start, active, gather_tid, name_hint="c2a_sparse_attn",
-        )
+    attended = attend_packed(
+        query, window_indices, window_cache, window_cache_scale,
+        compressed_indices, compressed_cache, compressed_cache_scale,
+        attn_sink, attended, num_tokens, cache_ready,
+    )
 
     o_proj(
         attended, wo_a, wo_a_scale, wo_b,

@@ -158,7 +158,7 @@ def prefill_c1a_reindex_attention(
         )
 
         attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        attend_packed(
+        attended = attend_packed(
             query,
             window_indices, window_cache, window_cache_scale,
             topk_indices, compressed_cache, compressed_cache_scale,
