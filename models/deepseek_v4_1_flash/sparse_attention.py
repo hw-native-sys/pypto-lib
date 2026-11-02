@@ -832,37 +832,44 @@ def swa_attention_partial(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Return conservative attention completion for subsequent cache-update ordering."""
-    # Conservatively keep later cache updates after full mixed attention while
-    # investigating PyPTO #2829. This boundary is not a confirmed causal fix.
-    tokens = pl.tensor.dim(query, 0)
-    blocks = pl.tensor.dim(cache, 0)
-    cache_rows = blocks * 128
-    # Small calls and cache-heavy calls avoid decoding unused physical rows.
-    # Bounded two-stage pools still submit one task for an empty active prefix.
-    use_shared = pl.cast(0, pl.INT32)
-    if num_tokens >= 32:
-        if cache_rows <= num_tokens * SWA_WINDOW:
-            use_shared = pl.cast(1, pl.INT32)
-    if use_shared == 0:
-        selected = pl.create_tensor([tokens, SWA_WINDOW, HEAD_DIM], dtype=pl.BF16)
-        gathered = gather_window_batched(cache, scales, indices, selected, num_tokens)
-        attention_done = attend_window_tiled(query, selected, indices, sink, output, num_tokens, gathered)
-        cache_consumed = attention_done
+    if LOCAL_H == 64:
+        ready = pl.system.task_dummy(deps=[])
+        cache_consumed = gather_sparse_attention(
+            query, indices, cache, scales, indices, cache, scales,
+            sink, output, num_tokens, ready, compressed_keys=0,
+        )
     else:
-        decoded_cache = pl.create_tensor([blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
-        zero_row = pl.create_tensor([32, HEAD_DIM], dtype=pl.BF16)
-        decoded = decode_shared_cache(cache, scales, decoded_cache, zero_row)
-        if num_tokens < 128:
-            attention_done = attend_shared_cache_plain(
-                query, decoded_cache, zero_row, indices, sink, output, num_tokens, decoded,
-            )
+        # Conservatively keep later cache updates after full mixed attention while
+        # investigating PyPTO #2829. This boundary is not a confirmed causal fix.
+        tokens = pl.tensor.dim(query, 0)
+        blocks = pl.tensor.dim(cache, 0)
+        cache_rows = blocks * 128
+        # Small calls and cache-heavy calls avoid decoding unused physical rows.
+        # Bounded two-stage pools still submit one task for an empty active prefix.
+        use_shared = pl.cast(0, pl.INT32)
+        if num_tokens >= 32:
+            if cache_rows <= num_tokens * SWA_WINDOW:
+                use_shared = pl.cast(1, pl.INT32)
+        if use_shared == 0:
+            selected = pl.create_tensor([tokens, SWA_WINDOW, HEAD_DIM], dtype=pl.BF16)
+            gathered = gather_window_batched(cache, scales, indices, selected, num_tokens)
+            attention_done = attend_window_tiled(query, selected, indices, sink, output, num_tokens, gathered)
+            cache_consumed = attention_done
         else:
-            descriptors = pl.create_tensor([tokens, SWA_RUN_PARTS, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
-            analyzed = analyze_index_runs(indices, descriptors, num_tokens, cache_rows)
-            attention_done = attend_shared_cache(
-                query, decoded_cache, zero_row, descriptors, indices, sink, output, num_tokens, decoded, analyzed,
-            )
-        cache_consumed = attention_done
+            decoded_cache = pl.create_tensor([blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
+            zero_row = pl.create_tensor([32, HEAD_DIM], dtype=pl.BF16)
+            decoded = decode_shared_cache(cache, scales, decoded_cache, zero_row)
+            if num_tokens < 128:
+                attention_done = attend_shared_cache_plain(
+                    query, decoded_cache, zero_row, indices, sink, output, num_tokens, decoded,
+                )
+            else:
+                descriptors = pl.create_tensor([tokens, SWA_RUN_PARTS, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
+                analyzed = analyze_index_runs(indices, descriptors, num_tokens, cache_rows)
+                attention_done = attend_shared_cache(
+                    query, decoded_cache, zero_row, descriptors, indices, sink, output, num_tokens, decoded, analyzed,
+                )
+            cache_consumed = attention_done
     return cache_consumed
 
 
@@ -1276,6 +1283,59 @@ def golden_merge_attention_stats(
         denominator = denominator + local_sum * scale
         numerator = numerator + local_numerator * scale.unsqueeze(-1)
     return numerator / denominator.unsqueeze(-1)
+
+
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "sparse_gather_vf.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "sparse_gather_vf.cpp",
+               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
+def _gather_sparse_vf_rows(
+    output: pl.Out[pl.Tensor],
+    query: pl.Tensor,
+    sink: pl.Tensor,
+    window: pl.Tensor,
+    window_scale: pl.Tensor,
+    compressed: pl.Tensor,
+    compressed_scale: pl.Tensor,
+    window_indices: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    heads: pl.Scalar[pl.INT32],
+    window_keys: pl.Scalar[pl.INT32],
+    compressed_keys: pl.Scalar[pl.INT32],
+    cache_mode: pl.constexpr,
+) -> pl.Tensor:
+    """Stream packed cache rows through L1 into sink-aware sparse attention."""
+    ...
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_sparse_attention(
+    query: pl.Tensor,
+    window_indices: pl.Tensor,
+    window: pl.Tensor,
+    window_scale: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    compressed: pl.Tensor,
+    compressed_scale: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    source_ready: pl.Scalar[pl.TASK_ID],
+    compressed_keys: pl.constexpr,
+):
+    """Attend H=64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
+    query = query[:num_tokens, :]
+    output = output[:num_tokens, :]
+    window_indices = window_indices[:num_tokens, :]
+    compressed_indices = compressed_indices[:num_tokens, :]
+    workers = pl.max(1, pl.min(num_tokens, WORKERS))
+    with pl.spmd(workers, name_hint="sparse_gather_vf", deps=[source_ready]) as attended:
+        output = _gather_sparse_vf_rows(
+            output, query, sink, window, window_scale, compressed, compressed_scale,
+            window_indices, compressed_indices, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+            cache_mode=compressed_keys,
+        )
+    return attended
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "gather_packed.cpp",
@@ -1803,43 +1863,49 @@ def attend_packed(
     num_tokens: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
 ):
-    marker = pl.create_tensor([1, 16], dtype=pl.FP32)
-    with pl.spmd(1, name_hint="sparse_query_ready", deps=[source_ready]) as ready:
-        block = pl.tile.get_block_idx()
-        marker[block:block + 1, :] = pl.cast(query[0:1, 0:16], pl.FP32)
-
-    cache_rows = (pl.tensor.dim(window, 0) + pl.tensor.dim(compressed, 0)) * 128
-    use_shared = pl.cast(0, pl.INT32)
-    if cache_rows <= CACHE_MAX_ROWS:
-        if cache_rows < num_tokens * SELECTED_KEYS:
-            use_shared = pl.cast(1, pl.INT32)
-    if use_shared == 1:
-        output = _attend_cache_shared(
+    if LOCAL_H == 64:
+        attended = gather_sparse_attention(
             query, window_indices, window, window_scale, compressed_indices,
-            compressed, compressed_scale, sink, output, num_tokens, ready,
+            compressed, compressed_scale, sink, output, num_tokens, source_ready, compressed_keys=INDEX_TOPK,
         )
     else:
-        if TP_SIZE == 1 and num_tokens <= 12:
-            ready = attend_packed_cohorts(
+        marker = pl.create_tensor([1, 16], dtype=pl.FP32)
+        with pl.spmd(1, name_hint="sparse_query_ready", deps=[source_ready]) as ready:
+            block = pl.tile.get_block_idx()
+            marker[block:block + 1, :] = pl.cast(query[0:1, 0:16], pl.FP32)
+
+        cache_rows = (pl.tensor.dim(window, 0) + pl.tensor.dim(compressed, 0)) * 128
+        use_shared = pl.cast(0, pl.INT32)
+        if cache_rows <= CACHE_MAX_ROWS:
+            if cache_rows < num_tokens * SELECTED_KEYS:
+                use_shared = pl.cast(1, pl.INT32)
+        if use_shared == 1:
+            output = _attend_cache_shared(
                 query, window_indices, window, window_scale, compressed_indices,
                 compressed, compressed_scale, sink, output, num_tokens, ready,
-                gather_name="c2a_gather", attn_name="c2a_sparse_attn",
             )
         else:
-            capacity = pl.max(1, pl.min(TOKEN_TILE, num_tokens))
-            selected = pl.create_tensor([capacity, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
-            indices = pl.create_tensor([capacity, SELECTED_KEYS], dtype=pl.INT32)
-            for offset in pl.range(0, num_tokens, TOKEN_TILE):
-                count = pl.min(TOKEN_TILE, num_tokens - offset)
-                q = pl.slice(query, [count, LOCAL_H * HEAD_DIM], [offset, 0])
-                wi = pl.slice(window_indices, [count, 128], [offset, 0])
-                ci = pl.slice(compressed_indices, [count, INDEX_TOPK], [offset, 0])
-                out = pl.slice(output, [count, LOCAL_H * HEAD_DIM], [offset, 0])
-                ready = _attend_packed_block(
-                    q, wi, window, window_scale,
-                    ci, compressed, compressed_scale,
-                    sink, out, selected, indices, count, ready,
+            if TP_SIZE == 1 and num_tokens <= 12:
+                ready = attend_packed_cohorts(
+                    query, window_indices, window, window_scale, compressed_indices,
+                    compressed, compressed_scale, sink, output, num_tokens, ready,
+                    gather_name="c2a_gather", attn_name="c2a_sparse_attn",
                 )
+            else:
+                capacity = pl.max(1, pl.min(TOKEN_TILE, num_tokens))
+                selected = pl.create_tensor([capacity, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
+                indices = pl.create_tensor([capacity, SELECTED_KEYS], dtype=pl.INT32)
+                for offset in pl.range(0, num_tokens, TOKEN_TILE):
+                    count = pl.min(TOKEN_TILE, num_tokens - offset)
+                    q = pl.slice(query, [count, LOCAL_H * HEAD_DIM], [offset, 0])
+                    wi = pl.slice(window_indices, [count, 128], [offset, 0])
+                    ci = pl.slice(compressed_indices, [count, INDEX_TOPK], [offset, 0])
+                    out = pl.slice(output, [count, LOCAL_H * HEAD_DIM], [offset, 0])
+                    ready = _attend_packed_block(
+                        q, wi, window, window_scale,
+                        ci, compressed, compressed_scale,
+                        sink, out, selected, indices, count, ready,
+                    )
     return output
 
 
@@ -1969,10 +2035,9 @@ def l2_c2a_attention(
     compressed.bind_dynamic(0, CMP_BLOCKS_DYN)
     rows = pl.tensor.dim(query, 0)
     source_ready = pl.system.task_dummy(deps=[])
-    done = attend_packed_cohorts(
+    output = attend_packed(
         query, window_indices, window, window_scale, compressed_indices,
         compressed, compressed_scale, sink, output, rows, source_ready,
-        gather_name="c2a_gather", attn_name="c2a_sparse_attn",
     )
     return output
 

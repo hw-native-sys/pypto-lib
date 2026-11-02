@@ -331,7 +331,7 @@ def golden_swa(tensors, *, reference=None):
     if reference is None:
         inputs = {name: normalized if name == "x" else tensors[name] for name in SWA_INPUT_NAMES}
         cache_rows = tensors["window_cache"].shape[0] * 128
-        shared_cache = active >= 32 and cache_rows <= active * 128
+        shared_cache = tensors["attn_sink"].numel() != 64 and active >= 32 and cache_rows <= active * 128
         partial, cache, scale = swa_official_reference(inputs, shared_cache=shared_cache)
         tensors["attention_output"][:active].copy_(partial.bfloat16())
         tensors["window_cache"].view(torch.uint8).copy_(cache.contiguous().view(torch.uint8))
