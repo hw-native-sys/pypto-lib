@@ -97,6 +97,7 @@ def check_factories():
     from .ecotech_full2_prefill import make_entries
     from .ecotech_swa_prefill import GEOMETRY, make_builders
     from .engram_ecotech_observed import make_engram_ecotech_observed
+    from .layers19_25 import make_decoder_layer_stages
     from .ratio1_prefill import make_ratio1_compress_publish
     from .smla_staging import make_import, make_pack
 
@@ -108,6 +109,8 @@ def check_factories():
         make_import(active, 2, 2)
     make_ratio1_compress_publish(16, dict(GEOMETRY, index_head_dim=128))
     make_engram_ecotech_observed(16, 4096)
+    for layer_id in (19, 20, 21, 24, 25):
+        make_decoder_layer_stages(layer_id, 16)
 
 
 def main():
@@ -120,7 +123,7 @@ def main():
         check_factories()
     print(f"PASS: {count} modules, source receipts, acyclic imports, and prefill controls")
     if args.factories:
-        print("PASS: module imports and SWA/Full2/Ratio1/Engram factories; no NPU execution")
+        print("PASS: module imports and SWA/Full2/Ratio1/Engram/decoder factories; no NPU execution")
 
 
 if __name__ == "__main__":

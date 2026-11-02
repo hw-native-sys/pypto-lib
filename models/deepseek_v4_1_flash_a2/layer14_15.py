@@ -33,7 +33,7 @@ from .indexer_select import (
     indexer_select_reference,
     make_indexer_select,
 )
-from .norm_rope import make_rmsnorm, rms_norm_reference
+from .norm_rope import make_rope, make_rmsnorm, rms_norm_reference, rope_reference
 from .output_proj import make_output_projection
 
 
@@ -184,6 +184,10 @@ def index_key_reference(
     index_wk: torch.Tensor,
     index_norm_weight: torch.Tensor,
     eps: float = 1.0e-20,
+    *,
+    cosine: torch.Tensor | None = None,
+    sine: torch.Tensor | None = None,
+    rope_dim: int = 64,
 ) -> dict[str, torch.Tensor]:
     """Project a BF16 compressed row into the INT8/FP16 QLI key cache."""
 
@@ -195,6 +199,14 @@ def index_key_reference(
         raise ValueError("index_norm_weight must have shape [128]")
     projected = torch.matmul(compressed.float(), index_wk.float()).to(torch.bfloat16)
     normalized = rms_norm_reference(projected, index_norm_weight, eps=eps)
+    if (cosine is None) != (sine is None):
+        raise ValueError("index-key cosine and sine tables must be supplied together")
+    if cosine is not None:
+        if cosine.shape != sine.shape or cosine.shape != (compressed.shape[0], rope_dim // 2):
+            raise ValueError("index-key RoPE tables must have shape [T, rope_dim // 2]")
+        normalized = rope_reference(
+            normalized, cosine, sine, heads=1, head_dim=CONTRACT.index_head_dim, rope_dim=rope_dim
+        )
     payload, scale = quantize_index_cache(normalized.unsqueeze(1))
     return {
         "projected": projected,
@@ -219,19 +231,68 @@ def layer14_source_reference(
     qli_weights: torch.Tensor,
     topk: int = 512,
     previous_valid: torch.Tensor | None = None,
+    compressed_cosine: torch.Tensor | None = None,
+    compressed_sine: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Run the L14 source handoff through compression, QLI and preparation."""
+    """Run the L14 source handoff through compression, QLI and preparation.
+
+    C2A publishes only completed pair rows.  Keep the token-shaped
+    ``compressed`` result for existing callers and expose compact published
+    rows for the cache and QLI key plane.
+    """
 
     source = ratio2_pool_reference(
         kv_proj, score_proj, previous_kv, previous_score, norm_weight, position_ids,
         previous_valid=previous_valid,
     )
-    key = index_key_reference(source["latent"], index_wk, index_norm_weight)
+    if (compressed_cosine is None) != (compressed_sine is None):
+        raise ValueError("compressed-key cosine and sine tables must be supplied together")
+    published = source["publish"]
+    latent = source["latent"]
+    if compressed_cosine is not None:
+        if compressed_cosine.shape != compressed_sine.shape or compressed_cosine.shape != (
+            latent.shape[0], 64 // 2
+        ):
+            raise ValueError("compressed-key RoPE tables must have shape [T, rope_dim // 2]")
+        compressed_full = rope_reference(
+            latent,
+            compressed_cosine,
+            compressed_sine,
+            heads=1,
+            head_dim=latent.shape[-1],
+            rope_dim=64,
+        )
+        published_cosine = compressed_cosine[published]
+        published_sine = compressed_sine[published]
+    else:
+        compressed_full = latent
+        published_cosine = published_sine = None
+    published_latent = latent[published]
+    key = index_key_reference(
+        published_latent,
+        index_wk,
+        index_norm_weight,
+        cosine=published_cosine,
+        sine=published_sine,
+    )
+    key_payload = key["payload"]
+    key_scale = key["scale"]
+    key_capacity = max(topk, key_payload.shape[0])
+    if key_capacity > key_payload.shape[0]:
+        padding = key_capacity - key_payload.shape[0]
+        key_payload = torch.cat(
+            (key_payload, torch.zeros(padding, key_payload.shape[-1], dtype=key_payload.dtype, device=key_payload.device)),
+            dim=0,
+        )
+        key_scale = torch.cat(
+            (key_scale, torch.ones(padding, dtype=key_scale.dtype, device=key_scale.device)),
+            dim=0,
+        )
     qli = indexer_select_reference(
         qli_query,
         qli_query_scale,
-        key["payload"],
-        key["scale"],
+        key_payload,
+        key_scale,
         qli_weights,
         position_ids,
         topk=topk,
@@ -239,7 +300,8 @@ def layer14_source_reference(
     )
     prepared = prepare_indexer_indices_reference(qli["indices"], position_ids, compress_ratio=2)
     return {
-        "compressed": source["latent"],
+        "compressed": compressed_full,
+        "published_compressed": compressed_full[published],
         "publish": source["publish"],
         "index_key": key["payload"],
         "index_key_scale": key["scale"],
@@ -517,6 +579,99 @@ def make_index_key_publish(capacity: int, compressed_dim: int = 512):
     return kernel
 
 
+def make_index_key_publish_rope(
+    capacity: int,
+    compressed_dim: int = 512,
+    rope_dim: int = 64,
+):
+    """Publish an index key after the A2/A3 partial-RoPE transform.
+
+    L20/C1A computes the index key from the normalized compressed row and
+    rotates its last ``rope_dim`` values before INT8 publication.  The older
+    ``make_index_key_publish`` entry point remains unchanged for existing
+    source-layer callers.
+    """
+
+    if compressed_dim % 256:
+        raise ValueError("compressed dimension must be divisible by 256")
+    if rope_dim <= 0 or rope_dim % 2 or rope_dim > CONTRACT.index_head_dim:
+        raise ValueError("index-key rope dimension must be positive, even, and at most 128")
+    if capacity <= 0 or capacity % 16:
+        raise ValueError("capacity must be a positive multiple of 16")
+    index_dim = CONTRACT.index_head_dim
+    project = _make_bf16_linear_inline(capacity, compressed_dim, index_dim)
+    norm = make_rmsnorm(capacity, index_dim, 1.0e-20)
+    rotate = make_rope(capacity, 1, index_dim, rope_dim)
+
+    @pl.jit.inline
+    def quantize_key(
+        value: pl.Tensor[[capacity, index_dim], pl.BF16],
+        payload: pl.Tensor[[capacity, index_dim], pl.INT8],
+        scales: pl.Tensor[[capacity], pl.FP16],
+        active: pl.Scalar[pl.INT32],
+    ):
+        scale_rows = pl.reshape(scales, [capacity, 1])
+        for block in pl.spmd((active + 15) // 16, name_hint="dsv41_a2a3_index_key_rope_quant"):
+            row = block * 16
+            valid_rows = pl.min(16, active - row)
+            tile = pl.slice(value, [16, index_dim], [row, 0], valid_shape=[valid_rows, index_dim])
+            tile = pl.set_validshape(pl.fillpad(tile, pad_value=pl.PadValue.zero), 16, index_dim)
+            value_fp32 = pl.cast(tile, pl.FP32)
+            raw_scale = pl.maximum(pl.div(pl.row_max(pl.abs(value_fp32)), 127.0), 1.0e-30)
+            stored_scale = pl.maximum(
+                pl.cast(pl.cast(raw_scale, pl.FP16, mode="rint"), pl.FP32), 2.0 ** -24
+            )
+            normalized = pl.row_expand_div(value_fp32, raw_scale)
+            positive = pl.maximum(normalized, 0.0)
+            negative = pl.minimum(normalized, 0.0)
+            epsilon = pl.mul(pl.maximum(pl.abs(normalized), 1.0), 2.0 ** -20)
+            positive = pl.cast(pl.sub(positive, epsilon), pl.INT32, mode="rint")
+            negative = pl.cast(negative, pl.INT32, mode="rint")
+            bounded = pl.minimum(pl.maximum(pl.add(positive, negative), -127), 127)
+            payload[row:row + 16, :] = pl.set_validshape(
+                pl.cast(bounded, pl.INT8, mode="trunc"), valid_rows, index_dim
+            )
+            scale_rows[row:row + 16, 0:1] = pl.set_validshape(
+                pl.reshape(pl.cast(stored_scale, pl.FP16), [16, 1]), valid_rows, 1
+            )
+        return payload, scales
+
+    @pl.jit
+    def kernel(
+        compressed: pl.Tensor[[capacity, compressed_dim], pl.BF16],
+        index_wk: pl.Tensor[[compressed_dim, index_dim], pl.BF16],
+        index_norm_weight: pl.Tensor[[index_dim], pl.BF16],
+        cosine: pl.Tensor[[capacity, rope_dim // 2], pl.FP32],
+        sine: pl.Tensor[[capacity, rope_dim // 2], pl.FP32],
+        projected: pl.Out[pl.Tensor[[capacity, index_dim], pl.BF16]],
+        rotated: pl.Out[pl.Tensor[[capacity, index_dim], pl.BF16]],
+        payload: pl.Out[pl.Tensor[[capacity, index_dim], pl.INT8]],
+        scale: pl.Out[pl.Tensor[[capacity], pl.FP16]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        scale_rows = pl.reshape(scale, [capacity, 1])
+        with pl.spmd(capacity // 16, name_hint="dsv41_a2a3_index_key_rope_init"):
+            row = pl.tile.get_block_idx() * 16
+            projected_zero = pl.tile.full([16, index_dim], dtype=pl.BF16, value=0.0)
+            rotated_zero = pl.tile.full([16, index_dim], dtype=pl.BF16, value=0.0)
+            payload_zero = pl.cast(
+                pl.tile.full([16, index_dim], dtype=pl.INT32, value=0), pl.INT8, mode="trunc"
+            )
+            scale_zero = pl.tile.full([16, 16], dtype=pl.FP16, value=0.0)
+            pl.store(projected_zero, [row, 0], projected)
+            pl.store(rotated_zero, [row, 0], rotated)
+            pl.store(payload_zero, [row, 0], payload)
+            pl.store(pl.set_validshape(scale_zero, 16, 1), [row, 0], scale_rows)
+        project(compressed, index_wk, projected, active)
+        normalized = pl.create_tensor([capacity, index_dim], dtype=pl.BF16)
+        norm(projected, index_norm_weight, normalized, active)
+        rotate(normalized, cosine, sine, rotated, active)
+        quantize_key(rotated, payload, scale, active)
+        return projected, rotated, payload, scale
+
+    return kernel
+
+
 def make_layer14_stages(
     capacity: int,
     *,
@@ -607,6 +762,7 @@ __all__ = [
     "layer15_reuse_reference",
     "load_a2a3_layer14_15_bundle",
     "make_index_key_publish",
+    "make_index_key_publish_rope",
     "make_layer14_stages",
     "make_layer15_stages",
     "make_ratio2_projection",

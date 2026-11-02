@@ -28,6 +28,7 @@ the private orchestration used to obtain the historical acceptance results.
 | `layer2_c1c2.py`, `c2_prefill_pool.py`, `ecotech_full2_*.py` | Ratio-two projection, ring state, pooling, cache publication and index observation. The width-128 index publisher includes the accepted 16-row quantization and reciprocal correction. |
 | `ratio1_prefill.py` | Ratio-one publication starting at an actual BF16 compressor projection. This is a distinct input boundary from the FP32 ratio-two compressor. |
 | `ecotech_prefill_consumer.py`, `indexer.py`, `sparse_consumer_prefill.py` | Consumer projections, causal controls and sparse attention stages. |
+| `layers19_25.py`, `candidate_pool.py`, `raw_checkpoint.py` | L19 C2A reuse, L20 C1A source, L21 C1A reuse, L24 reindex and L25 reuse, with A2/A3 candidate metadata and raw checkpoint loading. |
 | `swa_scheduler.py`, `smla_scheduler.py` | Integer-only request, page and causal-selection scheduling. Original and compressed lanes retain separate page tables. |
 | `swa_native.py`, `smla_native.py`, `smla_staging.py` | Registered BF16 SWA/ratio-one SMLA leaves, fresh metadata, and PyPTO dtype boundaries. |
 | `engram_ecotech*.py`, `engram_hash.py`, `engram_offload.py` | INT8 row lookup, BF16 projection, original-basis gating with probability observation, and host row preparation. |
@@ -143,7 +144,7 @@ python -m models.deepseek_v4_1_flash_a2.validate
 ```
 
 With Torch and PyPTO installed, also import every module and construct the
-bounded SWA, Full2, Ratio1 and Engram entries:
+bounded SWA, Full2, Ratio1, Engram, and L19/L20/L21/L24/L25 decoder entries:
 
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m models.deepseek_v4_1_flash_a2.validate --factories
@@ -160,9 +161,10 @@ they do not replace numerical comparison against an independent reference.
 The A2/A3 decoder adaptation is integrated into this same flat package. The
 decoder contract is shared through `config.py`, `engram.py`, and
 `sparse_attention.py`; W8A8 quantization and GEMM live in `quant.py` and
-`gemm.py`. Layer-14 source and layer-15 reuse stages are in `layer14_15.py`.
-The CPU references and bounded PyPTO validators are direct modules in this
-directory, with no nested `verifier` package.
+`gemm.py`. Layer-14 source and layer-15 reuse stages are in `layer14_15.py`;
+L19/L20/L21/L24/L25 stages are in `layers19_25.py`. The CPU references and
+bounded PyPTO validators are direct modules in this directory, with no nested
+`verifier` package.
 
 The decoder validator suite can be run without a device:
 
@@ -170,6 +172,8 @@ The decoder validator suite can be run without a device:
 python -m pytest models/deepseek_v4_1_flash_a2/test_operators.py -q
 python -m models.deepseek_v4_1_flash_a2.validate_layer14 --sim
 python -m models.deepseek_v4_1_flash_a2.validate_layer15 --sim
+# Supply the checkpoint through --checkpoint or DSV41_A2_CHECKPOINT.
+python -m models.deepseek_v4_1_flash_a2.validate_layers19_25 --checkpoint /path/to/checkpoint
 ```
 
 The validators retain the A2/A3 ABI: BF16 hidden and cache rows, INT8 weights

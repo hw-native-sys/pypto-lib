@@ -1,6 +1,7 @@
 """DeepSeek V4.1 Flash A2 prefill and A2/A3 decoder operators."""
 
 from .config import A2A3_DTYPE_CONTRACT, A2A3OperatorConfig
+from .candidate_pool import make_candidate_block_pool
 from .precision import ErrorMetrics, compare_tensors
 from .quant import (
     dequantize_int32,
@@ -60,10 +61,33 @@ from .layer14_15 import (
     update_ratio2_state_reference,
     validate_layer14_15_contract,
 )
+from .raw_checkpoint import (
+    RawCheckpoint,
+    flatten_scale,
+    load_attention_weights,
+    load_decoder_layer_weights,
+)
+from .layers19_25 import (
+    LAYER19,
+    LAYER20,
+    LAYER21,
+    LAYER24,
+    LAYER25,
+    TARGET_LAYERS,
+    c1a_full_reference,
+    c1a_reindex_reference,
+    c1a_reuse_reference,
+    c2a_reuse_reference,
+    layer_contract,
+    make_decoder_layer_stages,
+    select_candidate_block_pool_reference,
+    validate_layer19_20_21_24_25_contracts,
+)
 
 __all__ = [
     "A2A3OperatorConfig",
     "A2A3_DTYPE_CONTRACT",
+    "make_candidate_block_pool",
     "ErrorMetrics",
     "compare_tensors",
     "dequantize_int32",
@@ -124,4 +148,22 @@ __all__ = [
     "ratio2_pool_reference",
     "update_ratio2_state_reference",
     "validate_layer14_15_contract",
+    "RawCheckpoint",
+    "flatten_scale",
+    "load_attention_weights",
+    "load_decoder_layer_weights",
+    "LAYER19",
+    "LAYER20",
+    "LAYER21",
+    "LAYER24",
+    "LAYER25",
+    "TARGET_LAYERS",
+    "c1a_full_reference",
+    "c1a_reindex_reference",
+    "c1a_reuse_reference",
+    "c2a_reuse_reference",
+    "layer_contract",
+    "make_decoder_layer_stages",
+    "select_candidate_block_pool_reference",
+    "validate_layer19_20_21_24_25_contracts",
 ]
