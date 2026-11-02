@@ -123,7 +123,6 @@ def l2_decode_layer(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
     routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
@@ -298,7 +297,6 @@ def l2_decode_layer(
         routed_w1, routed_w1_scale,
         routed_w2, routed_w2_scale,
         routed_w3, routed_w3_scale,
-        mxfp4_pair_lut,
         shared_w1, shared_w1_scale,
         shared_w2, shared_w2_scale,
         shared_w3, shared_w3_scale,
@@ -381,7 +379,6 @@ def l3_decode_layer(
     routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w3_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    mxfp4_pair_lut: pl.Tensor[[EP_SIZE, 2, 256], pl.INT16],
     shared_w1: pl.Tensor[[EP_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[EP_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
@@ -470,7 +467,6 @@ def l3_decode_layer(
             routed_w1[rank], routed_w1_scale_rank,
             routed_w2[rank], routed_w2_scale_rank,
             routed_w3[rank], routed_w3_scale_rank,
-            mxfp4_pair_lut[rank],
             shared_w1[rank], shared_w1_scale_rank,
             shared_w2[rank], shared_w2_scale_rank,
             shared_w3[rank], shared_w3_scale_rank,
@@ -1086,7 +1082,7 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a5")
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=list(SUPPORTED_EP_SIZES))
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
