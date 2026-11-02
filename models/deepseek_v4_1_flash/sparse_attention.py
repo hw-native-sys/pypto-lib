@@ -1764,6 +1764,55 @@ def _attend_cache_shared(
     return output
 
 
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "sparse_packed.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "sparse_packed.cpp",
+               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
+def _attend_packed_rows(
+    output: pl.Out[pl.Tensor],
+    query: pl.Tensor,
+    selected: pl.Out[pl.Tensor],
+    indices: pl.Out[pl.Tensor],
+    sink: pl.Tensor,
+    window: pl.Tensor,
+    window_scale: pl.Tensor,
+    compressed: pl.Tensor,
+    compressed_scale: pl.Tensor,
+    window_indices: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    heads: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Gather packed rows on both AIVs and compute online attention in one task."""
+    ...
+
+
+@pl.jit.inline(auto_scope=False)
+def attend_packed_block(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
+    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
+    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    query_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Fuse attention where query and selected-key readiness already converge."""
+    workers = pl.max(1, pl.min(num_tokens * ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE), WORKERS))
+    with pl.spmd(workers, name_hint="sparse_packed_online", deps=[query_ready]) as attended:
+        output = _attend_packed_rows(
+            output, query, selected, indices, sink,
+            window, window_scale, compressed, compressed_scale, window_indices, compressed_indices,
+            num_tokens, LOCAL_H,
+        )
+    return attended
+
+
 @pl.jit.inline(auto_scope=False)
 def _attend_packed_block(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -1887,9 +1936,11 @@ def l2_sparse_attention(
 ):
     rows = pl.tensor.dim(query, 0)
     source_ready = pl.system.task_dummy(deps=[])
-    output = attend_packed(
+    selected = pl.create_tensor([rows, SELECTED_KEYS, HEAD_DIM], dtype=pl.BF16)
+    indices = pl.create_tensor([rows, SELECTED_KEYS], dtype=pl.INT32)
+    attend_packed_block(
         query, window_indices, window, window_scale, compressed_indices,
-        compressed, compressed_scale, sink, output, rows, source_ready,
+        compressed, compressed_scale, sink, output, selected, indices, rows, source_ready,
     )
     return output
 
