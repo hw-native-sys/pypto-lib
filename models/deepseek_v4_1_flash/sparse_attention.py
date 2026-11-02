@@ -79,7 +79,7 @@ WINDOW_PUBLISH_WORKER_TILE = 12
 SHARED_GATHER_WORKERS = 64
 CACHE_MAX_ROWS = 32768
 PACKED_QUERY_TILE = 32
-PACKED_COHORT_TILE = 24
+PACKED_COHORT_TILE = 36 if TP_SIZE == 1 else 24
 PACKED_HEAD_TILE = min(32, CUBE_HEADS) if TP_SIZE == 1 else 16
 PACKED_KEY_TILE = 128 if TP_SIZE == 1 else 64
 PACKED_ATTEND_SLOT_TILE = 1 if TP_SIZE == 1 else 2
@@ -1347,6 +1347,95 @@ def gather_packed_chunk(
 def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY_TILE, max_workers=32):
     """Build chunked sink attention with an optional Vector query startup."""
     sync_start = not vector_query
+
+    if TP_SIZE == 1 and not vector_query:
+        @pl.jit.inline(auto_scope=False)
+        def attend_selected_chunk(
+            query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+            selected: pl.Tensor[[selected_rows, SELECTED_KEYS, HEAD_DIM], pl.BF16],
+            combined: pl.Tensor[[selected_rows, SELECTED_KEYS], pl.INT32],
+            sink: pl.Tensor[[LOCAL_H], pl.FP32],
+            output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+            chunk_start: pl.Scalar[pl.INT32],
+            active: pl.Scalar[pl.INT32],
+            gather_ready: pl.Scalar[pl.TASK_ID],
+            name_hint: pl.constexpr,
+        ):
+            tokens = pl.tensor.dim(query, 0)
+            head_rows = tokens * LOCAL_H
+            selected_key_rows = selected_rows * SELECTED_KEYS
+            query_flat = pl.reshape(query, [head_rows, HEAD_DIM])
+            output_flat = pl.reshape(output, [head_rows, HEAD_DIM])
+            key_flat = pl.reshape(selected, [selected_key_rows, HEAD_DIM])
+            sink_row = pl.reshape(sink, [1, LOCAL_H])
+            workers = pl.min(active, max_workers)
+            if sync_start:
+                workers = pl.min(workers, pl.system.available_cluster_count())
+            # Direct-Q Cube transfers require ownership of the paired Vector UB.
+            with pl.spmd(
+                workers, name_hint=name_hint, deps=[gather_ready], sync_start=sync_start,
+                optimizations=[pl.cross_core_slot(slot_num=PACKED_ATTEND_SLOT_TILE)],
+            ) as attend_tid:
+                worker = pl.tile.get_block_idx()
+                for r in pl.range(worker, active, workers):
+                    q0 = (chunk_start + r) * LOCAL_H
+                    q = pl.tile.load(query_flat, [q0, 0], [64, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                    for lane_init in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                        maximum = pl.tile.full([1, 32], dtype=pl.FP32, value=-1e30)
+                        denominator = pl.tile.full([1, 32], dtype=pl.FP32, value=0.0)
+                        numerator = pl.tile.full([32, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                    for part in pl.range(PACKED_KEY_PARTS):
+                        k0 = r * SELECTED_KEYS + part * PACKED_KEY_TILE
+                        kv = pl.tile.load(
+                            key_flat, [k0, 0], [PACKED_KEY_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
+                        )
+                        qk = pl.tile.matmul(q, pl.tile.transpose_view(kv))
+                        for lane_score in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                            scores = pl.tile.aiv_shard(qk)
+                            scores = pl.mul(scores, SCALE)
+                            idx = pl.tile.load(combined, [r, part * PACKED_KEY_TILE], [1, PACKED_KEY_TILE])
+                            idx_float = pl.cast(idx, pl.FP32)
+                            valid = pl.minimum(pl.maximum(pl.add(idx_float, 1.0), 0.0), 1.0)
+                            invalid_bias = pl.mul(pl.sub(valid, 1.0), 1e30)
+                            masked = pl.col_expand_add(scores, invalid_bias)
+                            reduction = pl.tile.create([32, PACKED_KEY_TILE], dtype=pl.FP32)
+                            tile_max = pl.row_max(masked, tmp_tile=reduction)
+                            next_max = pl.maximum(maximum, pl.reshape(tile_max, [1, 32]))
+                            correction = pl.exp(pl.sub(maximum, next_max))
+                            next_max_column = pl.reshape(next_max, [32, 1])
+                            shifted = pl.row_expand_sub(masked, next_max_column)
+                            probabilities = pl.col_expand_mul(pl.exp(shifted), valid)
+                            part_sum_column = pl.row_sum(probabilities, tmp_tile=reduction)
+                            part_sum = pl.reshape(part_sum_column, [1, 32])
+                            previous_denominator = pl.mul(denominator, correction)
+                            denominator = pl.add(previous_denominator, part_sum)
+                            maximum = next_max
+                            probability_bf16 = pl.cast(probabilities, pl.BF16, mode="rint")
+                            probability_mat = pl.tile.aic_gather(probability_bf16)
+                        for column in pl.range(0, HEAD_DIM, 256):
+                            value = pl.tile.slice(kv, [PACKED_KEY_TILE, 256], [0, column])
+                            weighted = pl.tile.matmul(probability_mat, value)
+                            for lane_value in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                                weighted_half = pl.tile.aiv_shard(weighted)
+                                previous = pl.tile.slice(numerator, [32, 256], [0, column])
+                                correction_column = pl.reshape(correction, [32, 1])
+                                scaled = pl.row_expand_mul(previous, correction_column)
+                                updated = pl.add(scaled, weighted_half)
+                                numerator = pl.tile.assemble(numerator, updated, [0, column])
+                    for lane_output in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                        sinks = pl.tile.load(sink_row, [0, lane_output * 32], [1, 32])
+                        final_max = pl.maximum(maximum, sinks)
+                        correction = pl.exp(pl.sub(maximum, final_max))
+                        previous_denominator = pl.mul(denominator, correction)
+                        sink_weight = pl.exp(pl.sub(sinks, final_max))
+                        denominator = pl.add(previous_denominator, sink_weight)
+                        multiplier = pl.reshape(pl.div(correction, denominator), [32, 1])
+                        result = pl.row_expand_mul(numerator, multiplier)
+                        result_bf16 = pl.cast(result, pl.BF16, mode="rint")
+                        pl.tile.store(result_bf16, [q0 + lane_output * 32, 0], output_flat)
+            return attend_tid
+
+        return attend_selected_chunk
 
     @pl.jit.inline
     def attend_selected_chunk(
