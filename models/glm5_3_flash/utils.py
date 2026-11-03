@@ -105,7 +105,7 @@ class ForwardMetadata:
         pool_slots: ``[tokens]`` flattened physical row of the **pooled** state this
             token belongs to, one row per ``index_kpool`` tokens. Tokens inside the
             same pool share a row, and the row is only complete once the pool closes.
-        kda_state_rows: seed/working rows and two checkpoint offset/row pairs per request.
+        kda_state_rows: seed and working rows followed by per-chunk checkpoint destinations.
         pool_count: ``[requests]`` number of complete indexer pools.
         tail_start: ``[requests]`` first raw index of the incomplete tail pool.
         tail_count: ``[requests]`` tokens in that tail (``0 .. index_kpool - 1``).

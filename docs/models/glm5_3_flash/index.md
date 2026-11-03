@@ -6,7 +6,7 @@
 kernels, Torch goldens, W8A8 checkpoint staging, composed MoE FFN entries,
 chunk-capable forward kernels, MTP computation, and a 24-block vision tower
 with image/video preprocessing. PyPTO Serving owns resident generation,
-request lifecycle and greedy MTP verification.
+request lifecycle and generation.
 
 Each core component owns its kernels, cache operations, Torch references and
 validation: `kda.py`, `attention.py`, `indexer.py`, `mtp.py`, and `vision.py`.
@@ -148,61 +148,23 @@ larger capacities require their own memory and numerical validation.
 ### Complete native forward interface
 
 `prefill_fwd.py:l3_prefill_fwd` and `decode_fwd.py:l3_decode_fwd` each submit
-one L3 orchestration for a complete main forward. Each phase's implementation
-seeds the four BF16 streams, loops over all 45 layers on the device, gathers
-request-final hidden rows, and computes the final normalization
-and vocabulary projection. The serving runner packs inputs and owns allocation,
-submission, completion and request state; it does not schedule individual
-backbone layers. Reset and optional MTP proposals remain
-separate auxiliary operations.
+one L3 orchestration for all 45 backbone layers, final normalization and the
+NPU vocabulary head. They share the operators in `layer.py`. Serving owns
+allocation, submission, completion and request state; cache reset uses a
+separate auxiliary program.
 
-The phases share the same mathematical operators and resident weights, while
-using different query layouts. Prefill query buffers have `--capacity` rows;
-decode query buffers have sixteen rows, one per stable request slot. MoE owner
-buffers retain `ceil(capacity / (TP * 16)) * 16` rows for both phases. For
-example, capacity 256 at TP8 uses sixteen decode query rows and 32 MoE owner
-rows. Request metadata, pooled-cache dimensions and the 32-row hidden-output
-buffer have their own dimensions. Tensor contracts keep query, owner and head
-axes separate even when their numeric extents coincide. Fixed physical extents
-specialize the existing normalization, projection and recurrence bodies;
-active-token counts remain runtime values. Normalization and native W8A8
-projections derive their row counts from input tensors. Local reshape views
-align row expressions across normalization and quantization calls without
-copying data. Composed KDA and sparse-attention loops retain explicit physical
-query-row, request-slot and state-pool extents to keep their loop-carried shapes static for
-the pinned compiler. These counts include padded rows and empty request slots;
-they are separate from runtime active-token counts. A zero extent derives the
-count from the input tensor in component entries. Remaining `pl.constexpr`
-arguments are bound explicitly at JIT dependency calls; Python signature
-defaults are not applied there.
+Prefill uses `--capacity` query rows; decode uses sixteen stable request slots.
+MoE owner buffers retain `ceil(capacity / (TP * 16)) * 16` rows. Query, owner,
+request and head buffers have distinct tensor contracts. The pinned compiler
+requires explicit physical extents in composed KDA and sparse-attention loops;
+active-token counts remain runtime values.
 
-The serving executor imports each phase module and compiles its complete
-`l3_prefill_fwd` or `l3_decode_fwd` entry, including the NPU vocabulary head.
-`forward_parameter_names()` gives tensor argument order, and
-`forward_tensor_layouts()` returns concrete per-rank logical shapes and Torch
-dtypes without a leading rank axis. `forward_geometry()` records the distinct
-query, owner, stream, request and head capacities with ABI version 9. The only
-runtime scalar is `forward_epoch`. `FORWARD_PROGRAMS` is `("prefill", "decode")`.
-Each phase has one per-rank backbone implementation: `prefill_hidden_fwd`
-and `decode_hidden_fwd`. `prefill_fwd` and `decode_fwd` inline their respective
-backbones and add the device vocabulary head. The L3 entries retain their
-distinct tensor contracts.
-
-Each prepared phase owns its nine communication windows and a monotonically
-increasing forward epoch. The layer loop derives TP and MoE tickets from that
-epoch and the layer ordinal. Device-side completion tokens sample each query
-row after attention and after the full layer before constructing the next
-stage. Every rank, including ranks with no locally owned MoE tokens, completes
-the preceding stage before later MoE communication can reserve execution resources.
-Request resets and prefix restoration do not reset these counters.
-Prefill and decode counters are independent because their
-window allocations are independent. Submission reserves the next epoch; a
-failed dispatch invalidates the runner until close/reopen. Decode takes token
-IDs and a resident BF16 vocabulary shard. It gathers the local rows, performs
-one TP reduction, and seeds the four mHC streams before the backbone. Its TP
-epoch stride includes this extra collective. Serving may prepare a decode
-descriptor while previous work runs, then bind the actual sampled tokens at
-dispatch. Prefill, visual-feature fusion and MTP keep their host embedding inputs.
+`forward_parameter_names()` defines argument order, `forward_tensor_layouts()`
+provides per-rank shapes and dtypes, and `forward_geometry()` records ABI version
+9 and capacities. Each invocation takes one `forward_epoch`; the two phases
+own independent communication windows and counters. Decode gathers embeddings
+from resident BF16 vocabulary shards on the NPU before entering the backbone.
+Prefill keeps host-provided embeddings.
 
 ### Chunked prefill and incremental requests
 
@@ -496,8 +458,7 @@ python models/glm5_3_flash/lm_head.py -p a2a3 -d 0,1 --compile-only
 
 ## Validation
 
-`decode_fwd.py` exports the complete production decode and hidden-row L3
-entries. Component validation stays with the operators in `kda.py`,
+`decode_fwd.py` exports the complete production decode L3 entry. Component validation stays with the operators in `kda.py`,
 `attention.py`, `indexer.py`, `dense_mlp.py`, `decode_layer.py` and `layer.py`,
 using their Torch references. `prefill_fwd.py --check reference` provides the
 independent CPU backbone checks; its default invocation checks weight loading
@@ -723,7 +684,7 @@ Each of these was a compile or simulator failure, not a guess:
 - **Script entries put the repository root first on `sys.path`** to resolve
   model imports and the shared `golden` harness when invoked by file path.
 
-## MTP proposals and visual inputs
+## Standalone generation and visual inputs
 
 Execution is provided by `pypto-serving`; install that package and set
 `PYPTO_LIB_ROOT` to this checkout. The standalone command uses the same
@@ -731,22 +692,7 @@ Execution is provided by `pypto-serving`; install that package and set
 `prefill_fwd.py --check weights` and `--check reference` remain independent
 CPU checks in this repository.
 
-`Glm53ModelRunner(..., enable_mtp=True)` prepares checkpoint layer 45.
-After each target chunk, call `update_mtp(next_token_ids)` with the next input
-for each active request. It shifts the query token IDs left within each
-request while retaining target positions, uses post-final-norm target
-feedback, and zeros the position-zero embedding. The plain residual block
-uses its own MLA, MoE, embedding, shared-head norm and vocabulary head.
-
-`propose_mtp(request_slots, count)` returns one to three draft IDs per request.
-The first proposal computes its own indexer TopK; later steps reuse that
-request's selection and recompute K/gate writes and tail expansion. Recycled
-feedback uses the MTP shared-head norm exactly once. Speculative cache lengths
-roll back before target verification.
-The validation driver with `--spec-tokens 3` verifies
-each draft against the target greedy token and discards the remaining queue
-on rejection. Verification is sequential: the target KDA state advances only
-through confirmed tokens. This mode does not claim speculative speedup.
+MTP operators and their standalone Torch references remain in `mtp.py`.
 
 `VisionProcessor.image()` accepts an RGB uint8 tensor, Pillow image or file.
 `video()` accepts sampled RGB frames with timestamps; `video_file()` samples
@@ -764,8 +710,8 @@ The validation driver with image/video inputs
 expands image/video markers and replaces the corresponding embedding rows
 before seeding all four streams.
 
-The standalone validation driver accepts `--spec-tokens`,
-`--image`, `--video` and repeated `--video-frame` inputs. Visual inputs attach to prompt zero; the Python API
+The standalone validation driver accepts `--image`, `--video` and repeated
+`--video-frame` inputs. Visual inputs attach to prompt zero; the Python API
 supports multiple requests and ordered visual inputs. `--vision-runtime-dir`
 loads a separately compiled single-rank vision artifact. Build CPU artifacts
 before scheduling NPU execution, following the
@@ -781,7 +727,7 @@ python /path/to/pypto-serving/tests/glm53_generation.py --tp 16 --ep 16 \
   --capacity 2048 --max-seq-len 1048576 --cache-tokens 1048576 \
   --runtime-dir /path/to/runtime --checkpoint /path/to/checkpoint \
   --prompt "Describe the image." --image /path/to/image.png \
-  --vision-runtime-dir /path/to/vision-runtime --spec-tokens 3
+  --vision-runtime-dir /path/to/vision-runtime
 ```
 
 Component entries retain generated inputs by default and accept checkpoint
