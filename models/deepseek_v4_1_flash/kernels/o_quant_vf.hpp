@@ -19,78 +19,99 @@ __tf__ __aicore__ inline void quant_vf(
     auto scale = (__ubuf__ uint16_t*)__cce_get_tile_ptr(scales);
     __VEC_SCOPE__ {
         MaskReg all = pset_b32(PAT_ALL), all16 = pset_b16(PAT_ALL), all8 = pset_b8(PAT_ALL);
-        uint32_t count64 = 64, count1 = 1;
-        MaskReg bytes64 = CreatePredicate<uint8_t>(count64);
-        MaskReg half1 = CreatePredicate<uint16_t>(count1);
-        MaskReg lower32 = pset_b32(PAT_VL32);
-        RegTensor<uint32_t> lane, lo, hi, tmp, upper_index;
-        RegTensor<int32_t> izero, ione;
-        RegTensor<float> zero, one, low, high;
+        uint32_t four_count = 4;
+        MaskReg four = CreatePredicate<uint16_t>(four_count);
+        RegTensor<uint32_t> lane, group_index;
         vci((RegTensor<int32_t>&)lane, 0, INC_ORDER);
-        vdup(lo, 0u, all, MODE_ZEROING);
-        vdup(hi, 32u, all, MODE_ZEROING);
+        vshrs(group_index, lane, 3u, all, MODE_ZEROING);
+        RegTensor<uint32_t> pair_lo, pair_hi;
+        RegTensor<uint16_t> half_index, scatter_offset;
+        vshls(pair_lo, lane, 1u, all, MODE_ZEROING);
+        vadds(pair_hi, pair_lo, 1u, all, MODE_ZEROING);
+        vci((RegTensor<int16_t>&)half_index, 0, INC_ORDER);
+        vshls(scatter_offset, half_index, (uint16_t)4, all16, MODE_ZEROING);
+        vshls(half_index, half_index, (uint16_t)1, all16, MODE_ZEROING);
+        RegTensor<int32_t> izero, ione;
+        RegTensor<float> zero, onef, low, high;
         vdup(izero, 0, all, MODE_ZEROING);
         vdup(ione, 1, all, MODE_ZEROING);
         vdup(zero, 0.0f, all, MODE_ZEROING);
-        vdup(one, 1.0f, all, MODE_ZEROING);
+        vdup(onef, 1.0f, all, MODE_ZEROING);
         vdup(low, -448.0f, all, MODE_ZEROING);
         vdup(high, 448.0f, all, MODE_ZEROING);
-        // Upper 32-value reduction group.
-        vshrs(tmp, lane, 5u, all, MODE_ZEROING);
-        vshls(tmp, tmp, 5u, all, MODE_ZEROING);
-        vsub(upper_index, lane, tmp, all, MODE_ZEROING);
-        vadds(upper_index, upper_index, 32u, all, MODE_ZEROING);
-        RegTensor<uint8_t> byte_index;
-        vci((RegTensor<int8_t>&)byte_index, (int8_t)0, INC_ORDER);
-        vmuls((RegTensor<int16_t>&)byte_index, (RegTensor<int16_t>&)byte_index, (int16_t)4, all8);
-        for (uint16_t row = 0; row < Input::Rows; ++row) {
-            for (uint16_t chunk = 0; chunk < 8; ++chunk) {
-                RegTensor<float> x, amax, shuffled, divisor, floor_mask;
-                RegTensor<int32_t> exponent, nonzero;
-                if (row < active_rows) {
-                    RegTensor<bfloat16_t> raw;
-                    vlds(raw, src, row * 512 + chunk * 64, UNPK_B16);
-                    vcvt(x, raw, all16, PART_EVEN);
-                } else {
-                    vdup(x, 0.0f, all, MODE_ZEROING);
-                }
-                vabs(amax, x, all, MODE_ZEROING);
-                RegTensor<float> lower_max, upper_max;
-                // Both 32-value groups use the lower-half mask and lane-zero maxima.
-                vcmax(lower_max, amax, lower32);
-                vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)amax, upper_index);
-                vcmax(upper_max, shuffled, lower32);
-                vselr((RegTensor<uint32_t>&)lower_max, (RegTensor<uint32_t>&)lower_max, lo);
-                vselr((RegTensor<uint32_t>&)upper_max, (RegTensor<uint32_t>&)upper_max, lo);
-                vsel(amax, lower_max, upper_max, lower32);
-                vshrs(exponent, (RegTensor<int32_t>&)amax, 23, all, MODE_ZEROING);
-                vadds(exponent, exponent, -8, all, MODE_ZEROING);
-                vmax(exponent, exponent, izero, all, MODE_ZEROING);
+        for (uint16_t row = 0; row < active_rows; ++row) {
+            for (uint16_t chunk = 0; chunk < 2; ++chunk) {
+                RegTensor<float> x0, x1, x2, x3;
+                RegTensor<bfloat16_t> even, odd;
+                vlds(even, odd, src, row * 512 + chunk * 256, DINTLV_B16);
+                vcvt(x0, even, all16, PART_EVEN);
+                vcvt(x2, even, all16, PART_ODD);
+                vcvt(x1, odd, all16, PART_EVEN);
+                vcvt(x3, odd, all16, PART_ODD);
+                RegTensor<float> m0, m1, m2, m3, maximum;
+                vabs(m0, x0, all, MODE_ZEROING);
+                vabs(m1, x1, all, MODE_ZEROING);
+                vabs(m2, x2, all, MODE_ZEROING);
+                vabs(m3, x3, all, MODE_ZEROING);
+                vmax(m0, m0, m1, all, MODE_ZEROING);
+                vmax(m2, m2, m3, all, MODE_ZEROING);
+                vmax(m0, m0, m2, all, MODE_ZEROING);
+                vcgmax(maximum, m0, all, MODE_ZEROING);
+                RegTensor<int32_t> compact_exp, exponent, nonzero;
+                vshrs(compact_exp, (RegTensor<int32_t>&)maximum, 23, all, MODE_ZEROING);
+                vadds(compact_exp, compact_exp, -8, all, MODE_ZEROING);
+                vmax(compact_exp, compact_exp, izero, all, MODE_ZEROING);
+                vselr((RegTensor<uint32_t>&)exponent, (RegTensor<uint32_t>&)compact_exp, group_index);
                 vmax(nonzero, exponent, ione, all, MODE_ZEROING);
+                RegTensor<float> divisor, floor_mask;
                 vshls((RegTensor<int32_t>&)divisor, nonzero, 23, all, MODE_ZEROING);
-                vdiv(x, x, divisor, all, MODE_ZEROING);
                 MaskReg nonzero_mask;
                 vcmps_gt(nonzero_mask, exponent, 0, all);
-                vsel(floor_mask, one, zero, nonzero_mask);
-                vmul(x, x, floor_mask, all, MODE_ZEROING);
-                vmax(x, x, low, all, MODE_ZEROING);
-                vmin(x, x, high, all, MODE_ZEROING);
-                vector_f8e4m3 payload;
-                RegTensor<uint8_t> packed;
-                vcvt(payload, x, all, ROUND_R, RS_DISABLE, PART_P0);
-                vselr(packed, (RegTensor<uint8_t>&)payload, byte_index);
-                vsts(packed, dst, row * 512 + chunk * 64, NORM_B8, bytes64);
+                vsel(floor_mask, onef, zero, nonzero_mask);
+                vdiv(x0, x0, divisor, all, MODE_ZEROING);
+                vmul(x0, x0, floor_mask, all, MODE_ZEROING);
+                vmax(x0, x0, low, all, MODE_ZEROING);
+                vmin(x0, x0, high, all, MODE_ZEROING);
+                vdiv(x1, x1, divisor, all, MODE_ZEROING);
+                vmul(x1, x1, floor_mask, all, MODE_ZEROING);
+                vmax(x1, x1, low, all, MODE_ZEROING);
+                vmin(x1, x1, high, all, MODE_ZEROING);
+                vdiv(x2, x2, divisor, all, MODE_ZEROING);
+                vmul(x2, x2, floor_mask, all, MODE_ZEROING);
+                vmax(x2, x2, low, all, MODE_ZEROING);
+                vmin(x2, x2, high, all, MODE_ZEROING);
+                vdiv(x3, x3, divisor, all, MODE_ZEROING);
+                vmul(x3, x3, floor_mask, all, MODE_ZEROING);
+                vmax(x3, x3, low, all, MODE_ZEROING);
+                vmin(x3, x3, high, all, MODE_ZEROING);
+                vector_f8e4m3 p0, p1, p2, p3;
+                vcvt(p0, x0, all, ROUND_R, RS_DISABLE, PART_P0);
+                vcvt(p1, x1, all, ROUND_R, RS_DISABLE, PART_P1);
+                vcvt(p2, x2, all, ROUND_R, RS_DISABLE, PART_P2);
+                vcvt(p3, x3, all, ROUND_R, RS_DISABLE, PART_P3);
+                vor((RegTensor<uint8_t>&)p0, (RegTensor<uint8_t>&)p0, (RegTensor<uint8_t>&)p1, all8);
+                vor((RegTensor<uint8_t>&)p2, (RegTensor<uint8_t>&)p2, (RegTensor<uint8_t>&)p3, all8);
+                vor((RegTensor<uint8_t>&)p0, (RegTensor<uint8_t>&)p0, (RegTensor<uint8_t>&)p2, all8);
+                vsts((RegTensor<uint8_t>&)p0, dst, row * 512 + chunk * 256, NORM_B8, all8);
                 RegTensor<uint32_t> e0, e1;
-                vselr(e0, (RegTensor<uint32_t>&)exponent, lo);
-                vselr(e1, (RegTensor<uint32_t>&)exponent, hi);
+                RegTensor<uint16_t> pairs;
+                vselr(e0, (RegTensor<uint32_t>&)compact_exp, pair_lo);
+                vselr(e1, (RegTensor<uint32_t>&)compact_exp, pair_hi);
                 vshls(e1, e1, 8u, all, MODE_ZEROING);
                 vor(e0, e0, e1, all);
-                // Scale offsets are in uint16 pairs; each 64D chunk advances 16 pairs.
-                vsts((RegTensor<uint16_t>&)e0, scale, row + chunk * 16, ONEPT_B16, half1);
+                vselr(pairs, (RegTensor<uint16_t>&)e0, half_index);
+                auto scale_base = scale + (row / 16) * 128 + row % 16 + chunk * 64;
+                vscatter(pairs, scale_base, scatter_offset, four);
+            }
+        }
+        for (uint16_t row = active_rows; row < Input::Rows; ++row) {
+            for (uint16_t chunk = 0; chunk < 2; ++chunk) {
+                vsts((RegTensor<uint8_t>&)zero, dst, row * 512 + chunk * 256, NORM_B8, all8);
+                auto scale_base = scale + (row / 16) * 128 + row % 16 + chunk * 64;
+                vscatter((RegTensor<uint16_t>&)zero, scale_base, scatter_offset, four);
             }
         }
     }
 }
-
 #endif
 } // namespace o_quant

@@ -56,18 +56,19 @@ def _rope_o_vf(
     attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rotated: pl.Out[pl.Tensor[[80, LOCAL_H * HEAD_DIM], pl.BF16]],
+    rotated: pl.Out[pl.Tensor[[80, LOCAL_H * ROPE_DIM], pl.BF16]],
     active_rows: pl.Scalar[pl.INT32],
     groups: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
-    """Apply inverse RoPE and round the rotary coordinates to BF16."""
+    """Write the BF16 inverse-RoPE tail without changing the attention input."""
     ...
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_quant_vf.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _quant_o_vf(
-    rotated: pl.Tensor[[80, LOCAL_H * HEAD_DIM], pl.BF16],
+    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    rotated: pl.Tensor[[80, LOCAL_H * ROPE_DIM], pl.BF16],
     payload: pl.Out[pl.Tensor[[LOCAL_O_GROUPS * 80, O_GROUP_IN], pl.FP8E4M3FN]],
     scales: pl.Out[pl.Tensor[[LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], pl.FP8E8M0]],
     active_rows: pl.Scalar[pl.INT32],
@@ -161,9 +162,11 @@ def o_proj(
         sine_group = pl.tensor.slice(rope_sin, [group_rows, ROPE_DIM // 2], [group_start, 0])
         output_group = pl.tensor.slice(output, [group_rows, D], [group_start, 0])
         # Inverse RoPE.
-        rotated = pl.create_tensor([80, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        rotated = pl.create_tensor([80, LOCAL_H * ROPE_DIM], dtype=pl.BF16)
         vector_workers = pl.max(1, pl.min(64, 2 * pl.system.available_cluster_count()))
-        with pl.spmd(vector_workers, name_hint="rope_o_vf"):
+        rope_waves = pl.max(1, (active_rows + vector_workers - 1) // vector_workers)
+        rope_workers = pl.max(1, (active_rows + rope_waves - 1) // rope_waves)
+        with pl.spmd(rope_workers, name_hint="rope_o_vf"):
             rotated = _rope_o_vf(
                 attended_group, cosine_group, sine_group, rotated, active_rows, LOCAL_O_GROUPS,
             )
@@ -171,7 +174,7 @@ def o_proj(
         payload_all = pl.create_tensor([LOCAL_O_GROUPS * 80, O_GROUP_IN], dtype=pl.FP8E4M3FN)
         scales_all = pl.create_tensor([LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
         with pl.spmd(vector_workers, name_hint="quant_o_vf"):
-            payload_all, scales_all = _quant_o_vf(rotated, payload_all, scales_all, active_rows, LOCAL_O_GROUPS)
+            payload_all, scales_all = _quant_o_vf(attended_group, rotated, payload_all, scales_all, active_rows, LOCAL_O_GROUPS)
         output_group = _o_proj_quantized(
             payload_all, scales_all, wo_a, wo_a_scale, wo_b, wo_b_scale, output_group, active_rows,
         )
