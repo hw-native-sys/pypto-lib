@@ -10,8 +10,10 @@
 """DeepSeek-V4.1 decode MoE with mHC and expert parallelism."""
 
 from dataclasses import replace
+from pathlib import Path
 import sys
 import pypto.language as pl
+from pypto.runtime import pto_isa_include_dir
 import pypto.language.distributed as pld
 import config
 
@@ -97,6 +99,19 @@ def clear_moe_signals(
     return completion_anchor
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "moe_dispatch_stage.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _dispatch_stage_vf(
+    payload: pl.Tensor[[T, D], pl.FP8E4M3FN],
+    packed_scales: pl.Tensor[[1, T * K_SCALE], pl.FP8E8M0],
+    raw_payload: pl.Out[pl.Tensor[[T, D], pl.INT8]],
+    scales: pl.Out[pl.Tensor[[T, K_SCALE], pl.UINT8]],
+    active_tokens: pl.Scalar[pl.INT32],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Copy the payload and unpack MX_A_ZZ scale bytes into ND rows."""
+    return raw_payload, scales
+
+
 @pl.jit.inline
 def dispatch(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
@@ -124,27 +139,9 @@ def dispatch(
     x_norm_mx_raw = pl.create_tensor([T, D], dtype=pl.INT8)
     scale_src = pl.create_tensor([T, K_SCALE], dtype=pl.UINT8, manual_dep=True)
     with pl.spmd(T // DISPATCH_STAGE_TILE, name_hint="dispatch_stage") as _stage_tid:
-        t_begin = pl.tile.get_block_idx() * DISPATCH_STAGE_TILE
-        raw_row = pl.load(x_norm_mx, [t_begin, 0], [DISPATCH_STAGE_TILE, D])
-        raw_row_i8 = pl.reinterpret_view(raw_row, pl.INT8)
-        x_norm_mx_raw = pl.store(raw_row_i8, [t_begin, 0], x_norm_mx_raw)
-        scale_offset = t_begin // 16 * 16 * K_SCALE
-        raw_scale = pl.load(x_norm_scale, [0, scale_offset], [1, 16 * K_SCALE])
-        raw_scale_u8 = pl.reinterpret_view(raw_scale, pl.UINT8)
-        raw_scale_i8 = pl.reinterpret_view(raw_scale_u8, pl.INT8)
-        active_tokens = pl.cast(num_tokens, pl.INDEX)
-        if active_tokens < 0:
-            active_tokens = pl.cast(0, pl.INDEX)
-        if active_tokens > T:
-            active_tokens = pl.cast(T, pl.INDEX)
-        # Each block owns whole 64-byte lines in the UINT8 scale buffer.
-        t_end = pl.min(t_begin + DISPATCH_STAGE_TILE, active_tokens)
-        for t in pl.range(t_begin, t_end):
-            for group in pl.range(K_SCALE):
-                scale_index = group // 2 * 32 + t % 16 * 2 + group % 2
-                scale_i8 = pl.tile.read(raw_scale_i8, [0, scale_index])
-                scale = pl.cast(scale_i8, pl.UINT8)
-                pl.write(scale_src, [t, group], scale)
+        x_norm_mx_raw, scale_src = _dispatch_stage_vf(
+            x_norm_mx, x_norm_scale, x_norm_mx_raw, scale_src, num_tokens,
+        )
 
     # Publish per-source route counts.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta_publish", allow_early_resolve=True) as _meta_push_tid:
