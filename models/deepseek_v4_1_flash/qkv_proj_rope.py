@@ -20,7 +20,6 @@ from gemm import (
     MX_M_TILE, MX_K_TILE,
     golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum,
 )
-from quant import QUANT_SCALE_TILE, quantize_bf16_to_mxfp8
 from rmsnorm import golden_rms_norm
 
 
@@ -30,7 +29,6 @@ D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 Q_LORA = M.q_lora_rank
-EPS = M.rms_norm_eps
 
 # tiling
 Q_A_N_TILE = 64
@@ -87,6 +85,33 @@ def _proj_kv(
     ...
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "qkv_quant.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def qkv_quant(
+    x: pl.Tensor,
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+):
+    """Quantize BF16 projection inputs with M16-packed E8M0 scales."""
+    ...
+
+
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "q_norm_quant.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def q_norm_quant(
+    projected: pl.Tensor,
+    weight: pl.Tensor,
+    latent: pl.Out[pl.Tensor],
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INT32],
+):
+    """Normalize complete latent rows and quantize them with packed E8M0 scales."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def quantize_projection_input(
     x: pl.Tensor,
@@ -99,97 +124,9 @@ def quantize_projection_input(
     scales = pl.create_tensor([1, padded_rows * (D // 32)], dtype=pl.FP8E8M0)
     quant_blocks = (padded_rows // MX_M_TILE) * (D // MX_K_TILE)
     workers = pl.min(pl.min(quant_blocks, 32), 2 * pl.system.available_cluster_count())
-    for worker in pl.spmd(workers, name_hint="attention_qkv_input_quant_pooled"):
-        for work in pl.range(worker, quant_blocks, workers):
-            t0 = (work // (D // MX_K_TILE)) * MX_M_TILE
-            k0 = (work % (D // MX_K_TILE)) * MX_K_TILE
-            rows = pl.max(pl.min(MX_M_TILE, num_tokens - t0), 0)
-            quantized_tile, packed_scale = quantize_bf16_to_mxfp8(x, t0, k0, rows, MX_M_TILE)
-            payload = pl.store(quantized_tile, [t0, k0], payload)
-            scale_offset = t0 * (D // 32) + k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32)
-            packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
-            scales = pl.store(packed_flat, [0, scale_offset], scales)
+    with pl.spmd(workers, name_hint="qkv_quant"):
+        qkv_quant(x, payload, scales, num_tokens, padded_rows)
     return payload, scales
-
-
-@pl.jit.inline(auto_scope=False)
-def _q_normalize_to_mx(
-    projected: pl.Tensor,
-    q_norm_weight: pl.Tensor,
-    query_latent: pl.Tensor,
-    payload: pl.Tensor,
-    scale_backing: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    workers: pl.constexpr,
-):
-    weight_row = pl.tensor.view(q_norm_weight, [1, Q_LORA])
-    for worker in pl.spmd(workers, name_hint="attention_q_norm_quant"):
-        normalized_rows = pl.create_tile([MX_M_TILE, Q_LORA], dtype=pl.BF16)
-        for half in pl.unroll(2):
-            t = half * 8
-            rows = pl.max(pl.min(8, num_tokens - t), 0)
-            zero_source = pl.tile.full([8, Q_LORA], dtype=pl.BF16, value=0.0)
-            source = pl.fillpad(zero_source, pad_value=pl.PadValue.zero)
-            if num_tokens > t:
-                loaded = pl.load(projected, [t, 0], [8, Q_LORA], valid_shape=[rows, Q_LORA])
-                source = pl.set_validshape(pl.fillpad(loaded, pad_value=pl.PadValue.zero), 8, Q_LORA)
-            value = pl.cast(source, pl.FP32)
-            squared = pl.mul(value, value)
-            norm_tmp = pl.create_tile([8, Q_LORA], dtype=pl.FP32)
-            row_sum = pl.row_sum(squared, tmp_tile=norm_tmp)
-            mean = pl.mul(row_sum, 1.0 / Q_LORA)
-            rms_argument = pl.add(mean, EPS)
-            rsqrt_tmp = pl.create_tile([8, 1], dtype=pl.FP32)
-            row_inverse = pl.tile.rsqrt(rms_argument, tmp=rsqrt_tmp)
-            gamma = pl.cast(pl.load(weight_row, [0, 0], [1, Q_LORA]), pl.FP32)
-            normalized = pl.col_expand_mul(pl.row_expand_mul(value, row_inverse), gamma)
-            rounded = pl.cast(normalized, pl.BF16, mode="rint")
-            rounded_valid = pl.set_validshape(rounded, rows, Q_LORA)
-            if worker == 0 and num_tokens > t:
-                query_latent = pl.store(rounded_valid, [t, 0], query_latent)
-            padded = pl.set_validshape(pl.fillpad(rounded_valid, pad_value=pl.PadValue.zero), 8, Q_LORA)
-            padded_bits = pl.reinterpret_view(padded, pl.INT16)
-            zero_bits = pl.tile.full([8, Q_LORA], dtype=pl.INT16, value=0)
-            dense_bits = pl.add(zero_bits, padded_bits)
-            dense_rounded = pl.reinterpret_view(dense_bits, pl.BF16)
-            normalized_rows = pl.tile.assemble(normalized_rows, dense_rounded, [t, 0])
-        for k0 in pl.range(worker * MX_K_TILE, Q_LORA, workers * MX_K_TILE):
-            quant_source = pl.tile.slice(normalized_rows, [MX_M_TILE, MX_K_TILE], [0, k0])
-            source_fp32 = pl.cast(quant_source, pl.FP32)
-            groups = pl.reshape(source_fp32, [MX_M_TILE * (MX_K_TILE // 32), 32])
-            reduce_tmp = pl.create_tile([MX_M_TILE * (MX_K_TILE // 32), 32], dtype=pl.FP32)
-            magnitude = pl.abs(groups)
-            maximum = pl.row_max(magnitude, tmp_tile=reduce_tmp)
-            bits = pl.reinterpret_view(maximum, pl.INT32)
-            biased_exponent = pl.shrs(bits, 23)
-            scale_exponent = pl.sub(biased_exponent, 8)
-            exponent = pl.maximum(scale_exponent, 0)
-            # Scale code zero has a zero reciprocal.
-            negative_exponent = pl.mul(exponent, -1)
-            reciprocal_exponent = pl.add(negative_exponent, 254)
-            nonzero_exponent = pl.minimum(exponent, 1)
-            reciprocal_code = pl.mul(reciprocal_exponent, nonzero_exponent)
-            reciprocal_bits = pl.shls(reciprocal_code, 23)
-            reciprocal = pl.reinterpret_view(reciprocal_bits, pl.FP32)
-            quant_normalized = pl.row_expand_mul(groups, reciprocal)
-            quant_normalized = pl.maximum(quant_normalized, -448.0)
-            quant_normalized = pl.minimum(quant_normalized, 448.0)
-            payload_fp8 = pl.cast(quant_normalized, pl.FP8E4M3FN, mode="rint")
-            quantized_tile = pl.reshape(payload_fp8, [MX_M_TILE, MX_K_TILE])
-            sign_bit = pl.shrs(exponent, 7)
-            sign_offset = pl.mul(sign_bit, 256)
-            signed = pl.sub(exponent, sign_offset)
-            signed_codes = pl.cast(signed, pl.INT8)
-            codes = pl.reinterpret_view(signed_codes, pl.UINT8)
-            flat = pl.reshape(codes, [1, MX_M_TILE * (MX_K_TILE // 32)])
-            pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-            packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=QUANT_SCALE_TILE)
-            packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
-            payload = pl.store(quantized_tile, [0, k0], payload)
-            scale_offset = k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32)
-            packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
-            scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
-    return query_latent, payload, scale_backing
 
 
 @pl.jit.inline(auto_scope=False)
@@ -236,10 +173,11 @@ def q_proj_rope(
             qb_scales_tile = pl.tensor.slice(
                 qb_scales_group, [1, MX_M_TILE * (Q_LORA // 32)], [0, qb_scale_offset],
             )
-            _q_normalize_to_mx(
-                projected_tile, q_norm_weight, latent_tile,
-                qb_payload_tile, qb_scales_tile, q_rows, 5,
-            )
+            with pl.spmd(1, name_hint="q_norm_quant"):
+                q_norm_quant(
+                    projected_tile, q_norm_weight, latent_tile,
+                    qb_payload_tile, qb_scales_tile, q_rows,
+                )
         qb_workers = pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE)
         qb_workers = pl.min(qb_workers, pl.system.available_cluster_count())
         qb_workers = pl.max(1, qb_workers)
@@ -251,9 +189,9 @@ def q_proj_rope(
     return query_latent, query, qb_payload, qb_scales
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "window_norm_rope_publish.cpp",
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "norm_rope_publish.cpp",
                include_dirs=(pto_isa_include_dir(),))
-def _norm_rope_publish(
+def norm_rope_publish(
     source: pl.Tensor,
     weight: pl.Tensor,
     cosine: pl.Tensor,
@@ -303,8 +241,8 @@ def window_publish(
 ):
     """Fuse RMSNorm, RoPE, group-32 FP8 quantization, and window cache publication."""
     workers = pl.max(1, pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE))
-    with pl.spmd(workers, name_hint="norm_rope_pub_win", deps=[cache_ready]) as published:
-        cache = _norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, cache_scale, num_tokens)
+    with pl.spmd(workers, name_hint="norm_rope_publish", deps=[cache_ready]) as published:
+        cache = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, cache_scale, num_tokens)
     return published
 
 

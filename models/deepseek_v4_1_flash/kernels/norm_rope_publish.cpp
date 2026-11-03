@@ -186,18 +186,27 @@ __aicore__ inline void flush_rows(__gm__ int64_t* args, int rows, Vec<int64_t, 8
     postprocess(packed.data(), scales.data(), input.data(), weight.data(), cosine.data(), sine.data(), rows);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    for (int row = 0; row < rows; ++row) {
+    for (int row = 0; row < rows;) {
         int64_t slot = targets.GetValue(row);
-        Vec<uint8_t, 512> payload;
-        Vec<uint8_t, 32> codes;
+        int count = 1;
+        while (row + count < rows && targets.GetValue(row + count) == slot + count) ++count;
+        using Payload = Tile<TileType::Vec, uint8_t, 8, 512, BLayout::RowMajor, DYNAMIC, 512>;
+        using Codes = Tile<TileType::Vec, uint8_t, 8, 32, BLayout::RowMajor, DYNAMIC, 32>;
+        Payload payload(count);
+        Codes codes(count);
         TASSIGN(payload, 10240 + row * 512);
         TASSIGN(codes, 14336 + row * 32);
-        GM<uint8_t, 512> output_gm(data<uint8_t>(args, 5) + slot * 512);
-        GM<uint8_t, 32> scale_gm(data<uint8_t>(args, 6) + slot * 32);
+        using PayloadShape = TileShape2D<uint8_t, DYNAMIC, 512>;
+        using CodeShape = TileShape2D<uint8_t, DYNAMIC, 32>;
+        GlobalTensor<uint8_t, PayloadShape, BaseShape2D<uint8_t, 8, 512>> output_gm(
+            data<uint8_t>(args, 5) + slot * 512, PayloadShape(count, 512));
+        GlobalTensor<uint8_t, CodeShape, BaseShape2D<uint8_t, 8, 32>> scale_gm(
+            data<uint8_t>(args, 6) + slot * 32, CodeShape(count, 32));
         TSTORE(output_gm, payload);
         TSTORE(scale_gm, codes);
-        // Preserve input order for repeated slots and adjacent short scale writes.
+        // Preserve input order between runs, including repeated cache slots.
         pipe_barrier(PIPE_MTE3);
+        row += count;
     }
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
@@ -207,11 +216,11 @@ __aicore__ inline void flush_rows(__gm__ int64_t* args, int rows, Vec<int64_t, 8
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__)
-    Tile<TileType::Vec, int64_t, 1, 32, BLayout::RowMajor, 1, DYNAMIC> slots(32);
+    Tile<TileType::Vec, int64_t, 1, 128, BLayout::RowMajor, 1, DYNAMIC> slots(128);
     Vec<int64_t, 8> targets;
     Vec<bfloat16_t, 512> weight;
     TASSIGN(slots, 15616);
-    TASSIGN(targets, 15872);
+    TASSIGN(targets, 16640);
     TASSIGN(weight, 14592);
     GM<bfloat16_t, 512> weight_gm(data<bfloat16_t>(args, 1));
     TLOAD(weight, weight_gm);
@@ -219,30 +228,48 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     int worker = get_block_idx(args);
     int workers = get_block_num(args);
     int pending = 0;
-    for (int base = 0; base < tokens; base += 32) {
-        int count = tokens - base < 32 ? tokens - base : 32;
+    for (int base = 0; base < tokens; base += 128) {
+        int count = tokens - base < 128 ? tokens - base : 128;
         slots.SetValidCol(count);
-        using SlotGM = GlobalTensor<int64_t, TileShape2D<int64_t, 1, DYNAMIC>, BaseShape2D<int64_t, 1, 32>>;
+        using SlotGM = GlobalTensor<int64_t, TileShape2D<int64_t, 1, DYNAMIC>, BaseShape2D<int64_t, 1, 128>>;
         SlotGM slot_gm(data<int64_t>(args, 4) + base, TileShape2D<int64_t, 1, DYNAMIC>(1, count));
         TLOAD(slots, slot_gm);
         set_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
-        for (int lane = 0; lane < count; ++lane) {
+        for (int lane = 0; lane < count;) {
             int64_t slot = slots.GetValue(lane);
-            if (slot < 0 || (slot / 128) % workers != worker) continue;
-            targets.SetValue(pending, slot);
-            Vec<bfloat16_t, 512> input;
-            Vec<float, 32> cosine, sine;
+            if (slot < 0 || (slot / 128) % workers != worker) {
+                ++lane;
+                continue;
+            }
+            int run = 0;
+            while (lane + run < count && pending + run < 8) {
+                int64_t target = slots.GetValue(lane + run);
+                if (target < 0 || (target / 128) % workers != worker) break;
+                targets.SetValue(pending + run, target);
+                ++run;
+            }
+            using Input = Tile<TileType::Vec, bfloat16_t, 8, 512, BLayout::RowMajor, DYNAMIC, 512>;
+            using Rope = Tile<TileType::Vec, float, 8, 32, BLayout::RowMajor, DYNAMIC, 32>;
+            Input input(run);
+            Rope cosine(run), sine(run);
             TASSIGN(input, pending * 1024);
             TASSIGN(cosine, 8192 + pending * 128);
             TASSIGN(sine, 9216 + pending * 128);
-            GM<bfloat16_t, 512> input_gm(data<bfloat16_t>(args, 0) + (int64_t)(base + lane) * 512);
-            GM<float, 32> cos_gm(data<float>(args, 2) + (int64_t)(base + lane) * 32);
-            GM<float, 32> sin_gm(data<float>(args, 3) + (int64_t)(base + lane) * 32);
+            using InputShape = TileShape2D<bfloat16_t, DYNAMIC, 512>;
+            using RopeShape = TileShape2D<float, DYNAMIC, 32>;
+            GlobalTensor<bfloat16_t, InputShape, BaseShape2D<bfloat16_t, 8, 512>> input_gm(
+                data<bfloat16_t>(args, 0) + (int64_t)(base + lane) * 512, InputShape(run, 512));
+            GlobalTensor<float, RopeShape, BaseShape2D<float, 8, 32>> cos_gm(
+                data<float>(args, 2) + (int64_t)(base + lane) * 32, RopeShape(run, 32));
+            GlobalTensor<float, RopeShape, BaseShape2D<float, 8, 32>> sin_gm(
+                data<float>(args, 3) + (int64_t)(base + lane) * 32, RopeShape(run, 32));
             TLOAD(input, input_gm);
             TLOAD(cosine, cos_gm);
             TLOAD(sine, sin_gm);
-            if (++pending == 8) {
+            lane += run;
+            pending += run;
+            if (pending == 8) {
                 flush_rows(args, pending, targets);
                 pending = 0;
             }
