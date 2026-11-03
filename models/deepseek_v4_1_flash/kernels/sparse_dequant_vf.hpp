@@ -21,6 +21,7 @@ __tf__ __aicore__ inline void decode_nz(
     auto input = (__ubuf__ uint8_t*)__cce_get_tile_ptr(src);
     auto scale = (__ubuf__ uint16_t*)__cce_get_tile_ptr(factors);
     auto indices = (__ubuf__ int32_t*)__cce_get_tile_ptr(ids);
+    constexpr int nz_rows = Output::Rows + (Output::Compact == CompactMode::RowPlusOne ? 1 : 0);
     __VEC_SCOPE__ {
         MaskReg all8 = pset_b8(PAT_ALL);
         MaskReg all16 = pset_b16(PAT_ALL);
@@ -69,8 +70,8 @@ __tf__ __aicore__ inline void decode_nz(
                     vsel((RegTensor<uint32_t>&)packed, (RegTensor<uint32_t>&)packed,
                          (RegTensor<uint32_t>&)zero, valid);
                 }
-                auto target = output + chunk * Output::Rows * 128 + row * 16;
-                vsstb((RegTensor<uint16_t>&)packed, target, (uint32_t)(Output::Rows << 16), all16, POST_UPDATE);
+                auto target = output + chunk * nz_rows * 128 + row * 16;
+                vsstb((RegTensor<uint16_t>&)packed, target, (uint32_t)(nz_rows << 16), all16, POST_UPDATE);
             }
         }
     }

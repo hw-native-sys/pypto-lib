@@ -150,11 +150,13 @@ __aicore__ inline void gather_fp4_subtile(
     constexpr int payload_address = Slot * 8192;
     constexpr int scale_address = 16384 + Slot * 1024;
     int id_address = 24576 + index_offset * sizeof(int32_t);
-    constexpr int nz_address = 32768 + Slot * 16384;
+    // NZ17 slots end below PV at 65536 and do not overlap the ID region.
+    constexpr int nz_address = 28672 + Slot * 17408;
     Vec<int32_t, 1, 16> ids;
     Vec<float4_e2m1x2_t, 16, DIM> payload;
     Vec<bfloat16_t, 16, 32> scales;
-    Tile<TileType::Vec, bfloat16_t, 16, DIM, BLayout::ColMajor, 16, DIM, SLayout::RowMajor> nz;
+    Tile<TileType::Vec, bfloat16_t, 16, DIM, BLayout::ColMajor, 16, DIM, SLayout::RowMajor,
+         512, PadValue::Null, CompactMode::RowPlusOne> nz;
     TASSIGN(ids, id_address);
     TASSIGN(payload, payload_address);
     TASSIGN(scales, scale_address);
@@ -261,10 +263,12 @@ __aicore__ inline void gather_part(
     }
     drain_fp4_slots(fp4_active);
     Vec<int32_t, 1, 32> ids;
-    Tile<TileType::Vec, bfloat16_t, 32, DIM, BLayout::ColMajor, 32, DIM, SLayout::RowMajor> nz;
+    Tile<TileType::Vec, bfloat16_t, 32, DIM, BLayout::ColMajor, 32, DIM, SLayout::RowMajor,
+         512, PadValue::Null, CompactMode::RowPlusOne> nz;
     Mat<128, DIM> kv;
-    TASSIGN(ids, 28672);
-    TASSIGN(nz, 32768);
+    TASSIGN(ids, 24576);
+    // NZ33 occupies [31744, 65536), preserving the adjacent PV buffer.
+    TASSIGN(nz, 31744);
     TASSIGN(kv, KV_L1 + (ordinal % KV_SLOTS) * 131072);
     for (int sub = 0; sub < 2; ++sub) {
         int column = part * 128 + lane * 64 + sub * 32;
