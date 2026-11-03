@@ -83,10 +83,10 @@ __aicore__ inline void compute(AM& am, BM<NT>& bm, AS<K>& sa, BS<K, NT>& sb, AC<
     set_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(slot));
 }
 
-template <int K, int N, int NT = 256>
-__aicore__ inline void project(
+template <int K, int N, int NT, typename Emit>
+__aicore__ inline void project_emit(
     __gm__ F* a, __gm__ F* b, __gm__ S* a_scale, __gm__ S* b_scale,
-    __gm__ bfloat16_t* output, int rows, int output_width, int n) {
+    int n, Emit& emit) {
     AS<K> sa;
     BS<K, NT> sb;
     AC<NT> acc;
@@ -126,13 +126,31 @@ __aicore__ inline void project(
     }
     set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-    acc.SetValidRow(rows);
-    using OutShape = TileShape2D<bfloat16_t, DYNAMIC, NT, Layout::ND>;
-    using OutStride = BaseShape2D<bfloat16_t, DYNAMIC, DYNAMIC, Layout::ND>;
-    GlobalTensor<bfloat16_t, OutShape, OutStride, Layout::ND> cg(
-        output + n, OutShape(rows, NT), OutStride(rows, output_width));
-    TSTORE(cg, acc);
+    emit(acc);
     pipe_barrier(PIPE_ALL);
+}
+
+template <int NT>
+struct StoreOutput {
+    __gm__ bfloat16_t* output;
+    int rows, output_width, n;
+
+    __aicore__ inline void operator()(AC<NT>& acc) {
+        acc.SetValidRow(rows);
+        using OutShape = TileShape2D<bfloat16_t, DYNAMIC, NT, Layout::ND>;
+        using OutStride = BaseShape2D<bfloat16_t, DYNAMIC, DYNAMIC, Layout::ND>;
+        GlobalTensor<bfloat16_t, OutShape, OutStride, Layout::ND> cg(
+            output + n, OutShape(rows, NT), OutStride(rows, output_width));
+        TSTORE(cg, acc);
+    }
+};
+
+template <int K, int N, int NT = 256>
+__aicore__ inline void project(
+    __gm__ F* a, __gm__ F* b, __gm__ S* a_scale, __gm__ S* b_scale,
+    __gm__ bfloat16_t* output, int rows, int output_width, int n) {
+    StoreOutput<NT> emit{output, rows, output_width, n};
+    project_emit<K, N, NT>(a, b, a_scale, b_scale, n, emit);
 }
 
 }  // namespace mxfp8_projection
