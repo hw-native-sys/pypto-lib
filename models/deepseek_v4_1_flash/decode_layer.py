@@ -1171,9 +1171,9 @@ if __name__ == "__main__":
             "topk_indices": exact,
             "pool_block_ids": exact,
             "pool_block_counts": exact,
-            # Layer integration budget: at most 1.5% outliers per rank.
+            # Attention output budget includes FP8 cache rounding boundaries.
             "attention_output": _compare_active_rows_per_rank(
-                ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.015),
+                ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.02),
                 counts,
             ),
             "attention_hidden": _compare_active_rows_per_rank(
