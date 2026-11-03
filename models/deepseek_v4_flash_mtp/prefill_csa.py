@@ -187,7 +187,6 @@ OVERLAY_SOURCES = 2
 MAX_SEED_ROWS = COMPRESS_RATIO + 3
 MAX_COMPRESSED_ROWS_PER_TILE = T // COMPRESS_RATIO
 MAX_COMPRESSED_ROWS_PER_SEGMENT = (MAX_SEGMENT_TILES * MAX_COMPRESSED_ROWS_PER_TILE)
-PART_PAYLOAD_ROWS = EPOCHS * MAX_COMPRESSED_ROWS_PER_SEGMENT
 MERGE_ROW_TILE = 4  # rows per cp_csa_merge_part_* block; >=2 for the 64-byte meta line
 LEAF_STAGE_ROW_TILE = 16  # rows per cp_csa_leaf_data_stage block -> 80 blocks
 LEAF_STAGE_COPY_ROW_TILE = 4
@@ -998,8 +997,8 @@ def _cp_csa_compress_pack_part(
     payload_rows = EPOCHS * MAX_COMPRESSED_ROWS_PER_SEGMENT
     main_payload = pl.create_tensor([payload_rows, HEAD_DIM], dtype=pl.BF16)
     main_payload_epoch_view = pl.reshape(main_payload, [EPOCHS, MAX_COMPRESSED_ROWS_PER_SEGMENT, HEAD_DIM])
-    idx_payload = pl.create_tensor([PART_PAYLOAD_ROWS, IDX_HEAD_DIM], dtype=pl.INT8)
-    idx_scale_payload = pl.create_tensor([PART_PAYLOAD_ROWS, SCALE_TILE_COLS], dtype=pl.FP16)
+    idx_payload = pl.create_tensor([payload_rows, IDX_HEAD_DIM], dtype=pl.INT8)
+    idx_scale_payload = pl.create_tensor([payload_rows, SCALE_TILE_COLS], dtype=pl.FP16)
     record_meta = pl.create_tensor([payload_rows, META_DIM], dtype=pl.INT32)
     main_write_positions = pl.create_tensor([MAX_COMPRESS_LEAVES, MAX_CMP_WRITES], dtype=pl.INT32)
     main_write_destinations = pl.create_tensor([MAX_COMPRESS_LEAVES, MAX_CMP_WRITES], dtype=pl.INT32)
@@ -1108,8 +1107,9 @@ def _cp_csa_compress_pack_part(
                 x_leaf, main_state, main_state_block_table,
                 cmp_wkv, cmp_wgate, cmp_ape, pos_leaf, active,
                 main_leaf_write_pos, main_leaf_write_dst, main_state_map_leaf, main_completion,
-                main_state_next, main_forward_rows, history_pool_worker_cap, leaf > 0,
-                leaf_has_output, skip_first_history,
+                next_state=main_state_next, forward_rows=main_forward_rows,
+                history_pool_worker_cap=history_pool_worker_cap, emit_pool=leaf > 0,
+                compute_output=leaf_has_output, skip_history_pool=skip_first_history,
             )
             if leaf > 0:
                 # Each real leaf owns its cache and nonoverlapping payload rows.
@@ -1149,8 +1149,9 @@ def _cp_csa_compress_pack_part(
                 inner_wkv, inner_wgate, inner_ape, inner_norm_w,
                 freqs_cos, freqs_sin, hadamard_idx,
                 pos_leaf, active, idx_leaf_write_pos, idx_leaf_write_dst, inner_pool_completion,
-                history_pool_worker_cap,
-                pl.cast(leaf == 0 or leaf_has_output > 0, pl.INT32), skip_first_history,
+                history_pool_worker_cap=history_pool_worker_cap,
+                compute_output=pl.cast(leaf == 0 or leaf_has_output > 0, pl.INT32),
+                skip_history_pool=skip_first_history,
             )
             if active <= 8:
                 with pl.spmd(

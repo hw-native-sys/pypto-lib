@@ -274,9 +274,10 @@ def _compressor_prepare_state(
     forward_rows: pl.Scalar[pl.INDEX],
     history_pool_worker_cap: pl.Scalar[pl.INT32],
     emit_pool: pl.Scalar[pl.BOOL],
-    emit_output_tasks: pl.Scalar[pl.INT32],
-    skip_history: pl.Scalar[pl.INT32],
+    compute_output: pl.Scalar[pl.INT32],
+    skip_history_pool: pl.Scalar[pl.INT32],
 ):
+    """Project a leaf, optionally pool outputs, and write or forward its state."""
     state_block_num = pl.tensor.dim(compress_state, 0)
     cmp4_kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     cmp4_score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
@@ -309,7 +310,7 @@ def _compressor_prepare_state(
         active_pool_blocks = ((num_tokens + COMPRESS_RATIO - 1) // COMPRESS_RATIO) * (HEAD_DIM // HEAD_D_TILE)
         pool_workers = pl.min(active_pool_blocks, 12)
         current_pool_flags = pl.create_tensor([MAX_CMP_WRITES, 16], dtype=pl.INT32)
-        if emit_output_tasks > 0:
+        if compute_output > 0:
             with pl.spmd(pool_workers, name_hint="prefill_c4_softmax_pool_current") as current_pool_tid:
                 pool_worker = pl.tile.get_block_idx()
                 for pool_idx in pl.range(pool_worker, active_pool_blocks, pl.max(pool_workers, 1)):
@@ -363,7 +364,7 @@ def _compressor_prepare_state(
                         pl.write(current_pool_flags, [write_i, 0], pl.cast(1, pl.INT32))
                         pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=0.0)
             pool_done[0] = current_pool_tid
-            if skip_history <= 0:
+            if skip_history_pool <= 0:
                 history_pool_workers = pl.min(active_pool_blocks, history_pool_worker_cap)
                 with pl.spmd(history_pool_workers, name_hint="prefill_c4_softmax_pool", deps=[current_pool_tid]) as history_pool_tid:
                     pool_worker = pl.tile.get_block_idx()
@@ -500,9 +501,9 @@ def compressor_ratio4(
     pooled_kv, state_written = _compressor_prepare_state(
         x, compress_state, compress_state_block_table, wkv, wgate, ape,
         position_ids, num_tokens, write_pos_map, write_dst_map, state_slot_mapping, state_done,
-        compress_state, 0,
-        pl.cast(16, pl.INT32), True,
-        1, 0,
+        next_state=compress_state, forward_rows=0,
+        history_pool_worker_cap=pl.cast(16, pl.INT32), emit_pool=True,
+        compute_output=1, skip_history_pool=0,
     )
     cache_rows = pl.tensor.dim(cmp_kv, 0) * CMP_STORAGE_BLOCK_SIZE
     with pl.spmd(1, name_hint="prefill_c4_rmsnorm_rope_cache_write") as cache_write_tid:

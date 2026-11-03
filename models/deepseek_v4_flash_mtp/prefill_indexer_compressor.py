@@ -156,9 +156,10 @@ def _prefill_indexer_compressor_prepare(
     write_dst_map: pl.Tensor[[1, MAX_CMP_WRITES], pl.INT32],
     history_pool_completion: pl.Array[1, pl.TASK_ID],
     history_pool_worker_cap: pl.Scalar[pl.INT32],
-    emit_output_tasks: pl.Scalar[pl.INT32],
-    skip_history: pl.Scalar[pl.INT32],
+    compute_output: pl.Scalar[pl.INT32],
+    skip_history_pool: pl.Scalar[pl.INT32],
 ):
+    """Project and optionally pool, rotate, and quantize an indexer leaf."""
     state_block_num = pl.tensor.dim(compress_state, 0)
     kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
@@ -191,7 +192,7 @@ def _prefill_indexer_compressor_prepare(
     pool_workers = pl.min(active_pool_blocks, 12)
     current_pool_flags = pl.create_tensor([MAX_CMP_WRITES, 16], dtype=pl.INT32)
     history_pool_completion[0] = index_projection_tid
-    if emit_output_tasks > 0:
+    if compute_output > 0:
         with pl.spmd(pool_workers, name_hint="prefill_idx_c4_softmax_pool_current") as current_pool_tid:
             pool_worker = pl.tile.get_block_idx()
             for pool_idx in pl.range(pool_worker, active_pool_blocks, pl.max(pool_workers, 1)):
@@ -264,7 +265,7 @@ def _prefill_indexer_compressor_prepare(
                     pl.write(current_pool_flags, [write_i, 0], pl.cast(1, pl.INT32))
                     pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=0.0)
         history_pool_completion[0] = current_pool_tid
-        if skip_history <= 0:
+        if skip_history_pool <= 0:
             history_pool_workers = pl.min(active_pool_blocks, history_pool_worker_cap)
             with pl.spmd(history_pool_workers, name_hint="prefill_idx_c4_softmax_pool", deps=[current_pool_tid]) as history_pool_tid:
                 pool_worker = pl.tile.get_block_idx()
@@ -536,8 +537,8 @@ def _prefill_indexer_compressor_with_completion(
         x, compress_state, inner_compress_state_block_table,
         wkv, wgate, ape, norm_w, freqs_cos, freqs_sin, hadamard,
         position_ids, num_tokens, write_pos_map, write_dst_map, history_pool_completion,
-        pl.cast(16, pl.INT32),
-        1, 0,
+        history_pool_worker_cap=pl.cast(16, pl.INT32),
+        compute_output=1, skip_history_pool=0,
     )
     state_update_rows = pl.max(pl.cast(num_tokens, pl.INDEX), 0)
     state_update_tiles = (state_update_rows + 7) // 8

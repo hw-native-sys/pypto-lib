@@ -333,14 +333,7 @@ def hc_pre_norm(
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
     x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
-    """Prefill HC-pre with mix_x fused into the attention RMSNorm.
-
-    Each worker processes strided T_TILE-row tiles across all of D, with at
-    most sixteen workers instead of one block per token tile.
-    The square sum accumulates RMS_D_TILE chunks of the BF16-rounded mix in the
-    same order as ``rmsnorm.rms_norm``, so the result is bit-identical to
-    ``hc_pre`` followed by ``rms_norm``.
-    """
+    """Mix HC streams and RMS-normalize BF16-rounded rows in strided token tiles."""
     t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x, [t_dim, HC_DIM])

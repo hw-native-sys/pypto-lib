@@ -827,11 +827,12 @@ def prefill_attention_hca(
         dtype=pl.FP32,
     )
     scratch_state_flat = pl.reshape(scratch_state, [LOCAL_PARTS * state_rows, COMPRESS_STATE_DIM])
-    with pl.spmd(8, name_hint="cp_hca_init_state", allow_early_resolve=True) as state_init_done:
+    state_init_workers = 8
+    with pl.spmd(state_init_workers, name_hint="cp_hca_init_state", allow_early_resolve=True) as state_init_done:
         init_worker_id = pl.tile.get_block_idx()
         for part in pl.range(LOCAL_PARTS):
             segment = pl.read(owner_segments_t, [part])
-            for state_row in pl.range(init_worker_id, state_rows, 8):
+            for state_row in pl.range(init_worker_id, state_rows, state_init_workers):
                 destination = part * state_rows + state_row
                 scratch_state_flat[
                     destination : destination + 1, :
@@ -843,7 +844,7 @@ def prefill_attention_hca(
                         history_state_block = pl.read(compress_state_block_table, [history_position // HCA_STATE_BLOCK_SIZE])
                         history_state_row = history_state_block * HCA_STATE_BLOCK_SIZE + history_position % HCA_STATE_BLOCK_SIZE
                         # Each worker restores only the state rows it cleared.
-                        if history_state_block >= 0 and history_state_row < state_rows and history_state_row % 8 == init_worker_id:
+                        if history_state_block >= 0 and history_state_row < state_rows and history_state_row % state_init_workers == init_worker_id:
                             history_destination_row = part * state_rows + history_state_row
                             scratch_state_flat[history_destination_row:history_destination_row + 1, :] = history_state[row:row + 1, :]
 

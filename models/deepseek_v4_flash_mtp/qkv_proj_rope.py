@@ -1242,10 +1242,7 @@ def prefill_attention_prolog(
     """Shared HC mixing, attention normalization, and query projection."""
     rows = pl.tensor.dim(x_hc, 0)
     mixed = pl.create_tensor([rows, D], dtype=pl.BF16)
-    # hc_pre_norm folds mix_x into the attention RMSNorm: one block per T_TILE row tile
-    # across all of D, instead of (D // D_SPMD) mix_x blocks plus a separate rms_norm.
-    # It is bit-identical to hc_pre followed by rms_norm (see its docstring), and SWA
-    # has been on this path since step 4 -- HCA and CSA were still on the older one.
+    # Shared HC mixing and attention RMSNorm over strided token tiles.
     rms_tid = hc_pre_norm(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
                           mixed, post, comb, normed)
     rope_prepare_prefill(rope_cos, rope_sin, cos_il, sin_signed, swap_idx)
