@@ -26,10 +26,16 @@ __tf__ __aicore__ inline void decode_nz(
         MaskReg all16 = pset_b16(PAT_ALL);
         MaskReg all32 = pset_b32(PAT_ALL);
         RegTensor<uint32_t> group;
+        RegTensor<uint16_t> group16;
         RegTensor<float> zero;
         vdup(zero, 0.0f, all32, MODE_ZEROING);
         vci((vector_s32&)group, 0, INC_ORDER);
-        vshrs(group, group, (uint32_t)(FP4 ? 3 : 5), all32, MODE_ZEROING);
+        if constexpr (FP4) {
+            vci((vector_s16&)group16, 0, INC_ORDER);
+            vshrs(group16, group16, (uint16_t)4, all16, MODE_ZEROING);
+        } else {
+            vshrs(group, group, (uint32_t)5, all32, MODE_ZEROING);
+        }
         for (uint16_t row = 0; row < Output::Rows; ++row) {
             RegTensor<int32_t> index;
             MaskReg valid;
@@ -42,16 +48,14 @@ __tf__ __aicore__ inline void decode_nz(
                     vector_f4e2m1x2 raw;
                     vlds((RegTensor<uint8_t>&)raw, input, row * 256 + chunk * 64, UNPK4_B8);
                     vcvt(packed, raw, all8, PART_P0);
-                    vcvt(x0, packed, all16, PART_EVEN);
-                    vcvt(x1, packed, all16, PART_ODD);
-                    vgather2(s0, scale + row * 32 + chunk * 8, group, all32);
-                    vmul(x0, x0, s0, all32, MODE_ZEROING);
-                    vmul(x1, x1, s0, all32, MODE_ZEROING);
-                    vsel(x0, x0, zero, valid);
-                    vsel(x1, x1, zero, valid);
-                    vcvt(b0, x0, all32, ROUND_R, RS_DISABLE, PART_EVEN);
-                    vcvt(b1, x1, all32, ROUND_R, RS_DISABLE, PART_ODD);
-                    vor(packed, b0, b1, all16);
+                    RegTensor<bfloat16_t> scale16;
+                    vgather2((RegTensor<uint16_t>&)scale16,
+                             (__ubuf__ uint16_t*)scale + row * 32 + chunk * 8, group16, all16);
+                    vmul((vector_bf16&)packed, (vector_bf16&)packed, (vector_bf16&)scale16,
+                         all16, MODE_ZEROING);
+                    // Each int32 predicate lane selects both adjacent BF16 values.
+                    vsel((RegTensor<uint32_t>&)packed, (RegTensor<uint32_t>&)packed,
+                         (RegTensor<uint32_t>&)zero, valid);
                 } else {
                     vector_f8e4m3 raw0, raw1;
                     vlds((RegTensor<uint8_t>&)raw0, input, row * 512 + chunk * 128, UNPK4_B8);

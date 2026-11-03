@@ -38,7 +38,7 @@ from compressor import STATE_WIDTH, c2a_compressor_project, c2a_compressor_publi
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import (
     retire_prefill_signals,
-    golden_o_proj, prefill_sp_output_reduce_scatter, o_proj,
+    golden_o_proj, prefill_sp_output_reduce_scatter,
 )
 from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes, prefill_sp_post
 from rmsnorm import golden_rms_norm, rms_norm_tiled
@@ -48,10 +48,7 @@ from quant import dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import paged_slots, token_shards, window_metadata
-from sparse_attention import (
-    PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk,
-    prefill_attend_sparse,
-)
+from sparse_attention import _attend_project
 from prefill_indexer import prefill_indexer, publish_c2a_index_key
 
 # model config
@@ -180,24 +177,12 @@ def prefill_c2a_full_attention(
         topk_indices, compressed_lens, topk_indices, num_tokens, index_publish_tid, pool=False, c2a=True,
     )
 
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
-    combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
-    chunk_done = pl.system.task_dummy(deps=[select_tid, window_publish_tid, compressed_publish_tid])
-    for start in pl.range(0, num_tokens, QUERY_TILE):
-        active = pl.min(QUERY_TILE, num_tokens - start)
-        gather_tid = gather_packed_chunk(
-            window_cache, window_cache_scale, window_indices, compressed_cache,
-            compressed_cache_scale, topk_indices, selected, combined, start, active, chunk_done,
-        )
-        chunk_done = prefill_attend_sparse(
-            query, selected, combined, attn_sink, attended, start, active, gather_tid, name_hint="c2a_sparse_attn",
-        )
-
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b,
-        wo_b_scale, rope_cos, rope_sin,
-        partial, num_tokens,
+    source_ready = pl.system.task_dummy(deps=[select_tid, window_publish_tid, compressed_publish_tid])
+    _attend_project(
+        query, window_indices, window_cache, window_cache_scale,
+        topk_indices, compressed_cache, compressed_cache_scale, attn_sink,
+        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial,
+        num_tokens, source_ready, compressed_keys=INDEX_TOPK,
     )
     return partial
 

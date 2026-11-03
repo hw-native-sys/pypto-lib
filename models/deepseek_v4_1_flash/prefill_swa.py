@@ -16,8 +16,7 @@ import torch
 from utils import token_shards
 from golden import mapped_pool_ratio_allclose
 from sparse_attention import (
-    SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
-    analyze_index_runs, attend_shared_cache, decode_shared_cache_after_publish,
+    _attend_window_project,
     swa_official_reference as golden_reference,
     make_swa_inputs as make_inputs, make_packed_swa_inputs as make_packed_inputs,
 )
@@ -30,7 +29,7 @@ from hc import golden_hc_post, prefill_sp_post
 from hc import golden_hc_collapse, hc_pre, zero_bf16_padding
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from o_proj import retire_prefill_signals, o_proj, prefill_sp_output_reduce_scatter
+from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter
 from prefill_cp_allgather import make_prefill_sp_input_allgather
 
 
@@ -105,22 +104,12 @@ def prefill_swa_attention(
         window_slots, window_cache, window_cache_scale,
         num_tokens, cache_ready,
     )
-    cache_blocks = pl.tensor.dim(window_cache, 0)
-    cache_rows = cache_blocks * 128
-    decoded_cache = pl.create_tensor([cache_blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
-    zero_row = pl.create_tensor([32, HEAD_DIM], dtype=pl.BF16)
-    # Decode once for the entire packed prompt. The explicit publication
-    # dependency protects the hoisted reader independently of query staging.
-    decoded_ready = decode_shared_cache_after_publish(window_cache, window_cache_scale, decoded_cache, zero_row, chunk_done)
-
     chunk_x = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
     chunk_cos = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
     chunk_sin = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
     chunk_indices = pl.create_tensor([QUERY_TILE, 128], dtype=pl.INT32)
     qr = pl.create_tensor([QUERY_TILE, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    descriptors = pl.create_tensor([QUERY_TILE, RUN_PARTS, RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
-    attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
 
     for start in pl.range(0, num_tokens, QUERY_TILE):
@@ -144,16 +133,10 @@ def prefill_swa_attention(
             qr, q,
             active,
         )
-        index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
-        attend_shared_cache(
-            q, decoded_cache, zero_row,
-            descriptors, chunk_indices, attn_sink,
-            attended, active, decoded_ready, index_ready,
-        )
-        o_proj(
-            attended, wo_a, wo_a_scale, wo_b,
-            wo_b_scale, chunk_cos, chunk_sin,
-            chunk_partial, active,
+        _attend_window_project(
+            q, chunk_indices, window_cache, window_cache_scale, attn_sink,
+            wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial,
+            active, stage_tid,
         )
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
@@ -527,7 +510,7 @@ def reference_attention(tensors, hidden, base):
         partial = torch.zeros_like(hidden, dtype=torch.float32)
         cache, scale = inputs["window_cache"].clone(), inputs["window_cache_scale"].clone()
         if active:
-            active_partial, cache, scale = golden_reference(inputs, shared_cache=True)
+            active_partial, cache, scale = golden_reference(inputs, shared_cache=LOCAL_H != 64)
             partial[:active].copy_(active_partial)
         partials.append(partial)
         caches.append((cache, scale))

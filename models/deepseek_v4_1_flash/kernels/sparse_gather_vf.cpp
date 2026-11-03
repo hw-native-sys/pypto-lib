@@ -8,10 +8,10 @@
 // -----------------------------------------------------------------------------------------------------------
 // Packed-cache gather, direct-L1 KV reuse, and sink-aware sparse attention.
 #include <cstdint>
-#include <type_traits>
 #if defined(__CPU_SIM)
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <vector>
 #endif
@@ -20,6 +20,9 @@
 #include "intrinsic.h"
 #include "sparse_dequant_vf.hpp"
 #include "sparse_softmax_vf.hpp"
+#if defined(SPARSE_FUSED_O)
+#include "o_rope_quant_vf.hpp"
+#endif
 
 using namespace pto;
 
@@ -103,52 +106,33 @@ __aicore__ inline void load_rows(
 #endif
 
 
-#if !defined(__CPU_SIM)
-// Consume explicit startup credits on older local split pipes: PTO-ISA issue 390.
-// https://github.com/hw-native-sys/pto-isa/issues/390
-template <typename Pipe, typename = void>
-struct HasLocalCreditMethod : std::false_type {};
-
-template <typename Pipe>
-struct HasLocalCreditMethod<Pipe, std::void_t<decltype(Pipe::usesLocalNoSplitProtocol())>> : std::true_type {};
-
-template <typename Pipe, typename = void>
-struct HasLocalCreditFlag : std::false_type {};
-
-template <typename Pipe>
-struct HasLocalCreditFlag<Pipe, std::void_t<decltype(Pipe::uses_local_no_split_credit_protocol)>> : std::true_type {};
-
-template <typename Pipe>
-__aicore__ inline bool wait_for_local_credit(uint32_t tile_index) {
-    if constexpr (HasLocalCreditMethod<Pipe>::value) {
-        if (!Pipe::usesLocalNoSplitProtocol()) return true;
-    } else if constexpr (HasLocalCreditFlag<Pipe>::value) {
-        if (!Pipe::uses_local_no_split_credit_protocol) return true;
-    }
-    return Pipe::shouldWaitFree(tile_index);
-}
-
-struct AttentionPipe : TPipe<0, Direction::DIR_BOTH, 65536, 1, 2, false> {
-    using Base = TPipe<0, Direction::DIR_BOTH, 65536, 1, 2, false>;
-    using Base::Base;
-
-    __aicore__ inline static bool shouldWaitFree(uint32_t tile_index) {
-        return wait_for_local_credit<Base>(tile_index);
-    }
-};
+#if defined(SPARSE_FUSED_O)
+constexpr int ARG_TOKENS = 12;
+#else
+constexpr int ARG_TOKENS = 9;
 #endif
+constexpr int ARG_HEADS = ARG_TOKENS + 1;
+constexpr int ARG_WINDOW_KEYS = ARG_TOKENS + 2;
+constexpr int ARG_COMPRESSED_KEYS = ARG_TOKENS + 3;
 constexpr int DIM = 512;
-constexpr int PIPE_BYTES = 65536;
+// L1: P ring [0,32 KiB), Q [64,128 KiB), KV ring [128,512 KiB).
 constexpr int QUERY_L1 = 65536;
 constexpr int KV_L1 = 131072;
 constexpr int MAXIMUM_UB = 205056;
 constexpr int DENOMINATOR_UB = 205184;
 constexpr int NUMERATOR_UB = 131072;
-constexpr int WORK_UB = 65536;
-constexpr int REDUCE_UB = 81920;
 constexpr int NEXT_MAX_UB = 205312;
 constexpr int CORRECTION_UB = 205440;
-constexpr int ROW_SUM_UB = 205568;
+// UB: gather [0,64 KiB), PV [64,128 KiB), numerator [128,192 KiB).
+// Score occupies [216,232 KiB); state, P and IDs occupy the intervening region.
+constexpr int SCORE_UB = 221184;
+constexpr int QUERY_STATE_STRIDE = 1024;
+constexpr int CORRECTION_STRIDE = 256;
+constexpr int KV_SLOTS = 3;
+// Intra-block pairs: score 0/1, PV 2/3, P slots 4/5 and 6/7,
+// KV slots 8/9, 10/11 and 12/13. Cube uses both AIV flag banks.
+constexpr int FINISH_READY = 14;
+constexpr int FINISH_ACK = 15;
 
 template <int R, int C>
 using Mat = Tile<TileType::Mat, bfloat16_t, R, C, BLayout::ColMajor, R, C, SLayout::RowMajor>;
@@ -167,31 +151,108 @@ __aicore__ inline int64_t row_stride(__gm__ int64_t* args, int index) {
     return reinterpret_cast<__gm__ Tensor*>(args[index])->strides[0];
 }
 
+#if defined(SPARSE_FUSED_O) && defined(__DAV_VEC__) && !defined(__CPU_SIM)
+// The rounded attention occupies [128,160 KiB); quantization reuses the
+// retired upper half of its FP32 numerator after the conversion completes.
+constexpr int O_PAYLOAD_UB = 163840;
+constexpr int O_SCALES_UB = 180224;
+constexpr int O_COS_UB = 188416;
+constexpr int O_SIN_UB = 188544;
+
+template <int H>
+__aicore__ inline void store_quantized_query(__gm__ int64_t* args, int token) {
+    using DynamicStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
+    for (int shard = 0; shard < H / 8; ++shard) {
+        const int group = get_sub_block_id(args) * (H / 8) + shard;
+        Vec<float8_e4m3_t, 1, 4096> payload;
+        TASSIGN(payload, O_PAYLOAD_UB + shard * 4096);
+        GM<float8_e4m3_t, 1, 4096> payload_gm(
+            data<float8_e4m3_t>(args, 0) + (group * 80 + token) * row_stride(args, 0));
+        TSTORE(payload_gm, payload);
+
+        // Each 64D pair writes only its two bytes in MX_A_ZZ. Adjacent queries
+        // own the other bytes of the same 32-byte destination row.
+        Tile<TileType::Vec, uint8_t, 64, 32, BLayout::RowMajor, 64, DYNAMIC> scales(2);
+        TASSIGN(scales, O_SCALES_UB + shard * 64 * 32);
+        using ScaleShape = TileShape2D<uint8_t, 64, DYNAMIC>;
+        GlobalTensor<uint8_t, ScaleShape, DynamicStride> scale_gm(
+            data<uint8_t>(args, 11) + group * row_stride(args, 11)
+                + (token / 16) * 2048 + (token % 16) * 2,
+            ScaleShape(64, 2), DynamicStride(1, 1, 1, 32, 1));
+        TSTORE(scale_gm, scales);
+    }
+}
+
+template <int H>
+__aicore__ inline void quantize_query(__gm__ int64_t* args, int token) {
+    Vec<bfloat16_t, H, DIM> attended;
+    Vec<float8_e4m3_t, H, DIM> payload;
+    Vec<uint8_t, H * 8, 32> scales;
+    Vec<float, 1, 32> cosine, sine;
+    TASSIGN(attended, NUMERATOR_UB);
+    TASSIGN(payload, O_PAYLOAD_UB);
+    TASSIGN(scales, O_SCALES_UB);
+    TASSIGN(cosine, O_COS_UB);
+    TASSIGN(sine, O_SIN_UB);
+    // Wait until TCVT has finished reading the FP32 numerator before reusing
+    // its upper half for trig, payload, and aligned scale-pair staging.
+    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
+    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
+    GM<float, 1, 32> cos_gm(data<float>(args, 9) + token * row_stride(args, 9));
+    GM<float, 1, 32> sin_gm(data<float>(args, 10) + token * row_stride(args, 10));
+    TLOAD(cosine, cos_gm);
+    TLOAD(sine, sin_gm);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
+    o_quant::rope_quant_vf<0, 128, decltype(payload), decltype(scales), decltype(attended), decltype(cosine)>(
+        payload.data(), scales.data(), attended.data(), cosine.data(), sine.data(), H);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+    store_quantized_query<H>(args, token);
+}
+
+template <int H>
+__aicore__ inline void zero_quantized_padding(__gm__ int64_t* args) {
+    const int first = args[ARG_TOKENS] + get_block_idx(args);
+    if (first >= 80) return;
+    Vec<uint8_t, H, DIM> payload;
+    Vec<uint8_t, H * 8, 32> scales;
+    TASSIGN(payload, O_PAYLOAD_UB);
+    TASSIGN(scales, O_SCALES_UB);
+    TEXPANDS(payload, uint8_t(0));
+    TEXPANDS(scales, uint8_t(0));
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+    for (int token = first; token < 80; token += get_block_num(args)) {
+        store_quantized_query<H>(args, token);
+    }
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+}
+#endif
+
 #if defined(__DAV_VEC__) && !defined(__CPU_SIM)
-template <int Slot>
+template <int Slot, bool WaitInput = true>
 __aicore__ inline void gather_fp4_subtile(
     __gm__ int64_t* args, int index_offset, int destination_row, Mat<128, DIM>& kv) {
     constexpr int payload_address = Slot * 8192;
     constexpr int scale_address = 16384 + Slot * 1024;
-    constexpr int factor_address = 18432 + Slot * 2048;
     int id_address = 24576 + index_offset * sizeof(int32_t);
     constexpr int nz_address = 32768 + Slot * 16384;
     Vec<int32_t, 1, 16> ids;
     Vec<float4_e2m1x2_t, 16, DIM> payload;
     Vec<bfloat16_t, 16, 32> scales;
-    Vec<float, 16, 32> factors;
     Tile<TileType::Vec, bfloat16_t, 16, DIM, BLayout::ColMajor, 16, DIM, SLayout::RowMajor> nz;
     TASSIGN(ids, id_address);
     TASSIGN(payload, payload_address);
     TASSIGN(scales, scale_address);
-    TASSIGN(factors, factor_address);
     TASSIGN(nz, nz_address);
     auto payload_base = data<uint8_t>(args, 5);
     auto scale_base = data<bfloat16_t>(args, 6);
 
     // Payload/scales are reusable after VF consumes this slot. The 64
     // indices remain immutable throughout the gather; NZ has its own credit.
-    wait_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(5 + Slot));
+    if constexpr (WaitInput) wait_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(5 + Slot));
     for (int row = 0; row < 16; row += 2) {
         int first = ids.GetValue(row);
         int second = ids.GetValue(row + 1);
@@ -230,10 +291,9 @@ __aicore__ inline void gather_fp4_subtile(
     }
     set_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(5 + Slot));
     wait_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(5 + Slot));
-    TCVT(factors, scales, RoundMode::CAST_RINT);
     wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(5 + Slot));
-    sparse_dequant::decode_nz<true, decltype(nz), decltype(payload), decltype(factors), decltype(ids)>(
-        nz.data(), payload.data(), factors.data(), ids.data());
+    sparse_dequant::decode_nz<true, decltype(nz), decltype(payload), decltype(scales), decltype(ids)>(
+        nz.data(), payload.data(), scales.data(), ids.data());
     set_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(5 + Slot));
     set_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(5 + Slot));
     wait_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(5 + Slot));
@@ -241,15 +301,37 @@ __aicore__ inline void gather_fp4_subtile(
     set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(5 + Slot));
 }
 
-__aicore__ inline void gather_part(__gm__ int64_t* args, int token, int part, int lane, int ordinal) {
-    if (part * 128 >= args[11]) {
+__aicore__ inline void drain_fp4_slots(bool& active) {
+    if (active) {
+        // FP8 aliases both FP4 input and NZ slots. Consume all outstanding
+        // reader/copy credits before changing formats or retiring the kernel.
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID5);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID6);
+        active = false;
+    }
+}
+
+__aicore__ inline void gather_part(
+    __gm__ int64_t* args, int token, int part, int lane, int ordinal, bool& fp4_active) {
+    wait_intra_block(PIPE_MTE3, 9 + 2 * (ordinal % KV_SLOTS));
+    if (part * 128 >= args[ARG_WINDOW_KEYS]) {
         Mat<128, DIM> kv;
-        TASSIGN(kv, KV_L1 + (ordinal % 2) * 131072);
-        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
-        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
-        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID5);
-        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID6);
-        int source_column = part * 128 + lane * 64 - args[11];
+        TASSIGN(kv, KV_L1 + (ordinal % KV_SLOTS) * 131072);
+        if (!fp4_active) {
+            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
+            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID5);
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID6);
+            fp4_active = true;
+        }
+        // Both final VFs read the shared 64-ID array. Acquire their input
+        // credits before replacing IDs, then reuse those acquisitions for
+        // this part's first payload load in each slot.
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
+        int source_column = part * 128 + lane * 64 - args[ARG_WINDOW_KEYS];
         Vec<int32_t, 1, 64> all_ids;
         TASSIGN(all_ids, 24576);
         GM<int32_t, 1, 64> source_ids(
@@ -257,34 +339,32 @@ __aicore__ inline void gather_part(__gm__ int64_t* args, int token, int part, in
         TLOAD(all_ids, source_ids);
         set_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
         wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
-        gather_fp4_subtile<0>(args, 0, lane * 64, kv);
-        gather_fp4_subtile<1>(args, 16, lane * 64 + 16, kv);
+        gather_fp4_subtile<0, false>(args, 0, lane * 64, kv);
+        gather_fp4_subtile<1, false>(args, 16, lane * 64 + 16, kv);
         gather_fp4_subtile<0>(args, 32, lane * 64 + 32, kv);
         gather_fp4_subtile<1>(args, 48, lane * 64 + 48, kv);
-        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
-        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
-        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID5);
-        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID6);
-        set_intra_block(PIPE_MTE3, 8);
+        // Keep NZ copy credits live: following softmax does not touch NZ.
+        set_intra_block(PIPE_MTE3, 8 + 2 * (ordinal % KV_SLOTS));
         return;
     }
+    drain_fp4_slots(fp4_active);
     Vec<int32_t, 1, 32> ids;
     Tile<TileType::Vec, bfloat16_t, 32, DIM, BLayout::ColMajor, 32, DIM, SLayout::RowMajor> nz;
     Mat<128, DIM> kv;
     TASSIGN(ids, 28672);
     TASSIGN(nz, 32768);
-    TASSIGN(kv, KV_L1 + (ordinal % 2) * 131072);
+    TASSIGN(kv, KV_L1 + (ordinal % KV_SLOTS) * 131072);
     for (int sub = 0; sub < 2; ++sub) {
         int column = part * 128 + lane * 64 + sub * 32;
-        int source = column < args[11] ? 7 : 8;
-        int source_column = column < args[11] ? column : column - args[11];
+        int source = column < args[ARG_WINDOW_KEYS] ? 7 : 8;
+        int source_column = column < args[ARG_WINDOW_KEYS] ? column : column - args[ARG_WINDOW_KEYS];
         GM<int32_t, 1, 32> source_ids(
             data<int32_t>(args, source) + token * row_stride(args, source) + source_column);
         TLOAD(ids, source_ids);
         set_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
         wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
 
-        if (column < args[11]) {
+        if (column < args[ARG_WINDOW_KEYS]) {
             Vec<float8_e4m3_t, 32, DIM> payload;
             Vec<bfloat16_t, 32, 16> scales;
             Vec<float, 32, 16> factors;
@@ -299,14 +379,11 @@ __aicore__ inline void gather_part(__gm__ int64_t* args, int token, int part, in
         } else {
             Vec<float4_e2m1x2_t, 32, DIM> payload;
             Vec<bfloat16_t, 32, 32> scales;
-            Vec<float, 32, 32> factors;
             TASSIGN(payload, 0);
             TASSIGN(scales, 16384);
-            TASSIGN(factors, 24576);
             load_rows<EVENT_ID7, uint8_t, 256, 32>(data<uint8_t>(args, 5), data<bfloat16_t>(args, 6), ids);
-            TCVT(factors, scales, RoundMode::CAST_RINT);
-            sparse_dequant::decode_nz<true, decltype(nz), decltype(payload), decltype(factors), decltype(ids)>(
-                nz.data(), payload.data(), factors.data(), ids.data());
+            sparse_dequant::decode_nz<true, decltype(nz), decltype(payload), decltype(scales), decltype(ids)>(
+                nz.data(), payload.data(), scales.data(), ids.data());
         }
 
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID7);
@@ -315,307 +392,402 @@ __aicore__ inline void gather_part(__gm__ int64_t* args, int token, int part, in
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID7);
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID7);
     }
-    set_intra_block(PIPE_MTE3, 8);
+    set_intra_block(PIPE_MTE3, 8 + 2 * (ordinal % KV_SLOTS));
 }
 #endif
 
 #if defined(__DAV_CUBE__) && !defined(__CPU_SIM)
+template <pipe_t Pipe>
+__aicore__ inline void signal_vectors(int flag) {
+    set_intra_block(Pipe, flag);
+    set_intra_block(Pipe, flag + 16);
+}
+
+template <pipe_t Pipe>
+__aicore__ inline void wait_vectors(int flag) {
+    wait_intra_block(Pipe, flag);
+    wait_intra_block(Pipe, flag + 16);
+}
+
+template <int H, int K, typename Query>
+__aicore__ inline void compute_qk(Query& query, int ordinal) {
+    constexpr int QK_STEP = 128;
+    constexpr int QK_END = DIM;
+    constexpr int LEFT_SECOND = H * QK_STEP * 2;
+    TransposedMat<DIM, K> key;
+    Acc<H, K> scores;
+    TASSIGN(key, KV_L1 + (ordinal % KV_SLOTS) * 131072);
+    // Score and PV have independent L0C ownership through their FIXPIPE copies.
+    TASSIGN(scores, 131072);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    wait_vectors<PIPE_MTE1>(8 + 2 * (ordinal % KV_SLOTS));
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    for (int offset = 0; offset < QK_END; offset += 2 * QK_STEP) {
+        Left<H, QK_STEP> q0, q1;
+        Right<QK_STEP, K> k0, k1;
+        TASSIGN(q0, LEFT_SECOND);
+        TASSIGN(q1, 0);
+        TASSIGN(k0, 0);
+        TASSIGN(k1, 32768);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+        pipe_barrier(PIPE_MTE1);
+        TEXTRACT(q0, query, 0, offset);
+        TEXTRACT(k0, key, offset, 0);
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+        TEXTRACT(q1, query, 0, offset + QK_STEP);
+        TEXTRACT(k1, key, offset + QK_STEP, 0);
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+        pipe_barrier(PIPE_M);
+        if (offset == 0) TMATMUL(scores, q0, k0);
+        else TMATMUL_ACC(scores, scores, q0, k0);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+        pipe_barrier(PIPE_M);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+        TMATMUL_ACC(scores, scores, q1, k1);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+    }
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+    wait_vectors<PIPE_FIX>(1);
+    Vec<float, H / 2, K> received;
+    TASSIGN(received, SCORE_UB);
+    TMOV<decltype(received), decltype(scores), AccToVecMode::DualModeSplitM>(received, scores);
+    signal_vectors<PIPE_FIX>(0);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+}
+
+template <int H, int K>
+__aicore__ inline void compute_pv(int ordinal) {
+    Mat<K, DIM> kv;
+    Mat<H, K> weights;
+    Acc<H, DIM> weighted;
+    TASSIGN(kv, KV_L1 + (ordinal % KV_SLOTS) * 131072);
+    TASSIGN(weights, (ordinal % 2) * H * K * sizeof(bfloat16_t));
+    TASSIGN(weighted, 0);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    wait_vectors<PIPE_MTE1>(4 + 2 * (ordinal % 2));
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+    Left<H, K> p;
+    TASSIGN(p, 0);
+    TEXTRACT(p, weights, 0, 0);
+    signal_vectors<PIPE_MTE1>(5 + 2 * (ordinal % 2));
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+    for (int offset = 0; offset < DIM; offset += 256) {
+        Right<K, 128> v0, v1;
+        Acc<H, 128> out0, out1;
+        TASSIGN(v0, 0);
+        TASSIGN(v1, 32768);
+        TASSIGN(out0, offset * H * sizeof(float));
+        TASSIGN(out1, (offset + 128) * H * sizeof(float));
+        pipe_barrier(PIPE_MTE1);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
+        TEXTRACT(v0, kv, 0, offset);
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID6);
+        TEXTRACT(v1, kv, 0, offset + 128);
+        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+        pipe_barrier(PIPE_M);
+        TMATMUL(out0, p, v0);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
+        pipe_barrier(PIPE_M);
+        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
+        TMATMUL(out1, p, v1);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID6);
+    }
+    // KV remains live through the final PV L1 read, including both AIV halves.
+    signal_vectors<PIPE_MTE1>(9 + 2 * (ordinal % KV_SLOTS));
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
+    wait_vectors<PIPE_FIX>(3);
+    Vec<float, H / 2, DIM> received;
+    TASSIGN(received, 65536);
+    TMOV<decltype(received), decltype(weighted), AccToVecMode::DualModeSplitM>(received, weighted);
+    signal_vectors<PIPE_FIX>(2);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+}
+
 template <int H, int K>
 __aicore__ inline void attend_cube(__gm__ int64_t* args) {
-    constexpr int QK_STEP = K == 320 ? 48 : 128;
-    constexpr int QK_END = DIM / (2 * QK_STEP) * (2 * QK_STEP);
-    constexpr int LEFT_SECOND = H * QK_STEP * 2;
-    AttentionPipe pipe(nullptr, 65536, 0);
+    const int workers = get_block_num(args);
+    const int block = get_block_idx(args);
+    if (block >= args[ARG_TOKENS]) return;
+    const int queries = (args[ARG_TOKENS] - block + workers - 1) / workers;
+    const int parts = (args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS]) / K;
+    const int tiles = queries * parts;
+    if (tiles == 0) return;
+    const int valid_heads = args[ARG_HEADS] < H ? args[ARG_HEADS] : H;
+    Tile<TileType::Mat, bfloat16_t, H, DIM, BLayout::ColMajor,
+         DYNAMIC, DIM, SLayout::RowMajor, 512, PadValue::Zero> query(valid_heads);
+    TASSIGN(query, QUERY_L1);
     set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
-
     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
     set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
     set_flag(PIPE_M, PIPE_MTE1, EVENT_ID6);
-    int heads = args[10];
-    int valid_heads = heads < H ? heads : H;
-    int parts = (args[11] + args[12]) / K;
-    int tile_base = 0;
-    for (int token = get_block_idx(args); token < args[9]; token += get_block_num(args), tile_base += parts) {
-        for (int head = 0; head < heads; head += H) {
-            Tile<TileType::Mat, bfloat16_t, H, DIM, BLayout::ColMajor,
-                 DYNAMIC, DIM, SLayout::RowMajor, 512, PadValue::Zero> query(valid_heads);
-            TASSIGN(query, QUERY_L1);
-            using QueryShape = TileShape2D<bfloat16_t, DYNAMIC, DIM>;
-            GlobalTensor<bfloat16_t, QueryShape, BaseShape2D<bfloat16_t, H, DIM>> query_gm(
-                data<bfloat16_t>(args, 1) + token * row_stride(args, 1) + head * DIM,
-                QueryShape(valid_heads, DIM));
-            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
-            TLOAD(query, query_gm);
-            set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-            for (int part = 0; part < (args[11] + args[12]) / K; ++part) {
-                Mat<K, DIM> kv;
-                TransposedMat<DIM, K> key;
-                Acc<H, K> scores;
-                TASSIGN(kv, KV_L1 + ((tile_base + part) % 2) * 131072);
-                TASSIGN(key, KV_L1 + ((tile_base + part) % 2) * 131072);
-                TASSIGN(scores, 0);
-                wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-                wait_intra_block(PIPE_MTE1, 8);
-                wait_intra_block(PIPE_MTE1, 24);
-                wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-                for (int offset = 0; offset < QK_END; offset += 2 * QK_STEP) {
-                    Left<H, QK_STEP> q0, q1;
-                    Right<QK_STEP, K> k0, k1;
-                    TASSIGN(q0, LEFT_SECOND);
-                    TASSIGN(q1, 0);
-                    TASSIGN(k0, 0);
-                    TASSIGN(k1, 32768);
-                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-                    pipe_barrier(PIPE_MTE1);
-                    TEXTRACT(q0, query, 0, offset);
-                    TEXTRACT(k0, key, offset, 0);
-                    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
-                    TEXTRACT(q1, query, 0, offset + QK_STEP);
-                    TEXTRACT(k1, key, offset + QK_STEP, 0);
-                    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
-                    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-                    pipe_barrier(PIPE_M);
-                    if (offset == 0) TMATMUL(scores, q0, k0);
-                    else TMATMUL_ACC(scores, scores, q0, k0);
-                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-                    pipe_barrier(PIPE_M);
-                    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
-                    TMATMUL_ACC(scores, scores, q1, k1);
-                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
-                }
-                if constexpr (QK_END < DIM) {
-                    Left<H, DIM - QK_END> qtail;
-                    Right<DIM - QK_END, K> ktail;
-                    TASSIGN(qtail, LEFT_SECOND);
-                    TASSIGN(ktail, 0);
-                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
-                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID3);
-                    pipe_barrier(PIPE_MTE1);
-                    TEXTRACT(qtail, query, 0, QK_END);
-                    TEXTRACT(ktail, key, QK_END, 0);
-                    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
-                    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID2);
-                    pipe_barrier(PIPE_M);
-                    TMATMUL_ACC(scores, scores, qtail, ktail);
-                }
-                set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-                set_flag(PIPE_M, PIPE_MTE1, EVENT_ID4);
-                wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-                TPUSH<AttentionPipe, Acc<H, K>, TileSplitAxis::TILE_UP_DOWN>(pipe, scores);
-                set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
-                Mat<H, K> weights;
-                Acc<H, DIM> weighted;
-                TASSIGN(weighted, 0);
-                TPOP<AttentionPipe, Mat<H, K>, TileSplitAxis::TILE_UP_DOWN>(pipe, weights);
-                wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID4);
-                wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
-                Left<H, K> p;
-                TASSIGN(p, 0);
-                TEXTRACT(p, weights, 0, 0);
-                set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
-                wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
-                for (int offset = 0; offset < DIM; offset += 256) {
-                    Right<K, 128> v0, v1;
-                    Acc<H, 128> out0, out1;
-                    TASSIGN(v0, 0);
-                    TASSIGN(v1, 32768);
-                    TASSIGN(out0, offset * H * sizeof(float));
-                    TASSIGN(out1, (offset + 128) * H * sizeof(float));
-                    pipe_barrier(PIPE_MTE1);
-                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
-                    TEXTRACT(v0, kv, 0, offset);
-                    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
-                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID6);
-                    TEXTRACT(v1, kv, 0, offset + 128);
-                    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
-                    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
-                    pipe_barrier(PIPE_M);
-                    TMATMUL(out0, p, v0);
-                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
-                    pipe_barrier(PIPE_M);
-                    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID4);
-                    TMATMUL(out1, p, v1);
-                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID6);
-                }
-                set_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
-                set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-
-                TFREE<AttentionPipe, TileSplitAxis::TILE_UP_DOWN>(pipe);
-                set_intra_block(PIPE_MTE1, 9);
-                set_intra_block(PIPE_MTE1, 25);
-                wait_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
-                TPUSH<AttentionPipe, Acc<H, DIM>, TileSplitAxis::TILE_UP_DOWN>(pipe, weighted);
-                set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    signal_vectors<PIPE_MTE1>(5);
+    signal_vectors<PIPE_MTE1>(7);
+    for (int slot = 0; slot < KV_SLOTS; ++slot) signal_vectors<PIPE_MTE1>(9 + 2 * slot);
+    // Cube issues QK(i) then PV(i-1); Vector advances softmax on its own pipe.
+    for (int ordinal = 0; ordinal <= tiles; ++ordinal) {
+        if (ordinal < tiles) {
+            const int part = ordinal % parts;
+            if (part == 0) {
+                const int token = block + (ordinal / parts) * workers;
+                using QueryShape = TileShape2D<bfloat16_t, DYNAMIC, DIM>;
+                GlobalTensor<bfloat16_t, QueryShape, BaseShape2D<bfloat16_t, H, DIM>> query_gm(
+                    data<bfloat16_t>(args, 1) + token * row_stride(args, 1), QueryShape(valid_heads, DIM));
+                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+                TLOAD(query, query_gm);
+                set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
             }
-            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+            compute_qk<H, K>(query, ordinal);
+            if (part + 1 == parts) set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
         }
+        if (ordinal > 0) compute_pv<H, K>(ordinal - 1);
     }
     wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
-
     wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
     wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
     wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
     wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID5);
     wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID6);
+    wait_vectors<PIPE_FIX>(1);
+    wait_vectors<PIPE_FIX>(3);
+    wait_vectors<PIPE_MTE1>(FINISH_ACK);
     pipe_barrier(PIPE_ALL);
+    signal_vectors<PIPE_FIX>(FINISH_READY);
 }
 #endif
 
 #if defined(__DAV_VEC__) && !defined(__CPU_SIM)
 template <int H, int K>
-__aicore__ inline void attend_vector(__gm__ int64_t* args) {
-    AttentionPipe pipe(nullptr, 65536, 0);
-    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+__aicore__ inline void update_softmax(__gm__ int64_t* args, int token, int part, int ordinal, int query_slot) {
+    Vec<float, H, K> qk;
+    Vec<int32_t, 1, K> ids;
+    Vec<float, 1, H> maximum, denominator, next_max, correction;
+    Tile<TileType::Vec, bfloat16_t, H, K, BLayout::ColMajor, H, K, SLayout::RowMajor> weights;
+    Mat<2 * H, K> weights_l1;
+    TASSIGN(qk, SCORE_UB);
+    TASSIGN(ids, 217088);
+    TASSIGN(maximum, MAXIMUM_UB + query_slot * QUERY_STATE_STRIDE);
+    TASSIGN(denominator, DENOMINATOR_UB + query_slot * QUERY_STATE_STRIDE);
+    TASSIGN(next_max, NEXT_MAX_UB);
+    TASSIGN(correction, CORRECTION_UB + (ordinal % 2) * CORRECTION_STRIDE);
+    TASSIGN(weights, 208896);
+    TASSIGN(weights_l1, (ordinal % 2) * 2 * H * K * sizeof(bfloat16_t));
+    if (part == 0) {
+        TEXPANDS(maximum, -1e30f);
+        TEXPANDS(denominator, 0.0f);
+    }
+    const int source = part * K < args[ARG_WINDOW_KEYS] ? 7 : 8;
+    const int column = part * K < args[ARG_WINDOW_KEYS] ? part * K : part * K - args[ARG_WINDOW_KEYS];
+    GM<int32_t, 1, K> ids_gm(data<int32_t>(args, source) + token * row_stride(args, source) + column);
+    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    TLOAD(ids, ids_gm);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_intra_block(PIPE_V, 0);
+    // The previous P copy owns only this NZ staging tile, not gather or PV UB.
+    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID7);
+    sparse_softmax::update<decltype(weights), decltype(qk), decltype(ids), decltype(maximum)>(
+        weights.data(), next_max.data(), denominator.data(), correction.data(),
+        qk.data(), ids.data(), maximum.data(), denominator.data());
+    TMOV(maximum, next_max);
     set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    int heads = args[10];
-    int valid_heads = heads < H ? heads : H;
-    bool single_part = args[11] + args[12] == K;
-    int parts = (args[11] + args[12]) / K;
-    int tile_base = 0;
-    for (int token = get_block_idx(args); token < args[9]; token += get_block_num(args), tile_base += parts) {
-        int head = get_sub_block_id(args) * H;
-        {
-            Vec<float, 1, H> maximum, denominator;
-            Vec<float, H, DIM> numerator;
-            TASSIGN(maximum, MAXIMUM_UB);
-            TASSIGN(denominator, DENOMINATOR_UB);
-            TASSIGN(numerator, single_part ? 65536 : NUMERATOR_UB);
-            TEXPANDS(maximum, -1e30f);
-            TEXPANDS(denominator, 0.0f);
-            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-            if (!single_part) TEXPANDS(numerator, 0.0f);
-            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-            if (tile_base == 0) gather_part(args, token, 0, get_sub_block_id(args), 0);
-            for (int part = 0; part < (args[11] + args[12]) / K; ++part) {
-                Vec<float, H, K> qk, scores, reduce;
-                Vec<int32_t, 1, K> ids;
-                Vec<float, 1, K> penalty, valid;
-                Vec<float, 1, H> next_max, correction, previous_denominator, part_sum;
-                HeadColumn<H> max_column, correction_column, sum_column;
-                TASSIGN(scores, WORK_UB);
-                TASSIGN(reduce, REDUCE_UB);
-                TASSIGN(ids, 217088);
-                TASSIGN(penalty, REDUCE_UB);
-                TASSIGN(valid, 136448);
-                TASSIGN(next_max, NEXT_MAX_UB);
-                TASSIGN(max_column, NEXT_MAX_UB);
-                TASSIGN(correction, CORRECTION_UB);
-                TASSIGN(correction_column, CORRECTION_UB);
-                TASSIGN(previous_denominator, 205696);
-                TASSIGN(part_sum, ROW_SUM_UB);
-                TASSIGN(sum_column, ROW_SUM_UB);
-                TPOP<AttentionPipe, Vec<float, H, K>, TileSplitAxis::TILE_UP_DOWN>(pipe, qk);
-                Tile<TileType::Vec, bfloat16_t, H, K, BLayout::ColMajor, H, K, SLayout::RowMajor> weights_nz;
-                TASSIGN(weights_nz, 208896);
+    set_intra_block(PIPE_V, 1);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_intra_block(PIPE_MTE3, 5 + 2 * (ordinal % 2));
+    TINSERT(weights_l1, weights, get_sub_block_id(args) * H, 0);
+    set_intra_block(PIPE_MTE3, 4 + 2 * (ordinal % 2));
+    // Return the P staging credit; the next softmax consumes it before writing.
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID7);
+}
 
-                int source = part * K < args[11] ? 7 : 8;
-                int source_column = part * K < args[11] ? part * K : part * K - args[11];
-                GM<int32_t, 1, K> ids_gm(
-                    data<int32_t>(args, source) + token * row_stride(args, source) + source_column);
-                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-                TLOAD(ids, ids_gm);
-                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                sparse_softmax::update<decltype(weights_nz), decltype(qk), decltype(ids), decltype(maximum)>(
-                    weights_nz.data(), next_max.data(), denominator.data(), correction.data(),
-                    qk.data(), ids.data(), maximum.data(), denominator.data());
-                TFREE<AttentionPipe, TileSplitAxis::TILE_UP_DOWN>(pipe);
+template <int H>
+__aicore__ inline void finalize_query(__gm__ int64_t* args, int token, int query_slot, bool single_part) {
+    const int head = get_sub_block_id(args) * H;
+    const int valid_heads = args[ARG_HEADS] < H ? args[ARG_HEADS] : H;
+    Vec<float, 1, H> maximum, denominator, sink, final_max, correction;
+    Vec<float, H, DIM> numerator;
+    TASSIGN(maximum, MAXIMUM_UB + query_slot * QUERY_STATE_STRIDE);
+    TASSIGN(denominator, DENOMINATOR_UB + query_slot * QUERY_STATE_STRIDE);
+    TASSIGN(numerator, single_part ? 65536 : NUMERATOR_UB);
+    TASSIGN(sink, 196608);
+    TASSIGN(final_max, 196736);
+    // The other tile's alpha may already be live; finalization uses separate scratch.
+    TASSIGN(correction, 196864);
+    Tile<TileType::Vec, float, 1, H, BLayout::RowMajor, 1, DYNAMIC> sink_load(valid_heads);
+    TASSIGN(sink_load, 196608);
+    using SinkShape = TileShape2D<float, 1, DYNAMIC>;
+    auto sink_data = data<float>(args, 2);
+    const int64_t sink_stride = row_stride(args, 2);
+    if (sink_stride == 1) {
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+        GlobalTensor<float, SinkShape, BaseShape2D<float, 1, H>> sink_gm(
+            sink_data + head, SinkShape(1, valid_heads));
+        TLOAD(sink_load, sink_gm);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+    } else {
+        set_flag(PIPE_V, PIPE_S, EVENT_ID1);
+        wait_flag(PIPE_V, PIPE_S, EVENT_ID1);
+        for (int lane = 0; lane < H; ++lane) {
+            const float value = lane < valid_heads ? sink_data[(head + lane) * sink_stride] : 0.0f;
+            sink.SetValue(lane, value);
+        }
+        set_flag(PIPE_S, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_S, PIPE_V, EVENT_ID1);
+    }
+    TMAX(final_max, maximum, sink);
+    TSUB(correction, maximum, final_max);
+    TEXP(correction, correction);
+    TMUL(maximum, denominator, correction);
+    TSUB(sink, sink, final_max);
+    TEXP(sink, sink);
+    TADD(sink, maximum, sink);
+    TDIV(sink, correction, sink);
+    HeadColumn<H> multiplier;
+    TASSIGN(multiplier, 196608);
+    TROWEXPANDMUL(numerator, numerator, multiplier);
+    Vec<bfloat16_t, H, DIM> result;
+    TASSIGN(result, NUMERATOR_UB);
+    TCVT(result, numerator, RoundMode::CAST_RINT, SaturationMode::OFF);
+    if (single_part) set_intra_block(PIPE_V, 3);
+#if defined(SPARSE_FUSED_O)
+    quantize_query<H>(args, token);
+#else
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+    Tile<TileType::Vec, bfloat16_t, H, DIM, BLayout::RowMajor, DYNAMIC, DIM> active_result(valid_heads);
+    TASSIGN(active_result, NUMERATOR_UB);
+    using OutputShape = TileShape2D<bfloat16_t, DYNAMIC, DIM>;
+    GlobalTensor<bfloat16_t, OutputShape, BaseShape2D<bfloat16_t, H, DIM>> output_gm(
+        data<bfloat16_t>(args, 0) + token * row_stride(args, 0) + head * DIM, OutputShape(valid_heads, DIM));
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+    TSTORE(output_gm, active_result);
+#endif
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+}
 
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                TPUSH<AttentionPipe, decltype(weights_nz), TileSplitAxis::TILE_UP_DOWN>(pipe, weights_nz);
-                set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID7);
-                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID7);
-                if (part + 1 < parts) {
-                    gather_part(args, token, part + 1, get_sub_block_id(args), tile_base + part + 1);
-                } else if (token + get_block_num(args) < args[9]) {
-                    gather_part(args, token + get_block_num(args), 0, get_sub_block_id(args), tile_base + parts);
-                }
-                Vec<float, H, DIM> previous_numerator, weighted;
-                TASSIGN(previous_numerator, WORK_UB);
-
-                TPOP<AttentionPipe, Vec<float, H, DIM>, TileSplitAxis::TILE_UP_DOWN>(pipe, weighted);
-                if (!single_part) {
-                    sparse_softmax::accumulate<decltype(numerator), decltype(correction)>(
-                        numerator.data(), numerator.data(), weighted.data(), correction.data());
-                    TFREE<AttentionPipe, TileSplitAxis::TILE_UP_DOWN>(pipe);
-                }
-                TMOV(maximum, next_max);
-                wait_intra_block(PIPE_MTE3, 9);
+template <int H, int K>
+__aicore__ inline void attend_vector(__gm__ int64_t* args) {
+    const int workers = get_block_num(args);
+    const int block = get_block_idx(args);
+#if defined(SPARSE_FUSED_O)
+    zero_quantized_padding<H>(args);
+#endif
+    if (block >= args[ARG_TOKENS]) return;
+    const int queries = (args[ARG_TOKENS] - block + workers - 1) / workers;
+    const int parts = (args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS]) / K;
+    const int tiles = queries * parts;
+    if (tiles == 0) return;
+    const bool single_part = parts == 1;
+    bool fp4_active = false;
+    set_intra_block(PIPE_V, 1);
+    set_intra_block(PIPE_V, 3);
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID7);
+    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    gather_part(args, block, 0, get_sub_block_id(args), 0, fp4_active);
+    for (int ordinal = 0; ordinal <= tiles; ++ordinal) {
+        if (ordinal + 1 < tiles) {
+            const int next = ordinal + 1;
+            const int token = block + (next / parts) * workers;
+            gather_part(args, token, next % parts, get_sub_block_id(args), next, fp4_active);
+        }
+        if (ordinal < tiles) {
+            const int token = block + (ordinal / parts) * workers;
+            update_softmax<H, K>(args, token, ordinal % parts, ordinal, (ordinal / parts) % 2);
+        }
+        if (ordinal > 0) {
+            const int previous = ordinal - 1;
+            const int part = previous % parts;
+            Vec<float, H, DIM> numerator, weighted;
+            Vec<float, 1, H> correction;
+            TASSIGN(numerator, NUMERATOR_UB);
+            TASSIGN(weighted, 65536);
+            TASSIGN(correction, CORRECTION_UB + (previous % 2) * CORRECTION_STRIDE);
+            wait_intra_block(PIPE_V, 2);
+            if (part == 0) {
+                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+                if (!single_part) TEXPANDS(numerator, 0.0f);
             }
-            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
-            Vec<float, 1, H> sink, final_max, correction;
-            TASSIGN(sink, 196608);
-            TASSIGN(final_max, 196736);
-            TASSIGN(correction, CORRECTION_UB);
-            Tile<TileType::Vec, float, 1, H, BLayout::RowMajor, 1, DYNAMIC> sink_load(valid_heads);
-            TASSIGN(sink_load, 196608);
-            using SinkShape = TileShape2D<float, 1, DYNAMIC>;
-            auto sink_data = data<float>(args, 2);
-            int64_t sink_stride = row_stride(args, 2);
-            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
-            if (sink_stride == 1) {
-                GlobalTensor<float, SinkShape, BaseShape2D<float, 1, H>> sink_gm(
-                    sink_data + head, SinkShape(1, valid_heads));
-                TLOAD(sink_load, sink_gm);
-                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-            } else {
-                set_flag(PIPE_V, PIPE_S, EVENT_ID1);
-                wait_flag(PIPE_V, PIPE_S, EVENT_ID1);
-                for (int lane = 0; lane < H; ++lane) {
-                    float value = lane < valid_heads ? sink_data[(head + lane) * sink_stride] : 0.0f;
-                    sink.SetValue(lane, value);
-                }
-                set_flag(PIPE_S, PIPE_V, EVENT_ID1);
-                wait_flag(PIPE_S, PIPE_V, EVENT_ID1);
+            if (!single_part) {
+                sparse_softmax::accumulate<decltype(numerator), decltype(correction)>(
+                    numerator.data(), numerator.data(), weighted.data(), correction.data());
+                set_intra_block(PIPE_V, 3);
             }
-            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-            TMAX(final_max, maximum, sink);
-            TSUB(correction, maximum, final_max);
-            TEXP(correction, correction);
-            TMUL(maximum, denominator, correction);
-            TSUB(sink, sink, final_max);
-            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-            TEXP(sink, sink);
-            TADD(sink, maximum, sink);
-            TDIV(sink, correction, sink);
-            HeadColumn<H> multiplier;
-            TASSIGN(multiplier, 196608);
-            TROWEXPANDMUL(numerator, numerator, multiplier);
-            Vec<bfloat16_t, H, DIM> result;
-            TASSIGN(result, NUMERATOR_UB);
-            TCVT(result, numerator, RoundMode::CAST_RINT, SaturationMode::OFF);
-            if (single_part) TFREE<AttentionPipe, TileSplitAxis::TILE_UP_DOWN>(pipe);
-            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-            // Padded Cube rows outside the active head shard are never published.
-            Tile<TileType::Vec, bfloat16_t, H, DIM, BLayout::RowMajor, DYNAMIC, DIM> active_result(valid_heads);
-            TASSIGN(active_result, NUMERATOR_UB);
-            using OutputShape = TileShape2D<bfloat16_t, DYNAMIC, DIM>;
-            GlobalTensor<bfloat16_t, OutputShape, BaseShape2D<bfloat16_t, H, DIM>> output_gm(
-                data<bfloat16_t>(args, 0) + token * row_stride(args, 0) + head * DIM,
-                OutputShape(valid_heads, DIM));
-            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-            TSTORE(output_gm, active_result);
-            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            if (part + 1 == parts) {
+                const int token = block + (previous / parts) * workers;
+                finalize_query<H>(args, token, (previous / parts) % 2, single_part);
+            }
         }
     }
+    drain_fp4_slots(fp4_active);
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID7);
     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    // Consume all returned and unused startup credits before either core retires.
+    wait_intra_block(PIPE_MTE3, 5);
+    wait_intra_block(PIPE_MTE3, 7);
+    for (int slot = 0; slot < KV_SLOTS; ++slot) wait_intra_block(PIPE_MTE3, 9 + 2 * slot);
+    pipe_barrier(PIPE_ALL);
+    set_intra_block(PIPE_MTE3, FINISH_ACK);
+    wait_intra_block(PIPE_V, FINISH_READY);
     pipe_barrier(PIPE_ALL);
 }
 #endif
 #if defined(__CPU_SIM)
+#if defined(SPARSE_FUSED_O)
+void simulate_quantized_query(__gm__ int64_t* args, int token, const bfloat16_t* attended) {
+    for (int head = 0; head < args[ARG_HEADS]; ++head) {
+        float value[DIM] = {};
+        if (attended != nullptr) {
+            const auto src = attended + head * DIM;
+            for (int d = 0; d < DIM; ++d) value[d] = static_cast<float>(src[d]);
+            for (int pair = 0; pair < 32; ++pair) {
+                float cosine = data<float>(args, 9)[token * row_stride(args, 9) + pair];
+                float sine = -data<float>(args, 10)[token * row_stride(args, 10) + pair];
+                float re = value[448 + pair * 2], im = value[449 + pair * 2];
+                value[448 + pair * 2] = static_cast<float>(static_cast<bfloat16_t>(re * cosine - im * sine));
+                value[449 + pair * 2] = static_cast<float>(static_cast<bfloat16_t>(re * sine + im * cosine));
+            }
+        }
+        for (int group = 0; group < 16; ++group) {
+            float maximum = 0;
+            for (int d = 0; d < 32; ++d) maximum = std::max(maximum, std::fabs(value[group * 32 + d]));
+            uint32_t bits;
+            std::memcpy(&bits, &maximum, sizeof(bits));
+            int exponent = std::max(int(bits >> 23) - 8, 0);
+            uint32_t divisor_bits = uint32_t(std::max(exponent, 1)) << 23;
+            float divisor;
+            std::memcpy(&divisor, &divisor_bits, sizeof(divisor));
+            for (int d = 0; d < 32; ++d) {
+                float v = value[group * 32 + d] / divisor * float(exponent != 0);
+                v = std::min(std::max(v, -448.0f), 448.0f);
+                data<float8_e4m3_t>(args, 0)[(head / 8 * 80 + token) * row_stride(args, 0)
+                    + head % 8 * 512 + group * 32 + d] = static_cast<float8_e4m3_t>(v);
+            }
+            data<uint8_t>(args, 11)[head / 8 * row_stride(args, 11) + (token / 16) * 2048
+                + head % 8 * 256 + group / 2 * 32 + token % 16 * 2 + group % 2] = exponent;
+        }
+    }
+}
+#endif
+
 float decode_byte(uint8_t code, bool fp4) {
     if (fp4) {
         const float magnitude[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
@@ -629,18 +801,23 @@ float decode_byte(uint8_t code, bool fp4) {
 }
 
 void simulate_attention(__gm__ int64_t* args) {
-    int heads = args[10];
-    int keys = args[11] + args[12];
+    int heads = args[ARG_HEADS];
+    int keys = args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS];
     auto query = data<bfloat16_t>(args, 1);
+#if defined(SPARSE_FUSED_O)
+    std::vector<bfloat16_t> rounded_query(heads * DIM);
+    auto output = rounded_query.data();
+#else
     auto output = data<bfloat16_t>(args, 0);
+#endif
     auto sink = data<float>(args, 2);
     int64_t sink_stride = row_stride(args, 2);
-    for (int token = get_block_idx(args); token < args[9]; token += get_block_num(args)) {
+    for (int token = get_block_idx(args); token < args[ARG_TOKENS]; token += get_block_num(args)) {
         std::vector<float> numerator(heads * 512, 0.0f), maximum(heads, -1e30f), denominator(heads, 0.0f);
         std::vector<float> kv(128 * 512), scores(128);
         std::vector<bool> valid(128);
         for (int part = 0; part < keys; part += 128) {
-            bool fp4 = part >= args[11];
+            bool fp4 = part >= args[ARG_WINDOW_KEYS];
             int payload_arg = fp4 ? 5 : 3;
             int index_arg = fp4 ? 8 : 7;
             int width = fp4 ? 256 : 512;
@@ -649,7 +826,7 @@ void simulate_attention(__gm__ int64_t* args) {
             auto scales = data<bfloat16_t>(args, payload_arg + 1);
             auto indices = data<int32_t>(args, index_arg) + token * row_stride(args, index_arg);
             for (int k = 0; k < 128; ++k) {
-                int physical = indices[part + k - (fp4 ? args[11] : 0)];
+                int physical = indices[part + k - (fp4 ? args[ARG_WINDOW_KEYS] : 0)];
                 valid[k] = physical >= 0;
                 for (int d = 0; d < 512; ++d) {
                     float value = 0;
@@ -692,18 +869,37 @@ void simulate_attention(__gm__ int64_t* args) {
             float correction = std::exp(maximum[h] - final_max);
             float factor = correction / (denominator[h] * correction + std::exp(sink_value - final_max));
             for (int d = 0; d < 512; ++d) {
+#if defined(SPARSE_FUSED_O)
+                output[h * DIM + d] = static_cast<bfloat16_t>(numerator[h * DIM + d] * factor);
+#else
                 output[token * row_stride(args, 0) + h * 512 + d] = static_cast<bfloat16_t>(numerator[h * 512 + d] * factor);
+#endif
             }
         }
+#if defined(SPARSE_FUSED_O)
+        simulate_quantized_query(args, token, output);
+#endif
     }
+#if defined(SPARSE_FUSED_O)
+    for (int token = args[ARG_TOKENS] + get_block_idx(args); token < 80; token += get_block_num(args)) {
+        simulate_quantized_query(args, token, nullptr);
+    }
+#endif
 }
 #endif
 } // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+#if defined(SPARSE_FUSED_O)
+    // ABI: FP8 O, Q, sink, W, Ws, C, Cs, Wi, Ci, cos, sin, MX scales;
+    // active rows, heads, window keys, compressed keys. Each group has <=80 rows.
+#else
     // ABI: O, Q, sink, W, Ws, C, Cs, Wi, Ci; tokens, heads, Wkeys, Ckeys.
+#endif
 #if defined(__CPU_SIM) && defined(__DAV_VEC__)
-    if (get_sub_block_id(args) == 0) simulate_attention(args);
+    if (get_sub_block_id(args) == 0) {
+        simulate_attention(args);
+    }
 #endif
 #if defined(__DAV_CUBE__) && !defined(__CPU_SIM)
     attend_cube<64, 128>(args);

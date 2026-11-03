@@ -11,12 +11,11 @@
 
 import pypto.language as pl
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from o_proj import o_proj
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_paged,
     publish_index_rows, project_index_key,
 )
-from sparse_attention import attend_packed
+from sparse_attention import _attend_project
 from hc import hc_project, hc_sinkhorn, hc_head_norm, hc_post
 from config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
@@ -150,15 +149,12 @@ def decode_c1a_full(
         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
     )
     selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_ready])
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attend_packed(
-        query, window_indices, window_cache, window_cache_scale, topk_indices,
-        compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, selection_ready,
-    )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        attn_out, num_tokens,
+    _attend_project(
+        query, window_indices, window_cache, window_cache_scale, topk_indices,
+        compressed_cache, compressed_cache_scale, attn_sink,
+        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out,
+        num_tokens, selection_ready, compressed_keys=INDEX_TOPK,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)

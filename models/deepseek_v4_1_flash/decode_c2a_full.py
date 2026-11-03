@@ -20,9 +20,8 @@ from compressor import (
 )
 from hc import hc_head_norm, hc_project, hc_sinkhorn, hc_post
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from sparse_attention import attend_packed
+from sparse_attention import _attend_project
 from decode_indexer import decode_c2a_indexer
-from o_proj import o_proj
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -144,19 +143,16 @@ def decode_c2a_full(
 
     chunk_done = pl.system.task_dummy(deps=[select_tid, compressed_publish_tid])
 
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attend_packed(
+    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    _attend_project(
         query, window_indices, window_cache, window_cache_scale, topk_indices,
-        compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
+        compressed_cache, compressed_cache_scale, attn_sink,
+        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out,
+        num_tokens, chunk_done, compressed_keys=INDEX_TOPK,
     )
 
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        attn_out, num_tokens,
-    )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output, next_pre_mix
