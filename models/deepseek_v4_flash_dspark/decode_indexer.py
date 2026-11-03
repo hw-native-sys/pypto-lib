@@ -67,7 +67,7 @@ IDX_CACHE_BLOCK_NUM_DYN = pl.dynamic("IDX_CACHE_BLOCK_NUM_DYN")
 CACHE_TILE = min(64, BLOCK_SIZE)
 T_PAD = ((T + 16 - 1) // 16) * 16
 MM_ROW_TILE = 16
-QR_MM_ROW_TILE = 64
+QR_MM_ROW_TILE = 128
 QR_MM_N_TILE = 256
 QR_MM_T_PAD = ((T + QR_MM_ROW_TILE - 1) // QR_MM_ROW_TILE) * QR_MM_ROW_TILE
 DEQUANT_T_TILE = min(T, 8)
@@ -75,14 +75,13 @@ HEAD_DIM_TILE = 32
 WEIGHTS_OK = 4  # Weights-projection K tile count
 WEIGHTS_K_TILE = D // WEIGHTS_OK
 D_TILE = gcd(512, WEIGHTS_K_TILE)
-QH_QUANT_TILE = 64
+QH_QUANT_TILE = 96
 QH_QUANT_WORKERS = 48  # Query Hadamard quantization workers
 QR_PROJ_WORKERS = 24  # Query projection workers
 QH_MM_TILE = 64  # Query Hadamard cube tile
 QH_WORKERS = 24  # Query Hadamard matmul workers
 WEIGHTS_WORKERS = 24  # Weights-projection workers
 TP1_WEIGHTS_WORKERS = 8  # TP1 weights-projection workers
-QH_HEAD_DIM_TILE = 64
 DQ_ROPE_H_TILE = 4  # heads per fused query dequant + RoPE unit
 DQ_ROPE_WORKERS = 48  # fused query dequant + RoPE workers
 TOPK_PAIR_WIDTH = 2 * IDX_TOPK
@@ -981,28 +980,30 @@ def indexer_qr_hadamard_mm(
         allow_early_resolve=True,
     ) as qh_quant_tid:
         qh_quant_worker = pl.tile.get_block_idx()
-        for idx in pl.range(qh_quant_worker, bs_heads // QH_QUANT_TILE, QH_QUANT_WORKERS):
+        qh_quant_units = (bs_heads + QH_QUANT_TILE - 1) // QH_QUANT_TILE
+        for idx in pl.range(qh_quant_worker, qh_quant_units, QH_QUANT_WORKERS):
             o0 = idx * QH_QUANT_TILE
-            qh_full_f32 = qh_acc_gm[o0 : o0 + QH_QUANT_TILE, 0:IDX_HEAD_DIM]
-            qh_amax = pl.full([1, QH_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for h0 in pl.range(0, IDX_HEAD_DIM, QH_HEAD_DIM_TILE):
-                qh_a_f32 = qh_full_f32[:, h0 : h0 + QH_HEAD_DIM_TILE]
-                qh_a_neg = pl.neg(qh_a_f32)
-                qh_a_abs = pl.maximum(qh_a_f32, qh_a_neg)
-                qh_a_max_col = pl.row_max(qh_a_abs)
-                qh_a_max = pl.reshape(qh_a_max_col, [1, QH_QUANT_TILE])
-                qh_amax = pl.maximum(qh_amax, qh_a_max)
+            qh_rows = pl.min(QH_QUANT_TILE, bs_heads - o0)
+            qh_full_f32 = pl.slice(qh_acc_gm, [QH_QUANT_TILE, IDX_HEAD_DIM], [o0, 0], valid_shape=[qh_rows, IDX_HEAD_DIM])
+            qh_a_abs = pl.abs(qh_full_f32)
+            qh_a_max_col = pl.row_max(qh_a_abs)
+            qh_a_max = pl.reshape(qh_a_max_col, [1, QH_QUANT_TILE])
+            qh_a_max_valid = pl.set_validshape(qh_a_max, 1, qh_rows)
+            qh_amax = pl.maximum(qh_a_max_valid, INT8_AMAX_EPS)
             qh_scale_numerator = pl.full([1, QH_QUANT_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
-            qh_scale_quant_row = pl.div(qh_scale_numerator, qh_amax)
+            qh_scale_numerator_valid = pl.set_validshape(qh_scale_numerator, 1, qh_rows)
+            qh_scale_quant_row = pl.div(qh_scale_numerator_valid, qh_amax)
             qh_scale_recip = pl.recip(qh_scale_quant_row)
             qh_scale_dq = pl.reshape(qh_scale_recip, [QH_QUANT_TILE, 1])
-            qr_hadamard_scale_dq[o0 : o0 + QH_QUANT_TILE, :] = qh_scale_dq
+            qh_scale_valid = pl.set_validshape(qh_scale_dq, qh_rows, 1)
+            qr_hadamard_scale_dq[o0 : o0 + QH_QUANT_TILE, :] = qh_scale_valid
             qh_scale_quant = pl.reshape(qh_scale_quant_row, [QH_QUANT_TILE, 1])
             qh_q_scaled = pl.row_expand_mul(qh_full_f32, qh_scale_quant)
             qh_q_i32 = pl.cast(qh_q_scaled, target_type=pl.INT32, mode="rint")
             qh_q_half = pl.cast(qh_q_i32, target_type=pl.FP16, mode="round")
             qh_i8 = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc")
-            qr_hadamard_i8[o0 : o0 + QH_QUANT_TILE, 0:IDX_HEAD_DIM] = qh_i8
+            qh_i8_valid = pl.set_validshape(qh_i8, qh_rows, IDX_HEAD_DIM)
+            qr_hadamard_i8[o0 : o0 + QH_QUANT_TILE, 0:IDX_HEAD_DIM] = qh_i8_valid
 
 
     return qh_mm_tid, qh_quant_tid

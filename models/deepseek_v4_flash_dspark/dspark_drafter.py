@@ -421,7 +421,7 @@ def draft_layer(
     attention_grouped = pl.reshape(o_packed_heads, [O_GROUPS * LOCAL_T_PAD, O_GROUP_IN])
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     # DSA-CP and O projection use the same TP group, including a singleton.
-    tp_rank = dsa_cp_rank
+    tp_rank = pl.cast(dsa_cp_rank, pl.INT32)
     with pl.spmd(
         ATTENTION_PUBLISH_WORKERS,
         name_hint="dspark_o_group_publish",
