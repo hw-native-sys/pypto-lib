@@ -29,7 +29,7 @@ from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, pre
 from sparse_attention import (
     _attend_project, golden_compressed_attention, golden_prefill_c1a_attention,
 )
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import projection_padded_rows, quantize_projection_input, q_proj_rope, kv_proj, window_publish
 
 
 # model config
@@ -98,12 +98,15 @@ def prefill_c1a_reuse_attention(
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
-        q_proj_rope(
+        proj_rows = projection_padded_rows(pl.tensor.dim(x, 0))
+        qb_payload = pl.create_tensor([proj_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+        qb_scales = pl.create_tensor([1, proj_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+        q_proj_result = q_proj_rope(
             proj_payload, proj_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
-            query_latent, query,
+            query_latent, query, qb_payload, qb_scales,
             num_tokens,
         )
         source_ready = pl.system.task_dummy(deps=[])

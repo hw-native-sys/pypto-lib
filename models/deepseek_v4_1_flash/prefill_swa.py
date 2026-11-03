@@ -28,7 +28,7 @@ from hc import golden_mhc_mixes
 from hc import golden_hc_post, prefill_sp_post
 from hc import golden_hc_collapse, hc_pre, zero_bf16_padding
 from rmsnorm import golden_rms_norm, rms_norm_tiled
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import projection_padded_rows, quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter
 from prefill_cp_allgather import make_prefill_sp_input_allgather
 
@@ -110,6 +110,9 @@ def prefill_swa_attention(
     chunk_indices = pl.create_tensor([QUERY_TILE, 128], dtype=pl.INT32)
     qr = pl.create_tensor([QUERY_TILE, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    proj_rows = projection_padded_rows(QUERY_TILE)
+    qb_payload = pl.create_tensor([proj_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_scales = pl.create_tensor([1, proj_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
 
     for start in pl.range(0, num_tokens, QUERY_TILE):
@@ -125,12 +128,12 @@ def prefill_swa_attention(
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
         q_input_payload, q_input_scales = quantize_projection_input(chunk_x, active)
-        q_proj_rope(
+        q_proj_result = q_proj_rope(
             q_input_payload, q_input_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             chunk_cos, chunk_sin,
-            qr, q,
+            qr, q, qb_payload, qb_scales,
             active,
         )
         _attend_window_project(

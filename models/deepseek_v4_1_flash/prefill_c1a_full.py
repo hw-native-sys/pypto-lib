@@ -36,7 +36,7 @@ from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import token_shards
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, prefill_tp_output_all_reduce
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import projection_padded_rows, quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from compressor import c1a_compressor_project, c1a_compressor_publish
 from prefill_indexer import (
     prefill_indexer, publish_c1a_index_key, golden_prefill_indexer,
@@ -155,6 +155,9 @@ def prefill_c1a_full_attention(
     query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
+    proj_rows = projection_padded_rows(pl.tensor.dim(x, 0))
+    qb_payload = pl.create_tensor([proj_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_scales = pl.create_tensor([1, proj_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     publication = pl.array.create(1, pl.TASK_ID)
     publication[0] = pl.system.task_dummy(deps=[])
     if num_tokens > 0:
@@ -163,12 +166,12 @@ def prefill_c1a_full_attention(
             compressed_rope_cos, compressed_rope_sin, compressed_slots,
             compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, num_tokens,
         )
-        q_proj_rope(
+        q_proj_result = q_proj_rope(
             proj_payload, proj_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
-            query_latent, query,
+            query_latent, query, qb_payload, qb_scales,
             num_tokens,
         )
         publication[0] = published
@@ -1418,6 +1421,55 @@ def golden_prefill_c1a_full_case(tensors):
     tensors["output"][:] = hc_output.unsqueeze(0)
 
 
+def _staged_compressed_cache_compare(world_size, tokens):
+    """Check C1A publication on the device input while retaining exact pool guards."""
+    from compressor import golden_c1a_compressor
+    from qkv_proj_rope import golden_rope_interleave
+    from quant import quantize_mxfp4_cache
+    from utils import _publish_quantized_cache
+
+    names = ("compressed_cache", "compressed_cache_scale")
+    outputs = {}
+    checks = {
+        name: mapped_pool_ratio_allclose(
+            "compressed_slots", pool_name=name, mapping_shape=(world_size, tokens),
+            block_size=BLOCK_SIZE, leading_rank_axis=True,
+            atol=0.0, rtol=0.0, max_error_ratio=0.0,
+        ) for name in names
+    }
+    quantize = functools.partial(
+        quantize_mxfp4_cache, group_size=COMPRESSED_CACHE_GROUP, scale_format="bf16", round_to_even=True,
+    )
+
+    def compare(name, actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
+        if not outputs:
+            active = int(inputs["num_tokens"])
+            ranks = []
+            for rank in range(world_size):
+                latent = golden_c1a_compressor(
+                    actual_outputs["attn_input"][rank, :active],
+                    inputs["compressor_wkv"][rank], inputs["compressor_norm_weight"][rank],
+                )
+                cosine = inputs["compressed_rope_cos"][rank, :active]
+                sine = inputs["compressed_rope_sin"][rank, :active]
+                width = cosine.shape[-1] * 2
+                tail = golden_rope_interleave(latent[..., -width:], cosine, sine)
+                rotated = torch.cat((latent[..., :-width], tail), dim=-1)
+                # Publication only overwrites active slots; preserve the original golden elsewhere.
+                ranks.append(_publish_quantized_cache(
+                    expected_outputs[names[0]][rank], expected_outputs[names[1]][rank],
+                    rotated, inputs["compressed_slots"][rank, :active], quantize,
+                ))
+            outputs.update({name: torch.stack([result[index] for result in ranks])
+                            for index, name in enumerate(names)})
+        return checks[name](
+            actual, outputs[name], inputs=inputs, actual_outputs=actual_outputs,
+            expected_outputs=outputs, **kwargs,
+        )
+
+    return {name: functools.partial(compare, name) for name in names}
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -1493,18 +1545,7 @@ if __name__ == "__main__":
                 block_size=BLOCK_SIZE, leading_rank_axis=True,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
-            "compressed_cache": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="compressed_cache",
-                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
-                block_size=BLOCK_SIZE, leading_rank_axis=True,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
-            "compressed_cache_scale": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="compressed_cache_scale",
-                mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),
-                block_size=BLOCK_SIZE, leading_rank_axis=True,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
+            **_staged_compressed_cache_compare(len(devices), fixture_token_count(args.tokens, args.case)),
             "index_cache": mapped_pool_ratio_allclose(
                 "compressed_slots", pool_name="index_cache",
                 mapping_shape=(len(devices), fixture_token_count(args.tokens, args.case)),

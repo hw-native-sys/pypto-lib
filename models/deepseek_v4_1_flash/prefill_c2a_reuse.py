@@ -29,7 +29,7 @@ from prefill_c2a_full import (
     CMP_PACKED, CMP_SCALES, REUSE_INPUT_NAMES, make_c2a_inputs, golden_reference_c2a,
     _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
 )
-from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj, window_publish
+from qkv_proj_rope import projection_padded_rows, golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from sparse_attention import _attend_project
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from quant import quantize_mxfp8_cache
@@ -99,12 +99,15 @@ def prefill_c2a_reuse_attention(
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
-    q_proj_rope(
+    proj_rows = projection_padded_rows(pl.tensor.dim(x, 0))
+    qb_payload = pl.create_tensor([proj_rows, Q_LORA], dtype=pl.FP8E4M3FN)
+    qb_scales = pl.create_tensor([1, proj_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
+    q_proj_result = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
-        qr, query,
+        qr, query, qb_payload, qb_scales,
         num_tokens,
     )
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
@@ -588,7 +591,9 @@ if __name__ == "__main__":
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
             ring_heap=PREFILL_ATTN_RING_HEAP,
         ),
-        compare_fn=make_compare("reuse", len(devices), args.tokens),
+        compare_fn=make_compare(
+            "reuse", len(devices), args.tokens, initial_state, reference=golden_reference_c2a_reuse,
+        ),
     )
     if args.compile_only and result.passed:
         print("[C2A-HC] Compilation passed; device accuracy was NOT validated.")
