@@ -444,7 +444,10 @@ def prefill_moe(
         x_norm_scale = pl.create_tensor([1, t * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         indices = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
         weights = pl.create_tensor([t, TOPK], dtype=pl.FP32)
-        npu_gate(ffn_input, gate_weight, correction_bias, num_tokens, x_norm_mx, x_norm_scale, indices, weights)
+        npu_gate(
+            ffn_input, gate_weight, correction_bias, num_tokens,
+            x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
+        )
         dispatch_indices = indices
 
         shared_output = pl.create_tensor([t, D], dtype=pl.BF16)
@@ -477,7 +480,7 @@ def prefill_moe(
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_route_local, recv_meta_local,
-            routed_output, input_ready,
+            routed_output, input_ready, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
         )
         output_ready = combine_scattered(
             shared_output, sublayer,
@@ -762,7 +765,7 @@ def prefill_moe_sublayer(
         weights = pl.create_tensor([TOKENS, TOPK], dtype=pl.FP32)
         npu_gate(
             local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
-            x_norm_mx, x_norm_scale, indices, weights,
+            x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
         )
         dispatch_indices = indices
 
@@ -796,7 +799,7 @@ def prefill_moe_sublayer(
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             recv_route_local, recv_meta_local,
-            routed_output, input_ready,
+            routed_output, input_ready, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
         )
         output_ready = combine_scattered(
             shared_output, local_ffn_owned,

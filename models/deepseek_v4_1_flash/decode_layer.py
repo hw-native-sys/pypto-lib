@@ -304,7 +304,7 @@ def l2_decode_layer(
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         arrived, data_arrived, routed_output, combine_arrived,
         local_moe_tokens, rank, moe_epoch,
-        force_topk,
+        force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
 

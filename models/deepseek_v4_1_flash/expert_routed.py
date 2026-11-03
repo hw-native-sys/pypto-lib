@@ -70,8 +70,6 @@ MX_PACKED_LANE_COLS = MX_MM_INTER_TILE // 2
 MX_W1_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W3_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * MX_PACKED_LANE_ROWS
-ROUTED_ROW_CAPACITY = min(N_LOCAL_EXPERTS, M.num_experts_per_tok) * RECV_MAX
-ROUTED_PARTIAL_STRIDE = ((ROUTED_ROW_CAPACITY + 15) // 16 + 1) * 16
 LOCAL_PARTIAL_STRIDE = ((N_LOCAL_EXPERTS * RECV_MAX + MX_M_TILE - 1) // MX_M_TILE + 1) * MX_M_TILE
 
 
@@ -157,35 +155,38 @@ def _reduce_ffn_tile(
 
 @pl.jit.inline(auto_scope=False)
 def expert_routed_scatter(
-    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
-    recv_mx_scale: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
-    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
-    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    routed_w1_packed: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w3_packed: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w2_packed: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * H_SCALE, D], pl.FP8E8M0, pl.MX_B_NN],
-    recv_route: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    recv_meta: pl.Tensor[[EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_x: pl.Tensor,
+    recv_mx_scale: pl.Tensor,
+    recv_weights: pl.Tensor,
+    recv_expert_count: pl.Tensor,
+    routed_w1_packed: pl.Tensor,
+    routed_w1_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+    routed_w3_packed: pl.Tensor,
+    routed_w3_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+    routed_w2_packed: pl.Tensor,
+    routed_w2_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
+    recv_route: pl.Tensor,
+    recv_meta: pl.Tensor,
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
     input_ready: pl.Scalar[pl.TASK_ID],
+    local_experts: pl.constexpr = N_LOCAL_EXPERTS,
+    topk: pl.constexpr = M.num_experts_per_tok,
 ):
     """Compute active expert rows and scatter each source interval to its route destinations."""
-    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    route_weights = pl.reshape(recv_weights, [N_LOCAL_EXPERTS * RECV_MAX, 1])
+    recv_x_flat = pl.reshape(recv_x, [local_experts * RECV_MAX, D])
+    route_weights = pl.reshape(recv_weights, [local_experts * RECV_MAX, 1])
     partial, down_ready = _expert_routed_partials(
         recv_x_flat, recv_mx_scale, route_weights, recv_expert_count,
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale, input_ready,
-        N_LOCAL_EXPERTS, RECV_MAX, D, MOE_INTER, ROUTED_ROW_CAPACITY,
+        local_experts, RECV_MAX, D, MOE_INTER,
+        (local_experts if local_experts < topk else topk) * RECV_MAX,
     )
     with pl.spmd(64, name_hint="ffn_reduce_scatter", deps=[down_ready]) as scatter_done:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_reduce_scatter", no_dep_args=[routed_output]):
             core = pl.tile.get_block_idx()
             total_rows = 0
-            for expert in pl.range(N_LOCAL_EXPERTS):
+            for expert in pl.range(local_experts):
                 rows_read = pl.read(recv_expert_count, [expert, 0])
                 rows = pl.cast(rows_read, pl.INDEX)
                 total_rows = total_rows + rows
@@ -195,7 +196,7 @@ def expert_routed_scatter(
             core_rows = rows_per_core + pl.min(pl.max(extra_rows - core, 0), 1)
             core_end = core_begin + core_rows
             compact_base = 0
-            for local_e in pl.range(N_LOCAL_EXPERTS):
+            for local_e in pl.range(local_experts):
                 count_read = pl.read(recv_expert_count, [local_e, 0])
                 count = pl.cast(count_read, pl.INDEX)
                 source_begin = 0
@@ -214,7 +215,11 @@ def expert_routed_scatter(
                         route = pl.cast(route_read, pl.INDEX)
                         compact_row = compact_base + row
                         col = pl.cast(0, pl.INDEX)
-                        value = _reduce_ffn_tile(partial, compact_row, col, ROUTED_PARTIAL_STRIDE, 1, D)
+                        value = _reduce_ffn_tile(
+                            partial, compact_row, col,
+                            (((local_experts if local_experts < topk else topk) * RECV_MAX + 15) // 16 + 1) * 16,
+                            1, D,
+                        )
                         pld.tile.remote_store(value, target=routed_output, peer=src, offsets=[route, 0])
                     source_begin = source_end
                 compact_base = compact_base + count

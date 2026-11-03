@@ -107,13 +107,15 @@ def golden_gate_reference(
 @pl.jit.inline
 def gate_normalized(
     x_normed: pl.Tensor[[T, D], pl.BF16],
-    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    gate_w: pl.Tensor,
+    gate_bias: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     x_norm_mx: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
     x_norm_scale: pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0],
-    indices: pl.Tensor[[T, TOPK], pl.INT32],
-    weights: pl.Tensor[[T, TOPK], pl.FP32],
+    indices: pl.Tensor,
+    weights: pl.Tensor,
+    n_experts: pl.constexpr = N_EXPERTS,
+    topk: pl.constexpr = TOPK,
 ):
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
@@ -132,20 +134,22 @@ def gate_normalized(
 
     return gate_from_fp32(
         xg_buf, gate_w, gate_bias, num_tokens,
-        x_norm_mx, x_norm_scale, indices, weights,
+        x_norm_mx, x_norm_scale, indices, weights, n_experts=n_experts, topk=topk,
     )
 
 
 @pl.jit.inline
 def gate_from_fp32(
     xg_buf: pl.Tensor[[T_PAD, D], pl.FP32],
-    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    gate_w: pl.Tensor,
+    gate_bias: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     x_norm_mx: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
     x_norm_scale: pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0],
-    indices: pl.Tensor[[T, TOPK], pl.INT32],
-    weights: pl.Tensor[[T, TOPK], pl.FP32],
+    indices: pl.Tensor,
+    weights: pl.Tensor,
+    n_experts: pl.constexpr = N_EXPERTS,
+    topk: pl.constexpr = TOPK,
 ):
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
@@ -194,32 +198,32 @@ def gate_from_fp32(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
         for zt in pl.range(T):
             if zt >= active_tokens:
-                for zk in pl.range(TOPK):
+                for zk in pl.range(topk):
                     zero_index = pl.cast(0, pl.INT32)
                     pl.write(indices, [zt, zk], zero_index)
                     zero_weight = pl.cast(0.0, pl.FP32)
                     pl.write(weights, [zt, zk], zero_weight)
-        if N_EXPERTS < SCORE_PAD:
-            biased_pad = pl.full([T_PAD, SCORE_PAD - N_EXPERTS], dtype=pl.FP32, value=FP32_NEG_INF)
-            biased_scores_buf[:, N_EXPERTS:SCORE_PAD] = biased_pad
+        if n_experts < SCORE_PAD:
+            biased_pad = pl.full([T_PAD, SCORE_PAD - n_experts], dtype=pl.FP32, value=FP32_NEG_INF)
+            biased_scores_buf[:, n_experts:SCORE_PAD] = biased_pad
 
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     # Reserve both engines before any local Cube-to-Vector transfer.
     # Bound synchronous cohorts to the target A5 core count.
-    gate_bias_matrix = pl.reshape(gate_bias, [1, N_EXPERTS])
-    gate_tasks = task_gate_tiles * ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
+    gate_bias_matrix = pl.reshape(gate_bias, [1, n_experts])
+    gate_tasks = task_gate_tiles * ((n_experts + GATE_N_TILE - 1) // GATE_N_TILE)
     gate_workers = pl.min(gate_tasks, pl.min(16, pl.system.available_cluster_count()))
     for gate_worker in pl.spmd(gate_workers, name_hint="gate", sync_start=True):
         for gb_idx in pl.range(gate_worker, gate_tasks, gate_workers):
-            tg = gb_idx // ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
-            nb = gb_idx % ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
+            tg = gb_idx // ((n_experts + GATE_N_TILE - 1) // GATE_N_TILE)
+            nb = gb_idx % ((n_experts + GATE_N_TILE - 1) // GATE_N_TILE)
             t1 = tg * GATE_M_TILE
             n0 = nb * GATE_N_TILE
             gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
             for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
                 gd_kd = kb * GATE_D_TILE
                 gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
-                valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
+                valid_n = pl.min(GATE_N_TILE, n_experts - n0)
                 gd_w_raw = pl.slice(
                     gate_w, [GATE_N_TILE, GATE_D_TILE], [n0, gd_kd], valid_shape=[valid_n, GATE_D_TILE],
                 )
@@ -246,7 +250,7 @@ def gate_from_fp32(
             gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
             gp_score = pl.sqrt(gp_softplus)
             route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
-            bias_valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
+            bias_valid_n = pl.min(GATE_N_TILE, n_experts - n0)
             gp_bias_raw = pl.slice(
                 gate_bias_matrix, [1, GATE_N_TILE], [0, n0], valid_shape=[1, bias_valid_n],
             )
@@ -257,35 +261,36 @@ def gate_from_fp32(
 
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
     # does not emit an invalid function for a route_hash path that does no work.
-    task_route_tiles = (task_tokens + GATE_T_TILE - 1) // GATE_T_TILE
+    # Odd TopK uses 16 rows so each scalar-writing block owns whole 64-byte lines.
+    task_route_tiles = (task_tokens + GATE_T_TILE * (1 + topk % 2) - 1) // (GATE_T_TILE * (1 + topk % 2))
     for ts_idx in pl.spmd(task_route_tiles, name_hint="route_sort"):
-            t1 = ts_idx * GATE_T_TILE
+            t1 = ts_idx * GATE_T_TILE * (1 + topk % 2)
             # ptoas pto.tmrgsort requires a single source row.
-            topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+            topk_idx_tile = pl.create_tensor([GATE_T_TILE * (1 + topk % 2), TOPK_PAD], dtype=pl.INT32)
             sr_idx_init = pl.create_tensor([1, SCORE_PAD], dtype=pl.UINT32)
             sr_index_range = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
             sr_idx_init[:, :] = sr_index_range
-            for sr_tt in pl.range(GATE_T_TILE):
+            for sr_tt in pl.range(GATE_T_TILE * (1 + topk % 2)):
                 sr_t = t1 + sr_tt
                 sr_row = pl.slice(biased_scores_buf, [1, SCORE_PAD], [sr_t, 0])
                 sr_i = route_topk_row(sr_row, sr_idx_init)
                 topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
 
-            local_scores = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
-            local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE, :]
+            local_scores = pl.create_tensor([GATE_T_TILE * (1 + topk % 2), SCORE_PAD], dtype=pl.FP32)
+            local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE * (1 + topk % 2), :]
             gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
-            gather_valid = pl.set_validshape(gather_all, GATE_T_TILE, TOPK)
+            gather_valid = pl.set_validshape(gather_all, GATE_T_TILE * (1 + topk % 2), topk)
             topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
-            topk_idx_read = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+            topk_idx_read = pl.create_tensor([GATE_T_TILE * (1 + topk % 2), TOPK_PAD], dtype=pl.INT32)
             topk_idx_read[:, :] = topk_idx_tile[:, :]
             topk_sum = pl.row_sum(topk_vals_pad)
-            denom = pl.reshape(topk_sum, [GATE_T_TILE, 1])
+            denom = pl.reshape(topk_sum, [GATE_T_TILE * (1 + topk % 2), 1])
             topk_normalized = pl.row_expand_div(topk_vals_pad, denom)
             normalized_weights = pl.mul(topk_normalized, ROUTE_SCALE)
-            for wt_tt in pl.range(GATE_T_TILE):
+            for wt_tt in pl.range(GATE_T_TILE * (1 + topk % 2)):
                 wt_out_t = t1 + wt_tt
                 if wt_out_t < active_tokens:
-                    for wt_k in pl.range(TOPK):
+                    for wt_k in pl.range(topk):
                         wt_out_idx = pl.read(topk_idx_read, [wt_tt, wt_k])
                         pl.write(indices, [wt_out_t, wt_k], wt_out_idx)
                         wt_out_weight = pl.read(normalized_weights, [wt_tt, wt_k])
@@ -298,13 +303,15 @@ def gate_from_fp32(
 def gate(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
-    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    gate_w: pl.Tensor,
+    gate_bias: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     x_norm_mx: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
     x_norm_scale: pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0],
-    indices: pl.Tensor[[T, TOPK], pl.INT32],
-    weights: pl.Tensor[[T, TOPK], pl.FP32],
+    indices: pl.Tensor,
+    weights: pl.Tensor,
+    n_experts: pl.constexpr = N_EXPERTS,
+    topk: pl.constexpr = TOPK,
 ):
     """Normalize router inputs with BF16 rounding and FP32 output."""
     active_tokens = pl.cast(num_tokens, pl.INDEX)
@@ -315,7 +322,7 @@ def gate(
         rms_norm_tiled(x_mixed, norm_w, xg_buf, norm_block, active_tokens, output_fp32=True)
     return gate_from_fp32(
         xg_buf, gate_w, gate_bias, num_tokens,
-        x_norm_mx, x_norm_scale, indices, weights,
+        x_norm_mx, x_norm_scale, indices, weights, n_experts=n_experts, topk=topk,
     )
 
 
@@ -338,7 +345,7 @@ def l2_gate(
         x_mixed,
         norm_w, gate_w, gate_bias,
         num_tokens,
-        x_norm_mx, x_norm_scale, indices, weights,
+        x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
     )
     return x_norm_mx, x_norm_scale, indices, weights
 
