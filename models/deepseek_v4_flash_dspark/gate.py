@@ -144,17 +144,18 @@ def _gate(
             pl.tile.store(xn_q_i8, [tok, 0], x_norm_i8, shapes=[1, D])
 
     # Zero inactive fixed-tile inputs/outputs and mask padded expert scores.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
-        for zt in pl.range(T):
-            if zt >= active_tokens:
-                # Positive FP16 zero has zero bytes; no numeric conversion is needed.
-                inactive_x_norm_f16 = pl.full([1, D // 2], dtype=pl.FP16, value=0.0)
-                inactive_x_norm_i8 = pl.reinterpret_view(inactive_x_norm_f16, pl.INT8)
-                x_norm_i8[zt : zt + 1, :] = inactive_x_norm_i8
-                pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
-                for zk in pl.range(TOPK):
-                    pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
-                    pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
+    if active_tokens < T:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
+            for zt in pl.range(T):
+                if zt >= active_tokens:
+                    # Positive FP16 zero has zero bytes; no numeric conversion is needed.
+                    inactive_x_norm_f16 = pl.full([1, D // 2], dtype=pl.FP16, value=0.0)
+                    inactive_x_norm_i8 = pl.reinterpret_view(inactive_x_norm_f16, pl.INT8)
+                    x_norm_i8[zt : zt + 1, :] = inactive_x_norm_i8
+                    pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
+                    for zk in pl.range(TOPK):
+                        pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
+                        pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
     # Gate projection over expert columns.
     # Fan the matmul over expert columns so each block computes a [GATE_M_TILE,
     # GATE_N_TILE] slice on its own core; token-tile is the dynamic dim, so it
