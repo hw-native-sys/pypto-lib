@@ -30,12 +30,12 @@ from hc import golden_hc_post, hc_post, prefill_sp_post
 from hc import golden_hc_collapse, hc_pre
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from sparse_attention import (
-    attend_packed, golden_compressed_attention, golden_prefill_c1a_attention,
+    _attend_project, golden_compressed_attention, golden_prefill_c1a_attention,
 )
 from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import token_shards
 from prefill_cp_allgather import prefill_sp_input_allgather
-from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
+from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, prefill_tp_output_all_reduce
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from compressor import c1a_compressor_project, c1a_compressor_publish
 from prefill_indexer import (
@@ -188,18 +188,11 @@ def prefill_c1a_full_attention(
             num_tokens, source_ready,
         )
 
-        attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        attend_packed(
-            query,
-            window_indices, window_cache, window_cache_scale,
-            topk_indices, compressed_cache, compressed_cache_scale,
-            attn_sink, attended,
-            num_tokens, window_ready,
-        )
-        o_proj(
-            attended, wo_a, wo_a_scale, wo_b,
-            wo_b_scale, rope_cos, rope_sin,
-            partial, num_tokens,
+        _attend_project(
+            query, window_indices, window_cache, window_cache_scale,
+            topk_indices, compressed_cache, compressed_cache_scale, attn_sink,
+            wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial,
+            num_tokens, window_ready, compressed_keys=INDEX_TOPK,
         )
     if scatter_output:
         prefill_sp_output_reduce_scatter(
