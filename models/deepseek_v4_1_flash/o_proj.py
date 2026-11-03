@@ -12,11 +12,9 @@
 
 from pathlib import Path
 
-from gemm import MX_M_TILE
-
 import torch
 
-from quant import quantize_bf16_to_mxfp8, MX_GROUP, _quantize_mxfp8_activation, decode_e8m0, unpack_mx_b_scale
+from quant import MX_GROUP, _quantize_mxfp8_activation, decode_e8m0, unpack_mx_b_scale
 
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum
@@ -49,38 +47,52 @@ HC_DIM = M.hc_dim
 # tiling
 O_A_N_TILE = 256
 O_B_N_TILE = 160
-K_TILE = 256
 D_TILE = 512
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_rope_quant_vf.cpp",
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_rope_vf.cpp",
                include_dirs=(pto_isa_include_dir(),))
-def _rope_quant_o_vf(
+def _rope_o_vf(
     attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rotated: pl.Out[pl.Tensor[[80, LOCAL_H * HEAD_DIM], pl.BF16]],
+    active_rows: pl.Scalar[pl.INT32],
+    groups: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Apply inverse RoPE and round the rotary coordinates to BF16."""
+    ...
+
+
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_quant_vf.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _quant_o_vf(
+    rotated: pl.Tensor[[80, LOCAL_H * HEAD_DIM], pl.BF16],
     payload: pl.Out[pl.Tensor[[LOCAL_O_GROUPS * 80, O_GROUP_IN], pl.FP8E4M3FN]],
     scales: pl.Out[pl.Tensor[[LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], pl.FP8E8M0]],
     active_rows: pl.Scalar[pl.INT32],
     groups: pl.Scalar[pl.INT32],
 ) -> tuple[pl.Tensor, pl.Tensor]:
-    """Fuse inverse RoPE and OCP MXFP8 quantization, preserving BF16 rounding."""
+    """Quantize BF16 projection input to OCP MXFP8 payload and packed scales."""
     # Preserve both extern Out values: https://github.com/hw-native-sys/pypto/issues/3249
     return payload, scales
 
 
-@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "o_proj_a.cpp",
-               include_dirs=(pto_isa_include_dir(),))
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "o_proj_a.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "o_proj_a.cpp",
+               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
 def _o_proj_a(
     payload: pl.Tensor[[LOCAL_O_GROUPS * 80, O_GROUP_IN], pl.FP8E4M3FN],
     weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     activation_scale: pl.Tensor[[LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], pl.FP8E8M0],
     weight_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    output: pl.Out[pl.Tensor[[80, LOCAL_O_WIDTH], pl.BF16]],
+    output: pl.Out[pl.Tensor[[80, LOCAL_O_WIDTH], pl.FP8E4M3FN]],
+    output_scale: pl.Out[pl.Tensor[[1, 80 * (LOCAL_O_WIDTH // 32)], pl.FP8E8M0]],
     output_width: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Project grouped NZ weights and MX scales into concatenated BF16 columns."""
-    ...
+    active_rows: pl.Scalar[pl.INT32],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Round the O-A result to BF16 and quantize on the paired Vector cores."""
+    return output, output_scale
 
 
 @pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "o_proj_b.cpp",
@@ -109,29 +121,15 @@ def _o_proj_quantized(
     active_rows: pl.Scalar[pl.INT32],
 ):
     """Project one padded 80-row group from packed MXFP8 activations."""
-    row_tiles = 80 // MX_M_TILE
-    # O-A projection.
-    projected = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.BF16)
-    oa_workers = pl.min(LOCAL_O_GROUPS * (O_LORA // O_A_N_TILE), pl.system.available_cluster_count())
-    oa_workers = pl.max(1, oa_workers)
-    # Both projection grids write disjoint columns and may execute in waves.
-    with pl.spmd(oa_workers, name_hint="proj_o_a"):
-        projected = _o_proj_a(payload_all, wo_a, scales_all, wo_a_scale, projected, LOCAL_O_WIDTH)
-    # Quantize the O-A result for O-B.
     payload = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale_backing = pl.create_tensor([1, 80 * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-    output_blocks = row_tiles * (LOCAL_O_WIDTH // K_TILE)
-    output_workers = pl.min(pl.min(output_blocks, 64), 2 * pl.system.available_cluster_count())
-    for worker in pl.spmd(output_workers, name_hint="quant_o_a"):
-        for work in pl.range(worker, output_blocks, output_workers):
-            t0 = work // (LOCAL_O_WIDTH // K_TILE) * MX_M_TILE
-            k0 = work % (LOCAL_O_WIDTH // K_TILE) * K_TILE
-            rows = pl.max(pl.min(MX_M_TILE, active_rows - t0), 0)
-            output_quantized, output_packed_scale = quantize_bf16_to_mxfp8(projected, t0, k0, rows, MX_M_TILE)
-            payload = pl.store(output_quantized, [t0, k0], payload)
-            scale_offset = t0 * (LOCAL_O_WIDTH // 32) + k0 // K_TILE * MX_M_TILE * (K_TILE // 32)
-            output_packed_flat = pl.reshape(output_packed_scale, [1, MX_M_TILE * (K_TILE // 32)])
-            activation_scale_backing = pl.store(output_packed_flat, [0, scale_offset], activation_scale_backing)
+    oa_workers = pl.min(LOCAL_O_GROUPS * (O_LORA // O_A_N_TILE), pl.system.available_cluster_count())
+    oa_workers = pl.max(1, oa_workers)
+    with pl.spmd(oa_workers, name_hint="proj_o_a_quant"):
+        payload, activation_scale_backing = _o_proj_a(
+            payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale_backing,
+            LOCAL_O_WIDTH, active_rows,
+        )
     # O-B projection.
     capacity = pl.tensor.dim(output_group, 0)
     with pl.spmd(D // O_B_N_TILE, name_hint="proj_o_b"):
@@ -162,15 +160,18 @@ def o_proj(
         cosine_group = pl.tensor.slice(rope_cos, [group_rows, ROPE_DIM // 2], [group_start, 0])
         sine_group = pl.tensor.slice(rope_sin, [group_rows, ROPE_DIM // 2], [group_start, 0])
         output_group = pl.tensor.slice(output, [group_rows, D], [group_start, 0])
-        # Inverse RoPE and input quantization.
+        # Inverse RoPE.
+        rotated = pl.create_tensor([80, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+        vector_workers = pl.max(1, pl.min(64, 2 * pl.system.available_cluster_count()))
+        with pl.spmd(vector_workers, name_hint="rope_o_vf"):
+            rotated = _rope_o_vf(
+                attended_group, cosine_group, sine_group, rotated, active_rows, LOCAL_O_GROUPS,
+            )
+        # Input quantization.
         payload_all = pl.create_tensor([LOCAL_O_GROUPS * 80, O_GROUP_IN], dtype=pl.FP8E4M3FN)
         scales_all = pl.create_tensor([LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
-        quant_workers = pl.max(1, pl.min(64, 2 * pl.system.available_cluster_count()))
-        with pl.spmd(quant_workers, name_hint="rope_quant_o_vf"):
-            payload_all, scales_all = _rope_quant_o_vf(
-                attended_group, cosine_group, sine_group, payload_all, scales_all,
-                active_rows, LOCAL_O_GROUPS,
-            )
+        with pl.spmd(vector_workers, name_hint="quant_o_vf"):
+            payload_all, scales_all = _quant_o_vf(rotated, payload_all, scales_all, active_rows, LOCAL_O_GROUPS)
         output_group = _o_proj_quantized(
             payload_all, scales_all, wo_a, wo_a_scale, wo_b, wo_b_scale, output_group, active_rows,
         )
