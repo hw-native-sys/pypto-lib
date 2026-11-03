@@ -77,7 +77,8 @@ __tf__ __aicore__ inline void postprocess(
         for (int group = 0; group < 16; ++group) {
             float maximum = 1.0e-4f;
             for (int lane = 0; lane < 32; ++lane) maximum = std::max(maximum, std::abs(values[group * 32 + lane]));
-            bfloat16_t scale = static_cast<bfloat16_t>(maximum * (1.0f / 448.0f));
+            int32_t exponent = (std::bit_cast<int32_t>(maximum * (1.0f / 448.0f)) + 8388607) >> 23;
+            bfloat16_t scale = static_cast<bfloat16_t>(std::bit_cast<float>(exponent << 23));
             factors[row * 16 + group] = scale;
             auto output = reinterpret_cast<__ubuf__ float8_e4m3_t*>(dst);
             for (int lane = 0; lane < 32; ++lane) {
@@ -149,8 +150,10 @@ __tf__ __aicore__ inline void postprocess(
                 vsel(scale, lo, hi, lower);
                 vmaxs(scale, scale, 1.0e-4f, full, MODE_ZEROING);
                 vmuls(scale, scale, 1.0f / 448.0f, full, MODE_ZEROING);
-                vcvt(bf, scale, full, ROUND_R, RS_DISABLE, PART_EVEN);
-                vcvt(scale, bf, full, PART_EVEN);
+                RegTensor<int32_t> exponent, bits;
+                vadds(bits, (RegTensor<int32_t>&)scale, 8388607, full, MODE_ZEROING);
+                vshrs(exponent, bits, 23, full, MODE_ZEROING);
+                vshls((RegTensor<int32_t>&)scale, exponent, 23, full, MODE_ZEROING);
                 vdiv(normalized, values, scale, full, MODE_ZEROING);
                 vector_f8e4m3 fp8;
                 RegTensor<uint8_t> packed_bytes;

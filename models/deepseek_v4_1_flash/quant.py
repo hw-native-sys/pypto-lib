@@ -190,12 +190,15 @@ def quantize_mxfp4_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 
 
 def quantize_mxfp8_cache(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize the last dimension to E4M3 payload and group-32 BF16 scales."""
+    """Quantize the last dimension to E4M3 payload and upward power-of-two group-32 BF16 scales."""
     if value.shape[-1] % MX_GROUP:
         raise ValueError("MXFP8 cache width must be divisible by 32")
     grouped = value.float().unflatten(-1, (-1, MX_GROUP))
     amax = grouped.abs().amax(dim=-1).clamp_min(1e-4)
-    scale = (amax / 448.0).to(torch.bfloat16)
+    raw_scale = amax * (1.0 / 448.0)
+    # Round positive FP32 scales upward to powers of two.
+    scale_bits = (raw_scale.view(torch.int32) + 0x007FFFFF) & -0x00800000
+    scale = scale_bits.view(torch.float32).to(torch.bfloat16)
     payload = (grouped / scale.float().unsqueeze(-1)).clamp(-448.0, 448.0)
     return payload.flatten(-2).to(torch.float8_e4m3fn), scale
 
