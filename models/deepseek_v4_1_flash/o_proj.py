@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from quant import MX_GROUP, _quantize_mxfp8_activation, decode_e8m0, unpack_mx_b_scale
+from quant import MX_GROUP, _quantize_mxfp8_activation, decode_e8m0, encode_e8m0, pack_mx_a_scale, unpack_mx_b_scale
 
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum
@@ -29,6 +29,11 @@ from config import (
     PREFILL_MAX_TOKENS,
     FLASH as M, SP_T_DYN, T_DYN, TP_SIZE,
 )
+
+
+# Dynamic shape variables.
+O_PAYLOAD_ROWS = pl.dynamic("V41_O_PAYLOAD_ROWS")
+O_SCALE_COLS = pl.dynamic("V41_O_SCALE_COLS")
 
 
 # model config
@@ -50,31 +55,41 @@ O_B_N_TILE = 160
 D_TILE = 512
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_rope_vf.cpp",
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "rope_quant.cpp",
                include_dirs=(pto_isa_include_dir(),))
-def _rope_o_vf(
+def _rope_quant_o_vf(
     attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rotated: pl.Out[pl.Tensor[[80, LOCAL_H * HEAD_DIM], pl.BF16]],
+    payload: pl.Out[pl.Tensor[[O_PAYLOAD_ROWS, O_GROUP_IN], pl.FP8E4M3FN]],
+    scales: pl.Out[pl.Tensor[[LOCAL_O_GROUPS, O_SCALE_COLS], pl.FP8E8M0]],
     active_rows: pl.Scalar[pl.INT32],
     groups: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Apply inverse RoPE and round the rotary coordinates to BF16."""
-    ...
-
-
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_quant_vf.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _quant_o_vf(
-    rotated: pl.Tensor[[80, LOCAL_H * HEAD_DIM], pl.BF16],
-    payload: pl.Out[pl.Tensor[[LOCAL_O_GROUPS * 80, O_GROUP_IN], pl.FP8E4M3FN]],
-    scales: pl.Out[pl.Tensor[[LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], pl.FP8E8M0]],
-    active_rows: pl.Scalar[pl.INT32],
-    groups: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INT32],
 ) -> tuple[pl.Tensor, pl.Tensor]:
-    """Quantize BF16 projection input to OCP MXFP8 payload and packed scales."""
-    # Preserve both extern Out values: https://github.com/hw-native-sys/pypto/issues/3249
+    """Apply inverse RoPE, BF16 rounding and OCP MXFP8 quantization."""
+    return payload, scales
+
+
+@pl.jit.inline(auto_scope=False)
+def _rope_quant_output(
+    attended: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    active_rows: pl.Scalar[pl.INT32],
+):
+    """Write group-major payload and M16-packed MX_A_ZZ scales."""
+    padded_rows = pl.tensor.dim(payload, 0) // LOCAL_O_GROUPS
+    blocks = padded_rows // 16 * LOCAL_H
+    available = 2 * pl.system.available_cluster_count()
+    workers = pl.min(blocks, 64)
+    workers = pl.max(pl.min(workers, available), 1)
+    with pl.spmd(workers, name_hint="rope_quant_o_vf"):
+        payload, scales = _rope_quant_o_vf(
+            attended, rope_cos, rope_sin, payload, scales, active_rows, LOCAL_O_GROUPS, padded_rows,
+        )
     return payload, scales
 
 
@@ -160,18 +175,12 @@ def o_proj(
         cosine_group = pl.tensor.slice(rope_cos, [group_rows, ROPE_DIM // 2], [group_start, 0])
         sine_group = pl.tensor.slice(rope_sin, [group_rows, ROPE_DIM // 2], [group_start, 0])
         output_group = pl.tensor.slice(output, [group_rows, D], [group_start, 0])
-        # Inverse RoPE.
-        rotated = pl.create_tensor([80, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        vector_workers = pl.max(1, pl.min(64, 2 * pl.system.available_cluster_count()))
-        with pl.spmd(vector_workers, name_hint="rope_o_vf"):
-            rotated = _rope_o_vf(
-                attended_group, cosine_group, sine_group, rotated, active_rows, LOCAL_O_GROUPS,
-            )
-        # Input quantization.
+        # Inverse RoPE and input quantization.
         payload_all = pl.create_tensor([LOCAL_O_GROUPS * 80, O_GROUP_IN], dtype=pl.FP8E4M3FN)
         scales_all = pl.create_tensor([LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
-        with pl.spmd(vector_workers, name_hint="quant_o_vf"):
-            payload_all, scales_all = _quant_o_vf(rotated, payload_all, scales_all, active_rows, LOCAL_O_GROUPS)
+        payload_all, scales_all = _rope_quant_output(
+            attended_group, cosine_group, sine_group, payload_all, scales_all, active_rows,
+        )
         output_group = _o_proj_quantized(
             payload_all, scales_all, wo_a, wo_a_scale, wo_b, wo_b_scale, output_group, active_rows,
         )
@@ -432,6 +441,108 @@ def o_proj_with_hc_validation(
     return sublayer, output
 
 
+@pl.jit
+def rope_quant_validation(
+    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    payload: pl.Out[pl.Tensor[[O_PAYLOAD_ROWS, O_GROUP_IN], pl.FP8E4M3FN]],
+    scales: pl.Out[pl.Tensor[[LOCAL_O_GROUPS, O_SCALE_COLS], pl.FP8E8M0]],
+    active_rows: pl.Scalar[pl.INT32],
+    row_offset: pl.Scalar[pl.INT32],
+):
+    """Validate the production RoPE/quant producer, including sliced inputs."""
+    attended.bind_dynamic(0, T_DYN)
+    rope_cos.bind_dynamic(0, T_DYN)
+    rope_sin.bind_dynamic(0, T_DYN)
+    payload.bind_dynamic(0, O_PAYLOAD_ROWS)
+    scales.bind_dynamic(1, O_SCALE_COLS)
+    rows = pl.tensor.dim(attended, 0) - row_offset
+    attended_rows = pl.tensor.slice(attended, [rows, LOCAL_H * HEAD_DIM], [row_offset, 0])
+    cosine_rows = pl.tensor.slice(rope_cos, [rows, ROPE_DIM // 2], [row_offset, 0])
+    sine_rows = pl.tensor.slice(rope_sin, [rows, ROPE_DIM // 2], [row_offset, 0])
+    return _rope_quant_output(attended_rows, cosine_rows, sine_rows, payload, scales, active_rows)
+
+
+def golden_rope_quant(tensors):
+    """Compute packed payload and scales from BF16-rounded inverse RoPE."""
+    active = int(tensors["active_rows"])
+    input_offset = int(tensors["row_offset"])
+    padded = tensors["payload"].shape[0] // LOCAL_O_GROUPS
+    payload = tensors["payload"].view(LOCAL_O_GROUPS, padded, O_GROUP_IN)
+    scales = tensors["scales"]
+    payload.zero_()
+    scales.view(torch.uint8).zero_()
+    for start in range(0, active, 64):
+        end = min(active, start + 64)
+        value = tensors["attended"][input_offset + start:input_offset + end].unflatten(-1, (LOCAL_H, HEAD_DIM)).clone()
+        cos = tensors["rope_cos"][input_offset + start:input_offset + end]
+        sin = tensors["rope_sin"][input_offset + start:input_offset + end]
+        value[..., -ROPE_DIM:] = rope_interleave(value[..., -ROPE_DIM:], cos, sin, inverse=True)
+        grouped = value.reshape(end - start, LOCAL_O_GROUPS, O_GROUP_IN)
+        quantized, scale = _quantize_mxfp8_activation(grouped, scale_alg=0)
+        payload[:, start:end].copy_(quantized.flatten(-2).transpose(0, 1))
+        codes = encode_e8m0(scale).transpose(0, 1)
+        rows = (end - start + 16 - 1) // 16 * 16
+        logical = torch.zeros(LOCAL_O_GROUPS, rows, O_GROUP_IN // 32, dtype=torch.uint8)
+        logical[:, :end - start].copy_(codes)
+        for group in range(LOCAL_O_GROUPS):
+            packed = pack_mx_a_scale(logical[group]).reshape(-1)
+            scale_offset = start * (O_GROUP_IN // 32)
+            scales[group].view(torch.uint8)[scale_offset:scale_offset + packed.numel()].copy_(packed)
+
+
+def compare_rope_quant_bytes(actual, expected, **kwargs):
+    """Compare storage bytes through the standard strict comparator."""
+    from golden import ratio_allclose
+
+    compare = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
+    return compare(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8), **kwargs)
+
+
+def build_rope_quant_specs(active, capacity, seed=17, *, padded_rows=None, row_offset=0, edges=False):
+    """Build finite active inputs and poisoned inactive rows."""
+    from golden import ScalarSpec, TensorSpec
+
+    if not 0 <= active <= capacity or capacity < 1:
+        raise ValueError("Require 0 <= active <= capacity and capacity >= 1")
+    padded = padded_rows if padded_rows is not None else (capacity + 15) // 16 * 16
+    if padded < capacity or padded % 16 or row_offset < 0:
+        raise ValueError("Require M16-aligned padding >= capacity and a nonnegative row offset")
+    generator = torch.Generator().manual_seed(seed)
+    attended = torch.randn(capacity, LOCAL_H * HEAD_DIM, generator=generator).bfloat16()
+    if edges and active:
+        boundary = torch.tensor([0.0, -0.0, 0.5, -0.5, 0.99609375, 1.0, 1.0078125, 448.0])
+        for index, exponent in enumerate((-120, -16, 0, 16, 100)):
+            values = torch.ldexp(boundary, torch.full_like(boundary, exponent, dtype=torch.int32))
+            attended[0, index * 32:(index + 1) * 32] = values.repeat(4).bfloat16()
+        attended[0, 160:192] = 0.0
+    attended[active:] = float("nan")
+    frequencies = 10000.0 ** (-torch.arange(0, ROPE_DIM, 2).float() / ROPE_DIM)
+    angles = (torch.arange(capacity).float() + 127.0)[:, None] * frequencies
+    cos, sin = angles.cos(), angles.sin()
+    cos[active:] = float("nan")
+    sin[active:] = float("nan")
+    if row_offset:
+        prefix = torch.full([row_offset, LOCAL_H * HEAD_DIM], float("nan"), dtype=torch.bfloat16)
+        trig_prefix = torch.full([row_offset, ROPE_DIM // 2], float("nan"), dtype=torch.float32)
+        attended = torch.cat((prefix, attended))
+        cos = torch.cat((trig_prefix, cos))
+        sin = torch.cat((trig_prefix, sin))
+    scale_shape = [LOCAL_O_GROUPS, padded * (O_GROUP_IN // 32)]
+    initial_scales = torch.full(scale_shape, 127, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    return [
+        TensorSpec("attended", list(attended.shape), torch.bfloat16, init_value=attended),
+        TensorSpec("rope_cos", [capacity + row_offset, ROPE_DIM // 2], torch.float32, init_value=cos),
+        TensorSpec("rope_sin", [capacity + row_offset, ROPE_DIM // 2], torch.float32, init_value=sin),
+        TensorSpec("payload", [LOCAL_O_GROUPS * padded, O_GROUP_IN], torch.float8_e4m3fn, init_value=1.0),
+        TensorSpec("scales", scale_shape, torch.float8_e8m0fnu, init_value=initial_scales),
+        ScalarSpec("active_rows", torch.int32, active),
+        ScalarSpec("row_offset", torch.int32, row_offset),
+    ]
+
+
+
 def build_o_proj_specs(active_tokens: int, *, pad_to_tile: bool = True):
     """Build deterministic output-projection fixtures with padded inactive rows."""
     from golden import ScalarSpec, TensorSpec
@@ -547,10 +658,43 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tp", type=int, choices=[1, 2, 4, 8], default=TP_SIZE)
-    parser.add_argument("--case", choices=["all", "empty", "fast", "tail", "hc-post"], default="all")
+    parser.add_argument("--case", choices=["all", "empty", "fast", "tail", "hc-post", "rope-quant", "rope-quant-custom"], default="all")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--active", type=int, default=72)
+    parser.add_argument("--capacity", type=int, default=80)
+    parser.add_argument("--padded-rows", type=int, default=None)
+    parser.add_argument("--row-offset", type=int, default=0)
+    parser.add_argument("--edges", action="store_true")
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    if (args.golden_data or args.runtime_dir) and args.case != "rope-quant-custom":
+        parser.error("Golden/build replay requires --case rope-quant-custom")
+    if args.case in ("all", "rope-quant", "rope-quant-custom"):
+        quant_cases = [(0, 16, 80, 0), (1, 16, 80, 0), (12, 16, 80, 0), (17, 32, 80, 0),
+                       (72, 72, 80, 0), (72, 80, 80, 0), (80, 80, 80, 0), (17, 32, 80, 80)]
+        if args.case == "rope-quant-custom":
+            quant_cases = [(args.active, args.capacity, args.padded_rows, args.row_offset)]
+        for active, capacity, padded, offset in quant_cases:
+            print(f"[O_ROPE_QUANT] active={active}, capacity={capacity}, padded={padded}, offset={offset}", flush=True)
+            heap_bytes = max(256 * 1024 * 1024, capacity * LOCAL_H * HEAD_DIM * 4)
+            result = run(
+                fn=rope_quant_validation,
+                specs=build_rope_quant_specs(active, capacity, padded_rows=padded, row_offset=offset, edges=args.edges),
+                golden_fn=golden_rope_quant,
+                compare_fn={"payload": compare_rope_quant_bytes, "scales": compare_rope_quant_bytes},
+                config={
+                    "backend_type": args.backend_type, "execution_mode": args.execution_mode,
+                    "device_id": args.device, "ring_heap": (heap_bytes,) * 4,
+                },
+                compile_only=args.compile_only,
+                save_data=args.save_data,
+                golden_data=args.golden_data,
+                runtime_dir=args.runtime_dir,
+            )
+            if not result.passed:
+                raise SystemExit(result.error or 1)
     cases = (("empty", 0), ("fast", 12), ("tail", 17))
     for name, active in cases:
         if args.case not in ("all", name):
