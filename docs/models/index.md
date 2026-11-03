@@ -1,11 +1,13 @@
 # Model implementation
 
-`models/` holds end-to-end LLM kernels, one flat directory per model build.
+`models/` holds end-to-end LLM kernels and framework-specific operator integrations.
+Model builds have their own directories; `vllm_ascend/` groups operators by model.
 Files ending in `_draft.py` are work in progress and are not part of the
 tracked runnable set.
 
 | Directory | What it implements | `pypto-serving` |
 | --- | --- | --- |
+| [vllm_ascend](vllm_ascend/index.md) | DeepSeek V4 Flash CSA in SPMD/MPMD modes with vLLM Ascend native bindings | Uses the vLLM Ascend integration |
 | [qwen3_14b](qwen3_14b/index.md) | Qwen3-14B BF16 prefill and decode with the serving contract, plus A8W8 and TurboQuant variants and the sampling components | Supported — one-card A2/A3 accuracy |
 | [deepseek_v4_flash_mtp](deepseek_v4_flash_mtp/index.md) | DeepSeek V4-Flash at MTP = 1, batch 4 per card: operators, layer and MTP compositions, prefill/decode full forwards | Supported — eight-card accuracy job on relevant PRs |
 | [deepseek_v4_flash_dspark](deepseek_v4_flash_dspark/index.md) | The same V4-Flash checkpoint at batch 64 per card and S = 8 DSpark speculation, with TP-sharded DSA-CP attention; under development | Not supported |
