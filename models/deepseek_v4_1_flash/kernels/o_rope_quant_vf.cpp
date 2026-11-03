@@ -96,7 +96,7 @@ __aicore__ inline void run_cpu(__gm__ int64_t* args) {
                 for (int d = 0; d < 32; ++d) {
                     float v = value[g * 32 + d] / divisor * float(e != 0);
                     v = std::min(std::max(v, -448.0f), 448.0f);
-                    data<float8_e4m3_t>(args, 3)[(h / 8 * 80 + t0 + r) * stride(args, 3) + h % 8 * 512 + g * 32 + d] = static_cast<float8_e4m3_t>(v);
+                    data<float8_e4m3_t>(args, 3)[(h / 8 * 80 + t0 + r) * stride(args, 3) + h % 8 * 512 + g * 32 + d] = float8_e4m3_t(v, RoundMode::CAST_RINT);
                 }
                 data<uint8_t>(args, 4)[h / 8 * stride(args, 4) + t0 * 128 + h % 8 * 256 + g / 2 * 32 + r * 2 + g % 2] = e;
             }

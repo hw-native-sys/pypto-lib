@@ -19,6 +19,18 @@ namespace grouped_mxfp4 {
 
 using namespace pto;
 
+#if defined(__CPU_SIM)
+// FIFOs transport data between the simulator's private core memories.
+using WeightPipe = TPipe<0, Direction::DIR_V2C, 65536, 2>;
+using ProjectionPipe = TPipe<1, Direction::DIR_C2V, 65536, 2>;
+using HiddenPipe = TPipe<2, Direction::DIR_V2C, 16384, 2>;
+using ScalePipe = TPipe<3, Direction::DIR_V2C, 512, 2>;
+inline thread_local WeightPipe weightPipe(nullptr, 0, 0);
+inline thread_local ProjectionPipe projectionPipe(nullptr, 0, 0);
+inline thread_local HiddenPipe hiddenPipe(nullptr, 0, 0);
+inline thread_local ScalePipe scalePipe(nullptr, 0, 0);
+#endif
+
 constexpr uint32_t M_TILE = 64;
 constexpr uint32_t N_TILE = 256;
 constexpr uint32_t K_TILE = 256;
@@ -47,16 +59,22 @@ static_assert(L1_BASE + L1_SLOT_COUNT * L1_SLOT_BYTES <= 512 * 1024);
 #ifdef __DAV_CUBE__
 AICORE inline void releaseSlot(uint32_t slot)
 {
+#if defined(__CPU_SIM)
+    TFREE<WeightPipe, TileSplitAxis::TILE_UP_DOWN>(weightPipe);
+#else
     const uint8_t freeFlag = static_cast<uint8_t>(1 + 2 * slot);
     set_intra_block(PIPE_MTE1, freeFlag);
     set_intra_block(PIPE_MTE1, freeFlag + VEC_CORE_ID_OFFSET);
+#endif
 }
 
 AICORE inline void waitSlot(uint32_t slot)
 {
+#if !defined(__CPU_SIM)
     const uint8_t readyFlag = static_cast<uint8_t>(2 * slot);
     wait_intra_block(PIPE_MTE1, readyFlag);
     wait_intra_block(PIPE_MTE1, readyFlag + VEC_CORE_ID_OFFSET);
+#endif
 }
 #endif
 
@@ -64,7 +82,11 @@ template <typename T>
 AICORE inline __gm__ T* tensorData(__gm__ int64_t* args, uint32_t index)
 {
     auto* tensor = reinterpret_cast<__gm__ Tensor*>(args[index]);
+#if defined(__CPU_SIM)
+    dcci(tensor, cache_line_t::SINGLE_CACHE_LINE);
+#else
     dcci(tensor, SINGLE_CACHE_LINE);
+#endif
     return reinterpret_cast<__gm__ T*>(tensor->buffer.addr) + tensor->start_offset;
 }
 
@@ -77,7 +99,11 @@ struct Chunk {
 AICORE inline int64_t acquireCount(__gm__ int32_t* counts, int64_t expert)
 {
     auto* count = counts + expert;
+#if defined(__CPU_SIM)
+    dcci(count, cache_line_t::SINGLE_CACHE_LINE);
+#else
     dcci(count, SINGLE_CACHE_LINE);
+#endif
     return *count;
 }
 
@@ -136,10 +162,14 @@ AICORE inline void produceWeight(__gm__ uint8_t* weight, int64_t k, int64_t n,
             set_flag(PIPE_MTE2, PIPE_V, event);
         }
         wait_flag(PIPE_V, PIPE_MTE3, event);
+#if defined(__CPU_SIM)
+        TPUSH<WeightPipe, NZ, TileSplitAxis::TILE_UP_DOWN>(weightPipe, nz[slot]);
+#else
         wait_intra_block(PIPE_MTE3, static_cast<uint8_t>(1 + 2 * slot));
         TASSIGN(matSlot, L1_BASE + slot * L1_SLOT_BYTES);
         TINSERT(matSlot, nz[slot], static_cast<uint16_t>(lane * VEC_K_TILE), static_cast<uint16_t>(0));
         set_intra_block(PIPE_MTE3, static_cast<uint8_t>(2 * slot));
+#endif
         set_flag(PIPE_MTE3, PIPE_V, event);
     }
 }
@@ -255,8 +285,12 @@ AICORE inline void computeProjection(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0
         if (scaleOffset == 0) {
             wait_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(4 + scaleSlot));
         }
+#if defined(__CPU_SIM)
+        TPOP<WeightPipe, MatB, TileSplitAxis::TILE_UP_DOWN>(weightPipe, bMat);
+#else
         waitSlot(slot);
         TASSIGN(bMat, L1_BASE + slot * L1_SLOT_BYTES);
+#endif
         for (uint32_t half = 0; half < 2; ++half) {
             const auto event = static_cast<event_t>(half);
             const uint16_t offset = half * L0_K_TILE;
@@ -307,7 +341,10 @@ AICORE inline void beginGemm()
         set_flag(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(2 + slot));
         set_flag(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(4 + slot));
         set_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(slot));
+
+#if !defined(__CPU_SIM)
         releaseSlot(slot);
+#endif
 #endif
 #ifdef __DAV_VEC__
         set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(slot));
@@ -325,7 +362,9 @@ AICORE inline void endGemm()
 #endif
 #ifdef __DAV_VEC__
         wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(slot));
+#if !defined(__CPU_SIM)
         wait_intra_block(PIPE_MTE3, static_cast<uint8_t>(1 + 2 * slot));
+#endif
 #endif
     }
     pipe_barrier(PIPE_ALL);
@@ -522,6 +561,9 @@ struct ActivateProjection {
     template <typename Acc>
     AICORE inline void operator()(Acc& acc) const
     {
+#if defined(__CPU_SIM)
+        TPUSH<ProjectionPipe, Acc, TileSplitAxis::TILE_LEFT_RIGHT>(projectionPipe, acc);
+#else
         using VecResult = Tile<TileType::Vec, float, M_TILE, N_TILE / 2, BLayout::RowMajor, DYNAMIC, N_TILE / 2>;
         VecResult target;
         target.SetValidRow(acc.GetValidRow());
@@ -535,6 +577,7 @@ struct ActivateProjection {
             set_intra_block(PIPE_FIX, 4);
             set_intra_block(PIPE_FIX, 4 + VEC_CORE_ID_OFFSET);
         }
+#endif
     }
 };
 #endif
@@ -596,8 +639,12 @@ AICORE inline void consumeDown(__gm__ float8_e8m0_t* weightScale, __gm__ float* 
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
     for (int64_t k0 = 0; k0 < kEnd - kBegin; k0 += K_TILE) {
         const uint32_t slot = (k0 / K_TILE) % 2;
+#if defined(__CPU_SIM)
+        TPOP<WeightPipe, MatB, TileSplitAxis::TILE_UP_DOWN>(weightPipe, bMat);
+#else
         waitSlot(slot);
         TASSIGN(bMat, L1_BASE + slot * L1_SLOT_BYTES);
+#endif
         for (uint32_t half = 0; half < 2; ++half) {
             const auto event = static_cast<event_t>(half);
             const uint16_t offset = half * L0_K_TILE;
@@ -696,36 +743,94 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
             TLOAD(weight, globalWeight);
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID6);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID6);
+#if !defined(__CPU_SIM)
             set_intra_block(PIPE_V, 5);
+#endif
 #endif
             for (int64_t h = hBegin; h < hEnd; ++h) {
 #ifdef __DAV_VEC__
                 produceWeight(w1, width, hidden, expert, h * N_TILE);
                 produceWeight(w3, width, hidden, expert, h * N_TILE);
+#if !defined(__CPU_SIM)
                 wait_intra_block(PIPE_V, 4);
+#endif
+#if defined(__CPU_SIM)
+                using Projection = Tile<TileType::Vec, float, M_TILE, N_TILE / 2,
+                                        BLayout::RowMajor, DYNAMIC, N_TILE / 2>;
+                for (int address : {GATE_UB, UP_UB}) {
+                    Projection incoming, local;
+                    incoming.SetValidRow(valid);
+                    local.SetValidRow(valid);
+                    TPOP<ProjectionPipe, Projection, TileSplitAxis::TILE_LEFT_RIGHT>(projectionPipe, incoming);
+                    TASSIGN(local, address);
+                    TMOV(local, incoming);
+                    TFREE<ProjectionPipe, TileSplitAxis::TILE_LEFT_RIGHT>(projectionPipe);
+                }
+#endif
                 activateQuantize((__ubuf__ float*)GATE_UB, (__ubuf__ float*)UP_UB,
                                  (__ubuf__ float*)WEIGHT_UB, (__ubuf__ uint8_t*)ACT_UB,
                                  (__ubuf__ uint8_t*)SCALE_UB, valid, padded);
                 set_flag(PIPE_V, PIPE_MTE3, EVENT_ID6);
                 wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID6);
+#if defined(__CPU_SIM)
+                TPUSH<HiddenPipe, Payload, TileSplitAxis::TILE_LEFT_RIGHT>(hiddenPipe, payload);
+                using Codes = Tile<TileType::Vec, uint8_t, 1, M_TILE * 4>;
+                Codes codes;
+                TASSIGN(codes, SCALE_UB);
+                TPUSH<ScalePipe, Codes, TileSplitAxis::TILE_LEFT_RIGHT>(scalePipe, codes);
+#else
                 TINSERT(hMat, payload, 0, (h - hBegin) * N_TILE + lane * (N_TILE / 2));
                 auto* scaleDestination = (__cbuf__ uint8_t*)SCALE_L1 + (h - hBegin) * 128 + lane * 64;
                 copy_ubuf_to_cbuf(scaleDestination, (__ubuf__ uint8_t*)SCALE_UB, 0, padded / 16,
                                  2, 0, (H_CAP / 32 * 16 - 64) / 32);
+#endif
                 set_flag(PIPE_MTE3, PIPE_V, EVENT_ID6);
                 wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID6);
+#if !defined(__CPU_SIM)
                 set_intra_block(PIPE_MTE3, 5);
+#endif
 #endif
 #ifdef __DAV_CUBE__
                 computeProjection<M_TILE>(x, xScale, w1Scale, width, hidden, experts,
                                           experts * rowStride, chunk, h * N_TILE, ActivateProjection{GATE_UB});
                 computeProjection<M_TILE>(x, xScale, w3Scale, width, hidden, experts,
                                           experts * rowStride, chunk, h * N_TILE, ActivateProjection{UP_UB});
+#if defined(__CPU_SIM)
+                using HiddenTile = Tile<TileType::Mat, float8_e4m3_t, M_TILE, N_TILE,
+                                        BLayout::ColMajor, DYNAMIC, N_TILE, SLayout::RowMajor, 512>;
+                using HiddenMat = Tile<TileType::Mat, float8_e4m3_t, M_TILE, H_CAP,
+                                       BLayout::ColMajor, DYNAMIC, H_CAP, SLayout::RowMajor, 512>;
+                using Codes = Tile<TileType::Mat, uint8_t, 1, M_TILE * 8>;
+                HiddenTile incoming;
+                HiddenMat local;
+                incoming.SetValidRow(padded);
+                local.SetValidRow(padded);
+                TPOP<HiddenPipe, HiddenTile, TileSplitAxis::TILE_LEFT_RIGHT>(hiddenPipe, incoming);
+                TASSIGN(local, ACT_L1);
+                TINSERT(local, incoming, 0, (h - hBegin) * N_TILE);
+                TFREE<HiddenPipe, TileSplitAxis::TILE_LEFT_RIGHT>(hiddenPipe);
+                Codes codes;
+                TPOP<ScalePipe, Codes, TileSplitAxis::TILE_LEFT_RIGHT>(scalePipe, codes);
+                using ScaleMat = Tile<TileType::Mat, float8_e8m0_t, M_TILE, H_CAP / 32,
+                                      BLayout::RowMajor, DYNAMIC, H_CAP / 32, SLayout::RowMajor, 32>;
+                ScaleMat scales;
+                TASSIGN(scales, SCALE_L1);
+                auto* destination = reinterpret_cast<uint8_t*>(scales.data());
+                for (int lane = 0; lane < 2; ++lane) {
+                    for (int rowBlock = 0; rowBlock < padded / 16; ++rowBlock) {
+                        std::memcpy(destination + rowBlock * (H_CAP / 32 * 16) + (h - hBegin) * 128 + lane * 64,
+                                    codes.data() + lane * M_TILE * 4 + rowBlock * 64, 64);
+                    }
+                }
+                TFREE<ScalePipe, TileSplitAxis::TILE_LEFT_RIGHT>(scalePipe);
+#endif
 #endif
             }
 #ifdef __DAV_CUBE__
+#if !defined(__CPU_SIM)
             wait_intra_block(PIPE_MTE1, 5);
             wait_intra_block(PIPE_MTE1, 5 + VEC_CORE_ID_OFFSET);
+#endif
 #endif
             for (int64_t n0 = 0; n0 < width; n0 += N_TILE) {
 #ifdef __DAV_VEC__

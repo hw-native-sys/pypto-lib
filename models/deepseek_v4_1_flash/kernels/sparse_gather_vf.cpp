@@ -779,7 +779,7 @@ void simulate_quantized_query(__gm__ int64_t* args, int token, const bfloat16_t*
                 float v = value[group * 32 + d] / divisor * float(exponent != 0);
                 v = std::min(std::max(v, -448.0f), 448.0f);
                 data<float8_e4m3_t>(args, 0)[(head / 8 * 80 + token) * row_stride(args, 0)
-                    + head % 8 * 512 + group * 32 + d] = static_cast<float8_e4m3_t>(v);
+                    + head % 8 * 512 + group * 32 + d] = float8_e4m3_t(v, RoundMode::CAST_RINT);
             }
             data<uint8_t>(args, 11)[head / 8 * row_stride(args, 11) + (token / 16) * 2048
                 + head % 8 * 256 + group / 2 * 32 + token % 16 * 2 + group % 2] = exponent;
