@@ -318,7 +318,6 @@ def draft_layer(
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[C.EP_SIZE, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
@@ -412,7 +411,6 @@ def draft_layer(
         recv_scale,
         recv_weights,
         recv_routes,
-        arrived,
         data_arrived,
         routed_output,
         combine_arrived,
@@ -502,7 +500,6 @@ def _dspark_drafter(
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[C.EP_SIZE, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
@@ -700,7 +697,6 @@ def _dspark_drafter(
                 recv_scale,
                 recv_weights,
                 recv_routes,
-                arrived,
                 data_arrived,
                 routed_output,
                 combine_arrived,
@@ -826,7 +822,6 @@ def l3_dspark_drafter(
     recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
     recv_weights_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
     recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([C.EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
     routed_output_buf = pld.alloc_window_buffer([C.MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
@@ -838,7 +833,6 @@ def l3_dspark_drafter(
         recv_scale = pld.window(recv_scale_buf, [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
         recv_weights = pld.window(recv_weights_buf, [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
         recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        arrived = pld.window(arrived_buf, [C.EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buf, [C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
         routed_output = pld.window(routed_output_buf, [C.MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(
@@ -904,7 +898,6 @@ def l3_dspark_drafter(
             recv_scale,
             recv_weights,
             recv_routes,
-            arrived,
             data_arrived,
             routed_output,
             combine_arrived,

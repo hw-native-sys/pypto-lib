@@ -337,7 +337,6 @@ def _prefill_moe(
     recv_routes: pld.DistributedTensor[
         [LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32
     ],
-    arrived: pld.DistributedTensor[[RANKS, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[
         [RANKS, LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
@@ -393,7 +392,7 @@ def _prefill_moe(
                 routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
                 shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
                 round_next, round_mixed, round_output,
-                recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
+                recv_meta, recv_x, recv_scale, recv_weights, recv_routes, data_arrived,
                 routed_output, combine_arrived, active, ep_rank, epoch,
                 hf32=False,
             )
@@ -505,7 +504,6 @@ def l2_prefill_fwd(
     recv_scale: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, D // 32], pl.UINT8],
     recv_weights: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[RANKS, 128], pl.INT32],
     data_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
     routed_output: pld.DistributedTensor[[MOE_TOKENS * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
@@ -715,7 +713,7 @@ def l2_prefill_fwd(
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
             layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
             layer_shared_w3, layer_shared_w3_scale, next_pre, ffn_mixed, next_hidden,
-            recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
+            recv_meta, recv_x, recv_scale, recv_weights, recv_routes, data_arrived,
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
             moe_ready, active, rank, layer + 1,
         )
@@ -725,7 +723,7 @@ def l2_prefill_fwd(
     output_hidden = pl.reshape(x_hc_out, [CAPACITY, HC_DIM])
     gather_rows(source_hidden, identity_rows, output_hidden, gather_ready)
     gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready)
-    clear_moe_signals(x_hc_out, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
+    clear_moe_signals(x_hc_out, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     retire_prefill_signals(x_hc_out, attention_arrived, rank, 0)
     final_logits, final_sampled_ids = final_output(
         final_hidden, final_pre, final_norm_weight, lm_head_weight,
@@ -881,7 +879,6 @@ def l3_prefill_fwd(
     recv_scale_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
     recv_weights_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
     recv_routes_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    arrived_buffer = pld.alloc_window_buffer([RANKS, 128], dtype=pl.INT32)
     data_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
     routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
@@ -897,7 +894,6 @@ def l3_prefill_fwd(
         recv_scale = pld.window(recv_scale_buffer, [LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
         recv_weights = pld.window(recv_weights_buffer, [LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
         recv_routes = pld.window(recv_routes_buffer, [LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        arrived = pld.window(arrived_buffer, [RANKS, 128], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
         routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
@@ -961,7 +957,6 @@ def l3_prefill_fwd(
             recv_scale,
             recv_weights,
             recv_routes,
-            arrived,
             data_arrived,
             routed_output,
             combine_arrived,

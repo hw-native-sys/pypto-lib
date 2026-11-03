@@ -163,7 +163,6 @@ def decode_encoder(
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
@@ -386,7 +385,7 @@ def decode_encoder(
                 pre_mix, x_mixed, x_hc,
                 recv_meta, recv_x, recv_scale,
                 recv_weights, recv_routes,
-                arrived, data_arrived,
+                data_arrived,
                 routed_output, combine_arrived,
                 local_moe_tokens, rank, layer + 1,
                 force_topk,
@@ -459,7 +458,6 @@ def decode_decoder(
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
@@ -660,12 +658,12 @@ def decode_decoder(
                 pre_mix, x_mixed, x_hc,
                 recv_meta, recv_x, recv_scale,
                 recv_weights, recv_routes,
-                arrived, data_arrived,
+                data_arrived,
                 routed_output, combine_arrived,
                 local_moe_tokens, rank, layer + 1,
                 force_topk,
             )
-    clear_moe_signals(x_hc, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
+    clear_moe_signals(x_hc, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_hc
 
 
@@ -740,7 +738,6 @@ def l2_decode_fwd(
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
@@ -802,7 +799,7 @@ def l2_decode_fwd(
         routed_w1, routed_w2, routed_w3,
         shared_w1, shared_w2, shared_w3,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-        arrived, data_arrived, routed_output, combine_arrived,
+        data_arrived, routed_output, combine_arrived,
         moe_num_tokens, attention_num_tokens, rank,
         wq_a_scale, wq_b_scale, wkv_scale, wo_b_scale,
         index_wq_b_scale,
@@ -835,7 +832,7 @@ def l2_decode_fwd(
         routed_w1, routed_w2, routed_w3,
         shared_w1, shared_w2, shared_w3,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-        arrived, data_arrived, routed_output, combine_arrived,
+        data_arrived, routed_output, combine_arrived,
         moe_num_tokens, attention_num_tokens, rank,
         wq_a_scale, wq_b_scale, wkv_scale, wo_b_scale,
         index_wq_b_scale,
@@ -1033,7 +1030,6 @@ def l3_decode_fwd(
     recv_scale_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
     recv_weights_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
     recv_routes_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    arrived_buffer = pld.alloc_window_buffer([EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     data_arrived_buffer = pld.alloc_window_buffer(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
@@ -1055,7 +1051,6 @@ def l3_decode_fwd(
         recv_routes = pld.window(
             recv_routes_buffer, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32
         )
-        arrived = pld.window(arrived_buffer, [EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         data_arrived = pld.window(
             data_arrived_buffer,
             [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
@@ -1098,7 +1093,7 @@ def l3_decode_fwd(
             routed_w1[rank], routed_w2[rank], routed_w3[rank],
             shared_w1[rank], shared_w2[rank], shared_w3[rank],
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-            arrived, data_arrived, routed_output, combine_arrived,
+            data_arrived, routed_output, combine_arrived,
             moe_num_tokens, attention_num_tokens, rank,
             wq_a_scale[rank], wq_b_scale[rank], wkv_scale[rank], wo_b_scale[rank],
             index_wq_b_scale[rank],
