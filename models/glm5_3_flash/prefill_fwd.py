@@ -15,11 +15,10 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import argparse
+import os
 import dataclasses
-import inspect
 import json
 import math
-import os
 import tempfile
 from dataclasses import dataclass, field, replace
 from math import gcd
@@ -44,10 +43,7 @@ from models.glm5_3_flash.layer import (
     forward_epoch_guard as forward_epoch_guard, forward_geometry as forward_geometry,
     forward_parameter_names as forward_parameter_names,
     forward_query_tensor_names as forward_query_tensor_names,
-    forward_tensor_layouts as forward_tensor_layouts, l3_prefill_head_rows,
-    l3_prefill_lm_head_logits as l3_prefill_lm_head_logits, l3_prefill_moe_layer,
-    l3_prefill_mtp_head as l3_prefill_mtp_head, l3_prefill_mtp_prepare as l3_prefill_mtp_prepare,
-    l3_prefill_sparse_attention, prefill_dense_layer, prefill_head_rows,
+    forward_tensor_layouts as forward_tensor_layouts, prefill_dense_layer, prefill_head_rows,
     prefill_kda_attention, prefill_lm_head_logits, prefill_moe_layer, prefill_seed, prefill_sparse_attention,
     reference_layer_forward, synthetic_layer,
 )
@@ -756,39 +752,6 @@ GLM_WEIGHT_STACKS = (
 )
 _PARAM_TO_STACK = dict(GLM_WEIGHT_STACKS)
 _STACK_TO_PARAM = {stack: param for param, stack in GLM_WEIGHT_STACKS}
-WORKSPACES = {
-    "ws_attn_pre": ((CAPACITY, HC_MULT), torch.float32),
-    "ws_attn_post": ((CAPACITY, HC_MULT), torch.float32),
-    "ws_attn_res": ((CAPACITY, HC_MULT, HC_MULT), torch.float32),
-    "ws_collapsed": ((CAPACITY, D), torch.bfloat16),
-    "ws_normed": ((CAPACITY, D), torch.bfloat16),
-    "ws_attn_partial": ((CAPACITY, D), torch.float32),
-    "ws_sublayer_out": ((CAPACITY, D), torch.bfloat16),
-    "ws_ffn_pre": ((CAPACITY, HC_MULT), torch.float32),
-    "ws_ffn_post": ((CAPACITY, HC_MULT), torch.float32),
-    "ws_ffn_res": ((CAPACITY, HC_MULT, HC_MULT), torch.float32),
-    "ws_ffn_input": ((CAPACITY, D), torch.bfloat16),
-    "ws_ffn_partial": ((CAPACITY, D), torch.float32),
-    "ws_ffn_out": ((CAPACITY, D), torch.bfloat16),
-    "ws_x_hc_a": ((CAPACITY, HC_MULT, D), torch.bfloat16),
-    "ws_x_hc_b": ((CAPACITY, HC_MULT, D), torch.bfloat16),
-    "kda_out": ((CAPACITY, LOCAL_KDA_H, KDA_DIM), torch.bfloat16),
-    "dsa_query": ((CAPACITY, LOCAL_H, QK_DIM), torch.bfloat16),
-    "attn_out": ((CAPACITY, LOCAL_H, V_DIM), torch.bfloat16),
-    "index_q": ((CAPACITY, INDEX_H, INDEX_DIM), torch.bfloat16),
-    "index_k": ((CAPACITY, INDEX_DIM), torch.bfloat16),
-    "index_scores": ((CAPACITY, POOL_AXIS), torch.float32),
-    "selected_pools": ((CAPACITY, KPOOL_SELECT_K), torch.int32),
-    "selected_valid": ((CAPACITY, KPOOL_SELECT_K), torch.int32),
-    "mixed_qkv": ((CAPACITY, 3 * LOCAL_KDA_QKV_DIM), torch.bfloat16),
-    "decay": ((CAPACITY, LOCAL_KDA_H, KDA_DIM), torch.float32),
-    "beta": ((CAPACITY, BETA_PAD), torch.float32),
-    "kda_q": ((CAPACITY, LOCAL_KDA_H, KDA_DIM), torch.bfloat16),
-    "kda_k": ((CAPACITY, LOCAL_KDA_H, KDA_DIM), torch.bfloat16),
-    "kda_v": ((CAPACITY, LOCAL_KDA_H, KDA_DIM), torch.bfloat16),
-    "dense_x_int8": ((CAPACITY, D), torch.int8),
-}
-OUTPUTS = {"head_hidden": ((LOGIT_ROWS, D), torch.bfloat16)}
 
 _KDA_TENSORS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("w_q", "self_attn.", ("q_proj.weight",)),
@@ -847,10 +810,6 @@ INTERNAL_DUMP_KEYS = (
     "kda_gate", "kda_o_normed", "mla_q_resid", "mla_k_latent", "mla_topk_indices",
     "router_topk_weights", "router_topk_indices", "moe_routed", "moe_shared",
 )
-
-MTP_SPEC_TOKENS = 3
-VERIFY_X_H_C = os.environ.get("GLM53_PREFILL_VERIFY_XHC", "") == "1"
-TRACE_DISPATCH = os.environ.get("GLM53_PREFILL_TRACE_DISPATCH", "") == "1"
 
 
 @pl.jit(auto_scope=False)
@@ -1822,46 +1781,6 @@ def prepare_step_inputs(
         **step,
         **kda_host_constants(),
     }
-
-
-def production_program_entry(program: str):
-    """Select an auxiliary single-stage L3 entry for MTP execution."""
-    if program == "dsa_attn":
-        return l3_prefill_sparse_attention
-    if program == "moe_ffn":
-        return l3_prefill_moe_layer
-    if program == "head":
-        return l3_prefill_head_rows
-    raise ValueError(f"unknown consolidated program {program!r}")
-
-
-def _l3_arg_arity(entry) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """One entry's ``(tensor names, scalar names)``, both in signature order."""
-    tensors, scalars = [], []
-    for name, param in inspect.signature(entry._func).parameters.items():
-        if param.annotation is pl.constexpr:
-            continue
-        if getattr(param.annotation, "shape", None) is None:
-            scalars.append(name)
-        else:
-            tensors.append(name)
-    return tuple(tensors), tuple(scalars)
-
-
-def _alloc_name_of(param: str, overrides: dict[str, str]) -> str:
-    """One signature parameter's allocation name in the runner's tensor table.
-
-    Stream names answer the step's ping-pong override; every other ``out_*``
-    boundary name answers its ``ws_*`` workspace; the rest (step inputs, cache
-    pools, resident stacks, ``head_hidden``) allocate under their own names.
-    """
-    if param in overrides:
-        return overrides[param]
-    if param.startswith("out_"):
-        workspace = "ws_" + param[len("out_") :]
-        if workspace in WORKSPACES:
-            return workspace
-    return param
 
 
 def _read_ffn(
