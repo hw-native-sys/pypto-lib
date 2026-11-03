@@ -43,7 +43,7 @@ from pypto.ir import DistributedConfig
 
 # Standalone LM-head validation defaults to TP2/DP1.
 
-from config import FLASH as M, TP_SIZE as CONFIG_TP_SIZE
+from config import DP_SIZE as CONFIG_DP_SIZE, FLASH as M, TP_SIZE as CONFIG_TP_SIZE
 from hc import hc_head, golden_hc_collapse
 from rmsnorm import rms_norm_tiled_compensated, golden_rms_norm_tiled
 
@@ -74,7 +74,7 @@ def _parse_int_argv(name, default=None):
 
 TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
 # DP groups built by the l3_lm_head fixture; the kernel carries no DP extent.
-DP_SIZE: int = _parse_int_argv("--dp") or 1
+DP_SIZE: int = _parse_int_argv("--dp") or (1 if __name__ == "__main__" else CONFIG_DP_SIZE)
 WORLD_SIZE = TP_SIZE * DP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
@@ -129,7 +129,7 @@ def lm_head(
     hidden_states: pl.Tensor,
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
-    logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
@@ -138,7 +138,7 @@ def lm_head(
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
     completed_epochs: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
+) -> tuple[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32], pl.Scalar[pl.TASK_ID]]:
     # Scratch is allocated just outside the scope that first writes it: a
     # create_tensor inside a pl.at yields a tile, not a GM tensor view.
     selected_hidden = pl.create_tensor([MAX_LOGIT_ROWS, D], dtype=pl.BF16)
@@ -330,7 +330,7 @@ def lm_head(
     with pl.at(
         level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_retire",
         deps=[_readback_notify_tid, _readback_wait_tid], allow_early_resolve=False,
-    ):
+    ) as _retire_tid:
         anchor = pl.read(logits, [0, 0])
         if done_epoch == completed_epochs:
             for peer in pl.range(TP_SIZE):
@@ -344,7 +344,7 @@ def lm_head(
                         value=0, op=pld.NotifyOp.Set,
                     )
         pl.write(logits, [0, 0], anchor)
-    return logits
+    return logits, _retire_tid
 
 
 @pl.jit.inline
