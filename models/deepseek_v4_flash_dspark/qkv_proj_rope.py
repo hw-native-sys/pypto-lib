@@ -9,6 +9,8 @@
 """DeepSeek-V4 Q/KV LoRA + RoPE (dynamic shape): projects token-major
 attention-normalized inputs for both decode and prefill attention paths."""
 
+import inspect
+
 import pypto.language as pl
 
 from config import (
@@ -87,6 +89,27 @@ Q_STREAM_READY_EVENT = 0
 Q_STREAM_RELEASE_EVENT = 1
 assert QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert QPROJ_M_TILE % QPROJ_TAIL_M_TILE == 0
+
+
+# Select the adapter in Python before JIT parsing: the old frontend rejects
+# the new keyword, while the explicit-precision frontend requires it with tmp.
+if "high_precision" in inspect.signature(pl.tile.rsqrt).parameters:
+
+    @pl.jit.inline
+    def _rsqrt_high_precision(
+        value: pl.Tile[[1, Q_ROPE_T_TILE], pl.FP32],
+        workspace: pl.Tile[[1, Q_ROPE_T_TILE], pl.FP32],
+    ):
+        return pl.tile.rsqrt(value, tmp=workspace, high_precision=True)
+
+else:
+
+    @pl.jit.inline
+    def _rsqrt_high_precision(
+        value: pl.Tile[[1, Q_ROPE_T_TILE], pl.FP32],
+        workspace: pl.Tile[[1, Q_ROPE_T_TILE], pl.FP32],
+    ):
+        return pl.tile.rsqrt(value, tmp=workspace)
 
 
 @pl.jit.inline
@@ -465,7 +488,7 @@ def _q_head_norm_rope(
     if tail_math:
         inverse = pl.recip(pl.sqrt(variance))
     else:
-        inverse = pl.tile.rsqrt(variance, rsqrt_tmp)
+        inverse = _rsqrt_high_precision(variance, rsqrt_tmp)
     inverse_column = pl.reshape(inverse, [Q_ROPE_T_TILE, 1])
     nope = pl.row_expand_mul(dequantized[:, 0:NOPE_DIM], inverse_column)
     nope_bf16 = pl.cast(nope, target_type=pl.BF16, mode="rint")
