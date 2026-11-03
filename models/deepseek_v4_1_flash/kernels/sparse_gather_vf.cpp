@@ -367,15 +367,12 @@ __aicore__ inline void gather_part(
         if (column < args[ARG_WINDOW_KEYS]) {
             Vec<float8_e4m3_t, 32, DIM> payload;
             Vec<bfloat16_t, 32, 16> scales;
-            Vec<float, 32, 16> factors;
             TASSIGN(payload, 0);
             TASSIGN(scales, 16384);
-            TASSIGN(factors, 24576);
             load_rows<EVENT_ID7, float8_e4m3_t, 512, 16>(
                 data<float8_e4m3_t>(args, 3), data<bfloat16_t>(args, 4), ids);
-            TCVT(factors, scales, RoundMode::CAST_RINT);
-            sparse_dequant::decode_nz<false, decltype(nz), decltype(payload), decltype(factors), decltype(ids)>(
-                nz.data(), payload.data(), factors.data(), ids.data());
+            sparse_dequant::decode_nz<false, decltype(nz), decltype(payload), decltype(scales), decltype(ids)>(
+                nz.data(), payload.data(), scales.data(), ids.data());
         } else {
             Vec<float4_e2m1x2_t, 32, DIM> payload;
             Vec<bfloat16_t, 32, 32> scales;

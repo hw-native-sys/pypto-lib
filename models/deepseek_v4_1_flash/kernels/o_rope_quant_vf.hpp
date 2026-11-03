@@ -25,7 +25,8 @@ __tf__ __aicore__ inline void rope_quant_vf(
         uint32_t count64 = 64, count1 = 1;
         MaskReg bytes64 = CreatePredicate<uint8_t>(count64);
         MaskReg half1 = CreatePredicate<uint16_t>(count1);
-        RegTensor<uint32_t> lane, lo, hi, tmp, ix1, ix2, ix4, ix8, ix16, pair_index;
+        MaskReg lower32 = pset_b32(PAT_VL32);
+        RegTensor<uint32_t> lane, lo, hi, tmp, ix1, pair_index, upper_index;
         RegTensor<int32_t> izero, ione;
         RegTensor<float> zero, one, low, high;
         vci((RegTensor<int32_t>&)lane, 0, INC_ORDER);
@@ -37,26 +38,17 @@ __tf__ __aicore__ inline void rope_quant_vf(
         vdup(one, 1.0f, all, MODE_ZEROING);
         vdup(low, -448.0f, all, MODE_ZEROING);
         vdup(high, 448.0f, all, MODE_ZEROING);
-        // XOR permutations for a butterfly max restricted to each 32-value group.
-        vshrs(tmp, lane, 1u, all, MODE_ZEROING); vshls(tmp, tmp, 1u, all, MODE_ZEROING);
-        vsub(tmp, lane, tmp, all, MODE_ZEROING); vshls(tmp, tmp, 1u, all, MODE_ZEROING);
-        vadds(ix1, lane, 1u, all, MODE_ZEROING); vsub(ix1, ix1, tmp, all, MODE_ZEROING);
-        vshrs(ix2, lane, 1u, all, MODE_ZEROING); vshls(ix2, ix2, 1u, all, MODE_ZEROING);
-        vshrs(tmp, lane, 2u, all, MODE_ZEROING); vshls(tmp, tmp, 2u, all, MODE_ZEROING);
-        vsub(tmp, ix2, tmp, all, MODE_ZEROING); vshls(tmp, tmp, 1u, all, MODE_ZEROING);
-        vadds(ix2, lane, 2u, all, MODE_ZEROING); vsub(ix2, ix2, tmp, all, MODE_ZEROING);
-        vshrs(ix4, lane, 2u, all, MODE_ZEROING); vshls(ix4, ix4, 2u, all, MODE_ZEROING);
-        vshrs(tmp, lane, 3u, all, MODE_ZEROING); vshls(tmp, tmp, 3u, all, MODE_ZEROING);
-        vsub(tmp, ix4, tmp, all, MODE_ZEROING); vshls(tmp, tmp, 1u, all, MODE_ZEROING);
-        vadds(ix4, lane, 4u, all, MODE_ZEROING); vsub(ix4, ix4, tmp, all, MODE_ZEROING);
-        vshrs(ix8, lane, 3u, all, MODE_ZEROING); vshls(ix8, ix8, 3u, all, MODE_ZEROING);
-        vshrs(tmp, lane, 4u, all, MODE_ZEROING); vshls(tmp, tmp, 4u, all, MODE_ZEROING);
-        vsub(tmp, ix8, tmp, all, MODE_ZEROING); vshls(tmp, tmp, 1u, all, MODE_ZEROING);
-        vadds(ix8, lane, 8u, all, MODE_ZEROING); vsub(ix8, ix8, tmp, all, MODE_ZEROING);
-        vshrs(ix16, lane, 4u, all, MODE_ZEROING); vshls(ix16, ix16, 4u, all, MODE_ZEROING);
-        vshrs(tmp, lane, 5u, all, MODE_ZEROING); vshls(tmp, tmp, 5u, all, MODE_ZEROING);
-        vsub(tmp, ix16, tmp, all, MODE_ZEROING); vshls(tmp, tmp, 1u, all, MODE_ZEROING);
-        vadds(ix16, lane, 16u, all, MODE_ZEROING); vsub(ix16, ix16, tmp, all, MODE_ZEROING);
+        // Neighboring rotary coordinates and the upper 32-value reduction group.
+        vshrs(tmp, lane, 1u, all, MODE_ZEROING);
+        vshls(tmp, tmp, 1u, all, MODE_ZEROING);
+        vsub(tmp, lane, tmp, all, MODE_ZEROING);
+        vshls(tmp, tmp, 1u, all, MODE_ZEROING);
+        vadds(ix1, lane, 1u, all, MODE_ZEROING);
+        vsub(ix1, ix1, tmp, all, MODE_ZEROING);
+        vshrs(tmp, lane, 5u, all, MODE_ZEROING);
+        vshls(tmp, tmp, 5u, all, MODE_ZEROING);
+        vsub(upper_index, lane, tmp, all, MODE_ZEROING);
+        vadds(upper_index, upper_index, 32u, all, MODE_ZEROING);
         vshrs(pair_index, lane, 1u, all, MODE_ZEROING);
         MaskReg even;
         vcmp_gt(even, ix1, lane, all);
@@ -90,11 +82,15 @@ __tf__ __aicore__ inline void rope_quant_vf(
                     vdup(x, 0.0f, all, MODE_ZEROING);
                 }
                 vabs(amax, x, all, MODE_ZEROING);
-                vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)amax, ix16); vmax(amax, amax, shuffled, all, MODE_ZEROING);
-                vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)amax, ix8); vmax(amax, amax, shuffled, all, MODE_ZEROING);
-                vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)amax, ix4); vmax(amax, amax, shuffled, all, MODE_ZEROING);
-                vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)amax, ix2); vmax(amax, amax, shuffled, all, MODE_ZEROING);
-                vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)amax, ix1); vmax(amax, amax, shuffled, all, MODE_ZEROING);
+                RegTensor<float> lower_max, upper_max;
+                // Reuse one lower-half mask for both 32-value groups to avoid
+                // predicate spills; each VCMAX result is in lane zero.
+                vcmax(lower_max, amax, lower32);
+                vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)amax, upper_index);
+                vcmax(upper_max, shuffled, lower32);
+                vselr((RegTensor<uint32_t>&)lower_max, (RegTensor<uint32_t>&)lower_max, lo);
+                vselr((RegTensor<uint32_t>&)upper_max, (RegTensor<uint32_t>&)upper_max, lo);
+                vsel(amax, lower_max, upper_max, lower32);
                 vshrs(exponent, (RegTensor<int32_t>&)amax, 23, all, MODE_ZEROING);
                 vadds(exponent, exponent, -8, all, MODE_ZEROING);
                 vmax(exponent, exponent, izero, all, MODE_ZEROING);
