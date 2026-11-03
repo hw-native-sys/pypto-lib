@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-"""Selected-row BF16 greedy projection and full-vocabulary FP32 logits."""
+"""GLM-5.3-Flash vocabulary projections, greedy selection and TP reduction."""
 
 import sys
 from pathlib import Path
@@ -15,27 +15,25 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Standalone validation uses two cards; imports preserve the caller's topology.
 if __name__ == "__main__" and not any(
     tok in ("--tp", "--ep") or tok.startswith(("--tp=", "--ep=")) for tok in sys.argv
 ):
     sys.argv += ["--tp", "2", "--ep", "2"]
 
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
 
-from models.glm5_3_flash.config import D, EP_SIZE, FLASH, LOCAL_VOCAB, LOGIT_ROWS_DYN, TP_SIZE, T_DYN
-from models.glm5_3_flash.rmsnorm import golden_rmsnorm, rmsnorm
+from models.glm5_3_flash.config import EP_SIZE, FLASH, LOCAL_VOCAB, TP_SIZE, D
+from models.glm5_3_flash.rmsnorm import rms_norm, rmsnorm
+from models.glm5_3_flash.utils import Checkpoint, component_hidden
 
+LOGIT_ROWS_DYN = pl.dynamic('GLM53_LOGIT_ROWS_DYN')
+T_DYN = pl.dynamic('GLM53_T_DYN')
 
-# Model configuration.
 FP32_HEAD_EPS = FLASH.rms_norm_eps
-
-# Padding.
 FP32_NEG_INF_BITS = -8388608
-
-# Tiling.
 SELECT_D_TILE = 512
 LM_ROW_TILE = 16
 LM_VOCAB_TILE = 128
@@ -47,8 +45,6 @@ FP32_HEAD_N_TILE = 64
 FP32_HEAD_K_TILE = 128
 FP32_HEAD_REDUCE_TILE = 8
 FP32_HEAD_VOCAB_PAD = ((LOCAL_VOCAB + FP32_HEAD_N_TILE - 1) // FP32_HEAD_N_TILE) * FP32_HEAD_N_TILE
-
-# Validation shapes.
 TP_TEST_EPOCHS = 3
 TP_TEST_ROWS = TP_SIZE + 17
 
@@ -74,7 +70,7 @@ def lm_head(
         row = block // (D // SELECT_D_TILE)
         d0 = block % (D // SELECT_D_TILE) * SELECT_D_TILE
         source_row = pl.cast(pl.read(row_indices, [row]), pl.INDEX)
-        selected[row : row + 1, d0 : d0 + SELECT_D_TILE] = pl.full([1, SELECT_D_TILE], dtype=pl.BF16, value=0.0)
+        selected[row:row + 1, d0:d0 + SELECT_D_TILE] = pl.full([1, SELECT_D_TILE], dtype=pl.BF16, value=0.0)
         if source_row >= 0:
             if source_row < hidden_rows:
                 source = x[source_row : source_row + 1, d0 : d0 + SELECT_D_TILE]
@@ -160,7 +156,7 @@ def lm_head_project_fp32(
             for k0 in pl.pipeline(0, D, FP32_HEAD_K_TILE, stage=2):
                 projection_hidden = pl.slice(x, [LM_ROW_TILE, FP32_HEAD_K_TILE], [row0, k0], valid_shape=[valid_rows, FP32_HEAD_K_TILE])
                 projection_vocab = weight[vocab0 : vocab0 + FP32_HEAD_N_TILE, k0 : k0 + FP32_HEAD_K_TILE]
-                accum = pl.matmul_acc(accum, projection_hidden, projection_vocab, b_trans=True, init_cond=(k0 == 0))
+                accum = pl.matmul_acc(accum, projection_hidden, projection_vocab, b_trans=True, init_cond=k0 == 0)
             accum = pl.set_validshape(accum, valid_rows, FP32_HEAD_N_TILE)
             logits[row0 : row0 + LM_ROW_TILE, vocab0 : vocab0 + FP32_HEAD_N_TILE] = accum
     return logits
@@ -204,6 +200,7 @@ def lm_head_logits(
     lm_head_project_fp32(normalized, weight, logits)
     return logits
 
+
 @pl.jit.inline
 def lm_head_mtp_logits(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -221,7 +218,7 @@ def lm_head_mtp_logits(
         col0 = block % (D // 128) * 128
         valid = pl.min(8, rows - row0)
         source = pl.slice(normalized, [8, 128], [row0, col0], valid_shape=[valid, 128])
-        widened[row0:row0 + 8, col0:col0 + 128] = pl.cast(source, pl.FP32)
+        widened[row0 : row0 + 8, col0 : col0 + 128] = pl.cast(source, pl.FP32)
     lm_head_project_fp32(widened, weight, logits)
     return logits
 
@@ -360,9 +357,7 @@ def lm_head_tp_reduce_test(
     group_base = (rank // TP_SIZE) * TP_SIZE
     tp_rank = rank % TP_SIZE
     lm_head_tp_reduce(
-        local_values, local_indices,
-        value_exchange, index_exchange, arrived,
-        global_values, global_indices,
+        local_values, local_indices, value_exchange, index_exchange, arrived, global_values, global_indices,
         tp_rank, group_base, epoch,
     )
     return global_values, global_indices
@@ -385,10 +380,8 @@ def l3_lm_head_tp_reduce_test(
             index_exchange = pld.window(index_buffer, [TP_TEST_ROWS, TP_CANDIDATE_TILE], dtype=pl.INT32)
             arrived = pld.window(arrived_buffer, [TP_SIZE, 1], dtype=pl.INT32)
             lm_head_tp_reduce_test(
-                local_values[epoch, rank], local_indices[epoch, rank],
-                value_exchange, index_exchange, arrived,
-                global_values[epoch, rank], global_indices[epoch, rank],
-                rank, epoch + 1,
+                local_values[epoch, rank], local_indices[epoch, rank], value_exchange, index_exchange,
+                arrived, global_values[epoch, rank], global_indices[epoch, rank], rank, epoch + 1,
                 device=rank,
             )
 
@@ -418,8 +411,6 @@ def run_fp32_case(options, device_id):
     from functools import lru_cache
 
     from golden import TensorSpec, ratio_allclose, run
-    from models.glm5_3_flash.utils import component_hidden
-    from models.glm5_3_flash.weights import Checkpoint
 
     if not 0 <= options.shard < TP_SIZE:
         raise ValueError(f"--shard must be in [0, {TP_SIZE})")
@@ -435,36 +426,46 @@ def run_fp32_case(options, device_id):
         else:
             checkpoint = Checkpoint(options.checkpoint)
             rows = slice(options.shard * LOCAL_VOCAB, (options.shard + 1) * LOCAL_VOCAB)
-            head_name = 'lm_head.weight'
-            norm_names = ('model.language_model.norm.weight', 'model.norm.weight')
-            if options.case == 'mtp_fp32':
+            head_name = "lm_head.weight"
+            norm_names = ("model.language_model.norm.weight", "model.norm.weight")
+            if options.case == "mtp_fp32":
                 layer = FLASH.mtp_layer_id
-                norm_names = (f'model.language_model.layers.{layer}.shared_head.norm.weight',
-                              f'model.layers.{layer}.shared_head.norm.weight')
-                head_name = next(name.replace('norm.weight', 'head.weight') for name in norm_names if name in checkpoint)
-            weight[:LOCAL_VOCAB] = checkpoint.read(head_name, (rows, slice(None))).float()
+                norm_names = (
+                    f"model.language_model.layers.{layer}.shared_head.norm.weight",
+                    f"model.layers.{layer}.shared_head.norm.weight",
+                )
             names = [name for name in norm_names if name in checkpoint]
             if len(names) != 1:
-                raise ValueError('checkpoint final norm must resolve exactly once')
+                raise ValueError(f"checkpoint norm must resolve exactly once: expected one of {norm_names}")
+            if options.case == "mtp_fp32":
+                head_name = names[0].replace("norm.weight", "head.weight")
+            weight[:LOCAL_VOCAB] = checkpoint.read(head_name, (rows, slice(None))).float()
             norm = checkpoint.read(names[0])
-        return {'x': x, 'norm_weight': norm, 'weight': weight}
+        return {"x": x, "norm_weight": norm, "weight": weight}
 
-    specs = [TensorSpec('x', (options.tokens, D), torch.bfloat16, init_value=lambda: inputs()['x']),
-             TensorSpec('norm_weight', (D,), torch.bfloat16, init_value=lambda: inputs()['norm_weight']),
-             TensorSpec('weight', (FP32_HEAD_VOCAB_PAD, D), torch.float32, init_value=lambda: inputs()['weight']),
-             TensorSpec('logits', (options.tokens, FP32_HEAD_VOCAB_PAD), torch.float32)]
+    specs = [
+        TensorSpec("x", (options.tokens, D), torch.bfloat16, init_value=lambda: inputs()["x"]),
+        TensorSpec("norm_weight", (D,), torch.bfloat16, init_value=lambda: inputs()["norm_weight"]),
+        TensorSpec("weight", (FP32_HEAD_VOCAB_PAD, D), torch.float32, init_value=lambda: inputs()["weight"]),
+        TensorSpec("logits", (options.tokens, FP32_HEAD_VOCAB_PAD), torch.float32),
+    ]
+
     def golden(values):
-        if options.case == 'mtp_fp32':
-            normalized = golden_rmsnorm(values['x'], values['norm_weight']).double()
-            values['logits'].copy_((normalized @ values['weight'].double().t()).float())
+        if options.case == "mtp_fp32":
+            normalized = rms_norm(values["x"], values["norm_weight"]).double()
+            values["logits"].copy_((normalized @ values["weight"].double().t()).float())
         else:
             golden_lm_head_logits(values)
 
-    fn = lm_head_mtp_logits_test if options.case == 'mtp_fp32' else lm_head_logits_test
-    result = run(fn=fn, specs=specs, golden_fn=golden,
-                 config=dict(backend_type=options.backend_type, execution_mode=options.execution_mode, device_id=device_id),
-                 compare_fn={'logits': ratio_allclose(atol=1e-5, rtol=1e-5, max_error_ratio=0)},
-                 compile_only=options.compile_only)
+    fn = lm_head_mtp_logits_test if options.case == "mtp_fp32" else lm_head_logits_test
+    result = run(
+        fn=fn,
+        specs=specs,
+        golden_fn=golden,
+        config=dict(backend_type=options.backend_type, execution_mode=options.execution_mode, device_id=device_id),
+        compare_fn={"logits": ratio_allclose(atol=1e-05, rtol=1e-05, max_error_ratio=0)},
+        compile_only=options.compile_only,
+    )
     print(result)
     if not result.passed:
         raise SystemExit(result.error or 1)
@@ -476,7 +477,7 @@ def golden_lm_head(
     weight: torch.Tensor,
 ) -> torch.Tensor:
     """Return full local FP32 logits after the BF16 RMSNorm boundary."""
-    normalized = golden_rmsnorm(x, norm_weight).to(torch.bfloat16)
+    normalized = rms_norm(x, norm_weight).to(torch.bfloat16)
     return torch.nn.functional.linear(normalized.float(), weight.float())
 
 
@@ -504,7 +505,7 @@ def golden_lm_head_tp_reduce_test(tensors):
     for epoch in range(TP_TEST_EPOCHS):
         for start in range(0, EP_SIZE, TP_SIZE):
             group = slice(start, start + TP_SIZE)
-            values, indices = golden_lm_head_tp_reduce(
+            (values, indices) = golden_lm_head_tp_reduce(
                 tensors["local_values"][epoch, group], tensors["local_indices"][epoch, group],
             )
             tensors["global_values"][epoch, group] = values.unsqueeze(0)
@@ -565,7 +566,7 @@ def build_lm_head_tensor_specs(case: str):
         else:
             labels[:6] = torch.tensor([0, 127, 128, 1023, 1024, LOCAL_VOCAB - 1])
             row_indices = torch.tensor([18, 0, 7, 7, 16, 1, 15, 2, -1, 14, 3, 13, 4, 12, 5, 11, 6], dtype=torch.int32)
-        weight[labels] = golden_rmsnorm(x, norm_weight).mul(2).bfloat16()
+        weight[labels] = rms_norm(x, norm_weight).mul(2).bfloat16()
     else:
         x.fill_(1)
         norm_weight.fill_(1)
@@ -641,8 +642,9 @@ def main():
     import argparse
     import subprocess
 
-    from golden import run
     from pypto.ir import DistributedConfig
+
+    from golden import run
 
     cases = ("decode", "selection", "ties", "negative_tail", "padding")
     fp32_cases = ("fp32", "mtp_fp32")
@@ -654,10 +656,10 @@ def main():
     parser.add_argument("--ep", type=int, default=EP_SIZE)
     parser.add_argument("--case", choices=("all", *cases, "tp_reduce", *fp32_cases), default="all")
     parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument('--checkpoint', type=Path)
-    parser.add_argument('--hidden-input', type=Path)
-    parser.add_argument('--tokens', type=int, default=17)
-    parser.add_argument('--shard', type=int, default=0)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--hidden-input", type=Path)
+    parser.add_argument("--tokens", type=int, default=17)
+    parser.add_argument("--shard", type=int, default=0)
     args = parser.parse_args()
     device_ids = [int(device) for device in args.device.split(",")]
     if args.checkpoint is not None or args.hidden_input is not None:
@@ -675,9 +677,18 @@ def main():
         for case in (*cases, *fp32_cases, "tp_reduce"):
             devices = args.device if case == "tp_reduce" else str(device_ids[0])
             command = [
-                sys.executable, str(Path(__file__).resolve()),
-                "-p", args.backend_type, "-d", devices,
-                "--tp", str(args.tp), "--ep", str(args.ep), "--case", case,
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "-p",
+                args.backend_type,
+                "-d",
+                devices,
+                "--tp",
+                str(args.tp),
+                "--ep",
+                str(args.ep),
+                "--case",
+                case,
             ]
             if case in fp32_cases:
                 command.extend(("--tokens", str(args.tokens), "--shard", str(args.shard)))
@@ -694,11 +705,7 @@ def main():
             fn=l3_lm_head_tp_reduce_test,
             specs=build_tp_reduce_tensor_specs(),
             golden_fn=golden_lm_head_tp_reduce_test,
-            config=dict(
-                backend_type=args.backend_type,
-                execution_mode=args.execution_mode,
-                distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
-            ),
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0)),
             compare_fn={"global_values": compare_local_max, "global_indices": compare_local_argmax},
             compile_only=args.compile_only,
         )
@@ -722,19 +729,6 @@ def main():
                 print(result.error)
             raise SystemExit(1)
         print(f"[GOLDEN] PASS lm_head {case}")
-
-
-__all__ = [
-    "golden_lm_head",
-    "golden_lm_head_case",
-    "golden_lm_head_logits",
-    "golden_lm_head_tp_reduce",
-    "lm_head",
-    "lm_head_logits",
-    "lm_head_logits_test",
-    "lm_head_test",
-    "lm_head_tp_reduce",
-]
 
 
 if __name__ == "__main__":

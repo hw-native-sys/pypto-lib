@@ -11,8 +11,7 @@
 These model primitives retain extra product/reduction bits before the FP32
 rounding boundary. Inputs must be finite and keep splitter products normal;
 normalization denominators must be positive. Row reductions accept at most
-128 columns so their fixed-point accumulator cannot overflow.
-"""
+128 columns so their fixed-point accumulator cannot overflow."""
 
 import sys
 from pathlib import Path
@@ -23,13 +22,13 @@ if __package__ in (None, ""):
 import pypto.language as pl
 import torch
 
+FP32_NEG_INF = -3.4028234663852886e38  # Finite mask floor for sort and softmax.
 M = pl.dynamic("ELEMENTWISE_M")
 N = pl.dynamic("ELEMENTWISE_N")
 
 
-
 @pl.jit.inline
-def accurate_exp(x: pl.Tensor[[M,N], pl.FP32]):
+def accurate_exp(x: pl.Tensor[[M, N], pl.FP32]):
     """Evaluate exp on [-80, 80], saturating larger sigmoid arguments."""
     limited = pl.maximum(pl.minimum(x, 80.0), -80.0)
     n = pl.cast(pl.mul(limited, 1.4426950408889634), pl.INT32, mode="rint")
@@ -94,7 +93,7 @@ def accurate_exp(x: pl.Tensor[[M,N], pl.FP32]):
 
 
 @pl.jit.inline
-def accurate_reciprocal(x: pl.Tensor[[M,N], pl.FP32]):
+def accurate_reciprocal(x: pl.Tensor[[M, N], pl.FP32]):
     approximate = pl.recip(x)
     product = pl.mul(x, approximate)
     ah = pl.mul(x, 4097.0)
@@ -110,7 +109,7 @@ def accurate_reciprocal(x: pl.Tensor[[M,N], pl.FP32]):
 
 
 @pl.jit.inline
-def accurate_sigmoid(x: pl.Tensor[[M,N], pl.FP32], ROWS: pl.constexpr, COLS: pl.constexpr):
+def accurate_sigmoid(x: pl.Tensor[[M, N], pl.FP32], ROWS: pl.constexpr, COLS: pl.constexpr):
     argument = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
     argument[:, :] = pl.neg(x)
     exponential = accurate_exp(argument)
@@ -120,7 +119,7 @@ def accurate_sigmoid(x: pl.Tensor[[M,N], pl.FP32], ROWS: pl.constexpr, COLS: pl.
 
 
 @pl.jit.inline
-def accurate_silu(x: pl.Tensor[[M,N], pl.FP32], ROWS: pl.constexpr, COLS: pl.constexpr):
+def accurate_silu(x: pl.Tensor[[M, N], pl.FP32], ROWS: pl.constexpr, COLS: pl.constexpr):
     """Evaluate SiLU with one FP32 division before the activation is rounded."""
     value = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
     value[:, :] = x
@@ -133,7 +132,7 @@ def accurate_silu(x: pl.Tensor[[M,N], pl.FP32], ROWS: pl.constexpr, COLS: pl.con
 
 
 @pl.jit.inline
-def accurate_rsqrt(x: pl.Tensor[[M,N], pl.FP32]):
+def accurate_rsqrt(x: pl.Tensor[[M, N], pl.FP32]):
     approximate = pl.rsqrt(x, high_precision=True)
     squared = pl.mul(approximate, approximate)
     ah = pl.mul(approximate, 4097.0)
@@ -161,7 +160,7 @@ def accurate_rsqrt(x: pl.Tensor[[M,N], pl.FP32]):
 
 
 @pl.jit.inline
-def accurate_sqrt(x: pl.Tensor[[M,N], pl.FP32]):
+def accurate_sqrt(x: pl.Tensor[[M, N], pl.FP32]):
     approximate = pl.sqrt(x)
     squared = pl.mul(approximate, approximate)
     ah = pl.mul(approximate, 4097.0)
@@ -178,7 +177,7 @@ def accurate_sqrt(x: pl.Tensor[[M,N], pl.FP32]):
 
 
 @pl.jit.inline
-def accurate_divide(a: pl.Tensor[[M,N], pl.FP32], b: pl.Tensor[[M,N], pl.FP32]):
+def accurate_divide(a: pl.Tensor[[M, N], pl.FP32], b: pl.Tensor[[M, N], pl.FP32]):
     approximate = pl.div(a, b)
     product = pl.mul(approximate, b)
     ah = pl.mul(approximate, 4097.0)
@@ -195,9 +194,9 @@ def accurate_divide(a: pl.Tensor[[M,N], pl.FP32], b: pl.Tensor[[M,N], pl.FP32]):
 
 @pl.jit.inline
 def accurate_product_error(
-    a: pl.Tensor[[M,N], pl.FP32],
-    b: pl.Tensor[[M,N], pl.FP32],
-    product: pl.Tensor[[M,N], pl.FP32],
+    a: pl.Tensor[[M, N], pl.FP32],
+    b: pl.Tensor[[M, N], pl.FP32],
+    product: pl.Tensor[[M, N], pl.FP32],
 ):
     """Recover the low product bits under the module's splitter-domain contract."""
     ah = pl.mul(a, 4097.0)
@@ -212,18 +211,18 @@ def accurate_product_error(
 
 @pl.jit.inline
 def accurate_divide_parts(
-    high: pl.Tensor[[M,N], pl.FP32],
-    low: pl.Tensor[[M,N], pl.FP32],
-    denominator: pl.Tensor[[M,N], pl.FP32],
+    high: pl.Tensor[[M, N], pl.FP32],
+    low: pl.Tensor[[M, N], pl.FP32],
+    denominator: pl.Tensor[[M, N], pl.FP32],
     ROWS: pl.constexpr,
     COLS: pl.constexpr,
 ):
     """Divide a high/low numerator without dropping its reduction tail first."""
     high_buffer = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
-    low_buffer = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
-    divisor = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
     high_buffer[:, :] = high
+    low_buffer = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
     low_buffer[:, :] = low
+    divisor = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
     divisor[:, :] = denominator
     estimate = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
     estimate[:, :] = accurate_divide(high_buffer, divisor)
@@ -239,7 +238,7 @@ def accurate_divide_parts(
 
 
 @pl.jit.inline
-def accurate_row_sum_parts(x: pl.Tensor[[M,N], pl.FP32]):
+def accurate_row_sum_parts(x: pl.Tensor[[M, N], pl.FP32]):
     """Return high/low row sums for blocks with at most 128 finite columns."""
     magnitude = pl.maximum(pl.row_max(pl.abs(x)), 1e-30)
     magnitude_bits = pl.reinterpret_view(magnitude, pl.INT32)
@@ -262,7 +261,7 @@ def accurate_row_sum_parts(x: pl.Tensor[[M,N], pl.FP32]):
 
 
 @pl.jit.inline
-def accurate_row_sum(x: pl.Tensor[[M,N], pl.FP32]):
+def accurate_row_sum(x: pl.Tensor[[M, N], pl.FP32]):
     high, low = accurate_row_sum_parts(x)
     return pl.add(high, low)
 
@@ -281,9 +280,9 @@ def elementwise_test(
 ):
     with pl.spmd(1):
         row = pl.tile.get_block_idx() * 16
-        argument = pl.slice(x, [16, 128], [row, 0])
-        positive_part = pl.slice(positive, [16, 128], [row, 0])
-        sum_part = pl.slice(summands, [16, 128], [row, 0])
+        argument = x[row:row + 16, 0:128]
+        positive_part = positive[row:row + 16, 0:128]
+        sum_part = summands[row:row + 16, 0:128]
         exponential[:, :] = accurate_exp(argument)
         sigmoid[:, :] = accurate_sigmoid(argument, 16, 128)
         root[:, :] = accurate_sqrt(positive_part)
@@ -293,6 +292,22 @@ def elementwise_test(
         quotient[:, :] = accurate_divide(argument, denominator)
         total[:, :] = accurate_row_sum(sum_part)
     return exponential, sigmoid, root, inverse_root, quotient, total
+
+
+def _sum_fp32_reference(
+    value: torch.Tensor,
+    dim: int = -1,
+    keepdim: bool = True,
+    tile_size: int | None = None,
+) -> torch.Tensor:
+    """Round an independent wide reduction to FP32, preserving requested tile boundaries."""
+    if tile_size is None:
+        return value.double().sum(dim=dim, keepdim=keepdim).float()
+    total = None
+    for tile in value.split(tile_size, dim=dim):
+        partial = tile.float().sum(dim=dim, keepdim=True)
+        total = partial if total is None else total + partial
+    return total if keepdim else total.squeeze(dim)
 
 
 def golden_elementwise(tensors):
@@ -323,12 +338,12 @@ def main():
     shape = [16, 128]
     x = torch.rand(shape, generator=generator) * 32.0 - 16.0
     positive = torch.exp(torch.rand(shape, generator=generator) * 32.0 - 16.0)
-    summands = torch.randn(shape, generator=generator) * torch.exp(
-        torch.rand(shape, generator=generator) * 20.0 - 10.0
-    )
+    summands = torch.randn(shape, generator=generator) * torch.exp(torch.rand(shape, generator=generator) * 20.0 - 10.0)
     names = ("exponential", "sigmoid", "root", "inverse_root", "quotient", "total")
-    specs = [TensorSpec(name, shape, torch.float32, init_value=value)
-             for name, value in (("x", x), ("positive", positive), ("summands", summands))]
+    specs = [
+        TensorSpec(name, shape, torch.float32, init_value=value)
+        for name, value in (("x", x), ("positive", positive), ("summands", summands))
+    ]
     specs += [TensorSpec(name, [16, 1] if name == "total" else shape, torch.float32) for name in names]
     result = run(
         fn=elementwise_test,
@@ -336,7 +351,7 @@ def main():
         golden_fn=golden_elementwise,
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         compile_only=args.compile_only,
-        compare_fn={name: ratio_allclose(atol=0, rtol=1.2e-7, max_error_ratio=0) for name in names},
+        compare_fn={name: ratio_allclose(atol=0, rtol=1.2e-07, max_error_ratio=0) for name in names},
     )
     print(result)
     if not result.passed:

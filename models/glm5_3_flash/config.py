@@ -6,14 +6,33 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""GLM-5.3-Flash model, deployment, and kernel-shape configuration."""
+"""GLM-5.3-Flash architecture and parallel deployment configuration."""
 
 import sys
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, Tuple
 
-import pypto.language as pl
+VISION_DEPTH = 24
+VISION_HIDDEN = 1024
+VISION_HEADS = 16
+VISION_HEAD_DIM = VISION_HIDDEN // VISION_HEADS
+VISION_INTER = 4096
+VISION_PATCH = 14
+VISION_TEMPORAL_PATCH = 2
+VISION_IN_CHANNELS = 3
+VISION_IMAGE_SIZE = 448
+VISION_MERGE = 2
+VISION_PROJ_INTER = 10240
+VISION_RMS_NORM_EPS = 1e-5
+VISION_SWIGLU_LIMIT = 10.0
+VISION_PATCH_IN = VISION_IN_CHANNELS * VISION_TEMPORAL_PATCH * VISION_PATCH * VISION_PATCH
+IMAGE_TOKEN_ID = 154854
+VIDEO_TOKEN_ID = 154855
+IMAGE_START_TOKEN_ID = 154830
+IMAGE_END_TOKEN_ID = 154831
+VIDEO_START_TOKEN_ID = 154832
+VIDEO_END_TOKEN_ID = 154833
 
 
 class AttentionKind(str, Enum):
@@ -82,10 +101,6 @@ class Glm53FlashConfig:
     index_kpool: int
     index_kpool_compress: bool
     index_kpool_always_select_tail: bool
-    # Settled ABI (issue #1267): when on, the MTP layer selects its own top-k
-    # on a proposal's step 0 and the proposal's later draft steps reuse the
-    # request's selected_pools/selected_valid; the expansion is rebuilt per
-    # row. The sharing path is not implemented in phase one.
     index_share_for_mtp_iteration: bool
 
     # KDA linear attention (``linear_attn_config``).
@@ -149,20 +164,12 @@ class Glm53FlashConfig:
 
     @property
     def kda_layer_ids(self) -> Tuple[int, ...]:
-        return tuple(
-            layer_id
-            for layer_id in range(self.num_hidden_layers)
-            if layer_id % 4 != 3
-        )
+        return tuple(layer_id for layer_id in range(self.num_hidden_layers) if layer_id % 4 != 3)
 
     @property
     def dsa_layer_ids(self) -> Tuple[int, ...]:
         """Backbone layers with NoPE MLA and a kpool indexer (3, 7, 11, ...)."""
-        return tuple(
-            layer_id
-            for layer_id in range(self.num_hidden_layers)
-            if layer_id % 4 == 3
-        )
+        return tuple(layer_id for layer_id in range(self.num_hidden_layers) if layer_id % 4 == 3)
 
     @property
     def indexer_layer_ids(self) -> Tuple[int, ...]:
@@ -189,25 +196,15 @@ class Glm53FlashConfig:
             # The MTP layer is an MLA layer with its own indexer and a sparse MoE,
             # and it carries no hc_* weights, so it uses a plain residual.
             return Glm53LayerConfig(
-                layer_id=layer_id,
-                attention_kind=AttentionKind.SPARSE,
-                mlp_kind=MlpKind.SPARSE,
-                has_indexer=True,
-                has_hyper_connections=False,
-                is_mtp=True,
+                layer_id=layer_id, attention_kind=AttentionKind.SPARSE, mlp_kind=MlpKind.SPARSE,
+                has_indexer=True, has_hyper_connections=False, is_mtp=True,
             )
 
-        attention_kind = (
-            AttentionKind.SPARSE if layer_id in self.dsa_layer_ids else AttentionKind.LINEAR
-        )
+        attention_kind = AttentionKind.SPARSE if layer_id in self.dsa_layer_ids else AttentionKind.LINEAR
         mlp_kind = MlpKind.DENSE if layer_id < self.first_k_dense_replace else MlpKind.SPARSE
         return Glm53LayerConfig(
-            layer_id=layer_id,
-            attention_kind=attention_kind,
-            mlp_kind=mlp_kind,
-            has_indexer=attention_kind is AttentionKind.SPARSE,
-            has_hyper_connections=True,
-            is_mtp=False,
+            layer_id=layer_id, attention_kind=attention_kind, mlp_kind=mlp_kind,
+            has_indexer=attention_kind is AttentionKind.SPARSE, has_hyper_connections=True, is_mtp=False,
         )
 
     def backbone_layers(self) -> Tuple[Glm53LayerConfig, ...]:
@@ -217,10 +214,7 @@ class Glm53FlashConfig:
         if self.hidden_size <= 0 or self.vocab_size <= 0:
             raise ValueError("hidden_size and vocab_size must be positive")
         if self.qk_rope_head_dim:
-            raise ValueError(
-                "GLM-5.3-Flash MLA is NoPE; qk_rope_head_dim must be 0, "
-                f"got {self.qk_rope_head_dim}"
-            )
+            raise ValueError(f"GLM-5.3-Flash MLA is NoPE; qk_rope_head_dim must be 0, got {self.qk_rope_head_dim}")
         if self.kv_lora_rank <= 0 or self.q_lora_rank <= 0:
             raise ValueError("both LoRA ranks are required for the DSA attention layers")
         if self.n_routed_experts < self.num_experts_per_tok:
@@ -234,10 +228,7 @@ class Glm53FlashConfig:
         if self.index_kpool < 1:
             raise ValueError(f"index_kpool must be positive, got {self.index_kpool}")
         if self.index_topk % self.index_kpool:
-            raise ValueError(
-                f"index_topk ({self.index_topk}) must be divisible by "
-                f"index_kpool ({self.index_kpool})"
-            )
+            raise ValueError(f"index_topk ({self.index_topk}) must be divisible by index_kpool ({self.index_kpool})")
         if self.first_k_dense_replace > self.num_hidden_layers:
             raise ValueError("first_k_dense_replace exceeds the backbone depth")
         if len(self.kda_layer_ids) + len(self.dsa_layer_ids) != self.num_hidden_layers:
@@ -247,132 +238,48 @@ class Glm53FlashConfig:
 
 
 FLASH = Glm53FlashConfig(
-    name="glm5_3_flash",
-    vocab_size=154880,
-    hidden_size=4096,
-    num_hidden_layers=45,
-    first_k_dense_replace=3,
-    intermediate_size=12288,
-    rms_norm_eps=1e-5,
-    max_position_embeddings=1048576,
-    swiglu_limit=10.0,
-    tie_word_embeddings=False,
-    num_attention_heads=64,
-    q_lora_rank=1536,
-    kv_lora_rank=512,
-    qk_nope_head_dim=256,
-    qk_rope_head_dim=0,
-    v_head_dim=256,
-    index_n_heads=32,
-    index_head_dim=128,
-    index_topk=2048,
-    index_kpool=4,
-    index_kpool_compress=True,
-    index_kpool_always_select_tail=True,
+    name="glm5_3_flash", vocab_size=154880, hidden_size=4096, num_hidden_layers=45,
+    first_k_dense_replace=3, intermediate_size=12288, swiglu_limit=10.0,
+    rms_norm_eps=1e-5, max_position_embeddings=1048576, tie_word_embeddings=False,
+    num_attention_heads=64, q_lora_rank=1536, kv_lora_rank=512,
+    qk_nope_head_dim=256, qk_rope_head_dim=0, v_head_dim=256,
+    index_n_heads=32, index_head_dim=128,
+    index_topk=2048, index_kpool=4, index_kpool_compress=True, index_kpool_always_select_tail=True,
     index_share_for_mtp_iteration=True,
-    linear_num_heads=64,
-    linear_head_dim=128,
-    linear_conv_kernel_dim=4,
-    linear_lower_bound=-5.0,
-    n_routed_experts=288,
-    n_shared_experts=1,
-    num_experts_per_tok=8,
-    moe_intermediate_size=2048,
-    scoring_func="sigmoid",
-    topk_method="noaux_tc",
-    norm_topk_prob=True,
-    routed_scaling_factor=2.5,
-    n_group=1,
-    topk_group=1,
-    mhc=True,
-    hc_mult=4,
-    hc_sinkhorn_iters=20,
-    hc_eps=1e-6,
+    linear_num_heads=64, linear_head_dim=128, linear_conv_kernel_dim=4, linear_lower_bound=-5.0,
+    n_routed_experts=288, n_shared_experts=1, num_experts_per_tok=8,
+    moe_intermediate_size=2048, scoring_func="sigmoid", topk_method="noaux_tc", norm_topk_prob=True,
+    routed_scaling_factor=2.5, n_group=1, topk_group=1,
+    mhc=True, hc_mult=4, hc_sinkhorn_iters=20, hc_eps=1e-6,
     num_nextn_predict_layers=1,
-    dtype="bfloat16",
-    quant_method="w8a8",
-    activation_scheme="dynamic",
+    dtype="bfloat16", quant_method="w8a8", activation_scheme="dynamic",
 )
-
-
-T_DYN = pl.dynamic("GLM53_T_DYN")
-B_DYN = pl.dynamic("GLM53_B_DYN")
-Q_START_DYN = pl.dynamic("GLM53_Q_START_DYN")
-# Total physical blocks in one paged pool. The per-request block table is a
-# different quantity and gets its own symbol, or a signature carrying both
-# would assert they are equal.
-TABLE_DYN = pl.dynamic("GLM53_TABLE_DYN")
-BLOCK_TABLE_DYN = pl.dynamic("GLM53_BLOCK_TABLE_DYN")
-KV_BLOCKS_DYN = pl.dynamic("GLM53_KV_BLOCKS_DYN")
-INDEX_BLOCKS_DYN = pl.dynamic("GLM53_INDEX_BLOCKS_DYN")
-# Pool-write events, gathered page-table entries, and score columns have
-# independent extents, including when all three occur in one indexer step.
-POOL_EVENTS_DYN = pl.dynamic("GLM53_POOL_EVENTS_DYN")
-POOL_PAGES_DYN = pl.dynamic("GLM53_POOL_PAGES_DYN")
-POOLS_DYN = pl.dynamic("GLM53_POOLS_DYN")
-# Depth of a KDA recurrent- or conv-state pool. This is the pool's row count, not
-# the batch size: ``kda_state_rows`` exists precisely so a request can sit on any
-# row, and reusing B_DYN here would assert the two are equal and make that
-# indirection meaningless.
-KDA_STATE_DYN = pl.dynamic("GLM53_KDA_STATE_DYN")
-# Merged vision tokens in one batch: one row per placeholder, unrelated to the
-# text token count.
-VISION_ROWS_DYN = pl.dynamic("GLM53_VISION_ROWS_DYN")
-RECV_DYN = pl.dynamic("GLM53_RECV_DYN")
-LOGIT_ROWS_DYN = pl.dynamic("GLM53_LOGIT_ROWS_DYN")
-
 D = FLASH.hidden_size
 VOCAB = FLASH.vocab_size
 DENSE_INTER = FLASH.intermediate_size
-
-# NoPE MLA.
 H = FLASH.num_attention_heads
 QK_DIM = FLASH.qk_head_dim
 V_DIM = FLASH.v_head_dim
 Q_LORA = FLASH.q_lora_rank
 KV_LORA = FLASH.kv_lora_rank
-
-# kpool DSA indexer.
 INDEX_H = FLASH.index_n_heads
 INDEX_DIM = FLASH.index_head_dim
 INDEX_TOPK = FLASH.index_topk
 INDEX_KPOOL = FLASH.index_kpool
 KPOOL_SELECT_K = FLASH.kpool_select_k
 TOPK_INDEX_WIDTH = FLASH.topk_index_width
-# One indexer cache row is [key(128), gate_scores(128)]. The reference packs a
-# third `valid` channel, but that channel only exists to let pooling start at the
-# first real token of a left-padded dense batch; a paged cache has no left padding,
-# so validity is a function of the request's length and is not stored. This matches
-# vLLM Ascend's AscendIndexerKPoolStateSpec, whose head_size is 2 * 128.
 INDEX_STATE_WIDTH = 2 * INDEX_DIM
-
-# KDA linear attention.
 KDA_H = FLASH.linear_num_heads
 KDA_DIM = FLASH.linear_head_dim
 KDA_QKV_DIM = KDA_H * KDA_DIM
 KDA_CONV_K = FLASH.linear_conv_kernel_dim
 KDA_GATE_LOWER_BOUND = FLASH.linear_lower_bound
-
-# MoE.
 N_EXPERTS = FLASH.n_routed_experts
 TOPK = FLASH.num_experts_per_tok
 MOE_INTER = FLASH.moe_intermediate_size
-
-# Hyper-connections.
 HC_MULT = FLASH.hc_mult
 HC_DIM = FLASH.hc_dim
 MIX_HC = FLASH.mix_hc
-
-# The a2a3 int8 cube fractal is MKN 16,32,16, so every quantized K tile must be a
-# multiple of 32 (Ascend910_9392.ini, DtypeMKN).
-INT8_K_ALIGN = 32
-
-# Most-negative finite FP32, matching models/deepseek_v4_flash_mtp/config.py:284.
-# Used to floor masked scores in the sort and softmax paths: a genuine -inf would
-# propagate NaN through the sort, and a select cannot be used where an unmasked
-# score may legitimately be negative.
-FP32_NEG_INF = -3.4028234663852886e38
-
 SUPPORTED_TP_SIZES = (1, 2, 4, 8, 16)
 SUPPORTED_EP_SIZES = (1, 2, 4, 8, 16)
 
@@ -387,12 +294,7 @@ def _parse_parallel_size(name: str, default: int) -> int:
     return default
 
 
-# The deployment target is one Atlas 800 A3 node: 16 dies, TP16 with expert
-# parallelism over the same 16 ranks (vLLM Ascend's `--tensor-parallel-size 16
-# --enable-expert-parallel` recipe). Smaller shapes stay available for bring-up.
 EP_SIZE = _parse_parallel_size("ep", 16)
-# A standalone MoE entry selects only EP. Keep the default attention topology
-# compatible with that world without requiring a TP argument for expert kernels.
 TP_SIZE = _parse_parallel_size("tp", EP_SIZE)
 if TP_SIZE not in SUPPORTED_TP_SIZES:
     raise ValueError(f"--tp must be one of {SUPPORTED_TP_SIZES}, got {TP_SIZE}")
@@ -408,31 +310,12 @@ if INDEX_H % TP_SIZE:
     raise ValueError(f"{INDEX_H} indexer heads cannot be evenly sharded across TP{TP_SIZE}")
 if N_EXPERTS % EP_SIZE:
     raise ValueError(f"{N_EXPERTS} routed experts cannot be evenly sharded across EP{EP_SIZE}")
-
 DP_SIZE = EP_SIZE // TP_SIZE
 LOCAL_H = H // TP_SIZE
 LOCAL_KDA_H = KDA_H // TP_SIZE
-# The indexer is REPLICATED, not head-sharded. Its score sums over all 32 heads
-# before the top-k, so sharding heads would make every query need a cross-rank
-# reduction of partial scores on every DSA layer. Replicating a kernel this small
-# is far cheaper than 12 collectives per token, and it keeps the selection local.
-# LOCAL_INDEX_H stays defined for a future sharded variant; kernels use INDEX_H.
 LOCAL_INDEX_H = INDEX_H
 LOCAL_KDA_QKV_DIM = LOCAL_KDA_H * KDA_DIM
 N_LOCAL_EXPERTS = N_EXPERTS // EP_SIZE
 LOCAL_VOCAB = VOCAB // TP_SIZE if VOCAB % TP_SIZE == 0 else -1
-
 BLOCK_SIZE = 128
-# The indexer's pooled state is addressed in groups of index_kpool tokens, which
-# vLLM Ascend models as its own small page class (AscendIndexerKPoolStateSpec).
 INDEX_STATE_BLOCK_SIZE = INDEX_KPOOL
-MAX_BATCH_PER_DP = 32
-MTP_SPEC_TOKENS = 3
-DECODE_ROWS_PER_REQUEST = MTP_SPEC_TOKENS + 1
-DECODE_MAX_TOKENS = MAX_BATCH_PER_DP * DECODE_ROWS_PER_REQUEST
-PREFILL_MAX_TOKENS = 8192
-DECODE_RECV_MAX = DP_SIZE * DECODE_MAX_TOKENS
-PREFILL_RECV_MAX = DP_SIZE * PREFILL_MAX_TOKENS
-RECV_MAX = PREFILL_RECV_MAX
-AUX_WIDTH = 8
-ROUTE_WIDTH = 8

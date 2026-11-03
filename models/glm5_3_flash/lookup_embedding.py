@@ -8,19 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Look up one vocabulary shard and replicate BF16 embeddings into mHC streams."""
 
-import sys
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.config import D, HC_MULT, LOCAL_VOCAB, T_DYN
+from models.glm5_3_flash.config import HC_MULT, LOCAL_VOCAB, D
 
+T_DYN = pl.dynamic('GLM53_T_DYN')
 
-# tiling
 D_TILE = 1024
 
 
@@ -33,8 +27,8 @@ def lookup_embedding(
 ):
     """Write local-shard rows or zeros; the caller reduces across vocabulary shards."""
     token_count = pl.tensor.dim(token_ids, 0)
-    streams_flat = pl.reshape(hidden_streams, [token_count * HC_MULT, D])
     vocab_stop = vocab_start + LOCAL_VOCAB
+    streams_flat = pl.reshape(hidden_streams, [token_count * HC_MULT, D])
     for block in pl.spmd(48, name_hint="lookup_embedding"):
         for work in pl.range(block, token_count * (D // D_TILE), 48):
             token = work // (D // D_TILE)
@@ -63,9 +57,3 @@ def golden_lookup_embedding(
     rows = table.index_select(0, local_ids[local])
     output[local] = rows.unsqueeze(1).expand(-1, HC_MULT, -1)
     return output
-
-
-__all__ = [
-    "golden_lookup_embedding",
-    "lookup_embedding",
-]

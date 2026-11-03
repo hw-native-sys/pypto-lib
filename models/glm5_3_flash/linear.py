@@ -14,10 +14,14 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+
 import pypto.language as pl
 import torch
 
-from models.glm5_3_flash.quantization import quantize_bf16_rows, quantize_per_token_int8
+from models.glm5_3_flash.quantization import (
+    quantize_bf16_rows, quantize_per_channel_int8, quantize_per_token_int8,
+)
+from models.glm5_3_flash.utils import Checkpoint
 
 DOT_M = pl.dynamic("DOT_M")
 DOT_K = pl.dynamic("DOT_K")
@@ -25,15 +29,6 @@ DOT_W0 = pl.dynamic("DOT_W0")
 DOT_W1 = pl.dynamic("DOT_W1")
 DOT_BIAS = pl.dynamic("DOT_BIAS")
 DOT_K_TILE = 16
-
-
-def golden_bf16_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Reference BF16 products without CPU GEMM accumulation error at BF16 ties.
-
-    Round the independent FP64 dot product to the FP32 accumulator domain;
-    callers retain ownership of their BF16 projection boundaries.
-    """
-    return (x.double() @ weight.double().t()).float()
 
 
 @pl.jit.inline
@@ -95,7 +90,7 @@ def bf16_projection(
             bias_row = pl.reshape(pl.cast(bias_values, pl.FP32), [1, 64])
             projected = pl.col_expand_add(projected, bias_row)
         narrowed = pl.cast(projected, pl.BF16, mode="rint")
-        output[row0:row0 + 16, col0:col0 + 64] = pl.set_validshape(narrowed, valid_rows, valid_columns)
+        output[row0 : row0 + 16, col0 : col0 + 64] = pl.set_validshape(narrowed, valid_rows, valid_columns)
     return output
 
 
@@ -125,9 +120,9 @@ def int8_linear_tile(
     row_scale = pl.slice(token_scale, [M_TILE, 8], [x_start, 0], valid_shape=[valid_rows, 8])
     row_scale_column = pl.row_max(row_scale)
     channel_scale = pl.slice(weight_scale, [N_TILE], [w_start], valid_shape=[valid_columns])
-    channel_scale_row = pl.reshape(channel_scale, [1, N_TILE])
     products = pl.cast(accum, pl.FP32, mode="rint")
     row_dequantized = pl.row_expand_mul(products, row_scale_column)
+    channel_scale_row = pl.reshape(channel_scale, [1, N_TILE])
     return pl.col_expand_mul(row_dequantized, channel_scale_row)
 
 
@@ -142,17 +137,19 @@ def w8a8_projection_fp32(
 ):
     """Quantize each activation row and publish dequantized INT32 cube sums."""
     rows = pl.tensor.dim(x, 0)
-    quantized = pl.create_tensor([rows, K_DIM], dtype=pl.INT8)
     token_scale = pl.create_tensor([rows, 8], dtype=pl.FP32)
+    quantized = pl.create_tensor([rows, K_DIM], dtype=pl.INT8)
     quantize_bf16_rows(x, quantized, token_scale)
     for block in pl.spmd(((rows + 15) // 16) * ((N_DIM + 127) // 128), name_hint="w8a8_projection"):
         row0 = block // ((N_DIM + 127) // 128) * 16
         col0 = block % ((N_DIM + 127) // 128) * 128
         valid_rows = pl.min(16, rows - row0)
         valid_columns = pl.min(128, N_DIM - col0)
-        result = int8_linear_tile(quantized, weight, token_scale, weight_scale,
-                                  row0, col0, valid_rows, valid_columns, 16, 128, K_DIM)
-        output[row0:row0 + 16, col0:col0 + 128] = pl.set_validshape(result, valid_rows, valid_columns)
+        result = int8_linear_tile(
+            quantized, weight, token_scale, weight_scale, row0, col0, valid_rows, valid_columns, 16, 128,
+            K_DIM,
+        )
+        output[row0 : row0 + 16, col0 : col0 + 128] = pl.set_validshape(result, valid_rows, valid_columns)
     return output
 
 
@@ -175,7 +172,7 @@ def w8a8_projection_bf16(
         valid_rows = pl.min(8, rows - row0)
         valid_columns = pl.min(128, N_DIM - col0)
         source = pl.slice(projected, [8, 128], [row0, col0], valid_shape=[valid_rows, valid_columns])
-        output[row0:row0 + 8, col0:col0 + 128] = pl.cast(source, pl.BF16, mode="rint")
+        output[row0 : row0 + 8, col0 : col0 + 128] = pl.cast(source, pl.BF16, mode="rint")
     return output
 
 
@@ -199,9 +196,11 @@ def int8_linear_test(
         valid_rows = pl.min(16, rows - row0)
         col0 = pl.cast(0, pl.INDEX)
         valid_columns = pl.cast(128, pl.INDEX)
-        result = int8_linear_tile(quantized, weight, token_scale, weight_scale,
-                                  row0, col0, valid_rows, valid_columns, 16, 128, 4096)
-        output[row0:row0 + 16, :] = pl.set_validshape(result, valid_rows, 128)
+        result = int8_linear_tile(
+            quantized, weight, token_scale, weight_scale, row0, col0, valid_rows, valid_columns, 16, 128,
+            4096,
+        )
+        output[row0 : row0 + 16, :] = pl.set_validshape(result, valid_rows, 128)
     return quantized, token_scale, output
 
 
@@ -222,6 +221,15 @@ def linear_test(
     return (output, narrowed)
 
 
+def golden_bf16_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Reference BF16 products without CPU GEMM accumulation error at BF16 ties.
+
+    Round the independent FP64 dot product to the FP32 accumulator domain;
+    callers retain ownership of their BF16 projection boundaries.
+    """
+    return (x.double() @ weight.double().t()).float()
+
+
 def golden_linear(
     tensors,
 ):
@@ -236,8 +244,6 @@ def main():
     from functools import lru_cache
 
     from golden import TensorSpec, ratio_allclose, run
-    from models.glm5_3_flash.quantization import quantize_per_channel_int8
-    from models.glm5_3_flash.weights import Checkpoint
 
     parser = argparse.ArgumentParser(description="GLM-5.3-Flash BF16 and dynamic INT8 linear validation")
     parser.add_argument("-p", "--platform", dest="backend_type", default="a2a3", choices=["a2a3", "a5"])
@@ -281,9 +287,9 @@ def main():
         result = run(
             fn=int8_linear_test,
             specs=[
-                TensorSpec("x", [args.tokens, 4096], torch.bfloat16, init_value=lambda: native_inputs()["x"]),
-                TensorSpec("weight", [128, 4096], torch.int8, init_value=lambda: native_inputs()["weight"]),
-                TensorSpec("weight_scale", [128], torch.float32, init_value=lambda: native_inputs()["weight_scale"]),
+                TensorSpec("x", [args.tokens, 4096], torch.bfloat16, init_value=lambda : native_inputs()["x"]),
+                TensorSpec("weight", [128, 4096], torch.int8, init_value=lambda : native_inputs()["weight"]),
+                TensorSpec("weight_scale", [128], torch.float32, init_value=lambda : native_inputs()["weight_scale"]),
                 TensorSpec("quantized", [args.tokens, 4096], torch.int8),
                 TensorSpec("token_scale", [args.tokens, 8], torch.float32),
                 TensorSpec("output", [args.tokens, 128], torch.float32),
@@ -293,8 +299,8 @@ def main():
             compile_only=args.compile_only,
             compare_fn={
                 "quantized": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
-                "token_scale": ratio_allclose(atol=1e-8, rtol=1e-6, max_error_ratio=0),
-                "output": ratio_allclose(atol=1e-5, rtol=1e-5, max_error_ratio=0),
+                "token_scale": ratio_allclose(atol=1e-08, rtol=1e-06, max_error_ratio=0),
+                "output": ratio_allclose(atol=1e-05, rtol=1e-05, max_error_ratio=0),
             },
         )
         print(result)
@@ -316,10 +322,7 @@ def main():
         golden_fn=golden_linear,
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         compile_only=args.compile_only,
-        compare_fn={
-            "output": ratio_allclose(atol=1e-5, rtol=1e-6, max_error_ratio=0),
-            "narrowed": ratio_allclose(atol=0, rtol=0, max_error_ratio=0),
-        },
+        compare_fn={"output": ratio_allclose(atol=1e-05, rtol=1e-06, max_error_ratio=0), "narrowed": ratio_allclose(atol=0, rtol=0, max_error_ratio=0)},
     )
     print(result)
     if not result.passed:
