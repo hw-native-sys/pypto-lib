@@ -15,6 +15,54 @@ using Acc = mxfp8_projection::AC<256>;
 using ScaleB = BS<1280, 256>;
 using FullA = Tile<TileType::Mat, F, 80, 1280, BLayout::ColMajor, 80, 1280, SLayout::RowMajor, 512>;
 
+#if defined(__CPU_SIM)
+using QBRopePipe = TPipe<0, Direction::DIR_C2V, 20480, 2, 2>;
+#endif
+using QBRopeAcc = TileAcc<float, 80, 64>;
+using QBRopeRaw = Tile<TileType::Vec, float, 80, 64>;
+using QBRopeResult = Tile<TileType::Vec, bfloat16_t, 80, 64>;
+using QBRopeAngles = Tile<TileType::Vec, float, 80, 32>;
+
+#if defined(__DAV_CUBE__)
+template <bool ENABLED>
+struct QBRopeTransfer {
+    __aicore__ inline void finish() {}
+};
+
+template <>
+struct QBRopeTransfer<true> {
+    int transferred = 0;
+#if defined(__CPU_SIM)
+    QBRopePipe pipe;
+    __aicore__ QBRopeTransfer() : pipe(nullptr, 0, 0) {}
+#endif
+    __aicore__ inline void push(QBRopeAcc& tail) {
+#if defined(__CPU_SIM)
+        TPUSH<QBRopePipe, QBRopeAcc, TileSplitAxis::NONE>(pipe, tail);
+#else
+        int slot = transferred % 2;
+        // The vector lane owns both slots before the first transfer.
+        wait_intra_block(PIPE_FIX, slot * 2 + 1);
+        QBRopeRaw raw;
+        TASSIGN(raw, slot * 20480);
+        TMOV<QBRopeRaw, QBRopeAcc, AccToVecMode::SingleModeVec0>(raw, tail);
+        set_intra_block(PIPE_FIX, slot * 2);
+#endif
+        ++transferred;
+    }
+    __aicore__ inline void finish() {
+#if !defined(__CPU_SIM)
+        if (transferred > 0) {
+            // Drain both credits, including an unused second startup slot.
+            // Vector may return only after this final Cube acknowledgement.
+            wait_intra_block(PIPE_FIX, 1);
+            wait_intra_block(PIPE_FIX, 3);
+            set_intra_block(PIPE_FIX, 4);
+        }
+#endif
+    }
+};
+
 template <int N>
 __aicore__ inline void load_b(__gm__ F* b, int step, int block, int workers, int slot) {
     int n = (step / 5 * workers + block) * 256;
@@ -53,15 +101,19 @@ __aicore__ inline void compute_qb(FullA& am, MatB& bm, AS<1280>& sa, ScaleB& sb,
     set_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(slot));
 }
 
-template <int N, int WORKERS = (N / 256 < 32 ? N / 256 : 32), bool OFFSET_INPUT = false>
+template <int N, int WORKERS = (N / 256 < 32 ? N / 256 : 32), bool OFFSET_INPUT = false, bool FUSED_ROPE = false>
 __aicore__ inline void project_qb(__gm__ int64_t* args) {
     // Preserve constant loop bounds for full-width launches.
     if constexpr (WORKERS > 0) {
         if (get_block_num(args) != WORKERS) {
-            project_qb<N, 0, OFFSET_INPUT>(args);
+            project_qb<N, 0, OFFSET_INPUT, FUSED_ROPE>(args);
             return;
         }
     }
+    // Runtime ABI groups Tensor descriptors before scalar arguments.
+    const int rows = args[FUSED_ROPE ? 7 : 5];
+    const int row_start = args[FUSED_ROPE ? 9 : 7];
+    QBRopeTransfer<FUSED_ROPE> rope_transfer;
     int block = get_block_idx(args);
     int workers = WORKERS;
     int waves;
@@ -122,13 +174,29 @@ __aicore__ inline void project_qb(__gm__ int64_t* args) {
             if (step % 5 == 4) {
                 set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
                 wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-                acc.SetValidRow(args[5]);
+                acc.SetValidRow(rows);
                 using OS = TileShape2D<bfloat16_t, DYNAMIC, 256, Layout::ND>;
                 using ST = BaseShape2D<bfloat16_t, DYNAMIC, DYNAMIC, Layout::ND>;
                 int n = ((first_wave + wave) * workers + block) * 256;
                 GlobalTensor<bfloat16_t, OS, ST, Layout::ND> cg(
-                    data<bfloat16_t>(args, 4) + args[7] * N + n, OS(args[5], 256), ST(args[5], N));
-                TSTORE(cg, acc);
+                    data<bfloat16_t>(args, 4) + row_start * N + n, OS(rows, 256), ST(rows, N));
+                if constexpr (FUSED_ROPE) {
+                    if (n % 512 == 256) {
+                        TileAcc<float, 80, 256, DYNAMIC, 192> prefix(rows);
+                        TASSIGN(prefix, wave % 2 * 81920);
+                        using PS = TileShape2D<bfloat16_t, DYNAMIC, 192, Layout::ND>;
+                        GlobalTensor<bfloat16_t, PS, ST, Layout::ND> prefix_gm(
+                            data<bfloat16_t>(args, 4) + row_start * N + n, PS(rows, 192), ST(rows, N));
+                        TSTORE(prefix_gm, prefix);
+                        QBRopeAcc tail;
+                        TASSIGN(tail, wave % 2 * 81920 + 192 * 80 * sizeof(float));
+                        rope_transfer.push(tail);
+                    } else {
+                        TSTORE(cg, acc);
+                    }
+                } else {
+                    TSTORE(cg, acc);
+                }
                 set_flag(PIPE_FIX, PIPE_M, static_cast<event_t>(4 + wave % 2));
             }
         }
@@ -138,4 +206,139 @@ __aicore__ inline void project_qb(__gm__ int64_t* args) {
         }
         pipe_barrier(PIPE_ALL);
     }
+    rope_transfer.finish();
 }
+#endif
+
+#if defined(__DAV_VEC__)
+__tf__ __aicore__ inline void qb_rotate_tail(
+    QBRopeResult::TileDType __out__ output, QBRopeRaw::TileDType __in__ input,
+    QBRopeAngles::TileDType __in__ cosine, QBRopeAngles::TileDType __in__ sine, uint16_t rows) {
+    auto src = (__ubuf__ float*)__cce_get_tile_ptr(input);
+    auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(output);
+    auto cp = (__ubuf__ float*)__cce_get_tile_ptr(cosine);
+    auto sp = (__ubuf__ float*)__cce_get_tile_ptr(sine);
+#if defined(__CPU_SIM)
+    for (int row = 0; row < rows; ++row) {
+        for (int pair = 0; pair < 32; ++pair) {
+            float even = static_cast<float>(static_cast<bfloat16_t>(src[row * 64 + pair * 2]));
+            float odd = static_cast<float>(static_cast<bfloat16_t>(src[row * 64 + pair * 2 + 1]));
+            float ec = even * cp[row * 32 + pair];
+            float os = odd * sp[row * 32 + pair];
+            float es = even * sp[row * 32 + pair];
+            float oc = odd * cp[row * 32 + pair];
+            dst[row * 64 + pair * 2] = static_cast<bfloat16_t>(ec - os);
+            dst[row * 64 + pair * 2 + 1] = static_cast<bfloat16_t>(es + oc);
+        }
+    }
+#else
+    __VEC_SCOPE__ {
+        MaskReg full = pset_b32(PAT_ALL);
+        uint32_t count = 32;
+        MaskReg half = plt_b32(count, POST_UPDATE);
+        for (uint16_t row = 0; row < rows; ++row) {
+            RegTensor<bfloat16_t> bf;
+            RegTensor<float> values, even, odd, cosv, sinv, a, b, real, imag, rotated, unused;
+            vlds(values, src, row * 64, NORM);
+            vcvt(bf, values, full, ROUND_R, RS_DISABLE, PART_EVEN);
+            vcvt(values, bf, full, PART_EVEN);
+            vlds(cosv, cp, row * 32, NORM);
+            vlds(sinv, sp, row * 32, NORM);
+            vdintlv(even, odd, values, values);
+            vmul(a, even, cosv, half, MODE_ZEROING);
+            vmul(b, odd, sinv, half, MODE_ZEROING);
+            vsub(real, a, b, half);
+            vmul(a, even, sinv, half, MODE_ZEROING);
+            vmul(b, odd, cosv, half, MODE_ZEROING);
+            vadd(imag, a, b, half, MODE_ZEROING);
+            vintlv(rotated, unused, real, imag);
+            vcvt(bf, rotated, full, ROUND_R, RS_DISABLE, PART_EVEN);
+            vsts(bf, dst, row * 64, PK_B32, full);
+        }
+    }
+#endif
+}
+
+__aicore__ inline void project_qb_rope(__gm__ int64_t* args) {
+    int block = get_block_idx(args);
+    int workers = get_block_num(args);
+    int width = args[8];
+    int waves = (width / 256 - block + workers - 1) / workers;
+    int rows = args[7];
+    bool have_tail = false;
+    for (int wave = 0; wave < waves; ++wave) {
+        if (((wave * workers + block) & 1) != 0) have_tail = true;
+    }
+    if (!have_tail) return;
+#if defined(__CPU_SIM)
+    QBRopePipe pipe(nullptr, 0, 0);
+#endif
+    QBRopeAngles cosine, sine;
+    QBRopeResult result;
+    TASSIGN(cosine, 40960);
+    TASSIGN(sine, 51200);
+    TASSIGN(result, 61440);
+    if (rows > 0) {
+        using Shape = TileShape2D<float, DYNAMIC, 32>;
+        using Stride = BaseShape2D<float, DYNAMIC, DYNAMIC>;
+        auto cos_tensor = reinterpret_cast<__gm__ Tensor*>(args[5]);
+        auto sin_tensor = reinterpret_cast<__gm__ Tensor*>(args[6]);
+        Tile<TileType::Vec, float, 80, 32, BLayout::RowMajor, DYNAMIC, 32> c(rows), s(rows);
+        TASSIGN(c, 40960);
+        TASSIGN(s, 51200);
+        GlobalTensor<float, Shape, Stride> cg(data<float>(args, 5) + args[9] * cos_tensor->strides[0],
+            Shape(rows, 32), Stride(rows, cos_tensor->strides[0]));
+        GlobalTensor<float, Shape, Stride> sg(data<float>(args, 6) + args[9] * sin_tensor->strides[0],
+            Shape(rows, 32), Stride(rows, sin_tensor->strides[0]));
+        TLOAD(c, cg);
+        TLOAD(s, sg);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    }
+    int received = 0;
+    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+#if !defined(__CPU_SIM)
+    // No-tail lanes returned above. Active lanes lend two 20480-byte slots;
+    // the Cube consumes every credit and acknowledges their final return.
+    set_intra_block(PIPE_V, 1);
+    set_intra_block(PIPE_V, 3);
+#endif
+    for (int wave = 0; wave < waves; ++wave) {
+        int n = (wave * workers + block) * 256;
+        if (n % 512 != 256) continue;
+        int slot = received % 2;
+        QBRopeRaw raw;
+#if defined(__CPU_SIM)
+        TPOP<QBRopePipe, QBRopeRaw, TileSplitAxis::NONE>(pipe, raw);
+#else
+        TASSIGN(raw, slot * 20480);
+        wait_intra_block(PIPE_V, slot * 2);
+#endif
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        qb_rotate_tail(result.data(), raw.data(), cosine.data(), sine.data(), rows);
+#if defined(__CPU_SIM)
+        TFREE<QBRopePipe, TileSplitAxis::NONE>(pipe);
+#else
+        set_intra_block(PIPE_V, slot * 2 + 1);
+#endif
+        if (rows > 0) {
+            using Shape = TileShape2D<bfloat16_t, DYNAMIC, 64>;
+            using Stride = BaseShape2D<bfloat16_t, DYNAMIC, DYNAMIC>;
+            Tile<TileType::Vec, bfloat16_t, 80, 64, BLayout::RowMajor, DYNAMIC, 64> active_result(rows);
+            TASSIGN(active_result, 61440);
+            GlobalTensor<bfloat16_t, Shape, Stride> output(data<bfloat16_t>(args, 4) + args[9] * width + n + 192,
+                Shape(rows, 64), Stride(rows, width));
+            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            TSTORE(output, active_result);
+        }
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        ++received;
+    }
+    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+#if !defined(__CPU_SIM)
+    wait_intra_block(PIPE_V, 4);
+#endif
+    pipe_barrier(PIPE_ALL);
+}
+#endif

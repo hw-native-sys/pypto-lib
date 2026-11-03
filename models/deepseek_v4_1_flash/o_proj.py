@@ -53,6 +53,22 @@ K_TILE = 256
 D_TILE = 512
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_rope_quant_vf.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _rope_quant_o_vf(
+    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    payload: pl.Out[pl.Tensor[[LOCAL_O_GROUPS * 80, O_GROUP_IN], pl.FP8E4M3FN]],
+    scales: pl.Out[pl.Tensor[[LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], pl.FP8E8M0]],
+    active_rows: pl.Scalar[pl.INT32],
+    groups: pl.Scalar[pl.INT32],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Fuse inverse RoPE and OCP MXFP8 quantization, preserving BF16 rounding."""
+    # Preserve both extern Out values: https://github.com/hw-native-sys/pypto/issues/3249
+    return payload, scales
+
+
 @pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "o_proj_a.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _o_proj_a(
@@ -105,90 +121,14 @@ def o_proj(
         # Inverse RoPE and input quantization.
         padded_rows = 80
         row_tiles = padded_rows // MX_M_TILE
-        last_input_row = pl.max(pl.tensor.dim(attended_group, 0) - 1, 0)
-        payload_all = pl.create_tensor([LOCAL_O_GROUPS * padded_rows, O_GROUP_IN], dtype=pl.FP8E4M3FN)
-        scales_all = pl.create_tensor([LOCAL_O_GROUPS, padded_rows * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
-        group_quant_blocks = row_tiles * (O_GROUP_IN // (2 * K_TILE))
-        quant_blocks = LOCAL_O_GROUPS * group_quant_blocks
-        quant_workers = pl.min(pl.min(quant_blocks, 64), 2 * pl.system.available_cluster_count())
-        for worker in pl.spmd(quant_workers, name_hint="rope_quant_o_pooled"):
-            for work in pl.range(worker, quant_blocks, quant_workers):
-                quant_group = work // group_quant_blocks
-                group_work = work % group_quant_blocks
-                t0 = group_work // (O_GROUP_IN // (2 * K_TILE)) * MX_M_TILE
-                block = group_work % (O_GROUP_IN // (2 * K_TILE))
-                rows = pl.max(pl.min(MX_M_TILE, active_rows - t0), 0)
-                input_t0 = pl.min(t0, last_input_row)
-                cosine = pl.load(cosine_group, [input_t0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
-                cosine = pl.fillpad(cosine, pad_value=pl.PadValue.zero)
-                cosine = pl.set_validshape(cosine, MX_M_TILE, ROPE_DIM // 2)
-                sine = pl.load(sine_group, [input_t0, 0], [MX_M_TILE, ROPE_DIM // 2], valid_shape=[rows, ROPE_DIM // 2])
-                sine = pl.fillpad(sine, pad_value=pl.PadValue.zero)
-                valid_sine = pl.set_validshape(sine, MX_M_TILE, ROPE_DIM // 2)
-                sine = pl.mul(valid_sine, -1.0)
-                for chunk in pl.unroll(2):
-                    k0 = (chunk * (O_GROUP_IN // (2 * K_TILE)) + block) * K_TILE
-                    input_n = quant_group * O_GROUP_IN + k0
-                    raw_source = pl.load(attended_group, [input_t0, input_n], [MX_M_TILE, K_TILE], valid_shape=[rows, K_TILE])
-                    if block % (HEAD_DIM // K_TILE) == HEAD_DIM // K_TILE - 1:
-                        tail = pl.cast(raw_source[:, K_TILE - ROPE_DIM:K_TILE], pl.FP32)
-                        even = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P0101)
-                        odd = pl.tile.gather_mask(tail, mask_pattern=pl.tile.MaskPattern.P1010)
-                        rope_even_cos = pl.mul(even, cosine)
-                        rope_odd_sin = pl.mul(odd, sine)
-                        re = pl.sub(rope_even_cos, rope_odd_sin)
-                        rope_even_sin = pl.mul(even, sine)
-                        rope_odd_cos = pl.mul(odd, cosine)
-                        im = pl.add(rope_even_sin, rope_odd_cos)
-                        real_lanes = pl.tile.full([MX_M_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                        real_lanes = pl.tile.scatter_mask(real_lanes, re, mask_pattern=pl.tile.MaskPattern.P0101)
-                        imag_lanes = pl.tile.full([MX_M_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                        imag_lanes = pl.tile.scatter_mask(imag_lanes, im, mask_pattern=pl.tile.MaskPattern.P1010)
-                        real_bits = pl.reinterpret_view(real_lanes, pl.UINT32)
-                        imag_bits = pl.reinterpret_view(imag_lanes, pl.UINT32)
-                        rotated_bits = pl.or_(real_bits, imag_bits)
-                        rotated = pl.reinterpret_view(rotated_bits, pl.FP32)
-                        rotated = pl.cast(rotated, pl.BF16, mode="rint")
-                        valid_rotated = pl.set_validshape(rotated, rows, ROPE_DIM)
-                        assembled_source = pl.tile.assemble(raw_source, valid_rotated, [0, K_TILE - ROPE_DIM])
-                        valid_source = pl.set_validshape(assembled_source, rows, K_TILE)
-                    else:
-                        valid_source = raw_source
-                    padded_source = pl.fillpad(valid_source, pad_value=pl.PadValue.zero)
-                    source = pl.set_validshape(padded_source, MX_M_TILE, K_TILE)
-                    source_fp32 = pl.cast(source, pl.FP32)
-                    groups = pl.reshape(source_fp32, [MX_M_TILE * (K_TILE // 32), 32])
-                    reduce_tmp = pl.create_tile([MX_M_TILE * (K_TILE // 32), 32], dtype=pl.FP32)
-                    magnitude = pl.abs(groups)
-                    maximum = pl.row_max(magnitude, tmp_tile=reduce_tmp)
-                    bits = pl.reinterpret_view(maximum, pl.INT32)
-                    biased_exponent = pl.shrs(bits, 23)
-                    scale_exponent = pl.sub(biased_exponent, 8)
-                    exponent = pl.maximum(scale_exponent, 0)
-                    nonzero_exponent = pl.maximum(exponent, 1)
-                    divisor_bits = pl.shls(nonzero_exponent, 23)
-                    divisor = pl.reinterpret_view(divisor_bits, pl.FP32)
-                    normalized = pl.row_expand_div(groups, divisor)
-                    floor_code = pl.minimum(exponent, 1)
-                    floor_mask = pl.cast(floor_code, pl.FP32)
-                    normalized = pl.row_expand_mul(normalized, floor_mask)
-                    lower_clamped = pl.maximum(normalized, -448.0)
-                    normalized = pl.minimum(lower_clamped, 448.0)
-                    quantized = pl.cast(normalized, pl.FP8E4M3FN, mode="rint")
-                    quantized_tile = pl.reshape(quantized, [MX_M_TILE, K_TILE])
-                    payload_all = pl.store(quantized_tile, [quant_group * padded_rows + t0, k0], payload_all)
-                    sign_bit = pl.shrs(exponent, 7)
-                    sign_offset = pl.mul(sign_bit, 256)
-                    signed = pl.sub(exponent, sign_offset)
-                    signed_codes = pl.cast(signed, pl.INT8)
-                    codes = pl.reinterpret_view(signed_codes, pl.UINT8)
-                    flat = pl.reshape(codes, [1, MX_M_TILE * (K_TILE // 32)])
-                    pack_tmp = pl.create_tile([1, 96], dtype=pl.UINT8)
-                    packed = pl.tmov_x2zz(flat, pack_tmp, group_axis=1, dst_rows=MX_M_TILE, dst_cols=8)
-                    packed_scale = pl.reinterpret_view(packed, pl.FP8E8M0)
-                    scale_offset = t0 * (O_GROUP_IN // 32) + k0 // K_TILE * MX_M_TILE * (K_TILE // 32)
-                    packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (K_TILE // 32)])
-                    scales_all = pl.store(packed_flat, [quant_group, scale_offset], scales_all)
+        payload_all = pl.create_tensor([LOCAL_O_GROUPS * 80, O_GROUP_IN], dtype=pl.FP8E4M3FN)
+        scales_all = pl.create_tensor([LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
+        quant_workers = pl.max(1, pl.min(64, 2 * pl.system.available_cluster_count()))
+        with pl.spmd(quant_workers, name_hint="rope_quant_o_vf"):
+            payload_all, scales_all = _rope_quant_o_vf(
+                attended_group, cosine_group, sine_group, payload_all, scales_all,
+                active_rows, LOCAL_O_GROUPS,
+            )
         # O-A projection.
         projected = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.BF16)
         oa_workers = pl.min(LOCAL_O_GROUPS * (O_LORA // O_A_N_TILE), pl.system.available_cluster_count())

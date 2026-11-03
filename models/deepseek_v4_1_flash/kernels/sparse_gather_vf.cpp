@@ -168,8 +168,106 @@ __aicore__ inline int64_t row_stride(__gm__ int64_t* args, int index) {
 }
 
 #if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+template <int Slot>
+__aicore__ inline void gather_fp4_subtile(
+    __gm__ int64_t* args, int index_offset, int destination_row, Mat<128, DIM>& kv) {
+    constexpr int payload_address = Slot * 8192;
+    constexpr int scale_address = 16384 + Slot * 1024;
+    constexpr int factor_address = 18432 + Slot * 2048;
+    int id_address = 24576 + index_offset * sizeof(int32_t);
+    constexpr int nz_address = 32768 + Slot * 16384;
+    Vec<int32_t, 1, 16> ids;
+    Vec<float4_e2m1x2_t, 16, DIM> payload;
+    Vec<bfloat16_t, 16, 32> scales;
+    Vec<float, 16, 32> factors;
+    Tile<TileType::Vec, bfloat16_t, 16, DIM, BLayout::ColMajor, 16, DIM, SLayout::RowMajor> nz;
+    TASSIGN(ids, id_address);
+    TASSIGN(payload, payload_address);
+    TASSIGN(scales, scale_address);
+    TASSIGN(factors, factor_address);
+    TASSIGN(nz, nz_address);
+    auto payload_base = data<uint8_t>(args, 5);
+    auto scale_base = data<bfloat16_t>(args, 6);
+
+    // Payload/scales are reusable after VF consumes this slot. The 64
+    // indices remain immutable throughout the gather; NZ has its own credit.
+    wait_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(5 + Slot));
+    for (int row = 0; row < 16; row += 2) {
+        int first = ids.GetValue(row);
+        int second = ids.GetValue(row + 1);
+        if (first >= 0 && second >= 0 && first != second) {
+            int low = first < second ? first : second;
+            int high = first < second ? second : first;
+            Vec<uint8_t, 2, 256> pair;
+            Vec<bfloat16_t, 2, 32> factor_pair;
+            TASSIGN(pair, payload_address + row * 256);
+            TASSIGN(factor_pair, scale_address + row * 64);
+            using PairStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
+            using PayloadShape = Shape<1, 1, 1, 2, 256>;
+            using ScaleShape = Shape<1, 1, 1, 2, 32>;
+            GlobalTensor<uint8_t, PayloadShape, PairStride> input(
+                payload_base + (int64_t)low * 256, PayloadShape(),
+                PairStride(1, 1, 1, (int64_t)(high - low) * 256, 1));
+            GlobalTensor<bfloat16_t, ScaleShape, PairStride> scale(
+                scale_base + (int64_t)low * 32, ScaleShape(),
+                PairStride(1, 1, 1, (int64_t)(high - low) * 32, 1));
+            TLOAD(pair, input);
+            TLOAD(factor_pair, scale);
+        } else {
+            for (int pair_row = 0; pair_row < 2; ++pair_row) {
+                int physical = pair_row == 0 ? first : second;
+                if (physical < 0) physical = 0;
+                Vec<uint8_t, 1, 256> value;
+                Vec<bfloat16_t, 1, 32> factor;
+                TASSIGN(value, payload_address + (row + pair_row) * 256);
+                TASSIGN(factor, scale_address + (row + pair_row) * 64);
+                GM<uint8_t, 1, 256> input(payload_base + (int64_t)physical * 256);
+                GM<bfloat16_t, 1, 32> scale(scale_base + (int64_t)physical * 32);
+                TLOAD(value, input);
+                TLOAD(factor, scale);
+            }
+        }
+    }
+    set_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(5 + Slot));
+    wait_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(5 + Slot));
+    TCVT(factors, scales, RoundMode::CAST_RINT);
+    wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(5 + Slot));
+    sparse_dequant::decode_nz<true, decltype(nz), decltype(payload), decltype(factors), decltype(ids)>(
+        nz.data(), payload.data(), factors.data(), ids.data());
+    set_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(5 + Slot));
+    set_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(5 + Slot));
+    wait_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(5 + Slot));
+    TINSERT(kv, nz, destination_row, 0);
+    set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(5 + Slot));
+}
+
 __aicore__ inline void gather_part(__gm__ int64_t* args, int token, int part, int lane, int ordinal) {
-    pipe_barrier(PIPE_ALL);
+    if (part * 128 >= args[11]) {
+        Mat<128, DIM> kv;
+        TASSIGN(kv, KV_L1 + (ordinal % 2) * 131072);
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID5);
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID6);
+        int source_column = part * 128 + lane * 64 - args[11];
+        Vec<int32_t, 1, 64> all_ids;
+        TASSIGN(all_ids, 24576);
+        GM<int32_t, 1, 64> source_ids(
+            data<int32_t>(args, 8) + token * row_stride(args, 8) + source_column);
+        TLOAD(all_ids, source_ids);
+        set_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
+        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
+        gather_fp4_subtile<0>(args, 0, lane * 64, kv);
+        gather_fp4_subtile<1>(args, 16, lane * 64 + 16, kv);
+        gather_fp4_subtile<0>(args, 32, lane * 64 + 32, kv);
+        gather_fp4_subtile<1>(args, 48, lane * 64 + 48, kv);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID5);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID6);
+        set_intra_block(PIPE_MTE3, 8);
+        return;
+    }
     Vec<int32_t, 1, 32> ids;
     Tile<TileType::Vec, bfloat16_t, 32, DIM, BLayout::ColMajor, 32, DIM, SLayout::RowMajor> nz;
     Mat<128, DIM> kv;
@@ -218,7 +316,6 @@ __aicore__ inline void gather_part(__gm__ int64_t* args, int token, int part, in
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID7);
     }
     set_intra_block(PIPE_MTE3, 8);
-    pipe_barrier(PIPE_ALL);
 }
 #endif
 
