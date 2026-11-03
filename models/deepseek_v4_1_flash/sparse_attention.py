@@ -19,7 +19,7 @@ from compressor import golden_c1a_compressor
 from compressor import golden_c2a_compressor
 from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
-from o_proj import golden_o_proj, golden_grouped_output, o_proj, _o_proj_quantized
+from o_proj import golden_o_proj, golden_grouped_output, o_proj
 from qkv_proj_rope import golden_rope_tail
 from rmsnorm import golden_rms_norm
 from golden import TensorSpec
@@ -1229,25 +1229,8 @@ def gather_sparse_attention(
     return attended
 
 
-@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "sparse_gather_o_vf.cpp",
-               aiv_source=Path(__file__).parent / "kernels" / "sparse_gather_o_vf.cpp",
-               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
-def _gather_sparse_o_vf_rows(
-    payload: pl.Out[pl.Tensor], query: pl.Tensor, sink: pl.Tensor,
-    window: pl.Tensor, window_scale: pl.Tensor, compressed: pl.Tensor, compressed_scale: pl.Tensor,
-    window_indices: pl.Tensor, compressed_indices: pl.Tensor,
-    rope_cos: pl.Tensor, rope_sin: pl.Tensor,
-    scales: pl.Out[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32], heads: pl.Scalar[pl.INT32],
-    window_keys: pl.Scalar[pl.INT32], compressed_keys: pl.Scalar[pl.INT32],
-    cache_mode: pl.constexpr,
-) -> tuple[pl.Tensor, pl.Tensor]:
-    """Produce inverse-RoPE MXFP8 projection input directly from sparse attention."""
-    return payload, scales
-
-
 @pl.jit.inline(auto_scope=False)
-def _attend_project_native(
+def _attend_project(
     query: pl.Tensor, window_indices: pl.Tensor, window: pl.Tensor, window_scale: pl.Tensor,
     compressed_indices: pl.Tensor, compressed: pl.Tensor, compressed_scale: pl.Tensor, sink: pl.Tensor,
     wo_a: pl.Tensor, wo_a_scale: pl.Tensor, wo_b: pl.Tensor,
@@ -1255,53 +1238,20 @@ def _attend_project_native(
     rope_cos: pl.Tensor, rope_sin: pl.Tensor, output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32], source_ready: pl.Scalar[pl.TASK_ID], compressed_keys: pl.constexpr,
 ):
-    """Fuse native attention output quantization and project padded 80-row groups."""
-    total_rows = pl.tensor.dim(output, 0)
-    for group_start in pl.parallel(0, total_rows, 80):
-        group_rows = pl.min(80, total_rows - group_start)
-        active_rows = pl.max(pl.min(group_rows, num_tokens - group_start), 0)
-        query_group = pl.tensor.slice(query, [group_rows, LOCAL_H * HEAD_DIM], [group_start, 0])
-        wi_group = pl.tensor.slice(window_indices, [group_rows, WINDOW_KEYS], [group_start, 0])
-        ci_group = compressed_indices[group_start:group_start + group_rows, :]
-        cosine_group = pl.tensor.slice(rope_cos, [group_rows, ROPE_DIM // 2], [group_start, 0])
-        sine_group = pl.tensor.slice(rope_sin, [group_rows, ROPE_DIM // 2], [group_start, 0])
-        payload = pl.create_tensor([LOCAL_O_GROUPS * 80, O_GROUP_IN], dtype=pl.FP8E4M3FN)
-        scales = pl.create_tensor([LOCAL_O_GROUPS, 80 * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
-        if compressed_keys == 0:
-            query_waves = pl.max(1, (active_rows + WORKERS - 1) // WORKERS)
-            workers = pl.max(1, pl.min(WORKERS, (active_rows + query_waves - 1) // query_waves))
-        else:
-            workers = pl.max(1, pl.min(active_rows, WORKERS))
-        with pl.spmd(workers, name_hint="sparse_gather_o_vf", deps=[source_ready]):
-            payload, scales = _gather_sparse_o_vf_rows(
-                payload, query_group, sink, window, window_scale, compressed, compressed_scale,
-                wi_group, ci_group, cosine_group, sine_group, scales,
-                active_rows, LOCAL_H, WINDOW_KEYS, compressed_keys, cache_mode=compressed_keys,
-            )
-        output_group = pl.tensor.slice(output, [group_rows, D], [group_start, 0])
-        output_group = _o_proj_quantized(
-            payload, scales, wo_a, wo_a_scale, wo_b, wo_b_scale, output_group, active_rows,
-        )
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def _attend_project_packed_fallback(
-    query: pl.Tensor, window_indices: pl.Tensor, window: pl.Tensor, window_scale: pl.Tensor,
-    compressed_indices: pl.Tensor, compressed: pl.Tensor, compressed_scale: pl.Tensor, sink: pl.Tensor,
-    wo_a: pl.Tensor, wo_a_scale: pl.Tensor, wo_b: pl.Tensor,
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor, rope_sin: pl.Tensor, output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32], source_ready: pl.Scalar[pl.TASK_ID], compressed_keys: pl.constexpr,
-):
-    """Project packed-cache attention for local head counts below the native tile."""
+    """Project BF16 attention through separate inverse RoPE and quantization tasks."""
     total_rows = pl.tensor.dim(output, 0)
     attended = pl.create_tensor([total_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attend_packed(
-        query, window_indices, window, window_scale, compressed_indices, compressed, compressed_scale,
-        sink, attended, num_tokens, source_ready,
-    )
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    if LOCAL_H == 64:
+        gather_sparse_attention(
+            query, window_indices, window, window_scale, compressed_indices, compressed, compressed_scale,
+            sink, attended, num_tokens, source_ready, compressed_keys=compressed_keys,
+        )
+    else:
+        attend_packed(
+            query, window_indices, window, window_scale, compressed_indices, compressed, compressed_scale,
+            sink, attended, num_tokens, source_ready,
+        )
+    output = o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
     return output
 
 
@@ -1323,22 +1273,11 @@ def _attend_window_project(
     source_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Attend a published window cache and project its active query prefix."""
-    if LOCAL_H == 64:
-        _attend_project_native(
-            query, window_indices, window, window_scale, window_indices, window, window_scale, sink,
-            wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output,
-            num_tokens, source_ready, compressed_keys=0,
-        )
-    else:
-        total_rows = pl.tensor.dim(output, 0)
-        attended = pl.create_tensor([total_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        swa_attention_partial(query, window, window_scale, window_indices, sink, attended, num_tokens, source_ready)
-        o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
+    total_rows = pl.tensor.dim(output, 0)
+    attended = pl.create_tensor([total_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    swa_attention_partial(query, window, window_scale, window_indices, sink, attended, num_tokens, source_ready)
+    output = o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
     return output
-
-
-# Native output quantization uses two fixed 32-head Vector halves.
-_attend_project = _attend_project_native if LOCAL_H == 64 else _attend_project_packed_fallback
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "gather_packed.cpp",

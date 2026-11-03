@@ -11,7 +11,6 @@
 #if defined(__CPU_SIM)
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <limits>
 #include <vector>
 #endif
@@ -20,9 +19,6 @@
 #include "intrinsic.h"
 #include "sparse_dequant_vf.hpp"
 #include "sparse_softmax_vf.hpp"
-#if defined(SPARSE_FUSED_O)
-#include "o_rope_quant_vf.hpp"
-#endif
 
 using namespace pto;
 
@@ -106,11 +102,7 @@ __aicore__ inline void load_rows(
 #endif
 
 
-#if defined(SPARSE_FUSED_O)
-constexpr int ARG_TOKENS = 12;
-#else
 constexpr int ARG_TOKENS = 9;
-#endif
 constexpr int ARG_HEADS = ARG_TOKENS + 1;
 constexpr int ARG_WINDOW_KEYS = ARG_TOKENS + 2;
 constexpr int ARG_COMPRESSED_KEYS = ARG_TOKENS + 3;
@@ -150,86 +142,6 @@ using HeadColumn = Tile<TileType::Vec, float, H, 1, BLayout::ColMajor>;
 __aicore__ inline int64_t row_stride(__gm__ int64_t* args, int index) {
     return reinterpret_cast<__gm__ Tensor*>(args[index])->strides[0];
 }
-
-#if defined(SPARSE_FUSED_O) && defined(__DAV_VEC__) && !defined(__CPU_SIM)
-// The rounded attention occupies [128,160 KiB); quantization reuses the
-// retired upper half of its FP32 numerator after the conversion completes.
-constexpr int O_PAYLOAD_UB = 163840;
-constexpr int O_SCALES_UB = 180224;
-constexpr int O_COS_UB = 188416;
-constexpr int O_SIN_UB = 188544;
-
-template <int H>
-__aicore__ inline void store_quantized_query(__gm__ int64_t* args, int token) {
-    using DynamicStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
-    for (int shard = 0; shard < H / 8; ++shard) {
-        const int group = get_sub_block_id(args) * (H / 8) + shard;
-        Vec<float8_e4m3_t, 1, 4096> payload;
-        TASSIGN(payload, O_PAYLOAD_UB + shard * 4096);
-        GM<float8_e4m3_t, 1, 4096> payload_gm(
-            data<float8_e4m3_t>(args, 0) + (group * 80 + token) * row_stride(args, 0));
-        TSTORE(payload_gm, payload);
-
-        // Each 64D pair writes only its two bytes in MX_A_ZZ. Adjacent queries
-        // own the other bytes of the same 32-byte destination row.
-        Tile<TileType::Vec, uint8_t, 64, 32, BLayout::RowMajor, 64, DYNAMIC> scales(2);
-        TASSIGN(scales, O_SCALES_UB + shard * 64 * 32);
-        using ScaleShape = TileShape2D<uint8_t, 64, DYNAMIC>;
-        GlobalTensor<uint8_t, ScaleShape, DynamicStride> scale_gm(
-            data<uint8_t>(args, 11) + group * row_stride(args, 11)
-                + (token / 16) * 2048 + (token % 16) * 2,
-            ScaleShape(64, 2), DynamicStride(1, 1, 1, 32, 1));
-        TSTORE(scale_gm, scales);
-    }
-}
-
-template <int H>
-__aicore__ inline void quantize_query(__gm__ int64_t* args, int token) {
-    Vec<bfloat16_t, H, DIM> attended;
-    Vec<float8_e4m3_t, H, DIM> payload;
-    Vec<uint8_t, H * 8, 32> scales;
-    Vec<float, 1, 32> cosine, sine;
-    TASSIGN(attended, NUMERATOR_UB);
-    TASSIGN(payload, O_PAYLOAD_UB);
-    TASSIGN(scales, O_SCALES_UB);
-    TASSIGN(cosine, O_COS_UB);
-    TASSIGN(sine, O_SIN_UB);
-    // Wait until TCVT has finished reading the FP32 numerator before reusing
-    // its upper half for trig, payload, and aligned scale-pair staging.
-    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
-    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
-    GM<float, 1, 32> cos_gm(data<float>(args, 9) + token * row_stride(args, 9));
-    GM<float, 1, 32> sin_gm(data<float>(args, 10) + token * row_stride(args, 10));
-    TLOAD(cosine, cos_gm);
-    TLOAD(sine, sin_gm);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
-    o_quant::rope_quant_vf<0, 128, decltype(payload), decltype(scales), decltype(attended), decltype(cosine)>(
-        payload.data(), scales.data(), attended.data(), cosine.data(), sine.data(), H);
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
-    store_quantized_query<H>(args, token);
-}
-
-template <int H>
-__aicore__ inline void zero_quantized_padding(__gm__ int64_t* args) {
-    const int first = args[ARG_TOKENS] + get_block_idx(args);
-    if (first >= 80) return;
-    Vec<uint8_t, H, DIM> payload;
-    Vec<uint8_t, H * 8, 32> scales;
-    TASSIGN(payload, O_PAYLOAD_UB);
-    TASSIGN(scales, O_SCALES_UB);
-    TEXPANDS(payload, uint8_t(0));
-    TEXPANDS(scales, uint8_t(0));
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
-    for (int token = first; token < 80; token += get_block_num(args)) {
-        store_quantized_query<H>(args, token);
-    }
-    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
-    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
-}
-#endif
 
 #if defined(__DAV_VEC__) && !defined(__CPU_SIM)
 template <int Slot, bool WaitInput = true>
@@ -367,15 +279,12 @@ __aicore__ inline void gather_part(
         if (column < args[ARG_WINDOW_KEYS]) {
             Vec<float8_e4m3_t, 32, DIM> payload;
             Vec<bfloat16_t, 32, 16> scales;
-            Vec<float, 32, 16> factors;
             TASSIGN(payload, 0);
             TASSIGN(scales, 16384);
-            TASSIGN(factors, 24576);
             load_rows<EVENT_ID7, float8_e4m3_t, 512, 16>(
                 data<float8_e4m3_t>(args, 3), data<bfloat16_t>(args, 4), ids);
-            TCVT(factors, scales, RoundMode::CAST_RINT);
-            sparse_dequant::decode_nz<false, decltype(nz), decltype(payload), decltype(factors), decltype(ids)>(
-                nz.data(), payload.data(), factors.data(), ids.data());
+            sparse_dequant::decode_nz<false, decltype(nz), decltype(payload), decltype(scales), decltype(ids)>(
+                nz.data(), payload.data(), scales.data(), ids.data());
         } else {
             Vec<float4_e2m1x2_t, 32, DIM> payload;
             Vec<bfloat16_t, 32, 32> scales;
@@ -667,9 +576,6 @@ __aicore__ inline void finalize_query(__gm__ int64_t* args, int token, int query
     TASSIGN(result, NUMERATOR_UB);
     TCVT(result, numerator, RoundMode::CAST_RINT, SaturationMode::OFF);
     if (single_part) set_intra_block(PIPE_V, 3);
-#if defined(SPARSE_FUSED_O)
-    quantize_query<H>(args, token);
-#else
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
     Tile<TileType::Vec, bfloat16_t, H, DIM, BLayout::RowMajor, DYNAMIC, DIM> active_result(valid_heads);
     TASSIGN(active_result, NUMERATOR_UB);
@@ -678,7 +584,6 @@ __aicore__ inline void finalize_query(__gm__ int64_t* args, int token, int query
         data<bfloat16_t>(args, 0) + token * row_stride(args, 0) + head * DIM, OutputShape(valid_heads, DIM));
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
     TSTORE(output_gm, active_result);
-#endif
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
 }
 
@@ -686,9 +591,6 @@ template <int H, int K>
 __aicore__ inline void attend_vector(__gm__ int64_t* args) {
     const int workers = get_block_num(args);
     const int block = get_block_idx(args);
-#if defined(SPARSE_FUSED_O)
-    zero_quantized_padding<H>(args);
-#endif
     if (block >= args[ARG_TOKENS]) return;
     const int queries = (args[ARG_TOKENS] - block + workers - 1) / workers;
     const int parts = (args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS]) / K;
@@ -751,43 +653,6 @@ __aicore__ inline void attend_vector(__gm__ int64_t* args) {
 }
 #endif
 #if defined(__CPU_SIM)
-#if defined(SPARSE_FUSED_O)
-void simulate_quantized_query(__gm__ int64_t* args, int token, const bfloat16_t* attended) {
-    for (int head = 0; head < args[ARG_HEADS]; ++head) {
-        float value[DIM] = {};
-        if (attended != nullptr) {
-            const auto src = attended + head * DIM;
-            for (int d = 0; d < DIM; ++d) value[d] = static_cast<float>(src[d]);
-            for (int pair = 0; pair < 32; ++pair) {
-                float cosine = data<float>(args, 9)[token * row_stride(args, 9) + pair];
-                float sine = -data<float>(args, 10)[token * row_stride(args, 10) + pair];
-                float re = value[448 + pair * 2], im = value[449 + pair * 2];
-                value[448 + pair * 2] = static_cast<float>(static_cast<bfloat16_t>(re * cosine - im * sine));
-                value[449 + pair * 2] = static_cast<float>(static_cast<bfloat16_t>(re * sine + im * cosine));
-            }
-        }
-        for (int group = 0; group < 16; ++group) {
-            float maximum = 0;
-            for (int d = 0; d < 32; ++d) maximum = std::max(maximum, std::fabs(value[group * 32 + d]));
-            uint32_t bits;
-            std::memcpy(&bits, &maximum, sizeof(bits));
-            int exponent = std::max(int(bits >> 23) - 8, 0);
-            uint32_t divisor_bits = uint32_t(std::max(exponent, 1)) << 23;
-            float divisor;
-            std::memcpy(&divisor, &divisor_bits, sizeof(divisor));
-            for (int d = 0; d < 32; ++d) {
-                float v = value[group * 32 + d] / divisor * float(exponent != 0);
-                v = std::min(std::max(v, -448.0f), 448.0f);
-                data<float8_e4m3_t>(args, 0)[(head / 8 * 80 + token) * row_stride(args, 0)
-                    + head % 8 * 512 + group * 32 + d] = static_cast<float8_e4m3_t>(v);
-            }
-            data<uint8_t>(args, 11)[head / 8 * row_stride(args, 11) + (token / 16) * 2048
-                + head % 8 * 256 + group / 2 * 32 + token % 16 * 2 + group % 2] = exponent;
-        }
-    }
-}
-#endif
-
 float decode_byte(uint8_t code, bool fp4) {
     if (fp4) {
         const float magnitude[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
@@ -804,12 +669,7 @@ void simulate_attention(__gm__ int64_t* args) {
     int heads = args[ARG_HEADS];
     int keys = args[ARG_WINDOW_KEYS] + args[ARG_COMPRESSED_KEYS];
     auto query = data<bfloat16_t>(args, 1);
-#if defined(SPARSE_FUSED_O)
-    std::vector<bfloat16_t> rounded_query(heads * DIM);
-    auto output = rounded_query.data();
-#else
     auto output = data<bfloat16_t>(args, 0);
-#endif
     auto sink = data<float>(args, 2);
     int64_t sink_stride = row_stride(args, 2);
     for (int token = get_block_idx(args); token < args[ARG_TOKENS]; token += get_block_num(args)) {
@@ -869,33 +729,16 @@ void simulate_attention(__gm__ int64_t* args) {
             float correction = std::exp(maximum[h] - final_max);
             float factor = correction / (denominator[h] * correction + std::exp(sink_value - final_max));
             for (int d = 0; d < 512; ++d) {
-#if defined(SPARSE_FUSED_O)
-                output[h * DIM + d] = static_cast<bfloat16_t>(numerator[h * DIM + d] * factor);
-#else
                 output[token * row_stride(args, 0) + h * 512 + d] = static_cast<bfloat16_t>(numerator[h * 512 + d] * factor);
-#endif
             }
         }
-#if defined(SPARSE_FUSED_O)
-        simulate_quantized_query(args, token, output);
-#endif
     }
-#if defined(SPARSE_FUSED_O)
-    for (int token = args[ARG_TOKENS] + get_block_idx(args); token < 80; token += get_block_num(args)) {
-        simulate_quantized_query(args, token, nullptr);
-    }
-#endif
 }
 #endif
 } // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-#if defined(SPARSE_FUSED_O)
-    // ABI: FP8 O, Q, sink, W, Ws, C, Cs, Wi, Ci, cos, sin, MX scales;
-    // active rows, heads, window keys, compressed keys. Each group has <=80 rows.
-#else
     // ABI: O, Q, sink, W, Ws, C, Cs, Wi, Ci; tokens, heads, Wkeys, Ckeys.
-#endif
 #if defined(__CPU_SIM) && defined(__DAV_VEC__)
     if (get_sub_block_id(args) == 0) {
         simulate_attention(args);
