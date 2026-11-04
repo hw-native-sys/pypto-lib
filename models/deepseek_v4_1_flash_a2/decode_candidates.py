@@ -18,6 +18,9 @@ BASELINE_ID = "addb655f7b4f4a4ce56af875724a04d79d3fe325"
 INPUT_CONTRACT_ID = "decode-contract-v1"
 TOPOLOGY_CONTRACT_ID = "dp8-tp2-ep16-p1-pcp1-dcp1"
 TOLERANCE_CONTRACT_ID = "rtol-0.05-atol-0.05-discrete-exact"
+LAYER_CONTRACT_ID = "physical-layer-v1"
+QUANTIZATION_CONTRACT_ID = "w8a8-int8-engram-block128-v1"
+STATE_CONTRACT_ID = "decode-token-cache-request-state-v1"
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,11 @@ class DecodeCandidate:
     input_contract: str = INPUT_CONTRACT_ID
     topology_contract: str = TOPOLOGY_CONTRACT_ID
     tolerance_contract: str = TOLERANCE_CONTRACT_ID
+    layer_contract: str = LAYER_CONTRACT_ID
+    quantization_contract: str = QUANTIZATION_CONTRACT_ID
+    state_contract: str = STATE_CONTRACT_ID
+    product_scope: str = "bounded_swa_only"
+    formal_status: str = "not_run"
 
     def contract_identity(self) -> tuple[object, ...]:
         """Return the fields that must remain equal across candidates."""
@@ -45,6 +53,9 @@ class DecodeCandidate:
             self.input_contract,
             self.topology_contract,
             self.tolerance_contract,
+            self.layer_contract,
+            self.quantization_contract,
+            self.state_contract,
             self.page_size,
             self.scale_dtype,
         )
@@ -60,6 +71,7 @@ CANDIDATES = (
         packing="canonical_KN_int8",
         scale_dtype="fp32_channel",
         status="runnable_bounded_swa",
+        product_scope="bounded_swa_only",
     ),
     DecodeCandidate(
         name="B",
@@ -70,6 +82,7 @@ CANDIDATES = (
         packing="canonical_KN_int8_padded_state",
         scale_dtype="fp32_channel",
         status="runnable_bounded_swa",
+        product_scope="bounded_swa_only",
     ),
 )
 
@@ -83,12 +96,16 @@ def validate_candidates() -> tuple[DecodeCandidate, ...]:
         raise ValueError("Decode candidate names must be unique")
     identities = {candidate.contract_identity() for candidate in CANDIDATES}
     if len(identities) != 1:
-        raise ValueError("candidates must share page size and scale dtype")
+        raise ValueError("candidates must share baseline, layer, input, state, topology, quantization, page and scale contracts")
     for candidate in CANDIDATES:
         if not candidate.entrypoint.startswith("models.deepseek_v4_1_flash_a2.decode_"):
             raise ValueError(f"candidate {candidate.name} is outside the Decode package")
         if candidate.status != "runnable_bounded_swa":
             raise ValueError(f"candidate {candidate.name} is not an executable PyPTO route")
+        if candidate.product_scope != "bounded_swa_only":
+            raise ValueError(f"candidate {candidate.name} has an unsupported product scope")
+        if candidate.formal_status != "not_run":
+            raise ValueError(f"candidate {candidate.name} cannot be promoted before a formal NPU run")
     return CANDIDATES
 
 
@@ -97,7 +114,10 @@ __all__ = [
     "CANDIDATES",
     "DecodeCandidate",
     "INPUT_CONTRACT_ID",
+    "LAYER_CONTRACT_ID",
+    "QUANTIZATION_CONTRACT_ID",
     "SEARCH_K",
+    "STATE_CONTRACT_ID",
     "TOLERANCE_CONTRACT_ID",
     "TOPOLOGY_CONTRACT_ID",
     "validate_candidates",

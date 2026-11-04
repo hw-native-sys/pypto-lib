@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "scope": "source migration; device acceptance belongs to the frozen original independent-layer snapshots",
+  "scope": "source migration plus an independent A3 Decode acceptance session; formal device accuracy starts at not_run",
   "files": [
     {
       "file": "attention.py",
@@ -943,7 +943,7 @@
     {
       "file": "runtime_config.py",
       "source": "models/deepseek_v4_1_flash_a2/config.py",
-      "migrated_sha256": "5275c6c8bd47d39331a2b3e72aed31bd91f656d78aec8a5f30fe2c723c66818b",
+      "migrated_sha256": "ce9a16d14ec043492e3c83d8db0c992ae1e6edb4cbc6160b3f53961daf792f6c",
       "reason": "Keep runtime TP and Decode topology sizing outside model configuration."
     },
     {
@@ -1006,25 +1006,58 @@
     },
     {
       "file": "decode_gate.py",
-      "sha256": "d7acb25c0f91ccc4e2a834eed331aa3841710b056864b4bb2ae7b355cce3650d",
+      "sha256": "2547c65d318bae9212d1c4c220f1727307a9dd438494fec7facee7e6b600c551",
       "role": "fail-closed EP2/main/compatibility topology gate entry",
       "product_compute": false,
       "accuracy_evidence": "not_run"
     },
     {
       "file": "decode_candidates.py",
-      "sha256": "664508d4db5509281b4eae6dcbac29370bd8c8dec5274c9db3867c3d9ce2e7b5",
+      "sha256": "56788c1c870966822d6bed112fd8b28c800e2a746bab683314aab4981045fb75",
       "role": "Search K=2 executable PyPTO candidate registry",
       "product_compute": true,
       "accuracy_evidence": "not_run"
     },
     {
       "file": "decode_acceptance.py",
-      "sha256": "4c21d7333a8e8e78e9e2fd93476ecc7dbd8e27e9f6dff6a719dcf2126f029b46",
+      "sha256": "20d3e27469085680eaec0810b933eb9f1c87c6de3d10f2c113999d40c8f20479",
       "role": "independent Decode contract and product dependency verifier",
+      "product_compute": false,
+      "accuracy_evidence": "not_run"
+    },
+    {
+      "file": "decode_shape_contract.py",
+      "sha256": "808a4640d9a593ad5f691887bbf699c022c6ed7d5884a25033ae351b845aa8b8",
+      "role": "TP1/TP2/TP4 and EP2 shape, cache and communication contract",
+      "product_compute": false,
+      "accuracy_evidence": "not_run"
+    },
+    {
+      "file": "decode_reference.py",
+      "sha256": "69f2357107ab8f41156b34a53364d24f4f2d05f9c43f452abb871e0b607b2f90",
+      "role": "independent vLLM-Ascend reference capture manifest; never imported by product",
       "product_compute": false,
       "accuracy_evidence": "not_run"
     }
   ],
+  "decode_session": {
+    "session_id": "deepseek-v4.1-flash-a3-decode",
+    "baseline_target": "addb655f7b4f4a4ce56af875724a04d79d3fe325",
+    "current_checkout": "recorded_at_runtime_by_decode_acceptance",
+    "formal_status": "not_run",
+    "search_k": 2,
+    "product_compute": "PyPTO only",
+    "reference_compute": "independent vLLM-Ascend process",
+    "source_checkout": "unavailable_in_current_workspace",
+    "cherry_pick_x_evidence": "verified_in_temporary_clean_clone",
+    "cherry_pick_x_generated_commits": [
+      "b76f321946c620cd4507e965ed54a9c0d93ec4d4",
+      "286300578cecd2b1589407e273bb6e9a515defe1",
+      "2f8671af7bc9d1c3d5a3468f5c2f22b073726c21",
+      "56ef874b66126e3710758a7f9f717305a6e278cd"
+    ],
+    "cherry_pick_x_result_tree": "116493ca2094d9237868be8abfabf9d8c51e1227",
+    "recovery": "The product checkout retains the original target commit ancestry; use the generated clean-clone receipt when a cherry-pick -x ancestry is required for promotion."
+  },
   "preserved_definition_count": 153
 }

@@ -25,7 +25,8 @@ currently partial or accepted.
 The directory exposes operators and bounded stage factories. Callers supply
 actual checkpoint operands, scheduler controls, caches, and output buffers.
 It does not contain a checkpoint downloader, a full-block replay driver, or
-the private orchestration used to obtain the historical acceptance results.
+the private orchestration used by any earlier work; those results are not part
+of this Decode session.
 
 | Files | Responsibility |
 | --- | --- |
@@ -120,16 +121,13 @@ requires its own precision validation.
 
 ## Acceptance and source provenance
 
-The historical frozen snapshots passed independent same-input complete-block
-checks for layers **0, 1, 2, 3, 14, 15, 19, 20, 21, 24 and 25**. Layer zero
-has six complete calls; each of the other selected layers has twelve.
-`/data/disk/sunhaolun/captrue_and_vllm/models/deepseek_v4_1_flash_a2/acceptance_manifest.json`
-records the original evidence digests and limits.
-The most recent L20 gate uses six cases and twelve calls with all 384 experts,
-top-six routing and 64 attention heads. Its floating policy is
-`atol=0.05, rtol=0.05`, with zero violations and nonfinite values; discrete
-controls, routes, readonly inputs, inactive rows and untouched regions are
-checked exactly. Historical acceptance belongs to those frozen snapshots.
+This directory is the independent A3 Decode session. No historical Prefill,
+CPU, simulator, or private capture result is carried into its status. The
+formal status for layers **0, 1, 2, 3, 14, 15, 19, 20, 21, 24 and 25** starts at
+`not_run` and can only change after a same-input NPU PyPTO versus vLLM-Ascend
+reference comparison at the requested topology. The floating policy is
+`atol=0.05, rtol=0.05`; routes, lengths, masks, source IDs, readonly inputs,
+inactive rows and untouched cache regions are exact checks.
 
 `source_manifest.json` maps each ported file to its original source digest.
 It also records unchanged definition AST digests, the native-call identities,
@@ -140,14 +138,13 @@ parent model retain their compute definitions in this flat directory.
 The port includes the L14 Engram observation interface, L1 native boundaries,
 and the final L20 index-publication candidate.
 
-The external capture and validation tree has host validation and
-factory-construction coverage; it has not been replayed on an NPU. The local
-tree now contains bounded PyPTO L0 single-step and fixed-step SWA Decode
-entries, but they make no claim of validated C1A/C2A chaining, stacked layers,
-whole-network dataset score, full-table Engram residency, multi-card execution,
-or serving support.
-The original L25 evidence's missing large-readonly and dispatch-input artifacts
-remain a limitation of that historical record.
+The local tree contains bounded PyPTO L0 single-step and fixed-step SWA Decode
+entries. They make no claim of validated C1A/C2A chaining, mHC/residual,
+Engram residency, shared/routed MoE, distributed dispatch/combine, CP/SP,
+stacked layers, whole-network score, multi-card execution, or serving support.
+The independent vLLM-Ascend capture is described by
+[`decode_reference.py`](../../../models/deepseek_v4_1_flash_a2/decode_reference.py)
+and is not imported by the product path.
 
 ## Independent Decode acceptance
 
@@ -158,6 +155,15 @@ contract, input boundary, topology and tolerance. The acceptance contract and
 product dependency scan are executable without importing a model kernel:
 The four-commit ancestry and tree IDs are recorded in
 [`decode_cherry_pick_receipt.json`](../../../models/deepseek_v4_1_flash_a2/decode_cherry_pick_receipt.json).
+The generated `git cherry-pick -x` proof is kept in a temporary clean clone;
+the product checkout still retains the requested source commit IDs unchanged.
+[`decode_shape_contract.py`](../../../models/deepseek_v4_1_flash_a2/decode_shape_contract.py)
+records the global dimensions, the TP1/TP2/TP4 matrix, EP2 expert ownership,
+the replicated single KV head, page layout, and dispatch/combine contract.
+`runtime_config.py` records the constructed-runtime fields for sequence
+parallel MoE, cache block size, request scheduling and communication groups;
+unresolved fields stay `not_run`. Capacity and per-rank peak memory are also
+left `not_run` until real checkpoint buffers are allocated.
 
 ```bash
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_acceptance --json
@@ -177,7 +183,10 @@ side separately; they do not establish product accuracy.
 `decode_gate.py` is intentionally fail-closed. It emits the required
 `task-submit --device auto --device-num 2/16` command and records missing
 checkpoint, cache, input, or reference assets; it never launches vLLM or
-claims a gate without a same-input capture.
+claims a gate without a same-input capture. `decode_reference.py` records the
+separate reference process's Python path, source digest, mapped libraries,
+visible devices and runtime library path; it never imports vLLM in the product
+process.
 
 The current bounded entries accept the full state ABI, but do not yet consume
 per-request position/source/finished controls in the device schedule and only
@@ -194,9 +203,9 @@ Compile the bounded Decode ABI without allocating a device:
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_fwd -p a2a3 --sim --compile-only
 ```
 
-Run the deterministic single-context state replay for each supported step
-count. The replay checks cache and length mutation against the CPU reference;
-it is not checkpoint numerical accuracy evidence:
+Compile the deterministic single-context state replay for each supported step
+count. These commands exercise the bounded PyPTO ABI only; they are not NPU
+checkpoint accuracy evidence:
 
 ```bash
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_replay --steps 1 -p a2a3 --sim
@@ -204,26 +213,12 @@ PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_replay --steps 2 
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_replay --steps 8 -p a2a3 --sim
 ```
 
-Run the source receipt, dependency-closure and prefill-control checks from the
-external A5-shaped validation tree:
-
-```bash
-PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
-python -m models.deepseek_v4_1_flash_a2.validate
-```
-
-With Torch and PyPTO installed, also import every module and construct the
-bounded SWA, Full2, Ratio1, Engram, and L19/L20/L21/L24/L25 decoder entries:
-
-```bash
-PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m models.deepseek_v4_1_flash_a2.validate --factories
-```
-
-These checks do not allocate NPU buffers. Actual operator validation should
+The external A5-shaped validation tree is not part of this Decode session and
+must not be used as an acceptance shortcut. Actual operator validation should
 use the existing [Golden Harness](../../run-and-validate/golden-harness.md)
-with the same compute implementation, checkpoint operands and comparison
-policy. Native boundary reports verify identity and interface integrity;
+only to compile the PyPTO entry, then compare NPU outputs and state against the
+independent reference manifest under the same checkpoint, layer, cache and
+topology. Native boundary reports verify identity and interface integrity;
 they do not replace numerical comparison against an independent reference.
 
 ## Decoder operators
@@ -238,21 +233,9 @@ bounded PyPTO validators are direct modules in this directory, with no nested
 `verifier` package. The original `layer14_15.py` and `layers19_25.py` imports
 remain available during migration.
 
-The decoder validator suite can be run without a device:
-
-```bash
-PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
-python -m pytest /data/disk/sunhaolun/captrue_and_vllm/models/deepseek_v4_1_flash_a2/test_operators.py -q
-PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
-python -m models.deepseek_v4_1_flash_a2.validate_layer14 --sim
-PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
-python -m models.deepseek_v4_1_flash_a2.validate_layer15 --sim
-# Supply the checkpoint through --checkpoint or DSV41_A2_CHECKPOINT.
-PYTHONPATH=/data/disk/sunhaolun/captrue_and_vllm:/data/disk/sunhaolun/pypto-lib \
-python -m models.deepseek_v4_1_flash_a2.validate_layers19_25 --checkpoint /path/to/checkpoint
-```
-
-The validators retain the A2/A3 ABI: BF16 hidden and cache rows, INT8 weights
-and index payloads, FP32 W8A8 scales, FP16 index-cache scales, and INT32 GEMM
+The old external validator suite is intentionally excluded from this session.
+The retained A2/A3 ABI is BF16 hidden and cache rows, INT8 weights and index
+payloads, FP32 W8A8 scales, FP16 index-cache scales, and INT32 GEMM
 accumulation. Prefill callers continue to use the existing `prefill.py`,
-`attention.py`, and cache modules unchanged.
+`attention.py`, and cache modules unchanged; no Prefill result changes Decode
+status.

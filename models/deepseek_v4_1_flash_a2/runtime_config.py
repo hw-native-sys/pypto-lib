@@ -37,6 +37,13 @@ class DecodeParallelConfig:
     pp: int = 1
     pcp: int = 1
     dcp: int = 1
+    enable_expert_parallel: bool = True
+    use_sequence_parallel_moe: bool | None = None
+    cache_block_size: int = 128
+    enable_fused_mc2: bool = True
+    enable_dsa_cp: bool = True
+    enable_flashcomm1: bool = True
+    enable_shared_expert_dp: bool = True
 
     def validate(self) -> "DecodeParallelConfig":
         values = {
@@ -53,7 +60,35 @@ class DecodeParallelConfig:
             raise ValueError("A2/A3 Decode currently requires PP=1, PCP=1, and DCP=1")
         if self.dp * self.tp != self.ep:
             raise ValueError(f"Decode requires EP=DP*TP, got DP={self.dp}, TP={self.tp}, EP={self.ep}")
+        if self.cache_block_size != 128:
+            raise ValueError("A2/A3 Decode requires block_size=128")
+        if not self.enable_expert_parallel:
+            raise ValueError("Decode acceptance requires enable_expert_parallel=true")
         return self
+
+    def runtime_contract(self) -> dict[str, object]:
+        """Return constructed-runtime fields without guessing unresolved values."""
+
+        return {
+            "dp": self.dp,
+            "tp": self.tp,
+            "ep": self.ep,
+            "pp": self.pp,
+            "pcp": self.pcp,
+            "dcp": self.dcp,
+            "enable_expert_parallel": self.enable_expert_parallel,
+            "use_sequence_parallel_moe": self.use_sequence_parallel_moe
+            if self.use_sequence_parallel_moe is not None
+            else "runtime_capture_required",
+            "cache_block_size": self.cache_block_size,
+            "enable_fused_mc2": self.enable_fused_mc2,
+            "enable_dsa_cp": self.enable_dsa_cp,
+            "enable_flashcomm1": self.enable_flashcomm1,
+            "enable_shared_expert_dp": self.enable_shared_expert_dp,
+            "communication_groups": "runtime_capture_required",
+            "request_scheduler": "runtime_capture_required",
+            "status": "not_run",
+        }
 
 
 DECODE_PARALLEL = DecodeParallelConfig(
@@ -65,5 +100,7 @@ DECODE_PARALLEL = DecodeParallelConfig(
     dcp=_parse_parallel_size("dcp", 1),
 ).validate()
 
+DECODE_RUNTIME_CONTRACT = DECODE_PARALLEL.runtime_contract()
 
-__all__ = ["DECODE_PARALLEL", "DecodeParallelConfig", "TP_SIZE"]
+
+__all__ = ["DECODE_PARALLEL", "DECODE_RUNTIME_CONTRACT", "DecodeParallelConfig", "TP_SIZE"]

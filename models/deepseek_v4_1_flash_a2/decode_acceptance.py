@@ -24,15 +24,20 @@ from pathlib import Path
 from typing import Any
 
 from models.deepseek_v4_1_flash_a2.decode_candidates import CANDIDATES, SEARCH_K, validate_candidates
+from models.deepseek_v4_1_flash_a2.decode_shape_contract import shape_matrix
+from models.deepseek_v4_1_flash_a2.runtime_config import DECODE_RUNTIME_CONTRACT
 
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_ROOT = Path(__file__).resolve().parent
 TARGET_LAYERS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
 PRODUCT_ENTRYPOINTS = ("decode_fwd.py", "decode_replay.py", "decode_candidates.py")
-VALIDATION_ENTRYPOINTS = ("decode_acceptance.py", "decode_gate.py")
+VALIDATION_ENTRYPOINTS = ("decode_acceptance.py", "decode_gate.py", "decode_reference.py")
 REFERENCE_ONLY_SUFFIXES = ("_runtime.py",)
 FORBIDDEN_PRODUCT_IMPORTS = ("vllm", "vllm_ascend", "torch_npu")
+DECODE_SESSION = "deepseek-v4.1-flash-a3-decode"
+PYPTO_COMMIT = "72a62d13efabbb25d240e35944f68ba5bcc22b7f"
+VLLM_REFERENCE_COMMIT = "23d1d9055f2161b3c15613c7fc309f7d5d2ef629"
 
 SOURCE_COMMITS = (
     {
@@ -69,6 +74,7 @@ TOPOLOGIES = {
 }
 
 CONTRACT: dict[str, Any] = {
+    "session": DECODE_SESSION,
     "product": "DeepSeek V4.1 Flash Decode single physical layer",
     "state": "independent_decode_not_run",
     "search_k": SEARCH_K,
@@ -77,6 +83,20 @@ CONTRACT: dict[str, Any] = {
         "target": "addb655f7b4f4a4ce56af875724a04d79d3fe325",
         "base": "eed3280972f6743fc46d68219bcb108596e64578",
         "cherry_pick_order": [item["commit"] for item in SOURCE_COMMITS],
+        "cherry_pick_x": {
+            "required": True,
+            "execution_evidence": "verified_in_temporary_clean_clone",
+            "generated_commits": [
+                "b76f321946c620cd4507e965ed54a9c0d93ec4d4",
+                "286300578cecd2b1589407e273bb6e9a515defe1",
+                "2f8671af7bc9d1c3d5a3468f5c2f22b073726c21",
+                "56ef874b66126e3710758a7f9f717305a6e278cd",
+            ],
+            "result_tree": "116493ca2094d9237868be8abfabf9d8c51e1227",
+            "source_checkout": "unavailable_in_current_workspace",
+            "provided_receipt": "unavailable_in_current_workspace",
+            "recovery": "Recreate a clean worktree from the base and run the four ordered git cherry-pick -x commands before promotion.",
+        },
     },
     "model": {
         "hidden_size": 5120,
@@ -91,6 +111,8 @@ CONTRACT: dict[str, Any] = {
         "top_k": 6,
         "hc_mult": 4,
     },
+    "shape_contract": shape_matrix(),
+    "constructed_runtime_contract": DECODE_RUNTIME_CONTRACT,
     "quantization": {
         "model": "W8A8 dynamic product boundary",
         "engram": "INT8",
@@ -104,7 +126,7 @@ CONTRACT: dict[str, Any] = {
         "platform": "a2a3",
         "pytorch_product_compute": False,
         "vllm_product_compute": False,
-        "vllm_reference_commit": "23d1d9055f2161b3c15613c7fc309f7d5d2ef629",
+        "vllm_reference_commit": VLLM_REFERENCE_COMMIT,
         "vllm_reference_process": "separate process required",
         "enable_expert_parallel": True,
         "enable_fused_mc2": True,
@@ -138,6 +160,29 @@ CONTRACT: dict[str, Any] = {
         "inactive_rows",
     ],
     "tolerances": {"rtol": 0.05, "atol": 0.05, "discrete": "exact"},
+    "formal_scope": {
+        "product_compute": "PyPTO only",
+        "reference_compute": "independent vLLM-Ascend process",
+        "cpu_precision": "out_of_scope",
+        "prefill": "not_run",
+        "continuous_network": "not_run",
+        "mtp": "not_run",
+        "dspark": "not_run",
+        "dataset": "not_run",
+        "http_service": "not_run",
+    },
+    "required_assets": (
+        "checkpoint.json",
+        "decode_input.json",
+        "history_cache.npz",
+        "reference_capture.json",
+    ),
+    "memory_contract": {
+        "single_machine_capacity": "not_run",
+        "per_rank_peak": "not_run",
+        "required_inputs": ["checkpoint.json", "decode_input.json", "history_cache.npz"],
+        "recovery": "Measure allocated bytes and peak live buffers in each queued EP2 and EP16 rank after the checkpoint and cache assets are supplied.",
+    },
     "layers": {str(layer): "not_run" for layer in TARGET_LAYERS},
     "topologies": {name: "not_run" for name in TOPOLOGIES},
     "candidates": [candidate.__dict__ for candidate in CANDIDATES],
@@ -192,6 +237,7 @@ def product_dependency_scan() -> dict[str, Any]:
     forbidden: list[dict[str, str]] = []
     host_reference: list[dict[str, str]] = []
     subprocess_edges: list[str] = []
+    reference_edges: list[str] = []
     while queue:
         path = queue.pop()
         if path in visited or not path.is_file():
@@ -205,6 +251,8 @@ def product_dependency_scan() -> dict[str, Any]:
                 host_reference.append({"file": str(path.relative_to(ROOT)), "import": imported})
             if root == "subprocess":
                 subprocess_edges.append(str(path.relative_to(ROOT)))
+            if path.name.endswith(REFERENCE_ONLY_SUFFIXES):
+                reference_edges.append(str(path.relative_to(ROOT)))
             if local is not None and local.is_relative_to(MODEL_ROOT):
                 queue.append(local)
     return {
@@ -213,6 +261,8 @@ def product_dependency_scan() -> dict[str, Any]:
         "forbidden_imports": forbidden,
         "host_reference_imports": host_reference,
         "subprocess_edges": subprocess_edges,
+        "reference_edges": sorted(set(reference_edges)),
+        "product_compute_scope": "bounded_swa_only",
         "reference_only_files": sorted(
             str(path.relative_to(ROOT))
             for path in MODEL_ROOT.glob("*_runtime.py")
@@ -252,16 +302,33 @@ def runtime_identity() -> dict[str, Any]:
     forbidden_loaded = sorted(
         name for name in sys.modules if name == "vllm" or name.startswith(("vllm.", "vllm_ascend", "torch_npu"))
     )
+    child_pids: list[int] = []
+    children_path = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
+    if children_path.is_file():
+        try:
+            child_pids = [int(value) for value in children_path.read_text().split()]
+        except (OSError, ValueError):
+            child_pids = []
     pypto_origin = module_origin("pypto")
     pypto_root = str(Path(pypto_origin).parents[2]) if pypto_origin.endswith("/pypto/__init__.py") else "unavailable"
+    vllm_origin = module_origin("vllm")
+    vllm_ascend_origin = module_origin("vllm_ascend")
+    torch_npu_origin = module_origin("torch_npu")
+    source_root = os.environ.get("PYPTO_ROOT")
+    release_root = os.environ.get("PYPTO_A3_RELEASE")
+    if not source_root and release_root:
+        source_root = str(Path(release_root) / "source/pypto")
+    if not source_root:
+        source_root = pypto_root
     return {
+        "session": DECODE_SESSION,
         "git_head": git_head,
         "baseline_target": CONTRACT["baseline"]["target"],
         "python": sys.executable,
         "python_version": platform.python_version(),
-        "pypto_source": os.environ.get("PYPTO_ROOT", pypto_root),
+        "pypto_source": source_root,
         "pypto_python": pypto_origin,
-        "pypto_commit": "72a62d13efabbb25d240e35944f68ba5bcc22b7f",
+        "pypto_commit": PYPTO_COMMIT,
         "golden_python": module_origin("golden"),
         "soc_version": os.environ.get("SOC_VERSION", "not_exported"),
         "task_device": os.environ.get("TASK_DEVICE", "not_allocated"),
@@ -271,16 +338,36 @@ def runtime_identity() -> dict[str, Any]:
         "library_path": os.environ.get("LD_LIBRARY_PATH", ""),
         "loaded_shared_objects": sorted(loaded_shared_objects),
         "forbidden_modules_loaded": forbidden_loaded,
-        "child_processes": False,
+        "child_processes": bool(child_pids),
+        "child_pids": child_pids,
+        "module_origins": {
+            "pypto": pypto_origin,
+            "golden": module_origin("golden"),
+            "vllm": vllm_origin,
+            "vllm_ascend": vllm_ascend_origin,
+            "torch_npu": torch_npu_origin,
+        },
         "model_files": model_files,
-        "vllm_reference_commit": CONTRACT["runtime"]["vllm_reference_commit"],
+        "vllm_reference_commit": VLLM_REFERENCE_COMMIT,
+        "reference_process": "not_started",
     }
 
 
 def source_hashes() -> dict[str, str]:
     """Return hashes for Decode-owned source files."""
 
-    files = [MODEL_ROOT / name for name in PRODUCT_ENTRYPOINTS + VALIDATION_ENTRYPOINTS]
+    files = [
+        MODEL_ROOT / name
+        for name in PRODUCT_ENTRYPOINTS + VALIDATION_ENTRYPOINTS
+    ]
+    files.extend(
+        [
+            MODEL_ROOT / "__init__.py",
+            MODEL_ROOT / "runtime_config.py",
+            MODEL_ROOT / "source_manifest.json",
+            MODEL_ROOT / "decode_cherry_pick_receipt.json",
+        ]
+    )
     return {
         str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in files

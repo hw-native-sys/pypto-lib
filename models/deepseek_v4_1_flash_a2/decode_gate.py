@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from models.deepseek_v4_1_flash_a2.decode_acceptance import (
+    CONTRACT,
     TOPOLOGIES,
     runtime_identity,
 )
@@ -53,22 +54,45 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
     }
     missing = [name for name, exists in present.items() if not exists]
     devices = topology_config["devices"]
+    ready = not missing
     command = (
         f"task-submit --device auto --device-num {devices} --run "
         f"'PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_fwd "
         f"-p a2a3 --ep {topology_config['ep']} --dp {topology_config['dp']} "
         f"--tp {topology_config['tp']}'"
     )
+    reference_command = (
+        "task-submit --device auto --device-num "
+        f"{devices} --run '<independent-vllm-ascend-reference> "
+        f"--commit {CONTRACT['runtime']['vllm_reference_commit']} "
+        f"--topology {topology}'"
+    )
     return {
         "topology": topology,
         "topology_config": topology_config,
         "status": "not_run",
+        "ready_for_submission": ready,
         "assets": assets,
         "asset_presence": present,
         "missing_assets": missing,
+        "required_state_inputs": list(CONTRACT["state_inputs"]),
+        "required_state_outputs": list(CONTRACT["state_outputs"]),
         "queue_command": command,
+        "reference_command": reference_command,
         "product_entrypoint": "models.deepseek_v4_1_flash_a2.decode_fwd",
-        "reference_process": "independent vLLM-Ascend capture required",
+        "reference_process": {
+            "status": "not_run",
+            "commit": CONTRACT["runtime"]["vllm_reference_commit"],
+            "separate_process": True,
+            "product_imported": False,
+        },
+        "comparison": {
+            "status": "not_run",
+            "same_inputs": False,
+            "same_layer": False,
+            "same_topology": False,
+            "same_state_boundary": False,
+        },
         "runtime_identity": runtime_identity(),
         "recovery": (
             "Provide checkpoint/config conversion, identical decode input and "

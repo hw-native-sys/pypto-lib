@@ -7,8 +7,11 @@ NPU PyPTO versus an independently launched vLLM-Ascend reference process.
 
 ## Baseline and provenance
 
-The checkout is detached at `addb655f7b4f4a4ce56af875724a04d79d3fe325`.
-The requested linear history is present and has not been squashed or amended:
+The product checkout is currently detached at the Decode session's appended
+commit (the exact hash is recorded by `decode_acceptance.py`). Its parent is
+the requested `addb655f7b4f4a4ce56af875724a04d79d3fe325` target. The four
+source commits remain unchanged and are not squashed, amended, reset, or
+replaced:
 
 | order | commit | author | author time |
 | --- | --- | --- | --- |
@@ -19,8 +22,10 @@ The requested linear history is present and has not been squashed or amended:
 
 `eed3280972f6743fc46d68219bcb108596e64578` is the common base. The supplied
 source checkout and `cherry-pick-receipt.json` were not available in this
-workspace, so the commit graph is the receipt evidence and the missing paths
-remain a recovery condition.
+workspace. A temporary clean clone executed the four ordered `git
+cherry-pick -x` commands and its generated hashes/tree are recorded in
+`decode_cherry_pick_receipt.json`; the product checkout retains the original
+source object IDs.
 
 The worktree already contained user changes when this session started:
 Decode entry points, documentation, `source_manifest.json`, runtime topology
@@ -63,6 +68,13 @@ The machine-readable contract is emitted by
   untouched cache rows and inactive rows as required outputs;
 - floating `rtol=0.05`, `atol=0.05`; discrete routes, lengths, masks, source
   IDs and state regions must match exactly.
+- TP1/TP2/TP4 and EP2 local shapes, KV-head replication, page layout and
+  dispatch/combine ownership are recorded in `decode_shape_contract.py`; the
+  runtime-resolved fields remain `not_run` until a capture proves them.
+- The constructed runtime contract records `use_sequence_parallel_moe`, cache
+  block size, request scheduler, communication groups and fused communication
+  switches. Single-machine capacity and per-rank peak memory remain `not_run`
+  until real checkpoint buffers are allocated.
 
 The fixed topologies are DP2/TP1/EP2 for the MoE gate, DP8/TP2/EP16 as the
 main 16-device gate, and DP16/TP1/EP16 plus DP4/TP4/EP16 as compatibility
@@ -80,6 +92,9 @@ same baseline, input boundary, page size, scale dtype, topology and tolerance:
 
 Candidate promotion is disabled until both routes run on the same NPU inputs
 and Main independently reproduces the selected route at the same topology.
+The independent reference process contract is emitted by
+`decode_reference.py`; it records vLLM-Ascend paths and mapped libraries
+without importing that stack in the PyPTO process.
 
 ## Current implementation and gates
 
@@ -112,10 +127,12 @@ The following checks were run in the pinned shared environment on 2026-11-04:
 
 | check | result | evidence |
 | --- | --- | --- |
+| fixed A3 environment activation | `pass` | PyPTO `72a62d13efabbb25d240e35944f68ba5bcc22b7f`, Python 3.10.22, `SOC_VERSION=ascend910_9382`, workspace state directory |
 | product import/dependency scan | `pass` | `python -m models.deepseek_v4_1_flash_a2.decode_acceptance --static-scan` |
 | PyPTO single-step compile | `pass` | `decode_fwd -p a2a3 --sim --compile-only` |
 | PyPTO replay compile | `pass` | `decode_replay --steps 1/2/8 -p a2a3 --sim --compile-only` |
-| simulator state replay | `blocked` | runtime assemble could not create the shared environment PTO-ISA lock (`Errno 30`, read-only path); no numerical status inferred |
+| simulator numerical replay | `not_run` | CPU/simulator precision is outside this session; no NPU result inferred |
+| independent reference manifest | `not_run` | vLLM-Ascend path, checkpoint, cache and capture are not configured |
 | EP2 MoE gate | `not_run` | `decode_gate.py --topology ep2_gate`; checkpoint/cache/reference assets missing |
 | DP8/TP2/EP16 gate | `not_run` | `decode_gate.py --topology main`; checkpoint/cache/reference assets missing |
 
