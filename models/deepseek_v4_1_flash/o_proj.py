@@ -103,7 +103,7 @@ def _o_proj_b(
     weight: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     activation_scale: pl.Tensor[[1, 80 * (LOCAL_O_WIDTH // 32)], pl.FP8E8M0],
     weight_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    output: pl.Out[pl.Tensor],
     rows: pl.Scalar[pl.INDEX], reduction: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Project an 80-row group; scales contain MX_A_ZZ and MX_B_NN bytes."""
@@ -118,7 +118,7 @@ def _o_proj_quantized(
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    output_group: pl.Tensor[[T_DYN, D], pl.BF16],
+    output_group: pl.Tensor,
     active_rows: pl.Scalar[pl.INT32],
 ):
     """Project one padded 80-row group from packed MXFP8 activations."""
@@ -134,22 +134,23 @@ def _o_proj_quantized(
     # O-B projection.
     capacity = pl.tensor.dim(output_group, 0)
     with pl.spmd(D // O_B_N_TILE, name_hint="proj_o_b"):
-        output_group = _o_proj_b(
+        output_group_result = _o_proj_b(
             payload, wo_b, activation_scale_backing, wo_b_scale, output_group, capacity, LOCAL_O_WIDTH,
         )
-    return output_group
+    return output_group_result
+
 
 
 @pl.jit.inline(auto_scope=False)
 def o_proj(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    attended: pl.Tensor,
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
     wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Project row groups to BF16; both weights hold NZ bytes in logical [K, N] shapes."""
