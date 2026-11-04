@@ -155,9 +155,13 @@ separate auxiliary program.
 
 Prefill uses `--capacity` query rows; decode uses sixteen stable request slots.
 MoE owner buffers retain `ceil(capacity / (TP * 16)) * 16` rows. Query, owner,
-request and head buffers have distinct tensor contracts. The pinned compiler
-requires explicit physical extents in composed KDA and sparse-attention loops;
-active-token counts remain runtime values.
+request and head buffers have distinct tensor contracts. Composed KDA and
+sparse-attention operators derive query, request and state-pool extents from
+their input tensor dimensions; active-token counts remain runtime values.
+This requires PyPTO commit
+[`ff2e0a4`](https://github.com/hw-native-sys/pypto/commit/ff2e0a4ec3015c7bead91ca123ead3282f09f81e)
+or a later revision containing the dependent-shape parameter cloning fix from
+[PyPTO #3271](https://github.com/hw-native-sys/pypto/pull/3271).
 
 `forward_parameter_names()` defines argument order, `forward_tensor_layouts()`
 provides per-rank shapes and dtypes, and `forward_geometry()` records ABI version

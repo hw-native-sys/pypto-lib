@@ -659,19 +659,10 @@ def prefill_kda(
     head_onehot: pl.Tensor[[LOCAL_KDA_H, BETA_PAD], pl.FP32],
     eye_wide: pl.Tensor[[CHUNK_TILE, KDA_DIM], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
-    query_extent: pl.constexpr = 0,
-    request_extent: pl.constexpr = 0,
-    state_extent: pl.constexpr = 0,
 ):
-    """Apply chunked KDA with compiled query, request and state-pool bounds."""
-    if query_extent > 0:
-        t_dim = query_extent
-    else:
-        t_dim = pl.tensor.dim(query, 0)
-    if request_extent > 0:
-        requests = request_extent
-    else:
-        requests = pl.tensor.dim(query_start_loc, 0) - 1
+    """Apply chunked KDA with query, request and state-pool tensor dimensions."""
+    t_dim = pl.tensor.dim(query, 0)
+    requests = pl.tensor.dim(query_start_loc, 0) - 1
     # Flattened head-major, not token-major: with one row per (token, head) the tokens
     # of one head would sit LOCAL_KDA_H rows apart and a chunk slice would straddle
     # heads. Keeping the row axis as tokens makes a head a contiguous column range.
@@ -995,10 +986,7 @@ def prefill_kda(
     # returns uninitialised memory -- which is exactly the NaN a multi-chunk sequence
     # produced while a single-chunk one passed.
     state_gm = pl.create_tensor([LOCAL_KDA_H * requests * lanes * 2 * PREFILL_V_TILE, KDA_DIM], dtype=pl.FP32)
-    if state_extent > 0:
-        state_pool_rows = state_extent
-    else:
-        state_pool_rows = pl.tensor.dim(recurrent_state, 0)
+    state_pool_rows = pl.tensor.dim(recurrent_state, 0)
     state_2d = pl.reshape(recurrent_state, [state_pool_rows * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
     out_rows = pl.reshape(output, [t_dim, head_width])
     with pl.spmd(LOCAL_KDA_H * requests * lanes, name_hint="prefill_kda_scan", deps=[wu_tid]):
@@ -1093,7 +1081,6 @@ def prefill_kda_test(
     (output, recurrent_state) = prefill_kda(
         query, key, value, decay, beta, recurrent_state, query_start_loc, state_rows, tri_incl, tri_strict,
         head_onehot, eye_wide, output,
-        0, 0, PREFILL_POOL_ROWS,
     )
     return output, recurrent_state
 
