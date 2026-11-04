@@ -1,16 +1,14 @@
 # DeepSeek V4-Flash low-latency decode
 
-This directory contains batch-one attention and MoE components for eight
-logical ranks. They build on the configuration and primitives in the same
-directory; the composed forward is supplied separately. The default
-verification width is eight tokens. This is experimental code, not a
-`pypto-serving` deployment contract.
+This model directory provides the batch-one decode path with eight logical
+ranks. The default verification width is eight tokens. It is an experimental
+decode implementation, not a `pypto-serving` deployment contract.
 
 ## Precision contract
 
-The HC stream and residuals use FP32. Local attention and expert tensors
-also use BF16; integer projections accumulate INT8 operands as INT32 before
-applying the original FP32 row and channel scales.
+The native HC stream uses FP32 at `hc_pre` input and `hc_post` residual/output,
+including the public `pre_hc_hidden_out` output. Dense, attention and expert
+local tensors also use BF16; this is a mixed-precision contract.
 
 The independent Torch references preserve BF16 Cube K16 and FP32 Cube K4
 accumulation, ascending split-K reductions and per-group projection scales. Float64
@@ -18,11 +16,17 @@ intermediates model each product group's FP32 rounding; model operands
 and outputs keep their declared dtypes. This does not establish universal
 bitwise equivalence or replace the existing numerical comparisons.
 
-Gate quantization compensates the FP32 `127 / amax` quotient before the
-original INT8 rounding, with power-of-two range normalization for large
-finite denominators. Deferred RMS and dequantization order are unchanged.
 Standalone Q validation checks its produced head group; the other pure-Out
 heads have no initialized-value guarantee.
+
+The FP32 gate uses deferred RMS: `xg = x_mixed.float() * norm_w.float()`.
+It applies `inv_rms` after projection and includes it in the dequantization
+scale for INT8 `quant(xg)`, without BF16-rounding a normalized routing vector.
+Gate activation quantization refines the FP32 quotient with a product-error
+residual before round-to-nearest-even conversion. A power-of-two scaling keeps
+the compensation intermediates bounded for large finite denominators; it does
+not change the INT8 weights, FP32 dequantization scales or deferred RMS policy.
+This does not assert all-domain IEEE or nonfinite-input equivalence.
 
 Gate, QKV and SWA share scope-local FP32 compensation primitives in
 `fp32_numerics.py`; these helpers create no tasks or global-memory buffers.
@@ -51,6 +55,22 @@ not establish all-domain correctly rounded arithmetic or a performance gain.
 Q/KV kernels use
 the existing square-root correction and compensated reciprocal at their
 separately rounded FP32 inverse boundaries.
+
+Public stored LM-head logits are FP32. Community vLLM can select
+`hf_overrides={"head_dtype": "float32"}`; this alone does not align the forward.
+
+The observed vLLM-Ascend 0.30 reference uses BF16 HC streams across 43 layers;
+its FP32 router input widens already-rounded low-precision values. Its EP8
+expert quantization groups also differ from native TP8 with intermediate
+shards of 256. These are reference-policy boundaries; they establish neither
+a native implementation defect nor the cause of observed token differences.
+
+A complete golden must align weights/scales, input state, HC, quantization,
+routing, reduction and logit precision. Matching dtype labels or W8A8
+checkpoint names, source/component CI and local type checks do not establish
+complete-model numerical correctness. The existing comparison gates apply.
+The current FP32 policy is retained. A community-precision compatibility mode
+is not implemented and requires an explicit precision-policy decision.
 
 ## Reproducible reduction order
 
@@ -146,6 +166,79 @@ The composed `decode_swa.py` and `decode_hca.py` entries require eight logical
 TP ranks and declare `# ci: devices=8`, as does CSA. Their standalone
 `decode_sparse_attn_swa.py` and `decode_sparse_attn_hca.py` entries use one
 device and retain their original numerical references.
+
+`decode_fwd.py` validates all 43 layers against an independent Torch
+composition by default. It includes embedding, request-derived metadata,
+2 SWA / 21 CSA / 20 HCA attention layers, 43 TP MoE layers, HC head,
+final RMSNorm, vocabulary-sharded logits and sampling. All eight mutable
+cache/state pools and the four public outputs are compared by the existing
+harness. Source compilation and component CI do not qualify this full path.
+
+The Torch composition reuses the child operator references. Expert gate/up/down
+products accumulate INT8 operands as INT32 before applying original FP32
+scales. Activation quantization uses explicit FP32 division for `127 / amax`;
+the gate retains deferred RMS and its separate dequantization-scale order.
+BF16 Cube consumers use K16 FP32 accumulation and their kernel's split-K
+order in the CPU reference: Q/KV projections, sparse QK/PV, grouped output
+projection A, compressor projections, indexer Hadamard and routing-weight
+projections, and vocabulary logits. Batched rows and independent groups use
+the same host helper; indexer routing weights retain four split-K partials.
+Float64 evaluates each BF16 product group and each reference unary or division
+before rounding its result to FP32. Model operands, outputs, INT8-to-INT32 dots
+and scales retain their declared dtypes. HC-pre uses explicit balanced FP32
+reductions for its square sums and four-way Sinkhorn sums; its Torch reference
+spells out the stored exp/add/div boundaries instead of using a fused softmax.
+The native HC-pre maps compensate their reciprocal, reciprocal-square-root and
+division seeds. Exponential correction is bounded to `[-80, 80]`; the original
+exponential is retained outside that interval. These bounded corrections do not
+establish a general IEEE rounding guarantee for every input.
+TP projection contributions include channel scales before ordered rank
+reduction. Standalone grouped projections retain their own arithmetic.
+These choices do not establish bitwise equivalence with device instructions;
+the existing numerical comparisons remain required.
+
+- Default execution and `--full` run the same complete-forward comparison.
+  The generated bounded fixture starts at position 121 and uses one shared
+  MoE bank unless `--moe-banks` is supplied. This is synthetic correctness
+  coverage, not qualification of a real checkpoint or community equivalence.
+- A real checkpoint comparison requires the actual weights and original FP32
+  scales for all 43 layers (`--moe-banks 43`), matching inputs/state and the
+  precision contract above. Shared random banks cannot stand in for them.
+- `--input-data` replays complete `in/` and `out/` tensors, which take precedence
+  over the locally computed Torch reference. Partial numerical snapshots fail.
+- `--smoke` explicitly executes all 43 layers without numerical comparison.
+  It permits generated inputs or input-only replay and reports no correctness
+  verdict. It cannot be combined with saved expected outputs.
+- `--compile-only` performs code generation and ABI checks without computing
+  a Torch golden or executing the model.
+
+The full TP reference checks that shared attention operands, metadata and
+initial caches are replicated; mismatches are rejected explicitly. All three
+attention kinds consume the actual projection shards; unused full-projection
+arguments do not affect the reference. Every owner's MoE valid-row count is
+consumed; counts may differ across owners and must lie in `[0, T]`. The standalone MoE reference
+also computes each rank's HC/routing operands separately.
+
+A full-model Torch comparison establishes agreement with the implemented
+native precision contract for its supplied fixture. An independent community
+snapshot additionally requires alignment of the community numerical policy;
+matching INT8 checkpoint names or tensor dtype labels is insufficient.
+Existing operator/layer validators retain their own scope. No complete-model
+numerical PASS is implied by providing this reference or by host-only checks.
+
+Use `--seed` for reproducible generated inputs and `--save-data` to save both
+inputs and expected outputs. For example:
+
+```bash
+# Complete 43-layer numerical fixture; 16384 is a supported Indexer context.
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384
+# Generate the complete program without computing a Torch reference.
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --compile-only
+# Explicit execution-only smoke, without a correctness verdict.
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --smoke
+# Replay a complete snapshot with matching checkpoint and execution layout.
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --moe-banks 43 --input-data <reference>/data
+```
 
 ## Validation
 

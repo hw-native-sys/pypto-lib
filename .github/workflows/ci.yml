@@ -212,7 +212,7 @@ jobs:
         platform: ${{ fromJSON(needs.detect-changes.outputs.device_matrix) }}
     runs-on: ${{ fromJSON(matrix.platform == 'a5' && '["self-hosted", "linux", "npu-a5"]' || '["self-hosted", "linux", "npu", "a3"]') }}
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
-    # --max-time 600 run), or the job dies before task-submit's own timeout can
+    # --max-time up to 1800 run), or the job dies before task-submit's own timeout can
     # ever fire — and the first queued case would eat the whole job budget.
     timeout-minutes: 120
     defaults:
@@ -269,7 +269,11 @@ jobs:
             if [ "$ndev" -gt 1 ]; then
               device_flags+=(--device-num "$ndev" --ignore-whitelist)
             fi
-            if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 600 \
+            max_time=600
+            if [ "$f" = "models/deepseek_v4_flash_lowlat/decode_fwd.py" ]; then
+              max_time=1800
+            fi
+            if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time "$max_time" \
               --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE"; then
               status=pass
             else
