@@ -109,3 +109,10 @@ entries, must follow the project [coding style](../skills/fmt-coding-style/SKILL
   and timing sweeps must not replace default correctness coverage. Case
   selection and validation defaults belong to the executable entry, not model
   configuration.
+
+## Simulator CI eligibility
+
+Support Tile instructions and CCE operations already handled by the simulator
+(e.g. `pipe_barrier`, `set_flag`, and `wait_flag`). For other CCE features that
+require substantial simulator changes, skip simulator CI by adding only a
+standalone `# ci: no-sim` near the top of each affected executable Python entry.

@@ -16,7 +16,7 @@ using ScaleB = BS<1280, 256>;
 using FullA = Tile<TileType::Mat, F, 80, 1280, BLayout::ColMajor, 80, 1280, SLayout::RowMajor, 512>;
 
 #if defined(__CPU_SIM)
-using QBRopePipe = TPipe<0, Direction::DIR_C2V, 20480, 2, 2>;
+using QBRopePipe = TPipe<1, Direction::DIR_C2V, 20480, 2, 2>;
 #endif
 using QBRopeAcc = TileAcc<float, 80, 64>;
 using QBRopeRaw = Tile<TileType::Vec, float, 80, 64>;
@@ -38,7 +38,7 @@ struct QBRopeTransfer<true> {
 #endif
     __aicore__ inline void push(QBRopeAcc& tail) {
 #if defined(__CPU_SIM)
-        TPUSH<QBRopePipe, QBRopeAcc, TileSplitAxis::NONE>(pipe, tail);
+        TPUSH<QBRopePipe, QBRopeAcc, TileSplitAxis::TILE_NO_SPLIT>(pipe, tail);
 #else
         int slot = transferred % 2;
         // The vector lane owns both slots before the first transfer.
@@ -309,7 +309,7 @@ __aicore__ inline void project_qb_rope(__gm__ int64_t* args) {
         int slot = received % 2;
         QBRopeRaw raw;
 #if defined(__CPU_SIM)
-        TPOP<QBRopePipe, QBRopeRaw, TileSplitAxis::NONE>(pipe, raw);
+        TPOP<QBRopePipe, QBRopeRaw, TileSplitAxis::TILE_NO_SPLIT>(pipe, raw);
 #else
         TASSIGN(raw, slot * 20480);
         wait_intra_block(PIPE_V, slot * 2);
@@ -317,7 +317,7 @@ __aicore__ inline void project_qb_rope(__gm__ int64_t* args) {
         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
         qb_rotate_tail(result.data(), raw.data(), cosine.data(), sine.data(), rows);
 #if defined(__CPU_SIM)
-        TFREE<QBRopePipe, TileSplitAxis::NONE>(pipe);
+        TFREE<QBRopePipe, TileSplitAxis::TILE_NO_SPLIT>(pipe);
 #else
         set_intra_block(PIPE_V, slot * 2 + 1);
 #endif

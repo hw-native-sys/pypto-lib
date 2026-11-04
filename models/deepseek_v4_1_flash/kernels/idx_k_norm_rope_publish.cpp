@@ -49,11 +49,18 @@ __tf__ __aicore__ inline void postprocess(
 #if defined(__CPU_SIM)
     for (int head = 0; head < rows; ++head) {
         float values[128];
-        float square = 0;
-        for (int lane = 0; lane < 128; ++lane) {
-            float value = static_cast<float>(src[head * 128 + lane]);
-            square += value * value;
+        float partial[2][64];
+        for (int half = 0; half < 2; ++half) {
+            for (int lane = 0; lane < 64; ++lane) {
+                float value = static_cast<float>(src[head * 128 + half * 64 + lane]);
+                partial[half][lane] = value * value;
+            }
+            for (int width = 64; width > 1; width /= 2) {
+                for (int lane = 0; lane < width / 2; ++lane)
+                    partial[half][lane] = partial[half][lane * 2] + partial[half][lane * 2 + 1];
+            }
         }
+        float square = partial[0][0] + partial[1][0];
         float inv = 1.0f / std::sqrt(square / 128.0f + 1.0e-6f);
         for (int lane = 0; lane < 128; ++lane)
             values[lane] = static_cast<float>(static_cast<bfloat16_t>(
