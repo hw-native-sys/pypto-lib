@@ -68,7 +68,6 @@ from prefill_indexer import (
 from prefill_indexer_compressor import (
     golden_prefill_indexer_compressor,
     _prefill_indexer_compressor_prepare,
-    _prefill_indexer_state_update_rows,
     _prefill_indexer_cache_write,
 )
 from prefill_sparse_attn import (
@@ -99,6 +98,7 @@ from prefill_compressor_ratio4 import (
     _compressor_write_map,
     MAX_CMP_WRITES,
     _compressor_prepare_state,
+    _compressor_store_state_rows,
     _compressor_norm_rope_cache_write,
     golden_prefill_compressor_ratio4,
 )
@@ -1159,9 +1159,9 @@ def _cp_csa_compress_pack_part(
                     deps=[part_meta_seed_tid, inner_pool_completion[0]],
                 ):
                     update_block = pl.tile.get_block_idx()
-                    _prefill_indexer_state_update_rows(
+                    _compressor_store_state_rows(
                         idx_kv_proj, idx_score_proj, inner_ape,
-                        pos_leaf, active, inner_state_map_leaf, inner_state, inner_state_rows, update_block, 0,
+                        pos_leaf, active, inner_state_map_leaf, inner_state, update_block * 8, 8, 0, 64, inner_state_rows, 2 * IDX_HEAD_DIM,
                     )
                     _cp_csa_carry_indexer_state(
                         inner_state, inner_state_next, inner_state_rows, inner_state_block_table,
@@ -1176,10 +1176,10 @@ def _cp_csa_compress_pack_part(
                     update_workers, name_hint="prefill_idx_c4_state_update_forward", deps=[part_meta_seed_tid],
                 ):
                     update_block = first_update_tile + pl.tile.get_block_idx()
-                    _prefill_indexer_state_update_rows(
+                    _compressor_store_state_rows(
                         idx_kv_proj, idx_score_proj, inner_ape,
-                        pos_leaf, active, inner_state_map_leaf, inner_state_next, inner_state_rows, update_block,
-                        pl.max(pl.cast(active, pl.INDEX) - STATE_LEN, 0),
+                        pos_leaf, active, inner_state_map_leaf, inner_state_next, update_block * 8, 8,
+                        pl.max(pl.cast(active, pl.INDEX) - STATE_LEN, 0), 64, inner_state_rows, 2 * IDX_HEAD_DIM,
                     )
             if leaf > 0:
                 # Private quantization caches preserve each leaf's last writer.

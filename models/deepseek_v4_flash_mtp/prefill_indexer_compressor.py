@@ -9,7 +9,7 @@
 """DeepSeek-V4 prefill indexer compressor for ratio-4 overlapping KV cache."""
 
 import pypto.language as pl
-from prefill_compressor_ratio4 import _compressor_write_map
+from prefill_compressor_ratio4 import _compressor_write_map, _compressor_pool_reduce, _compressor_store_state_rows
 
 from config import (
     FLASH as M,
@@ -60,82 +60,6 @@ OUT_TILE = 64                # projection OUT_DIM (N) tile
 HEAD_D_TILE = 128            # head-dim tile for the softmax pool
 HEAD_TILE = 64
 PACKED_RMS_TILE = 16
-
-
-@pl.jit.inline(auto_scope=False)
-def _prefill_indexer_state_update_rows(
-    kv_proj_scratch: pl.Tensor[[T, OUT_DIM], pl.FP32],
-    score_proj_scratch: pl.Tensor[[T, OUT_DIM], pl.FP32],
-    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
-    compress_state: pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
-    state_rows: pl.Scalar[pl.INDEX],
-    update_t_blk: pl.Scalar[pl.INDEX],
-    first_row: pl.Scalar[pl.INDEX],
-):
-    """Write eight projected state rows to the selected destination bank."""
-    compress_state_flat = pl.tensor.view(compress_state, shape=[state_rows, COMPRESS_STATE_DIM])
-    state_zero = pl.tile.full([1, OUT_TILE], dtype=pl.FP32, value=0.0)
-    for update_t_i in pl.range(8):
-        update_t = update_t_blk * 8 + update_t_i
-        if update_t >= first_row and update_t < num_tokens:
-            state_row_raw = pl.read(inner_state_slot_mapping, [update_t])
-            if state_row_raw >= 0:
-                state_row = pl.cast(state_row_raw, pl.INDEX)
-                update_pos = pl.read(position_ids, [update_t])
-                ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                for update_ob in pl.range(OUT_DIM // OUT_TILE):
-                    update_o0 = update_ob * OUT_TILE
-                    ape_row = pl.load(ape, [ape_slot, update_o0], [1, OUT_TILE])
-                    kv_row = pl.load(kv_proj_scratch, [update_t, update_o0], [1, OUT_TILE])
-                    state_kv = pl.add(kv_row, state_zero)
-                    pl.store(state_kv, [state_row, update_o0], compress_state_flat)
-                    score_row = pl.load(score_proj_scratch, [update_t, update_o0], [1, OUT_TILE])
-                    state_score = pl.add(score_row, ape_row)
-                    state_score = pl.add(state_score, state_zero)
-                    score_offset = OUT_DIM + update_o0
-                    pl.store(state_score, [state_row, score_offset], compress_state_flat)
-    return compress_state
-
-
-@pl.jit.inline(auto_scope=False)
-def _prefill_indexer_pool_reduce(
-    pool_kv_tile: pl.Tensor[[STATE_LEN, HEAD_D_TILE], pl.FP32],
-    pool_score_tile: pl.Tensor[[STATE_LEN, HEAD_D_TILE], pl.FP32],
-    write_pos: pl.Scalar[pl.INT32],
-    write_i: pl.Scalar[pl.INDEX],
-    h0: pl.Scalar[pl.INDEX],
-    pooled_kv: pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.FP32],
-):
-    """Fold one indexer window in its original slot order."""
-    init_slot = STATE_LEN - 1
-    mi_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
-    li_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
-    oi_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
-    mi_buf[0:1, 0:HEAD_D_TILE] = pool_score_tile[init_slot : init_slot + 1, 0:HEAD_D_TILE]
-    li_buf[0:1, 0:HEAD_D_TILE] = pl.exp(pl.sub(mi_buf[0:1, 0:HEAD_D_TILE], mi_buf[0:1, 0:HEAD_D_TILE]))
-    oi_buf[0:1, 0:HEAD_D_TILE] = pool_kv_tile[init_slot : init_slot + 1, 0:HEAD_D_TILE]
-    for pool_slot_i in pl.range(STATE_LEN - 1):
-        if pool_slot_i >= COMPRESS_RATIO or write_pos >= 2 * COMPRESS_RATIO - 1:
-            mi = mi_buf[0:1, 0:HEAD_D_TILE]
-            li = li_buf[0:1, 0:HEAD_D_TILE]
-            oi = oi_buf[0:1, 0:HEAD_D_TILE]
-            slot_score = pool_score_tile[pool_slot_i : pool_slot_i + 1, 0:HEAD_D_TILE]
-            slot_kv = pool_kv_tile[pool_slot_i : pool_slot_i + 1, 0:HEAD_D_TILE]
-            mi_next = pl.maximum(mi, slot_score)
-            alpha = pl.exp(pl.sub(mi, mi_next))
-            beta = pl.exp(pl.sub(slot_score, mi_next))
-            li_next = pl.add(pl.mul(alpha, li), beta)
-            oi_next = pl.add(pl.mul(oi, alpha), pl.mul(slot_kv, beta))
-            mi_buf[0:1, 0:HEAD_D_TILE] = mi_next
-            li_buf[0:1, 0:HEAD_D_TILE] = li_next
-            oi_buf[0:1, 0:HEAD_D_TILE] = oi_next
-    pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.div(
-        oi_buf[0:1, 0:HEAD_D_TILE],
-        li_buf[0:1, 0:HEAD_D_TILE],
-    )
 
 
 @pl.jit.inline
@@ -255,9 +179,9 @@ def _prefill_indexer_compressor_prepare(
                                 current_complete = pl.cast(0, pl.INT32)
                     pl.write(current_pool_flags, [write_i, 0], current_complete)
                     if current_complete != 0:
-                        _prefill_indexer_pool_reduce(
+                        _compressor_pool_reduce(
                             pool_kv_tile, pool_score_tile, write_pos, write_i, h0,
-                            pooled_kv,
+                            pooled_kv, HEAD_D_TILE,
                         )
                     else:
                         pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=0.0)
@@ -374,9 +298,9 @@ def _prefill_indexer_compressor_prepare(
                                                 ]
                                                 pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_D_TILE] = pool_score
 
-                            _prefill_indexer_pool_reduce(
+                            _compressor_pool_reduce(
                                 pool_kv_tile, pool_score_tile, write_pos, write_i, h0,
-                                pooled_kv,
+                                pooled_kv, HEAD_D_TILE,
                             )
                         else:
                             pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=0.0)
@@ -543,13 +467,12 @@ def _prefill_indexer_compressor_with_completion(
     state_update_rows = pl.max(pl.cast(num_tokens, pl.INDEX), 0)
     state_update_tiles = (state_update_rows + 7) // 8
     state_update_workers = pl.max(1, pl.min((T + 7) // 8, state_update_tiles))
-    state_block_num = pl.tensor.dim(compress_state, 0)
-    state_update_extent = state_block_num * INNER_STATE_BLOCK_SIZE
+    state_update_extent = pl.tensor.dim(compress_state, 0) * INNER_STATE_BLOCK_SIZE
     with pl.spmd(state_update_workers, name_hint="prefill_idx_c4_state_update", deps=[history_pool_completion[0]]) as state_update_tid:
         update_t_blk = pl.tile.get_block_idx()
-        _prefill_indexer_state_update_rows(
+        _compressor_store_state_rows(
             kv_proj_scratch, score_proj_scratch, ape,
-            position_ids, num_tokens, inner_state_slot_mapping, compress_state, state_update_extent, update_t_blk, 0,
+            position_ids, num_tokens, inner_state_slot_mapping, compress_state, update_t_blk * 8, 8, 0, OUT_TILE, state_update_extent, OUT_DIM,
         )
     state_written = compress_state
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
@@ -802,10 +725,9 @@ def build_tensor_specs(start_pos: int = START_POS):
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
-        table = init_inner_compress_state_block_table()
         block = abs_pos // INNER_STATE_BLOCK_SIZE
         intra = abs_pos % INNER_STATE_BLOCK_SIZE
-        return int(table[block].item()) * INNER_STATE_BLOCK_SIZE + intra
+        return ((block * 17 + 3) % CSA_INNER_STATE_PHYSICAL_BLOCKS) * INNER_STATE_BLOCK_SIZE + intra
     def init_x():
         return ((torch.rand(T, D) - 0.5) * 0.1).to(torch.bfloat16)
     def init_compress_state():

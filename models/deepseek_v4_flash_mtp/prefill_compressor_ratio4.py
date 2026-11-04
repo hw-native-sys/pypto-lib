@@ -187,33 +187,34 @@ def _compressor_pool_reduce(
     write_i: pl.Scalar[pl.INDEX],
     h0: pl.Scalar[pl.INDEX],
     pooled_kv: pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.FP32],
+    pool_tile: pl.constexpr,
 ):
-    """Fold one main compressor window in its original slot order."""
+    """Fold one compressor window in its original slot order."""
     init_slot = STATE_LEN - 1
-    mi_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
-    li_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
-    oi_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
-    mi_buf[0:1, 0:HEAD_D_TILE] = pool_score_tile[init_slot : init_slot + 1, 0:HEAD_D_TILE]
-    li_buf[0:1, 0:HEAD_D_TILE] = pl.exp(pl.sub(mi_buf[0:1, 0:HEAD_D_TILE], mi_buf[0:1, 0:HEAD_D_TILE]))
-    oi_buf[0:1, 0:HEAD_D_TILE] = pool_kv_tile[init_slot : init_slot + 1, 0:HEAD_D_TILE]
+    mi_buf = pl.create_tensor([1, pool_tile], dtype=pl.FP32)
+    li_buf = pl.create_tensor([1, pool_tile], dtype=pl.FP32)
+    oi_buf = pl.create_tensor([1, pool_tile], dtype=pl.FP32)
+    mi_buf[0:1, 0:pool_tile] = pool_score_tile[init_slot : init_slot + 1, 0:pool_tile]
+    li_buf[0:1, 0:pool_tile] = pl.exp(pl.sub(mi_buf[0:1, 0:pool_tile], mi_buf[0:1, 0:pool_tile]))
+    oi_buf[0:1, 0:pool_tile] = pool_kv_tile[init_slot : init_slot + 1, 0:pool_tile]
     for pool_slot_i in pl.range(STATE_LEN - 1):
         if pool_slot_i >= COMPRESS_RATIO or write_pos >= 2 * COMPRESS_RATIO - 1:
-            mi = mi_buf[0:1, 0:HEAD_D_TILE]
-            li = li_buf[0:1, 0:HEAD_D_TILE]
-            oi = oi_buf[0:1, 0:HEAD_D_TILE]
-            slot_score = pool_score_tile[pool_slot_i : pool_slot_i + 1, 0:HEAD_D_TILE]
-            slot_kv = pool_kv_tile[pool_slot_i : pool_slot_i + 1, 0:HEAD_D_TILE]
+            mi = mi_buf[0:1, 0:pool_tile]
+            li = li_buf[0:1, 0:pool_tile]
+            oi = oi_buf[0:1, 0:pool_tile]
+            slot_score = pool_score_tile[pool_slot_i : pool_slot_i + 1, 0:pool_tile]
+            slot_kv = pool_kv_tile[pool_slot_i : pool_slot_i + 1, 0:pool_tile]
             mi_next = pl.maximum(mi, slot_score)
             alpha = pl.exp(pl.sub(mi, mi_next))
             beta = pl.exp(pl.sub(slot_score, mi_next))
             li_next = pl.add(pl.mul(alpha, li), beta)
             oi_next = pl.add(pl.mul(oi, alpha), pl.mul(slot_kv, beta))
-            mi_buf[0:1, 0:HEAD_D_TILE] = mi_next
-            li_buf[0:1, 0:HEAD_D_TILE] = li_next
-            oi_buf[0:1, 0:HEAD_D_TILE] = oi_next
-    pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.div(
-        oi_buf[0:1, 0:HEAD_D_TILE],
-        li_buf[0:1, 0:HEAD_D_TILE],
+            mi_buf[0:1, 0:pool_tile] = mi_next
+            li_buf[0:1, 0:pool_tile] = li_next
+            oi_buf[0:1, 0:pool_tile] = oi_next
+    pooled_kv[write_i : write_i + 1, h0 : h0 + pool_tile] = pl.div(
+        oi_buf[0:1, 0:pool_tile],
+        li_buf[0:1, 0:pool_tile],
     )
 
 
@@ -229,11 +230,13 @@ def _compressor_store_state_rows(
     update_base: pl.Scalar[pl.INDEX],
     update_token_tile: pl.Scalar[pl.INDEX],
     first_row: pl.Scalar[pl.INDEX],
+    out_tile: pl.constexpr,
+    state_rows: pl.Scalar[pl.INDEX],
+    out_dim: pl.constexpr,
 ):
     """Write projected KV and APE-adjusted score rows to one state bank."""
-    state_rows = pl.tensor.dim(state, 0) * CSA_STATE_BLOCK_SIZE
-    state_flat = pl.tensor.view(state, shape=[state_rows, COMPRESS_STATE_DIM])
-    pool_dep_tile = pl.tile.full([1, STATE_UPDATE_OUT_TILE], dtype=pl.FP32, value=0.0)
+    state_flat = pl.tensor.view(state, shape=[state_rows, 2 * out_dim])
+    pool_dep_tile = pl.tile.full([1, out_tile], dtype=pl.FP32, value=0.0)
     for update_dt in pl.range(update_token_tile):
         update_t = update_base + update_dt
         if update_t >= first_row and update_t < num_tokens:
@@ -242,15 +245,15 @@ def _compressor_store_state_rows(
                 state_row = pl.cast(state_row_raw, pl.INDEX)
                 update_pos = pl.read(position_ids, [update_t])
                 ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                for update_ob in pl.range(OUT_DIM // STATE_UPDATE_OUT_TILE):
-                    update_o0 = update_ob * STATE_UPDATE_OUT_TILE
-                    ape_row = pl.load(ape, [ape_slot, update_o0], [1, STATE_UPDATE_OUT_TILE])
-                    kv_row = pl.load(kv_proj, [update_t, update_o0], [1, STATE_UPDATE_OUT_TILE])
-                    score_row = pl.load(score_proj, [update_t, update_o0], [1, STATE_UPDATE_OUT_TILE])
+                for update_ob in pl.range(out_dim // out_tile):
+                    update_o0 = update_ob * out_tile
+                    ape_row = pl.load(ape, [ape_slot, update_o0], [1, out_tile])
+                    kv_row = pl.load(kv_proj, [update_t, update_o0], [1, out_tile])
+                    score_row = pl.load(score_proj, [update_t, update_o0], [1, out_tile])
                     state_kv = pl.add(kv_row, pool_dep_tile)
                     state_score = pl.add(score_row, ape_row)
                     state_score = pl.add(state_score, pool_dep_tile)
-                    score_o0 = OUT_DIM + update_o0
+                    score_o0 = out_dim + update_o0
                     pl.store(state_kv, [state_row, update_o0], state_flat)
                     pl.store(state_score, [state_row, score_o0], state_flat)
     return state
@@ -356,7 +359,7 @@ def _compressor_prepare_state(
                         if current_complete != 0:
                             _compressor_pool_reduce(
                                 pool_kv_tile, pool_score_tile, write_pos, write_i, h0,
-                                pooled_kv,
+                                pooled_kv, HEAD_D_TILE,
                             )
                         else:
                             pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=0.0)
@@ -437,7 +440,7 @@ def _compressor_prepare_state(
 
                                 _compressor_pool_reduce(
                                     pool_kv_tile, pool_score_tile, write_pos, write_i, h0,
-                                    pooled_kv,
+                                    pooled_kv, HEAD_D_TILE,
                                 )
                             else:
                                 pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=0.0)
@@ -462,7 +465,8 @@ def _compressor_prepare_state(
             forward_first = pl.max(state_update_rows - forward_rows, 0)
             _compressor_store_state_rows(
                 cmp4_kv_proj_scratch, cmp4_score_proj_scratch, ape, position_ids, num_tokens,
-                state_slot_mapping, next_state, forward_base, state_update_token_tile, forward_first,
+                state_slot_mapping, next_state, forward_base, state_update_token_tile, forward_first, STATE_UPDATE_OUT_TILE,
+                state_block_num * CSA_STATE_BLOCK_SIZE, OUT_DIM,
             )
         completion[0] = forward_tid
     else:
@@ -472,7 +476,8 @@ def _compressor_prepare_state(
             update_base = update_tb * state_update_token_tile
             _compressor_store_state_rows(
                 cmp4_kv_proj_scratch, cmp4_score_proj_scratch, ape, position_ids, num_tokens,
-                state_slot_mapping, compress_state, update_base, state_update_token_tile, 0,
+                state_slot_mapping, compress_state, update_base, state_update_token_tile, 0, STATE_UPDATE_OUT_TILE,
+                state_block_num * CSA_STATE_BLOCK_SIZE, OUT_DIM,
             )
         completion[0] = update_tid
     return pooled_kv, compress_state
@@ -655,6 +660,49 @@ def prefill_compressor_ratio4_test(
     )
 
 
+
+@pl.jit
+def prefill_compressor_state_forward_test(
+    x: pl.Tensor[[T, D], pl.BF16],
+    compress_state: pl.InOut[pl.Tensor[[STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
+    compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    next_state: pl.InOut[pl.Tensor[[STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
+    forward_rows: pl.Scalar[pl.INDEX],
+):
+    write_pos_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
+    write_dst_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
+    completion = pl.array.create(1, pl.TASK_ID)
+    _compressor_prepare_state(
+        x, compress_state, compress_state_block_table, wkv, wgate, ape,
+        position_ids, num_tokens, write_pos_map, write_dst_map, state_slot_mapping, completion,
+        next_state=next_state, forward_rows=forward_rows,
+        history_pool_worker_cap=pl.cast(16, pl.INT32), emit_pool=False,
+        compute_output=0, skip_history_pool=0,
+    )
+    return next_state, compress_state
+
+
+def golden_prefill_compressor_state_forward(tensors):
+    """Update only the requested boundary rows in a distinct destination bank."""
+    x = tensors["x"].float()
+    kv = x @ tensors["wkv"].float().t()
+    scores = x @ tensors["wgate"].float().t()
+    destination = tensors["next_state"].view(-1, COMPRESS_STATE_DIM)
+    active = int(tensors["num_tokens"])
+    for token in range(max(active - int(tensors["forward_rows"]), 0), active):
+        row = int(tensors["state_slot_mapping"][token])
+        if row >= 0:
+            position = int(tensors["position_ids"][token])
+            destination[row, :OUT_DIM] = kv[token]
+            destination[row, OUT_DIM:] = scores[token] + tensors["ape"][position % COMPRESS_RATIO]
+
+
 def build_tensor_specs(start_pos: int = START_POS):
     import torch
     from golden import ScalarSpec, TensorSpec
@@ -673,10 +721,9 @@ def build_tensor_specs(start_pos: int = START_POS):
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
-        table = init_compress_state_block_table()
         block = abs_pos // CSA_STATE_BLOCK_SIZE
         intra = abs_pos % CSA_STATE_BLOCK_SIZE
-        return int(table[block].item()) * CSA_STATE_BLOCK_SIZE + intra
+        return ((block * 17 + 3) % CSA_STATE_PHYSICAL_BLOCKS) * CSA_STATE_BLOCK_SIZE + intra
     def init_x():
         return ((torch.rand(T, D) - 0.5) * 0.1).to(torch.bfloat16)
     def init_compress_state():
@@ -750,16 +797,50 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true", default=False,
                         help="Compile/codegen only; also the implicit behavior on *sim platforms used by CI.")
-    parser.add_argument("--start-pos", type=int, default=START_POS,
-                        help="Fixture-only absolute position for token 0, lowered into position_ids and cmp_slot_mapping.")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="Validate this start position; defaults to both 0 and 8.")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
+    for start_pos in ([0, 8] if args.start_pos is None else [args.start_pos]):
+        result = run(
+            fn=prefill_compressor_ratio4_test,
+            specs=build_tensor_specs(start_pos),
+            golden_fn=golden_prefill_compressor_ratio4,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+            ),
+            compile_only=args.compile_only,
+            compare_fn={
+                "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+                "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            },
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    forward_names = {
+        "x", "compress_state", "compress_state_block_table", "wkv", "wgate", "ape",
+        "position_ids", "num_tokens", "state_slot_mapping",
+    }
+    forward_specs = [spec for spec in build_tensor_specs(8) if spec.name in forward_names]
+    state_shape = [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM]
+    forward_specs.append(TensorSpec("next_state", state_shape, torch.float32, init_value=torch.randn))
+    forward_specs.append(ScalarSpec("forward_rows", torch.int64, 7))
     result = run(
-        fn=prefill_compressor_ratio4_test,
-        specs=build_tensor_specs(args.start_pos),
-        golden_fn=golden_prefill_compressor_ratio4,
+        fn=prefill_compressor_state_forward_test,
+        specs=forward_specs,
+        golden_fn=golden_prefill_compressor_state_forward,
         config=dict(
             dump_passes=args.dump_passes,
             backend_type=args.backend_type,
@@ -769,8 +850,8 @@ if __name__ == "__main__":
         ),
         compile_only=args.compile_only,
         compare_fn={
-            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            "compress_state": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "next_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
         },
     )
     if not result.passed:
