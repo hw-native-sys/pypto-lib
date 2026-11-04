@@ -943,14 +943,14 @@
     {
       "file": "runtime_config.py",
       "source": "models/deepseek_v4_1_flash_a2/config.py",
-      "migrated_sha256": "90282ffb600858f595c519cd1399471ba4deaa60a61e346a266908c3a359e974",
-      "reason": "Keep runtime TP sizing outside model configuration."
+      "migrated_sha256": "5275c6c8bd47d39331a2b3e72aed31bd91f656d78aec8a5f30fe2c723c66818b",
+      "reason": "Keep runtime TP and Decode topology sizing outside model configuration."
     },
     {
       "file": "swa_attention.py",
       "source": "models/deepseek_v4_1_flash_a2/decode_swa.py",
-      "migrated_sha256": "7c9d8ef0e5c302c0889697080d7df37c59146ae407a5b11a5aac58cfe9ee6ce4",
-      "reason": "Share SWA compute between Decode, Prefill, and layer references."
+      "migrated_sha256": "47923bf9b06924c034189a57e93fceaa1c88283efc224de6859bc3b570a172ed",
+      "reason": "Share SWA compute between Decode, Prefill, and layer references while preserving the legacy Prefill ABI."
     },
     {
       "file": "decode_swa.py",
@@ -987,6 +987,43 @@
       "source": "models/deepseek_v4_1_flash/decode_c1a_reindex.py",
       "migrated_sha256": "e9a4ca5e1475dec2b8114b22d5cf012cef99e876ca952d63b0f4d0c331d7fb5b",
       "reason": "Expose the A2/A3 L24 C1A reindex path under the A5 decoder filename."
+    }
+  ],
+  "decode_files": [
+    {
+      "file": "decode_fwd.py",
+      "sha256": "579659153d81864973fc0ef4fcd033ae7accf981b5559d40ef6be2704d862b4a",
+      "role": "bounded PyPTO L0 SWA Decode ABI and topology contract",
+      "product_compute": true,
+      "accuracy_evidence": "not_run"
+    },
+    {
+      "file": "decode_replay.py",
+      "sha256": "d44c69633206f19c167b419d11b4f42b17165c85cfbed458394b727f30df5b40",
+      "role": "fixed 1/2/8-step PyPTO cache/state replay",
+      "product_compute": true,
+      "accuracy_evidence": "state_abi_only"
+    },
+    {
+      "file": "decode_gate.py",
+      "sha256": "d7acb25c0f91ccc4e2a834eed331aa3841710b056864b4bb2ae7b355cce3650d",
+      "role": "fail-closed EP2/main/compatibility topology gate entry",
+      "product_compute": false,
+      "accuracy_evidence": "not_run"
+    },
+    {
+      "file": "decode_candidates.py",
+      "sha256": "664508d4db5509281b4eae6dcbac29370bd8c8dec5274c9db3867c3d9ce2e7b5",
+      "role": "Search K=2 executable PyPTO candidate registry",
+      "product_compute": true,
+      "accuracy_evidence": "not_run"
+    },
+    {
+      "file": "decode_acceptance.py",
+      "sha256": "4c21d7333a8e8e78e9e2fd93476ecc7dbd8e27e9f6dff6a719dcf2126f029b46",
+      "role": "independent Decode contract and product dependency verifier",
+      "product_compute": false,
+      "accuracy_evidence": "not_run"
     }
   ],
   "preserved_definition_count": 153

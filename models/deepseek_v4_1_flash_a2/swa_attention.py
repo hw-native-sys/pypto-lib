@@ -1,8 +1,15 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """A2/A3 BF16 sink-aware sliding-window attention kernel and reference."""
 
 from __future__ import annotations
 
-import torch
 import pypto.language as pl
 
 from .swa_cache import (
@@ -23,6 +30,8 @@ def swa_attention_reference(
     valid_tokens: int | None = None,
 ) -> torch.Tensor:
     """Compute sink-aware attention over gathered BF16 SWA rows."""
+
+    import torch
 
     if query.ndim != 2 or query.shape[-1] % head_dim:
         raise ValueError("query must be [T, H*D] with a divisible head dimension")
@@ -53,32 +62,48 @@ def swa_attention_reference(
     return output
 
 
-def make_swa_attention(capacity: int, heads: int, head_dim: int, window: int):
-    """Build the sink-aware A2/A3 attention reduction kernel."""
+def make_swa_attention(
+    capacity: int,
+    heads: int,
+    head_dim: int,
+    window: int,
+    *,
+    decode_state: bool = False,
+):
+    """Build the sink-aware A2/A3 attention reduction kernel.
+
+    The default keeps the prefill/layer ABI. Decode requests opt into the
+    request-state controls explicitly so existing callers retain their
+    public signature.
+    """
 
     if capacity <= 0 or heads <= 0 or head_dim <= 0 or window <= 0:
         raise ValueError("attention dimensions must be positive")
     if heads % 16:
         raise ValueError("A2/A3 attention uses a 16-head vector tile")
-    publish = make_swa_cache_publish(capacity, 2, head_dim)
-    gather = make_swa_cache_gather(capacity, window, 2, head_dim)
+    publish = make_swa_cache_publish(capacity, 2, head_dim, decode_state=True)
+    gather = make_swa_cache_gather(capacity, window, 2, head_dim, decode_state=True)
     head_tile = 16
     scale = head_dim ** -0.5
 
     @pl.jit.inline
-    def attend(
+    def decode_attend(
         query: pl.Tensor[[capacity, heads * head_dim], pl.BF16],
         window_kv: pl.Tensor[[capacity, head_dim], pl.BF16],
         slots: pl.Tensor[[capacity, 2], pl.INT64],
         indices: pl.Tensor[[capacity, window], pl.INT32],
         sink: pl.Tensor[[heads], pl.FP32],
+        positions: pl.Tensor[[capacity], pl.INT64],
+        request_ids: pl.Tensor[[capacity], pl.INT32],
+        cache_source_ids: pl.Tensor[[capacity], pl.INT32],
+        finished: pl.Tensor[[capacity], pl.INT8],
         cache: pl.Tensor[[2, 128, 1, head_dim], pl.BF16],
         output: pl.Tensor[[capacity, heads * head_dim], pl.BF16],
         active: pl.Scalar[pl.INT32],
     ):
-        publish(window_kv, slots, cache, active)
+        publish(window_kv, slots, positions, request_ids, cache_source_ids, finished, cache, active)
         selected_flat = pl.create_tensor([capacity * window, head_dim], dtype=pl.BF16)
-        gather(cache, indices, selected_flat, active)
+        gather(cache, indices, finished, selected_flat, active)
         qflat = pl.reshape(query, [capacity * heads, head_dim])
         oflat = pl.reshape(output, [capacity * heads, head_dim])
         kflat = selected_flat
@@ -109,6 +134,39 @@ def make_swa_attention(capacity: int, heads: int, head_dim: int, window: int):
                 result, pl.BF16, mode="rint"
             )
         return output, cache, selected_flat
+
+    if decode_state:
+        return decode_attend
+
+    @pl.jit.inline
+    def attend(
+        query: pl.Tensor[[capacity, heads * head_dim], pl.BF16],
+        window_kv: pl.Tensor[[capacity, head_dim], pl.BF16],
+        slots: pl.Tensor[[capacity, 2], pl.INT64],
+        indices: pl.Tensor[[capacity, window], pl.INT32],
+        sink: pl.Tensor[[heads], pl.FP32],
+        cache: pl.Tensor[[2, 128, 1, head_dim], pl.BF16],
+        output: pl.Tensor[[capacity, heads * head_dim], pl.BF16],
+        active: pl.Scalar[pl.INT32],
+    ):
+        positions = pl.full([capacity], dtype=pl.INT64, value=0)
+        request_ids = pl.full([capacity], dtype=pl.INT32, value=0)
+        cache_source_ids = pl.full([capacity], dtype=pl.INT32, value=0)
+        finished = pl.full([capacity], dtype=pl.INT8, value=0)
+        return decode_attend(
+            query,
+            window_kv,
+            slots,
+            indices,
+            sink,
+            positions,
+            request_ids,
+            cache_source_ids,
+            finished,
+            cache,
+            output,
+            active,
+        )
 
     return attend
 

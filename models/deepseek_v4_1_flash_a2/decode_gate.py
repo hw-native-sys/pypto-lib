@@ -1,0 +1,103 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Fail-closed entry point for the independent A3 Decode topology gates."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+from models.deepseek_v4_1_flash_a2.decode_acceptance import (
+    TOPOLOGIES,
+    runtime_identity,
+)
+
+
+REQUIRED_ASSETS = (
+    "checkpoint.json",
+    "decode_input.json",
+    "history_cache.npz",
+    "reference_capture.json",
+)
+
+
+def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]:
+    """Describe one queued gate without claiming execution.
+
+    The product and vLLM reference are deliberately separate processes. This
+    entry point only checks that the frozen inputs exist and emits the exact
+    queue contract; it never imports or launches vLLM.
+    """
+
+    if topology not in TOPOLOGIES:
+        raise ValueError(f"unknown Decode topology: {topology}")
+    topology_config = TOPOLOGIES[topology]
+    configured_root = os.environ.get("DEEPSEEK_V41_DECODE_ASSETS")
+    root = asset_root or (Path(configured_root) if configured_root else None)
+    assets = {
+        name: (str(root / name) if root else "not_configured")
+        for name in REQUIRED_ASSETS
+    }
+    present = {
+        name: bool(root and (root / name).is_file())
+        for name in REQUIRED_ASSETS
+    }
+    missing = [name for name, exists in present.items() if not exists]
+    devices = topology_config["devices"]
+    command = (
+        f"task-submit --device auto --device-num {devices} --run "
+        f"'PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_fwd "
+        f"-p a2a3 --ep {topology_config['ep']} --dp {topology_config['dp']} "
+        f"--tp {topology_config['tp']}'"
+    )
+    return {
+        "topology": topology,
+        "topology_config": topology_config,
+        "status": "not_run",
+        "assets": assets,
+        "asset_presence": present,
+        "missing_assets": missing,
+        "queue_command": command,
+        "product_entrypoint": "models.deepseek_v4_1_flash_a2.decode_fwd",
+        "reference_process": "independent vLLM-Ascend capture required",
+        "runtime_identity": runtime_identity(),
+        "recovery": (
+            "Provide checkpoint/config conversion, identical decode input and "
+            "historical cache, and frozen vLLM-Ascend reference capture; then "
+            "submit this topology through task-submit and record per-rank state."
+        ),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--topology", choices=tuple(TOPOLOGIES), default="ep2_gate")
+    parser.add_argument("--asset-root", type=Path)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--record", type=Path)
+    args = parser.parse_args(argv)
+    result = gate_report(args.topology, args.asset_root)
+    encoded = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if args.record:
+        args.record.parent.mkdir(parents=True, exist_ok=True)
+        args.record.write_text(encoded, encoding="utf-8")
+    if args.json or args.record:
+        print(encoded, end="")
+    else:
+        print(f"[decode-gate] {args.topology}: not_run")
+        print(f"[decode-gate] missing assets: {', '.join(result['missing_assets']) or 'none'}")
+        print(f"[decode-gate] queue: {result['queue_command']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

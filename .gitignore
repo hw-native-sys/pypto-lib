@@ -20,6 +20,7 @@ develop-eggs/
 
 # Project build artifacts
 build_output/
+.pypto-a3-state/
 pa_build/
 site/
 .site-theme/

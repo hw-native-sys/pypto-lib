@@ -1,14 +1,23 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """BF16 RMSNorm and adjacent-pair RoPE for A2/A3."""
 
 from __future__ import annotations
 
-import torch
 import pypto.language as pl
 
 from .operator_config import CONTRACT
 
 
 def rms_norm_reference(value: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    import torch
+
     source = value.float()
     inverse = torch.rsqrt(source.square().mean(dim=-1, keepdim=True) + eps)
     return (source * inverse * weight.float()).to(torch.bfloat16)
@@ -22,6 +31,8 @@ def rope_reference(
     head_dim: int,
     rope_dim: int,
 ) -> torch.Tensor:
+    import torch
+
     if rope_dim % 2 or value.shape[-1] != heads * head_dim:
         raise ValueError("RoPE dimensions must be even and match heads * head_dim")
     output = value.clone()

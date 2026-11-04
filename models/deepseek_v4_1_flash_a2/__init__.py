@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """DeepSeek V4.1 Flash A2 prefill and A2/A3 decoder operators."""
 
 from importlib import import_module
@@ -26,6 +34,14 @@ _EXPORTS = {
     "make_shared_expert_w8a8": ("moe", "make_shared_expert_w8a8"),
     "layer0_reference": ("layer0", "layer0_reference"),
     "route_reference": ("layer0", "route_reference"),
+    "make_decode_step": ("decode_fwd", "make_decode_step"),
+    "make_decode_replay": ("decode_replay", "make_decode_replay"),
+    "validate_decode_contract": ("decode_fwd", "validate_decode_contract"),
+    "DecodeCandidate": ("decode_candidates", "DecodeCandidate"),
+    "DECODE_CANDIDATES": ("decode_candidates", "CANDIDATES"),
+    "validate_decode_candidates": ("decode_candidates", "validate_candidates"),
+    "decode_acceptance_report": ("decode_acceptance", "report"),
+    "decode_gate_report": ("decode_gate", "gate_report"),
     "engram_reference": ("engram", "engram_reference"),
     "make_gate": ("engram", "make_gate"),
     "make_lookup": ("engram", "make_lookup"),

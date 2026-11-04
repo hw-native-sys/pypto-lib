@@ -34,7 +34,9 @@ the private orchestration used to obtain the historical acceptance results.
 | `layer2_c1c2.py`, `c2_prefill_pool.py`, `ecotech_full2_*.py` | Ratio-two projection, ring state, pooling, cache publication and index observation. The width-128 index publisher includes the accepted 16-row quantization and reciprocal correction. |
 | `ratio1_prefill.py` | Ratio-one publication starting at an actual BF16 compressor projection. This is a distinct input boundary from the FP32 ratio-two compressor. |
 | `ecotech_prefill_consumer.py`, `indexer.py`, `sparse_consumer_prefill.py` | Consumer projections, causal controls and sparse attention stages. |
-| `decode_c2a_full.py`, `decode_c2a_reuse.py`, `decode_c1a_full.py`, `decode_c1a_reuse.py`, `decode_c1a_reindex.py` | A5-shaped A2/A3 decode entry points for L14/L15/L19/L20/L21/L24/L25. `layer14_15.py` and `layers19_25.py` remain aggregate compatibility providers. |
+| `decode_c2a_full.py`, `decode_c2a_reuse.py`, `decode_c1a_full.py`, `decode_c1a_reuse.py`, `decode_c1a_reindex.py` | A2/A3 stage owners for L14/L15/L19/L20/L21/L24/L25. `layer14_15.py` and `layers19_25.py` remain aggregate compatibility providers. |
+| `decode_fwd.py`, `decode_replay.py` | Bounded PyPTO L0 SWA Decode ABI, single-step entry, and fixed 1/2/8-step state replay. These entries do not claim checkpoint accuracy, full-model, or distributed Decode coverage. |
+| `decode_candidates.py`, `decode_acceptance.py`, `decode_gate.py` | Search K=2 candidate registry, independent Decode contract, product import closure scan, runtime identity capture, and fail-closed layer/topology gate reporting. |
 | `candidate_pool.py`, `raw_checkpoint.py` | A2/A3 candidate metadata and raw checkpoint loading. |
 | `swa_scheduler.py`, `smla_scheduler.py` | Integer-only request, page and causal-selection scheduling. Original and compressed lanes retain separate page tables. |
 | `swa_native.py`, `smla_native.py`, `smla_staging.py` | Registered BF16 SWA/ratio-one SMLA leaves, fresh metadata, and PyPTO dtype boundaries. |
@@ -131,19 +133,76 @@ checked exactly. Historical acceptance belongs to those frozen snapshots.
 
 `source_manifest.json` maps each ported file to its original source digest.
 It also records unchanged definition AST digests, the native-call identities,
-and host changes needed for relocation. Dependencies extracted from the
-original parent model retain their compute definitions in this flat directory.
+and host changes needed for relocation. Its `decode_files` records identify the
+new PyPTO Decode entry points and explicitly keep their accuracy evidence
+separate from source migration. Dependencies extracted from the original
+parent model retain their compute definitions in this flat directory.
 The port includes the L14 Engram observation interface, L1 native boundaries,
 and the final L20 index-publication candidate.
 
 The external capture and validation tree has host validation and
-factory-construction coverage; it has not been replayed on an NPU. It makes no claim of a newly validated
-full-block runner, stacked layers, whole-network dataset score, Decode,
-full-table Engram residency, multi-card execution or serving support. The
-original L25 evidence's missing large-readonly and dispatch-input artifacts
+factory-construction coverage; it has not been replayed on an NPU. The local
+tree now contains bounded PyPTO L0 single-step and fixed-step SWA Decode
+entries, but they make no claim of validated C1A/C2A chaining, stacked layers,
+whole-network dataset score, full-table Engram residency, multi-card execution,
+or serving support.
+The original L25 evidence's missing large-readonly and dispatch-input artifacts
 remain a limitation of that historical record.
 
+## Independent Decode acceptance
+
+The Decode session starts with every formal gate at `not_run`. Search K=2 is
+registered in [`decode_candidates.py`](../../../models/deepseek_v4_1_flash_a2/decode_candidates.py);
+both candidates use PyPTO entry points and share the same page size, scale
+contract, input boundary, topology and tolerance. The acceptance contract and
+product dependency scan are executable without importing a model kernel:
+The four-commit ancestry and tree IDs are recorded in
+[`decode_cherry_pick_receipt.json`](../../../models/deepseek_v4_1_flash_a2/decode_cherry_pick_receipt.json).
+
+```bash
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_acceptance --json
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_acceptance \
+  --record .pypto-a3-state/decode-acceptance.json
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_gate \
+  --topology ep2_gate --record .pypto-a3-state/decode-ep2-gate.json
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_gate \
+  --topology main --record .pypto-a3-state/decode-main-gate.json
+```
+
+The scan rejects vLLM, vLLM-Ascend and Torch-NPU imports in the product import
+closure. Files ending in `_runtime.py` are reference-only and cannot be loaded
+by a product entry. The scan records Torch imports used by the golden/reference
+side separately; they do not establish product accuracy.
+
+`decode_gate.py` is intentionally fail-closed. It emits the required
+`task-submit --device auto --device-num 2/16` command and records missing
+checkpoint, cache, input, or reference assets; it never launches vLLM or
+claims a gate without a same-input capture.
+
+The current bounded entries accept the full state ABI, but do not yet consume
+per-request position/source/finished controls in the device schedule and only
+advance the first length slot. Consequently the EP2 MoE gate, DP8/TP2/EP16
+complete layer gates, cache/state comparison, vLLM-Ascend same-input capture,
+and all eleven target-layer gates remain `not_run` until a checkpoint conversion,
+distributed driver, and independent reference capture are available.
+
 ## Checks without a device
+
+Compile the bounded Decode ABI without allocating a device:
+
+```bash
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_fwd -p a2a3 --sim --compile-only
+```
+
+Run the deterministic single-context state replay for each supported step
+count. The replay checks cache and length mutation against the CPU reference;
+it is not checkpoint numerical accuracy evidence:
+
+```bash
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_replay --steps 1 -p a2a3 --sim
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_replay --steps 2 -p a2a3 --sim
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_replay --steps 8 -p a2a3 --sim
+```
 
 Run the source receipt, dependency-closure and prefill-control checks from the
 external A5-shaped validation tree:

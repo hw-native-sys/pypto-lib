@@ -1,0 +1,322 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Independent DeepSeek V4.1 A3 Decode contract and product dependency scan."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import importlib.util
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from models.deepseek_v4_1_flash_a2.decode_candidates import CANDIDATES, SEARCH_K, validate_candidates
+
+
+ROOT = Path(__file__).resolve().parents[2]
+MODEL_ROOT = Path(__file__).resolve().parent
+TARGET_LAYERS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
+PRODUCT_ENTRYPOINTS = ("decode_fwd.py", "decode_replay.py", "decode_candidates.py")
+VALIDATION_ENTRYPOINTS = ("decode_acceptance.py", "decode_gate.py")
+REFERENCE_ONLY_SUFFIXES = ("_runtime.py",)
+FORBIDDEN_PRODUCT_IMPORTS = ("vllm", "vllm_ascend", "torch_npu")
+
+SOURCE_COMMITS = (
+    {
+        "commit": "500858a9abd6ce1d3796a5e26a4bb597cdf622e4",
+        "author": "Adelaide999",
+        "email": "73272686+Adelaide999@users.noreply.github.com",
+        "author_time": "2026-10-31T10:13:30+08:00",
+    },
+    {
+        "commit": "d401f4e82e6348aee1566118c0c768b66e70504d",
+        "author": "sunhaolun",
+        "email": "sunhaolun3@huawei.com",
+        "author_time": "2026-10-31T17:51:06+08:00",
+    },
+    {
+        "commit": "c0f23d56800fbd34d4b3442d5df9565be387a955",
+        "author": "Lun7777",
+        "email": "1055318345@qq.com",
+        "author_time": "2026-11-02T10:00:49+08:00",
+    },
+    {
+        "commit": "addb655f7b4f4a4ce56af875724a04d79d3fe325",
+        "author": "Lun7777",
+        "email": "1055318345@qq.com",
+        "author_time": "2026-11-02T14:36:58+08:00",
+    },
+)
+
+TOPOLOGIES = {
+    "ep2_gate": {"dp": 2, "tp": 1, "ep": 2, "pp": 1, "pcp": 1, "dcp": 1, "devices": 2},
+    "main": {"dp": 8, "tp": 2, "ep": 16, "pp": 1, "pcp": 1, "dcp": 1, "devices": 16},
+    "tp1_compat": {"dp": 16, "tp": 1, "ep": 16, "pp": 1, "pcp": 1, "dcp": 1, "devices": 16},
+    "tp4_compat": {"dp": 4, "tp": 4, "ep": 16, "pp": 1, "pcp": 1, "dcp": 1, "devices": 16},
+}
+
+CONTRACT: dict[str, Any] = {
+    "product": "DeepSeek V4.1 Flash Decode single physical layer",
+    "state": "independent_decode_not_run",
+    "search_k": SEARCH_K,
+    "baseline": {
+        "repository": "https://github.com/Adelaide999/pypto-lib",
+        "target": "addb655f7b4f4a4ce56af875724a04d79d3fe325",
+        "base": "eed3280972f6743fc46d68219bcb108596e64578",
+        "cherry_pick_order": [item["commit"] for item in SOURCE_COMMITS],
+    },
+    "model": {
+        "hidden_size": 5120,
+        "attention_heads": 64,
+        "kv_heads": 1,
+        "head_dim": 512,
+        "q_lora_rank": 1280,
+        "o_groups": 8,
+        "o_lora_rank": 1024,
+        "moe_intermediate": 2304,
+        "routed_experts": 384,
+        "top_k": 6,
+        "hc_mult": 4,
+    },
+    "quantization": {
+        "model": "W8A8 dynamic product boundary",
+        "engram": "INT8",
+        "weight_scale": "FP32 channel scale",
+        "expert_semantics": "FP4 checkpoint conversion remains an input contract",
+        "block_size": 128,
+    },
+    "runtime": {
+        "soc": "Ascend910_9382",
+        "soc_version": "ascend910_9382",
+        "platform": "a2a3",
+        "pytorch_product_compute": False,
+        "vllm_product_compute": False,
+        "vllm_reference_commit": "23d1d9055f2161b3c15613c7fc309f7d5d2ef629",
+        "vllm_reference_process": "separate process required",
+        "enable_expert_parallel": True,
+        "enable_fused_mc2": True,
+        "enable_dsa_cp": True,
+        "enable_flashcomm1": True,
+        "enable_shared_expert_dp": True,
+        "vllm_use_v2_model_runner": 0,
+    },
+    "state_inputs": [
+        "decode_token",
+        "history_token_length",
+        "position_ids",
+        "initial_kv_cache",
+        "block_table",
+        "slot_mapping",
+        "valid_lengths",
+        "mask",
+        "active_finished_request_state",
+        "engram_rows",
+        "cache_source_ids",
+        "ratio1_ratio2_state",
+    ],
+    "state_outputs": [
+        "layer_output",
+        "logits_or_hidden",
+        "cache_delta",
+        "index_and_candidate_state",
+        "route_ids_and_gate_weights",
+        "dispatch_combine_state",
+        "untouched_cache_rows",
+        "inactive_rows",
+    ],
+    "tolerances": {"rtol": 0.05, "atol": 0.05, "discrete": "exact"},
+    "layers": {str(layer): "not_run" for layer in TARGET_LAYERS},
+    "topologies": {name: "not_run" for name in TOPOLOGIES},
+    "candidates": [candidate.__dict__ for candidate in CANDIDATES],
+}
+
+
+def _module_name(path: Path) -> str:
+    relative = path.relative_to(ROOT).with_suffix("")
+    return ".".join(relative.parts)
+
+
+def _local_module(path: Path, module: str, level: int = 0) -> Path | None:
+    if level:
+        package = path.parent
+        for _ in range(level - 1):
+            package = package.parent
+        candidate = package / (module.replace(".", "/") if module else path.stem)
+    else:
+        candidate = ROOT / module.replace(".", "/")
+    py_file = candidate.with_suffix(".py")
+    package_file = candidate / "__init__.py"
+    if py_file.is_file():
+        return py_file
+    if package_file.is_file():
+        return package_file
+    return None
+
+
+def _import_targets(path: Path) -> list[tuple[str, Path | None]]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    targets: list[tuple[str, Path | None]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                targets.append((alias.name, _local_module(path, alias.name)))
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                local = _local_module(path, module, node.level)
+                targets.append((module, local))
+            else:
+                local = _local_module(path, module)
+                targets.append((module, local))
+    return targets
+
+
+def product_dependency_scan() -> dict[str, Any]:
+    """Walk the product entrypoint closure and reject forbidden native bridges."""
+
+    visited: set[Path] = set()
+    queue = [MODEL_ROOT / name for name in PRODUCT_ENTRYPOINTS]
+    forbidden: list[dict[str, str]] = []
+    host_reference: list[dict[str, str]] = []
+    subprocess_edges: list[str] = []
+    while queue:
+        path = queue.pop()
+        if path in visited or not path.is_file():
+            continue
+        visited.add(path)
+        for imported, local in _import_targets(path):
+            root = imported.split(".", 1)[0]
+            if root in FORBIDDEN_PRODUCT_IMPORTS:
+                forbidden.append({"file": str(path.relative_to(ROOT)), "import": imported})
+            if root == "torch":
+                host_reference.append({"file": str(path.relative_to(ROOT)), "import": imported})
+            if root == "subprocess":
+                subprocess_edges.append(str(path.relative_to(ROOT)))
+            if local is not None and local.is_relative_to(MODEL_ROOT):
+                queue.append(local)
+    return {
+        "status": "pass" if not forbidden else "failed",
+        "visited_files": sorted(str(path.relative_to(ROOT)) for path in visited),
+        "forbidden_imports": forbidden,
+        "host_reference_imports": host_reference,
+        "subprocess_edges": subprocess_edges,
+        "reference_only_files": sorted(
+            str(path.relative_to(ROOT))
+            for path in MODEL_ROOT.glob("*_runtime.py")
+        ),
+    }
+
+
+def runtime_identity() -> dict[str, Any]:
+    """Capture source and process identity without importing product kernels."""
+
+    try:
+        git_head = subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        git_head = "unavailable"
+    def module_origin(name: str) -> str:
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ModuleNotFoundError, ValueError):
+            return "unavailable"
+        return spec.origin if spec and spec.origin else "namespace"
+
+    loaded_shared_objects: set[str] = set()
+    maps_path = Path("/proc/self/maps")
+    if maps_path.is_file():
+        for line in maps_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = re.search(r"(/[^ ]+\.so(?:\.[^ ]+)?)", line)
+            if match:
+                loaded_shared_objects.add(match.group(1))
+
+    model_files = {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(MODEL_ROOT.glob("decode_*.py"))
+        if path.is_file()
+    }
+    forbidden_loaded = sorted(
+        name for name in sys.modules if name == "vllm" or name.startswith(("vllm.", "vllm_ascend", "torch_npu"))
+    )
+    pypto_origin = module_origin("pypto")
+    pypto_root = str(Path(pypto_origin).parents[2]) if pypto_origin.endswith("/pypto/__init__.py") else "unavailable"
+    return {
+        "git_head": git_head,
+        "baseline_target": CONTRACT["baseline"]["target"],
+        "python": sys.executable,
+        "python_version": platform.python_version(),
+        "pypto_source": os.environ.get("PYPTO_ROOT", pypto_root),
+        "pypto_python": pypto_origin,
+        "pypto_commit": "72a62d13efabbb25d240e35944f68ba5bcc22b7f",
+        "golden_python": module_origin("golden"),
+        "soc_version": os.environ.get("SOC_VERSION", "not_exported"),
+        "task_device": os.environ.get("TASK_DEVICE", "not_allocated"),
+        "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "not_exported"),
+        "pythonpath": os.environ.get("PYTHONPATH", ""),
+        "cann_root": os.environ.get("ASCEND_HOME_PATH", os.environ.get("CANN_HOME", "not_exported")),
+        "library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+        "loaded_shared_objects": sorted(loaded_shared_objects),
+        "forbidden_modules_loaded": forbidden_loaded,
+        "child_processes": False,
+        "model_files": model_files,
+        "vllm_reference_commit": CONTRACT["runtime"]["vllm_reference_commit"],
+    }
+
+
+def source_hashes() -> dict[str, str]:
+    """Return hashes for Decode-owned source files."""
+
+    files = [MODEL_ROOT / name for name in PRODUCT_ENTRYPOINTS + VALIDATION_ENTRYPOINTS]
+    return {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in files
+        if path.is_file()
+    }
+
+
+def report() -> dict[str, Any]:
+    validate_candidates()
+    result = dict(CONTRACT)
+    result["runtime_identity"] = runtime_identity()
+    result["product_dependency_scan"] = product_dependency_scan()
+    result["source_hashes"] = source_hashes()
+    result["formal_gate"] = "not_run"
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="emit the complete contract as JSON")
+    parser.add_argument("--static-scan", action="store_true", help="scan the PyPTO product import closure")
+    parser.add_argument("--record", type=Path, help="write the report to a JSON file")
+    args = parser.parse_args(argv)
+    result = report()
+    if args.record:
+        args.record.parent.mkdir(parents=True, exist_ok=True)
+        args.record.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if args.json or args.record:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        scan = result["product_dependency_scan"]
+        print(f"[decode-contract] static product scan={scan['status']}; files={len(scan['visited_files'])}")
+        print(f"[decode-contract] Search K={SEARCH_K}; formal_gate=not_run")
+        print("[decode-contract] NPU checkpoint/reference gates remain not_run until assets are supplied")
+    return 0 if result["product_dependency_scan"]["status"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

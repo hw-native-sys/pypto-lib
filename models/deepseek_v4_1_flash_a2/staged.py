@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """Memory-bounded staged kernels for a real-width A2/A3 L0 assembly.
 
 Each entry point owns one stable decoder boundary.  Keeping the boundaries
@@ -12,9 +20,7 @@ from collections.abc import Mapping
 import pypto.language as pl
 
 from .gemm import make_int8_linear_direct
-from .index_cache import make_index_cache_quantize
 from .norm_rope import make_rope, make_rmsnorm
-from .qkv import qkv_shape
 from .swa_attention import make_swa_attention
 
 ACT_TILE = 256
@@ -210,6 +216,8 @@ def make_swiglu(capacity: int, intermediate: int, clamp_limit: float = 10.0):
 
 
 def make_index_quantize(capacity: int, heads: int, head_dim: int = 128):
+    from .index_cache import make_index_cache_quantize
+
     quantize = make_index_cache_quantize(capacity, heads, head_dim)
 
     @pl.jit
@@ -226,22 +234,43 @@ def make_index_quantize(capacity: int, heads: int, head_dim: int = 128):
 
 
 def make_swa(capacity: int, config: Mapping[str, object]):
-    shape = qkv_shape(config)
+    # Keep the product entrypoint independent from the Torch-only reference
+    # helpers in qkv.py.  This shape is a model boundary, not a runtime object.
+    query_width = int(config["num_attention_heads"]) * int(config["head_dim"])
+    head_dim = int(config["head_dim"])
+    heads = int(config["num_attention_heads"])
     window = int(config["sliding_window"])
-    attend = make_swa_attention(capacity, shape.num_attention_heads, shape.head_dim, window)
+    attend = make_swa_attention(capacity, heads, head_dim, window, decode_state=True)
 
     @pl.jit
     def kernel(
-        query: pl.Tensor[[capacity, shape.query_width], pl.BF16],
-        window_kv: pl.Tensor[[capacity, shape.head_dim], pl.BF16],
+        query: pl.Tensor[[capacity, query_width], pl.BF16],
+        window_kv: pl.Tensor[[capacity, head_dim], pl.BF16],
         slots: pl.Tensor[[capacity, 2], pl.INT64],
         indices: pl.Tensor[[capacity, window], pl.INT32],
-        sink: pl.Tensor[[shape.num_attention_heads], pl.FP32],
-        cache: pl.InOut[pl.Tensor[[2, 128, 1, shape.head_dim], pl.BF16]],
-        output: pl.InOut[pl.Tensor[[capacity, shape.query_width], pl.BF16]],
+        sink: pl.Tensor[[heads], pl.FP32],
+        positions: pl.Tensor[[capacity], pl.INT64],
+        request_ids: pl.Tensor[[capacity], pl.INT32],
+        cache_source_ids: pl.Tensor[[capacity], pl.INT32],
+        finished: pl.Tensor[[capacity], pl.INT8],
+        cache: pl.InOut[pl.Tensor[[2, 128, 1, head_dim], pl.BF16]],
+        output: pl.InOut[pl.Tensor[[capacity, query_width], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        attend(query, window_kv, slots, indices, sink, cache, output, active)
+        attend(
+            query,
+            window_kv,
+            slots,
+            indices,
+            sink,
+            positions,
+            request_ids,
+            cache_source_ids,
+            finished,
+            cache,
+            output,
+            active,
+        )
         return cache, output
 
     return kernel
