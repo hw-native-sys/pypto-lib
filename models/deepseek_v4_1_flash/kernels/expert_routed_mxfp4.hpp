@@ -34,6 +34,7 @@ constexpr uint32_t VEC_K_TILE = K_TILE / 2;
 constexpr uint32_t PACKED_COLS = N_TILE / 2;
 constexpr uint32_t UB_SOURCE_BYTES = VEC_K_TILE * PACKED_COLS;
 constexpr uint32_t UB_NZ_BYTES = ((VEC_K_TILE + 15) / 16 * 16 + 1) * N_TILE;
+constexpr uint32_t PREFETCH_SLOTS = 4;
 constexpr uint32_t L0_PINGPONG_BYTES = 32 * 1024;
 constexpr uint32_t L1_BASE = 2 * M_TILE * A_STAGE_K + 2 * (M_TILE + N_TILE) * SCALE_STAGE_Q;
 constexpr uint32_t L1_SLOT_BYTES = K_TILE * N_TILE;
@@ -89,7 +90,7 @@ AICORE inline void produceWeight(__gm__ uint8_t* weight, int64_t k, int64_t n,
 {
     constexpr uint32_t PACKED_ROW_BYTES = 256 / 2;
     constexpr uint32_t PACKED_TILE_BYTES = 256 * 256 / 2;
-    static_assert(2 * (UB_SOURCE_BYTES + UB_NZ_BYTES) <= 192 * 1024);
+    static_assert(PREFETCH_SLOTS * UB_SOURCE_BYTES + 2 * UB_NZ_BYTES <= 192 * 1024);
     using Packed = Tile<TileType::Vec, float4_e2m1x2_t, VEC_K_TILE, N_TILE>;
     using Raw = Tile<TileType::Vec, uint8_t, VEC_K_TILE, PACKED_COLS>;
     using NZ = Tile<TileType::Vec, float8_e4m3_t, VEC_K_TILE, N_TILE, BLayout::ColMajor,
@@ -100,13 +101,15 @@ AICORE inline void produceWeight(__gm__ uint8_t* weight, int64_t k, int64_t n,
     using MatSlot = Tile<TileType::Mat, float8_e4m3_t, K_TILE, N_TILE, BLayout::ColMajor,
                          K_TILE, N_TILE, SLayout::RowMajor, 512>;
     MatSlot matSlot;
-    Packed packed[2];
-    Raw raw[2];
+    Packed packed[PREFETCH_SLOTS];
+    Raw raw[PREFETCH_SLOTS];
     NZ nz[2];
-    for (uint32_t slot = 0; slot < 2; ++slot) {
+    for (uint32_t slot = 0; slot < PREFETCH_SLOTS; ++slot) {
         TASSIGN(packed[slot], slot * UB_SOURCE_BYTES);
         TASSIGN(raw[slot], slot * UB_SOURCE_BYTES);
-        TASSIGN(nz[slot], 2 * UB_SOURCE_BYTES + slot * UB_NZ_BYTES);
+    }
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        TASSIGN(nz[slot], PREFETCH_SLOTS * UB_SOURCE_BYTES + slot * UB_NZ_BYTES);
     }
     const int64_t lane = get_subblockid();
     const int64_t expertBase = expert * k * n / 2;
@@ -114,28 +117,28 @@ AICORE inline void produceWeight(__gm__ uint8_t* weight, int64_t k, int64_t n,
     const int64_t sliceBase = (kBegin / K_TILE) * PACKED_TILE_BYTES;
     const int64_t laneBase = lane * VEC_K_TILE * PACKED_ROW_BYTES + (n0 % 256) / 2 + sliceBase;
     const int64_t iterations = ((kEnd == 0 ? k : kEnd) - kBegin) / K_TILE;
-    // Seed both input buffers. MTE2 may load slot1 while VF consumes slot0.
-    for (int64_t first = 0; first < 2 && first < iterations; ++first) {
+    // Prefetch four packed panels into independent source slots.
+    for (int64_t first = 0; first < PREFETCH_SLOTS && first < iterations; ++first) {
         GlobalPacked globalWeight(weight + expertBase + panelBase + first * PACKED_TILE_BYTES + laneBase);
         TLOAD(raw[first], globalWeight);
         set_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(first));
     }
     for (int64_t iteration = 0; iteration < iterations; ++iteration) {
         const uint32_t slot = iteration % 2;
+        const uint32_t rawSlot = iteration % PREFETCH_SLOTS;
+        const auto inputEvent = static_cast<event_t>(rawSlot);
         const auto event = static_cast<event_t>(slot);
-        wait_flag(PIPE_MTE2, PIPE_V, event);
+        wait_flag(PIPE_MTE2, PIPE_V, inputEvent);
         wait_flag(PIPE_MTE3, PIPE_V, event);
-        TCVT(nz[slot], packed[slot], RoundMode::CAST_RINT);
-        set_flag(PIPE_V, PIPE_MTE2, event);
+        TCVT(nz[slot], packed[rawSlot], RoundMode::CAST_RINT);
+        set_flag(PIPE_V, PIPE_MTE2, inputEvent);
         set_flag(PIPE_V, PIPE_MTE3, event);
-        wait_flag(PIPE_V, PIPE_MTE2, event);
-        // Reuse only the input buffer whose conversion has completed.
-        // This prefetch overlaps the following iteration's VF on the other slot.
-        if (iteration + 2 < iterations) {
-            const int64_t offset = expertBase + panelBase + (iteration + 2) * PACKED_TILE_BYTES + laneBase;
+        wait_flag(PIPE_V, PIPE_MTE2, inputEvent);
+        if (iteration + PREFETCH_SLOTS < iterations) {
+            const int64_t offset = expertBase + panelBase + (iteration + PREFETCH_SLOTS) * PACKED_TILE_BYTES + laneBase;
             GlobalPacked globalWeight(weight + offset);
-            TLOAD(raw[slot], globalWeight);
-            set_flag(PIPE_MTE2, PIPE_V, event);
+            TLOAD(raw[rawSlot], globalWeight);
+            set_flag(PIPE_MTE2, PIPE_V, inputEvent);
         }
         wait_flag(PIPE_V, PIPE_MTE3, event);
         wait_intra_block(PIPE_MTE3, static_cast<uint8_t>(1 + 2 * slot));
