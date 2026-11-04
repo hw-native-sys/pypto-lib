@@ -109,8 +109,10 @@ POOL_STRIDE = (
     // INDEX_STATE_BLOCK_SIZE
     * INDEX_STATE_BLOCK_SIZE
 )
+# Shared physical pages can appear in every request's logical score segment.
 POOL_AXIS = (
-    (max(LATENT_ROWS // INDEX_KPOOL, CAPACITY // INDEX_KPOOL + BATCH) + 2 * SORT_TILE - 2) // SORT_TILE
+    (max(LATENT_ROWS // INDEX_KPOOL, BATCH * TABLE_MAX * (BLOCK_SIZE // INDEX_KPOOL),
+         CAPACITY // INDEX_KPOOL + BATCH) + 2 * SORT_TILE - 2) // SORT_TILE
 ) * SORT_TILE
 POOL_TABLE_ROWS = LATENT_ROWS // INDEX_KPOOL + BLOCK_SIZE // INDEX_KPOOL  # final raw-page span is scratch
 KDA_STATE_BLOCKS = min(TABLE_MAX, (CAPACITY + BLOCK_SIZE - 1) // BLOCK_SIZE + 2)
