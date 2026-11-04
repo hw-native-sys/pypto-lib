@@ -169,7 +169,7 @@ def l2_prefill_layer_moe(
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[D], pl.BF16],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
@@ -274,7 +274,7 @@ def l3_prefill_layer(
     hc_ffn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
@@ -419,7 +419,7 @@ def make_moe_replicated_inputs(seed):
     shared_w3, shared_w3_scale = generate_mxfp8_weight_kn(MOE_INTER, D, shared_std["w3"], chan_cv=0.50, seed=seed + 2)
     shared_w2, shared_w2_scale = generate_mxfp8_weight_kn(D, MOE_INTER, shared_std["w2"], chan_cv=0.33, seed=seed + 3)
     return {
-        "gate_weight": torch.randn(N_EXPERTS, D, generator=gen) / D ** 0.5,
+        "gate_weight": (torch.randn(N_EXPERTS, D, generator=gen) / D ** 0.5).bfloat16(),
         # Separate expert routing scores with correction-bias offsets.
         "correction_bias": _route_bias(),
         "shared_w1": shared_w1, "shared_w1_scale": shared_w1_scale,

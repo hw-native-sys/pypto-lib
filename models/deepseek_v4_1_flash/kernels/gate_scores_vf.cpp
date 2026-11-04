@@ -6,7 +6,7 @@
 // INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
-// FP32 router projection with fused sqrt-softplus and selection bias.
+// BF16 router projection with FP32 accumulation, fused sqrt-softplus, and selection bias.
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
@@ -17,13 +17,13 @@ using namespace pto;
 namespace {
 constexpr int M = 16;
 constexpr int K = 512;
-using Pipe = TPipe<0, Direction::DIR_BOTH, 32768, 2, 2, true>;
+using Pipe = TPipe<0, Direction::DIR_BOTH, 16384, 2, 2, true>;
 using Scores = Tile<TileType::Vec, float, M, M>;
 using Bias = Tile<TileType::Vec, float, 1, M, BLayout::RowMajor, 1, DYNAMIC>;
-using Weight = Tile<TileType::Vec, float, M, K, BLayout::RowMajor, DYNAMIC, K>;
-using WeightPad = Tile<TileType::Vec, float, M, K, BLayout::RowMajor, M, K,
+using Weight = Tile<TileType::Vec, bfloat16_t, M, K, BLayout::RowMajor, DYNAMIC, K>;
+using WeightPad = Tile<TileType::Vec, bfloat16_t, M, K, BLayout::RowMajor, M, K,
                        SLayout::NoneBox, 512, PadValue::Zero>;
-using WeightNZ = Tile<TileType::Vec, float, M, K, BLayout::ColMajor, M, K,
+using WeightNZ = Tile<TileType::Vec, bfloat16_t, M, K, BLayout::ColMajor, M, K,
                       SLayout::RowMajor, 512, PadValue::Zero>;
 
 template <typename T>
@@ -115,10 +115,10 @@ __aicore__ inline void vector_gate(__gm__ int64_t* args) {
         for (int k0 = 0; k0 < width; k0 += 2 * K) {
             Weight input0(valid), input1(valid);
             TASSIGN(input0, 98304); TASSIGN(input1, 131072);
-            GlobalTensor<float, Shape<DYNAMIC, K>, Stride> weight0_gm(
-                data<float>(args, 1) + n0 * width + k0, Shape<DYNAMIC, K>(valid, K), Stride(1, 1, 1, width, 1));
-            GlobalTensor<float, Shape<DYNAMIC, K>, Stride> weight1_gm(
-                data<float>(args, 1) + n0 * width + k0 + K, Shape<DYNAMIC, K>(valid, K), Stride(1, 1, 1, width, 1));
+            GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, DYNAMIC, K>, Stride> weight0_gm(
+                data<bfloat16_t>(args, 1) + n0 * width + k0, TileShape2D<bfloat16_t, DYNAMIC, K>(valid, K), Stride(1, 1, 1, width, 1));
+            GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, DYNAMIC, K>, Stride> weight1_gm(
+                data<bfloat16_t>(args, 1) + n0 * width + k0 + K, TileShape2D<bfloat16_t, DYNAMIC, K>(valid, K), Stride(1, 1, 1, width, 1));
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
             TLOAD(input0, weight0_gm);
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -179,13 +179,13 @@ __aicore__ inline void vector_gate(__gm__ int64_t* args) {
 #endif
 
 #if defined(__DAV_CUBE__)
-using Mat = Tile<TileType::Mat, float, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
-using MatWeight = Tile<TileType::Mat, float, M, K, BLayout::ColMajor, M, K,
+using Mat = Tile<TileType::Mat, bfloat16_t, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
+using MatWeight = Tile<TileType::Mat, bfloat16_t, M, K, BLayout::ColMajor, M, K,
                        SLayout::RowMajor, 512, PadValue::Zero>;
-using Transposed = Tile<TileType::Mat, float, K, M, BLayout::RowMajor, K, M,
+using Transposed = Tile<TileType::Mat, bfloat16_t, K, M, BLayout::RowMajor, K, M,
                         SLayout::ColMajor, 512, PadValue::Zero>;
-using Left = Tile<TileType::Left, float, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
-using Right = Tile<TileType::Right, float, K, M, BLayout::RowMajor, K, M,
+using Left = Tile<TileType::Left, bfloat16_t, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
+using Right = Tile<TileType::Right, bfloat16_t, K, M, BLayout::RowMajor, K, M,
                    SLayout::ColMajor, 512, PadValue::Zero>;
 using Acc = Tile<TileType::Acc, float, M, M, BLayout::ColMajor, M, M, SLayout::RowMajor, 1024>;
 
@@ -208,10 +208,10 @@ __aicore__ inline void cube_gate(__gm__ int64_t* args) {
         for (int k0 = 0; k0 < width; k0 += 2 * K) {
             Mat input0, input1;
             TASSIGN(input0, 65536); TASSIGN(input1, 98304);
-            GlobalTensor<float, Shape<M, K>, Stride> input0_gm(
-                data<float>(args, 0) + t0 * width + k0, Shape<M, K>(), Stride(1, 1, 1, width, 1));
-            GlobalTensor<float, Shape<M, K>, Stride> input1_gm(
-                data<float>(args, 0) + t0 * width + k0 + K, Shape<M, K>(), Stride(1, 1, 1, width, 1));
+            GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, M, K>, Stride> input0_gm(
+                data<bfloat16_t>(args, 0) + t0 * width + k0, TileShape2D<bfloat16_t, M, K>(), Stride(1, 1, 1, width, 1));
+            GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, M, K>, Stride> input1_gm(
+                data<bfloat16_t>(args, 0) + t0 * width + k0 + K, TileShape2D<bfloat16_t, M, K>(), Stride(1, 1, 1, width, 1));
             wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
             TLOAD(input0, input0_gm); set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
             wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);

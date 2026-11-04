@@ -150,7 +150,7 @@ def decode_encoder(
     hc_ffn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
@@ -356,7 +356,7 @@ def decode_encoder(
             ffn_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_ffn_scale, [3], [layer * 3])
             ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_ffn_base, [MIX_HC], [layer * MIX_HC])
             layer_ffn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(ffn_norm_weight, [D], [layer * D])
-            ffn_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
+            ffn_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
             ffn_correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [layer * N_EXPERTS])
             ffn_routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
             ffn_routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
@@ -445,7 +445,7 @@ def decode_decoder(
     hc_ffn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
@@ -629,7 +629,7 @@ def decode_decoder(
             ffn_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_ffn_scale, [3], [layer * 3])
             ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_ffn_base, [MIX_HC], [layer * MIX_HC])
             layer_ffn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(ffn_norm_weight, [D], [layer * D])
-            ffn_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
+            ffn_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
             ffn_correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [layer * N_EXPERTS])
             ffn_routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
             ffn_routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
@@ -725,7 +725,7 @@ def l2_decode_fwd(
     hc_ffn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w2: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
@@ -923,7 +923,7 @@ def l3_decode_fwd(
     hc_ffn_scale: pl.Tensor[[EP_SIZE, N_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[EP_SIZE, N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[EP_SIZE, N_LAYERS * N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[EP_SIZE, N_LAYERS * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[EP_SIZE, N_LAYERS * N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[
         [EP_SIZE, N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
