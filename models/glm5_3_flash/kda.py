@@ -22,7 +22,8 @@ import torch
 import torch.nn.functional as F
 
 from models.glm5_3_flash.config import (
-    FLASH, KDA_CONV_K, KDA_DIM, KDA_GATE_LOWER_BOUND, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, D, Glm53FlashConfig,
+    EP_SIZE, FLASH, KDA_CONV_K, KDA_DIM, KDA_GATE_LOWER_BOUND, LOCAL_KDA_H, LOCAL_KDA_QKV_DIM,
+    TP_SIZE, D, Glm53FlashConfig,
 )
 from models.glm5_3_flash.elementwise import (
     accurate_divide, accurate_exp, accurate_row_sum, accurate_rsqrt, accurate_sigmoid, accurate_silu,
@@ -1204,24 +1205,43 @@ def _golden_decode_tensors(tensors) -> None:
     tensors["conv_state"][:] = st
 
 
-def conv_build_tensor_specs(case: str = "ragged", decode: bool = False):
+def conv_build_tensor_specs(
+    case: str = "ragged", decode: bool = False, *, requests: int | None = None,
+    query_len: int = 1, initial_state: str = "nonzero",
+):
     from golden import TensorSpec
 
     bf, i32 = torch.bfloat16, torch.int32
+    if requests is not None and (requests < 1 or query_len < 1):
+        raise ValueError("requests and query_len must be positive")
+    if decode and query_len != 1:
+        raise ValueError("the decode convolution accepts one token per request")
+    if initial_state not in ("zero", "nonzero"):
+        raise ValueError("initial_state must be zero or nonzero")
+    pool_rows = CONV_POOL_ROWS if requests is None else requests + 1
+
+    def init_state():
+        state = torch.zeros(pool_rows, STATE_LEN, CONV_DIM)
+        if initial_state == "nonzero":
+            state.normal_().mul_(0.6)
+        return state.to(bf)
 
     def common(tokens):
         return [
             TensorSpec("mixed_qkv", [tokens, CONV_DIM], bf, init_value=lambda : (torch.randn(tokens, CONV_DIM) * 0.8).to(bf)),
             TensorSpec("weight", [KDA_CONV_K, CONV_DIM], bf, init_value=lambda : (torch.randn(KDA_CONV_K, CONV_DIM) * 0.5).to(bf)),
             # Non-zero, so a dropped state read is visible rather than a no-op.
-            TensorSpec("conv_state", [CONV_POOL_ROWS, STATE_LEN, CONV_DIM], bf, init_value=lambda : (torch.randn(CONV_POOL_ROWS, STATE_LEN, CONV_DIM) * 0.6).to(bf)),
+            TensorSpec("conv_state", [pool_rows, STATE_LEN, CONV_DIM], bf, init_value=init_state),
         ]
 
     if decode:
-        tokens = 3 if case == "single" else 5
+        tokens = requests if requests is not None else (3 if case == "single" else 5)
         # Deliberately not the identity mapping: a kernel that ignores state_rows and
         # uses the token index would pass an identity fixture.
-        rows = torch.tensor([4, 1, 5, 0, 3][:tokens], dtype=torch.int32)
+        rows = (
+            torch.arange(requests, 0, -1, dtype=i32) if requests is not None
+            else torch.tensor([4, 1, 5, 0, 3][:tokens], dtype=i32)
+        )
         return common(tokens) + [
             TensorSpec("state_rows", [tokens], i32, init_value=lambda: rows),
             TensorSpec("query", [tokens, LOCAL_KDA_H, KDA_DIM], bf),
@@ -1229,15 +1249,18 @@ def conv_build_tensor_specs(case: str = "ragged", decode: bool = False):
             TensorSpec("value", [tokens, LOCAL_KDA_H, KDA_DIM], bf),
         ]
 
-    lengths = _PREFILL_LENGTHS[case]
+    lengths = [query_len] * requests if requests is not None else _PREFILL_LENGTHS[case]
     starts = [0]
     for length in lengths:
         starts.append(starts[-1] + length)
     tokens = starts[-1]
-    rows = torch.tensor([4, 1, 5, 0, 2][: len(lengths)], dtype=torch.int32)
+    rows = (
+        torch.arange(requests, 0, -1, dtype=i32) if requests is not None
+        else torch.tensor([4, 1, 5, 0, 2][: len(lengths)], dtype=i32)
+    )
     state_metadata = torch.full((len(lengths), 2 + (max(lengths) + CHUNK_TILE - 1) // CHUNK_TILE), -1, dtype=i32)
     state_metadata[:, :2] = rows.unsqueeze(1)
-    if case == "paged":
+    if requests is None and case == "paged":
         state_metadata[:, 1] = torch.tensor([0, 2], dtype=i32)
         state_metadata[0, 2:4] = torch.tensor([3, 5], dtype=i32)
 
@@ -1741,13 +1764,27 @@ def _decode_golden_tensors(tensors) -> None:
     tensors["recurrent_state"][:] = state
 
 
-def decode_build_tensor_specs(tokens: int = 5):
+def decode_build_tensor_specs(tokens: int = 5, *, initial_state: str = "nonzero"):
     from golden import TensorSpec
 
     bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
+    if tokens < 1:
+        raise ValueError("tokens must be positive")
+    if initial_state not in ("zero", "nonzero"):
+        raise ValueError("initial_state must be zero or nonzero")
+    pool_rows = max(DECODE_POOL_ROWS, tokens + 1)
+
+    def init_state():
+        state = torch.zeros(pool_rows, LOCAL_KDA_H, KDA_DIM, KDA_DIM)
+        if initial_state == "nonzero":
+            state.normal_().mul_(0.1)
+        return state
     # Deliberately not the identity mapping: a kernel that ignored state_rows and used
     # the token index would pass an identity fixture.
-    rows = torch.tensor([4, 1, 5, 0, 3][:tokens], dtype=torch.int32)
+    rows = (
+        torch.tensor([4, 1, 5, 0, 3][:tokens], dtype=i32) if tokens <= 5
+        else torch.arange(tokens, 0, -1, dtype=i32)
+    )
 
     return [
         TensorSpec("query", [tokens, LOCAL_KDA_H, KDA_DIM], bf, init_value=lambda : torch.randn(tokens, LOCAL_KDA_H, KDA_DIM).to(bf)),
@@ -1760,7 +1797,7 @@ def decode_build_tensor_specs(tokens: int = 5):
         # LOCAL_KDA_H columns are read.
         TensorSpec("beta", [tokens, BETA_PAD], f32, init_value=lambda: torch.rand(tokens, BETA_PAD)),
         # A non-zero initial state, so a kernel that silently starts from zero fails.
-        TensorSpec("recurrent_state", [DECODE_POOL_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], f32, init_value=lambda : torch.randn(DECODE_POOL_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM) * 0.1),
+        TensorSpec("recurrent_state", [pool_rows, LOCAL_KDA_H, KDA_DIM, KDA_DIM], f32, init_value=init_state),
         TensorSpec("state_rows", [tokens], i32, init_value=lambda: rows),
         TensorSpec("output", [tokens, LOCAL_KDA_H, KDA_DIM], bf),
     ]
@@ -1908,21 +1945,42 @@ def _prefill_golden_tensors(tensors) -> None:
     tensors["recurrent_state"][:] = state
 
 
-def prefill_build_tensor_specs(case: str = "ragged"):
+def prefill_build_tensor_specs(
+    case: str = "ragged", *, requests: int | None = None, tokens: int | None = None,
+    initial_state: str | None = None,
+):
     """``zerostate`` is a diagnostic: it isolates the carried state from everything else."""
     from golden import TensorSpec
 
     bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
-    lengths = _LENGTHS[case]
+    custom = requests is not None or tokens is not None
+    if custom:
+        requests = 1 if requests is None else requests
+        if requests < 1 or tokens is None or tokens < requests or tokens % requests:
+            raise ValueError("tokens must be positive and evenly divisible by requests")
+    if initial_state not in (None, "zero", "nonzero"):
+        raise ValueError("initial_state must be zero or nonzero")
+    zero_state = initial_state == "zero" or (initial_state is None and case == "zerostate")
+    lengths = [tokens // requests] * requests if custom else _LENGTHS[case]
+    pool_rows = requests + 1 if custom else PREFILL_POOL_ROWS
+
+    def init_state():
+        state = torch.zeros(pool_rows, LOCAL_KDA_H, KDA_DIM, KDA_DIM)
+        if not zero_state:
+            state.normal_().mul_(0.1)
+        return state
     starts = [0]
     for length in lengths:
         starts.append(starts[-1] + length)
     tokens = starts[-1]
-    rows = torch.tensor([4, 1, 5][: len(lengths)], dtype=torch.int32)
+    rows = (
+        torch.arange(requests, 0, -1, dtype=i32) if custom
+        else torch.tensor([4, 1, 5][: len(lengths)], dtype=i32)
+    )
 
     state_metadata = torch.full((len(lengths), 2 + (max(lengths) + CHUNK_TILE - 1) // CHUNK_TILE), -1, dtype=i32)
     state_metadata[:, :2] = rows.unsqueeze(1)
-    if case == "paged":
+    if not custom and case == "paged":
         state_metadata[:, 1] = torch.tensor([0, 2], dtype=i32)
         state_metadata[0, 2:4] = torch.tensor([3, 5], dtype=i32)
 
@@ -1943,7 +2001,7 @@ def prefill_build_tensor_specs(case: str = "ragged"):
         # LOCAL_KDA_H columns are read.
         TensorSpec("beta", [tokens, BETA_PAD], f32, init_value=(lambda : torch.zeros(tokens, BETA_PAD)) if case == "nobeta" else lambda : torch.rand(tokens, BETA_PAD)),
         # Non-zero, so a dropped carry or a transposed seed is visible.
-        TensorSpec("recurrent_state", [PREFILL_POOL_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], f32, init_value=(lambda : torch.zeros(PREFILL_POOL_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM)) if case == "zerostate" else lambda : torch.randn(PREFILL_POOL_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM) * 0.1),
+        TensorSpec("recurrent_state", [pool_rows, LOCAL_KDA_H, KDA_DIM, KDA_DIM], f32, init_value=init_state),
         TensorSpec("query_start_loc", [len(starts)], i32, init_value=lambda : torch.tensor(starts, dtype=torch.int32)),
         TensorSpec("state_rows", list(state_metadata.shape), i32, init_value=state_metadata),
         TensorSpec("tri_incl", [CHUNK_TILE, CHUNK_TILE], f32, init_value=lambda : torch.tril(torch.ones(CHUNK_TILE, CHUNK_TILE))),
@@ -1968,15 +2026,31 @@ def run_convolution_case(argv=None):
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "single", "long", "paged", "decode", "decode-single"])
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
+    parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "single", "long", "paged", "decode", "decode-single", "verify"])
+    parser.add_argument("--requests", type=int)
+    parser.add_argument("--query-len", type=int, default=1)
+    parser.add_argument("--initial-state", choices=["zero", "nonzero"], default="nonzero")
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
+
+    if args.case == "verify" and (args.requests is None or args.query_len < 2):
+        parser.error("--case verify requires --requests and --query-len >= 2")
+    if args.requests is not None and args.requests < 1:
+        parser.error("--requests must be positive")
+    if args.query_len < 1:
+        parser.error("--query-len must be positive")
+    if args.case != "verify" and args.query_len != 1:
+        parser.error("multiple tokens per request require --case verify")
 
     decode = args.case.startswith("decode")
     case = "single" if args.case == "decode-single" else ("ragged" if decode else args.case)
     result = run(
         fn=kda_conv_decode_test if decode else kda_conv_prefill_test,
-        specs=conv_build_tensor_specs(case, decode),
+        specs=conv_build_tensor_specs(
+            case, decode, requests=args.requests, query_len=args.query_len, initial_state=args.initial_state,
+        ),
         golden_fn=_golden_decode_tensors if decode else _golden_prefill_tensors,
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=0.02,
@@ -1986,6 +2060,8 @@ def run_convolution_case(argv=None):
         if result.error:
             print(result.error)
         raise SystemExit(1)
+    if args.case == "verify" or args.requests is not None:
+        return
 
     def boundary_key_compare(actual, expected, *, rtol, atol, **_kwargs):
         from golden import ratio_allclose
@@ -2023,11 +2099,16 @@ def run_projection_case(argv=None):
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
     parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "aligned", "single"])
+    parser.add_argument("--tokens", type=int)
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
-    tokens = {"ragged": 67, "aligned": 64, "single": 1}[args.case]
+    tokens = {"ragged": 67, "aligned": 64, "single": 1}[args.case] if args.tokens is None else args.tokens
+    if tokens < 1:
+        parser.error("--tokens must be positive")
     result = run(
         fn=kda_projection_test,
         specs=projection_build_tensor_specs(tokens),
@@ -2052,11 +2133,16 @@ def run_output_case(argv=None):
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
     parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "aligned", "single"])
+    parser.add_argument("--tokens", type=int)
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
-    tokens = {"ragged": 67, "aligned": 64, "single": 1}[args.case]
+    tokens = {"ragged": 67, "aligned": 64, "single": 1}[args.case] if args.tokens is None else args.tokens
+    if tokens < 1:
+        parser.error("--tokens must be positive")
     result = run(
         fn=kda_output_test,
         specs=output_build_tensor_specs(tokens),
@@ -2082,14 +2168,28 @@ def run_decode_case(argv=None):
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
     parser.add_argument("--case", type=str, default="batch", choices=["batch", "single"])
+    parser.add_argument("--requests", type=int)
+    parser.add_argument("--query-len", type=int, default=1)
+    parser.add_argument("--initial-state", choices=["zero", "nonzero"], default="nonzero")
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
+    requests = (1 if args.case == "single" else 5) if args.requests is None else args.requests
+    if requests < 1 or args.query_len < 1:
+        parser.error("--requests and --query-len must be positive")
+    multi_token = args.query_len > 1
+    specs = (
+        prefill_build_tensor_specs(
+            requests=requests, tokens=requests * args.query_len, initial_state=args.initial_state,
+        ) if multi_token else decode_build_tensor_specs(requests, initial_state=args.initial_state)
+    )
     result = run(
-        fn=decode_kda_test,
-        specs=decode_build_tensor_specs(1 if args.case == "single" else 5),
-        golden_fn=_decode_golden_tensors,
+        fn=prefill_kda_test if multi_token else decode_kda_test,
+        specs=specs,
+        golden_fn=_prefill_golden_tensors if multi_token else _decode_golden_tensors,
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=0.02,
         atol=0.02,
@@ -2110,13 +2210,24 @@ def run_prefill_case(argv=None):
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
     parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "single", "aligned", "zerostate", "nobeta", "paged"])
+    parser.add_argument("--requests", type=int)
+    parser.add_argument("--tokens", type=int)
+    parser.add_argument("--initial-state", choices=["zero", "nonzero"])
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
+    if args.requests is not None or args.tokens is not None:
+        requests = 1 if args.requests is None else args.requests
+        if requests < 1 or args.tokens is None or args.tokens < requests or args.tokens % requests:
+            parser.error("--tokens must be positive and evenly divisible by --requests")
     result = run(
         fn=prefill_kda_test,
-        specs=prefill_build_tensor_specs(args.case),
+        specs=prefill_build_tensor_specs(
+            args.case, requests=args.requests, tokens=args.tokens, initial_state=args.initial_state,
+        ),
         golden_fn=_prefill_golden_tensors,
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=0.02,

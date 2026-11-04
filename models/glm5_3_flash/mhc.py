@@ -407,6 +407,28 @@ def mhc_mixes_test(
     return residual_mix
 
 
+@pl.jit
+def mhc_pre_full_test(
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    function: pl.Tensor[[MIX_HC, HC_DIM], pl.BF16],
+    scale: pl.Tensor[[3], pl.FP32],
+    base: pl.Tensor[[MIX_HC], pl.FP32],
+    pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    post_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    residual_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32]],
+    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+):
+    """Compose coefficient generation and stream collapse in one entry."""
+    x_hc.bind_dynamic(0, T_DYN)
+    pre_mix.bind_dynamic(0, T_DYN)
+    post_mix.bind_dynamic(0, T_DYN)
+    residual_mix.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, T_DYN)
+    mhc_mixes(x_hc, function, scale, base, pre_mix, post_mix, residual_mix)
+    mhc_pre(x_hc, pre_mix, output)
+    return output
+
+
 @pl.jit.inline
 def seed_hc_streams(
     embedding_rows: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -530,7 +552,7 @@ def build_mhc_pre_tensor_specs(tokens: int = 20):
     ]
 
 
-def build_mhc_post_tensor_specs(tokens: int = 20):
+def build_mhc_post_tensor_specs(tokens: int = 20, seed: int = 101):
     """Build one deterministic residual expansion at the real hidden size.
 
     ``residual_mix`` is drawn doubly stochastic, which is what the 20 Sinkhorn
@@ -539,7 +561,7 @@ def build_mhc_post_tensor_specs(tokens: int = 20):
     """
     from golden import TensorSpec
 
-    generator = torch.Generator().manual_seed(101)
+    generator = torch.Generator().manual_seed(seed)
 
     def init_sublayer():
         return torch.randn(tokens, D, generator=generator).bfloat16()
@@ -598,11 +620,11 @@ def golden_mhc_head_case(tensors):
     tensors["output"][:] = hc_head(tensors["x_hc"])
 
 
-def build_mhc_mixes_tensor_specs(tokens: int = 20):
+def build_mhc_mixes_tensor_specs(tokens: int = 20, seed: int = 3):
     """Build deterministic inputs and outputs for coefficient validation."""
     from golden import TensorSpec
 
-    generator = torch.Generator().manual_seed(3)
+    generator = torch.Generator().manual_seed(seed)
 
     def init_x_hc():
         return torch.randn(tokens, HC_MULT, D, generator=generator).bfloat16()
@@ -635,6 +657,20 @@ def golden_mhc_mixes_case(tensors):
     tensors["pre_mix"][:] = pre_mix
     tensors["post_mix"][:] = post_mix
     tensors["residual_mix"][:] = residual_mix
+
+
+def build_mhc_pre_full_tensor_specs(tokens: int, seed: int):
+    """Use the coefficient fixture and publish its collapsed stream."""
+    from golden import TensorSpec
+
+    return build_mhc_mixes_tensor_specs(tokens, seed) + [
+        TensorSpec("output", [tokens, D], torch.bfloat16),
+    ]
+
+
+def golden_mhc_pre_full_case(tensors):
+    golden_mhc_mixes_case(tensors)
+    tensors["output"][:] = golden_mhc_pre(tensors["x_hc"], tensors["pre_mix"])
 
 
 def _check_mhc_replicated_quadrants_equal_four_by_four_sinkhorn():
@@ -808,21 +844,29 @@ def main():
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tokens", type=int, default=20)
+    parser.add_argument("--tp", type=int, default=16)
+    parser.add_argument("--ep", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--case", choices=["all", "mixes", "pre", "post", "head"], default="all")
+    parser.add_argument("--case", choices=["all", "mixes", "pre", "pre-full", "post", "head"], default="all")
     parser.add_argument("--golden-only", action="store_true")
     args = parser.parse_args()
+    if args.tokens < 1:
+        parser.error("--tokens must be positive")
     run_mhc_boundary_goldens()
     if args.golden_only:
         return
 
     compare = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
     cases = (
-        ("mixes", mhc_mixes_test, build_mhc_mixes_tensor_specs(args.tokens), golden_mhc_mixes_case),
+        ("mixes", mhc_mixes_test, build_mhc_mixes_tensor_specs(args.tokens, 3 if args.seed is None else args.seed), golden_mhc_mixes_case),
         ("pre", mhc_pre_test, build_mhc_pre_tensor_specs(args.tokens), golden_mhc_pre_case),
-        ("post", mhc_post_test, build_mhc_post_tensor_specs(args.tokens), golden_mhc_post_case),
+        ("post", mhc_post_test, build_mhc_post_tensor_specs(args.tokens, 101 if args.seed is None else args.seed), golden_mhc_post_case),
         ("head", mhc_head_test, build_mhc_head_tensor_specs(args.tokens), golden_mhc_head_case),
     )
+    if args.case == "pre-full":
+        seed = args.seed if args.seed is not None else 3
+        cases = (("pre-full", mhc_pre_full_test, build_mhc_pre_full_tensor_specs(args.tokens, seed), golden_mhc_pre_full_case),)
     for name, fn, specs, golden_fn in cases:
         if args.case not in ("all", name):
             continue
@@ -833,7 +877,7 @@ def main():
             config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
             rtol=1.0 / 128,
             atol=0.0001,
-            compare_fn={key: ratio_allclose(atol=1e-05, rtol=0.001) for key in ("pre_mix", "post_mix", "residual_mix")} if name == "mixes" else {"output": compare},
+            compare_fn={**{key: ratio_allclose(atol=1e-05, rtol=0.001) for key in ("pre_mix", "post_mix", "residual_mix")}, "output": compare} if name in ("mixes", "pre-full") else {"output": compare},
             compile_only=args.compile_only,
         )
         print(f"{name}: {result}")

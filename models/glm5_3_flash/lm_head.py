@@ -417,7 +417,7 @@ def run_fp32_case(options, device_id):
 
     @lru_cache(maxsize=1)
     def inputs():
-        generator = torch.Generator().manual_seed(5357)
+        generator = torch.Generator().manual_seed(options.seed)
         x = component_hidden(options, D, generator)
         weight = torch.zeros(FP32_HEAD_VOCAB_PAD, D, dtype=torch.float32)
         if options.checkpoint is None:
@@ -660,6 +660,7 @@ def main():
     parser.add_argument("--hidden-input", type=Path)
     parser.add_argument("--tokens", type=int, default=17)
     parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=5357)
     args = parser.parse_args()
     device_ids = [int(device) for device in args.device.split(",")]
     if args.checkpoint is not None or args.hidden_input is not None:
