@@ -1,9 +1,56 @@
 # DeepSeek V4-Flash low-latency decode
 
-This directory introduces batch-one decode primitives for eight logical
-ranks, with eight token rows by default. Attention/MoE components and the
-composed forward are supplied by the subsequent parts of this feature.
-This is experimental code, not a `pypto-serving` deployment contract.
+This directory contains batch-one attention and MoE components for eight
+logical ranks. They build on the configuration and primitives in the same
+directory; the composed forward is supplied separately. The default
+verification width is eight tokens. This is experimental code, not a
+`pypto-serving` deployment contract.
+
+## Precision contract
+
+The HC stream and residuals use FP32. Local attention and expert tensors
+also use BF16; integer projections accumulate INT8 operands as INT32 before
+applying the original FP32 row and channel scales.
+
+The independent Torch references preserve BF16 Cube K16 and FP32 Cube K4
+accumulation, ascending split-K reductions and per-group projection scales. Float64
+intermediates model each product group's FP32 rounding; model operands
+and outputs keep their declared dtypes. This does not establish universal
+bitwise equivalence or replace the existing numerical comparisons.
+
+Gate quantization compensates the FP32 `127 / amax` quotient before the
+original INT8 rounding, with power-of-two range normalization for large
+finite denominators. Deferred RMS and dequantization order are unchanged.
+Standalone Q validation checks its produced head group; the other pure-Out
+heads have no initialized-value guarantee.
+
+Gate, QKV and SWA share scope-local FP32 compensation primitives in
+`fp32_numerics.py`; these helpers create no tasks or global-memory buffers.
+The gate's softplus evaluates `log(1 + exp(-abs(x)))` before adding the
+nonnegative part of the input. Its logarithm correction consumes the
+unrounded two-part sum. The square-root correction applies within
+`[2^-40, 2^40]` and retains the original square-root result outside that
+interval. Owning Torch references round double-precision unary results to
+FP32 at the specified boundaries and preserve the explicit reduction order.
+Finite-case validation does not establish correctly rounded results for
+every FP32 input or replace complete-forward validation.
+
+The attention and final RMSNorm references reduce FP32 squared inputs in
+FP64, then round the sum once to FP32. The mean and epsilon addition remain
+FP32; the inverse square root is evaluated in FP64 and rounded to FP32.
+This specifies the reference's statistical precision without changing epsilon,
+activation dtypes, or the numerical comparison thresholds.
+
+RMSNorm compensates its pairwise FP32 square-sum and refines the reciprocal-
+square-root seed with a product-error residual. The compensated reduction
+applies when the original squared sum is at most `2^40`; the inverse correction
+applies for variance at most `2^40`. Larger values retain the original path.
+The reference and comparison thresholds are unchanged. Finite input tests do
+not establish all-domain correctly rounded arithmetic or a performance gain.
+
+Q/KV kernels use
+the existing square-root correction and compensated reciprocal at their
+separately rounded FP32 inverse boundaries.
 
 ## Reproducible reduction order
 
@@ -20,6 +67,18 @@ An ordered reduction adds the splits before the original gate, residual mix,
 and BF16 conversion. The split-local matrix multiplication and RMS arithmetic
 retain their original order.
 
+HC-pre Sinkhorn column sums use the explicit four-row pairing
+`(row0 + row1) + (row2 + row3)` in both implementations.
+
+SWA, HCA, and CSA softmax use a compensated, range-reduced FP32 exponential for finite
+max-subtracted scores in `[-80, 0]`, with the existing exponential outside
+that interval. SWA/HCA use a 128-element denominator tree; CSA uses a
+32-element tree. Each level pairs the two halves with FP32 additions. The independent
+Torch reference evaluates the exponential in double precision before FP32
+rounding and uses the same specified addition order. HCA/CSA compensate their
+final FP32 quotient before the existing BF16 packing. This does not claim
+correct rounding for every FP32 input or complete-forward agreement.
+
 These rules make the reduction order explicit. They do not establish bitwise
 equivalence across different hardware, compiler revisions, or other operations
 that use different arithmetic order.
@@ -31,6 +90,38 @@ readback. Its current callers use a fixed notify count of one. A retained
 single window must be reused only after all ranks finish the previous
 invocation; overlapping reuse is outside this contract.
 
+## Complete-set Indexer ordering
+
+When the number of visible compressed positions is no greater than `IDX_TOPK`,
+all visible positions are selected in ascending position order, including the
+original index offset. This gives single-query and grouped-query consumers the
+same attention accumulation order for the complete set. Score computation and
+cache updates are unchanged.
+
+For more than `IDX_TOPK` visible positions, the original score-based selection
+and tie handling remain in place. The validator requires exact positional
+indices for complete sets and retains the score-aware comparator for selected
+subsets. The boundary between these cases must be included when validating a
+new request layout.
+
+## Retired expert experiments
+
+The model uses the planned persistent routed-expert kernel. The shared expert
+occupies its own entry in that weight bank rather than a separate FFN chain.
+Its fixture weight generator remains in `utils.py`.
+
+An earlier scatter epilogue replaced the per-slot BF16 output and local gather
+with FP32 atomic accumulation into token rows. The recorded A2/A3 TP8, T8
+comparison used 20 rounds after three warmups and the fastest-rank mean:
+244.5 us for the retained MoE path versus 269.0 us for scatter, across three
+pairs. The standalone kernels measured 129.7 versus 136.8 us. These are
+historical component measurements, not request TPOT or an isolated estimate
+of scatter cost: task boundaries, initialization, stores, and rounding also
+changed. The mechanism's behavior at larger token or route counts remains
+unproven. The retired scatter and unused persistent A/B variants are omitted
+from the runnable model; re-evaluate with real consumer inputs if that scope
+changes.
+
 ## Execution shapes and component ownership
 
 `config.py` holds model configuration and quantization constants.
@@ -40,7 +131,7 @@ validation start-position defaults live with the host utilities.
 
 The attention-component part supplies `rope_interleave.py` and
 `o_proj_grouped.py` together with their first Indexer/compressor and standalone
-attention consumers. The former prepares batch-indexed half-width RoPE tables;
+attention consumers. The former prepares query-token or compression-boundary RoPE tables;
 QKV metadata preparation separately handles dynamic token tiles and its swap
 indices.
 
@@ -93,3 +184,11 @@ resulting binaries, original consumers, and complete relevant request paths.
 See [precision tuning](../../debug-and-tune/precision-tuning.md) and the
 [compile/runtime workflow](../../run-and-validate/compile-runtime-workflow.md)
 for validation and artifact handling.
+
+### Ratio-4 verification-step boundaries
+
+The main and indexer compressors pool every boundary with a nonnegative compressed-cache slot mapping. `kv[b, o]` contains boundary ordinal `o` within the step: row zero remains the first boundary. Unmapped ordinals and remaining rows have no output write contract. With eight tokens, starts 0, 4 and 121 produce boundaries 3/7, 7/11 and 123/127 respectively when both cache slots are admitted.
+
+Pooling consumes the current step's projected rows directly, including speculative rows without persistent state slots, and reads earlier prefix rows through the state block table. All pools precede persistent scatter; only nonnegative state slot mappings authorize that scatter. An early advance recomputes remaining tokens from the new step inputs and the committed prefix, without promoting rejected tokens into persistent state.
+
+Indexer query RoPE tables have one row per absolute query-token position. Compression RoPE tables are separate, indexed by boundary ordinal and aligned to each four-token window start. For a step starting at 8193, the first boundary 8195 uses compression position 8192; its query still uses its own absolute position. Standalone half-width tables are flattened `[B*S, rope_dim/2]`; the indexer additionally takes `inner_cos` and `inner_sin` for aligned compression windows. CSA derives both tables from its existing full RoPE inputs.
