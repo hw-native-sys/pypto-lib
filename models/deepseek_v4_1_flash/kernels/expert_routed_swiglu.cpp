@@ -26,6 +26,8 @@ namespace {
 constexpr int ROW_TILE = 16;
 constexpr int COL_TILE = 768;
 constexpr int SCALE_COLS = COL_TILE / 32;
+constexpr int SCALE_STRIDE = 32;
+constexpr int INPUT_BYTES = ROW_TILE * COL_TILE * sizeof(bfloat16_t);
 
 template <typename T>
 AICORE inline __gm__ T* tensorData(__gm__ int64_t* args, uint32_t index)
@@ -35,12 +37,12 @@ AICORE inline __gm__ T* tensorData(__gm__ int64_t* args, uint32_t index)
     return reinterpret_cast<__gm__ T*>(tensor->buffer.addr) + tensor->start_offset;
 }
 
-AICORE inline void activateQuantize(__ubuf__ float* gate, __ubuf__ float* up,
+AICORE inline void activateQuantize(__ubuf__ bfloat16_t* gate, __ubuf__ bfloat16_t* up,
                                    __ubuf__ float* weights, __ubuf__ uint8_t* out,
                                    __ubuf__ uint8_t* codes, uint16_t validRows, uint16_t validCols)
 {
 #if defined(__CPU_SIM)
-    using Input = Tile<TileType::Vec, float, ROW_TILE, COL_TILE>;
+    using Input = Tile<TileType::Vec, bfloat16_t, ROW_TILE, COL_TILE>;
     using Weight = Tile<TileType::Vec, float, 1, ROW_TILE>;
     using Output = Tile<TileType::Vec, uint8_t, ROW_TILE, COL_TILE>;
     using Codes = Tile<TileType::Vec, uint8_t, 1, ROW_TILE * SCALE_COLS>;
@@ -58,7 +60,7 @@ AICORE inline void activateQuantize(__ubuf__ float* gate, __ubuf__ float* up,
     weights = weightTile.data();
     out = outputTile.data();
     codes = codeTile.data();
-    for (uint16_t row = 0; row < ROW_TILE; ++row) {
+    for (uint16_t row = 0; row < validRows; ++row) {
         for (uint16_t group = 0; group < validCols / 32; ++group) {
             float values[32] = {};
             float maximum = 1e-4f;
@@ -75,7 +77,7 @@ AICORE inline void activateQuantize(__ubuf__ float* gate, __ubuf__ float* up,
             uint32_t bits;
             std::memcpy(&bits, &maximum, sizeof(bits));
             const uint32_t exponent = (bits + 8388607) >> 23;
-            codes[(group / 2) * 32 + row * 2 + group % 2] = static_cast<uint8_t>(exponent);
+            codes[row * SCALE_STRIDE + group] = static_cast<uint8_t>(exponent);
             bits = (254 - exponent) << 23;
             float reciprocal;
             std::memcpy(&reciprocal, &bits, sizeof(reciprocal));
@@ -90,6 +92,7 @@ AICORE inline void activateQuantize(__ubuf__ float* gate, __ubuf__ float* up,
     __VEC_SCOPE__ {
         constexpr auto halfStore = static_cast<::DistVST>(pto::DistVST::DIST_ONEPT_B16);
         vector_bool all = pset_b32(PAT_ALL);
+        vector_bool all16 = pset_b16(PAT_ALL);
         vector_bool lower = pset_b32(PAT_VL32);
         vector_bool upper;
         pnot(upper, lower, all);
@@ -103,10 +106,13 @@ AICORE inline void activateQuantize(__ubuf__ float* gate, __ubuf__ float* up,
             vlds(weight, weights, row, BRC_B32);
             for (uint16_t col = 0; col < validCols; col += 128) {
                 vector_f32 g0, g1, u0, u1;
-                vlds(g0, gate, row * COL_TILE + col, NORM);
-                vlds(g1, gate, row * COL_TILE + col + 64, NORM);
-                vlds(u0, up, row * COL_TILE + col, NORM);
-                vlds(u1, up, row * COL_TILE + col + 64, NORM);
+                RegTensor<bfloat16_t> g16, u16;
+                vlds(g16, gate, row * COL_TILE + col, NORM);
+                vlds(u16, up, row * COL_TILE + col, NORM);
+                vcvt(g0, g16, all16, PART_EVEN);
+                vcvt(g1, g16, all16, PART_ODD);
+                vcvt(u0, u16, all16, PART_EVEN);
+                vcvt(u1, u16, all16, PART_ODD);
                 vmins(g0, g0, 10.0f, all);
                 vmins(g1, g1, 10.0f, all);
                 vmins(u0, u0, 10.0f, all);
@@ -126,8 +132,8 @@ AICORE inline void activateQuantize(__ubuf__ float* gate, __ubuf__ float* up,
                 vmul(hiddenHigh, hiddenHigh, u1, all);
                 vmul(hiddenLow, hiddenLow, weight, all);
                 vmul(hiddenHigh, hiddenHigh, weight, all);
-                vector_f32 h0, h1;
-                vdintlv(h0, h1, hiddenLow, hiddenHigh);
+                vector_f32 h0 = hiddenLow;
+                vector_f32 h1 = hiddenHigh;
                 vector_f32 magnitude0, magnitude1, maximum, groups, even, odd;
                 vabs(magnitude0, h0, all);
                 vabs(magnitude1, h1, all);
@@ -144,13 +150,8 @@ AICORE inline void activateQuantize(__ubuf__ float* gate, __ubuf__ float* up,
                 vector_u8 packed8;
                 vpack(packed16, (vector_u32&)exponent, LOWER);
                 vpack(packed8, packed16, LOWER);
-                const uint16_t scaleOffset = (col / 64) * 32 + row * 2;
-                vsts((vector_u16&)packed8, (__ubuf__ uint16_t*)codes, scaleOffset / 2,
-                     std::integral_constant<::DistVST, halfStore>(), one16);
-                vector_s32 highExponent;
-                vshrs(highExponent, (vector_s32&)packed8, 16, one);
-                vsts((vector_u16&)highExponent, (__ubuf__ uint16_t*)codes, (scaleOffset + 32) / 2,
-                     std::integral_constant<::DistVST, halfStore>(), one16);
+                vsts((vector_u32&)packed8, (__ubuf__ uint32_t*)codes,
+                     (row * SCALE_STRIDE + col / 32) / 4, ONEPT_B32, one);
                 vsub(reciprocal, maxReciprocalExponent, exponent, four);
                 vshls(reciprocal, reciprocal, 23, four);
                 vintlv(expanded, unused, reciprocal, reciprocal);
@@ -168,109 +169,112 @@ AICORE inline void activateQuantize(__ubuf__ float* gate, __ubuf__ float* up,
                 vsts((vector_u8&)payload1, out, row * COL_TILE + col + 64, PK4_B32, all);
             }
         }
-        if (validRows < ROW_TILE) {
-            vector_f32 zero;
-            vector_f8e4m3 zeroPayload;
-            vector_s32 zeroExponent;
-            vbr(zero, 0.0f);
-            vcvt(zeroPayload, zero, all, ROUND_R, RS_ENABLE, PART_P0);
-            vbr(zeroExponent, 105 | (105 << 8));
-            for (uint16_t row = validRows; row < ROW_TILE; ++row) {
-                for (uint16_t col = 0; col < validCols; col += 64) {
-                    const uint16_t scaleOffset = (col / 64) * 32 + row * 2;
-                    vsts((vector_u16&)zeroExponent, (__ubuf__ uint16_t*)codes, scaleOffset / 2,
-                         std::integral_constant<::DistVST, halfStore>(), one16);
-                    vsts((vector_u8&)zeroPayload, out, row * COL_TILE + col, PK4_B32, all);
-                }
-            }
-        }
+
     }
 #endif
 }
 
 }  // namespace
 
+
+AICORE inline void reduceCounts(__ubuf__ int32_t* input, uint16_t count)
+{
+#if defined(__CPU_SIM)
+    int32_t total = 0;
+    for (uint16_t e = 0; e < count; ++e) total += input[e];
+    input[0] = total;
+#else
+    __VEC_SCOPE__ {
+        vector_s32 total;
+        vbr(total, 0);
+        vector_bool one = pset_b32(PAT_VL1);
+        uint32_t remaining = count;
+        for (uint16_t offset = 0; offset < count; offset += 64) {
+            vector_bool mask = plt_b32(remaining, POST_UPDATE);
+            vector_s32 values, sum;
+            vlds(values, input, offset, NORM);
+            vcadd(sum, values, mask, MODE_ZEROING);
+            vadd(total, total, sum, one);
+        }
+        vsts(total, input, 0, ONEPT_B32, one);
+    }
+#endif
+}
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {
-    auto* gate = tensorData<float>(args, 0);
-    auto* up = gate;
+    auto* pair = tensorData<bfloat16_t>(args, 0);
     auto* weights = tensorData<float>(args, 1);
     auto* counts = tensorData<int32_t>(args, 2);
     auto* out = tensorData<uint8_t>(args, 3);
     auto* scales = tensorData<uint8_t>(args, 4);
     const int64_t experts = args[5];
-    const int64_t rowStride = args[6];
     const int64_t width = args[7];
     const int64_t block = get_block_idx(args);
     const int64_t blocks = get_block_num(args);
-    const int64_t colTiles = (width + COL_TILE - 1) / COL_TILE;
-
-    using Input = Tile<TileType::Vec, float, ROW_TILE, COL_TILE, BLayout::RowMajor, ROW_TILE, DYNAMIC>;
-    using Weight = Tile<TileType::Vec, float, 1, ROW_TILE>;
-    using Output = Tile<TileType::Vec, uint8_t, ROW_TILE, COL_TILE, BLayout::RowMajor, ROW_TILE, DYNAMIC>;
-    using Codes = Tile<TileType::Vec, uint8_t, 1, ROW_TILE * SCALE_COLS, BLayout::RowMajor, 1, DYNAMIC>;
+    using Counts = Tile<TileType::Vec, int32_t, 1, 256, BLayout::RowMajor, 1, DYNAMIC>;
+    using GlobalCounts = GlobalTensor<int32_t, Shape<1, 1, 1, 1, DYNAMIC>, pto::Stride<1, 1, 1, 1, 1>>;
+    Counts localCounts;
+    TASSIGN(localCounts, 65536);
+    int64_t rows = 0;
+    for (int64_t first = 0; first < experts; first += 256) {
+        const int64_t entries = experts - first < 256 ? experts - first : 256;
+        localCounts.SetValidCol(entries);
+        GlobalCounts gc(counts + first, GlobalCounts::Shape(1, 1, 1, 1, entries));
+        TLOAD(localCounts, gc);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID3);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID3);
+        reduceCounts(localCounts.data(), entries);
+        set_flag(PIPE_V, PIPE_S, EVENT_ID3);
+        wait_flag(PIPE_V, PIPE_S, EVENT_ID3);
+        rows += localCounts.data()[0];
+    }
+    using Input = Tile<TileType::Vec, bfloat16_t, ROW_TILE, COL_TILE, BLayout::RowMajor, DYNAMIC, DYNAMIC>;
+    using Weight = Tile<TileType::Vec, float, 1, ROW_TILE, BLayout::RowMajor, 1, DYNAMIC>;
+    using Output = Tile<TileType::Vec, uint8_t, ROW_TILE, COL_TILE, BLayout::RowMajor, DYNAMIC, DYNAMIC>;
+    using Codes = Tile<TileType::Vec, uint8_t, ROW_TILE, SCALE_STRIDE, BLayout::RowMajor, DYNAMIC, DYNAMIC>;
     Input gateTile, upTile;
     Weight weightTile;
     Output outputTile;
-    Codes codes;
+    Codes codeTile;
     TASSIGN(gateTile, 0);
-    TASSIGN(upTile, ROW_TILE * COL_TILE * 4);
-    TASSIGN(weightTile, ROW_TILE * COL_TILE * 8);
-    TASSIGN(outputTile, ROW_TILE * COL_TILE * 8 + 64);
-    TASSIGN(codes, ROW_TILE * COL_TILE * 9 + 64);
-
-    using GlobalInput = GlobalTensor<float, Shape<1, 1, 1, ROW_TILE, DYNAMIC>,
-                                    pto::Stride<-1, -1, -1, -1, 1>>;
-    using GlobalWeight = GlobalTensor<float, Shape<1, 1, 1, 1, ROW_TILE>,
-                                     pto::Stride<ROW_TILE, ROW_TILE, ROW_TILE, ROW_TILE, 1>>;
-    using GlobalOutput = GlobalTensor<uint8_t, Shape<1, 1, 1, ROW_TILE, DYNAMIC>,
-                                     pto::Stride<-1, -1, -1, -1, 1>>;
-    using GlobalCodes = GlobalTensor<uint8_t, Shape<1, 1, 1, 1, DYNAMIC>,
-                                    pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
-
-    int64_t workBase = 0;
-    int64_t activationBase = 0;
-    for (int64_t expert = 0; expert < experts; ++expert) {
-        dcci(counts + expert, SINGLE_CACHE_LINE);
-        const int64_t count = counts[expert];
-        const int64_t workCount = ((count + ROW_TILE - 1) / ROW_TILE) * colTiles;
-        const int64_t firstWork = (block + blocks - workBase % blocks) % blocks;
-        for (int64_t work = firstWork; work < workCount; work += blocks) {
-            const int64_t localRow = (work / colTiles) * ROW_TILE;
-            const int64_t row = activationBase + localRow;
-            const int64_t col = (work % colTiles) * COL_TILE;
-            const uint16_t validCols = width - col < COL_TILE ? width - col : COL_TILE;
-            gateTile.SetValidCol(validCols);
-            upTile.SetValidCol(validCols);
-            outputTile.SetValidCol(validCols);
-            codes.SetValidCol(ROW_TILE * (validCols / 32));
-            const uint16_t validRows = count - localRow < ROW_TILE ? count - localRow : ROW_TILE;
-            const pto::Stride<-1, -1, -1, -1, 1> stride(ROW_TILE * width, ROW_TILE * width,
-                                                       ROW_TILE * width, width, 1);
-            const pto::Stride<-1, -1, -1, -1, 1> inputStride(ROW_TILE * width * 2, ROW_TILE * width * 2,
-                                                            ROW_TILE * width * 2, width * 2, 1);
-            GlobalInput globalGate(gate + row * width * 2 + col, GlobalInput::Shape(1, 1, 1, ROW_TILE, validCols), inputStride);
-            GlobalInput globalUp(up + row * width * 2 + width + col, GlobalInput::Shape(1, 1, 1, ROW_TILE, validCols), inputStride);
-            GlobalWeight globalWeight(weights + expert * rowStride + localRow);
-            TLOAD(gateTile, globalGate);
-            TLOAD(upTile, globalUp);
-            TLOAD(weightTile, globalWeight);
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            activateQuantize(gateTile.data(), upTile.data(), weightTile.data(), outputTile.data(),
-                             codes.data(), validRows, validCols);
-            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            GlobalOutput globalOut(out + row * width + col, GlobalOutput::Shape(1, 1, 1, ROW_TILE, validCols), stride);
-            const uint16_t codeBytes = ROW_TILE * (validCols / 32);
-            GlobalCodes globalScales(scales + row * (width / 32) + (col / COL_TILE) * ROW_TILE * SCALE_COLS,
-                                     GlobalCodes::Shape(1, 1, 1, 1, codeBytes),
-                                     GlobalCodes::Stride(codeBytes, codeBytes, codeBytes, codeBytes, 1));
-            TSTORE(globalOut, outputTile);
-            TSTORE(globalScales, codes);
-            pipe_barrier(PIPE_ALL);
-        }
-        workBase += workCount;
-        activationBase += (count + 15) / 16 * 16;
+    TASSIGN(upTile, INPUT_BYTES);
+    TASSIGN(weightTile, 2 * INPUT_BYTES);
+    TASSIGN(outputTile, 2 * INPUT_BYTES + 64);
+    TASSIGN(codeTile, 2 * INPUT_BYTES + 64 + ROW_TILE * COL_TILE);
+    using GI = GlobalTensor<bfloat16_t, Shape<1, 1, 1, DYNAMIC, DYNAMIC>, pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
+    using GW = GlobalTensor<float, Shape<1, 1, 1, 1, DYNAMIC>, pto::Stride<1, 1, 1, 1, 1>>;
+    using GO = GlobalTensor<uint8_t, Shape<1, 1, 1, DYNAMIC, DYNAMIC>, pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
+    const int64_t colTiles = (width + COL_TILE - 1) / COL_TILE;
+    const int64_t workCount = ((rows + ROW_TILE - 1) / ROW_TILE) * colTiles;
+    for (int64_t work = block; work < workCount; work += blocks) {
+        const int64_t row = work / colTiles * ROW_TILE;
+        const int64_t col = work % colTiles * COL_TILE;
+        const uint16_t validRows = rows - row < ROW_TILE ? rows - row : ROW_TILE;
+        const uint16_t validCols = width - col < COL_TILE ? width - col : COL_TILE;
+        gateTile.SetValidRow(validRows);
+        gateTile.SetValidCol(validCols);
+        upTile.SetValidRow(validRows);
+        upTile.SetValidCol(validCols);
+        weightTile.SetValidCol(validRows);
+        outputTile.SetValidRow(validRows);
+        outputTile.SetValidCol(validCols);
+        codeTile.SetValidRow(validRows);
+        codeTile.SetValidCol(validCols / 32);
+        GI gg(pair + row * width * 2 + col, GI::Shape(1, 1, 1, validRows, validCols), GI::Stride(1, 1, 1, width * 2, 1));
+        GI gu(pair + row * width * 2 + width + col, GI::Shape(1, 1, 1, validRows, validCols), GI::Stride(1, 1, 1, width * 2, 1));
+        GW gw(weights + row, GW::Shape(1, 1, 1, 1, validRows));
+        TLOAD(gateTile, gg);
+        TLOAD(upTile, gu);
+        TLOAD(weightTile, gw);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        activateQuantize(gateTile.data(), upTile.data(), weightTile.data(), outputTile.data(), codeTile.data(), validRows, validCols);
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        GO gy(out + row * width + col, GO::Shape(1, 1, 1, validRows, validCols), GO::Stride(1, 1, 1, width, 1));
+        GO gs(scales + row * (width / 32) + col / 32, GO::Shape(1, 1, 1, validRows, validCols / 32), GO::Stride(1, 1, 1, width / 32, 1));
+        TSTORE(gy, outputTile);
+        TSTORE(gs, codeTile);
+        pipe_barrier(PIPE_ALL);
     }
 }

@@ -176,11 +176,22 @@ AICORE inline void loadScaleStage(AScale& aScale, BScale& bScale,
     const int64_t q = k / 32;
     const int64_t globalQ = experts * q;
     const int64_t validQ = (limit - start < SCALE_STAGE_K ? limit - start : SCALE_STAGE_K) / 32;
+#ifdef COMPACT_ACTIVATIONS
+    // W2 scale rows are contiguous, with no padding between experts.
+    // Bound the last row tile by this expert's actual count.
+    const int64_t alignedRows = chunk.validRows;
+#else
     const int64_t alignedRows = ((chunk.validRows + 15) / 16) * 16;
+#endif
     aScale.SetValidRow(alignedRows);
     aScale.SetValidCol(validQ);
     bScale.SetValidRow(validQ);
+#ifdef COMPACT_ACTIVATIONS
+    // MX_A_ND uses row-major offsets; W13 input scales remain MX_A_ZZ.
+    const int64_t aOffset = chunk.stageRow * q + start / 32;
+#else
     const int64_t aOffset = chunk.stageRow * q + (start / 32) * 16;
+#endif
     const int64_t bOffset = n0 * globalQ + (chunk.expert * q + start / 32) * 16;
     GlobalAScale globalA(xScale + aOffset, typename GlobalAScale::Shape(alignedRows, validQ),
                         typename GlobalAScale::Stride(rows, q));
@@ -215,8 +226,13 @@ AICORE inline void computeProjection(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0
     using Acc = TileAccCompact<float, M, N_TILE, VALID_M>;
     using GlobalA = GlobalTensor<float8_e4m3_t, Shape<1, 1, 1, VALID_M, DYNAMIC>,
                                  pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
+#ifdef COMPACT_ACTIVATIONS
+    using GlobalAScale = GlobalTensor<float8_e8m0_t, TileShape2D<float8_e8m0_t, DYNAMIC, DYNAMIC, Layout::MX_A_ND>,
+                                      BaseShape2D<float8_e8m0_t, DYNAMIC, DYNAMIC, Layout::MX_A_ND>, Layout::MX_A_ND>;
+#else
     using GlobalAScale = GlobalTensor<float8_e8m0_t, TileShape2D<float8_e8m0_t, DYNAMIC, DYNAMIC, Layout::MX_A_ZZ>,
                                       BaseShape2D<float8_e8m0_t, DYNAMIC, DYNAMIC, Layout::MX_A_ZZ>, Layout::MX_A_ZZ>;
+#endif
     using GlobalBScale = GlobalTensor<float8_e8m0_t, TileShape2D<float8_e8m0_t, DYNAMIC, N_TILE, Layout::MX_B_NN>,
                                       BaseShape2D<float8_e8m0_t, DYNAMIC, DYNAMIC, Layout::MX_B_NN>, Layout::MX_B_NN>;
     MatA aMat[2];

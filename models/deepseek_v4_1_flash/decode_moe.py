@@ -125,7 +125,7 @@ def combine_scattered(
             if t < num_tokens:
                 shared_row = pl.load(shared_output, [t, 0], [1, D])
                 acc = pl.cast(shared_row, target_type=pl.FP32)
-                for k in pl.range(TOPK):
+                for k in pl.pipeline(TOPK, stage=2):
                     routed_row = pl.load(routed_output, [t * TOPK + k, 0], [1, D])
                     routed_fp32 = pl.cast(routed_row, target_type=pl.FP32)
                     acc = pl.add(acc, routed_fp32)
@@ -412,7 +412,7 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
 
     counts = _normalise_num_tokens(num_tokens)
     torch.manual_seed(41)
-    x = (torch.randn(EP_SIZE, MOE_TOKENS, D) * 0.25).to(torch.bfloat16)
+    _unused_x = (torch.randn(EP_SIZE, MOE_TOKENS, D) * 0.25).to(torch.bfloat16)
     norm_weight = torch.ones(EP_SIZE, D, dtype=torch.bfloat16)
     gate_weight = torch.randn(N_EXPERTS, D) / D ** 0.5
     gate_weight = gate_weight.unsqueeze(0).expand(EP_SIZE, -1, -1).contiguous()

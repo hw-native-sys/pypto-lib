@@ -76,8 +76,6 @@ MX_W1_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * M
 MX_W3_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * MX_PACKED_LANE_ROWS
 ROUTED_ROW_CAPACITY = min(N_LOCAL_EXPERTS, M.num_experts_per_tok) * RECV_MAX
-ROUTED_PARTIAL_STRIDE = ((ROUTED_ROW_CAPACITY + 15) // 16 + 1) * 16
-LOCAL_PARTIAL_STRIDE = ((N_LOCAL_EXPERTS * RECV_MAX + MX_M_TILE - 1) // MX_M_TILE + 1) * MX_M_TILE
 
 
 @pl.jit.inline(auto_scope=False)
@@ -288,14 +286,16 @@ def _routed_w13(
     w3: pl.Tensor,
     w3_scale: pl.Tensor,
     pair: pl.Out[pl.Tensor],
+    route_weights: pl.Tensor,
+    compact_weights: pl.Out[pl.Tensor],
     experts: pl.Scalar[pl.INDEX],
     stride: pl.Scalar[pl.INDEX],
     width: pl.Scalar[pl.INDEX],
     hidden: pl.Scalar[pl.INDEX],
     activation_rows: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Store FP32 gate and up projections in aligned expert-prefix rows."""
-    ...
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Store compact BF16 projections and route weights with the same row order."""
+    return pair, compact_weights
 
 
 @pl.jit.extern(
@@ -328,20 +328,20 @@ def _routed_w2(
     counts: pl.Tensor,
     weight: pl.Tensor,
     weight_scale: pl.Tensor,
-    partial: pl.Out[pl.Tensor],
+    output: pl.Out[pl.Tensor],
     experts: pl.Scalar[pl.INDEX],
     stride: pl.Scalar[pl.INDEX],
     width: pl.Scalar[pl.INDEX],
     hidden: pl.Scalar[pl.INDEX],
-    partial_stride: pl.Scalar[pl.INDEX],
+    output_rows: pl.Scalar[pl.INDEX],
     activation_rows: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
-    """Store two FP32 K-split partials in compact active-row order."""
+    """Store full-K BF16 results in compact active-row order."""
     ...
 
 
 @pl.jit.inline(auto_scope=False)
-def _expert_routed_partials(
+def _expert_routed_output(
     x: pl.Tensor,
     x_scale: pl.Tensor,
     weights: pl.Tensor,
@@ -357,53 +357,38 @@ def _expert_routed_partials(
     stride: pl.constexpr,
     width: pl.constexpr,
     hidden: pl.constexpr,
-    partial_rows: pl.constexpr,
+    row_capacity: pl.constexpr,
 ):
-    """Run separate FP32 W13, weighted MXFP8 activation, and W2 tasks.
+    """Run BF16 W13, FP32 weighted MXFP8 activation, and full-K BF16 W2.
 
     Counts are immutable after input_ready, lie in [0, stride], and sum to
-    at most partial_rows. Stride is divisible by 16; width and hidden are
-    divisible by 256. Each hidden slice contains 256 to 1280 columns.
+    at most row_capacity. Stride is divisible by 16; width and hidden are
+    divisible by 256.
     """
-    activation_rows = ((partial_rows + MX_M_TILE - 1) // MX_M_TILE + experts) * MX_M_TILE
-    pair = pl.create_tensor([((partial_rows + MX_M_TILE - 1) // MX_M_TILE + experts) * MX_M_TILE, 2 * hidden], dtype=pl.FP32)
+    activation_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
+    pair = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 2 * hidden], dtype=pl.BF16)
+    compact_weights = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 1], dtype=pl.FP32)
     with pl.spmd(32, name_hint="routed_w13", deps=[input_ready]) as w13_ready:
-        pair = _routed_w13(
+        pair, compact_weights = _routed_w13(
             x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
-            experts, stride, width, hidden, activation_rows,
+            weights, compact_weights, experts, stride, width, hidden, activation_rows,
         )
 
-    payload = pl.create_tensor([((partial_rows + MX_M_TILE - 1) // MX_M_TILE + experts) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
-    scales = pl.create_tensor([1, ((partial_rows + MX_M_TILE - 1) // MX_M_TILE + experts) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
+    payload = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
+    scales = pl.create_tensor([1, ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
     with pl.spmd(64, name_hint="routed_swiglu_quant", deps=[w13_ready]) as activation_ready:
         payload, scales = _routed_swiglu_quant(
-            pair, weights, counts, payload, scales, experts, stride, hidden,
+            pair, compact_weights, counts, payload, scales, experts, stride, hidden,
         )
 
-    partial_stride = ((partial_rows + MX_M_TILE - 1) // MX_M_TILE + 1) * MX_M_TILE
-    partial = pl.create_tensor([2 * ((partial_rows + MX_M_TILE - 1) // MX_M_TILE + 1) * MX_M_TILE, width], dtype=pl.FP32)
+    output_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
+    output = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, width], dtype=pl.BF16)
     with pl.spmd(32, name_hint="routed_w2", deps=[activation_ready]) as ready:
-        partial = _routed_w2(
-            payload, scales, counts, w2, w2_scale, partial,
-            experts, stride, width, hidden, partial_stride, activation_rows,
+        output = _routed_w2(
+            payload, scales, counts, w2, w2_scale, output,
+            experts, stride, width, hidden, output_rows, activation_rows,
         )
-    return partial, ready
-
-
-@pl.jit.inline(auto_scope=False)
-def _reduce_ffn_tile(
-    partial: pl.Tensor,
-    row: pl.Scalar[pl.INDEX],
-    col: pl.Scalar[pl.INDEX],
-    partial_stride: pl.constexpr,
-    row_tile: pl.constexpr,
-    col_tile: pl.constexpr,
-):
-    """Sum two FP32 partial tiles and round once to BF16."""
-    left = pl.load(partial, [row, col], [row_tile, col_tile])
-    right = pl.load(partial, [row + partial_stride, col], [row_tile, col_tile])
-    total = pl.add(left, right)
-    return pl.cast(total, pl.BF16, mode="rint")
+    return output, ready
 
 
 @pl.jit.inline(auto_scope=False)
@@ -426,14 +411,14 @@ def expert_routed_scatter(
     """Compute active expert rows and scatter each source interval to its route destinations."""
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     route_weights = pl.reshape(recv_weights, [N_LOCAL_EXPERTS * RECV_MAX, 1])
-    partial, down_ready = _expert_routed_partials(
+    output, down_ready = _expert_routed_output(
         recv_x_flat, recv_mx_scale, route_weights, recv_expert_count,
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale, input_ready,
         N_LOCAL_EXPERTS, RECV_MAX, D, MOE_INTER, ROUTED_ROW_CAPACITY,
     )
-    with pl.spmd(64, name_hint="ffn_reduce_scatter", deps=[down_ready]) as scatter_done:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_reduce_scatter", no_dep_args=[routed_output]):
+    with pl.spmd(64, name_hint="ffn_scatter", deps=[down_ready]) as scatter_done:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_scatter", no_dep_args=[routed_output]):
             core = pl.tile.get_block_idx()
             total_rows = 0
             for expert in pl.range(N_LOCAL_EXPERTS):
@@ -449,25 +434,28 @@ def expert_routed_scatter(
             for local_e in pl.range(N_LOCAL_EXPERTS):
                 count_read = pl.read(recv_expert_count, [local_e, 0])
                 count = pl.cast(count_read, pl.INDEX)
-                source_begin = 0
-                for src in pl.range(EP_WORLD_SIZE):
-                    source_rows_read = pl.read(recv_meta, [src, local_e])
-                    source_rows = pl.cast(source_rows_read, pl.INDEX)
-                    source_end = source_begin + source_rows
-                    valid_end = pl.min(source_end, count)
-                    valid_rows = pl.max(valid_end - source_begin, 0)
-                    source_compact = compact_base + source_begin
-                    first = pl.min(valid_rows, pl.max(core_begin - source_compact, 0))
-                    end = pl.min(valid_rows, pl.max(core_end - source_compact, 0))
-                    for work in pl.pipeline(first, end, stage=2):
-                        row = source_begin + work
-                        route_read = pl.read(recv_route, [local_e, row])
-                        route = pl.cast(route_read, pl.INDEX)
-                        compact_row = compact_base + row
-                        col = pl.cast(0, pl.INDEX)
-                        value = _reduce_ffn_tile(partial, compact_row, col, ROUTED_PARTIAL_STRIDE, 1, D)
-                        pld.tile.remote_store(value, target=routed_output, peer=src, offsets=[route, 0])
-                    source_begin = source_end
+                expert_begin = pl.max(compact_base, core_begin)
+                expert_end = pl.min(compact_base + count, core_end)
+                if expert_begin < expert_end:
+                    source_begin = 0
+                    for src in pl.range(EP_WORLD_SIZE):
+                        source_rows_read = pl.read(recv_meta, [src, local_e])
+                        source_rows = pl.cast(source_rows_read, pl.INDEX)
+                        source_end = source_begin + source_rows
+                        valid_end = pl.min(source_end, count)
+                        valid_rows = pl.max(valid_end - source_begin, 0)
+                        source_compact = compact_base + source_begin
+                        first = pl.min(valid_rows, pl.max(core_begin - source_compact, 0))
+                        end = pl.min(valid_rows, pl.max(core_end - source_compact, 0))
+                        for work in pl.pipeline(first, end, stage=2):
+                            row = source_begin + work
+                            route_read = pl.read(recv_route, [local_e, row])
+                            route = pl.cast(route_read, pl.INDEX)
+                            compact_row = compact_base + row
+                            col = pl.cast(0, pl.INDEX)
+                            value = pl.load(output, [compact_row, col], [1, D])
+                            pld.tile.remote_store(value, target=routed_output, peer=src, offsets=[route, 0])
+                        source_begin = source_end
                 compact_base = compact_base + count
     return scatter_done
 
@@ -489,13 +477,13 @@ def local_compute_test(
     input_ready = pl.system.task_dummy(deps=[])
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     route_weights = pl.reshape(recv_weights, [N_LOCAL_EXPERTS * RECV_MAX, 1])
-    partial, down_ready = _expert_routed_partials(
+    output, down_ready = _expert_routed_output(
         recv_x_flat, recv_mx_scale, route_weights, recv_expert_count,
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale, input_ready,
         N_LOCAL_EXPERTS, RECV_MAX, D, MOE_INTER, N_LOCAL_EXPERTS * RECV_MAX,
     )
-    with pl.spmd(64, name_hint="ffn_reduce", deps=[down_ready]):
+    with pl.spmd(64, name_hint="ffn_copy", deps=[down_ready]):
         core = pl.tile.get_block_idx()
         work_base = 0
         compact_base = 0
@@ -508,8 +496,8 @@ def local_compute_test(
                 local_row = work * 2
                 row = compact_base + local_row
                 col = pl.cast(0, pl.INDEX)
-                result = _reduce_ffn_tile(partial, row, col, LOCAL_PARTIAL_STRIDE, 2, D)
                 valid = pl.min(2, count - local_row)
+                result = pl.load(output, [row, col], [2, D], valid_shape=[valid, D])
                 masked = pl.set_validshape(result, valid, D)
                 routed_y = pl.store(masked, [expert * RECV_MAX + local_row, 0], routed_y)
             work_base = work_base + work_count
@@ -557,8 +545,8 @@ def golden_expert_routed(tensors):
         )
         w2_fp8 = unpack_mxfp4_weight_tiles(w2_packed, MOE_INTER, D, MX_K_TILE, MX_W2_D_OUT_TILE)
 
-        gate = matmul_mx_golden(x_sub, x_scale, w1_fp8, w1_scale[e])
-        up = matmul_mx_golden(x_sub, x_scale, w3_fp8, w3_scale[e])
+        gate = matmul_mx_golden(x_sub, x_scale, w1_fp8, w1_scale[e]).bfloat16().float()
+        up = matmul_mx_golden(x_sub, x_scale, w3_fp8, w3_scale[e]).bfloat16().float()
         if SWIGLU_LIMIT > 0:
             gate = gate.clamp(max=SWIGLU_LIMIT)
             up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
