@@ -80,7 +80,7 @@ __tf__ __aicore__ inline void quantize(
             int exponent = std::max(0, static_cast<int>(bits >> 23) - 8);
             float reciprocal = exponent ? std::ldexp(1.0f, 127 - exponent) : 0.0f;
             for (int i = 0; i < 32; ++i) {
-                F value = static_cast<F>(std::max(-448.0f, std::min(448.0f, values[i] * reciprocal)));
+                F value(std::max(-448.0f, std::min(448.0f, values[i] * reciprocal)), RoundMode::CAST_RINT);
                 std::memcpy(dst + row * 128 + group * 32 + i, &value, 1);
             }
             reinterpret_cast<__ubuf__ uint8_t*>(codes)[(row / 16) * 64 + (group / 2) * 32 + row % 16 * 2 + group % 2] = exponent;
