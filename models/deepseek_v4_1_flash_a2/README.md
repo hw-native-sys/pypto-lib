@@ -4,8 +4,9 @@ Independent single-layer Prefill and A2/A3 decoder operators, with W8A8
 projection, BF16 attention caches, mHC, Engram, and MoE boundaries.
 
 See the [model documentation](../../docs/models/deepseek_v4_1_flash_a2/index.md)
-for construction examples, native runtime requirements, and the precise scope
-of the historical single-layer acceptance evidence.
+for construction examples, native runtime requirements, and the independent A3
+Decode acceptance scope. Formal Decode accuracy starts at `not_run`; no
+historical Prefill or CPU result is reused.
 
 The [A5-to-A2 module alignment](MODULE_ALIGNMENT.md) is the canonical file
 ownership map. It keeps A5's semantic Decode/Prefill plan visible while
@@ -20,3 +21,8 @@ leaves. Decoder paths follow the A5 file names: `decode_c2a_full.py` owns L14,
 `layer14_15.py` and `layers19_25.py` remain aggregate compatibility providers.
 Shared SWA compute is owned by `swa_attention.py`; `decode_swa.py` remains a
 compatibility export for existing callers.
+
+`decode_acceptance.py`, `decode_gate.py`, `decode_reference.py`, and
+`decode_shape_contract.py` define the independent Decode session. The product
+path is PyPTO-only. vLLM-Ascend is described as a separately queued reference
+process and is never imported by product computation.
