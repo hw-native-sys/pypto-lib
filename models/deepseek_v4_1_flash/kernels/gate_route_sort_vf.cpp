@@ -117,20 +117,22 @@ __aicore__ inline void run(__gm__ int64_t* args) {
         TASSIGN(input, row * Columns * sizeof(float));
         TSORT32(sorted32, input, range);
         pipe_barrier(PIPE_ALL);
-        TMRGSORT(sorted64, sorted32, 64);
-        pipe_barrier(PIPE_ALL);
-        Part p0, p1, p2;
-        TASSIGN(p0, 36864); TASSIGN(p1, 37888); TASSIGN(p2, 38912);
-        MrgSortExecutedNumList executed{0, 0, 0, 0};
-        if constexpr (Columns == 256) {
-            TMRGSORT<Sorted, Sorted, Part, Part, false>(sorted, executed, scratch, p0, p1);
-        } else {
-            TMRGSORT<Sorted, Sorted, Part, Part, Part, false>(sorted, executed, scratch, p0, p1, p2);
+        if constexpr (Columns > 32) {
+            TMRGSORT(sorted64, sorted32, 64);
+            pipe_barrier(PIPE_ALL);
+            Part p0, p1, p2;
+            TASSIGN(p0, 36864); TASSIGN(p1, 37888); TASSIGN(p2, 38912);
+            MrgSortExecutedNumList executed{0, 0, 0, 0};
+            if constexpr (Columns == 256) {
+                TMRGSORT<Sorted, Sorted, Part, Part, false>(sorted, executed, scratch, p0, p1);
+            } else {
+                TMRGSORT<Sorted, Sorted, Part, Part, Part, false>(sorted, executed, scratch, p0, p1, p2);
+            }
+            pipe_barrier(PIPE_ALL);
         }
-        pipe_barrier(PIPE_ALL);
         Vec<float, 1, 16> prefix;
         Vec<int32_t, 1, 8> row_indices;
-        TASSIGN(prefix, 40960); TASSIGN(row_indices, 51200 + row * 32);
+        TASSIGN(prefix, Columns == 32 ? 32768 : 40960); TASSIGN(row_indices, 51200 + row * 32);
         TGATHER<decltype(row_indices), decltype(prefix), MaskPattern::P1010>(row_indices, prefix);
         pipe_barrier(PIPE_ALL);
     }
@@ -188,7 +190,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     set_atomic_none(); set_mask_norm(); set_vector_mask(-1, -1);
 #endif
     int columns = reinterpret_cast<__gm__ Tensor*>(args[0])->shapes[1];
-    if (columns == 256) run<256>(args);
+    if (columns == 32) run<32>(args);
+    else if (columns == 256) run<256>(args);
     else run<384>(args);
 #endif
 }
