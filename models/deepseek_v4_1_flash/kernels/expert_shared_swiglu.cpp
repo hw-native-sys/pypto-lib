@@ -431,7 +431,42 @@ __aicore__ inline void run_native(__gm__ int64_t* args) {
 } // namespace
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__CPU_SIM)
-    (void)args;
+#if defined(__DAV_VEC__)
+    const int64_t rows = dim(args, 0, 0);
+    const int64_t width = dim(args, 1, 1);
+    const int64_t inputStride = stride(args, 0), outputStride = stride(args, 1);
+    auto* input = data<bfloat16_t>(args, 0);
+    auto* output = data<uint8_t>(args, 1);
+    auto* codes = data<uint8_t>(args, 2);
+    const int64_t groups = width / 32;
+    const int64_t worker = get_block_idx(args);
+    const int64_t workers = get_block_num(args);
+    for (int64_t task = worker; task < rows * groups; task += workers) {
+        const int64_t row = task / groups, group = task % groups;
+        float values[32];
+        float maximum = 1e-4f;
+        for (int lane = 0; lane < 32; ++lane) {
+            const int64_t offset = row * inputStride + group * 32 + lane;
+            const float gate = std::min(float(input[offset]), 10.0f);
+            const float up = std::clamp(float(input[offset + width]), -10.0f, 10.0f);
+            values[lane] = float(bfloat16_t((gate / (1.0f + std::exp(-gate))) * up));
+            maximum = std::max(maximum, std::abs(values[lane]));
+        }
+        float scaled = maximum * (1.0f / 448.0f);
+        uint32_t bits;
+        std::memcpy(&bits, &scaled, sizeof(bits));
+        const uint32_t exponent = (bits + 8388607) >> 23;
+        codes[(row / 16) * 16 * groups + (group / 2) * 32 + (row % 16) * 2 + group % 2] = exponent;
+        bits = (254 - exponent) << 23;
+        float reciprocal;
+        std::memcpy(&reciprocal, &bits, sizeof(bits));
+        for (int lane = 0; lane < 32; ++lane) {
+            const float value = std::clamp(values[lane] * reciprocal, -448.0f, 448.0f);
+            output[row * outputStride + group * 32 + lane] =
+                float8_e4m3_t(value, RoundMode::CAST_RINT, SaturationMode::ON).RawData();
+        }
+    }
+#endif
 #elif defined(__DAV_VEC__)
     set_mask_norm(); set_vector_mask(-1, -1); run_native(args);
 #endif

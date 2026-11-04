@@ -60,7 +60,6 @@ W2_M_TILE = gcd(T_PAD, W13_M_TILE)
 W2_N_TILE = 256
 W2_K_TILE = 256
 W2_K_STAGE = 2
-W2_SYNC_START = True
 
 assert T_PAD % W13_PAD_ROWS == 0
 assert T_PAD % 16 == 0
@@ -197,7 +196,7 @@ def expert_shared(
         row0 = wm * W2_M_TILE
         valid_m = pl.min(W2_M_TILE, T_PAD - row0)
         valid_out = pl.min(W2_M_TILE, rows - row0)
-        with pl.spmd(D // W2_N_TILE, name_hint="sh_w2_mm", sync_start=W2_SYNC_START):
+        with pl.spmd(D // W2_N_TILE, name_hint="sh_w2_mm"):
             d0 = pl.tile.get_block_idx() * W2_N_TILE
             hs0 = pl.load(h_tile_mx, [row0, 0], [W2_M_TILE, W2_K_TILE], valid_shape=[valid_m, W2_K_TILE])
             hs_scale0 = pl.load(h_tile_scale_zz, [row0, 0], [W2_M_TILE, W2_K_TILE // MX_GROUP], valid_shape=[valid_m, W2_K_TILE // MX_GROUP])
@@ -332,8 +331,6 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
-    if args.execution_mode:
-        parser.error("this entry requires hardware; --sim is unsupported")
     if args.tokens is None:
         if args.golden_data or args.runtime_dir:
             parser.error("--golden-data and --runtime-dir require an explicit --tokens value")
