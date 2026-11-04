@@ -24,7 +24,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--ep", type=int, choices=[2, 4, 8], default=2)
     parser.add_argument("--experts-per-rank", type=int, default=4)
-    parser.add_argument("--case", choices=["all", "bounds", "tails", "zero", "full"], default="all")
+    parser.add_argument("--case", choices=["all", "bounds", "tails", "zero", "full", "balanced"], default="all")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -45,12 +45,13 @@ if __name__ == "__main__":
 
 from config import FLASH as M
 from config import EP_SIZE as EP_WORLD_SIZE, MOE_RECV_MAX as RECV_MAX
-from config import ROUTE_T_DYN, N_LOCAL_EXPERTS
+from config import ROUTE_T_DYN, N_LOCAL_EXPERTS, MOE_TOKENS
 from quant import pack_mxfp4_weight_tiles, unpack_mxfp4_weight_tiles
 
 
 # model config
 D = M.hidden_size
+TOPK = M.num_experts_per_tok
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
 MX_GROUP = 32
@@ -61,6 +62,9 @@ H_SCALE = MOE_INTER // MX_GROUP
 ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
 
 # tiling
+RECV_ROW_TILE = 16
+RECV_SCALE_TMP_TILE = ((64 + K_SCALE + 31) // 32) * 32
+GATHER_WORKERS = 64
 MX_M_TILE = 16
 MX_K_TILE = 256
 MX_MM_INTER_TILE = 256
@@ -75,32 +79,260 @@ ROUTED_PARTIAL_STRIDE = ((ROUTED_ROW_CAPACITY + 15) // 16 + 1) * 16
 LOCAL_PARTIAL_STRIDE = ((N_LOCAL_EXPERTS * RECV_MAX + MX_M_TILE - 1) // MX_M_TILE + 1) * MX_M_TILE
 
 
+@pl.jit.inline(auto_scope=False)
+def gather_routed_inputs(
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, K_SCALE], pl.UINT8],
+    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, 8], pl.FP32],
+    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, 8], pl.INT32],
+    recv_meta: pl.Tensor[[EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_meta_window: pld.DistributedTensor[[EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    counts: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    x_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
+    scale_out: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
+    weights_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    routes_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
+    wait_ready: pl.Scalar[pl.TASK_ID], push_ready: pl.Scalar[pl.TASK_ID],
+    max_per_source: pl.constexpr,
+):
+    """Gather source lanes and pack scales with aligned, count-driven workers."""
+    x_flat = pl.reshape(x_out, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    scale_nd = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, K_SCALE], dtype=pl.FP8E8M0)
+    with pl.spmd(GATHER_WORKERS, name_hint="dispatch_gather", deps=[wait_ready, push_ready]) as ready:
+        core = pl.tile.get_block_idx()
+        work_base = 0
+        for expert in pl.range(N_LOCAL_EXPERTS):
+            source_counts = pl.array.create(EP_WORLD_SIZE, pl.INT32)
+            count = pl.cast(0, pl.INDEX)
+            for src in pl.range(EP_WORLD_SIZE):
+                count_read = pl.read(recv_routes, [expert * RECV_MAX + src * max_per_source, 1])
+                source_counts[src] = count_read
+                count = count + pl.cast(count_read, pl.INDEX)
+                if core == 0:
+                    pl.write(recv_meta, [src, expert], count_read)
+                    pl.write(recv_meta_window, [src, expert], count_read)
+            if core == 0:
+                pl.write(counts, [expert, 0], pl.cast(count, pl.INT32))
+            work_count = (count + RECV_ROW_TILE - 1) // RECV_ROW_TILE
+            first = (core + GATHER_WORKERS - work_base % GATHER_WORKERS) % GATHER_WORKERS
+            for work in pl.range(first, work_count, GATHER_WORKERS):
+                row_begin = work * RECV_ROW_TILE
+                row_end = pl.min(row_begin + RECV_ROW_TILE, count)
+                expert_base = expert * RECV_MAX
+                source_begin = 0
+                for src in pl.range(EP_WORLD_SIZE):
+                    source_count_read = source_counts[src]
+                    source_count = pl.cast(source_count_read, pl.INDEX)
+                    source_end = source_begin + source_count
+                    source_base = expert_base + src * max_per_source
+                    gather_begin = pl.max(row_begin, source_begin)
+                    gather_end = pl.min(row_end, source_end)
+                    copy_rows = pl.max(gather_end - gather_begin, 0)
+                    if copy_rows > 0:
+                        source_row = source_base + gather_begin - source_begin
+                        output_row = expert_base + gather_begin
+                        payload_raw = pl.load(recv_x, [source_row, 0], [RECV_ROW_TILE, D], valid_shape=[copy_rows, D])
+                        payload = pl.reinterpret_view(payload_raw, pl.FP8E4M3FN)
+                        x_flat = pl.store(payload, [output_row, 0], x_flat)
+                        scale_raw = pl.load(
+                            recv_scale, [source_row, 0], [RECV_ROW_TILE, K_SCALE],
+                            valid_shape=[copy_rows, K_SCALE],
+                        )
+                        scale = pl.reinterpret_view(scale_raw, pl.FP8E8M0)
+                        scale_nd = pl.store(scale, [output_row, 0], scale_nd)
+                        for row in pl.range(gather_begin, gather_end):
+                            metadata_row = source_base + row - source_begin
+                            weight = pl.read(recv_weights, [metadata_row, 0])
+                            pl.write(weights_out, [expert, row], weight)
+                            route = pl.read(recv_routes, [metadata_row, 0])
+                            pl.write(routes_out, [expert, row], route)
+                    source_begin = source_end
+                # Each worker owns complete 64-byte metadata cache lines.
+                scale_row = expert_base + row_begin
+                scale_values = pl.load(scale_nd, [scale_row, 0], [RECV_ROW_TILE, K_SCALE])
+                scale_bytes = pl.reinterpret_view(scale_values, pl.UINT8)
+                temporary = pl.create_tile([1, RECV_SCALE_TMP_TILE], dtype=pl.UINT8)
+                packed = pl.tmov_x2zz(scale_bytes, temporary, group_axis=1, dst_rows=RECV_ROW_TILE, dst_cols=K_SCALE)
+                packed_mx = pl.reinterpret_view(packed, pl.FP8E8M0)
+                packed_flat = pl.reshape(packed_mx, [1, RECV_ROW_TILE * K_SCALE])
+                scale_out = pl.store(packed_flat, [0, scale_row * K_SCALE], scale_out)
+            work_base = work_base + work_count
+    return ready
+
+
+@pl.jit.inline(auto_scope=False)
+def push_dispatch_payload(
+    indices: pl.Tensor,
+    payload: pl.Tensor,
+    packed_scale: pl.Tensor,
+    weights: pl.Tensor,
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, K_SCALE], pl.UINT8],
+    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, 8], pl.FP32],
+    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, 8], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    input_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Send each expert lane directly from FP8 inputs and paired MX scale tiles."""
+    workers = EP_WORLD_SIZE * N_LOCAL_EXPERTS
+    with pl.spmd(workers, name_hint="dispatch_push", deps=[input_ready], allow_early_resolve=False) as ready:
+        block = pl.tile.get_block_idx()
+        peer = block // N_LOCAL_EXPERTS
+        expert = block % N_LOCAL_EXPERTS
+        active = pl.min(pl.max(pl.cast(num_tokens, pl.INDEX), 0), MOE_TOKENS)
+        base = expert * RECV_MAX + rank * MOE_TOKENS
+        ids = pl.load(indices, [0, 0], [MOE_TOKENS, 8], valid_shape=[MOE_TOKENS, TOPK])
+        route_weights = pl.load(weights, [0, 0], [MOE_TOKENS, 8], valid_shape=[MOE_TOKENS, TOPK])
+        weight_lane = pl.tile.full([MOE_TOKENS, 8], dtype=pl.FP32, value=0.0)
+        route_lane = pl.tile.full([MOE_TOKENS, 8], dtype=pl.INT32, value=0)
+        cursor = pl.array.create(1, pl.INT32)
+        cursor[0] = 0
+        for batch in pl.range((active + 15) // 16):
+            first = batch * 16
+            scales = pl.load(packed_scale, [0, first * K_SCALE], [1, 16 * K_SCALE])
+            scale_bytes = pl.reinterpret_view(scales, pl.UINT8)
+            pairs = pl.reinterpret_view(scale_bytes, pl.UINT16, shape=[K_SCALE // 2, 16])
+            pairs_nd = pl.transpose(pairs, 0, 1)
+            bytes_nd = pl.reinterpret_view(pairs_nd, pl.UINT8, shape=[16, K_SCALE])
+            for token in pl.range(first, pl.min(first + 16, active)):
+                for top in pl.range(TOPK):
+                    eid = pl.tile.read(ids, [token, top])
+                    if eid == block:
+                        slot = cursor[0]
+                        cursor[0] = slot + 1
+                        row = base + slot
+                        values = pl.load(payload, [token, 0], [1, D])
+                        value_bytes = pl.reinterpret_view(values, pl.INT8)
+                        pld.tile.remote_store(value_bytes, target=recv_x, peer=peer, offsets=[row, 0])
+                        scale_row = pl.slice(bytes_nd, [1, K_SCALE], [token - first, 0])
+                        pld.tile.remote_store(scale_row, target=recv_scale, peer=peer, offsets=[row, 0])
+                        value = pl.tile.read(route_weights, [token, top])
+                        pl.tile.write(weight_lane, [slot, 0], value)
+                        route = pl.cast(token * TOPK + top, pl.INT32)
+                        pl.tile.write(route_lane, [slot, 0], route)
+        pl.tile.write(route_lane, [0, 1], cursor[0])
+        pld.tile.remote_store(weight_lane, target=recv_weights, peer=peer, offsets=[base, 0])
+        pld.tile.remote_store(route_lane, target=recv_routes, peer=peer, offsets=[base, 0])
+    return ready
+
+
+@pl.jit.inline
+def dispatch(
+    indices: pl.Tensor[[MOE_TOKENS, TOPK], pl.INT32],
+    x_norm_mx: pl.Tensor[[MOE_TOKENS, D], pl.FP8E4M3FN],
+    x_norm_scale: pl.Tensor[[1, MOE_TOKENS * K_SCALE], pl.FP8E8M0],
+    weights: pl.Tensor[[MOE_TOKENS, TOPK], pl.FP32],
+    recv_x_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP8E4M3FN],
+    recv_scale_out: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
+    recv_weight_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_route_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
+    recv_count_out: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    recv_meta_local: pl.Tensor[[EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_meta: pld.DistributedTensor[[EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, K_SCALE], pl.UINT8],
+    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, 8], pl.FP32],
+    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, 8], pl.INT32],
+    data_arrived: pld.DistributedTensor[[EP_WORLD_SIZE, N_LOCAL_EXPERTS, 128], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+):
+    stage_anchor = pl.system.task_dummy(deps=[])
+    _push_tid = push_dispatch_payload(
+        indices, x_norm_mx, x_norm_scale, weights,
+        recv_x, recv_scale, recv_weights, recv_routes,
+        num_tokens, my_rank, stage_anchor,
+    )
+    # Publish one epoch only after every local payload store completes.
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="dispatch_publish_epoch",
+        deps=[_push_tid], allow_early_resolve=False,
+    ) as _publish_tid:
+        for dst in pl.range(EP_WORLD_SIZE):
+            if dst != my_rank:
+                pld.system.notify(
+                    target=data_arrived, peer=dst, offsets=[my_rank, 0, 0],
+                    value=moe_epoch, op=pld.NotifyOp.Set,
+                )
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_publish_tid]) as _wait_tid:
+        for src in pl.range(EP_WORLD_SIZE):
+            if src != my_rank:
+                pld.system.defer_wait(signal=data_arrived, offsets=[src, 0, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
+
+    return gather_routed_inputs(
+        recv_x, recv_scale, recv_weights, recv_routes, recv_meta_local, recv_meta, recv_count_out,
+        recv_x_out, recv_scale_out, recv_weight_out, recv_route_out,
+        _wait_tid, _push_tid, MOE_TOKENS,
+    )
+
+
 @pl.jit.extern(
     core_type="mixed",
-    aic_source=Path(__file__).parent / "kernels" / "expert_routed.cpp",
-    aiv_source=Path(__file__).parent / "kernels" / "expert_routed.cpp",
+    aic_source=Path(__file__).parent / "kernels" / "expert_routed_w13.cpp",
+    aiv_source=Path(__file__).parent / "kernels" / "expert_routed_w13.cpp",
     dual_aiv_dispatch=True, include_dirs=(pto_isa_include_dir(),),
 )
-def _expert_routed_extern(
+def _routed_w13(
     x: pl.Tensor,
     x_scale: pl.Tensor,
-    weights: pl.Tensor,
     counts: pl.Tensor,
     w1: pl.Tensor,
     w1_scale: pl.Tensor,
     w3: pl.Tensor,
     w3_scale: pl.Tensor,
-    w2: pl.Tensor,
-    w2_scale: pl.Tensor,
+    pair: pl.Out[pl.Tensor],
+    experts: pl.Scalar[pl.INDEX],
+    stride: pl.Scalar[pl.INDEX],
+    width: pl.Scalar[pl.INDEX],
+    hidden: pl.Scalar[pl.INDEX],
+    activation_rows: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Store FP32 gate and up projections in aligned expert-prefix rows."""
+    ...
+
+
+@pl.jit.extern(
+    core_type="aiv", source=Path(__file__).parent / "kernels" / "expert_routed_swiglu.cpp",
+    include_dirs=(pto_isa_include_dir(),),
+)
+def _routed_swiglu_quant(
+    pair: pl.Tensor,
+    weights: pl.Tensor,
+    counts: pl.Tensor,
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+    experts: pl.Scalar[pl.INDEX],
+    stride: pl.Scalar[pl.INDEX],
+    hidden: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Apply FP32 weighted SwiGLU and upward group-32 MXFP8 quantization."""
+    return payload, scales
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=Path(__file__).parent / "kernels" / "expert_routed_w2.cpp",
+    aiv_source=Path(__file__).parent / "kernels" / "expert_routed_w2.cpp",
+    dual_aiv_dispatch=True, include_dirs=(pto_isa_include_dir(),),
+)
+def _routed_w2(
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    counts: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
     partial: pl.Out[pl.Tensor],
     experts: pl.Scalar[pl.INDEX],
     stride: pl.Scalar[pl.INDEX],
     width: pl.Scalar[pl.INDEX],
     hidden: pl.Scalar[pl.INDEX],
-    parts: pl.Scalar[pl.INDEX],
     partial_stride: pl.Scalar[pl.INDEX],
+    activation_rows: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
-    """Compute compact FP32 W2 partials with on-chip weighted SwiGLU."""
+    """Store two FP32 K-split partials in compact active-row order."""
     ...
 
 
@@ -123,18 +355,33 @@ def _expert_routed_partials(
     hidden: pl.constexpr,
     partial_rows: pl.constexpr,
 ):
-    """Compute two FP32 W2 partials in compact count-prefix order.
+    """Run separate FP32 W13, weighted MXFP8 activation, and W2 tasks.
 
     Counts are immutable after input_ready, lie in [0, stride], and sum to
     at most partial_rows. Stride is divisible by 16; width and hidden are
     divisible by 256. Each hidden slice contains 256 to 1280 columns.
     """
+    activation_rows = ((partial_rows + MX_M_TILE - 1) // MX_M_TILE + experts) * MX_M_TILE
+    pair = pl.create_tensor([((partial_rows + MX_M_TILE - 1) // MX_M_TILE + experts) * MX_M_TILE, 2 * hidden], dtype=pl.FP32)
+    with pl.spmd(32, name_hint="routed_w13", deps=[input_ready]) as w13_ready:
+        pair = _routed_w13(
+            x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
+            experts, stride, width, hidden, activation_rows,
+        )
+
+    payload = pl.create_tensor([((partial_rows + MX_M_TILE - 1) // MX_M_TILE + experts) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
+    scales = pl.create_tensor([1, ((partial_rows + MX_M_TILE - 1) // MX_M_TILE + experts) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
+    with pl.spmd(64, name_hint="routed_swiglu_quant", deps=[w13_ready]) as activation_ready:
+        payload, scales = _routed_swiglu_quant(
+            pair, weights, counts, payload, scales, experts, stride, hidden,
+        )
+
     partial_stride = ((partial_rows + MX_M_TILE - 1) // MX_M_TILE + 1) * MX_M_TILE
     partial = pl.create_tensor([2 * ((partial_rows + MX_M_TILE - 1) // MX_M_TILE + 1) * MX_M_TILE, width], dtype=pl.FP32)
-    with pl.spmd(32, name_hint="fused_expert_ffn", deps=[input_ready]) as ready:
-        partial = _expert_routed_extern(
-            x, x_scale, weights, counts, w1, w1_scale, w3, w3_scale, w2, w2_scale,
-            partial, experts, stride, width, hidden, 2, partial_stride,
+    with pl.spmd(32, name_hint="routed_w2", deps=[activation_ready]) as ready:
+        partial = _routed_w2(
+            payload, scales, counts, w2, w2_scale, partial,
+            experts, stride, width, hidden, partial_stride, activation_rows,
         )
     return partial, ready
 
@@ -401,6 +648,8 @@ def validation_counts(case="bounds", *, tail_offset=0):
         pattern = (0,)
     elif case == "full":
         pattern = (RECV_MAX,)
+    elif case == "balanced":
+        pattern = (36,)
     elif case == "tails":
         pattern = (15, 16, 17, 63, 64, 65)
     elif case == "bounds":

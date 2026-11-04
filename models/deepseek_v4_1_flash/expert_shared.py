@@ -6,9 +6,32 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4.1 MoE shared-expert FFN with MXFP8 W1/W3/W2."""
+# ci: no-sim
+"""DeepSeek-V4.1 shared MXFP8 W13, SwiGLU requantization, and W2."""
+
+import sys
+from math import gcd
+from pathlib import Path
 
 import pypto.language as pl
+
+from pypto.runtime import pto_isa_include_dir
+
+import config
+
+
+def _parse_int_option(flag, default):
+    for index, argument in enumerate(sys.argv):
+        if argument == flag and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if argument.startswith(flag + "="):
+            return int(argument.split("=", 1)[1])
+    return default
+
+
+if __name__ == "__main__":
+    config.set_moe_tokens(_parse_int_option("--tokens", 80))
+
 
 from config import FLASH as M
 
@@ -17,48 +40,111 @@ from config import MOE_TOKENS
 
 # model config
 T = MOE_TOKENS
+T_PAD = ((T + 15) // 16) * 16
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
+MX_GROUP = M.weight_block_size[0]
 
 # tiling
-SH_M_TILE = 16
-SH_ROW_TILE = 2
-T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
-GATE_M_TILE = T_PAD if T_PAD <= 80 else 16
-W2_M_TILE = T_PAD if T_PAD <= 80 else 16
-SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
-assert T < SH_M_TILE or T % SH_M_TILE == 0
-assert SH_VALID_M % SH_ROW_TILE == 0
-MX_GROUP = 32
-MX_K_TILE = 512
-MX_RIGHT_K_TILE = 256
-MX_MM_INTER_TILE = 256
-MX_RIGHT_K_SCALE_GROUPS = MX_RIGHT_K_TILE // MX_GROUP
-# W2 reduces over MOE_INTER, whose V4.1 value (2304) is *not* a multiple of
-# MX_K_TILE (512): 2304 = 512 * 4 + 256. The V4-Pro presets all happen to be
-# multiples of 512 (2048 / 3072 / 4096), so the shared MX_K_TILE works there.
-# Reusing MX_K_TILE here made the last `pl.pipeline` step cover
-# [2048, 2560) and read `h_tile_mx` / `shared_w2` 256 columns past their end.
-# 768 divides both 2304 (W2 K) and 5120 (W1/W3 K) and is a multiple of
-# MX_W2_RIGHT_K_TILE, so the reduction tiles exactly.
-MX_W2_K_TILE = 768
-MX_W2_RIGHT_K_TILE = 256
-MX_W2_RIGHT_K_SCALE_GROUPS = MX_W2_RIGHT_K_TILE // MX_GROUP
-assert MOE_INTER % MX_MM_INTER_TILE == 0
-assert D % MX_K_TILE == 0
-assert MOE_INTER % MX_W2_K_TILE == 0
-assert MX_W2_K_TILE % MX_W2_RIGHT_K_TILE == 0
-ACT_INTER_TILE = 256
-D_OUT_TILE = 256
-W2_TASK_TILE = 512
-QUANT_TILE = 768
-QUANT_GROUPS = QUANT_TILE // 32
-QUANT_SCALE_TMP = ((64 + (SH_M_TILE // 16) * QUANT_GROUPS + 31) // 32) * 32
-assert MOE_INTER % QUANT_TILE == 0
-assert QUANT_TILE % ACT_INTER_TILE == 0
-assert MX_K_TILE % MX_RIGHT_K_TILE == 0
-assert MX_K_TILE % MX_W2_RIGHT_K_TILE == 0
+GATE_UP_N = 2 * MOE_INTER
+K_SCALE = D // MX_GROUP
+H_SCALE = MOE_INTER // MX_GROUP
+W13_M_TILE = 80
+W13_N_TILE = 256
+W13_BLOCKS = GATE_UP_N // W13_N_TILE
+W13_GROUPS = (T_PAD + W13_M_TILE - 1) // W13_M_TILE
+W13_ROWS = W13_GROUPS * W13_M_TILE
+W13_PAD_ROWS = 16  # staging granularity when the token block is not a whole tile
+SWIGLU_WORKERS = 60
+W2_M_TILE = gcd(T_PAD, W13_M_TILE)
+W2_N_TILE = 256
+W2_K_TILE = 256
+W2_K_STAGE = 2
+W2_SYNC_START = True
+
+assert T_PAD % W13_PAD_ROWS == 0
+assert T_PAD % 16 == 0
+assert GATE_UP_N % W13_N_TILE == 0
+assert MOE_INTER % W2_K_TILE == 0
+assert D % W2_N_TILE == 0
+assert W2_M_TILE % 16 == 0
+
+
+@pl.jit.extern(
+    core_type="aic",
+    source=Path(__file__).parent / "kernels" / "expert_shared_w13.cpp",
+    include_dirs=(pto_isa_include_dir(),),
+)
+def _shared_w13_mm(
+    x_local: pl.Tensor,
+    x_local_scale: pl.Tensor,
+    shared_w1: pl.Tensor,
+    shared_w1_scale: pl.Tensor,
+    shared_w3: pl.Tensor,
+    shared_w3_scale: pl.Tensor,
+    gate_up: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project ND MXFP8 activations with ND weights and resident MX scales."""
+    ...
+
+
+@pl.jit.extern(
+    core_type="aiv",
+    source=Path(__file__).parent / "kernels" / "expert_shared_swiglu.cpp",
+    include_dirs=(pto_isa_include_dir(),),
+)
+def _shared_swiglu_vf(
+    gate_up: pl.Tensor,
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+):
+    """Fuse the SwiGLU epilogue with upward MXFP8 requantization in one VF."""
+    ...
+
+
+@pl.jit.inline
+def _w13_padded_inputs(
+    x_local: pl.Tensor,
+    x_local_scale: pl.Tensor,
+):
+    """Pad payload and packed scales to whole W13 row tiles."""
+    x_padded = pl.create_tensor([W13_ROWS, D], dtype=pl.FP8E4M3FN)
+    scale_padded = pl.create_tensor([1, W13_ROWS * K_SCALE], dtype=pl.FP8E8M0)
+    scale_col = W13_PAD_ROWS * K_SCALE
+    with pl.spmd(T_PAD // W13_PAD_ROWS, name_hint="sh_w13_pad"):
+        row0 = pl.tile.get_block_idx() * W13_PAD_ROWS
+        x_rows = pl.load(x_local, [row0, 0], [W13_PAD_ROWS, D])
+        x_padded = pl.store(x_rows, [row0, 0], x_padded)
+        scale_rows = pl.load(x_local_scale, [0, row0 * K_SCALE], [1, scale_col])
+        scale_padded = pl.store(scale_rows, [0, row0 * K_SCALE], scale_padded)
+    return x_padded, scale_padded
+
+
+@pl.jit.inline
+def _w13_direct_inputs(
+    x_local: pl.Tensor,
+    x_local_scale: pl.Tensor,
+):
+    """The physical token block already spans whole W13 row tiles."""
+    return x_local, x_local_scale
+
+
+# Selected at import time so the fused program traces exactly one input path.
+_W13_INPUTS = _w13_direct_inputs if W13_ROWS == T_PAD else _w13_padded_inputs
+
+
+@pl.jit.inline
+def _shared_swiglu(
+    gate_up: pl.Tensor,
+    payload: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+):
+    """SwiGLU epilogue plus grouped MXFP8 requantization over the token block."""
+    with pl.spmd(SWIGLU_WORKERS, name_hint="sh_swiglu_vf"):
+        _shared_swiglu_vf(gate_up, payload, scales)
+    return payload, scales
 
 
 import torch.nn.functional as F
@@ -77,302 +163,66 @@ def expert_shared(
     sh: pl.Tensor[[T, D], pl.BF16],
 ):
     """Shared expert with device MXFP8 activation quantization before both projections."""
-    # The activation scale uses the official logical [M, K/32] backing;
-    # matmul_mx consumes it as MX_A_ZZ without a flat-to-MX view.
-    w1_scale_mx = shared_w1_scale
-    w3_scale_mx = shared_w3_scale
-    w2_scale_mx = shared_w2_scale
-    x_local_scale_mx = pl.tensor.view(
-        x_local_scale,
-        [T_PAD, D // MX_GROUP],
-        layout=pl.MX_A_ZZ,
-    )
-    gate_fp32 = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP32)
-    up_fp32 = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP32)
-    for gm in pl.parallel(T_PAD // GATE_M_TILE):
-        ts0 = gm * GATE_M_TILE
+    # Merged W1/W3 projection into BF16 gate/up columns.
+    gate_up = pl.create_tensor([T_PAD, GATE_UP_N], dtype=pl.BF16)
+    x_w13, x_w13_scale = _W13_INPUTS(x_local, x_local_scale)
+    for group in pl.parallel(W13_GROUPS):
+        row0 = group * W13_M_TILE
+        group_rows = pl.min(W13_M_TILE, T_PAD - row0)
+        x_group = pl.tensor.slice(x_w13, [W13_M_TILE, D], [row0, 0])
+        # Contiguous packed MX_A_ZZ row tiles.
+        x_scale_group = pl.tensor.slice(
+            x_w13_scale,
+            [1, W13_M_TILE * K_SCALE],
+            [0, row0 * K_SCALE],
+        )
+        gate_up_group = pl.tensor.slice(gate_up, [W13_M_TILE, GATE_UP_N], [row0, 0])
+        with pl.spmd(W13_BLOCKS, name_hint="sh_w13_mx_mm"):
+            gate_up_group = _shared_w13_mm(
+                x_group, x_scale_group,
+                shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+                gate_up_group, group_rows,
+            )
 
-        for nb_idx in pl.spmd(MOE_INTER // MX_MM_INTER_TILE, name_hint="sh_gate_mx_mm"):
-            n0 = nb_idx * MX_MM_INTER_TILE
-            xs0 = pl.load(x_local, [ts0, 0], [GATE_M_TILE, MX_RIGHT_K_TILE])
-            xs_scale0 = pl.load(
-                x_local_scale_mx,
-                [ts0, 0],
-                [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-            )
-            w1_0 = pl.load(shared_w1, [0, n0], [MX_RIGHT_K_TILE, MX_MM_INTER_TILE])
-            w1_scale0 = pl.load(
-                w1_scale_mx,
-                [0, n0],
-                [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-            )
-            gate_acc = pl.matmul_mx(xs0, xs_scale0, w1_0, w1_scale0)
-            for kb in pl.range(1, MX_K_TILE // MX_RIGHT_K_TILE):
-                k_local = kb * MX_RIGHT_K_TILE
-                xs_part = pl.load(x_local, [ts0, k_local], [GATE_M_TILE, MX_RIGHT_K_TILE])
-                xs_scale_part = pl.load(
-                    x_local_scale_mx,
-                    [ts0, k_local // MX_GROUP],
-                    [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-                )
-                w1_part = pl.load(
-                    shared_w1,
-                    [k_local, n0],
-                    [MX_RIGHT_K_TILE, MX_MM_INTER_TILE],
-                )
-                w1_scale_part = pl.load(
-                    w1_scale_mx,
-                    [k_local // MX_GROUP, n0],
-                    [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-                )
-                gate_acc = pl.matmul_mx_acc(
-                    gate_acc,
-                    xs_part,
-                    xs_scale_part,
-                    w1_part,
-                    w1_scale_part,
-                )
-            for k0 in pl.pipeline(MX_K_TILE, D, MX_K_TILE, stage=2):
-                for kb in pl.range(MX_K_TILE // MX_RIGHT_K_TILE):
-                    k_local = kb * MX_RIGHT_K_TILE
-                    xs_part = pl.load(
-                        x_local,
-                        [ts0, k0 + k_local],
-                        [GATE_M_TILE, MX_RIGHT_K_TILE],
-                    )
-                    xs_scale_part = pl.load(
-                        x_local_scale_mx,
-                        [ts0, (k0 + k_local) // MX_GROUP],
-                        [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-                    )
-                    w1_part = pl.load(
-                        shared_w1,
-                        [k0 + k_local, n0],
-                        [MX_RIGHT_K_TILE, MX_MM_INTER_TILE],
-                    )
-                    w1_scale_part = pl.load(
-                        w1_scale_mx,
-                        [(k0 + k_local) // MX_GROUP, n0],
-                        [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-                    )
-                    gate_acc = pl.matmul_mx_acc(
-                        gate_acc,
-                        xs_part,
-                        xs_scale_part,
-                        w1_part,
-                        w1_scale_part,
-                    )
-            gate_fp32 = pl.store(gate_acc, [ts0, n0], gate_fp32)
-
-        for nb_idx in pl.spmd(MOE_INTER // MX_MM_INTER_TILE, name_hint="sh_up_mx_mm"):
-            n0 = nb_idx * MX_MM_INTER_TILE
-            xs0 = pl.load(x_local, [ts0, 0], [GATE_M_TILE, MX_RIGHT_K_TILE])
-            xs_scale0 = pl.load(
-                x_local_scale_mx,
-                [ts0, 0],
-                [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-            )
-            w3_0 = pl.load(shared_w3, [0, n0], [MX_RIGHT_K_TILE, MX_MM_INTER_TILE])
-            w3_scale0 = pl.load(
-                w3_scale_mx,
-                [0, n0],
-                [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-            )
-            up_acc = pl.matmul_mx(xs0, xs_scale0, w3_0, w3_scale0)
-            for kb in pl.range(1, MX_K_TILE // MX_RIGHT_K_TILE):
-                k_local = kb * MX_RIGHT_K_TILE
-                xs_part = pl.load(x_local, [ts0, k_local], [GATE_M_TILE, MX_RIGHT_K_TILE])
-                xs_scale_part = pl.load(
-                    x_local_scale_mx,
-                    [ts0, k_local // MX_GROUP],
-                    [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-                )
-                w3_part = pl.load(
-                    shared_w3,
-                    [k_local, n0],
-                    [MX_RIGHT_K_TILE, MX_MM_INTER_TILE],
-                )
-                w3_scale_part = pl.load(
-                    w3_scale_mx,
-                    [k_local // MX_GROUP, n0],
-                    [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-                )
-                up_acc = pl.matmul_mx_acc(
-                    up_acc,
-                    xs_part,
-                    xs_scale_part,
-                    w3_part,
-                    w3_scale_part,
-                )
-            for k0 in pl.pipeline(MX_K_TILE, D, MX_K_TILE, stage=2):
-                for kb in pl.range(MX_K_TILE // MX_RIGHT_K_TILE):
-                    k_local = kb * MX_RIGHT_K_TILE
-                    xs_part = pl.load(
-                        x_local,
-                        [ts0, k0 + k_local],
-                        [GATE_M_TILE, MX_RIGHT_K_TILE],
-                    )
-                    xs_scale_part = pl.load(
-                        x_local_scale_mx,
-                        [ts0, (k0 + k_local) // MX_GROUP],
-                        [GATE_M_TILE, MX_RIGHT_K_SCALE_GROUPS],
-                    )
-                    w3_part = pl.load(
-                        shared_w3,
-                        [k0 + k_local, n0],
-                        [MX_RIGHT_K_TILE, MX_MM_INTER_TILE],
-                    )
-                    w3_scale_part = pl.load(
-                        w3_scale_mx,
-                        [(k0 + k_local) // MX_GROUP, n0],
-                        [MX_RIGHT_K_SCALE_GROUPS, MX_MM_INTER_TILE],
-                    )
-                    up_acc = pl.matmul_mx_acc(
-                        up_acc,
-                        xs_part,
-                        xs_scale_part,
-                        w3_part,
-                        w3_scale_part,
-                    )
-            up_fp32 = pl.store(up_acc, [ts0, n0], up_fp32)
-
+    # BF16-rounded SwiGLU, FP8 payload, and packed MX_A_ZZ scales.
     h_tile_mx = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP8E4M3FN)
-    h_scale_backing = pl.create_tensor([1, T_PAD * (MOE_INTER // MX_GROUP)], dtype=pl.FP8E8M0)
-    for mt in pl.parallel(T_PAD // SH_M_TILE):
-        ts0 = mt * SH_M_TILE
-        h_tile_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
-        for q_idx in pl.spmd(MOE_INTER // QUANT_TILE, name_hint="sh_gate_up_act"):
-            k0 = q_idx * QUANT_TILE
-            for row_block in pl.range(SH_M_TILE // SH_ROW_TILE):
-                row0 = row_block * SH_ROW_TILE
-                for n0 in pl.pipeline(k0, k0 + QUANT_TILE, ACT_INTER_TILE, stage=2):
-                    gate_rows = gate_fp32[ts0 + row0 : ts0 + row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
-                    up_rows = up_fp32[ts0 + row0 : ts0 + row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE]
-                    gate_rows = pl.cast(pl.cast(gate_rows, pl.BF16, mode="rint"), pl.FP32)
-                    up_rows = pl.cast(pl.cast(up_rows, pl.BF16, mode="rint"), pl.FP32)
-                    if SWIGLU_LIMIT > 0.0:
-                        gate_rows = pl.minimum(gate_rows, SWIGLU_LIMIT)
-                        up_max = pl.minimum(up_rows, SWIGLU_LIMIT)
-                        up_rows = pl.maximum(up_max, -SWIGLU_LIMIT)
-                    gate_neg = pl.neg(gate_rows)
-                    gate_exp = pl.exp(gate_neg)
-                    gate_exp_one = pl.add(gate_exp, 1.0)
-                    sigmoid = pl.recip(gate_exp_one)
-                    silu = pl.mul(gate_rows, sigmoid)
-                    gated = pl.mul(silu, up_rows)
-                    gated = pl.cast(pl.cast(gated, pl.BF16, mode="rint"), pl.FP32)
-                    h_tile_fp32[row0 : row0 + SH_ROW_TILE, n0 : n0 + ACT_INTER_TILE] = gated
-            h_fp32 = pl.load(h_tile_fp32, [0, k0], [SH_M_TILE, QUANT_TILE])
-            quant_groups = pl.reshape(h_fp32, [SH_M_TILE * QUANT_GROUPS, 32])
-            quant_tmp = pl.create_tile([SH_M_TILE * QUANT_GROUPS, 32], dtype=pl.FP32)
-            quant_maximum = pl.maximum(pl.row_max(pl.abs(quant_groups), tmp_tile=quant_tmp), 1e-4)
-            quant_bits = pl.reinterpret_view(pl.mul(quant_maximum, 1.0 / 448.0), pl.INT32)
-            quant_exponent = pl.shrs(pl.add(quant_bits, 8388607), 23)
-            quant_scale = pl.reinterpret_view(pl.shls(quant_exponent, 23), pl.FP32)
-            quant_normalized = pl.row_expand_div(quant_groups, quant_scale)
-            quant_clipped = pl.minimum(pl.maximum(quant_normalized, -448.0), 448.0)
-            quant_payload = pl.cast(quant_clipped, pl.FP8E4M3FN, mode="rint")
-            h_mx = pl.reshape(quant_payload, [SH_M_TILE, QUANT_TILE])
-            quant_signed = pl.sub(quant_exponent, pl.mul(pl.shrs(quant_exponent, 7), 256))
-            quant_codes = pl.reinterpret_view(pl.cast(quant_signed, pl.INT8), pl.UINT8)
-            quant_flat = pl.reshape(quant_codes, [1, SH_M_TILE * QUANT_GROUPS])
-            quant_pack_tmp = pl.create_tile([1, QUANT_SCALE_TMP], dtype=pl.UINT8)
-            quant_packed = pl.tmov_x2zz(
-                quant_flat, quant_pack_tmp, group_axis=1,
-                dst_rows=SH_M_TILE, dst_cols=QUANT_GROUPS,
-            )
-            h_scale_mx = pl.reinterpret_view(quant_packed, pl.FP8E8M0)
-            h_tile_mx = pl.store(h_mx, [ts0, k0], h_tile_mx)
-            scale_offset = ts0 * (MOE_INTER // MX_GROUP) + q_idx * SH_M_TILE * (QUANT_TILE // MX_GROUP)
-            h_scale_backing = pl.store(
-                pl.reshape(h_scale_mx, [1, SH_M_TILE * (QUANT_TILE // MX_GROUP)]),
-                [0, scale_offset],
-                h_scale_backing,
-            )
+    h_scale_mx = pl.create_tensor([T_PAD, H_SCALE], dtype=pl.FP8E8M0)
+    h_tile_mx, h_scale_mx = _shared_swiglu(gate_up, h_tile_mx, h_scale_mx)
 
-    for wm in pl.parallel(T_PAD // W2_M_TILE):
-        ts0 = wm * W2_M_TILE
-        h_tile_scale_mx = pl.tensor.view(h_scale_backing, [T_PAD, MOE_INTER // MX_GROUP], layout=pl.MX_A_ZZ)
-        # Synchronize Cube/Vector startup (pypto#2829) within available clusters.
-        workers = pl.min(D // W2_TASK_TILE, pl.system.available_cluster_count())
-        for worker in pl.spmd(workers, name_hint="sh_w2_mm", sync_start=True):
-            block_num = pl.tile.get_block_num()
-            for wave in pl.range((D // D_OUT_TILE + block_num - 1) // block_num):
-                db_idx = wave * block_num + worker
-                if db_idx < D // D_OUT_TILE:
-                    d0 = db_idx * D_OUT_TILE
-                    hs0 = pl.load(h_tile_mx, [ts0, 0], [W2_M_TILE, MX_W2_RIGHT_K_TILE])
-                    hs_scale0 = pl.load(
-                        h_tile_scale_mx,
-                        [ts0, 0],
-                        [W2_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
-                    )
-                    sw2_0 = pl.load(shared_w2, [0, d0], [MX_W2_RIGHT_K_TILE, D_OUT_TILE])
-                    sw2_scale0 = pl.load(
-                        w2_scale_mx,
-                        [0, d0],
-                        [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
-                    )
-                    y_acc = pl.matmul_mx(hs0, hs_scale0, sw2_0, sw2_scale0)
-                    for kb in pl.range(1, MX_W2_K_TILE // MX_W2_RIGHT_K_TILE):
-                        k_local = kb * MX_W2_RIGHT_K_TILE
-                        hs_part = pl.load(h_tile_mx, [ts0, k_local], [W2_M_TILE, MX_W2_RIGHT_K_TILE])
-                        hs_scale_part = pl.load(
-                            h_tile_scale_mx,
-                            [ts0, k_local // MX_GROUP],
-                            [W2_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
-                        )
-                        sw2_part = pl.load(
-                            shared_w2,
-                            [k_local, d0],
-                            [MX_W2_RIGHT_K_TILE, D_OUT_TILE],
-                        )
-                        sw2_scale_part = pl.load(
-                            w2_scale_mx,
-                            [k_local // MX_GROUP, d0],
-                            [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
-                        )
-                        y_acc = pl.matmul_mx_acc(
-                            y_acc,
-                            hs_part,
-                            hs_scale_part,
-                            sw2_part,
-                            sw2_scale_part,
-                        )
-                    for k0 in pl.pipeline(MX_W2_K_TILE, MOE_INTER, MX_W2_K_TILE, stage=2):
-                        for kb in pl.range(MX_W2_K_TILE // MX_W2_RIGHT_K_TILE):
-                            k_local = kb * MX_W2_RIGHT_K_TILE
-                            hs_part = pl.load(
-                                h_tile_mx,
-                                [ts0, k0 + k_local],
-                                [W2_M_TILE, MX_W2_RIGHT_K_TILE],
-                            )
-                            hs_scale_part = pl.load(
-                                h_tile_scale_mx,
-                                [ts0, (k0 + k_local) // MX_GROUP],
-                                [W2_M_TILE, MX_W2_RIGHT_K_SCALE_GROUPS],
-                            )
-                            sw2_part = pl.load(
-                                shared_w2,
-                                [k0 + k_local, d0],
-                                [MX_W2_RIGHT_K_TILE, D_OUT_TILE],
-                            )
-                            sw2_scale_part = pl.load(
-                                w2_scale_mx,
-                                [(k0 + k_local) // MX_GROUP, d0],
-                                [MX_W2_RIGHT_K_SCALE_GROUPS, D_OUT_TILE],
-                            )
-                            y_acc = pl.matmul_mx_acc(
-                                y_acc,
-                                hs_part,
-                                hs_scale_part,
-                                sw2_part,
-                                sw2_scale_part,
-                            )
-                    y_bf16 = pl.cast(y_acc, target_type=pl.BF16, mode="rint")
-                    valid_rows = pl.min(W2_M_TILE, T - ts0)
-                    y_valid = pl.set_validshape(y_bf16, valid_rows, D_OUT_TILE)
-                    sh = pl.store(y_valid, [ts0, d0], sh)
+    # Complete row tiles keep MX_A_ZZ scale loads inside the packed backing.
+    h_tile_scale_zz = pl.tensor.view(
+        h_scale_mx, [T_PAD, H_SCALE], layout=pl.MX_A_ZZ,
+    )
+    rows = pl.tensor.dim(sh, 0)
+    for wm in pl.parallel((T_PAD + W2_M_TILE - 1) // W2_M_TILE):
+        row0 = wm * W2_M_TILE
+        valid_m = pl.min(W2_M_TILE, T_PAD - row0)
+        valid_out = pl.min(W2_M_TILE, rows - row0)
+        with pl.spmd(D // W2_N_TILE, name_hint="sh_w2_mm", sync_start=W2_SYNC_START):
+            d0 = pl.tile.get_block_idx() * W2_N_TILE
+            hs0 = pl.load(h_tile_mx, [row0, 0], [W2_M_TILE, W2_K_TILE], valid_shape=[valid_m, W2_K_TILE])
+            hs_scale0 = pl.load(h_tile_scale_zz, [row0, 0], [W2_M_TILE, W2_K_TILE // MX_GROUP], valid_shape=[valid_m, W2_K_TILE // MX_GROUP])
+            sw2_0 = pl.load(shared_w2, [0, d0], [W2_K_TILE, W2_N_TILE])
+            sw2_scale0 = pl.load(
+                shared_w2_scale, [0, d0], [W2_K_TILE // MX_GROUP, W2_N_TILE],
+            )
+            y_acc = pl.matmul_mx(hs0, hs_scale0, sw2_0, sw2_scale0)
+            for k0 in pl.pipeline(W2_K_TILE, MOE_INTER, W2_K_TILE, stage=W2_K_STAGE):
+                hs_part = pl.load(h_tile_mx, [row0, k0], [W2_M_TILE, W2_K_TILE], valid_shape=[valid_m, W2_K_TILE])
+                hs_scale_part = pl.load(
+                    h_tile_scale_zz,
+                    [row0, k0 // MX_GROUP],
+                    [W2_M_TILE, W2_K_TILE // MX_GROUP], valid_shape=[valid_m, W2_K_TILE // MX_GROUP],
+                )
+                sw2_part = pl.load(shared_w2, [k0, d0], [W2_K_TILE, W2_N_TILE])
+                sw2_scale_part = pl.load(
+                    shared_w2_scale, [k0 // MX_GROUP, d0], [W2_K_TILE // MX_GROUP, W2_N_TILE],
+                )
+                y_acc = pl.matmul_mx_acc(
+                    y_acc, hs_part, hs_scale_part, sw2_part, sw2_scale_part,
+                )
+            # Fixpipe rounds the accumulator directly to BF16.
+            sh = pl.store(pl.set_validshape(y_acc, valid_out, W2_N_TILE), [row0, d0], sh)
 
     return sh
 
@@ -474,12 +324,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("--tokens", type=int, default=None)
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
+    if args.tokens is None:
+        if args.golden_data or args.runtime_dir:
+            parser.error("--golden-data and --runtime-dir require an explicit --tokens value")
+        import subprocess
+
+        for tokens in (16, 80, 96):
+            print(f"Shared expert validation: tokens={tokens}", flush=True)
+            command = [sys.executable, str(Path(__file__).resolve()), "--tokens", str(tokens), *sys.argv[1:]]
+            completed = subprocess.run(command, check=False)
+            if completed.returncode:
+                raise SystemExit(completed.returncode)
+        raise SystemExit(0)
 
     result = run(
         fn=l2_expert_shared,
@@ -487,6 +354,8 @@ if __name__ == "__main__":
         golden_fn=golden_expert_shared,
         golden_data=args.golden_data,
         save_data=args.save_data,
+        runtime_dir=args.runtime_dir,
+        compile_only=args.compile_only,
         config=dict(
             dump_passes=args.dump_passes,
             backend_type=args.backend_type,
