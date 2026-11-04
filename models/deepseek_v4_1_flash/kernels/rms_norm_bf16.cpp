@@ -33,11 +33,22 @@ __tf__ __aicore__ inline void normalize(Output::TileDType __out__ output,
     auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(output);
 #if defined(__CPU_SIM)
     for (int row = 0; row < Rows; ++row) {
-        float sum = 0.0f;
-        for (int k = 0; k < Width; ++k) {
-            float value = static_cast<float>(src[row * Width + k]);
-            sum += value * value;
+        float lanes[4][64] = {};
+        for (int k = 0; k < Width / 256; ++k) {
+            for (int part = 0; part < 4; ++part) {
+                for (int lane = 0; lane < 64; ++lane) {
+                    const float value = static_cast<float>(src[row * Width + k * 256 + part * 64 + lane]);
+                    lanes[part][lane] += value * value;
+                }
+            }
         }
+        for (int lane = 0; lane < 64; ++lane) {
+            lanes[0][lane] = (lanes[0][lane] + lanes[1][lane]) + (lanes[2][lane] + lanes[3][lane]);
+        }
+        for (int step = 32; step > 0; step /= 2) {
+            for (int lane = 0; lane < step; ++lane) lanes[0][lane] += lanes[0][lane + step];
+        }
+        const float sum = lanes[0][0];
         float inverse = 1.0f / std::sqrt(sum / Width + 1.0e-6f);
         for (int k = 0; k < Width; ++k) {
             float value = static_cast<float>(src[row * Width + k]) * inverse;
