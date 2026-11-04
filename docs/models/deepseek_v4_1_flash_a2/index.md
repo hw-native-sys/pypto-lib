@@ -28,6 +28,12 @@ It does not contain a checkpoint downloader, a full-block replay driver, or
 the private orchestration used by any earlier work; those results are not part
 of this Decode session.
 
+The supplied DeepSeek V4.1 Flash W8A8 Dynamic Aurora export is kept outside
+the repository and selected with `DEEPSEEK_V41_CHECKPOINT`. Run
+`decode_checkpoint_manifest.py` to verify its JSON metadata, indexed shard
+presence, target-layer-to-shard mapping, Engram files, and selected
+safetensors headers. The manifest does not hash or copy tensor payloads.
+
 | Files | Responsibility |
 | --- | --- |
 | `ops.py`, `qkv_w8a8.py`, `ecotech_linear*.py` | Per-token INT8 quantization, KN weight packing, full INT32 accumulation, explicit FP32 scaling and BF16 narrowing. |
@@ -38,6 +44,7 @@ of this Decode session.
 | `decode_c2a_full.py`, `decode_c2a_reuse.py`, `decode_c1a_full.py`, `decode_c1a_reuse.py`, `decode_c1a_reindex.py` | A2/A3 stage owners for L14/L15/L19/L20/L21/L24/L25. `layer14_15.py` and `layers19_25.py` remain aggregate compatibility providers. |
 | `decode_fwd.py`, `decode_replay.py` | Bounded PyPTO L0 SWA Decode ABI, single-step entry, and fixed 1/2/8-step state replay. These entries do not claim checkpoint accuracy, full-model, or distributed Decode coverage. |
 | `decode_candidates.py`, `decode_acceptance.py`, `decode_gate.py` | Search K=2 candidate registry, independent Decode contract, product import closure scan, runtime identity capture, and fail-closed layer/topology gate reporting. |
+| `decode_checkpoint_manifest.py`, `decode_weights.py` | Read-only Aurora metadata/header audit and lazy tensor resolver; neither performs product computation. |
 | `candidate_pool.py`, `raw_checkpoint.py` | A2/A3 candidate metadata and raw checkpoint loading. |
 | `swa_scheduler.py`, `smla_scheduler.py` | Integer-only request, page and causal-selection scheduling. Original and compressed lanes retain separate page tables. |
 | `swa_native.py`, `smla_native.py`, `smla_staging.py` | Registered BF16 SWA/ratio-one SMLA leaves, fresh metadata, and PyPTO dtype boundaries. |

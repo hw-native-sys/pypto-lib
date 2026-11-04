@@ -43,6 +43,8 @@ _EXPORTS = {
     "decode_acceptance_report": ("decode_acceptance", "report"),
     "decode_gate_report": ("decode_gate", "gate_report"),
     "decode_reference_manifest": ("decode_reference", "reference_manifest"),
+    "inspect_decode_checkpoint": ("decode_checkpoint_manifest", "inspect_checkpoint"),
+    "DecodeSafetensorsCheckpoint": ("decode_weights", "DecodeSafetensorsCheckpoint"),
     "DecodeGlobalShape": ("decode_shape_contract", "DecodeGlobalShape"),
     "DecodeRankShape": ("decode_shape_contract", "DecodeRankShape"),
     "decode_shape_matrix": ("decode_shape_contract", "shape_matrix"),

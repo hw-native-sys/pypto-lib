@@ -19,6 +19,7 @@ from typing import Any
 from models.deepseek_v4_1_flash_a2.decode_acceptance import (
     CONTRACT,
     TOPOLOGIES,
+    checkpoint_asset_report,
     runtime_identity,
 )
 
@@ -53,8 +54,9 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
         for name in REQUIRED_ASSETS
     }
     missing = [name for name, exists in present.items() if not exists]
+    checkpoint = checkpoint_asset_report()
     devices = topology_config["devices"]
-    ready = not missing
+    ready = not missing and checkpoint.get("status") == "metadata_verified"
     command = (
         f"task-submit --device auto --device-num {devices} --run "
         f"'PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_fwd "
@@ -75,6 +77,7 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
         "assets": assets,
         "asset_presence": present,
         "missing_assets": missing,
+        "checkpoint_asset": checkpoint,
         "required_state_inputs": list(CONTRACT["state_inputs"]),
         "required_state_outputs": list(CONTRACT["state_outputs"]),
         "queue_command": command,
@@ -95,9 +98,10 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
         },
         "runtime_identity": runtime_identity(),
         "recovery": (
-            "Provide checkpoint/config conversion, identical decode input and "
-            "historical cache, and frozen vLLM-Ascend reference capture; then "
-            "submit this topology through task-submit and record per-rank state."
+            "Provide identical decode input and historical cache, and frozen "
+            "vLLM-Ascend reference capture; set DEEPSEEK_V41_CHECKPOINT to the "
+            "verified Aurora export, submit "
+            "this topology through task-submit, and record per-rank state."
         ),
     }
 

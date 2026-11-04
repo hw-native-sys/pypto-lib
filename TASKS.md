@@ -105,15 +105,22 @@ driver. The kernel accepts position/request/source/finished controls but does
 not consume those controls in its device schedule and advances only
 `cache_lens[0]`; these are explicit formal blockers.
 
+The supplied Aurora W8A8 Dynamic export is registered as an external
+checkpoint asset. Its index references 270 quantized shard files using the
+`of-00272` naming convention, and four separate Engram safetensors are present
+for L1/L14. `decode_checkpoint_manifest.py` records metadata, shard presence,
+target-layer mapping, and safetensors headers without hashing tensor payloads.
+
 | gate | status | recovery condition |
 | --- | --- | --- |
 | product import/dependency scan | `pass` | Keep vLLM/Torch-NPU out of the product closure |
+| Aurora checkpoint metadata/header audit | `pass` | Keep the external manifest and set `DEEPSEEK_V41_CHECKPOINT` for jobs |
 | bounded L0 PyPTO compile/ABI | `bounded_only` | Does not establish checkpoint accuracy |
 | DP2/TP1/EP2 full MoE Decode | `not_run` | Implement 384-expert top-6 dispatch/combine and allocate two queued cards |
 | DP8/TP2/EP16 complete single layer | `not_run` | Implement the full layer and allocate 16 queued cards |
 | DP16/TP1/EP16 compatibility | `not_run` | Same complete layer at TP1 |
 | DP4/TP4/EP16 compatibility | `not_run` | Same complete layer at TP4 |
-| independent vLLM-Ascend capture | `not_run` | Supply matching checkpoint, reference environment and capture manifest |
+| independent vLLM-Ascend capture | `not_run` | Supply matching Decode input/cache, reference environment and capture manifest |
 | same-input NPU PyPTO/reference comparison | `not_run` | Supply all contract inputs and state outputs |
 | target layers 0,1,2,3,14,15,19,20,21,24,25 | `not_run` | Each layer must pass its own complete DP8/TP2/EP16 gate |
 
@@ -131,8 +138,9 @@ The following checks were run in the pinned shared environment on 2026-11-04:
 | product import/dependency scan | `pass` | `python -m models.deepseek_v4_1_flash_a2.decode_acceptance --static-scan` |
 | PyPTO single-step compile | `pass` | `decode_fwd -p a2a3 --sim --compile-only` |
 | PyPTO replay compile | `pass` | `decode_replay --steps 1/2/8 -p a2a3 --sim --compile-only` |
+| Aurora checkpoint manifest | `pass` | `.pypto-a3-state/deepseek-v41-checkpoint-manifest.json`; metadata/header audit only |
 | simulator numerical replay | `not_run` | CPU/simulator precision is outside this session; no NPU result inferred |
-| independent reference manifest | `not_run` | vLLM-Ascend path, checkpoint, cache and capture are not configured |
+| independent reference manifest | `not_run` | vLLM-Ascend path, Decode input/cache and capture are not configured |
 | EP2 MoE gate | `not_run` | `decode_gate.py --topology ep2_gate`; checkpoint/cache/reference assets missing |
 | DP8/TP2/EP16 gate | `not_run` | `decode_gate.py --topology main`; checkpoint/cache/reference assets missing |
 
@@ -173,9 +181,10 @@ holders, device reset, and single-card substitutes are prohibited.
 
 ## Recovery conditions and non-goals
 
-The formal task is blocked at `not_run` until the checkpoint/config conversion,
-historical cache and block-table assets, same-input vLLM-Ascend reference
-capture, distributed driver, and per-rank memory/communication reports are
-available. This session does not run Prefill, a continuous full network, MTP,
+The formal task is blocked at `not_run` until the Decode input, historical
+cache and block-table assets, same-input vLLM-Ascend reference capture,
+distributed driver, and per-rank memory/communication reports are available.
+The checkpoint metadata is present, but it does not supply those runtime
+states. This session does not run Prefill, a continuous full network, MTP,
 DSpark, datasets, HTTP serving, or `vllm serve`; none of those statuses are
 inferred here.

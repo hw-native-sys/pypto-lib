@@ -1038,6 +1038,20 @@
       "role": "independent vLLM-Ascend reference capture manifest; never imported by product",
       "product_compute": false,
       "accuracy_evidence": "not_run"
+    },
+    {
+      "file": "decode_checkpoint_manifest.py",
+      "sha256": "668c20151985f7d4ecc5cf19ec5397c46c635c210024dd80db02200471694ad9",
+      "role": "read-only Aurora safetensors metadata and target-layer layout manifest",
+      "product_compute": false,
+      "accuracy_evidence": "metadata_only"
+    },
+    {
+      "file": "decode_weights.py",
+      "sha256": "33d62d334e1286432f7bfcd0c2a1379afdda196679be3b8426ea33e8ed413382",
+      "role": "lazy Aurora safetensors tensor resolver for the Decode driver",
+      "product_compute": false,
+      "accuracy_evidence": "not_run"
     }
   ],
   "decode_session": {

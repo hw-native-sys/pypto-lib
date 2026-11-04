@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from models.deepseek_v4_1_flash_a2.decode_candidates import CANDIDATES, SEARCH_K, validate_candidates
+from models.deepseek_v4_1_flash_a2.decode_checkpoint_manifest import inspect_checkpoint
 from models.deepseek_v4_1_flash_a2.decode_shape_contract import shape_matrix
 from models.deepseek_v4_1_flash_a2.runtime_config import DECODE_RUNTIME_CONTRACT
 
@@ -38,6 +39,8 @@ FORBIDDEN_PRODUCT_IMPORTS = ("vllm", "vllm_ascend", "torch_npu")
 DECODE_SESSION = "deepseek-v4.1-flash-a3-decode"
 PYPTO_COMMIT = "72a62d13efabbb25d240e35944f68ba5bcc22b7f"
 VLLM_REFERENCE_COMMIT = "23d1d9055f2161b3c15613c7fc309f7d5d2ef629"
+CHECKPOINT_ENV = "DEEPSEEK_V41_CHECKPOINT"
+CHECKPOINT_MANIFEST_ENV = "DEEPSEEK_V41_CHECKPOINT_MANIFEST"
 
 SOURCE_COMMITS = (
     {
@@ -177,6 +180,12 @@ CONTRACT: dict[str, Any] = {
         "history_cache.npz",
         "reference_capture.json",
     ),
+    "checkpoint_asset": {
+        "path_env": CHECKPOINT_ENV,
+        "manifest_env": CHECKPOINT_MANIFEST_ENV,
+        "status": "not_configured",
+        "payload_hashing": "omitted; external safetensors payloads are not copied into the repository",
+    },
     "memory_contract": {
         "single_machine_capacity": "not_run",
         "per_rank_peak": "not_run",
@@ -366,6 +375,8 @@ def source_hashes() -> dict[str, str]:
             MODEL_ROOT / "runtime_config.py",
             MODEL_ROOT / "source_manifest.json",
             MODEL_ROOT / "decode_cherry_pick_receipt.json",
+            MODEL_ROOT / "decode_checkpoint_manifest.py",
+            MODEL_ROOT / "decode_weights.py",
         ]
     )
     return {
@@ -375,12 +386,55 @@ def source_hashes() -> dict[str, str]:
     }
 
 
+def checkpoint_asset_report() -> dict[str, Any]:
+    """Report the supplied checkpoint without treating it as Decode evidence."""
+
+    root_value = os.environ.get(CHECKPOINT_ENV)
+    manifest_value = os.environ.get(CHECKPOINT_MANIFEST_ENV)
+    if manifest_value:
+        manifest_path = Path(manifest_value).expanduser().resolve()
+        if not manifest_path.is_file():
+            return {
+                "status": "invalid_manifest",
+                "path_env": CHECKPOINT_ENV,
+                "manifest": str(manifest_path),
+                "error": "manifest does not exist",
+            }
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return {
+            "status": payload.get("status", "unknown"),
+            "root": payload.get("root", root_value or "not_configured"),
+            "manifest": str(manifest_path),
+            "index": payload.get("index", {}),
+            "config": payload.get("config", {}),
+            "target_layer_files": payload.get("target_layer_files", {}),
+            "engram_files": payload.get("engram_files", []),
+            "payload_hashing": payload.get("payload_hashing"),
+        }
+    if not root_value:
+        return {"status": "not_configured", "path_env": CHECKPOINT_ENV, "manifest_env": CHECKPOINT_MANIFEST_ENV}
+    try:
+        payload = inspect_checkpoint(root_value)
+    except (FileNotFoundError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
+        return {"status": "invalid", "root": str(Path(root_value).expanduser()), "error": str(exc)}
+    return {
+        "status": payload["status"],
+        "root": payload["root"],
+        "index": payload["index"],
+        "config": payload["config"],
+        "target_layer_files": payload["target_layer_files"],
+        "engram_files": payload["engram_files"],
+        "payload_hashing": payload["payload_hashing"],
+    }
+
+
 def report() -> dict[str, Any]:
     validate_candidates()
     result = dict(CONTRACT)
     result["runtime_identity"] = runtime_identity()
     result["product_dependency_scan"] = product_dependency_scan()
     result["source_hashes"] = source_hashes()
+    result["checkpoint_asset"] = checkpoint_asset_report()
     result["formal_gate"] = "not_run"
     return result
 
