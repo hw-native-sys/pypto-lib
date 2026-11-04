@@ -25,8 +25,8 @@ from models.glm5_3_flash.attention import (
     DECODE_ROWS_PER_REQUEST, decode_sparse_attn_test, golden_decode_sparse_attn_case,
 )
 from models.glm5_3_flash.config import (
-    BLOCK_SIZE, INDEX_DIM, INDEX_H, INDEX_KPOOL, INDEX_STATE_BLOCK_SIZE, INDEX_STATE_WIDTH,
-    KPOOL_SELECT_K, KV_LORA, LOCAL_H, Q_LORA, TOPK_INDEX_WIDTH, D, Glm53FlashConfig,
+    BLOCK_SIZE, EP_SIZE, INDEX_DIM, INDEX_H, INDEX_KPOOL, INDEX_STATE_BLOCK_SIZE, INDEX_STATE_WIDTH,
+    KPOOL_SELECT_K, KV_LORA, LOCAL_H, Q_LORA, TOPK_INDEX_WIDTH, TP_SIZE, D, Glm53FlashConfig,
 )
 from models.glm5_3_flash.elementwise import FP32_NEG_INF
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
@@ -1054,35 +1054,42 @@ def indexer_pool_write_test(
     return pool_cache, pool_scale, pool_valid
 
 
-def build_decode_indexer_step_specs(requests: int = 16, prior_counts: int | tuple[int, ...] | None = None):
-    """Build one deterministic decode step: sixteen requests, one closing pool each.
+def build_decode_indexer_step_specs(
+    requests: int = 16, prior_counts: int | tuple[int, ...] | None = None, *,
+    query_len: int = DECODE_ROWS_PER_REQUEST, history_tokens: int | None = None, seed: int | None = None,
+):
+    """Build paged request histories, fresh query rows and all newly closed pools.
 
-    The requests carry prior contexts of different lengths, so one closing pool
-    is made of four fresh rows, another of fresh rows mixed with rows cached by
-    earlier steps, and the pooled table starts with rows only earlier steps
-    could have written. Every request contributes exactly
-    ``DECODE_ROWS_PER_REQUEST`` query rows. ``prior_counts`` overrides the
-    fixture's per-request pool history for the business-shape benchmark points;
-    an int means the same history for every request.
+    ``prior_counts`` is the legacy pool-count interface. ``history_tokens``
+    selects the same raw-token history for every request, including a partial
+    pool. ``query_len`` is the number of successive queries in each request.
     """
     from golden import TensorSpec
 
-    rows_per_request = DECODE_ROWS_PER_REQUEST
+    rows_per_request = query_len
+    if requests < 1 or rows_per_request < 1:
+        raise ValueError("requests and query length must be positive")
     tokens = requests * rows_per_request
     if tokens % PROJ_T_TILE:
         raise ValueError(f"the projection stage needs a token count that is a multiple of {PROJ_T_TILE}")
-    if prior_counts is None:
-        prior_counts = (13, 5, 40, 2, 9, 21, 60, 3, 33, 7, 50, 17, 26, 11, 44, 6)[:requests]
-    elif isinstance(prior_counts, int):
-        prior_counts = (prior_counts,) * requests
-    if len(prior_counts) != requests:
-        raise ValueError("prior_counts must hold one pool count per request")
-    new_counts = tuple(count + 1 for count in prior_counts)
+    if history_tokens is not None:
+        if history_tokens < 0 or prior_counts is not None:
+            raise ValueError("history_tokens must be nonnegative and cannot accompany prior_counts")
+        prior_tokens = (history_tokens,) * requests
+        prior_counts = (history_tokens // INDEX_KPOOL,) * requests
+    else:
+        if prior_counts is None:
+            defaults = (13, 5, 40, 2, 9, 21, 60, 3, 33, 7, 50, 17, 26, 11, 44, 6)
+            prior_counts = tuple(defaults[request % len(defaults)] for request in range(requests))
+        elif isinstance(prior_counts, int):
+            prior_counts = (prior_counts,) * requests
+        if len(prior_counts) != requests or any(count < 0 for count in prior_counts):
+            raise ValueError("prior_counts must hold one nonnegative pool count per request")
+        prior_tokens = tuple(INDEX_KPOOL * count for count in prior_counts)
+    new_counts = tuple((count + rows_per_request) // INDEX_KPOOL for count in prior_tokens)
     pools_true = sum(new_counts)
-    width = ((pools_true + 2 * SORT_TILE - 2) // SORT_TILE) * SORT_TILE
-
-    generator = torch.Generator().manual_seed(89)
-    prior_tokens = [4 * count for count in prior_counts]
+    width = max(SORT_TILE, ((pools_true + 2 * SORT_TILE - 2) // SORT_TILE) * SORT_TILE)
+    generator = torch.Generator().manual_seed(89 if seed is None else seed)
 
     def row_map():
         """Physical raw row of every request's logical token, past and new.
@@ -1111,6 +1118,9 @@ def build_decode_indexer_step_specs(requests: int = 16, prior_counts: int | tupl
         return rows
 
     mapping = row_map()
+    raw_cache_rows = max(mapping.values()) + 1
+    if history_tokens is not None:
+        raw_cache_rows = ((raw_cache_rows + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
 
     def raw_rows_for(request, first, count):
         return [mapping[(request, position)] for position in range(first, first + count)]
@@ -1151,13 +1161,16 @@ def build_decode_indexer_step_specs(requests: int = 16, prior_counts: int | tupl
             tail_start[token] = length - int(tail_count[token])
             kv_len[token] = length
 
-    closing_slots = torch.full((requests, INDEX_KPOOL), -1, dtype=torch.int32)
-    closing_dest = torch.zeros(requests, dtype=torch.int32)
+    events = sum(new - prior for new, prior in zip(new_counts, prior_counts))
+    closing_slots = torch.full((events, INDEX_KPOOL), -1, dtype=torch.int32)
+    closing_dest = torch.zeros(events, dtype=torch.int32)
+    event = 0
     for request in range(requests):
-        closing = new_counts[request] - 1
-        first = closing * INDEX_KPOOL
-        closing_slots[request] = torch.tensor(raw_rows_for(request, first, INDEX_KPOOL), dtype=torch.int32)
-        closing_dest[request] = pool_row_of[(request, closing)]
+        for closing in range(prior_counts[request], new_counts[request]):
+            first = closing * INDEX_KPOOL
+            closing_slots[event] = torch.tensor(raw_rows_for(request, first, INDEX_KPOOL), dtype=torch.int32)
+            closing_dest[event] = pool_row_of[(request, closing)]
+            event += 1
 
     index_slots = torch.zeros(tokens, dtype=torch.int32)
     for request in range(requests):
@@ -1171,7 +1184,7 @@ def build_decode_indexer_step_specs(requests: int = 16, prior_counts: int | tupl
         return torch.randn(tokens, Q_LORA, generator=generator, dtype=torch.float32).bfloat16()
 
     def init_raw_cache():
-        rows = max(mapping.values()) + 1
+        rows = raw_cache_rows
         cache = torch.randn(rows, INDEX_STATE_WIDTH, generator=generator)
         cache[:, :INDEX_DIM] = cache[:, :INDEX_DIM].bfloat16().float()
         return cache
@@ -1218,18 +1231,18 @@ def build_decode_indexer_step_specs(requests: int = 16, prior_counts: int | tupl
         TensorSpec("hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard),
         TensorSpec("compress_ape", [INDEX_KPOOL, INDEX_DIM], torch.bfloat16, init_value=lambda : torch.randn(INDEX_KPOOL, INDEX_DIM, generator=generator).bfloat16()),
         TensorSpec("index_slots", [tokens], torch.int32, init_value=lambda: index_slots),
-        TensorSpec("pool_token_slots", [requests, INDEX_KPOOL], torch.int32, init_value=lambda : closing_slots),
-        TensorSpec("pool_slots", [requests], torch.int32, init_value=lambda: closing_dest),
+        TensorSpec("pool_token_slots", [events, INDEX_KPOOL], torch.int32, init_value=lambda : closing_slots),
+        TensorSpec("pool_slots", [events], torch.int32, init_value=lambda: closing_dest),
         TensorSpec("pool_blocks", [pages], torch.int32, init_value=lambda: page_bases),
         TensorSpec("seg_start", [tokens], torch.int32, init_value=lambda: seg_start),
         TensorSpec("pool_count", [tokens], torch.int32, init_value=lambda: pool_count),
         TensorSpec("tail_start", [tokens], torch.int32, init_value=lambda: tail_start),
         TensorSpec("tail_count", [tokens], torch.int32, init_value=lambda: tail_count),
         TensorSpec("kv_len", [tokens], torch.int32, init_value=lambda: kv_len),
-        TensorSpec("raw_cache", [max(mapping.values()) + 1, INDEX_STATE_WIDTH], torch.float32, init_value=init_raw_cache),
+        TensorSpec("raw_cache", [raw_cache_rows, INDEX_STATE_WIDTH], torch.float32, init_value=init_raw_cache),
         TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.int8, init_value=init_pool_cache),
         TensorSpec("pool_scale", [pool_table_rows, POOL_SCALE_WIDTH], torch.float32, init_value=init_pool_scale),
-        TensorSpec("pool_valid", [requests, POOL_VALID_WIDTH], torch.int32),
+        TensorSpec("pool_valid", [events, POOL_VALID_WIDTH], torch.int32),
         TensorSpec("index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16),
         TensorSpec("index_k", [tokens, INDEX_DIM], torch.bfloat16),
         TensorSpec("head_weights", [tokens, INDEX_H], torch.float32),
@@ -1282,7 +1295,10 @@ def golden_decode_indexer_step_case(tensors):
         )
 
 
-def build_decode_indexer_abi_specs(topk_indices: torch.Tensor, kv_len: torch.Tensor):
+def build_decode_indexer_abi_specs(
+    topk_indices: torch.Tensor, kv_len: torch.Tensor, query_len: int = DECODE_ROWS_PER_REQUEST,
+    seed: int | None = None,
+):
     """Build the sparse-attention consumer specs around a real index list.
 
     Takes the decode step's actual front-packed ``topk_indices`` together with
@@ -1296,14 +1312,16 @@ def build_decode_indexer_abi_specs(topk_indices: torch.Tensor, kv_len: torch.Ten
     from golden import TensorSpec
 
     tokens = topk_indices.shape[0]
-    requests = tokens // DECODE_ROWS_PER_REQUEST
+    if query_len < 1 or tokens % query_len:
+        raise ValueError("query rows must contain whole request segments")
+    requests = tokens // query_len
     pages_per_request = (int(kv_len.max()) + BLOCK_SIZE - 1) // BLOCK_SIZE
 
-    generator = torch.Generator().manual_seed(101)
+    generator = torch.Generator().manual_seed(101 if seed is None else seed)
     pages = torch.randperm(requests * pages_per_request, generator=generator)
     block_table = pages.reshape(requests, pages_per_request).to(torch.int32)
     cache_rows = requests * pages_per_request * BLOCK_SIZE
-    request_ids = torch.arange(tokens, dtype=torch.int32) // DECODE_ROWS_PER_REQUEST
+    request_ids = torch.arange(tokens, dtype=torch.int32) // query_len
 
     return [
         TensorSpec("absorbed_query", [tokens, LOCAL_H, KV_LORA], torch.bfloat16, init_value=lambda : torch.randn(tokens, LOCAL_H, KV_LORA, generator=generator, dtype=torch.float32).bfloat16()),
@@ -2690,6 +2708,22 @@ def _cache_self_check() -> None:
     print("[GOLDEN] PASS indexer_cache self-check")
 
 
+def _add_case_options(parser):
+    parser.add_argument("--tp", type=int, default=TP_SIZE)
+    parser.add_argument("--ep", type=int, default=EP_SIZE)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+
+
+def _case_config(options):
+    if (options.tp, options.ep) != (TP_SIZE, EP_SIZE):
+        raise ValueError("parallel sizes must match the values selected before importing the model")
+    return dict(
+        backend_type=options.backend_type, execution_mode=options.execution_mode,
+        device_id=options.device, enable_chip_swimlane=options.enable_chip_swimlane,
+    )
+
+
 def run_decode_case(argv=None):
     """Prove the composed golden on CPU, then validate one decode step on device."""
     import argparse
@@ -2697,11 +2731,13 @@ def run_decode_case(argv=None):
     from golden import ratio_allclose, run, topk_pair_compare
 
     parser = argparse.ArgumentParser()
+    _add_case_options(parser)
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--requests", type=int, default=16)
+    parser.add_argument("--query-len", type=int, default=DECODE_ROWS_PER_REQUEST)
     parser.add_argument(
         "--case", default="all", choices=["step", "abi", "all"],
         help="step: the indexer composition alone; abi: the composition with the sparse attention consuming its index list; all: both",
@@ -2710,8 +2746,10 @@ def run_decode_case(argv=None):
         "--bench", action="store_true",
         help="run the step at a business shape without golden validation; the shape comes from --requests/--prior-tokens, timing from PYPTO_BENCH=1",
     )
-    parser.add_argument("--prior-tokens", type=int, default=8192, help="per-request history length in tokens; defines the bench geometry")
+    parser.add_argument("--prior-tokens", type=int, help="per-request history length in raw tokens, also used by validated step cases")
     args = parser.parse_args(argv)
+    if args.requests < 1 or args.query_len < 1 or (args.prior_tokens is not None and args.prior_tokens < 0):
+        parser.error("requests/query length must be positive and prior tokens nonnegative")
 
     def print_bench(label: str, result) -> None:
         stats = result.bench
@@ -2723,21 +2761,23 @@ def run_decode_case(argv=None):
         )
 
     if args.bench:
-        if args.requests * DECODE_ROWS_PER_REQUEST % PROJ_T_TILE:
+        if args.requests * args.query_len % PROJ_T_TILE:
             parser.error(f"--bench needs a token count that is a multiple of {PROJ_T_TILE}")
-        prior_pools = args.prior_tokens // INDEX_KPOOL
-        specs = build_decode_indexer_step_specs(args.requests, prior_pools)
-        pools_true = args.requests * (prior_pools + 1)
+        history = 8192 if args.prior_tokens is None else args.prior_tokens
+        specs = build_decode_indexer_step_specs(
+            args.requests, query_len=args.query_len, history_tokens=history, seed=args.seed,
+        )
+        pools_true = args.requests * ((history + args.query_len) // INDEX_KPOOL)
         width = ((pools_true + 2 * SORT_TILE - 2) // SORT_TILE) * SORT_TILE
         label = (
-            f"decode_step requests={args.requests} prior_tokens={args.prior_tokens} "
-            f"T={args.requests * 4} pools={pools_true} width={width}"
+            f"decode_step requests={args.requests} prior_tokens={history} "
+            f"T={args.requests * args.query_len} pools={pools_true} width={width}"
         )
         result = run(
             fn=decode_indexer_step_test,
             specs=specs,
             golden_fn=None,
-            config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+            config=_case_config(args),
             compile_only=args.compile_only,
         )
         print_bench(label, result)
@@ -2878,9 +2918,11 @@ def run_decode_case(argv=None):
         results.append(
             run(
                 fn=decode_indexer_step_test,
-                specs=build_decode_indexer_step_specs(args.requests),
+                specs=build_decode_indexer_step_specs(
+                    args.requests, query_len=args.query_len, history_tokens=args.prior_tokens, seed=args.seed,
+                ),
                 golden_fn=golden_decode_indexer_step_case,
-                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                config=_case_config(args),
                 rtol=1.0 / 64,
                 atol=0.001,
                 compare_fn=step_compare,
@@ -2888,14 +2930,16 @@ def run_decode_case(argv=None):
             ),
         )
     if args.case in ("abi", "all"):
-        step_specs = build_decode_indexer_step_specs(args.requests)
+        step_specs = build_decode_indexer_step_specs(
+            args.requests, query_len=args.query_len, history_tokens=args.prior_tokens, seed=args.seed,
+        )
         kv_len = {spec.name: spec for spec in step_specs}["kv_len"].init_value()
         results.append(
             run(
                 fn=decode_indexer_step_test,
                 specs=step_specs,
                 golden_fn=golden_decode_indexer_step_case,
-                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                config=_case_config(args),
                 rtol=1.0 / 64,
                 atol=0.001,
                 compare_fn={**step_compare, "topk_indices": capture_topk_indices},
@@ -2915,9 +2959,9 @@ def run_decode_case(argv=None):
             results.append(
                 run(
                     fn=decode_sparse_attn_test,
-                    specs=build_decode_indexer_abi_specs(indices, kv_len),
+                    specs=build_decode_indexer_abi_specs(indices, kv_len, args.query_len, args.seed),
                     golden_fn=golden_decode_sparse_attn_case,
-                    config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                    config=_case_config(args),
                     rtol=1.0 / 64,
                     atol=0.001,
                     compare_fn={"output": ratio_allclose(atol=0.001, rtol=1.0 / 64)},
@@ -2965,6 +3009,7 @@ def run_prefill_case(argv=None):
     _prefill_self_check()
 
     parser = argparse.ArgumentParser()
+    _add_case_options(parser)
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
@@ -3217,7 +3262,7 @@ def run_prefill_case(argv=None):
             run(
                 fn=indexer_proj_test,
                 specs=build_indexer_proj_specs(args.tokens),
-                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                config=_case_config(args),
                 compile_only=args.compile_only,
                 **extra,
             ),
@@ -3257,7 +3302,7 @@ def run_prefill_case(argv=None):
             run(
                 fn=indexer_score_test,
                 specs=specs,
-                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                config=_case_config(args),
                 compile_only=args.compile_only,
                 **extra,
             ),
@@ -3276,7 +3321,7 @@ def run_prefill_case(argv=None):
                     rtol=1.0 / 128,
                     atol=0.0001,
                     compare_fn={"index_scores": score_window_compare},
-                    config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                    config=_case_config(args),
                     compile_only=args.compile_only,
                 ),
             )
@@ -3293,7 +3338,7 @@ def run_prefill_case(argv=None):
                     compare_fn={
                         "index_scores": score_window_compare,
                     },
-                    config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                    config=_case_config(args),
                     compile_only=args.compile_only,
                 )
             )
@@ -3313,7 +3358,7 @@ def run_prefill_case(argv=None):
                 run(
                     fn=indexer_score_test,
                     specs=sparse_specs,
-                    config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                    config=_case_config(args),
                     compile_only=args.compile_only,
                     **extra,
                 ),
@@ -3339,7 +3384,7 @@ def run_prefill_case(argv=None):
             run(
                 fn=indexer_topk_test,
                 specs=specs,
-                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                config=_case_config(args),
                 compile_only=args.compile_only,
                 **extra,
             ),
@@ -3358,7 +3403,7 @@ def run_prefill_case(argv=None):
             run(
                 fn=indexer_expand_test,
                 specs=specs,
-                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                config=_case_config(args),
                 compile_only=args.compile_only,
                 **extra,
             ),
@@ -3414,7 +3459,7 @@ def run_prefill_case(argv=None):
                 run(
                     fn=indexer_prefill_step_test,
                     specs=specs,
-                    config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                    config=_case_config(args),
                     compile_only=args.compile_only,
                     **extra,
                 ),
@@ -3443,6 +3488,7 @@ def run_cache_case(argv=None):
     _cache_self_check()
 
     parser = argparse.ArgumentParser()
+    _add_case_options(parser)
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
@@ -3475,7 +3521,7 @@ def run_cache_case(argv=None):
                 fn=indexer_cache_write_test,
                 specs=build_indexer_cache_write_specs(args.tokens, args.pages),
                 golden_fn=None if args.bench else golden_indexer_cache_write_case,
-                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                config=_case_config(args),
                 rtol=0.0,
                 atol=0.0,
                 compile_only=args.compile_only,
@@ -3489,7 +3535,7 @@ def run_cache_case(argv=None):
                 fn=indexer_pool_write_test,
                 specs=build_indexer_pool_write_specs(args.events, args.raw_pages, args.pool_pages),
                 golden_fn=None if args.bench else golden_indexer_pool_write_case,
-                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+                config=_case_config(args),
                 rtol=1.0 / 64,
                 atol=0.001,
                 compare_fn=None if args.bench else {"pool_cache": ratio_allclose(atol=1.0, rtol=0.0, max_error_ratio=0.005), "pool_scale": ratio_allclose(atol=1e-06, rtol=0.001, max_error_ratio=0.005)},

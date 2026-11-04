@@ -8,13 +8,17 @@
 # -----------------------------------------------------------------------------------------------------------
 """Daily operator performance: run each fixed workload and report its effective time.
 
-Commands: ci submits every case through task-submit and writes report.md;
-case captures one model's benchmark inside its task-submit allocation.
+Commands: ci prepares and submits the selected suite, then writes report.md;
+prepare freezes a GLM case on CPU; case captures its allocated device replay.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
+from contextlib import contextmanager
+import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -30,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 MANIFEST = Path(__file__).with_name("perf_cases.json")
 CASE_TIMEOUT = 1800  # task-submit --max-time: one model's compile, golden and benchmark
+PREPARE_TIMEOUT = 3600
 QUEUE_TIMEOUT = 3600  # task-submit --timeout: queue wait plus execution
 # Ring sizes pinned for every case, independent of the host's PTO2_RING_* exports.
 RING_CONFIG = {"ring_task_window": 16384, "ring_dep_pool": 16384, "ring_heap": 1 << 30}
@@ -44,17 +49,258 @@ def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def load_manifest(platform=None):
+def ring_config(case):
+    """Resolve only explicitly supported ring overrides for one fixed workload."""
+    overrides = case.get("runtime_config", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("case runtime_config must be an object")
+    unknown = set(overrides) - set(RING_CONFIG)
+    if unknown:
+        raise ValueError(f"unsupported performance runtime_config keys: {sorted(unknown)}")
+    for name, value in overrides.items():
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"runtime_config {name} must be a positive integer")
+    return {**RING_CONFIG, **overrides}
+
+
+def load_manifest(platform=None, suite="all"):
     manifest = read_json(MANIFEST)
     ids = [case["case_id"] for case in manifest["cases"]]
     if len(set(ids)) != len(ids):
         raise ValueError("duplicate case_id in the manifest")
+    for case in manifest["cases"]:
+        ring_config(case)
     if platform is not None:
         manifest["cases"] = [case for case in manifest["cases"]
                              if case.get("platform", manifest["platform"]) == platform]
         if not manifest["cases"]:
             raise ValueError(f"no performance cases for platform {platform}")
+    if suite != "all":
+        manifest["cases"] = [case for case in manifest["cases"] if case.get("suite", "default") == suite]
+        if not manifest["cases"]:
+            raise ValueError(f"no performance cases for suite {suite} on platform {platform}")
     return manifest
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def case_contract(manifest, case):
+    reference = case.get("reference_profile")
+    profiles = manifest.get("reference_profiles", {})
+    if reference is not None and reference not in profiles:
+        raise ValueError(f"unknown reference profile: {reference}")
+    return {"case": case, "sampling": manifest["sampling"],
+            "reference_profile": profiles.get(reference),
+            "platform": case.get("platform", manifest["platform"])}
+
+
+def source_hashes(entry):
+    paths = {ROOT / entry, Path(__file__).resolve()}
+    for directory in (ROOT / "models/glm5_3_flash", ROOT / "golden"):
+        paths.update(directory.glob("*.py"))
+    return {str(path.relative_to(ROOT)): sha256(path) for path in sorted(paths)}
+
+
+def validate_glm_dimensions(manifest, case):
+    """Reject changed model geometry or numerics rather than moving its baseline."""
+    if case.get("suite") != "glm5.3-flash":
+        return
+    profile = case_contract(manifest, case)["reference_profile"] or {}
+    dimensions = profile.get("model_config", {})
+    if not dimensions:
+        return
+    config = importlib.import_module("models.glm5_3_flash.config")
+    for name, expected in dimensions.items():
+        actual = getattr(config.FLASH, name)
+        if actual != expected:
+            raise ValueError(f"fixed GLM parameter {name} changed: expected {expected}, got {actual}")
+    for attribute, name in (("TP_SIZE", "tp"), ("EP_SIZE", "ep")):
+        expected = profile.get(name)
+        if expected is not None and getattr(config, attribute) != expected:
+            raise ValueError(f"fixed GLM {name} differs from the imported model configuration")
+
+
+@contextmanager
+def cached_native_only():
+    """Fail on a cache miss before a device replay can start CPU compilation."""
+    from pypto.runtime import device_runner
+    from pypto.runtime.debug import pto_rebuild
+
+    def forbidden(*_args, **_kwargs):
+        raise RuntimeError("prepared performance case requires native compilation; prepare it again on CPU")
+
+    # Registration wrappers also load cached sidecars. Guard the common native
+    # compiler/linker subprocess boundary, not those cache-aware wrappers.
+    compiler = device_runner.KernelCompiler
+    original = compiler._run
+    original_ptoas = pto_rebuild._run_ptoas
+    try:
+        compiler._run = forbidden
+        pto_rebuild._run_ptoas = forbidden
+        yield
+    finally:
+        compiler._run = original
+        pto_rebuild._run_ptoas = original_ptoas
+
+
+def model_argv(manifest, case, selected):
+    entry = ROOT / case["entrypoint"]
+    platform = case.get("platform", manifest["platform"])
+    argv = [str(entry), "-p", platform, "-d", ",".join(map(str, selected)), *case["arguments"]]
+    if platform == "a2a3":
+        argv += ["--enable-chip-swimlane", "0"]
+    return argv
+
+
+def prepare_case(args):
+    """Compile, assemble and freeze the original golden case without a device."""
+    # cloudpickle is provided by the Simpler runtime, also used for its callables.
+    import cloudpickle
+    import golden
+    from golden import ScalarSpec, TensorSpec, runner
+    from pypto.runtime.device_runner import _compile_and_assemble
+
+    manifest = load_manifest()
+    case = next(case for case in manifest["cases"] if case["case_id"] == args.case)
+    if case.get("suite") != "glm5.3-flash" or case["device_count"] != 1:
+        raise ValueError("CPU preparation currently supports the single-device GLM suite")
+    prepared = args.output.resolve()
+    prepared.parent.mkdir(parents=True, exist_ok=True)
+    if prepared.exists():
+        raise ValueError(f"prepared case already exists: {prepared}")
+    platform = case.get("platform", manifest["platform"])
+    sources = source_hashes(case["entrypoint"])
+    original_run = golden.run
+    calls = 0
+    metadata = None
+    os.environ["PYPTO_BENCH"] = "0"
+
+    def freeze(**kwargs):
+        nonlocal calls, metadata
+        calls += 1
+        if calls != 1:
+            raise ValueError("a case must call golden.run exactly once")
+        if kwargs.get("golden_fn") is None:
+            raise ValueError("GLM performance preparation requires an independent golden")
+        cfg = {**kwargs["config"], **ring_config(case), "device_id": 0, "execution_mode": False,
+               "enable_chip_swimlane": 0}
+        if cfg.get("distributed_config") is not None:
+            raise ValueError("GLM local-shard performance cases must not allocate distributed workers")
+        compile_kwargs = {**kwargs, "config": cfg, "compile_only": True, "save_data": False,
+                          "runtime_dir": None, "golden_data": None}
+        result = original_run(**compile_kwargs)
+        if not result.passed:
+            raise ValueError(result.error or "CPU compilation failed")
+        build = Path(result.work_dir).resolve()
+        # Populate the same registration/sidecar caches that ordinary replay
+        # reads. Exporting a separate prebuilt bundle does not fill every
+        # version's normal loader cache.
+        _compile_and_assemble(build, platform)
+        with cached_native_only():
+            runner._setup_runtime_dir(str(build), compile_label="prepared case", platform=platform)
+            _compile_and_assemble(build, platform)
+
+        specs = kwargs["specs"]
+        tensor_specs = [spec for spec in specs if isinstance(spec, TensorSpec)]
+        scalar_specs = [spec for spec in specs if isinstance(spec, ScalarSpec)]
+        if any(spec.has_benchmark_step for spec in scalar_specs):
+            raise ValueError("prepared GLM cases cannot use stepped scalar replay")
+        frozen = prepared.parent / "frozen"
+        tensors, scalars = runner._prepare_inputs(specs, tensor_specs, scalar_specs, None, frozen, True)
+        outputs = runner._compute_golden(
+            specs, tensor_specs, scalars, tensors, frozen, None, kwargs["golden_fn"], True,
+        )
+        if not outputs:
+            raise ValueError("GLM performance preparation produced no golden outputs")
+        clean_specs = [copy.copy(spec) for spec in specs]
+        for spec in clean_specs:
+            if isinstance(spec, TensorSpec):
+                spec.init_value = None
+        payload = {key: value for key, value in kwargs.items()
+                   if key not in ("fn", "golden_fn", "compile_only", "runtime_dir", "golden_data", "save_data")}
+        payload.update(specs=clean_specs, config=cfg)
+        payload_path = prepared.parent / "prepared-payload.pkl"
+        with payload_path.open("wb") as stream:
+            cloudpickle.dump(payload, stream)
+        with payload_path.open("rb") as stream:
+            restored = cloudpickle.load(stream)
+        # Exercise the serialized original callbacks before allocating a card.
+        # This checks callback bindings only, not device correctness.
+        reference_buffers = {**tensors, **{name: value.clone() for name, value in outputs.items()}}
+        runner._validate(
+            tensor_specs, reference_buffers, outputs, restored.get("rtol", 1e-5),
+            restored.get("atol", 1e-5), restored.get("compare_fn") or {}, scalars,
+        )
+        binaries = {str(path.relative_to(build)): sha256(path) for path in sorted(build.rglob("*"))
+                    if path.is_file() and path.suffix in (".bin", ".so", ".cpp", ".pto")}
+        if not any(name.endswith(".bin") for name in binaries):
+            raise ValueError("CPU preparation produced no native binaries")
+        metadata = {"contract": case_contract(manifest, case), "function": kwargs["fn"].__name__,
+                    "comparator_cpu_self_check": True,
+                    "sources": sources, "runtime_dir": str(build), "binaries": binaries,
+                    "payload_sha256": sha256(payload_path),
+                    "data": {str(path.relative_to(frozen / "data")): sha256(path)
+                             for path in sorted((frozen / "data").rglob("*.pt"))},
+                    "tensor_specs": [{"name": spec.name, "shape": list(spec.shape),
+                                      "dtype": str(spec.dtype), "direction": spec.direction}
+                                     for spec in tensor_specs]}
+        return result
+
+    sys.argv = model_argv(manifest, case, [0])
+    validate_glm_dimensions(manifest, case)
+    sys.path.insert(0, str((ROOT / case["entrypoint"]).parent))
+    golden.run = freeze
+    try:
+        runpy.run_path(str(ROOT / case["entrypoint"]), run_name="__main__")
+    finally:
+        golden.run = original_run
+    if calls != 1 or metadata is None:
+        raise ValueError("model produced no prepared case")
+    if source_hashes(case["entrypoint"]) != sources:
+        raise ValueError("model source changed during CPU preparation")
+    write_json(prepared, metadata)
+    return 0
+
+
+def replay_prepared(manifest, case, selected, output, prepared):
+    """Load the CPU-frozen contract without rerunning model fixture builders."""
+    import cloudpickle
+    import golden
+
+    metadata = read_json(prepared)
+    if metadata["contract"] != case_contract(manifest, case):
+        raise ValueError("prepared workload differs from the current manifest")
+    if source_hashes(case["entrypoint"]) != metadata["sources"]:
+        raise ValueError("source changed after CPU preparation")
+    build = Path(metadata["runtime_dir"])
+    data = prepared.parent / "frozen/data"
+    payload_path = prepared.parent / "prepared-payload.pkl"
+    if sha256(payload_path) != metadata["payload_sha256"]:
+        raise ValueError("prepared validation payload changed")
+    for directory, files in ((build, metadata["binaries"]), (data, metadata["data"])):
+        for name, expected in files.items():
+            if sha256(directory / name) != expected:
+                raise ValueError(f"prepared artifact changed: {name}")
+    if not any(name.startswith("out/") for name in metadata["data"]):
+        raise ValueError("prepared case has no correctness reference")
+    module = importlib.import_module(case["entrypoint"].removesuffix(".py").replace("/", "."))
+    validate_glm_dimensions(manifest, case)
+    fn = getattr(module, metadata["function"])
+    with payload_path.open("rb") as stream:
+        payload = cloudpickle.load(stream)
+    payload["config"].update(device_id=selected[0], execution_mode=False, enable_chip_swimlane=0)
+    with cached_native_only():
+        result = make_capture(golden.run, output, selected, case.get("runtime_config"))(
+            fn=fn, golden_fn=None, golden_data=str(data), runtime_dir=str(build), **payload,
+        )
+    if not result.passed:
+        raise ValueError(f"correctness failed: {result.error}")
 
 
 # ---------------------------------------------------------------------------
@@ -71,14 +317,23 @@ def benchmark_payload(stats):
                   for row in grid]
     else:
         rounds = [{str(item.pid): [item.effective_us]} for item in stats.invocations]
-    return {"rounds": stats.rounds, "warmup": stats.warmup,
+    payload = {"rounds": stats.rounds, "warmup": stats.warmup,
             "fallback_flattened": stats.fallback_flattened,
             "unstable_dispatch_slots": getattr(stats, "unstable_dispatch_slots", False),
             "all_zero_device": stats.all_zero_device, "samples": rounds}
+    payload["device_wall_us"] = stats.per_round("device")
+    payload["host_wall_us"] = stats.per_round("host")
+    payload["metric_boundaries"] = {
+        "samples": "Per-rank orch/sched execution windows; not a physical kernel interval union",
+        "device_wall_us": "Per-round device runner window; distributed rounds use the maximum rank",
+        "host_wall_us": "Per-round runtime host dispatch window, including transfers and synchronization",
+    }
+    return payload
 
 
-def make_capture(original_run, output, selected):
+def make_capture(original_run, output, selected, runtime_config=None):
     """Wrap golden.run: pin the ring settings and save the benchmark."""
+    fixed_ring = ring_config({"runtime_config": {} if runtime_config is None else runtime_config})
     def capture(**kwargs):
         if output.exists():
             raise ValueError("a case must call golden.run exactly once")
@@ -87,9 +342,9 @@ def make_capture(original_run, output, selected):
         actual = list(distributed.device_ids) if distributed else [cfg["device_id"]]
         if actual != selected:
             raise ValueError(f"model runs on devices {actual}, allocation is {selected}")
-        kwargs["config"] = {**cfg, **RING_CONFIG}
+        kwargs["config"] = {**cfg, **fixed_ring}
         result = original_run(**kwargs)
-        payload = {"passed": result.passed, "error": result.error}
+        payload = {"passed": result.passed, "error": result.error, "runtime_config": fixed_ring}
         if result.passed:
             payload["benchmark"] = benchmark_payload(result.bench)
         write_json(output, payload)
@@ -104,15 +359,17 @@ def run_case(args):
     selected = [int(item) for item in os.environ["TASK_DEVICE"].split(",")]
     if len(selected) != case["device_count"]:
         raise ValueError(f"allocated {len(selected)} devices, case needs {case['device_count']}")
+    sys.argv = model_argv(manifest, case, selected)
+    if case.get("suite") == "glm5.3-flash":
+        if args.prepared is None:
+            raise ValueError("GLM performance must be prepared on CPU before device allocation")
+        replay_prepared(manifest, case, selected, args.output, args.prepared.resolve())
+        return 0
     import golden
 
-    golden.run = make_capture(golden.run, args.output, selected)
+    golden.run = make_capture(golden.run, args.output, selected, case.get("runtime_config"))
     entry = ROOT / case["entrypoint"]
     sys.path.insert(0, str(entry.parent))
-    platform = case.get("platform", manifest["platform"])
-    sys.argv = [str(entry), "-p", platform, "-d", ",".join(map(str, selected)), *case["arguments"]]
-    if platform == "a2a3":
-        sys.argv += ["--enable-chip-swimlane", "0"]
     runpy.run_path(str(entry), run_name="__main__")
     if not args.output.is_file():
         raise ValueError("model produced no benchmark result")
@@ -159,6 +416,8 @@ def submit_command(case, case_dir, sampling):
                 if key in os.environ})
     capture = [sys.executable, str(ROOT / ".github/scripts/ci_perf.py"), "case",
                "--case", case["case_id"], "--output", str(case_dir / "raw-result.json")]
+    if case.get("suite") == "glm5.3-flash":
+        capture += ["--prepared", str(case_dir / "prepared.json")]
     payload = (f"cd {shlex.quote(str(ROOT))} && source activate.sh && cd {shlex.quote(str(case_dir))} && "
                + shlex.join(["env", *(f"{key}={value}" for key, value in env.items()), *capture]))
     command = ["task-submit", "--device", "auto"]
@@ -169,24 +428,30 @@ def submit_command(case, case_dir, sampling):
     return command + ["--timeout", str(QUEUE_TIMEOUT), "--max-time", str(CASE_TIMEOUT), "--run", payload]
 
 
-def render_report(manifest, results):
-    lines = ["| Case | Effective (us) |", "| --- | --- |"]
+def render_report(manifest, results, device_results=None):
+    device_results = device_results or {}
+    lines = ["| Case | Effective (us) | Device window median (us) |", "| --- | --- | --- |"]
     for case in manifest["cases"]:
         value = results.get(case["case_id"], "-")
-        lines.append(f"| {case['case_id']} | {value:.2f} |" if isinstance(value, float)
-                     else f"| {case['case_id']} | {value} |")
+        effective = f"{value:.2f}" if isinstance(value, float) else str(value)
+        window = device_results.get(case["case_id"])
+        device = f"{window:.2f}" if window is not None else "-"
+        lines.append(f"| {case['case_id']} | {effective} | {device} |")
+    lines.extend(["", "Effective retains the existing metric (single-device median; multi-device fastest-rank mean).",
+                  "Device window is the median of each round's maximum-rank device window; neither is kernel-only time."])
     return "\n".join(lines) + "\n"
 
 
-def run_ci(output, platform="a2a3"):
-    manifest = load_manifest(platform)
+def run_ci(output, platform="a2a3", suite="all"):
+    manifest = load_manifest(platform, suite)
     sampling = manifest["sampling"]
     work, published = output / "work", output / "published"
     work.mkdir(parents=True)
     published.mkdir(parents=True)
     env = {key: value for key, value in os.environ.items() if key not in ("GH_TOKEN", "GITHUB_TOKEN")}
-    results = {}
-    (published / "report.md").write_text(render_report(manifest, results))
+    results, device_results = {}, {}
+    write_json(published / "manifest.json", manifest)
+    (published / "report.md").write_text(render_report(manifest, results, device_results))
     for case in manifest["cases"]:
         case_id = case["case_id"]
         case_dir = work / case_id
@@ -194,6 +459,14 @@ def run_ci(output, platform="a2a3"):
         print(f"[perf] {case_id}: running on {case['device_count']} device(s)", flush=True)
         print(f"::group::{case_id}", flush=True)
         try:
+            if case.get("suite") == "glm5.3-flash":
+                command = [sys.executable, str(ROOT / ".github/scripts/ci_perf.py"), "prepare",
+                           "--case", case_id, "--output", str(case_dir / "prepared.json")]
+                with (case_dir / "prepare.log").open("w", encoding="utf-8") as log:
+                    prepared = subprocess.run(command, cwd=case_dir, env={**env, "PYPTO_BENCH": "0"},
+                                              stdout=log, stderr=subprocess.STDOUT, timeout=PREPARE_TIMEOUT)
+                if prepared.returncode:
+                    raise ValueError(f"CPU preparation exited {prepared.returncode}; see prepare.log")
             with (case_dir / "run.log").open("w", encoding="utf-8") as log, \
                  subprocess.Popen(submit_command(case, case_dir, sampling), env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -205,19 +478,24 @@ def run_ci(output, platform="a2a3"):
             rc = proc.returncode
             if rc != 0:
                 raise ValueError(f"task-submit exited {rc}")
-            results[case_id] = effective_us(read_json(case_dir / "raw-result.json"), case, sampling)
+            payload = read_json(case_dir / "raw-result.json")
+            results[case_id] = effective_us(payload, case, sampling)
+            windows = payload["benchmark"]["device_wall_us"]
+            if len(windows) != sampling["rounds"] or not any(windows):
+                raise ValueError("device window samples are incomplete or all zero")
+            device_results[case_id] = statistics.median(windows)
             print(f"[perf] {case_id}: {results[case_id]:.2f} us", flush=True)
-        except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
             results[case_id] = "FAIL"
             print(f"[perf] {case_id}: FAIL ({error}); see {case_id}/run.log in the artifact", flush=True)
         finally:
             print("::endgroup::", flush=True)
         # Publish logs and raw results only, never build trees.
         (published / case_id).mkdir()
-        for name in ("run.log", "raw-result.json"):
+        for name in ("prepare.log", "prepared.json", "run.log", "raw-result.json"):
             if (case_dir / name).is_file():
                 shutil.copyfile(case_dir / name, published / case_id / name)
-        (published / "report.md").write_text(render_report(manifest, results))
+        (published / "report.md").write_text(render_report(manifest, results, device_results))
     return 0 if all(isinstance(value, float) for value in results.values()) else 1
 
 
@@ -226,13 +504,20 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="mode", required=True)
     ci = commands.add_parser("ci", help="Run every case through task-submit and write report.md")
     ci.add_argument("--platform", choices=("a2a3", "a5"), default="a2a3")
+    ci.add_argument("--suite", choices=("all", "default", "glm5.3-flash"), default="all")
     ci.add_argument("--output-dir", required=True, type=Path)
+    prepare = commands.add_parser("prepare", help="Prepare and freeze one GLM case on CPU")
+    prepare.add_argument("--case", required=True)
+    prepare.add_argument("--output", required=True, type=Path)
     capture = commands.add_parser("case", help="Capture one model inside its task-submit allocation")
     capture.add_argument("--case", required=True)
     capture.add_argument("--output", required=True, type=Path)
+    capture.add_argument("--prepared", type=Path)
     args = parser.parse_args(argv)
     if args.mode == "ci":
-        return run_ci(args.output_dir.resolve(), args.platform)
+        return run_ci(args.output_dir.resolve(), args.platform, args.suite)
+    if args.mode == "prepare":
+        return prepare_case(args)
     return run_case(args)
 
 
