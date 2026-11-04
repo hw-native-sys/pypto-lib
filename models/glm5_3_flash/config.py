@@ -207,9 +207,6 @@ class Glm53FlashConfig:
             has_indexer=attention_kind is AttentionKind.SPARSE, has_hyper_connections=True, is_mtp=False,
         )
 
-    def backbone_layers(self) -> Tuple[Glm53LayerConfig, ...]:
-        return tuple(self.layer_config(layer_id) for layer_id in range(self.num_hidden_layers))
-
     def _validate_dimensions(self) -> None:
         if self.hidden_size <= 0 or self.vocab_size <= 0:
             raise ValueError("hidden_size and vocab_size must be positive")
