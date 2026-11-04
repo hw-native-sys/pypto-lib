@@ -303,13 +303,9 @@ def absorb_query(
     query: pl.Tensor[[T_DYN, LOCAL_H, QK_DIM], pl.BF16],
     w_k: pl.Tensor[[LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
     absorbed: pl.Tensor[[T_DYN, LOCAL_H, KV_LORA], pl.BF16],
-    query_extent: pl.constexpr = 0,
 ):
     """Multiply each query head by the BF16 key projection into latent space."""
-    if query_extent > 0:
-        t_dim = query_extent
-    else:
-        t_dim = pl.tensor.dim(query, 0)
+    t_dim = pl.tensor.dim(query, 0)
     t_mm = ((t_dim + PROJECTION_MM_T_TILE - 1) // PROJECTION_MM_T_TILE) * PROJECTION_MM_T_TILE
     absorbed_flat = pl.reshape(absorbed, [t_dim, LOCAL_H * KV_LORA])
     for head in pl.range(LOCAL_H):
@@ -349,7 +345,7 @@ def mla_absorb_query_test(
     """Run one query absorption for golden.run validation."""
     query.bind_dynamic(0, T_DYN)
     absorbed.bind_dynamic(0, T_DYN)
-    absorb_query(query, w_k, absorbed, 0)
+    absorb_query(query, w_k, absorbed)
     return absorbed
 
 
@@ -363,15 +359,11 @@ def prefill_sparse_attn(
     w_v: pl.Tensor[[LOCAL_H, V_DIM, KV_LORA], pl.BF16],
     topk_indices: pl.Tensor[[T_DYN, TOPK_INDEX_WIDTH], pl.INT32],
     output: pl.Tensor[[T_DYN, LOCAL_H, V_DIM], pl.BF16],
-    query_extent: pl.constexpr = 0,
 ):
     """Sparse attention over the selected latent rows, prefill path."""
-    if query_extent > 0:
-        t_dim = query_extent
-    else:
-        t_dim = pl.tensor.dim(query, 0)
+    t_dim = pl.tensor.dim(query, 0)
     absorbed = pl.create_tensor([t_dim, LOCAL_H, KV_LORA], dtype=pl.BF16)
-    absorb_query(query, w_k, absorbed, query_extent)
+    absorb_query(query, w_k, absorbed)
 
     # Head-major: the value expansion needs its M rows contiguous per head.
     context = pl.create_tensor([LOCAL_H * t_dim, KV_LORA], dtype=pl.BF16)
@@ -504,7 +496,7 @@ def prefill_sparse_attn_test(
     topk_indices.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
     block_table.bind_dynamic(1, BLOCK_TABLE_DYN)
-    prefill_sparse_attn(query, latent_cache, block_table, request_ids, w_k, w_v, topk_indices, output, 0)
+    prefill_sparse_attn(query, latent_cache, block_table, request_ids, w_k, w_v, topk_indices, output)
     return output
 
 

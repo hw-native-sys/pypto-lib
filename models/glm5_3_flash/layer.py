@@ -626,7 +626,6 @@ def dsa_attention_sublayer(
     pool_valid: pl.Tensor[[POOL_AXIS, POOL_VALID_WIDTH], pl.INT32],
     attn_partial: pl.Tensor[[CAPACITY, D], pl.FP32],
     skip_topk: pl.Scalar[pl.INT32],
-    query_extent: pl.constexpr = CAPACITY,
 ):
     """MLA NoPE projection -> latent cache publish -> kpool indexer chain -> sparse
     attention -> head projection, leaving the row-parallel FP32 partial.
@@ -659,7 +658,7 @@ def dsa_attention_sublayer(
         )
         indexer_topk(index_scores, seg_start, pool_count_tok, selected_pools, selected_valid)
     indexer_expand(selected_pools, selected_valid, tail_start, tail_count, kv_len_tok, topk_indices)
-    prefill_sparse_attn(query, latent_cache, block_table, request_ids, w_k, w_v, topk_indices, attn_out, query_extent)
+    prefill_sparse_attn(query, latent_cache, block_table, request_ids, w_k, w_v, topk_indices, attn_out)
     mla_epilog_w8a8(attn_out, w_o, w_o_scale, attn_partial)
 
 
@@ -699,7 +698,6 @@ def kda_attention_sublayer(
     value: pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     kda_out: pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     attn_partial: pl.Tensor[[CAPACITY, D], pl.FP32],
-    query_extent: pl.constexpr = CAPACITY,
 ):
     """KDA projection -> causal conv -> chunked delta attention -> gated output."""
     stack_conv_weight(conv_q, conv_k, conv_v, conv_w)
@@ -710,7 +708,7 @@ def kda_attention_sublayer(
     kda_conv_prefill(mixed_qkv, conv_w, conv_state, query_start_loc, kda_state_rows, query, key, value)
     prefill_kda(
         query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, tri_incl,
-        tri_strict, head_onehot, eye_wide, kda_out, query_extent, BATCH, state_extent=KDA_ROWS,
+        tri_strict, head_onehot, eye_wide, kda_out,
     )
 
 
@@ -903,7 +901,6 @@ def prefill_kda_attention(
     kda_ord: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     attn_epoch: pl.Scalar[pl.INT32],
-    query_extent: pl.constexpr = CAPACITY,
 ):
     """Run resident KDA attention with runtime layer ordinals."""
     num_tokens: pl.Scalar[pl.INT32] = pl.read(active_tokens, [0])
@@ -945,7 +942,7 @@ def prefill_kda_attention(
             conv_state_l, recurrent_state_l, query_start_loc, kda_state_rows, kda_tri_incl, kda_tri_strict,
             kda_head_onehot, kda_eye_wide, conv_w, mixed_qkv, decay, beta, out_gate,
             kda_q, kda_k, kda_v, kda_out,
-            out_attn_partial, query_extent,
+            out_attn_partial,
         )
         kda_output(kda_out, kda_o_norm_l, out_gate, kda_w_o_l, out_attn_partial)
         tp_all_reduce(out_attn_partial, tp_partial, tp_arrived, out_sublayer_out, num_tokens, my_rank, 0, attn_epoch)
@@ -1156,7 +1153,6 @@ def prefill_dense_layer(
     my_rank: pl.Scalar[pl.INT32],
     attn_epoch: pl.Scalar[pl.INT32],
     ffn_epoch: pl.Scalar[pl.INT32],
-    query_extent: pl.constexpr = CAPACITY,
 ):
     """Run a resident KDA layer with a dense feed-forward sublayer."""
     num_tokens: pl.Scalar[pl.INT32] = pl.read(active_tokens, [0])
@@ -1206,7 +1202,7 @@ def prefill_dense_layer(
             conv_state_l, recurrent_state_l, query_start_loc, kda_state_rows, kda_tri_incl, kda_tri_strict,
             kda_head_onehot, kda_eye_wide, conv_w, mixed_qkv, decay, beta, out_gate,
             kda_q, kda_k, kda_v, kda_out,
-            out_attn_partial, query_extent,
+            out_attn_partial,
         )
         kda_output(kda_out, kda_o_norm_l, out_gate, kda_w_o_l, out_attn_partial)
         tp_all_reduce(out_attn_partial, tp_partial, tp_arrived, out_sublayer_out, num_tokens, my_rank, 0, attn_epoch)
@@ -1320,7 +1316,6 @@ def prefill_sparse_attention(
     my_rank: pl.Scalar[pl.INT32],
     attn_epoch: pl.Scalar[pl.INT32],
     skip_topk: pl.Scalar[pl.INT32],
-    query_extent: pl.constexpr = CAPACITY,
 ):
     """Run resident sparse attention with runtime layer ordinals."""
     num_tokens: pl.Scalar[pl.INT32] = pl.read(active_tokens, [0])
@@ -1381,7 +1376,7 @@ def prefill_sparse_attention(
             kv_len_tok, q_resid, dsa_query, kv_latent, attn_out, index_q, index_k, head_weights, gate_scores,
             index_scores,
             selected_pools, selected_valid, topk_indices, pool_valid,
-            out_attn_partial, skip_topk, query_extent,
+            out_attn_partial, skip_topk,
         )
         tp_all_reduce(out_attn_partial, tp_partial, tp_arrived, out_sublayer_out, num_tokens, my_rank, 0, attn_epoch)
         zero_bf16_padding_rows(out_sublayer_out, num_tokens)

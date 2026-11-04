@@ -210,7 +210,7 @@ def decode_hidden_fwd(
                 ws_ffn_input, ws_ffn_partial, ws_ffn_out, following, kda_out,
                 mixed_qkv, decay, beta, kda_q, kda_k,
                 kda_v, dense_x_int8, bb_ord, kda_ord, dense_ord,
-                rank, attn_epoch, ffn_epoch, BATCH,
+                rank, attn_epoch, ffn_epoch,
             )
         else:
             if layer % 4 == 3:
@@ -227,7 +227,7 @@ def decode_hidden_fwd(
                     ws_attn_post, ws_attn_res, ws_collapsed, ws_normed, ws_attn_partial,
                     ws_sublayer_out, ws_x_hc_mid, dsa_query, attn_out, index_q,
                     index_k, index_scores, selected_pools, selected_valid, bb_ord,
-                    dsa_ord, rank, attn_epoch, skip_topk, BATCH,
+                    dsa_ord, rank, attn_epoch, skip_topk,
                 )
             else:
                 _inline_prefill_kda_attention(
@@ -241,7 +241,6 @@ def decode_hidden_fwd(
                     ws_normed, ws_attn_partial, ws_sublayer_out, ws_x_hc_mid, kda_out,
                     mixed_qkv, decay, beta, kda_q, kda_k,
                     kda_v, bb_ord, kda_ord, rank, attn_epoch,
-                    BATCH,
                 )
             _complete_forward_stage(ws_x_hc_mid)
             _inline_prefill_moe_layer(
