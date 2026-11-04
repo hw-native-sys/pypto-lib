@@ -153,10 +153,10 @@ AICORE inline void produceWeight(__gm__ uint8_t* weight, int64_t k, int64_t n,
 #ifdef __DAV_CUBE__
 template <typename AStage, typename GlobalA>
 AICORE inline void loadAStage(AStage& target, __gm__ float8_e4m3_t* x,
-                             int64_t k, int64_t rows, Chunk chunk, int64_t start, uint32_t slot)
+                             int64_t k, int64_t rows, Chunk chunk, int64_t start, uint32_t slot, int64_t limit)
 {
     const auto event = static_cast<event_t>(2 + slot);
-    const int64_t validK = k - start < A_STAGE_K ? k - start : A_STAGE_K;
+    const int64_t validK = limit - start < A_STAGE_K ? limit - start : A_STAGE_K;
     target.SetValidCol(validK);
     GlobalA globalA(x + chunk.stageRow * k + start,
                     typename GlobalA::Shape(1, 1, 1, chunk.validRows, validK),
@@ -170,12 +170,12 @@ template <typename AScale, typename BScale, typename GlobalAScale, typename Glob
 AICORE inline void loadScaleStage(AScale& aScale, BScale& bScale,
                                  __gm__ float8_e8m0_t* xScale, __gm__ float8_e8m0_t* weightScale,
                                  int64_t k, int64_t n, int64_t experts, int64_t rows,
-                                 Chunk chunk, int64_t n0, int64_t start, uint32_t slot)
+                                 Chunk chunk, int64_t n0, int64_t start, uint32_t slot, int64_t limit)
 {
     const auto event = static_cast<event_t>(4 + slot);
     const int64_t q = k / 32;
     const int64_t globalQ = experts * q;
-    const int64_t validQ = (k - start < SCALE_STAGE_K ? k - start : SCALE_STAGE_K) / 32;
+    const int64_t validQ = (limit - start < SCALE_STAGE_K ? limit - start : SCALE_STAGE_K) / 32;
     const int64_t alignedRows = ((chunk.validRows + 15) / 16) * 16;
     aScale.SetValidRow(alignedRows);
     aScale.SetValidCol(validQ);
@@ -247,9 +247,9 @@ AICORE inline void computeProjection(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0
         TASSIGN(bScale[slot], GetScaleAddr(b[slot].data()));
     }
     TASSIGN(acc, 0);
-    loadAStage<MatA, GlobalA>(aMat[0], x, k, rows, chunk, kBegin, 0);
+    loadAStage<MatA, GlobalA>(aMat[0], x, k, rows, chunk, kBegin, 0, limit);
     loadScaleStage<MatAScale, MatBScale, GlobalAScale, GlobalBScale>(
-        aScaleMat[0], bScaleMat[0], xScale, weightScale, k, n, experts, rows, chunk, n0, kBegin, 0);
+        aScaleMat[0], bScaleMat[0], xScale, weightScale, k, n, experts, rows, chunk, n0, kBegin, 0, limit);
     for (int64_t k0 = kBegin; k0 < limit; k0 += K_TILE) {
         const uint32_t slot = ((k0 - kBegin) / K_TILE) % 2;
         const uint32_t aSlot = ((k0 - kBegin) / A_STAGE_K) % 2;
@@ -294,12 +294,12 @@ AICORE inline void computeProjection(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0
             set_flag(PIPE_M, PIPE_MTE1, event);
         }
         if (aOffset == 0 && k0 + A_STAGE_K < limit) {
-            loadAStage<MatA, GlobalA>(aMat[1-aSlot], x, k, rows, chunk, k0 + A_STAGE_K, 1-aSlot);
+            loadAStage<MatA, GlobalA>(aMat[1-aSlot], x, k, rows, chunk, k0 + A_STAGE_K, 1-aSlot, limit);
         }
         if (scaleOffset == 0 && k0 + SCALE_STAGE_K < limit) {
             loadScaleStage<MatAScale, MatBScale, GlobalAScale, GlobalBScale>(
                 aScaleMat[1-scaleSlot], bScaleMat[1-scaleSlot], xScale, weightScale,
-                k, n, experts, rows, chunk, n0, k0 + SCALE_STAGE_K, 1-scaleSlot);
+                k, n, experts, rows, chunk, n0, k0 + SCALE_STAGE_K, 1-scaleSlot, limit);
         }
     }
     sink(acc);
