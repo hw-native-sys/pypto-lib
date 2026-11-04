@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from models.glm5_3_flash.config import FLASH, TP_SIZE, D, Glm53FlashConfig
 from models.glm5_3_flash.elementwise import accurate_divide, accurate_exp
 from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
-from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, expert, quantize_per_token_int8
+from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
 from models.glm5_3_flash.utils import _assert_close, _randn
 
 T_DYN = pl.dynamic('GLM53_T_DYN')
@@ -255,15 +255,6 @@ def dense_mlp_test(
 
     dense_mlp(x_int8, x_scale, w_gate_up, w_gate_up_scale, w_down, w_down_scale, output)
     return output
-
-
-def golden_dense_mlp(
-    x: torch.Tensor,
-    w_gate: torch.Tensor,
-    w_up: torch.Tensor,
-    w_down: torch.Tensor,
-) -> torch.Tensor:
-    return expert(x, w_gate, w_up, w_down)
 
 
 def golden_dense_mlp_fn(tensors):

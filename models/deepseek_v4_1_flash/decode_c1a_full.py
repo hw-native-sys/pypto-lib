@@ -10,22 +10,18 @@
 
 
 import pypto.language as pl
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
-from o_proj import o_proj
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from decode_indexer import (
-    select_candidate_block_pool, c1a_index, score_select_c1a_groups,
-    publish_index_rows, c1a_project_index_key, c1a_rotate_index_key,
+    select_candidate_block_pool, c1a_index, score_select_paged,
+    publish_index_rows, project_index_key,
 )
-from sparse_attention import (
-    attend_selected, gather_packed, publish_window_row, GATHER_WORKERS as GATHER_WORKER_TILE,
-)
+from sparse_attention import _attend_project
 from hc import hc_project, hc_sinkhorn, hc_head_norm, hc_post
 from config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
 )
-from rmsnorm import rms_norm
-from compressor import c1a_compressor_project, compressor_rope, c1a_compressor_publish
+from compressor import c1a_compressor_project, c1a_compressor_publish
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -105,7 +101,6 @@ def decode_c1a_full(
     x_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
     qr, query, qb_payload, qb_scales = q_proj_rope(
@@ -116,39 +111,25 @@ def decode_c1a_full(
         qr, query,
         num_tokens,
     )
-    kv_proj_rope(
-        proj_payload, proj_scales,
-        wkv, wkv_scale, kv_norm_weight,
-        rope_cos, rope_sin,
-        kv_projection, kv,
-        num_tokens,
+    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    window_publish(
+        kv_projection, kv_norm_weight, rope_cos, rope_sin,
+        window_slots, window_cache, window_cache_scale,
+        num_tokens, x_ready,
     )
-    publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     projected, pc_tid = c1a_compressor_project(x_norm, compressor_wkv, projected, num_tokens, x_ready)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    with pl.spmd((num_tokens + 7) // 8, name_hint="norm_cmp", deps=[pc_tid]) as nc_tid:
-        norm_worker = pl.tile.get_block_idx()
-        rms_norm(projected, compressor_norm_weight, latent, norm_worker, num_tokens, width=HEAD_DIM)
-    projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    pk_tid = c1a_project_index_key(latent, index_wk, projected_key, num_tokens, nc_tid)
-    normalized_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    with pl.spmd((num_tokens + 7) // 8, name_hint="norm_idx_k", deps=[pk_tid]) as nk_tid:
-        norm_worker = pl.tile.get_block_idx()
-        rms_norm(projected_key, index_norm_weight, normalized_key, norm_worker, num_tokens, width=INDEX_DIM)
-    index_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    ik_tid = c1a_rotate_index_key(
-        normalized_key, compressed_rope_cos, compressed_rope_sin, index_key, num_tokens, nk_tid,
-    )
-    index_ready = publish_index_rows(
-        index_key, compressed_slots, index_cache, index_cache_scale, num_tokens, x_ready, ik_tid,
-    )
-    compressed_rotated = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    compressed_rotated = compressor_rope(
-        latent, compressed_rope_cos, compressed_rope_sin, compressed_rotated, num_tokens,
-    )
     compressed_ready = c1a_compressor_publish(
-        compressed_rotated, compressed_slots, compressed_cache, compressed_cache_scale, num_tokens, x_ready,
+        projected, compressor_norm_weight, latent, compressed_rope_cos, compressed_rope_sin,
+        compressed_slots, compressed_cache, compressed_cache_scale,
+        num_tokens, x_ready, pc_tid,
+    )
+    projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+    pk_tid = project_index_key(latent, index_wk, projected_key, num_tokens, compressed_ready, max_workers=8)
+    index_ready = publish_index_rows(
+        projected_key, index_norm_weight, compressed_rope_cos, compressed_rope_sin, compressed_slots,
+        index_cache, index_cache_scale, num_tokens, x_ready, pk_tid,
     )
     # Logical index score capacity.
     score_width = pl.tensor.dim(index_block_table, 1) * 128
@@ -157,30 +138,23 @@ def decode_c1a_full(
         num_tokens, score_width, x_ready,
         qb_payload, qb_scales,
     )
-    topk_tid, scores_tid = score_select_c1a_groups(
+    topk_tid, scores_tid = score_select_paged(
         index_query, index_query_scale, index_weights,
         index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
         scores, topk_indices,
         num_tokens, index_ready, query_tid, weights_tid,
-        pl.tensor.dim(pool_block_ids, 1),
+        pl.tensor.dim(pool_block_ids, 1), False,
     )
     pool_tid = select_candidate_block_pool(
         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
     )
     selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_ready])
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([tokens, 640, HEAD_DIM], dtype=pl.BF16)
-    indices = pl.create_tensor([tokens, 640], dtype=pl.INT32)
-    selected_ret, indices_ret, gather_tid = gather_packed(
-        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-        window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
-        max_workers=GATHER_WORKER_TILE, name_hint="c1a_gather",
-    )
-    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        attn_out, num_tokens,
+    _attend_project(
+        query, window_indices, window_cache, window_cache_scale, topk_indices,
+        compressed_cache, compressed_cache_scale, attn_sink,
+        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out,
+        num_tokens, selection_ready, compressed_keys=INDEX_TOPK,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)

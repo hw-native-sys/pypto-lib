@@ -19,6 +19,8 @@ amax+rescale of the same tokens.
 """
 
 
+from math import gcd
+
 import pypto.language as pl
 
 from config import (FLASH as M, MOE_TOKENS, INT8_SCALE_MAX, INT8_AMAX_EPS)
@@ -31,9 +33,8 @@ MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
 
 # tiling
-SH_M_TILE = 64
+SH_M_TILE = 128 if T % 128 == 0 else 64
 SH_ROW_PAD = 8
-SH_ROWS_PER_BLOCK = 2
 T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
 # Decode (T <= SH_M_TILE, single partial block) or prefill (T a multiple of
 # SH_M_TILE, fully valid blocks); a T that is neither would need a dynamic
@@ -41,20 +42,21 @@ T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
 assert T <= SH_M_TILE or T % SH_M_TILE == 0, \
     "expert_shared needs T <= SH_M_TILE (decode) or T a multiple of SH_M_TILE (prefill)"
 SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
+SH_ROWS_PER_BLOCK = gcd(SH_ROW_PAD, SH_VALID_M)
 N_MTILES = T_PAD // SH_M_TILE
 assert SH_VALID_M % SH_ROWS_PER_BLOCK == 0
 
-K_TILE = 1024
+K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 128
-SH_MM_BLOCKS = 6
+SH_MM_BLOCKS = 16 if SH_M_TILE == 128 else 8
 ACT_INTER_TILE = 1024
-D_OUT_TILE = 256
+D_OUT_TILE = 128 if SH_M_TILE == 128 or SH_VALID_M < SH_M_TILE else 256
+W2_SPLIT_MODE = pl.SplitMode.NONE if SH_VALID_M < SH_M_TILE else pl.SplitMode.UP_DOWN
+W2_PIPE_SLOTS = 1 if SH_M_TILE == 128 else 2
 W2_INNER = 2
 # h_tile_i8 stores use a whole number of a2a3 512-byte L2 cache lines.
 QUANT_TILE = 2048
-D_OUT_TILE_ACT = 128
-W2_ACT_INNER = 8
 
 
 def _expert_shared(
@@ -75,38 +77,22 @@ def _expert_shared(
         gate_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
         up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
 
-        # gate (w1) cube matmul -> INT32 GM accumulator.
-        for nb_idx in pl.spmd(
-            SH_MM_BLOCKS,
-            name_hint="sh_gate_mm",
-            allow_early_resolve=True,
-        ):
-            # Weight reads bypass L2.
-            pl.set_cache_policy(shared_w1, pl.CachePolicy.BYPASS)
+        # Paired gate/up projections with a shared input tile.
+        for nb_idx in pl.spmd(SH_MM_BLOCKS, name_hint="sh_gate_up_mm", allow_early_resolve=True):
             for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
                 n0 = ng * MM_INTER_TILE
-                gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                xs_first = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, 0], valid_shape=[SH_VALID_M, K_TILE])
+                sw1_first = shared_w1[n0 : n0 + MM_INTER_TILE, 0:K_TILE]
+                sw3_first = shared_w3[n0 : n0 + MM_INTER_TILE, 0:K_TILE]
+                gate_acc = pl.matmul(xs_first, sw1_first, b_trans=True, out_dtype=pl.INT32)
+                up_acc = pl.matmul(xs_first, sw3_first, b_trans=True, out_dtype=pl.INT32)
+                for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
                     xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
                     sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                    gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True, init_cond=(k0 == 0))
-                gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
-
-        # up (w3) cube matmul -> INT32 GM accumulator.
-        for nb_idx in pl.spmd(
-            SH_MM_BLOCKS,
-            name_hint="sh_up_mm",
-            allow_early_resolve=True,
-        ):
-            # Weight reads bypass L2.
-            pl.set_cache_policy(shared_w3, pl.CachePolicy.BYPASS)
-            for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
-                n0 = ng * MM_INTER_TILE
-                up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
                     sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                    up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True, init_cond=(k0 == 0))
+                    gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
+                    up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True)
+                gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
                 up_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
 
         # Each AIV block owns SH_ROWS_PER_BLOCK rows across the intermediate axis.
@@ -229,16 +215,15 @@ def _expert_shared(
                     0:SH_ROWS_PER_BLOCK, :
                 ]
 
-        # w2 (down) cube matmul -> INT32 GM accumulator.
-        y_i32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.INT32)
+        # W2 matmul, dequantization, and BF16 output.
         for db_idx in pl.spmd(
             D // (W2_INNER * D_OUT_TILE),
             name_hint="sh_w2_mm",
             allow_early_resolve=True,
+            optimizations=[pl.split(W2_SPLIT_MODE), pl.cross_core_slot(slot_num=W2_PIPE_SLOTS)],
         ):
-            # Weight reads bypass L2.
-            pl.set_cache_policy(shared_w2, pl.CachePolicy.BYPASS)
             d_base = db_idx * (W2_INNER * D_OUT_TILE)
+            h_scale = pl.row_max(h_tile_scale_dq[:, :])
             for dg in pl.range(W2_INNER):
                 d0 = d_base + dg * D_OUT_TILE
                 y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
@@ -248,27 +233,13 @@ def _expert_shared(
                         d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K
                     ]
                     y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True, init_cond=(k0 == 0))
-                y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
-        # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.
-        for db_idx in pl.spmd(
-            D // (W2_ACT_INNER * D_OUT_TILE_ACT),
-            name_hint="sh_w2_act",
-            allow_early_resolve=True,
-        ):
-            d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
-            h_scale = pl.row_max(h_tile_scale_dq[:, :])
-            for dg in pl.pipeline(W2_ACT_INNER, stage=2):
-                d0 = d_base + dg * D_OUT_TILE_ACT
-                y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
-                w2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
-                y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
+                w2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE], [1, D_OUT_TILE])
+                y_2d = pl.cast(y_acc, target_type=pl.FP32, mode="none")
                 y_2d = pl.col_expand_mul(
                     pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk
                 )
-                # Write valid rows straight to the (unpadded) output, mirroring
-                # expert_routed's direct recv_y store; no sh_pad round-trip.
                 y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
-                sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE_ACT] = y_bf16[0:SH_VALID_M, :]
+                sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE] = y_bf16[0:SH_VALID_M, :]
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value; sh is convenient because it's already pl.Out.

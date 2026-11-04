@@ -302,7 +302,6 @@ def draft_layer(
     routed_w2_scale: pl.Tensor,
     routed_w3: pl.Tensor,
     routed_w3_scale: pl.Tensor,
-    mxfp4_pair_lut: pl.Tensor,
     shared_w1: pl.Tensor,
     shared_w1_scale: pl.Tensor,
     shared_w2: pl.Tensor,
@@ -319,7 +318,6 @@ def draft_layer(
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[C.EP_SIZE, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
@@ -399,7 +397,6 @@ def draft_layer(
         routed_w2_scale,
         routed_w3,
         routed_w3_scale,
-        mxfp4_pair_lut,
         shared_w1,
         shared_w1_scale,
         shared_w2,
@@ -414,7 +411,6 @@ def draft_layer(
         recv_scale,
         recv_weights,
         recv_routes,
-        arrived,
         data_arrived,
         routed_output,
         combine_arrived,
@@ -470,7 +466,7 @@ def _dspark_drafter(
     hc_ffn_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[DSPARK_DRAFT_LAYERS, MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, D], pl.BF16],
-    gate_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[DSPARK_DRAFT_LAYERS, N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[
         [DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
@@ -490,7 +486,6 @@ def _dspark_drafter(
     routed_w3_scale: pl.Tensor[
         [DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0
     ],
-    mxfp4_pair_lut: pl.Tensor[[2, 256], pl.INT16],
     shared_w1: pl.Tensor[[DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[DSPARK_DRAFT_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
@@ -505,7 +500,6 @@ def _dspark_drafter(
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
     recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[C.EP_SIZE, SIGNAL_PAD], pl.INT32],
     data_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[C.ROUTE_T_DYN, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
@@ -687,7 +681,6 @@ def _dspark_drafter(
                 layer_routed_w2_scale,
                 routed_w3[layer],
                 layer_routed_w3_scale,
-                mxfp4_pair_lut,
                 shared_w1[layer],
                 layer_shared_w1_scale,
                 shared_w2[layer],
@@ -704,7 +697,6 @@ def _dspark_drafter(
                 recv_scale,
                 recv_weights,
                 recv_routes,
-                arrived,
                 data_arrived,
                 routed_output,
                 combine_arrived,
@@ -777,7 +769,7 @@ def l3_dspark_drafter(
     hc_ffn_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D], pl.BF16],
-    gate_weight: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[
         [C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
@@ -797,7 +789,6 @@ def l3_dspark_drafter(
     routed_w3_scale: pl.Tensor[
         [C.EP_SIZE, DSPARK_DRAFT_LAYERS, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0
     ],
-    mxfp4_pair_lut: pl.Tensor[[C.EP_SIZE, 2, 256], pl.INT16],
     shared_w1: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
     shared_w1_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     shared_w2: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
@@ -831,7 +822,6 @@ def l3_dspark_drafter(
     recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
     recv_weights_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
     recv_routes_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-    arrived_buf = pld.alloc_window_buffer([C.EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
     routed_output_buf = pld.alloc_window_buffer([C.MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
@@ -843,7 +833,6 @@ def l3_dspark_drafter(
         recv_scale = pld.window(recv_scale_buf, [N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
         recv_weights = pld.window(recv_weights_buf, [N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
         recv_routes = pld.window(recv_routes_buf, [N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
-        arrived = pld.window(arrived_buf, [C.EP_SIZE, SIGNAL_PAD], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buf, [C.EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32)
         routed_output = pld.window(routed_output_buf, [C.MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(
@@ -895,7 +884,6 @@ def l3_dspark_drafter(
             routed_w2_scale[rank],
             routed_w3[rank],
             routed_w3_scale[rank],
-            mxfp4_pair_lut[rank],
             shared_w1[rank],
             shared_w1_scale[rank],
             shared_w2[rank],
@@ -910,7 +898,6 @@ def l3_dspark_drafter(
             recv_scale,
             recv_weights,
             recv_routes,
-            arrived,
             data_arrived,
             routed_output,
             combine_arrived,

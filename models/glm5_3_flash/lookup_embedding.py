@@ -9,9 +9,12 @@
 """Look up one vocabulary shard and replicate BF16 embeddings into mHC streams."""
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import torch
 
-from models.glm5_3_flash.config import HC_MULT, LOCAL_VOCAB, D
+from models.glm5_3_flash.all_reduce import tp_all_reduce
+from models.glm5_3_flash.config import EP_SIZE, HC_MULT, LOCAL_VOCAB, D
+from models.glm5_3_flash.mhc import seed_hc_streams
 
 T_DYN = pl.dynamic('GLM53_T_DYN')
 
@@ -42,6 +45,32 @@ def lookup_embedding(
             for stream in pl.range(HC_MULT):
                 row = token * HC_MULT + stream
                 streams_flat[row : row + 1, hidden_offset : hidden_offset + D_TILE] = chunk
+    return hidden_streams
+
+
+@pl.jit.inline(auto_scope=False)
+def tp_lookup_embedding(
+    token_ids: pl.Tensor[[T_DYN], pl.INT32],
+    table: pl.Tensor[[LOCAL_VOCAB, D], pl.BF16],
+    partial: pl.Tensor[[T_DYN, D], pl.FP32],
+    embedding_rows: pl.Tensor[[T_DYN, D], pl.BF16],
+    hidden_streams: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    exchange: pld.DistributedTensor[[T_DYN, D], pl.FP32],
+    arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+):
+    """Gather vocabulary shards, reduce one stream, and seed all mHC streams."""
+    lookup_embedding(token_ids, table, rank * LOCAL_VOCAB, hidden_streams)
+    rows = pl.tensor.dim(token_ids, 0)
+    for row in pl.spmd(rows, name_hint="embedding_partial"):
+        local = pl.slice(hidden_streams, [1, 1, D], [row, 0, 0])
+        local_flat = pl.reshape(local, [1, D])
+        partial[row:row + 1, 0:D] = pl.cast(local_flat, pl.FP32)
+        embedding_rows[row:row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+    tp_all_reduce(partial, exchange, arrived, embedding_rows, num_tokens, rank, 0, epoch)
+    seed_hc_streams(embedding_rows, hidden_streams)
     return hidden_streams
 
 

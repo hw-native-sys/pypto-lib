@@ -25,15 +25,14 @@ from hc import golden_hc_post, hc_post, prefill_sp_post
 from hc import golden_hc_collapse, hc_pre
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from sparse_attention import (
-    attend_packed, golden_compressed_attention, golden_prefill_c1a_attention,
-    prefill_publish_window,
+    _attend_project, golden_compressed_attention, golden_prefill_c1a_attention,
 )
 from prefill_c1a_full import (
     CASE_DEFAULT, CASE_MAX_TOKENS, CASE_NAMES, apply_distributed_golden, fixture_token_count, make_fixture_values, topk_indices_compare, wrap_attention_compare, COMMON_INPUT_NAMES,
 )
 from prefill_cp_allgather import prefill_sp_input_allgather
-from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
-from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj_rope
+from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, prefill_tp_output_all_reduce
+from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from prefill_indexer import (
     prefill_indexer, golden_prefill_indexer,
     golden_prefill_index_scores as golden_index_scores,
@@ -144,31 +143,19 @@ def prefill_c1a_reindex_attention(
             rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
             pool_block_ids, pool_block_counts, topk_indices, num_tokens, cache_ready, pool=use_candidates, c2a=False,
         )
-        window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        kv_proj_rope(
-            proj_payload, proj_scales,
-            wkv, wkv_scale, kv_norm_weight,
-            rope_cos, rope_sin,
-            kv_projection, window_kv,
-            num_tokens,
-        )
-        window_ready = prefill_publish_window(
-            window_kv, window_slots, window_cache, window_cache_scale, num_tokens, indexer_completion,
+        kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+        window_ready = window_publish(
+            kv_projection, kv_norm_weight, rope_cos, rope_sin,
+            window_slots, window_cache, window_cache_scale,
+            num_tokens, indexer_completion,
         )
 
-        attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        attend_packed(
-            query,
-            window_indices, window_cache, window_cache_scale,
-            topk_indices, compressed_cache, compressed_cache_scale,
-            attn_sink, attended,
-            num_tokens, window_ready,
-        )
-        o_proj(
-            attended, wo_a, wo_a_scale, wo_b,
-            wo_b_scale, rope_cos, rope_sin,
-            partial, num_tokens,
+        _attend_project(
+            query, window_indices, window_cache, window_cache_scale,
+            topk_indices, compressed_cache, compressed_cache_scale, attn_sink,
+            wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial,
+            num_tokens, window_ready, compressed_keys=INDEX_TOPK,
         )
     if scatter_output:
         prefill_sp_output_reduce_scatter(

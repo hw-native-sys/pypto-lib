@@ -10,6 +10,8 @@
 """DeepSeek-V4 attention RMSNorm (dynamic shape): normalizes token-major
 activations for the decode attention path."""
 
+import inspect
+
 import pypto.language as pl
 
 from config import FLASH as M
@@ -26,6 +28,27 @@ EPS = M.rms_norm_eps
 
 # tiling
 REDUCE_ROW_TILE = 16
+
+# Select the adapter in Python before JIT parsing: the old frontend rejects
+# the new keyword, while the explicit-precision frontend requires it with tmp.
+if "high_precision" in inspect.signature(pl.tile.rsqrt).parameters:
+
+    @pl.jit.inline
+    def _rsqrt_high_precision(
+        value: pl.Tile[[1, REDUCE_ROW_TILE], pl.FP32],
+        workspace: pl.Tile[[1, REDUCE_ROW_TILE], pl.FP32],
+    ):
+        return pl.tile.rsqrt(value, tmp=workspace, high_precision=True)
+
+else:
+
+    @pl.jit.inline
+    def _rsqrt_high_precision(
+        value: pl.Tile[[1, REDUCE_ROW_TILE], pl.FP32],
+        workspace: pl.Tile[[1, REDUCE_ROW_TILE], pl.FP32],
+    ):
+        return pl.tile.rsqrt(value, tmp=workspace)
+
 
 @pl.jit.inline
 def rms_norm(
@@ -178,7 +201,7 @@ def rms_norm(
         x_mean_sq = pl.mul(x_sq_sum, 1.0 / D)
         x_mean_eps = pl.add(x_mean_sq, EPS)
         rsqrt_tmp = pl.create_tile([1, REDUCE_ROW_TILE], dtype=pl.FP32)
-        raw_inverse = pl.tile.rsqrt(x_mean_eps, rsqrt_tmp)
+        raw_inverse = _rsqrt_high_precision(x_mean_eps, rsqrt_tmp)
         inverse_work = pl.tile.minimums(x_mean_eps, 1099511627776.0)
         inverse_square_as = pl.mul(raw_inverse, 4097.0)
         inverse_square_ad = pl.sub(inverse_square_as, raw_inverse)

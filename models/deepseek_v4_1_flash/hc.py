@@ -35,8 +35,7 @@ HC_PAD = 8
 T_TILE = 8
 LINEAR_T_TILE = 16
 HF32_LINEAR_T_TILE = 80  # Matches M_TILE in kernels/hc_linear.cpp.
-SINKHORN_LOAD_T_TILE = 8
-SINKHORN_T_TILE = 2
+SINKHORN_T_TILE = 6
 SINKHORN_WORKER_TILE = 12
 RMS_K_TILE = 1024
 LINEAR_K_TILE = 256
@@ -46,7 +45,6 @@ D_TILE = 2560
 PRE_T_TILE = 2
 HEAD_D_TILE = 5120
 PRE_NORM_T_TILE = 8
-PRE_NORM_D_TILE = 512
 POST_WORKER_TILE = 64
 
 
@@ -63,139 +61,31 @@ def _hc_linear(
     ...
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "hc_sinkhorn.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _hc_sinkhorn(
+    partials: pl.Tensor, inv_rms: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
+    pre_mix: pl.Out[pl.Tensor], post_mix: pl.Out[pl.Tensor], residual_mix: pl.Out[pl.Tensor],
+    tokens: pl.Scalar[pl.INDEX], padded_rows: pl.Scalar[pl.INDEX],
+    eps: pl.Scalar[pl.FP32], iterations: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Compute FP32 coefficients in a register-resident VF."""
+    ...
+
+
 @pl.jit.inline
 def hc_sinkhorn(
-    inv_rms: pl.Tensor,
-    partials: pl.Tensor,
-    scale: pl.Tensor,
-    base: pl.Tensor,
-    pre_mix: pl.Tensor,
-    post_mix: pl.Tensor,
-    residual_mix: pl.Tensor,
+    inv_rms: pl.Tensor, partials: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
+    pre_mix: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
 ):
-    """Normalize independent HC matrices in two-row tiles."""
+    """Normalize six independent HC matrices per vector worker."""
     tokens = pl.tensor.dim(pre_mix, 0)
-    linear_tokens = pl.tensor.dim(inv_rms, 0)
-    base_row = pl.reshape(base, [1, MIX_HC])
-    residual_flat = pl.reshape(residual_mix, [tokens, HC_MULT * HC_MULT])
-    scale0 = pl.read(scale, [0])
-    scale1 = pl.read(scale, [1])
-    scale2 = pl.read(scale, [2])
+    padded_rows = pl.tensor.dim(inv_rms, 0)
     blocks = (tokens + SINKHORN_T_TILE - 1) // SINKHORN_T_TILE
     workers = pl.min(blocks, SINKHORN_WORKER_TILE)
     with pl.spmd(workers, name_hint="mhc_sinkhorn") as ready:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, blocks, workers):
-            t0 = block * SINKHORN_T_TILE
-            valid_rows = pl.min(SINKHORN_T_TILE, tokens - t0)
-            load_t0 = t0 // SINKHORN_LOAD_T_TILE * SINKHORN_LOAD_T_TILE
-            local_t0 = t0 - load_t0
-            total = pl.tile.full([SINKHORN_T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
-            for split in pl.unroll(LINEAR_OK):
-                offset = split * linear_tokens + t0
-                part = pl.load(partials, [offset, 0], [SINKHORN_T_TILE, MIX_PAD])
-                total = pl.add(total, part)
-            inverse_group = pl.load(inv_rms, [load_t0, 0], [SINKHORN_LOAD_T_TILE, 1])
-            inverse0 = pl.tile.read(inverse_group, [local_t0, 0])
-            inverse1 = pl.tile.read(inverse_group, [local_t0 + 1, 0])
-            row0 = pl.tile.slice(total, [1, MIX_PAD], [0, 0])
-            row1 = pl.tile.slice(total, [1, MIX_PAD], [1, 0])
-            normalized0 = pl.mul(row0, inverse0)
-            normalized1 = pl.mul(row1, inverse1)
-            normalized = pl.create_tile([SINKHORN_T_TILE, MIX_PAD], dtype=pl.FP32)
-            normalized = pl.tile.assemble(normalized, normalized0, [0, 0])
-            normalized = pl.tile.assemble(normalized, normalized1, [1, 0])
-            bias = pl.load(base_row, [0, 0], [1, MIX_PAD], valid_shape=[1, MIX_HC])
-            bias = pl.fillpad(bias, pad_value=pl.PadValue.zero)
-            pre_raw = pl.slice(normalized, [SINKHORN_T_TILE, HC_PAD], [0, 0])
-            pre_bias = pl.slice(bias, [1, HC_PAD], [0, 0])
-            pre_scaled = pl.mul(pre_raw, scale0)
-            pre_logits = pl.col_expand_add(pre_scaled, pre_bias)
-            pre_negated = pl.neg(pre_logits)
-            pre_exp = pl.exp(pre_negated)
-            pre_denominator = pl.add(pre_exp, 1.0)
-            pre = pl.recip(pre_denominator)
-            pre = pl.add(pre, HC_EPS)
-            pre = pl.slice(pre, [SINKHORN_T_TILE, HC_PAD], [0, 0])
-            pre = pl.mul(pre, 1.0)
-            pre = pl.set_validshape(pre, valid_rows, HC_MULT)
-            pl.store(pre, [t0, 0], pre_mix)
-            post_raw = pl.slice(normalized, [SINKHORN_T_TILE, HC_PAD], [0, HC_MULT])
-            post_bias = pl.slice(bias, [1, HC_PAD], [0, HC_MULT])
-            post_scaled = pl.mul(post_raw, scale1)
-            post_logits = pl.col_expand_add(post_scaled, post_bias)
-            post_negated = pl.neg(post_logits)
-            post_exp = pl.exp(post_negated)
-            post_denominator = pl.add(post_exp, 1.0)
-            post = pl.recip(post_denominator)
-            post = pl.mul(post, 2.0)
-            post = pl.slice(post, [SINKHORN_T_TILE, HC_PAD], [0, 0])
-            post = pl.mul(post, 1.0)
-            post = pl.set_validshape(post, valid_rows, HC_MULT)
-            pl.store(post, [t0, 0], post_mix)
-            comb_scaled = pl.mul(normalized, scale2)
-            comb_logits = pl.col_expand_add(comb_scaled, bias)
-            comb_logits = pl.slice(comb_logits, [SINKHORN_T_TILE, MIX_PAD], [0, 0])
-            comb_logits = pl.mul(comb_logits, 1.0)
-            comb_logits = pl.set_validshape(comb_logits, valid_rows, MIX_HC)
-            comb_logits = pl.fillpad(comb_logits, pad_value=pl.PadValue.zero)
-            comb_logits = pl.set_validshape(comb_logits, SINKHORN_T_TILE, MIX_PAD)
-            flat_logits = pl.reshape(comb_logits, [1, SINKHORN_T_TILE * MIX_PAD])
-            lanes = pl.tile.arange(0, [1, HC_PAD * HC_PAD], dtype=pl.INT32)
-            token = pl.shrs(lanes, 5)
-            row = pl.shrs(lanes, 3)
-            row = pl.ands(row, 3)
-            column = pl.ands(lanes, 3)
-            token_offset = pl.mul(token, MIX_PAD)
-            row_offset = pl.mul(row, HC_MULT)
-            indices = pl.add(token_offset, row_offset)
-            indices = pl.add(indices, column)
-            indices = pl.add(indices, HC_MULT * 2)
-            gather_tmp = pl.create_tile([1, HC_PAD * HC_PAD], dtype=pl.FP32)
-            gathered = pl.tile.gather(flat_logits, indices, gather_tmp)
-            rows = pl.reshape(gathered, [HC_PAD, HC_PAD])
-            column_token = pl.shrs(lanes, 2)
-            column_token = pl.ands(column_token, 1)
-            mask_tmp = pl.create_tile([1, HC_PAD * HC_PAD], dtype=pl.INT32)
-            different_token = pl.xor(token, column_token, mask_tmp)
-            diagonal = pl.mul(different_token, -1)
-            diagonal = pl.add(diagonal, 1)
-            diagonal = pl.cast(diagonal, pl.FP32)
-            diagonal = pl.reshape(diagonal, [HC_PAD, HC_PAD])
-            row_tmp = pl.create_tile([HC_PAD, HC_PAD], dtype=pl.FP32)
-            maximum = pl.row_max(rows, row_tmp)
-            rows = pl.row_expand_sub(rows, maximum)
-            rows = pl.exp(rows)
-            rows = pl.mul(rows, diagonal)
-            row_sum = pl.row_sum(rows, row_tmp)
-            rows = pl.row_expand_div(rows, row_sum)
-            rows = pl.add(rows, HC_EPS)
-            rows = pl.mul(rows, diagonal)
-            column_sum = pl.col_sum(rows)
-            column_sum = pl.add(column_sum, HC_EPS)
-            rows = pl.col_expand_div(rows, column_sum)
-            for _ in pl.unroll(HC_SINKHORN_ITER - 1):
-                row_sum = pl.row_sum(rows, row_tmp)
-                row_sum = pl.add(row_sum, HC_EPS)
-                rows = pl.row_expand_div(rows, row_sum)
-                column_sum = pl.col_sum(rows)
-                column_sum = pl.add(column_sum, HC_EPS)
-                rows = pl.col_expand_div(rows, column_sum)
-            output_lanes = pl.tile.arange(0, [1, 2 * HC_MULT * HC_MULT], dtype=pl.INT32)
-            output_token = pl.shrs(output_lanes, 4)
-            output_row = pl.shrs(output_lanes, 2)
-            output_row = pl.ands(output_row, 3)
-            output_column = pl.ands(output_lanes, 3)
-            output_token_offset = pl.mul(output_token, HC_MULT * (HC_PAD + 1))
-            output_row_offset = pl.mul(output_row, HC_PAD)
-            output_indices = pl.add(output_token_offset, output_row_offset)
-            output_indices = pl.add(output_indices, output_column)
-            flat_rows = pl.reshape(rows, [1, HC_PAD * HC_PAD])
-            output_tmp = pl.create_tile([1, 2 * HC_MULT * HC_MULT], dtype=pl.FP32)
-            packed = pl.tile.gather(flat_rows, output_indices, output_tmp)
-            output = pl.reshape(packed, [SINKHORN_T_TILE, HC_MULT * HC_MULT])
-            output = pl.set_validshape(output, valid_rows, HC_MULT * HC_MULT)
-            pl.store(output, [t0, 0], residual_flat)
+        _hc_sinkhorn(partials, inv_rms, scale, base, pre_mix, post_mix, residual_mix,
+                     tokens, padded_rows, HC_EPS, HC_SINKHORN_ITER)
     return ready
 
 
@@ -292,7 +182,20 @@ def hc_head(
     return output
 
 
-@pl.jit.inline
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "hc_collapse_norm.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def hc_collapse_norm(
+    x: pl.Tensor,
+    pre_mix: pl.Tensor,
+    norm_weight: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INDEX],
+):
+    """Collapse and normalize eight HC rows with BF16 rounding."""
+    ...
+
+
+@pl.jit.inline(auto_scope=False)
 def hc_head_norm(
     x_hc: pl.Tensor,
     pre_mix: pl.Tensor,
@@ -301,58 +204,8 @@ def hc_head_norm(
 ):
     """Collapse eight HC rows and normalize their rounded BF16 values."""
     tokens = pl.tensor.dim(x_hc, 0)
-    x_flat = pl.reshape(x_hc, [tokens, HC_DIM])
     with pl.spmd((tokens + PRE_NORM_T_TILE - 1) // PRE_NORM_T_TILE, name_hint="hc_collapse_norm") as ready:
-        block = pl.tile.get_block_idx()
-        t0 = block * PRE_NORM_T_TILE
-        valid_rows = pl.min(PRE_NORM_T_TILE, tokens - t0)
-        pre_tile = pl.slice(pre_mix, [PRE_NORM_T_TILE, HC_PAD], [t0, 0], valid_shape=[valid_rows, HC_MULT])
-        pre_tile = pl.set_validshape(pre_tile, PRE_NORM_T_TILE, HC_PAD)
-        pre_rows = pl.transpose(pre_tile, 0, 1)
-        pre0 = pl.reshape(pre_rows[0:1, 0:PRE_NORM_T_TILE], [PRE_NORM_T_TILE, 1])
-        pre1 = pl.reshape(pre_rows[1:2, 0:PRE_NORM_T_TILE], [PRE_NORM_T_TILE, 1])
-        pre2 = pl.reshape(pre_rows[2:3, 0:PRE_NORM_T_TILE], [PRE_NORM_T_TILE, 1])
-        pre3 = pl.reshape(pre_rows[3:4, 0:PRE_NORM_T_TILE], [PRE_NORM_T_TILE, 1])
-        pre0 = pl.set_validshape(pre0, valid_rows, 1)
-        pre1 = pl.set_validshape(pre1, valid_rows, 1)
-        pre2 = pl.set_validshape(pre2, valid_rows, 1)
-        pre3 = pl.set_validshape(pre3, valid_rows, 1)
-        collapsed = pl.create_tensor([D // PRE_NORM_D_TILE * PRE_NORM_T_TILE, PRE_NORM_D_TILE], dtype=pl.BF16)
-        sq_sum = pl.full([1, PRE_NORM_T_TILE], dtype=pl.FP32, value=0.0)
-        for d0 in pl.pipeline(0, D, PRE_NORM_D_TILE, stage=2):
-            x0 = pl.slice(x_flat, [PRE_NORM_T_TILE, PRE_NORM_D_TILE], [t0, d0], valid_shape=[valid_rows, PRE_NORM_D_TILE])
-            x1 = pl.slice(x_flat, [PRE_NORM_T_TILE, PRE_NORM_D_TILE], [t0, D + d0], valid_shape=[valid_rows, PRE_NORM_D_TILE])
-            x2 = pl.slice(x_flat, [PRE_NORM_T_TILE, PRE_NORM_D_TILE], [t0, 2 * D + d0], valid_shape=[valid_rows, PRE_NORM_D_TILE])
-            x3 = pl.slice(x_flat, [PRE_NORM_T_TILE, PRE_NORM_D_TILE], [t0, 3 * D + d0], valid_shape=[valid_rows, PRE_NORM_D_TILE])
-            y0 = pl.row_expand_mul(x0, pre0)
-            y1 = pl.row_expand_mul(x1, pre1)
-            y2 = pl.row_expand_mul(x2, pre2)
-            y3 = pl.row_expand_mul(x3, pre3)
-            y01 = pl.add(y0, y1)
-            y23 = pl.add(y2, y3)
-            mixed = pl.add(y01, y23)
-            rounded = pl.cast(mixed, target_type=pl.BF16, mode="rint")
-            cache_row = d0 // PRE_NORM_D_TILE * PRE_NORM_T_TILE
-            collapsed[cache_row : cache_row + PRE_NORM_T_TILE, 0:PRE_NORM_D_TILE] = rounded
-            padded = pl.fillpad(rounded, pad_value=pl.PadValue.zero)
-            padded = pl.set_validshape(padded, PRE_NORM_T_TILE, PRE_NORM_D_TILE)
-            value = pl.cast(padded, target_type=pl.FP32)
-            squared = pl.mul(value, value)
-            partial = pl.reshape(pl.row_sum(squared), [1, PRE_NORM_T_TILE])
-            sq_sum[0:1, 0:PRE_NORM_T_TILE] = pl.add(sq_sum, partial)
-        rms_arg = pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)
-        inverse = pl.rsqrt(rms_arg, high_precision=True)
-        inverse = pl.reshape(inverse, [PRE_NORM_T_TILE, 1])
-        for d0 in pl.pipeline(0, D, PRE_NORM_D_TILE, stage=2):
-            cache_row = d0 // PRE_NORM_D_TILE * PRE_NORM_T_TILE
-            value = pl.cast(collapsed[cache_row : cache_row + PRE_NORM_T_TILE, 0:PRE_NORM_D_TILE], target_type=pl.FP32)
-            gamma = pl.cast(norm_weight[d0 : d0 + PRE_NORM_D_TILE], target_type=pl.FP32)
-            gamma = pl.reshape(gamma, [1, PRE_NORM_D_TILE])
-            scaled = pl.row_expand_mul(value, inverse)
-            normalized = pl.col_expand_mul(scaled, gamma)
-            result = pl.cast(normalized, target_type=pl.BF16, mode="rint")
-            result = pl.set_validshape(result, valid_rows, PRE_NORM_D_TILE)
-            output[t0 : t0 + PRE_NORM_T_TILE, d0 : d0 + PRE_NORM_D_TILE] = result
+        hc_collapse_norm(x_hc, pre_mix, norm_weight, output, tokens)
     return ready
 
 
@@ -392,39 +245,14 @@ def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
                 x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
 
-@pl.jit.inline(auto_scope=False)
-def hc_post_block(
-    sublayer: pl.Tensor,
-    residual_flat: pl.Tensor,
-    post_mix: pl.Tensor,
-    residual_mix_flat: pl.Tensor,
-    output_flat: pl.Tensor,
-    block: pl.Scalar[pl.INDEX],
-    stream_tile: pl.constexpr,
-):
-    """Mix one hidden-width tile for one or four output streams."""
-    pair_block = block // (D // D_TILE)
-    t = pair_block // (HC_MULT // stream_tile)
-    out_base = (pair_block % (HC_MULT // stream_tile)) * stream_tile
-    d0 = (block % (D // D_TILE)) * D_TILE
-    x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + D_TILE], pl.FP32)
-    residual0 = residual_flat[t : t + 1, d0 : d0 + D_TILE]
-    residual1 = residual_flat[t : t + 1, D + d0 : D + d0 + D_TILE]
-    residual2 = residual_flat[t : t + 1, 2 * D + d0 : 2 * D + d0 + D_TILE]
-    residual3 = residual_flat[t : t + 1, 3 * D + d0 : 3 * D + d0 + D_TILE]
-    for out_offset in pl.unroll(stream_tile):
-        out_h = out_base + out_offset
-        value = pl.mul(x_tile, pl.read(post_mix, [t, out_h]))
-        term0 = pl.mul(residual0, pl.read(residual_mix_flat, [t, out_h]))
-        value = pl.add(value, term0)
-        term1 = pl.mul(residual1, pl.read(residual_mix_flat, [t, HC_MULT + out_h]))
-        value = pl.add(value, term1)
-        term2 = pl.mul(residual2, pl.read(residual_mix_flat, [t, 2 * HC_MULT + out_h]))
-        value = pl.add(value, term2)
-        term3 = pl.mul(residual3, pl.read(residual_mix_flat, [t, 3 * HC_MULT + out_h]))
-        value = pl.add(value, term3)
-        output_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + D_TILE] = value
-    return output_flat
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "hc_post.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _hc_post(
+    sublayer: pl.Tensor, residual: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
+    output: pl.Out[pl.Tensor], tokens: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Mix four residual streams with ordered FP32 register operations."""
+    ...
 
 
 @pl.jit.inline
@@ -437,23 +265,10 @@ def hc_post(
     deps: pl.Array[2, pl.TASK_ID],
 ):
     """Mix all four residual streams after the supplied producer dependencies."""
-    t_dim = pl.tensor.dim(sublayer, 0)
-    residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
-    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
-    output_flat = pl.reshape(output, [t_dim, HC_DIM])
-    total_work = t_dim * (D // D_TILE)
-    full_work = total_work // POST_WORKER_TILE * POST_WORKER_TILE
-    tail_work = (total_work - full_work) * HC_MULT
-    workers = pl.min(total_work * HC_MULT, POST_WORKER_TILE)
+    tokens = pl.tensor.dim(sublayer, 0)
+    workers = pl.min(tokens * (D // D_TILE) * HC_MULT, POST_WORKER_TILE)
     with pl.spmd(workers, name_hint="hc_post", deps=[deps]):
-        worker = pl.tile.get_block_idx()
-        for block in pl.pipeline(worker, full_work, POST_WORKER_TILE, stage=1):
-            hc_post_block(sublayer, residual_flat, post_mix, residual_mix_flat, output_flat, block, HC_MULT)
-        for tail in pl.range(worker, tail_work, POST_WORKER_TILE):
-            tail_chunk = full_work + tail // HC_MULT
-            tail_stream = (tail_chunk // (D // D_TILE)) * HC_MULT + tail % HC_MULT
-            tail_block = tail_stream * (D // D_TILE) + tail_chunk % (D // D_TILE)
-            hc_post_block(sublayer, residual_flat, post_mix, residual_mix_flat, output_flat, tail_block, 1)
+        _hc_post(sublayer, residual, post_mix, residual_mix, output, tokens)
     return output
 
 
