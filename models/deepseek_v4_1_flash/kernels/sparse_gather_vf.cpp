@@ -116,8 +116,16 @@ constexpr int NUMERATOR_UB = 131072;
 constexpr int NEXT_MAX_UB = 205312;
 constexpr int CORRECTION_UB = 205440;
 // UB: gather [0,64 KiB), PV [64,128 KiB), numerator [128,192 KiB).
-// Score occupies [216,232 KiB); state, P and IDs occupy the intervening region.
+// Score occupies [216,232 KiB); state and P occupy the intervening region.
 constexpr int SCORE_UB = 221184;
+// A gather runs one tile ahead of softmax. Three ID slots avoid stalling the
+// following gather on softmax's return credit. That credit follows every
+// decode and softmax read of the immutable slot. Local events 0/2/3 are used;
+// event 1 remains reserved for sink loads. The ID arena ends at 26112.
+constexpr int IDS_UB = 24576;
+constexpr int ID_SLOTS = 3;
+constexpr int ID_ELEMENTS = 128;
+constexpr int ID_STRIDE = ID_ELEMENTS * sizeof(int32_t);
 constexpr int QUERY_STATE_STRIDE = 1024;
 constexpr int CORRECTION_STRIDE = 256;
 constexpr int KV_SLOTS = 3;
@@ -136,8 +144,6 @@ template <int R, int C>
 using Right = Tile<TileType::Right, bfloat16_t, R, C, BLayout::RowMajor, R, C, SLayout::ColMajor>;
 template <int R, int C>
 using Acc = Tile<TileType::Acc, float, R, C, BLayout::ColMajor, R, C, SLayout::RowMajor, 1024>;
-template <int H>
-using HeadColumn = Tile<TileType::Vec, float, H, 1, BLayout::ColMajor>;
 
 __aicore__ inline int64_t row_stride(__gm__ int64_t* args, int index) {
     return reinterpret_cast<__gm__ Tensor*>(args[index])->strides[0];
@@ -149,7 +155,7 @@ __aicore__ inline void gather_fp4_subtile(
     __gm__ int64_t* args, int index_offset, int destination_row, Mat<128, DIM>& kv) {
     constexpr int payload_address = Slot * 8192;
     constexpr int scale_address = 16384 + Slot * 1024;
-    int id_address = 24576 + index_offset * sizeof(int32_t);
+    int id_address = IDS_UB + index_offset * sizeof(int32_t);
     // NZ17 slots end below PV at 65536 and do not overlap the ID region.
     constexpr int nz_address = 28672 + Slot * 17408;
     Vec<int32_t, 1, 16> ids;
@@ -164,8 +170,8 @@ __aicore__ inline void gather_fp4_subtile(
     auto payload_base = data<uint8_t>(args, 5);
     auto scale_base = data<bfloat16_t>(args, 6);
 
-    // Payload/scales are reusable after VF consumes this slot. The 64
-    // indices remain immutable throughout the gather; NZ has its own credit.
+    // Payload/scales are reusable after VF consumes this slot. Its ID ring
+    // slot remains immutable through softmax; NZ has a separate copy credit.
     if constexpr (WaitInput) wait_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(5 + Slot));
     for (int row = 0; row < 16; row += 2) {
         int first = ids.GetValue(row);
@@ -230,6 +236,18 @@ __aicore__ inline void drain_fp4_slots(bool& active) {
 __aicore__ inline void gather_part(
     __gm__ int64_t* args, int token, int part, int lane, int ordinal, bool& fp4_active) {
     wait_intra_block(PIPE_MTE3, 9 + 2 * (ordinal % KV_SLOTS));
+    const int id_slot = ordinal % ID_SLOTS;
+    const int id_event = id_slot == 0 ? 0 : id_slot + 1;
+    const int id_source = part * 128 < args[ARG_WINDOW_KEYS] ? 7 : 8;
+    const int id_column = part * 128 < args[ARG_WINDOW_KEYS] ? part * 128 : part * 128 - args[ARG_WINDOW_KEYS];
+    Vec<int32_t, 1, ID_ELEMENTS> shared_ids;
+    TASSIGN(shared_ids, IDS_UB + id_slot * ID_STRIDE);
+    GM<int32_t, 1, ID_ELEMENTS> shared_ids_gm(data<int32_t>(args, id_source) + token * row_stride(args, id_source) + id_column);
+    wait_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(id_event));
+    TLOAD(shared_ids, shared_ids_gm);
+    set_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(id_event));
+    set_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
     if (part * 128 >= args[ARG_WINDOW_KEYS]) {
         Mat<128, DIM> kv;
         TASSIGN(kv, KV_L1 + (ordinal % KV_SLOTS) * 131072);
@@ -240,23 +258,15 @@ __aicore__ inline void gather_part(
             set_flag(PIPE_MTE3, PIPE_V, EVENT_ID6);
             fp4_active = true;
         }
-        // Both final VFs read the shared 64-ID array. Acquire their input
-        // credits before replacing IDs, then reuse those acquisitions for
-        // this part's first payload load in each slot.
+        // Acquire both payload-slot credits, then reuse the acquisitions
+        // for this part's first load in each slot. The ID ring has its own
+        // lifetime, ending only after softmax returns its credit.
         wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID5);
         wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
-        int source_column = part * 128 + lane * 64 - args[ARG_WINDOW_KEYS];
-        Vec<int32_t, 1, 64> all_ids;
-        TASSIGN(all_ids, 24576);
-        GM<int32_t, 1, 64> source_ids(
-            data<int32_t>(args, 8) + token * row_stride(args, 8) + source_column);
-        TLOAD(all_ids, source_ids);
-        set_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
-        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
-        gather_fp4_subtile<0, false>(args, 0, lane * 64, kv);
-        gather_fp4_subtile<1, false>(args, 16, lane * 64 + 16, kv);
-        gather_fp4_subtile<0>(args, 32, lane * 64 + 32, kv);
-        gather_fp4_subtile<1>(args, 48, lane * 64 + 48, kv);
+        gather_fp4_subtile<0, false>(args, id_slot * ID_ELEMENTS + lane * 64 + 0, lane * 64, kv);
+        gather_fp4_subtile<1, false>(args, id_slot * ID_ELEMENTS + lane * 64 + 16, lane * 64 + 16, kv);
+        gather_fp4_subtile<0>(args, id_slot * ID_ELEMENTS + lane * 64 + 32, lane * 64 + 32, kv);
+        gather_fp4_subtile<1>(args, id_slot * ID_ELEMENTS + lane * 64 + 48, lane * 64 + 48, kv);
         // Keep NZ copy credits live: following softmax does not touch NZ.
         set_intra_block(PIPE_MTE3, 8 + 2 * (ordinal % KV_SLOTS));
         return;
@@ -266,19 +276,12 @@ __aicore__ inline void gather_part(
     Tile<TileType::Vec, bfloat16_t, 32, DIM, BLayout::ColMajor, 32, DIM, SLayout::RowMajor,
          512, PadValue::Null, CompactMode::RowPlusOne> nz;
     Mat<128, DIM> kv;
-    TASSIGN(ids, 24576);
     // NZ33 occupies [31744, 65536), preserving the adjacent PV buffer.
     TASSIGN(nz, 31744);
     TASSIGN(kv, KV_L1 + (ordinal % KV_SLOTS) * 131072);
     for (int sub = 0; sub < 2; ++sub) {
         int column = part * 128 + lane * 64 + sub * 32;
-        int source = column < args[ARG_WINDOW_KEYS] ? 7 : 8;
-        int source_column = column < args[ARG_WINDOW_KEYS] ? column : column - args[ARG_WINDOW_KEYS];
-        GM<int32_t, 1, 32> source_ids(
-            data<int32_t>(args, source) + token * row_stride(args, source) + source_column);
-        TLOAD(ids, source_ids);
-        set_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
-        wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID7);
+        TASSIGN(ids, IDS_UB + id_slot * ID_STRIDE + (lane * 64 + sub * 32) * sizeof(int32_t));
 
         if (column < args[ARG_WINDOW_KEYS]) {
             Vec<float8_e4m3_t, 32, DIM> payload;
@@ -493,7 +496,7 @@ __aicore__ inline void update_softmax(__gm__ int64_t* args, int token, int part,
     Tile<TileType::Vec, bfloat16_t, H, K, BLayout::ColMajor, H, K, SLayout::RowMajor> weights;
     Mat<2 * H, K> weights_l1;
     TASSIGN(qk, SCORE_UB);
-    TASSIGN(ids, 217088);
+    TASSIGN(ids, IDS_UB + (ordinal % ID_SLOTS) * ID_STRIDE);
     TASSIGN(maximum, MAXIMUM_UB + query_slot * QUERY_STATE_STRIDE);
     TASSIGN(denominator, DENOMINATOR_UB + query_slot * QUERY_STATE_STRIDE);
     TASSIGN(next_max, NEXT_MAX_UB);
@@ -504,13 +507,9 @@ __aicore__ inline void update_softmax(__gm__ int64_t* args, int token, int part,
         TEXPANDS(maximum, -1e30f);
         TEXPANDS(denominator, 0.0f);
     }
-    const int source = part * K < args[ARG_WINDOW_KEYS] ? 7 : 8;
-    const int column = part * K < args[ARG_WINDOW_KEYS] ? part * K : part * K - args[ARG_WINDOW_KEYS];
-    GM<int32_t, 1, K> ids_gm(data<int32_t>(args, source) + token * row_stride(args, source) + column);
-    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-    TLOAD(ids, ids_gm);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    const int id_slot = ordinal % ID_SLOTS;
+    const int id_event = id_slot == 0 ? 0 : id_slot + 1;
+    wait_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(id_event));
     wait_intra_block(PIPE_V, 0);
     // The previous P copy owns only this NZ staging tile, not gather or PV UB.
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID7);
@@ -518,7 +517,7 @@ __aicore__ inline void update_softmax(__gm__ int64_t* args, int token, int part,
         weights.data(), next_max.data(), denominator.data(), correction.data(),
         qk.data(), ids.data(), maximum.data(), denominator.data());
     TMOV(maximum, next_max);
-    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(id_event));
     set_intra_block(PIPE_V, 1);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -533,15 +532,12 @@ template <int H>
 __aicore__ inline void finalize_query(__gm__ int64_t* args, int token, int query_slot, bool single_part) {
     const int head = get_sub_block_id(args) * H;
     const int valid_heads = args[ARG_HEADS] < H ? args[ARG_HEADS] : H;
-    Vec<float, 1, H> maximum, denominator, sink, final_max, correction;
+    Vec<float, 1, H> maximum, denominator, sink;
     Vec<float, H, DIM> numerator;
     TASSIGN(maximum, MAXIMUM_UB + query_slot * QUERY_STATE_STRIDE);
     TASSIGN(denominator, DENOMINATOR_UB + query_slot * QUERY_STATE_STRIDE);
     TASSIGN(numerator, single_part ? 65536 : NUMERATOR_UB);
     TASSIGN(sink, 196608);
-    TASSIGN(final_max, 196736);
-    // The other tile's alpha may already be live; finalization uses separate scratch.
-    TASSIGN(correction, 196864);
     Tile<TileType::Vec, float, 1, H, BLayout::RowMajor, 1, DYNAMIC> sink_load(valid_heads);
     TASSIGN(sink_load, 196608);
     using SinkShape = TileShape2D<float, 1, DYNAMIC>;
@@ -565,20 +561,10 @@ __aicore__ inline void finalize_query(__gm__ int64_t* args, int token, int query
         set_flag(PIPE_S, PIPE_V, EVENT_ID1);
         wait_flag(PIPE_S, PIPE_V, EVENT_ID1);
     }
-    TMAX(final_max, maximum, sink);
-    TSUB(correction, maximum, final_max);
-    TEXP(correction, correction);
-    TMUL(maximum, denominator, correction);
-    TSUB(sink, sink, final_max);
-    TEXP(sink, sink);
-    TADD(sink, maximum, sink);
-    TDIV(sink, correction, sink);
-    HeadColumn<H> multiplier;
-    TASSIGN(multiplier, 196608);
-    TROWEXPANDMUL(numerator, numerator, multiplier);
     Vec<bfloat16_t, H, DIM> result;
     TASSIGN(result, NUMERATOR_UB);
-    TCVT(result, numerator, RoundMode::CAST_RINT, SaturationMode::OFF);
+    sparse_softmax::finalize<decltype(result), decltype(numerator), decltype(sink)>(
+        result.data(), sink.data(), numerator.data(), maximum.data(), denominator.data(), sink.data());
     if (single_part) set_intra_block(PIPE_V, 3);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
     Tile<TileType::Vec, bfloat16_t, H, DIM, BLayout::RowMajor, DYNAMIC, DIM> active_result(valid_heads);
@@ -607,6 +593,8 @@ __aicore__ inline void attend_vector(__gm__ int64_t* args) {
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID7);
     set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
+    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID3);
     gather_part(args, block, 0, get_sub_block_id(args), 0, fp4_active);
     for (int ordinal = 0; ordinal <= tiles; ++ordinal) {
         if (ordinal + 1 < tiles) {
@@ -646,6 +634,8 @@ __aicore__ inline void attend_vector(__gm__ int64_t* args) {
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID7);
     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
+    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID3);
     // Consume all returned and unused startup credits before either core retires.
     wait_intra_block(PIPE_MTE3, 5);
     wait_intra_block(PIPE_MTE3, 7);
