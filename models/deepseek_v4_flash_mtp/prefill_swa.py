@@ -42,7 +42,7 @@ from prefill_cp_zigzag import (
 )
 from prefill_cp_exchange import _prefill_cp_hidden_tail_exchange_wave
 from golden import TensorSpec
-from qkv_proj_rope import build_tensor_specs as build_qkv_tensor_specs, rope_prepare_prefill
+from qkv_proj_rope import KV_PREFILL_RMS_T_TILE, build_tensor_specs as build_qkv_tensor_specs, rope_prepare_prefill
 from prefill_sparse_attn import (
     BIAS_TOKEN_TILE,
     PREFILL_ATTN_BLOCKS,
@@ -146,7 +146,11 @@ def _prefill_mtp_attention_swa(
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos_t, rope_sin_t)
+    materialize_rope_rows(
+        freqs_cos, freqs_sin, position_ids, num_tokens,
+        rope_cos_t, rope_sin_t,
+        row_tiles_per_worker=1,
+    )
 
     # Reuse the shared prefill QKV/RoPE projection to stay aligned with decode.
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
@@ -162,7 +166,7 @@ def _prefill_mtp_attention_swa(
         x_normed, post, comb, cos_il, sin_signed, swap_idx, q, qr, qr_scale,
     )
     late_dep = pl.system.task_dummy(deps=[rms_tid])
-    kv_proj_rope(x_normed, wkv, gamma_ckv, cos_il, sin_signed, swap_idx, kv, late_dep)
+    kv_proj_rope(x_normed, wkv, gamma_ckv, cos_il, sin_signed, swap_idx, kv, late_dep, KV_PREFILL_RMS_T_TILE)
 
     block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [block_num * BLOCK_SIZE, HEAD_DIM])
@@ -982,6 +986,7 @@ def prefill_attention_swa(
         materialize_rope_rows(
             freqs_cos, freqs_sin, q_positions, pl.cast(hc_rows, pl.INT32),
             hc_q_cos_input, hc_q_sin_input,
+            row_tiles_per_worker=1,
         )
         # Seed only padding: mix_x independently owns every live row.
         hc_segment_mixed = pl.slice(mixed, [SEGMENT_ROWS, D], [hc_offset, 0])
@@ -1049,7 +1054,6 @@ def prefill_attention_swa(
     tail_exchange_tid = _prefill_cp_hidden_tail_exchange_wave(
         local_hidden_tail,
         reverse_index,
-        owner_rank_table,
         hidden_tail_window,
         ready,
         consumed,
@@ -1161,12 +1165,13 @@ def prefill_attention_swa(
         materialize_rope_rows(
             freqs_cos, freqs_sin, kv_positions, pl.cast(kv_rows, pl.INT32),
             kv_cos_input, kv_sin_input,
+            row_tiles_per_worker=1,
         )
         rope_prepare_prefill(kv_cos_input, kv_sin_input, kv_cos, kv_sin, kv_swap)
         kv_output = pl.slice(augmented_kv, [kv_rows, HEAD_DIM], [kv_offset, 0])
         kv_proj_rope(
             kv_input, wkv, gamma_ckv, kv_cos, kv_sin, kv_swap,
-            kv_output, augmented_lowering_tid,
+            kv_output, augmented_lowering_tid, KV_PREFILL_RMS_T_TILE,
         )
 
     predecessor_kv = pl.create_tensor([LOCAL_PARTS * TAIL_ROWS, HEAD_DIM], dtype=pl.BF16)
@@ -1229,11 +1234,9 @@ def prefill_attention_swa(
     final_rope_swap_idx = pl.create_tensor([TAIL_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
     final_kv = pl.create_tensor([TAIL_ROWS, HEAD_DIM], dtype=pl.BF16)
     materialize_rope_rows(
-        freqs_cos, freqs_sin,
-        final_positions,
-        pl.const(TAIL_ROWS, pl.INT32),
-        final_rope_cos,
-        final_rope_sin,
+        freqs_cos, freqs_sin, final_positions, pl.const(TAIL_ROWS, pl.INT32),
+        final_rope_cos, final_rope_sin,
+        row_tiles_per_worker=1,
     )
     rope_prepare_prefill(final_rope_cos, final_rope_sin, final_rope_cos_il, final_rope_sin_signed, final_rope_swap_idx)
     kv_proj_rope(
@@ -1245,6 +1248,7 @@ def prefill_attention_swa(
         final_rope_swap_idx,
         final_kv,
         final_hidden_tid,
+        KV_PREFILL_RMS_T_TILE,
     )
 
     raw_blocks = pl.tensor.dim(kv_cache, 0)
