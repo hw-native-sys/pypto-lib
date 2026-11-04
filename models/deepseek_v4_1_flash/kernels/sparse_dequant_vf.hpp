@@ -29,28 +29,36 @@ __tf__ __aicore__ inline void decode_nz(
         RegTensor<uint16_t> group16;
         RegTensor<float> zero;
         vdup(zero, 0.0f, all32, MODE_ZEROING);
-        vci((vector_s16&)group16, 0, INC_ORDER);
-        vshrs(group16, group16, (uint16_t)(FP4 ? 4 : 5), all16, MODE_ZEROING);
+        if constexpr (!FP4) {
+            vci((vector_s16&)group16, 0, INC_ORDER);
+            vshrs(group16, group16, (uint16_t)5, all16, MODE_ZEROING);
+        }
         for (uint16_t row = 0; row < Output::Rows; ++row) {
             RegTensor<int32_t> index;
             MaskReg valid;
             vlds(index, indices, row, BRC_B32);
             vcmps_ge(valid, index, 0, all32);
-            for (uint16_t chunk = 0; chunk < 4; ++chunk) {
-                RegTensor<bfloat16_t> b0, b1, packed, unused;
-                if constexpr (FP4) {
+            if constexpr (FP4) {
+#pragma unroll
+                for (uint16_t chunk = 0; chunk < 4; ++chunk) {
+                    RegTensor<bfloat16_t> packed, scale16;
                     vector_f4e2m1x2 raw;
                     vlds((RegTensor<uint8_t>&)raw, input, row * 256 + chunk * 64, UNPK4_B8);
                     vcvt(packed, raw, all8, PART_P0);
-                    RegTensor<bfloat16_t> scale16;
-                    vgather2((RegTensor<uint16_t>&)scale16,
-                             scale + row * 32 + chunk * 8, group16, all16);
+                    vlds((RegTensor<uint16_t>&)scale16,
+                         scale + row * 32 + chunk * 8, 0, E2B_B16);
                     vmul((vector_bf16&)packed, (vector_bf16&)packed, (vector_bf16&)scale16,
                          all16, MODE_ZEROING);
                     // Each int32 predicate lane selects both adjacent BF16 values.
                     vsel((RegTensor<uint32_t>&)packed, (RegTensor<uint32_t>&)packed,
                          (RegTensor<uint32_t>&)zero, valid);
-                } else {
+                    auto target = output + chunk * nz_rows * 128 + row * 16;
+                    vsstb((RegTensor<uint16_t>&)packed, target, (uint32_t)(nz_rows << 16), all16, POST_UPDATE);
+                }
+            } else {
+#pragma unroll
+                for (uint16_t chunk = 0; chunk < 4; ++chunk) {
+                    RegTensor<bfloat16_t> b0, b1, packed, unused;
                     RegTensor<float> x0, x1;
                     vector_f8e4m3 raw0, raw1;
                     vlds((RegTensor<uint8_t>&)raw0, input, row * 512 + chunk * 128, UNPK4_B8);
@@ -69,9 +77,9 @@ __tf__ __aicore__ inline void decode_nz(
                          all16, MODE_ZEROING);
                     vsel((RegTensor<uint32_t>&)packed, (RegTensor<uint32_t>&)packed,
                          (RegTensor<uint32_t>&)zero, valid);
+                    auto target = output + chunk * nz_rows * 128 + row * 16;
+                    vsstb((RegTensor<uint16_t>&)packed, target, (uint32_t)(nz_rows << 16), all16, POST_UPDATE);
                 }
-                auto target = output + chunk * nz_rows * 128 + row * 16;
-                vsstb((RegTensor<uint16_t>&)packed, target, (uint32_t)(nz_rows << 16), all16, POST_UPDATE);
             }
         }
     }
