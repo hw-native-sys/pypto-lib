@@ -7,6 +7,9 @@
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
 // Sharded paged scores, local TopK, and candidate merge in one MIX kernel.
+#if defined(__CPU_SIM)
+#include "index_score_topk_sim.hpp"
+#else
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
@@ -785,3 +788,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     fused::merge(args);
 #endif
 }
+
+#endif

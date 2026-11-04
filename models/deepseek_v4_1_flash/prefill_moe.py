@@ -7,7 +7,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-# ci: no-sim
 """DeepSeek-V4.1 prefill MoE with compact TP owner rows and mHC."""
 
 from dataclasses import replace

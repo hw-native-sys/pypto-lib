@@ -18,6 +18,11 @@
 #include "intrinsic.h"
 
 namespace grouped_mxfp4 {
+#if defined(__CPU_SIM)
+using WeightPipe = pto::TPipe<0, pto::Direction::DIR_V2C, 65536, 2>;
+inline thread_local WeightPipe weightPipe(nullptr, 0, 0);
+#endif
+
 
 using namespace pto;
 
@@ -49,16 +54,22 @@ static_assert(L1_BASE + L1_SLOT_COUNT * L1_SLOT_BYTES <= 512 * 1024);
 #ifdef __DAV_CUBE__
 AICORE inline void releaseSlot(uint32_t slot)
 {
+#if defined(__CPU_SIM)
+    TFREE<WeightPipe, TileSplitAxis::TILE_UP_DOWN>(weightPipe);
+#else
     const uint8_t freeFlag = static_cast<uint8_t>(1 + 2 * slot);
     set_intra_block(PIPE_MTE1, freeFlag);
     set_intra_block(PIPE_MTE1, freeFlag + VEC_CORE_ID_OFFSET);
+#endif
 }
 
 AICORE inline void waitSlot(uint32_t slot)
 {
+#if !defined(__CPU_SIM)
     const uint8_t readyFlag = static_cast<uint8_t>(2 * slot);
     wait_intra_block(PIPE_MTE1, readyFlag);
     wait_intra_block(PIPE_MTE1, readyFlag + VEC_CORE_ID_OFFSET);
+#endif
 }
 #endif
 
@@ -138,10 +149,14 @@ AICORE inline void produceWeight(__gm__ uint8_t* weight, int64_t k, int64_t n,
             set_flag(PIPE_MTE2, PIPE_V, event);
         }
         wait_flag(PIPE_V, PIPE_MTE3, event);
+#if defined(__CPU_SIM)
+        TPUSH<WeightPipe, NZ, TileSplitAxis::TILE_UP_DOWN>(weightPipe, nz[slot]);
+#else
         wait_intra_block(PIPE_MTE3, static_cast<uint8_t>(1 + 2 * slot));
         TASSIGN(matSlot, L1_BASE + slot * L1_SLOT_BYTES);
         TINSERT(matSlot, nz[slot], static_cast<uint16_t>(lane * VEC_K_TILE), static_cast<uint16_t>(0));
         set_intra_block(PIPE_MTE3, static_cast<uint8_t>(2 * slot));
+#endif
         set_flag(PIPE_MTE3, PIPE_V, event);
     }
 }
@@ -259,8 +274,12 @@ AICORE inline void computeProjection(__gm__ float8_e4m3_t* x, __gm__ float8_e8m0
         if (scaleOffset == 0) {
             wait_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(4 + scaleSlot));
         }
+#if defined(__CPU_SIM)
+        TPOP<WeightPipe, MatB, TileSplitAxis::TILE_UP_DOWN>(weightPipe, bMat);
+#else
         waitSlot(slot);
         TASSIGN(bMat, L1_BASE + slot * L1_SLOT_BYTES);
+#endif
         for (uint32_t half = 0; half < 2; ++half) {
             const auto event = static_cast<event_t>(half);
             const uint16_t offset = half * L0_K_TILE;
@@ -311,7 +330,9 @@ AICORE inline void beginGemm()
         set_flag(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(2 + slot));
         set_flag(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(4 + slot));
         set_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(slot));
+#if !defined(__CPU_SIM)
         releaseSlot(slot);
+#endif
 #endif
 #ifdef __DAV_VEC__
         set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(slot));
@@ -329,7 +350,9 @@ AICORE inline void endGemm()
 #endif
 #ifdef __DAV_VEC__
         wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(slot));
+#if !defined(__CPU_SIM)
         wait_intra_block(PIPE_MTE3, static_cast<uint8_t>(1 + 2 * slot));
+#endif
 #endif
     }
     pipe_barrier(PIPE_ALL);

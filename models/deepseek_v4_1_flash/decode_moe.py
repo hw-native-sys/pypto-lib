@@ -7,7 +7,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-# ci: no-sim
 """DeepSeek-V4.1 decode MoE with mHC and expert parallelism."""
 
 from dataclasses import replace
