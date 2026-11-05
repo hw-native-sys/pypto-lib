@@ -94,11 +94,14 @@ def _prefill_indexer_compressor_tile(
     rope_swap_idx_template: pl.Tensor[[PACKED_RMS_TILE, ROPE_HEAD_DIM], pl.INT32],
     rope_sign_template: pl.Tensor[[PACKED_RMS_TILE, ROPE_HEAD_DIM], pl.FP32],
     state_order_fence: pl.InOut[pl.Tensor[[1], pl.INT32]],
+    request_start: pl.Scalar[pl.INDEX],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
     checkpoint_end: pl.Scalar[pl.INT32],
 ):
     state_block_num = pl.tensor.dim(compress_state, 0)
+    request_position = pl.read(position_ids, [request_start])
+    tile_first_position = pl.read(position_ids, [tile_base])
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     kv_proj_scratch = pl.create_tensor([PREFILL_STATE_TILE, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([PREFILL_STATE_TILE, OUT_DIM], dtype=pl.FP32)
@@ -243,12 +246,20 @@ def _prefill_indexer_compressor_tile(
                     value=FP32_NEG_INF,
                 )
                 if write_pos >= 2 * COMPRESS_RATIO - 1:
-                    prev_state_block = pl.cast(prev_abs // INNER_STATE_BLOCK_SIZE, pl.INDEX)
-                    prev_state_intra = pl.cast(prev_abs - prev_state_block * INNER_STATE_BLOCK_SIZE, pl.INDEX)
-                    prev_phys_block_raw = pl.read(inner_compress_state_block_table, [prev_state_block])
-                    if prev_phys_block_raw >= 0:
-                        prev_phys_block = pl.cast(prev_phys_block_raw, pl.INDEX)
-                        prev_state_row = prev_phys_block * INNER_STATE_BLOCK_SIZE + prev_state_intra
+                    prev_state_row_raw = pl.cast(-1, pl.INT64)
+                    if prev_abs < tile_first_position:
+                        if prev_abs >= request_position:
+                            prev_source = request_start + pl.cast(prev_abs - request_position, pl.INDEX)
+                            prev_state_row_raw = pl.read(inner_state_slot_mapping, [prev_source])
+                        else:
+                            prev_state_block = pl.cast(prev_abs // INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                            prev_state_intra = pl.cast(prev_abs % INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                            prev_phys_block_raw = pl.read(inner_compress_state_block_table, [prev_state_block])
+                            if prev_phys_block_raw >= 0:
+                                prev_state_row_raw = pl.cast(prev_phys_block_raw * INNER_STATE_BLOCK_SIZE, pl.INT64)
+                                prev_state_row_raw = prev_state_row_raw + prev_state_intra
+                    if prev_state_row_raw >= 0:
+                        prev_state_row = pl.cast(prev_state_row_raw, pl.INDEX)
                         pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
                             prev_state_row : prev_state_row + 1,
                             h0 : h0 + HEAD_D_TILE,
@@ -270,12 +281,20 @@ def _prefill_indexer_compressor_tile(
                     dtype=pl.FP32,
                     value=FP32_NEG_INF,
                 )
-                cur_state_block = pl.cast(cur_abs // INNER_STATE_BLOCK_SIZE, pl.INDEX)
-                cur_state_intra = pl.cast(cur_abs - cur_state_block * INNER_STATE_BLOCK_SIZE, pl.INDEX)
-                cur_phys_block_raw = pl.read(inner_compress_state_block_table, [cur_state_block])
-                if cur_phys_block_raw >= 0:
-                    cur_phys_block = pl.cast(cur_phys_block_raw, pl.INDEX)
-                    cur_state_row = cur_phys_block * INNER_STATE_BLOCK_SIZE + cur_state_intra
+                cur_state_row_raw = pl.cast(-1, pl.INT64)
+                if cur_abs < tile_first_position:
+                    if cur_abs >= request_position:
+                        cur_source = request_start + pl.cast(cur_abs - request_position, pl.INDEX)
+                        cur_state_row_raw = pl.read(inner_state_slot_mapping, [cur_source])
+                    else:
+                        cur_state_block = pl.cast(cur_abs // INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                        cur_state_intra = pl.cast(cur_abs % INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                        cur_phys_block_raw = pl.read(inner_compress_state_block_table, [cur_state_block])
+                        if cur_phys_block_raw >= 0:
+                            cur_state_row_raw = pl.cast(cur_phys_block_raw * INNER_STATE_BLOCK_SIZE, pl.INT64)
+                            cur_state_row_raw = cur_state_row_raw + cur_state_intra
+                if cur_state_row_raw >= 0:
+                    cur_state_row = pl.cast(cur_state_row_raw, pl.INDEX)
                     pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
                         cur_state_row : cur_state_row + 1,
                         HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_D_TILE,
@@ -624,6 +643,7 @@ def prefill_indexer_compressor(
                     rope_swap_idx_template,
                     rope_sign_template,
                     state_order_fence,
+                    request_start,
                     tile_base,
                     tile_rows,
                     pl.read(state_checkpoint_ends, [request]),
@@ -723,6 +743,10 @@ def golden_prefill_indexer_compressor(tensors):
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
+        if abs_pos >= int(position_ids[0]):
+            if abs_pos >= int(position_ids[tile_base]):
+                return -1
+            return int(tensors["inner_state_slot_mapping"][abs_pos - int(position_ids[0])])
         block = abs_pos // INNER_STATE_BLOCK_SIZE
         intra = abs_pos % INNER_STATE_BLOCK_SIZE
         phys_block = int(state_block_table[block].item())

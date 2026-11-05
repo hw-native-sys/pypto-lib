@@ -96,6 +96,7 @@ def _prefill_compressor_ratio128_tile(
     rope_swap_idx_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.INT32],
     rope_sign_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.FP32],
     state_order_fence: pl.InOut[pl.Tensor[[1], pl.INT32]],
+    request_start: pl.Scalar[pl.INDEX],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
     checkpoint_end: pl.Scalar[pl.INT32],
@@ -230,7 +231,6 @@ def _prefill_compressor_ratio128_tile(
         if write_slot_raw >= 0:
             write_pos = pl.read(write_pos_map, [0, write_i])
             write_src = pl.cast(pl.read(write_src_map, [0, write_i]), pl.INDEX)
-            tile_end = tile_base + tile_rows
             pool_start = write_pos + 1 - COMPRESS_RATIO
             for pool_state_i in pl.range(STATE_LEN):
                 pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.full(
@@ -245,13 +245,19 @@ def _prefill_compressor_ratio128_tile(
                 )
                 pool_abs = pool_start + pool_state_i
                 pool_source = write_src - pl.cast(write_pos - pool_abs, pl.INDEX)
-                if pool_source < tile_base or pool_source >= tile_end:
-                    pool_state_block = pl.cast(pool_abs // HCA_STATE_BLOCK_SIZE, pl.INDEX)
-                    pool_state_intra = pl.cast(pool_abs - pool_state_block * HCA_STATE_BLOCK_SIZE, pl.INDEX)
-                    pool_phys_block_raw = pl.read(compress_state_block_table, [pool_state_block])
-                    if pool_phys_block_raw >= 0:
-                        pool_phys_block = pl.cast(pool_phys_block_raw, pl.INDEX)
-                        pool_state_row = pool_phys_block * HCA_STATE_BLOCK_SIZE + pool_state_intra
+                if pool_source < tile_base:
+                    pool_state_row_raw = pl.cast(-1, pl.INT64)
+                    if pool_source >= request_start:
+                        pool_state_row_raw = pl.read(state_slot_mapping, [pool_source])
+                    else:
+                        pool_state_block = pl.cast(pool_abs // HCA_STATE_BLOCK_SIZE, pl.INDEX)
+                        pool_state_intra = pl.cast(pool_abs % HCA_STATE_BLOCK_SIZE, pl.INDEX)
+                        pool_phys_block_raw = pl.read(compress_state_block_table, [pool_state_block])
+                        if pool_phys_block_raw >= 0:
+                            pool_state_row_raw = pl.cast(pool_phys_block_raw * HCA_STATE_BLOCK_SIZE, pl.INT64)
+                            pool_state_row_raw = pool_state_row_raw + pool_state_intra
+                    if pool_state_row_raw >= 0:
+                        pool_state_row = pl.cast(pool_state_row_raw, pl.INDEX)
                         pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
                             pool_state_row : pool_state_row + 1,
                             h0 : h0 + HEAD_TILE,
@@ -501,6 +507,7 @@ def _prefill_compressor_ratio128(
                     rope_swap_idx_template,
                     rope_sign_template,
                     state_order_fence,
+                    request_start,
                     tile_base,
                     tile_rows,
                     pl.read(state_checkpoint_ends, [request]),
@@ -529,6 +536,9 @@ def golden_prefill_compressor_ratio128(tensors):
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
+            return -1
+        # This reference overlays all current-forward projections below.
+        if abs_pos >= int(tensors["position_ids"][0]):
             return -1
         block = abs_pos // HCA_STATE_BLOCK_SIZE
         intra = abs_pos % HCA_STATE_BLOCK_SIZE

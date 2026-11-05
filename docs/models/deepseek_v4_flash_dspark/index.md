@@ -123,6 +123,15 @@ by those chunks before it becomes reusable. Intermediate state positions are
 not all materialized and must not be indexed as immutable Prefix Cache solely
 because their tokens have been computed.
 
+Prefill state read tables and write slot mappings may name different physical
+pages. The read tables preserve the entry history before the request's first
+position; earlier tiles in the same forward are read through the existing
+write slot mappings, and the current tile uses projection scratch. Callers
+must retain entry pages until the forward settles and keep both views stable
+during execution. This permits compact state rings without copying history or
+changing the Prefill tensor-argument list. The three compressors' references
+accept both shared and distinct read/write views.
+
 ### Attention under DSA-CP
 
 The three attention paths are the MTP tree's, re-cut along the token axis:
