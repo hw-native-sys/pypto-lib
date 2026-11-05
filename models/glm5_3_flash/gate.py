@@ -20,8 +20,9 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import FLASH, N_EXPERTS, TOPK, D, Glm53FlashConfig
-from models.glm5_3_flash.elementwise import FP32_NEG_INF, accurate_divide, accurate_sigmoid
-from models.glm5_3_flash.linear import bf16_linear
+from models.glm5_3_flash.elementwise import (
+    FP32_NEG_INF, accurate_divide, accurate_row_sum_parts, accurate_sigmoid,
+)
 from models.glm5_3_flash.rmsnorm import golden_rmsnorm_quant, rms_norm, rmsnorm_quant
 
 T_DYN = pl.dynamic('GLM53_T_DYN')
@@ -29,8 +30,9 @@ T_DYN = pl.dynamic('GLM53_T_DYN')
 ROUTE_SCALE = FLASH.routed_scaling_factor
 SCORE_PAD = 512  # 288 experts padded to the next sort32-friendly width
 GATE_T_TILE = 8  # router sort / write-back token tile
-GATE_M_TILE = 16  # cube M-tile: matmul rows must be a multiple of 16 (fractal)
+GATE_M_TILE = 16  # Token rows per Gate block
 GATE_N_TILE = 16  # expert columns per gate spmd block
+GATE_K_TILE = 128  # Compensated INT32 row sums support at most 128 products
 TOPK_PAD = 8  # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2  # (val, idx) interleaved slice width
 T_DYN_TEST = 64
@@ -92,15 +94,33 @@ def moe_gate(
             nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
             t1 = tg * GATE_M_TILE
             n0 = nb * GATE_N_TILE
-            rows = pl.min(GATE_M_TILE, token_rows - t1)
-            logits = bf16_linear(
-                normalized_input, gate_weight, t1, n0, rows, pl.cast(GATE_N_TILE, pl.INDEX), GATE_M_TILE,
-                GATE_N_TILE, D, True,
-            )
-            gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-            gate_logits_tile[:, :] = logits
+            rows = pl.min(GATE_M_TILE, active_tokens - t1)
+            gate_logits_tile = pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=0.0)
+            for row in pl.range(rows):
+                total = pl.full([1, GATE_N_TILE], dtype=pl.FP32, value=0.0)
+                correction = pl.full([1, GATE_N_TILE], dtype=pl.FP32, value=0.0)
+                for k0 in pl.pipeline(0, D, GATE_K_TILE, stage=2):
+                    x_part = pl.cast(normalized_input[t1 + row:t1 + row + 1, k0:k0 + GATE_K_TILE], pl.FP32)
+                    w_part = pl.cast(gate_weight[n0:n0 + GATE_N_TILE, k0:k0 + GATE_K_TILE], pl.FP32)
+                    # BF16 products are exact in FP32. Retain the reduction tail
+                    # within each block and compensate the sum across blocks.
+                    products = pl.col_expand_mul(w_part, x_part)
+                    part_high, part_low = accurate_row_sum_parts(products)
+                    high = pl.reshape(part_high, [1, GATE_N_TILE])
+                    low = pl.reshape(part_low, [1, GATE_N_TILE])
+                    updated = pl.add(total, high)
+                    recovered = pl.sub(updated, total)
+                    left_error = pl.sub(total, pl.sub(updated, recovered))
+                    right_error = pl.sub(high, recovered)
+                    block_error = pl.add(pl.add(left_error, right_error), low)
+                    correction = pl.add(correction, block_error)
+                    total = updated
+                logits = pl.reshape(pl.add(total, correction), [1, GATE_N_TILE])
+                gate_logits_tile = pl.assemble(gate_logits_tile, logits, [row, 0])
+            gate_buffer = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
+            gate_buffer[:, :] = gate_logits_tile
             gp_sigmoid = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-            gp_sigmoid[:, :] = accurate_sigmoid(gate_logits_tile, GATE_M_TILE, GATE_N_TILE)
+            gp_sigmoid[:, :] = accurate_sigmoid(gate_buffer, GATE_M_TILE, GATE_N_TILE)
             route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_sigmoid
             gp_bias_row = pl.reshape(correction_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
             gp_biased = pl.col_expand_add(gp_sigmoid, gp_bias_row)

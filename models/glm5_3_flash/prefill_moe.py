@@ -24,7 +24,7 @@ import pypto.language.distributed as pld
 import torch
 
 from models.glm5_3_flash.config import EP_SIZE, MOE_INTER, N_LOCAL_EXPERTS, TOPK, D
-from models.glm5_3_flash.expert_routed import RECV_TILE, expert_routed, golden_expert_routed_fn
+from models.glm5_3_flash.expert_routed import ACT_INTER_TILE, RECV_TILE, expert_routed, golden_expert_routed_fn
 from models.glm5_3_flash.quantization import quantize_per_token_int8
 from models.glm5_3_flash.utils import gen_routed_weight
 
@@ -556,7 +556,8 @@ def prefill_ring_heap(*, additional_bytes=0):
     """Size ring zero for routed scratch plus the enclosing entry's allocations."""
     expert_rows = ((GROUPED_CAP + RECV_TILE - 1) // RECV_TILE) * RECV_TILE
     routed_bytes = GROUPED_CAP * (5 * D + 16)
-    expert_bytes = expert_rows * (13 * MOE_INTER + 4 * D + 4)
+    # Include the per-activation-tile maxima beside the expert's row scale.
+    expert_bytes = expert_rows * (13 * MOE_INTER + 4 * D + 4 + 4 * MOE_INTER // ACT_INTER_TILE)
     send_bytes = ROUTES_PER_SRC * (D + 4 * AUX_PAD + 4)
     # Reserve count buffers and allocation alignment separately from caller scratch.
     required_bytes = routed_bytes + expert_bytes + send_bytes + additional_bytes + 16 * 1024 * 1024
