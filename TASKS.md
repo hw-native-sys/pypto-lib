@@ -146,8 +146,8 @@ The following checks were run in the pinned shared environment on 2026-11-05:
 | Aurora checkpoint manifest | `pass` | `.pypto-a3-state/deepseek-v41-checkpoint-manifest.json`; metadata/header audit only |
 | simulator numerical replay | `not_run` | CPU/simulator precision is outside this session; no NPU result inferred |
 | independent reference manifest | `not_run` | vLLM-Ascend path, Decode input/cache and capture are not configured |
-| EP2 MoE gate | `not_run` | `decode_gate.py --topology ep2_gate`; checkpoint/cache/reference assets missing |
-| DP8/TP2/EP16 gate | `not_run` | `decode_gate.py --topology main`; checkpoint/cache/reference assets missing |
+| EP2 MoE gate | `not_run` | `decode_gate.py --topology ep2_gate`; checkpoint metadata is verified, but `decode_input.json`, `history_cache.npz`, and `reference_capture.json` are missing |
+| DP8/TP2/EP16 gate | `not_run` | `decode_gate.py --topology main`; complete layer input/cache/reference assets are missing |
 
 The Aurora loader was also exercised against the supplied checkpoint without
 materializing the full model. Layer 0, 1 and 14 index coverage was verified,
@@ -175,6 +175,12 @@ PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_gate \
 
 They only emit the public queue command and a missing-asset report. They do not
 load or launch vLLM-Ascend and do not claim NPU accuracy.
+
+For the supplied checkpoint, set `DEEPSEEK_V41_CHECKPOINT` to
+`/mnt/data/models/DeepSeek-V4.1-Flash-w8a8` and point
+`DEEPSEEK_V41_DECODE_ASSETS` at the private Decode asset directory. The latest
+queued no-device EP2 report records checkpoint `metadata_verified`, with the
+three runtime assets above still absent.
 
 The reference candidate environment exists at a nobody-owned shared path that
 is now readable through the supplied shared release. The independent probe
