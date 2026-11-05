@@ -7,12 +7,37 @@ picks its compile path from it. A few specialized smoke, artifact-regeneration, 
 external-runtime drivers call PyPTO's compile/runtime APIs directly; their
 `__main__` blocks are the authority for what a command actually validates.
 
+## Selecting and running a case
+
+Choose the component, layer, or forward entry that directly answers the
+requested question using the relevant [model documentation](../models/index.md).
+Confirm that the file has an executable entry point; validate library-only
+operators through a consuming component or layer.
+
+Before running, inspect the entry's `--help`, source, and `# ci:` markers.
+`# ci: no-sim` requires a real device; `# ci: devices=N` requires N allocated
+cards. Parser acceptance alone does not establish validated platform support.
+Run from the repository root with that root on `PYTHONPATH`, and allocate
+devices through the site's allocator rather than probing for an idle card.
+
+Run only system-test cases directly relevant to the requested or changed scope.
+Use CI for the full system-test suite; if CI is unavailable, report that
+limitation instead of running the full suite locally.
+
+Report the exact command, platform, allocated device set, and actual validation
+output. Require a passing golden comparison or the entry's own forward
+validation summary; exit status alone and `PASS (validation skipped)` do not
+prove numerical correctness. For repeated runs with unchanged numerics, use
+[Save and Replay Golden Data](save-and-replay.md).
+
 ## CLI shape
 
-A typical model `__main__` block parses three flags and dispatches into
-the harness:
+A model `__main__` block parses platform, device, and capture flags before
+calling the harness. This excerpt uses V4-MTP's `decode_csa.py`:
 
 ```python
+from golden import ratio_allclose, ratio_reldiff, run
+
 parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
 parser.add_argument("--sim", dest="execution_mode", action="store_true")
 parser.add_argument("-d", "--device", type=int, default=0)
@@ -20,13 +45,17 @@ parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, defa
 args = parser.parse_args()
 
 result = run(
-    fn=qwen3_decode,                          # module-level @pl.jit function
-    specs=build_tensor_specs(...),            # TensorSpec / ScalarSpec, in fn's param order
-    golden_fn=golden_qwen3_decode,            # PyTorch reference
+    fn=attention_csa_test,                   # module-level pl.jit callable
+    specs=build_tensor_specs(),              # default CSA fixture
+    golden_fn=golden_attention_csa,          # PyTorch reference
     config=dict(dump_passes=True, backend_type=args.backend_type, execution_mode=args.execution_mode,
                 device_id=args.device,
                 enable_chip_swimlane=args.enable_chip_swimlane),
-    rtol=3e-3, atol=3e-3,
+    rtol=1e-2, atol=1e-2,
+    compare_fn={
+        "x_out": ratio_reldiff(diff_thd=4e-3, pct_thd=0.03, max_diff_hd=2),
+        "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+    },
 )
 ```
 
@@ -267,11 +296,18 @@ accepted everywhere; gap attribution and early-dispatch proofs need an explicit
 
 For an onboard chip swimlane run, PyPTO first attempts a dependency-graph
 capture and then a clean timing capture so the converter can add dependency
-arrows without perturbing the timing pass. Open the generated
-`merged_swimlane_*.json` at
-[ui.perfetto.dev](https://ui.perfetto.dev/) to visualize per-task
-execution on each AICPU / AIC / AIV lane and inspect kernel duration,
-gaps, and dependency stalls. Simulator runs retain
+arrows without perturbing the timing pass. Prefer opening
+`chip_swimlane_records.json` directly with the **PyPTO3 Toolkit VSCode
+extension** from the
+[`hw-native-sys/pypto-tools` repository](https://github.com/hw-native-sys/pypto-tools):
+right-click the file and select
+**PyPTO3 Toolkit: Open File**. For L3 runs, select the relevant
+`dfx_outputs/rankN/dK/chip_swimlane_records.json` and keep matching `deps.json`
+and `name_map*.json` in the same directory. See the
+[viewer instructions](../debug-and-tune/performance-tuning.md#capture).
+
+The generated `merged_swimlane_*.json` remains a secondary option for
+[Perfetto](https://ui.perfetto.dev/) inspection. Simulator runs retain
 `chip_swimlane_records.json` but do not generate the merged trace because the
 required task metadata is unavailable.
 
@@ -349,7 +385,7 @@ false; an uncaught compile/runtime exception is already a nonzero failure.
 | `compile_only=True` | Stops after the compile phase. Useful for a smoke test that just checks the program lowers cleanly. |
 | `runtime_dir="<path>"` | Skips compile and reuses an existing `build_output/<...>` directory. Useful when iterating on `golden_fn` or validation logic without recompiling. |
 | `golden_data="<path>"` | Loads inputs from `<path>/in/` and goldens from `<path>/out/` instead of generating them. `golden_data` overrides `golden_fn`. With `golden_fn=None` and no `<path>/out/`, only the inputs are replayed and validation is skipped. Useful for deterministic regressions: a previous run leaves these files in its `data/` dir, so passing that dir reproduces the exact failing inputs. |
-| `save_data=True` (default `False`) | Writes the `data/in/` + `data/out/` snapshot so the exact inputs/goldens can be replayed later via `golden_data`. Off by default: runs skip the snapshot and validate against the in-memory golden only. Opt in when you need replay; full-model kernels like `models/qwen3_14b/{prefill_fwd,decode_fwd}.py` expose it as `--save-data`. |
+| `save_data=True` (default `False`) | Writes the `data/in/` + `data/out/` snapshot so the exact inputs/goldens can be replayed later via `golden_data`. Off by default: runs skip the snapshot and validate against the in-memory golden only. Opt in when you need replay; `models/deepseek_v4_flash_mtp/decode_csa.py` exposes it as `--save-data`. |
 
 For diagnosing compile errors, runtime hangs, and precision mismatches, see
 [debugging.md](../debug-and-tune/debugging.md).

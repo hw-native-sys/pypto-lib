@@ -200,12 +200,12 @@ the same `optimizations`, `deps` and `allow_early_resolve` kwargs are accepted.
 | Shape | Write |
 |---|---|
 | One region, or a few that want separate names | `pl.at`, one per region |
-| `for … in pl.parallel:` wrapping a `with pl.at:` over many independent chunks | `pl.spmd` — one dispatch covers them all |
+| One InCore body repeated over independent chunks | `pl.spmd` — one scheduling unit covers its parallel blocks |
+| Multiple dependent InCore stages repeated over independent chunks | Consider `pl.parallel` around the chain of InCore launches or `pl.spmd` groups to overlap stages across chunks |
 
 The two call forms, the argument shape and the full kwarg list are in
-[Loops](loops.md#plspmd-parallel-spmd-dispatch); the dispatch-overhead
-argument for reaching for it is in
-[Performance Tuning](../debug-and-tune/performance-tuning.md#7-plspmd-for-parallel-sub-kernel-dispatch).
+[Loops](loops.md#plspmd-parallel-spmd-dispatch); the scheduling-overhead and dependency-overlap tradeoff is discussed in
+[Performance Tuning](../debug-and-tune/performance-tuning.md#adjust-task-granularity-along-the-critical-path).
 
 ---
 

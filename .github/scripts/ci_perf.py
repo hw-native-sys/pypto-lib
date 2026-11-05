@@ -289,7 +289,7 @@ def run_case(args):
 def effective_us(payload, case, sampling):
     """Per rank and round, sum all dispatches.
 
-    Single card reports the median; multi-card reports the fastest rank's mean.
+    Single card reports the median; multi-card reports the lowest per-rank median.
     """
     if payload.get("passed") is not True:
         raise ValueError(f"correctness failed: {payload.get('error')}")
@@ -309,7 +309,7 @@ def effective_us(payload, case, sampling):
             totals.setdefault(pid, []).append(sum(dispatches))
     if case["device_count"] == 1:
         return statistics.median(next(iter(totals.values())))
-    return min(statistics.mean(values) for values in totals.values())
+    return min(statistics.median(values) for values in totals.values())
 
 
 def submit_command(case, case_dir, sampling):
@@ -336,7 +336,8 @@ def submit_command(case, case_dir, sampling):
 
 
 def render_report(manifest, results):
-    lines = ["| Case | Effective (us) |", "| --- | --- |"]
+    lines = ["Single-card median or lowest per-rank median, after summing dispatches per round.",
+             "", "| Case | Effective median (us) |", "| --- | --- |"]
     for case in manifest["cases"]:
         value = results.get(case["case_id"], "-")
         lines.append(f"| {case['case_id']} | {value:.2f} |" if isinstance(value, float)

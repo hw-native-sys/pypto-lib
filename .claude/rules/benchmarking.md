@@ -42,7 +42,7 @@ none of which is the thing being measured. Do not pay for them twice.
 2. **Freeze the golden once.** Capture with `--save-data`, then replay every
    later run with `--golden-data <work_dir>/data` — input generation and the
    torch recompute drop out. Regenerate only when specs, inputs, or the
-   reference computation change. See the `test-with-golden` skill and
+   reference computation change. See
    [`docs/run-and-validate/save-and-replay.md`](../../docs/run-and-validate/save-and-replay.md).
 3. **Reuse the compiled work dir** — `--runtime-dir <build_output/…>` skips
    the pypto compile while validation logic, `golden_fn`, or the generated
@@ -67,8 +67,9 @@ none of which is the thing being measured. Do not pay for them twice.
 
 Neither flag is universal: an entry may expose `--save-data`, `--golden-data`,
 both, or neither. Check the target's `--help` first and add the missing argparse
-option and its keyword forwarding through the `test-with-golden` skill before
-running the loop below.
+option and its keyword forwarding as described in
+[Save and Replay Golden Data](../../docs/run-and-validate/save-and-replay.md)
+before running the loop below.
 
 ```bash
 # Capture once: compile, generate inputs, compute the golden, freeze it.
@@ -113,6 +114,6 @@ Keep it honest:
 ## Reporting a Result
 
 Every benchmark number states: platform and device, rounds / warmup, the metric
-and its convention (headline mean vs fastest rank's median), the baseline it is
+and its convention (single-card median vs fastest rank's median), the baseline it is
 compared against, and whether the golden was replayed. A number without those
 cannot be reproduced or trusted.

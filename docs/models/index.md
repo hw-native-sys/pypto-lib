@@ -25,6 +25,6 @@ Entry points take script-specific platform and device arguments; inspect
 [Golden Harness guide](../run-and-validate/golden-harness.md).
 
 ```bash
-python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
+python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0
 python models/deepseek_v4_flash_mtp/decode_layer.py -p a2a3 --ep 2 -d 0,1
 ```

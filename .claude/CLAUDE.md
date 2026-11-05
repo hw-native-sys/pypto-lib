@@ -38,7 +38,7 @@ the table below lists common entry points, not an exhaustive skill catalog.
 | Model implementation, optimization, or review | [Model rules](rules/models.md) |
 | Writing or modifying kernels | [L2 programming](../docs/pypto-coding/l2-programming.md), relevant sibling pages in [PyPTO coding](../docs/pypto-coding/index.md), and [formatting workflow](skills/fmt-coding-style/SKILL.md) |
 | Environment setup | [Setup skill](skills/setup-env/SKILL.md) and [installation guide](../docs/get-started/installation.md) |
-| Running a model | [Model case selection](skills/run-model-cases/SKILL.md) |
+| Running a model | [Compile/runtime workflow](../docs/run-and-validate/compile-runtime-workflow.md#selecting-and-running-a-case) and the relevant [model documentation](../docs/models/index.md) |
 | Harness or validation changes | [Golden harness](../docs/run-and-validate/golden-harness.md) and [compile/runtime workflow](../docs/run-and-validate/compile-runtime-workflow.md) |
 | Performance measurement or tuning | [Benchmarking rules](rules/benchmarking.md) and [performance guide](../docs/debug-and-tune/performance-tuning.md); use the matching profiling or tuning skill |
 | Cube tile tuning | [Cube tile tuning skill](skills/cube-tile-tuning/SKILL.md) |
@@ -82,7 +82,7 @@ before running it. Common commands from the repository root:
 
 ```bash
 python examples/beginner/hello_world.py -p a2a3 --sim
-python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
+python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0
 python -m pytest tests/golden -v
 python tests/lint/check_headers.py
 python tests/lint/check_english_only.py

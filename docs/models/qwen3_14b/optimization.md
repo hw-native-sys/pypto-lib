@@ -41,7 +41,7 @@ product get faster"; a device span answers "did the kernel get faster". They
 move independently, and this page says which one a change moved.
 
 None of the three is what a new measurement should use. Today's number is the
-`mean=` field of `PYPTO_BENCH=1`'s `[RUN] effective_us` line — see
+`median=` field of `PYPTO_BENCH=1`'s single-card `[RUN] effective_us` line — see
 [Performance Tuning](../../debug-and-tune/performance-tuning.md). Do not
 compare a fresh `effective_us` against a figure on this page.
 
