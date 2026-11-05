@@ -157,12 +157,13 @@ indices.
 
 ## CI targets and validation scope
 
-This model uses A2/A3 device CI. The standalone `lookup_embedding.py`,
-`hc_head.py`, `hc_post.py`, `rmsnorm.py`, and `sample.py` entries also run in
-simulator CI with `-p a2a3 --sim`, including their default golden comparisons.
-The remaining runnable entries retain `# ci: no-sim` while simulator
-qualification continues. Both pull-request and daily selectors honor these
-markers.
+This model uses A2/A3 device CI. Thirteen standalone single-card entries also
+run in simulator CI with `-p a2a3 --sim`, including their default golden
+comparisons: embedding lookup, HC head/post, RMSNorm, sampling, QKV/RoPE,
+both compressors, Indexer and its compressor, standalone SWA/HCA sparse
+attention, and the routed-expert entry. Other runnable entries retain
+`# ci: no-sim` while qualification continues. Both pull-request and daily
+selectors honor these markers.
 
 The composed `decode_swa.py` and `decode_hca.py` entries require eight logical
 TP ranks and declare `# ci: devices=8`, as does CSA. Their standalone

@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # A2/A3 device validation; simulator CI is deferred for this model.
 """DeepSeek-V4 MoE routed expert compute over a TP slice of the intermediate dim.
 
 Every rank holds every expert and a 1/TP slice of the intermediate dim, so
@@ -630,6 +629,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
     )
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument(
         "--tp",
@@ -661,7 +661,7 @@ if __name__ == "__main__":
         config=dict(
             dump_passes=args.dump_passes,
             backend_type=args.platform.removesuffix("sim"),
-            execution_mode=args.platform.endswith("sim"),
+            execution_mode=args.sim or args.platform.endswith("sim"),
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
