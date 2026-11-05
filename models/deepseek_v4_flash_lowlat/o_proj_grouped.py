@@ -13,7 +13,7 @@ The three sparse-attention decoders end at the same packed head output,
 same code. This is that code, once.
 
 The model path does not use it: every decoder hands ``o_packed`` to the
-TP-by-group projection in ``o_proj_tp``, which shards the groups one per card and
+TP-by-group projection in ``o_proj_tp``, which assigns consecutive groups per rank and
 all-reduces. This replicated form -- every card runs all ``O_GROUPS`` chains -- is
 what the per-decoder single-card unit entries validate the attention against.
 """

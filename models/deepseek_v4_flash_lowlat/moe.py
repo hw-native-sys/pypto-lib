@@ -6,8 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # A2/A3 device validation; simulator CI is deferred for this model.
-# ci: devices=8  # CI: 8-card TP run; the deployment world size, borrowed via task-submit --device-num
+# ci: devices=2
 """DeepSeek-V4 Flash MoE layer, tensor-parallel over the intermediate dim.
 
 Every rank holds every expert and a 1/TP slice of the intermediate dim, and every
@@ -250,7 +249,7 @@ def all_reduce_ffn(
             )
 
     # A rank's T rows are contiguous inside its band, so one block sums whole
-    # [T, REDUCE_D_TILE] tiles -- eight of them, one per rank -- instead of
+    # [T, REDUCE_D_TILE] tiles, one per physical rank, instead of
     # walking the band a single row at a time.
     with pl.spmd(D // REDUCE_D_TILE, name_hint="moe_reduce", allow_early_resolve=True, deps=[barrier_tid]) as _reduce_tid:
         d0 = pl.tile.get_block_idx() * REDUCE_D_TILE
@@ -728,6 +727,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-tokens", type=int, default=T,
                         help=f"active token count for MoE routing/combine (0..{T})")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -755,7 +755,7 @@ if __name__ == "__main__":
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
             backend_type=args.platform.removesuffix("sim"),
-            execution_mode=args.platform.endswith("sim"),
+            execution_mode=args.sim or args.platform.endswith("sim"),
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_pmu=args.enable_pmu,
             log_level=args.log_level,

@@ -6,35 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # A2/A3 device validation; simulator CI is deferred for this model.
-# ci: devices=8  # CI: 8-card TP run; the deployment world size, borrowed via task-submit --device-num
-"""DeepSeek-V4 CSA (Compressed Sparse Attention) decode orchestration.
-
-This standalone harness targets the ratio-4 compression step used by the current
-workflow checkpoint. It composes:
-
-- hc_pre
-- qkv_proj_rope
-- main compressor (ratio=4, rotate=False)
-- inner compressor (ratio=4, rotate=True)
-- indexer
-- sparse_attn_csa (packed per-group attention output)
-- o_proj, sharded one group per card
-- hc_post
-
-The output projection is tensor-parallel by group: `O_GROUPS == TP == 8`, so card
-`r` owns group `r` -- heads [8r, 8r+8), whose `o_packed` rows it already produced.
-Everything ahead of the projection is replicated, and only the projection's
-`[T, D]` INT32 partial crosses the wire, so there is no input collective.
-
-    python decode_csa.py -p a2a3 -d 0,1,2,3,4,5,6,7
-
-The helper stack in this repo has already moved to the refreshed v4 contracts:
-q_proj runs through the W8A8 path, sparse_attn_csa hands the projection a packed
-per-group buffer, and the indexer consumes a prepared `idx_kv_cache` instead of
-owning the inner compressor itself. This file aligns to that stack instead of the
-older draft surface.
-"""
+# ci: devices=2
+"""CSA decode with per-rank token shards and output-projection group banks."""
 
 
 from qkv_proj_rope import prepare_qkv_rope_metadata
@@ -45,6 +18,7 @@ import pypto.language.distributed as pld
 
 from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
 from decode_shapes import DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, DECODE_CMP_BLOCK_NUM, DECODE_IDX_BLOCK_NUM, DECODE_ORI_BLOCK_NUM, IDX_CACHE_MAX_BLOCKS, KV_CMP_MAX_BLOCKS, KV_ORI_MAX_BLOCKS, KV_ORI_TABLE_MAX_BLOCKS
+from o_proj_tp import GROUPS_PER_RANK
 from decode_compressor_ratio4 import compressor_ratio4
 from hc_post import hc_post
 from hc_pre import hc_pre
@@ -53,7 +27,7 @@ from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
 from rope_interleave import rope_interleave
 from decode_sparse_attn_csa import (
-    csa_q_all_to_all,
+    csa_q_all_to_all, csa_o_all_to_all_wait,
     sparse_attn_csa_packed,
 )
 import decode_sparse_attn_csa as CSA
@@ -90,16 +64,17 @@ O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 # tensor annotation, so OTP.* must not appear in a signature.
 OPROJ_N_RANKS = OTP.N_RANKS
 # Token-shard exchange windows: q in on the head axis, o_packed out on the
-# group axis. Both are one 8 KB slice per (src, dst) pair.
-TOK_Q_ROWS = CSA.H
+# group axis. Each physical rank owns TOKENS_PER_RANK consecutive tokens.
+TOK_Q_ROWS = CSA.TOKEN_Q_ROWS
+TOK_O_ROWS = CSA.TOKEN_O_ROWS
+TOKENS_PER_RANK = CSA.TOKENS_PER_RANK
 TOK_O_COLS = CSA.O_SHARD_COLS
 OPROJ_REDUCE_ROWS = OTP.REDUCE_WINDOW_ROWS
 OPROJ_FIRST_EPOCH = OTP.FIRST_EPOCH
-# The shard this card warms into L2: group `my_rank` of proj_a, and proj_b's
-# matching O_LORA column band.
-WO_A_FLAT = O_LORA * O_GROUP_IN
-WO_B_FLAT = D * O_LORA
-assert O_GROUPS == OPROJ_N_RANKS, f"one group per card: O_GROUPS={O_GROUPS}, TP={OPROJ_N_RANKS}"
+# Each rank warms its consecutive groups in both contiguous projection banks.
+WO_A_FLAT = GROUPS_PER_RANK * O_LORA * O_GROUP_IN
+WO_B_FLAT = D * GROUPS_PER_RANK * O_LORA
+assert O_GROUPS % OPROJ_N_RANKS == 0, "TP must divide the projection group count"
 
 # kernel-local
 COMPRESS_RATIO = 4
@@ -247,7 +222,7 @@ def attention_csa_packed(
     comb_t: pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32],
     q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
     q_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
-    o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
+    o_window: pld.DistributedTensor[[TOK_O_ROWS, TOK_O_COLS], pl.BF16],
     o_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     tok_epoch: pl.Scalar[pl.INT32],
@@ -296,12 +271,14 @@ def attention_csa_packed(
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    qkv_proj_rope(
-        x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
-        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-        q, kv, qr, qr_scale, kv_dep,
-        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
-    )
+    for local_group in pl.range(GROUPS_PER_RANK):
+        group_id = pl.cast(my_rank, pl.INDEX) * GROUPS_PER_RANK + local_group
+        qkv_proj_rope(
+            x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
+            rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+            q, kv, qr, qr_scale, kv_dep,
+            pl.cast(group_id, pl.INT32) * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
+        )
 
     # Transpose q onto the token shard right here. Everything between this push
     # and qk_pv -- the KV writeback, the compressor, the whole indexer -- reads
@@ -348,7 +325,7 @@ def attention_csa_packed(
         idx_score_unused, idx_topk_full,
         position_ids_bsd, idx_slot_mapping_bsd, inner_state_slot_mapping_bsd,
         kv_seq_lens, 0, late_dep,
-        my_rank, idx_rope_swap_idx,
+        my_rank * TOKENS_PER_RANK, TOKENS_PER_RANK, idx_rope_swap_idx,
     )
 
     # sparse_attn_csa now folds the compressed-slot masking + valid-block flags in from
@@ -356,12 +333,17 @@ def attention_csa_packed(
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
     position_ids_t1 = pl.reshape(position_ids, [T, 1])
 
-    return sparse_attn_csa_packed(
-        q_window, q_signal, q_push_tid, kv_cache, window_swa_indices,
-        cmp_kv, cmp_block_table, idx_topk_flat, position_ids_t1,
-        attn_sink, rope_cos_t, rope_sin_t, o_packed,
-        o_window, o_signal, my_rank, tok_epoch, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
-    )
+    token_done = pl.array.create(TOKENS_PER_RANK, pl.TASK_ID)
+    for local_token in pl.range(TOKENS_PER_RANK):
+        token_id = pl.cast(my_rank, pl.INT32) * TOKENS_PER_RANK + pl.cast(local_token, pl.INT32)
+        token_tid = sparse_attn_csa_packed(
+            q_window, q_signal, q_push_tid, kv_cache, window_swa_indices,
+            cmp_kv, cmp_block_table, idx_topk_flat, position_ids_t1,
+            attn_sink, rope_cos_t, rope_sin_t, o_packed,
+            o_window, o_signal, token_id, tok_epoch, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
+        )
+        token_done[local_token] = token_tid
+    return csa_o_all_to_all_wait(o_window, o_signal, o_packed, my_rank, tok_epoch, token_done)
 
 
 @pl.jit.inline
@@ -416,8 +398,8 @@ def attention_csa(
     position_ids: pl.Tensor[[T], pl.INT32],
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
@@ -426,7 +408,7 @@ def attention_csa(
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
     q_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
-    o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
+    o_window: pld.DistributedTensor[[TOK_O_ROWS, TOK_O_COLS], pl.BF16],
     o_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     oproj_epoch: pl.Scalar[pl.INT32],
@@ -444,9 +426,8 @@ def attention_csa(
 ):
     """CSA layer whose attention is token-sharded and projection group-sharded.
 
-    Everything ahead of the projection is replicated exactly as today -- the
-    shard boundary is the group axis, and group `my_rank` is heads
-    [8*my_rank, 8*my_rank+8), whose o_packed rows this card already produced.
+    Each rank owns consecutive query tokens for sparse attention. The output
+    exchange gathers all tokens for its consecutive projection head groups.
     """
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
@@ -537,8 +518,8 @@ def attention_csa_test(
     position_ids: pl.Tensor[[T], pl.INT32],
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
@@ -547,7 +528,7 @@ def attention_csa_test(
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
     q_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
-    o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
+    o_window: pld.DistributedTensor[[TOK_O_ROWS, TOK_O_COLS], pl.BF16],
     o_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     oproj_epoch: pl.Scalar[pl.INT32],
@@ -628,8 +609,8 @@ def l3_attention_csa(
     position_ids: pl.Tensor[[OPROJ_N_RANKS, T], pl.INT32],
     kv_seq_lens: pl.Tensor[[OPROJ_N_RANKS, B], pl.INT32],
     attn_sink: pl.Tensor[[OPROJ_N_RANKS, H], pl.FP32],
-    wo_a_shard: pl.Tensor[[OPROJ_N_RANKS, 1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[OPROJ_N_RANKS, D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[OPROJ_N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[OPROJ_N_RANKS, GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[OPROJ_N_RANKS, D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[OPROJ_N_RANKS, T, HC_MULT, D], pl.FP32]],
 ):
@@ -641,7 +622,7 @@ def l3_attention_csa(
     # lands token-ordered for this card's group.
     q_window_buf = pld.alloc_window_buffer([TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
     q_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
-    o_window_buf = pld.alloc_window_buffer([T, TOK_O_COLS], dtype=pl.BF16)
+    o_window_buf = pld.alloc_window_buffer([TOK_O_ROWS, TOK_O_COLS], dtype=pl.BF16)
     o_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
@@ -650,7 +631,7 @@ def l3_attention_csa(
         sync_signal = pld.window(sync_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
         q_window = pld.window(q_window_buf, [TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
         q_signal = pld.window(q_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
-        o_window = pld.window(o_window_buf, [T, TOK_O_COLS], dtype=pl.BF16)
+        o_window = pld.window(o_window_buf, [TOK_O_ROWS, TOK_O_COLS], dtype=pl.BF16)
         o_signal = pld.window(o_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
         attention_csa_test(
             x_hc[r], gate_w[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r], cmp_wkv[r], cmp_wgate[r], cmp_ape[r], cmp_norm_w[r], compress_state[r], compress_state_block_table[r], idx_wq_b[r], idx_wq_b_scale[r], weights_proj[r], hadamard_idx[r], inner_wkv[r], inner_wgate[r], inner_ape[r], inner_norm_w[r], inner_compress_state[r], inner_compress_state_block_table[r], kv_cache[r], cmp_kv[r], cmp_block_table[r], idx_kv_cache[r], idx_kv_scale[r], idx_block_table[r], ori_slot_mapping[r], window_swa_indices[r], window_swa_lens[r], cmp_slot_mapping[r], idx_slot_mapping[r], state_slot_mapping[r], inner_state_slot_mapping[r], position_ids[r], kv_seq_lens[r], attn_sink[r],
@@ -1231,18 +1212,18 @@ def build_l3_tensor_specs(start_pos=None):
     out = []
     for spec in base:
         if spec.name == "wo_a":
-            # Card r carries group r's proj_a rows only.
+            # Each rank carries its consecutive proj_a group rows.
             out.append(TensorSpec(
-                "wo_a_shard", [OPROJ_N_RANKS, 1, O_LORA, O_GROUP_IN], torch.bfloat16,
+                "wo_a_shard", [OPROJ_N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN], torch.bfloat16,
                 init_value=lambda: torch.stack(
-                    [wo_a[r:r + 1] for r in range(OPROJ_N_RANKS)], dim=0),
+                    [wo_a[r * GROUPS_PER_RANK:(r + 1) * GROUPS_PER_RANK] for r in range(OPROJ_N_RANKS)], dim=0),
                 resident="stacked"))
         elif spec.name == "wo_b":
-            # ... and proj_b's matching O_LORA column band.
+            # Each proj_b group is contiguous in the rank-local bank.
             out.append(TensorSpec(
-                "wo_b_shard", [OPROJ_N_RANKS, D, O_LORA], torch.int8,
+                "wo_b_shard", [OPROJ_N_RANKS, GROUPS_PER_RANK, D, O_LORA], torch.int8,
                 init_value=lambda: torch.stack(
-                    [wo_b[:, r * O_LORA:(r + 1) * O_LORA] for r in range(OPROJ_N_RANKS)], dim=0),
+                    [wo_b.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2)[r * GROUPS_PER_RANK:(r + 1) * GROUPS_PER_RANK] for r in range(OPROJ_N_RANKS)], dim=0),
                 resident="stacked"))
         else:
             out.append(ranked(spec))
@@ -1251,10 +1232,8 @@ def build_l3_tensor_specs(start_pos=None):
 
 def golden_attention_csa_l3(tensors):
     """Per-rank golden: rebuild the full weights from the shards, then reuse the layer's."""
-    import torch
 
-    wo_a = torch.cat([tensors["wo_a_shard"][r] for r in range(OPROJ_N_RANKS)], dim=0)
-    wo_b = torch.cat([tensors["wo_b_shard"][r] for r in range(OPROJ_N_RANKS)], dim=1)
+    wo_a, wo_b = OTP.projection_weights(tensors)
     for r in range(OPROJ_N_RANKS):
         per_rank = {k: (v[r] if k not in ("wo_a_shard", "wo_b_shard") else v)
                     for k, v in tensors.items()}
@@ -1287,10 +1266,12 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("--compile-only", action="store_true", default=False)
     from config import CONTEXT_CAPACITY
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
+    parser.add_argument("--tp", type=int, default=OPROJ_N_RANKS, choices=[1, 2, 4, 8])
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
@@ -1307,7 +1288,7 @@ if __name__ == "__main__":
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:OPROJ_N_RANKS], num_sub_workers=0),
             backend_type=args.platform.removesuffix("sim"),
-            execution_mode=args.platform.endswith("sim"),
+            execution_mode=args.sim or args.platform.endswith("sim"),
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
         atol=1e-2,

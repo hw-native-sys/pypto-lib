@@ -6,8 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # A2/A3 device validation; simulator CI is deferred for this model.
-# ci: devices=8  # CI: 8-card TP run; the deployment world size, borrowed via task-submit --device-num
+# ci: devices=2
 """DeepSeek-V4 Flash token embedding over a TP vocab shard.
 
 Rank r holds embedding rows [r * VOCAB_PER_TP, (r+1) * VOCAB_PER_TP), the same split
@@ -225,6 +224,7 @@ if __name__ == "__main__":
                         help="tensor-parallel degree / rank count; config freezes it at import")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -241,7 +241,7 @@ if __name__ == "__main__":
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
             backend_type=args.platform.removesuffix("sim"),
-            execution_mode=args.platform.endswith("sim"),
+            execution_mode=args.sim or args.platform.endswith("sim"),
         ),
         rtol=0.0,
         atol=0.0,

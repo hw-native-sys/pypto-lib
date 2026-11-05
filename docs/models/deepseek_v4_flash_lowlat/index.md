@@ -1,7 +1,8 @@
 # DeepSeek V4-Flash low-latency decode
 
-This model directory provides the batch-one decode path with eight logical
-ranks. The default verification width is eight tokens. It is an experimental
+This model directory provides the batch-one decode path with two physical TP
+ranks by default. The verification width remains eight tokens, and the eight
+attention projection groups are assigned four per rank. It is an experimental
 decode implementation, not a `pypto-serving` deployment contract.
 
 ## Precision contract
@@ -74,10 +75,11 @@ is not implemented and requires an explicit precision-policy decision.
 
 ## Reproducible reduction order
 
-The output projection publishes each rank's FP32 contribution into a separate
-slot. Each of the two alternating lanes contains `N_RANKS * T_PAD` rows.
-After the existing all-peer completion barrier, the consumer adds ranks
-`0..N_RANKS-1` to a positive-zero accumulator and rounds to BF16 once.
+The output projection publishes each logical group's FP32 contribution into a
+separate slot. Each of the two alternating lanes contains `O_GROUPS * T_PAD`
+rows. A physical rank announces completion after publishing every local group.
+After the all-peer completion barrier, the consumer adds groups `0..O_GROUPS-1`
+to a positive-zero accumulator and rounds to BF16 once.
 Every producer overwrites its valid rows before publication; allocator contents
 and arrival order do not contribute to the sum. Alternating lanes retain the
 previous call's inputs until all peers have advanced beyond their consumers.
@@ -166,18 +168,25 @@ indices.
 
 ## CI targets and validation scope
 
-This model uses A2/A3 device CI. Fifteen standalone single-card entries also
-run in simulator CI with `-p a2a3 --sim`, including their default golden
-comparisons: embedding lookup, HC pre/head/post, RMSNorm, sampling, QKV/RoPE,
-both compressors, Indexer and its compressor, standalone SWA/HCA sparse
-attention, and both routed-expert entries. Other runnable entries retain
-`# ci: no-sim` while qualification continues. Both pull-request and daily
-selectors honor these markers.
+This model uses A2/A3 device CI with at most two devices per entry. Sixteen
+standalone entries use one device; nine distributed entries use TP2 by default
+and declare `# ci: devices=2`. Only the multi-layer `decode_fwd.py` and
+`decode_layer.py` entries retain `# ci: no-sim`. The other twenty-three entries
+run with `-p a2a3 --sim`, including their original golden and state comparisons.
+Both pull-request and daily selectors honor these markers.
 
-The composed `decode_swa.py` and `decode_hca.py` entries require eight logical
-TP ranks and declare `# ci: devices=8`, as does CSA. Their standalone
+The composed `decode_swa.py`, `decode_hca.py`, and `decode_csa.py` entries use
+two physical TP ranks by default and declare `# ci: devices=2`. Each rank
+processes its consecutive head groups. CSA assigns four logical tokens per
+rank and exchanges their query and output rows before projection. Their standalone
 `decode_sparse_attn_swa.py` and `decode_sparse_attn_hca.py` entries use one
 device and retain their original numerical references.
+
+Projection weights are resident group-major banks: `wo_a_shard` has shape
+`[N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN]` and `wo_b_shard` has shape
+`[N_RANKS, GROUPS_PER_RANK, D, O_LORA]`. Each per-group matrix is contiguous.
+Regenerate saved projection, layer and forward fixtures after this layout
+change, including fixtures that retain an explicit TP8 configuration.
 
 `decode_fwd.py` executes all 43 layers without computing or comparing a golden
 by default, including in CI. Use `--full` to opt into the independent Torch
@@ -206,7 +215,7 @@ The native HC-pre maps compensate their reciprocal, reciprocal-square-root and
 division seeds. Exponential correction is bounded to `[-80, 80]`; the original
 exponential is retained outside that interval. These bounded corrections do not
 establish a general IEEE rounding guarantee for every input.
-TP projection contributions include channel scales before ordered rank
+TP projection contributions include channel scales before ordered group
 reduction. Standalone grouped projections retain their own arithmetic.
 These choices do not establish bitwise equivalence with device instructions;
 the existing numerical comparisons remain required.
@@ -216,6 +225,17 @@ projection call. This bounds its product buffer independently of the number
 of TP/DP owners. It preserves each owner's row selection, K16 FP32
 accumulation order, zero rows and sampling inputs; device kernels and
 comparison thresholds are unchanged.
+
+The HCA Torch reference skips matrix products for fully masked sparse tiles
+and materializes their original neutral statistics: a `NEG_INF` maximum and
+positive-zero denominator and numerator. Every block remains in its original
+softmax merge position. Valid tiles retain their K16 products and arithmetic.
+
+CSA packs the independent alpha and beta exponential arguments into one
+full-valid row tile and evaluates the sink on a full-valid row tile after the
+merge. It retains the same compensated signed exponential, evaluation count,
+ascending block recurrence and stage-two pipeline. This bounds generated
+simulator C++ size without adding global-memory buffers or tasks.
 
 - Default execution and `--smoke` execute all 43 layers without a numerical
   comparison. They permit generated inputs or input-only replay and report
@@ -293,7 +313,7 @@ python models/deepseek_v4_flash_lowlat/hc_head.py --help
 python models/deepseek_v4_flash_lowlat/o_proj_tp.py --help
 ```
 
-`o_proj_tp.py` uses the full eight-rank communication contract. Its default
+`o_proj_tp.py` assigns all eight logical groups to the physical TP ranks. Its default
 correctness entry runs two distinct inputs at epochs 1 and 2 in one dispatch,
 checks both outputs against the original reference, and clears signals only
 after the second epoch. `--single-epoch` retains the original one-epoch entry

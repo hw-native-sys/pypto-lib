@@ -6,8 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # A2/A3 device validation; simulator CI is deferred for this model.
-# ci: devices=8  # CI: 8-card TP run; the deployment world size, borrowed via task-submit --device-num
+# ci: no-sim  # Multi-layer composition is validated on A2/A3 devices.
+# ci: devices=2
 """DeepSeek-V4 decode layer smoke: attention followed by the TP MoE.
 
 Each rank owns a local decode micro-batch for the selected attention stage.
@@ -65,6 +65,8 @@ from decode_hca import (
 )
 from decode_csa import CMP_BLOCK_NUM as CSA_CMP_BLOCK_NUM, CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS, CMP_STORAGE_BLOCK_SIZE as CSA_CMP_STORAGE_BLOCK_SIZE, COMPRESS_RATIO as CSA_COMPRESS_RATIO, IDX_CACHE_BLOCK_NUM as CSA_IDX_CACHE_BLOCK_NUM, IDX_CACHE_MAX_BLOCKS as CSA_IDX_CACHE_MAX_BLOCKS, IDX_HEAD_DIM as CSA_IDX_HEAD_DIM, IDX_N_HEADS as CSA_IDX_N_HEADS, INNER_OUT_DIM as CSA_INNER_OUT_DIM, INNER_STATE_BLOCK_NUM as CSA_INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE as CSA_INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM as CSA_INNER_STATE_DIM, INNER_STATE_MAX_BLOCKS as CSA_INNER_STATE_MAX_BLOCKS, MAIN_OUT_DIM as CSA_MAIN_OUT_DIM, MAIN_STATE_BLOCK_NUM as CSA_MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE as CSA_MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM as CSA_MAIN_STATE_DIM, MAIN_STATE_MAX_BLOCKS as CSA_MAIN_STATE_MAX_BLOCKS, OPROJ_FIRST_EPOCH as CSA_OPROJ_FIRST_EPOCH, OPROJ_REDUCE_ROWS as CSA_OPROJ_REDUCE_ROWS, attention_csa, prepare_csa_metadata, CSA_ROPE_ROWS, IDX_ROPE_ROWS, clear_csa_oproj_signals, TOK_Q_ROWS, TOK_O_COLS, build_tensor_specs as build_csa_tensor_specs, golden_attention_csa
 from config import FLASH as MODEL_CONFIG
+from o_proj_tp import GROUPS_PER_RANK
+from decode_csa import TOK_O_ROWS
 from utils import DECODE_START_POS
 from moe import (
     MOE_INTER,
@@ -119,8 +121,8 @@ def decode_layer(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     hca_cmp_wkv: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
@@ -189,7 +191,7 @@ def decode_layer(
     oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     tok_q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
     tok_q_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    tok_o_window: pld.DistributedTensor[[T, TOK_O_COLS], pl.BF16],
+    tok_o_window: pld.DistributedTensor[[TOK_O_ROWS, TOK_O_COLS], pl.BF16],
     tok_o_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -353,8 +355,8 @@ def l3_decode_layer(
     wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    wo_a_shard: pl.Tensor[[N_RANKS, 1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[N_RANKS, D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[N_RANKS, GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     hca_cmp_wkv: pl.Tensor[[N_RANKS, HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[N_RANKS, HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[N_RANKS, HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
@@ -432,7 +434,7 @@ def l3_decode_layer(
     # Token-shard exchange: q in on the head axis, o_packed out on the group axis.
     tok_q_window_buf = pld.alloc_window_buffer([TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
     tok_q_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    tok_o_window_buf = pld.alloc_window_buffer([T, TOK_O_COLS], dtype=pl.BF16)
+    tok_o_window_buf = pld.alloc_window_buffer([TOK_O_ROWS, TOK_O_COLS], dtype=pl.BF16)
     tok_o_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
@@ -443,7 +445,7 @@ def l3_decode_layer(
         oproj_sync_signal = pld.window(oproj_sync_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         tok_q_window = pld.window(tok_q_window_buf, [TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
         tok_q_signal = pld.window(tok_q_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
-        tok_o_window = pld.window(tok_o_window_buf, [T, TOK_O_COLS], dtype=pl.BF16)
+        tok_o_window = pld.window(tok_o_window_buf, [TOK_O_ROWS, TOK_O_COLS], dtype=pl.BF16)
         tok_o_signal = pld.window(tok_o_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         decode_layer(
             x_hc[r],
@@ -871,19 +873,19 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         for name, spec in attention_specs
     ]
 
-    # Card r owns o-projection group r: proj_a's rows for that group and proj_b's
-    # matching O_LORA column band. Positional binding, so these sit exactly where
+    # Each rank owns consecutive projection groups in both contiguous weight banks.
+    # Positional binding places the shards exactly where
     # l3_decode_layer takes them -- right after wo_b_scale.
     oproj_shards = [
         TensorSpec(
-            "wo_a_shard", [N_RANKS, 1, O_LORA, O_GROUP_IN], torch.bfloat16,
+            "wo_a_shard", [N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN], torch.bfloat16,
             init_value=lambda: torch.stack(
-                [wo_a_value[r : r + 1] for r in range(N_RANKS)], dim=0),
+                [wo_a_value[r * GROUPS_PER_RANK:(r + 1) * GROUPS_PER_RANK] for r in range(N_RANKS)], dim=0),
         ),
         TensorSpec(
-            "wo_b_shard", [N_RANKS, D, O_LORA], torch.int8,
+            "wo_b_shard", [N_RANKS, GROUPS_PER_RANK, D, O_LORA], torch.int8,
             init_value=lambda: torch.stack(
-                [wo_b_value[:, r * O_LORA : (r + 1) * O_LORA] for r in range(N_RANKS)], dim=0),
+                [wo_b_value.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2)[r * GROUPS_PER_RANK:(r + 1) * GROUPS_PER_RANK] for r in range(N_RANKS)], dim=0),
         ),
     ]
     shard_at = next(i for i, s in enumerate(specs) if s.name == "wo_b_scale") + 1
