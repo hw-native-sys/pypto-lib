@@ -18,7 +18,7 @@ constexpr int Rows = 16;
 constexpr int Columns = 1024;
 template <typename T, int R, int C>
 using Vec = Tile<TileType::Vec, T, R, C>;
-using Input = Vec<float, Rows, Columns>;
+using Input = Vec<bfloat16_t, Rows, Columns>;
 using Payload = Vec<uint8_t, Rows, Columns>;
 using Scales = Vec<uint8_t, 1, Rows * Columns / 32>;
 
@@ -32,7 +32,7 @@ __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int index) {
 __tf__ __aicore__ inline void quantize(
     Payload::TileDType __out__ payload, Scales::TileDType __out__ scales,
     Input::TileDType __in__ input) {
-    auto src = (__ubuf__ float*)__cce_get_tile_ptr(input);
+    auto src = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(input);
     auto dst = (__ubuf__ uint8_t*)__cce_get_tile_ptr(payload);
     auto packed_scales = (__ubuf__ uint16_t*)__cce_get_tile_ptr(scales);
     __VEC_SCOPE__ {
@@ -60,7 +60,9 @@ __tf__ __aicore__ inline void quantize(
             for (uint16_t segment = 0; segment < Columns / 64; ++segment) {
                 RegTensor<float> x, maximum, shuffled, divisor;
                 RegTensor<int32_t> exponent;
-                vlds(x, src, row * Columns + segment * 64, NORM);
+                RegTensor<bfloat16_t> raw;
+                vlds(raw, src, row * Columns + segment * 64, UNPK_B16);
+                vcvt(x, raw, all, PART_EVEN);
                 vabs(maximum, x, all, MODE_ZEROING);
                 vselr((RegTensor<uint32_t>&)shuffled, (RegTensor<uint32_t>&)maximum, ix16);
                 vmax(maximum, maximum, shuffled, all, MODE_ZEROING);
@@ -103,9 +105,9 @@ __aicore__ inline void run_native(__gm__ int64_t* args) {
     Scales scales;
     TASSIGN(input, 0); TASSIGN(payload, 65536); TASSIGN(scales, 81920);
     using Stride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
-    GlobalTensor<float, TileShape2D<float, Rows, Columns>, Stride> input_gm(
-        data<float>(args, 0) + first * width + column,
-        TileShape2D<float, Rows, Columns>(), Stride(1, 1, 1, width, 1));
+    GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, Rows, Columns>, Stride> input_gm(
+        data<bfloat16_t>(args, 0) + first * width + column,
+        TileShape2D<bfloat16_t, Rows, Columns>(), Stride(1, 1, 1, width, 1));
     TLOAD(input, input_gm);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0); wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     quantize(payload.data(), scales.data(), input.data());
@@ -153,11 +155,14 @@ __aicore__ inline void run_tiles(__gm__ int64_t* args) {
     TASSIGN(quantized, 53248); TASSIGN(payload, 53248); TASSIGN(max_scratch, 57600);
     for (int part = 0; part < 4; ++part) {
         using Stride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
-        GlobalTensor<float, TileShape2D<float, Rows, 256>, Stride> input_gm(
-            data<float>(args, 0) + first * width + column + part * 256,
-            TileShape2D<float, Rows, 256>(), Stride(1, 1, 1, width, 1));
-        TLOAD(input, input_gm);
+        GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, Rows, 256>, Stride> input_gm(
+            data<bfloat16_t>(args, 0) + first * width + column + part * 256,
+            TileShape2D<bfloat16_t, Rows, 256>(), Stride(1, 1, 1, width, 1));
+        Vec<bfloat16_t, Rows, 256> raw;
+        TASSIGN(raw, 65536);
+        TLOAD(raw, input_gm);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0); wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        TCVT(input, raw, RoundMode::CAST_NONE);
         TABS(absolute, groups); TROWMAX(maximum, absolute, max_scratch);
         TMAXS(maximum_row, maximum_row, 1e-4f); TMULS(maximum_row, maximum_row, 1.0f / 448.0f);
         Integers bits;

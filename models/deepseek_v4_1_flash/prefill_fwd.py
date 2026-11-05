@@ -296,7 +296,7 @@ def _prefill_moe(
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[D], pl.BF16],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[
@@ -462,7 +462,7 @@ def l2_prefill_fwd(
     hc_ffn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
@@ -626,7 +626,7 @@ def l2_prefill_fwd(
         layer_index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN, pl.NZ] = index_wq_b[index_source]
         layer_index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(index_wq_b_scale, [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], [index_source * (Q_LORA // MX_GROUP), 0])
         layer_index_weights: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ] = index_weights_proj[index_source]
-        layer_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
+        layer_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
         layer_gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [layer * N_EXPERTS])
         layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
         layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
@@ -791,7 +791,7 @@ def l3_prefill_fwd(
     hc_ffn_scale: pl.Tensor[[RANKS, N_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[RANKS, N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[RANKS, N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS, D], pl.FP32],
+    gate_weight: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS, D], pl.BF16],
     correction_bias: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
@@ -1202,7 +1202,7 @@ def forward_weight_layouts(local_experts: int):
         "hc_ffn_scale": ((layers * 3,), torch.float32),
         "hc_ffn_base": ((layers * M.mix_hc,), torch.float32),
         "ffn_norm_weight": ((layers * d,), torch.bfloat16),
-        "gate_weight": ((layers * experts, d), torch.float32),
+        "gate_weight": ((layers * experts, d), torch.bfloat16),
         "correction_bias": ((layers * experts,), torch.float32),
         "routed_w1": ((layers * local_experts, packed_rows, 128), torch.uint8),
         "routed_w1_scale": ((layers * (local_experts * (d // 32)), inter), torch.float8_e8m0fnu),
