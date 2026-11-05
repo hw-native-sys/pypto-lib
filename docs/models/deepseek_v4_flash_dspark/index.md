@@ -113,6 +113,16 @@ orchestrations, and the same `hc_head → rms_norm → lm_head` tail. Prompt
 sequence lengths that do not divide the CP group are padded rather than
 rejected, so one program serves an arbitrary chunk against a resident prefix.
 
+Prefill also takes `state_checkpoint_ends`, an INT32 vector with one absolute
+checkpoint boundary per packed request (rank-stacked in L3). The caller uses
+the same aligned boundary as its Prefix Cache replay policy; a zero boundary
+requests no extra checkpoint publication. HCA and both CSA compressors publish the required
+history window at that boundary from their existing tile projections, in
+addition to their normal terminal tails. A window spanning chunks is completed
+by those chunks before it becomes reusable. Intermediate state positions are
+not all materialized and must not be indexed as immutable Prefix Cache solely
+because their tokens have been computed.
+
 ### Attention under DSA-CP
 
 The three attention paths are the MTP tree's, re-cut along the token axis:

@@ -648,6 +648,7 @@ def _prefill_indexer_dense_tile(
 def prefill_indexer(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
@@ -683,7 +684,7 @@ def prefill_indexer(
     compressor_completion = pl.array.create(1, pl.TASK_ID)
     prefill_indexer_compressor(
         x,
-        query_start_loc,
+        query_start_loc, state_checkpoint_ends,
         inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         cmp_freqs_cos, cmp_freqs_sin,
@@ -840,6 +841,7 @@ def golden_prefill_indexer_core(tensors):
                 "idx_kv_scale": tensors["idx_kv_scale"],
                 "idx_block_table": tensors["idx_block_table"][request : request + 1],
                 "position_ids": tensors["position_ids"][request_rows],
+                "state_checkpoint_ends": tensors["state_checkpoint_ends"][request : request + 1],
                 "idx_slot_mapping": tensors["idx_slot_mapping"][request_rows],
                 "inner_state_slot_mapping": tensors["inner_state_slot_mapping"][request_rows],
             }
@@ -938,6 +940,7 @@ def golden_prefill_indexer(tensors):
 def prefill_indexer_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
@@ -971,6 +974,7 @@ def prefill_indexer_test(
 ):
     x.bind_dynamic(0, T_DYN)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
     qr.bind_dynamic(0, T_DYN)
     qr_scale.bind_dynamic(0, T_DYN)
     cos.bind_dynamic(0, T_DYN)
@@ -989,7 +993,7 @@ def prefill_indexer_test(
 
     prefill_indexer(
         x,
-        query_start_loc,
+        query_start_loc, state_checkpoint_ends,
         qr,
         qr_scale,
         wq_b,
@@ -1232,6 +1236,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.zeros(1, dtype=torch.int32)),
         TensorSpec("qr", [token_count, Q_LORA], torch.int8, init_value=lambda: qr_i8),
         TensorSpec("qr_scale", [token_count, 1], torch.float32, init_value=lambda: qr_scale),
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),

@@ -98,6 +98,7 @@ def _prefill_compressor_ratio128_tile(
     state_order_fence: pl.InOut[pl.Tensor[[1], pl.INT32]],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
+    checkpoint_end: pl.Scalar[pl.INT32],
 ):
     state_block_num = pl.tensor.dim(compress_state, 0)
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
@@ -294,13 +295,19 @@ def _prefill_compressor_ratio128_tile(
 
     tail_rows = pl.min(tile_rows, STATE_STORAGE_LEN)
     tail_base = tile_rows - tail_rows
+    tile_position = pl.read(position_ids, [tile_base])
+    checkpoint_begin = pl.max(tile_position, checkpoint_end - STATE_LEN)
+    checkpoint_stop = pl.min(tile_position + tail_base, checkpoint_end)
+    checkpoint_rows = pl.max(0, checkpoint_stop - checkpoint_begin)
     with pl.spmd(
-        tail_rows,
+        tail_rows + checkpoint_rows,
         name_hint="prefill_hca_c128_state_tail_update",
         deps=[pool_tid],
     ) as state_update_tid:
         tail_i = pl.tile.get_block_idx()
         update_local = tail_base + tail_i
+        if tail_i >= tail_rows:
+            update_local = checkpoint_begin - tile_position + tail_i - tail_rows
         update_global = tile_base + update_local
         state_row_raw = pl.read(state_slot_mapping, [update_global])
         if state_row_raw >= 0:
@@ -407,6 +414,7 @@ def _prefill_compressor_ratio128_tile(
 def _prefill_compressor_ratio128(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
     compress_state: pl.InOut[
         pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
@@ -428,6 +436,7 @@ def _prefill_compressor_ratio128(
     """
     x.bind_dynamic(0, T_DYN)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
     compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
     compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
@@ -494,6 +503,7 @@ def _prefill_compressor_ratio128(
                     state_order_fence,
                     tile_base,
                     tile_rows,
+                    pl.read(state_checkpoint_ends, [request]),
                 )
     return cmp_kv, compress_state
 
@@ -559,8 +569,13 @@ def golden_prefill_compressor_ratio128(tensors):
         normed[:, NOPE_HEAD_DIM:] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
         cmp_kv_flat[dst_row] = normed[0]
 
+    checkpoint_end = int(tensors["state_checkpoint_ends"][0])
     for t in range(token_count):
+        tile_end = min((t // PREFILL_STATE_TILE + 1) * PREFILL_STATE_TILE, token_count)
         pos = int(tensors["position_ids"][t].item())
+        checkpoint_row = max(0, checkpoint_end - STATE_LEN) <= pos < checkpoint_end
+        if t < tile_end - STATE_STORAGE_LEN and not checkpoint_row:
+            continue
         dst_row = int(tensors["state_slot_mapping"][t].item())
         if dst_row < 0:
             continue
@@ -666,6 +681,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.zeros(1, dtype=torch.int32)),
         TensorSpec(
             "compress_state",
             [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
