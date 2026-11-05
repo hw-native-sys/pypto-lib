@@ -166,11 +166,11 @@ indices.
 
 ## CI targets and validation scope
 
-This model uses A2/A3 device CI. Fourteen standalone single-card entries also
+This model uses A2/A3 device CI. Fifteen standalone single-card entries also
 run in simulator CI with `-p a2a3 --sim`, including their default golden
 comparisons: embedding lookup, HC pre/head/post, RMSNorm, sampling, QKV/RoPE,
 both compressors, Indexer and its compressor, standalone SWA/HCA sparse
-attention, and the routed-expert entry. Other runnable entries retain
+attention, and both routed-expert entries. Other runnable entries retain
 `# ci: no-sim` while qualification continues. Both pull-request and daily
 selectors honor these markers.
 
@@ -262,6 +262,14 @@ python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384
 ```
 
 ## Validation
+
+The persistent expert grid uses the runtime's available cluster count and
+retains synchronized start. Gate/up projections and SwiGLU use bounded
+column tiles; activation quantization reduces the maximum across the entire
+local intermediate shard before quantizing any tile. TP2 uses all 1024
+intermediate columns, with the original per-element casts, down projection
+and numerical comparison retained. Standalone A2/A3 simulator coverage includes
+TP2, TP4 and TP8.
 
 HC pre and HC post use a dynamic token axis and bound their final tiles to the
 remaining rows. Their default entries check the configured width plus 1, 6, 9,
