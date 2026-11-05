@@ -73,7 +73,8 @@ __tf__ __aicore__ inline void update(
         mem_bar(VST_VLD);
         RegTensor<float> next_max, corr;
         vlds(next_max, m, 0, NORM);
-        vexpdif(corr, prior_max, next_max, heads, PART_EVEN);
+        vsub(corr, prior_max, next_max, heads, MODE_ZEROING);
+        vexp(corr, corr, heads, MODE_ZEROING);
         vsts(corr, c, 0, NORM_B32, heads);
         // Second pass: probabilities and each head's new tile sum.
         for (uint16_t row = 0; row < Weights::Rows; ++row) {
@@ -85,8 +86,10 @@ __tf__ __aicore__ inline void update(
             vsel(x0, x0, invalid, valid0);
             vsel(x1, x1, invalid, valid1);
             vlds(mx, m, row, BRC_B32);
-            vexpdif(x0, x0, mx, all, PART_EVEN);
-            vexpdif(x1, x1, mx, all, PART_EVEN);
+            vsub(x0, x0, mx, all, MODE_ZEROING);
+            vsub(x1, x1, mx, all, MODE_ZEROING);
+            vexp(x0, x0, all, MODE_ZEROING);
+            vexp(x1, x1, all, MODE_ZEROING);
             vsel(x0, x0, zero, valid0);
             vsel(x1, x1, zero, valid1);
             vcadd(sum0, x0, all, MODE_ZEROING);
@@ -103,7 +106,8 @@ __tf__ __aicore__ inline void update(
         mem_bar(VST_VLD);
         RegTensor<float> tile_sum;
         vlds(tile_sum, l, 0, NORM);
-        vmadd(prior_den, corr, tile_sum, heads, MODE_ZEROING);
+        vmul(prior_den, prior_den, corr, heads, MODE_ZEROING);
+        vadd(prior_den, prior_den, tile_sum, heads, MODE_ZEROING);
         vsts(prior_den, l, 0, NORM_B32, heads);
     }
 }
@@ -157,6 +161,8 @@ __tf__ __aicore__ inline void normalization(
         vadd(s, l, s, heads, MODE_ZEROING);
         vdiv(s, corr, s, heads, MODE_ZEROING);
         vsts(s, dst, 0, NORM_B32, heads);
+        // The PV finish consumes this multiplier through vector loads.
+        mem_bar(VST_VLD);
     }
 }
 
