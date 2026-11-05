@@ -20,7 +20,7 @@ from config import FLASH as M
 from config import MOE_TOKENS, EP_SIZE, N_LOCAL_EXPERTS
 
 
-from rmsnorm import rms_norm_tiled
+from rmsnorm import rms_norm_bf16
 
 
 # model config
@@ -35,6 +35,7 @@ N_HASH_LAYERS = 0
 # tiling
 GATE_T_TILE = 8
 GATE_INPUT_TILE = 8
+GATE_NORM_TILE = 2
 assert T % GATE_T_TILE == 0
 GATE_M_TILE = 16
 GATE_N_TILE = 16
@@ -310,9 +311,14 @@ def gate(
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     active_tokens = pl.max(active_tokens, 0)
     active_tokens = pl.min(active_tokens, T)
+    normalized = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
+    with pl.spmd(T_PAD // GATE_NORM_TILE, name_hint="rms_norm"):
+        normalized = rms_norm_bf16(x_mixed, norm_w, normalized, active_tokens)
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
-    for norm_block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="rms_norm"):
-        rms_norm_tiled(x_mixed, norm_w, xg_buf, norm_block, active_tokens, output_fp32=True)
+    for block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="gate_normalized_input"):
+        t0 = block * GATE_INPUT_TILE
+        source = normalized[t0 : t0 + GATE_INPUT_TILE, :]
+        xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = pl.cast(source, pl.FP32)
     return gate_from_fp32(
         xg_buf, gate_w, gate_bias, num_tokens,
         x_norm_mx, x_norm_scale, indices, weights, n_experts=n_experts, topk=topk,
