@@ -14,7 +14,7 @@ import pypto.language.distributed as pld
 from config import DECODE_ROWS_PER_REQUEST, EP_SIZE, FLASH, MAX_BATCH_PER_DP, TP_SIZE
 from hc import hc_head
 from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, lm_head_with_sampling
-from rmsnorm import rms_norm_tiled_compensated
+from rmsnorm import NORM_T_TILE, rms_norm
 
 
 D = FLASH.hidden_size
@@ -50,8 +50,8 @@ def sample_target_chunk_rank(
     collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_head(x_hc, pre_mix, collapsed)
     normalized = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    for block in pl.spmd((tokens + 7) // 8, name_hint="dspark_target_final_norm"):
-        rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, block, tokens)
+    with pl.spmd(pl.max(1, (tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="dspark_target_final_norm"):
+        normalized = rms_norm(collapsed, final_norm_weight, normalized, tokens, width=D)
     row_indices = pl.create_tensor([MAX_LOGIT_ROWS], dtype=pl.INT32)
     for _core in pl.spmd(1, name_hint="dspark_target_select_rows"):
         for row in pl.range(MAX_LOGIT_ROWS):

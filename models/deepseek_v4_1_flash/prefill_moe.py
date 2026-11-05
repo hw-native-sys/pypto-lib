@@ -51,7 +51,7 @@ from expert_routed import (
 )
 from hc import golden_mhc_mixes, golden_hc_collapse, golden_hc_post
 from hc import hc_pre, hc_post
-from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
+from rmsnorm import NORM_T_TILE, golden_rms_norm, rms_norm
 from o_proj import prefill_tp_output_all_reduce
 
 
@@ -196,10 +196,12 @@ def prefill_moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         x_mixed, next_pre_mix, post_mix, residual_mix, hf32=hf32,
     )
+    norm_source = pl.reshape(x_mixed, [t, D])
     ffn_input = pl.create_tensor([t, D], dtype=pl.BF16)
     norm_tokens = pl.tensor.dim(x_mixed, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(x_mixed, norm_weight, ffn_input, norm_block, norm_tokens, output_fp32=False)
+    with pl.spmd(pl.max(1, (norm_tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="rms_norm"):
+        norm_result = rms_norm(norm_source, norm_weight, ffn_input, norm_tokens, width=D)
+    ffn_input = pl.reshape(norm_result, [t, D])
 
     # MoE transport and routed-result scope.
     with pl.scope():
@@ -514,8 +516,8 @@ def prefill_moe_sublayer(
     _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
     norm_tokens = pl.tensor.dim(local_ffn_input, 0)
     local_ffn_normed = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens, output_fp32=False)
+    with pl.spmd(pl.max(1, (norm_tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="rms_norm"):
+        local_ffn_normed = rms_norm(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_tokens, width=D)
 
     local_num_tokens = _local_token_count(num_tokens, tp_rank)
     local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
@@ -837,7 +839,7 @@ def _golden_moe_core(tensors):
         indices = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.int32)
         weights = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.float32)
         golden_gate_normalized_core({
-            "x_normed": golden_rms_norm_tiled(
+            "x_normed": golden_rms_norm(
                 tensors["x"][src], tensors["norm_weight"][src]
             ),
             "gate_w": tensors["gate_weight"][src],

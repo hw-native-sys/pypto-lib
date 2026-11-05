@@ -19,7 +19,7 @@ import torch
 import config as C
 from config import BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, PREFILL_MAX_TOKENS, TP_SIZE, TABLE_DYN
 from o_proj import prefill_tp_output_all_reduce
-from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
+from rmsnorm import NORM_T_TILE, golden_rms_norm, rms_norm
 from hc import hc_head, hc_post, hc_pre, zero_bf16_padding
 from expert_routed import (
     MX_PACKED_LANE_COLS,
@@ -82,7 +82,7 @@ def golden_main_projection(
     if weight.shape != (flat.shape[-1], target_hidden.shape[-1]):
         raise ValueError("main projection weight must be [3 * hidden, hidden]")
     projected = torch.matmul(flat.float(), weight.float()).to(flat.dtype)
-    return golden_rms_norm_tiled(projected, norm_weight)
+    return golden_rms_norm(projected, norm_weight)
 
 
 def golden_query_block(
@@ -197,9 +197,10 @@ def dspark_proj(
         projected[row : row + 16, col : col + 128] = pl.set_validshape(
             pl.cast(acc, pl.BF16, mode="rint"), rows, 128
         )
-    for block in pl.spmd((num_tokens + 7) // 8, name_hint="dspark_main_norm"):
-        rms_norm_tiled(projected, main_norm_weight, main_x, block, num_tokens, output_fp32=False)
-    return main_x
+    main_output = pl.reshape(main_x, [tokens, D])
+    with pl.spmd(pl.max(1, (num_tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="dspark_main_norm"):
+        main_output = rms_norm(projected, main_norm_weight, main_output, num_tokens, width=D)
+    return main_output
 
 
 @pl.jit
@@ -362,8 +363,8 @@ def draft_layer(
         x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         attention_input, attention_pre_mix, post_mix, residual_mix, hf32=True,
     )
-    for block in pl.spmd((MOE_TOKENS + 7) // 8, name_hint="dspark_attn_norm"):
-        rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, MOE_TOKENS, output_fp32=False)
+    with pl.spmd(pl.max(1, (MOE_TOKENS + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="dspark_attn_norm"):
+        normalized_attention = rms_norm(attention_input, attn_norm_weight, normalized_attention, MOE_TOKENS, width=D)
     zero_bf16_padding(normalized_attention, num_tokens)
     attention_partial = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     dspark_attention(

@@ -20,7 +20,7 @@ from config import FLASH as M
 from config import MOE_TOKENS, EP_SIZE, N_LOCAL_EXPERTS
 
 
-from rmsnorm import rms_norm_bf16
+from rmsnorm import NORM_T_TILE, rms_norm
 
 
 # model config
@@ -35,7 +35,6 @@ N_HASH_LAYERS = 0
 # tiling
 GATE_T_TILE = 8
 GATE_INPUT_TILE = 8
-GATE_NORM_TILE = 2
 assert T % GATE_T_TILE == 0
 GATE_M_TILE = 16
 GATE_N_TILE = 16
@@ -311,9 +310,10 @@ def gate(
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     active_tokens = pl.max(active_tokens, 0)
     active_tokens = pl.min(active_tokens, T)
+    norm_source = pl.reshape(x_mixed, [T, D])
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
-    with pl.spmd(T_PAD // GATE_NORM_TILE, name_hint="rms_norm"):
-        xg_buf = rms_norm_bf16(x_mixed, norm_w, xg_buf, active_tokens)
+    with pl.spmd(T_PAD // NORM_T_TILE, name_hint="rms_norm"):
+        xg_buf = rms_norm(norm_source, norm_w, xg_buf, active_tokens, width=D)
     return gate_from_bf16(
         xg_buf, gate_w, gate_bias, num_tokens,
         x_norm_mx, x_norm_scale, indices, weights, n_experts=n_experts, topk=topk,
@@ -348,9 +348,9 @@ def _golden_gate_scores(tensors):
     """Recompute the host router scores from the immutable gate inputs."""
     import torch
 
-    from rmsnorm import golden_rms_norm_tiled
+    from rmsnorm import golden_rms_norm
 
-    x_norm = golden_rms_norm_tiled(tensors["x_mixed"], tensors["norm_w"]).cpu().float().view(T, D)
+    x_norm = golden_rms_norm(tensors["x_mixed"], tensors["norm_w"]).cpu().float().view(T, D)
 
     gate_w = tensors["gate_w"].cpu().to(torch.bfloat16).float()
     gate_bias = tensors["gate_bias"].cpu().float()

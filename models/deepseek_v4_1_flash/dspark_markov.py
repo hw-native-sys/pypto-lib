@@ -25,7 +25,7 @@ from config import (
     TP_SIZE,
 )
 from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, TP_SIZE as LM_HEAD_TP_SIZE, VOCAB_PER_TP, lm_head
-from rmsnorm import rms_norm_tiled
+from rmsnorm import NORM_T_TILE, rms_norm
 
 
 D = FLASH.hidden_size
@@ -581,8 +581,8 @@ def _markov_sample_from_hidden(
     flat_hidden = pl.create_tensor([rows, D], dtype=pl.BF16)
     flat_hidden[:, :] = pl.reshape(head_hidden, [rows, D])
     normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
-    for block in pl.spmd((rows + 7) // 8, name_hint="dspark_final_norm"):
-        rms_norm_tiled(flat_hidden, final_norm_weight, normalized, block, rows, output_fp32=False)
+    with pl.spmd(pl.max(1, (rows + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="dspark_final_norm"):
+        normalized = rms_norm(flat_hidden, final_norm_weight, normalized, rows, width=D)
     base_logits = pl.create_tensor([batch, DSPARK_QUERY_WIDTH, VOCAB], dtype=pl.FP32)
     flat_logits = pl.reshape(base_logits, [rows, VOCAB])
     group_base = rank // TP_SIZE * TP_SIZE

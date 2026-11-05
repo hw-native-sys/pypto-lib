@@ -14,11 +14,13 @@
 using namespace pto;
 namespace {
 constexpr int Rows = 2;
-constexpr int Width = 5120;
 template <typename T, int R, int C>
 using Vec = Tile<TileType::Vec, T, R, C>;
+template <int Width>
 using Input = Vec<bfloat16_t, Rows, Width>;
+template <int Width>
 using Weight = Vec<bfloat16_t, 1, Width>;
+template <int Width>
 using Output = Vec<bfloat16_t, Rows, Width>;
 template <typename T>
 __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int index) {
@@ -26,8 +28,9 @@ __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int index) {
     return reinterpret_cast<__gm__ T*>(tensor->buffer.addr) + tensor->start_offset;
 }
 #if defined(__DAV_VEC__) && (defined(PTO_NPU_ARCH_A5) || defined(__CPU_SIM))
-__tf__ __aicore__ inline void normalize(Output::TileDType __out__ output,
-    Input::TileDType __in__ input, Weight::TileDType __in__ weight, uint16_t valid) {
+template <int Width>
+__tf__ __aicore__ inline void normalize(typename Output<Width>::TileDType __out__ output,
+    typename Input<Width>::TileDType __in__ input, typename Weight<Width>::TileDType __in__ weight, uint16_t valid) {
     auto src = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(input);
     auto gamma = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(weight);
     auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(output);
@@ -81,6 +84,16 @@ __tf__ __aicore__ inline void normalize(Output::TileDType __out__ output,
                 vmul(square3, value3, value3, all, MODE_ZEROING);
                 vadd(sum3, sum3, square3, all, MODE_ZEROING);
             }
+            if constexpr (Width % 256 != 0) {
+                for (uint16_t k = Width / 256 * 4; k < Width / 64; ++k) {
+                    RegTensor<bfloat16_t> packed;
+                    RegTensor<float> value, square;
+                    vlds(packed, src, row * Width + k * 64, UNPK_B16);
+                    vcvt(value, packed, all, PART_EVEN);
+                    vmul(square, value, value, all, MODE_ZEROING);
+                    vadd(sum, sum, square, all, MODE_ZEROING);
+                }
+            }
             vadd(sum, sum, sum1, all, MODE_ZEROING);
             vadd(sum2, sum2, sum3, all, MODE_ZEROING);
             vadd(sum, sum, sum2, all, MODE_ZEROING);
@@ -109,55 +122,112 @@ __tf__ __aicore__ inline void normalize(Output::TileDType __out__ output,
 #endif
 }
 #endif
-}
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__)
+template <int Width>
+__aicore__ inline void run(__gm__ int64_t* args) {
 #if !defined(__CPU_SIM)
-    set_atomic_none(); set_mask_norm(); set_vector_mask(-1, -1);
+    set_atomic_none();
+    set_mask_norm();
+    set_vector_mask(-1, -1);
 #endif
     int first = get_block_idx(args) * Rows;
     int valid = args[3] - first;
     valid = valid < 0 ? 0 : (valid > Rows ? Rows : valid);
-    Input input;
-    Weight weight;
-    Output output;
-    TASSIGN(input, 0); TASSIGN(weight, 20480); TASSIGN(output, 30720);
-    GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, Rows, Width>, BaseShape2D<bfloat16_t, Rows, Width>> source(data<bfloat16_t>(args, 0) + first * Width);
-    GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, 1, Width>, BaseShape2D<bfloat16_t, 1, Width>> gamma(data<bfloat16_t>(args, 1));
-    GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, Rows, Width>, BaseShape2D<bfloat16_t, Rows, Width>> target(data<bfloat16_t>(args, 2) + first * Width);
-    TLOAD(input, source); TLOAD(weight, gamma);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0); wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-#if defined(PTO_NPU_ARCH_A5) || defined(__CPU_SIM)
-    normalize(output.data(), input.data(), weight.data(), valid);
-#else
-    Vec<float, Rows, Width> value, square;
-    Vec<float, 1, Width> gain;
-    Tile<TileType::Vec, float, 8, 1, BLayout::ColMajor, DYNAMIC, 1> inverse(Rows);
-    Vec<float, Rows, 128> scratch;
-    TASSIGN(value, 73728); TASSIGN(square, 114688);
-    TASSIGN(gain, 155648); TASSIGN(inverse, 176128); TASSIGN(scratch, 176160);
-    TCVT(value, input, RoundMode::CAST_NONE);
-    TCVT(gain, weight, RoundMode::CAST_NONE);
-    TMUL(square, value, value);
-    TROWSUM(inverse, square, scratch);
-    TMULS(inverse, inverse, 1.0f / Width);
-    TADDS(inverse, inverse, 1.0e-6f);
-    TRSQRT(inverse, inverse);
-    TROWEXPANDMUL(value, value, inverse);
-    TCOLEXPANDMUL(value, value, gain);
-    TCVT(input, value, RoundMode::CAST_RINT);
-    TMOV(output, input);
-    if (valid < Rows) {
-        Vec<bfloat16_t, 1, Width> zero;
-        TASSIGN(zero, 30720 + valid * Width * sizeof(bfloat16_t));
-        for (int row = valid; row < Rows; ++row) {
-            TASSIGN(zero, 30720 + row * Width * sizeof(bfloat16_t));
-            TEXPANDS(zero, 0.0f);
-        }
+    auto source_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    auto target_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    int input_rows = source_tensor->shapes[0] - first;
+    input_rows = input_rows < 0 ? 0 : (input_rows > Rows ? Rows : input_rows);
+    valid = valid < input_rows ? valid : input_rows;
+    int output_rows = target_tensor->shapes[0] - first;
+    output_rows = output_rows < 0 ? 0 : (output_rows > Rows ? Rows : output_rows);
+    if (output_rows == 0) return;
+    Input<Width> input;
+    Weight<Width> weight;
+    Output<Width> output;
+    TASSIGN(input, 0);
+    TASSIGN(weight, 20480);
+    TASSIGN(output, 30720);
+    using Active = Tile<TileType::Vec, bfloat16_t, Rows, Width, BLayout::RowMajor, DYNAMIC, Width>;
+    using Shape = TileShape2D<bfloat16_t, DYNAMIC, Width>;
+    using GlobalStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
+    Active active_input(valid);
+    TASSIGN(active_input, 0);
+    if (valid > 0) {
+        GlobalTensor<bfloat16_t, Shape, GlobalStride> source(
+            data<bfloat16_t>(args, 0) + first * source_tensor->strides[0],
+            Shape(valid, Width), GlobalStride(1, 1, 1, source_tensor->strides[0], 1));
+        GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, 1, Width>, BaseShape2D<bfloat16_t, 1, Width>> gamma(
+            data<bfloat16_t>(args, 1));
+        TLOAD(active_input, source);
+        TLOAD(weight, gamma);
     }
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    if (valid == 0) {
+        TEXPANDS(output, static_cast<bfloat16_t>(0.0f));
+    } else {
+#if defined(PTO_NPU_ARCH_A5) || defined(__CPU_SIM)
+        for (int row = valid; row < Rows; ++row) {
+            Vec<bfloat16_t, 1, Width> zero;
+            TASSIGN(zero, row * Width * sizeof(bfloat16_t));
+            TEXPANDS(zero, static_cast<bfloat16_t>(0.0f));
+        }
+        normalize<Width>(output.data(), input.data(), weight.data(), valid);
+#else
+        Vec<float, Rows, Width> value, square;
+        Vec<float, 1, Width> gain;
+        Tile<TileType::Vec, float, 8, 1, BLayout::ColMajor, DYNAMIC, 1> inverse(Rows);
+        Vec<float, Rows, 128> scratch;
+        TASSIGN(value, 73728);
+        TASSIGN(square, 114688);
+        TASSIGN(gain, 155648);
+        TASSIGN(inverse, 176128);
+        TASSIGN(scratch, 176160);
+        for (int row = valid; row < Rows; ++row) {
+            Vec<bfloat16_t, 1, Width> zero;
+            TASSIGN(zero, row * Width * sizeof(bfloat16_t));
+            TEXPANDS(zero, static_cast<bfloat16_t>(0.0f));
+        }
+        TCVT(value, input, RoundMode::CAST_NONE);
+        TCVT(gain, weight, RoundMode::CAST_NONE);
+        TMUL(square, value, value);
+        TROWSUM(inverse, square, scratch);
+        TMULS(inverse, inverse, 1.0f / Width);
+        TADDS(inverse, inverse, 1.0e-6f);
+        TRSQRT(inverse, inverse);
+        TROWEXPANDMUL(value, value, inverse);
+        TCOLEXPANDMUL(value, value, gain);
+        TCVT(input, value, RoundMode::CAST_RINT);
+        TMOV(output, input);
+        if (valid < Rows) {
+            Vec<bfloat16_t, 1, Width> zero;
+            TASSIGN(zero, 30720 + valid * Width * sizeof(bfloat16_t));
+            for (int row = valid; row < Rows; ++row) {
+                TASSIGN(zero, 30720 + row * Width * sizeof(bfloat16_t));
+                TEXPANDS(zero, static_cast<bfloat16_t>(0.0f));
+            }
+        }
 #endif
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0); wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    TSTORE(target, output);
+    }
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    Active active_output(output_rows);
+    TASSIGN(active_output, 30720);
+    GlobalTensor<bfloat16_t, Shape, GlobalStride> target(
+        data<bfloat16_t>(args, 2) + first * target_tensor->strides[0],
+        Shape(output_rows, Width), GlobalStride(1, 1, 1, target_tensor->strides[0], 1));
+    TSTORE(target, active_output);
     pipe_barrier(PIPE_ALL);
+}
+#endif
+} // namespace
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+#if defined(__DAV_VEC__)
+    auto weight = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    if (weight->shapes[0] == 128) {
+        run<128>(args);
+    } else {
+        run<5120>(args);
+    }
 #endif
 }

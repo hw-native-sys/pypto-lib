@@ -33,7 +33,7 @@ from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_ro
 from sparse_attention import _attend_project
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from quant import quantize_mxfp8_cache
-from rmsnorm import golden_rms_norm, rms_norm_tiled
+from rmsnorm import NORM_T_TILE, golden_rms_norm, rms_norm
 
 
 # model config
@@ -181,8 +181,8 @@ def prefill_c2a_reuse_sp(
         hf32=False,
     )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
-    for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
+    with pl.spmd(pl.max(1, (hc_norm_tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="rms_norm"):
+        local_hidden = rms_norm(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_tokens, width=D)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input,
         group_base, tp_rank, num_tokens, attention_epoch,
@@ -262,12 +262,12 @@ def prefill_c2a_reuse(
         hf32=False,
     )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
-    for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hc_collapsed, attn_norm_weight, attn_input, hc_norm_block, hc_norm_tokens, output_fp32=False)
-    attention_tokens = pl.tensor.dim(attn_input, 0)
-    attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
+    normalized_input = pl.reshape(attn_input, [tokens, D])
+    with pl.spmd(pl.max(1, (hc_norm_tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="rms_norm"):
+        normalized_input = rms_norm(hc_collapsed, attn_norm_weight, normalized_input, hc_norm_tokens, width=D)
+    attention_partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
     prefill_c2a_reuse_attention(
-        attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b,
+        normalized_input, wq_a, wq_a_scale, q_norm_weight, wq_b,
         wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
