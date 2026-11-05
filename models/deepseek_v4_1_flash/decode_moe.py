@@ -111,13 +111,16 @@ def combine_scattered(
             if peer != my_rank:
                 pld.system.notify(target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[notify_tid]) as _cwait_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="combine_wait",
+        deps=[scatter_done], no_dep_args=[combine_arrived],
+    ) as _cwait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.defer_wait(signal=combine_arrived, offsets=[src, 0, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
     # Wait for local and peer routed-output stores.
-    with pl.spmd((T + COMBINE_T_TILE - 1) // COMBINE_T_TILE, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
+    with pl.spmd((T + COMBINE_T_TILE - 1) // COMBINE_T_TILE, name_hint="combine_reduce", deps=[_cwait_tid, notify_tid]) as _reduce_tid:
         t_begin = pl.tile.get_block_idx() * COMBINE_T_TILE
         for t in pl.range(t_begin, pl.min(t_begin + COMBINE_T_TILE, T)):
             if t < num_tokens:
