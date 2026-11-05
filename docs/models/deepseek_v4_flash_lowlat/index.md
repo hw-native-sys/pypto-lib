@@ -157,10 +157,10 @@ indices.
 
 ## CI targets and validation scope
 
-This model currently uses A2/A3 device CI. Its runnable entries are marked
-`# ci: no-sim`, which both pull-request and daily selectors honor. Simulator
-qualification is deferred; this does not assert simulator incompatibility.
-Other model families and their simulator coverage are unchanged.
+This model uses A2/A3 device CI. Runnable entries without `# ci: no-sim`
+also run in simulator CI with `-p a2a3 --sim` and their original golden
+comparisons. Entries still being qualified retain `# ci: no-sim`.
+Both pull-request and daily selectors honor these markers.
 
 The composed `decode_swa.py` and `decode_hca.py` entries require eight logical
 TP ranks and declare `# ci: devices=8`, as does CSA. Their standalone
