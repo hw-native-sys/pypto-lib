@@ -45,7 +45,7 @@ from pypto.ir import DistributedConfig
 
 from config import DP_SIZE as CONFIG_DP_SIZE, FLASH as M, TP_SIZE as CONFIG_TP_SIZE
 from hc import hc_head, golden_hc_collapse
-from rmsnorm import rms_norm_tiled_compensated, golden_rms_norm_tiled
+from rmsnorm import NORM_T_TILE, rms_norm, golden_rms_norm
 
 
 # model config
@@ -550,8 +550,9 @@ def _final_output(
     collapsed = pl.create_tensor([rows, D], dtype=pl.BF16)
     hc_head(x_hc, pre_mix, collapsed)
     normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
-    for norm_block in pl.spmd((rows + 7) // 8, name_hint="final_rms_norm"):
-        rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, norm_block, rows)
+    with pl.spmd(pl.max(1, (rows + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="final_rms_norm"):
+        norm_result = rms_norm(collapsed, final_norm_weight, normalized, rows, width=D)
+    normalized = pl.reshape(norm_result, [rows, D])
     lm_head_with_sampling(
         normalized, lm_head_weight, logit_row_indices, logits, sampled_ids,
         hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,
@@ -628,7 +629,7 @@ def golden_final_output(tensors):
     hidden = []
     for rank in range(WORLD_SIZE):
         collapsed = golden_hc_collapse(tensors["x_hc"][rank], tensors["pre_mix"][rank]).to(torch.bfloat16)
-        normalized = golden_rms_norm_tiled(collapsed, tensors["final_norm_weight"][rank])
+        normalized = golden_rms_norm(collapsed, tensors["final_norm_weight"][rank])
         hidden.append(normalized.to(torch.bfloat16))
     golden_lm_head({**tensors, "hidden_states": torch.stack(hidden)})
 

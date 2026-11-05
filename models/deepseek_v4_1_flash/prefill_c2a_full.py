@@ -41,7 +41,7 @@ from o_proj import (
     golden_o_proj, prefill_sp_output_reduce_scatter,
 )
 from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes, prefill_sp_post
-from rmsnorm import golden_rms_norm, rms_norm_tiled
+from rmsnorm import NORM_T_TILE, golden_rms_norm, rms_norm
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables
 from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from quant import dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
@@ -272,8 +272,8 @@ def prefill_c2a_full_sp(
         hf32=False,
     )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
-    for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
+    with pl.spmd(pl.max(1, (hc_norm_tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="rms_norm"):
+        local_hidden = rms_norm(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_tokens, width=D)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input,
         group_base, tp_rank, num_tokens, attention_epoch,

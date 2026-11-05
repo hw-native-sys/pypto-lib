@@ -23,7 +23,7 @@ from config import (
 from hc import golden_mhc_mixes
 from hc import golden_hc_post, hc_post, prefill_sp_post
 from hc import golden_hc_collapse, hc_pre
-from rmsnorm import golden_rms_norm, rms_norm_tiled
+from rmsnorm import NORM_T_TILE, golden_rms_norm, rms_norm
 from sparse_attention import (
     _attend_project, golden_compressed_attention, golden_prefill_c1a_attention,
 )
@@ -329,8 +329,8 @@ def l2_prefill_c1a_reindex_sharded(
         hf32=False,
     )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
-    for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
+    with pl.spmd(pl.max(1, (hc_norm_tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="rms_norm"):
+        local_hidden = rms_norm(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_tokens, width=D)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
         active, attention_epoch,
@@ -538,8 +538,8 @@ def prefill_c1a_reindex(
         hf32=False,
     )
     norm_tokens = pl.tensor.dim(hidden, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hidden, attn_norm_weight, attn_input, norm_block, norm_tokens, output_fp32=False)
+    with pl.spmd(pl.max(1, (norm_tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="rms_norm"):
+        attn_input = rms_norm(hidden, attn_norm_weight, attn_input, norm_tokens, width=D)
     prefill_c1a_reindex_attention(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,

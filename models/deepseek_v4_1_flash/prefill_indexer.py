@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import pypto.language as pl
 
 from config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, T_DYN
-from rmsnorm import EPS, rms_norm, golden_rms_norm
+from rmsnorm import NORM_T_TILE, rms_norm, golden_rms_norm
 from quant import dequantize_mxfp4_cache, quantize_mxfp4_cache
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
@@ -1092,23 +1092,18 @@ def prefill_index_key_project(
 ):
     """Project C2A keys, then normalize after the compressor pool_ready dependency."""
     tokens = pl.tensor.dim(latent, 0)
+    latent_rows = pl.reshape(latent, [tokens, HEAD_DIM])
+    output_rows = pl.reshape(output, [tokens, INDEX_DIM])
     projected = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     projection_ready = pl.system.task_dummy(deps=[])
     projected_result, projected_tid = gemm_bf16_to_bf16(
-        latent, weight, projected, num_tokens, projection_ready,
+        latent_rows, weight, projected, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
         workers=2147483647, name_hint="prefill_index_key",
     )
-    norm_blocks = (num_tokens + M_TILE - 1) // M_TILE
-    with pl.spmd(norm_blocks, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
-        t0 = pl.tile.get_block_idx() * M_TILE
-        rows = pl.min(M_TILE, num_tokens - t0)
-        value = pl.cast(pl.slice(projected, [M_TILE, INDEX_DIM], [t0, 0], valid_shape=[rows, INDEX_DIM]), pl.FP32)
-        square = pl.mul(pl.row_sum(pl.mul(value, value)), 1.0 / INDEX_DIM)
-        inv = pl.rsqrt(pl.add(square, EPS), high_precision=True)
-        gamma = pl.reshape(pl.cast(norm_weight[:], pl.FP32), [1, INDEX_DIM])
-        normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv), gamma)
-        output[t0 : t0 + M_TILE, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, INDEX_DIM)
+    norm_blocks = (num_tokens + NORM_T_TILE - 1) // NORM_T_TILE
+    with pl.spmd(pl.max(1, norm_blocks), name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
+        output_rows = rms_norm(projected, norm_weight, output_rows, num_tokens, width=INDEX_DIM)
     return norm_tid
 
 
@@ -1133,10 +1128,9 @@ def publish_c1a_index_key(
         workers=2147483647, name_hint="prefill_index_key",
     )
     index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
-    norm_blocks = (num_tokens + 7) // 8
-    for norm_worker in pl.spmd(pl.max(1, norm_blocks), name_hint="attention_rmsnorm"):
-        if norm_worker < norm_blocks:
-            rms_norm(index_projection, index_norm_weight, index_normalized, norm_worker, num_tokens, width=INDEX_DIM)
+    norm_tokens = pl.cast(num_tokens, pl.INT32)
+    with pl.spmd(pl.max(1, (norm_tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="attention_rmsnorm"):
+        index_normalized = rms_norm(index_projection, index_norm_weight, index_normalized, norm_tokens, width=INDEX_DIM)
     index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     _index_rope(
         index_normalized, compressed_rope_cos, compressed_rope_sin, index_rotated, num_tokens,

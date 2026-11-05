@@ -27,7 +27,7 @@ from config import (
 from hc import golden_mhc_mixes
 from hc import golden_hc_post, prefill_sp_post
 from hc import golden_hc_collapse, hc_pre, zero_bf16_padding
-from rmsnorm import golden_rms_norm, rms_norm_tiled
+from rmsnorm import NORM_T_TILE, golden_rms_norm, rms_norm
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter
 from prefill_cp_allgather import make_prefill_sp_input_allgather
@@ -199,8 +199,8 @@ def prefill_swa(
         hf32=False,
     )
     norm_tokens = pl.tensor.dim(collapsed, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(collapsed, attn_norm_weight, local_hidden, norm_block, norm_tokens, output_fp32=False)
+    with pl.spmd(pl.max(1, (norm_tokens + NORM_T_TILE - 1) // NORM_T_TILE), name_hint="rms_norm"):
+        local_hidden = rms_norm(collapsed, attn_norm_weight, local_hidden, norm_tokens, width=D)
     zero_bf16_padding(local_hidden, pl.min(tokens, pl.tensor.dim(local_hidden, 0)))
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, hidden,
