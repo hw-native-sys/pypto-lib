@@ -42,6 +42,7 @@ _EXPORTS = {
     "validate_decode_candidates": ("decode_candidates", "validate_candidates"),
     "decode_acceptance_report": ("decode_acceptance", "report"),
     "decode_gate_report": ("decode_gate", "gate_report"),
+    "validate_decode_assets": ("decode_asset_contract", "validate_assets"),
     "decode_ep2": ("decode_moe_ep2", "decode_ep2"),
     "decode_ep2_contract": ("decode_moe_ep2", "product_contract"),
     "decode_reference_manifest": ("decode_reference", "reference_manifest"),

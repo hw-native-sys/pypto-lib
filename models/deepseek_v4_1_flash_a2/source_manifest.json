@@ -1026,6 +1026,13 @@
       "accuracy_evidence": "not_run"
     },
     {
+      "file": "decode_asset_contract.py",
+      "sha256": "0bcb5a9b51087d040cb33f71ffd76ab89f3fb80f4ffc4e7cb521495ee5d4be68",
+      "role": "fail-closed Decode input/cache/reference asset structure verifier",
+      "product_compute": false,
+      "accuracy_evidence": "not_run"
+    },
+    {
       "file": "decode_candidates.py",
       "sha256": "56788c1c870966822d6bed112fd8b28c800e2a746bab683314aab4981045fb75",
       "role": "Search K=2 executable PyPTO candidate registry",

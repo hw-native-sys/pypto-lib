@@ -22,6 +22,7 @@ from models.deepseek_v4_1_flash_a2.decode_acceptance import (
     checkpoint_asset_report,
     runtime_identity,
 )
+from models.deepseek_v4_1_flash_a2.decode_asset_contract import validate_assets
 
 
 REQUIRED_ASSETS = (
@@ -55,12 +56,19 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
     }
     missing = [name for name, exists in present.items() if not exists]
     checkpoint = checkpoint_asset_report()
+    asset_validation = validate_assets(
+        root,
+        topology_config,
+        checkpoint_root=checkpoint.get("root"),
+        expected_reference_commit=CONTRACT["runtime"]["vllm_reference_commit"],
+    )
     implementation = CONTRACT["implementation"]
     devices = topology_config["devices"]
     ready = (
         not missing
         and checkpoint.get("status") == "metadata_verified"
         and implementation["formal_ready"]
+        and asset_validation["status"] == "pass"
     )
     command = (
         f"task-submit --device auto --device-num {devices} --run "
@@ -84,6 +92,7 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
         "assets": assets,
         "asset_presence": present,
         "missing_assets": missing,
+        "asset_validation": asset_validation,
         "checkpoint_asset": checkpoint,
         "implementation": implementation,
         "required_state_inputs": list(CONTRACT["state_inputs"]),

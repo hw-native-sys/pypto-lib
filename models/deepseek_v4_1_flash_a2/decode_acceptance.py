@@ -40,6 +40,7 @@ PRODUCT_ENTRYPOINTS = (
 )
 VALIDATION_ENTRYPOINTS = (
     "decode_acceptance.py",
+    "decode_asset_contract.py",
     "decode_gate.py",
     "decode_reference.py",
     "decode_ep2_compile.py",
