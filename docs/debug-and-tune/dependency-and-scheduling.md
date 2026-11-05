@@ -251,7 +251,15 @@ waiting for — is settled by two artifacts and their join.
 | `chip_swimlane_records.json` | `--enable-chip-swimlane` | Per-task timing and scheduler/orchestrator phases; **no** edges |
 | `name_map*.json` | Compile | Callable id → source name |
 | `dispatch_program.json` | Compile | Which program a dispatch directory belongs to |
-| `merged_swimlane*.json` | `swimlane_converter` | The two joined, for Perfetto |
+| `merged_swimlane*.json` | `swimlane_converter` | Optional joined trace for Perfetto |
+
+For visual inspection, prefer opening `chip_swimlane_records.json` directly
+with the PyPTO3 Toolkit VSCode extension from the
+[`hw-native-sys/pypto-tools` repository](https://github.com/hw-native-sys/pypto-tools).
+Keep the
+matching `deps.json` and `name_map*.json` in the same dispatch directory.
+See [viewer instructions](performance-tuning.md#capture). The merged trace
+is a secondary option for Perfetto.
 
 Timing and topology are deliberately separate: per-task fanout on the device
 hot path would cost a ~1 KB GM store and a linked-list walk per task. The

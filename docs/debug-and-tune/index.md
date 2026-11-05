@@ -16,6 +16,7 @@ then move from the broadest evidence to the narrowest:
 | Diagnose compile errors, runtime failures, hangs, or missing dependencies | [Debugging](debugging.md) |
 | Diagnose numerical drift and choose comparison thresholds | [Precision Tuning](precision-tuning.md) |
 | Measure end-to-end time and inspect the task schedule | [Performance Tuning](performance-tuning.md) |
+| Measure selected stages inside a full program | [Task-Timing Slots](task-timing-slots.md) |
 | See how a full decode path was optimized, in order, with the limit found at each step | [DeepSeek V4 Decode Optimization](../models/deepseek_v4_flash_mtp/decode_optimization.md) |
 | See how a single-card dense model's kernels were tuned, in the order the work happened | [Qwen3-14B Optimization](../models/qwen3_14b/optimization.md) |
 | Understand how task edges are formed and when the scheduler issues them | [Dependencies and Scheduling](dependency-and-scheduling.md) |
@@ -47,8 +48,10 @@ source.
 - Use the same platform, device topology, runtime configuration, and benchmark
   round count for every candidate.
 - Collect repeats as rounds inside one process (`PYPTO_BENCH_ROUNDS`), not as
-  repeated invocations of the script, and report the `mean=` field of the
-  `[RUN] effective_us` line. Retain the raw samples (`PYPTO_BENCH_RAW=1`).
+  repeated invocations of the script. For single-card tuning, report the
+  `median=` field of the `[RUN] effective_us` line. For multi-card tuning, use
+  the [lowest per-rank median](performance-tuning.md#multi-card-l3-output).
+  Retain the raw samples (`PYPTO_BENCH_RAW=1`).
 - Keep generated traces and build products under `build_output/`; do not commit
   them.
 - Remove diagnostic instrumentation and rerun validation before submitting a

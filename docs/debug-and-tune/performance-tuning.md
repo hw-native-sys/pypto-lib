@@ -1,9 +1,9 @@
 # Performance Tuning
 
-A practical guide for tuning pypto-lib kernels on Ascend NPU (A3 / 910C).
-The flow is two-tiered: first balance the inter-kernel schedule on the
-AICPU side (chip swimlane), then optimize each kernel's internal pipeline
-(L1/L0 swimlane + PMU).
+A practical guide for tuning pypto-lib kernels on Ascend A2/A3 and A5.
+Start with the chip swimlane to locate the bottleneck, then choose task
+organization or intra-kernel optimization. Iterate between these levels as
+the bottleneck moves.
 
 For the underlying levels see simpler's
 [Hierarchical Level Runtime](https://www.pypto.ai/simpler/hierarchical-level-runtime/):
@@ -14,12 +14,14 @@ compute core.
 
 ## Measuring — the benchmark loop (`PYPTO_BENCH`)
 
+The examples below use V4-MTP's CSA decode operator,
+`models/deepseek_v4_flash_mtp/decode_csa.py`.
 Tuning needs a number before and after. Set `PYPTO_BENCH=1` and every
 `run` call in the process times the kernel on device after its
 correctness dispatch — no `--benchmark` flag, no edit to the model file:
 
 ```bash
-PYPTO_BENCH=1 python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
+PYPTO_BENCH=1 python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0
 ```
 
 ```
@@ -28,8 +30,11 @@ PYPTO_BENCH=1 python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
 
 **Effective** is the framework's post-graph-build execution window on
 device (`orch` ∪ `sched` — the old device-log "Total"), recovered from the
-runtime's `[STRACE]` markers. Quote `mean=` — this field of this line is the
-per-case number, so two runs are comparable only when both quote it.
+runtime's `[STRACE]` markers. Quote `median=` for single-card comparisons.
+Daily CI uses the same median convention. Older multi-card Daily CI reports
+used the fastest rank's mean; recompute those baselines from their raw samples
+before comparing them with medians. For multi-card tuning, use the fastest
+rank's median as described below.
 
 Requirements: a real device — a `*sim` platform prints
 `effective_us unavailable: no device-domain spans` — and a runtime built
@@ -52,6 +57,11 @@ A distributed program adds a per-rank breakdown and a context line:
   the slowest card finishes. The `eff_us` lines expose the cross-card
   imbalance that max hides; a persistent gap between ranks is a load-balance
   problem, not a kernel problem.
+- For tuning comparisons, report the **lowest per-rank median** from the
+  `rank N: eff_us` lines to reduce the effect of start skew. This is not
+  end-to-end step latency; identify the convention explicitly and compare
+  like for like. Retain persistent rank imbalance in the report; a faster
+  rank alone does not prove an improvement in the whole distributed step.
 - A `rank N: eff_us` line **sums** that card's dispatches within a round (a card
   runs them serially). When a card dispatches more than once per round, each rank
   line gains a nested `slot` line per dispatch so you can see which dispatch owns
@@ -97,9 +107,9 @@ reported number should come from; if you change the loop sizes, compare only
 against other runs with the same sizes.
 
 ```bash
-# Quick iteration on a long prefill, with the raw per-dispatch samples.
+# Quick CSA decode iteration, with the raw per-dispatch samples.
 PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=10 PYPTO_BENCH_WARMUP=2 PYPTO_BENCH_RAW=1 \
-  python models/deepseek_v4_flash_mtp/prefill_fwd.py -p a2a3 -d 0
+  python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0
 ```
 
 When only the timing changes between iterations — not the numerics — save the
@@ -114,18 +124,18 @@ of every later run. See
 ### Capture
 
 Run the case with `--enable-chip-swimlane`. The runtime writes raw per-task
-chip swimlane records under the build directory and, on a real-device platform,
-converts them to a merged swimlane:
+chip swimlane records under the build directory. Open these records directly
+for routine analysis; real-device runs also attempt merged-trace conversion:
 
 ```bash
-python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0 --enable-chip-swimlane
+python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0 --enable-chip-swimlane
 ```
 
 ```
 build_output/<ProgramName>_<ts>/dfx_outputs/
-├── chip_swimlane_records.json
+├── chip_swimlane_records.json  # preferred viewer input
 ├── deps.json                    # real-device graph pass
-└── merged_swimlane_<ts>.json   # real device only; open this
+└── merged_swimlane_<ts>.json   # optional Perfetto view, real device only
 ```
 
 The flag takes a capture **level**, and a bare flag means level 1 — per-task
@@ -135,117 +145,33 @@ measures. Gap attribution and early-dispatch proofs need
 `--enable-chip-swimlane 4` — see
 [Capture levels](dependency-and-scheduling.md#capture-levels).
 
-Two viewers work:
+Prefer the **PyPTO3 Toolkit VSCode extension**, documented in the
+[`hw-native-sys/pypto-tools` repository](https://github.com/hw-native-sys/pypto-tools)
+and the
+[PyPTO3 Toolkit guide](https://www.pypto.ai/pypto-tools/). Right-click
+`chip_swimlane_records.json` and select **PyPTO3 Toolkit: Open File**. For an
+L3 capture, open the records for the selected rank and dispatch, for example
+`build_output/<ProgramName>_<ts>/dfx_outputs/rank0/d0/chip_swimlane_records.json`.
+Keep matching `deps.json` and `name_map*.json` alongside the records so the
+extension can show dependencies and function statistics. Available worker,
+scheduler, and orchestrator views depend on the capture level.
 
-- Open `merged_swimlane_<ts>.json` in <https://ui.perfetto.dev/>.
-- Or open `chip_swimlane_records.json` directly with the
-  [pypto-toolkit VSCode extension](https://marketplace.visualstudio.com/items?itemName=CANN-PUB.pypto-toolkit).
+As a secondary option, open `merged_swimlane_<ts>.json` in
+[Perfetto](https://ui.perfetto.dev/). Keep this format for Perfetto-specific
+inspection; it is not the default file to open or deliver.
 
 Simulator platforms emit `chip_swimlane_records.json` but intentionally skip
-the merged conversion because their records do not yet include the task
-metadata the converter requires. Use a real-device capture when you need the
-merged Perfetto view and dependency arrows.
-
-The trace shows one lane per AICPU / AIC / AIV with task name, duration
-and dependency edges — gaps and stalls are visible directly.
+merged conversion because their records do not yet include the task metadata
+the converter requires. Dependency inspection requires a matching graph;
+use a real-device capture when the simulator does not provide it.
 
 ### Timing one stage of a full network — task-timing slots
 
-A swimlane answers "where did every task go". A narrower question comes up
-constantly on a full network: **what does this one stage cost inside the whole
-program?** simpler answers that with *selective task-timing slots* — 16 fixed
-slots into which the Scheduler folds a tagged task's AICPU dispatch→finish
-window, at the same boundaries the swimlane's `finish_time` uses.
-
-| | Task-timing slot | Chip swimlane |
-|---|---|---|
-| Covers | up to 16 tagged tasks | every task |
-| Switch | tagging in the generated orchestration `.cpp` — no env var, no compile gate, works in `SIMPLER_DFX=0` builds | `--enable-chip-swimlane` |
-| Cost on untagged tasks | one cache-hot sentinel compare | per-task records and collector threads |
-| Output | `[STRACE]` spans named `chip.run.runner_run.device_wall.task_slot_<N>` (`clk=dev`, `ts` / `dur` in ns) | merged Perfetto JSON |
-
-Reach for a slot when a whole-network swimlane is too large to read or perturbs
-the schedule being measured, and you already know which stage you care about.
-Reach for the swimlane when the question is *why* that stage is slow.
-
-They are also how a change the benchmark loop distorts gets attributed. An L2
-warm is the standard example: `PYPTO_BENCH` replays the same weights every round,
-so its L2 is already warm and the end-to-end delta is both flattered and diluted
-— see [L2 Prefetch](l2-prefetch.md#the-benchmark-loop-flatters-a-warm).
-
-**PyPTO exposes no DSL surface for the tag**, so the workflow patches the
-generated orchestration C++ and replays it — the same
-[`runtime_dir` loop](debugging.md#3-reuse-a-compile-with-runtime_dir-edit-cpp-pto-and-retest)
-used for any generated-code edit:
-
-1. Compile once (`--compile-only`, or reuse an existing build directory).
-2. Open the orchestration source — `<work_dir>/orchestration/<prog>.cpp` for an
-   L2 program, `<work_dir>/next_levels/<prog>/orchestration/<prog>.cpp` for an
-   L3 one. Every submit block carries a comment naming its scope and kernel,
-   which is how a stage is located:
-
-   ```cpp
-   // Spmd w1_mm_spmd: w1_mm
-   CoreTaskArgs params_t0;
-   params_t0.add_input(ext_recv_x);
-   params_t0.add_output(ext_gate_i32);
-   params_t0.set_task_timing_slot(0);        // <- the tag
-   params_t0.launch_spec.set_block_num(8);
-   rt_submit_aic_task(0, params_t0);
-   ```
-
-3. **Tag one iteration, not all.** A `pl.range` layer loop becomes a real C++
-   `for` whose induction variable keeps the DSL's own name, so an unguarded tag
-   merges all 20 layers into one useless window. Guard it:
-
-   ```cpp
-   if (ordinal == 10) params_t0.set_task_timing_slot(0);
-   ```
-
-4. Replay the patched build. Editing the `.cpp` is the only signal the harness
-   needs — do not delete the sibling `.o` / `.so`:
-
-   ```bash
-   PYPTO_BENCH=1 python models/deepseek_v4_flash_mtp/decode_fwd.py -p a2a3 -d 0,1 --ep 2 \
-       --runtime-dir build_output/<ProgramName>_<ts>
-   ```
-
-5. Read the `[RUN] task slots` block the benchmark prints (below). Without
-   `PYPTO_BENCH` the one correctness dispatch prints its spans to the runtime
-   log instead, at the default `timing` level — pass `PYPTO_RUNTIME_LOG=timing`
-   if the entry raised the threshold, then grep for `task_slot_`. The benchmark
-   captures stderr itself, so under `PYPTO_BENCH` those log lines never appear.
-
-#### Reading the numbers
-
-- **Each slot reduces to `min(dispatch)` / `max(finish)`.** Reusing one slot
-  across several tasks yields a single merged window from the earliest tagged
-  dispatch to the latest tagged finish — which is exactly how a multi-kernel
-  *stage* is measured. Distinct slots keep each task's own window, so tooling
-  can recover `finish(B) − dispatch(A)`. A MIX task's AIC/AIV0/AIV1 subtasks and
-  an SPMD task's blocks all fold into the one tagged slot.
-- **Read finish-to-finish, not span length.** `dispatch` is the *speculative*
-  publication, so under `allow_early_resolve` the windows overlap heavily and a
-  slot's own `dur` is not that stage's cost. Take
-  `(slot_{k+1}.ts + slot_{k+1}.dur) − (slot_k.ts + slot_k.dur)`, which means
-  tagging the preceding stage too — otherwise the first stage has no anchor.
-- **Slots reset every run.** A plain replay therefore yields one sample per
-  slot. Add `PYPTO_BENCH=1` to the replay for a distribution: every measured
-  round reports its slots, and the harness prints one line per rank and slot —
-
-  ```text
-  [RUN]   task slots: ranks=2
-  [RUN]     rank 1872915 task_slot 4: n=100 fin_us=2177.4 dur_us=8.6 dfin_us=713.9
-  [RUN]     rank 1872915 task_slot 5: n=100 fin_us=2599.3 dur_us=7.9 dfin_us=428.1
-  ```
-
-  `fin_us` is the slot's finish from the run's device-clock origin, `dur_us`
-  its own window, and `dfin_us` the per-round finish minus the previous slot's
-  finish — the finish-to-finish stage cost when slots are numbered in stage
-  order. All three are medians; `PYPTO_BENCH_RAW=1` adds each round's `fin_us`.
-- **The patch lives in `build_output/` only.** Recompiling regenerates the
-  orchestration `.cpp` and silently drops every tag — which is also how the
-  instrumentation is removed.
+Use task-timing slots when you already know which stage to measure and a full
+swimlane is too large or perturbs the schedule. Slots provide repeated stage
+measurements within the full program; use the swimlane to investigate why a
+stage is slow. See [Task-Timing Slots](task-timing-slots.md) for instrumentation,
+replay, and interpretation of dispatch and finish timestamps.
 
 ### What to look for
 
@@ -253,12 +179,12 @@ Look for these shapes on the swimlane that indicate a problem:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Cores idle while AICPU lane is solid | Kernels too small; AICPU scheduling is the bottleneck | Make kernels larger (item 2) |
-| Long tail on a single AIC/AIV | One kernel is too big and serializes | Split it (item 3) |
-| Cube / vector unit utilization low even though kernel is busy | Tile size under-fills the user-visible on-chip buffers | Re-tile against `Mat` / `Acc` for cube or `Vec` for vector work (item 4) |
-| Cube lane busy while vector lane idle (or vice versa) | Vec/cube epilogue is split into separate kernels | Merge into a mixed kernel (item 2c) |
-| A stage re-reads the same weights every layer, MTE2-bound, with a large unrelated stage in between | The weights are evicted from L2 before the next use | Warm them with `pl.prefetch` (item 5) |
-| Sequential AICPU dispatch trail per region | Region issues one kernel per iteration | Use `pl.spmd` to dispatch a block fan-out once (item 6) |
+| Cores idle while AICPU lane is solid | Kernels too small; AICPU scheduling is the bottleneck | [Coarsen task granularity](#adjust-task-granularity-along-the-critical-path) |
+| Long tail on a single AIC/AIV | One kernel is too big and serializes | [Split critical work](#adjust-task-granularity-along-the-critical-path) |
+| Cube / vector unit utilization low even though kernel is busy | Tile size under-fills the user-visible on-chip buffers | [Tune tiles against buffer constraints](#improve-intra-kernel-efficiency) |
+| Cube lane busy while vector lane idle (or vice versa) | Vec/cube epilogue is split into separate kernels | [Evaluate MIX fusion](#fuse-tasks-with-the-full-dataflow-in-mind) |
+| A stage re-reads the same weights every layer, MTE2-bound, with a large unrelated stage in between | The weights are evicted from L2 before the next use | [Warm reused weights](#reduce-redundant-work-and-improve-data-reuse) |
+| Sequential AICPU dispatch trail per region | Region issues one kernel per iteration | [Dispatch blocks with `pl.spmd`](#adjust-task-granularity-along-the-critical-path) |
 
 A gap on this trace is not automatically a scheduling problem: the interval
 before a task splits into producer-FIN detection, ready-but-undispatched
@@ -269,12 +195,27 @@ without guessing.
 
 ### Tuning rules
 
-#### 1. Use `pl.range` vs. `pl.parallel` correctly
+Use these as hypotheses to test on the current workload. Recheck the critical
+path after each change; a task's criticality can change with the schedule.
 
-`pl.parallel` declares iterations are independent — the compiler may
-distribute them across cores. `pl.range` is strict sequential and forces
-a dependency chain. Use `pl.parallel` whenever there is no carried state,
-and reserve `pl.range` for accumulators or stateful loops.
+#### Adjust task granularity along the critical path
+
+For critical-path tasks, try smaller work units and more parallelism until
+scheduling, synchronization, or lost data reuse offsets the gain. Further
+splitting has diminishing returns.
+
+For noncritical tasks, try larger work units and fewer workers. Use the time
+available before their consumers need the results to reduce dispatch and
+resource contention. Larger tasks must neither delay those consumers nor hold
+cores long enough to block critical work.
+
+**Expose independent iterations.**
+
+Use outer `pl.parallel` when independent iterations should be exposed to
+the scheduler. Use `pl.range` for carried state or to batch work inside one
+InCore task, including independent work that benefits from coarser granularity.
+Independence permits parallel execution; it does not require a separate task
+for every iteration.
 
 ```python
 # the batch tile is independent — pl.parallel
@@ -282,18 +223,29 @@ for b0 in pl.parallel(0, BATCH, BATCH_TILE):
     ...
 ```
 
-A `pl.range` over an independent dimension forces the swimlane into a
-single lane; switching to `pl.parallel` is usually the largest single
-win at this stage.
+Expose independent work with `pl.parallel`, then measure whether the added
+parallelism shortens the critical path.
 
-#### 2. Kernels too small — make each kernel do more
+**Split critical work across cores.**
 
-When the swimlane shows cores idling while the AICPU lane is fully
-saturated, the AICPU dispatcher is the bottleneck. Target ~50 µs per
-kernel on A3 / 910C (smaller kernels add dispatch overhead that the AICPU
-can't hide). Three ways to grow each kernel:
+When one InCore body contains independent chunks, expose those chunks as
+parallel blocks of a `pl.spmd` task. This example assumes `hidden` is divisible
+by `Q_OUT_CHUNK`. Otherwise, round the block count up and handle the final
+partial chunk in the body; floor division would omit it.
 
-**a. Fold outer iterations into the core.** Move part of an outer
+```python
+# Before: one giant InCore region over all q_out blocks
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
+    for q0 in pl.range(0, hidden, Q_OUT_CHUNK):
+        ...
+
+# After: one scheduling unit with parallel blocks of the same body
+for q_block in pl.spmd(hidden // Q_OUT_CHUNK, name_hint="q_proj"):
+    q0 = q_block * Q_OUT_CHUNK
+    ...
+```
+
+**Coarsen noncritical work inside each core.** Move part of an outer
 `pl.range` / `pl.parallel`'s iterations **into** the `pl.at` region as an
 inner `pl.range`, so each dispatched kernel processes a tile of iterations
 instead of one:
@@ -311,7 +263,97 @@ for b0 in pl.parallel(0, BATCH, BATCH_TILE):
             ...
 ```
 
-**b. Merge consecutive `pl.at` blocks.** Adjacent `pl.at` regions in the
+**Choose SPMD or MPMD around the dependency structure.**
+
+An InCore launch and a `pl.spmd` group each form one scheduling unit. The
+SPMD unit contains multiple blocks of the same InCore body. An outer
+`pl.parallel` can expose independent chains of InCore launches or SPMD groups
+to the scheduler (MPMD).
+
+For a single InCore body that needs parallel execution, prefer `pl.spmd`:
+
+```python
+for q_grid in pl.spmd(Q_ON * N_SUB, name_hint="q_proj_fused_dequant"):
+    ...
+```
+
+For multiple dependent InCore stages repeated over independent chunks,
+consider `pl.parallel` around the chain, with each stage expressed as an
+InCore launch or a `pl.spmd` group. This exposes opportunities to overlap
+stages from different chunks and hide stalls:
+
+```text
+Chunk 0: A0 -> B0 -> C0
+Chunk 1: A1 -> B1 -> C1
+Chunk 2: A2 -> B2 -> C2
+```
+
+With chunk-local dependencies, B0 can become ready when A0 finishes while
+A1 and A2 are still running. In contrast, grouping all A blocks into one
+SPMD task and all B blocks into another makes the completion dependency
+coarser: B waits for the whole A group. MPMD can preserve more overlap at
+the cost of additional scheduling units and dependency tracking.
+
+Choose between these forms by measuring the scheduling overhead against the
+overlap gained. Preserve true cross-chunk dependencies and scratch-buffer
+lifetimes; do not assume chunks are independent merely because their work
+can be split. SPMD is a useful default for one parallel body, not a universal
+replacement for parallel chains of kernels.
+
+#### Reduce redundant work and improve data reuse
+
+Share quantized inputs, reuse weights across more rows, and eliminate
+unnecessary intermediate tensors and layout conversions. Choose compute and
+transfer tiles for the reuse they provide; quantization and output stages can
+retain smaller tiles when needed.
+
+**Warm weights that will be reused.**
+
+When a stage re-reads a fixed weight set every layer and something between two
+layers evicts it, an SDMA cache warm (`pl.prefetch`) can hide the reload behind
+compute that is already running. It writes no tensor, so it is free to try and
+free to delete — but a partial or oversized warm costs more than it saves. See
+[L2 Prefetch](l2-prefetch.md).
+
+**Use NZ layout and cache bypass where appropriate.**
+
+NZ layout can avoid repeated weight reformatting during loads. Cache bypass
+is a separate candidate for streamed weights with no useful reuse, to avoid
+evicting reusable data. Declare the actual byte layout and test the cache
+policy independently:
+
+| Declaration | What it changes | What it costs |
+| --- | --- | --- |
+| `pl.Tensor[[E, N, K], pl.INT8, pl.NZ]` | the cube loads the weight NZ→NZ instead of reformatting ND on the way into L1, so the contiguous run is one fractal column block rather than one K-tile row | the fixture must write the bytes in fractal order (`utils.pack_nz`) and the golden must read them back (`utils.unpack_nz`) |
+| `pl.set_cache_policy(w, pl.CachePolicy.BYPASS)` at the top of the reading scope | the load is issued against the device's uncached alias, so it does not evict what *does* have reuse | nothing to the kernel; the author asserts nobody writes those bytes while it runs |
+
+NZ changes the contiguous transfer shape as well as removing ND-to-NZ
+conversion. Its benefit depends on the logical tile, physical strides, dtype,
+and target load implementation; do not infer a fixed bandwidth gain from the
+layout name.
+
+Keep the fixture, checkpoint upload, kernel annotation, and golden consistent
+with the physical byte order. Merely adding `pl.NZ` does not repack data.
+For supported slicing, reshaping, stores, and dtype-dependent fractal sizes,
+consult the selected PyPTO revision's
+[BlockNzTensorViews rules](https://github.com/hw-native-sys/pypto/blob/main/docs/en/dev/passes/16-block_nz_tensor_views.md).
+NZ fractal constraints are distinct from GM access granularity and L2 cache
+line size. Validate the exact target and shape with the compiler.
+
+**Measure both separately.** They are independent, and which one pays depends on
+whether the ND load is already at its bandwidth ceiling: at a coarse blocking
+where ND already saturates, NZ can be worth nothing while the bypass still pays,
+and at a finer blocking the order reverses. One `PYPTO_BENCH` run per variant on
+the same frozen inputs settles it.
+
+#### Fuse tasks with the full dataflow in mind
+
+Before fusing stages, check other consumers, available parallelism, load
+balance, and write ownership. A fused task can save transfers while delaying
+another branch that previously consumed an intermediate result earlier.
+Fewer tasks alone do not establish a performance improvement.
+
+**Merge consecutive `pl.at` blocks.** Adjacent `pl.at` regions in the
 same scope each become a separate kernel with an AICPU hand-off between
 them. Fuse back-to-back regions into one `pl.at` so a single kernel covers
 the whole sequence:
@@ -328,8 +370,12 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_q_proj"):
     ...   # rmsnorm, then q_proj
 ```
 
-**c. Merge cube + vector into a mixed kernel.** When a matmul (cube) and
-its epilogue (cast / add / norm — vector) sit in separate `pl.at` regions,
+**Combine Cube and Vector stages into MIX.** Try this when cooperating stages
+frequently exchange data. Tune their pipeline, tile sizes, and buffering
+together to reduce intermediate transfers and keep both sides progressing.
+
+When a matmul (cube) and its epilogue (cast / add / norm — vector) sit in
+separate `pl.at` regions,
 every projection generates two kernels and an AICPU hand-off between them.
 Place both inside the **same** `pl.at` and the compiler co-schedules cube
 and vector on the right unit internally, removing the hand-off:
@@ -343,190 +389,41 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
     q_proj[b0:b0 + BATCH_TILE, q0:q0 + Q_OUT_CHUNK] = q_bf16
 ```
 
-#### 3. Kernels too big — split and parallelize
+#### Improve intra-kernel efficiency
 
-When one kernel dominates the swimlane and the rest of the chip waits on
-it, the kernel is too coarse. Pull a `pl.range` out of the `pl.at` and
-convert it to a `pl.parallel` chunk loop so each chunk becomes its own
-InCore kernel scheduled across cores:
+Faster compute and transfers shorten critical tasks or free resources for
+other work. Check the overall effect when an optimization consumes additional
+cores or bandwidth.
 
-```python
-# Before: one giant InCore region over all q_out blocks
-with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
-    for q0 in pl.range(0, hidden, Q_OUT_CHUNK):
-        ...
-
-# After: each q-chunk is its own kernel, parallel across cores
-for q0 in pl.parallel(0, hidden, Q_OUT_CHUNK):
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
-        ...
-```
-
-#### 4. Tiling — fill the core-internal buffers
-
-Each AIC / AIV core has fixed on-chip buffers. At the DSL level, cube tiles
-directly consume `Mat` (L1 operand storage) and `Acc` (L0C accumulator
-storage), while vector tiles consume `Vec` (UB). The tile sizes declared in
-your `pl.slice` / `pl.matmul` (typically `BATCH_TILE`, `K_STEP`,
-`Q_OUT_CHUNK`, …) control these spaces.
-
-- Too small → buffers are under-utilized, cube/vector throughput drops
-  proportionally, MTE2 issues many small loads.
-- Too large → tile spills, the compiler falls back to smaller transfer
-  units, or compile-time shape checks fail.
-
-**Check actual occupancy.** Every compile writes a per-kernel buffer
-report to
-
-```
-build_output/<ProgramName>_<ts>/report/memory_after_AllocateMemoryAddr.txt
-```
-
-listing, for each compute function, how full each on-chip space runs
-against its hardware limit (on the illustrated 910C configuration: vector
-`Vec` has a 184 KB compiler-safe limit within the 192 KB physical UB; cube
-`Mat` is 512 KB, `Left` / `Right` are 64 KB each, and `Acc` is 128 KB):
-
-```
---- gather_kv ---
-  Space  |  Used       |  Limit      |  Usage   |  MemRefs
-  -------+-------------+-------------+----------+---------
-  Vec    |   129.0 KB  |   184.0 KB  |   70.1%  |  2
-
---- kv_proj_matmul ---
-  Space  |  Used       |  Limit      |  Usage   |  MemRefs
-  -------+-------------+-------------+----------+---------
-  Mat    |    80.0 KB  |   512.0 KB  |   15.6%  |  4
-  Left   |    32.0 KB  |    64.0 KB  |   50.0%  |  1
-  Right  |    16.0 KB  |    64.0 KB  |   25.0%  |  1
-  Acc    |     4.0 KB  |   128.0 KB  |    3.1%  |  1
-```
-
-Scan the `Usage` column for `Mat`, `Acc`, and `Vec`. These are the
-user-visible constraints affected by the M/N/K or vector fragment. `Left`
-and `Right` report the L0A/L0B staging chosen by the compiler for the L1
-fragment; they can routinely read close to 100% and are not independent DSL
-tile budgets. Do not shrink a tile merely to reduce a `Left` or `Right`
-percentage.
-
-Grow the space that limits the task: `Mat` for operand fragments, `Acc` for
-the output fragment, or `Vec` for vector working data. An oversized plain
-matmul output may be compiler-subtiled through L0C, so `Acc` is often a
-performance boundary rather than an immediate compile failure; extra tiles
-still add FIXPIPE drains. The exact build report and compile result are
-authoritative.
-
-Practical procedure:
-
-1. Start from the natural problem dimensions (`BATCH`, `HIDDEN`, …).
-2. Pick `K_STEP` and the output-chunk size so `Mat` and `Acc` stay within
-   the intended bounds without forcing inefficient compiler sub-tiling.
-3. Sweep one tile dim up/down by 2× and re-measure with PMU — keep the
-   size that pushes the cube (or vector) unit closer to 100 %.
-
-The K loop is then driven by `pl.pipeline(stage=2 or 4)` so the next
-tile's MTE2 overlaps the current tile's compute (see Part 2 item 2).
-For the complete M/N/K constraint model and empirical sweep method, see
-[Cube Tile Tuning](cube-tile-tuning.md).
-
-#### 5. Warm L2 for a weight set the next stage evicts
-
-When a stage re-reads a fixed weight set every layer and something between two
-layers evicts it, an SDMA cache warm (`pl.prefetch`) can hide the reload behind
-compute that is already running. It writes no tensor, so it is free to try and
-free to delete — but a partial or oversized warm costs more than it saves. See
-[L2 Prefetch](l2-prefetch.md).
-
-#### 6. Stream a weight that has no reuse: NZ layout and `CachePolicy.BYPASS`
-
-A weight read once per dispatch and never re-read is *streamed*, not cached, and
-two declarations make that read cheaper. Both are properties of the weight, so
-both belong on the parameter and the fixture that fills it — neither is a
-compiler inference.
-
-| Declaration | What it changes | What it costs |
-| --- | --- | --- |
-| `pl.Tensor[[E, N, K], pl.INT8, pl.NZ]` | the cube loads the weight NZ→NZ instead of reformatting ND on the way into L1, so the contiguous run is one fractal column block rather than one K-tile row | the fixture must write the bytes in fractal order (`utils.pack_nz`) and the golden must read them back (`utils.unpack_nz`) |
-| `pl.set_cache_policy(w, pl.CachePolicy.BYPASS)` at the top of the reading scope | the load is issued against the device's uncached alias, so it does not evict what *does* have reuse | nothing to the kernel; the author asserts nobody writes those bytes while it runs |
-
-The ND penalty is worth seeing concretely. A logical `[E, N, K]` INT8 weight
-sliced by a K tile gives the DMA `K_TILE` contiguous bytes before the next row
-is `K` bytes away — 512 B runs at `K_TILE = 512`. The same weight in NZ order
-gives 16 rows × one C0 line, an 8 KB run, with the column-block stride between
-them. Same bytes, same footprint, 16× the contiguous run.
-
-**Where NZ fits, and where it does not.** pto-isa declares NZ at a fixed rank-5
-shape with one batch slot, so the layout is only addressable when the *stacked*
-axis is a leading one:
-
-- `[E, N, K]` (routed experts) and `[LAYERS * O_GROUPS, O_LORA, O_GROUP_IN]`
-  (`wo_a`, `wo_b`) work as they stand — a per-layer `pl.slice` narrows a leading axis
-  and the trailing matrix stays whole.
-- `[LAYERS * D, Q_LORA]` (`wq_a`, `wq_b`, `wkv`) does not. One layer's
-  rows sit inside *every* fractal column block, so the window is not contiguous
-  and the compiler refuses it by name. Those are declared `[LAYERS, D, C]`
-  instead — a leading stacked axis — which is what makes NZ available to them.
-- Only one leading axis may be narrowed at a time. The leading axes fold into
-  the single batch slot row-major, so a window on an axis that a spanning axis
-  precedes selects a set no contiguous run describes; the compiler refuses it.
-- An NZ tensor is read-only, but it can be flattened whole for an SDMA warm
-  (rule 5): a rank-1 view of every element is the same byte range either way.
-  `wo_a` and `wo_b` are both NZ and both warmed.
-- The trailing extents must be static, rows a multiple of 16, and columns a
-  whole C0 line (32 B); a slice offset must be a provably non-negative multiple
-  of those, which rules out an offset built by subtraction — and a remainder or
-  quotient is only non-negative once its dividend is, since both truncate
-  toward zero on device.
-
-**Measure both separately.** They are independent, and which one pays depends on
-whether the ND load is already at its bandwidth ceiling: at a coarse blocking
-where ND already saturates, NZ can be worth nothing while the bypass still pays,
-and at a finer blocking the order reverses. One `PYPTO_BENCH` run per variant on
-the same frozen inputs settles it.
-
-#### 7. `pl.spmd` for parallel sub-kernel dispatch
-
-`pl.spmd(N)` dispatches `N` blocks of an InCore body in parallel from
-**one** AICPU schedule entry, instead of N successive `pl.parallel +
-pl.at` dispatches. When a region has many parallel chunks and AICPU
-overhead is visible per iteration on the swimlane, replace the explicit
-`for ... in pl.parallel: with pl.at: ...` pattern with `pl.spmd`:
-
-```python
-# qwen3_14b/decode_layer_a8w8.py: one AICPU dispatch fans out every q_proj block
-for q_grid in pl.spmd(Q_ON * N_SUB, name_hint="q_proj_fused_dequant"):
-    ...
-```
-
-Collapsing N dispatches into one schedule entry cuts AICPU scheduling
-overhead sharply. The win is largest for **MPMD-shaped** regions with
-heavy fan-in / fan-out — where each block depends on (or feeds) many
-others, the AICPU would otherwise track a dependency edge per block, and
-`pl.spmd` replaces that whole fan with a single dispatch and its barrier.
-
-Use `pl.spmd` once the per-iteration body is self-contained and the
-AICPU lane shows a dispatch trail; keep the explicit form when you need
-to nest named sub-regions inside the chunk.
+Choose tiles against the generated memory report at
+`report/memory_after_AllocateMemoryAddr.txt`: `Mat`, `Acc`, and `Vec` are the
+relevant DSL constraints; `Left` and `Right` reflect compiler-managed staging.
+See [Cube Tile Tuning](cube-tile-tuning.md) for buffer interpretation and the
+M/N/K sweep method, and [L1/L0 tuning](#part-2-l1-l0-tuning-intra-kernel) below
+for transfer granularity, pipelining, and PMU analysis.
 
 ---
 
-## Part 2 — L1 / L0 tuning (intra-kernel)
+## Part 2: L1-L0 tuning (intra-kernel)
 
-Once L2 is balanced, individual kernels become the bottleneck. Two
-artifacts drive intra-kernel tuning:
+When the swimlane identifies expensive kernels, inspect their internal
+pipelines and resource use. Kernel improvements can change task granularity
+and the critical path, so revisit the L2 schedule after significant changes.
 
 ### Capture
 
-PMU counters per kernel:
+For per-kernel PMU counters on `decode_csa.py`, add `enable_pmu=2` to the
+existing `config=dict(...)` passed to `run`, preserving its other settings
+and validation options, then run:
 
 ```bash
-python models/deepseek_v4_flash_mtp/decode_sparse_attn.py -p a2a3 -d 0 --enable-pmu 2
+python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0
 # → build_output/<...>/dfx_outputs/pmu.csv
 ```
 
-Not every kernel exposes `--enable-pmu`; a kernel that does not can still be
-captured by passing `config={"enable_pmu": 2}` to its `run` call (the
-`RunConfig` carries it to the runtime as a DFX option).
+This entry does not expose `--enable-pmu`; `RunConfig` carries the setting
+to the runtime as a DFX option. Remove the setting for ordinary benchmark
+comparisons.
 
 For a per-kernel intra-core swimlane, use
 [In-Core Simulator Profiling](incore-simulator-profiling.md).
@@ -540,7 +437,42 @@ For phase timing inside a multi-core extern on real hardware, use
 per-core on-device timestamps, collective-barrier interpretation, and exact
 partitions that reconcile internal phases with the L2 task total.
 
+### Platform-specific constraints
+
+Use the selected PyPTO revision and target backend as the source of truth for
+sizes and alignment. Distinguish performance recommendations from operation
+legality and allocator alignment; they are not interchangeable.
+
+The current backend definitions expose these values:
+
+| Backend | GM access granularity | PH001 recommended minimum trailing dimension | L2 cache line |
+| --- | ---: | ---: | ---: |
+| `a2a3` / Ascend910B | 512 B | 512 B | 512 B |
+| `a5` / Ascend950 | 128 B | 128 B | 512 B |
+
+Check `GetGmAccessGranularityBytes`, `GetRecommendedInnermostDimBytes`, and
+`GetL2CacheLineBytes` in the
+[A2/A3 handler](https://github.com/hw-native-sys/pypto/blob/main/include/pypto/backend/910B/backend_910b_handler.h)
+and [A5 handler](https://github.com/hw-native-sys/pypto/blob/main/include/pypto/backend/950/backend_950_handler.h).
+These links point to main; use the files at the revision that compiled the
+case when reproducing a measurement.
+
+For buffer capacities, core counts, and allocator alignment, inspect PyPTO's
+[SoC definitions](https://github.com/hw-native-sys/pypto/blob/main/src/backend/common/soc.cpp)
+and the target's `Backend::GetMemSize`, `GetCoreCount`, and `GetMemAlignment`.
+Use `report/memory_after_AllocateMemoryAddr.txt` to check the actual allocation
+for each candidate, including buffering and compiler-reserved space. Use the
+operator's verifier and generated code for dtype, layout, and instruction
+constraints; do not carry another platform's tile limits into a sweep.
+
 ### Tuning rules
+
+**Reduce redundant transfers and computation.** Check InCore loops for
+repeated loads of unchanged data, quantization, layout conversions, and
+type casts. Hoist loop-invariant work and reuse intermediate results where
+dependencies and numerical behavior permit. Check the generated memory
+report: keeping intermediates alive longer increases on-chip memory usage
+and can constrain tile sizes or pipeline buffering.
 
 #### 1. Fix tile-shape MTE hints from `perf_hints.log`
 
@@ -550,10 +482,9 @@ Every compile writes a perf-hint log next to the memory report:
 build_output/<ProgramName>_<ts>/report/perf_hints.log
 ```
 
-The compiler flags every `tile.load` / `tile.store` whose innermost
-(trailing) dimension is smaller than the 512 B L2 cache line — the case
-that forces MTE into many short, cache-line-straddling transfers. Each
-hint carries the exact source location:
+PH001 flags GM tile accesses whose innermost dimension is below the target
+backend's recommended size. This is a performance advisory, not a legality
+error. For example, an A2/A3 build may report:
 
 ```
 [perf_hint PH001] TileInnermostDimGranularity: tile.load has innermost
@@ -562,43 +493,51 @@ Consider increasing tile shape on the innermost axis.
 at models/deepseek_v4_flash_mtp/qkv_proj_rope.py:68:4
 ```
 
-Walk the log and widen the trailing tile dimension at each flagged site
-so the innermost slice is a multiple of 512 B (item 3 gives the per-dtype
-element counts). Bringing every flagged `tile.load` / `tile.store` up to
-≥ 512 B is usually the single biggest MTE-efficiency win at this level.
+Inspect the flagged accesses on expensive paths and try wider contiguous
+transfers where shapes and buffer budgets allow. On A5, a 128 B access meets
+the current hint threshold even though the L2 cache line is 512 B. Measure
+whether further widening helps; extra padding, redundant work, or reduced
+parallelism can erase the transfer benefit.
 
 #### 2. `pl.pipeline` for ping-pong on the K loop
 
-Inside a `pl.at` region, the reduction loop of a matmul (the K loop)
-should be `pl.pipeline(..., stage=2 or 4)`. The compiler replicates the
-loop body `stage` times for ping-pong buffering, so MTE2 (load) overlaps
-with cube/vec compute on alternating tiles.
+Try `pl.pipeline` for matmul K loops to overlap loads with computation.
+Compare depths such as 2 and 4 against the current implementation, checking
+the generated pipeline and buffer allocation. The useful depth depends on
+the target, tile sizes, K-loop length, and available memory.
 
 ```python
-# stage=4 for the largest input-projection K dim
+# Candidate depth 4: check its extra buffering cost
 for kb in pl.pipeline(HIDDEN // K_STEP, stage=4):
     ...
 
-# stage=2 is the common default
+# Candidate depth 2
 for kb in pl.pipeline(0, hidden // K_STEP, stage=2):
     ...
 ```
 
-A `pl.range` here forces strictly serial K iterations — the cube unit
-will stall on every load. Always prefer `pl.pipeline` in the K loop.
+A plain `pl.range` does not request this software pipeline, but its presence
+alone does not prove a stall on every load. Inspect actual load/compute
+overlap, and keep additional pipeline stages only when timing improves.
 
 #### 3. Watch `pl.slice` / `pl.assemble` granularity
 
-MTE transfers prefer 512-byte aligned addresses and lengths on A3 / 910C.
-Pick the trailing-dim tile size so the slice is a multiple of 512 B:
+Choose trailing tile extents using the target's GM access granularity and
+the element size. For byte-addressable dtypes, these counts correspond to one
+access unit in the current backend definitions:
 
-- BF16 (2 B/element) → trailing dim multiple of 256 elements
-- FP32 (4 B/element) → trailing dim multiple of 128 elements
-- INT8 (1 B/element) → trailing dim multiple of 512 elements
+| Dtype | A2/A3: 512 B | A5: 128 B |
+| --- | ---: | ---: |
+| BF16 (2 B) | 256 elements | 64 elements |
+| FP32 (4 B) | 128 elements | 32 elements |
+| INT8 (1 B) | 512 elements | 128 elements |
 
-Misaligned slices fall back to slower paths visible as long MTE2 bars in
-the kernel-insight swimlane. In the qwen3-14b kernels, all `K_STEP` /
-`Q_OUT_CHUNK` constants are picked to keep the inner load 512 B aligned.
+These are transfer-sizing guides, not universal legal shape or address
+alignment requirements. A larger trailing dimension does not guarantee
+aligned row addresses: inspect base offsets, row strides, physical layout,
+and tail handling as well. Packed dtypes and NZ layouts require their own
+physical-layout calculation. Evaluate padding and buffer costs before
+widening tiles to a full cache line.
 
 #### 4. Read PMU utilization
 
@@ -622,17 +561,18 @@ What each pipe means in context:
 | `cube_busy_cycles` | cube compute | — |
 | `vec_busy_cycles`  | — | vector compute |
 
-The bottleneck pipe should sit near 100 % of `pmu_total_cycles`; the
-others run overlapped underneath it. Targets:
+Use `*_busy_cycles / pmu_total_cycles` to locate the pipelines that occupy
+most of the kernel's execution window. Busy time measures occupancy, not
+useful FLOPs or transferred bytes: high MTE2 occupancy does not prove peak
+bandwidth, and high Cube occupancy does not prove efficient matrix shapes.
+Pipelines overlap, so their busy ratios need not sum to 100%.
 
-- **Cube kernel**: `max(mte2_busy_cycles, cube_busy_cycles) / pmu_total_cycles ≈ 100 %`.
-  Either the L1 load or the cube compute is saturated — whichever the
-  shape is bound by.
-- **Vector kernel**: `max(mte2_busy_cycles, vec_busy_cycles) / pmu_total_cycles ≈ 100 %`.
-  Either the GM→UB load or the vector compute is saturated. For very
-  store-heavy kernels, `mte3_busy_cycles` can be the bottleneck instead.
+For a dominant transfer pipe, inspect bytes moved, layout conversions, and
+access granularity. For a dominant compute pipe, inspect useful work, tile
+shape, and instruction mix. Compare achieved throughput against an appropriate
+reference for the same target, dtype, and operation when one is available.
 
-If both compute and MTE2 are well below 100 %, open the kernel-insight
-swimlane: gaps usually mean (a) a missing `pl.pipeline` on the K loop,
-(b) suboptimal instruction scheduling, or (c) incorrectly placed
-synchronization barriers.
+Use the intra-core trace to inspect overlap, dependencies, synchronization,
+and pipeline startup or drain. Low compute and MTE2 ratios may also mean
+another pipe dominates; include MTE1, MTE3, FIXPIPE, and scalar work in the
+analysis. Select changes by measured latency, using PMU to explain the result.
