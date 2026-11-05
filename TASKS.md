@@ -142,6 +142,7 @@ The following checks were run in the pinned shared environment on 2026-11-05:
 | PyPTO single-step compile | `pass` | `decode_fwd -p a2a3 --sim --compile-only` |
 | PyPTO replay compile | `pass` | `decode_replay --steps 1/2/8 -p a2a3 --sim --compile-only` |
 | EP2 PyPTO MoE code generation | `pass` | `decode_ep2_compile`; `.pypto-a3-state/decode-ep2-compile.json`; A3 artifact generated with 384 routed experts and 192 local experts per rank |
+| real Aurora EP2 weight ABI probe | `pass` | `decode_weight_abi.py`; one real layer-0 expert, router, and shared expert packed in the vLLM environment; NZ round-trip and W2 zero-tail checks passed |
 | Aurora checkpoint manifest | `pass` | `.pypto-a3-state/deepseek-v41-checkpoint-manifest.json`; metadata/header audit only |
 | simulator numerical replay | `not_run` | CPU/simulator precision is outside this session; no NPU result inferred |
 | independent reference manifest | `not_run` | vLLM-Ascend path, Decode input/cache and capture are not configured |
@@ -155,6 +156,13 @@ observed routed W1/W3 layout is INT8 `[2304, 5120]`, W2 is INT8
 `[5120, 2304]`, scales are FP32 `[out, 1]`, and sampled offsets are zero.
 This is weight-layout evidence only; it does not supply the required decode
 token, history cache, request state, or reference output.
+
+`decode_weight_abi.py` is a host preprocessing boundary and is not imported
+by the PyPTO product closure. It reads the real Aurora tensors lazily, rejects
+non-zero affine offsets, packs routed W1/W3/W2 to FRACTAL_NZ, pads only the
+W2 reduction tail from 2304 to 2560, and transposes/concatenates the shared
+expert operands for the logical `moe_shared` ABI. The probe covered one real
+expert and does not constitute an EP2 NPU or accuracy gate.
 
 The gate entry points are:
 

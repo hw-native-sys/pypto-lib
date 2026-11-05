@@ -1066,6 +1066,13 @@
       "role": "lazy Aurora safetensors tensor resolver for the Decode driver",
       "product_compute": false,
       "accuracy_evidence": "not_run"
+    },
+    {
+      "file": "decode_weight_abi.py",
+      "sha256": "dcfc5eee13e7348781f20ca9df21341750b0d32f6a93c6c0bffa1751049928d5",
+      "role": "host-only Aurora W8A8 to EP2 NZ/padded/shared weight ABI adapter",
+      "product_compute": false,
+      "accuracy_evidence": "host_layout_verified_single_expert"
     }
   ],
   "decode_session": {

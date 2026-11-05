@@ -402,6 +402,7 @@ def source_hashes() -> dict[str, str]:
             MODEL_ROOT / "decode_cherry_pick_receipt.json",
             MODEL_ROOT / "decode_checkpoint_manifest.py",
             MODEL_ROOT / "decode_weights.py",
+            MODEL_ROOT / "decode_weight_abi.py",
         ]
     )
     return {
