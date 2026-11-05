@@ -64,6 +64,8 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
     )
     command = (
         f"task-submit --device auto --device-num {devices} --run "
+        f"'PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_moe_ep2 "
+        "--contract'" if topology == "ep2_gate" else
         f"'PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_fwd "
         f"-p a2a3 --ep {topology_config['ep']} --dp {topology_config['dp']} "
         f"--tp {topology_config['tp']}'"
@@ -88,7 +90,11 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
         "required_state_outputs": list(CONTRACT["state_outputs"]),
         "queue_command": command,
         "reference_command": reference_command,
-        "product_entrypoint": "models.deepseek_v4_1_flash_a2.decode_fwd",
+        "product_entrypoint": (
+            "models.deepseek_v4_1_flash_a2.decode_moe_ep2.decode_ep2"
+            if topology == "ep2_gate"
+            else "models.deepseek_v4_1_flash_a2.decode_fwd"
+        ),
         "reference_process": {
             "status": "not_run",
             "commit": CONTRACT["runtime"]["vllm_reference_commit"],

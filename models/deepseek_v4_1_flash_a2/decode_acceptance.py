@@ -32,8 +32,18 @@ from models.deepseek_v4_1_flash_a2.runtime_config import DECODE_RUNTIME_CONTRACT
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_ROOT = Path(__file__).resolve().parent
 TARGET_LAYERS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
-PRODUCT_ENTRYPOINTS = ("decode_fwd.py", "decode_replay.py", "decode_candidates.py")
-VALIDATION_ENTRYPOINTS = ("decode_acceptance.py", "decode_gate.py", "decode_reference.py")
+PRODUCT_ENTRYPOINTS = (
+    "decode_fwd.py",
+    "decode_replay.py",
+    "decode_candidates.py",
+    "decode_moe_ep2.py",
+)
+VALIDATION_ENTRYPOINTS = (
+    "decode_acceptance.py",
+    "decode_gate.py",
+    "decode_reference.py",
+    "decode_ep2_compile.py",
+)
 REFERENCE_ONLY_SUFFIXES = ("_runtime.py",)
 FORBIDDEN_PRODUCT_IMPORTS = ("vllm", "vllm_ascend", "torch_npu")
 DECODE_SESSION = "deepseek-v4.1-flash-a3-decode"
@@ -175,14 +185,15 @@ CONTRACT: dict[str, Any] = {
         "http_service": "not_run",
     },
     "implementation": {
-        "status": "bounded_only",
+        "status": "ep2_driver_not_run",
         "formal_ready": False,
-        "formal_entrypoint": None,
+        "formal_entrypoint": "models.deepseek_v4_1_flash_a2.decode_moe_ep2.decode_ep2",
         "blockers": [
+            "EP2 driver compile and NPU execution gate",
+            "same-input EP2 vLLM-Ascend reference capture",
             "complete mHC/residual composition",
             "C1A/C2A compression and index refresh",
             "Engram state and cache ownership",
-            "384-expert EP dispatch/local compute/combine",
             "TP/DP/CP/SP runtime driver and state outputs",
         ],
     },
@@ -283,7 +294,7 @@ def product_dependency_scan() -> dict[str, Any]:
         "host_reference_imports": host_reference,
         "subprocess_edges": subprocess_edges,
         "reference_edges": sorted(set(reference_edges)),
-        "product_compute_scope": "bounded_swa_only",
+        "product_compute_scope": "bounded_swa_and_ep2_moe_driver",
         "reference_only_files": sorted(
             str(path.relative_to(ROOT))
             for path in MODEL_ROOT.glob("*_runtime.py")

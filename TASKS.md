@@ -98,12 +98,13 @@ without importing that stack in the PyPTO process.
 
 ## Current implementation and gates
 
-The current PyPTO code is a bounded L0 SWA ABI and a 1/2/8-step state replay.
-It does not yet compose C1A/C2A index/compression, mHC/residual, Engram,
-shared/routed MoE, distributed dispatch/combine, CP/SP, or a full checkpoint
-driver. The kernel accepts position/request/source/finished controls but does
-not consume those controls in its device schedule and advances only
-`cache_lens[0]`; these are explicit formal blockers.
+The current PyPTO code includes the bounded L0 SWA ABI, a 1/2/8-step state
+replay, and an independent EP2 routed/shared MoE product driver. The EP2
+driver keeps all 384 routed experts, owns 192 experts per rank, and compiles
+its dispatch/combine windows with PyPTO. It has not yet consumed the real
+checkpoint, historical cache, request state, or an independent reference
+capture; complete C1A/C2A index/compression, mHC/residual, Engram, CP/SP and
+full-layer composition remain formal blockers.
 
 The supplied Aurora W8A8 Dynamic export is registered as an external
 checkpoint asset. Its index references 270 quantized shard files using the
@@ -116,7 +117,8 @@ target-layer mapping, and safetensors headers without hashing tensor payloads.
 | product import/dependency scan | `pass` | Keep vLLM/Torch-NPU out of the product closure |
 | Aurora checkpoint metadata/header audit | `pass` | Keep the external manifest and set `DEEPSEEK_V41_CHECKPOINT` for jobs |
 | bounded L0 PyPTO compile/ABI | `bounded_only` | Does not establish checkpoint accuracy |
-| DP2/TP1/EP2 full MoE Decode | `not_run` | Implement 384-expert top-6 dispatch/combine and allocate two queued cards |
+| EP2 PyPTO MoE code generation | `pass` | `decode_ep2_compile`; compiler artifact has physical NZ lowering, execution remains not_run |
+| DP2/TP1/EP2 full MoE Decode | `not_run` | Submit the real checkpoint/input/cache through the two-card queue and compare to the same-input reference |
 | DP8/TP2/EP16 complete single layer | `not_run` | Implement the full layer and allocate 16 queued cards |
 | DP16/TP1/EP16 compatibility | `not_run` | Same complete layer at TP1 |
 | DP4/TP4/EP16 compatibility | `not_run` | Same complete layer at TP4 |
@@ -130,7 +132,7 @@ reference-only run.
 
 ## Executed checks
 
-The following checks were run in the pinned shared environment on 2026-11-04:
+The following checks were run in the pinned shared environment on 2026-11-05:
 
 | check | result | evidence |
 | --- | --- | --- |
@@ -139,6 +141,7 @@ The following checks were run in the pinned shared environment on 2026-11-04:
 | product import/dependency scan | `pass` | `python -m models.deepseek_v4_1_flash_a2.decode_acceptance --static-scan` |
 | PyPTO single-step compile | `pass` | `decode_fwd -p a2a3 --sim --compile-only` |
 | PyPTO replay compile | `pass` | `decode_replay --steps 1/2/8 -p a2a3 --sim --compile-only` |
+| EP2 PyPTO MoE code generation | `pass` | `decode_ep2_compile`; `.pypto-a3-state/decode-ep2-compile.json`; A3 artifact generated with 384 routed experts and 192 local experts per rank |
 | Aurora checkpoint manifest | `pass` | `.pypto-a3-state/deepseek-v41-checkpoint-manifest.json`; metadata/header audit only |
 | simulator numerical replay | `not_run` | CPU/simulator precision is outside this session; no NPU result inferred |
 | independent reference manifest | `not_run` | vLLM-Ascend path, Decode input/cache and capture are not configured |
@@ -189,8 +192,8 @@ holders, device reset, and single-card substitutes are prohibited.
 ## Recovery conditions and non-goals
 
 The formal task is blocked at `not_run` until the Decode input, historical
-cache and block-table assets, same-input vLLM-Ascend reference capture,
-distributed driver, and per-rank memory/communication reports are available.
+cache and block-table assets, same-input vLLM-Ascend reference capture, a
+queued NPU execution, and per-rank memory/communication reports are available.
 The checkpoint metadata is present, but it does not supply those runtime
 states. This session does not run Prefill, a continuous full network, MTP,
 DSpark, datasets, HTTP serving, or `vllm serve`; none of those statuses are

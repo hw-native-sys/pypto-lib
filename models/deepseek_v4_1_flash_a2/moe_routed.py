@@ -26,16 +26,16 @@ MOE_INTER_PAD = 2560
 SWIGLU_LIMIT = 10.0
 
 # EP layout / recv buffers (single-card view: kernel only sees the local shard)
-# Keep the same compiled kernel for a compact local expert slab.  Production
-# EP can set this to the number of experts owned by a rank; the verifier uses
-# a small non-contiguous subset from the stable vLLM capture.
+# Decode sets these before importing the leaf so the same W8A8 kernel covers
+# the complete EP2 local owner set.  The compact defaults remain useful for
+# the standalone operator case.
 N_LOCAL_EXPERTS = int(os.environ.get("A2_MOE_LOCAL_EXPERTS", "1"))
 if N_LOCAL_EXPERTS <= 0:
     raise ValueError("A2_MOE_LOCAL_EXPERTS must be positive")
 
 # tiling
 RECV_TILE = 64
-RECV_MAX = 64
+RECV_MAX = int(os.environ.get("A2_MOE_RECV_MAX", "64"))
 K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 256
@@ -248,8 +248,8 @@ def expert_routed_tile(
     return w2_act_tid
 
 
-@pl.jit(auto_scope=False)
-def expert_routed_test(
+@pl.jit.inline(auto_scope=False)
+def expert_routed_inline(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
@@ -291,6 +291,36 @@ def expert_routed_test(
                 )
                 recv_y_flat[flat_tile_row : flat_tile_row + RECV_TILE, :] = recv_y_tile
     return recv_y
+
+
+@pl.jit(auto_scope=False)
+def expert_routed_test(
+    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
+    recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER_PAD], pl.INT8, pl.NZ],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.FP32]],
+):
+    """Compile the routed expert as a standalone operator."""
+    return expert_routed_inline(
+        recv_x,
+        recv_scale_dq,
+        recv_weights,
+        recv_expert_count,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
+        routed_w2,
+        routed_w2_scale,
+        recv_y,
+    )
 
 
 def golden_expert_routed(tensors):

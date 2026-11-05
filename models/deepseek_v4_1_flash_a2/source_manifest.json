@@ -427,7 +427,7 @@
         "gen_routed_weight": "bc94de37d89bb3900b183abc4a0a1d3831f9fd38f148b7524a9b712ce9fa7069",
         "build_tensor_specs": "d6a6f42715fe6966663e5b85dc1a4326cb32e25125fc121c59535240c405d87c"
       },
-      "migrated_sha256": "96eb44ee29b1ece3d8542b27b2441ba6b7b62c986f1aa34ca982907039d89290",
+      "migrated_sha256": "4286780aac5ab9bd4a9e367e81bcc71e6371e8e2bb543b787da795fbb306ed17",
       "L20_freeze_source_match": true,
       "import_relocation": true,
       "host_changes": [
@@ -1005,8 +1005,22 @@
       "accuracy_evidence": "state_abi_only"
     },
     {
+      "file": "decode_moe_ep2.py",
+      "sha256": "ed28ab6019a072ea73ba8b65ed4e2b3889dc2313345b2ab765a730f5e90b6a56",
+      "role": "PyPTO-only EP2 Decode routed/shared MoE dispatch, local expert and combine driver",
+      "product_compute": true,
+      "accuracy_evidence": "not_run"
+    },
+    {
+      "file": "decode_ep2_compile.py",
+      "sha256": "224c839f35b4109fcdd790e29a7adab9c3882b261e14b4631471dc41b5aa4d81",
+      "role": "A3 PyPTO EP2 code-generation entry; physical NZ lowering evidence only",
+      "product_compute": false,
+      "accuracy_evidence": "compile_only"
+    },
+    {
       "file": "decode_gate.py",
-      "sha256": "a163ee98e58d7e94839d11e53c95d25be9839b8cb526038c0a934ff4f1a0534e",
+      "sha256": "d5d9a5f7d220a14c480428755d91734b769b90d89bc49145e3d64b53778bbcfa",
       "role": "fail-closed EP2/main/compatibility topology gate entry",
       "product_compute": false,
       "accuracy_evidence": "not_run"
@@ -1020,7 +1034,7 @@
     },
     {
       "file": "decode_acceptance.py",
-      "sha256": "1b27f00bbfa5eb2d7b369b2ea339e12a451906a20561e80d3c41d1face9a7f21",
+      "sha256": "b84c1395bc0de5337aaa611d6d5af8ad3ba384e8a06da7d00e7c61ba37aa232f",
       "role": "independent Decode contract and product dependency verifier",
       "product_compute": false,
       "accuracy_evidence": "not_run"

@@ -146,9 +146,10 @@ The port includes the L14 Engram observation interface, L1 native boundaries,
 and the final L20 index-publication candidate.
 
 The local tree contains bounded PyPTO L0 single-step and fixed-step SWA Decode
-entries. They make no claim of validated C1A/C2A chaining, mHC/residual,
-Engram residency, shared/routed MoE, distributed dispatch/combine, CP/SP,
-stacked layers, whole-network score, multi-card execution, or serving support.
+entries plus the independently compiled EP2 routed/shared MoE entry. These
+entries make no claim of validated C1A/C2A chaining, mHC/residual, Engram
+residency, checkpoint-backed routing, distributed NPU execution, CP/SP,
+stacked layers, whole-network score, or serving support.
 The independent vLLM-Ascend capture is described by
 [`decode_reference.py`](../../../models/deepseek_v4_1_flash_a2/decode_reference.py)
 and is not imported by the product path.
@@ -195,12 +196,13 @@ separate reference process's Python path, source digest, mapped libraries,
 visible devices and runtime library path; it never imports vLLM in the product
 process.
 
-The current bounded entries accept the full state ABI, but do not yet consume
-per-request position/source/finished controls in the device schedule and only
-advance the first length slot. Consequently the EP2 MoE gate, DP8/TP2/EP16
-complete layer gates, cache/state comparison, vLLM-Ascend same-input capture,
-and all eleven target-layer gates remain `not_run` until a checkpoint conversion,
-distributed driver, and independent reference capture are available.
+The bounded entries accept the full state ABI, while the independent
+`decode_moe_ep2.py` product entry now owns the PyPTO EP2 dispatch/combine,
+192-expert-per-rank routed shard, and shared-expert merge. Its A3 code
+generation gate passes through `decode_ep2_compile.py`; execution and accuracy
+remain `not_run` because the real checkpoint, historical cache/request state,
+and same-input vLLM-Ascend capture are not yet available. Complete C1A/C2A,
+mHC/residual, Engram, CP/SP and full-layer composition remain formal blockers.
 
 ## Checks without a device
 
@@ -208,11 +210,13 @@ Compile the bounded Decode ABI without allocating a device:
 
 ```bash
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_fwd -p a2a3 --sim --compile-only
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_ep2_compile
 ```
 
 Compile the deterministic single-context state replay for each supported step
-count. These commands exercise the bounded PyPTO ABI only; they are not NPU
-checkpoint accuracy evidence:
+count. These commands exercise PyPTO code generation only; they are not NPU
+checkpoint accuracy evidence. The EP2 compiler entry reports physical
+FRACTAL_NZ lowering separately from execution.
 
 ```bash
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_replay --steps 1 -p a2a3 --sim
