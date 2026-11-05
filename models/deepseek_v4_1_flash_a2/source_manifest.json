@@ -1012,9 +1012,23 @@
       "accuracy_evidence": "not_run"
     },
     {
+      "file": "decode_layer_ep2.py",
+      "sha256": "34ef0da2dabd57de0b9f13b45a3145e033c0ad616e0e8a3e9276e89e4da35443",
+      "role": "complete PyPTO L0 Decode composition of mHC attention, cache, EP2 MoE and mHC output",
+      "product_compute": true,
+      "accuracy_evidence": "not_run"
+    },
+    {
       "file": "decode_ep2_compile.py",
       "sha256": "224c839f35b4109fcdd790e29a7adab9c3882b261e14b4631471dc41b5aa4d81",
       "role": "A3 PyPTO EP2 code-generation entry; physical NZ lowering evidence only",
+      "product_compute": false,
+      "accuracy_evidence": "compile_only"
+    },
+    {
+      "file": "decode_layer_ep2_compile.py",
+      "sha256": "cd74144763d24b5ef6bdea65bc706b71448ac4f6465eaf59a2fc3f731f1b6863",
+      "role": "A3 PyPTO complete L0 EP2 composition code-generation entry",
       "product_compute": false,
       "accuracy_evidence": "compile_only"
     },

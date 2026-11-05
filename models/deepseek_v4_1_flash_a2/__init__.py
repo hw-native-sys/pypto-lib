@@ -45,6 +45,8 @@ _EXPORTS = {
     "validate_decode_assets": ("decode_asset_contract", "validate_assets"),
     "decode_ep2": ("decode_moe_ep2", "decode_ep2"),
     "decode_ep2_contract": ("decode_moe_ep2", "product_contract"),
+    "decode_layer_ep2": ("decode_layer_ep2", "decode_layer_ep2"),
+    "decode_layer_ep2_contract": ("decode_layer_ep2", "product_contract"),
     "decode_reference_manifest": ("decode_reference", "reference_manifest"),
     "inspect_decode_checkpoint": ("decode_checkpoint_manifest", "inspect_checkpoint"),
     "DecodeSafetensorsCheckpoint": ("decode_weights", "DecodeSafetensorsCheckpoint"),

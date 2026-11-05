@@ -99,18 +99,14 @@ without importing that stack in the PyPTO process.
 ## Current implementation and gates
 
 The current PyPTO code includes the bounded L0 SWA ABI, a 1/2/8-step state
-replay, and an independent EP2 routed/shared MoE product driver. The EP2
-driver keeps all 384 routed experts, owns 192 experts per rank, and compiles
-its dispatch/combine windows with PyPTO. It has not yet consumed the real
-checkpoint, historical cache, request state, or an independent reference
-capture; complete C1A/C2A index/compression, mHC/residual, Engram, CP/SP and
-full-layer composition remain formal blockers.
-
-The bounded SWA entry and the EP2 MoE entry are intentionally separate
-operators. No current entry claims a complete physical layer that composes
-attention/cache, mHC residual streams, Engram, and routed/shared MoE; that
-composition must be added and independently gated before DP8/TP2/EP16 can
-advance.
+replay, an independent EP2 routed/shared MoE product driver, and a complete
+L0 composition entry. The EP2 driver keeps all 384 routed experts, owns 192
+experts per rank, and compiles its dispatch/combine windows with PyPTO. The
+composition entry now joins mHC attention/cache, FFN mHC, routed/shared EP2
+MoE, and mHC output restoration. It has not yet consumed the real checkpoint,
+historical cache, request state, or an independent reference capture; complete
+C1A/C2A index/compression, Engram, CP/SP and full-layer NPU execution remain
+formal blockers.
 
 The supplied Aurora W8A8 Dynamic export is registered as an external
 checkpoint asset. Its index references 270 quantized shard files using the
@@ -124,8 +120,9 @@ target-layer mapping, and safetensors headers without hashing tensor payloads.
 | Aurora checkpoint metadata/header audit | `pass` | Keep the external manifest and set `DEEPSEEK_V41_CHECKPOINT` for jobs |
 | bounded L0 PyPTO compile/ABI | `bounded_only` | Does not establish checkpoint accuracy |
 | EP2 PyPTO MoE code generation | `pass` | `decode_ep2_compile`; compiler artifact has physical NZ lowering, execution remains not_run |
+| complete L0 EP2 PyPTO composition code generation | `pass` | `decode_layer_ep2_compile`; mHC/attention/cache/MoE composition compiles, execution remains not_run |
 | DP2/TP1/EP2 full MoE Decode | `not_run` | Submit the real checkpoint/input/cache through the two-card queue and compare to the same-input reference |
-| DP8/TP2/EP16 complete single layer | `not_run` | Implement the full layer and allocate 16 queued cards |
+| DP8/TP2/EP16 complete single layer | `not_run` | Allocate 16 queued cards and run the complete composition |
 | DP16/TP1/EP16 compatibility | `not_run` | Same complete layer at TP1 |
 | DP4/TP4/EP16 compatibility | `not_run` | Same complete layer at TP4 |
 | independent vLLM-Ascend capture | `not_run` | Supply matching Decode input/cache, reference environment and capture manifest |

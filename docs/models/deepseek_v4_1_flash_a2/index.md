@@ -43,6 +43,7 @@ safetensors headers. The manifest does not hash or copy tensor payloads.
 | `ecotech_prefill_consumer.py`, `indexer.py`, `sparse_consumer_prefill.py` | Consumer projections, causal controls and sparse attention stages. |
 | `decode_c2a_full.py`, `decode_c2a_reuse.py`, `decode_c1a_full.py`, `decode_c1a_reuse.py`, `decode_c1a_reindex.py` | A2/A3 stage owners for L14/L15/L19/L20/L21/L24/L25. `layer14_15.py` and `layers19_25.py` remain aggregate compatibility providers. |
 | `decode_fwd.py`, `decode_replay.py` | Bounded PyPTO L0 SWA Decode ABI, single-step entry, and fixed 1/2/8-step state replay. These entries do not claim checkpoint accuracy, full-model, or distributed Decode coverage. |
+| `decode_layer_ep2.py` | Complete PyPTO L0 composition for the DP2/TP1/EP2 gate: mHC attention/cache, FFN mHC, routed/shared MoE dispatch/combine, and output restoration. Accuracy remains `not_run` until the frozen input/cache/reference contract is captured. |
 | `decode_candidates.py`, `decode_acceptance.py`, `decode_asset_contract.py`, `decode_gate.py` | Search K=2 candidate registry, independent Decode contract, asset structure validation, product import closure scan, runtime identity capture, and fail-closed layer/topology gate reporting. |
 | `decode_checkpoint_manifest.py`, `decode_weights.py`, `decode_weight_abi.py` | Read-only Aurora metadata/header audit, lazy tensor resolver, and host-only W8A8-to-EP2 ABI packing; none performs product computation. |
 | `candidate_pool.py`, `raw_checkpoint.py` | A2/A3 candidate metadata and raw checkpoint loading. |
@@ -197,12 +198,14 @@ visible devices and runtime library path; it never imports vLLM in the product
 process.
 
 The bounded entries accept the full state ABI, while the independent
-`decode_moe_ep2.py` product entry now owns the PyPTO EP2 dispatch/combine,
-192-expert-per-rank routed shard, and shared-expert merge. Its A3 code
-generation gate passes through `decode_ep2_compile.py`; execution and accuracy
-remain `not_run` because the real checkpoint, historical cache/request state,
-and same-input vLLM-Ascend capture are not yet available. Complete C1A/C2A,
-mHC/residual, Engram, CP/SP and full-layer composition remain formal blockers.
+`decode_moe_ep2.py` product entry owns the PyPTO EP2 dispatch/combine,
+192-expert-per-rank routed shard, and shared-expert merge. The
+`decode_layer_ep2.py` entry composes that MoE path with the L0 mHC attention,
+SWA cache and FFN residual stream. Its A3 code-generation gates pass through
+`decode_ep2_compile.py` and `decode_layer_ep2_compile.py`; execution and
+accuracy remain `not_run` because the real checkpoint, historical cache/request
+state, and same-input vLLM-Ascend capture are not yet available. Complete
+C1A/C2A, Engram, CP/SP and full-layer execution remain formal blockers.
 
 ## Checks without a device
 
@@ -211,6 +214,7 @@ Compile the bounded Decode ABI without allocating a device:
 ```bash
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_fwd -p a2a3 --sim --compile-only
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_ep2_compile
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_layer_ep2_compile
 ```
 
 Compile the deterministic single-context state replay for each supported step
