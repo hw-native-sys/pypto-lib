@@ -148,6 +148,14 @@ The following checks were run in the pinned shared environment on 2026-11-05:
 | EP2 MoE gate | `not_run` | `decode_gate.py --topology ep2_gate`; checkpoint/cache/reference assets missing |
 | DP8/TP2/EP16 gate | `not_run` | `decode_gate.py --topology main`; checkpoint/cache/reference assets missing |
 
+The Aurora loader was also exercised against the supplied checkpoint without
+materializing the full model. Layer 0, 1 and 14 index coverage was verified,
+with samples from routed experts 0/191/192/383 and the shared expert. The
+observed routed W1/W3 layout is INT8 `[2304, 5120]`, W2 is INT8
+`[5120, 2304]`, scales are FP32 `[out, 1]`, and sampled offsets are zero.
+This is weight-layout evidence only; it does not supply the required decode
+token, history cache, request state, or reference output.
+
 The gate entry points are:
 
 ```bash
