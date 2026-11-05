@@ -584,6 +584,43 @@ Separate real-weight TP8 and TP16 resident regressions retained all 25 and 29
 saved output vectors bitwise. These layout comparisons preserve the reference
 math and acceptance thresholds.
 
+Routed SwiGLU activation tasks also publish one cache line of partial row
+maxima each. Requantization reduces those partials instead of rereading all
+2,048 FP32 activations for the maximum, and fully overwrites the INT8 tile
+without a separate zero-fill task. Four parallel Down epilogue groups each
+process two 512-column chunks. They preserve dequantization before applying
+the routing weight, including the existing FP32 operation order.
+
+Gate forms exact FP32 products from its BF16 inputs and weights, reduces
+128 products at a time with high/low compensated row sums, and compensates
+the sum across blocks. This replaces scalar-position cube dot products while
+retaining the FP32 accumulation domain, compensated sigmoid, normalization
+and stable expert tie rule. The independent FP64 reference is unchanged.
+Only active token rows enter the score projection; empty owners still
+participate in EP communication.
+
+Bitwise comparisons against `29e70fe` covered 51 Gate cases (eight synthetic
+boundaries and all 43 backbone/MTP MoE weight sets), 12 routed-expert cases
+across the EP8/EP16 shard geometries, and complete EP8 prefill/decode MoE.
+The A3 EP8 benchmark used published W8A8 layer-3 weights, resident tensors,
+four global tokens with owner counts `[1, 1, 1, 1, 0, 0, 0, 0]`, and four-row
+rank capacity. Each round ran two MoE invocations per rank with advancing
+EP epochs; five warmups preceded 100 timed rounds. Per-invocation effective
+device latency, expressed as the range of per-rank medians, changed from
+11.487--11.991 to 0.422--1.042 ms for prefill and from 11.756--12.232 to
+0.335--0.945 ms for decode. These are single-MoE measurements; full-network
+throughput and 16-rank distributed execution have not been revalidated.
+
+The fixed local-shard MoE cases introduced by PR #1692 were also compared
+against `fbdf6de` on one A3 device, with TP16/EP16 fixture geometry, seed 1024,
+ten warmups and 100 timed rounds. Median effective latency changed from
+116.536 to 11.733 ms for Gate with 192 rows and from 487.92 to 454.92 us for
+96 balanced routed rows. The unchanged TP16 shared-expert case (192 rows,
+128 intermediate columns) measured 114.98 and 114.03 us; that difference is
+not attributed to this optimization. All three cases retained bitwise
+baseline outputs. These component cases do not include EP collectives, and
+the shared TP16 fixture does not change the model's default full replica.
+
 The existing FFN validation entries keep generated weights as their default.
 Add `--checkpoint` to load real weights into the same kernels, goldens and
 precision checks:

@@ -41,7 +41,7 @@ QUANT_TILE = 512  # per-row requant tile
 INTER_K_TILE = 512  # w2 K tile (= moe_intermediate_size)
 D_OUT_TILE = 256  # w2 N tile over D
 D_ACT_TILE = 512
-W2_GROUP_TILE = 8
+W2_GROUP_TILE = 2
 T_DYN_TEST = 64
 
 
@@ -90,9 +90,8 @@ def expert_routed(
             h_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
             h_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             h_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_i8_init"):
-                h_i8_value_full = pl.full([RECV_TILE, MOE_INTER], dtype=pl.FP16, value=0.0)
-                h_i8[:, :] = pl.cast(h_i8_value_full, target_type=pl.INT8, mode="trunc")
+            # Each activation task publishes one cache line of partial row maxima.
+            h_partial_amax = pl.create_tensor([MOE_INTER // ACT_INTER_TILE, RECV_TILE], dtype=pl.FP32)
             for act_blk in pl.spmd(MOE_INTER // ACT_INTER_TILE, name_hint="exp_gate_up_act"):
                 a0 = act_blk * ACT_INTER_TILE
                 x_scale_col = pl.slice(x_scale, [RECV_TILE, 1], [flat_row, 0], valid_shape=[valid_rows, 1])
@@ -110,13 +109,13 @@ def expert_routed(
                 sigmoid = accurate_sigmoid(gate_buffer, RECV_TILE, ACT_INTER_TILE)
                 gated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
                 h_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated
+                chunk_amax = pl.reshape(pl.row_max(pl.abs(gated)), [1, RECV_TILE])
+                h_partial_amax[act_blk:act_blk + 1, :] = chunk_amax
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_quant"):
-                row_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                    h_chunk = h_fp32[:, k0 : k0 + QUANT_TILE]
-                    chunk_amax = pl.reshape(pl.row_max(pl.abs(h_chunk)), [1, RECV_TILE])
-                    row_amax = pl.maximum(row_amax, chunk_amax)
+                # Reuse the maxima computed while activations were already in UB.
+                # INT8 quantization writes every row/column, so no zero-fill is needed.
+                row_amax = pl.maximum(pl.col_max(h_partial_amax[:, :]), INT8_AMAX_EPS)
                 amax_buffer = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
                 amax_buffer[:, :] = row_amax
                 numerator = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
