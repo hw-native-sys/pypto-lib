@@ -468,8 +468,8 @@ def gate_test(
         if active_tokens > 0:
             packed_indices = pl.tile.load(indices_pad, [0, 0], [T, TOPK_PAD], valid_shape=[active_tokens, TOPK])
             packed_weights = pl.tile.load(weights_pad, [0, 0], [T, TOPK_PAD], valid_shape=[active_tokens, TOPK])
-            pl.tile.store(packed_indices, [0, 0], indices, shapes=[active_tokens, TOPK])
-            pl.tile.store(packed_weights, [0, 0], weights, shapes=[active_tokens, TOPK])
+            pl.tile.store(packed_indices, [0, 0], indices)
+            pl.tile.store(packed_weights, [0, 0], weights)
     return x_norm_i8, x_norm_scale, indices, weights
 
 
