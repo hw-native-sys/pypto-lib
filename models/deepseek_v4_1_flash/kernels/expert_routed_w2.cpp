@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+#define COMPACT_ACTIVATIONS
 #include "expert_routed_mxfp4.hpp"
 
 using namespace pto;
@@ -15,8 +16,8 @@ using namespace grouped_mxfp4;
 
 #ifdef __DAV_CUBE__
 namespace {
-struct StorePartial {
-    __gm__ float* out;
+struct StoreOutput {
+    __gm__ bfloat16_t* out;
     int64_t width;
     int64_t stride;
     int64_t row;
@@ -25,11 +26,11 @@ struct StorePartial {
     template <typename Acc>
     AICORE inline void operator()(Acc& acc) const
     {
-        using Global = GlobalTensor<float, Shape<1, 1, 1, DYNAMIC, N_TILE>,
+        using Global = GlobalTensor<bfloat16_t, Shape<1, 1, 1, DYNAMIC, N_TILE>,
                                     pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
         Global target(out + row * width + col,
                       Global::Shape(1, 1, 1, acc.GetValidRow(), N_TILE),
-                      Global::Stride(2 * stride * width, 2 * stride * width, 2 * stride * width, width, 1));
+                      Global::Stride(stride * width, stride * width, stride * width, width, 1));
         TSTORE<STPhase::Final>(target, acc);
     }
 };
@@ -43,7 +44,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     const int64_t stride = args[7];
     const int64_t width = args[8];
     const int64_t hidden = args[9];
-    const int64_t partialStride = args[10];
+    const int64_t outputRows = args[10];
     const int64_t activationRows = args[11];
     const int64_t block = get_block_idx(args);
     const int64_t blocks = get_block_num(args);
@@ -55,7 +56,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     auto* x = tensorData<float8_e4m3_t>(args, 0);
     auto* xScale = tensorData<float8_e8m0_t>(args, 1);
     auto* weightScale = tensorData<float8_e8m0_t>(args, 4);
-    auto* out = tensorData<float>(args, 5);
+    auto* out = tensorData<bfloat16_t>(args, 5);
 #endif
     beginGemm();
     int64_t compactBase = 0;
@@ -63,30 +64,25 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     int64_t workBase = 0;
     for (int64_t expert = 0; expert < experts; ++expert) {
         const int64_t count = acquireCount(counts, expert);
-        const int64_t workCount = ((count + M_TILE - 1) / M_TILE) * 2 * nTiles;
+        const int64_t workCount = ((count + M_TILE - 1) / M_TILE) * nTiles;
         const int64_t first = (block + blocks - workBase % blocks) % blocks;
         for (int64_t work = first; work < workCount; work += blocks) {
-            const int64_t row = work / (2 * nTiles) * M_TILE;
+            const int64_t row = work / nTiles * M_TILE;
             const int64_t col = work % nTiles * N_TILE;
-            const int64_t part = (work / nTiles) % 2;
-            const int64_t kBegin = (hidden / K_TILE) * part / 2 * K_TILE;
-            const int64_t kEnd = (hidden / K_TILE) * (part + 1) / 2 * K_TILE;
             const int64_t valid = count - row < M_TILE ? count - row : M_TILE;
 #ifdef __DAV_VEC__
-            produceWeight(weight, hidden, width, expert, col, kBegin, kEnd);
+            produceWeight(weight, hidden, width, expert, col);
 #endif
 #ifdef __DAV_CUBE__
             const Chunk chunk{expert, activationBase + row, valid};
             computeProjection<M_TILE>(x, xScale, weightScale, hidden, width, experts,
                                       activationRows, chunk, col,
-                                      StorePartial{out, width, partialStride,
-                                                   part * partialStride + compactBase + row, col},
-                                      kBegin, kEnd);
+                                      StoreOutput{out, width, outputRows, compactBase + row, col});
 #endif
         }
         workBase += workCount;
         compactBase += count;
-        activationBase += (count + 15) / 16 * 16;
+        activationBase += count;
     }
     endGemm();
 }

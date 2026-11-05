@@ -184,7 +184,7 @@ def expert_shared(
                 gate_up_group, group_rows,
             )
 
-    # BF16-rounded SwiGLU, FP8 payload, and packed MX_A_ZZ scales.
+    # FP32 SwiGLU, FP8 payload, and packed MX_A_ZZ scales.
     h_tile_mx = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP8E4M3FN)
     h_scale_mx = pl.create_tensor([T_PAD, H_SCALE], dtype=pl.FP8E8M0)
     h_tile_mx, h_scale_mx = _shared_swiglu(gate_up, h_tile_mx, h_scale_mx)
@@ -269,7 +269,7 @@ def golden_expert_shared(tensors):
     if SWIGLU_LIMIT > 0:
         sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-    sh_h = (F.silu(sh_gate) * sh_up).bfloat16().float()
+    sh_h = F.silu(sh_gate) * sh_up
     sh_h_fp8, sh_h_scale = host_quant_mxfp8(sh_h)
     sh = matmul_mx_golden(sh_h_fp8, sh_h_scale, w2_fp8, w2_scale)
 

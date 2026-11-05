@@ -68,7 +68,7 @@ using PayloadTile = Vec<uint8_t, ROW_TILE, COL_TILE>;
 using ScaleTile = Vec<uint8_t, 1, SCALE_BYTES>;
 
 // Upward MXFP8: gate is clamped from above only, up from both sides, the gated
-// value is rounded to BF16, and every 32-value group takes its own E8M0 scale.
+// value stays FP32, and every 32-value group takes its own E8M0 scale.
 //
 // The 16 rows of a tile are independent, so four rows are in flight at once and
 // each opcode is issued across all four chains. The vector unit is deeply
@@ -77,7 +77,7 @@ using ScaleTile = Vec<uint8_t, 1, SCALE_BYTES>;
 constexpr int CHAINS = 4;
 constexpr int ROW_GROUPS = ROW_TILE / CHAINS;
 
-// Upcast a BF16 row, clamp it, evaluate SiLU(gate) * up and round to BF16.
+// Upcast a BF16 row, clamp it, and evaluate SiLU(gate) * up in FP32.
 __aicore__ inline void activate4(__ubuf__ bfloat16_t* gsrc, __ubuf__ bfloat16_t* usrc, uint16_t base,
                                  RegTensor<float>& h0, RegTensor<float>& h1, RegTensor<float>& h2,
                                  RegTensor<float>& h3, MaskReg all, MaskReg all16) {
@@ -131,15 +131,6 @@ __aicore__ inline void activate4(__ubuf__ bfloat16_t* gsrc, __ubuf__ bfloat16_t*
     vmul(h1, h1, u1, all);
     vmul(h2, h2, u2, all);
     vmul(h3, h3, u3, all);
-    // The released golden rounds the gated value to BF16 before scaling.
-    vcvt(b0, h0, all, ROUND_R, RS_DISABLE, PART_EVEN);
-    vcvt(b1, h1, all, ROUND_R, RS_DISABLE, PART_EVEN);
-    vcvt(b2, h2, all, ROUND_R, RS_DISABLE, PART_EVEN);
-    vcvt(b3, h3, all, ROUND_R, RS_DISABLE, PART_EVEN);
-    vcvt(h0, b0, all16, PART_EVEN);
-    vcvt(h1, b1, all16, PART_EVEN);
-    vcvt(h2, b2, all16, PART_EVEN);
-    vcvt(h3, b3, all16, PART_EVEN);
 }
 
 // Per-group upward E8M0 scale: one MX group is one half of a row, so each half is

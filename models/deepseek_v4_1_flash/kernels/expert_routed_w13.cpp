@@ -16,7 +16,7 @@ using namespace grouped_mxfp4;
 #ifdef __DAV_CUBE__
 namespace {
 struct StorePair {
-    __gm__ float* out;
+    __gm__ bfloat16_t* out;
     int64_t rows;
     int64_t width;
     int64_t row;
@@ -25,7 +25,7 @@ struct StorePair {
     template <typename Acc>
     AICORE inline void operator()(Acc& acc) const
     {
-        using Global = GlobalTensor<float, Shape<1, 1, 1, DYNAMIC, N_TILE>,
+        using Global = GlobalTensor<bfloat16_t, Shape<1, 1, 1, DYNAMIC, N_TILE>,
                                     pto::Stride<DYNAMIC, DYNAMIC, DYNAMIC, DYNAMIC, 1>>;
         Global target(out + row * width + col,
                       Global::Shape(1, 1, 1, acc.GetValidRow(), N_TILE),
@@ -36,14 +36,32 @@ struct StorePair {
 }  // namespace
 #endif
 
+#ifdef __DAV_VEC__
+AICORE inline void copyRouteWeights(__gm__ float* input, __gm__ float* output, int64_t count)
+{
+    using W = Tile<TileType::Vec, float, 1, M_TILE, BLayout::RowMajor, 1, DYNAMIC>;
+    using G = GlobalTensor<float, Shape<1, 1, 1, 1, DYNAMIC>, pto::Stride<1, 1, 1, 1, 1>>;
+    W tile(count);
+    TASSIGN(tile, 0);
+    G source(input, G::Shape(1, 1, 1, 1, count));
+    G target(output, G::Shape(1, 1, 1, 1, count));
+    TLOAD(tile, source);
+    set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID7);
+    wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID7);
+    TSTORE(target, tile);
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+}
+#endif
+
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 {
     auto* counts = tensorData<int32_t>(args, 2);
-    const int64_t experts = args[8];
-    const int64_t stride = args[9];
-    const int64_t width = args[10];
-    const int64_t hidden = args[11];
-    const int64_t activationRows = args[12];
+    const int64_t experts = args[10];
+    const int64_t stride = args[11];
+    const int64_t width = args[12];
+    const int64_t hidden = args[13];
+    const int64_t activationRows = args[14];
     const int64_t block = get_block_idx(args);
     const int64_t blocks = get_block_num(args);
     const int64_t hTiles = hidden / N_TILE;
@@ -56,7 +74,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     auto* xScale = tensorData<float8_e8m0_t>(args, 1);
     auto* s1 = tensorData<float8_e8m0_t>(args, 4);
     auto* s3 = tensorData<float8_e8m0_t>(args, 6);
-    auto* out = tensorData<float>(args, 7);
+    auto* out = tensorData<bfloat16_t>(args, 7);
 #endif
     beginGemm();
     int64_t workBase = 0;
@@ -71,6 +89,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
             const bool up = (work / hTiles) % 2 != 0;
             const int64_t valid = count - row < M_TILE ? count - row : M_TILE;
 #ifdef __DAV_VEC__
+            if (work % (2 * hTiles) == 0 && get_subblockid() == 0) {
+                copyRouteWeights(tensorData<float>(args, 8) + expert * stride + row,
+                                 tensorData<float>(args, 9) + activationBase + row, valid);
+            }
             produceWeight(up ? w3 : w1, width, hidden, expert, col);
 #endif
 #ifdef __DAV_CUBE__
@@ -83,7 +105,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
 #endif
         }
         workBase += workCount;
-        activationBase += (count + 15) / 16 * 16;
+        activationBase += count;
     }
     endGemm();
 }
