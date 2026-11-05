@@ -135,6 +135,7 @@ The following checks were run in the pinned shared environment on 2026-11-04:
 | check | result | evidence |
 | --- | --- | --- |
 | fixed A3 environment activation | `pass` | PyPTO `72a62d13efabbb25d240e35944f68ba5bcc22b7f`, Python 3.10.22, `SOC_VERSION=ascend910_9382`, workspace state directory |
+| queued EP2 A3 device preflight | `pass` | `task_20261105_101415_246219319021`; `TASK_DEVICE=0,1`, `ASCEND_RT_VISIBLE_DEVICES=0,1`, Ascend910 health OK; no model compute |
 | product import/dependency scan | `pass` | `python -m models.deepseek_v4_1_flash_a2.decode_acceptance --static-scan` |
 | PyPTO single-step compile | `pass` | `decode_fwd -p a2a3 --sim --compile-only` |
 | PyPTO replay compile | `pass` | `decode_replay --steps 1/2/8 -p a2a3 --sim --compile-only` |
@@ -155,6 +156,12 @@ PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_gate \
 
 They only emit the public queue command and a missing-asset report. They do not
 load or launch vLLM-Ascend and do not claim NPU accuracy.
+
+The reference candidate environment exists at a nobody-owned shared path that
+the Decode user cannot traverse. The pinned PyPTO environment has no
+`vllm`, `vllm_ascend`, or `torch_npu` package. The reference source commit and
+loaded libraries therefore remain unverified; this is an environment access
+blocker, not a reference pass.
 
 ## Environment and queue
 

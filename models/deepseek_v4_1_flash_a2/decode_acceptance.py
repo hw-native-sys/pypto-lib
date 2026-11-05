@@ -293,7 +293,9 @@ def runtime_identity() -> dict[str, Any]:
             spec = importlib.util.find_spec(name)
         except (ImportError, ModuleNotFoundError, ValueError):
             return "unavailable"
-        return spec.origin if spec and spec.origin else "namespace"
+        if spec is None:
+            return "unavailable"
+        return spec.origin if spec.origin else "namespace"
 
     loaded_shared_objects: set[str] = set()
     maps_path = Path("/proc/self/maps")

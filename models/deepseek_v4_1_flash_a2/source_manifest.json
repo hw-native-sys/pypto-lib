@@ -1020,7 +1020,7 @@
     },
     {
       "file": "decode_acceptance.py",
-      "sha256": "20d3e27469085680eaec0810b933eb9f1c87c6de3d10f2c113999d40c8f20479",
+      "sha256": "4dc8d001e5c36497d37491b965fc6a0de2e7beb2155e06547c86f830365d4d8",
       "role": "independent Decode contract and product dependency verifier",
       "product_compute": false,
       "accuracy_evidence": "not_run"
