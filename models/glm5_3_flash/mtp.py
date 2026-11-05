@@ -82,6 +82,73 @@ def golden_mtp_projection(
     return golden_bf16_linear(combined, w_eh).bfloat16()
 
 
+
+FEEDBACK_ROWS = pl.dynamic("GLM53_FEEDBACK_ROWS")
+FEEDBACK_REQUESTS = pl.dynamic("GLM53_FEEDBACK_REQUESTS")
+
+
+@pl.jit.inline
+def mtp_prepare_feedback(
+    embedding: pl.Tensor[[T_DYN, D], pl.BF16],
+    target_feedback: pl.Tensor[[FEEDBACK_ROWS, D], pl.BF16],
+    target_last: pl.Tensor[[FEEDBACK_REQUESTS, D], pl.BF16],
+    draft_last: pl.Tensor[[FEEDBACK_REQUESTS, D], pl.BF16],
+    feedback_indices: pl.Tensor[[T_DYN], pl.INT32],
+    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    visible_lengths: pl.Tensor[[T_DYN], pl.INT32],
+    feedback_mode: pl.Tensor[[1], pl.INT32],
+    enorm_weight: pl.Tensor[[D], pl.BF16],
+    hnorm_weight: pl.Tensor[[D], pl.BF16],
+    w_eh: pl.Tensor[[D, 2 * D], pl.BF16],
+    output: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Gather target or recycled draft feedback and prepare MTP inputs."""
+    rows = pl.tensor.dim(embedding, 0)
+    feedback = pl.create_tensor([rows, D], dtype=pl.BF16)
+    tokens = pl.create_tensor([rows, D], dtype=pl.BF16)
+    for block in pl.spmd(rows * (D // 128), name_hint="mtp_feedback_gather"):
+        row = block // (D // 128)
+        column = block % (D // 128) * 128
+        request = pl.read(request_ids, [row])
+        value = pl.full([1, 128], dtype=pl.BF16, value=0.0)
+        token = pl.full([1, 128], dtype=pl.BF16, value=0.0)
+        if request >= 0:
+            request_index = pl.cast(request, pl.INDEX)
+            mode = pl.read(feedback_mode, [0])
+            if mode == 0:
+                selected = pl.read(feedback_indices, [row])
+                if selected >= 0:
+                    source = pl.cast(selected, pl.INDEX)
+                    value = target_feedback[source:source + 1, column:column + 128]
+            elif mode == 1:
+                value = target_last[request_index:request_index + 1, column:column + 128]
+            else:
+                value = draft_last[request_index:request_index + 1, column:column + 128]
+            if pl.read(visible_lengths, [row]) > 1:
+                token = embedding[row:row + 1, column:column + 128]
+        feedback[row:row + 1, column:column + 128] = value
+        tokens[row:row + 1, column:column + 128] = token
+    mtp_projection(tokens, feedback, enorm_weight, hnorm_weight, w_eh, output)
+    return output
+
+
+@pl.jit.inline
+def save_request_feedback(
+    feedback: pl.Tensor[[FEEDBACK_ROWS, D], pl.BF16],
+    last_feedback: pl.Tensor[[FEEDBACK_REQUESTS, D], pl.BF16],
+    selected_rows: pl.Tensor[[FEEDBACK_REQUESTS], pl.INT32],
+):
+    """Publish one accepted hidden row for each active request."""
+    requests = pl.tensor.dim(selected_rows, 0)
+    for block in pl.spmd(requests * (D // 128), name_hint="save_request_feedback"):
+        request = block // (D // 128)
+        column = block % (D // 128) * 128
+        selected = pl.read(selected_rows, [request])
+        if selected >= 0:
+            source = pl.cast(selected, pl.INDEX)
+            last_feedback[request:request + 1, column:column + 128] = feedback[source:source + 1, column:column + 128]
+    return last_feedback
+
 def main():
     import argparse
     from functools import lru_cache

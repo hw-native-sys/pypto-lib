@@ -27,9 +27,9 @@ from models.glm5_3_flash.config import (
 )
 from models.glm5_3_flash.elementwise import accurate_divide, accurate_exp, accurate_row_sum_parts
 from models.glm5_3_flash.linear import (
-    bf16_linear, golden_bf16_linear, w8a8_projection_bf16, w8a8_projection_fp32,
+    bf16_linear, golden_bf16_linear, w8a8_projection_bf16,
 )
-from models.glm5_3_flash.quantization import quantize_per_token_int8, w8a8_dynamic_linear
+from models.glm5_3_flash.quantization import w8a8_dynamic_linear
 from models.glm5_3_flash.rmsnorm import rms_norm, rmsnorm
 from models.glm5_3_flash.utils import (
     _FLOAT32_MIN, Checkpoint, _check, _check_sparse_attention_impl, _randn, _report, _selected_rows,
@@ -40,6 +40,9 @@ BLOCK_TABLE_DYN = pl.dynamic("GLM53_BLOCK_TABLE_DYN")
 B_DYN = pl.dynamic("GLM53_B_DYN")
 TABLE_DYN = pl.dynamic("GLM53_TABLE_DYN")
 T_DYN = pl.dynamic("GLM53_T_DYN")
+
+MLA_CACHE_QUANT_TILE = 128
+MLA_CACHE_WIDTH = KV_LORA + KV_LORA // MLA_CACHE_QUANT_TILE * 4
 
 OUTPUT_MM_T_TILE = 16  # cube M tile; rows are a 16-row boxed tile
 O_N_TILE = 256  # o_proj output-column tile over D
@@ -52,7 +55,7 @@ ABSORB_N_TILE = 128  # absorb_query output-column tile
 
 PREFILL_SOFTMAX_SCALE = QK_DIM**-0.5
 PREFILL_NEG_INF = -1.0e20  # finite floor; a true -inf would make an all-masked row NaN
-PREFILL_ATTN_K_TILE = 128  # selected rows per sparse block
+PREFILL_ATTN_K_TILE = 16  # selected rows per sparse block
 PREFILL_H_TILE = min(LOCAL_H, 16)
 PREFILL_H_PAD = ((PREFILL_H_TILE + 15) // 16) * 16
 PREFILL_MM_T_TILE = 16  # cube M tile of the value expansion
@@ -61,7 +64,13 @@ EXPAND_K_TILE = 256  # value-expansion KV_LORA reduction tile
 
 DECODE_SOFTMAX_SCALE = QK_DIM**-0.5
 DECODE_NEG_INF = -1.0e20  # finite floor; a true -inf would make an all-masked row NaN
-DECODE_ATTN_K_TILE = 128  # selected rows per sparse block
+# Selected rows per sparse block, pinned between two hard limits. The packed
+# INT8 latent row makes 96 and above overflow the Vec buffer at compile time,
+# while smaller tiles multiply the score dispatch, which is
+# tokens * ceil(TOPK_INDEX_WIDTH / this): at 16 a full 32-request decode step
+# emits 16512 blocks and the scheduler never drains them. 64 is the largest
+# tile that compiles, and holds a full batch to 4224 blocks.
+DECODE_ATTN_K_TILE = 64
 NUM_QK_CORES = 24  # qk_pv dispatch lanes = a2a3 AIC count
 DECODE_H_TILE = min(LOCAL_H, 16)
 DECODE_H_PAD = ((DECODE_H_TILE + 15) // 16) * 16
@@ -98,10 +107,17 @@ def mla_epilog_w8a8(
     w_o_scale: pl.Tensor[[D], pl.FP32],
     output: pl.Tensor[[T_DYN, D], pl.FP32],
 ):
-    """Publish the native W8A8 output projection's row-parallel FP32 partial."""
+    """Publish the BF16-rounded row-parallel projection in the FP32 collective buffer."""
     rows = pl.tensor.dim(attn_out, 0)
     attn_flat = pl.reshape(attn_out, [rows, LOCAL_H * V_DIM])
-    w8a8_projection_fp32(attn_flat, w_o, w_o_scale, output, LOCAL_H * V_DIM, D)
+    partial = pl.create_tensor([rows, D], dtype=pl.BF16)
+    w8a8_projection_bf16(attn_flat, w_o, w_o_scale, partial, LOCAL_H * V_DIM, D)
+    for block in pl.spmd(((rows + OUTPUT_MM_T_TILE - 1) // OUTPUT_MM_T_TILE) * (D // O_N_TILE)):
+        row = block // (D // O_N_TILE) * OUTPUT_MM_T_TILE
+        col = block % (D // O_N_TILE) * O_N_TILE
+        valid = pl.min(OUTPUT_MM_T_TILE, rows - row)
+        value = pl.slice(partial, [OUTPUT_MM_T_TILE, O_N_TILE], [row, col], valid_shape=[valid, O_N_TILE])
+        output[row:row + OUTPUT_MM_T_TILE, col:col + O_N_TILE] = pl.cast(value, pl.FP32)
     return output
 
 
@@ -351,9 +367,39 @@ def mla_absorb_query_test(
 
 
 @pl.jit.inline
+def mla_dequant_cache_block(
+    cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, MLA_CACHE_WIDTH], pl.INT8],
+    source: pl.Scalar[pl.INDEX],
+    col: pl.Scalar[pl.INDEX],
+):
+    """Decode one 128-element block with its packed FP32 scale into BF16."""
+    packed_tail = cache[source:source + 1, KV_LORA - 16:MLA_CACHE_WIDTH]
+    scale_view = pl.reinterpret_view(packed_tail, pl.FP32)
+    scale = pl.read(scale_view, [0, 4 + col // MLA_CACHE_QUANT_TILE])
+    codes = cache[source:source + 1, col:col + MLA_CACHE_QUANT_TILE]
+    codes_half = pl.cast(codes, pl.FP16)
+    values = pl.mul(pl.cast(codes_half, pl.FP32), scale)
+    return pl.cast(values, pl.BF16, mode="rint")
+
+
+@pl.jit.inline
+def mla_dequant_cache_row(
+    cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, MLA_CACHE_WIDTH], pl.INT8],
+    source: pl.Scalar[pl.INDEX],
+):
+    """Decode the packed C8 latent row into the BF16 Cube operand."""
+    row = pl.create_tensor([1, KV_LORA], dtype=pl.BF16)
+    for block in pl.unroll(KV_LORA // MLA_CACHE_QUANT_TILE):
+        col = pl.cast(block * MLA_CACHE_QUANT_TILE, pl.INDEX)
+        values = mla_dequant_cache_block(cache, source, col)
+        row[:, col:col + MLA_CACHE_QUANT_TILE] = values
+    return row
+
+
+@pl.jit.inline
 def prefill_sparse_attn(
     query: pl.Tensor[[T_DYN, LOCAL_H, QK_DIM], pl.BF16],
-    latent_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, KV_LORA], pl.BF16],
+    latent_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, MLA_CACHE_WIDTH], pl.INT8],
     block_table: pl.Tensor[[B_DYN, BLOCK_TABLE_DYN], pl.INT32],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     w_k: pl.Tensor[[LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
@@ -391,24 +437,6 @@ def prefill_sparse_attn(
                 init_values=(running_m, running_l, running_o),
             ):
                 w0 = sb * PREFILL_ATTN_K_TILE
-                kv_tile = pl.create_l1([PREFILL_ATTN_K_TILE, KV_LORA], pl.BF16)
-                # Lane 0 is -1 only when the whole block is padding.
-                if pl.read(topk_indices, [token, w0]) >= 0:
-                    for r in pl.range(PREFILL_ATTN_K_TILE):
-                        if w0 + r < TOPK_INDEX_WIDTH:
-                            position = pl.read(topk_indices, [token, w0 + r])
-                            if position >= 0:
-                                logical = pl.cast(position, pl.INDEX)
-                                page = pl.cast(pl.read(block_table, [request, logical // BLOCK_SIZE]), pl.INDEX)
-                                source = page * BLOCK_SIZE + logical % BLOCK_SIZE
-                                kv_tile = pl.gather_row(kv_tile, latent_cache, [r, 0], [source, 0], [1, KV_LORA])
-                            else:
-                                kv_tile = pl.gather_row(kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA])
-                        else:
-                            kv_tile = pl.gather_row(kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA])
-                else:
-                    kv_tile = pl.gather_row(kv_tile, latent_cache, [0, 0], [0, 0], [PREFILL_ATTN_K_TILE, KV_LORA])
-
                 # Release the query pipe slot before the PV weights use the same FIFO.
                 for q_aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
                     q0 = q_aiv_id * (PREFILL_H_PAD // 2)
@@ -417,6 +445,19 @@ def prefill_sparse_attn(
                     q_part = pl.slice(absorbed_rows, [PREFILL_H_PAD // 2, KV_LORA], [q_start, 0], valid_shape=[q_valid, KV_LORA])
                     q_padded = pl.fillpad(q_part, pad_value=pl.PadValue.zero)
                     q_tile = pl.aic_gather(q_padded)
+                for kv_aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    kv_values = pl.full([PREFILL_ATTN_K_TILE // 2, KV_LORA], dtype=pl.BF16, value=0.0)
+                    for row in pl.range(PREFILL_ATTN_K_TILE // 2):
+                        selected = w0 + kv_aiv_id * (PREFILL_ATTN_K_TILE // 2) + row
+                        if selected < TOPK_INDEX_WIDTH:
+                            position = pl.read(topk_indices, [token, selected])
+                            if position >= 0:
+                                logical = pl.cast(position, pl.INDEX)
+                                page = pl.cast(pl.read(block_table, [request, logical // BLOCK_SIZE]), pl.INDEX)
+                                source = page * BLOCK_SIZE + logical % BLOCK_SIZE
+                                kv_values[row:row + 1, :] = mla_dequant_cache_row(latent_cache, source)
+                    kv_tile = pl.aic_gather(kv_values)
+
                 raw = pl.matmul(q_tile, kv_tile, b_trans=True, out_dtype=pl.FP32)
                 for _ in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
                     raw_part = pl.aiv_shard(raw)
@@ -488,7 +529,7 @@ if PREFILL_H_TILE != LOCAL_H:
 @pl.jit
 def prefill_sparse_attn_test(
     query: pl.Tensor[[T_DYN, LOCAL_H, QK_DIM], pl.BF16],
-    latent_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, KV_LORA], pl.BF16],
+    latent_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, MLA_CACHE_WIDTH], pl.INT8],
     block_table: pl.Tensor[[B_DYN, BLOCK_TABLE_DYN], pl.INT32],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     w_k: pl.Tensor[[LOCAL_H, QK_DIM, KV_LORA], pl.BF16],
@@ -510,19 +551,51 @@ def prefill_sparse_attn_test(
 def mla_cache_write(
     latent: pl.Tensor[[T_DYN, KV_LORA], pl.BF16],
     slots: pl.Tensor[[T_DYN], pl.INT32],
-    cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, KV_LORA], pl.BF16],
+    cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, MLA_CACHE_WIDTH], pl.INT8],
 ):
-    """Scatter one step's latent rows into the paged pool, one block per row.
-
-    Returns the region's TaskId so a later gather can order against the write.
-    """
+    """Quantize normalized BF16 latents and scatter packed INT8 payload/FP32 scales."""
     tokens = pl.tensor.dim(latent, 0)
     with pl.spmd(tokens, name_hint="mla_cache_write") as write_tid:
         token = pl.tile.get_block_idx()
         slot_i32 = pl.read(slots, [token])
         if slot_i32 >= 0:
             slot = pl.cast(slot_i32, pl.INDEX)
-            pl.store(pl.load(latent, [token, 0], [1, KV_LORA]), [slot, 0], cache)
+            tail_bits = pl.full([1, 8], dtype=pl.INT32, value=0)
+            for block in pl.range(KV_LORA // MLA_CACHE_QUANT_TILE):
+                col = block * MLA_CACHE_QUANT_TILE
+                value = pl.cast(latent[token:token + 1, col:col + MLA_CACHE_QUANT_TILE], pl.FP32)
+                repeated = pl.col_expand_add(pl.full([8, MLA_CACHE_QUANT_TILE], dtype=pl.FP32, value=0.0), value)
+                amax = pl.row_max(pl.abs(repeated))
+                maximum = pl.read(amax, [0, 0])
+                if maximum > 0.0:
+                    max_lanes = pl.create_tensor([1, 8], dtype=pl.FP32)
+                    max_lanes[:, :] = pl.reshape(amax, [1, 8])
+                    one_lanes = pl.create_tensor([1, 8], dtype=pl.FP32)
+                    one_lanes[:, :] = pl.full([1, 8], dtype=pl.FP32, value=1.0)
+                    reciprocal_lanes = accurate_divide(one_lanes, max_lanes)
+                    inverse_lanes = pl.mul(reciprocal_lanes, 127.0)
+                    inverse_column = pl.reshape(inverse_lanes, [8, 1])
+                    scaled = pl.row_expand_mul(repeated, inverse_column)
+                    integer = pl.cast(scaled, pl.INT32, mode="rint")
+                    bounded = pl.minimum(pl.maximum(integer, -127), 127)
+                    half = pl.cast(bounded, pl.FP16)
+                    codes = pl.cast(half, pl.INT8, mode="trunc")
+                    cache[slot:slot + 1, col:col + MLA_CACHE_QUANT_TILE] = pl.set_validshape(codes, 1, MLA_CACHE_QUANT_TILE)
+                    scale_lanes = pl.mul(max_lanes, 1.0 / 127.0)
+                    scale_bits = pl.reinterpret_view(scale_lanes, pl.INT32)
+                    pl.write(tail_bits, [0, 4 + block], pl.read(scale_bits, [0, 0]))
+                    if block == KV_LORA // MLA_CACHE_QUANT_TILE - 1:
+                        code_bits = pl.reinterpret_view(codes, pl.INT32)
+                        for word in pl.unroll(4):
+                            pl.write(tail_bits, [0, word], pl.read(code_bits, [0, MLA_CACHE_QUANT_TILE // 4 - 4 + word]))
+                else:
+                    zeros = pl.full([1, MLA_CACHE_QUANT_TILE], dtype=pl.FP16, value=0.0)
+                    zero_codes = pl.cast(zeros, pl.INT8, mode="trunc")
+                    cache[slot:slot + 1, col:col + MLA_CACHE_QUANT_TILE] = zero_codes
+                    pl.write(tail_bits, [0, 4 + block], pl.cast(0, pl.INT32))
+            packed_tail = pl.reinterpret_view(tail_bits, pl.INT8)
+            cache[slot:slot + 1, KV_LORA - 16:MLA_CACHE_WIDTH] = packed_tail
+
     return write_tid
 
 
@@ -530,7 +603,7 @@ def mla_cache_write(
 def mla_cache_write_test(
     latent: pl.Tensor[[T_DYN, KV_LORA], pl.BF16],
     slots: pl.Tensor[[T_DYN], pl.INT32],
-    cache: pl.InOut[pl.Tensor[[TABLE_DYN * BLOCK_SIZE, KV_LORA], pl.BF16]],
+    cache: pl.InOut[pl.Tensor[[TABLE_DYN * BLOCK_SIZE, MLA_CACHE_WIDTH], pl.INT8]],
 ):
     """Run one scatter for golden.run validation."""
     latent.bind_dynamic(0, T_DYN)
@@ -542,7 +615,7 @@ def mla_cache_write_test(
 @pl.jit.inline
 def decode_sparse_attn(
     absorbed_query: pl.Tensor[[T_DYN, LOCAL_H, KV_LORA], pl.BF16],
-    latent_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, KV_LORA], pl.BF16],
+    latent_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, MLA_CACHE_WIDTH], pl.INT8],
     block_table: pl.Tensor[[B_DYN, BLOCK_TABLE_DYN], pl.INT32],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     topk_indices: pl.Tensor[[T_DYN, TOPK_INDEX_WIDTH], pl.INT32],
@@ -590,7 +663,8 @@ def decode_sparse_attn(
                             query_value = pl.create_tensor([DECODE_H_PAD, 128], dtype=pl.FP32)
                             query_value[:, :] = pl.full([DECODE_H_PAD, 128], dtype=pl.FP32, value=0.0)
                             query_value[0:DECODE_H_TILE, :] = pl.cast(query_part, pl.FP32)
-                            key_value = pl.cast(latent_cache[source:source + 1, k0:k0 + 128], pl.FP32)
+                            key_bf16 = mla_dequant_cache_block(latent_cache, source, k0)
+                            key_value = pl.cast(key_bf16, pl.FP32)
                             products = pl.create_tensor([DECODE_H_PAD, 128], dtype=pl.FP32)
                             products[:, :] = pl.col_expand_mul(query_value, key_value)
                             high, low = accurate_row_sum_parts(products, 128)
@@ -636,19 +710,18 @@ def decode_sparse_attn(
                         blk_li[blk_row:blk_row + DECODE_H_PAD, :] = empty_l
                         blk_oi[blk_row:blk_row + DECODE_H_PAD, :] = empty_o
             else:
-                kv_tile = pl.create_l1([DECODE_ATTN_K_TILE, KV_LORA], pl.BF16)
-                for r in pl.range(DECODE_ATTN_K_TILE):
-                    if w0 + r < TOPK_INDEX_WIDTH:
-                        position = pl.read(topk_indices, [token, w0 + r])
-                        if position >= 0:
-                            logical = pl.cast(position, pl.INDEX)
-                            page = pl.cast(pl.read(block_table, [request, logical // BLOCK_SIZE]), pl.INDEX)
-                            source = page * BLOCK_SIZE + logical % BLOCK_SIZE
-                            kv_tile = pl.gather_row(kv_tile, latent_cache, [r, 0], [source, 0], [1, KV_LORA])
-                        else:
-                            kv_tile = pl.gather_row(kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA])
-                    else:
-                        kv_tile = pl.gather_row(kv_tile, latent_cache, [r, 0], [0, 0], [1, KV_LORA])
+                for kv_aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    kv_values = pl.full([DECODE_ATTN_K_TILE // 2, KV_LORA], dtype=pl.BF16, value=0.0)
+                    for row in pl.range(DECODE_ATTN_K_TILE // 2):
+                        selected = w0 + kv_aiv_id * (DECODE_ATTN_K_TILE // 2) + row
+                        if selected < TOPK_INDEX_WIDTH:
+                            position = pl.read(topk_indices, [token, selected])
+                            if position >= 0:
+                                logical = pl.cast(position, pl.INDEX)
+                                page = pl.cast(pl.read(block_table, [request, logical // BLOCK_SIZE]), pl.INDEX)
+                                source = page * BLOCK_SIZE + logical % BLOCK_SIZE
+                                kv_values[row:row + 1, :] = mla_dequant_cache_row(latent_cache, source)
+                    kv_tile = pl.aic_gather(kv_values)
 
                 for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
                     raw_part = raw_scores[(token * ((LOCAL_H + DECODE_H_TILE - 1) // DECODE_H_TILE) + head) * DECODE_H_PAD + aiv_id * (DECODE_H_PAD // 2):(token * ((LOCAL_H + DECODE_H_TILE - 1) // DECODE_H_TILE) + head) * DECODE_H_PAD + aiv_id * (DECODE_H_PAD // 2) + DECODE_H_PAD // 2, w0:w0 + DECODE_ATTN_K_TILE]
@@ -734,7 +807,7 @@ def decode_sparse_attn(
 @pl.jit
 def decode_sparse_attn_test(
     absorbed_query: pl.Tensor[[T_DYN, LOCAL_H, KV_LORA], pl.BF16],
-    latent_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, KV_LORA], pl.BF16],
+    latent_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, MLA_CACHE_WIDTH], pl.INT8],
     block_table: pl.Tensor[[B_DYN, BLOCK_TABLE_DYN], pl.INT32],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     topk_indices: pl.Tensor[[T_DYN, TOPK_INDEX_WIDTH], pl.INT32],
@@ -785,9 +858,8 @@ def output_run_native_case(options):
     ]
 
     def golden(values):
-        quantized, scales = quantize_per_token_int8(values["attn_out"].flatten(1))
-        products = quantized.int() @ values["w_o"].int().t()
-        values["output"].copy_(products.float() * scales * values["w_o_scale"])
+        expected = w8a8_dynamic_linear(values["attn_out"].flatten(1), values["w_o"], values["w_o_scale"])
+        values["output"].copy_(expected.float())
 
     result = run(
         fn=mla_epilog_w8a8_test,
@@ -1116,6 +1188,30 @@ def run_mla_prolog_goldens(golden_prolog, golden_split, golden_absorb_query, gol
     _report("mla_prolog")
 
 
+def pack_mla_cache(latent: torch.Tensor) -> torch.Tensor:
+    """Pack independent per-token, 128-element INT8 blocks and FP32 dequant scales."""
+    if latent.shape[-1] != KV_LORA:
+        raise ValueError(f"expected latent width {KV_LORA}, got {latent.shape[-1]}")
+    grouped = latent.float().reshape(*latent.shape[:-1], KV_LORA // MLA_CACHE_QUANT_TILE, MLA_CACHE_QUANT_TILE)
+    maximum = grouped.abs().amax(-1)
+    scales = maximum * (1.0 / 127.0)
+    inverse = torch.where(maximum > 0, maximum.reciprocal() * 127.0, torch.zeros_like(maximum))
+    codes = (grouped * inverse.unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
+    return torch.cat((codes.flatten(-2), scales.contiguous().view(torch.int8)), dim=-1)
+
+
+def dequant_mla_cache(cache: torch.Tensor) -> torch.Tensor:
+    """Decode packed C8 blocks with the BF16 boundary used by sparse attention."""
+    if cache.dtype != torch.int8:
+        return cache
+    if cache.shape[-1] != MLA_CACHE_WIDTH:
+        raise ValueError(f"expected packed cache width {MLA_CACHE_WIDTH}, got {cache.shape[-1]}")
+    codes = cache[..., :KV_LORA].float()
+    scales = cache[..., KV_LORA:].contiguous().view(torch.float32)
+    values = codes * scales.repeat_interleave(MLA_CACHE_QUANT_TILE, dim=-1)
+    return values.to(torch.bfloat16)
+
+
 def golden_prefill_sparse_attn(
     query: torch.Tensor,
     latent_cache: torch.Tensor,
@@ -1152,6 +1248,7 @@ def golden_prefill_sparse_attn(
     Returns:
         ``[T, H, V_DIM]`` attention output in ``query``'s dtype.
     """
+    latent_cache = dequant_mla_cache(latent_cache)
     valid = topk_indices >= 0
     positions = topk_indices.clamp(min=0).to(torch.int64)
     rows = paged_slots(positions, request_ids.to(torch.int64).unsqueeze(-1), block_table)
@@ -1178,6 +1275,7 @@ def _golden_prefill_sparse_attn_impl(
 
     The expanded FP32 reference remains :func:`golden_prefill_sparse_attn`.
     """
+    latent_cache = dequant_mla_cache(latent_cache)
     tokens, heads, _ = query.shape
     latent_width = latent_cache.shape[-1]
     output = query.new_zeros((tokens, heads, w_v.shape[1]))
@@ -1277,7 +1375,7 @@ def build_prefill_sparse_attn_specs(
         return torch.randn(tokens, LOCAL_H, QK_DIM, generator=generator).bfloat16()
 
     def init_cache():
-        return torch.randn(cache_rows, KV_LORA, generator=generator).bfloat16()
+        return pack_mla_cache(torch.randn(cache_rows, KV_LORA, generator=generator).bfloat16())
 
     def init_w_k():
         return (torch.randn(LOCAL_H, QK_DIM, KV_LORA, generator=generator) * 0.02).bfloat16()
@@ -1307,7 +1405,7 @@ def build_prefill_sparse_attn_specs(
 
     return [
         TensorSpec("query", [tokens, LOCAL_H, QK_DIM], torch.bfloat16, init_value=init_query),
-        TensorSpec("latent_cache", [cache_rows, KV_LORA], torch.bfloat16, init_value=init_cache),
+        TensorSpec("latent_cache", [cache_rows, MLA_CACHE_WIDTH], torch.int8, init_value=init_cache),
         TensorSpec("block_table", [requests, pages_per_request], torch.int32, init_value=init_block_table),
         TensorSpec("request_ids", [tokens], torch.int32, init_value=init_request_ids),
         TensorSpec("w_k", [LOCAL_H, QK_DIM, KV_LORA], torch.bfloat16, init_value=init_w_k),
@@ -1409,7 +1507,7 @@ def golden_mla_cache_write(
     """Scatter one step's latent rows into the paged pool, skipping ``-1`` slots.
 
     Args:
-        cache: ``[TABLE * BLOCK_SIZE, KV_LORA]`` pool holding the prior state.
+        cache: ``[TABLE * BLOCK_SIZE, MLA_CACHE_WIDTH]`` INT8 pool holding the prior state.
         latent: ``[T, KV_LORA]`` rows from :func:`models.glm5_3_flash.mla_prolog.golden_mla_prolog`.
         slots: ``[T]`` physical rows from ``ForwardMetadata.mla_slots``, ``-1`` for a row
             that owns no cache position.
@@ -1419,7 +1517,7 @@ def golden_mla_cache_write(
     """
     updated = cache.clone()
     written = slots >= 0
-    updated[slots.to(torch.long)[written]] = latent.to(cache.dtype)[written]
+    updated[slots.to(torch.long)[written]] = pack_mla_cache(latent)[written]
     return updated
 
 
@@ -1436,10 +1534,14 @@ def build_mla_cache_tensor_specs(tokens: int = 24, pages: int = 4):
     cache_rows = pages * BLOCK_SIZE
 
     def init_latent():
-        return torch.randn(tokens, KV_LORA, generator=generator, dtype=torch.float32).bfloat16()
+        value = torch.randn(tokens, KV_LORA, generator=generator).bfloat16()
+        if tokens:
+            value[0, :MLA_CACHE_QUANT_TILE] = 0
+            value[0, MLA_CACHE_QUANT_TILE:2 * MLA_CACHE_QUANT_TILE] = 1e-8
+        return value
 
     def init_cache():
-        return torch.randn(cache_rows, KV_LORA, generator=generator, dtype=torch.float32).bfloat16()
+        return pack_mla_cache(torch.randn(cache_rows, KV_LORA, generator=generator).bfloat16())
 
     def init_slots():
         # Distinct rows, drawn out of order.
@@ -1451,7 +1553,7 @@ def build_mla_cache_tensor_specs(tokens: int = 24, pages: int = 4):
     return [
         TensorSpec("latent", [tokens, KV_LORA], torch.bfloat16, init_value=init_latent),
         TensorSpec("slots", [tokens], torch.int32, init_value=init_slots),
-        TensorSpec("cache", [cache_rows, KV_LORA], torch.bfloat16, init_value=init_cache),
+        TensorSpec("cache", [cache_rows, MLA_CACHE_WIDTH], torch.int8, init_value=init_cache),
     ]
 
 
@@ -1463,8 +1565,8 @@ def golden_mla_cache_case(tensors):
 def run_mla_cache_golden(golden_cache_write) -> None:
     """Check that the latent cache write scatters by slot and touches nothing else."""
     torch.manual_seed(29)
-    rows, kv_lora = 16, 8
-    cache = torch.randn(rows, kv_lora, dtype=torch.bfloat16)
+    rows, kv_lora = 16, KV_LORA
+    cache = pack_mla_cache(torch.randn(rows, kv_lora, dtype=torch.bfloat16))
     original = cache.clone()
     latent = torch.randn(4, kv_lora, dtype=torch.bfloat16)
     # Row 2 owns no cache position.
@@ -1478,7 +1580,7 @@ def run_mla_cache_golden(golden_cache_write) -> None:
     for row, slot in enumerate(slots.tolist()):
         if slot < 0:
             continue
-        _check(torch.equal(updated[slot], latent[row]), f"slot {slot} did not receive its row")
+        _check(torch.equal(updated[slot], pack_mla_cache(latent[row])), f"slot {slot} did not receive its row")
     untouched = [index for index in range(rows) if index not in written]
     _check(torch.equal(updated[untouched], original[untouched]), "the write disturbed rows outside its slot mapping")
     # A -1 slot must not wrap into the tail of the pool.
@@ -1521,6 +1623,7 @@ def _golden_decode_sparse_attn_math(
     Returns:
         ``[T, H, KV_LORA]`` latent-space context in ``absorbed_query``'s dtype.
     """
+    latent_cache = dequant_mla_cache(latent_cache)
     valid = topk_indices >= 0
     positions = topk_indices.clamp(min=0).to(torch.int64)
     rows = paged_slots(positions, request_ids.to(torch.int64).unsqueeze(-1), block_table)
@@ -1543,6 +1646,7 @@ def golden_decode_sparse_attn(
     The BF16 cast precedes each block's PV product; the denominator keeps the
     FP32 exponentials. The FP32 mathematical reference is a separate diagnostic.
     """
+    latent_cache = dequant_mla_cache(latent_cache)
     output = torch.zeros_like(absorbed_query)
     query_fp32 = absorbed_query.float()
     heads, width = absorbed_query.shape[1:]
@@ -1604,7 +1708,7 @@ def build_decode_sparse_attn_specs(
         return torch.randn(tokens, LOCAL_H, KV_LORA, generator=generator).bfloat16()
 
     def init_cache():
-        return torch.randn(cache_rows, KV_LORA, generator=generator).bfloat16()
+        return pack_mla_cache(torch.randn(cache_rows, KV_LORA, generator=generator).bfloat16())
 
     def init_block_table():
         pages = torch.randperm(requests * pages_per_request, generator=generator)
@@ -1628,7 +1732,7 @@ def build_decode_sparse_attn_specs(
 
     return [
         TensorSpec("absorbed_query", [tokens, LOCAL_H, KV_LORA], torch.bfloat16, init_value=init_query),
-        TensorSpec("latent_cache", [cache_rows, KV_LORA], torch.bfloat16, init_value=init_cache),
+        TensorSpec("latent_cache", [cache_rows, MLA_CACHE_WIDTH], torch.int8, init_value=init_cache),
         TensorSpec("block_table", [requests, pages_per_request], torch.int32, init_value=init_block_table),
         TensorSpec("request_ids", [tokens], torch.int32, init_value=init_request_ids),
         TensorSpec("topk_indices", [tokens, TOPK_INDEX_WIDTH], torch.int32, init_value=init_indices),
@@ -1861,11 +1965,7 @@ def run_prefill_case(argv=None):
 
 
 def run_cache_case(argv=None):
-    """Prove the golden on CPU, then validate the scatter on device.
-
-    The device case runs at zero tolerance: a scatter either moves the bytes or is
-    wrong, so there is no precision budget to spend.
-    """
+    """Validate packed C8 quantization, payload/scale bytes and masked scatter."""
     import argparse
 
     from golden import run

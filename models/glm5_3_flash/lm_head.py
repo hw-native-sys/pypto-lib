@@ -32,7 +32,6 @@ from models.glm5_3_flash.utils import Checkpoint, component_hidden
 LOGIT_ROWS_DYN = pl.dynamic('GLM53_LOGIT_ROWS_DYN')
 T_DYN = pl.dynamic('GLM53_T_DYN')
 
-FP32_HEAD_EPS = FLASH.rms_norm_eps
 FP32_NEG_INF_BITS = -8388608
 SELECT_D_TILE = 512
 LM_ROW_TILE = 16
@@ -41,10 +40,9 @@ LM_K_TILE = 512
 MAX_M_TILE = 8
 MAX_N_TILE = 256
 TP_CANDIDATE_TILE = 8
-FP32_HEAD_N_TILE = 64
-FP32_HEAD_K_TILE = 128
-FP32_HEAD_REDUCE_TILE = 8
-FP32_HEAD_VOCAB_PAD = ((LOCAL_VOCAB + FP32_HEAD_N_TILE - 1) // FP32_HEAD_N_TILE) * FP32_HEAD_N_TILE
+HEAD_N_TILE = 64
+HEAD_K_TILE = 128
+HEAD_VOCAB_PAD = ((LOCAL_VOCAB + HEAD_N_TILE - 1) // HEAD_N_TILE) * HEAD_N_TILE
 TP_TEST_EPOCHS = 3
 TP_TEST_ROWS = TP_SIZE + 17
 
@@ -90,7 +88,9 @@ def lm_head(
                 hidden = pl.slice(normalized, [LM_ROW_TILE, LM_K_TILE], [row0, k0], valid_shape=[valid_rows, LM_K_TILE])
                 vocab = pl.slice(weight, [LM_VOCAB_TILE, LM_K_TILE], [vocab0, k0], valid_shape=[valid_vocab, LM_K_TILE])
                 accum = pl.matmul_acc(accum, hidden, vocab, b_trans=True, init_cond=(k0 == 0))
-            accum_valid = pl.set_validshape(accum, valid_rows, valid_vocab)
+            logits_bf16 = pl.cast(accum, pl.BF16, mode="rint")
+            logits_fp32 = pl.cast(logits_bf16, pl.FP32)
+            accum_valid = pl.set_validshape(logits_fp32, valid_rows, valid_vocab)
             logits[row0 : row0 + LM_ROW_TILE, vocab0 : vocab0 + LM_VOCAB_TILE] = accum_valid
 
     # One writer owns the compact output arrays and their shared cache lines.
@@ -141,24 +141,26 @@ def lm_head_test(
 
 
 @pl.jit.inline
-def lm_head_project_fp32(
-    x: pl.Tensor[[T_DYN, D], pl.FP32],
-    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
-    logits: pl.Tensor[[T_DYN, FP32_HEAD_VOCAB_PAD], pl.FP32],
+def lm_head_project(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    weight: pl.Tensor[[HEAD_VOCAB_PAD, D], pl.BF16],
+    logits: pl.Tensor[[T_DYN, HEAD_VOCAB_PAD], pl.FP32],
 ):
-    """Project FP32 activations without imposing another normalization boundary."""
+    """Project BF16 activations and weights, then widen BF16 logits to FP32."""
     rows = pl.tensor.dim(x, 0)
     for row0 in pl.parallel(0, rows, LM_ROW_TILE):
-        for block in pl.spmd(FP32_HEAD_VOCAB_PAD // FP32_HEAD_N_TILE, name_hint="lm_head_fp32_projection"):
-            vocab0 = block * FP32_HEAD_N_TILE
+        for block in pl.spmd(HEAD_VOCAB_PAD // HEAD_N_TILE, name_hint="lm_head_projection"):
+            vocab0 = block * HEAD_N_TILE
             valid_rows = pl.min(LM_ROW_TILE, rows - row0)
-            accum = pl.create_tensor([LM_ROW_TILE, FP32_HEAD_N_TILE], dtype=pl.FP32)
-            for k0 in pl.pipeline(0, D, FP32_HEAD_K_TILE, stage=2):
-                projection_hidden = pl.slice(x, [LM_ROW_TILE, FP32_HEAD_K_TILE], [row0, k0], valid_shape=[valid_rows, FP32_HEAD_K_TILE])
-                projection_vocab = weight[vocab0 : vocab0 + FP32_HEAD_N_TILE, k0 : k0 + FP32_HEAD_K_TILE]
+            accum = pl.create_tensor([LM_ROW_TILE, HEAD_N_TILE], dtype=pl.FP32)
+            for k0 in pl.pipeline(0, D, HEAD_K_TILE, stage=2):
+                projection_hidden = pl.slice(x, [LM_ROW_TILE, HEAD_K_TILE], [row0, k0], valid_shape=[valid_rows, HEAD_K_TILE])
+                projection_vocab = weight[vocab0 : vocab0 + HEAD_N_TILE, k0 : k0 + HEAD_K_TILE]
                 accum = pl.matmul_acc(accum, projection_hidden, projection_vocab, b_trans=True, init_cond=k0 == 0)
-            accum = pl.set_validshape(accum, valid_rows, FP32_HEAD_N_TILE)
-            logits[row0 : row0 + LM_ROW_TILE, vocab0 : vocab0 + FP32_HEAD_N_TILE] = accum
+            logits_bf16 = pl.cast(accum, pl.BF16, mode="rint")
+            logits_fp32 = pl.cast(logits_bf16, pl.FP32)
+            logits_valid = pl.set_validshape(logits_fp32, valid_rows, HEAD_N_TILE)
+            logits[row0 : row0 + LM_ROW_TILE, vocab0 : vocab0 + HEAD_N_TILE] = logits_valid
     return logits
 
 
@@ -166,38 +168,19 @@ def lm_head_project_fp32(
 def lm_head_logits(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_weight: pl.Tensor[[D], pl.BF16],
-    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
-    logits: pl.Tensor[[T_DYN, FP32_HEAD_VOCAB_PAD], pl.FP32],
+    weight: pl.Tensor[[HEAD_VOCAB_PAD, D], pl.BF16],
+    normalized: pl.Tensor[[T_DYN, D], pl.BF16],
+    logits: pl.Tensor[[T_DYN, HEAD_VOCAB_PAD], pl.FP32],
 ):
-    """Normalize BF16 rows in FP32 and project the complete local vocabulary.
+    """Normalize to BF16 and project the complete local vocabulary.
 
-    The vocabulary shard contains exactly widened BF16 checkpoint weights and
-    zero padding to a complete projection tile. Normalized activations and the
-    output stay FP32. The caller strips padding before concatenating TP shards.
+    The caller owns the normalized scratch so its row extent stays tied to the
+    declared row symbol. The caller strips zero-weight padding before
+    concatenating TP shards.
     """
-    rows = pl.tensor.dim(x, 0)
-    normalized = pl.create_tensor([rows, D], dtype=pl.FP32)
-    for row in pl.spmd(rows, name_hint="lm_head_fp32_norm"):
-        hidden = pl.cast(x[row : row + 1, 0:D], pl.FP32)
-        squared = pl.mul(hidden, hidden)
-        squared_rows = pl.reshape(squared, [FP32_HEAD_REDUCE_TILE, D // FP32_HEAD_REDUCE_TILE])
-        partial_sum = pl.row_sum(squared_rows)
-        partial_row = pl.reshape(partial_sum, [1, FP32_HEAD_REDUCE_TILE])
-        reduction = pl.full([FP32_HEAD_REDUCE_TILE, FP32_HEAD_REDUCE_TILE], dtype=pl.FP32, value=0.0)
-        reduction[0:1, 0:FP32_HEAD_REDUCE_TILE] = partial_row
-        reduction = pl.set_validshape(reduction, 1, FP32_HEAD_REDUCE_TILE)
-        squared_sum = pl.row_sum(reduction)
-        mean_squared = pl.mul(squared_sum, 1.0 / D)
-        variance = pl.add(mean_squared, FP32_HEAD_EPS)
-        inverse_rms = pl.rsqrt(variance, high_precision=True)
-        inverse_rms_value = pl.read(inverse_rms, [0, 0])
-        scaled = pl.mul(hidden, inverse_rms_value)
-        gamma_values = pl.cast(norm_weight[0:D], pl.FP32)
-        gamma = pl.reshape(gamma_values, [1, D])
-        normalized_row = pl.mul(scaled, gamma)
-        normalized[row : row + 1, 0:D] = normalized_row
+    rmsnorm(x, norm_weight, normalized)
 
-    lm_head_project_fp32(normalized, weight, logits)
+    lm_head_project(normalized, weight, logits)
     return logits
 
 
@@ -205,21 +188,12 @@ def lm_head_logits(
 def lm_head_mtp_logits(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_weight: pl.Tensor[[D], pl.BF16],
-    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
-    logits: pl.Tensor[[T_DYN, FP32_HEAD_VOCAB_PAD], pl.FP32],
+    weight: pl.Tensor[[HEAD_VOCAB_PAD, D], pl.BF16],
+    normalized: pl.Tensor[[T_DYN, D], pl.BF16],
+    logits: pl.Tensor[[T_DYN, HEAD_VOCAB_PAD], pl.FP32],
 ):
-    """Apply the MTP shared head's BF16 norm once, then project in FP32."""
-    rows = pl.tensor.dim(x, 0)
-    normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
-    rmsnorm(x, norm_weight, normalized)
-    widened = pl.create_tensor([rows, D], dtype=pl.FP32)
-    for block in pl.spmd(((rows + 7) // 8) * (D // 128), name_hint="mtp_head_widen"):
-        row0 = block // (D // 128) * 8
-        col0 = block % (D // 128) * 128
-        valid = pl.min(8, rows - row0)
-        source = pl.slice(normalized, [8, 128], [row0, col0], valid_shape=[valid, 128])
-        widened[row0 : row0 + 8, col0 : col0 + 128] = pl.cast(source, pl.FP32)
-    lm_head_project_fp32(widened, weight, logits)
+    """Apply the MTP shared head's norm once and project BF16 logits."""
+    lm_head_logits(x, norm_weight, weight, normalized, logits)
     return logits
 
 
@@ -227,12 +201,14 @@ def lm_head_mtp_logits(
 def lm_head_mtp_logits_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_weight: pl.Tensor[[D], pl.BF16],
-    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
-    logits: pl.Out[pl.Tensor[[T_DYN, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+    weight: pl.Tensor[[HEAD_VOCAB_PAD, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[T_DYN, HEAD_VOCAB_PAD], pl.FP32]],
 ):
     x.bind_dynamic(0, T_DYN)
     logits.bind_dynamic(0, T_DYN)
-    lm_head_mtp_logits(x, norm_weight, weight, logits)
+    t_dim = pl.tensor.dim(x, 0)
+    normalized = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+    lm_head_mtp_logits(x, norm_weight, weight, normalized, logits)
     return logits
 
 
@@ -240,12 +216,14 @@ def lm_head_mtp_logits_test(
 def lm_head_logits_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_weight: pl.Tensor[[D], pl.BF16],
-    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
-    logits: pl.Out[pl.Tensor[[T_DYN, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+    weight: pl.Tensor[[HEAD_VOCAB_PAD, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[T_DYN, HEAD_VOCAB_PAD], pl.FP32]],
 ):
     x.bind_dynamic(0, T_DYN)
     logits.bind_dynamic(0, T_DYN)
-    lm_head_logits(x, norm_weight, weight, logits)
+    t_dim = pl.tensor.dim(x, 0)
+    normalized = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+    lm_head_logits(x, norm_weight, weight, normalized, logits)
     return logits
 
 
@@ -387,19 +365,13 @@ def l3_lm_head_tp_reduce_test(
 
 
 def reference_lm_head_logits(x, norm_weight, weight, *, vocab_block=4096):
-    """Keep FP32 normalization boundaries and round independent FP64 dots to FP32.
-
-    CPU FP32 GEMM can itself exceed the all-element 1e-5 acceptance gate near
-    cancellation. The wide dot product avoids using its reduction error as an
-    expected value. This does not change the gate or the device calculation.
-    """
-    hidden = x.float()
-    inverse_rms = torch.rsqrt(hidden.square().mean(dim=-1, keepdim=True) + FP32_HEAD_EPS)
-    normalized = (hidden * inverse_rms * norm_weight.float()).double()
-    output = torch.empty((hidden.shape[0], weight.shape[0]), dtype=torch.float32)
+    """Apply the BF16 norm and output boundaries around independent wide dots."""
+    normalized = rms_norm(x, norm_weight).double()
+    output = torch.empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
     for begin in range(0, weight.shape[0], vocab_block):
         end = min(begin + vocab_block, weight.shape[0])
-        output[:, begin:end] = (normalized @ weight[begin:end].double().t()).float()
+        dots = (normalized @ weight[begin:end].double().t()).float()
+        output[:, begin:end] = dots.bfloat16().float()
     return output
 
 
@@ -407,10 +379,39 @@ def golden_lm_head_logits(tensors):
     tensors["logits"].copy_(reference_lm_head_logits(tensors["x"], tensors["norm_weight"], tensors["weight"]))
 
 
-def run_fp32_case(options, device_id):
+
+def compare_bf16_logits(actual, expected, **kwargs):
+    """Require one BF16 ULP or 1e-5 absolute error at every logit, and exact argmax."""
+    from golden import ratio_allclose
+
+    if not bool(torch.isfinite(actual).all() and torch.isfinite(expected).all()):
+        return False, "logits must be finite"
+    rounded_actual = actual.bfloat16().float()
+    if not torch.equal(actual, rounded_actual):
+        return False, "logits must contain BF16 values widened to FP32"
+    if bool(actual[:, LOCAL_VOCAB:].count_nonzero()):
+        return False, "padded vocabulary columns must be zero"
+    actual_bits = actual.bfloat16().contiguous().view(torch.int16).to(torch.int32)
+    expected_bits = expected.bfloat16().contiguous().view(torch.int16).to(torch.int32)
+    actual_order = torch.where(actual_bits < 0, -32768 - actual_bits, actual_bits)
+    expected_order = torch.where(expected_bits < 0, -32768 - expected_bits, expected_bits)
+    absolute_close = (actual - expected).abs() <= 1e-5
+    actual_order = torch.where(absolute_close, expected_order, actual_order)
+    compare = ratio_allclose(atol=1.0, rtol=0.0, max_error_ratio=0)
+    passed, detail = compare(actual_order.float(), expected_order.float(), **kwargs)
+    if not passed:
+        return False, f"BF16 logit ULP comparison failed: {detail}"
+    actual_tokens = actual[:, :LOCAL_VOCAB].argmax(dim=-1)
+    expected_tokens = expected[:, :LOCAL_VOCAB].argmax(dim=-1)
+    if not torch.equal(actual_tokens, expected_tokens):
+        return False, "local greedy token indices differ"
+    return True, ""
+
+
+def run_logits_case(options, device_id):
     from functools import lru_cache
 
-    from golden import TensorSpec, ratio_allclose, run
+    from golden import TensorSpec, run
 
     if not 0 <= options.shard < TP_SIZE:
         raise ValueError(f"--shard must be in [0, {TP_SIZE})")
@@ -419,16 +420,16 @@ def run_fp32_case(options, device_id):
     def inputs():
         generator = torch.Generator().manual_seed(options.seed)
         x = component_hidden(options, D, generator)
-        weight = torch.zeros(FP32_HEAD_VOCAB_PAD, D, dtype=torch.float32)
+        weight = torch.zeros(HEAD_VOCAB_PAD, D, dtype=torch.bfloat16)
         if options.checkpoint is None:
-            weight[:LOCAL_VOCAB] = (torch.randn(LOCAL_VOCAB, D, generator=generator) * 0.02).bfloat16().float()
+            weight[:LOCAL_VOCAB] = (torch.randn(LOCAL_VOCAB, D, generator=generator) * 0.02).bfloat16()
             norm = torch.ones(D, dtype=torch.bfloat16)
         else:
             checkpoint = Checkpoint(options.checkpoint)
             rows = slice(options.shard * LOCAL_VOCAB, (options.shard + 1) * LOCAL_VOCAB)
             head_name = "lm_head.weight"
             norm_names = ("model.language_model.norm.weight", "model.norm.weight")
-            if options.case == "mtp_fp32":
+            if options.case == "mtp_logits":
                 layer = FLASH.mtp_layer_id
                 norm_names = (
                     f"model.language_model.layers.{layer}.shared_head.norm.weight",
@@ -437,33 +438,26 @@ def run_fp32_case(options, device_id):
             names = [name for name in norm_names if name in checkpoint]
             if len(names) != 1:
                 raise ValueError(f"checkpoint norm must resolve exactly once: expected one of {norm_names}")
-            if options.case == "mtp_fp32":
+            if options.case == "mtp_logits":
                 head_name = names[0].replace("norm.weight", "head.weight")
-            weight[:LOCAL_VOCAB] = checkpoint.read(head_name, (rows, slice(None))).float()
+            weight[:LOCAL_VOCAB] = checkpoint.read(head_name, (rows, slice(None))).bfloat16()
             norm = checkpoint.read(names[0])
         return {"x": x, "norm_weight": norm, "weight": weight}
 
     specs = [
         TensorSpec("x", (options.tokens, D), torch.bfloat16, init_value=lambda: inputs()["x"]),
         TensorSpec("norm_weight", (D,), torch.bfloat16, init_value=lambda: inputs()["norm_weight"]),
-        TensorSpec("weight", (FP32_HEAD_VOCAB_PAD, D), torch.float32, init_value=lambda: inputs()["weight"]),
-        TensorSpec("logits", (options.tokens, FP32_HEAD_VOCAB_PAD), torch.float32),
+        TensorSpec("weight", (HEAD_VOCAB_PAD, D), torch.bfloat16, init_value=lambda: inputs()["weight"]),
+        TensorSpec("logits", (options.tokens, HEAD_VOCAB_PAD), torch.float32),
     ]
 
-    def golden(values):
-        if options.case == "mtp_fp32":
-            normalized = rms_norm(values["x"], values["norm_weight"]).double()
-            values["logits"].copy_((normalized @ values["weight"].double().t()).float())
-        else:
-            golden_lm_head_logits(values)
-
-    fn = lm_head_mtp_logits_test if options.case == "mtp_fp32" else lm_head_logits_test
+    fn = lm_head_mtp_logits_test if options.case == "mtp_logits" else lm_head_logits_test
     result = run(
         fn=fn,
         specs=specs,
-        golden_fn=golden,
+        golden_fn=golden_lm_head_logits,
         config=dict(backend_type=options.backend_type, execution_mode=options.execution_mode, device_id=device_id),
-        compare_fn={"logits": ratio_allclose(atol=1e-05, rtol=1e-05, max_error_ratio=0)},
+        compare_fn={"logits": compare_bf16_logits},
         compile_only=options.compile_only,
     )
     print(result)
@@ -476,9 +470,9 @@ def golden_lm_head(
     norm_weight: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
-    """Return full local FP32 logits after the BF16 RMSNorm boundary."""
+    """Return BF16-rounded local logits widened to FP32."""
     normalized = rms_norm(x, norm_weight).to(torch.bfloat16)
-    return torch.nn.functional.linear(normalized.float(), weight.float())
+    return torch.nn.functional.linear(normalized.float(), weight.float()).bfloat16().float()
 
 
 def golden_lm_head_tp_reduce(local_max_value: torch.Tensor, local_argmax: torch.Tensor):
@@ -647,14 +641,14 @@ def main():
     from golden import run
 
     cases = ("decode", "selection", "ties", "negative_tail", "padding")
-    fp32_cases = ("fp32", "mtp_fp32")
+    logits_cases = ("logits", "mtp_logits")
     parser = argparse.ArgumentParser(description="GLM-5.3-Flash local LM-head and TP reduction validation")
     parser.add_argument("-p", "--platform", dest="backend_type", default="a2a3", choices=["a2a3"])
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=",".join(str(i) for i in range(EP_SIZE)))
     parser.add_argument("--tp", type=int, default=TP_SIZE)
     parser.add_argument("--ep", type=int, default=EP_SIZE)
-    parser.add_argument("--case", choices=("all", *cases, "tp_reduce", *fp32_cases), default="all")
+    parser.add_argument("--case", choices=("all", *cases, "tp_reduce", *logits_cases), default="all")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--hidden-input", type=Path)
@@ -664,18 +658,18 @@ def main():
     args = parser.parse_args()
     device_ids = [int(device) for device in args.device.split(",")]
     if args.checkpoint is not None or args.hidden_input is not None:
-        if args.case not in fp32_cases:
-            parser.error("--checkpoint and --hidden-input require --case fp32 or mtp_fp32")
+        if args.case not in logits_cases:
+            parser.error("--checkpoint and --hidden-input require --case logits or mtp_logits")
     if args.tokens < 1:
         parser.error("--tokens must be positive")
-    if args.case in fp32_cases:
-        run_fp32_case(args, device_ids[0])
+    if args.case in logits_cases:
+        run_logits_case(args, device_ids[0])
         return
     if args.case in ("all", "tp_reduce") and len(device_ids) != args.ep:
         parser.error(f"TP validation needs exactly {args.ep} devices")
     if args.case == "all":
         # Separate processes own the single-device and distributed runtime lifetimes.
-        for case in (*cases, *fp32_cases, "tp_reduce"):
+        for case in (*cases, *logits_cases, "tp_reduce"):
             devices = args.device if case == "tp_reduce" else str(device_ids[0])
             command = [
                 sys.executable,
@@ -691,7 +685,7 @@ def main():
                 "--case",
                 case,
             ]
-            if case in fp32_cases:
+            if case in logits_cases:
                 command.extend(("--tokens", str(args.tokens), "--shard", str(args.shard)))
             if args.execution_mode:
                 command.append("--sim")

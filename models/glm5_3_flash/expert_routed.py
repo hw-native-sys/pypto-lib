@@ -18,7 +18,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import (
-    EP_SIZE, FLASH, MOE_INTER, N_EXPERTS, N_LOCAL_EXPERTS, D, Glm53FlashConfig,
+    EP_SIZE, FLASH, MOE_INTER, N_EXPERTS, N_LOCAL_EXPERTS, TP_SIZE, D, Glm53FlashConfig,
 )
 from models.glm5_3_flash.dense_mlp import DenseTensors, dense_mlp_forward, swiglu_limited
 from models.glm5_3_flash.elementwise import accurate_divide, accurate_sigmoid
@@ -98,6 +98,10 @@ def expert_routed(
                 x_scale_col = pl.slice(x_scale, [RECV_TILE, 1], [flat_row, 0], valid_shape=[valid_rows, 1])
                 gate_w_scale = pl.reshape(w_gate_up_scale[local_e, a0:a0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
                 up_w_scale = pl.reshape(w_gate_up_scale[local_e, MOE_INTER + a0:MOE_INTER + a0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                gate_w_bf16 = pl.cast(gate_w_scale, pl.BF16, mode="rint")
+                up_w_bf16 = pl.cast(up_w_scale, pl.BF16, mode="rint")
+                gate_w_scale = pl.cast(gate_w_bf16, pl.FP32)
+                up_w_scale = pl.cast(up_w_bf16, pl.FP32)
                 gate_fp32 = pl.cast(gate_up_i32[:, a0:a0 + ACT_INTER_TILE], target_type=pl.FP32, mode="none")
                 up_fp32 = pl.cast(gate_up_i32[:, MOE_INTER + a0:MOE_INTER + a0 + ACT_INTER_TILE], target_type=pl.FP32, mode="none")
                 gate_fp32 = pl.col_expand_mul(pl.row_expand_mul(gate_fp32, x_scale_col), gate_w_scale)
@@ -112,21 +116,21 @@ def expert_routed(
                 h_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_quant"):
-                row_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                row_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=0.0)
                 for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
                     h_chunk = h_fp32[:, k0 : k0 + QUANT_TILE]
                     chunk_amax = pl.reshape(pl.row_max(pl.abs(h_chunk)), [1, RECV_TILE])
                     row_amax = pl.maximum(row_amax, chunk_amax)
                 amax_buffer = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
-                amax_buffer[:, :] = row_amax
-                numerator = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
-                numerator[:, :] = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+                zero_rows = pl.cmp(row_amax, 0.0, cmp_type=0)
+                amax_buffer[:, :] = pl.add(row_amax, zero_rows)
                 row_scale_q = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
-                row_scale_q[:, :] = accurate_divide(numerator, amax_buffer)
                 one = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
                 one[:, :] = pl.full([1, RECV_TILE], dtype=pl.FP32, value=1.0)
+                inverse_maximum = accurate_divide(one, amax_buffer)
+                row_scale_q[:, :] = pl.mul(inverse_maximum, INT8_SCALE_MAX)
                 row_scale_dq = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
-                row_scale_dq[:, :] = accurate_divide(one, row_scale_q)
+                row_scale_dq[:, :] = pl.mul(row_amax, 1.0 / INT8_SCALE_MAX)
                 h_scale_dq[:, :] = pl.reshape(row_scale_dq, [RECV_TILE, 1])
                 row_scale_q_col = pl.reshape(row_scale_q, [RECV_TILE, 1])
                 for q_idx in pl.pipeline(0, MOE_INTER // QUANT_TILE, stage=2):
@@ -156,9 +160,12 @@ def expert_routed(
                     d0 = d_base + dg * D_ACT_TILE
                     y_2d_i32 = y_i32[:, d0 : d0 + D_ACT_TILE]
                     w2_scale_chunk = pl.reshape(w_down_scale[local_e, d0:d0 + D_ACT_TILE], [1, D_ACT_TILE])
+                    w2_scale_bf16 = pl.cast(w2_scale_chunk, pl.BF16, mode="rint")
+                    w2_scale_chunk = pl.cast(w2_scale_bf16, pl.FP32)
                     y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                     y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_scale_dq), w2_scale_chunk)
-                    y_2d = pl.row_expand_mul(y_2d, w_row_blk)
+                    y_bf16 = pl.cast(y_2d, pl.BF16, mode="rint")
+                    y_2d = pl.row_expand_mul(pl.cast(y_bf16, pl.FP32), w_row_blk)
                     y_valid = pl.set_validshape(y_2d, valid_rows, D_ACT_TILE)
                     output[flat_row:flat_row + RECV_TILE, d0:d0 + D_ACT_TILE] = y_valid
 
@@ -329,9 +336,9 @@ def golden_expert_routed_fn(tensors):
     x_int8 = tensors["x_int8"].to(torch.int32)
     x_scale = tensors["x_scale"].float()
     gate_up_i8 = tensors["w_gate_up"].to(torch.int32)
-    gate_up_scale = tensors["w_gate_up_scale"].float()
+    gate_up_scale = tensors["w_gate_up_scale"].bfloat16().float()
     w_down_i8 = tensors["w_down"].to(torch.int32)
-    w_down_scale = tensors["w_down_scale"].float()
+    w_down_scale = tensors["w_down_scale"].bfloat16().float()
     expert_offsets = tensors["expert_offsets"].to(torch.int64)
     route_weights = tensors["route_weights"].float()
 
@@ -355,7 +362,7 @@ def golden_expert_routed_fn(tensors):
         h_i8, h_sd = quantize_per_token_int8(h)
         out_i = h_i8.to(torch.int32) @ w_down_i8[e].T
         out = out_i.float() * h_sd * w_down_scale[e].view(1, -1)
-        output[start:end] = out * route_weights[start:end]
+        output[start:end] = out.bfloat16().float() * route_weights[start:end]
 
     tensors["output"][:] = output.to(torch.float32)
 
@@ -445,6 +452,9 @@ def build_checkpoint_moe_specs(checkpoint, layer_id, *, capacity, num_tokens, nu
     """
     from golden import ScalarSpec, TensorSpec
 
+    if TP_SIZE != EP_SIZE:
+        raise ValueError("standalone MoE requires TP=EP with DP1")
+    shared_inter = MOE_INTER // TP_SIZE
     if num_ranks != EP_SIZE:
         raise ValueError(f"checkpoint fixture requires the compiled EP size {EP_SIZE}, got {num_ranks}")
     if not 0 <= num_tokens <= capacity:
@@ -459,6 +469,8 @@ def build_checkpoint_moe_specs(checkpoint, layer_id, *, capacity, num_tokens, nu
             raise ValueError(f"hidden must be a BF16 tensor with shape {expected}")
         if hidden.device.type != "cpu":
             raise ValueError("hidden must be a CPU tensor")
+        if not torch.equal(hidden, hidden[:1].expand_as(hidden)):
+            raise ValueError("standalone TP MoE hidden inputs must be replicated across ranks")
 
     checkpoint = Checkpoint(checkpoint) if not isinstance(checkpoint, Checkpoint) else checkpoint
     if not FLASH.first_k_dense_replace <= layer_id < FLASH.num_hidden_layers:
@@ -468,7 +480,7 @@ def build_checkpoint_moe_specs(checkpoint, layer_id, *, capacity, num_tokens, nu
     if hidden is None:
 
         generator = torch.Generator().manual_seed(7)
-        embeddings = torch.randn(num_ranks, capacity, D, generator=generator).bfloat16()
+        embeddings = torch.randn(1, capacity, D, generator=generator).bfloat16().expand(num_ranks, capacity, D)
         mhc = checkpoint.mhc(layer_id, "ffn")
         with torch.no_grad():
             for rank in range(num_ranks):
@@ -487,14 +499,14 @@ def build_checkpoint_moe_specs(checkpoint, layer_id, *, capacity, num_tokens, nu
         "w_gate_up_scale": ((N_LOCAL_EXPERTS, 2 * MOE_INTER), torch.float32),
         "w_down": ((N_LOCAL_EXPERTS, D, MOE_INTER), torch.int8),
         "w_down_scale": ((N_LOCAL_EXPERTS, D), torch.float32),
-        "shared_w_gate_up": ((2 * MOE_INTER, D), torch.int8),
-        "shared_w_gate_up_scale": ((2 * MOE_INTER,), torch.float32),
-        "shared_w_down": ((D, MOE_INTER), torch.int8),
+        "shared_w_gate_up": ((2 * shared_inter, D), torch.int8),
+        "shared_w_gate_up_scale": ((2 * shared_inter,), torch.float32),
+        "shared_w_down": ((D, shared_inter), torch.int8),
         "shared_w_down_scale": ((D,), torch.float32),
     }
     weights = {}
     for rank in range(num_ranks):
-        local = checkpoint.ffn(layer_id, ep_rank=rank, ep=num_ranks)
+        local = checkpoint.ffn(layer_id, tp_rank=rank, tp=TP_SIZE, ep_rank=rank, ep=num_ranks)
         if local.keys() != layout.keys():
             raise ValueError("checkpoint FFN tensors differ from the composed MoE input names")
         for name, (shape, dtype) in layout.items():
@@ -521,7 +533,7 @@ def build_checkpoint_moe_specs(checkpoint, layer_id, *, capacity, num_tokens, nu
     return specs
 
 
-if __name__ == "__main__":
+def main():
     import argparse
 
     from golden import ratio_reldiff, run
@@ -536,6 +548,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
     if args.num_tokens < 1:
         parser.error("--num-tokens must be positive")
@@ -547,6 +560,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.num_tokens),
         golden_fn=golden_expert_routed_fn,
         config=dict(dump_passes=args.dump_passes, backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane),
+        compile_only=args.compile_only,
         rtol=0.001,
         atol=0.001,
         compare_fn={"output": ratio_reldiff(diff_thd=0.003, pct_thd=0.01)},
@@ -555,3 +569,7 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

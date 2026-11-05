@@ -106,13 +106,12 @@ The indexer uses separate dynamic symbols for independent pool dimensions:
 | --- | --- |
 | `POOL_EVENTS_DYN` | Pool-write events in `pool_token_slots`, `pool_slots`, and `pool_valid` |
 | `POOL_PAGES_DYN` | Entries in the gathered `pool_blocks` page table |
-| `POOLS_DYN` | Columns in `index_scores` |
-| `INDEX_BLOCKS_DYN` | Physical blocks backing `pool_cache` and `pool_scale` |
+| `INDEX_BLOCKS_DYN` | Physical blocks backing `pool_cache` |
 
-For example, the default decode fixture has 16 write events, 1024 page-table
-entries, and 4096 score columns. A shared dynamic symbol requires equal
-extents; binding these quantities to one symbol can underallocate the gather
-scratch. Its live row count is `POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE`.
+For example, the default decode fixture has 16 write events and 25 page-table
+entries. A shared dynamic symbol requires equal extents; binding these
+quantities to one symbol can underallocate the gather scratch. Its live row
+count is `POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE`.
 
 ## Deployment target
 
@@ -153,7 +152,7 @@ NPU vocabulary head. They share the operators in `layer.py`. Serving owns
 allocation, submission, completion and request state; cache reset uses a
 separate auxiliary program.
 
-Prefill uses `--capacity` query rows; decode uses sixteen stable request slots.
+Prefill uses `--capacity` query rows; decode uses thirty-two stable request slots.
 MoE owner buffers retain `ceil(capacity / (TP * 16)) * 16` rows. Query, owner,
 request and head buffers have distinct tensor contracts. Composed KDA and
 sparse-attention operators derive query, request and state-pool extents from
@@ -165,7 +164,7 @@ or a later revision containing the dependent-shape parameter cloning fix from
 
 `forward_parameter_names()` defines argument order, `forward_tensor_layouts()`
 provides per-rank shapes and dtypes, and `forward_geometry()` records ABI version
-9 and capacities. Each invocation takes one `forward_epoch`; the two phases
+11 and capacities. Each invocation takes one `forward_epoch`; the four phases
 own independent communication windows and counters. Decode gathers embeddings
 from resident BF16 vocabulary shards on the NPU before entering the backbone.
 Prefill keeps host-provided embeddings.
@@ -196,13 +195,13 @@ At completed 128-token boundaries, the convolution and recurrent kernels write
 the assigned checkpoint rows. A prefix hit reads those rows without modifying
 them; the new request continues in its private working row. All supported
 prefill/decode entries use this same metadata contract, recorded by forward ABI
-version 9. Earlier runtime artifacts require recompilation.
+version 11. Earlier runtime artifacts require recompilation.
 
 
 The serving runner executes NPU final RMSNorm and full-vocabulary
-projection for its 16 returned rows. BF16 hidden rows and final norm weights
-are widened to FP32; normalized activations, projection weights and logits
-remain FP32. Each rank owns a vocabulary shard, padded with zero weights to a
+projection for its 16 returned rows. The head retains BF16 weights and rounds
+the GEMM result to BF16 before widening it to FP32, matching the reference
+head's dtype boundary. Each rank owns a vocabulary shard, padded with zero weights to a
 multiple of 64 rows: 19,392 rows at TP8 and 9,728 at TP16. The additional device weight is
 317,718,528 bytes (303 MiB) per rank at TP8 or 159,383,552 bytes (152 MiB) at
 TP16, excluding workspace and runtime overhead. The host strips each shard's
@@ -232,8 +231,8 @@ All 25 saved request outputs remain bitwise identical.
 The query `--capacity` and per-request `--max-seq-len` are independent compiled
 dimensions. Query capacity bounds the sum of new chunk tokens; context capacity
 bounds logical request lengths. `--cache-tokens` independently bounds the
-shared physical page pool, aligned to 128 tokens. Its default is the smaller
-of sixteen full request contexts and 1,048,576 aggregate tokens. A request may
+shared physical page pool, aligned to 640 tokens. Its default is the smaller
+of thirty-two full request contexts and 1,048,960 aggregate tokens. A request may
 grow to the configured context limit only while physical pages remain free.
 Allocation reserves all cache groups for a request atomically. Request release
 drops ownership; shared immutable pages remain eligible for prefix reuse. Indexer pool-close events include
@@ -257,7 +256,7 @@ step's `seconds` starts after input preparation and H2D copies. Separate
 including dispatch, completion waits and output processing, rather than
 device-only kernel times.
 
-Serving accepts 1–16 active requests and uses the common scheduler to split
+Serving accepts 1–32 active requests and uses the common scheduler to split
 prefill into chunks, sample completed prompts, batch incremental decode and
 release finished/cancelled requests. Configure the new-token budget with
 `--max-num-batched-tokens`, the per-request context with `--max-model-len`, and
@@ -694,7 +693,7 @@ matrix as the indexer golden; it is not the checkpoint's hidden-size rotation.
 `ResidentPrefillWeights.iter_rank_uploads(rank)` yields
 `(stack_name, cpu_tensor, byte_offset)` payloads. Layered norm, mHC, router,
 KDA, MLA, Indexer and MoE stacks arrive one layer slice at a time. Dense
-stacks and unstacked residents (`norm.final_norm`, `mtp.*` and `hadamard`)
+stacks and unstacked residents (`norm.final_norm` and `mtp.*`)
 each arrive as a whole payload at offset 0. The serving runner allocates
 the destination tensors and performs device copies; the lib payload planner
 opens no device worker or execution context.
@@ -725,8 +724,8 @@ model = checkpoint.model(tp_rank=0, tp=16, ep_rank=0, ep=16)
 its other entries are `embedding`, `lm_head`, `final_norm`, `vocab_start` and
 `vocab_stop`. Embedding and LM-head rows are TP-sharded; the final norm is
 replicated. Dense FFNs are TP-sharded along their intermediate dimension.
-Routed experts are EP-sharded by expert ID, and shared experts remain complete
-on every EP rank. Attention follows the existing head partition; the indexer
+Routed experts are EP-sharded by expert ID, and the shared expert is TP-sharded
+along its intermediate dimension. Attention follows the existing head partition; the indexer
 remains replicated. Prefill and decode can reuse the same staged weights.
 
 Shared-expert INT8 gate/up and down matrices are packed into NZ order once
@@ -739,7 +738,7 @@ contract and consumes those same packed bytes. The 43 stored MoE slices include
 the reserved MTP tail; the backbone executes 42 MoE layers.
 Standalone/default/checkpoint FFN fixtures pack the same shared
 inputs, and their goldens only undo the layout before the existing reference math.
-Runtime manifest version 9 records the complete prefill/decode ABI, phase
+Runtime manifest version 11 records the complete prefill/decode ABI, phase
 geometries, head backend, shared INT8 NZ and native MLA contracts; recompile
 older runtime directories before using these uploaded weights.
 

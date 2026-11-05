@@ -28,6 +28,7 @@ import torch
 import models.glm5_3_flash.config as C
 from models.glm5_3_flash.all_reduce import tp_all_reduce
 from models.glm5_3_flash.attention import (
+    MLA_CACHE_WIDTH,
     MlaTensors, mla_cache_write, mla_epilog_w8a8, mla_prolog_w8a8, prefill_sparse_attn, synthetic_mla,
     topk_attention_mask,
 )
@@ -44,21 +45,22 @@ from models.glm5_3_flash.expert_routed import (
     ExpertProvider, SyntheticExpertProvider, build_checkpoint_moe_specs, expert_routed, moe_forward,
 )
 from models.glm5_3_flash.expert_shared import (
-    SH_M_TILE, SH_ROW_PAD, expert_shared, golden_expert_shared_fn, moe_layer_add,
+    MOE_INTER as SHARED_INTER,
+    SH_M_TILE, SH_ROW_PAD, expert_shared, golden_moe_tp_combine, moe_tp_combine,
 )
 from models.glm5_3_flash.gate import (
     GATE_M_TILE, SCORE_PAD, TOPK_PAD, RouterTensors, gate, make_correction_bias, moe_gate, router_forward,
 )
 from models.glm5_3_flash.indexer import (
-    POOL_SCALE_WIDTH, POOL_VALID_WIDTH, SORT_TILE, IndexerTensors, indexer_cache_write, indexer_expand,
-    indexer_pool_write, indexer_proj, indexer_score, indexer_topk, reference_indexer_topk,
+    POOL_VALID_WIDTH, SORT_TILE, IndexerTensors, indexer_cache_write, indexer_expand,
+    indexer_pool_write, indexer_proj, indexer_select, reference_indexer_topk,
     synthetic_indexer,
 )
 from models.glm5_3_flash.kda import (
-    BETA_PAD, CHUNK_TILE, CONV_DIM, STATE_LEN, KdaTensors, kda_conv_prefill, kda_forward, kda_output,
+    BETA_PAD, CHUNK_TILE, CONV_DIM, STATE_LEN, kda_conv_recurrent, recurrent_kda, KdaTensors, kda_conv_prefill, kda_forward, kda_output,
     kda_projection, prefill_kda, stack_conv_weight, synthetic_kda,
 )
-from models.glm5_3_flash.lm_head import FP32_HEAD_VOCAB_PAD, lm_head_logits
+from models.glm5_3_flash.lm_head import HEAD_VOCAB_PAD, lm_head_logits
 from models.glm5_3_flash.mhc import (
     MhcTensors, combine_streams, hc_mixes, hc_pre, hc_seed, mhc_head, mhc_mapping, mhc_mixes, mhc_post,
     mhc_pre, plain_residual_post, plain_residual_pre, seed_hc_streams, synthetic_mhc,
@@ -74,7 +76,7 @@ from models.glm5_3_flash.utils import _assert_close, _prefill_model, _randn, gen
 MAX_BATCH_PER_DP = 32
 PREFILL_MAX_TOKENS = 8192
 _shape_parser = argparse.ArgumentParser(add_help=False)
-_shape_parser.add_argument("--capacity", type=int, default=2048)
+_shape_parser.add_argument("--capacity", type=int, default=8192)
 _shape_parser.add_argument("--max-seq-len", type=int)
 _shape_parser.add_argument("--cache-tokens", type=int)
 _shape_parser.add_argument("--tokens", type=int)
@@ -82,7 +84,7 @@ _shape_options = _shape_parser.parse_known_args()[0]
 CAPACITY = _shape_options.capacity
 MAX_SEQ_LEN = CAPACITY if _shape_options.max_seq_len is None else _shape_options.max_seq_len
 _default_cache_tokens = min(
-    16 * ((MAX_SEQ_LEN + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE) * C.BLOCK_SIZE, C.FLASH.max_position_embeddings,
+    32 * ((MAX_SEQ_LEN + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE) * C.BLOCK_SIZE, ((C.FLASH.max_position_embeddings + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE) * C.BLOCK_SIZE,
 )
 CACHE_TOKENS = _default_cache_tokens if _shape_options.cache_tokens is None else _shape_options.cache_tokens
 T_MOE = ((CAPACITY + C.TP_SIZE * 16 - 1) // (C.TP_SIZE * 16)) * 16
@@ -97,8 +99,12 @@ MLA_STACK_LAYERS = len(MODEL.indexer_layer_ids)
 MOE_STACK_LAYERS = MODEL.num_checkpoint_layers - DENSE_NUM_LAYERS
 NORM_STACK_LAYERS = MODEL.num_checkpoint_layers
 ROUTER_STACK_LAYERS = MOE_STACK_LAYERS
-BATCH = 16  # first-light packed batch: 16 prompts, one batch for all ranks
-LOGIT_ROWS = MAX_BATCH_PER_DP  # 32; covers BATCH with headroom (design S3.4)
+BATCH = 32
+SPECULATIVE_TOKENS = 5
+VERIFY_QUERY_WIDTH = SPECULATIVE_TOKENS + 1
+INDEX_TAIL_CAPACITY = INDEX_KPOOL + SPECULATIVE_TOKENS
+INDEX_RAW_ROWS = ((BATCH * INDEX_TAIL_CAPACITY + CAPACITY + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+LOGIT_ROWS = BATCH * (SPECULATIVE_TOKENS + 1)
 QUERY_ROWS_DYN = pl.dynamic("GLM53_QUERY_ROWS_DYN")
 LOCAL_DENSE_INTER = DENSE_INTER // TP_SIZE
 TABLE_MAX = (MAX_SEQ_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -114,17 +120,19 @@ POOL_AXIS = (
     (max(LATENT_ROWS // INDEX_KPOOL, BATCH * TABLE_MAX * (BLOCK_SIZE // INDEX_KPOOL),
          CAPACITY // INDEX_KPOOL + BATCH) + 2 * SORT_TILE - 2) // SORT_TILE
 ) * SORT_TILE
+POOL_EVENTS = ((CAPACITY + INDEX_KPOOL - 1) // INDEX_KPOOL + BATCH + 15) // 16 * 16
+POOL_PAGE_ROWS = (POOL_AXIS + INDEX_STATE_BLOCK_SIZE - 1) // INDEX_STATE_BLOCK_SIZE
 POOL_TABLE_ROWS = LATENT_ROWS // INDEX_KPOOL + BLOCK_SIZE // INDEX_KPOOL  # final raw-page span is scratch
 KDA_STATE_BLOCKS = min(TABLE_MAX, (CAPACITY + BLOCK_SIZE - 1) // BLOCK_SIZE + 2)
 KDA_STATE_PAGES = BATCH * (KDA_STATE_BLOCKS + 2)
-KDA_STATE_COLUMNS = 2 + (CAPACITY + CHUNK_TILE - 1) // CHUNK_TILE
-KDA_ROWS = BATCH + KDA_STATE_PAGES  # private working rows followed by grouped checkpoints
+KDA_STATE_COLUMNS = 2 + max(SPECULATIVE_TOKENS + 1, (CAPACITY + CHUNK_TILE - 1) // CHUNK_TILE)
+KDA_CHECKPOINT_BASE = BATCH * (SPECULATIVE_TOKENS + 2)
+KDA_ROWS = KDA_CHECKPOINT_BASE + KDA_STATE_PAGES
 POOL_TABLE_MAX = (MAX_SEQ_LEN + INDEX_KPOOL * INDEX_STATE_BLOCK_SIZE - 1) // (INDEX_KPOOL * INDEX_STATE_BLOCK_SIZE)
 CACHE_LAYOUTS = {
-    "mla_latent_cache": ((DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA), torch.bfloat16),
-    "index_raw_cache": ((DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH), torch.float32),
-    "index_pool_cache": ((DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM), torch.int8),
-    "index_pool_scale": ((DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH), torch.float32),
+    "mla_latent_cache": ((DSA_NUM_LAYERS, LATENT_ROWS, MLA_CACHE_WIDTH), torch.int8),
+    "index_raw_cache": ((DSA_NUM_LAYERS, INDEX_RAW_ROWS, INDEX_STATE_WIDTH), torch.float32),
+    "index_pool_cache": ((DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM), torch.bfloat16),
     "kda_conv_state": ((KDA_NUM_LAYERS, KDA_ROWS, STATE_LEN, CONV_DIM), torch.bfloat16),
     "kda_recurrent_state": ((KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM), torch.float32),
 }
@@ -134,10 +142,10 @@ RESIDENT_TOTAL_CAP = N_RANKS * RESIDENT_ROUTES_PER_SRC
 RESIDENT_GROUPED_CAP = RESIDENT_TOTAL_CAP + N_LOCAL_EXPERTS * (ROW_TILE - 1)
 
 
-FORWARD_ABI_VERSION = 9
-FORWARD_PROGRAMS = ("prefill", "decode")
+FORWARD_ABI_VERSION = 11
+FORWARD_PROGRAMS = ("prefill", "decode", "verify", "mtp")
 _COMMON_PARAMETERS = (
-    'embedding_rows', 'query_start_loc', 'kda_state_rows', 'active_tokens', 'kda_tri_incl',
+    'embedding_rows', 'query_start_loc', 'kda_state_rows', 'active_tokens', 'execution_mode', 'target_feedback', 'target_feedback_last', 'mtp_feedback_last', 'mtp_feedback_indices', 'mtp_feedback_mode', 'mtp_skip_topk', 'mtp_enorm', 'mtp_hnorm', 'mtp_eh_proj', 'mtp_head_norm', 'mtp_lm_head_weight', 'mtp_selected_pools', 'mtp_selected_valid', 'kda_tri_incl',
     'kda_tri_strict', 'kda_head_onehot', 'kda_eye_wide', 'kda_w_q', 'kda_w_k', 'kda_w_v', 'kda_conv_q',
     'kda_conv_k', 'kda_conv_v', 'kda_w_f_a', 'kda_w_f_b', 'kda_w_g_a', 'kda_w_g_b', 'kda_w_b',
     'kda_dt_bias', 'kda_a_log', 'kda_o_norm', 'kda_w_o', 'mhc_attn_fn', 'mhc_attn_scale',
@@ -146,36 +154,51 @@ _COMMON_PARAMETERS = (
     'kda_recurrent_state', 'ws_attn_pre', 'ws_attn_post', 'ws_attn_res', 'ws_collapsed', 'ws_normed',
     'ws_attn_partial', 'ws_sublayer_out', 'ws_x_hc_mid', 'ws_ffn_pre', 'ws_ffn_post', 'ws_ffn_res',
     'ws_ffn_input', 'ws_ffn_partial', 'ws_ffn_out', 'kda_out', 'mixed_qkv', 'decay', 'beta', 'kda_q',
-    'kda_k', 'kda_v', 'dense_x_int8', 'request_ids', 'mla_slots', 'index_slots', 'seg_start',
+    'kda_k', 'kda_v', 'dense_x_int8', 'request_ids', 'mla_slots', 'index_slots', 'index_tail_slots', 'seg_start',
     'pool_count_tok', 'tail_start', 'tail_count', 'kv_len_tok', 'pool_token_slots', 'pool_slots',
     'pool_blocks', 'block_table', 'mla_w_q_a', 'mla_w_q_a_scale', 'mla_q_a_norm', 'mla_w_q_b',
     'mla_w_q_b_scale', 'mla_w_kv_a', 'mla_w_kv_a_scale', 'mla_kv_a_norm', 'mla_w_k', 'mla_w_v',
     'mla_w_o', 'mla_w_o_scale', 'idx_w_q_b', 'idx_w_k', 'idx_k_norm_w', 'idx_k_norm_b', 'idx_w_weights',
-    'idx_w_compress_gate', 'idx_compress_ape', 'hadamard', 'mla_latent_cache', 'index_raw_cache',
-    'index_pool_cache', 'index_pool_scale', 'dsa_query', 'attn_out', 'index_q', 'index_k',
-    'index_scores', 'selected_pools', 'selected_valid', 'router_gate_w', 'router_gate_bias',
+    'idx_w_compress_gate', 'idx_compress_ape', 'mla_latent_cache', 'index_raw_cache',
+    'index_pool_cache', 'dsa_query', 'attn_out', 'index_q', 'index_k',
+    'selected_pools', 'selected_valid', 'router_gate_w', 'router_gate_bias',
     'moe_w_gate_up', 'moe_w_gate_up_scale', 'moe_w_down', 'moe_w_down_scale', 'moe_shared_w_gate_up',
     'moe_shared_w_gate_up_scale', 'moe_shared_w_down', 'moe_shared_w_down_scale', 'logit_row_indices',
     'head_hidden', 'ws_x_hc_pair',
 )
 _QUERY_PARAMETERS = (
-    'embedding_rows', 'token_ids', 'ws_attn_pre', 'ws_attn_post', 'ws_attn_res', 'ws_collapsed', 'ws_normed',
+    'embedding_rows', 'token_ids', 'mtp_feedback_indices', 'ws_attn_pre', 'ws_attn_post', 'ws_attn_res', 'ws_collapsed', 'ws_normed',
     'ws_attn_partial', 'ws_sublayer_out', 'ws_x_hc_mid', 'ws_ffn_pre', 'ws_ffn_post', 'ws_ffn_res',
     'ws_ffn_input', 'ws_ffn_partial', 'ws_ffn_out', 'kda_out', 'mixed_qkv', 'decay', 'beta', 'kda_q',
-    'kda_k', 'kda_v', 'dense_x_int8', 'request_ids', 'mla_slots', 'index_slots', 'seg_start',
+    'kda_k', 'kda_v', 'dense_x_int8', 'request_ids', 'mla_slots', 'index_slots', 'index_tail_slots', 'seg_start',
     'pool_count_tok', 'tail_start', 'tail_count', 'kv_len_tok', 'dsa_query', 'attn_out', 'index_q',
-    'index_k', 'index_scores', 'selected_pools', 'selected_valid',
+    'index_k', 'selected_pools', 'selected_valid',
 )
 _HEAD_PARAMETERS = (
     'final_norm', 'lm_head_weight', 'logits',
 )
 _TENSOR_LAYOUTS = {
+    'target_feedback': ((CAPACITY, D), torch.bfloat16),
+    'target_feedback_last': ((BATCH, D), torch.bfloat16),
+    'mtp_feedback_last': ((BATCH, D), torch.bfloat16),
+    'mtp_feedback_indices': ((CAPACITY,), torch.int32),
+    'mtp_feedback_mode': ((1,), torch.int32),
+    'mtp_skip_topk': ((1,), torch.int32),
+    'mtp_enorm': ((D,), torch.bfloat16),
+    'mtp_hnorm': ((D,), torch.bfloat16),
+    'mtp_eh_proj': ((D, 2 * D), torch.bfloat16),
+    'mtp_head_norm': ((D,), torch.bfloat16),
+    'mtp_lm_head_weight': ((HEAD_VOCAB_PAD, D), torch.bfloat16),
+    'mtp_selected_pools': ((BATCH, KPOOL_SELECT_K), torch.int32),
+    'mtp_selected_valid': ((BATCH, KPOOL_SELECT_K), torch.int32),
+
     'embedding_rows': ((CAPACITY, D), torch.bfloat16),
     'token_ids': ((CAPACITY,), torch.int32),
     'embedding_weight': ((LOCAL_VOCAB, D), torch.bfloat16),
     'query_start_loc': ((BATCH + 1,), torch.int32),
     'kda_state_rows': ((BATCH, KDA_STATE_COLUMNS), torch.int32),
     'active_tokens': ((1,), torch.int32),
+    'execution_mode': ((1,), torch.int32),
     'kda_tri_incl': ((CHUNK_TILE, CHUNK_TILE), torch.float32),
     'kda_tri_strict': ((CHUNK_TILE, CHUNK_TILE), torch.float32),
     'kda_head_onehot': ((LOCAL_KDA_H, BETA_PAD), torch.float32),
@@ -234,14 +257,15 @@ _TENSOR_LAYOUTS = {
     'request_ids': ((CAPACITY,), torch.int32),
     'mla_slots': ((CAPACITY,), torch.int32),
     'index_slots': ((CAPACITY,), torch.int32),
+    'index_tail_slots': ((CAPACITY,), torch.int32),
     'seg_start': ((CAPACITY,), torch.int32),
     'pool_count_tok': ((CAPACITY,), torch.int32),
     'tail_start': ((CAPACITY,), torch.int32),
     'tail_count': ((CAPACITY,), torch.int32),
     'kv_len_tok': ((CAPACITY,), torch.int32),
-    'pool_token_slots': ((POOL_AXIS, INDEX_KPOOL), torch.int32),
-    'pool_slots': ((POOL_AXIS,), torch.int32),
-    'pool_blocks': ((POOL_AXIS,), torch.int32),
+    'pool_token_slots': ((POOL_EVENTS, INDEX_KPOOL), torch.int32),
+    'pool_slots': ((POOL_EVENTS,), torch.int32),
+    'pool_blocks': ((POOL_PAGE_ROWS,), torch.int32),
     'block_table': ((BATCH, TABLE_MAX), torch.int32),
     'mla_w_q_a': ((MLA_STACK_LAYERS, Q_LORA, D), torch.int8),
     'mla_w_q_a_scale': ((MLA_STACK_LAYERS, Q_LORA), torch.float32),
@@ -262,16 +286,13 @@ _TENSOR_LAYOUTS = {
     'idx_w_weights': ((MLA_STACK_LAYERS, D, INDEX_H), torch.bfloat16),
     'idx_w_compress_gate': ((MLA_STACK_LAYERS, D, INDEX_DIM), torch.bfloat16),
     'idx_compress_ape': ((MLA_STACK_LAYERS, INDEX_KPOOL, INDEX_DIM), torch.bfloat16),
-    'hadamard': ((INDEX_DIM, INDEX_DIM), torch.bfloat16),
-    'mla_latent_cache': ((DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA), torch.bfloat16),
-    'index_raw_cache': ((DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH), torch.float32),
-    'index_pool_cache': ((DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM), torch.int8),
-    'index_pool_scale': ((DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH), torch.float32),
+    'mla_latent_cache': ((DSA_NUM_LAYERS, LATENT_ROWS, MLA_CACHE_WIDTH), torch.int8),
+    'index_raw_cache': ((DSA_NUM_LAYERS, INDEX_RAW_ROWS, INDEX_STATE_WIDTH), torch.float32),
+    'index_pool_cache': ((DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM), torch.bfloat16),
     'dsa_query': ((CAPACITY, LOCAL_H, QK_DIM), torch.bfloat16),
     'attn_out': ((CAPACITY, LOCAL_H, V_DIM), torch.bfloat16),
     'index_q': ((CAPACITY, INDEX_H, INDEX_DIM), torch.bfloat16),
-    'index_k': ((CAPACITY, INDEX_DIM), torch.bfloat16),
-    'index_scores': ((CAPACITY, POOL_AXIS), torch.float32),
+    'index_k': ((CAPACITY, INDEX_DIM), torch.float32),
     'selected_pools': ((CAPACITY, KPOOL_SELECT_K), torch.int32),
     'selected_valid': ((CAPACITY, KPOOL_SELECT_K), torch.int32),
     'router_gate_w': ((ROUTER_STACK_LAYERS, N_EXPERTS, D), torch.bfloat16),
@@ -280,16 +301,16 @@ _TENSOR_LAYOUTS = {
     'moe_w_gate_up_scale': ((MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER), torch.float32),
     'moe_w_down': ((MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D, MOE_INTER), torch.int8),
     'moe_w_down_scale': ((MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D), torch.float32),
-    'moe_shared_w_gate_up': ((MOE_STACK_LAYERS, 2 * MOE_INTER, D), torch.int8),
-    'moe_shared_w_gate_up_scale': ((MOE_STACK_LAYERS, 2 * MOE_INTER), torch.float32),
-    'moe_shared_w_down': ((MOE_STACK_LAYERS, D, MOE_INTER), torch.int8),
+    'moe_shared_w_gate_up': ((MOE_STACK_LAYERS, 2 * SHARED_INTER, D), torch.int8),
+    'moe_shared_w_gate_up_scale': ((MOE_STACK_LAYERS, 2 * SHARED_INTER), torch.float32),
+    'moe_shared_w_down': ((MOE_STACK_LAYERS, D, SHARED_INTER), torch.int8),
     'moe_shared_w_down_scale': ((MOE_STACK_LAYERS, D), torch.float32),
     'logit_row_indices': ((LOGIT_ROWS,), torch.int32),
     'head_hidden': ((LOGIT_ROWS, D), torch.bfloat16),
     'ws_x_hc_pair': ((2 * CAPACITY, HC_MULT, D), torch.bfloat16),
     'final_norm': ((D,), torch.bfloat16),
-    'lm_head_weight': ((FP32_HEAD_VOCAB_PAD, D), torch.float32),
-    'logits': ((BATCH, FP32_HEAD_VOCAB_PAD), torch.float32),
+    'lm_head_weight': ((HEAD_VOCAB_PAD, D), torch.bfloat16),
+    'logits': ((LOGIT_ROWS, HEAD_VOCAB_PAD), torch.float32),
 }
 
 
@@ -329,7 +350,11 @@ def forward_geometry(kind: str) -> dict[str, int]:
     _check_phase(kind)
     return {
         "version": FORWARD_ABI_VERSION,
-        "query_capacity": CAPACITY if kind == "prefill" else BATCH,
+        # Verify runs the prefill orchestration body, whose per-token metadata
+        # tensors are statically CAPACITY-wide, so it declares prefill's query
+        # capacity and bounds its active rows through active_tokens instead.
+        # Only decode narrows the contract, to one row per request slot.
+        "query_capacity": BATCH if kind == "decode" else CAPACITY,
         "owner_capacity": T_MOE,
         "stream_capacity": CAPACITY,
         "request_capacity": BATCH,
@@ -376,9 +401,9 @@ def l2_prefill_layer(
     w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ],
-    shared_w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
-    shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
+    shared_w_gate_up: pl.Tensor[[2 * SHARED_INTER, D], pl.INT8, pl.NZ],
+    shared_w_gate_up_scale: pl.Tensor[[2 * SHARED_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[D, SHARED_INTER], pl.INT8, pl.NZ],
     shared_w_down_scale: pl.Tensor[[D], pl.FP32],
     y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
     lane_x: pld.DistributedTensor[[TOTAL_CAP, D], pl.INT8],
@@ -388,11 +413,13 @@ def l2_prefill_layer(
     x_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     slot_out: pld.DistributedTensor[[ROUTES_PER_SRC, D], pl.FP32],
     return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    shared_exchange: pld.DistributedTensor[[T, D], pl.FP32],
+    shared_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
 ):
-    """Run EP routed experts and a complete shared expert over this rank's tokens."""
+    """Run EP routed experts and reduce shared TP shards over replicated tokens."""
     x_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
 
     # Block head: normalized router and the INT8 view both branches reuse.
@@ -431,13 +458,13 @@ def l2_prefill_layer(
         num_tokens, my_rank, epoch, dispatch_tid,
     )
 
-    # Shared branch: the complete local expert uses this rank's activation rows.
+    # Shared branch: each TP rank computes its intermediate-channel shard.
     shared_out = pl.create_tensor([T, D], dtype=pl.FP32)
     expert_shared(
         x_int8, x_scale, shared_w_gate_up, shared_w_gate_up_scale, shared_w_down, shared_w_down_scale,
         shared_out,
     )
-    moe_layer_add(routed, shared_out, y, num_tokens)
+    moe_tp_combine(routed, shared_out, shared_exchange, shared_ready, y, num_tokens, my_rank, epoch)
     return y
 
 
@@ -451,15 +478,15 @@ def l3_prefill_layer(
     w_gate_up_scale: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     w_down: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_w_gate_up: pl.Tensor[[N_RANKS, 2 * MOE_INTER, D], pl.INT8],
-    shared_w_gate_up_scale: pl.Tensor[[N_RANKS, 2 * MOE_INTER], pl.FP32],
-    shared_w_down: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
+    shared_w_gate_up: pl.Tensor[[N_RANKS, 2 * SHARED_INTER, D], pl.INT8],
+    shared_w_gate_up_scale: pl.Tensor[[N_RANKS, 2 * SHARED_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[N_RANKS, D, SHARED_INTER], pl.INT8],
     shared_w_down_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     y: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
     num_ranks: pl.Scalar[pl.INT32],
 ):
-    """Launch independent token batches with EP routed weights and full shared replicas."""
+    """Launch replicated tokens with EP experts and shared TP weight shards."""
     lane_x_buf = pld.alloc_window_buffer([TOTAL_CAP, D], dtype=pl.INT8)
     lane_aux_buf = pld.alloc_window_buffer([TOTAL_CAP, AUX_PAD], dtype=pl.FP32)
     lane_count_buf = pld.alloc_window_buffer([N_RANKS, COUNT_PAD], dtype=pl.INT32)
@@ -467,6 +494,8 @@ def l3_prefill_layer(
     x_ready_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     slot_out_buf = pld.alloc_window_buffer([ROUTES_PER_SRC, D], dtype=pl.FP32)
     return_ready_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    shared_exchange_buf = pld.alloc_window_buffer([T, D], dtype=pl.FP32)
+    shared_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
 
     # Repeat the same inputs with successive EP epochs to exercise window reuse.
     # Each rank completes combine before starting its next dispatch.
@@ -479,12 +508,15 @@ def l3_prefill_layer(
             x_ready = pld.window(x_ready_buf, [N_RANKS, 1], dtype=pl.INT32)
             slot_out = pld.window(slot_out_buf, [ROUTES_PER_SRC, D], dtype=pl.FP32)
             return_ready = pld.window(return_ready_buf, [N_RANKS, 1], dtype=pl.INT32)
+            shared_exchange = pld.window(shared_exchange_buf, [T, D], dtype=pl.FP32)
+            shared_ready = pld.window(shared_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
             l2_prefill_layer(
                 x_mixed[r], norm_weight[r], gate_weight[r], correction_bias[r], w_gate_up[r],
                 w_gate_up_scale[r],
                 w_down[r], w_down_scale[r],
                 shared_w_gate_up[r], shared_w_gate_up_scale[r], shared_w_down[r], shared_w_down_scale[r],
-                y[r], lane_x, lane_aux, lane_count, count_ready, x_ready, slot_out, return_ready, num_tokens,
+                y[r], lane_x, lane_aux, lane_count, count_ready, x_ready, slot_out, return_ready,
+                shared_exchange, shared_ready, num_tokens,
                 r, pl.cast(call + 1, pl.INT32), device=r,
             )
 
@@ -594,18 +626,17 @@ def dsa_attention_sublayer(
     idx_w_weights: pl.Tensor[[D, INDEX_H], pl.BF16],
     idx_w_compress_gate: pl.Tensor[[D, INDEX_DIM], pl.BF16],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
-    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    latent_cache: pl.Tensor[[LATENT_ROWS, KV_LORA], pl.BF16],
-    raw_cache: pl.Tensor[[LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32],
-    pool_cache: pl.Tensor[[POOL_TABLE_ROWS, INDEX_DIM], pl.INT8],
-    pool_scale: pl.Tensor[[POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32],
+    latent_cache: pl.Tensor[[LATENT_ROWS, MLA_CACHE_WIDTH], pl.INT8],
+    raw_cache: pl.Tensor[[INDEX_RAW_ROWS, INDEX_STATE_WIDTH], pl.FP32],
+    pool_cache: pl.Tensor[[POOL_TABLE_ROWS, INDEX_DIM], pl.BF16],
     block_table: pl.Tensor[[BATCH, TABLE_MAX], pl.INT32],
     request_ids: pl.Tensor[[CAPACITY], pl.INT32],
     mla_slots: pl.Tensor[[CAPACITY], pl.INT32],
     index_slots: pl.Tensor[[CAPACITY], pl.INT32],
-    pool_token_slots: pl.Tensor[[POOL_AXIS, INDEX_KPOOL], pl.INT32],
-    pool_slots: pl.Tensor[[POOL_AXIS], pl.INT32],
-    pool_blocks: pl.Tensor[[POOL_AXIS], pl.INT32],
+    index_tail_slots: pl.Tensor[[CAPACITY], pl.INT32],
+    pool_token_slots: pl.Tensor[[POOL_EVENTS, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[POOL_EVENTS], pl.INT32],
+    pool_blocks: pl.Tensor[[POOL_PAGE_ROWS], pl.INT32],
     seg_start: pl.Tensor[[CAPACITY], pl.INT32],
     pool_count_tok: pl.Tensor[[CAPACITY], pl.INT32],
     tail_start: pl.Tensor[[CAPACITY], pl.INT32],
@@ -616,14 +647,13 @@ def dsa_attention_sublayer(
     kv_latent: pl.Tensor[[CAPACITY, KV_LORA], pl.BF16],
     attn_out: pl.Tensor[[CAPACITY, LOCAL_H, V_DIM], pl.BF16],
     index_q: pl.Tensor[[CAPACITY, INDEX_H, INDEX_DIM], pl.BF16],
-    index_k: pl.Tensor[[CAPACITY, INDEX_DIM], pl.BF16],
+    index_k: pl.Tensor[[CAPACITY, INDEX_DIM], pl.FP32],
     head_weights: pl.Tensor[[CAPACITY, INDEX_H], pl.FP32],
     gate_scores: pl.Tensor[[CAPACITY, INDEX_DIM], pl.FP32],
-    index_scores: pl.Tensor[[CAPACITY, POOL_AXIS], pl.FP32],
     selected_pools: pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32],
     selected_valid: pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32],
     topk_indices: pl.Tensor[[CAPACITY, TOPK_INDEX_WIDTH], pl.INT32],
-    pool_valid: pl.Tensor[[POOL_AXIS, POOL_VALID_WIDTH], pl.INT32],
+    pool_valid: pl.Tensor[[POOL_EVENTS, POOL_VALID_WIDTH], pl.INT32],
     attn_partial: pl.Tensor[[CAPACITY, D], pl.FP32],
     skip_topk: pl.Scalar[pl.INT32],
 ):
@@ -648,15 +678,23 @@ def dsa_attention_sublayer(
         index_q, index_k, head_weights, gate_scores, skip_topk,
     )
     indexer_cache_write(index_k, gate_scores, index_slots, raw_cache)
-    indexer_pool_write(
-        raw_cache, compress_ape, hadamard, pool_token_slots, pool_slots, pool_cache, pool_scale, pool_valid,
+    pool_tid = indexer_pool_write(
+        raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid,
     )
+    tail_tokens = pl.tensor.dim(index_slots, 0)
+    with pl.spmd(tail_tokens, name_hint="indexer_tail_publish", deps=[pool_tid]):
+        token = pl.tile.get_block_idx()
+        destination = pl.read(index_tail_slots, [token])
+        if destination >= 0:
+            source = pl.cast(pl.read(index_slots, [token]), pl.INDEX)
+            target = pl.cast(destination, pl.INDEX)
+            tail_row = pl.load(raw_cache, [source, 0], [1, INDEX_STATE_WIDTH])
+            pl.store(tail_row, [target, 0], raw_cache)
     if skip_topk == 0:
-        indexer_score(
-            index_q, hadamard, pool_cache, pool_scale, pool_blocks, head_weights, seg_start, pool_count_tok,
-            index_scores,
+        indexer_select(
+            index_q, pool_cache, pool_blocks, head_weights, seg_start, pool_count_tok,
+            selected_pools, selected_valid,
         )
-        indexer_topk(index_scores, seg_start, pool_count_tok, selected_pools, selected_valid)
     indexer_expand(selected_pools, selected_valid, tail_start, tail_count, kv_len_tok, topk_indices)
     prefill_sparse_attn(query, latent_cache, block_table, request_ids, w_k, w_v, topk_indices, attn_out)
     mla_epilog_w8a8(attn_out, w_o, w_o_scale, attn_partial)
@@ -698,6 +736,7 @@ def kda_attention_sublayer(
     value: pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     kda_out: pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     attn_partial: pl.Tensor[[CAPACITY, D], pl.FP32],
+    verification_mode: pl.Scalar[pl.INT32],
 ):
     """KDA projection -> causal conv -> chunked delta attention -> gated output."""
     stack_conv_weight(conv_q, conv_k, conv_v, conv_w)
@@ -705,11 +744,15 @@ def kda_attention_sublayer(
         normed,
         w_q, w_k, w_v, w_f_a, w_f_b, dt_bias, a_log, w_b, w_g_a, w_g_b, mixed_qkv, decay, beta, out_gate,
     )
-    kda_conv_prefill(mixed_qkv, conv_w, conv_state, query_start_loc, kda_state_rows, query, key, value)
-    prefill_kda(
-        query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, tri_incl,
-        tri_strict, head_onehot, eye_wide, kda_out,
-    )
+    if verification_mode == 1:
+        kda_conv_recurrent(mixed_qkv, conv_w, conv_state, query_start_loc, kda_state_rows, query, key, value)
+        recurrent_kda(query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, kda_out)
+    else:
+        kda_conv_prefill(mixed_qkv, conv_w, conv_state, query_start_loc, kda_state_rows, query, key, value)
+        prefill_kda(
+            query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, tri_incl,
+            tri_strict, head_onehot, eye_wide, kda_out,
+        )
 
 
 @pl.jit.inline
@@ -742,9 +785,9 @@ def moe_ffn_sublayer(
     w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ],
-    shared_w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
-    shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
+    shared_w_gate_up: pl.Tensor[[2 * SHARED_INTER, D], pl.INT8, pl.NZ],
+    shared_w_gate_up_scale: pl.Tensor[[2 * SHARED_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[D, SHARED_INTER], pl.INT8, pl.NZ],
     shared_w_down_scale: pl.Tensor[[D], pl.FP32],
     lane_x: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, AUX_PAD], pl.FP32],
@@ -769,7 +812,7 @@ def moe_ffn_sublayer(
     slab_src: pl.Tensor[[RESIDENT_GROUPED_CAP, 1], pl.INT32],
     expert_y: pl.Tensor[[RESIDENT_GROUPED_CAP, D], pl.FP32],
     routed: pl.Tensor[[T_MOE, D], pl.FP32],
-    shared_out: pl.Tensor[[T_MOE, D], pl.FP32],
+    shared_out: pl.Tensor[[CAPACITY, D], pl.FP32],
     y_local: pl.Tensor[[T_MOE, D], pl.FP32],
     ffn_partial: pl.Tensor[[CAPACITY, D], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -799,13 +842,27 @@ def moe_ffn_sublayer(
         expert_y, slab_route, slab_src, expert_offsets, expert_counts, routed, slot_out, return_ready,
         local_tokens, my_rank, epoch, dispatch_tid,
     )
-    if local_tokens > 0:
-        expert_shared(
-            x_int8, x_scale, shared_w_gate_up, shared_w_gate_up_scale, shared_w_down, shared_w_down_scale,
-            shared_out,
-        )
-    moe_layer_add(routed, shared_out, y_local, local_tokens)
-    scatter_local_tokens_fp32(y_local, ffn_partial, num_tokens, my_rank)
+    rows = pl.tensor.dim(ffn_input, 0)
+    shared_normed = pl.create_tensor([rows, D], dtype=pl.BF16)
+    shared_int8 = pl.create_tensor([rows, D], dtype=pl.INT8)
+    shared_scale = pl.create_tensor([rows, 1], dtype=pl.FP32)
+    rmsnorm_quant(ffn_input, post_norm_w, shared_normed, shared_int8, shared_scale, num_tokens)
+    expert_shared(
+        shared_int8, shared_scale, shared_w_gate_up, shared_w_gate_up_scale, shared_w_down, shared_w_down_scale,
+        shared_out,
+    )
+    scatter_local_tokens_fp32(routed, ffn_partial, num_tokens, my_rank)
+    for block in pl.spmd(((rows + 7) // 8) * (D // 128), name_hint="moe_add_shared_shard"):
+        row = block // (D // 128) * 8
+        column = block % (D // 128) * 128
+        valid = pl.max(pl.min(8, num_tokens - row), 0)
+        routed_tile = pl.slice(ffn_partial, [8, 128], [row, column], valid_shape=[valid, 128])
+        shared_tile = pl.slice(shared_out, [8, 128], [row, column], valid_shape=[valid, 128])
+        routed_bf16 = pl.cast(pl.cast(routed_tile, pl.BF16, mode="rint"), pl.FP32)
+        summed = pl.add(routed_bf16, shared_tile)
+        combined = pl.cast(pl.cast(summed, pl.BF16, mode="rint"), pl.FP32)
+        combined = pl.fillpad(pl.set_validshape(combined, valid, 128), pad_value=pl.PadValue.zero)
+        ffn_partial[row:row + 8, column:column + 128] = combined
     return ffn_partial
 
 
@@ -845,6 +902,7 @@ def prefill_kda_attention(
     query_start_loc: pl.Tensor[[BATCH + 1], pl.INT32],
     kda_state_rows: pl.Tensor[[BATCH, KDA_STATE_COLUMNS], pl.INT32],
     active_tokens: pl.Tensor[[1], pl.INT32],
+    execution_mode: pl.Tensor[[1], pl.INT32],
     kda_tri_incl: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
     kda_tri_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
     kda_head_onehot: pl.Tensor[[LOCAL_KDA_H, BETA_PAD], pl.FP32],
@@ -942,7 +1000,7 @@ def prefill_kda_attention(
             conv_state_l, recurrent_state_l, query_start_loc, kda_state_rows, kda_tri_incl, kda_tri_strict,
             kda_head_onehot, kda_eye_wide, conv_w, mixed_qkv, decay, beta, out_gate,
             kda_q, kda_k, kda_v, kda_out,
-            out_attn_partial,
+            out_attn_partial, pl.read(execution_mode, [0]),
         )
         kda_output(kda_out, kda_o_norm_l, out_gate, kda_w_o_l, out_attn_partial)
         tp_all_reduce(out_attn_partial, tp_partial, tp_arrived, out_sublayer_out, num_tokens, my_rank, 0, attn_epoch)
@@ -966,6 +1024,7 @@ def prefill_moe_layer(
     # -- sublayer input: the stream the attention half left in the mid workspace -----
     x_hc_mid: pl.Tensor[[CAPACITY, HC_MULT, D], pl.BF16],
     active_tokens: pl.Tensor[[1], pl.INT32],
+    execution_mode: pl.Tensor[[1], pl.INT32],
     # -- resident weight stacks (the FFN half's own families) ------------------------
     mhc_ffn_fn: pl.Tensor[[NUM_LAYERS, MIX_HC, HC_DIM], pl.BF16],
     mhc_ffn_scale: pl.Tensor[[NUM_LAYERS, 3], pl.FP32],
@@ -977,9 +1036,9 @@ def prefill_moe_layer(
     moe_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     moe_w_down: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     moe_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, N_LOCAL_EXPERTS, D], pl.FP32],
-    moe_shared_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER, D], pl.INT8, pl.NZ],
-    moe_shared_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER], pl.FP32],
-    moe_shared_w_down: pl.Tensor[[MOE_STACK_LAYERS, D, MOE_INTER], pl.INT8, pl.NZ],
+    moe_shared_w_gate_up: pl.Tensor[[MOE_STACK_LAYERS, 2 * SHARED_INTER, D], pl.INT8, pl.NZ],
+    moe_shared_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, 2 * SHARED_INTER], pl.FP32],
+    moe_shared_w_down: pl.Tensor[[MOE_STACK_LAYERS, D, SHARED_INTER], pl.INT8, pl.NZ],
     moe_shared_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, D], pl.FP32],
     # -- windows (fresh per diff launch: the MoE barriers and this entry's
     #    single TP reduce all run at epoch 1 -- a fresh window's tp epoch IS
@@ -1020,13 +1079,14 @@ def prefill_moe_layer(
     moe_w_gate_up_scale_l: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32] = moe_w_gate_up_scale[moe_ord]
     moe_w_down_l: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8] = moe_w_down[moe_ord]
     moe_w_down_scale_l: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32] = moe_w_down_scale[moe_ord]
-    moe_shared_w_gate_up_l: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ] = moe_shared_w_gate_up[moe_ord]
-    moe_shared_w_gate_up_scale_l: pl.Tensor[[2 * MOE_INTER], pl.FP32] = moe_shared_w_gate_up_scale[moe_ord]
-    moe_shared_w_down_l: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ] = moe_shared_w_down[moe_ord]
+    moe_shared_w_gate_up_l: pl.Tensor[[2 * SHARED_INTER, D], pl.INT8, pl.NZ] = moe_shared_w_gate_up[moe_ord]
+    moe_shared_w_gate_up_scale_l: pl.Tensor[[2 * SHARED_INTER], pl.FP32] = moe_shared_w_gate_up_scale[moe_ord]
+    moe_shared_w_down_l: pl.Tensor[[D, SHARED_INTER], pl.INT8, pl.NZ] = moe_shared_w_down[moe_ord]
     moe_shared_w_down_scale_l: pl.Tensor[[D], pl.FP32] = moe_shared_w_down_scale[moe_ord]
 
     y_local = pl.create_tensor([T_MOE, D], dtype=pl.FP32)
-    shared_out = pl.create_tensor([T_MOE, D], dtype=pl.FP32)
+    shared_rows = pl.tensor.dim(x_hc_mid, 0)
+    shared_out = pl.create_tensor([shared_rows, D], dtype=pl.FP32)
     routed = pl.create_tensor([T_MOE, D], dtype=pl.FP32)
     expert_y = pl.create_tensor([RESIDENT_GROUPED_CAP, D], dtype=pl.FP32)
     slab_src = pl.create_tensor([RESIDENT_GROUPED_CAP, 1], dtype=pl.INT32)
@@ -1081,6 +1141,7 @@ def prefill_dense_layer(
     query_start_loc: pl.Tensor[[BATCH + 1], pl.INT32],
     kda_state_rows: pl.Tensor[[BATCH, KDA_STATE_COLUMNS], pl.INT32],
     active_tokens: pl.Tensor[[1], pl.INT32],
+    execution_mode: pl.Tensor[[1], pl.INT32],
     kda_tri_incl: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
     kda_tri_strict: pl.Tensor[[CHUNK_TILE, CHUNK_TILE], pl.FP32],
     kda_head_onehot: pl.Tensor[[LOCAL_KDA_H, BETA_PAD], pl.FP32],
@@ -1202,7 +1263,7 @@ def prefill_dense_layer(
             conv_state_l, recurrent_state_l, query_start_loc, kda_state_rows, kda_tri_incl, kda_tri_strict,
             kda_head_onehot, kda_eye_wide, conv_w, mixed_qkv, decay, beta, out_gate,
             kda_q, kda_k, kda_v, kda_out,
-            out_attn_partial,
+            out_attn_partial, pl.read(execution_mode, [0]),
         )
         kda_output(kda_out, kda_o_norm_l, out_gate, kda_w_o_l, out_attn_partial)
         tp_all_reduce(out_attn_partial, tp_partial, tp_arrived, out_sublayer_out, num_tokens, my_rank, 0, attn_epoch)
@@ -1250,16 +1311,18 @@ def prefill_sparse_attention(
     request_ids: pl.Tensor[[CAPACITY], pl.INT32],
     mla_slots: pl.Tensor[[CAPACITY], pl.INT32],
     index_slots: pl.Tensor[[CAPACITY], pl.INT32],
+    index_tail_slots: pl.Tensor[[CAPACITY], pl.INT32],
     seg_start: pl.Tensor[[CAPACITY], pl.INT32],
     pool_count_tok: pl.Tensor[[CAPACITY], pl.INT32],
     tail_start: pl.Tensor[[CAPACITY], pl.INT32],
     tail_count: pl.Tensor[[CAPACITY], pl.INT32],
     kv_len_tok: pl.Tensor[[CAPACITY], pl.INT32],
-    pool_token_slots: pl.Tensor[[POOL_AXIS, INDEX_KPOOL], pl.INT32],
-    pool_slots: pl.Tensor[[POOL_AXIS], pl.INT32],
-    pool_blocks: pl.Tensor[[POOL_AXIS], pl.INT32],
+    pool_token_slots: pl.Tensor[[POOL_EVENTS, INDEX_KPOOL], pl.INT32],
+    pool_slots: pl.Tensor[[POOL_EVENTS], pl.INT32],
+    pool_blocks: pl.Tensor[[POOL_PAGE_ROWS], pl.INT32],
     block_table: pl.Tensor[[BATCH, TABLE_MAX], pl.INT32],
     active_tokens: pl.Tensor[[1], pl.INT32],
+    execution_mode: pl.Tensor[[1], pl.INT32],
     # -- resident weight stacks (the attention half's own families) ------------------
     mla_w_q_a: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA, D], pl.INT8],
     mla_w_q_a_scale: pl.Tensor[[MLA_STACK_LAYERS, Q_LORA], pl.FP32],
@@ -1284,13 +1347,9 @@ def prefill_sparse_attention(
     mhc_attn_scale: pl.Tensor[[NUM_LAYERS, 3], pl.FP32],
     mhc_attn_base: pl.Tensor[[NUM_LAYERS, MIX_HC], pl.FP32],
     norm_input_norm: pl.Tensor[[NORM_STACK_LAYERS, D], pl.BF16],
-    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    # -- cache pools ------------------------------------------------------------------
-    mla_latent_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, KV_LORA], pl.BF16]],
-    index_raw_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
-    index_pool_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
-    index_pool_scale: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
-    # -- window (fresh per diff launch; the attention reduce is epoch 1) --------------
+    mla_latent_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, MLA_CACHE_WIDTH], pl.INT8]],
+    index_raw_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, INDEX_RAW_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
+    index_pool_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.BF16]],
     tp_partial: pld.DistributedTensor[[CAPACITY, D], pl.FP32],
     tp_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     # -- boundary outputs: the attention half's sublayer boundaries -------------------
@@ -1305,8 +1364,7 @@ def prefill_sparse_attention(
     dsa_query: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_H, QK_DIM], pl.BF16]],
     attn_out: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_H, V_DIM], pl.BF16]],
     index_q: pl.InOut[pl.Tensor[[CAPACITY, INDEX_H, INDEX_DIM], pl.BF16]],
-    index_k: pl.InOut[pl.Tensor[[CAPACITY, INDEX_DIM], pl.BF16]],
-    index_scores: pl.InOut[pl.Tensor[[CAPACITY, POOL_AXIS], pl.FP32]],
+    index_k: pl.InOut[pl.Tensor[[CAPACITY, INDEX_DIM], pl.FP32]],
     selected_pools: pl.InOut[pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32]],
     selected_valid: pl.InOut[pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32]],
     # -- scalars last: the ordinals are dispatch-time runtime scalars computed by
@@ -1346,7 +1404,6 @@ def prefill_sparse_attention(
     latent_cache_l = mla_latent_cache[dsa_ord]
     raw_cache_l = index_raw_cache[dsa_ord]
     pool_cache_l = index_pool_cache[dsa_ord]
-    pool_scale_l = index_pool_scale[dsa_ord]
 
     pool_valid = pl.create_tensor([pools_axis, POOL_VALID_WIDTH], dtype=pl.INT32)
     topk_indices = pl.create_tensor([t_tokens, TOPK_INDEX_WIDTH], dtype=pl.INT32)
@@ -1369,12 +1426,10 @@ def prefill_sparse_attention(
             mla_w_q_a_l, mla_w_q_a_scale_l, mla_q_a_norm_l, mla_w_q_b_l, mla_w_q_b_scale_l, mla_w_kv_a_l,
             mla_w_kv_a_scale_l, mla_kv_a_norm_l, mla_w_k_l, mla_w_v_l, mla_w_o_l, mla_w_o_scale_l,
             idx_w_q_b_l, idx_w_k_l, idx_k_norm_w_l, idx_k_norm_b_l, idx_w_weights_l, idx_w_compress_gate_l,
-            idx_compress_ape_l, hadamard, latent_cache_l, raw_cache_l, pool_cache_l, pool_scale_l,
-            block_table, request_ids, mla_slots,
-            index_slots,
+            idx_compress_ape_l, latent_cache_l, raw_cache_l, pool_cache_l, block_table, request_ids, mla_slots,
+            index_slots, index_tail_slots,
             pool_token_slots, pool_slots, pool_blocks, seg_start, pool_count_tok, tail_start, tail_count,
             kv_len_tok, q_resid, dsa_query, kv_latent, attn_out, index_q, index_k, head_weights, gate_scores,
-            index_scores,
             selected_pools, selected_valid, topk_indices, pool_valid,
             out_attn_partial, skip_topk,
         )
@@ -1401,12 +1456,13 @@ def prefill_sparse_attention(
 def prefill_lm_head_logits(
     head_hidden: pl.Tensor[[LOGIT_ROWS, D], pl.BF16],
     final_norm: pl.Tensor[[D], pl.BF16],
-    weight: pl.Tensor[[FP32_HEAD_VOCAB_PAD, D], pl.FP32],
-    logits: pl.Out[pl.Tensor[[BATCH, FP32_HEAD_VOCAB_PAD], pl.FP32]],
+    weight: pl.Tensor[[HEAD_VOCAB_PAD, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[LOGIT_ROWS, HEAD_VOCAB_PAD], pl.FP32]],
 ):
     """Project the request prefix of the device's padded head-row buffer."""
-    selected = head_hidden[0:BATCH, 0:D]
-    lm_head_logits(selected, final_norm, weight, logits)
+    selected = head_hidden[0:LOGIT_ROWS, 0:D]
+    normalized = pl.create_tensor([LOGIT_ROWS, D], dtype=pl.BF16)
+    lm_head_logits(selected, final_norm, weight, normalized, logits)
     return logits
 
 
@@ -1449,23 +1505,7 @@ def golden_prefill_layer(tensors):
     golden_prefill_moe(routed_work)
     routed = routed_work["routed"]
 
-    shared = torch.zeros(N_RANKS, T, D, dtype=torch.float32)
-    for r in range(N_RANKS):
-        work = {
-            "x_int8": x_int8[r],
-            "x_scale": x_scale[r],
-            "w_gate_up": tensors["shared_w_gate_up"][r],
-            "w_gate_up_scale": tensors["shared_w_gate_up_scale"][r],
-            "w_down": tensors["shared_w_down"][r],
-            "w_down_scale": tensors["shared_w_down_scale"][r],
-            "output": torch.zeros(T, D, dtype=torch.float32),
-        }
-        golden_expert_shared_fn(work)
-        shared[r] = work["output"]
-
-    out = torch.zeros_like(tensors["y"])
-    out[:, :num_tokens] = routed[:, :num_tokens] + shared[:, :num_tokens]
-    tensors["y"][:] = out
+    tensors["y"][:] = golden_moe_tp_combine(tensors, routed, x_int8, x_scale, num_tokens)
 
 
 def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, layer_id=3, hidden=None):
@@ -1491,17 +1531,23 @@ def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, laye
         return w_i8, s
 
     def gen_shared_weight(shape, dequant_std, chan_cv):
-        # Quantize one complete shared expert and replicate it to every EP rank.
         weight = torch.randn(*shape) * torch.exp(chan_cv * torch.randn(shape[0], 1))
         w_i8, scale = quantize_rows(weight, dequant_std)
-        return (
-            w_i8.unsqueeze(0).expand(N_RANKS, *w_i8.shape).contiguous(),
-            scale.unsqueeze(0).expand(N_RANKS, *scale.shape).contiguous(),
-        )
+        if shape[1] == D:
+            shards, scales = [], []
+            for rank in range(N_RANKS):
+                first = rank * SHARED_INTER
+                gate = slice(first, first + SHARED_INTER)
+                up = slice(MOE_INTER + first, MOE_INTER + first + SHARED_INTER)
+                shards.append(torch.cat((w_i8[gate], w_i8[up])))
+                scales.append(torch.cat((scale[gate], scale[up])))
+            return torch.stack(shards), torch.stack(scales)
+        shards = torch.stack([w_i8[:, r * SHARED_INTER:(r + 1) * SHARED_INTER] for r in range(N_RANKS)])
+        return shards, scale.unsqueeze(0).expand(N_RANKS, D).contiguous()
 
     gen = torch.Generator().manual_seed(7)
 
-    emb = torch.randn(N_RANKS, T, D, generator=gen).to(torch.bfloat16)
+    emb = torch.randn(1, T, D, generator=gen).bfloat16().expand(N_RANKS, T, D)
     hc_fn = torch.randn(MIX_HC, HC_DIM, generator=gen).to(torch.bfloat16)
     hc_scale = torch.rand(3, generator=gen)
     hc_base = torch.randn(MIX_HC, generator=gen)
@@ -1512,7 +1558,7 @@ def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, laye
             pre_mix = hc_mixes(x_hc, hc_fn, hc_scale, hc_base)[0]
             batches.append(hc_pre(x_hc, pre_mix))
         x_mixed = torch.stack(batches)
-    # Norm/router and full shared weights are replicated checkpoint tensors.
+    # Norm/router tensors are replicated; shared weights are TP-sharded.
     gate_row = torch.randn(N_EXPERTS, D, generator=gen) / (D**0.5)
     gate_weight = gate_row.unsqueeze(0).expand(N_RANKS, *gate_row.shape).contiguous()
 
@@ -1533,9 +1579,9 @@ def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, laye
         TensorSpec("w_gate_up_scale", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda : w_gu_s),
         TensorSpec("w_down", [N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
         TensorSpec("w_down_scale", [N_RANKS, N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
-        TensorSpec("shared_w_gate_up", [N_RANKS, 2 * MOE_INTER, D], torch.int8, init_value=lambda : pack_int8_nz(shared_gu_i8)),
-        TensorSpec("shared_w_gate_up_scale", [N_RANKS, 2 * MOE_INTER], torch.float32, init_value=lambda : shared_gu_s),
-        TensorSpec("shared_w_down", [N_RANKS, D, MOE_INTER], torch.int8, init_value=lambda : pack_int8_nz(shared_w2_i8)),
+        TensorSpec("shared_w_gate_up", [N_RANKS, 2 * SHARED_INTER, D], torch.int8, init_value=lambda : pack_int8_nz(shared_gu_i8)),
+        TensorSpec("shared_w_gate_up_scale", [N_RANKS, 2 * SHARED_INTER], torch.float32, init_value=lambda : shared_gu_s),
+        TensorSpec("shared_w_down", [N_RANKS, D, SHARED_INTER], torch.int8, init_value=lambda : pack_int8_nz(shared_w2_i8)),
         TensorSpec("shared_w_down_scale", [N_RANKS, D], torch.float32, init_value=lambda: shared_w2_s),
         TensorSpec("y", [N_RANKS, T, D], torch.float32),
         ScalarSpec("num_tokens", torch.int32, num_tokens),

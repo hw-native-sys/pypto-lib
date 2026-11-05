@@ -29,7 +29,9 @@ from models.glm5_3_flash.decode_moe import (
     moe_combine, moe_dispatch, moe_pack, moe_return, moe_return_notify,
 )
 from models.glm5_3_flash.expert_routed import build_checkpoint_moe_specs, expert_routed
-from models.glm5_3_flash.expert_shared import expert_shared, golden_expert_shared_fn, moe_layer_add
+from models.glm5_3_flash.expert_shared import (
+    MOE_INTER as SHARED_INTER, expert_shared, golden_moe_tp_combine, moe_tp_combine,
+)
 from models.glm5_3_flash.gate import gate, make_correction_bias, moe_gate
 from models.glm5_3_flash.mhc import hc_mixes, hc_pre, hc_seed
 from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
@@ -47,9 +49,9 @@ def decode_mlp(
     w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ],
-    shared_w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
-    shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
+    shared_w_gate_up: pl.Tensor[[2 * SHARED_INTER, D], pl.INT8, pl.NZ],
+    shared_w_gate_up_scale: pl.Tensor[[2 * SHARED_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[D, SHARED_INTER], pl.INT8, pl.NZ],
     shared_w_down_scale: pl.Tensor[[D], pl.FP32],
     y: pl.Tensor[[T, D], pl.FP32],
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
@@ -58,13 +60,15 @@ def decode_mlp(
     lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
     return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    shared_exchange: pld.DistributedTensor[[T, D], pl.FP32],
+    shared_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     num_ranks: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
     input_tid: pl.Scalar[pl.TASK_ID],
 ):
-    """Run MoE for this rank's token batch with EP routed and complete shared weights."""
+    """Run EP routed experts and reduce shared TP shards over replicated tokens."""
     x_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
 
     # Block head: normalized router and the INT8 view both branches reuse.
@@ -114,13 +118,13 @@ def decode_mlp(
     routed = pl.create_tensor([T, D], dtype=pl.FP32)
     moe_combine(slot_out, return_ready, routed, num_tokens, num_ranks, my_rank, epoch, sync_tid)
 
-    # Shared branch: the full expert computes only this rank's token rows.
+    # Shared branch: each TP rank computes its intermediate-channel shard.
     shared_out = pl.create_tensor([T, D], dtype=pl.FP32)
     expert_shared(
         x_int8, x_scale, shared_w_gate_up, shared_w_gate_up_scale, shared_w_down, shared_w_down_scale,
         shared_out,
     )
-    moe_layer_add(routed, shared_out, y, num_tokens)
+    moe_tp_combine(routed, shared_out, shared_exchange, shared_ready, y, num_tokens, my_rank, epoch)
     return y
 
 
@@ -134,9 +138,9 @@ def l2_decode_layer(
     w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_w_gate_up: pl.Tensor[[2 * MOE_INTER, D], pl.INT8, pl.NZ],
-    shared_w_gate_up_scale: pl.Tensor[[2 * MOE_INTER], pl.FP32],
-    shared_w_down: pl.Tensor[[D, MOE_INTER], pl.INT8, pl.NZ],
+    shared_w_gate_up: pl.Tensor[[2 * SHARED_INTER, D], pl.INT8, pl.NZ],
+    shared_w_gate_up_scale: pl.Tensor[[2 * SHARED_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[D, SHARED_INTER], pl.INT8, pl.NZ],
     shared_w_down_scale: pl.Tensor[[D], pl.FP32],
     y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
     lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
@@ -145,18 +149,21 @@ def l2_decode_layer(
     lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
     return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    shared_exchange: pld.DistributedTensor[[T, D], pl.FP32],
+    shared_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     num_ranks: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
 ):
-    """Run MoE for this rank's token batch with EP routed and complete shared weights."""
+    """Run EP routed experts and reduce shared TP shards over replicated tokens."""
     input_tid = pl.system.task_dummy(deps=[])
     decode_mlp(
         x_mixed, norm_weight, gate_weight, correction_bias, w_gate_up, w_gate_up_scale,
         w_down, w_down_scale,
         shared_w_gate_up, shared_w_gate_up_scale, shared_w_down, shared_w_down_scale, y, lane_x, lane_aux,
-        lane_count, lane_ready, slot_out, return_ready, num_tokens, num_ranks, my_rank, epoch, input_tid,
+        lane_count, lane_ready, slot_out, return_ready, shared_exchange, shared_ready,
+        num_tokens, num_ranks, my_rank, epoch, input_tid,
     )
     return y
 
@@ -171,21 +178,23 @@ def l3_decode_layer(
     w_gate_up_scale: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
     w_down: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, D], pl.FP32],
-    shared_w_gate_up: pl.Tensor[[N_RANKS, 2 * MOE_INTER, D], pl.INT8],
-    shared_w_gate_up_scale: pl.Tensor[[N_RANKS, 2 * MOE_INTER], pl.FP32],
-    shared_w_down: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
+    shared_w_gate_up: pl.Tensor[[N_RANKS, 2 * SHARED_INTER, D], pl.INT8],
+    shared_w_gate_up_scale: pl.Tensor[[N_RANKS, 2 * SHARED_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[N_RANKS, D, SHARED_INTER], pl.INT8],
     shared_w_down_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     y: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
     num_ranks: pl.Scalar[pl.INT32],
 ):
-    """Launch rank-local token batches over EP experts and replicated shared weights."""
+    """Launch replicated tokens with EP experts and shared TP weight shards."""
     lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, D], dtype=pl.INT8)
     lane_aux_buf = pld.alloc_window_buffer([LANE_ROWS, AUX_PAD], dtype=pl.FP32)
     lane_count_buf = pld.alloc_window_buffer([N_RANKS, COUNT_PAD], dtype=pl.INT32)
     lane_ready_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     slot_out_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.FP32)
     return_ready_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    shared_exchange_buf = pld.alloc_window_buffer([T, D], dtype=pl.FP32)
+    shared_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
     # Repeat the EP path over the same windows with a fresh barrier epoch.
     for call in pl.range(2):
         for r in pl.range(pld.world_size()):
@@ -195,18 +204,21 @@ def l3_decode_layer(
             lane_ready = pld.window(lane_ready_buf, [N_RANKS, 1], dtype=pl.INT32)
             slot_out = pld.window(slot_out_buf, [N_ROUTES, D], dtype=pl.FP32)
             return_ready = pld.window(return_ready_buf, [N_RANKS, 1], dtype=pl.INT32)
+            shared_exchange = pld.window(shared_exchange_buf, [T, D], dtype=pl.FP32)
+            shared_ready = pld.window(shared_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
             l2_decode_layer(
                 x_mixed[r], norm_weight[r], gate_weight[r], correction_bias[r], w_gate_up[r],
                 w_gate_up_scale[r],
                 w_down[r], w_down_scale[r],
                 shared_w_gate_up[r], shared_w_gate_up_scale[r], shared_w_down[r], shared_w_down_scale[r],
-                y[r], lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready, num_tokens, num_ranks,
+                y[r], lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready, shared_exchange, shared_ready,
+                num_tokens, num_ranks,
                 r, pl.cast(call + 1, pl.INT32), device=r,
             )
 
 
 def golden_decode_layer(tensors):
-    """Add the EP routed output to the full shared output for each rank's tokens."""
+    """Combine EP routed rows and shared TP partials for replicated tokens."""
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
@@ -239,23 +251,7 @@ def golden_decode_layer(tensors):
         },
     )
 
-    shared = torch.zeros(N_RANKS, T, D, dtype=torch.float32)
-    for r in range(N_RANKS):
-        work = {
-            "x_int8": x_int8[r],
-            "x_scale": x_scale[r],
-            "w_gate_up": tensors["shared_w_gate_up"][r],
-            "w_gate_up_scale": tensors["shared_w_gate_up_scale"][r],
-            "w_down": tensors["shared_w_down"][r],
-            "w_down_scale": tensors["shared_w_down_scale"][r],
-            "output": torch.zeros(T, D, dtype=torch.float32),
-        }
-        golden_expert_shared_fn(work)
-        shared[r] = work["output"]
-
-    out = torch.zeros_like(tensors["y"])
-    out[:, :num_tokens] = routed[:, :num_tokens] + shared[:, :num_tokens]
-    tensors["y"][:] = out
+    tensors["y"][:] = golden_moe_tp_combine(tensors, routed, x_int8, x_scale, num_tokens)
 
 
 def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, layer_id=3, hidden=None):
@@ -280,24 +276,30 @@ def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, laye
         s = (s.squeeze(-1) * (dequant_std / (w_i8.float() * s).std())).float()
         return w_i8, s
 
-    # Quantize the complete shared FFN once and replicate its weights and scales.
+    # Quantize one shared FFN and split its gate/up rows and down columns.
     def gen_fused_shared(dequant_std, chan_cv):
         w = torch.randn(2 * MOE_INTER, D) * torch.exp(chan_cv * torch.randn(2 * MOE_INTER, 1))
         w_i8, s = quantize_rows(w, dequant_std)
-        weights = w_i8.unsqueeze(0).expand(N_RANKS, 2 * MOE_INTER, D).contiguous()
-        scales = s.unsqueeze(0).expand(N_RANKS, 2 * MOE_INTER).contiguous()
+        shards, scale_shards = [], []
+        for rank in range(N_RANKS):
+            first = rank * SHARED_INTER
+            gate = slice(first, first + SHARED_INTER)
+            up = slice(MOE_INTER + first, MOE_INTER + first + SHARED_INTER)
+            shards.append(torch.cat((w_i8[gate], w_i8[up])))
+            scale_shards.append(torch.cat((s[gate], s[up])))
+        weights, scales = torch.stack(shards), torch.stack(scale_shards)
         return weights, scales
 
     def gen_down_shared(dequant_std, chan_cv):
         w = torch.randn(D, MOE_INTER) * torch.exp(chan_cv * torch.randn(D, 1))
         w_i8, s = quantize_rows(w, dequant_std)
-        weights = w_i8.unsqueeze(0).expand(N_RANKS, D, MOE_INTER).contiguous()
+        weights = torch.stack([w_i8[:, r * SHARED_INTER:(r + 1) * SHARED_INTER] for r in range(N_RANKS)])
         scales = s.unsqueeze(0).expand(N_RANKS, D).contiguous()
         return weights, scales
 
     gen = torch.Generator().manual_seed(7)
 
-    emb = torch.randn(N_RANKS, T, D, generator=gen).to(torch.bfloat16)
+    emb = torch.randn(1, T, D, generator=gen).bfloat16().expand(N_RANKS, T, D)
     hc_fn = torch.randn(MIX_HC, HC_DIM, generator=gen).to(torch.bfloat16)
     hc_scale = torch.rand(3, generator=gen)
     hc_base = torch.randn(MIX_HC, generator=gen)
@@ -326,9 +328,9 @@ def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, laye
         TensorSpec("w_gate_up_scale", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda : w_gu_s),
         TensorSpec("w_down", [N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
         TensorSpec("w_down_scale", [N_RANKS, N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
-        TensorSpec("shared_w_gate_up", [N_RANKS, 2 * MOE_INTER, D], torch.int8, init_value=lambda : pack_int8_nz(shared_gu_i8)),
-        TensorSpec("shared_w_gate_up_scale", [N_RANKS, 2 * MOE_INTER], torch.float32, init_value=lambda : shared_gu_s),
-        TensorSpec("shared_w_down", [N_RANKS, D, MOE_INTER], torch.int8, init_value=lambda : pack_int8_nz(shared_w2_i8)),
+        TensorSpec("shared_w_gate_up", [N_RANKS, 2 * SHARED_INTER, D], torch.int8, init_value=lambda : pack_int8_nz(shared_gu_i8)),
+        TensorSpec("shared_w_gate_up_scale", [N_RANKS, 2 * SHARED_INTER], torch.float32, init_value=lambda : shared_gu_s),
+        TensorSpec("shared_w_down", [N_RANKS, D, SHARED_INTER], torch.int8, init_value=lambda : pack_int8_nz(shared_w2_i8)),
         TensorSpec("shared_w_down_scale", [N_RANKS, D], torch.float32, init_value=lambda: shared_w2_s),
         TensorSpec("y", [N_RANKS, T, D], torch.float32),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
