@@ -197,6 +197,12 @@ reduction. Standalone grouped projections retain their own arithmetic.
 These choices do not establish bitwise equivalence with device instructions;
 the existing numerical comparisons remain required.
 
+The LM-head Torch reference batches at most two independent owners per
+projection call. This bounds its product buffer independently of the number
+of TP/DP owners. It preserves each owner's row selection, K16 FP32
+accumulation order, zero rows and sampling inputs; device kernels and
+comparison thresholds are unchanged.
+
 - Default execution and `--full` run the same complete-forward comparison.
   The generated bounded fixture starts at position 121 and uses one shared
   MoE bank unless `--moe-banks` is supplied. This is synthetic correctness
