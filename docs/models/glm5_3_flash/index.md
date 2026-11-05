@@ -280,6 +280,27 @@ runs with fixed inputs and private pool segments. The per-query path preserves
 the original score formula, quantization, TopK ordering and owning numerical
 checks; changing attention index order would not correct those score values.
 
+### Query absorption performance
+
+`absorb_query` schedules independent heads with `pl.parallel`, preserving
+compensated FP32 accumulation and the BF16 output boundary.
+
+Standalone measurements against `b931df2`: a2a3, PTOAS 0.65, 17 query rows,
+single-device TP-shard shapes, 100 timed rounds after five warmups. Each
+pair reuses frozen inputs and golden outputs; times are device-wall medians.
+
+| TP shard | Before (ms) | After (ms) | Speedup |
+|---|---:|---:|---:|
+| TP1, 64 local heads | 77.8978 | 17.8008 | 4.38x |
+| TP2, 32 local heads | 38.9932 | 9.4154 | 4.14x |
+
+Outputs are bitwise equal to baseline and pass the unchanged comparator.
+In TP8/EP8 serving with PTOAS 0.67, absorption code generation is unchanged
+and no measurable benefit is observed: C1 layer-3 rank-0 stage medians are
+14.865 -> 15.095 ms for prefill and 2.471 -> 2.484 ms for decode, with a
+128-token prompt. These stage intervals include dependency and scheduling
+waits; standalone speedups do not establish a serving improvement.
+
 ### Earlier Serving measurements
 
 The measurements below predate native MLA activation quantization and the
