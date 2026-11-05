@@ -29,7 +29,7 @@ DOT_K = pl.dynamic("DOT_K")
 DOT_W0 = pl.dynamic("DOT_W0")
 DOT_W1 = pl.dynamic("DOT_W1")
 DOT_BIAS = pl.dynamic("DOT_BIAS")
-DOT_K_TILE = 16
+DOT_K_TILE = 128
 
 
 @pl.jit.inline
@@ -45,18 +45,22 @@ def bf16_linear(
     K_DIM: pl.constexpr,
     B_TRANS: pl.constexpr,
 ):
-    """Accumulate BF16 dot-product blocks with compensated FP32 sums."""
+    """BF16 Cube blocks with compensated FP32 inter-block sums.
+
+    Each block retains its native FP32 matmul accumulation rounding.
+    """
     total = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
     correction = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
-    for k0 in pl.pipeline(0, K_DIM, 1, stage=1):
-        x_part = pl.slice(x, [M_TILE, DOT_K_TILE], [x_start, k0], valid_shape=[valid_rows, 1])
+    for k0 in pl.pipeline(0, K_DIM, DOT_K_TILE, stage=1):
+        valid_k = pl.min(DOT_K_TILE, K_DIM - k0)
+        x_part = pl.slice(x, [M_TILE, DOT_K_TILE], [x_start, k0], valid_shape=[valid_rows, valid_k])
         x_full = pl.set_validshape(pl.fillpad(x_part, pad_value=pl.PadValue.zero), M_TILE, DOT_K_TILE)
         if B_TRANS:
-            w_part = pl.slice(weight, [N_TILE, DOT_K_TILE], [w_start, k0], valid_shape=[weight_rows, 1])
+            w_part = pl.slice(weight, [N_TILE, DOT_K_TILE], [w_start, k0], valid_shape=[weight_rows, valid_k])
             w_full = pl.set_validshape(pl.fillpad(w_part, pad_value=pl.PadValue.zero), N_TILE, DOT_K_TILE)
             partial = pl.matmul(x_full, w_full, out_dtype=pl.FP32, b_trans=True)
         else:
-            w_forward = pl.slice(weight, [DOT_K_TILE, N_TILE], [k0, w_start], valid_shape=[1, weight_rows])
+            w_forward = pl.slice(weight, [DOT_K_TILE, N_TILE], [k0, w_start], valid_shape=[valid_k, weight_rows])
             w_forward_full = pl.set_validshape(pl.fillpad(w_forward, pad_value=pl.PadValue.zero), DOT_K_TILE, N_TILE)
             partial = pl.matmul(x_full, w_forward_full, out_dtype=pl.FP32)
         updated = pl.add(total, partial)

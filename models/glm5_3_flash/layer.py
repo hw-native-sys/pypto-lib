@@ -50,12 +50,12 @@ from models.glm5_3_flash.gate import (
     GATE_M_TILE, SCORE_PAD, TOPK_PAD, RouterTensors, gate, make_correction_bias, moe_gate, router_forward,
 )
 from models.glm5_3_flash.indexer import (
-    POOL_SCALE_WIDTH, POOL_VALID_WIDTH, SORT_TILE, IndexerTensors, indexer_cache_write, indexer_expand,
+    POOL_QUANT_TILE, POOL_SCALE_WIDTH, POOL_VALID_WIDTH, SORT_TILE, IndexerTensors, indexer_cache_write, indexer_expand,
     indexer_pool_write, indexer_proj, indexer_score, indexer_topk, reference_indexer_topk,
     synthetic_indexer,
 )
 from models.glm5_3_flash.kda import (
-    BETA_PAD, CHUNK_TILE, CONV_DIM, STATE_LEN, KdaTensors, kda_conv_prefill, kda_forward, kda_output,
+    BETA_PAD, CHUNK_TILE, CONV_DIM, STATE_LEN, KdaTensors, decode_kda, kda_conv_prefill, kda_forward, kda_output,
     kda_projection, prefill_kda, stack_conv_weight, synthetic_kda,
 )
 from models.glm5_3_flash.lm_head import FP32_HEAD_VOCAB_PAD, lm_head_logits
@@ -114,6 +114,10 @@ POOL_AXIS = (
     (max(LATENT_ROWS // INDEX_KPOOL, BATCH * TABLE_MAX * (BLOCK_SIZE // INDEX_KPOOL),
          CAPACITY // INDEX_KPOOL + BATCH) + 2 * SORT_TILE - 2) // SORT_TILE
 ) * SORT_TILE
+# A query batch closes at most ceil(CAPACITY / INDEX_KPOOL) + BATCH pools.
+POOL_MAX_CLOSURES = (CAPACITY + INDEX_KPOOL - 1) // INDEX_KPOOL + BATCH
+POOL_EVENT_CAP = min(POOL_AXIS, ((POOL_MAX_CLOSURES + POOL_QUANT_TILE - 1) // POOL_QUANT_TILE) * POOL_QUANT_TILE)
+POOL_EVENT_CLEAR_TILE = 128
 POOL_TABLE_ROWS = LATENT_ROWS // INDEX_KPOOL + BLOCK_SIZE // INDEX_KPOOL  # final raw-page span is scratch
 KDA_STATE_BLOCKS = min(TABLE_MAX, (CAPACITY + BLOCK_SIZE - 1) // BLOCK_SIZE + 2)
 KDA_STATE_PAGES = BATCH * (KDA_STATE_BLOCKS + 2)
@@ -643,19 +647,41 @@ def dsa_attention_sublayer(
         kv_a_norm, q_resid, query, kv_latent,
     )
     mla_cache_write(kv_latent, mla_slots, latent_cache)
+    # TopK selects every visible pool without reading scores at short contexts.
+    query_extent = pl.tensor.dim(normed, 0)
+    max_visible_pools = pl.cast(0, pl.INT32)
+    for token in pl.range(0, query_extent):
+        max_visible_pools = pl.max(max_visible_pools, pl.read(pool_count_tok, [token]))
+    skip_index_query = pl.cast(1, pl.INT32)
+    if max_visible_pools > KPOOL_SELECT_K:
+        if skip_topk == 0:
+            skip_index_query = pl.cast(0, pl.INT32)
     indexer_proj(
         normed, q_resid, idx_w_q_b, idx_w_k, idx_k_norm_w, idx_k_norm_b, idx_w_weights, idx_w_compress_gate,
-        index_q, index_k, head_weights, gate_scores, skip_topk,
+        index_q, index_k, head_weights, gate_scores, skip_index_query,
     )
     indexer_cache_write(index_k, gate_scores, index_slots, raw_cache)
+    # The metadata builder packs live events first; the remaining flags stay zero.
+    if POOL_EVENT_CAP < POOL_AXIS:
+        clear_tiles = (POOL_AXIS - POOL_EVENT_CAP + POOL_EVENT_CLEAR_TILE - 1) // POOL_EVENT_CLEAR_TILE
+        with pl.spmd(clear_tiles, name_hint="indexer_clear_unused_events"):
+            row = POOL_EVENT_CAP + pl.tile.get_block_idx() * POOL_EVENT_CLEAR_TILE
+            rows = pl.min(POOL_EVENT_CLEAR_TILE, POOL_AXIS - row)
+            zeros = pl.full([POOL_EVENT_CLEAR_TILE, POOL_VALID_WIDTH], dtype=pl.INT32, value=0)
+            pool_valid[row:row + POOL_EVENT_CLEAR_TILE, :] = pl.set_validshape(zeros, rows, POOL_VALID_WIDTH)
+    pool_event_members = pl.slice(pool_token_slots, [POOL_EVENT_CAP, INDEX_KPOOL], [0, 0])
+    pool_event_slots = pl.slice(pool_slots, [POOL_EVENT_CAP], [0])
+    pool_event_valid = pl.slice(pool_valid, [POOL_EVENT_CAP, POOL_VALID_WIDTH], [0, 0])
     indexer_pool_write(
-        raw_cache, compress_ape, hadamard, pool_token_slots, pool_slots, pool_cache, pool_scale, pool_valid,
+        raw_cache, compress_ape, hadamard, pool_event_members, pool_event_slots, pool_cache, pool_scale,
+        pool_event_valid,
     )
     if skip_topk == 0:
-        indexer_score(
-            index_q, hadamard, pool_cache, pool_scale, pool_blocks, head_weights, seg_start, pool_count_tok,
-            index_scores,
-        )
+        if max_visible_pools > KPOOL_SELECT_K:
+            indexer_score(
+                index_q, hadamard, pool_cache, pool_scale, pool_blocks, head_weights, seg_start, pool_count_tok,
+                index_scores,
+            )
         indexer_topk(index_scores, seg_start, pool_count_tok, selected_pools, selected_valid)
     indexer_expand(selected_pools, selected_valid, tail_start, tail_count, kv_len_tok, topk_indices)
     prefill_sparse_attn(query, latent_cache, block_table, request_ids, w_k, w_v, topk_indices, attn_out)
@@ -698,18 +724,22 @@ def kda_attention_sublayer(
     value: pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     kda_out: pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     attn_partial: pl.Tensor[[CAPACITY, D], pl.FP32],
+    decode_mode: pl.constexpr = False,
 ):
-    """KDA projection -> causal conv -> chunked delta attention -> gated output."""
+    """KDA projection and convolution followed by the phase-specific recurrence."""
     stack_conv_weight(conv_q, conv_k, conv_v, conv_w)
     kda_projection(
         normed,
         w_q, w_k, w_v, w_f_a, w_f_b, dt_bias, a_log, w_b, w_g_a, w_g_b, mixed_qkv, decay, beta, out_gate,
     )
     kda_conv_prefill(mixed_qkv, conv_w, conv_state, query_start_loc, kda_state_rows, query, key, value)
-    prefill_kda(
-        query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, tri_incl,
-        tri_strict, head_onehot, eye_wide, kda_out,
-    )
+    if decode_mode:
+        decode_kda(query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, kda_out)
+    else:
+        prefill_kda(
+            query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, tri_incl,
+            tri_strict, head_onehot, eye_wide, kda_out,
+        )
 
 
 @pl.jit.inline
@@ -838,7 +868,7 @@ def prefill_head_rows(
 
 
 @pl.jit(auto_scope=False)
-def prefill_kda_attention(
+def kda_attention(
     # -- sublayer input: the stream entering the attention half ----------------------
     x_hc: pl.Tensor[[CAPACITY, HC_MULT, D], pl.BF16],
     # -- metadata and per-step inputs (the KDA chain's own subset) -------------------
@@ -874,7 +904,7 @@ def prefill_kda_attention(
     kda_recurrent_state: pl.InOut[
         pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]
     ],
-    # -- window (fresh per diff launch; the attention reduce is epoch 1) --------------
+    # -- persistent attention TP window; the caller supplies its next epoch --------
     tp_partial: pld.DistributedTensor[[CAPACITY, D], pl.FP32],
     tp_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     # -- boundary outputs: the attention half's sublayer boundaries -------------------
@@ -895,12 +925,13 @@ def prefill_kda_attention(
     kda_q: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
     kda_k: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
     kda_v: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
-    # -- scalars last: the ordinals are dispatch-time runtime scalars computed by
-    #    the HOST (never layer arithmetic inside the graph) ---------------------------
+    # -- scalars last: runtime ordinals and epochs come from the HOST entries or
+    #    the resident backbone loop --------------------------------------------------
     bb_ord: pl.Scalar[pl.INT32],
     kda_ord: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     attn_epoch: pl.Scalar[pl.INT32],
+    decode_mode: pl.constexpr = False,
 ):
     """Run resident KDA attention with runtime layer ordinals."""
     num_tokens: pl.Scalar[pl.INT32] = pl.read(active_tokens, [0])
@@ -942,7 +973,7 @@ def prefill_kda_attention(
             conv_state_l, recurrent_state_l, query_start_loc, kda_state_rows, kda_tri_incl, kda_tri_strict,
             kda_head_onehot, kda_eye_wide, conv_w, mixed_qkv, decay, beta, out_gate,
             kda_q, kda_k, kda_v, kda_out,
-            out_attn_partial,
+            out_attn_partial, decode_mode,
         )
         kda_output(kda_out, kda_o_norm_l, out_gate, kda_w_o_l, out_attn_partial)
         tp_all_reduce(out_attn_partial, tp_partial, tp_arrived, out_sublayer_out, num_tokens, my_rank, 0, attn_epoch)
@@ -981,9 +1012,7 @@ def prefill_moe_layer(
     moe_shared_w_gate_up_scale: pl.Tensor[[MOE_STACK_LAYERS, 2 * MOE_INTER], pl.FP32],
     moe_shared_w_down: pl.Tensor[[MOE_STACK_LAYERS, D, MOE_INTER], pl.INT8, pl.NZ],
     moe_shared_w_down_scale: pl.Tensor[[MOE_STACK_LAYERS, D], pl.FP32],
-    # -- windows (fresh per diff launch: the MoE barriers and this entry's
-    #    single TP reduce all run at epoch 1 -- a fresh window's tp epoch IS
-    #    its call count, two notifies per call) ---------------------------------------
+    # -- persistent MoE and TP windows; the caller supplies independent epochs -----
     lane_x: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, D], pl.INT8],
     lane_aux: pld.DistributedTensor[[RESIDENT_TOTAL_CAP, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
@@ -1001,8 +1030,8 @@ def prefill_moe_layer(
     out_ffn_partial: pl.Out[pl.Tensor[[CAPACITY, D], pl.FP32]],
     out_ffn_out: pl.InOut[pl.Tensor[[CAPACITY, D], pl.BF16]],
     out_x_hc_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT, D], pl.BF16]],
-    # -- scalars last: the ordinals are dispatch-time runtime scalars computed by
-    #    the HOST (never layer arithmetic inside the graph) ---------------------------
+    # -- scalars last: runtime ordinals and epochs come from the HOST entries or
+    #    the resident backbone loop --------------------------------------------------
     bb_ord: pl.Scalar[pl.INT32],
     moe_ord: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -1073,7 +1102,7 @@ def prefill_moe_layer(
 
 
 @pl.jit(auto_scope=False)
-def prefill_dense_layer(
+def dense_layer(
     # -- layer input: the stream entering the layer --------------------------------
     x_hc: pl.Tensor[[CAPACITY, HC_MULT, D], pl.BF16],
     # -- metadata and per-step inputs (the KDA chain's own subset; the dense
@@ -1118,7 +1147,7 @@ def prefill_dense_layer(
     kda_recurrent_state: pl.InOut[
         pl.Tensor[[KDA_NUM_LAYERS, KDA_ROWS, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]
     ],
-    # -- window (fresh per launch; the dense layer's shared tp pair runs at 1 and 2) -
+    # -- persistent TP window; attention and FFN use consecutive caller epochs ------
     tp_partial: pld.DistributedTensor[[CAPACITY, D], pl.FP32],
     tp_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     # -- boundary outputs (identical names and mutability to the whole-layer entry) --
@@ -1145,14 +1174,15 @@ def prefill_dense_layer(
     kda_k: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
     kda_v: pl.InOut[pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
     dense_x_int8: pl.InOut[pl.Tensor[[CAPACITY, D], pl.INT8]],
-    # -- scalars last: the ordinals are dispatch-time runtime scalars computed by
-    #    the HOST (never layer arithmetic inside the graph) ---------------------------
+    # -- scalars last: runtime ordinals and epochs come from the HOST entries or
+    #    the resident backbone loop --------------------------------------------------
     bb_ord: pl.Scalar[pl.INT32],
     kda_ord: pl.Scalar[pl.INT32],
     dense_ord: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     attn_epoch: pl.Scalar[pl.INT32],
     ffn_epoch: pl.Scalar[pl.INT32],
+    decode_mode: pl.constexpr = False,
 ):
     """Run a resident KDA layer with a dense feed-forward sublayer."""
     num_tokens: pl.Scalar[pl.INT32] = pl.read(active_tokens, [0])
@@ -1202,7 +1232,7 @@ def prefill_dense_layer(
             conv_state_l, recurrent_state_l, query_start_loc, kda_state_rows, kda_tri_incl, kda_tri_strict,
             kda_head_onehot, kda_eye_wide, conv_w, mixed_qkv, decay, beta, out_gate,
             kda_q, kda_k, kda_v, kda_out,
-            out_attn_partial,
+            out_attn_partial, decode_mode,
         )
         kda_output(kda_out, kda_o_norm_l, out_gate, kda_w_o_l, out_attn_partial)
         tp_all_reduce(out_attn_partial, tp_partial, tp_arrived, out_sublayer_out, num_tokens, my_rank, 0, attn_epoch)
@@ -1290,7 +1320,7 @@ def prefill_sparse_attention(
     index_raw_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, LATENT_ROWS, INDEX_STATE_WIDTH], pl.FP32]],
     index_pool_cache: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, INDEX_DIM], pl.INT8]],
     index_pool_scale: pl.InOut[pl.Tensor[[DSA_NUM_LAYERS, POOL_TABLE_ROWS, POOL_SCALE_WIDTH], pl.FP32]],
-    # -- window (fresh per diff launch; the attention reduce is epoch 1) --------------
+    # -- persistent attention TP window; the caller supplies its next epoch --------
     tp_partial: pld.DistributedTensor[[CAPACITY, D], pl.FP32],
     tp_arrived: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
     # -- boundary outputs: the attention half's sublayer boundaries -------------------
@@ -1309,8 +1339,8 @@ def prefill_sparse_attention(
     index_scores: pl.InOut[pl.Tensor[[CAPACITY, POOL_AXIS], pl.FP32]],
     selected_pools: pl.InOut[pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32]],
     selected_valid: pl.InOut[pl.Tensor[[CAPACITY, KPOOL_SELECT_K], pl.INT32]],
-    # -- scalars last: the ordinals are dispatch-time runtime scalars computed by
-    #    the HOST (never layer arithmetic inside the graph) ---------------------------
+    # -- scalars last: runtime ordinals and epochs come from the HOST entries or
+    #    the resident backbone loop --------------------------------------------------
     bb_ord: pl.Scalar[pl.INT32],
     dsa_ord: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
