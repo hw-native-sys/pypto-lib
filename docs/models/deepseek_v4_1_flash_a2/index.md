@@ -44,7 +44,7 @@ safetensors headers. The manifest does not hash or copy tensor payloads.
 | `decode_c2a_full.py`, `decode_c2a_reuse.py`, `decode_c1a_full.py`, `decode_c1a_reuse.py`, `decode_c1a_reindex.py` | A2/A3 stage owners for L14/L15/L19/L20/L21/L24/L25. `layer14_15.py` and `layers19_25.py` remain aggregate compatibility providers. |
 | `decode_fwd.py`, `decode_replay.py` | Bounded PyPTO L0 SWA Decode ABI, single-step entry, and fixed 1/2/8-step state replay. These entries do not claim checkpoint accuracy, full-model, or distributed Decode coverage. |
 | `decode_candidates.py`, `decode_acceptance.py`, `decode_gate.py` | Search K=2 candidate registry, independent Decode contract, product import closure scan, runtime identity capture, and fail-closed layer/topology gate reporting. |
-| `decode_checkpoint_manifest.py`, `decode_weights.py` | Read-only Aurora metadata/header audit and lazy tensor resolver; neither performs product computation. |
+| `decode_checkpoint_manifest.py`, `decode_weights.py`, `decode_weight_abi.py` | Read-only Aurora metadata/header audit, lazy tensor resolver, and host-only W8A8-to-EP2 ABI packing; none performs product computation. |
 | `candidate_pool.py`, `raw_checkpoint.py` | A2/A3 candidate metadata and raw checkpoint loading. |
 | `swa_scheduler.py`, `smla_scheduler.py` | Integer-only request, page and causal-selection scheduling. Original and compressed lanes retain separate page tables. |
 | `swa_native.py`, `smla_native.py`, `smla_staging.py` | Registered BF16 SWA/ratio-one SMLA leaves, fresh metadata, and PyPTO dtype boundaries. |
