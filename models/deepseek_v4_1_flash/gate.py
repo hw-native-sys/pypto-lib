@@ -45,7 +45,7 @@ QUANT_TASK_TILE = QUANT_TILE * 4
 assert D % QUANT_TASK_TILE == 0
 MX_GROUP = 32
 MX_SCALE_GROUPS = D // MX_GROUP
-SCORE_PAD = 32 if N_EXPERTS <= 32 else 256 if N_EXPERTS <= 256 else 384
+SCORE_PAD = 32 if N_EXPERTS <= 32 else ((N_EXPERTS + 127) // 128) * 128
 
 
 @pl.jit.extern(
