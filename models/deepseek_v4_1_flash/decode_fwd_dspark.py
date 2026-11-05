@@ -133,7 +133,10 @@ def prepare_target_decode_rank(
                 pl.write(window_indices, [row, column], visible)
         for row in pl.range(PADDED_ROWS):
             for lane in pl.range(HC_MULT):
-                pl.write(pre_mix, [row, lane], pl.cast(1.0, pl.FP32))
+                value = pl.cast(0.0, pl.FP32)
+                if lane == 0:
+                    value = pl.cast(1.0, pl.FP32)
+                pl.write(pre_mix, [row, lane], value)
     pack_x_hc(padded_ids, embedding_weight, x_hc)
     return x_hc, pre_mix
 
@@ -226,11 +229,29 @@ def golden_prepare_target_decode(values: Mapping[str, Any]) -> None:
             active_positions, active_requests, values["c1a_table"], BLOCK_SIZE, 1, True,
         )
     values["query_starts"].copy_(torch.arange(BATCH + 1, dtype=torch.int32) * ROWS)
-    values["pre_mix"].fill_(1)
+    values["pre_mix"].zero_()
+    values["pre_mix"][:, 0] = 1.0
     padded = torch.zeros(PADDED_ROWS, dtype=torch.int64)
     padded[:TARGET_ROWS] = ids
     embedded = values["embedding_weight"].index_select(0, padded).float()
     values["x_hc"].copy_(embedded[:, None, :].expand(-1, HC_MULT, -1))
+
+
+def _compare_target_initial_mix(actual, expected, *, actual_outputs, expected_outputs, **kwargs):
+    """Check identity coefficients and preservation of the active embeddings."""
+    from golden import ratio_allclose
+    from hc import golden_hc_collapse
+
+    compare = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
+    context = dict(actual_outputs=actual_outputs, expected_outputs=expected_outputs, **kwargs)
+    ok, detail = compare(actual, expected, **context)
+    if not ok:
+        return ok, detail
+    hidden = actual_outputs["x_hc"].reshape(-1, HC_MULT, D)
+    collapsed = golden_hc_collapse(hidden, actual.reshape(-1, HC_MULT))
+    embedding = expected_outputs["x_hc"].reshape(-1, HC_MULT, D)[:, 0, :]
+    active = expected_outputs["request_ids"].reshape(-1) >= 0
+    return compare(collapsed[active], embedding[active], **context)
 
 
 def run_prepare_target_decode_case(*, platform: str = "a5", devices: tuple[int, ...] = (0,),
@@ -294,7 +315,10 @@ def run_prepare_target_decode_case(*, platform: str = "a5", devices: tuple[int, 
         }
     else:
         raise ValueError(f"provide one device or EP_SIZE={EP_SIZE} devices, got {devices}")
-    return run(fn=fn, specs=specs, golden_fn=golden_fn, config=config, compile_only=compile_only)
+    return run(
+        fn=fn, specs=specs, golden_fn=golden_fn, config=config, compile_only=compile_only,
+        compare_fn={"pre_mix": _compare_target_initial_mix},
+    )
 
 
 def run_copy_target_hidden_case(*, devices: tuple[int, ...], execution_mode: bool = False,
