@@ -90,14 +90,14 @@ def gather_routed_inputs(
     scale_out: pl.Tensor,
     weights_out: pl.Tensor,
     routes_out: pl.Tensor,
-    wait_ready: pl.Scalar[pl.TASK_ID], publish_ready: pl.Scalar[pl.TASK_ID],
+    wait_ready: pl.Scalar[pl.TASK_ID], push_ready: pl.Scalar[pl.TASK_ID],
     max_per_source: pl.constexpr,
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
 ):
     """Gather source lanes and pack scales with aligned, count-driven workers."""
     x_flat = pl.reshape(x_out, [local_experts * RECV_MAX, D])
     scale_nd = pl.create_tensor([local_experts * RECV_MAX, K_SCALE], dtype=pl.FP8E8M0)
-    with pl.spmd(GATHER_WORKERS, name_hint="dispatch_gather", deps=[wait_ready, publish_ready]) as ready:
+    with pl.spmd(GATHER_WORKERS, name_hint="dispatch_gather", deps=[wait_ready, push_ready]) as ready:
         core = pl.tile.get_block_idx()
         work_base = 0
         for expert in pl.range(local_experts):
@@ -260,10 +260,7 @@ def dispatch(
                     value=moe_epoch, op=pld.NotifyOp.Set,
                 )
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="dispatch_wait",
-        deps=[_push_tid], no_dep_args=[data_arrived],
-    ) as _wait_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_publish_tid]) as _wait_tid:
         for src in pl.range(EP_WORLD_SIZE):
             if src != my_rank:
                 pld.system.defer_wait(signal=data_arrived, offsets=[src, 0, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
@@ -271,7 +268,7 @@ def dispatch(
     return gather_routed_inputs(
         recv_x, recv_scale, recv_weights, recv_routes, recv_meta_local, recv_meta, recv_count_out,
         recv_x_out, recv_scale_out, recv_weight_out, recv_route_out,
-        _wait_tid, _publish_tid, MOE_TOKENS, local_experts=local_experts,
+        _wait_tid, _push_tid, MOE_TOKENS, local_experts=local_experts,
     )
 
 

@@ -6,7 +6,7 @@
 // INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
-// BF16 router projection with FP32 accumulation, fused sqrt-softplus, and selection bias.
+// FP32 router projection with fused sqrt-softplus and selection bias.
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
@@ -17,9 +17,14 @@ using namespace pto;
 namespace {
 constexpr int M = 16;
 constexpr int K = 512;
-using Pipe = TPipe<0, Direction::DIR_C2V, 1024, 2, 2, true>;
+using Pipe = TPipe<0, Direction::DIR_BOTH, 32768, 2, 2, true>;
 using Scores = Tile<TileType::Vec, float, M, M>;
 using Bias = Tile<TileType::Vec, float, 1, M, BLayout::RowMajor, 1, DYNAMIC>;
+using Weight = Tile<TileType::Vec, float, M, K, BLayout::RowMajor, DYNAMIC, K>;
+using WeightPad = Tile<TileType::Vec, float, M, K, BLayout::RowMajor, M, K,
+                       SLayout::NoneBox, 512, PadValue::Zero>;
+using WeightNZ = Tile<TileType::Vec, float, M, K, BLayout::ColMajor, M, K,
+                      SLayout::RowMajor, 512, PadValue::Zero>;
 
 template <typename T>
 __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int index) {
@@ -64,18 +69,19 @@ __tf__ __aicore__ inline void score_vf(
             vmax(relu, x, zero, all, MODE_ZEROING);
             vabs(absolute, x, all, MODE_ZEROING);
             vmuls(tail, absolute, -1.0f, all, MODE_ZEROING);
-            vexp(floor, tail, all, MODE_ZEROING);
-            vadds(tail, floor, 1.0f, all, MODE_ZEROING);
+            vexp(tail, tail, all, MODE_ZEROING);
+            vadds(tail, tail, 1.0f, all, MODE_ZEROING);
             vln(tail, tail, all, MODE_ZEROING);
             vadd(tail, relu, tail, all, MODE_ZEROING);
             vmuls(mask, x, -1.0f, all, MODE_ZEROING);
             vadds(mask, mask, -10.0f, all, MODE_ZEROING);
             vmax(mask, mask, zero, all, MODE_ZEROING);
             vmin(mask, mask, one, all, MODE_ZEROING);
+            vmin(floor, x, zero, all, MODE_ZEROING);
+            vexp(floor, floor, all, MODE_ZEROING);
             vmul(floor, mask, floor, all, MODE_ZEROING);
             vmax(score, tail, floor, all, MODE_ZEROING);
             vsqrt(score, score, all, MODE_ZEROING);
-            vsel(score, score, zero, valid_columns);
             vsts(score, dst, segment * 64, NORM_B32, all);
             vadd(score, score, b, all, MODE_ZEROING);
             vsts(score, selection, segment * 64, NORM_B32, all);
@@ -83,23 +89,15 @@ __tf__ __aicore__ inline void score_vf(
     }
 }
 #else
-__aicore__ inline void score_tiles(Scores& scores, Scores& biased, Scores& logits, Bias& bias, int valid) {
+__aicore__ inline void score_tiles(Scores& scores, Scores& biased, Scores& logits, Bias& bias) {
     Scores relu, absolute, tail, mask, floor;
     TASSIGN(relu, 68608); TASSIGN(absolute, 69632); TASSIGN(tail, 70656);
     TASSIGN(mask, 71680); TASSIGN(floor, 72704);
     TMAXS(relu, logits, 0.0f); TABS(absolute, logits); TNEG(tail, absolute);
-    TEXP(floor, tail); TADDS(tail, floor, 1.0f); TLOG(tail, tail); TADD(tail, relu, tail);
+    TEXP(tail, tail); TADDS(tail, tail, 1.0f); TLOG(tail, tail); TADD(tail, relu, tail);
     TNEG(mask, logits); TSUBS(mask, mask, 10.0f); TMAXS(mask, mask, 0.0f); TMINS(mask, mask, 1.0f);
-    TMUL(floor, mask, floor);
-    TMAX(scores, tail, floor); TSQRT(scores, scores);
-    using ValidScores = Tile<TileType::Vec, float, M, M, BLayout::RowMajor, M, DYNAMIC>;
-    using PaddedScores = Tile<TileType::Vec, float, M, M, BLayout::RowMajor, M, M,
-                              SLayout::NoneBox, 512, PadValue::Zero>;
-    ValidScores valid_scores(valid);
-    PaddedScores padded_scores;
-    TASSIGN(valid_scores, 65536); TASSIGN(padded_scores, 65536);
-    TFILLPAD<pto::TFillPadMode::InPlace>(padded_scores, valid_scores);
-    TCOLEXPANDADD(biased, scores, bias);
+    TMINS(floor, logits, 0.0f); TEXP(floor, floor); TMUL(floor, mask, floor);
+    TMAX(scores, tail, floor); TSQRT(scores, scores); TCOLEXPANDADD(biased, scores, bias);
 }
 #endif
 
@@ -107,11 +105,43 @@ __aicore__ inline void vector_gate(__gm__ int64_t* args) {
     int experts = dim(args, 1, 0), width = dim(args, 0, 1), columns = (experts + 15) / 16;
     int out_stride = dim(args, 3, 1);
     Pipe pipe(nullptr, 0, 0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
     for (int work = get_block_idx(args); work < args[5]; work += get_block_num(args)) {
         int t0 = work / columns * M, n0 = work % columns * M;
         int valid = experts - n0; valid = valid > M ? M : valid;
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
+        for (int k0 = 0; k0 < width; k0 += 2 * K) {
+            Weight input0(valid), input1(valid);
+            TASSIGN(input0, 98304); TASSIGN(input1, 131072);
+            GlobalTensor<float, Shape<DYNAMIC, K>, Stride> weight0_gm(
+                data<float>(args, 1) + n0 * width + k0, Shape<DYNAMIC, K>(valid, K), Stride(1, 1, 1, width, 1));
+            GlobalTensor<float, Shape<DYNAMIC, K>, Stride> weight1_gm(
+                data<float>(args, 1) + n0 * width + k0 + K, Shape<DYNAMIC, K>(valid, K), Stride(1, 1, 1, width, 1));
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            TLOAD(input0, weight0_gm);
+            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+            TLOAD(input1, weight1_gm);
+            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+            for (int slot = 0; slot < 2; ++slot) {
+                auto event = static_cast<event_t>(slot);
+                Weight input(valid);
+                WeightPad padded;
+                WeightNZ nz;
+                TASSIGN(input, 98304 + slot * 32768);
+                TASSIGN(padded, 98304 + slot * 32768);
+                TASSIGN(nz, slot == 0 ? 163840 : 65536);
+                wait_flag(PIPE_MTE2, PIPE_V, event);
+                TFILLPAD<pto::TFillPadMode::InPlace>(padded, input);
+                TMOV(nz, padded);
+                set_flag(PIPE_V, PIPE_MTE3, event); wait_flag(PIPE_V, PIPE_MTE3, event);
+                TPUSH<Pipe, WeightNZ, TileSplitAxis::TILE_NO_SPLIT>(pipe, nz);
+                set_flag(PIPE_MTE3, PIPE_MTE2, event);
+            }
+        }
+        pipe_barrier(PIPE_ALL);
         Scores logits, scores, biased;
         Bias bias(valid);
         TASSIGN(scores, 65536); TASSIGN(biased, 66560); TASSIGN(bias, 67584);
@@ -130,7 +160,7 @@ __aicore__ inline void vector_gate(__gm__ int64_t* args) {
         TFILLPAD<pto::TFillPadMode::InPlace>(padded_bias, bias);
         Bias full_bias(M);
         TASSIGN(full_bias, 67584);
-        score_tiles(scores, biased, logits, full_bias, valid);
+        score_tiles(scores, biased, logits, full_bias);
 #endif
         pipe_barrier(PIPE_ALL);
         TFREE<Pipe, TileSplitAxis::TILE_NO_SPLIT>(pipe);
@@ -141,23 +171,21 @@ __aicore__ inline void vector_gate(__gm__ int64_t* args) {
         TSTORE(scores_gm, scores); TSTORE(biased_gm, biased);
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
     }
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
     pipe_barrier(PIPE_ALL);
 }
 #endif
 
 #if defined(__DAV_CUBE__)
-template <int R, int C>
-using InputShape = TileShape2D<bfloat16_t, R, C>;
-using Mat = Tile<TileType::Mat, bfloat16_t, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
-using MatWeight = Tile<TileType::Mat, bfloat16_t, M, K, BLayout::ColMajor, M, K,
+using Mat = Tile<TileType::Mat, float, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
+using MatWeight = Tile<TileType::Mat, float, M, K, BLayout::ColMajor, M, K,
                        SLayout::RowMajor, 512, PadValue::Zero>;
-using WeightLoad = Tile<TileType::Mat, bfloat16_t, M, K, BLayout::ColMajor, DYNAMIC, K,
-                        SLayout::RowMajor, 512, PadValue::Zero>;
-using Transposed = Tile<TileType::Mat, bfloat16_t, K, M, BLayout::RowMajor, K, M,
+using Transposed = Tile<TileType::Mat, float, K, M, BLayout::RowMajor, K, M,
                         SLayout::ColMajor, 512, PadValue::Zero>;
-using Left = Tile<TileType::Left, bfloat16_t, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
-using Right = Tile<TileType::Right, bfloat16_t, K, M, BLayout::RowMajor, K, M,
+using Left = Tile<TileType::Left, float, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
+using Right = Tile<TileType::Right, float, K, M, BLayout::RowMajor, K, M,
                    SLayout::ColMajor, 512, PadValue::Zero>;
 using Acc = Tile<TileType::Acc, float, M, M, BLayout::ColMajor, M, M, SLayout::RowMajor, 1024>;
 
@@ -173,30 +201,21 @@ __aicore__ inline void cube_gate(__gm__ int64_t* args) {
         set_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(slot));
     }
     for (int work = get_block_idx(args); work < args[5]; work += get_block_num(args)) {
-        int t0 = work / columns * M, n0 = work % columns * M;
-        int valid = experts - n0; valid = valid > M ? M : valid;
+        int t0 = work / columns * M;
         Acc acc;
         TASSIGN(acc, 0);
         wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
         for (int k0 = 0; k0 < width; k0 += 2 * K) {
             Mat input0, input1;
-            WeightLoad weight0(valid), weight1(valid);
             TASSIGN(input0, 65536); TASSIGN(input1, 98304);
-            TASSIGN(weight0, 131072); TASSIGN(weight1, 163840);
-            GlobalTensor<bfloat16_t, InputShape<M, K>, Stride> input0_gm(
-                data<bfloat16_t>(args, 0) + t0 * width + k0, InputShape<M, K>(), Stride(1, 1, 1, width, 1));
-            GlobalTensor<bfloat16_t, InputShape<M, K>, Stride> input1_gm(
-                data<bfloat16_t>(args, 0) + t0 * width + k0 + K, InputShape<M, K>(), Stride(1, 1, 1, width, 1));
-            GlobalTensor<bfloat16_t, InputShape<DYNAMIC, K>, Stride> weight0_gm(
-                data<bfloat16_t>(args, 1) + n0 * width + k0, InputShape<DYNAMIC, K>(valid, K), Stride(1, 1, 1, width, 1));
-            GlobalTensor<bfloat16_t, InputShape<DYNAMIC, K>, Stride> weight1_gm(
-                data<bfloat16_t>(args, 1) + n0 * width + k0 + K, InputShape<DYNAMIC, K>(valid, K), Stride(1, 1, 1, width, 1));
+            GlobalTensor<float, Shape<M, K>, Stride> input0_gm(
+                data<float>(args, 0) + t0 * width + k0, Shape<M, K>(), Stride(1, 1, 1, width, 1));
+            GlobalTensor<float, Shape<M, K>, Stride> input1_gm(
+                data<float>(args, 0) + t0 * width + k0 + K, Shape<M, K>(), Stride(1, 1, 1, width, 1));
             wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
-            TLOAD(input0, input0_gm); TLOAD(weight0, weight0_gm);
-            set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+            TLOAD(input0, input0_gm); set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
             wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
-            TLOAD(input1, input1_gm); TLOAD(weight1, weight1_gm);
-            set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+            TLOAD(input1, input1_gm); set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
             for (int slot = 0; slot < 2; ++slot) {
                 int offset = slot == 0 ? 32768 : 0;
                 auto event = static_cast<event_t>(slot);
@@ -206,13 +225,14 @@ __aicore__ inline void cube_gate(__gm__ int64_t* args) {
                 Left left;
                 Right right;
                 TASSIGN(input, 65536 + slot * 32768);
-                TASSIGN(weight, 131072 + slot * 32768);
                 TASSIGN(left, offset); TASSIGN(right, offset);
                 wait_flag(PIPE_MTE2, PIPE_MTE1, event);
                 wait_flag(PIPE_M, PIPE_MTE1, event);
+                TPOP<Pipe, MatWeight, TileSplitAxis::TILE_NO_SPLIT>(pipe, weight);
                 TRESHAPE(transposed, weight);
                 TMOV(left, input); TMOV(right, transposed);
                 set_flag(PIPE_MTE1, PIPE_M, event); wait_flag(PIPE_MTE1, PIPE_M, event);
+                TFREE<Pipe, TileSplitAxis::TILE_NO_SPLIT>(pipe);
                 if (k0 == 0 && slot == 0) TMATMUL(acc, left, right);
                 else TMATMUL_ACC(acc, acc, left, right);
                 set_flag(PIPE_M, PIPE_MTE1, event);
