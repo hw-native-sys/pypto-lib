@@ -106,6 +106,12 @@ checkpoint, historical cache, request state, or an independent reference
 capture; complete C1A/C2A index/compression, mHC/residual, Engram, CP/SP and
 full-layer composition remain formal blockers.
 
+The bounded SWA entry and the EP2 MoE entry are intentionally separate
+operators. No current entry claims a complete physical layer that composes
+attention/cache, mHC residual streams, Engram, and routed/shared MoE; that
+composition must be added and independently gated before DP8/TP2/EP16 can
+advance.
+
 The supplied Aurora W8A8 Dynamic export is registered as an external
 checkpoint asset. Its index references 270 quantized shard files using the
 `of-00272` naming convention, and four separate Engram safetensors are present
@@ -143,6 +149,7 @@ The following checks were run in the pinned shared environment on 2026-11-05:
 | PyPTO replay compile | `pass` | `decode_replay --steps 1/2/8 -p a2a3 --sim --compile-only` |
 | EP2 PyPTO MoE code generation | `pass` | `decode_ep2_compile`; `.pypto-a3-state/decode-ep2-compile.json`; A3 artifact generated with 384 routed experts and 192 local experts per rank |
 | real Aurora EP2 weight ABI probe | `pass` | `decode_weight_abi.py`; one real layer-0 expert, router, and shared expert packed in the vLLM environment; NZ round-trip and W2 zero-tail checks passed |
+| Decode asset structure verifier | `pass` | `decode_asset_contract.py`; current report rejects the absent input, history-cache, and reference-capture files before queue submission |
 | Aurora checkpoint manifest | `pass` | `.pypto-a3-state/deepseek-v41-checkpoint-manifest.json`; metadata/header audit only |
 | simulator numerical replay | `not_run` | CPU/simulator precision is outside this session; no NPU result inferred |
 | independent reference manifest | `not_run` | vLLM-Ascend path, Decode input/cache and capture are not configured |
