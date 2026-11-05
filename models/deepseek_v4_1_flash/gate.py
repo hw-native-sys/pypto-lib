@@ -20,7 +20,7 @@ from config import FLASH as M
 from config import MOE_TOKENS, EP_SIZE, N_LOCAL_EXPERTS
 
 
-from rmsnorm import rms_norm_tiled
+from rmsnorm import rms_norm_bf16
 
 
 # model config
@@ -35,6 +35,7 @@ N_HASH_LAYERS = 0
 # tiling
 GATE_T_TILE = 8
 GATE_INPUT_TILE = 8
+GATE_NORM_TILE = 2
 assert T % GATE_T_TILE == 0
 GATE_M_TILE = 16
 GATE_N_TILE = 16
@@ -163,7 +164,7 @@ def golden_gate_reference(
     correction_bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute sqrt-softplus routing, with bias affecting selection only."""
-    scores = F.softplus(F.linear(x.float(), weight.float()) / M.gate_temperature).sqrt()
+    scores = F.softplus(F.linear(x.float(), weight.to(torch.bfloat16).float()) / M.gate_temperature).sqrt()
     indices = (scores + correction_bias.float()).topk(M.num_experts_per_tok, dim=-1).indices
     weights = scores.gather(-1, indices)
     weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
@@ -189,24 +190,24 @@ def gate_normalized(
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
 
-    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
+    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
     for block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="gate_normalized_input"):
         t0 = block * GATE_INPUT_TILE
         valid_rows = pl.min(GATE_INPUT_TILE, pl.max(active_tokens - t0, 0))
         normalized = pl.slice(x_normed, [GATE_INPUT_TILE, D], [t0, 0], valid_shape=[valid_rows, D])
         normalized = pl.fillpad(normalized, pad_value=pl.PadValue.zero)
         normalized = pl.set_validshape(normalized, GATE_INPUT_TILE, D)
-        xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = pl.cast(normalized, pl.FP32)
+        xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = normalized
 
-    return gate_from_fp32(
+    return gate_from_bf16(
         xg_buf, gate_w, gate_bias, num_tokens,
         x_norm_mx, x_norm_scale, indices, weights, n_experts=n_experts, topk=topk,
     )
 
 
 @pl.jit.inline
-def gate_from_fp32(
-    xg_buf: pl.Tensor[[T_PAD, D], pl.FP32],
+def gate_from_bf16(
+    xg_buf: pl.Tensor[[T_PAD, D], pl.BF16],
     gate_w: pl.Tensor,
     gate_bias: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
@@ -306,14 +307,14 @@ def gate(
     n_experts: pl.constexpr = N_EXPERTS,
     topk: pl.constexpr = TOPK,
 ):
-    """Normalize router inputs with BF16 rounding and FP32 output."""
+    """Normalize router inputs and pass BF16 values to quantization and projection."""
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     active_tokens = pl.max(active_tokens, 0)
     active_tokens = pl.min(active_tokens, T)
-    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
-    for norm_block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="rms_norm"):
-        rms_norm_tiled(x_mixed, norm_w, xg_buf, norm_block, active_tokens, output_fp32=True)
-    return gate_from_fp32(
+    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
+    with pl.spmd(T_PAD // GATE_NORM_TILE, name_hint="rms_norm"):
+        xg_buf = rms_norm_bf16(x_mixed, norm_w, xg_buf, active_tokens)
+    return gate_from_bf16(
         xg_buf, gate_w, gate_bias, num_tokens,
         x_norm_mx, x_norm_scale, indices, weights, n_experts=n_experts, topk=topk,
     )
@@ -323,7 +324,7 @@ def gate(
 def l2_gate(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
-    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.BF16],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -351,7 +352,7 @@ def _golden_gate_scores(tensors):
 
     x_norm = golden_rms_norm_tiled(tensors["x_mixed"], tensors["norm_w"]).cpu().float().view(T, D)
 
-    gate_w = tensors["gate_w"].cpu().float()
+    gate_w = tensors["gate_w"].cpu().to(torch.bfloat16).float()
     gate_bias = tensors["gate_bias"].cpu().float()
     logits = x_norm @ gate_w.T
     softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
@@ -413,7 +414,7 @@ def golden_gate_normalized_core(tensors):
     import torch
 
     x_norm = tensors["x_normed"].cpu().to(torch.bfloat16).float().view(T, D)
-    gate_w = tensors["gate_w"].cpu().float()
+    gate_w = tensors["gate_w"].cpu().to(torch.bfloat16).float()
     gate_bias = tensors["gate_bias"].cpu().float()
     logits = x_norm @ gate_w.T
     softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
@@ -459,7 +460,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
     return [
         TensorSpec("x_mixed", [T, D], torch.bfloat16, init_value=init_x_mixed),
         TensorSpec("norm_w", [D], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=init_gate_w),
+        TensorSpec("gate_w", [N_EXPERTS, D], torch.bfloat16, init_value=init_gate_w),
         TensorSpec("gate_bias", [N_EXPERTS], torch.float32, init_value=init_gate_bias),
         ScalarSpec("layer_id", torch.int32, layer_id),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
