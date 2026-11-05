@@ -21,7 +21,7 @@ import torch
 
 from models.glm5_3_flash.config import FLASH, N_EXPERTS, TOPK, D, Glm53FlashConfig
 from models.glm5_3_flash.elementwise import FP32_NEG_INF, accurate_divide, accurate_sigmoid
-from models.glm5_3_flash.linear import bf16_linear
+from models.glm5_3_flash.linear import bf16_linear_row
 from models.glm5_3_flash.rmsnorm import golden_rmsnorm_quant, rms_norm, rmsnorm_quant
 
 T_DYN = pl.dynamic('GLM53_T_DYN')
@@ -29,10 +29,11 @@ T_DYN = pl.dynamic('GLM53_T_DYN')
 ROUTE_SCALE = FLASH.routed_scaling_factor
 SCORE_PAD = 512  # 288 experts padded to the next sort32-friendly width
 GATE_T_TILE = 8  # router sort / write-back token tile
-GATE_M_TILE = 16  # cube M-tile: matmul rows must be a multiple of 16 (fractal)
+GATE_M_TILE = 16  # score scratch row padding
 GATE_N_TILE = 16  # expert columns per gate spmd block
 TOPK_PAD = 8  # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2  # (val, idx) interleaved slice width
+GATE_WORKERS_TILE = 32256  # Runtime set_block_num ceiling
 T_DYN_TEST = 64
 
 
@@ -56,7 +57,6 @@ def moe_gate(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > token_rows:
         active_tokens = pl.cast(token_rows, pl.INDEX)
-    active_gate_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
     normalized_input = pl.create_tensor([token_rows, D], dtype=pl.BF16)
     if active_tokens > 0:
@@ -87,24 +87,19 @@ def moe_gate(
     route_scores_buf = pl.create_tensor([padded_rows, SCORE_PAD], dtype=pl.FP32)
     if active_tokens > 0:
         # BF16 normalized routing inputs produce FP32 logits and sigmoid scores.
-        for gb_idx in pl.spmd(active_gate_tiles * (N_EXPERTS // GATE_N_TILE), name_hint="gate", allow_early_resolve=True):
-            tg = gb_idx // (N_EXPERTS // GATE_N_TILE)
-            nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
-            t1 = tg * GATE_M_TILE
-            n0 = nb * GATE_N_TILE
-            rows = pl.min(GATE_M_TILE, token_rows - t1)
-            logits = bf16_linear(
-                normalized_input, gate_weight, t1, n0, rows, pl.cast(GATE_N_TILE, pl.INDEX), GATE_M_TILE,
-                GATE_N_TILE, D, True,
-            )
-            gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-            gate_logits_tile[:, :] = logits
-            gp_sigmoid = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-            gp_sigmoid[:, :] = accurate_sigmoid(gate_logits_tile, GATE_M_TILE, GATE_N_TILE)
-            route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_sigmoid
-            gp_bias_row = pl.reshape(correction_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
-            gp_biased = pl.col_expand_add(gp_sigmoid, gp_bias_row)
-            biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
+        for worker in pl.spmd(pl.min(active_tokens * (N_EXPERTS // GATE_N_TILE), GATE_WORKERS_TILE), name_hint="gate", allow_early_resolve=True):
+            for gb_idx in pl.range(worker, active_tokens * (N_EXPERTS // GATE_N_TILE), GATE_WORKERS_TILE):
+                t1 = gb_idx // (N_EXPERTS // GATE_N_TILE)
+                n0 = gb_idx % (N_EXPERTS // GATE_N_TILE) * GATE_N_TILE
+                logits = bf16_linear_row(normalized_input, gate_weight, t1, n0, GATE_N_TILE, D, 128, 2)
+                gate_logits_tile = pl.create_tensor([1, GATE_N_TILE], dtype=pl.FP32)
+                gate_logits_tile[:, :] = logits
+                gp_sigmoid = pl.create_tensor([1, GATE_N_TILE], dtype=pl.FP32)
+                gp_sigmoid[:, :] = accurate_sigmoid(gate_logits_tile, 1, GATE_N_TILE)
+                route_scores_buf[t1:t1 + 1, n0:n0 + GATE_N_TILE] = gp_sigmoid
+                gp_bias_row = pl.reshape(correction_bias[n0:n0 + GATE_N_TILE], [1, GATE_N_TILE])
+                gp_biased = pl.add(gp_sigmoid, gp_bias_row)
+                biased_scores_buf[t1:t1 + 1, n0:n0 + GATE_N_TILE] = gp_biased
 
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     if active_tokens > 0:
@@ -327,9 +322,19 @@ def compare_route_weights(actual, expected, *, actual_outputs, expected_outputs,
     )
 
 
-def build_tensor_specs(num_tokens=T_DYN_TEST, seed=533):
+def compare_quantized_input(actual, expected, *, inputs, **kwargs):
+    """Compare active quantized rows using the executed input scalar."""
+    from golden import ratio_allclose
+
+    valid_rows = min(actual.shape[0], gate_active_rows(inputs["num_tokens"]))
+    compare = ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001, valid_rows=valid_rows)
+    return compare(actual, expected, inputs=inputs, **kwargs)
+
+
+def build_tensor_specs(num_tokens=T_DYN_TEST, seed=533, *, active_tokens=None):
     from golden import ScalarSpec, TensorSpec
 
+    active_tokens = num_tokens if active_tokens is None else active_tokens
     generator = torch.Generator().manual_seed(seed)
 
     def init_x():
@@ -349,7 +354,7 @@ def build_tensor_specs(num_tokens=T_DYN_TEST, seed=533):
         TensorSpec("norm_weight", [D], torch.bfloat16, init_value=init_norm_weight),
         TensorSpec("gate_weight", [N_EXPERTS, D], torch.bfloat16, init_value=init_gate_weight),
         TensorSpec("correction_bias", [N_EXPERTS], torch.float32, init_value=init_correction_bias),
-        ScalarSpec("num_tokens", torch.int32, num_tokens),
+        ScalarSpec("num_tokens", torch.int32, active_tokens),
         TensorSpec("route_weights", [num_tokens, TOPK], torch.float32),
         TensorSpec("route_indices", [num_tokens, TOPK], torch.int32),
         TensorSpec("x_int8", [num_tokens, D], torch.int8),
@@ -360,7 +365,7 @@ def build_tensor_specs(num_tokens=T_DYN_TEST, seed=533):
 if __name__ == "__main__":
     import argparse
 
-    from golden import ratio_allclose, run
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
@@ -370,20 +375,31 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=int, default=16)
     parser.add_argument("--ep", type=int, default=16)
     parser.add_argument("--seed", type=int, default=533)
+    parser.add_argument("--active-tokens", type=int, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", default=None)
     args = parser.parse_args()
     if args.num_tokens < 1:
         parser.error("--num-tokens must be positive")
 
+    num_tokens = args.num_tokens
+    if args.golden_data is not None:
+        cached_x = Path(args.golden_data) / "in" / "x.pt"
+        num_tokens = torch.load(cached_x, weights_only=True, map_location="cpu").shape[0]
+    active_tokens = num_tokens if args.active_tokens is None else args.active_tokens
+
     result = run(
         fn=moe_gate_test,
-        specs=build_tensor_specs(args.num_tokens, args.seed),
+        specs=build_tensor_specs(num_tokens, args.seed, active_tokens=active_tokens),
         golden_fn=golden_moe_gate,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         config=dict(dump_passes=args.dump_passes, backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane),
         rtol=0.001,
         atol=0.001,
-        compare_fn={"x_int8": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001, valid_rows=gate_active_rows(args.num_tokens)), "route_weights": compare_route_weights, "route_indices": compare_route_indices},
+        compare_fn={"x_int8": compare_quantized_input, "route_weights": compare_route_weights, "route_indices": compare_route_indices},
     )
     if not result.passed:
         if result.error:

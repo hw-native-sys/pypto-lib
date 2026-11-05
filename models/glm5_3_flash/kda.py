@@ -29,7 +29,7 @@ from models.glm5_3_flash.elementwise import (
     accurate_divide, accurate_exp, accurate_row_sum, accurate_rsqrt, accurate_sigmoid, accurate_silu,
     accurate_sqrt,
 )
-from models.glm5_3_flash.linear import bf16_linear, golden_bf16_linear
+from models.glm5_3_flash.linear import bf16_linear_row, golden_bf16_linear
 from models.glm5_3_flash.rmsnorm import l2norm, reference_l2norm, rms_norm_gated
 from models.glm5_3_flash.utils import _assert_close, _randn
 
@@ -47,15 +47,21 @@ DECODE_C_TILE = 128  # channels per decode convolution task
 _PREFILL_LENGTHS = {"ragged": [5, 1, 9, 2, 0], "single": [1], "long": [40], "paged": [32, 1]}
 CONV_POOL_ROWS = 6
 
-PROJECTION_T_TILE = 16  # tokens per task
+PROJECTION_WORKERS_TILE = 32256  # Runtime set_block_num ceiling
+PROJECTION_T_TILE = 16
+PROJECTION_N_TILE = 16
+PROJECTION_K_TILE = 512
+PROJECTION_PIPELINE_TILE = 1
+GATE_PROJECTION_N_TILE = 64
+OUTPUT_PROJECTION_N_TILE = 32
+OUTPUT_PROJECTION_K_TILE = 256
+OUTPUT_PROJECTION_PIPELINE_TILE = 2
+BETA_N_TILE = 16  # 32-byte BF16 output row
 BETA_PAD = ((LOCAL_KDA_H + 15) // 16) * 16
-N_TILE = min(256, LOCAL_KDA_QKV_DIM)
 
 EPS = FLASH.rms_norm_eps
 KDA_DIM_INV = 1.0 / KDA_DIM
-OUTPUT_T_TILE = 16  # tokens per task; the norm pass handles T_TILE * LOCAL_KDA_H rows
 OUTPUT_NORM_ROWS_TILE = 8
-D_TILE = 128  # output columns per projection task
 
 DECODE_L2_EPS = 1e-6
 DECODE_Q_SCALE = KDA_DIM**-0.5
@@ -363,54 +369,53 @@ def kda_projection(
             else:
                 w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
-    with pl.spmd(tiles * (LOCAL_KDA_QKV_DIM // N_TILE), name_hint="kda_projection_qkv"):
-        task = pl.tile.get_block_idx()
-        t0 = task // (LOCAL_KDA_QKV_DIM // N_TILE) * PROJECTION_T_TILE
-        n0 = task % (LOCAL_KDA_QKV_DIM // N_TILE) * N_TILE
-        rows = pl.min(PROJECTION_T_TILE, t_dim - t0)
-        acc_q = bf16_linear(x, w_q, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), PROJECTION_T_TILE, N_TILE, D, True)
-        acc_q_bf16 = pl.cast(acc_q, pl.BF16, mode="rint")
-        mixed_qkv[t0 : t0 + PROJECTION_T_TILE, n0 : n0 + N_TILE] = pl.set_validshape(acc_q_bf16, rows, N_TILE)
-        acc_k = bf16_linear(x, w_k, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), PROJECTION_T_TILE, N_TILE, D, True)
-        acc_k_bf16 = pl.cast(acc_k, pl.BF16, mode="rint")
-        mixed_qkv[t0:t0 + PROJECTION_T_TILE, LOCAL_KDA_QKV_DIM + n0:LOCAL_KDA_QKV_DIM + n0 + N_TILE] = pl.set_validshape(acc_k_bf16, rows, N_TILE)
-        acc_v = bf16_linear(x, w_v, t0, n0, rows, pl.cast(N_TILE, pl.INDEX), PROJECTION_T_TILE, N_TILE, D, True)
-        acc_v_bf16 = pl.cast(acc_v, pl.BF16, mode="rint")
-        mixed_qkv[t0:t0 + PROJECTION_T_TILE, 2 * LOCAL_KDA_QKV_DIM + n0:2 * LOCAL_KDA_QKV_DIM + n0 + N_TILE] = pl.set_validshape(acc_v_bf16, rows, N_TILE)
+    with pl.spmd(pl.min(t_dim * (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE), PROJECTION_WORKERS_TILE), name_hint="kda_projection_qkv"):
+        for task in pl.range(pl.tile.get_block_idx(), t_dim * (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE), PROJECTION_WORKERS_TILE):
+            t0 = task // (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE)
+            n0 = task % (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE) * PROJECTION_N_TILE
+            acc_q = bf16_linear_row(x, w_q, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+            acc_q_bf16 = pl.cast(acc_q, pl.BF16, mode="rint")
+            mixed_qkv[t0:t0 + 1, n0:n0 + PROJECTION_N_TILE] = acc_q_bf16
+            acc_k = bf16_linear_row(x, w_k, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+            acc_k_bf16 = pl.cast(acc_k, pl.BF16, mode="rint")
+            k0 = LOCAL_KDA_QKV_DIM + n0
+            mixed_qkv[t0:t0 + 1, k0:k0 + PROJECTION_N_TILE] = acc_k_bf16
+            acc_v = bf16_linear_row(x, w_v, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+            acc_v_bf16 = pl.cast(acc_v, pl.BF16, mode="rint")
+            v0 = 2 * LOCAL_KDA_QKV_DIM + n0
+            mixed_qkv[t0:t0 + 1, v0:v0 + PROJECTION_N_TILE] = acc_v_bf16
     b_raw_gm = pl.create_tensor([t_pad, BETA_PAD], dtype=pl.BF16)
     g_a_gm = pl.create_tensor([t_pad, KDA_DIM], dtype=pl.BF16)
     f_a_gm = pl.create_tensor([t_pad, KDA_DIM], dtype=pl.BF16)
-    with pl.spmd(tiles, name_hint="kda_projection_bottleneck", deps=[pad_tid]) as bottleneck_tid:
-        t0 = pl.tile.get_block_idx() * PROJECTION_T_TILE
-        rows = pl.min(PROJECTION_T_TILE, t_dim - t0)
-        f_a_index = pl.cast(0, pl.INDEX)
-        KDA_DIM_index = pl.cast(KDA_DIM, pl.INDEX)
-        f_a = bf16_linear(x, w_f_a, t0, f_a_index, rows, KDA_DIM_index, PROJECTION_T_TILE, KDA_DIM, D, True)
-        f_a_gm[t0 : t0 + PROJECTION_T_TILE, :] = pl.set_validshape(pl.cast(f_a, pl.BF16, mode="rint"), rows, KDA_DIM)
-        g_a_index = pl.cast(0, pl.INDEX)
-        KDA_DIM_index_2 = pl.cast(KDA_DIM, pl.INDEX)
-        g_a = bf16_linear(x, w_g_a, t0, g_a_index, rows, KDA_DIM_index_2, PROJECTION_T_TILE, KDA_DIM, D, True)
-        g_a_gm[t0 : t0 + PROJECTION_T_TILE, :] = pl.set_validshape(pl.cast(g_a, pl.BF16, mode="rint"), rows, KDA_DIM)
-        b_raw_index = pl.cast(0, pl.INDEX)
-        BETA_PAD_index = pl.cast(BETA_PAD, pl.INDEX)
-        b_raw = bf16_linear(x, w_b_pad, t0, b_raw_index, rows, BETA_PAD_index, PROJECTION_T_TILE, BETA_PAD, D, True)
-        b_raw_bf16 = pl.cast(b_raw, pl.BF16, mode="rint")
-        b_raw_gm[t0 : t0 + PROJECTION_T_TILE, :] = pl.set_validshape(b_raw_bf16, rows, BETA_PAD)
+    bottleneck_tasks = t_dim * (KDA_DIM // PROJECTION_N_TILE)
+    with pl.spmd(pl.min(bottleneck_tasks, PROJECTION_WORKERS_TILE), name_hint="kda_projection_bottleneck", deps=[pad_tid]) as bottleneck_tid:
+        for task in pl.range(pl.tile.get_block_idx(), bottleneck_tasks, PROJECTION_WORKERS_TILE):
+            t0 = task // (KDA_DIM // PROJECTION_N_TILE)
+            n0 = task % (KDA_DIM // PROJECTION_N_TILE) * PROJECTION_N_TILE
+            f_a = bf16_linear_row(x, w_f_a, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+            f_a_bf16 = pl.cast(f_a, pl.BF16, mode="rint")
+            f_a_gm[t0:t0 + 1, n0:n0 + PROJECTION_N_TILE] = f_a_bf16
+            g_a = bf16_linear_row(x, w_g_a, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+            g_a_bf16 = pl.cast(g_a, pl.BF16, mode="rint")
+            g_a_gm[t0:t0 + 1, n0:n0 + PROJECTION_N_TILE] = g_a_bf16
+            if n0 == 0:
+                for b0 in pl.range(0, BETA_PAD, BETA_N_TILE):
+                    b_raw = bf16_linear_row(x, w_b_pad, t0, b0, BETA_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+                    b_raw_bf16 = pl.cast(b_raw, pl.BF16, mode="rint")
+                    b_raw_gm[t0:t0 + 1, b0:b0 + BETA_N_TILE] = b_raw_bf16
     out_gate_flat = pl.reshape(out_gate, [t_dim, LOCAL_KDA_QKV_DIM])
     g_raw_gm = pl.create_tensor([t_pad, LOCAL_KDA_QKV_DIM], dtype=pl.BF16)
-    with pl.spmd(tiles * (LOCAL_KDA_QKV_DIM // N_TILE), name_hint="kda_projection_output", deps=[bottleneck_tid]) as output_tid:
-        task = pl.tile.get_block_idx()
-        t0 = task // (LOCAL_KDA_QKV_DIM // N_TILE) * PROJECTION_T_TILE
-        n0 = task % (LOCAL_KDA_QKV_DIM // N_TILE) * N_TILE
-        rows = pl.min(PROJECTION_T_TILE, t_dim - t0)
-        N_TILE_index = pl.cast(N_TILE, pl.INDEX)
-        g_raw = bf16_linear(f_a_gm, w_f_b, t0, n0, rows, N_TILE_index, PROJECTION_T_TILE, N_TILE, KDA_DIM, True)
-        g_raw_bf16 = pl.cast(g_raw, pl.BF16, mode="rint")
-        g_raw_gm[t0 : t0 + PROJECTION_T_TILE, n0 : n0 + N_TILE] = pl.set_validshape(g_raw_bf16, rows, N_TILE)
-        N_TILE_index_2 = pl.cast(N_TILE, pl.INDEX)
-        out_raw = bf16_linear(g_a_gm, w_g_b, t0, n0, rows, N_TILE_index_2, PROJECTION_T_TILE, N_TILE, KDA_DIM, True)
-        out_raw_bf16 = pl.cast(out_raw, pl.BF16, mode="rint")
-        out_gate_flat[t0 : t0 + PROJECTION_T_TILE, n0 : n0 + N_TILE] = pl.set_validshape(out_raw_bf16, rows, N_TILE)
+    output_tasks = t_dim * (LOCAL_KDA_QKV_DIM // GATE_PROJECTION_N_TILE)
+    with pl.spmd(pl.min(output_tasks, PROJECTION_WORKERS_TILE), name_hint="kda_projection_output", deps=[bottleneck_tid]) as output_tid:
+        for task in pl.range(pl.tile.get_block_idx(), output_tasks, PROJECTION_WORKERS_TILE):
+            t0 = task // (LOCAL_KDA_QKV_DIM // GATE_PROJECTION_N_TILE)
+            n0 = task % (LOCAL_KDA_QKV_DIM // GATE_PROJECTION_N_TILE) * GATE_PROJECTION_N_TILE
+            g_raw = bf16_linear_row(f_a_gm, w_f_b, t0, n0, GATE_PROJECTION_N_TILE, KDA_DIM, 128, 2)
+            g_raw_bf16 = pl.cast(g_raw, pl.BF16, mode="rint")
+            g_raw_gm[t0:t0 + 1, n0:n0 + GATE_PROJECTION_N_TILE] = g_raw_bf16
+            out_raw = bf16_linear_row(g_a_gm, w_g_b, t0, n0, GATE_PROJECTION_N_TILE, KDA_DIM, 128, 2)
+            out_raw_bf16 = pl.cast(out_raw, pl.BF16, mode="rint")
+            out_gate_flat[t0:t0 + 1, n0:n0 + GATE_PROJECTION_N_TILE] = out_raw_bf16
     dt_bias_row = pl.reshape(dt_bias, [1, LOCAL_KDA_QKV_DIM])
     decay_flat = pl.reshape(decay, [t_dim, LOCAL_KDA_QKV_DIM])
     with pl.spmd((t_dim + 3) // 4 * (LOCAL_KDA_QKV_DIM // KDA_DIM), name_hint="kda_projection_decay", deps=[output_tid]):
@@ -473,7 +478,6 @@ def kda_output(
     output: pl.Tensor[[T_DYN, D], pl.FP32],
 ):
     t_dim = pl.tensor.dim(core_attn_out, 0)
-    tiles = (t_dim + OUTPUT_T_TILE - 1) // OUTPUT_T_TILE
     gated = pl.create_tensor([t_dim, LOCAL_KDA_QKV_DIM], dtype=pl.BF16)
     gated_rows = pl.reshape(gated, [t_dim * LOCAL_KDA_H, KDA_DIM])
     weight_row = pl.reshape(norm_weight, [1, KDA_DIM])
@@ -505,16 +509,17 @@ def kda_output(
         activated = pl.mul(normed, gate_sigmoid)
         activated_bf16 = pl.cast(activated, pl.BF16, mode="rint")
         gated_rows[r0 : r0 + OUTPUT_NORM_ROWS_TILE, 0:KDA_DIM] = pl.set_validshape(activated_bf16, rows, KDA_DIM)
-    with pl.spmd(tiles * (D // D_TILE), name_hint="kda_output_proj"):
-        task = pl.tile.get_block_idx()
-        t0 = task // (D // D_TILE) * OUTPUT_T_TILE
-        d0 = task % (D // D_TILE) * D_TILE
-        rows = pl.min(OUTPUT_T_TILE, t_dim - t0)
-        D_TILE_index = pl.cast(D_TILE, pl.INDEX)
-        partial = bf16_linear(gated, w_o, t0, d0, rows, D_TILE_index, OUTPUT_T_TILE, D_TILE, LOCAL_KDA_QKV_DIM, True)
-        local_bf16 = pl.cast(partial, pl.BF16, mode="rint")
-        exchange_value = pl.cast(local_bf16, pl.FP32)
-        output[t0 : t0 + OUTPUT_T_TILE, d0 : d0 + D_TILE] = pl.set_validshape(exchange_value, rows, D_TILE)
+    with pl.spmd(pl.min(t_dim * (D // OUTPUT_PROJECTION_N_TILE), PROJECTION_WORKERS_TILE), name_hint="kda_output_proj"):
+        for task in pl.range(pl.tile.get_block_idx(), t_dim * (D // OUTPUT_PROJECTION_N_TILE), PROJECTION_WORKERS_TILE):
+            t0 = task // (D // OUTPUT_PROJECTION_N_TILE)
+            d0 = task % (D // OUTPUT_PROJECTION_N_TILE) * OUTPUT_PROJECTION_N_TILE
+            partial = bf16_linear_row(
+                gated, w_o, t0, d0,
+                OUTPUT_PROJECTION_N_TILE, LOCAL_KDA_QKV_DIM, OUTPUT_PROJECTION_K_TILE, OUTPUT_PROJECTION_PIPELINE_TILE,
+            )
+            local_bf16 = pl.cast(partial, pl.BF16, mode="rint")
+            exchange_value = pl.cast(local_bf16, pl.FP32)
+            output[t0:t0 + 1, d0:d0 + OUTPUT_PROJECTION_N_TILE] = exchange_value
     return output
 
 
@@ -2103,6 +2108,8 @@ def run_projection_case(argv=None):
     parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
     parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "aligned", "single"])
     parser.add_argument("--tokens", type=int)
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", default=None)
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
@@ -2114,6 +2121,8 @@ def run_projection_case(argv=None):
         specs=projection_build_tensor_specs(tokens),
         golden_fn=golden_kda_projection_tensors,
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         rtol=0.02,
         atol=0.02,
     )
@@ -2137,6 +2146,8 @@ def run_output_case(argv=None):
     parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
     parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "aligned", "single"])
     parser.add_argument("--tokens", type=int)
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", default=None)
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
@@ -2149,6 +2160,8 @@ def run_output_case(argv=None):
         golden_fn=golden_kda_output_tensors,
         compare_fn={"output": compare_kda_output},
         config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         rtol=0.02,
         atol=0.02,
     )

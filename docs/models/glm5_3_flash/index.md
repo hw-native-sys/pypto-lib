@@ -301,6 +301,151 @@ and no measurable benefit is observed: C1 layer-3 rank-0 stage medians are
 128-token prompt. These stage intervals include dependency and scheduling
 waits; standalone speedups do not establish a serving improvement.
 
+### mHC projection performance
+
+The narrow `mhc_linear` projection uses independent token/output-channel tasks
+on the vector cores. Each task reduces 128-element K chunks and retains both
+reduction parts with compensated FP32 accumulation. RMS normalization and
+Sinkhorn mixing retain their existing implementation and precision checks.
+
+At whole-model row capacities, the complete `mhc_mixes` component measures
+40.833 -> 0.759 ms for 16 rows and 44.620 -> 3.174 ms for 128 rows. These are
+device-effective medians on a2a3 device 0 with PTOAS 0.67, 100 timed rounds
+after five warmups, replaying frozen inputs and golden outputs. All three
+mix outputs are bitwise equal to the original implementation and pass the
+unchanged `atol=1e-5, rtol=0.001` comparator. Component timings are not
+whole-model speedups.
+
+Whole-model generation on 2026-11-04 compares this projection against the
+retained attention-optimized baseline: serving PR #286 (`b1138f4`) and lib
+PR #1631 (`88c0b2d`), with identical attention changes in both variants.
+The published W8A8 checkpoint runs on a2a3 devices 0-7, TP8/EP8/DP1,
+PyPTO `ce0eb7c`, PTOAS 0.67 and CANN 9.0.0. Frozen prompts have 128 input
+and 16 output tokens, greedy sampling, a 32-token prefill chunk, a 128-token
+batch budget and prefix caching disabled. Each concurrency discards one
+warmup and measures three rounds; startup and profiling are excluded.
+Metrics below are host-observed serving medians, including dispatch and
+synchronization, compared with the retained unprofiled baseline samples.
+
+| Concurrency | Throughput before/after (token/s) | TTFT before/after (s) | TPOT before/after (s) |
+|---|---:|---:|---:|
+| 1 | 0.091105 / 0.158884 | 55.142 / 39.950 | 8.031 / 4.050 |
+| 4 | 0.361711 / 0.631067 | 55.507 / 40.273 | 8.094 / 4.077 |
+
+Throughput improves by 74.4% / 74.5%; TPOT falls by 49.6% for both cases.
+All 320 generated token IDs across 20 requests, including warmups, match
+the baseline. These measurements cover this prompt length and concurrency;
+they do not establish performance for longer contexts or larger batches.
+
+### KDA projection and router component performance
+
+The initial vector implementation used shared row dots with 128-element K
+reductions and compensated FP32 accumulation for KDA QKV, low-rank gates,
+output projection and router logits. mHC reuses the same primitive. BF16 projection boundaries,
+router TopK and all existing comparison thresholds remain unchanged.
+
+Against `8fe4823`, a2a3 onboard measurements use TP8 shard shapes, PTOAS 0.67,
+100 timed rounds after five warmups and frozen input/golden replay. Values
+are median device-effective latency of the complete component; KDA uses
+device 0 and routing uses device 1, with each pair on the same device.
+KDA processes all capacity rows; gate cases specify capacity / active rows.
+In the captured TP8 C1 workload, MoE token compaction gives gate capacity 16
+with one active row for decode and four for a 32-token prefill chunk.
+The 128-row gate cases below are additional coverage, not that serving shape.
+
+| Component | Rows | Before (ms) | After (ms) | Speedup |
+|---|---:|---:|---:|---:|
+| KDA front-end projection | 16 | 79.531 | 10.540 | 7.55x |
+| KDA front-end projection | 128 | 185.619 | 78.925 | 2.35x |
+| KDA output, including normalization | 16 | 9.451 | 3.047 | 3.10x |
+| KDA output, including normalization | 128 | 56.531 | 23.921 | 2.36x |
+| Router, including normalization and TopK | 16 / 1 | 11.338 | 0.282 | 40.21x |
+| Router, including normalization and TopK | 16 / 4 | 11.355 | 0.437 | 25.96x |
+| Router, including normalization and TopK | 128 / 32 | 23.791 | 1.980 | 12.01x |
+| Router, including normalization and TopK | 128 / 128 | 77.646 | 7.396 | 10.50x |
+
+Every measured output is bitwise equal to baseline. Single-row and ragged
+KDA, zero-active and ragged routing, and mHC regression checks pass. mHC
+remains at 0.759 / 3.174 ms for 16 / 128 rows. Component speedups are not
+serving gains; the complete generation measurements follow below.
+
+KDA projection/output entries accept `--tp 8 --ep 8 --tokens 16` or
+`--tokens 128`. The router accepts `--num-tokens 16 --active-tokens 1`;
+omitting `--active-tokens` keeps all rows active. Both support `--save-data`
+and `--golden-data`. Preserve each shape's snapshot separately when reusing
+compiled dynamic-shape kernels.
+
+### KDA reduction tile refinement
+
+The follow-up uses separate tiling for the three projection stages. QKV and
+first-stage gate projections use N=16, K=512 with one pipeline stage; the
+second-stage gates use N=64, K=128; the final output projection uses N=32,
+K=256 with two pipeline stages. The shared reduction scales its integer
+accumulator by a power-of-two column bound to keep the wider reductions
+within INT32 range. Single-chunk reductions omit cross-chunk compensation;
+BF16 rounding and the FP32 exchange boundary remain unchanged. Each row-dot
+launch uses at most 32,256 blocks; a strided in-core loop processes any
+remaining work items. This bound also applies to router row dots.
+
+The comparison below starts from the already-vectorized implementation in
+PR #1697, not the earlier scalar baseline. TP8/EP8 uses capacity rows 16 and
+128 from the whole-model decode/prefill workload. Both versions run on the
+same a2a3 device, with PTOAS 0.67, five warmups and 100 timed rounds. The
+isolated kernels reproduce the production SPMD bodies; their inputs are
+frozen from the existing component fixtures, with gate intermediates derived
+once using the unchanged reference. Values are median device-effective time.
+
+| Operator or component | Rows | Before (ms) | After (ms) | Latency reduction |
+|---|---:|---:|---:|---:|
+| `kda_projection_qkv` | 16 | 9.109 | 7.622 | 16.3% |
+| `kda_projection_qkv` | 128 | 70.946 | 59.082 | 16.7% |
+| `kda_projection_output` | 16 | 0.228 | 0.224 | 1.7% |
+| `kda_projection_output` | 128 | 1.614 | 1.509 | 6.5% |
+| `kda_output_proj` | 16 | 3.009 | 2.647 | 12.0% |
+| `kda_output_proj` | 128 | 23.733 | 20.880 | 12.0% |
+| Complete KDA front-end | 16 | 10.539 | 8.413 | 20.2% |
+| Complete KDA front-end | 128 | 78.901 | 65.912 | 16.5% |
+| KDA output including norm | 16 | 3.047 | 2.692 | 11.6% |
+| KDA output including norm | 128 | 23.914 | 21.087 | 11.8% |
+
+Every measured output is bitwise equal to the vector baseline. TP8/TP16
+single-row and ragged 17-row KDA cases, shared mHC/router callers, and exact
+BF16 comparisons for zero, constant, cancellation and varying-magnitude dot
+products pass. Existing golden thresholds are unchanged. KDA and router also pass at 2,048
+and 8,192 rows, including TP16 KDA at 8,192 rows. Boundary cases exercise
+253-row output projection, 505-row QKV and 1,793 active router rows. Router
+replay comparison derives its active extent from the executed input scalar
+and output shape, including when snapshot metadata overrides CLI defaults.
+
+The earlier full-model swimlane interval for `kda_projection_output` includes
+scheduling overlap with QKV. It must not be compared to these isolated timings
+as if it were pure compute time. No whole-model performance run includes this
+follow-up yet; the generation results below describe the prior implementation.
+
+### Combined projection whole-model performance
+
+The combined mHC, KDA and router changes were measured on 2026-11-04 with
+the same serving PR #286 / lib PR #1631 revisions, checkpoint, devices 0-7,
+TP8/EP8/DP1 and toolchain as the mHC experiment above. The targeted projection
+changes were applied to that retained lib checkout, preserving its forward
+ABI and the identical attention optimization in both comparison variants.
+Each concurrency uses the same frozen 128-token prompts, 16 output tokens,
+one warmup and three measured rounds. Profiling is disabled, and the
+623.59-second model startup is excluded from the serving metrics.
+
+| Concurrency | mHC-only throughput (token/s) | Combined throughput (token/s) | Combined TTFT (s) | Combined TPOT (s) | Throughput ratio vs mHC-only |
+|---|---:|---:|---:|---:|---:|
+| 1 | 0.158884 | 0.556300 | 17.690 | 0.738 | 3.50x |
+| 4 | 0.631067 | 2.181827 | 18.095 | 0.749 | 3.46x |
+
+Relative to the retained attention-only baseline, throughput changes from
+0.091105 to 0.556300 token/s at concurrency 1 and from 0.361711 to 2.181827
+token/s at concurrency 4: 6.11x and 6.03x, respectively. TPOT falls from
+8.031 to 0.738 seconds and from 8.094 to 0.749 seconds. All 320 output token
+IDs across 20 requests, including warmups, match the original, attention-only
+and mHC-only saved runs. The reference runs are retained measurements, not
+new baseline reruns; these results cover this prompt length and concurrency.
+
 ### Earlier Serving measurements
 
 The measurements below predate native MLA activation quantization and the
