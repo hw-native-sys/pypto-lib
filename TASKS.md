@@ -161,10 +161,17 @@ They only emit the public queue command and a missing-asset report. They do not
 load or launch vLLM-Ascend and do not claim NPU accuracy.
 
 The reference candidate environment exists at a nobody-owned shared path that
-the Decode user cannot traverse. The pinned PyPTO environment has no
-`vllm`, `vllm_ascend`, or `torch_npu` package. The reference source commit and
-loaded libraries therefore remain unverified; this is an environment access
-blocker, not a reference pass.
+is now readable through the supplied shared release. The independent probe
+`tools/deepseek_v41_vllm_reference.py` was run with the release's Python and
+recorded at `.pypto-a3-state/vllm-reference-config.json` and
+`.pypto-a3-state/vllm-reference-npu-probe.json`. It confirmed vLLM
+`0.31.0+empty`, vLLM-Ascend
+`0.19.1rc2.dev2832+g23d1d9055`, the pinned source/native identities, and
+`torch_npu.npu_rms_norm` on queued device 4. This is runtime/config evidence
+only: no weights were loaded, no vLLM serve process was started, and no
+same-input Decode output or cache capture exists yet. The bundled extra
+`npu_rms_norm_cast` check remains a diagnostic failure because the current
+`libopapi.so` lacks `aclnnRmsNormCast`.
 
 ## Environment and queue
 
