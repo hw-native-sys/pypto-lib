@@ -138,6 +138,9 @@ def probe(root: Path, model: Path | None, *, tensor_parallel: int, data_parallel
             "shape": [1, 7168],
             "dtype": "float16",
             "device": "npu:0",
+            "device_mapping": [
+                {"logical_device": 0, "physical_device": os.environ.get("TASK_DEVICE", "unknown")}
+            ],
             "status": "pass",
             "output_dtype": str(output.dtype),
         }
