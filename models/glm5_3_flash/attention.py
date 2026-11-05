@@ -309,7 +309,7 @@ def absorb_query(
     t_dim = pl.tensor.dim(query, 0)
     t_mm = ((t_dim + PROJECTION_MM_T_TILE - 1) // PROJECTION_MM_T_TILE) * PROJECTION_MM_T_TILE
     absorbed_flat = pl.reshape(absorbed, [t_dim, LOCAL_H * KV_LORA])
-    for head in pl.range(LOCAL_H):
+    for head in pl.parallel(LOCAL_H):
         query_head = pl.create_tensor([t_dim, QK_DIM], dtype=pl.BF16)
         weight_head = pl.create_tensor([QK_DIM, KV_LORA], dtype=pl.BF16)
         for block in pl.spmd(t_mm // PROJECTION_MM_T_TILE, name_hint="mla_query_head"):
@@ -377,12 +377,17 @@ def prefill_sparse_attn(
         with pl.spmd(t_dim, name_hint="prefill_sparse_flash") as flash_tid:
             token = pl.tile.get_block_idx()
             request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
+            # Front-packed selections have one contiguous prefix of live blocks.
+            live_blocks = pl.cast(0, pl.INDEX)
+            for start in pl.range(0, TOPK_INDEX_WIDTH, PREFILL_ATTN_K_TILE):
+                if pl.read(topk_indices, [token, start]) >= 0:
+                    live_blocks = live_blocks + 1
             for _ in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                 running_m = pl.reshape(pl.full([1, PREFILL_H_PAD // 2], dtype=pl.FP32, value=PREFILL_NEG_INF), [PREFILL_H_PAD // 2, 1])
                 running_l = pl.reshape(pl.full([1, PREFILL_H_PAD // 2], dtype=pl.FP32, value=0.0), [PREFILL_H_PAD // 2, 1])
                 running_o = pl.full([PREFILL_H_PAD // 2, KV_LORA], dtype=pl.FP32, value=0.0)
             for sb, (m_iter, l_iter, o_iter) in pl.range(
-                ((TOPK_INDEX_WIDTH + PREFILL_ATTN_K_TILE - 1) // PREFILL_ATTN_K_TILE),
+                live_blocks,
                 init_values=(running_m, running_l, running_o),
             ):
                 w0 = sb * PREFILL_ATTN_K_TILE
@@ -1816,8 +1821,6 @@ def run_prefill_case(argv=None):
     if prefill_sparse_attn is None:
         raise ValueError(f"sparse MLA attention needs TP >= 4 (LOCAL_H={LOCAL_H} > 16 heads per tile)")
 
-    run_prefill_sparse_attn_golden(golden_prefill_sparse_attn, _golden_prefill_sparse_attn_impl)
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
     parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
@@ -1831,7 +1834,11 @@ def run_prefill_case(argv=None):
     parser.add_argument("--history-tokens", type=int)
     parser.add_argument("--selection", choices=["ragged", "pool4-causal"], default="ragged")
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true", help="persist inputs and golden outputs for replay")
+    parser.add_argument("--golden-data", type=str, help="directory containing cached in/ and out/ tensors")
     args = parser.parse_args(argv)
+
+    run_prefill_sparse_attn_golden(golden_prefill_sparse_attn, _golden_prefill_sparse_attn_impl)
 
     result = run(
         fn=prefill_sparse_attn_test,
@@ -1845,6 +1852,8 @@ def run_prefill_case(argv=None):
         atol=0.002,
         compare_fn={"output": ratio_allclose(atol=0.002, rtol=1.0 / 32)},
         compile_only=args.compile_only,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
     )
     print(result)
     if not result.passed:
