@@ -52,8 +52,7 @@ def make_attention_block(capacity, config):
         wkv_scale: pl.Tensor[[head_dim], pl.FP32],
         kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
         wo_a: pl.Tensor[[groups, group_input, rank], pl.BF16],
-        wo_b: pl.Tensor[[groups * rank, hidden], pl.INT8],
-        wo_b_scale: pl.Tensor[[hidden], pl.FP32],
+        wo_b: pl.Tensor[[groups * rank, hidden], pl.BF16],
         rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
         rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
         slots: pl.Tensor[[capacity, 2], pl.INT64],
@@ -80,7 +79,7 @@ def make_attention_block(capacity, config):
             rms_norm_tiled(collapsed, norm_weight, normed, block, active)
         attention(
             normed, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-            kv_norm_weight, wo_a, wo_b, wo_b_scale,
+            kv_norm_weight, wo_a, wo_b,
             rope_cos, rope_sin, slots, indices, sink,
             positions, query_latent, query, window_kv, cache, cache_lens, output, active,
         )

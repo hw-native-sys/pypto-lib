@@ -27,6 +27,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import numpy as np
 from pathlib import Path
 import re
 import shutil
@@ -497,14 +498,132 @@ def _patch_reference_mhc_fallback() -> dict[str, str]:
     }
 
 
-def _patch_runner_capture(output_dir: Path, rank: int, layer_id: int) -> None:
+def _patch_runner_capture(
+    output_dir: Path, rank: int, layer_id: int, *, skip_cache: bool = False
+) -> None:
     """Patch only the reference runner; the patch never enters the product."""
 
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+    from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+    import vllm_ascend.models.deepseek_v41.model as deepseek_v41_model
+    from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer, DeepseekV41MoE
 
     original_execute = NPUModelRunner.execute_model
     original_forward = NPUModelRunner._model_forward
-    state: dict[str, Any] = {"decode": False, "captured": False}
+    # AscendRoutedExperts calls the concrete router's _select_experts method
+    # directly.  Hooking the abstract public select_experts method misses the
+    # actual route tensors on the pinned vLLM-Ascend path.
+    original_router_select = BaseRouter._select_experts
+    original_moe_forward = DeepseekV41MoE.forward
+    original_layer_forward = DeepseekV41DecoderLayer.forward
+    original_muls_add = deepseek_v41_model.muls_add_triton
+    state: dict[str, Any] = {"decode": False, "captured": False, "skip_cache": skip_cache}
+
+    def wrapped_layer_forward(self, positions, hidden_states, pre_mix, *args, **kwargs):
+        capture_this = (
+            state["decode"]
+            and int(getattr(self, "layer_idx", -1)) == layer_id
+            and not state.get("layer_input_captured")
+        )
+        if capture_this:
+            state["layer_input"] = hidden_states.detach().cpu().clone()
+            state["layer_pre_mix"] = pre_mix.detach().cpu().clone()
+            state["layer_input_captured"] = True
+        result = original_layer_forward(self, positions, hidden_states, pre_mix, *args, **kwargs)
+        if capture_this and isinstance(result, tuple):
+            state["layer_output"] = result[0].detach().cpu().clone()
+            state["layer_next_pre"] = result[1].detach().cpu().clone()
+        return result
+
+    def wrapped_muls_add(x, y, scale):
+        # DeepSeekV41MoE combines the routed result and the replicated shared
+        # result as ``routed * scale + shared``. Capture both operands at the
+        # same NPU boundary as the final MoE output for product-side diagnosis.
+        result = original_muls_add(x, y, scale)
+        if state["decode"] and state.get("moe_input_captured") and not state.get("components_captured"):
+            state["routed_output"] = x.detach().cpu().clone()
+            state["shared_output"] = y.detach().cpu().clone()
+            state["routed_scale"] = float(scale)
+            state["components_captured"] = True
+        return result
+
+    def wrapped_router_select(self, hidden_states, router_logits, topk_indices_dtype=None, *, input_ids=None):
+        result = original_router_select(
+            self,
+            hidden_states,
+            router_logits,
+            topk_indices_dtype=topk_indices_dtype,
+            input_ids=input_ids,
+        )
+        if state["decode"] and state.get("moe_input_captured") and not state.get("route_captured"):
+            weights, ids = result
+            state["route_weights"] = weights.detach().cpu().clone()
+            state["route_ids"] = ids.detach().cpu().clone()
+            state["router_logits"] = router_logits.detach().cpu().clone()
+            state["route_captured"] = True
+        return result
+
+    def wrapped_moe_forward(
+        self,
+        hidden_states,
+        input_ids=None,
+        hidden_states_fp32=None,
+        already_sequence_parallel=False,
+    ):
+        capture_this = (
+            state["decode"]
+            and not state.get("moe_input_captured")
+            and int(getattr(self, "layer_idx", -1)) == layer_id
+        )
+        if capture_this:
+            state["moe_input"] = hidden_states.detach().cpu().clone()
+            if hidden_states_fp32 is None:
+                state["moe_router_input"] = hidden_states.float().detach().cpu().clone()
+            else:
+                state["moe_router_input"] = hidden_states_fp32.detach().cpu().clone()
+            state["moe_input_captured"] = True
+            # The fused MoE returns ``(shared, routed)`` before the model
+            # applies the final routed scaling and addition.  Capture at this
+            # boundary instead of relying on the optional Triton ``muls_add``
+            # rewrite, which may be bypassed by the eager backend.
+            original_experts_forward = self.experts.forward
+
+            def wrapped_experts_forward(*args, **kwargs):
+                experts_result = original_experts_forward(*args, **kwargs)
+                if (
+                    state["decode"]
+                    and not state.get("components_captured")
+                ):
+                    if isinstance(experts_result, tuple) and len(experts_result) == 2:
+                        shared_output, routed_output = experts_result
+                        if shared_output is not None:
+                            state["shared_output"] = shared_output.detach().cpu().clone()
+                        else:
+                            state["shared_output"] = routed_output.detach().cpu().clone().zero_()
+                        state["routed_output"] = routed_output.detach().cpu().clone()
+                    else:
+                        # With mix placement enabled the fused backend folds
+                        # shared and routed experts into one tensor. Preserve
+                        # that boundary as routed_output and use a zero shared
+                        # operand so the diagnostic remains explicit.
+                        state["routed_output"] = experts_result.detach().cpu().clone()
+                        state["shared_output"] = state["routed_output"].clone().zero_()
+                    state["routed_scale"] = float(getattr(self, "routed_scaling_factor", 1.0))
+                    state["components_captured"] = True
+                return experts_result
+
+            self.experts.forward = wrapped_experts_forward
+        result = original_moe_forward(
+            self,
+            hidden_states,
+            input_ids=input_ids,
+            hidden_states_fp32=hidden_states_fp32,
+            already_sequence_parallel=already_sequence_parallel,
+        )
+        if capture_this:
+            self.experts.forward = original_experts_forward
+            state["moe_output"] = result.detach().cpu().clone()
+        return result
 
     def wrapped_forward(self, num_tokens, input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs):
         if state["decode"] and not state["captured"]:
@@ -539,17 +658,92 @@ def _patch_runner_capture(output_dir: Path, rank: int, layer_id: int) -> None:
             state["valid_lengths"] = [
                 int(value) for value in batch.num_computed_tokens_cpu[: batch.num_reqs].tolist()
             ]
-            state["cache_before"] = _clone_cache(self.kv_caches)
-            state["cache_layout"] = [_cache_description(cache) for cache in self.kv_caches]
+            if not state["skip_cache"]:
+                state["cache_before"] = _clone_cache(self.kv_caches)
+                state["cache_layout"] = [_cache_description(cache) for cache in self.kv_caches]
         result = original_execute(self, scheduler_output, intermediate_tensors)
         if is_decode and not state["captured"]:
-            state["cache_after"] = _clone_cache(self.kv_caches)
+            if not state["skip_cache"]:
+                state["cache_after"] = _clone_cache(self.kv_caches)
             state["result_type"] = type(result).__name__
             state["captured"] = True
             state["decode"] = False
             rank_dir = output_dir / f"rank{rank}"
             rank_dir.mkdir(parents=True, exist_ok=True)
-            npz_meta = _save_cache_npz(rank_dir / "history_cache.npz", state["cache_before"], state["cache_after"])
+            npz_meta = {}
+            if not state["skip_cache"]:
+                npz_meta = _save_cache_npz(
+                    rank_dir / "history_cache.npz", state["cache_before"], state["cache_after"]
+                )
+            moe_meta = None
+            if (
+                state.get("moe_input_captured")
+                and state.get("route_captured")
+                and "moe_output" in state
+                and state.get("components_captured")
+            ):
+                import numpy as np
+                import torch
+
+                def bf16_storage(value):
+                    return value.contiguous().view(torch.int16).numpy()
+
+                moe_path = rank_dir / "moe_capture.npz"
+                np.savez_compressed(
+                    moe_path,
+                    input_bf16=bf16_storage(state["moe_input"]),
+                    router_input_fp32=state["moe_router_input"].float().numpy(),
+                    output_bf16=bf16_storage(state["moe_output"]),
+                    route_ids=state["route_ids"].numpy(),
+                    route_weights=state["route_weights"].float().numpy(),
+                    router_logits=state["router_logits"].float().numpy(),
+                    routed_output_bf16=bf16_storage(state["routed_output"]),
+                    shared_output_bf16=bf16_storage(state["shared_output"]),
+                )
+                moe_meta = {
+                    "file": f"rank{rank}/moe_capture.npz",
+                    "input_shape": list(state["moe_input"].shape),
+                    "router_input_shape": list(state["moe_router_input"].shape),
+                    "output_shape": list(state["moe_output"].shape),
+                    "route_ids_shape": list(state["route_ids"].shape),
+                    "route_weights_shape": list(state["route_weights"].shape),
+                    "router_logits_shape": list(state["router_logits"].shape),
+                    "input_dtype": "torch.bfloat16",
+                    "router_input_dtype": "torch.float32",
+                    "output_dtype": "torch.bfloat16",
+                    "route_ids_dtype": "torch.int32",
+                    "route_weights_dtype": "torch.float32",
+                    "routed_output_shape": list(state["routed_output"].shape),
+                    "shared_output_shape": list(state["shared_output"].shape),
+                    "routed_scale": state["routed_scale"],
+                    "component_dtype": "torch.bfloat16",
+                }
+            layer_meta = None
+            if "layer_input" in state and "layer_output" in state:
+                import torch
+
+                def bf16_storage(value):
+                    return value.contiguous().view(torch.int16).numpy()
+
+                layer_path = rank_dir / "layer_capture.npz"
+                np.savez_compressed(
+                    layer_path,
+                    input_bf16=bf16_storage(state["layer_input"]),
+                    pre_mix_fp32=state["layer_pre_mix"].float().numpy(),
+                    output_bf16=bf16_storage(state["layer_output"]),
+                    next_pre_fp32=state["layer_next_pre"].float().numpy(),
+                )
+                layer_meta = {
+                    "file": f"rank{rank}/layer_capture.npz",
+                    "input_shape": list(state["layer_input"].shape),
+                    "pre_mix_shape": list(state["layer_pre_mix"].shape),
+                    "output_shape": list(state["layer_output"].shape),
+                    "next_pre_shape": list(state["layer_next_pre"].shape),
+                    "input_dtype": "torch.bfloat16",
+                    "pre_mix_dtype": "torch.float32",
+                    "output_dtype": "torch.bfloat16",
+                    "next_pre_dtype": "torch.float32",
+                }
             payload = {
                 "rank": rank,
                 "layer_id": layer_id,
@@ -561,6 +755,8 @@ def _patch_runner_capture(output_dir: Path, rank: int, layer_id: int) -> None:
                 "cache_layout": state.get("cache_layout"),
                 "cache_arrays": npz_meta,
                 "hidden": _tensor_to_list(state["hidden"]) if "hidden" in state else None,
+                "moe_capture": moe_meta,
+                "layer_capture": layer_meta,
                 "result_type": state.get("result_type"),
             }
             (rank_dir / "capture.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -568,6 +764,10 @@ def _patch_runner_capture(output_dir: Path, rank: int, layer_id: int) -> None:
 
     NPUModelRunner._model_forward = wrapped_forward
     NPUModelRunner.execute_model = wrapped_execute
+    BaseRouter._select_experts = wrapped_router_select
+    DeepseekV41MoE.forward = wrapped_moe_forward
+    DeepseekV41DecoderLayer.forward = wrapped_layer_forward
+    deepseek_v41_model.muls_add_triton = wrapped_muls_add
 
 
 def _assemble_existing(args: argparse.Namespace) -> int:
@@ -797,6 +997,8 @@ def _assemble_existing(args: argparse.Namespace) -> int:
                 "hidden_shape": [len(record["hidden"]), len(record["hidden"][0])]
                 if record.get("hidden")
                 else None,
+                "moe_capture": record.get("moe_capture"),
+                "layer_capture": record.get("layer_capture"),
                 "result_type": record.get("result_type"),
             }
             for record in records
@@ -861,7 +1063,7 @@ def _run_capture(args: argparse.Namespace) -> int:
             "the shared CANN runtime has no aclnnHcPre/aclnnHcPost; rerun with --mhc-mode fallback"
         )
     mhc_identity = _patch_reference_mhc_fallback()
-    _patch_runner_capture(output_dir, rank, args.layer_id)
+    _patch_runner_capture(output_dir, rank, args.layer_id, skip_cache=args.skip_cache)
 
     llm = LLM(
         model=str(temporary_root),
@@ -910,17 +1112,18 @@ def _run_capture(args: argparse.Namespace) -> int:
     for peer in range(world):
         record_path = output_dir / f"rank{peer}" / "capture.json"
         cache_path = output_dir / f"rank{peer}" / "history_cache.npz"
-        if not record_path.is_file() or not cache_path.is_file():
+        if not record_path.is_file() or (not args.skip_cache and not cache_path.is_file()):
             raise RuntimeError(f"rank {peer} did not produce a capture")
         rank_records.append(json.loads(record_path.read_text(encoding="utf-8")))
 
     import numpy as np
 
-    merged_cache: dict[str, Any] = {}
-    for peer in range(world):
-        with np.load(output_dir / f"rank{peer}" / "history_cache.npz") as archive:
-            merged_cache.update({f"rank{peer}_{name}": archive[name] for name in archive.files})
-    np.savez(output_dir / "history_cache.npz", **merged_cache)
+    if not args.skip_cache:
+        merged_cache: dict[str, Any] = {}
+        for peer in range(world):
+            with np.load(output_dir / f"rank{peer}" / "history_cache.npz") as archive:
+                merged_cache.update({f"rank{peer}_{name}": archive[name] for name in archive.files})
+        np.savez(output_dir / "history_cache.npz", **merged_cache)
 
     asset_root = output_dir
     checkpoint_manifest = args.checkpoint.parent / ".pypto-a3-state" / "deepseek-v41-checkpoint-manifest.json"
@@ -945,7 +1148,7 @@ def _run_capture(args: argparse.Namespace) -> int:
         "history_token_length": args.history_length,
         "prompt_token_ids": prompt_ids,
         "position_ids": [args.history_length],
-        "initial_kv_cache": "history_cache.npz",
+        "initial_kv_cache": None if args.skip_cache else "history_cache.npz",
         "block_table": [record["block_table"] for record in rank_records],
         "slot_mapping": [record["slot_mapping"] for record in rank_records],
         "valid_lengths": [record["valid_lengths"] for record in rank_records],
@@ -988,13 +1191,19 @@ def _run_capture(args: argparse.Namespace) -> int:
                 "cache_layout": record["cache_layout"],
                 "cache_arrays": record["cache_arrays"],
                 "hidden_shape": [len(record["hidden"]), len(record["hidden"][0])] if record.get("hidden") else None,
+                "moe_capture": record.get("moe_capture"),
+                "layer_capture": record.get("layer_capture"),
                 "result_type": record.get("result_type"),
             }
             for record in rank_records
         ],
         "runtime_identity": identity,
         "reference_mhc": mhc_identity,
-        "input_contract": "decode-token-cache-request-state-v1",
+        "input_contract": (
+            "decode-token-cache-request-state-v1"
+            if not args.skip_cache
+            else "reference-moe-diagnostic-no-cache-v1"
+        ),
         "capture_command": "tools/deepseek_v41_vllm_capture.py",
         "generated_at_unix": time.time(),
     }
@@ -1017,6 +1226,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-model-len", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--assemble-existing", action="store_true")
+    parser.add_argument(
+        "--skip-cache",
+        action="store_true",
+        help="diagnostic-only capture: omit the large KV cache snapshots and merged cache archive",
+    )
     parser.add_argument("--task-device", default="not_recorded")
     parser.add_argument("--capture-task", default="not_recorded")
     parser.add_argument(

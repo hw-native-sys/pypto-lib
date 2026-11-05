@@ -33,6 +33,7 @@ def make_moe_router_inline(capacity, config):
     @pl.jit.inline
     def moe_router_inline(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
+        router_x: pl.Tensor[[capacity, hidden], pl.BF16],
         gate_weight: pl.Tensor[[experts, hidden], pl.FP32],
         text_bias: pl.Tensor[[experts], pl.FP32],
         vision_bias: pl.Tensor[[experts], pl.FP32],
@@ -47,7 +48,7 @@ def make_moe_router_inline(capacity, config):
             expert = block % (experts // EXPERT_TILE) * EXPERT_TILE
             dot_sum = pl.full([1, EXPERT_TILE], dtype=pl.FP32, value=0.0)
             for inner in pl.range(0, hidden, D_TILE):
-                source = pl.cast(x[token:token + 1, inner:inner + D_TILE], pl.FP32)
+                source = pl.cast(router_x[token:token + 1, inner:inner + D_TILE], pl.FP32)
                 weight = gate_weight[expert:expert + EXPERT_TILE, inner:inner + D_TILE]
                 product = pl.col_expand_mul(weight, source)
                 partial = pl.reshape(pl.row_sum(product), [1, EXPERT_TILE])
@@ -120,6 +121,7 @@ def make_moe_router(capacity, config):
     @pl.jit
     def moe_router(
         x: pl.Tensor[[capacity, hidden], pl.BF16],
+        router_x: pl.Tensor[[capacity, hidden], pl.BF16],
         gate_weight: pl.Tensor[[experts, hidden], pl.FP32],
         text_bias: pl.Tensor[[experts], pl.FP32],
         vision_bias: pl.Tensor[[experts], pl.FP32],
@@ -129,7 +131,7 @@ def make_moe_router(capacity, config):
         route_weights: pl.InOut[pl.Tensor[[capacity, topk], pl.FP32]],
         active: pl.Scalar[pl.INT32],
     ):
-        compute(x, gate_weight, text_bias, vision_bias, input_ids, logits, route_ids, route_weights, active)
+        compute(x, router_x, gate_weight, text_bias, vision_bias, input_ids, logits, route_ids, route_weights, active)
         return logits, route_ids, route_weights
 
     return moe_router

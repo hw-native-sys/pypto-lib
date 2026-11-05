@@ -102,11 +102,23 @@ The current PyPTO code includes the bounded L0 SWA ABI, a 1/2/8-step state
 replay, an independent EP2 routed/shared MoE product driver, and a complete
 L0 composition entry. The EP2 driver keeps all 384 routed experts, owns 192
 experts per rank, and compiles its dispatch/combine windows with PyPTO. The
-composition entry now joins mHC attention/cache, FFN mHC, routed/shared EP2
-MoE, and mHC output restoration. It has not yet consumed the real checkpoint,
-historical cache, request state, or an independent reference capture; complete
-C1A/C2A index/compression, Engram, CP/SP and full-layer NPU execution remain
-formal blockers.
+real two-card MoE boundary has executed with the checkpoint and the
+independent vLLM-Ascend capture input; route IDs, route weights, logits, and
+the merged MoE output pass the fixed floating gate. The evidence is
+`.pypto-a3-state/product/decode-ep2-l0-v25e.json`.
+
+The composition entry has now consumed a real layer input, historical cache,
+request state, and cache write boundary in a queued two-card A3 run. The
+representative L0 result compares the complete PyPTO output, router input,
+logits, routes, MoE output, FFN state, and the populated cache pages against
+the same vLLM-Ascend boundary. The latest joint reference contract is v29 and
+the product evidence is `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json`.
+
+The formal EP2 gate remains `not_run`: this run is one active request and does
+not yet cover the required no-local-input collective, finished/inactive rows,
+unequal-length batch, or slot-reuse cases. Complete C1A/C2A
+index/compression, Engram, CP/SP and the requested 16-device gates remain
+separate blockers.
 
 The supplied Aurora W8A8 Dynamic export is registered as an external
 checkpoint asset. Its index references 270 quantized shard files using the
@@ -119,14 +131,17 @@ target-layer mapping, and safetensors headers without hashing tensor payloads.
 | product import/dependency scan | `pass` | Keep vLLM/Torch-NPU out of the product closure |
 | Aurora checkpoint metadata/header audit | `pass` | Keep the external manifest and set `DEEPSEEK_V41_CHECKPOINT` for jobs |
 | bounded L0 PyPTO compile/ABI | `bounded_only` | Does not establish checkpoint accuracy |
-| EP2 PyPTO MoE code generation | `pass` | `decode_ep2_compile`; compiler artifact has physical NZ lowering, execution remains not_run |
-| complete L0 EP2 PyPTO composition code generation | `pass` | `decode_layer_ep2_compile`; mHC/attention/cache/MoE composition compiles, execution remains not_run |
-| DP2/TP1/EP2 full MoE Decode | `not_run` | Submit the real checkpoint/input/cache through the two-card queue and compare to the same-input reference |
+| EP2 PyPTO MoE code generation | `pass` | `decode_ep2_compile`; compiler artifact has physical NZ lowering |
+| complete L0 EP2 PyPTO composition code generation | `pass` | `decode_layer_ep2_compile`; mHC/attention/cache/MoE composition compiles |
+| DP2/TP1/EP2 MoE boundary Decode | `pass` | `.pypto-a3-state/product/decode-ep2-l0-v25e.json`; real two-card A3 route/output gate passed |
+| DP2/TP1/EP2 complete physical layer representative Decode | `pass` | `task_20261106_042451_245850019523`; `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json`; output, router input, routes, MoE, FFN state, and cache pages compared on A3 |
+| DP2/TP1/EP2 formal Decode gate | `not_run` | Add no-local-input, finished/inactive, unequal-length, slot-reuse and additional request-state cases |
 | DP8/TP2/EP16 complete single layer | `not_run` | Allocate 16 queued cards and run the complete composition |
 | DP16/TP1/EP16 compatibility | `not_run` | Same complete layer at TP1 |
 | DP4/TP4/EP16 compatibility | `not_run` | Same complete layer at TP4 |
-| independent vLLM-Ascend capture | `not_run` | Supply matching Decode input/cache, reference environment and capture manifest |
-| same-input NPU PyPTO/reference comparison | `not_run` | Supply all contract inputs and state outputs |
+| independent vLLM-Ascend MoE capture | `pass` | `.pypto-a3-state/reference/decode_ep2_l0_20261106_v25`; reference-only vLLM-Ascend process captured the same MoE input, routes and output |
+| independent vLLM-Ascend full-state capture | `pass` | `.pypto-a3-state/reference/decode_ep2_l0_20261106_v29/reference_capture.json`; v29 joins layer, MoE, and cache state; v24/v26 remain historical split captures |
+| same-input NPU PyPTO/reference representative comparison | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json`; fixed `rtol=0.05`, `atol=0.05` and exact route IDs |
 | target layers 0,1,2,3,14,15,19,20,21,24,25 | `not_run` | Each layer must pass its own complete DP8/TP2/EP16 gate |
 
 No status in this table may be promoted from the historical Prefill evidence,
@@ -149,8 +164,10 @@ The following checks were run in the pinned shared environment on 2026-11-05:
 | Decode asset structure verifier | `pass` | `decode_asset_contract.py`; current report rejects the absent input, history-cache, and reference-capture files before queue submission |
 | Aurora checkpoint manifest | `pass` | `.pypto-a3-state/deepseek-v41-checkpoint-manifest.json`; metadata/header audit only |
 | simulator numerical replay | `not_run` | CPU/simulator precision is outside this session; no NPU result inferred |
-| independent reference manifest | `not_run` | vLLM-Ascend path, Decode input/cache and capture are not configured |
-| EP2 MoE gate | `not_run` | `decode_gate.py --topology ep2_gate`; checkpoint metadata is verified, but `decode_input.json`, `history_cache.npz`, and `reference_capture.json` are missing |
+| independent reference manifest | `pass` | `.pypto-a3-state/reference/decode_ep2_l0_20261106_v29/reference_capture.json`; vLLM-Ascend paths, native hashes, input, layer, MoE, and cache capture are recorded |
+| queued two-card PyPTO EP2 MoE run | `pass` | `task_20261106_024728_200089531660`; A3 `TASK_DEVICE=0,1`, routes and output pass in `.pypto-a3-state/product/decode-ep2-l0-v25e.json` |
+| EP2 complete physical-layer representative run | `pass` | `task_20261106_042451_245850019523`; `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json` |
+| EP2 formal multi-case gate | `not_run` | The representative case lacks no-local-input, finished/inactive, unequal-length, and slot-reuse coverage |
 | DP8/TP2/EP16 gate | `not_run` | `decode_gate.py --topology main`; complete layer input/cache/reference assets are missing |
 
 The Aurora loader was also exercised against the supplied checkpoint without
@@ -183,19 +200,18 @@ load or launch vLLM-Ascend and do not claim NPU accuracy.
 For the supplied checkpoint, set `DEEPSEEK_V41_CHECKPOINT` to
 `/mnt/data/models/DeepSeek-V4.1-Flash-w8a8` and point
 `DEEPSEEK_V41_DECODE_ASSETS` at the private Decode asset directory. The latest
-queued no-device EP2 report records checkpoint `metadata_verified`, with the
-three runtime assets above still absent.
+queued no-device EP2 report records checkpoint `metadata_verified`; the v29
+joint runtime assets are now present under the private reference directory.
 
 The reference candidate environment exists at a nobody-owned shared path that
-is now readable through the supplied shared release. The independent probe
-`tools/deepseek_v41_vllm_reference.py` was run with the release's Python and
-recorded at `.pypto-a3-state/vllm-reference-config.json` and
-`.pypto-a3-state/vllm-reference-npu-probe.json`. It confirmed vLLM
-`0.31.0+empty`, vLLM-Ascend
+is now readable through the supplied shared release. The independent capture
+uses its Python with vLLM `0.31.0+empty`, vLLM-Ascend
 `0.19.1rc2.dev2832+g23d1d9055`, the pinned source/native identities, and
-`torch_npu.npu_rms_norm` on queued device 4. This is runtime/config evidence
-only: no weights were loaded, no vLLM serve process was started, and no
-same-input Decode output or cache capture exists yet. The bundled extra
+`torch_npu` only in the reference process. The v29 capture records the same
+layer-0 input, route tensors, layer output, and cache before/after state in one
+joint contract consumed by the PyPTO run. v24/v26 remain historical split
+captures and are not used for this comparison. No vLLM serve process was
+started. The bundled extra
 `npu_rms_norm_cast` check remains a diagnostic failure because the current
 `libopapi.so` lacks `aclnnRmsNormCast`.
 
@@ -224,10 +240,9 @@ holders, device reset, and single-card substitutes are prohibited.
 
 ## Recovery conditions and non-goals
 
-The formal task is blocked at `not_run` until the Decode input, historical
-cache and block-table assets, same-input vLLM-Ascend reference capture, a
-queued NPU execution, and per-rank memory/communication reports are available.
-The checkpoint metadata is present, but it does not supply those runtime
-states. This session does not run Prefill, a continuous full network, MTP,
-DSpark, datasets, HTTP serving, or `vllm serve`; none of those statuses are
-inferred here.
+The representative full physical-layer task is recorded as `pass` for the
+single active request case. The formal EP2 task remains `not_run` until the
+additional request-state and collective cases are run and the joint
+vLLM-Ascend layer/MoE/cache capture is recorded. This session does not run
+Prefill, a continuous full network, MTP, DSpark, datasets, HTTP serving, or
+`vllm serve`; none of those statuses are inferred here.

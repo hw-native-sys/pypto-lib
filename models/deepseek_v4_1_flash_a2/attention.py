@@ -12,7 +12,7 @@ import pypto.language as pl
 
 from .qkv_w8a8 import make_qkv_w8a8_inline
 from .swa import make_swa_inline
-from .o_proj import make_o_proj_inline
+from .output_proj import make_output_projection_bf16
 
 
 def make_attention_inline(capacity, config):
@@ -29,7 +29,15 @@ def make_attention_inline(capacity, config):
     rank = config["o_lora_rank"]
     qkv = make_qkv_w8a8_inline(capacity, config)
     swa = make_swa_inline(capacity, 2, config)
-    project = make_o_proj_inline(capacity, config)
+    project = make_output_projection_bf16(
+        capacity,
+        heads,
+        head_dim,
+        config["qk_rope_head_dim"],
+        groups,
+        rank,
+        hidden,
+    )
 
     @pl.jit.inline
     def attention_inline(
@@ -43,8 +51,7 @@ def make_attention_inline(capacity, config):
         wkv_scale: pl.Tensor[[head_dim], pl.FP32],
         kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
         wo_a: pl.Tensor[[groups, group_input, rank], pl.BF16],
-        wo_b: pl.Tensor[[groups * rank, hidden], pl.INT8],
-        wo_b_scale: pl.Tensor[[hidden], pl.FP32],
+        wo_b: pl.Tensor[[groups * rank, hidden], pl.BF16],
         rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
         rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
         slots: pl.Tensor[[capacity, 2], pl.INT64],
@@ -67,7 +74,9 @@ def make_attention_inline(capacity, config):
         )
         attended = pl.create_tensor([capacity, width], dtype=pl.BF16)
         swa(query, window_kv, slots, indices, sink, cache, attended, active)
-        project(attended, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, output, active)
+        rotated = pl.create_tensor([capacity, width], dtype=pl.BF16)
+        grouped = pl.create_tensor([capacity, groups * rank], dtype=pl.BF16)
+        project(attended, wo_a, wo_b, rope_cos, rope_sin, rotated, grouped, output, active)
         return positions, query_latent, query, window_kv, cache, cache_lens, output
 
     return attention_inline
@@ -99,8 +108,7 @@ def make_attention(capacity, config):
         wkv_scale: pl.Tensor[[head_dim], pl.FP32],
         kv_norm_weight: pl.Tensor[[head_dim], pl.BF16],
         wo_a: pl.Tensor[[groups, group_input, rank], pl.BF16],
-        wo_b: pl.Tensor[[groups * rank, hidden], pl.INT8],
-        wo_b_scale: pl.Tensor[[hidden], pl.FP32],
+        wo_b: pl.Tensor[[groups * rank, hidden], pl.BF16],
         rope_cos: pl.Tensor[[capacity, pairs], pl.FP32],
         rope_sin: pl.Tensor[[capacity, pairs], pl.FP32],
         slots: pl.Tensor[[capacity, 2], pl.INT64],
@@ -118,7 +126,7 @@ def make_attention(capacity, config):
 
         compute(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-            kv_norm_weight, wo_a, wo_b, wo_b_scale,
+            kv_norm_weight, wo_a, wo_b,
             rope_cos, rope_sin, slots, indices, sink,
             positions, query_latent, query, window_kv, cache, cache_lens, output, active,
         )

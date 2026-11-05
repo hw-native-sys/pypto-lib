@@ -1,6 +1,10 @@
 # Copyright (c) PyPTO Contributors.
-# This program is free software; you can redistribute it and/or modify it under the terms of
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek V4.1 A2/A3 W8A8 Decode MoE for the two-rank EP gate.
 
@@ -50,14 +54,20 @@ COUNT_PAD = 16
 # variables are read only while importing that leaf and never change the ABI.
 os.environ["A2_MOE_LOCAL_EXPERTS"] = str(N_LOCAL_EXPERTS)
 os.environ["A2_MOE_RECV_MAX"] = str(RECV_MAX)
-from models.deepseek_v4_1_flash_a2.moe_routed import expert_routed_inline
+from models.deepseek_v4_1_flash_a2.moe_routed import expert_routed_tile
 
 
 _ROUTER_CONFIG = asdict(FLASH)
 _ROUTER_CONFIG["image_sentinel_base_id"] = 129257
 ROUTER = make_moe_router_inline(T, _ROUTER_CONFIG)
 QUANTIZE = make_dynamic_int8_quantize(T, D)
-SHARED = make_shared_moe_w8a8_inline(T, _ROUTER_CONFIG, fused_activation=False)
+SHARED = make_shared_moe_w8a8_inline(T, _ROUTER_CONFIG, fused_activation=True)
+# Temporary NPU diagnosis switch.  It is consumed only by the local EP2
+# runner to isolate the two additive MoE branches; the formal path remains
+# the default ``sum`` route.
+_DEBUG_COMPONENT = {"routed_only": 1, "shared_only": 2}.get(
+    os.environ.get("PYPTO_EP2_DEBUG_COMPONENT", "sum"), 0
+)
 
 
 @pl.jit.inline
@@ -216,19 +226,20 @@ def decode_ep2_regroup(
         running = pl.cast(0, pl.INT32)
         for expert in pl.range(N_LOCAL_EXPERTS):
             pl.write(expert_offsets, [expert], running)
-            pl.write(cursors, [expert], running)
+            pl.write(cursors, [expert], pl.cast(0, pl.INT32))
             pl.write(recv_count, [expert, 0], pl.read(expert_counts, [expert]))
             running = running + pl.read(expert_counts, [expert])
         pl.write(expert_offsets, [N_LOCAL_EXPERTS], running)
         for row in pl.range(total):
             expert = pl.cast(pl.read(route_expert, [row, 0]), pl.INDEX)
-            slot = pl.read(cursors, [expert])
-            pl.write(cursors, [expert], pl.cast(slot + 1, pl.INT32))
-            pl.write(bucket, [slot], pl.cast(row, pl.INT32))
-            pl.write(recv_scale, [expert, slot], pl.read(route_scale, [row, 0]))
-            pl.write(recv_weight, [expert, slot], pl.read(route_weight, [row, 0]))
-            pl.write(recv_source, [expert, slot], pl.read(route_source, [row, 0]))
-            pl.write(recv_route, [expert, slot], pl.read(route_id, [row, 0]))
+            local_slot = pl.read(cursors, [expert])
+            pl.write(cursors, [expert], pl.cast(local_slot + 1, pl.INT32))
+            bucket_slot = pl.read(expert_offsets, [expert]) + local_slot
+            pl.write(bucket, [bucket_slot], pl.cast(row, pl.INT32))
+            pl.write(recv_scale, [expert, local_slot], pl.read(route_scale, [row, 0]))
+            pl.write(recv_weight, [expert, local_slot], pl.read(route_weight, [row, 0]))
+            pl.write(recv_source, [expert, local_slot], pl.read(route_source, [row, 0]))
+            pl.write(recv_route, [expert, local_slot], pl.read(route_id, [row, 0]))
 
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     with pl.spmd(N_LOCAL_EXPERTS, name_hint="dsv41_ep2_regroup_payload", deps=[meta_tid]):
@@ -308,7 +319,13 @@ def decode_ep2_combine(
                 slot = token * TOPK + route
                 routed = pl.add(routed, slot_out[slot:slot + 1, :])
             shared = pl.cast(shared_output[token:token + 1, :], pl.FP32)
-            output[token:token + 1, :] = pl.cast(pl.add(routed, shared), pl.BF16, mode="rint")
+            if _DEBUG_COMPONENT == 1:
+                combined = routed
+            elif _DEBUG_COMPONENT == 2:
+                combined = shared
+            else:
+                combined = pl.add(routed, shared)
+            output[token:token + 1, :] = pl.cast(combined, pl.BF16, mode="rint")
         else:
             output[token:token + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
     return wait_tid
@@ -317,15 +334,16 @@ def decode_ep2_combine(
 @pl.jit(auto_scope=False)
 def decode_ep2_rank(
     value: pl.Tensor[[T, D], pl.BF16],
+    router_value: pl.Tensor[[T, D], pl.BF16],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     text_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     vision_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, 2560], pl.INT8, pl.NZ],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, 2560], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     shared_gate_up: pl.Tensor[[D, MOE_INTER * 2], pl.INT8],
     shared_gate_up_scale: pl.Tensor[[MOE_INTER * 2], pl.FP32],
@@ -350,7 +368,7 @@ def decode_ep2_rank(
     x_int8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     QUANTIZE(value, x_int8, x_scale, active)
-    ROUTER(value, gate_weight, text_bias, vision_bias, input_ids, logits, route_ids, route_weights, active)
+    ROUTER(value, router_value, gate_weight, text_bias, vision_bias, input_ids, logits, route_ids, route_weights, active)
 
     pack_tid = decode_ep2_pack(
         route_ids, route_weights, x_int8, x_scale, lane_x, lane_aux, lane_count, lane_ready, active, rank, epoch,
@@ -380,11 +398,32 @@ def decode_ep2_rank(
     )
 
     routed_output = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP32)
-    expert_routed_inline(
-        recv_x, recv_scale, recv_weight, recv_count,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale, routed_output,
-    )
+    routed_output_flat = pl.reshape(routed_output, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    d_tiles = D // 256
+    with pl.spmd(N_LOCAL_EXPERTS * (RECV_MAX // 64) * d_tiles, name_hint="dsv41_ep2_expert_output_zero") as inputs_ready:
+        block = pl.tile.get_block_idx()
+        zero_row = (block // d_tiles) * 64
+        zero_col = (block % d_tiles) * 256
+        routed_output_flat[zero_row : zero_row + 64, zero_col : zero_col + 256] = pl.full(
+            [64, 256], dtype=pl.FP32, value=0.0
+        )
+    for local_e in pl.parallel(N_LOCAL_EXPERTS):
+        n_rows = pl.cast(pl.read(recv_count, [local_e, 0]), pl.INDEX)
+        n_tiles = (n_rows + 64 - 1) // 64
+        for tile in pl.parallel(n_tiles):
+            tile_row = tile * 64
+            valid_rows = pl.min(64, n_rows - tile_row)
+            flat_tile_row = local_e * RECV_MAX + tile_row
+            recv_y_tile = pl.create_tensor([64, D], dtype=pl.FP32)
+            expert_routed_tile(
+                recv_x, recv_scale, recv_weight,
+                routed_w1, routed_w1_scale,
+                routed_w3, routed_w3_scale,
+                routed_w2, routed_w2_scale,
+                recv_y_tile,
+                local_e, tile_row, valid_rows, inputs_ready,
+            )
+            routed_output_flat[flat_tile_row : flat_tile_row + 64, :] = recv_y_tile
     return_tid = decode_ep2_return(routed_output, recv_source, recv_route, recv_count, slot_out)
 
     shared_output = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -396,15 +435,16 @@ def decode_ep2_rank(
 @pl.jit.host
 def decode_ep2(
     value: pl.Tensor[[EP_SIZE, T, D], pl.BF16],
+    router_value: pl.Tensor[[EP_SIZE, T, D], pl.BF16],
     gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.FP32],
     text_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
     vision_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
     input_ids: pl.Tensor[[EP_SIZE, T], pl.INT64],
-    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
+    routed_w3: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w3_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, D, 2560], pl.INT8, pl.NZ],
+    routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, D, 2560], pl.INT8],
     routed_w2_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, D], pl.FP32],
     shared_gate_up: pl.Tensor[[EP_SIZE, D, MOE_INTER * 2], pl.INT8],
     shared_gate_up_scale: pl.Tensor[[EP_SIZE, MOE_INTER * 2], pl.FP32],
@@ -433,7 +473,7 @@ def decode_ep2(
         slot_out = pld.window(slot_out_buf, [N_ROUTES, D], dtype=pl.FP32)
         return_ready = pld.window(return_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
         decode_ep2_rank(
-            value[rank], gate_weight[rank], text_bias[rank], vision_bias[rank], input_ids[rank],
+            value[rank], router_value[rank], gate_weight[rank], text_bias[rank], vision_bias[rank], input_ids[rank],
             routed_w1[rank], routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank],
             routed_w2[rank], routed_w2_scale[rank], shared_gate_up[rank], shared_gate_up_scale[rank],
             shared_down[rank], shared_down_scale[rank], lane_x, lane_aux, lane_count, lane_ready,

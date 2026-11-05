@@ -142,15 +142,27 @@ def load_routed_shard(
     layer: int,
     rank: int,
 ) -> dict[str, torch.Tensor]:
-    """Materialize one complete 192-expert EP2 shard in kernel layout."""
+    """Materialize one complete 192-expert EP2 shard in external NZ layout.
+
+    The ``pl.NZ`` annotation is logical in the Python signature, but the
+    distributed host ABI passes the compiler's physical five-dimensional
+    view.  The first dimension is the local expert, followed by
+    ``[C / C0, R / 16, 16, C0]``.  Keeping that shape here prevents the
+    validation runner from silently treating packed bytes as row-major data.
+    """
 
     entries = [packed for _, packed in iter_routed_experts(checkpoint, layer, rank)]
+
+    def stack_nz(name: str, rows: int, cols: int) -> torch.Tensor:
+        value = torch.stack([entry[name] for entry in entries])
+        return value.reshape(LOCAL_EXPERTS, cols // 32, rows // 16, 16, 32).contiguous()
+
     return {
-        "routed_w1": torch.stack([entry["w1"] for entry in entries]),
+        "routed_w1": stack_nz("w1", INTERMEDIATE, HIDDEN),
         "routed_w1_scale": torch.stack([entry["w1_scale"] for entry in entries]),
-        "routed_w3": torch.stack([entry["w3"] for entry in entries]),
+        "routed_w3": stack_nz("w3", INTERMEDIATE, HIDDEN),
         "routed_w3_scale": torch.stack([entry["w3_scale"] for entry in entries]),
-        "routed_w2": torch.stack([entry["w2"] for entry in entries]),
+        "routed_w2": stack_nz("w2", HIDDEN, INTERMEDIATE_PADDED),
         "routed_w2_scale": torch.stack([entry["w2_scale"] for entry in entries]),
     }
 
@@ -233,12 +245,12 @@ def abi_summary() -> dict[str, Any]:
         "offset_policy": "reject_nonzero",
         "routed": {
             "w1_w3_logical": [INTERMEDIATE, HIDDEN],
-            "w1_w3_device": [LOCAL_EXPERTS, INTERMEDIATE, HIDDEN],
+            "w1_w3_device": [LOCAL_EXPERTS, HIDDEN // 32, INTERMEDIATE // 16, 16, 32],
             "w2_logical": [HIDDEN, INTERMEDIATE],
-            "w2_device": [LOCAL_EXPERTS, HIDDEN, INTERMEDIATE_PADDED],
+            "w2_device": [LOCAL_EXPERTS, INTERMEDIATE_PADDED // 32, HIDDEN // 16, 16, 32],
             "scale_w1_w3": [LOCAL_EXPERTS, INTERMEDIATE],
             "scale_w2": [LOCAL_EXPERTS, HIDDEN],
-            "layout": "FRACTAL_NZ for all routed matrices",
+            "layout": "FRACTAL_NZ for all routed matrices; EP host shape flattens to [EP*LOCAL_EXPERTS, ...]",
         },
         "shared": {
             "gate_up": [HIDDEN, INTERMEDIATE * 2],

@@ -39,6 +39,7 @@ REQUIRED_INPUT_FIELDS = (
     "cache_source_ids",
     "ratio1_ratio2_state",
 )
+FULL_CACHE_CRC_LIMIT = 1 << 30
 
 
 def _read_json(path: Path, errors: list[str]) -> dict[str, Any] | None:
@@ -80,10 +81,27 @@ def _check_history_cache(path: Path, errors: list[str]) -> None:
     try:
         with zipfile.ZipFile(path) as archive:
             names = archive.namelist()
-            if archive.testzip() is not None:
-                errors.append("history_cache.npz: ZIP member checksum failed")
             if not any(name.endswith(".npy") for name in names):
                 errors.append("history_cache.npz: no NumPy array members")
+                return
+            logical_bytes = sum(info.file_size for info in archive.infolist())
+            if logical_bytes <= FULL_CACHE_CRC_LIMIT:
+                if archive.testzip() is not None:
+                    errors.append("history_cache.npz: ZIP member checksum failed")
+                return
+            # A full CRC pass would expand the reference cache's tens of GiB
+            # of logical zero pages. Validate the NPY magic on the members used
+            # by the Decode runner; the runner then streams and checks the
+            # exact cache-page prefixes consumed by the product.
+            required = ("before_cache_0.npy", "after_cache_0.npy")
+            for member in required:
+                matches = [name for name in names if name.endswith(member)]
+                if not matches:
+                    errors.append(f"history_cache.npz: missing {member}")
+                    continue
+                with archive.open(matches[0]) as stream:
+                    if stream.read(6) != b"\x93NUMPY":
+                        errors.append(f"history_cache.npz: invalid NPY header for {matches[0]}")
     except (OSError, zipfile.BadZipFile) as exc:
         errors.append(f"history_cache.npz: invalid NPZ container ({exc})")
 
