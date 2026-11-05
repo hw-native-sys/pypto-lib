@@ -645,6 +645,140 @@ def decode_kda_test(
 
 
 @pl.jit.inline
+def decode_kda_mixed_precision(
+    query: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    key: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    value: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    decay: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.FP32],
+    beta: pl.Tensor[[T_DYN, BETA_PAD], pl.FP32],
+    recurrent_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
+    output: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+):
+    """Advance one token from seed rows into working and optional checkpoint rows."""
+    requests = pl.tensor.dim(query_start_loc, 0) - 1
+    t_dim = pl.tensor.dim(query, 0)
+    q_rows = pl.reshape(query, [t_dim, LOCAL_KDA_H * KDA_DIM])
+    k_rows = pl.reshape(key, [t_dim, LOCAL_KDA_H * KDA_DIM])
+    v_rows = pl.reshape(value, [t_dim, LOCAL_KDA_H * KDA_DIM])
+    g_rows = pl.reshape(decay, [t_dim, LOCAL_KDA_H * KDA_DIM])
+    scratch_rows = requests * LOCAL_KDA_H * CHUNK_TILE
+    qg_gm = pl.create_tensor([scratch_rows, KDA_DIM], dtype=pl.BF16)
+    w_gm = pl.create_tensor([scratch_rows, KDA_DIM], dtype=pl.BF16)
+    u_gm = pl.create_tensor([scratch_rows, KDA_DIM], dtype=pl.FP32)
+    kdec_gm = pl.create_tensor([scratch_rows, KDA_DIM], dtype=pl.BF16)
+    a2_gm = pl.create_tensor([scratch_rows, CHUNK_TILE], dtype=pl.BF16)
+    eg_gm = pl.create_tensor([requests * LOCAL_KDA_H, KDA_DIM], dtype=pl.FP32)
+    with pl.spmd(requests * LOCAL_KDA_H, name_hint="decode_kda_mixed_prepare") as prepare_tid:
+        task = pl.tile.get_block_idx()
+        h = task // requests
+        request = task % requests
+        token = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+        end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+        if end > token:
+            col = h * KDA_DIM
+            q_part = pl.slice(q_rows, [CHUNK_TILE, KDA_DIM], [token, col], valid_shape=[1, KDA_DIM])
+            k_part = pl.slice(k_rows, [CHUNK_TILE, KDA_DIM], [token, col], valid_shape=[1, KDA_DIM])
+            q_full = pl.set_validshape(pl.fillpad(q_part, pad_value=pl.PadValue.zero), CHUNK_TILE, KDA_DIM)
+            k_full = pl.set_validshape(pl.fillpad(k_part, pad_value=pl.PadValue.zero), CHUNK_TILE, KDA_DIM)
+            q_fp32 = pl.cast(q_full, pl.FP32)
+            k_fp32 = pl.cast(k_full, pl.FP32)
+            q_sum = pl.row_sum(pl.mul(q_fp32, q_fp32))
+            k_sum = pl.row_sum(pl.mul(k_fp32, k_fp32))
+            q_inv = pl.rsqrt(pl.add(q_sum, PREFILL_L2_EPS), high_precision=True)
+            k_inv = pl.rsqrt(pl.add(k_sum, PREFILL_L2_EPS), high_precision=True)
+            q_unit = pl.mul(pl.row_expand_mul(q_fp32, q_inv), PREFILL_Q_SCALE)
+            k_unit = pl.row_expand_mul(k_fp32, k_inv)
+            base = task * CHUNK_TILE
+            qk = pl.matmul(q_unit, k_unit, pl.FP32, b_trans=True)
+            a2_gm[base:base + CHUNK_TILE, :] = pl.cast(qk, pl.BF16, mode="rint")
+
+            g = g_rows[token:token + 1, col:col + KDA_DIM]
+            eg = pl.exp(g)
+            eg_ones = pl.full([CHUNK_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
+            eg_full = pl.col_expand_mul(eg_ones, eg)
+            qg = pl.cast(pl.mul(q_unit, eg_full), pl.BF16, mode="rint")
+            kg = pl.cast(pl.mul(k_unit, eg_full), pl.BF16, mode="rint")
+            b = pl.read(beta, [token, h])
+            w = pl.cast(pl.mul(pl.cast(kg, pl.FP32), b), pl.BF16, mode="rint")
+            v_part = pl.slice(v_rows, [CHUNK_TILE, KDA_DIM], [token, col], valid_shape=[1, KDA_DIM])
+            v_full = pl.set_validshape(pl.fillpad(v_part, pad_value=pl.PadValue.zero), CHUNK_TILE, KDA_DIM)
+            u = pl.cast(pl.mul(pl.cast(v_full, pl.FP32), b), pl.BF16, mode="rint")
+            qg_gm[base:base + CHUNK_TILE, :] = qg
+            w_gm[base:base + CHUNK_TILE, :] = w
+            u_gm[base:base + CHUNK_TILE, :] = pl.cast(u, pl.FP32)
+            kdec_gm[base:base + CHUNK_TILE, :] = pl.cast(k_unit, pl.BF16, mode="rint")
+            eg_gm[task:task + 1, :] = eg
+
+    state_pool_rows = pl.tensor.dim(recurrent_state, 0)
+    state_rows_total = state_pool_rows * LOCAL_KDA_H * KDA_DIM
+    state_2d = pl.reshape(recurrent_state, [state_rows_total, KDA_DIM])
+    out_rows = pl.reshape(output, [t_dim, LOCAL_KDA_H * KDA_DIM])
+    update_tasks = requests * LOCAL_KDA_H * (KDA_DIM // PREFILL_V_TILE)
+    with pl.spmd(update_tasks, name_hint="decode_kda_mixed_update", deps=[prepare_tid]):
+        task = pl.tile.get_block_idx()
+        lane = task % (KDA_DIM // PREFILL_V_TILE)
+        prep = task // (KDA_DIM // PREFILL_V_TILE)
+        h = prep // requests
+        request = prep % requests
+        token = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+        end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+        if end > token:
+            row = pl.cast(pl.read(state_rows, [request, 0]), pl.INDEX)
+            v0 = lane * PREFILL_V_TILE
+            state_base = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
+            state = state_2d[state_base:state_base + PREFILL_V_TILE, :]
+            state_bf16 = pl.cast(state, pl.BF16, mode="rint")
+            base = prep * CHUNK_TILE
+            w = w_gm[base:base + CHUNK_TILE, :]
+            u = u_gm[base:base + CHUNK_TILE, v0:v0 + PREFILL_V_TILE]
+            predicted = pl.matmul(w, state_bf16, pl.FP32, b_trans=True)
+            delta = pl.cast(pl.sub(u, predicted), pl.BF16, mode="rint")
+            qg = qg_gm[base:base + CHUNK_TILE, :]
+            a2 = a2_gm[base:base + CHUNK_TILE, :]
+            carried_output = pl.matmul(qg, state_bf16, pl.FP32, b_trans=True)
+            delta_output = pl.matmul(a2, delta, pl.FP32)
+            result = pl.cast(pl.add(carried_output, delta_output), pl.BF16, mode="rint")
+            out_col = h * KDA_DIM + v0
+            result_row = pl.set_validshape(result, 1, PREFILL_V_TILE)
+            out_rows[token:token + CHUNK_TILE, out_col:out_col + PREFILL_V_TILE] = result_row
+            eg = eg_gm[prep:prep + 1, :]
+            kdec = kdec_gm[base:base + CHUNK_TILE, :]
+            decayed_state = pl.col_expand_mul(state, eg)
+            state_delta = pl.matmul(delta, kdec, pl.FP32, a_trans=True)
+            next_state = pl.add(decayed_state, state_delta)
+            working_row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+            working_base = (working_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+            state_2d[working_base:working_base + PREFILL_V_TILE, :] = next_state
+            checkpoint_row = pl.cast(pl.read(state_rows, [request, 2]), pl.INDEX)
+            if checkpoint_row >= 0:
+                checkpoint_base = (checkpoint_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+                state_2d[checkpoint_base:checkpoint_base + PREFILL_V_TILE, :] = next_state
+    return output, recurrent_state
+
+
+
+@pl.jit
+def decode_kda_mixed_precision_test(
+    query: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    key: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    value: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    decay: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.FP32],
+    beta: pl.Tensor[[T_DYN, BETA_PAD], pl.FP32],
+    recurrent_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
+    output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+):
+    output, recurrent_state = decode_kda_mixed_precision(
+        query, key, value, decay, beta, recurrent_state, query_start_loc, state_rows, output,
+    )
+    return output, recurrent_state
+
+
+
+@pl.jit.inline
 def prefill_kda(
     query: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     key: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
@@ -1766,6 +1900,58 @@ def decode_build_tensor_specs(tokens: int = 5):
     ]
 
 
+def decode_mixed_build_tensor_specs(case: str = "packed"):
+    """Packed one-token requests with permuted state rows and inactive sentinels."""
+    from golden import TensorSpec
+
+    tokens = 16
+    active = {
+        "packed": (0, 3, 7, 15), "packed-single": (15,), "packed-all": tuple(range(16)),
+        "packed-empty": (), "packed-in-place": (0, 15), "packed-shared-seed": (0, 15),
+        "packed-zero-qk": (2, 14), "packed-beta": (0, 15),
+    }[case]
+    lengths = [int(request in active) for request in range(16)]
+    starts = torch.tensor([0] + torch.tensor(lengths).cumsum(0).tolist(), dtype=torch.int32)
+    seed_rows = torch.arange(16, dtype=torch.int32).roll(5)
+    rows = torch.stack((seed_rows, seed_rows + 16, seed_rows + 32), dim=1)
+    rows[3, 2] = -1
+    if case == "packed-in-place":
+        rows[:, 1] = rows[:, 0]
+    if case == "packed-shared-seed":
+        rows[15, 0] = rows[0, 0]
+    shape = [tokens, LOCAL_KDA_H, KDA_DIM]
+    state_shape = [51, LOCAL_KDA_H, KDA_DIM, KDA_DIM]
+    bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
+    qk_init = (lambda: torch.zeros(shape, dtype=bf)) if case == "packed-zero-qk" else lambda: torch.randn(shape).to(bf)
+    beta = torch.rand(tokens, BETA_PAD)
+    if case == "packed-beta":
+        beta[0].zero_()
+        beta[1].fill_(1.0)
+    return [
+        TensorSpec("query", shape, bf, init_value=qk_init),
+        TensorSpec("key", shape, bf, init_value=qk_init),
+        TensorSpec("value", shape, bf, init_value=lambda: torch.randn(shape).to(bf)),
+        TensorSpec("decay", shape, f32, init_value=lambda: -5.0 * torch.rand(shape)),
+        TensorSpec("beta", [tokens, BETA_PAD], f32, init_value=beta),
+        TensorSpec("recurrent_state", state_shape, f32, init_value=lambda: torch.randn(state_shape) * 0.1),
+        TensorSpec("query_start_loc", [17], i32, init_value=starts),
+        TensorSpec("state_rows", [16, 3], i32, init_value=rows),
+        TensorSpec("output", shape, bf, init_value=lambda: torch.full(shape, 0.125, dtype=bf)),
+    ]
+
+
+
+def _decode_mixed_golden_tensors(tensors) -> None:
+    output, state = golden_prefill_kda_mixed_precision(
+        tensors["query"], tensors["key"], tensors["value"], tensors["decay"], tensors["beta"],
+        tensors["recurrent_state"], tensors["query_start_loc"], tensors["state_rows"],
+    )
+    tokens = int(tensors["query_start_loc"][-1])
+    tensors["output"][:tokens] = output[:tokens]
+    tensors["recurrent_state"][:] = state
+
+
+
 def golden_prefill_kda_fp32(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -2082,22 +2268,34 @@ def run_decode_case(argv=None):
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--case", type=str, default="batch", choices=["batch", "single"])
+    cases = [
+        "batch", "single", "packed", "packed-single", "packed-all", "packed-empty",
+        "packed-in-place", "packed-shared-seed", "packed-zero-qk", "packed-beta",
+    ]
+    parser.add_argument("--case", default="all", choices=["all", *cases])
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
-    result = run(
-        fn=decode_kda_test,
-        specs=decode_build_tensor_specs(1 if args.case == "single" else 5),
-        golden_fn=_decode_golden_tensors,
-        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-        rtol=0.02,
-        atol=0.02,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for case in cases if args.case == "all" else [args.case]:
+        packed = case.startswith("packed")
+        if packed:
+            specs = decode_mixed_build_tensor_specs(case)
+        else:
+            specs = decode_build_tensor_specs(1 if case == "single" else 5)
+        print(f"KDA decode case={case}", flush=True)
+        result = run(
+            fn=decode_kda_mixed_precision_test if packed else decode_kda_test,
+            specs=specs,
+            golden_fn=_decode_mixed_golden_tensors if packed else _decode_golden_tensors,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            rtol=0.02,
+            atol=0.02,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+
 
 
 def run_prefill_case(argv=None):

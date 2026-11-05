@@ -280,6 +280,48 @@ runs with fixed inputs and private pool segments. The per-query path preserves
 the original score formula, quantization, TopK ordering and owning numerical
 checks; changing attention index order would not correct those score values.
 
+### Single-token KDA recurrence
+
+The shared KDA sublayer uses `decode_kda_mixed_precision` when each active
+request has one query token. Two SPMD stages retain the chunk core's FP32
+normalization, BF16 intermediate rounding and FP32 carried state, while
+omitting the single-token chunk's triangular inverse. Projection, convolution,
+output projection and TP reduction use the existing operators. Batches with
+a multi-token request and entirely empty batches continue to use `prefill_kda`.
+
+Grouped cache metadata selects the seed, private working and optional
+checkpoint rows. Shared seeds remain immutable unless the working row aliases
+the seed. The independent FP32 `decode_kda` remains a separate recurrence and
+is not used as the mixed-precision implementation reference.
+
+Run `python models/glm5_3_flash/kda.py --component decode -p a2a3 -d 0` for
+bounded standalone coverage. The default covers the independent recurrence
+and packed single-token batches with sparse and high-numbered request slots,
+all slots active, an empty batch, in-place state, shared seeds, zero q/k and
+beta boundaries. `--case packed` selects the sparse-request example;
+`--case packed-empty` checks unchanged state and output padding.
+These component checks use `golden_prefill_kda_mixed_precision` with the
+existing `rtol=atol=0.02` gate. They do not establish whole-model throughput.
+
+A single Ascend A3 NPU comparison uses 16 query rows, 16 request slots,
+head width 128, 51 FP32 state rows, and one token per active request.
+Fixed random inputs and nonzero states are restored before every dispatch;
+the device-wall median includes the identical state and output restoration.
+After five warmups and 100 timed rounds on PyPTO `ff2e0a4`, runtime `31f9e72`,
+PTOAS 0.72 and CANN 9.0.0, the measured recurrence entries are:
+
+| Local heads (TP geometry) | Active requests | Chunk (us) | Single-token (us) |
+|---|---:|---:|---:|
+| 8 (TP8) | 1 | 1007.000 | 472.460 |
+| 8 (TP8) | 4 | 1036.590 | 489.760 |
+| 4 (TP16) | 1 | 533.660 | 255.120 |
+| 4 (TP16) | 4 | 543.640 | 265.859 |
+
+The paired NPU outputs and full states match elementwise across sparse, full,
+empty, in-place and shared-seed cases. These are single-device component
+measurements, excluding projection, convolution, TP communication and Serving.
+Whole-model throughput for this isolated change has not been measured.
+
 ### Earlier Serving measurements
 
 The measurements below predate native MLA activation quantization and the

@@ -55,7 +55,7 @@ from models.glm5_3_flash.indexer import (
     synthetic_indexer,
 )
 from models.glm5_3_flash.kda import (
-    BETA_PAD, CHUNK_TILE, CONV_DIM, STATE_LEN, KdaTensors, kda_conv_prefill, kda_forward, kda_output,
+    BETA_PAD, CHUNK_TILE, CONV_DIM, STATE_LEN, KdaTensors, decode_kda_mixed_precision, kda_conv_prefill, kda_forward, kda_output,
     kda_projection, prefill_kda, stack_conv_weight, synthetic_kda,
 )
 from models.glm5_3_flash.lm_head import FP32_HEAD_VOCAB_PAD, lm_head_logits
@@ -699,17 +699,27 @@ def kda_attention_sublayer(
     kda_out: pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     attn_partial: pl.Tensor[[CAPACITY, D], pl.FP32],
 ):
-    """KDA projection -> causal conv -> chunked delta attention -> gated output."""
+    """KDA projection and convolution followed by single-token or chunked attention."""
     stack_conv_weight(conv_q, conv_k, conv_v, conv_w)
     kda_projection(
         normed,
         w_q, w_k, w_v, w_f_a, w_f_b, dt_bias, a_log, w_b, w_g_a, w_g_b, mixed_qkv, decay, beta, out_gate,
     )
     kda_conv_prefill(mixed_qkv, conv_w, conv_state, query_start_loc, kda_state_rows, query, key, value)
-    prefill_kda(
-        query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, tri_incl,
-        tri_strict, head_onehot, eye_wide, kda_out,
-    )
+    max_query_length = pl.cast(0, pl.INDEX)
+    for request in pl.range(pl.tensor.dim(query_start_loc, 0) - 1):
+        begin = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+        end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+        max_query_length = pl.max(max_query_length, end - begin)
+    if max_query_length == 1:
+        decode_kda_mixed_precision(
+            query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, kda_out,
+        )
+    else:
+        prefill_kda(
+            query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, tri_incl,
+            tri_strict, head_onehot, eye_wide, kda_out,
+        )
 
 
 @pl.jit.inline
