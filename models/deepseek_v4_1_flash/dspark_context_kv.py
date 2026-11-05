@@ -11,13 +11,14 @@
 import pypto.language as pl
 import torch
 
-from config import DSPARK_QUERY_WIDTH, FLASH, ORI_BLOCKS_DYN, T_DYN
+from config import FLASH, ORI_BLOCKS_DYN
 from qkv_proj_rope import golden_rope_interleave, quantize_projection_input, kv_proj, window_publish
 from gemm import golden_mxfp8_linear_grouped_sum
 from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm
 
 
+T_DYN = pl.dynamic("V41_DSPARK_CONTEXT_T_DYN")
 D = FLASH.hidden_size
 HEAD_DIM = FLASH.head_dim
 ROPE_DIM = FLASH.qk_rope_head_dim
@@ -100,17 +101,18 @@ def dspark_context_kv_test(
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     context_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[3, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[3, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
+    """Publish through a middle-layer view while retaining both guard layers."""
     main_x.bind_dynamic(0, T_DYN)
     rope_cos.bind_dynamic(0, T_DYN)
     rope_sin.bind_dynamic(0, T_DYN)
     context_slots.bind_dynamic(0, T_DYN)
-    window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
-    window_cache_scale.bind_dynamic(0, ORI_BLOCKS_DYN)
-    return dspark_context_kv(
+    window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
+    window_cache_scale.bind_dynamic(1, ORI_BLOCKS_DYN)
+    dspark_context_kv(
         main_x,
         wkv,
         wkv_scale,
@@ -118,10 +120,11 @@ def dspark_context_kv_test(
         rope_cos,
         rope_sin,
         context_slots,
-        window_cache,
-        window_cache_scale,
+        window_cache[1],
+        window_cache_scale[1],
         num_tokens,
     )
+    return window_cache, window_cache_scale
 
 
 def _compare_context_cache(
@@ -136,7 +139,8 @@ def _compare_context_cache(
     from quant import dequantize_mxfp8_cache
 
     slots = inputs["context_slots"]
-    active = slots[slots >= 0].long().unique()
+    layer_rows = actual_outputs["window_cache"].shape[1] * 128
+    active = slots[slots >= 0].long().unique() + layer_rows
     actual = dequantize_mxfp8_cache(
         actual_outputs["window_cache"], actual_outputs["window_cache_scale"]
     ).reshape(-1, HEAD_DIM)
@@ -164,7 +168,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark context KV validation")
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
@@ -173,7 +177,7 @@ if __name__ == "__main__":
     from quant import pack_fp8_nz, pack_mx_b_scale
 
     torch.manual_seed(42)
-    tokens = DSPARK_QUERY_WIDTH
+    tokens = 8
     main_x = torch.randn(tokens, D, dtype=torch.bfloat16) * 0.1
     weight = (torch.randn(D, HEAD_DIM) * 0.01).to(torch.float8_e4m3fn)
     weight = pack_fp8_nz(weight)
@@ -183,8 +187,13 @@ if __name__ == "__main__":
     sin = torch.zeros_like(cos)
     sin[0].fill_(1.0)
     cos[0].zero_()
-    cache = torch.zeros(1, 128, 1, HEAD_DIM, dtype=torch.float8_e4m3fn)
-    cache_scale = torch.ones((1, 128, 1, HEAD_DIM // 32), dtype=torch.bfloat16)
+    cache = torch.empty(3, 2, 128, 1, HEAD_DIM)
+    cache_scale = torch.empty((3, 2, 128, 1, HEAD_DIM // 32), dtype=torch.bfloat16)
+    for layer in range(3):
+        cache[layer].fill_((layer + 1) * 0.25)
+        cache_scale[layer].fill_((layer + 1) * 4.0)
+    cache = cache.to(torch.float8_e4m3fn)
+    slots = torch.tensor([0, 1, 127, 128, 255, -1, -1, -1], dtype=torch.int64)
 
     def golden(values):
         payload, scale = golden_context_kv_cache(
@@ -195,11 +204,11 @@ if __name__ == "__main__":
             values["rope_cos"],
             values["rope_sin"],
             values["context_slots"],
-            values["window_cache"],
-            values["window_cache_scale"],
+            values["window_cache"][1],
+            values["window_cache_scale"][1],
         )
-        values["window_cache"].copy_(payload)
-        values["window_cache_scale"].copy_(scale)
+        values["window_cache"][1].copy_(payload)
+        values["window_cache_scale"][1].copy_(scale)
 
     specs = [
         TensorSpec("main_x", [tokens, D], torch.bfloat16, init_value=main_x),
@@ -208,10 +217,10 @@ if __name__ == "__main__":
         TensorSpec("kv_norm_weight", [HEAD_DIM], torch.bfloat16, init_value=1.0),
         TensorSpec("rope_cos", [tokens, ROPE_DIM // 2], torch.float32, init_value=cos),
         TensorSpec("rope_sin", [tokens, ROPE_DIM // 2], torch.float32, init_value=sin),
-        TensorSpec("context_slots", [tokens], torch.int64, init_value=torch.arange(tokens) * 2 + 3),
-        TensorSpec("window_cache", [1, 128, 1, HEAD_DIM], torch.float8_e4m3fn, init_value=cache),
+        TensorSpec("context_slots", [tokens], torch.int64, init_value=slots),
+        TensorSpec("window_cache", [3, 2, 128, 1, HEAD_DIM], torch.float8_e4m3fn, init_value=cache),
         TensorSpec(
-            "window_cache_scale", [1, 128, 1, HEAD_DIM // 32], torch.bfloat16, init_value=cache_scale
+            "window_cache_scale", [3, 2, 128, 1, HEAD_DIM // 32], torch.bfloat16, init_value=cache_scale
         ),
         ScalarSpec("num_tokens", torch.int32, tokens, compile_runtime=True),
     ]
@@ -221,10 +230,8 @@ if __name__ == "__main__":
         specs=specs,
         golden_fn=golden,
         compare_fn=compare,
-        config={
-            "backend_type": args.backend_type, "execution_mode": args.execution_mode,
-            "device_id": args.device,
-        },
+        config={"backend_type": "a5", "device_id": args.device,
+                "execution_mode": args.execution_mode or args.platform == "a5sim"},
         compile_only=args.compile_only,
     )
     print(result)

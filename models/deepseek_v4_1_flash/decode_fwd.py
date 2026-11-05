@@ -18,16 +18,20 @@ import config as C
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) else 64
 _shape_parser.add_argument("--experts-per-rank", type=int, default=_default_experts)
+_shape_parser.add_argument("--weight-bank-size", type=int, default=C.FLASH.num_hidden_layers)
 _shape_options = _shape_parser.parse_known_args()[0]
 if _shape_options.experts_per_rank <= 0 or C.EP_SIZE * _shape_options.experts_per_rank % 16:
     _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
 C.N_LOCAL_EXPERTS = _shape_options.experts_per_rank
+WEIGHT_BANK_SIZE = _shape_options.weight_bank_size
+if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
+    _shape_parser.error("--weight-bank-size must be 1 or the full layer count")
 
 
 from config import (
     FLASH as M, B_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, COMPRESSED_CACHE_GROUP,
     DECODE_MAX_TOKENS, DECODE_INPUT_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
-    MOE_TOKENS,
+    MOE_TOKENS, DSPARK_DRAFT_LAYERS, DSPARK_TARGET_LAYER_IDS,
 )
 from compressor import STATE_WIDTH
 from decode_c1a_full import decode_c1a_full
@@ -51,6 +55,7 @@ LOCAL_H = M.num_attention_heads
 LOCAL_O_GROUPS = M.o_groups
 LOCAL_O_WIDTH = M.o_groups * M.o_lora_rank
 D = M.hidden_size
+DSPARK_MAIN_IN = DSPARK_DRAFT_LAYERS * D
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 Q_LORA = M.q_lora_rank
@@ -100,19 +105,19 @@ def decode_encoder(
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.FP8E4M3FN],
-    q_norm_weight: pl.Tensor[[N_LAYERS * Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
-    kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    hc_attn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
+    wq_a: pl.Tensor[[WEIGHT_BANK_SIZE, D, Q_LORA], pl.FP8E4M3FN],
+    q_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[WEIGHT_BANK_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wkv: pl.Tensor[[WEIGHT_BANK_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
+    kv_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[WEIGHT_BANK_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     token_rope_cos: pl.Out[pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32]],
@@ -146,18 +151,18 @@ def decode_encoder(
     index_norm_weight: pl.Tensor[[INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_weights_proj: pl.Tensor[[INDEX_SOURCE_COUNT, D, INDEX_H], pl.BF16, pl.NZ],
-    hc_ffn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
-    ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    hc_ffn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
+    gate_weight: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -173,17 +178,17 @@ def decode_encoder(
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
-    wq_a_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
-    wq_b_scale: pl.Tensor[[N_LAYERS * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-    wkv_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
-    wo_b_scale: pl.Tensor[[N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
+    wq_a_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
+    wq_b_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
+    wo_b_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
     index_wq_b_scale: pl.Tensor[[INDEX_SOURCE_COUNT * (Q_LORA // MX_GROUP), INDEX_H * INDEX_DIM], pl.FP8E8M0],
-    routed_w1_scale: pl.Tensor[[N_LAYERS * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
-    routed_w2_scale: pl.Tensor[[N_LAYERS * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
-    routed_w3_scale: pl.Tensor[[N_LAYERS * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
-    shared_w1_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    shared_w2_scale: pl.Tensor[[N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    routed_w1_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    routed_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
+    routed_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    shared_w1_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    shared_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
 ) -> tuple[
     pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
@@ -245,25 +250,26 @@ def decode_encoder(
                     engram_weight[engram_slot], x_hc, x_hc,
                 )
         with pl.scope():
+            weight_layer = layer % WEIGHT_BANK_SIZE
             layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [layer * window_blocks_per_layer, 0, 0, 0])
             layer_window_cache_scale = pl.slice(window_cache_scale_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], [layer * window_blocks_per_layer, 0, 0, 0])
-            layer_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [layer * MIX_HC, 0])
-            layer_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [layer * 3])
-            layer_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [layer * MIX_HC])
-            layer_norm_weight: pl.Tensor[[D], pl.BF16] = pl.slice(attn_norm_weight, [D], [layer * D])
-            layer_wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN] = wq_a[layer]
-            layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wq_a_scale, [D // MX_GROUP, Q_LORA], [layer * (D // MX_GROUP), 0])
-            layer_q_norm: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(q_norm_weight, [Q_LORA], [layer * Q_LORA])
-            layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN] = wq_b[layer]
-            layer_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wq_b_scale, [Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], [layer * (Q_LORA // MX_GROUP), 0])
-            layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN] = wkv[layer]
-            layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wkv_scale, [D // MX_GROUP, HEAD_DIM], [layer * (D // MX_GROUP), 0])
-            layer_kv_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(kv_norm_weight, [HEAD_DIM], [layer * HEAD_DIM])
-            layer_sink: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(attn_sink, [LOCAL_H], [layer * LOCAL_H])
-            layer_wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
-            layer_wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
-            layer_wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[layer]
-            layer_wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [layer * (LOCAL_O_WIDTH // MX_GROUP), 0])
+            layer_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [weight_layer * MIX_HC, 0])
+            layer_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [weight_layer * 3])
+            layer_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [weight_layer * MIX_HC])
+            layer_norm_weight: pl.Tensor[[D], pl.BF16] = pl.slice(attn_norm_weight, [D], [weight_layer * D])
+            layer_wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN] = wq_a[weight_layer]
+            layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wq_a_scale, [D // MX_GROUP, Q_LORA], [weight_layer * (D // MX_GROUP), 0])
+            layer_q_norm: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(q_norm_weight, [Q_LORA], [weight_layer * Q_LORA])
+            layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN] = wq_b[weight_layer]
+            layer_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wq_b_scale, [Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], [weight_layer * (Q_LORA // MX_GROUP), 0])
+            layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN] = wkv[weight_layer]
+            layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wkv_scale, [D // MX_GROUP, HEAD_DIM], [weight_layer * (D // MX_GROUP), 0])
+            layer_kv_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(kv_norm_weight, [HEAD_DIM], [weight_layer * HEAD_DIM])
+            layer_sink: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(attn_sink, [LOCAL_H], [weight_layer * LOCAL_H])
+            layer_wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [weight_layer * LOCAL_O_GROUPS, 0, 0])
+            layer_wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [weight_layer * LOCAL_O_GROUPS, 0, 0])
+            layer_wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[weight_layer]
+            layer_wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [weight_layer * (LOCAL_O_WIDTH // MX_GROUP), 0])
             if layer < 2:
                 swa_attention_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
                 decode_swa(
@@ -351,25 +357,25 @@ def decode_encoder(
                     topk_indices,
                     attention_hidden, attention_pre_mix, attention_count,
                 )
-            ffn_routed_base = layer * N_LOCAL_EXPERTS
-            ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [layer * MIX_HC, 0])
-            ffn_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_ffn_scale, [3], [layer * 3])
-            ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_ffn_base, [MIX_HC], [layer * MIX_HC])
-            layer_ffn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(ffn_norm_weight, [D], [layer * D])
-            ffn_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
-            ffn_correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [layer * N_EXPERTS])
+            ffn_routed_base = weight_layer * N_LOCAL_EXPERTS
+            ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [weight_layer * MIX_HC, 0])
+            ffn_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_ffn_scale, [3], [weight_layer * 3])
+            ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_ffn_base, [MIX_HC], [weight_layer * MIX_HC])
+            layer_ffn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(ffn_norm_weight, [D], [weight_layer * D])
+            ffn_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [weight_layer * N_EXPERTS, 0])
+            ffn_correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [weight_layer * N_EXPERTS])
             ffn_routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
-            ffn_routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
+            ffn_routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [weight_layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
             ffn_routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
-            ffn_routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [layer * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
+            ffn_routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [weight_layer * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
             ffn_routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
-            ffn_routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
-            ffn_shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w1[layer]
-            ffn_shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w1_scale, [D // MX_GROUP, MOE_INTER], [layer * (D // MX_GROUP), 0])
-            ffn_shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN] = shared_w2[layer]
-            ffn_shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w2_scale, [MOE_INTER // MX_GROUP, D], [layer * (MOE_INTER // MX_GROUP), 0])
-            ffn_shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w3[layer]
-            ffn_shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w3_scale, [D // MX_GROUP, MOE_INTER], [layer * (D // MX_GROUP), 0])
+            ffn_routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [weight_layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
+            ffn_shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w1[weight_layer]
+            ffn_shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w1_scale, [D // MX_GROUP, MOE_INTER], [weight_layer * (D // MX_GROUP), 0])
+            ffn_shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN] = shared_w2[weight_layer]
+            ffn_shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w2_scale, [MOE_INTER // MX_GROUP, D], [weight_layer * (MOE_INTER // MX_GROUP), 0])
+            ffn_shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w3[weight_layer]
+            ffn_shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w3_scale, [D // MX_GROUP, MOE_INTER], [weight_layer * (D // MX_GROUP), 0])
             force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
             moe(
                 attention_hidden, attention_pre_mix,
@@ -388,7 +394,7 @@ def decode_encoder(
                 data_arrived,
                 routed_output, combine_arrived,
                 local_moe_tokens, rank, layer + 1,
-                force_topk,
+                force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
             )
     return x_hc, pre_mix, token_rope_cos, token_rope_sin
 
@@ -397,19 +403,20 @@ def decode_encoder(
 def decode_decoder(
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.FP8E4M3FN],
-    q_norm_weight: pl.Tensor[[N_LAYERS * Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
-    kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    dspark_target_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, DSPARK_MAIN_IN], pl.BF16]],
+    hc_attn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
+    wq_a: pl.Tensor[[WEIGHT_BANK_SIZE, D, Q_LORA], pl.FP8E4M3FN],
+    q_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[WEIGHT_BANK_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wkv: pl.Tensor[[WEIGHT_BANK_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
+    kv_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[WEIGHT_BANK_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     token_rope_cos: pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
     token_rope_sin: pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
@@ -441,18 +448,18 @@ def decode_decoder(
     index_norm_weight: pl.Tensor[[INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_weights_proj: pl.Tensor[[INDEX_SOURCE_COUNT, D, INDEX_H], pl.BF16, pl.NZ],
-    hc_ffn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
-    ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    hc_ffn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
+    gate_weight: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -468,21 +475,22 @@ def decode_decoder(
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
-    wq_a_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
-    wq_b_scale: pl.Tensor[[N_LAYERS * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-    wkv_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
-    wo_b_scale: pl.Tensor[[N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
+    wq_a_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
+    wq_b_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
+    wo_b_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
     index_wq_b_scale: pl.Tensor[[INDEX_SOURCE_COUNT * (Q_LORA // MX_GROUP), INDEX_H * INDEX_DIM], pl.FP8E8M0],
-    routed_w1_scale: pl.Tensor[[N_LAYERS * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
-    routed_w2_scale: pl.Tensor[[N_LAYERS * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
-    routed_w3_scale: pl.Tensor[[N_LAYERS * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
-    shared_w1_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    shared_w2_scale: pl.Tensor[[N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    routed_w1_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    routed_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
+    routed_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    shared_w1_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    shared_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
 ):
     attention_count = pl.read(attention_num_tokens, [rank])
     x_hc.bind_dynamic(0, LOCAL_T_DYN)
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
+    dspark_target_hidden.bind_dynamic(0, LOCAL_T_DYN)
     window_cache_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
@@ -514,28 +522,29 @@ def decode_decoder(
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
     for layer in pl.range(20, 40):
         with pl.scope():
+            weight_layer = layer % WEIGHT_BANK_SIZE
             layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [layer * window_blocks_per_layer, 0, 0, 0])
             layer_window_cache_scale = pl.slice(window_cache_scale_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], [layer * window_blocks_per_layer, 0, 0, 0])
             layer_source_id = 3
             layer_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, HEAD_DIM // 2], [layer_source_id * compressed_blocks_per_source, 0, 0, 0])
             layer_compressed_cache_scale = pl.slice(compressed_cache_scale_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], [layer_source_id * compressed_blocks_per_source, 0, 0, 0])
-            layer_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [layer * MIX_HC, 0])
-            layer_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [layer * 3])
-            layer_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [layer * MIX_HC])
-            layer_norm_weight: pl.Tensor[[D], pl.BF16] = pl.slice(attn_norm_weight, [D], [layer * D])
-            layer_wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN] = wq_a[layer]
-            layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wq_a_scale, [D // MX_GROUP, Q_LORA], [layer * (D // MX_GROUP), 0])
-            layer_q_norm: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(q_norm_weight, [Q_LORA], [layer * Q_LORA])
-            layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN] = wq_b[layer]
-            layer_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wq_b_scale, [Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], [layer * (Q_LORA // MX_GROUP), 0])
-            layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN] = wkv[layer]
-            layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wkv_scale, [D // MX_GROUP, HEAD_DIM], [layer * (D // MX_GROUP), 0])
-            layer_kv_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(kv_norm_weight, [HEAD_DIM], [layer * HEAD_DIM])
-            layer_sink: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(attn_sink, [LOCAL_H], [layer * LOCAL_H])
-            layer_wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
-            layer_wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [layer * LOCAL_O_GROUPS, 0, 0])
-            layer_wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[layer]
-            layer_wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [layer * (LOCAL_O_WIDTH // MX_GROUP), 0])
+            layer_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [weight_layer * MIX_HC, 0])
+            layer_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [weight_layer * 3])
+            layer_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [weight_layer * MIX_HC])
+            layer_norm_weight: pl.Tensor[[D], pl.BF16] = pl.slice(attn_norm_weight, [D], [weight_layer * D])
+            layer_wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN] = wq_a[weight_layer]
+            layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wq_a_scale, [D // MX_GROUP, Q_LORA], [weight_layer * (D // MX_GROUP), 0])
+            layer_q_norm: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(q_norm_weight, [Q_LORA], [weight_layer * Q_LORA])
+            layer_wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN] = wq_b[weight_layer]
+            layer_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wq_b_scale, [Q_LORA // MX_GROUP, LOCAL_H * HEAD_DIM], [weight_layer * (Q_LORA // MX_GROUP), 0])
+            layer_wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN] = wkv[weight_layer]
+            layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wkv_scale, [D // MX_GROUP, HEAD_DIM], [weight_layer * (D // MX_GROUP), 0])
+            layer_kv_norm: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(kv_norm_weight, [HEAD_DIM], [weight_layer * HEAD_DIM])
+            layer_sink: pl.Tensor[[LOCAL_H], pl.FP32] = pl.slice(attn_sink, [LOCAL_H], [weight_layer * LOCAL_H])
+            layer_wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN] = pl.slice(wo_a, [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [weight_layer * LOCAL_O_GROUPS, 0, 0])
+            layer_wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0] = pl.slice(wo_a_scale, [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], [weight_layer * LOCAL_O_GROUPS, 0, 0])
+            layer_wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[weight_layer]
+            layer_wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [weight_layer * (LOCAL_O_WIDTH // MX_GROUP), 0])
             if layer == 20:
                 full_index_source_id = 3
                 full_index_cache = pl.slice(index_cache_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // 2], [full_index_source_id * index_blocks_per_source, 0, 0, 0])
@@ -624,25 +633,25 @@ def decode_decoder(
                     topk_indices,
                     attention_hidden, attention_pre_mix, attention_count,
                 )
-            ffn_routed_base = layer * N_LOCAL_EXPERTS
-            ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [layer * MIX_HC, 0])
-            ffn_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_ffn_scale, [3], [layer * 3])
-            ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_ffn_base, [MIX_HC], [layer * MIX_HC])
-            layer_ffn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(ffn_norm_weight, [D], [layer * D])
-            ffn_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
-            ffn_correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [layer * N_EXPERTS])
+            ffn_routed_base = weight_layer * N_LOCAL_EXPERTS
+            ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [weight_layer * MIX_HC, 0])
+            ffn_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_ffn_scale, [3], [weight_layer * 3])
+            ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_ffn_base, [MIX_HC], [weight_layer * MIX_HC])
+            layer_ffn_norm: pl.Tensor[[D], pl.BF16] = pl.slice(ffn_norm_weight, [D], [weight_layer * D])
+            ffn_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [weight_layer * N_EXPERTS, 0])
+            ffn_correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [weight_layer * N_EXPERTS])
             ffn_routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
-            ffn_routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
+            ffn_routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [weight_layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
             ffn_routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
-            ffn_routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [layer * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
+            ffn_routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w2_scale, [N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], [weight_layer * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), 0])
             ffn_routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w3, [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], [ffn_routed_base, 0, 0])
-            ffn_routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
-            ffn_shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w1[layer]
-            ffn_shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w1_scale, [D // MX_GROUP, MOE_INTER], [layer * (D // MX_GROUP), 0])
-            ffn_shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN] = shared_w2[layer]
-            ffn_shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w2_scale, [MOE_INTER // MX_GROUP, D], [layer * (MOE_INTER // MX_GROUP), 0])
-            ffn_shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w3[layer]
-            ffn_shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w3_scale, [D // MX_GROUP, MOE_INTER], [layer * (D // MX_GROUP), 0])
+            ffn_routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w3_scale, [N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [weight_layer * (N_LOCAL_EXPERTS * (D // MX_GROUP)), 0])
+            ffn_shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w1[weight_layer]
+            ffn_shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w1_scale, [D // MX_GROUP, MOE_INTER], [weight_layer * (D // MX_GROUP), 0])
+            ffn_shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN] = shared_w2[weight_layer]
+            ffn_shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w2_scale, [MOE_INTER // MX_GROUP, D], [weight_layer * (MOE_INTER // MX_GROUP), 0])
+            ffn_shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN] = shared_w3[weight_layer]
+            ffn_shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(shared_w3_scale, [D // MX_GROUP, MOE_INTER], [weight_layer * (D // MX_GROUP), 0])
             force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
             moe(
                 attention_hidden, attention_pre_mix,
@@ -661,8 +670,16 @@ def decode_decoder(
                 data_arrived,
                 routed_output, combine_arrived,
                 local_moe_tokens, rank, layer + 1,
-                force_topk,
+                force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
             )
+        if layer >= DSPARK_TARGET_LAYER_IDS[0]:
+            target_column = (layer - DSPARK_TARGET_LAYER_IDS[0]) * D
+            for token in pl.spmd(MOE_TOKENS, name_hint="decode_dspark_target_hidden"):
+                if token < local_moe_tokens:
+                    hc_row = x_hc[token : token + 1, 0:HC_MULT, 0:D]
+                    hc_mean = pl.mul(pl.col_sum(pl.reshape(hc_row, [HC_MULT, D])), 1.0 / HC_MULT)
+                    target_bf16 = pl.cast(hc_mean, pl.BF16, mode="rint")
+                    dspark_target_hidden[token : token + 1, target_column : target_column + D] = target_bf16
     clear_moe_signals(x_hc, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_hc
 
@@ -675,19 +692,20 @@ def l2_decode_fwd(
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
     x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    hc_attn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[N_LAYERS, D, Q_LORA], pl.FP8E4M3FN],
-    q_norm_weight: pl.Tensor[[N_LAYERS * Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wkv: pl.Tensor[[N_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
-    kv_norm_weight: pl.Tensor[[N_LAYERS * HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[N_LAYERS * LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    dspark_target_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, DSPARK_MAIN_IN], pl.BF16]],
+    hc_attn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
+    wq_a: pl.Tensor[[WEIGHT_BANK_SIZE, D, Q_LORA], pl.FP8E4M3FN],
+    q_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[WEIGHT_BANK_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wkv: pl.Tensor[[WEIGHT_BANK_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
+    kv_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[WEIGHT_BANK_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     freqs_cos: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
@@ -721,18 +739,18 @@ def l2_decode_fwd(
     index_norm_weight: pl.Tensor[[INDEX_SOURCE_COUNT * INDEX_DIM], pl.BF16],
     index_wq_b: pl.Tensor[[INDEX_SOURCE_COUNT, Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
     index_weights_proj: pl.Tensor[[INDEX_SOURCE_COUNT, D, INDEX_H], pl.BF16, pl.NZ],
-    hc_ffn_fn: pl.Tensor[[N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[N_LAYERS * 3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
-    ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3: pl.Tensor[[N_LAYERS * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    shared_w1: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w2: pl.Tensor[[N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w3: pl.Tensor[[N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
+    hc_ffn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[WEIGHT_BANK_SIZE * D], pl.BF16],
+    gate_weight: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[WEIGHT_BANK_SIZE * N_EXPERTS], pl.FP32],
+    routed_w1: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w2: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    routed_w3: pl.Tensor[[WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    shared_w1: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w2: pl.Tensor[[WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w3: pl.Tensor[[WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -748,17 +766,17 @@ def l2_decode_fwd(
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     rank: pl.Scalar[pl.INT32],
-    wq_a_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
-    wq_b_scale: pl.Tensor[[N_LAYERS * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-    wkv_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
-    wo_b_scale: pl.Tensor[[N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
+    wq_a_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
+    wq_b_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
+    wo_b_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
     index_wq_b_scale: pl.Tensor[[INDEX_SOURCE_COUNT * (Q_LORA // MX_GROUP), INDEX_H * INDEX_DIM], pl.FP8E8M0],
-    routed_w1_scale: pl.Tensor[[N_LAYERS * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
-    routed_w2_scale: pl.Tensor[[N_LAYERS * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
-    routed_w3_scale: pl.Tensor[[N_LAYERS * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
-    shared_w1_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    shared_w2_scale: pl.Tensor[[N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    shared_w3_scale: pl.Tensor[[N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    routed_w1_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    routed_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0],
+    routed_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
+    shared_w1_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    shared_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -807,7 +825,7 @@ def l2_decode_fwd(
         shared_w1_scale, shared_w2_scale, shared_w3_scale,
     )
     result = decode_decoder(
-        encoder_hidden, encoder_pre_mix,
+        encoder_hidden, encoder_pre_mix, dspark_target_hidden,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_weight,
         wq_a, q_norm_weight, wq_b,
@@ -856,23 +874,24 @@ def l3_decode_fwd(
     engram_weight: pl.Tensor[[EP_SIZE, 2, HC_MULT, D], pl.FP32],
     x_hc: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     pre_mix: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    hc_attn_fn: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[EP_SIZE, N_LAYERS * 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[EP_SIZE, N_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[EP_SIZE, N_LAYERS, D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
-    q_norm_weight: pl.Tensor[[EP_SIZE, N_LAYERS * Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[EP_SIZE, N_LAYERS, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-    wkv: pl.Tensor[[EP_SIZE, N_LAYERS, D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
-    kv_norm_weight: pl.Tensor[[EP_SIZE, N_LAYERS * HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[EP_SIZE, N_LAYERS * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[EP_SIZE, N_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
+    dspark_target_hidden: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, DSPARK_MAIN_IN], pl.BF16]],
+    hc_attn_fn: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * D], pl.BF16],
+    wq_a: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE, D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * (D // MX_GROUP), Q_LORA], pl.FP8E8M0],
+    q_norm_weight: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * (Q_LORA // MX_GROUP), LOCAL_H * HEAD_DIM], pl.FP8E8M0],
+    wkv: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE, D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * (D // MX_GROUP), HEAD_DIM], pl.FP8E8M0],
+    kv_norm_weight: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
+    wo_a_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
+    wo_b: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * (LOCAL_O_WIDTH // MX_GROUP), D], pl.FP8E8M0],
     freqs_cos: pl.Tensor[[EP_SIZE, 2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     freqs_sin: pl.Tensor[[EP_SIZE, 2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
@@ -919,36 +938,36 @@ def l3_decode_fwd(
         [EP_SIZE, INDEX_SOURCE_COUNT * (Q_LORA // MX_GROUP), INDEX_H * INDEX_DIM], pl.FP8E8M0
     ],
     index_weights_proj: pl.Tensor[[EP_SIZE, INDEX_SOURCE_COUNT, D, INDEX_H], pl.BF16],
-    hc_ffn_fn: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[EP_SIZE, N_LAYERS * 3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[EP_SIZE, N_LAYERS * MIX_HC], pl.FP32],
-    ffn_norm_weight: pl.Tensor[[EP_SIZE, N_LAYERS * D], pl.BF16],
-    gate_weight: pl.Tensor[[EP_SIZE, N_LAYERS * N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[EP_SIZE, N_LAYERS * N_EXPERTS], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
+    ffn_norm_weight: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * D], pl.BF16],
+    gate_weight: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[
-        [EP_SIZE, N_LAYERS * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
+        [EP_SIZE, WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
     ],
     routed_w1_scale: pl.Tensor[
-        [EP_SIZE, N_LAYERS * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0
+        [EP_SIZE, WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0
     ],
     routed_w2: pl.Tensor[
-        [EP_SIZE, N_LAYERS * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
+        [EP_SIZE, WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
     ],
     routed_w2_scale: pl.Tensor[
-        [EP_SIZE, N_LAYERS * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0
+        [EP_SIZE, WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP)), D], pl.FP8E8M0
     ],
     routed_w3: pl.Tensor[
-        [EP_SIZE, N_LAYERS * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
+        [EP_SIZE, WEIGHT_BANK_SIZE * N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8
     ],
     routed_w3_scale: pl.Tensor[
-        [EP_SIZE, N_LAYERS * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0
+        [EP_SIZE, WEIGHT_BANK_SIZE * (N_LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0
     ],
-    shared_w1: pl.Tensor[[EP_SIZE, N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w1_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
-    shared_w2: pl.Tensor[[EP_SIZE, N_LAYERS, MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w2_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
-    shared_w3: pl.Tensor[[EP_SIZE, N_LAYERS, D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w3_scale: pl.Tensor[[EP_SIZE, N_LAYERS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w1: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w1_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
+    shared_w2: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE, MOE_INTER, D], pl.FP8E4M3FN],
+    shared_w2_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
+    shared_w3: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE, D, MOE_INTER], pl.FP8E4M3FN],
+    shared_w3_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
@@ -999,7 +1018,8 @@ def l3_decode_fwd(
     RMSNorm feed the TP-sharded LM head and greedy sampler. logit_row_indices
     selects up to MAX_LOGIT_ROWS rank-local rows; -1 produces zero logits and
     sampled ID zero, which the caller ignores, including on idle ranks.
-    x_hc/pre_mix retain the final layer state; logits and sampled_ids are outputs.
+    x_hc/pre_mix retain the final layer state; logits, sampled_ids and the three
+    DSpark target-layer hidden states are outputs.
 
     Retain cache allocations and page ownership until runtime completion, then
     commit lengths before the next call. Completed forwards clear MoE signals;
@@ -1009,6 +1029,7 @@ def l3_decode_fwd(
     """
     x_hc.bind_dynamic(1, LOCAL_T_DYN)
     pre_mix.bind_dynamic(1, LOCAL_T_DYN)
+    dspark_target_hidden.bind_dynamic(1, LOCAL_T_DYN)
     window_cache_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     window_cache_scale_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(1, FWD_CMP_BLOCKS_DYN)
@@ -1068,7 +1089,7 @@ def l3_decode_fwd(
         head_logits_done = pld.window(head_logits_done_buffer, [1, 1], dtype=pl.INT32)
         l2_decode_fwd(
             engram_lookup[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
-            x_hc[rank], pre_mix[rank],
+            x_hc[rank], pre_mix[rank], dspark_target_hidden[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_weight[rank],
             wq_a[rank], q_norm_weight[rank], wq_b[rank],
@@ -1105,7 +1126,7 @@ def l3_decode_fwd(
             head_hidden, head_hidden_done, head_logits, head_logits_done,
             device=rank,
         )
-    return logits, sampled_ids
+    return logits, sampled_ids, dspark_target_hidden
 
 
 import inspect
@@ -1202,7 +1223,7 @@ def build_tensor_specs():
         elif name == "final_norm_weight":
             init_value = 1.0
         elif name == "correction_bias":
-            init_value = _route_bias().repeat(EP_SIZE, N_LAYERS)
+            init_value = _route_bias().repeat(EP_SIZE, WEIGHT_BANK_SIZE)
         elif name.endswith("_scale"):
             init_value = 1.0
         specs.append(TensorSpec(name, shape, dtype, init_value=init_value))
@@ -1218,8 +1239,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1])
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
+    parser.add_argument("--dp", type=int, default=C.DP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--experts-per-rank", type=int, default=N_LOCAL_EXPERTS, help="routed experts on each EP rank")
+    parser.add_argument("--weight-bank-size", type=int, default=WEIGHT_BANK_SIZE, choices=[1, N_LAYERS])
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--dump-passes", action="store_true")
@@ -1228,8 +1252,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.execution_mode:
         parser.error("this forward entry requires hardware; --sim is unsupported")
-    if (args.ep, args.experts_per_rank) != (EP_SIZE, N_LOCAL_EXPERTS):
-        parser.error("--ep/--experts-per-rank are import-time configuration; pass them on the Python command line")
+    if (args.tp, args.ep, args.dp, args.experts_per_rank) != (C.TP_SIZE, EP_SIZE, C.DP_SIZE, N_LOCAL_EXPERTS):
+        parser.error("--tp/--ep/--dp/--experts-per-rank must match the import-time configuration")
+    if args.weight_bank_size != WEIGHT_BANK_SIZE:
+        parser.error("--weight-bank-size must match the import-time configuration")
+    if args.tp != 1:
+        parser.error("the decode_fwd smoke fixture requires --tp 1")
     devices = [int(device) for device in args.device.split(",") if device]
     if len(devices) != EP_SIZE or len(set(devices)) != EP_SIZE:
         parser.error(f"need exactly {EP_SIZE} distinct devices, got {devices}")
