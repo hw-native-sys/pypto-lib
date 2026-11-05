@@ -35,6 +35,8 @@ Keep both scripts in this skill directory.
 - Do not mix a worker and injection library from unrelated CANN versions
   without explicitly reporting the fallback and validating the collection.
 - Never interpret a near-empty or wrong-pipe trace as a fast kernel.
+- For `pl.split_aiv` kernels, verify each vector core entered its intended
+  branch. Nonzero VECTOR cycles on both cores do not prove branch coverage.
 
 ## Resolve the input
 
@@ -112,8 +114,15 @@ Check:
 - total cycles are plausible;
 - CUBE cycles are nonzero for matmul kernels;
 - VECTOR cycles are nonzero for vector work;
-- mixed kernels contain both expected pipe classes; and
+- mixed kernels contain both expected pipe classes;
+- split-AIV branches show the expected distinct work on each vector core;
 - the instruction CSV is not only scalar/synchronization work.
+
+When the sibling PTO IR identifies `__pypto_spmd_subblock_idx`, the workflow
+wires the generated standalone case to the physical AIV lane ID and records
+`subblock_lane` in the manifest. Check that field and the per-core instruction
+CSV. If the direct camodel still sends both cores through one branch, report
+the trace as incomplete rather than drawing a performance conclusion.
 
 If control tensors or scalar tail arguments collapsed the workload:
 

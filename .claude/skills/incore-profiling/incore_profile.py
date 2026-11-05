@@ -40,6 +40,8 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 
+from gen_profiling_case import wire_subblock_lane
+
 
 def _find_repo_root(start: Path) -> Path:
     """Locate the repo root regardless of where this script is placed.
@@ -332,6 +334,18 @@ def read_first_kernel_names(source: Path) -> list[str]:
     return names
 
 
+def read_kernel_name(source: Path) -> str:
+    """Read the declared kernel name, including the base of a mixed kernel."""
+    names = read_first_kernel_names(source)
+    if not names:
+        return source.stem
+    first = names[0]
+    base = first.removesuffix("_aic").removesuffix("_aiv")
+    if f"{base}_aic" in names and f"{base}_aiv" in names:
+        return base
+    return first
+
+
 def detect_host_triplets(ascend_home: Path) -> list[str]:
     triplets = []
     for name in ("aarch64-linux", "x86_64-linux"):
@@ -492,7 +506,10 @@ def write_outputs(run_root: Path, results: list[dict[str, object]], fieldnames: 
         "exports:",
     ]
     for r in results:
-        lines.append(f"{r.get('func')}\t{r.get('status')}\t{r.get('export_dir')}\t{r.get('message')}")
+        lines.append(
+            f"{r.get('func')}\t{r.get('status')}\t{r.get('export_dir')}\t"
+            f"subblock_lane={r.get('subblock_lane')}\t{r.get('message')}"
+        )
     (run_root / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -535,6 +552,7 @@ def export_one(
         "visualize_data_bin": "",
         "core_trace_count": 0,
         "instr_csv_count": 0,
+        "subblock_lane": "",
         "duration_sec": "",
         "message": "",
     }
@@ -566,6 +584,11 @@ def export_one(
         if args.generate_testcase == GEN_PROFILING_CASE:
             gen_cmd += ["--dynamic-dim", str(args.dynamic_dim)]
         run_cmd(gen_cmd, env=env, log_path=logs_dir / "generate.log", timeout=args.step_timeout)
+        result["subblock_lane"] = wire_subblock_lane(
+            case_dir / f"{testcase}_kernel.cpp",
+            source_cpp.with_suffix(".pto"),
+            read_kernel_name(source_cpp),
+        )
 
         log(f"[{index:02d}/{total:02d}] build {func}")
         cmake_cmd = [
@@ -1252,6 +1275,7 @@ def main(argv: list[str] | None = None) -> int:
         "visualize_data_bin",
         "core_trace_count",
         "instr_csv_count",
+        "subblock_lane",
         "duration_sec",
         "message",
     ]

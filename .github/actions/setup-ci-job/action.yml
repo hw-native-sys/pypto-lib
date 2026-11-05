@@ -890,7 +890,15 @@ runs:
         if command -v ccec >/dev/null 2>&1 &&
            [ -f "${ASCEND_HOME_PATH:-}/tools/hcc/bin/aarch64-target-linux-gnu-g++" ]; then
           cann_id="$(basename "$(readlink -f "${CANN_ROOT:-}")" 2>/dev/null || echo unknown)"
-          cann_info="$(ls "${CANN_ROOT:-}"/*-linux/ascend_toolkit_install.info 2>/dev/null | head -1)"
+          # This metadata is optional; an unmatched glob must not abort the
+          # setup shell under -e and pipefail before either wheel is built.
+          cann_info=""
+          for candidate in "${CANN_ROOT:-}"/*-linux/ascend_toolkit_install.info; do
+            if [ -f "$candidate" ]; then
+              cann_info="$candidate"
+              break
+            fi
+          done
           if [ -n "$cann_info" ]; then
             cann_id="$cann_id-$(sha256sum "$cann_info" | cut -c1-12)"
           fi
