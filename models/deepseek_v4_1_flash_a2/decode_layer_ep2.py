@@ -31,7 +31,6 @@ from .decode_moe_ep2 import (
     MOE_INTER,
     N_EXPERTS,
     N_LOCAL_EXPERTS,
-    RECV_MAX,
     T,
     TOPK,
     decode_ep2_rank,
