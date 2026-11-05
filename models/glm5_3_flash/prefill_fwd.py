@@ -50,7 +50,7 @@ from models.glm5_3_flash.layer import (
     forward_parameter_names as forward_parameter_names,
     forward_query_tensor_names as forward_query_tensor_names,
     forward_tensor_layouts as forward_tensor_layouts, prefill_dense_layer, prefill_head_rows,
-    prefill_kda_attention, prefill_lm_head_logits, prefill_moe_layer, prefill_seed, prefill_sparse_attention,
+    prefill_kda_attention, prefill_lm_head_logits, moe_layer, prefill_seed, prefill_sparse_attention,
     reference_layer_forward, synthetic_layer,
 )
 from models.glm5_3_flash.attention import MlaTensors
@@ -88,7 +88,7 @@ _inline_prefill_kda_attention = pl.jit.inline(auto_scope=False)(prefill_kda_atte
 
 _inline_prefill_sparse_attention = pl.jit.inline(auto_scope=False)(prefill_sparse_attention._func)
 
-_inline_prefill_moe_layer = pl.jit.inline(auto_scope=False)(prefill_moe_layer._func)
+_inline_moe_layer = pl.jit.inline(auto_scope=False)(moe_layer._func)
 
 _inline_prefill_head_rows = pl.jit.inline(auto_scope=False)(prefill_head_rows._func)
 
@@ -332,7 +332,7 @@ def prefill_hidden_fwd(
                     kda_v, bb_ord, kda_ord, rank, attn_epoch,
                 )
             _complete_forward_stage(ws_x_hc_mid)
-            _inline_prefill_moe_layer(
+            _inline_moe_layer(
                 ws_x_hc_mid, active_tokens, execution_mode, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base,
                 norm_post_norm, router_gate_w, router_gate_bias, moe_w_gate_up, moe_w_gate_up_scale,
                 moe_w_down, moe_w_down_scale, moe_shared_w_gate_up, moe_shared_w_gate_up_scale, moe_shared_w_down,
@@ -340,7 +340,7 @@ def prefill_hidden_fwd(
                 x_ready, slot_out, return_ready, tp_partial, tp_arrived,
                 ws_ffn_pre, ws_ffn_post, ws_ffn_res, ws_ffn_input, ws_ffn_partial,
                 ws_ffn_out, following, bb_ord, moe_ord, rank,
-                moe_epoch, ffn_epoch,
+                moe_epoch, ffn_epoch, False,
             )
         _complete_forward_stage(following)
     final_offset = ((first_layer + layer_count) % 2) * CAPACITY

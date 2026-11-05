@@ -25,10 +25,10 @@ import torch
 
 from models.glm5_3_flash.config import EP_SIZE, HC_DIM, MIX_HC, N_EXPERTS, N_LOCAL_EXPERTS, TOPK, D
 from models.glm5_3_flash.decode_moe import (
-    AUX_PAD, COUNT_PAD, LANE_ROWS, MOE_INTER, N_RANKS, N_ROUTES, T, golden_routed_ep, moe_arrive,
-    moe_combine, moe_dispatch, moe_pack, moe_return, moe_return_notify,
+    AUX_PAD, COUNT_PAD, LANE_ROWS, LANE_ROWS_DYN, MOE_INTER, N_RANKS, N_ROUTES, ROUTE_ROWS_DYN, T,
+    decode_moe, golden_routed_ep,
 )
-from models.glm5_3_flash.expert_routed import build_checkpoint_moe_specs, expert_routed
+from models.glm5_3_flash.expert_routed import build_checkpoint_moe_specs
 from models.glm5_3_flash.expert_shared import (
     MOE_INTER as SHARED_INTER, expert_shared, golden_moe_tp_combine, moe_tp_combine,
 )
@@ -54,11 +54,11 @@ def decode_mlp(
     shared_w_down: pl.Tensor[[D, SHARED_INTER], pl.INT8, pl.NZ],
     shared_w_down_scale: pl.Tensor[[D], pl.FP32],
     y: pl.Tensor[[T, D], pl.FP32],
-    lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
-    lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
     lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
     return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     shared_exchange: pld.DistributedTensor[[T, D], pl.FP32],
     shared_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
@@ -66,7 +66,6 @@ def decode_mlp(
     num_ranks: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
-    input_tid: pl.Scalar[pl.TASK_ID],
 ):
     """Run EP routed experts and reduce shared TP shards over replicated tokens."""
     x_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
@@ -80,43 +79,13 @@ def decode_mlp(
         num_tokens,
     )
 
-    # Routed branch: dispatch this rank's routes, run its experts, return and sum.
-    pack_tid = moe_pack(
-        route_indices, route_weights, x_int8, x_scale, lane_x, lane_aux, lane_count, lane_ready, num_tokens,
-        num_ranks, my_rank,
-    )
-    # Empty owners must still finish the preceding TP stage before waiting for EP.
-    pack_tid = pl.system.task_dummy(deps=[pack_tid, input_tid])
-    arrive_total = pl.create_tensor([1], dtype=pl.INT32)
-    arrive_src = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
-    arrive_expert = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
-    arrive_route = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
-    arrive_weight = pl.create_tensor([LANE_ROWS, 1], dtype=pl.FP32)
-    arrive_scale = pl.create_tensor([LANE_ROWS, 1], dtype=pl.FP32)
-    arrive_x = pl.create_tensor([LANE_ROWS, D], dtype=pl.INT8)
-    moe_arrive(
-        lane_x, lane_aux, lane_count, lane_ready, arrive_x, arrive_scale, arrive_weight, arrive_route,
-        arrive_expert, arrive_src, arrive_total, num_ranks, my_rank, epoch, pack_tid,
-    )
-    expert_offsets = pl.create_tensor([N_LOCAL_EXPERTS + 1], dtype=pl.INT32)
-    recv_route = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
-    recv_src = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
-    recv_weight = pl.create_tensor([LANE_ROWS, 1], dtype=pl.FP32)
-    recv_scale = pl.create_tensor([LANE_ROWS, 1], dtype=pl.FP32)
-    recv_x = pl.create_tensor([LANE_ROWS, D], dtype=pl.INT8)
-    moe_dispatch(
-        arrive_expert, arrive_src, arrive_route, arrive_x, arrive_scale, arrive_weight, arrive_total, recv_x,
-        recv_scale, recv_weight, recv_src, recv_route, expert_offsets,
-    )
-    expert_out = pl.create_tensor([LANE_ROWS, D], dtype=pl.FP32)
-    expert_routed(
-        recv_x, recv_scale, w_gate_up, w_gate_up_scale,
-        w_down, w_down_scale, expert_offsets, recv_weight, expert_out,
-    )
-    return_tid = moe_return(expert_out, recv_src, recv_route, slot_out, arrive_total)
-    sync_tid = moe_return_notify(return_ready, num_ranks, my_rank, return_tid)
     routed = pl.create_tensor([T, D], dtype=pl.FP32)
-    moe_combine(slot_out, return_ready, routed, num_tokens, num_ranks, my_rank, epoch, sync_tid)
+    decode_moe(
+        route_indices, route_weights, x_int8, x_scale,
+        w_gate_up, w_gate_up_scale, w_down, w_down_scale, routed,
+        lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready,
+        num_tokens, num_ranks, my_rank, epoch,
+    )
 
     # Shared branch: each TP rank computes its intermediate-channel shard.
     shared_out = pl.create_tensor([T, D], dtype=pl.FP32)
@@ -157,13 +126,12 @@ def l2_decode_layer(
     epoch: pl.Scalar[pl.INT32],
 ):
     """Run EP routed experts and reduce shared TP shards over replicated tokens."""
-    input_tid = pl.system.task_dummy(deps=[])
     decode_mlp(
         x_mixed, norm_weight, gate_weight, correction_bias, w_gate_up, w_gate_up_scale,
         w_down, w_down_scale,
         shared_w_gate_up, shared_w_gate_up_scale, shared_w_down, shared_w_down_scale, y, lane_x, lane_aux,
         lane_count, lane_ready, slot_out, return_ready, shared_exchange, shared_ready,
-        num_tokens, num_ranks, my_rank, epoch, input_tid,
+        num_tokens, num_ranks, my_rank, epoch,
     )
     return y
 

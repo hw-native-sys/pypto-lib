@@ -27,6 +27,9 @@ from models.glm5_3_flash.expert_routed import expert_routed, golden_expert_route
 from models.glm5_3_flash.quantization import quantize_per_token_int8
 from models.glm5_3_flash.utils import gen_routed_weight
 
+LANE_ROWS_DYN = pl.dynamic("GLM53_DECODE_MOE_LANE_ROWS_DYN")
+ROUTE_ROWS_DYN = pl.dynamic("GLM53_DECODE_MOE_ROUTE_ROWS_DYN")
+
 N_RANKS = EP_SIZE
 MOE_INTER = FLASH.moe_intermediate_size
 T = 16  # decode capacity exercised by this entry (token rows per rank)
@@ -45,8 +48,8 @@ def moe_pack(
     route_weights: pl.Tensor[[T, TOPK], pl.FP32],
     x_int8: pl.Tensor[[T, D], pl.INT8],
     x_scale: pl.Tensor[[T, 1], pl.FP32],
-    lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
-    lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
     lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -121,8 +124,8 @@ def moe_pack(
 
 @pl.jit.inline
 def moe_arrive(
-    lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
-    lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
     lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     arrive_x: pl.Tensor[[LANE_ROWS, D], pl.INT8],
@@ -249,7 +252,7 @@ def moe_return(
     expert_out: pl.Tensor[[LANE_ROWS, D], pl.FP32],
     recv_src: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
     recv_route: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
-    slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
     route_count: pl.Tensor[[1], pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Put every expert row back to its owner's route slot."""
@@ -290,7 +293,7 @@ def moe_return_notify(
 
 @pl.jit.inline
 def moe_combine(
-    slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
     return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
@@ -331,8 +334,8 @@ def moe_combine(
     return y
 
 
-@pl.jit(auto_scope=False)
-def l2_decode_moe(
+@pl.jit.inline(auto_scope=False)
+def decode_moe(
     route_indices: pl.Tensor[[T, TOPK], pl.INT32],
     route_weights: pl.Tensor[[T, TOPK], pl.FP32],
     x_int8: pl.Tensor[[T, D], pl.INT8],
@@ -342,11 +345,11 @@ def l2_decode_moe(
     w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
     w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
-    lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
-    lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
     lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
     lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
     return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     num_ranks: pl.Scalar[pl.INT32],
@@ -388,6 +391,38 @@ def l2_decode_moe(
     return_tid = moe_return(expert_out, recv_src, recv_route, slot_out, arrive_total)
     sync_tid = moe_return_notify(return_ready, num_ranks, my_rank, return_tid)
     moe_combine(slot_out, return_ready, y, num_tokens, num_ranks, my_rank, epoch, sync_tid)
+    return y
+
+
+@pl.jit(auto_scope=False)
+def l2_decode_moe(
+    route_indices: pl.Tensor[[T, TOPK], pl.INT32],
+    route_weights: pl.Tensor[[T, TOPK], pl.FP32],
+    x_int8: pl.Tensor[[T, D], pl.INT8],
+    x_scale: pl.Tensor[[T, 1], pl.FP32],
+    w_gate_up: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+):
+    """Run the routed decode MoE as a standalone L2 entry."""
+    decode_moe(
+        route_indices, route_weights, x_int8, x_scale,
+        w_gate_up, w_gate_up_scale, w_down, w_down_scale, y,
+        lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready,
+        num_tokens, num_ranks, my_rank, epoch,
+    )
     return y
 
 

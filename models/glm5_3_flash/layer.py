@@ -38,6 +38,7 @@ from models.glm5_3_flash.config import (
     LOCAL_KDA_H, LOCAL_KDA_QKV_DIM, LOCAL_VOCAB, MIX_HC, MOE_INTER, N_EXPERTS, N_LOCAL_EXPERTS, Q_LORA, QK_DIM, TOPK,
     TOPK_INDEX_WIDTH, TP_SIZE, V_DIM, AttentionKind, D, Glm53FlashConfig, Glm53LayerConfig, MlpKind,
 )
+from models.glm5_3_flash.decode_moe import T as DECODE_T, decode_moe
 from models.glm5_3_flash.dense_mlp import (
     DenseTensors, dense_mlp, dense_mlp_forward, swiglu_limited, synthetic_dense,
 )
@@ -818,6 +819,7 @@ def moe_ffn_sublayer(
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     epoch: pl.Scalar[pl.INT32],
+    is_decode: pl.constexpr,
 ):
     """Owner-compact -> gate (deferred norm) -> EP dispatch -> routed + shared ->
     TOPK sum -> scatter back into the full-width FP32 partial.
@@ -829,19 +831,32 @@ def moe_ffn_sublayer(
     local_tokens = pl.cast(local_token_count(num_tokens, my_rank), pl.INT32)
     compact_local_tokens(ffn_input, local_ffn, num_tokens, my_rank)
     moe_gate(local_ffn, post_norm_w, gate_w, gate_bias, route_weights, route_indices, x_int8, x_scale, local_tokens)
-    dispatch_tid = prefill_moe_dispatch(
-        route_indices, route_weights, x_int8, x_scale, send_counts, recv_expert_counts, expert_counts,
-        expert_offsets, lane_x, lane_aux, lane_count, count_ready, x_ready, slab_x, slab_scale, slab_weight,
-        slab_route, slab_src, local_tokens, my_rank, epoch,
-    )
-    expert_routed(
-        slab_x, slab_scale, w_gate_up, w_gate_up_scale,
-        w_down, w_down_scale, expert_offsets, slab_weight, expert_y,
-    )
-    prefill_moe_return(
-        expert_y, slab_route, slab_src, expert_offsets, expert_counts, routed, slot_out, return_ready,
-        local_tokens, my_rank, epoch, dispatch_tid,
-    )
+    if is_decode:
+        decode_indices = pl.slice(route_indices, [DECODE_T, TOPK], [0, 0])
+        decode_weights = pl.slice(route_weights, [DECODE_T, TOPK], [0, 0])
+        decode_x = pl.slice(x_int8, [DECODE_T, D], [0, 0])
+        decode_scale = pl.slice(x_scale, [DECODE_T, 1], [0, 0])
+        decode_out = pl.slice(routed, [DECODE_T, D], [0, 0])
+        decode_moe(
+            decode_indices, decode_weights, decode_x, decode_scale,
+            w_gate_up, w_gate_up_scale, w_down, w_down_scale, decode_out,
+            lane_x, lane_aux, lane_count, count_ready, slot_out, return_ready,
+            local_tokens, pl.cast(N_RANKS, pl.INT32), my_rank, epoch,
+        )
+    else:
+        dispatch_tid = prefill_moe_dispatch(
+            route_indices, route_weights, x_int8, x_scale, send_counts, recv_expert_counts, expert_counts,
+            expert_offsets, lane_x, lane_aux, lane_count, count_ready, x_ready, slab_x, slab_scale, slab_weight,
+            slab_route, slab_src, local_tokens, my_rank, epoch,
+        )
+        expert_routed(
+            slab_x, slab_scale, w_gate_up, w_gate_up_scale,
+            w_down, w_down_scale, expert_offsets, slab_weight, expert_y,
+        )
+        prefill_moe_return(
+            expert_y, slab_route, slab_src, expert_offsets, expert_counts, routed, slot_out, return_ready,
+            local_tokens, my_rank, epoch, dispatch_tid,
+        )
     rows = pl.tensor.dim(ffn_input, 0)
     shared_normed = pl.create_tensor([rows, D], dtype=pl.BF16)
     shared_int8 = pl.create_tensor([rows, D], dtype=pl.INT8)
@@ -1020,7 +1035,7 @@ def prefill_kda_attention(
 
 
 @pl.jit(auto_scope=False)
-def prefill_moe_layer(
+def moe_layer(
     # -- sublayer input: the stream the attention half left in the mid workspace -----
     x_hc_mid: pl.Tensor[[CAPACITY, HC_MULT, D], pl.BF16],
     active_tokens: pl.Tensor[[1], pl.INT32],
@@ -1067,6 +1082,7 @@ def prefill_moe_layer(
     my_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
     ffn_epoch: pl.Scalar[pl.INT32],
+    is_decode: pl.constexpr,
 ):
     """Run the resident MoE feed-forward sublayer with runtime layer ordinals."""
     num_tokens: pl.Scalar[pl.INT32] = pl.read(active_tokens, [0])
@@ -1120,7 +1136,7 @@ def prefill_moe_layer(
             x_ready, slot_out, return_ready, local_ffn, moe_route_weights, moe_route_indices, moe_x_int8,
             moe_x_scale, send_counts, recv_expert_counts, expert_counts, expert_offsets, slab_x, slab_scale,
             slab_weight, slab_route, slab_src, expert_y, routed, shared_out, y_local, out_ffn_partial,
-            num_tokens, my_rank, moe_epoch,
+            num_tokens, my_rank, moe_epoch, is_decode,
         )
         tp_all_reduce(out_ffn_partial, tp_partial, tp_arrived, out_ffn_out, num_tokens, my_rank, 0, ffn_epoch)
         zero_bf16_padding_rows(out_ffn_out, num_tokens)
