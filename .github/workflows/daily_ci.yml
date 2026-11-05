@@ -1,161 +1,58 @@
-name: Daily CI
+name: PR bounded A2 validation
 
 on:
-  schedule:
-    - cron: '51 18 * * *'  # UTC 18:51 = Shanghai 02:51
   workflow_dispatch:
     inputs:
-      performance_only:
-        description: Run only the operator performance suites (a2a3 and a5)
-        type: boolean
-        default: false
+      case_id:
+        description: Reviewed PR to measure against the baseline
+        type: choice
+        options: ['1361', '1372', '1200']
+        required: true
+      baseline_sha:
+        description: Exact shared baseline commit
+        type: string
+        required: true
+      resume_root:
+        description: Retained evidence root from a passing SWA baseline
+        type: string
+        default: ''
 
-# Every job only reads the repo (checkouts use persist-credentials: false, the
-# artifact up/download steps use the run-scoped runtime token, the summaries
-# write $GITHUB_STEP_SUMMARY), so the token needs nothing beyond contents:read.
 permissions:
   contents: read
 
+concurrency:
+  group: pr-triage-a2a3-${{ inputs.case_id }}
+  cancel-in-progress: false
+
 jobs:
-  model-tests-sim:
-    if: ${{ !inputs.performance_only }}
-    # Simulator job: no device needed, so it runs on the CPU runner — but on the
-    # host, through the same setup-ci-job composite as the a2a3 device job (same
-    # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
-    # the only difference: no Ascend env, which the simulator does not use.
-    runs-on: [self-hosted, linux, cpu]
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        # Route the model families to their matching simulator: a2a3sim sweeps
-        # every A2/A3 model, while a5sim sweeps the V4.1-Flash tree — the same
-        # operators the a5 device job runs, on the cases a simulator can take.
-        platform: [a2a3sim, a5sim]
-    defaults:
-      run:
-        working-directory: checkout
+  paired-benchmark:
+    runs-on: [self-hosted, linux, npu, a3]
+    timeout-minutes: 100
     env:
-      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTOAS_ROOT: ${{ github.workspace }}/pr-eval-${{ inputs.case_id }}/ptoas-bin
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the a2a3 job; 000 keeps cache files mutually writable. Both
-      # jobs now run as ci-runner (no container root), but the dir still holds
-      # root-owned entries from the container era, so keep the umask.
-      # The cache *paths* are exported by setup-ci-job from the runner config's
-      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
       CCACHE_UMASK: '000'
-
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: http.version
+      GIT_CONFIG_VALUE_0: HTTP/1.1
+      CASE_ID: ${{ inputs.case_id }}
+      BASELINE_SHA: ${{ inputs.baseline_sha }}
+      RESUME_ROOT: ${{ inputs.resume_root }}
     steps:
-      - name: Fetch composite action definitions
-        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./checkout — sparse-fetch just
-        # the action defs at the workspace root first (clean: false leaves sibling
-        # subdir checkouts on this persistent runner untouched).
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: checkout
-          needs-device: 'false'
-          build-namespace: ${{ matrix.platform }}
-          pip-cache-name: pip-sim
-          toolchain: bundle
-          # a5sim is the MXFP8 leg: the V4.1-Flash tree holds every MX scale in
-          # a torch.float8_e8m0fnu tensor, which 2.6 does not have. 20 of the 24
-          # a5sim failures in the 2026-09-19 nightly were that one
-          # AttributeError, raised before anything compiled. a2a3sim keeps the
-          # default, which is the version the serving torch_npu pin requires.
-          torch-version: ${{ matrix.platform == 'a5sim' && 'torch==2.10.0' || 'torch==2.6.0' }}
-
-      - name: Select all simulator models
-        id: selection
-        env:
-          PLATFORM: ${{ matrix.platform }}
-        run: |
-          source activate.sh
-          files=$(python .github/scripts/detect_changes.py --all --root models --platform "$PLATFORM")
-          echo "files=$files" >> "$GITHUB_OUTPUT"
-
-      - name: Run simulator tests
-        uses: ./.github/actions/run-sim-tests
-        with:
-          platform: ${{ matrix.platform }}
-          files: ${{ steps.selection.outputs.files }}
-
-  model-tests-device:
-    name: Model tests (${{ matrix.platform }})
-    if: ${{ !inputs.performance_only }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: a2a3
-            runner: [self-hosted, linux, npu, a3]
-          - platform: a5
-            runner: [self-hosted, linux, npu-a5]
-    runs-on: ${{ matrix.runner }}
-    # The cases run one after another, each bounded by task-submit's own
-    # --timeout 3600 queue wait + --max-time 900 run, on top of the build.
-    # Each entry declares its device count with a CI marker.
-    timeout-minutes: 120
-    defaults:
-      run:
-        working-directory: checkout
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_MAXSIZE: 30G
-      # The cache *paths* are exported by setup-ci-job from the runner config's
-      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
-      CCACHE_UMASK: '000'
-
-    steps:
-      - name: Point git at the runner's live proxy
-        if: ${{ matrix.platform == 'a5' }}
-        # The A5 host's git carries a file-scope http(s).proxy that has gone
-        # stale (a dead local forwarder — every nightly since 2026-08-07 died
-        # in the checkout below with "Failed to connect to 127.0.0.1 port
-        # 7890"), and file-scope git config beats the proxy environment. So
-        # git dials the dead port while the runner service and curl use the
-        # live proxy from the runner's own environment ("Runner is running
-        # behind proxy server ..." in Set up job). Re-point git at that same
-        # live proxy for this job only: GIT_CONFIG_* is command-scope config,
-        # which outranks every config file and touches no host state — when
-        # the host's git config is repaired this becomes a harmless no-op, as
-        # it already is on runners with no proxy in their environment.
-        # Runs before the checkout, so it must not assume ./checkout exists.
-        working-directory: ${{ github.workspace }}
+      - name: Check retained baseline before environment setup
+        if: ${{ inputs.resume_root != '' }}
         shell: bash
         run: |
-          live="${https_proxy:-${HTTPS_PROXY:-}}"
-          if [ -n "$live" ]; then
-            {
-              echo "GIT_CONFIG_COUNT=2"
-              echo "GIT_CONFIG_KEY_0=http.proxy"
-              echo "GIT_CONFIG_VALUE_0=$live"
-              echo "GIT_CONFIG_KEY_1=https.proxy"
-              echo "GIT_CONFIG_VALUE_1=$live"
-            } >> "$GITHUB_ENV"
-            echo "git proxy pinned to the runner's live proxy for this job"
-          else
-            echo "no proxy in the runner environment — leaving git alone"
+          if [[ ! -f "$RESUME_ROOT/private/measurement/result.json" || ! -d "$RESUME_ROOT/private/baseline" ]]; then
+            echo "::error::The previous runner did not retain the baseline evidence directory."
+            exit 2
           fi
+          echo "Retained baseline evidence is available."
 
       - name: Fetch composite action definitions
-        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./checkout — sparse-fetch just
-        # the action defs at the workspace root first (clean: false leaves
-        # sibling subdir checkouts on this persistent runner untouched).
         uses: actions/checkout@v4
         with:
           sparse-checkout: .github/actions
@@ -165,242 +62,88 @@ jobs:
       - name: Setup CI job
         uses: ./.github/actions/setup-ci-job
         with:
-          checkout-path: checkout
+          checkout-path: pr-eval-${{ inputs.case_id }}
           needs-device: 'true'
-          build-namespace: ${{ matrix.platform }}-daily
-          pip-cache-name: pip-${{ matrix.platform }}
+          build-namespace: pr-triage-a2a3-${{ inputs.case_id }}
+          pip-cache-name: pip-pr-triage-${{ inputs.case_id }}
           toolchain: bundle
-          # A5 MXFP8 entries require float8_e8m0fnu from newer Torch.
           torch-version: 'torch==2.10.0'
+          pypto-ref: '38a8aa6da24c62bf0c6f6f9ef94deb513fbb4d2e'
 
-      - name: Run model tests (${{ matrix.platform }}, via task-submit)
-        id: sweep
+      - name: Run paired benchmark through task-submit
+        id: benchmark
         shell: bash
-        env:
-          PYPTO_LOG_LEVEL: error
-          PYPTO_WARNING_LEVEL: none
-          # Quiet simpler's runtime logger — see the sim job for the full note.
-          PYPTO_RUNTIME_LOG: error
-          MODEL_PLATFORM: ${{ matrix.platform }}
-          PYPTO_BENCH: '0'  # Correctness only; the dedicated performance job owns timing.
+        working-directory: pr-eval-${{ inputs.case_id }}
         run: |
+          set -Eeuo pipefail
           source activate.sh
-          FILES=$(python .github/scripts/detect_changes.py --all --root models --platform "$MODEL_PLATFORM")
-          : > results.tsv
-          failed=()
-          for f in $FILES; do
-            echo "::group::$f"
-            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
-            ndev=${ndev:-1}
-            device_flags=()
-            if [ "$ndev" -gt 1 ]; then
-              device_flags+=(--device-num "$ndev" --ignore-whitelist)
-            fi
-            if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYPTO_BENCH=0 PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $MODEL_PLATFORM -d \$TASK_DEVICE"; then
-              status=pass
-            else
-              status=fail
-              failed+=("$f")
-              echo "::error file=${f}::FAIL"
-            fi
-            echo "[model][$MODEL_PLATFORM] $f: $status"
-            printf '%s\t%s\n' "$f" "$status" >> results.tsv
-            echo "::endgroup::"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            printf 'FAILED: %s\n' "${failed[@]}"
-            exit 1
+          [[ "$BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 2
+          case "$CASE_ID" in 1361|1372|1200) ;; *) exit 2 ;; esac
+          export PERF_ROOT="$CI_CACHE_ROOT/pr-triage-measurements/pr-triage-$CASE_ID-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf 'PERF_ROOT=%s\n' "$PERF_ROOT" >> "$GITHUB_ENV"
+          mkdir -p "$PERF_ROOT/published" "$PERF_ROOT/private"
+          trap 'for result in "$PERF_ROOT/private/measurement/"*.json; do if [[ -f "$result" ]]; then cp -- "$result" "$PERF_ROOT/published/"; fi; done' EXIT
+          git fetch --no-tags --depth=1 origin "$BASELINE_SHA"
+          git worktree add --detach "$PERF_ROOT/private/baseline" "$BASELINE_SHA"
+          git worktree add --detach "$PERF_ROOT/private/candidate" "$BASELINE_SHA"
+          git -C "$PERF_ROOT/private/candidate" apply --unidiff-zero "$PWD/.github/scripts/pr_triage/pr$CASE_ID.ported.patch"
+          git -C "$PERF_ROOT/private/candidate" diff --check
+          git -C "$PERF_ROOT/private/candidate" diff > "$PERF_ROOT/published/evaluated.patch"
+          sha256sum ".github/scripts/pr_triage/pr$CASE_ID.ported.patch" > "$PERF_ROOT/published/patch.sha256"
+          baseline_root="$PERF_ROOT/private/baseline"
+          if [[ -n "$RESUME_ROOT" ]]; then
+            [[ "$CASE_ID" == 1372 && -d "$RESUME_ROOT/private/baseline" && -f "$RESUME_ROOT/private/measurement/result.json" && -f "$RESUME_ROOT/published/run.log" ]] || exit 2
+            baseline_root="$RESUME_ROOT/private/baseline"
           fi
+          args=(python -u -B "$PWD/.github/scripts/pr_triage/benchmark_dspark_pair.py"
+            --baseline-root "$baseline_root"
+            --candidate-root "$PERF_ROOT/private/candidate"
+            --output-dir "$PERF_ROOT/private/measurement" --baseline-control)
+          count=1
+          if [[ "$CASE_ID" == 1372 ]]; then
+            args+=(--case swa --tp 1)
+          elif [[ "$CASE_ID" == 1200 ]]; then
+            count=4
+            args+=(--case hca --tp 4)
+          else
+            args=(python -u -B "$PWD/.github/scripts/pr_triage/compare_lm_head.py"
+              --baseline-repo "$PERF_ROOT/private/baseline"
+              --candidate-repo "$PERF_ROOT/private/candidate"
+              --output-dir "$PERF_ROOT/private/measurement"
+              --head-tp 1 --entry sample --active 128 --rounds 100 --warmup 5)
+          fi
+          printf -v payload 'cd %q && source %q && ' "$PWD" "$PWD/activate.sh"
+          printf -v command '%q ' env PYPTO_LOG_LEVEL=error PYPTO_WARNING_LEVEL=none PYPTO_RUNTIME_LOG=error TORCH_DEVICE_BACKEND_AUTOLOAD=0 "${args[@]}"
+          payload+="$command"
+          if [[ "$CASE_ID" == 1361 ]]; then
+            payload+=' --devices "$TASK_DEVICE"'
+          fi
+          device_flags=(--device auto --device-num "$count")
+          if (( count > 1 )); then device_flags+=(--ignore-whitelist); fi
+          if [[ -n "$RESUME_ROOT" ]]; then
+            args+=(--resume-root "$RESUME_ROOT" --expected-sdk "$PWD/.github/scripts/pr_triage/swa_expected_sdk.json")
+            printf -v command '%q ' env PYPTO_LOG_LEVEL=error PYPTO_WARNING_LEVEL=none PYPTO_RUNTIME_LOG=error TORCH_DEVICE_BACKEND_AUTOLOAD=0 "${args[@]}"
+            printf -v payload 'cd %q && source %q && ' "$PWD" "$PWD/activate.sh"
+            payload+="$command"
+            devices=$(python -c 'import json, os; from pathlib import Path; p=Path(os.environ["RESUME_ROOT"])/"private/measurement/result.json"; print(",".join(str(int(x)) for x in json.loads(p.read_text())["devices"]))')
+            device_flags=(--device "$devices" --ignore-whitelist)
+          fi
+          set +e
+          task-submit "${device_flags[@]}" --timeout 1800 --max-time 1800 --run "$payload" 2>&1 | tee "$PERF_ROOT/published/run.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
 
-      - name: Kill orphaned task-submit tasks
+      - name: Kill orphaned tasks from this checkout
         if: always()
         uses: ./.github/actions/kill-orphaned-tasks
         with:
-          checkout-path: checkout
+          checkout-path: pr-eval-${{ inputs.case_id }}
 
-      - name: Clean up build artifacts
-        if: always()
-        working-directory: checkout
-        run: rm -rf build_output
-
-      - name: Upload results artifact
-        # Gated on the sweep having started — see the sim job's upload step
-        # for the full note. This job is where the bare always() actually
-        # bit: every nightly from 2026-08-07 to 2026-08-11 died in checkout
-        # (dead git proxy, fixed by this job's first step) yet re-uploaded a
-        # byte-identical results-a5 leftover from the 08-05 sweep, so the
-        # summary kept presenting six-day-old numbers as current.
-        if: ${{ always() && steps.sweep.outcome != 'skipped' }}
+      - name: Upload paired measurement evidence
+        if: ${{ always() && steps.benchmark.outcome != 'skipped' }}
         uses: ./.github/actions/upload-results
         with:
-          name: results-${{ matrix.platform }}
-          path: checkout/results.tsv
-
-  operator-performance:
-    needs: model-tests-device
-    # Run after both sweeps, including failures or performance-only skips.
-    if: ${{ !cancelled() }}
-    name: Operator performance (${{ matrix.platform }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: a2a3
-            runner: [self-hosted, linux, npu, a3]
-          - platform: a5
-            runner: [self-hosted, linux, npu-a5]
-    runs-on: ${{ matrix.runner }}
-    # Each platform runs its own serial task-submit cases.
-    timeout-minutes: 300
-    concurrency:
-      group: operator-performance-${{ matrix.platform }}
-      cancel-in-progress: false
-    defaults:
-      run:
-        working-directory: operator-checkout
-    env:
-      PTOAS_ROOT: ${{ github.workspace }}/operator-checkout/ptoas-bin
-      CMAKE_BUILD_PARALLEL_LEVEL: 16
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_MAXSIZE: 30G
-      CCACHE_UMASK: '000'
-    steps:
-      - name: Fetch composite action definitions
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github/actions
-          clean: false
-          persist-credentials: false
-
-      - name: Setup CI job
-        uses: ./.github/actions/setup-ci-job
-        with:
-          checkout-path: operator-checkout
-          needs-device: 'true'
-          build-namespace: operator-performance-${{ matrix.platform }}
-          pip-cache-name: pip-operator-performance-${{ matrix.platform }}
-          toolchain: bundle
-          torch-version: 'torch==2.10.0'
-
-      - name: Run operator performance cases
-        id: perf
-        env:
-          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          source activate.sh
-          python .github/scripts/ci_perf.py ci --platform "${{ matrix.platform }}" --output-dir "$PERF_DIR"
-
-      - name: Kill orphaned task-submit tasks
-        if: always()
-        uses: ./.github/actions/kill-orphaned-tasks
-        with:
-          checkout-path: operator-checkout
-
-      - name: Publish performance summary
-        if: ${{ always() && steps.perf.outcome != 'skipped' }}
-        env:
-          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          report="$PERF_DIR/published/report.md"
-          if [ -f "$report" ]; then
-            cat "$report" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Operator performance produced no report." >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Upload operator performance results
-        id: upload
-        if: ${{ always() && steps.perf.outcome != 'skipped' }}
-        uses: ./.github/actions/upload-results
-        with:
-          name: operator-perf-${{ matrix.platform }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/operator-perf-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}/published
+          name: pr-triage-${{ inputs.case_id }}-${{ github.run_attempt }}
+          path: ${{ env.PERF_ROOT }}/published
           if-no-files-found: error
-
-      - name: Remove private operator builds after uploading evidence
-        if: ${{ always() && steps.upload.outcome == 'success' }}
-        env:
-          PERF_DIR: ${{ runner.temp }}/operator-perf-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
-        run: rm -rf -- "$PERF_DIR/work"
-
-  summary:
-    name: Aggregate results summary
-    # Wait for all model and performance jobs to finish before summarizing.
-    # `always()` keeps the summary running when any sweep fails.
-    needs: [model-tests-sim, model-tests-device, operator-performance]
-    if: ${{ always() && !inputs.performance_only }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all results
-        uses: actions/download-artifact@v4
-        with:
-          path: results
-
-      - name: Build combined summary table
-        run: |
-          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
-          import pathlib
-
-          # One table per model family: a2a3 with a2a3sim, and the two A5 legs
-          # together, using the shared directory platform configuration.
-          ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
-          ROOT = pathlib.Path("results")
-
-          def load(platform):
-              """Case statuses, or None if the job wrote no artifact."""
-              tsv = ROOT / f"results-{platform}" / "results.tsv"
-              if not tsv.exists():
-                  return None
-              status = {}
-              for line in tsv.read_text().splitlines():
-                  if not line.strip():
-                      continue
-                  parts = line.split("\t")
-                  status[parts[0]] = parts[1]
-              return status
-
-          def no_artifact(platforms):
-              names = ", ".join(f"`{p}`" for p in platforms)
-              return (
-                  f":warning: No results artifact from {names} — the sweep died "
-                  "before writing one, most likely in setup: a sweep that merely "
-                  "fails cases still uploads its table."
-              )
-
-          def table(title, platforms):
-              """Show correctness for each platform, including missing artifacts."""
-              data = {p: load(p) for p in platforms}
-              present = [p for p in platforms if data[p] is not None]
-              missing = [p for p in platforms if data[p] is None]
-              print(f"### {title}")
-              print()
-              if not present:
-                  print(no_artifact(missing))
-                  print()
-                  return
-              header = ["Case"]
-              for p in platforms:
-                  header.append(p)
-              print("| " + " | ".join(header) + " |")
-              print("| " + " | ".join("---" for _ in header) + " |")
-              for case in sorted({c for p in present for c in data[p]}):
-                  row = [f"`{case}`"]
-                  for p in platforms:
-                      row.append(ICON.get((data[p] or {}).get(case, "missing"), "?"))
-                  print("| " + " | ".join(row) + " |")
-              print()
-              print("Passed: " + ", ".join(
-                  f"**{p}** {sum(1 for v in data[p].values() if v == 'pass')}"
-                  f"/{len(data[p])}" for p in present))
-              if missing:
-                  print()
-                  print(no_artifact(missing) + " Those columns read all `-`.")
-              print()
-
-          print("## Daily CI Model Test Results")
-          print()
-          table("a2a3 and a2a3sim", ["a2a3", "a2a3sim"])
-          table("a5 and a5sim", ["a5", "a5sim"])
-          EOF

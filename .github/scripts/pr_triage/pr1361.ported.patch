@@ -1,0 +1,83 @@
+diff --git a/models/deepseek_v4_flash_dspark/lm_head.py b/models/deepseek_v4_flash_dspark/lm_head.py
+index 70f853b2..4b7c5a0a 100644
+--- a/models/deepseek_v4_flash_dspark/lm_head.py
++++ b/models/deepseek_v4_flash_dspark/lm_head.py
+@@ -10 +10 @@
+-"""DeepSeek-V4 Flash DSpark LM head: fused matmul+push projection with DP-owned hidden and TP vocab shards."""
++"""DeepSeek-V4 Flash DSpark LM head projection and masked greedy sampling."""
+@@ -68,0 +69 @@ FUSED_VOCAB_TILE = 128
++TP1_VOCAB_TILE = 256
+@@ -111 +112,68 @@ assert VOCAB < GREEDY_INDEX_SENTINEL, "sentinel must lose every row_min against
+-def lm_head(
++def _lm_head_tp1(
++    hidden_states: pl.Tensor,
++    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
++    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
++    logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
++    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
++    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
++    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
++    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
++    group_base: pl.Scalar[pl.INT32],
++    tp_rank: pl.Scalar[pl.INT32],
++    done_epoch: pl.Scalar[pl.INT32],
++    hidden_ready_tid: pl.Scalar[pl.TASK_ID],
++) -> tuple[
++    pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
++    pl.Scalar[pl.TASK_ID],
++]:
++    """Project local hidden rows directly into full-vocabulary logits."""
++    selected_hidden = pl.create_tensor([MAX_LOGIT_ROWS, D], dtype=pl.BF16)
++    with pl.spmd(MAX_LOGIT_ROWS // PUSH_ROW_TILE, name_hint="lm_head_select_hidden", deps=[hidden_ready_tid]) as select_tid:
++        block = pl.tile.get_block_idx()
++        row_begin = block * PUSH_ROW_TILE
++        hidden_rows = pl.tensor.dim(hidden_states, 0)
++        for row_offset in pl.range(PUSH_ROW_TILE):
++            row = row_begin + row_offset
++            source_row_raw = pl.read(logit_row_indices, [row])
++            safe_row_raw = pl.max(pl.min(source_row_raw, hidden_rows - 1), 0)
++            selected_hidden[row : row + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
++            if source_row_raw >= 0:
++                source_row = pl.cast(safe_row_raw, target_type=pl.INDEX)
++                selected_hidden[row : row + 1, :] = hidden_states[source_row : source_row + 1, :]
++
++    with pl.spmd(
++        FUSED_LM_HEAD_CORES, name_hint="lm_head_matmul_push", deps=[select_tid],
++        optimizations=[pl.cross_core_slot(slot_num=1)],
++    ) as matmul_tid:
++        pl.set_cache_policy(lm_head_weight, pl.CachePolicy.BYPASS)
++        core = pl.tile.get_block_idx()
++        for vocab_block in pl.range(core, VOCAB // TP1_VOCAB_TILE, FUSED_LM_HEAD_CORES):
++            vocab_begin = vocab_block * TP1_VOCAB_TILE
++            for row_begin in pl.range(0, MAX_LOGIT_ROWS, MM_ROW_TILE):
++                acc = pl.create_tensor([MM_ROW_TILE, TP1_VOCAB_TILE], dtype=pl.FP32)
++                for k_begin in pl.pipeline(0, D, FUSED_K_TILE, stage=2):
++                    hidden_tile = selected_hidden[row_begin : row_begin + MM_ROW_TILE, k_begin : k_begin + FUSED_K_TILE]
++                    weight_tile = lm_head_weight[vocab_begin : vocab_begin + TP1_VOCAB_TILE, k_begin : k_begin + FUSED_K_TILE]
++                    acc = pl.matmul_acc(acc, hidden_tile, weight_tile, b_trans=True, init_cond=(k_begin == 0))
++                for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
++                    lane_begin = row_begin + aiv_id * LANE_ROWS
++                    logits[lane_begin : lane_begin + LANE_ROWS, vocab_begin : vocab_begin + TP1_VOCAB_TILE] = pl.aiv_shard(acc)
++
++        if VOCAB % TP1_VOCAB_TILE != 0:
++            if core == (VOCAB // TP1_VOCAB_TILE) % FUSED_LM_HEAD_CORES:
++                tail_begin = VOCAB // TP1_VOCAB_TILE * TP1_VOCAB_TILE
++                for tail_row in pl.range(0, MAX_LOGIT_ROWS, MM_ROW_TILE):
++                    tail_acc = pl.create_tensor([MM_ROW_TILE, VOCAB % TP1_VOCAB_TILE], dtype=pl.FP32)
++                    for tail_k in pl.pipeline(0, D, FUSED_K_TILE, stage=2):
++                        tail_x = selected_hidden[tail_row : tail_row + MM_ROW_TILE, tail_k : tail_k + FUSED_K_TILE]
++                        tail_w = lm_head_weight[tail_begin:VOCAB, tail_k : tail_k + FUSED_K_TILE]
++                        tail_acc = pl.matmul_acc(tail_acc, tail_x, tail_w, b_trans=True, init_cond=(tail_k == 0))
++                    for tail_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
++                        tail_lane = tail_row + tail_aiv * LANE_ROWS
++                        logits[tail_lane : tail_lane + LANE_ROWS, tail_begin:VOCAB] = pl.aiv_shard(tail_acc)
++
++    return logits, matmul_tid
++
++
++@pl.jit.inline(auto_scope=False)
++def _lm_head_distributed(
+@@ -346,0 +415,3 @@ def lm_head(
++lm_head = _lm_head_tp1 if TP_SIZE == 1 else _lm_head_distributed
++
++
