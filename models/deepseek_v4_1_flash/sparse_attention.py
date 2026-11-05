@@ -1184,14 +1184,16 @@ def _gather_sparse_vf_rows(
     compressed_scale: pl.Tensor,
     window_indices: pl.Tensor,
     compressed_indices: pl.Tensor,
+    partials: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     heads: pl.Scalar[pl.INT32],
     window_keys: pl.Scalar[pl.INT32],
     compressed_keys: pl.Scalar[pl.INT32],
+    balanced: pl.Scalar[pl.INT32],
     cache_mode: pl.constexpr,
-) -> pl.Tensor:
+) -> tuple[pl.Tensor, pl.Tensor]:
     """Stream packed cache rows through L1 into sink-aware sparse attention."""
-    ...
+    return output, partials
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1211,7 +1213,7 @@ def gather_sparse_attention(
 ):
     """Attend H=64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
     query = query[:num_tokens, :]
-    output = output[:num_tokens, :]
+    active_output = output[:num_tokens, :]
     window_indices = window_indices[:num_tokens, :]
     compressed_indices = compressed_indices[:num_tokens, :]
     if compressed_keys == 0:
@@ -1220,11 +1222,25 @@ def gather_sparse_attention(
         workers = pl.max(1, pl.min(WORKERS, (num_tokens + query_waves - 1) // query_waves))
     else:
         workers = pl.max(1, pl.min(num_tokens, WORKERS))
-    with pl.spmd(workers, name_hint="sparse_gather_vf", deps=[source_ready]) as attended:
-        output = _gather_sparse_vf_rows(
-            output, query, sink, window, window_scale, compressed, compressed_scale,
-            window_indices, compressed_indices, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
-            cache_mode=compressed_keys,
+    workers = pl.min(workers, pl.system.available_cluster_count())
+    parts = (WINDOW_KEYS + compressed_keys) // 128
+    whole_tiles = ((num_tokens + workers - 1) // workers) * parts
+    balanced_tiles = (num_tokens * parts + workers - 1) // workers
+    balanced = pl.cast(0, pl.INT32)
+    if num_tokens > workers:
+        if whole_tiles - balanced_tiles >= 3:
+            balanced = pl.cast(1, pl.INT32)
+    slots = pl.max(1, 2 * workers * balanced)
+    partials = pl.create_tensor([slots * 64 * (HEAD_DIM + 2) + 2 * workers], dtype=pl.FP32)
+    if balanced != 0:
+        ready_offset = 2 * workers * 64 * (HEAD_DIM + 2)
+        for ready_index in pl.range(2 * workers):
+            pl.write(partials, [ready_offset + ready_index], pl.cast(0, pl.FP32))
+    with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[source_ready]) as attended:
+        computed_output, computed_partials = _gather_sparse_vf_rows(
+            active_output, query, sink, window, window_scale, compressed, compressed_scale,
+            window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
+            balanced, cache_mode=compressed_keys,
         )
     return attended
 
@@ -2091,9 +2107,16 @@ def swa_core_reference(inputs):
     return reference
 
 
+# One-part (window-only) dispatches whose worker blocks own exactly T tiles. Above
+# 32 tokens the window-only worker count saturates at WORKERS, so 64/96/128 active
+# tokens give T=2/3/4; the four-tick drain loop must then retire the pipeline with no
+# short-pipeline bypass. The row plans below also carry the mask/order fixtures.
+SWA_DRAIN_CASES = {"drain1": 1, "drain2": 64, "drain3": 96, "drain4": 128}
+
+
 def make_swa_case(case, packed=False):
     """Create masked, prefix, wrap and irregular rows for one dispatch route."""
-    cases = {"gather": 3, "plain": 33, "runs": 129}
+    cases = {"gather": 3, "plain": 33, "runs": 129, **SWA_DRAIN_CASES}
     if case not in cases:
         raise ValueError(f"Unknown SWA case: {case}")
     active = cases[case]
@@ -2164,12 +2187,22 @@ def compare_swa_core(actual, expected, *, inputs, reference, **kwargs):
 
 
 def validate_swa_core(args):
-    """Validate the split BF16-scale and packed544 production SWA paths."""
+    """Validate the split BF16-scale and packed544 production SWA paths.
+
+    The T=1..4 drain cases run on the split-cache route, which is the one that enters
+    kernels/sparse_gather_vf.cpp; the packed544 core is a separate validation-only DSL
+    implementation and has no drain-tap pipeline to exercise.
+    """
     from functools import partial
 
     from golden import run
 
-    cases = ("gather", "plain", "runs") if args.swa_case == "all" else (args.swa_case,)
+    if args.swa_case == "all":
+        cases = ("gather", "plain", "runs", *SWA_DRAIN_CASES)
+    elif args.swa_case == "drains":
+        cases = tuple(SWA_DRAIN_CASES)
+    else:
+        cases = (args.swa_case,)
     layouts = (False,) if args.mode == "swa" else (True,)
     if args.mode in ("all", "swa-both"):
         layouts = (False, True)
@@ -2178,6 +2211,8 @@ def validate_swa_core(args):
         entry = l2_sparse_attention_swa_packed if packed else l2_sparse_attention_swa
         mode = "swa-packed" if packed else "swa"
         for case in cases:
+            if packed and case in SWA_DRAIN_CASES:
+                continue
             inputs, reference = make_swa_case(case, packed)
             result = run(
                 entry,
@@ -2657,7 +2692,7 @@ if __name__ == "__main__":
     mode_choices = ["gather", "packed", "bf16", "both", "c2a", "swa", "swa-packed", "swa-both",
                     "project", "project-packed", "project-swa", "all"]
     parser.add_argument("--mode", default="all", choices=mode_choices)
-    parser.add_argument("--swa-case", default="all", choices=["gather", "plain", "runs", "all"])
+    parser.add_argument("--swa-case", default="all", choices=["gather", "plain", "runs", "drains", "all"])
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--runtime-dir", type=str)
@@ -2674,6 +2709,8 @@ if __name__ == "__main__":
         raise ValueError("Gather and projection validation generate their own boundary fixtures")
     if args.rows is not None and args.rows < 1:
         raise ValueError("--rows must be positive")
+    if args.swa_case == "drains" and args.mode == "swa-packed":
+        parser.error("--swa-case drains exercises the split-cache SFA route; use --mode swa")
     if args.mode == "gather":
         _main_results = validate_gather_packed(args)
     elif args.mode.startswith("swa"):
