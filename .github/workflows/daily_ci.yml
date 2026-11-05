@@ -9,6 +9,11 @@ on:
         description: Run only the operator performance suites (a2a3 and a5)
         type: boolean
         default: false
+      performance_suite:
+        description: Select the fixed operator performance suite
+        type: choice
+        options: [all, default, glm5.3-flash]
+        default: all
 
 # Every job only reads the repo (checkouts use persist-credentials: false, the
 # artifact up/download steps use the run-scoped runtime token, the summaries
@@ -240,7 +245,7 @@ jobs:
   operator-performance:
     needs: model-tests-device
     # Run after both sweeps, including failures or performance-only skips.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && inputs.performance_suite != 'glm5.3-flash' }}
     name: Operator performance (${{ matrix.platform }})
     strategy:
       fail-fast: false
@@ -290,7 +295,7 @@ jobs:
           PERF_DIR: ${{ runner.temp }}/operator-perf-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           source activate.sh
-          python .github/scripts/ci_perf.py ci --platform "${{ matrix.platform }}" --output-dir "$PERF_DIR"
+          python .github/scripts/ci_perf.py ci --platform "${{ matrix.platform }}" --suite default --output-dir "$PERF_DIR"
 
       - name: Kill orphaned task-submit tasks
         if: always()
@@ -325,11 +330,94 @@ jobs:
           PERF_DIR: ${{ runner.temp }}/operator-perf-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
         run: rm -rf -- "$PERF_DIR/work"
 
+  glm-operator-performance:
+    needs: model-tests-device
+    # Run after both sweeps, including failures or performance-only skips.
+    if: ${{ !cancelled() && inputs.performance_suite != 'default' }}
+    name: GLM operator performance (a3)
+    runs-on: [self-hosted, linux, npu, a3]
+    # GLM preparation runs on the CPU; sampling uses task-submit allocations.
+    timeout-minutes: 300
+    concurrency:
+      group: glm-operator-performance-a3
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: glm-operator-checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/glm-operator-checkout/ptoas-bin
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: glm-operator-checkout
+          needs-device: 'true'
+          build-namespace: glm-operator-performance-a3
+          pip-cache-name: pip-glm-operator-performance-a3
+          toolchain: bundle
+          torch-version: 'torch==2.10.0'
+
+      - name: Run operator performance cases
+        id: perf
+        env:
+          OMP_NUM_THREADS: '8'
+          OPENBLAS_NUM_THREADS: '8'
+          MKL_NUM_THREADS: '8'
+          PERF_DIR: ${{ runner.temp }}/glm-operator-perf-a3-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          source activate.sh
+          python .github/scripts/ci_perf.py ci --platform a2a3 --suite glm5.3-flash --output-dir "$PERF_DIR"
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: glm-operator-checkout
+
+      - name: Publish performance summary
+        if: ${{ always() && steps.perf.outcome != 'skipped' }}
+        env:
+          PERF_DIR: ${{ runner.temp }}/glm-operator-perf-a3-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          report="$PERF_DIR/published/report.md"
+          if [ -f "$report" ]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Operator performance produced no report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload operator performance results
+        id: upload
+        if: ${{ always() && steps.perf.outcome != 'skipped' }}
+        uses: ./.github/actions/upload-results
+        with:
+          name: glm-operator-perf-a3-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/glm-operator-perf-a3-${{ github.run_id }}-${{ github.run_attempt }}/published
+          if-no-files-found: error
+
+      - name: Remove private operator builds after uploading evidence
+        if: ${{ always() && steps.upload.outcome == 'success' }}
+        env:
+          PERF_DIR: ${{ runner.temp }}/glm-operator-perf-a3-${{ github.run_id }}-${{ github.run_attempt }}
+        run: rm -rf -- "$PERF_DIR/work"
+
   summary:
     name: Aggregate results summary
     # Wait for all model and performance jobs to finish before summarizing.
     # `always()` keeps the summary running when any sweep fails.
-    needs: [model-tests-sim, model-tests-device, operator-performance]
+    needs: [model-tests-sim, model-tests-device, operator-performance, glm-operator-performance]
     if: ${{ always() && !inputs.performance_only }}
     runs-on: ubuntu-latest
     steps:

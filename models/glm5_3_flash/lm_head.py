@@ -417,7 +417,7 @@ def run_fp32_case(options, device_id):
 
     @lru_cache(maxsize=1)
     def inputs():
-        generator = torch.Generator().manual_seed(5357)
+        generator = torch.Generator().manual_seed(options.seed)
         x = component_hidden(options, D, generator)
         weight = torch.zeros(FP32_HEAD_VOCAB_PAD, D, dtype=torch.float32)
         if options.checkpoint is None:
@@ -462,7 +462,7 @@ def run_fp32_case(options, device_id):
         fn=fn,
         specs=specs,
         golden_fn=golden,
-        config=dict(backend_type=options.backend_type, execution_mode=options.execution_mode, device_id=device_id),
+        config=dict(backend_type=options.backend_type, execution_mode=options.execution_mode, device_id=device_id, enable_chip_swimlane=options.enable_chip_swimlane),
         compare_fn={"logits": ratio_allclose(atol=1e-05, rtol=1e-05, max_error_ratio=0)},
         compile_only=options.compile_only,
     )
@@ -660,6 +660,8 @@ def main():
     parser.add_argument("--hidden-input", type=Path)
     parser.add_argument("--tokens", type=int, default=17)
     parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=5357)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
     device_ids = [int(device) for device in args.device.split(",")]
     if args.checkpoint is not None or args.hidden_input is not None:

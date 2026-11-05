@@ -531,9 +531,15 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T_DYN_TEST)
+    parser.add_argument("--tp", type=int, default=16)
+    parser.add_argument("--ep", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=1024)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    if args.num_tokens < 1:
+        parser.error("--num-tokens must be positive")
+    torch.manual_seed(args.seed)
 
     result = run(
         fn=expert_routed_test,

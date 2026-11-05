@@ -145,6 +145,41 @@ communication buffers, and upload temporaries. TP8/EP8 has been exercised with
 the published W8A8 checkpoint at packed capacity 576 on eight 64-GiB A3 devices;
 larger capacities require their own memory and numerical validation.
 
+### Fixed A3 performance suite
+
+Daily CI runs the `glm5.3-flash` suite from
+[`.github/scripts/perf_cases.json`](../../../.github/scripts/perf_cases.json).
+The `glm5.3-flash-a3-v1` reference profile pins the vLLM Ascend A3 recipe:
+TP16/EP16/DP1, 32 requests, five MTP proposals, and an 8192-token prefill
+budget. Verification fixtures contain 32 independent requests with six query
+tokens each; the bounded history probe is 8192 tokens per request, below the
+recipe's 1M maximum context. Prefill starts with one zero-state 8192-token request; subsequent benchmark
+repetitions carry state rather than resetting to a fresh request.
+Each case measures one local shard on one allocated A3 device, without TP/EP
+collectives or a complete speculative serving loop.
+
+The suite covers KDA projection, short convolution, verification recurrence,
+prefill recurrence and output; MLA prolog, sparse verification, sparse prefill
+and output; the complete Indexer step; mHC pre/post; routing, shared/routed
+experts; and the vocabulary head. The shared-expert fixture selects
+`--shared-tp 16` (128 intermediate columns), while existing model callers
+keep the replicated full-width branch. Routed experts use 96 balanced local
+route rows: `32 * 6 * 8 / 16`, across 18 experts.
+
+The manifest records the remaining storage and numerical differences:
+PyPTO MLA uses BF16 cache rather than C8, the pooled Indexer cache is INT8
+rather than BF16, and the vocabulary head retains its current FP32 contract.
+These are labelled current implementations, not claims of C8 or full-model
+alignment. Keep the v1 workload and precision contracts fixed; an intentional
+change requires a new case ID and baseline.
+
+Each explicit performance selection calls `golden.run` once. CI prepares and
+assembles on the CPU, freezes the original inputs/golden and numerical gates,
+then submits only replay to `task-submit`. Sampling is 100 rounds after ten
+warmups, with the existing input-refresh and InOut state-carry protocol.
+The published effective/device windows include runtime scheduling; neither
+is a kernel-only or scheduler-excluded metric.
+
 ### Complete native forward interface
 
 `prefill_fwd.py:l3_prefill_fwd` and `decode_fwd.py:l3_decode_fwd` each submit
