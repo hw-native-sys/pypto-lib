@@ -33,12 +33,13 @@ __tf__ __aicore__ inline void normalize(Output::TileDType __out__ output,
     auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(output);
 #if defined(__CPU_SIM)
     for (int row = 0; row < Rows; ++row) {
-        float sum = 0.0f;
+        // Avoid serial FP32 reduction error crossing a BF16 rounding boundary.
+        double sum = 0.0;
         for (int k = 0; k < Width; ++k) {
             float value = static_cast<float>(src[row * Width + k]);
             sum += value * value;
         }
-        float inverse = 1.0f / std::sqrt(sum / Width + 1.0e-6f);
+        float inverse = 1.0f / std::sqrt(static_cast<float>(sum) / Width + 1.0e-6f);
         for (int k = 0; k < Width; ++k) {
             float value = static_cast<float>(src[row * Width + k]) * inverse;
             value *= static_cast<float>(gamma[k]);
@@ -111,7 +112,9 @@ __tf__ __aicore__ inline void normalize(Output::TileDType __out__ output,
 }
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__)
+#if !defined(__CPU_SIM)
     set_atomic_none(); set_mask_norm(); set_vector_mask(-1, -1);
+#endif
     int first = get_block_idx(args) * Rows;
     int valid = args[3] - first;
     valid = valid < 0 ? 0 : (valid > Rows ? Rows : valid);
