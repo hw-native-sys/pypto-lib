@@ -55,8 +55,13 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
     }
     missing = [name for name, exists in present.items() if not exists]
     checkpoint = checkpoint_asset_report()
+    implementation = CONTRACT["implementation"]
     devices = topology_config["devices"]
-    ready = not missing and checkpoint.get("status") == "metadata_verified"
+    ready = (
+        not missing
+        and checkpoint.get("status") == "metadata_verified"
+        and implementation["formal_ready"]
+    )
     command = (
         f"task-submit --device auto --device-num {devices} --run "
         f"'PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_fwd "
@@ -78,6 +83,7 @@ def gate_report(topology: str, asset_root: Path | None = None) -> dict[str, Any]
         "asset_presence": present,
         "missing_assets": missing,
         "checkpoint_asset": checkpoint,
+        "implementation": implementation,
         "required_state_inputs": list(CONTRACT["state_inputs"]),
         "required_state_outputs": list(CONTRACT["state_outputs"]),
         "queue_command": command,

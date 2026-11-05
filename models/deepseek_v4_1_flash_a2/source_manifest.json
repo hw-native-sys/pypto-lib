@@ -1006,7 +1006,7 @@
     },
     {
       "file": "decode_gate.py",
-      "sha256": "2547c65d318bae9212d1c4c220f1727307a9dd438494fec7facee7e6b600c551",
+      "sha256": "a163ee98e58d7e94839d11e53c95d25be9839b8cb526038c0a934ff4f1a0534e",
       "role": "fail-closed EP2/main/compatibility topology gate entry",
       "product_compute": false,
       "accuracy_evidence": "not_run"
@@ -1020,7 +1020,7 @@
     },
     {
       "file": "decode_acceptance.py",
-      "sha256": "4dc8d001e5c36497d37491b965fc6a0de2e7beb2155e06547c86f830365d4d8",
+      "sha256": "1b27f00bbfa5eb2d7b369b2ea339e12a451906a20561e80d3c41d1face9a7f21",
       "role": "independent Decode contract and product dependency verifier",
       "product_compute": false,
       "accuracy_evidence": "not_run"

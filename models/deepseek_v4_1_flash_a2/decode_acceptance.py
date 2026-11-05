@@ -174,6 +174,18 @@ CONTRACT: dict[str, Any] = {
         "dataset": "not_run",
         "http_service": "not_run",
     },
+    "implementation": {
+        "status": "bounded_only",
+        "formal_ready": False,
+        "formal_entrypoint": None,
+        "blockers": [
+            "complete mHC/residual composition",
+            "C1A/C2A compression and index refresh",
+            "Engram state and cache ownership",
+            "384-expert EP dispatch/local compute/combine",
+            "TP/DP/CP/SP runtime driver and state outputs",
+        ],
+    },
     "required_assets": (
         "checkpoint.json",
         "decode_input.json",
