@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # A2/A3 device validation; simulator CI is deferred for this model.
 """DeepSeek-V4 hc_pre -- hyper-connection pre-mix.
 
 x[T, hc, D] holds hc streams of the hidden state (x_flat = x.reshape(T, hc*D)). With the
@@ -223,14 +222,23 @@ def hc_pre(
         t0 = ob * COMB_T_TILE
         comb_rows = pl.min(COMB_T_TILE, t_dim - t0)
         inv_col_t = pl.slice(inv_rms, [COMB_T_TILE, 1], [t0, 0], valid_shape=[comb_rows, 1])
-        mix_g0 = pl.slice(mixes_raw, [COMB_T_TILE, HC_PAD], [t0, 8], valid_shape=[comb_rows, HC_MULT])
-        mix_g1 = pl.slice(mixes_raw, [COMB_T_TILE, HC_PAD], [t0, 12], valid_shape=[comb_rows, HC_MULT])
-        mix_g2 = pl.slice(mixes_raw, [COMB_T_TILE, HC_PAD], [t0, 16], valid_shape=[comb_rows, HC_MULT])
-        mix_g3 = pl.slice(mixes_raw, [COMB_T_TILE, HC_PAD], [t0, 20], valid_shape=[comb_rows, HC_MULT])
-        row0_exp = hc_softmax_exp_math(mix_g0, inv_col_t, hc_scale, hc_base, group=2, offset=8)
-        row1_exp = hc_softmax_exp_math(mix_g1, inv_col_t, hc_scale, hc_base, group=2, offset=12)
-        row2_exp = hc_softmax_exp_math(mix_g2, inv_col_t, hc_scale, hc_base, group=2, offset=16)
-        row3_exp = hc_softmax_exp_math(mix_g3, inv_col_t, hc_scale, hc_base, group=2, offset=20)
+        exp_rows = pl.full([HC_MULT * COMB_T_TILE, HC_PAD], dtype=pl.FP32, value=0.0)
+        for hc_row in pl.range(HC_MULT):
+            mix_offset = 2 * HC_MULT + hc_row * HC_MULT
+            mix_g = pl.slice(mixes_raw, [COMB_T_TILE, HC_PAD], [t0, mix_offset], valid_shape=[comb_rows, HC_MULT])
+            row_exp = hc_softmax_exp_math(mix_g, inv_col_t, hc_scale, hc_base, group=2, offset=mix_offset)
+            row_exp = pl.set_validshape(row_exp, COMB_T_TILE, HC_MULT)
+            row_exp = pl.fillpad(row_exp, pad_value=pl.PadValue.zero)
+            row_exp = pl.set_validshape(row_exp, COMB_T_TILE, HC_PAD)
+            # Materialize a dense tile before local assembly.
+            row_zero = pl.full([COMB_T_TILE, HC_PAD], dtype=pl.FP32, value=0.0)
+            row_exp = pl.add(row_zero, row_exp)
+            row_start = hc_row * COMB_T_TILE
+            exp_rows[row_start : row_start + COMB_T_TILE, :] = row_exp
+        row0_exp = pl.slice(exp_rows, [COMB_T_TILE, HC_PAD], [0, 0])
+        row1_exp = pl.slice(exp_rows, [COMB_T_TILE, HC_PAD], [COMB_T_TILE, 0])
+        row2_exp = pl.slice(exp_rows, [COMB_T_TILE, HC_PAD], [2 * COMB_T_TILE, 0])
+        row3_exp = pl.slice(exp_rows, [COMB_T_TILE, HC_PAD], [3 * COMB_T_TILE, 0])
         row0_sum = pl.row_sum(row0_exp)
         row1_sum = pl.row_sum(row1_exp)
         row2_sum = pl.row_sum(row2_exp)
@@ -842,6 +850,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
     )
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--mode", choices=["decode"], default="decode")
     parser.add_argument(
@@ -878,7 +887,7 @@ if __name__ == "__main__":
                 config=dict(
                     dump_passes=args.dump_passes,
                     backend_type=args.platform.removesuffix("sim"),
-                    execution_mode=args.platform.endswith("sim"),
+                    execution_mode=args.sim or args.platform.endswith("sim"),
                     device_id=args.device,
                     enable_chip_swimlane=args.enable_chip_swimlane,
                 ),
