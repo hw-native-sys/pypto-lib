@@ -593,7 +593,7 @@ def decode_sparse_attn(
                             key_value = pl.cast(latent_cache[source:source + 1, k0:k0 + 128], pl.FP32)
                             products = pl.create_tensor([DECODE_H_PAD, 128], dtype=pl.FP32)
                             products[:, :] = pl.col_expand_mul(query_value, key_value)
-                            high, low = accurate_row_sum_parts(products)
+                            high, low = accurate_row_sum_parts(products, 128)
                             part_sum = pl.reshape(high, [1, DECODE_H_PAD])
                             tail = pl.reshape(low, [1, DECODE_H_PAD])
                             updated = pl.add(total, part_sum)

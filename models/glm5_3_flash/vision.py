@@ -216,7 +216,7 @@ def vision_attention(
                     mass_argument[:, :] = pl.add(mass_zero, mass_shifted)
                     mass_exponentials = pl.create_tensor([ATTENTION_M_TILE, ATTENTION_N_TILE], dtype=pl.FP32)
                     mass_exponentials[:, :] = vision_softmax_exp(mass_argument)
-                    mass_high, mass_low = accurate_row_sum_parts(mass_exponentials)
+                    mass_high, mass_low = accurate_row_sum_parts(mass_exponentials, 128)
                     block_mass = pl.reshape(mass_high, [1, ATTENTION_M_TILE])
                     block_error = pl.reshape(mass_low, [1, ATTENTION_M_TILE])
                     updated_mass = pl.add(mass, block_mass)

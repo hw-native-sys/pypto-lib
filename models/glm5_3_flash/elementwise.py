@@ -238,12 +238,14 @@ def accurate_divide_parts(
 
 
 @pl.jit.inline
-def accurate_row_sum_parts(x: pl.Tensor[[M, N], pl.FP32]):
-    """Return high/low row sums for blocks with at most 128 finite columns."""
-    magnitude = pl.maximum(pl.row_max(pl.abs(x)), 1e-30)
+def accurate_row_sum_parts(x: pl.Tensor[[M, N], pl.FP32], N_BOUND: pl.constexpr):
+    """Return high/low row sums within a power-of-two column bound of at least 128."""
+    row_magnitude = pl.row_max(pl.abs(x))
+    bounded_magnitude = pl.mul(row_magnitude, N_BOUND / 128)
+    magnitude = pl.maximum(bounded_magnitude, 1e-30)
     magnitude_bits = pl.reinterpret_view(magnitude, pl.INT32)
     exponent = pl.shr(magnitude_bits, 23)
-    # Each rounded lane is at most 2**23; 128 lanes fit signed INT32.
+    # N_BOUND rounded lanes sum to at most 2**30 in signed INT32.
     scale_exponent = pl.add(pl.neg(exponent), 276)
     scale_bits = pl.shl(scale_exponent, 23)
     scale = pl.reinterpret_view(scale_bits, pl.FP32)
@@ -262,7 +264,7 @@ def accurate_row_sum_parts(x: pl.Tensor[[M, N], pl.FP32]):
 
 @pl.jit.inline
 def accurate_row_sum(x: pl.Tensor[[M, N], pl.FP32]):
-    high, low = accurate_row_sum_parts(x)
+    high, low = accurate_row_sum_parts(x, 128)
     return pl.add(high, low)
 
 

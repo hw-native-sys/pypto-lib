@@ -24,7 +24,7 @@ from models.glm5_3_flash.elementwise import (
     _sum_fp32_reference, accurate_divide, accurate_exp, accurate_row_sum, accurate_row_sum_parts,
     accurate_rsqrt, accurate_sigmoid,
 )
-from models.glm5_3_flash.linear import bf16_linear
+from models.glm5_3_flash.linear import bf16_linear_row
 from models.glm5_3_flash.rmsnorm import unweighted_rms_norm
 from models.glm5_3_flash.utils import _assert_close, _check, _randn, _report
 
@@ -35,13 +35,14 @@ HC_SINKHORN_ITER = FLASH.hc_sinkhorn_iters
 HC_EPS = FLASH.hc_eps
 NORM_EPS = FLASH.rms_norm_eps
 MIX_D_TILE = 256
-MIX_PAD = 32  # MIX_HC = 24 padded to the cube's N granularity
+MIX_PAD = 32  # coefficient scratch row width
 HC_PAD = 8  # HC_MULT = 4 padded so an FP32 row is 32 bytes
 RMS_T_TILE = 8  # token tile of the sum-of-squares scope
-LINEAR_T_TILE = 16  # cube M tile; below 16 the matmul is not L0 split
+LINEAR_T_TILE = 16  # coefficient scratch row padding
 COMB_T_TILE = 8  # token tile of the softmax / Sinkhorn scope
 POST_COEFF_TILE = 16  # minimum 32-byte BF16 vector row
 RMS_K_TILE = 128  # HC_DIM reduction chunk of the sum of squares
+LINEAR_N_TILE = 8
 
 
 @pl.jit.inline
@@ -94,7 +95,7 @@ def mhc_mixes(
             rms_value = pl.cast(rms_x_tile, pl.FP32)
             rms_square = pl.create_tensor([RMS_T_TILE, RMS_K_TILE], dtype=pl.FP32)
             rms_square[:, :] = pl.mul(rms_value, rms_value)
-            part_high, part_low = accurate_row_sum_parts(rms_square)
+            part_high, part_low = accurate_row_sum_parts(rms_square, 128)
             sq_part = pl.reshape(part_high, [1, RMS_T_TILE])
             part_error = pl.reshape(part_low, [1, RMS_T_TILE])
             sq_updated = pl.add(sq_sum, sq_part)
@@ -108,13 +109,13 @@ def mhc_mixes(
         inv_rms[t0 : t0 + RMS_T_TILE, 0:1] = pl.reshape(inverse, [RMS_T_TILE, 1])
 
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
-    for block in pl.spmd(t_linear // LINEAR_T_TILE, name_hint="mhc_linear"):
-        t0 = block * LINEAR_T_TILE
-        valid_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
-        zero = pl.cast(0, pl.INDEX)
-        columns = pl.cast(MIX_HC, pl.INDEX)
-        raw = bf16_linear(x_flat, function, t0, zero, valid_rows, columns, LINEAR_T_TILE, MIX_PAD, HC_DIM, True)
-        mixes_raw[t0 : t0 + LINEAR_T_TILE, 0:MIX_PAD] = raw
+    # The 24-channel projection exposes more parallelism as independent row dots.
+    # Retain both reduction parts and compensate accumulation across K chunks.
+    for block in pl.spmd(t_dim * (MIX_HC // LINEAR_N_TILE), name_hint="mhc_linear"):
+        token = block // (MIX_HC // LINEAR_N_TILE)
+        column = block % (MIX_HC // LINEAR_N_TILE) * LINEAR_N_TILE
+        raw = bf16_linear_row(x_flat, function, token, column, LINEAR_N_TILE, HC_DIM, 128, 2)
+        mixes_raw[token:token + 1, column:column + LINEAR_N_TILE] = raw
 
     residual_flat = pl.reshape(residual_mix, [t_dim * HC_MULT, HC_MULT])
     for t in pl.spmd(t_dim, name_hint="mhc_coefficients"):
