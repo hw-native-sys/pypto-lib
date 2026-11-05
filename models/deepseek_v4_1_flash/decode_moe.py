@@ -111,16 +111,13 @@ def combine_scattered(
             if peer != my_rank:
                 pld.system.notify(target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="combine_wait",
-        deps=[scatter_done], no_dep_args=[combine_arrived],
-    ) as _cwait_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[notify_tid]) as _cwait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.defer_wait(signal=combine_arrived, offsets=[src, 0, 0], expected=moe_epoch, cmp=pld.WaitCmp.Ge)
 
     # Wait for local and peer routed-output stores.
-    with pl.spmd((T + COMBINE_T_TILE - 1) // COMBINE_T_TILE, name_hint="combine_reduce", deps=[_cwait_tid, notify_tid]) as _reduce_tid:
+    with pl.spmd((T + COMBINE_T_TILE - 1) // COMBINE_T_TILE, name_hint="combine_reduce", deps=[_cwait_tid]) as _reduce_tid:
         t_begin = pl.tile.get_block_idx() * COMBINE_T_TILE
         for t in pl.range(t_begin, pl.min(t_begin + COMBINE_T_TILE, T)):
             if t < num_tokens:
@@ -256,7 +253,7 @@ def l2_moe(
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[D], pl.BF16],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
@@ -315,7 +312,7 @@ def l3_moe(
     hc_ffn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.BF16],
+    gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.FP32],
     correction_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
     routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
@@ -498,7 +495,7 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
             specs.append(ScalarSpec(name, torch.int32, 1, compile_runtime=True))
             continue
         dtype = torch.float32
-        if name in ("norm_weight", "x_mixed", "gate_weight"):
+        if name == "norm_weight" or name == "x_mixed":
             dtype = torch.bfloat16
         elif name == "num_tokens" or name == "force_topk":
             dtype = torch.int32

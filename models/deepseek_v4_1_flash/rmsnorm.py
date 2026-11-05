@@ -8,10 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek V4.1 Flash RMSNorm kernels and shared Torch references."""
 
-from pathlib import Path
-
 import pypto.language as pl
-from pypto.runtime import pto_isa_include_dir
 import torch
 
 from config import FLASH as M, T_DYN
@@ -24,15 +21,6 @@ D = M.hidden_size
 EPS = M.rms_norm_eps
 NORM_T_TILE = 8
 NORM_D_TILE = 512
-
-
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "rms_norm_bf16.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def rms_norm_bf16(
-    x: pl.Tensor, weight: pl.Tensor, output: pl.Out[pl.Tensor], num_tokens: pl.Scalar[pl.INT32],
-):
-    """Normalize two rows and store BF16 values."""
-    ...
 
 
 @pl.jit.inline
