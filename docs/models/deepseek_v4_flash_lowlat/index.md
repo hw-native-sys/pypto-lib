@@ -142,6 +142,15 @@ unproven. The retired scatter and unused persistent A/B variants are omitted
 from the runnable model; re-evaluate with real consumer inputs if that scope
 changes.
 
+## HC pre simulator compilation
+
+HC pre computes its four independent softmax rows in a local loop, sharing
+one compensated exponential instruction body. It explicitly zeroes padded
+columns before widening and packing the results locally. The original paired
+column sums, nineteen further Sinkhorn iterations and golden thresholds
+remain unchanged. The compact body bounds generated C++ size for simulator
+compilation without adding a GM buffer or task.
+
 ## Execution shapes and component ownership
 
 `config.py` holds model configuration and quantization constants.
@@ -157,9 +166,9 @@ indices.
 
 ## CI targets and validation scope
 
-This model uses A2/A3 device CI. Thirteen standalone single-card entries also
+This model uses A2/A3 device CI. Fourteen standalone single-card entries also
 run in simulator CI with `-p a2a3 --sim`, including their default golden
-comparisons: embedding lookup, HC head/post, RMSNorm, sampling, QKV/RoPE,
+comparisons: embedding lookup, HC pre/head/post, RMSNorm, sampling, QKV/RoPE,
 both compressors, Indexer and its compressor, standalone SWA/HCA sparse
 attention, and the routed-expert entry. Other runnable entries retain
 `# ci: no-sim` while qualification continues. Both pull-request and daily
