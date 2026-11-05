@@ -6,14 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # A2/A3 device validation; simulator CI is deferred for this model.
 """Persistent routed and shared MoE expert execution.
 
 The planned entry consumes compact slot and row-count tables produced by route
 grouping. The balanced wrapper constructs those tables for standalone fixtures
-with arbitrary active slots. A 24-block grid processes complete expert chains,
+with arbitrary active slots. Each grid block processes complete expert chains,
 with gate/up matmuls, SwiGLU, activation quantization, down matmul and dequantization
-kept in one mixed task. Each cube core uses two vector lanes through UP_DOWN
+kept in one mixed task. The grid uses the runtime cluster count. Each cube core uses two vector lanes through UP_DOWN
 regions; intermediate activations stay on chip.
 """
 
@@ -28,9 +27,6 @@ from expert_routed import (
 )
 
 
-# Persistent blocks == the a2a3 AIC count. No barrier lives in this kernel, so a
-# mismatch on another SoC is a scheduling fact, not a hang.
-NUM_CORES = 24
 WORK_SLOTS_PAD = (N_SLOTS_B + IDX_PAD - 1) // IDX_PAD * IDX_PAD
 
 # One cluster = 1 cube core + 2 buddy vector cores.
@@ -38,21 +34,10 @@ AIV_LANES = 2
 ROW_HALF = RECV_TILE // AIV_LANES
 
 # tiling
-FUSED_N_TILE = MOE_INTER
-# The whole intermediate shard is one cube N tile, which is what lets the amax
-# stay a within-row reduction -- and it is also what bounds this form by buffer
-# size. Acc holds gate_acc and up_acc double-buffered at 2 * 2 * ROW_TILE *
-# MOE_INTER * 4 B, so MOE_INTER > 512 overflows L0C no matter how K is tiled;
-# below that, K is what keeps Mat (double-buffered operands plus the 64 KiB c2v
-# ring) under its limit. TP=8 gives MOE_INTER=256 and K stays at 512.
-assert MOE_INTER <= 512, (
-    f"the fused routed expert needs MOE_INTER <= 512, got {MOE_INTER}: gate_acc and "
-    "up_acc do not fit L0C. Use expert_routed.py's four-task form at this TP degree."
-)
-# Both cube operands are bounded the same way: the gate/up weight tile is
-# MOE_INTER x FUSED_K_TILE and the down weight tile is FUSED_Y_TILE x MOE_INTER,
-# each double-buffered, and Mat has to hold them beside the 64 KiB c2v ring.
-FUSED_K_TILE = max(64, min(512, 131072 // MOE_INTER))
+FUSED_N_TILE = min(128, MOE_INTER)
+# Two double-buffered INT32 accumulators share the 128 KiB L0C.
+assert 4 * RECV_TILE * FUSED_N_TILE * 4 <= 131072, "gate/up accumulator tiles exceed L0C"
+FUSED_K_TILE = max(64, min(512, 131072 // FUSED_N_TILE))
 FUSED_Y_TILE = max(64, min(512, 131072 // MOE_INTER))
 
 
@@ -82,22 +67,15 @@ def expert_routed_persistent_planned(
     w2_2d = pl.reshape(routed_w2, [N_BANK * D, MOE_INTER])
 
     with pl.scope():
-        # sync_start: the combine grid downstream is submitted while this task is
-        # still running and parks blocks on AIV lanes waiting for recv_y. Without
-        # a synchronized start this grid takes whatever lanes are free and leaves
-        # some of its own blocks queued behind those occupants -- normally a
-        # 10-20 us start spread, but occasionally a block starts only after
-        # another has already finished, which stretches the task ~113 -> ~146 us
-        # on that card, and the layer waits for it. Starting all NUM_CORES blocks
-        # together holds the spread at ~1.5 us; the grid is the whole AIC array,
-        # so refusing a partial start gives nothing away.
+        # One synchronized block per available AIC cluster.
         with pl.spmd(
-            NUM_CORES, name_hint="exp_routed_balanced", sync_start=True,
+            pl.system.available_cluster_count(), name_hint="exp_routed_balanced", sync_start=True,
             allow_early_resolve=True,
         ):
-            core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
+            core = pl.tile.get_block_idx()
+            num_cores = pl.tile.get_block_num()
 
-            for w in pl.range(core, N_SLOTS_B, NUM_CORES):
+            for w in pl.range(core, N_SLOTS_B, num_cores):
                 s = pl.cast(pl.read(work_slot, [w]), pl.INDEX)
                 eid = pl.cast(pl.read(slot_expert, [s, 0]), pl.INDEX)
                 n_rows = pl.read(work_rows, [w])
@@ -111,106 +89,108 @@ def expert_routed_persistent_planned(
                     flat_t0 = slot_base + t0
                     valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
-                    gate_acc = pl.create_tensor([RECV_TILE, FUSED_N_TILE], dtype=pl.INT32)
-                    for kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
-                        k0 = kb * FUSED_K_TILE
-                        x_k = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, k0],
-                                       valid_shape=[valid_rows, FUSED_K_TILE])
-                        w1_k = w1_2d[e_w1 : e_w1 + FUSED_N_TILE, k0 : k0 + FUSED_K_TILE]
-                        gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True, init_cond=(kb == 0))
+                    h_full = pl.create_tensor([ROW_HALF, MOE_INTER], dtype=pl.FP32)
 
-                    up_acc = pl.create_tensor([RECV_TILE, FUSED_N_TILE], dtype=pl.INT32)
-                    for ukb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
-                        uk0 = ukb * FUSED_K_TILE
-                        x_u = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, uk0],
-                                       valid_shape=[valid_rows, FUSED_K_TILE])
-                        w3_k = w3_2d[e_w1 : e_w1 + FUSED_N_TILE, uk0 : uk0 + FUSED_K_TILE]
-                        up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True, init_cond=(ukb == 0))
+                    for inter_start in pl.range(0, MOE_INTER, FUSED_N_TILE):
+                        inter_base = e_w1 + inter_start
+                        gate_acc = pl.create_tensor([RECV_TILE, FUSED_N_TILE], dtype=pl.INT32)
+                        for kb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
+                            k0 = kb * FUSED_K_TILE
+                            x_k = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, k0],
+                                           valid_shape=[valid_rows, FUSED_K_TILE])
+                            w1_k = w1_2d[inter_base : inter_base + FUSED_N_TILE, k0 : k0 + FUSED_K_TILE]
+                            gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True, init_cond=(kb == 0))
 
-                    w1_sc = routed_w1_scale[eid : eid + 1, 0:FUSED_N_TILE]
-                    w3_sc = routed_w3_scale[eid : eid + 1, 0:FUSED_N_TILE]
+                        up_acc = pl.create_tensor([RECV_TILE, FUSED_N_TILE], dtype=pl.INT32)
+                        for ukb in pl.pipeline(0, D // FUSED_K_TILE, stage=2):
+                            uk0 = ukb * FUSED_K_TILE
+                            x_u = pl.slice(recv_x_flat, [RECV_TILE, FUSED_K_TILE], [flat_t0, uk0],
+                                           valid_shape=[valid_rows, FUSED_K_TILE])
+                            w3_k = w3_2d[inter_base : inter_base + FUSED_N_TILE, uk0 : uk0 + FUSED_K_TILE]
+                            up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True, init_cond=(ukb == 0))
 
-                    # ---- vector phase 1: dequant + SwiGLU + per-row A8 requant ----
-                    # UP_DOWN halves the shard on rows, so each lane holds ROW_HALF
-                    # COMPLETE rows and pl.row_max is a within-lane reduction.
-                    for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
-                        # A lane-derived read address is what marks the load
-                        # per-lane for the region's half-width scan. Column-sliced
-                        # in place rather than through a 1-D view of the whole
-                        # table: a 2-D -> 1-D reshape of an inline parameter loses
-                        # its inferred metadata once moe.py nests this call.
-                        lane_r0 = pl.cast(aiv_id * ROW_HALF, pl.INDEX)
+                        w1_sc = routed_w1_scale[eid : eid + 1, inter_start : inter_start + FUSED_N_TILE]
+                        w3_sc = routed_w3_scale[eid : eid + 1, inter_start : inter_start + FUSED_N_TILE]
 
-                        x_sc = pl.reshape(
-                            recv_scale_dq[s : s + 1, lane_r0 : lane_r0 + ROW_HALF],
-                            [ROW_HALF, 1])
-                        w_col = pl.reshape(
-                            recv_weights[s : s + 1, lane_r0 : lane_r0 + ROW_HALF],
-                            [ROW_HALF, 1])
-                        gate_sh = pl.aiv_shard(gate_acc)
-                        up_sh = pl.aiv_shard(up_acc)
-                        gate_f = pl.create_tensor([ROW_HALF, FUSED_N_TILE], dtype=pl.FP32)
-                        gate_f = pl.cast(gate_sh, target_type=pl.FP32, mode="none")
-                        up_f = pl.cast(up_sh, target_type=pl.FP32, mode="none")
-                        gate_f = pl.col_expand_mul(pl.row_expand_mul(gate_f, x_sc), w1_sc)
-                        up_f = pl.col_expand_mul(pl.row_expand_mul(up_f, x_sc), w3_sc)
-                        if SWIGLU_LIMIT > 0.0:
-                            gate_f = pl.minimum(gate_f, SWIGLU_LIMIT)
-                            up_f = pl.maximum(pl.minimum(up_f, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                        sg_fix_exponential = rne_exp_signed(
-                            gate_f, rows=ROW_HALF, cols=FUSED_N_TILE,
-                            safe_zero=False, negate=True,
-                        )
-                        sg_fix_denominator = pl.add(sg_fix_exponential, 1.0)
-                        sg_fix_original = pl.recip(sg_fix_denominator)
-                        sg_fix_bounded = pl.minimum(sg_fix_denominator, 4294967296.0)
-                        sg_fix_estimate = sg_fix_original
-                        sg_fix_product = sg_fix_estimate
-                        sg_fix_error = sg_fix_estimate
-                        sg_fix_a_split = pl.mul(sg_fix_estimate, 4097.0)
-                        sg_fix_a_delta = pl.sub(sg_fix_a_split, sg_fix_estimate)
-                        sg_fix_a_hi = pl.sub(sg_fix_a_split, sg_fix_a_delta)
-                        sg_fix_a_lo = pl.sub(sg_fix_estimate, sg_fix_a_hi)
-                        sg_fix_b_split = pl.mul(sg_fix_bounded, 4097.0)
-                        sg_fix_b_delta = pl.sub(sg_fix_b_split, sg_fix_bounded)
-                        sg_fix_b_hi = pl.sub(sg_fix_b_split, sg_fix_b_delta)
-                        sg_fix_b_lo = pl.sub(sg_fix_bounded, sg_fix_b_hi)
-                        sg_fix_product = pl.mul(sg_fix_estimate, sg_fix_bounded)
-                        sg_fix_high_product = pl.mul(sg_fix_a_hi, sg_fix_b_hi)
-                        sg_fix_error = pl.sub(sg_fix_high_product, sg_fix_product)
-                        sg_fix_high_low = pl.mul(sg_fix_a_hi, sg_fix_b_lo)
-                        sg_fix_error = pl.add(sg_fix_error, sg_fix_high_low)
-                        sg_fix_low_high = pl.mul(sg_fix_a_lo, sg_fix_b_hi)
-                        sg_fix_error = pl.add(sg_fix_error, sg_fix_low_high)
-                        sg_fix_low_product = pl.mul(sg_fix_a_lo, sg_fix_b_lo)
-                        sg_fix_error = pl.add(sg_fix_error, sg_fix_low_product)
-                        sg_fix_one = pl.full([ROW_HALF, MOE_INTER], dtype=pl.FP32, value=1.0)
-                        sg_fix_residual_hi = pl.sub(sg_fix_one, sg_fix_product)
-                        sg_fix_residual = pl.sub(sg_fix_residual_hi, sg_fix_error)
-                        sg_fix_correction = pl.div(sg_fix_residual, sg_fix_bounded)
-                        sg_fix_corrected = pl.add(sg_fix_estimate, sg_fix_correction)
-                        sg_fix_overflow = pl.sub(sg_fix_denominator, 4294967296.0)
-                        sg_fix_overflow = pl.mul(sg_fix_overflow, 0.001953125)
-                        sg_fix_overflow = pl.minimum(pl.maximum(sg_fix_overflow, 0.0), 1.0)
-                        sg_fix_inside = pl.sub(sg_fix_one, sg_fix_overflow)
-                        sg_fix_fixed_inside = pl.mul(sg_fix_corrected, sg_fix_inside)
-                        sg_fix_retained = pl.mul(sg_fix_original, sg_fix_overflow)
-                        sg_fix_fixed = pl.add(sg_fix_fixed_inside, sg_fix_retained)
-                        sigmoid = sg_fix_fixed
-                        h_raw = pl.mul(pl.mul(gate_f, sigmoid), up_f)
-                        # valid_shape rides the matmul's A operand through the c2v push
-                        # and the per-lane pop, so h_raw already carries this lane's
-                        # row extent; re-marking it is rejected ("cannot re-narrow a
-                        # popped tile"). Mask the tail, then re-widen so the narrowed
-                        # extent does not leave the pad rows of y undefined.
-                        h_pad = pl.fillpad(h_raw, pad_value=pl.PadValue.zero)
-                        h_f32 = pl.set_validshape(h_pad, ROW_HALF, FUSED_N_TILE)
+                        # ---- vector phase 1: dequant + SwiGLU + per-row A8 requant ----
+                        # UP_DOWN halves the shard on rows, so each lane holds ROW_HALF
+                        # COMPLETE rows and pl.row_max is a within-lane reduction.
+                        for aiv_id in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                            # A lane-derived read address is what marks the load
+                            # per-lane for the region's half-width scan. Column-sliced
+                            # in place rather than through a 1-D view of the whole
+                            # table: a 2-D -> 1-D reshape of an inline parameter loses
+                            # its inferred metadata once moe.py nests this call.
+                            lane_r0 = pl.cast(aiv_id * ROW_HALF, pl.INDEX)
+                            if inter_start == 0:
+                                h_full = pl.full([ROW_HALF, MOE_INTER], dtype=pl.FP32, value=0.0)
 
-                        h_abs = pl.maximum(h_f32, pl.neg(h_f32))
-                        h_amax = pl.maximum(
-                            pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_AMAX_EPS),
-                            pl.reshape(pl.row_max(h_abs), [1, ROW_HALF]),
-                        )
+                            x_sc = pl.reshape(
+                                recv_scale_dq[s : s + 1, lane_r0 : lane_r0 + ROW_HALF],
+                                [ROW_HALF, 1])
+                            gate_sh = pl.aiv_shard(gate_acc)
+                            up_sh = pl.aiv_shard(up_acc)
+                            gate_f = pl.create_tensor([ROW_HALF, FUSED_N_TILE], dtype=pl.FP32)
+                            gate_f = pl.cast(gate_sh, target_type=pl.FP32, mode="none")
+                            up_f = pl.cast(up_sh, target_type=pl.FP32, mode="none")
+                            gate_f = pl.col_expand_mul(pl.row_expand_mul(gate_f, x_sc), w1_sc)
+                            up_f = pl.col_expand_mul(pl.row_expand_mul(up_f, x_sc), w3_sc)
+                            if SWIGLU_LIMIT > 0.0:
+                                gate_f = pl.minimum(gate_f, SWIGLU_LIMIT)
+                                up_f = pl.maximum(pl.minimum(up_f, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                            sg_fix_exponential = rne_exp_signed(
+                                gate_f, rows=ROW_HALF, cols=FUSED_N_TILE,
+                                safe_zero=False, negate=True,
+                            )
+                            sg_fix_denominator = pl.add(sg_fix_exponential, 1.0)
+                            sg_fix_original = pl.recip(sg_fix_denominator)
+                            sg_fix_bounded = pl.minimum(sg_fix_denominator, 4294967296.0)
+                            sg_fix_estimate = sg_fix_original
+                            sg_fix_product = sg_fix_estimate
+                            sg_fix_error = sg_fix_estimate
+                            sg_fix_a_split = pl.mul(sg_fix_estimate, 4097.0)
+                            sg_fix_a_delta = pl.sub(sg_fix_a_split, sg_fix_estimate)
+                            sg_fix_a_hi = pl.sub(sg_fix_a_split, sg_fix_a_delta)
+                            sg_fix_a_lo = pl.sub(sg_fix_estimate, sg_fix_a_hi)
+                            sg_fix_b_split = pl.mul(sg_fix_bounded, 4097.0)
+                            sg_fix_b_delta = pl.sub(sg_fix_b_split, sg_fix_bounded)
+                            sg_fix_b_hi = pl.sub(sg_fix_b_split, sg_fix_b_delta)
+                            sg_fix_b_lo = pl.sub(sg_fix_bounded, sg_fix_b_hi)
+                            sg_fix_product = pl.mul(sg_fix_estimate, sg_fix_bounded)
+                            sg_fix_high_product = pl.mul(sg_fix_a_hi, sg_fix_b_hi)
+                            sg_fix_error = pl.sub(sg_fix_high_product, sg_fix_product)
+                            sg_fix_high_low = pl.mul(sg_fix_a_hi, sg_fix_b_lo)
+                            sg_fix_error = pl.add(sg_fix_error, sg_fix_high_low)
+                            sg_fix_low_high = pl.mul(sg_fix_a_lo, sg_fix_b_hi)
+                            sg_fix_error = pl.add(sg_fix_error, sg_fix_low_high)
+                            sg_fix_low_product = pl.mul(sg_fix_a_lo, sg_fix_b_lo)
+                            sg_fix_error = pl.add(sg_fix_error, sg_fix_low_product)
+                            sg_fix_one = pl.full([ROW_HALF, FUSED_N_TILE], dtype=pl.FP32, value=1.0)
+                            sg_fix_residual_hi = pl.sub(sg_fix_one, sg_fix_product)
+                            sg_fix_residual = pl.sub(sg_fix_residual_hi, sg_fix_error)
+                            sg_fix_correction = pl.div(sg_fix_residual, sg_fix_bounded)
+                            sg_fix_corrected = pl.add(sg_fix_estimate, sg_fix_correction)
+                            sg_fix_overflow = pl.sub(sg_fix_denominator, 4294967296.0)
+                            sg_fix_overflow = pl.mul(sg_fix_overflow, 0.001953125)
+                            sg_fix_overflow = pl.minimum(pl.maximum(sg_fix_overflow, 0.0), 1.0)
+                            sg_fix_inside = pl.sub(sg_fix_one, sg_fix_overflow)
+                            sg_fix_fixed_inside = pl.mul(sg_fix_corrected, sg_fix_inside)
+                            sg_fix_retained = pl.mul(sg_fix_original, sg_fix_overflow)
+                            sg_fix_fixed = pl.add(sg_fix_fixed_inside, sg_fix_retained)
+                            sigmoid = sg_fix_fixed
+                            h_raw = pl.mul(pl.mul(gate_f, sigmoid), up_f)
+                            h_full[:, inter_start : inter_start + FUSED_N_TILE] = h_raw
+
+                    # Reduce the whole shard before quantizing any column tile.
+                    for aiv_quant in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                        lane_r0 = pl.cast(aiv_quant * ROW_HALF, pl.INDEX)
+                        w_col = pl.reshape(recv_weights[s : s + 1, lane_r0 : lane_r0 + ROW_HALF], [ROW_HALF, 1])
+                        h_amax = pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                        for amax_start in pl.range(0, MOE_INTER, FUSED_N_TILE):
+                            h_amax_chunk = h_full[:, amax_start : amax_start + FUSED_N_TILE]
+                            h_abs = pl.maximum(h_amax_chunk, pl.neg(h_amax_chunk))
+                            h_chunk_max = pl.reshape(pl.row_max(h_abs), [1, ROW_HALF])
+                            h_amax = pl.maximum(h_amax, h_chunk_max)
                         qd_epb_numerator = pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_SCALE_MAX)
                         qd_epb_work = pl.mul(h_amax, 5.421010862427522e-20)
                         qd_epb_estimate = pl.div(qd_epb_numerator, qd_epb_work)
@@ -263,11 +243,15 @@ def expert_routed_persistent_planned(
                         dqfix_scale_dequant_row = pl.mul(dqfix_ef_corrected_work, 65536.0)
                         h_scale_dq = pl.reshape(dqfix_scale_dequant_row, [ROW_HALF, 1])
                         sq_col = pl.reshape(sq_row, [ROW_HALF, 1])
-                        q_scaled = pl.row_expand_mul(h_f32, sq_col)
-                        q_i32 = pl.cast(q_scaled, target_type=pl.INT32, mode="rint")
-                        q_f16 = pl.cast(q_i32, target_type=pl.FP16, mode="round")
-                        h_i8 = pl.cast(q_f16, target_type=pl.INT8, mode="trunc")
+                        h_f16 = pl.create_tensor([ROW_HALF, MOE_INTER], dtype=pl.FP16)
+                        for q_start in pl.range(0, MOE_INTER, FUSED_N_TILE):
+                            h_chunk = h_full[:, q_start : q_start + FUSED_N_TILE]
+                            q_scaled = pl.row_expand_mul(h_chunk, sq_col)
+                            q_i32 = pl.cast(q_scaled, target_type=pl.INT32, mode="rint")
+                            q_f16 = pl.cast(q_i32, target_type=pl.FP16, mode="round")
+                            h_f16[:, q_start : q_start + FUSED_N_TILE] = q_f16
 
+                        h_i8 = pl.cast(h_f16, target_type=pl.INT8, mode="trunc")
                         row_scale = pl.mul(h_scale_dq, w_col)
 
                         # V->C: the two lanes' row bands are stitched back into one
@@ -366,6 +350,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("--sim", action="store_true", default=False)
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tp", type=int, default=TP, choices=[1, 2, 4, 8], help="tensor-parallel degree; config freezes it at import")
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -387,7 +372,7 @@ if __name__ == "__main__":
         config=dict(
             dump_passes=args.dump_passes,
             backend_type=args.platform.removesuffix("sim"),
-            execution_mode=args.platform.endswith("sim"),
+            execution_mode=args.sim or args.platform.endswith("sim"),
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
