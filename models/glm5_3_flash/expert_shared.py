@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """GLM-5.3-Flash shared W8A8 SwiGLU expert and FFN branch addition."""
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -24,15 +25,18 @@ from models.glm5_3_flash.utils import pack_int8_nz, unpack_int8_nz
 
 T_DYN = pl.dynamic('GLM53_T_DYN')
 
-MOE_INTER = FLASH.moe_intermediate_size
+_shared_parser = argparse.ArgumentParser(add_help=False)
+_shared_parser.add_argument("--shared-tp", type=int, choices=(1, 2, 4, 8, 16), default=1)
+SHARED_TP = _shared_parser.parse_known_args()[0].shared_tp
+MOE_INTER = FLASH.moe_intermediate_size // SHARED_TP
 SWIGLU_LIMIT = FLASH.swiglu_limit
 SH_M_TILE = 16  # cube M-tile: matmul rows must be a multiple of 16 (fractal)
 SH_ROW_PAD = 8
 SH_ROW_TILE = 2
 K_TILE = 512  # gate/up K tile over D = 4096
 MM_INTER_TILE = 128  # gate/up N tile; 2 * MOE_INTER must be a multiple
-ACT_INTER_TILE = 256
-QUANT_TILE = 256
+ACT_INTER_TILE = min(256, MOE_INTER)
+QUANT_TILE = min(256, MOE_INTER)
 INTER_K_TILE = 128  # w2 K tile over the complete intermediate axis
 D_OUT_TILE = 256  # w2 N tile over D
 D_ACT_TILE = 512
@@ -283,7 +287,6 @@ def build_tensor_specs(num_tokens=T_DYN_TEST):
 
 
 if __name__ == "__main__":
-    import argparse
 
     from golden import ratio_reldiff, run
 
@@ -292,9 +295,17 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T_DYN_TEST)
+    parser.add_argument("--tp", type=int, default=16)
+    parser.add_argument("--ep", type=int, default=16)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--shared-tp", type=int, choices=(1, 2, 4, 8, 16), default=SHARED_TP)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    if args.num_tokens < 1:
+        parser.error("--num-tokens must be positive")
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
 
     result = run(
         fn=expert_shared_test,

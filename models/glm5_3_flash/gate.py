@@ -327,10 +327,10 @@ def compare_route_weights(actual, expected, *, actual_outputs, expected_outputs,
     )
 
 
-def build_tensor_specs(num_tokens=T_DYN_TEST):
+def build_tensor_specs(num_tokens=T_DYN_TEST, seed=533):
     from golden import ScalarSpec, TensorSpec
 
-    generator = torch.Generator().manual_seed(533)
+    generator = torch.Generator().manual_seed(seed)
 
     def init_x():
         return torch.randn(num_tokens, D, dtype=torch.bfloat16, generator=generator)
@@ -367,13 +367,18 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T_DYN_TEST)
+    parser.add_argument("--tp", type=int, default=16)
+    parser.add_argument("--ep", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=533)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    if args.num_tokens < 1:
+        parser.error("--num-tokens must be positive")
 
     result = run(
         fn=moe_gate_test,
-        specs=build_tensor_specs(args.num_tokens),
+        specs=build_tensor_specs(args.num_tokens, args.seed),
         golden_fn=golden_moe_gate,
         config=dict(dump_passes=args.dump_passes, backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane),
         rtol=0.001,

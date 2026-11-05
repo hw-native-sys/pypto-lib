@@ -21,7 +21,8 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import (
-    BLOCK_SIZE, FLASH, KV_LORA, LOCAL_H, Q_LORA, QK_DIM, TOPK_INDEX_WIDTH, TP_SIZE, V_DIM, D,
+    BLOCK_SIZE, EP_SIZE, FLASH, INDEX_KPOOL, KPOOL_SELECT_K, KV_LORA, LOCAL_H, Q_LORA, QK_DIM,
+    TOPK_INDEX_WIDTH, TP_SIZE, V_DIM, D,
     Glm53FlashConfig,
 )
 from models.glm5_3_flash.elementwise import accurate_divide, accurate_exp, accurate_row_sum_parts
@@ -760,7 +761,7 @@ def output_run_native_case(options):
 
     @lru_cache(maxsize=1)
     def inputs():
-        generator = torch.Generator().manual_seed(5358)
+        generator = torch.Generator().manual_seed(5358 if options.seed is None else options.seed)
         hidden = component_hidden(options, LOCAL_H * V_DIM, generator)
         values = {"attn_out": hidden.reshape(options.tokens, LOCAL_H, V_DIM)}
         if options.checkpoint is not None:
@@ -928,7 +929,7 @@ def projection_run_native_case(options):
 
     @lru_cache(maxsize=1)
     def inputs():
-        generator = torch.Generator().manual_seed(5356)
+        generator = torch.Generator().manual_seed(5356 if options.seed is None else options.seed)
         values = {"x": component_hidden(options, D, generator)}
         if options.checkpoint is not None:
             values.update(Checkpoint(options.checkpoint).attention(options.layer, tp=TP_SIZE, mla_mode="native"))
@@ -1211,7 +1212,42 @@ def _golden_prefill_sparse_attn_impl(
     return output
 
 
-def build_prefill_sparse_attn_specs(requests: int = 2, rows: int = 6, pages_per_request: int = 4):
+def _sparse_fixture_pages(requests, rows, pages, history_tokens, selection):
+    if requests < 1 or rows < 1:
+        raise ValueError("requests and query rows must be positive")
+    if selection == "pool4-causal":
+        if history_tokens is None or history_tokens < 0:
+            raise ValueError("pool4-causal selection requires a nonnegative history length in tokens")
+        required = (history_tokens + rows + BLOCK_SIZE - 1) // BLOCK_SIZE
+        if pages is not None and pages < required:
+            raise ValueError("the page table cannot hold the history and query rows")
+        return required if pages is None else pages
+    if selection != "ragged" or history_tokens is not None:
+        raise ValueError("history tokens are supported only with pool4-causal selection")
+    pages = 4 if pages is None else pages
+    if pages < 1:
+        raise ValueError("pages per request must be positive")
+    return pages
+
+
+def _causal_pool_indices(requests, rows, history_tokens, generator):
+    indices = torch.full((requests * rows, TOPK_INDEX_WIDTH), -1, dtype=torch.int32)
+    members = torch.arange(INDEX_KPOOL)
+    for token in range(requests * rows):
+        visible = history_tokens + token % rows + 1
+        complete_pools = visible // INDEX_KPOOL
+        pools = torch.randperm(complete_pools, generator=generator)[:KPOOL_SELECT_K]
+        history = (pools[:, None] * INDEX_KPOOL + members).flatten()
+        tail = torch.arange(complete_pools * INDEX_KPOOL, visible)
+        selected = torch.cat((history, tail)).to(torch.int32)
+        indices[token, :selected.numel()] = selected
+    return indices
+
+
+def build_prefill_sparse_attn_specs(
+    requests: int = 2, rows: int = 6, pages_per_request: int | None = None, *,
+    history_tokens: int | None = None, selection: str = "ragged", seed: int | None = None,
+):
     """Build one deterministic prefill selection with ragged per-token counts.
 
     The counts ramp past ``ATTN_K_TILE`` so rows span one to four sparse blocks, which
@@ -1226,7 +1262,8 @@ def build_prefill_sparse_attn_specs(requests: int = 2, rows: int = 6, pages_per_
     """
     from golden import TensorSpec
 
-    generator = torch.Generator().manual_seed(89)
+    pages_per_request = _sparse_fixture_pages(requests, rows, pages_per_request, history_tokens, selection)
+    generator = torch.Generator().manual_seed(89 if seed is None else seed)
     tokens = requests * rows
     cache_rows = requests * pages_per_request * BLOCK_SIZE
     visible = pages_per_request * BLOCK_SIZE
@@ -1251,11 +1288,13 @@ def build_prefill_sparse_attn_specs(requests: int = 2, rows: int = 6, pages_per_
         return (torch.arange(tokens, dtype=torch.int32) // rows).to(torch.int32)
 
     def init_indices():
+        if selection == "pool4-causal":
+            return _causal_pool_indices(requests, rows, history_tokens, generator)
         indices = torch.full((tokens, TOPK_INDEX_WIDTH), -1, dtype=torch.int32)
         for token in range(tokens):
             if token == rows:
                 continue
-            count = min(37 + 113 * (token % rows), visible - 1)
+            count = min(37 + 113 * (token % rows), visible - 1, TOPK_INDEX_WIDTH)
             chosen = torch.randperm(visible - 1, generator=generator)[: count - 1]
             selected = torch.cat([chosen, torch.tensor([visible - 1])]).to(torch.int32)
             indices[token, : selected.numel()] = selected
@@ -1533,7 +1572,10 @@ def golden_decode_sparse_attn(
     return output
 
 
-def build_decode_sparse_attn_specs(requests: int = 2, pages_per_request: int = 4):
+def build_decode_sparse_attn_specs(
+    requests: int = 2, pages_per_request: int | None = None, *, query_len: int = DECODE_ROWS_PER_REQUEST,
+    history_tokens: int | None = None, selection: str = "ragged", seed: int | None = None,
+):
     """Build one deterministic selection: ragged valid counts, padded tails.
 
     Live rows select different numbers of positions and keep their own tail, as
@@ -1547,8 +1589,9 @@ def build_decode_sparse_attn_specs(requests: int = 2, pages_per_request: int = 4
     """
     from golden import TensorSpec
 
-    generator = torch.Generator().manual_seed(83)
-    tokens = requests * DECODE_ROWS_PER_REQUEST
+    pages_per_request = _sparse_fixture_pages(requests, query_len, pages_per_request, history_tokens, selection)
+    generator = torch.Generator().manual_seed(83 if seed is None else seed)
+    tokens = requests * query_len
     cache_rows = requests * pages_per_request * BLOCK_SIZE
     visible = pages_per_request * BLOCK_SIZE
 
@@ -1563,14 +1606,16 @@ def build_decode_sparse_attn_specs(requests: int = 2, pages_per_request: int = 4
         return pages.reshape(requests, pages_per_request).to(torch.int32)
 
     def init_request_ids():
-        return torch.arange(tokens, dtype=torch.int32) // DECODE_ROWS_PER_REQUEST
+        return torch.arange(tokens, dtype=torch.int32) // query_len
 
     def init_indices():
+        if selection == "pool4-causal":
+            return _causal_pool_indices(requests, query_len, history_tokens, generator)
         indices = torch.full((tokens, TOPK_INDEX_WIDTH), -1, dtype=torch.int32)
         for token in range(tokens):
             if token == tokens - 1:
                 continue
-            count = min(37 + 61 * token, visible - 1)
+            count = min(37 + 61 * token, visible - 1, TOPK_INDEX_WIDTH)
             chosen = torch.randperm(visible - 1, generator=generator)[: count - 1]
             selected = torch.cat([chosen, torch.tensor([visible - 1])]).to(torch.int32)
             indices[token, : selected.numel()] = selected
@@ -1642,6 +1687,9 @@ def run_output_case(argv=None):
     run_mla_epilog_goldens()
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
@@ -1706,6 +1754,9 @@ def run_projection_case(argv=None):
     run_mla_prolog_goldens(golden_mla_prolog, golden_split_kv_b, golden_absorb_query, golden_absorb_output)
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
@@ -1768,18 +1819,26 @@ def run_prefill_case(argv=None):
     run_prefill_sparse_attn_golden(golden_prefill_sparse_attn, _golden_prefill_sparse_attn_impl)
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument("--rows", type=int, default=6)
-    parser.add_argument("--pages", type=int, default=4)
+    parser.add_argument("--pages", type=int)
+    parser.add_argument("--history-tokens", type=int)
+    parser.add_argument("--selection", choices=["ragged", "pool4-causal"], default="ragged")
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args(argv)
 
     result = run(
         fn=prefill_sparse_attn_test,
-        specs=build_prefill_sparse_attn_specs(args.requests, args.rows, args.pages),
+        specs=build_prefill_sparse_attn_specs(
+            args.requests, args.rows, args.pages, history_tokens=args.history_tokens,
+            selection=args.selection, seed=args.seed,
+        ),
         golden_fn=golden_prefill_sparse_attn_case,
         config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
         rtol=1.0 / 32,
@@ -1840,17 +1899,26 @@ def run_decode_case(argv=None):
     run_decode_sparse_attn_golden(_golden_decode_sparse_attn_math, golden_decode_sparse_attn)
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--requests", type=int, default=2)
-    parser.add_argument("--pages", type=int, default=4)
+    parser.add_argument("--query-len", type=int, default=DECODE_ROWS_PER_REQUEST)
+    parser.add_argument("--pages", type=int)
+    parser.add_argument("--history-tokens", type=int)
+    parser.add_argument("--selection", choices=["ragged", "pool4-causal"], default="ragged")
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args(argv)
 
     result = run(
         fn=decode_sparse_attn_test,
-        specs=build_decode_sparse_attn_specs(args.requests, args.pages),
+        specs=build_decode_sparse_attn_specs(
+            args.requests, args.pages, query_len=args.query_len, history_tokens=args.history_tokens,
+            selection=args.selection, seed=args.seed,
+        ),
         golden_fn=golden_decode_sparse_attn_case,
         config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
         rtol=1.0 / 64,
