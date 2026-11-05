@@ -42,7 +42,7 @@ TABLE_DYN = pl.dynamic("GLM53_TABLE_DYN")
 T_DYN = pl.dynamic("GLM53_T_DYN")
 
 OUTPUT_MM_T_TILE = 16  # cube M tile; rows are a 16-row boxed tile
-O_N_TILE = 256  # o_proj output-column tile over D
+O_N_TILE = 128  # o_proj output-column tile over D
 
 PROJECTION_MM_T_TILE = 16  # cube M tile; rows are a 16-row boxed tile
 QA_N_TILE = 128  # q_a_proj output-column tile
