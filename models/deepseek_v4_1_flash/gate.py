@@ -35,6 +35,7 @@ N_HASH_LAYERS = 0
 # tiling
 GATE_T_TILE = 8
 GATE_INPUT_TILE = 8
+GATE_CAST_TILE = 4
 GATE_NORM_TILE = 2
 assert T % GATE_T_TILE == 0
 GATE_M_TILE = 16
@@ -229,6 +230,18 @@ def gate_from_bf16(
     with pl.spmd((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), name_hint="x_norm_mx_quant"):
         x_norm_mx, x_norm_scale = _gate_quant_vf(xg_buf, x_norm_mx, x_norm_scale)
 
+    router_input = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
+    router_weight = pl.create_tensor([n_experts, D], dtype=pl.FP32)
+    for block in pl.spmd(T_PAD // GATE_CAST_TILE, name_hint="gate_projection_input"):
+        row = block * GATE_CAST_TILE
+        input_value = pl.load(xg_buf, [row, 0], [GATE_CAST_TILE, D])
+        router_input = pl.store(pl.cast(input_value, pl.FP32), [row, 0], router_input)
+    for block in pl.spmd((n_experts + GATE_CAST_TILE - 1) // GATE_CAST_TILE, name_hint="gate_projection_weight"):
+        row = block * GATE_CAST_TILE
+        valid_rows = pl.min(GATE_CAST_TILE, n_experts - row)
+        weight_value = pl.load(gate_w, [row, 0], [GATE_CAST_TILE, D], valid_shape=[valid_rows, D])
+        router_weight = pl.store(pl.cast(weight_value, pl.FP32), [row, 0], router_weight)
+
     biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     with pl.spmd(1, name_hint="gate_pre_route"):
         indices, weights, biased_scores_buf = _gate_pre_route_vf(
@@ -243,7 +256,7 @@ def gate_from_bf16(
     gate_workers = pl.max(1, pl.min(gate_tasks, gate_worker_limit))
     with pl.spmd(gate_workers, name_hint="gate", sync_start=True):
         route_scores_buf, biased_scores_buf = _gate_scores_vf(
-            xg_buf, gate_w, gate_bias, route_scores_buf, biased_scores_buf, gate_tasks,
+            router_input, router_weight, gate_bias, route_scores_buf, biased_scores_buf, gate_tasks,
         )
 
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
