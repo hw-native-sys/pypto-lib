@@ -20,7 +20,7 @@ import torch
 import models.glm5_3_flash.config as C
 import models.glm5_3_flash.config as V
 from models.glm5_3_flash.config import (
-    BLOCK_SIZE, DENSE_INTER, FLASH, INDEX_DIM, INDEX_KPOOL, INDEX_STATE_BLOCK_SIZE, KV_LORA, N_EXPERTS,
+    BLOCK_SIZE, DENSE_INTER, FLASH, INDEX_KPOOL, INDEX_STATE_BLOCK_SIZE, KV_LORA, N_EXPERTS,
     N_LOCAL_EXPERTS, QK_DIM, SUPPORTED_EP_SIZES, SUPPORTED_TP_SIZES, TP_SIZE, V_DIM, D, Glm53FlashConfig,
 )
 
@@ -248,6 +248,8 @@ def build_indexer_chunk_metadata(
     pools_cap: int,
     pool_rows: int,
     pool_block_table: torch.Tensor | None = None,
+    tail_ring_capacity: int = 0,
+    events_cap: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Lower one chunk against persistent raw and pooled indexer caches.
 
@@ -257,7 +259,7 @@ def build_indexer_chunk_metadata(
     expanded attention indices remain absolute positions within each request.
     Empty requests produce no events, and padded events target the scratch row.
     """
-    if pools_cap <= 0 or (pool_block_table is None and pool_rows < pools_cap * INDEX_STATE_BLOCK_SIZE):
+    if pools_cap <= 0 or (pool_block_table is None and pool_rows < pools_cap):
         raise ValueError("indexer pool storage must cover the identity pool-block gather")
     device = metadata.query_start_loc.device
     old_lengths = metadata.kv_seq_lens.to(device=device, dtype=torch.int64)
@@ -274,15 +276,16 @@ def build_indexer_chunk_metadata(
     prior_pools = torch.div(old_lengths, INDEX_KPOOL, rounding_mode="floor")
     new_pools = torch.div(new_lengths, INDEX_KPOOL, rounding_mode="floor")
     event_counts = new_pools - prior_pools
-    if int(event_counts.sum().item()) > pools_cap:
+    event_capacity = pools_cap if events_cap is None else events_cap
+    if int(event_counts.sum().item()) > event_capacity:
         raise ValueError("indexer pool-close events exceed the compiled event capacity")
     active_requests = new_lengths > old_lengths
     invalid_windows = (offsets < 0) | (offsets + new_pools > pools_cap)
     if bool((active_requests & invalid_windows).any()):
         raise ValueError("indexer request pool segment exceeds the compiled score width")
 
-    members = torch.full((pools_cap, INDEX_KPOOL), -1, dtype=torch.int32, device=device)
-    destinations = torch.full((pools_cap,), pool_rows - 1, dtype=torch.int32, device=device)
+    members = torch.full((event_capacity, INDEX_KPOOL), -1, dtype=torch.int32, device=device)
+    destinations = torch.full((event_capacity,), pool_rows - 1, dtype=torch.int32, device=device)
     raw_table = index_block_table.to(device=device, dtype=torch.int64)
     lanes = torch.arange(INDEX_KPOOL, dtype=torch.int64, device=device)
     event = 0
@@ -299,6 +302,10 @@ def build_indexer_chunk_metadata(
         if bool((pages < 0).any()):
             raise ValueError("indexer pool-close event references an unallocated raw page")
         rows = pages * BLOCK_SIZE + positions.remainder(BLOCK_SIZE)
+        if tail_ring_capacity:
+            prior_rows = request * tail_ring_capacity + positions.remainder(tail_ring_capacity)
+            current_rows = requests * tail_ring_capacity + metadata.query_start_loc[request] + positions - old_lengths[request]
+            rows = torch.where(positions < old_lengths[request], prior_rows, current_rows)
         members[event : event + count] = rows.to(torch.int32)
         if pool_block_table is None:
             destinations[event : event + count] = (offsets[request] + pools).to(torch.int32)
@@ -323,7 +330,8 @@ def build_indexer_chunk_metadata(
     visible = torch.div(length_through, INDEX_KPOOL, rounding_mode="floor")
     visible = torch.where(valid, torch.minimum(visible, new_pools[safe_requests]), torch.zeros_like(visible))
     segments = torch.where(valid, offsets[safe_requests], torch.zeros_like(positions))
-    pool_blocks = torch.arange(pools_cap, dtype=torch.int32, device=device) * INDEX_STATE_BLOCK_SIZE
+    page_capacity = (pools_cap + INDEX_STATE_BLOCK_SIZE - 1) // INDEX_STATE_BLOCK_SIZE
+    pool_blocks = torch.arange(page_capacity, dtype=torch.int32, device=device) * INDEX_STATE_BLOCK_SIZE
     if pool_block_table is not None:
         scratch_base = pool_rows - INDEX_STATE_BLOCK_SIZE
         pool_blocks.fill_(scratch_base)
@@ -334,7 +342,13 @@ def build_indexer_chunk_metadata(
             if (sources < 0).any() or (sources + INDEX_STATE_BLOCK_SIZE > scratch_base).any():
                 raise ValueError("pooled page lies outside shared cache storage")
             pool_blocks[begin : begin + pages] = sources
+    tail_slots = torch.full_like(metadata.request_ids, -1)
+    if tail_ring_capacity:
+        retained = valid & (positions >= new_lengths[safe_requests] - tail_ring_capacity)
+        rows = safe_requests * tail_ring_capacity + positions.remainder(tail_ring_capacity)
+        tail_slots[retained] = rows[retained].to(torch.int32)
     return {
+        "index_tail_slots": tail_slots,
         "seg_start": segments.to(torch.int32),
         "pool_count_tok": visible.to(torch.int32),
         "tail_start": (length_through - tails).to(torch.int32),
@@ -488,14 +502,6 @@ def unpack_int8_nz(packed: torch.Tensor) -> torch.Tensor:
         raise ValueError("INT8 NZ weights require 16-row fractals and 32-element C0 lines")
     blocks = packed.reshape(-1, cols // _NZ_INT8_C0, rows // _NZ_ROWS, _NZ_ROWS, _NZ_INT8_C0)
     return blocks.permute(0, 2, 3, 1, 4).contiguous().reshape(packed.shape)
-
-
-def sylvester_hadamard(head_dim: int = INDEX_DIM) -> torch.Tensor:
-    """Build the scaled Sylvester Hadamard for indexer projection and pooling."""
-    matrix = torch.ones((1, 1))
-    while matrix.shape[0] < head_dim:
-        matrix = torch.cat([torch.cat([matrix, matrix], dim=1), torch.cat([matrix, -matrix], dim=1)], dim=0)
-    return (matrix * (head_dim**-0.5)).to(torch.bfloat16)
 
 
 def gen_routed_weight(shape, dequant_std, chunk_experts=16):
@@ -923,13 +929,20 @@ def shard_routed_experts(
 def load_shared_expert(
     tensors: Mapping[str, torch.Tensor],
     layer_id: int,
+    *,
+    tp_rank: int = 0,
+    tp_size: int = 1,
 ) -> FfnShard:
-    """Load the complete shared expert replicated on every EP rank."""
+    """Load this TP rank's shared-expert intermediate channels."""
+    if tp_size not in SUPPORTED_TP_SIZES or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"invalid shared-expert TP rank {tp_rank}/{tp_size}")
     prefixes = layer_prefixes(layer_id)
     intermediate = FLASH.moe_intermediate_size
+    width = intermediate // tp_size
+    channels = slice(tp_rank * width, (tp_rank + 1) * width)
     (gate_up, gate_up_scale, down, down_scale) = _fused_ffn(
         tensors, prefixes, ("shared_fused", "shared_fused_down", "shared_gate", "shared_up", "shared_down"),
-        intermediate=intermediate,
+        intermediate=intermediate, channels=channels,
     )
     return FfnShard(gate_up, gate_up_scale, down, down_scale)
 
@@ -1344,7 +1357,7 @@ class Checkpoint(Mapping[str, torch.Tensor]):
         ep_rank: int = 0,
         ep: int = 16,
     ) -> dict[str, torch.Tensor]:
-        """Load dense TP channels or complete EP experts with a replicated shared FFN."""
+        """Load dense/shared TP channels and complete EP expert shards."""
         norm = self._float(self.layer_key(layer, "post_attention_layernorm.weight"), (D,))
         if layer < FLASH.first_k_dense_replace:
             return {"norm_weight": norm, **self._ffn_dict(shard_dense_mlp(self, layer, tp_rank, tp))}
@@ -1353,7 +1366,7 @@ class Checkpoint(Mapping[str, torch.Tensor]):
             self, layer, ep_rank, ep, local_experts=experts.stop - experts.start,
             global_experts=FLASH.n_routed_experts,
         )
-        shared = self._ffn_dict(load_shared_expert(self, layer))
+        shared = self._ffn_dict(load_shared_expert(self, layer, tp_rank=tp_rank, tp_size=tp))
         router = layer_router(self, layer)
         return {
             "norm_weight": norm,
@@ -1474,7 +1487,6 @@ class Checkpoint(Mapping[str, torch.Tensor]):
             ("compress_ape", "index_kpool_compress_ape", (FLASH.index_kpool, width)),
         )
         out.update({name: self._float(prefix + key, shape) for name, key, shape in vectors})
-        out["hadamard"] = sylvester_hadamard(width)
         return out
 
     def layer(

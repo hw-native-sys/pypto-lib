@@ -83,13 +83,17 @@ def dense_mlp(
             row0 = row_block * DN_ROW_TILE
             blk_rows = pl.min(pl.cast(DN_ROW_TILE, pl.INDEX), valid_rows - row0)
             x_scale_blk = pl.slice(x_scale, [DN_ROW_PAD, 1], [ts0 + row0, 0], valid_shape=[blk_rows, 1])
-            row_amax = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            row_amax = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=0.0)
             for part in pl.pipeline(LOCAL_DENSE_INTER // ACT_INTER_TILE, stage=1):
                 n0 = part * ACT_INTER_TILE
                 gate_chunk_i32 = pl.slice(gate_up_i32, [DN_ROW_PAD, ACT_INTER_TILE], [row0, n0], valid_shape=[DN_ROW_TILE, ACT_INTER_TILE])
                 up_chunk_i32 = pl.slice(gate_up_i32, [DN_ROW_PAD, ACT_INTER_TILE], [row0, LOCAL_DENSE_INTER + n0], valid_shape=[DN_ROW_TILE, ACT_INTER_TILE])
                 gate_w_scale = pl.reshape(w_gate_up_scale[n0 : n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
                 up_w_scale = pl.reshape(w_gate_up_scale[LOCAL_DENSE_INTER + n0:LOCAL_DENSE_INTER + n0 + ACT_INTER_TILE], [1, ACT_INTER_TILE])
+                gate_w_bf16 = pl.cast(gate_w_scale, pl.BF16, mode="rint")
+                up_w_bf16 = pl.cast(up_w_scale, pl.BF16, mode="rint")
+                gate_w_scale = pl.cast(gate_w_bf16, pl.FP32)
+                up_w_scale = pl.cast(up_w_bf16, pl.FP32)
                 gate_fp32 = pl.cast(gate_chunk_i32, target_type=pl.FP32, mode="none")
                 up_fp32 = pl.cast(up_chunk_i32, target_type=pl.FP32, mode="none")
                 gate_fp32 = pl.col_expand_mul(pl.row_expand_mul(gate_fp32, x_scale_blk), gate_w_scale)
@@ -107,25 +111,24 @@ def dense_mlp(
                 denominator = pl.create_tensor([DN_ROW_PAD, ACT_INTER_TILE], dtype=pl.FP32)
                 denominator[:, :] = pl.add(exponential, 1.0)
                 silu_value = accurate_divide(gate_buffer, denominator)
-                silu = pl.cast(silu_value, pl.BF16, mode="rint")
-                product = pl.mul(pl.cast(silu, pl.FP32), up_fp32)
+                product = pl.mul(silu_value, up_fp32)
                 gated = pl.cast(pl.cast(product, pl.BF16, mode="rint"), pl.FP32)
                 gated = pl.set_validshape(gated, DN_ROW_TILE, ACT_INTER_TILE)
                 chunk_amax = pl.reshape(pl.row_max(pl.abs(gated)), [1, DN_ROW_PAD])
                 row_amax = pl.maximum(row_amax, chunk_amax)
                 h_fp32[row0:row0 + DN_ROW_TILE, n0:n0 + ACT_INTER_TILE] = gated[0:DN_ROW_TILE, :]
             amax_buffer = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
-            numerator = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
-            amax_buffer[:, :] = row_amax
-            numerator[:, :] = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
+            zero_rows = pl.cmp(row_amax, 0.0, cmp_type=0)
+            amax_buffer[:, :] = pl.add(row_amax, zero_rows)
             row_scale_q_buffer = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
-            quantization_scale = accurate_divide(numerator, amax_buffer)
+            one = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
+            one[:, :] = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=1.0)
+            inverse_maximum = accurate_divide(one, amax_buffer)
+            quantization_scale = pl.mul(inverse_maximum, INT8_SCALE_MAX)
             row_scale_q_buffer[:, :] = quantization_scale
             row_scale_q = row_scale_q_buffer
             row_scale_q_col = pl.reshape(row_scale_q, [DN_ROW_PAD, 1])
-            one_buffer = pl.create_tensor([1, DN_ROW_PAD], dtype=pl.FP32)
-            one_buffer[:, :] = pl.full([1, DN_ROW_PAD], dtype=pl.FP32, value=1.0)
-            dequant = accurate_divide(one_buffer, row_scale_q_buffer)
+            dequant = pl.mul(row_amax, 1.0 / INT8_SCALE_MAX)
             row_scale_dq_col = pl.reshape(dequant, [DN_ROW_PAD, 1])
             row_scale_dq_full = pl.full([DN_ROW_PAD, DN_ROW_PAD], dtype=pl.FP32, value=0.0)
             row_scale_dq = pl.row_expand(row_scale_dq_full, row_scale_dq_col)
@@ -158,6 +161,8 @@ def dense_mlp(
                 d0 = d_base + dg * D_ACT_TILE
                 y_2d_i32 = y_i32[:, d0 : d0 + D_ACT_TILE]
                 w2_scale_chunk = pl.reshape(w_down_scale[d0 : d0 + D_ACT_TILE], [1, D_ACT_TILE])
+                w2_scale_bf16 = pl.cast(w2_scale_chunk, pl.BF16, mode="rint")
+                w2_scale_chunk = pl.cast(w2_scale_bf16, pl.FP32)
                 y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                 y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk)
                 y_2d = pl.cast(pl.cast(y_2d, pl.BF16, mode="rint"), pl.FP32)
@@ -208,8 +213,7 @@ def dense_mlp_bf16(
         denominator = pl.create_tensor([BF16_ACT_M_TILE, BF16_N_TILE], dtype=pl.FP32)
         denominator[:, :] = pl.add(exponential, 1.0)
         silu_value = accurate_divide(gate_buffer, denominator)
-        silu = pl.cast(silu_value, pl.BF16, mode="rint")
-        product = pl.mul(pl.cast(silu, pl.FP32), up)
+        product = pl.mul(silu_value, up)
         product_bf16 = pl.cast(product, pl.BF16, mode="rint")
         activated[t0:t0 + BF16_ACT_M_TILE, n0:n0 + BF16_N_TILE] = pl.set_validshape(product_bf16, rows, BF16_N_TILE)
 
@@ -263,9 +267,9 @@ def golden_dense_mlp_fn(tensors):
     x_int8 = tensors["x_int8"].to(torch.int32)
     x_scale = tensors["x_scale"].float()
     gate_up_i8 = tensors["w_gate_up"].to(torch.int32)
-    gate_up_scale = tensors["w_gate_up_scale"].float()
+    gate_up_scale = tensors["w_gate_up_scale"].bfloat16().float()
     w_down_i8 = tensors["w_down"].to(torch.int32)
-    w_down_scale = tensors["w_down_scale"].float()
+    w_down_scale = tensors["w_down_scale"].bfloat16().float()
 
     local = LOCAL_DENSE_INTER
     gate_i = x_int8 @ gate_up_i8[:local].T
@@ -277,7 +281,7 @@ def golden_dense_mlp_fn(tensors):
     if SWIGLU_LIMIT > 0:
         gate_v = gate_v.clamp(max=SWIGLU_LIMIT)
         up_v = up_v.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-    silu = (gate_v.double() / (1.0 + torch.exp(-gate_v.double()).float()).double()).float().bfloat16().float()
+    silu = (gate_v.double() / (1.0 + torch.exp(-gate_v.double()).float()).double()).float()
     h = (silu * up_v).bfloat16()
     h_i8, h_sd = quantize_per_token_int8(h)
     out_i = h_i8.to(torch.int32) @ w_down_i8.T
@@ -305,7 +309,7 @@ def golden_dense_mlp_bf16(x: torch.Tensor, w_gate_up: torch.Tensor, w_down: torc
     if SWIGLU_LIMIT > 0:
         gate = gate.clamp(max=SWIGLU_LIMIT)
         up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-    silu = (gate.double() / (1.0 + torch.exp(-gate.double()).float()).double()).float().bfloat16().float()
+    silu = (gate.double() / (1.0 + torch.exp(-gate.double()).float()).double()).float()
     activated = (silu * up).bfloat16()
     return golden_bf16_linear(activated, w_down).bfloat16()
 
@@ -439,7 +443,7 @@ def _test_dense_mlp(model: Glm53FlashConfig) -> None:
     print("  dense MLP: manual equivalence, SwiGLU clamp")
 
 
-if __name__ == "__main__":
+def main():
     import argparse
 
     from golden import ratio_allclose, ratio_reldiff, run
@@ -478,7 +482,7 @@ if __name__ == "__main__":
             print(result)
             if not result.passed:
                 raise SystemExit(result.error or 1)
-        raise SystemExit(0)
+        return
 
     cases = {"single": 1, "ragged": 17, "aligned": 16}
     selected = (args.case,) if args.case != "all" else tuple(cases)
@@ -498,3 +502,7 @@ if __name__ == "__main__":
             if result.error:
                 print(result.error)
             raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

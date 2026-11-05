@@ -647,7 +647,7 @@
       ]
     },
     {
-      "case_id": "glm5.3-flash-a3-v1-lm-head-fp32-t192-tp16",
+      "case_id": "glm5.3-flash-a3-v1-lm-head-logits-t192-tp16",
       "suite": "glm5.3-flash",
       "reference_profile": "glm5.3-flash-a3-v1",
       "entrypoint": "models/glm5_3_flash/lm_head.py",
@@ -661,7 +661,7 @@
         "--seed",
         "1024",
         "--case",
-        "fp32",
+        "logits",
         "--tokens",
         "192",
         "--shard",

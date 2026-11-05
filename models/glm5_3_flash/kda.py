@@ -36,6 +36,7 @@ from models.glm5_3_flash.utils import _assert_close, _randn
 B_DYN = pl.dynamic("GLM53_B_DYN")
 KDA_STATE_DYN = pl.dynamic("GLM53_KDA_STATE_DYN")
 KDA_METADATA_DYN = pl.dynamic("GLM53_KDA_METADATA_DYN")
+KDA_LAYERS_DYN = pl.dynamic("GLM53_KDA_LAYERS_DYN")
 Q_START_DYN = pl.dynamic("GLM53_Q_START_DYN")
 T_DYN = pl.dynamic("GLM53_T_DYN")
 
@@ -256,6 +257,78 @@ def kda_conv_prefill(
 
 
 @pl.jit.inline
+def kda_conv_recurrent(
+    mixed_qkv: pl.Tensor[[T_DYN, CONV_DIM], pl.BF16],
+    weight: pl.Tensor[[KDA_CONV_K, CONV_DIM], pl.BF16],
+    conv_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, STATE_LEN, CONV_DIM], pl.BF16]],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
+    query: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    key: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    value: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+):
+    """Four-tap causal convolution with per-query snapshots for speculative verification."""
+    t_dim = pl.tensor.dim(mixed_qkv, 0)
+    cs2 = pl.reshape(conv_state, [pl.tensor.dim(conv_state, 0) * STATE_LEN, CONV_DIM])
+    v_flat = pl.reshape(value, [t_dim, LOCAL_KDA_QKV_DIM])
+    k_flat = pl.reshape(key, [t_dim, LOCAL_KDA_QKV_DIM])
+    q_flat = pl.reshape(query, [t_dim, LOCAL_KDA_QKV_DIM])
+    requests = pl.tensor.dim(query_start_loc, 0) - 1
+    with pl.spmd(requests * (CONV_DIM // DECODE_C_TILE), name_hint="kda_conv_recurrent"):
+        task = pl.tile.get_block_idx()
+        lanes = CONV_DIM // DECODE_C_TILE
+        request = task // lanes
+        c0 = task % lanes * DECODE_C_TILE
+        begin = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+        end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+        for t in pl.range(begin, end):
+            step = t - begin
+            source_col = pl.min(step, 1) * (step + 1)
+            row = pl.cast(pl.read(state_rows, [request, source_col]), pl.INDEX)
+            if row < 0:
+                row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+            destination = pl.cast(pl.read(state_rows, [request, step + 2]), pl.INDEX)
+            if destination < 0:
+                destination = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+            drow = destination * STATE_LEN
+            srow = row * STATE_LEN
+            st0 = pl.cast(cs2[srow + 0:srow + 0 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
+            st1 = pl.cast(cs2[srow + 1:srow + 1 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
+            st2 = pl.cast(cs2[srow + 2:srow + 2 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
+            xt = pl.cast(mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
+            acc_fp32 = pl.cast(weight[0:1, c0 : c0 + DECODE_C_TILE], pl.FP32)
+            acc_mul = pl.mul(st0, acc_fp32)
+            acc_fp32_2 = pl.cast(weight[1:2, c0 : c0 + DECODE_C_TILE], pl.FP32)
+            acc_mul_2 = pl.mul(st1, acc_fp32_2)
+            acc_add = pl.add(acc_mul, acc_mul_2)
+            acc_fp32_3 = pl.cast(weight[2:3, c0 : c0 + DECODE_C_TILE], pl.FP32)
+            acc_mul_3 = pl.mul(st2, acc_fp32_3)
+            acc_fp32_4 = pl.cast(weight[3:4, c0 : c0 + DECODE_C_TILE], pl.FP32)
+            acc_mul_4 = pl.mul(xt, acc_fp32_4)
+            acc_add_2 = pl.add(acc_add, acc_mul_3)
+            acc = pl.add(acc_add_2, acc_mul_4)
+            activation_arg_activated = pl.create_tensor([1, DECODE_C_TILE], dtype=pl.FP32)
+            activation_arg_activated[:, :] = acc
+            activated = accurate_silu(activation_arg_activated, 1, DECODE_C_TILE)
+            out_tile = pl.cast(activated, pl.BF16, mode="rint")
+            if c0 < LOCAL_KDA_QKV_DIM:
+                q_flat[t : t + 1, c0 : c0 + DECODE_C_TILE] = out_tile
+            elif c0 < 2 * LOCAL_KDA_QKV_DIM:
+                k_flat[t : t + 1, c0 - LOCAL_KDA_QKV_DIM : c0 - LOCAL_KDA_QKV_DIM + DECODE_C_TILE] = out_tile
+            else:
+                v_flat[t:t + 1, c0 - 2 * LOCAL_KDA_QKV_DIM:c0 - 2 * LOCAL_KDA_QKV_DIM + DECODE_C_TILE] = out_tile
+            cs2[drow : drow + 1, c0 : c0 + DECODE_C_TILE] = pl.cast(st1, pl.BF16, mode="rint")
+            cs2[drow + 1 : drow + 2, c0 : c0 + DECODE_C_TILE] = pl.cast(st2, pl.BF16, mode="rint")
+            cs2[drow + 2 : drow + 3, c0 : c0 + DECODE_C_TILE] = mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE]
+            if t + 1 == end:
+                final_row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX) * STATE_LEN
+                cs2[final_row:final_row + 1, c0:c0 + DECODE_C_TILE] = pl.cast(st1, pl.BF16, mode="rint")
+                cs2[final_row + 1:final_row + 2, c0:c0 + DECODE_C_TILE] = pl.cast(st2, pl.BF16, mode="rint")
+                cs2[final_row + 2:final_row + 3, c0:c0 + DECODE_C_TILE] = mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE]
+    return (query, key, value, conv_state)
+
+
+@pl.jit.inline
 def kda_conv_decode(
     mixed_qkv: pl.Tensor[[T_DYN, CONV_DIM], pl.BF16],
     weight: pl.Tensor[[KDA_CONV_K, CONV_DIM], pl.BF16],
@@ -265,47 +338,18 @@ def kda_conv_decode(
     key: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     value: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
 ):
-    t_dim = pl.tensor.dim(mixed_qkv, 0)
-    cs2 = pl.reshape(conv_state, [pl.tensor.dim(conv_state, 0) * STATE_LEN, CONV_DIM])
-    v_flat = pl.reshape(value, [t_dim, LOCAL_KDA_QKV_DIM])
-    k_flat = pl.reshape(key, [t_dim, LOCAL_KDA_QKV_DIM])
-    q_flat = pl.reshape(query, [t_dim, LOCAL_KDA_QKV_DIM])
-    with pl.spmd(t_dim * (CONV_DIM // DECODE_C_TILE), name_hint="kda_conv_decode"):
-        task = pl.tile.get_block_idx()
-        lanes = CONV_DIM // DECODE_C_TILE
-        t = task // lanes
-        c0 = task % lanes * DECODE_C_TILE
-        row = pl.cast(pl.read(state_rows, [t]), pl.INDEX)
-        srow = row * STATE_LEN
-        st0 = pl.cast(cs2[srow + 0:srow + 0 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
-        st1 = pl.cast(cs2[srow + 1:srow + 1 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
-        st2 = pl.cast(cs2[srow + 2:srow + 2 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
-        xt = pl.cast(mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
-        acc_fp32 = pl.cast(weight[0:1, c0 : c0 + DECODE_C_TILE], pl.FP32)
-        acc_mul = pl.mul(st0, acc_fp32)
-        acc_fp32_2 = pl.cast(weight[1:2, c0 : c0 + DECODE_C_TILE], pl.FP32)
-        acc_mul_2 = pl.mul(st1, acc_fp32_2)
-        acc_add = pl.add(acc_mul, acc_mul_2)
-        acc_fp32_3 = pl.cast(weight[2:3, c0 : c0 + DECODE_C_TILE], pl.FP32)
-        acc_mul_3 = pl.mul(st2, acc_fp32_3)
-        acc_fp32_4 = pl.cast(weight[3:4, c0 : c0 + DECODE_C_TILE], pl.FP32)
-        acc_mul_4 = pl.mul(xt, acc_fp32_4)
-        acc_add_2 = pl.add(acc_add, acc_mul_3)
-        acc = pl.add(acc_add_2, acc_mul_4)
-        activation_arg_activated = pl.create_tensor([1, DECODE_C_TILE], dtype=pl.FP32)
-        activation_arg_activated[:, :] = acc
-        activated = accurate_silu(activation_arg_activated, 1, DECODE_C_TILE)
-        out_tile = pl.cast(activated, pl.BF16, mode="rint")
-        if c0 < LOCAL_KDA_QKV_DIM:
-            q_flat[t : t + 1, c0 : c0 + DECODE_C_TILE] = out_tile
-        elif c0 < 2 * LOCAL_KDA_QKV_DIM:
-            k_flat[t : t + 1, c0 - LOCAL_KDA_QKV_DIM : c0 - LOCAL_KDA_QKV_DIM + DECODE_C_TILE] = out_tile
-        else:
-            v_flat[t:t + 1, c0 - 2 * LOCAL_KDA_QKV_DIM:c0 - 2 * LOCAL_KDA_QKV_DIM + DECODE_C_TILE] = out_tile
-        cs2[srow : srow + 1, c0 : c0 + DECODE_C_TILE] = pl.cast(st1, pl.BF16, mode="rint")
-        cs2[srow + 1 : srow + 2, c0 : c0 + DECODE_C_TILE] = pl.cast(st2, pl.BF16, mode="rint")
-        cs2[srow + 2 : srow + 3, c0 : c0 + DECODE_C_TILE] = mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE]
-    return (query, key, value, conv_state)
+    tokens = pl.tensor.dim(mixed_qkv, 0)
+    starts = pl.create_tensor([tokens + 1], dtype=pl.INT32)
+    rows = pl.create_tensor([tokens, 3], dtype=pl.INT32)
+    for task in pl.spmd(1, name_hint="decode_conv_metadata"):
+        for token in pl.range(tokens):
+            row = pl.read(state_rows, [token])
+            pl.write(starts, [token], pl.cast(token, pl.INT32))
+            for column in pl.unroll(3):
+                pl.write(rows, [token, column], row)
+        pl.write(starts, [tokens], pl.cast(tokens, pl.INT32))
+    kda_conv_recurrent(mixed_qkv, weight, conv_state, starts, rows, query, key, value)
+    return query, key, value, conv_state
 
 
 @pl.jit
@@ -536,19 +580,22 @@ def kda_output_test(
 
 
 @pl.jit.inline
-def decode_kda(
+def recurrent_kda(
     query: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     key: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     value: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     decay: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.FP32],
     beta: pl.Tensor[[T_DYN, BETA_PAD], pl.FP32],
     recurrent_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
-    state_rows: pl.Tensor[[T_DYN], pl.INT32],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
     output: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
 ):
+    """Causal recurrent attention with one caller-owned snapshot row per query token."""
     t_dim = pl.tensor.dim(query, 0)
     lanes = KDA_DIM // DECODE_V_TILE
-    tasks = t_dim * LOCAL_KDA_H * lanes
+    requests = pl.tensor.dim(query_start_loc, 0) - 1
+    tasks = requests * LOCAL_KDA_H * lanes
     rows_total = t_dim * LOCAL_KDA_H
     norm_tiles = (rows_total + DECODE_NORM_ROWS_TILE - 1) // DECODE_NORM_ROWS_TILE
     kn_gm = pl.create_tensor([norm_tiles * DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
@@ -591,48 +638,88 @@ def decode_kda(
     out_rows = pl.reshape(output, [t_dim, LOCAL_KDA_H * KDA_DIM])
     with pl.spmd(tasks, name_hint="decode_kda", deps=[norm_tid]):
         task = pl.tile.get_block_idx()
-        t = task // (LOCAL_KDA_H * lanes)
+        request = task // (LOCAL_KDA_H * lanes)
         h = task // lanes % LOCAL_KDA_H
         v0 = task % lanes * DECODE_V_TILE
-        row = pl.cast(pl.read(state_rows, [t]), pl.INDEX)
-        qk_row = t * LOCAL_KDA_H + h
-        q_row = qn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
-        k_row = kn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
-        exp_buffer = pl.create_tensor([1, KDA_DIM], dtype=pl.FP32)
-        decay_tile = pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0])
-        exp_buffer[:, :] = pl.reshape(decay_tile, [1, KDA_DIM])
-        g_row = accurate_exp(exp_buffer)
-        beta_s = pl.read(beta, [t, h])
-        srow = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
-        state_tile = state_2d[srow:srow + DECODE_V_TILE, 0:KDA_DIM]
-        decayed = pl.col_expand_mul(state_tile, g_row)
-        kv_buffer = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
-        kv_buffer[:, :] = pl.col_expand_mul(decayed, k_row)
-        kv_col = accurate_row_sum(kv_buffer)
-        value_tile = pl.slice(value, [1, 1, DECODE_V_TILE], [t, h, v0], drop_dims=[0])
-        v_row_v4_rows = pl.reshape(value_tile, [1, DECODE_V_TILE])
-        v_row = pl.cast(v_row_v4_rows, pl.FP32)
-        v_col_full = pl.full([COL_REP_TILE, DECODE_V_TILE], dtype=pl.FP32, value=1.0)
-        v_col_col_expand_mul = pl.col_expand_mul(v_col_full, v_row)
-        v_col_transpose = pl.transpose(v_col_col_expand_mul, 0, 1)
-        v_col_row_sum = pl.row_sum(v_col_transpose)
-        v_col = pl.mul(v_col_row_sum, 1.0 / COL_REP_TILE)
-        delta_col = pl.mul(pl.sub(v_col, kv_col), beta_s)
-        updated_full = pl.full([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
-        updated_row_expand_mul = pl.row_expand_mul(updated_full, delta_col)
-        updated_col_expand_mul = pl.col_expand_mul(updated_row_expand_mul, k_row)
-        updated = pl.add(decayed, updated_col_expand_mul)
-        state_2d[srow : srow + DECODE_V_TILE, 0:KDA_DIM] = updated
-        # Keep the state/query dot product in the same FP32 reduction domain
-        # as the recurrent update.
-        out_products = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
-        out_products[:, :] = pl.col_expand_mul(updated, q_row)
-        out_sum = accurate_row_sum(out_products)
-        out_row = pl.reshape(out_sum, [1, DECODE_V_TILE])
-        ocol = h * KDA_DIM + v0
-        out_row_bf16 = pl.cast(out_row, pl.BF16, mode="rint")
-        out_rows[t : t + 1, ocol : ocol + DECODE_V_TILE] = pl.set_validshape(out_row_bf16, 1, DECODE_V_TILE)
+        begin = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+        end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+        for t in pl.range(begin, end):
+            step = t - begin
+            qk_row = t * LOCAL_KDA_H + h
+            q_row = qn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
+            k_row = kn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
+            exp_buffer = pl.create_tensor([1, KDA_DIM], dtype=pl.FP32)
+            decay_tile = pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0])
+            exp_buffer[:, :] = pl.reshape(decay_tile, [1, KDA_DIM])
+            g_row = accurate_exp(exp_buffer)
+            beta_s = pl.read(beta, [t, h])
+            source_col = pl.min(step, 1) * (step + 1)
+            row = pl.cast(pl.read(state_rows, [request, source_col]), pl.INDEX)
+            if row < 0:
+                row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+            destination = pl.cast(pl.read(state_rows, [request, step + 2]), pl.INDEX)
+            if destination < 0:
+                destination = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+            srow = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
+            drow = (destination * LOCAL_KDA_H + h) * KDA_DIM + v0
+            state_tile = state_2d[srow:srow + DECODE_V_TILE, 0:KDA_DIM]
+            decayed = pl.col_expand_mul(state_tile, g_row)
+            kv_buffer = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
+            kv_buffer[:, :] = pl.col_expand_mul(decayed, k_row)
+            kv_col = accurate_row_sum(kv_buffer)
+            value_tile = pl.slice(value, [1, 1, DECODE_V_TILE], [t, h, v0], drop_dims=[0])
+            v_row_v4_rows = pl.reshape(value_tile, [1, DECODE_V_TILE])
+            v_row = pl.cast(v_row_v4_rows, pl.FP32)
+            v_col_full = pl.full([COL_REP_TILE, DECODE_V_TILE], dtype=pl.FP32, value=1.0)
+            v_col_col_expand_mul = pl.col_expand_mul(v_col_full, v_row)
+            v_col_transpose = pl.transpose(v_col_col_expand_mul, 0, 1)
+            v_col_row_sum = pl.row_sum(v_col_transpose)
+            v_col = pl.mul(v_col_row_sum, 1.0 / COL_REP_TILE)
+            delta_col = pl.mul(pl.sub(v_col, kv_col), beta_s)
+            updated_full = pl.full([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
+            updated_row_expand_mul = pl.row_expand_mul(updated_full, delta_col)
+            updated_col_expand_mul = pl.col_expand_mul(updated_row_expand_mul, k_row)
+            updated = pl.add(decayed, updated_col_expand_mul)
+            state_2d[drow : drow + DECODE_V_TILE, 0:KDA_DIM] = updated
+            if t + 1 == end:
+                final_row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+                final_offset = (final_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+                state_2d[final_offset:final_offset + DECODE_V_TILE, 0:KDA_DIM] = updated
+            # Keep the state/query dot product in the same FP32 reduction domain
+            # as the recurrent update.
+            out_products = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
+            out_products[:, :] = pl.col_expand_mul(updated, q_row)
+            out_sum = accurate_row_sum(out_products)
+            out_row = pl.reshape(out_sum, [1, DECODE_V_TILE])
+            ocol = h * KDA_DIM + v0
+            out_row_bf16 = pl.cast(out_row, pl.BF16, mode="rint")
+            out_rows[t : t + 1, ocol : ocol + DECODE_V_TILE] = pl.set_validshape(out_row_bf16, 1, DECODE_V_TILE)
     return (output, recurrent_state)
+
+
+@pl.jit.inline
+def decode_kda(
+    query: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    key: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    value: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    decay: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.FP32],
+    beta: pl.Tensor[[T_DYN, BETA_PAD], pl.FP32],
+    recurrent_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    state_rows: pl.Tensor[[T_DYN], pl.INT32],
+    output: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+):
+    tokens = pl.tensor.dim(query, 0)
+    starts = pl.create_tensor([tokens + 1], dtype=pl.INT32)
+    rows = pl.create_tensor([tokens, 3], dtype=pl.INT32)
+    for task in pl.spmd(1, name_hint="decode_kda_metadata"):
+        for token in pl.range(tokens):
+            row = pl.read(state_rows, [token])
+            pl.write(starts, [token], pl.cast(token, pl.INT32))
+            for column in pl.unroll(3):
+                pl.write(rows, [token, column], row)
+        pl.write(starts, [tokens], pl.cast(tokens, pl.INT32))
+    recurrent_kda(query, key, value, decay, beta, recurrent_state, starts, rows, output)
+    return output, recurrent_state
 
 
 @pl.jit
@@ -648,6 +735,76 @@ def decode_kda_test(
 ):
     output, recurrent_state = decode_kda(query, key, value, decay, beta, recurrent_state, state_rows, output)
     return output, recurrent_state
+
+
+@pl.jit.inline
+def kda_restore_states(
+    conv_state: pl.InOut[pl.Tensor[[KDA_LAYERS_DYN, KDA_STATE_DYN, STATE_LEN, CONV_DIM], pl.BF16]],
+    recurrent_state: pl.InOut[
+        pl.Tensor[[KDA_LAYERS_DYN, KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]
+    ],
+    source_rows: pl.Tensor[[B_DYN], pl.INT32],
+    destination_rows: pl.Tensor[[B_DYN], pl.INT32],
+):
+    """Restore accepted recurrent/conv snapshots; negative source rows preserve inactive requests."""
+    layers = pl.tensor.dim(conv_state, 0)
+    states = pl.tensor.dim(conv_state, 1)
+    requests = pl.tensor.dim(source_rows, 0)
+    conv_flat = pl.reshape(conv_state, [layers * states * STATE_LEN, CONV_DIM])
+    recurrent_flat = pl.reshape(recurrent_state, [layers * states * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
+    for task in pl.spmd(layers * requests * (CONV_DIM // DECODE_C_TILE), name_hint="kda_restore_conv"):
+        lane = task % (CONV_DIM // DECODE_C_TILE)
+        request = task // (CONV_DIM // DECODE_C_TILE) % requests
+        layer = task // ((CONV_DIM // DECODE_C_TILE) * requests)
+        source = pl.cast(pl.read(source_rows, [request]), pl.INDEX)
+        destination = pl.cast(pl.read(destination_rows, [request]), pl.INDEX)
+        if source >= 0:
+            c0 = lane * DECODE_C_TILE
+            src = (layer * states + source) * STATE_LEN
+            dst = (layer * states + destination) * STATE_LEN
+            for tap in pl.unroll(STATE_LEN):
+                value = conv_flat[src + tap:src + tap + 1, c0:c0 + DECODE_C_TILE]
+                conv_flat[dst + tap:dst + tap + 1, c0:c0 + DECODE_C_TILE] = value
+    tiles = LOCAL_KDA_H * KDA_DIM // DECODE_V_TILE
+    for task in pl.spmd(layers * requests * tiles, name_hint="kda_restore_recurrent"):
+        offset = task % tiles * DECODE_V_TILE
+        request = task // tiles % requests
+        layer = task // (tiles * requests)
+        source = pl.cast(pl.read(source_rows, [request]), pl.INDEX)
+        destination = pl.cast(pl.read(destination_rows, [request]), pl.INDEX)
+        if source >= 0:
+            src = (layer * states + source) * LOCAL_KDA_H * KDA_DIM + offset
+            dst = (layer * states + destination) * LOCAL_KDA_H * KDA_DIM + offset
+            recurrent_value = recurrent_flat[src:src + DECODE_V_TILE, :]
+            recurrent_flat[dst:dst + DECODE_V_TILE, :] = recurrent_value
+    return conv_state, recurrent_state
+
+
+@pl.jit
+def verify_kda_test(
+    mixed_qkv: pl.Tensor[[T_DYN, CONV_DIM], pl.BF16],
+    weight: pl.Tensor[[KDA_CONV_K, CONV_DIM], pl.BF16],
+    decay: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.FP32],
+    beta: pl.Tensor[[T_DYN, BETA_PAD], pl.FP32],
+    conv_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, STATE_LEN, CONV_DIM], pl.BF16]],
+    recurrent_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
+    restore_rows: pl.Tensor[[B_DYN], pl.INT32],
+    destination_rows: pl.Tensor[[B_DYN], pl.INT32],
+    output: pl.Out[pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+):
+    tokens = pl.tensor.dim(mixed_qkv, 0)
+    states = pl.tensor.dim(conv_state, 0)
+    query = pl.create_tensor([tokens, LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
+    key = pl.create_tensor([tokens, LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
+    value = pl.create_tensor([tokens, LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
+    kda_conv_recurrent(mixed_qkv, weight, conv_state, query_start_loc, state_rows, query, key, value)
+    recurrent_kda(query, key, value, decay, beta, recurrent_state, query_start_loc, state_rows, output)
+    conv_layers = pl.reshape(conv_state, [1, states, STATE_LEN, CONV_DIM])
+    recurrent_layers = pl.reshape(recurrent_state, [1, states, LOCAL_KDA_H, KDA_DIM, KDA_DIM])
+    kda_restore_states(conv_layers, recurrent_layers, restore_rows, destination_rows)
+    return output, conv_state, recurrent_state
 
 
 @pl.jit.inline
@@ -2252,9 +2409,115 @@ def run_prefill_case(argv=None):
         raise SystemExit(1)
 
 
+def verify_build_tensor_specs(requests=None, query_len=6):
+    """Cover partial/full acceptance, untouched inactive rows and distinct snapshot ownership."""
+    from golden import TensorSpec
+
+    lengths = [6, 3, 0, 1] if requests is None else [query_len] * requests
+    requests = len(lengths)
+    max_query = max(lengths)
+    tokens = sum(lengths)
+    states = requests * (max_query + 1) + 1
+    starts = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32)
+    metadata = torch.full((requests, max_query + 2), -1, dtype=torch.int32)
+    destinations = torch.arange(requests - 1, -1, -1, dtype=torch.int32)
+    restore = torch.full((requests,), -1, dtype=torch.int32)
+    for request, length in enumerate(lengths):
+        metadata[request, 0] = destinations[request]
+        snapshots = torch.arange(requests + request * max_query, requests + (request + 1) * max_query)
+        metadata[request, 2:] = snapshots
+        metadata[request, 1] = snapshots[max(length - 1, 0)]
+        accepted = length if request % 3 == 0 else min(request % 3, length)
+        if accepted:
+            restore[request] = snapshots[accepted - 1]
+    bf, fp = torch.bfloat16, torch.float32
+    return [
+        TensorSpec("mixed_qkv", [tokens, CONV_DIM], bf, init_value=lambda: torch.randn(tokens, CONV_DIM).bfloat16()),
+        TensorSpec("weight", [KDA_CONV_K, CONV_DIM], bf, init_value=lambda: torch.randn(KDA_CONV_K, CONV_DIM).bfloat16() * 0.2),
+        TensorSpec("decay", [tokens, LOCAL_KDA_H, KDA_DIM], fp, init_value=lambda: -5 * torch.rand(tokens, LOCAL_KDA_H, KDA_DIM)),
+        TensorSpec("beta", [tokens, BETA_PAD], fp, init_value=lambda: torch.rand(tokens, BETA_PAD)),
+        TensorSpec("conv_state", [states, STATE_LEN, CONV_DIM], bf, init_value=lambda: torch.randn(states, STATE_LEN, CONV_DIM).bfloat16()),
+        TensorSpec("recurrent_state", [states, LOCAL_KDA_H, KDA_DIM, KDA_DIM], fp, init_value=lambda: torch.randn(states, LOCAL_KDA_H, KDA_DIM, KDA_DIM) * 0.1),
+        TensorSpec("query_start_loc", list(starts.shape), torch.int32, init_value=starts),
+        TensorSpec("state_rows", list(metadata.shape), torch.int32, init_value=metadata),
+        TensorSpec("restore_rows", list(restore.shape), torch.int32, init_value=restore),
+        TensorSpec("destination_rows", list(destinations.shape), torch.int32, init_value=destinations),
+        TensorSpec("output", [tokens, LOCAL_KDA_H, KDA_DIM], bf),
+    ]
+
+
+def golden_verify_kda_tensors(tensors):
+    """Independent sequential reference including every checkpoint and accepted-state restoration."""
+    conv = tensors["conv_state"].clone()
+    recurrent = tensors["recurrent_state"].clone()
+    starts = tensors["query_start_loc"].tolist()
+    metadata = tensors["state_rows"]
+    for request, (begin, end) in enumerate(zip(starts, starts[1:])):
+        working = int(metadata[request, 1])
+        source = int(metadata[request, 0])
+        if source < 0:
+            source = working
+        for step, token in enumerate(range(begin, end)):
+            output, tail = _conv_reference(tensors["mixed_qkv"][token:token + 1], conv[source].float(), tensors["weight"])
+            q, k, v = output.bfloat16().reshape(1, 3, LOCAL_KDA_H, KDA_DIM).unbind(1)
+            out, updated = golden_decode_kda(
+                q, k, v, tensors["decay"][token:token + 1], tensors["beta"][token:token + 1],
+                recurrent[source:source + 1], torch.zeros(1, dtype=torch.int32),
+            )
+            # A negative snapshot destination keeps the rolling state in the
+            # request's private working row, as the kernels do.
+            destination = int(metadata[request, step + 2])
+            if destination < 0:
+                destination = working
+            conv[destination].copy_(tail.bfloat16())
+            recurrent[destination].copy_(updated[0])
+            tensors["output"][token].copy_(out[0])
+            source = destination
+        if end > begin:
+            final = working
+            conv[final].copy_(conv[source])
+            recurrent[final].copy_(recurrent[source])
+    for source, destination in zip(tensors["restore_rows"].tolist(), tensors["destination_rows"].tolist()):
+        if source >= 0:
+            conv[destination].copy_(conv[source])
+            recurrent[destination].copy_(recurrent[source])
+    tensors["conv_state"].copy_(conv)
+    tensors["recurrent_state"].copy_(recurrent)
+
+
+def run_verify_case(argv=None):
+    from golden import run
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
+    parser.add_argument("--seed", type=int, default=1024)
+    parser.add_argument("--requests", type=int)
+    parser.add_argument("--query-len", type=int, default=6)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args(argv)
+    if args.requests is not None and args.requests < 1 or not 1 <= args.query_len <= 6:
+        parser.error("--requests must be positive and --query-len must be 1..6")
+    torch.manual_seed(args.seed)
+    result = run(
+        fn=verify_kda_test,
+        specs=verify_build_tensor_specs(args.requests, args.query_len),
+        golden_fn=golden_verify_kda_tensors,
+        config=dict(backend_type=args.platform, execution_mode=args.sim, device_id=args.device),
+        compile_only=args.compile_only,
+        rtol=0.02,
+        atol=0.02,
+    )
+    if not result.passed:
+        raise SystemExit(result.error or 1)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, add_help=False)
-    components = ["all", "projection", "convolution", "output", "decode", "prefill"]
+    components = ["all", "projection", "convolution", "output", "decode", "prefill", "verify"]
     parser.add_argument("--component", choices=components, default="all")
     options, remaining = parser.parse_known_args(argv)
     if options.component == "all" and any(arg in ("-h", "--help") for arg in remaining):
@@ -2267,6 +2530,7 @@ def main(argv=None):
         "output": run_output_case,
         "decode": run_decode_case,
         "prefill": run_prefill_case,
+        "verify": run_verify_case,
     }
     selected = cases if options.component == "all" else {options.component: cases[options.component]}
     for run_case in selected.values():

@@ -156,6 +156,8 @@ def int8_linear_tile(
     row_scale = pl.slice(token_scale, [M_TILE, 8], [x_start, 0], valid_shape=[valid_rows, 8])
     row_scale_column = pl.row_max(row_scale)
     channel_scale = pl.slice(weight_scale, [N_TILE], [w_start], valid_shape=[valid_columns])
+    channel_scale_bf16 = pl.cast(channel_scale, pl.BF16, mode="rint")
+    channel_scale = pl.cast(channel_scale_bf16, pl.FP32)
     products = pl.cast(accum, pl.FP32, mode="rint")
     row_dequantized = pl.row_expand_mul(products, row_scale_column)
     channel_scale_row = pl.reshape(channel_scale, [1, N_TILE])
@@ -319,7 +321,7 @@ def main():
             values["quantized"].copy_(quantized)
             values["token_scale"].copy_(scales.expand(-1, 8))
             products = (quantized.int() @ values["weight"].int().t()).float()
-            values["output"].copy_(products * scales * values["weight_scale"].float())
+            values["output"].copy_(products * scales * values["weight_scale"].bfloat16().float())
 
         result = run(
             fn=int8_linear_test,

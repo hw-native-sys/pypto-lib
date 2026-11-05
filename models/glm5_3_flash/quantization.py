@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from models.glm5_3_flash.config import FLASH
-from models.glm5_3_flash.elementwise import accurate_divide, accurate_reciprocal
+from models.glm5_3_flash.elementwise import accurate_divide
 from models.glm5_3_flash.utils import _check, _report
 
 INT8_K_ALIGN = 32
@@ -43,7 +43,7 @@ def quantize_bf16_rows(
     for block in pl.spmd((rows + QUANT_M_TILE - 1) // QUANT_M_TILE, name_hint="glm53_dynamic_quant"):
         row0 = block * QUANT_M_TILE
         valid_rows = pl.min(QUANT_M_TILE, rows - row0)
-        maximum = pl.full([1, QUANT_M_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        maximum = pl.full([1, QUANT_M_TILE], dtype=pl.FP32, value=0.0)
         for col0 in pl.range(0, width, QUANT_N_TILE):
             valid_columns = pl.min(QUANT_N_TILE, width - col0)
             source = pl.slice(x, [QUANT_M_TILE, QUANT_N_TILE], [row0, col0], valid_shape=[valid_rows, valid_columns])
@@ -51,13 +51,15 @@ def quantize_bf16_rows(
             value = pl.cast(padded, pl.FP32)
             part_maximum = pl.reshape(pl.row_max(pl.abs(value)), [1, QUANT_M_TILE])
             maximum = pl.maximum(maximum, part_maximum)
-        numerator = pl.create_tensor([1, QUANT_M_TILE], dtype=pl.FP32)
         denominator = pl.create_tensor([1, QUANT_M_TILE], dtype=pl.FP32)
         scale_buffer = pl.create_tensor([1, QUANT_M_TILE], dtype=pl.FP32)
-        numerator[:, :] = pl.full([1, QUANT_M_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
-        denominator[:, :] = maximum
-        scale_buffer[:, :] = accurate_divide(numerator, denominator)
-        inverse_scale = accurate_reciprocal(scale_buffer)
+        zero_rows = pl.cmp(maximum, 0.0, cmp_type=0)
+        denominator[:, :] = pl.add(maximum, zero_rows)
+        one = pl.create_tensor([1, QUANT_M_TILE], dtype=pl.FP32)
+        one[:, :] = pl.full([1, QUANT_M_TILE], dtype=pl.FP32, value=1.0)
+        inverse_maximum = accurate_divide(one, denominator)
+        scale_buffer[:, :] = pl.mul(inverse_maximum, INT8_SCALE_MAX)
+        inverse_scale = pl.mul(maximum, 1.0 / INT8_SCALE_MAX)
         inverse_column = pl.reshape(inverse_scale, [QUANT_M_TILE, 1])
         scale_column = pl.reshape(scale_buffer, [QUANT_M_TILE, 1])
         scale_lanes = pl.full([QUANT_M_TILE, 8], dtype=pl.FP32, value=0.0)
@@ -123,9 +125,10 @@ def quantize_per_token_int8(
     value = x.float()
     if smooth_scale is not None:
         value = value * smooth_scale.float()
-    amax = value.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = torch.div(torch.full_like(amax, INT8_SCALE_MAX), amax)
-    return _round_to_int8(value * scale_quant), 1.0 / scale_quant
+    amax = value.abs().amax(dim=-1, keepdim=True)
+    denominator = torch.where(amax == 0, torch.ones_like(amax), amax)
+    scale_quant = torch.reciprocal(denominator) * INT8_SCALE_MAX
+    return _round_to_int8(value * scale_quant), amax * (1.0 / INT8_SCALE_MAX)
 
 
 def int8_matmul(x_int8: torch.Tensor, weight_int8: torch.Tensor) -> torch.Tensor:
@@ -159,7 +162,7 @@ def w8a8_dynamic_linear(
     """
     x_int8, token_scale = quantize_per_token_int8(x, smooth_scale)
     accumulator = int8_matmul(x_int8, weight_int8).float()
-    result = accumulator * token_scale * weight_scale.float().reshape(-1)
+    result = accumulator * token_scale * weight_scale.to(x.dtype).float().reshape(-1)
     if bias is not None:
         result = result + bias.float()
     return result.to(out_dtype)
@@ -263,6 +266,12 @@ def run_quantization_goldens(quantize_per_channel, quantize_per_token, dynamic_l
     _check(x_int8.dtype is torch.int8, f"activation dtype {x_int8.dtype}")
     _check(token_scale.shape == (tokens, 1), f"per-token scale shape {tuple(token_scale.shape)}")
 
+    edge_rows = torch.tensor([[0.0] * in_features, [1e-8] * in_features], dtype=torch.bfloat16)
+    edge_quant, edge_scale = quantize_per_token(edge_rows)
+    _check(not bool(edge_quant[0].any()) and edge_scale[0].item() == 0.0, "zero-row quantization")
+    _check(bool((edge_quant[1] == 127).all()), "small nonzero rows must use their full INT8 range")
+    _check(torch.equal(edge_scale[1], edge_rows[1, :1].float() * (1.0 / INT8_SCALE_MAX)), "small-row scale")
+
     reference = torch.nn.functional.linear(x.float(), weight.float())
     quantized = dynamic_linear(x, weight_int8, weight_scale, out_dtype=torch.float32)
     error = (quantized - reference).abs().max() / reference.abs().max()
@@ -271,8 +280,12 @@ def run_quantization_goldens(quantize_per_channel, quantize_per_token, dynamic_l
     _report("quantization")
 
 
-if __name__ == "__main__":
+def main():
     run_swiglu_golden(swiglu)
     run_expert_golden(expert)
 
     run_quantization_goldens(quantize_per_channel_int8, quantize_per_token_int8, w8a8_dynamic_linear)
+
+
+if __name__ == "__main__":
+    main()

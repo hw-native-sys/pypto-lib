@@ -21,7 +21,7 @@ from models.glm5_3_flash.config import FLASH, D
 from models.glm5_3_flash.elementwise import (
     _sum_fp32_reference, accurate_divide_parts, accurate_row_sum_parts, accurate_rsqrt,
 )
-from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
+from models.glm5_3_flash.quantization import INT8_SCALE_MAX, quantize_per_token_int8
 from models.glm5_3_flash.utils import _check, _report
 
 T_DYN = pl.dynamic('GLM53_T_DYN')
@@ -86,8 +86,7 @@ def rmsnorm(
             gamma_buffer[:, :] = gamma_row
             gamma = pl.cast(gamma_buffer[:, :], pl.FP32)
             unit = pl.row_expand_mul(value, inv_rms)
-            unit_bf16 = pl.cast(unit, pl.BF16, mode="rint")
-            normalized = pl.col_expand_mul(pl.cast(unit_bf16, pl.FP32), gamma)
+            normalized = pl.col_expand_mul(unit, gamma)
             normalized_bf16 = pl.cast(normalized, pl.BF16, mode="rint")
             output[t0:t0 + NORM_T_TILE, k0:k0 + NORM_D_TILE] = pl.set_validshape(normalized_bf16, valid_rows, norm_columns)
     return output
@@ -140,8 +139,7 @@ def rmsnorm_quant(
             value = pl.cast(source, pl.FP32)
             gamma = pl.reshape(pl.cast(weight[k0 : k0 + NORM_D_TILE], pl.FP32), [1, NORM_D_TILE])
             unit = pl.row_expand_mul(value, inv_rms)
-            unit_bf16 = pl.cast(unit, pl.BF16, mode="rint")
-            normalized = pl.col_expand_mul(pl.cast(unit_bf16, pl.FP32), gamma)
+            normalized = pl.col_expand_mul(unit, gamma)
             normalized_bf16 = pl.cast(normalized, pl.BF16, mode="rint")
             quant_source = pl.cast(normalized_bf16, pl.FP32)
             quant_source_fp32[t0:t0 + NORM_T_TILE, k0:k0 + NORM_D_TILE] = pl.set_validshape(quant_source, valid_rows, NORM_D_TILE)
@@ -160,13 +158,13 @@ def rmsnorm_quant(
                     amax_tmp = pl.create_tile([NORM_T_TILE, NORM_T_TILE], dtype=pl.FP32)
                     amax = pl.row_max(reduce_tile, amax_tmp)
                     amax = pl.set_validshape(pl.reshape(amax, [1, NORM_T_TILE]), 1, 1)
-                    floor = pl.set_validshape(pl.tile.full([1, NORM_T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS), 1, 1)
-                    amax = pl.maximum(amax, floor)
-                    # Scalar division matches the Qwen quantizer and the FP32 reference.
-                    # Tile/scalar division rounds via reciprocal multiplication on A3.
+                    zero_rows = pl.tile.cmps(amax, 0.0, cmp_type=0)
+                    safe_amax = pl.tile.select(zero_rows, 1.0, amax)
                     amax_scalar = pl.tile.read(amax, [0, 0])
-                    scale_quant = INT8_SCALE_MAX / amax_scalar
-                    scale_dequant = amax_scalar / INT8_SCALE_MAX
+                    denominator_scalar = pl.tile.read(safe_amax, [0, 0])
+                    reciprocal = 1.0 / denominator_scalar
+                    scale_quant = reciprocal * INT8_SCALE_MAX
+                    scale_dequant = amax_scalar * (1.0 / INT8_SCALE_MAX)
                     scale = scale_dequant
                     scaled = pl.mul(quant_row_fp32, scale_quant)
                     rounded = pl.cast(scaled, pl.INT32, mode="rint")
@@ -267,7 +265,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = FLASH.rms_norm_
     value = x.float()
     square_mean = value.double().square().mean(dim=-1, keepdim=True).float()
     value = value * torch.rsqrt((square_mean + eps).double()).float()
-    return (weight.to(dtype).float() * value.to(dtype).float()).to(dtype)
+    return (weight.to(dtype).float() * value).to(dtype)
 
 
 def rms_norm_gated(
@@ -297,12 +295,12 @@ def golden_rmsnorm_quant(
     value = x.float()
     square_mean = value.double().square().mean(dim=-1, keepdim=True).float()
     inverse = torch.rsqrt((square_mean + EPS).double()).float()
-    unit = (value * inverse).to(x.dtype).float()
+    unit = value * inverse
     normalized = (unit * weight.to(x.dtype).float()).to(x.dtype)
     quant_source = normalized.float()
     quantized, _scale = quantize_per_token_int8(quant_source)
-    amax = quant_source.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale = amax / INT8_SCALE_MAX
+    amax = quant_source.abs().amax(dim=-1, keepdim=True)
+    scale = amax * (1.0 / INT8_SCALE_MAX)
     return normalized.to(x.dtype), quantized, scale
 
 
@@ -427,10 +425,11 @@ def run_norm_goldens(golden_rms_norm, golden_rms_norm_gated, golden_l2norm) -> N
 
 
 def reference_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Glm5NextTextRMSNorm: FP32 variance, weight applied after the inverse cast."""
-    variance = x.pow(2).mean(-1, keepdim=True)
-    normalized = x * torch.rsqrt(variance + eps)
-    return weight * normalized
+    """RMSNorm with FP32 computation and one final activation-dtype cast."""
+    value = x.float()
+    variance = value.pow(2).mean(-1, keepdim=True)
+    normalized = value * torch.rsqrt(variance + eps)
+    return (weight.float() * normalized).to(x.dtype)
 
 
 def unweighted_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:

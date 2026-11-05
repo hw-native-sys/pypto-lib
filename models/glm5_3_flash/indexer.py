@@ -22,20 +22,18 @@ import torch
 import torch.nn.functional as F
 
 from models.glm5_3_flash.attention import (
-    DECODE_ROWS_PER_REQUEST, decode_sparse_attn_test, golden_decode_sparse_attn_case,
+    DECODE_ROWS_PER_REQUEST, MLA_CACHE_WIDTH, decode_sparse_attn_test, golden_decode_sparse_attn_case, pack_mla_cache,
 )
 from models.glm5_3_flash.config import (
     BLOCK_SIZE, EP_SIZE, INDEX_DIM, INDEX_H, INDEX_KPOOL, INDEX_STATE_BLOCK_SIZE, INDEX_STATE_WIDTH,
     KPOOL_SELECT_K, KV_LORA, LOCAL_H, Q_LORA, TOPK_INDEX_WIDTH, TP_SIZE, D, Glm53FlashConfig,
 )
 from models.glm5_3_flash.elementwise import FP32_NEG_INF
-from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX, quantize_per_token_int8
 from models.glm5_3_flash.utils import (
-    _FLOAT32_MIN, _randn, build_forward_metadata, build_indexer_chunk_metadata, sylvester_hadamard,
+    _FLOAT32_MIN, _randn, build_forward_metadata, build_indexer_chunk_metadata,
 )
 
 INDEX_BLOCKS_DYN = pl.dynamic("GLM53_INDEX_BLOCKS_DYN")
-POOLS_DYN = pl.dynamic("GLM53_POOLS_DYN")
 POOL_EVENTS_DYN = pl.dynamic("GLM53_POOL_EVENTS_DYN")
 POOL_PAGES_DYN = pl.dynamic("GLM53_POOL_PAGES_DYN")
 TABLE_DYN = pl.dynamic("GLM53_TABLE_DYN")
@@ -45,7 +43,7 @@ SORT_TILE = 2048
 PAIR_WIDTH = 2 * KPOOL_SELECT_K
 K_NORM_EPS = 1e-6
 SOFTMAX_SCALE = INDEX_DIM**-0.5
-WEIGHTS_SCALE = INDEX_H**-0.5
+WEIGHTS_SCALE = (INDEX_H * INDEX_DIM)**-0.5
 PROJ_T_TILE = 16
 PROJ_K_TILE = 128
 Q_OUT_TILE = 256
@@ -54,11 +52,9 @@ SCORE_C_TILE = 64
 EXPAND_W_TILE = 256
 EXPAND_TAIL_TILE = 8  # covers the last lanes in one aligned tile
 EXPAND_TOKEN_TILE = 4
-TOPK_QUERY_WORKERS = 48
 POOL_GATHER_PAGE_TILE = 16
 POOL_GATHER_ROW_TILE = POOL_GATHER_PAGE_TILE * INDEX_STATE_BLOCK_SIZE
 POOL_GATHER_WORKERS = 48
-POOL_SCALE_WORKERS = 48
 # Batches at or below this token count take the decode-shaped dispatch:
 # persistent workers own pool-gather chunks and scale blocks. Larger prefill
 # chunks dispatch one task per chunk/block instead. The threshold matches the
@@ -67,7 +63,6 @@ INDEXER_PERSISTENT_MAX_TOKENS = 32 * DECODE_ROWS_PER_REQUEST
 
 POOL_STAGE_DYN = pl.dynamic("GLM53_POOL_STAGE_DYN")
 POOL_VALID_WIDTH = 8
-POOL_SCALE_WIDTH = 8
 POOL_QUANT_TILE = 64
 # Rows per cache-write block: the key half loads as one wide BF16 tile and
 # widens to FP32 once, then each row scatters by its own slot.
@@ -84,7 +79,6 @@ def decode_indexer_step_test(
     k_norm_bias: pl.Tensor[[INDEX_DIM], pl.BF16],
     w_weights: pl.Tensor[[D, INDEX_H], pl.BF16],
     w_compress_gate: pl.Tensor[[D, INDEX_DIM], pl.BF16],
-    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     index_slots: pl.Tensor[[T_DYN], pl.INT32],
     pool_token_slots: pl.Tensor[[POOL_EVENTS_DYN, INDEX_KPOOL], pl.INT32],
@@ -96,23 +90,21 @@ def decode_indexer_step_test(
     tail_count: pl.Tensor[[T_DYN], pl.INT32],
     kv_len: pl.Tensor[[T_DYN], pl.INT32],
     raw_cache: pl.InOut[pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32]],
-    pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8]],
-    pool_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32]],
+    pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16]],
     pool_valid: pl.Out[pl.Tensor[[POOL_EVENTS_DYN, POOL_VALID_WIDTH], pl.INT32]],
     index_q: pl.Out[pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16]],
-    index_k: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16]],
+    index_k: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32]],
     head_weights: pl.Out[pl.Tensor[[T_DYN, INDEX_H], pl.FP32]],
     gate_scores: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32]],
-    index_scores: pl.Out[pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32]],
     selected_pools: pl.Out[pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32]],
     selected_valid: pl.Out[pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32]],
     topk_indices: pl.Out[pl.Tensor[[T_DYN, TOPK_INDEX_WIDTH], pl.INT32]],
 ):
     """Run one whole decode step for golden.run validation.
 
-    The raw scatter, the pool close, the score, the selection and the expansion
-    order themselves through their shared tensors; every stage's output is
-    exposed so the harness can validate the composition, not just the tail.
+    The raw scatter, the pool close, the selection and the expansion order
+    themselves through their shared tensors; every stage's output is exposed
+    so the harness can validate the composition, not just the tail.
     """
     x.bind_dynamic(0, T_DYN)
     q_resid.bind_dynamic(0, T_DYN)
@@ -130,11 +122,9 @@ def decode_indexer_step_test(
     index_k.bind_dynamic(0, T_DYN)
     head_weights.bind_dynamic(0, T_DYN)
     gate_scores.bind_dynamic(0, T_DYN)
-    index_scores.bind_dynamic(0, T_DYN)
     selected_pools.bind_dynamic(0, T_DYN)
     selected_valid.bind_dynamic(0, T_DYN)
     topk_indices.bind_dynamic(0, T_DYN)
-    index_scores.bind_dynamic(1, POOLS_DYN)
 
     indexer_proj(
         x, q_resid, w_q_b, w_k, k_norm_weight, k_norm_bias, w_weights, w_compress_gate, index_q, index_k,
@@ -142,13 +132,12 @@ def decode_indexer_step_test(
     )
     indexer_cache_write(index_k, gate_scores, index_slots, raw_cache)
     indexer_pool_write(
-        raw_cache, compress_ape, hadamard, pool_token_slots, pool_slots, pool_cache, pool_scale, pool_valid,
+        raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid,
     )
-    indexer_score(
-        index_q, hadamard, pool_cache, pool_scale, pool_blocks, head_weights, seg_start, pool_count,
-        index_scores,
+    indexer_select(
+        index_q, pool_cache, pool_blocks, head_weights, seg_start, pool_count,
+        selected_pools, selected_valid,
     )
-    indexer_topk(index_scores, seg_start, pool_count, selected_pools, selected_valid)
     indexer_expand(selected_pools, selected_valid, tail_start, tail_count, kv_len, topk_indices)
     return (
         index_q,
@@ -157,9 +146,7 @@ def decode_indexer_step_test(
         gate_scores,
         raw_cache,
         pool_cache,
-        pool_scale,
         pool_valid,
-        index_scores,
         selected_pools,
         selected_valid,
         topk_indices,
@@ -177,7 +164,7 @@ def indexer_proj_test(
     w_weights: pl.Tensor[[D, INDEX_H], pl.BF16],
     w_compress_gate: pl.Tensor[[D, INDEX_DIM], pl.BF16],
     index_q: pl.Out[pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16]],
-    index_k: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16]],
+    index_k: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32]],
     head_weights: pl.Out[pl.Tensor[[T_DYN, INDEX_H], pl.FP32]],
     gate_scores: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32]],
 ):
@@ -193,52 +180,6 @@ def indexer_proj_test(
         head_weights, gate_scores, pl.cast(0, pl.INT32),
     )
     return index_q, index_k, head_weights, gate_scores
-
-
-@pl.jit
-def indexer_score_test(
-    index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
-    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
-    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
-    pool_blocks: pl.Tensor[[POOL_PAGES_DYN], pl.INT32],
-    head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
-    seg_start: pl.Tensor[[T_DYN], pl.INT32],
-    pool_count: pl.Tensor[[T_DYN], pl.INT32],
-    index_scores: pl.Out[pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32]],
-):
-    """Score one packed batch for golden.run validation."""
-    index_q.bind_dynamic(0, T_DYN)
-    head_weights.bind_dynamic(0, T_DYN)
-    seg_start.bind_dynamic(0, T_DYN)
-    pool_count.bind_dynamic(0, T_DYN)
-    pool_blocks.bind_dynamic(0, POOL_PAGES_DYN)
-    index_scores.bind_dynamic(0, T_DYN)
-    index_scores.bind_dynamic(1, POOLS_DYN)
-    indexer_score(
-        index_q, hadamard, pool_cache, pool_scale, pool_blocks, head_weights, seg_start, pool_count,
-        index_scores,
-    )
-    return index_scores
-
-
-@pl.jit
-def indexer_topk_test(
-    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
-    seg_start: pl.Tensor[[T_DYN], pl.INT32],
-    pool_count: pl.Tensor[[T_DYN], pl.INT32],
-    selected_pools: pl.Out[pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32]],
-    selected_valid: pl.Out[pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32]],
-):
-    """Select the top pools for one batch for golden.run validation."""
-    index_scores.bind_dynamic(0, T_DYN)
-    index_scores.bind_dynamic(1, POOLS_DYN)
-    seg_start.bind_dynamic(0, T_DYN)
-    pool_count.bind_dynamic(0, T_DYN)
-    selected_pools.bind_dynamic(0, T_DYN)
-    selected_valid.bind_dynamic(0, T_DYN)
-    indexer_topk(index_scores, seg_start, pool_count, selected_pools, selected_valid)
-    return selected_pools, selected_valid
 
 
 @pl.jit
@@ -271,7 +212,6 @@ def indexer_prefill_step_test(
     k_norm_bias: pl.Tensor[[INDEX_DIM], pl.BF16],
     w_weights: pl.Tensor[[D, INDEX_H], pl.BF16],
     w_compress_gate: pl.Tensor[[D, INDEX_DIM], pl.BF16],
-    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     index_slots: pl.Tensor[[T_DYN], pl.INT32],
     pool_token_slots: pl.Tensor[[POOL_EVENTS_DYN, INDEX_KPOOL], pl.INT32],
@@ -283,14 +223,12 @@ def indexer_prefill_step_test(
     tail_count: pl.Tensor[[T_DYN], pl.INT32],
     kv_len: pl.Tensor[[T_DYN], pl.INT32],
     raw_cache: pl.InOut[pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32]],
-    pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8]],
-    pool_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32]],
+    pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16]],
     pool_valid: pl.Out[pl.Tensor[[POOL_EVENTS_DYN, POOL_VALID_WIDTH], pl.INT32]],
     index_q: pl.Out[pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16]],
-    index_k: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16]],
+    index_k: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32]],
     head_weights: pl.Out[pl.Tensor[[T_DYN, INDEX_H], pl.FP32]],
     gate_scores: pl.Out[pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32]],
-    index_scores: pl.Out[pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32]],
     selected_pools: pl.Out[pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32]],
     selected_valid: pl.Out[pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32]],
     topk_indices: pl.Out[pl.Tensor[[T_DYN, TOPK_INDEX_WIDTH], pl.INT32]],
@@ -298,9 +236,9 @@ def indexer_prefill_step_test(
     """Run one whole prefill chunk for golden.run validation.
 
     One request's chunk walks the pipeline the way serving does: project the
-    chunk, scatter its raw rows, close every pool the chunk completes, score
-    each query against the request's whole visible segment, and expand the
-    front-packed index list. Every stage's output is exposed so the harness
+    chunk, scatter its raw rows, close every pool the chunk completes, select
+    each query's top pools over the request's whole visible segment, and expand
+    the front-packed index list. Every stage's output is exposed so the harness
     validates the composition, not just the tail.
     """
     x.bind_dynamic(0, T_DYN)
@@ -319,24 +257,21 @@ def indexer_prefill_step_test(
     index_k.bind_dynamic(0, T_DYN)
     head_weights.bind_dynamic(0, T_DYN)
     gate_scores.bind_dynamic(0, T_DYN)
-    index_scores.bind_dynamic(0, T_DYN)
     selected_pools.bind_dynamic(0, T_DYN)
     selected_valid.bind_dynamic(0, T_DYN)
     topk_indices.bind_dynamic(0, T_DYN)
-    index_scores.bind_dynamic(1, POOLS_DYN)
     indexer_proj(
         x, q_resid, w_q_b, w_k, k_norm_weight, k_norm_bias, w_weights, w_compress_gate, index_q, index_k,
         head_weights, gate_scores, pl.cast(0, pl.INT32),
     )
     indexer_cache_write(index_k, gate_scores, index_slots, raw_cache)
     indexer_pool_write(
-        raw_cache, compress_ape, hadamard, pool_token_slots, pool_slots, pool_cache, pool_scale, pool_valid,
+        raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid,
     )
-    indexer_score(
-        index_q, hadamard, pool_cache, pool_scale, pool_blocks, head_weights, seg_start, pool_count,
-        index_scores,
+    indexer_select(
+        index_q, pool_cache, pool_blocks, head_weights, seg_start, pool_count,
+        selected_pools, selected_valid,
     )
-    indexer_topk(index_scores, seg_start, pool_count, selected_pools, selected_valid)
     indexer_expand(selected_pools, selected_valid, tail_start, tail_count, kv_len, topk_indices)
     return (
         index_q,
@@ -345,9 +280,7 @@ def indexer_prefill_step_test(
         gate_scores,
         raw_cache,
         pool_cache,
-        pool_scale,
         pool_valid,
-        index_scores,
         selected_pools,
         selected_valid,
         topk_indices,
@@ -365,7 +298,7 @@ def indexer_proj(
     w_weights: pl.Tensor[[D, INDEX_H], pl.BF16],
     w_compress_gate: pl.Tensor[[D, INDEX_DIM], pl.BF16],
     index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
-    index_k: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
+    index_k: pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32],
     head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
     gate_scores: pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32],
     skip_query: pl.Scalar[pl.INT32],
@@ -398,6 +331,7 @@ def indexer_proj(
         for db in pl.pipeline(0, D // PROJ_K_TILE, stage=2):
             d0 = db * PROJ_K_TILE
             k_acc = pl.matmul_acc(k_acc, x[t0:t0 + PROJ_T_TILE, d0:d0 + PROJ_K_TILE], w_k[d0:d0 + PROJ_K_TILE, 0:INDEX_DIM], init_cond=d0 == 0)
+        k_acc = pl.cast(pl.cast(k_acc, pl.BF16, mode="rint"), pl.FP32)
         mean = pl.mul(pl.row_sum(k_acc), 1.0 / INDEX_DIM)
         centered = pl.row_expand_sub(k_acc, mean)
         variance = pl.mul(pl.row_sum(pl.mul(centered, centered)), 1.0 / INDEX_DIM)
@@ -407,7 +341,7 @@ def indexer_proj(
         bias_row = pl.cast(pl.reshape(k_norm_bias, [1, INDEX_DIM])[0:1, 0:INDEX_DIM], pl.FP32, mode="none")
         index_k_value_col_expand_mul = pl.col_expand_mul(normed, weight_row)
         index_k_value_col_expand_add = pl.col_expand_add(index_k_value_col_expand_mul, bias_row)
-        index_k[t0:t0 + PROJ_T_TILE, 0:INDEX_DIM] = pl.cast(index_k_value_col_expand_add, pl.BF16, mode="rint")
+        index_k[t0:t0 + PROJ_T_TILE, 0:INDEX_DIM] = index_k_value_col_expand_add
 
     if skip_query == 0:
         for idx in pl.spmd(t_dim // PROJ_T_TILE, name_hint="indexer_weights_proj"):
@@ -416,7 +350,7 @@ def indexer_proj(
             for db in pl.pipeline(0, D // PROJ_K_TILE, stage=2):
                 d0 = db * PROJ_K_TILE
                 w_acc = pl.matmul_acc(w_acc, x[t0:t0 + PROJ_T_TILE, d0:d0 + PROJ_K_TILE], w_weights[d0:d0 + PROJ_K_TILE, 0:INDEX_H], init_cond=d0 == 0)
-            head_weights[t0 : t0 + PROJ_T_TILE, 0:INDEX_H] = pl.mul(w_acc, WEIGHTS_SCALE)
+            head_weights[t0 : t0 + PROJ_T_TILE, 0:INDEX_H] = pl.mul(pl.cast(pl.cast(w_acc, pl.BF16, mode="rint"), pl.FP32), WEIGHTS_SCALE)
 
     for idx in pl.spmd(t_dim // PROJ_T_TILE, name_hint="indexer_gate_proj"):
         t0 = idx * PROJ_T_TILE
@@ -424,240 +358,69 @@ def indexer_proj(
         for db in pl.pipeline(0, D // PROJ_K_TILE, stage=2):
             d0 = db * PROJ_K_TILE
             g_acc = pl.matmul_acc(g_acc, x[t0:t0 + PROJ_T_TILE, d0:d0 + PROJ_K_TILE], w_compress_gate[d0:d0 + PROJ_K_TILE, 0:INDEX_DIM], init_cond=d0 == 0)
-        gate_scores[t0 : t0 + PROJ_T_TILE, 0:INDEX_DIM] = g_acc
+        gate_scores[t0 : t0 + PROJ_T_TILE, 0:INDEX_DIM] = pl.cast(pl.cast(g_acc, pl.BF16, mode="rint"), pl.FP32)
 
     return index_q, index_k, head_weights, gate_scores
 
 
-@pl.jit.inline
-def _indexer_pool_gather_chunk(
-    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
-    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
-    pool_blocks: pl.Tensor[[POOL_PAGES_DYN], pl.INT32],
-    pool_i8: pl.Tensor[[POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE + SCORE_C_TILE, INDEX_DIM], pl.INT8],
-    pool_scale_g: pl.Tensor[[POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE + SCORE_C_TILE, POOL_SCALE_WIDTH], pl.FP32],
-    chunk: pl.Scalar[pl.INDEX],
-    page_count: pl.Scalar[pl.INDEX],
-):
-    """Gather one 16-page chunk into contiguous score scratch."""
-    chunk_base = pl.cast(chunk, pl.INT32) * POOL_GATHER_PAGE_TILE
-    chunk_ok = 1
-    for j in pl.range(1, POOL_GATHER_PAGE_TILE):
-        step = chunk_base + j
-        cur = pl.read(pool_blocks, [pl.min(step, page_count - 1)])
-        prv = pl.read(pool_blocks, [pl.max(pl.min(step, page_count - 1) - 1, 0)])
-        good = pl.cast(cur == pl.add(prv, INDEX_STATE_BLOCK_SIZE), pl.INT32)
-        good = good * pl.cast(step < page_count, pl.INT32)
-        chunk_ok = chunk_ok * good
-    if chunk_ok == 1:
-        p0_idx = pl.cast(chunk_base, pl.INDEX) * INDEX_STATE_BLOCK_SIZE
-        base_idx = pl.cast(pl.read(pool_blocks, [chunk_base]), pl.INDEX)
-        pool_i8[p0_idx : p0_idx + POOL_GATHER_ROW_TILE, :] = pool_cache[
-            base_idx : base_idx + POOL_GATHER_ROW_TILE, :
-        ]
-        pool_scale_g[p0_idx : p0_idx + POOL_GATHER_ROW_TILE, :] = pool_scale[
-            base_idx : base_idx + POOL_GATHER_ROW_TILE, :
-        ]
-    else:
-        for j in pl.range(POOL_GATHER_PAGE_TILE):
-            page_i = chunk_base + j
-            if page_i < page_count:
-                p0_idx = pl.cast(page_i, pl.INDEX) * INDEX_STATE_BLOCK_SIZE
-                base_idx = pl.cast(pl.read(pool_blocks, [page_i]), pl.INDEX)
-                pool_i8[p0_idx : p0_idx + INDEX_STATE_BLOCK_SIZE, :] = pool_cache[
-                    base_idx : base_idx + INDEX_STATE_BLOCK_SIZE, :
-                ]
-                pool_scale_g[p0_idx : p0_idx + INDEX_STATE_BLOCK_SIZE, :] = pool_scale[
-                    base_idx : base_idx + INDEX_STATE_BLOCK_SIZE, :
-                ]
+
+
+
+
 
 
 @pl.jit.inline
-def _indexer_pool_scale_block(
-    pool_scale_g: pl.Tensor[[POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE + SCORE_C_TILE, POOL_SCALE_WIDTH], pl.FP32],
-    pool_scale_col: pl.Tensor[[POOL_PAGES_DYN * INDEX_STATE_BLOCK_SIZE + SCORE_C_TILE, 1], pl.FP32],
-    scale_block: pl.Scalar[pl.INDEX],
-):
-    """Pack one 64-row scale block and apply the score scale."""
-    c0 = pl.cast(scale_block, pl.INT32) * SCORE_C_TILE
-    c0_idx = pl.cast(c0, pl.INDEX)
-    sc8 = pool_scale_g[c0_idx : c0_idx + SCORE_C_TILE, :]
-    summed = pl.reshape(pl.row_sum(sc8), [SCORE_C_TILE, 1])
-    pool_scale_col[c0_idx : c0_idx + SCORE_C_TILE, :] = pl.mul(summed, 0.125 * SOFTMAX_SCALE)
-
-
-@pl.jit.inline
-def _indexer_score_prepare(
+def _indexer_score_tile(
     index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
-    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
-    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16],
     pool_blocks: pl.Tensor[[POOL_PAGES_DYN], pl.INT32],
+    head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
+    token: pl.Scalar[pl.INDEX],
+    segment: pl.Scalar[pl.INDEX],
+    column: pl.Scalar[pl.INDEX],
+    visible: pl.Scalar[pl.INDEX],
 ):
-    """Shared scorer prologue: query rotation/quant and the pool gather.
-
-    Returns the INT8 query rows with their dequant scales and the contiguous
-    INT8/scale scratch the score loops read. ``pool_blocks`` holds one physical
-    base row per INDEX_STATE_BLOCK_SIZE-row page; the gather walks it page by
-    page, which is the granularity the metadata module lowers the pool page
-    table at — the host lowers paging, the kernel gathers. The score matrix
-    itself needs no preparation: prefill tiles store their whole lane span and
-    the top-k clamps through its valid-shaped leaf loads, so there is no init
-    fill.
-    """
-    t_dim = pl.tensor.dim(index_q, 0)
-    page_count = pl.tensor.dim(pool_blocks, 0)
-    pools = page_count * INDEX_STATE_BLOCK_SIZE
-
-    qh_acc = pl.create_tensor([t_dim * INDEX_H, INDEX_DIM], dtype=pl.FP32)
-    q_flat = pl.reshape(index_q, [t_dim * INDEX_H, INDEX_DIM])
-    for idx in pl.spmd(t_dim * INDEX_H // QH_MM_TILE, name_hint="indexer_q_hadamard", allow_early_resolve=True):
-        r0 = idx * QH_MM_TILE
-        qh_acc[r0:r0 + QH_MM_TILE, :] = pl.matmul(q_flat[r0:r0 + QH_MM_TILE, :], hadamard, out_dtype=pl.FP32)
-
-    q_scale_dq = pl.create_tensor([t_dim * INDEX_H, 1], dtype=pl.FP32)
-    q_i8 = pl.create_tensor([t_dim * INDEX_H, INDEX_DIM], dtype=pl.INT8)
-    for idx in pl.spmd(t_dim * INDEX_H // QH_MM_TILE, name_hint="indexer_q_quant", allow_early_resolve=True):
-        r0 = idx * QH_MM_TILE
-        qh_tile = qh_acc[r0 : r0 + QH_MM_TILE, :]
-        qh_amax = pl.full([1, QH_MM_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        qh_abs = pl.maximum(qh_tile, pl.neg(qh_tile))
-        qh_amax = pl.maximum(qh_amax, pl.reshape(pl.row_max(qh_abs), [1, QH_MM_TILE]))
-        scale_quant_row = pl.div(pl.full([1, QH_MM_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qh_amax)
-        q_scale_dq[r0 : r0 + QH_MM_TILE, :] = pl.reshape(pl.recip(scale_quant_row), [QH_MM_TILE, 1])
-        qh_scaled = pl.row_expand_mul(qh_tile, pl.reshape(scale_quant_row, [QH_MM_TILE, 1]))
-        qh_i32 = pl.cast(qh_scaled, target_type=pl.INT32, mode="rint")
-        qh_half = pl.cast(qh_i32, target_type=pl.FP16, mode="round")
-        q_i8[r0 : r0 + QH_MM_TILE, :] = pl.cast(qh_half, target_type=pl.INT8, mode="trunc")
-
-    pool_scale_g = pl.create_tensor([pools + SCORE_C_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32)
-    pool_i8 = pl.create_tensor([pools + SCORE_C_TILE, INDEX_DIM], dtype=pl.INT8)
-    if t_dim <= INDEXER_PERSISTENT_MAX_TOKENS:
-        # Persistent workers own 16-page chunks. A contiguous chunk is copied once
-        # as 64 rows; a scattered chunk retains per-page moves with identical bytes.
-        chunk_count = (page_count + POOL_GATHER_PAGE_TILE - 1) // POOL_GATHER_PAGE_TILE
-        gather_workers = pl.max(pl.min(chunk_count, POOL_GATHER_WORKERS), 1)
-        with pl.spmd(gather_workers, name_hint="indexer_pool_gather"):
-            worker = pl.tile.get_block_idx()
-            for chunk in pl.range(worker, chunk_count, POOL_GATHER_WORKERS):
-                _indexer_pool_gather_chunk(
-                    pool_cache, pool_scale, pool_blocks, pool_i8, pool_scale_g, chunk, page_count
-                )
-    else:
-        # Larger prefill batches dispatch one task per 16-page chunk with the
-        # same contiguous and scattered copy paths.
-        prefill_chunk_count = (page_count + POOL_GATHER_PAGE_TILE - 1) // POOL_GATHER_PAGE_TILE
-        for prefill_chunk in pl.spmd(prefill_chunk_count, name_hint="indexer_pool_gather"):
-            _indexer_pool_gather_chunk(
-                pool_cache, pool_scale, pool_blocks, pool_i8, pool_scale_g, prefill_chunk, page_count
-            )
-    # Collapse the replicated scale lanes once, width-proportional work outside
-    # the per-token loop: a strided lane-0 column read is not a legal TLOAD, and
-    # reducing inside the score loop costs ~40-70 ns per (token, tile) step.
-    # The softmax scale rides along here (it is per-row constant), so the score
-    # loops never multiply it per tile.
-    pool_scale_col = pl.create_tensor([pools + SCORE_C_TILE, 1], dtype=pl.FP32)
-    # pools is the page-table length times INDEX_STATE_BLOCK_SIZE and is NOT
-    # padded to SCORE_C_TILE — the production page table ends at the last live
-    # page — so the dispatch is ceiled: the final partial tile still packs its
-    # real rows. Lanes at or beyond pools stay undefined under the same
-    # clamped-by-valid-shape contract as the score matrix, and the scratch
-    # slack above covers every reader's widest tile, so the tail reads in
-    # bounds.
-    scale_blocks = (pools + SCORE_C_TILE - 1) // SCORE_C_TILE
-    if t_dim <= INDEXER_PERSISTENT_MAX_TOKENS:
-        scale_workers = pl.max(pl.min(scale_blocks, POOL_SCALE_WORKERS), 1)
-        with pl.spmd(scale_workers, name_hint="indexer_pool_scale_pack"):
-            worker = pl.tile.get_block_idx()
-            for scale_block in pl.range(worker, scale_blocks, POOL_SCALE_WORKERS):
-                _indexer_pool_scale_block(pool_scale_g, pool_scale_col, scale_block)
-    else:
-        for c_block in pl.spmd(scale_blocks, name_hint="indexer_pool_scale_pack"):
-            _indexer_pool_scale_block(pool_scale_g, pool_scale_col, c_block)
-    return q_i8, q_scale_dq, pool_i8, pool_scale_col
+    """Gather and score one bounded BF16 key tile from the physical pool table."""
+    keys = pl.create_l1([SCORE_C_TILE, INDEX_DIM], pl.BF16)
+    for row in pl.range(SCORE_C_TILE):
+        logical = segment + column + row
+        if column + row < visible:
+            page = pl.cast(pl.read(pool_blocks, [logical // INDEX_STATE_BLOCK_SIZE]), pl.INDEX)
+            source = page + logical % INDEX_STATE_BLOCK_SIZE
+            keys = pl.gather_row(keys, pool_cache, [row, 0], [source, 0], [1, INDEX_DIM])
+        else:
+            keys = pl.gather_row(keys, pool_cache, [row, 0], [0, 0], [1, INDEX_DIM])
+    query = index_q[token, :, :]
+    weights = head_weights[token:token + 1, :]
+    dots = pl.matmul(keys, query, out_dtype=pl.FP32, b_trans=True)
+    positive = pl.maximum(dots, 0.0)
+    weighted = pl.col_expand_mul(positive, weights)
+    scores = pl.reshape(pl.row_sum(weighted), [1, SCORE_C_TILE])
+    valid = pl.max(0, pl.min(SCORE_C_TILE, visible - column))
+    return pl.fillpad(pl.set_validshape(scores, 1, valid), pad_value=pl.PadValue.min)
 
 
 @pl.jit.inline
-def indexer_score(
+def indexer_select(
     index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
-    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
-    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
-    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16],
     pool_blocks: pl.Tensor[[POOL_PAGES_DYN], pl.INT32],
     head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
     seg_start: pl.Tensor[[T_DYN], pl.INT32],
     pool_count: pl.Tensor[[T_DYN], pl.INT32],
-    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
-):
-    """Score each query's own pooled-key segment for prefill and decode."""
-    t_dim = pl.tensor.dim(index_q, 0)
-    (q_i8, q_scale_dq, pool_i8, pool_scale_col) = _indexer_score_prepare(
-        index_q, hadamard, pool_cache, pool_scale, pool_blocks,
-    )
-
-    for token in pl.spmd(t_dim, name_hint="indexer_score"):
-        visible = pl.max(pl.read(pool_count, [token]), 0)
-        if visible > 0:
-            seg0 = pl.read(seg_start, [token])
-            q_tile_i8 = q_i8[token * INDEX_H : token * INDEX_H + INDEX_H, :]
-            q_scale_row = pl.reshape(q_scale_dq[token * INDEX_H : token * INDEX_H + INDEX_H, :], [1, INDEX_H])
-            # Fused per-head multiplier; the softmax scale already rides on the
-            # packed key scale, and the positive scale commutes with the relu.
-            qsw = pl.mul(q_scale_row, head_weights[token : token + 1, 0:INDEX_H])
-            for c0 in pl.range(0, visible, SCORE_C_TILE):
-                kv_q_i8 = pool_i8[seg0 + c0 : seg0 + c0 + SCORE_C_TILE, :]
-                kv_cache_scale_dq = pool_scale_col[seg0 + c0 : seg0 + c0 + SCORE_C_TILE, :]
-                dots_i32 = pl.matmul(kv_q_i8, q_tile_i8, out_dtype=pl.INT32, b_trans=True)
-                dots = pl.cast(dots_i32, target_type=pl.FP32, mode="none")
-                dots = pl.row_expand_mul(dots, kv_cache_scale_dq)
-                relu = pl.maximum(dots, 0.0)
-                weighted = pl.col_expand_mul(relu, qsw)
-                row_score = pl.reshape(pl.row_sum(weighted), [1, SCORE_C_TILE])
-                valid_len = pl.min(SCORE_C_TILE, visible - c0)
-                masked = pl.fillpad(pl.set_validshape(row_score, 1, valid_len), pad_value=pl.PadValue.min)
-                masked = pl.maximum(masked, pl.full([1, SCORE_C_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
-                index_scores[token : token + 1, seg0 + c0 : seg0 + c0 + SCORE_C_TILE] = masked
-
-
-@pl.jit.incore
-def _indexer_topk_query(
-    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
-    seg_start: pl.Tensor[[T_DYN], pl.INT32],
-    pool_count: pl.Tensor[[T_DYN], pl.INT32],
-    selected_pools: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
-    selected_valid: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
-) -> None:
-    """Stripe queries round-robin over the dispatched workers.
-
-    ``min(t_dim, TOPK_QUERY_WORKERS)`` blocks are dispatched. Worker ``w``
-    processes ``w, w + TOPK_QUERY_WORKERS, ...`` while the query is below
-    ``t_dim``.
-    """
-    worker = pl.tile.get_block_idx()
-    t_dim = pl.tensor.dim(index_scores, 0)
-    for query in pl.range(worker, t_dim, TOPK_QUERY_WORKERS):
-        _indexer_topk_one_query(index_scores, seg_start, pool_count, selected_pools, selected_valid, query)
-
-
-@pl.jit.inline
-def indexer_topk(
-    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
-    seg_start: pl.Tensor[[T_DYN], pl.INT32],
-    pool_count: pl.Tensor[[T_DYN], pl.INT32],
     selected_pools: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
     selected_valid: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
 ):
-    """Top-512 over each query's visible window, persistent-worker dispatch.
+    """Stream 2048-key leaves and retain 512 candidates per query.
 
-    ``min(t_dim, TOPK_QUERY_WORKERS)`` blocks stripe the queries. A window of
-    at most ``KPOOL_SELECT_K`` pools selects every visible pool in compact id
-    order; larger windows take the exact sorted path.
+    A window of at most ``KPOOL_SELECT_K`` pools selects every visible pool in
+    compact id order without scoring anything; larger windows score one leaf at
+    a time and merge each leaf's sorted top pairs into a running root, so no
+    full score row is ever materialized.
 
     Selections are segment-local pool ids: the sort payload carries the offset
     from ``seg_start``, so ``indexer_expand`` can map pool ``j`` to raw
     positions ``4j .. 4j+3`` without any batch knowledge.
-
-    The sorted path's running top pairs live in a loop-carried on-chip tile.
 
     **Sharing ABI** (``index_share_for_mtp_iteration``, settled in issue
     #1267): ``selected_pools``/``selected_valid`` are the shareable selection
@@ -667,15 +430,88 @@ def indexer_topk(
     expansion is *not* shareable and is rebuilt per row by
     :func:`indexer_expand`. The resident MTP scheduler retains the selection
     per request and skips this entry on recycled proposal steps.
-
-    Returns the region's TaskId so the expansion can order against it.
     """
-    t_dim = pl.tensor.dim(index_scores, 0)
-    with pl.spmd(
-        pl.min(t_dim, TOPK_QUERY_WORKERS), name_hint="indexer_topk"
-    ) as topk_tid:
-        _indexer_topk_query(index_scores, seg_start, pool_count, selected_pools, selected_valid)
-    return topk_tid
+    tokens = pl.tensor.dim(index_q, 0)
+    maximum = pl.cast(0, pl.INDEX)
+    for token in pl.range(tokens):
+        count = pl.cast(pl.read(pool_count, [token]), pl.INDEX)
+        maximum = pl.max(maximum, count)
+    with pl.spmd(tokens, name_hint="indexer_select_short"):
+        token = pl.tile.get_block_idx()
+        visible = pl.max(pl.read(pool_count, [token]), 0)
+        if visible <= KPOOL_SELECT_K:
+            lane = pl.tile.arange(0, [1, KPOOL_SELECT_K], dtype=pl.INT32)
+            keep = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, pl.cast(visible, pl.INT32))), 0), 1)
+            indices = pl.sub(pl.add(pl.mul(lane, keep), keep), 1)
+            pl.store(indices, [token, 0], selected_pools)
+            pl.store(keep, [token, 0], selected_valid)
+    if maximum > KPOOL_SELECT_K:
+        leaf_scores = pl.create_tensor([tokens, SORT_TILE], dtype=pl.FP32)
+        roots = pl.create_tensor([tokens, PAIR_WIDTH], dtype=pl.FP32)
+        for leaf in pl.range((maximum + SORT_TILE - 1) // SORT_TILE):
+            leaf_start = leaf * SORT_TILE
+            with pl.spmd(tokens, name_hint="indexer_select_scores") as score_tid:
+                token = pl.tile.get_block_idx()
+                visible = pl.cast(pl.max(pl.read(pool_count, [token]), 0), pl.INDEX)
+                segment = pl.cast(pl.read(seg_start, [token]), pl.INDEX)
+                if visible > KPOOL_SELECT_K and leaf_start < visible:
+                    for offset in pl.range(0, SORT_TILE, SCORE_C_TILE):
+                        column = leaf_start + offset
+                        scores = _indexer_score_tile(
+                            index_q, pool_cache, pool_blocks, head_weights, token, segment, column, visible,
+                        )
+                        leaf_scores[token:token + 1, offset:offset + SCORE_C_TILE] = scores
+            with pl.spmd(tokens, name_hint="indexer_select_merge", deps=[score_tid]):
+                token = pl.tile.get_block_idx()
+                visible = pl.cast(pl.max(pl.read(pool_count, [token]), 0), pl.INDEX)
+                if visible > KPOOL_SELECT_K and leaf_start < visible:
+                    row = pl.load(leaf_scores, [token, 0], [1, SORT_TILE])
+                    row = pl.maximum(row, pl.tile.full([1, SORT_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
+                    ramp = pl.tile.arange(0, [1, SORT_TILE], dtype=pl.INT32)
+                    ids = pl.add(ramp, pl.cast(leaf_start, pl.INT32))
+                    sort_tmp = pl.tile.create([1, 2 * SORT_TILE], dtype=pl.FP32)
+                    pairs = pl.tile.sort32(row, pl.reinterpret_view(ids, pl.UINT32), tmp=sort_tmp)
+                    pairs = pl.tile.mrgsort(pairs, block_len=64)
+                    pairs = pl.tile.mrgsort(pairs, block_len=256)
+                    pairs = pl.tile.mrgsort(pairs, block_len=1024)
+                    candidate = pl.tile.extract(pairs, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
+                    root = pl.tile.create([1, PAIR_WIDTH], dtype=pl.FP32)
+                    if leaf == 0:
+                        root = pl.tile.assemble(root, candidate, [0, 0])
+                    else:
+                        old = pl.load(roots, [token, 0], [1, PAIR_WIDTH])
+                        temporary = pl.tile.create([1, 2 * PAIR_WIDTH], dtype=pl.FP32)
+                        merged = pl.tile.mrgsort(old, candidate, tmp=temporary)
+                        retained = pl.tile.extract(merged, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
+                        root = pl.tile.assemble(root, retained, [0, 0])
+                    pl.store(root, [token, 0], roots)
+                    picked = pl.tile.gather_mask(root, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                    pl.store(picked, [token, 0], selected_pools)
+                    pl.store(pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=1), [token, 0], selected_valid)
+
+    return selected_pools, selected_valid
+
+
+@pl.jit
+def indexer_select_test(
+    index_q: pl.Tensor[[T_DYN, INDEX_H, INDEX_DIM], pl.BF16],
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16],
+    pool_blocks: pl.Tensor[[POOL_PAGES_DYN], pl.INT32],
+    head_weights: pl.Tensor[[T_DYN, INDEX_H], pl.FP32],
+    seg_start: pl.Tensor[[T_DYN], pl.INT32],
+    pool_count: pl.Tensor[[T_DYN], pl.INT32],
+    selected_pools: pl.Out[pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32]],
+    selected_valid: pl.Out[pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32]],
+):
+    index_q.bind_dynamic(0, T_DYN)
+    pool_blocks.bind_dynamic(0, POOL_PAGES_DYN)
+    head_weights.bind_dynamic(0, T_DYN)
+    seg_start.bind_dynamic(0, T_DYN)
+    pool_count.bind_dynamic(0, T_DYN)
+    selected_pools.bind_dynamic(0, T_DYN)
+    selected_valid.bind_dynamic(0, T_DYN)
+    indexer_select(index_q, pool_cache, pool_blocks, head_weights, seg_start, pool_count, selected_pools, selected_valid)
+    return selected_pools, selected_valid
 
 
 @pl.jit.inline
@@ -785,7 +621,7 @@ def indexer_expand(
 
 @pl.jit.inline
 def indexer_cache_write(
-    index_k: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
+    index_k: pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32],
     gate_scores: pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32],
     slots: pl.Tensor[[T_DYN], pl.INT32],
     cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
@@ -813,7 +649,7 @@ def indexer_cache_write(
         # bounds check below drops the window's phantom rows from the slot read
         # and both stores. Full blocks are unaffected.
         keys_f32 = pl.tile.fillpad(
-            pl.cast(pl.load(index_k, [base, 0], [CACHE_WRITE_TILE, INDEX_DIM], clamp=True), pl.FP32, mode="none")
+            pl.load(index_k, [base, 0], [CACHE_WRITE_TILE, INDEX_DIM], clamp=True)
         )
         gates = pl.tile.fillpad(pl.load(gate_scores, [base, 0], [CACHE_WRITE_TILE, INDEX_DIM], clamp=True))
         for row in pl.unroll(0, CACHE_WRITE_TILE):
@@ -824,81 +660,6 @@ def indexer_cache_write(
                     pl.store(pl.tile.slice(keys_f32, [1, INDEX_DIM], [row, 0]), [slot, 0], cache)
                     pl.store(pl.tile.slice(gates, [1, INDEX_DIM], [row, 0]), [slot, INDEX_DIM], cache)
     return write_tid
-
-
-@pl.jit.inline
-def _indexer_topk_one_query(
-    index_scores: pl.Tensor[[T_DYN, POOLS_DYN], pl.FP32],
-    seg_start: pl.Tensor[[T_DYN], pl.INT32],
-    pool_count: pl.Tensor[[T_DYN], pl.INT32],
-    selected_pools: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
-    selected_valid: pl.Tensor[[T_DYN, KPOOL_SELECT_K], pl.INT32],
-    query: pl.Scalar[pl.INDEX],
-) -> None:
-    """Select one query's top visible pools (the per-query sort pipeline)."""
-    pl.store(pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=-1), [query, 0], selected_pools)
-    pl.store(pl.tile.full([1, KPOOL_SELECT_K], dtype=pl.INT32, value=0), [query, 0], selected_valid)
-    visible_count = pl.max(pl.read(pool_count, [query]), 0)
-    if visible_count > 0:
-        seg0 = pl.read(seg_start, [query])
-        if visible_count <= KPOOL_SELECT_K:
-            # At or below the select width, materialize every visible pool
-            # directly from the compact id ramp without reading scores or
-            # sorting. The selection prefix order is ABI-free.
-            valid_topk = pl.cast(visible_count, pl.INT32)
-            lane = pl.tile.arange(0, [1, KPOOL_SELECT_K], dtype=pl.INT32)
-            keep = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, valid_topk)), 0), 1)
-            indices_out = pl.sub(pl.add(pl.mul(lane, keep), keep), 1)
-            pl.store(indices_out, [query, 0], selected_pools)
-            pl.store(keep, [query, 0], selected_valid)
-        else:
-            # Carry a pad-free root tile across the leaf loop. Extract each
-            # leaf's sorted top pairs and merge them into the root with
-            # assemble; a re-sliced merge result is a view whose pad-carrying
-            # type is rejected as a loop iter-arg. A one-leaf window publishes
-            # directly from the seeded root.
-            leaf_valid = pl.min(SORT_TILE, visible_count)
-            row_raw = pl.load(index_scores, [query, seg0], [1, SORT_TILE], valid_shape=[1, leaf_valid])
-            row = pl.tile.fillpad(row_raw, pad_value=pl.PadValue.min)
-            row = pl.maximum(row, pl.tile.full([1, SORT_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
-            index_ramp = pl.tile.arange(0, [1, SORT_TILE], dtype=pl.INT32)
-            leaf_pairs = pl.tile.sort32(row, pl.reinterpret_view(index_ramp, pl.UINT32))
-            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=64)
-            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=256)
-            leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=1024)
-            root = pl.tile.create([1, PAIR_WIDTH], dtype=pl.FP32)
-            seed = pl.tile.extract(leaf_pairs, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
-            root = pl.tile.assemble(root, seed, [0, 0])
-            leaf_count = (visible_count + SORT_TILE - 1) // SORT_TILE
-            for leaf in pl.range(1, leaf_count):
-                leaf0 = leaf * SORT_TILE
-                lv = pl.min(SORT_TILE, visible_count - leaf0)
-                row2_raw = pl.load(index_scores, [query, seg0 + leaf0], [1, SORT_TILE], valid_shape=[1, lv])
-                row2 = pl.tile.fillpad(row2_raw, pad_value=pl.PadValue.min)
-                row2 = pl.maximum(row2, pl.tile.full([1, SORT_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
-                ramp2 = pl.tile.arange(0, [1, SORT_TILE], dtype=pl.INT32)
-                lp2 = pl.tile.sort32(row2, pl.reinterpret_view(pl.tile.add(ramp2, pl.cast(leaf0, pl.INT32)), pl.UINT32))
-                lp2 = pl.tile.mrgsort(lp2, block_len=64)
-                lp2 = pl.tile.mrgsort(lp2, block_len=256)
-                lp2 = pl.tile.mrgsort(lp2, block_len=1024)
-                lp2_top = pl.tile.extract(lp2, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
-                old_root = pl.tile.extract(root, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
-                merge_tmp = pl.tile.create([1, 2 * PAIR_WIDTH], dtype=pl.FP32)
-                merged = pl.tile.mrgsort(old_root, lp2_top, tmp=merge_tmp)
-                next_root = pl.tile.extract(merged, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
-                root = pl.tile.assemble(root, next_root, [0, 0])
-            pairs = pl.tile.extract(root, 0, 0, [1, PAIR_WIDTH], target_memory=pl.Mem.Vec)
-            picked = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            valid_topk = pl.cast(pl.min(visible_count, KPOOL_SELECT_K), pl.INT32)
-            # Materialize the picked payload in one integer lane pass. keep is
-            # the 0/1 window mask: picked*keep + keep - 1 maps valid lanes to
-            # picked ids and padding lanes to -1, while keep is the validity
-            # output. fillpad cannot emit the arbitrary integer -1 pad.
-            lane = pl.tile.arange(0, [1, KPOOL_SELECT_K], dtype=pl.INT32)
-            keep = pl.minimum(pl.maximum(pl.neg(pl.sub(lane, valid_topk)), 0), 1)
-            indices_out = pl.sub(pl.add(pl.mul(picked, keep), keep), 1)
-            pl.store(indices_out, [query, 0], selected_pools)
-            pl.store(keep, [query, 0], selected_valid)
 
 
 @pl.jit.incore
@@ -914,9 +675,8 @@ def _indexer_pool_write_event(
     The softmax runs per dimension over the four pool lanes in FP32, matching the
     reference numerics: ``weights = softmax(gate + ape)`` along the lane axis, then
     ``pool_key = sum(weights * key)``. The FP32 pooled key lands in the
-    contiguous ``pool_stage`` row of its event; a second scope quantizes the
-    staged rows to INT8 plus a dequant scale and scatters them to the paged
-    destinations. An event with a ``-1`` member slot is a padded pool: it stages a
+    contiguous ``pool_stage`` row of its event; a second scope rounds the
+    staged rows to BF16 and scatters them to the paged destinations. An event with a ``-1`` member slot is a padded pool: it stages a
     zero row and reports ``pool_valid = 0`` so the scorer can drop it. The staged
     row is always written, which keeps the epilogue's input fully defined.
     """
@@ -972,55 +732,27 @@ def _indexer_pool_write_event(
 def indexer_pool_write(
     raw_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
-    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
     pool_token_slots: pl.Tensor[[POOL_EVENTS_DYN, INDEX_KPOOL], pl.INT32],
     pool_slots: pl.Tensor[[POOL_EVENTS_DYN], pl.INT32],
-    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8],
-    pool_scale: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32],
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16],
     pool_valid: pl.Tensor[[POOL_EVENTS_DYN, POOL_VALID_WIDTH], pl.INT32],
 ):
-    """Write one quantized pooled key row per pool-close event."""
+    """Compress four FP32 key/gate rows into one BF16 pooled key."""
     events = pl.tensor.dim(pool_token_slots, 0)
-    stage_rows = ((events + POOL_QUANT_TILE - 1) // POOL_QUANT_TILE) * POOL_QUANT_TILE
-    pool_stage = pl.create_tensor([stage_rows, INDEX_DIM], dtype=pl.FP32)
+    pool_stage = pl.create_tensor([events, INDEX_DIM], dtype=pl.FP32)
     with pl.spmd(events, name_hint="indexer_pool_write") as pool_tid:
         _indexer_pool_write_event(raw_cache, compress_ape, pool_token_slots, pool_stage, pool_valid)
-    for blk in pl.spmd((events + POOL_QUANT_TILE - 1) // POOL_QUANT_TILE, name_hint="indexer_pool_quant"):
-        # Slicing wants INDEX offsets; the INT32 twin feeds the arithmetic.
-        e0 = pl.cast(blk, pl.INT32) * POOL_QUANT_TILE
-        e0_idx = pl.cast(e0, pl.INDEX)
-        staged = pool_stage[e0_idx : e0_idx + POOL_QUANT_TILE, :]
-        for _ in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-            staged_bf16 = pl.cast(staged, pl.BF16, mode="rint")
-            staged_mat = pl.aic_gather(staged_bf16)
-        staged_rot = pl.matmul(staged_mat, hadamard, out_dtype=pl.FP32)
-        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-            rotated = pl.aiv_shard(staged_rot)
-            if aiv_id == 0:
-                staged_abs = pl.maximum(rotated, pl.neg(rotated))
-                amax = pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                amax = pl.maximum(amax, pl.reshape(pl.row_max(staged_abs), [1, POOL_QUANT_TILE]))
-                scale_quant_row = pl.div(pl.full([1, POOL_QUANT_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), amax)
-                staged_scaled = pl.row_expand_mul(rotated, pl.reshape(scale_quant_row, [POOL_QUANT_TILE, 1]))
-                staged_i32 = pl.cast(staged_scaled, target_type=pl.INT32, mode="rint")
-                staged_half = pl.cast(staged_i32, target_type=pl.FP16, mode="round")
-                staged_i8 = pl.cast(staged_half, target_type=pl.INT8, mode="trunc")
-                scale_dq_col = pl.reshape(pl.recip(scale_quant_row), [POOL_QUANT_TILE, 1])
-                scale_pad_full = pl.full([POOL_QUANT_TILE, POOL_SCALE_WIDTH], dtype=pl.FP32, value=1.0)
-                scale_pad = pl.row_expand_mul(scale_pad_full, scale_dq_col)
-                for e in pl.range(POOL_QUANT_TILE):
-                    ei = pl.cast(e, pl.INT32)
-                    if e0 + ei < events:
-                        ei_idx = pl.cast(ei, pl.INDEX)
-                        dest = pl.cast(pl.read(pool_slots, [e0 + ei]), pl.INDEX)
-                        pool_cache[dest : dest + 1, :] = staged_i8[ei_idx : ei_idx + 1, :]
-                        pool_scale[dest : dest + 1, :] = scale_pad[ei_idx : ei_idx + 1, :]
-    return pool_tid
+    with pl.spmd(events, name_hint="indexer_pool_store", deps=[pool_tid]) as store_tid:
+        event = pl.tile.get_block_idx()
+        destination = pl.cast(pl.read(pool_slots, [event]), pl.INDEX)
+        pooled = pl.cast(pool_stage[event:event + 1, :], pl.BF16, mode="rint")
+        pool_cache[destination:destination + 1, :] = pooled
+    return store_tid
 
 
 @pl.jit
 def indexer_cache_write_test(
-    index_k: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
+    index_k: pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32],
     gate_scores: pl.Tensor[[T_DYN, INDEX_DIM], pl.FP32],
     slots: pl.Tensor[[T_DYN], pl.INT32],
     cache: pl.InOut[pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32]],
@@ -1037,11 +769,9 @@ def indexer_cache_write_test(
 def indexer_pool_write_test(
     raw_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
-    hadamard: pl.Tensor[[INDEX_DIM, INDEX_DIM], pl.BF16],
     pool_token_slots: pl.Tensor[[POOL_EVENTS_DYN, INDEX_KPOOL], pl.INT32],
     pool_slots: pl.Tensor[[POOL_EVENTS_DYN], pl.INT32],
-    pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.INT8]],
-    pool_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH], pl.FP32]],
+    pool_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16]],
     pool_valid: pl.Out[pl.Tensor[[POOL_EVENTS_DYN, POOL_VALID_WIDTH], pl.INT32]],
 ):
     """Close every pool event of one dispatch for golden.run validation."""
@@ -1049,9 +779,9 @@ def indexer_pool_write_test(
     pool_slots.bind_dynamic(0, POOL_EVENTS_DYN)
     pool_valid.bind_dynamic(0, POOL_EVENTS_DYN)
     indexer_pool_write(
-        raw_cache, compress_ape, hadamard, pool_token_slots, pool_slots, pool_cache, pool_scale, pool_valid,
+        raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid,
     )
-    return pool_cache, pool_scale, pool_valid
+    return pool_cache, pool_valid
 
 
 def build_decode_indexer_step_specs(
@@ -1189,22 +919,11 @@ def build_decode_indexer_step_specs(
         cache[:, :INDEX_DIM] = cache[:, :INDEX_DIM].bfloat16().float()
         return cache
 
-    # The pooled table starts as the quantized form earlier steps would have
-    # left behind: INT8 rows already rotated into the Hadamard basis, paired
-    # with their dequant scales, one draw feeding both so the pairs stay
-    # consistent.
-    (prior_i8, prior_scale_col) = quantize_per_token_int8(
-        torch.randn(pool_table_rows, INDEX_DIM, generator=generator, dtype=torch.float32),
-    )
+    # Completed pools are retained as unrotated BF16 keys.
+    prior_pool = torch.randn(pool_table_rows, INDEX_DIM, generator=generator, dtype=torch.float32).bfloat16()
 
     def init_pool_cache():
-        return prior_i8
-
-    def init_pool_scale():
-        # The writer replicates the scale across all POOL_SCALE_WIDTH lanes and
-        # the scorer reads the row sum scaled by 1/8, so the prior table must
-        # carry the replication too.
-        return prior_scale_col.expand(-1, POOL_SCALE_WIDTH).contiguous().clone()
+        return prior_pool.clone()
 
     shapes = {
         "w_q_b": (Q_LORA, INDEX_H * INDEX_DIM),
@@ -1228,7 +947,6 @@ def build_decode_indexer_step_specs(
         TensorSpec("k_norm_bias", [INDEX_DIM], torch.bfloat16, init_value=lambda : (0.1 * torch.randn(INDEX_DIM, generator=generator)).bfloat16()),
         TensorSpec("w_weights", [D, INDEX_H], torch.bfloat16, init_value=init_weights("w_weights", 0.05)),
         TensorSpec("w_compress_gate", [D, INDEX_DIM], torch.bfloat16, init_value=init_weights("w_compress_gate", 0.02)),
-        TensorSpec("hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard),
         TensorSpec("compress_ape", [INDEX_KPOOL, INDEX_DIM], torch.bfloat16, init_value=lambda : torch.randn(INDEX_KPOOL, INDEX_DIM, generator=generator).bfloat16()),
         TensorSpec("index_slots", [tokens], torch.int32, init_value=lambda: index_slots),
         TensorSpec("pool_token_slots", [events, INDEX_KPOOL], torch.int32, init_value=lambda : closing_slots),
@@ -1240,14 +958,12 @@ def build_decode_indexer_step_specs(
         TensorSpec("tail_count", [tokens], torch.int32, init_value=lambda: tail_count),
         TensorSpec("kv_len", [tokens], torch.int32, init_value=lambda: kv_len),
         TensorSpec("raw_cache", [raw_cache_rows, INDEX_STATE_WIDTH], torch.float32, init_value=init_raw_cache),
-        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.int8, init_value=init_pool_cache),
-        TensorSpec("pool_scale", [pool_table_rows, POOL_SCALE_WIDTH], torch.float32, init_value=init_pool_scale),
+        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.bfloat16, init_value=init_pool_cache),
         TensorSpec("pool_valid", [events, POOL_VALID_WIDTH], torch.int32),
         TensorSpec("index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16),
-        TensorSpec("index_k", [tokens, INDEX_DIM], torch.bfloat16),
+        TensorSpec("index_k", [tokens, INDEX_DIM], torch.float32),
         TensorSpec("head_weights", [tokens, INDEX_H], torch.float32),
         TensorSpec("gate_scores", [tokens, INDEX_DIM], torch.float32),
-        TensorSpec("index_scores", [tokens, width], torch.float32),
         TensorSpec("selected_pools", [tokens, KPOOL_SELECT_K], torch.int32),
         TensorSpec("selected_valid", [tokens, KPOOL_SELECT_K], torch.int32),
         TensorSpec("topk_indices", [tokens, TOPK_INDEX_WIDTH], torch.int32),
@@ -1269,18 +985,17 @@ def golden_decode_indexer_step_case(tensors):
         tensors["raw_cache"],
         index_k, gate_scores, tensors["index_slots"],
     )
-    (pool_cache, pool_scale, pool_valid) = golden_indexer_pool_write(
-        tensors["pool_cache"], tensors["pool_scale"], tensors["raw_cache"], tensors["compress_ape"],
-        tensors["hadamard"], tensors["pool_token_slots"], tensors["pool_slots"],
+    (pool_cache, pool_valid) = golden_indexer_pool_write(
+        tensors["pool_cache"], tensors["raw_cache"], tensors["compress_ape"],
+        tensors["pool_token_slots"], tensors["pool_slots"],
     )
     tensors["pool_cache"][:] = pool_cache
-    tensors["pool_scale"][:] = pool_scale
     tensors["pool_valid"][:] = pool_valid
-    tensors["index_scores"][:] = golden_indexer_score(
-        tensors["index_q"], tensors["hadamard"], tensors["pool_cache"], tensors["pool_scale"],
+    scores = golden_indexer_score(
+        tensors["index_q"], tensors["pool_cache"],
         tensors["pool_blocks"], tensors["head_weights"], tensors["seg_start"], tensors["pool_count"],
     )
-    (selected, valid) = golden_indexer_topk(tensors["index_scores"], tensors["seg_start"], tensors["pool_count"])
+    (selected, valid) = golden_indexer_topk(scores, tensors["seg_start"], tensors["pool_count"])
     tensors["selected_pools"][:] = selected
     tensors["selected_valid"][:] = valid
     tensors["topk_indices"][:] = golden_indexer_expand(
@@ -1325,7 +1040,7 @@ def build_decode_indexer_abi_specs(
 
     return [
         TensorSpec("absorbed_query", [tokens, LOCAL_H, KV_LORA], torch.bfloat16, init_value=lambda : torch.randn(tokens, LOCAL_H, KV_LORA, generator=generator, dtype=torch.float32).bfloat16()),
-        TensorSpec("latent_cache", [cache_rows, KV_LORA], torch.bfloat16, init_value=lambda : torch.randn(cache_rows, KV_LORA, generator=generator).bfloat16()),
+        TensorSpec("latent_cache", [cache_rows, MLA_CACHE_WIDTH], torch.int8, init_value=lambda: pack_mla_cache(torch.randn(cache_rows, KV_LORA, generator=generator).bfloat16())),
         TensorSpec("block_table", [requests, pages_per_request], torch.int32, init_value=lambda : block_table),
         TensorSpec("request_ids", [tokens], torch.int32, init_value=lambda: request_ids),
         TensorSpec("topk_indices", [tokens, TOPK_INDEX_WIDTH], torch.int32, init_value=lambda : topk_indices.clone()),
@@ -1576,7 +1291,7 @@ def build_indexer_proj_specs(tokens: int = 64):
         TensorSpec("w_weights", [D, INDEX_H], torch.bfloat16, init_value=init_w_weights),
         TensorSpec("w_compress_gate", [D, INDEX_DIM], torch.bfloat16, init_value=init_w_compress_gate),
         TensorSpec("index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16),
-        TensorSpec("index_k", [tokens, INDEX_DIM], torch.bfloat16),
+        TensorSpec("index_k", [tokens, INDEX_DIM], torch.float32),
         TensorSpec("head_weights", [tokens, INDEX_H], torch.float32),
         TensorSpec("gate_scores", [tokens, INDEX_DIM], torch.float32),
     ]
@@ -1642,7 +1357,7 @@ def _pool_batch(
     request_slots: int | None = None,
     table_max: int | None = None,
 ):
-    """Derive the score/topk batch geometry from per-request pool counts.
+    """Derive the selection batch geometry from per-request pool counts.
 
     Returns the leaf-aligned width, pooled-table row count, leaf-padded draw
     row count, per-query segment metadata, and pool row indirection. ``positions``
@@ -1736,7 +1451,7 @@ def _pool_batch(
     return width, pool_table_rows, pool_table_rows, seg_start, pool_count, pool_blocks
 
 
-def build_indexer_score_specs(
+def build_indexer_select_specs(
     tokens: int = 8,
     counts: tuple[int, ...] | None = None,
     positions: tuple[int, ...] | None = None,
@@ -1747,11 +1462,12 @@ def build_indexer_score_specs(
     request_slots: int | None = None,
     table_max: int | None = None,
 ):
-    """Build one deterministic two-request score batch.
+    """Build one deterministic two-request selection batch.
 
     Request 0 owns 3000 pools so its longest query spans two sort leaves, and
     the query positions ramp from a first token (visible count 0) to a full
-    window, so the causal clamp and the leaf-crossing window both execute.
+    window, so the causal clamp, the short route below ``KPOOL_SELECT_K`` and
+    the leaf-crossing sorted route all execute in one batch.
     ``counts``/``positions`` override the fixture geometry for the
     business-shape benchmark points: one request whose positions are the
     ``history`` ramp in front of the measured chunk. ``pad_pages=False`` ends
@@ -1766,7 +1482,7 @@ def build_indexer_score_specs(
 
     counts = (3000, 140) if counts is None else counts
     positions = (2, 6, 5000, 11999, 3, 7, 500, 559) if positions is None else positions
-    (width, pool_table_rows, prior_draw_rows, seg_start, pool_count, pool_blocks) = _pool_batch(
+    (_, pool_table_rows, prior_draw_rows, seg_start, pool_count, pool_blocks) = _pool_batch(
         tokens,
         counts,
         positions,
@@ -1782,42 +1498,31 @@ def build_indexer_score_specs(
     def init_index_q():
         return torch.randn(tokens, INDEX_H, INDEX_DIM, generator=generator).bfloat16()
 
-    # One leaf-padded draw supplies paired INT8 keys and dequant scales in
-    # the Hadamard basis; the resident cache retains its row prefix.
-    (prior_i8, prior_scale_col) = quantize_per_token_int8(
-        torch.randn(prior_draw_rows, INDEX_DIM, generator=generator, dtype=torch.float32),
-    )
+    # The resident BF16 cache retains the leaf-padded prior draw prefix.
+    prior_pool = torch.randn(prior_draw_rows, INDEX_DIM, generator=generator, dtype=torch.float32).bfloat16()
     if prior_draw_rows > pool_table_rows:
-        prior_i8 = prior_i8[:pool_table_rows]
-        prior_scale_col = prior_scale_col[:pool_table_rows]
+        prior_pool = prior_pool[:pool_table_rows]
 
     def init_pool_cache():
-        return prior_i8
-
-    def init_pool_scale():
-        # The writer replicates the scale across all POOL_SCALE_WIDTH lanes and
-        # the scorer reads the row sum scaled by 1/8, so the prior table must
-        # carry the replication too.
-        return prior_scale_col.expand(-1, POOL_SCALE_WIDTH).contiguous().clone()
+        return prior_pool.clone()
 
     def init_head_weights():
         return torch.randn(tokens, INDEX_H, generator=generator)
 
     return [
         TensorSpec("index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16, init_value=init_index_q),
-        TensorSpec("hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard),
-        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.int8, init_value=init_pool_cache),
-        TensorSpec("pool_scale", [pool_table_rows, POOL_SCALE_WIDTH], torch.float32, init_value=init_pool_scale),
+        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.bfloat16, init_value=init_pool_cache),
         TensorSpec("pool_blocks", [len(pool_blocks)], torch.int32, init_value=lambda : pool_blocks),
         TensorSpec("head_weights", [tokens, INDEX_H], torch.float32, init_value=init_head_weights),
         TensorSpec("seg_start", [tokens], torch.int32, init_value=lambda: seg_start),
         TensorSpec("pool_count", [tokens], torch.int32, init_value=lambda: pool_count),
-        TensorSpec("index_scores", [tokens, width], torch.float32),
+        TensorSpec("selected_pools", [tokens, KPOOL_SELECT_K], torch.int32),
+        TensorSpec("selected_valid", [tokens, KPOOL_SELECT_K], torch.int32),
     ]
 
 
-def build_indexer_score_tail_specs():
-    """Score batch whose gathered row count misses both score tile boundaries.
+def build_indexer_select_tail_specs():
+    """Selection batch whose gathered row count misses both score tile boundaries.
 
     Thirty-three live four-row pages hold 132 pooled rows, so the scale pack
     and per-query score loops both end with a partial 64-row tile. This is
@@ -1825,11 +1530,11 @@ def build_indexer_score_tail_specs():
     cannot reach. The position ramp climbs from an empty window through the
     64-row boundary to the full 132-row one.
     """
-    return build_indexer_score_specs(8, (132,), (1, 3, 7, 15, 31, 63, 255, 527), pad_pages=False)
+    return build_indexer_select_specs(8, (132,), (1, 3, 7, 15, 31, 63, 255, 527), pad_pages=False)
 
 
-def build_indexer_score_run_specs():
-    """Score batch whose page table is mostly one physical run.
+def build_indexer_select_run_specs():
+    """Selection batch whose page table is mostly one physical run.
 
     A ``pool_block_table=None`` metadata lowering is the identity map
     (:func:`models.glm5_3_flash.utils.build_indexer_chunk_metadata`), so
@@ -1840,57 +1545,7 @@ def build_indexer_score_run_specs():
     run spanning several gather chunks — every branch of the gather's run
     merge under the same window/golden contract.
     """
-    return build_indexer_score_specs(page_map="runs")
-
-
-def build_indexer_topk_specs(
-    tokens: int = 8,
-    counts: tuple[int, ...] | None = None,
-    positions: tuple[int, ...] | None = None,
-    *,
-    pool_stride: int | None = None,
-    request_slots: int | None = None,
-):
-    """Score-and-select on one batch: synthetic scores, real windows.
-
-    The score rows are random values inside each query's window and
-    ``FP32_NEG_INF`` outside it, which is exactly the shape :func:`indexer_score`
-    leaves behind, so the sort sees realistic value structure without depending
-    on the scorer's numerics. ``counts``/``positions`` override the fixture
-    geometry for the business-shape benchmark points.
-    """
-    from golden import TensorSpec
-
-    counts = (3000, 140) if counts is None else counts
-    positions = (2, 6, 5000, 11999, 3, 7, 500, 559) if positions is None else positions
-    # Synthetic-score batches use the permuted page-map geometry without a
-    # resident raw block-table extent.
-    width, _, _, seg_start, pool_count, _ = _pool_batch(
-        tokens,
-        counts,
-        positions,
-        page_map="perm",
-        pool_stride=pool_stride,
-        request_slots=request_slots,
-    )
-
-    generator = torch.Generator().manual_seed(79)
-
-    def init_index_scores():
-        rows = torch.rand(tokens, width, generator=generator) * 10.0
-        mask = torch.full((tokens, width), FP32_NEG_INF)
-        for token in range(tokens):
-            seg0 = int(seg_start[token])
-            mask[token, seg0 : seg0 + int(pool_count[token])] = 1.0
-        return rows * mask
-
-    return [
-        TensorSpec("index_scores", [tokens, width], torch.float32, init_value=init_index_scores),
-        TensorSpec("seg_start", [tokens], torch.int32, init_value=lambda: seg_start),
-        TensorSpec("pool_count", [tokens], torch.int32, init_value=lambda: pool_count),
-        TensorSpec("selected_pools", [tokens, KPOOL_SELECT_K], torch.int32),
-        TensorSpec("selected_valid", [tokens, KPOOL_SELECT_K], torch.int32),
-    ]
+    return build_indexer_select_specs(page_map="runs")
 
 
 def build_indexer_expand_specs(tokens: int = 8, lengths: tuple[int, ...] | None = None):
@@ -1948,31 +1603,6 @@ def golden_indexer_proj_case(tensors):
     tensors["index_k"][:] = index_k
     tensors["head_weights"][:] = head_weights
     tensors["gate_scores"][:] = gate_scores
-
-
-def golden_indexer_score_case(tensors):
-    """Fill the expected scores for :func:`build_indexer_score_specs`.
-
-    The golden emits one column per gathered row; lanes past that width stay
-    ``FP32_NEG_INF`` under the same contract the kernel leaves them — the
-    top-k clamps through its valid shapes, so only windows are compared.
-    """
-
-    expected = golden_indexer_score(
-        tensors["index_q"], tensors["hadamard"], tensors["pool_cache"], tensors["pool_scale"],
-        tensors["pool_blocks"], tensors["head_weights"], tensors["seg_start"], tensors["pool_count"],
-    )
-    scores = tensors["index_scores"]
-    scores[:] = FP32_NEG_INF
-    width = min(expected.shape[1], scores.shape[1])
-    scores[:, :width] = expected[:, :width]
-
-
-def golden_indexer_topk_case(tensors):
-    """Fill the expected selections for :func:`build_indexer_topk_specs`."""
-    (selected, valid) = golden_indexer_topk(tensors["index_scores"], tensors["seg_start"], tensors["pool_count"])
-    tensors["selected_pools"][:] = selected
-    tensors["selected_valid"][:] = valid
 
 
 def golden_indexer_expand_case(tensors):
@@ -2191,20 +1821,10 @@ def build_indexer_step_specs(
         cache[:, :INDEX_DIM] = cache[:, :INDEX_DIM].bfloat16().float()
         return cache
 
-    # One leaf-padded draw supplies paired INT8 keys and dequant scales in
-    # the Hadamard basis; the resident cache retains its row prefix.
-    (prior_i8, prior_scale_col) = quantize_per_token_int8(
-        torch.randn(prior_draw_rows, INDEX_DIM, generator=generator, dtype=torch.float32),
-    )
+    # The resident BF16 cache retains the leaf-padded prior draw prefix.
+    prior_pool = torch.randn(prior_draw_rows, INDEX_DIM, generator=generator, dtype=torch.float32).bfloat16()
     if prior_draw_rows > pool_table_rows:
-        prior_i8 = prior_i8[:pool_table_rows]
-        prior_scale_col = prior_scale_col[:pool_table_rows]
-
-    def init_pool_scale():
-        # The writer replicates the scale across all POOL_SCALE_WIDTH lanes and
-        # the scorer reads the row sum scaled by 1/8, so the prior table must
-        # carry the replication too.
-        return prior_scale_col.expand(-1, POOL_SCALE_WIDTH).contiguous().clone()
+        prior_pool = prior_pool[:pool_table_rows]
 
     specs = [
         TensorSpec("x", [tokens, D], torch.bfloat16, init_value=lambda : torch.randn(tokens, D, generator=generator, dtype=torch.float32).bfloat16()),
@@ -2215,7 +1835,6 @@ def build_indexer_step_specs(
         TensorSpec("k_norm_bias", [INDEX_DIM], torch.bfloat16, init_value=lambda : (0.1 * torch.randn(INDEX_DIM, generator=generator)).bfloat16()),
         TensorSpec("w_weights", [D, INDEX_H], torch.bfloat16, init_value=init_weights("w_weights", 0.05)),
         TensorSpec("w_compress_gate", [D, INDEX_DIM], torch.bfloat16, init_value=init_weights("w_compress_gate", 0.02)),
-        TensorSpec("hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard),
         TensorSpec("compress_ape", [INDEX_KPOOL, INDEX_DIM], torch.bfloat16, init_value=lambda : torch.randn(INDEX_KPOOL, INDEX_DIM, generator=generator).bfloat16()),
         TensorSpec("index_slots", [tokens], torch.int32, init_value=lambda: index_slots),
         TensorSpec("pool_token_slots", [events, INDEX_KPOOL], torch.int32, init_value=lambda : pool_token_slots),
@@ -2227,14 +1846,12 @@ def build_indexer_step_specs(
         TensorSpec("tail_count", [tokens], torch.int32, init_value=lambda: tail_count),
         TensorSpec("kv_len", [tokens], torch.int32, init_value=lambda: kv_len),
         TensorSpec("raw_cache", [raw_rows, INDEX_STATE_WIDTH], torch.float32, init_value=init_raw_cache),
-        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.int8, init_value=lambda: prior_i8),
-        TensorSpec("pool_scale", [pool_table_rows, POOL_SCALE_WIDTH], torch.float32, init_value=init_pool_scale),
+        TensorSpec("pool_cache", [pool_table_rows, INDEX_DIM], torch.bfloat16, init_value=lambda: prior_pool.clone()),
         TensorSpec("pool_valid", [events, POOL_VALID_WIDTH], torch.int32),
         TensorSpec("index_q", [tokens, INDEX_H, INDEX_DIM], torch.bfloat16),
-        TensorSpec("index_k", [tokens, INDEX_DIM], torch.bfloat16),
+        TensorSpec("index_k", [tokens, INDEX_DIM], torch.float32),
         TensorSpec("head_weights", [tokens, INDEX_H], torch.float32),
         TensorSpec("gate_scores", [tokens, INDEX_DIM], torch.float32),
-        TensorSpec("index_scores", [tokens, width], torch.float32),
         TensorSpec("selected_pools", [tokens, KPOOL_SELECT_K], torch.int32),
         TensorSpec("selected_valid", [tokens, KPOOL_SELECT_K], torch.int32),
         TensorSpec("topk_indices", [tokens, TOPK_INDEX_WIDTH], torch.int32),
@@ -2256,20 +1873,17 @@ def golden_indexer_prefill_step_case(tensors):
         tensors["raw_cache"],
         index_k, gate_scores, tensors["index_slots"],
     )
-    (pool_cache, pool_scale, pool_valid) = golden_indexer_pool_write(
-        tensors["pool_cache"], tensors["pool_scale"], tensors["raw_cache"], tensors["compress_ape"],
-        tensors["hadamard"], tensors["pool_token_slots"], tensors["pool_slots"],
+    (pool_cache, pool_valid) = golden_indexer_pool_write(
+        tensors["pool_cache"], tensors["raw_cache"], tensors["compress_ape"],
+        tensors["pool_token_slots"], tensors["pool_slots"],
     )
     tensors["pool_cache"][:] = pool_cache
-    tensors["pool_scale"][:] = pool_scale
     tensors["pool_valid"][:] = pool_valid
     expected_scores = golden_indexer_score(
-        tensors["index_q"], tensors["hadamard"], tensors["pool_cache"], tensors["pool_scale"],
+        tensors["index_q"], tensors["pool_cache"],
         tensors["pool_blocks"], tensors["head_weights"], tensors["seg_start"], tensors["pool_count"],
     )
-    score_width = tensors["index_scores"].shape[1]
-    tensors["index_scores"][:] = expected_scores[:, :score_width]
-    (selected, valid) = golden_indexer_topk(tensors["index_scores"], tensors["seg_start"], tensors["pool_count"])
+    (selected, valid) = golden_indexer_topk(expected_scores, tensors["seg_start"], tensors["pool_count"])
     tensors["selected_pools"][:] = selected
     tensors["selected_valid"][:] = valid
     tensors["topk_indices"][:] = golden_indexer_expand(
@@ -2300,12 +1914,12 @@ def _prefill_self_check() -> None:
         torch.randn(hidden, dim).bfloat16() * 0.1,
     )
     assert index_q.shape == (8, heads, dim), index_q.shape
-    assert index_k.dtype is torch.bfloat16
+    assert index_k.dtype is torch.float32
     manual_q = torch.nn.functional.linear(q_resid.float(), w_q_b.t().float())
     assert torch.allclose(index_q.float().flatten(1), manual_q, atol=2e-2), "q projection drifted"
-    raw = torch.nn.functional.linear(x.float(), w_k.t().float())
+    raw = torch.nn.functional.linear(x.float(), w_k.t().float()).bfloat16().float()
     manual_k = torch.nn.functional.layer_norm(raw, (dim,), k_w.float(), k_b.float(), K_NORM_EPS)
-    assert torch.allclose(index_k.float(), manual_k.to(torch.bfloat16).float(), atol=2e-2)
+    assert torch.allclose(index_k.float(), manual_k.float(), atol=2e-2)
 
     scores = torch.tensor([[9.0, 9.0, 5.0, 1.0, 3.0, 0.0], [0.0, 0.0, 9.0, 1.0, 5.0, 1.0]])
     seg = torch.tensor([0, 2], dtype=torch.int32)
@@ -2347,63 +1961,55 @@ def golden_indexer_proj(
     index_q = torch.nn.functional.linear(q_resid.float(), w_q_b.t().float())
     index_q = index_q.reshape(tokens, heads, dim).to(torch.bfloat16)
 
-    projected = torch.nn.functional.linear(x.float(), w_k.t().float())
+    projected = torch.nn.functional.linear(x.float(), w_k.t().float()).bfloat16().float()
     mean = projected.mean(dim=-1, keepdim=True)
     centered = projected - mean
     variance = centered.square().mean(dim=-1, keepdim=True)
     normalized = centered * (1.0 / torch.sqrt(variance + K_NORM_EPS))
-    index_k = (normalized * k_norm_weight.float() + k_norm_bias.float()).to(torch.bfloat16)
+    index_k = normalized * k_norm_weight.float() + k_norm_bias.float()
 
-    head_weights = torch.nn.functional.linear(x.float(), w_weights.t().float()) * WEIGHTS_SCALE
-    gate_scores = torch.nn.functional.linear(x.float(), w_compress_gate.t().float())
+    head_weights = torch.nn.functional.linear(x.float(), w_weights.t().float()).bfloat16().float() * WEIGHTS_SCALE
+    gate_scores = torch.nn.functional.linear(x.float(), w_compress_gate.t().float()).bfloat16().float()
     return index_q, index_k, head_weights, gate_scores
 
 
 def golden_indexer_score(
     index_q: torch.Tensor,
-    hadamard: torch.Tensor,
     pool_cache: torch.Tensor,
-    pool_scale: torch.Tensor,
     pool_blocks: torch.Tensor,
     head_weights: torch.Tensor,
     seg_start: torch.Tensor,
     pool_count: torch.Tensor,
 ) -> torch.Tensor:
-    """Head-weighted ReLU scores of every query against the pooled table.
-
-    The pooled table arrives already quantized — INT8 keys with their per-row
-    dequant scales, rotated into this Hadamard basis and quantized once at pool
-    close — and the query-side Hadamard rotation and INT8 quantization mirror
-    the kernel op for op. ``pool_blocks`` holds one physical base row per
-    compacted INDEX_STATE_BLOCK_SIZE-row page, the same page granularity the
-    metadata module maps pool slots at. The reference
-    ``Glm5NextTextIndexer`` scores in plain FP32, and the quantized path is
-    the a2a3 deployment numerics, so the golden carries the quantization
-    rather than approximating around it.
-    """
+    """Compute unrotated BF16-key scores with independent Torch reductions."""
     tokens = index_q.shape[0]
-    pools = pool_blocks.shape[0] * INDEX_STATE_BLOCK_SIZE
+    pools = pool_blocks.numel() * INDEX_STATE_BLOCK_SIZE
     scores = torch.full((tokens, pools), FP32_NEG_INF, dtype=torch.float32)
-    if pools == 0 or tokens == 0:
-        return scores
-    rotated = index_q.float().reshape(tokens * INDEX_H, INDEX_DIM) @ hadamard.float()
-    q_i8, q_scale = quantize_per_token_int8(rotated)
-    gathered = pool_blocks.to(torch.long).repeat_interleave(INDEX_STATE_BLOCK_SIZE) + torch.arange(
-        INDEX_STATE_BLOCK_SIZE
-    ).repeat(pool_blocks.shape[0])
-    k_i8 = pool_cache[gathered]
-    k_scale = pool_scale[gathered].sum(dim=-1, keepdim=True) * (0.125 * SOFTMAX_SCALE)
+    gathered = pool_blocks.long().repeat_interleave(INDEX_STATE_BLOCK_SIZE)
+    gathered = gathered + torch.arange(INDEX_STATE_BLOCK_SIZE).repeat(pool_blocks.numel())
+    keys = pool_cache[gathered].float()
     for token in range(tokens):
         visible = int(pool_count[token])
-        if visible <= 0:
-            continue
-        seg0 = int(seg_start[token])
-        q_rows = slice(token * INDEX_H, (token + 1) * INDEX_H)
-        dots = torch.matmul(k_i8[seg0:seg0 + visible].to(torch.int32), q_i8[q_rows].to(torch.int32).t()).float()
-        dots = torch.relu(dots * k_scale[seg0 : seg0 + visible])
-        query_weights = q_scale[q_rows].t() * head_weights[token]
-        scores[token, seg0 : seg0 + visible] = (dots * query_weights).sum(dim=1)
+        start = int(seg_start[token])
+        if visible:
+            dots = keys[start:start + visible] @ index_q[token].float().T
+            scores[token, start:start + visible] = (dots.relu() * head_weights[token]).sum(-1)
     return scores
+
+
+def golden_indexer_select_case(tensors):
+    """Fill the expected selections for :func:`build_indexer_select_specs`.
+
+    The kernel streams its scores, so the golden composes the two references
+    the score grid used to sit between.
+    """
+    scores = golden_indexer_score(
+        tensors["index_q"], tensors["pool_cache"], tensors["pool_blocks"], tensors["head_weights"],
+        tensors["seg_start"], tensors["pool_count"],
+    )
+    selected, valid = golden_indexer_topk(scores, tensors["seg_start"], tensors["pool_count"])
+    tensors["selected_pools"].copy_(selected)
+    tensors["selected_valid"].copy_(valid)
 
 
 def golden_indexer_topk(
@@ -2484,56 +2090,27 @@ def golden_indexer_cache_write(
 
 def golden_indexer_pool_write(
     pool_cache: torch.Tensor,
-    pool_scale: torch.Tensor,
     raw_cache: torch.Tensor,
     compress_ape: torch.Tensor,
-    hadamard: torch.Tensor,
     pool_token_slots: torch.Tensor,
     pool_slots: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Close each pool event: per-dimension softmax over its four gate lanes.
-
-    The pooled key is rotated into the scorer's Hadamard basis (with the same
-    BF16 round the kernel's operand takes) and quantized to INT8 plus a per-row
-    dequant scale at write time. FP32 softmax and reduction use ordinary PyTorch
-    operations; device rounding can differ at quantization boundaries.
-
-    Args:
-        pool_cache: ``[POOL_TABLE * INDEX_STATE_BLOCK_SIZE, INDEX_DIM]`` INT8
-            pooled-key table holding the prior state.
-        pool_scale: ``[POOL_TABLE * INDEX_STATE_BLOCK_SIZE, POOL_SCALE_WIDTH]``
-            FP32 per-row dequant scales holding the prior state.
-        raw_cache: ``[TABLE * BLOCK_SIZE, INDEX_STATE_WIDTH]`` raw support table.
-        compress_ape: ``[INDEX_KPOOL, INDEX_DIM]`` learned pool-lane bias.
-        hadamard: ``[INDEX_DIM, INDEX_DIM]`` BF16 scorer-basis rotation.
-        pool_token_slots: ``[events, INDEX_KPOOL]`` physical raw row of each member
-            token, ``-1`` for a padded member.
-        pool_slots: ``[events]`` destination pooled row of each event.
-
-    Returns:
-        The updated INT8 table, the updated scale table and the per-event
-        validity (all four members present).
-    """
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compress raw FP32 state with per-channel softmax and BF16 storage."""
     updated = pool_cache.clone()
-    updated_scale = pool_scale.clone()
     valid = torch.zeros(pool_slots.numel(), POOL_VALID_WIDTH, dtype=torch.int32)
-    for event in range(pool_slots.numel()):
-        members = pool_token_slots[event].to(torch.long)
-        destination = int(pool_slots[event])
+    for event, destination in enumerate(pool_slots.tolist()):
+        members = pool_token_slots[event].long()
         present = bool((members >= 0).all())
         if present:
-            keys = raw_cache[members, 0:INDEX_DIM].float()
+            keys = raw_cache[members, :INDEX_DIM].float()
             gates = raw_cache[members, INDEX_DIM:].float()
             probabilities = torch.softmax(gates + compress_ape.float(), dim=0)
-            pooled = (probabilities * keys).sum(dim=0, keepdim=True)
+            pooled = (probabilities * keys).sum(0)
+            valid[event, 0] = 1
         else:
-            pooled = torch.zeros(1, INDEX_DIM)
-        pooled = pooled.to(torch.bfloat16).float() @ hadamard.float()
-        key_i8, key_scale = quantize_per_token_int8(pooled)
-        updated[destination] = key_i8[0]
-        updated_scale[destination, :] = key_scale[0, 0]
-        valid[event, 0] = 1 if present else 0
-    return updated, updated_scale, valid
+            pooled = torch.zeros(INDEX_DIM)
+        updated[destination] = pooled.bfloat16()
+    return updated, valid
 
 
 def build_indexer_cache_write_specs(tokens: int = 24, pages: int = 4):
@@ -2565,7 +2142,7 @@ def build_indexer_cache_write_specs(tokens: int = 24, pages: int = 4):
         return slots
 
     return [
-        TensorSpec("index_k", [tokens, INDEX_DIM], torch.bfloat16, init_value=init_index_k),
+        TensorSpec("index_k", [tokens, INDEX_DIM], torch.float32, init_value=init_index_k),
         TensorSpec("gate_scores", [tokens, INDEX_DIM], torch.float32, init_value=init_gate_scores),
         TensorSpec("slots", [tokens], torch.int32, init_value=init_slots),
         TensorSpec("cache", [cache_rows, INDEX_STATE_WIDTH], torch.float32, init_value=init_cache),
@@ -2615,29 +2192,18 @@ def build_indexer_pool_write_specs(events: int = 6, raw_pages: int = 2, pool_pag
         chosen = torch.randperm(pool_rows, generator=generator)[:events]
         return chosen.to(torch.int32)
 
-    # One draw feeds both tables so the prior INT8 rows and their scales match;
-    # the rows read as already Hadamard-rotated prior state, the way earlier
-    # pool writes would have left them.
-    (prior_i8, prior_scale_col) = quantize_per_token_int8(
-        torch.randn(pool_rows, INDEX_DIM, generator=generator, dtype=torch.float32),
-    )
+    # Retain completed BF16 pools outside the selected write destinations.
+    prior_pool = torch.randn(pool_rows, INDEX_DIM, generator=generator, dtype=torch.float32).bfloat16()
 
     def init_pool_cache():
-        return prior_i8
-
-    def init_pool_scale():
-        scale = torch.zeros(pool_rows, POOL_SCALE_WIDTH)
-        scale[:, 0] = prior_scale_col[:, 0]
-        return scale
+        return prior_pool.clone()
 
     return [
         TensorSpec("raw_cache", [raw_rows, INDEX_STATE_WIDTH], torch.float32, init_value=init_raw_cache),
         TensorSpec("compress_ape", [INDEX_KPOOL, INDEX_DIM], torch.bfloat16, init_value=init_compress_ape),
-        TensorSpec("hadamard", [INDEX_DIM, INDEX_DIM], torch.bfloat16, init_value=sylvester_hadamard),
         TensorSpec("pool_token_slots", [events, INDEX_KPOOL], torch.int32, init_value=init_pool_token_slots),
         TensorSpec("pool_slots", [events], torch.int32, init_value=init_pool_slots),
-        TensorSpec("pool_cache", [pool_rows, INDEX_DIM], torch.int8, init_value=init_pool_cache),
-        TensorSpec("pool_scale", [pool_rows, POOL_SCALE_WIDTH], torch.float32, init_value=init_pool_scale),
+        TensorSpec("pool_cache", [pool_rows, INDEX_DIM], torch.bfloat16, init_value=init_pool_cache),
         TensorSpec("pool_valid", [events, POOL_VALID_WIDTH], torch.int32),
     ]
 
@@ -2651,12 +2217,11 @@ def golden_indexer_cache_write_case(tensors):
 
 def golden_indexer_pool_write_case(tensors):
     """Fill the expected pooled tables and validity for :func:`build_indexer_pool_write_specs`."""
-    (pool_cache, pool_scale, pool_valid) = golden_indexer_pool_write(
-        tensors["pool_cache"], tensors["pool_scale"], tensors["raw_cache"], tensors["compress_ape"],
-        tensors["hadamard"], tensors["pool_token_slots"], tensors["pool_slots"],
+    (pool_cache, pool_valid) = golden_indexer_pool_write(
+        tensors["pool_cache"], tensors["raw_cache"], tensors["compress_ape"],
+        tensors["pool_token_slots"], tensors["pool_slots"],
     )
     tensors["pool_cache"][:] = pool_cache
-    tensors["pool_scale"][:] = pool_scale
     tensors["pool_valid"][:] = pool_valid
 
 
@@ -2675,36 +2240,26 @@ def _cache_self_check() -> None:
             assert torch.equal(updated[slot], expected), f"slot {slot} did not receive its row"
     assert torch.equal(updated[-1], cache[-1]), "a -1 slot wrapped into the last row"
 
-    pool_i8, pool_scale_col = quantize_per_token_int8(torch.randn(8, INDEX_DIM, generator=generator))
-    pool_cache = pool_i8
-    pool_scale = torch.zeros(8, POOL_SCALE_WIDTH)
-    pool_scale[:, 0] = pool_scale_col[:, 0]
+    pool_cache = torch.randn(8, INDEX_DIM, generator=generator).bfloat16()
     raw_cache = torch.cat(
         [torch.randn(32, INDEX_DIM, generator=generator).bfloat16().float(), torch.randn(32, INDEX_DIM, generator=generator)],
         dim=-1,
     )
     ape = torch.randn(INDEX_KPOOL, INDEX_DIM, generator=generator).bfloat16()
-    hadamard = sylvester_hadamard()
     pool_token_slots = torch.tensor(
         [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, -1, 15], [16, 17, 18, 19]], dtype=torch.int32,
     )
     pool_slots = torch.tensor([7, 3, 0, 5, 2], dtype=torch.int32)
-    (new_cache, new_scale, valid) = golden_indexer_pool_write(
-        pool_cache, pool_scale, raw_cache, ape, hadamard, pool_token_slots, pool_slots,
+    (new_cache, valid) = golden_indexer_pool_write(
+        pool_cache, raw_cache, ape, pool_token_slots, pool_slots,
     )
     assert valid[:, 0].tolist() == [1, 1, 1, 0, 1], valid
     members = pool_token_slots[0].long()
     weights = torch.softmax(raw_cache[members, INDEX_DIM:].float() + ape.float(), dim=0)
     expected = (weights * raw_cache[members, 0:INDEX_DIM].float()).sum(dim=0, keepdim=True)
-    expected = expected.to(torch.bfloat16).float() @ hadamard.float()
-    expected_i8, expected_scale = quantize_per_token_int8(expected)
-    assert torch.equal(new_cache[7], expected_i8[0]), "pool 0 INT8 bytes differ"
-    assert (new_scale[7] == expected_scale[0, 0]).all(), "pool 0 scale lanes differ"
-    zero_i8, zero_scale = quantize_per_token_int8(torch.zeros(1, INDEX_DIM))
-    assert torch.equal(new_cache[5], zero_i8[0].to(torch.int8)), "padded pool is not quantized zero"
-    assert (new_scale[5] == zero_scale[0, 0]).all(), "padded pool scale lanes differ"
+    assert torch.equal(new_cache[7], expected[0].bfloat16()), "pool 0 BF16 values differ"
+    assert torch.count_nonzero(new_cache[5]) == 0, "padded pool is not zero"
     assert torch.equal(new_cache[1], pool_cache[1]), "an untouched pooled row changed"
-    assert torch.equal(new_scale[1], pool_scale[1]), "an untouched scale row changed"
     print("[GOLDEN] PASS indexer_cache self-check")
 
 
@@ -2771,6 +2326,19 @@ def run_decode_case(argv=None):
             raise SystemExit(result.error or 1)
         return
 
+    def step_scores(actual_outputs, inputs):
+        """Rebuild the step's score matrix from the device's own stage outputs.
+
+        The composed step no longer publishes a score grid — the selection
+        streams it — so the tie-aware comparators below recompute it from the
+        stages that feed the selection: the device's projections and pooled
+        cache, under this batch's page table and windows.
+        """
+        return golden_indexer_score(
+            actual_outputs["index_q"].cpu(), actual_outputs["pool_cache"].cpu(), inputs["pool_blocks"].cpu(),
+            actual_outputs["head_weights"].cpu(), inputs["seg_start"].cpu(), inputs["pool_count"].cpu(),
+        )
+
     def selected_pools_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         """Tie-aware selection compare that also audits the picked scores.
 
@@ -2780,7 +2348,7 @@ def run_decode_case(argv=None):
         picked, under the same tolerance: a legal tie swap keeps the paired
         values equal, a real miss breaks them.
         """
-        scores = actual_outputs["index_scores"].float()
+        scores = step_scores(actual_outputs, inputs)
         seg0 = inputs["seg_start"].long().unsqueeze(1)
 
         def paired_of(selected):
@@ -2810,32 +2378,13 @@ def run_decode_case(argv=None):
         exact = torch.equal(actual.cpu(), expected.cpu())
         return exact, "" if exact else "    integer output differs from golden"
 
-    def score_window_compare(actual, expected, *, inputs, rtol, atol, **_kwargs):
-        """Compare only each query's visible window: lanes outside it are
-        undefined scratch under the scorer's contract (the top-k clamps
-        through its valid shapes), so they carry nothing to check."""
-
-        seg = inputs["seg_start"].long().unsqueeze(1)
-        end = seg + inputs["pool_count"].long().clamp(min=0).unsqueeze(1)
-        lanes = torch.arange(actual.shape[-1]).unsqueeze(0)
-        window = (lanes >= seg) & (lanes < end)
-        picked_a = actual.float()[window]
-        picked_e = expected.float()[window]
-        if picked_a.numel() == 0:
-            return True, ""
-        bad = ~torch.isfinite(picked_a)
-        bad |= (picked_a - picked_e).abs() > (atol + rtol * picked_e.abs())
-        ratio = bad.float().mean().item()
-        ok = ratio <= 0.01
-        return ok, "" if ok else f"    in-window mismatch ratio {ratio:.4f}"
-
     def topk_indices_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         """Tie-aware position compare for the expanded front-packed rows.
 
         A near-boundary score cluster can reshuffle two pools whose scores each
         sit inside the scorer's own tolerance; the swap is legal exactly when
         the swapped positions' paired scores agree under the same allclose rule
-        that certified ``index_scores``. Tail and padding lanes are deterministic
+        that certified the selection. Tail and padding lanes are deterministic
         given the inputs, so any mismatch there fails outright, and every actual
         row must keep the front-packed ABI.
         """
@@ -2843,7 +2392,7 @@ def run_decode_case(argv=None):
         e = expected.cpu()
         if torch.equal(a, e):
             return True, ""
-        scores = actual_outputs["index_scores"].float().cpu()
+        scores = step_scores(actual_outputs, inputs)
         seg0 = inputs["seg_start"].long().unsqueeze(1)
         kv_len = inputs["kv_len"].long().unsqueeze(1)
         hist_len = (kv_len // INDEX_KPOOL) * INDEX_KPOOL
@@ -2879,12 +2428,9 @@ def run_decode_case(argv=None):
         # The raw rows carry the projection rounding of the composed step,
         # unlike the standalone scatter, which moves bytes at zero tolerance.
         "raw_cache": ratio_allclose(atol=1e-3, rtol=1.0 / 64, max_error_ratio=0.01),
-        # The pooled table is quantized on write; the softmax transcendentals
-        # can flip a rint boundary, so allow a tiny tail of one-quantum flips.
-        "pool_cache": ratio_allclose(atol=1.0, rtol=0.0, max_error_ratio=0.005),
-        "pool_scale": ratio_allclose(atol=1e-6, rtol=1e-3, max_error_ratio=0.005),
+        # Pooled keys round the FP32 channel softmax output to BF16.
+        "pool_cache": ratio_allclose(atol=0.001, rtol=1.0 / 64, max_error_ratio=0.005),
         "pool_valid": exact_compare,
-        "index_scores": score_window_compare,
         "selected_pools": selected_pools_compare,
         "selected_valid": exact_compare,
         "topk_indices": topk_indices_compare,
@@ -2964,7 +2510,7 @@ def run_prefill_case(argv=None):
     """Prove the goldens on CPU, then validate each stage on device.
 
     The projections round once to BF16 or hold FP32, so their budget is one
-    BF16 ulp with a small outlier allowance. The scorer carries the INT8
+    BF16 ulp with a small outlier allowance. The scorer carries the BF16
     quantization of both operands, so a tie-swapped top-k is judged through the
     paired-score comparator rather than index equality. The expansion is pure
     integer lane math and compares exactly.
@@ -2973,25 +2519,6 @@ def run_prefill_case(argv=None):
 
     from golden import ratio_allclose, run, topk_pair_compare
 
-    def score_window_compare(actual, expected, *, inputs, rtol, atol, **_kwargs):
-        """Compare only each query's visible window: the kernel leaves every
-        other lane as undefined scratch (the top-k clamps through its valid
-        shapes), so out-of-window contents carry no contract to check."""
-
-        seg = inputs["seg_start"].long().unsqueeze(1)
-        end = seg + inputs["pool_count"].long().clamp(min=0).unsqueeze(1)
-        lanes = torch.arange(actual.shape[-1]).unsqueeze(0)
-        window = (lanes >= seg) & (lanes < end)
-        picked_a = actual.float()[window]
-        picked_e = expected.float()[window]
-        if picked_a.numel() == 0:
-            return True, ""
-        bad = ~torch.isfinite(picked_a)
-        bad |= (picked_a - picked_e).abs() > (atol + rtol * picked_e.abs())
-        ratio = bad.float().mean().item()
-        ok = ratio <= 0.01
-        return ok, "" if ok else f"    in-window mismatch ratio {ratio:.4f}"
-
     _prefill_self_check()
 
     parser = argparse.ArgumentParser()
@@ -2999,7 +2526,7 @@ def run_prefill_case(argv=None):
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--case", default="all", choices=["proj", "score", "topk", "expand", "step", "all"])
+    parser.add_argument("--case", default="all", choices=["proj", "select", "expand", "step", "all"])
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument(
         "--bench", action="store_true",
@@ -3022,7 +2549,7 @@ def run_prefill_case(argv=None):
         dest="bench_page_map",
         choices=["resident", "perm", "identity"],
         default=None,
-        help="bench-only pool page table for --case score: 'resident' lowers the current "
+        help="bench-only pool page table for --case select: 'resident' lowers the current "
         "resident explicit pool_block_table (live pages per slot, shared scratch aliases) "
         "and is the multi-request default; 'identity' is the fully contiguous pre-rebase "
         "diagnostic, NOT the production layout; 'perm' is the scattered diagnostic. "
@@ -3034,8 +2561,8 @@ def run_prefill_case(argv=None):
     bench_request_slots = None
     bench_table_max = None
     if args.bench_requests > 1:
-        if args.bench_requests > 16:
-            parser.error("--bench-requests cannot exceed the resident batch's 16 request slots")
+        if args.bench_requests > 32:
+            parser.error("--bench-requests cannot exceed the resident batch's 32 request slots")
         per_request_span = (args.tokens + args.history) // args.bench_requests
         max_seq_len = max(args.tokens, per_request_span)
         bench_table_max = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -3043,7 +2570,7 @@ def run_prefill_case(argv=None):
         bench_pool_stride = (
             (pool_pages_per_request + INDEX_STATE_BLOCK_SIZE - 1) // INDEX_STATE_BLOCK_SIZE
         ) * INDEX_STATE_BLOCK_SIZE
-        bench_request_slots = 16
+        bench_request_slots = 32
 
     def print_bench(label: str, result) -> None:
         stats = result.bench
@@ -3075,7 +2602,7 @@ def run_prefill_case(argv=None):
             parser.error(
                 f"--case {args.case} has no pool-space geometry (its shape follows "
                 "--tokens/--history alone); --bench-requests only packs the "
-                "score/topk/step batches"
+                "select/step batches"
             )
         span = args.tokens + args.history
         if requests == 1:
@@ -3112,7 +2639,7 @@ def run_prefill_case(argv=None):
         # Pool-preparation cases use one block per 16 pages for large T and at
         # most 48 persistent workers for small T. Other cases have no pool
         # gather or scale-pack launch.
-        if args.case in ("score", "step", "all"):
+        if args.case in ("select", "step", "all"):
             bench_pages = bench_width if bench_pool_stride is not None else bench_width // INDEX_STATE_BLOCK_SIZE
             bench_pool_chunks = (bench_pages + POOL_GATHER_PAGE_TILE - 1) // POOL_GATHER_PAGE_TILE
             if args.tokens <= INDEXER_PERSISTENT_MAX_TOKENS:
@@ -3164,10 +2691,17 @@ def run_prefill_case(argv=None):
             )
         return True, ""
 
-    def selected_pools_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        return _selection_compare(
-            inputs["index_scores"].float(), actual, expected, actual_outputs=actual_outputs,
-            expected_outputs=expected_outputs, inputs=inputs, rtol=rtol, atol=atol,
+    def _step_scores(actual_outputs, inputs):
+        """Rebuild the composed step's score matrix from its own stage outputs.
+
+        The step no longer publishes a score grid — the selection streams it —
+        so the tie-aware comparators recompute it from the stages that feed the
+        selection: the device's projections and pooled cache, under this
+        batch's page table and windows.
+        """
+        return golden_indexer_score(
+            actual_outputs["index_q"].cpu(), actual_outputs["pool_cache"].cpu(), inputs["pool_blocks"].cpu(),
+            actual_outputs["head_weights"].cpu(), inputs["seg_start"].cpu(), inputs["pool_count"].cpu(),
         )
 
     def exact_compare(actual, expected, **_kwargs):
@@ -3175,14 +2709,9 @@ def run_prefill_case(argv=None):
         return exact, "" if exact else "    integer output differs from golden"
 
     def fused_selected_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        """Tie-aware selection compare reading the scores the run produced.
-
-        The composed step emits ``index_scores`` as an output, so the paired
-        scores for the top-k check come from ``actual_outputs`` — the same
-        rule :func:`selected_pools_compare` applies with an input matrix.
-        """
+        """Tie-aware selection compare against the step's own recomputed scores."""
         return _selection_compare(
-            actual_outputs["index_scores"].float(), actual, expected, actual_outputs=actual_outputs,
+            _step_scores(actual_outputs, inputs), actual, expected, actual_outputs=actual_outputs,
             expected_outputs=expected_outputs, inputs=inputs, rtol=rtol, atol=atol,
         )
 
@@ -3192,7 +2721,7 @@ def run_prefill_case(argv=None):
         A near-boundary score cluster can reshuffle two pools whose scores each
         sit inside the scorer's own tolerance; the swap is legal exactly when
         the swapped positions' paired scores agree under the same allclose rule
-        that certified ``index_scores``. Tail and padding lanes are
+        that certified the selection. Tail and padding lanes are
         deterministic given the inputs, so any mismatch there fails outright,
         and every actual row must keep the front-packed ABI.
         """
@@ -3200,7 +2729,7 @@ def run_prefill_case(argv=None):
         e = expected.cpu()
         if torch.equal(a, e):
             return True, ""
-        scores = actual_outputs["index_scores"].float().cpu()
+        scores = _step_scores(actual_outputs, inputs)
         seg0 = inputs["seg_start"].long().unsqueeze(1)
         kv_len = inputs["kv_len"].long().unsqueeze(1)
         hist_len = (kv_len // INDEX_KPOOL) * INDEX_KPOOL
@@ -3254,17 +2783,32 @@ def run_prefill_case(argv=None):
         )
         if args.bench:
             print_bench(label, results[-1])
-    if args.case in ("score", "all"):
+    if args.case in ("select", "all"):
+
+        def select_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+            scores = golden_indexer_score(
+                inputs["index_q"], inputs["pool_cache"], inputs["pool_blocks"], inputs["head_weights"],
+                inputs["seg_start"], inputs["pool_count"],
+            )
+            return _selection_compare(
+                scores, actual, expected, actual_outputs=actual_outputs, expected_outputs=expected_outputs,
+                inputs=inputs, rtol=rtol, atol=atol,
+            )
+
+        select_extra = dict(
+            golden_fn=golden_indexer_select_case, rtol=1.0 / 128, atol=0.0001,
+            compare_fn={"selected_pools": select_compare, "selected_valid": exact_compare},
+        )
         if args.bench:
             if args.bench_page_map is not None and args.case == "all":
-                parser.error("--bench-page-map needs --case score (the probe measures the score stage alone)")
+                parser.error("--bench-page-map needs --case select (the probe measures the selection alone)")
             page_map = args.bench_page_map or ("resident" if requests > 1 else "perm")
             if page_map == "resident" and requests < 2:
                 parser.error(
                     "--bench-page-map resident needs --bench-requests > 1 "
                     "(the resident explicit table lives in the stable-slot layout)"
                 )
-            specs = build_indexer_score_specs(
+            specs = build_indexer_select_specs(
                 args.tokens,
                 bench_counts,
                 bench_positions,
@@ -3274,18 +2818,15 @@ def run_prefill_case(argv=None):
                 table_max=bench_table_max,
             )
             extra = dict(golden_fn=None)
-            label = bench_label("score", sum(bench_counts), bench_width)
+            label = bench_label("select", sum(bench_counts), bench_width)
             if requests > 1 or args.bench_page_map is not None:
                 label += f" pages={page_map}"
         else:
-            specs = build_indexer_score_specs()
-            extra = dict(
-                golden_fn=golden_indexer_score_case, rtol=1.0 / 128, atol=0.0001,
-                compare_fn={"index_scores": score_window_compare},
-            )
+            specs = build_indexer_select_specs()
+            extra = select_extra
         results.append(
             run(
-                fn=indexer_score_test,
+                fn=indexer_select_test,
                 specs=specs,
                 config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                 compile_only=args.compile_only,
@@ -3300,14 +2841,11 @@ def run_prefill_case(argv=None):
             # partial-tail-tile shape the padded fixtures cannot reach.
             results.append(
                 run(
-                    fn=indexer_score_test,
-                    specs=build_indexer_score_tail_specs(),
-                    golden_fn=golden_indexer_score_case,
-                    rtol=1.0 / 128,
-                    atol=0.0001,
-                    compare_fn={"index_scores": score_window_compare},
+                    fn=indexer_select_test,
+                    specs=build_indexer_select_tail_specs(),
                     config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                     compile_only=args.compile_only,
+                    **select_extra,
                 ),
             )
             # Mostly-identity page table: the gather's run-merge branches (wide
@@ -3315,21 +2853,16 @@ def run_prefill_case(argv=None):
             # table the permuted fixtures never produce.
             results.append(
                 run(
-                    fn=indexer_score_test,
-                    specs=build_indexer_score_run_specs(),
-                    golden_fn=golden_indexer_score_case,
-                    rtol=1.0 / 128,
-                    atol=1e-4,
-                    compare_fn={
-                        "index_scores": score_window_compare,
-                    },
+                    fn=indexer_select_test,
+                    specs=build_indexer_select_run_specs(),
                     config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                     compile_only=args.compile_only,
-                )
+                    **select_extra,
+                ),
             )
             # Stable request slots can leave a large leading pooled-key gap.
             # Only sixteen queries are live in this capacity-192 batch.
-            sparse_specs = build_indexer_score_specs(192, (388,), (0,) * 192)
+            sparse_specs = build_indexer_select_specs(192, (388,), (0,) * 192)
             sparse_segments = torch.zeros(192, dtype=torch.int32)
             sparse_segments[:16] = 384
             sparse_counts = torch.zeros(192, dtype=torch.int32)
@@ -3341,41 +2874,13 @@ def run_prefill_case(argv=None):
                     spec.init_value = sparse_counts
             results.append(
                 run(
-                    fn=indexer_score_test,
+                    fn=indexer_select_test,
                     specs=sparse_specs,
                     config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                     compile_only=args.compile_only,
-                    **extra,
+                    **select_extra,
                 ),
             )
-    if args.case in ("topk", "all"):
-        if args.bench:
-            specs = build_indexer_topk_specs(
-                args.tokens,
-                bench_counts,
-                bench_positions,
-                pool_stride=bench_pool_stride,
-                request_slots=bench_request_slots,
-            )
-            extra = dict(golden_fn=None)
-            label = bench_label("topk", sum(bench_counts), bench_width)
-        else:
-            specs = build_indexer_topk_specs()
-            extra = dict(
-                golden_fn=golden_indexer_topk_case, rtol=0.001, atol=0.001,
-                compare_fn={"selected_pools": selected_pools_compare, "selected_valid": exact_compare},
-            )
-        results.append(
-            run(
-                fn=indexer_topk_test,
-                specs=specs,
-                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
-                compile_only=args.compile_only,
-                **extra,
-            ),
-        )
-        if args.bench:
-            print_bench(label, results[-1])
     if args.case in ("expand", "all"):
         if args.bench:
             specs = build_indexer_expand_specs(args.tokens, (args.tokens + args.history,) * args.tokens)
@@ -3404,12 +2909,9 @@ def run_prefill_case(argv=None):
             # The raw rows carry the projection rounding of the composed chunk,
             # unlike the standalone scatter, which moves bytes at zero tolerance.
             "raw_cache": ratio_allclose(atol=1e-3, rtol=1.0 / 64, max_error_ratio=0.01),
-            # The pooled table is quantized on write; the softmax transcendentals
-            # can flip a rint boundary, so allow a tiny tail of one-quantum flips.
-            "pool_cache": ratio_allclose(atol=1.0, rtol=0.0, max_error_ratio=0.005),
-            "pool_scale": ratio_allclose(atol=1e-6, rtol=1e-3, max_error_ratio=0.005),
+            # Pooled keys round the FP32 channel softmax output to BF16.
+            "pool_cache": ratio_allclose(atol=0.001, rtol=1.0 / 64, max_error_ratio=0.005),
             "pool_valid": exact_compare,
-            "index_scores": score_window_compare,
             "selected_pools": fused_selected_compare,
             "selected_valid": exact_compare,
             "topk_indices": step_topk_indices_compare,
@@ -3461,10 +2963,9 @@ def run_cache_case(argv=None):
     """Prove the goldens on CPU, then validate both writers on device.
 
     The raw scatter is pure data movement, so it runs at zero tolerance. The
-    pooled key is an FP32 softmax quantized once to INT8 plus a dequant scale;
-    device and reference differ only in the softmax transcendentals, which
-    almost always lands on the same quantized byte — the budget allows a tiny
-    tail of one-quantum flips at rint boundaries.
+    pooled key is an FP32 softmax result rounded once to BF16;
+    device and reference retain the BF16 output boundary and validate the
+    values with the existing BF16 relative-error criterion.
     """
     import argparse
 
@@ -3522,7 +3023,7 @@ def run_cache_case(argv=None):
                 config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                 rtol=1.0 / 64,
                 atol=0.001,
-                compare_fn=None if args.bench else {"pool_cache": ratio_allclose(atol=1.0, rtol=0.0, max_error_ratio=0.005), "pool_scale": ratio_allclose(atol=1e-06, rtol=0.001, max_error_ratio=0.005)},
+                compare_fn=None if args.bench else {"pool_cache": ratio_allclose(atol=0.001, rtol=1.0 / 64, max_error_ratio=0.005)},
                 compile_only=args.compile_only,
             )
         )
