@@ -167,12 +167,14 @@ TP ranks and declare `# ci: devices=8`, as does CSA. Their standalone
 `decode_sparse_attn_swa.py` and `decode_sparse_attn_hca.py` entries use one
 device and retain their original numerical references.
 
-`decode_fwd.py` validates all 43 layers against an independent Torch
-composition by default. It includes embedding, request-derived metadata,
+`decode_fwd.py` executes all 43 layers without computing or comparing a golden
+by default, including in CI. Use `--full` to opt into the independent Torch
+comparison or a complete saved reference. It includes embedding, request-derived metadata,
 2 SWA / 21 CSA / 20 HCA attention layers, 43 TP MoE layers, HC head,
 final RMSNorm, vocabulary-sharded logits and sampling. All eight mutable
 cache/state pools and the four public outputs are compared by the existing
-harness. Source compilation and component CI do not qualify this full path.
+harness in `--full` mode. A default smoke PASS confirms execution only;
+source compilation and component CI do not qualify this full numerical path.
 
 The Torch composition reuses the child operator references. Expert gate/up/down
 products accumulate INT8 operands as INT32 before applying original FP32
@@ -197,18 +199,19 @@ reduction. Standalone grouped projections retain their own arithmetic.
 These choices do not establish bitwise equivalence with device instructions;
 the existing numerical comparisons remain required.
 
-- Default execution and `--full` run the same complete-forward comparison.
-  The generated bounded fixture starts at position 121 and uses one shared
-  MoE bank unless `--moe-banks` is supplied. This is synthetic correctness
-  coverage, not qualification of a real checkpoint or community equivalence.
+- Default execution and `--smoke` execute all 43 layers without a numerical
+  comparison. They permit generated inputs or input-only replay and report
+  no correctness verdict. Saved expected outputs require explicit `--full`.
+- `--full` runs the complete-forward comparison. The generated bounded fixture
+  starts at position 121 and uses one shared MoE bank unless `--moe-banks` is
+  supplied. This is synthetic correctness coverage, not qualification of a
+  real checkpoint or community equivalence.
 - A real checkpoint comparison requires the actual weights and original FP32
   scales for all 43 layers (`--moe-banks 43`), matching inputs/state and the
   precision contract above. Shared random banks cannot stand in for them.
-- `--input-data` replays complete `in/` and `out/` tensors, which take precedence
-  over the locally computed Torch reference. Partial numerical snapshots fail.
-- `--smoke` explicitly executes all 43 layers without numerical comparison.
-  It permits generated inputs or input-only replay and reports no correctness
-  verdict. It cannot be combined with saved expected outputs.
+- `--full --input-data` replays complete `in/` and `out/` tensors, which take
+  precedence over the locally computed Torch reference. Partial numerical
+  snapshots fail. Without `--full`, replay accepts input-only snapshots.
 - `--compile-only` performs code generation and ABI checks without computing
   a Torch golden or executing the model.
 
@@ -226,18 +229,18 @@ matching INT8 checkpoint names or tensor dtype labels is insufficient.
 Existing operator/layer validators retain their own scope. No complete-model
 numerical PASS is implied by providing this reference or by host-only checks.
 
-Use `--seed` for reproducible generated inputs and `--save-data` to save both
-inputs and expected outputs. For example:
+Use `--seed` for reproducible generated inputs and `--save-data` to save inputs
+for replay. In `--full` mode, it also saves expected outputs. For example:
 
 ```bash
 # Complete 43-layer numerical fixture; 16384 is a supported Indexer context.
-python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --full
 # Generate the complete program without computing a Torch reference.
 python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --compile-only
-# Explicit execution-only smoke, without a correctness verdict.
-python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --smoke
+# Default execution-only smoke, without a correctness verdict.
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384
 # Replay a complete snapshot with matching checkpoint and execution layout.
-python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --moe-banks 43 --input-data <reference>/data
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --moe-banks 43 --full --input-data <reference>/data
 ```
 
 ## Validation

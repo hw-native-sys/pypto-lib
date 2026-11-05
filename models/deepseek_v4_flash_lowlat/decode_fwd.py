@@ -2105,7 +2105,7 @@ def _forward_annotation_specs(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch-one full 43-layer decode correctness against Torch or saved references.")
+    parser = argparse.ArgumentParser(description="Batch-one 43-layer decode smoke; use --full for numerical validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--tp", type=int, default=N_RANKS, choices=[2, 4, 8], help="tensor-parallel degree / rank count; config freezes it at import")
     parser.add_argument("--moe-banks", type=int, default=MOE_BANKS, help="distinct MoE expert banks the layers cycle through")
@@ -2128,10 +2128,14 @@ def main():
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
-    parser.add_argument("--input-data", type=str, default=None, help="Saved snapshot with complete in/ and out/ tensors; input-only replay requires --smoke.")
+    input_help = "Saved snapshot: input-only by default; --full requires complete in/ and out/ tensors."
+    parser.add_argument("--input-data", type=str, default=None, help=input_help)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--full", action="store_true", help="Compare all 43 layers against the independent Torch reference or supplied in/out snapshot (default).")
-    mode.add_argument("--smoke", action="store_true", help="Execute all 43 layers without a reference; this does not validate numerical correctness.")
+    full_help = "Compare all 43 layers against the independent Torch reference or supplied in/out snapshot."
+    mode.add_argument("--full", dest="smoke", action="store_false", help=full_help)
+    smoke_help = "Execute all 43 layers without numerical comparison (default)."
+    mode.add_argument("--smoke", action="store_true", help=smoke_help)
+    parser.set_defaults(smoke=True)
     parser.add_argument("--seed", type=int, default=0, help="Seed for reproducible generated fixtures.")
     parser.add_argument("--save-data", action="store_true", default=False, help="save inputs for replay")
     from config import CONTEXT_CAPACITY
@@ -2144,7 +2148,7 @@ def main():
 
         has_reference = (Path(args.input_data) / "out").is_dir()
         if args.smoke and has_reference:
-            parser.error("--smoke requires generated inputs or an input-only snapshot; omit it to validate saved out/")
+            parser.error("Smoke execution requires an input-only snapshot; use --full to validate saved out/")
         if not args.smoke:
             reference_outputs = [*CACHE_POOL_NAMES, "pre_hc_hidden_out", "hidden_out", "logits", "sampled_ids"]
             missing = [name for name in reference_outputs if not (Path(args.input_data) / "out" / f"{name}.pt").is_file()]
