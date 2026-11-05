@@ -62,7 +62,6 @@ DECODE_Q_SCALE = KDA_DIM**-0.5
 DECODE_V_TILE = 16  # value rows per state-update task
 DECODE_NORM_ROWS_TILE = 16  # (token, head) rows per normalisation task
 COL_REP_TILE = 16  # replication width used to turn a row into a legal column
-DECODE_POOL_ROWS = 6
 
 CHUNK_TILE = 16
 DECAY_CAP = 80.0  # FP32 exp argument ceiling
@@ -538,12 +537,16 @@ def decode_kda(
     decay: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.FP32],
     beta: pl.Tensor[[T_DYN, BETA_PAD], pl.FP32],
     recurrent_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
-    state_rows: pl.Tensor[[T_DYN], pl.INT32],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
     output: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
 ):
+    """FP32 recurrence with BF16 inputs and output, independent of chunk rounding."""
     t_dim = pl.tensor.dim(query, 0)
     lanes = KDA_DIM // DECODE_V_TILE
-    tasks = t_dim * LOCAL_KDA_H * lanes
+    requests = pl.tensor.dim(query_start_loc, 0) - 1
+    tasks = requests * LOCAL_KDA_H * lanes
+    live_tokens = pl.cast(pl.read(query_start_loc, [requests]), pl.INDEX)
     rows_total = t_dim * LOCAL_KDA_H
     norm_tiles = (rows_total + DECODE_NORM_ROWS_TILE - 1) // DECODE_NORM_ROWS_TILE
     kn_gm = pl.create_tensor([norm_tiles * DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
@@ -552,81 +555,91 @@ def decode_kda(
     q_rows = pl.reshape(query, [rows_total, KDA_DIM])
     with pl.spmd(norm_tiles, name_hint="decode_kda_l2norm") as norm_tid:
         r0 = pl.tile.get_block_idx() * DECODE_NORM_ROWS_TILE
-        rows = pl.min(DECODE_NORM_ROWS_TILE, rows_total - r0)
-        q_rows_tile = pl.slice(q_rows, [DECODE_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
-        qt = pl.cast(q_rows_tile, pl.FP32)
-        k_rows_tile = pl.slice(k_rows, [DECODE_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
-        kt = pl.cast(k_rows_tile, pl.FP32)
-        q_buffer = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        k_buffer = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        q_buffer[:, :] = qt
-        k_buffer[:, :] = kt
-        q_squared_norm = pl.create_tensor([DECODE_NORM_ROWS_TILE, 1], dtype=pl.FP32)
-        k_squared_norm = pl.create_tensor([DECODE_NORM_ROWS_TILE, 1], dtype=pl.FP32)
-        q_square = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        k_square = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        q_square[:, :] = pl.mul(q_buffer, q_buffer)
-        k_square[:, :] = pl.mul(k_buffer, k_buffer)
-        q_sum = accurate_row_sum(q_square)
-        k_sum = accurate_row_sum(k_square)
-        q_squared_norm[:, :] = pl.add(q_sum, DECODE_L2_EPS)
-        k_squared_norm[:, :] = pl.add(k_sum, DECODE_L2_EPS)
-        q_root = accurate_sqrt(q_squared_norm)
-        k_root = accurate_sqrt(k_squared_norm)
-        q_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        k_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        ones = pl.full([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
-        q_denominator[:, :] = pl.row_expand_mul(ones, q_root)
-        k_denominator[:, :] = pl.row_expand_mul(ones, k_root)
-        q_unit = accurate_divide(q_buffer, q_denominator)
-        k_unit = accurate_divide(k_buffer, k_denominator)
-        qn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = pl.mul(q_unit, DECODE_Q_SCALE)
-        kn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = k_unit
+        rows = pl.min(DECODE_NORM_ROWS_TILE, live_tokens * LOCAL_KDA_H - r0)
+        if rows > 0:
+            q_rows_tile = pl.slice(q_rows, [DECODE_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
+            qt = pl.cast(q_rows_tile, pl.FP32)
+            k_rows_tile = pl.slice(k_rows, [DECODE_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
+            kt = pl.cast(k_rows_tile, pl.FP32)
+            q_buffer = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            k_buffer = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            q_buffer[:, :] = qt
+            k_buffer[:, :] = kt
+            q_squared_norm = pl.create_tensor([DECODE_NORM_ROWS_TILE, 1], dtype=pl.FP32)
+            k_squared_norm = pl.create_tensor([DECODE_NORM_ROWS_TILE, 1], dtype=pl.FP32)
+            q_square = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            k_square = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            q_square[:, :] = pl.mul(q_buffer, q_buffer)
+            k_square[:, :] = pl.mul(k_buffer, k_buffer)
+            q_sum = accurate_row_sum(q_square)
+            k_sum = accurate_row_sum(k_square)
+            q_squared_norm[:, :] = pl.add(q_sum, DECODE_L2_EPS)
+            k_squared_norm[:, :] = pl.add(k_sum, DECODE_L2_EPS)
+            q_root = accurate_sqrt(q_squared_norm)
+            k_root = accurate_sqrt(k_squared_norm)
+            q_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            k_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            ones = pl.full([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
+            q_denominator[:, :] = pl.row_expand_mul(ones, q_root)
+            k_denominator[:, :] = pl.row_expand_mul(ones, k_root)
+            q_unit = accurate_divide(q_buffer, q_denominator)
+            k_unit = accurate_divide(k_buffer, k_denominator)
+            qn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = pl.mul(q_unit, DECODE_Q_SCALE)
+            kn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = k_unit
     state_2d = pl.reshape(recurrent_state, [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
     out_rows = pl.reshape(output, [t_dim, LOCAL_KDA_H * KDA_DIM])
     with pl.spmd(tasks, name_hint="decode_kda", deps=[norm_tid]):
         task = pl.tile.get_block_idx()
-        t = task // (LOCAL_KDA_H * lanes)
+        request = task // (LOCAL_KDA_H * lanes)
         h = task // lanes % LOCAL_KDA_H
         v0 = task % lanes * DECODE_V_TILE
-        row = pl.cast(pl.read(state_rows, [t]), pl.INDEX)
-        qk_row = t * LOCAL_KDA_H + h
-        q_row = qn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
-        k_row = kn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
-        exp_buffer = pl.create_tensor([1, KDA_DIM], dtype=pl.FP32)
-        decay_tile = pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0])
-        exp_buffer[:, :] = pl.reshape(decay_tile, [1, KDA_DIM])
-        g_row = accurate_exp(exp_buffer)
-        beta_s = pl.read(beta, [t, h])
-        srow = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
-        state_tile = state_2d[srow:srow + DECODE_V_TILE, 0:KDA_DIM]
-        decayed = pl.col_expand_mul(state_tile, g_row)
-        kv_buffer = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
-        kv_buffer[:, :] = pl.col_expand_mul(decayed, k_row)
-        kv_col = accurate_row_sum(kv_buffer)
-        value_tile = pl.slice(value, [1, 1, DECODE_V_TILE], [t, h, v0], drop_dims=[0])
-        v_row_v4_rows = pl.reshape(value_tile, [1, DECODE_V_TILE])
-        v_row = pl.cast(v_row_v4_rows, pl.FP32)
-        v_col_full = pl.full([COL_REP_TILE, DECODE_V_TILE], dtype=pl.FP32, value=1.0)
-        v_col_col_expand_mul = pl.col_expand_mul(v_col_full, v_row)
-        v_col_transpose = pl.transpose(v_col_col_expand_mul, 0, 1)
-        v_col_row_sum = pl.row_sum(v_col_transpose)
-        v_col = pl.mul(v_col_row_sum, 1.0 / COL_REP_TILE)
-        delta_col = pl.mul(pl.sub(v_col, kv_col), beta_s)
-        updated_full = pl.full([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
-        updated_row_expand_mul = pl.row_expand_mul(updated_full, delta_col)
-        updated_col_expand_mul = pl.col_expand_mul(updated_row_expand_mul, k_row)
-        updated = pl.add(decayed, updated_col_expand_mul)
-        state_2d[srow : srow + DECODE_V_TILE, 0:KDA_DIM] = updated
-        # Keep the state/query dot product in the same FP32 reduction domain
-        # as the recurrent update.
-        out_products = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
-        out_products[:, :] = pl.col_expand_mul(updated, q_row)
-        out_sum = accurate_row_sum(out_products)
-        out_row = pl.reshape(out_sum, [1, DECODE_V_TILE])
-        ocol = h * KDA_DIM + v0
-        out_row_bf16 = pl.cast(out_row, pl.BF16, mode="rint")
-        out_rows[t : t + 1, ocol : ocol + DECODE_V_TILE] = pl.set_validshape(out_row_bf16, 1, DECODE_V_TILE)
+        t = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+        end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+        if end > t:
+            row = pl.cast(pl.read(state_rows, [request, 0]), pl.INDEX)
+            qk_row = t * LOCAL_KDA_H + h
+            q_row = qn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
+            k_row = kn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
+            exp_buffer = pl.create_tensor([1, KDA_DIM], dtype=pl.FP32)
+            decay_tile = pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0])
+            exp_buffer[:, :] = pl.reshape(decay_tile, [1, KDA_DIM])
+            g_row = accurate_exp(exp_buffer)
+            beta_s = pl.read(beta, [t, h])
+            srow = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
+            state_tile = state_2d[srow:srow + DECODE_V_TILE, 0:KDA_DIM]
+            decayed = pl.col_expand_mul(state_tile, g_row)
+            kv_buffer = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
+            kv_buffer[:, :] = pl.col_expand_mul(decayed, k_row)
+            kv_col = accurate_row_sum(kv_buffer)
+            value_tile = pl.slice(value, [1, 1, DECODE_V_TILE], [t, h, v0], drop_dims=[0])
+            v_row_v4_rows = pl.reshape(value_tile, [1, DECODE_V_TILE])
+            v_row = pl.cast(v_row_v4_rows, pl.FP32)
+            v_col_full = pl.full([COL_REP_TILE, DECODE_V_TILE], dtype=pl.FP32, value=1.0)
+            v_col_col_expand_mul = pl.col_expand_mul(v_col_full, v_row)
+            v_col_transpose = pl.transpose(v_col_col_expand_mul, 0, 1)
+            v_col_row_sum = pl.row_sum(v_col_transpose)
+            v_col = pl.mul(v_col_row_sum, 1.0 / COL_REP_TILE)
+            delta_col = pl.mul(pl.sub(v_col, kv_col), beta_s)
+            updated_full = pl.full([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
+            updated_row_expand_mul = pl.row_expand_mul(updated_full, delta_col)
+            updated_col_expand_mul = pl.col_expand_mul(updated_row_expand_mul, k_row)
+            updated = pl.add(decayed, updated_col_expand_mul)
+            working_row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+            working_base = (working_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+            state_2d[working_base:working_base + DECODE_V_TILE, 0:KDA_DIM] = updated
+            checkpoint_row = pl.cast(pl.read(state_rows, [request, 2]), pl.INDEX)
+            if checkpoint_row >= 0:
+                checkpoint_base = (checkpoint_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+                state_2d[checkpoint_base:checkpoint_base + DECODE_V_TILE, 0:KDA_DIM] = updated
+            # Keep the state/query dot product in the same FP32 reduction domain
+            # as the recurrent update.
+            out_products = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
+            out_products[:, :] = pl.col_expand_mul(updated, q_row)
+            out_sum = accurate_row_sum(out_products)
+            out_row = pl.reshape(out_sum, [1, DECODE_V_TILE])
+            ocol = h * KDA_DIM + v0
+            out_row_bf16 = pl.cast(out_row, pl.BF16, mode="rint")
+            out_rows[t : t + 1, ocol : ocol + DECODE_V_TILE] = pl.set_validshape(out_row_bf16, 1, DECODE_V_TILE)
     return (output, recurrent_state)
 
 
@@ -638,10 +651,11 @@ def decode_kda_test(
     decay: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.FP32],
     beta: pl.Tensor[[T_DYN, BETA_PAD], pl.FP32],
     recurrent_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
-    state_rows: pl.Tensor[[T_DYN], pl.INT32],
-    output: pl.Out[pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
+    output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
 ):
-    output, recurrent_state = decode_kda(query, key, value, decay, beta, recurrent_state, state_rows, output)
+    output, recurrent_state = decode_kda(query, key, value, decay, beta, recurrent_state, query_start_loc, state_rows, output)
     return output, recurrent_state
 
 
@@ -1729,6 +1743,7 @@ def golden_decode_kda(
     decay: torch.Tensor,
     beta: torch.Tensor,
     recurrent_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
     state_rows: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns ``(output, recurrent_state)``; the state is returned updated.
@@ -1738,19 +1753,27 @@ def golden_decode_kda(
     tokens = query.shape[0]
     state = recurrent_state.clone().float()
     out = torch.zeros(tokens, LOCAL_KDA_H, KDA_DIM, dtype=torch.float32)
-    for t in range(tokens):
-        row = int(state_rows[t])
+    for request in range(query_start_loc.numel() - 1):
+        t = int(query_start_loc[request])
+        end = int(query_start_loc[request + 1])
+        if end == t:
+            continue
+        if end - t != 1:
+            raise ValueError("decode_kda requires one token per active request")
+        row, destination, checkpoint = map(int, state_rows[request, :3])
         for h in range(LOCAL_KDA_H):
             q = l2norm(query[t, h].float(), eps=DECODE_L2_EPS) * DECODE_Q_SCALE  # [K]
             k = l2norm(key[t, h].float(), eps=DECODE_L2_EPS)  # [K]
             v = value[t, h].float()  # [V]
             g = decay[t, h].float()  # [K]
             b = float(beta[t, h])
-            s = state[row, h] * torch.exp(g.double()).float().unsqueeze(0)  # [V, K]
+            s = recurrent_state[row, h].float() * torch.exp(g.double()).float().unsqueeze(0)  # [V, K]
             kv_mem = (s * k.unsqueeze(0)).double().sum(dim=-1).float()  # [V]
             delta = (v - kv_mem) * b  # [V]
             s = s + delta.unsqueeze(-1) * k.unsqueeze(0)
-            state[row, h] = s
+            state[destination, h] = s
+            if checkpoint >= 0:
+                state[checkpoint, h] = s
             out[t, h] = (s * q.unsqueeze(0)).double().sum(dim=-1).float()
     return out.to(query.dtype), state.to(recurrent_state.dtype)
 
@@ -1758,48 +1781,89 @@ def golden_decode_kda(
 def _decode_golden_tensors(tensors) -> None:
     (out, state) = golden_decode_kda(
         tensors["query"], tensors["key"], tensors["value"], tensors["decay"], tensors["beta"],
-        tensors["recurrent_state"], tensors["state_rows"],
+        tensors["recurrent_state"], tensors["query_start_loc"], tensors["state_rows"],
     )
-    tensors["output"][:] = out
+    count = int(tensors["query_start_loc"][-1])
+    tensors["output"][:count] = out[:count]
     tensors["recurrent_state"][:] = state
 
 
-def decode_build_tensor_specs(tokens: int = 5, *, initial_state: str = "nonzero"):
+def _decode_compare_output(actual, expected, *, inputs, **kwargs):
+    from golden import ratio_allclose
+
+    count = int(inputs["query_start_loc"][-1])
+    if not torch.equal(actual[count:], expected[count:]):
+        return False, "decode modified output padding"
+    return ratio_allclose(max_error_ratio=0.0)(actual[:count], expected[:count], inputs=inputs, **kwargs)
+
+
+def _decode_compare_state(actual, expected, *, inputs, **kwargs):
+    from golden import ratio_allclose
+
+    starts = inputs["query_start_loc"]
+    rows = inputs["state_rows"]
+    readonly = torch.ones(actual.shape[0], dtype=torch.bool)
+    for request in range(starts.numel() - 1):
+        if int(starts[request + 1]) == int(starts[request]):
+            continue
+        readonly[int(rows[request, 1])] = False
+        checkpoint = int(rows[request, 2])
+        if checkpoint >= 0:
+            readonly[checkpoint] = False
+    if not torch.equal(actual[readonly], expected[readonly]):
+        return False, "decode modified a read-only state row"
+    return ratio_allclose(max_error_ratio=0.0)(actual, expected, inputs=inputs, **kwargs)
+
+
+def decode_build_tensor_specs(tokens: int | None = None, *, initial_state: str = "nonzero", case: str = "batch"):
+    """Packed single-token requests with independent seeds and optional checkpoints."""
     from golden import TensorSpec
 
-    bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
+    if tokens is None:
+        tokens = 1 if case == "single" else 5
     if tokens < 1:
         raise ValueError("tokens must be positive")
     if initial_state not in ("zero", "nonzero"):
         raise ValueError("initial_state must be zero or nonzero")
-    pool_rows = max(DECODE_POOL_ROWS, tokens + 1)
+    slots = {
+        "single": tuple(range(tokens)), "batch": tuple(range(tokens)), "holes": (0, 3, 7, 15),
+        "slot15": (15,), "all": tuple(range(16)), "empty": (),
+        "in-place": (0, 3, 7, 15), "shared-seed": (0, 15), "boundaries": (0, 15),
+    }[case]
+    request_slots = max(16, tokens) if case in ("single", "batch") else 16
+    lengths = torch.tensor([int(request in slots) for request in range(request_slots)], dtype=torch.int32)
+    starts = torch.cat((torch.zeros(1, dtype=torch.int32), lengths.cumsum(0).int()))
+    seeds = torch.arange(request_slots, dtype=torch.int32).roll(5)
+    rows = torch.stack((seeds, seeds + request_slots, seeds + 2 * request_slots), dim=1)
+    rows[3, 2] = -1
+    if case == "in-place":
+        rows[:, 1] = rows[:, 0]
+    if case == "shared-seed":
+        rows[15, 0] = rows[0, 0]
+    bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
+    shape = [request_slots, LOCAL_KDA_H, KDA_DIM]
+    state_shape = [3 * request_slots + 3, LOCAL_KDA_H, KDA_DIM, KDA_DIM]
+    beta = torch.rand(request_slots, BETA_PAD)
+    if case == "boundaries":
+        beta[0].zero_()
+        beta[1].fill_(1.0)
 
     def init_state():
-        state = torch.zeros(pool_rows, LOCAL_KDA_H, KDA_DIM, KDA_DIM)
+        state = torch.zeros(state_shape)
         if initial_state == "nonzero":
             state.normal_().mul_(0.1)
         return state
-    # Deliberately not the identity mapping: a kernel that ignored state_rows and used
-    # the token index would pass an identity fixture.
-    rows = (
-        torch.tensor([4, 1, 5, 0, 3][:tokens], dtype=i32) if tokens <= 5
-        else torch.arange(tokens, 0, -1, dtype=i32)
-    )
 
     return [
-        TensorSpec("query", [tokens, LOCAL_KDA_H, KDA_DIM], bf, init_value=lambda : torch.randn(tokens, LOCAL_KDA_H, KDA_DIM).to(bf)),
-        TensorSpec("key", [tokens, LOCAL_KDA_H, KDA_DIM], bf, init_value=lambda : torch.randn(tokens, LOCAL_KDA_H, KDA_DIM).to(bf)),
-        TensorSpec("value", [tokens, LOCAL_KDA_H, KDA_DIM], bf, init_value=lambda : torch.randn(tokens, LOCAL_KDA_H, KDA_DIM).to(bf)),
-        # The real gate spans the whole (-5, 0) range. A near-zero fixture would make
-        # exp(g) ~ 1 and hide both the decay and its overflow guards.
-        TensorSpec("decay", [tokens, LOCAL_KDA_H, KDA_DIM], f32, init_value=lambda : -5.0 * torch.rand(tokens, LOCAL_KDA_H, KDA_DIM)),
-        # beta carries kda_projection's cube-width padding; only the first
-        # LOCAL_KDA_H columns are read.
-        TensorSpec("beta", [tokens, BETA_PAD], f32, init_value=lambda: torch.rand(tokens, BETA_PAD)),
-        # A non-zero initial state, so a kernel that silently starts from zero fails.
-        TensorSpec("recurrent_state", [pool_rows, LOCAL_KDA_H, KDA_DIM, KDA_DIM], f32, init_value=init_state),
-        TensorSpec("state_rows", [tokens], i32, init_value=lambda: rows),
-        TensorSpec("output", [tokens, LOCAL_KDA_H, KDA_DIM], bf),
+        TensorSpec("query", shape, bf, init_value=lambda: torch.randn(shape).to(bf)),
+        TensorSpec("key", shape, bf, init_value=lambda: torch.randn(shape).to(bf)),
+        TensorSpec("value", shape, bf, init_value=lambda: torch.randn(shape).to(bf)),
+        TensorSpec("decay", shape, f32, init_value=lambda: -5.0 * torch.rand(shape)),
+        TensorSpec("beta", [request_slots, BETA_PAD], f32, init_value=beta),
+        TensorSpec("recurrent_state", state_shape, f32, init_value=init_state),
+        TensorSpec("query_start_loc", [request_slots + 1], i32, init_value=starts),
+        TensorSpec("state_rows", [request_slots, 3], i32, init_value=rows),
+        TensorSpec("output", shape, bf, init_value=lambda: torch.full(shape, 0.125, dtype=bf)),
     ]
 
 
@@ -2168,37 +2232,49 @@ def run_decode_case(argv=None):
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    cases = ["single", "batch", "holes", "slot15", "all", "empty", "in-place", "shared-seed", "boundaries"]
     parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
     parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
-    parser.add_argument("--case", type=str, default="batch", choices=["batch", "single"])
+    parser.add_argument("--case", default="default", choices=["default", *cases])
     parser.add_argument("--requests", type=int)
     parser.add_argument("--query-len", type=int, default=1)
     parser.add_argument("--initial-state", choices=["zero", "nonzero"], default="nonzero")
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
-    requests = (1 if args.case == "single" else 5) if args.requests is None else args.requests
-    if requests < 1 or args.query_len < 1:
+    if args.query_len < 1 or args.requests is not None and args.requests < 1:
         parser.error("--requests and --query-len must be positive")
-    multi_token = args.query_len > 1
-    specs = (
-        prefill_build_tensor_specs(
-            requests=requests, tokens=requests * args.query_len, initial_state=args.initial_state,
-        ) if multi_token else decode_build_tensor_specs(requests, initial_state=args.initial_state)
-    )
-    result = run(
-        fn=prefill_kda_test if multi_token else decode_kda_test,
-        specs=specs,
-        golden_fn=_prefill_golden_tensors if multi_token else _decode_golden_tensors,
-        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-        rtol=0.02,
-        atol=0.02,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
-
+    selected = cases if args.case == "default" else [args.case]
+    if args.requests is not None or args.query_len > 1:
+        if args.case not in ("default", "single", "batch"):
+            parser.error("custom request counts and query lengths require --case single or batch")
+        selected = ["single" if args.case == "single" else "batch"]
+    for case in selected:
+        requests = (1 if case == "single" else 5) if args.requests is None else args.requests
+        multi_token = args.query_len > 1
+        specs = (
+            prefill_build_tensor_specs(
+                requests=requests, tokens=requests * args.query_len, initial_state=args.initial_state,
+            ) if multi_token else decode_build_tensor_specs(
+                requests, initial_state=args.initial_state, case=case,
+            )
+        )
+        result = run(
+            fn=prefill_kda_test if multi_token else decode_kda_test,
+            specs=specs,
+            golden_fn=_prefill_golden_tensors if multi_token else _decode_golden_tensors,
+            compare_fn=None if multi_token else {
+                "output": _decode_compare_output,
+                "recurrent_state": _decode_compare_state,
+            },
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            rtol=0.02,
+            atol=0.02,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
 
 def run_prefill_case(argv=None):
     import argparse

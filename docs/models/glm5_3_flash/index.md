@@ -367,6 +367,31 @@ and native compilation pass on the matched toolchain. These compile checks
 establish build compatibility; numerical device validation and performance
 measurements remain separate gates.
 
+### KDA phase selection
+
+Both forward entries compose the shared `dense_layer` and `kda_attention`
+functions. Their `decode_mode` parameter is a compile-time choice. The KDA
+sublayer selects the recurrence from the explicit forward phase. Prefill uses
+`prefill_kda`, retaining the chunk core's BF16 intermediates
+and FP32 carried state, even for a one-token prompt tail. Decode reuses the
+existing `decode_kda`: BF16 query/key/value inputs, FP32 normalization and
+recurrent arithmetic, and a BF16 output. It requires one packed token per active
+request and skips empty request slots. The standalone decode component uses the
+same kernel and its FP32 reference; it does not inherit the chunk reference's
+intermediate rounding.
+
+The host packer rejects decode requests containing multiple new tokens before
+building metadata. Multi-token queries use the prefill path; empty request slots
+remain valid. Component validation requires unchanged output padding and
+read-only state rows to match exactly, while computed values retain their
+numerical tolerance.
+
+Both recurrences use grouped metadata naming a seed row, a private working row
+and optional checkpoint rows. Decode reads each request's seed, updates its
+working row, and publishes the updated state when its checkpoint row is valid.
+Shared read-only seeds, request holes and output padding preserve their cache
+ownership. The complete-forward ABI and Serving's cache allocation stay the same.
+
 ### MoE expert parallelism
 
 The resident forward skips the complete shared expert on ranks with no

@@ -43,8 +43,8 @@ from models.glm5_3_flash.layer import (
     forward_epoch_guard as forward_epoch_guard, forward_geometry as forward_geometry,
     forward_parameter_names as forward_parameter_names,
     forward_query_tensor_names as forward_query_tensor_names,
-    forward_tensor_layouts as forward_tensor_layouts, prefill_dense_layer, prefill_head_rows,
-    prefill_kda_attention, prefill_lm_head_logits, prefill_moe_layer, prefill_seed, prefill_sparse_attention,
+    forward_tensor_layouts as forward_tensor_layouts, dense_layer, prefill_head_rows,
+    kda_attention, prefill_lm_head_logits, prefill_moe_layer, prefill_seed, prefill_sparse_attention,
     reference_layer_forward, synthetic_layer,
 )
 from models.glm5_3_flash.attention import MlaTensors
@@ -76,9 +76,9 @@ from models.glm5_3_flash.utils import (
 
 _inline_prefill_seed = pl.jit.inline(auto_scope=False)(prefill_seed._func)
 
-_inline_prefill_dense_layer = pl.jit.inline(auto_scope=False)(prefill_dense_layer._func)
+_inline_dense_layer = pl.jit.inline(auto_scope=False)(dense_layer._func)
 
-_inline_prefill_kda_attention = pl.jit.inline(auto_scope=False)(prefill_kda_attention._func)
+_inline_kda_attention = pl.jit.inline(auto_scope=False)(kda_attention._func)
 
 _inline_prefill_sparse_attention = pl.jit.inline(auto_scope=False)(prefill_sparse_attention._func)
 
@@ -238,7 +238,7 @@ def prefill_hidden_fwd(
         moe_epoch = forward_epoch * (NUM_LAYERS - DENSE_NUM_LAYERS) + moe_ord + 1
         skip_topk = pl.cast(0, pl.INT32)
         if layer < DENSE_NUM_LAYERS:
-            _inline_prefill_dense_layer(
+            _inline_dense_layer(
                 current, query_start_loc, kda_state_rows, active_tokens, kda_tri_incl,
                 kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
                 kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
@@ -252,7 +252,7 @@ def prefill_hidden_fwd(
                 ws_ffn_input, ws_ffn_partial, ws_ffn_out, following, kda_out,
                 mixed_qkv, decay, beta, kda_q, kda_k,
                 kda_v, dense_x_int8, bb_ord, kda_ord, dense_ord,
-                rank, attn_epoch, ffn_epoch,
+                rank, attn_epoch, ffn_epoch, False,
             )
         else:
             if layer % 4 == 3:
@@ -272,7 +272,7 @@ def prefill_hidden_fwd(
                     dsa_ord, rank, attn_epoch, skip_topk,
                 )
             else:
-                _inline_prefill_kda_attention(
+                _inline_kda_attention(
                     current, query_start_loc, kda_state_rows, active_tokens, kda_tri_incl,
                     kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
                     kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
@@ -283,6 +283,7 @@ def prefill_hidden_fwd(
                     ws_normed, ws_attn_partial, ws_sublayer_out, ws_x_hc_mid, kda_out,
                     mixed_qkv, decay, beta, kda_q, kda_k,
                     kda_v, bb_ord, kda_ord, rank, attn_epoch,
+                    False,
                 )
             _complete_forward_stage(ws_x_hc_mid)
             _inline_prefill_moe_layer(
@@ -1702,6 +1703,8 @@ def prepare_step_inputs(
         raise ValueError("device decode accepts target text tokens without embedding overrides")
     if len(sequences) != BATCH:
         raise ValueError(f"the packed batch has {BATCH} request slots, got {len(sequences)}")
+    if phase == "decode" and any(len(seq) > 1 for seq in sequences):
+        raise ValueError("decode requires one token per active request; use prefill for multi-token queries")
     lengths = torch.tensor([len(seq) for seq in sequences], dtype=torch.int64)
     previous = torch.zeros(BATCH, dtype=torch.int32) if kv_seq_lens is None else kv_seq_lens.to(torch.int32)
     if previous.shape != (BATCH,) or bool((previous < 0).any()):

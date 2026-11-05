@@ -55,7 +55,7 @@ from models.glm5_3_flash.indexer import (
     synthetic_indexer,
 )
 from models.glm5_3_flash.kda import (
-    BETA_PAD, CHUNK_TILE, CONV_DIM, STATE_LEN, KdaTensors, kda_conv_prefill, kda_forward, kda_output,
+    BETA_PAD, CHUNK_TILE, CONV_DIM, STATE_LEN, KdaTensors, decode_kda, kda_conv_prefill, kda_forward, kda_output,
     kda_projection, prefill_kda, stack_conv_weight, synthetic_kda,
 )
 from models.glm5_3_flash.lm_head import FP32_HEAD_VOCAB_PAD, lm_head_logits
@@ -698,18 +698,22 @@ def kda_attention_sublayer(
     value: pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     kda_out: pl.Tensor[[CAPACITY, LOCAL_KDA_H, KDA_DIM], pl.BF16],
     attn_partial: pl.Tensor[[CAPACITY, D], pl.FP32],
+    decode_mode: pl.constexpr = False,
 ):
-    """KDA projection -> causal conv -> chunked delta attention -> gated output."""
+    """KDA projection and convolution followed by the phase-specific recurrence."""
     stack_conv_weight(conv_q, conv_k, conv_v, conv_w)
     kda_projection(
         normed,
         w_q, w_k, w_v, w_f_a, w_f_b, dt_bias, a_log, w_b, w_g_a, w_g_b, mixed_qkv, decay, beta, out_gate,
     )
     kda_conv_prefill(mixed_qkv, conv_w, conv_state, query_start_loc, kda_state_rows, query, key, value)
-    prefill_kda(
-        query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, tri_incl,
-        tri_strict, head_onehot, eye_wide, kda_out,
-    )
+    if decode_mode:
+        decode_kda(query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, kda_out)
+    else:
+        prefill_kda(
+            query, key, value, decay, beta, recurrent_state, query_start_loc, kda_state_rows, tri_incl,
+            tri_strict, head_onehot, eye_wide, kda_out,
+        )
 
 
 @pl.jit.inline
@@ -838,7 +842,7 @@ def prefill_head_rows(
 
 
 @pl.jit(auto_scope=False)
-def prefill_kda_attention(
+def kda_attention(
     # -- sublayer input: the stream entering the attention half ----------------------
     x_hc: pl.Tensor[[CAPACITY, HC_MULT, D], pl.BF16],
     # -- metadata and per-step inputs (the KDA chain's own subset) -------------------
@@ -901,6 +905,7 @@ def prefill_kda_attention(
     kda_ord: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     attn_epoch: pl.Scalar[pl.INT32],
+    decode_mode: pl.constexpr = False,
 ):
     """Run resident KDA attention with runtime layer ordinals."""
     num_tokens: pl.Scalar[pl.INT32] = pl.read(active_tokens, [0])
@@ -942,7 +947,7 @@ def prefill_kda_attention(
             conv_state_l, recurrent_state_l, query_start_loc, kda_state_rows, kda_tri_incl, kda_tri_strict,
             kda_head_onehot, kda_eye_wide, conv_w, mixed_qkv, decay, beta, out_gate,
             kda_q, kda_k, kda_v, kda_out,
-            out_attn_partial,
+            out_attn_partial, decode_mode,
         )
         kda_output(kda_out, kda_o_norm_l, out_gate, kda_w_o_l, out_attn_partial)
         tp_all_reduce(out_attn_partial, tp_partial, tp_arrived, out_sublayer_out, num_tokens, my_rank, 0, attn_epoch)
@@ -1073,7 +1078,7 @@ def prefill_moe_layer(
 
 
 @pl.jit(auto_scope=False)
-def prefill_dense_layer(
+def dense_layer(
     # -- layer input: the stream entering the layer --------------------------------
     x_hc: pl.Tensor[[CAPACITY, HC_MULT, D], pl.BF16],
     # -- metadata and per-step inputs (the KDA chain's own subset; the dense
@@ -1153,6 +1158,7 @@ def prefill_dense_layer(
     my_rank: pl.Scalar[pl.INT32],
     attn_epoch: pl.Scalar[pl.INT32],
     ffn_epoch: pl.Scalar[pl.INT32],
+    decode_mode: pl.constexpr = False,
 ):
     """Run a resident KDA layer with a dense feed-forward sublayer."""
     num_tokens: pl.Scalar[pl.INT32] = pl.read(active_tokens, [0])
@@ -1202,7 +1208,7 @@ def prefill_dense_layer(
             conv_state_l, recurrent_state_l, query_start_loc, kda_state_rows, kda_tri_incl, kda_tri_strict,
             kda_head_onehot, kda_eye_wide, conv_w, mixed_qkv, decay, beta, out_gate,
             kda_q, kda_k, kda_v, kda_out,
-            out_attn_partial,
+            out_attn_partial, decode_mode,
         )
         kda_output(kda_out, kda_o_norm_l, out_gate, kda_w_o_l, out_attn_partial)
         tp_all_reduce(out_attn_partial, tp_partial, tp_arrived, out_sublayer_out, num_tokens, my_rank, 0, attn_epoch)
