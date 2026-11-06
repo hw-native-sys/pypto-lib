@@ -149,7 +149,7 @@ def prepare_target_decode_rank(
                 if lane == 0:
                     value = pl.cast(1.0, pl.FP32)
                 pl.write(pre_mix, [row, lane], value)
-    pack_x_hc(padded_ids, embedding_weight, x_hc)
+    pack_x_hc(padded_ids, embedding_weight, x_hc, hidden_tile=512)
     return x_hc, pre_mix
 
 

@@ -13,9 +13,10 @@ using namespace mxfp8_projection;
 
 template <int K>
 __aicore__ inline void project_ob(__gm__ int64_t* args) {
-    project<K, 5120, 160>(
+    constexpr int N_TILE = K == 8192 ? 160 : 256;
+    project<K, 5120, N_TILE>(
         data<F>(args, 0), data<F>(args, 1), data<S>(args, 2), data<S>(args, 3),
-        data<bfloat16_t>(args, 4), args[5], 5120, get_block_idx(args) * 160);
+        data<bfloat16_t>(args, 4), args[5], 5120, get_block_idx(args) * N_TILE);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {

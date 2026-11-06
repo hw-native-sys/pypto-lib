@@ -1215,7 +1215,7 @@ def gather_sparse_attention(
     source_ready: pl.Scalar[pl.TASK_ID],
     compressed_keys: pl.constexpr,
 ):
-    """Attend H=64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
+    """Attend H=32/64, D=512 packed caches with K=128 or 640 and both Vector lanes."""
     query = query[:num_tokens, :]
     active_output = output[:num_tokens, :]
     window_indices = window_indices[:num_tokens, :]
@@ -1247,32 +1247,6 @@ def gather_sparse_attention(
             balanced, cache_mode=compressed_keys,
         )
     return attended
-
-
-@pl.jit.inline(auto_scope=False)
-def _attend_project(
-    query: pl.Tensor, window_indices: pl.Tensor, window: pl.Tensor, window_scale: pl.Tensor,
-    compressed_indices: pl.Tensor, compressed: pl.Tensor, compressed_scale: pl.Tensor, sink: pl.Tensor,
-    wo_a: pl.Tensor, wo_a_scale: pl.Tensor, wo_b: pl.Tensor,
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor, rope_sin: pl.Tensor, output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32], source_ready: pl.Scalar[pl.TASK_ID], compressed_keys: pl.constexpr,
-):
-    """Project BF16 attention through separate inverse RoPE and quantization tasks."""
-    total_rows = pl.tensor.dim(output, 0)
-    attended = pl.create_tensor([total_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    if LOCAL_H == 64:
-        gather_sparse_attention(
-            query, window_indices, window, window_scale, compressed_indices, compressed, compressed_scale,
-            sink, attended, num_tokens, source_ready, compressed_keys=compressed_keys,
-        )
-    else:
-        attend_packed(
-            query, window_indices, window, window_scale, compressed_indices, compressed, compressed_scale,
-            sink, attended, num_tokens, source_ready,
-        )
-    output = o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens)
-    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1695,28 +1669,25 @@ def gather_decoded_caches(
         for block in pl.range(worker, num_tokens * (SELECTED_KEYS // SELECTED_GATHER_TILE), workers):
             token = block // (SELECTED_KEYS // SELECTED_GATHER_TILE)
             column = block % (SELECTED_KEYS // SELECTED_GATHER_TILE) * SELECTED_GATHER_TILE
+            zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
             values = pl.tile.create([SELECTED_GATHER_TILE, HEAD_DIM], dtype=pl.BF16)
             if column < 128:
                 ids = pl.tile.load(wi, [token, column], [1, SELECTED_GATHER_TILE])
-                safe_ids = pl.maximum(ids, 0)
                 for lane in pl.range(SELECTED_GATHER_TILE):
-                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    values = pl.tile.gather_row(
-                        values, decoded_window, [lane, 0], [physical, 0], [1, HEAD_DIM]
-                    )
+                    physical = pl.cast(pl.tile.read(ids, [0, lane]), pl.INDEX)
+                    if physical >= 0:
+                        values = pl.tile.gather_row(values, decoded_window, [lane, 0], [physical, 0], [1, HEAD_DIM])
+                    else:
+                        values = pl.tile.assemble(values, zero, [lane, 0])
             else:
                 ids = pl.tile.load(ci, [token, column - 128], [1, SELECTED_GATHER_TILE])
-                safe_ids = pl.maximum(ids, 0)
                 for lane in pl.range(SELECTED_GATHER_TILE):
-                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    values = pl.tile.gather_row(
-                        values, decoded_compressed, [lane, 0], [physical, 0], [1, HEAD_DIM]
-                    )
+                    physical = pl.cast(pl.tile.read(ids, [0, lane]), pl.INDEX)
+                    if physical >= 0:
+                        values = pl.tile.gather_row(values, decoded_compressed, [lane, 0], [physical, 0], [1, HEAD_DIM])
+                    else:
+                        values = pl.tile.assemble(values, zero, [lane, 0])
             pl.tile.store(values, [token * SELECTED_KEYS + column, 0], dst)
-            zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            for lane in pl.range(SELECTED_GATHER_TILE):
-                if pl.tile.read(ids, [0, lane]) < 0:
-                    pl.tile.store(zero, [token * SELECTED_KEYS + column + lane, 0], dst)
             pl.tile.store(ids, [token, column], indices)
     return gathered
 
@@ -1800,7 +1771,7 @@ def attend_packed(
     num_tokens: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
 ):
-    if LOCAL_H == 64:
+    if LOCAL_H >= 32:
         attended = gather_sparse_attention(
             query, window_indices, window, window_scale, compressed_indices,
             compressed, compressed_scale, sink, output, num_tokens, source_ready, compressed_keys=INDEX_TOPK,
@@ -2539,11 +2510,14 @@ def l2_attend_project(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     source_ready = pl.system.task_dummy(deps=[])
-    output = _attend_project(
-        query, window_indices, window, window_scale,
-        compressed_indices, compressed, compressed_scale, sink,
-        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        output, num_tokens, source_ready, compressed_keys=INDEX_TOPK,
+    attention_rows = pl.tensor.dim(output, 0)
+    attended = pl.create_tensor([attention_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attend_packed(
+        query, window_indices, window, window_scale, compressed_indices, compressed, compressed_scale,
+        sink, attended, num_tokens, source_ready,
+    )
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens,
     )
     return output
 

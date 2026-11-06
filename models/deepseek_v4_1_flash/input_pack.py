@@ -58,6 +58,7 @@ def gather_rows(
     row_ids: pl.Tensor[[TOKEN_DYN], pl.INT32],
     output: pl.Tensor[[TOKEN_DYN, ROW_WIDTH], pl.FP32],
     source_ready: pl.Scalar[pl.TASK_ID],
+    column_tile: pl.constexpr = HIDDEN_TILE,
 ):
     """Gather rows after source_ready; negative IDs produce zero padding."""
     rows = pl.tensor.dim(output, 0)
@@ -66,13 +67,13 @@ def gather_rows(
         worker = pl.tile.get_block_idx()
         for row in pl.range(worker, rows, SPMD_BLOCKS):
             source_row = pl.cast(pl.read(row_ids, [row]), pl.INDEX)
-            for col in pl.range(0, width, HIDDEN_TILE):
-                active = pl.min(HIDDEN_TILE, width - col)
+            for col in pl.range(0, width, column_tile):
+                active = pl.min(column_tile, width - col)
                 if source_row >= 0:
-                    value = pl.load(source, [source_row, col], [1, HIDDEN_TILE], valid_shape=[1, active])
+                    value = pl.load(source, [source_row, col], [1, column_tile], valid_shape=[1, active])
                     pl.store(value, [row, col], output)
                 else:
-                    empty = pl.tile.full([1, HIDDEN_TILE], dtype=pl.FP32, value=0.0)
+                    empty = pl.tile.full([1, column_tile], dtype=pl.FP32, value=0.0)
                     pl.store(pl.set_validshape(empty, 1, active), [row, col], output)
     return output
 
@@ -82,23 +83,24 @@ def pack_x_hc(
     input_ids: pl.Tensor[[TOKEN_DYN], pl.INT64],
     embed_weight: pl.Tensor[[VOCAB_DYN, D], pl.BF16],
     x_hc: pl.Tensor[[TOKEN_DYN, HC_MULT, D], pl.FP32],
+    hidden_tile: pl.constexpr = HIDDEN_TILE,
 ) -> pl.Tensor[[TOKEN_DYN, HC_MULT, D], pl.FP32]:
     """Look up token embeddings and replicate them across the HC lanes."""
     token_count = pl.tensor.dim(input_ids, 0)
     vocab_rows = pl.tensor.dim(embed_weight, 0)
     x_hc_flat = pl.reshape(x_hc, [token_count * HC_MULT, D])
-    work_items = token_count * (D // HIDDEN_TILE)
+    work_items = token_count * (D // hidden_tile)
     for block in pl.spmd(SPMD_BLOCKS, name_hint="pack_x_hc"):
         for work_idx in pl.range(block, work_items, SPMD_BLOCKS):
-            token_idx = work_idx // (D // HIDDEN_TILE)
-            hidden_offset = (work_idx % (D // HIDDEN_TILE)) * HIDDEN_TILE
+            token_idx = work_idx // (D // hidden_tile)
+            hidden_offset = (work_idx % (D // hidden_tile)) * hidden_tile
             token_id = pl.tensor.read(input_ids, [token_idx])
             safe_token_id = pl.max(pl.min(token_id, vocab_rows - 1), 0)
             token_row = pl.cast(safe_token_id, target_type=pl.INDEX)
             hidden_chunk = pl.cast(
                 embed_weight[
                     token_row : token_row + 1,
-                    hidden_offset : hidden_offset + HIDDEN_TILE,
+                    hidden_offset : hidden_offset + hidden_tile,
                 ],
                 target_type=pl.FP32,
             )
@@ -106,7 +108,7 @@ def pack_x_hc(
                 x_hc_row = token_idx * HC_MULT + hc_idx
                 x_hc_flat[
                     x_hc_row : x_hc_row + 1,
-                    hidden_offset : hidden_offset + HIDDEN_TILE,
+                    hidden_offset : hidden_offset + hidden_tile,
                 ] = hidden_chunk
     return x_hc
 
@@ -120,7 +122,7 @@ def l2_input_pack(
     input_ids.bind_dynamic(0, TOKEN_DYN)
     embed_weight.bind_dynamic(0, VOCAB_DYN)
     x_hc.bind_dynamic(0, TOKEN_DYN)
-    return pack_x_hc(input_ids, embed_weight, x_hc)
+    return pack_x_hc(input_ids, embed_weight, x_hc, hidden_tile=512)
 
 
 def golden_pack_x_hc(tensors):

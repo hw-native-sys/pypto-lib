@@ -627,7 +627,7 @@ def _dspark_drafter(
                         pl.write(padded_indices, [layer, token, offset], index)
 
         x_hc = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-        pack_x_hc(padded_ids, embedding_weight, x_hc)
+        pack_x_hc(padded_ids, embedding_weight, x_hc, hidden_tile=512)
         pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
         for _ in pl.spmd(1, name_hint="dspark_initial_pre_mix"):
             for token in pl.range(MOE_TOKENS):

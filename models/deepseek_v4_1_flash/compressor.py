@@ -15,7 +15,7 @@ from pypto.runtime import pto_isa_include_dir
 import torch
 
 from config import (
-    FLASH as M, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN,
+    FLASH as M, TP_SIZE, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN,
     T_DYN, COMPRESSED_CACHE_GROUP, CMP_BLOCKS_DYN,
 )
 from quant import unpack_bf16_nz
@@ -45,26 +45,28 @@ def c1a_compressor_project(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
+    m_tile: pl.constexpr,
+    n_tile: pl.constexpr,
 ):
     """Project NZ weights with full-height Cube tiles and store active rows."""
-    blocks = (num_tokens + C1A_PROJ_M_TILE - 1) // C1A_PROJ_M_TILE * (HEAD_DIM // C1A_PROJ_N_TILE)
+    blocks = (num_tokens + m_tile - 1) // m_tile * (HEAD_DIM // n_tile)
     workers = pl.max(blocks, 1)
     with pl.spmd(workers, name_hint="proj_cmp", deps=[ready]) as completed:
         with pl.at(level=pl.Level.CORE_GROUP):
             block = pl.tile.get_block_idx()
-            row = block // (HEAD_DIM // C1A_PROJ_N_TILE) * C1A_PROJ_M_TILE
-            col = block % (HEAD_DIM // C1A_PROJ_N_TILE) * C1A_PROJ_N_TILE
-            rows = pl.max(pl.min(C1A_PROJ_M_TILE, num_tokens - row), 0)
-            a = pl.load(source, [row, 0], [C1A_PROJ_M_TILE, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
-            b = pl.load(weight, [0, col], [C1A_PROJ_K_TILE, C1A_PROJ_N_TILE], target_memory=pl.Mem.Mat)
-            full_a = pl.set_validshape(a, C1A_PROJ_M_TILE, C1A_PROJ_K_TILE)
+            row = block // (HEAD_DIM // n_tile) * m_tile
+            col = block % (HEAD_DIM // n_tile) * n_tile
+            rows = pl.max(pl.min(m_tile, num_tokens - row), 0)
+            a = pl.load(source, [row, 0], [m_tile, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+            b = pl.load(weight, [0, col], [C1A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+            full_a = pl.set_validshape(a, m_tile, C1A_PROJ_K_TILE)
             acc = pl.matmul(full_a, b)
             for k in pl.pipeline(C1A_PROJ_K_TILE, D, C1A_PROJ_K_TILE, stage=2):
-                a = pl.load(source, [row, k], [C1A_PROJ_M_TILE, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
-                b = pl.load(weight, [k, col], [C1A_PROJ_K_TILE, C1A_PROJ_N_TILE], target_memory=pl.Mem.Mat)
-                full_a = pl.set_validshape(a, C1A_PROJ_M_TILE, C1A_PROJ_K_TILE)
+                a = pl.load(source, [row, k], [m_tile, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                b = pl.load(weight, [k, col], [C1A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                full_a = pl.set_validshape(a, m_tile, C1A_PROJ_K_TILE)
                 acc = pl.matmul_acc(acc, full_a, b)
-            value = pl.set_validshape(acc, rows, C1A_PROJ_N_TILE)
+            value = pl.set_validshape(acc, rows, n_tile)
             output = pl.store(value, [row, col], output)
     return output, completed
 
@@ -241,7 +243,11 @@ def c2a_compressor_publish(
                         if pl.read(token_to_req_indices, [token]) == request:
                             pl.write(mapped_requests, [token], count)
                     count = pl.cast(count + 1, pl.INT32)
-    workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
+    # TP1 decode retains its measured request-based worker policy.
+    if TP_SIZE == 1:
+        workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
+    else:
+        workers = pl.max(pl.min(native_blocks, 32), 1)
     native_count = pl.cast(native_blocks, pl.INT32)
     with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as completed:
         _c2a_compress(

@@ -30,7 +30,8 @@ from prefill_c2a_full import (
     _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
 )
 from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from sparse_attention import _attend_project
+from o_proj import o_proj
+from sparse_attention import attend_packed
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm, rms_norm_tiled
@@ -115,11 +116,13 @@ def prefill_c2a_reuse_attention(
     )
 
     source_ready = pl.system.task_dummy(deps=[window_publish_tid, cache_ready])
-    _attend_project(
-        query, window_indices, window_cache, window_cache_scale,
-        compressed_indices, compressed_cache, compressed_cache_scale, attn_sink,
-        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial,
-        num_tokens, source_ready, compressed_keys=INDEX_TOPK,
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attend_packed(
+        query, window_indices, window_cache, window_cache_scale, compressed_indices, compressed_cache, compressed_cache_scale,
+        attn_sink, attended, num_tokens, source_ready,
+    )
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens,
     )
     return partial
 
