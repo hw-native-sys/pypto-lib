@@ -126,6 +126,15 @@ checkpoint asset. Its index references 270 quantized shard files using the
 for L1/L14. `decode_checkpoint_manifest.py` records metadata, shard presence,
 target-layer mapping, and safetensors headers without hashing tensor payloads.
 
+The independent layer setup is recorded by
+`tools/deepseek_v41_layer_contract.py` and
+`tools/deepseek_v41_layer_stage_inventory.py`. The generated reports under
+`.pypto-a3-state/decode-assets/` distinguish representative product evidence
+from formal accuracy, and keep all reference, NPU, and accuracy fields at
+`not_run` until the matching layer has its own capture and PyPTO replay.
+Capacity-16 stage construction is setup evidence only; it is not a layer
+precision result.
+
 | gate | status | recovery condition |
 | --- | --- | --- |
 | product import/dependency scan | `pass` | Keep vLLM/Torch-NPU out of the product closure |
@@ -143,6 +152,9 @@ target-layer mapping, and safetensors headers without hashing tensor payloads.
 | independent vLLM-Ascend full-state capture | `pass` | `.pypto-a3-state/reference/decode_ep2_l0_20261106_v29/reference_capture.json`; v29 joins layer, MoE, and cache state; v24/v26 remain historical split captures |
 | same-input NPU PyPTO/reference representative comparison | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json`; fixed `rtol=0.05`, `atol=0.05` and exact route IDs |
 | target layers 0,1,2,3,14,15,19,20,21,24,25 | `not_run` | Each layer must pass its own complete DP8/TP2/EP16 gate |
+| independent L1 reference capture | `pending` | `task_20261106_103011_5220629172`; waits for two queued A3 cards, then writes a layer-1 token/cache/state contract |
+| independent layer contract matrix | `pass` | `.pypto-a3-state/decode-assets/layer-contracts.json`; metadata/setup only, formal status remains `not_run` |
+| capacity-16 stage inventory | `pass` | `.pypto-a3-state/decode-assets/layer-stage-inventory.json`; stage construction only, no NPU or accuracy claim |
 
 No status in this table may be promoted from the historical Prefill evidence,
 CPU golden, simulator replay, TP1 diagnosis, single expert, or native

@@ -1,8 +1,12 @@
 # Copyright (c) PyPTO Contributors.
-# This program is free software; you can redistribute it and/or modify it under the terms of
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Replay the complete physical L0 Decode layer on two A3 ranks.
+"""Replay one complete physical Decode layer on two A3 ranks.
 
 The input boundary is frozen by the independent vLLM-Ascend capture.  This
 process only imports PyPTO and the host checkpoint reader; vLLM and torch-npu
@@ -60,6 +64,7 @@ from models.deepseek_v4_1_flash_a2.utils import unpack_nz
 DEFAULT_ASSETS = Path(".pypto-a3-state/reference/decode_ep2_l0_20261106_v26")
 DEFAULT_CACHE_ASSETS = Path(".pypto-a3-state/reference/decode_ep2_l0_20261106_v24")
 DEFAULT_FIXTURE = Path(".pypto-a3-state/product/decode-layer-ep2-l0-fixture-v27")
+TARGET_LAYER_IDS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
 
 
 def _bf16_storage(value: np.ndarray) -> torch.Tensor:
@@ -207,7 +212,26 @@ def _attention_weights(checkpoint: DecodeSafetensorsCheckpoint, layer: int) -> d
 
 
 def _layer_inputs(asset_root: Path, cache_root: Path, checkpoint_root: Path, layer: int) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    _validate_reference_boundary(asset_root, cache_root)
+    boundary = _validate_reference_boundary(asset_root, cache_root)
+    decode_input = boundary["decode_input"]
+    position_ids = [int(value) for value in decode_input["position_ids"]]
+    if len(position_ids) != 1:
+        raise ValueError(f"the current EP2 runner expects one decode row, got {position_ids}")
+    decode_position = position_ids[0]
+    decode_token = int(decode_input["decode_token"])
+    history_length = int(decode_input["history_token_length"])
+    slot_mapping = decode_input["slot_mapping"]
+    if len(slot_mapping) != EP_SIZE:
+        raise ValueError(f"slot_mapping must contain {EP_SIZE} rank records")
+    slots_from_contract: list[tuple[int, int]] = []
+    for rank in range(EP_SIZE):
+        rank_slots = slot_mapping[rank]
+        if not rank_slots or not rank_slots[0]:
+            raise ValueError(f"rank {rank} has no decode slot mapping")
+        physical_slot = int(rank_slots[0][0])
+        slots_from_contract.append((physical_slot // 128, physical_slot % 128))
+    if any(page < 0 or page >= 2 for page, _ in slots_from_contract):
+        raise ValueError(f"EP2 fixture only supports the two captured cache pages: {slots_from_contract}")
     checkpoint = DecodeSafetensorsCheckpoint(checkpoint_root)
     attention = _attention_weights(checkpoint, layer)
     router = load_router(checkpoint, layer)
@@ -275,7 +299,7 @@ def _layer_inputs(asset_root: Path, cache_root: Path, checkpoint_root: Path, lay
         "output": torch.zeros((EP_SIZE, T, HC, HIDDEN), dtype=torch.bfloat16),
     }
     frequencies = 1.0 / (10000.0 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64.0))
-    angle = 8.0 * frequencies
+    angle = decode_position * frequencies
     rope_cos = torch.cos(angle)
     rope_sin = torch.sin(angle)
     for rank in range(EP_SIZE):
@@ -283,10 +307,14 @@ def _layer_inputs(asset_root: Path, cache_root: Path, checkpoint_root: Path, lay
         moe = moes[rank]
         inputs["x_hc"][rank, 0] = _bf16_storage(cap["input_bf16"])[0]
         inputs["attn_incoming"][rank, 0] = torch.from_numpy(cap["pre_mix_fp32"])[0]
-        inputs["positions"][rank, 0] = 8
-        inputs["slots"][rank, 0] = torch.tensor([1, 8], dtype=torch.int64)
-        inputs["indices"][rank, 0, :9] = torch.arange(128, 137, dtype=torch.int32)
-        inputs["input_ids"][rank, 0] = int(json.loads((asset_root / "decode_input.json").read_text())["decode_token"])
+        inputs["positions"][rank, 0] = decode_position
+        inputs["slots"][rank, 0] = torch.tensor(slots_from_contract[rank], dtype=torch.int64)
+        physical_slot = slots_from_contract[rank][0] * 128 + slots_from_contract[rank][1]
+        first_history = max(0, physical_slot - history_length)
+        inputs["indices"][rank, 0, : history_length + 1] = torch.arange(
+            first_history, physical_slot + 1, dtype=torch.int32
+        )
+        inputs["input_ids"][rank, 0] = decode_token
         shard = load_routed_shard(checkpoint, layer, rank)
         inputs["routed_w1"][rank] = unpack_nz(shard["routed_w1"].reshape(N_LOCAL_EXPERTS, MOE_INTER, D))
         inputs["routed_w3"][rank] = unpack_nz(shard["routed_w3"].reshape(N_LOCAL_EXPERTS, MOE_INTER, D))
@@ -361,7 +389,13 @@ def _compare(name: str, expected: torch.Tensor):
     return compare
 
 
-def _write_fixture(root: Path, inputs: dict[str, torch.Tensor], expected: dict[str, torch.Tensor]) -> None:
+def _write_fixture(
+    root: Path,
+    inputs: dict[str, torch.Tensor],
+    expected: dict[str, torch.Tensor],
+    *,
+    layer_id: int,
+) -> None:
     if root.exists():
         import shutil
         shutil.rmtree(root)
@@ -373,7 +407,20 @@ def _write_fixture(root: Path, inputs: dict[str, torch.Tensor], expected: dict[s
     torch.save(torch.tensor(1, dtype=torch.int32), root / "in" / "epoch.pt")
     for name, value in expected.items():
         torch.save(value, root / "out" / f"{name}.pt")
-    (root / "contract.json").write_text(json.dumps({"status": "frozen_full_layer_inputs", "product_compute": "PyPTO only", "formal_accuracy": "not_run", "topology": {"dp": 2, "tp": 1, "ep": 2}}, indent=2) + "\n", encoding="utf-8")
+    (root / "contract.json").write_text(
+        json.dumps(
+            {
+                "status": "frozen_full_layer_inputs",
+                "product_compute": "PyPTO only",
+                "formal_accuracy": "not_run",
+                "layer_id": layer_id,
+                "topology": {"dp": 2, "tp": 1, "ep": 2},
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -382,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-assets", type=Path, default=DEFAULT_CACHE_ASSETS)
     parser.add_argument("--checkpoint", type=Path, default=Path(os.environ.get("DEEPSEEK_V41_CHECKPOINT", "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8")))
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
+    parser.add_argument("--layer-id", type=int, choices=TARGET_LAYER_IDS, default=0)
     parser.add_argument("--device", default=os.environ.get("TASK_DEVICE", "0,1"))
     parser.add_argument("--platform", default="a2a3", choices=("a2a3", "a5"))
     parser.add_argument("--sim", action="store_true")
@@ -389,11 +437,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--record", type=Path)
     args = parser.parse_args(argv)
     assets, cache_assets, checkpoint = args.assets.resolve(), args.cache_assets.resolve(), args.checkpoint.resolve()
-    inputs, expected = _layer_inputs(assets, cache_assets, checkpoint, 0)
-    _write_fixture(args.fixture.resolve(), inputs, expected)
+    inputs, expected = _layer_inputs(assets, cache_assets, checkpoint, args.layer_id)
+    _write_fixture(args.fixture.resolve(), inputs, expected, layer_id=args.layer_id)
     if args.prepare_only:
-        print(json.dumps({"status": "fixture_ready", "fixture": str(args.fixture.resolve())}, indent=2))
+        print(
+            json.dumps(
+                {"status": "fixture_ready", "layer_id": args.layer_id, "fixture": str(args.fixture.resolve())},
+                indent=2,
+            )
+        )
         return 0
+    if args.layer_id != 0:
+        report = {
+            "status": "not_run",
+            "formal_accuracy": "not_run",
+            "scope": "independent physical Decode layer",
+            "layer_id": args.layer_id,
+            "topology": {"dp": 2, "tp": 1, "ep": 2},
+            "same_input": True,
+            "same_layer": True,
+            "same_topology": True,
+            "same_state_boundary": True,
+            "product_compute": "PyPTO only",
+            "reference_assets": {"root": str(assets), "cache_root": str(cache_assets)},
+            "blocker": (
+                "decode_layer_ep2 is the L0 SWA composition. The selected physical layer "
+                "requires its C1A/C2A cache/index path and, for L1/L14, Engram state; "
+                "running the L0 kernel here would compare the wrong semantics."
+            ),
+            "recovery": "Add a layer-specific PyPTO composition and capture all owned cache/index/Engram state before NPU submission.",
+        }
+        if args.record:
+            args.record.parent.mkdir(parents=True, exist_ok=True)
+            args.record.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2))
+        return 2
     devices = [int(item) for item in args.device.split(",") if item]
     if devices != [0, 1] and len(devices) != 2:
         raise SystemExit(f"EP2 needs two allocated devices, got {devices}")
@@ -416,7 +494,8 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "status": "pass" if result.passed else "fail",
         "formal_accuracy": "not_run",
-        "scope": "complete physical L0 layer EP2 representative case",
+        "scope": f"complete physical L{args.layer_id} layer EP2 representative case",
+        "layer_id": args.layer_id,
         "topology": {"dp": 2, "tp": 1, "ep": 2, "devices": devices},
         "same_input": True,
         "same_layer": True,

@@ -16,8 +16,9 @@ step.  The product PyPTO package is never imported by this module.
 The full checkpoint has forty layers and cannot be loaded on the two-card EP2
 gate.  The temporary model root therefore changes only ``num_hidden_layers``
 to ``layer_id + 1`` and leaves every weight shard and quantization description
-as symlinks to the supplied checkpoint.  For the initial gate ``layer_id=0``
-this loads the complete physical L0 with the real 384-expert W8A8 weights.
+as symlinks to the supplied checkpoint.  Each invocation captures one
+physical layer independently; it never uses a product or a previous PyPTO
+layer result as its input.
 """
 
 from __future__ import annotations
@@ -218,6 +219,33 @@ def _make_layer_root(checkpoint: Path, root: Path, layer_id: int) -> Path:
         save_file(tensors, str(target), metadata={"format": "pt", "source": str(source)})
     (root / ".ready").write_text("complete\n", encoding="utf-8")
     return root
+
+
+def _layer_state_contract(checkpoint: Path, layer_id: int) -> dict[str, Any]:
+    """Resolve the immutable cache ownership fields for one physical layer."""
+
+    config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+    text = config.get("text_config", config)
+    ratios = [int(value) for value in text.get("compress_ratios", ())]
+    kv_sources = [int(value) for value in text.get("kv_source_layer_ids", ())]
+    index_sources = [int(value) for value in text.get("index_source_layer_ids", ())]
+    if not 0 <= layer_id < len(ratios):
+        raise ValueError(f"layer_id {layer_id} is outside the checkpoint layer plan")
+    ratio = ratios[layer_id]
+
+    def latest(sources: list[int]) -> int | None:
+        matching = [source for source in sources if source <= layer_id and ratios[source] == ratio]
+        return matching[-1] if matching else None
+
+    return {
+        "layer_ratio": ratio,
+        "source_layer": latest(kv_sources),
+        "index_source_layer": latest(index_sources),
+        "is_kv_source": layer_id in kv_sources,
+        "is_index_source": layer_id in index_sources,
+        "is_candidate_source": layer_id == int(text.get("candidate_source_layer_id", -1)),
+        "engram_required": layer_id in {int(value) for value in text.get("engram_layer_ids", ())},
+    }
 
 
 def _wait_for_layer_root(root: Path, timeout_s: float = 120.0) -> None:
@@ -943,6 +971,7 @@ def _assemble_existing(args: argparse.Namespace) -> int:
         "device": "NPU tensor operations in reference process",
     }
     topology = {**TOPOLOGY, "devices": 2}
+    layer_state = _layer_state_contract(checkpoint, args.layer_id)
     decode_input = {
         "session": SESSION,
         "checkpoint": str(checkpoint),
@@ -962,9 +991,13 @@ def _assemble_existing(args: argparse.Namespace) -> int:
             "request_count": 1,
             "batch_padding": 1,
         },
-        "engram_rows": [],
+        "engram_rows": {
+            "required": layer_state["engram_required"],
+            "captured": False,
+            "reason": "reference runner does not expose Engram table rows in this capture",
+        },
         "cache_source_ids": ["vllm_ascend.rank0", "vllm_ascend.rank1"],
-        "ratio1_ratio2_state": {"layer_ratio": 0, "source_layer": None, "index_source_layer": None},
+        "ratio1_ratio2_state": layer_state,
         "topology": topology,
         "runtime_identity": identity,
         "reference_mhc": mhc_identity,
@@ -1047,7 +1080,7 @@ def _run_capture(args: argparse.Namespace) -> int:
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if world != 2:
         raise RuntimeError(f"reference capture requires two external-launcher ranks, got {world}")
-    temporary_root = output_dir / "reference_model_l0"
+    temporary_root = output_dir / f"reference_model_l{args.layer_id}"
     if rank == 0 and temporary_root.exists():
         shutil.rmtree(temporary_root)
     if dist.is_available() and dist.is_initialized():
@@ -1140,6 +1173,7 @@ def _run_capture(args: argparse.Namespace) -> int:
     # The product contract uses one shared input description and a rank-indexed
     # cache archive.  Keep both rank records so communication and untouched
     # regions can be checked without reconstructing the reference process.
+    layer_state = _layer_state_contract(args.checkpoint.resolve(), args.layer_id)
     decode_input = {
         "session": SESSION,
         "checkpoint": str(args.checkpoint.resolve()),
@@ -1159,9 +1193,13 @@ def _run_capture(args: argparse.Namespace) -> int:
             "request_count": 1,
             "batch_padding": 1,
         },
-        "engram_rows": [],
+        "engram_rows": {
+            "required": layer_state["engram_required"],
+            "captured": False,
+            "reason": "reference runner does not expose Engram table rows in this capture",
+        },
         "cache_source_ids": ["vllm_ascend.rank0", "vllm_ascend.rank1"],
-        "ratio1_ratio2_state": {"layer_ratio": 0, "source_layer": None, "index_source_layer": None},
+        "ratio1_ratio2_state": layer_state,
         "topology": {**TOPOLOGY, "devices": 2},
         "runtime_identity": identity,
         "reference_mhc": mhc_identity,
@@ -1241,8 +1279,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--prompt", default="DeepSeek V4.1 decode capture for PyPTO.")
     args = parser.parse_args(argv)
-    if args.layer_id != 0:
-        raise SystemExit("the initial capture driver supports physical L0 only")
     if args.assemble_existing:
         return _assemble_existing(args)
     return _run_capture(args)
