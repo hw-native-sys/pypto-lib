@@ -40,7 +40,7 @@ the table below lists common entry points, not an exhaustive skill catalog.
 | Environment setup | [Setup skill](skills/setup-env/SKILL.md) and [installation guide](../docs/get-started/installation.md) |
 | Running a model | [Compile/runtime workflow](../docs/run-and-validate/compile-runtime-workflow.md#selecting-and-running-a-case) and the relevant [model documentation](../docs/models/index.md) |
 | Harness or validation changes | [Golden harness](../docs/run-and-validate/golden-harness.md) and [compile/runtime workflow](../docs/run-and-validate/compile-runtime-workflow.md) |
-| Performance measurement or tuning | [Benchmarking rules](rules/benchmarking.md) and [performance guide](../docs/debug-and-tune/performance-tuning.md); use the matching profiling or tuning skill |
+| Performance measurement or tuning | [Benchmarking rules](rules/benchmarking.md) and [performance guide](../docs/debug-and-tune/performance-tuning.md); use [perf](skills/perf/SKILL.md) to run a case and collect a chip swimlane or raw timing, or the matching tuning skill |
 | Cube tile tuning | [Cube tile tuning skill](skills/cube-tile-tuning/SKILL.md) |
 | In-core profiling | [In-core profiling skill](skills/incore-profiling/SKILL.md) |
 | Precision debugging | [Precision guide](../docs/debug-and-tune/precision-tuning.md); use [precision bisect](skills/bisect-precision/SKILL.md) for a reproducible revision regression |

@@ -1153,29 +1153,41 @@ class TestRuntimeDir:
         benchmark.assert_not_called()
         assert "stepped scalar(s) ['epoch']" in capsys.readouterr().out
 
-    def test_runtime_dir_l2_runs_requested_benchmark(
-        self, three_kinds_specs, tmp_path, monkeypatch,
+    @pytest.mark.parametrize("bench", [None, "0", "1"])
+    def test_runtime_dir_l2_benchmark_reports_raw_samples(
+        self, three_kinds_specs, tmp_path, monkeypatch, capsys, bench,
     ):
         prebuilt = tmp_path / "prebuilt"
         prebuilt.mkdir()
-        monkeypatch.setenv("PYPTO_BENCH", "1")
-        stats = object()
+        if bench is not None:
+            monkeypatch.setenv("PYPTO_BENCH", bench)
+        stats = _FakeStats()
 
         with (
             _patch_reload(prebuilt) as reload,
             patch("golden.runner._is_l3", return_value=False),
-            patch("golden.runner._run_benchmark", return_value=stats) as benchmark,
+            patch("pypto.runtime.benchmark", return_value=stats, create=True) as benchmark,
             patch("golden.runner._run_benchmark_l3") as benchmark_l3,
             patch("golden.runner._dispatch") as execute,
         ):
             result = run(fn=object(), specs=three_kinds_specs, runtime_dir=str(prebuilt))
 
         assert result.passed, result.error
-        assert result.bench is stats
         execute.assert_called_once()
-        benchmark.assert_called_once()
-        assert benchmark.call_args.args[0] is reload.return_value
         benchmark_l3.assert_not_called()
+        out = capsys.readouterr().out
+        if bench == "1":
+            assert result.bench is stats
+            benchmark.assert_called_once()
+            assert benchmark.call_args.args[0] is reload.return_value
+            assert "effective_us (2 rounds)" in out
+            assert "rank 10 raw n=2 eff_us=[50.0, 51.0]" in out
+            assert "rank 11 raw n=2 eff_us=[99.0, 100.4]" in out
+        else:
+            assert result.bench is None
+            benchmark.assert_not_called()
+            assert "effective_us" not in out
+            assert "raw samples:" not in out
 
     def test_runtime_dir_missing_returns_fail(self, three_kinds_specs, tmp_path):
         missing = tmp_path / "does_not_exist"
@@ -2932,12 +2944,11 @@ class TestBenchLoopSizes:
 class TestBenchReports:
     """The ``[RUN]`` benchmark report lines."""
 
-    def test_raw_samples_off_by_default(self, capsys):
-        _report_raw_samples(_FakeStats())
+    def test_raw_samples_omitted_without_invocations(self, capsys):
+        _report_raw_samples(types.SimpleNamespace(invocations=()))
         assert capsys.readouterr().out == ""
 
-    def test_raw_samples_lists_every_dispatch_per_rank(self, monkeypatch, capsys):
-        monkeypatch.setenv("PYPTO_BENCH_RAW", "1")
+    def test_raw_samples_lists_every_dispatch_per_rank(self, capsys):
         _report_raw_samples(_FakeStats())
         lines = capsys.readouterr().out.splitlines()
         assert "raw samples: ranks=2 rounds=2 warmup=1" in lines[0]
@@ -2987,7 +2998,7 @@ class TestBenchReports:
         _report_task_slots(_FakeStats())
         assert capsys.readouterr().out == ""
 
-    def test_task_slots_merge_repeats_and_pair_by_invocation(self, monkeypatch, capsys):
+    def test_task_slots_merge_repeats_and_pair_by_invocation(self, capsys):
         """Slot 0 repeats in inv 0; inv 1 lacks slot 1 and inv 2 lacks slot 0.
 
         Inv 0's slot 0 window is 500..2000 ns. Both slots hold two samples, so a
@@ -3005,7 +3016,6 @@ class TestBenchReports:
         invs[1].spans = (span(0, 1500, 500),)
         invs[2].spans = (span(1, 11000, 1000),)
         stats = types.SimpleNamespace(invocations=list(reversed(invs)))
-        monkeypatch.setenv("PYPTO_BENCH_RAW", "1")
         _report_task_slots(stats)
         assert capsys.readouterr().out.splitlines() == [
             "[RUN]   task slots: ranks=1",
@@ -3015,7 +3025,7 @@ class TestBenchReports:
             "[RUN]       raw fin_us=[5.0, 12.0]",
         ]
 
-    def test_report_lines_stay_ci_safe(self, monkeypatch, capsys):
+    def test_report_lines_stay_ci_safe(self, capsys):
         """Daily CI's pattern selects the headline and only the headline.
 
         The pattern is .github/workflows/daily_ci.yml's ``extract_perf``: it
@@ -3025,7 +3035,6 @@ class TestBenchReports:
         """
         import re
 
-        monkeypatch.setenv("PYPTO_BENCH_RAW", "1")
         # The multi-dispatch fake exercises every reporter, including the nested
         # per-dispatch slot lines, against the single-match contract.
         stats = _FakeMultiDispatchStats()
@@ -3037,6 +3046,7 @@ class TestBenchReports:
         )
         out = capsys.readouterr().out
         ci_pattern = r"effective_us \(\d+ rounds\) min=[0-9.]+ median=[0-9.]+ mean=([0-9.]+)"
+        assert "raw samples: ranks=2 rounds=2 warmup=1" in out
         assert re.findall(ci_pattern, out) == ["99.7"]  # mean of [99.0, 100.4]
         # Even with every breakdown line respelled, the pattern still picks one.
         assert re.findall(ci_pattern, out.replace("eff_us", "effective_us")) == ["99.7"]
