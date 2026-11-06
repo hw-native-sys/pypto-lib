@@ -10,7 +10,10 @@
 
 
 import pypto.language as pl
-from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
+
+from quant import pack_cache_specs, packed_cache_comparators, packed_cache_golden
+
+from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_BYTES
 from sparse_attention import _attend_window_project
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding, hc_post
@@ -59,8 +62,7 @@ def decode_swa(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     attention_output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
     attention_hidden: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     attention_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
@@ -89,11 +91,11 @@ def decode_swa(
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
     cache_ready = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
-        window_slots, window_cache, window_cache_scale,
+        window_slots, window_cache,
         num_tokens, x_ready,
     )
     _attend_window_project(
-        q, window_indices, window_cache, window_cache_scale, attn_sink,
+        q, window_indices, window_cache, attn_sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attention_output,
         num_tokens, cache_ready,
     )
@@ -129,8 +131,7 @@ def l2_decode_swa(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     attention_output: pl.InOut[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
@@ -147,7 +148,7 @@ def l2_decode_swa(
         wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale,
+        window_cache,
         attention_output, attention_hidden, attention_pre_mix,
         num_tokens,
     )
@@ -178,8 +179,7 @@ def l3_decode_swa(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     attention_output: pl.InOut[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
@@ -203,7 +203,7 @@ def l3_decode_swa(
         wo_a, wo_a_scale, wo_b, wo_b_scale_r,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale,
+        window_cache,
         attention_output, attention_hidden, attention_pre_mix,
         num_tokens, device=0,
     )
@@ -304,7 +304,7 @@ def build_swa_specs(args):
     specs.append(TensorSpec("gathered", [args.tokens, D], torch.bfloat16, init_value=13.0))
     specs.append(ScalarSpec("num_tokens", torch.int32, args.active_tokens))
     specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None))
-    by_name = {spec.name: spec for spec in specs}
+    by_name = {spec.name: spec for spec in pack_cache_specs(specs)}
     return [by_name[name] for name in l3_decode_swa.param_names]
 
 
@@ -387,9 +387,9 @@ if __name__ == "__main__":
     devices = [args.device]
     result = run(
         fn=l3_decode_swa,
-        specs=build_swa_specs(args),
-        golden_fn=golden_swa,
-        compare_fn={
+        specs=pack_cache_specs(build_swa_specs(args)),
+        golden_fn=packed_cache_golden(golden_swa),
+        compare_fn=packed_cache_comparators({
             "attention_hidden": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
             "attention_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
@@ -403,7 +403,7 @@ if __name__ == "__main__":
                 block_size=128, leading_rank_axis=False,
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
-        },
+        }),
         config={
             "backend_type": args.backend_type, "execution_mode": args.execution_mode,
             "enable_chip_swimlane": args.enable_chip_swimlane,

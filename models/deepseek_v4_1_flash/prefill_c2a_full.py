@@ -24,6 +24,8 @@ import argparse
 import math
 import os
 import pypto.language as pl
+
+
 import pypto.language.distributed as pld
 import torch
 
@@ -32,7 +34,7 @@ from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_all
 from config import (
     FLASH as M, B_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, TABLE_DYN, Q_START_DYN,
     STATE_BLOCKS_DYN, TP_SIZE, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, MAX_BATCH_PER_DP,
-    PREFILL_MAX_TOKENS, STATE_CAPACITY, WINDOW_CACHE_GROUP, SP_T_DYN, BLOCK_SIZE,
+    PREFILL_MAX_TOKENS, STATE_CAPACITY, SP_T_DYN, BLOCK_SIZE, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from compressor import STATE_WIDTH, c2a_compressor_project, c2a_compressor_publish
 from prefill_cp_allgather import prefill_sp_input_allgather
@@ -44,7 +46,11 @@ from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes, prefill_sp_
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables
 from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from quant import dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
+from quant import (
+    dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight,
+    quantize_mxfp4_cache, quantize_mxfp8_cache, pack_cache_specs, packed_cache_comparators,
+    packed_cache_golden,
+)
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import paged_slots, token_shards, window_metadata
@@ -91,12 +97,8 @@ def prefill_c2a_full_attention(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[
-        [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
-    ],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
@@ -151,7 +153,7 @@ def prefill_c2a_full_attention(
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
     window_publish_tid = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
-        window_slots, window_cache, window_cache_scale,
+        window_slots, window_cache,
         num_tokens, cache_ready,
     )
 
@@ -162,7 +164,7 @@ def prefill_c2a_full_attention(
     compressed_publish_tid = c2a_compressor_publish(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
         state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
-        compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache, compressed_cache_scale,
+        compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache,
     )
 
     # Index keys come from the unrotated latent; the compressed cache stores the rotated one.
@@ -179,8 +181,8 @@ def prefill_c2a_full_attention(
 
     source_ready = pl.system.task_dummy(deps=[select_tid, window_publish_tid, compressed_publish_tid])
     _attend_project(
-        query, window_indices, window_cache, window_cache_scale,
-        topk_indices, compressed_cache, compressed_cache_scale, attn_sink,
+        query, window_indices, window_cache,
+        topk_indices, compressed_cache, attn_sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial,
         num_tokens, source_ready, compressed_keys=INDEX_TOPK,
     )
@@ -212,12 +214,8 @@ def prefill_c2a_full_sp(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[
-        [CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
-    ],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
@@ -288,8 +286,8 @@ def prefill_c2a_full_sp(
             attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
             wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-            window_slots, window_indices, window_cache, window_cache_scale, compressed_cache,
-            compressed_cache_scale, token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
+            window_slots, window_indices, window_cache, compressed_cache,
+            token_to_req_indices, compressed_lens, index_cache, index_cache_scale,
             index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv,
             compressor_wgate, query_start_loc, state_block_table, state_cache, compressor_norm_weight,
             compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
@@ -1009,12 +1007,8 @@ def l2_prefill_c2a_full(
     freqs_sin: pl.Tensor[[ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
-    ],
-    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8]],
@@ -1076,8 +1070,8 @@ def l2_prefill_c2a_full(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        window_slots, window_indices, window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale, token_to_req_indices, compressed_lens,
+        window_slots, window_indices, window_cache,
+        compressed_cache, token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table, position_ids,
         compressed_rope_cos, compressed_rope_sin, compressor_wkv, compressor_wgate,
         query_start_loc, state_block_table, state_cache, compressor_norm_weight,
@@ -1088,10 +1082,7 @@ def l2_prefill_c2a_full(
     )
     retire_prefill_signals(x_hc_out, input_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     retire_prefill_signals(x_hc_out, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
-    return (
-        x_hc_out, next_pre_mix, attn_output, attn_input, topk_indices, window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale, index_cache, index_cache_scale, state_cache,
-    )
+    return x_hc_out, next_pre_mix, attn_output, attn_input, topk_indices, window_cache, compressed_cache, index_cache, index_cache_scale, state_cache
 
 
 @pl.jit.host
@@ -1119,14 +1110,8 @@ def l3_prefill_c2a_full(
     freqs_sin: pl.Tensor[[RANKS_DYN, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT64],
     window_indices: pl.Tensor[[RANKS_DYN, T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
-    ],
-    compressed_cache: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[
-        pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16]
-    ],
+    window_cache: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[RANKS_DYN, INDEX_BLOCKS_DYN, 128, 1, IDX_PACKED], pl.UINT8]],
@@ -1192,7 +1177,7 @@ def l3_prefill_c2a_full(
             wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank],
             attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r, freqs_cos[rank],
             freqs_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
-            window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
+            compressed_cache[rank],
             token_to_req_indices[rank], compressed_lens[rank], index_cache[rank],
             index_cache_scale[rank], index_block_table[rank], position_ids[rank],
             compressed_freqs_cos[rank], compressed_freqs_sin[rank], compressed_rope_positions[rank], compressor_wkv[rank],
@@ -1338,8 +1323,8 @@ if __name__ == "__main__":
     initial_state = {}
     result = run(
         fn=l3_prefill_c2a_full,
-        specs=build_specs(args, "full", initial_state),
-        golden_fn=golden_prefill_c2a,
+        specs=pack_cache_specs(build_specs(args, "full", initial_state)),
+        golden_fn=packed_cache_golden(golden_prefill_c2a),
         compile_only=args.compile_only,
         config=dict(
             backend_type=args.backend_type,
@@ -1348,7 +1333,7 @@ if __name__ == "__main__":
             # Full retains the K-chunk products for both compressor projections.
             ring_heap=PREFILL_C2A_FULL_RING_HEAP,
         ),
-        compare_fn=make_compare("full", len(devices), args.tokens),
+        compare_fn=packed_cache_comparators(make_compare("full", len(devices), args.tokens)),
     )
     if args.compile_only and result.passed:
         print("[C2A-HC] Compilation passed; device accuracy was NOT validated.")

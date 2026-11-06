@@ -435,3 +435,114 @@ def unpack_mxfp4_weight_tiles(
         codes = FP4_E4M3_CODES.to(torch.uint8)[nibbles_kn.to(torch.long)]
         output[batch] = codes.view(torch.float8_e4m3fn)
     return output.reshape(*lead, k, n)
+
+
+# Cache fields follow each physical row; index-cache scales remain separate.
+_CACHE_FIELDS = (
+    ("window_cache", "window_cache_scale", False),
+    ("compressed_cache", "compressed_cache_scale", True),
+    ("window_cache", "window_scales", False),
+    ("compressed_cache", "compressed_scales", True),
+    ("window_cache_pool", "window_cache_scale_pool", False),
+    ("compressed_cache_pool", "compressed_cache_scale_pool", True),
+    ("window", "window_scale", False),
+    ("compressed", "compressed_scale", True),
+    ("cache", "scales", False),
+)
+
+
+def pack_quantized_cache(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Store quantized payload followed by BF16 factors in each physical row."""
+    return torch.cat((payload.view(torch.uint8), scales.view(torch.uint8)), dim=-1)
+
+
+def unpack_quantized_cache(cache: torch.Tensor, fp4: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expose zero-copy payload and BF16 factor views of packed cache storage."""
+    width = cache.shape[-1] * (4 if fp4 else 16) // (5 if fp4 else 17)
+    payload = cache[..., :width]
+    if not fp4:
+        payload = payload.view(torch.float8_e4m3fn)
+    return payload, cache[..., width:].view(torch.bfloat16)
+
+
+def pack_cache_tensors(tensors):
+    """Pack host cache fixtures while preserving non-cache tensors."""
+    result = dict(tensors)
+    packed = set()
+    for name, scale, fp4 in _CACHE_FIELDS:
+        if name in result and scale in result and result[name] is not None:
+            factors = result.pop(scale)
+            if name not in packed:
+                result[name] = pack_quantized_cache(result[name], factors)
+                packed.add(name)
+    return result
+
+
+def unpack_cache_tensors(tensors):
+    """Expose cache fields to numerical references without copying their storage."""
+    result = dict(tensors)
+    for name, scale, fp4 in _CACHE_FIELDS:
+        value = tensors.get(name)
+        if value is None or not isinstance(value, torch.Tensor):
+            continue
+        width = 320 if fp4 else 544
+        if value.dtype == torch.uint8 and value.shape[-1] == width:
+            result[name], result[scale] = unpack_quantized_cache(value, fp4)
+    return result
+
+
+def pack_cache_specs(specs):
+    """Combine cache fixture specifications into a single byte tensor per pool."""
+    from dataclasses import replace
+
+    result = {spec.name: spec for spec in specs}
+    for name, scale, fp4 in _CACHE_FIELDS:
+        if name not in result or scale not in result:
+            continue
+        payload = result[name]
+        factors = result.pop(scale)
+        shape = [*payload.shape[:-1], payload.shape[-1] + 2 * factors.shape[-1]]
+        def initialize(payload=payload, factors=factors):
+            return pack_quantized_cache(payload.create_tensor(), factors.create_tensor())
+        result[name] = replace(payload, shape=shape, dtype=torch.uint8, init_value=initialize)
+    return list(result.values())
+
+
+def packed_cache_golden(golden):
+    """Run the numerical reference against writable views of packed cache fields."""
+    from functools import wraps
+
+    @wraps(golden)
+    def reference(tensors, **kwargs):
+        fields = unpack_cache_tensors(tensors)
+        result = golden(fields, **kwargs)
+        tensors.update(pack_cache_tensors(fields))
+        return result
+    return reference
+
+
+def packed_cache_comparators(comparators):
+    """Keep the original payload and scale checks for each packed output pool."""
+    if not isinstance(comparators, dict):
+        return comparators
+    result = {}
+    for name, comparator in comparators.items():
+        def compare_fields(actual, expected, comparator=comparator, **kwargs):
+            for key in ("inputs", "actual_outputs", "expected_outputs", "reference"):
+                if key in kwargs and isinstance(kwargs[key], dict):
+                    kwargs[key] = unpack_cache_tensors(kwargs[key])
+            return comparator(actual, expected, **kwargs)
+        result[name] = compare_fields
+    for name, scale, fp4 in _CACHE_FIELDS:
+        if name not in result or scale not in result:
+            continue
+        payload_compare = result[name]
+        scale_compare = result.pop(scale)
+        def compare(actual, expected, payload_compare=payload_compare, scale_compare=scale_compare, fp4=fp4, **kwargs):
+            actual_payload, actual_scale = unpack_quantized_cache(actual, fp4)
+            expected_payload, expected_scale = unpack_quantized_cache(expected, fp4)
+            payload_ok, payload_detail = payload_compare(actual_payload, expected_payload, **kwargs)
+            scale_ok, scale_detail = scale_compare(actual_scale, expected_scale, **kwargs)
+            return payload_ok and scale_ok, "\n".join(filter(None, (payload_detail, scale_detail)))
+        result[name] = compare
+    return result

@@ -27,12 +27,6 @@ using State = Tile<TileType::Vec, float, 1, HALF>;
 using Values = Tile<TileType::Vec, float, HALF, DIM>;
 using Result = Tile<TileType::Vec, bfloat16_t, HALF, DIM>;
 
-template <typename T>
-__aicore__ inline __gm__ T* data(__gm__ int64_t* args, int index) {
-    auto tensor = reinterpret_cast<__gm__ Tensor*>(args[index]);
-    return reinterpret_cast<__gm__ T*>(tensor->buffer.addr) + tensor->start_offset;
-}
-
 #if defined(__DAV_VEC__) && !defined(__CPU_SIM)
 __tf__ __aicore__ inline void merge_factors(
     State::TileDType __out__ weight_left, State::TileDType __out__ weight_right,
@@ -103,9 +97,10 @@ __tf__ __aicore__ inline void merge_values(
     }
 }
 
-__aicore__ inline void reduce(__gm__ int64_t* args, int boundary, int head, int token) {
-    const int valid = args[11] - head < HALF ? args[11] - head : HALF;
-    auto partials = data<float>(args, 9);
+__aicore__ inline void reduce(
+    __gm__ float* partials, __gm__ bfloat16_t* output, __gm__ float* sink_values,
+    int64_t output_stride, int64_t sink_stride, int heads, int boundary, int head, int token) {
+    const int valid = heads - head < HALF ? heads - head : HALF;
     auto left_base = partials + (int64_t)(2 * boundary - 1) * PARTIAL_STRIDE;
     auto right_base = partials + (int64_t)(2 * boundary) * PARTIAL_STRIDE;
     State ml, ll, mr, lr, sink, wl, wr;
@@ -127,13 +122,12 @@ __aicore__ inline void reduce(__gm__ int64_t* args, int boundary, int head, int 
     TLOAD(lr, lr_gm);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    const int64_t sink_stride = reinterpret_cast<__gm__ Tensor*>(args[2])->strides[0];
     if (sink_stride == 1) {
         Tile<TileType::Vec, float, 1, HALF, BLayout::RowMajor, 1, DYNAMIC> sink_load(valid);
         TASSIGN(sink_load, 512);
         using SinkShape = TileShape2D<float, 1, DYNAMIC>;
         GlobalTensor<float, SinkShape, BaseShape2D<float, 1, HEADS>> sink_gm(
-            data<float>(args, 2) + head, SinkShape(1, valid));
+            sink_values + head, SinkShape(1, valid));
         TLOAD(sink_load, sink_gm);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -141,7 +135,7 @@ __aicore__ inline void reduce(__gm__ int64_t* args, int boundary, int head, int 
         set_flag(PIPE_V, PIPE_S, EVENT_ID1);
         wait_flag(PIPE_V, PIPE_S, EVENT_ID1);
         for (int i = 0; i < HALF; ++i) {
-            sink.SetValue(i, i < valid ? data<float>(args, 2)[(head + i) * sink_stride] : 0.0f);
+            sink.SetValue(i, i < valid ? sink_values[(head + i) * sink_stride] : 0.0f);
         }
         set_flag(PIPE_S, PIPE_V, EVENT_ID1);
         wait_flag(PIPE_S, PIPE_V, EVENT_ID1);
@@ -152,8 +146,6 @@ __aicore__ inline void reduce(__gm__ int64_t* args, int boundary, int head, int 
     TASSIGN(left, 8192);
     TASSIGN(right, 73728);
     TASSIGN(result, 139264);
-    auto output = data<bfloat16_t>(args, 0);
-    const int64_t output_stride = reinterpret_cast<__gm__ Tensor*>(args[0])->strides[0];
     for (int channel = 0; channel < 1; ++channel) {
         using InputShape = TileShape2D<float, HALF, DIM>;
         using InputBase = BaseShape2D<float, HEADS, DIM>;
