@@ -853,6 +853,11 @@ def mapped_pool_ratio_reldiff(
     )
 
 
+# torch.quantile refuses an input above this many elements, and a prefill-shaped
+# output is well past it, so the percentile rows sample instead of failing.
+_QUANTILE_MAX = 1 << 24
+
+
 def error_distribution(
     diff_thds: tuple[float, ...] = (1e-3, 3e-3, 5e-3, 1e-2, 3e-2, 5e-2),
     quantiles: tuple[float, ...] = (0.5, 0.9, 0.99, 0.999, 0.9999, 1.0),
@@ -906,10 +911,13 @@ def error_distribution(
                 return False, msg
 
         diff = (a - e).abs()
-        rel = (diff.norm() / e.norm().clamp_min(1e-12)).item()
-        cos = torch.nn.functional.cosine_similarity(
-            a.flatten(), e.flatten(), dim=0
-        ).item()
+        # float64 accumulation: a float32 sum over a prefill-shaped output drifts far
+        # enough to report a cosine above 1, which is not a possible value.
+        norm_a = torch.sqrt(torch.sum(a * a, dtype=torch.float64))
+        norm_e = torch.sqrt(torch.sum(e * e, dtype=torch.float64))
+        norm_diff = torch.sqrt(torch.sum(diff * diff, dtype=torch.float64))
+        rel = float(norm_diff / norm_e.clamp_min(1e-12))
+        cos = float(torch.sum(a * e, dtype=torch.float64) / (norm_a * norm_e).clamp_min(1e-12))
         print(f"rel-L2 = {rel:.4%}  cosine = {cos:.7f}  numel={a.numel()}")
 
         # frac>thd: floored relative diff, same rule as ratio_reldiff.
@@ -929,6 +937,11 @@ def error_distribution(
             if flat.numel() == 0:
                 print(f"  {label}: (no finite values)")
                 return
+            note = ""
+            if flat.numel() > _QUANTILE_MAX:
+                step = -(-flat.numel() // _QUANTILE_MAX)
+                note = f"  [sampled 1 in {step} of {flat.numel()} points]"
+                flat = flat[::step]
             pv = torch.quantile(flat, qs)
             print(
                 f"  {label}: "
@@ -936,6 +949,7 @@ def error_distribution(
                     f"p{q * 100:g}={v:.3g}"
                     for q, v in zip(quantiles, pv.tolist())
                 )
+                + note
             )
 
         denom = torch.maximum(a.abs(), e.abs()).clamp_min(1e-6)
