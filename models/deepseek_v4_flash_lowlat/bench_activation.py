@@ -14,10 +14,28 @@ one core while others idle.
 """
 import argparse, importlib, torch
 from golden import TensorSpec, run
-from utils import int8_quant_per_row
-from expert_routed import (D, IDX_PAD, MOE_INTER, N_BANK, N_EXPERTS, N_SLOTS,
-                           N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT,
-                           golden_expert_routed, gen_routed_weight, compare_recv_y)
+if __package__:
+    from .utils import int8_quant_per_row
+else:
+    from utils import int8_quant_per_row
+if __package__:
+    from .expert_routed import (
+        D,
+        IDX_PAD,
+        MOE_INTER,
+        N_BANK,
+        N_EXPERTS,
+        N_SLOTS,
+        N_SLOTS_B,
+        RECV_MAX,
+        SHARED_EID,
+        SH_SLOT,
+        golden_expert_routed,
+        gen_routed_weight,
+        compare_recv_y,
+    )
+else:
+    from expert_routed import D, IDX_PAD, MOE_INTER, N_BANK, N_EXPERTS, N_SLOTS, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT, golden_expert_routed, gen_routed_weight, compare_recv_y
 
 p = argparse.ArgumentParser()
 p.add_argument("--variant", required=True, choices=["expert_routed", "expert_routed_persistent_balanced"])

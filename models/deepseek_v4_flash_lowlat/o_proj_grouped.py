@@ -20,8 +20,14 @@ what the per-decoder single-card unit entries validate the attention against.
 
 import pypto.language as pl
 
-from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
-from decode_shapes import DECODE_BATCH, DECODE_SEQ
+if __package__:
+    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+else:
+    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+if __package__:
+    from .decode_shapes import DECODE_BATCH, DECODE_SEQ
+else:
+    from decode_shapes import DECODE_BATCH, DECODE_SEQ
 
 
 # model config

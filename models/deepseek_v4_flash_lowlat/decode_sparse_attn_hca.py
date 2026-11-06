@@ -12,17 +12,33 @@
 
 import pypto.language as pl
 
-from fp32_numerics import rne_exp_nonpositive
+if __package__:
+    pass
+else:
+    pass
 
-from o_proj_grouped import o_proj_grouped
 
-from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
-from decode_shapes import DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, DECODE_CMP_BLOCK_NUM, DECODE_ORI_BLOCK_NUM, KV_CMP_MAX_BLOCKS, KV_ORI_MAX_BLOCKS
+if __package__:
+    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+else:
+    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+if __package__:
+    from .decode_shapes import (
+        DECODE_BATCH,
+        DECODE_SEQ,
+        BLOCK_SIZE,
+        DECODE_CMP_BLOCK_NUM,
+        DECODE_ORI_BLOCK_NUM,
+        KV_CMP_MAX_BLOCKS,
+        KV_ORI_MAX_BLOCKS,
+    )
+else:
+    from decode_shapes import DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, DECODE_CMP_BLOCK_NUM, DECODE_ORI_BLOCK_NUM, KV_CMP_MAX_BLOCKS, KV_ORI_MAX_BLOCKS
 
 
 # Dynamic shape variables.
-ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
-CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
+ORI_BLOCK_NUM_DYN = pl.dynamic('LOWLAT_TARGET_ORI_BLOCK_NUM_DYN')
+CMP_BLOCK_NUM_DYN = pl.dynamic('LOWLAT_TARGET_CMP_BLOCK_NUM_DYN')
 
 # model config
 B = DECODE_BATCH
@@ -179,13 +195,17 @@ def sparse_attn_hca_packed(
             plan_c0 = plan_cb * ATTN_K_TILE
             plan_rows = pl.min(ATTN_K_TILE, plan_length - plan_c0)
             plan_first = pl.read(cmp_block_table, [plan_b, plan_c0])
-            plan_pages_i32 = pl.slice(cmp_block_table, [1, ATTN_K_TILE], [plan_b, plan_c0], valid_shape=[1, plan_rows])
+            plan_pages_i32 = pl.slice(
+                cmp_block_table, [1, ATTN_K_TILE], [plan_b, plan_c0], valid_shape=[1, plan_rows]
+            )
             plan_pages = pl.cast(plan_pages_i32, target_type=pl.FP32)
             plan_expected = pl.add(plan_cols, pl.cast(plan_first, pl.FP32))
             plan_delta = pl.abs(pl.sub(plan_pages, plan_expected))
             plan_delta_valid = pl.set_validshape(plan_delta, 1, plan_rows)
             plan_delta_padded = pl.fillpad(plan_delta_valid, pad_value=pl.PadValue.zero)
-            plan_delta_rows = pl.col_expand(pl.full([8, ATTN_K_TILE], dtype=pl.FP32, value=0.0), plan_delta_padded)
+            plan_delta_rows = pl.col_expand(
+                pl.full([8, ATTN_K_TILE], dtype=pl.FP32, value=0.0), plan_delta_padded
+            )
             plan_error = pl.row_max(plan_delta_rows)
             plan_base = pl.cast(-1, pl.INT32)
             if pl.read(plan_error, [0, 0]) == 0.0:
@@ -197,7 +217,6 @@ def sparse_attn_hca_packed(
     head_base = pl.cast(my_rank, pl.INDEX) * H_LOCAL
     sparse_blk_mi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
-    sparse_blk_li_flat = pl.reshape(sparse_blk_li, [1, T * QK_M_BOX * SPARSE_BLOCKS])
     sparse_blk_oi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, HEAD_DIM], dtype=pl.FP32)
 
     with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", allow_early_resolve=True) as qk_tid:
@@ -219,7 +238,9 @@ def sparse_attn_hca_packed(
                 qk_cmp_flag = pl.min(qk_sb, 1)
                 qk_window_len = pl.cast(pl.read(window_swa_lens, [qk_t]), pl.INDEX)
                 qk_cmp_rows = pl.min(ATTN_K_TILE, pl.max(qk_cmp_len - (qk_sb - 1) * ATTN_K_TILE, 0))
-                qk_valid = pl.min(WIN, pl.max(qk_window_len, 0)) * (1 - qk_cmp_flag) + qk_cmp_rows * qk_cmp_flag
+                qk_valid = (
+                    pl.min(WIN, pl.max(qk_window_len, 0)) * (1 - qk_cmp_flag) + qk_cmp_rows * qk_cmp_flag
+                )
                 if qk_sb < qk_live_blocks:
                     qk_token_base = qk_t * QK_M_BOX * SPARSE_BLOCKS
                     qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
@@ -230,73 +251,99 @@ def sparse_attn_hca_packed(
                         qk_blk1 = pl.max(pl.read(window_swa_indices, [qk_t, qk_head % WIN]), 0)
                         qk_len = pl.min(pl.max(pl.read(window_swa_lens, [qk_t]), 0), WIN)
                         qk_src0 = pl.cast(qk_slot0, pl.INDEX)
-                        qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [0, 0], [qk_src0, 0],
-                                              [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_head, HEAD_DIM])
+                        qk_kv = pl.gather_row(
+                            qk_kv,
+                            ori_kv_flat,
+                            [0, 0],
+                            [qk_src0, 0],
+                            [ATTN_K_TILE, HEAD_DIM],
+                            valid_shape=[qk_head, HEAD_DIM],
+                        )
                         if qk_r > 0:
                             qk_src1 = pl.cast(qk_blk1, pl.INDEX)
-                            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_head, 0], [qk_src1, 0],
-                                                  [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_r, HEAD_DIM])
+                            qk_kv = pl.gather_row(
+                                qk_kv,
+                                ori_kv_flat,
+                                [qk_head, 0],
+                                [qk_src1, 0],
+                                [ATTN_K_TILE, HEAD_DIM],
+                                valid_shape=[qk_r, HEAD_DIM],
+                            )
                         qk_tail = WIN - qk_len
                         if qk_tail > 0:
                             # Fill the cold-start tail from the oldest visible row.
                             for qk_fill in pl.range(qk_tail):
-                                qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_len + qk_fill, 0],
-                                                      [qk_src0, 0], [1, HEAD_DIM])
+                                qk_kv = pl.gather_row(
+                                    qk_kv, ori_kv_flat, [qk_len + qk_fill, 0], [qk_src0, 0], [1, HEAD_DIM]
+                                )
                     else:
                         qk_col0 = (qk_sb - 1) * ATTN_K_TILE
                         qk_base_i32 = pl.read(cmp_run_bases, [qk_b, qk_sb - 1])
                         if qk_base_i32 >= 0:
                             qk_base = pl.cast(qk_base_i32, pl.INDEX)
-                            qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [0, 0], [qk_base, 0], [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_valid, HEAD_DIM])
+                            qk_kv = pl.gather_row(
+                                qk_kv,
+                                cmp_kv_flat,
+                                [0, 0],
+                                [qk_base, 0],
+                                [ATTN_K_TILE, HEAD_DIM],
+                                valid_shape=[qk_valid, HEAD_DIM],
+                            )
                             qk_pad_rows = ATTN_K_TILE - qk_valid
                             if qk_pad_rows > 0:
                                 qk_pad_src0 = pl.cast(pl.read(window_swa_indices, [qk_t, 0]), pl.INDEX)
                                 qk_pad_head = pl.min(qk_pad_rows, BLOCK_SIZE - qk_pad_src0 % BLOCK_SIZE)
-                                qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_valid, 0], [qk_pad_src0, 0], [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_pad_head, HEAD_DIM])
+                                qk_kv = pl.gather_row(
+                                    qk_kv,
+                                    ori_kv_flat,
+                                    [qk_valid, 0],
+                                    [qk_pad_src0, 0],
+                                    [ATTN_K_TILE, HEAD_DIM],
+                                    valid_shape=[qk_pad_head, HEAD_DIM],
+                                )
                                 if qk_pad_rows > qk_pad_head:
-                                    qk_pad_src1 = pl.cast(pl.read(window_swa_indices, [qk_t, qk_pad_head]), pl.INDEX)
-                                    qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_valid + qk_pad_head, 0], [qk_pad_src1, 0], [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_pad_rows - qk_pad_head, HEAD_DIM])
+                                    qk_pad_src1 = pl.cast(
+                                        pl.read(window_swa_indices, [qk_t, qk_pad_head]), pl.INDEX
+                                    )
+                                    qk_kv = pl.gather_row(
+                                        qk_kv,
+                                        ori_kv_flat,
+                                        [qk_valid + qk_pad_head, 0],
+                                        [qk_pad_src1, 0],
+                                        [ATTN_K_TILE, HEAD_DIM],
+                                        valid_shape=[qk_pad_rows - qk_pad_head, HEAD_DIM],
+                                    )
                         else:
                             qk_first_src = pl.cast(pl.read(cmp_block_table, [qk_b, qk_col0]), pl.INDEX)
                             for qk_cr in pl.range(ATTN_K_TILE):
                                 qk_cs = qk_first_src
                                 if qk_cr < qk_valid:
-                                    qk_cs = pl.cast(pl.read(cmp_block_table, [qk_b, qk_col0 + qk_cr]), pl.INDEX)
-                                qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_cr, 0], [qk_cs, 0], [1, HEAD_DIM])
+                                    qk_cs = pl.cast(
+                                        pl.read(cmp_block_table, [qk_b, qk_col0 + qk_cr]), pl.INDEX
+                                    )
+                                qk_kv = pl.gather_row(
+                                    qk_kv, cmp_kv_flat, [qk_cr, 0], [qk_cs, 0], [1, HEAD_DIM]
+                                )
                     for qk_hb in pl.pipeline(H_LOCAL // QK_M_TILE, stage=2):
                         qk_h0 = qk_hb * QK_M_TILE
                         qk_head_row = qk_t * H + head_base + qk_h0
                         qk_q_tile = pl.slice(
-                            q_flat, [QK_M_BOX, HEAD_DIM], [qk_head_row, 0],
-                            valid_shape=[QK_M_TILE, HEAD_DIM])
+                            q_flat, [QK_M_BOX, HEAD_DIM], [qk_head_row, 0], valid_shape=[QK_M_TILE, HEAD_DIM]
+                        )
                         qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
                         qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
                         qk_scores_valid = pl.set_validshape(qk_scaled, QK_M_TILE, qk_valid)
                         qk_scores_padded = pl.fillpad(qk_scores_valid, pad_value=pl.PadValue.min)
                         qk_scores = pl.set_validshape(qk_scores_padded, QK_M_TILE, ATTN_K_TILE)
                         qk_mi = pl.row_max(qk_scores)
-                        qk_delta = pl.create_tensor([QK_M_BOX, ATTN_K_TILE], dtype=pl.FP32)
-                        qk_delta_raw = pl.row_expand_sub(qk_scores, qk_mi)
-                        qk_delta = pl.maximum(qk_delta_raw, NEG_INF)
-                        qk_exp = rne_exp_nonpositive(qk_delta, rows=QK_M_BOX, cols=ATTN_K_TILE)
-                        qk_sum64 = pl.add(qk_exp[0:QK_M_BOX, 0:64], qk_exp[0:QK_M_BOX, 64:128])
-                        qk_sum32 = pl.add(qk_sum64[0:QK_M_BOX, 0:32], qk_sum64[0:QK_M_BOX, 32:64])
-                        qk_sum16 = pl.add(qk_sum32[0:QK_M_BOX, 0:16], qk_sum32[0:QK_M_BOX, 16:32])
-                        qk_sum8 = pl.add(qk_sum16[0:QK_M_BOX, 0:8], qk_sum16[0:QK_M_BOX, 8:16])
-                        qk_sum8_zero = pl.full([QK_M_BOX, 8], dtype=pl.FP32, value=0.0)
-                        qk_sum8_zero_valid = pl.set_validshape(qk_sum8_zero, QK_M_TILE, 8)
-                        qk_sum8_default_pad = pl.add(qk_sum8_zero_valid, qk_sum8)
-                        qk_sum8_t_physical = pl.transpose(qk_sum8_default_pad, 0, 1)
-                        qk_sum8_t = pl.slice(qk_sum8_t_physical, [8, QK_M_BOX], [0, 0], valid_shape=[8, QK_M_TILE])
-                        qk_sum4_t = pl.add(qk_sum8_t[0:4, 0:QK_M_BOX], qk_sum8_t[4:8, 0:QK_M_BOX])
-                        qk_sum2_t = pl.add(qk_sum4_t[0:2, 0:QK_M_BOX], qk_sum4_t[2:4, 0:QK_M_BOX])
-                        qk_sum1_t = pl.add(qk_sum2_t[0:1, 0:QK_M_BOX], qk_sum2_t[1:2, 0:QK_M_BOX])
+                        qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                        qk_li = pl.row_sum(qk_exp)
                         qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
                         qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
                         qk_row = qk_token_base + qk_sb * QK_M_BOX
-                        sparse_blk_mi[qk_row : qk_row + QK_M_BOX, 0 : 1] = qk_mi
-                        sparse_blk_li_flat[0:1, qk_row : qk_row + QK_M_BOX] = qk_sum1_t
-                        sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0 : HEAD_DIM] = qk_oi
+                        sparse_blk_mi[qk_row : qk_row + QK_M_BOX, 0:1] = qk_mi
+                        sparse_blk_li[qk_row : qk_row + QK_M_BOX, 0:1] = qk_li
+                        sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0:HEAD_DIM] = qk_oi
 
     # Online-softmax merge across sparse-K tiles, sink-norm, then fused inverse RoPE.
     # One spmd block per (token, head-tile) -- T*(H//H_TILE) blocks -- so the merge
@@ -312,9 +359,9 @@ def sparse_attn_hca_packed(
         m_h_idx = m_idx - m_t * (H_LOCAL // H_TILE)
         m_h0 = m_h_idx * H_TILE
         m_blk_base = m_idx * SPARSE_BLOCKS * QK_M_BOX
-        m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
-        m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
-        m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
+        m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0:1]
+        m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0:1]
+        m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0:HEAD_DIM]
 
         # Merge visible KV tiles in their original order.
         m_cmp_len = pl.cast(pl.read(cmp_seq_lens, [m_t]), pl.INDEX)
@@ -322,9 +369,9 @@ def sparse_attn_hca_packed(
         if SPARSE_BLOCKS == 2:
             if m_cmp_len > 0:
                 m_row = m_blk_base + QK_M_BOX
-                m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-                m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-                m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+                m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0:1]
+                m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0:1]
+                m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0:HEAD_DIM]
                 m_mi_new = pl.maximum(m_mi, m_cur_mi)
                 m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
                 m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
@@ -335,9 +382,9 @@ def sparse_attn_hca_packed(
         else:
             for m_sb in pl.pipeline(1, m_live_blocks, stage=2):
                 m_row = m_blk_base + m_sb * QK_M_BOX
-                m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-                m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-                m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+                m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0:1]
+                m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0:1]
+                m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0:HEAD_DIM]
                 m_mi_new = pl.maximum(m_mi, m_cur_mi)
                 m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
                 m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
@@ -349,58 +396,7 @@ def sparse_attn_hca_packed(
         n_sink_bias = pl.reshape(attn_sink[m_h_global : m_h_global + H_TILE], [H_TILE, 1])
         n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
         n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-        n_div_seed = pl.row_expand_div(m_oi, n_denom)[0:H_TILE, 0:HEAD_DIM]
-        n_div_left_v = m_oi[:, 0:0 + 256]
-        n_div_left_estimate = n_div_seed[:, 0:0 + 256]
-        n_div_left_zero = pl.sub(n_div_left_v, n_div_left_v)
-        n_div_left_expanded = pl.row_expand_add(n_div_left_zero, n_denom)
-        n_div_left_a_split = pl.mul(n_div_left_estimate, 4097.0)
-        n_div_left_a_delta = pl.sub(n_div_left_a_split, n_div_left_estimate)
-        n_div_left_a_hi = pl.sub(n_div_left_a_split, n_div_left_a_delta)
-        n_div_left_a_lo = pl.sub(n_div_left_estimate, n_div_left_a_hi)
-        n_div_left_b_split = pl.mul(n_div_left_expanded, 4097.0)
-        n_div_left_b_delta = pl.sub(n_div_left_b_split, n_div_left_expanded)
-        n_div_left_b_hi = pl.sub(n_div_left_b_split, n_div_left_b_delta)
-        n_div_left_b_lo = pl.sub(n_div_left_expanded, n_div_left_b_hi)
-        n_div_left_product = pl.mul(n_div_left_estimate, n_div_left_expanded)
-        n_div_left_high_product = pl.mul(n_div_left_a_hi, n_div_left_b_hi)
-        n_div_left_error0 = pl.sub(n_div_left_high_product, n_div_left_product)
-        n_div_left_high_low = pl.mul(n_div_left_a_hi, n_div_left_b_lo)
-        n_div_left_error1 = pl.add(n_div_left_error0, n_div_left_high_low)
-        n_div_left_low_high = pl.mul(n_div_left_a_lo, n_div_left_b_hi)
-        n_div_left_error2 = pl.add(n_div_left_error1, n_div_left_low_high)
-        n_div_left_low_product = pl.mul(n_div_left_a_lo, n_div_left_b_lo)
-        n_div_left_error = pl.add(n_div_left_error2, n_div_left_low_product)
-        n_div_left_residual_hi = pl.sub(n_div_left_v, n_div_left_product)
-        n_div_left_residual = pl.sub(n_div_left_residual_hi, n_div_left_error)
-        n_div_left_correction = pl.div(n_div_left_residual, n_div_left_expanded)
-        n_div_left_fixed = pl.add(n_div_left_estimate, n_div_left_correction)
-        n_div_right_v = m_oi[:, 256:256 + 256]
-        n_div_right_estimate = n_div_seed[:, 256:256 + 256]
-        n_div_right_zero = pl.sub(n_div_right_v, n_div_right_v)
-        n_div_right_expanded = pl.row_expand_add(n_div_right_zero, n_denom)
-        n_div_right_a_split = pl.mul(n_div_right_estimate, 4097.0)
-        n_div_right_a_delta = pl.sub(n_div_right_a_split, n_div_right_estimate)
-        n_div_right_a_hi = pl.sub(n_div_right_a_split, n_div_right_a_delta)
-        n_div_right_a_lo = pl.sub(n_div_right_estimate, n_div_right_a_hi)
-        n_div_right_b_split = pl.mul(n_div_right_expanded, 4097.0)
-        n_div_right_b_delta = pl.sub(n_div_right_b_split, n_div_right_expanded)
-        n_div_right_b_hi = pl.sub(n_div_right_b_split, n_div_right_b_delta)
-        n_div_right_b_lo = pl.sub(n_div_right_expanded, n_div_right_b_hi)
-        n_div_right_product = pl.mul(n_div_right_estimate, n_div_right_expanded)
-        n_div_right_high_product = pl.mul(n_div_right_a_hi, n_div_right_b_hi)
-        n_div_right_error0 = pl.sub(n_div_right_high_product, n_div_right_product)
-        n_div_right_high_low = pl.mul(n_div_right_a_hi, n_div_right_b_lo)
-        n_div_right_error1 = pl.add(n_div_right_error0, n_div_right_high_low)
-        n_div_right_low_high = pl.mul(n_div_right_a_lo, n_div_right_b_hi)
-        n_div_right_error2 = pl.add(n_div_right_error1, n_div_right_low_high)
-        n_div_right_low_product = pl.mul(n_div_right_a_lo, n_div_right_b_lo)
-        n_div_right_error = pl.add(n_div_right_error2, n_div_right_low_product)
-        n_div_right_residual_hi = pl.sub(n_div_right_v, n_div_right_product)
-        n_div_right_residual = pl.sub(n_div_right_residual_hi, n_div_right_error)
-        n_div_right_correction = pl.div(n_div_right_residual, n_div_right_expanded)
-        n_div_right_fixed = pl.add(n_div_right_estimate, n_div_right_correction)
-        n_full = pl.concat(n_div_left_fixed, n_div_right_fixed)
+        n_full = pl.row_expand_div(m_oi, n_denom)[0:H_TILE, 0:HEAD_DIM]
         n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
         # Inverse RoPE on this head-tile's fp32 rope segment. cos_il / sign*sin are
@@ -408,13 +404,13 @@ def sparse_attn_hca_packed(
         # rope_swap_idx (j^1, prebuilt above) pairs the interleaved real/imag lanes.
         # Rounded to bf16 (golden also rounds inverse-RoPE to bf16) and packed into
         # o_packed's rope columns.
-        m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
-        m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
-        m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
+        m_rope = n_full[0:H_TILE, NOPE_DIM:HEAD_DIM]
+        m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_DIM]
+        m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0:ROPE_DIM]
         m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[0:H_TILE, 0:ROPE_DIM])
         m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
         n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-        n_full_bf16 = pl.concat(n_bf16[:, : NOPE_DIM], n_rope_bf16)
+        n_full_bf16 = pl.concat(n_bf16[:, :NOPE_DIM], n_rope_bf16)
 
         for n_hi in pl.unroll(H_TILE):
             n_pack_row = pl.cast(my_rank, pl.INDEX) * T + m_t
@@ -433,56 +429,6 @@ def sparse_attn_hca_packed(
     return merge_tid
 
 
-@pl.jit.inline
-def sparse_attn_hca(
-    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    window_swa_lens: pl.Tensor[[T], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[T, CMP_TOPK], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T, D], pl.BF16],
-):
-    """Sparse decode attention over the compressed + window cache, and inverse RoPE, then the replicated grouped o_proj.
-
-    The model path stops at `sparse_attn_hca_packed` and hands `o_packed` to the TP-by-group
-    projection in `o_proj_tp`; this replicated form stays as the single-card unit
-    entry below, whose subject is the attention, not the projection.
-    """
-    o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    prepare_hca_output_rope(freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
-    # The packed attention is head-sharded: one call writes group `my_rank`'s heads
-    # only, while the replicated projection reads every group, so run it per group.
-    cmp_seq_lens = pl.create_tensor([T], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_fixture_lengths", allow_early_resolve=True):
-        for length_t in pl.range(T):
-            length_count = pl.cast(0, pl.INT32)
-            for length_k in pl.range(CMP_TOPK):
-                if pl.read(cmp_sparse_indices, [length_t, length_k]) >= 0:
-                    length_count = length_count + pl.cast(1, pl.INT32)
-            pl.write(cmp_seq_lens, [length_t], length_count)
-    merge_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
-    for g in pl.range(O_GROUPS):
-        g_tid = sparse_attn_hca_packed(
-            q, ori_kv, window_swa_indices, window_swa_lens, cmp_kv, cmp_block_table,
-            cmp_seq_lens, attn_sink, freqs_cos, freqs_sin, o_packed,
-            pl.cast(g, pl.INT32), rope_cos_il, rope_sin_signed, rope_swap_idx,
-        )
-        merge_tids[g] = g_tid
-    merge_tid = pl.system.task_dummy(deps=[merge_tids])
-    o_proj_grouped(o_packed, merge_tid, wo_a, wo_b, wo_b_scale, attn_out)
-    return attn_out
-
 @pl.jit
 def sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
@@ -500,22 +446,41 @@ def sparse_attn_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    sparse_attn_hca(
-        q,
-        ori_kv,
-        window_swa_indices,
-        window_swa_lens,
-        cmp_kv,
-        cmp_block_table,
-        cmp_sparse_indices,
-        attn_sink,
-        freqs_cos,
-        freqs_sin,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
-    )
+    o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
+    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
+    prepare_hca_output_rope(freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
+    cmp_seq_lens = pl.create_tensor([T], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_fixture_lengths", allow_early_resolve=True):
+        for length_t in pl.range(T):
+            length_count = pl.cast(0, pl.INT32)
+            for length_k in pl.range(CMP_TOPK):
+                if pl.read(cmp_sparse_indices, [length_t, length_k]) >= 0:
+                    length_count = length_count + pl.cast(1, pl.INT32)
+            pl.write(cmp_seq_lens, [length_t], length_count)
+    merge_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
+    for g in pl.range(O_GROUPS):
+        g_tid = sparse_attn_hca_packed(
+            q,
+            ori_kv,
+            window_swa_indices,
+            window_swa_lens,
+            cmp_kv,
+            cmp_block_table,
+            cmp_seq_lens,
+            attn_sink,
+            freqs_cos,
+            freqs_sin,
+            o_packed,
+            pl.cast(g, pl.INT32),
+            rope_cos_il,
+            rope_sin_signed,
+            rope_swap_idx,
+        )
+        merge_tids[g] = g_tid
+    merge_tid = pl.system.task_dummy(deps=[merge_tids])
+    o_proj_grouped(o_packed, merge_tid, wo_a, wo_b, wo_b_scale, attn_out)
     return attn_out
 
 
@@ -523,7 +488,11 @@ def golden_sparse_attn(tensors):
     """Torch reference: sparse_attn decode path followed by grouped o_proj."""
     import math
     import torch
-    from utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
+
+    if __package__:
+        from .utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
+    else:
+        from utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
 
     q = tensors["q"].float()
     ori_kv = tensors["ori_kv"].float()
@@ -584,13 +553,15 @@ def golden_sparse_attn(tensors):
         block_li = []
         block_oi = []
         for tile_start in range(0, PADDED_TOPK, ATTN_K_TILE):
-            kv_tile = kv_b[tile_start:tile_start + ATTN_K_TILE]
-            valid_tile = valid_b[tile_start:tile_start + ATTN_K_TILE]
+            kv_tile = kv_b[tile_start : tile_start + ATTN_K_TILE]
+            valid_tile = valid_b[tile_start : tile_start + ATTN_K_TILE]
             scores = bf16_matmul_fp32(q_t, kv_tile.T) * SOFTMAX_SCALE
             scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
             mi = scores.max(dim=-1, keepdim=True).values
             exp_values = [math.exp(value) for value in (scores - mi).reshape(-1).tolist()]
-            exp_scores = torch.tensor(exp_values, dtype=torch.float32, device=scores.device).reshape_as(scores)
+            exp_scores = torch.tensor(exp_values, dtype=torch.float32, device=scores.device).reshape_as(
+                scores
+            )
             exp_scores = exp_scores.masked_fill(~valid_tile.unsqueeze(0), 0.0)
             li64 = exp_scores[..., :64] + exp_scores[..., 64:128]
             li32 = li64[..., :32] + li64[..., 32:64]
@@ -637,22 +608,22 @@ def golden_sparse_attn(tensors):
     # activation scale before the groups are summed (the per-group scale cannot
     # factor out of the K-sum), then the per-channel weight scale is applied.
     o_r_g = o_r.reshape(T, O_GROUPS, O_LORA)
-    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)   # [T, G, 1]
+    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)  # [T, G, 1]
     scale_q_g = INT8_SCALE_MAX / amax_g
     if tensors.get("tp_projection", False):
         scale_q_g = torch.div(torch.full_like(amax_g, INT8_SCALE_MAX), amax_g)
     o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dq_g = 1.0 / scale_q_g                                              # [T, G, 1]
+    scale_dq_g = 1.0 / scale_q_g  # [T, G, 1]
     wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
     out = torch.zeros(T, D, dtype=torch.float32)
     for g in range(O_GROUPS):
-        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T   # [T, D]
+        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T  # [T, D]
         partial = p_g.float() * scale_dq_g[:, g]
         if tensors.get("tp_projection", False):
             partial = partial * wo_b_scale.unsqueeze(0)
-        out = out + partial                             # per-row group scale
+        out = out + partial  # per-row group scale
     if not tensors.get("tp_projection", False):
-        out = out * wo_b_scale.unsqueeze(0)                                        # per-channel weight scale
+        out = out * wo_b_scale.unsqueeze(0)  # per-channel weight scale
 
     tensors["attn_out"][:] = out.to(torch.bfloat16)
 
@@ -665,7 +636,11 @@ def build_tensor_specs(
     """Build deterministic demo tensors for the HCA standalone harness."""
     import torch
     from golden import TensorSpec
-    from utils import block_table, quant_w_per_channel
+
+    if __package__:
+        from .utils import block_table, quant_w_per_channel
+    else:
+        from utils import block_table, quant_w_per_channel
 
     cmp_valid = min(CMP_CAPACITY, TOPK - WIN)
 
@@ -766,7 +741,7 @@ def build_tensor_specs(
 
     def init_wo_a():
         """Initialize the grouped first-stage output-projection weights."""
-        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN ** 0.5)
+        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN**0.5)
 
     wo_b_bf16 = ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) / ((O_GROUPS * O_LORA) ** 0.5)).to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
@@ -781,10 +756,17 @@ def build_tensor_specs(
 
     return [
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
-        TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
+        TensorSpec(
+            "ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv
+        ),
         TensorSpec("window_swa_indices", [T, WIN], torch.int32, init_value=init_window_swa_indices),
         TensorSpec("window_swa_lens", [T], torch.int32, init_value=init_window_swa_lens),
-        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec(
+            "cmp_kv",
+            [CMP_BLOCK_NUM, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
+            torch.bfloat16,
+            init_value=init_cmp_kv,
+        ),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, CMP_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
@@ -798,6 +780,11 @@ def build_tensor_specs(
 
 
 if __name__ == "__main__":
+    if __package__:
+        from .o_proj_grouped import o_proj_grouped
+    else:
+        from o_proj_grouped import o_proj_grouped
+
     import argparse
     from golden import ratio_allclose, run
 
@@ -823,7 +810,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
-    from config import CONTEXT_CAPACITY
+    if __package__:
+        from .config import CONTEXT_CAPACITY
+    else:
+        from config import CONTEXT_CAPACITY
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     args = parser.parse_args()

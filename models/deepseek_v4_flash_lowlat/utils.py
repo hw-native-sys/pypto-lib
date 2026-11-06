@@ -18,8 +18,20 @@ from typing import Any, Callable
 
 import torch
 
-from config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
-from decode_shapes import BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, C128_COMPRESSOR_BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ
+if __package__:
+    from .config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+else:
+    from config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+if __package__:
+    from .decode_shapes import (
+        BLOCK_SIZE,
+        C4A_COMPRESSOR_BLOCK_SIZE,
+        C128_COMPRESSOR_BLOCK_SIZE,
+        DECODE_BATCH,
+        DECODE_SEQ,
+    )
+else:
+    from decode_shapes import BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, C128_COMPRESSOR_BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ
 
 
 # Validation default; runtime operators receive actual request positions.
@@ -510,71 +522,34 @@ def materialize_half_rope_tables(
 
 # --- Cube projection references. ---
 def fp32_matmul_fp32(a: torch.Tensor, b: torch.Tensor, *, split_k=1) -> torch.Tensor:
-    """CPU FP32 Cube reference with FP32 K4 partials and batched lhs rows.
-
-    Float64 evaluates each FP32 product group plus the incoming accumulator
-    before one FP32 rounding. Split partials are added in ascending K order.
-    Output columns are chunked independently to bound the product buffer.
-    """
+    """FP32 Torch projection with split partials added in ascending K order."""
     if a.ndim < 2 or b.ndim != 2 or a.shape[-1] != b.shape[0]:
         raise ValueError("FP32 projection requires lhs rows and a compatible two-dimensional rhs")
     if not isinstance(split_k, int) or split_k < 1 or a.shape[-1] % (4 * split_k):
         raise ValueError("Projection K must be divisible by 4 times split_k")
-    rows, k_dim = a.flatten(0, -2).shape
-    cols = b.shape[1]
-    groups = k_dim // split_k // 4
-    lhs = a.float().reshape(rows, 1, split_k, groups, 4)
-    result = torch.zeros(rows, cols, dtype=torch.float32, device=a.device)
-    for col0 in range(0, cols, 1024):
-        col1 = min(col0 + 1024, cols)
-        width = col1 - col0
-        rhs = b[:, col0:col1].float().reshape(split_k, groups, 4, width)
-        rhs = rhs.permute(3, 0, 1, 2).unsqueeze(0)
-        partials = torch.zeros(rows, width, split_k, dtype=torch.float32, device=a.device)
-        for group0 in range(0, groups, 16):
-            dots = (lhs[..., group0:group0 + 16, :].double()
-                    * rhs[..., group0:group0 + 16, :].double()).sum(dim=-1)
-            for group in range(dots.shape[-1]):
-                partials = (partials.double() + dots[..., group]).float()
-        column_result = torch.zeros(rows, width, dtype=torch.float32, device=a.device)
-        for split in range(split_k):
-            column_result = column_result + partials[..., split]
-        result[:, col0:col1] = column_result
-    return result.reshape(*a.shape[:-1], cols)
+    lhs, rhs = a.float(), b.float()
+    width = a.shape[-1] // split_k
+    result = torch.zeros((*a.shape[:-1], b.shape[1]), dtype=torch.float32, device=a.device)
+    for split in range(split_k):
+        start = split * width
+        result = result + torch.matmul(lhs[..., start : start + width], rhs[start : start + width])
+    return result
 
 
 def bf16_matmul_fp32(a: torch.Tensor, b: torch.Tensor, *, split_k=1) -> torch.Tensor:
-    """CPU BF16 Cube reference with FP32 K16 partials and batched lhs rows.
-
-    Float64 evaluates each BF16 product group plus the incoming accumulator
-    before one FP32 rounding. Split partials are added in ascending K order.
-    Output columns are chunked independently to bound the product buffer.
-    """
+    """Torch projection with BF16-rounded operands and FP32 split accumulation."""
     if a.ndim < 2 or b.ndim != 2 or a.shape[-1] != b.shape[0]:
         raise ValueError("BF16 projection requires lhs rows and a compatible two-dimensional rhs")
     if not isinstance(split_k, int) or split_k < 1 or a.shape[-1] % (16 * split_k):
         raise ValueError("Projection K must be divisible by 16 times split_k")
-    rows, k_dim = a.flatten(0, -2).shape
-    cols = b.shape[1]
-    groups = k_dim // split_k // 16
-    lhs = a.to(torch.bfloat16).float().reshape(rows, 1, split_k, groups, 16)
-    result = torch.zeros(rows, cols, dtype=torch.float32, device=a.device)
-    for col0 in range(0, cols, 1024):
-        col1 = min(col0 + 1024, cols)
-        width = col1 - col0
-        rhs = b[:, col0:col1].to(torch.bfloat16).float().reshape(split_k, groups, 16, width)
-        rhs = rhs.permute(3, 0, 1, 2).unsqueeze(0)
-        partials = torch.zeros(rows, width, split_k, dtype=torch.float32, device=a.device)
-        for group0 in range(0, groups, 16):
-            dots = (lhs[..., group0:group0 + 16, :].double()
-                    * rhs[..., group0:group0 + 16, :].double()).sum(dim=-1)
-            for group in range(dots.shape[-1]):
-                partials = (partials.double() + dots[..., group]).float()
-        column_result = torch.zeros(rows, width, dtype=torch.float32, device=a.device)
-        for split in range(split_k):
-            column_result = column_result + partials[..., split]
-        result[:, col0:col1] = column_result
-    return result.reshape(*a.shape[:-1], cols)
+    lhs = a.to(torch.bfloat16).float()
+    rhs = b.to(torch.bfloat16).float()
+    width = a.shape[-1] // split_k
+    result = torch.zeros((*a.shape[:-1], b.shape[1]), dtype=torch.float32, device=a.device)
+    for split in range(split_k):
+        start = split * width
+        result = result + torch.matmul(lhs[..., start : start + width], rhs[start : start + width])
+    return result
 
 
 def grouped_bf16_matmul_fp32(a: torch.Tensor, weight: torch.Tensor, *, split_k=1) -> torch.Tensor:

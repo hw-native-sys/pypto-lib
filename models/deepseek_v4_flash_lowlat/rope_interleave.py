@@ -28,34 +28,44 @@ Folding the sign into sin here rather than at each consumer is exact: multiplyin
 
 import pypto.language as pl
 
-from config import FLASH as M
-from decode_shapes import DECODE_BATCH
+if __package__:
+    from .config import FLASH as M
+else:
+    from config import FLASH as M
+if __package__:
+    from .decode_shapes import DECODE_BATCH
+else:
+    from decode_shapes import DECODE_BATCH
 
 
 B = DECODE_BATCH
-ROPE_ROWS = pl.dynamic("ROPE_ROWS")
+ROPE_ROWS = pl.dynamic('LOWLAT_TARGET_ROPE_ROWS')
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_HEAD_DIM // 2
 
 
 @pl.jit.inline
-def rope_interleave(
-    cos_half: pl.Tensor[[ROPE_ROWS, HALF_ROPE], pl.FP32],
-    sin_half: pl.Tensor[[ROPE_ROWS, HALF_ROPE], pl.FP32],
-    cos_il: pl.Tensor[[ROPE_ROWS, ROPE_HEAD_DIM], pl.FP32],
-    sin_signed: pl.Tensor[[ROPE_ROWS, ROPE_HEAD_DIM], pl.FP32],
-    ROWS: pl.constexpr,
-):
+def rope_interleave(cos_half: pl.Tensor[[ROPE_ROWS, HALF_ROPE], pl.FP32], sin_half: pl.Tensor[[ROPE_ROWS, HALF_ROPE], pl.FP32], cos_il: pl.Tensor[[ROPE_ROWS, ROPE_HEAD_DIM], pl.FP32], sin_signed: pl.Tensor[[ROPE_ROWS, ROPE_HEAD_DIM], pl.FP32], ROWS: pl.constexpr):
     """Expand half-width cos/sin rows to the interleaved, sign-folded rope layout."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_interleave", allow_early_resolve=True):
-        il_ones = pl.full([ROWS, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        il_col = pl.col_expand_mul(
-            il_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        il_dup_f = pl.cast(pl.cast(pl.mul(il_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        il_dup_idx = pl.cast(il_dup_f, target_type=pl.INT32)                                    # j>>1
-        il_lane = pl.sub(il_col, pl.mul(il_dup_f, 2.0))                                         # j%2
-        il_sign = pl.sub(pl.mul(il_lane, 2.0), 1.0)                                             # [-1,+1,...]
-        cos_il[0:ROWS, 0:ROPE_HEAD_DIM] = pl.gather(
-            cos_half[0:ROWS, 0:HALF_ROPE], dim=-1, index=il_dup_idx)
-        sin_signed[0:ROWS, 0:ROPE_HEAD_DIM] = pl.mul(
-            pl.gather(sin_half[0:ROWS, 0:HALF_ROPE], dim=-1, index=il_dup_idx), il_sign)
+    rows = pl.tensor.dim(cos_half, 0)
+    if ROWS >= 0:
+        rows = ROWS
+    for row in pl.spmd(rows, name_hint='rope_interleave', allow_early_resolve=True):
+        il_ones = pl.full([1, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        il_columns = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
+        il_columns_f32 = pl.cast(il_columns, target_type=pl.FP32)
+        il_col = pl.col_expand_mul(il_ones, il_columns_f32)
+        il_half_col = pl.mul(il_col, 0.5)
+        il_dup_idx = pl.cast(il_half_col, target_type=pl.INT32, mode='trunc')
+        il_dup_f = pl.cast(il_dup_idx, target_type=pl.FP32)
+        il_even_col = pl.mul(il_dup_f, 2.0)
+        il_lane = pl.sub(il_col, il_even_col)
+        il_double_lane = pl.mul(il_lane, 2.0)
+        il_sign = pl.sub(il_double_lane, 1.0)
+        cos_row = cos_half[row:row + 1, 0:HALF_ROPE]
+        sin_row = sin_half[row:row + 1, 0:HALF_ROPE]
+        cos_expanded = pl.gather(cos_row, dim=-1, index=il_dup_idx)
+        sin_expanded = pl.gather(sin_row, dim=-1, index=il_dup_idx)
+        cos_il[row:row + 1, 0:ROPE_HEAD_DIM] = cos_expanded
+        sin_signed[row:row + 1, 0:ROPE_HEAD_DIM] = pl.mul(sin_expanded, il_sign)
+    return (cos_il, sin_signed)

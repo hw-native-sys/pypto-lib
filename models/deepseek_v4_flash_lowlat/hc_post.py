@@ -12,11 +12,17 @@ output with its hc-residual into the next hc-stack via post and comb weights."""
 
 import pypto.language as pl
 
-from config import FLASH as M
-from decode_shapes import DECODE_BATCH, DECODE_SEQ
+if __package__:
+    from .config import FLASH as M
+else:
+    from config import FLASH as M
+if __package__:
+    from .decode_shapes import DECODE_BATCH, DECODE_SEQ
+else:
+    from decode_shapes import DECODE_BATCH, DECODE_SEQ
 
 # Dynamic shape variables.
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+T_DYN = pl.dynamic('LOWLAT_TARGET_T_DYN')  # T = B * S
 
 # model config
 D = M.hidden_size
@@ -42,11 +48,14 @@ def hc_post(
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, HC_DIM])
 
-    for block in pl.spmd(((t_dim + T_TILE - 1) // T_TILE) * HC_MULT, name_hint="hc_post", allow_early_resolve=True):
+    for block in pl.spmd(
+        ((t_dim + T_TILE - 1) // T_TILE) * HC_MULT, name_hint="hc_post", allow_early_resolve=True
+    ):
         token_block = block // HC_MULT
         out_h = block % HC_MULT
         t0 = token_block * T_TILE
-        for t in pl.pipeline(t0, pl.min(t0 + T_TILE, t_dim), stage=2):
+        token_end = pl.min(t0 + T_TILE, t_dim)
+        for t in pl.pipeline(t0, token_end, stage=2):
             post_w = pl.read(post, [t, out_h])
             x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)
             y_row = pl.mul(x_row, post_w)

@@ -16,16 +16,24 @@ variants live in sibling modules.
 
 import pypto.language as pl
 
-from fp32_numerics import rne_exp_nonpositive
+if __package__:
+    pass
+else:
+    pass
 
-from o_proj_grouped import o_proj_grouped
 
-from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
-from decode_shapes import DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, DECODE_ORI_BLOCK_NUM, KV_ORI_MAX_BLOCKS
+if __package__:
+    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+else:
+    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+if __package__:
+    from .decode_shapes import DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, DECODE_ORI_BLOCK_NUM, KV_ORI_MAX_BLOCKS
+else:
+    from decode_shapes import DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, DECODE_ORI_BLOCK_NUM, KV_ORI_MAX_BLOCKS
 
 
 # Dynamic shape variables.
-ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
+ORI_BLOCK_NUM_DYN = pl.dynamic('LOWLAT_TARGET_ORI_BLOCK_NUM_DYN')
 
 # model config
 B = DECODE_BATCH
@@ -169,7 +177,6 @@ def sparse_attn_swa_packed(
     sparse_blk_mi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * QK_M_BOX * SPARSE_BLOCKS, HEAD_DIM], dtype=pl.FP32)
-    sparse_blk_li_flat = pl.reshape(sparse_blk_li, [1, T * QK_M_BOX * SPARSE_BLOCKS])
 
     with pl.spmd(T, name_hint="qk_pv", allow_early_resolve=True) as qk_tid:
         qk_t = pl.tile.get_block_idx()
@@ -179,30 +186,52 @@ def sparse_attn_swa_packed(
         # contiguous L1 operand with two bulk DMAs: valid_shape carries the runtime
         # split without touching the tile's allocation, so the cube still sees a
         # single ATTN_K_TILE-column matmul and the KV never round-trips through GM.
-        qk_slot0 = pl.max(pl.read(swa_indices, [qk_t, 0]), 0)
+        qk_raw0 = pl.read(swa_indices, [qk_t, 0])
+        qk_slot0 = pl.max(qk_raw0, 0)
         qk_r = qk_slot0 % BLOCK_SIZE
         qk_head = WIN - qk_r
-        qk_blk1 = pl.max(pl.read(swa_indices, [qk_t, qk_head % WIN]), 0)
+        qk_raw1 = pl.read(swa_indices, [qk_t, qk_head % WIN])
+        qk_blk1 = pl.max(qk_raw1, 0)
         qk_len = pl.min(pl.max(pl.read(swa_lens, [qk_t]), 0), WIN)
         qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
         qk_src0 = pl.cast(qk_slot0, pl.INDEX)
-        qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [0, 0], [qk_src0, 0],
-                              [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_head, HEAD_DIM])
-        if qk_r > 0:
-            qk_src1 = pl.cast(qk_blk1, pl.INDEX)
-            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_head, 0], [qk_src1, 0],
-                                  [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_r, HEAD_DIM])
-        qk_tail = WIN - qk_len
-        if qk_tail > 0:
-            # Cold start: rows past the visible prefix are allocated but not yet
-            # written. Replicate the window's oldest visible slot over them --
-            # that row is written by definition, whereas a run starting anywhere
-            # else in the pool is no more initialized than the rows it replaces.
-            # sparse_bias masks their scores, but a non-finite value would reach
-            # the QK matmul and propagate through row_max before it applied.
-            for qk_fill in pl.range(qk_tail):
-                qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_len + qk_fill, 0],
-                                      [qk_src0, 0], [1, HEAD_DIM])
+        qk_fast = pl.cast(0, pl.INT32)
+        if qk_raw0 >= 0:
+            if qk_len <= qk_head:
+                qk_fast = pl.cast(1, pl.INT32)
+            else:
+                if qk_raw1 >= 0:
+                    qk_fast = pl.cast(1, pl.INT32)
+        if qk_fast == 1:
+            qk_kv = pl.gather_row(
+                qk_kv, ori_kv_flat, [0, 0], [qk_src0, 0], [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_head, HEAD_DIM]
+            )
+            if qk_r > 0:
+                qk_src1 = pl.cast(qk_blk1, pl.INDEX)
+                qk_kv = pl.gather_row(
+                    qk_kv, ori_kv_flat, [qk_head, 0], [qk_src1, 0],
+                    [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_r, HEAD_DIM],
+                )
+            qk_tail = WIN - qk_len
+            if qk_tail > 0:
+                # Fill the masked tail from an initialized visible row.
+                for qk_fill in pl.range(qk_tail):
+                    qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_len + qk_fill, 0], [qk_src0, 0], [1, HEAD_DIM])
+        else:
+            # An unmapped page can occur inside the visible window. Gather the
+            # mapped rows individually and use a finite query row for masked
+            # positions so an unwritten cache row cannot introduce NaNs.
+            qk_filler = pl.cast(qk_t * H + head_base, pl.INDEX)
+            for qk_row in pl.range(WIN):
+                qk_index = pl.read(swa_indices, [qk_t, qk_row])
+                if qk_row < qk_len:
+                    if qk_index >= 0:
+                        qk_src = pl.cast(qk_index, pl.INDEX)
+                        qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_row, 0], [qk_src, 0], [1, HEAD_DIM])
+                    else:
+                        qk_kv = pl.gather_row(qk_kv, q_flat, [qk_row, 0], [qk_filler, 0], [1, HEAD_DIM])
+                else:
+                    qk_kv = pl.gather_row(qk_kv, q_flat, [qk_row, 0], [qk_filler, 0], [1, HEAD_DIM])
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
             qk_s0 = qk_sb * ATTN_K_TILE
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
@@ -213,42 +242,33 @@ def sparse_attn_swa_packed(
                 qk_h0 = qk_hb * QK_M_TILE
                 qk_head_row = qk_t * H + head_base + qk_h0
                 qk_q_tile = pl.slice(
-                    q_flat, [QK_M_BOX, HEAD_DIM], [qk_head_row, 0],
-                    valid_shape=[QK_M_TILE, HEAD_DIM])
+                    q_flat, [QK_M_BOX, HEAD_DIM], [qk_head_row, 0], valid_shape=[QK_M_TILE, HEAD_DIM]
+                )
                 qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
                 qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
                 qk_mi = pl.row_max(qk_scores)
                 # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
                 # blocks die in the merge alpha/beta -- no mask multiply needed.
-                qk_delta = pl.create_tensor([QK_M_BOX, ATTN_K_TILE], dtype=pl.FP32)
-                qk_delta = pl.row_expand_sub(qk_scores, qk_mi)
-                qk_exp = rne_exp_nonpositive(qk_delta, rows=QK_M_BOX, cols=ATTN_K_TILE)
-                qk_sum64 = pl.add(qk_exp[0:QK_M_BOX, 0:64], qk_exp[0:QK_M_BOX, 64:128])
-                qk_sum32 = pl.add(qk_sum64[0:QK_M_BOX, 0:32], qk_sum64[0:QK_M_BOX, 32:64])
-                qk_sum16 = pl.add(qk_sum32[0:QK_M_BOX, 0:16], qk_sum32[0:QK_M_BOX, 16:32])
-                qk_sum8 = pl.add(qk_sum16[0:QK_M_BOX, 0:8], qk_sum16[0:QK_M_BOX, 8:16])
-                qk_sum8_t_physical = pl.transpose(qk_sum8, 0, 1)
-                qk_sum8_t = pl.slice(qk_sum8_t_physical, [8, QK_M_BOX], [0, 0], valid_shape=[8, QK_M_TILE])
-                qk_sum4_t = pl.add(qk_sum8_t[0:4, 0:QK_M_BOX], qk_sum8_t[4:8, 0:QK_M_BOX])
-                qk_sum2_t = pl.add(qk_sum4_t[0:2, 0:QK_M_BOX], qk_sum4_t[2:4, 0:QK_M_BOX])
-                qk_sum1_t = pl.add(qk_sum2_t[0:1, 0:QK_M_BOX], qk_sum2_t[1:2, 0:QK_M_BOX])
+                qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                qk_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
                 qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
                 # One head tile per card, so the whole (valid) accumulator stores
                 # straight out -- slicing it to 8 rows would ask the cube for a
                 # partial 16x16 box, which has no address.
                 qk_row = qk_token_base + qk_sb * QK_M_BOX
-                sparse_blk_mi[qk_row : qk_row + QK_M_BOX, 0 : 1] = qk_mi
-                sparse_blk_li_flat[0:1, qk_row : qk_row + QK_M_BOX] = qk_sum1_t
-                sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0 : HEAD_DIM] = qk_oi
+                sparse_blk_mi[qk_row : qk_row + QK_M_BOX, 0:1] = qk_mi
+                sparse_blk_li[qk_row : qk_row + QK_M_BOX, 0:1] = qk_li
+                sparse_blk_oi[qk_row : qk_row + QK_M_BOX, 0:HEAD_DIM] = qk_oi
 
     # Flatten the one-block SWA merge over token/head tiles into a single
     # 32-block grid, which fits in one AIV wave and avoids eight group-grid
     # submissions. Each block writes two output-projection groups using the
     # same contiguous per-group stores.
-    with pl.spmd(T * (H_LOCAL // H_TILE), name_hint="merge_norm", deps=[qk_tid],
-                 allow_early_resolve=True) as merge_tid:
+    with pl.spmd(
+        T * (H_LOCAL // H_TILE), name_hint="merge_norm", deps=[qk_tid], allow_early_resolve=True
+    ) as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H_LOCAL // H_TILE)
         m_h_idx = m_idx - m_t * (H_LOCAL // H_TILE)
@@ -307,46 +327,6 @@ def sparse_attn_swa_packed(
     return merge_tid
 
 
-
-@pl.jit.inline
-def sparse_attn_swa(
-    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    swa_lens: pl.Tensor[[T], pl.INT32],
-    sparse_bias: pl.Tensor[[T, PADDED_TOPK], pl.FP32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T, D], pl.BF16],
-):
-    """Sparse decode attention over the sliding window, and inverse RoPE, then the replicated grouped o_proj.
-
-    The model path stops at `sparse_attn_swa_packed` and hands `o_packed` to the TP-by-group
-    projection in `o_proj_tp`; this replicated form stays as the single-card unit
-    entry below, whose subject is the attention, not the projection.
-    """
-    o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    prepare_swa_output_rope(freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
-    # The packed attention is head-sharded: one call writes group `my_rank`'s heads
-    # only, while the replicated projection reads every group, so run it per group.
-    merge_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
-    for g in pl.range(O_GROUPS):
-        g_tid = sparse_attn_swa_packed(
-            q, ori_kv, swa_indices, swa_lens, sparse_bias, attn_sink,
-            freqs_cos, freqs_sin, o_packed, pl.cast(g, pl.INT32), rope_cos_il, rope_sin_signed, rope_swap_idx,
-        )
-        merge_tids[g] = g_tid
-    merge_tid = pl.system.task_dummy(deps=[merge_tids])
-    o_proj_grouped(o_packed, merge_tid, wo_a, wo_b, wo_b_scale, attn_out)
-    return attn_out
-
 @pl.jit
 def sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
@@ -375,28 +355,44 @@ def sparse_attn_test(
         v_mapped = pl.minimum(pl.maximum(pl.add(v_indices, 1.0), 0.0), 1.0)
         v_valid = pl.mul(v_valid, v_mapped)
         sparse_bias[0:T, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
-    sparse_attn_swa(
-        q,
-        ori_kv,
-        swa_indices,
-        swa_lens,
-        sparse_bias,
-        attn_sink,
-        freqs_cos,
-        freqs_sin,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
-    )
+    o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
+    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
+    prepare_swa_output_rope(freqs_cos, freqs_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
+    merge_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
+    for g in pl.range(O_GROUPS):
+        g_tid = sparse_attn_swa_packed(
+            q,
+            ori_kv,
+            swa_indices,
+            swa_lens,
+            sparse_bias,
+            attn_sink,
+            freqs_cos,
+            freqs_sin,
+            o_packed,
+            pl.cast(g, pl.INT32),
+            rope_cos_il,
+            rope_sin_signed,
+            rope_swap_idx,
+        )
+        merge_tids[g] = g_tid
+    merge_tid = pl.system.task_dummy(deps=[merge_tids])
+    o_proj_grouped(o_packed, merge_tid, wo_a, wo_b, wo_b_scale, attn_out)
     return attn_out
 
 
 def golden_sparse_attn(tensors):
     import math
+
     """Torch reference: sparse_attn decode path followed by grouped o_proj."""
     import torch
-    from utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
+
+    if __package__:
+        from .utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
+    else:
+        from utils import bf16_matmul_fp32, grouped_bf16_matmul_fp32
 
     q = tensors["q"].float()
     ori_kv = tensors["ori_kv"].float()
@@ -435,10 +431,12 @@ def golden_sparse_attn(tensors):
                 dtype=torch.bool,
             )
             if end - start < ATTN_K_TILE:
-                valid_tile = torch.cat([
-                    valid_tile,
-                    torch.zeros(ATTN_K_TILE - (end - start), dtype=torch.bool),
-                ])
+                valid_tile = torch.cat(
+                    [
+                        valid_tile,
+                        torch.zeros(ATTN_K_TILE - (end - start), dtype=torch.bool),
+                    ]
+                )
             valid_tile = valid_tile.to(device=ori_kv.device)
             kv_tile = torch.zeros(ATTN_K_TILE, HEAD_DIM, dtype=ori_kv.dtype, device=ori_kv.device)
             for r, slot in enumerate(slots):
@@ -451,7 +449,9 @@ def golden_sparse_attn(tensors):
             scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
             mi = scores.max(dim=-1, keepdim=True).values
             exp_values = [math.exp(value) for value in (scores - mi).reshape(-1).tolist()]
-            exp_scores = torch.tensor(exp_values, dtype=torch.float32, device=scores.device).reshape_as(scores)
+            exp_scores = torch.tensor(exp_values, dtype=torch.float32, device=scores.device).reshape_as(
+                scores
+            )
             exp_scores = exp_scores.masked_fill(~valid_tile.unsqueeze(0), 0.0)
             li64 = exp_scores[..., :64] + exp_scores[..., 64:128]
             li32 = li64[..., :32] + li64[..., 32:64]
@@ -498,33 +498,38 @@ def golden_sparse_attn(tensors):
     # activation scale before the groups are summed (the per-group scale cannot
     # factor out of the K-sum), then the per-channel weight scale is applied.
     o_r_g = o_r.reshape(T, O_GROUPS, O_LORA)
-    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)   # [T, G, 1]
+    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)  # [T, G, 1]
     scale_q_g = INT8_SCALE_MAX / amax_g
     if tensors.get("tp_projection", False):
         scale_q_g = torch.div(torch.full_like(amax_g, INT8_SCALE_MAX), amax_g)
     o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dq_g = 1.0 / scale_q_g                                              # [T, G, 1]
+    scale_dq_g = 1.0 / scale_q_g  # [T, G, 1]
     wo_b_g = wo_b_i8.reshape(D, O_GROUPS, O_LORA)
     out = torch.zeros(T, D, dtype=torch.float32)
     for g in range(O_GROUPS):
-        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T   # [T, D]
+        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[:, g].to(torch.int32).T  # [T, D]
         partial = p_g.float() * scale_dq_g[:, g]
         if tensors.get("tp_projection", False):
             partial = partial * wo_b_scale.unsqueeze(0)
-        out = out + partial                             # per-row group scale
+        out = out + partial  # per-row group scale
     if not tensors.get("tp_projection", False):
-        out = out * wo_b_scale.unsqueeze(0)                                        # per-channel weight scale
+        out = out * wo_b_scale.unsqueeze(0)  # per-channel weight scale
 
     tensors["attn_out"][:] = out.to(torch.bfloat16)
 
 def build_tensor_specs(
     causal_regression_fixture: bool = False,
     short_window_fixture: bool = False,
+    unmapped_window_fixture: bool = False,
 ):
     """Build deterministic demo tensors for the merged standalone harness."""
     import torch
     from golden import TensorSpec
-    from utils import block_table, quant_w_per_channel
+
+    if __package__:
+        from .utils import block_table, quant_w_per_channel
+    else:
+        from utils import block_table, quant_w_per_channel
 
     def init_q():
         """Initialize the query tensor used by the decode attention stage."""
@@ -538,6 +543,8 @@ def build_tensor_specs(
         kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
         if causal_regression_fixture:
             kv[0, WIN - 1, 0].fill_(8.0)
+        if unmapped_window_fixture:
+            kv[0].fill_(float("nan"))
         return kv
 
     def init_attn_sink():
@@ -558,6 +565,17 @@ def build_tensor_specs(
         """Build physical cache-row indices for the standalone SWA fixture."""
         tbl = init_ori_block_table()
         indices = torch.full((T, WIN), -1, dtype=torch.int32)
+        if unmapped_window_fixture:
+            half = WIN // 2
+            for t in range(T):
+                if t % 4 == 0:
+                    indices[t, half:] = BLOCK_SIZE + torch.arange(half, dtype=torch.int32)
+                elif t % 4 == 1:
+                    indices[t, :half] = 2 * BLOCK_SIZE + half + torch.arange(half, dtype=torch.int32)
+                elif t % 4 == 3:
+                    indices[t, :half] = 3 * BLOCK_SIZE + half + torch.arange(half, dtype=torch.int32)
+                    indices[t, half:] = 4 * BLOCK_SIZE + torch.arange(half, dtype=torch.int32)
+            return indices
         lens = init_swa_lens()
         for t in range(T):
             b = t // S
@@ -584,7 +602,7 @@ def build_tensor_specs(
 
     def init_wo_a():
         """Initialize the grouped first-stage output-projection weights."""
-        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN ** 0.5)
+        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN**0.5)
 
     wo_b_bf16 = ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) / ((O_GROUPS * O_LORA) ** 0.5)).to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
@@ -599,7 +617,9 @@ def build_tensor_specs(
 
     return [
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
-        TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
+        TensorSpec(
+            "ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv
+        ),
         TensorSpec("swa_indices", [T, WIN], torch.int32, init_value=init_swa_indices),
         TensorSpec("swa_lens", [T], torch.int32, init_value=init_swa_lens),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
@@ -613,6 +633,11 @@ def build_tensor_specs(
 
 
 if __name__ == "__main__":
+    if __package__:
+        from .o_proj_grouped import o_proj_grouped
+    else:
+        from o_proj_grouped import o_proj_grouped
+
     import argparse
     from golden import ratio_allclose, run
 
@@ -623,6 +648,8 @@ if __name__ == "__main__":
                         help="Amplify the S=2 future-window-slot regression.")
     parser.add_argument("--short-window-fixture", action="store_true", default=False,
                         help="Use a short-window topk row with valid prefix + -1 padding.")
+    parser.add_argument("--unmapped-window-fixture", action="store_true", default=False,
+                        help="Exercise unmapped pages in a visible SWA window.")
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
@@ -641,6 +668,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(
             args.causal_regression_fixture,
             args.short_window_fixture,
+            args.unmapped_window_fixture,
         ),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,

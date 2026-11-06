@@ -19,8 +19,14 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import FLASH as M
-from decode_shapes import DECODE_TOKENS, TP
+if __package__:
+    from .config import FLASH as M
+else:
+    from config import FLASH as M
+if __package__:
+    from .decode_shapes import DECODE_TOKENS, TP
+else:
+    from decode_shapes import DECODE_TOKENS, TP
 
 
 # model config
@@ -55,106 +61,65 @@ def embed_shard_gather(
 
 
 @pl.jit.inline
-def all_gather_embedding(
-    input_ids: pl.Tensor[[T], pl.INT64],
-    owned_rows: pl.Tensor[[T, D], pl.BF16],
-    hidden_states: pl.Tensor[[T, D], pl.BF16],
-    gather_window: pld.DistributedTensor[[T, D], pl.BF16],
-    gather_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    vocab_base: pl.Scalar[pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-    # One notify per peer in a call; current callers use a fixed value of one.
-    gather_epoch: pl.Scalar[pl.INT32],
-):
+def all_gather_embedding(input_ids: pl.Tensor[[T], pl.INT64], owned_rows: pl.Tensor[[T, D], pl.BF16], hidden_states: pl.Tensor[[T, D], pl.BF16], gather_window: pld.DistributedTensor[[T, D], pl.BF16], gather_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32], vocab_base: pl.Scalar[pl.INT32], my_rank: pl.Scalar[pl.INT32], gather_epoch: pl.Scalar[pl.INT32], defer_clear: pl.constexpr):
     """Publish, wait, read, and clear counters before the invocation completes.
 
     Reuse this single window only after all ranks finish the previous call.
     """
-    with pl.spmd(T, name_hint="embed_publish", allow_early_resolve=True) as publish_tid:
+    with pl.spmd(T, name_hint='embed_publish', allow_early_resolve=True) as publish_tid:
         token = pl.tile.get_block_idx()
         token_id = pl.cast(pl.tensor.read(input_ids, [token]), pl.INT32)
         local_id = token_id - vocab_base
         if local_id >= 0:
             if local_id < VOCAB_PER_TP:
                 for peer in pl.range(N_RANKS):
-                    pld.tensor.put(
-                        dst=gather_window,
-                        peer=peer,
-                        src=owned_rows,
-                        dst_offsets=[token, 0],
-                        src_offsets=[token, 0],
-                        shape=[1, D],
-                    )
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="embed_barrier", allow_early_resolve=True, deps=[publish_tid]) as barrier_tid:
+                    pld.tensor.put(dst=gather_window, peer=peer, src=owned_rows, dst_offsets=[token, 0], src_offsets=[token, 0], shape=[1, D])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint='embed_barrier', allow_early_resolve=True, deps=[publish_tid]) as barrier_tid:
         for peer in pl.range(N_RANKS):
-            pld.system.notify(
-                target=gather_signal,
-                peer=peer,
-                offsets=[my_rank, 0],
-                value=1,
-                op=pld.NotifyOp.AtomicAdd,
-            )
+            pld.system.notify(target=gather_signal, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
         for src in pl.range(N_RANKS):
-            pld.system.wait(
-                signal=gather_signal,
-                offsets=[src, 0],
-                expected=gather_epoch,
-                cmp=pld.WaitCmp.Ge,
-            )
-
-    with pl.spmd(T * (D // HIDDEN_TILE), name_hint="embed_readback", allow_early_resolve=True, deps=[barrier_tid]) as _readback_tid:
+            pld.system.wait(signal=gather_signal, offsets=[src, 0], expected=gather_epoch, cmp=pld.WaitCmp.Ge)
+    with pl.spmd(T * (D // HIDDEN_TILE), name_hint='embed_readback', allow_early_resolve=True, deps=[barrier_tid]) as _readback_tid:
         block = pl.tile.get_block_idx()
         token = block // (D // HIDDEN_TILE)
-        hidden_offset = (block % (D // HIDDEN_TILE)) * HIDDEN_TILE
+        hidden_offset = block % (D // HIDDEN_TILE) * HIDDEN_TILE
         gathered = pl.load(gather_window, [token, hidden_offset], [1, HIDDEN_TILE])
         pl.store(gathered, [token, hidden_offset], hidden_states)
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="embed_signal_clear", deps=[_readback_tid]):
-        zero = pl.cast(0, pl.INT32)
-        for src in pl.range(N_RANKS):
-            pl.write(gather_signal, [src, 0], zero)
+    if not defer_clear:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint='embed_signal_clear', deps=[_readback_tid]):
+            zero = pl.cast(0, pl.INT32)
+            for src in pl.range(N_RANKS):
+                pl.write(gather_signal, [src, 0], zero)
 
 
 @pl.jit.inline
-def tp_lookup_embedding(
-    input_ids: pl.Tensor[[T], pl.INT64],
-    embed_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    hidden_states: pl.Tensor[[T, D], pl.BF16],
-    gather_window: pld.DistributedTensor[[T, D], pl.BF16],
+def clear_embedding_signals(
+    completion_anchor: pl.Tensor[[T, D], pl.BF16],
     gather_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-    gather_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, D], pl.BF16]:
+):
+    """Clear this rank's embedding counters after its forward completes."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="embed_signal_clear") as s6_embed_cleanup_tid:
+        _completion_anchor = pl.read(completion_anchor, [0, 0])
+        zero = pl.cast(0, pl.INT32)
+        for src in pl.range(N_RANKS):
+            pl.write(gather_signal, [src, 0], zero)
+    return (completion_anchor, s6_embed_cleanup_tid)
+
+@pl.jit.inline
+def tp_lookup_embedding(input_ids: pl.Tensor[[T], pl.INT64], embed_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16], hidden_states: pl.Tensor[[T, D], pl.BF16], gather_window: pld.DistributedTensor[[T, D], pl.BF16], gather_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32], my_rank: pl.Scalar[pl.INT32], gather_epoch: pl.Scalar[pl.INT32], defer_clear: pl.constexpr) -> pl.Tensor[[T, D], pl.BF16]:
     vocab_base = pl.cast(my_rank, pl.INT32) * VOCAB_PER_TP
     if N_RANKS == 1:
         embed_shard_gather(input_ids, embed_weight, hidden_states, vocab_base)
     else:
         owned_rows = pl.create_tensor([T, D], dtype=pl.BF16)
         embed_shard_gather(input_ids, embed_weight, owned_rows, vocab_base)
-        all_gather_embedding(
-            input_ids, owned_rows, hidden_states,
-            gather_window, gather_signal,
-            vocab_base, my_rank, gather_epoch,
-        )
+        all_gather_embedding(input_ids, owned_rows, hidden_states, gather_window, gather_signal, vocab_base, my_rank, gather_epoch, defer_clear=defer_clear)
     return hidden_states
 
 
 @pl.jit
-def tp_embedding_test(
-    input_ids: pl.Tensor[[T], pl.INT64],
-    embed_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    hidden_states: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    gather_window: pld.DistributedTensor[[T, D], pl.BF16],
-    gather_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-    gather_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, D], pl.BF16]:
-    tp_lookup_embedding(
-        input_ids, embed_weight, hidden_states,
-        gather_window, gather_signal,
-        my_rank, gather_epoch,
-    )
+def tp_embedding_test(input_ids: pl.Tensor[[T], pl.INT64], embed_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16], hidden_states: pl.Out[pl.Tensor[[T, D], pl.BF16]], gather_window: pld.DistributedTensor[[T, D], pl.BF16], gather_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32], my_rank: pl.Scalar[pl.INT32], gather_epoch: pl.Scalar[pl.INT32]) -> pl.Tensor[[T, D], pl.BF16]:
+    tp_lookup_embedding(input_ids, embed_weight, hidden_states, gather_window, gather_signal, my_rank, gather_epoch, defer_clear=False)
     return hidden_states
 
 

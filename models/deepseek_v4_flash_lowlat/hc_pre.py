@@ -25,11 +25,20 @@ comb_sinkhorn / mix_x), ordered by their GM read/write dependencies. mix_hc(24) 
 """
 
 import pypto.language as pl
-from config import FLASH as M
-from hc_pre_numerics import hc_sigmoid_math, hc_softmax_exp_math
-from decode_shapes import DECODE_BATCH, DECODE_SEQ
+if __package__:
+    from .config import FLASH as M
+else:
+    from config import FLASH as M
+if __package__:
+    pass
+else:
+    pass
+if __package__:
+    from .decode_shapes import DECODE_BATCH, DECODE_SEQ
+else:
+    from decode_shapes import DECODE_BATCH, DECODE_SEQ
 
-T_DYN = pl.dynamic("T_DYN")
+T_DYN = pl.dynamic('LOWLAT_TARGET_T_DYN')
 D = M.hidden_size
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
@@ -68,13 +77,18 @@ def hc_pre(
     buffers are sized to t_linear, the token count padded up to whole 16-row cube tiles.
     """
     t_dim = pl.tensor.dim(x, 0)
-    t_linear = (t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE * LINEAR_T_TILE
+    t_linear = (
+        (t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE
+    ) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
     scale0 = pl.read(hc_scale, [0])
     scale1 = pl.read(hc_scale, [1])
     scale2 = pl.read(hc_scale, [2])
-    hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])
+    hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])  # for per-group comb base loads in comb_sinkhorn
+
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
+
+    # rms: full-K sum-of-squares per token-tile -> inv_rms.
     for t in pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
         t0 = t * T_TILE
         rms_rows = pl.min(T_TILE, t_dim - t0)
@@ -83,98 +97,24 @@ def hc_pre(
             k0 = kb * RMS_K_TILE
             x_chunk = pl.slice(x_flat, [T_TILE, RMS_K_TILE], [t0, k0], valid_shape=[rms_rows, RMS_K_TILE])
             x_sq = pl.mul(x_chunk, x_chunk)
-            # Preserve each FP32 addition of the reference's adjacent-pair tree.
-            hc_rms_sq256_even = pl.gather(x_sq, mask_pattern=1)
-            hc_rms_sq256_odd = pl.gather(x_sq, mask_pattern=2)
-            hc_rms_sq256 = pl.add(hc_rms_sq256_even, hc_rms_sq256_odd)
-            hc_rms_sq128_even = pl.gather(hc_rms_sq256, mask_pattern=1)
-            hc_rms_sq128_odd = pl.gather(hc_rms_sq256, mask_pattern=2)
-            hc_rms_sq128 = pl.add(hc_rms_sq128_even, hc_rms_sq128_odd)
-            hc_rms_sq64_even = pl.gather(hc_rms_sq128, mask_pattern=1)
-            hc_rms_sq64_odd = pl.gather(hc_rms_sq128, mask_pattern=2)
-            hc_rms_sq64 = pl.add(hc_rms_sq64_even, hc_rms_sq64_odd)
-            hc_rms_sq32_even = pl.gather(hc_rms_sq64, mask_pattern=1)
-            hc_rms_sq32_odd = pl.gather(hc_rms_sq64, mask_pattern=2)
-            hc_rms_sq32 = pl.add(hc_rms_sq32_even, hc_rms_sq32_odd)
-            hc_rms_sq16_even = pl.gather(hc_rms_sq32, mask_pattern=1)
-            hc_rms_sq16_odd = pl.gather(hc_rms_sq32, mask_pattern=2)
-            hc_rms_sq16 = pl.add(hc_rms_sq16_even, hc_rms_sq16_odd)
-            hc_rms_sq8_even = pl.gather(hc_rms_sq16, mask_pattern=1)
-            hc_rms_sq8_odd = pl.gather(hc_rms_sq16, mask_pattern=2)
-            hc_rms_sq8 = pl.add(hc_rms_sq8_even, hc_rms_sq8_odd)
-            # Keep eight FP32 columns (32 bytes) for the last three levels.
-            hc_rms_sq8_t = pl.transpose(hc_rms_sq8, 0, 1)
-            hc_rms_pair0 = pl.add(hc_rms_sq8_t[0:1, :], hc_rms_sq8_t[1:2, :])
-            hc_rms_pair1 = pl.add(hc_rms_sq8_t[2:3, :], hc_rms_sq8_t[3:4, :])
-            hc_rms_pair2 = pl.add(hc_rms_sq8_t[4:5, :], hc_rms_sq8_t[5:6, :])
-            hc_rms_pair3 = pl.add(hc_rms_sq8_t[6:7, :], hc_rms_sq8_t[7:8, :])
-            hc_rms_sum_first = pl.add(hc_rms_pair0, hc_rms_pair1)
-            hc_rms_sum_last = pl.add(hc_rms_pair2, hc_rms_pair3)
-            x_sq_row = pl.add(hc_rms_sum_first, hc_rms_sum_last)
+            x_sq_row = pl.reshape(pl.row_sum(x_sq), [1, T_TILE])
             sq_sum = pl.add(sq_sum, x_sq_row)
-        sq_mean = sq_sum
         sq_mean = pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)
-        inv_seed = sq_mean
-        inv_seed = pl.rsqrt(sq_mean, high_precision=True)
-        rms_work = pl.minimum(sq_mean, 1099511627776.0)
-        rms_seed = pl.rsqrt(rms_work, high_precision=True)
-        rms_y2_as = pl.mul(rms_seed, 4097.0)
-        rms_y2_ad = pl.sub(rms_y2_as, rms_seed)
-        rms_y2_ah = pl.sub(rms_y2_as, rms_y2_ad)
-        rms_y2_al = pl.sub(rms_seed, rms_y2_ah)
-        rms_y2_bs = pl.mul(rms_seed, 4097.0)
-        rms_y2_bd = pl.sub(rms_y2_bs, rms_seed)
-        rms_y2_bh = pl.sub(rms_y2_bs, rms_y2_bd)
-        rms_y2_bl = pl.sub(rms_seed, rms_y2_bh)
-        rms_y2_p = pl.mul(rms_seed, rms_seed)
-        rms_y2_hh = pl.mul(rms_y2_ah, rms_y2_bh)
-        rms_y2_e0 = pl.sub(rms_y2_hh, rms_y2_p)
-        rms_y2_hl = pl.mul(rms_y2_ah, rms_y2_bl)
-        rms_y2_e1 = pl.add(rms_y2_e0, rms_y2_hl)
-        rms_y2_lh = pl.mul(rms_y2_al, rms_y2_bh)
-        rms_y2_e2 = pl.add(rms_y2_e1, rms_y2_lh)
-        rms_y2_ll = pl.mul(rms_y2_al, rms_y2_bl)
-        rms_y2_e = pl.add(rms_y2_e2, rms_y2_ll)
-        rms_xy2_as = pl.mul(rms_work, 4097.0)
-        rms_xy2_ad = pl.sub(rms_xy2_as, rms_work)
-        rms_xy2_ah = pl.sub(rms_xy2_as, rms_xy2_ad)
-        rms_xy2_al = pl.sub(rms_work, rms_xy2_ah)
-        rms_xy2_bs = pl.mul(rms_y2_p, 4097.0)
-        rms_xy2_bd = pl.sub(rms_xy2_bs, rms_y2_p)
-        rms_xy2_bh = pl.sub(rms_xy2_bs, rms_xy2_bd)
-        rms_xy2_bl = pl.sub(rms_y2_p, rms_xy2_bh)
-        rms_xy2_p = pl.mul(rms_work, rms_y2_p)
-        rms_xy2_hh = pl.mul(rms_xy2_ah, rms_xy2_bh)
-        rms_xy2_e0 = pl.sub(rms_xy2_hh, rms_xy2_p)
-        rms_xy2_hl = pl.mul(rms_xy2_ah, rms_xy2_bl)
-        rms_xy2_e1 = pl.add(rms_xy2_e0, rms_xy2_hl)
-        rms_xy2_lh = pl.mul(rms_xy2_al, rms_xy2_bh)
-        rms_xy2_e2 = pl.add(rms_xy2_e1, rms_xy2_lh)
-        rms_xy2_ll = pl.mul(rms_xy2_al, rms_xy2_bl)
-        rms_xy2_e = pl.add(rms_xy2_e2, rms_xy2_ll)
-        rms_one = pl.full([1, T_TILE], dtype=pl.FP32, value=1.0)
-        rms_r0 = pl.sub(rms_one, rms_xy2_p)
-        rms_r1 = pl.sub(rms_r0, rms_xy2_e)
-        rms_low = pl.mul(rms_work, rms_y2_e)
-        rms_residual = pl.sub(rms_r1, rms_low)
-        rms_half_seed = pl.mul(rms_seed, 0.5)
-        rms_step = pl.mul(rms_half_seed, rms_residual)
-        rms_corrected = pl.add(rms_seed, rms_step)
-        rms_overflow = pl.sub(sq_mean, 1099511627776.0)
-        rms_gate = pl.minimum(pl.maximum(pl.mul(rms_overflow, 7.62939453125e-06), 0.0), 1.0)
-        rms_inside = pl.sub(rms_one, rms_gate)
-        rms_value = pl.add(pl.mul(rms_corrected, rms_inside), pl.mul(inv_seed, rms_gate))
-        inv = pl.reshape(rms_value, [T_TILE, 1])
-        inv_valid = pl.set_validshape(inv, rms_rows, 1)
-        inv_rms[t0 : t0 + T_TILE, 0:1] = inv_valid
+        inv = pl.reshape(pl.rsqrt(sq_mean, high_precision=True), [T_TILE, 1])
+        inv_rms[t0 : t0 + T_TILE, 0:1] = inv
+
+    # linear: split-K matmul -> per-split partials. The t_dim..t_linear pad rows are
+    # zero-filled by valid_shape, never materialized.
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
     for task in pl.spmd(
-        t_linear // LINEAR_T_TILE * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True
+        (t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True
     ):
-        t0 = task // LINEAR_OK * LINEAR_T_TILE
+        t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         linear_split = task % LINEAR_OK
         k_base = linear_split * LINEAR_K_PER_SPLIT
-        t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+        t_rows = pl.min(
+            LINEAR_T_TILE, t_dim - t0
+        )  # last row-block spills past t_dim; valid_shape zero-fills the tail
         acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
             k0 = k_base + kb * LINEAR_K_TILE
@@ -182,502 +122,213 @@ def hc_pre(
                 x_flat, [LINEAR_T_TILE, LINEAR_K_TILE], [t0, k0], valid_shape=[t_rows, LINEAR_K_TILE]
             )
             w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, k0], valid_shape=[MIX_HC, LINEAR_K_TILE])
-            acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True, init_cond=kb == 0)
+            acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True, init_cond=(kb == 0))
         partial_row0 = linear_split * t_linear + t0
         mixes_partials[partial_row0 : partial_row0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
+
+    # Partials are reduced in ascending K order.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
     for linear_block in pl.spmd(
         t_linear // LINEAR_T_TILE, name_hint="hc_pre_linear_reduce", allow_early_resolve=True
     ):
         linear_t0 = linear_block * LINEAR_T_TILE
-        reduce_rows = pl.min(LINEAR_T_TILE, t_dim - linear_t0)
-        mixes_total = pl.slice(
-            mixes_partials, [LINEAR_T_TILE, MIX_PAD], [linear_t0, 0], valid_shape=[reduce_rows, MIX_HC]
-        )
+        mixes_total = mixes_partials[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD]
         for linear_split in pl.range(1, LINEAR_OK):
             partial_t0 = linear_split * t_linear + linear_t0
-            partial_tile = pl.slice(
-                mixes_partials, [LINEAR_T_TILE, MIX_PAD], [partial_t0, 0], valid_shape=[reduce_rows, MIX_HC]
-            )
+            partial_tile = mixes_partials[partial_t0 : partial_t0 + LINEAR_T_TILE, 0:MIX_PAD]
             mixes_total = pl.add(mixes_total, partial_tile)
-        reduced_valid = pl.set_validshape(mixes_total, reduce_rows, MIX_HC)
-        mixes_raw[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD] = reduced_valid
+        mixes_raw[linear_t0 : linear_t0 + LINEAR_T_TILE, 0:MIX_PAD] = mixes_total
+
+    # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
+    # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
+    # 32B tile, 4 cols valid -- a bare 4-wide slice allocs a 16B tile ptoas rejects). comb gate
+    # lives in comb_sinkhorn.
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
     for ob in pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="split_pre_post", allow_early_resolve=True):
         t0 = ob * T_TILE
-        split_rows = pl.min(T_TILE, t_dim - t0)
-        inv_col = pl.slice(inv_rms, [T_TILE, 1], [t0, 0], valid_shape=[split_rows, 1])
-        pre_mix = pl.slice(mixes_raw, [T_TILE, HC_PAD], [t0, 0], valid_shape=[split_rows, HC_PAD])
-        pre_sig = hc_sigmoid_math(pre_mix, inv_col, hc_scale, hc_base, group=0, offset=0)
+        post_rows = pl.min(T_TILE, t_dim - t0)
+        inv_col = inv_rms[t0 : t0 + T_TILE, 0:1]
+
+        pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
+        pre_norm = pl.row_expand_mul(mixes_raw[t0 : t0 + T_TILE, 0:HC_PAD], inv_col)
+        pre_scaled = pl.mul(pre_norm, scale0)
+        pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
+        pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
         pre_val = pl.add(pre_sig, HC_EPS)
-        pre_out = pl.set_validshape(pre_val, split_rows, HC_PAD)
-        pre_val_store[t0 : t0 + T_TILE, 0:HC_PAD] = pre_out
-        post_mix = pl.slice(mixes_raw, [T_TILE, HC_PAD], [t0, HC_MULT], valid_shape=[split_rows, HC_PAD])
-        post_sig = hc_sigmoid_math(post_mix, inv_col, hc_scale, hc_base, group=1, offset=4)
+        pre_val_store[t0 : t0 + T_TILE, 0:HC_PAD] = pre_val
+
+        post_base = pl.reshape(hc_base[HC_MULT : HC_MULT + HC_PAD], [1, HC_PAD])
+        post_norm = pl.row_expand_mul(mixes_raw[t0 : t0 + T_TILE, HC_MULT : HC_MULT + HC_PAD], inv_col)
+        post_scaled = pl.mul(post_norm, scale1)
+        post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
+        post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
         post_pad = pl.mul(post_sig, 2.0)
-        post_out = pl.slice(post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[split_rows, HC_MULT])
-        post[t0 : t0 + T_TILE, 0:HC_MULT] = post_out
+        post[t0 : t0 + T_TILE, 0:HC_MULT] = pl.slice(
+            post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[post_rows, HC_MULT]
+        )
+
+    # comb_sinkhorn: comb gate from mixes_raw cols 8/12/16/20, softmax, then a
+    # column-first 20-iteration Sinkhorn -> comb.
     for ob in pl.spmd(
         (t_dim + COMB_T_TILE - 1) // COMB_T_TILE, name_hint="comb_sinkhorn", allow_early_resolve=True
     ):
         t0 = ob * COMB_T_TILE
         comb_rows = pl.min(COMB_T_TILE, t_dim - t0)
-        inv_col_t = pl.slice(inv_rms, [COMB_T_TILE, 1], [t0, 0], valid_shape=[comb_rows, 1])
-        mix_g0 = pl.slice(mixes_raw, [COMB_T_TILE, HC_PAD], [t0, 8], valid_shape=[comb_rows, HC_MULT])
-        mix_g1 = pl.slice(mixes_raw, [COMB_T_TILE, HC_PAD], [t0, 12], valid_shape=[comb_rows, HC_MULT])
-        mix_g2 = pl.slice(mixes_raw, [COMB_T_TILE, HC_PAD], [t0, 16], valid_shape=[comb_rows, HC_MULT])
-        mix_g3 = pl.slice(mixes_raw, [COMB_T_TILE, HC_PAD], [t0, 20], valid_shape=[comb_rows, HC_MULT])
-        row0_exp = hc_softmax_exp_math(mix_g0, inv_col_t, hc_scale, hc_base, group=2, offset=8)
-        row1_exp = hc_softmax_exp_math(mix_g1, inv_col_t, hc_scale, hc_base, group=2, offset=12)
-        row2_exp = hc_softmax_exp_math(mix_g2, inv_col_t, hc_scale, hc_base, group=2, offset=16)
-        row3_exp = hc_softmax_exp_math(mix_g3, inv_col_t, hc_scale, hc_base, group=2, offset=20)
-        row0_sum = pl.row_sum(row0_exp)
-        row1_sum = pl.row_sum(row1_exp)
-        row2_sum = pl.row_sum(row2_exp)
-        row3_sum = pl.row_sum(row3_exp)
-        hc_div1_zero = pl.sub(row0_exp, row0_exp)
-        hc_div1_den = pl.row_expand_add(hc_div1_zero, row0_sum)
-        hc_div1_q = pl.div(row0_exp, hc_div1_den)
-        hc_div1_as = pl.mul(hc_div1_q, 4097.0)
-        hc_div1_ad = pl.sub(hc_div1_as, hc_div1_q)
-        hc_div1_ah = pl.sub(hc_div1_as, hc_div1_ad)
-        hc_div1_al = pl.sub(hc_div1_q, hc_div1_ah)
-        hc_div1_bs = pl.mul(hc_div1_den, 4097.0)
-        hc_div1_bd = pl.sub(hc_div1_bs, hc_div1_den)
-        hc_div1_bh = pl.sub(hc_div1_bs, hc_div1_bd)
-        hc_div1_bl = pl.sub(hc_div1_den, hc_div1_bh)
-        hc_div1_prod = pl.mul(hc_div1_q, hc_div1_den)
-        hc_div1_hh = pl.mul(hc_div1_ah, hc_div1_bh)
-        hc_div1_e0 = pl.sub(hc_div1_hh, hc_div1_prod)
-        hc_div1_hl = pl.mul(hc_div1_ah, hc_div1_bl)
-        hc_div1_e1 = pl.add(hc_div1_e0, hc_div1_hl)
-        hc_div1_lh = pl.mul(hc_div1_al, hc_div1_bh)
-        hc_div1_e2 = pl.add(hc_div1_e1, hc_div1_lh)
-        hc_div1_ll = pl.mul(hc_div1_al, hc_div1_bl)
-        hc_div1_error = pl.add(hc_div1_e2, hc_div1_ll)
-        hc_div1_r0 = pl.sub(row0_exp, hc_div1_prod)
-        hc_div1_residual = pl.sub(hc_div1_r0, hc_div1_error)
-        hc_div1_correction = pl.div(hc_div1_residual, hc_div1_den)
-        hc_div1_fixed = pl.add(hc_div1_q, hc_div1_correction)
-        row0_soft = pl.add(hc_div1_fixed, HC_EPS)
-        hc_div2_zero = pl.sub(row1_exp, row1_exp)
-        hc_div2_den = pl.row_expand_add(hc_div2_zero, row1_sum)
-        hc_div2_q = pl.div(row1_exp, hc_div2_den)
-        hc_div2_as = pl.mul(hc_div2_q, 4097.0)
-        hc_div2_ad = pl.sub(hc_div2_as, hc_div2_q)
-        hc_div2_ah = pl.sub(hc_div2_as, hc_div2_ad)
-        hc_div2_al = pl.sub(hc_div2_q, hc_div2_ah)
-        hc_div2_bs = pl.mul(hc_div2_den, 4097.0)
-        hc_div2_bd = pl.sub(hc_div2_bs, hc_div2_den)
-        hc_div2_bh = pl.sub(hc_div2_bs, hc_div2_bd)
-        hc_div2_bl = pl.sub(hc_div2_den, hc_div2_bh)
-        hc_div2_prod = pl.mul(hc_div2_q, hc_div2_den)
-        hc_div2_hh = pl.mul(hc_div2_ah, hc_div2_bh)
-        hc_div2_e0 = pl.sub(hc_div2_hh, hc_div2_prod)
-        hc_div2_hl = pl.mul(hc_div2_ah, hc_div2_bl)
-        hc_div2_e1 = pl.add(hc_div2_e0, hc_div2_hl)
-        hc_div2_lh = pl.mul(hc_div2_al, hc_div2_bh)
-        hc_div2_e2 = pl.add(hc_div2_e1, hc_div2_lh)
-        hc_div2_ll = pl.mul(hc_div2_al, hc_div2_bl)
-        hc_div2_error = pl.add(hc_div2_e2, hc_div2_ll)
-        hc_div2_r0 = pl.sub(row1_exp, hc_div2_prod)
-        hc_div2_residual = pl.sub(hc_div2_r0, hc_div2_error)
-        hc_div2_correction = pl.div(hc_div2_residual, hc_div2_den)
-        hc_div2_fixed = pl.add(hc_div2_q, hc_div2_correction)
-        row1_soft = pl.add(hc_div2_fixed, HC_EPS)
-        hc_div3_zero = pl.sub(row2_exp, row2_exp)
-        hc_div3_den = pl.row_expand_add(hc_div3_zero, row2_sum)
-        hc_div3_q = pl.div(row2_exp, hc_div3_den)
-        hc_div3_as = pl.mul(hc_div3_q, 4097.0)
-        hc_div3_ad = pl.sub(hc_div3_as, hc_div3_q)
-        hc_div3_ah = pl.sub(hc_div3_as, hc_div3_ad)
-        hc_div3_al = pl.sub(hc_div3_q, hc_div3_ah)
-        hc_div3_bs = pl.mul(hc_div3_den, 4097.0)
-        hc_div3_bd = pl.sub(hc_div3_bs, hc_div3_den)
-        hc_div3_bh = pl.sub(hc_div3_bs, hc_div3_bd)
-        hc_div3_bl = pl.sub(hc_div3_den, hc_div3_bh)
-        hc_div3_prod = pl.mul(hc_div3_q, hc_div3_den)
-        hc_div3_hh = pl.mul(hc_div3_ah, hc_div3_bh)
-        hc_div3_e0 = pl.sub(hc_div3_hh, hc_div3_prod)
-        hc_div3_hl = pl.mul(hc_div3_ah, hc_div3_bl)
-        hc_div3_e1 = pl.add(hc_div3_e0, hc_div3_hl)
-        hc_div3_lh = pl.mul(hc_div3_al, hc_div3_bh)
-        hc_div3_e2 = pl.add(hc_div3_e1, hc_div3_lh)
-        hc_div3_ll = pl.mul(hc_div3_al, hc_div3_bl)
-        hc_div3_error = pl.add(hc_div3_e2, hc_div3_ll)
-        hc_div3_r0 = pl.sub(row2_exp, hc_div3_prod)
-        hc_div3_residual = pl.sub(hc_div3_r0, hc_div3_error)
-        hc_div3_correction = pl.div(hc_div3_residual, hc_div3_den)
-        hc_div3_fixed = pl.add(hc_div3_q, hc_div3_correction)
-        row2_soft = pl.add(hc_div3_fixed, HC_EPS)
-        hc_div4_zero = pl.sub(row3_exp, row3_exp)
-        hc_div4_den = pl.row_expand_add(hc_div4_zero, row3_sum)
-        hc_div4_q = pl.div(row3_exp, hc_div4_den)
-        hc_div4_as = pl.mul(hc_div4_q, 4097.0)
-        hc_div4_ad = pl.sub(hc_div4_as, hc_div4_q)
-        hc_div4_ah = pl.sub(hc_div4_as, hc_div4_ad)
-        hc_div4_al = pl.sub(hc_div4_q, hc_div4_ah)
-        hc_div4_bs = pl.mul(hc_div4_den, 4097.0)
-        hc_div4_bd = pl.sub(hc_div4_bs, hc_div4_den)
-        hc_div4_bh = pl.sub(hc_div4_bs, hc_div4_bd)
-        hc_div4_bl = pl.sub(hc_div4_den, hc_div4_bh)
-        hc_div4_prod = pl.mul(hc_div4_q, hc_div4_den)
-        hc_div4_hh = pl.mul(hc_div4_ah, hc_div4_bh)
-        hc_div4_e0 = pl.sub(hc_div4_hh, hc_div4_prod)
-        hc_div4_hl = pl.mul(hc_div4_ah, hc_div4_bl)
-        hc_div4_e1 = pl.add(hc_div4_e0, hc_div4_hl)
-        hc_div4_lh = pl.mul(hc_div4_al, hc_div4_bh)
-        hc_div4_e2 = pl.add(hc_div4_e1, hc_div4_lh)
-        hc_div4_ll = pl.mul(hc_div4_al, hc_div4_bl)
-        hc_div4_error = pl.add(hc_div4_e2, hc_div4_ll)
-        hc_div4_r0 = pl.sub(row3_exp, hc_div4_prod)
-        hc_div4_residual = pl.sub(hc_div4_r0, hc_div4_error)
-        hc_div4_correction = pl.div(hc_div4_residual, hc_div4_den)
-        hc_div4_fixed = pl.add(hc_div4_q, hc_div4_correction)
-        row3_soft = pl.add(hc_div4_fixed, HC_EPS)
-        row0_valid = pl.set_validshape(row0_soft, comb_rows, HC_MULT)
-        row1_valid = pl.set_validshape(row1_soft, comb_rows, HC_MULT)
-        row2_valid = pl.set_validshape(row2_soft, comb_rows, HC_MULT)
-        row3_valid = pl.set_validshape(row3_soft, comb_rows, HC_MULT)
+        inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
+        comb_off = HC_MULT * 2
+        mix_g0 = pl.load(
+            mixes_raw,
+            [t0, comb_off + 0 * HC_MULT],
+            [COMB_T_TILE, HC_PAD],
+            valid_shape=[COMB_T_TILE, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        mix_g1 = pl.load(
+            mixes_raw,
+            [t0, comb_off + 1 * HC_MULT],
+            [COMB_T_TILE, HC_PAD],
+            valid_shape=[COMB_T_TILE, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        mix_g2 = pl.load(
+            mixes_raw,
+            [t0, comb_off + 2 * HC_MULT],
+            [COMB_T_TILE, HC_PAD],
+            valid_shape=[COMB_T_TILE, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        mix_g3 = pl.load(
+            mixes_raw,
+            [t0, comb_off + 3 * HC_MULT],
+            [COMB_T_TILE, HC_PAD],
+            valid_shape=[COMB_T_TILE, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        cb0 = pl.load(
+            hc_base_2d,
+            [0, comb_off + 0 * HC_MULT],
+            [1, HC_PAD],
+            valid_shape=[1, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        cb1 = pl.load(
+            hc_base_2d,
+            [0, comb_off + 1 * HC_MULT],
+            [1, HC_PAD],
+            valid_shape=[1, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        cb2 = pl.load(
+            hc_base_2d,
+            [0, comb_off + 2 * HC_MULT],
+            [1, HC_PAD],
+            valid_shape=[1, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        cb3 = pl.load(
+            hc_base_2d,
+            [0, comb_off + 3 * HC_MULT],
+            [1, HC_PAD],
+            valid_shape=[1, HC_MULT],
+            target_memory=pl.MemorySpace.Vec,
+        )
+        row0 = pl.add(pl.mul(pl.row_expand_mul(mix_g0, inv_col_t), scale2), pl.col_expand(mix_g0, cb0))
+        row1 = pl.add(pl.mul(pl.row_expand_mul(mix_g1, inv_col_t), scale2), pl.col_expand(mix_g1, cb1))
+        row2 = pl.add(pl.mul(pl.row_expand_mul(mix_g2, inv_col_t), scale2), pl.col_expand(mix_g2, cb2))
+        row3 = pl.add(pl.mul(pl.row_expand_mul(mix_g3, inv_col_t), scale2), pl.col_expand(mix_g3, cb3))
+        row0_p = pl.fillpad(row0, pad_value=pl.PadValue.min)
+        row1_p = pl.fillpad(row1, pad_value=pl.PadValue.min)
+        row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
+        row3_p = pl.fillpad(row3, pad_value=pl.PadValue.min)
+
+        row_max_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row_sum_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row0_max = pl.row_max(row0_p, row_max_tmp)
+        row1_max = pl.row_max(row1_p, row_max_tmp)
+        row2_max = pl.row_max(row2_p, row_max_tmp)
+        row3_max = pl.row_max(row3_p, row_max_tmp)
+        row0_exp = pl.exp(pl.row_expand_sub(row0_p, row0_max))
+        row1_exp = pl.exp(pl.row_expand_sub(row1_p, row1_max))
+        row2_exp = pl.exp(pl.row_expand_sub(row2_p, row2_max))
+        row3_exp = pl.exp(pl.row_expand_sub(row3_p, row3_max))
+        row0_sum = pl.row_sum(row0_exp, row_sum_tmp)
+        row1_sum = pl.row_sum(row1_exp, row_sum_tmp)
+        row2_sum = pl.row_sum(row2_exp, row_sum_tmp)
+        row3_sum = pl.row_sum(row3_exp, row_sum_tmp)
+        row0_soft = pl.add(pl.row_expand_div(row0_exp, row0_sum), HC_EPS)
+        row1_soft = pl.add(pl.row_expand_div(row1_exp, row1_sum), HC_EPS)
+        row2_soft = pl.add(pl.row_expand_div(row2_exp, row2_sum), HC_EPS)
+        row3_soft = pl.add(pl.row_expand_div(row3_exp, row3_sum), HC_EPS)
+
+        row0_valid = pl.set_validshape(row0_soft, COMB_T_TILE, HC_MULT)
+        row1_valid = pl.set_validshape(row1_soft, COMB_T_TILE, HC_MULT)
+        row2_valid = pl.set_validshape(row2_soft, COMB_T_TILE, HC_MULT)
+        row3_valid = pl.set_validshape(row3_soft, COMB_T_TILE, HC_MULT)
         row0_eff = pl.fillpad(row0_valid, pad_value=pl.PadValue.zero)
         row1_eff = pl.fillpad(row1_valid, pad_value=pl.PadValue.zero)
         row2_eff = pl.fillpad(row2_valid, pad_value=pl.PadValue.zero)
         row3_eff = pl.fillpad(row3_valid, pad_value=pl.PadValue.zero)
+
+        row_sum_tmp_iter = pl.create_tile(
+            [COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+        )
         col_sum = pl.add(pl.add(row0_eff, row1_eff), pl.add(row2_eff, row3_eff))
         col_sum = pl.add(col_sum, HC_EPS)
-        hc_div5_q = pl.div(row0_eff, col_sum)
-        hc_div5_as = pl.mul(hc_div5_q, 4097.0)
-        hc_div5_ad = pl.sub(hc_div5_as, hc_div5_q)
-        hc_div5_ah = pl.sub(hc_div5_as, hc_div5_ad)
-        hc_div5_al = pl.sub(hc_div5_q, hc_div5_ah)
-        hc_div5_bs = pl.mul(col_sum, 4097.0)
-        hc_div5_bd = pl.sub(hc_div5_bs, col_sum)
-        hc_div5_bh = pl.sub(hc_div5_bs, hc_div5_bd)
-        hc_div5_bl = pl.sub(col_sum, hc_div5_bh)
-        hc_div5_prod = pl.mul(hc_div5_q, col_sum)
-        hc_div5_hh = pl.mul(hc_div5_ah, hc_div5_bh)
-        hc_div5_e0 = pl.sub(hc_div5_hh, hc_div5_prod)
-        hc_div5_hl = pl.mul(hc_div5_ah, hc_div5_bl)
-        hc_div5_e1 = pl.add(hc_div5_e0, hc_div5_hl)
-        hc_div5_lh = pl.mul(hc_div5_al, hc_div5_bh)
-        hc_div5_e2 = pl.add(hc_div5_e1, hc_div5_lh)
-        hc_div5_ll = pl.mul(hc_div5_al, hc_div5_bl)
-        hc_div5_error = pl.add(hc_div5_e2, hc_div5_ll)
-        hc_div5_r0 = pl.sub(row0_eff, hc_div5_prod)
-        hc_div5_residual = pl.sub(hc_div5_r0, hc_div5_error)
-        hc_div5_correction = pl.div(hc_div5_residual, col_sum)
-        hc_div5_fixed = pl.add(hc_div5_q, hc_div5_correction)
-        row0_cur = hc_div5_fixed
-        hc_div6_q = pl.div(row1_eff, col_sum)
-        hc_div6_as = pl.mul(hc_div6_q, 4097.0)
-        hc_div6_ad = pl.sub(hc_div6_as, hc_div6_q)
-        hc_div6_ah = pl.sub(hc_div6_as, hc_div6_ad)
-        hc_div6_al = pl.sub(hc_div6_q, hc_div6_ah)
-        hc_div6_bs = pl.mul(col_sum, 4097.0)
-        hc_div6_bd = pl.sub(hc_div6_bs, col_sum)
-        hc_div6_bh = pl.sub(hc_div6_bs, hc_div6_bd)
-        hc_div6_bl = pl.sub(col_sum, hc_div6_bh)
-        hc_div6_prod = pl.mul(hc_div6_q, col_sum)
-        hc_div6_hh = pl.mul(hc_div6_ah, hc_div6_bh)
-        hc_div6_e0 = pl.sub(hc_div6_hh, hc_div6_prod)
-        hc_div6_hl = pl.mul(hc_div6_ah, hc_div6_bl)
-        hc_div6_e1 = pl.add(hc_div6_e0, hc_div6_hl)
-        hc_div6_lh = pl.mul(hc_div6_al, hc_div6_bh)
-        hc_div6_e2 = pl.add(hc_div6_e1, hc_div6_lh)
-        hc_div6_ll = pl.mul(hc_div6_al, hc_div6_bl)
-        hc_div6_error = pl.add(hc_div6_e2, hc_div6_ll)
-        hc_div6_r0 = pl.sub(row1_eff, hc_div6_prod)
-        hc_div6_residual = pl.sub(hc_div6_r0, hc_div6_error)
-        hc_div6_correction = pl.div(hc_div6_residual, col_sum)
-        hc_div6_fixed = pl.add(hc_div6_q, hc_div6_correction)
-        row1_cur = hc_div6_fixed
-        hc_div7_q = pl.div(row2_eff, col_sum)
-        hc_div7_as = pl.mul(hc_div7_q, 4097.0)
-        hc_div7_ad = pl.sub(hc_div7_as, hc_div7_q)
-        hc_div7_ah = pl.sub(hc_div7_as, hc_div7_ad)
-        hc_div7_al = pl.sub(hc_div7_q, hc_div7_ah)
-        hc_div7_bs = pl.mul(col_sum, 4097.0)
-        hc_div7_bd = pl.sub(hc_div7_bs, col_sum)
-        hc_div7_bh = pl.sub(hc_div7_bs, hc_div7_bd)
-        hc_div7_bl = pl.sub(col_sum, hc_div7_bh)
-        hc_div7_prod = pl.mul(hc_div7_q, col_sum)
-        hc_div7_hh = pl.mul(hc_div7_ah, hc_div7_bh)
-        hc_div7_e0 = pl.sub(hc_div7_hh, hc_div7_prod)
-        hc_div7_hl = pl.mul(hc_div7_ah, hc_div7_bl)
-        hc_div7_e1 = pl.add(hc_div7_e0, hc_div7_hl)
-        hc_div7_lh = pl.mul(hc_div7_al, hc_div7_bh)
-        hc_div7_e2 = pl.add(hc_div7_e1, hc_div7_lh)
-        hc_div7_ll = pl.mul(hc_div7_al, hc_div7_bl)
-        hc_div7_error = pl.add(hc_div7_e2, hc_div7_ll)
-        hc_div7_r0 = pl.sub(row2_eff, hc_div7_prod)
-        hc_div7_residual = pl.sub(hc_div7_r0, hc_div7_error)
-        hc_div7_correction = pl.div(hc_div7_residual, col_sum)
-        hc_div7_fixed = pl.add(hc_div7_q, hc_div7_correction)
-        row2_cur = hc_div7_fixed
-        hc_div8_q = pl.div(row3_eff, col_sum)
-        hc_div8_as = pl.mul(hc_div8_q, 4097.0)
-        hc_div8_ad = pl.sub(hc_div8_as, hc_div8_q)
-        hc_div8_ah = pl.sub(hc_div8_as, hc_div8_ad)
-        hc_div8_al = pl.sub(hc_div8_q, hc_div8_ah)
-        hc_div8_bs = pl.mul(col_sum, 4097.0)
-        hc_div8_bd = pl.sub(hc_div8_bs, col_sum)
-        hc_div8_bh = pl.sub(hc_div8_bs, hc_div8_bd)
-        hc_div8_bl = pl.sub(col_sum, hc_div8_bh)
-        hc_div8_prod = pl.mul(hc_div8_q, col_sum)
-        hc_div8_hh = pl.mul(hc_div8_ah, hc_div8_bh)
-        hc_div8_e0 = pl.sub(hc_div8_hh, hc_div8_prod)
-        hc_div8_hl = pl.mul(hc_div8_ah, hc_div8_bl)
-        hc_div8_e1 = pl.add(hc_div8_e0, hc_div8_hl)
-        hc_div8_lh = pl.mul(hc_div8_al, hc_div8_bh)
-        hc_div8_e2 = pl.add(hc_div8_e1, hc_div8_lh)
-        hc_div8_ll = pl.mul(hc_div8_al, hc_div8_bl)
-        hc_div8_error = pl.add(hc_div8_e2, hc_div8_ll)
-        hc_div8_r0 = pl.sub(row3_eff, hc_div8_prod)
-        hc_div8_residual = pl.sub(hc_div8_r0, hc_div8_error)
-        hc_div8_correction = pl.div(hc_div8_residual, col_sum)
-        hc_div8_fixed = pl.add(hc_div8_q, hc_div8_correction)
-        row3_cur = hc_div8_fixed
+        row0_cur = pl.div(row0_eff, col_sum)
+        row1_cur = pl.div(row1_eff, col_sum)
+        row2_cur = pl.div(row2_eff, col_sum)
+        row3_cur = pl.div(row3_eff, col_sum)
+
         for _sk_it in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
-            row0_rowsum = pl.add(pl.row_sum(row0_cur), HC_EPS)
-            row1_rowsum = pl.add(pl.row_sum(row1_cur), HC_EPS)
-            row2_rowsum = pl.add(pl.row_sum(row2_cur), HC_EPS)
-            row3_rowsum = pl.add(pl.row_sum(row3_cur), HC_EPS)
-            hc_div9_zero = pl.sub(row0_cur, row0_cur)
-            hc_div9_den = pl.row_expand_add(hc_div9_zero, row0_rowsum)
-            hc_div9_q = pl.div(row0_cur, hc_div9_den)
-            hc_div9_as = pl.mul(hc_div9_q, 4097.0)
-            hc_div9_ad = pl.sub(hc_div9_as, hc_div9_q)
-            hc_div9_ah = pl.sub(hc_div9_as, hc_div9_ad)
-            hc_div9_al = pl.sub(hc_div9_q, hc_div9_ah)
-            hc_div9_bs = pl.mul(hc_div9_den, 4097.0)
-            hc_div9_bd = pl.sub(hc_div9_bs, hc_div9_den)
-            hc_div9_bh = pl.sub(hc_div9_bs, hc_div9_bd)
-            hc_div9_bl = pl.sub(hc_div9_den, hc_div9_bh)
-            hc_div9_prod = pl.mul(hc_div9_q, hc_div9_den)
-            hc_div9_hh = pl.mul(hc_div9_ah, hc_div9_bh)
-            hc_div9_e0 = pl.sub(hc_div9_hh, hc_div9_prod)
-            hc_div9_hl = pl.mul(hc_div9_ah, hc_div9_bl)
-            hc_div9_e1 = pl.add(hc_div9_e0, hc_div9_hl)
-            hc_div9_lh = pl.mul(hc_div9_al, hc_div9_bh)
-            hc_div9_e2 = pl.add(hc_div9_e1, hc_div9_lh)
-            hc_div9_ll = pl.mul(hc_div9_al, hc_div9_bl)
-            hc_div9_error = pl.add(hc_div9_e2, hc_div9_ll)
-            hc_div9_r0 = pl.sub(row0_cur, hc_div9_prod)
-            hc_div9_residual = pl.sub(hc_div9_r0, hc_div9_error)
-            hc_div9_correction = pl.div(hc_div9_residual, hc_div9_den)
-            hc_div9_fixed = pl.add(hc_div9_q, hc_div9_correction)
-            row0_norm = hc_div9_fixed
-            hc_div10_zero = pl.sub(row1_cur, row1_cur)
-            hc_div10_den = pl.row_expand_add(hc_div10_zero, row1_rowsum)
-            hc_div10_q = pl.div(row1_cur, hc_div10_den)
-            hc_div10_as = pl.mul(hc_div10_q, 4097.0)
-            hc_div10_ad = pl.sub(hc_div10_as, hc_div10_q)
-            hc_div10_ah = pl.sub(hc_div10_as, hc_div10_ad)
-            hc_div10_al = pl.sub(hc_div10_q, hc_div10_ah)
-            hc_div10_bs = pl.mul(hc_div10_den, 4097.0)
-            hc_div10_bd = pl.sub(hc_div10_bs, hc_div10_den)
-            hc_div10_bh = pl.sub(hc_div10_bs, hc_div10_bd)
-            hc_div10_bl = pl.sub(hc_div10_den, hc_div10_bh)
-            hc_div10_prod = pl.mul(hc_div10_q, hc_div10_den)
-            hc_div10_hh = pl.mul(hc_div10_ah, hc_div10_bh)
-            hc_div10_e0 = pl.sub(hc_div10_hh, hc_div10_prod)
-            hc_div10_hl = pl.mul(hc_div10_ah, hc_div10_bl)
-            hc_div10_e1 = pl.add(hc_div10_e0, hc_div10_hl)
-            hc_div10_lh = pl.mul(hc_div10_al, hc_div10_bh)
-            hc_div10_e2 = pl.add(hc_div10_e1, hc_div10_lh)
-            hc_div10_ll = pl.mul(hc_div10_al, hc_div10_bl)
-            hc_div10_error = pl.add(hc_div10_e2, hc_div10_ll)
-            hc_div10_r0 = pl.sub(row1_cur, hc_div10_prod)
-            hc_div10_residual = pl.sub(hc_div10_r0, hc_div10_error)
-            hc_div10_correction = pl.div(hc_div10_residual, hc_div10_den)
-            hc_div10_fixed = pl.add(hc_div10_q, hc_div10_correction)
-            row1_norm = hc_div10_fixed
-            hc_div11_zero = pl.sub(row2_cur, row2_cur)
-            hc_div11_den = pl.row_expand_add(hc_div11_zero, row2_rowsum)
-            hc_div11_q = pl.div(row2_cur, hc_div11_den)
-            hc_div11_as = pl.mul(hc_div11_q, 4097.0)
-            hc_div11_ad = pl.sub(hc_div11_as, hc_div11_q)
-            hc_div11_ah = pl.sub(hc_div11_as, hc_div11_ad)
-            hc_div11_al = pl.sub(hc_div11_q, hc_div11_ah)
-            hc_div11_bs = pl.mul(hc_div11_den, 4097.0)
-            hc_div11_bd = pl.sub(hc_div11_bs, hc_div11_den)
-            hc_div11_bh = pl.sub(hc_div11_bs, hc_div11_bd)
-            hc_div11_bl = pl.sub(hc_div11_den, hc_div11_bh)
-            hc_div11_prod = pl.mul(hc_div11_q, hc_div11_den)
-            hc_div11_hh = pl.mul(hc_div11_ah, hc_div11_bh)
-            hc_div11_e0 = pl.sub(hc_div11_hh, hc_div11_prod)
-            hc_div11_hl = pl.mul(hc_div11_ah, hc_div11_bl)
-            hc_div11_e1 = pl.add(hc_div11_e0, hc_div11_hl)
-            hc_div11_lh = pl.mul(hc_div11_al, hc_div11_bh)
-            hc_div11_e2 = pl.add(hc_div11_e1, hc_div11_lh)
-            hc_div11_ll = pl.mul(hc_div11_al, hc_div11_bl)
-            hc_div11_error = pl.add(hc_div11_e2, hc_div11_ll)
-            hc_div11_r0 = pl.sub(row2_cur, hc_div11_prod)
-            hc_div11_residual = pl.sub(hc_div11_r0, hc_div11_error)
-            hc_div11_correction = pl.div(hc_div11_residual, hc_div11_den)
-            hc_div11_fixed = pl.add(hc_div11_q, hc_div11_correction)
-            row2_norm = hc_div11_fixed
-            hc_div12_zero = pl.sub(row3_cur, row3_cur)
-            hc_div12_den = pl.row_expand_add(hc_div12_zero, row3_rowsum)
-            hc_div12_q = pl.div(row3_cur, hc_div12_den)
-            hc_div12_as = pl.mul(hc_div12_q, 4097.0)
-            hc_div12_ad = pl.sub(hc_div12_as, hc_div12_q)
-            hc_div12_ah = pl.sub(hc_div12_as, hc_div12_ad)
-            hc_div12_al = pl.sub(hc_div12_q, hc_div12_ah)
-            hc_div12_bs = pl.mul(hc_div12_den, 4097.0)
-            hc_div12_bd = pl.sub(hc_div12_bs, hc_div12_den)
-            hc_div12_bh = pl.sub(hc_div12_bs, hc_div12_bd)
-            hc_div12_bl = pl.sub(hc_div12_den, hc_div12_bh)
-            hc_div12_prod = pl.mul(hc_div12_q, hc_div12_den)
-            hc_div12_hh = pl.mul(hc_div12_ah, hc_div12_bh)
-            hc_div12_e0 = pl.sub(hc_div12_hh, hc_div12_prod)
-            hc_div12_hl = pl.mul(hc_div12_ah, hc_div12_bl)
-            hc_div12_e1 = pl.add(hc_div12_e0, hc_div12_hl)
-            hc_div12_lh = pl.mul(hc_div12_al, hc_div12_bh)
-            hc_div12_e2 = pl.add(hc_div12_e1, hc_div12_lh)
-            hc_div12_ll = pl.mul(hc_div12_al, hc_div12_bl)
-            hc_div12_error = pl.add(hc_div12_e2, hc_div12_ll)
-            hc_div12_r0 = pl.sub(row3_cur, hc_div12_prod)
-            hc_div12_residual = pl.sub(hc_div12_r0, hc_div12_error)
-            hc_div12_correction = pl.div(hc_div12_residual, hc_div12_den)
-            hc_div12_fixed = pl.add(hc_div12_q, hc_div12_correction)
-            row3_norm = hc_div12_fixed
+            row0_rowsum = pl.add(pl.row_sum(row0_cur, row_sum_tmp_iter), HC_EPS)
+            row1_rowsum = pl.add(pl.row_sum(row1_cur, row_sum_tmp_iter), HC_EPS)
+            row2_rowsum = pl.add(pl.row_sum(row2_cur, row_sum_tmp_iter), HC_EPS)
+            row3_rowsum = pl.add(pl.row_sum(row3_cur, row_sum_tmp_iter), HC_EPS)
+            row0_norm = pl.row_expand_div(row0_cur, row0_rowsum)
+            row1_norm = pl.row_expand_div(row1_cur, row1_rowsum)
+            row2_norm = pl.row_expand_div(row2_cur, row2_rowsum)
+            row3_norm = pl.row_expand_div(row3_cur, row3_rowsum)
             col_sum = pl.add(pl.add(row0_norm, row1_norm), pl.add(row2_norm, row3_norm))
             col_sum = pl.add(col_sum, HC_EPS)
-            hc_div13_q = pl.div(row0_norm, col_sum)
-            hc_div13_as = pl.mul(hc_div13_q, 4097.0)
-            hc_div13_ad = pl.sub(hc_div13_as, hc_div13_q)
-            hc_div13_ah = pl.sub(hc_div13_as, hc_div13_ad)
-            hc_div13_al = pl.sub(hc_div13_q, hc_div13_ah)
-            hc_div13_bs = pl.mul(col_sum, 4097.0)
-            hc_div13_bd = pl.sub(hc_div13_bs, col_sum)
-            hc_div13_bh = pl.sub(hc_div13_bs, hc_div13_bd)
-            hc_div13_bl = pl.sub(col_sum, hc_div13_bh)
-            hc_div13_prod = pl.mul(hc_div13_q, col_sum)
-            hc_div13_hh = pl.mul(hc_div13_ah, hc_div13_bh)
-            hc_div13_e0 = pl.sub(hc_div13_hh, hc_div13_prod)
-            hc_div13_hl = pl.mul(hc_div13_ah, hc_div13_bl)
-            hc_div13_e1 = pl.add(hc_div13_e0, hc_div13_hl)
-            hc_div13_lh = pl.mul(hc_div13_al, hc_div13_bh)
-            hc_div13_e2 = pl.add(hc_div13_e1, hc_div13_lh)
-            hc_div13_ll = pl.mul(hc_div13_al, hc_div13_bl)
-            hc_div13_error = pl.add(hc_div13_e2, hc_div13_ll)
-            hc_div13_r0 = pl.sub(row0_norm, hc_div13_prod)
-            hc_div13_residual = pl.sub(hc_div13_r0, hc_div13_error)
-            hc_div13_correction = pl.div(hc_div13_residual, col_sum)
-            hc_div13_fixed = pl.add(hc_div13_q, hc_div13_correction)
-            row0_cur = hc_div13_fixed
-            hc_div14_q = pl.div(row1_norm, col_sum)
-            hc_div14_as = pl.mul(hc_div14_q, 4097.0)
-            hc_div14_ad = pl.sub(hc_div14_as, hc_div14_q)
-            hc_div14_ah = pl.sub(hc_div14_as, hc_div14_ad)
-            hc_div14_al = pl.sub(hc_div14_q, hc_div14_ah)
-            hc_div14_bs = pl.mul(col_sum, 4097.0)
-            hc_div14_bd = pl.sub(hc_div14_bs, col_sum)
-            hc_div14_bh = pl.sub(hc_div14_bs, hc_div14_bd)
-            hc_div14_bl = pl.sub(col_sum, hc_div14_bh)
-            hc_div14_prod = pl.mul(hc_div14_q, col_sum)
-            hc_div14_hh = pl.mul(hc_div14_ah, hc_div14_bh)
-            hc_div14_e0 = pl.sub(hc_div14_hh, hc_div14_prod)
-            hc_div14_hl = pl.mul(hc_div14_ah, hc_div14_bl)
-            hc_div14_e1 = pl.add(hc_div14_e0, hc_div14_hl)
-            hc_div14_lh = pl.mul(hc_div14_al, hc_div14_bh)
-            hc_div14_e2 = pl.add(hc_div14_e1, hc_div14_lh)
-            hc_div14_ll = pl.mul(hc_div14_al, hc_div14_bl)
-            hc_div14_error = pl.add(hc_div14_e2, hc_div14_ll)
-            hc_div14_r0 = pl.sub(row1_norm, hc_div14_prod)
-            hc_div14_residual = pl.sub(hc_div14_r0, hc_div14_error)
-            hc_div14_correction = pl.div(hc_div14_residual, col_sum)
-            hc_div14_fixed = pl.add(hc_div14_q, hc_div14_correction)
-            row1_cur = hc_div14_fixed
-            hc_div15_q = pl.div(row2_norm, col_sum)
-            hc_div15_as = pl.mul(hc_div15_q, 4097.0)
-            hc_div15_ad = pl.sub(hc_div15_as, hc_div15_q)
-            hc_div15_ah = pl.sub(hc_div15_as, hc_div15_ad)
-            hc_div15_al = pl.sub(hc_div15_q, hc_div15_ah)
-            hc_div15_bs = pl.mul(col_sum, 4097.0)
-            hc_div15_bd = pl.sub(hc_div15_bs, col_sum)
-            hc_div15_bh = pl.sub(hc_div15_bs, hc_div15_bd)
-            hc_div15_bl = pl.sub(col_sum, hc_div15_bh)
-            hc_div15_prod = pl.mul(hc_div15_q, col_sum)
-            hc_div15_hh = pl.mul(hc_div15_ah, hc_div15_bh)
-            hc_div15_e0 = pl.sub(hc_div15_hh, hc_div15_prod)
-            hc_div15_hl = pl.mul(hc_div15_ah, hc_div15_bl)
-            hc_div15_e1 = pl.add(hc_div15_e0, hc_div15_hl)
-            hc_div15_lh = pl.mul(hc_div15_al, hc_div15_bh)
-            hc_div15_e2 = pl.add(hc_div15_e1, hc_div15_lh)
-            hc_div15_ll = pl.mul(hc_div15_al, hc_div15_bl)
-            hc_div15_error = pl.add(hc_div15_e2, hc_div15_ll)
-            hc_div15_r0 = pl.sub(row2_norm, hc_div15_prod)
-            hc_div15_residual = pl.sub(hc_div15_r0, hc_div15_error)
-            hc_div15_correction = pl.div(hc_div15_residual, col_sum)
-            hc_div15_fixed = pl.add(hc_div15_q, hc_div15_correction)
-            row2_cur = hc_div15_fixed
-            hc_div16_q = pl.div(row3_norm, col_sum)
-            hc_div16_as = pl.mul(hc_div16_q, 4097.0)
-            hc_div16_ad = pl.sub(hc_div16_as, hc_div16_q)
-            hc_div16_ah = pl.sub(hc_div16_as, hc_div16_ad)
-            hc_div16_al = pl.sub(hc_div16_q, hc_div16_ah)
-            hc_div16_bs = pl.mul(col_sum, 4097.0)
-            hc_div16_bd = pl.sub(hc_div16_bs, col_sum)
-            hc_div16_bh = pl.sub(hc_div16_bs, hc_div16_bd)
-            hc_div16_bl = pl.sub(col_sum, hc_div16_bh)
-            hc_div16_prod = pl.mul(hc_div16_q, col_sum)
-            hc_div16_hh = pl.mul(hc_div16_ah, hc_div16_bh)
-            hc_div16_e0 = pl.sub(hc_div16_hh, hc_div16_prod)
-            hc_div16_hl = pl.mul(hc_div16_ah, hc_div16_bl)
-            hc_div16_e1 = pl.add(hc_div16_e0, hc_div16_hl)
-            hc_div16_lh = pl.mul(hc_div16_al, hc_div16_bh)
-            hc_div16_e2 = pl.add(hc_div16_e1, hc_div16_lh)
-            hc_div16_ll = pl.mul(hc_div16_al, hc_div16_bl)
-            hc_div16_error = pl.add(hc_div16_e2, hc_div16_ll)
-            hc_div16_r0 = pl.sub(row3_norm, hc_div16_prod)
-            hc_div16_residual = pl.sub(hc_div16_r0, hc_div16_error)
-            hc_div16_correction = pl.div(hc_div16_residual, col_sum)
-            hc_div16_fixed = pl.add(hc_div16_q, hc_div16_correction)
-            row3_cur = hc_div16_fixed
+            row0_cur = pl.div(row0_norm, col_sum)
+            row1_cur = pl.div(row1_norm, col_sum)
+            row2_cur = pl.div(row2_norm, col_sum)
+            row3_cur = pl.div(row3_norm, col_sum)
+
         row0_out = pl.set_validshape(row0_cur, comb_rows, HC_MULT)
         row1_out = pl.set_validshape(row1_cur, comb_rows, HC_MULT)
         row2_out = pl.set_validshape(row2_cur, comb_rows, HC_MULT)
         row3_out = pl.set_validshape(row3_cur, comb_rows, HC_MULT)
-        row0_write = pl.slice(row0_out, [COMB_T_TILE, HC_PAD], [0, 0], valid_shape=[comb_rows, HC_MULT])
-        comb[t0 : t0 + COMB_T_TILE, 0 * HC_MULT : (0 + 1) * HC_MULT] = row0_write
-        row1_write = pl.slice(row1_out, [COMB_T_TILE, HC_PAD], [0, 0], valid_shape=[comb_rows, HC_MULT])
-        comb[t0 : t0 + COMB_T_TILE, 1 * HC_MULT : (1 + 1) * HC_MULT] = row1_write
-        row2_write = pl.slice(row2_out, [COMB_T_TILE, HC_PAD], [0, 0], valid_shape=[comb_rows, HC_MULT])
-        comb[t0 : t0 + COMB_T_TILE, 2 * HC_MULT : (2 + 1) * HC_MULT] = row2_write
-        row3_write = pl.slice(row3_out, [COMB_T_TILE, HC_PAD], [0, 0], valid_shape=[comb_rows, HC_MULT])
-        comb[t0 : t0 + COMB_T_TILE, 3 * HC_MULT : (3 + 1) * HC_MULT] = row3_write
+        pl.store(row0_out, [t0, 0 * HC_MULT], comb)
+        pl.store(row1_out, [t0, 1 * HC_MULT], comb)
+        pl.store(row2_out, [t0, 2 * HC_MULT], comb)
+        pl.store(row3_out, [t0, 3 * HC_MULT], comb)
+
+    # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D/D_SPMD blocks per token tile.
     for blk in pl.spmd(
-        (t_dim + T_TILE - 1) // T_TILE * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True
+        ((t_dim + T_TILE - 1) // T_TILE) * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True
     ):
-        t0 = blk // (D // D_SPMD) * T_TILE
+        t0 = (blk // (D // D_SPMD)) * T_TILE
+        d_base = (blk % (D // D_SPMD)) * D_SPMD
         mix_rows = pl.min(T_TILE, t_dim - t0)
-        d_base = blk % (D // D_SPMD) * D_SPMD
-        pre_tile = pl.slice(pre_val_store, [T_TILE, HC_PAD], [t0, 0], valid_shape=[mix_rows, HC_PAD])
-        pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
+        pre_tile_t = pl.transpose(pre_val_store[t0 : t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
         pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
         pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
         pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
         pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
-        pre0_valid = pl.set_validshape(pre0, mix_rows, 1)
-        pre1_valid = pl.set_validshape(pre1, mix_rows, 1)
-        pre2_valid = pl.set_validshape(pre2, mix_rows, 1)
-        pre3_valid = pl.set_validshape(pre3, mix_rows, 1)
         for db in pl.pipeline(D_SPMD // D_TILE, stage=2):
             d0 = d_base + db * D_TILE
             x0 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 0 * D + d0], valid_shape=[mix_rows, D_TILE])
             x1 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 1 * D + d0], valid_shape=[mix_rows, D_TILE])
             x2 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 2 * D + d0], valid_shape=[mix_rows, D_TILE])
             x3 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 3 * D + d0], valid_shape=[mix_rows, D_TILE])
-            y0 = pl.row_expand_mul(x0, pre0_valid)
-            y1 = pl.row_expand_mul(x1, pre1_valid)
-            y2 = pl.row_expand_mul(x2, pre2_valid)
-            y3 = pl.row_expand_mul(x3, pre3_valid)
+            y0 = pl.row_expand_mul(x0, pre0)
+            y1 = pl.row_expand_mul(x1, pre1)
+            y2 = pl.row_expand_mul(x2, pre2)
+            y3 = pl.row_expand_mul(x3, pre3)
             y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
             y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-            mixed_valid = pl.set_validshape(y_bf16, mix_rows, D_TILE)
-            x_mixed[t0 : t0 + T_TILE, d0 : d0 + D_TILE] = mixed_valid
+            x_mixed[t0 : t0 + T_TILE, d0 : d0 + D_TILE] = pl.set_validshape(y_bf16, mix_rows, D_TILE)
     return x_mixed
 
 
@@ -726,7 +377,11 @@ def _golden_a2a3_cube_linear(x_flat_2d, hc_fn):
 def golden_hc_pre(tensors):
     """Torch reference matching the target HC-pre reduction and nonlinearities."""
     import torch
-    from utils import fp32_matmul_fp32
+
+    if __package__:
+        from .utils import fp32_matmul_fp32
+    else:
+        from utils import fp32_matmul_fp32
 
     x = tensors["x"].float()
     hc_fn = tensors["hc_fn"].float()

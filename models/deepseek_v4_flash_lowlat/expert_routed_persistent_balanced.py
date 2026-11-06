@@ -19,13 +19,26 @@ regions; intermediate activations stay on chip.
 
 
 import pypto.language as pl
-from fp32_numerics import rne_exp_signed
-
-from config import (INT8_SCALE_MAX, INT8_AMAX_EPS)
-from expert_routed import (
-    D, IDX_PAD, MOE_INTER, N_BANK, N_SLOTS_B, RECV_MAX, RECV_TILE, SWIGLU_LIMIT,
-    build_tensor_specs, golden_expert_routed, compare_recv_y,
-)
+if __package__:
+    from .config import INT8_SCALE_MAX, INT8_AMAX_EPS
+else:
+    from config import INT8_SCALE_MAX, INT8_AMAX_EPS
+if __package__:
+    from .expert_routed import (
+        D,
+        IDX_PAD,
+        MOE_INTER,
+        N_BANK,
+        N_SLOTS_B,
+        RECV_MAX,
+        RECV_TILE,
+        SWIGLU_LIMIT,
+        build_tensor_specs,
+        golden_expert_routed,
+        compare_recv_y,
+    )
+else:
+    from expert_routed import D, IDX_PAD, MOE_INTER, N_BANK, N_SLOTS_B, RECV_MAX, RECV_TILE, SWIGLU_LIMIT, build_tensor_specs, golden_expert_routed, compare_recv_y
 
 
 # Persistent blocks == the a2a3 AIC count. No barrier lives in this kernel, so a
@@ -149,7 +162,6 @@ def expert_routed_persistent_planned(
                             [ROW_HALF, 1])
                         gate_sh = pl.aiv_shard(gate_acc)
                         up_sh = pl.aiv_shard(up_acc)
-                        gate_f = pl.create_tensor([ROW_HALF, FUSED_N_TILE], dtype=pl.FP32)
                         gate_f = pl.cast(gate_sh, target_type=pl.FP32, mode="none")
                         up_f = pl.cast(up_sh, target_type=pl.FP32, mode="none")
                         gate_f = pl.col_expand_mul(pl.row_expand_mul(gate_f, x_sc), w1_sc)
@@ -157,46 +169,7 @@ def expert_routed_persistent_planned(
                         if SWIGLU_LIMIT > 0.0:
                             gate_f = pl.minimum(gate_f, SWIGLU_LIMIT)
                             up_f = pl.maximum(pl.minimum(up_f, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                        sg_fix_exponential = rne_exp_signed(
-                            gate_f, rows=ROW_HALF, cols=FUSED_N_TILE,
-                            safe_zero=False, negate=True,
-                        )
-                        sg_fix_denominator = pl.add(sg_fix_exponential, 1.0)
-                        sg_fix_original = pl.recip(sg_fix_denominator)
-                        sg_fix_bounded = pl.minimum(sg_fix_denominator, 4294967296.0)
-                        sg_fix_estimate = sg_fix_original
-                        sg_fix_product = sg_fix_estimate
-                        sg_fix_error = sg_fix_estimate
-                        sg_fix_a_split = pl.mul(sg_fix_estimate, 4097.0)
-                        sg_fix_a_delta = pl.sub(sg_fix_a_split, sg_fix_estimate)
-                        sg_fix_a_hi = pl.sub(sg_fix_a_split, sg_fix_a_delta)
-                        sg_fix_a_lo = pl.sub(sg_fix_estimate, sg_fix_a_hi)
-                        sg_fix_b_split = pl.mul(sg_fix_bounded, 4097.0)
-                        sg_fix_b_delta = pl.sub(sg_fix_b_split, sg_fix_bounded)
-                        sg_fix_b_hi = pl.sub(sg_fix_b_split, sg_fix_b_delta)
-                        sg_fix_b_lo = pl.sub(sg_fix_bounded, sg_fix_b_hi)
-                        sg_fix_product = pl.mul(sg_fix_estimate, sg_fix_bounded)
-                        sg_fix_high_product = pl.mul(sg_fix_a_hi, sg_fix_b_hi)
-                        sg_fix_error = pl.sub(sg_fix_high_product, sg_fix_product)
-                        sg_fix_high_low = pl.mul(sg_fix_a_hi, sg_fix_b_lo)
-                        sg_fix_error = pl.add(sg_fix_error, sg_fix_high_low)
-                        sg_fix_low_high = pl.mul(sg_fix_a_lo, sg_fix_b_hi)
-                        sg_fix_error = pl.add(sg_fix_error, sg_fix_low_high)
-                        sg_fix_low_product = pl.mul(sg_fix_a_lo, sg_fix_b_lo)
-                        sg_fix_error = pl.add(sg_fix_error, sg_fix_low_product)
-                        sg_fix_one = pl.full([ROW_HALF, MOE_INTER], dtype=pl.FP32, value=1.0)
-                        sg_fix_residual_hi = pl.sub(sg_fix_one, sg_fix_product)
-                        sg_fix_residual = pl.sub(sg_fix_residual_hi, sg_fix_error)
-                        sg_fix_correction = pl.div(sg_fix_residual, sg_fix_bounded)
-                        sg_fix_corrected = pl.add(sg_fix_estimate, sg_fix_correction)
-                        sg_fix_overflow = pl.sub(sg_fix_denominator, 4294967296.0)
-                        sg_fix_overflow = pl.mul(sg_fix_overflow, 0.001953125)
-                        sg_fix_overflow = pl.minimum(pl.maximum(sg_fix_overflow, 0.0), 1.0)
-                        sg_fix_inside = pl.sub(sg_fix_one, sg_fix_overflow)
-                        sg_fix_fixed_inside = pl.mul(sg_fix_corrected, sg_fix_inside)
-                        sg_fix_retained = pl.mul(sg_fix_original, sg_fix_overflow)
-                        sg_fix_fixed = pl.add(sg_fix_fixed_inside, sg_fix_retained)
-                        sigmoid = sg_fix_fixed
+                        sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_f)), 1.0))
                         h_raw = pl.mul(pl.mul(gate_f, sigmoid), up_f)
                         # valid_shape rides the matmul's A operand through the c2v push
                         # and the per-lane pop, so h_raw already carries this lane's
@@ -211,57 +184,10 @@ def expert_routed_persistent_planned(
                             pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_AMAX_EPS),
                             pl.reshape(pl.row_max(h_abs), [1, ROW_HALF]),
                         )
-                        qd_epb_numerator = pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_SCALE_MAX)
-                        qd_epb_work = pl.mul(h_amax, 5.421010862427522e-20)
-                        qd_epb_estimate = pl.div(qd_epb_numerator, qd_epb_work)
-                        qd_epb_left_split = pl.mul(qd_epb_estimate, 4097.0)
-                        qd_epb_left_delta = pl.sub(qd_epb_left_split, qd_epb_estimate)
-                        qd_epb_left_hi = pl.sub(qd_epb_left_split, qd_epb_left_delta)
-                        qd_epb_left_lo = pl.sub(qd_epb_estimate, qd_epb_left_hi)
-                        qd_epb_right_split = pl.mul(qd_epb_work, 4097.0)
-                        qd_epb_right_delta = pl.sub(qd_epb_right_split, qd_epb_work)
-                        qd_epb_right_hi = pl.sub(qd_epb_right_split, qd_epb_right_delta)
-                        qd_epb_right_lo = pl.sub(qd_epb_work, qd_epb_right_hi)
-                        qd_epb_product = pl.mul(qd_epb_estimate, qd_epb_work)
-                        qd_epb_hi_product = pl.mul(qd_epb_left_hi, qd_epb_right_hi)
-                        qd_epb_error = pl.sub(qd_epb_hi_product, qd_epb_product)
-                        qd_epb_hi_lo = pl.mul(qd_epb_left_hi, qd_epb_right_lo)
-                        qd_epb_error = pl.add(qd_epb_error, qd_epb_hi_lo)
-                        qd_epb_lo_hi = pl.mul(qd_epb_left_lo, qd_epb_right_hi)
-                        qd_epb_error = pl.add(qd_epb_error, qd_epb_lo_hi)
-                        qd_epb_lo_product = pl.mul(qd_epb_left_lo, qd_epb_right_lo)
-                        qd_epb_error = pl.add(qd_epb_error, qd_epb_lo_product)
-                        qd_epb_residual_hi = pl.sub(qd_epb_numerator, qd_epb_product)
-                        qd_epb_residual = pl.sub(qd_epb_residual_hi, qd_epb_error)
-                        qd_epb_correction = pl.div(qd_epb_residual, qd_epb_work)
-                        qd_epb_corrected_work = pl.add(qd_epb_estimate, qd_epb_correction)
-                        sq_row = pl.mul(qd_epb_corrected_work, 5.421010862427522e-20)
-                        dqfix_ones_row = pl.full([1, ROW_HALF], dtype=pl.FP32, value=1.0)
-                        dqfix_ef_work = pl.mul(sq_row, 65536.0)
-                        dqfix_ef_estimate = pl.div(dqfix_ones_row, dqfix_ef_work)
-                        dqfix_ef_left_split = pl.mul(dqfix_ef_estimate, 4097.0)
-                        dqfix_ef_left_delta = pl.sub(dqfix_ef_left_split, dqfix_ef_estimate)
-                        dqfix_ef_left_hi = pl.sub(dqfix_ef_left_split, dqfix_ef_left_delta)
-                        dqfix_ef_left_lo = pl.sub(dqfix_ef_estimate, dqfix_ef_left_hi)
-                        dqfix_ef_right_split = pl.mul(dqfix_ef_work, 4097.0)
-                        dqfix_ef_right_delta = pl.sub(dqfix_ef_right_split, dqfix_ef_work)
-                        dqfix_ef_right_hi = pl.sub(dqfix_ef_right_split, dqfix_ef_right_delta)
-                        dqfix_ef_right_lo = pl.sub(dqfix_ef_work, dqfix_ef_right_hi)
-                        dqfix_ef_product = pl.mul(dqfix_ef_estimate, dqfix_ef_work)
-                        dqfix_ef_hi_product = pl.mul(dqfix_ef_left_hi, dqfix_ef_right_hi)
-                        dqfix_ef_error = pl.sub(dqfix_ef_hi_product, dqfix_ef_product)
-                        dqfix_ef_hi_lo = pl.mul(dqfix_ef_left_hi, dqfix_ef_right_lo)
-                        dqfix_ef_error = pl.add(dqfix_ef_error, dqfix_ef_hi_lo)
-                        dqfix_ef_lo_hi = pl.mul(dqfix_ef_left_lo, dqfix_ef_right_hi)
-                        dqfix_ef_error = pl.add(dqfix_ef_error, dqfix_ef_lo_hi)
-                        dqfix_ef_lo_product = pl.mul(dqfix_ef_left_lo, dqfix_ef_right_lo)
-                        dqfix_ef_error = pl.add(dqfix_ef_error, dqfix_ef_lo_product)
-                        dqfix_ef_residual_hi = pl.sub(dqfix_ones_row, dqfix_ef_product)
-                        dqfix_ef_residual = pl.sub(dqfix_ef_residual_hi, dqfix_ef_error)
-                        dqfix_ef_correction = pl.div(dqfix_ef_residual, dqfix_ef_work)
-                        dqfix_ef_corrected_work = pl.add(dqfix_ef_estimate, dqfix_ef_correction)
-                        dqfix_scale_dequant_row = pl.mul(dqfix_ef_corrected_work, 65536.0)
-                        h_scale_dq = pl.reshape(dqfix_scale_dequant_row, [ROW_HALF, 1])
+                        sq_row = pl.div(
+                            pl.full([1, ROW_HALF], dtype=pl.FP32, value=INT8_SCALE_MAX), h_amax
+                        )
+                        h_scale_dq = pl.reshape(pl.recip(sq_row), [ROW_HALF, 1])
                         sq_col = pl.reshape(sq_row, [ROW_HALF, 1])
                         q_scaled = pl.row_expand_mul(h_f32, sq_col)
                         q_i32 = pl.cast(q_scaled, target_type=pl.INT32, mode="rint")
@@ -360,7 +286,11 @@ def expert_routed_persistent_balanced_test(
 
 if __name__ == "__main__":
     import argparse
-    from decode_shapes import TP
+
+    if __package__:
+        from .decode_shapes import TP
+    else:
+        from decode_shapes import TP
     from golden import run
 
     parser = argparse.ArgumentParser()

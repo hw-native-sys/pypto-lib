@@ -221,6 +221,9 @@ jobs:
         working-directory: checkout
     env:
       PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      # An A2/A3 job only needs its own onboard runtime; its CANN SDK may not
+      # provide the A5 HCCL channel APIs required to build the A5 runtime.
+      SIMPLER_BUILD_TARGET: ${{ matrix.platform == 'a2a3' && 'build_package_a2a3' || '' }}
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -272,11 +275,17 @@ jobs:
               device_flags+=(--device-num "$ndev" --ignore-whitelist)
             fi
             max_time=600
+            extra_args=""
             if [ "$f" = "models/deepseek_v4_flash_lowlat/decode_fwd.py" ]; then
               max_time=1800
+              extra_args="--test-layers 5"
+            elif [ "$f" = "models/deepseek_v4_flash_lowlat/decode_sparse_attn_swa.py" ]; then
+              extra_args="--unmapped-window-fixture"
+            elif [ "$f" = "models/deepseek_v4_flash_lowlat/decode_compressor_ratio128.py" ]; then
+              extra_args="--boundary-missing-slot-fixture"
             fi
             if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time "$max_time" \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE"; then
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE $extra_args"; then
               status=pass
             else
               status=fail

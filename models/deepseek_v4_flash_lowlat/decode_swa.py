@@ -17,24 +17,66 @@ Companion files: attention_csa_draft.py (ratio=4)
                  attention_hca_draft.py (ratio=128)."""
 
 
-from qkv_proj_rope import prepare_qkv_rope_metadata
-from decode_sparse_attn_swa import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
+if __package__:
+    from .qkv_proj_rope import prepare_qkv_rope_metadata
+else:
+    from qkv_proj_rope import prepare_qkv_rope_metadata
+if __package__:
+    from .decode_sparse_attn_swa import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
+else:
+    from decode_sparse_attn_swa import prepare_swa_output_rope, H_TILE as SWA_ROPE_ROWS
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-import o_proj_tp as OTP
-from o_proj_tp import o_proj_tp_core
+if __package__:
+    from . import o_proj_tp as OTP
+else:
+    import o_proj_tp as OTP
+if __package__:
+    from .o_proj_tp import o_proj_tp_core
+else:
+    from o_proj_tp import o_proj_tp_core
 
-from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
-from decode_shapes import DECODE_BATCH, DECODE_ORI_BLOCK_NUM, DECODE_SEQ, BLOCK_SIZE, KV_CMP_MAX_BLOCKS, KV_ORI_MAX_BLOCKS, KV_ORI_TABLE_MAX_BLOCKS
-from hc_pre import hc_pre
-from hc_post import hc_post
-from qkv_proj_rope import qkv_proj_rope
-from rmsnorm import rms_norm
-from decode_sparse_attn_swa import sparse_attn_swa_packed
+if __package__:
+    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+else:
+    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+if __package__:
+    from .decode_shapes import (
+        DECODE_BATCH,
+        DECODE_ORI_BLOCK_NUM,
+        DECODE_SEQ,
+        BLOCK_SIZE,
+        KV_CMP_MAX_BLOCKS,
+        KV_ORI_MAX_BLOCKS,
+        KV_ORI_TABLE_MAX_BLOCKS,
+    )
+else:
+    from decode_shapes import DECODE_BATCH, DECODE_ORI_BLOCK_NUM, DECODE_SEQ, BLOCK_SIZE, KV_CMP_MAX_BLOCKS, KV_ORI_MAX_BLOCKS, KV_ORI_TABLE_MAX_BLOCKS
+if __package__:
+    from .hc_pre import hc_pre
+else:
+    from hc_pre import hc_pre
+if __package__:
+    from .hc_post import hc_post
+else:
+    from hc_post import hc_post
+if __package__:
+    from .qkv_proj_rope import qkv_proj_rope
+else:
+    from qkv_proj_rope import qkv_proj_rope
+if __package__:
+    from .rmsnorm import rms_norm
+else:
+    from rmsnorm import rms_norm
+if __package__:
+    from .decode_sparse_attn_swa import sparse_attn_swa_packed
+else:
+    from decode_sparse_attn_swa import sparse_attn_swa_packed
 
 
 # model config
+
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
@@ -62,7 +104,7 @@ O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
-ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
+ORI_BLOCK_NUM_DYN = pl.dynamic('LOWLAT_TARGET_ORI_BLOCK_NUM_DYN')
 TOPK = WIN                          # SWA: sparse_attn topk = window only
 SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
@@ -82,6 +124,8 @@ WO_B_FLAT = D * O_LORA
 OPROJ_N_RANKS = OTP.N_RANKS
 OPROJ_REDUCE_ROWS = OTP.REDUCE_WINDOW_ROWS
 OPROJ_FIRST_EPOCH = OTP.FIRST_EPOCH
+
+
 
 
 @pl.jit.inline
@@ -143,7 +187,6 @@ def attention_swa(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
-
     reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -182,10 +225,24 @@ def attention_swa(
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     qkv_proj_rope(
-        x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
-        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-        q, kv, qr, qr_scale, rms_tid,
-        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
+        x_normed_t,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        rope_cos_t,
+        rope_sin_t,
+        gamma_cq,
+        gamma_ckv,
+        q,
+        kv,
+        qr,
+        qr_scale,
+        rms_tid,
+        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS),
+        q_rope_cos_il,
+        q_rope_sin_signed,
+        q_rope_swap_idx,
     )
 
     # Commit current decode KV and build its additive padding mask in one task.
@@ -199,27 +256,59 @@ def attention_swa(
             write_row_i64 = pl.read(swa_slot_mapping, [write_t])
             if write_row_i64 >= 0:
                 write_row = pl.cast(write_row_i64, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+                kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
         v_col = pl.cast(pl.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)
         v_col_m = pl.col_expand(pl.full([T, WIN], dtype=pl.FP32, value=0.0), v_col)
-        v_lens = pl.cast(pl.reshape(swa_lens[0:T], [T, 1]), target_type=pl.FP32)
-        v_valid = pl.minimum(
-            pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0),
-            1.0,
-        )
-        v_indices = pl.cast(swa_indices[0:T, 0:WIN], pl.FP32)
-        v_mapped = pl.minimum(pl.maximum(pl.add(v_indices, 1.0), 0.0), 1.0)
-        v_valid = pl.mul(v_valid, v_mapped)
-        sparse_bias[0:T, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
+        if T < 8:
+            for bias_row in pl.range(T):
+                swa_length = pl.read(swa_lens, [bias_row])
+                swa_length_f32 = pl.cast(swa_length, target_type=pl.FP32)
+                v_delta_row = pl.sub(v_col_m[bias_row : bias_row + 1, :], swa_length_f32)
+                v_valid_row = pl.minimum(pl.maximum(pl.neg(v_delta_row), 0.0), 1.0)
+                v_indices_row = pl.cast(swa_indices[bias_row : bias_row + 1, 0:WIN], target_type=pl.FP32)
+                v_mapped_row = pl.minimum(pl.maximum(pl.add(v_indices_row, 1.0), 0.0), 1.0)
+                v_valid_row = pl.mul(v_valid_row, v_mapped_row)
+                sparse_bias[bias_row : bias_row + 1, 0:WIN] = pl.mul(pl.sub(v_valid_row, 1.0), -NEG_INF)
+        else:
+            v_lens = pl.cast(pl.reshape(swa_lens[0:T], [T, 1]), target_type=pl.FP32)
+            v_delta = pl.row_expand_sub(v_col_m, v_lens)
+            v_valid = pl.minimum(
+                pl.maximum(pl.neg(v_delta), 0.0),
+                1.0,
+            )
+            v_indices = pl.cast(swa_indices[0:T, 0:WIN], target_type=pl.FP32)
+            v_mapped = pl.minimum(pl.maximum(pl.add(v_indices, 1.0), 0.0), 1.0)
+            v_valid = pl.mul(v_valid, v_mapped)
+            sparse_bias[0:T, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     merge_tid = sparse_attn_swa_packed(
-        q, kv_cache, swa_indices, swa_lens, sparse_bias,
-        attn_sink, rope_cos_t, rope_sin_t, o_packed, my_rank, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
+        q,
+        kv_cache,
+        swa_indices,
+        swa_lens,
+        sparse_bias,
+        attn_sink,
+        rope_cos_t,
+        rope_sin_t,
+        o_packed,
+        my_rank,
+        out_rope_cos_il,
+        out_rope_sin_signed,
+        out_rope_swap_idx,
     )
     o_proj_tp_core(
-        o_packed, merge_tid, wo_a_shard, wo_b_shard, wo_b_scale, attn_out,
-        reduce_window,  reduce_signal, sync_signal, my_rank, oproj_epoch,
+        o_packed,
+        merge_tid,
+        wo_a_shard,
+        wo_b_shard,
+        wo_b_scale,
+        attn_out,
+        reduce_window,
+        reduce_signal,
+        sync_signal,
+        my_rank,
+        oproj_epoch,
     )
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)
@@ -250,11 +339,9 @@ def clear_swa_oproj_signals(
 def attention_swa_test(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    # hc_pre weights
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    # qkv_proj_rope weights
     attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
@@ -264,21 +351,17 @@ def attention_swa_test(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
-    # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    # o_proj, sharded one group per card
     wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
-
     reduce_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     sync_signal: pld.DistributedTensor[[OPROJ_N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -292,19 +375,55 @@ def attention_swa_test(
     out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
     out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
     out_rope_swap_idx = pl.create_tensor([SWA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
-    prepare_swa_metadata(freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx)
+    prepare_swa_metadata(
+        freqs_cos,
+        freqs_sin,
+        position_ids,
+        rope_cos_t,
+        rope_sin_t,
+        q_rope_cos_il,
+        q_rope_sin_signed,
+        q_rope_swap_idx,
+        out_rope_cos_il,
+        out_rope_sin_signed,
+        out_rope_swap_idx,
+    )
     attention_swa(
-        x_hc, gate_w,
-        hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
-        gamma_cq, gamma_ckv,
-        rope_cos_t, rope_sin_t,
-        kv_cache, swa_slot_mapping, swa_indices, swa_lens, position_ids,
+        x_hc,
+        gate_w,
+        hc_attn_fn,
+        hc_attn_scale,
+        hc_attn_base,
+        attn_norm_w,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        gamma_cq,
+        gamma_ckv,
+        rope_cos_t,
+        rope_sin_t,
+        kv_cache,
+        swa_slot_mapping,
+        swa_indices,
+        swa_lens,
+        position_ids,
         attn_sink,
-        wo_a_shard, wo_b_shard, wo_b_scale,
+        wo_a_shard,
+        wo_b_shard,
+        wo_b_scale,
         x_out,
-        reduce_window,  reduce_signal, sync_signal,
-        my_rank, oproj_epoch, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
+        reduce_window,
+        reduce_signal,
+        sync_signal,
+        my_rank,
+        oproj_epoch,
+        q_rope_cos_il,
+        q_rope_sin_signed,
+        q_rope_swap_idx,
+        out_rope_cos_il,
+        out_rope_sin_signed,
+        out_rope_swap_idx,
     )
     clear_swa_oproj_signals(x_out, reduce_signal, sync_signal)
     return x_out
@@ -341,21 +460,11 @@ def l3_attention_swa(
     reduce_window_buf = pld.alloc_window_buffer([OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
     reduce_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
     sync_signal_buf = pld.alloc_window_buffer([OPROJ_N_RANKS, 1], dtype=pl.INT32)
-
     for r in pl.range(pld.world_size()):
         reduce_window = pld.window(reduce_window_buf, [OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
         reduce_signal = pld.window(reduce_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
         sync_signal = pld.window(sync_signal_buf, [OPROJ_N_RANKS, 1], dtype=pl.INT32)
-        attention_swa_test(
-            x_hc[r], gate_w[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
-            attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r],
-            gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r],
-            kv_cache[r], swa_slot_mapping[r], swa_indices[r], swa_lens[r], position_ids[r],
-            attn_sink[r],
-            wo_a_shard[r], wo_b_shard[r], wo_b_scale[r], x_out[r],
-            reduce_window,  reduce_signal, sync_signal,
-            r, OPROJ_FIRST_EPOCH, device=r,
-        )
+        attention_swa_test(x_hc[r], gate_w[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r], kv_cache[r], swa_slot_mapping[r], swa_indices[r], swa_lens[r], position_ids[r], attn_sink[r], wo_a_shard[r], wo_b_shard[r], wo_b_scale[r], x_out[r], reduce_window, reduce_signal, sync_signal, r, OPROJ_FIRST_EPOCH, device=r)
 
 
 def golden_attention_swa(tensors):
@@ -364,25 +473,42 @@ def golden_attention_swa(tensors):
     no indexer, no cmp_kv) + Block.hc_post."""
     import torch
 
-    from hc_pre import golden_hc_pre
-    from qkv_proj_rope import golden_qkv_proj_rope
-    from rmsnorm import golden_rms_norm
-    from decode_sparse_attn_swa import golden_sparse_attn
-    from hc_post import golden_hc_post
+    if __package__:
+        from .hc_pre import golden_hc_pre
+    else:
+        from hc_pre import golden_hc_pre
+    if __package__:
+        from .qkv_proj_rope import golden_qkv_proj_rope
+    else:
+        from qkv_proj_rope import golden_qkv_proj_rope
+    if __package__:
+        from .rmsnorm import golden_rms_norm
+    else:
+        from rmsnorm import golden_rms_norm
+    if __package__:
+        from .decode_sparse_attn_swa import golden_sparse_attn
+    else:
+        from decode_sparse_attn_swa import golden_sparse_attn
+    if __package__:
+        from .hc_post import golden_hc_post
+    else:
+        from hc_post import golden_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
     x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
     post_t = torch.zeros(T, HC_MULT)
     comb_t = torch.zeros(T, HC_MULT * HC_MULT)
-    golden_hc_pre({
-        "x": tensors["x_hc"],
-        "hc_fn": tensors["hc_attn_fn"],
-        "hc_scale": tensors["hc_attn_scale"],
-        "hc_base": tensors["hc_attn_base"],
-        "x_mixed": x_mixed,
-        "post": post_t,
-        "comb": comb_t,
-    })
+    golden_hc_pre(
+        {
+            "x": tensors["x_hc"],
+            "hc_fn": tensors["hc_attn_fn"],
+            "hc_scale": tensors["hc_attn_scale"],
+            "hc_base": tensors["hc_attn_base"],
+            "x_mixed": x_mixed,
+            "post": post_t,
+            "comb": comb_t,
+        }
+    )
 
     # ===== Attention.forward (model.py:484-543), ratio==0 branch =====
     position_ids = tensors["position_ids"].to(torch.int64)
@@ -405,21 +531,23 @@ def golden_attention_swa(tensors):
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
     x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
-    golden_qkv_proj_rope({
-        "x": x_normed,
-        "wq_a": tensors["wq_a"],
-        "wq_b": tensors["wq_b"],
-        "wq_b_scale": tensors["wq_b_scale"],
-        "wkv": tensors["wkv"],
-        "rope_cos": rope_cos_T,
-        "rope_sin": rope_sin_T,
-        "gamma_cq": tensors["gamma_cq"],
-        "gamma_ckv": tensors["gamma_ckv"],
-        "q": q,
-        "kv": kv,
-        "qr": qr,                                                              # qr unused on SWA path
-        "qr_scale": qr_scale,
-    })
+    golden_qkv_proj_rope(
+        {
+            "x": x_normed,
+            "wq_a": tensors["wq_a"],
+            "wq_b": tensors["wq_b"],
+            "wq_b_scale": tensors["wq_b_scale"],
+            "wkv": tensors["wkv"],
+            "rope_cos": rope_cos_T,
+            "rope_sin": rope_sin_T,
+            "gamma_cq": tensors["gamma_cq"],
+            "gamma_ckv": tensors["gamma_ckv"],
+            "q": q,
+            "kv": kv,
+            "qr": qr,  # qr unused on SWA path
+            "qr_scale": qr_scale,
+        }
+    )
 
     kv_cache = tensors["kv_cache"]
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
@@ -434,46 +562,65 @@ def golden_attention_swa(tensors):
             write_intra = write_row % BLOCK_SIZE
             kv_cache[write_blk, write_intra, 0] = kv[t]
 
-    golden_sparse_attn({
-        "q": q,
-        "ori_kv": kv_cache,
-        "swa_indices": tensors["swa_indices"],
-        "swa_lens": tensors["swa_lens"],
-        "attn_sink": tensors["attn_sink"],
-        "freqs_cos": rope_cos_T,
-        "freqs_sin": rope_sin_T,
-        "wo_a": tensors["wo_a"],
-        "wo_b": tensors["wo_b"],
-        "wo_b_scale": tensors["wo_b_scale"],
-        "attn_out": attn_out,
-        "tp_projection": tensors.get("tp_projection", False),
-    })
+    golden_sparse_attn(
+        {
+            "q": q,
+            "ori_kv": kv_cache,
+            "swa_indices": tensors["swa_indices"],
+            "swa_lens": tensors["swa_lens"],
+            "attn_sink": tensors["attn_sink"],
+            "freqs_cos": rope_cos_T,
+            "freqs_sin": rope_sin_T,
+            "wo_a": tensors["wo_a"],
+            "wo_b": tensors["wo_b"],
+            "wo_b_scale": tensors["wo_b_scale"],
+            "attn_out": attn_out,
+            "tp_projection": tensors.get("tp_projection", False),
+        }
+    )
 
     # ===== Block.hc_post (model.py:694) =====
     y = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
-    golden_hc_post({
-        "x": attn_out,
-        "residual": tensors["x_hc"],
-        "post": post_t,
-        "comb": comb_t,
-        "y": y,
-    })
+    golden_hc_post(
+        {
+            "x": attn_out,
+            "residual": tensors["x_hc"],
+            "post": post_t,
+            "comb": comb_t,
+            "y": y,
+        }
+    )
 
     tensors["x_out"][:] = y
 
 
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
-    from utils import (
-        block_table,
-        paged_slot_mapping,
-        position_ids_from_starts,
-        resolve_start_positions,
-        swa_indices_and_lens,
-        swa_decode_start_set,
-    )
+
+    if __package__:
+        from .utils import (
+            block_table,
+            paged_slot_mapping,
+            position_ids_from_starts,
+            resolve_start_positions,
+            swa_indices_and_lens,
+            swa_decode_start_set,
+        )
+    else:
+        from utils import (
+            block_table,
+            paged_slot_mapping,
+            position_ids_from_starts,
+            resolve_start_positions,
+            swa_indices_and_lens,
+            swa_decode_start_set,
+        )
     from golden import TensorSpec
-    from utils import build_rope_tables
+
+    if __package__:
+        from .utils import build_rope_tables
+    else:
+        from utils import build_rope_tables
 
     shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, 0, dtype=torch.bfloat16)
 
@@ -497,38 +644,70 @@ def build_tensor_specs(start_pos=None):
 
     def init_x_hc():
         return torch.empty(T, HC_MULT, D).uniform_(-1, 1)
+
     # Real layer-0 (SWA) hc_attn scale/base (fn synthetic at real magnitude). A synthetic
     # scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out and the
     # hc residual to near-zero in x_out where quant noise blows up the relative tail.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.039
+
     def init_hc_attn_scale():
         return torch.tensor([2.076026, 0.018729, 0.245936])
+
     def init_hc_attn_base():
-        return torch.tensor([
-            3.9083, -2.0399, -2.2033, -2.017,
-            -2.4443, -10.3158, -8.9943, -6.3581,
-            9.8577, -9.5177, -24.8724, -22.8929,
-            -21.545, 0.7791, -3.386, 1.1948,
-            -20.9605, -0.7702, 1.4218, -4.8994,
-            1.5177, -29.7663, -30.1413, -1.2413,
-        ])
+        return torch.tensor(
+            [
+                3.9083,
+                -2.0399,
+                -2.2033,
+                -2.017,
+                -2.4443,
+                -10.3158,
+                -8.9943,
+                -6.3581,
+                9.8577,
+                -9.5177,
+                -24.8724,
+                -22.8929,
+                -21.545,
+                0.7791,
+                -3.386,
+                1.1948,
+                -20.9605,
+                -0.7702,
+                1.4218,
+                -4.8994,
+                1.5177,
+                -29.7663,
+                -30.1413,
+                -1.2413,
+            ]
+        )
+
     def init_attn_norm_w():
         return torch.ones(D)
+
     def init_wq_a():
-        return torch.randn(D, Q_LORA) / D ** 0.5
+        return torch.randn(D, Q_LORA) / D**0.5
+
     def init_wq_b():
-        return torch.randn(Q_LORA, H * HEAD_DIM) / Q_LORA ** 0.5
+        return torch.randn(Q_LORA, H * HEAD_DIM) / Q_LORA**0.5
+
     def init_wkv():
-        return torch.randn(D, HEAD_DIM) / D ** 0.5
+        return torch.randn(D, HEAD_DIM) / D**0.5
+
     def init_gamma_cq():
         return torch.ones(Q_LORA)
+
     def init_gamma_ckv():
         return torch.ones(HEAD_DIM)
+
     def init_freqs_cos():
         return shared_freqs_cos.clone()
+
     def init_freqs_sin():
         return shared_freqs_sin.clone()
+
     def init_normalized_cache(shape):
         cache = torch.randn(*shape)
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
@@ -542,9 +721,11 @@ def build_tensor_specs(start_pos=None):
 
     def init_attn_sink():
         return torch.zeros(H)
+
     def init_default_start_pos():
         # Canonical SWA start-position set (sliding-window regimes + 8k long-context).
         return swa_decode_start_set(batch=B, window=WIN)
+
     def init_start_pos():
         return resolve_start_positions(
             start_pos,
@@ -553,14 +734,21 @@ def build_tensor_specs(start_pos=None):
             max_seq_len=MAX_SEQ_LEN,
             default_fn=init_default_start_pos,
         )
+
     def init_position_ids():
         return position_ids_from_starts(init_start_pos(), seq=S).reshape(-1).contiguous()
+
     def init_swa_slot_mapping():
-        return paged_slot_mapping(
-            position_ids_from_starts(init_start_pos(), seq=S),
-            init_block_table(),
-            block_size=BLOCK_SIZE,
-        ).reshape(-1).contiguous()
+        return (
+            paged_slot_mapping(
+                position_ids_from_starts(init_start_pos(), seq=S),
+                init_block_table(),
+                block_size=BLOCK_SIZE,
+            )
+            .reshape(-1)
+            .contiguous()
+        )
+
     def init_swa_metadata():
         return swa_indices_and_lens(
             position_ids_from_starts(init_start_pos(), seq=S),
@@ -568,12 +756,16 @@ def build_tensor_specs(start_pos=None):
             block_size=BLOCK_SIZE,
             window=WIN,
         )
+
     def init_swa_indices():
         return init_swa_metadata()[0].contiguous()
+
     def init_swa_lens():
         return init_swa_metadata()[1].contiguous()
+
     def init_wo_a():
-        return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
+        return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN**0.5
+
     def init_wo_b():
         return torch.randn(D, O_GROUPS * O_LORA) / (O_GROUPS * O_LORA) ** 0.5
 
@@ -584,7 +776,12 @@ def build_tensor_specs(start_pos=None):
 
     return [
         TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
-        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=lambda: torch.empty([N_EXPERTS, D], dtype=torch.float32).uniform_(-0.1, 0.1)),
+        TensorSpec(
+            "gate_w",
+            [N_EXPERTS, D],
+            torch.float32,
+            init_value=lambda: torch.empty([N_EXPERTS, D], dtype=torch.float32).uniform_(-0.1, 0.1),
+        ),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
@@ -597,7 +794,9 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
+        TensorSpec(
+            "kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache
+        ),
         TensorSpec("swa_slot_mapping", [T], torch.int64, init_value=init_swa_slot_mapping),
         TensorSpec("swa_indices", [T, WIN], torch.int32, init_value=init_swa_indices),
         TensorSpec("swa_lens", [T], torch.int32, init_value=init_swa_lens),

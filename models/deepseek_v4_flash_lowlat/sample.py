@@ -11,8 +11,14 @@
 
 import pypto.language as pl
 
-from config import FLASH as M, FP32_NEG_INF
-from decode_shapes import DECODE_TOKENS
+if __package__:
+    from .config import FLASH as M, FP32_NEG_INF
+else:
+    from config import FLASH as M, FP32_NEG_INF
+if __package__:
+    from .decode_shapes import DECODE_TOKENS
+else:
+    from decode_shapes import DECODE_TOKENS
 
 
 # model config

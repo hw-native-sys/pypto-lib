@@ -11,12 +11,18 @@
 
 import pypto.language as pl
 
-from config import FLASH as M
-from decode_shapes import DECODE_BATCH, DECODE_SEQ
+if __package__:
+    from .config import FLASH as M
+else:
+    from config import FLASH as M
+if __package__:
+    from .decode_shapes import DECODE_BATCH, DECODE_SEQ
+else:
+    from decode_shapes import DECODE_BATCH, DECODE_SEQ
 
 
 # Dynamic shape variables.
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+T_DYN = pl.dynamic('LOWLAT_TARGET_T_DYN')  # T = B * S
 
 # model config
 B = DECODE_BATCH

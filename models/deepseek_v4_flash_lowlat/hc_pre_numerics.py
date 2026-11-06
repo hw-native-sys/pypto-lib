@@ -15,7 +15,10 @@ retained outside that interval. No task or GM tensor is allocated here.
 """
 
 import pypto.language as pl
-from fp32_numerics import rne_exp_signed
+if __package__:
+    from .fp32_numerics import rne_exp_signed
+else:
+    from fp32_numerics import rne_exp_signed
 
 
 @pl.jit.inline(auto_scope=False)
