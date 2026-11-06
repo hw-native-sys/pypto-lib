@@ -155,7 +155,7 @@ precision result.
 | independent L1 reference capture | `pending` | Retry `task_20261106_113416_60083921106` uses the absolute reference Python; the first queued wrapper `task_20261106_103011_5220629172` exited `127` before launching (`exec` received an empty Python path) |
 | independent layer contract matrix | `pass` | `.pypto-a3-state/decode-assets/layer-contracts.json`; metadata/setup only, formal status remains `not_run` |
 | capacity-16 stage inventory | `pass` | `.pypto-a3-state/decode-assets/layer-stage-inventory.json`; stage construction only, no NPU or accuracy claim |
-| per-layer capture/replay execution plan | `pass` | `.pypto-a3-state/decode-assets/layer-contracts.json`; fixed EP2 vLLM-Ascend and PyPTO queue commands are recorded for all 11 layers; commands are not submitted automatically |
+| per-layer capture/replay execution plan | `pass` | `.pypto-a3-state/decode-assets/layer-contracts.json`; fixed EP2 vLLM-Ascend commands are recorded for all 11 layers, while only the complete L0 PyPTO replay is executable and the other ten remain blocked by missing layer compositions |
 
 No status in this table may be promoted from the historical Prefill evidence,
 CPU golden, simulator replay, TP1 diagnosis, single expert, or native
