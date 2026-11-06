@@ -89,18 +89,28 @@ def _execution_plan(
         "--history-length 8 --max-model-len 128 "
         "--task-device \\$TASK_DEVICE --capture-task \\$TASK_ID'\""
     )
-    replay = (
-        "task-submit --device auto --device-num 2 --run "
-        "\"source /mnt/data/pyptouser/liufei-shared-envs/"
-        "pypto-a3-72a62d13-20261031/activate-shared-pypto.sh; "
-        "export PYPTO_A3_STATE_DIR=\\$PWD/.pypto-a3-state; "
-        "export SOC_VERSION=ascend910_9382; "
-        "export DEEPSEEK_V41_CHECKPOINT="
-        f"{checkpoint}; "
-        "PYTHONPATH=\\$PWD python tools/deepseek_v41_pypto_layer_ep2_runner.py "
-        f"--layer-id {layer} --assets {reference_output} "
-        f"--cache-assets {reference_output} --record {product_report}\""
-    )
+    if layer == 0:
+        replay_status = "ready_to_submit"
+        replay = (
+            "task-submit --device auto --device-num 2 --run "
+            "\"source /mnt/data/pyptouser/liufei-shared-envs/"
+            "pypto-a3-72a62d13-20261031/activate-shared-pypto.sh; "
+            "export PYPTO_A3_STATE_DIR=\\$PWD/.pypto-a3-state; "
+            "export SOC_VERSION=ascend910_9382; "
+            "export DEEPSEEK_V41_CHECKPOINT="
+            f"{checkpoint}; "
+            "PYTHONPATH=\\$PWD python tools/deepseek_v41_pypto_layer_ep2_runner.py "
+            f"--layer-id {layer} --assets {reference_output} "
+            f"--cache-assets {reference_output} --record {product_report}\""
+        )
+        replay_blocker = None
+    else:
+        replay_status = "blocked_missing_complete_layer_entrypoint"
+        replay = None
+        replay_blocker = (
+            "The current A2/A3 checkout exposes only stage factories for this layer; "
+            "a complete PyPTO mHC/attention/cache/index/Engram/MoE composition is required."
+        )
     return {
         "reference": {
             "status": "ready_to_submit" if checkpoint.is_dir() else "blocked_missing_checkpoint",
@@ -123,10 +133,11 @@ def _execution_plan(
             ],
         },
         "product": {
-            "status": "not_run",
+            "status": replay_status,
             "topology": {**TOPOLOGY, "devices": 2},
             "record": str(product_report),
             "command": replay,
+            "blocker": replay_blocker,
             "requires": [
                 "reference_capture.json",
                 "decode_input.json",
