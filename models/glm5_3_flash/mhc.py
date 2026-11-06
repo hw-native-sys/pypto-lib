@@ -25,6 +25,7 @@ from models.glm5_3_flash.elementwise import (
     accurate_rsqrt, accurate_sigmoid,
 )
 from models.glm5_3_flash.linear import bf16_linear_row
+from models.glm5_3_flash.kda import PROJECTION_WORKERS_TILE
 from models.glm5_3_flash.rmsnorm import unweighted_rms_norm
 from models.glm5_3_flash.utils import _assert_close, _check, _randn, _report
 
@@ -332,16 +333,18 @@ def plain_residual_post(
 ):
     """Add one BF16 sublayer result to the plain residual and replicate its lanes."""
     rows = pl.tensor.dim(streams, 0)
-    for block in pl.spmd(rows * (D // 128), name_hint="plain_residual_post"):
-        row = block // (D // 128)
-        col0 = block % (D // 128) * 128
-        residual = pl.cast(streams[row : row + 1, 0:1, col0 : col0 + 128], pl.FP32)
-        residual_row = pl.reshape(residual, [1, 128])
-        value = pl.cast(update[row : row + 1, col0 : col0 + 128], pl.FP32)
-        combined = pl.cast(pl.add(residual_row, value), pl.BF16, mode="rint")
-        expanded = pl.reshape(combined, [1, 1, 128])
-        for lane in pl.unroll(HC_MULT):
-            output[row : row + 1, lane : lane + 1, col0 : col0 + 128] = expanded
+    plain_residual_post_tasks = rows * (D // 128)
+    for worker in pl.spmd(pl.min(plain_residual_post_tasks, PROJECTION_WORKERS_TILE), name_hint="plain_residual_post"):
+        for block in pl.range(worker, plain_residual_post_tasks, PROJECTION_WORKERS_TILE):
+            row = block // (D // 128)
+            col0 = block % (D // 128) * 128
+            residual = pl.cast(streams[row : row + 1, 0:1, col0 : col0 + 128], pl.FP32)
+            residual_row = pl.reshape(residual, [1, 128])
+            value = pl.cast(update[row : row + 1, col0 : col0 + 128], pl.FP32)
+            combined = pl.cast(pl.add(residual_row, value), pl.BF16, mode="rint")
+            expanded = pl.reshape(combined, [1, 1, 128])
+            for lane in pl.unroll(HC_MULT):
+                output[row : row + 1, lane : lane + 1, col0 : col0 + 128] = expanded
     return output
 
 

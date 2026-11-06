@@ -752,31 +752,35 @@ def kda_restore_states(
     requests = pl.tensor.dim(source_rows, 0)
     conv_flat = pl.reshape(conv_state, [layers * states * STATE_LEN, CONV_DIM])
     recurrent_flat = pl.reshape(recurrent_state, [layers * states * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
-    for task in pl.spmd(layers * requests * (CONV_DIM // DECODE_C_TILE), name_hint="kda_restore_conv"):
-        lane = task % (CONV_DIM // DECODE_C_TILE)
-        request = task // (CONV_DIM // DECODE_C_TILE) % requests
-        layer = task // ((CONV_DIM // DECODE_C_TILE) * requests)
-        source = pl.cast(pl.read(source_rows, [request]), pl.INDEX)
-        destination = pl.cast(pl.read(destination_rows, [request]), pl.INDEX)
-        if source >= 0:
-            c0 = lane * DECODE_C_TILE
-            src = (layer * states + source) * STATE_LEN
-            dst = (layer * states + destination) * STATE_LEN
-            for tap in pl.unroll(STATE_LEN):
-                value = conv_flat[src + tap:src + tap + 1, c0:c0 + DECODE_C_TILE]
-                conv_flat[dst + tap:dst + tap + 1, c0:c0 + DECODE_C_TILE] = value
+    conv_tasks = layers * requests * (CONV_DIM // DECODE_C_TILE)
+    for worker in pl.spmd(pl.min(conv_tasks, PROJECTION_WORKERS_TILE), name_hint="kda_restore_conv"):
+        for task in pl.range(worker, conv_tasks, PROJECTION_WORKERS_TILE):
+            lane = task % (CONV_DIM // DECODE_C_TILE)
+            request = task // (CONV_DIM // DECODE_C_TILE) % requests
+            layer = task // ((CONV_DIM // DECODE_C_TILE) * requests)
+            source = pl.cast(pl.read(source_rows, [request]), pl.INDEX)
+            destination = pl.cast(pl.read(destination_rows, [request]), pl.INDEX)
+            if source >= 0:
+                c0 = lane * DECODE_C_TILE
+                src = (layer * states + source) * STATE_LEN
+                dst = (layer * states + destination) * STATE_LEN
+                for tap in pl.unroll(STATE_LEN):
+                    value = conv_flat[src + tap:src + tap + 1, c0:c0 + DECODE_C_TILE]
+                    conv_flat[dst + tap:dst + tap + 1, c0:c0 + DECODE_C_TILE] = value
     tiles = LOCAL_KDA_H * KDA_DIM // DECODE_V_TILE
-    for task in pl.spmd(layers * requests * tiles, name_hint="kda_restore_recurrent"):
-        offset = task % tiles * DECODE_V_TILE
-        request = task // tiles % requests
-        layer = task // (tiles * requests)
-        source = pl.cast(pl.read(source_rows, [request]), pl.INDEX)
-        destination = pl.cast(pl.read(destination_rows, [request]), pl.INDEX)
-        if source >= 0:
-            src = (layer * states + source) * LOCAL_KDA_H * KDA_DIM + offset
-            dst = (layer * states + destination) * LOCAL_KDA_H * KDA_DIM + offset
-            recurrent_value = recurrent_flat[src:src + DECODE_V_TILE, :]
-            recurrent_flat[dst:dst + DECODE_V_TILE, :] = recurrent_value
+    restore_tasks = layers * requests * tiles
+    for worker in pl.spmd(pl.min(restore_tasks, PROJECTION_WORKERS_TILE), name_hint="kda_restore_recurrent"):
+        for task in pl.range(worker, restore_tasks, PROJECTION_WORKERS_TILE):
+            offset = task % tiles * DECODE_V_TILE
+            request = task // tiles % requests
+            layer = task // (tiles * requests)
+            source = pl.cast(pl.read(source_rows, [request]), pl.INDEX)
+            destination = pl.cast(pl.read(destination_rows, [request]), pl.INDEX)
+            if source >= 0:
+                src = (layer * states + source) * LOCAL_KDA_H * KDA_DIM + offset
+                dst = (layer * states + destination) * LOCAL_KDA_H * KDA_DIM + offset
+                recurrent_value = recurrent_flat[src:src + DECODE_V_TILE, :]
+                recurrent_flat[dst:dst + DECODE_V_TILE, :] = recurrent_value
     return conv_state, recurrent_state
 
 
