@@ -152,7 +152,7 @@ precision result.
 | independent vLLM-Ascend full-state capture | `pass` | `.pypto-a3-state/reference/decode_ep2_l0_20261106_v29/reference_capture.json`; v29 joins layer, MoE, and cache state; v24/v26 remain historical split captures |
 | same-input NPU PyPTO/reference representative comparison | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json`; fixed `rtol=0.05`, `atol=0.05` and exact route IDs |
 | target layers 0,1,2,3,14,15,19,20,21,24,25 | `not_run` | Each layer must pass its own complete DP8/TP2/EP16 gate |
-| independent L1 reference capture | `pending` | `task_20261106_103011_5220629172`; waits for two queued A3 cards, then writes a layer-1 token/cache/state contract |
+| independent L1 reference capture | `pending` | Retry `task_20261106_113416_60083921106` uses the absolute reference Python; the first queued wrapper `task_20261106_103011_5220629172` exited `127` before launching (`exec` received an empty Python path) |
 | independent layer contract matrix | `pass` | `.pypto-a3-state/decode-assets/layer-contracts.json`; metadata/setup only, formal status remains `not_run` |
 | capacity-16 stage inventory | `pass` | `.pypto-a3-state/decode-assets/layer-stage-inventory.json`; stage construction only, no NPU or accuracy claim |
 

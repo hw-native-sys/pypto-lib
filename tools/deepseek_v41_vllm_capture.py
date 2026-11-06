@@ -190,6 +190,21 @@ def _make_layer_root(checkpoint: Path, root: Path, layer_id: int) -> Path:
     index["weight_map"] = filtered_map
     target_index.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
     needed_shards = set(filtered_map.values())
+    # Engram embeddings are separate multi-gigabyte safetensors files rather
+    # than ordinary quantized shards.  The reference loader binds them by
+    # filename from the temporary model root, so expose only the tables owned
+    # by the truncated layer view.
+    for engram_layer in text.get("engram_layer_ids", ()):
+        if int(engram_layer) > layer_id:
+            continue
+        for kind in ("weight", "scale"):
+            source = checkpoint / f"engram_embed_{kind}_l{int(engram_layer)}.safetensors"
+            if not source.is_file():
+                raise FileNotFoundError(f"Engram table is missing for layer {engram_layer}: {source}")
+            target = root / source.name
+            if target.is_symlink() or target.exists():
+                target.unlink()
+            target.symlink_to(source)
     # Tokenizer files may be stored under an auxiliary directory in this export.
     for source in checkpoint.iterdir():
         if source.suffix == ".safetensors":
