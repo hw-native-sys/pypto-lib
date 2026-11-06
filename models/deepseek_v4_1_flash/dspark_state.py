@@ -284,23 +284,6 @@ def prepare_target_rank(
     return input_ids, position_ids, active_widths
 
 
-@pl.jit.host
-def l3_prepare_target(
-    slot_ids: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    generations: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    state_tokens: pl.Tensor[[EP_SIZE, BATCH, STATE_TOKEN_WIDTH], pl.INT64],
-    state_meta: pl.Tensor[[EP_SIZE, BATCH, STATE_META_WIDTH], pl.INT32],
-    input_ids: pl.Out[pl.Tensor[[EP_SIZE, BATCH, ROWS], pl.INT64]],
-    position_ids: pl.Out[pl.Tensor[[EP_SIZE, BATCH, ROWS], pl.INT32]],
-    active_widths: pl.Out[pl.Tensor[[EP_SIZE, BATCH], pl.INT32]],
-):
-    for rank in pl.range(pld.world_size()):
-        prepare_target_rank(
-            slot_ids[rank], generations[rank], state_tokens[rank], state_meta[rank],
-            input_ids[rank], position_ids[rank], active_widths[rank], device=rank,
-        )
-
-
 def golden_accept_target(
     slot_ids: torch.Tensor,
     generations: torch.Tensor,
@@ -411,32 +394,6 @@ def accept_target_rank(
     return state_tokens, state_meta, accepted_ids, accepted_counts
 
 
-@pl.jit.host
-def l3_accept_target(
-    slot_ids: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    generations: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    active_widths: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    sampled_ids: pl.Tensor[[EP_SIZE, BATCH * ROWS, SAMPLED_STRIDE], pl.INT32],
-    state_tokens: pl.InOut[pl.Tensor[[EP_SIZE, BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, BATCH, STATE_META_WIDTH], pl.INT32]],
-    accepted_ids: pl.Out[pl.Tensor[[EP_SIZE, BATCH, ROWS], pl.INT32]],
-    accepted_counts: pl.Out[pl.Tensor[[EP_SIZE, BATCH], pl.INT32]],
-    context_valid: pl.Out[pl.Tensor[[EP_SIZE, BATCH, ROWS], pl.INT32]],
-    context_positions: pl.Out[pl.Tensor[[EP_SIZE, BATCH, ROWS], pl.INT32]],
-    num_sampled: pl.Out[pl.Tensor[[EP_SIZE, BATCH], pl.INT32]],
-    last_sampled: pl.Out[pl.Tensor[[EP_SIZE, BATCH], pl.INT64]],
-    anchor_ids: pl.Out[pl.Tensor[[EP_SIZE, BATCH], pl.INT64]],
-    first_query_positions: pl.Out[pl.Tensor[[EP_SIZE, BATCH], pl.INT32]],
-):
-    for rank in pl.range(pld.world_size()):
-        accept_target_rank(
-            slot_ids[rank], generations[rank], active_widths[rank], sampled_ids[rank],
-            state_tokens[rank], state_meta[rank], accepted_ids[rank], accepted_counts[rank],
-            context_valid[rank], context_positions[rank], num_sampled[rank],
-            last_sampled[rank], anchor_ids[rank], first_query_positions[rank], device=rank,
-        )
-
-
 def golden_commit_drafts(
     slot_ids: torch.Tensor,
     generations: torch.Tensor,
@@ -495,22 +452,6 @@ def commit_drafts_rank(
     return state_tokens, state_meta, committed
 
 
-@pl.jit.host
-def l3_commit_drafts(
-    slot_ids: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    generations: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    draft_ids: pl.Tensor[[EP_SIZE, BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
-    state_tokens: pl.InOut[pl.Tensor[[EP_SIZE, BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, BATCH, STATE_META_WIDTH], pl.INT32]],
-    committed: pl.Out[pl.Tensor[[EP_SIZE, BATCH], pl.INT32]],
-):
-    for rank in pl.range(pld.world_size()):
-        commit_drafts_rank(
-            slot_ids[rank], generations[rank], draft_ids[rank], state_tokens[rank],
-            state_meta[rank], committed[rank], device=rank,
-        )
-
-
 @pl.jit
 def prepare_drafter_geometry_rank(
     context_valid: pl.Tensor[[BATCH, ROWS], pl.INT32],
@@ -566,32 +507,6 @@ def prepare_drafter_geometry_rank(
                     pl.write(query_rope_cos, [row, col], cos)
                     pl.write(query_rope_sin, [row, col], sin)
     return context_slots, context_rope_cos, context_rope_sin, query_rope_cos, query_rope_sin
-
-
-@pl.jit.host
-def l3_prepare_drafter_geometry(
-    context_valid: pl.Tensor[[EP_SIZE, BATCH, ROWS], pl.INT32],
-    context_positions: pl.Tensor[[EP_SIZE, BATCH, ROWS], pl.INT32],
-    first_query_positions: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    block_tables: pl.Tensor[[EP_SIZE, DSPARK_DRAFT_LAYERS, BATCH, TABLE_DYN], pl.INT32],
-    rope_cos_table: pl.Tensor[[EP_SIZE, ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
-    rope_sin_table: pl.Tensor[[EP_SIZE, ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
-    context_slots: pl.Out[pl.Tensor[[EP_SIZE, DSPARK_DRAFT_LAYERS, BATCH * ROWS], pl.INT64]],
-    context_rope_cos: pl.Out[pl.Tensor[[EP_SIZE, BATCH * ROWS, ROPE_HALF], pl.FP32]],
-    context_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, BATCH * ROWS, ROPE_HALF], pl.FP32]],
-    query_rope_cos: pl.Out[pl.Tensor[[EP_SIZE, BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
-    query_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
-):
-    block_tables.bind_dynamic(3, TABLE_DYN)
-    rope_cos_table.bind_dynamic(1, ROPE_ROWS_DYN)
-    rope_sin_table.bind_dynamic(1, ROPE_ROWS_DYN)
-    for rank in pl.range(pld.world_size()):
-        prepare_drafter_geometry_rank(
-            context_valid[rank], context_positions[rank], first_query_positions[rank],
-            block_tables[rank], rope_cos_table[rank], rope_sin_table[rank],
-            context_slots[rank], context_rope_cos[rank], context_rope_sin[rank],
-            query_rope_cos[rank], query_rope_sin[rank], device=rank,
-        )
 
 
 @pl.jit
