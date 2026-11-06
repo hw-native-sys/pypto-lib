@@ -97,16 +97,32 @@ git clone --recurse-submodules https://github.com/hw-native-sys/pypto.git ../pyp
 export PYPTO_ROOT="$(cd ../pypto && pwd)"
 
 python -m pip install --no-build-isolation "$PYPTO_ROOT"
-python -m pip install --no-build-isolation "$PYPTO_ROOT/runtime"
+# Default to simulation; select a2a3 or a5 for a device, or a5sim for A5 simulation.
+RUNTIME_PLATFORM=a2a3sim
+python -m pip install --no-build-isolation "$PYPTO_ROOT/runtime" \
+  --config-settings="build.targets=build_package_${RUNTIME_PLATFORM}"
 ```
 
 `runtime/` is the simpler submodule this PyPTO revision pins; installing from
-that path keeps build and runtime at the same revision.
+that path keeps build and runtime at the same revision. The explicit build target
+includes both the Python binding and the selected platform's runtime binaries.
+Choose the NPU architecture and device/simulator mode, not the host CPU
+architecture: `aarch64` and `x86_64` do not distinguish A2/A3 from A5.
 
-**Source CANN before this step.** The simpler installer builds the onboard
-binaries with the compilers it finds at install time; sourcing `set_env.sh`
-afterwards does not add them, and the fix is to source it and reinstall
-`runtime/`.
+An unrestricted install can also build A5 on an A2/A3 host. A5 onboard builds
+require a CANN SDK with HCCL channel-config APIs, including
+`HcclChannelAcquireWithConfig`; selecting `a2a3` or a simulator target avoids
+requiring those APIs for a job that does not use A5. A5 jobs still need a
+compatible SDK.
+
+CI passes this choice through the setup action's `runtime-platform` input for
+both wheel builds and direct installs. The simpler wheel cache includes the
+selected platform and, for device builds, the CANN SDK identity.
+
+**For device targets, source CANN before installing the runtime.** The simpler
+installer builds the selected onboard binaries with the compilers it finds at
+install time. Simulator targets do not require CANN. To switch targets, select
+the new `RUNTIME_PLATFORM` and rerun the targeted runtime installation above.
 
 ## PTOAS
 
@@ -146,20 +162,28 @@ re-cloned rather than reused in place.
 
 ## Verify
 
+Check the imports, then run the smoke test for the selected `RUNTIME_PLATFORM`:
+
 ```bash
 python -c "import pypto, torch; from golden import run; print(torch.__version__)"
-python examples/beginner/hello_world.py -p a2a3 --sim
 ```
 
-The example ends in a `[RUN] PASS` line, having exercised the whole chain —
-front end, PTOAS, runtime, simulator — so it fails loudly if any piece above is
-missing. On a device, in a shell carrying `PYTHONPATH`, `PTOAS_ROOT`, and the
-same CANN environment simpler was built against:
+For a simulator target (`a2a3sim` or `a5sim`):
+
+```bash
+python examples/beginner/hello_world.py -p "${RUNTIME_PLATFORM%sim}" --sim
+```
+
+For a device target (`a2a3` or `a5`), use a shell carrying `PYTHONPATH`,
+`PTOAS_ROOT`, and the same CANN environment simpler was built against:
 
 ```bash
 source "$CANN_ROOT/set_env.sh"
-python examples/beginner/hello_world.py -p a2a3 -d 0
+python examples/beginner/hello_world.py -p "$RUNTIME_PLATFORM" -d 0
 ```
+
+The selected example ends in a `[RUN] PASS` line after exercising the front end,
+PTOAS, and the installed runtime on the selected simulator or device.
 
 Then proceed to [Run your first kernel](first-kernel.md).
 
