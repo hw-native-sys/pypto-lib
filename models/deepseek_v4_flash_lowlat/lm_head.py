@@ -519,18 +519,17 @@ def golden_lm_head(tensors):
     # reproduces the global vocabulary order every owner assembles.
     weight = tensors["lm_head_weight"].float()
     full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
+    full_logits = []
     world_size = hidden.shape[0]
-    # Project at most two owners per reference batch.
-    for owner_start in range(0, world_size, 2):
-        owner_stop = min(owner_start + 2, world_size)
-        selected = torch.zeros((owner_stop - owner_start, MAX_LOGIT_ROWS, D), dtype=torch.float32)
-        for owner_rank in range(owner_start, owner_stop):
-            for row in range(MAX_LOGIT_ROWS):
-                source_row = int(tensors["logit_row_indices"][owner_rank, row])
-                if source_row >= 0:
-                    source_row = min(source_row, hidden.shape[1] - 1)
-                    selected[owner_rank - owner_start, row].copy_(hidden[owner_rank, source_row])
-        tensors["logits"][owner_start:owner_stop] = bf16_matmul_fp32(selected, full_weight.t())
+    for owner_rank in range(world_size):
+        selected = torch.zeros((MAX_LOGIT_ROWS, D), dtype=torch.float32)
+        for row in range(MAX_LOGIT_ROWS):
+            source_row = int(tensors["logit_row_indices"][owner_rank, row])
+            if source_row >= 0:
+                source_row = min(source_row, hidden.shape[1] - 1)
+                selected[row].copy_(hidden[owner_rank, source_row])
+        full_logits.append(bf16_matmul_fp32(selected, full_weight.t()))
+    tensors["logits"][:] = torch.stack(full_logits, dim=0)
     if "sampled_ids" in tensors:
         for rank in range(world_size):
             golden_sample(

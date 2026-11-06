@@ -585,12 +585,6 @@ def golden_sparse_attn(tensors):
         for tile_start in range(0, PADDED_TOPK, ATTN_K_TILE):
             kv_tile = kv_b[tile_start:tile_start + ATTN_K_TILE]
             valid_tile = valid_b[tile_start:tile_start + ATTN_K_TILE]
-            if not bool(valid_tile.any()):
-                # Keep the neutral block in the original merge order.
-                block_mi.append(torch.full((H, 1), NEG_INF, dtype=q_t.dtype, device=q_t.device))
-                block_li.append(torch.zeros((H, 1), dtype=q_t.dtype, device=q_t.device))
-                block_oi.append(torch.zeros((H, HEAD_DIM), dtype=q_t.dtype, device=q_t.device))
-                continue
             scores = bf16_matmul_fp32(q_t, kv_tile.T) * SOFTMAX_SCALE
             scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
             mi = scores.max(dim=-1, keepdim=True).values

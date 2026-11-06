@@ -220,17 +220,6 @@ reduction. Standalone grouped projections retain their own arithmetic.
 These choices do not establish bitwise equivalence with device instructions;
 the existing numerical comparisons remain required.
 
-The LM-head Torch reference batches at most two independent owners per
-projection call. This bounds its product buffer independently of the number
-of TP/DP owners. It preserves each owner's row selection, K16 FP32
-accumulation order, zero rows and sampling inputs; device kernels and
-comparison thresholds are unchanged.
-
-The HCA Torch reference skips matrix products for fully masked sparse tiles
-and materializes their original neutral statistics: a `NEG_INF` maximum and
-positive-zero denominator and numerator. Every block remains in its original
-softmax merge position. Valid tiles retain their K16 products and arithmetic.
-
 CSA packs the independent alpha and beta exponential arguments into one
 full-valid row tile and evaluates the sink on a full-valid row tile after the
 merge. It retains the same compensated signed exponential, evaluation count
