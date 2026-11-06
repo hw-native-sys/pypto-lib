@@ -18,6 +18,9 @@ import sys
 import torch
 
 import pypto.language as pl
+
+from quant import pack_cache_specs, packed_cache_comparators, packed_cache_golden
+
 import pypto.language.distributed as pld
 
 
@@ -42,9 +45,8 @@ if not any(argument == "--ep" or argument.startswith("--ep=") for argument in sy
 
 
 from config import (
-    FLASH as M, BLOCK_SIZE, TP_SIZE, MAX_BATCH_PER_DP, PREFILL_MAX_TOKENS, WINDOW_CACHE_GROUP,
-    CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, ROUTE_T_DYN,
-    set_moe_tokens,
+    FLASH as M, BLOCK_SIZE, TP_SIZE, MAX_BATCH_PER_DP, PREFILL_MAX_TOKENS, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN,
+    ROUTE_T_DYN, set_moe_tokens, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 
 
@@ -71,7 +73,7 @@ from prefill_moe import (
 from o_proj import retire_prefill_signals
 from prefill_moe import prefill_moe_sublayer, prefill_ffn_restore
 from prefill_c2a_full import (
-    ATTENTION_STATE, CMP_PACKED, CMP_SCALES, MODES,
+    ATTENTION_STATE, MODES,
     StagedAttentionReference, _report as report_stage,
     golden_reference_c2a, make_attention_inputs, reference_attention,
 )
@@ -130,10 +132,8 @@ def l2_prefill_layer_attention(
     rope_sin: pl.Tensor[[TOKENS, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[TOKENS], pl.INT64],
     window_indices: pl.Tensor[[TOKENS, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[TOKENS, INDEX_TOPK], pl.INT32],
     attn_input: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
     attn_output: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
@@ -152,13 +152,13 @@ def l2_prefill_layer_attention(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
         attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
-        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+        window_cache, compressed_cache,
         compressed_indices, output_window, output_arrived, attn_input, attn_output,
         attn_pre_mix, x_hc_mid, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens,
         attention_epoch,
     )
     retire_prefill_signals(x_hc_mid, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
-    return x_hc_mid, attn_pre_mix, attn_output, attn_input, window_cache, window_cache_scale
+    return x_hc_mid, attn_pre_mix, attn_output, attn_input, window_cache
 
 
 @pl.jit
@@ -265,10 +265,8 @@ def l3_prefill_layer(
     rope_sin: pl.Tensor[[EP_SIZE, TOKENS, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[EP_SIZE, TOKENS], pl.INT64],
     window_indices: pl.Tensor[[EP_SIZE, TOKENS, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, CMP_PACKED], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, CMP_SCALES], pl.BF16],
+    window_cache: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[EP_SIZE, TOKENS, INDEX_TOPK], pl.INT32],
     hc_ffn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[EP_SIZE, 3], pl.FP32],
@@ -321,8 +319,8 @@ def l3_prefill_layer(
             attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank],
             wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank],
             wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank],
-            window_slots[rank], window_indices[rank], window_cache[rank], window_cache_scale[rank],
-            compressed_cache[rank], compressed_cache_scale[rank], compressed_indices[rank],
+            window_slots[rank], window_indices[rank], window_cache[rank],
+            compressed_cache[rank], compressed_indices[rank],
             attn_input[rank], attn_output[rank], attn_pre_mix[rank], x_hc_mid[rank],
             attention_data, attention_signal, rank, num_tokens, layer_epoch, device=rank,
         )
@@ -897,8 +895,8 @@ if __name__ == "__main__":
     initial_state = {}
     result = run(
         fn=l3_prefill_layer,
-        specs=build_specs(args, mode, initial_state),
-        golden_fn=make_layer_golden(mode),
+        specs=pack_cache_specs(build_specs(args, mode, initial_state)),
+        golden_fn=packed_cache_golden(make_layer_golden(mode)),
         compile_only=args.compile_only,
         config=dict(
             backend_type=args.backend_type,
@@ -906,7 +904,7 @@ if __name__ == "__main__":
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
             ring_heap=LAYER_RING_HEAP,
         ),
-        compare_fn=make_layer_compare(mode, args.tokens, initial_state, len(devices)),
+        compare_fn=packed_cache_comparators(make_layer_compare(mode, args.tokens, initial_state, len(devices))),
     )
     print(f"[LAYER] work_dir={result.work_dir}")
     if args.compile_only and result.passed:

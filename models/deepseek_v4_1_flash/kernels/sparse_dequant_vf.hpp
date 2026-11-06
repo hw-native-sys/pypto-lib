@@ -13,13 +13,13 @@ namespace sparse_dequant {
 using namespace pto;
 
 #if defined(__DAV_VEC__) && !defined(__CPU_SIM)
-template <bool FP4, typename Output, typename Payload, typename Factors, typename Indices>
+template <bool FP4, typename Output, typename Payload, typename Indices>
 __tf__ __aicore__ inline void decode_nz(
     typename Output::TileDType __out__ dst, typename Payload::TileDType __in__ src,
-    typename Factors::TileDType __in__ factors, typename Indices::TileDType __in__ ids) {
+    typename Indices::TileDType __in__ ids) {
     auto output = (__ubuf__ uint16_t*)__cce_get_tile_ptr(dst);
     auto input = (__ubuf__ uint8_t*)__cce_get_tile_ptr(src);
-    auto scale = (__ubuf__ uint16_t*)__cce_get_tile_ptr(factors);
+    auto scale = (__ubuf__ uint16_t*)(input + (FP4 ? 256 : 512));
     auto indices = (__ubuf__ int32_t*)__cce_get_tile_ptr(ids);
     constexpr int nz_rows = Output::Rows + (Output::Compact == CompactMode::RowPlusOne ? 1 : 0);
     __VEC_SCOPE__ {
@@ -43,10 +43,10 @@ __tf__ __aicore__ inline void decode_nz(
                 for (uint16_t chunk = 0; chunk < 4; ++chunk) {
                     RegTensor<bfloat16_t> packed, scale16;
                     vector_f4e2m1x2 raw;
-                    vlds((RegTensor<uint8_t>&)raw, input, row * 256 + chunk * 64, UNPK4_B8);
+                    vlds((RegTensor<uint8_t>&)raw, input, row * 544 + chunk * 64, UNPK4_B8);
                     vcvt(packed, raw, all8, PART_P0);
                     vlds((RegTensor<uint16_t>&)scale16,
-                         scale + row * 32 + chunk * 8, 0, E2B_B16);
+                         scale + row * 272 + chunk * 8, 0, E2B_B16);
                     vmul((vector_bf16&)packed, (vector_bf16&)packed, (vector_bf16&)scale16,
                          all16, MODE_ZEROING);
                     // Each int32 predicate lane selects both adjacent BF16 values.
@@ -61,8 +61,8 @@ __tf__ __aicore__ inline void decode_nz(
                     RegTensor<bfloat16_t> b0, b1, packed, unused;
                     RegTensor<float> x0, x1;
                     vector_f8e4m3 raw0, raw1;
-                    vlds((RegTensor<uint8_t>&)raw0, input, row * 512 + chunk * 128, UNPK4_B8);
-                    vlds((RegTensor<uint8_t>&)raw1, input, row * 512 + chunk * 128 + 64, UNPK4_B8);
+                    vlds((RegTensor<uint8_t>&)raw0, input, row * 544 + chunk * 128, UNPK4_B8);
+                    vlds((RegTensor<uint8_t>&)raw1, input, row * 544 + chunk * 128 + 64, UNPK4_B8);
                     vcvt(x0, raw0, all8, PART_P0);
                     vcvt(x1, raw1, all8, PART_P0);
                     // Every finite E4M3 value is exactly representable in BF16.
@@ -72,7 +72,7 @@ __tf__ __aicore__ inline void decode_nz(
                     vdintlv(packed, unused, b0, b1);
                     RegTensor<bfloat16_t> scale16;
                     vgather2((RegTensor<uint16_t>&)scale16,
-                             scale + row * 16 + chunk * 4, group16, all16);
+                             scale + row * 272 + chunk * 4, group16, all16);
                     vmul((vector_bf16&)packed, (vector_bf16&)packed, (vector_bf16&)scale16,
                          all16, MODE_ZEROING);
                     vsel((RegTensor<uint32_t>&)packed, (RegTensor<uint32_t>&)packed,

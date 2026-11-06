@@ -203,7 +203,8 @@ __aicore__ inline void publish_rows(
     Batch<uint8_t, 256>& packed, Batch<bfloat16_t, 32>& scales, Vec<float, 32>& scratch,
     Vec<int64_t, 8>& targets, Vec<int32_t, 8>& tokens, int rows,
     int input_address, int packed_address, int scales_address,
-    __gm__ bfloat16_t* latent, __gm__ uint8_t* cache, __gm__ bfloat16_t* cache_scales) {
+    __gm__ bfloat16_t* latent, __gm__ uint8_t* cache, __gm__ bfloat16_t* cache_scales,
+    int64_t cache_stride, int64_t scale_stride) {
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     for (int row = 0; row < rows; ++row) {
@@ -226,8 +227,8 @@ __aicore__ inline void publish_rows(
         Vec<bfloat16_t, 32> factor;
         TASSIGN(payload, packed_address + row * 256);
         TASSIGN(factor, scales_address + row * 64);
-        GM<uint8_t, 256> output_gm(cache + slot * 256);
-        GM<bfloat16_t, 32> scales_gm(cache_scales + slot * 32);
+        GM<uint8_t, 256> output_gm(cache + slot * cache_stride);
+        GM<bfloat16_t, 32> scales_gm(cache_scales + slot * scale_stride);
         TSTORE(output_gm, payload);
         TSTORE(scales_gm, factor);
         pipe_barrier(PIPE_MTE3);

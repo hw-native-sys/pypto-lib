@@ -86,8 +86,13 @@ __aicore__ inline void flush(__gm__ int64_t* args, int rows, Vec<int64_t, 8>& ta
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     normalize(input.data(), input.data(), weight.data(), rows);
+    auto cache_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    auto cache_data = data<uint8_t>(args, 2);
+    auto scale_data = reinterpret_cast<__gm__ bfloat16_t*>(cache_data + 256);
+    int64_t scale_stride = cache_tensor->strides[1] / sizeof(bfloat16_t);
     publish_rows<true>(input, cosine, sine, packed, scales, scratch, targets, tokens, rows,
-                       0, 8192, 10240, data<bfloat16_t>(args, 7), data<uint8_t>(args, 2), data<bfloat16_t>(args, 3));
+                       0, 8192, 10240, data<bfloat16_t>(args, 6), cache_data, scale_data,
+                       cache_tensor->strides[1], scale_stride);
 }
 
 __aicore__ inline void run(__gm__ int64_t* args) {
@@ -101,9 +106,9 @@ __aicore__ inline void run(__gm__ int64_t* args) {
     TASSIGN(targets, 11136);
     TASSIGN(tokens, 14336);
     TASSIGN(weight, 13312);
-    GM<bfloat16_t, 512> weight_gm(data<bfloat16_t>(args, 6));
+    GM<bfloat16_t, 512> weight_gm(data<bfloat16_t>(args, 5));
     TLOAD(weight, weight_gm);
-    int count_tokens = args[8];
+    int count_tokens = args[7];
     int worker = get_block_idx(args), workers = get_block_num(args);
     int pending = 0;
     for (int base = 0; base < count_tokens; base += 32) {
@@ -126,8 +131,8 @@ __aicore__ inline void run(__gm__ int64_t* args) {
             TASSIGN(cosine, 11200 + pending * 128);
             TASSIGN(sine, 12224 + pending * 128);
             GM<bfloat16_t, 512> input_gm(data<bfloat16_t>(args, 0) + (int64_t)token * 512);
-            GM<float, 32> cos_gm(data<float>(args, 4) + (int64_t)token * 32);
-            GM<float, 32> sin_gm(data<float>(args, 5) + (int64_t)token * 32);
+            GM<float, 32> cos_gm(data<float>(args, 3) + (int64_t)token * 32);
+            GM<float, 32> sin_gm(data<float>(args, 4) + (int64_t)token * 32);
             TLOAD(input, input_gm);
             TLOAD(cosine, cos_gm);
             TLOAD(sine, sin_gm);

@@ -12,11 +12,13 @@
 
 
 import pypto.language as pl
+
+
 import pypto.language.distributed as pld
 from config import (
     FLASH as M, MOE_TOKENS, B_DYN, T_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, TABLE_DYN, ORI_BLOCKS_DYN,
-    CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, STATE_BLOCKS_DYN, COMPRESSED_CACHE_GROUP,
-    INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
+    CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, STATE_BLOCKS_DYN, INDEX_CACHE_GROUP,
+    STATE_CAPACITY, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from compressor import STATE_WIDTH
 from decode_c1a_full import decode_c1a_full
@@ -78,10 +80,8 @@ def l2_decode_layer(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
@@ -171,7 +171,7 @@ def l2_decode_layer(
             wo_a, wo_a_scale, wo_b, wo_b_scale,
             rope_cos, rope_sin,
             window_slots, window_indices,
-            window_cache, window_cache_scale,
+            window_cache,
             attention_output, attention_hidden, attention_pre_mix,
             attention_num_tokens,
         )
@@ -188,7 +188,7 @@ def l2_decode_layer(
                 wo_a, wo_a_scale, wo_b, wo_b_scale,
                 rope_cos, rope_sin,
                 window_slots, window_indices,
-                window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+                window_cache, compressed_cache,
                 token_to_req_indices, compressed_lens,
                 index_cache, index_cache_scale, index_block_table,
                 position_ids,
@@ -216,7 +216,7 @@ def l2_decode_layer(
                 wo_a, wo_a_scale, wo_b, wo_b_scale,
                 rope_cos, rope_sin,
                 window_slots, window_indices,
-                window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+                window_cache, compressed_cache,
                 topk_indices,
                 attention_hidden, attention_pre_mix,
                 attention_num_tokens,
@@ -233,7 +233,7 @@ def l2_decode_layer(
             wo_a, wo_a_scale, wo_b, wo_b_scale,
             rope_cos, rope_sin,
             window_slots, window_indices,
-            window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+            window_cache, compressed_cache,
             request_ids, compressed_lens,
             index_cache, index_cache_scale, index_block_table,
             compressed_rope_cos, compressed_rope_sin,
@@ -258,7 +258,7 @@ def l2_decode_layer(
             wo_a, wo_a_scale, wo_b, wo_b_scale,
             rope_cos, rope_sin,
             window_slots, window_indices,
-            window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+            window_cache, compressed_cache,
             request_ids, compressed_lens,
             index_cache, index_cache_scale, index_block_table,
             pool_block_ids, pool_block_counts,
@@ -279,7 +279,7 @@ def l2_decode_layer(
             wo_a, wo_a_scale, wo_b, wo_b_scale,
             rope_cos, rope_sin,
             window_slots, window_indices,
-            window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+            window_cache, compressed_cache,
             compressed_indices,
             attention_hidden, attention_pre_mix,
             attention_num_tokens,
@@ -333,10 +333,8 @@ def l3_decode_layer(
     rope_sin: pl.Tensor[[EP_SIZE, T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
     window_indices: pl.Tensor[[EP_SIZE, T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.InOut[pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[EP_SIZE, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[EP_SIZE, CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     request_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     position_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
@@ -443,7 +441,7 @@ def l3_decode_layer(
             wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_rank,
             rope_cos[rank], rope_sin[rank],
             window_slots[rank], window_indices[rank],
-            window_cache[rank], window_cache_scale[rank], compressed_cache[rank], compressed_cache_scale[rank],
+            window_cache[rank], compressed_cache[rank],
             request_ids[rank], token_to_req_indices[rank], position_ids[rank], compressed_lens[rank],
             index_cache[rank], index_cache_scale[rank], index_block_table[rank],
             compressed_rope_cos[rank], compressed_rope_sin[rank],
@@ -483,7 +481,8 @@ from enum import IntEnum
 from typing import Any, Mapping
 from quant import (
     decode_e8m0, pack_mx_b_scale, unpack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp4_weight,
-    quantize_mxfp8_cache, quantize_grouped_mxfp8_weight, dequantize_mxfp4_cache,
+    quantize_mxfp8_cache, quantize_grouped_mxfp8_weight, dequantize_mxfp4_cache, pack_cache_specs,
+    packed_cache_comparators, packed_cache_golden,
 )
 from config import DECODE_MAX_TOKENS
 from decode_c1a_full import golden_c1a
@@ -1133,8 +1132,8 @@ if __name__ == "__main__":
     exact = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
     result = run(
         fn=l3_decode_layer,
-        specs=specs,
-        golden_fn=golden_l3_decode_layer,
+        specs=pack_cache_specs(specs),
+        golden_fn=packed_cache_golden(golden_l3_decode_layer),
         compile_only=args.compile_only,
         save_data=args.save_data,
         golden_data=args.golden_data,
@@ -1148,7 +1147,7 @@ if __name__ == "__main__":
             # Attention and the packed EP MoE keep intermediate tensors live together.
             ring_heap=1073741824,
         ),
-        compare_fn={
+        compare_fn=packed_cache_comparators({
             # Window-cache payload and scale tolerances on mapped attention rows.
             "window_cache": mapped_pool_ratio_allclose(
                 "window_slots", pool_name="window cache", mapping_shape=(EP_SIZE, DECODE_MAX_TOKENS),
@@ -1184,7 +1183,7 @@ if __name__ == "__main__":
                 counts,
             ),
             "x_next": _compare_moe_from_actual_attention(counts),
-        },
+        }),
     )
     if result is not None and not result.passed:
         raise SystemExit(result.error or 1)

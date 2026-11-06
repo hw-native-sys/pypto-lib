@@ -11,10 +11,13 @@
 
 
 import pypto.language as pl
+
+from quant import pack_cache_specs, packed_cache_comparators, packed_cache_golden
+
 from config import (
     FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
     Q_START_DYN, STATE_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, STATE_CAPACITY,
-    WINDOW_CACHE_GROUP,
+    WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from compressor import (
     c2a_compressor_publish, STATE_WIDTH, c2a_compressor_project,
@@ -72,10 +75,8 @@ def decode_c2a_full(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
@@ -121,7 +122,7 @@ def decode_c2a_full(
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
-        window_slots, window_cache, window_cache_scale,
+        window_slots, window_cache,
         num_tokens, cache_ready,
     )
 
@@ -132,7 +133,7 @@ def decode_c2a_full(
     compressed_publish_tid = c2a_compressor_publish(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
         state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
-        compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache, compressed_cache_scale,
+        compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache,
     )
 
     select_tid = decode_c2a_indexer(
@@ -146,8 +147,8 @@ def decode_c2a_full(
 
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     _attend_project(
-        query, window_indices, window_cache, window_cache_scale, topk_indices,
-        compressed_cache, compressed_cache_scale, attn_sink,
+        query, window_indices, window_cache, topk_indices,
+        compressed_cache, attn_sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out,
         num_tokens, chunk_done, compressed_keys=INDEX_TOPK,
     )
@@ -184,10 +185,8 @@ def l2_decode_c2a_full(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -231,8 +230,8 @@ def l2_decode_c2a_full(
         wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale,
+        window_cache,
+        compressed_cache,
         token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         position_ids,
@@ -273,10 +272,8 @@ def l3_decode_c2a_full(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -325,8 +322,8 @@ def l3_decode_c2a_full(
         wo_a, wo_a_scale, wo_b, wo_b_scale_mx,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale,
+        window_cache,
+        compressed_cache,
         token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         position_ids,
@@ -665,6 +662,9 @@ def build_c2a_specs(
         values["topk_indices"] = torch.full((tokens, INDEX_TOPK), -1, dtype=torch.int32)
     values["output"] = torch.zeros(tokens, HC_MULT, D)
     values["next_pre_mix"] = torch.zeros(tokens, HC_MULT)
+    from quant import pack_cache_tensors
+
+    values = pack_cache_tensors(values)
     names = l3_decode_c2a_full.param_names if param_names is None else param_names
     specs = [
         TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=partial(torch.clone, values[name]))
@@ -713,9 +713,9 @@ if __name__ == "__main__":
     )
     result = run(
         fn=host,
-        specs=specs,
-        golden_fn=golden_c2a,
-        compare_fn={
+        specs=pack_cache_specs(specs),
+        golden_fn=packed_cache_golden(golden_c2a),
+        compare_fn=packed_cache_comparators({
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "window_cache": mapped_pool_ratio_allclose(
@@ -756,7 +756,7 @@ if __name__ == "__main__":
             ),
             "state_cache": ratio_allclose(atol=1e-3, rtol=1e-3),
             "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-        },
+        }),
         compile_only=args.compile_only,
         save_data=args.save_data,
         golden_data=args.golden_data,

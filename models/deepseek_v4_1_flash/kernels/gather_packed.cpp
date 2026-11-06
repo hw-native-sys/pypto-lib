@@ -65,8 +65,8 @@ __aicore__ inline void load_rows(
         Vec<bfloat16_t, 1, ScaleColumns> factor;
         TASSIGN(row, lane * PayloadColumns * sizeof(T));
         TASSIGN(factor, 16384 + lane * ScaleColumns * sizeof(bfloat16_t));
-        GM<T, 1, PayloadColumns> input(payload + (int64_t)physical * PayloadColumns);
-        GM<bfloat16_t, 1, ScaleColumns> scale(scales + (int64_t)physical * ScaleColumns);
+        GM<T, 1, PayloadColumns> input(payload + (int64_t)physical * (PayloadColumns + 2 * ScaleColumns));
+        GM<bfloat16_t, 1, ScaleColumns> scale(scales + (int64_t)physical * (PayloadColumns / 2 + ScaleColumns));
         TLOAD(row, input);
         TLOAD(factor, scale);
     }
@@ -84,7 +84,10 @@ __aicore__ inline void decode_window(__gm__ int64_t* args, Vec<int32_t, 1, 32>& 
     TASSIGN(scales, 16384);
     TASSIGN(factors, 131072);
     TASSIGN(values, 65536);
-    load_rows<float8_e4m3_t, 512, 16>(data<float8_e4m3_t>(args, 0), data<bfloat16_t>(args, 1), ids);
+    auto cache = data<uint8_t>(args, 0);
+    auto payload_data = reinterpret_cast<__gm__ float8_e4m3_t*>(cache);
+    auto scale_data = reinterpret_cast<__gm__ bfloat16_t*>(cache + 512);
+    load_rows<float8_e4m3_t, 512, 16>(payload_data, scale_data, ids);
     TCVT(factors, scales, RoundMode::CAST_RINT);
     TCVT(values, payload, RoundMode::CAST_RINT);
     multiply_groups<5, decltype(values), decltype(factors)>(values.data(), values.data(), factors.data());
@@ -101,7 +104,9 @@ __aicore__ inline void decode_compressed(__gm__ int64_t* args, Vec<int32_t, 1, 3
     TASSIGN(scales, 16384);
     TASSIGN(factors, 131072);
     TASSIGN(values, 65536);
-    load_rows<uint8_t, 256, 32>(data<uint8_t>(args, 2), data<bfloat16_t>(args, 3), ids);
+    auto cache = data<uint8_t>(args, 1);
+    auto scale_data = reinterpret_cast<__gm__ bfloat16_t*>(cache + 256);
+    load_rows<uint8_t, 256, 32>(cache, scale_data, ids);
     TCVT(factors, scales, RoundMode::CAST_RINT);
     TCVT(output, payload, RoundMode::CAST_RINT);
     TCVT(values, output, RoundMode::CAST_RINT);
@@ -117,17 +122,17 @@ __aicore__ inline void gather(__gm__ int64_t* args) {
     TASSIGN(output, 32768);
     TASSIGN(zero, 135424);
     TEXPANDS(zero, (bfloat16_t)0.0f);
-    int tokens = args[8];
+    int tokens = args[6];
     int worker = get_block_idx(args);
     int workers = get_block_num(args);
     for (int block = worker; block < tokens * 20; block += workers) {
         int token = block / 20;
         int column = block % 20 * 32;
-        int source = column < 128 ? 4 : 5;
+        int source = column < 128 ? 2 : 3;
         int source_column = column < 128 ? column : column - 128;
         auto source_tensor = reinterpret_cast<__gm__ Tensor*>(args[source]);
-        auto output_tensor = reinterpret_cast<__gm__ Tensor*>(args[6]);
-        auto indices_tensor = reinterpret_cast<__gm__ Tensor*>(args[7]);
+        auto output_tensor = reinterpret_cast<__gm__ Tensor*>(args[4]);
+        auto indices_tensor = reinterpret_cast<__gm__ Tensor*>(args[5]);
         GM<int32_t, 1, 32> input_ids(
             data<int32_t>(args, source) + (int64_t)token * source_tensor->strides[0] + source_column);
         TLOAD(ids, input_ids);
@@ -135,8 +140,8 @@ __aicore__ inline void gather(__gm__ int64_t* args) {
         wait_flag(PIPE_MTE2, PIPE_S, EVENT_ID0);
         if (column < 128) decode_window(args, ids, output);
         else decode_compressed(args, ids, output);
-        auto dst = data<bfloat16_t>(args, 6) + (int64_t)token * output_tensor->strides[0] + column * 512;
-        auto combined = data<int32_t>(args, 7) + (int64_t)token * indices_tensor->strides[0] + column;
+        auto dst = data<bfloat16_t>(args, 4) + (int64_t)token * output_tensor->strides[0] + column * 512;
+        auto combined = data<int32_t>(args, 5) + (int64_t)token * indices_tensor->strides[0] + column;
         GM<bfloat16_t, 32, 512> output_gm(dst);
         GM<int32_t, 1, 32> indices_gm(combined);
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);

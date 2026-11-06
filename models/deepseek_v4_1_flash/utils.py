@@ -207,8 +207,8 @@ def _publish_quantized_cache(
 
 
 DECODE_CACHE_NAMES = {
-    "window_cache_pool": "window_cache", "window_cache_scale_pool": "window_scales",
-    "compressed_cache_pool": "compressed_cache", "compressed_cache_scale_pool": "compressed_scales",
+    "window_cache_pool": "window_cache",
+    "compressed_cache_pool": "compressed_cache",
     "index_cache_pool": "index_cache", "index_cache_scale_pool": "index_scales",
     "state_cache_pool": "state_cache",
 }

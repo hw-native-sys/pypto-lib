@@ -9,12 +9,14 @@
 """Publish one V4.1 DSpark draft layer's context KV into its SWA cache."""
 
 import pypto.language as pl
+
+
 import torch
 
-from config import FLASH, ORI_BLOCKS_DYN
+from config import FLASH, ORI_BLOCKS_DYN, WINDOW_CACHE_BYTES
 from qkv_proj_rope import golden_rope_interleave, quantize_projection_input, kv_proj, window_publish
 from gemm import golden_mxfp8_linear_grouped_sum
-from quant import quantize_mxfp8_cache
+from quant import quantize_mxfp8_cache, pack_cache_specs, packed_cache_comparators, packed_cache_golden
 from rmsnorm import golden_rms_norm
 
 
@@ -74,8 +76,7 @@ def dspark_context_kv(
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     context_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Use the draft layer's own WKV, norm, and paged cache mapping."""
@@ -86,10 +87,10 @@ def dspark_context_kv(
     projected = kv_proj(kv_input_payload, kv_input_scales, wkv, wkv_scale, projected, num_tokens)
     window_publish(
         projected, kv_norm_weight, rope_cos, rope_sin,
-        context_slots, window_cache, window_cache_scale,
+        context_slots, window_cache,
         num_tokens, window_input_ready,
     )
-    return window_cache, window_cache_scale
+    return window_cache
 
 
 @pl.jit
@@ -101,8 +102,7 @@ def dspark_context_kv_test(
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     context_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_cache: pl.InOut[pl.Tensor[[3, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[3, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[3, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Publish through a middle-layer view while retaining both guard layers."""
@@ -111,7 +111,6 @@ def dspark_context_kv_test(
     rope_sin.bind_dynamic(0, T_DYN)
     context_slots.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
-    window_cache_scale.bind_dynamic(1, ORI_BLOCKS_DYN)
     dspark_context_kv(
         main_x,
         wkv,
@@ -121,10 +120,9 @@ def dspark_context_kv_test(
         rope_sin,
         context_slots,
         window_cache[1],
-        window_cache_scale[1],
         num_tokens,
     )
-    return window_cache, window_cache_scale
+    return window_cache
 
 
 def _compare_context_cache(
@@ -227,9 +225,9 @@ if __name__ == "__main__":
     compare = {name: _compare_context_cache for name in ("window_cache", "window_cache_scale")}
     result = run(
         fn=dspark_context_kv_test,
-        specs=specs,
-        golden_fn=golden,
-        compare_fn=compare,
+        specs=pack_cache_specs(specs),
+        golden_fn=packed_cache_golden(golden),
+        compare_fn=packed_cache_comparators(compare),
         config={"backend_type": "a5", "device_id": args.device,
                 "execution_mode": args.execution_mode or args.platform == "a5sim"},
         compile_only=args.compile_only,
