@@ -76,21 +76,36 @@ def packed_query_lengths(tokens, requests, query_lens=None):
     return list(query_lens)
 
 
+def validate_request_id_tensors(host_token_to_req_indices, device_token_to_req_indices, num_tokens):
+    """Check CPU snapshots of the active Host/Device request mapping in debug or golden validation."""
+    for name, value in (("host_token_to_req_indices", host_token_to_req_indices), ("device_token_to_req_indices", device_token_to_req_indices)):
+        if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
+            raise ValueError(f"{name} validation requires a CPU snapshot; device readback must be explicit")
+        if value.dtype != torch.int32 or value.ndim != 1:
+            raise ValueError(f"{name} must be a rank-1 INT32 tensor")
+    if host_token_to_req_indices.shape != device_token_to_req_indices.shape:
+        raise ValueError("Host/Device request mapping capacities must match")
+    if not 0 <= num_tokens <= host_token_to_req_indices.numel():
+        raise ValueError("num_tokens must fit the request mapping capacity")
+    if not torch.equal(host_token_to_req_indices[:num_tokens], device_token_to_req_indices[:num_tokens]):
+        raise ValueError("Host/Device request mappings disagree in the active token range")
+
+
 def paged_slots(
     positions: torch.Tensor,
-    request_ids: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
     storage_block_size: int = BLOCK_SIZE,
     logical_divisor: int = 1,
     publish_only_complete: bool = False,
 ) -> torch.Tensor:
     """Map logical token positions to flattened physical cache rows."""
-    if positions.ndim != 1 or request_ids.shape != positions.shape or block_table.ndim != 2:
-        raise ValueError("positions/request_ids must be matching vectors and block_table must be a matrix")
+    if positions.ndim != 1 or token_to_req_indices.shape != positions.shape or block_table.ndim != 2:
+        raise ValueError("positions/token_to_req_indices must be matching vectors and block_table must be a matrix")
     if storage_block_size <= 0 or logical_divisor <= 0:
         raise ValueError("storage_block_size and logical_divisor must be positive")
-    if any(value.dtype not in (torch.int32, torch.int64) for value in (positions, request_ids, block_table)):
-        raise ValueError("positions, request_ids and block_table must contain integer indices")
+    if any(value.dtype not in (torch.int32, torch.int64) for value in (positions, token_to_req_indices, block_table)):
+        raise ValueError("positions, token_to_req_indices and block_table must contain integer indices")
     publish = torch.ones_like(positions, dtype=torch.bool)
     if publish_only_complete and logical_divisor > 1:
         publish = (positions + 1).remainder(logical_divisor) == 0
@@ -98,12 +113,12 @@ def paged_slots(
     logical = torch.div(positions[publish], logical_divisor, rounding_mode="floor")
     logical_block = torch.div(logical, storage_block_size, rounding_mode="floor")
     offset = logical.remainder(storage_block_size)
-    active_requests = request_ids[publish]
+    active_requests = token_to_req_indices[publish]
     if bool(((active_requests < 0) | (active_requests >= block_table.shape[0])).any()):
         raise ValueError("published request id is outside the block table")
     if bool(((logical_block < 0) | (logical_block >= block_table.shape[1])).any()):
         raise ValueError("block table does not cover a required logical page")
-    physical = block_table[request_ids[publish].to(torch.long), logical_block.to(torch.long)]
+    physical = block_table[token_to_req_indices[publish].to(torch.long), logical_block.to(torch.long)]
     if bool((physical < 0).any()):
         raise ValueError("required logical page has no physical allocation")
     slots[publish] = physical.to(torch.int64) * storage_block_size + offset.to(torch.int64)
@@ -112,19 +127,19 @@ def paged_slots(
 
 def window_metadata(
     positions: torch.Tensor,
-    request_ids: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
     window: int = M.sliding_window,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build paged write slots plus causal indices for the visible sliding window."""
-    slots = paged_slots(positions, request_ids, block_table)
+    slots = paged_slots(positions, token_to_req_indices, block_table)
     lens = torch.minimum(positions + 1, torch.full_like(positions, window)).to(torch.int32)
     offsets = torch.arange(window, device=positions.device)
     starts = positions - lens.to(positions.dtype) + 1
     visible = starts.unsqueeze(-1) + offsets
     valid = offsets.unsqueeze(0) < lens.unsqueeze(-1)
     indices = torch.full_like(visible, -1, dtype=torch.int64)
-    visible_requests = request_ids.unsqueeze(-1).expand_as(visible)
+    visible_requests = token_to_req_indices.unsqueeze(-1).expand_as(visible)
     indices[valid] = paged_slots(visible[valid], visible_requests[valid], block_table)
     return slots, indices.to(torch.int32), lens
 
