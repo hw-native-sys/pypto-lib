@@ -99,6 +99,11 @@ inputs:
       Workspace-relative dir to check the repo out into (also the venv /
       activate.sh home). Isolates each job's tree on the shared self-hosted host.
     required: true
+  runtime-platform:
+    description: >-
+      Simpler runtime to build: a2a3, a5, a2a3sim, or a5sim. Select the
+      job's NPU target explicitly; the CPU architecture does not identify it.
+    required: true
   needs-device:
     description: >-
       When 'true' the job talks to an NPU: have activate.sh source CANN's
@@ -184,12 +189,18 @@ runs:
       shell: bash
       env:
         NEEDS_DEVICE: ${{ inputs.needs-device }}
+        RUNTIME_PLATFORM: ${{ inputs.runtime-platform }}
         CCACHE_NAME: ${{ inputs.ccache-name }}
         PIP_CACHE_NAME: ${{ inputs.pip-cache-name }}
         BUILD_NAMESPACE: ${{ inputs.build-namespace }}
         TOOLCHAIN_IN: ${{ inputs.toolchain }}
       run: |
         set -uo pipefail
+        case "$NEEDS_DEVICE:$RUNTIME_PLATFORM" in
+          true:a2a3|true:a5|false:a2a3sim|false:a5sim) ;;
+          *) echo "::error::runtime-platform must match needs-device (a2a3/a5 for device, a2a3sim/a5sim for sim)"
+             exit 1 ;;
+        esac
         # Prerequisites CI does not create, so they must already be there. The
         # simulator needs no Ascend env, so CANN_ROOT is device-jobs-only. Model
         # dirs are only needed by the serving job, which checks its own.
@@ -671,6 +682,7 @@ runs:
       working-directory: ${{ inputs.checkout-path }}
       env:
         INSTALL_TORCH_NPU: ${{ inputs.install-torch-npu }}
+        RUNTIME_PLATFORM: ${{ inputs.runtime-platform }}
         TORCH_VERSION: ${{ inputs.torch-version }}
       run: |
         source activate.sh
@@ -690,10 +702,14 @@ runs:
         }
         # Same split, for producing a wheel instead of installing one.
         py_build_wheel() {  # <out-dir> <source-dir>
+          local settings=()
+          if [ "$2" = "$PYPTO_SRC/runtime" ]; then
+            settings+=("--config-settings=build.targets=build_package_${RUNTIME_PLATFORM}")
+          fi
           if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
-            uv build --wheel --no-build-isolation --out-dir "$1" "$2"
+            uv build --wheel --no-build-isolation --out-dir "$1" "$2" "${settings[@]}"
           else
-            pip wheel --no-build-isolation --no-deps --wheel-dir "$1" "$2"
+            pip wheel --no-build-isolation --no-deps --wheel-dir "$1" "$2" "${settings[@]}"
           fi
         }
         if [ "${PYPTO_USE_UV:-false}" != "true" ]; then
@@ -777,7 +793,13 @@ runs:
             sleep $((attempt * 10))
           done
         }
-        retry_build() { retry_native "$1" py_install --no-build-isolation "$1"; }
+        retry_build() {
+          local settings=()
+          if [ "$1" = "$PYPTO_SRC/runtime" ]; then
+            settings+=("--config-settings=build.targets=build_package_${RUNTIME_PLATFORM}")
+          fi
+          retry_native "$1" py_install --no-build-isolation "$1" "${settings[@]}"
+        }
 
         # ----------------------------------------------------------------------
         # Wheel cache — a second layer above ccache, aimed at a different axis.
@@ -870,25 +892,12 @@ runs:
         # this checkout, is what gets built here.
         pypto_tree="$(git -C "$PYPTO_SRC" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
         simpler_tree="$(git -C "$PYPTO_SRC/runtime" rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
-        # ...and the set of runtimes the build host could actually produce.
-        # Installing simpler runs simpler_setup/build_runtimes.py, which asks what
-        # the toolchain supports: gcc alone yields the a2a3sim / a5sim runtimes,
-        # and the onboard a2a3 / a5 pair is added only when ccec and CANN's
-        # cross-compiler are both there. That is exactly the difference between a
-        # sim job and a device job ON THIS HOST — cpu-N and npu-N are runner
-        # instances of the same machine and share one CI_CACHE_ROOT — so without
-        # this dimension a device job could install a simulator-only simpler and
-        # fail at run time rather than at install time.
-        #
-        # Probed with the same predicate build_runtimes.detect_buildable_platforms()
-        # uses, rather than keyed on the needs-device input: the input says what
-        # the job wants, this says what the build produced. CANN identifies itself
-        # in there too, because the onboard runtimes are compiled against that
-        # toolkit and an upgrade must not be served the old ones. CANN_ROOT is a
-        # symlink on at least one runner, so resolve it before taking a basename.
-        simpler_rt="sim"
-        if command -v ccec >/dev/null 2>&1 &&
-           [ -f "${ASCEND_HOME_PATH:-}/tools/hcc/bin/aarch64-target-linux-gnu-g++" ]; then
+        # The explicit runtime target is part of the wheel identity. CPU and
+        # NPU jobs can share CI_CACHE_ROOT, but must not reuse another platform's
+        # wheel. Device wheels also depend on the active CANN SDK; simulator
+        # builds do not, even if CANN happens to be installed on the host.
+        simpler_rt="$RUNTIME_PLATFORM"
+        if [ "$RUNTIME_PLATFORM" = a2a3 ] || [ "$RUNTIME_PLATFORM" = a5 ]; then
           cann_id="$(basename "$(readlink -f "${CANN_ROOT:-}")" 2>/dev/null || echo unknown)"
           # This metadata is optional; an unmatched glob must not abort the
           # setup shell under -e and pipefail before either wheel is built.
@@ -902,7 +911,7 @@ runs:
           if [ -n "$cann_info" ]; then
             cann_id="$cann_id-$(sha256sum "$cann_info" | cut -c1-12)"
           fi
-          simpler_rt="sim-onboard-$cann_id"
+          simpler_rt="$RUNTIME_PLATFORM-$cann_id"
         fi
         if [ -z "$pypto_tree" ] || [ -z "$simpler_tree" ] ||
            [ -z "$toolchain_prefix" ] || [ -z "$build_inputs" ]; then

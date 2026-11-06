@@ -65,6 +65,7 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'false'
+          runtime-platform: ${{ matrix.platform }}
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
           toolchain: bundle
@@ -167,6 +168,7 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'true'
+          runtime-platform: ${{ matrix.platform }}
           build-namespace: ${{ matrix.platform }}-daily
           pip-cache-name: pip-${{ matrix.platform }}
           toolchain: bundle
@@ -279,6 +281,7 @@ jobs:
         with:
           checkout-path: operator-checkout
           needs-device: 'true'
+          runtime-platform: ${{ matrix.platform }}
           build-namespace: operator-performance-${{ matrix.platform }}
           pip-cache-name: pip-operator-performance-${{ matrix.platform }}
           toolchain: bundle

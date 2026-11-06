@@ -190,6 +190,7 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'false'
+          runtime-platform: ${{ matrix.platform }}
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
           toolchain: bundle
@@ -248,6 +249,7 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'true'
+          runtime-platform: ${{ matrix.platform }}
           build-namespace: ${{ matrix.platform }}-ci
           pip-cache-name: pip-${{ matrix.platform }}
           toolchain: bundle
@@ -347,6 +349,7 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'true'
+          runtime-platform: a2a3
           build-namespace: serving
           toolchain: bundle
           # Serving uses PyPTO/simpler for NPU execution; it does not need
@@ -409,6 +412,7 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'true'
+          runtime-platform: a2a3
           build-namespace: serving
           toolchain: bundle
           # DeepSeek V4 uses CPU Torch; its V4.1 loader needs Torch 2.10's
@@ -477,6 +481,7 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'true'
+          runtime-platform: a2a3
           build-namespace: serving
           toolchain: bundle
           # Serving uses PyPTO/simpler for NPU execution; it does not need
