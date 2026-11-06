@@ -614,6 +614,30 @@ for EP2/EP4 and select 512 MiB for EP8 or 1 GiB for EP16 on ring zero. An enclos
 forward must additionally budget its own live allocations and pass sufficient
 runtime capacity; see [runtime ring sizing](../../debug-and-tune/ring-heap-and-scope-stats.md).
 
+### Routed expert measurements
+
+`expert_routed.py` pairs the INT8 Gate/Up projections around a resident L1
+input tile, uses 128-column projection fragments and groups two W2 output
+tiles per epilogue block. The routed-expert implementation shared by prefill
+and decode retains its 16-row tiles and existing rounding and quantization
+boundaries.
+The standalone entry supports `--save-data` and `--golden-data` for replay.
+
+On A3 device 0, with hidden size 4096, intermediate size 2048 and 18 local
+experts, single-card `effective_us` medians were measured over 100 rounds
+after 5 warmups. Each optimized case replayed the corresponding mainline
+frozen inputs and golden outputs and passed the existing comparator.
+Rows below are received routed rows distributed across the local experts.
+
+| Received rows | Mainline (us) | Optimized (us) | Latency reduction |
+| ---: | ---: | ---: | ---: |
+| 1 | 81.45 | 77.37 | 5.0% |
+| 17 | 481.92 | 425.81 | 11.6% |
+| 96 | 507.81 | 454.41 | 10.5% |
+| 512 | 878.12 | 744.74 | 15.2% |
+
+These component measurements do not establish serving throughput gains.
+
 ### Vocabulary operators
 
 `lookup_embedding.py` gathers from one BF16 vocabulary shard using global token

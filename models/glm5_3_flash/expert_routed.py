@@ -35,13 +35,13 @@ RECV_DYN = pl.dynamic('GLM53_RECV_DYN')
 SWIGLU_LIMIT = FLASH.swiglu_limit
 RECV_TILE = 16  # expert row tile: matmul rows must be a multiple of 16
 K_TILE = 512  # gate/up K tile over D = 4096
-MM_INTER_TILE = 256  # gate/up N tile; 2 * MOE_INTER must be a multiple
+MM_INTER_TILE = 128  # gate/up N tile; MOE_INTER must be a multiple
 ACT_INTER_TILE = 128  # Bounds the compensated sigmoid working set
 QUANT_TILE = 512  # per-row requant tile
 INTER_K_TILE = 512  # w2 K tile (= moe_intermediate_size)
 D_OUT_TILE = 256  # w2 N tile over D
 D_ACT_TILE = 512
-W2_GROUP_TILE = 8
+W2_GROUP_TILE = 2
 T_DYN_TEST = 64
 
 
@@ -70,18 +70,25 @@ def expert_routed(
             valid_rows = pl.min(pl.cast(RECV_TILE, pl.INDEX), n_rows - tile_row)
             flat_row = e_start + tile_row
 
-            # Fused gate/up cube matmul: w_gate_up rows [0, 2*MOE_INTER) contract
-            # the same INT8 x rows, so one K-loop fills both halves of the INT32
-            # accumulator. w_k is the per-expert [1, N, K] slice.
+            # Paired gate/up projections share a resident INT8 input tile.
             gate_up_i32 = pl.create_tensor([RECV_TILE, 2 * MOE_INTER], dtype=pl.INT32)
-            for nb in pl.spmd(2 * MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_mm", allow_early_resolve=True):
+            for nb in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_mm", allow_early_resolve=True):
                 n0 = nb * MM_INTER_TILE
-                acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                    xs_k = pl.slice(x_int8, [RECV_TILE, K_TILE], [flat_row, k0], valid_shape=[valid_rows, K_TILE])
-                    w_k = w_gate_up[local_e : local_e + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                    acc = pl.matmul_acc(acc, xs_k, w_k, b_trans=True, init_cond=(k0 == 0))
-                gate_up_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(acc, [RECV_TILE, MM_INTER_TILE])
+                x_l1 = pl.create_l1([RECV_TILE, D], dtype=pl.INT8)
+                x_l1 = pl.gather_row(x_l1, x_int8, [0, 0], [flat_row, 0], [RECV_TILE, D], valid_shape=[valid_rows, D])
+                xs_first = pl.slice(x_l1, [RECV_TILE, K_TILE], [0, 0], valid_shape=[valid_rows, K_TILE])
+                gate_first = w_gate_up[local_e:local_e + 1, n0:n0 + MM_INTER_TILE, 0:K_TILE]
+                up_first = w_gate_up[local_e:local_e + 1, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE, 0:K_TILE]
+                gate_acc = pl.matmul(xs_first, gate_first, b_trans=True, out_dtype=pl.INT32)
+                up_acc = pl.matmul(xs_first, up_first, b_trans=True, out_dtype=pl.INT32)
+                for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
+                    xs_k = pl.slice(x_l1, [RECV_TILE, K_TILE], [0, k0], valid_shape=[valid_rows, K_TILE])
+                    gate_k = w_gate_up[local_e:local_e + 1, n0:n0 + MM_INTER_TILE, k0:k0 + K_TILE]
+                    up_k = w_gate_up[local_e:local_e + 1, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE, k0:k0 + K_TILE]
+                    gate_acc = pl.matmul_acc(gate_acc, xs_k, gate_k, b_trans=True)
+                    up_acc = pl.matmul_acc(up_acc, xs_k, up_k, b_trans=True)
+                gate_up_i32[:, n0:n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
+                gate_up_i32[:, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE] = pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
 
             # Activation epilogue: dequant (per-token x scale x per-channel weight
             # scale), clamped SwiGLU, per-row amax, INT8 requant for w2. The
@@ -90,9 +97,6 @@ def expert_routed(
             h_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
             h_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             h_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_i8_init"):
-                h_i8_value_full = pl.full([RECV_TILE, MOE_INTER], dtype=pl.FP16, value=0.0)
-                h_i8[:, :] = pl.cast(h_i8_value_full, target_type=pl.INT8, mode="trunc")
             for act_blk in pl.spmd(MOE_INTER // ACT_INTER_TILE, name_hint="exp_gate_up_act"):
                 a0 = act_blk * ACT_INTER_TILE
                 x_scale_col = pl.slice(x_scale, [RECV_TILE, 1], [flat_row, 0], valid_shape=[valid_rows, 1])
@@ -549,6 +553,8 @@ def main():
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", default=None)
     args = parser.parse_args()
     if args.num_tokens < 1:
         parser.error("--num-tokens must be positive")
@@ -559,6 +565,8 @@ def main():
         fn=expert_routed_test,
         specs=build_tensor_specs(args.num_tokens),
         golden_fn=golden_expert_routed_fn,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         config=dict(dump_passes=args.dump_passes, backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane),
         compile_only=args.compile_only,
         rtol=0.001,
