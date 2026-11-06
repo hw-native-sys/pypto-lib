@@ -25,6 +25,9 @@ from typing import Any
 TARGET_LAYERS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
 SESSION = "deepseek-v4.1-flash-a3-decode"
 TOPOLOGY = {"dp": 2, "tp": 1, "ep": 2, "pp": 1, "pcp": 1, "dcp": 1}
+REFERENCE_COMMIT = "23d1d9055f2161b3c15613c7fc309f7d5d2ef629"
+REFERENCE_ROOT = "/mnt/data/pyptouser/liufei-shared-envs/vllm-a3-0.31.0-20261031"
+REFERENCE_PYTHON = f"{REFERENCE_ROOT}/vllm-python.sh"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -62,6 +65,78 @@ def _stage_entry(layer: int, ratio: int, engram: bool) -> dict[str, Any]:
     return {"module": "decode_c1a_reuse", "status": "stage_factory_only"}
 
 
+def _execution_plan(
+    layer: int,
+    *,
+    checkpoint: Path,
+    assets_root: Path,
+    product_root: Path,
+) -> dict[str, Any]:
+    """Return fixed, non-running commands for one independent layer replay."""
+
+    reference_output = assets_root / f"decode_ep2_l{layer}"
+    product_report = product_root / f"decode-layer-ep2-l{layer}.json"
+    # Keep shell variables literal in the recorded command.  They are
+    # resolved only inside the queue job after task-submit allocates devices.
+    capture = (
+        "task-submit --device auto --device-num 2 --run "
+        "\"bash -lc 'set -euo pipefail; "
+        "export VLLM_USE_V2_MODEL_RUNNER=0; "
+        "export SOC_VERSION=ascend910_9382; "
+        f"{REFERENCE_PYTHON} tools/deepseek_v41_vllm_capture.py "
+        f"--release-root {REFERENCE_ROOT} --checkpoint {checkpoint} "
+        f"--output {reference_output} --layer-id {layer} "
+        "--history-length 8 --max-model-len 128 "
+        "--task-device \\$TASK_DEVICE --capture-task \\$TASK_ID'\""
+    )
+    replay = (
+        "task-submit --device auto --device-num 2 --run "
+        "\"source /mnt/data/pyptouser/liufei-shared-envs/"
+        "pypto-a3-72a62d13-20261031/activate-shared-pypto.sh; "
+        "export PYPTO_A3_STATE_DIR=\\$PWD/.pypto-a3-state; "
+        "export SOC_VERSION=ascend910_9382; "
+        "export DEEPSEEK_V41_CHECKPOINT="
+        f"{checkpoint}; "
+        "PYTHONPATH=\\$PWD python tools/deepseek_v41_pypto_layer_ep2_runner.py "
+        f"--layer-id {layer} --assets {reference_output} "
+        f"--cache-assets {reference_output} --record {product_report}\""
+    )
+    return {
+        "reference": {
+            "status": "ready_to_submit" if checkpoint.is_dir() else "blocked_missing_checkpoint",
+            "commit": REFERENCE_COMMIT,
+            "python": REFERENCE_PYTHON,
+            "topology": {**TOPOLOGY, "devices": 2},
+            "output": str(reference_output),
+            "command": capture,
+            "required_files": [
+                "checkpoint.json",
+                "decode_input.json",
+                "history_cache.npz",
+                "reference_capture.json",
+                "rank0/capture.json",
+                "rank1/capture.json",
+                "rank0/layer_capture.npz",
+                "rank1/layer_capture.npz",
+                "rank0/moe_capture.npz",
+                "rank1/moe_capture.npz",
+            ],
+        },
+        "product": {
+            "status": "not_run",
+            "topology": {**TOPOLOGY, "devices": 2},
+            "record": str(product_report),
+            "command": replay,
+            "requires": [
+                "reference_capture.json",
+                "decode_input.json",
+                "history_cache.npz",
+                "complete layer-specific PyPTO entrypoint",
+            ],
+        },
+    }
+
+
 def build_report(
     checkpoint: str | Path,
     *,
@@ -82,6 +157,8 @@ def build_report(
         raise ValueError("checkpoint weight_map is missing")
     assets = Path(assets_root).expanduser().resolve() if assets_root else None
     product = Path(product_root).expanduser().resolve() if product_root else None
+    plan_assets = assets or (root.parent / ".pypto-a3-state" / "reference")
+    plan_product = product or (root.parent / ".pypto-a3-state" / "product")
     layers: list[dict[str, Any]] = []
     for layer in TARGET_LAYERS:
         ratio = ratios[layer]
@@ -132,6 +209,12 @@ def build_report(
                 "product_accuracy": product_status,
                 "representative_status": "pass" if product_status == "pass" and asset_dir else "not_run",
                 "stage_entry": _stage_entry(layer, ratio, layer in {1, 14}),
+                "execution_plan": _execution_plan(
+                    layer,
+                    checkpoint=root,
+                    assets_root=plan_assets,
+                    product_root=plan_product,
+                ),
                 # A single active-request EP2 replay is not the formal gate.
                 # Keep this independent from the representative report so a
                 # report with ``status=pass`` cannot promote a layer.
