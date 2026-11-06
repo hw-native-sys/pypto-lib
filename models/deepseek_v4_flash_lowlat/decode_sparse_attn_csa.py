@@ -409,7 +409,7 @@ def sparse_attn_csa_packed(
         m_li = sparse_blk_li[m_h0 : m_h0 + H_TILE, 0 : 1]
         m_oi = sparse_blk_oi[m_h0 : m_h0 + H_TILE, 0 : HEAD_DIM]
 
-        for m_sb in pl.pipeline(1, SPARSE_BLOCKS, stage=2):
+        for m_sb in pl.range(1, SPARSE_BLOCKS):
             m_row = m_sb * H + m_h0
             m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
             m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]

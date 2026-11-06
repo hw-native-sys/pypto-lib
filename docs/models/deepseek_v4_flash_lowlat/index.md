@@ -233,9 +233,10 @@ softmax merge position. Valid tiles retain their K16 products and arithmetic.
 
 CSA packs the independent alpha and beta exponential arguments into one
 full-valid row tile and evaluates the sink on a full-valid row tile after the
-merge. It retains the same compensated signed exponential, evaluation count,
-ascending block recurrence and stage-two pipeline. This bounds generated
-simulator C++ size without adding global-memory buffers or tasks.
+merge. It retains the same compensated signed exponential, evaluation count
+and ascending block recurrence. A sequential merge loop avoids duplicating
+the exponential body across pipeline stages. This bounds generated simulator
+C++ size without adding global-memory buffers or tasks.
 
 - Default execution and `--smoke` execute all 43 layers without a numerical
   comparison. They permit generated inputs or input-only replay and report
