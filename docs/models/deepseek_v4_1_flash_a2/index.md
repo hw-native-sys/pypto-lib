@@ -155,6 +155,28 @@ The independent vLLM-Ascend capture is described by
 [`decode_reference.py`](../../../models/deepseek_v4_1_flash_a2/decode_reference.py)
 and is not imported by the product path.
 
+Before cards are allocated, prepare the independent physical-layer plans with
+the no-device preflight:
+
+```bash
+PYTHONPATH=$PWD python tools/deepseek_v41_layer_preflight.py \
+  --checkpoint /mnt/data/models/DeepSeek-V4.1-Flash-w8a8
+```
+
+This writes one plan for each retained layer under
+`.pypto-a3-state/decode-assets/layers/l*/`. Plans contain only metadata and
+queue commands. The reference process must later create the real
+`decode_input.json`, cache and capture files; the preflight never synthesizes
+those assets. Run the reference command from a plan through the two-card
+queue, validate all required files, and only then add the complete PyPTO layer
+runner for that physical layer.
+
+Generic `layer_capture.npz` and `moe_capture.npz` files do not satisfy a
+non-SWA layer plan. C2A/C1A captures must also declare complete semantic
+`compressed_kv_cache`, `index_cache`, `index_scale` and (for C1A)
+`candidate_pool` state in `reference_capture.json`; L1/L14 must mark the
+captured Engram rows.
+
 ## Independent Decode acceptance
 
 The Decode session starts with every formal gate at `not_run`. Search K=2 is
@@ -204,6 +226,13 @@ MoE boundary has executed on A3 with the checkpoint and the vLLM-Ascend
 capture input; `logits`, `route_ids`, `route_weights`, and the merged MoE
 output pass the `rtol=0.05, atol=0.05` gate. The evidence is recorded in
 `.pypto-a3-state/product/decode-ep2-l0-v25e.json`.
+
+The same PyPTO MoE boundary replay has also passed for L1, L2, L3, L14, L15,
+L19, L20, L21, L24 and L25 using their layer-specific vLLM-Ascend captures.
+Those reports compare logits, exact top-six route IDs, route weights and the
+merged routed/shared output. They are component evidence only; each complete
+physical layer remains `not_run` until its attention, cache/index, mHC and
+Engram state are composed and compared.
 
 The complete L0 composition has also executed on the same two-card A3
 topology with mHC attention, SWA cache read/write, FFN residual, routed/shared

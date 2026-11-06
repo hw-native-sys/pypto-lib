@@ -135,6 +135,19 @@ from formal accuracy, and keep all reference, NPU, and accuracy fields at
 Capacity-16 stage construction is setup evidence only; it is not a layer
 precision result.
 
+The no-device per-layer preflight is recorded by
+`tools/deepseek_v41_layer_preflight.py`. It creates one plan directory for each
+of L0, L1, L2, L3, L14, L15, L19, L20, L21, L24 and L25 under
+`.pypto-a3-state/decode-assets/layers/`. Each plan fixes the layer mode,
+compression/cache source, weight shards, Engram assets, EP2 topology, input
+state boundary, reference command, product command status and recovery rule.
+It never creates placeholder token/cache/capture files. The only complete
+product layer entrypoint currently exposed is L0; all other product replay
+commands remain blocked until their full A2/A3 layer composition is added.
+The verifier also rejects generic layer/MoE captures for non-SWA layers: C2A
+and C1A require semantic compressed-KV, index-cache/scale and (for C1A)
+candidate-pool state, while L1/L14 require captured Engram rows.
+
 | gate | status | recovery condition |
 | --- | --- | --- |
 | product import/dependency scan | `pass` | Keep vLLM/Torch-NPU out of the product closure |
@@ -144,6 +157,19 @@ precision result.
 | complete L0 EP2 PyPTO composition code generation | `pass` | `decode_layer_ep2_compile`; mHC/attention/cache/MoE composition compiles |
 | DP2/TP1/EP2 MoE boundary Decode | `pass` | `.pypto-a3-state/product/decode-ep2-l0-v25e.json`; real two-card A3 route/output gate passed |
 | DP2/TP1/EP2 complete physical layer representative Decode | `pass` | `task_20261106_042451_245850019523`; `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json`; output, router input, routes, MoE, FFN state, and cache pages compared on A3 |
+| L1 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261106_182455_412234226294`; `.pypto-a3-state/product/decode-ep2-l1-moe-v2.json`; logits, exact route IDs, route weights, and output compared on devices 2,3 |
+| L2 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261106_182455_412234319554`; `.pypto-a3-state/product/decode-ep2-l2-moe-v2.json`; logits, exact route IDs, route weights, and output compared on devices 4,5 |
+| L3 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261106_182455_412234130828`; `.pypto-a3-state/product/decode-ep2-l3-moe-v2.json`; logits, exact route IDs, route weights, and output compared on devices 0,1 |
+| L14 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261107_005915_175293029255`; `.pypto-a3-state/product/decode-ep2-l14-moe-v2.json`; logits, exact route IDs, route weights, and output compared on devices 6,7 |
+| L15 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261107_005915_175292910575`; `.pypto-a3-state/product/decode-ep2-l15-moe-v2.json`; logits, exact route IDs, route weights, and output compared on devices 4,5 |
+| L19 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261107_010231_177414730073`; `.pypto-a3-state/product/decode-ep2-l19-moe-v1.json`; logits, exact route IDs, route weights, and output compared on devices 4,5 |
+| L20 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261107_023110_224905226856`; `.pypto-a3-state/product/decode-ep2-l20-moe-v1.json`; logits, exact route IDs, route weights, and output compared on devices 0,1 |
+| L21 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261107_023110_224905330745`; `.pypto-a3-state/product/decode-ep2-l21-moe-v1.json`; logits, exact route IDs, route weights, and output compared on devices 2,3 |
+| L24 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261107_023325_226337011669`; `.pypto-a3-state/product/decode-ep2-l24-moe-v1.json`; logits, exact route IDs, route weights, and output compared on devices 2,3 |
+| L25 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261107_023325_22633697697`; `.pypto-a3-state/product/decode-ep2-l25-moe-v1.json`; logits, exact route IDs, route weights, and output compared on devices 0,1 |
+| L1/L2/L3 complete physical Decode | `not_run` | The current runner covers the MoE boundary only; each layer still needs its own attention/cache/index/mHC composition and cache/state comparison |
+| L14/L15/L19 complete physical Decode | `not_run` | The new two-card runs cover only the MoE boundary; C2A compression/index/cache and mHC/attention composition are not executed |
+| L14/L15 vLLM-Ascend reference capture | `not_run` | Layer-root construction reaches 60.43 GiB per rank before the next 2.11 GiB W2 allocation; CPU offload 16/32/96 GiB does not apply until after FusedMoEFactory construction |
 | DP2/TP1/EP2 formal Decode gate | `not_run` | Add no-local-input, finished/inactive, unequal-length, slot-reuse and additional request-state cases |
 | DP8/TP2/EP16 complete single layer | `not_run` | Allocate 16 queued cards and run the complete composition |
 | DP16/TP1/EP16 compatibility | `not_run` | Same complete layer at TP1 |
@@ -152,9 +178,10 @@ precision result.
 | independent vLLM-Ascend full-state capture | `pass` | `.pypto-a3-state/reference/decode_ep2_l0_20261106_v29/reference_capture.json`; v29 joins layer, MoE, and cache state; v24/v26 remain historical split captures |
 | same-input NPU PyPTO/reference representative comparison | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json`; fixed `rtol=0.05`, `atol=0.05` and exact route IDs |
 | target layers 0,1,2,3,14,15,19,20,21,24,25 | `not_run` | Each layer must pass its own complete DP8/TP2/EP16 gate |
-| independent L1 reference capture | `pending` | `task_20261106_113416_60083921106` reached vLLM initialization but failed because the child could not import CANN `acl`; retry `task_20261106_142835_270996310588` clears inherited `PYTHONPATH`/`ASCEND_HOME_PATH` and writes v2 assets |
+| independent L1 reference capture | `not_run` | Earlier tasks failed before a complete capture: `task_20261106_113416_60083921106` could not import CANN `acl`, `task_20261106_142835_270996310588` expanded an unset `TASK_ID`, and `task_20261106_144922_29541712834` launched one process (`WORLD_SIZE=1`). The refreshed plan uses `torch.distributed.run --standalone --nproc_per_node=2`, absolute `vllm-python.sh`, cleared inherited paths, and `${TASK_ID:-not_recorded}`. v6 has rank-local arrays, but no assembled top-level contract yet. |
 | independent layer contract matrix | `pass` | `.pypto-a3-state/decode-assets/layer-contracts.json`; metadata/setup only, formal status remains `not_run` |
 | capacity-16 stage inventory | `pass` | `.pypto-a3-state/decode-assets/layer-stage-inventory.json`; stage construction only, no NPU or accuracy claim |
+| no-device per-layer preflight | `pass` | `.pypto-a3-state/decode-assets/layer-preflight.json` and `layers/l*/plan.json`; 11 isolated plans, no synthetic input/cache assets |
 | per-layer capture/replay execution plan | `pass` | `.pypto-a3-state/decode-assets/layer-contracts.json`; fixed EP2 vLLM-Ascend commands are recorded for all 11 layers, while only the complete L0 PyPTO replay is executable and the other ten remain blocked by missing layer compositions |
 
 No status in this table may be promoted from the historical Prefill evidence,
@@ -180,6 +207,9 @@ The following checks were run in the pinned shared environment on 2026-11-05:
 | independent reference manifest | `pass` | `.pypto-a3-state/reference/decode_ep2_l0_20261106_v29/reference_capture.json`; vLLM-Ascend paths, native hashes, input, layer, MoE, and cache capture are recorded |
 | queued two-card PyPTO EP2 MoE run | `pass` | `task_20261106_024728_200089531660`; A3 `TASK_DEVICE=0,1`, routes and output pass in `.pypto-a3-state/product/decode-ep2-l0-v25e.json` |
 | EP2 complete physical-layer representative run | `pass` | `task_20261106_042451_245850019523`; `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json` |
+| queued L14/L15/L19 PyPTO EP2 MoE boundary runs | `pass` | `task_20261107_005915_175293029255`, `task_20261107_005915_175292910575`, `task_20261107_010231_177414730073`; user-state PyPTO runtime, devices 6,7 / 4,5 / 4,5; each report has logits, exact routes, route weights and output PASS |
+| queued L20/L21/L24/L25 PyPTO EP2 MoE boundary runs | `pass` | `task_20261107_023110_224905226856`, `task_20261107_023110_224905330745`, `task_20261107_023325_226337011669`, `task_20261107_023325_22633697697`; user-state PyPTO runtime; each report has logits, exact routes, route weights and output PASS |
+| initial L14/L15 retry with shared PyPTO path | `blocked_environment` | `task_20261107_005442_173030223340`, `task_20261107_005442_173030330312`; `PYTHONPATH=$PWD` selected the read-only shared `simpler_setup` and failed on `.pto-isa.lock`; reruns preserved `$PYPTO_A3_STATE_DIR/python` and passed |
 | EP2 formal multi-case gate | `not_run` | The representative case lacks no-local-input, finished/inactive, unequal-length, and slot-reuse coverage |
 | DP8/TP2/EP16 gate | `not_run` | `decode_gate.py --topology main`; complete layer input/cache/reference assets are missing |
 

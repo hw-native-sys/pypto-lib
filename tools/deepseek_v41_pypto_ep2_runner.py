@@ -55,7 +55,34 @@ from models.deepseek_v4_1_flash_a2.utils import unpack_nz
 DEFAULT_ASSETS = Path(
     ".pypto-a3-state/reference/decode_ep2_l0_20261105_v19"
 )
-DEFAULT_FIXTURE = Path(".pypto-a3-state/product/decode_ep2_l0_moe_fixture_v1")
+DEFAULT_FIXTURE_ROOT = Path(".pypto-a3-state/product")
+TARGET_LAYERS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
+
+
+def _bind_user_pto_isa() -> None:
+    """Keep device-side runtime assembly on the writable pinned checkout.
+
+    The queue's L3 worker can import the shared ``simpler_setup`` package even
+    when the host process sees the per-session overlay.  Its resolver then
+    tries to create a lock beside the read-only shared wheel.  The activation
+    helper has already verified the user checkout; bind both resolver entry
+    points to that checkout before the distributed dispatch is assembled.
+    """
+
+    state = os.environ.get("PYPTO_A3_STATE_DIR")
+    if not state:
+        return
+    overlay = Path(state).resolve() / "python" / "simpler_setup" / "_assets" / "build" / "pto-isa"
+    if not overlay.is_dir():
+        return
+    resolved = str(overlay.resolve())
+    import pypto.runtime.pto_isa as pypto_pto_isa
+    import simpler_setup.pto_isa as simpler_pto_isa
+
+    pypto_pto_isa._resolve_pinned_pto_isa_root.cache_clear()
+    pypto_pto_isa._resolve_pinned_pto_isa_root = lambda: resolved
+    simpler_pto_isa.ensure_pto_isa_root = lambda verbose=False: resolved
+    os.environ["PTO_ISA_ROOT"] = resolved
 
 
 def _bf16_from_storage(value: np.ndarray) -> torch.Tensor:
@@ -260,8 +287,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--assets", type=Path, default=DEFAULT_ASSETS)
     parser.add_argument("--checkpoint", type=Path, default=Path(os.environ.get("DEEPSEEK_V41_CHECKPOINT", "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8")))
-    parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
-    parser.add_argument("--layer", type=int, default=0)
+    parser.add_argument(
+        "--fixture",
+        type=Path,
+        help="per-layer golden fixture; defaults to decode_ep2_l<layer>_moe_fixture_v1",
+    )
+    parser.add_argument("--layer", type=int, choices=TARGET_LAYERS, default=0)
     parser.add_argument(
         "--device",
         default=os.environ.get("TASK_DEVICE", "0,1"),
@@ -273,11 +304,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--record", type=Path)
     args = parser.parse_args(argv)
 
-    if args.layer != 0:
-        raise SystemExit("the frozen EP2 gate is currently defined for physical layer 0")
+    _bind_user_pto_isa()
+
     assets = args.assets.resolve()
     checkpoint = args.checkpoint.resolve()
-    fixture = args.fixture.resolve()
+    fixture = (args.fixture or DEFAULT_FIXTURE_ROOT / f"decode_ep2_l{args.layer}_moe_fixture_v1").resolve()
     values = _load_inputs(assets, checkpoint, args.layer)
     _write_fixture(fixture, values)
     del values
@@ -311,7 +342,8 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "status": "pass" if result.passed else "fail",
         "formal_accuracy": "not_run",
-        "scope": "MoE boundary only; full physical L0 Decode remains not_run",
+        "scope": f"MoE boundary only for physical L{args.layer}; complete physical layer remains not_run",
+        "layer_id": args.layer,
         "topology": {"dp": 2, "tp": 1, "ep": 2, "devices": devices},
         "assets": str(assets),
         "checkpoint": str(checkpoint),
