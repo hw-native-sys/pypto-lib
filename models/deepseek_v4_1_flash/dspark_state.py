@@ -698,6 +698,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark bootstrap context-boundary validation")
     parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
@@ -727,7 +728,8 @@ if __name__ == "__main__":
     result = run(
         fn=bootstrap_inputs_rank, specs=specs,
         golden_fn=lambda tensors: golden_bootstrap_inputs(tensors, {}), rtol=0.0, atol=0.0,
-        config={"backend_type": "a5", "device_id": args.device, "execution_mode": args.platform == "a5sim"},
+        config={"backend_type": "a5", "device_id": args.device,
+                "execution_mode": args.execution_mode or args.platform == "a5sim"},
         compile_only=args.compile_only,
     )
     print(result)
