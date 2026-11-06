@@ -10,13 +10,14 @@
 # ci: no-sim
 """Compose native V4.1 operators into one resident CED prefill per A5 rank.
 
-CI uses TP1/EP2/DP2 with 128 experts. Checkpoint generation uses 384 experts
-with EP4/DP4 (default) or EP8/DP8. Each rank owns one prompt and a shard of
-routed experts; attention weights are replicated. Original MXFP8/MXFP4
+CI uses TP2/EP2/DP1 with 128 experts. Checkpoint generation uses 384 experts
+with EP4/DP4 (default) or EP8/DP8. Each TP group owns one prompt; ranks own token intervals and routed expert shards.
+Attention heads and weights are TP-sharded; native cache state is replicated within each TP group. Original MXFP8/MXFP4
 weights remain resident. Calls append current rows to caller-owned native caches.
 Engram consumes host-gathered rows at layers 1 and 14.
 """
 
+from contextlib import nullcontext
 import struct
 import math
 from numbers import Integral
@@ -43,6 +44,9 @@ from pypto.backend import BackendType
 from pypto.runtime import ExecutionMode, RunConfig, StackedDeviceTensor
 import torch
 
+if not any(argument == "--tp" or argument.startswith("--tp=") for argument in sys.argv):
+    sys.argv += ["--tp", "1" if any(argument.startswith("--checkpoint") for argument in sys.argv) else "2"]
+
 import config as C
 
 _shape_parser = argparse.ArgumentParser(add_help=False)
@@ -50,23 +54,23 @@ _shape_parser.add_argument("--checkpoint")
 _shape_parser.add_argument("--ep", type=int, choices=[2, 4, 8])
 _shape_parser.add_argument("--experts-per-rank", type=int)
 _shape_parser.add_argument("--capacity", type=int, default=128)
+_shape_parser.add_argument("--moe-tokens", type=int, default=1024)
 _shape_parser.add_argument("--dp", type=int)
 _shape_options = _shape_parser.parse_known_args()[0]
-if _shape_options.checkpoint and _shape_options.ep is None and _shape_options.dp is None:
-    C.EP_SIZE = 4
-    C.DP_SIZE = 4
+C.EP_SIZE = _shape_options.ep or (4 if _shape_options.checkpoint else 2)
 _default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) else 64
 C.N_LOCAL_EXPERTS = _default_experts if _shape_options.experts_per_rank is None else _shape_options.experts_per_rank
 if C.N_LOCAL_EXPERTS <= 0 or C.EP_SIZE * C.N_LOCAL_EXPERTS % 16:
     _shape_parser.error("--experts-per-rank must be positive and give a total expert count aligned to 16")
 _MAX_CHUNK_TOKENS = 4096
 CAPACITY = _shape_options.capacity
-if C.TP_SIZE != 1 or _shape_options.dp not in (None, C.EP_SIZE):
-    _shape_parser.error("prefill requires TP1 with DP equal to EP")
+DP_SIZE = C.EP_SIZE // C.TP_SIZE
+if C.EP_SIZE % C.TP_SIZE or _shape_options.dp not in (None, DP_SIZE):
+    _shape_parser.error("prefill requires EP = TP * DP")
 if not 16 <= CAPACITY <= _MAX_CHUNK_TOKENS or CAPACITY % 16:
     _shape_parser.error("--capacity must be between 16 and 4096 and a multiple of 16")
 # Keep MoE scratch bounded independently of the current-row capacity.
-C.set_moe_tokens(min(CAPACITY, C.MOE_TOKENS))
+C.set_moe_tokens(min(CAPACITY, _shape_options.moe_tokens))
 
 from config import (
     FLASH as M,
@@ -85,20 +89,20 @@ from config import (
     STATE_BLOCKS_DYN,
     STATE_CAPACITY,
     MOE_TOKENS,
-    ROUTE_T_DYN,
     DSPARK_DRAFT_LAYERS,
     DSPARK_TARGET_LAYER_IDS,
 )
 
+from prefill_cp_allgather import prefill_cp_restore_hc
 from hc import hc_post
-from hc import hc_head, hc_pre, zero_bf16_padding
+from hc import hc_head, hc_head_norm, hc_project, hc_sinkhorn
 from input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
 from utils import paged_slots, window_metadata
 from engram import ENGRAM_K, KV_OUT, HostEngram, engram_from_rows
 from lm_head import final_output
-from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals
-from prefill_moe import prefill_moe
+from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, clear_moe_signals
+from prefill_moe import prefill_moe_slabs
 from compressor import STATE_WIDTH
 from prefill_c1a_full import prefill_publish_decoder
 from prefill_swa import prefill_swa_attention
@@ -120,6 +124,8 @@ C2A_TABLE_DYN = pl.dynamic("V41_PREFILL_C2A_TABLE")
 C1A_TABLE_DYN = pl.dynamic("V41_PREFILL_C1A_TABLE")
 LOCAL_EXPERTS = C.N_LOCAL_EXPERTS
 N_LAYERS = M.num_hidden_layers
+RING_HEAP_BYTES = 4 * 1024**3
+FINAL_SLOT = 2 * CAPACITY
 C2A_SOURCE_COUNT = sum(M.compress_ratios[source] == 2 for source in M.kv_source_layer_ids)
 KV_SOURCE_COUNT = len(M.kv_source_layer_ids)
 INDEX_SOURCE_COUNT = len(M.index_source_layer_ids)
@@ -288,140 +294,6 @@ def prefill_attention(
     return output
 
 
-@pl.jit.inline(auto_scope=False)
-def _prefill_moe(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    norm_weight: pl.Tensor[[D], pl.BF16],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w1_scale: pl.Tensor[
-        [LOCAL_EXPERTS * (D // 32), MOE_INTER],
-        pl.FP8E8M0,
-        pl.MX_B_NN,
-    ],
-    routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2_scale: pl.Tensor[
-        [LOCAL_EXPERTS * (MOE_INTER // 32), D],
-        pl.FP8E8M0,
-        pl.MX_B_NN,
-    ],
-    routed_w3: pl.Tensor[[LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3_scale: pl.Tensor[
-        [LOCAL_EXPERTS * (D // 32), MOE_INTER],
-        pl.FP8E8M0,
-        pl.MX_B_NN,
-    ],
-    shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w1_scale: pl.Tensor[
-        [D // 32, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
-    ],
-    shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w2_scale: pl.Tensor[
-        [MOE_INTER // 32, D], pl.FP8E8M0, pl.MX_B_NN
-    ],
-    shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w3_scale: pl.Tensor[
-        [D // 32, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN
-    ],
-    next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
-    x_next: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    recv_meta: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[
-        [LOCAL_EXPERTS * RECV_MAX, D // 32], pl.UINT8
-    ],
-    recv_weights: pld.DistributedTensor[
-        [LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32
-    ],
-    recv_routes: pld.DistributedTensor[
-        [LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32
-    ],
-    data_arrived: pld.DistributedTensor[
-        [RANKS, LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[
-        [RANKS, LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
-    ],
-    slab_hidden: pl.Tensor[[2 * MOE_TOKENS, HC_MULT, D], pl.FP32],
-    slab_pre: pl.Tensor[[2 * MOE_TOKENS, HC_MULT], pl.FP32],
-    slab_mixed: pl.Tensor[[MOE_TOKENS, D], pl.BF16],
-    slab_rows: pl.Tensor[[MOE_TOKENS], pl.INT32],
-    reuse_ready: pl.Scalar[pl.TASK_ID],
-    num_tokens: pl.Scalar[pl.INT32],
-    ep_rank: pl.Scalar[pl.INT32],
-    moe_epoch: pl.Scalar[pl.INT32],
-):
-    """Run bounded MoE slabs and return completion of every scratch reader."""
-    capacity = pl.tensor.dim(x_hc, 0)
-    source_hidden = pl.reshape(x_hc, [capacity, HC_DIM])
-    round_completion = pl.array.create(1, pl.TASK_ID)
-    round_completion[0] = reuse_ready
-    rounds = (CAPACITY + MOE_TOKENS - 1) // MOE_TOKENS
-    for round_id in pl.range(rounds):
-        begin = round_id * MOE_TOKENS
-        rows = pl.min(MOE_TOKENS, capacity - begin)
-        # Keep caller-owned destinations outside the slab allocation scope.
-        hidden_destination = pl.slice(x_next, [rows, HC_MULT, D], [begin, 0, 0])
-        mixed_destination = pl.slice(x_mixed, [rows, D], [begin, 0])
-        pre_destination = pl.slice(next_pre_mix, [rows, HC_MULT], [begin, 0])
-        # Carry completion explicitly before overwriting shared scratch.
-        row_ids = pl.slice(slab_rows, [MOE_TOKENS], [0])
-        round_hidden = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [0, 0, 0])
-        round_output = pl.slice(slab_hidden, [MOE_TOKENS, HC_MULT, D], [MOE_TOKENS, 0, 0])
-        round_pre = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [0, 0])
-        round_next = pl.slice(slab_pre, [MOE_TOKENS, HC_MULT], [MOE_TOKENS, 0])
-        round_mixed = pl.slice(slab_mixed, [MOE_TOKENS, D], [0, 0])
-        with pl.scope():
-            active = pl.max(0, pl.min(MOE_TOKENS, num_tokens - begin))
-            with pl.spmd(1, name_hint="prefill_moe_rows", deps=[round_completion[0]]) as rows_ready:
-                writer = pl.tile.get_block_idx()
-                for row in pl.range(writer, MOE_TOKENS):
-                    source_row = pl.cast(-1, pl.INT32)
-                    if row < active:
-                        source_row = pl.cast(begin + row, pl.INT32)
-                    pl.write(row_ids, [row], source_row)
-            packed_hidden = pl.reshape(round_hidden, [MOE_TOKENS, HC_DIM])
-            gather_rows(source_hidden, row_ids, packed_hidden, rows_ready)
-            gather_rows(pre_mix, row_ids, round_pre, rows_ready)
-            epoch = (moe_epoch - 1) * rounds + round_id + 1
-            prefill_moe(
-                round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
-                gate_weight, correction_bias,
-                routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
-                shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
-                round_next, round_mixed, round_output,
-                recv_meta, recv_x, recv_scale, recv_weights, recv_routes, data_arrived,
-                routed_output, combine_arrived, active, ep_rank, epoch,
-                hf32=False,
-            )
-            with pl.spmd(32, name_hint="prefill_moe_results") as hidden_copied:
-                worker = pl.tile.get_block_idx()
-                for row in pl.range(worker, MOE_TOKENS, 32):
-                    if begin + row < capacity:
-                        for lane in pl.range(HC_MULT):
-                            for column in pl.range(0, D, 512):
-                                hidden = round_output[row:row + 1, lane:lane + 1, column:column + 512]
-                                hidden_destination[row:row + 1, lane:lane + 1, column:column + 512] = hidden
-                        mixed = round_mixed[row:row + 1, :]
-                        mixed_destination[row:row + 1, :] = mixed
-            with pl.spmd(1, name_hint="prefill_moe_pre_mix") as pre_copied:
-                writer = pl.tile.get_block_idx()
-                for row in pl.range(writer, MOE_TOKENS):
-                    if begin + row < capacity:
-                        for lane in pl.range(HC_MULT):
-                            value = pl.read(round_next, [row, lane])
-                            pl.write(pre_destination, [row, lane], value)
-            round_completion[0] = pl.system.task_dummy(deps=[hidden_copied, pre_copied])
-    return round_completion[0]
-
-
 @pl.jit(auto_scope=False)
 def l2_prefill_fwd(
     embedding: pl.Tensor[[CAPACITY, D], pl.BF16],
@@ -498,7 +370,7 @@ def l2_prefill_fwd(
     index_scales: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 4], pl.FP8E8M0]],
     state_cache: pl.InOut[pl.Tensor[[3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB // TP_SIZE, D], pl.BF16],
     logit_rows: pl.Tensor[[16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
@@ -510,12 +382,15 @@ def l2_prefill_fwd(
     recv_scale: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, D // 32], pl.UINT8],
     recv_weights: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
     recv_routes: pld.DistributedTensor[[LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
+    arrived: pld.DistributedTensor[[RANKS, 128], pl.INT32],
     data_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
     routed_output: pld.DistributedTensor[[MOE_TOKENS * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[RANKS, LOCAL_EXPERTS, 128], pl.INT32],
     attention_window: pld.DistributedTensor[[C.PREFILL_MAX_TOKENS, D], pl.BF16],
     attention_arrived: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
-    head_hidden: pld.DistributedTensor[[16, D], pl.BF16],
+    hc_window: pld.DistributedTensor[[CAPACITY, HC_DIM + 16], pl.FP32],
+    hc_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    head_hidden: pld.DistributedTensor[[TP_SIZE * 16, D], pl.BF16],
     head_hidden_done: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
     head_logits: pld.DistributedTensor[[16, VOCAB], pl.FP32],
     head_logits_done: pld.DistributedTensor[[C.TP_SIZE, 1], pl.INT32],
@@ -559,8 +434,8 @@ def l2_prefill_fwd(
     initial_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [0, 0, 0])
     initial_mix = pl.slice(pre_pair, [CAPACITY, HC_MULT], [0, 0])
     gather_ready = pl.system.task_dummy(deps=[])
-    pack_x_hc(embedding_ids, embedding, initial_hidden)
-    gather_rows(initial_pre, identity_rows, initial_mix, gather_ready)
+    pack_x_hc(embedding_ids, embedding, initial_hidden, hidden_tile=D)
+    gather_rows(initial_pre, identity_rows, initial_mix, gather_ready, column_tile=512)
     topk_indices = pl.create_tensor([CAPACITY, INDEX_TOPK], dtype=pl.INT32)
     history_positions = pl.tensor.dim(compressed_cache, 1) * 128
     pool_blocks = pl.min(INDEX_POOL_BLOCKS, (history_positions // 8 + 31) // 32 * 32)
@@ -656,8 +531,8 @@ def l2_prefill_fwd(
                 )
                 gathered_hidden = pl.reshape(hidden, [CAPACITY, HC_DIM])
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])
-                gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready)
-                gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready)
+                gather_rows(source_hidden, replay_rows, gathered_hidden, publisher_ready, column_tile=D)
+                gather_rows(encoder_pre, replay_rows, delayed_pre, publisher_ready, column_tile=512)
         if layer == 1 or layer == 14:
             with pl.scope():
                 engram_slot = layer // 14
@@ -669,18 +544,14 @@ def l2_prefill_fwd(
         with pl.scope():
             attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
             attn_residual = pl.create_tensor([CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
-            collapsed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
             attn_output = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-            zero_bf16_padding(attn_output, pl.cast(0, pl.INT32))
-            hc_pre(
-                hidden, delayed_pre, layer_attn_fn, layer_attn_scale, layer_attn_base,
-                collapsed, attn_pre, attn_post, attn_residual,
-                hf32=False,
-            )
-            norm_tokens = pl.tensor.dim(collapsed, 0)
-            for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                rms_norm_tiled(collapsed, layer_attn_norm, normalized, norm_block, norm_tokens, output_fp32=False)
+            with pl.spmd(32, name_hint="prefill_attention_zero"):
+                worker = pl.tile.get_block_idx()
+                zeros = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+                for row in pl.range(worker, CAPACITY, 32):
+                    pl.store(zeros, [row, 0], attn_output)
+            hc_head_norm(hidden, delayed_pre, layer_attn_norm, normalized)
             mode = 0
             cache_slot = 0
             rope_slot = 0
@@ -710,18 +581,31 @@ def l2_prefill_fwd(
                     layer_compressor_wkv, layer_compressor_wgate, query_start_loc[stage], state_block_table, state_cache[state_slot],
                     layer_compressor_norm, c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale,
                     layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
-                    attn_output, rank, 0, active, layer + 1, mode,
+                    attn_output, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, layer + 1, mode,
                 )
+            owner_begin = rank % TP_SIZE * (CAPACITY // TP_SIZE)
+            owner_hidden = pl.slice(hidden, [CAPACITY // TP_SIZE, HC_MULT, D], [owner_begin, 0, 0])
+            owner_output = pl.slice(attn_output, [CAPACITY // TP_SIZE, D], [owner_begin, 0])
+            owner_pre = pl.slice(attn_pre, [CAPACITY // TP_SIZE, HC_MULT], [owner_begin, 0])
+            owner_post = pl.slice(attn_post, [CAPACITY // TP_SIZE, HC_MULT], [owner_begin, 0])
+            owner_residual = pl.slice(attn_residual, [CAPACITY // TP_SIZE, HC_MULT, HC_MULT], [owner_begin, 0, 0])
+            owner_destination = pl.slice(attn_hidden, [CAPACITY // TP_SIZE, HC_MULT, D], [owner_begin, 0, 0])
+            inv_rms, mix_partials = hc_project(owner_hidden, layer_attn_fn, hf32=False)
+            hc_sinkhorn(inv_rms, mix_partials, layer_attn_scale, layer_attn_base, owner_pre, owner_post, owner_residual)
             hc_post_deps = pl.array.create(2, pl.TASK_ID)
-            hc_post(attn_output, hidden, attn_post, attn_residual, attn_hidden, deps=hc_post_deps)
-        moe_ready = _prefill_moe(
+            hc_post(owner_output, owner_hidden, owner_post, owner_residual, owner_destination, deps=hc_post_deps)
+        moe_ready = prefill_moe_slabs(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,
             layer_shared_w1, layer_shared_w1_scale, layer_shared_w2, layer_shared_w2_scale,
             layer_shared_w3, layer_shared_w3_scale, next_pre, ffn_mixed, next_hidden,
-            recv_meta, recv_x, recv_scale, recv_weights, recv_routes, data_arrived,
+            recv_meta, recv_x, recv_scale, recv_weights, recv_routes, arrived, data_arrived,
             routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
-            moe_ready, active, rank, layer + 1,
+            moe_ready, active, rank, layer + 1, capacity=CAPACITY,
+        )
+        moe_ready = prefill_cp_restore_hc(
+            next_hidden, next_pre, hc_window, hc_arrived,
+            rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, layer + 1, moe_ready,
         )
         if layer >= DSPARK_TARGET_LAYER_IDS[0]:
             target_column = (layer - DSPARK_TARGET_LAYER_IDS[0]) * D
@@ -734,19 +618,30 @@ def l2_prefill_fwd(
                     else:
                         target_bf16 = pl.full([1, D], dtype=pl.BF16, value=0.0)
                     dspark_target_hidden[token : token + 1, target_column : target_column + D] = target_bf16
-    final_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [2 * CAPACITY, 0, 0])
-    final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [2 * CAPACITY, 0])
+    final_hidden = pl.slice(hidden_pair, [CAPACITY, HC_MULT, D], [FINAL_SLOT, 0, 0])
+    final_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [FINAL_SLOT, 0])
     source_hidden = pl.reshape(final_hidden, [CAPACITY, HC_DIM])
     output_hidden = pl.reshape(x_hc_out, [CAPACITY, HC_DIM])
-    gather_rows(source_hidden, identity_rows, output_hidden, gather_ready)
-    gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready)
-    clear_moe_signals(x_hc_out, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
-    retire_prefill_signals(x_hc_out, attention_arrived, rank, 0)
+    gather_rows(source_hidden, identity_rows, output_hidden, gather_ready, column_tile=D)
+    gather_rows(final_pre, identity_rows, pre_mix_out, gather_ready, column_tile=512)
+    clear_moe_signals(x_hc_out, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
+    retire_prefill_signals(x_hc_out, attention_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
+    retire_prefill_signals(x_hc_out, hc_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
+    owner_logit_rows = pl.create_tensor([16], dtype=pl.INT32)
+    with pl.spmd(1, name_hint="prefill_logit_owners"):
+        writer = pl.tile.get_block_idx()
+        for row in pl.range(writer, 16):
+            source = pl.read(logit_rows, [row])
+            owner_source = pl.cast(-1, pl.INT32)
+            if source >= 0 and source < CAPACITY:
+                if source // (CAPACITY // TP_SIZE) == rank % TP_SIZE:
+                    owner_source = source
+            pl.write(owner_logit_rows, [row], owner_source)
     final_logits, final_sampled_ids = final_output(
         final_hidden, final_pre, final_norm_weight, lm_head_weight,
-        logit_rows, logits, sampled_ids,
+        owner_logit_rows, logits, sampled_ids,
         head_hidden, head_hidden_done, head_logits, head_logits_done,
-        rank, 0, 1, 1,
+        rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, 1, 1,
     )
     return final_logits, final_sampled_ids
 
@@ -827,7 +722,7 @@ def l3_prefill_fwd(
     index_scales: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 4], pl.FP8E8M0]],
     state_cache: pl.InOut[pl.Tensor[[RANKS, 3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     final_norm_weight: pl.Tensor[[RANKS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[RANKS, VOCAB, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[RANKS, VOCAB // TP_SIZE, D], pl.BF16],
     logit_rows: pl.Tensor[[RANKS, 16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
@@ -899,12 +794,15 @@ def l3_prefill_fwd(
     recv_scale_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
     recv_weights_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
     recv_routes_buffer = pld.alloc_window_buffer([LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
+    arrived_buffer = pld.alloc_window_buffer([RANKS, 128], dtype=pl.INT32)
     data_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
     routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buffer = pld.alloc_window_buffer([RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
     attention_window_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
     attention_arrived_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    head_hidden_buffer = pld.alloc_window_buffer([16, D], dtype=pl.BF16)
+    hc_window_buffer = pld.alloc_window_buffer([CAPACITY, HC_DIM + 16], dtype=pl.FP32)
+    hc_arrived_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    head_hidden_buffer = pld.alloc_window_buffer([TP_SIZE * 16, D], dtype=pl.BF16)
     head_hidden_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     head_logits_buffer = pld.alloc_window_buffer([16, VOCAB], dtype=pl.FP32)
     head_logits_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
@@ -914,12 +812,15 @@ def l3_prefill_fwd(
         recv_scale = pld.window(recv_scale_buffer, [LOCAL_EXPERTS * RECV_MAX, D // 32], dtype=pl.UINT8)
         recv_weights = pld.window(recv_weights_buffer, [LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], dtype=pl.FP32)
         recv_routes = pld.window(recv_routes_buffer, [LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], dtype=pl.INT32)
+        arrived = pld.window(arrived_buffer, [RANKS, 128], dtype=pl.INT32)
         data_arrived = pld.window(data_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
         routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buffer, [RANKS, LOCAL_EXPERTS, 128], dtype=pl.INT32)
         attention_window = pld.window(attention_window_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
         attention_arrived = pld.window(attention_arrived_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        head_hidden = pld.window(head_hidden_buffer, [16, D], dtype=pl.BF16)
+        hc_window = pld.window(hc_window_buffer, [CAPACITY, HC_DIM + 16], dtype=pl.FP32)
+        hc_arrived = pld.window(hc_arrived_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        head_hidden = pld.window(head_hidden_buffer, [TP_SIZE * 16, D], dtype=pl.BF16)
         head_hidden_done = pld.window(head_hidden_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
         head_logits = pld.window(head_logits_buffer, [16, VOCAB], dtype=pl.FP32)
         head_logits_done = pld.window(head_logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
@@ -977,13 +878,14 @@ def l3_prefill_fwd(
             recv_scale,
             recv_weights,
             recv_routes,
+            arrived,
             data_arrived,
             routed_output,
             combine_arrived,
             attention_window,
             attention_arrived,
-            head_hidden,
-            head_hidden_done,
+            hc_window, hc_arrived,
+            head_hidden, head_hidden_done,
             head_logits,
             head_logits_done,
             rank, device=rank,
@@ -1155,8 +1057,8 @@ class PrefillCheckpoint:
 
 
 def forward_weight_layouts(local_experts: int):
-    """Return TP1 rank-local weight layouts shared by prefill and decode."""
-    layers = M.num_hidden_layers
+    """Return TP-sharded rank-local weight layouts."""
+    layers = N_LAYERS
     d = M.hidden_size
     inter = M.moe_intermediate_size
     local_h = M.num_attention_heads // TP_SIZE
@@ -1391,7 +1293,7 @@ def prepare_prefill_inputs(
     cache_state: Mapping[str, torch.Tensor] | None = None,
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Prepare one TP1 rank's next embedding chunk and native cache metadata.
+    """Prepare one TP group's next embedding chunk and native cache metadata.
 
     ``capacity`` bounds current rows, independently of ``max_seq_len``, which
     sizes the retained history. Reuse rope_tables across calls; their full
@@ -1600,7 +1502,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     weights = ResidentPrefillWeights(checkpoint, ep_size=RANKS)
     engram = HostEngram(checkpoint, tokenizer)
     config = RunConfig(
-        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, ring_heap=2 * 1024**3,
+        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, ring_heap=RING_HEAP_BYTES,
         distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
     )
     outputs = {
@@ -1791,7 +1693,8 @@ def build_tensor_specs():
         "logits": ([RANKS, 16, VOCAB], torch.float32),
         "sampled_ids": ([RANKS, 16, 8], torch.int32),
     }
-    active_rows = [CAPACITY, CAPACITY // 2, *([0] * (RANKS - 2))]
+    dp_active_rows = [CAPACITY, CAPACITY // 2, *([0] * max(0, DP_SIZE - 2))][:DP_SIZE]
+    active_rows = [count for count in dp_active_rows for _ in range(TP_SIZE)]
     rank_values = []
     for count in active_rows:
         embedding = torch.full((count, D), 0.125, dtype=torch.bfloat16)
@@ -1921,6 +1824,7 @@ if __name__ == "__main__":
         parser.add_argument("--dp", type=int, default=RANKS, choices=[4, 8])
         parser.add_argument("--experts-per-rank", type=int, default=LOCAL_EXPERTS)
         parser.add_argument("--capacity", type=int, default=CAPACITY)
+        parser.add_argument("--moe-tokens", type=int, default=MOE_TOKENS)
         parser.add_argument("--prompt", action="append", help="one prompt per rank; provide exactly --ep prompts")
         parser.add_argument("--max-new-tokens", type=int, default=16)
         parser.add_argument("--chunk-size", type=int, default=CAPACITY)
@@ -1972,20 +1876,22 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
         parser.add_argument("--sim", dest="execution_mode", action="store_true")
-        parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1])
+        parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1, 2, 4, 8])
         parser.add_argument("--ep", type=int, default=RANKS, choices=[2, 4, 8])
-        parser.add_argument("--dp", type=int, default=RANKS, choices=[2, 4, 8])
+        parser.add_argument("--dp", type=int, default=DP_SIZE, choices=[1, 2, 4, 8])
         parser.add_argument("--experts-per-rank", type=int, default=LOCAL_EXPERTS, help="routed experts on each EP rank")
         parser.add_argument("--capacity", type=int, default=CAPACITY)
+        parser.add_argument("--moe-tokens", type=int, default=MOE_TOKENS)
         parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(RANKS)))
         parser.add_argument("--compile-only", action="store_true")
+        parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
         parser.add_argument("--dump-passes", action="store_true")
         parser.add_argument("--enable-scope-stats", action="store_true")
         parser.add_argument("--log-level", default=None)
         args = parser.parse_args()
         if args.execution_mode:
             parser.error("this forward entry requires hardware; --sim is unsupported")
-        if (args.tp, args.ep, args.dp, args.experts_per_rank, args.capacity) != (1, RANKS, RANKS, LOCAL_EXPERTS, CAPACITY):
+        if (args.tp, args.ep, args.dp, args.experts_per_rank, args.capacity) != (C.TP_SIZE, RANKS, DP_SIZE, LOCAL_EXPERTS, CAPACITY):
             parser.error("parallel sizes, expert count and capacity must match the import-time configuration")
         devices = [int(device) for device in args.device.split(",") if device]
         if len(devices) != RANKS or len(set(devices)) != RANKS:
@@ -1996,8 +1902,9 @@ if __name__ == "__main__":
             execution_mode=args.execution_mode,
             dump_passes=args.dump_passes,
             enable_scope_stats=args.enable_scope_stats,
+            enable_chip_swimlane=args.enable_chip_swimlane,
             log_level=args.log_level,
-            ring_heap=(2 * 1024**3,) * 4,
+            ring_heap=(RING_HEAP_BYTES,) * 4,
             ring_dep_pool=131072,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
         )
@@ -2016,14 +1923,46 @@ if __name__ == "__main__":
             host_inputs = {}
             upload_buffer = torch.empty(64 * 1024**2, dtype=torch.uint8).share_memory_()
             inherited = [*host_inputs.values(), upload_buffer]
-            with compiled.prepare(cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=inherited) as runtime:
-                parameters = compiled._get_metadata()[0]
-                arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
-                runtime(*arguments, config=cfg)
-                target_hidden = torch.empty((RANKS, CAPACITY, DSPARK_MAIN_IN), dtype=torch.bfloat16)
-                final_hc = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.float32)
-                runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("dspark_target_hidden")], target_hidden)
-                runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("x_hc_out")], final_hc)
+            from golden.runner import _bench_enabled, _bench_loop_sizes, _report_bench
+            from pypto.runtime.bench import _capture_fd_stderr, _parse_stats_from_strace
+            from pypto.runtime.log_config import configure_log, current_level
+            benchmark = _bench_enabled()
+            rounds, warmup = _bench_loop_sizes() if benchmark else (1, 0)
+            trace_path = Path(result.work_dir) / "prefill_benchmark.strace"
+            prior_level = current_level()
+            if benchmark:
+                configure_log("timing")
+            try:
+                capture = _capture_fd_stderr(trace_path) if benchmark else nullcontext()
+                with capture:
+                    with compiled.prepare(cfg, persistent=True, reset_persistent_windows=False, inherited_host_tensors=inherited) as runtime:
+                        parameters = compiled._get_metadata()[0]
+                        arguments = upload_forward_inputs(runtime, specs, parameters, len(devices), host_inputs, upload_buffer)
+                        for iteration in range(warmup + rounds):
+                            if iteration:
+                                for spec, parameter, argument in zip(specs, parameters, arguments, strict=True):
+                                    if parameter.direction.name != "InOut":
+                                        continue
+                                    for rank, handle in enumerate(argument.shards):
+                                        value = spec.init_value[rank].contiguous().view(torch.uint8).reshape(-1)
+                                        for offset in range(0, handle.nbytes, upload_buffer.numel()):
+                                            size = min(upload_buffer.numel(), handle.nbytes - offset)
+                                            upload_buffer[:size].copy_(value[offset:offset + size])
+                                            runtime.copy_to(handle.data_ptr, upload_buffer.data_ptr(), size, dst_offset=offset, worker_id=rank)
+                            runtime(*arguments, config=cfg)
+                        target_hidden = torch.empty((RANKS, CAPACITY, DSPARK_MAIN_IN), dtype=torch.bfloat16)
+                        final_hc = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.float32)
+                        runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("dspark_target_hidden")], target_hidden)
+                        runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("x_hc_out")], final_hc)
+            except Exception:
+                if benchmark and trace_path.exists():
+                    print(trace_path.read_text(), file=sys.stderr)
+                raise
+            finally:
+                configure_log(prior_level)
+            if benchmark:
+                stats = _parse_stats_from_strace(trace_path.read_text(), rounds=rounds, warmup=warmup, distributed=True)
+                _report_bench(stats, compiled, l3=True, resident=True)
             final_tap = target_hidden[:, :, 2 * D : 3 * D]
             expected_final_tap = final_hc.mean(dim=2).to(torch.bfloat16)
             if not torch.isfinite(target_hidden.float()).all():

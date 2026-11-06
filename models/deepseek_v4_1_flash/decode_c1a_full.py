@@ -16,13 +16,14 @@ from decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_paged,
     publish_index_rows, project_index_key,
 )
-from sparse_attention import _attend_project
+from o_proj import o_proj
+from sparse_attention import gather_sparse_attention
 from hc import hc_project, hc_sinkhorn, hc_head_norm, hc_post
 from config import (
     LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
     CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
 )
-from compressor import c1a_compressor_project, c1a_compressor_publish
+from compressor import C1A_PROJ_M_TILE, C1A_PROJ_N_TILE, c1a_compressor_project, c1a_compressor_publish
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -119,7 +120,10 @@ def decode_c1a_full(
         num_tokens, x_ready,
     )
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    projected, pc_tid = c1a_compressor_project(x_norm, compressor_wkv, projected, num_tokens, x_ready)
+    projected, pc_tid = c1a_compressor_project(
+        x_norm, compressor_wkv, projected, num_tokens, x_ready,
+        m_tile=C1A_PROJ_M_TILE, n_tile=C1A_PROJ_N_TILE,
+    )
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     compressed_ready = c1a_compressor_publish(
         projected, compressor_norm_weight, latent, compressed_rope_cos, compressed_rope_sin,
@@ -151,11 +155,13 @@ def decode_c1a_full(
     )
     selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_ready])
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    _attend_project(
-        query, window_indices, window_cache, window_cache_scale, topk_indices,
-        compressed_cache, compressed_cache_scale, attn_sink,
-        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out,
-        num_tokens, selection_ready, compressed_keys=INDEX_TOPK,
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    gather_sparse_attention(
+        query, window_indices, window_cache, window_cache_scale, topk_indices, compressed_cache, compressed_cache_scale,
+        attn_sink, attended, num_tokens, selection_ready, compressed_keys=INDEX_TOPK,
+    )
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out, num_tokens,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)

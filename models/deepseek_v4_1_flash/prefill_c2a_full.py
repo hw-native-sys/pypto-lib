@@ -34,7 +34,8 @@ from config import (
     STATE_BLOCKS_DYN, TP_SIZE, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, MAX_BATCH_PER_DP,
     PREFILL_MAX_TOKENS, STATE_CAPACITY, WINDOW_CACHE_GROUP, SP_T_DYN, BLOCK_SIZE,
 )
-from compressor import STATE_WIDTH, c2a_compressor_project, c2a_compressor_publish
+from compressor import STATE_WIDTH, c2a_compressor_project
+from compressor import c2a_compressor_publish
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import (
     retire_prefill_signals,
@@ -48,7 +49,8 @@ from quant import dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import paged_slots, token_shards, window_metadata
-from sparse_attention import _attend_project
+from o_proj import o_proj
+from sparse_attention import attend_packed
 from prefill_indexer import prefill_indexer, publish_c2a_index_key
 
 # model config
@@ -178,11 +180,13 @@ def prefill_c2a_full_attention(
     )
 
     source_ready = pl.system.task_dummy(deps=[select_tid, window_publish_tid, compressed_publish_tid])
-    _attend_project(
-        query, window_indices, window_cache, window_cache_scale,
-        topk_indices, compressed_cache, compressed_cache_scale, attn_sink,
-        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial,
-        num_tokens, source_ready, compressed_keys=INDEX_TOPK,
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    attend_packed(
+        query, window_indices, window_cache, window_cache_scale, topk_indices, compressed_cache, compressed_cache_scale,
+        attn_sink, attended, num_tokens, source_ready,
+    )
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens,
     )
     return partial
 

@@ -36,6 +36,18 @@ FP4_E4M3_CODES = torch.tensor(
 )
 
 
+@pl.jit.inline
+def fp4_e4m3_lut():
+    """Map packed FP4 nibbles to exact FP8 carrier bits."""
+    codes = pl.tile.arange(0, [1, 16], dtype=pl.INT32)
+    magnitude = pl.ands(codes, 7)
+    values = pl.add(pl.shls(magnitude, 2), 48)
+    values = pl.tile.select(pl.tile.cmps(magnitude, 0, cmp_type=0), 0, values)
+    values = pl.tile.select(pl.tile.cmps(magnitude, 1, cmp_type=0), 48, values)
+    values = pl.or_(values, pl.shls(pl.ands(codes, 8), 4))
+    return pl.cast(values, pl.INT16)
+
+
 @pl.jit.inline(auto_scope=False)
 def quantize_bf16_to_mxfp8(
     x: pl.Tensor,

@@ -293,22 +293,25 @@ def prefill_sp_post(
     residual_flat = pl.reshape(residual, [tokens, HC_MULT * D])
     mix_flat = pl.reshape(residual_mix, [tokens, HC_MULT * HC_MULT])
     output_flat = pl.reshape(output, [tokens, HC_MULT * D])
-    for block in pl.spmd(tokens * HC_MULT, name_hint="sp_mhc_post"):
-        row = block // HC_MULT
-        out_h = block % HC_MULT
-        for col in pl.pipeline(0, D, 256, stage=2):
-            value = pl.full([1, 256], dtype=pl.FP32, value=0.0)
-            if tp_rank * tokens + row < num_tokens:
-                hidden = pl.cast(sublayer[row:row + 1, col:col + 256], pl.FP32)
-                value = pl.mul(hidden, pl.read(post_mix, [row, out_h]))
-                for in_h in pl.unroll(HC_MULT):
-                    lane = residual_flat[row:row + 1, in_h * D + col:in_h * D + col + 256]
-                    value = pl.add(value, pl.mul(lane, pl.read(mix_flat, [row, in_h * HC_MULT + out_h])))
-            output_flat[row:row + 1, out_h * D + col:out_h * D + col + 256] = value
-    for row in pl.spmd(tokens, name_hint="sp_mix_zero_padding"):
-        if tp_rank * tokens + row >= num_tokens:
-            zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
-            next_pre_mix[row:row + 1, :] = pl.set_validshape(zero_mix, 1, HC_MULT)
+    for worker in pl.spmd(64, name_hint="sp_mhc_post"):
+        for block in pl.range(worker, tokens * HC_MULT, 64):
+            row = block // HC_MULT
+            out_h = block % HC_MULT
+            for col in pl.pipeline(0, D, 1024, stage=2):
+                value = pl.full([1, 1024], dtype=pl.FP32, value=0.0)
+                if tp_rank * tokens + row < num_tokens:
+                    hidden = pl.cast(sublayer[row:row + 1, col:col + 1024], pl.FP32)
+                    value = pl.mul(hidden, pl.read(post_mix, [row, out_h]))
+                    for in_h in pl.unroll(HC_MULT):
+                        lane = residual_flat[row:row + 1, in_h * D + col:in_h * D + col + 1024]
+                        value = pl.add(value, pl.mul(lane, pl.read(mix_flat, [row, in_h * HC_MULT + out_h])))
+                output_flat[row:row + 1, out_h * D + col:out_h * D + col + 1024] = value
+    active = pl.max(0, pl.min(tokens, num_tokens - tp_rank * tokens))
+    if active < tokens:
+        for worker in pl.spmd(32, name_hint="sp_mix_zero_padding"):
+            for row in pl.range(active + worker, tokens, 32):
+                zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
+                next_pre_mix[row:row + 1, :] = pl.set_validshape(zero_mix, 1, HC_MULT)
     return output, next_pre_mix
 
 

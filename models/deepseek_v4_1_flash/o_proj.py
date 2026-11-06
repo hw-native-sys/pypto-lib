@@ -45,9 +45,11 @@ HC_DIM = M.hc_dim
 
 
 # tiling
+# TP1 decode retains its measured tiles and worker counts.
+O_VECTOR_WORKERS = 64 if TP_SIZE == 1 else 8
 O_A_N_TILE = 256
-O_B_N_TILE = 160
-D_TILE = 512
+O_B_N_TILE = 160 if LOCAL_O_WIDTH == 8192 else 256
+D_TILE = D
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_rope_vf.cpp",
@@ -125,6 +127,8 @@ def _o_proj_quantized(
     payload = pl.create_tensor([80, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale_backing = pl.create_tensor([1, 80 * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
     oa_workers = pl.min(LOCAL_O_GROUPS * (O_LORA // O_A_N_TILE), pl.system.available_cluster_count())
+    if TP_SIZE != 1:
+        oa_workers = pl.min(oa_workers, 8)
     oa_workers = pl.max(1, oa_workers)
     with pl.spmd(oa_workers, name_hint="proj_o_a_quant"):
         payload, activation_scale_backing = _o_proj_a(
@@ -164,7 +168,7 @@ def o_proj(
         output_group = pl.tensor.slice(output, [group_rows, D], [group_start, 0])
         # Inverse RoPE.
         rotated = pl.create_tensor([80, LOCAL_H * ROPE_DIM], dtype=pl.BF16)
-        vector_workers = pl.max(1, pl.min(64, 2 * pl.system.available_cluster_count()))
+        vector_workers = pl.max(1, pl.min(O_VECTOR_WORKERS, 2 * pl.system.available_cluster_count()))
         rope_waves = pl.max(1, (active_rows + vector_workers - 1) // vector_workers)
         rope_workers = pl.max(1, (active_rows + rope_waves - 1) // rope_waves)
         with pl.spmd(rope_workers, name_hint="rope_o_vf"):
@@ -273,13 +277,12 @@ def prefill_sp_output_reduce_scatter(
                 output_arrived,
                 offsets=[peer, 0], expected=(attention_epoch - 1) * 2, cmp=pld.WaitCmp.Ge,
             )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_publish", deps=[reuse_tid]) as publish_tid:
-        if num_tokens > 0:
-            pld.tensor.put(
-                dst=output_window, peer=group_base + tp_rank, src=partial,
-                dst_offsets=[0, 0], src_offsets=[0, 0], shape=[num_tokens, D],
-                chunk_rows=1, chunk_cols=D_TILE, pipeline=True,
-            )
+    with pl.spmd(64, name_hint="sp_reduce_publish", deps=[reuse_tid]) as copied_tid:
+        worker = pl.tile.get_block_idx()
+        for row in pl.range(worker, num_tokens, 64):
+            publish_value = pl.load(partial, [row, 0], [1, D])
+            pld.tile.remote_store(publish_value, output_window, peer=group_base + tp_rank, offsets=[row, 0])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_notify", deps=[copied_tid]) as publish_tid:
         for peer in pl.range(TP_SIZE):
             pld.system.notify(
                 output_arrived,
@@ -337,10 +340,9 @@ def prefill_tp_output_all_reduce(
             pld.system.wait(output_arrived, offsets=[peer, 0], expected=previous_epoch, cmp=pld.WaitCmp.Ge)
     with pl.spmd(64, name_hint="prefill_tp_publish", deps=[reuse_tid]) as publish_tid:
         worker = pl.tile.get_block_idx()
-        for tile in pl.range(worker, num_tokens * (D // 512), 64):
-            row = tile // (D // 512)
-            col = tile % (D // 512) * 512
-            value = pl.load(output_partial, [row, col], [1, 512])
+        for row in pl.range(worker, num_tokens, 64):
+            col = 0
+            value = pl.load(output_partial, [row, col], [1, D])
             pld.tile.remote_store(value, output_window, peer=group_base + tp_rank, offsets=[row, col])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_ready", deps=[publish_tid]) as ready_tid:
         for peer in pl.range(TP_SIZE):
@@ -355,14 +357,13 @@ def prefill_tp_output_all_reduce(
             pld.system.wait(output_arrived, offsets=[peer, 0], expected=ready_epoch, cmp=pld.WaitCmp.Ge)
     with pl.spmd(64, name_hint="prefill_tp_reduce", deps=[wait_tid]) as reduce_tid:
         worker = pl.tile.get_block_idx()
-        for tile in pl.range(worker, num_tokens * (D // 512), 64):
-            row = tile // (D // 512)
-            col = tile % (D // 512) * 512
-            acc = pl.tile.full([1, 512], dtype=pl.FP32, value=0.0)
+        for row in pl.range(worker, num_tokens, 64):
+            col = 0
+            acc = pl.tile.full([1, D], dtype=pl.FP32, value=0.0)
             for peer in pl.range(TP_SIZE):
                 value = pld.tile.remote_load(
                     output_window,
-                    peer=group_base + peer, offsets=[row, col], shape=[1, 512],
+                    peer=group_base + peer, offsets=[row, col], shape=[1, D],
                 )
                 acc = pl.add(acc, pl.cast(value, pl.FP32))
             output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
