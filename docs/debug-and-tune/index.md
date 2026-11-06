@@ -51,7 +51,7 @@ source.
   repeated invocations of the script. For single-card tuning, report the
   `median=` field of the `[RUN] effective_us` line. For multi-card tuning, use
   the [lowest per-rank median](performance-tuning.md#multi-card-l3-output).
-  Retain the raw samples (`PYPTO_BENCH_RAW=1`).
+  Retain the raw samples printed by the benchmark.
 - Keep generated traces and build products under `build_output/`; do not commit
   them.
 - Remove diagnostic instrumentation and rerun validation before submitting a

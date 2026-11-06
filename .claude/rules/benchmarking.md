@@ -96,7 +96,7 @@ mean and not the median.
 
 When the per-rank breakdown is not enough:
 
-- `PYPTO_BENCH_RAW=1` prints every dispatch's sample per rank in order — use it
+- `PYPTO_BENCH=1` also prints every dispatch's sample per rank in order — use it
   to spot start-up drift, a bimodal rank, or one card lagging.
 - Capture a per-rank chip swimlane and measure from the first real compute task
   instead of the window start, subtracting the leading wait explicitly.

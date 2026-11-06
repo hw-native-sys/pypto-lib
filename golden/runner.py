@@ -562,17 +562,6 @@ def _resident_loop_sizes() -> tuple[int, int]:
     return rounds, max(warmup, 1)
 
 
-def _bench_raw_enabled() -> bool:
-    """True when ``PYPTO_BENCH_RAW`` is set truthy.
-
-    Opt-in companion to :func:`_bench_enabled`, off by default (the raw dump is
-    one line per rank holding every sample). Turn it on when a summary looks
-    suspicious — start-up drift, a bimodal rank, one card lagging — and the
-    individual samples are needed to see the shape.
-    """
-    return _env_flag("PYPTO_BENCH_RAW")
-
-
 def _benchmark_unavailable(error: RuntimeError) -> bool:
     """True only for the optional-profiling failure emitted by the runtime."""
     return "no [STRACE] markers captured" in str(error)
@@ -659,9 +648,9 @@ def _benchmark_and_report(
 def _report_bench(stats: Any, compiled: Any, *, l3: bool, resident: bool) -> None:
     """Print one benchmark run's report block.
 
-    Four blocks: the ``effective_us`` headline, L3's per-rank table, the opt-in
-    raw dump, and L3's context line. The headline goes first and is the only
-    line spelling the metric out; every breakdown line says ``eff_us``, so one
+    Includes the ``effective_us`` headline, raw samples, tagged task slots,
+    and L3's per-rank table and context line. The headline goes first and is
+    the only line spelling the metric out; every breakdown line says ``eff_us``, so one
     glance down a 60-line multi-card dump finds the headline number. Structured
     performance consumers use the returned benchmark data rather than this text.
     """
@@ -687,7 +676,7 @@ def _report_task_slots(stats: Any) -> None:
     Repeated spans of one slot in a dispatch merge into one
     ``min(ts)``..``max(ts + dur)`` window, and ``dfin_us`` pairs only the
     dispatches that carry both slots. Each is the median over measured
-    dispatches; ``PYPTO_BENCH_RAW`` adds the per-dispatch ``fin_us`` lists.
+    dispatches, followed by the per-dispatch ``fin_us`` lists.
     """
     by_pid: dict[int, dict[int, dict[int, tuple[float, float]]]] = {}
     for iv in sorted(stats.invocations or [], key=lambda i: (i.pid, i.inv)):
@@ -726,8 +715,7 @@ def _report_task_slots(stats: Any) -> None:
                 if deltas:
                     line += f" dfin_us={statistics.median(deltas):.1f}"
             print(line, flush=True)
-            if _bench_raw_enabled():
-                print(f"[RUN]       raw fin_us={[round(f, 1) for f in fins]}", flush=True)
+            print(f"[RUN]       raw fin_us={[round(f, 1) for f in fins]}", flush=True)
             prev = slot
 
 
@@ -777,9 +765,8 @@ def _report_effective(stats: Any) -> None:
 def _report_raw_samples(stats: Any) -> None:
     """Print every measured dispatch's raw Effective sample, per rank.
 
-    No-op unless :func:`_bench_raw_enabled` (``PYPTO_BENCH_RAW``). Reads
-    :attr:`BenchmarkStats.invocations` — the flat per-dispatch list — rather than
-    the per-round grid, so it works for L2 (one rank, one dispatch per round),
+    Reads :attr:`BenchmarkStats.invocations` — the flat per-dispatch list —
+    rather than the per-round grid, so it works for L2 (one rank, one dispatch per round),
     for L3, and for the L3 flatten fallback where ``per_rank`` returns ``{}`` and
     the summary lines are the least trustworthy.
 
@@ -787,7 +774,7 @@ def _report_raw_samples(stats: Any) -> None:
     drift directly. The lines carry a ``raw`` token and ``eff_us``, matching the
     breakdown-line spelling described in :func:`_report_bench`.
     """
-    if not _bench_raw_enabled() or not stats.invocations:
+    if not stats.invocations:
         return
     by_pid: dict[int, list[Any]] = {}
     for iv in sorted(stats.invocations, key=lambda i: (i.pid, i.inv)):

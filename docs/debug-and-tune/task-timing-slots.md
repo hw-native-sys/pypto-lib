@@ -98,8 +98,8 @@ used for any generated-code edit:
   finish when slots are numbered in stage order. It is a finish-boundary
   delta, not an elapsed stage duration. For example, a stage running from
   20 to 120 us whose predecessor finishes at 100 us has a 20 us delta but a
-  100 us runtime. All three fields are medians; `PYPTO_BENCH_RAW=1` adds each
-  round's `fin_us`.
+  100 us runtime. All three fields are medians; the benchmark also prints the
+  per-dispatch `fin_us` samples.
 - **The patch lives in `build_output/` only.** Recompiling regenerates the
   orchestration `.cpp` and silently drops every tag — which is also how the
   instrumentation is removed.

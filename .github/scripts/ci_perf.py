@@ -314,7 +314,7 @@ def effective_us(payload, case, sampling):
 
 def submit_command(case, case_dir, sampling):
     count = case["device_count"]
-    env = {"PYTHONPATH": str(ROOT), "PYPTO_BENCH": "1", "PYPTO_BENCH_RAW": "1",
+    env = {"PYTHONPATH": str(ROOT), "PYPTO_BENCH": "1",
            "PYPTO_BENCH_ROUNDS": str(sampling["rounds"]), "PYPTO_BENCH_WARMUP": str(sampling["warmup"]),
            "PYPTO_LOG_LEVEL": "error", "PYPTO_RUNTIME_LOG": "error", "SIMPLER_DEVICE_STRACE_ENABLE": "1"}
     # task-submit sources ~/.bashrc; forward the job's resolved toolchain.

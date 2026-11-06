@@ -96,10 +96,13 @@ A distributed program adds a per-rank breakdown and a context line:
 
 | Env | Default | Effect |
 |-----|---------|--------|
-| `PYPTO_BENCH` | off | Enables the timed loop. Any value except `""` / `0` / `false` / `False` is on. |
+| `PYPTO_BENCH` | off | Enables the timed loop, summary, and raw samples. Any value except `""` / `0` / `false` / `False` is on. |
 | `PYPTO_BENCH_ROUNDS` | `100` | Timed rounds. 100 rounds is ~0.1 s of device time for a decode step but minutes for a long prefill or a multi-card run — drop it while iterating. |
 | `PYPTO_BENCH_WARMUP` | `5` | Leading launches discarded before measurement. The resident L3 path always keeps ≥ 1 (its first warmup launch doubles as the validation dispatch). |
-| `PYPTO_BENCH_RAW` | off | Prints every measured dispatch's Effective sample, one line per rank, in dispatch order. Use it when a summary looks suspicious — start-up drift, a bimodal rank, one card lagging. |
+
+Every benchmark prints each measured dispatch's Effective sample, one line
+per rank in dispatch order, after measurement. Use these samples to spot
+start-up drift, a bimodal rank, or one card lagging.
 
 A malformed or out-of-range value warns and falls back to the default
 rather than failing the run. The 100 / 5 default is the baseline every
@@ -108,7 +111,7 @@ against other runs with the same sizes.
 
 ```bash
 # Quick CSA decode iteration, with the raw per-dispatch samples.
-PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=10 PYPTO_BENCH_WARMUP=2 PYPTO_BENCH_RAW=1 \
+PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=10 PYPTO_BENCH_WARMUP=2 \
   python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0
 ```
 

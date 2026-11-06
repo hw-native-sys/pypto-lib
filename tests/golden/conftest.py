@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # sends every run() down the benchmark path — which the stub pypto cannot serve —
 # and fails a couple of dozen unrelated tests, so clear them for the whole suite;
 # the tests that exercise these knobs set them explicitly via monkeypatch.
-_BENCH_ENV = ("PYPTO_BENCH", "PYPTO_BENCH_RAW", "PYPTO_BENCH_ROUNDS", "PYPTO_BENCH_WARMUP")
+_BENCH_ENV = ("PYPTO_BENCH", "PYPTO_BENCH_ROUNDS", "PYPTO_BENCH_WARMUP")
 
 
 @pytest.fixture(autouse=True)
