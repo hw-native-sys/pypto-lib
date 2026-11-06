@@ -32,6 +32,90 @@ from config import (
 
 
 # --- Paged-KV metadata lowering. ---
+def prefill_state_fixture(
+    start_pos, token_count, checkpoint_end, *, history, block_size, table, physical_blocks,
+):
+    """Allocate non-aliasing entry and publication rows for checkpoint fixtures."""
+    positions = torch.arange(start_pos, start_pos + token_count, dtype=torch.int64)
+    if checkpoint_end == 0:
+        return table, table[positions // block_size].long() * block_size + positions % block_size, physical_blocks
+    if not 0 < checkpoint_end <= len(table) * block_size:
+        raise ValueError("fixture checkpoint exceeds the model context")
+    read_first = max(0, start_pos - history) // block_size
+    read_stop = (start_pos + block_size - 1) // block_size
+    read_blocks = read_stop - read_first
+    write_first = start_pos // block_size
+    write_blocks = (start_pos + token_count + block_size - 1) // block_size - write_first
+    table = torch.full_like(table, -1)
+    table[read_first:read_stop] = torch.arange(read_blocks, dtype=table.dtype).flip(0)
+    pages = torch.arange(read_blocks, read_blocks + write_blocks, dtype=torch.int64).flip(0)
+    if start_pos % block_size:
+        pages[0] = table[write_first]
+    mapping = pages[positions // block_size - write_first] * block_size + positions % block_size
+    return table, mapping, max(physical_blocks, read_blocks + write_blocks)
+
+
+def validate_prefill_state_checkpoint(
+    tensors, *, history, block_size, tail, table_name="compress_state_block_table", slot_name="state_slot_mapping",
+):
+    """Reject missing/aliased checkpoint publication in the Host reference only.
+
+    Callers retain published checkpoint pages across forwards with their normal
+    snapshot/COW lifetime rules. Kernel execution never performs this scan.
+    """
+    checkpoint = int(tensors["state_checkpoint_ends"][0])
+    if checkpoint == 0:
+        return
+    positions = tensors["position_ids"].tolist()
+    start, end = positions[0], positions[-1] + 1
+    if positions != list(range(start, end)) or checkpoint < 0:
+        raise ValueError("checkpoint validation requires consecutive positions and a nonnegative checkpoint")
+    mapping = tensors[slot_name].tolist()
+    table = tensors[table_name][0]
+    capacity = tensors["compress_state"].shape[0] * block_size
+
+    def row(position):
+        if position >= start:
+            result = int(mapping[position - start])
+        else:
+            block = position // block_size
+            result = int(table[block]) * block_size + position % block_size if block < len(table) else -1
+        if not 0 <= result < capacity:
+            raise ValueError(f"missing checkpoint state at position {position}")
+        return result
+
+    owners = {}
+    retained = {}
+    for position in range(max(0, start - history), start):
+        physical = row(position)
+        if physical in owners and owners[physical] != position:
+            raise ValueError("entry state rows alias")
+        owners[physical] = position
+        if checkpoint - history <= position < checkpoint:
+            retained[physical] = position
+    for offset in range(0, len(positions), 512):
+        tile_start, tile_end = start + offset, min(start + offset + 512, end)
+        published = set(range(max(tile_start, tile_end - tail), tile_end))
+        published.update(range(max(tile_start, checkpoint - history), min(tile_end, checkpoint)))
+        writes = {}
+        for position in published:
+            physical = row(position)
+            if (physical in writes and writes[physical] != position
+                    or physical in retained and retained[physical] != position):
+                raise ValueError("checkpoint publication rows alias")
+            writes[physical] = position
+        owners.update(writes)
+        retained.update((p, q) for p, q in writes.items() if checkpoint - history <= q < checkpoint)
+    # A target may lie in a later/earlier chunk. Validate this forward's
+    # checkpoint fragment and entry history, never invent an absent full window.
+    windows = ((max(0, start - history, checkpoint - history), min(checkpoint, end)),
+               (max(0, end - history), end))
+    for begin, stop in windows:
+        for position in range(begin, stop):
+            if owners.get(row(position)) != position:
+                raise ValueError(f"checkpoint or terminal state was overwritten at position {position}")
+
+
 def resolve_start_positions(
     start_pos: int | list[int] | tuple[int, ...] | torch.Tensor | None,
     *,

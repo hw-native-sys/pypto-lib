@@ -613,6 +613,12 @@ prefill_compressor_ratio4_test = pl.jit(auto_scope=False)(_compressor_ratio4)
 def golden_prefill_compressor_ratio4(tensors):
     """Physical token-major torch reference with transactional state publication."""
     import torch
+    from utils import validate_prefill_state_checkpoint
+
+    validate_prefill_state_checkpoint(
+        tensors, history=STATE_LEN, block_size=CSA_STATE_BLOCK_SIZE, tail=STATE_LEN,
+        table_name="compress_state_block_table", slot_name="state_slot_mapping",
+    )
 
     token_count = tensors["x"].shape[0]
     x = tensors["x"].view(token_count, D).float()
@@ -744,10 +750,10 @@ def golden_prefill_compressor_ratio4(tensors):
             score_state_flat[dst_row] = score_proj[token_id] + ape[pos % COMPRESS_RATIO]
 
 
-def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
+def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0):
     import torch
     from golden import TensorSpec
-    from utils import token_local_rope
+    from utils import prefill_state_fixture, token_local_rope
 
     if token_count <= 0 or token_count > MAX_SEQ_LEN:
         raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
@@ -756,25 +762,29 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     if start_pos + token_count > MAX_SEQ_LEN:
         raise ValueError("start_pos + token_count exceeds max_position_embeddings")
 
+    logical_blocks = torch.arange(CSA_STATE_MAX_BLOCKS, dtype=torch.int64)
+    state_table = ((logical_blocks * 17 + 3) % CSA_STATE_BLOCKS_PER_REQUEST).to(torch.int32)
+    state_table, state_mapping, state_blocks = prefill_state_fixture(
+        start_pos, token_count, checkpoint_end, history=STATE_LEN, block_size=CSA_STATE_BLOCK_SIZE,
+        table=state_table, physical_blocks=CSA_STATE_BLOCK_NUM,
+    )
+
     def init_compress_state_block_table():
-        logical_blocks = torch.arange(CSA_STATE_MAX_BLOCKS, dtype=torch.int64)
-        physical_blocks = (logical_blocks * 17 + 3) % CSA_STATE_BLOCKS_PER_REQUEST
-        physical_blocks = physical_blocks.to(torch.int32)
-        return physical_blocks.unsqueeze(0)
+        return state_table.unsqueeze(0)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
         block = abs_pos // CSA_STATE_BLOCK_SIZE
         intra = abs_pos % CSA_STATE_BLOCK_SIZE
-        physical_block = (block * 17 + 3) % CSA_STATE_BLOCKS_PER_REQUEST
+        physical_block = int(state_table[block])
         return physical_block * CSA_STATE_BLOCK_SIZE + intra
 
     def init_x():
         return ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
 
     def init_compress_state():
-        state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
+        state = torch.zeros(state_blocks, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
         flat = state.view(-1, COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, start_pos - STATE_LEN), start_pos):
             row = state_row(abs_pos)
@@ -833,18 +843,15 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return mapping
 
     def init_state_slot_mapping():
-        mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        for t in range(token_count):
-            mapping[t] = state_row(start_pos + t)
-        return mapping
+        return state_mapping.clone()
 
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
-        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.zeros(1, dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.tensor([checkpoint_end], dtype=torch.int32)),
         TensorSpec(
             "compress_state",
-            [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+            [state_blocks, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
             torch.float32,
             init_value=init_compress_state,
         ),
@@ -906,24 +913,28 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        fn=prefill_compressor_ratio4_test,
-        specs=build_tensor_specs(args.start_pos, args.token_count),
-        golden_fn=golden_prefill_compressor_ratio4,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        compile_only=args.compile_only,
-        compare_fn={
-            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    cases = [(args.start_pos, args.token_count, 0)]
+    if args.start_pos == START_POS and args.token_count == PREFILL_SEQ:
+        cases.extend(((0, 8192, 8064), (33, 1024, 640), (127, 513, 128)))
+    for start_pos, token_count, checkpoint_end in cases:
+        result = run(
+            fn=prefill_compressor_ratio4_test,
+            specs=build_tensor_specs(start_pos, token_count, checkpoint_end),
+            golden_fn=golden_prefill_compressor_ratio4,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+            ),
+            compile_only=args.compile_only,
+            compare_fn={
+                "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+                "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            },
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)

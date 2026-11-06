@@ -591,12 +591,14 @@ def _state_block_table(max_blocks, physical_blocks):
 def build_tensor_specs(
     start_pos: int = START_POS,
     token_count: int = PREFILL_SEQ,
+    checkpoint_end: int = 0,
 ):
     import torch
     from golden import TensorSpec
     from utils import (
         int8_quant_per_row,
         pack_nz,
+        prefill_state_fixture,
         quant_w_per_channel,
         token_local_rope,
     )
@@ -779,12 +781,16 @@ def build_tensor_specs(
         )
 
     state_table = _state_block_table(CSA_STATE_MAX_BLOCKS, CSA_STATE_BLOCKS_PER_REQUEST)
+    state_table, state_mapping, state_blocks = prefill_state_fixture(
+        start_pos, token_count, checkpoint_end, history=MAIN_STATE_LEN, block_size=CSA_STATE_BLOCK_SIZE,
+        table=state_table, physical_blocks=CSA_STATE_BLOCK_NUM,
+    )
 
     def init_compress_state_block_table():
         return state_table.clone().unsqueeze(0)
 
     def init_compress_state():
-        state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM)
+        state = torch.zeros(state_blocks, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM)
         flat = state.view(-1, MAIN_COMPRESS_STATE_DIM)
         history_positions = torch.arange(max(0, context_len - MAIN_STATE_LEN), context_len, dtype=torch.int64)
         history_rows = paged_rows(state_table, history_positions, CSA_STATE_BLOCK_SIZE)
@@ -820,12 +826,16 @@ def build_tensor_specs(
         )
 
     inner_state_table = _state_block_table(INNER_STATE_MAX_BLOCKS, CSA_INNER_STATE_BLOCKS_PER_REQUEST)
+    inner_state_table, inner_state_mapping, inner_state_blocks = prefill_state_fixture(
+        start_pos, token_count, checkpoint_end, history=INNER_STATE_LEN, block_size=INNER_STATE_BLOCK_SIZE,
+        table=inner_state_table, physical_blocks=INNER_STATE_BLOCK_NUM,
+    )
 
     def init_inner_compress_state_block_table():
         return inner_state_table.clone().unsqueeze(0)
 
     def init_inner_compress_state():
-        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM)
+        state = torch.zeros(inner_state_blocks, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM)
         flat = state.view(-1, INNER_COMPRESS_STATE_DIM)
         history_positions = torch.arange(max(0, context_len - INNER_STATE_LEN), context_len, dtype=torch.int64)
         history_rows = paged_rows(inner_state_table, history_positions, INNER_STATE_BLOCK_SIZE)
@@ -909,10 +919,10 @@ def build_tensor_specs(
         return mapping
 
     def init_state_slot_mapping():
-        return paged_rows(state_table, token_pos().to(torch.int64), CSA_STATE_BLOCK_SIZE)
+        return state_mapping.clone()
 
     def init_inner_state_slot_mapping():
-        return paged_rows(inner_state_table, token_pos().to(torch.int64), INNER_STATE_BLOCK_SIZE)
+        return inner_state_mapping.clone()
 
     def init_attn_sink():
         return torch.zeros(H)
@@ -940,7 +950,7 @@ def build_tensor_specs(
     return [
         TensorSpec("x_hc", [token_count, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
-        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.zeros(1, dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.tensor([checkpoint_end], dtype=torch.int32)),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
@@ -961,7 +971,7 @@ def build_tensor_specs(
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
         TensorSpec(
             "compress_state",
-            [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM],
+            [state_blocks, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM],
             torch.float32,
             init_value=init_compress_state,
         ),
@@ -992,7 +1002,7 @@ def build_tensor_specs(
         TensorSpec("inner_norm_w", [IDX_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
         TensorSpec(
             "inner_compress_state",
-            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM],
+            [inner_state_blocks, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM],
             torch.float32,
             init_value=init_inner_compress_state,
         ),
@@ -1674,11 +1684,11 @@ def l3_prefill_attention_csa_cp(
         )
 
 
-
 def build_cp_tensor_specs(
     start_pos: int = START_POS,
     token_count: int = PREFILL_SEQ,
     tp_size: int = TP_SIZE,
+    checkpoint_end: int = 0,
 ):
     """Replicate CSA layer boundaries and split query positions across the CP group."""
     import torch
@@ -1701,7 +1711,7 @@ def build_cp_tensor_specs(
     )
 
     specs = []
-    for spec in build_tensor_specs(start_pos, token_count):
+    for spec in build_tensor_specs(start_pos, token_count, checkpoint_end):
         value = materialize_spec(spec)
         if spec.name == "x_hc":
             specs.append(TensorSpec(
@@ -1750,7 +1760,7 @@ def build_cp_tensor_specs(
     return specs
 
 
-def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
+def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE, checkpoint_ends: tuple[int, int] = (0, 0)):
     """Build the two-request rank-crossing CSA fixture from the B1 CP specs."""
     import torch
 
@@ -1770,6 +1780,11 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
 
     token_count = 8
     request_starts = (126, 30)
+    if len(checkpoint_ends) != 2 or any(
+        c != 0 and not start < c <= start + count
+        for c, start, count in zip(checkpoint_ends, request_starts, (3, 4))
+    ):
+        raise ValueError("ragged checkpoints must be zero or within their own request")
     request_positions = (
         torch.tensor([126, 127, 128], dtype=torch.int32),
         torch.tensor([30, 31, 32, 33], dtype=torch.int32),
@@ -1865,7 +1880,7 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
 
     replacements = {
         "query_start_loc": cp_stack(query_start_loc, tp_size),
-        "state_checkpoint_ends": torch.zeros(tp_size, 2, dtype=torch.int32),
+        "state_checkpoint_ends": cp_stack(torch.tensor(checkpoint_ends, dtype=torch.int32), tp_size),
         "local_request_ids": request_ids.reshape(tp_size, token_count // tp_size).contiguous(),
         "freqs_cos": cp_stack(freqs_cos, tp_size),
         "freqs_sin": cp_stack(freqs_sin, tp_size),

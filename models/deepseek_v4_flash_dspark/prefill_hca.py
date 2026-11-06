@@ -108,7 +108,6 @@ HCA_ORI_BLOCK_NUM = SPARSE_ORI_BLOCK_NUM
 HCA_CMP_BLOCK_NUM = SPARSE_CMP_BLOCK_NUM
 
 
-
 def _prefill_attention_hca(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
@@ -474,10 +473,11 @@ def golden_prefill_attention_hca(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
+def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0):
     import torch
     from golden import TensorSpec
-    from utils import block_table, cache_row_from_table, pack_nz, quant_w_per_channel, token_local_rope
+    from utils import (block_table, cache_row_from_table, pack_nz, prefill_state_fixture,
+                       quant_w_per_channel, token_local_rope)
 
     # Single-request geometry: the physical token dimension is q_len.
     context_len = start_pos
@@ -624,6 +624,10 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         physical_blocks=HCA_STATE_PHYSICAL_BLOCKS,
         request_slots=DECODE_BATCH,
     )[0]
+    state_table, state_mapping, state_blocks = prefill_state_fixture(
+        start_pos, token_count, checkpoint_end, history=COMPRESS_RATIO, block_size=HCA_STATE_BLOCK_SIZE,
+        table=state_table, physical_blocks=HCA_STATE_BLOCK_NUM,
+    )
 
     def init_compress_state_block_table():
         return state_table.clone().unsqueeze(0)
@@ -636,7 +640,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return int(state_table[block].item()) * HCA_STATE_BLOCK_SIZE + intra
 
     def init_compress_state():
-        state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM)
+        state = torch.zeros(state_blocks, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM)
         flat = state.view(-1, MAIN_COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, context_len - COMPRESS_RATIO), context_len):
             row = state_row(abs_pos)
@@ -708,11 +712,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return out
 
     def init_state_slot_mapping():
-        mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        _, pos = token_meta()
-        for t in range(token_count):
-            mapping[t] = state_row(int(pos[t].item()))
-        return mapping
+        return state_mapping.clone()
 
     def init_attn_sink():
         return torch.zeros(H)
@@ -735,7 +735,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     return [
         TensorSpec("x_hc", [token_count, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=init_query_start_loc),
-        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.zeros(1, dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.tensor([checkpoint_end], dtype=torch.int32)),
         TensorSpec("local_request_ids", [token_count], torch.int32, init_value=init_local_request_ids),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
@@ -757,7 +757,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
         TensorSpec(
             "compress_state",
-            [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM],
+            [state_blocks, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM],
             torch.float32,
             init_value=init_compress_state,
         ),
@@ -791,6 +791,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [token_count, HC_MULT, D], torch.float32),
     ]
+
 
 
 @pl.jit.inline
@@ -1317,11 +1318,11 @@ def l3_prefill_attention_hca_cp(
         )
 
 
-
 def build_cp_tensor_specs(
     start_pos: int = START_POS,
     token_count: int = PREFILL_SEQ,
     tp_size: int = TP_SIZE,
+    checkpoint_end: int = 0,
 ):
     """Replicate layer-boundary state and full inputs while sharding query positions."""
     import torch
@@ -1343,7 +1344,7 @@ def build_cp_tensor_specs(
     full_names = ("ori_slot_mapping", "cmp_slot_mapping", "state_slot_mapping")
 
     specs = []
-    for spec in build_tensor_specs(start_pos, token_count):
+    for spec in build_tensor_specs(start_pos, token_count, checkpoint_end):
         value = materialize_spec(spec)
         if spec.name == "query_start_loc":
             specs.append(TensorSpec(
@@ -1397,7 +1398,7 @@ def build_cp_tensor_specs(
     return specs
 
 
-def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
+def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE, checkpoint_ends: tuple[int, int] = (0, 0)):
     """Build the two-request rank-crossing HCA fixture from the B1 CP specs."""
     import torch
 
@@ -1417,6 +1418,11 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
 
     token_count = 8
     request_starts = (126, 30)
+    if len(checkpoint_ends) != 2 or any(
+        c != 0 and not start < c <= start + count
+        for c, start, count in zip(checkpoint_ends, request_starts, (3, 4))
+    ):
+        raise ValueError("ragged checkpoints must be zero or within their own request")
     request_positions = (
         torch.tensor([126, 127, 128], dtype=torch.int32),
         torch.tensor([30, 31, 32, 33], dtype=torch.int32),
@@ -1489,7 +1495,7 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):
 
     replacements = {
         "query_start_loc": cp_stack(query_start_loc, tp_size),
-        "state_checkpoint_ends": torch.zeros(tp_size, 2, dtype=torch.int32),
+        "state_checkpoint_ends": cp_stack(torch.tensor(checkpoint_ends, dtype=torch.int32), tp_size),
         "local_request_ids": request_ids.reshape(tp_size, token_count // tp_size).contiguous(),
         "freqs_cos": cp_stack(freqs_cos, tp_size),
         "freqs_sin": cp_stack(freqs_sin, tp_size),

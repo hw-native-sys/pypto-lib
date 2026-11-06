@@ -521,13 +521,18 @@ prefill_compressor_ratio128_test = pl.jit(auto_scope=False)(_prefill_compressor_
 
 def golden_prefill_compressor_ratio128(tensors):
     import torch
+    from utils import validate_prefill_state_checkpoint
+
+    validate_prefill_state_checkpoint(
+        tensors, history=STATE_LEN, block_size=HCA_STATE_BLOCK_SIZE, tail=STATE_STORAGE_LEN,
+        table_name="compress_state_block_table", slot_name="state_slot_mapping",
+    )
 
     token_count = tensors["x"].shape[0]
     kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()  # wkv stored [OUT_DIM, D] for b_trans
     score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
     compress_state_flat = tensors["compress_state"].view(
-        HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE,
-        COMPRESS_STATE_DIM,
+        -1, COMPRESS_STATE_DIM,
     )
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
@@ -594,10 +599,10 @@ def golden_prefill_compressor_ratio128(tensors):
         score_state_flat[dst_row] = score_proj[t] + tensors["ape"][slot]
 
 
-def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
+def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0):
     import torch
     from golden import TensorSpec
-    from utils import block_table, token_local_rope
+    from utils import block_table, prefill_state_fixture, token_local_rope
 
     if token_count <= 0 or token_count > MAX_SEQ_LEN:
         raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
@@ -612,6 +617,10 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         physical_blocks=HCA_STATE_BLOCK_NUM,
         request_slots=DECODE_BATCH,
     )[0]
+    state_table, state_mapping, state_blocks = prefill_state_fixture(
+        start_pos, token_count, checkpoint_end, history=STATE_LEN, block_size=HCA_STATE_BLOCK_SIZE,
+        table=state_table, physical_blocks=HCA_STATE_BLOCK_NUM,
+    )
 
     def init_compress_state_block_table():
         return state_table.unsqueeze(0)
@@ -628,7 +637,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
 
     def init_compress_state():
-        state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
+        state = torch.zeros(state_blocks, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, start_pos - COMPRESS_RATIO), start_pos):
             row = state_row(abs_pos)
             if row >= 0:
@@ -683,18 +692,15 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return mapping
 
     def init_state_slot_mapping():
-        mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        for token_id in range(token_count):
-            mapping[token_id] = state_row(start_pos + token_id)
-        return mapping
+        return state_mapping.clone()
 
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
-        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.zeros(1, dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.tensor([checkpoint_end], dtype=torch.int32)),
         TensorSpec(
             "compress_state",
-            [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+            [state_blocks, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
             torch.float32,
             init_value=init_compress_state,
         ),
@@ -756,26 +762,30 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        fn=prefill_compressor_ratio128_test,
-        specs=build_tensor_specs(args.start_pos, args.token_count),
-        golden_fn=golden_prefill_compressor_ratio128,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compile_only=args.compile_only,
-        compare_fn={
-            "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
-            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    cases = [(args.start_pos, args.token_count, 0)]
+    if args.start_pos == START_POS and args.token_count == PREFILL_SEQ:
+        cases.extend(((0, 8192, 8064), (33, 1024, 640), (127, 513, 128)))
+    for start_pos, token_count, checkpoint_end in cases:
+        result = run(
+            fn=prefill_compressor_ratio128_test,
+            specs=build_tensor_specs(start_pos, token_count, checkpoint_end),
+            golden_fn=golden_prefill_compressor_ratio128,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            compile_only=args.compile_only,
+            compare_fn={
+                "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+                "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+            },
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
