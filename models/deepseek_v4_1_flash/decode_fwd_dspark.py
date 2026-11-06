@@ -477,6 +477,7 @@ TARGET_FWD_ROUTE_WIDTH = target_fwd.ROUTE_WIDTH
 TARGET_FWD_SIGNAL_PAD = target_fwd.SIGNAL_PAD
 TARGET_FWD_MOE_TOKENS = target_fwd.MOE_TOKENS
 TARGET_FWD_TOPK = target_fwd.TOPK
+TARGET_FWD_COMM_WIDTH = target_fwd.PACKED_WIDTH
 TARGET_FWD_GROUP_LOGIT_ROWS = target_fwd.GROUP_LOGIT_ROWS
 SAMPLING_GROUP_LOGIT_ROWS = sampling.GROUP_LOGIT_ROWS
 SAMPLING_MAX_LOGIT_ROWS = sampling.MAX_LOGIT_ROWS
@@ -702,13 +703,14 @@ def l3_decode_fwd_dspark(
         )
 
     # Decode fwd.
+    # Allocate packed return packets at the aligned communication domain base.
+    target_fwd_routed_output_buffer = pld.alloc_window_buffer([TARGET_FWD_MOE_TOKENS * TARGET_FWD_TOPK, TARGET_FWD_COMM_WIDTH], dtype=pl.BF16)
     target_fwd_recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS], dtype=pl.INT32)
     target_fwd_recv_x_buffer = pld.alloc_window_buffer([TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, D], dtype=pl.INT8)
     target_fwd_recv_scale_buffer = pld.alloc_window_buffer([TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, D // TARGET_FWD_MX_GROUP], dtype=pl.UINT8)
     target_fwd_recv_weights_buffer = pld.alloc_window_buffer([TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, TARGET_FWD_AUX_WIDTH], dtype=pl.FP32)
     target_fwd_recv_routes_buffer = pld.alloc_window_buffer([TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, TARGET_FWD_ROUTE_WIDTH], dtype=pl.INT32)
     target_fwd_data_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_SIGNAL_PAD], dtype=pl.INT32)
-    target_fwd_routed_output_buffer = pld.alloc_window_buffer([TARGET_FWD_MOE_TOKENS * TARGET_FWD_TOPK, D], dtype=pl.BF16)
     target_fwd_combine_arrived_buffer = pld.alloc_window_buffer([EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_SIGNAL_PAD], dtype=pl.INT32)
     target_fwd_head_hidden_buffer = pld.alloc_window_buffer([TARGET_FWD_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
     target_fwd_head_hidden_done_buffer = pld.alloc_window_buffer([1, 1], dtype=pl.INT32)
@@ -721,7 +723,7 @@ def l3_decode_fwd_dspark(
         target_fwd_recv_weights = pld.window(target_fwd_recv_weights_buffer, [TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, TARGET_FWD_AUX_WIDTH], dtype=pl.FP32)
         target_fwd_recv_routes = pld.window(target_fwd_recv_routes_buffer, [TARGET_FWD_N_LOCAL_EXPERTS * TARGET_FWD_RECV_MAX, TARGET_FWD_ROUTE_WIDTH], dtype=pl.INT32)
         target_fwd_data_arrived = pld.window(target_fwd_data_arrived_buffer, [EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_SIGNAL_PAD], dtype=pl.INT32)
-        target_fwd_routed_output = pld.window(target_fwd_routed_output_buffer, [TARGET_FWD_MOE_TOKENS * TARGET_FWD_TOPK, D], dtype=pl.BF16)
+        target_fwd_routed_output = pld.window(target_fwd_routed_output_buffer, [TARGET_FWD_MOE_TOKENS * TARGET_FWD_TOPK, TARGET_FWD_COMM_WIDTH], dtype=pl.BF16)
         target_fwd_combine_arrived = pld.window(target_fwd_combine_arrived_buffer, [EP_SIZE, TARGET_FWD_N_LOCAL_EXPERTS, TARGET_FWD_SIGNAL_PAD], dtype=pl.INT32)
         target_fwd_head_hidden = pld.window(target_fwd_head_hidden_buffer, [TARGET_FWD_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         target_fwd_head_hidden_done = pld.window(target_fwd_head_hidden_done_buffer, [1, 1], dtype=pl.INT32)
