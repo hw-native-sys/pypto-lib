@@ -95,6 +95,7 @@ def expert_routed(
             # intermediate is NOT TP-sharded here (EP shards experts instead), so
             # the full 2048 columns walk ACT_INTER_TILE at a time.
             h_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+            partial_amax = pl.create_tensor([MOE_INTER // ACT_INTER_TILE, RECV_TILE], dtype=pl.FP32)
             h_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             h_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
             for act_blk in pl.spmd(MOE_INTER // ACT_INTER_TILE, name_hint="exp_gate_up_act"):
@@ -118,13 +119,11 @@ def expert_routed(
                 sigmoid = accurate_sigmoid(gate_buffer, RECV_TILE, ACT_INTER_TILE)
                 gated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
                 h_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated
+                chunk_amax = pl.reshape(pl.row_max(pl.abs(gated)), [1, RECV_TILE])
+                partial_amax[act_blk:act_blk + 1, :] = chunk_amax
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_quant"):
-                row_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=0.0)
-                for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                    h_chunk = h_fp32[:, k0 : k0 + QUANT_TILE]
-                    chunk_amax = pl.reshape(pl.row_max(pl.abs(h_chunk)), [1, RECV_TILE])
-                    row_amax = pl.maximum(row_amax, chunk_amax)
+                row_amax = pl.col_max(partial_amax)
                 amax_buffer = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
                 zero_rows = pl.cmp(row_amax, 0.0, cmp_type=0)
                 amax_buffer[:, :] = pl.add(row_amax, zero_rows)
@@ -146,7 +145,7 @@ def expert_routed(
 
             # w2 (down) cube matmul: [rows, MOE_INTER] INT8 x [D, MOE_INTER] INT8 -> INT32.
             y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
-            for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="exp_w2_mm"):
+            for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="exp_w2_mm", allow_early_resolve=True):
                 d0 = db_idx * D_OUT_TILE
                 y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
                 for k0 in pl.pipeline(0, MOE_INTER, INTER_K_TILE, stage=2):

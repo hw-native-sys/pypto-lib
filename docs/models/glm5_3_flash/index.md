@@ -618,7 +618,10 @@ runtime capacity; see [runtime ring sizing](../../debug-and-tune/ring-heap-and-s
 
 `expert_routed.py` pairs the INT8 Gate/Up projections around a resident L1
 input tile, uses 128-column projection fragments and groups two W2 output
-tiles per epilogue block. The routed-expert implementation shared by prefill
+tiles per epilogue block. Activation blocks publish partial row maxima for
+the quantizer, and W2 projection tiles expose completion independently to
+their consumers. The prefill heap budget includes the maxima cache.
+The routed-expert implementation shared by prefill
 and decode retains its 16-row tiles and existing rounding and quantization
 boundaries.
 The standalone entry supports `--save-data` and `--golden-data` for replay.
@@ -631,10 +634,13 @@ Rows below are received routed rows distributed across the local experts.
 
 | Received rows | Mainline (us) | Optimized (us) | Latency reduction |
 | ---: | ---: | ---: | ---: |
-| 1 | 81.45 | 77.37 | 5.0% |
-| 17 | 481.92 | 425.81 | 11.6% |
-| 96 | 507.81 | 454.41 | 10.5% |
-| 512 | 878.12 | 744.74 | 15.2% |
+| 1 | 81.45 | 74.65 | 8.3% |
+| 17 | 481.92 | 407.79 | 15.4% |
+| 96 | 507.81 | 431.31 | 15.1% |
+| 512 | 878.12 | 706.64 | 19.5% |
+
+Relative to the paired-projection baseline, independent W2 completion and
+cached activation maxima reduce these component medians by 3.5% to 5.1%.
 
 These component measurements do not establish serving throughput gains.
 
