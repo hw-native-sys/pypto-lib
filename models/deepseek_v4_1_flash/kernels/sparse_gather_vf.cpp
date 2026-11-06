@@ -556,13 +556,21 @@ __aicore__ inline void attend_cube(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__) && !defined(__CPU_SIM)
 template <bool FP4, typename PayloadT>
 __aicore__ inline void gather_rows(__gm__ PayloadT* payload, __gm__ bfloat16_t* scales,
-                                   GatherIds& ids, int raw_base) {
+                                   __gm__ const int32_t* indices, int raw_base) {
     constexpr int width = FP4 ? 256 : 512;
     constexpr int group = FP4 ? 32 : 16;
     constexpr int payload_bytes = VEC_KEYS * width;
+    constexpr uint64_t cache_line_bytes = 64;
+    const uint64_t first_line = reinterpret_cast<uint64_t>(indices) & ~(cache_line_bytes - 1);
+    const uint64_t last_line = reinterpret_cast<uint64_t>(indices + VEC_KEYS - 1) & ~(cache_line_bytes - 1);
+    // Refresh every scalar index cache line, including unaligned tensor views.
+    for (uint64_t line = first_line; line <= last_line; line += cache_line_bytes) {
+        dcci(reinterpret_cast<__gm__ void*>(line), cache_line_t::SINGLE_CACHE_LINE);
+    }
+    dsb(DSB_DDR);
     for (int row = 0; row < VEC_KEYS; row += 2) {
-        const int a = ids.GetValue(row);
-        const int b = ids.GetValue(row + 1);
+        const int a = indices[row];
+        const int b = indices[row + 1];
         const int first = a < b ? a : b;
         const int second = a < b ? b : a;
         // Joint K/V pair permutation preserves attention; both masks are valid on the paired path.
@@ -609,17 +617,15 @@ __aicore__ inline void gather_half(__gm__ int64_t* args, const TileTask& task, i
     const int index_column = task.compressed ? column - args[ARG_WINDOW_KEYS] : column;
     GatherIds ids;
     TASSIGN(ids, GATHER_ID_UB + slot * GATHER_ID_STRIDE);
-    GM<int32_t, 1, VEC_KEYS> ids_gm(
-        data<int32_t>(args, source) + (int64_t)task.token * row_stride(args, source) + index_column);
+    auto indices = data<int32_t>(args, source) + (int64_t)task.token * row_stride(args, source) + index_column;
+    GM<int32_t, 1, VEC_KEYS> ids_gm(indices);
     wait_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>((EV_RAW0 + slot)));
     TLOAD(ids, ids_gm);
-    set_flag(PIPE_MTE2, PIPE_S, static_cast<event_t>(EVENT_ID7));
-    wait_flag(PIPE_MTE2, PIPE_S, static_cast<event_t>(EVENT_ID7));
     if (task.compressed) {
-        gather_rows<true>(data<uint8_t>(args, ARG_COMPRESSED), data<bfloat16_t>(args, ARG_COMPRESSED_SCALE), ids,
+        gather_rows<true>(data<uint8_t>(args, ARG_COMPRESSED), data<bfloat16_t>(args, ARG_COMPRESSED_SCALE), indices,
                           raw_base);
     } else {
-        gather_rows<false>(data<float8_e4m3_t>(args, ARG_WINDOW), data<bfloat16_t>(args, ARG_WINDOW_SCALE), ids,
+        gather_rows<false>(data<float8_e4m3_t>(args, ARG_WINDOW), data<bfloat16_t>(args, ARG_WINDOW_SCALE), indices,
                            raw_base);
     }
     set_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>((EV_RAW0 + slot)));

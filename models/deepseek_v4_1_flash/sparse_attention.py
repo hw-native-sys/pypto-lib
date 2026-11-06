@@ -1192,7 +1192,11 @@ def _gather_sparse_vf_rows(
     balanced: pl.Scalar[pl.INT32],
     cache_mode: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor]:
-    """Stream packed cache rows through L1 into sink-aware sparse attention."""
+    """Stream cache rows through L1 with sink-aware sparse attention.
+
+    Scalar gather indices use refreshed GM cache lines; vector masks use
+    the asynchronous index copy in UB.
+    """
     return output, partials
 
 
