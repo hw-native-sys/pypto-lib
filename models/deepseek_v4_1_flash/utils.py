@@ -207,8 +207,8 @@ def _publish_quantized_cache(
 
 
 DECODE_CACHE_NAMES = {
-    "window_cache_pool": "window_cache", "window_cache_scale_pool": "window_scales",
-    "compressed_cache_pool": "compressed_cache", "compressed_cache_scale_pool": "compressed_scales",
+    "window_cache_pool": "window_cache",
+    "compressed_cache_pool": "compressed_cache",
     "index_cache_pool": "index_cache", "index_cache_scale_pool": "index_scales",
     "state_cache_pool": "state_cache",
 }
@@ -234,3 +234,16 @@ def prepare_decode_inputs(values):
                  "c2a_index_block_table", "c1a_index_block_table", "state_block_table"):
         result[name] = values[name]
     return result
+
+
+def packed_cache_compare(payload_compare, scale_compare, *, fp4: bool):
+    """Compare explicit packed fields with independent numerical and mapped-row gates."""
+    from quant import unpack_quantized_cache
+
+    def compare(actual, expected, **kwargs):
+        actual_payload, actual_scale = unpack_quantized_cache(actual, fp4)
+        expected_payload, expected_scale = unpack_quantized_cache(expected, fp4)
+        payload_ok, payload_detail = payload_compare(actual_payload, expected_payload, **kwargs)
+        scale_ok, scale_detail = scale_compare(actual_scale, expected_scale, **kwargs)
+        return payload_ok and scale_ok, "\n".join(filter(None, (payload_detail, scale_detail)))
+    return compare

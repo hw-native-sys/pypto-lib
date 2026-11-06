@@ -47,17 +47,15 @@ constexpr int ARG_OUTPUT = 0;
 constexpr int ARG_QUERY = 1;
 constexpr int ARG_SINK = 2;
 constexpr int ARG_WINDOW = 3;
-constexpr int ARG_WINDOW_SCALE = 4;
-constexpr int ARG_COMPRESSED = 5;
-constexpr int ARG_COMPRESSED_SCALE = 6;
-constexpr int ARG_WINDOW_INDICES = 7;
-constexpr int ARG_COMPRESSED_INDICES = 8;
-constexpr int ARG_PARTIALS = 9;
-constexpr int ARG_TOKENS = 10;
-constexpr int ARG_HEADS = 11;
-constexpr int ARG_WINDOW_KEYS = 12;
-constexpr int ARG_COMPRESSED_KEYS = 13;
-constexpr int ARG_BALANCED = 14;
+constexpr int ARG_COMPRESSED = 4;
+constexpr int ARG_WINDOW_INDICES = 5;
+constexpr int ARG_COMPRESSED_INDICES = 6;
+constexpr int ARG_PARTIALS = 7;
+constexpr int ARG_TOKENS = 8;
+constexpr int ARG_HEADS = 9;
+constexpr int ARG_WINDOW_KEYS = 10;
+constexpr int ARG_COMPRESSED_KEYS = 11;
+constexpr int ARG_BALANCED = 12;
 constexpr int PARTIAL_STRIDE = 64 * (512 + 2);
 
 #if !defined(__CPU_SIM)
@@ -112,12 +110,7 @@ constexpr int ALPHA_STATE_UB = 156928;
 constexpr int STATE_SLOT_STRIDE = 256;
 constexpr int SINK_UB = 157440;
 constexpr int FINAL_MAX_UB = 157568;
-// Raw slots keep the contract's 17,408-B geometry, but each slot holds dense
-// format-specific sub-regions instead of a uniform 544-byte row stride: SFA's
-// payload and scale live in separate GM tensors, so a 544-byte contiguous row
-// cannot be fetched by one copy. Window: payload 32x512 B at +0, scales at
-// +16,384; compressed: payload 32x256 B at +0, scales at +8,192. Slot size and
-// no-aliasing/no-format-switch guarantees match contract section 5.1.
+// Raw slots use 32 packed rows with a 544-byte UB row stride.
 constexpr int RAW_UB = 157696;
 constexpr int RAW_STRIDE = 17408;
 constexpr int NZ_UB = 209920;
@@ -224,10 +217,6 @@ using SoftmaxIds = Vec<int32_t, 1, TILE_KEYS>;
 using GatherIds = Vec<int32_t, 1, VEC_KEYS>;
 using NzChunk = Tile<TileType::Vec, bfloat16_t, 16, DIM, BLayout::ColMajor, 16, DIM, SLayout::RowMajor, 512,
                      PadValue::Null, CompactMode::RowPlusOne>;
-using PayloadFp8 = Vec<float8_e4m3_t, 16, DIM>;
-using PayloadFp4 = Vec<float4_e2m1x2_t, 16, DIM>;
-using ScaleFp8 = Vec<bfloat16_t, 16, 16>;
-using ScaleFp4 = Vec<bfloat16_t, 16, 32>;
 using ChunkIds = Vec<int32_t, 1, 16>;
 using ResultBf16 = Vec<bfloat16_t, VEC_HEADS, 256>;
 
@@ -554,12 +543,9 @@ __aicore__ inline void attend_cube(__gm__ int64_t* args) {
 #endif
 
 #if defined(__DAV_VEC__) && !defined(__CPU_SIM)
-template <bool FP4, typename PayloadT>
-__aicore__ inline void gather_rows(__gm__ PayloadT* payload, __gm__ bfloat16_t* scales,
-                                   __gm__ const int32_t* indices, int raw_base) {
-    constexpr int width = FP4 ? 256 : 512;
-    constexpr int group = FP4 ? 32 : 16;
-    constexpr int payload_bytes = VEC_KEYS * width;
+template <bool FP4>
+__aicore__ inline void gather_rows(__gm__ uint8_t* cache, __gm__ const int32_t* indices, int raw_base) {
+    constexpr int row_bytes = FP4 ? 320 : 544;
     constexpr uint64_t cache_line_bytes = 64;
     const uint64_t first_line = reinterpret_cast<uint64_t>(indices) & ~(cache_line_bytes - 1);
     const uint64_t last_line = reinterpret_cast<uint64_t>(indices + VEC_KEYS - 1) & ~(cache_line_bytes - 1);
@@ -573,36 +559,23 @@ __aicore__ inline void gather_rows(__gm__ PayloadT* payload, __gm__ bfloat16_t* 
         const int b = indices[row + 1];
         const int first = a < b ? a : b;
         const int second = a < b ? b : a;
-        // Joint K/V pair permutation preserves attention; both masks are valid on the paired path.
         if (first >= 0 && second > first) {
-            Vec<PayloadT, 2, width> pair;
-            Vec<bfloat16_t, 2, group> factor_pair;
-            TASSIGN(pair, raw_base + row * width);
-            TASSIGN(factor_pair, raw_base + payload_bytes + row * group * sizeof(bfloat16_t));
+            Tile<TileType::Vec, uint8_t, 2, 544, BLayout::RowMajor, 2, row_bytes> pair;
+            TASSIGN(pair, raw_base + row * 544);
             using PairStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
-            using PayloadShape = Shape<1, 1, 1, 2, width>;
-            using ScaleShape = Shape<1, 1, 1, 2, group>;
-            GlobalTensor<PayloadT, PayloadShape, PairStride> input(
-                payload + (int64_t)first * width, PayloadShape(),
-                PairStride(1, 1, 1, (int64_t)(second - first) * width, 1));
-            GlobalTensor<bfloat16_t, ScaleShape, PairStride> factor(
-                scales + (int64_t)first * group, ScaleShape(),
-                PairStride(1, 1, 1, (int64_t)(second - first) * group, 1));
+            using PairShape = Shape<1, 1, 1, 2, row_bytes>;
+            GlobalTensor<uint8_t, PairShape, PairStride> input(
+                cache + (int64_t)first * row_bytes, PairShape(),
+                PairStride(1, 1, 1, (int64_t)(second - first) * row_bytes, 1));
             TLOAD(pair, input);
-            TLOAD(factor_pair, factor);
         } else {
             for (int index = 0; index < 2; ++index) {
-                int physical = index == 0 ? a : b;
-                // Invalid rows are zeroed by decode_nz before any matrix use.
+                const int physical = index == 0 ? a : b;
                 if (physical < 0) continue;
-                Vec<PayloadT, 1, width> value;
-                Vec<bfloat16_t, 1, group> factor;
-                TASSIGN(value, raw_base + (row + index) * width);
-                TASSIGN(factor, raw_base + payload_bytes + (row + index) * group * sizeof(bfloat16_t));
-                GM<PayloadT, 1, width> input(payload + (int64_t)physical * width);
-                GM<bfloat16_t, 1, group> scale(scales + (int64_t)physical * group);
+                Vec<uint8_t, 1, row_bytes> value;
+                TASSIGN(value, raw_base + (row + index) * 544);
+                GM<uint8_t, 1, row_bytes> input(cache + (int64_t)physical * row_bytes);
                 TLOAD(value, input);
-                TLOAD(factor, scale);
             }
         }
     }
@@ -622,11 +595,9 @@ __aicore__ inline void gather_half(__gm__ int64_t* args, const TileTask& task, i
     wait_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>((EV_RAW0 + slot)));
     TLOAD(ids, ids_gm);
     if (task.compressed) {
-        gather_rows<true>(data<uint8_t>(args, ARG_COMPRESSED), data<bfloat16_t>(args, ARG_COMPRESSED_SCALE), indices,
-                          raw_base);
+        gather_rows<true>(data<uint8_t>(args, ARG_COMPRESSED), indices, raw_base);
     } else {
-        gather_rows<false>(data<float8_e4m3_t>(args, ARG_WINDOW), data<bfloat16_t>(args, ARG_WINDOW_SCALE), indices,
-                           raw_base);
+        gather_rows<false>(data<uint8_t>(args, ARG_WINDOW), indices, raw_base);
     }
     set_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>((EV_RAW0 + slot)));
 }
@@ -637,10 +608,6 @@ __aicore__ inline void dequant_half(__gm__ int64_t* args, const TileTask& task, 
     const int raw_base = RAW_UB + ring * RAW_STRIDE;
     const int id_base = GATHER_ID_UB + ring * GATHER_ID_STRIDE;
     const int kv_slot = task.ordinal % KV_SLOTS;
-    constexpr int payload_bytes = VEC_KEYS * DIM;
-    const int scale_offset = task.compressed ? VEC_KEYS * 256 : payload_bytes;
-    const int width = task.compressed ? 256 : DIM;
-    const int group = task.compressed ? 32 : 16;
     const int kv_base = half == 0 ? (KV_LOWER_BASE + kv_slot * KV_STRIDE) : (KV_UPPER_BASE + kv_slot * KV_STRIDE);
     NzChunk nz[2];
     TASSIGN(nz[0], NZ_UB + 0 * NZ_STRIDE);
@@ -648,24 +615,16 @@ __aicore__ inline void dequant_half(__gm__ int64_t* args, const TileTask& task, 
     wait_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>((EV_RAW0 + ring)));
     for (int chunk = 0; chunk < 2; ++chunk) {
         ChunkIds ids;
-        PayloadFp8 payload8;
-        PayloadFp4 payload4;
-        ScaleFp8 scales8;
-        ScaleFp4 scales4;
-        const int payload_base = raw_base + chunk * 16 * width;
-        const int scale_base = raw_base + scale_offset + chunk * 16 * group * sizeof(bfloat16_t);
+        Vec<uint8_t, 16, 544> packed_rows;
         TASSIGN(ids, id_base + chunk * 16 * (int)sizeof(int32_t));
-        TASSIGN(payload8, payload_base);
-        TASSIGN(payload4, payload_base);
-        TASSIGN(scales8, scale_base);
-        TASSIGN(scales4, scale_base);
+        TASSIGN(packed_rows, raw_base + chunk * 16 * 544);
         wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>((EV_NZ0 + chunk)));
         if (task.compressed) {
-            sparse_dequant::decode_nz<true, NzChunk, PayloadFp4, ScaleFp4, ChunkIds>(
-                nz[chunk].data(), payload4.data(), scales4.data(), ids.data());
+            sparse_dequant::decode_nz<true, NzChunk, decltype(packed_rows), ChunkIds>(
+                nz[chunk].data(), packed_rows.data(), ids.data());
         } else {
-            sparse_dequant::decode_nz<false, NzChunk, PayloadFp8, ScaleFp8, ChunkIds>(
-                nz[chunk].data(), payload8.data(), scales8.data(), ids.data());
+            sparse_dequant::decode_nz<false, NzChunk, decltype(packed_rows), ChunkIds>(
+                nz[chunk].data(), packed_rows.data(), ids.data());
         }
         set_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>((EV_NZ0 + chunk)));
     }
@@ -937,10 +896,10 @@ void simulate_attention(__gm__ int64_t* args) {
             bool fp4 = part >= args[ARG_WINDOW_KEYS];
             int payload_arg = fp4 ? ARG_COMPRESSED : ARG_WINDOW;
             int index_arg = fp4 ? ARG_COMPRESSED_INDICES : ARG_WINDOW_INDICES;
-            int width = fp4 ? 256 : 512;
-            int groups = fp4 ? 32 : 16;
+            int width = fp4 ? 320 : 544;
+            int groups = width / sizeof(bfloat16_t);
             auto payload = data<uint8_t>(args, payload_arg);
-            auto scales = data<bfloat16_t>(args, payload_arg + 1);
+            auto scales = reinterpret_cast<__gm__ bfloat16_t*>(payload + (fp4 ? 256 : 512));
             auto indices = data<int32_t>(args, index_arg) + token * row_stride(args, index_arg);
             for (int k = 0; k < 128; ++k) {
                 int physical = indices[part + k - (fp4 ? args[ARG_WINDOW_KEYS] : 0)];
@@ -997,7 +956,7 @@ void simulate_attention(__gm__ int64_t* args) {
 }  // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    // ABI: O, Q, sink, W, Ws, C, Cs, Wi, Ci, partials; tokens, heads, Wkeys, Ckeys, balanced.
+    // ABI: O, Q, sink, W, C, Wi, Ci, partials; tokens, heads, Wkeys, Ckeys, balanced.
 #if defined(__CPU_SIM) && defined(__DAV_VEC__)
     if (get_sub_block_id(args) == 0) {
         simulate_attention(args);
@@ -1032,7 +991,9 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
                 for (int pause = 0; pause < 50; ++pause) asm volatile("nop");
             }
             // Main-loop users are drained; the reducer reuses their UB storage.
-            sparse_merge::reduce(args, boundary, head, cut / parts);
+            sparse_merge::reduce(
+                data<float>(args, ARG_PARTIALS), data<bfloat16_t>(args, ARG_OUTPUT), data<float>(args, ARG_SINK),
+                row_stride(args, ARG_OUTPUT), row_stride(args, ARG_SINK), args[ARG_HEADS], boundary, head, cut / parts);
         }
     } else {
         if (parts == 5) attend_vector<5, false>(args);

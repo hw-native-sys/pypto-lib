@@ -13,11 +13,18 @@
 from dataclasses import dataclass
 import inspect
 import pypto.language as pl
+
+from quant import unpack_quantized_cache
+from utils import packed_cache_compare
+
 import pypto.language.distributed as pld
 import torch
 
 import config as C
-from config import BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, PREFILL_MAX_TOKENS, TP_SIZE, TABLE_DYN
+from config import (
+    BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, PREFILL_MAX_TOKENS, TP_SIZE, TABLE_DYN,
+    WINDOW_CACHE_BYTES,
+)
 from o_proj import prefill_tp_output_all_reduce
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
 from hc import hc_head, hc_post, hc_pre, zero_bf16_padding
@@ -315,7 +322,6 @@ def draft_layer(
     window_slots: pl.Tensor,
     window_indices: pl.Tensor,
     window_cache: pl.Tensor,
-    window_cache_scale: pl.Tensor,
     hc_ffn_fn: pl.Tensor,
     hc_ffn_scale: pl.Tensor,
     hc_ffn_base: pl.Tensor,
@@ -387,7 +393,6 @@ def draft_layer(
         window_slots,
         window_indices,
         window_cache,
-        window_cache_scale,
         attention_partial,
         num_tokens,
     )
@@ -483,12 +488,7 @@ def _dspark_drafter(
     wo_b: pl.Tensor[[DSPARK_DRAFT_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
     window_cache: pl.InOut[
-        pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]
-    ],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[
-            [DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // MX_GROUP], pl.BF16
-        ]
+        pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]
     ],
     hc_ffn_fn: pl.Tensor[[DSPARK_DRAFT_LAYERS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, 3], pl.FP32],
@@ -555,7 +555,6 @@ def _dspark_drafter(
     block_tables.bind_dynamic(1, B_DYN)
     block_tables.bind_dynamic(2, TABLE_DYN)
     window_cache.bind_dynamic(1, C.ORI_BLOCKS_DYN)
-    window_cache_scale.bind_dynamic(1, C.ORI_BLOCKS_DYN)
     head_hidden.bind_dynamic(0, B_DYN)
     context_tokens = pl.tensor.dim(target_hidden, 0)
     batch = pl.tensor.dim(num_sampled, 0)
@@ -593,7 +592,6 @@ def _dspark_drafter(
             context_rope_sin,
             context_slots[layer],
             window_cache[layer],
-            window_cache_scale[layer],
             context_tokens,
         )
 
@@ -697,7 +695,6 @@ def _dspark_drafter(
                 padded_slots[layer],
                 padded_indices[layer],
                 window_cache[layer],
-                window_cache_scale[layer],
                 hc_ffn_fn[layer],
                 hc_ffn_scale[layer],
                 hc_ffn_base[layer],
@@ -741,7 +738,7 @@ def _dspark_drafter(
         hc_head(x_hc, pre_mix, padded_head, worker_limit=64)
         for row in pl.spmd(active_tokens, name_hint="dspark_head_unpad"):
             flat_head_hidden[first_token + row : first_token + row + 1, :] = padded_head[row : row + 1, :]
-    return head_hidden, window_cache, window_cache_scale
+    return head_hidden, window_cache
 
 
 dspark_drafter = pl.jit.inline(auto_scope=False)(_dspark_drafter)
@@ -786,15 +783,7 @@ def l3_dspark_drafter(
     ],
     wo_b: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
-    window_cache: pl.InOut[
-        pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]
-    ],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[
-            [C.EP_SIZE, DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // MX_GROUP],
-            pl.BF16,
-        ]
-    ],
+    window_cache: pl.InOut[pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     hc_ffn_fn: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, MIX_HC], pl.FP32],
@@ -843,7 +832,6 @@ def l3_dspark_drafter(
     block_tables.bind_dynamic(2, B_DYN)
     block_tables.bind_dynamic(3, TABLE_DYN)
     window_cache.bind_dynamic(2, C.ORI_BLOCKS_DYN)
-    window_cache_scale.bind_dynamic(2, C.ORI_BLOCKS_DYN)
     head_hidden.bind_dynamic(1, B_DYN)
 
     attention_output_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
@@ -903,7 +891,6 @@ def l3_dspark_drafter(
             wo_b[rank],
             wo_b_scale[rank],
             window_cache[rank],
-            window_cache_scale[rank],
             hc_ffn_fn[rank],
             hc_ffn_scale[rank],
             hc_ffn_base[rank],
@@ -1013,8 +1000,12 @@ def build_drafter_specs():
             value[:, :, 0] = 32
             value[:, :, 1] = 33
             return value
-        if name in ("context_rope_cos", "query_rope_cos", "window_cache_scale"):
+        if name in ("context_rope_cos", "query_rope_cos"):
             return 1
+        if name == "window_cache":
+            value = torch.zeros(shape, dtype=torch.uint8)
+            value[..., HEAD_DIM:].view(torch.bfloat16).fill_(1.0)
+            return value
         if name == "target_hidden":
             return 0.25
         if name == "main_norm_weight":
@@ -1040,6 +1031,7 @@ def golden_dspark_drafter(tensors):
     """Reference the three zero-weight draft layers without calling device kernels."""
     from quant import quantize_mxfp8_cache
 
+    cache_payload, cache_factors = unpack_quantized_cache(tensors["window_cache"], False)
     batch = tensors["num_sampled"].shape[1]
     query_tokens = batch * DSPARK_QUERY_WIDTH
     for rank in range(EP_SIZE):
@@ -1076,15 +1068,15 @@ def golden_dspark_drafter(tensors):
             valid_slots = slots[slots >= 0]
             if valid_slots.numel():
                 payload, scale = quantize_mxfp8_cache(torch.zeros(valid_slots.numel(), HEAD_DIM))
-                tensors["window_cache"][rank, layer].reshape(-1, HEAD_DIM)[valid_slots] = payload
-                tensors["window_cache_scale"][rank, layer].reshape(-1, HEAD_DIM // MX_GROUP)[valid_slots] = scale
+                cache_payload[rank, layer].reshape(-1, HEAD_DIM)[valid_slots] = payload
+                cache_factors[rank, layer].reshape(-1, HEAD_DIM // MX_GROUP)[valid_slots] = scale
             context_slots = tensors["context_slots"][rank, layer]
             active = context_slots >= 0
             rows = context_slots[active].long()
             if rows.numel():
                 context_payload, context_scale = quantize_mxfp8_cache(torch.zeros(rows.numel(), HEAD_DIM))
-                tensors["window_cache"][rank, layer].reshape(-1, HEAD_DIM)[rows] = context_payload
-                tensors["window_cache_scale"][rank, layer].reshape(-1, HEAD_DIM // MX_GROUP)[rows] = context_scale
+                cache_payload[rank, layer].reshape(-1, HEAD_DIM)[rows] = context_payload
+                cache_factors[rank, layer].reshape(-1, HEAD_DIM // MX_GROUP)[rows] = context_scale
 
         collapsed = golden_hc_collapse(x_hc, incoming_pre)
         tensors["head_hidden"][rank] = collapsed.reshape(batch, DSPARK_QUERY_WIDTH, D).to(torch.bfloat16)
@@ -1221,13 +1213,13 @@ if __name__ == "__main__":
             return nonzero and bool(close), f"nonzero={nonzero}, allclose={bool(close)}"
 
         def compare_cache(actual, expected, **_kwargs):
-            return bool(torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))), "cache payload"
+            return bool(torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))), "cache field storage"
 
         result = run(
             fn=l3_dspark_drafter,
             specs=build_drafter_specs(),
             golden_fn=golden_dspark_drafter,
-            compare_fn={"head_hidden": compare_head, "window_cache": compare_cache},
+            compare_fn={"head_hidden": compare_head, "window_cache": packed_cache_compare(compare_cache, compare_cache, fp4=False)},
             config={
                 "backend_type": "a5",
                 "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),

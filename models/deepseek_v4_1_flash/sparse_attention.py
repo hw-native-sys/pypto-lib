@@ -24,17 +24,24 @@ from qkv_proj_rope import golden_rope_tail
 from rmsnorm import golden_rms_norm
 from golden import TensorSpec
 from utils import _publish_quantized_cache
-from quant import dequantize_mxfp4_cache, dequantize_mxfp8_cache, quantize_mxfp8_upward_reference, quantize_grouped_mxfp8_weight, pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache
+from quant import (
+    dequantize_mxfp4_cache, dequantize_mxfp8_cache, quantize_mxfp4_cache, quantize_mxfp8_cache,
+    quantize_mxfp8_upward_reference, quantize_grouped_mxfp8_weight, pack_mx_b_scale,
+    pack_quantized_cache, unpack_quantized_cache,
+)
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from utils import packed_query_lengths, window_metadata
 
 from pathlib import Path
 
 import pypto.language as pl
+
+
 from pypto.runtime import pto_isa_include_dir
 
 from config import (
-    FLASH as M, CMP_BLOCKS_DYN, MAX_BATCH_PER_DP, ORI_BLOCKS_DYN, T_DYN, TP_SIZE,
+    FLASH as M, CMP_BLOCKS_DYN, MAX_BATCH_PER_DP, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, WINDOW_CACHE_BYTES,
+    COMPRESSED_CACHE_BYTES,
 )
 
 # Dynamic shape variables.
@@ -62,7 +69,6 @@ SCALE = HEAD_DIM**-0.5
 SWA_WINDOW = M.sliding_window
 SWA_GROUPS = HEAD_DIM // 32
 SWA_SCALE_BYTES = SWA_GROUPS * 2
-SWA_PACKED_ROW_BYTES = HEAD_DIM + SWA_SCALE_BYTES
 
 # Tiling.
 CUBE_HEADS = max(16, LOCAL_H)
@@ -100,16 +106,14 @@ SWA_RUN_DESCRIPTOR_WIDTH = 8
 
 @pl.jit.inline(auto_scope=False)
 def gather_window_batched(
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
     selected: pl.Tensor[[T_DYN, SWA_WINDOW, HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
     source_ready: pl.Scalar[pl.TASK_ID],
 ):
     rows = pl.tensor.dim(cache, 0) * 128
-    flat = pl.reshape(cache, [rows, HEAD_DIM])
-    factors = pl.reshape(scales, [rows, SWA_GROUPS])
+    flat_bytes = pl.reshape(cache, [rows, WINDOW_CACHE_BYTES])
     tokens = pl.tensor.dim(selected, 0)
     dst_rows = tokens * SWA_WINDOW
     dst = pl.reshape(selected, [dst_rows, HEAD_DIM])
@@ -121,89 +125,7 @@ def gather_window_batched(
             column = block % (SWA_WINDOW // SWA_SELECTED_GATHER_TILE) * SWA_SELECTED_GATHER_TILE
             ids = pl.tile.load(indices, [token, column], [1, SWA_SELECTED_GATHER_TILE])
             safe_ids = pl.maximum(ids, 0)
-            payload = pl.tile.create([SWA_SELECTED_GATHER_TILE, HEAD_DIM], dtype=pl.FP8E4M3FN)
-            factor_tile = pl.tile.create([SWA_SELECTED_GATHER_TILE, SWA_GROUPS], dtype=pl.BF16)
-            # Check every index before coalescing the at-most-two physical page runs.
-            # Arbitrary order, duplicate rows and negative masks keep the fallback.
-            first = pl.tile.read(ids, [0, 0])
-            first_rows_i32 = pl.cast(pl.min(SWA_SELECTED_GATHER_TILE, 128 - first % 128), pl.INT32)
-            first_rows = pl.cast(first_rows_i32, pl.INDEX)
-            second = first + first_rows_i32
-            if first_rows < SWA_SELECTED_GATHER_TILE:
-                second = pl.tile.read(ids, [0, first_rows])
-            sequence_first = pl.tile.ci(first, [1, SWA_SELECTED_GATHER_TILE], dtype=pl.INT32)
-            sequence_second = pl.tile.ci(second - first_rows_i32, [1, SWA_SELECTED_GATHER_TILE], dtype=pl.INT32)
-            columns = pl.tile.ci(0, [1, SWA_SELECTED_GATHER_TILE], dtype=pl.INT32)
-            mask = pl.tile.cmps(columns, first_rows_i32, cmp_type=2)
-            sequence = pl.tile.select(mask, sequence_first, sequence_second)
-            delta = pl.abs(pl.cast(pl.sub(ids, sequence), pl.FP32))
-            checks = pl.tile.full([8, SWA_SELECTED_GATHER_TILE], dtype=pl.FP32, value=0.0)
-            checks = pl.tile.assemble(checks, delta, [0, 0])
-            check_tmp = pl.tile.create([8, SWA_SELECTED_GATHER_TILE], dtype=pl.FP32)
-            error = pl.tile.read(pl.row_max(checks, tmp_tile=check_tmp), [0, 0])
-            first_wide = pl.cast(first, pl.INDEX)
-            second_wide = pl.cast(second, pl.INDEX)
-            page_runs = ((first >= 0) and (second >= 0) and (first_wide + first_rows <= rows)
-                          and (second_wide + SWA_SELECTED_GATHER_TILE - first_rows <= rows) and (error == 0.0))
-            if page_runs:
-                payload = pl.tile.gather_row(
-                    payload, flat, [0, 0], [first_wide, 0], [SWA_SELECTED_GATHER_TILE, HEAD_DIM],
-                    valid_shape=[first_rows, HEAD_DIM],
-                )
-                factor_tile = pl.tile.gather_row(
-                    factor_tile, factors, [0, 0], [first_wide, 0], [SWA_SELECTED_GATHER_TILE, SWA_GROUPS],
-                    valid_shape=[first_rows, SWA_GROUPS],
-                )
-                if first_rows < SWA_SELECTED_GATHER_TILE:
-                    payload = pl.tile.gather_row(
-                        payload, flat, [first_rows, 0], [second_wide, 0], [SWA_SELECTED_GATHER_TILE, HEAD_DIM],
-                        valid_shape=[SWA_SELECTED_GATHER_TILE - first_rows, HEAD_DIM],
-                    )
-                    factor_tile = pl.tile.gather_row(
-                        factor_tile, factors, [first_rows, 0], [second_wide, 0], [SWA_SELECTED_GATHER_TILE, SWA_GROUPS],
-                        valid_shape=[SWA_SELECTED_GATHER_TILE - first_rows, SWA_GROUPS],
-                    )
-            else:
-                for lane in pl.range(SWA_SELECTED_GATHER_TILE):
-                    physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    payload = pl.tile.gather_row(payload, flat, [lane, 0], [physical, 0], [1, HEAD_DIM])
-                    factor_tile = pl.tile.gather_row(factor_tile, factors, [lane, 0], [physical, 0], [1, SWA_GROUPS])
-            value = pl.reshape(pl.cast(payload, pl.FP32), [SWA_SELECTED_GATHER_TILE * SWA_GROUPS, 32])
-            factor = pl.reshape(pl.cast(factor_tile, pl.FP32), [SWA_SELECTED_GATHER_TILE * SWA_GROUPS, 1])
-            decoded_scaled = pl.row_expand_mul(value, factor)
-            decoded_bf16 = pl.cast(decoded_scaled, pl.BF16, mode='rint')
-            decoded = pl.reshape(decoded_bf16, [SWA_SELECTED_GATHER_TILE, HEAD_DIM])
-            pl.tile.store(decoded, [token * SWA_WINDOW + column, 0], dst)
-            # Restore zeros for masked rows.
-            if not page_runs:
-                zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                for lane in pl.range(SWA_SELECTED_GATHER_TILE):
-                    if pl.tile.read(ids, [0, lane]) < 0:
-                        pl.tile.store(zero, [token * SWA_WINDOW + column + lane, 0], dst)
-    return gathered
-
-
-@pl.jit.inline(auto_scope=False)
-def gather_window_packed544(
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
-    selected: pl.Tensor[[T_DYN, SWA_WINDOW, HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    rows = pl.tensor.dim(cache, 0) * 128
-    flat_bytes = pl.reshape(cache, [rows, SWA_PACKED_ROW_BYTES])
-    tokens = pl.tensor.dim(selected, 0)
-    dst_rows = tokens * SWA_WINDOW
-    dst = pl.reshape(selected, [dst_rows, HEAD_DIM])
-    workers = pl.max(1, pl.min(num_tokens * (SWA_WINDOW // SWA_SELECTED_GATHER_TILE), SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_gather_packed", allow_early_resolve=True) as gathered:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, num_tokens * (SWA_WINDOW // SWA_SELECTED_GATHER_TILE), workers):
-            token = block // (SWA_WINDOW // SWA_SELECTED_GATHER_TILE)
-            column = block % (SWA_WINDOW // SWA_SELECTED_GATHER_TILE) * SWA_SELECTED_GATHER_TILE
-            ids = pl.tile.load(indices, [token, column], [1, SWA_SELECTED_GATHER_TILE])
-            safe_ids = pl.maximum(ids, 0)
-            raw = pl.tile.create([SWA_SELECTED_GATHER_TILE, SWA_PACKED_ROW_BYTES], dtype=pl.UINT8)
+            raw = pl.tile.create([SWA_SELECTED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8)
             # Check every index before coalescing the at-most-two physical page runs.
             # Arbitrary order, duplicate rows and negative masks keep the fallback.
             first = pl.tile.read(ids, [0, 0])
@@ -228,27 +150,27 @@ def gather_window_packed544(
                           and (second_wide + SWA_SELECTED_GATHER_TILE - first_rows <= rows) and (error == 0.0))
             if page_runs:
                 raw = pl.tile.gather_row(
-                    raw, flat_bytes, [0, 0], [first_wide, 0], [SWA_SELECTED_GATHER_TILE, SWA_PACKED_ROW_BYTES],
-                    valid_shape=[first_rows, SWA_PACKED_ROW_BYTES],
+                    raw, flat_bytes, [0, 0], [first_wide, 0], [SWA_SELECTED_GATHER_TILE, WINDOW_CACHE_BYTES],
+                    valid_shape=[first_rows, WINDOW_CACHE_BYTES],
                 )
                 if first_rows < SWA_SELECTED_GATHER_TILE:
                     raw = pl.tile.gather_row(
                         raw, flat_bytes, [first_rows, 0], [second_wide, 0],
-                        [SWA_SELECTED_GATHER_TILE, SWA_PACKED_ROW_BYTES],
-                        valid_shape=[SWA_SELECTED_GATHER_TILE - first_rows, SWA_PACKED_ROW_BYTES],
+                        [SWA_SELECTED_GATHER_TILE, WINDOW_CACHE_BYTES],
+                        valid_shape=[SWA_SELECTED_GATHER_TILE - first_rows, WINDOW_CACHE_BYTES],
                     )
             else:
                 for lane in pl.range(SWA_SELECTED_GATHER_TILE):
                     physical = pl.cast(pl.tile.read(safe_ids, [0, lane]), pl.INDEX)
-                    raw = pl.tile.gather_row(raw, flat_bytes, [lane, 0], [physical, 0], [1, SWA_PACKED_ROW_BYTES])
+                    raw = pl.tile.gather_row(raw, flat_bytes, [lane, 0], [physical, 0], [1, WINDOW_CACHE_BYTES])
             # Reinterpret the dense packed tile before slicing to preserve its physical pitch.
             signed_bytes = pl.tile.reinterpret_view(raw, pl.INT8)
             payload_all = pl.tile.reinterpret_view(
-                signed_bytes, pl.FP8E4M3FN, shape=[SWA_SELECTED_GATHER_TILE, SWA_PACKED_ROW_BYTES],
+                signed_bytes, pl.FP8E4M3FN, shape=[SWA_SELECTED_GATHER_TILE, WINDOW_CACHE_BYTES],
             )
             payload = pl.tile.slice(payload_all, [SWA_SELECTED_GATHER_TILE, HEAD_DIM], [0, 0])
             factor_bits = pl.tile.reinterpret_view(
-                raw, pl.INT16, shape=[SWA_SELECTED_GATHER_TILE, SWA_PACKED_ROW_BYTES // 2],
+                raw, pl.INT16, shape=[SWA_SELECTED_GATHER_TILE, WINDOW_CACHE_BYTES // 2],
             )
             factors_all = pl.tile.reinterpret_view(factor_bits, pl.BF16)
             factors = pl.tile.slice(factors_all, [SWA_SELECTED_GATHER_TILE, SWA_GROUPS], [0, HEAD_DIM // 2])
@@ -265,6 +187,8 @@ def gather_window_packed544(
                     if pl.tile.read(ids, [0, lane]) < 0:
                         pl.tile.store(zero, [token * SWA_WINDOW + column + lane, 0], dst)
     return gathered
+
+
 
 
 @pl.jit.inline(auto_scope=False)
@@ -361,50 +285,18 @@ def attend_window_tiled(
 
 @pl.jit.inline(auto_scope=False)
 def decode_shared_cache(
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     decoded_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.BF16],
     zero_row: pl.Tensor[[32, HEAD_DIM], pl.BF16],
     source_ready: pl.Scalar[pl.TASK_ID],
 ):
     rows = pl.tensor.dim(cache, 0) * 128
-    payload_flat = pl.reshape(cache, [rows, HEAD_DIM])
-    scale_flat = pl.reshape(scales, [rows, SWA_GROUPS])
+    flat_bytes = pl.reshape(cache, [rows, WINDOW_CACHE_BYTES])
     decoded_flat = pl.reshape(decoded_cache, [rows, HEAD_DIM])
     # Physical pages are a multiple of 128 rows; GATHER_TILE=32 has no tail.
     # Decode each physical row once with contiguous transfers.
     workers = pl.max(1, pl.min(rows // SWA_GATHER_TILE, SWA_WORKER_TILE))
     with pl.spmd(workers, name_hint="swa_decode_cache", deps=[source_ready]) as ready:
-        worker = pl.tile.get_block_idx()
-        if worker == 0:
-            value_full = pl.tile.full([32, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            pl.tile.store(value_full, [0, 0], zero_row)
-        for block in pl.range(worker, rows // SWA_GATHER_TILE, workers):
-            row = block * SWA_GATHER_TILE
-            payload = pl.tile.load(payload_flat, [row, 0], [SWA_GATHER_TILE, HEAD_DIM])
-            factors = pl.tile.load(scale_flat, [row, 0], [SWA_GATHER_TILE, SWA_GROUPS])
-            value = pl.reshape(pl.cast(payload, pl.FP32), [SWA_GATHER_TILE * SWA_GROUPS, 32])
-            multiplier = pl.reshape(pl.cast(factors, pl.FP32), [SWA_GATHER_TILE * SWA_GROUPS, 1])
-            decoded_scaled = pl.row_expand_mul(value, multiplier)
-            decoded_bf16 = pl.cast(decoded_scaled, pl.BF16, mode='rint')
-            decoded = pl.reshape(decoded_bf16, [SWA_GATHER_TILE, HEAD_DIM])
-            pl.tile.store(decoded, [row, 0], decoded_flat)
-    return ready
-
-
-@pl.jit.inline(auto_scope=False)
-def decode_shared_cache_packed(
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
-    decoded_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.BF16],
-    zero_row: pl.Tensor[[32, HEAD_DIM], pl.BF16],
-):
-    rows = pl.tensor.dim(cache, 0) * 128
-    flat_bytes = pl.reshape(cache, [rows, SWA_PACKED_ROW_BYTES])
-    decoded_flat = pl.reshape(decoded_cache, [rows, HEAD_DIM])
-    # Physical pages are a multiple of 128 rows; GATHER_TILE=32 has no tail.
-    # Decode each physical row once with contiguous transfers.
-    workers = pl.max(1, pl.min(rows // SWA_GATHER_TILE, SWA_WORKER_TILE))
-    with pl.spmd(workers, name_hint="swa_decode_packed") as ready:
         worker = pl.tile.get_block_idx()
         if worker == 0:
             value_full = pl.tile.full([32, HEAD_DIM], dtype=pl.BF16, value=0.0)
@@ -430,6 +322,8 @@ def decode_shared_cache_packed(
             decoded = pl.reshape(decoded_bf16, [SWA_GATHER_TILE, HEAD_DIM])
             pl.tile.store(decoded, [row, 0], decoded_flat)
     return ready
+
+
 
 
 @pl.jit.inline(auto_scope=False)
@@ -709,8 +603,7 @@ def attend_shared_cache_plain(
 @pl.jit.inline(auto_scope=False)
 def swa_attention_partial(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -720,7 +613,7 @@ def swa_attention_partial(
     """Return conservative attention completion for subsequent cache-update ordering."""
     if LOCAL_H == 64:
         cache_consumed = gather_sparse_attention(
-            query, indices, cache, scales, indices, cache, scales,
+            query, indices, cache, indices, cache,
             sink, output, num_tokens, source_ready, compressed_keys=0,
         )
     else:
@@ -737,13 +630,13 @@ def swa_attention_partial(
                 use_shared = pl.cast(1, pl.INT32)
         if use_shared == 0:
             selected = pl.create_tensor([tokens, SWA_WINDOW, HEAD_DIM], dtype=pl.BF16)
-            gathered = gather_window_batched(cache, scales, indices, selected, num_tokens, source_ready)
+            gathered = gather_window_batched(cache, indices, selected, num_tokens, source_ready)
             attention_done = attend_window_tiled(query, selected, indices, sink, output, num_tokens, gathered)
             cache_consumed = attention_done
         else:
             decoded_cache = pl.create_tensor([blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
             zero_row = pl.create_tensor([32, HEAD_DIM], dtype=pl.BF16)
-            decoded = decode_shared_cache(cache, scales, decoded_cache, zero_row, source_ready)
+            decoded = decode_shared_cache(cache, decoded_cache, zero_row, source_ready)
             if num_tokens < 128:
                 attention_done = attend_shared_cache_plain(
                     query, decoded_cache, zero_row, indices, sink, output, num_tokens, decoded,
@@ -761,8 +654,7 @@ def swa_attention_partial(
 @pl.jit.inline(auto_scope=False)
 def swa_attention(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -770,93 +662,27 @@ def swa_attention(
 ):
     """Attend the active query prefix; leave caller-owned inactive rows untouched."""
     source_ready = pl.system.task_dummy(deps=[])
-    swa_attention_partial(query, cache, scales, indices, sink, output, num_tokens, source_ready)
+    swa_attention_partial(query, cache, indices, sink, output, num_tokens, source_ready)
     return output
 
 
-@pl.jit.inline(auto_scope=False)
-def _swa_attention_packed_partial(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Return conservative attention completion for subsequent cache-update ordering."""
-    # Use the same conservative boundary as the split cache path while
-    # investigating PyPTO #2829; no causal fix is established here.
-    tokens = pl.tensor.dim(query, 0)
-    blocks = pl.tensor.dim(cache, 0)
-    cache_rows = blocks * 128
-    # Small calls and cache-heavy calls avoid decoding unused physical rows.
-    # Bounded two-stage pools still submit one task for an empty active prefix.
-    use_shared = pl.cast(0, pl.INT32)
-    if num_tokens >= 32:
-        if cache_rows <= num_tokens * SWA_WINDOW:
-            use_shared = pl.cast(1, pl.INT32)
-    if use_shared == 0:
-        selected = pl.create_tensor([tokens, SWA_WINDOW, HEAD_DIM], dtype=pl.BF16)
-        gathered = gather_window_packed544(cache, indices, selected, num_tokens)
-        attention_done = attend_window_tiled(query, selected, indices, sink, output, num_tokens, gathered)
-        cache_consumed = attention_done
-    else:
-        decoded_cache = pl.create_tensor([blocks, 128, 1, HEAD_DIM], dtype=pl.BF16)
-        zero_row = pl.create_tensor([32, HEAD_DIM], dtype=pl.BF16)
-        decoded = decode_shared_cache_packed(cache, decoded_cache, zero_row)
-        if num_tokens < 128:
-            attention_done = attend_shared_cache_plain(
-                query, decoded_cache, zero_row, indices, sink, output, num_tokens, decoded,
-            )
-        else:
-            descriptors = pl.create_tensor([tokens, SWA_RUN_PARTS, SWA_RUN_DESCRIPTOR_WIDTH], dtype=pl.INT32)
-            analyzed = analyze_index_runs(indices, descriptors, num_tokens, cache_rows)
-            attention_done = attend_shared_cache(
-                query, decoded_cache, zero_row, descriptors, indices, sink, output, num_tokens, decoded, analyzed,
-            )
-        cache_consumed = attention_done
-    return cache_consumed
 
 
-@pl.jit.inline(auto_scope=False)
-def swa_attention_packed(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Attend the active query prefix; leave caller-owned inactive rows untouched."""
-    _swa_attention_packed_partial(query, cache, indices, sink, output, num_tokens)
-    return output
 
 
 @pl.jit(auto_scope=False)
 def l2_sparse_attention_swa(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    scales: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_GROUPS], pl.BF16],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    output = swa_attention(query, cache, scales, indices, sink, output, num_tokens)
+    output = swa_attention(query, cache, indices, sink, output, num_tokens)
     return output
 
 
-@pl.jit(auto_scope=False)
-def l2_sparse_attention_swa_packed(
-    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, SWA_PACKED_ROW_BYTES], pl.UINT8],
-    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
-    sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    output = swa_attention_packed(query, cache, indices, sink, output, num_tokens)
-    return output
 
 
 SWA_INPUT_NAMES = (
@@ -1179,9 +1005,7 @@ def _gather_sparse_vf_rows(
     query: pl.Tensor,
     sink: pl.Tensor,
     window: pl.Tensor,
-    window_scale: pl.Tensor,
     compressed: pl.Tensor,
-    compressed_scale: pl.Tensor,
     window_indices: pl.Tensor,
     compressed_indices: pl.Tensor,
     partials: pl.InOut[pl.Tensor],
@@ -1205,10 +1029,8 @@ def gather_sparse_attention(
     query: pl.Tensor,
     window_indices: pl.Tensor,
     window: pl.Tensor,
-    window_scale: pl.Tensor,
     compressed_indices: pl.Tensor,
     compressed: pl.Tensor,
-    compressed_scale: pl.Tensor,
     sink: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
@@ -1242,7 +1064,7 @@ def gather_sparse_attention(
             pl.write(partials, [ready_offset + ready_index], pl.cast(0, pl.FP32))
     with pl.spmd(workers, name_hint="sparse_gather_vf", sync_start=True, deps=[source_ready]) as attended:
         computed_output, computed_partials = _gather_sparse_vf_rows(
-            active_output, query, sink, window, window_scale, compressed, compressed_scale,
+            active_output, query, sink, window, compressed,
             window_indices, compressed_indices, partials, num_tokens, LOCAL_H, WINDOW_KEYS, compressed_keys,
             balanced, cache_mode=compressed_keys,
         )
@@ -1254,7 +1076,6 @@ def _attend_window_project(
     query: pl.Tensor,
     window_indices: pl.Tensor,
     window: pl.Tensor,
-    window_scale: pl.Tensor,
     sink: pl.Tensor,
     wo_a: pl.Tensor,
     wo_a_scale: pl.Tensor,
@@ -1269,7 +1090,7 @@ def _attend_window_project(
     """Attend a published window cache and project its active query prefix."""
     total_rows = pl.tensor.dim(output, 0)
     attended = pl.create_tensor([total_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    swa_attention_partial(query, window, window_scale, window_indices, sink, attended, num_tokens, source_ready)
+    swa_attention_partial(query, window, window_indices, sink, attended, num_tokens, source_ready)
     output = o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens, worker_limit=32)
     return output
 
@@ -1278,9 +1099,7 @@ def _attend_window_project(
                include_dirs=(pto_isa_include_dir(),))
 def _gather_packed_rows(
     window: pl.Tensor,
-    window_scale: pl.Tensor,
     compressed: pl.Tensor,
-    compressed_scale: pl.Tensor,
     window_indices: pl.Tensor,
     compressed_indices: pl.Tensor,
     selected: pl.Out[pl.Tensor],
@@ -1293,10 +1112,8 @@ def _gather_packed_rows(
 
 @pl.jit.inline(auto_scope=False)
 def gather_packed(
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     wi: pl.Tensor[[T_DYN, 128], pl.INT32],
     ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
@@ -1310,7 +1127,7 @@ def gather_packed(
     workers = pl.max(1, pl.min(num_tokens * (SELECTED_KEYS // GATHER_KEY_TILE), max_workers))
     with pl.spmd(workers, name_hint=name_hint, deps=[ready]) as gathered:
         selected = _gather_packed_rows(
-            window, window_scale, compressed, compressed_scale, wi, ci, selected, indices, num_tokens,
+            window, compressed, wi, ci, selected, indices, num_tokens,
         )
     return selected, indices, gathered
 
@@ -1594,24 +1411,24 @@ def _attend_bf16_block(
 
 @pl.jit.inline(auto_scope=False)
 def decode_packed_caches(
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     decoded_window: pl.Tensor[[CACHE_WINDOW_ROWS, HEAD_DIM], pl.BF16],
     decoded_compressed: pl.Tensor[[CACHE_COMPRESSED_ROWS, HEAD_DIM], pl.BF16],
     ready: pl.Scalar[pl.TASK_ID],
 ):
     window_rows = pl.tensor.dim(window, 0) * 128
-    w = pl.reshape(window, [window_rows, HEAD_DIM])
-    ws = pl.reshape(window_scale, [window_rows, HEAD_DIM // 32])
+    w = pl.reshape(window, [window_rows, WINDOW_CACHE_BYTES])
     workers = pl.max(1, pl.min(window_rows // GATHER_KEY_TILE, CACHE_WORKERS))
     with pl.spmd(workers, name_hint="sparse_shared_window_decode", deps=[ready]) as window_ready:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, window_rows // GATHER_KEY_TILE, workers):
             row = block * GATHER_KEY_TILE
-            w_payload = pl.tile.load(w, [row, 0], [GATHER_KEY_TILE, HEAD_DIM])
-            w_factors = pl.tile.load(ws, [row, 0], [GATHER_KEY_TILE, HEAD_DIM // 32])
+            w_bytes = pl.tile.load(w, [row, 0], [GATHER_KEY_TILE, HEAD_DIM])
+            w_signed = pl.reinterpret_view(w_bytes, pl.INT8)
+            w_payload = pl.reinterpret_view(w_signed, pl.FP8E4M3FN)
+            w_scale_bytes = pl.tile.load(w, [row, HEAD_DIM], [GATHER_KEY_TILE, HEAD_DIM // 16])
+            w_factors = pl.reinterpret_view(w_scale_bytes, pl.BF16)
             w_scales = pl.cast(w_factors, pl.FP32)
             w_scale_column = pl.reshape(w_scales, [GATHER_KEY_TILE * (HEAD_DIM // 32), 1])
             w_values = pl.cast(w_payload, pl.FP32)
@@ -1622,15 +1439,15 @@ def decode_packed_caches(
             pl.tile.store(decoded, [row, 0], decoded_window)
 
     compressed_rows = pl.tensor.dim(compressed, 0) * 128
-    c = pl.reshape(compressed, [compressed_rows, HEAD_DIM // 2])
-    cs = pl.reshape(compressed_scale, [compressed_rows, HEAD_DIM // 16])
+    c = pl.reshape(compressed, [compressed_rows, COMPRESSED_CACHE_BYTES])
     workers = pl.max(1, pl.min(compressed_rows // GATHER_KEY_TILE, CACHE_WORKERS))
     with pl.spmd(workers, name_hint="sparse_shared_compressed_decode", deps=[ready]) as compressed_ready:
         worker = pl.tile.get_block_idx()
         for block in pl.range(worker, compressed_rows // GATHER_KEY_TILE, workers):
             row = block * GATHER_KEY_TILE
             c_payload = pl.tile.load(c, [row, 0], [GATHER_KEY_TILE, HEAD_DIM // 2])
-            c_factors = pl.tile.load(cs, [row, 0], [GATHER_KEY_TILE, HEAD_DIM // 16])
+            c_scale_bytes = pl.tile.load(c, [row, HEAD_DIM // 2], [GATHER_KEY_TILE, HEAD_DIM // 8])
+            c_factors = pl.reinterpret_view(c_scale_bytes, pl.BF16)
             c_fp4 = pl.reinterpret_view(c_payload, pl.FP4E2M1X2)
             c_values = pl.cast(c_fp4, pl.BF16)
             c_grouped = pl.reshape(c_values, [GATHER_KEY_TILE * (HEAD_DIM // 16), 16])
@@ -1696,11 +1513,9 @@ def gather_decoded_caches(
 def _attend_cache_shared(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
@@ -1711,7 +1526,7 @@ def _attend_cache_shared(
     decoded_window = pl.create_tensor([window_rows, HEAD_DIM], dtype=pl.BF16)
     decoded_compressed = pl.create_tensor([compressed_rows, HEAD_DIM], dtype=pl.BF16)
     window_ready, compressed_ready = decode_packed_caches(
-        window, window_scale, compressed, compressed_scale,
+        window, compressed,
         decoded_window, decoded_compressed, query_ready,
     )
     capacity = pl.max(1, pl.min(TOKEN_TILE, num_tokens))
@@ -1736,11 +1551,9 @@ def _attend_cache_shared(
 def _attend_packed_block(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
@@ -1749,7 +1562,7 @@ def _attend_packed_block(
     query_ready: pl.Scalar[pl.TASK_ID],
 ):
     selected, indices, gathered = gather_packed(
-        window, window_scale, compressed, compressed_scale,
+        window, compressed,
         window_indices, compressed_indices, selected, indices, num_tokens, query_ready, max_workers=GATHER_WORKERS,
         name_hint="c2a_gather",
     )
@@ -1761,11 +1574,9 @@ def _attend_packed_block(
 def attend_packed(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
@@ -1773,8 +1584,8 @@ def attend_packed(
 ):
     if LOCAL_H >= 32:
         attended = gather_sparse_attention(
-            query, window_indices, window, window_scale, compressed_indices,
-            compressed, compressed_scale, sink, output, num_tokens, source_ready, compressed_keys=INDEX_TOPK,
+            query, window_indices, window, compressed_indices,
+            compressed, sink, output, num_tokens, source_ready, compressed_keys=INDEX_TOPK,
         )
     else:
         marker = pl.create_tensor([1, 16], dtype=pl.FP32)
@@ -1789,14 +1600,14 @@ def attend_packed(
                 use_shared = pl.cast(1, pl.INT32)
         if use_shared == 1:
             output = _attend_cache_shared(
-                query, window_indices, window, window_scale, compressed_indices,
-                compressed, compressed_scale, sink, output, num_tokens, ready,
+                query, window_indices, window, compressed_indices,
+                compressed, sink, output, num_tokens, ready,
             )
         else:
             if TP_SIZE == 1 and num_tokens <= 12:
                 ready = attend_packed_cohorts(
-                    query, window_indices, window, window_scale, compressed_indices,
-                    compressed, compressed_scale, sink, output, num_tokens, ready,
+                    query, window_indices, window, compressed_indices,
+                    compressed, sink, output, num_tokens, ready,
                     gather_name="c2a_gather", attn_name="c2a_sparse_attn",
                 )
             else:
@@ -1810,8 +1621,8 @@ def attend_packed(
                     ci = pl.slice(compressed_indices, [count, INDEX_TOPK], [offset, 0])
                     out = pl.slice(output, [count, LOCAL_H * HEAD_DIM], [offset, 0])
                     ready = _attend_packed_block(
-                        q, wi, window, window_scale,
-                        ci, compressed, compressed_scale,
+                        q, wi, window,
+                        ci, compressed,
                         sink, out, selected, indices, count, ready,
                     )
     return output
@@ -1851,19 +1662,17 @@ def attend_bf16(
 def l2_sparse_attention(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Out[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
 ):
     rows = pl.tensor.dim(query, 0)
     source_ready = pl.system.task_dummy(deps=[])
     output = attend_packed(
-        query, window_indices, window, window_scale, compressed_indices,
-        compressed, compressed_scale, sink, output, rows, source_ready,
+        query, window_indices, window, compressed_indices,
+        compressed, sink, output, rows, source_ready,
     )
     return output
 
@@ -1877,11 +1686,9 @@ _attend_cohort = make_attend_selected_chunk(
 def attend_packed_cohorts(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     rows: pl.Scalar[pl.INT32],
@@ -1903,7 +1710,7 @@ def attend_packed_cohorts(
         query_a = pl.slice(query, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
         output_a = pl.slice(output, [active_a, LOCAL_H * HEAD_DIM], [start, 0])
         selected_a, combined_a, gathered_a = gather_packed(
-            window, window_scale, compressed, compressed_scale,
+            window, compressed,
             wi_a, ci_a, selected_a, combined_a, active_a, done_a, max_workers=32, name_hint=gather_name,
         )
         done_a = _attend_cohort(
@@ -1916,7 +1723,7 @@ def attend_packed_cohorts(
             query_b = pl.slice(query, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
             output_b = pl.slice(output, [active_b, LOCAL_H * HEAD_DIM], [start + width, 0])
             selected_b, combined_b, gathered_b = gather_packed(
-                window, window_scale, compressed, compressed_scale,
+                window, compressed,
                 wi_b, ci_b, selected_b, combined_b, active_b, done_b, max_workers=32, name_hint=gather_name,
             )
             done_b = _attend_cohort(
@@ -1930,11 +1737,9 @@ def attend_packed_cohorts(
 def l2_c2a_attention(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     output: pl.Out[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
 ):
@@ -1944,18 +1749,16 @@ def l2_c2a_attention(
     rows = pl.tensor.dim(query, 0)
     source_ready = pl.system.task_dummy(deps=[])
     output = attend_packed(
-        query, window_indices, window, window_scale, compressed_indices,
-        compressed, compressed_scale, sink, output, rows, source_ready,
+        query, window_indices, window, compressed_indices,
+        compressed, sink, output, rows, source_ready,
     )
     return output
 
 
 @pl.jit(auto_scope=False)
 def l2_gather_packed(
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     wi: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
     ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     selected: pl.InOut[pl.Tensor[[T_DYN, SELECTED_KEYS, HEAD_DIM], pl.BF16]],
@@ -1967,7 +1770,7 @@ def l2_gather_packed(
     compressed_part = pl.slice(ci, [num_tokens, INDEX_TOPK], [start, 0])
     ready = pl.system.task_dummy(deps=[])
     selected_ret, indices_ret, gathered = gather_packed(
-        window, window_scale, compressed, compressed_scale, window_part, compressed_part,
+        window, compressed, window_part, compressed_part,
         selected, indices, num_tokens, ready, max_workers=GATHER_WORKERS, name_hint="gather_packed",
     )
     return selected, indices
@@ -1990,9 +1793,9 @@ def l2_sparse_attention_bf16(
 
 def golden_gather_packed(tensors, *, active, start):
     """Gather decoded BF16 rows and preserve the inactive output suffix."""
-    window = dequantize_mxfp8_cache(tensors["window"], tensors["window_scale"])
+    window = dequantize_mxfp8_cache(*unpack_quantized_cache(tensors["window"], False))
     window = window.bfloat16().reshape(-1, HEAD_DIM)
-    compressed = dequantize_mxfp4_cache(tensors["compressed"], tensors["compressed_scale"], 16, "bf16")
+    compressed = dequantize_mxfp4_cache(*unpack_quantized_cache(tensors["compressed"], True), 16, "bf16")
     compressed = compressed.bfloat16().reshape(-1, HEAD_DIM)
     wi = tensors["wi"][start:start + active]
     ci = tensors["ci"][start:start + active]
@@ -2036,8 +1839,9 @@ def validate_gather_packed(args):
         ci[-1] = 0
         selected = torch.full((rows, SELECTED_KEYS, HEAD_DIM), 0.5, dtype=torch.bfloat16)
         indices = torch.full((rows, SELECTED_KEYS), -1024, dtype=torch.int32)
-        inputs = dict(window=window, window_scale=window_scale, compressed=compressed,
-                      compressed_scale=compressed_scale, wi=wi, ci=ci, selected=selected, indices=indices)
+        inputs = dict(window=pack_quantized_cache(window, window_scale),
+                      compressed=pack_quantized_cache(compressed, compressed_scale),
+                      wi=wi, ci=ci, selected=selected, indices=indices)
         specs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in inputs.items()]
         specs += [ScalarSpec("num_tokens", torch.int32, active), ScalarSpec("start", torch.int32, start)]
         exact = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
@@ -2051,7 +1855,7 @@ def validate_gather_packed(args):
         if not result.passed:
             raise RuntimeError(result.error)
         records.append(dict(mode="gather", rows=rows, active=active, start=start, passed=result.passed))
-        status = "COMPILE_ONLY" if args.compile_only else "DEVICE_VALIDATED"
+        status = "COMPILE_ONLY" if args.compile_only else "SIM_VALIDATED" if args.execution_mode else "DEVICE_VALIDATED"
         print(status, "gather", f"rows={rows} active={active} start={start}", result.work_dir)
     return records
 
@@ -2059,13 +1863,7 @@ def validate_gather_packed(args):
 def swa_core_reference(inputs):
     """Compute sink-aware FP32 attention over the decoded BF16 SWA rows."""
     tokens = int(inputs["num_tokens"])
-    cache = inputs["cache"]
-    if "scales" in inputs:
-        payload, scales = cache, inputs["scales"]
-    else:
-        payload = cache[..., :HEAD_DIM].contiguous().view(torch.float8_e4m3fn)
-        scale_bytes = cache[..., HEAD_DIM:].contiguous()
-        scales = scale_bytes.view(torch.bfloat16)
+    payload, scales = unpack_quantized_cache(inputs["cache"], False)
     decoded = payload.float() * scales.float().repeat_interleave(32, dim=-1)
     decoded = decoded.bfloat16().reshape(-1, HEAD_DIM)
     query = inputs["query"][:tokens].reshape(tokens, LOCAL_H, HEAD_DIM).float()
@@ -2089,7 +1887,7 @@ def swa_core_reference(inputs):
 SWA_DRAIN_CASES = {"drain1": 1, "drain2": 64, "drain3": 96, "drain4": 128}
 
 
-def make_swa_case(case, packed=False):
+def make_swa_case(case):
     """Create masked, prefix, wrap and irregular rows for one dispatch route."""
     cases = {"gather": 3, "plain": 33, "runs": 129, **SWA_DRAIN_CASES}
     if case not in cases:
@@ -2115,15 +1913,10 @@ def make_swa_case(case, packed=False):
             indices[row, 5:9] = 17
         elif kind == 5:
             indices[row, :65] = torch.arange(65, dtype=torch.int32) + 64
-    inputs = dict(query=query, cache=cache, scales=scales, indices=indices)
+    inputs = dict(query=query, cache=pack_quantized_cache(cache, scales), indices=indices)
     inputs["sink"] = torch.linspace(-6.0, -1.0, LOCAL_H)
     inputs["output"] = torch.full_like(query, 7.25)
     inputs["num_tokens"] = active
-    if packed:
-        payload_bytes = cache.view(torch.uint8)
-        scale_bytes = scales.view(torch.uint8)
-        inputs["cache"] = torch.cat((payload_bytes, scale_bytes), dim=-1).contiguous()
-        del inputs["scales"]
     return inputs, swa_core_reference(inputs)
 
 
@@ -2162,12 +1955,7 @@ def compare_swa_core(actual, expected, *, inputs, reference, **kwargs):
 
 
 def validate_swa_core(args):
-    """Validate the split BF16-scale and packed544 production SWA paths.
-
-    The T=1..4 drain cases run on the split-cache route, which is the one that enters
-    kernels/sparse_gather_vf.cpp; the packed544 core is a separate validation-only DSL
-    implementation and has no drain-tap pipeline to exercise.
-    """
+    """Validate packed production SWA, masks, irregular rows and pipeline drains."""
     from functools import partial
 
     from golden import run
@@ -2178,31 +1966,21 @@ def validate_swa_core(args):
         cases = tuple(SWA_DRAIN_CASES)
     else:
         cases = (args.swa_case,)
-    layouts = (False,) if args.mode == "swa" else (True,)
-    if args.mode in ("all", "swa-both"):
-        layouts = (False, True)
     records = []
-    for packed in layouts:
-        entry = l2_sparse_attention_swa_packed if packed else l2_sparse_attention_swa
-        mode = "swa-packed" if packed else "swa"
-        for case in cases:
-            if packed and case in SWA_DRAIN_CASES:
-                continue
-            inputs, reference = make_swa_case(case, packed)
-            result = run(
-                entry,
-                build_swa_specs(inputs),
-                golden_fn=golden_swa_core,
-                compare_fn={"output": partial(compare_swa_core, reference=reference)},
-                config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-                compile_only=args.compile_only,
-                save_data=True,
-            )
-            records.append(dict(mode=mode, case=case, passed=result.passed, work_dir=str(result.work_dir)))
-            if not result.passed:
-                raise RuntimeError(result.error)
-            status = "COMPILE_ONLY" if args.compile_only else "DEVICE_VALIDATED"
-            print(status, mode, case, result.work_dir)
+    for case in cases:
+        inputs, reference = make_swa_case(case)
+        result = run(
+            l2_sparse_attention_swa, build_swa_specs(inputs),
+            golden_fn=golden_swa_core,
+            compare_fn={"output": partial(compare_swa_core, reference=reference)},
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            compile_only=args.compile_only, save_data=True,
+        )
+        records.append(dict(mode="swa", case=case, passed=result.passed, work_dir=str(result.work_dir)))
+        if not result.passed:
+            raise RuntimeError(result.error)
+        status = "COMPILE_ONLY" if args.compile_only else "SIM_VALIDATED" if args.execution_mode else "DEVICE_VALIDATED"
+        print(status, "swa", case, result.work_dir)
     return records
 
 
@@ -2494,11 +2272,9 @@ def golden_compressed_attention(
 def l2_attend_project(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 16], pl.BF16],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
@@ -2513,7 +2289,7 @@ def l2_attend_project(
     attention_rows = pl.tensor.dim(output, 0)
     attended = pl.create_tensor([attention_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attend_packed(
-        query, window_indices, window, window_scale, compressed_indices, compressed, compressed_scale,
+        query, window_indices, window, compressed_indices, compressed,
         sink, attended, num_tokens, source_ready,
     )
     o_proj(
@@ -2526,8 +2302,7 @@ def l2_attend_project(
 def l2_attend_window_project(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
-    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     sink: pl.Tensor[[LOCAL_H], pl.FP32],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
@@ -2540,7 +2315,7 @@ def l2_attend_window_project(
 ):
     source_ready = pl.system.task_dummy(deps=[])
     output = _attend_window_project(
-        query, window_indices, window, window_scale, sink,
+        query, window_indices, window, sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         output, num_tokens, source_ready,
     )
@@ -2564,28 +2339,26 @@ def build_attend_project_specs(rows, active, *, compressed):
             wi = torch.randint(0, 256, (rows, WINDOW_KEYS), generator=generator, dtype=torch.int32)
             wi[:, ::13] = -1
             wi[0] = -1
-            values.update(query=query, window_indices=wi, window=wp, window_scale=ws)
+            values.update(query=query, window_indices=wi, window=pack_quantized_cache(wp, ws))
             if compressed:
                 cache = torch.randn(2, 128, 1, HEAD_DIM, generator=generator).mul_(0.6).bfloat16()
                 cp, cs = quantize_mxfp4_cache(cache, 16, "bf16")
                 ci = torch.randint(0, 256, (rows, INDEX_TOPK), generator=generator, dtype=torch.int32)
                 ci[:, ::19] = -1
                 ci[0] = -1
-                values.update(compressed_indices=ci, compressed=cp, compressed_scale=cs)
+                values.update(compressed_indices=ci, compressed=pack_quantized_cache(cp, cs))
             values["sink"] = torch.linspace(-2.0, 3.0, LOCAL_H)
         return values
 
     shapes = [
         ("query", [rows, LOCAL_H * HEAD_DIM], torch.bfloat16),
         ("window_indices", [rows, WINDOW_KEYS], torch.int32),
-        ("window", [2, 128, 1, HEAD_DIM], torch.float8_e4m3fn),
-        ("window_scale", [2, 128, 1, HEAD_DIM // 32], torch.bfloat16),
+        ("window", [2, 128, 1, WINDOW_CACHE_BYTES], torch.uint8),
     ]
     if compressed:
         shapes += [
             ("compressed_indices", [rows, INDEX_TOPK], torch.int32),
-            ("compressed", [2, 128, 1, HEAD_DIM // 2], torch.uint8),
-            ("compressed_scale", [2, 128, 1, HEAD_DIM // 16], torch.bfloat16),
+            ("compressed", [2, 128, 1, COMPRESSED_CACHE_BYTES], torch.uint8),
         ]
     shapes.append(("sink", [LOCAL_H], torch.float32))
     specs = [TensorSpec(name, shape, dtype, init_value=lambda name=name: inputs()[name])
@@ -2602,11 +2375,11 @@ def golden_attend_project(tensors):
     if active == 0:
         return
     query = tensors["query"][:active].unflatten(-1, (LOCAL_H, HEAD_DIM))
-    window = dequantize_mxfp8_cache(tensors["window"], tensors["window_scale"]).bfloat16()
+    window = dequantize_mxfp8_cache(*unpack_quantized_cache(tensors["window"], False)).bfloat16()
     wi = tensors["window_indices"][:active]
     parts = [golden_paged_sparse_attention_stats(query, window, wi)]
     if "compressed" in tensors:
-        compressed = dequantize_mxfp4_cache(tensors["compressed"], tensors["compressed_scale"], 16, "bf16")
+        compressed = dequantize_mxfp4_cache(*unpack_quantized_cache(tensors["compressed"], True), 16, "bf16")
         ci = tensors["compressed_indices"][:active]
         parts.append(golden_paged_sparse_attention_stats(query, compressed.bfloat16(), ci))
     attended = golden_merge_attention_stats(tuple(parts), tensors["sink"]).bfloat16()
@@ -2643,7 +2416,7 @@ def validate_attend_project(args):
             if not result.passed:
                 raise RuntimeError(result.error)
             records.append(dict(mode=mode, rows=rows, active=active, passed=result.passed, work_dir=str(result.work_dir)))
-            status = "COMPILE_ONLY" if args.compile_only else "DEVICE_VALIDATED"
+            status = "COMPILE_ONLY" if args.compile_only else "SIM_VALIDATED" if args.execution_mode else "DEVICE_VALIDATED"
             print(status, mode, f"rows={rows} active={active}", result.work_dir)
     return records
 
@@ -2667,7 +2440,7 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4, 8])
     rows_help = "single row count; gather and projection default to boundary cases, sparse MLA to 72"
     parser.add_argument("--rows", type=int, help=rows_help)
-    mode_choices = ["gather", "packed", "bf16", "both", "c2a", "swa", "swa-packed", "swa-both",
+    mode_choices = ["gather", "packed", "bf16", "both", "c2a", "swa",
                     "project", "project-packed", "project-swa", "all"]
     parser.add_argument("--mode", default="all", choices=mode_choices)
     parser.add_argument("--swa-case", default="all", choices=["gather", "plain", "runs", "drains", "all"])
@@ -2679,7 +2452,7 @@ if __name__ == "__main__":
         raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
     if args.mode == "c2a" and TP_SIZE != 1:
         parser.error("C2A standalone validation requires --tp 1")
-    if args.mode in ("swa", "swa-packed", "swa-both", "all") and (args.fixture or args.runtime_dir):
+    if args.mode in ("swa", "all") and (args.fixture or args.runtime_dir):
         raise ValueError("--fixture and --runtime-dir require a sparse MLA mode: packed, bf16 or c2a")
     if args.runtime_dir and args.mode == "both":
         raise ValueError("--runtime-dir requires one --mode")
@@ -2687,8 +2460,6 @@ if __name__ == "__main__":
         raise ValueError("Gather and projection validation generate their own boundary fixtures")
     if args.rows is not None and args.rows < 1:
         raise ValueError("--rows must be positive")
-    if args.swa_case == "drains" and args.mode == "swa-packed":
-        parser.error("--swa-case drains exercises the split-cache SFA route; use --mode swa")
     if args.mode == "gather":
         _main_results = validate_gather_packed(args)
     elif args.mode.startswith("swa"):
@@ -2748,8 +2519,8 @@ if __name__ == "__main__":
                 else:
                     expected = fixture[f"expected_{reference_mode}"]
                 if reference_mode == "packed":
-                    inputs = dict(query=query.flatten(1), window_indices=window_indices, window=wp, window_scale=ws,
-                                  compressed_indices=compressed_indices, compressed=cp, compressed_scale=cs, sink=sink)
+                    inputs = dict(query=query.flatten(1), window_indices=window_indices, window=pack_quantized_cache(wp, ws),
+                                  compressed_indices=compressed_indices, compressed=pack_quantized_cache(cp, cs), sink=sink)
                     reference = expected.flatten(1)
                     result_dtype = torch.bfloat16
                     entry = l2_c2a_attention if mode == "c2a" else l2_sparse_attention
@@ -2778,7 +2549,7 @@ if __name__ == "__main__":
                 records.append(dict(mode=mode, rows=rows, passed=result.passed, work_dir=str(result.work_dir)))
                 if not result.passed:
                     raise RuntimeError(result.error)
-                status = "COMPILE_ONLY" if args.compile_only else "DEVICE_VALIDATED"
+                status = "COMPILE_ONLY" if args.compile_only else "SIM_VALIDATED" if args.execution_mode else "DEVICE_VALIDATED"
                 print(status, mode, f"rows={rows}", result.work_dir)
         if args.mode == "all":
             records.extend(validate_gather_packed(args))

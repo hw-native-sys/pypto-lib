@@ -12,6 +12,7 @@
 
 import argparse
 import pypto.language as pl
+
 import pypto.language.distributed as pld
 import config as C
 
@@ -29,9 +30,9 @@ if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
 
 
 from config import (
-    FLASH as M, B_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, COMPRESSED_CACHE_GROUP,
-    DECODE_MAX_TOKENS, DECODE_INPUT_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
-    MOE_TOKENS, DSPARK_DRAFT_LAYERS, DSPARK_LAST_TARGET_LAYER, DSPARK_TARGET_LAYER_IDS,
+    FLASH as M, B_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, DECODE_MAX_TOKENS,
+    DECODE_INPUT_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, MOE_TOKENS, DSPARK_DRAFT_LAYERS,
+    DSPARK_LAST_TARGET_LAYER, DSPARK_TARGET_LAYER_IDS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from compressor import STATE_WIDTH
 from decode_c1a_full import decode_c1a_full
@@ -124,14 +125,8 @@ def decode_encoder(
     token_rope_sin: pl.Out[pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32]],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
-    window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
-    ],
-    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
-    ],
+    window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -199,9 +194,7 @@ def decode_encoder(
     x_hc.bind_dynamic(0, LOCAL_T_DYN)
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
     window_cache_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
-    window_cache_scale_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
-    compressed_cache_scale_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
     index_cache_scale_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
     c2a_compressed_slots.bind_dynamic(0, T_DYN)
@@ -254,8 +247,7 @@ def decode_encoder(
                 )
         with pl.scope():
             weight_layer = layer % WEIGHT_BANK_SIZE
-            layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [layer * window_blocks_per_layer, 0, 0, 0])
-            layer_window_cache_scale = pl.slice(window_cache_scale_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], [layer * window_blocks_per_layer, 0, 0, 0])
+            layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], [layer * window_blocks_per_layer, 0, 0, 0])
             layer_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [weight_layer * MIX_HC, 0])
             layer_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [weight_layer * 3])
             layer_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [weight_layer * MIX_HC])
@@ -289,14 +281,13 @@ def decode_encoder(
                     layer_wo_b, layer_wo_b_scale,
                     base_rope_cos, base_rope_sin,
                     window_slots, window_indices,
-                    layer_window_cache, layer_window_cache_scale,
+                    layer_window_cache,
                     swa_attention_output,
                     attention_hidden, attention_pre_mix, attention_count,
                 )
             elif (layer - 2) % 6 == 0:
                 full_source_id = (layer - 2) // 6
-                full_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, HEAD_DIM // 2], [full_source_id * compressed_blocks_per_source, 0, 0, 0])
-                full_compressed_cache_scale = pl.slice(compressed_cache_scale_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], [full_source_id * compressed_blocks_per_source, 0, 0, 0])
+                full_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], [full_source_id * compressed_blocks_per_source, 0, 0, 0])
                 full_index_cache = pl.slice(index_cache_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // 2], [full_source_id * index_blocks_per_source, 0, 0, 0])
                 full_index_cache_scale = pl.slice(index_cache_scale_pool, [index_blocks_per_source, BLOCK_SIZE, 1, INDEX_DIM // INDEX_CACHE_GROUP], [full_source_id * index_blocks_per_source, 0, 0, 0])
                 full_state_cache = pl.slice(state_cache_pool, [state_blocks_per_source, STATE_CAPACITY, STATE_WIDTH], [full_source_id * state_blocks_per_source, 0, 0])
@@ -322,8 +313,8 @@ def decode_encoder(
                     layer_wo_b, layer_wo_b_scale,
                     compressed_token_rope_cos, compressed_token_rope_sin,
                     window_slots, window_indices,
-                    layer_window_cache, layer_window_cache_scale,
-                    full_compressed_cache, full_compressed_cache_scale,
+                    layer_window_cache,
+                    full_compressed_cache,
                     token_to_req_indices, c2a_compressed_lens,
                     full_index_cache, full_index_cache_scale,
                     c2a_index_block_table, position_ids,
@@ -339,8 +330,7 @@ def decode_encoder(
                 )
             else:
                 reuse_source_id = (layer - 2) // 6
-                reuse_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, HEAD_DIM // 2], [reuse_source_id * compressed_blocks_per_source, 0, 0, 0])
-                reuse_compressed_cache_scale = pl.slice(compressed_cache_scale_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], [reuse_source_id * compressed_blocks_per_source, 0, 0, 0])
+                reuse_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], [reuse_source_id * compressed_blocks_per_source, 0, 0, 0])
                 decode_c2a_reuse(
                     x_hc, pre_mix,
                     layer_hc_fn, layer_hc_scale, layer_hc_base,
@@ -355,8 +345,8 @@ def decode_encoder(
                     layer_wo_b, layer_wo_b_scale,
                     compressed_token_rope_cos, compressed_token_rope_sin,
                     window_slots, window_indices,
-                    layer_window_cache, layer_window_cache_scale,
-                    reuse_compressed_cache, reuse_compressed_cache_scale,
+                    layer_window_cache,
+                    reuse_compressed_cache,
                     topk_indices,
                     attention_hidden, attention_pre_mix, attention_count,
                 )
@@ -424,14 +414,8 @@ def decode_decoder(
     token_rope_sin: pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
-    window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
-    ],
-    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
-    ],
+    window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -495,9 +479,7 @@ def decode_decoder(
     pre_mix.bind_dynamic(0, LOCAL_T_DYN)
     dspark_target_hidden.bind_dynamic(0, LOCAL_T_DYN)
     window_cache_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
-    window_cache_scale_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
-    compressed_cache_scale_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
     index_cache_scale_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
     c1a_compressed_slots.bind_dynamic(0, T_DYN)
@@ -526,11 +508,9 @@ def decode_decoder(
     for layer in pl.range(20, 40):
         with pl.scope():
             weight_layer = layer % WEIGHT_BANK_SIZE
-            layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM], [layer * window_blocks_per_layer, 0, 0, 0])
-            layer_window_cache_scale = pl.slice(window_cache_scale_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], [layer * window_blocks_per_layer, 0, 0, 0])
+            layer_window_cache = pl.slice(window_cache_pool, [window_blocks_per_layer, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], [layer * window_blocks_per_layer, 0, 0, 0])
             layer_source_id = 3
-            layer_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, HEAD_DIM // 2], [layer_source_id * compressed_blocks_per_source, 0, 0, 0])
-            layer_compressed_cache_scale = pl.slice(compressed_cache_scale_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], [layer_source_id * compressed_blocks_per_source, 0, 0, 0])
+            layer_compressed_cache = pl.slice(compressed_cache_pool, [compressed_blocks_per_source, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], [layer_source_id * compressed_blocks_per_source, 0, 0, 0])
             layer_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [weight_layer * MIX_HC, 0])
             layer_hc_scale: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [weight_layer * 3])
             layer_hc_base: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [weight_layer * MIX_HC])
@@ -572,8 +552,8 @@ def decode_decoder(
                     layer_wo_b, layer_wo_b_scale,
                     compressed_token_rope_cos, compressed_token_rope_sin,
                     window_slots, window_indices,
-                    layer_window_cache, layer_window_cache_scale,
-                    layer_compressed_cache, layer_compressed_cache_scale,
+                    layer_window_cache,
+                    layer_compressed_cache,
                     token_to_req_indices, c1a_compressed_lens,
                     full_index_cache, full_index_cache_scale,
                     c1a_index_block_table,
@@ -606,8 +586,8 @@ def decode_decoder(
                     layer_wo_b, layer_wo_b_scale,
                     compressed_token_rope_cos, compressed_token_rope_sin,
                     window_slots, window_indices,
-                    layer_window_cache, layer_window_cache_scale,
-                    layer_compressed_cache, layer_compressed_cache_scale,
+                    layer_window_cache,
+                    layer_compressed_cache,
                     token_to_req_indices, c1a_compressed_lens,
                     reindex_index_cache, reindex_index_cache_scale,
                     c1a_index_block_table,
@@ -631,8 +611,8 @@ def decode_decoder(
                     layer_wo_b, layer_wo_b_scale,
                     compressed_token_rope_cos, compressed_token_rope_sin,
                     window_slots, window_indices,
-                    layer_window_cache, layer_window_cache_scale,
-                    layer_compressed_cache, layer_compressed_cache_scale,
+                    layer_window_cache,
+                    layer_compressed_cache,
                     topk_indices,
                     attention_hidden, attention_pre_mix, attention_count,
                 )
@@ -715,14 +695,8 @@ def l2_decode_fwd(
     freqs_sin: pl.Tensor[[2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, BLOCK_SIZE], pl.INT32],
-    window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
-    ],
-    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale_pool: pl.InOut[
-        pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]
-    ],
+    window_cache_pool: pl.InOut[pl.Tensor[[FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache_pool: pl.InOut[pl.Tensor[[FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[pl.Tensor[[FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -806,8 +780,8 @@ def l2_decode_fwd(
         freqs_cos, freqs_sin,
         compressed_token_rope_cos, compressed_token_rope_sin,
         window_slots, window_indices,
-        window_cache_pool, window_cache_scale_pool,
-        compressed_cache_pool, compressed_cache_scale_pool,
+        window_cache_pool,
+        compressed_cache_pool,
         token_to_req_indices, position_ids,
         index_cache_pool, index_cache_scale_pool,
         c2a_index_block_table,
@@ -839,8 +813,8 @@ def l2_decode_fwd(
         wo_a, wo_a_scale, wo_b,
         token_cos, token_sin,
         window_slots, window_indices,
-        window_cache_pool, window_cache_scale_pool,
-        compressed_cache_pool, compressed_cache_scale_pool,
+        window_cache_pool,
+        compressed_cache_pool,
         token_to_req_indices, position_ids,
         index_cache_pool, index_cache_scale_pool,
         c1a_index_block_table,
@@ -901,20 +875,8 @@ def l3_decode_fwd(
     freqs_sin: pl.Tensor[[EP_SIZE, 2, ROPE_ROWS_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[EP_SIZE, T_DYN], pl.INT64],
     window_indices: pl.Tensor[[EP_SIZE, T_DYN, BLOCK_SIZE], pl.INT32],
-    window_cache_pool: pl.InOut[
-        pl.Tensor[[EP_SIZE, FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]
-    ],
-    window_cache_scale_pool: pl.InOut[
-        pl.Tensor[[EP_SIZE, FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]
-    ],
-    compressed_cache_pool: pl.InOut[
-        pl.Tensor[[EP_SIZE, FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // 2], pl.UINT8]
-    ],
-    compressed_cache_scale_pool: pl.InOut[
-        pl.Tensor[
-            [EP_SIZE, FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16
-        ]
-    ],
+    window_cache_pool: pl.InOut[pl.Tensor[[EP_SIZE, FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache_pool: pl.InOut[pl.Tensor[[EP_SIZE, FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     position_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     index_cache_pool: pl.InOut[
@@ -1036,9 +998,7 @@ def l3_decode_fwd(
     pre_mix.bind_dynamic(1, LOCAL_T_DYN)
     dspark_target_hidden.bind_dynamic(1, LOCAL_T_DYN)
     window_cache_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
-    window_cache_scale_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(1, FWD_CMP_BLOCKS_DYN)
-    compressed_cache_scale_pool.bind_dynamic(1, FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(1, FWD_INDEX_BLOCKS_DYN)
     index_cache_scale_pool.bind_dynamic(1, FWD_INDEX_BLOCKS_DYN)
     state_cache_pool.bind_dynamic(1, FWD_STATE_BLOCKS_DYN)
@@ -1103,8 +1063,8 @@ def l3_decode_fwd(
             wo_a[rank], wo_a_scale[rank], wo_b[rank],
             freqs_cos[rank], freqs_sin[rank],
             window_slots[rank], window_indices[rank],
-            window_cache_pool[rank], window_cache_scale_pool[rank],
-            compressed_cache_pool[rank], compressed_cache_scale_pool[rank],
+            window_cache_pool[rank],
+            compressed_cache_pool[rank],
             token_to_req_indices[rank], position_ids[rank],
             index_cache_pool[rank], index_cache_scale_pool[rank],
             c2a_index_block_table[rank], c1a_index_block_table[rank],
