@@ -78,6 +78,7 @@ def _gate_route_sort_vf(
     weights: pl.InOut[pl.Tensor],
     active_tokens: pl.Scalar[pl.INDEX],
     route_scale: pl.Scalar[pl.FP32],
+    topk: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Sort router scores, normalize selected weights, and store active rows."""
     return indices, weights
@@ -102,6 +103,7 @@ def _gate_pre_route_vf(
     biased_scores: pl.Out[pl.Tensor],
     active_tokens: pl.Scalar[pl.INDEX],
     experts: pl.Scalar[pl.INDEX],
+    topk: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
     """Zero inactive routes and initialize padded expert scores."""
     return indices, weights, biased_scores
@@ -245,7 +247,7 @@ def gate_from_bf16(
     biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     with pl.spmd(1, name_hint="gate_pre_route"):
         indices, weights, biased_scores_buf = _gate_pre_route_vf(
-            indices, weights, biased_scores_buf, active_tokens, n_experts,
+            indices, weights, biased_scores_buf, active_tokens, n_experts, topk,
         )
 
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
@@ -266,7 +268,7 @@ def gate_from_bf16(
         task_route_tiles = (task_tokens + GATE_T_TILE - 1) // GATE_T_TILE
         with pl.spmd(pl.max(task_route_tiles, 1), name_hint="route_sort"):
             indices, weights = _gate_route_sort_vf(
-                biased_scores_buf, route_scores_buf, indices, weights, active_tokens, ROUTE_SCALE,
+                biased_scores_buf, route_scores_buf, indices, weights, active_tokens, ROUTE_SCALE, topk,
             )
     else:
         task_route_tiles = (task_tokens + GATE_T_TILE * (1 + topk % 2) - 1) // (GATE_T_TILE * (1 + topk % 2))

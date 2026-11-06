@@ -297,6 +297,7 @@ def _routed_w13(
     width: pl.Scalar[pl.INDEX],
     hidden: pl.Scalar[pl.INDEX],
     activation_rows: pl.Scalar[pl.INDEX],
+    row_capacity: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Store compact BF16 projections and route weights with the same row order."""
     return pair, compact_weights
@@ -315,6 +316,7 @@ def _routed_swiglu_quant(
     experts: pl.Scalar[pl.INDEX],
     stride: pl.Scalar[pl.INDEX],
     hidden: pl.Scalar[pl.INDEX],
+    row_capacity: pl.constexpr,
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Apply FP32 weighted SwiGLU and upward group-32 MXFP8 quantization."""
     return payload, scales
@@ -339,6 +341,7 @@ def _routed_w2(
     hidden: pl.Scalar[pl.INDEX],
     output_rows: pl.Scalar[pl.INDEX],
     activation_rows: pl.Scalar[pl.INDEX],
+    row_capacity: pl.constexpr,
 ) -> pl.Tensor:
     """Store full-K BF16 results in compact active-row order."""
     ...
@@ -375,14 +378,14 @@ def _expert_routed_output(
     with pl.spmd(32, name_hint="routed_w13", deps=[input_ready]) as w13_ready:
         pair, compact_weights = _routed_w13(
             x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
-            weights, compact_weights, experts, stride, width, hidden, activation_rows,
+            weights, compact_weights, experts, stride, width, hidden, activation_rows, row_capacity,
         )
 
     payload = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
     with pl.spmd(64, name_hint="routed_swiglu_quant", deps=[w13_ready]) as activation_ready:
         payload, scales = _routed_swiglu_quant(
-            pair, compact_weights, counts, payload, scales, experts, stride, hidden,
+            pair, compact_weights, counts, payload, scales, experts, stride, hidden, row_capacity,
         )
 
     output_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
@@ -390,7 +393,7 @@ def _expert_routed_output(
     with pl.spmd(32, name_hint="routed_w2", deps=[activation_ready]) as ready:
         output = _routed_w2(
             payload, scales, counts, w2, w2_scale, output,
-            experts, stride, width, hidden, output_rows, activation_rows,
+            experts, stride, width, hidden, output_rows, activation_rows, row_capacity,
         )
     return output, ready
 
