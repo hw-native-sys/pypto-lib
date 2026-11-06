@@ -197,78 +197,84 @@ def decode_hidden_fwd(
         tp_partial, tp_arrived, num_tokens, rank, embedding_epoch,
     )
     for layer in pl.range(NUM_LAYERS):
-        current_offset = (layer % 2) * CAPACITY
-        following_offset = ((layer + 1) % 2) * CAPACITY
-        current = pl.slice(ws_x_hc_pair, [BATCH, HC_MULT, D], [current_offset, 0, 0])
-        following = pl.slice(ws_x_hc_pair, [BATCH, HC_MULT, D], [following_offset, 0, 0])
-        bb_ord = pl.cast(layer, pl.INT32)
-        kda_ord = pl.cast(layer - layer // 4, pl.INT32)
-        dsa_ord = pl.cast(layer // 4, pl.INT32)
-        dense_ord = pl.cast(layer, pl.INT32)
-        moe_ord = pl.cast(layer - DENSE_NUM_LAYERS, pl.INT32)
-        attn_epoch = forward_epoch * (2 * NUM_LAYERS + 1) + 2 * bb_ord + 2
-        ffn_epoch = attn_epoch + 1
-        moe_epoch = forward_epoch * (NUM_LAYERS - DENSE_NUM_LAYERS) + moe_ord + 1
-        skip_topk = pl.cast(0, pl.INT32)
-        if layer < DENSE_NUM_LAYERS:
-            _inline_prefill_dense_layer(
-                current, query_start_loc, kda_state_rows, active_tokens, execution_mode, kda_tri_incl,
-                kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
-                kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
-                kda_w_f_b, kda_w_g_a, kda_w_g_b, kda_w_b, kda_dt_bias,
-                kda_a_log, kda_o_norm, kda_w_o, mhc_attn_fn, mhc_attn_scale,
-                mhc_attn_base, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base, norm_input_norm,
-                norm_post_norm, dense_w_gate_up, dense_w_gate_up_scale, dense_w_down, dense_w_down_scale,
-                kda_conv_state, kda_recurrent_state, tp_partial, tp_arrived, ws_attn_pre,
-                ws_attn_post, ws_attn_res, ws_collapsed, ws_normed, ws_attn_partial,
-                ws_sublayer_out, ws_x_hc_mid, ws_ffn_pre, ws_ffn_post, ws_ffn_res,
-                ws_ffn_input, ws_ffn_partial, ws_ffn_out, following, kda_out,
-                mixed_qkv, decay, beta, kda_q, kda_k,
-                kda_v, dense_x_int8, bb_ord, kda_ord, dense_ord,
-                rank, attn_epoch, ffn_epoch,
-            )
-        else:
-            if layer % 4 == 3:
-                _inline_prefill_sparse_attention(
-                    current, request_ids, mla_slots, index_slots, index_tail_slots, seg_start,
-                    pool_count_tok, tail_start, tail_count, kv_len_tok, pool_token_slots,
-                    pool_slots, pool_blocks, block_table, active_tokens, execution_mode, mla_w_q_a,
-                    mla_w_q_a_scale, mla_q_a_norm, mla_w_q_b, mla_w_q_b_scale, mla_w_kv_a,
-                    mla_w_kv_a_scale, mla_kv_a_norm, mla_w_k, mla_w_v, mla_w_o,
-                    mla_w_o_scale, idx_w_q_b, idx_w_k, idx_k_norm_w, idx_k_norm_b,
-                    idx_w_weights, idx_w_compress_gate, idx_compress_ape, mhc_attn_fn, mhc_attn_scale,
-                    mhc_attn_base, norm_input_norm, mla_latent_cache, index_raw_cache,
-                    index_pool_cache, tp_partial, tp_arrived, ws_attn_pre,
-                    ws_attn_post, ws_attn_res, ws_collapsed, ws_normed, ws_attn_partial,
-                    ws_sublayer_out, ws_x_hc_mid, dsa_query, attn_out, index_q,
-                    index_k, selected_pools, selected_valid, bb_ord,
-                    dsa_ord, rank, attn_epoch, skip_topk,
-                )
-            else:
-                _inline_prefill_kda_attention(
+        # auto_scope is off, so without this every task the layer body emits
+        # stays on ring 0, whose enclosing scope ends only when the forward
+        # returns, and the retained live set grows with the layer count
+        # until the ring cannot satisfy the next allocation. One scope per
+        # layer retires them, matching the prefill stack.
+        with pl.scope():
+            current_offset = (layer % 2) * CAPACITY
+            following_offset = ((layer + 1) % 2) * CAPACITY
+            current = pl.slice(ws_x_hc_pair, [BATCH, HC_MULT, D], [current_offset, 0, 0])
+            following = pl.slice(ws_x_hc_pair, [BATCH, HC_MULT, D], [following_offset, 0, 0])
+            bb_ord = pl.cast(layer, pl.INT32)
+            kda_ord = pl.cast(layer - layer // 4, pl.INT32)
+            dsa_ord = pl.cast(layer // 4, pl.INT32)
+            dense_ord = pl.cast(layer, pl.INT32)
+            moe_ord = pl.cast(layer - DENSE_NUM_LAYERS, pl.INT32)
+            attn_epoch = forward_epoch * (2 * NUM_LAYERS + 1) + 2 * bb_ord + 2
+            ffn_epoch = attn_epoch + 1
+            moe_epoch = forward_epoch * (NUM_LAYERS - DENSE_NUM_LAYERS) + moe_ord + 1
+            skip_topk = pl.cast(0, pl.INT32)
+            if layer < DENSE_NUM_LAYERS:
+                _inline_prefill_dense_layer(
                     current, query_start_loc, kda_state_rows, active_tokens, execution_mode, kda_tri_incl,
                     kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
                     kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
                     kda_w_f_b, kda_w_g_a, kda_w_g_b, kda_w_b, kda_dt_bias,
                     kda_a_log, kda_o_norm, kda_w_o, mhc_attn_fn, mhc_attn_scale,
-                    mhc_attn_base, norm_input_norm, kda_conv_state, kda_recurrent_state, tp_partial,
-                    tp_arrived, ws_attn_pre, ws_attn_post, ws_attn_res, ws_collapsed,
-                    ws_normed, ws_attn_partial, ws_sublayer_out, ws_x_hc_mid, kda_out,
+                    mhc_attn_base, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base, norm_input_norm,
+                    norm_post_norm, dense_w_gate_up, dense_w_gate_up_scale, dense_w_down, dense_w_down_scale,
+                    kda_conv_state, kda_recurrent_state, tp_partial, tp_arrived, ws_attn_pre,
+                    ws_attn_post, ws_attn_res, ws_collapsed, ws_normed, ws_attn_partial,
+                    ws_sublayer_out, ws_x_hc_mid, ws_ffn_pre, ws_ffn_post, ws_ffn_res,
+                    ws_ffn_input, ws_ffn_partial, ws_ffn_out, following, kda_out,
                     mixed_qkv, decay, beta, kda_q, kda_k,
-                    kda_v, bb_ord, kda_ord, rank, attn_epoch,
+                    kda_v, dense_x_int8, bb_ord, kda_ord, dense_ord,
+                    rank, attn_epoch, ffn_epoch,
                 )
-            _complete_forward_stage(ws_x_hc_mid)
-            _inline_moe_layer(
-                ws_x_hc_mid, active_tokens, execution_mode, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base,
-                norm_post_norm, router_gate_w, router_gate_bias, moe_w_gate_up, moe_w_gate_up_scale,
-                moe_w_down, moe_w_down_scale, moe_shared_w_gate_up, moe_shared_w_gate_up_scale, moe_shared_w_down,
-                moe_shared_w_down_scale, lane_x, lane_aux, lane_count, count_ready,
-                x_ready, slot_out, return_ready, tp_partial, tp_arrived,
-                ws_ffn_pre, ws_ffn_post, ws_ffn_res, ws_ffn_input, ws_ffn_partial,
-                ws_ffn_out, following, bb_ord, moe_ord, rank,
-                moe_epoch, ffn_epoch, True,
-            )
-        _complete_forward_stage(following)
+            else:
+                if layer % 4 == 3:
+                    _inline_prefill_sparse_attention(
+                        current, request_ids, mla_slots, index_slots, index_tail_slots, seg_start,
+                        pool_count_tok, tail_start, tail_count, kv_len_tok, pool_token_slots,
+                        pool_slots, pool_blocks, block_table, active_tokens, execution_mode, mla_w_q_a,
+                        mla_w_q_a_scale, mla_q_a_norm, mla_w_q_b, mla_w_q_b_scale, mla_w_kv_a,
+                        mla_w_kv_a_scale, mla_kv_a_norm, mla_w_k, mla_w_v, mla_w_o,
+                        mla_w_o_scale, idx_w_q_b, idx_w_k, idx_k_norm_w, idx_k_norm_b,
+                        idx_w_weights, idx_w_compress_gate, idx_compress_ape, mhc_attn_fn, mhc_attn_scale,
+                        mhc_attn_base, norm_input_norm, mla_latent_cache, index_raw_cache,
+                        index_pool_cache, tp_partial, tp_arrived, ws_attn_pre,
+                        ws_attn_post, ws_attn_res, ws_collapsed, ws_normed, ws_attn_partial,
+                        ws_sublayer_out, ws_x_hc_mid, dsa_query, attn_out, index_q,
+                        index_k, selected_pools, selected_valid, bb_ord,
+                        dsa_ord, rank, attn_epoch, skip_topk,
+                    )
+                else:
+                    _inline_prefill_kda_attention(
+                        current, query_start_loc, kda_state_rows, active_tokens, execution_mode, kda_tri_incl,
+                        kda_tri_strict, kda_head_onehot, kda_eye_wide, kda_w_q, kda_w_k,
+                        kda_w_v, kda_conv_q, kda_conv_k, kda_conv_v, kda_w_f_a,
+                        kda_w_f_b, kda_w_g_a, kda_w_g_b, kda_w_b, kda_dt_bias,
+                        kda_a_log, kda_o_norm, kda_w_o, mhc_attn_fn, mhc_attn_scale,
+                        mhc_attn_base, norm_input_norm, kda_conv_state, kda_recurrent_state, tp_partial,
+                        tp_arrived, ws_attn_pre, ws_attn_post, ws_attn_res, ws_collapsed,
+                        ws_normed, ws_attn_partial, ws_sublayer_out, ws_x_hc_mid, kda_out,
+                        mixed_qkv, decay, beta, kda_q, kda_k,
+                        kda_v, bb_ord, kda_ord, rank, attn_epoch,
+                    )
+                _complete_forward_stage(ws_x_hc_mid)
+                _inline_moe_layer(
+                    ws_x_hc_mid, active_tokens, execution_mode, mhc_ffn_fn, mhc_ffn_scale, mhc_ffn_base,
+                    norm_post_norm, router_gate_w, router_gate_bias, moe_w_gate_up, moe_w_gate_up_scale,
+                    moe_w_down, moe_w_down_scale, moe_shared_w_gate_up, moe_shared_w_gate_up_scale, moe_shared_w_down,
+                    moe_shared_w_down_scale, lane_x, lane_aux, lane_count, count_ready,
+                    x_ready, slot_out, return_ready, tp_partial, tp_arrived,
+                    ws_ffn_pre, ws_ffn_post, ws_ffn_res, ws_ffn_input, ws_ffn_partial,
+                    ws_ffn_out, following, bb_ord, moe_ord, rank,
+                    moe_epoch, ffn_epoch, True,
+                )
+            _complete_forward_stage(following)
     current = pl.slice(ws_x_hc_pair, [BATCH, HC_MULT, D], [(NUM_LAYERS % 2) * CAPACITY, 0, 0])
     _inline_prefill_head_rows(
         current, logit_row_indices, head_hidden,

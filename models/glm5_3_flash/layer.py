@@ -1002,9 +1002,9 @@ def prefill_kda_attention(
     conv_state_l = kda_conv_state[kda_ord]
     recurrent_state_l = kda_recurrent_state[kda_ord]
 
-    out_gate = pl.create_tensor([t_tokens, LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
-    conv_w = pl.create_tensor([KDA_CONV_K, CONV_DIM], dtype=pl.BF16)
     with pl.scope():
+        out_gate = pl.create_tensor([t_tokens, LOCAL_KDA_H, KDA_DIM], dtype=pl.BF16)
+        conv_w = pl.create_tensor([KDA_CONV_K, CONV_DIM], dtype=pl.BF16)
         mhc_mixes(x_hc, attn_fn_l, attn_scale_l, attn_base_l, out_attn_pre, out_attn_post, out_attn_res)
         mhc_pre(x_hc, out_attn_pre, out_collapsed)
         rmsnorm(out_collapsed, input_norm_l, out_normed)
@@ -1105,21 +1105,21 @@ def moe_layer(
     shared_out = pl.create_tensor([shared_rows, D], dtype=pl.FP32)
     routed = pl.create_tensor([T_MOE, D], dtype=pl.FP32)
     expert_y = pl.create_tensor([RESIDENT_GROUPED_CAP, D], dtype=pl.FP32)
-    slab_src = pl.create_tensor([RESIDENT_GROUPED_CAP, 1], dtype=pl.INT32)
-    slab_route = pl.create_tensor([RESIDENT_GROUPED_CAP, 1], dtype=pl.INT32)
-    slab_weight = pl.create_tensor([RESIDENT_GROUPED_CAP, 1], dtype=pl.FP32)
-    slab_scale = pl.create_tensor([RESIDENT_GROUPED_CAP, 1], dtype=pl.FP32)
-    slab_x = pl.create_tensor([RESIDENT_GROUPED_CAP, D], dtype=pl.INT8)
-    expert_offsets = pl.create_tensor([N_LOCAL_EXPERTS + 1], dtype=pl.INT32)
-    expert_counts = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
-    recv_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL_EXPERTS], dtype=pl.INT32)
-    send_counts = pl.create_tensor([N_RANKS, 1], dtype=pl.INT32)
-    moe_x_scale = pl.create_tensor([T_MOE, 1], dtype=pl.FP32)
-    moe_x_int8 = pl.create_tensor([T_MOE, D], dtype=pl.INT8)
-    moe_route_indices = pl.create_tensor([T_MOE, TOPK], dtype=pl.INT32)
-    moe_route_weights = pl.create_tensor([T_MOE, TOPK], dtype=pl.FP32)
-    local_ffn = pl.create_tensor([T_MOE, D], dtype=pl.BF16)
     with pl.scope():
+        slab_src = pl.create_tensor([RESIDENT_GROUPED_CAP, 1], dtype=pl.INT32)
+        slab_route = pl.create_tensor([RESIDENT_GROUPED_CAP, 1], dtype=pl.INT32)
+        slab_weight = pl.create_tensor([RESIDENT_GROUPED_CAP, 1], dtype=pl.FP32)
+        slab_scale = pl.create_tensor([RESIDENT_GROUPED_CAP, 1], dtype=pl.FP32)
+        slab_x = pl.create_tensor([RESIDENT_GROUPED_CAP, D], dtype=pl.INT8)
+        expert_offsets = pl.create_tensor([N_LOCAL_EXPERTS + 1], dtype=pl.INT32)
+        expert_counts = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
+        recv_expert_counts = pl.create_tensor([N_RANKS, N_LOCAL_EXPERTS], dtype=pl.INT32)
+        send_counts = pl.create_tensor([N_RANKS, 1], dtype=pl.INT32)
+        moe_x_scale = pl.create_tensor([T_MOE, 1], dtype=pl.FP32)
+        moe_x_int8 = pl.create_tensor([T_MOE, D], dtype=pl.INT8)
+        moe_route_indices = pl.create_tensor([T_MOE, TOPK], dtype=pl.INT32)
+        moe_route_weights = pl.create_tensor([T_MOE, TOPK], dtype=pl.FP32)
+        local_ffn = pl.create_tensor([T_MOE, D], dtype=pl.BF16)
         if bb_ord == NUM_LAYERS:
             plain_residual_pre(x_hc_mid, out_ffn_input, out_ffn_pre, out_ffn_post, out_ffn_res)
         else:
@@ -1421,13 +1421,13 @@ def prefill_sparse_attention(
     raw_cache_l = index_raw_cache[dsa_ord]
     pool_cache_l = index_pool_cache[dsa_ord]
 
-    pool_valid = pl.create_tensor([pools_axis, POOL_VALID_WIDTH], dtype=pl.INT32)
-    topk_indices = pl.create_tensor([t_tokens, TOPK_INDEX_WIDTH], dtype=pl.INT32)
-    gate_scores = pl.create_tensor([t_tokens, INDEX_DIM], dtype=pl.FP32)
-    head_weights = pl.create_tensor([t_tokens, INDEX_H], dtype=pl.FP32)
-    kv_latent = pl.create_tensor([t_tokens, KV_LORA], dtype=pl.BF16)
-    q_resid = pl.create_tensor([t_tokens, Q_LORA], dtype=pl.BF16)
     with pl.scope():
+        pool_valid = pl.create_tensor([pools_axis, POOL_VALID_WIDTH], dtype=pl.INT32)
+        topk_indices = pl.create_tensor([t_tokens, TOPK_INDEX_WIDTH], dtype=pl.INT32)
+        gate_scores = pl.create_tensor([t_tokens, INDEX_DIM], dtype=pl.FP32)
+        head_weights = pl.create_tensor([t_tokens, INDEX_H], dtype=pl.FP32)
+        kv_latent = pl.create_tensor([t_tokens, KV_LORA], dtype=pl.BF16)
+        q_resid = pl.create_tensor([t_tokens, Q_LORA], dtype=pl.BF16)
         if bb_ord == NUM_LAYERS:
             plain_residual_pre(x_hc, out_collapsed, out_attn_pre, out_attn_post, out_attn_res)
         else:

@@ -20,6 +20,7 @@ import torch
 
 from models.glm5_3_flash.config import FLASH, D
 from models.glm5_3_flash.linear import bf16_projection, golden_bf16_linear
+from models.glm5_3_flash.kda import PROJECTION_WORKERS_TILE
 from models.glm5_3_flash.rmsnorm import rms_norm, rmsnorm
 from models.glm5_3_flash.utils import Checkpoint
 
@@ -106,28 +107,30 @@ def mtp_prepare_feedback(
     rows = pl.tensor.dim(embedding, 0)
     feedback = pl.create_tensor([rows, D], dtype=pl.BF16)
     tokens = pl.create_tensor([rows, D], dtype=pl.BF16)
-    for block in pl.spmd(rows * (D // 128), name_hint="mtp_feedback_gather"):
-        row = block // (D // 128)
-        column = block % (D // 128) * 128
-        request = pl.read(request_ids, [row])
-        value = pl.full([1, 128], dtype=pl.BF16, value=0.0)
-        token = pl.full([1, 128], dtype=pl.BF16, value=0.0)
-        if request >= 0:
-            request_index = pl.cast(request, pl.INDEX)
-            mode = pl.read(feedback_mode, [0])
-            if mode == 0:
-                selected = pl.read(feedback_indices, [row])
-                if selected >= 0:
-                    source = pl.cast(selected, pl.INDEX)
-                    value = target_feedback[source:source + 1, column:column + 128]
-            elif mode == 1:
-                value = target_last[request_index:request_index + 1, column:column + 128]
-            else:
-                value = draft_last[request_index:request_index + 1, column:column + 128]
-            if pl.read(visible_lengths, [row]) > 1:
-                token = embedding[row:row + 1, column:column + 128]
-        feedback[row:row + 1, column:column + 128] = value
-        tokens[row:row + 1, column:column + 128] = token
+    mtp_feedback_gather_tasks = rows * (D // 128)
+    for worker in pl.spmd(pl.min(mtp_feedback_gather_tasks, PROJECTION_WORKERS_TILE), name_hint="mtp_feedback_gather"):
+        for block in pl.range(worker, mtp_feedback_gather_tasks, PROJECTION_WORKERS_TILE):
+            row = block // (D // 128)
+            column = block % (D // 128) * 128
+            request = pl.read(request_ids, [row])
+            value = pl.full([1, 128], dtype=pl.BF16, value=0.0)
+            token = pl.full([1, 128], dtype=pl.BF16, value=0.0)
+            if request >= 0:
+                request_index = pl.cast(request, pl.INDEX)
+                mode = pl.read(feedback_mode, [0])
+                if mode == 0:
+                    selected = pl.read(feedback_indices, [row])
+                    if selected >= 0:
+                        source = pl.cast(selected, pl.INDEX)
+                        value = target_feedback[source:source + 1, column:column + 128]
+                elif mode == 1:
+                    value = target_last[request_index:request_index + 1, column:column + 128]
+                else:
+                    value = draft_last[request_index:request_index + 1, column:column + 128]
+                if pl.read(visible_lengths, [row]) > 1:
+                    token = embedding[row:row + 1, column:column + 128]
+            feedback[row:row + 1, column:column + 128] = value
+            tokens[row:row + 1, column:column + 128] = token
     mtp_projection(tokens, feedback, enorm_weight, hnorm_weight, w_eh, output)
     return output
 
