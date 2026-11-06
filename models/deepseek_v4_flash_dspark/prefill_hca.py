@@ -95,6 +95,8 @@ HCA_SWA_ROW_TILE = 8
 HCA_QUERY_SLICE_TILE = 8
 HCA_CACHE_READY_TILE = 64
 HCA_CACHE_WRITE_TILE = 64
+SWA_QUERY_TILE = 16
+HCA_CACHE_READY_STRIDE = 16  # One 64-byte cache line per INT32 writer.
 MAIN_OUT_DIM = HEAD_DIM
 MAIN_COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 START_POS = 0
@@ -227,8 +229,10 @@ def _prefill_attention_hca(
     )
 
     swa_indices = pl.create_tensor([t_dim, WIN], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_swa_indices") as swa_indices_tid:
-        for idx_t in pl.range(t_dim):
+    # Batch independent query rows into one parallel dispatch.
+    with pl.spmd((t_dim + SWA_QUERY_TILE - 1) // SWA_QUERY_TILE, name_hint="prefill_hca_swa_indices") as swa_indices_tid:
+        idx_base = pl.tile.get_block_idx() * SWA_QUERY_TILE
+        for idx_t in pl.range(idx_base, pl.min(idx_base + SWA_QUERY_TILE, t_dim)):
             swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
             request_id = pl.read(local_request_ids, [idx_t])
             if request_id >= 0:
@@ -905,7 +909,7 @@ def prefill_attention_hca_cp_core(
     compress_state_flat = pl.reshape(compress_state, [state_rows, MAIN_COMPRESS_STATE_DIM])
     q_ready_flat = pl.reshape(q, [q_dim * H, HEAD_DIM])
     cache_ready_blocks = (kv_dim + HCA_CACHE_READY_TILE - 1) // HCA_CACHE_READY_TILE
-    cache_ready_fence = pl.create_tensor([cache_ready_blocks], dtype=pl.INT32)
+    cache_ready_fence = pl.create_tensor([cache_ready_blocks, HCA_CACHE_READY_STRIDE], dtype=pl.INT32)
     with pl.spmd(
         cache_ready_blocks, name_hint="prefill_hca_cp_cache_ready",
         deps=[ori_cache_write_tid, swa_indices_tid],
@@ -934,7 +938,7 @@ def prefill_attention_hca_cp_core(
                     cmp_ready_sample = pl.tile.read(cmp_ready_bits, [0, 0])
                     cmp_ready_value = pl.cast(cmp_ready_sample, pl.INT32)
                     ready_bit = ready_bit + cmp_ready_value
-        pl.write(cache_ready_fence, [ready_block], ready_bit)
+        pl.write(cache_ready_fence, [ready_block, 0], ready_bit)
 
     # Per-request HCA streaming over rank-local packed query intervals.
     with pl.spmd(q_dim, name_hint="prefill_hca_cp_pad_output_init") as pad_output_tid:
