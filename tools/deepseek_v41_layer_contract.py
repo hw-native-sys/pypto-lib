@@ -83,11 +83,14 @@ def _execution_plan(
         "\"bash -lc 'set -euo pipefail; unset PYTHONPATH; unset ASCEND_HOME_PATH; "
         "export VLLM_USE_V2_MODEL_RUNNER=0; "
         "export SOC_VERSION=ascend910_9382; "
-        f"{REFERENCE_PYTHON} tools/deepseek_v41_vllm_capture.py "
+        "export ASCEND_RT_VISIBLE_DEVICES=\\\"\\${TASK_DEVICE:?TASK_DEVICE is required}\\\"; "
+        f"{REFERENCE_PYTHON} -m torch.distributed.run --standalone "
+        "--nnodes=1 --nproc_per_node=2 tools/deepseek_v41_vllm_capture.py "
         f"--release-root {REFERENCE_ROOT} --checkpoint {checkpoint} "
         f"--output {reference_output} --layer-id {layer} "
         "--history-length 8 --max-model-len 128 "
-        "--task-device \\$TASK_DEVICE --capture-task \\$TASK_ID'\""
+        "--task-device \\\"\\${TASK_DEVICE:?TASK_DEVICE is required}\\\" "
+        "--capture-task \\\"\\${TASK_ID:-not_recorded}\\\"'\""
     )
     if layer == 0:
         replay_status = "ready_to_submit"
@@ -187,6 +190,10 @@ def build_report(
             report_candidates.extend(sorted(product.glob(f"decode-layer-ep2-l{layer}-*.json"), reverse=True))
             report_candidates.extend(sorted(product.glob(f"decode-layer-ep2-l{layer}.json"), reverse=True))
         product_report = next((item for item in report_candidates if item.name != "decode-acceptance.json"), None)
+        component_candidates = []
+        if product:
+            component_candidates.extend(sorted(product.glob(f"decode-ep2-l{layer}-moe-*.json"), reverse=True))
+        component_report = next((item for item in component_candidates if item.name != "decode-acceptance.json"), None)
         product_status = "not_run"
         if product_report:
             try:
@@ -194,6 +201,12 @@ def build_report(
                 product_status = str(payload.get("status", "not_run"))
             except (OSError, ValueError):
                 product_status = "invalid_report"
+        component_status = "not_run"
+        if component_report:
+            try:
+                component_status = str(_read_json(component_report).get("status", "not_run"))
+            except (OSError, ValueError):
+                component_status = "invalid_report"
         layers.append(
             {
                 "layer_id": layer,
@@ -218,6 +231,8 @@ def build_report(
                 },
                 "product_report": str(product_report) if product_report else "not_run",
                 "product_accuracy": product_status,
+                "moe_component_report": str(component_report) if component_report else "not_run",
+                "moe_component_accuracy": component_status,
                 "representative_status": "pass" if product_status == "pass" and asset_dir else "not_run",
                 "stage_entry": _stage_entry(layer, ratio, layer in {1, 14}),
                 "execution_plan": _execution_plan(

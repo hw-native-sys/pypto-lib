@@ -77,6 +77,46 @@ def _reference_flags(document: Mapping[str, Any]) -> Mapping[str, Any]:
     return comparison if isinstance(comparison, Mapping) else document
 
 
+def _validate_layer_state_capture(
+    layer: int | None,
+    decode_input: Mapping[str, Any] | None,
+    reference: Mapping[str, Any] | None,
+    errors: list[str],
+) -> None:
+    """Require physical cache planes beyond the generic MoE/layer capture."""
+
+    if layer is None or decode_input is None or reference is None:
+        return
+    ratio_state = decode_input.get("ratio1_ratio2_state")
+    if not isinstance(ratio_state, Mapping):
+        return
+    ratio = ratio_state.get("layer_ratio")
+    engram_required = ratio_state.get("engram_required") is True
+    if ratio == 0:
+        if engram_required:
+            rows = decode_input.get("engram_rows")
+            if not isinstance(rows, Mapping) or rows.get("captured") is not True:
+                errors.append("decode_input.json: Engram rows are required and must be captured")
+        return
+    if ratio not in (1, 2):
+        errors.append("decode_input.json: unsupported layer compression ratio")
+        return
+
+    required = ["compressed_kv_cache", "index_cache", "index_scale"]
+    if ratio == 1:
+        required.append("candidate_pool")
+    state = reference.get("layer_state_capture")
+    if not isinstance(state, Mapping):
+        errors.append("reference_capture.json: layer_state_capture is required for C1A/C2A")
+        return
+    if state.get("complete") is not True:
+        errors.append("reference_capture.json: layer_state_capture.complete must be true")
+    for name in required:
+        value = state.get(name)
+        if not isinstance(value, Mapping) or value.get("captured") is not True:
+            errors.append(f"reference_capture.json: layer_state_capture.{name} is not captured")
+
+
 def _check_history_cache(path: Path, errors: list[str]) -> None:
     try:
         with zipfile.ZipFile(path) as archive:
@@ -181,6 +221,8 @@ def validate_assets(
             errors.append("reference_capture.json: runtime_identity is required")
         if reference.get("product_imported") is True:
             errors.append("reference_capture.json: product process must not import the reference stack")
+
+    _validate_layer_state_capture(input_layer, decode_input, reference, errors)
 
     return {
         "status": "pass" if not errors else "not_ready",

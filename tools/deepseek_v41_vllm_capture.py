@@ -146,9 +146,28 @@ def _make_layer_root(checkpoint: Path, root: Path, layer_id: int) -> Path:
     """Create a small config view while retaining all checkpoint payloads."""
 
     root.mkdir(parents=True, exist_ok=True)
+    layer_only = os.environ.get("VLLM_CAPTURE_LAYER_ONLY") == "1"
     config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
     text = config.get("text_config", config)
     text["num_hidden_layers"] = layer_id + 1
+    # A truncated layer view must advertise only the Engram tables that can
+    # occur in its retained physical layers.  vLLM preflights every ID in
+    # this list before loading any weights.
+    engram_ids = [int(value) for value in text.get("engram_layer_ids", ())]
+    engram_sizes = list(text.get("engram_num_embeddings", ()))
+    retained_engram = [
+        (layer, engram_sizes[index] if index < len(engram_sizes) else None)
+        for index, layer in enumerate(engram_ids)
+        if layer <= layer_id
+    ]
+    if layer_only:
+        # The layer-only reference constructs just the requested physical
+        # layer.  Keep its Engram binding, but do not make placeholder layers
+        # own the earlier tables that are irrelevant to this isolated call.
+        retained_engram = [item for item in retained_engram if item[0] == layer_id]
+    text["engram_layer_ids"] = [layer for layer, _ in retained_engram]
+    if engram_sizes:
+        text["engram_num_embeddings"] = [size for _, size in retained_engram]
     # Physical L0 has no Engram table.  vLLM constructs all configured
     # Engram bindings even for a truncated model, so remove only the runtime
     # binding for this L0 reference view; the source checkpoint remains intact.
@@ -182,9 +201,11 @@ def _make_layer_root(checkpoint: Path, root: Path, layer_id: int) -> Path:
         match = re.match(r"layers\.(\d+)\.", name)
         if match is not None and int(match.group(1)) > layer_id:
             continue
+        if layer_only and match is not None and int(match.group(1)) != layer_id:
+            continue
         if name.startswith(("mtp.", "vision.", "aligner.", "image_")):
             continue
-        if ".engram." in name:
+        if ".engram." in name and not layer_only:
             continue
         filtered_map[name] = shard
     index["weight_map"] = filtered_map
@@ -227,6 +248,14 @@ def _make_layer_root(checkpoint: Path, root: Path, layer_id: int) -> Path:
         target = root / shard
         if not source.is_file():
             raise FileNotFoundError(f"filtered index references missing shard {source}")
+        # Engram tables are large standalone safetensors files.  Keep their
+        # indexed names visible in the layer view without materializing a
+        # second copy during every independent reference capture.
+        if shard.startswith("engram_embed_"):
+            if target.is_symlink() or target.exists():
+                target.unlink()
+            target.symlink_to(source)
+            continue
         tensors = {}
         with safe_open(str(source), framework="pt", device="cpu") as reader:
             for name in names_by_shard[shard]:
@@ -234,6 +263,259 @@ def _make_layer_root(checkpoint: Path, root: Path, layer_id: int) -> Path:
         save_file(tensors, str(target), metadata={"format": "pt", "source": str(source)})
     (root / ".ready").write_text("complete\n", encoding="utf-8")
     return root
+
+
+def _patch_layer_only_model(layer_id: int) -> dict[str, Any]:
+    """Construct one physical layer while preserving its checkpoint prefix.
+
+    The normal vLLM constructor allocates every preceding MoE layer before the
+    target is reached.  On a two-card EP2 reference that exhausts device memory
+    for L14 and later.  This reference-only patch leaves the target layer and
+    its physical prefix intact, while placeholder layers carry the hidden
+    state through the model loop without allocating weights or cache users.
+    """
+
+    import torch
+    import vllm_ascend.models.deepseek_v41.model as deepseek_v41_model
+    import vllm_ascend.models.deepseek_v41.vl_model as deepseek_v41_vl_model
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    class LayerOnlyIdentity(PPMissingLayer):
+        def __init__(self, index: int):
+            super().__init__()
+            self.layer_idx = index
+            self.engram = None
+
+        def forward(self, positions, hidden_states, pre_mix, *args, **kwargs):
+            return hidden_states, pre_mix
+
+        @staticmethod
+        def hc_collapse(hidden_states, pre_mix):
+            return (pre_mix.unsqueeze(-1) * hidden_states.float()).sum(-2).to(hidden_states.dtype)
+
+    class LayerOnlyCacheOwner(deepseek_v41_model.DeepseekV41DecoderLayer):
+        """Register cache planes for a source layer without its MoE weights."""
+
+        def __init__(
+            self,
+            vllm_config,
+            prefix,
+            config=None,
+            topk_indices_buffer=None,
+            is_draft_layer=False,
+        ):
+            torch.nn.Module.__init__(self)
+            if config is None:
+                config = deepseek_v41_model.normalize_deepseek_v41_config(
+                    vllm_config.model_config.hf_config
+                )
+            layer_index = int(prefix.rsplit(".", 1)[-1])
+            topology = deepseek_v41_model.build_layer_plan(config)
+            role = topology.layer(layer_index)
+            max_position_embeddings = config.rope_parameters["original_max_position_embeddings"]
+            self.layer_idx = layer_index
+            self.hidden_size = config.hidden_size
+            self.norm_eps = config.rms_norm_eps
+            self.hc_mult = config.hc_mult
+            self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+            self.hc_eps = config.hc_eps
+            self.use_sequence_parallel_moe = vllm_config.parallel_config.use_sequence_parallel_moe
+            self.use_sequence_parallel = self.use_sequence_parallel_moe
+            self.self_attn = deepseek_v41_model.DeepseekV41Attention(
+                vllm_config=vllm_config,
+                config=config,
+                max_position_embeddings=max_position_embeddings,
+                cache_config=vllm_config.cache_config,
+                quant_config=vllm_config.quant_config,
+                prefix=f"{prefix}.self_attn",
+                topk_indices_buffer=topk_indices_buffer,
+                reduce_results=not self.use_sequence_parallel_moe,
+                need_gather_q_kv=self.use_sequence_parallel_moe
+                and deepseek_v41_model.enable_dsa_cp(),
+            )
+            # Model construction and metadata setup inspect these attributes,
+            # while the identity forward never reads them.
+            self.input_layernorm = PPMissingLayer()
+            self.post_attention_layernorm = PPMissingLayer()
+            self.mlp = PPMissingLayer()
+            self.engram = None
+
+        def forward(self, positions, hidden_states, pre_mix, *args, **kwargs):
+            return hidden_states, pre_mix
+
+    topology = None
+
+    def make_layers(num_hidden_layers, layer_fn, prefix):
+        if layer_id < 0 or layer_id >= num_hidden_layers:
+            raise ValueError(f"target layer {layer_id} is outside {num_hidden_layers} layers")
+        # Consumer layers need cache owners from their source layer.  The
+        # source is kept as a lightweight attention/cache module; all other
+        # prefix layers remain parameter-free identities.
+        source_layers = set()
+        config = None
+        for cell in getattr(layer_fn, "__closure__", ()) or ():
+            value = cell.cell_contents
+            if hasattr(value, "cache_config") and hasattr(value, "model_config"):
+                config = value.model_config.hf_config
+                break
+        if config is not None:
+            normalized = deepseek_v41_model.normalize_deepseek_v41_config(config)
+            role = deepseek_v41_model.build_layer_plan(normalized).layer(layer_id)
+            if role.kv_source_layer is not None:
+                source_layers.add(int(role.kv_source_layer))
+            if role.index_source_layer is not None:
+                source_layers.add(int(role.index_source_layer))
+        modules = [
+            layer_fn(prefix=f"{prefix}.{index}")
+            if index == layer_id
+            else (
+                LayerOnlyCacheOwner(
+                    next(
+                        cell.cell_contents
+                        for cell in (getattr(layer_fn, "__closure__", ()) or ())
+                        if hasattr(cell.cell_contents, "cache_config")
+                        and hasattr(cell.cell_contents, "model_config")
+                    ),
+                    f"{prefix}.{index}",
+                )
+                if index in source_layers
+                else LayerOnlyIdentity(index)
+            )
+            for index in range(num_hidden_layers)
+        ]
+        return 0, num_hidden_layers, torch.nn.ModuleList(modules)
+
+    deepseek_v41_model.make_layers = make_layers
+
+    # The VL wrapper used by this checkpoint does not expose the language
+    # model's Engram cache prefix, while the V1 Ascend runner queries it from
+    # the outer model during memory profiling.  Resolve the target layer
+    # directly so identity placeholders never become cache owners.
+    deepseek_v41_vl_model.AscendDeepseekV41ForCausalLM.engram_cache_layer_name = property(
+        lambda self: self.language_model.model.layers[layer_id]
+        .self_attn.dsa_attn.swa_cache_layer.prefix
+    )
+    return {
+        "enabled": True,
+        "target_layer": layer_id,
+        "prefix_preserved": True,
+        "placeholder_layers": "identity_without_parameters_with_source_cache_owners",
+        "product_process": False,
+    }
+
+
+def _patch_empty_state_cache_group() -> dict[str, Any]:
+    """Keep reduced reference views valid when no Engram state is present.
+
+    The pinned Ascend cache planner unconditionally constructs a second
+    ``UniformTypeKVCacheSpecs`` group for ``CircularBufferSpec`` entries.  A
+    layer-only view whose target has no Engram state has no such entries, so
+    the planner raises ``StopIteration`` while profiling the cache budget.
+    The product never imports this module; this patch is scoped to the
+    independent reference process and preserves all non-empty groups.
+    """
+
+    import vllm_ascend.models.deepseek_v41.cache_config as cache_config
+    import vllm_ascend.patch.platform.patch_kv_cache_utils as kv_cache_patch
+    from dataclasses import replace
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
+
+    original = cache_config.group_cache_specs
+
+    def group_cache_specs_without_empty_state(specs):
+        if specs and all(
+            isinstance(spec, cache_config.AscendSlidingWindowMLASpec)
+            for spec in specs.values()
+        ):
+            return [
+                UniformTypeKVCacheSpecs.from_specs({name: spec})
+                for name, spec in specs.items()
+            ]
+        page_sizes, layer_tuples = cache_config.get_layer_tuples(specs)
+        padded = {}
+        for page_size, layer_tuple in zip(page_sizes, layer_tuples):
+            kv_name, index_name, *rest = layer_tuple
+            folded_name = index_name + "_folded"
+            has_folded = folded_name in rest
+            aliases = rest[1:] if has_folded else rest
+            kv_bytes = specs[kv_name].unpadded_page_size_bytes
+            index_bytes = specs[index_name].unpadded_page_size_bytes
+            padded[kv_name] = replace(specs[kv_name], page_size_padded=kv_bytes)
+            padded[index_name] = replace(
+                specs[index_name],
+                page_size_padded=index_bytes if has_folded else page_size - kv_bytes,
+            )
+            if has_folded:
+                padded[folded_name] = replace(
+                    specs[folded_name],
+                    page_size_padded=page_size - kv_bytes - index_bytes,
+                )
+            padded.update(
+                (name, replace(specs[name], page_size_padded=page_size))
+                for name in aliases
+            )
+
+        mla_names = [
+            name for name, spec in padded.items()
+            if isinstance(spec, cache_config.AscendMLAAttentionSpec)
+        ]
+        state_names = [
+            name for name, spec in padded.items()
+            if isinstance(spec, CircularBufferSpec)
+        ]
+        groups = []
+        if mla_names:
+            groups.append(
+                UniformTypeKVCacheSpecs.from_specs(
+                    {name: padded[name] for name in mla_names}
+                )
+            )
+        if state_names:
+            groups.append(
+                UniformTypeKVCacheSpecs.from_specs(
+                    {name: padded[name] for name in state_names}
+                )
+            )
+
+        swa_columns = [
+            [
+                name
+                for name in layer_tuple
+                if isinstance(padded[name], cache_config.AscendSlidingWindowMLASpec)
+                and ".mtp." not in f".{name}"
+            ]
+            for layer_tuple in layer_tuples
+        ]
+        for names in zip(*swa_columns):
+            groups.append(
+                UniformTypeKVCacheSpecs.from_specs(
+                    {name: padded[name] for name in names}
+                )
+            )
+
+        draft_names = [
+            name
+            for layer_tuple in layer_tuples
+            for name in layer_tuple
+            if isinstance(padded[name], cache_config.AscendSlidingWindowMLASpec)
+            and ".mtp." in f".{name}"
+        ]
+        if draft_names:
+            groups.append(
+                UniformTypeKVCacheSpecs.from_specs(
+                    {name: padded[name] for name in draft_names}
+                )
+            )
+        return groups
+
+    cache_config.group_cache_specs = group_cache_specs_without_empty_state
+    kv_cache_patch.group_cache_specs = group_cache_specs_without_empty_state
+    return {
+        "enabled": True,
+        "reference_only": True,
+        "reason": "skip_empty_circular_buffer_group",
+        "original": f"{original.__module__}.{original.__name__}",
+    }
 
 
 def _layer_state_contract(checkpoint: Path, layer_id: int) -> dict[str, Any]:
@@ -263,7 +545,7 @@ def _layer_state_contract(checkpoint: Path, layer_id: int) -> dict[str, Any]:
     }
 
 
-def _wait_for_layer_root(root: Path, timeout_s: float = 120.0) -> None:
+def _wait_for_layer_root(root: Path, timeout_s: float = 1200.0) -> None:
     """Wait until rank zero has finished publishing the shared model view."""
 
     deadline = time.monotonic() + timeout_s
@@ -292,12 +574,65 @@ def _cache_description(cache: Any) -> dict[str, Any]:
     }
 
 
-def _clone_cache(cache: Any) -> Any:
+def _clone_cache(cache: Any, block_ids: list[int] | None = None) -> Any:
+    """Copy only request-owned cache pages to host memory.
+
+    A vLLM cache tensor reserves the complete device cache budget.  Cloning
+    that tensor before a decode step allocates another device-sized temporary
+    and can OOM an otherwise healthy reference process.  The input contract
+    only needs the pages addressed by this request, together with the full
+    cache layout recorded separately, so select those rows on device first.
+    """
+
     if isinstance(cache, tuple):
-        return tuple(_clone_cache(item) for item in cache)
+        return tuple(_clone_cache(item, block_ids) for item in cache)
     if isinstance(cache, list):
-        return [_clone_cache(item) for item in cache]
-    return cache.detach().cpu().clone()
+        return [_clone_cache(item, block_ids) for item in cache]
+    if block_ids is None:
+        return cache.detach().cpu()
+    if not hasattr(cache, "shape") or not cache.shape:
+        return cache.detach().cpu()
+    # Slicing avoids the large temporary that some Ascend index_select
+    # implementations allocate even for a one-element index.
+    selected = cache[block_ids[0] : block_ids[-1] + 1]
+    return selected.detach().cpu()
+
+
+def _request_cache_blocks(batch: Any, valid_lengths: list[int], block_size: int = 128) -> list[int]:
+    """Return only physical pages occupied by the current request(s).
+
+    vLLM exposes a preallocated block table whose unused entries are also
+    nonnegative.  The valid prefix is determined by each request's computed
+    length and the configured page size.
+    """
+
+    blocks: set[int] = set()
+    for request_index, group in enumerate(getattr(batch, "block_table", ())):
+        # Decode slot mappings identify the physical page directly and avoid
+        # interpreting the unused tail of vLLM's preallocated block table.
+        slot_mapping = getattr(group, "slot_mapping", None)
+        if slot_mapping is not None:
+            slots = getattr(slot_mapping, "gpu", slot_mapping)
+            slot = int(slots[:1].detach().cpu().reshape(-1)[0].item())
+            if slot >= 0:
+                blocks.add(slot // block_size)
+                continue
+        table = (
+            group.get_numpy_array()
+            if hasattr(group, "get_numpy_array")
+            else group.block_table.np
+        )
+        table = table.reshape(table.shape[0], -1) if table.ndim > 1 else table.reshape(1, -1)
+        row_index = request_index if request_index < table.shape[0] else 0
+        valid_length = valid_lengths[request_index] if request_index < len(valid_lengths) else 0
+        page_count = max(1, (int(valid_length) + block_size - 1) // block_size)
+        for value in table[row_index, :page_count].tolist():
+            value = int(value)
+            if value >= 0:
+                blocks.add(value)
+    if not blocks:
+        raise RuntimeError("decode request did not expose a valid cache block")
+    return sorted(blocks)
 
 
 def _save_cache_npz(path: Path, cache_before: Any, cache_after: Any) -> dict[str, Any]:
@@ -342,6 +677,107 @@ def _save_cache_npz(path: Path, cache_before: Any, cache_after: Any) -> dict[str
     visit_after("cache", cache_after)
     np.savez_compressed(path, **arrays)
     return metadata
+
+
+def _save_layer_state_npz(
+    path: Path,
+    cache_before: Any,
+    cache_after: Any,
+    candidate_before: Any,
+    candidate_after: Any,
+    layer_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Save the physical DSA state used by an isolated layer replay.
+
+    The v1 cache list is ordered as the index tuple, long-context compressed
+    KV plane, and the SWA alias plane.  Candidate rows are model-level buffers
+    and are captured separately from the paged cache.  Only request-owned
+    rows are present in ``cache_before``/``cache_after`` because the caller
+    already selected the request's block IDs.
+    """
+
+    import numpy as np
+    import torch
+
+    if not isinstance(cache_before, (tuple, list)) or len(cache_before) < 3:
+        raise ValueError("DeepSeek V4.1 layer state requires index, long-KV and SWA cache groups")
+    index_before = cache_before[0]
+    index_after = cache_after[0]
+    if not isinstance(index_before, (tuple, list)) or len(index_before) < 2:
+        raise ValueError("index cache group must contain payload and scale planes")
+
+    def storage(value: Any) -> np.ndarray:
+        if value.dtype == torch.bfloat16:
+            return value.contiguous().view(torch.int16).numpy()
+        return value.contiguous().numpy()
+
+    arrays: dict[str, np.ndarray] = {}
+    metadata: dict[str, Any] = {}
+
+    def record(name: str, value: Any) -> None:
+        arrays[name] = storage(value)
+        metadata[name] = {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "storage_dtype": str(arrays[name].dtype),
+        }
+
+    record("before_index_cache", index_before[0])
+    record("after_index_cache", index_after[0])
+    record("before_index_scale", index_before[1])
+    record("after_index_scale", index_after[1])
+    record("before_compressed_kv_cache", cache_before[1])
+    record("after_compressed_kv_cache", cache_after[1])
+    record("before_swa_cache", cache_before[2])
+    record("after_swa_cache", cache_after[2])
+    if candidate_before is None or candidate_after is None:
+        raise ValueError("candidate pool state was not exposed by the reference model")
+    for prefix, value in (("before", candidate_before), ("after", candidate_after)):
+        if not isinstance(value, dict):
+            raise ValueError("candidate state must be a mapping")
+        for name in ("indices", "lengths", "topk_indices", "topk_lengths"):
+            if name not in value or value[name] is None:
+                raise ValueError(f"candidate state is missing {name}")
+            record(f"{prefix}_candidate_{name}", value[name])
+    state_meta = {
+        "complete": True,
+        "layer_id": int(layer_state.get("source_layer") or -1),
+        "compressed_kv_cache": {
+            "captured": True,
+            "before": "before_compressed_kv_cache",
+            "after": "after_compressed_kv_cache",
+        },
+        "index_cache": {
+            "captured": True,
+            "before": "before_index_cache",
+            "after": "after_index_cache",
+        },
+        "index_scale": {
+            "captured": True,
+            "before": "before_index_scale",
+            "after": "after_index_scale",
+        },
+        "candidate_pool": {
+            "captured": True,
+            "before": [
+                "before_candidate_indices",
+                "before_candidate_lengths",
+            ],
+            "after": [
+                "after_candidate_indices",
+                "after_candidate_lengths",
+            ],
+        },
+        "swa_cache": {
+            "captured": True,
+            "before": "before_swa_cache",
+            "after": "after_swa_cache",
+        },
+        "file": path.name,
+        "arrays": metadata,
+    }
+    np.savez_compressed(path, **arrays)
+    return state_meta
 
 
 def _patch_reference_mhc_fallback() -> dict[str, str]:
@@ -478,8 +914,13 @@ def _patch_reference_mhc_fallback() -> dict[str, str]:
         native_op = getattr(torch.ops._C_ascend, op_name)
 
         def normalize_cmp_ratio(*args, _native_op=native_op, **kwargs):
-            if not kwargs.get("has_cmp_kv", True) and kwargs.get("cmp_ratio") == 0:
-                kwargs["cmp_ratio"] = 1
+            # CANN 9.1's A3 metadata ABI accepts only the C4A compressed
+            # ratio when a compressed top-k plane is present.  vLLM's
+            # DeepSeek V4.1 config names the physical C2A layer as ratio 2;
+            # keep that model contract in the capture while adapting only
+            # this reference-native ABI boundary.
+            if kwargs.get("has_cmp_kv", False) and kwargs.get("cmp_topk", 0) and kwargs.get("cmp_ratio") == 2:
+                kwargs["cmp_ratio"] = 4
             return _native_op(*args, **kwargs)
 
         setattr(torch.ops._C_ascend, op_name, normalize_cmp_ratio)
@@ -501,6 +942,36 @@ def _patch_reference_mhc_fallback() -> dict[str, str]:
     # device_op imports the fused-MoE package; establish that package first
     # so the reference-only monkey patch does not enter its import cycle.
     import vllm_ascend.ops  # noqa: F401
+
+    # The pinned DeepSeek V4.1 path still calls the legacy CANN V2 metadata
+    # symbol when the packed-cache branch is disabled.  The A3 CANN image in
+    # this environment does not export that symbol, while the same pinned
+    # vLLM-Ascend checkout exposes the equivalent packaged dispatcher.  Keep
+    # this compatibility mapping inside the reference process only.
+    qli_metadata_fallback = "native_custom_transformer"
+    if os.environ.get("VLLM_CAPTURE_FORCE_QLI_PACKAGED") == "1":
+        from vllm_ascend.ops import packaged_attention
+
+        def qli_v2_metadata(*args, **kwargs):
+            positional = list(args)
+            if len(positional) >= 5:
+                kwargs.setdefault("num_heads_q", positional[0])
+                kwargs.setdefault("num_heads_k", positional[1])
+                kwargs.setdefault("head_dim", positional[2])
+                kwargs.setdefault("topk", positional[3])
+                kwargs.setdefault("quant_mode", positional[4])
+                positional = positional[5:]
+            if positional:
+                raise TypeError(f"unexpected QLI metadata positional arguments: {positional}")
+            kwargs.pop("quant_mode", None)
+            kwargs.pop("device", None)
+            return packaged_attention.quant_lightning_indexer_metadata(**kwargs)
+
+        # torch.ops namespaces materialize a lazy OpOverload even when its
+        # implementation is absent from libopapi.so. Force this mapping only
+        # when a caller explicitly requests the packaged diagnostic path.
+        torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata = qli_v2_metadata
+        qli_metadata_fallback = "packaged_attention.quant_lightning_indexer_metadata"
     from vllm_ascend.device.device_op import DeviceOperator
 
     DeviceOperator.rms_norm_cast = staticmethod(rms_norm_cast)
@@ -535,14 +1006,20 @@ def _patch_reference_mhc_fallback() -> dict[str, str]:
         "device": "NPU tensor operations",
         "rms_norm_cast": "torch_npu.npu_rms_norm",
         "topk_softplus_sqrt": "reference NPU softplus/sqrt + topk/hash",
-        "sparse_flash_mla_cmp_ratio": "reference ABI normalization 0->1 when has_cmp_kv=false",
+        "sparse_flash_mla_cmp_ratio": "reference ABI normalization 2->4 for compressed top-k on A3 CANN; preserve 0 when compressed KV is disabled",
         "partial_rotary_mul": "torch_npu.npu_rotary_mul on selected partial slice with in-place copy",
         "scatter_nd_update_sk": "torch_npu.npu_scatter_nd_update_ with padding-row filtering",
+        "quant_lightning_indexer_v2_metadata": qli_metadata_fallback,
     }
 
 
 def _patch_runner_capture(
-    output_dir: Path, rank: int, layer_id: int, *, skip_cache: bool = False
+    output_dir: Path,
+    rank: int,
+    layer_id: int,
+    layer_state: dict[str, Any],
+    *,
+    skip_cache: bool = False,
 ) -> None:
     """Patch only the reference runner; the patch never enters the product."""
 
@@ -571,11 +1048,27 @@ def _patch_runner_capture(
         if capture_this:
             state["layer_input"] = hidden_states.detach().cpu().clone()
             state["layer_pre_mix"] = pre_mix.detach().cpu().clone()
+            shared = getattr(getattr(self, "self_attn", None), "shared_state", None)
+            if shared is not None:
+                state["candidate_before"] = {
+                    "indices": shared.candidates.detach().cpu().clone(),
+                    "lengths": shared.candidate_lengths.detach().cpu().clone(),
+                    "topk_indices": shared.topk_indices.detach().cpu().clone(),
+                    "topk_lengths": shared.topk_lengths.detach().cpu().clone(),
+                }
             state["layer_input_captured"] = True
         result = original_layer_forward(self, positions, hidden_states, pre_mix, *args, **kwargs)
         if capture_this and isinstance(result, tuple):
             state["layer_output"] = result[0].detach().cpu().clone()
             state["layer_next_pre"] = result[1].detach().cpu().clone()
+            shared = getattr(getattr(self, "self_attn", None), "shared_state", None)
+            if shared is not None:
+                state["candidate_after"] = {
+                    "indices": shared.candidates.detach().cpu().clone(),
+                    "lengths": shared.candidate_lengths.detach().cpu().clone(),
+                    "topk_indices": shared.topk_indices.detach().cpu().clone(),
+                    "topk_lengths": shared.topk_lengths.detach().cpu().clone(),
+                }
         return result
 
     def wrapped_muls_add(x, y, scale):
@@ -702,21 +1195,35 @@ def _patch_runner_capture(
                 int(value) for value in batch.num_computed_tokens_cpu[: batch.num_reqs].tolist()
             ]
             if not state["skip_cache"]:
-                state["cache_before"] = _clone_cache(self.kv_caches)
+                state["cache_block_ids"] = _request_cache_blocks(batch, state["valid_lengths"])
+                state["cache_before"] = _clone_cache(
+                    self.kv_caches, state["cache_block_ids"]
+                )
                 state["cache_layout"] = [_cache_description(cache) for cache in self.kv_caches]
         result = original_execute(self, scheduler_output, intermediate_tensors)
         if is_decode and not state["captured"]:
             if not state["skip_cache"]:
-                state["cache_after"] = _clone_cache(self.kv_caches)
+                state["cache_after"] = _clone_cache(
+                    self.kv_caches, state["cache_block_ids"]
+                )
             state["result_type"] = type(result).__name__
             state["captured"] = True
             state["decode"] = False
             rank_dir = output_dir / f"rank{rank}"
             rank_dir.mkdir(parents=True, exist_ok=True)
             npz_meta = {}
+            layer_state_meta = None
             if not state["skip_cache"]:
                 npz_meta = _save_cache_npz(
                     rank_dir / "history_cache.npz", state["cache_before"], state["cache_after"]
+                )
+                layer_state_meta = _save_layer_state_npz(
+                    rank_dir / "layer_state_capture.npz",
+                    state["cache_before"],
+                    state["cache_after"],
+                    state.get("candidate_before"),
+                    state.get("candidate_after"),
+                    layer_state,
                 )
             moe_meta = None
             if (
@@ -796,7 +1303,9 @@ def _patch_runner_capture(
                 "slot_mapping": state.get("slot_mapping"),
                 "valid_lengths": state.get("valid_lengths"),
                 "cache_layout": state.get("cache_layout"),
+                "cache_block_ids": state.get("cache_block_ids"),
                 "cache_arrays": npz_meta,
+                "layer_state_capture": layer_state_meta,
                 "hidden": _tensor_to_list(state["hidden"]) if "hidden" in state else None,
                 "moe_capture": moe_meta,
                 "layer_capture": layer_meta,
@@ -1068,7 +1577,19 @@ def _assemble_existing(args: argparse.Namespace) -> int:
 def _run_capture(args: argparse.Namespace) -> int:
     output_dir = args.output.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.layer_only:
+        os.environ["VLLM_CAPTURE_LAYER_ONLY"] = "1"
     ascend_home_identity = _prepare_reference_ascend_home(output_dir)
+    root = args.release_root.resolve()
+    vendor_root = root / "source/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer"
+    vendor_lib = vendor_root / "op_api/lib"
+    if vendor_lib.is_dir():
+        os.environ["ASCEND_CUSTOM_OPP_PATH"] = ":".join(
+            item for item in (str(vendor_root), os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")) if item
+        )
+        os.environ["LD_LIBRARY_PATH"] = ":".join(
+            item for item in (str(vendor_lib), os.environ.get("LD_LIBRARY_PATH", "")) if item
+        )
     # Triton A2/A3 compilation creates nested temporary files. The activated
     # reference env points TMPDIR at an NFS cache whose cleanup is racy across
     # external-launcher ranks, so keep only this process's scratch files local.
@@ -1088,7 +1609,22 @@ def _run_capture(args: argparse.Namespace) -> int:
         raise RuntimeError(f"SOC_VERSION must be {EXPECTED_SOC}")
     if not os.environ.get("TASK_DEVICE"):
         raise RuntimeError("capture must run through task-submit with TASK_DEVICE")
-    root = args.release_root.resolve()
+    task_devices = {
+        item.strip()
+        for item in os.environ["TASK_DEVICE"].split(",")
+        if item.strip()
+    }
+    visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+    visible_set = {item.strip() for item in visible_devices.split(",") if item.strip()}
+    if not visible_set:
+        raise RuntimeError(
+            "capture must export ASCEND_RT_VISIBLE_DEVICES to the queued TASK_DEVICE set"
+        )
+    if visible_set != task_devices:
+        raise RuntimeError(
+            "ASCEND_RT_VISIBLE_DEVICES must match TASK_DEVICE: "
+            f"visible={visible_devices!r}, task={os.environ['TASK_DEVICE']!r}"
+        )
     identity = _module_identity(root)
     identity["ascend_home"] = ascend_home_identity
     rank = int(os.environ.get("RANK", "0"))
@@ -1096,13 +1632,13 @@ def _run_capture(args: argparse.Namespace) -> int:
     if world != 2:
         raise RuntimeError(f"reference capture requires two external-launcher ranks, got {world}")
     temporary_root = output_dir / f"reference_model_l{args.layer_id}"
-    if rank == 0 and temporary_root.exists():
+    if rank == 0 and temporary_root.exists() and not (temporary_root / ".ready").is_file():
         shutil.rmtree(temporary_root)
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
     # Both external-launcher ranks share the output filesystem.  Publish the
     # symlink view once, otherwise concurrent tokenizer links race at startup.
-    if rank == 0:
+    if rank == 0 and not (temporary_root / ".ready").is_file():
         _make_layer_root(args.checkpoint.resolve(), temporary_root, args.layer_id)
     else:
         _wait_for_layer_root(temporary_root)
@@ -1111,7 +1647,20 @@ def _run_capture(args: argparse.Namespace) -> int:
             "the shared CANN runtime has no aclnnHcPre/aclnnHcPost; rerun with --mhc-mode fallback"
         )
     mhc_identity = _patch_reference_mhc_fallback()
-    _patch_runner_capture(output_dir, rank, args.layer_id, skip_cache=args.skip_cache)
+    layer_only_identity = (
+        _patch_layer_only_model(args.layer_id) if args.layer_only else {"enabled": False}
+    )
+    cache_group_identity = (
+        _patch_empty_state_cache_group() if args.layer_only else {"enabled": False}
+    )
+    layer_state = _layer_state_contract(args.checkpoint.resolve(), args.layer_id)
+    _patch_runner_capture(
+        output_dir,
+        rank,
+        args.layer_id,
+        layer_state,
+        skip_cache=args.skip_cache,
+    )
 
     llm = LLM(
         model=str(temporary_root),
@@ -1130,6 +1679,7 @@ def _run_capture(args: argparse.Namespace) -> int:
         block_size=128,
         enforce_eager=True,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        cpu_offload_gb=args.cpu_offload_gb,
         disable_custom_all_reduce=True,
         trust_remote_code=False,
         seed=17,
@@ -1162,7 +1712,11 @@ def _run_capture(args: argparse.Namespace) -> int:
         cache_path = output_dir / f"rank{peer}" / "history_cache.npz"
         if not record_path.is_file() or (not args.skip_cache and not cache_path.is_file()):
             raise RuntimeError(f"rank {peer} did not produce a capture")
+        if not args.skip_cache and not (output_dir / f"rank{peer}" / "layer_state_capture.npz").is_file():
+            raise RuntimeError(f"rank {peer} did not produce the physical layer state capture")
         rank_records.append(json.loads(record_path.read_text(encoding="utf-8")))
+
+    rank_state = rank_records[0].get("layer_state_capture") or {}
 
     import numpy as np
 
@@ -1218,6 +1772,11 @@ def _run_capture(args: argparse.Namespace) -> int:
         "topology": {**TOPOLOGY, "devices": 2},
         "runtime_identity": identity,
         "reference_mhc": mhc_identity,
+        "layer_only_reference": layer_only_identity,
+        "cache_group_reference": cache_group_identity,
+        "input_boundary_mode": (
+            "target_layer_with_identity_prefix" if args.layer_only else "truncated_physical_prefix"
+        ),
     }
     (asset_root / "decode_input.json").write_text(json.dumps(decode_input, indent=2) + "\n", encoding="utf-8")
 
@@ -1243,6 +1802,7 @@ def _run_capture(args: argparse.Namespace) -> int:
                 "capture_file": f"rank{record['rank']}/capture.json",
                 "cache_layout": record["cache_layout"],
                 "cache_arrays": record["cache_arrays"],
+                "layer_state_capture": record.get("layer_state_capture"),
                 "hidden_shape": [len(record["hidden"]), len(record["hidden"][0])] if record.get("hidden") else None,
                 "moe_capture": record.get("moe_capture"),
                 "layer_capture": record.get("layer_capture"),
@@ -1252,6 +1812,20 @@ def _run_capture(args: argparse.Namespace) -> int:
         ],
         "runtime_identity": identity,
         "reference_mhc": mhc_identity,
+        "layer_state_capture": {
+            "complete": all(record.get("layer_state_capture", {}).get("complete") is True for record in rank_records),
+            "compressed_kv_cache": rank_state.get("compressed_kv_cache", {"captured": False}),
+            "index_cache": rank_state.get("index_cache", {"captured": False}),
+            "index_scale": rank_state.get("index_scale", {"captured": False}),
+            "candidate_pool": rank_state.get("candidate_pool", {"captured": False}),
+            "swa_cache": rank_state.get("swa_cache", {"captured": False}),
+            "per_rank": [record.get("layer_state_capture") for record in rank_records],
+        },
+        "layer_only_reference": layer_only_identity,
+        "cache_group_reference": cache_group_identity,
+        "input_boundary_mode": (
+            "target_layer_with_identity_prefix" if args.layer_only else "truncated_physical_prefix"
+        ),
         "input_contract": (
             "decode-token-cache-request-state-v1"
             if not args.skip_cache
@@ -1275,9 +1849,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument(
+        "--layer-only",
+        action="store_true",
+        help="reference-only: instantiate only the requested physical layer and identity placeholders",
+    )
     parser.add_argument("--history-length", type=int, default=8)
     parser.add_argument("--max-model-len", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument(
+        "--cpu-offload-gb",
+        type=float,
+        default=0.0,
+        help="reference-only vLLM CPU weight offload budget per rank",
+    )
     parser.add_argument("--assemble-existing", action="store_true")
     parser.add_argument(
         "--skip-cache",

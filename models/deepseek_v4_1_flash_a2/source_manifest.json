@@ -1041,7 +1041,7 @@
     },
     {
       "file": "decode_asset_contract.py",
-      "sha256": "0bcb5a9b51087d040cb33f71ffd76ab89f3fb80f4ffc4e7cb521495ee5d4be68",
+      "sha256": "15f98bd11bd1b62e8063a1dce15459a74b91214ee12fcd5540249e886750e318",
       "role": "fail-closed Decode input/cache/reference asset structure verifier",
       "product_compute": false,
       "accuracy_evidence": "not_run"
