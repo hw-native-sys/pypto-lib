@@ -16,10 +16,19 @@ arrive already grouped: slot ``i`` holds the rows routed to expert
 """
 
 import pypto.language as pl
-from fp32_numerics import rne_exp_signed
+if __package__:
+    from .fp32_numerics import rne_exp_signed
+else:
+    from fp32_numerics import rne_exp_signed
 
-from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
-from decode_shapes import DECODE_BATCH, DECODE_SEQ, TP
+if __package__:
+    from .config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+else:
+    from config import FLASH as M, INT8_SCALE_MAX, INT8_AMAX_EPS
+if __package__:
+    from .decode_shapes import DECODE_BATCH, DECODE_SEQ, TP
+else:
+    from decode_shapes import DECODE_BATCH, DECODE_SEQ, TP
 
 
 # model config
@@ -400,7 +409,11 @@ def expert_routed_test(
 def golden_expert_routed(tensors):
     """Integer-accumulate W8A8 reference for one TP intermediate partition."""
     import torch
-    from utils import int8_quant_per_row
+
+    if __package__:
+        from .utils import int8_quant_per_row
+    else:
+        from utils import int8_quant_per_row
 
     counts = tensors["recv_expert_count"]
     recv_y = torch.zeros_like(tensors["recv_y"], dtype=torch.float32)
@@ -519,7 +532,10 @@ def build_tensor_specs(merged=False):
     MXFP8, not MXFP4 -- so the merge does not silently change the numerics the
     shared path is validated against).
     """
-    from utils import int8_quant_per_row
+    if __package__:
+        from .utils import int8_quant_per_row
+    else:
+        from utils import int8_quant_per_row
     import torch
     from golden import TensorSpec
 
@@ -588,7 +604,10 @@ def build_tensor_specs(merged=False):
     # Only the slot experts are ever read, so synthesize N_SLOTS weight sets and
     # scatter them into the full expert bank; the rest stay zero.
     def scatter_bank(shape_tail, dequant_std, shared_dequant_std, chan_cv):
-        from utils import gen_shared_weight
+        if __package__:
+            from .utils import gen_shared_weight
+        else:
+            from utils import gen_shared_weight
 
         w_i8, w_s = gen_routed_weight((N_SLOTS, *shape_tail), dequant_std)
         bank_i8 = torch.zeros(n_bank, *shape_tail, dtype=torch.int8)

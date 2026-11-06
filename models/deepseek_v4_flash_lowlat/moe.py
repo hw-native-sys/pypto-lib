@@ -25,15 +25,34 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import FLASH as M
-from decode_shapes import MOE_TOKENS, TP
-from expert_routed import (
-    IDX_PAD, N_BANK, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT,
-)
-from expert_routed_persistent_balanced import WORK_SLOTS_PAD, expert_routed_persistent_planned
-from gate import gate, ROUTE_ROW_PAD
-from hc_post import hc_post
-from hc_pre import hc_pre
+if __package__:
+    from .config import FLASH as M
+else:
+    from config import FLASH as M
+if __package__:
+    from .decode_shapes import MOE_TOKENS, TP
+else:
+    from decode_shapes import MOE_TOKENS, TP
+if __package__:
+    from .expert_routed import IDX_PAD, N_BANK, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT
+else:
+    from expert_routed import IDX_PAD, N_BANK, N_SLOTS_B, RECV_MAX, SHARED_EID, SH_SLOT
+if __package__:
+    from .expert_routed_persistent_balanced import WORK_SLOTS_PAD, expert_routed_persistent_planned
+else:
+    from expert_routed_persistent_balanced import WORK_SLOTS_PAD, expert_routed_persistent_planned
+if __package__:
+    from .gate import gate, ROUTE_ROW_PAD
+else:
+    from gate import gate, ROUTE_ROW_PAD
+if __package__:
+    from .hc_post import hc_post
+else:
+    from hc_post import hc_post
+if __package__:
+    from .hc_pre import hc_pre
+else:
+    from hc_pre import hc_pre
 
 
 # model config
@@ -66,13 +85,16 @@ def clear_moe_signals(
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
 ):
     """Clear this rank's all-reduce counters after its final MoE completes."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear", allow_early_resolve=True):
+    with pl.at(
+        level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear", allow_early_resolve=True
+    ) as s6_moe_cleanup_tid:
         # The final MoE output depends on this rank observing every peer's final
         # publish notify, so no peer can issue another one in this forward.
         _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
         zero = pl.cast(0, pl.INT32)
         for src in pl.range(N_RANKS):
             pl.write(reduce_signal, [src, 0], zero)
+    return s6_moe_cleanup_tid
 
 
 # === Routing ================================================================
@@ -275,6 +297,83 @@ def reduce_ffn_tp1(
 
 
 @pl.jit.inline(auto_scope=False)
+def prepare_moe(
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
+    comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    hc_pre(
+        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        x_mixed, post_ffn, comb_ffn,
+    )
+
+    x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
+    x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32, manual_dep=True)
+    indices = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.INT32)
+    weights = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.FP32)
+    gate(
+        x_mixed, norm_w, gate_w, gate_bias,
+        layer_id, num_tokens, tid2eid, input_ids,
+        x_norm_i8, x_norm_scale, indices, weights,
+    )
+
+    recv_x = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.INT8)
+    recv_scale = pl.create_tensor([N_SLOTS_B, RECV_MAX], dtype=pl.FP32)
+    recv_w = pl.create_tensor([N_SLOTS_B, RECV_MAX], dtype=pl.FP32)
+    work_slot = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+    work_rows = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
+    slot_expert = pl.create_tensor([N_SLOTS_B, IDX_PAD], dtype=pl.INT32)
+    route_slot_row = pl.create_tensor([N_ROUTES, IDX_PAD], dtype=pl.INT32)
+    route_group(
+        indices, weights, x_norm_i8, x_norm_scale,
+        recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row,
+        num_tokens,
+    )
+    return post_ffn, comb_ffn, recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row
+
+
+@pl.jit.inline(auto_scope=False)
+def moe_local(
+    recv_x: pl.Tensor[[N_SLOTS_B, RECV_MAX, D], pl.INT8],
+    recv_scale: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    recv_w: pl.Tensor[[N_SLOTS_B, RECV_MAX], pl.FP32],
+    work_slot: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    work_rows: pl.Tensor[[WORK_SLOTS_PAD], pl.INT32],
+    slot_expert: pl.Tensor[[N_SLOTS_B, IDX_PAD], pl.INT32],
+    route_slot_row: pl.Tensor[[N_ROUTES, IDX_PAD], pl.INT32],
+    routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_BANK, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_BANK, D], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    recv_y = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.BF16)
+    expert_routed_persistent_planned(
+        recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        recv_y,
+    )
+
+    ffn_partial = pl.create_tensor([T, D], dtype=pl.FP32)
+    combine_local(recv_y, route_slot_row, ffn_partial, num_tokens)
+    return ffn_partial
+
+
+@pl.jit.inline(auto_scope=False)
 def moe(
     # model inputs
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -306,48 +405,18 @@ def moe(
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     # Non-output intermediates allocate locally, in their producer's scope.
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
-    post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
-    comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(
-        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, post_ffn, comb_ffn,
-    )
-
-    x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
-    x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32, manual_dep=True)
-    indices = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.INT32)
-    weights = pl.create_tensor([T, ROUTE_ROW_PAD], dtype=pl.FP32)
-    gate(
-        x_mixed, norm_w, gate_w, gate_bias,
-        layer_id, num_tokens, tid2eid, input_ids,
-        x_norm_i8, x_norm_scale, indices, weights,
-    )
-
-    recv_x = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.INT8)
-    recv_scale = pl.create_tensor([N_SLOTS_B, RECV_MAX], dtype=pl.FP32)
-    recv_w = pl.create_tensor([N_SLOTS_B, RECV_MAX], dtype=pl.FP32)
-    work_slot = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
-    work_rows = pl.create_tensor([WORK_SLOTS_PAD], dtype=pl.INT32)
-    slot_expert = pl.create_tensor([N_SLOTS_B, IDX_PAD], dtype=pl.INT32)
-    route_slot_row = pl.create_tensor([N_ROUTES, IDX_PAD], dtype=pl.INT32)
-    route_group(
-        indices, weights, x_norm_i8, x_norm_scale,
-        recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row,
-        num_tokens,
+    (post_ffn, comb_ffn, recv_x, recv_scale, recv_w, work_slot, work_rows,
+     slot_expert, route_slot_row) = prepare_moe(
+        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias,
+        tid2eid, input_ids, layer_id, num_tokens,
     )
 
     with pl.scope():
-        recv_y = pl.create_tensor([N_SLOTS_B, RECV_MAX, D], dtype=pl.BF16)
-        expert_routed_persistent_planned(
-            recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert,
+        ffn_partial = moe_local(
+            recv_x, recv_scale, recv_w, work_slot, work_rows, slot_expert, route_slot_row,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-            routed_w2, routed_w2_scale,
-            recv_y,
+            routed_w2, routed_w2_scale, num_tokens,
         )
-
-        ffn_partial = pl.create_tensor([T, D], dtype=pl.FP32)
-        combine_local(recv_y, route_slot_row, ffn_partial, num_tokens)
 
         ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
         if N_RANKS == 1:
@@ -445,10 +514,23 @@ def l3_moe(
 def golden_moe(tensors):
     """Per-rank routing, integer expert partitions and ordered FP32 TP reduction."""
     import torch
-    from hc_pre import golden_hc_pre
-    from hc_post import golden_hc_post
-    from gate import golden_gate_core
-    from expert_routed import golden_expert_routed
+
+    if __package__:
+        from .hc_pre import golden_hc_pre
+    else:
+        from hc_pre import golden_hc_pre
+    if __package__:
+        from .hc_post import golden_hc_post
+    else:
+        from hc_post import golden_hc_post
+    if __package__:
+        from .gate import golden_gate_core
+    else:
+        from gate import golden_gate_core
+    if __package__:
+        from .expert_routed import golden_expert_routed
+    else:
+        from expert_routed import golden_expert_routed
 
     counts = tensors.get("num_tokens_per_owner", tensors.get("num_tokens", T))
     counts = torch.as_tensor(counts).reshape(-1)
@@ -464,25 +546,39 @@ def golden_moe(tensors):
         x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
         post_ffn = torch.zeros(T, HC_MULT, dtype=torch.float32)
         comb_ffn = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
-        golden_hc_pre({
-            "x": tensors["x_hc"][rank], "hc_fn": tensors["hc_ffn_fn"][rank],
-            "hc_scale": tensors["hc_ffn_scale"][rank], "hc_base": tensors["hc_ffn_base"][rank],
-            "x_mixed": x_mixed, "post": post_ffn, "comb": comb_ffn,
-        })
+        golden_hc_pre(
+            {
+                "x": tensors["x_hc"][rank],
+                "hc_fn": tensors["hc_ffn_fn"][rank],
+                "hc_scale": tensors["hc_ffn_scale"][rank],
+                "hc_base": tensors["hc_ffn_base"][rank],
+                "x_mixed": x_mixed,
+                "post": post_ffn,
+                "comb": comb_ffn,
+            }
+        )
         posts.append(post_ffn)
         combs.append(comb_ffn)
         x_norm_i8 = torch.zeros(T, D, dtype=torch.int8)
         x_norm_scale = torch.zeros(T, 1, dtype=torch.float32)
         indices = torch.zeros(T, TOPK, dtype=torch.int32)
         weights = torch.zeros(T, TOPK, dtype=torch.float32)
-        golden_gate_core({
-            "x_mixed": x_mixed, "norm_w": tensors["norm_w"][rank],
-            "gate_w": tensors["gate_w"][rank], "gate_bias": tensors["gate_bias"][rank],
-            "layer_id": tensors["layer_id"], "num_tokens": num_tokens,
-            "tid2eid": tensors["tid2eid"][rank], "input_ids": tensors["input_ids"][rank],
-            "x_norm_i8": x_norm_i8, "x_norm_scale": x_norm_scale,
-            "indices": indices, "weights": weights,
-        })
+        golden_gate_core(
+            {
+                "x_mixed": x_mixed,
+                "norm_w": tensors["norm_w"][rank],
+                "gate_w": tensors["gate_w"][rank],
+                "gate_bias": tensors["gate_bias"][rank],
+                "layer_id": tensors["layer_id"],
+                "num_tokens": num_tokens,
+                "tid2eid": tensors["tid2eid"][rank],
+                "input_ids": tensors["input_ids"][rank],
+                "x_norm_i8": x_norm_i8,
+                "x_norm_scale": x_norm_scale,
+                "indices": indices,
+                "weights": weights,
+            }
+        )
         # Batch routed token/expert pairs and the ungated shared expert.
         slot_of_expert = {}
         slot_expert = torch.zeros(N_SLOTS_B, IDX_PAD, dtype=torch.int32)
@@ -512,13 +608,28 @@ def golden_moe(tensors):
             recv_w[SH_SLOT, t] = 1.0
             recv_x[SH_SLOT, t, :] = x_norm_i8[t, :]
         recv_y = torch.zeros(N_SLOTS_B, RECV_MAX, D, dtype=torch.bfloat16)
-        expert_inputs = {name: tensors[name][rank] for name in (
-            "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale", "routed_w2", "routed_w2_scale",
-        )}
-        golden_expert_routed(dict(
-            expert_inputs, recv_x=recv_x, recv_scale_dq=recv_scale, recv_weights=recv_w,
-            recv_expert_count=recv_count, slot_expert=slot_expert, recv_y=recv_y,
-        ))
+        expert_inputs = {
+            name: tensors[name][rank]
+            for name in (
+                "routed_w1",
+                "routed_w1_scale",
+                "routed_w3",
+                "routed_w3_scale",
+                "routed_w2",
+                "routed_w2_scale",
+            )
+        }
+        golden_expert_routed(
+            dict(
+                expert_inputs,
+                recv_x=recv_x,
+                recv_scale_dq=recv_scale,
+                recv_weights=recv_w,
+                recv_expert_count=recv_count,
+                slot_expert=slot_expert,
+                recv_y=recv_y,
+            )
+        )
         recv_y_flat = recv_y.reshape(N_SLOTS_B * RECV_MAX, D).float()
         partial = torch.zeros(T, D, dtype=torch.float32)
         for token in range(num_tokens):
@@ -531,10 +642,15 @@ def golden_moe(tensors):
         ffn_sum = ffn_sum + partial
     ffn_out = ffn_sum.to(torch.bfloat16)
     for rank in range(N_RANKS):
-        golden_hc_post({
-            "x": ffn_out, "residual": tensors["x_hc"][rank],
-            "post": posts[rank], "comb": combs[rank], "y": tensors["x_next"][rank],
-        })
+        golden_hc_post(
+            {
+                "x": ffn_out,
+                "residual": tensors["x_hc"][rank],
+                "post": posts[rank],
+                "comb": combs[rank],
+                "y": tensors["x_next"][rank],
+            }
+        )
 
 
 # Seed for the decode routing draw used by the layer / full-forward fixtures.
@@ -568,8 +684,15 @@ def decode_route_rows():
 def build_tensor_specs(layer_id=0, num_tokens=T):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from expert_routed import gen_routed_weight
-    from utils import gen_shared_weight
+
+    if __package__:
+        from .expert_routed import gen_routed_weight
+    else:
+        from expert_routed import gen_routed_weight
+    if __package__:
+        from .utils import gen_shared_weight
+    else:
+        from utils import gen_shared_weight
 
     # Routed = MXFP4 (gen_routed_weight), shared = MXFP8 (gen_shared_weight). This
     # is an integration test whose x_next-equivalent output is dominated by near-zero
@@ -599,21 +722,41 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
         return replicate(torch.tensor([0.11334, 0.035901, 0.058183]))
 
     def init_hc_ffn_base():
-        base = torch.tensor([
-            2.4153, -2.0252, -2.0019, -2.1947,
-            -1.5430, -3.0228, -6.8248, 0.5894,
-            2.1916, -7.2132, -3.0938, -2.1119,
-            -3.0161, 3.3293, -3.2224, -4.0226,
-            -2.0428, -3.3478, 3.0893, -3.4166,
-            -1.8144, -3.8147, -3.1307, 1.7862,
-        ])
+        base = torch.tensor(
+            [
+                2.4153,
+                -2.0252,
+                -2.0019,
+                -2.1947,
+                -1.5430,
+                -3.0228,
+                -6.8248,
+                0.5894,
+                2.1916,
+                -7.2132,
+                -3.0938,
+                -2.1119,
+                -3.0161,
+                3.3293,
+                -3.2224,
+                -4.0226,
+                -2.0428,
+                -3.3478,
+                3.0893,
+                -3.4166,
+                -1.8144,
+                -3.8147,
+                -3.1307,
+                1.7862,
+            ]
+        )
         return replicate(base)
 
     def init_norm_w():
         return replicate(torch.ones(D))
 
     def init_gate_w():
-        return replicate(torch.randn(N_EXPERTS, D) / D ** 0.5)
+        return replicate(torch.randn(N_EXPERTS, D) / D**0.5)
 
     def init_gate_bias():
         return replicate(torch.zeros(N_EXPERTS))
@@ -674,24 +817,24 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
     rw2_i8, rw2_s = merge_bank(rw2_i8, sw2_i8), merge_bank(rw2_s, sw2_s)
 
     specs = [
-        TensorSpec("x_hc",          [N_RANKS, T, HC_MULT, D],     torch.float32, init_value=init_x_hc),
-        TensorSpec("hc_ffn_fn",     [N_RANKS, MIX_HC, HC_DIM],       torch.float32,  init_value=init_hc_ffn_fn),
-        TensorSpec("hc_ffn_scale",  [N_RANKS, 3],                    torch.float32,  init_value=init_hc_ffn_scale),
-        TensorSpec("hc_ffn_base",   [N_RANKS, MIX_HC],               torch.float32,  init_value=init_hc_ffn_base),
-        TensorSpec("norm_w",        [N_RANKS, D],                    torch.bfloat16,  init_value=init_norm_w),
-        TensorSpec("gate_w",        [N_RANKS, N_EXPERTS, D],         torch.float32,  init_value=init_gate_w),
-        TensorSpec("gate_bias",     [N_RANKS, N_EXPERTS],            torch.float32,  init_value=init_gate_bias),
-        TensorSpec("tid2eid",       [N_RANKS, VOCAB, TOPK],          torch.int32,    init_value=init_tid2eid),
-        TensorSpec("input_ids",     [N_RANKS, T],                 torch.int64,    init_value=init_input_ids),
-        TensorSpec("routed_w1",        [N_RANKS, N_BANK, MOE_INTER, D], torch.int8,    init_value=lambda: rw1_i8),
-        TensorSpec("routed_w1_scale",  [N_RANKS, N_BANK, MOE_INTER],    torch.float32, init_value=lambda: rw1_s),
-        TensorSpec("routed_w3",        [N_RANKS, N_BANK, MOE_INTER, D], torch.int8,    init_value=lambda: rw3_i8),
-        TensorSpec("routed_w3_scale",  [N_RANKS, N_BANK, MOE_INTER],    torch.float32, init_value=lambda: rw3_s),
-        TensorSpec("routed_w2",        [N_RANKS, N_BANK, D, MOE_INTER], torch.int8,    init_value=lambda: rw2_i8),
-        TensorSpec("routed_w2_scale",  [N_RANKS, N_BANK, D],            torch.float32, init_value=lambda: rw2_s),
-        TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.float32),
-        ScalarSpec("layer_id",         torch.int32,                      layer_id),
-        ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
+        TensorSpec("x_hc", [N_RANKS, T, HC_MULT, D], torch.float32, init_value=init_x_hc),
+        TensorSpec("hc_ffn_fn", [N_RANKS, MIX_HC, HC_DIM], torch.float32, init_value=init_hc_ffn_fn),
+        TensorSpec("hc_ffn_scale", [N_RANKS, 3], torch.float32, init_value=init_hc_ffn_scale),
+        TensorSpec("hc_ffn_base", [N_RANKS, MIX_HC], torch.float32, init_value=init_hc_ffn_base),
+        TensorSpec("norm_w", [N_RANKS, D], torch.bfloat16, init_value=init_norm_w),
+        TensorSpec("gate_w", [N_RANKS, N_EXPERTS, D], torch.float32, init_value=init_gate_w),
+        TensorSpec("gate_bias", [N_RANKS, N_EXPERTS], torch.float32, init_value=init_gate_bias),
+        TensorSpec("tid2eid", [N_RANKS, VOCAB, TOPK], torch.int32, init_value=init_tid2eid),
+        TensorSpec("input_ids", [N_RANKS, T], torch.int64, init_value=init_input_ids),
+        TensorSpec("routed_w1", [N_RANKS, N_BANK, MOE_INTER, D], torch.int8, init_value=lambda: rw1_i8),
+        TensorSpec("routed_w1_scale", [N_RANKS, N_BANK, MOE_INTER], torch.float32, init_value=lambda: rw1_s),
+        TensorSpec("routed_w3", [N_RANKS, N_BANK, MOE_INTER, D], torch.int8, init_value=lambda: rw3_i8),
+        TensorSpec("routed_w3_scale", [N_RANKS, N_BANK, MOE_INTER], torch.float32, init_value=lambda: rw3_s),
+        TensorSpec("routed_w2", [N_RANKS, N_BANK, D, MOE_INTER], torch.int8, init_value=lambda: rw2_i8),
+        TensorSpec("routed_w2_scale", [N_RANKS, N_BANK, D], torch.float32, init_value=lambda: rw2_s),
+        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32),
+        ScalarSpec("layer_id", torch.int32, layer_id),
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
     ]
 
     # Keep the static weight parameters device-resident (child_memory), sharded
@@ -699,12 +842,23 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
     # as weight[r] and dispatched to device=r; resident="stacked" uploads shard r
     # to card r once and reuses it across dispatches, skipping the per-dispatch
     # H2D/D2H.
-    RESIDENT_WEIGHT_NAMES = frozenset([
-        "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
-        "gate_w", "gate_bias", "tid2eid",
-        "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
-        "routed_w2", "routed_w2_scale",
-    ])
+    RESIDENT_WEIGHT_NAMES = frozenset(
+        [
+            "hc_ffn_fn",
+            "hc_ffn_scale",
+            "hc_ffn_base",
+            "norm_w",
+            "gate_w",
+            "gate_bias",
+            "tid2eid",
+            "routed_w1",
+            "routed_w1_scale",
+            "routed_w3",
+            "routed_w3_scale",
+            "routed_w2",
+            "routed_w2_scale",
+        ]
+    )
     for spec in specs:
         if spec.name in RESIDENT_WEIGHT_NAMES:
             spec.resident = "stacked"

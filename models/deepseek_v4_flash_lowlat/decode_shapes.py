@@ -10,12 +10,17 @@
 
 import os
 
-from config import FLASH, _parse_int_argv
+if __package__:
+    from .config import FLASH, _parse_int_argv
+else:
+    from config import FLASH, _parse_int_argv
 
 
 # Deployment constants
 DECODE_BATCH = 1                     # B: requests per decode step
-DSPARK_SPEC_TOKENS = 7               # drafts the DSpark drafter proposes per request
+DSPARK_SPEC_TOKENS = _parse_int_argv("--spec-tokens", 7)
+if not 0 <= DSPARK_SPEC_TOKENS <= 7:
+    raise ValueError("--spec-tokens must be in [0, 7]")
 DECODE_SEQ = 1 + DSPARK_SPEC_TOKENS  # S: tokens the target model verifies per step
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 

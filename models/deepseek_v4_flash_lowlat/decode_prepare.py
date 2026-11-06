@@ -10,12 +10,27 @@
 
 import pypto.language as pl
 
-from config import FLASH as M
-from decode_shapes import BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, C128_COMPRESSOR_BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ, IDX_CACHE_MAX_BLOCKS, KV_CMP_MAX_BLOCKS, KV_ORI_TABLE_MAX_BLOCKS
+if __package__:
+    from .config import FLASH as M
+else:
+    from config import FLASH as M
+if __package__:
+    from .decode_shapes import (
+        BLOCK_SIZE,
+        C4A_COMPRESSOR_BLOCK_SIZE,
+        C128_COMPRESSOR_BLOCK_SIZE,
+        DECODE_BATCH,
+        DECODE_SEQ,
+        IDX_CACHE_MAX_BLOCKS,
+        KV_CMP_MAX_BLOCKS,
+        KV_ORI_TABLE_MAX_BLOCKS,
+    )
+else:
+    from decode_shapes import BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, C128_COMPRESSOR_BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ, IDX_CACHE_MAX_BLOCKS, KV_CMP_MAX_BLOCKS, KV_ORI_TABLE_MAX_BLOCKS
 
 
 # Dynamic shape variables.
-VOCAB_DYN = pl.dynamic("PACK_X_HC_VOCAB_DYN")
+VOCAB_DYN = pl.dynamic('LOWLAT_TARGET_PACK_X_HC_VOCAB_DYN')
 
 # model config
 B = DECODE_BATCH
@@ -376,7 +391,11 @@ def pack_mtp_hidden(
 def golden_decode_metadata(tensors):
     """Lower actual request tables/counts to the metadata consumed by the forward."""
     import torch
-    from utils import ori_slot_mapping, swa_indices_and_lens
+
+    if __package__:
+        from .utils import ori_slot_mapping, swa_indices_and_lens
+    else:
+        from utils import ori_slot_mapping, swa_indices_and_lens
 
     positions = tensors["position_ids"].reshape(B, S).to(torch.int64)
     table = tensors["block_table"]
@@ -390,12 +409,54 @@ def golden_decode_metadata(tensors):
     }
     counts = tensors["block_counts"]
     groups = (
-        ("hca_cmp_slot_mapping", "hca_cmp_block_table", GROUP_HCA_CMP, BLOCK_SIZE, HCA_CMP_STORAGE_BLOCK_SIZE, HCA_COMPRESS_RATIO),
-        ("csa_cmp_slot_mapping", "csa_cmp_block_table", GROUP_CSA_CMP, BLOCK_SIZE, CSA_CMP_STORAGE_BLOCK_SIZE, CSA_COMPRESS_RATIO),
-        ("csa_idx_slot_mapping", "idx_block_table", GROUP_IDX, BLOCK_SIZE, CSA_CMP_STORAGE_BLOCK_SIZE, CSA_COMPRESS_RATIO),
-        ("hca_state_slot_mapping", "hca_compress_state_block_table", GROUP_HCA_STATE, C128_COMPRESSOR_BLOCK_SIZE, C128_COMPRESSOR_BLOCK_SIZE, 1),
-        ("csa_state_slot_mapping", "csa_compress_state_block_table", GROUP_CSA_STATE, C4A_COMPRESSOR_BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, 1),
-        ("csa_inner_state_slot_mapping", "csa_inner_compress_state_block_table", GROUP_CSA_INNER_STATE, C4A_COMPRESSOR_BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, 1),
+        (
+            "hca_cmp_slot_mapping",
+            "hca_cmp_block_table",
+            GROUP_HCA_CMP,
+            BLOCK_SIZE,
+            HCA_CMP_STORAGE_BLOCK_SIZE,
+            HCA_COMPRESS_RATIO,
+        ),
+        (
+            "csa_cmp_slot_mapping",
+            "csa_cmp_block_table",
+            GROUP_CSA_CMP,
+            BLOCK_SIZE,
+            CSA_CMP_STORAGE_BLOCK_SIZE,
+            CSA_COMPRESS_RATIO,
+        ),
+        (
+            "csa_idx_slot_mapping",
+            "idx_block_table",
+            GROUP_IDX,
+            BLOCK_SIZE,
+            CSA_CMP_STORAGE_BLOCK_SIZE,
+            CSA_COMPRESS_RATIO,
+        ),
+        (
+            "hca_state_slot_mapping",
+            "hca_compress_state_block_table",
+            GROUP_HCA_STATE,
+            C128_COMPRESSOR_BLOCK_SIZE,
+            C128_COMPRESSOR_BLOCK_SIZE,
+            1,
+        ),
+        (
+            "csa_state_slot_mapping",
+            "csa_compress_state_block_table",
+            GROUP_CSA_STATE,
+            C4A_COMPRESSOR_BLOCK_SIZE,
+            C4A_COMPRESSOR_BLOCK_SIZE,
+            1,
+        ),
+        (
+            "csa_inner_state_slot_mapping",
+            "csa_inner_compress_state_block_table",
+            GROUP_CSA_INNER_STATE,
+            C4A_COMPRESSOR_BLOCK_SIZE,
+            C4A_COMPRESSOR_BLOCK_SIZE,
+            1,
+        ),
     )
     for output, table_name, group, source_page, storage_rows, ratio in groups:
         count = counts[:, group].to(torch.int64)

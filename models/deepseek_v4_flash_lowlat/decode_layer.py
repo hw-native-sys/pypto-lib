@@ -22,66 +22,115 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from decode_swa import (
-    B,
-    BLOCK_SIZE,
-    D,
-    HC_DIM,
-    HC_MULT,
-    H,
-    HEAD_DIM,
-    MAX_SEQ_LEN,
-    MIX_HC,
-    O_GROUPS,
-    O_GROUP_IN,
-    O_LORA,
-    ORI_BLOCK_NUM,
-    ORI_TABLE_MAX_BLOCKS,
-    Q_LORA,
-    ROPE_HEAD_DIM,
-    T,
-    WIN as SWA_WIN,
-    attention_swa,
-    prepare_swa_metadata,
-    SWA_ROPE_ROWS,
-    build_tensor_specs as build_attention_tensor_specs,
-    golden_attention_swa,
-)
-from decode_hca import (
-    CMP_BLOCK_NUM as HCA_CMP_BLOCK_NUM,
-    CMP_MAX_BLOCKS as HCA_CMP_MAX_BLOCKS,
-    CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE,
-    COMPRESS_RATIO as HCA_COMPRESS_RATIO,
-    COMPRESS_STATE_BLOCK_NUM as HCA_COMPRESS_STATE_BLOCK_NUM,
-    COMPRESS_STATE_BLOCK_SIZE as HCA_COMPRESS_STATE_BLOCK_SIZE,
-    COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM,
-    COMPRESS_STATE_MAX_BLOCKS as HCA_COMPRESS_STATE_MAX_BLOCKS,
-    MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
-    attention_hca,
-    prepare_hca_metadata,
-    HCA_ROPE_ROWS,
-    build_tensor_specs as build_hca_tensor_specs,
-    golden_attention_hca,
-)
-from decode_csa import CMP_BLOCK_NUM as CSA_CMP_BLOCK_NUM, CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS, CMP_STORAGE_BLOCK_SIZE as CSA_CMP_STORAGE_BLOCK_SIZE, COMPRESS_RATIO as CSA_COMPRESS_RATIO, IDX_CACHE_BLOCK_NUM as CSA_IDX_CACHE_BLOCK_NUM, IDX_CACHE_MAX_BLOCKS as CSA_IDX_CACHE_MAX_BLOCKS, IDX_HEAD_DIM as CSA_IDX_HEAD_DIM, IDX_N_HEADS as CSA_IDX_N_HEADS, INNER_OUT_DIM as CSA_INNER_OUT_DIM, INNER_STATE_BLOCK_NUM as CSA_INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE as CSA_INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM as CSA_INNER_STATE_DIM, INNER_STATE_MAX_BLOCKS as CSA_INNER_STATE_MAX_BLOCKS, MAIN_OUT_DIM as CSA_MAIN_OUT_DIM, MAIN_STATE_BLOCK_NUM as CSA_MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE as CSA_MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM as CSA_MAIN_STATE_DIM, MAIN_STATE_MAX_BLOCKS as CSA_MAIN_STATE_MAX_BLOCKS, OPROJ_FIRST_EPOCH as CSA_OPROJ_FIRST_EPOCH, OPROJ_REDUCE_ROWS as CSA_OPROJ_REDUCE_ROWS, attention_csa, prepare_csa_metadata, CSA_ROPE_ROWS, IDX_ROPE_ROWS, clear_csa_oproj_signals, TOK_Q_ROWS, TOK_O_COLS, build_tensor_specs as build_csa_tensor_specs, golden_attention_csa
-from config import FLASH as MODEL_CONFIG
-from utils import DECODE_START_POS
-from moe import (
-    MOE_INTER,
-    N_BANK,
-    N_EXPERTS,
-    N_RANKS,
-    REDUCE_WINDOW_ROWS,
-    TOPK,
-    VOCAB,
-    build_tensor_specs as build_moe_tensor_specs,
-    decode_route_rows,
-    clear_moe_signals,
-    golden_moe,
-    moe,
-)
+if __package__:
+    from .decode_swa import (
+        B,
+        BLOCK_SIZE,
+        D,
+        HC_DIM,
+        HC_MULT,
+        H,
+        HEAD_DIM,
+        MAX_SEQ_LEN,
+        MIX_HC,
+        O_GROUPS,
+        O_GROUP_IN,
+        O_LORA,
+        ORI_BLOCK_NUM,
+        ORI_TABLE_MAX_BLOCKS,
+        Q_LORA,
+        ROPE_HEAD_DIM,
+        T,
+        WIN as SWA_WIN,
+        attention_swa,
+        prepare_swa_metadata,
+        SWA_ROPE_ROWS,
+        build_tensor_specs as build_attention_tensor_specs,
+        golden_attention_swa,
+    )
+else:
+    from decode_swa import B, BLOCK_SIZE, D, HC_DIM, HC_MULT, H, HEAD_DIM, MAX_SEQ_LEN, MIX_HC, O_GROUPS, O_GROUP_IN, O_LORA, ORI_BLOCK_NUM, ORI_TABLE_MAX_BLOCKS, Q_LORA, ROPE_HEAD_DIM, T, WIN as SWA_WIN, attention_swa, prepare_swa_metadata, SWA_ROPE_ROWS, build_tensor_specs as build_attention_tensor_specs, golden_attention_swa
+if __package__:
+    from .decode_hca import (
+        CMP_BLOCK_NUM as HCA_CMP_BLOCK_NUM,
+        CMP_MAX_BLOCKS as HCA_CMP_MAX_BLOCKS,
+        CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE,
+        COMPRESS_RATIO as HCA_COMPRESS_RATIO,
+        COMPRESS_STATE_BLOCK_NUM as HCA_COMPRESS_STATE_BLOCK_NUM,
+        COMPRESS_STATE_BLOCK_SIZE as HCA_COMPRESS_STATE_BLOCK_SIZE,
+        COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM,
+        COMPRESS_STATE_MAX_BLOCKS as HCA_COMPRESS_STATE_MAX_BLOCKS,
+        MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
+        attention_hca,
+        prepare_hca_metadata,
+        HCA_ROPE_ROWS,
+        build_tensor_specs as build_hca_tensor_specs,
+        golden_attention_hca,
+    )
+else:
+    from decode_hca import CMP_BLOCK_NUM as HCA_CMP_BLOCK_NUM, CMP_MAX_BLOCKS as HCA_CMP_MAX_BLOCKS, CMP_STORAGE_BLOCK_SIZE as HCA_CMP_STORAGE_BLOCK_SIZE, COMPRESS_RATIO as HCA_COMPRESS_RATIO, COMPRESS_STATE_BLOCK_NUM as HCA_COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE as HCA_COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM, COMPRESS_STATE_MAX_BLOCKS as HCA_COMPRESS_STATE_MAX_BLOCKS, MAIN_OUT_DIM as HCA_MAIN_OUT_DIM, attention_hca, prepare_hca_metadata, HCA_ROPE_ROWS, build_tensor_specs as build_hca_tensor_specs, golden_attention_hca
+if __package__:
+    from .decode_csa import (
+        CMP_BLOCK_NUM as CSA_CMP_BLOCK_NUM,
+        CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS,
+        CMP_STORAGE_BLOCK_SIZE as CSA_CMP_STORAGE_BLOCK_SIZE,
+        COMPRESS_RATIO as CSA_COMPRESS_RATIO,
+        IDX_CACHE_BLOCK_NUM as CSA_IDX_CACHE_BLOCK_NUM,
+        IDX_CACHE_MAX_BLOCKS as CSA_IDX_CACHE_MAX_BLOCKS,
+        IDX_HEAD_DIM as CSA_IDX_HEAD_DIM,
+        IDX_N_HEADS as CSA_IDX_N_HEADS,
+        INNER_OUT_DIM as CSA_INNER_OUT_DIM,
+        INNER_STATE_BLOCK_NUM as CSA_INNER_STATE_BLOCK_NUM,
+        INNER_STATE_BLOCK_SIZE as CSA_INNER_STATE_BLOCK_SIZE,
+        INNER_STATE_DIM as CSA_INNER_STATE_DIM,
+        INNER_STATE_MAX_BLOCKS as CSA_INNER_STATE_MAX_BLOCKS,
+        MAIN_OUT_DIM as CSA_MAIN_OUT_DIM,
+        MAIN_STATE_BLOCK_NUM as CSA_MAIN_STATE_BLOCK_NUM,
+        MAIN_STATE_BLOCK_SIZE as CSA_MAIN_STATE_BLOCK_SIZE,
+        MAIN_STATE_DIM as CSA_MAIN_STATE_DIM,
+        MAIN_STATE_MAX_BLOCKS as CSA_MAIN_STATE_MAX_BLOCKS,
+        OPROJ_FIRST_EPOCH as CSA_OPROJ_FIRST_EPOCH,
+        OPROJ_REDUCE_ROWS as CSA_OPROJ_REDUCE_ROWS,
+        attention_csa,
+        prepare_csa_metadata,
+        CSA_ROPE_ROWS,
+        IDX_ROPE_ROWS,
+        clear_csa_oproj_signals,
+        TOK_Q_ROWS,
+        TOK_O_COLS,
+        build_tensor_specs as build_csa_tensor_specs,
+        golden_attention_csa,
+    )
+else:
+    from decode_csa import CMP_BLOCK_NUM as CSA_CMP_BLOCK_NUM, CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS, CMP_STORAGE_BLOCK_SIZE as CSA_CMP_STORAGE_BLOCK_SIZE, COMPRESS_RATIO as CSA_COMPRESS_RATIO, IDX_CACHE_BLOCK_NUM as CSA_IDX_CACHE_BLOCK_NUM, IDX_CACHE_MAX_BLOCKS as CSA_IDX_CACHE_MAX_BLOCKS, IDX_HEAD_DIM as CSA_IDX_HEAD_DIM, IDX_N_HEADS as CSA_IDX_N_HEADS, INNER_OUT_DIM as CSA_INNER_OUT_DIM, INNER_STATE_BLOCK_NUM as CSA_INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE as CSA_INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM as CSA_INNER_STATE_DIM, INNER_STATE_MAX_BLOCKS as CSA_INNER_STATE_MAX_BLOCKS, MAIN_OUT_DIM as CSA_MAIN_OUT_DIM, MAIN_STATE_BLOCK_NUM as CSA_MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE as CSA_MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM as CSA_MAIN_STATE_DIM, MAIN_STATE_MAX_BLOCKS as CSA_MAIN_STATE_MAX_BLOCKS, OPROJ_FIRST_EPOCH as CSA_OPROJ_FIRST_EPOCH, OPROJ_REDUCE_ROWS as CSA_OPROJ_REDUCE_ROWS, attention_csa, prepare_csa_metadata, CSA_ROPE_ROWS, IDX_ROPE_ROWS, clear_csa_oproj_signals, TOK_Q_ROWS, TOK_O_COLS, build_tensor_specs as build_csa_tensor_specs, golden_attention_csa
+if __package__:
+    from .config import FLASH as MODEL_CONFIG
+else:
+    from config import FLASH as MODEL_CONFIG
+if __package__:
+    from .utils import DECODE_START_POS
+else:
+    from utils import DECODE_START_POS
+if __package__:
+    from .moe import (
+        MOE_INTER,
+        N_BANK,
+        N_EXPERTS,
+        N_RANKS,
+        REDUCE_WINDOW_ROWS,
+        TOPK,
+        VOCAB,
+        build_tensor_specs as build_moe_tensor_specs,
+        decode_route_rows,
+        clear_moe_signals,
+        golden_moe,
+        moe,
+    )
+else:
+    from moe import MOE_INTER, N_BANK, N_EXPERTS, N_RANKS, REDUCE_WINDOW_ROWS, TOPK, VOCAB, build_tensor_specs as build_moe_tensor_specs, decode_route_rows, clear_moe_signals, golden_moe, moe
 
 assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS
+
 
 
 @pl.jit
@@ -126,15 +175,16 @@ def decode_layer(
     hca_cmp_ape: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     hca_compress_state: pl.Tensor[
-        [HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM],
-        pl.FP32,
+        [HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32
     ],
     hca_compress_state_block_table: pl.Tensor[[B, HCA_COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     csa_cmp_wkv: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    csa_compress_state: pl.Tensor[[CSA_MAIN_STATE_BLOCK_NUM, CSA_MAIN_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM], pl.FP32],
+    csa_compress_state: pl.Tensor[
+        [CSA_MAIN_STATE_BLOCK_NUM, CSA_MAIN_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM], pl.FP32
+    ],
     csa_compress_state_block_table: pl.Tensor[[B, CSA_MAIN_STATE_MAX_BLOCKS], pl.INT32],
     csa_idx_wq_b: pl.Tensor[[Q_LORA, CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.FP32],
@@ -145,25 +195,17 @@ def decode_layer(
     csa_inner_ape: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[CSA_IDX_HEAD_DIM], pl.BF16],
     csa_inner_compress_state: pl.Tensor[
-        [CSA_INNER_STATE_BLOCK_NUM, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM],
-        pl.FP32,
+        [CSA_INNER_STATE_BLOCK_NUM, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM], pl.FP32
     ],
     csa_inner_compress_state_block_table: pl.Tensor[[B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32],
-    hca_cmp_kv: pl.Tensor[
-        [HCA_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
-    ],
-    csa_cmp_kv: pl.Tensor[
-        [CSA_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16
-    ],
+    hca_cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    csa_cmp_kv: pl.Tensor[[CSA_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     hca_cmp_block_table: pl.Tensor[[B, HCA_CMP_MAX_BLOCKS], pl.INT32],
     csa_cmp_block_table: pl.Tensor[[B, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[
-        [CSA_IDX_CACHE_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM],
-        pl.INT8,
+        [CSA_IDX_CACHE_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], pl.INT8
     ],
-    idx_kv_scale: pl.Tensor[
-        [CSA_IDX_CACHE_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32
-    ],
+    idx_kv_scale: pl.Tensor[[CSA_IDX_CACHE_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
@@ -173,7 +215,6 @@ def decode_layer(
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    # Expert SHARED_EID of each bank is the shared expert; see moe.route_group.
     routed_w1: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_BANK, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_BANK, MOE_INTER, D], pl.INT8],
@@ -184,7 +225,6 @@ def decode_layer(
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     oproj_reduce_window: pld.DistributedTensor[[CSA_OPROJ_REDUCE_ROWS, D], pl.FP32],
-
     oproj_reduce_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     oproj_sync_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     tok_q_window: pld.DistributedTensor[[TOK_Q_ROWS, HEAD_DIM], pl.BF16],
@@ -204,25 +244,57 @@ def decode_layer(
         out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
         out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
         swa_out_rope_swap_idx = pl.create_tensor([SWA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
-        prepare_swa_metadata(freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, swa_out_rope_swap_idx)
+        prepare_swa_metadata(
+            freqs_cos,
+            freqs_sin,
+            position_ids,
+            rope_cos_t,
+            rope_sin_t,
+            q_rope_cos_il,
+            q_rope_sin_signed,
+            q_rope_swap_idx,
+            out_rope_cos_il,
+            out_rope_sin_signed,
+            swa_out_rope_swap_idx,
+        )
         attention_swa(
-            x_hc, gate_w,
-            hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_w, wq_a, wq_b, wq_b_scale,
-            wkv, gamma_cq, gamma_ckv, rope_cos_t, rope_sin_t,
+            x_hc,
+            gate_w,
+            hc_attn_fn,
+            hc_attn_scale,
+            hc_attn_base,
+            attn_norm_w,
+            wq_a,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            gamma_cq,
+            gamma_ckv,
+            rope_cos_t,
+            rope_sin_t,
             kv_cache,
-            swa_slot_mapping, swa_indices, swa_lens, position_ids,
-            attn_sink, wo_a_shard, wo_b_shard, wo_b_scale,
+            swa_slot_mapping,
+            swa_indices,
+            swa_lens,
+            position_ids,
+            attn_sink,
+            wo_a_shard,
+            wo_b_shard,
+            wo_b_scale,
             x_attn,
             oproj_reduce_window,
-            oproj_reduce_signal, oproj_sync_signal,
-            my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, swa_out_rope_swap_idx,
+            oproj_reduce_signal,
+            oproj_sync_signal,
+            my_rank,
+            pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
+            q_rope_cos_il,
+            q_rope_sin_signed,
+            q_rope_swap_idx,
+            out_rope_cos_il,
+            out_rope_sin_signed,
+            swa_out_rope_swap_idx,
         )
-        # One attention layer per dispatch, so this is that layer: reset the
-        # counters the projection left monotonic for the next dispatch.
-        clear_csa_oproj_signals(
-            x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal
-        )
+        clear_csa_oproj_signals(x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal)
     elif layer_id % 2 == 1:
         rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
         rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -235,29 +307,75 @@ def decode_layer(
         out_rope_cos_il = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
         out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
         hca_out_rope_swap_idx = pl.create_tensor([HCA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
-        prepare_hca_metadata(freqs_cos, freqs_sin, position_ids, kv_seq_lens, rope_cos_t, rope_sin_t, hca_cmp_cos_il, hca_cmp_sin_signed, cmp_seq_lens, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, hca_out_rope_swap_idx)
+        prepare_hca_metadata(
+            freqs_cos,
+            freqs_sin,
+            position_ids,
+            kv_seq_lens,
+            rope_cos_t,
+            rope_sin_t,
+            hca_cmp_cos_il,
+            hca_cmp_sin_signed,
+            cmp_seq_lens,
+            q_rope_cos_il,
+            q_rope_sin_signed,
+            q_rope_swap_idx,
+            out_rope_cos_il,
+            out_rope_sin_signed,
+            hca_out_rope_swap_idx,
+        )
         attention_hca(
-            x_hc, gate_w,
-            hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_w, wq_a, wq_b, wq_b_scale,
-            wkv, gamma_cq, gamma_ckv, rope_cos_t, rope_sin_t, hca_cmp_cos_il, hca_cmp_sin_signed, cmp_seq_lens,
-            hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
-            hca_compress_state, hca_compress_state_block_table,
-            kv_cache, hca_cmp_kv, hca_cmp_block_table,
-            ori_slot_mapping, window_swa_indices, window_swa_lens,
-            hca_cmp_slot_mapping, hca_state_slot_mapping,
-            position_ids, kv_seq_lens,
-            attn_sink, wo_a_shard, wo_b_shard, wo_b_scale,
+            x_hc,
+            gate_w,
+            hc_attn_fn,
+            hc_attn_scale,
+            hc_attn_base,
+            attn_norm_w,
+            wq_a,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            gamma_cq,
+            gamma_ckv,
+            rope_cos_t,
+            rope_sin_t,
+            hca_cmp_cos_il,
+            hca_cmp_sin_signed,
+            cmp_seq_lens,
+            hca_cmp_wkv,
+            hca_cmp_wgate,
+            hca_cmp_ape,
+            hca_cmp_norm_w,
+            hca_compress_state,
+            hca_compress_state_block_table,
+            kv_cache,
+            hca_cmp_kv,
+            hca_cmp_block_table,
+            ori_slot_mapping,
+            window_swa_indices,
+            window_swa_lens,
+            hca_cmp_slot_mapping,
+            hca_state_slot_mapping,
+            position_ids,
+            kv_seq_lens,
+            attn_sink,
+            wo_a_shard,
+            wo_b_shard,
+            wo_b_scale,
             x_attn,
             oproj_reduce_window,
-            oproj_reduce_signal, oproj_sync_signal,
-            my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, hca_out_rope_swap_idx,
+            oproj_reduce_signal,
+            oproj_sync_signal,
+            my_rank,
+            pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
+            q_rope_cos_il,
+            q_rope_sin_signed,
+            q_rope_swap_idx,
+            out_rope_cos_il,
+            out_rope_sin_signed,
+            hca_out_rope_swap_idx,
         )
-        # One attention layer per dispatch, so this is that layer: reset the
-        # counters the projection left monotonic for the next dispatch.
-        clear_csa_oproj_signals(
-            x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal
-        )
+        clear_csa_oproj_signals(x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal)
     else:
         rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
         rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -272,46 +390,121 @@ def decode_layer(
         out_rope_sin_signed = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.FP32)
         csa_out_rope_swap_idx = pl.create_tensor([CSA_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
         idx_rope_swap_idx = pl.create_tensor([IDX_ROPE_ROWS, ROPE_HEAD_DIM], dtype=pl.INT32)
-        prepare_csa_metadata(freqs_cos, freqs_sin, position_ids, rope_cos_t, rope_sin_t, step_cos_il, step_sin_signed, csa_cmp_cos_il, csa_cmp_sin_signed, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, csa_out_rope_swap_idx, idx_rope_swap_idx)
+        prepare_csa_metadata(
+            freqs_cos,
+            freqs_sin,
+            position_ids,
+            rope_cos_t,
+            rope_sin_t,
+            step_cos_il,
+            step_sin_signed,
+            csa_cmp_cos_il,
+            csa_cmp_sin_signed,
+            q_rope_cos_il,
+            q_rope_sin_signed,
+            q_rope_swap_idx,
+            out_rope_cos_il,
+            out_rope_sin_signed,
+            csa_out_rope_swap_idx,
+            idx_rope_swap_idx,
+        )
         attention_csa(
-            x_hc, gate_w,
-            hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_w, wq_a, wq_b, wq_b_scale,
-            wkv, gamma_cq, gamma_ckv, rope_cos_t, rope_sin_t, step_cos_il, step_sin_signed, csa_cmp_cos_il, csa_cmp_sin_signed,
-            csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w,
-            csa_compress_state, csa_compress_state_block_table,
-            csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx,
-            csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
-            csa_inner_compress_state, csa_inner_compress_state_block_table,
-            kv_cache, csa_cmp_kv, csa_cmp_block_table,
-            idx_kv_cache, idx_kv_scale, idx_block_table,
-            ori_slot_mapping, window_swa_indices, window_swa_lens,
-            csa_cmp_slot_mapping, csa_idx_slot_mapping,
-            csa_state_slot_mapping, csa_inner_state_slot_mapping,
-            position_ids, kv_seq_lens,
-            attn_sink, wo_a_shard, wo_b_shard, wo_b_scale,
+            x_hc,
+            gate_w,
+            hc_attn_fn,
+            hc_attn_scale,
+            hc_attn_base,
+            attn_norm_w,
+            wq_a,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            gamma_cq,
+            gamma_ckv,
+            rope_cos_t,
+            rope_sin_t,
+            step_cos_il,
+            step_sin_signed,
+            csa_cmp_cos_il,
+            csa_cmp_sin_signed,
+            csa_cmp_wkv,
+            csa_cmp_wgate,
+            csa_cmp_ape,
+            csa_cmp_norm_w,
+            csa_compress_state,
+            csa_compress_state_block_table,
+            csa_idx_wq_b,
+            csa_idx_wq_b_scale,
+            csa_weights_proj,
+            csa_hadamard_idx,
+            csa_inner_wkv,
+            csa_inner_wgate,
+            csa_inner_ape,
+            csa_inner_norm_w,
+            csa_inner_compress_state,
+            csa_inner_compress_state_block_table,
+            kv_cache,
+            csa_cmp_kv,
+            csa_cmp_block_table,
+            idx_kv_cache,
+            idx_kv_scale,
+            idx_block_table,
+            ori_slot_mapping,
+            window_swa_indices,
+            window_swa_lens,
+            csa_cmp_slot_mapping,
+            csa_idx_slot_mapping,
+            csa_state_slot_mapping,
+            csa_inner_state_slot_mapping,
+            position_ids,
+            kv_seq_lens,
+            attn_sink,
+            wo_a_shard,
+            wo_b_shard,
+            wo_b_scale,
             x_attn,
             oproj_reduce_window,
-            oproj_reduce_signal, oproj_sync_signal,
-            tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
-            my_rank, pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
-            pl.const(1, pl.INT32), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx, out_rope_cos_il, out_rope_sin_signed, csa_out_rope_swap_idx, idx_rope_swap_idx,
+            oproj_reduce_signal,
+            oproj_sync_signal,
+            tok_q_window,
+            tok_q_signal,
+            tok_o_window,
+            tok_o_signal,
+            my_rank,
+            pl.const(CSA_OPROJ_FIRST_EPOCH, pl.INT32),
+            pl.const(1, pl.INT32),
+            q_rope_cos_il,
+            q_rope_sin_signed,
+            q_rope_swap_idx,
+            out_rope_cos_il,
+            out_rope_sin_signed,
+            csa_out_rope_swap_idx,
+            idx_rope_swap_idx,
         )
-        # One CSA layer per dispatch, so this is that layer: reset the counters
-        # the projection left monotonic for the next dispatch.
-        clear_csa_oproj_signals(
-            x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal
-        )
-
+        clear_csa_oproj_signals(x_attn, oproj_reduce_signal, oproj_sync_signal, tok_q_signal, tok_o_signal)
     moe(
         x_attn,
-        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        norm_w, gate_w, gate_bias, tid2eid, input_ids,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
+        hc_ffn_fn,
+        hc_ffn_scale,
+        hc_ffn_base,
+        norm_w,
+        gate_w,
+        gate_bias,
+        tid2eid,
+        input_ids,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
+        routed_w2,
+        routed_w2_scale,
         x_next,
-        reduce_window, reduce_signal,
-        layer_id, pl.const(T, pl.INT32), my_rank, pl.const(1, pl.INT32),
+        reduce_window,
+        reduce_signal,
+        layer_id,
+        pl.const(T, pl.INT32),
+        my_rank,
+        pl.const(1, pl.INT32),
     )
     clear_moe_signals(x_next, reduce_signal)
     return x_next
@@ -369,8 +562,7 @@ def l3_decode_layer(
     csa_cmp_ape: pl.Tensor[[N_RANKS, CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
     csa_compress_state: pl.Tensor[
-        [N_RANKS, CSA_MAIN_STATE_BLOCK_NUM, CSA_MAIN_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM],
-        pl.FP32,
+        [N_RANKS, CSA_MAIN_STATE_BLOCK_NUM, CSA_MAIN_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM], pl.FP32
     ],
     csa_compress_state_block_table: pl.Tensor[[N_RANKS, B, CSA_MAIN_STATE_MAX_BLOCKS], pl.INT32],
     csa_idx_wq_b: pl.Tensor[[N_RANKS, Q_LORA, CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.INT8],
@@ -382,28 +574,17 @@ def l3_decode_layer(
     csa_inner_ape: pl.Tensor[[N_RANKS, CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[N_RANKS, CSA_IDX_HEAD_DIM], pl.BF16],
     csa_inner_compress_state: pl.Tensor[
-        [N_RANKS, CSA_INNER_STATE_BLOCK_NUM, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM],
-        pl.FP32,
+        [N_RANKS, CSA_INNER_STATE_BLOCK_NUM, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM], pl.FP32
     ],
     csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32],
-    hca_cmp_kv: pl.Tensor[
-        [N_RANKS, HCA_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
-        pl.BF16,
-    ],
-    csa_cmp_kv: pl.Tensor[
-        [N_RANKS, CSA_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM],
-        pl.BF16,
-    ],
+    hca_cmp_kv: pl.Tensor[[N_RANKS, HCA_CMP_BLOCK_NUM, HCA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    csa_cmp_kv: pl.Tensor[[N_RANKS, CSA_CMP_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     hca_cmp_block_table: pl.Tensor[[N_RANKS, B, HCA_CMP_MAX_BLOCKS], pl.INT32],
     csa_cmp_block_table: pl.Tensor[[N_RANKS, B, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[
-        [N_RANKS, CSA_IDX_CACHE_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM],
-        pl.INT8,
+        [N_RANKS, CSA_IDX_CACHE_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], pl.INT8
     ],
-    idx_kv_scale: pl.Tensor[
-        [N_RANKS, CSA_IDX_CACHE_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1],
-        pl.FP32,
-    ],
+    idx_kv_scale: pl.Tensor[[N_RANKS, CSA_IDX_CACHE_BLOCK_NUM, CSA_CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[N_RANKS, B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
     hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
@@ -424,17 +605,13 @@ def l3_decode_layer(
 ):
     reduce_window_buf = pld.alloc_window_buffer([REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
     reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    # The CSA o-projection reduces a different quantity -- INT32 partials plus the
-    # per-rank activation scale -- so it carries its own windows and signals.
     oproj_reduce_buf = pld.alloc_window_buffer([CSA_OPROJ_REDUCE_ROWS, D], dtype=pl.FP32)
     oproj_reduce_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     oproj_sync_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    # Token-shard exchange: q in on the head axis, o_packed out on the group axis.
     tok_q_window_buf = pld.alloc_window_buffer([TOK_Q_ROWS, HEAD_DIM], dtype=pl.BF16)
     tok_q_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     tok_o_window_buf = pld.alloc_window_buffer([T, TOK_O_COLS], dtype=pl.BF16)
     tok_o_signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-
     for r in pl.range(pld.world_size()):
         reduce_window = pld.window(reduce_window_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
         reduce_signal = pld.window(reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
@@ -445,44 +622,7 @@ def l3_decode_layer(
         tok_q_signal = pld.window(tok_q_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         tok_o_window = pld.window(tok_o_window_buf, [T, TOK_O_COLS], dtype=pl.BF16)
         tok_o_signal = pld.window(tok_o_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
-        decode_layer(
-            x_hc[r],
-            hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
-            attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r],
-            wkv[r], gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r],
-            kv_cache[r], block_table[r],
-            ori_slot_mapping[r],
-            window_swa_indices[r], window_swa_lens[r],
-            swa_slot_mapping[r],
-            swa_indices[r], swa_lens[r],
-            hca_cmp_slot_mapping[r], hca_state_slot_mapping[r],
-            csa_cmp_slot_mapping[r], csa_idx_slot_mapping[r],
-            csa_state_slot_mapping[r], csa_inner_state_slot_mapping[r],
-            position_ids[r], kv_seq_lens[r],
-            attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
-            wo_a_shard[r], wo_b_shard[r],
-            hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r], hca_cmp_norm_w[r],
-            hca_compress_state[r], hca_compress_state_block_table[r],
-            csa_cmp_wkv[r], csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r],
-            csa_compress_state[r], csa_compress_state_block_table[r],
-            csa_idx_wq_b[r], csa_idx_wq_b_scale[r], csa_weights_proj[r], csa_hadamard_idx[r],
-            csa_inner_wkv[r], csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r],
-            csa_inner_compress_state[r], csa_inner_compress_state_block_table[r],
-            hca_cmp_kv[r], csa_cmp_kv[r],
-            hca_cmp_block_table[r], csa_cmp_block_table[r],
-            idx_kv_cache[r], idx_kv_scale[r], idx_block_table[r],
-            hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
-            norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
-            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
-            routed_w2[r], routed_w2_scale[r],
-            x_next[r],
-            reduce_window, reduce_signal,
-            oproj_reduce_window,
-            oproj_reduce_signal, oproj_sync_signal,
-            tok_q_window, tok_q_signal, tok_o_window, tok_o_signal,
-            layer_id, r,
-            device=r,
-        )
+        decode_layer(x_hc[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r], freqs_cos[r], freqs_sin[r], kv_cache[r], block_table[r], ori_slot_mapping[r], window_swa_indices[r], window_swa_lens[r], swa_slot_mapping[r], swa_indices[r], swa_lens[r], hca_cmp_slot_mapping[r], hca_state_slot_mapping[r], csa_cmp_slot_mapping[r], csa_idx_slot_mapping[r], csa_state_slot_mapping[r], csa_inner_state_slot_mapping[r], position_ids[r], kv_seq_lens[r], attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r], wo_a_shard[r], wo_b_shard[r], hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r], hca_cmp_norm_w[r], hca_compress_state[r], hca_compress_state_block_table[r], csa_cmp_wkv[r], csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r], csa_compress_state[r], csa_compress_state_block_table[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r], csa_weights_proj[r], csa_hadamard_idx[r], csa_inner_wkv[r], csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r], csa_inner_compress_state[r], csa_inner_compress_state_block_table[r], hca_cmp_kv[r], csa_cmp_kv[r], hca_cmp_block_table[r], csa_cmp_block_table[r], idx_kv_cache[r], idx_kv_scale[r], idx_block_table[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r], routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r], routed_w2[r], routed_w2_scale[r], x_next[r], reduce_window, reduce_signal, oproj_reduce_window, oproj_reduce_signal, oproj_sync_signal, tok_q_window, tok_q_signal, tok_o_window, tok_o_signal, layer_id, r, device=r)
 
 
 def golden_decode_layer(tensors):
@@ -722,15 +862,17 @@ def _attention_kind_for_layer(layer_id):
 def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     import torch
     from dataclasses import replace
-    from utils import block_table
+
+    if __package__:
+        from .utils import block_table
+    else:
+        from utils import block_table
     from golden import ScalarSpec, TensorSpec
 
     _validate_layer_id(layer_id)
 
     swa_specs = {
-        spec.name: spec
-        for spec in build_attention_tensor_specs(start_pos)
-        if isinstance(spec, TensorSpec)
+        spec.name: spec for spec in build_attention_tensor_specs(start_pos) if isinstance(spec, TensorSpec)
     }
     # One draw of the o-projection weights. SWA and HCA read the replicated copy,
     # the CSA layer reads the per-card shard cut from it, and the golden works off
@@ -741,14 +883,10 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     swa_specs["wo_a"] = replace(swa_specs["wo_a"], init_value=wo_a_value)
     swa_specs["wo_b"] = replace(swa_specs["wo_b"], init_value=wo_b_value)
     hca_specs = {
-        spec.name: spec
-        for spec in build_hca_tensor_specs(start_pos)
-        if isinstance(spec, TensorSpec)
+        spec.name: spec for spec in build_hca_tensor_specs(start_pos) if isinstance(spec, TensorSpec)
     }
     csa_specs = {
-        spec.name: spec
-        for spec in build_csa_tensor_specs(start_pos)
-        if isinstance(spec, TensorSpec)
+        spec.name: spec for spec in build_csa_tensor_specs(start_pos) if isinstance(spec, TensorSpec)
     }
     moe_specs = build_moe_tensor_specs(layer_id)
     moe_tensor_specs = {spec.name: spec for spec in moe_specs if isinstance(spec, TensorSpec)}
@@ -811,7 +949,10 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         ("freqs_cos", swa_specs["freqs_cos"]),
         ("freqs_sin", swa_specs["freqs_sin"]),
         ("kv_cache", swa_specs["kv_cache"]),
-        ("block_table", TensorSpec("block_table", [B, ORI_TABLE_MAX_BLOCKS], torch.int32, init_value=init_block_table)),
+        (
+            "block_table",
+            TensorSpec("block_table", [B, ORI_TABLE_MAX_BLOCKS], torch.int32, init_value=init_block_table),
+        ),
         ("ori_slot_mapping", active_specs.get("ori_slot_mapping", hca_specs["ori_slot_mapping"])),
         ("window_swa_indices", hca_specs["window_swa_indices"]),
         ("window_swa_lens", hca_specs["window_swa_lens"]),
@@ -876,14 +1017,18 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     # l3_decode_layer takes them -- right after wo_b_scale.
     oproj_shards = [
         TensorSpec(
-            "wo_a_shard", [N_RANKS, 1, O_LORA, O_GROUP_IN], torch.bfloat16,
-            init_value=lambda: torch.stack(
-                [wo_a_value[r : r + 1] for r in range(N_RANKS)], dim=0),
+            "wo_a_shard",
+            [N_RANKS, 1, O_LORA, O_GROUP_IN],
+            torch.bfloat16,
+            init_value=lambda: torch.stack([wo_a_value[r : r + 1] for r in range(N_RANKS)], dim=0),
         ),
         TensorSpec(
-            "wo_b_shard", [N_RANKS, D, O_LORA], torch.int8,
+            "wo_b_shard",
+            [N_RANKS, D, O_LORA],
+            torch.int8,
             init_value=lambda: torch.stack(
-                [wo_b_value[:, r * O_LORA : (r + 1) * O_LORA] for r in range(N_RANKS)], dim=0),
+                [wo_b_value[:, r * O_LORA : (r + 1) * O_LORA] for r in range(N_RANKS)], dim=0
+            ),
         ),
     ]
     shard_at = next(i for i, s in enumerate(specs) if s.name == "wo_b_scale") + 1
@@ -895,6 +1040,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         if spec.name in {"x_hc", "x_next"}:
             continue
         if spec.name == "tid2eid":
+
             def init_tid2eid():
                 base = torch.arange(VOCAB, dtype=torch.int32).reshape(VOCAB, 1) * TOPK
                 offs = torch.arange(TOPK, dtype=torch.int32).reshape(1, TOPK)
@@ -912,6 +1058,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
 
             specs.append(TensorSpec("tid2eid", spec.shape, spec.dtype, init_value=init_tid2eid))
         elif spec.name == "input_ids":
+
             def init_input_ids():
                 ids = torch.arange(T, dtype=torch.int64)
                 return ids.unsqueeze(0).expand(N_RANKS, -1).contiguous()
@@ -931,24 +1078,42 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     # block tables / ids / position_ids / kv_seq_lens, the input activation
     # (x_hc), and the output (x_next), which change per token.
     RESIDENT_WEIGHT_NAMES = replicated_attention | {
-        "wo_a_shard", "wo_b_shard",
-        "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
-        "gate_w", "gate_bias", "tid2eid",
-        "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
-        "routed_w2", "routed_w2_scale",
+        "wo_a_shard",
+        "wo_b_shard",
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+        "hc_ffn_base",
+        "norm_w",
+        "gate_w",
+        "gate_bias",
+        "tid2eid",
+        "routed_w1",
+        "routed_w1_scale",
+        "routed_w3",
+        "routed_w3_scale",
+        "routed_w2",
+        "routed_w2_scale",
     }
     RESIDENT_CACHE_NAMES = {
-        "kv_cache", "hca_cmp_kv", "csa_cmp_kv", "idx_kv_cache", "idx_kv_scale",
-        "csa_compress_state", "csa_inner_compress_state", "hca_compress_state",
+        "kv_cache",
+        "hca_cmp_kv",
+        "csa_cmp_kv",
+        "idx_kv_cache",
+        "idx_kv_scale",
+        "csa_compress_state",
+        "csa_inner_compress_state",
+        "hca_compress_state",
     }
     for spec in specs:
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in RESIDENT_CACHE_NAMES:
             spec.resident = "stacked"
 
-    specs.extend([
-        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32),
-        ScalarSpec("layer_id", torch.int32, layer_id),
-    ])
+    specs.extend(
+        [
+            TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32),
+            ScalarSpec("layer_id", torch.int32, layer_id),
+        ]
+    )
     return specs
 
 
@@ -986,7 +1151,10 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False,
                         help="persist inputs and golden outputs for replay")
     parser.add_argument("--dump-passes", action="store_true", default=False)
-    from config import CONTEXT_CAPACITY
+    if __package__:
+        from .config import CONTEXT_CAPACITY
+    else:
+        from config import CONTEXT_CAPACITY
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     args = parser.parse_args()

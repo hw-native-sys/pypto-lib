@@ -10,11 +10,11 @@ The native HC stream uses FP32 at `hc_pre` input and `hc_post` residual/output,
 including the public `pre_hc_hidden_out` output. Dense, attention and expert
 local tensors also use BF16; this is a mixed-precision contract.
 
-The independent Torch references preserve BF16 Cube K16 and FP32 Cube K4
-accumulation, ascending split-K reductions and per-group projection scales. Float64
-intermediates model each product group's FP32 rounding; model operands
-and outputs keep their declared dtypes. This does not establish universal
-bitwise equivalence or replace the existing numerical comparisons.
+The independent Torch references use standard FP32 matrix multiplication
+with BF16-rounded operands where required, ascending split-K reductions, and
+per-group projection scales. Model operands and outputs keep their declared
+dtypes. Torch and device accumulation order may differ; numerical comparisons
+do not assume bitwise equivalence.
 
 Standalone Q validation checks its produced head group; the other pure-Out
 heads have no initialized-value guarantee.
@@ -22,22 +22,11 @@ heads have no initialized-value guarantee.
 The FP32 gate uses deferred RMS: `xg = x_mixed.float() * norm_w.float()`.
 It applies `inv_rms` after projection and includes it in the dequantization
 scale for INT8 `quant(xg)`, without BF16-rounding a normalized routing vector.
-Gate activation quantization refines the FP32 quotient with a product-error
-residual before round-to-nearest-even conversion. A power-of-two scaling keeps
-the compensation intermediates bounded for large finite denominators; it does
-not change the INT8 weights, FP32 dequantization scales or deferred RMS policy.
-This does not assert all-domain IEEE or nonfinite-input equivalence.
-
-Gate, QKV and SWA share scope-local FP32 compensation primitives in
-`fp32_numerics.py`; these helpers create no tasks or global-memory buffers.
-The gate's softplus evaluates `log(1 + exp(-abs(x)))` before adding the
-nonnegative part of the input. Its logarithm correction consumes the
-unrounded two-part sum. The square-root correction applies within
-`[2^-40, 2^40]` and retains the original square-root result outside that
-interval. Owning Torch references round double-precision unary results to
-FP32 at the specified boundaries and preserve the explicit reduction order.
-Finite-case validation does not establish correctly rounded results for
-every FP32 input or replace complete-forward validation.
+Gate activation quantization uses FP32 division before round-to-nearest-even
+conversion. The router uses the device's FP32 exponential, logarithm, square
+root and division operations; the routed expert uses the same fast arithmetic
+for activation and requantization. The Torch reference can differ in rounding,
+so the existing numerical gates remain applicable.
 
 The attention and final RMSNorm references reduce FP32 squared inputs in
 FP64, then round the sum once to FP32. The mean and epsilon addition remain
@@ -45,16 +34,20 @@ FP32; the inverse square root is evaluated in FP64 and rounded to FP32.
 This specifies the reference's statistical precision without changing epsilon,
 activation dtypes, or the numerical comparison thresholds.
 
-RMSNorm compensates its pairwise FP32 square-sum and refines the reciprocal-
-square-root seed with a product-error residual. The compensated reduction
-applies when the original squared sum is at most `2^40`; the inverse correction
-applies for variance at most `2^40`. Larger values retain the original path.
-The reference and comparison thresholds are unchanged. Finite input tests do
-not establish all-domain correctly rounded arithmetic or a performance gain.
+The fast HC, RMSNorm, QKV and attention paths use the device's FP32 reduction,
+reciprocal, and exponential operations without the reference branch's full
+product-error and transcendental compensation. Their results can differ from
+the Torch reference and must be checked with the output-specific golden gates.
+Finite input tests do not establish all-domain correctly rounded arithmetic or
+a complete-model performance gain.
 
-Q/KV kernels use
-the existing square-root correction and compensated reciprocal at their
-separately rounded FP32 inverse boundaries.
+A previous HC-pre component comparison used three captured layer inputs at
+six-token width on four dual-chip 910C boards. Its ordinary submit-to-result
+median was 0.898 ms for the older arithmetic and 1.034 ms for the compensated
+path. A separate instrumented capture measured the Sinkhorn kernel at 13.93
+and 123.21 microseconds, respectively. This supports an implementation-cost
+finding for that component and input scope; it is not a measurement of this
+commit's complete-request TPOT.
 
 Public stored LM-head logits are FP32. Community vLLM can select
 `hf_overrides={"head_dtype": "float32"}`; this alone does not align the forward.
@@ -69,8 +62,48 @@ A complete golden must align weights/scales, input state, HC, quantization,
 routing, reduction and logit precision. Matching dtype labels or W8A8
 checkpoint names, source/component CI and local type checks do not establish
 complete-model numerical correctness. The existing comparison gates apply.
-The current FP32 policy is retained. A community-precision compatibility mode
-is not implemented and requires an explicit precision-policy decision.
+The current FP32 storage policy is retained. A community-precision
+compatibility mode is not implemented.
+
+## Full-forward numerical checks
+
+The independent Torch forward remains the reference. Each owner and token row
+of `pre_hc_hidden_out`, `hidden_out`, and active `logits` must have relative L2
+error at most 0.20. The reference norm has a per-element RMS floor of `1e-3`;
+this prevents a near-zero row from making the relative denominator vanish.
+Each checked row also caps its largest absolute error at eight times the L2
+limit times the reference RMS, plus `1e-3`, so a large isolated outlier cannot
+hide in a long vector. Written cache rows use 16 times their L2 limit; logits
+use four times the L2 limit.
+Inactive logits retain the strict `rtol=atol=1e-3` check, and nonfinite output
+values fail.
+
+Paged caches use the actual request metadata to select the rows the forward can
+write. Every unwritten cache byte must match the reference exactly. Each written
+row is checked separately for every owner and layer: the relative L2 limit is
+0.15 for KV and indexer cache values and 0.30 for compressor state. Indexer
+INT8 cache values are compared after applying their corresponding dequantization
+scales, and the scales are checked separately. Sentinel values must match.
+
+Sampled IDs must match sampling from the actual logits. A different ID from the
+Torch reference is reported, since close logits can change their ordering. The
+L2 limits are experimental coarse forward checks chosen for this fast W8A8
+path; in particular, the 0.30 compressor-state limit is not a claim of 30%
+accuracy or an official DSpark tolerance. These checks do not establish output
+quality on SpeedBench, MT-Bench, long contexts, or other workloads.
+The full-forward command uses up to 32 CPU threads for the Torch reference
+unless `PYPTO_GOLDEN_NUM_THREADS` is explicitly set.
+Device CI runs `--test-layers 5`, covering two SWA layers followed by CSA,
+HCA, and CSA plus the output head. The default remains the full 43-layer
+forward; the five-layer result is not full-model qualification.
+
+The standalone CSA fixture permits at most 5% of points to exceed `3e-3` under
+`ratio_reldiff`'s combined absolute/relative rule and retains its worst-point cap
+of 1. The 5% allowance also appears in the MoE layer fixture. Two unseeded CI
+fixtures had 0.8064% and 2.4902% bad points; their inputs were not saved, so the
+reason for that variation remains unresolved. This is a fixture tolerance, not
+an official model-quality threshold. Generated CSA fixture inputs use seed 0 by
+default and can be varied with `--seed`.
 
 ## Reproducible reduction order
 
@@ -90,14 +123,10 @@ retain their original order.
 HC-pre Sinkhorn column sums use the explicit four-row pairing
 `(row0 + row1) + (row2 + row3)` in both implementations.
 
-SWA, HCA, and CSA softmax use a compensated, range-reduced FP32 exponential for finite
-max-subtracted scores in `[-80, 0]`, with the existing exponential outside
-that interval. SWA/HCA use a 128-element denominator tree; CSA uses a
-32-element tree. Each level pairs the two halves with FP32 additions. The independent
-Torch reference evaluates the exponential in double precision before FP32
-rounding and uses the same specified addition order. HCA/CSA compensate their
-final FP32 quotient before the existing BF16 packing. This does not claim
-correct rounding for every FP32 input or complete-forward agreement.
+The fast SWA, HCA, and CSA softmax paths use the device exponential and row
+reduction operations. Their reduction order and rounding can differ from the
+independent Torch reference. The output-specific numerical checks cover that
+difference rather than assuming bitwise equality.
 
 These rules make the reduction order explicit. They do not establish bitwise
 equivalence across different hardware, compiler revisions, or other operations
@@ -178,20 +207,13 @@ The Torch composition reuses the child operator references. Expert gate/up/down
 products accumulate INT8 operands as INT32 before applying original FP32
 scales. Activation quantization uses explicit FP32 division for `127 / amax`;
 the gate retains deferred RMS and its separate dequantization-scale order.
-BF16 Cube consumers use K16 FP32 accumulation and their kernel's split-K
-order in the CPU reference: Q/KV projections, sparse QK/PV, grouped output
-projection A, compressor projections, indexer Hadamard and routing-weight
-projections, and vocabulary logits. Batched rows and independent groups use
-the same host helper; indexer routing weights retain four split-K partials.
-Float64 evaluates each BF16 product group and each reference unary or division
-before rounding its result to FP32. Model operands, outputs, INT8-to-INT32 dots
-and scales retain their declared dtypes. HC-pre uses explicit balanced FP32
-reductions for its square sums and four-way Sinkhorn sums; its Torch reference
-spells out the stored exp/add/div boundaries instead of using a fused softmax.
-The native HC-pre maps compensate their reciprocal, reciprocal-square-root and
-division seeds. Exponential correction is bounded to `[-80, 80]`; the original
-exponential is retained outside that interval. These bounded corrections do not
-establish a general IEEE rounding guarantee for every input.
+BF16 projection references round operands to BF16 and use FP32 `torch.matmul`;
+the helper accumulates split-K partials in ascending order. Some operator
+references, including HC-pre and RMSNorm, separately use FP64 intermediates
+for their specified reductions or unary operations. The fast native HC-pre uses
+the device's ordinary reciprocal, reciprocal-square-root and exponential paths.
+Model operands, outputs, INT8-to-INT32 dots and scales retain their declared
+dtypes. These choices do not guarantee bitwise equality across implementations.
 TP projection contributions include channel scales before ordered rank
 reduction. Standalone grouped projections retain their own arithmetic.
 These choices do not establish bitwise equivalence with device instructions;
@@ -280,8 +302,174 @@ for validation and artifact handling.
 
 ### Ratio-4 verification-step boundaries
 
-The main and indexer compressors pool every boundary with a nonnegative compressed-cache slot mapping. `kv[b, o]` contains boundary ordinal `o` within the step: row zero remains the first boundary. Unmapped ordinals and remaining rows have no output write contract. With eight tokens, starts 0, 4 and 121 produce boundaries 3/7, 7/11 and 123/127 respectively when both cache slots are admitted.
+The main and indexer compressors write each boundary with a nonnegative
+compressed-cache slot mapping at its input-token index: `kv[b, s]`, or
+`kv_flat[b * S + s]`, corresponds to `position_ids[b, s]`. Non-boundary
+tokens and boundaries with unmapped cache slots have no output write
+contract. With eight tokens, starts 0, 4 and 121 produce absolute boundaries
+3/7, 7/11 and 123/127 respectively. When both cache slots are admitted, the
+output rows within the step are 3/7, 3/7 and 2/6, respectively.
 
 Pooling consumes the current step's projected rows directly, including speculative rows without persistent state slots, and reads earlier prefix rows through the state block table. All pools precede persistent scatter; only nonnegative state slot mappings authorize that scatter. An early advance recomputes remaining tokens from the new step inputs and the committed prefix, without promoting rejected tokens into persistent state.
 
-Indexer query RoPE tables have one row per absolute query-token position. Compression RoPE tables are separate, indexed by boundary ordinal and aligned to each four-token window start. For a step starting at 8193, the first boundary 8195 uses compression position 8192; its query still uses its own absolute position. Standalone half-width tables are flattened `[B*S, rope_dim/2]`; the indexer additionally takes `inner_cos` and `inner_sin` for aligned compression windows. CSA derives both tables from its existing full RoPE inputs.
+Indexer query RoPE tables use each token's absolute query position.
+Compression RoPE tables have one row per input token, using the same
+token index as the output. `prepare_csa_metadata` selects compression
+position `position - COMPRESS_RATIO + 1` for boundary tokens and position
+zero for non-boundary placeholders. For a step starting at 8193, boundary
+8195 uses compression position 8192 at token index 2; its query uses
+absolute position 8195. Standalone fixtures follow the same per-token rule,
+with half-width tables flattened to `[B*S, rope_dim/2]`. The indexer
+additionally takes `inner_cos` and `inner_sin` for the aligned compression
+windows. CSA derives query and compression tables from its existing full
+RoPE inputs.
+
+## Batch-one DSpark request serving
+
+
+This deployment retains five draft tokens and six target verification rows.
+It complements the [wide-batch DSpark model](../deepseek_v4_flash_dspark/index.md).
+
+The source includes the batch-one drafter, Markov sampling, six-row target,
+device request-state transitions, two-frame host policy and native build. A
+complete request benchmark requires an external caller and actual checkpoint
+weights. Clean-checkout execution and performance qualification are still
+pending. No historical TPOT is claimed for this revision.
+
+The target retains rank-ordered output projection, ordered HC-head split
+reduction, and ascending complete-set Indexer selection. Target RMS uses the
+fast FP32 path, including the gate's RMS and routing arithmetic.
+Single-query and verification entries share these operators. Full request
+numerical and performance qualification remain separate from component
+validation; failures remain visible in either stage.
+
+## Component boundary
+
+- `drafter/entry.py` exports the three-layer drafter with TP4/CP4/EP4 geometry,
+  a 128-row target-history window, and five query rows. Only the four drafter
+  ranks execute it; they are a subset of the eight target ranks.
+- `markov/entry.py` exports the target LM-head and sequential five-step Markov
+  proposal/confidence path with four vocabulary shards.
+- `drafter/device_metadata.py` selects the actual absolute-position metadata bank from
+  committed state. A communication epoch is not a metadata-bank index.
+- `target_bridge.py` broadcasts the seed token and five proposals with an epoch
+  tag before the target can consume them.
+- `target_commit.py` accepts the longest greedy-matching draft prefix and emits
+  the target bonus. The original control fields distinguish logical advance
+  from the number of tokens still permitted by the output budget.
+- `device_control.py` materializes target metadata after the prior-cycle gate;
+  `target_state.py` publishes the next state after the real history commit
+  acknowledgement. `phase_reuse.py` supplies the peer-only eight-rank boundary
+  for reuse of communication slots within a two-cycle parent.
+
+The first three request-state fields are the monotonic epoch, committed anchor,
+and remaining output budget. Field three stores the last delivered token.
+History has 128 live rows in a 136-row owning allocation. Target features are
+three concatenated 4096-wide HC means from layers 40, 41 and 42, not the final
+learned HC head.
+
+`native_pipeline.native_cycles` composes D/M on ranks 0–3 and target verification
+on all eight ranks. `native_rsag_pipeline` selects the ordered MoE
+reduce-scatter/allgather composition. Its target package shares unchanged kernels
+with the baseline package. The `cycle_count` constexpr selects a one- or two-cycle
+parent in source; it does not require editing generated host code.
+
+The compact single-query entry is `native_single.py`; request cycles use
+`native_pipeline.py` and `native_rsag_pipeline.py`, which call the corresponding
+target verification modules. They share this model directory's operator files
+and 43 layer-specific weight banks. Each build freezes its query width in a fresh
+process. Request benchmarks require actual checkpoint weights.
+
+The drafter and Markov packages isolate their import-time deployment arguments
+and restore the caller's arguments in `finally`. Their kernel bodies and active
+constants are carried forward from the batch-one implementation; unused
+standalone fixtures and prefill modules are omitted. These packages have not
+been substituted with the wide-batch deployment defaults.
+
+## Streaming and termination
+
+`stream_controller.run_request` uses two independently owned output frames and
+at most two accepted parent handles. A frame is reusable only after successful
+whole-parent completion, packet validation, delivery or EOS discard, and release.
+It never performs a device read or frees an in-flight frame itself.
+
+A single-cycle parent is used when fewer than seven tokens remain. A second
+two-cycle parent can be accepted ahead only when at least 24 tokens remain,
+so its reservation survives the predecessor's maximum twelve-token advance.
+This controls preparation ahead of execution; safe execution also requires the
+real runtime launch-depth-one parent retirement boundary and per-run HOST output
+publication. FIFO order alone is insufficient.
+
+The controller supports a maximum of 2048 generated tokens including the first
+prefill prediction. It stops delivery at a real tokenizer EOS. An already
+accepted successor is still waited on, captured and validated, then discarded;
+no replacement is submitted. Exceptions remain the caller's responsibility to
+persist and drain during normal Worker cleanup.
+
+## Source generation
+
+From the repository root, in the configured PyPTO environment:
+
+```bash
+python -m models.deepseek_v4_flash_lowlat.build \
+  --profile rsag --devices 0,1,2,3,4,5,6,7 \
+  --cache build_output/dspark-bs1-cache \
+  --report build_output/dspark-bs1-rsag-generated.json
+```
+
+The other profiles are `single`, `one`, and `two`. This command creates generated
+artifacts only: it does not load weights, construct a Worker, allocate NPU memory,
+or measure performance. The eight device IDs describe logical compile topology;
+runtime board/chip mapping and capacity admission are separate.
+Each PTOAS subprocess has a default 180-second deadline for vector code
+generation. `--ptoas-timeout-seconds` accepts a value from 1 to 600 and
+records it in the generated report. This scoped build policy preserves the
+backend's assembler command, version checks and errors, and restores its
+binding on exit; it does not modify the installed toolchain.
+
+The native W2 prefetch implementation is a tracked C++ Cube-body fragment.
+`native_source` selects it before publication only after the complete generated
+Cube, shared declarations, ABI and exports match the reviewed fingerprint. The
+freshly generated Vector arithmetic is preserved. Both original and selected
+sources remain in the artifact report, and cache hits replay the same graft
+validation. The fragment and selector digest is a JIT constexpr key input, and
+the fragment is included in the model source manifest. Normal native compilation
+is still required; no retained binary is substituted for changed code.
+
+## Runtime and benchmark scope
+
+The source-generation entry produces the model artifacts described above.
+Complete-request execution, checkpoint preparation, and performance
+measurement require an external caller and data; experimental tooling
+for those tasks is not part of this model package.
+
+## Reproduction and numerical status
+
+Performance reproduction and numerical qualification are separate. The planned
+benchmark retains batch size one, concurrency one, real EOS or length termination,
+initialization/upload/warmup accounting, per-request output IDs, and request-wall
+TPOT. Kernel duration divided by a presumed acceptance count is not TPOT.
+
+The merged target model's numerical checks do not establish the accuracy of
+this composition. A later complete entry must retain the existing packet,
+commit, history-ring, final-state and complete-output checks. Until that entry
+is built and measured from a clean checkout, both full-pipeline reproduction and
+numerical qualification remain pending.
+
+## Fast arithmetic delivery
+
+This branch restores the pre-alignment hardware arithmetic in target HC,
+RMS, QKV and sparse attention. It keeps W8A8 tensors, the existing public
+interfaces, request scheduling, ordered collectives, buffer padding and
+ownership checks. Golden functions remain enabled. The full-forward floating
+outputs use the bounded checks described above; other component gates are
+unchanged.
+
+Fast arithmetic does not guarantee bitwise agreement with the refined
+reference arithmetic. FP32 reductions and transcendental approximations can
+change greedy token choices and EOS positions. Model-quality scores and
+whole-request speed for this port must be evaluated separately; a historical
+measurement is not a measurement of the current commit.
+
+The validated reference-arithmetic source is preserved on
+[the reference branch](https://github.com/zzjc1234/pypto-lib/tree/feat/dsv4-dspark-bs1-reference).

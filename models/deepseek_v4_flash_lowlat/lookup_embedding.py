@@ -11,13 +11,19 @@
 
 import pypto.language as pl
 
-from config import FLASH as M
-from decode_shapes import DECODE_TOKENS
+if __package__:
+    from .config import FLASH as M
+else:
+    from config import FLASH as M
+if __package__:
+    from .decode_shapes import DECODE_TOKENS
+else:
+    from decode_shapes import DECODE_TOKENS
 
 
 # Dynamic shape variables.
-T_DYN = pl.dynamic("LOOKUP_EMBEDDING_T_DYN")
-VOCAB_DYN = pl.dynamic("LOOKUP_EMBEDDING_VOCAB_DYN")
+T_DYN = pl.dynamic('LOWLAT_TARGET_LOOKUP_EMBEDDING_T_DYN')
+VOCAB_DYN = pl.dynamic('LOWLAT_TARGET_LOOKUP_EMBEDDING_VOCAB_DYN')
 
 # model config
 D = M.hidden_size
