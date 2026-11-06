@@ -534,6 +534,11 @@ measurements remain separate gates.
 
 ### MoE expert parallelism
 
+The complete forward selects the MoE transport at compile time. Prefill uses
+`prefill_moe.py`; decode uses the same `decode_moe.py` implementation as the
+standalone decode MoE and FFN entries. The shared `layer.py:moe_layer` retains
+mHC mixing, token ownership and TP output restoration for both phases.
+
 The resident forward skips the complete shared expert on ranks with no
 locally owned source tokens. Such ranks still receive and compute routed
 experts for peers and participate in EP exchange and TP token restoration.
