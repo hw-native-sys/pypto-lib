@@ -228,14 +228,13 @@ def attention_swa(
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    for local_group in pl.range(GROUPS_PER_RANK):
-        group_id = pl.cast(my_rank, pl.INDEX) * GROUPS_PER_RANK + local_group
-        qkv_proj_rope(
-            x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
-            rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-            q, kv, qr, qr_scale, rms_tid,
-            pl.cast(group_id, pl.INT32) * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
-        )
+    first_head = pl.cast(my_rank, pl.INT32) * GROUPS_PER_RANK * (H // O_GROUPS)
+    qkv_proj_rope(
+        x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
+        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+        q, kv, qr, qr_scale, rms_tid,
+        first_head, GROUPS_PER_RANK * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
+    )
 
     # Commit current decode KV and build its additive padding mask in one task.
     # The SWA attention kernel reads every visible row through metadata-expanded
