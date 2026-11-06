@@ -80,7 +80,7 @@ def _execution_plan(
     # resolved only inside the queue job after task-submit allocates devices.
     capture = (
         "task-submit --device auto --device-num 2 --run "
-        "\"bash -lc 'set -euo pipefail; "
+        "\"bash -lc 'set -euo pipefail; unset PYTHONPATH; unset ASCEND_HOME_PATH; "
         "export VLLM_USE_V2_MODEL_RUNNER=0; "
         "export SOC_VERSION=ascend910_9382; "
         f"{REFERENCE_PYTHON} tools/deepseek_v41_vllm_capture.py "
