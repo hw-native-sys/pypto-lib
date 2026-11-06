@@ -44,6 +44,7 @@ from input_pack import prepare_compressed_lens
 from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, final_output
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows
 from engram import ENGRAM_K, KV_OUT, engram_from_rows
+from decode_moe_combine import PACKED_WIDTH
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from decode_moe import (
     moe, SIGNAL_PAD, clear_moe_signals, AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH,
@@ -171,7 +172,7 @@ def decode_encoder(
     data_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, PACKED_WIDTH], pl.BF16],
     combine_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
@@ -468,7 +469,7 @@ def decode_decoder(
     data_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, PACKED_WIDTH], pl.BF16],
     combine_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
@@ -759,7 +760,7 @@ def l2_decode_fwd(
     data_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, PACKED_WIDTH], pl.BF16],
     combine_arrived: pld.DistributedTensor[
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32
     ],
@@ -1046,6 +1047,8 @@ def l3_decode_fwd(
     position_ids.bind_dynamic(1, T_DYN)
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
+    # Packet payload and arrival markers must share aligned 512-byte transfers.
+    routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, PACKED_WIDTH], dtype=pl.BF16)
     recv_meta_buffer = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buffer = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
@@ -1054,7 +1057,6 @@ def l3_decode_fwd(
     data_arrived_buffer = pld.alloc_window_buffer(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
-    routed_output_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, D], dtype=pl.BF16)
     combine_arrived_buffer = pld.alloc_window_buffer(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
@@ -1077,7 +1079,7 @@ def l3_decode_fwd(
             [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],
             dtype=pl.INT32,
         )
-        routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, D], dtype=pl.BF16)
+        routed_output = pld.window(routed_output_buffer, [MOE_TOKENS * TOPK, PACKED_WIDTH], dtype=pl.BF16)
         combine_arrived = pld.window(
             combine_arrived_buffer,
             [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD],

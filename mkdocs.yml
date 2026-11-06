@@ -98,6 +98,7 @@ nav:
       - DeepSeek V4-Flash (low latency): models/deepseek_v4_flash_lowlat/index.md
       - DeepSeek V4.1-Flash:
           - Model overview: models/deepseek_v4_1_flash/index.md
+          - Decode MoE return kernel: models/deepseek_v4_1_flash/moe-return-kernel.md
           - Vision encoder and visual aligner: models/deepseek_v4_1_flash/vision.md
       - GLM-5.3-Flash: models/glm5_3_flash/index.md
   - Debug and Tune:
