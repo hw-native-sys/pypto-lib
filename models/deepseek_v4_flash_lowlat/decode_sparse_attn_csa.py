@@ -44,6 +44,11 @@ ORI_BLOCK_NUM_DYN = pl.dynamic('LOWLAT_TARGET_ORI_BLOCK_NUM_DYN')
 CMP_BLOCK_NUM_DYN = pl.dynamic('LOWLAT_TARGET_CMP_BLOCK_NUM_DYN')
 
 # model config
+if __package__:
+    from .decode_shapes import TP
+else:
+    from decode_shapes import TP
+
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
@@ -61,8 +66,8 @@ SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
-# Attention is token-sharded: card `my_rank` computes every head of token
-# `my_rank`, and the group axis is restored by an all-to-all before o_proj.
+# Token kernels compute all heads; physical ranks own consecutive token ranges.
+# The output exchange restores the local projection-group axis.
 H_LOCAL = H
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 COMPRESS_RATIO = 4
@@ -79,30 +84,28 @@ CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # === token shard ===========================================================
-# Card r owns token r and computes ALL H heads for it, instead of owning
-# H_LOCAL heads of every token. T == N_RANKS is what makes the map one-to-one.
-N_RANKS = O_GROUPS
-# The standalone entry below is token-sharded; CSA composition also imports
-# the head-sharded helper for other supported query widths.
+# Each physical rank owns consecutive tokens and computes every head of them.
+N_RANKS = TP
+GROUPS_PER_RANK = O_GROUPS // N_RANKS
 if __name__ == "__main__":
-    assert T == N_RANKS, "the standalone token-sharded case requires eight queries"
-# q arrives head-sharded (card p holds heads [8p, 8p+8) of every token) and a
-# token-sharded card needs all 64 heads of its own token, so the two axes are
-# transposed by an all-to-all: 8 heads x HEAD_DIM per (src, dst) pair.
-Q_SHARD_ROWS = HEADS_PER_GROUP
-# o_packed is consumed group-sharded by o_proj, so merge_norm's token-sharded
-# output is transposed back the same way: one O_GROUP_IN row per (src, dst).
+    assert T == O_GROUPS, "standalone token sharding requires eight queries"
+TOKENS_PER_RANK = max(T // N_RANKS, 1)
+TOKEN_Q_ROWS = TOKENS_PER_RANK * H
+TOKEN_O_ROWS = GROUPS_PER_RANK * T
+# Q publication assembles every head of each rank's local token range.
+Q_SHARD_ROWS = GROUPS_PER_RANK * HEADS_PER_GROUP
+# Each output row contains one logical group's heads for one token.
 O_SHARD_COLS = HEADS_PER_GROUP * HEAD_DIM
 
 # tiling
 H_TILE = 8               # merge_norm head tile
-# One token per card gives the cube a full 64-row M, so every qk/pv box is
+# A token kernel gives the cube a full 64-row M, so every qk/pv box is
 # 16 valid rows instead of the 8-in-16 the head shard was forced into.
 QK_M_TILE = 16
 QK_AIV_TILE = QK_M_TILE // 2
 QK_M_BOX = 16
 QK_HEAD_TILES = H // QK_M_TILE
-# K tile. The head shard ran 128 with T * 5 = 40 work items; one token leaves 5,
+# K tile. The head shard ran 128 with T * 5 = 40 work items; a token leaves 5,
 # so the tile shrinks to keep every lane fed off a single token's rows.
 ATTN_K_TILE = 32
 NUM_QK_CORES = 24        # qk_pv dispatch lanes = a2a3 AIC count; re-sweep for other AIC counts
@@ -119,7 +122,7 @@ SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 WIN_BLOCKS = WIN // ATTN_K_TILE   # leading tiles that are pure sliding window
 assert WIN % ATTN_K_TILE == 0, "the window must tile whole so a tile is window or compressed, never both"
-# One token per card, so a work item is one sparse block of that token.
+# Each token kernel schedules one work item per sparse block.
 QK_ITEMS = SPARSE_BLOCKS
 # Page-contiguous runs one sliding-window K tile spans: WIN rows capped by the tile,
 # plus a worst-case BLOCK_SIZE - 1 head offset, rounded up to pages.
@@ -127,7 +130,7 @@ SWA_TILE_WIN_ROWS = min(ATTN_K_TILE, WIN)
 SWA_RUNS = (SWA_TILE_WIN_ROWS + 2 * (BLOCK_SIZE - 1)) // BLOCK_SIZE
 
 
-TOKEN_SHARDED = T == N_RANKS
+TOKEN_SHARDED = T == O_GROUPS
 HEAD_SHARD_LOCAL = HEADS_PER_GROUP
 HEAD_SHARD_QK_M_TILE = HEADS_PER_GROUP
 HEAD_SHARD_QK_M_BOX = 16
@@ -359,43 +362,25 @@ def sparse_attn_csa_head_packed(
 @pl.jit.inline
 def csa_q_all_to_all(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    q_window: pld.DistributedTensor[[H, HEAD_DIM], pl.BF16],
+    q_window: pld.DistributedTensor[[TOKEN_Q_ROWS, HEAD_DIM], pl.BF16],
     q_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     tok_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
-    """Transpose q from the head shard onto the token shard: push only.
-
-    Card `my_rank` holds heads [8*my_rank, 8*my_rank+8) of every token and card
-    `peer` wants all H heads of token `peer`, so the slice this card owes `peer`
-    is one 8-head block of one token -- 8 KB. Issued here rather than next to its
-    consumer so the compressor and the indexer, neither of which reads q, cover
-    the flight; only the wait sits in front of `qk_pv`.
-    """
+    """Publish this rank's head groups to every token-owning rank."""
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     my_head0 = pl.cast(my_rank, pl.INDEX) * Q_SHARD_ROWS
-    # The edge to the q projection is the tensormap read of q_flat: its spmd is a
-    # for-form and never names a TaskId. Verify it in deps.json after a build --
-    # a missing edge here would race the push against the projection.
     with pl.spmd(N_RANKS, name_hint="csa_q_a2a") as q_push_tid:
         peer = pl.tile.get_block_idx()
-        pld.tensor.put(
-            dst=q_window,
-            peer=peer,
-            src=q_flat,
-            dst_offsets=[my_head0, 0],
-            src_offsets=[peer * H + my_head0, 0],
-            shape=[Q_SHARD_ROWS, HEAD_DIM],
-            chunk_rows=Q_SHARD_ROWS,
-            chunk_cols=HEAD_DIM,
-        )
-        pld.system.notify(
-            target=q_signal,
-            peer=peer,
-            offsets=[my_rank, 0],
-            value=1,
-            op=pld.NotifyOp.AtomicAdd,
-        )
+        for token in pl.range(TOKENS_PER_RANK):
+            source_token = peer * TOKENS_PER_RANK + token
+            pld.tensor.put(
+                dst=q_window, peer=peer, src=q_flat,
+                dst_offsets=[token * H + my_head0, 0],
+                src_offsets=[source_token * H + my_head0, 0],
+                shape=[Q_SHARD_ROWS, HEAD_DIM], chunk_rows=Q_SHARD_ROWS, chunk_cols=HEAD_DIM,
+            )
+        pld.system.notify(target=q_signal, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
     return q_push_tid
 
 
@@ -434,7 +419,7 @@ def prepare_csa_output_rope(
 
 @pl.jit.inline
 def sparse_attn_csa_packed(
-    q_window: pld.DistributedTensor[[H, HEAD_DIM], pl.BF16],
+    q_window: pld.DistributedTensor[[TOKEN_Q_ROWS, HEAD_DIM], pl.BF16],
     q_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     q_push_tid: pl.Scalar[pl.TASK_ID],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -447,25 +432,19 @@ def sparse_attn_csa_packed(
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
-    o_window: pld.DistributedTensor[[T, O_SHARD_COLS], pl.BF16],
+    o_window: pld.DistributedTensor[[TOKEN_O_ROWS, O_SHARD_COLS], pl.BF16],
     o_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
+    token_id: pl.Scalar[pl.INT32],
     tok_epoch: pl.Scalar[pl.INT32],
     rope_cos_il: pl.Tensor[[T, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[T, ROPE_DIM], pl.FP32],
     rope_swap_idx: pl.Tensor[[H_TILE, ROPE_DIM], pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
-    """Token-sharded sparse decode attention, up to the packed head output.
-
-    Card `my_rank` owns token `my_rank` and computes every head of it, so the
-    scattered compressed gather -- the term that bounds `qk_pv`, and the one
-    thing here that is per-token rather than per-head -- costs this card one
-    token's rows instead of all T. The head axis is restored on the way out.
-    """
+    """Compute one logical token and publish its projection-group rows."""
     # Compressed index contract: -1 invalid, [0, ...) compressed KV slots.
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    my_t = pl.cast(my_rank, pl.INDEX)
+    my_t = pl.cast(token_id, pl.INDEX)
 
     # WAR marker (pypto-lib#481): a scalar-driven gather_row does not mark ori_kv
     # add_inout, so the layer's KV writeback would lose its WAR edge against the
@@ -548,7 +527,7 @@ def sparse_attn_csa_packed(
                 expected=tok_epoch,
                 cmp=pld.WaitCmp.Ge,
             )
-        pl.store(pl.load(q_window, [0, 0], [H, HEAD_DIM]), [0, 0], q_tok)
+        pl.store(pl.load(q_window, [(my_t % TOKENS_PER_RANK) * H, 0], [H, HEAD_DIM]), [0, 0], q_tok)
 
     # One lane per core over this card's own token's K tiles. Each lane gathers a
     # tile into L1 and runs every head against it, so the H axis rides the tile
@@ -715,17 +694,12 @@ def sparse_attn_csa_packed(
             # Nope and inverse-RoPE halves concatenated on chip: one contiguous store.
             o_tok[m_g : m_g + 1, n_col : n_col + HEAD_DIM] = n_full_bf16[n_hi : n_hi + 1, :]
 
-        # Transpose this group back onto the shard o_proj consumes, from the block
-        # that just produced it. Group m_g's only consumer is card m_g, so the push
-        # needs nothing the block does not already hold, and a block that finishes
-        # early puts its 8 KB on the wire while its siblings are still merging --
-        # a separate grid after merge_norm would serialize all eight behind the
-        # slowest one.
+        # Publish this logical group's token row to its physical owner.
         pld.tensor.put(
             dst=o_window,
-            peer=m_g,
+            peer=m_g // GROUPS_PER_RANK,
             src=o_tok,
-            dst_offsets=[my_t, 0],
+            dst_offsets=[(m_g % GROUPS_PER_RANK) * T + my_t, 0],
             src_offsets=[m_g, 0],
             shape=[1, O_SHARD_COLS],
             chunk_rows=1,
@@ -733,34 +707,42 @@ def sparse_attn_csa_packed(
         )
         pld.system.notify(
             target=o_signal,
-            peer=m_g,
-            offsets=[my_rank, 0],
+            peer=m_g // GROUPS_PER_RANK,
+            offsets=[my_t // TOKENS_PER_RANK, 0],
             value=1,
             op=pld.NotifyOp.AtomicAdd,
         )
 
-    # Land this card's group into the rows its own o_proj shard reads. Split from
-    # the push so the notify rides merge_norm's program order.
-    o_base = pl.cast(my_rank, pl.INDEX) * T
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="csa_o_a2a_wait", deps=[merge_tid], allow_early_resolve=True
-    ) as o_wait_tid:
-        for o_src in pl.range(N_RANKS):
-            pld.system.wait(
-                signal=o_signal,
-                offsets=[o_src, 0],
-                expected=tok_epoch,
-                cmp=pld.WaitCmp.Ge,
-            )
-        o_landed = pl.load(o_window, [0, 0], [T, O_SHARD_COLS])
-        pl.store(o_landed, [o_base, 0], o_packed)
+    return merge_tid
 
+
+@pl.jit.inline
+def csa_o_all_to_all_wait(
+    o_window: pld.DistributedTensor[[TOKEN_O_ROWS, O_SHARD_COLS], pl.BF16],
+    o_signal: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
+    my_rank: pl.Scalar[pl.INT32],
+    tok_epoch: pl.Scalar[pl.INT32],
+    token_done: pl.Array[TOKENS_PER_RANK, pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Land every local group after all ranks publish all their token rows."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_o_a2a_wait", deps=[token_done], allow_early_resolve=True) as o_wait_tid:
+        for source_rank in pl.range(N_RANKS):
+            pld.system.wait(
+                signal=o_signal, offsets=[source_rank, 0],
+                expected=tok_epoch * TOKENS_PER_RANK * GROUPS_PER_RANK, cmp=pld.WaitCmp.Ge,
+            )
+        for local_group in pl.range(GROUPS_PER_RANK):
+            source_row = local_group * T
+            group_id = pl.cast(my_rank, pl.INDEX) * GROUPS_PER_RANK + local_group
+            landed = pl.load(o_window, [source_row, 0], [T, O_SHARD_COLS])
+            pl.store(landed, [group_id * T, 0], o_packed)
     return o_wait_tid
 
 
 # The replicated single-card `sparse_attn_csa` / `sparse_attn_test` entries are
-# dropped in this variant: the token shard is defined by the layer's comm
-# windows, so there is no one-card form of it to unit-test.
+# dropped in this variant: this leaf uses the layer's communication windows
+# and is qualified through the composed distributed entry.
 
 def golden_sparse_attn(tensors):
     """Torch reference: sparse_attn decode path followed by grouped o_proj."""

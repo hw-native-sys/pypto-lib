@@ -84,7 +84,7 @@ def hc_softmax_exp_math(
     scales: pl.Tensor[[3], pl.FP32],
     bases: pl.Tensor[[24], pl.FP32],
     group: pl.constexpr,
-    offset: pl.constexpr,
+    offset: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     hc_scale = pl.read(scales, [group])
     hc_base_raw = pl.slice(bases, [8], [offset], valid_shape=[4], clamp=True)

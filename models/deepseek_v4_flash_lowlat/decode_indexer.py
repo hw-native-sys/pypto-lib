@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # A2/A3 device validation; simulator CI is deferred for this model.
 """DeepSeek-V4 Indexer (decode). Mirrors model.py Indexer (line 380-433);
 golden is a port of forward's decode branch (prefill `start_pos == 0` path is omitted).
 The inner Compressor is invoked via golden_compressor (placeholder)."""
@@ -38,6 +37,11 @@ else:
     from rope_interleave import rope_interleave
 
 # model config
+if __package__:
+    from .decode_shapes import TP
+else:
+    from decode_shapes import TP
+
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
@@ -149,7 +153,7 @@ assert IDX_TOPK <= TOPK_HALF_LEN, (
 
 
 TOKEN_SHARDED = T == IDX_N_RANKS
-QUERY_SLOTS = 1 if TOKEN_SHARDED else T
+QUERY_SLOTS = T // TP if TOKEN_SHARDED else T
 BATCH_QUERY_PROJECTION = T == 6 and (not TOKEN_SHARDED)
 QR_ACC_ROWS = T_PAD if BATCH_QUERY_PROJECTION else QUERY_SLOTS * T_PAD
 QR_ACC_ROW_STRIDE = 1 if BATCH_QUERY_PROJECTION else T_PAD
@@ -275,7 +279,7 @@ def indexer(
         ):
             query_token = query_slot
             if TOKEN_SHARDED:
-                query_token = pl.cast(my_rank, pl.INDEX)
+                query_token = pl.cast(my_rank, pl.INDEX) * QUERY_SLOTS + query_slot
             query_batch = query_token // S
             query_column = query_token - query_batch * S
             query_cache_len = pl.read(kv_seq_lens, [query_batch]) // COMPRESS_RATIO
@@ -314,7 +318,7 @@ def indexer(
                 qproj_slot = ot // (IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE)
                 qproj_token = qproj_slot
                 if TOKEN_SHARDED:
-                    qproj_token = pl.cast(my_rank, pl.INDEX)
+                    qproj_token = pl.cast(my_rank, pl.INDEX) * QUERY_SLOTS + qproj_slot
                 qproj_column = ot % (IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE)
                 o_base = qproj_column * Q_OUT_TILE
                 for ns in pl.range(0, Q_OUT_TILE, MM_N_TILE):
@@ -337,7 +341,7 @@ def indexer(
             qdeq_slot = ot // (IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE)
             qdeq_token = qdeq_slot
             if TOKEN_SHARDED:
-                qdeq_token = pl.cast(my_rank, pl.INDEX)
+                qdeq_token = pl.cast(my_rank, pl.INDEX) * QUERY_SLOTS + qdeq_slot
             qdeq_column = ot % (IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE)
             o_base = qdeq_column * Q_OUT_TILE
             o0 = qdeq_slot * IDX_N_HEADS + qdeq_column * (Q_OUT_TILE // IDX_HEAD_DIM)
@@ -472,7 +476,7 @@ def indexer(
         qh_scale_flat = pl.reshape(qr_hadamard_scale_dq, [1, QUERY_SLOTS * IDX_N_HEADS])
         weights_flat = pl.reshape(weights, [1, T_PAD * IDX_N_HEADS])
 
-        # S8 scores one rank-owned token; other widths score every real query locally.
+        # S8 scores the rank-owned token range; other widths score all queries locally.
         for split in pl.spmd(
             QUERY_SLOTS * REDUCE_NSPLIT,
             name_hint="score",
@@ -483,7 +487,7 @@ def indexer(
             score_split = split % REDUCE_NSPLIT
             t0 = score_slot
             if TOKEN_SHARDED:
-                t0 = pl.cast(my_rank, pl.INDEX)
+                t0 = pl.cast(my_rank, pl.INDEX) * QUERY_SLOTS + score_slot
             b = t0 // S
             s0 = t0 - b * S
             clen_b = pl.read(kv_seq_lens, [b]) // COMPRESS_RATIO
@@ -552,7 +556,7 @@ def indexer(
             for _tk in pl.spmd(QUERY_SLOTS, name_hint="topk", allow_early_resolve=True, deps=[topk_init_tid]):
                 t = _tk
                 if TOKEN_SHARDED:
-                    t = pl.cast(my_rank, pl.INDEX)
+                    t = pl.cast(my_rank, pl.INDEX) * QUERY_SLOTS + _tk
                 batch_idx = t // S
                 token_s = t - batch_idx * S
                 cache_len_b = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
@@ -612,7 +616,7 @@ def indexer(
                 leaf_arena0 = leaf_slot * TOPK_ARENA_ROWS
                 t = leaf_slot
                 if TOKEN_SHARDED:
-                    t = pl.cast(my_rank, pl.INDEX)
+                    t = pl.cast(my_rank, pl.INDEX) * QUERY_SLOTS + leaf_slot
                 batch_idx = t // S
                 token_s = t - batch_idx * S
                 cache_len_b = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
@@ -656,7 +660,7 @@ def indexer(
                 merge_arena0 = _tk * TOPK_ARENA_ROWS
                 t = _tk
                 if TOKEN_SHARDED:
-                    t = pl.cast(my_rank, pl.INDEX)
+                    t = pl.cast(my_rank, pl.INDEX) * QUERY_SLOTS + _tk
                 batch_idx = t // S
                 token_s = t - batch_idx * S
                 cache_len_b = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
@@ -708,8 +712,8 @@ def indexer(
     return score, topk_idxs
 
 
-# Token this standalone entry scores. The indexer is token-sharded -- card `my_rank`
-# scores token `my_rank` only -- so a single-card run covers exactly one token, and
+# Physical rank whose consecutive query range the standalone entry scores.
+# The eight-query case distributes all rows across the configured TP ranks, and
 # the golden below masks the rest to the untouched contract (score NEG_INF, idx -1).
 TEST_MY_RANK = 0
 
@@ -958,15 +962,15 @@ def golden_indexer(tensors):
 
 
 def golden_indexer_test(tensors):
-    """Torch reference for the standalone entry: every token, then keep one token's row."""
+    """Compute the full reference, then retain this physical rank's query rows."""
     import torch
 
     golden_indexer(tensors)
-    # One card scores one token: every row but TEST_MY_RANK's keeps the untouched
-    # contract -- score stays NEG_INF (which score_valid_compare then skips) and
+    # Rows outside this rank's query range keep the untouched contract:
+    # score stays NEG_INF (which score_valid_compare then skips) and
     # topk_idxs stays at the -1 the kernel's topk_init writes.
     keep = torch.zeros(B * S, dtype=torch.bool)
-    keep[TEST_MY_RANK] = True
+    keep[TEST_MY_RANK * QUERY_SLOTS:(TEST_MY_RANK + 1) * QUERY_SLOTS] = True
     if not TOKEN_SHARDED:
         keep[:] = True
     keep = keep.view(B, S, 1)
@@ -1252,7 +1256,7 @@ def _indexer_visible_rows(inputs):
     position_len = (positions + 1) // COMPRESS_RATIO
     visible = torch.minimum(cache_len, position_len).clamp(max=SCORE_LEN)
     owned_query = (
-        torch.arange(B * S).reshape(B, S) == TEST_MY_RANK
+        torch.arange(B * S).reshape(B, S) // QUERY_SLOTS == TEST_MY_RANK
         if TOKEN_SHARDED
         else torch.ones((B, S), dtype=torch.bool)
     )
@@ -1277,7 +1281,7 @@ def topk_idxs_compare(actual, expected, *, actual_outputs, expected_outputs, inp
     a_top = actual.cpu()[..., :IDX_TOPK]
     e_top = expected.cpu()[..., :IDX_TOPK]
     owned_query = (
-        torch.arange(B * S).reshape(B, S) == TEST_MY_RANK
+        torch.arange(B * S).reshape(B, S) // QUERY_SLOTS == TEST_MY_RANK
         if TOKEN_SHARDED
         else torch.ones((B, S), dtype=torch.bool)
     )
@@ -1386,6 +1390,7 @@ if __name__ == "__main__":
         choices=[0, 1, 2],
         help="chip swimlane level: 0=off, 1=AICore timing, 2=+AICPU timing.",
     )
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument(
         "--start-pos",
@@ -1413,7 +1418,7 @@ if __name__ == "__main__":
         config=dict(
             dump_passes=args.dump_passes,
             backend_type=args.platform.removesuffix("sim"),
-            execution_mode=args.platform.endswith("sim"),
+            execution_mode=args.sim or args.platform.endswith("sim"),
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

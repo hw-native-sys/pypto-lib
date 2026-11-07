@@ -27,7 +27,7 @@ DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 # Parallelism constants. TP shards the MoE intermediate dim and the embedding /
 # LM-head vocab. Attention uses head-group sharding and CSA token sharding;
 # its public per-rank decode inputs still contain DECODE_TOKENS rows.
-TP = _parse_int_argv("--tp", 8)
+TP = _parse_int_argv("--tp", 2)
 if TP <= 0:
     raise ValueError(f"--tp must be a positive integer, got {TP}")
 WORLD_SIZE = TP

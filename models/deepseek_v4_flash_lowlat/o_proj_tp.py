@@ -6,9 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # A2/A3 device validation; simulator CI is deferred for this model.
-# ci: devices=8  # CI: 8-card TP run; the deployment world size, borrowed via task-submit --device-num
-"""DeepSeek-V4 grouped output projection with rank-ordered FP32 reduction."""
+# ci: devices=2
+"""DeepSeek-V4 grouped output projection with group-ordered FP32 reduction."""
 
 import sys as _sys
 
@@ -37,8 +36,9 @@ O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
-# parallelism. Card r owns output group r, so the world size is the group count.
+# Physical ranks own consecutive output-projection groups.
 N_RANKS = TP
+GROUPS_PER_RANK = O_GROUPS // N_RANKS
 
 # tiling -- carried over from decode_sparse_attn_hca.py so the shard is the only
 # variable between the two entries.
@@ -53,7 +53,7 @@ B_K_TILE = 256  # proj_b_mm cube K frag
 # v0.57, fastest-rank median: 69.0 / 69.3 / 69.9 us at 1 / 2 / 4 chunks -- the
 # fan-out no longer pays. The two-task form it replaced, whose chunks shared one
 # amax through GM, read 71.1 / 70.7 / 72.5 there. Re-sweep on any ptoas bump.
-# TP arm: the rank owns one group, so quant is on the serial chain instead of
+# In the measured TP8 setup a rank owns one group, so quant is on the serial chain instead of
 # running beside seven siblings. Its O_LORA columns are the axis it fans out over.
 QUANT_CHUNKS = _parse_int_argv("--quant-chunks", 1)
 # The publish put moves [T, D] FP32 = 128 KB. With chunk_cols == D it goes as a
@@ -94,16 +94,16 @@ EVICT_TRIPS = (EVICT_PER_BLOCK // EVICT_CHUNK) if EVICT_L2 else 0
 # Zero trip count disables the leading barrier without changing the graph.
 PRE_SYNC_PEERS = N_RANKS if PRE_SYNC else 0
 
-# All-reduce window: one `[T_PAD, D]` slot per rank per lane.
+# All-reduce window: one [T_PAD, D] slot per logical group and lane.
 # Two lanes alternate by epoch so a rank can publish call e while a peer still
 # reads call e-1, which keeps one barrier per call enough: reaching call e means
 # every peer published e-1, hence finished reading e-2. A layer stack calls this
 # projection once per CSA layer off one window, so the lanes are what make the
 # reuse safe.
-REDUCE_LANE_ROWS = N_RANKS * T_PAD
+REDUCE_LANE_ROWS = O_GROUPS * T_PAD
 REDUCE_WINDOW_ROWS = 2 * REDUCE_LANE_ROWS
 # D chunk per reduce block, i.e. D // this = 8 blocks. This grid loads all eight
-# rank slots per block, which keeps it element-bound enough that 8 blocks still pay:
+# group slots per block, which keeps it element-bound enough that 8 blocks still pay:
 # 1024 reads 65.4 us and 2048 reads 68.7 against 64.9 here.
 # Both element-light grids below are per-block fixed-cost bound, not element bound,
 # so they want FEWER, wider blocks than a loaded grid does: measured 70.0 / 67.5 /
@@ -114,7 +114,7 @@ REDUCE_D_TILE = 1024  # D // this = 4 reduce blocks
 FIRST_EPOCH = 1
 QUANT_ROW_TILE = max(8, T)
 
-assert O_GROUPS == N_RANKS, f"TP-by-group needs one group per rank: O_GROUPS={O_GROUPS}, TP={N_RANKS}"
+assert O_GROUPS % N_RANKS == 0, "TP must divide the output-projection group count"
 
 
 
@@ -287,8 +287,8 @@ def _proj_chain(
 def o_proj_tp_core(
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
     upstream: pl.Scalar[pl.TASK_ID],
-    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T, D], pl.BF16],
     reduce_window: pld.DistributedTensor[[REDUCE_WINDOW_ROWS, D], pl.FP32],
@@ -299,152 +299,88 @@ def o_proj_tp_core(
     # `>= oproj_epoch` and `clear_oproj_signals` resets them once at the end.
     oproj_epoch: pl.Scalar[pl.INT32],
 ):
-    """Card `my_rank` runs group `my_rank`'s chain, then all-reduces its partial.
-
-    The dequantized partial is published as FP32 rather than the INT32 accumulator
-    because each group carries its own activation scale, which cannot factor out
-    of the cross-rank sum. The shared per-channel `wo_b_scale` is applied to
-    each partial during dequantization, before publishing it to the other ranks.
-    """
-    o_r_pad = pl.create_tensor([T_PAD, O_LORA], dtype=pl.FP32)
-    o_r_i8_pad = pl.create_tensor([T_PAD, O_LORA], dtype=pl.INT8)
-    act_scale_col = pl.create_tensor([T, 1], dtype=pl.FP32)
-    partial = pl.create_tensor([T_PAD, D], dtype=pl.INT32)
-    part_f32 = pl.create_tensor([T, D], dtype=pl.FP32)
+    """Project this rank's logical groups and reduce them in global group order."""
+    o_r_all = pl.create_tensor([GROUPS_PER_RANK * T_PAD, O_LORA], dtype=pl.FP32)
+    o_i8_all = pl.create_tensor([GROUPS_PER_RANK * T_PAD, O_LORA], dtype=pl.INT8)
+    scale_all = pl.create_tensor([GROUPS_PER_RANK * T, 1], dtype=pl.FP32)
+    partial_all = pl.create_tensor([GROUPS_PER_RANK * T_PAD, D], dtype=pl.INT32)
+    part_f32 = pl.create_tensor([GROUPS_PER_RANK * T, D], dtype=pl.FP32)
+    group_done = pl.array.create(GROUPS_PER_RANK, pl.TASK_ID)
     barrier_out = pl.array.create(1, pl.TASK_ID)
-
     lane_base = pl.cast(((oproj_epoch - 1) % 2) * REDUCE_LANE_ROWS, pl.INDEX)
-    my_row = lane_base + pl.cast(my_rank, pl.INDEX) * T_PAD
-    row_base_o = pl.cast(my_rank, pl.INDEX) * T
+    first_group = pl.cast(my_rank, pl.INDEX) * GROUPS_PER_RANK
     wo_b_scale_2d = pl.reshape(wo_b_scale, [1, D])
 
     with pl.manual_scope():
-        # Optional leading barrier, anchored on the actual attention producer.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="oproj_pre_sync", deps=[upstream]) as _sync_tid:
-            _sync_anchor = pl.read(o_packed, [0, 0])
-            sync_peers = PRE_SYNC_PEERS
-            for peer in pl.range(sync_peers):
-                pld.system.notify(
-                    target=sync_signal,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-            for src in pl.range(sync_peers):
-                pld.system.wait(
-                    signal=sync_signal,
-                    offsets=[src, 0],
-                    expected=oproj_epoch,
-                    cmp=pld.WaitCmp.Ge,
-                )
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="oproj_pre_sync", deps=[upstream]) as sync_tid:
+            sync_anchor = pl.read(o_packed, [0, 0])
+            for peer in pl.range(PRE_SYNC_PEERS):
+                pld.system.notify(target=sync_signal, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+            for src in pl.range(PRE_SYNC_PEERS):
+                pld.system.wait(signal=sync_signal, offsets=[src, 0], expected=oproj_epoch, cmp=pld.WaitCmp.Ge)
 
-        # The padding rows carry no data and depend on nothing, so they are zeroed
-        # off the proj_a -> quant -> proj_b chain rather than inside quant, where the
-        # fill is the same [T_PAD - T, O_LORA] element count as the real quantize.
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="quant_pad_zero", deps=[_sync_tid], allow_early_resolve=True
-        ) as pad_tid:
-            zero_half = pl.full([T_PAD - T, O_LORA], dtype=pl.FP16, value=0.0)
-            zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc", saturation_mode="on")
-            o_r_i8_pad[T:T_PAD, 0:O_LORA] = zero_i8
+        for local_group in pl.range(GROUPS_PER_RANK):
+            scratch_row = local_group * T_PAD
+            scale_row = local_group * T
+            group_id = first_group + local_group
+            group_a = pl.slice(wo_a_shard, [1, O_LORA, O_GROUP_IN], [local_group, 0, 0])
+            group_b_view = pl.slice(wo_b_shard, [1, D, O_LORA], [local_group, 0, 0])
+            group_b: pl.Tensor[[D, O_LORA], pl.INT8] = pl.reshape(group_b_view, [D, O_LORA])
+            o_r_pad = o_r_all[scratch_row:scratch_row + T_PAD, :]
+            o_r_i8_pad = o_i8_all[scratch_row:scratch_row + T_PAD, :]
+            act_scale_col = scale_all[scale_row:scale_row + T, :]
+            partial = partial_all[scratch_row:scratch_row + T_PAD, :]
+            row_base_o = group_id * T
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant_pad_zero", deps=[sync_tid], allow_early_resolve=True) as pad_tid:
+                zero_half = pl.full([T_PAD - T, O_LORA], dtype=pl.FP16, value=0.0)
+                zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc", saturation_mode="on")
+                o_r_i8_pad[T:T_PAD, 0:O_LORA] = zero_i8
+            pb_tid = _proj_chain(
+                o_packed, group_a, group_b, o_r_pad, o_r_i8_pad,
+                act_scale_col, partial, row_base_o, upstream, pad_tid,
+            )
+            with pl.spmd(D // DEQUANT_N_TILE, name_hint="oproj_dequant", deps=[pb_tid], allow_early_resolve=True) as dq_tid:
+                dq0 = pl.tile.get_block_idx() * DEQUANT_N_TILE
+                p_f32 = pl.cast(partial[0:T, dq0:dq0 + DEQUANT_N_TILE], target_type=pl.FP32, mode="none")
+                if T < 8:
+                    for row in pl.range(T):
+                        p_scale = pl.read(act_scale_col, [row, 0])
+                        partial_row = p_f32[row:row + 1, :]
+                        scaled_row = pl.mul(partial_row, p_scale)
+                        channel_row = pl.col_expand_mul(scaled_row, wo_b_scale_2d[0:1, dq0:dq0 + DEQUANT_N_TILE])
+                        part_f32[scale_row + row:scale_row + row + 1, dq0:dq0 + DEQUANT_N_TILE] = channel_row
+                else:
+                    p_act = pl.row_expand_mul(p_f32, act_scale_col[0:T, 0:1])
+                    channel = wo_b_scale_2d[0:1, dq0:dq0 + DEQUANT_N_TILE]
+                    part_f32[scale_row:scale_row + T, dq0:dq0 + DEQUANT_N_TILE] = pl.col_expand_mul(p_act, channel)
+            group_done[local_group] = dq_tid
 
-        pb_tid = _proj_chain(
-            o_packed,
-            wo_a_shard,
-            wo_b_shard,
-            o_r_pad,
-            o_r_i8_pad,
-            act_scale_col,
-            partial,
-            row_base_o,
-            upstream,
-            pad_tid,
-        )
-
-        # Dequantize before the wire, so what crosses it is addable. `wo_b_scale` is
-        # per-channel and shared across ranks, so it distributes over the cross-rank
-        # sum and rides this pass too -- the band then holds the finished value and
-        # nothing is left to scale on the far side.
-        with pl.spmd(
-            D // DEQUANT_N_TILE, name_hint="oproj_dequant", deps=[pb_tid], allow_early_resolve=True
-        ) as dq_tid:
-            dq0 = pl.tile.get_block_idx() * DEQUANT_N_TILE
-            p_f32 = pl.cast(partial[0:T, dq0 : dq0 + DEQUANT_N_TILE], target_type=pl.FP32, mode="none")
-            if T < 8:
-                for row in pl.range(T):
-                    p_scale = pl.read(act_scale_col, [row, 0])
-                    partial_row = p_f32[row : row + 1, :]
-                    scaled_row = pl.mul(partial_row, p_scale)
-                    channel_row = pl.col_expand_mul(
-                        scaled_row, wo_b_scale_2d[0:1, dq0 : dq0 + DEQUANT_N_TILE]
-                    )
-                    part_f32[row : row + 1, dq0 : dq0 + DEQUANT_N_TILE] = channel_row
-            else:
-                p_act = pl.row_expand_mul(p_f32, act_scale_col[0:T, 0:1])
-                part_f32[0:T, dq0 : dq0 + DEQUANT_N_TILE] = pl.col_expand_mul(
-                    p_act, wo_b_scale_2d[0:1, dq0 : dq0 + DEQUANT_N_TILE]
-                )
-
-        with pl.spmd(N_RANKS, name_hint="oproj_publish", deps=[dq_tid]) as publish_tid:
+        with pl.spmd(N_RANKS, name_hint="oproj_publish", deps=[group_done]) as publish_tid:
             peer = pl.tile.get_block_idx()
-            pld.tensor.put(
-                dst=reduce_window,
-                peer=peer,
-                src=part_f32,
-                dst_offsets=[my_row, 0],
-                src_offsets=[0, 0],
-                shape=[T, D],
-                chunk_rows=T,
-                chunk_cols=PUT_CHUNK_COLS,
-                pipeline=PUT_PIPELINE,
-            )
-            pld.system.notify(
-                target=reduce_signal,
-                peer=peer,
-                offsets=[my_rank, 0],
-                value=1,
-                op=pld.NotifyOp.AtomicAdd,
-            )
-
-        # Split from the push so the notify rides the push scope's program order
-        # and only the wait holds a core group.
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="oproj_barrier",
-            deps=[pb_tid],
-            allow_early_resolve=True,
-        ) as barrier_tid:
-            for src in pl.range(N_RANKS):
-                pld.system.wait(
-                    signal=reduce_signal,
-                    offsets=[src, 0],
-                    expected=oproj_epoch,
-                    cmp=pld.WaitCmp.Ge,
+            for publish_group in pl.range(GROUPS_PER_RANK):
+                src_row = publish_group * T
+                dst_row = lane_base + (first_group + publish_group) * T_PAD
+                pld.tensor.put(
+                    dst=reduce_window, peer=peer, src=part_f32,
+                    dst_offsets=[dst_row, 0], src_offsets=[src_row, 0], shape=[T, D],
+                    chunk_rows=T, chunk_cols=PUT_CHUNK_COLS, pipeline=PUT_PIPELINE,
                 )
+            pld.system.notify(target=reduce_signal, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
 
-        # Carry the all-peer completion fence outside the manual scope.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="oproj_barrier", deps=[publish_tid], allow_early_resolve=True) as barrier_tid:
+            for src in pl.range(N_RANKS):
+                pld.system.wait(signal=reduce_signal, offsets=[src, 0], expected=oproj_epoch, cmp=pld.WaitCmp.Ge)
         barrier_out[0] = barrier_tid
 
-    # The reduce is the sole attn_out writer and must sit OUTSIDE the manual scope:
-    # manual_scope suppresses auto-dep, so a consumer of attn_out in the caller
-    # (hc_post, in the full layer) would carry no edge to this write and would read
-    # the buffer while the reduce is still filling it. The barrier's TaskId rides an
-    # Array[TASK_ID], the sanctioned way out of a scope that has closed.
-    # One block per D tile carrying all T rows: [1, REDUCE_D_TILE] blocks make this
-    # 64 tasks whose per-task fixed cost dominates 2 KB of loads.
-    with pl.spmd(
-        D // REDUCE_D_TILE, name_hint="oproj_reduce", deps=[barrier_out[0]], allow_early_resolve=True
-    ) as _reduce_tid:
+    with pl.spmd(D // REDUCE_D_TILE, name_hint="oproj_reduce", deps=[barrier_out[0]], allow_early_resolve=True):
         d0 = pl.tile.get_block_idx() * REDUCE_D_TILE
         acc = pl.tile.full([T, REDUCE_D_TILE], dtype=pl.FP32, value=0.0)
-        for source_rank in pl.range(N_RANKS):
-            source_row = lane_base + source_rank * T_PAD
-            partial_rank = pl.load(reduce_window, [source_row, d0], [T, REDUCE_D_TILE])
-            acc = pl.add(acc, partial_rank)
+        for source_group in pl.range(O_GROUPS):
+            source_row = lane_base + source_group * T_PAD
+            partial_group = pl.load(reduce_window, [source_row, d0], [T, REDUCE_D_TILE])
+            acc = pl.add(acc, partial_group)
         narrowed = pl.cast(acc, target_type=pl.BF16, mode="rint")
         pl.store(narrowed, [0, d0], attn_out)
-
     return attn_out
 
 
@@ -468,8 +404,8 @@ def clear_oproj_signals(
 @pl.jit.inline
 def o_proj_tp(
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
-    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     l2_evict: pl.Tensor[[EVICT_BLOCKS, EVICT_PER_BLOCK], pl.INT8],
     l2_evict_sink: pl.Tensor[[EVICT_BLOCKS, EVICT_CHUNK], pl.INT8],
@@ -503,8 +439,8 @@ def o_proj_tp(
 @pl.jit
 def o_proj_tp_test(
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
-    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     l2_evict: pl.Tensor[[EVICT_BLOCKS, EVICT_PER_BLOCK], pl.INT8],
     l2_evict_sink: pl.Tensor[[EVICT_BLOCKS, EVICT_CHUNK], pl.INT8],
@@ -521,8 +457,8 @@ def o_proj_tp_test(
 @pl.jit.host
 def l3_o_proj_tp(
     o_packed: pl.Tensor[[N_RANKS, O_GROUPS * T, O_GROUP_IN], pl.BF16],
-    wo_a_shard: pl.Tensor[[N_RANKS, 1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[N_RANKS, D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[N_RANKS, GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     l2_evict: pl.Tensor[[N_RANKS, EVICT_BLOCKS, EVICT_PER_BLOCK], pl.INT8],
     l2_evict_sink: pl.Tensor[[N_RANKS, EVICT_BLOCKS, EVICT_CHUNK], pl.INT8],
@@ -542,8 +478,8 @@ def l3_o_proj_tp(
 def o_proj_tp_reuse_test(
     o_packed: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
     o_packed_epoch2: pl.Tensor[[O_GROUPS * T, O_GROUP_IN], pl.BF16],
-    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     l2_evict: pl.Tensor[[EVICT_BLOCKS, EVICT_PER_BLOCK], pl.INT8],
     l2_evict_sink: pl.Tensor[[EVICT_BLOCKS, EVICT_CHUNK], pl.INT8],
@@ -591,8 +527,8 @@ def o_proj_tp_reuse_test(
 def l3_o_proj_tp_reuse(
     o_packed: pl.Tensor[[N_RANKS, O_GROUPS * T, O_GROUP_IN], pl.BF16],
     o_packed_epoch2: pl.Tensor[[N_RANKS, O_GROUPS * T, O_GROUP_IN], pl.BF16],
-    wo_a_shard: pl.Tensor[[N_RANKS, 1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[N_RANKS, D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[N_RANKS, GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     l2_evict: pl.Tensor[[N_RANKS, EVICT_BLOCKS, EVICT_PER_BLOCK], pl.INT8],
     l2_evict_sink: pl.Tensor[[N_RANKS, EVICT_BLOCKS, EVICT_CHUNK], pl.INT8],
@@ -611,7 +547,7 @@ def l3_o_proj_tp_reuse(
 
 # === Golden =================================================================
 def _golden_o_proj(o_packed, wo_a, wo_b_i8, wo_b_scale):
-    """Torch reference, term for term with decode_sparse_attn_hca's grouped o_proj."""
+    """Independent grouped projection reference."""
     import torch
 
     o_model = o_packed.float().reshape(O_GROUPS, T, O_GROUP_IN)
@@ -630,12 +566,19 @@ def _golden_o_proj(o_packed, wo_a, wo_b_i8, wo_b_scale):
     return out.to(torch.bfloat16)
 
 
-def golden_tp(tensors):
+def projection_weights(tensors):
+    """Reconstruct full projection matrices from contiguous per-rank group banks."""
     import torch
 
-    # Rebuild the full weights from the per-rank shards: rank r holds group r.
-    wo_a_full = torch.cat([tensors["wo_a_shard"][r] for r in range(N_RANKS)], dim=0)
-    wo_b_full = torch.cat([tensors["wo_b_shard"][r] for r in range(N_RANKS)], dim=1)
+    wo_a = torch.cat(list(tensors["wo_a_shard"].unbind(0)), dim=0)
+    groups_b = torch.cat(list(tensors["wo_b_shard"].unbind(0)), dim=0)
+    wo_b = groups_b.permute(1, 0, 2).reshape(D, O_GROUPS * O_LORA).contiguous()
+    return wo_a, wo_b
+
+
+def golden_tp(tensors):
+
+    wo_a_full, wo_b_full = projection_weights(tensors)
     for r in range(tensors["o_packed"].shape[0]):
         tensors["attn_out"][r] = _golden_o_proj(
             tensors["o_packed"][r],
@@ -681,20 +624,20 @@ def build_tensor_specs():
         ),
     ]
     specs += [
-        # Card r carries group r's proj_a rows and proj_b columns only.
+        # Rank r carries its consecutive logical groups in contiguous banks.
         TensorSpec(
             "wo_a_shard",
-            [N_RANKS, 1, O_LORA, O_GROUP_IN],
+            [N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN],
             torch.bfloat16,
-            init_value=lambda: torch.stack([wo_a[r : r + 1] for r in range(N_RANKS)], dim=0),
+            init_value=lambda: torch.stack([wo_a[r * GROUPS_PER_RANK : (r + 1) * GROUPS_PER_RANK] for r in range(N_RANKS)], dim=0),
             resident="stacked",
         ),
         TensorSpec(
             "wo_b_shard",
-            [N_RANKS, D, O_LORA],
+            [N_RANKS, GROUPS_PER_RANK, D, O_LORA],
             torch.int8,
             init_value=lambda: torch.stack(
-                [wo_b[:, r * O_LORA : (r + 1) * O_LORA] for r in range(N_RANKS)], dim=0
+                [wo_b.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2)[r * GROUPS_PER_RANK:(r + 1) * GROUPS_PER_RANK] for r in range(N_RANKS)], dim=0
             ),
             resident="stacked",
         ),
@@ -753,6 +696,8 @@ if __name__ == "__main__":
         "--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4)
     )
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
+    parser.add_argument("--tp", type=int, default=N_RANKS, choices=[1, 2, 4, 8])
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("--single-epoch", action="store_true", help="Replay the original one-epoch entry and its saved fixtures.")
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -800,7 +745,7 @@ if __name__ == "__main__":
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
             backend_type=args.platform.removesuffix("sim"),
-            execution_mode=args.platform.endswith("sim"),
+            execution_mode=args.sim or args.platform.endswith("sim"),
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_pmu=args.enable_pmu,
         ),
