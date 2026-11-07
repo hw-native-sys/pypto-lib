@@ -237,6 +237,18 @@ reduction. Standalone grouped projections retain their own arithmetic.
 These choices do not establish bitwise equivalence with device instructions;
 the existing numerical comparisons remain required.
 
+The LM-head Torch reference projects at most two independent owners per
+batch. Each owner retains its row selection, BF16-rounded operands and FP32
+matrix multiplication, zero rows, and sampling inputs. Device kernels and
+comparison thresholds are unchanged.
+
+The HCA Torch reference skips matrix products for fully masked sparse tiles
+and materializes their original neutral statistics: a `NEG_INF` maximum and
+positive-zero denominator and numerator. Every block remains in its original
+softmax merge position. Valid tiles retain their existing arithmetic.
+These optimizations affect host-side reference work only; device kernels and
+comparison thresholds are unchanged.
+
 - Default execution and `--smoke` execute all 43 layers without a numerical
   comparison. They permit generated inputs or input-only replay and report
   no correctness verdict. Saved expected outputs require explicit `--full`.
