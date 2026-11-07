@@ -94,9 +94,9 @@ accuracy or an official DSpark tolerance. These checks do not establish output
 quality on SpeedBench, MT-Bench, long contexts, or other workloads.
 The full-forward command uses up to 32 CPU threads for the Torch reference
 unless `PYPTO_GOLDEN_NUM_THREADS` is explicitly set.
-Device CI runs `--test-layers 5`, covering two SWA layers followed by CSA,
-HCA, and CSA plus the output head. The default remains the full 43-layer
-forward; the five-layer result is not full-model qualification.
+PR and daily device CI run the default 43-layer forward execution smoke. It
+does not compute or compare a golden. Use `--test-layers 5` for an explicit
+five-layer smoke; that result is not full-model qualification.
 
 The standalone CSA fixture permits at most 5% of points to exceed `3e-3` under
 `ratio_reldiff`'s combined absolute/relative rule and retains its worst-point cap
@@ -195,6 +195,11 @@ and declare `# ci: devices=2`. Only the multi-layer `decode_fwd.py` and
 run with `-p a2a3 --sim`, including their original golden and state comparisons.
 Both pull-request and daily selectors honor these markers.
 
+PR and daily device sweeps use the same runner, command defaults, logging
+environment, disabled benchmarking, 3600-second queue wait and 900-second
+per-entry execution budget. Entry device counts remain declared by
+`# ci: devices` markers.
+
 The composed `decode_swa.py`, `decode_hca.py`, and `decode_csa.py` entries use
 two physical TP ranks by default and declare `# ci: devices=2`. Each rank
 processes its consecutive head groups. CSA assigns four logical tokens per
@@ -212,9 +217,9 @@ inputs. Their attention call sites create singleton group views without
 copying or changing the public request parameter shapes.
 
 `decode_fwd.py` executes all 43 layers without computing or comparing a golden
-by default. Device CI selects five layers with `--test-layers 5`, retaining
-the same execution-only mode and covering SWA, CSA and HCA. Use `--full` to opt into the independent Torch
-comparison or a complete saved reference. It includes embedding, request-derived metadata,
+by default, in both PR and daily CI. Use `--test-layers 5` for an explicit
+five-layer smoke. Use `--full` to opt into the independent Torch comparison
+or a complete saved reference. It includes embedding, request-derived metadata,
 2 SWA / 21 CSA / 20 HCA attention layers, 43 TP MoE layers, HC head,
 final RMSNorm, vocabulary-sharded logits and sampling. All eight mutable
 cache/state pools and the four public outputs are compared by the existing
