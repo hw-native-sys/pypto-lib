@@ -625,6 +625,25 @@ The routed-expert implementation shared by prefill
 and decode retains its 16-row tiles and existing rounding and quantization
 boundaries.
 The standalone entry supports `--save-data` and `--golden-data` for replay.
+Its input and weight/scale pairs share lazy initializers, so frozen replay
+constructs specifications without generating random activation or weight tensors.
+
+The measured pypto-lib revisions are:
+
+- Mainline baseline: [`521058090d2792cc2e6344c6c0ca1e670c9291c5`](https://github.com/hw-native-sys/pypto-lib/commit/521058090d2792cc2e6344c6c0ca1e670c9291c5).
+- Paired-projection baseline: [`e02a7c039713a0e0610bdcf768e15f48ce6ec3fb`](https://github.com/hw-native-sys/pypto-lib/commit/e02a7c039713a0e0610bdcf768e15f48ce6ec3fb).
+- Optimized device kernel: [`9c79b577207f3bbf0f31e94b36cc5f5b127bee3b`](https://github.com/hw-native-sys/pypto-lib/commit/9c79b577207f3bbf0f31e94b36cc5f5b127bee3b).
+
+All three measurements used this matched toolchain:
+
+| Component | Revision / version |
+| --- | --- |
+| PyPTO | `ce0eb7c07fad364b6b169ee99a55950283e60dae` |
+| simpler runtime | `d8f997fabd1b6988b69a94feef61ab669dda0eea` |
+| PTOAS | `0.67` |
+| PTO-ISA | `b1d460ee8c001585ede36b68ba3678dc5a226bbf` |
+| CANN | `9.0.0` |
+| PyTorch | `2.9.1+cpu` |
 
 On A3 device 0, with hidden size 4096, intermediate size 2048 and 18 local
 experts, single-card `effective_us` medians were measured over 100 rounds
@@ -639,8 +658,9 @@ Rows below are received routed rows distributed across the local experts.
 | 96 | 507.81 | 431.31 | 15.1% |
 | 512 | 878.12 | 706.64 | 19.5% |
 
-Relative to the paired-projection baseline, independent W2 completion and
-cached activation maxima reduce these component medians by 3.5% to 5.1%.
+Relative to the paired-projection baseline (`e02a7c0`), independent W2
+completion and cached activation maxima reduce these component medians by
+3.5% to 5.1%.
 
 These component measurements do not establish serving throughput gains.
 

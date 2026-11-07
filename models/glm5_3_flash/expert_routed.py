@@ -9,6 +9,7 @@
 """GLM-5.3-Flash routed W8A8 SwiGLU experts."""
 
 import sys
+from functools import cache
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -417,29 +418,28 @@ def build_tensor_specs(num_tokens=T_DYN_TEST):
     offsets = torch.zeros(N_LOCAL_EXPERTS + 1, dtype=torch.int32)
     offsets[1:] = torch.cumsum(per_expert, dim=0).to(torch.int32)
 
-    x_bf16 = torch.randn(total, D, dtype=torch.bfloat16)
-
-    def init_x_int8():
-
-        x_i8, _ = quantize_per_token_int8(x_bf16)
-        return x_i8
-
-    def init_x_scale():
-
-        _, x_sd = quantize_per_token_int8(x_bf16)
-        return x_sd
+    @cache
+    def init_x():
+        x_bf16 = torch.randn(total, D, dtype=torch.bfloat16)
+        return quantize_per_token_int8(x_bf16)
 
     ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
-    w_gu_i8, w_gu_s = gen_routed_weight((N_LOCAL_EXPERTS, 2 * MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
-    w2_i8, w2_s = gen_routed_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
+
+    @cache
+    def init_gate_up():
+        return gen_routed_weight((N_LOCAL_EXPERTS, 2 * MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
+
+    @cache
+    def init_down():
+        return gen_routed_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
 
     return [
-        TensorSpec("x_int8", [total, D], torch.int8, init_value=init_x_int8),
-        TensorSpec("x_scale", [total, 1], torch.float32, init_value=init_x_scale),
-        TensorSpec("w_gate_up", [N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8, init_value=lambda: w_gu_i8),
-        TensorSpec("w_gate_up_scale", [N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda : w_gu_s),
-        TensorSpec("w_down", [N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
-        TensorSpec("w_down_scale", [N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
+        TensorSpec("x_int8", [total, D], torch.int8, init_value=lambda: init_x()[0]),
+        TensorSpec("x_scale", [total, 1], torch.float32, init_value=lambda: init_x()[1]),
+        TensorSpec("w_gate_up", [N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8, init_value=lambda: init_gate_up()[0]),
+        TensorSpec("w_gate_up_scale", [N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda: init_gate_up()[1]),
+        TensorSpec("w_down", [N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: init_down()[0]),
+        TensorSpec("w_down_scale", [N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: init_down()[1]),
         TensorSpec("expert_offsets", [N_LOCAL_EXPERTS + 1], torch.int32, init_value=lambda: offsets),
         TensorSpec("route_weights", [total, 1], torch.float32, init_value=lambda: torch.rand(total, 1)),
         TensorSpec("output", [total, D], torch.float32, init_value=torch.zeros),
