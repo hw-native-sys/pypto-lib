@@ -32,14 +32,29 @@ from config import (
 
 
 # --- Paged-KV metadata lowering. ---
+def checkpoint_ends_tensor(checkpoints):
+    """Pack up to three ordered checkpoint boundaries per request."""
+    result = torch.zeros((len(checkpoints), 3), dtype=torch.int32)
+    for index, values in enumerate(checkpoints):
+        values = [values] if isinstance(values, int) else list(values)
+        if any(v < 0 for v in values):
+            raise ValueError("checkpoint boundaries must be nonnegative")
+        values = sorted(set(v for v in values if v))
+        if len(values) > 3:
+            raise ValueError("at most three checkpoints may intersect one Prefill chunk")
+        result[index, :len(values)] = torch.tensor(values, dtype=torch.int32)
+    return result
+
+
 def prefill_state_fixture(
     start_pos, token_count, checkpoint_end, *, history, block_size, table, physical_blocks,
 ):
     """Allocate non-aliasing entry and publication rows for checkpoint fixtures."""
     positions = torch.arange(start_pos, start_pos + token_count, dtype=torch.int64)
-    if checkpoint_end == 0:
+    checkpoints = checkpoint_ends_tensor([checkpoint_end])[0].tolist()
+    if not any(checkpoints):
         return table, table[positions // block_size].long() * block_size + positions % block_size, physical_blocks
-    if not 0 < checkpoint_end <= len(table) * block_size:
+    if max(checkpoints) > len(table) * block_size:
         raise ValueError("fixture checkpoint exceeds the model context")
     read_first = max(0, start_pos - history) // block_size
     read_stop = (start_pos + block_size - 1) // block_size
@@ -63,12 +78,12 @@ def validate_prefill_state_checkpoint(
     Callers retain published checkpoint pages across forwards with their normal
     snapshot/COW lifetime rules. Kernel execution never performs this scan.
     """
-    checkpoint = int(tensors["state_checkpoint_ends"][0])
-    if checkpoint == 0:
+    checkpoints = tensors["state_checkpoint_ends"][0].reshape(-1).tolist()
+    if not any(checkpoints):
         return
     positions = tensors["position_ids"].tolist()
     start, end = positions[0], positions[-1] + 1
-    if positions != list(range(start, end)) or checkpoint < 0:
+    if positions != list(range(start, end)) or any(b < 0 for b in checkpoints):
         raise ValueError("checkpoint validation requires consecutive positions and a nonnegative checkpoint")
     mapping = tensors[slot_name].tolist()
     table = tensors[table_name][0]
@@ -91,12 +106,13 @@ def validate_prefill_state_checkpoint(
         if physical in owners and owners[physical] != position:
             raise ValueError("entry state rows alias")
         owners[physical] = position
-        if checkpoint - history <= position < checkpoint:
+        if any(b - history <= position < b for b in checkpoints):
             retained[physical] = position
     for offset in range(0, len(positions), 512):
         tile_start, tile_end = start + offset, min(start + offset + 512, end)
         published = set(range(max(tile_start, tile_end - tail), tile_end))
-        published.update(range(max(tile_start, checkpoint - history), min(tile_end, checkpoint)))
+        for boundary in checkpoints:
+            published.update(range(max(tile_start, boundary - history), min(tile_end, boundary)))
         writes = {}
         for position in published:
             physical = row(position)
@@ -105,11 +121,11 @@ def validate_prefill_state_checkpoint(
                 raise ValueError("checkpoint publication rows alias")
             writes[physical] = position
         owners.update(writes)
-        retained.update((p, q) for p, q in writes.items() if checkpoint - history <= q < checkpoint)
+        retained.update((p, q) for p, q in writes.items() if any(b - history <= q < b for b in checkpoints))
     # A target may lie in a later/earlier chunk. Validate this forward's
     # checkpoint fragment and entry history, never invent an absent full window.
-    windows = ((max(0, start - history, checkpoint - history), min(checkpoint, end)),
-               (max(0, end - history), end))
+    windows = [(max(0, start - history, b - history), min(b, end)) for b in checkpoints if b]
+    windows.append((max(0, end - history), end))
     for begin, stop in windows:
         for position in range(begin, stop):
             if owners.get(row(position)) != position:

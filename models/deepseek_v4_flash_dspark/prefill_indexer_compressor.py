@@ -9,6 +9,7 @@
 """DeepSeek-V4 prefill indexer compressor for ratio-4 overlapping KV cache."""
 
 import pypto.language as pl
+from utils import checkpoint_ends_tensor
 
 from config import (
     BLOCK_SIZE,
@@ -97,7 +98,7 @@ def _prefill_indexer_compressor_tile(
     request_start: pl.Scalar[pl.INDEX],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
-    checkpoint_end: pl.Scalar[pl.INT32],
+    checkpoint_ends: pl.Tensor[[3], pl.INT32],
 ):
     state_block_num = pl.tensor.dim(compress_state, 0)
     request_position = pl.read(position_ids, [request_start])
@@ -396,16 +397,31 @@ def _prefill_indexer_compressor_tile(
     publish_rows = pl.min(tile_rows, STATE_LEN)
     publish_base = tile_rows - publish_rows
     tile_position = pl.read(position_ids, [tile_base])
-    checkpoint_begin = pl.max(tile_position, checkpoint_end - STATE_LEN)
-    checkpoint_stop = pl.min(tile_position + publish_base, checkpoint_end)
-    checkpoint_rows = pl.max(0, checkpoint_stop - checkpoint_begin)
+    checkpoint_rows = pl.cast(0, pl.INDEX)
+    previous_end = pl.cast(0, pl.INT32)
+    for checkpoint_i in pl.range(3):
+        checkpoint_end = pl.read(checkpoint_ends, [checkpoint_i])
+        checkpoint_begin = pl.max(tile_position, pl.max(checkpoint_end - STATE_LEN, previous_end))
+        checkpoint_stop = pl.min(tile_position + publish_base, checkpoint_end)
+        checkpoint_rows = checkpoint_rows + pl.max(0, checkpoint_stop - checkpoint_begin)
+        previous_end = pl.max(previous_end, checkpoint_end)
     publish_count = publish_rows + checkpoint_rows
     with pl.spmd(publish_count, name_hint="prefill_idx_c4_state_tail_publish", deps=[pool_tid]) as state_publish_tid:
         publish_i = pl.tile.get_block_idx()
         if publish_i < publish_count:
             publish_local = publish_base + publish_i
             if publish_i >= publish_rows:
-                publish_local = checkpoint_begin - tile_position + publish_i - publish_rows
+                checkpoint_offset = publish_i - publish_rows
+                selected_previous = pl.cast(0, pl.INT32)
+                for selected_i in pl.range(3):
+                    selected_end = pl.read(checkpoint_ends, [selected_i])
+                    selected_begin = pl.max(tile_position, pl.max(selected_end - STATE_LEN, selected_previous))
+                    selected_stop = pl.min(tile_position + publish_base, selected_end)
+                    selected_rows = pl.max(0, selected_stop - selected_begin)
+                    if checkpoint_offset >= 0 and checkpoint_offset < selected_rows:
+                        publish_local = selected_begin - tile_position + checkpoint_offset
+                    checkpoint_offset = checkpoint_offset - selected_rows
+                    selected_previous = pl.max(selected_previous, selected_end)
             publish_global = tile_base + publish_local
             publish_row_raw = pl.read(inner_state_slot_mapping, [publish_global])
             if publish_row_raw >= 0:
@@ -567,7 +583,7 @@ def _prefill_indexer_compressor_tile(
 def prefill_indexer_compressor(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
     compress_state: pl.InOut[
         pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
@@ -646,7 +662,7 @@ def prefill_indexer_compressor(
                     request_start,
                     tile_base,
                     tile_rows,
-                    pl.read(state_checkpoint_ends, [request]),
+                    state_checkpoint_ends[request],
                 )
 
     # Compressor completion fence.
@@ -665,7 +681,7 @@ def prefill_indexer_compressor(
 def prefill_indexer_compressor_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
     compress_state: pl.InOut[
         pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
@@ -852,11 +868,11 @@ def golden_prefill_indexer_compressor(tensors):
             cache_rows[dst_row] = row_i8
             scale_rows[dst_row] = 1.0 / scale_q
 
-        checkpoint_end = int(tensors["state_checkpoint_ends"][0])
+        checkpoint_ends = tensors["state_checkpoint_ends"][0].reshape(-1).tolist()
         publish_base = max(tile_base, tile_end - STATE_LEN)
         for token_id in range(tile_base, tile_end):
             position = int(position_ids[token_id])
-            if token_id < publish_base and not max(0, checkpoint_end - STATE_LEN) <= position < checkpoint_end:
+            if token_id < publish_base and not any(max(0, b - STATE_LEN) <= position < b for b in checkpoint_ends):
                 continue
             dst_row = int(tensors["inner_state_slot_mapping"][token_id].item())
             if dst_row < 0:
@@ -981,7 +997,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
-        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.tensor([checkpoint_end], dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", [1, 3], torch.int32, init_value=checkpoint_ends_tensor([checkpoint_end])),
         TensorSpec(
             "compress_state",
             [state_blocks, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
@@ -1060,7 +1076,7 @@ if __name__ == "__main__":
 
     cases = [(args.start_pos, args.token_count, 0)]
     if args.start_pos == START_POS and args.token_count == PREFILL_SEQ:
-        cases.extend(((0, 8192, 8064), (33, 1024, 640), (127, 513, 128)))
+        cases.extend(((0, 8192, (512, 4096, 8064)), (33, 1024, 640), (127, 513, 128)))
     for start_pos, token_count, checkpoint_end in cases:
         result = run(
             fn=prefill_indexer_compressor_test,

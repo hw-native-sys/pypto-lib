@@ -123,7 +123,7 @@ if GROUP_TOKENS > PREFILL_GROUP_CAP:
 def prefill_layer_attention(
     x_hc: pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -438,7 +438,7 @@ def prefill_layer_moe(
 def l3_prefill_layer(
     x_hc: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[N_RANKS, QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[N_RANKS, REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[N_RANKS, REQUESTS_DYN, 3], pl.INT32],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],

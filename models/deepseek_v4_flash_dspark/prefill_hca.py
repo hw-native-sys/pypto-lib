@@ -10,6 +10,7 @@
 """DeepSeek-V4 packed prefill HCA (ratio-128) attention over one contiguous run of <=T tokens."""
 
 import pypto.language as pl
+from utils import checkpoint_ends_tensor
 
 from config import (
     BLOCK_SIZE,
@@ -111,7 +112,7 @@ HCA_CMP_BLOCK_NUM = SPARSE_CMP_BLOCK_NUM
 def _prefill_attention_hca(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
     local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -735,7 +736,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     return [
         TensorSpec("x_hc", [token_count, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=init_query_start_loc),
-        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.tensor([checkpoint_end], dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", [1, 3], torch.int32, init_value=checkpoint_ends_tensor([checkpoint_end])),
         TensorSpec("local_request_ids", [token_count], torch.int32, init_value=init_local_request_ids),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
@@ -799,7 +800,7 @@ def prefill_attention_hca_cp_core(
     x_normed_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
     x_normed_full: pl.Tensor[[CP_KV_T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
     local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
@@ -985,7 +986,7 @@ def prefill_attention_hca_cp_core(
 def prefill_attention_hca_cp(
     x_hc_full: pl.Tensor[[CP_KV_T_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
     local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -1112,7 +1113,7 @@ def prefill_attention_hca_cp(
 def prefill_attention_hca_cp_test(
     x_hc_full: pl.Tensor[[CP_KV_T_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
     local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -1215,7 +1216,7 @@ def prefill_attention_hca_cp_test(
 def l3_prefill_attention_hca_cp(
     x_hc_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[TP_SIZE, QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[TP_SIZE, REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[TP_SIZE, REQUESTS_DYN, 3], pl.INT32],
     local_request_ids: pl.Tensor[[TP_SIZE, CP_Q_T_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[TP_SIZE, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[TP_SIZE, 3], pl.FP32],
@@ -1495,7 +1496,7 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE, checkpoint_ends: tuple
 
     replacements = {
         "query_start_loc": cp_stack(query_start_loc, tp_size),
-        "state_checkpoint_ends": cp_stack(torch.tensor(checkpoint_ends, dtype=torch.int32), tp_size),
+        "state_checkpoint_ends": cp_stack(checkpoint_ends_tensor(checkpoint_ends), tp_size),
         "local_request_ids": request_ids.reshape(tp_size, token_count // tp_size).contiguous(),
         "freqs_cos": cp_stack(freqs_cos, tp_size),
         "freqs_sin": cp_stack(freqs_sin, tp_size),

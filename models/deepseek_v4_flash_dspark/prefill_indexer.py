@@ -648,7 +648,7 @@ def _prefill_indexer_dense_tile(
 def prefill_indexer(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
@@ -940,7 +940,7 @@ def golden_prefill_indexer(tensors):
 def prefill_indexer_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     # NOT pl.NZ: o0/tail_o0 are formed via integer division of a flattened
@@ -1236,7 +1236,7 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
-        TensorSpec("state_checkpoint_ends", [1], torch.int32, init_value=torch.zeros(1, dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", [1, 3], torch.int32, init_value=torch.zeros((1, 3), dtype=torch.int32)),
         TensorSpec("qr", [token_count, Q_LORA], torch.int8, init_value=lambda: qr_i8),
         TensorSpec("qr_scale", [token_count, 1], torch.float32, init_value=lambda: qr_scale),
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),

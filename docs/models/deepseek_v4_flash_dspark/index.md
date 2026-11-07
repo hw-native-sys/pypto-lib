@@ -113,12 +113,12 @@ orchestrations, and the same `hc_head → rms_norm → lm_head` tail. Prompt
 sequence lengths that do not divide the CP group are padded rather than
 rejected, so one program serves an arbitrary chunk against a resident prefix.
 
-Prefill also takes `state_checkpoint_ends`, an INT32 vector with one absolute
-checkpoint boundary per packed request (rank-stacked in L3). The caller uses
-the same aligned boundary as its Prefix Cache replay policy; a zero boundary
-requests no extra checkpoint publication. HCA and both CSA compressors publish the required
-history window at that boundary from their existing tile projections, in
-addition to their normal terminal tails. A window spanning chunks is completed
+Prefill also takes `state_checkpoint_ends`, an INT32 `[requests, 3]` matrix
+(rank-stacked in L3). Each row contains up to three ordered, unique absolute
+boundaries, with unused entries zeroed. The caller selects periodic, replay,
+and shared-prefix boundaries; an all-zero row requests no extra publication.
+HCA and both CSA compressors publish the union of the required history windows
+from their existing tile projections, in addition to their normal terminal tails. A window spanning chunks is completed
 by those chunks before it becomes reusable. Intermediate state positions are
 not all materialized and must not be indexed as immutable Prefix Cache solely
 because their tokens have been computed.
@@ -139,8 +139,8 @@ must use other pages or the caller's existing copy-on-write mechanism.
 Increasing the read view alone does not protect checkpoint destination pages.
 
 The compressor fixture builders accept `checkpoint_end=0` by default. A
-nonzero boundary allocates non-aliasing entry and publication rows covering
-that bounded fixture. A partial entry page retains its history rows and accepts
+nonzero boundary, or a tuple of up to three boundaries, allocates non-aliasing
+entry and publication rows covering that bounded fixture. A partial entry page retains its history rows and accepts
 new rows in place, keeping the checkpoint representable by one page table.
 The Host references reject missing or aliased state.
 The three standalone compressor validations run the original zero-boundary
