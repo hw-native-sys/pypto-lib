@@ -85,9 +85,10 @@ def expert_shared(
         h_fp32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.FP32)
         h_i8 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT8)
         h_scale_dq = pl.create_tensor([SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_h_i8_init"):
-            h_i8_value_full = pl.full([SH_M_TILE, MOE_INTER], dtype=pl.FP16, value=0.0)
-            h_i8[:, :] = pl.cast(h_i8_value_full, target_type=pl.INT8, mode="trunc")
+        if valid_rows < SH_M_TILE:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_h_i8_init"):
+                h_i8_value_full = pl.full([SH_M_TILE, MOE_INTER], dtype=pl.FP16, value=0.0)
+                h_i8[:, :] = pl.cast(h_i8_value_full, target_type=pl.INT8, mode="trunc")
         n_act_blocks = (valid_rows + SH_ROW_TILE - 1) // SH_ROW_TILE
         for row_block in pl.spmd(n_act_blocks, name_hint="sh_gate_up_act_q"):
             row0 = row_block * SH_ROW_TILE

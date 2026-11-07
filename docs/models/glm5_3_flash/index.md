@@ -684,6 +684,32 @@ in experts whose weights are consumed by one row tile per invocation.
 
 These component measurements do not establish serving throughput gains.
 
+### Shared expert measurements
+
+The shared expert initializes its INT8 requantization buffer only for partial
+16-row tiles. For a full tile, the activation/quantization blocks overwrite
+every row before W2 consumes it, so the separate zero-fill task is redundant.
+Partial tiles retain their original initialization and output masks.
+
+On A3 device 0, with the matched toolchain above, 100 measured rounds after
+5 warmups and the original frozen goldens, standalone shared-expert medians
+changed as follows. The intermediate width is 2048 divided by shared TP.
+
+| Shared TP | Token rows | Before (us) | After (us) | Latency reduction |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 16 | 188.18 | 186.36 | 1.0% |
+| 1 | 17 | 192.92 | 192.37 | 0.3% |
+| 1 | 192 | 411.34 | 415.04 | -0.9% |
+| 8 | 16 | 54.83 | 52.90 | 3.5% |
+| 8 | 17 | 58.01 | 55.69 | 4.0% |
+| 8 | 192 | 129.30 | 119.40 | 7.7% |
+| 16 | 16 | 46.96 | 44.94 | 4.3% |
+| 16 | 17 | 49.46 | 48.00 | 3.0% |
+| 16 | 192 | 115.67 | 108.41 | 6.3% |
+
+All nine cases pass the original comparator. TP1 is approximately flat;
+the measured gain is concentrated in TP8/TP16. These are component timings.
+
 ### Vocabulary operators
 
 `lookup_embedding.py` gathers from one BF16 vocabulary shard using global token
