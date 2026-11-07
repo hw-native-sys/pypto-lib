@@ -200,6 +200,7 @@ HCA_LAYER_STACKED_NAMES = [
 ]
 # Per-rank tensors shared by every layer.
 SHARED_NAMES = [
+    "state_checkpoint_ends",
     "swa_freqs_cos", "swa_freqs_sin",
     "compressed_freqs_cos", "compressed_freqs_sin",
     "hca_cmp_freqs_cos", "hca_cmp_freqs_sin",
@@ -263,6 +264,7 @@ def _copy_target_hc_row(
 def prefill_fwd(
     x_hc: pl.InOut[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -389,6 +391,7 @@ def prefill_fwd(
     the physical token shape and participate in every EP MoE wave.
     """
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
     hca_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     csa_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     csa_inner_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
@@ -730,7 +733,7 @@ def prefill_fwd(
                 if group_tokens > 0:
                     prefill_attention_csa_cp(
                         x_hc,
-                        query_start_loc,
+                        query_start_loc, state_checkpoint_ends,
                         hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa,
                         attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
                         wkv_csa, gamma_cq_csa, gamma_ckv_csa,
@@ -867,7 +870,7 @@ def prefill_fwd(
                 if group_tokens > 0:
                     prefill_attention_hca_cp(
                         x_hc,
-                        query_start_loc, local_request_ids,
+                        query_start_loc, state_checkpoint_ends, local_request_ids,
                         hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
                         attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
                         wkv_hca, gamma_cq_hca, gamma_ckv_hca,
@@ -1030,7 +1033,7 @@ def prefill_fwd(
             if group_tokens > 0:
                 prefill_attention_csa_cp(
                     x_hc,
-                    query_start_loc,
+                    query_start_loc, state_checkpoint_ends,
                     hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last,
                     attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
                     wkv_last, gamma_cq_last, gamma_ckv_last,
@@ -1135,6 +1138,7 @@ def prefill_fwd(
 def l3_prefill_fwd(
     x_hc: pl.InOut[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     query_start_loc: pl.Tensor[[N_RANKS, QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[N_RANKS, REQUESTS_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -1250,6 +1254,7 @@ def l3_prefill_fwd(
     """
     x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     query_start_loc.bind_dynamic(1, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(1, REQUESTS_DYN)
     hca_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
     csa_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
     csa_inner_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
@@ -1327,7 +1332,7 @@ def l3_prefill_fwd(
         lm_head_logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         prefill_fwd(
             x_hc[r],
-            query_start_loc[r],
+            query_start_loc[r], state_checkpoint_ends[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
             attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r],
             wkv[r], gamma_cq[r], gamma_ckv[r],
@@ -1500,7 +1505,7 @@ def _global_token_index_map(local_tokens, torch):
 
 # Canonical host-tensor order for a single unified prefill layer.
 HOST_TENSOR_ORDER = (
-    "x_hc", "query_start_loc",
+    "x_hc", "query_start_loc", "state_checkpoint_ends",
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
     "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
     "swa_freqs_cos", "swa_freqs_sin",
@@ -1591,6 +1596,7 @@ def build_single_layer_tensor_specs(
     attention_specs = [
         ("x_hc", active["x_hc_full"]),
         ("query_start_loc", csa["query_start_loc"]),
+        ("state_checkpoint_ends", csa["state_checkpoint_ends"]),
         ("hc_attn_fn", active["hc_attn_fn"]), ("hc_attn_scale", active["hc_attn_scale"]),
         ("hc_attn_base", active["hc_attn_base"]),
         ("attn_norm_w", active["attn_norm_w"]),
@@ -1759,7 +1765,7 @@ def build_tensor_specs(
     }
 
     ordered_names = [
-        "x_hc", "query_start_loc",
+        "x_hc", "query_start_loc", "state_checkpoint_ends",
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
         "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
         "kv_cache", "attn_sink", "wo_a", "wo_b", "wo_b_scale",
