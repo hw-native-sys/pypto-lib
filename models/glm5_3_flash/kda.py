@@ -1042,8 +1042,10 @@ def prefill_kda(
     # M = 1, which the cube lowers to an extract whose row count must be a multiple
     # of 16.
 
-    prod_gm = pl.create_tensor([LOCAL_KDA_H * scratch_rows, 5 * KDA_DIM], dtype=pl.FP32)
-    estep_gm = pl.create_tensor([LOCAL_KDA_H * scratch_rows, 5 * KDA_DIM], dtype=pl.FP32)
+    # Adjacent stages use opposite banks. Their explicit dependencies retire all
+    # reads before a bank is reused, so earlier inverse iterates need not stay live.
+    prod_gm = pl.create_tensor([LOCAL_KDA_H * scratch_rows, 2 * KDA_DIM], dtype=pl.FP32)
+    estep_gm = pl.create_tensor([LOCAL_KDA_H * scratch_rows, 2 * KDA_DIM], dtype=pl.FP32)
     with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_inv_seed", deps=[chunk_tid]) as seed_tid:
         task = pl.tile.get_block_idx()
         h = task // requests
@@ -1091,10 +1093,10 @@ def prefill_kda(
             e16 = estep_gm[rb : rb + CHUNK_TILE, 128 : 128 + CHUNK_TILE]
             e_wide = estep_gm[rb : rb + CHUNK_TILE, 128 : 128 + KDA_DIM]
             two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
-            prod_gm[rb:rb + CHUNK_TILE, 256:256 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM], pl.FP32)
+            prod_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM], pl.FP32)
             estep_gm_value_sub_2 = pl.sub(e_wide, two_eye)
             estep_gm_value_matmul_2 = pl.matmul(e16, estep_gm_value_sub_2, pl.FP32)
-            estep_gm[rb:rb + CHUNK_TILE, 256:256 + KDA_DIM] = pl.add(estep_gm_value_matmul_2, two_eye)
+            estep_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM] = pl.add(estep_gm_value_matmul_2, two_eye)
 
     with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_inv2", deps=[inv1_tid]) as inv2_tid:
         task = pl.tile.get_block_idx()
@@ -1107,13 +1109,13 @@ def prefill_kda(
             off = bos + s_idx
             base = off + n * CHUNK_TILE
             rb = h * scratch_rows + base
-            e16 = estep_gm[rb : rb + CHUNK_TILE, 256 : 256 + CHUNK_TILE]
-            e_wide = estep_gm[rb : rb + CHUNK_TILE, 256 : 256 + KDA_DIM]
+            e16 = estep_gm[rb : rb + CHUNK_TILE, 0:CHUNK_TILE]
+            e_wide = estep_gm[rb : rb + CHUNK_TILE, 0:KDA_DIM]
             two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
-            prod_gm[rb:rb + CHUNK_TILE, 384:384 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 256:256 + KDA_DIM], pl.FP32)
+            prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM], pl.FP32)
             estep_gm_value_sub_3 = pl.sub(e_wide, two_eye)
             estep_gm_value_matmul_3 = pl.matmul(e16, estep_gm_value_sub_3, pl.FP32)
-            estep_gm[rb:rb + CHUNK_TILE, 384:384 + KDA_DIM] = pl.add(estep_gm_value_matmul_3, two_eye)
+            estep_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM] = pl.add(estep_gm_value_matmul_3, two_eye)
 
     with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_inv3", deps=[inv2_tid]) as inv3_tid:
         task = pl.tile.get_block_idx()
@@ -1126,13 +1128,13 @@ def prefill_kda(
             off = bos + s_idx
             base = off + n * CHUNK_TILE
             rb = h * scratch_rows + base
-            e16 = estep_gm[rb : rb + CHUNK_TILE, 384 : 384 + CHUNK_TILE]
-            e_wide = estep_gm[rb : rb + CHUNK_TILE, 384 : 384 + KDA_DIM]
+            e16 = estep_gm[rb : rb + CHUNK_TILE, 128:128 + CHUNK_TILE]
+            e_wide = estep_gm[rb : rb + CHUNK_TILE, 128:128 + KDA_DIM]
             two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
-            prod_gm[rb:rb + CHUNK_TILE, 512:512 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 384:384 + KDA_DIM], pl.FP32)
+            prod_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM], pl.FP32)
             estep_gm_value_sub_4 = pl.sub(e_wide, two_eye)
             estep_gm_value_matmul_4 = pl.matmul(e16, estep_gm_value_sub_4, pl.FP32)
-            estep_gm[rb:rb + CHUNK_TILE, 512:512 + KDA_DIM] = pl.add(estep_gm_value_matmul_4, two_eye)
+            estep_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM] = pl.add(estep_gm_value_matmul_4, two_eye)
 
     u_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, KDA_DIM], dtype=pl.FP32)
     w_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, KDA_DIM], dtype=pl.BF16)
@@ -1155,7 +1157,7 @@ def prefill_kda(
             beta_block_fillpad_2 = pl.fillpad(beta_block_slice_2, pad_value=pl.PadValue.zero)
             beta_block = pl.set_validshape(beta_block_fillpad_2, CHUNK_TILE, BETA_PAD)
             b_col = pl.row_sum(pl.col_expand_mul(beta_block, head_onehot[h : h + 1, 0:BETA_PAD]))
-            a_inv_bf = pl.cast(prod_gm[rb:rb + CHUNK_TILE, 4 * KDA_DIM:4 * KDA_DIM + CHUNK_TILE], pl.BF16, mode="rint")
+            a_inv_bf = pl.cast(prod_gm[rb:rb + CHUNK_TILE, 0:CHUNK_TILE], pl.BF16, mode="rint")
             kg_bf_slice = pl.slice(kg_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
             kg_bf_reshape = pl.reshape(kg_bf_slice, [CHUNK_TILE, KDA_DIM])
             kg_bf_row_expand_mul = pl.row_expand_mul(pl.cast(kg_bf_reshape, pl.FP32), b_col)
