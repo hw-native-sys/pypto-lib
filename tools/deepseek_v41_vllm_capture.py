@@ -50,6 +50,57 @@ TOPOLOGY = {
     "enable_expert_parallel": True,
 }
 
+CAPTURE_SCENARIOS = (
+    "single",
+    "active_batch",
+    "unequal_lengths",
+    "finished_inactive",
+    "slot_reuse",
+    "no_local_input",
+)
+
+
+def _scenario_contract(name: str, history_length: int, capture_step: int) -> dict[str, Any]:
+    """Describe the request boundary without claiming product coverage.
+
+    The reference runner can materialize the first three request schedules.  The
+    latter three need scheduler/cache controls that are not exposed by the pinned
+    vLLM API; they remain explicit not-run scenarios instead of being silently
+    represented by the single-request capture.
+    """
+
+    if name not in CAPTURE_SCENARIOS:
+        raise ValueError(f"unknown Decode capture scenario: {name}")
+    if history_length < 1 or capture_step < 1:
+        raise ValueError("history_length and capture_step must be positive")
+    supported = name in {"single", "active_batch", "unequal_lengths"}
+    if name == "single":
+        request_count = 1
+        history_lengths = [history_length]
+    elif name == "active_batch":
+        request_count = 2
+        history_lengths = [history_length, history_length]
+    elif name == "unequal_lengths":
+        request_count = 2
+        history_lengths = [history_length, max(1, history_length - 3)]
+    elif name == "finished_inactive":
+        request_count = 2
+        history_lengths = [history_length, max(1, history_length - 2)]
+    else:
+        request_count = 2
+        history_lengths = [history_length, history_length]
+    return {
+        "name": name,
+        "capture_decode_step": capture_step,
+        "reference_schedule_supported": supported,
+        "product_schedule_supported": False,
+        "request_count": request_count,
+        "history_lengths": history_lengths,
+        "finished_control": name == "finished_inactive",
+        "slot_reuse_control": name == "slot_reuse",
+        "no_local_input_control": name == "no_local_input",
+    }
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -1020,6 +1071,9 @@ def _patch_runner_capture(
     layer_state: dict[str, Any],
     *,
     skip_cache: bool = False,
+    capture_decode_step: int = 1,
+    scenario: str = "single",
+    history_length: int = 1,
 ) -> None:
     """Patch only the reference runner; the patch never enters the product."""
 
@@ -1037,7 +1091,18 @@ def _patch_runner_capture(
     original_moe_forward = DeepseekV41MoE.forward
     original_layer_forward = DeepseekV41DecoderLayer.forward
     original_muls_add = deepseek_v41_model.muls_add_triton
-    state: dict[str, Any] = {"decode": False, "captured": False, "skip_cache": skip_cache}
+    if capture_decode_step < 1:
+        raise ValueError("capture_decode_step must be positive")
+    scenario_meta = _scenario_contract(scenario, history_length, capture_decode_step)
+    state: dict[str, Any] = {
+        "decode": False,
+        "captured": False,
+        "skip_cache": skip_cache,
+        "decode_count": 0,
+        "capture_decode_step": capture_decode_step,
+        "scenario": scenario,
+        "scenario_meta": scenario_meta,
+    }
 
     def wrapped_layer_forward(self, positions, hidden_states, pre_mix, *args, **kwargs):
         capture_this = (
@@ -1166,6 +1231,14 @@ def _patch_runner_capture(
             batch = self.input_batch
             state["input_ids"] = input_ids.detach().cpu().tolist() if input_ids is not None else None
             state["positions"] = positions.detach().cpu().tolist()
+            # In vLLM V1 the decode batch may still expose the prefill value
+            # (zero) through ``num_computed_tokens_cpu``.  The model runner's
+            # position tensor is the authoritative history boundary for the
+            # captured token and keeps the cache contract useful for short
+            # pages and batched requests.
+            position_values = [int(value) for value in positions.detach().cpu().reshape(-1).tolist()]
+            if position_values and len(position_values) >= batch.num_reqs:
+                state["valid_lengths"] = position_values[: batch.num_reqs]
             state["block_table"] = [
                 (
                     group.get_numpy_array()
@@ -1187,9 +1260,24 @@ def _patch_runner_capture(
     def wrapped_execute(self, scheduler_output, intermediate_tensors=None):
         counts = getattr(scheduler_output, "num_scheduled_tokens", None)
         total = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0))
-        is_decode = total == 1 and counts is not None
+        count_values = []
+        if counts is not None:
+            if isinstance(counts, dict):
+                count_values = [int(value) for value in counts.values()]
+            else:
+                try:
+                    count_values = [int(value) for value in counts]
+                except TypeError:
+                    count_values = [int(counts)]
+        # A decode step may contain several one-token requests. Reject mixed
+        # prefill/decode schedules while allowing a whole decode batch.
+        is_decode = total > 0 and bool(count_values) and all(value <= 1 for value in count_values)
         if is_decode and not state["captured"]:
-            state["decode"] = True
+            state["decode_count"] += 1
+            state["decode"] = state["decode_count"] == state["capture_decode_step"]
+        else:
+            state["decode"] = False
+        if is_decode and state["decode"] and not state["captured"]:
             batch = self.input_batch
             state["valid_lengths"] = [
                 int(value) for value in batch.num_computed_tokens_cpu[: batch.num_reqs].tolist()
@@ -1201,7 +1289,7 @@ def _patch_runner_capture(
                 )
                 state["cache_layout"] = [_cache_description(cache) for cache in self.kv_caches]
         result = original_execute(self, scheduler_output, intermediate_tensors)
-        if is_decode and not state["captured"]:
+        if is_decode and state["decode"] and not state["captured"]:
             if not state["skip_cache"]:
                 state["cache_after"] = _clone_cache(
                     self.kv_caches, state["cache_block_ids"]
@@ -1310,6 +1398,9 @@ def _patch_runner_capture(
                 "moe_capture": moe_meta,
                 "layer_capture": layer_meta,
                 "result_type": state.get("result_type"),
+                "scenario": state.get("scenario", "single"),
+                "scenario_meta": state.get("scenario_meta", {}),
+                "decode_count": state.get("decode_count", 0),
             }
             (rank_dir / "capture.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return result
@@ -1495,13 +1586,18 @@ def _assemble_existing(args: argparse.Namespace) -> int:
         "device": "NPU tensor operations in reference process",
     }
     topology = {**TOPOLOGY, "devices": 2}
+    scenario = getattr(args, "scenario", "single")
+    capture_decode_step = int(getattr(args, "capture_decode_step", 1))
+    scenario_meta = _scenario_contract(scenario, args.history_length, capture_decode_step)
     layer_state = _layer_state_contract(checkpoint, args.layer_id)
     decode_input = {
         "session": SESSION,
         "checkpoint": str(checkpoint),
         "layer_id": args.layer_id,
         "decode_token": decode_token,
+        "decode_tokens": [decode_token] if decode_token is not None else [],
         "history_token_length": args.history_length,
+        "history_token_lengths": scenario_meta["history_lengths"],
         "prompt_token_ids": prompt_ids,
         "position_ids": first.get("positions", [args.history_length]),
         "initial_kv_cache": "history_cache.npz",
@@ -1510,10 +1606,10 @@ def _assemble_existing(args: argparse.Namespace) -> int:
         "valid_lengths": [record.get("valid_lengths") for record in records],
         "mask": {"type": "causal_swa", "window": 128, "readonly_history": True},
         "active_finished_request_state": {
-            "active": [True, True],
-            "finished": [False, False],
-            "request_count": 1,
-            "batch_padding": 1,
+            "active": [True] * scenario_meta["request_count"],
+            "finished": [False] * scenario_meta["request_count"],
+            "request_count": scenario_meta["request_count"],
+            "batch_padding": scenario_meta["request_count"],
         },
         "engram_rows": {
             "required": layer_state["engram_required"],
@@ -1525,6 +1621,9 @@ def _assemble_existing(args: argparse.Namespace) -> int:
         "topology": topology,
         "runtime_identity": identity,
         "reference_mhc": mhc_identity,
+        "scenario": scenario,
+        "scenario_contract": scenario_meta,
+        "capture_decode_step": capture_decode_step,
     }
     (output_dir / "decode_input.json").write_text(
         json.dumps(decode_input, indent=2) + "\n", encoding="utf-8"
@@ -1544,6 +1643,9 @@ def _assemble_existing(args: argparse.Namespace) -> int:
         "product_imported": False,
         "child_processes": True,
         "generated_token_ids": [decode_token] if decode_token is not None else [],
+        "scenario": scenario,
+        "scenario_contract": scenario_meta,
+        "capture_decode_step": capture_decode_step,
         "rank_capture": [
             {
                 "rank": record["rank"],
@@ -1577,6 +1679,12 @@ def _assemble_existing(args: argparse.Namespace) -> int:
 def _run_capture(args: argparse.Namespace) -> int:
     output_dir = args.output.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    scenario_meta = _scenario_contract(args.scenario, args.history_length, args.capture_decode_step)
+    if not scenario_meta["reference_schedule_supported"]:
+        raise RuntimeError(
+            f"reference scenario {args.scenario!r} is not exposed by the pinned vLLM scheduler; "
+            "leave this scenario not_run instead of reusing a single-request capture"
+        )
     if args.layer_only:
         os.environ["VLLM_CAPTURE_LAYER_ONLY"] = "1"
     ascend_home_identity = _prepare_reference_ascend_home(output_dir)
@@ -1660,6 +1768,9 @@ def _run_capture(args: argparse.Namespace) -> int:
         args.layer_id,
         layer_state,
         skip_cache=args.skip_cache,
+        capture_decode_step=args.capture_decode_step,
+        scenario=args.scenario,
+        history_length=args.history_length,
     )
 
     llm = LLM(
@@ -1689,11 +1800,26 @@ def _run_capture(args: argparse.Namespace) -> int:
     if len(prompt_ids) < args.history_length:
         raise RuntimeError("prompt tokenization produced fewer tokens than history_length")
     prompt_ids = prompt_ids[: args.history_length]
+    request_prompt_ids = [prompt_ids]
+    if scenario_meta["request_count"] > 1:
+        second = tokenizer.encode(args.prompt + " second request")
+        second_length = scenario_meta["history_lengths"][1]
+        if len(second) < second_length:
+            raise RuntimeError("second scenario prompt is shorter than its requested history length")
+        request_prompt_ids.append(second[:second_length])
     # Two generated tokens guarantee that the first generated token is a
     # separate Decode execution after the prompt prefill.
     sampling = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=2, ignore_eos=True)
-    outputs = llm.generate({"prompt_token_ids": prompt_ids}, sampling_params=sampling, use_tqdm=False)
-    generated = outputs[0].outputs[0].token_ids if outputs else []
+    requests = [{"prompt_token_ids": value} for value in request_prompt_ids]
+    outputs = llm.generate(
+        requests if len(requests) > 1 else requests[0],
+        sampling_params=sampling,
+        use_tqdm=False,
+    )
+    generated_by_request = [
+        list(output.outputs[0].token_ids) for output in outputs
+    ] if outputs else []
+    generated = generated_by_request[0] if generated_by_request else []
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
     if rank != 0:
@@ -1748,19 +1874,21 @@ def _run_capture(args: argparse.Namespace) -> int:
         "checkpoint": str(args.checkpoint.resolve()),
         "layer_id": args.layer_id,
         "decode_token": int(generated[0]) if generated else None,
+        "decode_tokens": [int(tokens[0]) for tokens in generated_by_request if tokens],
         "history_token_length": args.history_length,
+        "history_token_lengths": scenario_meta["history_lengths"],
         "prompt_token_ids": prompt_ids,
-        "position_ids": [args.history_length],
+        "position_ids": rank_records[0].get("positions", [args.history_length]),
         "initial_kv_cache": None if args.skip_cache else "history_cache.npz",
         "block_table": [record["block_table"] for record in rank_records],
         "slot_mapping": [record["slot_mapping"] for record in rank_records],
         "valid_lengths": [record["valid_lengths"] for record in rank_records],
         "mask": {"type": "causal_swa", "window": 128, "readonly_history": True},
         "active_finished_request_state": {
-            "active": [True, True],
-            "finished": [False, False],
-            "request_count": 1,
-            "batch_padding": 1,
+            "active": [True] * scenario_meta["request_count"],
+            "finished": [False] * scenario_meta["request_count"],
+            "request_count": scenario_meta["request_count"],
+            "batch_padding": scenario_meta["request_count"],
         },
         "engram_rows": {
             "required": layer_state["engram_required"],
@@ -1777,6 +1905,10 @@ def _run_capture(args: argparse.Namespace) -> int:
         "input_boundary_mode": (
             "target_layer_with_identity_prefix" if args.layer_only else "truncated_physical_prefix"
         ),
+        "scenario": args.scenario,
+        "scenario_contract": scenario_meta,
+        "capture_decode_step": args.capture_decode_step,
+        "generated_token_ids_by_request": generated_by_request,
     }
     (asset_root / "decode_input.json").write_text(json.dumps(decode_input, indent=2) + "\n", encoding="utf-8")
 
@@ -1795,6 +1927,10 @@ def _run_capture(args: argparse.Namespace) -> int:
         "product_imported": False,
         "child_processes": True,
         "generated_token_ids": list(generated),
+        "generated_token_ids_by_request": generated_by_request,
+        "scenario": args.scenario,
+        "scenario_contract": scenario_meta,
+        "capture_decode_step": args.capture_decode_step,
         "rank_capture": [
             {
                 "rank": record["rank"],
@@ -1813,7 +1949,10 @@ def _run_capture(args: argparse.Namespace) -> int:
         "runtime_identity": identity,
         "reference_mhc": mhc_identity,
         "layer_state_capture": {
-            "complete": all(record.get("layer_state_capture", {}).get("complete") is True for record in rank_records),
+            "complete": all(
+                (record.get("layer_state_capture") or {}).get("complete") is True
+                for record in rank_records
+            ),
             "compressed_kv_cache": rank_state.get("compressed_kv_cache", {"captured": False}),
             "index_cache": rank_state.get("index_cache", {"captured": False}),
             "index_scale": rank_state.get("index_scale", {"captured": False}),
@@ -1855,6 +1994,18 @@ def main(argv: list[str] | None = None) -> int:
         help="reference-only: instantiate only the requested physical layer and identity placeholders",
     )
     parser.add_argument("--history-length", type=int, default=8)
+    parser.add_argument(
+        "--scenario",
+        choices=CAPTURE_SCENARIOS,
+        default="single",
+        help="reference request schedule; unsupported scheduler controls remain not_run",
+    )
+    parser.add_argument(
+        "--capture-decode-step",
+        type=int,
+        default=1,
+        help="one-based Decode execution to freeze after prompt prefill",
+    )
     parser.add_argument("--max-model-len", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument(

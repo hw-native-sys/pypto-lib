@@ -65,6 +65,7 @@ DEFAULT_ASSETS = Path(".pypto-a3-state/reference/decode_ep2_l0_20261106_v26")
 DEFAULT_CACHE_ASSETS = Path(".pypto-a3-state/reference/decode_ep2_l0_20261106_v24")
 DEFAULT_FIXTURE = Path(".pypto-a3-state/product/decode-layer-ep2-l0-fixture-v27")
 TARGET_LAYER_IDS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
+PRODUCT_SCENARIOS = ("single",)
 
 
 def _bf16_storage(value: np.ndarray) -> torch.Tensor:
@@ -430,6 +431,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkpoint", type=Path, default=Path(os.environ.get("DEEPSEEK_V41_CHECKPOINT", "/mnt/data/models/DeepSeek-V4.1-Flash-w8a8")))
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
     parser.add_argument("--layer-id", type=int, choices=TARGET_LAYER_IDS, default=0)
+    parser.add_argument(
+        "--scenario",
+        default="single",
+        help="Decode request schedule; only the single-row product ABI is implemented",
+    )
     parser.add_argument("--device", default=os.environ.get("TASK_DEVICE", "0,1"))
     parser.add_argument("--platform", default="a2a3", choices=("a2a3", "a5"))
     parser.add_argument("--sim", action="store_true")
@@ -437,6 +443,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--record", type=Path)
     args = parser.parse_args(argv)
     assets, cache_assets, checkpoint = args.assets.resolve(), args.cache_assets.resolve(), args.checkpoint.resolve()
+    if args.scenario not in PRODUCT_SCENARIOS:
+        report = {
+            "status": "not_run",
+            "formal_accuracy": "not_run",
+            "scope": "complete physical Decode layer EP2 multi-scene replay",
+            "layer_id": args.layer_id,
+            "scenario": args.scenario,
+            "topology": {"dp": 2, "tp": 1, "ep": 2},
+            "product_compute": "PyPTO only",
+            "blocker": "the current complete-layer PyPTO ABI has T=16 padding but one shared active scalar; per-request active/finished/slot state is not implemented",
+            "recovery": "add per-rank request-state tensors and a scenario-specific reference/product fixture before submitting NPU validation",
+        }
+        if args.record:
+            args.record.parent.mkdir(parents=True, exist_ok=True)
+            args.record.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2))
+        return 2
+    boundary_contract = _decode_boundary(assets)
+    captured_scenario = boundary_contract.get("scenario", "single")
+    if captured_scenario != args.scenario:
+        report = {
+            "status": "not_run",
+            "formal_accuracy": "not_run",
+            "scope": "complete physical Decode layer EP2 replay",
+            "layer_id": args.layer_id,
+            "scenario": args.scenario,
+            "reference_scenario": captured_scenario,
+            "topology": {"dp": 2, "tp": 1, "ep": 2},
+            "blocker": "reference and product scenario contracts differ",
+        }
+        if args.record:
+            args.record.parent.mkdir(parents=True, exist_ok=True)
+            args.record.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2))
+        return 2
     inputs, expected = _layer_inputs(assets, cache_assets, checkpoint, args.layer_id)
     _write_fixture(args.fixture.resolve(), inputs, expected, layer_id=args.layer_id)
     if args.prepare_only:
@@ -453,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
             "formal_accuracy": "not_run",
             "scope": "independent physical Decode layer",
             "layer_id": args.layer_id,
+            "scenario": args.scenario,
             "topology": {"dp": 2, "tp": 1, "ep": 2},
             "same_input": True,
             "same_layer": True,
@@ -496,6 +538,7 @@ def main(argv: list[str] | None = None) -> int:
         "formal_accuracy": "not_run",
         "scope": f"complete physical L{args.layer_id} layer EP2 representative case",
         "layer_id": args.layer_id,
+        "scenario": args.scenario,
         "topology": {"dp": 2, "tp": 1, "ep": 2, "devices": devices},
         "same_input": True,
         "same_layer": True,

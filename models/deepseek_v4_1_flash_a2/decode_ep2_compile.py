@@ -46,7 +46,7 @@ def _dummy_args() -> list[torch.Tensor | int]:
 
     return [
         torch.empty([EP_SIZE, T, D], dtype=torch.bfloat16),
-        torch.empty([EP_SIZE, T, D], dtype=torch.float32),
+        torch.empty([EP_SIZE, T, D], dtype=torch.bfloat16),
         torch.empty([EP_SIZE, N_EXPERTS, D], dtype=torch.float32),
         torch.empty([EP_SIZE, N_EXPERTS], dtype=torch.float32),
         torch.empty([EP_SIZE, N_EXPERTS], dtype=torch.float32),

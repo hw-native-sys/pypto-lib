@@ -125,6 +125,7 @@ def _read_moe_capture(asset_root: Path, rank: int) -> dict[str, torch.Tensor]:
                 np.ascontiguousarray(archive["route_weights"])
             ).float(),
             "reference_logits": torch.from_numpy(np.ascontiguousarray(archive["router_logits"])).float(),
+            "input_ids": torch.tensor(record.get("input_ids", ()), dtype=torch.int64),
         }
 
 
@@ -141,16 +142,23 @@ def _load_inputs(asset_root: Path, checkpoint_root: Path, layer: int) -> dict[st
 
     input_contract = json.loads((asset_root / "decode_input.json").read_text(encoding="utf-8"))
     token = int(input_contract["decode_token"])
+    active_counts: list[int] = []
     for rank, item in enumerate(captured):
-        if tuple(item["value"].shape) != (1, D):
-            raise ValueError(f"rank {rank} MoE input must be [1,{D}], got {tuple(item['value'].shape)}")
-        value[rank, 0] = item["value"][0]
-        router_value[rank, 0] = item["router_value"].reshape(-1, D)[0].to(torch.bfloat16)
-        reference_output[rank, 0] = item["reference_output"].reshape(-1, D)[0]
-        route_ids[rank, 0] = item["reference_route_ids"].reshape(-1, TOPK)[0]
-        route_weights[rank, 0] = item["reference_route_weights"].reshape(-1, TOPK)[0]
-        reference_logits[rank, 0] = item["reference_logits"].reshape(-1, N_EXPERTS)[0]
-        input_ids[rank, 0] = token
+        rows = int(item["value"].reshape(-1, D).shape[0])
+        if rows < 1 or rows > T:
+            raise ValueError(f"rank {rank} MoE input row count must be in [1,{T}], got {rows}")
+        active_counts.append(rows)
+        value[rank, :rows] = item["value"].reshape(-1, D)[:rows]
+        router_value[rank, :rows] = item["router_value"].reshape(-1, D)[:rows].to(torch.bfloat16)
+        reference_output[rank, :rows] = item["reference_output"].reshape(-1, D)[:rows]
+        route_ids[rank, :rows] = item["reference_route_ids"].reshape(-1, TOPK)[:rows]
+        route_weights[rank, :rows] = item["reference_route_weights"].reshape(-1, TOPK)[:rows]
+        reference_logits[rank, :rows] = item["reference_logits"].reshape(-1, N_EXPERTS)[:rows]
+        captured_ids = item["input_ids"].reshape(-1)
+        if captured_ids.numel() >= rows:
+            input_ids[rank, :rows] = captured_ids[:rows]
+        else:
+            input_ids[rank, :rows] = token
 
     router = load_router(checkpoint, layer)
     routed_target = {
@@ -173,6 +181,11 @@ def _load_inputs(asset_root: Path, checkpoint_root: Path, layer: int) -> dict[st
         del shard
 
     shared = load_shared_expert(checkpoint, layer)
+    if len(set(active_counts)) != 1:
+        raise ValueError(
+            "the current EP2 product ABI uses one shared active row count; "
+            f"reference ranks disagree: {active_counts}"
+        )
     result = {
         "value": value,
         "router_value": router_value,
@@ -189,7 +202,7 @@ def _load_inputs(asset_root: Path, checkpoint_root: Path, layer: int) -> dict[st
         "route_ids": route_ids,
         "route_weights": route_weights,
         "output": reference_output,
-        "active": torch.tensor(1, dtype=torch.int32),
+        "active": torch.tensor(active_counts[0], dtype=torch.int32),
         "epoch": torch.tensor(1, dtype=torch.int32),
     }
     return result
@@ -229,7 +242,7 @@ def _write_fixture(root: Path, values: dict[str, torch.Tensor]) -> None:
                 "status": "frozen_reference_inputs",
                 "source": "independent_vllm_ascend_npu_capture",
                 "product_compute": "PyPTO only",
-                "active_rows": 1,
+                "active_rows": int(values["active"].item()),
                 "topology": {"dp": 2, "tp": 1, "ep": 2},
                 "outputs": ["logits", "route_ids", "route_weights", "output"],
             },
@@ -308,6 +321,8 @@ def main(argv: list[str] | None = None) -> int:
 
     assets = args.assets.resolve()
     checkpoint = args.checkpoint.resolve()
+    boundary = json.loads((assets / "decode_input.json").read_text(encoding="utf-8"))
+    scenario = str(boundary.get("scenario", "single"))
     fixture = (args.fixture or DEFAULT_FIXTURE_ROOT / f"decode_ep2_l{args.layer}_moe_fixture_v1").resolve()
     values = _load_inputs(assets, checkpoint, args.layer)
     _write_fixture(fixture, values)
@@ -344,6 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         "formal_accuracy": "not_run",
         "scope": f"MoE boundary only for physical L{args.layer}; complete physical layer remains not_run",
         "layer_id": args.layer,
+        "scenario": scenario,
         "topology": {"dp": 2, "tp": 1, "ep": 2, "devices": devices},
         "assets": str(assets),
         "checkpoint": str(checkpoint),
