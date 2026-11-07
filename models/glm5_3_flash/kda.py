@@ -67,7 +67,7 @@ OUTPUT_NORM_ROWS_TILE = 8
 
 DECODE_L2_EPS = 1e-6
 DECODE_Q_SCALE = KDA_DIM**-0.5
-DECODE_V_TILE = 16  # value rows per state-update task
+DECODE_V_TILE = 64  # value rows per state-update task
 DECODE_NORM_ROWS_TILE = 16  # (token, head) rows per normalisation task
 COL_REP_TILE = 16  # replication width used to turn a row into a legal column
 DECODE_POOL_ROWS = 6
