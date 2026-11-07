@@ -614,6 +614,102 @@ for EP2/EP4 and select 512 MiB for EP8 or 1 GiB for EP16 on ring zero. An enclos
 forward must additionally budget its own live allocations and pass sufficient
 runtime capacity; see [runtime ring sizing](../../debug-and-tune/ring-heap-and-scope-stats.md).
 
+### Routed expert measurements
+
+`expert_routed.py` pairs the INT8 Gate/Up projections around a resident L1
+input tile, uses 128-column projection fragments and groups two W2 output
+tiles per epilogue block. Activation blocks publish partial row maxima for
+the quantizer, and W2 projection tiles expose completion independently to
+their consumers. The prefill heap budget includes the maxima cache.
+The routed-expert implementation shared by prefill
+and decode retains its 16-row tiles and existing rounding and quantization
+boundaries.
+The standalone entry supports `--save-data` and `--golden-data` for replay.
+Its input and weight/scale pairs share lazy initializers, so frozen replay
+constructs specifications without generating random activation or weight tensors.
+
+The measured pypto-lib revisions are:
+
+- Mainline baseline: [`521058090d2792cc2e6344c6c0ca1e670c9291c5`](https://github.com/hw-native-sys/pypto-lib/commit/521058090d2792cc2e6344c6c0ca1e670c9291c5).
+- Paired-projection baseline: [`e02a7c039713a0e0610bdcf768e15f48ce6ec3fb`](https://github.com/hw-native-sys/pypto-lib/commit/e02a7c039713a0e0610bdcf768e15f48ce6ec3fb).
+- Optimized device kernel: [`9c79b577207f3bbf0f31e94b36cc5f5b127bee3b`](https://github.com/hw-native-sys/pypto-lib/commit/9c79b577207f3bbf0f31e94b36cc5f5b127bee3b).
+
+All three measurements used this matched toolchain:
+
+| Component | Revision / version |
+| --- | --- |
+| PyPTO | `ce0eb7c07fad364b6b169ee99a55950283e60dae` |
+| simpler runtime | `d8f997fabd1b6988b69a94feef61ab669dda0eea` |
+| PTOAS | `0.67` |
+| PTO-ISA | `b1d460ee8c001585ede36b68ba3678dc5a226bbf` |
+| CANN | `9.0.0` |
+| PyTorch | `2.9.1+cpu` |
+
+On A3 device 0, with hidden size 4096, intermediate size 2048 and 18 local
+experts, single-card `effective_us` medians were measured over 100 rounds
+after 5 warmups. Each optimized case replayed the corresponding mainline
+frozen inputs and golden outputs and passed the existing comparator.
+Rows below are received routed rows distributed across the local experts.
+
+| Received rows | Mainline (us) | Optimized (us) | Latency reduction |
+| ---: | ---: | ---: | ---: |
+| 1 | 81.45 | 74.65 | 8.3% |
+| 17 | 481.92 | 407.79 | 15.4% |
+| 96 | 507.81 | 431.31 | 15.1% |
+| 512 | 878.12 | 706.64 | 19.5% |
+
+Relative to the paired-projection baseline (`e02a7c0`), independent W2
+completion and cached activation maxima reduce these component medians by
+3.5% to 5.1%.
+
+Gate/Up weight reads now follow each expert's row occupancy. An expert with
+one 16-row tile streams its read-only weights with L2 bypass; experts with
+multiple tiles retain cached reads for weight reuse. Both launch scopes use
+the same paired-projection helper. W2 retains its original cache policy.
+
+An incremental comparison against the prior optimized kernel, using the same
+A3 device, 100/5 sampling and frozen goldens, gives:
+
+| Received rows | Prior optimized (us) | Selective cache (us) | Latency reduction |
+| ---: | ---: | ---: | ---: |
+| 1 | 74.65 | 73.59 | 1.4% |
+| 17 | 407.79 | 384.22 | 5.8% |
+| 96 | 431.31 | 407.12 | 5.6% |
+| 512 | 706.64 | 712.17 | -0.8% |
+
+The 512-row case uses two tiles per expert. A fresh paired confirmation on
+device 0 measured 708.98 to 709.75 us, a 0.1% increase within the observed
+variation. The multi-tile case is approximately flat; the gain is concentrated
+in experts whose weights are consumed by one row tile per invocation.
+
+These component measurements do not establish serving throughput gains.
+
+### Shared expert measurements
+
+The shared expert initializes its INT8 requantization buffer only for partial
+16-row tiles. For a full tile, the activation/quantization blocks overwrite
+every row before W2 consumes it, so the separate zero-fill task is redundant.
+Partial tiles retain their original initialization and output masks.
+
+On A3 device 0, with the matched toolchain above, 100 measured rounds after
+5 warmups and the original frozen goldens, standalone shared-expert medians
+changed as follows. The intermediate width is 2048 divided by shared TP.
+
+| Shared TP | Token rows | Before (us) | After (us) | Latency reduction |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 16 | 188.18 | 186.36 | 1.0% |
+| 1 | 17 | 192.92 | 192.37 | 0.3% |
+| 1 | 192 | 411.34 | 415.04 | -0.9% |
+| 8 | 16 | 54.83 | 52.90 | 3.5% |
+| 8 | 17 | 58.01 | 55.69 | 4.0% |
+| 8 | 192 | 129.30 | 119.40 | 7.7% |
+| 16 | 16 | 46.96 | 44.94 | 4.3% |
+| 16 | 17 | 49.46 | 48.00 | 3.0% |
+| 16 | 192 | 115.67 | 108.41 | 6.3% |
+
+All nine cases pass the original comparator. TP1 is approximately flat;
+the measured gain is concentrated in TP8/TP16. These are component timings.
+
 ### Vocabulary operators
 
 `lookup_embedding.py` gathers from one BF16 vocabulary shard using global token

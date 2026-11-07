@@ -9,6 +9,7 @@
 """GLM-5.3-Flash routed W8A8 SwiGLU experts."""
 
 import sys
+from functools import cache
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -35,14 +36,42 @@ RECV_DYN = pl.dynamic('GLM53_RECV_DYN')
 SWIGLU_LIMIT = FLASH.swiglu_limit
 RECV_TILE = 16  # expert row tile: matmul rows must be a multiple of 16
 K_TILE = 512  # gate/up K tile over D = 4096
-MM_INTER_TILE = 256  # gate/up N tile; 2 * MOE_INTER must be a multiple
+MM_INTER_TILE = 128  # gate/up N tile; MOE_INTER must be a multiple
 ACT_INTER_TILE = 128  # Bounds the compensated sigmoid working set
 QUANT_TILE = 512  # per-row requant tile
 INTER_K_TILE = 512  # w2 K tile (= moe_intermediate_size)
 D_OUT_TILE = 256  # w2 N tile over D
 D_ACT_TILE = 512
-W2_GROUP_TILE = 8
+W2_GROUP_TILE = 2
 T_DYN_TEST = 64
+
+
+@pl.jit.inline(auto_scope=False)
+def _gate_up_projection(
+    x_int8: pl.Tensor[[RECV_DYN, D], pl.INT8],
+    w_gate_up: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    gate_up_i32: pl.Tensor[[RECV_TILE, 2 * MOE_INTER], pl.INT32],
+    local_e: pl.Scalar[pl.INDEX],
+    flat_row: pl.Scalar[pl.INDEX],
+    valid_rows: pl.Scalar[pl.INDEX],
+    n0: pl.Scalar[pl.INDEX],
+):
+    x_l1 = pl.create_l1([RECV_TILE, D], dtype=pl.INT8)
+    x_l1 = pl.gather_row(x_l1, x_int8, [0, 0], [flat_row, 0], [RECV_TILE, D], valid_shape=[valid_rows, D])
+    xs_first = pl.slice(x_l1, [RECV_TILE, K_TILE], [0, 0], valid_shape=[valid_rows, K_TILE])
+    gate_first = w_gate_up[local_e:local_e + 1, n0:n0 + MM_INTER_TILE, 0:K_TILE]
+    up_first = w_gate_up[local_e:local_e + 1, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE, 0:K_TILE]
+    gate_acc = pl.matmul(xs_first, gate_first, b_trans=True, out_dtype=pl.INT32)
+    up_acc = pl.matmul(xs_first, up_first, b_trans=True, out_dtype=pl.INT32)
+    for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
+        xs_k = pl.slice(x_l1, [RECV_TILE, K_TILE], [0, k0], valid_shape=[valid_rows, K_TILE])
+        gate_k = w_gate_up[local_e:local_e + 1, n0:n0 + MM_INTER_TILE, k0:k0 + K_TILE]
+        up_k = w_gate_up[local_e:local_e + 1, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE, k0:k0 + K_TILE]
+        gate_acc = pl.matmul_acc(gate_acc, xs_k, gate_k, b_trans=True)
+        up_acc = pl.matmul_acc(up_acc, xs_k, up_k, b_trans=True)
+    gate_up_i32[:, n0:n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
+    gate_up_i32[:, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE] = pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
+    return gate_up_i32
 
 
 @pl.jit.inline
@@ -70,29 +99,30 @@ def expert_routed(
             valid_rows = pl.min(pl.cast(RECV_TILE, pl.INDEX), n_rows - tile_row)
             flat_row = e_start + tile_row
 
-            # Fused gate/up cube matmul: w_gate_up rows [0, 2*MOE_INTER) contract
-            # the same INT8 x rows, so one K-loop fills both halves of the INT32
-            # accumulator. w_k is the per-expert [1, N, K] slice.
+            # Paired gate/up projections share a resident INT8 input tile.
             gate_up_i32 = pl.create_tensor([RECV_TILE, 2 * MOE_INTER], dtype=pl.INT32)
-            for nb in pl.spmd(2 * MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_mm", allow_early_resolve=True):
-                n0 = nb * MM_INTER_TILE
-                acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                    xs_k = pl.slice(x_int8, [RECV_TILE, K_TILE], [flat_row, k0], valid_shape=[valid_rows, K_TILE])
-                    w_k = w_gate_up[local_e : local_e + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                    acc = pl.matmul_acc(acc, xs_k, w_k, b_trans=True, init_cond=(k0 == 0))
-                gate_up_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(acc, [RECV_TILE, MM_INTER_TILE])
+            if n_tiles == 1:
+                for nb in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_stream", allow_early_resolve=True):
+                    pl.set_cache_policy(w_gate_up, pl.CachePolicy.BYPASS)
+                    n0 = nb * MM_INTER_TILE
+                    gate_up_i32 = _gate_up_projection(
+                        x_int8, w_gate_up, gate_up_i32, local_e, flat_row, valid_rows, n0,
+                    )
+            else:
+                for nb in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_mm", allow_early_resolve=True):
+                    n0 = nb * MM_INTER_TILE
+                    gate_up_i32 = _gate_up_projection(
+                        x_int8, w_gate_up, gate_up_i32, local_e, flat_row, valid_rows, n0,
+                    )
 
             # Activation epilogue: dequant (per-token x scale x per-channel weight
             # scale), clamped SwiGLU, per-row amax, INT8 requant for w2. The
             # intermediate is NOT TP-sharded here (EP shards experts instead), so
             # the full 2048 columns walk ACT_INTER_TILE at a time.
             h_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+            partial_amax = pl.create_tensor([MOE_INTER // ACT_INTER_TILE, RECV_TILE], dtype=pl.FP32)
             h_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             h_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_i8_init"):
-                h_i8_value_full = pl.full([RECV_TILE, MOE_INTER], dtype=pl.FP16, value=0.0)
-                h_i8[:, :] = pl.cast(h_i8_value_full, target_type=pl.INT8, mode="trunc")
             for act_blk in pl.spmd(MOE_INTER // ACT_INTER_TILE, name_hint="exp_gate_up_act"):
                 a0 = act_blk * ACT_INTER_TILE
                 x_scale_col = pl.slice(x_scale, [RECV_TILE, 1], [flat_row, 0], valid_shape=[valid_rows, 1])
@@ -114,13 +144,11 @@ def expert_routed(
                 sigmoid = accurate_sigmoid(gate_buffer, RECV_TILE, ACT_INTER_TILE)
                 gated = pl.mul(pl.mul(gate_fp32, sigmoid), up_fp32)
                 h_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated
+                chunk_amax = pl.reshape(pl.row_max(pl.abs(gated)), [1, RECV_TILE])
+                partial_amax[act_blk:act_blk + 1, :] = chunk_amax
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_quant"):
-                row_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=0.0)
-                for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                    h_chunk = h_fp32[:, k0 : k0 + QUANT_TILE]
-                    chunk_amax = pl.reshape(pl.row_max(pl.abs(h_chunk)), [1, RECV_TILE])
-                    row_amax = pl.maximum(row_amax, chunk_amax)
+                row_amax = pl.col_max(partial_amax)
                 amax_buffer = pl.create_tensor([1, RECV_TILE], dtype=pl.FP32)
                 zero_rows = pl.cmp(row_amax, 0.0, cmp_type=0)
                 amax_buffer[:, :] = pl.add(row_amax, zero_rows)
@@ -142,7 +170,7 @@ def expert_routed(
 
             # w2 (down) cube matmul: [rows, MOE_INTER] INT8 x [D, MOE_INTER] INT8 -> INT32.
             y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
-            for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="exp_w2_mm"):
+            for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="exp_w2_mm", allow_early_resolve=True):
                 d0 = db_idx * D_OUT_TILE
                 y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
                 for k0 in pl.pipeline(0, MOE_INTER, INTER_K_TILE, stage=2):
@@ -414,29 +442,28 @@ def build_tensor_specs(num_tokens=T_DYN_TEST):
     offsets = torch.zeros(N_LOCAL_EXPERTS + 1, dtype=torch.int32)
     offsets[1:] = torch.cumsum(per_expert, dim=0).to(torch.int32)
 
-    x_bf16 = torch.randn(total, D, dtype=torch.bfloat16)
-
-    def init_x_int8():
-
-        x_i8, _ = quantize_per_token_int8(x_bf16)
-        return x_i8
-
-    def init_x_scale():
-
-        _, x_sd = quantize_per_token_int8(x_bf16)
-        return x_sd
+    @cache
+    def init_x():
+        x_bf16 = torch.randn(total, D, dtype=torch.bfloat16)
+        return quantize_per_token_int8(x_bf16)
 
     ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
-    w_gu_i8, w_gu_s = gen_routed_weight((N_LOCAL_EXPERTS, 2 * MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
-    w2_i8, w2_s = gen_routed_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
+
+    @cache
+    def init_gate_up():
+        return gen_routed_weight((N_LOCAL_EXPERTS, 2 * MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
+
+    @cache
+    def init_down():
+        return gen_routed_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
 
     return [
-        TensorSpec("x_int8", [total, D], torch.int8, init_value=init_x_int8),
-        TensorSpec("x_scale", [total, 1], torch.float32, init_value=init_x_scale),
-        TensorSpec("w_gate_up", [N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8, init_value=lambda: w_gu_i8),
-        TensorSpec("w_gate_up_scale", [N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda : w_gu_s),
-        TensorSpec("w_down", [N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
-        TensorSpec("w_down_scale", [N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
+        TensorSpec("x_int8", [total, D], torch.int8, init_value=lambda: init_x()[0]),
+        TensorSpec("x_scale", [total, 1], torch.float32, init_value=lambda: init_x()[1]),
+        TensorSpec("w_gate_up", [N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8, init_value=lambda: init_gate_up()[0]),
+        TensorSpec("w_gate_up_scale", [N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda: init_gate_up()[1]),
+        TensorSpec("w_down", [N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: init_down()[0]),
+        TensorSpec("w_down_scale", [N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: init_down()[1]),
         TensorSpec("expert_offsets", [N_LOCAL_EXPERTS + 1], torch.int32, init_value=lambda: offsets),
         TensorSpec("route_weights", [total, 1], torch.float32, init_value=lambda: torch.rand(total, 1)),
         TensorSpec("output", [total, D], torch.float32, init_value=torch.zeros),
@@ -549,6 +576,8 @@ def main():
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", default=None)
     args = parser.parse_args()
     if args.num_tokens < 1:
         parser.error("--num-tokens must be positive")
@@ -559,6 +588,8 @@ def main():
         fn=expert_routed_test,
         specs=build_tensor_specs(args.num_tokens),
         golden_fn=golden_expert_routed_fn,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         config=dict(dump_passes=args.dump_passes, backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane),
         compile_only=args.compile_only,
         rtol=0.001,
