@@ -409,7 +409,7 @@ def hc_pre_norm(
     x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
     row_recip: pl.Scalar[pl.BOOL],
 ):
-    """Normalize pre-mixed activations for complete eight-token decode tiles."""
+    """Normalize pre-mixed activations with a padded final token tile."""
     t_dim = pl.tensor.dim(x, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
@@ -419,17 +419,19 @@ def hc_pre_norm(
     scale1 = pl.read(hc_scale, [1])
     scale2 = pl.read(hc_scale, [2])
     x_flat = pl.reshape(x, [t_dim, HC_DIM])
-    x_mixed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+    mixed_rows = (t_dim + T_TILE - 1) // T_TILE * T_TILE
+    x_mixed = pl.create_tensor([mixed_rows, D], dtype=pl.BF16)
 
     # The RMS statistic includes the intermediate BF16 rounding.
-    with pl.spmd(t_dim // T_TILE, name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
+    with pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="mix_x_rms_norm", allow_early_resolve=True) as mixed_tid:
         t0 = pl.tile.get_block_idx() * T_TILE
+        valid_rows = pl.min(T_TILE, t_dim - t0)
         pre_val, post_pad, mixes_total = _hc_pre_gate_values(
             mixes_partials, inv_rms, hc_base, t0, t_linear, scale0, scale1,
         )
         pl.store(mixes_total, [t0, 0], mixes_raw)
         pl.store(pre_val, [t0, 0], pre_val_store)
-        post_valid = pl.set_validshape(post_pad, T_TILE, HC_MULT)
+        post_valid = pl.set_validshape(post_pad, valid_rows, HC_MULT)
         pl.store(post_valid, [t0, 0], post)
         pre_tile = pre_val_store[t0:t0 + T_TILE, 0:HC_PAD]
         pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
@@ -440,10 +442,14 @@ def hc_pre_norm(
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for mix_db in pl.pipeline(D // D_TILE, stage=2):
             d0 = mix_db * D_TILE
-            x0 = x_flat[t0:t0 + T_TILE, d0:d0 + D_TILE]
-            x1 = x_flat[t0:t0 + T_TILE, D + d0:D + d0 + D_TILE]
-            x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_TILE]
-            x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_TILE]
+            x0_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, d0], valid_shape=[valid_rows, D_TILE])
+            x0 = pl.set_validshape(x0_tail, T_TILE, D_TILE)
+            x1_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, D + d0], valid_shape=[valid_rows, D_TILE])
+            x1 = pl.set_validshape(x1_tail, T_TILE, D_TILE)
+            x2_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 2 * D + d0], valid_shape=[valid_rows, D_TILE])
+            x2 = pl.set_validshape(x2_tail, T_TILE, D_TILE)
+            x3_tail = pl.slice(x_flat, [T_TILE, D_TILE], [t0, 3 * D + d0], valid_shape=[valid_rows, D_TILE])
+            x3 = pl.set_validshape(x3_tail, T_TILE, D_TILE)
             y0 = pl.row_expand_mul(x0, pre0)
             y1 = pl.row_expand_mul(x1, pre1)
             y2 = pl.row_expand_mul(x2, pre2)
@@ -469,7 +475,8 @@ def hc_pre_norm(
             norm_w_input = norm_w[d0:d0 + D_TILE]
             norm_w_row = pl.reshape(norm_w_input, [1, D_TILE])
             normed_bf16 = rms_norm_apply(mixed_input, norm_w_row, y_inv)
-            x_normed[t0:t0 + T_TILE, d0:d0 + D_TILE] = normed_bf16
+            normed_valid = pl.set_validshape(normed_bf16, valid_rows, D_TILE)
+            x_normed[t0:t0 + T_TILE, d0:d0 + D_TILE] = normed_valid
     _hc_pre_combinations(mixes_raw, inv_rms, hc_base, comb, t_dim, scale2, row_recip)
     return mixed_tid
 
