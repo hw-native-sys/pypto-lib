@@ -79,7 +79,7 @@ PREFILL_L2_EPS = 1e-6
 PREFILL_Q_SCALE = KDA_DIM**-0.5
 PREFILL_CHUNK_WORKERS_TILE = 24  # Bound mixed-kernel pipe buffers, then stride over chunks
 PREFILL_OWNER_PAD = 32  # 128-byte INT32 rows isolate scalar GM writers
-PREFILL_V_TILE = 64  # value columns per scan task: the carried state slice is [128, 64] FP32
+PREFILL_V_TILE = 64  # value rows per scan task; carried state is [64, 128] FP32
 PREFILL_POOL_ROWS = 6
 _LENGTHS = {"ragged": [140, 7, 64], "single": [3], "aligned": [64], "zerostate": [3], "nobeta": [70], "paged": [32, 1]}
 
@@ -1219,64 +1219,65 @@ def prefill_kda(
         bos = pl.cast(pl.read(query_start_loc, [n]), pl.INDEX)
         eos = pl.cast(pl.read(query_start_loc, [n + 1]), pl.INDEX)
         length = eos - bos
-        row = pl.cast(pl.read(state_rows, [n, 0]), pl.INDEX)
-
-        # The scan runs in the pool's own [V, K] orientation. The recurrence is natural
-        # in [K, V], but every re-orientation it needs is a matmul operand flag, and
-        # keeping [V, K] means the seed and the flush are plain copies. That matters
-        # beyond tidiness: the transpose instruction constrains both of its row counts
-        # to multiples of 16, which the simulator does not check and the device does.
-        pool_row = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
-        seed = state_2d[pool_row:pool_row + PREFILL_V_TILE, 0:KDA_DIM]
-        slot0 = task * 2 * PREFILL_V_TILE
-        state_gm[slot0 : slot0 + PREFILL_V_TILE, 0:KDA_DIM] = seed
-
-        for s_idx in pl.range(0, length, CHUNK_TILE):
-            off = bos + s_idx
-            actual = pl.min(length - s_idx, CHUNK_TILE)
-            base = off + n * CHUNK_TILE
-            chunk_idx = s_idx // CHUNK_TILE
-            src = chunk_idx % 2
-            dst = (chunk_idx + 1) % 2
-            s_cur = state_gm[(task * 2 + src) * PREFILL_V_TILE:(task * 2 + src) * PREFILL_V_TILE + PREFILL_V_TILE, 0:KDA_DIM]
-            s_bf = pl.cast(s_cur, pl.BF16, mode="rint")
-            w_c_slice = pl.slice(w_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
-            w_c = pl.reshape(w_c_slice, [CHUNK_TILE, KDA_DIM])
-            u_c_slice = pl.slice(u_gm, [1, CHUNK_TILE, PREFILL_V_TILE], [h, base, v0], drop_dims=[0])
-            u_c = pl.reshape(u_c_slice, [CHUNK_TILE, PREFILL_V_TILE])
-            # v' = U - W S: the part of the chunk's values the carried state already
-            # explains.
-            vi = pl.sub(u_c, pl.matmul(w_c, s_bf, pl.FP32, b_trans=True))
-            vi_bf = pl.cast(vi, pl.BF16, mode="rint")
-            qg_c_slice = pl.slice(qg_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
-            qg_c = pl.reshape(qg_c_slice, [CHUNK_TILE, KDA_DIM])
-            a2_c_slice = pl.slice(a2_gm, [1, CHUNK_TILE, CHUNK_TILE], [h, base, 0], drop_dims=[0])
-            a2_c = pl.reshape(a2_c_slice, [CHUNK_TILE, CHUNK_TILE])
-            oc = pl.add(pl.matmul(qg_c, s_bf, pl.FP32, b_trans=True), pl.matmul(a2_c, vi_bf, pl.FP32))
-            ocol = h * KDA_DIM + v0
-            out_rows[off:off + CHUNK_TILE, ocol:ocol + PREFILL_V_TILE] = pl.set_validshape(pl.cast(oc, pl.BF16, mode="rint"), actual, PREFILL_V_TILE)
-
-            kdec_c_slice = pl.slice(kdec_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
-            kdec_c = pl.reshape(kdec_c_slice, [CHUNK_TILE, KDA_DIM])
-            # In [V, K] the chunk-final decay is a per-column factor, so it applies as
-            # the row it already is.
-            eglast_row = eglast_gm[h * scratch_rows + base:h * scratch_rows + base + 1, 0:KDA_DIM]
-            d_row = (task * 2 + dst) * PREFILL_V_TILE
-            state_gm_value_col_expand_mul = pl.col_expand_mul(s_cur, eglast_row)
-            state_gm_value_matmul = pl.matmul(vi_bf, kdec_c, pl.FP32, a_trans=True)
-            state_gm[d_row:d_row + PREFILL_V_TILE, 0:KDA_DIM] = pl.add(state_gm_value_col_expand_mul, state_gm_value_matmul)
-
-            state_row = pl.cast(pl.read(state_rows, [n, 2 + s_idx // CHUNK_TILE]), pl.INDEX)
-            if state_row >= 0:
-                checkpoint_row = (state_row * LOCAL_KDA_H + h) * KDA_DIM + v0
-                chunk_state = state_gm[d_row:d_row + PREFILL_V_TILE, 0:KDA_DIM]
-                state_2d[checkpoint_row:checkpoint_row + PREFILL_V_TILE, 0:KDA_DIM] = chunk_state
-
-        # Flush the private working row.
-        chunks = (length + CHUNK_TILE - 1) // CHUNK_TILE
-        last = chunks % 2
-        final = state_gm[(task * 2 + last) * PREFILL_V_TILE:(task * 2 + last) * PREFILL_V_TILE + PREFILL_V_TILE, 0:KDA_DIM]
+        # Empty request slots neither consume a seed nor publish a carried state.
         if length > 0:
+            row = pl.cast(pl.read(state_rows, [n, 0]), pl.INDEX)
+
+            # The scan runs in the pool's own [V, K] orientation. The recurrence is natural
+            # in [K, V], but every re-orientation it needs is a matmul operand flag, and
+            # keeping [V, K] means the seed and the flush are plain copies. That matters
+            # beyond tidiness: the transpose instruction constrains both of its row counts
+            # to multiples of 16, which the simulator does not check and the device does.
+            pool_row = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
+            seed = state_2d[pool_row:pool_row + PREFILL_V_TILE, 0:KDA_DIM]
+            slot0 = task * 2 * PREFILL_V_TILE
+            state_gm[slot0 : slot0 + PREFILL_V_TILE, 0:KDA_DIM] = seed
+
+            for s_idx in pl.range(0, length, CHUNK_TILE):
+                off = bos + s_idx
+                actual = pl.min(length - s_idx, CHUNK_TILE)
+                base = off + n * CHUNK_TILE
+                chunk_idx = s_idx // CHUNK_TILE
+                src = chunk_idx % 2
+                dst = (chunk_idx + 1) % 2
+                s_cur = state_gm[(task * 2 + src) * PREFILL_V_TILE:(task * 2 + src) * PREFILL_V_TILE + PREFILL_V_TILE, 0:KDA_DIM]
+                s_bf = pl.cast(s_cur, pl.BF16, mode="rint")
+                w_c_slice = pl.slice(w_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
+                w_c = pl.reshape(w_c_slice, [CHUNK_TILE, KDA_DIM])
+                u_c_slice = pl.slice(u_gm, [1, CHUNK_TILE, PREFILL_V_TILE], [h, base, v0], drop_dims=[0])
+                u_c = pl.reshape(u_c_slice, [CHUNK_TILE, PREFILL_V_TILE])
+                # v' = U - W S: the part of the chunk's values the carried state already
+                # explains.
+                vi = pl.sub(u_c, pl.matmul(w_c, s_bf, pl.FP32, b_trans=True))
+                vi_bf = pl.cast(vi, pl.BF16, mode="rint")
+                qg_c_slice = pl.slice(qg_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
+                qg_c = pl.reshape(qg_c_slice, [CHUNK_TILE, KDA_DIM])
+                a2_c_slice = pl.slice(a2_gm, [1, CHUNK_TILE, CHUNK_TILE], [h, base, 0], drop_dims=[0])
+                a2_c = pl.reshape(a2_c_slice, [CHUNK_TILE, CHUNK_TILE])
+                oc = pl.add(pl.matmul(qg_c, s_bf, pl.FP32, b_trans=True), pl.matmul(a2_c, vi_bf, pl.FP32))
+                ocol = h * KDA_DIM + v0
+                out_rows[off:off + CHUNK_TILE, ocol:ocol + PREFILL_V_TILE] = pl.set_validshape(pl.cast(oc, pl.BF16, mode="rint"), actual, PREFILL_V_TILE)
+
+                kdec_c_slice = pl.slice(kdec_gm, [1, CHUNK_TILE, KDA_DIM], [h, base, 0], drop_dims=[0])
+                kdec_c = pl.reshape(kdec_c_slice, [CHUNK_TILE, KDA_DIM])
+                # In [V, K] the chunk-final decay is a per-column factor, so it applies as
+                # the row it already is.
+                eglast_row = eglast_gm[h * scratch_rows + base:h * scratch_rows + base + 1, 0:KDA_DIM]
+                d_row = (task * 2 + dst) * PREFILL_V_TILE
+                state_gm_value_col_expand_mul = pl.col_expand_mul(s_cur, eglast_row)
+                state_gm_value_matmul = pl.matmul(vi_bf, kdec_c, pl.FP32, a_trans=True)
+                state_gm[d_row:d_row + PREFILL_V_TILE, 0:KDA_DIM] = pl.add(state_gm_value_col_expand_mul, state_gm_value_matmul)
+
+                state_row = pl.cast(pl.read(state_rows, [n, 2 + s_idx // CHUNK_TILE]), pl.INDEX)
+                if state_row >= 0:
+                    checkpoint_row = (state_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+                    chunk_state = state_gm[d_row:d_row + PREFILL_V_TILE, 0:KDA_DIM]
+                    state_2d[checkpoint_row:checkpoint_row + PREFILL_V_TILE, 0:KDA_DIM] = chunk_state
+
+            # Flush the private working row.
+            chunks = (length + CHUNK_TILE - 1) // CHUNK_TILE
+            last = chunks % 2
+            final = state_gm[(task * 2 + last) * PREFILL_V_TILE:(task * 2 + last) * PREFILL_V_TILE + PREFILL_V_TILE, 0:KDA_DIM]
             working_row = pl.cast(pl.read(state_rows, [n, 1]), pl.INDEX)
             output_row = (working_row * LOCAL_KDA_H + h) * KDA_DIM + v0
             state_2d[output_row:output_row + PREFILL_V_TILE, 0:KDA_DIM] = final
