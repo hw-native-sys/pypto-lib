@@ -615,44 +615,48 @@ def recurrent_kda(
     lanes = KDA_DIM // DECODE_V_TILE
     requests = pl.tensor.dim(query_start_loc, 0) - 1
     tasks = requests * LOCAL_KDA_H * lanes
+    # Packed requests occupy a prefix; padded token rows are never read below.
+    live_tokens = pl.cast(pl.read(query_start_loc, [requests]), pl.INDEX)
     rows_total = t_dim * LOCAL_KDA_H
     norm_tiles = (rows_total + DECODE_NORM_ROWS_TILE - 1) // DECODE_NORM_ROWS_TILE
+    live_norm_tiles = pl.max(1, (live_tokens * LOCAL_KDA_H + DECODE_NORM_ROWS_TILE - 1) // DECODE_NORM_ROWS_TILE)
     kn_gm = pl.create_tensor([norm_tiles * DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
     qn_gm = pl.create_tensor([norm_tiles * DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
     k_rows = pl.reshape(key, [rows_total, KDA_DIM])
     q_rows = pl.reshape(query, [rows_total, KDA_DIM])
-    with pl.spmd(norm_tiles, name_hint="decode_kda_l2norm") as norm_tid:
+    with pl.spmd(live_norm_tiles, name_hint="decode_kda_l2norm") as norm_tid:
         r0 = pl.tile.get_block_idx() * DECODE_NORM_ROWS_TILE
-        rows = pl.min(DECODE_NORM_ROWS_TILE, rows_total - r0)
-        q_rows_tile = pl.slice(q_rows, [DECODE_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
-        qt = pl.cast(q_rows_tile, pl.FP32)
-        k_rows_tile = pl.slice(k_rows, [DECODE_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
-        kt = pl.cast(k_rows_tile, pl.FP32)
-        q_buffer = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        k_buffer = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        q_buffer[:, :] = qt
-        k_buffer[:, :] = kt
-        q_squared_norm = pl.create_tensor([DECODE_NORM_ROWS_TILE, 1], dtype=pl.FP32)
-        k_squared_norm = pl.create_tensor([DECODE_NORM_ROWS_TILE, 1], dtype=pl.FP32)
-        q_square = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        k_square = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        q_square[:, :] = pl.mul(q_buffer, q_buffer)
-        k_square[:, :] = pl.mul(k_buffer, k_buffer)
-        q_sum = accurate_row_sum(q_square)
-        k_sum = accurate_row_sum(k_square)
-        q_squared_norm[:, :] = pl.add(q_sum, DECODE_L2_EPS)
-        k_squared_norm[:, :] = pl.add(k_sum, DECODE_L2_EPS)
-        q_root = accurate_sqrt(q_squared_norm)
-        k_root = accurate_sqrt(k_squared_norm)
-        q_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        k_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
-        ones = pl.full([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
-        q_denominator[:, :] = pl.row_expand_mul(ones, q_root)
-        k_denominator[:, :] = pl.row_expand_mul(ones, k_root)
-        q_unit = accurate_divide(q_buffer, q_denominator)
-        k_unit = accurate_divide(k_buffer, k_denominator)
-        qn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = pl.mul(q_unit, DECODE_Q_SCALE)
-        kn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = k_unit
+        rows = pl.min(DECODE_NORM_ROWS_TILE, live_tokens * LOCAL_KDA_H - r0)
+        if rows > 0:
+            q_rows_tile = pl.slice(q_rows, [DECODE_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
+            qt = pl.cast(q_rows_tile, pl.FP32)
+            k_rows_tile = pl.slice(k_rows, [DECODE_NORM_ROWS_TILE, KDA_DIM], [r0, 0], valid_shape=[rows, KDA_DIM])
+            kt = pl.cast(k_rows_tile, pl.FP32)
+            q_buffer = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            k_buffer = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            q_buffer[:, :] = qt
+            k_buffer[:, :] = kt
+            q_squared_norm = pl.create_tensor([DECODE_NORM_ROWS_TILE, 1], dtype=pl.FP32)
+            k_squared_norm = pl.create_tensor([DECODE_NORM_ROWS_TILE, 1], dtype=pl.FP32)
+            q_square = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            k_square = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            q_square[:, :] = pl.mul(q_buffer, q_buffer)
+            k_square[:, :] = pl.mul(k_buffer, k_buffer)
+            q_sum = accurate_row_sum(q_square)
+            k_sum = accurate_row_sum(k_square)
+            q_squared_norm[:, :] = pl.add(q_sum, DECODE_L2_EPS)
+            k_squared_norm[:, :] = pl.add(k_sum, DECODE_L2_EPS)
+            q_root = accurate_sqrt(q_squared_norm)
+            k_root = accurate_sqrt(k_squared_norm)
+            q_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            k_denominator = pl.create_tensor([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32)
+            ones = pl.full([DECODE_NORM_ROWS_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
+            q_denominator[:, :] = pl.row_expand_mul(ones, q_root)
+            k_denominator[:, :] = pl.row_expand_mul(ones, k_root)
+            q_unit = accurate_divide(q_buffer, q_denominator)
+            k_unit = accurate_divide(k_buffer, k_denominator)
+            qn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = pl.mul(q_unit, DECODE_Q_SCALE)
+            kn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = k_unit
     state_2d = pl.reshape(recurrent_state, [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
     out_rows = pl.reshape(output, [t_dim, LOCAL_KDA_H * KDA_DIM])
     with pl.spmd(tasks, name_hint="decode_kda", deps=[norm_tid]):
