@@ -114,6 +114,13 @@ logits, routes, MoE output, FFN state, and the populated cache pages against
 the same vLLM-Ascend boundary. The latest joint reference contract is v29 and
 the product evidence is `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json`.
 
+The cache replay path was revalidated on A3 after correcting the physical
+cache prefix read to the product's two-block ABI and binding runtime assembly
+to the writable pinned PTO-ISA checkout. The v30 fixture and report
+`.pypto-a3-state/product/decode-layer-ep2-l0-v30.json` pass the same cache,
+FFN state, route, MoE and output comparisons on two ranks. This is still a
+single-request L0 representative case.
+
 The formal EP2 gate remains `not_run`: this run is one active request and does
 not yet cover the required no-local-input collective, finished/inactive rows,
 unequal-length batch, or slot-reuse cases. Complete C1A/C2A
@@ -228,6 +235,7 @@ The following checks were run in the pinned shared environment on 2026-11-05:
 | independent reference manifest | `pass` | `.pypto-a3-state/reference/decode_ep2_l0_20261106_v29/reference_capture.json`; vLLM-Ascend paths, native hashes, input, layer, MoE, and cache capture are recorded |
 | queued two-card PyPTO EP2 MoE run | `pass` | `task_20261106_024728_200089531660`; A3 `TASK_DEVICE=0,1`, routes and output pass in `.pypto-a3-state/product/decode-ep2-l0-v25e.json` |
 | EP2 complete physical-layer representative run | `pass` | `task_20261106_042451_245850019523`; `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json` |
+| L0 cache ABI and pinned PTO-ISA revalidation | `pass` | `task_20261107_211521_159540026017`; `.pypto-a3-state/product/decode-layer-ep2-l0-v30.json`; cache `[2,2,128,1,512]`, state, routes and output passed on A3 |
 | queued L14/L15/L19 PyPTO EP2 MoE boundary runs | `pass` | `task_20261107_005915_175293029255`, `task_20261107_005915_175292910575`, `task_20261107_010231_177414730073`; user-state PyPTO runtime, devices 6,7 / 4,5 / 4,5; each report has logits, exact routes, route weights and output PASS |
 | queued L20/L21/L24/L25 PyPTO EP2 MoE boundary runs | `pass` | `task_20261107_023110_224905226856`, `task_20261107_023110_224905330745`, `task_20261107_023325_226337011669`, `task_20261107_023325_22633697697`; user-state PyPTO runtime; each report has logits, exact routes, route weights and output PASS |
 | initial L14/L15 retry with shared PyPTO path | `blocked_environment` | `task_20261107_005442_173030223340`, `task_20261107_005442_173030330312`; `PYTHONPATH=$PWD` selected the read-only shared `simpler_setup` and failed on `.pto-isa.lock`; reruns preserved `$PYPTO_A3_STATE_DIR/python` and passed |

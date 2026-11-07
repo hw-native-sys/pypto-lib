@@ -68,6 +68,25 @@ TARGET_LAYER_IDS = (0, 1, 2, 3, 14, 15, 19, 20, 21, 24, 25)
 PRODUCT_SCENARIOS = ("single",)
 
 
+def _bind_user_pto_isa() -> None:
+    """Bind runtime assembly to the writable pinned session checkout."""
+
+    state = os.environ.get("PYPTO_A3_STATE_DIR")
+    if not state:
+        return
+    overlay = Path(state).resolve() / "python" / "simpler_setup" / "_assets" / "build" / "pto-isa"
+    if not overlay.is_dir():
+        return
+    resolved = str(overlay.resolve())
+    import pypto.runtime.pto_isa as pypto_pto_isa
+    import simpler_setup.pto_isa as simpler_pto_isa
+
+    pypto_pto_isa._resolve_pinned_pto_isa_root.cache_clear()
+    pypto_pto_isa._resolve_pinned_pto_isa_root = lambda: resolved
+    simpler_pto_isa.ensure_pto_isa_root = lambda verbose=False: resolved
+    os.environ["PTO_ISA_ROOT"] = resolved
+
+
 def _bf16_storage(value: np.ndarray) -> torch.Tensor:
     if value.dtype != np.int16:
         raise ValueError(f"expected BF16 int16 storage, got {value.dtype}")
@@ -176,9 +195,10 @@ def _cache_pages(cache_root: Path, rank: int) -> tuple[torch.Tensor, torch.Tenso
     if len(shape) != 4 or tuple(shape[1:]) != (128, 1, 512):
         raise ValueError(f"unexpected cache shape in {capture_path}: {shape}")
     # The first dimension is the physical block.  Keep blocks 0 and 1; page 1
-    # contains the eight history rows and the decode slot 136.
-    before = _read_npz_prefix(path, "before_cache_0.npy", shape, np.dtype("<i2"), 2 * 128)
-    after = _read_npz_prefix(path, "after_cache_0.npy", shape, np.dtype("<i2"), 2 * 128)
+    # contains the eight history rows and the decode slot 136.  The product
+    # ABI owns two blocks, each with 128 rows, so read two outer rows here.
+    before = _read_npz_prefix(path, "before_cache_0.npy", shape, np.dtype("<i2"), 2)
+    after = _read_npz_prefix(path, "after_cache_0.npy", shape, np.dtype("<i2"), 2)
     return _bf16_storage(before), _bf16_storage(after)
 
 
@@ -442,6 +462,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--record", type=Path)
     args = parser.parse_args(argv)
+    _bind_user_pto_isa()
     assets, cache_assets, checkpoint = args.assets.resolve(), args.cache_assets.resolve(), args.checkpoint.resolve()
     if args.scenario not in PRODUCT_SCENARIOS:
         report = {
