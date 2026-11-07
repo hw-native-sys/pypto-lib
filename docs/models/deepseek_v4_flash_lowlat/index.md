@@ -186,6 +186,12 @@ attention consumers. The former prepares query-token or compression-boundary RoP
 QKV metadata preparation separately handles dynamic token tiles and its swap
 indices.
 
+Each composed attention entry calls QKV once for its rank's contiguous head
+span. Q-LoRA projection, normalization and quantization, and KV projection and
+RoPE run once per rank; Q projection and per-head normalization and RoPE cover
+all owned heads. With TP2 this span contains 32 heads. The standalone QKV entry
+continues to exercise one eight-head group.
+
 ## CI targets and validation scope
 
 This model uses A2/A3 device CI with at most two devices per entry. Sixteen
