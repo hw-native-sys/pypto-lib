@@ -421,6 +421,46 @@ scheduling overlap with QKV. It must not be compared to these isolated timings
 as if it were pure compute time. No whole-model performance run includes this
 follow-up yet; the generation results below describe the prior implementation.
 
+### KDA QKV active capacity rows
+
+The shared KDA projection takes `query_start_loc` and uses its final offset
+as the number of packed input rows for QKV. Inactive QKV capacity rows are
+explicitly zeroed; active rows retain the same compensated FP32 reduction
+and BF16 rounding. Both compute and padding launches respect the runtime's
+32,256-block limit. Empty packs perform only the padding writes. The other
+projection outputs retain their existing full-capacity computation.
+
+Single-card TP8/EP8 measurements collected on 2026-11-05 compare against
+main `eb76b3b` on a2a3 device 1, using PyPTO `ff2e0a4`, PTOAS 0.72, five
+warmups and 100 measured rounds. The metric is median device-effective wall time with
+profiling disabled. QKV-only cases extract the same production SPMD body,
+including padding writes. The before/after pair replays identical frozen
+synthetic inputs and goldens; inactive input rows are zero in this timing
+fixture. Capacity 16 with one/four active rows follows the decode workload;
+capacity 128 with 32 active rows covers a partial prefill chunk. Fully occupied
+cases distinguish padding removal from arithmetic throughput.
+
+| Capacity / active rows | QKV before (ms) | QKV after (ms) | QKV speedup | Complete projection before / after (ms) |
+|---|---:|---:|---:|---:|
+| 16 / 1 | 7.618 | 0.725 | 10.51x | 8.415 / 1.547 |
+| 16 / 4 | 7.618 | 2.103 | 3.62x | 8.411 / 2.849 |
+| 16 / 16 | 7.618 | 7.619 | 1.00x | 8.414 / 8.416 |
+| 128 / 32 | 59.053 | 14.888 | 3.97x | 65.865 / 21.578 |
+| 128 / 128 | 59.053 | 59.057 | 1.00x | 65.864 / 65.862 |
+
+All measured outputs are bitwise equal to the baseline and saved golden.
+The bounded default projection entry additionally checks single-row, empty,
+padded, ragged-tail and full ragged inputs on TP8 and TP16, with nonzero
+inactive input rows. Full prefill and decode composition compile successfully.
+These measurements describe component latency. No whole-model performance
+or generation validation has been run on the current-main PR branch.
+
+Use `kda.py --component projection --tp 8 --ep 8 --tokens 16
+--active-tokens 1` to select a capacity/occupancy pair. Omit selection flags
+for bounded correctness coverage. `--save-data` and `--golden-data` operate
+on one selected case; snapshots include `query_start_loc`, so snapshots from
+the earlier projection signature must be regenerated.
+
 ### Combined projection whole-model performance
 
 The combined mHC, KDA and router changes were measured on 2026-11-04 with

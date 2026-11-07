@@ -742,7 +742,7 @@ def kda_attention_sublayer(
     """KDA projection -> causal conv -> chunked delta attention -> gated output."""
     stack_conv_weight(conv_q, conv_k, conv_v, conv_w)
     kda_projection(
-        normed,
+        normed, query_start_loc,
         w_q, w_k, w_v, w_f_a, w_f_b, dt_bias, a_log, w_b, w_g_a, w_g_b, mixed_qkv, decay, beta, out_gate,
     )
     if verification_mode == 1:

@@ -50,6 +50,7 @@ CONV_POOL_ROWS = 6
 
 PROJECTION_WORKERS_TILE = 32256  # Runtime set_block_num ceiling
 PROJECTION_T_TILE = 16
+QKV_PAD_N_TILE = 256
 PROJECTION_N_TILE = 16
 PROJECTION_K_TILE = 512
 PROJECTION_PIPELINE_TILE = 1
@@ -386,6 +387,7 @@ def kda_conv_decode_test(
 @pl.jit.inline
 def kda_projection(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     w_q: pl.Tensor[[LOCAL_KDA_QKV_DIM, D], pl.BF16],
     w_k: pl.Tensor[[LOCAL_KDA_QKV_DIM, D], pl.BF16],
     w_v: pl.Tensor[[LOCAL_KDA_QKV_DIM, D], pl.BF16],
@@ -402,6 +404,8 @@ def kda_projection(
     out_gate: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x, 0)
+    requests = pl.tensor.dim(query_start_loc, 0) - 1
+    live_tokens = pl.cast(pl.read(query_start_loc, [requests]), pl.INDEX)
     tiles = (t_dim + PROJECTION_T_TILE - 1) // PROJECTION_T_TILE
     t_pad = tiles * PROJECTION_T_TILE
     w_b_pad = pl.create_tensor([BETA_PAD, D], dtype=pl.BF16)
@@ -413,8 +417,10 @@ def kda_projection(
             else:
                 w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
-    with pl.spmd(pl.min(t_dim * (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE), PROJECTION_WORKERS_TILE), name_hint="kda_projection_qkv"):
-        for task in pl.range(pl.tile.get_block_idx(), t_dim * (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE), PROJECTION_WORKERS_TILE):
+    qkv_tasks = live_tokens * (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE)
+    qkv_workers = pl.max(1, pl.min(qkv_tasks, PROJECTION_WORKERS_TILE))
+    with pl.spmd(qkv_workers, name_hint="kda_projection_qkv"):
+        for task in pl.range(pl.tile.get_block_idx(), qkv_tasks, PROJECTION_WORKERS_TILE):
             t0 = task // (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE)
             n0 = task % (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE) * PROJECTION_N_TILE
             acc_q = bf16_linear_row(x, w_q, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
@@ -428,6 +434,17 @@ def kda_projection(
             acc_v_bf16 = pl.cast(acc_v, pl.BF16, mode="rint")
             v0 = 2 * LOCAL_KDA_QKV_DIM + n0
             mixed_qkv[t0:t0 + 1, v0:v0 + PROJECTION_N_TILE] = acc_v_bf16
+    if live_tokens < t_dim:
+        pad_tiles = (t_dim - live_tokens + PROJECTION_T_TILE - 1) // PROJECTION_T_TILE
+        pad_tasks = pad_tiles * (CONV_DIM // QKV_PAD_N_TILE)
+        with pl.spmd(pl.min(pad_tasks, PROJECTION_WORKERS_TILE), name_hint="kda_projection_qkv_pad"):
+            for task in pl.range(pl.tile.get_block_idx(), pad_tasks, PROJECTION_WORKERS_TILE):
+                t0 = live_tokens + task // (CONV_DIM // QKV_PAD_N_TILE) * PROJECTION_T_TILE
+                n0 = task % (CONV_DIM // QKV_PAD_N_TILE) * QKV_PAD_N_TILE
+                rows = pl.min(PROJECTION_T_TILE, t_dim - t0)
+                zeros = pl.full([PROJECTION_T_TILE, QKV_PAD_N_TILE], dtype=pl.BF16, value=0.0)
+                padding = pl.set_validshape(zeros, rows, QKV_PAD_N_TILE)
+                mixed_qkv[t0:t0 + PROJECTION_T_TILE, n0:n0 + QKV_PAD_N_TILE] = padding
     b_raw_gm = pl.create_tensor([t_pad, BETA_PAD], dtype=pl.BF16)
     g_a_gm = pl.create_tensor([t_pad, KDA_DIM], dtype=pl.BF16)
     f_a_gm = pl.create_tensor([t_pad, KDA_DIM], dtype=pl.BF16)
@@ -492,6 +509,7 @@ def kda_projection(
 @pl.jit
 def kda_projection_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
     w_q: pl.Tensor[[LOCAL_KDA_QKV_DIM, D], pl.BF16],
     w_k: pl.Tensor[[LOCAL_KDA_QKV_DIM, D], pl.BF16],
     w_v: pl.Tensor[[LOCAL_KDA_QKV_DIM, D], pl.BF16],
@@ -508,7 +526,8 @@ def kda_projection_test(
     out_gate: pl.Out[pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
 ):
     (mixed_qkv, decay, beta, out_gate) = kda_projection(
-        x, w_q, w_k, w_v, w_f_a, w_f_b, dt_bias, a_log, w_b, w_g_a, w_g_b, mixed_qkv, decay, beta, out_gate,
+        x, query_start_loc, w_q, w_k, w_v, w_f_a, w_f_b, dt_bias, a_log, w_b, w_g_a, w_g_b,
+        mixed_qkv, decay, beta, out_gate,
     )
     return mixed_qkv, decay, beta, out_gate
 
@@ -1546,23 +1565,29 @@ def golden_kda_projection_tensors(tensors) -> None:
         tensors["x"], tensors["w_q"], tensors["w_k"], tensors["w_v"], tensors["w_f_a"], tensors["w_f_b"],
         tensors["dt_bias"], tensors["a_log"], tensors["w_b"], tensors["w_g_a"], tensors["w_g_b"],
     )
+    live_tokens = int(tensors["query_start_loc"][-1])
+    mixed_qkv[live_tokens:] = 0
     tensors["mixed_qkv"][:] = mixed_qkv
     tensors["decay"][:] = decay
     tensors["beta"][:] = beta
     tensors["out_gate"][:] = out_gate
 
 
-def projection_build_tensor_specs(tokens: int = 67):
+def projection_build_tensor_specs(tokens: int = 67, active_tokens: int | None = None):
     """A deliberately ragged token count, so the tail block is always exercised."""
     from golden import TensorSpec
 
     bf, f32 = torch.bfloat16, torch.float32
+    active_tokens = tokens if active_tokens is None else active_tokens
+    if not 0 <= active_tokens <= tokens:
+        raise ValueError("active_tokens must be within capacity")
 
     def w(rows, cols, scale=0.02):
         return lambda: (torch.randn(rows, cols) * scale).to(bf)
 
     return [
         TensorSpec("x", [tokens, D], bf, init_value=lambda: (torch.randn(tokens, D) * 0.5).to(bf)),
+        TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, active_tokens], dtype=torch.int32)),
         TensorSpec("w_q", [LOCAL_KDA_QKV_DIM, D], bf, init_value=w(LOCAL_KDA_QKV_DIM, D)),
         TensorSpec("w_k", [LOCAL_KDA_QKV_DIM, D], bf, init_value=w(LOCAL_KDA_QKV_DIM, D)),
         TensorSpec("w_v", [LOCAL_KDA_QKV_DIM, D], bf, init_value=w(LOCAL_KDA_QKV_DIM, D)),
@@ -2258,7 +2283,7 @@ def run_convolution_case(argv=None):
 def run_projection_case(argv=None):
     import argparse
 
-    from golden import run
+    from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
@@ -2267,30 +2292,43 @@ def run_projection_case(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
     parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
-    parser.add_argument("--case", type=str, default="ragged", choices=["ragged", "aligned", "single"])
+    parser.add_argument("--case", type=str, choices=["ragged", "aligned", "single", "empty", "padded", "tail"])
     parser.add_argument("--tokens", type=int)
+    parser.add_argument("--active-tokens", type=int)
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--golden-data", default=None)
     args = parser.parse_args(argv)
     torch.manual_seed(args.seed)
 
-    tokens = {"ragged": 67, "aligned": 64, "single": 1}[args.case] if args.tokens is None else args.tokens
-    if tokens < 1:
-        parser.error("--tokens must be positive")
-    result = run(
-        fn=kda_projection_test,
-        specs=projection_build_tensor_specs(tokens),
-        golden_fn=golden_kda_projection_tensors,
-        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        rtol=0.02,
-        atol=0.02,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    selected = args.case is not None or args.tokens is not None or args.active_tokens is not None
+    selected = selected or args.golden_data is not None or args.save_data
+    cases = [args.case or "ragged"] if selected else ["single", "empty", "padded", "tail", "ragged"]
+    shapes = {"ragged": (67, 67), "aligned": (64, 64), "single": (1, 1),
+              "empty": (16, 0), "padded": (16, 4), "tail": (17, 1)}
+    for case in cases:
+        capacity, active = shapes[case]
+        if args.tokens is not None:
+            capacity = args.tokens
+            active = capacity
+        if args.active_tokens is not None:
+            active = args.active_tokens
+        if capacity < 1 or not 0 <= active <= capacity:
+            parser.error("require positive --tokens and 0 <= --active-tokens <= --tokens")
+        result = run(
+            fn=kda_projection_test,
+            specs=projection_build_tensor_specs(capacity, active),
+            golden_fn=golden_kda_projection_tensors,
+            compare_fn={"mixed_qkv": ratio_allclose(rtol=0, atol=0, max_error_ratio=0)},
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            rtol=0.02,
+            atol=0.02,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
 
 
 def run_output_case(argv=None):
