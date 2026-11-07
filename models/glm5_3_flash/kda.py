@@ -1057,8 +1057,10 @@ def prefill_kda(
             off = bos + s_idx
             base = off + n * CHUNK_TILE
             rb = h * scratch_rows + base
-            estep_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM] = pl.sub(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], agw_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM])
-            prod_gm[rb : rb + CHUNK_TILE, 0:KDA_DIM] = eye_wide[0:CHUNK_TILE, 0:KDA_DIM]
+            e0 = pl.sub(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], agw_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM])
+            estep_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM] = e0
+            # P_1 = E_0 P_0 = E_0; no identity matmul is needed.
+            prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM] = e0
 
     with pl.spmd(LOCAL_KDA_H * requests, name_hint="prefill_kda_inv0", deps=[seed_tid]) as inv0_tid:
         task = pl.tile.get_block_idx()
@@ -1074,7 +1076,6 @@ def prefill_kda(
             e16 = estep_gm[rb : rb + CHUNK_TILE, 0 : 0 + CHUNK_TILE]
             e_wide = estep_gm[rb : rb + CHUNK_TILE, 0 : 0 + KDA_DIM]
             two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
-            prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 0:0 + KDA_DIM], pl.FP32)
             estep_gm_value_sub = pl.sub(e_wide, two_eye)
             estep_gm_value_matmul = pl.matmul(e16, estep_gm_value_sub, pl.FP32)
             estep_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM] = pl.add(estep_gm_value_matmul, two_eye)
@@ -1129,12 +1130,8 @@ def prefill_kda(
             base = off + n * CHUNK_TILE
             rb = h * scratch_rows + base
             e16 = estep_gm[rb : rb + CHUNK_TILE, 128:128 + CHUNK_TILE]
-            e_wide = estep_gm[rb : rb + CHUNK_TILE, 128:128 + KDA_DIM]
-            two_eye = pl.mul(eye_wide[0:CHUNK_TILE, 0:KDA_DIM], 2.0)
+            # W/U consume P_4 only; the next inverse iterate E_4 is unused.
             prod_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM] = pl.matmul(e16, prod_gm[rb:rb + CHUNK_TILE, 128:128 + KDA_DIM], pl.FP32)
-            estep_gm_value_sub_4 = pl.sub(e_wide, two_eye)
-            estep_gm_value_matmul_4 = pl.matmul(e16, estep_gm_value_sub_4, pl.FP32)
-            estep_gm[rb:rb + CHUNK_TILE, 0:KDA_DIM] = pl.add(estep_gm_value_matmul_4, two_eye)
 
     u_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, KDA_DIM], dtype=pl.FP32)
     w_gm = pl.create_tensor([LOCAL_KDA_H, scratch_rows, KDA_DIM], dtype=pl.BF16)
