@@ -120,6 +120,27 @@ unequal-length batch, or slot-reuse cases. Complete C1A/C2A
 index/compression, Engram, CP/SP and the requested 16-device gates remain
 separate blockers.
 
+The latest queued two-card component replays extend the independent
+vLLM-Ascend comparison to two request schedules for each of L1, L2, L3, L14,
+L15, L19, L20, L21, L24 and L25. Each report compares PyPTO logits, exact
+top-six route IDs, route weights and the merged routed/shared output at
+`rtol=0.05`, `atol=0.05`:
+
+| layers | active batch | unequal lengths | scope |
+| --- | --- | --- | --- |
+| L1/L2/L3 | `decode-ep2-l{1,2,3}-active-batch-v1.json` | `decode-ep2-l{1,2,3}-unequal-v1.json` | MoE boundary only |
+| L14/L15 | `decode-ep2-l{14,15}-active-batch-v1.json` | `decode-ep2-l{14,15}-unequal-v1.json` | MoE boundary only |
+| L19/L20/L21 | `decode-ep2-l{19,20,21}-active-batch-v1.json` | `decode-ep2-l{19,20,21}-unequal-v1.json` | MoE boundary only |
+| L24/L25 | `decode-ep2-l{24,25}-active-batch-v1.json` | `decode-ep2-l{24,25}-unequal-v1.json` | MoE boundary only |
+
+These 20 reports have `status=pass` and `formal_accuracy=not_run` by design;
+their cache/state field is `not_applicable_at_moe_boundary`. They do not
+establish a complete physical layer result. The complete-layer runner still
+has only the L0 SWA composition and a single contiguous `active` scalar, so
+the ten target layers remain `not_run` until their Engram/C1A/C2A/index/cache
+composition and request-state ABI are implemented and captured with real
+history cache state.
+
 The supplied Aurora W8A8 Dynamic export is registered as an external
 checkpoint asset. Its index references 270 quantized shard files using the
 `of-00272` naming convention, and four separate Engram safetensors are present
