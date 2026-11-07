@@ -110,7 +110,17 @@ ATTN_GI_STAT_ROWS = ATTN_TOK_GROUP * ATTN_GI_GROUP * Q_HEAD_BATCH_PAD
 ATTN_PHASE_MICRO_GROUPS = (FINALIZE_TOK_GROUP + ATTN_TOK_GROUP - 1) // ATTN_TOK_GROUP
 ATTN_GI_BLOCKS = (TOTAL_Q_GROUPS + ATTN_GI_GROUP - 1) // ATTN_GI_GROUP
 ATTN_PHASE_WORK_ITEMS = ATTN_PHASE_MICRO_GROUPS * ATTN_GI_BLOCKS
-ATTN_PHASE_SPMD_BLOCKS = 24
+# Launch width for both sync-start attention phases. Both carry a hard MIX
+# syncall (pl.system.syncall / qwen_fai_syncall_mix), which needs full
+# occupancy + sync_start; the HardSyncallOccupancyValid verifier therefore
+# requires the width to equal the run's cluster count. The upstream literal 24
+# only holds on >=24-cluster dies (the CI pool); on this host's 910B3 (20
+# clusters/die) the AICPU runtime rejected the first prefill with rc=-7
+# (507018, "require_sync_start block_num=24 > limit=20 (deadlock
+# guaranteed)")). The two kernels below pass pl.system.available_cluster_count()
+# instead — the run's own geometry (20 here, 24 on the CI pool), the portable
+# spelling the verifier prescribes.
+ATTN_PHASE_SPMD_BLOCKS = 20
 ATTN_PHASE_SCORE_ROWS = ATTN_PHASE_WORK_ITEMS * ATTN_GI_SCORE_ROWS
 ATTN_PHASE_STAT_ROWS = ATTN_PHASE_WORK_ITEMS * ATTN_GI_STAT_ROWS
 ATTN_PHASE_ACC_SCORE_ROWS = ATTN_PHASE_MICRO_GROUPS * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_PAD
@@ -207,6 +217,9 @@ def _attention_phase_window(
     cache_token_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
     k_cache_bsnd = pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])
     v_cache_bsnd = pl.reshape(v_cache, [cache_token_rows, KV_HIDDEN])
+    # Hard-syncall launch width: this run's cluster count, not a baked literal
+    # (see the ATTN_PHASE_SPMD_BLOCKS note at the top of this file).
+    attn_phase_blocks = pl.system.available_cluster_count()
     cur_mi_phase = pl.create_tensor([ATTN_PHASE_ACC_STAT_ROWS, 1], dtype=pl.FP32)
     if finalize_tok > 0:
         block_ctx_len = chunk_start + p0 + final_ti0 + finalize_tok
@@ -261,17 +274,17 @@ def _attention_phase_window(
                                 pl.write(qkpv_wcur, [0], pl.cast(plan_w + 1, pl.INT32))
 
             with pl.spmd(
-                ATTN_PHASE_SPMD_BLOCKS,
+                attn_phase_blocks,
                 name_hint="qk_pv_partial_plan_spmd",
                 deps=[rope_ready_deps[0]],
                 sync_start=True,
             ) as qkpv_tid:
                 phase_core = pl.tile.get_block_idx()
                 qkpv_lane_iters = (
-                    QKPV_PLAN_WORK_ITEMS - phase_core + ATTN_PHASE_SPMD_BLOCKS - 1
-                ) // ATTN_PHASE_SPMD_BLOCKS
+                    QKPV_PLAN_WORK_ITEMS - phase_core + attn_phase_blocks - 1
+                ) // attn_phase_blocks
                 for qkpv_it in pl.range(qkpv_lane_iters):
-                    qkpv_flat = phase_core + qkpv_it * ATTN_PHASE_SPMD_BLOCKS
+                    qkpv_flat = phase_core + qkpv_it * attn_phase_blocks
                     qkpv_item = pl.cast(pl.read(qkpv_order, [qkpv_flat]), pl.INDEX)
                     si = qkpv_item // ATTN_PHASE_WORK_ITEMS
                     work_id = qkpv_item - si * ATTN_PHASE_WORK_ITEMS
@@ -555,14 +568,17 @@ def _attention_phase_window_full_single_block(
     cache_token_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
     k_cache_bsnd = pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])
     v_cache_bsnd = pl.reshape(v_cache, [cache_token_rows, KV_HIDDEN])
+    # Hard-syncall launch width: this run's cluster count, not a baked literal
+    # (see the ATTN_PHASE_SPMD_BLOCKS note at the top of this file).
+    attn_phase_blocks = pl.system.available_cluster_count()
     with pl.spmd(
-        ATTN_PHASE_SPMD_BLOCKS,
+        attn_phase_blocks,
         name_hint="qk_pv_single_block_spmd",
         deps=[rope_ready_deps[0]],
         sync_start=True,
     ) as attn_tid:
         phase_core = pl.tile.get_block_idx()
-        for work_id in pl.range(phase_core, ATTN_PHASE_WORK_ITEMS, ATTN_PHASE_SPMD_BLOCKS):
+        for work_id in pl.range(phase_core, ATTN_PHASE_WORK_ITEMS, attn_phase_blocks):
             micro_id = work_id // ATTN_GI_BLOCKS
             gi_block = work_id - micro_id * ATTN_GI_BLOCKS
             gi = gi_block * ATTN_GI_GROUP
@@ -638,7 +654,7 @@ def _attention_phase_window_full_single_block(
         for final_work_id in pl.range(
             phase_core,
             ATTN_PHASE_FINALIZE_WORK_ITEMS,
-            ATTN_PHASE_SPMD_BLOCKS,
+            attn_phase_blocks,
         ):
             final_micro_id = final_work_id // (ATTN_TOK_GROUP * TOTAL_Q_GROUPS)
             final_rem = final_work_id - final_micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS

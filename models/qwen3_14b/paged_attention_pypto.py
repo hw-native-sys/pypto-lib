@@ -27,7 +27,9 @@ SEQ_LEN = 3584  # 7 * 512 — page & stack clean
 MAX_BLOCKS = SEQ_LEN // BLOCK_SIZE  # 28
 NUM_BLOCKS = BATCH * MAX_BLOCKS  # 448
 NUM_TASKS = BATCH * NUM_KV_HEADS  # 128
-ATTN_SPMD_BLOCKS = 24
+ATTN_SPMD_BLOCKS = 24  # static upper bound only (sizes TRANSFER_ROWS); the
+# launch width itself is the run's cluster count — see the note in
+# paged_attention_pypto_swpipe below.
 PRE_LAUNCH = 2
 TRANSFER_SLOTS = PRE_LAUNCH + 1
 FFTS_WORKSPACE_ELEMENTS = 256
@@ -95,6 +97,16 @@ def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention AP
     scratch_ready_tid: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Run fused Q/K norm, RoPE, cache append, and dynamic paged attention."""
+    # Sync-start launch width. This spmd carries a hard MIX syncall
+    # (pl.system.syncall below), so it needs full occupancy + sync_start and
+    # the HardSyncallOccupancyValid verifier only accepts the run's own
+    # cluster count here — the literal 24 upstream tuning holds only on
+    # >=24-cluster dies (the CI pool). On this host's 910B3 (20 clusters/die)
+    # the AICPU runtime aborted the decode dispatch with rc=-7 (507018,
+    # "require_sync_start block_num=24 > limit=20 (deadlock guaranteed)")).
+    # TRANSFER_ROWS stays sized from the static ATTN_SPMD_BLOCKS=24 cap, so a
+    # smaller runtime width merely leaves the tail rows unused.
+    attn_blocks = pl.system.available_cluster_count()
     active_batch = pl.tensor.dim(seq_lens, 0)
     num_tasks = active_batch * NUM_KV_HEADS
     query_rows = pl.tensor.dim(q_tnd_flat, 0)
@@ -107,7 +119,7 @@ def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention AP
     cache_base = layer_cache_base_token_rows
     out2d = pl.reshape(out, [query_rows, HEAD_DIM])
     with pl.spmd(
-        ATTN_SPMD_BLOCKS,
+        attn_blocks,
         name_hint="attn_swpipe_spmd",
         sync_start=True,
         allow_early_resolve=True,
@@ -258,7 +270,7 @@ def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention AP
         pl.system.syncall(core_type=pl.KernelType.MIX)
         pl.system.cacheinvalid()
 
-        for task in pl.range(core, num_tasks, ATTN_SPMD_BLOCKS):
+        for task in pl.range(core, num_tasks, attn_blocks):
             batch = task // NUM_KV_HEADS
             kv_head = task % NUM_KV_HEADS
             seq_len = pl.read(seq_lens, [batch])
