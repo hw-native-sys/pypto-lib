@@ -9,6 +9,8 @@
 """DeepSeek-V4 CSA decode sparse attention over sliding-window and compressed KV caches."""
 
 
+from math import gcd
+
 import pypto.language as pl
 
 from config import (
@@ -62,7 +64,7 @@ CACHE_BLOCK_SHIFT = BLOCK_SIZE.bit_length() - 1
 H_TILE = 16
 QK_H_TILE = min(H, 64)
 MERGE_WORKERS = 48
-QK_PRE_LAUNCH = 1
+QK_PRE_LAUNCH = 2
 QK_TRANSFER_SLOTS = QK_PRE_LAUNCH + 1
 QK_KV_READY_EVENT = 0
 QK_SCORE_READY_EVENT = 1
@@ -92,7 +94,8 @@ VALID_BLOCK_MASK_COLS = (
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 SWA_TILE_WIN_ROWS = min(ATTN_K_TILE, WIN)
 SWA_RUNS = (SWA_TILE_WIN_ROWS + 2 * (BLOCK_SIZE - 1)) // BLOCK_SIZE  # Sliding-window page runs
-BIAS_T_TILE = min(T, 8)
+BIAS_T_TILE = 8
+BIAS_T_STEP = gcd(S, BIAS_T_TILE)
 if T % BIAS_T_TILE != 0:
     raise ValueError("CSA token capacity must contain complete bias tiles")
 if H_TILE % HEADS_PER_GROUP != 0:
@@ -144,10 +147,13 @@ def _sparse_attn_csa(
     with pl.spmd(CSA_PLAN_WORKERS, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
         plan_worker = pl.tile.get_block_idx()
         # Valid compressed slots.
-        for bias_t0 in pl.range(plan_worker * BIAS_T_TILE, t_dim, CSA_PLAN_WORKERS * BIAS_T_TILE):
-            c_raw_i32 = pl.load(idx_topk, [bias_t0, 0], [BIAS_T_TILE, IDX_TOPK])
+        for bias_t0 in pl.range(plan_worker * BIAS_T_STEP, t_dim, CSA_PLAN_WORKERS * BIAS_T_STEP):
+            c_raw_i32 = pl.load(idx_topk, [bias_t0, 0], [BIAS_T_TILE, IDX_TOPK], valid_shape=[BIAS_T_STEP, IDX_TOPK])
+            c_raw_i32 = pl.fillpad(c_raw_i32, pad_value=pl.PadValue.zero)
+            c_raw_i32 = pl.set_validshape(c_raw_i32, BIAS_T_TILE, IDX_TOPK)
             c_raw = pl.cast(c_raw_i32, target_type=pl.FP32)
-            c_pos_i32 = pl.load(position_ids, [bias_t0, 0], [BIAS_T_TILE, 1])
+            c_pos_i32 = pl.load(position_ids, [bias_t0, 0], [BIAS_T_TILE, 1], valid_shape=[BIAS_T_STEP, 1])
+            c_pos_i32 = pl.set_validshape(c_pos_i32, BIAS_T_TILE, 1)
             c_pos = pl.cast(c_pos_i32, target_type=pl.FP32)
             c_pos_scaled = pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV)
             c_pos_i32 = pl.cast(c_pos_scaled, target_type=pl.INT32, mode="trunc")
@@ -171,8 +177,10 @@ def _sparse_attn_csa(
             c_physical = pl.add(c_page_starts, c_intra_page)
             c_valid_i32 = pl.cast(c_mask, target_type=pl.INT32)
             c_physical_masked = pl.sub(pl.mul(c_valid_i32, pl.add(c_physical, 1)), 1)
-            pl.store(c_physical_masked, [bias_t0, 0], cmp_sparse_indices)
-            v_win_i32 = pl.load(window_swa_indices, [bias_t0, 0], [BIAS_T_TILE, WIN])
+            c_physical_masked_valid = pl.set_validshape(c_physical_masked, BIAS_T_STEP, IDX_TOPK)
+            pl.store(c_physical_masked_valid, [bias_t0, 0], cmp_sparse_indices)
+            v_win_i32 = pl.load(window_swa_indices, [bias_t0, 0], [BIAS_T_TILE, WIN], valid_shape=[BIAS_T_STEP, WIN])
+            v_win_i32 = pl.set_validshape(v_win_i32, BIAS_T_TILE, WIN)
             v_win_f = pl.cast(v_win_i32, target_type=pl.FP32)
             v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
             # Scalar writes, but VALID_BLOCK_MASK_COLS gives every token row its own
@@ -184,25 +192,27 @@ def _sparse_attn_csa(
             raw_block_valid = pl.row_max(v_win_valid, c_valid_tmp)
             raw_block_full = pl.row_min(v_win_valid, c_valid_tmp)
             raw_block_kind = pl.add(raw_block_valid, raw_block_full)
-            for c_t0 in pl.range(BIAS_T_TILE):
+            for c_t0 in pl.range(BIAS_T_STEP):
                 c_valid = pl.cast(pl.read(raw_block_kind, [c_t0, 0]), target_type=pl.INT32)
                 pl.write(valid_block_mask, [bias_t0 + c_t0, 0], c_valid)
             for c_sb in pl.range(1, SPARSE_BLOCKS):
                 c_s0 = (c_sb - 1) * ATTN_K_TILE
                 c_mask_block = pl.tile.slice(c_mask, [BIAS_T_TILE, ATTN_K_TILE], [0, c_s0])
                 c_blk_valid = pl.row_max(c_mask_block, c_valid_tmp)
-                for c_dt in pl.range(BIAS_T_TILE):
+                for c_dt in pl.range(BIAS_T_STEP):
                     c_valid = pl.cast(pl.read(c_blk_valid, [c_dt, 0]), target_type=pl.INT32)
                     pl.write(valid_block_mask, [bias_t0 + c_dt, c_sb], c_valid)
 
             # Additive sparse softmax bias.
             c_window_bias = pl.mul(pl.sub(v_win_valid, 1.0), -NEG_INF)
-            pl.store(c_window_bias, [bias_t0, 0], sparse_bias)
+            c_window_bias_valid = pl.set_validshape(c_window_bias, BIAS_T_STEP, WIN)
+            pl.store(c_window_bias_valid, [bias_t0, 0], sparse_bias)
             c_sparse_bias = pl.mul(pl.minimum(c_out, 0.0), -NEG_INF)
-            pl.store(c_sparse_bias, [bias_t0, WIN], sparse_bias)
+            c_sparse_bias_valid = pl.set_validshape(c_sparse_bias, BIAS_T_STEP, IDX_TOPK)
+            pl.store(c_sparse_bias_valid, [bias_t0, WIN], sparse_bias)
             if PADDED_TOPK > TOPK:
-                sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, TOPK:PADDED_TOPK] = pl.full(
-                    [BIAS_T_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF,
+                sparse_bias[bias_t0 : bias_t0 + BIAS_T_STEP, TOPK:PADDED_TOPK] = pl.full(
+                    [BIAS_T_STEP, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF,
                 )
 
     # Interleaved inverse-RoPE frequency rows.
@@ -210,7 +220,7 @@ def _sparse_attn_csa(
     rope_sin_signed = pl.create_tensor([T_PAD, ROPE_DIM], dtype=pl.FP32)
     # Inverse-RoPE lane-swap index.
     rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_swap") as swap_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_swap", allow_early_resolve=True) as swap_tid:
         sw_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         sw_idx_f = pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32)
         sw_col = pl.col_expand_mul(sw_ones, sw_idx_f)
@@ -263,31 +273,38 @@ def _sparse_attn_csa(
     with pl.spmd(qk_workers, name_hint="qk_pv", deps=[qk_plan_tid, rope_tid], allow_early_resolve=True) as qk_tid:
         qk_core = pl.tile.get_block_idx()
         pl.system.set_ffts(ffts_workspace)
-        for qk_item in pl.range(qk_core, t_dim * (H // QK_H_TILE), qk_workers):
+        qk_queries = 1
+        if FUSE_FINAL:
+            qk_queries = pl.max((t_dim * (H // QK_H_TILE) - qk_core + qk_workers - 1) // qk_workers, 1)
+        qk_work_count = qk_queries * SPARSE_BLOCKS
+        for qk_item in pl.range(qk_core, t_dim * (H // QK_H_TILE), qk_workers * qk_queries):
             qk_t = qk_item // (H // QK_H_TILE)
             qk_head_base = (qk_item % (H // QK_H_TILE)) * QK_H_TILE
             qk_q = pl.load(
                 q_flat, [qk_t * H + qk_head_base, 0], [QK_H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
             )
             qk_l1 = pl.create_tile([QK_TRANSFER_SLOTS * ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
-            for qk_tick in pl.range(SPARSE_BLOCKS + QK_PRE_LAUNCH):
-                if qk_tick < SPARSE_BLOCKS:
-                    qk_sb = qk_tick
-                    qk_block_kind = pl.read(valid_block_mask, [qk_t, qk_sb])
+            for qk_tick in pl.range(qk_work_count + QK_PRE_LAUNCH):
+                if qk_tick < qk_work_count:
+                    qk_sb = qk_tick % SPARSE_BLOCKS
+                    gather_t = (qk_item + (qk_tick // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
+                    if qk_sb == 0:
+                        qk_q = pl.load(q_flat, [gather_t * H + qk_head_base, 0], [QK_H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                    qk_block_kind = pl.read(valid_block_mask, [gather_t, qk_sb])
                     if qk_block_kind > 0:
-                        qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
+                        qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_tick % QK_TRANSFER_SLOTS
                         qk_kv_row = qk_slot * ATTN_K_TILE
                         qk_transfer_row = qk_slot * QK_H_TILE
-                        qk_l1_row = (qk_sb % QK_TRANSFER_SLOTS) * ATTN_K_TILE
+                        qk_l1_row = (qk_tick % QK_TRANSFER_SLOTS) * ATTN_K_TILE
                         if qk_block_kind == 2:
                             qk_window = qk_l1
-                            qk_pos = pl.cast(pl.read(position_ids, [qk_t, 0]), pl.INDEX)
+                            qk_pos = pl.cast(pl.read(position_ids, [gather_t, 0]), pl.INDEX)
                             qk_win_head = (qk_pos - WIN + 1) % BLOCK_SIZE
                             for qk_run in pl.unroll(SWA_RUNS):
                                 qk_lo = pl.max(qk_run * BLOCK_SIZE - qk_win_head, 0)
                                 qk_hi = pl.min((qk_run + 1) * BLOCK_SIZE - qk_win_head, WIN)
                                 if qk_hi > qk_lo:
-                                    qk_raw_row = pl.read(window_swa_indices, [qk_t, qk_lo])
+                                    qk_raw_row = pl.read(window_swa_indices, [gather_t, qk_lo])
                                     qk_window = pl.gather_row(
                                         qk_window, ori_kv_flat, [qk_l1_row + qk_lo, 0], [qk_raw_row, 0],
                                         [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_hi - qk_lo, HEAD_DIM],
@@ -308,19 +325,27 @@ def _sparse_attn_csa(
                             ffts_mode=2, core_type=pl.KernelType.AIC,
                         )
                 if qk_tick >= QK_PRE_LAUNCH:
-                    pv_sb = qk_tick - QK_PRE_LAUNCH
-                    if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
-                        pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
+                    pv_work = qk_tick - QK_PRE_LAUNCH
+                    pv_sb = pv_work % SPARSE_BLOCKS
+                    pv_t = (qk_item + (pv_work // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
+                    if pl.read(valid_block_mask, [pv_t, pv_sb]) > 0:
+                        pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_work % QK_TRANSFER_SLOTS
                         pv_transfer_row = pv_slot * QK_H_TILE
                         pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
                         pv_probability = pl.load(
                             probability_transfer, [pv_transfer_row, 0], [QK_H_TILE, ATTN_K_TILE],
                             target_memory=pl.MemorySpace.Mat,
                         )
-                        pv_l1_row = (pv_sb % QK_TRANSFER_SLOTS) * ATTN_K_TILE
-                        pv_kv = pl.tile.slice(qk_l1, [ATTN_K_TILE, HEAD_DIM], [pv_l1_row, 0])
-                        pv_output = pl.matmul(pv_probability, pv_kv, out_dtype=pl.FP32)
-                        pl.store(pv_output, [pv_transfer_row, 0], pv_transfer)
+                        pv_l1_row = (pv_work % QK_TRANSFER_SLOTS) * ATTN_K_TILE
+                        pv_probability_left = pl.tile.move(pv_probability, target_memory=pl.MemorySpace.Left)
+                        pv_first_right = pl.tile.extract(qk_l1, pv_l1_row, 0, [ATTN_K_TILE, 128], target_memory=pl.MemorySpace.Right)
+                        pv_previous = pl.tile.matmul(pv_probability_left, pv_first_right)
+                        for pv_n in pl.unroll(1, HEAD_DIM // 128):
+                            pv_next_right = pl.tile.extract(qk_l1, pv_l1_row, pv_n * 128, [ATTN_K_TILE, 128], target_memory=pl.MemorySpace.Right)
+                            pv_current = pl.tile.matmul(pv_probability_left, pv_next_right)
+                            pl.store(pv_previous, [pv_transfer_row, (pv_n - 1) * 128], pv_transfer)
+                            pv_previous = pv_current
+                        pl.store(pv_previous, [pv_transfer_row, HEAD_DIM - 128], pv_transfer)
                         pl.system.sync_set(
                             QK_PV_READY_EVENT, pipe=pl.PipeType.FIX,
                             ffts_mode=2, core_type=pl.KernelType.AIC,
@@ -330,26 +355,37 @@ def _sparse_attn_csa(
                 pl.system.set_ffts(ffts_workspace)
                 qk_lane_head = qk_aiv * (QK_H_TILE // 2)
                 qk_lane_kv = qk_aiv * (ATTN_K_TILE // 2)
+                m_swap = pl.load(rope_swap_idx, [0, 0], [H_TILE, ROPE_DIM])
+                m_swap_f = pl.cast(m_swap, target_type=pl.FP32)
+                m_swap_source = pl.add(m_swap_f, NOPE_DIM)
+                m_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
+                m_row_ids_f = pl.cast(m_row_ids, target_type=pl.FP32)
+                m_row_offsets = pl.mul(m_row_ids_f, HEAD_DIM)
+                m_row_offsets_col = pl.reshape(m_row_offsets, [H_TILE, 1])
+                m_swap_flat = pl.row_expand_add(m_swap_source, m_row_offsets_col)
+                m_swap_idx = pl.cast(m_swap_flat, target_type=pl.INT32)
+                m_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
                 running_m = pl.load(attn_sink_col, [qk_head_base + qk_lane_head, 0], [QK_H_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
                 running_l = pl.tile.muls(running_m, 0.0)
                 running_left = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
                 running_right = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-                previous_m = pl.tile.muls(running_m, 0.0)
-                previous_l = pl.tile.muls(running_m, 0.0)
-                for qk_tick, (m_iter, l_iter, left_iter, right_iter, mi_iter, li_iter) in pl.range(
-                    SPARSE_BLOCKS + QK_PRE_LAUNCH + 1,
-                    init_values=(running_m, running_l, running_left, running_right, previous_m, previous_l),
+                # Softmax statistics stay live until the delayed PV merge consumes their slot.
+                stats_ring = pl.create_tile([QK_TRANSFER_SLOTS * 2, QK_H_TILE // 2], dtype=pl.FP32)
+                for qk_tick, (m_iter, l_iter, left_iter, right_iter, stats_iter) in pl.range(
+                    qk_work_count + QK_PRE_LAUNCH + 1,
+                    init_values=(running_m, running_l, running_left, running_right, stats_ring),
                 ):
-                    if qk_tick < SPARSE_BLOCKS:
-                        qk_sb = qk_tick
-                        if pl.read(valid_block_mask, [qk_t, qk_sb]) == 1:
-                            qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_sb % QK_TRANSFER_SLOTS
+                    if qk_tick < qk_work_count:
+                        qk_sb = qk_tick % SPARSE_BLOCKS
+                        gather_t = (qk_item + (qk_tick // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
+                        if pl.read(valid_block_mask, [gather_t, qk_sb]) == 1:
+                            qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_tick % QK_TRANSFER_SLOTS
                             qk_kv_row = qk_slot * ATTN_K_TILE
                             qk_transfer_row = qk_slot * QK_H_TILE
                             qk_s0 = qk_sb * ATTN_K_TILE
-                            qk_kv_half = pl.tile.full([ATTN_K_TILE // 2, HEAD_DIM], dtype=pl.BF16, value=0.0)
                             if qk_s0 < WIN:
-                                qk_pos = pl.cast(pl.read(position_ids, [qk_t, 0]), pl.INDEX)
+                                qk_kv_half = pl.tile.full([ATTN_K_TILE // 2, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                                qk_pos = pl.cast(pl.read(position_ids, [gather_t, 0]), pl.INDEX)
                                 qk_win_len = pl.min(qk_pos + 1, WIN)
                                 qk_win_start = qk_pos - qk_win_len + 1
                                 qk_head = (qk_win_start + qk_s0) % BLOCK_SIZE
@@ -358,7 +394,7 @@ def _sparse_attn_csa(
                                     qk_lo = pl.max(qk_run * BLOCK_SIZE - qk_head - qk_lane_kv, 0)
                                     qk_hi = pl.min((qk_run + 1) * BLOCK_SIZE - qk_head - qk_lane_kv, qk_rows)
                                     if qk_hi > qk_lo:
-                                        qk_raw_row = pl.read(window_swa_indices, [qk_t, qk_s0 + qk_lane_kv + qk_lo])
+                                        qk_raw_row = pl.read(window_swa_indices, [gather_t, qk_s0 + qk_lane_kv + qk_lo])
                                         if qk_raw_row >= 0:
                                             qk_kv_half = pl.gather_row(
                                                 qk_kv_half, ori_kv_flat, [qk_lo, 0], [qk_raw_row, 0],
@@ -366,13 +402,15 @@ def _sparse_attn_csa(
                                             )
                             else:
                                 qk_cmp_k = qk_s0 + qk_lane_kv - WIN
-                                qk_src_masked = pl.load(cmp_sparse_indices, [qk_t, qk_cmp_k], [1, ATTN_K_TILE // 2])
+                                qk_src_masked = pl.load(cmp_sparse_indices, [gather_t, qk_cmp_k], [1, ATTN_K_TILE // 2])
                                 qk_kv_half = pl.tile.mgather(cmp_kv_flat, qk_src_masked, coalesce="row", gather_oob="zero")
                             pl.store(qk_kv_half, [qk_kv_row + qk_lane_kv, 0], kv_transfer)
-                    if qk_tick > 0 and qk_tick <= SPARSE_BLOCKS:
-                        softmax_sb = qk_tick - 1
-                        if pl.read(valid_block_mask, [qk_t, softmax_sb]) > 0:
-                            qk_slot = qk_core * QK_TRANSFER_SLOTS + softmax_sb % QK_TRANSFER_SLOTS
+                    if qk_tick > 0 and qk_tick <= qk_work_count:
+                        softmax_work = qk_tick - 1
+                        softmax_sb = softmax_work % SPARSE_BLOCKS
+                        softmax_t = (qk_item + (softmax_work // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
+                        if pl.read(valid_block_mask, [softmax_t, softmax_sb]) > 0:
+                            qk_slot = qk_core * QK_TRANSFER_SLOTS + softmax_work % QK_TRANSFER_SLOTS
                             qk_transfer_row = qk_slot * QK_H_TILE
                             qk_s0 = softmax_sb * ATTN_K_TILE
                             pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
@@ -381,7 +419,7 @@ def _sparse_attn_csa(
                                 target_memory=pl.MemorySpace.Vec,
                             )
                             qk_bias = pl.load(
-                                sparse_bias, [qk_t, qk_s0], [1, ATTN_K_TILE], target_memory=pl.MemorySpace.Vec,
+                                sparse_bias, [softmax_t, qk_s0], [1, ATTN_K_TILE], target_memory=pl.MemorySpace.Vec,
                             )
                             qk_scaled = pl.mul(qk_scores_half, SOFTMAX_SCALE)
                             qk_masked = pl.col_expand_add(qk_scaled, qk_bias)
@@ -395,27 +433,38 @@ def _sparse_attn_csa(
                                 QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE3,
                                 ffts_mode=2, core_type=pl.KernelType.AIV,
                             )
-                            mi_valid, li_valid = pl.yield_(qk_mi, qk_li)
+                            stats_row = (softmax_work % QK_TRANSFER_SLOTS) * 2
+                            stats_m = pl.reshape(qk_mi, [1, QK_H_TILE // 2])
+                            stats_l = pl.reshape(qk_li, [1, QK_H_TILE // 2])
+                            stats_with_m = pl.tile.assemble(stats_iter, stats_m, [stats_row, 0])
+                            stats_with_l = pl.tile.assemble(stats_with_m, stats_l, [stats_row + 1, 0])
+                            stats_valid = pl.yield_(stats_with_l)
                         else:
-                            mi_valid, li_valid = pl.yield_(mi_iter, li_iter)
-                        mi_next, li_next = pl.yield_(mi_valid, li_valid)
+                            stats_valid = pl.yield_(stats_iter)
+                        stats_next = pl.yield_(stats_valid)
                     else:
-                        mi_next, li_next = pl.yield_(mi_iter, li_iter)
+                        stats_next = pl.yield_(stats_iter)
                     # Publish the next KV-ready event after the preceding softmax stores.
-                    if qk_tick < SPARSE_BLOCKS:
-                        if pl.read(valid_block_mask, [qk_t, qk_tick]) == 1:
+                    if qk_tick < qk_work_count:
+                        publish_t = (qk_item + (qk_tick // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
+                        if pl.read(valid_block_mask, [publish_t, qk_tick % SPARSE_BLOCKS]) == 1:
                             pl.system.sync_set(
                                 QK_KV_READY_EVENT, pipe=pl.PipeType.MTE3,
                                 ffts_mode=2, core_type=pl.KernelType.AIV,
                             )
                     if qk_tick >= QK_PRE_LAUNCH + 1:
-                        pv_sb = qk_tick - QK_PRE_LAUNCH - 1
-                        if pl.read(valid_block_mask, [qk_t, pv_sb]) > 0:
-                            pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_sb % QK_TRANSFER_SLOTS
+                        pv_work = qk_tick - QK_PRE_LAUNCH - 1
+                        pv_sb = pv_work % SPARSE_BLOCKS
+                        pv_t = (qk_item + (pv_work // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
+                        if pl.read(valid_block_mask, [pv_t, pv_sb]) > 0:
+                            pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_work % QK_TRANSFER_SLOTS
                             pv_transfer_row = pv_slot * QK_H_TILE
                             pl.system.sync_wait(QK_PV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
-                            pv_m = mi_iter
-                            pv_l = li_iter
+                            pv_stats_row = (pv_work % QK_TRANSFER_SLOTS) * 2
+                            pv_m_row = pl.tile.extract(stats_iter, pv_stats_row, 0, [1, QK_H_TILE // 2], target_memory=pl.MemorySpace.Vec)
+                            pv_l_row = pl.tile.extract(stats_iter, pv_stats_row + 1, 0, [1, QK_H_TILE // 2], target_memory=pl.MemorySpace.Vec)
+                            pv_m = pl.reshape(pv_m_row, [QK_H_TILE // 2, 1])
+                            pv_l = pl.reshape(pv_l_row, [QK_H_TILE // 2, 1])
                             next_m = pl.maximum(m_iter, pv_m)
                             alpha = pl.exp(pl.sub(m_iter, next_m))
                             beta = pl.exp(pl.sub(pv_m, next_m))
@@ -435,16 +484,8 @@ def _sparse_attn_csa(
                             m_valid, l_valid, left_valid, right_valid = pl.yield_(m_iter, l_iter, left_iter, right_iter)
                         # Publish on the final logical block, including an invalid final block.
                         if FUSE_FINAL and pv_sb == SPARSE_BLOCKS - 1:
-                            m_swap = pl.load(rope_swap_idx, [0, 0], [H_TILE, ROPE_DIM])
-                            m_swap_f = pl.cast(m_swap, target_type=pl.FP32)
-                            m_swap_source = pl.add(m_swap_f, NOPE_DIM)
-                            m_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
-                            m_row_ids_f = pl.cast(m_row_ids, target_type=pl.FP32)
-                            m_row_offsets = pl.mul(m_row_ids_f, HEAD_DIM)
-                            m_row_offsets_col = pl.reshape(m_row_offsets, [H_TILE, 1])
-                            m_swap_flat = pl.row_expand_add(m_swap_source, m_row_offsets_col)
-                            m_swap_idx = pl.cast(m_swap_flat, target_type=pl.INT32)
-                            m_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
+                            m_cos_il = pl.load(rope_cos_il, [pv_t, 0], [1, ROPE_DIM])
+                            m_sin_signed = pl.load(rope_sin_signed, [pv_t, 0], [1, ROPE_DIM])
                             for pub_h in pl.unroll((QK_H_TILE // 2) // H_TILE):
                                 pub_head = pub_h * H_TILE
                                 m_h0 = qk_head_base + qk_lane_head + pub_head
@@ -466,8 +507,6 @@ def _sparse_attn_csa(
 
                                 # Inverse-RoPE head tile.
                                 m_rope = n_full[0:H_TILE, NOPE_DIM:HEAD_DIM]
-                                m_cos_il = pl.load(rope_cos_il, [qk_t, 0], [1, ROPE_DIM])
-                                m_sin_signed = pl.load(rope_sin_signed, [qk_t, 0], [1, ROPE_DIM])
                                 m_swapped = pl.tile.gather(n_full, m_swap_idx, m_gather_tmp)
                                 m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
                                 n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
@@ -476,15 +515,23 @@ def _sparse_attn_csa(
                                 n_group_bf16 = pl.reshape(n_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
                                 n_pack_first = n_group_bf16[0:1, 0:O_GROUP_IN]
                                 n_pack_second = n_group_bf16[1:2, 0:O_GROUP_IN]
-                                n_pack_row = (m_h0 // HEADS_PER_GROUP) * T_PAD + qk_t
+                                n_pack_row = (m_h0 // HEADS_PER_GROUP) * T_PAD + pv_t
                                 n_pack_row_second = n_pack_row + T_PAD
                                 pl.store(n_pack_first, [n_pack_row, 0], o_packed_heads)
                                 pl.store(n_pack_second, [n_pack_row_second, 0], o_packed_heads)
-                        m_after, l_after, left_after, right_after = pl.yield_(m_valid, l_valid, left_valid, right_valid)
+                        if FUSE_FINAL and pv_sb == SPARSE_BLOCKS - 1:
+                            reset_m = pl.load(attn_sink_col, [qk_head_base + qk_lane_head, 0], [QK_H_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
+                            reset_l = pl.tile.muls(reset_m, 0.0)
+                            reset_left = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+                            reset_right = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+                            m_reset, l_reset, left_reset, right_reset = pl.yield_(reset_m, reset_l, reset_left, reset_right)
+                        else:
+                            m_reset, l_reset, left_reset, right_reset = pl.yield_(m_valid, l_valid, left_valid, right_valid)
+                        m_after, l_after, left_after, right_after = pl.yield_(m_reset, l_reset, left_reset, right_reset)
                     else:
                         m_after, l_after, left_after, right_after = pl.yield_(m_iter, l_iter, left_iter, right_iter)
-                    running_m, running_l, running_left, running_right, previous_m, previous_l = pl.yield_(
-                        m_after, l_after, left_after, right_after, mi_next, li_next,
+                    running_m, running_l, running_left, running_right, stats_ring = pl.yield_(
+                        m_after, l_after, left_after, right_after, stats_next,
                     )
                 if not FUSE_FINAL:
                     qk_output_row = qk_t * H + qk_head_base + qk_lane_head

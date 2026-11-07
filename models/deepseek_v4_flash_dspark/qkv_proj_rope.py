@@ -438,29 +438,46 @@ def q_proj_q_matmul(
         # Weight reads bypass L2.
         pl.set_cache_policy(wq_b, pl.CachePolicy.BYPASS)
         qproj_worker = pl.tile.get_block_idx()
-        for qproj_n_idx in pl.range(
-            qproj_worker, (H * HEAD_DIM) // QPROJ_MM_N_TILE, QPROJ_WORKERS,
-        ):
-            w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
-            for t0 in pl.range(0, qproj_full_rows, QPROJ_M_TILE):
-                col_acc = pl.create_tile([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc)
-                for qproj_k in pl.pipeline(Q_LORA // QPROJ_K_TILE, stage=2):
-                    qproj_k0 = qproj_k * QPROJ_K_TILE
-                    qr_full = pl.load(qr_i8_matmul, [t0, qproj_k0], [QPROJ_M_TILE, QPROJ_K_TILE], target_memory=pl.MemorySpace.Mat)
-                    wq_chunk = pl.load(wq_b, [qproj_k0, w_col0], [QPROJ_K_TILE, QPROJ_MM_N_TILE], target_memory=pl.MemorySpace.Mat)
-                    col_acc = pl.tile.matmul_acc(col_acc, qr_full, wq_chunk, init_cond=(qproj_k == 0))
-                pl.store(col_acc, [t0, w_col0], q_proj_i32)
+        if tile_rows > 64 and tile_rows <= 128:
+            qref128_worker = pl.max(qproj_worker, 0)
+            qref128_padded_rows = (tile_rows + 128 - 1) // 128 * 128
+            for qref128_round in pl.range(0, ((H * HEAD_DIM) // 256 - qref128_worker + QPROJ_WORKERS - 1) // QPROJ_WORKERS):
+                qref128_n_idx = qref128_worker + qref128_round * QPROJ_WORKERS
+                qref128_column = qref128_n_idx * 256
+                for qref128_row in pl.range(0, qref128_padded_rows, 128):
+                    qref128_rows = pl.min(128, tile_rows - qref128_row)
+                    qref128_first_x = pl.slice(qr_i8_matmul, [128, 256], [qref128_row, 0], valid_shape=[qref128_rows, 256])
+                    qref128_first_w = wq_b[0:256, qref128_column : qref128_column + 256]
+                    qref128_acc = pl.matmul(qref128_first_x, qref128_first_w, out_dtype=pl.INT32)
+                    for qref128_k in pl.pipeline(256, Q_LORA, 256, stage=2):
+                        qref128_x = pl.slice(qr_i8_matmul, [128, 256], [qref128_row, qref128_k], valid_shape=[qref128_rows, 256])
+                        qref128_w = wq_b[qref128_k : qref128_k + 256, qref128_column : qref128_column + 256]
+                        qref128_acc = pl.matmul_acc(qref128_acc, qref128_x, qref128_w)
+                    q_proj_i32[qref128_row : qref128_row + 128, qref128_column : qref128_column + 256] = qref128_acc
+        else:
+            for qproj_n_idx in pl.range(
+                qproj_worker, (H * HEAD_DIM) // QPROJ_MM_N_TILE, QPROJ_WORKERS,
+            ):
+                w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
+                for t0 in pl.range(0, qproj_full_rows, QPROJ_M_TILE):
+                    col_acc = pl.create_tile([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32, target_memory=pl.MemorySpace.Acc)
+                    for qproj_k in pl.pipeline(Q_LORA // QPROJ_K_TILE, stage=2):
+                        qproj_k0 = qproj_k * QPROJ_K_TILE
+                        qr_full = pl.load(qr_i8_matmul, [t0, qproj_k0], [QPROJ_M_TILE, QPROJ_K_TILE], target_memory=pl.MemorySpace.Mat)
+                        wq_chunk = pl.load(wq_b, [qproj_k0, w_col0], [QPROJ_K_TILE, QPROJ_MM_N_TILE], target_memory=pl.MemorySpace.Mat)
+                        col_acc = pl.tile.matmul_acc(col_acc, qr_full, wq_chunk, init_cond=(qproj_k == 0))
+                    pl.store(col_acc, [t0, w_col0], q_proj_i32)
 
-            tail_w_col0 = w_col0
-            for tail_t0 in pl.range(qproj_full_rows, qproj_t_matmul, QPROJ_TAIL_M_TILE):
-                qproj_tail_rows = pl.min(QPROJ_TAIL_M_TILE, tile_rows - tail_t0)
-                wq_full = wq_b[0:Q_LORA, w_col0 : w_col0 + QPROJ_MM_N_TILE]
-                qr_i8_tail = pl.slice(qr_i8_matmul, [QPROJ_TAIL_M_TILE, Q_LORA], [tail_t0, 0], valid_shape=[qproj_tail_rows, Q_LORA])
-                tail_acc = pl.matmul(qr_i8_tail, wq_full, out_dtype=pl.INT32)
-                q_proj_i32[
-                    tail_t0 : tail_t0 + QPROJ_TAIL_M_TILE,
-                    tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
-                ] = tail_acc
+                tail_w_col0 = w_col0
+                for tail_t0 in pl.range(qproj_full_rows, qproj_t_matmul, QPROJ_TAIL_M_TILE):
+                    qproj_tail_rows = pl.min(QPROJ_TAIL_M_TILE, tile_rows - tail_t0)
+                    wq_full = wq_b[0:Q_LORA, w_col0 : w_col0 + QPROJ_MM_N_TILE]
+                    qr_i8_tail = pl.slice(qr_i8_matmul, [QPROJ_TAIL_M_TILE, Q_LORA], [tail_t0, 0], valid_shape=[qproj_tail_rows, Q_LORA])
+                    tail_acc = pl.matmul(qr_i8_tail, wq_full, out_dtype=pl.INT32)
+                    q_proj_i32[
+                        tail_t0 : tail_t0 + QPROJ_TAIL_M_TILE,
+                        tail_w_col0 : tail_w_col0 + QPROJ_MM_N_TILE,
+                    ] = tail_acc
     return qproj_tid
 
 

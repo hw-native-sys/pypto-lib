@@ -112,6 +112,7 @@ SCORE_LANE_ROWS = SCORE_TILE // 2
 # a time and the block-diagonal weight degenerates to a single row.
 SCORE_QUERY_TILE = 2 if S % 2 == 0 else 1
 STREAM_QUERY_TILE = 6 if S == 6 else 2
+STREAM_SPLIT_ROWS = STREAM_QUERY_TILE * IDX_N_HEADS // 2
 STREAM_ENABLED = int(TP == 1 and S == 6)
 STREAM_COEF_ROWS = (T_PAD + STREAM_QUERY_TILE - 1) // STREAM_QUERY_TILE * MM_ROW_TILE
 SCORE_ARENA_ROWS = max(T_PAD, TOPK_SCORE_WORKERS * SCORE_QUERY_TILE * 2)
@@ -207,6 +208,27 @@ def indexer_topk_half_leaf(
 
 
 @pl.jit.inline
+def stream_leaf_plan(history: pl.Scalar[pl.INDEX], groups: pl.Scalar[pl.INDEX]):
+    """Balance candidate tiles across complete score-worker waves."""
+    tiles = (history + STREAM_TILE - 1) // STREAM_TILE
+    leaves = pl.max((history + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF, 1)
+    multiple = pl.max((TOPK_SCORE_WORKERS + groups - 1) // groups, 1)
+    balanced = (leaves + multiple - 1) // multiple * multiple
+    if balanced <= TOPK_MAX_LEAVES and balanced <= tiles:
+        leaves = balanced
+    per_leaf = TOPK_CANDIDATES_PER_LEAF // STREAM_TILE
+    extra = 0
+    if multiple > 1:
+        per_leaf = tiles // leaves
+        extra = tiles % leaves
+    if groups == 24 and history <= 65536:
+        leaves = 1
+        per_leaf = tiles
+        extra = 0
+    return leaves, per_leaf, extra
+
+
+@pl.jit.inline
 def indexer_topk_query_merge_one(
     query: pl.Scalar[pl.INDEX],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
@@ -224,6 +246,12 @@ def indexer_topk_query_merge_one(
     visible_count = pl.min(cache_bound, TOPK_MAX_CANDIDATES)
     if visible_count > 0:
         leaf_count = (visible_count + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF
+        if roots_per_leaf == 1:
+            groups = pl.tensor.dim(position_ids, 0) // STREAM_QUERY_TILE
+            last_query = query // STREAM_QUERY_TILE * STREAM_QUERY_TILE + STREAM_QUERY_TILE - 1
+            last_position = pl.read(position_ids, [last_query])
+            group_visible = pl.max(pl.min(pl.min(cache_len, (last_position + 1) // COMPRESS_RATIO), TOPK_MAX_CANDIDATES), 0)
+            leaf_count, _leaf_tiles, _extra = stream_leaf_plan(group_visible, groups)
         half_count = leaf_count * roots_per_leaf
         arena_base = query * TOPK_ROWS_PER_QUERY
         for child in pl.range(1, half_count):
@@ -358,6 +386,90 @@ def indexer_topk_single_leaf_publish(
 
 
 @pl.jit.inline(auto_scope=False)
+def stream_scale_layout(
+    block_table: pl.Tensor[[B_DYN, IDX_MAX_BLOCKS], pl.INT32],
+    batch: pl.Scalar[pl.INDEX],
+    page_begin: pl.Scalar[pl.INDEX],
+    pages: pl.Scalar[pl.INDEX],
+    physical_pages: pl.Scalar[pl.INDEX],
+    batch_stride: pl.Scalar[pl.INDEX],
+):
+    """Prove stride-one or batch-strided physical pages for this leaf."""
+    first_page = pl.cast(0, pl.INDEX)
+    proven_stride = pl.cast(0, pl.INT32)
+    if physical_pages <= 16777216:
+        first = pl.cast(pl.read(block_table, [batch, page_begin]), pl.INDEX)
+        last = pl.cast(pl.read(block_table, [batch, page_begin + pages - 1]), pl.INDEX)
+        trial_stride = pl.cast(1, pl.INDEX)
+        if pages > 1:
+            second = pl.cast(pl.read(block_table, [batch, page_begin + 1]), pl.INDEX)
+            trial_stride = second - first
+        final_page = first + (pages - 1) * trial_stride
+        stride_supported = trial_stride == 1 or trial_stride == batch_stride
+        if stride_supported and trial_stride > 0 and first >= 0 and final_page < physical_pages and last == final_page:
+            first_page = first
+            proven_stride = pl.cast(trial_stride, pl.INT32)
+            for proof_start in pl.range(0, pages, 256):
+                proof_count = pl.min(256, pages - proof_start)
+                page_ids = pl.load(block_table, [batch, page_begin + proof_start], [1, 256], valid_shape=[1, proof_count])
+                page_offsets = pl.cast(pl.tile.arange(0, [1, 256], dtype=pl.INT32), pl.FP32)
+                first_i32 = pl.cast(first + proof_start * trial_stride, pl.INT32)
+                trial_stride_i32 = pl.cast(trial_stride, pl.INT32)
+                page_steps = pl.mul(page_offsets, pl.cast(trial_stride_i32, pl.FP32))
+                expected_full = pl.add(page_steps, pl.cast(first_i32, pl.FP32))
+                expected = pl.set_validshape(expected_full, 1, proof_count)
+                difference = pl.abs(pl.sub(pl.cast(page_ids, pl.FP32), expected))
+                proof_ones = pl.tile.full([8, 256], dtype=pl.FP32, value=1.0)
+                proof_ones = pl.set_validshape(proof_ones, 1, proof_count)
+                proof_rows = pl.col_expand_mul(proof_ones, difference)
+                proof_rows = pl.set_validshape(proof_rows, 1, proof_count)
+                proof_tmp = pl.create_tile([8, 256], dtype=pl.FP32)
+                max_difference = pl.row_max(proof_rows, proof_tmp)
+                if pl.tile.read(max_difference, [0, 0]) != 0.0:
+                    proven_stride = pl.cast(0, pl.INT32)
+    return first_page, proven_stride
+
+
+@pl.jit.inline(auto_scope=False)
+def indexer_stream_sort_top512(values: pl.Tile[[1, 2048], pl.FP32], begin: pl.Scalar[pl.INT32]):
+    indices = pl.tile.add(pl.tile.arange(0, [1, 2048], dtype=pl.INT32), begin)
+    pairs = pl.tile.sort32(values, pl.tile.reinterpret_view(indices, pl.UINT32))
+    pairs = pl.tile.mrgsort(pairs, block_len=64)
+    pairs = pl.tile.mrgsort(pairs, block_len=256)
+    pairs = pl.tile.mrgsort(pairs, block_len=1024)
+    root = pl.tile.extract(pairs, 0, 0, [1, 1024], target_memory=pl.Mem.Vec)
+    return root
+
+@pl.jit.inline(auto_scope=False)
+def indexer_stream_partial_sort_top512(values: pl.Tile[[1, 2048], pl.FP32], begin: pl.Scalar[pl.INT32], valid: pl.Scalar[pl.INT32]):
+    if valid <= 512:
+        tiny_tile = pl.tile.extract(values, 0, 0, [1, 512], target_memory=pl.Mem.Vec)
+        tiny_raw = pl.tile.set_validshape(tiny_tile, 1, pl.cast(valid, pl.INDEX))
+        tiny_scores = pl.maximum(pl.tile.fillpad(tiny_raw, pad_value=pl.PadValue.min), FP32_NEG_INF)
+        tiny_indices = pl.tile.add(pl.tile.arange(0, [1, 512], dtype=pl.INT32), begin)
+        tiny_pairs = pl.tile.sort32(tiny_scores, pl.tile.reinterpret_view(tiny_indices, pl.UINT32))
+        tiny_pairs = pl.tile.mrgsort(tiny_pairs, block_len=64)
+        tiny_pairs = pl.tile.mrgsort(tiny_pairs, block_len=256)
+        root = pl.tile.extract(tiny_pairs, 0, 0, [1, 1024], target_memory=pl.Mem.Vec)
+    elif valid <= 1024:
+        small_tile = pl.tile.extract(values, 0, 0, [1, 1024], target_memory=pl.Mem.Vec)
+        small_raw = pl.tile.set_validshape(small_tile, 1, pl.cast(valid, pl.INDEX))
+        small_scores = pl.maximum(pl.tile.fillpad(small_raw, pad_value=pl.PadValue.min), FP32_NEG_INF)
+        small_indices = pl.tile.add(pl.tile.arange(0, [1, 1024], dtype=pl.INT32), begin)
+        small_pairs = pl.tile.sort32(small_scores, pl.tile.reinterpret_view(small_indices, pl.UINT32))
+        small_pairs = pl.tile.mrgsort(small_pairs, block_len=64)
+        small_pairs = pl.tile.mrgsort(small_pairs, block_len=256)
+        small_left = pl.tile.extract(small_pairs, 0, 0, [1, 1024], target_memory=pl.Mem.Vec)
+        small_right = pl.tile.extract(small_pairs, 0, 1024, [1, 1024], target_memory=pl.Mem.Vec)
+        small_tmp = pl.tile.create([1, 2048], dtype=pl.FP32)
+        small_merged = pl.tile.mrgsort(small_left, small_right, tmp=small_tmp)
+        root = pl.tile.extract(small_merged, 0, 0, [1, 1024], target_memory=pl.Mem.Vec)
+    else:
+        root = indexer_stream_sort_top512(values, begin)
+    return root
+
+
+@pl.jit.inline(auto_scope=False)
 def indexer_score_topk_stream(
     qr_hadamard_i8: pl.Tensor[[T_PAD * IDX_N_HEADS, IDX_HEAD_DIM], pl.INT8],
     score_coefficient: pl.Tensor[[STREAM_COEF_ROWS, IDX_N_HEADS * STREAM_QUERY_TILE], pl.FP16],
@@ -378,6 +490,11 @@ def indexer_score_topk_stream(
     table_len = b_dim * IDX_MAX_BLOCKS
     kv_cache_i8_flat = pl.reshape(idx_kv_cache, [cache_rows, IDX_HEAD_DIM])
     kv_scale_row = pl.reshape(idx_kv_scale, [1, cache_rows])
+    scale_batch_layout = pl.cast(cache_rows % (b_dim * BLOCK_SIZE) == 0, pl.INT32)
+    scale_page_cols = BLOCK_SIZE
+    if scale_batch_layout != 0:
+        scale_page_cols = b_dim * BLOCK_SIZE
+    kv_scale_pages = pl.reshape(idx_kv_scale, [cache_rows // scale_page_cols, scale_page_cols])
     idx_block_table_flat = pl.reshape(idx_block_table, [table_len])
     transfer = pl.create_tensor(
         [TOPK_SCORE_WORKERS * 2 * STREAM_QUERY_TILE, STREAM_TILE], dtype=pl.FP32
@@ -400,14 +517,20 @@ def indexer_score_topk_stream(
             cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
             position = pl.read(position_ids, [query + STREAM_QUERY_TILE - 1])
             visible = pl.max(pl.min(pl.min(cache_len, (position + 1) // COMPRESS_RATIO), TOPK_MAX_CANDIDATES), 0)
-            begin = leaf * TOPK_CANDIDATES_PER_LEAF
-            if begin < visible:
-                valid = pl.min(visible - begin, TOPK_CANDIDATES_PER_LEAF)
+            leaf_count, leaf_tiles, extra_tiles = stream_leaf_plan(visible, query_groups)
+            begin = (leaf * leaf_tiles + pl.min(leaf, extra_tiles)) * STREAM_TILE
+            if leaf < leaf_count and begin < visible:
+                valid = pl.min(visible - begin, (leaf_tiles + pl.cast(leaf < extra_tiles, pl.INDEX)) * STREAM_TILE)
                 steps = (valid + STREAM_TILE - 1) // STREAM_TILE
                 query_l1 = pl.tile.load(qr_hadamard_i8, [query * IDX_N_HEADS, 0], [STREAM_QUERY_TILE * IDX_N_HEADS, IDX_HEAD_DIM], target_memory=pl.Mem.Mat)
-                query_left = pl.tile.move(query_l1, target_memory=pl.Mem.Left)
                 coef_l1 = pl.tile.load(score_coefficient, [query // STREAM_QUERY_TILE * MM_ROW_TILE, 0], [MM_ROW_TILE, STREAM_QUERY_TILE * IDX_N_HEADS], target_memory=pl.Mem.Mat)
-                coef_left = pl.tile.move(coef_l1, target_memory=pl.Mem.Left)
+                query_left0 = pl.tile.extract(query_l1, 0, 0, [STREAM_SPLIT_ROWS, IDX_HEAD_DIM], target_memory=pl.Mem.Left)
+                query_left1 = pl.tile.extract(query_l1, STREAM_SPLIT_ROWS, 0, [STREAM_SPLIT_ROWS, IDX_HEAD_DIM], target_memory=pl.Mem.Left)
+                coef_left0 = pl.tile.extract(coef_l1, 0, 0, [MM_ROW_TILE, STREAM_SPLIT_ROWS], target_memory=pl.Mem.Left)
+                coef_left1 = pl.tile.extract(coef_l1, 0, STREAM_SPLIT_ROWS, [MM_ROW_TILE, STREAM_SPLIT_ROWS], target_memory=pl.Mem.Left)
+                qk_acc0 = pl.tile.create([STREAM_SPLIT_ROWS, STREAM_PANEL_TILE], pl.INT32, target_memory=pl.Mem.Acc)
+                qk_acc1 = pl.tile.create([STREAM_SPLIT_ROWS, STREAM_PANEL_TILE], pl.INT32, target_memory=pl.Mem.Acc)
+                reduced_acc = pl.tile.create([MM_ROW_TILE, STREAM_PANEL_TILE], pl.FP32, target_memory=pl.Mem.Acc)
                 for step in pl.range(steps):
                     if step >= 2:
                         pl.system.sync_wait(SCORE_CONSUMED_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
@@ -415,7 +538,8 @@ def indexer_score_topk_stream(
                     # Keep the two Key slots live independently of Score L1.
                     # Stage QK(i) before reducing Score(i-1).
                     key_pool = pl.tile.create([2 * STREAM_PANEL_TILE, IDX_HEAD_DIM], pl.INT8, target_memory=pl.Mem.Mat)
-                    previous_score = pl.tile.create([STREAM_QUERY_TILE * IDX_N_HEADS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
+                    previous_score0 = pl.tile.create([STREAM_SPLIT_ROWS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
+                    previous_score1 = pl.tile.create([STREAM_SPLIT_ROWS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
                     for page in pl.unroll(STREAM_PANEL_TILE // BLOCK_SIZE):
                         logical = pl.min(begin + step * STREAM_TILE + page * BLOCK_SIZE, (visible - 1) // BLOCK_SIZE * BLOCK_SIZE)
                         block = pl.cast(pl.read(idx_block_table_flat, [batch * IDX_MAX_BLOCKS + logical // BLOCK_SIZE]), pl.INDEX)
@@ -427,19 +551,29 @@ def indexer_score_topk_stream(
                                 logical = pl.min(begin + step * STREAM_TILE + (panel + 1) * STREAM_PANEL_TILE + page * BLOCK_SIZE, (visible - 1) // BLOCK_SIZE * BLOCK_SIZE)
                                 block = pl.cast(pl.read(idx_block_table_flat, [batch * IDX_MAX_BLOCKS + logical // BLOCK_SIZE]), pl.INDEX)
                                 key_pool = pl.tile.gather_row(key_pool, kv_cache_i8_flat, [(panel + 1) % 2 * STREAM_PANEL_TILE + page * BLOCK_SIZE, 0], [block * BLOCK_SIZE, 0], [BLOCK_SIZE, IDX_HEAD_DIM])
-                        current_score = pl.tile.create([STREAM_QUERY_TILE * IDX_N_HEADS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
+                        current_score0 = pl.tile.create([STREAM_SPLIT_ROWS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
+                        current_score1 = pl.tile.create([STREAM_SPLIT_ROWS, STREAM_PANEL_TILE], pl.FP16, target_memory=pl.Mem.Mat)
                         if panel > 0:
-                            previous_right = pl.tile.move(previous_score, target_memory=pl.Mem.Right)
-                            qk = pl.tile.matmul(query_left, key)
-                            reduced = pl.tile.matmul(coef_left, previous_right)
-                            current_score = pl.tile.assemble(current_score, qk, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
+                            previous_right0 = pl.tile.move(previous_score0, target_memory=pl.Mem.Right)
+                            previous_right1 = pl.tile.move(previous_score1, target_memory=pl.Mem.Right)
+                            qk0 = pl.tile.matmul_acc(qk_acc0, query_left0, key, init_cond=True)
+                            current_score0 = pl.tile.assemble(current_score0, qk0, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
+                            qk1 = pl.tile.matmul_acc(qk_acc1, query_left1, key, init_cond=True)
+                            current_score1 = pl.tile.assemble(current_score1, qk1, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
+                            reduced_first = pl.tile.matmul_acc(reduced_acc, coef_left0, previous_right0, init_cond=True)
+                            reduced = pl.tile.matmul_acc(reduced_first, coef_left1, previous_right1)
                             pl.tile.store(pl.tile.set_validshape(reduced, STREAM_QUERY_TILE, STREAM_PANEL_TILE), [transfer_row, (panel - 1) * STREAM_PANEL_TILE], transfer)
                         else:
-                            qk = pl.tile.matmul(query_left, key)
-                            current_score = pl.tile.assemble(current_score, qk, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
-                        previous_score = current_score
-                    last_right = pl.tile.move(previous_score, target_memory=pl.Mem.Right)
-                    last_reduced = pl.tile.matmul(coef_left, last_right)
+                            qk0 = pl.tile.matmul_acc(qk_acc0, query_left0, key, init_cond=True)
+                            current_score0 = pl.tile.assemble(current_score0, qk0, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
+                            qk1 = pl.tile.matmul_acc(qk_acc1, query_left1, key, init_cond=True)
+                            current_score1 = pl.tile.assemble(current_score1, qk1, [0, 0], pre_quant=SCORE_FIXPIPE_SCALE, pre_relu=True)
+                        previous_score0 = current_score0
+                        previous_score1 = current_score1
+                    last_right0 = pl.tile.move(previous_score0, target_memory=pl.Mem.Right)
+                    last_right1 = pl.tile.move(previous_score1, target_memory=pl.Mem.Right)
+                    last_first = pl.tile.matmul_acc(reduced_acc, coef_left0, last_right0, init_cond=True)
+                    last_reduced = pl.tile.matmul_acc(last_first, coef_left1, last_right1)
                     pl.tile.store(pl.tile.set_validshape(last_reduced, STREAM_QUERY_TILE, STREAM_PANEL_TILE), [transfer_row, STREAM_TILE - STREAM_PANEL_TILE], transfer)
                     pl.system.sync_set(SCORE_READY_EVENT, pipe=pl.PipeType.FIX, ffts_mode=2, core_type=pl.KernelType.AIC)
                 for drain in pl.range(pl.min(steps, 2)):
@@ -455,18 +589,42 @@ def indexer_score_topk_stream(
                 cache_len = pl.read(kv_seq_lens, [batch]) // COMPRESS_RATIO
                 last_position = pl.read(position_ids, [query + STREAM_QUERY_TILE - 1])
                 visible = pl.max(pl.min(pl.min(cache_len, (last_position + 1) // COMPRESS_RATIO), TOPK_MAX_CANDIDATES), 0)
-                begin = leaf * TOPK_CANDIDATES_PER_LEAF
-                if begin < visible:
-                    valid = pl.min(visible - begin, TOPK_CANDIDATES_PER_LEAF)
+                leaf_count, leaf_tiles, extra_tiles = stream_leaf_plan(visible, query_groups)
+                begin = (leaf * leaf_tiles + pl.min(leaf, extra_tiles)) * STREAM_TILE
+                if leaf < leaf_count and begin < visible:
+                    valid = pl.min(visible - begin, (leaf_tiles + pl.cast(leaf < extra_tiles, pl.INDEX)) * STREAM_TILE)
                     steps = (valid + STREAM_TILE - 1) // STREAM_TILE
+                    scale_pages = (valid + BLOCK_SIZE - 1) // BLOCK_SIZE
+                    scale_first, scale_page_stride = stream_scale_layout(idx_block_table, batch, begin // BLOCK_SIZE, scale_pages, cache_rows // BLOCK_SIZE, b_dim)
                     root = pl.tile.full([STREAM_QUERY_TILE // 2, TOPK_PAIR_WIDTH], pl.FP32, value=FP32_NEG_INF)
                     segments = pl.tile.full([STREAM_QUERY_TILE, STREAM_TILE], pl.FP32, value=FP32_NEG_INF)
                     for step in pl.range(steps):
-                        scale = pl.tile.create([1, STREAM_TILE], pl.FP32, target_memory=pl.Mem.Vec)
-                        for page in pl.unroll(STREAM_TILE // BLOCK_SIZE):
-                            logical = pl.min(begin + step * STREAM_TILE + page * BLOCK_SIZE, (visible - 1) // BLOCK_SIZE * BLOCK_SIZE)
-                            block = pl.cast(pl.read(idx_block_table_flat, [batch * IDX_MAX_BLOCKS + logical // BLOCK_SIZE]), pl.INDEX)
-                            scale = pl.tile.gather_row(scale, kv_scale_row, [0, page * BLOCK_SIZE], [0, block * BLOCK_SIZE], [1, BLOCK_SIZE])
+                        if scale_page_stride == 1:
+                            scale_valid = pl.min(valid - step * STREAM_TILE, STREAM_TILE)
+                            scale_start = scale_first * BLOCK_SIZE + step * STREAM_TILE
+                            scale_loaded = pl.load(kv_scale_row, [0, scale_start], [1, STREAM_TILE], valid_shape=[1, scale_valid])
+                            scale_full = pl.tile.fillpad(scale_loaded, pad_value=pl.PadValue.zero)
+                            scale = pl.yield_(pl.set_validshape(scale_full, 1, STREAM_TILE))
+                        else:
+                            if scale_page_stride == b_dim and scale_batch_layout != 0:
+                                scale_valid = pl.min(valid - step * STREAM_TILE, STREAM_TILE)
+                                scale_valid_pages = (scale_valid + BLOCK_SIZE - 1) // BLOCK_SIZE
+                                scale_page_row = scale_first // b_dim + step * (STREAM_TILE // BLOCK_SIZE)
+                                scale_page_col = (scale_first % b_dim) * BLOCK_SIZE
+                                scale_matrix = pl.load(kv_scale_pages, [scale_page_row, scale_page_col], [STREAM_TILE // BLOCK_SIZE, BLOCK_SIZE], valid_shape=[scale_valid_pages, BLOCK_SIZE])
+                                scale_matrix_full = pl.tile.set_validshape(scale_matrix, STREAM_TILE // BLOCK_SIZE, BLOCK_SIZE)
+                                scale_flat = pl.tile.reshape(scale_matrix_full, [1, STREAM_TILE])
+                                scale_tail = pl.tile.set_validshape(scale_flat, 1, scale_valid)
+                                scale_full = pl.tile.fillpad(scale_tail, pad_value=pl.PadValue.zero)
+                                scale_noncontiguous = pl.yield_(pl.tile.set_validshape(scale_full, 1, STREAM_TILE))
+                            else:
+                                scale_scattered = pl.tile.create([1, STREAM_TILE], pl.FP32, target_memory=pl.Mem.Vec)
+                                for page in pl.unroll(STREAM_TILE // BLOCK_SIZE):
+                                    logical = pl.min(begin + step * STREAM_TILE + page * BLOCK_SIZE, (visible - 1) // BLOCK_SIZE * BLOCK_SIZE)
+                                    block = pl.cast(pl.read(idx_block_table_flat, [batch * IDX_MAX_BLOCKS + logical // BLOCK_SIZE]), pl.INDEX)
+                                    scale_scattered = pl.tile.gather_row(scale_scattered, kv_scale_row, [0, page * BLOCK_SIZE], [0, block * BLOCK_SIZE], [1, BLOCK_SIZE])
+                                scale_noncontiguous = pl.yield_(scale_scattered)
+                            scale = pl.yield_(scale_noncontiguous)
                         transfer_row = (worker * 2 + step % 2) * STREAM_QUERY_TILE + lane * (STREAM_QUERY_TILE // 2)
                         pl.system.sync_wait(SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
                         raw = pl.tile.load(transfer, [transfer_row, 0], [STREAM_QUERY_TILE // 2, STREAM_TILE])
@@ -489,12 +647,9 @@ def indexer_score_topk_stream(
                                     data = pl.tile.set_validshape(data, 1, segment_valid)
                                     data = pl.tile.fillpad(data, pad_value=pl.PadValue.min)
                                     data = pl.maximum(data, FP32_NEG_INF)
-                                    indices = pl.tile.add(pl.tile.arange(0, [1, 2 * STREAM_TILE], dtype=pl.INT32), pl.cast(segment_begin, pl.INT32))
-                                    pairs = pl.tile.sort32(data, pl.tile.reinterpret_view(indices, pl.UINT32))
-                                    pairs = pl.tile.mrgsort(pairs, block_len=64)
-                                    pairs = pl.tile.mrgsort(pairs, block_len=256)
-                                    pairs = pl.tile.mrgsort(pairs, block_len=1024)
-                                    new_root = pl.tile.extract(pairs, 0, 0, [1, TOPK_PAIR_WIDTH], target_memory=pl.Mem.Vec)
+                                    logical_begin_i32 = pl.cast(segment_begin, pl.INT32)
+                                    segment_valid_i32 = pl.cast(segment_valid, pl.INT32)
+                                    new_root = indexer_stream_partial_sort_top512(data, logical_begin_i32, segment_valid_i32)
                                     if step < 2:
                                         root = pl.tile.assemble(root, new_root, [local, 0])
                                     else:
@@ -679,7 +834,8 @@ def indexer_score_topk_forest(
         score_tid = buffered_leaf_tid
     elif stream_score > 0:
         stream_history = pl.min(max_topk_cache_len, TOPK_MAX_CANDIDATES)
-        stream_leaves = pl.max((stream_history + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF, 1)
+        stream_groups = pl.tensor.dim(position_ids, 0) // STREAM_QUERY_TILE
+        stream_leaves, _stream_tiles, _stream_extra = stream_leaf_plan(stream_history, stream_groups)
         score_tid = indexer_score_topk_stream(
             qr_hadamard_i8, stream_coefficient, idx_kv_cache, idx_kv_scale,
             idx_block_table, position_ids, kv_seq_lens, pair_arena,
@@ -913,35 +1069,46 @@ def indexer_qr_rope(
                 qr_acc_pad[qr_r0 : qr_r0 + QR_MM_ROW_TILE, o_base : o_base + QR_MM_N_TILE] = qr_acc
     # Fused dequant + RoPE: one unit is DEQUANT_T_TILE tokens x DQ_ROPE_H_TILE heads.
     qr_bf16_2d = pl.reshape(qr_bf16, [T_PAD, IDX_N_HEADS * IDX_HEAD_DIM])
-    dq_rope_units = (bs // DEQUANT_T_TILE) * (IDX_N_HEADS // DQ_ROPE_H_TILE)
+    dq_rope_units = ((bs + DEQUANT_T_TILE - 1) // DEQUANT_T_TILE) * (IDX_N_HEADS // DQ_ROPE_H_TILE)
     dq_rope_workers = pl.min(dq_rope_units, DQ_ROPE_WORKERS)
     for dq_rope_worker in pl.spmd(dq_rope_workers, name_hint="idx_qr_dequant_rope", allow_early_resolve=True):
-        sw_ones = pl.full([DEQUANT_T_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        sw_index = pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32)
-        sw_col = pl.col_expand_mul(sw_ones, sw_index)
-        sw_dup_f = pl.cast(pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))
-        rope_swap_idx = pl.cast(pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)
+        swap_i = pl.tile.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
+        swap_tmp = pl.create_tile([1, ROPE_HEAD_DIM], dtype=pl.INT32)
+        swap_lane = pl.tile.rems(swap_i, 2, swap_tmp)
+        swap_row = pl.tile.adds(pl.tile.sub(swap_i, pl.tile.muls(swap_lane, 2)), IDX_NOPE_HEAD_DIM + 1)
+        swap_base = pl.create_tile([DEQUANT_T_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+        swap_source = pl.col_expand(swap_base, swap_row)
+        row_ids = pl.tile.arange(0, [1, DEQUANT_T_TILE], dtype=pl.INT32)
+        row_offsets = pl.tile.muls(row_ids, IDX_HEAD_DIM)
+        row_offsets_col = pl.reshape(row_offsets, [DEQUANT_T_TILE, 1])
+        flat_swap = pl.reshape(pl.row_expand_add(swap_source, row_offsets_col), [1, DEQUANT_T_TILE * ROPE_HEAD_DIM])
+        gather_tmp = pl.create_tile([1, DEQUANT_T_TILE * ROPE_HEAD_DIM], dtype=pl.INT32)
         for dq_unit in pl.range(dq_rope_worker, dq_rope_units, dq_rope_workers):
             hg = (dq_unit % (IDX_N_HEADS // DQ_ROPE_H_TILE)) * DQ_ROPE_H_TILE
             dq_t0 = (dq_unit // (IDX_N_HEADS // DQ_ROPE_H_TILE)) * DEQUANT_T_TILE
-            qr_scale_tile = qr_scale[dq_t0 : dq_t0 + DEQUANT_T_TILE, :]
-            cos_tile = cos[dq_t0 : dq_t0 + DEQUANT_T_TILE, 0 : ROPE_HEAD_DIM]
-            sin_tile = sin[dq_t0 : dq_t0 + DEQUANT_T_TILE, 0 : ROPE_HEAD_DIM]
+            dq_valid_rows = pl.min(DEQUANT_T_TILE, bs - dq_t0)
+            qr_scale_tail = pl.load(qr_scale, [dq_t0, 0], [DEQUANT_T_TILE, 1], valid_shape=[dq_valid_rows, 1])
+            qr_scale_tile = pl.set_validshape(qr_scale_tail, DEQUANT_T_TILE, 1)
+            cos_tail = pl.load(cos, [dq_t0, 0], [DEQUANT_T_TILE, ROPE_HEAD_DIM], valid_shape=[dq_valid_rows, ROPE_HEAD_DIM])
+            cos_tile = pl.set_validshape(cos_tail, DEQUANT_T_TILE, ROPE_HEAD_DIM)
+            sin_tail = pl.load(sin, [dq_t0, 0], [DEQUANT_T_TILE, ROPE_HEAD_DIM], valid_shape=[dq_valid_rows, ROPE_HEAD_DIM])
+            sin_tile = pl.set_validshape(sin_tail, DEQUANT_T_TILE, ROPE_HEAD_DIM)
             for h_inner in pl.pipeline(DQ_ROPE_H_TILE, stage=2):
                 h0 = (hg + h_inner) * IDX_HEAD_DIM
-                wq_scale = pl.reshape(wq_b_scale[h0 : h0 + IDX_HEAD_DIM], [1, IDX_HEAD_DIM])
+                wq_scale = pl.reshape(pl.load(wq_b_scale, [h0], [IDX_HEAD_DIM]), [1, IDX_HEAD_DIM])
                 acc_fp32 = pl.cast(
-                    qr_acc_pad[dq_t0 : dq_t0 + DEQUANT_T_TILE, h0 : h0 + IDX_HEAD_DIM],
+                    pl.load(qr_acc_pad, [dq_t0, h0], [DEQUANT_T_TILE, IDX_HEAD_DIM]),
                     target_type=pl.FP32, mode="none")
                 qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, qr_scale_tile), wq_scale)
                 qr_nope_bf16 = pl.cast(qr_dequant[:, 0 : IDX_NOPE_HEAD_DIM], target_type=pl.BF16, mode="rint")
                 qr_rope_slice = qr_dequant[:, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-                qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
+                qr_dequant_flat = pl.reshape(qr_dequant, [1, DEQUANT_T_TILE * IDX_HEAD_DIM])
+                qr_swapped_flat = pl.tile.gather(qr_dequant_flat, flat_swap, gather_tmp)
+                qr_swapped = pl.reshape(qr_swapped_flat, [DEQUANT_T_TILE, ROPE_HEAD_DIM])
                 rope_rot = pl.add(pl.mul(qr_rope_slice, cos_tile), pl.mul(qr_swapped, sin_tile))
                 rope_bf16 = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
-                qr_bf16_2d[dq_t0 : dq_t0 + DEQUANT_T_TILE, h0 : h0 + IDX_NOPE_HEAD_DIM] = qr_nope_bf16
-                qr_bf16_2d[dq_t0 : dq_t0 + DEQUANT_T_TILE, h0 + IDX_NOPE_HEAD_DIM : h0 + IDX_HEAD_DIM] = rope_bf16
+                pl.store(qr_nope_bf16, [dq_t0, h0], qr_bf16_2d)
+                pl.store(rope_bf16, [dq_t0, h0 + IDX_NOPE_HEAD_DIM], qr_bf16_2d)
 
 
     return idx_qr_mm_tid

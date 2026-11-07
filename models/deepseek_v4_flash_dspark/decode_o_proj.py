@@ -355,7 +355,7 @@ def decode_o_proj_tp1(
 
 
 HC_MULT = M.hc_mult
-HC_ACT_TASK_T_TILE = 8
+HC_ACT_WORKERS = 48
 
 
 @pl.jit.inline
@@ -396,16 +396,17 @@ def _decode_o_proj_hc_post(
 ):
     """Dequantize projection partials and mix HC rows with bounded UB storage."""
     t_dim = pl.tensor.dim(x_out, 0)
-    act_t_blks = (t_dim + HC_ACT_TASK_T_TILE - 1) // HC_ACT_TASK_T_TILE
+    act_token_tile = pl.max((t_dim * HC_D_BLOCKS + HC_ACT_WORKERS - 1) // HC_ACT_WORKERS, 1)
+    act_t_blks = (t_dim + act_token_tile - 1) // act_token_tile
     y_flat = pl.reshape(x_out, [t_dim, HC_MULT * D])
     with pl.spmd(act_t_blks * HC_D_BLOCKS, name_hint="proj_b_act_hc_post",
                  deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
         act_idx = pl.tile.get_block_idx()
-        t0 = act_idx // HC_D_BLOCKS * HC_ACT_TASK_T_TILE
+        t0 = act_idx // HC_D_BLOCKS * act_token_tile
         d0 = act_idx % HC_D_BLOCKS * HC_D_TILE
         wb_scale = pl.load(wo_b_scale, [d0], [HC_D_TILE], target_memory=pl.MemorySpace.Vec)
         wb_scale_row = pl.reshape(wb_scale, [1, HC_D_TILE])
-        for t in pl.pipeline(t0, pl.min(t0 + HC_ACT_TASK_T_TILE, t_dim), stage=2):
+        for t in pl.pipeline(t0, pl.min(t0 + act_token_tile, t_dim), stage=2):
             acc = pl.tile.full([1, HC_D_TILE], dtype=pl.FP32, value=0.0)
             for act_g in pl.pipeline(O_GROUPS, stage=2):
                 p_col0 = act_g * D + d0

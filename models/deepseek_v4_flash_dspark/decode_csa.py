@@ -11,6 +11,7 @@
 
 
 import sys
+from math import gcd
 
 import config
 
@@ -188,6 +189,8 @@ CSA_PROJECTION_PACK_ROW_TILE = 8
 CSA_PROJECTION_PACK_WORKERS = 16
 CSA_ALL_VISIBLE_WORKERS = 16
 CSA_WB_TOKEN_TILE = 8
+TP1_CSA_ROPE_TILE = gcd(4, S)
+TP1_CSA_WB_TOKEN_TILE = gcd(CSA_WB_TOKEN_TILE, S)
 CSA_ROPE_WORKERS = 16
 CSA_WB_WORKERS = 48  # CSA cache-write workers
 TP1_CSA_WB_WORKERS = 8  # TP1 CSA cache-write workers
@@ -835,7 +838,7 @@ def _decode_csa_tp1(
     idx_block_table.bind_dynamic(0, B_DYN)
     x_out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(x_hc, 0)
-    wb_blocks = t_dim // CSA_WB_TOKEN_TILE
+    wb_blocks = t_dim // TP1_CSA_WB_TOKEN_TILE
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     x_normed_t = pl.create_tensor([t_dim, D], dtype=pl.BF16)
@@ -849,26 +852,26 @@ def _decode_csa_tp1(
     idx_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_cos_il = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
     cmp_sin_signed = pl.create_tensor([t_dim, ROPE_HEAD_DIM], dtype=pl.FP32)
-    with pl.spmd(pl.min(t_dim // 4, CSA_ROPE_WORKERS), name_hint="csa_rope_interleave") as rope_tid:
-        for rope_block in pl.range(pl.tile.get_block_idx(), t_dim // 4, pl.min(t_dim // 4, CSA_ROPE_WORKERS)):
-            rope_t0 = rope_block * 4
-            il_ones = pl.full([4, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+    with pl.spmd(pl.min(t_dim // TP1_CSA_ROPE_TILE, CSA_ROPE_WORKERS), name_hint="csa_rope_interleave", allow_early_resolve=True) as rope_tid:
+        for rope_block in pl.range(pl.tile.get_block_idx(), t_dim // TP1_CSA_ROPE_TILE, pl.min(t_dim // TP1_CSA_ROPE_TILE, CSA_ROPE_WORKERS)):
+            rope_t0 = rope_block * TP1_CSA_ROPE_TILE
+            il_ones = pl.full([TP1_CSA_ROPE_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
             il_lane_ids = pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32)
             il_col = pl.col_expand_mul(il_ones, il_lane_ids)
             il_dup_f = pl.cast(pl.cast(pl.mul(il_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
             il_dup_idx = pl.cast(il_dup_f, target_type=pl.INT32)
             il_lane = pl.sub(il_col, pl.mul(il_dup_f, 2.0))
             il_sign = pl.sub(pl.mul(il_lane, 2.0), 1.0)
-            idx_cos_half = pl.cast(freqs_cos[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32)
-            idx_cos_il[rope_t0 : rope_t0 + 4, :] = pl.gather(idx_cos_half, dim=-1, index=il_dup_idx)
-            idx_sin_half = pl.cast(freqs_sin[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32)
+            idx_cos_half = pl.cast(freqs_cos[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, 0:HALF_ROPE], target_type=pl.FP32)
+            idx_cos_il[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, :] = pl.gather(idx_cos_half, dim=-1, index=il_dup_idx)
+            idx_sin_half = pl.cast(freqs_sin[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, 0:HALF_ROPE], target_type=pl.FP32)
             idx_sin_il = pl.gather(idx_sin_half, dim=-1, index=il_dup_idx)
-            idx_sin_signed[rope_t0 : rope_t0 + 4, :] = pl.mul(idx_sin_il, il_sign)
-            cmp_cos_half = pl.cast(cmp_freqs_cos[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32)
-            cmp_cos_il[rope_t0 : rope_t0 + 4, :] = pl.gather(cmp_cos_half, dim=-1, index=il_dup_idx)
-            cmp_sin_half = pl.cast(cmp_freqs_sin[rope_t0 : rope_t0 + 4, 0:HALF_ROPE], target_type=pl.FP32)
+            idx_sin_signed[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, :] = pl.mul(idx_sin_il, il_sign)
+            cmp_cos_half = pl.cast(cmp_freqs_cos[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, 0:HALF_ROPE], target_type=pl.FP32)
+            cmp_cos_il[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, :] = pl.gather(cmp_cos_half, dim=-1, index=il_dup_idx)
+            cmp_sin_half = pl.cast(cmp_freqs_sin[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, 0:HALF_ROPE], target_type=pl.FP32)
             cmp_sin_il = pl.gather(cmp_sin_half, dim=-1, index=il_dup_idx)
-            cmp_sin_signed[rope_t0 : rope_t0 + 4, :] = pl.mul(cmp_sin_il, il_sign)
+            cmp_sin_signed[rope_t0 : rope_t0 + TP1_CSA_ROPE_TILE, :] = pl.mul(cmp_sin_il, il_sign)
 
     q = pl.create_tensor([t_dim, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.BF16)
@@ -892,8 +895,8 @@ def _decode_csa_tp1(
         with pl.spmd(TP1_CSA_WB_WORKERS, name_hint="csa_cache_writeback"):
             wb_worker = pl.tile.get_block_idx()
             for wb_blk in pl.range(wb_worker, wb_blocks, TP1_CSA_WB_WORKERS):
-                wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
-                for write_dt in pl.range(CSA_WB_TOKEN_TILE):
+                wb_t0 = wb_blk * TP1_CSA_WB_TOKEN_TILE
+                for write_dt in pl.range(TP1_CSA_WB_TOKEN_TILE):
                     write_t = wb_t0 + write_dt
                     write_row_i64 = pl.read(ori_slot_mapping, [write_t])
                     if write_row_i64 >= 0:
@@ -1227,7 +1230,8 @@ def build_tensor_specs(start_pos=None, batch=B):
     max_active_pages = max(1, (max_visible_rows + BLOCK_SIZE - 1) // BLOCK_SIZE)
     cmp_block_num = batch * max_active_pages
     idx_cache_block_num = batch * max_active_pages
-    window_block_table = block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_BLOCK_NUM)
+    window_pool_blocks = (ORI_BLOCK_NUM // batch) * batch
+    window_block_table = block_table(batch=batch, table_blocks=ORI_MAX_BLOCKS, physical_blocks=window_pool_blocks)
     cmp_block_table = block_table(batch=batch, table_blocks=CMP_MAX_BLOCKS, physical_blocks=cmp_block_num)
     idx_block_table = block_table(batch=batch, table_blocks=IDX_MAX_BLOCKS, physical_blocks=idx_cache_block_num)
     def round_half_away_from_zero(x):
