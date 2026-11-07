@@ -46,6 +46,34 @@ W2_GROUP_TILE = 2
 T_DYN_TEST = 64
 
 
+@pl.jit.inline(auto_scope=False)
+def _gate_up_projection(
+    x_int8: pl.Tensor[[RECV_DYN, D], pl.INT8],
+    w_gate_up: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    gate_up_i32: pl.Tensor[[RECV_TILE, 2 * MOE_INTER], pl.INT32],
+    local_e: pl.Scalar[pl.INDEX],
+    flat_row: pl.Scalar[pl.INDEX],
+    valid_rows: pl.Scalar[pl.INDEX],
+    n0: pl.Scalar[pl.INDEX],
+):
+    x_l1 = pl.create_l1([RECV_TILE, D], dtype=pl.INT8)
+    x_l1 = pl.gather_row(x_l1, x_int8, [0, 0], [flat_row, 0], [RECV_TILE, D], valid_shape=[valid_rows, D])
+    xs_first = pl.slice(x_l1, [RECV_TILE, K_TILE], [0, 0], valid_shape=[valid_rows, K_TILE])
+    gate_first = w_gate_up[local_e:local_e + 1, n0:n0 + MM_INTER_TILE, 0:K_TILE]
+    up_first = w_gate_up[local_e:local_e + 1, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE, 0:K_TILE]
+    gate_acc = pl.matmul(xs_first, gate_first, b_trans=True, out_dtype=pl.INT32)
+    up_acc = pl.matmul(xs_first, up_first, b_trans=True, out_dtype=pl.INT32)
+    for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
+        xs_k = pl.slice(x_l1, [RECV_TILE, K_TILE], [0, k0], valid_shape=[valid_rows, K_TILE])
+        gate_k = w_gate_up[local_e:local_e + 1, n0:n0 + MM_INTER_TILE, k0:k0 + K_TILE]
+        up_k = w_gate_up[local_e:local_e + 1, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE, k0:k0 + K_TILE]
+        gate_acc = pl.matmul_acc(gate_acc, xs_k, gate_k, b_trans=True)
+        up_acc = pl.matmul_acc(up_acc, xs_k, up_k, b_trans=True)
+    gate_up_i32[:, n0:n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
+    gate_up_i32[:, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE] = pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
+    return gate_up_i32
+
+
 @pl.jit.inline
 def expert_routed(
     x_int8: pl.Tensor[[RECV_DYN, D], pl.INT8],
@@ -73,23 +101,19 @@ def expert_routed(
 
             # Paired gate/up projections share a resident INT8 input tile.
             gate_up_i32 = pl.create_tensor([RECV_TILE, 2 * MOE_INTER], dtype=pl.INT32)
-            for nb in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_mm", allow_early_resolve=True):
-                n0 = nb * MM_INTER_TILE
-                x_l1 = pl.create_l1([RECV_TILE, D], dtype=pl.INT8)
-                x_l1 = pl.gather_row(x_l1, x_int8, [0, 0], [flat_row, 0], [RECV_TILE, D], valid_shape=[valid_rows, D])
-                xs_first = pl.slice(x_l1, [RECV_TILE, K_TILE], [0, 0], valid_shape=[valid_rows, K_TILE])
-                gate_first = w_gate_up[local_e:local_e + 1, n0:n0 + MM_INTER_TILE, 0:K_TILE]
-                up_first = w_gate_up[local_e:local_e + 1, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE, 0:K_TILE]
-                gate_acc = pl.matmul(xs_first, gate_first, b_trans=True, out_dtype=pl.INT32)
-                up_acc = pl.matmul(xs_first, up_first, b_trans=True, out_dtype=pl.INT32)
-                for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
-                    xs_k = pl.slice(x_l1, [RECV_TILE, K_TILE], [0, k0], valid_shape=[valid_rows, K_TILE])
-                    gate_k = w_gate_up[local_e:local_e + 1, n0:n0 + MM_INTER_TILE, k0:k0 + K_TILE]
-                    up_k = w_gate_up[local_e:local_e + 1, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE, k0:k0 + K_TILE]
-                    gate_acc = pl.matmul_acc(gate_acc, xs_k, gate_k, b_trans=True)
-                    up_acc = pl.matmul_acc(up_acc, xs_k, up_k, b_trans=True)
-                gate_up_i32[:, n0:n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
-                gate_up_i32[:, MOE_INTER + n0:MOE_INTER + n0 + MM_INTER_TILE] = pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
+            if n_tiles == 1:
+                for nb in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_stream", allow_early_resolve=True):
+                    pl.set_cache_policy(w_gate_up, pl.CachePolicy.BYPASS)
+                    n0 = nb * MM_INTER_TILE
+                    gate_up_i32 = _gate_up_projection(
+                        x_int8, w_gate_up, gate_up_i32, local_e, flat_row, valid_rows, n0,
+                    )
+            else:
+                for nb in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_up_mm", allow_early_resolve=True):
+                    n0 = nb * MM_INTER_TILE
+                    gate_up_i32 = _gate_up_projection(
+                        x_int8, w_gate_up, gate_up_i32, local_e, flat_row, valid_rows, n0,
+                    )
 
             # Activation epilogue: dequant (per-token x scale x per-channel weight
             # scale), clamped SwiGLU, per-row amax, INT8 requant for w2. The

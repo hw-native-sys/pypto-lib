@@ -662,6 +662,26 @@ Relative to the paired-projection baseline (`e02a7c0`), independent W2
 completion and cached activation maxima reduce these component medians by
 3.5% to 5.1%.
 
+Gate/Up weight reads now follow each expert's row occupancy. An expert with
+one 16-row tile streams its read-only weights with L2 bypass; experts with
+multiple tiles retain cached reads for weight reuse. Both launch scopes use
+the same paired-projection helper. W2 retains its original cache policy.
+
+An incremental comparison against the prior optimized kernel, using the same
+A3 device, 100/5 sampling and frozen goldens, gives:
+
+| Received rows | Prior optimized (us) | Selective cache (us) | Latency reduction |
+| ---: | ---: | ---: | ---: |
+| 1 | 74.65 | 73.59 | 1.4% |
+| 17 | 407.79 | 384.22 | 5.8% |
+| 96 | 431.31 | 407.12 | 5.6% |
+| 512 | 706.64 | 712.17 | -0.8% |
+
+The 512-row case uses two tiles per expert. A fresh paired confirmation on
+device 0 measured 708.98 to 709.75 us, a 0.1% increase within the observed
+variation. The multi-tile case is approximately flat; the gain is concentrated
+in experts whose weights are consumed by one row tile per invocation.
+
 These component measurements do not establish serving throughput gains.
 
 ### Vocabulary operators
