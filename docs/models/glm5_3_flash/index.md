@@ -304,32 +304,34 @@ waits; standalone speedups do not establish a serving improvement.
 
 The narrow `mhc_linear` projection partitions each token's 16,384-element
 reduction into eight independent 2,048-element segments per eight output
-channels. Each task reduces 1,024-element K tiles, retaining high and low FP32
-parts in scratch. A compensated merge combines the segments before the final
-FP32 rounding. The projection launch is capped at the existing model worker
-limit, with excess segments assigned by a strided loop.
+channels. Each task reduces 1,024-element K tiles and accumulates the segment
+sum in FP32. A second scope sums the eight segment partials. The projection
+launch is capped at the existing model worker limit, with excess segments
+assigned by a strided loop.
 
 `mhc_rms` uses the same eight-way K partition for each eight-token tile and
-merges both reduction parts before normalization. The stream operators
+sums the segment partials before normalization. The stream operators
 `mhc_pre`, `mhc_post`, and `mhc_head` use 1,024-element hidden tiles. Their
 BF16 rounding boundaries and the Sinkhorn coefficient computation are unchanged.
 
 The split reductions were measured against the already vectorized implementation
 at commit `838079c` (whose mHC implementation matches main `2230490`). On a2a3
-device 1, PyPTO `ff2e0a4`, and PTOAS 0.72, the complete `mhc_mixes` component
-has these device-effective medians with 100 timed rounds after five warmups:
+with PyPTO `ff2e0a4` and PTOAS 0.72, the complete `mhc_mixes` component has
+these device-effective medians with 100 timed rounds after five warmups:
 
 | Token rows | Before (microseconds) | After (microseconds) | Speedup |
 |---|---:|---:|---:|
-| 16 | 764.3 | 391.0 | 1.95x |
-| 128 | 3195.3 | 2360.4 | 1.35x |
-| 32 | 1072.8 | 648.3 | 1.65x |
-| 192 | 4576.7 | 3469.2 | 1.32x |
+| 16 | 764.0 | 208.4 | 3.67x |
+| 128 | 3193.0 | 1084.4 | 2.94x |
+| 32 | 1072.9 | 312.9 | 3.43x |
+| 192 | 4575.8 | 1569.3 | 2.92x |
 
-These cases replay identical frozen inputs and pass bitwise comparison against
-the CPU golden. The 16/128-row cases reproduce the captured TP8/EP8 serving
-shapes; 32/192 also cover the newer forward capacities. These component results
-do not establish a whole-model throughput gain.
+These cases replay identical frozen inputs against the CPU golden. The worst
+observed deviation is 4.8e-7 absolute and 1.1e-6 relative on `post_mix`, and no
+point of any shape falls outside the unchanged component comparator
+(`atol=1e-5, rtol=1e-3`). The 16/128-row cases reproduce the captured TP8/EP8
+serving shapes; 32/192 also cover the newer forward capacities. These component
+results do not establish a whole-model throughput gain.
 
 The earlier vectorization, measured against the scalar-K implementation, reduced
 the complete `mhc_mixes` component from 40.833 -> 0.759 ms for 16 rows and 44.620 -> 3.174 ms for 128 rows. These are

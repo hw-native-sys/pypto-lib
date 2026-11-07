@@ -21,7 +21,7 @@ import torch
 
 from models.glm5_3_flash.config import FLASH, HC_DIM, HC_MULT, MIX_HC, D, Glm53FlashConfig
 from models.glm5_3_flash.elementwise import (
-    _sum_fp32_reference, accurate_divide, accurate_exp, accurate_row_sum, accurate_row_sum_parts,
+    _sum_fp32_reference, accurate_divide, accurate_exp, accurate_row_sum,
     accurate_rsqrt, accurate_sigmoid,
 )
 from models.glm5_3_flash.kda import PROJECTION_WORKERS_TILE
@@ -87,61 +87,36 @@ def mhc_mixes(
 
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     rms_part_rows = ((t_dim + RMS_T_TILE - 1) // RMS_T_TILE) * (HC_DIM // RMS_PART_TILE)
-    rms_high = pl.create_tensor([rms_part_rows, RMS_T_TILE], dtype=pl.FP32)
-    rms_low = pl.create_tensor([rms_part_rows, RMS_T_TILE], dtype=pl.FP32)
+    rms_partial = pl.create_tensor([rms_part_rows, RMS_T_TILE], dtype=pl.FP32)
     for block in pl.spmd(rms_part_rows, name_hint="mhc_rms"):
         group = block // (HC_DIM // RMS_PART_TILE)
         split = block % (HC_DIM // RMS_PART_TILE)
         t0 = group * RMS_T_TILE
         valid_rows = pl.min(RMS_T_TILE, t_dim - t0)
         sq_sum = pl.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
-        sq_error = pl.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(RMS_PART_TILE // RMS_K_TILE, stage=2):
             k0 = split * RMS_PART_TILE + kb * RMS_K_TILE
             rms_x_tile = pl.slice(x_flat, [RMS_T_TILE, RMS_K_TILE], [t0, k0], valid_shape=[valid_rows, RMS_K_TILE])
             rms_value = pl.cast(rms_x_tile, pl.FP32)
             rms_square = pl.create_tensor([RMS_T_TILE, RMS_K_TILE], dtype=pl.FP32)
             rms_square[:, :] = pl.mul(rms_value, rms_value)
-            part_high, part_low = accurate_row_sum_parts(rms_square, RMS_K_TILE)
-            sq_part = pl.reshape(part_high, [1, RMS_T_TILE])
-            part_error = pl.reshape(part_low, [1, RMS_T_TILE])
-            sq_updated = pl.add(sq_sum, sq_part)
-            recovered = pl.sub(sq_updated, sq_sum)
-            right_remainder = pl.sub(sq_updated, recovered)
-            left_error = pl.sub(sq_sum, right_remainder)
-            right_error = pl.sub(sq_part, recovered)
-            error = pl.add(left_error, right_error)
-            error = pl.add(error, part_error)
-            sq_error = pl.add(sq_error, error)
-            sq_sum = sq_updated
-        rms_high[block:block + 1, :] = sq_sum
-        rms_low[block:block + 1, :] = sq_error
+            sq_part = pl.reshape(pl.row_sum(rms_square), [1, RMS_T_TILE])
+            sq_sum = pl.add(sq_sum, sq_part)
+        rms_partial[block:block + 1, :] = sq_sum
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     for group in pl.spmd((t_dim + RMS_T_TILE - 1) // RMS_T_TILE, name_hint="mhc_rms_reduce"):
         t0 = group * RMS_T_TILE
         sq_sum = pl.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
-        sq_error = pl.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
         for split in pl.range(HC_DIM // RMS_PART_TILE):
             row = group * (HC_DIM // RMS_PART_TILE) + split
-            partial = rms_high[row:row + 1, :]
-            tail = rms_low[row:row + 1, :]
-            updated = pl.add(sq_sum, partial)
-            recovered = pl.sub(updated, sq_sum)
-            right_remainder = pl.sub(updated, recovered)
-            left_error = pl.sub(sq_sum, right_remainder)
-            right_error = pl.sub(partial, recovered)
-            error = pl.add(left_error, right_error)
-            error = pl.add(error, tail)
-            sq_error = pl.add(sq_error, error)
-            sq_sum = updated
+            sq_sum = pl.add(sq_sum, rms_partial[row:row + 1, :])
         rms_arg = pl.create_tensor([1, RMS_T_TILE], dtype=pl.FP32)
-        rms_arg[:, :] = pl.add(pl.mul(pl.add(sq_sum, sq_error), HC_DIM_INV), NORM_EPS)
+        rms_arg[:, :] = pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)
         inverse = accurate_rsqrt(rms_arg)
         inv_rms[t0 : t0 + RMS_T_TILE, 0:1] = pl.reshape(inverse, [RMS_T_TILE, 1])
 
     linear_part_rows = t_dim * (HC_DIM // LINEAR_PART_TILE)
-    linear_high = pl.create_tensor([linear_part_rows, MIX_PAD], dtype=pl.FP32)
-    linear_low = pl.create_tensor([linear_part_rows, MIX_PAD], dtype=pl.FP32)
+    linear_partial = pl.create_tensor([linear_part_rows, MIX_PAD], dtype=pl.FP32)
     linear_tasks = t_dim * (HC_DIM // LINEAR_PART_TILE) * (MIX_HC // LINEAR_N_TILE)
     for worker in pl.spmd(pl.min(linear_tasks, PROJECTION_WORKERS_TILE), name_hint="mhc_linear"):
         for block in pl.range(worker, linear_tasks, PROJECTION_WORKERS_TILE):
@@ -149,48 +124,25 @@ def mhc_mixes(
             split = block // (MIX_HC // LINEAR_N_TILE) % (HC_DIM // LINEAR_PART_TILE)
             column = block % (MIX_HC // LINEAR_N_TILE) * LINEAR_N_TILE
             total = pl.full([1, LINEAR_N_TILE], dtype=pl.FP32, value=0.0)
-            correction = pl.full([1, LINEAR_N_TILE], dtype=pl.FP32, value=0.0)
             for offset in pl.pipeline(0, LINEAR_PART_TILE, LINEAR_K_TILE, stage=2):
                 k0 = split * LINEAR_PART_TILE + offset
                 source = pl.cast(x_flat[token:token + 1, k0:k0 + LINEAR_K_TILE], pl.FP32)
                 weights = pl.cast(function[column:column + LINEAR_N_TILE, k0:k0 + LINEAR_K_TILE], pl.FP32)
                 products = pl.create_tensor([LINEAR_N_TILE, LINEAR_K_TILE], dtype=pl.FP32)
                 products[:, :] = pl.col_expand_mul(weights, source)
-                high, low = accurate_row_sum_parts(products, LINEAR_K_TILE)
-                partial = pl.reshape(high, [1, LINEAR_N_TILE])
-                tail = pl.reshape(low, [1, LINEAR_N_TILE])
-                updated = pl.add(total, partial)
-                recovered = pl.sub(updated, total)
-                right_remainder = pl.sub(updated, recovered)
-                left_error = pl.sub(total, right_remainder)
-                right_error = pl.sub(partial, recovered)
-                error = pl.add(left_error, right_error)
-                error = pl.add(error, tail)
-                correction = pl.add(correction, error)
-                total = updated
+                partial = pl.reshape(pl.row_sum(products), [1, LINEAR_N_TILE])
+                total = pl.add(total, partial)
             row = token * (HC_DIM // LINEAR_PART_TILE) + split
-            linear_high[row:row + 1, column:column + LINEAR_N_TILE] = total
-            linear_low[row:row + 1, column:column + LINEAR_N_TILE] = correction
+            linear_partial[row:row + 1, column:column + LINEAR_N_TILE] = total
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
     for block in pl.spmd(t_dim * (MIX_HC // LINEAR_N_TILE), name_hint="mhc_linear_reduce"):
         token = block // (MIX_HC // LINEAR_N_TILE)
         column = block % (MIX_HC // LINEAR_N_TILE) * LINEAR_N_TILE
         total = pl.full([1, LINEAR_N_TILE], dtype=pl.FP32, value=0.0)
-        correction = pl.full([1, LINEAR_N_TILE], dtype=pl.FP32, value=0.0)
         for split in pl.range(HC_DIM // LINEAR_PART_TILE):
             row = token * (HC_DIM // LINEAR_PART_TILE) + split
-            partial = linear_high[row:row + 1, column:column + LINEAR_N_TILE]
-            tail = linear_low[row:row + 1, column:column + LINEAR_N_TILE]
-            updated = pl.add(total, partial)
-            recovered = pl.sub(updated, total)
-            right_remainder = pl.sub(updated, recovered)
-            left_error = pl.sub(total, right_remainder)
-            right_error = pl.sub(partial, recovered)
-            error = pl.add(left_error, right_error)
-            error = pl.add(error, tail)
-            correction = pl.add(correction, error)
-            total = updated
-        mixes_raw[token:token + 1, column:column + LINEAR_N_TILE] = pl.add(total, correction)
+            total = pl.add(total, linear_partial[row:row + 1, column:column + LINEAR_N_TILE])
+        mixes_raw[token:token + 1, column:column + LINEAR_N_TILE] = total
 
     residual_flat = pl.reshape(residual_mix, [t_dim * HC_MULT, HC_MULT])
     for t in pl.spmd(t_dim, name_hint="mhc_coefficients"):
