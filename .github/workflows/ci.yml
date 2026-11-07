@@ -213,7 +213,7 @@ jobs:
         platform: ${{ fromJSON(needs.detect-changes.outputs.device_matrix) }}
     runs-on: ${{ fromJSON(matrix.platform == 'a5' && '["self-hosted", "linux", "npu-a5"]' || '["self-hosted", "linux", "npu", "a3"]') }}
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
-    # --max-time up to 1800 run), or the job dies before task-submit's own timeout can
+    # --max-time 900 run), or the job dies before task-submit's own timeout can
     # ever fire — and the first queued case would eat the whole job budget.
     timeout-minutes: 120
     defaults:
@@ -221,9 +221,6 @@ jobs:
         working-directory: checkout
     env:
       PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
-      # An A2/A3 job only needs its own onboard runtime; its CANN SDK may not
-      # provide the A5 HCCL channel APIs required to build the A5 runtime.
-      SIMPLER_BUILD_TARGET: ${{ matrix.platform == 'a2a3' && 'build_package_a2a3' || '' }}
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -258,48 +255,11 @@ jobs:
           toolchain: bundle
           torch-version: 'torch==2.10.0'
 
-      - name: Run ${{ matrix.platform }} tests (via task-submit)
-        shell: bash
-        env:
-          CI_PLATFORM: ${{ matrix.platform }}
-          CI_ENTRIES: ${{ needs.detect-changes.outputs[format('{0}_files', matrix.platform)] }}
-        run: |
-          source activate.sh
-          failed=()
-          for f in $CI_ENTRIES; do
-            echo "::group::$f"
-            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
-            ndev=${ndev:-1}
-            device_flags=()
-            if [ "$ndev" -gt 1 ]; then
-              device_flags+=(--device-num "$ndev" --ignore-whitelist)
-            fi
-            max_time=600
-            extra_args=""
-            if [ "$f" = "models/deepseek_v4_flash_lowlat/decode_fwd.py" ]; then
-              max_time=1800
-              extra_args="--test-layers 5"
-            elif [ "$f" = "models/deepseek_v4_flash_lowlat/decode_sparse_attn_swa.py" ]; then
-              extra_args="--unmapped-window-fixture"
-            elif [ "$f" = "models/deepseek_v4_flash_lowlat/decode_compressor_ratio128.py" ]; then
-              extra_args="--boundary-missing-slot-fixture"
-            fi
-            if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time "$max_time" \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $CI_PLATFORM -d \$TASK_DEVICE $extra_args"; then
-              status=pass
-            else
-              status=fail
-              failed+=("$f")
-              echo "::error file=${f}::FAIL"
-            fi
-            echo "[device][$CI_PLATFORM] $f: $status"
-            echo "::endgroup::"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            printf 'FAILED: %s\n' "${failed[@]}"
-            exit 1
-          fi
-          echo "All selected files passed."
+      - name: Run device tests
+        uses: ./.github/actions/run-device-tests
+        with:
+          platform: ${{ matrix.platform }}
+          files: ${{ needs.detect-changes.outputs[format('{0}_files', matrix.platform)] }}
 
       - name: Upload failure diagnostics
         if: failure()
