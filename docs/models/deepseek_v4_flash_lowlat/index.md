@@ -1,7 +1,8 @@
 # DeepSeek V4-Flash low-latency decode
 
-This model directory provides the batch-one decode path with eight logical
-ranks. The default verification width is eight tokens. It is an experimental
+This model directory provides the batch-one decode path with two physical TP
+ranks by default. The verification width remains eight tokens, and the eight
+attention projection groups are assigned four per rank. It is an experimental
 decode implementation, not a `pypto-serving` deployment contract.
 
 ## Precision contract
@@ -107,10 +108,11 @@ default and can be varied with `--seed`.
 
 ## Reproducible reduction order
 
-The output projection publishes each rank's FP32 contribution into a separate
-slot. Each of the two alternating lanes contains `N_RANKS * T_PAD` rows.
-After the existing all-peer completion barrier, the consumer adds ranks
-`0..N_RANKS-1` to a positive-zero accumulator and rounds to BF16 once.
+The output projection publishes each logical group's FP32 contribution into a
+separate slot. Each of the two alternating lanes contains `O_GROUPS * T_PAD`
+rows. A physical rank announces completion after publishing every local group.
+After the all-peer completion barrier, the consumer adds groups `0..O_GROUPS-1`
+to a positive-zero accumulator and rounds to BF16 once.
 Every producer overwrites its valid rows before publication; allocator contents
 and arrival order do not contribute to the sum. Alternating lanes retain the
 previous call's inputs until all peers have advanced beyond their consumers.
@@ -186,22 +188,38 @@ indices.
 
 ## CI targets and validation scope
 
-This model currently uses A2/A3 device CI. Its runnable entries are marked
-`# ci: no-sim`, which both pull-request and daily selectors honor. Simulator
-qualification is deferred; this does not assert simulator incompatibility.
-Other model families and their simulator coverage are unchanged.
+This model uses A2/A3 device CI with at most two devices per entry. Sixteen
+standalone entries use one device; nine distributed entries use TP2 by default
+and declare `# ci: devices=2`. Only the multi-layer `decode_fwd.py` and
+`decode_layer.py` entries retain `# ci: no-sim`. The other twenty-three entries
+run with `-p a2a3 --sim`, including their original golden and state comparisons.
+Both pull-request and daily selectors honor these markers.
 
-The composed `decode_swa.py` and `decode_hca.py` entries require eight logical
-TP ranks and declare `# ci: devices=8`, as does CSA. Their standalone
+The composed `decode_swa.py`, `decode_hca.py`, and `decode_csa.py` entries use
+two physical TP ranks by default and declare `# ci: devices=2`. Each rank
+processes its consecutive head groups. CSA assigns four logical tokens per
+rank and exchanges their query and output rows before projection. Their standalone
 `decode_sparse_attn_swa.py` and `decode_sparse_attn_hca.py` entries use one
 device and retain their original numerical references.
 
-`decode_fwd.py` validates all 43 layers against an independent Torch
-composition by default. It includes embedding, request-derived metadata,
+Projection weights are resident group-major banks: `wo_a_shard` has shape
+`[N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN]` and `wo_b_shard` has shape
+`[N_RANKS, GROUPS_PER_RANK, D, O_LORA]`. Each per-group matrix is contiguous.
+Regenerate saved projection, layer and forward fixtures after this layout
+change, including fixtures that retain an explicit TP8 configuration.
+The native TP8 request profiles retain their existing flat projection-weight
+inputs. Their attention call sites create singleton group views without
+copying or changing the public request parameter shapes.
+
+`decode_fwd.py` executes all 43 layers without computing or comparing a golden
+by default. Device CI selects five layers with `--test-layers 5`, retaining
+the same execution-only mode and covering SWA, CSA and HCA. Use `--full` to opt into the independent Torch
+comparison or a complete saved reference. It includes embedding, request-derived metadata,
 2 SWA / 21 CSA / 20 HCA attention layers, 43 TP MoE layers, HC head,
 final RMSNorm, vocabulary-sharded logits and sampling. All eight mutable
 cache/state pools and the four public outputs are compared by the existing
-harness. Source compilation and component CI do not qualify this full path.
+harness in `--full` mode. A default smoke PASS confirms execution only;
+source compilation and component CI do not qualify this full numerical path.
 
 The Torch composition reuses the child operator references. Expert gate/up/down
 products accumulate INT8 operands as INT32 before applying original FP32
@@ -219,18 +237,19 @@ reduction. Standalone grouped projections retain their own arithmetic.
 These choices do not establish bitwise equivalence with device instructions;
 the existing numerical comparisons remain required.
 
-- Default execution and `--full` run the same complete-forward comparison.
-  The generated bounded fixture starts at position 121 and uses one shared
-  MoE bank unless `--moe-banks` is supplied. This is synthetic correctness
-  coverage, not qualification of a real checkpoint or community equivalence.
+- Default execution and `--smoke` execute all 43 layers without a numerical
+  comparison. They permit generated inputs or input-only replay and report
+  no correctness verdict. Saved expected outputs require explicit `--full`.
+- `--full` runs the complete-forward comparison. The generated bounded fixture
+  starts at position 121 and uses one shared MoE bank unless `--moe-banks` is
+  supplied. This is synthetic correctness coverage, not qualification of a
+  real checkpoint or community equivalence.
 - A real checkpoint comparison requires the actual weights and original FP32
   scales for all 43 layers (`--moe-banks 43`), matching inputs/state and the
   precision contract above. Shared random banks cannot stand in for them.
-- `--input-data` replays complete `in/` and `out/` tensors, which take precedence
-  over the locally computed Torch reference. Partial numerical snapshots fail.
-- `--smoke` explicitly executes all 43 layers without numerical comparison.
-  It permits generated inputs or input-only replay and reports no correctness
-  verdict. It cannot be combined with saved expected outputs.
+- `--full --input-data` replays complete `in/` and `out/` tensors, which take
+  precedence over the locally computed Torch reference. Partial numerical
+  snapshots fail. Without `--full`, replay accepts input-only snapshots.
 - `--compile-only` performs code generation and ABI checks without computing
   a Torch golden or executing the model.
 
@@ -248,21 +267,30 @@ matching INT8 checkpoint names or tensor dtype labels is insufficient.
 Existing operator/layer validators retain their own scope. No complete-model
 numerical PASS is implied by providing this reference or by host-only checks.
 
-Use `--seed` for reproducible generated inputs and `--save-data` to save both
-inputs and expected outputs. For example:
+Use `--seed` for reproducible generated inputs and `--save-data` to save inputs
+for replay. In `--full` mode, it also saves expected outputs. For example:
 
 ```bash
 # Complete 43-layer numerical fixture; 16384 is a supported Indexer context.
-python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --full
 # Generate the complete program without computing a Torch reference.
 python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --compile-only
-# Explicit execution-only smoke, without a correctness verdict.
-python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --smoke
+# Default execution-only smoke, without a correctness verdict.
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384
 # Replay a complete snapshot with matching checkpoint and execution layout.
-python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --moe-banks 43 --input-data <reference>/data
+python models/deepseek_v4_flash_lowlat/decode_fwd.py -p a2a3 --max-seq-len 16384 --moe-banks 43 --full --input-data <reference>/data
 ```
 
 ## Validation
+
+The persistent expert retains the guarded native TP8 single-tile schedule
+when the complete intermediate shard fits in one tile. Wider shards use the
+runtime's available cluster count and synchronized start. Gate/up projections
+and SwiGLU use bounded column tiles; activation quantization reduces the
+maximum across the entire local intermediate shard before quantizing any
+tile. TP2 uses all 1024 intermediate columns, retaining the main branch's
+per-element arithmetic and comparison thresholds. The default standalone
+entry validates this TP2 split on the A2/A3 simulator.
 
 HC pre and HC post use a dynamic token axis and bound their final tiles to the
 remaining rows. Their default entries check the configured width plus 1, 6, 9,
@@ -286,7 +314,7 @@ python models/deepseek_v4_flash_lowlat/hc_head.py --help
 python models/deepseek_v4_flash_lowlat/o_proj_tp.py --help
 ```
 
-`o_proj_tp.py` uses the full eight-rank communication contract. Its default
+`o_proj_tp.py` assigns all eight logical groups to the physical TP ranks. Its default
 correctness entry runs two distinct inputs at epochs 1 and 2 in one dispatch,
 checks both outputs against the original reference, and clears signals only
 after the second epoch. `--single-epoch` retains the original one-epoch entry

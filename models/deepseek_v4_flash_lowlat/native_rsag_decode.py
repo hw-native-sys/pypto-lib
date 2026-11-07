@@ -414,7 +414,12 @@ def decode_fwd(
     wo_a_shard_l0: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
         wo_a_shard, [1, O_LORA, O_GROUP_IN], [0, 0, 0]
     )
-    wo_b_shard_l0: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(wo_b_shard, [D, O_LORA], [0 * D, 0])
+    wo_b_shard_l0_flat: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(
+        wo_b_shard, [D, O_LORA], [0 * D, 0]
+    )
+    wo_b_shard_l0: pl.Tensor[[1, D, O_LORA], pl.INT8] = pl.reshape(
+        wo_b_shard_l0_flat, [1, D, O_LORA]
+    )
     wo_b_l0: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [0 * D, 0])
     wo_b_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [0 * D])
     hc_ffn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -468,7 +473,12 @@ def decode_fwd(
     wo_a_shard_l1: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
         wo_a_shard, [1, O_LORA, O_GROUP_IN], [1, 0, 0]
     )
-    wo_b_shard_l1: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(wo_b_shard, [D, O_LORA], [1 * D, 0])
+    wo_b_shard_l1_flat: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(
+        wo_b_shard, [D, O_LORA], [1 * D, 0]
+    )
+    wo_b_shard_l1: pl.Tensor[[1, D, O_LORA], pl.INT8] = pl.reshape(
+        wo_b_shard_l1_flat, [1, D, O_LORA]
+    )
     wo_b_l1: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [1 * D, 0])
     wo_b_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [1 * D])
     hc_ffn_fn_l1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(
@@ -682,8 +692,11 @@ def decode_fwd(
         wo_a_shard_csa: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
             wo_a_shard, [1, O_LORA, O_GROUP_IN], [csa_layer, 0, 0]
         )
-        wo_b_shard_csa: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(
+        wo_b_shard_csa_flat: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(
             wo_b_shard, [D, O_LORA], [csa_layer * D, 0]
+        )
+        wo_b_shard_csa: pl.Tensor[[1, D, O_LORA], pl.INT8] = pl.reshape(
+            wo_b_shard_csa_flat, [1, D, O_LORA]
         )
         csa_cmp_wkv_csa: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(
             csa_cmp_wkv, [CSA_MAIN_OUT_DIM, D], [loop_i * CSA_MAIN_OUT_DIM, 0]
@@ -919,8 +932,11 @@ def decode_fwd(
         wo_a_shard_hca: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
             wo_a_shard, [1, O_LORA, O_GROUP_IN], [hca_layer, 0, 0]
         )
-        wo_b_shard_hca: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(
+        wo_b_shard_hca_flat: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(
             wo_b_shard, [D, O_LORA], [hca_layer * D, 0]
+        )
+        wo_b_shard_hca: pl.Tensor[[1, D, O_LORA], pl.INT8] = pl.reshape(
+            wo_b_shard_hca_flat, [1, D, O_LORA]
         )
         wo_b_hca: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(
             wo_b, [D, O_GROUPS * O_LORA], [hca_layer * D, 0]
@@ -1108,8 +1124,11 @@ def decode_fwd(
     wo_a_shard_last: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(
         wo_a_shard, [1, O_LORA, O_GROUP_IN], [csa_layer_last, 0, 0]
     )
-    wo_b_shard_last: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(
+    wo_b_shard_last_flat: pl.Tensor[[D, O_LORA], pl.INT8] = pl.slice(
         wo_b_shard, [D, O_LORA], [csa_layer_last * D, 0]
+    )
+    wo_b_shard_last: pl.Tensor[[1, D, O_LORA], pl.INT8] = pl.reshape(
+        wo_b_shard_last_flat, [1, D, O_LORA]
     )
     last_oproj_epoch: pl.Scalar[pl.INT32] = pl.cast(2 * HCA_NUM_LAYERS + 3, pl.INT32)
     csa_cmp_wkv_last: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(

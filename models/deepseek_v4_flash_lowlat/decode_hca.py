@@ -6,8 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=8  # Eight logical TP ranks for the sharded output projection.
-# ci: no-sim  # A2/A3 device validation; simulator CI is deferred for this model.
+# ci: devices=2
 """DeepSeek-V4 HCA (Hierarchical Compressed Attention) decode orchestration — `compress_ratio == 128` path.
 Active in layers 3/5 of the model (2 of the 8 layers in demo). Has the main compressor (ratio=128,
 overlap=False) but NO indexer; the compressed-portion topk for sparse_attn comes from a deterministic
@@ -86,6 +85,11 @@ else:
 
 # model config
 
+if __package__:
+    from .o_proj_tp import GROUPS_PER_RANK
+else:
+    from o_proj_tp import GROUPS_PER_RANK
+
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
@@ -144,12 +148,12 @@ HCA_LENGTH_TOKEN_TILE = 8
 HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
 
 
-# This card owns group `my_rank` of the output projection, so the weights it
-# warms and multiplies are one group's slice, not the whole bank. Names mirror
+# Each rank warms and multiplies its consecutive output-projection groups.
+# The local bank holds every owned group contiguously. Names mirror
 # decode_csa.py; a pl.jit tensor annotation cannot carry a dotted name, so the
 # OTP.* values are aliased here.
-WO_A_FLAT = O_LORA * O_GROUP_IN
-WO_B_FLAT = D * O_LORA
+WO_A_FLAT = GROUPS_PER_RANK * O_LORA * O_GROUP_IN
+WO_B_FLAT = D * GROUPS_PER_RANK * O_LORA
 OPROJ_N_RANKS = OTP.N_RANKS
 OPROJ_REDUCE_ROWS = OTP.REDUCE_WINDOW_ROWS
 OPROJ_FIRST_EPOCH = OTP.FIRST_EPOCH
@@ -237,9 +241,9 @@ def attention_hca(
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    # o_proj, sharded one group per card
-    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
+    # Per-rank output-projection group bank
+    wo_a_shard: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
@@ -281,26 +285,14 @@ def attention_hca(
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)  # unused on HCA path
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    qkv_proj_rope(
-        x_normed,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        rope_cos_t,
-        rope_sin_t,
-        gamma_cq,
-        gamma_ckv,
-        q,
-        kv,
-        qr,
-        qr_scale,
-        rms_tid,
-        pl.cast(my_rank, pl.INT32) * (H // O_GROUPS),
-        q_rope_cos_il,
-        q_rope_sin_signed,
-        q_rope_swap_idx,
-    )
+    for local_group in pl.range(GROUPS_PER_RANK):
+        group_id = pl.cast(my_rank, pl.INDEX) * GROUPS_PER_RANK + local_group
+        qkv_proj_rope(
+            x_normed, wq_a, wq_b, wq_b_scale, wkv,
+            rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+            q, kv, qr, qr_scale, rms_tid,
+            pl.cast(group_id, pl.INT32) * (H // O_GROUPS), q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
+        )
 
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
@@ -345,23 +337,16 @@ def attention_hca(
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-    merge_tid = sparse_attn_hca_packed(
-        q,
-        kv_cache,
-        window_swa_indices,
-        window_swa_lens,
-        cmp_kv,
-        cmp_block_table,
-        cmp_seq_lens,
-        attn_sink,
-        rope_cos_t,
-        rope_sin_t,
-        o_packed,
-        my_rank,
-        out_rope_cos_il,
-        out_rope_sin_signed,
-        out_rope_swap_idx,
-    )
+    group_merge = pl.array.create(GROUPS_PER_RANK, pl.TASK_ID)
+    for local_group in pl.range(GROUPS_PER_RANK):
+        group_id = pl.cast(my_rank, pl.INDEX) * GROUPS_PER_RANK + local_group
+        group_merge_tid = sparse_attn_hca_packed(
+            q, kv_cache, window_swa_indices, window_swa_lens,
+            cmp_kv, cmp_block_table, cmp_seq_lens,
+            attn_sink, rope_cos_t, rope_sin_t, o_packed, pl.cast(group_id, pl.INT32), out_rope_cos_il, out_rope_sin_signed, out_rope_swap_idx,
+        )
+        group_merge[local_group] = group_merge_tid
+    merge_tid = pl.system.task_dummy(deps=[group_merge])
     o_proj_tp_core(
         o_packed,
         merge_tid,
@@ -435,8 +420,8 @@ def attention_hca_test(
     position_ids: pl.Tensor[[T], pl.INT32],
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    wo_a_shard: pl.Tensor[[1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     reduce_window: pld.DistributedTensor[[OPROJ_REDUCE_ROWS, D], pl.FP32],
@@ -563,8 +548,8 @@ def l3_attention_hca(
     position_ids: pl.Tensor[[OPROJ_N_RANKS, T], pl.INT32],
     kv_seq_lens: pl.Tensor[[OPROJ_N_RANKS, B], pl.INT32],
     attn_sink: pl.Tensor[[OPROJ_N_RANKS, H], pl.FP32],
-    wo_a_shard: pl.Tensor[[OPROJ_N_RANKS, 1, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b_shard: pl.Tensor[[OPROJ_N_RANKS, D, O_LORA], pl.INT8],
+    wo_a_shard: pl.Tensor[[OPROJ_N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b_shard: pl.Tensor[[OPROJ_N_RANKS, GROUPS_PER_RANK, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[OPROJ_N_RANKS, D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[OPROJ_N_RANKS, T, HC_MULT, D], pl.FP32]],
 ):
@@ -1090,18 +1075,18 @@ def build_l3_tensor_specs(start_pos=None):
     out = []
     for spec in base:
         if spec.name == "wo_a":
-            # Card r carries group r's proj_a rows only.
+            # Each rank carries its consecutive proj_a group rows.
             out.append(TensorSpec(
-                "wo_a_shard", [OPROJ_N_RANKS, 1, O_LORA, O_GROUP_IN], torch.bfloat16,
+                "wo_a_shard", [OPROJ_N_RANKS, GROUPS_PER_RANK, O_LORA, O_GROUP_IN], torch.bfloat16,
                 init_value=lambda: torch.stack(
-                    [wo_a[r:r + 1] for r in range(OPROJ_N_RANKS)], dim=0),
+                    [wo_a[r * GROUPS_PER_RANK:(r + 1) * GROUPS_PER_RANK] for r in range(OPROJ_N_RANKS)], dim=0),
                 resident="stacked"))
         elif spec.name == "wo_b":
-            # ... and proj_b's matching O_LORA column band.
+            # Each proj_b group is contiguous in the rank-local bank.
             out.append(TensorSpec(
-                "wo_b_shard", [OPROJ_N_RANKS, D, O_LORA], torch.int8,
+                "wo_b_shard", [OPROJ_N_RANKS, GROUPS_PER_RANK, D, O_LORA], torch.int8,
                 init_value=lambda: torch.stack(
-                    [wo_b[:, r * O_LORA:(r + 1) * O_LORA] for r in range(OPROJ_N_RANKS)], dim=0),
+                    [wo_b.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2)[r * GROUPS_PER_RANK:(r + 1) * GROUPS_PER_RANK] for r in range(OPROJ_N_RANKS)], dim=0),
                 resident="stacked"))
         else:
             out.append(ranked(spec))
@@ -1110,10 +1095,8 @@ def build_l3_tensor_specs(start_pos=None):
 
 def golden_attention_hca_l3(tensors):
     """Per-rank golden: rebuild the full weights from the shards, then reuse the layer's."""
-    import torch
 
-    wo_a = torch.cat([tensors["wo_a_shard"][r] for r in range(OPROJ_N_RANKS)], dim=0)
-    wo_b = torch.cat([tensors["wo_b_shard"][r] for r in range(OPROJ_N_RANKS)], dim=1)
+    wo_a, wo_b = OTP.projection_weights(tensors)
     for r in range(OPROJ_N_RANKS):
         per_rank = {k: (v[r] if k not in ("wo_a_shard", "wo_b_shard") else v)
                     for k, v in tensors.items()}
@@ -1144,6 +1127,7 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("--compile-only", action="store_true", default=False)
     if __package__:
         from .config import CONTEXT_CAPACITY
@@ -1151,6 +1135,7 @@ if __name__ == "__main__":
         from config import CONTEXT_CAPACITY
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
+    parser.add_argument("--tp", type=int, default=OPROJ_N_RANKS, choices=[1, 2, 4, 8])
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
@@ -1175,7 +1160,7 @@ if __name__ == "__main__":
                 dump_passes=args.dump_passes,
                 distributed_config=DistributedConfig(device_ids=device_ids[:OPROJ_N_RANKS], num_sub_workers=0),
                 backend_type=args.platform.removesuffix("sim"),
-                execution_mode=args.platform.endswith("sim"),
+                execution_mode=args.sim or args.platform.endswith("sim"),
                 enable_chip_swimlane=args.enable_chip_swimlane,
             ),
             atol=1e-2,
