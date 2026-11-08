@@ -119,61 +119,63 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
-    int t0 = get_block_idx(args) * 8, rows = args[4] - t0;
-    rows = rows > 8 ? 8 : rows;
-    // Two 80-KiB input slots and two 10-KiB output slots precede gamma and premix.
-    Vec<bfloat16_t, 1, 5120> weight;
-    Premix mix(rows * 4);
-    TASSIGN(weight, 184320);
-    TASSIGN(mix, 194560);
-    GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, 1, 5120>, BaseShape2D<bfloat16_t, 1, 5120>> gamma(
-        data<bfloat16_t>(args, 2));
-    using MixShape = TileShape2D<float, 1, DYNAMIC>;
-    GlobalTensor<float, MixShape, BaseShape2D<float, 1, 32>> premix(data<float>(args, 1) + t0 * 4, MixShape(1, rows * 4));
-    TLOAD(weight, gamma);
-    TLOAD(mix, premix);
-    using InShape = TileShape2D<float, 1, 20480>;
-    using OutShape = TileShape2D<bfloat16_t, 1, 5120>;
-    Input first(1);
-    TASSIGN(first, 0);
-    GlobalTensor<float, InShape, BaseShape2D<float, 1, 20480>> first_source(data<float>(args, 0) + t0 * 20480);
-    TLOAD(first, first_source);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-    // V-to-MTE2 credits protect input reuse; MTE3-to-V credits protect output reuse.
-    for (int local = 0; local < rows; ++local) {
-        int slot = local % 2;
-        event_t current = slot == 0 ? EVENT_ID0 : EVENT_ID1;
-        event_t next = slot == 0 ? EVENT_ID1 : EVENT_ID0;
-        if (local + 1 < rows) {
-            if (local > 0) wait_flag(PIPE_V, PIPE_MTE2, next);
-            Input pending(1);
-            TASSIGN(pending, (1 - slot) * 81920);
-            GlobalTensor<float, InShape, BaseShape2D<float, 1, 20480>> source(
-                data<float>(args, 0) + (t0 + local + 1) * 20480);
-            TLOAD(pending, source);
-            set_flag(PIPE_MTE2, PIPE_V, next);
+    for (int t0 = get_block_idx(args) * 8; t0 < args[4]; t0 += get_block_num(args) * 8) {
+        int rows = args[4] - t0;
+        rows = rows > 8 ? 8 : rows;
+        // Two 80-KiB input slots and two 10-KiB output slots precede gamma and premix.
+        Vec<bfloat16_t, 1, 5120> weight;
+        Premix mix(rows * 4);
+        TASSIGN(weight, 184320);
+        TASSIGN(mix, 194560);
+        GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, 1, 5120>, BaseShape2D<bfloat16_t, 1, 5120>> gamma(
+            data<bfloat16_t>(args, 2));
+        using MixShape = TileShape2D<float, 1, DYNAMIC>;
+        GlobalTensor<float, MixShape, BaseShape2D<float, 1, 32>> premix(data<float>(args, 1) + t0 * 4, MixShape(1, rows * 4));
+        TLOAD(weight, gamma);
+        TLOAD(mix, premix);
+        using InShape = TileShape2D<float, 1, 20480>;
+        using OutShape = TileShape2D<bfloat16_t, 1, 5120>;
+        Input first(1);
+        TASSIGN(first, 0);
+        GlobalTensor<float, InShape, BaseShape2D<float, 1, 20480>> first_source(data<float>(args, 0) + t0 * 20480);
+        TLOAD(first, first_source);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+        // V-to-MTE2 credits protect input reuse; MTE3-to-V credits protect output reuse.
+        for (int local = 0; local < rows; ++local) {
+            int slot = local % 2;
+            event_t current = slot == 0 ? EVENT_ID0 : EVENT_ID1;
+            event_t next = slot == 0 ? EVENT_ID1 : EVENT_ID0;
+            if (local + 1 < rows) {
+                if (local > 0) wait_flag(PIPE_V, PIPE_MTE2, next);
+                Input pending(1);
+                TASSIGN(pending, (1 - slot) * 81920);
+                GlobalTensor<float, InShape, BaseShape2D<float, 1, 20480>> source(
+                    data<float>(args, 0) + (t0 + local + 1) * 20480);
+                TLOAD(pending, source);
+                set_flag(PIPE_MTE2, PIPE_V, next);
+            }
+            Input input(1);
+            Output output(1);
+            TASSIGN(input, slot * 81920);
+            TASSIGN(output, 163840 + slot * 10240);
+            wait_flag(PIPE_MTE2, PIPE_V, current);
+            wait_flag(PIPE_MTE3, PIPE_V, current);
+            collapse_norm(output.data(), input.data(), weight.data(), mix.data(), 1, local);
+            set_flag(PIPE_V, PIPE_MTE2, current);
+            set_flag(PIPE_V, PIPE_MTE3, current);
+            wait_flag(PIPE_V, PIPE_MTE3, current);
+            GlobalTensor<bfloat16_t, OutShape, BaseShape2D<bfloat16_t, 1, 5120>> target(
+                data<bfloat16_t>(args, 3) + (t0 + local) * 5120);
+            TSTORE(target, output);
+            set_flag(PIPE_MTE3, PIPE_V, current);
         }
-        Input input(1);
-        Output output(1);
-        TASSIGN(input, slot * 81920);
-        TASSIGN(output, 163840 + slot * 10240);
-        wait_flag(PIPE_MTE2, PIPE_V, current);
-        wait_flag(PIPE_MTE3, PIPE_V, current);
-        collapse_norm(output.data(), input.data(), weight.data(), mix.data(), 1, local);
-        set_flag(PIPE_V, PIPE_MTE2, current);
-        set_flag(PIPE_V, PIPE_MTE3, current);
-        wait_flag(PIPE_V, PIPE_MTE3, current);
-        GlobalTensor<bfloat16_t, OutShape, BaseShape2D<bfloat16_t, 1, 5120>> target(
-            data<bfloat16_t>(args, 3) + (t0 + local) * 5120);
-        TSTORE(target, output);
-        set_flag(PIPE_MTE3, PIPE_V, current);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+        if (rows > 1) wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+        pipe_barrier(PIPE_ALL);
     }
-    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-    if (rows > 1) wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
-    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-    pipe_barrier(PIPE_ALL);
 #endif
 }

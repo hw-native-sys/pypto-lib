@@ -141,18 +141,19 @@ def dspark_attention(
 ):
     qr = pl.create_tensor([MOE_TOKENS, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
+    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x, num_tokens)
     q_proj_result = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, q,
-        num_tokens,
+        num_tokens, qa_worker_limit=32, qb_worker_limit=32,
+        padded_rows=proj_payload_padded_rows,
     )
     kv_projection = pl.create_tensor([MOE_TOKENS, HEAD_DIM], dtype=pl.BF16)
     window_input_ready = pl.system.task_dummy(deps=[])
-    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=32)
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache, window_cache_scale,
@@ -164,7 +165,7 @@ def dspark_attention(
     attend_result = attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
     o_proj_result = o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale,
-        rope_cos, rope_sin, output, num_tokens,
+        rope_cos, rope_sin, output, num_tokens, worker_limit=32,
     )
     return output, window_cache, window_cache_scale
 

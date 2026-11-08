@@ -105,20 +105,21 @@ def decode_c2a_full(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    cache_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm)
+    cache_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm, worker_limit=64)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
+    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens)
     qr, query, qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens,
+        num_tokens, qa_worker_limit=32, qb_worker_limit=32,
+        padded_rows=proj_payload_padded_rows,
     )
-    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=32)
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache, window_cache_scale,
@@ -127,7 +128,7 @@ def decode_c2a_full(
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
-    c2a_compressor_project(x_norm, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens)
+    c2a_compressor_project(x_norm, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens, n_tile=64)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     compressed_publish_tid = c2a_compressor_publish(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
@@ -151,10 +152,10 @@ def decode_c2a_full(
         attn_sink, attended, num_tokens, chunk_done, compressed_keys=INDEX_TOPK,
     )
     o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out, num_tokens,
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out, num_tokens, worker_limit=32,
     )
 
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
@@ -362,7 +363,7 @@ def golden_c2a(tensors, mode="full"):
     if "x_hc" in t:
         x_hc = t["x_hc"]
         next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
-            x_hc, t["hc_attn_fn"], t["hc_attn_scale"], t["hc_attn_base"], hf32=True,
+            x_hc, t["hc_attn_fn"], t["hc_attn_scale"], t["hc_attn_base"],
         )
         attention_input = golden_hc_collapse(x_hc, t["pre_mix"]).to(torch.bfloat16)
         x = golden_rms_norm(attention_input, t["attn_norm_weight"])

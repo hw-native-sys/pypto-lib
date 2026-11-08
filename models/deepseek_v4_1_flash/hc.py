@@ -38,9 +38,7 @@ HF32_LINEAR_T_TILE = 80  # Matches M_TILE in kernels/hc_linear.cpp.
 SINKHORN_T_TILE = 6
 SINKHORN_WORKER_TILE = 12
 RMS_K_TILE = 1024
-LINEAR_K_TILE = 256
 LINEAR_OK = 4
-LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 D_TILE = 2560
 PRE_T_TILE = 2
 HEAD_D_TILE = 5120
@@ -90,61 +88,39 @@ def hc_sinkhorn(
 
 
 @pl.jit.inline
-def hc_project(x_hc: pl.Tensor, function: pl.Tensor, hf32: pl.constexpr):
-    """Compute FP32 inverse RMS and split-K coefficients, using HF32 for decode."""
+def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.constexpr):
+    """Compute FP32 inverse RMS and split-K HC projection coefficients."""
     t_dim = pl.tensor.dim(x_hc, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
 
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    for block in pl.spmd((t_dim + T_TILE - 1) // T_TILE, name_hint="mhc_rms"):
-        t0 = block * T_TILE
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for kb in pl.pipeline(HC_DIM // RMS_K_TILE, stage=4):
-            k0 = kb * RMS_K_TILE
-            rms_x_tile = pl.slice(
-                x_flat,
-                [T_TILE, RMS_K_TILE],
-                [t0, k0],
-                valid_shape=[valid_rows, RMS_K_TILE],
+    rms_blocks = (t_dim + T_TILE - 1) // T_TILE
+    rms_workers = pl.max(pl.min(rms_blocks, rms_worker_limit), 1)
+    for worker in pl.spmd(rms_workers, name_hint="mhc_rms"):
+        for block in pl.range(worker, rms_blocks, rms_workers):
+            t0 = block * T_TILE
+            valid_rows = pl.min(T_TILE, t_dim - t0)
+            sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+            for kb in pl.pipeline(HC_DIM // RMS_K_TILE, stage=4):
+                k0 = kb * RMS_K_TILE
+                rms_x_tile = pl.slice(
+                    x_flat,
+                    [T_TILE, RMS_K_TILE],
+                    [t0, k0],
+                    valid_shape=[valid_rows, RMS_K_TILE],
+                )
+                sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_tile, rms_x_tile)), [1, T_TILE]))
+            rms_arg = pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)
+            inv_rms[t0 : t0 + T_TILE, 0:1] = pl.reshape(
+                pl.rsqrt(rms_arg, high_precision=True), [T_TILE, 1]
             )
-            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_tile, rms_x_tile)), [1, T_TILE]))
-        rms_arg = pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)
-        inv_rms[t0 : t0 + T_TILE, 0:1] = pl.reshape(
-            pl.rsqrt(rms_arg, high_precision=True), [T_TILE, 1]
-        )
 
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
-    if hf32:
-        tasks = ((t_dim + HF32_LINEAR_T_TILE - 1) // HF32_LINEAR_T_TILE) * LINEAR_OK
-        workers = pl.min(tasks, pl.system.available_cluster_count())
-        with pl.spmd(workers, name_hint="mhc_linear"):
-            _hc_linear(x_flat, function, mixes_partials, t_dim, t_linear)
-    else:
-        for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="mhc_linear"):
-            t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-            split = task % LINEAR_OK
-            k_base = split * LINEAR_K_PER_SPLIT
-            valid_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
-            acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
-            for kb in pl.pipeline(LINEAR_K_PER_SPLIT // LINEAR_K_TILE, stage=2):
-                k0 = k_base + kb * LINEAR_K_TILE
-                linear_x_tile = pl.slice(
-                    x_flat,
-                    [LINEAR_T_TILE, LINEAR_K_TILE],
-                    [t0, k0],
-                    valid_shape=[valid_rows, LINEAR_K_TILE],
-                )
-                w_tile = pl.slice(
-                    function,
-                    [MIX_PAD, LINEAR_K_TILE],
-                    [0, k0],
-                    valid_shape=[MIX_HC, LINEAR_K_TILE],
-                )
-                acc = pl.matmul_acc(acc, linear_x_tile, w_tile, b_trans=True, init_cond=(kb == 0))
-            partial = split * t_linear + t0
-            mixes_partials[partial : partial + LINEAR_T_TILE, 0:MIX_PAD] = acc
+    tasks = ((t_dim + HF32_LINEAR_T_TILE - 1) // HF32_LINEAR_T_TILE) * LINEAR_OK
+    workers = pl.min(tasks, pl.system.available_cluster_count())
+    with pl.spmd(workers, name_hint="mhc_linear"):
+        _hc_linear(x_flat, function, mixes_partials, t_dim, t_linear)
 
     return inv_rms, mixes_partials
 
@@ -154,12 +130,15 @@ def hc_head(
     x_hc: pl.Tensor,
     pre_mix: pl.Tensor,
     output: pl.Tensor,
+    worker_limit: pl.constexpr,
 ):
     """Collapse HC streams with the delayed pre-mix and BF16 rounding."""
     t_dim = pl.tensor.dim(x_hc, 0)
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
-    for block in pl.spmd((t_dim + PRE_T_TILE - 1) // PRE_T_TILE, name_hint="hc_collapse", allow_early_resolve=True):
-        for t in pl.range(block * PRE_T_TILE, pl.min((block + 1) * PRE_T_TILE, t_dim)):
+    workers = pl.max(pl.min((t_dim + PRE_T_TILE - 1) // PRE_T_TILE, worker_limit), 1)
+    rows_per_worker = (t_dim + workers - 1) // workers
+    for block in pl.spmd(workers, name_hint="hc_collapse", allow_early_resolve=True):
+        for t in pl.range(block * rows_per_worker, pl.min((block + 1) * rows_per_worker, t_dim)):
             pre_tile = pl.load(pre_mix, [t, 0], [1, HC_PAD], valid_shape=[1, HC_MULT])
             pre0 = pl.tile.read(pre_tile, [0, 0])
             pre1 = pl.tile.read(pre_tile, [0, 1])
@@ -201,10 +180,12 @@ def hc_head_norm(
     pre_mix: pl.Tensor,
     norm_weight: pl.Tensor[[D], pl.BF16],
     output: pl.Tensor,
+    worker_limit: pl.constexpr,
 ):
     """Collapse eight HC rows and normalize their rounded BF16 values."""
     tokens = pl.tensor.dim(x_hc, 0)
-    with pl.spmd((tokens + PRE_NORM_T_TILE - 1) // PRE_NORM_T_TILE, name_hint="hc_collapse_norm") as ready:
+    workers = pl.min((tokens + PRE_NORM_T_TILE - 1) // PRE_NORM_T_TILE, worker_limit)
+    with pl.spmd(workers, name_hint="hc_collapse_norm") as ready:
         hc_collapse_norm(x_hc, pre_mix, norm_weight, output, tokens)
     return ready
 
@@ -220,12 +201,13 @@ def hc_pre(
     next_pre_mix: pl.Tensor,
     post_mix: pl.Tensor,
     residual_mix: pl.Tensor,
-    hf32: pl.constexpr,
+    rms_worker_limit: pl.constexpr,
+    head_worker_limit: pl.constexpr,
 ):
     """Generate delayed HC coefficients and collapse the incoming streams."""
-    inv_rms, partials = hc_project(x_hc, function, hf32=hf32)
+    inv_rms, partials = hc_project(x_hc, function, rms_worker_limit=rms_worker_limit)
     mixes_ready = hc_sinkhorn(inv_rms, partials, scale, base, next_pre_mix, post_mix, residual_mix)
-    hc_head(x_hc, incoming_pre_mix, output)
+    hc_head(x_hc, incoming_pre_mix, output, worker_limit=head_worker_limit)
     return mixes_ready
 
 
@@ -328,13 +310,12 @@ def golden_mhc_mixes(
     scale: torch.Tensor,
     base: torch.Tensor,
     iterations: int = M.hc_sinkhorn_iters,
-    hf32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project one HC stream into pre, post, and doubly-stochastic residual mixes."""
     flat = x_hc.flatten(-2).float()
     inverse_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + M.rms_norm_eps)
-    projection_input = _round_hf32(flat) if hf32 else flat
-    projection_weight = _round_hf32(function.float()) if hf32 else function.float()
+    projection_input = _round_hf32(flat)
+    projection_weight = _round_hf32(function.float())
     mixes = F.linear(projection_input, projection_weight) * inverse_rms
     hc = M.hc_mult
     pre_raw, post_raw, residual_raw = mixes.split((hc, hc, hc * hc), dim=-1)
@@ -374,7 +355,6 @@ def golden_l2_hc_pre(tensors):
     """Compute the four outputs with the incoming mix independent of the next mix."""
     pre_mix, post_mix, residual_mix = golden_mhc_mixes(
         tensors["x_hc"], tensors["function"], tensors["scale"], tensors["base"],
-        hf32=True,
     )
     tensors["pre_mix"][:] = pre_mix
     tensors["post_mix"][:] = post_mix
@@ -435,7 +415,7 @@ def l2_hc_pre(
     pre_mix.bind_dynamic(0, T_DYN)
     post_mix.bind_dynamic(0, T_DYN)
     residual_mix.bind_dynamic(0, T_DYN)
-    hc_pre(x_hc, incoming_pre_mix, function, scale, base, output, pre_mix, post_mix, residual_mix, hf32=True)
+    hc_pre(x_hc, incoming_pre_mix, function, scale, base, output, pre_mix, post_mix, residual_mix, rms_worker_limit=64, head_worker_limit=64)
     return output
 
 
@@ -536,7 +516,7 @@ def l2_hc_head(
     x_hc.bind_dynamic(0, T_DYN)
     pre_mix.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
-    hc_head(x_hc, pre_mix, output)
+    hc_head(x_hc, pre_mix, output, worker_limit=64)
     return output
 
 

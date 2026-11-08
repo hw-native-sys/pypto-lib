@@ -170,15 +170,19 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     const int width = args[6];
     const int active = args[7];
     const int workers = get_block_num(args);
+    const int padded_rows = args[8];
+    const int columns = width / 256;
 #if defined(__DAV_CUBE__)
     QuantizeOutput emit;
-    for (int tile = get_block_idx(args); tile < width / 256; tile += workers) {
-        int group = tile / 4;
+    for (int tile = get_block_idx(args); tile < (padded_rows / 80) * columns; tile += workers) {
+        const int row = tile / columns * 80;
+        const int column = tile % columns;
+        int group = column / 4;
         project_emit<4096, 1024, 256>(
-            data<F>(args, 0) + group * 80 * 4096,
+            data<F>(args, 0) + (group * padded_rows + row) * 4096,
             data<F>(args, 1) + group * 4096 * 1024,
-            data<S>(args, 2) + group * 80 * 128,
-            data<S>(args, 3) + group * 128 * 1024, tile % 4 * 256, emit);
+            data<S>(args, 2) + (group * padded_rows + row) * 128,
+            data<S>(args, 3) + group * 128 * 1024, column % 4 * 256, emit);
     }
     emit.finish();
 #elif defined(__DAV_VEC__)
@@ -192,27 +196,30 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     set_intra_block(PIPE_V, RELEASE);
 #endif
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-    for (int tile = get_block_idx(args); tile < width / 256; tile += workers) {
+    for (int tile = get_block_idx(args); tile < (padded_rows / 80) * columns; tile += workers) {
 #if defined(__CPU_SIM)
         TPOP<SimPipe, Raw, TileSplitAxis::TILE_LEFT_RIGHT>(pipe, raw);
 #else
         wait_intra_block(PIPE_V, READY);
 #endif
         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-        quantize(payload.data(), scales.data(), raw.data(), active);
+        const int row = tile / columns * 80;
+        const int column = tile % columns;
+        const int valid = active - row < 0 ? 0 : (active - row > 80 ? 80 : active - row);
+        quantize(payload.data(), scales.data(), raw.data(), valid);
 #if defined(__CPU_SIM)
         TFREE<SimPipe, TileSplitAxis::TILE_LEFT_RIGHT>(pipe);
 #else
         set_intra_block(PIPE_V, RELEASE);
 #endif
-        const int n = tile * 256 + get_sub_block_id(args) * 128;
+        const int n = column * 256 + get_sub_block_id(args) * 128;
         using Stride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
         using PayloadShape = TileShape2D<F, 80, 128>;
         using ScaleShape = TileShape2D<uint8_t, 5, 64>;
         const int64_t payload_stride = reinterpret_cast<__gm__ Tensor*>(args[4])->strides[0];
-        GlobalTensor<F, PayloadShape, Stride> pg(data<F>(args, 4) + n,
+        GlobalTensor<F, PayloadShape, Stride> pg(data<F>(args, 4) + row * payload_stride + n,
             PayloadShape(), Stride(1, 1, 1, payload_stride, 1));
-        GlobalTensor<uint8_t, ScaleShape, Stride> sg(data<uint8_t>(args, 5) + n / 64 * 32,
+        GlobalTensor<uint8_t, ScaleShape, Stride> sg(data<uint8_t>(args, 5) + row * (width / 32) + n / 64 * 32,
             ScaleShape(), Stride(1, 1, 1, width / 2, 1));
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);

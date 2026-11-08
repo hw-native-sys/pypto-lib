@@ -47,7 +47,7 @@ def sample_target_rank(
     pre_mix.bind_dynamic(0, TARGET_T_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
     collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_head(x_hc, pre_mix, collapsed)
+    hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
     normalized = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd((tokens + 7) // 8, name_hint="dspark_target_final_norm") as ready:
         block = pl.tile.get_block_idx()

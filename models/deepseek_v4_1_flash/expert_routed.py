@@ -47,6 +47,9 @@ if __name__ == "__main__":
 from config import FLASH as M
 from config import EP_SIZE as EP_WORLD_SIZE, MOE_RECV_MAX as RECV_MAX
 from config import ROUTE_T_DYN, N_LOCAL_EXPERTS, MOE_TOKENS
+
+ROUTED_CUBE_WORKER_TILE = 28 if MOE_TOKENS > 80 else 32
+ROUTED_VECTOR_WORKER_TILE = 32 if MOE_TOKENS > 80 else 64
 from quant import pack_mxfp4_weight_tiles, unpack_mxfp4_weight_tiles
 
 
@@ -375,7 +378,7 @@ def _expert_routed_output(
     activation_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     pair = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 2 * hidden], dtype=pl.BF16)
     compact_weights = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, 1], dtype=pl.FP32)
-    with pl.spmd(32, name_hint="routed_w13", deps=[input_ready]) as w13_ready:
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13", deps=[input_ready]) as w13_ready:
         pair, compact_weights = _routed_w13(
             x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
             weights, compact_weights, experts, stride, width, hidden, activation_rows, row_capacity,
@@ -383,14 +386,14 @@ def _expert_routed_output(
 
     payload = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, hidden], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE * (hidden // MX_GROUP)], dtype=pl.FP8E8M0)
-    with pl.spmd(64, name_hint="routed_swiglu_quant", deps=[w13_ready]) as activation_ready:
+    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant", deps=[w13_ready]) as activation_ready:
         payload, scales = _routed_swiglu_quant(
             pair, compact_weights, counts, payload, scales, experts, stride, hidden, row_capacity,
         )
 
     output_rows = ((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
     output = pl.create_tensor([((row_capacity + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE, width], dtype=pl.BF16)
-    with pl.spmd(32, name_hint="routed_w2", deps=[activation_ready]) as ready:
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w2", deps=[activation_ready]) as ready:
         output = _routed_w2(
             payload, scales, counts, w2, w2_scale, output,
             experts, stride, width, hidden, output_rows, activation_rows, row_capacity,
@@ -427,7 +430,7 @@ def expert_routed_scatter(
         local_experts, RECV_MAX, D, MOE_INTER,
         (local_experts if local_experts < topk else topk) * RECV_MAX,
     )
-    with pl.spmd(64, name_hint="ffn_scatter", deps=[down_ready]) as scatter_done:
+    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="ffn_scatter", deps=[down_ready]) as scatter_done:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_scatter", no_dep_args=[routed_output]):
             core = pl.tile.get_block_idx()
             total_rows = 0
@@ -435,8 +438,8 @@ def expert_routed_scatter(
                 rows_read = pl.read(recv_expert_count, [expert, 0])
                 rows = pl.cast(rows_read, pl.INDEX)
                 total_rows = total_rows + rows
-            rows_per_core = total_rows // 64
-            extra_rows = total_rows % 64
+            rows_per_core = total_rows // ROUTED_VECTOR_WORKER_TILE
+            extra_rows = total_rows % ROUTED_VECTOR_WORKER_TILE
             core_begin = core * rows_per_core + pl.min(core, extra_rows)
             core_rows = rows_per_core + pl.min(pl.max(extra_rows - core, 0), 1)
             core_end = core_begin + core_rows

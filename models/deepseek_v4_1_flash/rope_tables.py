@@ -83,6 +83,7 @@ def materialize_rope_rows(
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     pair_start: pl.constexpr,
+    worker_limit: pl.constexpr,
 ) -> pl.Scalar[pl.TASK_ID]:
     """Gather active token rows from serving-owned full tables inside the graph.
 
@@ -94,9 +95,9 @@ def materialize_rope_rows(
     use explicit dependencies, as the attention entries do with cache_ready.
     """
     # A fixed worker grid also supports idle ranks: never submit core_num=0.
-    with pl.spmd(32, name_hint="v41_rope_rows") as rope_ready:
+    with pl.spmd(worker_limit, name_hint="v41_rope_rows") as rope_ready:
         worker = pl.tile.get_block_idx()
-        for token in pl.range(worker, num_tokens, 32):
+        for token in pl.range(worker, num_tokens, worker_limit):
             position = pl.cast(pl.read(position_ids, [token]), pl.INDEX)
             if pair_start:
                 if position >= 0 and (position + 1) % 2 == 0:

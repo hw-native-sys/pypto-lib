@@ -683,7 +683,7 @@ def golden_decode_layer(
     attn_pre = attention_tensors["next_pre_mix"]
     attention_input = attention_tensors["attention_input"]
     next_pre_mix, ffn_post, ffn_residual = golden_mhc_mixes(
-        attention_hidden, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, hf32=True,
+        attention_hidden, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
     )
     ffn_input = golden_hc_collapse(attention_hidden, attn_pre).to(torch.bfloat16)
     moe_overrides = {"x": ffn_input, "norm_weight": ffn_norm_weight}
@@ -928,7 +928,7 @@ def _compare_next_pre_mix_from_actual_attention(counts):
                 pre, _, _ = golden_mhc_mixes(
                     actual_outputs["attention_hidden"][rank, :active],
                     inputs["hc_ffn_fn"][rank], inputs["hc_ffn_scale"][rank],
-                    inputs["hc_ffn_base"][rank], hf32=True,
+                    inputs["hc_ffn_base"][rank],
                 )
                 conditioned[rank, :active] = pre
         return compare_mixes(actual, conditioned, actual_outputs=actual_outputs, inputs=inputs, **kwargs)

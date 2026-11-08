@@ -141,16 +141,17 @@ def prefill_c2a_full_attention(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
+    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x, num_tokens)
     q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens,
+        num_tokens, qa_worker_limit=8, qb_worker_limit=8,
+        padded_rows=proj_payload_padded_rows,
     )
-    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=4)
     window_publish_tid = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache, window_cache_scale,
@@ -159,7 +160,7 @@ def prefill_c2a_full_attention(
 
     compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
     compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
-    c2a_compressor_project(x, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens)
+    c2a_compressor_project(x, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens, n_tile=128)
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     compressed_publish_tid = c2a_compressor_publish(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
@@ -186,7 +187,7 @@ def prefill_c2a_full_attention(
         attn_sink, attended, num_tokens, source_ready,
     )
     o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens,
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, worker_limit=32,
     )
     return partial
 
@@ -273,20 +274,26 @@ def prefill_c2a_full_sp(
     hc_pre(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         hc_collapsed, next_pre_mix, post_mix, residual_mix,
-        hf32=False,
+        rms_worker_limit=16, head_worker_limit=16,
     )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
-    for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
+    hc_norm_block_blocks = (hc_norm_tokens + 7) // 8
+    hc_norm_block_workers = pl.min(hc_norm_block_blocks, 32)
+    for hc_norm_block_worker in pl.spmd(hc_norm_block_workers, name_hint="rms_norm"):
+        for hc_norm_block in pl.range(hc_norm_block_worker, hc_norm_block_blocks, hc_norm_block_workers):
+            rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input,
         group_base, tp_rank, num_tokens, attention_epoch,
     )
     group_tokens = pl.tensor.dim(attn_input, 0)
     partial = pl.create_tensor([group_tokens, D], dtype=pl.BF16)
-    for row in pl.spmd(group_tokens, name_hint="sp_topk_padding"):
-        if row >= num_tokens:
-            topk_indices[row:row + 1, :] = pl.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+    if num_tokens < group_tokens:
+        padding_workers = pl.min(group_tokens - num_tokens, 64)
+        for worker in pl.spmd(padding_workers, name_hint="sp_topk_padding"):
+            for row in pl.range(num_tokens + worker, group_tokens, padding_workers):
+                padding = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+                topk_indices = pl.store(padding, [row, 0], topk_indices)
     if num_tokens > 0:
         prefill_c2a_full_attention(
             attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b,
@@ -839,7 +846,7 @@ def golden_prefill_c2a(tensors, *, mode="full", reference=golden_reference_c2a):
         x_hc[active:] = 0
         incoming = tensors["pre_mix"][group].flatten(0, 1)[:tokens]
         pre, post, comb = golden_mhc_mixes(
-            x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
+            x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base],
         )
         collapsed = golden_hc_collapse(x_hc, incoming).to(torch.bfloat16)
         x = golden_rms_norm(collapsed, tensors["attn_norm_weight"][base])
@@ -1071,10 +1078,11 @@ def l2_prefill_c2a_full(
     rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
-    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, active, rope_cos, rope_sin, False)
+    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, active, rope_cos, rope_sin, False, worker_limit=12)
     materialize_rope_rows(
         compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, active,
         compressed_rope_cos, compressed_rope_sin, False,
+        worker_limit=12,
     )
     prefill_c2a_full_sp(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,

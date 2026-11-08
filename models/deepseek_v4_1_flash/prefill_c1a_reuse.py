@@ -98,18 +98,19 @@ def prefill_c1a_reuse_attention(
     if num_tokens > 0:
         query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
         query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        proj_payload, proj_scales = quantize_projection_input(x, num_tokens)
+        proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x, num_tokens)
         q_proj_rope(
             proj_payload, proj_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
             query_latent, query,
-            num_tokens,
+            num_tokens, qa_worker_limit=24, qb_worker_limit=24,
+            padded_rows=proj_payload_padded_rows,
         )
         source_ready = pl.system.task_dummy(deps=[])
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+        kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=8)
         window_ready = window_publish(
             kv_projection, kv_norm_weight, rope_cos, rope_sin,
             window_slots, window_cache, window_cache_scale,
@@ -122,7 +123,7 @@ def prefill_c1a_reuse_attention(
             attn_sink, attended, num_tokens, window_ready,
         )
         o_proj(
-            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens,
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, worker_limit=32,
         )
     if scatter_output:
         prefill_sp_output_reduce_scatter(
@@ -282,11 +283,14 @@ def l2_prefill_c1a_reuse_sharded(
     hc_pre(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         hc_collapsed, next_pre_mix, post_mix, residual_mix,
-        hf32=False,
+        rms_worker_limit=16, head_worker_limit=16,
     )
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
-    for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
+    hc_norm_block_blocks = (hc_norm_tokens + 7) // 8
+    hc_norm_block_workers = pl.min(hc_norm_block_blocks, 32)
+    for hc_norm_block_worker in pl.spmd(hc_norm_block_workers, name_hint="rms_norm"):
+        for hc_norm_block in pl.range(hc_norm_block_worker, hc_norm_block_blocks, hc_norm_block_workers):
+            rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
         active, attention_epoch,
@@ -465,11 +469,14 @@ def prefill_c1a_reuse(
     hc_pre(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         hidden, next_pre_mix, post_mix, residual_mix,
-        hf32=False,
+        rms_worker_limit=16, head_worker_limit=16,
     )
     norm_tokens = pl.tensor.dim(hidden, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hidden, attn_norm_weight, attn_input, norm_block, norm_tokens, output_fp32=False)
+    norm_block_blocks = (norm_tokens + 7) // 8
+    norm_block_workers = pl.min(norm_block_blocks, 64)
+    for norm_block_worker in pl.spmd(norm_block_workers, name_hint="rms_norm"):
+        for norm_block in pl.range(norm_block_worker, norm_block_blocks, norm_block_workers):
+            rms_norm_tiled(hidden, attn_norm_weight, attn_input, norm_block, norm_tokens, output_fp32=False)
     prefill_c1a_reuse_attention(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,

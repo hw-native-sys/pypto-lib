@@ -102,11 +102,11 @@ __tf__ __aicore__ inline void normalize_weights(
 #endif
 
 template <int Columns>
-__aicore__ inline void run(__gm__ int64_t* args) {
+__aicore__ inline void run(__gm__ int64_t* args, int block) {
     int capacity = reinterpret_cast<__gm__ Tensor*>(args[2])->shapes[0];
     int active = args[4];
     active = active < 0 ? 0 : (active > capacity ? capacity : active);
-    int first = get_block_idx(args) * Rows;
+    int first = block * Rows;
     int valid = active - first;
     valid = valid > Rows ? Rows : valid;
     if (valid <= 0) return;
@@ -242,9 +242,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     set_atomic_none(); set_mask_norm(); set_vector_mask(-1, -1);
 #endif
     int columns = reinterpret_cast<__gm__ Tensor*>(args[0])->shapes[1];
-    if (columns == 32) run<32>(args);
-    else if (columns == 128) run<128>(args);
-    else if (columns == 256) run<256>(args);
-    else run<384>(args);
+    int tasks = (args[4] + Rows - 1) / Rows;
+    for (int block = get_block_idx(args); block < tasks; block += get_block_num(args)) {
+        if (columns == 32) run<32>(args, block);
+        else if (columns == 128) run<128>(args, block);
+        else if (columns == 256) run<256>(args, block);
+        else run<384>(args, block);
+    }
 #endif
 }

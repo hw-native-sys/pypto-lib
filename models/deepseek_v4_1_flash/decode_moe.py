@@ -184,7 +184,8 @@ def moe(
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
     mixes_ready = hc_pre(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, next_pre_mix, post_mix, residual_mix, hf32=True,
+        x_mixed, next_pre_mix, post_mix, residual_mix,
+        rms_worker_limit=64, head_worker_limit=64,
     )
 
     # MoE transport and routed-result scope.
@@ -199,7 +200,8 @@ def moe(
         )
         if BALANCED_ROUTING:
             for token in pl.spmd(num_tokens, name_hint="moe_forced_routes"):
-                indices[token : token + 1, :] = force_topk[token : token + 1, :]
+                forced = pl.load(force_topk, [token, 0], [1, 8], valid_shape=[1, topk])
+                indices = pl.store(forced, [token, 0], indices)
 
         shared_output = pl.create_tensor([t, D], dtype=pl.BF16)
         shared_result = expert_shared(
@@ -531,7 +533,7 @@ def golden_moe(tensors):
     for rank in range(EP_SIZE):
         pre, post, residual = golden_mhc_mixes(
             x_hc[rank],
-            tensors['hc_ffn_fn'][rank], tensors['hc_ffn_scale'][rank], tensors['hc_ffn_base'][rank], hf32=True,
+            tensors['hc_ffn_fn'][rank], tensors['hc_ffn_scale'][rank], tensors['hc_ffn_base'][rank],
         )
         next_pre_mix[rank] = pre
         post_mix[rank] = post

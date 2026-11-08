@@ -52,14 +52,15 @@ K_SCALE = D // MX_GROUP
 H_SCALE = MOE_INTER // MX_GROUP
 W13_M_TILE = 80
 W13_N_TILE = 256
-W13_BLOCKS = GATE_UP_N // W13_N_TILE
 W13_GROUPS = (T_PAD + W13_M_TILE - 1) // W13_M_TILE
 W13_ROWS = W13_GROUPS * W13_M_TILE
 W13_PAD_ROWS = 16  # staging granularity when the token block is not a whole tile
-SWIGLU_WORKERS = 60
-W2_M_TILE = gcd(T_PAD, W13_M_TILE)
+SWIGLU_WORKER_TILE = 8 if T > 80 else 60
+W13_WORKER_TILE = 4 if T > 80 else GATE_UP_N // W13_N_TILE
+W2_WORKER_TILE = 4 if T > 80 else D // 256
+W2_M_TILE = gcd(T_PAD, 256) if T > 80 else gcd(T_PAD, W13_M_TILE)
 W2_N_TILE = 256
-W2_K_TILE = 256
+W2_K_TILE = 128 if T > 80 else 256
 W2_K_STAGE = 2
 W2_SYNC_START = True
 
@@ -113,12 +114,15 @@ def _w13_padded_inputs(
     x_padded = pl.create_tensor([W13_ROWS, D], dtype=pl.FP8E4M3FN)
     scale_padded = pl.create_tensor([1, W13_ROWS * K_SCALE], dtype=pl.FP8E8M0)
     scale_col = W13_PAD_ROWS * K_SCALE
-    with pl.spmd(T_PAD // W13_PAD_ROWS, name_hint="sh_w13_pad"):
-        row0 = pl.tile.get_block_idx() * W13_PAD_ROWS
-        x_rows = pl.load(x_local, [row0, 0], [W13_PAD_ROWS, D])
-        x_padded = pl.store(x_rows, [row0, 0], x_padded)
-        scale_rows = pl.load(x_local_scale, [0, row0 * K_SCALE], [1, scale_col])
-        scale_padded = pl.store(scale_rows, [0, row0 * K_SCALE], scale_padded)
+    pad_workers = pl.min(T_PAD // W13_PAD_ROWS, 16)
+    with pl.spmd(pad_workers, name_hint="sh_w13_pad"):
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, T_PAD // W13_PAD_ROWS, pad_workers):
+            row0 = block * W13_PAD_ROWS
+            x_rows = pl.load(x_local, [row0, 0], [W13_PAD_ROWS, D])
+            x_padded = pl.store(x_rows, [row0, 0], x_padded)
+            scale_rows = pl.load(x_local_scale, [0, row0 * K_SCALE], [1, scale_col])
+            scale_padded = pl.store(scale_rows, [0, row0 * K_SCALE], scale_padded)
     return x_padded, scale_padded
 
 
@@ -142,7 +146,7 @@ def _shared_swiglu(
     scales: pl.Out[pl.Tensor],
 ):
     """SwiGLU epilogue plus grouped MXFP8 requantization over the token block."""
-    with pl.spmd(SWIGLU_WORKERS, name_hint="sh_swiglu_vf"):
+    with pl.spmd(SWIGLU_WORKER_TILE, name_hint="sh_swiglu_vf"):
         _shared_swiglu_vf(gate_up, payload, scales)
     return payload, scales
 
@@ -166,23 +170,13 @@ def expert_shared(
     # Merged W1/W3 projection into BF16 gate/up columns.
     gate_up = pl.create_tensor([T_PAD, GATE_UP_N], dtype=pl.BF16)
     x_w13, x_w13_scale = _W13_INPUTS(x_local, x_local_scale)
-    for group in pl.parallel(W13_GROUPS):
-        row0 = group * W13_M_TILE
-        group_rows = pl.min(W13_M_TILE, T_PAD - row0)
-        x_group = pl.tensor.slice(x_w13, [W13_M_TILE, D], [row0, 0])
-        # Contiguous packed MX_A_ZZ row tiles.
-        x_scale_group = pl.tensor.slice(
-            x_w13_scale,
-            [1, W13_M_TILE * K_SCALE],
-            [0, row0 * K_SCALE],
+    w13_workers = pl.min(W13_GROUPS * (GATE_UP_N // W13_N_TILE), W13_WORKER_TILE)
+    with pl.spmd(w13_workers, name_hint="sh_w13_mx_mm"):
+        gate_up = _shared_w13_mm(
+            x_w13, x_w13_scale,
+            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+            gate_up, T_PAD,
         )
-        gate_up_group = pl.tensor.slice(gate_up, [W13_M_TILE, GATE_UP_N], [row0, 0])
-        with pl.spmd(W13_BLOCKS, name_hint="sh_w13_mx_mm"):
-            gate_up_group = _shared_w13_mm(
-                x_group, x_scale_group,
-                shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-                gate_up_group, group_rows,
-            )
 
     # FP32 SwiGLU, FP8 payload, and packed MX_A_ZZ scales.
     h_tile_mx = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP8E4M3FN)
@@ -194,35 +188,39 @@ def expert_shared(
         h_scale_mx, [T_PAD, H_SCALE], layout=pl.MX_A_ZZ,
     )
     rows = pl.tensor.dim(sh, 0)
-    for wm in pl.parallel((T_PAD + W2_M_TILE - 1) // W2_M_TILE):
-        row0 = wm * W2_M_TILE
-        valid_m = pl.min(W2_M_TILE, T_PAD - row0)
-        valid_out = pl.min(W2_M_TILE, rows - row0)
-        with pl.spmd(D // W2_N_TILE, name_hint="sh_w2_mm", sync_start=W2_SYNC_START):
-            d0 = pl.tile.get_block_idx() * W2_N_TILE
-            hs0 = pl.load(h_tile_mx, [row0, 0], [W2_M_TILE, W2_K_TILE], valid_shape=[valid_m, W2_K_TILE])
-            hs_scale0 = pl.load(h_tile_scale_zz, [row0, 0], [W2_M_TILE, W2_K_TILE // MX_GROUP], valid_shape=[valid_m, W2_K_TILE // MX_GROUP])
-            sw2_0 = pl.load(shared_w2, [0, d0], [W2_K_TILE, W2_N_TILE])
-            sw2_scale0 = pl.load(
-                shared_w2_scale, [0, d0], [W2_K_TILE // MX_GROUP, W2_N_TILE],
-            )
-            y_acc = pl.matmul_mx(hs0, hs_scale0, sw2_0, sw2_scale0)
-            for k0 in pl.pipeline(W2_K_TILE, MOE_INTER, W2_K_TILE, stage=W2_K_STAGE):
-                hs_part = pl.load(h_tile_mx, [row0, k0], [W2_M_TILE, W2_K_TILE], valid_shape=[valid_m, W2_K_TILE])
-                hs_scale_part = pl.load(
-                    h_tile_scale_zz,
-                    [row0, k0 // MX_GROUP],
-                    [W2_M_TILE, W2_K_TILE // MX_GROUP], valid_shape=[valid_m, W2_K_TILE // MX_GROUP],
-                )
-                sw2_part = pl.load(shared_w2, [k0, d0], [W2_K_TILE, W2_N_TILE])
-                sw2_scale_part = pl.load(
-                    shared_w2_scale, [k0 // MX_GROUP, d0], [W2_K_TILE // MX_GROUP, W2_N_TILE],
-                )
-                y_acc = pl.matmul_mx_acc(
-                    y_acc, hs_part, hs_scale_part, sw2_part, sw2_scale_part,
-                )
-            # Fixpipe rounds the accumulator directly to BF16.
-            sh = pl.store(pl.set_validshape(y_acc, valid_out, W2_N_TILE), [row0, d0], sh)
+    with pl.spmd(W2_WORKER_TILE, name_hint="sh_w2_mm", sync_start=W2_SYNC_START):
+        worker = pl.tile.get_block_idx()
+        for lane in pl.range((D // W2_N_TILE + W2_WORKER_TILE - 1) // W2_WORKER_TILE):
+            column = worker + lane * W2_WORKER_TILE
+            if column < D // W2_N_TILE:
+                d0 = column * W2_N_TILE
+                for wm in pl.range((T_PAD + W2_M_TILE - 1) // W2_M_TILE):
+                    row0 = wm * W2_M_TILE
+                    valid_m = pl.min(W2_M_TILE, T_PAD - row0)
+                    valid_out = pl.min(W2_M_TILE, rows - row0)
+                    hs0 = pl.load(h_tile_mx, [row0, 0], [W2_M_TILE, W2_K_TILE], valid_shape=[valid_m, W2_K_TILE])
+                    hs_scale0 = pl.load(h_tile_scale_zz, [row0, 0], [W2_M_TILE, W2_K_TILE // MX_GROUP], valid_shape=[valid_m, W2_K_TILE // MX_GROUP])
+                    sw2_0 = pl.load(shared_w2, [0, d0], [W2_K_TILE, W2_N_TILE])
+                    sw2_scale0 = pl.load(
+                        shared_w2_scale, [0, d0], [W2_K_TILE // MX_GROUP, W2_N_TILE],
+                    )
+                    y_acc = pl.matmul_mx(hs0, hs_scale0, sw2_0, sw2_scale0)
+                    for k0 in pl.pipeline(W2_K_TILE, MOE_INTER, W2_K_TILE, stage=W2_K_STAGE):
+                        hs_part = pl.load(h_tile_mx, [row0, k0], [W2_M_TILE, W2_K_TILE], valid_shape=[valid_m, W2_K_TILE])
+                        hs_scale_part = pl.load(
+                            h_tile_scale_zz,
+                            [row0, k0 // MX_GROUP],
+                            [W2_M_TILE, W2_K_TILE // MX_GROUP], valid_shape=[valid_m, W2_K_TILE // MX_GROUP],
+                        )
+                        sw2_part = pl.load(shared_w2, [k0, d0], [W2_K_TILE, W2_N_TILE])
+                        sw2_scale_part = pl.load(
+                            shared_w2_scale, [k0 // MX_GROUP, d0], [W2_K_TILE // MX_GROUP, W2_N_TILE],
+                        )
+                        y_acc = pl.matmul_mx_acc(
+                            y_acc, hs_part, hs_scale_part, sw2_part, sw2_scale_part,
+                        )
+                    # Fixpipe rounds the accumulator directly to BF16.
+                    sh = pl.store(pl.set_validshape(y_acc, valid_out, W2_N_TILE), [row0, d0], sh)
 
     return sh
 

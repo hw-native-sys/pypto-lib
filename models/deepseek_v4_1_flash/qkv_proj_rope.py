@@ -23,6 +23,17 @@ from gemm import (
 from rmsnorm import golden_rms_norm
 
 
+# Dynamic shape variables.
+QA_INPUT_ROWS = pl.dynamic("QA_INPUT_ROWS")
+QA_SCALE_COLS = pl.dynamic("QA_SCALE_COLS")
+QA_OUTPUT_ROWS = pl.dynamic("QA_OUTPUT_ROWS")
+KV_INPUT_ROWS = pl.dynamic("KV_INPUT_ROWS")
+KV_SCALE_COLS = pl.dynamic("KV_SCALE_COLS")
+KV_OUTPUT_ROWS = pl.dynamic("KV_OUTPUT_ROWS")
+QB_INPUT_ROWS = pl.dynamic("QB_INPUT_ROWS")
+QB_SCALE_COLS = pl.dynamic("QB_SCALE_COLS")
+QB_OUTPUT_ROWS = pl.dynamic("QB_OUTPUT_ROWS")
+
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
 D = M.hidden_size
@@ -41,25 +52,25 @@ WINDOW_PUBLISH_WORKER_TILE = 12
 @pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_a.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _proj_q_a(
-    payload: pl.Tensor,
+    payload: pl.Tensor[[QA_INPUT_ROWS, D], pl.FP8E4M3FN],
     weight: pl.Tensor,
-    activation_scale: pl.Tensor,
+    activation_scale: pl.Tensor[[1, QA_SCALE_COLS], pl.FP8E8M0],
     weight_scale: pl.Tensor,
-    output: pl.Out[pl.Tensor],
+    output: pl.Out[pl.Tensor[[QA_OUTPUT_ROWS, Q_LORA], pl.BF16]],
     rows: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Project ND activations and NZ weights with packed MX scales."""
-    ...
+    return output
 
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "proj_q_b.cpp",
                aiv_source=Path(__file__).parent / "kernels" / "proj_q_b.cpp", include_dirs=(pto_isa_include_dir(),))
 def _proj_q_b(
-    payload: pl.Tensor,
+    payload: pl.Tensor[[QB_INPUT_ROWS, Q_LORA], pl.FP8E4M3FN],
     weight: pl.Tensor,
-    activation_scale: pl.Tensor,
+    activation_scale: pl.Tensor[[1, QB_SCALE_COLS], pl.FP8E8M0],
     weight_scale: pl.Tensor,
-    output: pl.Out[pl.Tensor],
+    output: pl.Out[pl.Tensor[[QB_OUTPUT_ROWS, LOCAL_H * HEAD_DIM], pl.BF16]],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     rows: pl.Scalar[pl.INDEX],
@@ -67,22 +78,22 @@ def _proj_q_b(
     row_start: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Project Q and rotate the BF16-rounded tail on the paired Vector core."""
-    ...
+    return output
 
 
 @pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_kv.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _proj_kv(
-    payload: pl.Tensor,
+    payload: pl.Tensor[[KV_INPUT_ROWS, D], pl.FP8E4M3FN],
     weight: pl.Tensor,
-    activation_scale: pl.Tensor,
+    activation_scale: pl.Tensor[[1, KV_SCALE_COLS], pl.FP8E8M0],
     weight_scale: pl.Tensor,
-    output: pl.Out[pl.Tensor],
+    output: pl.Out[pl.Tensor[[KV_OUTPUT_ROWS, HEAD_DIM], pl.BF16]],
     rows: pl.Scalar[pl.INDEX],
     row_start: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Project ND activations and NZ weights with packed MX scales."""
-    ...
+    return output
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "qkv_quant.cpp",
@@ -108,7 +119,7 @@ def q_norm_quant(
     scales: pl.Out[pl.Tensor],
     rows: pl.Scalar[pl.INT32],
 ):
-    """Normalize complete latent rows and quantize them with packed E8M0 scales."""
+    """Normalize latent rows and write M16-packed MXFP8 outputs."""
     ...
 
 
@@ -126,7 +137,7 @@ def quantize_projection_input(
     workers = pl.min(pl.min(quant_blocks, 32), 2 * pl.system.available_cluster_count())
     with pl.spmd(workers, name_hint="qkv_quant"):
         qkv_quant(x, payload, scales, num_tokens, padded_rows)
-    return payload, scales
+    return payload, scales, padded_rows
 
 
 @pl.jit.inline(auto_scope=False)
@@ -143,51 +154,34 @@ def q_proj_rope(
     query_latent: pl.Tensor,
     query: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    padded_rows: pl.Scalar[pl.INDEX],
+    qa_worker_limit: pl.constexpr = 32,
+    qb_worker_limit: pl.constexpr = 32,
 ):
-    """Project NZ QA/QB weights, rotate Q, and retain M80 QB input for Index-Q."""
-    payload_rows = pl.tensor.dim(payload, 0)
+    """Project NZ QA/QB weights, rotate Q, and retain normalized rows for Index-Q."""
+    payload_rows = padded_rows
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
-    for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
-        group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
-        group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
-        scale_start = group_start * (D // 32)
-        group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
-        projected = pl.create_tensor([PROJ_M_TILE, Q_LORA], dtype=pl.BF16)
-        # Projection blocks own disjoint columns; no simultaneous start is required.
-        with pl.spmd(Q_LORA // Q_A_N_TILE, name_hint="proj_q_a"):
-            projected = _proj_q_a(group_payload, wq_a, group_scales, wq_a_scale, projected, group_rows)
-        qb_payload_group = pl.tensor.slice(qb_payload, [PROJ_M_TILE, Q_LORA], [group_start, 0])
-        qb_scale_start = group_start * (Q_LORA // 32)
-        qb_scales_group = pl.tensor.slice(
-            qb_scales, [1, PROJ_M_TILE * (Q_LORA // 32)], [0, qb_scale_start],
+    projected = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.BF16)
+    qa_tasks = ((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE) * (Q_LORA // Q_A_N_TILE)
+    qa_workers = pl.max(pl.min(qa_tasks, qa_worker_limit), 1)
+    with pl.spmd(qa_workers, name_hint="proj_q_a"):
+        projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens)
+    norm_workers = pl.max(pl.min(payload_rows // MX_M_TILE, 32), 1)
+    latent_rows = pl.tensor.dim(query_latent, 0)
+    norm_latent = pl.tensor.slice(query_latent, [latent_rows, Q_LORA], [0, 0])
+    norm_payload = pl.tensor.slice(qb_payload, [payload_rows, Q_LORA], [0, 0])
+    norm_scales = pl.tensor.slice(qb_scales, [1, payload_rows * (Q_LORA // 32)], [0, 0])
+    with pl.spmd(norm_workers, name_hint="q_norm_quant"):
+        q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
+    qb_tasks = ((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
+    qb_workers = pl.max(pl.min(qb_tasks, qb_worker_limit), 1)
+    with pl.spmd(qb_workers, name_hint="proj_q_b"):
+        query = _proj_q_b(
+            qb_payload, wq_b, qb_scales, wq_b_scale,
+            query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0,
         )
-        for q_mt in pl.parallel(PROJ_M_TILE // MX_M_TILE):
-            q_local = q_mt * MX_M_TILE
-            q_start = group_start + pl.min(q_local, group_rows)
-            q_rows = pl.max(pl.min(MX_M_TILE, group_rows - q_local), 0)
-            projected_tile = pl.slice(projected, [q_rows, Q_LORA], [q_local, 0])
-            latent_tile = pl.slice(query_latent, [q_rows, Q_LORA], [q_start, 0])
-            qb_payload_tile = pl.tensor.slice(qb_payload_group, [MX_M_TILE, Q_LORA], [q_local, 0])
-            qb_scale_offset = q_local * (Q_LORA // 32)
-            qb_scales_tile = pl.tensor.slice(
-                qb_scales_group, [1, MX_M_TILE * (Q_LORA // 32)], [0, qb_scale_offset],
-            )
-            with pl.spmd(1, name_hint="q_norm_quant"):
-                q_norm_quant(
-                    projected_tile, q_norm_weight, latent_tile,
-                    qb_payload_tile, qb_scales_tile, q_rows,
-                )
-        qb_workers = pl.min(32, LOCAL_H * HEAD_DIM // Q_B_N_TILE)
-        qb_workers = pl.min(qb_workers, pl.system.available_cluster_count())
-        qb_workers = pl.max(1, qb_workers)
-        with pl.spmd(qb_workers, name_hint="proj_q_b"):
-            query = _proj_q_b(
-                qb_payload_group, wq_b, qb_scales_group, wq_b_scale,
-                query, rope_cos, rope_sin, group_rows, LOCAL_H * HEAD_DIM, group_start,
-            )
     return query_latent, query, qb_payload, qb_scales
-
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "norm_rope_publish.cpp",
@@ -214,17 +208,13 @@ def kv_proj(
     wkv_scale: pl.Tensor,
     kv_projection: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    worker_limit: pl.constexpr = 32,
 ):
     """Project NZ KV weights to BF16 rows in M80 groups."""
-    for group_start in pl.parallel(0, num_tokens, PROJ_M_TILE):
-        group_rows = pl.min(PROJ_M_TILE, num_tokens - group_start)
-        group_payload = pl.tensor.slice(payload, [PROJ_M_TILE, D], [group_start, 0])
-        scale_start = group_start * (D // 32)
-        group_scales = pl.tensor.slice(scales, [1, PROJ_M_TILE * (D // 32)], [0, scale_start])
-        with pl.spmd(HEAD_DIM // KV_N_TILE, name_hint="proj_kv", sync_start=True):
-            kv_projection = _proj_kv(
-                group_payload, wkv, group_scales, wkv_scale, kv_projection, group_rows, group_start,
-            )
+    tasks = ((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE) * (HEAD_DIM // KV_N_TILE)
+    workers = pl.max(pl.min(tasks, worker_limit), 1)
+    with pl.spmd(workers, name_hint="proj_kv", sync_start=True):
+        kv_projection = _proj_kv(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0)
     return kv_projection
 
 
@@ -256,7 +246,6 @@ def window_publish(
                 scale = pl.load(local_rows, [slot, 0], [1, HEAD_DIM // 32])
                 pl.store(scale, [slot, 0], output_rows)
     return completed
-
 
 
 def golden_rope_interleave(

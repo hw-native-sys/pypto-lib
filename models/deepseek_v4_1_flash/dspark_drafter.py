@@ -360,7 +360,8 @@ def draft_layer(
     residual_mix = pl.create_tensor([MOE_TOKENS, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_pre(
         x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attention_input, attention_pre_mix, post_mix, residual_mix, hf32=True,
+        attention_input, attention_pre_mix, post_mix, residual_mix,
+        rms_worker_limit=64, head_worker_limit=64,
     )
     for block in pl.spmd((MOE_TOKENS + 7) // 8, name_hint="dspark_attn_norm"):
         rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, MOE_TOKENS, output_fp32=False)
@@ -737,7 +738,7 @@ def _dspark_drafter(
             pre_mix = next_pre_mix
 
         padded_head = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
-        hc_head(x_hc, pre_mix, padded_head)
+        hc_head(x_hc, pre_mix, padded_head, worker_limit=64)
         for row in pl.spmd(active_tokens, name_hint="dspark_head_unpad"):
             flat_head_hidden[first_token + row : first_token + row + 1, :] = padded_head[row : row + 1, :]
     return head_hidden, window_cache, window_cache_scale

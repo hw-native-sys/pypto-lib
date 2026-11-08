@@ -102,9 +102,9 @@ def prefill_index_query(
     padded_rows = (rows + 79) // 80 * 80
     payload = pl.create_tensor([padded_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, padded_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
-    with pl.spmd(32, name_hint="prefill_index_input_quant") as quantized:
+    with pl.spmd(16, name_hint="prefill_index_input_quant") as quantized:
         worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, padded_rows // 16 * (Q_LORA // 256), 32):
+        for block in pl.range(worker, padded_rows // 16 * (Q_LORA // 256), 16):
             row = block // (Q_LORA // 256) * 16
             column = block % (Q_LORA // 256) * 256
             active = pl.max(0, pl.min(16, num_tokens - row))
@@ -123,12 +123,12 @@ def prefill_index_query(
     sine_rows = pl.reshape(sine, [rows, 32])
     output_scales = pl.reshape(query_scale, [rows, INDEX_QUERY_SCALE_WIDTH])
     packed = pl.create_tensor([rows, INDEX_QUERY_WIDTH // 2], dtype=pl.UINT8)
-    with pl.spmd(16, name_hint="idx_q", deps=[quantized]) as projected:
+    with pl.spmd(8, name_hint="idx_q", deps=[quantized]) as projected:
         packed_result = _idx_q(payload, weight, scales, weight_scale, cosine_rows, sine_rows, packed, output_scales, num_tokens)
-    with pl.spmd(32, name_hint="prefill_index_query_carrier", deps=[projected, ready]) as completed:
+    with pl.spmd(16, name_hint="prefill_index_query_carrier", deps=[projected, ready]) as completed:
         worker = pl.tile.get_block_idx()
         lut = fp4_e4m3_lut()
-        for row in pl.range(worker, num_tokens, 32):
+        for row in pl.range(worker, num_tokens, 16):
             packed_row = pl.tile.load(packed_result, [row, 0], [1, INDEX_QUERY_WIDTH // 2])
             signed_bytes = pl.reinterpret_view(packed_row, pl.INT8)
             byte_values = pl.ands(pl.cast(signed_bytes, pl.INT16), 255)
@@ -591,16 +591,19 @@ def project_index_weights(
     projected_result, projected_tid = gemm_bf16_to_bf16(
         x, weight, projected_weights, num_tokens, ready,
         width=D, output_width=INDEX_H, n_tile=INDEX_H, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint="prefill_index_weights",
+        workers=4, name_hint="prefill_index_weights",
     )
-    with pl.spmd((num_tokens + M_TILE - 1) // M_TILE, name_hint="c1a_index_weights_scale") as weights_tid:
-        block = pl.tile.get_block_idx()
-        token = block * M_TILE
-        rows = pl.min(M_TILE, num_tokens - token)
-        projected = pl.slice(projected_weights, [M_TILE, INDEX_H], [token, 0], valid_shape=[rows, INDEX_H])
-        scaled = pl.mul(pl.cast(projected, pl.FP32), INDEX_SCORE_SCALE)
-        rounded = pl.cast(scaled, pl.BF16, mode="rint")
-        output[token:token + M_TILE, :] = pl.set_validshape(rounded, rows, INDEX_H)
+    scale_blocks = (num_tokens + M_TILE - 1) // M_TILE
+    scale_workers = pl.max(pl.min(scale_blocks, 8), 1)
+    with pl.spmd(scale_workers, name_hint="c1a_index_weights_scale") as weights_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, scale_blocks, scale_workers):
+            token = block * M_TILE
+            rows = pl.min(M_TILE, num_tokens - token)
+            projected = pl.slice(projected_weights, [M_TILE, INDEX_H], [token, 0], valid_shape=[rows, INDEX_H])
+            scaled = pl.mul(pl.cast(projected, pl.FP32), INDEX_SCORE_SCALE)
+            rounded = pl.cast(scaled, pl.BF16, mode="rint")
+            output[token:token + M_TILE, :] = pl.set_validshape(rounded, rows, INDEX_H)
     return weights_tid
 
 
@@ -691,10 +694,10 @@ def _prefill_index_scores(
         decoded_rows = cache_rows
         decoded_cols = INDEX_DIM
     decoded_keys = pl.create_tensor([decoded_rows, decoded_cols], dtype=pl.FP8E4M3FN)
-    with pl.spmd(32, name_hint="prefill_index_cache_decode", deps=[ready]) as decoded_tid:
+    with pl.spmd(8, name_hint="prefill_index_cache_decode", deps=[ready]) as decoded_tid:
         decode_worker = pl.tile.get_block_idx()
         decode_lut = fp4_e4m3_lut()
-        for decode_row in pl.range(decode_worker * 128, cache_rows, 32 * 128):
+        for decode_row in pl.range(decode_worker * 128, cache_rows, 8 * 128):
             decode_packed = pl.load(packed_flat, [decode_row, 0], [128, INDEX_DIM // 2])
             decode_signed = pl.reinterpret_view(decode_packed, pl.INT8)
             decode_bytes = pl.ands(pl.cast(decode_signed, pl.INT16), 255)
@@ -994,57 +997,59 @@ def _select_c2a_topk(
     tokens = pl.tensor.dim(scores, 0)
     width = pl.tensor.dim(scores, 1)
     leaf_rows = pl.create_tensor([tokens, LEAF], dtype=pl.INT32)
-    with pl.spmd(num_tokens, name_hint="prefill_c2a_topk", deps=[ready]) as selected:
-        token = pl.tile.get_block_idx()
-        request = pl.read(requests, [token])
-        length = pl.min(pl.max(pl.read(lengths, [token]), 0), width)
-        empty = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
-        pl.store(empty, [token, 0], output)
-        if length <= INDEX_TOPK:
-            written = pl.cast(0, pl.INDEX)
-            for part in pl.range(INDEX_TOPK // 128):
-                begin = part * 128
-                if begin < length and request >= 0 and request < pl.tensor.dim(table, 0):
-                    page = pl.read(table, [request, part])
-                    if page >= 0 and page < cache_pages:
-                        count = pl.min(128, length - begin)
-                        short_rows = pl.add(pl.tile.arange(0, [1, 128], dtype=pl.INT32), pl.cast(page * 128, pl.INT32))
-                        pl.store(pl.set_validshape(short_rows, 1, count), [token, written], output)
-                        written = written + count
-        else:
-            running = pl.tile.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=SORT_FLOOR)
-            for leaf, (previous,) in pl.range((length + LEAF - 1) // LEAF, init_values=(running,)):
-                begin = leaf * LEAF
-                for part in pl.range(LEAF // 128):
-                    logical = begin + part * 128
-                    physical_rows = pl.tile.full([1, 128], dtype=pl.INT32, value=-1)
-                    if logical < length and request >= 0 and request < pl.tensor.dim(table, 0):
-                        page = pl.read(table, [request, logical // 128])
+    workers = pl.min(num_tokens, 64)
+    with pl.spmd(workers, name_hint="prefill_c2a_topk", deps=[ready]) as selected:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, num_tokens, workers):
+            request = pl.read(requests, [token])
+            length = pl.min(pl.max(pl.read(lengths, [token]), 0), width)
+            empty = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
+            pl.store(empty, [token, 0], output)
+            if length <= INDEX_TOPK:
+                written = pl.cast(0, pl.INDEX)
+                for part in pl.range(INDEX_TOPK // 128):
+                    begin = part * 128
+                    if begin < length and request >= 0 and request < pl.tensor.dim(table, 0):
+                        page = pl.read(table, [request, part])
                         if page >= 0 and page < cache_pages:
-                            row_offsets = pl.tile.arange(0, [1, 128], dtype=pl.INT32)
-                            physical_rows = pl.add(row_offsets, pl.cast(page * 128, pl.INT32))
-                    pl.store(physical_rows, [token, part * 128], leaf_rows)
-                raw = pl.load(scores, [token, begin], [1, LEAF], valid_shape=[1, pl.min(LEAF, length - begin)])
-                padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
-                values = pl.maximum(padded, SORT_FLOOR)
-                leaf_row_ids = pl.load(leaf_rows, [token, 0], [1, LEAF])
-                pairs = pl.tile.sort32(values, pl.reinterpret_view(leaf_row_ids, pl.UINT32))
-                pairs = pl.tile.mrgsort(pairs, block_len=64)
-                pairs = pl.tile.mrgsort(pairs, block_len=256)
-                pairs = pl.tile.mrgsort(pairs, block_len=1024)
-                merge_tmp = pl.tile.create([1, 2 * TOPK_PAIR_WIDTH], dtype=pl.FP32)
-                merged = pl.tile.mrgsort(previous, pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0]), tmp=merge_tmp)
-                running = pl.yield_(pl.tile.slice(merged, [1, TOPK_PAIR_WIDTH], [0, 0]))
-            chosen_values = pl.tile.gather_mask(running, mask_pattern=pl.tile.MaskPattern.P0101)
-            chosen = pl.tile.gather_mask(running, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            valid = pl.tile.cmps(chosen_values, -1e29, cmp_type=4)
-            order_values = pl.tile.select(valid, pl.mul(pl.cast(chosen, pl.FP32), -1.0), SORT_FLOOR)
-            order_rows = pl.tile.select(valid, chosen, -1)
-            ordered = pl.tile.sort32(order_values, pl.reinterpret_view(order_rows, pl.UINT32))
-            ordered = pl.tile.mrgsort(ordered, block_len=64)
-            ordered = pl.tile.mrgsort(ordered, block_len=256)
-            final = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            pl.store(final, [token, 0], output)
+                            count = pl.min(128, length - begin)
+                            short_rows = pl.add(pl.tile.arange(0, [1, 128], dtype=pl.INT32), pl.cast(page * 128, pl.INT32))
+                            pl.store(pl.set_validshape(short_rows, 1, count), [token, written], output)
+                            written = written + count
+            else:
+                running = pl.tile.full([1, TOPK_PAIR_WIDTH], dtype=pl.FP32, value=SORT_FLOOR)
+                for leaf, (previous,) in pl.range((length + LEAF - 1) // LEAF, init_values=(running,)):
+                    begin = leaf * LEAF
+                    for part in pl.range(LEAF // 128):
+                        logical = begin + part * 128
+                        physical_rows = pl.tile.full([1, 128], dtype=pl.INT32, value=-1)
+                        if logical < length and request >= 0 and request < pl.tensor.dim(table, 0):
+                            page = pl.read(table, [request, logical // 128])
+                            if page >= 0 and page < cache_pages:
+                                row_offsets = pl.tile.arange(0, [1, 128], dtype=pl.INT32)
+                                physical_rows = pl.add(row_offsets, pl.cast(page * 128, pl.INT32))
+                        pl.store(physical_rows, [token, part * 128], leaf_rows)
+                    raw = pl.load(scores, [token, begin], [1, LEAF], valid_shape=[1, pl.min(LEAF, length - begin)])
+                    padded = pl.tile.fillpad(raw, pad_value=pl.PadValue.min)
+                    values = pl.maximum(padded, SORT_FLOOR)
+                    leaf_row_ids = pl.load(leaf_rows, [token, 0], [1, LEAF])
+                    pairs = pl.tile.sort32(values, pl.reinterpret_view(leaf_row_ids, pl.UINT32))
+                    pairs = pl.tile.mrgsort(pairs, block_len=64)
+                    pairs = pl.tile.mrgsort(pairs, block_len=256)
+                    pairs = pl.tile.mrgsort(pairs, block_len=1024)
+                    merge_tmp = pl.tile.create([1, 2 * TOPK_PAIR_WIDTH], dtype=pl.FP32)
+                    merged = pl.tile.mrgsort(previous, pl.tile.slice(pairs, [1, TOPK_PAIR_WIDTH], [0, 0]), tmp=merge_tmp)
+                    running = pl.yield_(pl.tile.slice(merged, [1, TOPK_PAIR_WIDTH], [0, 0]))
+                chosen_values = pl.tile.gather_mask(running, mask_pattern=pl.tile.MaskPattern.P0101)
+                chosen = pl.tile.gather_mask(running, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                valid = pl.tile.cmps(chosen_values, -1e29, cmp_type=4)
+                order_values = pl.tile.select(valid, pl.mul(pl.cast(chosen, pl.FP32), -1.0), SORT_FLOOR)
+                order_rows = pl.tile.select(valid, chosen, -1)
+                ordered = pl.tile.sort32(order_values, pl.reinterpret_view(order_rows, pl.UINT32))
+                ordered = pl.tile.mrgsort(ordered, block_len=64)
+                ordered = pl.tile.mrgsort(ordered, block_len=256)
+                final = pl.tile.gather_mask(ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                pl.store(final, [token, 0], output)
     return selected
 
 
@@ -1124,18 +1129,21 @@ def prefill_index_key_project(
     projected_result, projected_tid = gemm_bf16_to_bf16(
         latent, weight, projected, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint="prefill_index_key",
+        workers=4, name_hint="prefill_index_key",
     )
     norm_blocks = (num_tokens + M_TILE - 1) // M_TILE
-    with pl.spmd(norm_blocks, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
-        t0 = pl.tile.get_block_idx() * M_TILE
-        rows = pl.min(M_TILE, num_tokens - t0)
-        value = pl.cast(pl.slice(projected, [M_TILE, INDEX_DIM], [t0, 0], valid_shape=[rows, INDEX_DIM]), pl.FP32)
-        square = pl.mul(pl.row_sum(pl.mul(value, value)), 1.0 / INDEX_DIM)
-        inv = pl.rsqrt(pl.add(square, EPS), high_precision=True)
-        gamma = pl.reshape(pl.cast(norm_weight[:], pl.FP32), [1, INDEX_DIM])
-        normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv), gamma)
-        output[t0 : t0 + M_TILE, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, INDEX_DIM)
+    norm_workers = pl.max(pl.min(norm_blocks, 8), 1)
+    with pl.spmd(norm_workers, name_hint="prefill_c2a_index_norm", deps=[pool_ready]) as norm_tid:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, norm_blocks, norm_workers):
+            t0 = block * M_TILE
+            rows = pl.min(M_TILE, num_tokens - t0)
+            value = pl.cast(pl.slice(projected, [M_TILE, INDEX_DIM], [t0, 0], valid_shape=[rows, INDEX_DIM]), pl.FP32)
+            square = pl.mul(pl.row_sum(pl.mul(value, value)), 1.0 / INDEX_DIM)
+            inv = pl.rsqrt(pl.add(square, EPS), high_precision=True)
+            gamma = pl.reshape(pl.cast(norm_weight[:], pl.FP32), [1, INDEX_DIM])
+            normalized = pl.col_expand_mul(pl.row_expand_mul(value, inv), gamma)
+            output[t0 : t0 + M_TILE, :] = pl.set_validshape(pl.cast(normalized, pl.BF16, mode="rint"), rows, INDEX_DIM)
     return norm_tid
 
 
@@ -1157,17 +1165,20 @@ def publish_c1a_index_key(
     projected_result, projected_tid = gemm_bf16_to_bf16(
         compressed_latent, index_wk, index_projection, num_tokens, projection_ready,
         width=HEAD_DIM, output_width=INDEX_DIM, n_tile=INDEX_PROJ_N_TILE, k_tile=INDEX_PROJ_K_TILE,
-        workers=2147483647, name_hint="prefill_index_key",
+        workers=4, name_hint="prefill_index_key",
     )
     index_normalized = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     norm_blocks = (num_tokens + 7) // 8
-    for norm_worker in pl.spmd(pl.max(1, norm_blocks), name_hint="attention_rmsnorm"):
-        if norm_worker < norm_blocks:
-            rms_norm(index_projection, index_norm_weight, index_normalized, norm_worker, num_tokens, width=INDEX_DIM)
+    norm_worker_blocks = pl.max(1, norm_blocks)
+    norm_worker_workers = pl.min(norm_worker_blocks, 8)
+    for norm_worker_worker in pl.spmd(norm_worker_workers, name_hint="attention_rmsnorm"):
+        for norm_worker in pl.range(norm_worker_worker, norm_worker_blocks, norm_worker_workers):
+            if norm_worker < norm_blocks:
+                rms_norm(index_projection, index_norm_weight, index_normalized, norm_worker, num_tokens, width=INDEX_DIM)
     index_rotated = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     _index_rope(
         index_normalized, compressed_rope_cos, compressed_rope_sin, index_rotated, num_tokens,
-        heads=1, max_workers=32,
+        heads=1, max_workers=16,
     )
     index_ready = publish_index_cache(
         index_rotated, compressed_slots, index_cache, index_cache_scale, num_tokens,
@@ -1195,7 +1206,7 @@ def publish_c2a_index_key(
     rotated_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     _index_rope(
         index_key, compressed_rope_cos, compressed_rope_sin, rotated_key, num_tokens,
-        heads=1, max_workers=32,
+        heads=1, max_workers=16,
     )
     index_publish_tid = publish_index_key(
         rotated_key, compressed_slots, index_cache, index_cache_scale, num_tokens, cache_ready

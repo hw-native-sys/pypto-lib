@@ -95,8 +95,8 @@ def prefill_swa_attention(
         worker = pl.tile.get_block_idx()
         for row in pl.range(worker, num_tokens, WORKER_TILE):
             kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    kv_input_payload, kv_input_scales = quantize_projection_input(x, num_tokens)
-    kv_projection = kv_proj(kv_input_payload, kv_input_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(x, num_tokens)
+    kv_projection = kv_proj(kv_input_payload, kv_input_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=8)
     chunk_done = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache, window_cache_scale,
@@ -121,18 +121,19 @@ def prefill_swa_attention(
                 chunk_cos[row:row + 1, :] = rope_cos[source_row:source_row + 1, :]
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
-        q_input_payload, q_input_scales = quantize_projection_input(chunk_x, active)
+        q_input_payload, q_input_scales, q_input_payload_padded_rows = quantize_projection_input(chunk_x, active)
         q_proj_rope(
             q_input_payload, q_input_scales,
             wq_a, wq_a_scale, q_norm_weight,
             wq_b, wq_b_scale,
             chunk_cos, chunk_sin,
             qr, q,
-            active,
+            active, qa_worker_limit=24, qb_worker_limit=24,
+            padded_rows=q_input_payload_padded_rows,
         )
         attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         swa_attention_partial(q, window_cache, window_cache_scale, chunk_indices, attn_sink, attended, active, stage_tid)
-        o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active)
+        o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active, worker_limit=32)
 
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
@@ -191,11 +192,14 @@ def prefill_swa(
     hc_pre(
         x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
         collapsed, next_pre_mix, post_mix, residual_mix,
-        hf32=False,
+        rms_worker_limit=24, head_worker_limit=24,
     )
     norm_tokens = pl.tensor.dim(collapsed, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(collapsed, attn_norm_weight, local_hidden, norm_block, norm_tokens, output_fp32=False)
+    norm_block_blocks = (norm_tokens + 7) // 8
+    norm_block_workers = pl.min(norm_block_blocks, 64)
+    for norm_block_worker in pl.spmd(norm_block_workers, name_hint="rms_norm"):
+        for norm_block in pl.range(norm_block_worker, norm_block_blocks, norm_block_workers):
+            rms_norm_tiled(collapsed, attn_norm_weight, local_hidden, norm_block, norm_tokens, output_fp32=False)
     zero_bf16_padding(local_hidden, pl.min(tokens, pl.tensor.dim(local_hidden, 0)))
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, hidden,
