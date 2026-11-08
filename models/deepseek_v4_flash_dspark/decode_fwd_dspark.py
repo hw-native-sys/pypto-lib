@@ -1019,7 +1019,7 @@ def l3_decode_fwd_dspark(
 # Fixture geometry.  The group tables are indexed by logical page, so their
 # widths follow decode_prepare's own bounds; the RoPE tables only need to cover
 # the fixture's position limit.
-FIXTURE_ACTIVE_REQUESTS = 2
+FIXTURE_ACTIVE_REQUESTS = decode.config.DECODE_BATCH // TP_SIZE
 FIXTURE_POSITION_LIMIT = 512
 FIXTURE_ROPE_ROWS = 2048
 FIXTURE_ORI_TABLE_BLOCKS = (FIXTURE_POSITION_LIMIT + SAMPLED_IDS_PAD + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -1056,16 +1056,20 @@ def _fixture_device_state():
     tokens = torch.zeros((N_RANKS, DSPARK_STATE_CAPACITY, DSPARK_STATE_TOKEN_WIDTH), dtype=torch.int64)
     meta = torch.zeros((N_RANKS, DSPARK_STATE_CAPACITY, DSPARK_STATE_META_WIDTH), dtype=torch.int32)
     for slot in range(active):
-        slot_ids[:, slot] = slot
         generations[:, slot] = 1
-        group_slot_ids[:, slot] = slot
-        group_generations[:, slot] = 1
-        tokens[:, slot, :] = torch.arange(100 * (slot + 1), 100 * (slot + 1) + DSPARK_STATE_TOKEN_WIDTH)
-        meta[:, slot, prepare.STATE_VALID] = 1
-        meta[:, slot, prepare.STATE_GENERATION] = 1
-        meta[:, slot, prepare.STATE_ANCHOR_POSITION] = 64 * (slot + 1)
-        meta[:, slot, prepare.STATE_DRAFT_COUNT] = DRAFT_DSPARK_QUERY_WIDTH
-        meta[:, slot, prepare.STATE_POSITION_LIMIT] = FIXTURE_POSITION_LIMIT
+        for owner in range(TP_SIZE):
+            group_slot = owner * DSPARK_STATE_LOCAL_BATCH + slot
+            group_slot_ids[:, group_slot] = group_slot
+            group_generations[:, group_slot] = 1
+            for rank in range(owner, N_RANKS, TP_SIZE):
+                slot_ids[rank, slot] = group_slot
+            token_ids = torch.arange(100 * (group_slot + 1), 100 * (group_slot + 1) + DSPARK_STATE_TOKEN_WIDTH)
+            tokens[:, group_slot, :] = torch.remainder(token_ids, decode.RUNTIME_TEST_VOCAB)
+            meta[:, group_slot, prepare.STATE_VALID] = 1
+            meta[:, group_slot, prepare.STATE_GENERATION] = 1
+            meta[:, group_slot, prepare.STATE_ANCHOR_POSITION] = min(64 * (slot + 1), FIXTURE_POSITION_LIMIT - prepare.S)
+            meta[:, group_slot, prepare.STATE_DRAFT_COUNT] = DRAFT_DSPARK_QUERY_WIDTH
+            meta[:, group_slot, prepare.STATE_POSITION_LIMIT] = FIXTURE_POSITION_LIMIT
     return slot_ids, generations, group_slot_ids, group_generations, tokens, meta
 
 
@@ -1081,7 +1085,8 @@ def build_tensor_specs():
         copied.resident = source.resident
         return copied
 
-    specs = {spec.name: spec for spec in decode.build_tensor_specs()}
+    token_counts = [decode.config.DECODE_BATCH // TP_SIZE * prepare.S] * N_RANKS
+    specs = {spec.name: spec for spec in decode.build_tensor_specs(num_tokens_per_owner=token_counts)}
     for spec in dspark.build_tensor_specs(dspark.DSPARK_MAX_BATCH):
         specs.setdefault("draft_" + spec.name, rename("draft_" + spec.name, spec))
     for spec in markov.build_tensor_specs(dspark.DSPARK_MAX_BATCH, distributed=True, world_size=N_RANKS):

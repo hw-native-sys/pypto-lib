@@ -9,6 +9,7 @@
 # ci: devices=2
 """DeepSeek-V4 Flash DSpark LM head: fused matmul+push projection with DP-owned hidden and TP vocab shards."""
 
+from math import gcd
 import sys
 
 import pypto.language as pl
@@ -66,11 +67,11 @@ TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card
 # the weight tile re-reads a narrower row tile forces.
 FUSED_K_TILE = 256
 FUSED_VOCAB_TILE = 128
-MM_ROW_TILE = 128
+MM_ROW_TILE = gcd(MAX_LOGIT_ROWS, 128)
 HIDDEN_GATHER_TILE = 1024
-HIDDEN_GATHER_ROW_TILE = min(GROUP_LOGIT_ROWS, 64)
-PUSH_ROW_TILE = 16  # rows pushed per dispatch_push block (fewer, larger ring puts)
-LOGITS_GATHER_ROW_TILE = min(MAX_LOGIT_ROWS, 8)
+HIDDEN_GATHER_ROW_TILE = gcd(GROUP_LOGIT_ROWS, min(GROUP_LOGIT_ROWS, 64))
+PUSH_ROW_TILE = gcd(MAX_LOGIT_ROWS, 16)  # rows pushed per dispatch_push block (fewer, larger ring puts)
+LOGITS_GATHER_ROW_TILE = gcd(MAX_LOGIT_ROWS, 8)
 LOGITS_COMM_TILE = 2048
 # Greedy sampling scans each row as a [GREEDY_BLOCK_ROWS, GREEDY_ROW_WIDTH] grid.
 # 8 rows keeps a reduction result at 32 B; alloc_tile rejects the 4 B a [1, 1] gives.
@@ -81,7 +82,7 @@ FUSED_LM_HEAD_CORES = 24
 # AIV lanes per AICore: the fused kernel splits each row block's accumulator
 # across the two lanes, and each lane pushes a contiguous half of one owner's rows.
 AIV_LANES = 2
-LANE_ROWS = MM_ROW_TILE // AIV_LANES
+LANE_ROWS = (MM_ROW_TILE + AIV_LANES - 1) // AIV_LANES
 VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 VOCAB_FULL_TILES = VOCAB_PER_TP // FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
@@ -241,10 +242,11 @@ def lm_head(
                     mm_shard = pl.aiv_shard(mm_acc)
                     owner_tp = mm_rb // (MAX_LOGIT_ROWS // MM_ROW_TILE)
                     owner_r0 = (mm_rb % (MAX_LOGIT_ROWS // MM_ROW_TILE)) * MM_ROW_TILE + aiv_id * LANE_ROWS
-                    pld.tensor.remote_store(
-                        mm_shard, logits_window, group_base + owner_tp,
-                        [owner_r0, vocab_base + mm_o0],
-                    )
+                    if aiv_id * LANE_ROWS < MM_ROW_TILE:
+                        pld.tensor.remote_store(
+                            mm_shard, logits_window, group_base + owner_tp,
+                            [owner_r0, vocab_base + mm_o0],
+                        )
 
         # Ragged tail: its own matmul on one block; the accumulator is already
         # VOCAB_TAIL wide. Hoisted out of the strided loop: a dynamic branch would
@@ -270,10 +272,11 @@ def lm_head(
                         tail_shard = pl.aiv_shard(tail_acc)
                         owner_tp = tail_rb // (MAX_LOGIT_ROWS // MM_ROW_TILE)
                         owner_r0 = (tail_rb % (MAX_LOGIT_ROWS // MM_ROW_TILE)) * MM_ROW_TILE + aiv_id * LANE_ROWS
-                        pld.tensor.remote_store(
-                            tail_shard, logits_window, group_base + owner_tp,
-                            [owner_r0, vocab_base + mm_tail_o0],
-                        )
+                        if aiv_id * LANE_ROWS < MM_ROW_TILE:
+                            pld.tensor.remote_store(
+                                tail_shard, logits_window, group_base + owner_tp,
+                                [owner_r0, vocab_base + mm_tail_o0],
+                            )
 
         # Notify folded into the push: each block signals every peer after its own
         # stores, so a peer sees FUSED_LM_HEAD_CORES notifies per source per epoch.

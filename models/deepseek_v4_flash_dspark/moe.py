@@ -13,6 +13,8 @@
 # Sub-kernels freeze EP / n_routed_experts into their shapes at import
 # time: read --ep / --experts-per-rank from argv and override config before
 # importing them below.
+from math import gcd
+
 import dataclasses
 import functools
 import sys
@@ -44,7 +46,12 @@ if EXPERTS_PER_RANK <= 0:
     raise ValueError(f"--experts-per-rank must be a positive integer (got {EXPERTS_PER_RANK})")
 config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=EXPERTS_PER_RANK * EP)
 config.EP = EP
-config.RECV_MAX = EP * config.MOE_TOKENS
+MOE_TOKEN_CAPACITY = _parse_int_argv("--token-capacity", config.MOE_TOKENS)
+TOKEN_CAPACITY_SPECIFIED = any(arg == "--token-capacity" or arg.startswith("--token-capacity=") for arg in sys.argv)
+if TOKEN_CAPACITY_SPECIFIED and (MOE_TOKEN_CAPACITY <= 0 or (MOE_TOKEN_CAPACITY > 64 and MOE_TOKEN_CAPACITY % 64 != 0)):
+    raise ValueError("--token-capacity must be positive and, above 64, a multiple of 64")
+config.MOE_TOKENS = MOE_TOKEN_CAPACITY
+config.RECV_MAX = ((EP * config.MOE_TOKENS + 63) // 64) * 64
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -98,7 +105,7 @@ IDX_PAD = 8  # INT32 route tile width; route rides a separate window from scale/
 
 # tiling
 PREFILL_INPUT_ID_TILE = 4
-COMBINE_TOKEN_TILE = 4
+COMBINE_TOKEN_TILE = gcd(T, 4)
 
 PREFILL_RECV_TILE = 16
 PREFILL_K_TILE = 512
@@ -113,7 +120,7 @@ PREFILL_W2_ACT_INNER = 1
 PREFILL_MOE_SCALE_PAD = 16
 PREFILL_MOE_EXPERT_SCALE_PAD = 16
 PREFILL_MOE_ROUTE_MAP_PAD = 16
-PREFILL_MOE_FINALIZE_TOKEN_TILE = 16
+PREFILL_MOE_FINALIZE_TOKEN_TILE = gcd(T, 16)
 PREFILL_MOE_GROUPED_EXPERT_TILE = 16
 PREFILL_MOE_ROUTES_PER_SRC = T * TOPK
 PREFILL_MOE_PEER_CAP = PREFILL_MOE_ROUTES_PER_SRC
@@ -130,7 +137,6 @@ PREFILL_REVERSE_ROW_TILE = 1
 # Scalar stores into recv_* land a whole 64-byte line at a time, so an expert
 # row and a token block must each own whole lines.
 assert RECV_MAX % FP32_PER_CACHE_LINE == 0
-assert T % INT64_PER_CACHE_LINE == 0
 
 
 @pl.jit.inline
@@ -1063,13 +1069,12 @@ def prefill_moe_dispatch(
         scale_row = pl.tile.full([1, PREFILL_MOE_SEND_SCALE_PAD], dtype=pl.FP32, value=0.0)
         token_scales = pl.tile.load(token_scales_row, [0, 0], [1, T])
         route_weights = pl.tile.load(weights, [0, 0], [T, 8], valid_shape=[T, TOPK])
-        route_map = pl.tile.load(route_to_packed_out, [0, 0], [PREFILL_MOE_ROUTES_PER_SRC, PREFILL_MOE_ROUTE_MAP_PAD])
         for token in pl.range(pack_block, active_tokens, PREFILL_SOURCE_PACK_BLOCKS):
+            route_map = pl.tile.load(route_to_packed_out, [token * TOPK, 0], [TOPK, PREFILL_MOE_ROUTE_MAP_PAD])
             hidden_row = x_norm_i8[token:token + 1, :]
             token_scale = pl.tile.read(token_scales, [0, token])
             for topk in pl.range(TOPK):
-                route = token * TOPK + topk
-                packed_slot = pl.tile.read(route_map, [route, 0])
+                packed_slot = pl.tile.read(route_map, [topk, 0])
                 packed_row = pl.cast(packed_slot, pl.INDEX)
                 x_send[packed_row:packed_row + 1, :] = hidden_row
                 pl.tile.write(scale_row, [0, 0], token_scale)
@@ -1524,14 +1529,14 @@ def prefill_moe(
             input_id_count = pl.tensor.dim(input_ids, 0)
             input_ids_rows = pl.reshape(input_ids, [input_id_count, 1])
             input_ids_wave_rows = pl.create_tensor([T, 1], dtype=pl.INT64)
-            if wave_rows == T:
+            if wave_rows == T and T % INT64_PER_CACHE_LINE == 0:
                 for token_block in pl.spmd(T // PREFILL_INPUT_ID_TILE, name_hint="prefill_moe_ids_stage"):
                     token0 = token_block * PREFILL_INPUT_ID_TILE
                     local_token = local_wave_base + token0
                     input_id_tile = input_ids_rows[local_token : local_token + PREFILL_INPUT_ID_TILE, 0:1]
                     input_ids_wave_rows[token0 : token0 + PREFILL_INPUT_ID_TILE, 0:1] = input_id_tile
             else:
-                for token_block in pl.spmd(T // INT64_PER_CACHE_LINE, name_hint="prefill_moe_ids_stage_tail"):
+                for token_block in pl.spmd((T + INT64_PER_CACHE_LINE - 1) // INT64_PER_CACHE_LINE, name_hint="prefill_moe_ids_stage_tail"):
                     token_begin = token_block * INT64_PER_CACHE_LINE
                     for token_offset in pl.range(INT64_PER_CACHE_LINE):
                         token = token_begin + token_offset
@@ -1539,7 +1544,8 @@ def prefill_moe(
                         if token < wave_rows:
                             local_token = local_wave_base + token
                             input_id = pl.read(input_ids_rows, [local_token, 0])
-                        pl.write(input_ids_wave_rows, [token, 0], input_id)
+                        if token < T:
+                            pl.write(input_ids_wave_rows, [token, 0], input_id)
             input_ids_wave = pl.reshape(input_ids_wave_rows, [T])
 
             if wave_rows == T:
@@ -2144,9 +2150,6 @@ def _build_tensor_specs(layer_id, num_tokens, routing, fixture_rounds):
 
     if balanced_routing:
         assert layer_id < M.num_hash_layers, "balanced routing requires a hash-routing layer"
-        active_routes = N_RANKS * max(0, min(T, num_tokens)) * TOPK
-        assert active_routes % N_EXPERTS_GLOBAL == 0, \
-            "balanced routing requires the active route count to divide evenly across experts"
 
     x_hc_shape = [N_RANKS, T, HC_MULT, D]
     input_ids_shape = [N_RANKS, T]
@@ -2227,6 +2230,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--token-capacity", type=int, default=MOE_TOKEN_CAPACITY,
+                        help="compiled token capacity per rank; active tokens may be smaller")
     parser.add_argument("--num-tokens", type=int, default=T,
                         help=f"active token count for MoE dispatch/combine (0..{T})")
     parser.add_argument("--routing", type=str, default="uniform", choices=ROUTING_CHOICES,
@@ -2243,6 +2248,9 @@ if __name__ == "__main__":
                         help="runtime log threshold: debug, v0..v9, info, warn, error, null")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    if not 0 <= args.num_tokens <= MOE_TOKEN_CAPACITY:
+        parser.error("--num-tokens must be within --token-capacity")
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"

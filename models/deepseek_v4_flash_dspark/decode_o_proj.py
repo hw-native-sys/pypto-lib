@@ -209,7 +209,9 @@ def _decode_o_proj_tp1_partials(
             col_g = g * O_LORA
             with pl.spmd((t_dim + QUANT_TASK_T_TILE - 1) // QUANT_TASK_T_TILE, name_hint="quant", deps=[pa_tid], allow_early_resolve=True) as q_tid:
                 quant_start = pl.tile.get_block_idx() * QUANT_TASK_T_TILE
-                for qt in pl.pipeline(quant_start, pl.min(quant_start + QUANT_TASK_T_TILE, t_dim), QUANT_TOKEN_TILE, stage=2):
+                quant_end = pl.min(quant_start + QUANT_TASK_T_TILE, t_dim)
+                quant_padded_end = (quant_end + QUANT_TOKEN_TILE - 1) // QUANT_TOKEN_TILE * QUANT_TOKEN_TILE
+                for qt in pl.pipeline(quant_start, quant_padded_end, QUANT_TOKEN_TILE, stage=2):
                     oc_amax = o_r_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA]
                     g_abs = pl.abs(oc_amax)
                     g_row_max = pl.row_max(g_abs)
@@ -227,9 +229,10 @@ def _decode_o_proj_tp1_partials(
                     oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
                     oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
                     o_r_i8_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = oq_i8
-                # Zero the tail of the final active proj_b_mm row tile.
+                # Zero complete quantization tiles after the last active tile.
                 if quant_start + QUANT_TASK_T_TILE >= t_dim:
-                    for zt in pl.range(t_dim, proj_b_padded_rows, QUANT_TOKEN_TILE):
+                    quant_tail = (t_dim + QUANT_TOKEN_TILE - 1) // QUANT_TOKEN_TILE * QUANT_TOKEN_TILE
+                    for zt in pl.range(quant_tail, proj_b_padded_rows, QUANT_TOKEN_TILE):
                         zero_half = pl.full([QUANT_TOKEN_TILE, O_LORA], dtype=pl.FP16, value=0.0)
                         o_r_i8_pad[zt : zt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = pl.cast(
                             zero_half, target_type=pl.INT8, mode="trunc")

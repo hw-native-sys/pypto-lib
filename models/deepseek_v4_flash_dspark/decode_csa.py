@@ -188,7 +188,7 @@ IDX_DEP_COUNT = IDX_LEAF_DEP_SLOT + 1
 CSA_PROJECTION_PACK_ROW_TILE = 8
 CSA_PROJECTION_PACK_WORKERS = 16
 CSA_ALL_VISIBLE_WORKERS = 16
-CSA_WB_TOKEN_TILE = 8
+CSA_WB_TOKEN_TILE = gcd(S, 8)
 TP1_CSA_ROPE_TILE = gcd(4, S)
 TP1_CSA_WB_TOKEN_TILE = gcd(CSA_WB_TOKEN_TILE, S)
 CSA_ROPE_WORKERS = 16
@@ -951,8 +951,8 @@ decode_csa_tp1_test = pl.jit(auto_scope=False)(_decode_csa_tp1)
 
 
 # fixture
-if LOCAL_T < 2 * ROPE_CS_T_TILE:
-    raise ValueError("CSA fixture token capacity must leave one RoPE row tile for subcapacity")
+if LOCAL_T < ROPE_CS_T_TILE:
+    raise ValueError("CSA fixture token capacity must contain one RoPE row tile")
 if LOCAL_T % ROPE_CS_T_TILE != 0:
     raise ValueError("CSA fixture token capacity must align to the RoPE row tile")
 if (LOCAL_T - ROPE_CS_T_TILE) % S != 0:

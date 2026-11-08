@@ -9,6 +9,8 @@
 # ci: devices=2
 """Context-parallel prefill token-row all-gather into rank-major order on every rank."""
 
+from math import gcd
+
 import sys
 
 # runtime configuration
@@ -32,7 +34,7 @@ if TP_SIZE not in _TP_CHOICES:
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from config import FLASH as M
+from config import FLASH as M, MOE_TOKENS, DECODE_SEQ
 
 
 # Dynamic shape variables.
@@ -48,7 +50,7 @@ PREFILL_LOCAL_CAP = PREFILL_GROUP_CAP // TP_SIZE
 
 # tiling
 COMM_ROW_TILE = 8
-READBACK_ROW_TILE = 16
+READBACK_ROW_TILE = gcd(MOE_TOKENS // DECODE_SEQ * (DECODE_SEQ - 1), 16)
 READBACK_WORKERS = 16
 
 # fixture

@@ -43,7 +43,7 @@ ROPE_HEAD_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_HEAD_DIM // 2
 
 # tiling
-B_TILE = 4  # rows per full gather block
+B_TILE = min(B_MAX, 4)  # rows per full gather block
 
 
 @pl.jit.inline
@@ -71,10 +71,16 @@ def rope_interleave(
         # Rows [b_dim, B_MAX) of the scratch stay unwritten; no consumer reads them.
         for il_blk in pl.range(full_b // B_TILE):
             il_b0 = il_blk * B_TILE
-            cos_il[il_b0 : il_b0 + B_TILE, 0:ROPE_HEAD_DIM] = pl.gather(
-                cos_half[il_b0 : il_b0 + B_TILE, 0:HALF_ROPE], dim=-1, index=il_dup_idx)
-            sin_signed[il_b0 : il_b0 + B_TILE, 0:ROPE_HEAD_DIM] = pl.mul(
-                pl.gather(sin_half[il_b0 : il_b0 + B_TILE, 0:HALF_ROPE], dim=-1, index=il_dup_idx), il_sign)
+            valid_rows = pl.min(B_TILE, b_dim - il_b0)
+            cos_rows = pl.slice(cos_half, [B_TILE, HALF_ROPE], [il_b0, 0], valid_shape=[valid_rows, HALF_ROPE])
+            sin_rows = pl.slice(sin_half, [B_TILE, HALF_ROPE], [il_b0, 0], valid_shape=[valid_rows, HALF_ROPE])
+            cos_gathered = pl.gather(cos_rows, dim=-1, index=il_dup_idx)
+            sin_gathered = pl.gather(sin_rows, dim=-1, index=il_dup_idx)
+            sin_values = pl.mul(sin_gathered, il_sign)
+            cos_valid = pl.set_validshape(cos_gathered, valid_rows, ROPE_HEAD_DIM)
+            sin_valid = pl.set_validshape(sin_values, valid_rows, ROPE_HEAD_DIM)
+            cos_il = pl.assemble(cos_il, cos_valid, [il_b0, 0])
+            sin_signed = pl.assemble(sin_signed, sin_valid, [il_b0, 0])
         for il_b in pl.range(full_b, b_dim):
             cos_il[il_b : il_b + 1, 0:ROPE_HEAD_DIM] = pl.gather(
                 cos_half[il_b : il_b + 1, 0:HALF_ROPE], dim=-1, index=il_dup_idx[0:1, :])

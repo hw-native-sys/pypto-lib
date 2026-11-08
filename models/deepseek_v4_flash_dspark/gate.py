@@ -31,7 +31,7 @@ N_HASH_LAYERS = M.num_hash_layers
 # tiling
 NORM_TOKEN_TILE = 4
 GATE_T_TILE = 8
-GATE_M_TILE = min(64, T)  # Fully initialized token tiles at every supported TP.
+GATE_M_TILE = min(64, ((T + GATE_T_TILE - 1) // GATE_T_TILE) * GATE_T_TILE)  # Fully initialized token tiles at every supported TP.
 GATE_N_TILE = 32        # expert columns per gate spmd block
 assert N_EXPERTS % GATE_N_TILE == 0
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
@@ -93,7 +93,8 @@ def _gate(
     for xg_block in pl.spmd(norm_blocks, name_hint="ffn_xg", allow_early_resolve=True):
         xg_tok0 = xg_block * NORM_TOKEN_TILE
         xg_prod_w = pl.cast(pl.tile.load(norm_w_2d, [0, 0], [1, D]), pl.FP32)
-        xg_prod_input = pl.tile.load(x_mixed, [xg_tok0, 0], [NORM_TOKEN_TILE, D])
+        xg_prod_input = pl.tile.load(x_mixed, [xg_tok0, 0], [NORM_TOKEN_TILE, D], valid_shape=[pl.min(NORM_TOKEN_TILE, T - xg_tok0), D])
+        xg_prod_input = pl.fillpad(xg_prod_input, pad_value=pl.PadValue.zero)
         xg_prod_x = pl.cast(xg_prod_input, pl.FP32)
         xg_prod = pl.col_expand_mul(xg_prod_x, xg_prod_w)
         pl.tile.store(xg_prod, [xg_tok0, 0], xg_buf, shapes=[NORM_TOKEN_TILE, D])

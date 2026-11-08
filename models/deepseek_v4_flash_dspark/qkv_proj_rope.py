@@ -1394,6 +1394,7 @@ if __name__ == "__main__":
 
     MODES = {
         "decode": (DECODE_BATCH // TP, DECODE_SEQ),
+        "decode_tail": (1, 6),
         "prefill": (PREFILL_BATCH, PREFILL_SEQ),
     }
 
@@ -1403,9 +1404,9 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument(
         "--mode",
-        choices=["decode", "prefill", "split", "all"],
+        choices=["decode", "decode_tail", "prefill", "split", "all"],
         default="all",
-        help="decode / prefill batch sizes, 'split' for mismatched q and kv rows, or 'all'.",
+        help="decode / prefill shapes, 'decode_tail' for six rows, 'split' for mismatched q and kv rows, or 'all'.",
     )
     parser.add_argument(
         "--enable-chip-swimlane",
