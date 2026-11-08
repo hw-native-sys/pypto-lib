@@ -1055,7 +1055,7 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
 
 
 def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
-    from utils import int8_quant_per_row, pack_nz
+    from utils import checkpoint_ends_tensor, int8_quant_per_row, pack_nz
     import torch
     from golden import TensorSpec
     from utils import token_local_rope
@@ -1236,11 +1236,12 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     )
     wq_b_i8 = wq_b_i8_T.t().contiguous()
     qr_i8, qr_scale = int8_quant_per_row(torch.rand(token_count, Q_LORA))
+    checkpoint_tensor = checkpoint_ends_tensor([0], starts=[start_pos], lengths=[token_count])
 
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
-        TensorSpec("state_checkpoint_ends", [1, 3], torch.int32, init_value=torch.zeros((1, 3), dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", list(checkpoint_tensor.shape), torch.int32, init_value=checkpoint_tensor),
         TensorSpec("qr", [token_count, Q_LORA], torch.int8, init_value=lambda: qr_i8),
         TensorSpec("qr_scale", [token_count, 1], torch.float32, init_value=lambda: qr_scale),
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
