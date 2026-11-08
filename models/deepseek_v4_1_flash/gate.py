@@ -47,6 +47,11 @@ assert D % QUANT_TASK_TILE == 0
 MX_GROUP = 32
 MX_SCALE_GROUPS = D // MX_GROUP
 SCORE_PAD = 32 if N_EXPERTS <= 32 else 256 if N_EXPERTS <= 256 else 384
+QUANT_WORKER_TILE = 24 if T > 80 else 64
+CAST_WORKER_TILE = 8 if T > 80 else 64
+WEIGHT_WORKER_TILE = 4 if T > 80 else 64
+NORMALIZED_WORKER_TILE = 16 if T > 80 else 64
+ROUTE_WORKER_TILE = 24 if T > 80 else 64
 TOPK_PAD = 8
 SORT_PAD = TOPK_PAD * 2
 
@@ -194,13 +199,15 @@ def gate_normalized(
         active_tokens = pl.cast(T, pl.INDEX)
 
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
-    for block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="gate_normalized_input"):
-        t0 = block * GATE_INPUT_TILE
-        valid_rows = pl.min(GATE_INPUT_TILE, pl.max(active_tokens - t0, 0))
-        normalized = pl.slice(x_normed, [GATE_INPUT_TILE, D], [t0, 0], valid_shape=[valid_rows, D])
-        normalized = pl.fillpad(normalized, pad_value=pl.PadValue.zero)
-        normalized = pl.set_validshape(normalized, GATE_INPUT_TILE, D)
-        xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = normalized
+    input_workers = pl.min(T_PAD // GATE_INPUT_TILE, NORMALIZED_WORKER_TILE)
+    for worker in pl.spmd(input_workers, name_hint="gate_normalized_input"):
+        for block in pl.range(worker, T_PAD // GATE_INPUT_TILE, input_workers):
+            t0 = block * GATE_INPUT_TILE
+            valid_rows = pl.min(GATE_INPUT_TILE, pl.max(active_tokens - t0, 0))
+            normalized = pl.slice(x_normed, [GATE_INPUT_TILE, D], [t0, 0], valid_shape=[valid_rows, D])
+            normalized = pl.fillpad(normalized, pad_value=pl.PadValue.zero)
+            normalized = pl.set_validshape(normalized, GATE_INPUT_TILE, D)
+            xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = normalized
 
     return gate_from_bf16(
         xg_buf, gate_w, gate_bias, num_tokens,
@@ -229,20 +236,26 @@ def gate_from_bf16(
     task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
     task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
-    with pl.spmd((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), name_hint="x_norm_mx_quant"):
+    with pl.spmd(pl.min((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), QUANT_WORKER_TILE), name_hint="x_norm_mx_quant"):
         x_norm_mx, x_norm_scale = _gate_quant_vf(xg_buf, x_norm_mx, x_norm_scale)
 
     router_input = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
     router_weight = pl.create_tensor([n_experts, D], dtype=pl.FP32)
-    for block in pl.spmd(T_PAD // GATE_CAST_TILE, name_hint="gate_projection_input"):
-        row = block * GATE_CAST_TILE
-        input_value = pl.load(xg_buf, [row, 0], [GATE_CAST_TILE, D])
-        router_input = pl.store(pl.cast(input_value, pl.FP32), [row, 0], router_input)
-    for block in pl.spmd((n_experts + GATE_CAST_TILE - 1) // GATE_CAST_TILE, name_hint="gate_projection_weight"):
-        row = block * GATE_CAST_TILE
-        valid_rows = pl.min(GATE_CAST_TILE, n_experts - row)
-        weight_value = pl.load(gate_w, [row, 0], [GATE_CAST_TILE, D], valid_shape=[valid_rows, D])
-        router_weight = pl.store(pl.cast(weight_value, pl.FP32), [row, 0], router_weight)
+    cast_blocks = T_PAD // GATE_CAST_TILE
+    cast_workers = pl.min(cast_blocks, CAST_WORKER_TILE)
+    for worker in pl.spmd(cast_workers, name_hint="gate_projection_input"):
+        for block in pl.range(worker, cast_blocks, cast_workers):
+            row = block * GATE_CAST_TILE
+            input_value = pl.load(xg_buf, [row, 0], [GATE_CAST_TILE, D])
+            router_input = pl.store(pl.cast(input_value, pl.FP32), [row, 0], router_input)
+    weight_blocks = (n_experts + GATE_CAST_TILE - 1) // GATE_CAST_TILE
+    weight_workers = pl.min(weight_blocks, WEIGHT_WORKER_TILE)
+    for worker in pl.spmd(weight_workers, name_hint="gate_projection_weight"):
+        for block in pl.range(worker, weight_blocks, weight_workers):
+            row = block * GATE_CAST_TILE
+            valid_rows = pl.min(GATE_CAST_TILE, n_experts - row)
+            weight_value = pl.load(gate_w, [row, 0], [GATE_CAST_TILE, D], valid_shape=[valid_rows, D])
+            router_weight = pl.store(pl.cast(weight_value, pl.FP32), [row, 0], router_weight)
 
     biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     with pl.spmd(1, name_hint="gate_pre_route"):
@@ -266,7 +279,7 @@ def gate_from_bf16(
     # The native route publisher stores six columns; odd Top-K uses aligned DSL tasks.
     if topk == 6:
         task_route_tiles = (task_tokens + GATE_T_TILE - 1) // GATE_T_TILE
-        with pl.spmd(pl.max(task_route_tiles, 1), name_hint="route_sort"):
+        with pl.spmd(pl.max(pl.min(task_route_tiles, ROUTE_WORKER_TILE), 1), name_hint="route_sort"):
             indices, weights = _gate_route_sort_vf(
                 biased_scores_buf, route_scores_buf, indices, weights, active_tokens, ROUTE_SCALE, topk,
             )

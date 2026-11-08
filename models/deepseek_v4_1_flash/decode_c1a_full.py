@@ -97,23 +97,24 @@ def decode_c1a_full(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn, hf32=True)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    x_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm)
+    x_ready = hc_head_norm(x_hc, pre_mix, attn_norm_weight, x_norm, worker_limit=64)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales = quantize_projection_input(x_norm, num_tokens)
+    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens)
     qr, query, qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
         wq_b, wq_b_scale,
         rope_cos, rope_sin,
         qr, query,
-        num_tokens,
+        num_tokens, qa_worker_limit=32, qb_worker_limit=32,
+        padded_rows=proj_payload_padded_rows,
     )
-    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens)
+    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=32)
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache, window_cache_scale,
@@ -161,7 +162,7 @@ def decode_c1a_full(
         attn_sink, attended, num_tokens, selection_ready, compressed_keys=INDEX_TOPK,
     )
     o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out, num_tokens,
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out, num_tokens, worker_limit=32,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
@@ -363,7 +364,7 @@ def golden_c1a(tensors, mode="full"):
     a = dict(tensors)
     x_hc = a["x_hc"]
     next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
-        x_hc, a["hc_attn_fn"], a["hc_attn_scale"], a["hc_attn_base"], hf32=True,
+        x_hc, a["hc_attn_fn"], a["hc_attn_scale"], a["hc_attn_base"],
     )
     attention_input = golden_hc_collapse(x_hc, a["pre_mix"]).to(torch.bfloat16)
     x = golden_rms_norm(attention_input, a["attn_norm_weight"])

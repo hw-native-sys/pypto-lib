@@ -102,7 +102,7 @@ __aicore__ inline void compute_qb(FullA& am, MatB& bm, AS<1280>& sa, ScaleB& sb,
 }
 
 template <int N, int WORKERS = (N / 256 < 32 ? N / 256 : 32), bool OFFSET_INPUT = false, bool FUSED_ROPE = false>
-__aicore__ inline void project_qb(__gm__ int64_t* args) {
+__aicore__ inline void project_qb(__gm__ int64_t* args, int row_offset = 0, int tile_rows = -1, int lane = -1, int lane_count = 0) {
     // Preserve constant loop bounds for full-width launches.
     if constexpr (WORKERS > 0) {
         if (get_block_num(args) != WORKERS) {
@@ -111,20 +111,20 @@ __aicore__ inline void project_qb(__gm__ int64_t* args) {
         }
     }
     // Runtime ABI groups Tensor descriptors before scalar arguments.
-    const int rows = args[FUSED_ROPE ? 7 : 5];
-    const int row_start = args[FUSED_ROPE ? 9 : 7];
+    const int rows = tile_rows < 0 ? args[FUSED_ROPE ? 7 : 5] : tile_rows;
+    const int row_start = args[FUSED_ROPE ? 9 : 7] + row_offset;
     QBRopeTransfer<FUSED_ROPE> rope_transfer;
-    int block = get_block_idx(args);
+    int block = lane < 0 ? get_block_idx(args) : lane;
     int workers = WORKERS;
     int waves;
     if constexpr (WORKERS > 0) {
         waves = N / (256 * WORKERS);
     } else {
-        workers = get_block_num(args);
+        workers = lane_count > 0 ? lane_count : get_block_num(args);
         waves = (N / 256 - block + workers - 1) / workers;
     }
-    int input_row = 0;
-    if constexpr (OFFSET_INPUT) input_row = args[8];
+    int input_row = row_offset;
+    if constexpr (OFFSET_INPUT) input_row += args[8];
     FullA am;
     AS<1280> sa;
     TASSIGN(am, 0);
@@ -259,12 +259,12 @@ __tf__ __aicore__ inline void qb_rotate_tail(
 #endif
 }
 
-__aicore__ inline void project_qb_rope(__gm__ int64_t* args) {
-    int block = get_block_idx(args);
-    int workers = get_block_num(args);
+__aicore__ inline void project_qb_rope(__gm__ int64_t* args, int row_offset = 0, int tile_rows = -1, int lane = -1, int lane_count = 0) {
+    int block = lane < 0 ? get_block_idx(args) : lane;
+    int workers = lane_count > 0 ? lane_count : get_block_num(args);
     int width = args[8];
     int waves = (width / 256 - block + workers - 1) / workers;
-    int rows = args[7];
+    int rows = tile_rows < 0 ? args[7] : tile_rows;
     bool have_tail = false;
     for (int wave = 0; wave < waves; ++wave) {
         if (((wave * workers + block) & 1) != 0) have_tail = true;
@@ -286,9 +286,9 @@ __aicore__ inline void project_qb_rope(__gm__ int64_t* args) {
         Tile<TileType::Vec, float, 80, 32, BLayout::RowMajor, DYNAMIC, 32> c(rows), s(rows);
         TASSIGN(c, 40960);
         TASSIGN(s, 51200);
-        GlobalTensor<float, Shape, Stride> cg(data<float>(args, 5) + args[9] * cos_tensor->strides[0],
+        GlobalTensor<float, Shape, Stride> cg(data<float>(args, 5) + (args[9] + row_offset) * cos_tensor->strides[0],
             Shape(rows, 32), Stride(rows, cos_tensor->strides[0]));
-        GlobalTensor<float, Shape, Stride> sg(data<float>(args, 6) + args[9] * sin_tensor->strides[0],
+        GlobalTensor<float, Shape, Stride> sg(data<float>(args, 6) + (args[9] + row_offset) * sin_tensor->strides[0],
             Shape(rows, 32), Stride(rows, sin_tensor->strides[0]));
         TLOAD(c, cg);
         TLOAD(s, sg);
@@ -326,7 +326,7 @@ __aicore__ inline void project_qb_rope(__gm__ int64_t* args) {
             using Stride = BaseShape2D<bfloat16_t, DYNAMIC, DYNAMIC>;
             Tile<TileType::Vec, bfloat16_t, 80, 64, BLayout::RowMajor, DYNAMIC, 64> active_result(rows);
             TASSIGN(active_result, 61440);
-            GlobalTensor<bfloat16_t, Shape, Stride> output(data<bfloat16_t>(args, 4) + args[9] * width + n + 192,
+            GlobalTensor<bfloat16_t, Shape, Stride> output(data<bfloat16_t>(args, 4) + (args[9] + row_offset) * width + n + 192,
                 Shape(rows, 64), Stride(rows, width));
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);

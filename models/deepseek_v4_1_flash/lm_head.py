@@ -548,7 +548,7 @@ def _final_output(
     x_hc.bind_dynamic(0, T_DYN)
     rows = pl.tensor.dim(x_hc, 0)
     collapsed = pl.create_tensor([rows, D], dtype=pl.BF16)
-    hc_head(x_hc, pre_mix, collapsed)
+    hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
     normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
     for norm_block in pl.spmd((rows + 7) // 8, name_hint="final_rms_norm"):
         rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, norm_block, rows)

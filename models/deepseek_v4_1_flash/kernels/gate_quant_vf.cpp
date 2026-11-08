@@ -96,9 +96,9 @@ __tf__ __aicore__ inline void quantize(
     }
 }
 
-__aicore__ inline void run_native(__gm__ int64_t* args) {
+__aicore__ inline void run_native(__gm__ int64_t* args, int block) {
     int width = reinterpret_cast<__gm__ Tensor*>(args[0])->shapes[1];
-    int chunks = width / Columns, block = get_block_idx(args);
+    int chunks = width / Columns;
     int first = block / chunks * Rows, column = block % chunks * Columns;
     Input input;
     Payload payload;
@@ -124,9 +124,9 @@ __aicore__ inline void run_native(__gm__ int64_t* args) {
 #endif
 
 #if defined(__DAV_VEC__) && !defined(PTO_NPU_ARCH_A5)
-__aicore__ inline void run_tiles(__gm__ int64_t* args) {
+__aicore__ inline void run_tiles(__gm__ int64_t* args, int block) {
     int width = reinterpret_cast<__gm__ Tensor*>(args[0])->shapes[1];
-    int chunks = width / Columns, block = get_block_idx(args);
+    int chunks = width / Columns;
     int first = block / chunks * Rows, column = block % chunks * Columns;
     using Chunk = Vec<float, Rows, 256>;
     using Groups = Vec<float, 128, 32>;
@@ -195,10 +195,14 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if !defined(__CPU_SIM)
     set_atomic_none(); set_mask_norm(); set_vector_mask(-1, -1);
 #endif
+    auto input = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    int tasks = input->shapes[0] / Rows * (input->shapes[1] / Columns);
+    for (int block = get_block_idx(args); block < tasks; block += get_block_num(args)) {
 #if defined(PTO_NPU_ARCH_A5)
-    run_native(args);
+        run_native(args, block);
 #else
-    run_tiles(args);
+        run_tiles(args, block);
 #endif
+    }
 #endif
 }

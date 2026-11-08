@@ -14,9 +14,17 @@ using namespace mxfp8_projection;
 template <int K>
 __aicore__ inline void project_ob(__gm__ int64_t* args) {
     constexpr int N_TILE = K == 8192 ? 160 : 256;
-    project<K, 5120, N_TILE>(
-        data<F>(args, 0), data<F>(args, 1), data<S>(args, 2), data<S>(args, 3),
-        data<bfloat16_t>(args, 4), args[5], 5120, get_block_idx(args) * N_TILE);
+    constexpr int COLUMNS = 5120 / N_TILE;
+    const int tasks = (args[5] + 79) / 80 * COLUMNS;
+    for (int task = get_block_idx(args); task < tasks; task += get_block_num(args)) {
+        const int row = task / COLUMNS * 80;
+        const int n = task % COLUMNS * N_TILE;
+        const int rows = args[5] - row < 80 ? args[5] - row : 80;
+        project<K, 5120, N_TILE>(
+            data<F>(args, 0) + row * K, data<F>(args, 1),
+            data<S>(args, 2) + row * (K / 32), data<S>(args, 3),
+            data<bfloat16_t>(args, 4) + row * 5120, rows, 5120, n);
+    }
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {

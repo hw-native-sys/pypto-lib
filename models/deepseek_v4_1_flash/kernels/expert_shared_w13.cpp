@@ -23,13 +23,16 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     const int rows = static_cast<int>(args[7]);
     const int block = get_block_idx(args);
     const int blocks = get_block_num(args);
-    for (int work = block; work < 2 * NTILES; work += blocks) {
-        const int projection = work / NTILES;
+    const int tasks = (rows + 79) / 80 * 2 * NTILES;
+    for (int work = block; work < tasks; work += blocks) {
+        const int row = work / (2 * NTILES) * 80;
+        const int projection = work / NTILES % 2;
         const int n = work % NTILES * NT;
+        const int active = rows - row < 80 ? rows - row : 80;
         __gm__ F* weight = data<F>(args, projection ? 4 : 2);
         __gm__ S* weight_scale = data<S>(args, projection ? 5 : 3);
-        __gm__ bfloat16_t* output = data<bfloat16_t>(args, 6) + projection * MOE_INTER;
+        __gm__ bfloat16_t* output = data<bfloat16_t>(args, 6) + row * N_OUT + projection * MOE_INTER;
         project<D, MOE_INTER, NT>(
-            data<F>(args, 0), weight, data<S>(args, 1), weight_scale, output, rows, N_OUT, n);
+            data<F>(args, 0) + row * D, weight, data<S>(args, 1) + row * (D / 32), weight_scale, output, active, N_OUT, n);
     }
 }

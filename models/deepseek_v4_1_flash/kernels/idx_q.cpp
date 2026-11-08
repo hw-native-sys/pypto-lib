@@ -202,9 +202,8 @@ __aicore__ inline void multiply(FullA& am, FullB& bm, ScaleA& sa, ScaleB& sb, Ac
     set_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(slot));
 }
 
-__aicore__ inline void project(__gm__ int64_t* args) {
+__aicore__ inline void project(__gm__ int64_t* args, int block) {
     using namespace mxfp8_projection;
-    int block = get_block_idx(args);
 #if defined(__CPU_SIM)
     SimPipe pipe(nullptr, 0, 0);
 #endif
@@ -273,8 +272,7 @@ __aicore__ inline void project(__gm__ int64_t* args) {
 
 #if defined(__DAV_VEC__)
 namespace {
-__aicore__ inline void finish(__gm__ int64_t* args) {
-    int block = get_block_idx(args);
+__aicore__ inline void finish(__gm__ int64_t* args, int block) {
     int sub = get_subblockid();
 #if defined(__CPU_SIM)
     SimPipe pipe(nullptr, 0, 0);
@@ -363,8 +361,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #endif
 #endif
 #if defined(__DAV_CUBE__)
-    project(args);
+    for (int block = get_block_idx(args); block < 16; block += get_block_num(args)) {
+        project(args, block);
+    }
 #else
-    finish(args);
+    for (int block = get_block_idx(args); block < 16; block += get_block_num(args)) {
+        finish(args, block);
+    }
 #endif
 }

@@ -34,7 +34,6 @@ C1A_PROJ_M_TILE = 48
 C1A_PROJ_N_TILE = 64
 C1A_PROJ_K_TILE = 512
 C2A_PROJ_M_TILE = 80
-C2A_PROJ_N_TILE = 64
 C2A_PROJ_K_TILE = 256
 
 
@@ -50,24 +49,27 @@ def c1a_compressor_project(
 ):
     """Project NZ weights with full-height Cube tiles and store active rows."""
     blocks = (num_tokens + m_tile - 1) // m_tile * (HEAD_DIM // n_tile)
-    workers = pl.max(blocks, 1)
+    workers = pl.max(pl.min(blocks, 8), 1)
     with pl.spmd(workers, name_hint="proj_cmp", deps=[ready]) as completed:
         with pl.at(level=pl.Level.CORE_GROUP):
-            block = pl.tile.get_block_idx()
-            row = block // (HEAD_DIM // n_tile) * m_tile
-            col = block % (HEAD_DIM // n_tile) * n_tile
-            rows = pl.max(pl.min(m_tile, num_tokens - row), 0)
-            a = pl.load(source, [row, 0], [m_tile, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
-            b = pl.load(weight, [0, col], [C1A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
-            full_a = pl.set_validshape(a, m_tile, C1A_PROJ_K_TILE)
-            acc = pl.matmul(full_a, b)
-            for k in pl.pipeline(C1A_PROJ_K_TILE, D, C1A_PROJ_K_TILE, stage=2):
-                a = pl.load(source, [row, k], [m_tile, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
-                b = pl.load(weight, [k, col], [C1A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+            worker = pl.tile.get_block_idx()
+            col = worker % (HEAD_DIM // n_tile) * n_tile
+            row_workers = pl.max(workers // (HEAD_DIM // n_tile), 1)
+            row_blocks = (num_tokens + m_tile - 1) // m_tile
+            for row_block in pl.range(worker // (HEAD_DIM // n_tile), row_blocks, row_workers):
+                row = row_block * m_tile
+                rows = pl.max(pl.min(m_tile, num_tokens - row), 0)
+                a = pl.load(source, [row, 0], [m_tile, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                b = pl.load(weight, [0, col], [C1A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
                 full_a = pl.set_validshape(a, m_tile, C1A_PROJ_K_TILE)
-                acc = pl.matmul_acc(acc, full_a, b)
-            value = pl.set_validshape(acc, rows, n_tile)
-            output = pl.store(value, [row, col], output)
+                acc = pl.matmul(full_a, b)
+                for k in pl.pipeline(C1A_PROJ_K_TILE, D, C1A_PROJ_K_TILE, stage=2):
+                    a = pl.load(source, [row, k], [m_tile, C1A_PROJ_K_TILE], valid_shape=[rows, C1A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+                    b = pl.load(weight, [k, col], [C1A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+                    full_a = pl.set_validshape(a, m_tile, C1A_PROJ_K_TILE)
+                    acc = pl.matmul_acc(acc, full_a, b)
+                value = pl.set_validshape(acc, rows, n_tile)
+                output = pl.store(value, [row, col], output)
     return output, completed
 
 
@@ -118,17 +120,18 @@ def _c2a_compressor_project_tile(
     row: pl.Scalar[pl.INDEX],
     col: pl.Scalar[pl.INDEX],
     rows: pl.Scalar[pl.INDEX],
+    n_tile: pl.constexpr,
 ):
     a = pl.load(x, [row, 0], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE], valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
-    b = pl.load(weight, [0, col], [C2A_PROJ_K_TILE, C2A_PROJ_N_TILE], target_memory=pl.Mem.Mat)
+    b = pl.load(weight, [0, col], [C2A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
     a_full = pl.set_validshape(a, C2A_PROJ_M_TILE, C2A_PROJ_K_TILE)
     acc = pl.matmul(a_full, b)
     for k in pl.pipeline(C2A_PROJ_K_TILE, D, C2A_PROJ_K_TILE, stage=2):
         a = pl.load(x, [row, k], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE], valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
-        b = pl.load(weight, [k, col], [C2A_PROJ_K_TILE, C2A_PROJ_N_TILE], target_memory=pl.Mem.Mat)
+        b = pl.load(weight, [k, col], [C2A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
         a_full = pl.set_validshape(a, C2A_PROJ_M_TILE, C2A_PROJ_K_TILE)
         acc = pl.matmul_acc(acc, a_full, b)
-    value = pl.set_validshape(acc, rows, C2A_PROJ_N_TILE)
+    value = pl.set_validshape(acc, rows, n_tile)
     output = pl.store(value, [row, col], output)
     return output
 
@@ -141,19 +144,24 @@ def c2a_compressor_project(
     kv_out: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
     score_out: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
+    n_tile: pl.constexpr,
 ):
     """Project KV and gate with NZ BF16 weights and FP32 Cube output."""
-    blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE * (2 * HEAD_DIM // C2A_PROJ_N_TILE)
-    with pl.spmd(pl.max(blocks, 1), name_hint="proj_cmp"):
+    blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE * (2 * HEAD_DIM // n_tile)
+    workers = pl.max(pl.min(blocks, 16), 1)
+    with pl.spmd(workers, name_hint="proj_cmp"):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_cmp"):
-            block = pl.tile.get_block_idx()
-            row = block // (2 * HEAD_DIM // C2A_PROJ_N_TILE) * C2A_PROJ_M_TILE
-            col = block % (HEAD_DIM // C2A_PROJ_N_TILE) * C2A_PROJ_N_TILE
-            rows = pl.max(pl.min(C2A_PROJ_M_TILE, num_tokens - row), 0)
-            if block % (2 * HEAD_DIM // C2A_PROJ_N_TILE) < HEAD_DIM // C2A_PROJ_N_TILE:
-                kv_out = _c2a_compressor_project_tile(x, wkv, kv_out, row, col, rows)
-            else:
-                score_out = _c2a_compressor_project_tile(x, wgate, score_out, row, col, rows)
+            worker = pl.tile.get_block_idx()
+            col = worker % (HEAD_DIM // n_tile) * n_tile
+            row_blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE
+            row_workers = pl.max(workers // (2 * HEAD_DIM // n_tile), 1)
+            for row_block in pl.range(worker // (2 * HEAD_DIM // n_tile), row_blocks, row_workers):
+                row = row_block * C2A_PROJ_M_TILE
+                rows = pl.min(C2A_PROJ_M_TILE, num_tokens - row)
+                if worker % (2 * HEAD_DIM // n_tile) < HEAD_DIM // n_tile:
+                    kv_out = _c2a_compressor_project_tile(x, wkv, kv_out, row, col, rows, n_tile)
+                else:
+                    score_out = _c2a_compressor_project_tile(x, wgate, score_out, row, col, rows, n_tile)
     return kv_out, score_out
 
 

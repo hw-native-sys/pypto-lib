@@ -465,7 +465,7 @@ def golden_moe_sublayer(tensors, x_hc_mid, attn_pre_mix, tokens):
     for base in range(0, world, TP_SIZE):
         mid = x_hc_mid[base]
         pre, post, comb = golden_mhc_mixes(
-            mid, tensors["hc_ffn_fn"][base], tensors["hc_ffn_scale"][base], tensors["hc_ffn_base"][base]
+            mid, tensors["hc_ffn_fn"][base], tensors["hc_ffn_scale"][base], tensors["hc_ffn_base"][base],
         )
         hidden = golden_hc_collapse(mid, attn_pre_mix[base]).to(torch.bfloat16)
         for rank in range(base, base + TP_SIZE):
@@ -540,7 +540,7 @@ def make_layer_golden(mode):
             ranks = range(base, base + TP_SIZE)
             x_hc = tensors["x_hc"][base]
             pre, post, comb = golden_mhc_mixes(
-                x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
+                x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base],
             )
             collapsed = golden_hc_collapse(x_hc, tensors["pre_mix"][base]).to(torch.bfloat16)
             x = golden_rms_norm(collapsed, tensors["attn_norm_weight"][base])

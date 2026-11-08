@@ -221,13 +221,16 @@ def decode_encoder(
     c2a_rope_sin = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
     materialize_rope_rows(
         freqs_cos[0], freqs_sin[0], position_ids, attention_count, base_rope_cos, base_rope_sin, False,
+        worker_limit=32,
     )
     materialize_rope_rows(
         freqs_cos[1], freqs_sin[1], position_ids, attention_count,
         compressed_token_rope_cos, compressed_token_rope_sin, False,
+        worker_limit=32,
     )
     materialize_rope_rows(
         freqs_cos[1], freqs_sin[1], position_ids, attention_count, c2a_rope_cos, c2a_rope_sin, True,
+        worker_limit=32,
     )
     c2a_compressed_lens = pl.create_tensor([global_tokens], dtype=pl.INT32)
     prepare_compressed_lens(position_ids, c2a_compressed_lens, 1)

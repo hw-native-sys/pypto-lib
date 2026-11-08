@@ -99,11 +99,10 @@ __tf__ __aicore__ inline void normalize_quantize(
 }
 #endif
 }
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+__aicore__ inline void normalize_chunk(__gm__ int64_t* args, int first, int rows) {
 #if defined(__DAV_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
-    int rows = args[5];
     Input input(rows);
     Vec<bfloat16_t, 16, 1280> normalized;
     Vec<bfloat16_t, 1, 1280> weight;
@@ -117,7 +116,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     using Shape = TileShape2D<bfloat16_t, DYNAMIC, 1280>;
     using Stride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
     if (rows > 0) {
-        GlobalTensor<bfloat16_t, Shape, Stride> source(data<bfloat16_t>(args, 0),
+        GlobalTensor<bfloat16_t, Shape, Stride> source(data<bfloat16_t>(args, 0) + first * stride(args, 0),
             Shape(rows, 1280), Stride(1, 1, 1, stride(args, 0), 1));
         GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, 1, 1280>, BaseShape2D<bfloat16_t, 1, 1280>> gamma(
             data<bfloat16_t>(args, 1));
@@ -135,14 +134,26 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     if (rows > 0) {
         Input active_normalized(rows);
         TASSIGN(active_normalized, 40960);
-        GlobalTensor<bfloat16_t, Shape, Stride> latent(data<bfloat16_t>(args, 2),
+        GlobalTensor<bfloat16_t, Shape, Stride> latent(data<bfloat16_t>(args, 2) + first * stride(args, 2),
             Shape(rows, 1280), Stride(1, 1, 1, stride(args, 2), 1));
         TSTORE(latent, active_normalized);
     }
-    GlobalTensor<uint8_t, TileShape2D<uint8_t, 16, 1280>, BaseShape2D<uint8_t, 16, 1280>> target(data<uint8_t>(args, 3));
-    GlobalTensor<uint8_t, TileShape2D<uint8_t, 1, 640>, BaseShape2D<uint8_t, 1, 640>> scale_target(data<uint8_t>(args, 4));
+    GlobalTensor<uint8_t, TileShape2D<uint8_t, 16, 1280>, BaseShape2D<uint8_t, 16, 1280>> target(data<uint8_t>(args, 3) + first * 1280);
+    GlobalTensor<uint8_t, TileShape2D<uint8_t, 1, 640>, BaseShape2D<uint8_t, 1, 640>> scale_target(data<uint8_t>(args, 4) + first * 40);
     TSTORE(target, output);
     TSTORE(scale_target, scales);
     pipe_barrier(PIPE_ALL);
+#endif
+}
+
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+#if defined(__DAV_VEC__)
+    int active = args[5];
+    const int capacity = reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[0];
+    for (int first = get_block_idx(args) * 16; first < capacity; first += get_block_num(args) * 16) {
+        int rows = active - first;
+        rows = rows < 0 ? 0 : (rows > 16 ? 16 : rows);
+        normalize_chunk(args, first, rows);
+    }
 #endif
 }

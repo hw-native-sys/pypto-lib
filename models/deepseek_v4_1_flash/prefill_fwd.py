@@ -415,15 +415,19 @@ def l2_prefill_fwd(
     decoder_count = pl.read(counts, [1])
     materialize_rope_rows(
         freqs_cos[0], freqs_sin[0], position_ids[0], encoder_count, rope_cos[0], rope_sin[0], False,
+        worker_limit=32,
     )
     materialize_rope_rows(
         freqs_cos[1], freqs_sin[1], position_ids[0], encoder_count, rope_cos[1], rope_sin[1], False,
+        worker_limit=32,
     )
     materialize_rope_rows(
         freqs_cos[1], freqs_sin[1], position_ids[1], decoder_count, rope_cos[2], rope_sin[2], False,
+        worker_limit=32,
     )
     materialize_rope_rows(
         freqs_cos[1], freqs_sin[1], position_ids[0], encoder_count, compressed_cos, compressed_sin, True,
+        worker_limit=32,
     )
     c2a_compressed_lens = pl.create_tensor([CAPACITY], dtype=pl.INT32)
     c1a_compressed_lens = pl.create_tensor([CAPACITY], dtype=pl.INT32)
@@ -516,13 +520,16 @@ def l2_prefill_fwd(
                 encoder_pre = pl.slice(pre_pair, [CAPACITY, HC_MULT], [0, 0])
                 encoder_collapsed = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
                 encoder_normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-                hc_head(encoder_hidden, encoder_pre, encoder_collapsed)
+                hc_head(encoder_hidden, encoder_pre, encoder_collapsed, worker_limit=64)
                 norm_tokens = pl.tensor.dim(encoder_collapsed, 0)
-                for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-                    rms_norm_tiled(
-                        encoder_collapsed, layer_attn_norm, encoder_normalized, norm_block, norm_tokens,
-                        output_fp32=False,
-                    )
+                norm_block_blocks = (norm_tokens + 7) // 8
+                norm_block_workers = pl.min(norm_block_blocks, 64)
+                for norm_block_worker in pl.spmd(norm_block_workers, name_hint="rms_norm"):
+                    for norm_block in pl.range(norm_block_worker, norm_block_blocks, norm_block_workers):
+                        rms_norm_tiled(
+                            encoder_collapsed, layer_attn_norm, encoder_normalized, norm_block, norm_tokens,
+                            output_fp32=False,
+                        )
                 publisher_ready = prefill_publish_decoder(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
@@ -551,7 +558,7 @@ def l2_prefill_fwd(
                 zeros = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
                 for row in pl.range(worker, CAPACITY, 32):
                     pl.store(zeros, [row, 0], attn_output)
-            hc_head_norm(hidden, delayed_pre, layer_attn_norm, normalized)
+            hc_head_norm(hidden, delayed_pre, layer_attn_norm, normalized, worker_limit=64)
             mode = 0
             cache_slot = 0
             rope_slot = 0
@@ -590,7 +597,7 @@ def l2_prefill_fwd(
             owner_post = pl.slice(attn_post, [CAPACITY // TP_SIZE, HC_MULT], [owner_begin, 0])
             owner_residual = pl.slice(attn_residual, [CAPACITY // TP_SIZE, HC_MULT, HC_MULT], [owner_begin, 0, 0])
             owner_destination = pl.slice(attn_hidden, [CAPACITY // TP_SIZE, HC_MULT, D], [owner_begin, 0, 0])
-            inv_rms, mix_partials = hc_project(owner_hidden, layer_attn_fn, hf32=False)
+            inv_rms, mix_partials = hc_project(owner_hidden, layer_attn_fn, rms_worker_limit=64)
             hc_sinkhorn(inv_rms, mix_partials, layer_attn_scale, layer_attn_base, owner_pre, owner_post, owner_residual)
             hc_post_deps = pl.array.create(2, pl.TASK_ID)
             hc_post(owner_output, owner_hidden, owner_post, owner_residual, owner_destination, deps=hc_post_deps)
