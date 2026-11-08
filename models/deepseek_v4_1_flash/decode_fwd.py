@@ -31,7 +31,7 @@ if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
 from config import (
     FLASH as M, B_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, COMPRESSED_CACHE_GROUP,
     DECODE_MAX_TOKENS, DECODE_INPUT_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, WINDOW_CACHE_GROUP,
-    MOE_TOKENS, DSPARK_DRAFT_LAYERS, DSPARK_TARGET_LAYER_IDS,
+    MOE_TOKENS, DSPARK_DRAFT_LAYERS, DSPARK_LAST_TARGET_LAYER, DSPARK_TARGET_LAYER_IDS,
 )
 from compressor import STATE_WIDTH
 from decode_c1a_full import decode_c1a_full
@@ -675,8 +675,10 @@ def decode_decoder(
                 local_moe_tokens, rank, layer + 1,
                 force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
             )
-        if layer >= DSPARK_TARGET_LAYER_IDS[0]:
-            target_column = (layer - DSPARK_TARGET_LAYER_IDS[0]) * D
+        # This residual enters the next layer's attention.
+        target_layer = layer + 1
+        if target_layer >= DSPARK_TARGET_LAYER_IDS[0] and target_layer <= DSPARK_LAST_TARGET_LAYER:
+            target_column = (target_layer - DSPARK_TARGET_LAYER_IDS[0]) * D
             for token in pl.spmd(MOE_TOKENS, name_hint="decode_dspark_target_hidden"):
                 if token < local_moe_tokens:
                     hc_row = x_hc[token : token + 1, 0:HC_MULT, 0:D]
