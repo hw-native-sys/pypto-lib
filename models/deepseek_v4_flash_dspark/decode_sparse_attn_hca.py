@@ -9,6 +9,8 @@
 """DeepSeek-V4 HCA sparse attention over the sliding window and ratio-128 compressed cache."""
 
 
+from math import gcd
+
 import pypto.language as pl
 
 from config import (
@@ -87,7 +89,7 @@ ROPE_CS_T_TILE = S  # rope cos/sin row block: one request per block
 T_PAD = ((T + 16 - 1) // 16) * 16
 MERGE_WORKERS = 48
 ATTENTION_PUBLISH_WORKERS = 48
-ATTENTION_PUBLISH_T_TILE = 4
+ATTENTION_PUBLISH_T_TILE = gcd(S, 4)
 LOCAL_O_GROUPS = O_GROUPS // TP
 GROUP_T_PAD = TP * T_PAD
 ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
@@ -326,7 +328,9 @@ def sparse_attn_hca(
             g_bulk_first = pl.read(window_swa_indices, [g_t0, 0])
             g_bulk_matches = g_bulk_matches * pl.cast(g_bulk_first >= 0, pl.INT32)
             g_bulk_matches = g_bulk_matches * pl.cast(g_bulk_first <= 2147483647 - (WIN - 1), pl.INT32)
-            valid_slots_i32 = pl.load(window_swa_indices, [g_t0, 0], [VALID_TOKEN_TILE, WIN])
+            valid_slots_i32 = pl.load(window_swa_indices, [g_t0, 0], [VALID_TOKEN_TILE, WIN], valid_shape=[S, WIN])
+            valid_slots_i32 = pl.fillpad(valid_slots_i32, pad_value=pl.PadValue.zero)
+            valid_slots_i32 = pl.set_validshape(valid_slots_i32, VALID_TOKEN_TILE, WIN)
             g_sequence_col = pl.tile.arange(0, [1, WIN], dtype=pl.INT32)
             if g_bulk_matches == 1:
                 g_sequence = pl.add(g_sequence_col, g_bulk_first)
@@ -399,12 +403,14 @@ def sparse_attn_hca(
             valid_col = pl.cast(g_sequence_col, target_type=pl.FP32)
             valid_zero = pl.tile.full([VALID_TOKEN_TILE, WIN], dtype=pl.FP32, value=0.0)
             valid_cols = pl.col_expand_add(valid_zero, valid_col)
-            valid_lens_i32 = pl.load(window_swa_lens, [valid_t0], [VALID_TOKEN_TILE], target_memory=pl.MemorySpace.Vec)
+            valid_lens_i32 = pl.load(window_swa_lens, [valid_t0], [VALID_TOKEN_TILE], valid_shape=[S], target_memory=pl.MemorySpace.Vec)
+            valid_lens_i32 = pl.fillpad(valid_lens_i32, pad_value=pl.PadValue.zero)
             valid_lens = pl.cast(pl.reshape(valid_lens_i32, [VALID_TOKEN_TILE, 1]), target_type=pl.FP32)
             valid_mask = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(valid_cols, valid_lens)), 0.0), 1.0)
             valid_slots = pl.cast(valid_slots_i32, target_type=pl.FP32)
             valid_slot_mask = pl.minimum(pl.maximum(pl.add(valid_slots, 1.0), 0.0), 1.0)
             valid_mask = pl.mul(valid_mask, valid_slot_mask)
+            valid_mask = pl.set_validshape(valid_mask, S, WIN)
             pl.store(valid_mask, [valid_t0, 0], raw_valid)
 
         with pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs") as rope_cs_tid:

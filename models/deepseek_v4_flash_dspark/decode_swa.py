@@ -10,6 +10,8 @@
 """DeepSeek-V4 SWA full-layer TP and TP1 entries."""
 
 
+from math import gcd
+
 import sys
 
 import config
@@ -114,7 +116,7 @@ SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shap
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
 
 # tiling
-BIAS_T_TILE = 8  # sparse_bias row block; T is a multiple of 8 by the batch contract
+BIAS_T_TILE = 8  # sparse_bias row block, including a partial final block
 SWA_WB_TOKEN_TILE = 32  # tokens per cache-writeback SPMD block
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
@@ -197,7 +199,7 @@ def _decode_swa(
     x_out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(x_hc, 0)
     kv_dim = pl.tensor.dim(swa_slot_mapping, 0)
-    bias_blocks = t_dim // BIAS_T_TILE
+    bias_blocks = (t_dim + BIAS_T_TILE - 1) // BIAS_T_TILE
     # split_pre_post -> hc_post is covered by x_normed_t -> attn_out.
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
@@ -254,16 +256,20 @@ def _decode_swa(
 
     with pl.spmd(bias_blocks, name_hint="swa_valid_bias"):
         bias_block = pl.tile.get_block_idx()
-        valid_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
+        valid_col = pl.cast(pl.tile.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
         token_start = bias_block * BIAS_T_TILE
-        zero_rows = pl.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
+        zero_rows = pl.tile.full([BIAS_T_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0)
         valid_cols = pl.col_expand(zero_rows, valid_col)
-        lens_slice = swa_lens[token_start : token_start + BIAS_T_TILE]
+        valid_rows = pl.min(BIAS_T_TILE, t_dim - token_start)
+        lens_slice = pl.load(swa_lens, [token_start], [BIAS_T_TILE], valid_shape=[valid_rows])
+        lens_slice = pl.fillpad(lens_slice, pad_value=pl.PadValue.zero)
         lens_col = pl.reshape(lens_slice, [BIAS_T_TILE, 1])
         lens_fp32 = pl.cast(lens_col, target_type=pl.FP32)
         valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(valid_cols, lens_fp32)), 0.0), 1.0)
         valid_bias = pl.sub(valid, 1.0)
-        sparse_bias[token_start : token_start + BIAS_T_TILE, 0 : ATTN_K_TILE] = pl.mul(valid_bias, -NEG_INF)
+        bias_tile = pl.mul(valid_bias, -NEG_INF)
+        bias_tile = pl.set_validshape(bias_tile, valid_rows, ATTN_K_TILE)
+        pl.store(bias_tile, [token_start, 0], sparse_bias)
 
     attention_local_flat = pl.create_tensor([ATTENTION_WINDOW_ROWS, O_GROUP_IN], dtype=pl.BF16)
     attn_out = pl.create_tensor([t_dim, D], dtype=pl.BF16)
@@ -482,7 +488,7 @@ def _decode_swa_tp1(
     # gathers a full-context table through position_ids. position_ids stays in
     # the ABI for host admission and golden semantics only.
     t_dim = pl.tensor.dim(x_hc, 0)
-    bias_blocks = t_dim // BIAS_T_TILE
+    bias_blocks = (t_dim + BIAS_T_TILE - 1) // BIAS_T_TILE
     # The attention path already orders the producer of post_t.
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
@@ -514,17 +520,23 @@ def _decode_swa_tp1(
     for write_blk in pl.spmd(bias_blocks, name_hint="swa_cache_insert"):
         write_t0 = write_blk * BIAS_T_TILE
         for write_t in pl.range(write_t0, write_t0 + BIAS_T_TILE):
-            write_row_i64 = pl.read(swa_slot_mapping, [write_t])
-            if write_row_i64 >= 0:
-                write_row = pl.cast(write_row_i64, pl.INDEX)
-                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+            if write_t < t_dim:
+                write_row_i64 = pl.read(swa_slot_mapping, [write_t])
+                if write_row_i64 >= 0:
+                    write_row = pl.cast(write_row_i64, pl.INDEX)
+                    kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
     for v_blk in pl.spmd(bias_blocks, name_hint="swa_valid_bias", allow_early_resolve=True):
         v_t0 = v_blk * BIAS_T_TILE
-        v_col = pl.cast(pl.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)
-        v_col_m = pl.col_expand(pl.full([BIAS_T_TILE, WIN], dtype=pl.FP32, value=0.0), v_col)
-        v_lens = pl.cast(pl.reshape(swa_lens[v_t0 : v_t0 + BIAS_T_TILE], [BIAS_T_TILE, 1]), target_type=pl.FP32)
+        v_col = pl.cast(pl.tile.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)
+        v_col_m = pl.col_expand(pl.tile.full([BIAS_T_TILE, WIN], dtype=pl.FP32, value=0.0), v_col)
+        v_rows = pl.min(BIAS_T_TILE, t_dim - v_t0)
+        v_lens_raw = pl.load(swa_lens, [v_t0], [BIAS_T_TILE], valid_shape=[v_rows])
+        v_lens_raw = pl.fillpad(v_lens_raw, pad_value=pl.PadValue.zero)
+        v_lens = pl.cast(pl.reshape(v_lens_raw, [BIAS_T_TILE, 1]), target_type=pl.FP32)
         v_valid = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0), 1.0)
-        sparse_bias[v_t0 : v_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
+        v_bias = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
+        v_bias = pl.set_validshape(v_bias, v_rows, WIN)
+        pl.store(v_bias, [v_t0, 0], sparse_bias)
     o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
     o_packed_heads, heads_dep = sparse_attn_swa_tp1(
         q, kv_cache, swa_indices, swa_lens, sparse_bias,
@@ -826,8 +838,9 @@ def build_distributed_tensor_specs(local_t, start_pos=None):
     from golden import ScalarSpec, TensorSpec
     from decode_cp_allgather import cp_split, cp_stack, materialize_spec
 
-    if local_t < BIAS_T_TILE or local_t > LOCAL_T or local_t % BIAS_T_TILE != 0 or local_t % S != 0:
-        raise ValueError(f"local_t must be a multiple of {BIAS_T_TILE} in [{BIAS_T_TILE}, {LOCAL_T}], got {local_t}")
+    token_tile = gcd(BIAS_T_TILE, S)
+    if local_t < token_tile or local_t > LOCAL_T or local_t % token_tile != 0 or local_t % S != 0:
+        raise ValueError(f"local_t must be a multiple of {token_tile} in [{token_tile}, {LOCAL_T}], got {local_t}")
 
     local_batch = local_t // S
     group_batch = TP_SIZE * local_batch

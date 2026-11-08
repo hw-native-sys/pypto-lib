@@ -8,11 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compose the target LM head with sequential Markov sampling and confidence."""
 
+from math import gcd
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
-from config import FLASH as M
+from config import DECODE_SEQ, MOE_TOKENS, FLASH as M
 from lm_head import (
     DONE_VALUE,
     GROUP_LOGIT_ROWS,
@@ -30,10 +32,10 @@ B_DYN = pl.dynamic("DSPARK_MARKOV_B_DYN")
 
 # DSpark Markov program contract.
 DSPARK_MARKOV_RANK = 256
-DSPARK_QUERY_WIDTH = 7
-DSPARK_QUERY_PAD = 8
-DSPARK_SUPPORTED_BATCHES = (4, 8, 12, 16)
-DSPARK_MAX_BATCH = max(DSPARK_SUPPORTED_BATCHES)
+DSPARK_QUERY_WIDTH = DECODE_SEQ - 1
+DSPARK_QUERY_PAD = DECODE_SEQ
+DSPARK_MAX_BATCH = MOE_TOKENS // DSPARK_QUERY_PAD
+DSPARK_SUPPORTED_BATCHES = tuple(sorted({batch for batch in (2, 4, 8, 12, 16, DSPARK_MAX_BATCH) if batch <= DSPARK_MAX_BATCH}))
 DSPARK_MOE_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_PAD
 
 assert DSPARK_QUERY_WIDTH < DSPARK_QUERY_PAD
@@ -46,13 +48,14 @@ EPS = M.rms_norm_eps
 # tiling
 HIDDEN_TILE = 512
 RMS_M_TILE = 8
-LM_M_TILE = 16
+DSPARK_NORM_TOKENS = (DSPARK_MOE_TOKENS + RMS_M_TILE - 1) // RMS_M_TILE * RMS_M_TILE
+LM_M_TILE = gcd(16, *(batch * DSPARK_QUERY_PAD for batch in DSPARK_SUPPORTED_BATCHES))
 LM_N_TILE = 128
 LM_K_TILE = 256
-MARKOV_M_TILE = DSPARK_MAX_BATCH
+MARKOV_M_TILE = max(8, DSPARK_MAX_BATCH)
 # Keep each request's scratch row on its own 64-byte cache line. Scalar writes
 # from concurrent request blocks otherwise overwrite the neighbouring row.
-MARKOV_ID_PAD = 16
+MARKOV_ID_PAD = (DSPARK_QUERY_WIDTH + 15) // 16 * 16
 CONFIDENCE_PAD = 8
 GREEDY_VOCAB_CHUNK = 256
 GREEDY_NUM_CHUNKS = VOCAB // GREEDY_VOCAB_CHUNK
@@ -75,16 +78,16 @@ for _batch in DSPARK_SUPPORTED_BATCHES:
 def normalize_head_hidden(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
-    normalized: pl.Tensor[[DSPARK_MOE_TOKENS, D], pl.BF16],
+    normalized: pl.Tensor[[DSPARK_NORM_TOKENS, D], pl.BF16],
 ):
     batch = pl.tensor.dim(head_hidden, 0)
     active_tokens = batch * DSPARK_QUERY_WIDTH
     padded_tokens = batch * DSPARK_QUERY_PAD
     hidden_flat = pl.reshape(head_hidden, [active_tokens, D])
-    padded_hidden = pl.create_tensor([DSPARK_MOE_TOKENS, D], dtype=pl.BF16)
+    padded_hidden = pl.create_tensor([DSPARK_NORM_TOKENS, D], dtype=pl.BF16)
     hidden_blocks = D // HIDDEN_TILE
     with pl.spmd(
-        (DSPARK_MOE_TOKENS // RMS_M_TILE) * hidden_blocks,
+        (DSPARK_NORM_TOKENS // RMS_M_TILE) * hidden_blocks,
         name_hint="dspark_hidden_zero",
     ) as hidden_zero_tid:
         zero_task = pl.tile.get_block_idx()
@@ -106,7 +109,7 @@ def normalize_head_hidden(
     # the generic rms_norm inline kernel loses its inferred tensor metadata
     # during JIT specialization.
     with pl.spmd(
-        padded_tokens // RMS_M_TILE,
+        (padded_tokens + RMS_M_TILE - 1) // RMS_M_TILE,
         name_hint="dspark_final_norm",
         deps=[hidden_pad_tid],
         allow_early_resolve=True,
@@ -185,7 +188,7 @@ def compute_base_logits(
 ):
     batch = pl.tensor.dim(head_hidden, 0)
     padded_tokens = batch * DSPARK_QUERY_PAD
-    normalized = pl.create_tensor([DSPARK_MOE_TOKENS, D], dtype=pl.BF16)
+    normalized = pl.create_tensor([DSPARK_NORM_TOKENS, D], dtype=pl.BF16)
     final_norm_tid = normalize_head_hidden(
         head_hidden,
         final_norm_weight,
@@ -426,20 +429,7 @@ def greedy_markov_step(
                 request : request + 1,
                 0:MARKOV_ID_PAD,
             ]
-            if step == 0:
-                pl.write(token_row, [0, 0], winning_token)
-            if step == 1:
-                pl.write(token_row, [0, 1], winning_token)
-            if step == 2:
-                pl.write(token_row, [0, 2], winning_token)
-            if step == 3:
-                pl.write(token_row, [0, 3], winning_token)
-            if step == 4:
-                pl.write(token_row, [0, 4], winning_token)
-            if step == 5:
-                pl.write(token_row, [0, 5], winning_token)
-            if step == 6:
-                pl.write(token_row, [0, 6], winning_token)
+            pl.write(token_row, [0, pl.cast(step, pl.INDEX)], winning_token)
             draft_token_scratch[
                 request : request + 1,
                 0:MARKOV_ID_PAD,
@@ -480,52 +470,18 @@ def sample_from_base_logits(
             request : request + 1,
             0:MARKOV_ID_PAD,
         ] = pl.full([1, MARKOV_ID_PAD], dtype=pl.INT32, value=0)
-    step_0_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, token_scratch_zero_tid, pl.cast(0, pl.INT32)
-    )
-    step_1_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_0_tid, pl.cast(1, pl.INT32)
-    )
-    step_2_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_1_tid, pl.cast(2, pl.INT32)
-    )
-    step_3_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_2_tid, pl.cast(3, pl.INT32)
-    )
-    step_4_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_3_tid, pl.cast(4, pl.INT32)
-    )
-    step_5_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_4_tid, pl.cast(5, pl.INT32)
-    )
-    step_6_tid = greedy_markov_step(
-        head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
-        markov_w1, markov_w2, confidence_head_weight,
-        draft_token_scratch, confidence_scratch,
-        base_logits_ready_tid, step_5_tid, pl.cast(6, pl.INT32)
-    )
+    final_step_tid = token_scratch_zero_tid
+    for step in pl.unroll(DSPARK_QUERY_WIDTH):
+        final_step_tid = greedy_markov_step(
+            head_hidden, base_logits, num_sampled, last_sampled, next_prefill_tokens,
+            markov_w1, markov_w2, confidence_head_weight,
+            draft_token_scratch, confidence_scratch,
+            base_logits_ready_tid, final_step_tid, pl.cast(step, pl.INT32)
+        )
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="dspark_markov_token_output_copy",
-        deps=[step_6_tid],
+        deps=[final_step_tid],
     ):
         for request in pl.range(batch):
             for output_step in pl.range(DSPARK_QUERY_WIDTH):
@@ -614,7 +570,7 @@ def _distributed_markov_sample(
     next_prefill_tokens.bind_dynamic(0, B_DYN)
     draft_token_ids.bind_dynamic(0, B_DYN)
     confidence_probs.bind_dynamic(0, B_DYN)
-    normalized = pl.create_tensor([DSPARK_MOE_TOKENS, D], dtype=pl.BF16)
+    normalized = pl.create_tensor([DSPARK_NORM_TOKENS, D], dtype=pl.BF16)
     final_norm_tid = normalize_head_hidden(
         head_hidden,
         final_norm_weight,
@@ -1015,7 +971,10 @@ if __name__ == "__main__":
 
     assert args.tp == TP_SIZE
     assert args.dp * args.tp == WORLD_SIZE
-    config = dict(dump_passes=args.dump_passes, backend_type=args.backend_type, execution_mode=args.execution_mode)
+    config = dict(
+        dump_passes=args.dump_passes, backend_type=args.backend_type,
+        execution_mode=args.execution_mode, ring_heap=LM_HEAD_RING_HEAP,
+    )
     fn = markov_sample
     golden_fn = golden_nonzero_markov
     if args.distributed:

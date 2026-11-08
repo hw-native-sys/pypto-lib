@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Device-side metadata lowering for recurrent DeepSeek-V4 DSpark decode."""
 
+from math import gcd
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -690,8 +692,8 @@ CONTEXT_T = LOCAL_BATCH * S
 LOCAL_METADATA_ROWS = CONTEXT_T + T_QUERY
 GROUP_METADATA_ROWS = DSPARK_CP_SIZE * LOCAL_METADATA_ROWS
 METADATA_WIDTH = 1 + DSPARK_DRAFT_LAYERS
-META_COMM_ROWS = 16
-ROPE_COMM_ROWS = 8
+META_COMM_ROWS = gcd(GROUP_METADATA_ROWS, 16)
+ROPE_COMM_ROWS = gcd(GROUP_METADATA_ROWS, 8)
 BRIDGE_B_DYN = pl.dynamic("DSPARK_BRIDGE_B_DYN")
 BRIDGE_GROUP_CONTEXT_T_DYN = pl.dynamic("DSPARK_BRIDGE_GROUP_CONTEXT_T_DYN")
 

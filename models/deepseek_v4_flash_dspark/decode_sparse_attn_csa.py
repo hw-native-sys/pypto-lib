@@ -75,7 +75,7 @@ NUM_QK_CORES = 24  # qk_pv dispatch lanes
 CSA_PLAN_WORKERS = 16  # csa_slots_build_valid_qk_plan token-tile lanes
 T_PAD = ((T + 16 - 1) // 16) * 16  # Cube M floor
 ATTENTION_PUBLISH_WORKERS = 48
-ATTENTION_PUBLISH_T_TILE = 4
+ATTENTION_PUBLISH_T_TILE = gcd(S, 4)
 LOCAL_O_GROUPS = O_GROUPS // TP
 GROUP_T_PAD = TP * T_PAD
 ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
@@ -96,7 +96,7 @@ SWA_TILE_WIN_ROWS = min(ATTN_K_TILE, WIN)
 SWA_RUNS = (SWA_TILE_WIN_ROWS + 2 * (BLOCK_SIZE - 1)) // BLOCK_SIZE  # Sliding-window page runs
 BIAS_T_TILE = 8
 BIAS_T_STEP = gcd(S, BIAS_T_TILE)
-if T % BIAS_T_TILE != 0:
+if T % BIAS_T_STEP != 0:
     raise ValueError("CSA token capacity must contain complete bias tiles")
 if H_TILE % HEADS_PER_GROUP != 0:
     raise ValueError(f"CSA head tile {H_TILE} must contain complete output groups")

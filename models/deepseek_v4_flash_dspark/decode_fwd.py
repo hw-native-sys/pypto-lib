@@ -49,38 +49,49 @@ FWD_CSA_WEIGHT_BANK_SIZE = 21 if FWD_WEIGHT_BANK_SIZE == 43 else 1
 FWD_HCA_WEIGHT_BANK_SIZE = 20 if FWD_WEIGHT_BANK_SIZE == 43 else 1
 
 config.TP = TP_SIZE
+config.MOE_TOKENS = config.DECODE_TOKENS // TP_SIZE
+_parallel_argv_length = len(sys.argv)
+if not any(arg == "--lm-head-tp" or arg.startswith("--lm-head-tp=") for arg in sys.argv):
+    sys.argv.extend(("--lm-head-tp", str(min(4, EP_SIZE))))
+if not any(arg == "--tp" or arg.startswith("--tp=") for arg in sys.argv):
+    sys.argv.extend(("--tp", str(TP_SIZE)))
+if not any(arg == "--ep" or arg.startswith("--ep=") for arg in sys.argv):
+    sys.argv.extend(("--ep", str(EP_SIZE)))
 
-import decode_csa as csa
-import decode_hca as hca
-import decode_swa as swa
-import moe as moe_module
-import pypto.language as pl
-import pypto.language.distributed as pld
-from decode_cp_allgather import (
-    KV_B_DYN,
-    KV_T_DYN,
-    DECODE_GROUP_CAP,
-)
-from decode_csa import decode_csa, decode_csa_tp1
-from decode_hca import decode_hca, decode_hca_tp1
-from decode_swa import decode_swa, decode_swa_tp1
-from hc_head import hc_head
-from lm_head import (
-    GRAMMAR_SEGMENT_WORDS,
-    GREEDY_GRID_ROWS,
-    GROUP_LOGIT_ROWS,
-    MAX_LOGIT_ROWS,
-    SAMPLED_IDS_PAD,
-    TP_SIZE as LM_HEAD_TP_SIZE,
-    VOCAB as LM_HEAD_VOCAB,
-    VOCAB_PER_TP,
-    greedy_sample,
-    lm_head,
-)
-from lookup_embedding import VOCAB_DYN as EMBED_VOCAB_DYN
-from lookup_embedding import lookup_embedding
-from moe import clear_moe_signals, moe
-from rmsnorm import rms_norm
+try:
+    import decode_csa as csa
+    import decode_hca as hca
+    import decode_swa as swa
+    import moe as moe_module
+    import pypto.language as pl
+    import pypto.language.distributed as pld
+    from decode_cp_allgather import (
+        KV_B_DYN,
+        KV_T_DYN,
+        DECODE_GROUP_CAP,
+    )
+    from decode_csa import decode_csa, decode_csa_tp1
+    from decode_hca import decode_hca, decode_hca_tp1
+    from decode_swa import decode_swa, decode_swa_tp1
+    from hc_head import hc_head
+    from lm_head import (
+        GRAMMAR_SEGMENT_WORDS,
+        GREEDY_GRID_ROWS,
+        GROUP_LOGIT_ROWS,
+        MAX_LOGIT_ROWS,
+        SAMPLED_IDS_PAD,
+        TP_SIZE as LM_HEAD_TP_SIZE,
+        VOCAB as LM_HEAD_VOCAB,
+        VOCAB_PER_TP,
+        greedy_sample,
+        lm_head,
+    )
+    from lookup_embedding import VOCAB_DYN as EMBED_VOCAB_DYN
+    from lookup_embedding import lookup_embedding
+    from moe import clear_moe_signals, moe
+    from rmsnorm import rms_norm
+finally:
+    del sys.argv[_parallel_argv_length:]
 
 
 # Dynamic shape variables.
@@ -205,7 +216,6 @@ PACKED_POOL_LAYER_COUNTS = {
 }
 
 MOE_INPUT_IDS_PER_CACHE_LINE = 8  # One 64-byte cache line of INT64 values.
-assert MOE_TOKENS % MOE_INPUT_IDS_PER_CACHE_LINE == 0
 
 
 def build_num_tokens_per_owner_host(values, physical_tokens):
@@ -269,14 +279,15 @@ def decode_embedding_preamble(
     owner_tokens: pl.Scalar[pl.INT32],
 ):
     """Prepare one owner's fixed-capacity embedding and MoE token-id buffers."""
-    for token_block in pl.spmd(MOE_TOKENS // MOE_INPUT_IDS_PER_CACHE_LINE, name_hint="decode_fwd_pack_moe_input_ids"):
+    for token_block in pl.spmd((MOE_TOKENS + MOE_INPUT_IDS_PER_CACHE_LINE - 1) // MOE_INPUT_IDS_PER_CACHE_LINE, name_hint="decode_fwd_pack_moe_input_ids"):
         token_begin = token_block * MOE_INPUT_IDS_PER_CACHE_LINE
         for token_offset in pl.range(MOE_INPUT_IDS_PER_CACHE_LINE):
             token_idx = token_begin + token_offset
             token_id = pl.cast(0, pl.INT64)
             if token_idx < owner_tokens:
                 token_id = pl.read(input_ids, [token_idx])
-            pl.write(moe_input_ids, [token_idx], token_id)
+            if token_idx < MOE_TOKENS:
+                pl.write(moe_input_ids, [token_idx], token_id)
     lookup_embedding(input_ids, embed_weight, hidden_states, x_hc)
     physical_tokens = pl.tensor.dim(input_ids, 0)
     for token in pl.spmd(MOE_TOKENS, name_hint="decode_fwd_embedding_active_mask"):
@@ -2055,6 +2066,8 @@ def main():
         )
     start_pos = _parse_start_pos(args.start_pos)
     num_tokens_per_owner = _parse_num_tokens_per_owner(args.num_tokens_per_owner)
+    if num_tokens_per_owner is None and start_pos is None and args.runtime_case != "long_context_tail":
+        num_tokens_per_owner = [config.DECODE_BATCH // TP_SIZE * config.DECODE_SEQ] * N_RANKS
     weight_bank_size = args.weight_bank_size
     if weight_bank_size != FWD_WEIGHT_BANK_SIZE:
         parser.error(f"weight bank froze at import as {FWD_WEIGHT_BANK_SIZE}, got {weight_bank_size}")

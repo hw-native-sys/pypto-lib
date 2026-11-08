@@ -36,6 +36,7 @@ if config.TP not in _TP_CHOICES:
     raise ValueError(f"--tp must be one of {_TP_CHOICES} (got {config.TP})")
 if config.EP not in _EP_CHOICES:
     raise ValueError(f"--ep must be one of {_EP_CHOICES} (got {config.EP})")
+config.MOE_TOKENS = config.DECODE_TOKENS // config.TP
 _caller_argv_length = len(sys.argv)
 if not _tp_explicit:
     sys.argv.extend(("--tp", str(config.TP)))
@@ -104,11 +105,11 @@ MAIN_PROJ_T_DYN = pl.dynamic("DSPARK_PROJ_T_DYN")
 
 # DSpark program contract.
 DSPARK_DRAFT_LAYERS = 3
-DSPARK_QUERY_WIDTH = 7
-DSPARK_QUERY_PAD = 8
+DSPARK_QUERY_WIDTH = DECODE_SEQ - 1
+DSPARK_QUERY_PAD = DECODE_SEQ
 DSPARK_NOISE_TOKEN_ID = 128799
-DSPARK_SUPPORTED_BATCHES = (4, 8, 12, 16)
-DSPARK_MAX_BATCH = max(DSPARK_SUPPORTED_BATCHES)
+DSPARK_MAX_BATCH = MOE_TOKENS // DSPARK_QUERY_PAD
+DSPARK_SUPPORTED_BATCHES = tuple(sorted({batch for batch in (2, 4, 8, 12, 16, DSPARK_MAX_BATCH) if batch <= DSPARK_MAX_BATCH}))
 # Each rank owns complete seven-row request blocks; a CP group therefore carries
 # exactly DSPARK_CP_SIZE times one supported local batch.
 DSPARK_QUERY_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_WIDTH
@@ -116,8 +117,7 @@ DSPARK_MOE_TOKENS = DSPARK_MAX_BATCH * DSPARK_QUERY_PAD
 DSPARK_SWA_INDEX_WIDTH = (M.sliding_window + DSPARK_QUERY_WIDTH + 63) // 64 * 64
 DSPARK_CP_SIZE = PREFILL_CP_SIZE
 
-# The query batch is one MoE slab, not the TP split of the target batch: the two
-# agree only at TP=4, and dspark_attention sizes its query rows off the slab.
+# Query rows follow the configured per-rank MoE token slab.
 assert DSPARK_QUERY_TOKENS == DSPARK_ATTENTION_T
 assert DSPARK_MOE_TOKENS == MOE_TOKENS
 assert DSPARK_SWA_INDEX_WIDTH >= M.sliding_window + DSPARK_QUERY_WIDTH
@@ -999,7 +999,7 @@ def build_tensor_specs(batch, *, mode="decode"):
     if mode == "decode":
         local_context_tokens = batch * DECODE_SEQ
         positions = _anchor_position_set(batch).unsqueeze(0).expand(N_RANKS, -1).contiguous()
-        valid_pattern = torch.tensor([1, 4, 7, 2, 5, 8, 3, 6], dtype=torch.int32)
+        valid_pattern = torch.tensor([1, 4, 7, 2, 5, 8, 3, 6], dtype=torch.int32).clamp(max=DECODE_SEQ)
         valid_counts = valid_pattern.repeat((batch + valid_pattern.numel() - 1) // valid_pattern.numel())[:batch]
         context_request_ids = torch.arange(batch, dtype=torch.int64).repeat_interleave(DECODE_SEQ)
         context_offsets = torch.arange(DECODE_SEQ, dtype=torch.int32).repeat(batch)

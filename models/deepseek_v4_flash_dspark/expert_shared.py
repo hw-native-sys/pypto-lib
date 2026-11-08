@@ -33,16 +33,11 @@ MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
 
 # tiling
-SH_M_TILE = 128 if T % 128 == 0 else 64
+SH_M_TILE = 128 if T % 128 == 0 else (max(16, gcd(T, 64)) if T > 64 else 64)
 SH_ROW_PAD = 8
 T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
-# Decode (T <= SH_M_TILE, single partial block) or prefill (T a multiple of
-# SH_M_TILE, fully valid blocks); a T that is neither would need a dynamic
-# per-block row count the static valid_shape below can't express.
-assert T <= SH_M_TILE or T % SH_M_TILE == 0, \
-    "expert_shared needs T <= SH_M_TILE (decode) or T a multiple of SH_M_TILE (prefill)"
 SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
-SH_ROWS_PER_BLOCK = gcd(SH_ROW_PAD, SH_VALID_M)
+SH_ROWS_PER_BLOCK = gcd(SH_ROW_PAD, SH_VALID_M, T)
 N_MTILES = T_PAD // SH_M_TILE
 assert SH_VALID_M % SH_ROWS_PER_BLOCK == 0
 
@@ -51,8 +46,8 @@ INTER_K = 512
 MM_INTER_TILE = 128
 SH_MM_BLOCKS = 16 if SH_M_TILE == 128 else 8
 ACT_INTER_TILE = 1024
-D_OUT_TILE = 128 if SH_M_TILE == 128 or SH_VALID_M < SH_M_TILE else 256
-W2_SPLIT_MODE = pl.SplitMode.NONE if SH_VALID_M < SH_M_TILE else pl.SplitMode.UP_DOWN
+D_OUT_TILE = 128 if SH_M_TILE == 128 or T % SH_M_TILE != 0 else 256
+W2_SPLIT_MODE = pl.SplitMode.NONE if T % SH_M_TILE != 0 else pl.SplitMode.UP_DOWN
 W2_PIPE_SLOTS = 1 if SH_M_TILE == 128 else 2
 W2_INNER = 2
 # h_tile_i8 stores use a whole number of a2a3 512-byte L2 cache lines.
@@ -73,6 +68,9 @@ def _expert_shared(
     # One M-tile of SH_M_TILE rows per iteration.
     for mt in pl.parallel(N_MTILES):
         ts0 = mt * SH_M_TILE
+        valid_m = SH_VALID_M
+        if T > SH_M_TILE and T % SH_M_TILE != 0:
+            valid_m = pl.min(SH_M_TILE, T - ts0)
 
         gate_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
         up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
@@ -81,13 +79,13 @@ def _expert_shared(
         for nb_idx in pl.spmd(SH_MM_BLOCKS, name_hint="sh_gate_up_mm", allow_early_resolve=True):
             for ng in pl.range(nb_idx, MOE_INTER // MM_INTER_TILE, SH_MM_BLOCKS):
                 n0 = ng * MM_INTER_TILE
-                xs_first = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, 0], valid_shape=[SH_VALID_M, K_TILE])
+                xs_first = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, 0], valid_shape=[valid_m, K_TILE])
                 sw1_first = shared_w1[n0 : n0 + MM_INTER_TILE, 0:K_TILE]
                 sw3_first = shared_w3[n0 : n0 + MM_INTER_TILE, 0:K_TILE]
                 gate_acc = pl.matmul(xs_first, sw1_first, b_trans=True, out_dtype=pl.INT32)
                 up_acc = pl.matmul(xs_first, sw3_first, b_trans=True, out_dtype=pl.INT32)
                 for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
-                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[valid_m, K_TILE])
                     sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                     sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                     gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
@@ -110,7 +108,7 @@ def _expert_shared(
                 mode="trunc",
             )
         for row_block in pl.spmd(
-            SH_VALID_M // SH_ROWS_PER_BLOCK,
+            valid_m // SH_ROWS_PER_BLOCK,
             name_hint="sh_gate_up_act_q",
             allow_early_resolve=True,
         ):
@@ -239,7 +237,11 @@ def _expert_shared(
                     pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk
                 )
                 y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
-                sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE] = y_bf16[0:SH_VALID_M, :]
+                if T > SH_M_TILE and T % SH_M_TILE != 0:
+                    y_valid = pl.slice(y_bf16, [SH_M_TILE, D_OUT_TILE], [0, 0], valid_shape=[valid_m, D_OUT_TILE])
+                    sh = pl.assemble(sh, y_valid, [ts0, d0])
+                else:
+                    sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE] = y_bf16[0:SH_VALID_M, :]
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value; sh is convenient because it's already pl.Out.

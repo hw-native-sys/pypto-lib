@@ -140,7 +140,8 @@ COMPRESS_STATE_BLOCKS_PER_REQUEST = COMPRESS_STATE_PHYSICAL_BLOCKS // DECODE_BAT
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
-HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
+HCA_WB_TOKEN_TILE = math.gcd(S, 8)  # tokens per cache-writeback SPMD block
+TP1_HCA_WB_TOKEN_TILE = math.gcd(HCA_WB_TOKEN_TILE, S)
 
 if T != LOCAL_T:
     raise ValueError(f"HCA token capacity {T} must equal TP local token capacity {LOCAL_T}")
@@ -632,7 +633,7 @@ def _decode_hca_tp1(
     kv_seq_lens.bind_dynamic(0, B_DYN)
     x_out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(x_hc, 0)
-    wb_blocks = t_dim // HCA_WB_TOKEN_TILE
+    wb_blocks = t_dim // TP1_HCA_WB_TOKEN_TILE
     post_t = pl.create_tensor([t_dim, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([t_dim, HC_MULT * HC_MULT], dtype=pl.FP32)
     x_normed = pl.create_tensor([t_dim, D], dtype=pl.BF16)
@@ -664,8 +665,8 @@ def _decode_hca_tp1(
     kv_cache_flat = pl.reshape(kv_cache, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     with pl.spmd(wb_blocks, name_hint="hca_cache_writeback") as ori_cache_write_tid:
         wb_blk = pl.tile.get_block_idx()
-        wb_t0 = wb_blk * HCA_WB_TOKEN_TILE
-        for write_dt in pl.range(HCA_WB_TOKEN_TILE):
+        wb_t0 = wb_blk * TP1_HCA_WB_TOKEN_TILE
+        for write_dt in pl.range(TP1_HCA_WB_TOKEN_TILE):
             write_t = wb_t0 + write_dt
             write_row_i64 = pl.read(ori_slot_mapping, [write_t])
             if write_row_i64 >= 0:
@@ -936,11 +937,12 @@ def _hca_start_positions(start_pos, *, batch):
 def _validate_hca_token_count(token_count):
     """Validate the dynamic token extent shared by TP1 and distributed HCA."""
     group_cap = TP_SIZE * LOCAL_T
-    if (token_count < VALID_TOKEN_TILE or token_count > group_cap
-            or token_count % VALID_TOKEN_TILE != 0 or token_count % S != 0):
+    token_tile = math.gcd(VALID_TOKEN_TILE, S)
+    if (token_count < token_tile or token_count > group_cap
+            or token_count % token_tile != 0 or token_count % S != 0):
         raise ValueError(
-            f"HCA token count must be a multiple of {VALID_TOKEN_TILE} and S={S} "
-            f"in [{VALID_TOKEN_TILE}, {group_cap}], got {token_count}",
+            f"HCA token count must be a multiple of {token_tile} and S={S} "
+            f"in [{token_tile}, {group_cap}], got {token_count}",
         )
 
 

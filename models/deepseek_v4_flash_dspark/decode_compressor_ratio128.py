@@ -577,9 +577,12 @@ def build_tensor_specs(start_pos=None, batch=B):
             table_blocks=CMP_MAX_BLOCKS,
             physical_blocks=CMP_BLOCK_NUM,
             permuted=True,
+            request_slots=1 << (batch - 1).bit_length(),
         )
     def init_default_start_pos():
-        # Canonical HCA start-position set (ratio-128 compressor branches + 8k long-context).
+        # A singleton starts at the first compression boundary.
+        if batch == 1:
+            return torch.tensor([COMPRESS_RATIO - 1], dtype=torch.int32)
         return hca_decode_start_set(
             batch=batch, compress_ratio=COMPRESS_RATIO, state_block_size=COMPRESS_STATE_BLOCK_SIZE)
     def init_start_pos():
@@ -643,17 +646,17 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-b", "--batch", type=int, default=B,
-                        help=f"runtime request count; a multiple of 4 up to {B} (the compile-time "
+                        help=f"runtime request count; a positive integer up to {B} (the compile-time "
                              "upper bound). The batch axes are pl.dynamic, so one compiled program "
                              "serves every value.")
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
-                             "default (unset) uses the canonical per-batch HCA set that includes the 8k point.")
+                             "default (unset) uses the canonical per-batch HCA set.")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
-    if args.batch < 4 or args.batch > B or args.batch % 4 != 0:
-        parser.error(f"--batch must be a multiple of 4 in [4, {B}], got {args.batch}")
+    if not 0 < args.batch <= B:
+        parser.error(f"--batch must be in [1, {B}], got {args.batch}")
 
     result = run(
         fn=compressor_test,

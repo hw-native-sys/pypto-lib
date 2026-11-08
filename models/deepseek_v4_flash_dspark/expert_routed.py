@@ -12,7 +12,7 @@
 import pypto.language as pl
 
 from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
-                    EP, RECV_MAX)
+                    EP, RECV_MAX, MOE_TOKENS)
 
 
 # model config
@@ -28,12 +28,13 @@ N_LOCAL_EXPERTS = M.n_routed_experts // EP
 
 # tiling
 RECV_TILE = 64
+W2_EXPERT_ROWS = (MOE_TOKENS * M.num_experts_per_tok + N_LOCAL_EXPERTS - 1) // N_LOCAL_EXPERTS
 K_TILE = 512
-INTER_K = 512
+INTER_K = 256 if W2_EXPERT_ROWS >= 2 * RECV_TILE else 512
 MM_INTER_TILE = 256
 MM_GATE_INNER = 2
 ACT_INTER_TILE = MOE_INTER // 2
-D_OUT_TILE = 256
+D_OUT_TILE = 512 if W2_EXPERT_ROWS >= 2 * RECV_TILE else 256
 QUANT_ROW_TILE = 8
 D_OUT_TILE_ACT = 256
 W2_INNER = 2
