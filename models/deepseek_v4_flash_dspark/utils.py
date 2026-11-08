@@ -17,6 +17,7 @@ import math
 from typing import Any, Callable
 
 import torch
+from prefill_metadata import CHECKPOINTS_PER_TILE, METADATA_TOKEN_TILE
 
 from config import (
     BLOCK_SIZE,
@@ -32,17 +33,25 @@ from config import (
 
 
 # --- Paged-KV metadata lowering. ---
-def checkpoint_ends_tensor(checkpoints):
-    """Pack up to three ordered checkpoint boundaries per request."""
-    result = torch.zeros((len(checkpoints), 3), dtype=torch.int32)
+def checkpoint_ends_tensor(checkpoints, *, starts, lengths):
+    """Pack ordered boundaries into bounded request-local projection tiles."""
+    if len(checkpoints) != len(starts) or len(starts) != len(lengths) or not lengths or min(lengths) <= 0:
+        raise ValueError("checkpoint metadata requires one positive extent per request")
+    tiles = (max(lengths) + METADATA_TOKEN_TILE - 1) // METADATA_TOKEN_TILE
+    result = torch.zeros((len(checkpoints), tiles, CHECKPOINTS_PER_TILE), dtype=torch.int32)
     for index, values in enumerate(checkpoints):
         values = [values] if isinstance(values, int) else list(values)
         if any(v < 0 for v in values):
             raise ValueError("checkpoint boundaries must be nonnegative")
         values = sorted(set(v for v in values if v))
-        if len(values) > 3:
-            raise ValueError("at most three checkpoints may intersect one Prefill chunk")
-        result[index, :len(values)] = torch.tensor(values, dtype=torch.int32)
+        buckets = [[] for _ in range(tiles)]
+        for boundary in values:
+            if starts[index] < boundary <= starts[index] + lengths[index]:
+                buckets[(boundary - starts[index] - 1) // METADATA_TOKEN_TILE].append(boundary)
+        for tile, ends in enumerate(buckets):
+            if len(ends) > CHECKPOINTS_PER_TILE:
+                raise ValueError("at most six checkpoint boundaries may end in one projection tile")
+            result[index, tile, :len(ends)] = torch.tensor(ends, dtype=torch.int32)
     return result
 
 
@@ -51,7 +60,9 @@ def prefill_state_fixture(
 ):
     """Allocate non-aliasing entry and publication rows for checkpoint fixtures."""
     positions = torch.arange(start_pos, start_pos + token_count, dtype=torch.int64)
-    checkpoints = checkpoint_ends_tensor([checkpoint_end])[0].tolist()
+    checkpoints = [checkpoint_end] if isinstance(checkpoint_end, int) else list(checkpoint_end)
+    if any(v < 0 for v in checkpoints):
+        raise ValueError("checkpoint boundaries must be nonnegative")
     if not any(checkpoints):
         return table, table[positions // block_size].long() * block_size + positions % block_size, physical_blocks
     if max(checkpoints) > len(table) * block_size:

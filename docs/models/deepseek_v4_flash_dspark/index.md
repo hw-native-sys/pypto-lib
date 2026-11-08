@@ -113,15 +113,19 @@ orchestrations, and the same `hc_head → rms_norm → lm_head` tail. Prompt
 sequence lengths that do not divide the CP group are padded rather than
 rejected, so one program serves an arbitrary chunk against a resident prefix.
 
-Prefill also takes `state_checkpoint_ends`, an INT32 `[requests, 3]` matrix
-(rank-stacked in L3). Each row contains up to three ordered, unique absolute
-boundaries, with unused entries zeroed. The caller selects periodic, replay,
-and shared-prefix boundaries; an all-zero row requests no extra publication.
-HCA and both CSA compressors publish the union of the required history windows
-from their existing tile projections, in addition to their normal terminal tails. A window spanning chunks is completed
-by those chunks before it becomes reusable. Intermediate state positions are
-not all materialized and must not be indexed as immutable Prefix Cache solely
-because their tokens have been computed.
+Prefill also takes `state_checkpoint_ends`, an INT32
+`[requests, checkpoint_tiles, 6]` tensor (rank-stacked in L3).
+Checkpoint tiles follow each request's own 512-token projection tiles. Each
+ordered row names at most four periodic boundaries on the common 128-token
+alignment plus two replay/shared boundaries; unused entries are zero. The
+caller chooses the retention interval independently of the Prefill chunk.
+A boundary is placed in the tile where it ends. Any earlier fragment of its
+history is covered by the preceding tile's normal tail, whose extent is at
+least the required checkpoint history. Empty rows skip extra publication.
+HCA and both CSA compressors publish the union of the selected history windows
+from existing tile projections, in addition to their normal terminal tails.
+Intermediate state positions are not all materialized and must not be indexed
+as immutable Prefix Cache solely because their tokens have been computed.
 
 Prefill state read tables and write slot mappings may name different physical
 pages. The read tables preserve the entry history before the request's first
@@ -139,7 +143,7 @@ must use other pages or the caller's existing copy-on-write mechanism.
 Increasing the read view alone does not protect checkpoint destination pages.
 
 The compressor fixture builders accept `checkpoint_end=0` by default. A
-nonzero boundary, or a tuple of up to three boundaries, allocates non-aliasing
+nonzero boundary, or a tuple of boundaries with at most six ending per tile, allocates non-aliasing
 entry and publication rows covering that bounded fixture. A partial entry page retains its history rows and accepts
 new rows in place, keeping the checkpoint representable by one page table.
 The Host references reject missing or aliased state.

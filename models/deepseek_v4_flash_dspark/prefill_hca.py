@@ -33,7 +33,10 @@ from prefill_compressor_ratio128 import (
     golden_prefill_compressor_ratio128,
     prefill_compressor_ratio128,
 )
-from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN
+from prefill_metadata import (
+    CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
+    QUERY_START_LOC_DYN, REQUESTS_DYN,
+)
 from qkv_proj_rope import golden_qkv_proj_rope, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
@@ -112,7 +115,7 @@ HCA_CMP_BLOCK_NUM = SPARSE_CMP_BLOCK_NUM
 def _prefill_attention_hca(
     x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     local_request_ids: pl.Tensor[[T_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -153,6 +156,7 @@ def _prefill_attention_hca(
     x_hc.bind_dynamic(0, T_DYN)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
     state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
     local_request_ids.bind_dynamic(0, T_DYN)
     compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
     compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
@@ -733,10 +737,12 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     # into [GROUPS, D, O_LORA] before packing each group's fractal blocks.
     wo_b_i8_groups = wo_b_i8.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2).contiguous()
 
+    checkpoint_tensor = checkpoint_ends_tensor([checkpoint_end], starts=[start_pos], lengths=[token_count])
+
     return [
         TensorSpec("x_hc", [token_count, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=init_query_start_loc),
-        TensorSpec("state_checkpoint_ends", [1, 3], torch.int32, init_value=checkpoint_ends_tensor([checkpoint_end])),
+        TensorSpec("state_checkpoint_ends", list(checkpoint_tensor.shape), torch.int32, init_value=checkpoint_tensor),
         TensorSpec("local_request_ids", [token_count], torch.int32, init_value=init_local_request_ids),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
@@ -800,7 +806,7 @@ def prefill_attention_hca_cp_core(
     x_normed_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
     x_normed_full: pl.Tensor[[CP_KV_T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
@@ -986,7 +992,7 @@ def prefill_attention_hca_cp_core(
 def prefill_attention_hca_cp(
     x_hc_full: pl.Tensor[[CP_KV_T_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -1113,7 +1119,7 @@ def prefill_attention_hca_cp(
 def prefill_attention_hca_cp_test(
     x_hc_full: pl.Tensor[[CP_KV_T_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -1164,6 +1170,7 @@ def prefill_attention_hca_cp_test(
     x_hc_full.bind_dynamic(0, CP_KV_T_DYN)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
     state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
     local_request_ids.bind_dynamic(0, CP_Q_T_DYN)
     compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
     compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
@@ -1216,7 +1223,7 @@ def prefill_attention_hca_cp_test(
 def l3_prefill_attention_hca_cp(
     x_hc_full: pl.Tensor[[TP_SIZE, CP_KV_T_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[TP_SIZE, QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[TP_SIZE, REQUESTS_DYN, 3], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[TP_SIZE, REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     local_request_ids: pl.Tensor[[TP_SIZE, CP_Q_T_DYN], pl.INT32],
     hc_attn_fn: pl.Tensor[[TP_SIZE, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[TP_SIZE, 3], pl.FP32],
@@ -1259,6 +1266,7 @@ def l3_prefill_attention_hca_cp(
     x_hc_full.bind_dynamic(1, CP_KV_T_DYN)
     query_start_loc.bind_dynamic(1, QUERY_START_LOC_DYN)
     state_checkpoint_ends.bind_dynamic(1, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(2, CHECKPOINT_TILES_DYN)
     local_request_ids.bind_dynamic(1, CP_Q_T_DYN)
     compress_state.bind_dynamic(1, STATE_BLOCK_NUM_DYN)
     compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
@@ -1494,9 +1502,10 @@ def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE, checkpoint_ends: tuple
         max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
     )
 
+    checkpoint_tensor = checkpoint_ends_tensor(checkpoint_ends, starts=request_starts, lengths=(3, 4))
     replacements = {
         "query_start_loc": cp_stack(query_start_loc, tp_size),
-        "state_checkpoint_ends": cp_stack(checkpoint_ends_tensor(checkpoint_ends), tp_size),
+        "state_checkpoint_ends": cp_stack(checkpoint_tensor, tp_size),
         "local_request_ids": request_ids.reshape(tp_size, token_count // tp_size).contiguous(),
         "freqs_cos": cp_stack(freqs_cos, tp_size),
         "freqs_sin": cp_stack(freqs_sin, tp_size),

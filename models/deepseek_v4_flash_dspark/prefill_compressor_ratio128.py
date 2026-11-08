@@ -20,7 +20,10 @@ from config import (
     HCA_STATE_PHYSICAL_BLOCKS,
     PREFILL_SEQ,
 )
-from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN
+from prefill_metadata import (
+    CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
+    QUERY_START_LOC_DYN, REQUESTS_DYN,
+)
 
 
 
@@ -100,7 +103,7 @@ def _prefill_compressor_ratio128_tile(
     request_start: pl.Scalar[pl.INDEX],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
-    checkpoint_ends: pl.Tensor[[3], pl.INT32],
+    checkpoint_ends: pl.Tensor[[CHECKPOINTS_PER_TILE], pl.INT32],
 ):
     state_block_num = pl.tensor.dim(compress_state, 0)
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
@@ -305,12 +308,13 @@ def _prefill_compressor_ratio128_tile(
     tile_position = pl.read(position_ids, [tile_base])
     checkpoint_rows = pl.cast(0, pl.INDEX)
     previous_end = pl.cast(0, pl.INT32)
-    for checkpoint_i in pl.range(3):
-        checkpoint_end = pl.read(checkpoint_ends, [checkpoint_i])
-        checkpoint_begin = pl.max(tile_position, pl.max(checkpoint_end - STATE_LEN, previous_end))
-        checkpoint_stop = pl.min(tile_position + tail_base, checkpoint_end)
-        checkpoint_rows = checkpoint_rows + pl.max(0, checkpoint_stop - checkpoint_begin)
-        previous_end = pl.max(previous_end, checkpoint_end)
+    if pl.read(checkpoint_ends, [0]) > 0:
+        for checkpoint_i in pl.range(CHECKPOINTS_PER_TILE):
+            checkpoint_end = pl.read(checkpoint_ends, [checkpoint_i])
+            checkpoint_begin = pl.max(tile_position, pl.max(checkpoint_end - STATE_LEN, previous_end))
+            checkpoint_stop = pl.min(tile_position + tail_base, checkpoint_end)
+            checkpoint_rows = checkpoint_rows + pl.max(0, checkpoint_stop - checkpoint_begin)
+            previous_end = pl.max(previous_end, checkpoint_end)
     with pl.spmd(
         tail_rows + checkpoint_rows,
         name_hint="prefill_hca_c128_state_tail_update",
@@ -321,7 +325,7 @@ def _prefill_compressor_ratio128_tile(
         if tail_i >= tail_rows:
             checkpoint_offset = tail_i - tail_rows
             selected_previous = pl.cast(0, pl.INT32)
-            for selected_i in pl.range(3):
+            for selected_i in pl.range(CHECKPOINTS_PER_TILE):
                 selected_end = pl.read(checkpoint_ends, [selected_i])
                 selected_begin = pl.max(tile_position, pl.max(selected_end - STATE_LEN, selected_previous))
                 selected_stop = pl.min(tile_position + tail_base, selected_end)
@@ -436,7 +440,7 @@ def _prefill_compressor_ratio128_tile(
 def _prefill_compressor_ratio128(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     compress_state: pl.InOut[
         pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
@@ -459,6 +463,7 @@ def _prefill_compressor_ratio128(
     x.bind_dynamic(0, T_DYN)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
     state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
     compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
     compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
@@ -526,7 +531,7 @@ def _prefill_compressor_ratio128(
                     request_start,
                     tile_base,
                     tile_rows,
-                    state_checkpoint_ends[request],
+                    state_checkpoint_ends[request, request_offset // PREFILL_STATE_TILE],
                 )
     return cmp_kv, compress_state
 
@@ -710,10 +715,12 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     def init_state_slot_mapping():
         return state_mapping.clone()
 
+    checkpoint_tensor = checkpoint_ends_tensor([checkpoint_end], starts=[start_pos], lengths=[token_count])
+
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
-        TensorSpec("state_checkpoint_ends", [1, 3], torch.int32, init_value=checkpoint_ends_tensor([checkpoint_end])),
+        TensorSpec("state_checkpoint_ends", list(checkpoint_tensor.shape), torch.int32, init_value=checkpoint_tensor),
         TensorSpec(
             "compress_state",
             [state_blocks, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],

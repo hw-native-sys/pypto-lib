@@ -91,7 +91,10 @@ from prefill_cp_token_allgather import (
     PREFILL_GROUP_CAP,
     TP_SIZE,
 )
-from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN, lower_local_request_ids
+from prefill_metadata import (
+    CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
+    QUERY_START_LOC_DYN, REQUESTS_DYN, lower_local_request_ids,
+)
 from prefill_o_proj import (
     O_PROJ_LOCAL_GROUPS,
     O_PROJ_SCRATCH_D,
@@ -264,7 +267,7 @@ def _copy_target_hc_row(
 def prefill_fwd(
     x_hc: pl.InOut[pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -392,6 +395,7 @@ def prefill_fwd(
     """
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
     state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
     hca_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     csa_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     csa_inner_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
@@ -1138,7 +1142,7 @@ def prefill_fwd(
 def l3_prefill_fwd(
     x_hc: pl.InOut[pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     query_start_loc: pl.Tensor[[N_RANKS, QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[N_RANKS, REQUESTS_DYN, 3], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[N_RANKS, REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -1255,6 +1259,7 @@ def l3_prefill_fwd(
     x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     query_start_loc.bind_dynamic(1, QUERY_START_LOC_DYN)
     state_checkpoint_ends.bind_dynamic(1, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(2, CHECKPOINT_TILES_DYN)
     hca_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
     csa_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
     csa_inner_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)

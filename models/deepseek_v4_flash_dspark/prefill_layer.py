@@ -99,7 +99,10 @@ from prefill_hca import (
     prefill_attention_hca_cp,
 )
 from prefill_cp_token_allgather import PREFILL_GROUP_CAP, TP_SIZE
-from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN, lower_local_request_ids
+from prefill_metadata import (
+    CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
+    QUERY_START_LOC_DYN, REQUESTS_DYN, lower_local_request_ids,
+)
 from prefill_swa import golden_prefill_attention_swa, prefill_attention_swa_cp
 
 
@@ -123,7 +126,7 @@ if GROUP_TOKENS > PREFILL_GROUP_CAP:
 def prefill_layer_attention(
     x_hc: pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, 3], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -201,6 +204,7 @@ def prefill_layer_attention(
     x_hc.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
     state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
     hca_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     csa_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     csa_inner_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
@@ -438,7 +442,7 @@ def prefill_layer_moe(
 def l3_prefill_layer(
     x_hc: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[N_RANKS, QUERY_START_LOC_DYN], pl.INT32],
-    state_checkpoint_ends: pl.Tensor[[N_RANKS, REQUESTS_DYN, 3], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[N_RANKS, REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
@@ -533,6 +537,7 @@ def l3_prefill_layer(
     x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     query_start_loc.bind_dynamic(1, QUERY_START_LOC_DYN)
     state_checkpoint_ends.bind_dynamic(1, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(2, CHECKPOINT_TILES_DYN)
     hca_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
     csa_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
     csa_inner_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
