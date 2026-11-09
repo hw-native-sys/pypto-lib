@@ -23,8 +23,9 @@ hand-written CCE implementation is still retained.
 def paged_attention_pypto_swpipe(...):
     active_batch = pl.tensor.dim(seq_lens, 0)
     num_tasks = active_batch * 8
+    attn_blocks = pl.system.available_cluster_count()
 
-    with pl.spmd(24, sync_start=True, deps=[...]) as attn_tid:
+    with pl.spmd(attn_blocks, sync_start=True, deps=[...]) as attn_tid:
         core = pl.tile.get_block_idx()
 
         # 1. Prepare the current token: Q/K norm, RoPE, and K/V cache append (Chapter 4).
@@ -33,7 +34,7 @@ def paged_attention_pypto_swpipe(...):
 
         publish_gm_and_sync_mixed_cores()
 
-        for task in pl.range(core, num_tasks, 24):
+        for task in pl.range(core, num_tasks, attn_blocks):
             # AIC loop
             for tick in pl.range(stack_count + 2):
                 if tick < stack_count:
@@ -175,7 +176,7 @@ enter `deps`; the standalone entry uses `task_dummy` as a placeholder.
 | `ffts_workspace` | `[256]` INT64 | Synchronization primitive | Event control state; no Attention values |
 
 ```text title="Three-slot row layout · GM mailbox"
-1152 rows = 24 cores × 3 ring slots × 16 physical rows
+1152 rows = 24-block static cap × 3 ring slots × 16 physical rows
 
 transfer_base = core * 3 * 16
 slot_row      = transfer_base + (stack % 3) * 16
@@ -184,6 +185,11 @@ slot_row      = transfer_base + (stack % 3) * 16
 Each core owns three slots. Every slot reserves 16 rows for cube, but only the
 first five rows are valid for one task. A later stack reuses the slot after its
 consumer finishes.
+
+The row total is sized once from the static cap of 24 blocks — the largest
+launch width a supported die reports — while the launch width itself is this
+run's cluster count (Chapter 3.2). Dies with fewer clusters simply leave the
+tail rows unused.
 
 ### 2.3 Dynamic dimensions change only the descriptor { #step-2-3 }
 
@@ -205,7 +211,7 @@ q2d = reshape(q_tnd_flat, [active_batch * 40, 128])
 ## 3. Build the mixed-core SPMD shell { #step-3 }
 
 This chapter does not compute Attention. It establishes the AIC/AIV division
-of work and assigns tasks to 24 cores.
+of work and assigns tasks to one core per cluster.
 
 ### 3.1 AIC/AIV work on one core { #step-3-1 }
 
@@ -224,11 +230,11 @@ ordering inside each stack.
 `pl.split_aiv(2)` makes two AIV lanes execute one copy of the vector code each;
 AIC executes the QK and PV matrix multiplications.
 
-### 3.2 Launch 24 cores { #step-3-2 }
+### 3.2 Launch every cluster { #step-3-2 }
 
-```python title="Mixed-core shell · core = 0…23"
+```python title="Mixed-core shell · one core per cluster"
 with pl.spmd(
-    24,
+    pl.system.available_cluster_count(),
     name_hint="attn_swpipe_spmd",
     sync_start=True,
     allow_early_resolve=True,
@@ -238,29 +244,35 @@ with pl.spmd(
     pl.system.set_ffts(ffts_workspace)
 ```
 
-SPMD means that 24 cores run the same program. `get_block_idx()` returns one
-index from 0 through 23 for each copy.
+SPMD means that one copy per cluster of this run executes the same program —
+24 on a ≥24-cluster die, 20 on a 910B3. `get_block_idx()` returns one index
+from 0 through `count - 1` for each copy. The launch carries a hard
+`syncall` (Chapter 4.4), which completes only when every block is co-resident,
+so the width must be the run's own cluster count: `available_cluster_count()`
+resolves to exactly that on any die, while a baked-in literal overfills smaller
+dies (the AICPU runtime rejects the submit) and underfills larger ones.
 
 ### 3.3 Assign tasks with a grid stride { #step-3-3 }
 
-Each task is handled completely by one core. There are 24 cores, so each core
-steps by 24 to claim its next task:
+Each task is handled completely by one core. The launch width is this run's
+cluster count, so each core steps by `attn_blocks` to claim its next task:
 
-```python title="Task assignment · stride = 24 cores"
-for task in pl.range(core, num_tasks, 24):
+```python title="Task assignment · stride = launch width"
+for task in pl.range(core, num_tasks, attn_blocks):
     ...
 ```
 
-| Core | Tasks processed in order when `active_batch = 16` |
+| Core | Tasks processed in order when `active_batch = 16` on a 24-cluster die |
 | ---: | --- |
 | 0 | 0, 24, 48, 72, 96, 120 |
 | 1 | 1, 25, 49, 73, 97, 121 |
 | … | … |
 | 23 | 23, 47, 71, 95, 119 |
 
-With only two batch rows there are 16 tasks. Cores 0–15 process one task each;
-cores 16–23 do not enter the Attention task loop, but they still participate in
-the preceding Phase 0 and mixed barrier.
+On a 20-cluster die the stride is 20 and the table stops at core 19. With only
+two batch rows there are 16 tasks. Cores 0–15 process one task each; the
+remaining cores do not enter the Attention task loop, but they still
+participate in the preceding Phase 0 and mixed barrier.
 
 ## 4. Implement Phase 0 and the GM barrier { #step-4 }
 

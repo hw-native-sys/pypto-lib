@@ -27,11 +27,8 @@ SEQ_LEN = 3584  # 7 * 512 — page & stack clean
 MAX_BLOCKS = SEQ_LEN // BLOCK_SIZE  # 28
 NUM_BLOCKS = BATCH * MAX_BLOCKS  # 448
 NUM_TASKS = BATCH * NUM_KV_HEADS  # 128
-# Static platform cap (PLATFORM_MAX_BLOCKDIM): the largest SPMD width any
-# supported die may report via pl.system.available_cluster_count(). This only
-# sizes the transfer buffer (TRANSFER_ROWS) — it is never a launch width; the
-# swpipe launch itself uses the run's cluster count (see the note in
-# paged_attention_pypto_swpipe).
+# TRANSFER_ROWS sizing cap: the largest width any supported die reports.
+# The launch width is always pl.system.available_cluster_count().
 TRANSFER_BUFFER_BLOCK_CAP = 24
 PRE_LAUNCH = 2
 TRANSFER_SLOTS = PRE_LAUNCH + 1
@@ -100,15 +97,8 @@ def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention AP
     scratch_ready_tid: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Run fused Q/K norm, RoPE, cache append, and dynamic paged attention."""
-    # Sync-start launch width. This spmd carries a hard MIX syncall
-    # (pl.system.syncall below), so it needs full occupancy + sync_start and
-    # the HardSyncallOccupancyValid verifier only accepts the run's own
-    # cluster count here — the literal 24 upstream tuning holds only on
-    # >=24-cluster dies (the CI pool). On this host's 910B3 (20 clusters/die)
-    # the AICPU runtime aborted the decode dispatch with rc=-7 (507018,
-    # "require_sync_start block_num=24 > limit=20 (deadlock guaranteed)")).
-    # TRANSFER_ROWS stays sized from the static TRANSFER_BUFFER_BLOCK_CAP=24
-    # platform cap, so a smaller runtime width merely leaves the tail rows
+    # Hard-syncall launch width: the run's cluster count (pypto-lib#1384).
+    # TRANSFER_ROWS keeps its static cap; a smaller width leaves tail rows
     # unused.
     attn_blocks = pl.system.available_cluster_count()
     active_batch = pl.tensor.dim(seq_lens, 0)
