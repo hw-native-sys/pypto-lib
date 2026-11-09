@@ -2,11 +2,12 @@
 
 The Flash TopK-6 decode path uses a stock ISA C++ kernel for expert return,
 arrival polling, shared-plus-routed reduction, and packet-marker cleanup.
-The tables compare the original split DSL, initial C++ implementation, and
-revised C++ implementation with AscendC A5 MTE `MoEDistributeCombine`.
-The revised source removes redundant work, but per-rank latency changes are
-mixed and do not establish a universal speedup. This is a
-kernel comparison, not a full-MoE or runtime speedup claim.
+The tables compare the pre-PR split DSL with the final C++ implementation;
+AscendC A5 MTE `MoEDistributeCombine` is the external reference. Intermediate
+C++ measurements remain in the raw evidence, outside the performance tables.
+The original DSL has stage-level timings rather than a comparable complete
+kernel interval, so these data do not establish an overall before/after
+speedup. This is a kernel comparison, not a full-MoE or runtime speedup claim.
 
 ## Integration and numerical contract
 
@@ -55,24 +56,23 @@ bodies and overlaps runtime scheduling, so the retained traces do not provide
 a comparable complete-return kernel latency for the original path. Do not
 sum these stages or calculate a before/after speedup from this table.
 
-Both C++ columns and CANN cover their respective complete fused kernel
+Final C++ and CANN cover their respective complete fused kernel
 execution intervals, as defined below. The original M48 DSL uses 64 scatter
 workers, 24 reduce workers, and one each for notify/wait; both fused kernels
 use 64 AIV. The common maximum budget is 64 AIV, not identical work assignment.
 
-| Remote / local rows per rank | Rank | Split DSL S / N / W / R | Initial C++ | Revised C++ | CANN |
-| --- | --- | --- | ---: | ---: | ---: |
-| 9 / 279 | 0 | 3.023 / 1.522 / 1.178 / 4.491 | 17.214 | 20.476 | 15.997 |
-| 9 / 279 | 1 | 2.967 / 1.569 / 1.316 / 4.532 | 14.055 | 13.632 | 15.844 |
-| 144 / 144 | 0 | 35.096 / 1.551 / 1.255 / 5.271 | 58.501 | 58.500 | 58.302 |
-| 144 / 144 | 1 | 35.511 / 1.518 / 1.249 / 5.217 | 49.660 | 49.068 | 57.438 |
-| 279 / 9 | 0 | 74.558 / 1.519 / 1.274 / 5.419 | 100.009 | 102.745 | 102.088 |
-| 279 / 9 | 1 | 75.628 / 1.517 / 1.208 / 5.397 | 95.197 | 91.394 | 100.913 |
+| Remote / local rows per rank | Rank | Pre-PR DSL S / N / W / R | Final C++ | CANN |
+| --- | --- | --- | ---: | ---: |
+| 9 / 279 | 0 | 3.023 / 1.522 / 1.178 / 4.491 | 20.476 | 15.997 |
+| 9 / 279 | 1 | 2.967 / 1.569 / 1.316 / 4.532 | 13.632 | 15.844 |
+| 144 / 144 | 0 | 35.096 / 1.551 / 1.255 / 5.271 | 58.500 | 58.302 |
+| 144 / 144 | 1 | 35.511 / 1.518 / 1.249 / 5.217 | 49.068 | 57.438 |
+| 279 / 9 | 0 | 74.558 / 1.519 / 1.274 / 5.419 | 102.745 | 102.088 |
+| 279 / 9 | 1 | 75.628 / 1.517 / 1.208 / 5.397 | 91.394 | 100.913 |
 
-For small M48 traffic, the larger of the two rank medians increased from
-17.214 to 20.476 us; this is an observed regression, not a speedup. The initial
-capture used devices 0/1 on November 6, and the revised capture used devices
-1/3 on November 9. Both ranks and the original samples remain visible.
+For small M48 traffic, final C++ rank 0 is slower than CANN while rank 1
+is faster. Report both ranks; selecting only the faster rank would hide this
+imbalance. Capture devices and dates are recorded with the retained samples.
 
 The 144-row case is uniform EP2 routing. The 9-row case models the average
 traffic to one of 32 expert ranks: `48 * 6 / 32 = 9` rows. The 279-row case
@@ -105,38 +105,34 @@ uniform EP2 case has 216 remote / 216 local rows. Dtypes, accumulation, maximum
 64-AIV budget, warmup/sample counts, and kernel timing definitions match M48.
 The original DSL uses 64 scatter, 40 reduce, and one notify/wait worker each.
 
-| Remote / local rows per rank | Rank | Split DSL S / N / W / R | Initial C++ | Revised C++ | CANN |
-| --- | --- | --- | ---: | ---: | ---: |
-| 14 / 418 | 0 | 3.808 / 1.395 / 1.202 / 4.615 | 16.997 | 20.977 | 17.798 |
-| 14 / 418 | 1 | 3.798 / 1.731 / 1.361 / 4.611 | 22.805 | 17.148 | 17.898 |
-| 216 / 216 | 0 | 55.042 / 1.468 / 1.256 / 5.341 | 82.321 | 82.204 | 80.739 |
-| 216 / 216 | 1 | 56.716 / 1.763 / 1.313 / 5.330 | 73.420 | 72.848 | 80.803 |
+| Remote / local rows per rank | Rank | Pre-PR DSL S / N / W / R | Final C++ | CANN |
+| --- | --- | --- | ---: | ---: |
+| 14 / 418 | 0 | 3.808 / 1.395 / 1.202 / 4.615 | 20.977 | 17.798 |
+| 14 / 418 | 1 | 3.798 / 1.731 / 1.361 / 4.611 | 17.148 | 17.898 |
+| 216 / 216 | 0 | 55.042 / 1.468 / 1.256 / 5.341 | 82.204 | 80.739 |
+| 216 / 216 | 1 | 56.716 / 1.763 / 1.313 / 5.330 | 72.848 | 80.803 |
 
-For small M72 traffic, rank 1 changed from 22.805 to 17.148 us, while rank 0
-changed from 16.997 to 20.977 us. The larger rank median therefore changed
-from 22.805 to 20.977 us, not to 17.148 us. The slower rank changed; the
-measurements do not establish that a fixed 5-us cost was eliminated or that
-both ranks are consistently below 20 us. The initial M72 small-traffic capture used devices 1/2; the revised capture
-used devices 1/3, in a separate run.
+For small M72 traffic, final C++ measures 20.977 / 17.148 us on ranks 0 / 1,
+versus CANN's 17.798 / 17.898 us. This does not establish that both ranks are
+consistently below 20 us or that the rank imbalance has been resolved.
 
 The C++ and original DSL paths have 80 physical output rows and zero the final
 eight; the CANN fixtures have 72 physical rows. All return the same 72 valid
 BF16 rows. The C++ interval includes this padding work. The same native body
 supports both token counts; there is no separate tuned M48 implementation.
 
-All initial C++ and CANN samples were retained. The current revised C++ was
-captured once per listed condition on November 9, on devices 1/3, with 5
-warmups and 100 samples per rank. No original C++ or CANN performance
-condition was recollected. The older M72 uniform C++/CANN captures used
-devices 4/5. Device and source identities are retained per capture.
+All existing DSL, intermediate C++ and CANN samples were retained. Final
+C++ was captured once per listed condition on November 9, on devices 1/3,
+with 5 warmups and 100 samples per rank. M48 CANN captures used devices 0/1
+on November 6; M72 uniform used 4/5, and M72 small traffic used 1/2.
+Device and source identities are retained per capture. No existing
+performance condition was recollected for this presentation.
 
 The raw level-1 trace contains body start/end per physical core, not logical
 block roles, packet-arrival times, or poll/copy/reduction phase boundaries.
-For the initial M72 small-traffic rank 1, the maximum-core execution median
-was 21.871 us, versus its 22.805-us kernel interval. Thus the gap was not only
-an envelope around shorter cores. This evidence still cannot assign the
-roughly 5-us CANN gap entirely to communication waits or any individual
-source operation. Kernel-internal waiting remains included in every column.
+It cannot attribute rank differences precisely to communication waits or
+individual source operations. Kernel-internal waiting remains included in
+the final C++ and CANN columns.
 
 The composed MoE passed its original golden tolerances for active-token counts
 `[48, 48]`, `[72, 72]`, and `[0, 37]`. Standalone 48- and 72-token routing cases
@@ -190,11 +186,9 @@ the fixed model kernel. The JSON retains the full detail audit.
 | Shared and weighted inputs | C++ starts from shared and consumes already-weighted rows; CANN adds shared later and multiplies route scales | Preserve the model's numerical/input contract; matched fixtures keep shared zero and CANN scales one |
 | Buffer reuse and completion | The persistent C++ caller and CANN launch have different state/fence ownership | Preserve descriptor invalidation, draining and peer-release requirements |
 
-The initialization-only candidate and a candidate without marker batching
-were also checked, using separate source revisions and no baseline recapture.
-Neither established a universal latency improvement. The final source adds
-descriptor coalescing and retains the explicit mixed per-rank measurements
-above; no source-level work count is converted into an unmeasured us saving.
+The final source includes descriptor coalescing and the initialization
+changes above. Intermediate measurements remain available in the retained
+evidence; no source-level work count is converted into an unmeasured saving.
 
 The descriptor change was checked on 1,881 CPU ranges across EP2/4/8 metadata,
 including empty experts and partial source segments. This is an index-mapping
