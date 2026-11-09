@@ -29,7 +29,7 @@ from models.glm5_3_flash.elementwise import (
     accurate_divide, accurate_exp, accurate_row_sum, accurate_rsqrt, accurate_sigmoid, accurate_silu,
     accurate_sqrt,
 )
-from models.glm5_3_flash.linear import bf16_linear_row, bf16_matmul, golden_bf16_linear
+from models.glm5_3_flash.linear import bf16_matmul, golden_bf16_linear
 from models.glm5_3_flash.rmsnorm import l2norm, reference_l2norm, rms_norm_gated
 from models.glm5_3_flash.utils import _assert_close, _randn
 
@@ -51,12 +51,12 @@ CONV_POOL_ROWS = 6
 PROJECTION_WORKERS_TILE = 32256  # Runtime set_block_num ceiling
 PROJECTION_T_TILE = 16
 QKV_PAD_N_TILE = 256
-PROJECTION_N_TILE = 16
-PROJECTION_K_TILE = 512
-PROJECTION_PIPELINE_TILE = 1
 PROJECTION_MM_N_TILE = 64  # cube N tile of the batched q/k/v projection
 PROJECTION_MM_K_TILE = 256  # cube K tile shared by the batched projections
+BOTTLENECK_N_TILE = 32
+BOTTLENECK_K_TILE = 256
 GATE_PROJECTION_N_TILE = 64
+GATE_PROJECTION_K_TILE = 128
 OUTPUT_PROJECTION_MM_N_TILE = 128  # cube N tile of the batched output projection
 OUTPUT_PROJECTION_MM_K_TILE = 128  # narrower K tile keeps the 128-column staging inside Vec
 BETA_N_TILE = 16  # 32-byte BF16 output row
@@ -464,35 +464,64 @@ def kda_projection(
     b_raw_gm = pl.create_tensor([t_pad, BETA_PAD], dtype=pl.BF16)
     g_a_gm = pl.create_tensor([t_pad, KDA_DIM], dtype=pl.BF16)
     f_a_gm = pl.create_tensor([t_pad, KDA_DIM], dtype=pl.BF16)
-    bottleneck_tasks = t_dim * (KDA_DIM // PROJECTION_N_TILE)
-    with pl.spmd(pl.min(bottleneck_tasks, PROJECTION_WORKERS_TILE), name_hint="kda_projection_bottleneck", deps=[pad_tid]) as bottleneck_tid:
+    bottleneck_tasks = tiles * (KDA_DIM // BOTTLENECK_N_TILE)
+    bottleneck_workers = pl.min(bottleneck_tasks, PROJECTION_WORKERS_TILE)
+    with pl.spmd(bottleneck_workers, name_hint="kda_projection_bottleneck", deps=[pad_tid]) as bottleneck_tid:
         for task in pl.range(pl.tile.get_block_idx(), bottleneck_tasks, PROJECTION_WORKERS_TILE):
-            t0 = task // (KDA_DIM // PROJECTION_N_TILE)
-            n0 = task % (KDA_DIM // PROJECTION_N_TILE) * PROJECTION_N_TILE
-            f_a = bf16_linear_row(x, w_f_a, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+            t0 = task // (KDA_DIM // BOTTLENECK_N_TILE) * PROJECTION_T_TILE
+            n0 = task % (KDA_DIM // BOTTLENECK_N_TILE) * BOTTLENECK_N_TILE
+            rows = pl.min(PROJECTION_T_TILE, t_dim - t0)
+            k_start = pl.cast(0, pl.INDEX)
+            columns = pl.cast(BOTTLENECK_N_TILE, pl.INDEX)
+            f_a = bf16_matmul(
+                x, w_f_a, t0, n0, k_start, rows, columns,
+                PROJECTION_T_TILE, BOTTLENECK_N_TILE, BOTTLENECK_K_TILE, D,
+            )
             f_a_bf16 = pl.cast(f_a, pl.BF16, mode="rint")
-            f_a_gm[t0:t0 + 1, n0:n0 + PROJECTION_N_TILE] = f_a_bf16
-            g_a = bf16_linear_row(x, w_g_a, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+            f_a_valid = pl.set_validshape(f_a_bf16, rows, BOTTLENECK_N_TILE)
+            f_a_gm[t0:t0 + PROJECTION_T_TILE, n0:n0 + BOTTLENECK_N_TILE] = f_a_valid
+            g_a = bf16_matmul(
+                x, w_g_a, t0, n0, k_start, rows, columns,
+                PROJECTION_T_TILE, BOTTLENECK_N_TILE, BOTTLENECK_K_TILE, D,
+            )
             g_a_bf16 = pl.cast(g_a, pl.BF16, mode="rint")
-            g_a_gm[t0:t0 + 1, n0:n0 + PROJECTION_N_TILE] = g_a_bf16
+            g_a_valid = pl.set_validshape(g_a_bf16, rows, BOTTLENECK_N_TILE)
+            g_a_gm[t0:t0 + PROJECTION_T_TILE, n0:n0 + BOTTLENECK_N_TILE] = g_a_valid
             if n0 == 0:
                 for b0 in pl.range(0, BETA_PAD, BETA_N_TILE):
-                    b_raw = bf16_linear_row(x, w_b_pad, t0, b0, BETA_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+                    beta_columns = pl.cast(BETA_N_TILE, pl.INDEX)
+                    b_raw = bf16_matmul(
+                        x, w_b_pad, t0, b0, k_start, rows, beta_columns,
+                        PROJECTION_T_TILE, BETA_N_TILE, BOTTLENECK_K_TILE, D,
+                    )
                     b_raw_bf16 = pl.cast(b_raw, pl.BF16, mode="rint")
-                    b_raw_gm[t0:t0 + 1, b0:b0 + BETA_N_TILE] = b_raw_bf16
+                    b_raw_valid = pl.set_validshape(b_raw_bf16, rows, BETA_N_TILE)
+                    b_raw_gm[t0:t0 + PROJECTION_T_TILE, b0:b0 + BETA_N_TILE] = b_raw_valid
     out_gate_flat = pl.reshape(out_gate, [t_dim, LOCAL_KDA_QKV_DIM])
     g_raw_gm = pl.create_tensor([t_pad, LOCAL_KDA_QKV_DIM], dtype=pl.BF16)
-    output_tasks = t_dim * (LOCAL_KDA_QKV_DIM // GATE_PROJECTION_N_TILE)
-    with pl.spmd(pl.min(output_tasks, PROJECTION_WORKERS_TILE), name_hint="kda_projection_output", deps=[bottleneck_tid]) as output_tid:
+    output_tasks = tiles * (LOCAL_KDA_QKV_DIM // GATE_PROJECTION_N_TILE)
+    output_workers = pl.min(output_tasks, PROJECTION_WORKERS_TILE)
+    with pl.spmd(output_workers, name_hint="kda_projection_output", deps=[bottleneck_tid]) as output_tid:
         for task in pl.range(pl.tile.get_block_idx(), output_tasks, PROJECTION_WORKERS_TILE):
-            t0 = task // (LOCAL_KDA_QKV_DIM // GATE_PROJECTION_N_TILE)
+            t0 = task // (LOCAL_KDA_QKV_DIM // GATE_PROJECTION_N_TILE) * PROJECTION_T_TILE
             n0 = task % (LOCAL_KDA_QKV_DIM // GATE_PROJECTION_N_TILE) * GATE_PROJECTION_N_TILE
-            g_raw = bf16_linear_row(f_a_gm, w_f_b, t0, n0, GATE_PROJECTION_N_TILE, KDA_DIM, 128, 2)
+            rows = pl.min(PROJECTION_T_TILE, t_dim - t0)
+            k_start = pl.cast(0, pl.INDEX)
+            columns = pl.cast(GATE_PROJECTION_N_TILE, pl.INDEX)
+            g_raw = bf16_matmul(
+                f_a_gm, w_f_b, t0, n0, k_start, rows, columns,
+                PROJECTION_T_TILE, GATE_PROJECTION_N_TILE, GATE_PROJECTION_K_TILE, KDA_DIM,
+            )
             g_raw_bf16 = pl.cast(g_raw, pl.BF16, mode="rint")
-            g_raw_gm[t0:t0 + 1, n0:n0 + GATE_PROJECTION_N_TILE] = g_raw_bf16
-            out_raw = bf16_linear_row(g_a_gm, w_g_b, t0, n0, GATE_PROJECTION_N_TILE, KDA_DIM, 128, 2)
+            g_raw_valid = pl.set_validshape(g_raw_bf16, rows, GATE_PROJECTION_N_TILE)
+            g_raw_gm[t0:t0 + PROJECTION_T_TILE, n0:n0 + GATE_PROJECTION_N_TILE] = g_raw_valid
+            out_raw = bf16_matmul(
+                g_a_gm, w_g_b, t0, n0, k_start, rows, columns,
+                PROJECTION_T_TILE, GATE_PROJECTION_N_TILE, GATE_PROJECTION_K_TILE, KDA_DIM,
+            )
             out_raw_bf16 = pl.cast(out_raw, pl.BF16, mode="rint")
-            out_gate_flat[t0:t0 + 1, n0:n0 + GATE_PROJECTION_N_TILE] = out_raw_bf16
+            out_raw_valid = pl.set_validshape(out_raw_bf16, rows, GATE_PROJECTION_N_TILE)
+            out_gate_flat[t0:t0 + PROJECTION_T_TILE, n0:n0 + GATE_PROJECTION_N_TILE] = out_raw_valid
     dt_bias_row = pl.reshape(dt_bias, [1, LOCAL_KDA_QKV_DIM])
     decay_flat = pl.reshape(decay, [t_dim, LOCAL_KDA_QKV_DIM])
     with pl.spmd((t_dim + 3) // 4 * (LOCAL_KDA_QKV_DIM // KDA_DIM), name_hint="kda_projection_decay", deps=[output_tid]):
