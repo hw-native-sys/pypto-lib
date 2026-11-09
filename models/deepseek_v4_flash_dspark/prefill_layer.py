@@ -99,7 +99,10 @@ from prefill_hca import (
     prefill_attention_hca_cp,
 )
 from prefill_cp_token_allgather import PREFILL_GROUP_CAP, TP_SIZE
-from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN, lower_local_request_ids
+from prefill_metadata import (
+    CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
+    QUERY_START_LOC_DYN, REQUESTS_DYN, lower_local_request_ids,
+)
 from prefill_swa import golden_prefill_attention_swa, prefill_attention_swa_cp
 
 
@@ -123,6 +126,7 @@ if GROUP_TOKENS > PREFILL_GROUP_CAP:
 def prefill_layer_attention(
     x_hc: pl.Tensor[[FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -199,6 +203,8 @@ def prefill_layer_attention(
     """Run one selected DSA-CP attention kind."""
     x_hc.bind_dynamic(0, FWD_GROUP_TOKENS_DYN)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
     hca_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     csa_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     csa_inner_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
@@ -257,7 +263,7 @@ def prefill_layer_attention(
         elif layer_id == 2:
             attn_stage, gather_signal = prefill_attention_csa_cp(
                 x_hc,
-                query_start_loc,
+                query_start_loc, state_checkpoint_ends,
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_w,
                 wq_a, wq_b, wq_b_scale,
@@ -291,7 +297,7 @@ def prefill_layer_attention(
         else:
             attn_stage, gather_signal = prefill_attention_hca_cp(
                 x_hc,
-                query_start_loc, local_request_ids,
+                query_start_loc, state_checkpoint_ends, local_request_ids,
                 hc_attn_fn, hc_attn_scale, hc_attn_base,
                 attn_norm_w,
                 wq_a, wq_b, wq_b_scale,
@@ -436,6 +442,7 @@ def prefill_layer_moe(
 def l3_prefill_layer(
     x_hc: pl.Tensor[[N_RANKS, FWD_GROUP_TOKENS_DYN, HC_MULT, D], pl.FP32],
     query_start_loc: pl.Tensor[[N_RANKS, QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[N_RANKS, REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
@@ -529,6 +536,8 @@ def l3_prefill_layer(
     """Run one DSA-CP layer across all ranks."""
     x_hc.bind_dynamic(1, FWD_GROUP_TOKENS_DYN)
     query_start_loc.bind_dynamic(1, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(1, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(2, CHECKPOINT_TILES_DYN)
     hca_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
     csa_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
     csa_inner_compress_state_block_table.bind_dynamic(1, REQUESTS_DYN)
@@ -592,7 +601,7 @@ def l3_prefill_layer(
             tp_rank = rank % TP_SIZE
             prefill_layer_attention(
                 x_hc[rank],
-                query_start_loc[rank],
+                query_start_loc[rank], state_checkpoint_ends[rank],
                 hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
                 attn_norm_w[rank],
                 wq_a[rank], wq_b[rank], wq_b_scale[rank],
@@ -850,6 +859,7 @@ def _attention_golden_tensors(tensors, rank, layer_id, x_out):
     common = {
         "x_hc": tensors["x_hc"][rank],
         "query_start_loc": query_start_loc,
+        "state_checkpoint_ends": tensors["state_checkpoint_ends"][rank],
         "local_request_ids": local_request_ids,
         "hc_attn_fn": tensors["hc_attn_fn"][rank],
         "hc_attn_scale": tensors["hc_attn_scale"][rank],

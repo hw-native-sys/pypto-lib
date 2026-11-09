@@ -113,6 +113,46 @@ orchestrations, and the same `hc_head → rms_norm → lm_head` tail. Prompt
 sequence lengths that do not divide the CP group are padded rather than
 rejected, so one program serves an arbitrary chunk against a resident prefix.
 
+Prefill also takes `state_checkpoint_ends`, an INT32
+`[requests, checkpoint_tiles, 6]` tensor (rank-stacked in L3).
+Checkpoint tiles follow each request's own 512-token projection tiles. Each
+ordered row names at most four periodic boundaries on the common 128-token
+alignment plus two replay/shared boundaries; unused entries are zero. The
+caller chooses the retention interval independently of the Prefill chunk.
+A boundary is placed in the tile where it ends. Any earlier fragment of its
+history is covered by the preceding tile's normal tail, whose extent is at
+least the required checkpoint history. Empty rows skip extra publication.
+HCA and both CSA compressors publish the union of the selected history windows
+from existing tile projections, in addition to their normal terminal tails.
+Intermediate state positions are not all materialized and must not be indexed
+as immutable Prefix Cache solely because their tokens have been computed.
+
+Prefill state read tables and write slot mappings may name different physical
+pages. The read tables preserve the entry history before the request's first
+position; earlier tiles in the same forward are read through the existing
+write slot mappings, and the current tile uses projection scratch. Callers
+must retain entry pages until the forward settles and keep both views stable
+during execution. This permits compact state rings without copying history or
+changing the Prefill tensor-argument list. The three compressors' references
+accept both shared and distinct read/write views.
+
+Checkpoint publication and the normal tile tail must not assign different
+logical positions to the same physical row. Published checkpoint pages remain
+immutable until the caller drops their references; later tiles and forwards
+must use other pages or the caller's existing copy-on-write mechanism.
+Increasing the read view alone does not protect checkpoint destination pages.
+
+The compressor fixture builders accept `checkpoint_end=0` by default. A
+nonzero boundary, or a tuple of boundaries with at most six ending per tile, allocates non-aliasing
+entry and publication rows covering that bounded fixture. A partial entry page retains its history rows and accepts
+new rows in place, keeping the checkpoint representable by one page table.
+The Host references reject missing or aliased state.
+The three standalone compressor validations run the original zero-boundary
+case plus checkpoints inside a tile and across a tile boundary, including a
+non-aligned start. HCA/CSA CP builders forward `checkpoint_end`; their ragged
+builders accept per-request `checkpoint_ends`. These checks and extra fixture
+pages are validation-only and add no scan or synchronization to model execution.
+
 ### Attention under DSA-CP
 
 The three attention paths are the MTP tree's, re-cut along the token axis:

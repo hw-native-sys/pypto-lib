@@ -549,7 +549,7 @@ def _hca_streaming_attn_tile(
     cmp_cache_rows = cmp_block_num * HCA_CMP_STORAGE_BLOCK_SIZE
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
 
-    with pl.manual_scope():
+    with pl.scope():
         tile_cmp_work_count = pl.create_tensor([1], dtype=pl.INT32)
         with pl.at(
             level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stream_cmp_plan", deps=[packed_init_tid],
@@ -1118,7 +1118,7 @@ def _sparse_attn_o_proj(
     quant_rows = o_compute_rows // QUANT_TOKEN_TILE
     proj_b_rows = o_compute_rows // PROJ_B_ROW_TILE
 
-    with pl.manual_scope():
+    with pl.scope():
         # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], init_cond K loop.
         # Row-blocked over PROJ_A_ROW_TILE with a padded load, so the T_PAD-strided
         # o_packed slab never feeds uninitialized rows into the matmul.

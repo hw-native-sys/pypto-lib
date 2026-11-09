@@ -9,6 +9,7 @@
 """DeepSeek-V4 prefill indexer compressor for ratio-4 overlapping KV cache."""
 
 import pypto.language as pl
+from utils import checkpoint_ends_tensor
 
 from config import (
     BLOCK_SIZE,
@@ -21,7 +22,10 @@ from config import (
     INT8_SCALE_MAX,
     PREFILL_SEQ,
 )
-from prefill_metadata import QUERY_START_LOC_DYN, REQUESTS_DYN
+from prefill_metadata import (
+    CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE,
+    QUERY_START_LOC_DYN, REQUESTS_DYN,
+)
 
 # Bounded physical-row tile for index projection/state updates.
 PREFILL_STATE_TILE = 512
@@ -94,10 +98,14 @@ def _prefill_indexer_compressor_tile(
     rope_swap_idx_template: pl.Tensor[[PACKED_RMS_TILE, ROPE_HEAD_DIM], pl.INT32],
     rope_sign_template: pl.Tensor[[PACKED_RMS_TILE, ROPE_HEAD_DIM], pl.FP32],
     state_order_fence: pl.InOut[pl.Tensor[[1], pl.INT32]],
+    request_start: pl.Scalar[pl.INDEX],
     tile_base: pl.Scalar[pl.INDEX],
     tile_rows: pl.Scalar[pl.INDEX],
+    checkpoint_ends: pl.Tensor[[CHECKPOINTS_PER_TILE], pl.INT32],
 ):
     state_block_num = pl.tensor.dim(compress_state, 0)
+    request_position = pl.read(position_ids, [request_start])
+    tile_first_position = pl.read(position_ids, [tile_base])
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     kv_proj_scratch = pl.create_tensor([PREFILL_STATE_TILE, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([PREFILL_STATE_TILE, OUT_DIM], dtype=pl.FP32)
@@ -242,12 +250,20 @@ def _prefill_indexer_compressor_tile(
                     value=FP32_NEG_INF,
                 )
                 if write_pos >= 2 * COMPRESS_RATIO - 1:
-                    prev_state_block = pl.cast(prev_abs // INNER_STATE_BLOCK_SIZE, pl.INDEX)
-                    prev_state_intra = pl.cast(prev_abs - prev_state_block * INNER_STATE_BLOCK_SIZE, pl.INDEX)
-                    prev_phys_block_raw = pl.read(inner_compress_state_block_table, [prev_state_block])
-                    if prev_phys_block_raw >= 0:
-                        prev_phys_block = pl.cast(prev_phys_block_raw, pl.INDEX)
-                        prev_state_row = prev_phys_block * INNER_STATE_BLOCK_SIZE + prev_state_intra
+                    prev_state_row_raw = pl.cast(-1, pl.INT64)
+                    if prev_abs < tile_first_position:
+                        if prev_abs >= request_position:
+                            prev_source = request_start + pl.cast(prev_abs - request_position, pl.INDEX)
+                            prev_state_row_raw = pl.read(inner_state_slot_mapping, [prev_source])
+                        else:
+                            prev_state_block = pl.cast(prev_abs // INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                            prev_state_intra = pl.cast(prev_abs % INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                            prev_phys_block_raw = pl.read(inner_compress_state_block_table, [prev_state_block])
+                            if prev_phys_block_raw >= 0:
+                                prev_state_row_raw = pl.cast(prev_phys_block_raw * INNER_STATE_BLOCK_SIZE, pl.INT64)
+                                prev_state_row_raw = prev_state_row_raw + prev_state_intra
+                    if prev_state_row_raw >= 0:
+                        prev_state_row = pl.cast(prev_state_row_raw, pl.INDEX)
                         pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
                             prev_state_row : prev_state_row + 1,
                             h0 : h0 + HEAD_D_TILE,
@@ -269,12 +285,20 @@ def _prefill_indexer_compressor_tile(
                     dtype=pl.FP32,
                     value=FP32_NEG_INF,
                 )
-                cur_state_block = pl.cast(cur_abs // INNER_STATE_BLOCK_SIZE, pl.INDEX)
-                cur_state_intra = pl.cast(cur_abs - cur_state_block * INNER_STATE_BLOCK_SIZE, pl.INDEX)
-                cur_phys_block_raw = pl.read(inner_compress_state_block_table, [cur_state_block])
-                if cur_phys_block_raw >= 0:
-                    cur_phys_block = pl.cast(cur_phys_block_raw, pl.INDEX)
-                    cur_state_row = cur_phys_block * INNER_STATE_BLOCK_SIZE + cur_state_intra
+                cur_state_row_raw = pl.cast(-1, pl.INT64)
+                if cur_abs < tile_first_position:
+                    if cur_abs >= request_position:
+                        cur_source = request_start + pl.cast(cur_abs - request_position, pl.INDEX)
+                        cur_state_row_raw = pl.read(inner_state_slot_mapping, [cur_source])
+                    else:
+                        cur_state_block = pl.cast(cur_abs // INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                        cur_state_intra = pl.cast(cur_abs % INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                        cur_phys_block_raw = pl.read(inner_compress_state_block_table, [cur_state_block])
+                        if cur_phys_block_raw >= 0:
+                            cur_state_row_raw = pl.cast(cur_phys_block_raw * INNER_STATE_BLOCK_SIZE, pl.INT64)
+                            cur_state_row_raw = cur_state_row_raw + cur_state_intra
+                if cur_state_row_raw >= 0:
+                    cur_state_row = pl.cast(cur_state_row_raw, pl.INDEX)
                     pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
                         cur_state_row : cur_state_row + 1,
                         HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_D_TILE,
@@ -375,10 +399,33 @@ def _prefill_indexer_compressor_tile(
 
     publish_rows = pl.min(tile_rows, STATE_LEN)
     publish_base = tile_rows - publish_rows
-    with pl.spmd(STATE_LEN, name_hint="prefill_idx_c4_state_tail_publish", deps=[pool_tid]) as state_publish_tid:
+    tile_position = pl.read(position_ids, [tile_base])
+    checkpoint_rows = pl.cast(0, pl.INDEX)
+    previous_end = pl.cast(0, pl.INT32)
+    if pl.read(checkpoint_ends, [0]) > 0:
+        for checkpoint_i in pl.range(CHECKPOINTS_PER_TILE):
+            checkpoint_end = pl.read(checkpoint_ends, [checkpoint_i])
+            checkpoint_begin = pl.max(tile_position, pl.max(checkpoint_end - STATE_LEN, previous_end))
+            checkpoint_stop = pl.min(tile_position + publish_base, checkpoint_end)
+            checkpoint_rows = checkpoint_rows + pl.max(0, checkpoint_stop - checkpoint_begin)
+            previous_end = pl.max(previous_end, checkpoint_end)
+    publish_count = publish_rows + checkpoint_rows
+    with pl.spmd(publish_count, name_hint="prefill_idx_c4_state_tail_publish", deps=[pool_tid]) as state_publish_tid:
         publish_i = pl.tile.get_block_idx()
-        if publish_i < publish_rows:
+        if publish_i < publish_count:
             publish_local = publish_base + publish_i
+            if publish_i >= publish_rows:
+                checkpoint_offset = publish_i - publish_rows
+                selected_previous = pl.cast(0, pl.INT32)
+                for selected_i in pl.range(CHECKPOINTS_PER_TILE):
+                    selected_end = pl.read(checkpoint_ends, [selected_i])
+                    selected_begin = pl.max(tile_position, pl.max(selected_end - STATE_LEN, selected_previous))
+                    selected_stop = pl.min(tile_position + publish_base, selected_end)
+                    selected_rows = pl.max(0, selected_stop - selected_begin)
+                    if checkpoint_offset >= 0 and checkpoint_offset < selected_rows:
+                        publish_local = selected_begin - tile_position + checkpoint_offset
+                    checkpoint_offset = checkpoint_offset - selected_rows
+                    selected_previous = pl.max(selected_previous, selected_end)
             publish_global = tile_base + publish_local
             publish_row_raw = pl.read(inner_state_slot_mapping, [publish_global])
             if publish_row_raw >= 0:
@@ -540,6 +587,7 @@ def _prefill_indexer_compressor_tile(
 def prefill_indexer_compressor(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     compress_state: pl.InOut[
         pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
@@ -615,8 +663,10 @@ def prefill_indexer_compressor(
                     rope_swap_idx_template,
                     rope_sign_template,
                     state_order_fence,
+                    request_start,
                     tile_base,
                     tile_rows,
+                    state_checkpoint_ends[request, request_offset // PREFILL_STATE_TILE],
                 )
 
     # Compressor completion fence.
@@ -635,6 +685,7 @@ def prefill_indexer_compressor(
 def prefill_indexer_compressor_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     compress_state: pl.InOut[
         pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
@@ -654,6 +705,8 @@ def prefill_indexer_compressor_test(
 ):
     x.bind_dynamic(0, T_DYN)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
     compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
     inner_compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
     idx_kv_cache.bind_dynamic(0, IDX_BLOCK_NUM_DYN)
@@ -667,7 +720,7 @@ def prefill_indexer_compressor_test(
     completion = pl.array.create(1, pl.TASK_ID)
     return prefill_indexer_compressor(
         x,
-        query_start_loc,
+        query_start_loc, state_checkpoint_ends,
         compress_state,
         inner_compress_state_block_table,
         wkv,
@@ -688,6 +741,12 @@ def prefill_indexer_compressor_test(
 
 def golden_prefill_indexer_compressor(tensors):
     import torch
+    from utils import validate_prefill_state_checkpoint
+
+    validate_prefill_state_checkpoint(
+        tensors, history=STATE_LEN, block_size=INNER_STATE_BLOCK_SIZE, tail=STATE_LEN,
+        table_name="inner_compress_state_block_table", slot_name="inner_state_slot_mapping",
+    )
 
     token_count = tensors["x"].shape[0]
     kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()  # wkv stored [OUT_DIM, D] for b_trans
@@ -711,6 +770,10 @@ def golden_prefill_indexer_compressor(tensors):
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
+        if abs_pos >= int(position_ids[0]):
+            if abs_pos >= int(position_ids[tile_base]):
+                return -1
+            return int(tensors["inner_state_slot_mapping"][abs_pos - int(position_ids[0])])
         block = abs_pos // INNER_STATE_BLOCK_SIZE
         intra = abs_pos % INNER_STATE_BLOCK_SIZE
         phys_block = int(state_block_table[block].item())
@@ -810,8 +873,12 @@ def golden_prefill_indexer_compressor(tensors):
             cache_rows[dst_row] = row_i8
             scale_rows[dst_row] = 1.0 / scale_q
 
+        checkpoint_ends = tensors["state_checkpoint_ends"][0].reshape(-1).tolist()
         publish_base = max(tile_base, tile_end - STATE_LEN)
-        for token_id in range(publish_base, tile_end):
+        for token_id in range(tile_base, tile_end):
+            position = int(position_ids[token_id])
+            if token_id < publish_base and not any(max(0, b - STATE_LEN) <= position < b for b in checkpoint_ends):
+                continue
             dst_row = int(tensors["inner_state_slot_mapping"][token_id].item())
             if dst_row < 0:
                 continue
@@ -822,10 +889,10 @@ def golden_prefill_indexer_compressor(tensors):
     tensors["idx_kv_scale"][:] = idx_kv_scale
 
 
-def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ):
+def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SEQ, checkpoint_end: int = 0):
     import torch
     from golden import TensorSpec
-    from utils import token_local_rope
+    from utils import prefill_state_fixture, token_local_rope
 
     if token_count <= 0 or token_count > MAX_SEQ_LEN:
         raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
@@ -834,25 +901,29 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
     if start_pos + token_count > MAX_SEQ_LEN:
         raise ValueError("start_pos + token_count exceeds max_position_embeddings")
 
+    logical_blocks = torch.arange(INNER_STATE_MAX_BLOCKS, dtype=torch.int64)
+    state_table = ((logical_blocks * 17 + 3) % CSA_INNER_STATE_BLOCKS_PER_REQUEST).to(torch.int32)
+    state_table, state_mapping, state_blocks = prefill_state_fixture(
+        start_pos, token_count, checkpoint_end, history=STATE_LEN, block_size=INNER_STATE_BLOCK_SIZE,
+        table=state_table, physical_blocks=INNER_STATE_BLOCK_NUM,
+    )
+
     def init_inner_compress_state_block_table():
-        logical_blocks = torch.arange(INNER_STATE_MAX_BLOCKS, dtype=torch.int64)
-        physical_blocks = (logical_blocks * 17 + 3) % CSA_INNER_STATE_BLOCKS_PER_REQUEST
-        physical_blocks = physical_blocks.to(torch.int32)
-        return physical_blocks.unsqueeze(0)
+        return state_table.unsqueeze(0)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
         block = abs_pos // INNER_STATE_BLOCK_SIZE
         intra = abs_pos % INNER_STATE_BLOCK_SIZE
-        physical_block = (block * 17 + 3) % CSA_INNER_STATE_BLOCKS_PER_REQUEST
+        physical_block = int(state_table[block])
         return physical_block * INNER_STATE_BLOCK_SIZE + intra
 
     def init_x():
         return ((torch.rand(token_count, D) - 0.5) * 0.1).to(torch.bfloat16)
 
     def init_compress_state():
-        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
+        state = torch.zeros(state_blocks, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
         flat = state.view(-1, COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, start_pos - STATE_LEN), start_pos):
             row = state_row(abs_pos)
@@ -926,17 +997,17 @@ def build_tensor_specs(start_pos: int = START_POS, token_count: int = PREFILL_SE
         return mapping
 
     def init_inner_state_slot_mapping():
-        mapping = torch.full((token_count,), -1, dtype=torch.int64)
-        for t in range(token_count):
-            mapping[t] = state_row(start_pos + t)
-        return mapping
+        return state_mapping.clone()
+
+    checkpoint_tensor = checkpoint_ends_tensor([checkpoint_end], starts=[start_pos], lengths=[token_count])
 
     return [
         TensorSpec("x", [token_count, D], torch.bfloat16, init_value=init_x),
         TensorSpec("query_start_loc", [2], torch.int32, init_value=torch.tensor([0, token_count], dtype=torch.int32)),
+        TensorSpec("state_checkpoint_ends", list(checkpoint_tensor.shape), torch.int32, init_value=checkpoint_tensor),
         TensorSpec(
             "compress_state",
-            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+            [state_blocks, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
             torch.float32,
             init_value=init_compress_state,
         ),
@@ -1010,26 +1081,30 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        fn=prefill_indexer_compressor_test,
-        specs=build_tensor_specs(args.start_pos, args.token_count),
-        golden_fn=golden_prefill_indexer_compressor,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        compile_only=args.compile_only,
-        compare_fn={
-            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            # C8 cache: INT8 rows exact bar the <=B boundary rows the compressor rewrote (+/-1 LSB).
-            "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-            "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    cases = [(args.start_pos, args.token_count, 0)]
+    if args.start_pos == START_POS and args.token_count == PREFILL_SEQ:
+        cases.extend(((0, 8192, (512, 4096, 8064)), (33, 1024, 640), (127, 513, 128)))
+    for start_pos, token_count, checkpoint_end in cases:
+        result = run(
+            fn=prefill_indexer_compressor_test,
+            specs=build_tensor_specs(start_pos, token_count, checkpoint_end),
+            golden_fn=golden_prefill_indexer_compressor,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+            ),
+            compile_only=args.compile_only,
+            compare_fn={
+                "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+                # C8 cache: INT8 rows exact bar the <=B boundary rows the compressor rewrote (+/-1 LSB).
+                "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
+                "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+            },
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
