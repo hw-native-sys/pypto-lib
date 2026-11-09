@@ -121,3 +121,31 @@ def test_prefill_arguments_follow_the_generated_metadata():
     assert prefill_arguments(metadata, {"weights": weights, "prompt": prompt}) == (prompt, weights)
     with pytest.raises(ValueError, match="Missing prefill arguments"):
         prefill_arguments(metadata, {"prompt": prompt})
+
+
+def test_decode_ring_counts_are_expanded_for_prefill():
+    tables = _tables()
+    counts = torch.tensor([2, 2, 2, 2, 16, 2, 2], dtype=torch.int32).view(1, 1, 7).repeat(8, 1, 1)
+    groups = {
+        "hca_cmp_block_table": 1, "csa_cmp_block_table": 2, "idx_block_table": 3,
+        "hca_compress_state_block_table": 4, "csa_compress_state_block_table": 5,
+        "csa_inner_compress_state_block_table": 6,
+    }
+    for name, group in groups.items():
+        tables[name][:, :, int(counts[0, 0, group]):] = -1
+    converted = prefill_block_tables(tables, block_counts=counts)
+    assert converted["hca_compress_state_block_table"][0, 0, 14:19].tolist() == [14, 15, 0, 1, 2]
+    assert converted["csa_compress_state_block_table"][0, 0, :8].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+    assert converted["csa_cmp_block_table"][0, 0, :5].tolist() == [0, 1, 0, 1, 0]
+    cos = torch.ones((2, 256, 64), dtype=torch.bfloat16)
+    meta = prepare_prefill_metadata(torch.tensor([3, 9, 2, 5, 7]), start_pos=125, tables=tables,
+                                   caches=_cache_metadata(), rope_cos=cos, rope_sin=cos,
+                                   max_logit_rows=128, terminal=True, block_counts=counts)
+    assert meta["hca_state_slot_mapping_full"][0, :5].tolist() == [125, 126, 127, 0, 1]
+    assert meta["csa_state_slot_mapping_full"][0, :5].tolist() == [5, 6, 7, 0, 1]
+    invalid = counts.clone()
+    invalid[:, :, 5] = 0
+    with pytest.raises(ValueError, match="no cache page"):
+        prepare_prefill_metadata(torch.tensor([3]), start_pos=0, tables=tables, caches=_cache_metadata(),
+                                 rope_cos=cos, rope_sin=cos, max_logit_rows=128, terminal=True,
+                                 block_counts=invalid)

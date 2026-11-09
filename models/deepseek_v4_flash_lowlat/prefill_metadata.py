@@ -35,12 +35,14 @@ def prefill_tap_positions(start_pos, token_count):
     return positions.reshape(CP_SIZE, padded // CP_SIZE)
 
 
-def prepare_prefill_metadata(tokens, *, start_pos, tables, caches, rope_cos, rope_sin, max_logit_rows, terminal):
+def prepare_prefill_metadata(tokens, *, start_pos, tables, caches, rope_cos, rope_sin, max_logit_rows, terminal,
+                             block_counts=None):
     """Build the B1 CP4/EP8 prompt metadata for one chunk.
 
     ``rope_cos`` and ``rope_sin`` are the existing decode tables with the
     uncompressed and compressed profiles at indices 0 and 1. Cache tables
-    must name the currently live worker-owned allocations.
+    must name the currently live worker-owned allocations. Pass the decode
+    ``block_counts`` when its compressor tables contain cyclic page mappings.
     """
     if not isinstance(tokens, torch.Tensor) or tokens.ndim != 1 or tokens.dtype != torch.int64:
         raise TypeError("tokens must be a one-dimensional INT64 tensor")
@@ -89,8 +91,8 @@ def prepare_prefill_metadata(tokens, *, start_pos, tables, caches, rope_cos, rop
         indices = positions.to(torch.int64)
         inputs[name + "_cos"] = _replicate(rope_cos[profile].index_select(0, indices))
         inputs[name + "_sin"] = _replicate(rope_sin[profile].index_select(0, indices))
-    inputs.update(prefill_block_tables(tables))
-    inputs.update(prefill_slot_mappings(_replicate(active_positions), tables, caches))
+    inputs.update(prefill_block_tables(tables, block_counts=block_counts))
+    inputs.update(prefill_slot_mappings(_replicate(active_positions), tables, caches, block_counts=block_counts))
     return inputs
 
 

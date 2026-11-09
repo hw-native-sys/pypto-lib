@@ -398,7 +398,8 @@ without clearing other requests' or shared-prefix pages.
 
 `prefill_metadata` packs each prompt chunk and its RoPE rows for both groups.
 Physical page IDs may differ between ranks; each rank's table is converted
-against its own cache allocation.
+against its own cache allocation. Pass the existing `block_counts` when the
+compressor tables use the decode ring layout.
 The caller must provide enough non-aliased cache pages for the whole chunk and
 the preceding sliding window. The metadata helper rejects missing pages,
 out-of-bounds writes, and overwritten live history. Prefix checkpoints are

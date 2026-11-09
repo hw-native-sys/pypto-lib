@@ -39,6 +39,35 @@ TABLE_LAYOUTS = {
     "csa_inner_compress_state_block_table": ("csa_inner_compress_state_block_table", 2, 524288),
 }
 
+_COUNT_GROUPS = {
+    "hca_cmp_block_table": 1,
+    "csa_cmp_block_table": 2,
+    "idx_block_table": 3,
+    "hca_compress_state_block_table": 4,
+    "csa_compress_state_block_table": 5,
+    "csa_inner_compress_state_block_table": 6,
+}
+
+
+def _page_counts(block_counts):
+    if block_counts is None:
+        return {}
+    if (not isinstance(block_counts, torch.Tensor) or block_counts.dtype != torch.int32
+            or tuple(block_counts.shape) != (RANKS, 1, 7)):
+        raise ValueError("block_counts must be an INT32 [8, 1, 7] tensor")
+    if bool((block_counts < 0).any()):
+        raise ValueError("block_counts cannot be negative")
+    return {name: block_counts[:, 0, index].to(torch.int64) for name, index in _COUNT_GROUPS.items()}
+
+
+def _cyclic_pages(table, counts, length):
+    if bool((counts > table.shape[-1]).any()):
+        raise ValueError("A cache page count exceeds its table")
+    logical = torch.arange(length, dtype=torch.int64, device=table.device).unsqueeze(0)
+    physical_index = logical.remainder(counts.clamp(min=1).unsqueeze(1))
+    pages = torch.gather(table[:, 0, :], 1, physical_index)
+    return torch.where(counts.unsqueeze(1) > 0, pages, -1).unsqueeze(1)
+
 
 def _cache_shape(name, shape, dtype):
     layers, decode_page, prefill_page, tail, expected_dtype = CACHE_LAYOUTS[name]
@@ -136,11 +165,14 @@ def _table(table, name):
     return table
 
 
-def prefill_block_tables(decode_tables):
+def prefill_block_tables(decode_tables, *, block_counts=None):
     """Split decode pages into prefill pages without changing physical rows."""
     result = {}
+    counts = _page_counts(block_counts)
     for name, (decode_name, factor, depth) in TABLE_LAYOUTS.items():
         table = _table(decode_tables[decode_name], decode_name)
+        if decode_name in counts:
+            table = _cyclic_pages(table, counts[decode_name], depth // factor)
         if table.shape[-1] * factor > depth:
             raise ValueError(f"{decode_name} exceeds the prefill table depth")
         if factor != 1:
@@ -158,12 +190,18 @@ def prefill_block_tables(decode_tables):
     return result
 
 
-def _physical_rows(table, positions, page_tokens, rows_per_page, compression=1):
+def _physical_rows(table, positions, page_tokens, rows_per_page, compression=1, counts=None):
     valid = positions >= 0
     logical_page = positions.clamp(min=0).to(torch.int64) // page_tokens
+    if counts is not None:
+        if bool((counts > table.shape[-1]).any()):
+            raise ValueError("A cache page count exceeds its table")
+        logical_page = logical_page.remainder(counts.clamp(min=1).unsqueeze(1))
     if bool((logical_page[valid] >= table.shape[-1]).any()):
         raise ValueError("A prefill position exceeds its cache table")
     page = torch.gather(table[:, 0, :], 1, logical_page.clamp(max=table.shape[-1] - 1))
+    if counts is not None:
+        page = torch.where(counts.unsqueeze(1) > 0, page, -1)
     if bool((page[valid] < 0).any()):
         raise ValueError("An active prefill position has no cache page")
     row = page.to(torch.int64) * rows_per_page + positions.clamp(min=0) % page_tokens // compression
@@ -178,7 +216,7 @@ def _check_rows(name, rows, cache, cache_name):
         raise ValueError(f"{name} exceeds the {cache_name} allocation")
 
 
-def prefill_slot_mappings(positions, decode_tables, caches):
+def prefill_slot_mappings(positions, decode_tables, caches, *, block_counts=None):
     """Map absolute positions to the shared physical rows; -1 marks padding."""
     if not isinstance(positions, torch.Tensor) or positions.dtype not in (torch.int32, torch.int64):
         raise TypeError("positions must be an integer tensor")
@@ -193,16 +231,20 @@ def prefill_slot_mappings(positions, decode_tables, caches):
         raise ValueError("Padding must follow every active position")
     for name in {item[0] for item in TABLE_LAYOUTS.values()}:
         _table(decode_tables[name], name)
+    counts = _page_counts(block_counts)
     mapping = {
         "ori_slot_mapping_full": _physical_rows(decode_tables["block_table"], positions, 128, 128),
         "hca_state_slot_mapping_full": _physical_rows(
-            decode_tables["hca_compress_state_block_table"], positions, 8, 8
+            decode_tables["hca_compress_state_block_table"], positions, 8, 8,
+            counts=counts.get("hca_compress_state_block_table")
         ),
         "csa_state_slot_mapping_full": _physical_rows(
-            decode_tables["csa_compress_state_block_table"], positions, 4, 4
+            decode_tables["csa_compress_state_block_table"], positions, 4, 4,
+            counts=counts.get("csa_compress_state_block_table")
         ),
         "csa_inner_state_slot_mapping_full": _physical_rows(
-            decode_tables["csa_inner_compress_state_block_table"], positions, 4, 4
+            decode_tables["csa_inner_compress_state_block_table"], positions, 4, 4,
+            counts=counts.get("csa_inner_compress_state_block_table")
         ),
     }
     for name, table_name, ratio, page_rows in (
@@ -212,7 +254,8 @@ def prefill_slot_mappings(positions, decode_tables, caches):
     ):
         boundary = (positions >= 0) & ((positions + 1) % ratio == 0)
         boundary_positions = torch.where(boundary, positions, -1)
-        mapping[name] = _physical_rows(decode_tables[table_name], boundary_positions, 128, page_rows, ratio)
+        mapping[name] = _physical_rows(decode_tables[table_name], boundary_positions, 128, page_rows, ratio,
+                                       counts=counts.get(table_name))
     for name, rows in mapping.items():
         for rank in range(RANKS):
             active = rows[rank][rows[rank] >= 0]
@@ -261,7 +304,8 @@ def prefill_slot_mappings(positions, decode_tables, caches):
             if not boundaries.numel():
                 continue
             boundaries = boundaries.unsqueeze(0).expand(RANKS, -1)
-            physical = _physical_rows(decode_tables[table_name], boundaries, 128, page_rows, ratio)
+            physical = _physical_rows(decode_tables[table_name], boundaries, 128, page_rows, ratio,
+                                      counts=counts.get(table_name))
             _check_rows(table_name, physical, caches[cache_name], cache_name)
             for rank in range(RANKS):
                 if physical.shape[1] != torch.unique(physical[rank]).numel():
