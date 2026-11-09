@@ -154,6 +154,10 @@ def test_decode_ring_counts_are_expanded_for_prefill():
 
 
 def test_prefill_uses_ordered_kv_without_changing_existing_module(monkeypatch):
+    import pypto
+
+    if getattr(pypto, "__pypto_stub__", False):
+        pytest.skip("requires the real PyPTO frontend")
     existing = ModuleType("qkv_proj_rope")
     existing.kv_proj_rope = object()
     monkeypatch.setitem(sys.modules, "qkv_proj_rope", existing)
@@ -169,6 +173,10 @@ def test_prefill_uses_ordered_kv_without_changing_existing_module(monkeypatch):
 
 
 def test_prefill_rejects_incompatible_ordered_kv_geometry(monkeypatch):
+    import pypto
+
+    if getattr(pypto, "__pypto_stub__", False):
+        pytest.skip("requires the real PyPTO frontend")
     ordered = importlib.import_module("models.deepseek_v4_flash_lowlat.drafter.qkv_proj_rope")
     monkeypatch.setattr(ordered, "KV_OK", ordered.KV_OK + 1)
     old_path, old_argv = list(sys.path), list(sys.argv)

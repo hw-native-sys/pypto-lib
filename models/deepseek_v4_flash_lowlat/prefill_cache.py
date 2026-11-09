@@ -85,8 +85,6 @@ def prefill_cache_views(caches, *, worker=None):
     The original buffers must remain live until both programs finish. A view is
     never an independent allocation and must not be freed separately.
     """
-    from pypto.runtime import StackedDeviceTensor
-
     views = {}
     for name in CACHE_LAYOUTS:
         root = caches[name]
@@ -96,6 +94,8 @@ def prefill_cache_views(caches, *, worker=None):
                 raise ValueError(f"{name} must have contiguous storage")
             views[name] = root.view(shape)
             continue
+        from pypto.runtime import StackedDeviceTensor
+
         if not isinstance(root, StackedDeviceTensor) or root.worker_ids != tuple(range(RANKS)):
             raise TypeError(f"{name} must be a rank-ordered StackedDeviceTensor")
         if worker is None or not callable(getattr(worker, "view_tensor", None)):
