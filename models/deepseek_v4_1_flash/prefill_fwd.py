@@ -86,6 +86,9 @@ from input_pack import gather_rows, pack_x_hc
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
 from utils import paged_slots, window_metadata
 from engram import ENGRAM_K, KV_OUT, HostEngram, engram_from_rows
+from gate import gather_routing_bias
+
+BIAS_DYN = pl.dynamic("PREFILL_FORWARD_BIAS_DYN")
 from lm_head import final_output
 from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, clear_moe_signals
 from prefill_moe import prefill_moe_slabs
@@ -471,7 +474,7 @@ def l2_prefill_fwd(
     hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
     gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
+    correction_bias: pl.Tensor[[BIAS_DYN], pl.FP32],
     routed_w1: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
     routed_w2: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
@@ -531,6 +534,7 @@ def l2_prefill_fwd(
     rank: pl.Scalar[pl.INT32],
 ):
     """Run both CED stages and retire communication signals after the decoder."""
+    correction_bias.bind_dynamic(0, BIAS_DYN)
     compressed_cache.bind_dynamic(1, PAGES)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     state_block_table.bind_dynamic(0, B_DYN)
@@ -701,7 +705,17 @@ def l2_prefill_fwd(
         layer_index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(index_wq_b_scale, [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], [index_source * (Q_LORA // MX_GROUP), 0])
         layer_index_weights: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ] = index_weights_proj[index_source]
         layer_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
-        layer_gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [layer * N_EXPERTS])
+        bias_rows = pl.tensor.dim(correction_bias, 0) // (N_LAYERS * N_EXPERTS)
+        bias_length = bias_rows * N_EXPERTS
+        source_bias = pl.slice(correction_bias, [bias_length], [layer * bias_length])
+        stage_gate_bias = pl.create_tensor([bias_length], dtype=pl.FP32)
+        if stage == 0:
+            gather_routing_bias(source_bias, identity_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS)
+        else:
+            gather_routing_bias(source_bias, replay_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS)
+        local_bias_rows = pl.min(bias_rows, LOCAL_CAPACITY)
+        layer_gate_bias = pl.create_tensor([local_bias_rows * N_EXPERTS], dtype=pl.FP32)
+        gather_routing_bias(stage_gate_bias, q_rows[stage], layer_gate_bias, moe_ready, n_experts=N_EXPERTS)
         layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
         layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
         layer_routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
@@ -742,6 +756,7 @@ def l2_prefill_fwd(
                 engram_from_rows(
                     engram_lookup[engram_slot], engram_wkv[engram_slot], layer_engram_scale,
                     engram_weight[engram_slot], hidden, hidden,
+                    mask_zero_rows=True,
                 )
         with pl.scope():
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
@@ -893,7 +908,7 @@ def l3_prefill_fwd(
     hc_ffn_base: pl.Tensor[[RANKS, N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[RANKS, N_LAYERS * D], pl.BF16],
     gate_weight: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS], pl.FP32],
+    correction_bias: pl.Tensor[[RANKS, BIAS_DYN], pl.FP32],
     routed_w1: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
     routed_w2: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
@@ -981,8 +996,13 @@ def l3_prefill_fwd(
     reset_persistent_windows=False; signals are retired at forward completion.
     After request completion, release pages and reset the request slot in all C2A sources before
     assigning them to another request; failed calls require cache restoration
-    or reset before retry. Engram consumes host lookup rows; vision and DSpark have no inputs here.
+    or reset before retry. Engram consumes host lookup rows, with zero rows
+    suppressing its update. correction_bias accepts the text layout
+    [RANKS, N_LAYERS * N_EXPERTS] or flattened per-token biases
+    [RANKS, N_LAYERS * CAPACITY * N_EXPERTS] in encoder input-row order.
+    Decoder replay and slab ownership gather the corresponding token bias.
     """
+    correction_bias.bind_dynamic(1, BIAS_DYN)
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
     compressed_cache.bind_dynamic(2, PAGES)
@@ -1643,6 +1663,7 @@ def prepare_resident_inputs(
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
     engram: HostEngram,
     request_id: int = 0,
+    token_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Prepare packed embeddings and Engram histories for one DP group.
 
@@ -1661,6 +1682,10 @@ def prepare_resident_inputs(
         raise ValueError("token id is outside the checkpoint vocabulary")
     ids = ids.long()
     embedding = weights.lookup_rows(ids)
+    if token_mask is not None:
+        token_mask = torch.as_tensor(token_mask, device="cpu")
+        if token_mask.dtype != torch.bool or token_mask.shape != ids.shape:
+            raise ValueError("Engram token_mask must be a boolean vector matching token IDs")
 
     values = prepare_prefill_inputs(
         embedding, capacity, start_pos=start_pos, query_lens=query_lens, request_capacity=request_capacity,
@@ -1673,7 +1698,9 @@ def prepare_resident_inputs(
     for request, (length, prefix) in enumerate(zip(lengths, starts)):
         if length:
             history_key = request_id if query_lens is None else (request_id, request)
-            rows = engram.lookup(ids[offset:offset + length], length, prefix, request_id=history_key)
+            mask = None if token_mask is None else token_mask[offset:offset + length]
+            rows = engram.lookup(ids[offset:offset + length], length, prefix,
+                                 request_id=history_key, token_mask=mask)
             values["engram_lookup"][:, offset:offset + length] = rows
         offset += length
     return values

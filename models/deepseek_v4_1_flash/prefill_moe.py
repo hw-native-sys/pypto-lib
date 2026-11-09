@@ -44,8 +44,10 @@ from config import FLASH as M
 from config import EP_SIZE, SUPPORTED_EP_SIZES
 from config import MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
 from config import T_DYN
-from gate import gate_from_bf16
+from gate import gate_from_bf16, gather_routing_bias, prepare_routing_bias
 from expert_shared import expert_shared
+
+BIAS_DYN = pl.dynamic("PREFILL_MOE_BIAS_DYN")
 from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
     expert_routed_scatter,
@@ -358,7 +360,7 @@ def prefill_moe(
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    correction_bias: pl.Tensor,
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
@@ -487,7 +489,7 @@ def prefill_moe_slabs(
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    correction_bias: pl.Tensor,
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[
         [N_LOCAL_EXPERTS * (D // 32), MOE_INTER],
@@ -583,10 +585,13 @@ def prefill_moe_slabs(
             packed_hidden = pl.reshape(round_hidden, [MOE_TOKENS, HC_DIM])
             gather_rows(source_hidden, row_ids, packed_hidden, rows_ready, column_tile=D)
             gather_rows(pre_mix, row_ids, round_pre, rows_ready, column_tile=512)
+            bias_rows = pl.min(pl.tensor.dim(correction_bias, 0) // N_EXPERTS, MOE_TOKENS)
+            round_bias = pl.create_tensor([bias_rows * N_EXPERTS], dtype=pl.FP32)
+            gather_routing_bias(correction_bias, row_ids, round_bias, rows_ready, n_experts=N_EXPERTS)
             epoch = (moe_epoch - 1) * rounds + round_id + 1
             prefill_moe(
                 round_hidden, round_pre, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_weight,
-                gate_weight, correction_bias,
+                gate_weight, round_bias,
                 routed_w1, routed_w1_scale, routed_w2, routed_w2_scale, routed_w3, routed_w3_scale,
                 shared_w1, shared_w1_scale, shared_w2, shared_w2_scale, shared_w3, shared_w3_scale,
                 round_next, round_mixed, round_output,
@@ -683,7 +688,7 @@ def l2_prefill_moe_slabs(
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[D], pl.BF16],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    correction_bias: pl.Tensor[[BIAS_DYN], pl.FP32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
     routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
@@ -713,6 +718,7 @@ def l2_prefill_moe_slabs(
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
     """Validate bounded MoE slabs on each rank."""
+    correction_bias.bind_dynamic(0, BIAS_DYN)
     capacity = pl.tensor.dim(x_hc, 0)
     slab_hidden = pl.create_tensor([2 * MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
     slab_pre = pl.create_tensor([2 * MOE_TOKENS, HC_MULT], dtype=pl.FP32)
@@ -749,7 +755,7 @@ def l3_prefill_moe(
     hc_ffn_base: pl.Tensor[[EP_SIZE, MIX_HC], pl.FP32],
     norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
     gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
+    correction_bias: pl.Tensor[[EP_SIZE, BIAS_DYN], pl.FP32],
     routed_w1: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
     routed_w2: pl.Tensor[[EP_SIZE, N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
@@ -769,6 +775,7 @@ def l3_prefill_moe(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     """EP host driver for the HC-wrapped Flash MoE block."""
+    correction_bias.bind_dynamic(1, BIAS_DYN)
     recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
@@ -1044,7 +1051,7 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
 
 
 
-def build_slab_specs(counts):
+def build_slab_specs(counts, *, token_bias=False):
     """Build independent nonzero prompt rows per rank with bounded MoE weights."""
     specs = build_tensor_specs(MOE_TOKENS)
     generator = torch.Generator().manual_seed(73)
@@ -1060,6 +1067,13 @@ def build_slab_specs(counts):
             spec.init_value = pre
         elif spec.name == "num_tokens":
             spec.init_value = counts
+        elif spec.name == "correction_bias" and token_bias:
+            text_bias = _route_bias()
+            vision_bias = text_bias.roll(TOPK)
+            image_rows = torch.arange(SLAB_CAPACITY) % 3 == 1
+            bias = prepare_routing_bias(text_bias, vision_bias, image_rows, SLAB_CAPACITY)
+            spec.shape = [EP_SIZE, SLAB_CAPACITY * N_EXPERTS]
+            spec.init_value = bias.repeat(EP_SIZE, 1)
     return specs
 
 
@@ -1077,10 +1091,17 @@ def golden_moe_slabs(tensors):
             shape[1] = MOE_TOKENS
             slab[name] = torch.zeros(shape, dtype=tensors[name].dtype)
         counts = torch.zeros(EP_SIZE, dtype=torch.int32)
+        bias_rows = tensors["correction_bias"].shape[1] // N_EXPERTS
+        if bias_rows > 1:
+            slab["correction_bias"] = torch.zeros(EP_SIZE, MOE_TOKENS * N_EXPERTS)
         for rank in range(EP_SIZE):
             begin = offset
             active = max(0, min(rows, int(tensors["num_tokens"][rank]) - begin))
             counts[rank] = active
+            if bias_rows > 1:
+                source_bias = tensors["correction_bias"][rank].view(capacity, N_EXPERTS)
+                target_bias = slab["correction_bias"][rank].view(MOE_TOKENS, N_EXPERTS)
+                target_bias[:active].copy_(source_bias[begin:begin + active])
             for name in ("x_hc", "pre_mix"):
                 slab[name][rank, :active].copy_(tensors[name][rank, begin:begin + active])
         slab["num_tokens"] = counts
@@ -1355,7 +1376,10 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--log-level", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--token-bias", action="store_true", help="mixed text/vision routing in slab validation")
     args = parser.parse_args()
+    if args.token_bias and not VALIDATE_SLABS:
+        parser.error("--token-bias requires --entry slabs")
 
     torch.manual_seed(args.seed)
     device_ids = [int(d) for d in args.device.split(",") if d != ""]
@@ -1385,7 +1409,7 @@ if __name__ == "__main__":
             counts = counts.expand(EP_SIZE).clone()
         if counts.numel() != EP_SIZE or bool(((counts < 0) | (counts > SLAB_CAPACITY)).any()):
             parser.error("slab counts must provide an active prefix in [0, capacity] per rank")
-        specs = build_slab_specs(counts)
+        specs = build_slab_specs(counts, token_bias=args.token_bias)
         golden_fn = golden_moe_slabs
         compare_fn = {
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),

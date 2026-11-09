@@ -19,7 +19,7 @@ constexpr int M = 16;
 constexpr int K = 1024;
 using Pipe = TPipe<0, Direction::DIR_C2V, M * M * sizeof(float), 2, 2, true>;
 using Scores = Tile<TileType::Vec, float, M, M>;
-using Bias = Tile<TileType::Vec, float, 1, M, BLayout::RowMajor, 1, DYNAMIC>;
+using Bias = Tile<TileType::Vec, float, M, M, BLayout::RowMajor, M, DYNAMIC>;
 
 template <typename T>
 __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int index) {
@@ -56,9 +56,9 @@ __tf__ __aicore__ inline void score_vf(
         vdup(zero, 0.0f, all, MODE_ZEROING);
         vdup(one, 1.0f, all, MODE_ZEROING);
         vdup(minus_inf, -3.4028234663852886e38f, all, MODE_ZEROING);
-        vgather2(b, gamma, column, valid_columns);
-        vsel(b, b, minus_inf, valid_columns);
         for (uint16_t segment = 0; segment < 4; ++segment) {
+            vlds(b, gamma, segment * 64, NORM);
+            vsel(b, b, minus_inf, valid_columns);
             RegTensor<float> x, relu, absolute, tail, mask, floor, score;
             vlds(x, src, segment * 64, NORM);
             vmax(relu, x, zero, all, MODE_ZEROING);
@@ -92,7 +92,7 @@ __aicore__ inline void score_tiles(Scores& scores, Scores& biased, Scores& logit
     TEXP(tail, tail); TADDS(tail, tail, 1.0f); TLOG(tail, tail); TADD(tail, relu, tail);
     TNEG(mask, logits); TSUBS(mask, mask, 10.0f); TMAXS(mask, mask, 0.0f); TMINS(mask, mask, 1.0f);
     TMINS(floor, logits, 0.0f); TEXP(floor, floor); TMUL(floor, mask, floor);
-    TMAX(scores, tail, floor); TSQRT(scores, scores); TCOLEXPANDADD(biased, scores, bias);
+    TMAX(scores, tail, floor); TSQRT(scores, scores); TADD(biased, scores, bias);
 }
 #endif
 
@@ -109,15 +109,17 @@ __aicore__ inline void vector_gate(__gm__ int64_t* args) {
         Scores logits, scores, biased;
         Bias bias(valid);
         TASSIGN(scores, 65536); TASSIGN(biased, 66560); TASSIGN(bias, 67584);
-        GlobalTensor<float, Shape<1, DYNAMIC>, Stride> bias_gm(
-            data<float>(args, 2) + n0, Shape<1, DYNAMIC>(1, valid), Stride(1, 1, 1, valid, 1));
+        int bias_stride = args[6];
+        GlobalTensor<float, Shape<M, DYNAMIC>, Stride> bias_gm(
+            data<float>(args, 2) + t0 * bias_stride + n0,
+            Shape<M, DYNAMIC>(M, valid), Stride(1, 1, 1, bias_stride, 1));
         TLOAD(bias, bias_gm);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0); wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         TPOP<Pipe, Scores, TileSplitAxis::TILE_NO_SPLIT>(pipe, logits);
 #if defined(PTO_NPU_ARCH_A5)
         score_vf(scores.data(), biased.data(), logits.data(), bias.data(), valid);
 #else
-        using BiasPad = Tile<TileType::Vec, float, 1, M, BLayout::RowMajor, 1, M,
+        using BiasPad = Tile<TileType::Vec, float, M, M, BLayout::RowMajor, M, M,
                              SLayout::NoneBox, 512, PadValue::Min>;
         BiasPad padded_bias;
         TASSIGN(padded_bias, 67584);

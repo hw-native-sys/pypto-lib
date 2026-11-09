@@ -62,7 +62,9 @@ def engram_gate(
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
     x: pl.Tensor,
     out: pl.Tensor,
+    mask_source: pl.Tensor,
     output_fp32: pl.constexpr,
+    mask_zero_rows: pl.constexpr,
 ):
     """Gate projected keys and values into each residual stream copy."""
     t_dim = pl.tensor.dim(kv, 0)
@@ -95,6 +97,15 @@ def engram_gate(
         nonnegative = pl.cmps(dot, 0.0, cmp_type=5)
         signed = pl.tile.select(nonnegative, root, pl.neg(root))
         gate = pl.reshape(pl.recip(pl.add(pl.exp(pl.neg(signed)), 1.0)), [T_TILE, 1])
+        lookup_sum = pl.tile.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        if mask_zero_rows:
+            for k0 in pl.range(0, ENGRAM_K, K_TILE):
+                lookup_raw = pl.load(mask_source, [t0, k0], [T_TILE, K_TILE], valid_shape=[valid_rows, K_TILE])
+                lookup_fp32 = pl.cast(lookup_raw, pl.FP32)
+                lookup_fp32 = pl.set_validshape(pl.fillpad(lookup_fp32, pad_value=pl.PadValue.zero), T_TILE, K_TILE)
+                lookup_abs = pl.abs(lookup_fp32)
+                lookup_part = pl.reshape(pl.row_sum(lookup_abs, reduction_tmp), [1, T_TILE])
+                lookup_sum = pl.add(lookup_sum, lookup_part)
         for d0 in pl.range(0, D, D_TILE):
             output_source = pl.load(x_flat, [t0, c * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
             output_value = pl.load(kv, [t0, HC_MULT * D + d0], [T_TILE, D_TILE], valid_shape=[valid_rows, D_TILE])
@@ -103,6 +114,13 @@ def engram_gate(
             y_bf16 = pl.cast(y, target_type=pl.BF16, mode="rint")
             if output_fp32:
                 y_rounded = pl.cast(y_bf16, pl.FP32)
+                if mask_zero_rows:
+                    lookup_column = pl.reshape(lookup_sum, [T_TILE, 1])
+                    mask_ones = pl.tile.full([T_TILE, D_TILE], dtype=pl.FP32, value=1.0)
+                    lookup_expanded = pl.row_expand_mul(mask_ones, lookup_column)
+                    lookup_valid = pl.set_validshape(lookup_expanded, valid_rows, D_TILE)
+                    lookup_active = pl.cmps(lookup_valid, 0.0, cmp_type=4)
+                    y_rounded = pl.tile.select(lookup_active, y_rounded, output_source)
                 pl.store(pl.set_validshape(y_rounded, valid_rows, D_TILE), [t0, c * D + d0], out_flat)
             else:
                 pl.store(pl.set_validshape(y_bf16, valid_rows, D_TILE), [t0, c * D + d0], out_flat)
@@ -117,8 +135,9 @@ def engram_from_rows(
     weight: pl.Tensor[[HC_MULT, D], pl.FP32],
     x: pl.Tensor,
     out: pl.Tensor,
+    mask_zero_rows: pl.constexpr,
 ):
-    """Project host-gathered BF16 rows and gate the FP32 residual stream."""
+    """Project host BF16 rows; all-zero lookup rows preserve the FP32 residual exactly."""
     tokens = pl.tensor.dim(x, 0)
     kv = pl.create_tensor([tokens, KV_OUT], dtype=pl.BF16)
     gemm_bf16_via_mxfp8_to_bf16_staged(
@@ -127,7 +146,24 @@ def engram_from_rows(
     )
     kv_fp32 = pl.create_tensor([tokens, KV_OUT], dtype=pl.FP32)
     engram_cast_to_fp32(kv, kv_fp32)
-    engram_gate(kv_fp32, weight, x, out, output_fp32=True)
+    engram_gate(kv_fp32, weight, x, out, lookup, output_fp32=True, mask_zero_rows=mask_zero_rows)
+    return out
+
+
+@pl.jit
+def l2_engram_masked_gate(
+    kv: pl.Tensor[[T_DYN, KV_OUT], pl.FP32],
+    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    lookup: pl.Tensor[[T_DYN, ENGRAM_K], pl.BF16],
+    out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+):
+    """Validate masked host-lookup gating over FP32 residual streams."""
+    kv.bind_dynamic(0, T_DYN)
+    x.bind_dynamic(0, T_DYN)
+    lookup.bind_dynamic(0, T_DYN)
+    out.bind_dynamic(0, T_DYN)
+    engram_gate(kv, weight, x, out, lookup, output_fp32=True, mask_zero_rows=True)
     return out
 
 
@@ -182,7 +218,7 @@ def engram(
     x_fp32 = pl.create_tensor([t_dim, HC_MULT * D], dtype=pl.FP32)
     engram_cast_to_fp32(x_flat, x_fp32)
     x_hc_fp32 = pl.reshape(x_fp32, [t_dim, HC_MULT, D])
-    engram_gate(kv, weight, x_hc_fp32, out, output_fp32=False)
+    engram_gate(kv, weight, x_hc_fp32, out, kv, output_fp32=False, mask_zero_rows=False)
     return out
 
 
@@ -232,7 +268,8 @@ class HostEngram:
 
     Reuse one instance across prefill chunks and decode calls. Each request_id
     owns its compressed-token history; start_pos=0 resets that request, and
-    continuation requires the preceding history. Image-token masking is unsupported.
+    continuation requires the preceding history. False token_mask entries exclude
+    image positions and stop n-grams from crossing image spans.
     """
 
     def __init__(self, checkpoint, tokenizer):
@@ -281,7 +318,7 @@ class HostEngram:
             for layer in M.engram_layer_ids
         ])
 
-    def hash_ids(self, token_ids, start_pos=0, *, request_id=0):
+    def hash_ids(self, token_ids, start_pos=0, *, request_id=0, token_mask=None):
         """Return [layer, token, hash column] IDs and commit the current text history."""
         ids = torch.as_tensor(token_ids, device="cpu")
         if ids.numel() and ids.dtype not in (torch.int32, torch.int64):
@@ -292,13 +329,21 @@ class HostEngram:
         history = self.history.get(request_id, torch.empty(0, dtype=torch.int64))
         if isinstance(start_pos, bool) or not isinstance(start_pos, int) or not 0 <= start_pos <= history.numel():
             raise ValueError("Engram continuation requires all preceding token history")
-        compressed = torch.cat((history[:start_pos], self.token_map[ids]))
+        current = self.token_map[ids]
+        if token_mask is not None:
+            mask = torch.as_tensor(token_mask, device="cpu")
+            if mask.dtype != torch.bool or mask.shape != ids.shape:
+                raise ValueError("Engram token_mask must be a boolean vector matching token IDs")
+            current = torch.where(mask, current, -1)
+        compressed = torch.cat((history[:start_pos], current))
         positions = torch.arange(start_pos, compressed.numel())
         lookback = []
+        blocked = torch.zeros_like(positions, dtype=torch.bool)
         for shift in range(M.engram_max_ngram_size):
             source = (positions - shift).clamp_min(0)
             values = compressed[source]
-            lookback.append(torch.where(positions >= shift, values, self.pad_id))
+            blocked |= (positions < shift) | (values == -1)
+            lookback.append(torch.where(blocked, self.pad_id, values))
         tokens = torch.stack(lookback, dim=-1)
         products = tokens.unsqueeze(0) * self.multipliers.unsqueeze(1)
         rolling, hashes = products[..., 0], []
@@ -310,7 +355,7 @@ class HostEngram:
         self.history[request_id] = compressed
         return torch.cat(hashes, dim=-1) + self.offsets.unsqueeze(1)
 
-    def lookup(self, token_ids, capacity, start_pos=0, *, request_id=0):
+    def lookup(self, token_ids, capacity, start_pos=0, *, request_id=0, token_mask=None):
         """Read current rows and group-32 E8M0 scales into [2, capacity, 6144] BF16.
 
         Tables stay in host checkpoint files; only selected rows are read.
@@ -320,21 +365,70 @@ class HostEngram:
 
         if len(token_ids) > capacity or capacity <= 0:
             raise ValueError("Engram rows must fit the current-token capacity")
-        hashes = self.hash_ids(token_ids, start_pos, request_id=request_id)
+        hashes = self.hash_ids(token_ids, start_pos, request_id=request_id, token_mask=token_mask)
+        active = torch.ones(len(token_ids), dtype=torch.bool)
+        if token_mask is not None:
+            active = torch.as_tensor(token_mask, device="cpu")
         layers = len(M.engram_layer_ids)
         width = self.primes.shape[1] * M.engram_head_dim
         result = torch.zeros((layers, capacity, width), dtype=torch.bfloat16)
         for slot, layer in enumerate(M.engram_layer_ids):
             prefix = f"layers.{layer}.engram.embed."
-            rows = self.checkpoint.tensor_rows(prefix + "weight", hashes[slot])
-            scales = self.checkpoint.tensor_rows(prefix + "scale", hashes[slot])
+            if not bool(active.any()):
+                continue
+            rows = self.checkpoint.tensor_rows(prefix + "weight", hashes[slot, active])
+            scales = self.checkpoint.tensor_rows(prefix + "scale", hashes[slot, active])
             if rows.dtype != torch.float8_e4m3fn or rows.shape[-1] != M.engram_head_dim:
                 raise ValueError(f"unsupported native Engram table layout: {prefix}weight")
             if scales.dtype != torch.float8_e8m0fnu or scales.shape[-1] != M.engram_head_dim // 32:
                 raise ValueError(f"unsupported native Engram table scales: {prefix}scale")
             values = rows.float() * decode_e8m0(scales).repeat_interleave(32, dim=-1)
-            result[slot, :len(token_ids)] = values.flatten(1).to(torch.bfloat16)
+            result[slot, :len(token_ids)][active] = values.flatten(1).to(torch.bfloat16)
         return result
+
+
+def build_masked_gate_specs(tokens):
+    """Build mixed text/image rows with non-BF16 FP32 residual values."""
+    from golden import TensorSpec
+
+    generator = torch.Generator().manual_seed(9)
+    lookup = torch.randn(tokens, ENGRAM_K, generator=generator).bfloat16()
+    kv = torch.randn(tokens, KV_OUT, generator=generator)
+    lookup[1::3] = 0
+    kv[1::3] = 0
+    hidden = torch.randn(tokens, HC_MULT, D, generator=generator)
+    return [
+        TensorSpec("kv", [tokens, KV_OUT], torch.float32, init_value=kv),
+        TensorSpec("weight", [HC_MULT, D], torch.float32, init_value=1.0),
+        TensorSpec("x", [tokens, HC_MULT, D], torch.float32, init_value=hidden),
+        TensorSpec("lookup", [tokens, ENGRAM_K], torch.bfloat16, init_value=lookup),
+        TensorSpec("out", [tokens, HC_MULT, D], torch.float32),
+    ]
+
+
+def golden_masked_gate(tensors):
+    """Evaluate gated text rows and exact image-row residual passthrough."""
+    hidden = tensors["x"]
+    keys = tensors["kv"][:, :HC_MULT * D].reshape(-1, HC_MULT, D)
+    value = tensors["kv"][:, HC_MULT * D:]
+    dot = (hidden * tensors["weight"] * keys).sum(-1)
+    dot *= torch.rsqrt(hidden.square().mean(-1) + NORM_EPS)
+    dot *= torch.rsqrt(keys.square().mean(-1) + NORM_EPS) * DOT_SCALE
+    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(CLAMP).sqrt(), dot))
+    expected = (hidden + gate.unsqueeze(-1) * value[:, None]).bfloat16().float()
+    masked = tensors["lookup"].count_nonzero(dim=-1) == 0
+    expected[masked] = hidden[masked]
+    tensors["out"].copy_(expected)
+
+
+def compare_masked_gate(actual, expected, *, inputs, **kwargs):
+    """Require exact masked residuals and the existing Engram text comparator."""
+    from golden import ratio_allclose
+
+    masked = inputs["lookup"].count_nonzero(dim=-1) == 0
+    if not torch.equal(actual[masked], inputs["x"][masked]):
+        return False, "masked FP32 residual changed"
+    return ratio_allclose(atol=1e-3, rtol=1e-2)(actual, expected, inputs=inputs, **kwargs)
 
 
 def build_engram_tensor_specs(batch: int = 2, sequence: int = 4):
@@ -407,6 +501,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=4)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--masked-gate", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
 
@@ -414,10 +509,15 @@ if __name__ == "__main__":
     if len(device_ids) != 1:
         raise ValueError(f"need exactly one device id, got {device_ids}")
 
+    entry = l2_engram_masked_gate if args.masked_gate else l2_engram
+    specs = (build_masked_gate_specs(args.batch * args.sequence) if args.masked_gate
+             else build_engram_tensor_specs(args.batch, args.sequence))
+    golden_fn = golden_masked_gate if args.masked_gate else golden_engram_case
+    comparator = compare_masked_gate if args.masked_gate else ratio_allclose(atol=1e-3, rtol=1e-2)
     result = run(
-        fn=l2_engram,
-        specs=build_engram_tensor_specs(args.batch, args.sequence),
-        golden_fn=golden_engram_case,
+        fn=entry,
+        specs=specs,
+        golden_fn=golden_fn,
         config={
             "backend_type": args.backend_type, "execution_mode": args.execution_mode,
             "device_id": device_ids[0],
@@ -425,7 +525,7 @@ if __name__ == "__main__":
         },
         rtol=1e-3,
         atol=1e-3,
-        compare_fn={"out": ratio_allclose(atol=1e-3, rtol=1e-2)},
+        compare_fn={"out": comparator},
         compile_only=args.compile_only,
     )
     if not result.passed:
