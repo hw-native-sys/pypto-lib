@@ -582,6 +582,60 @@ task intervals, merged across simultaneous core executions, fall from
 query absorption is tiled. These instrumented spans are diagnostic, not
 the unprofiled benchmark medians above.
 
+### Bounded recurrent KDA workers
+
+`recurrent_kda` distributes its request/head/value partitions across at most
+48 AIV workers. Each worker visits partitions with stride 48, retaining the
+original 16-value-row state tile and sequential token loop. Empty request
+slots still undergo metadata checks inside the worker; they no longer create
+one runtime block per partition. Normalization and FP32 arithmetic are unchanged.
+
+For TP8 with 32 request slots, the recurrent launch falls from
+`32 * 8 * (128 / 16) = 2048` blocks to 48. One active request has only 64 useful
+partitions, making empty-block dispatch the main target. This applies to both
+the `decode_kda` and compiler-suffixed `decode_kda_0` scopes.
+
+The following isolated measurements compare against `fc87600` on the same
+a2a3 device, using 100 timed rounds after five warmups and replaying frozen
+golden inputs. Times are device effective-time medians for normalization plus
+recurrence. Shapes match serving: Q/K/V `[32, 8, 128]`, state
+`[320, 8, 128, 128]`, request offsets `[33]`, and state metadata `[32, 14]`.
+
+| Active requests | Before (us) | After (us) | Speedup |
+|---|---:|---:|---:|
+| 1 | 578.6 | 67.9 | 8.52x |
+| 32 | 780.7 | 635.7 | 1.23x |
+
+These are operator measurements; the whole-model results above precede this
+scheduling change. Whole-model throughput has not been remeasured for it.
+
+### Bounded recurrent convolution workers
+
+`kda_conv_recurrent` also caps its launch at 48 AIV workers, retaining the
+128-channel partition, four-tap FP32 convolution, corrected SiLU, and BF16
+state/output boundaries. It interleaves the two request halves so TP8 workers
+visit consecutive request slots rather than repeatedly selecting even or odd
+requests. This improves work distribution for uneven multi-token batches.
+Each partition still processes its tokens sequentially and writes the same
+snapshot and private working-state rows.
+
+With 32 TP8 request slots, the launch falls from 768 blocks to 48; one active
+request has only 24 useful partitions. The compiler-suffixed
+`kda_conv_recurrent_0` uses this same implementation.
+
+Compared against `fc87600` on the same a2a3 device, with frozen golden replay,
+100 timed rounds and five warmups, isolated device effective-time medians are:
+
+| Case | Input rows | Before (us) | After (us) | Speedup |
+|---|---:|---:|---:|---:|
+| One active request | 32 | 165.3 | 25.9 | 6.38x |
+| 32 one-token requests | 32 | 202.7 | 107.0 | 1.89x |
+| Uneven request lengths `[6, 0, 2, 1] * 8` | 192 | 270.4 | 202.0 | 1.34x |
+
+The serving-shaped decode inputs are `[32, 3072]`, weights `[4, 3072]`,
+convolution state `[320, 3, 3072]`, request offsets `[33]`, and state metadata
+`[32, 14]`. These operator results do not include a new whole-model benchmark.
+
 ### KDA QKV active capacity rows
 
 The shared KDA projection takes `query_start_loc` and uses its final offset

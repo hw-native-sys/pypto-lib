@@ -44,7 +44,8 @@ CONV_DIM = 3 * LOCAL_KDA_QKV_DIM
 STATE_LEN = KDA_CONV_K - 1
 CONV_T_TILE = 16  # tokens per bulk task
 C_TILE = 128  # Bounds the corrected SiLU working set alongside the FP32 tap sum
-DECODE_C_TILE = 128  # channels per decode convolution task
+DECODE_C_TILE = 128  # channels per decode convolution partition
+CONV_WORKERS_TILE = 48  # AIV workers sharing the recurrent convolution partitions
 _PREFILL_LENGTHS = {"ragged": [5, 1, 9, 2, 0], "single": [1], "long": [40], "paged": [32, 1]}
 CONV_POOL_ROWS = 6
 
@@ -68,7 +69,8 @@ OUTPUT_NORM_ROWS_TILE = 8
 
 DECODE_L2_EPS = 1e-6
 DECODE_Q_SCALE = KDA_DIM**-0.5
-DECODE_V_TILE = 16  # value rows per state-update task
+DECODE_V_TILE = 16  # value rows per state-update partition
+DECODE_WORKERS_TILE = 48  # AIV workers sharing the recurrent partitions
 DECODE_NORM_ROWS_TILE = 16  # (token, head) rows per normalisation task
 COL_REP_TILE = 16  # replication width used to turn a row into a legal column
 DECODE_POOL_ROWS = 6
@@ -276,57 +278,60 @@ def kda_conv_recurrent(
     k_flat = pl.reshape(key, [t_dim, LOCAL_KDA_QKV_DIM])
     q_flat = pl.reshape(query, [t_dim, LOCAL_KDA_QKV_DIM])
     requests = pl.tensor.dim(query_start_loc, 0) - 1
-    with pl.spmd(requests * (CONV_DIM // DECODE_C_TILE), name_hint="kda_conv_recurrent"):
-        task = pl.tile.get_block_idx()
-        lanes = CONV_DIM // DECODE_C_TILE
-        request = task // lanes
-        c0 = task % lanes * DECODE_C_TILE
-        begin = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
-        end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
-        for t in pl.range(begin, end):
-            step = t - begin
-            source_col = pl.min(step, 1) * (step + 1)
-            row = pl.cast(pl.read(state_rows, [request, source_col]), pl.INDEX)
-            if row < 0:
-                row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
-            destination = pl.cast(pl.read(state_rows, [request, step + 2]), pl.INDEX)
-            if destination < 0:
-                destination = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
-            drow = destination * STATE_LEN
-            srow = row * STATE_LEN
-            st0 = pl.cast(cs2[srow + 0:srow + 0 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
-            st1 = pl.cast(cs2[srow + 1:srow + 1 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
-            st2 = pl.cast(cs2[srow + 2:srow + 2 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
-            xt = pl.cast(mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
-            acc_fp32 = pl.cast(weight[0:1, c0 : c0 + DECODE_C_TILE], pl.FP32)
-            acc_mul = pl.mul(st0, acc_fp32)
-            acc_fp32_2 = pl.cast(weight[1:2, c0 : c0 + DECODE_C_TILE], pl.FP32)
-            acc_mul_2 = pl.mul(st1, acc_fp32_2)
-            acc_add = pl.add(acc_mul, acc_mul_2)
-            acc_fp32_3 = pl.cast(weight[2:3, c0 : c0 + DECODE_C_TILE], pl.FP32)
-            acc_mul_3 = pl.mul(st2, acc_fp32_3)
-            acc_fp32_4 = pl.cast(weight[3:4, c0 : c0 + DECODE_C_TILE], pl.FP32)
-            acc_mul_4 = pl.mul(xt, acc_fp32_4)
-            acc_add_2 = pl.add(acc_add, acc_mul_3)
-            acc = pl.add(acc_add_2, acc_mul_4)
-            activation_arg_activated = pl.create_tensor([1, DECODE_C_TILE], dtype=pl.FP32)
-            activation_arg_activated[:, :] = acc
-            activated = accurate_silu(activation_arg_activated, 1, DECODE_C_TILE)
-            out_tile = pl.cast(activated, pl.BF16, mode="rint")
-            if c0 < LOCAL_KDA_QKV_DIM:
-                q_flat[t : t + 1, c0 : c0 + DECODE_C_TILE] = out_tile
-            elif c0 < 2 * LOCAL_KDA_QKV_DIM:
-                k_flat[t : t + 1, c0 - LOCAL_KDA_QKV_DIM : c0 - LOCAL_KDA_QKV_DIM + DECODE_C_TILE] = out_tile
-            else:
-                v_flat[t:t + 1, c0 - 2 * LOCAL_KDA_QKV_DIM:c0 - 2 * LOCAL_KDA_QKV_DIM + DECODE_C_TILE] = out_tile
-            cs2[drow : drow + 1, c0 : c0 + DECODE_C_TILE] = pl.cast(st1, pl.BF16, mode="rint")
-            cs2[drow + 1 : drow + 2, c0 : c0 + DECODE_C_TILE] = pl.cast(st2, pl.BF16, mode="rint")
-            cs2[drow + 2 : drow + 3, c0 : c0 + DECODE_C_TILE] = mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE]
-            if t + 1 == end:
-                final_row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX) * STATE_LEN
-                cs2[final_row:final_row + 1, c0:c0 + DECODE_C_TILE] = pl.cast(st1, pl.BF16, mode="rint")
-                cs2[final_row + 1:final_row + 2, c0:c0 + DECODE_C_TILE] = pl.cast(st2, pl.BF16, mode="rint")
-                cs2[final_row + 2:final_row + 3, c0:c0 + DECODE_C_TILE] = mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE]
+    lanes = CONV_DIM // DECODE_C_TILE
+    tasks = requests * lanes
+    with pl.spmd(pl.min(tasks, CONV_WORKERS_TILE), name_hint="kda_conv_recurrent"):
+        for task in pl.range(pl.tile.get_block_idx(), tasks, CONV_WORKERS_TILE):
+            # Interleave request halves; TP8 workers visit consecutive request slots.
+            request_slot = task // lanes
+            request = request_slot // 2 + (request_slot % 2) * ((requests + 1) // 2)
+            c0 = task % lanes * DECODE_C_TILE
+            begin = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+            end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+            for t in pl.range(begin, end):
+                step = t - begin
+                source_col = pl.min(step, 1) * (step + 1)
+                row = pl.cast(pl.read(state_rows, [request, source_col]), pl.INDEX)
+                if row < 0:
+                    row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+                destination = pl.cast(pl.read(state_rows, [request, step + 2]), pl.INDEX)
+                if destination < 0:
+                    destination = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+                drow = destination * STATE_LEN
+                srow = row * STATE_LEN
+                st0 = pl.cast(cs2[srow + 0:srow + 0 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
+                st1 = pl.cast(cs2[srow + 1:srow + 1 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
+                st2 = pl.cast(cs2[srow + 2:srow + 2 + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
+                xt = pl.cast(mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE], pl.FP32)
+                acc_fp32 = pl.cast(weight[0:1, c0 : c0 + DECODE_C_TILE], pl.FP32)
+                acc_mul = pl.mul(st0, acc_fp32)
+                acc_fp32_2 = pl.cast(weight[1:2, c0 : c0 + DECODE_C_TILE], pl.FP32)
+                acc_mul_2 = pl.mul(st1, acc_fp32_2)
+                acc_add = pl.add(acc_mul, acc_mul_2)
+                acc_fp32_3 = pl.cast(weight[2:3, c0 : c0 + DECODE_C_TILE], pl.FP32)
+                acc_mul_3 = pl.mul(st2, acc_fp32_3)
+                acc_fp32_4 = pl.cast(weight[3:4, c0 : c0 + DECODE_C_TILE], pl.FP32)
+                acc_mul_4 = pl.mul(xt, acc_fp32_4)
+                acc_add_2 = pl.add(acc_add, acc_mul_3)
+                acc = pl.add(acc_add_2, acc_mul_4)
+                activation_arg_activated = pl.create_tensor([1, DECODE_C_TILE], dtype=pl.FP32)
+                activation_arg_activated[:, :] = acc
+                activated = accurate_silu(activation_arg_activated, 1, DECODE_C_TILE)
+                out_tile = pl.cast(activated, pl.BF16, mode="rint")
+                if c0 < LOCAL_KDA_QKV_DIM:
+                    q_flat[t : t + 1, c0 : c0 + DECODE_C_TILE] = out_tile
+                elif c0 < 2 * LOCAL_KDA_QKV_DIM:
+                    k_flat[t : t + 1, c0 - LOCAL_KDA_QKV_DIM : c0 - LOCAL_KDA_QKV_DIM + DECODE_C_TILE] = out_tile
+                else:
+                    v_flat[t:t + 1, c0 - 2 * LOCAL_KDA_QKV_DIM:c0 - 2 * LOCAL_KDA_QKV_DIM + DECODE_C_TILE] = out_tile
+                cs2[drow : drow + 1, c0 : c0 + DECODE_C_TILE] = pl.cast(st1, pl.BF16, mode="rint")
+                cs2[drow + 1 : drow + 2, c0 : c0 + DECODE_C_TILE] = pl.cast(st2, pl.BF16, mode="rint")
+                cs2[drow + 2 : drow + 3, c0 : c0 + DECODE_C_TILE] = mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE]
+                if t + 1 == end:
+                    final_row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX) * STATE_LEN
+                    cs2[final_row:final_row + 1, c0:c0 + DECODE_C_TILE] = pl.cast(st1, pl.BF16, mode="rint")
+                    cs2[final_row + 1:final_row + 2, c0:c0 + DECODE_C_TILE] = pl.cast(st2, pl.BF16, mode="rint")
+                    cs2[final_row + 2:final_row + 3, c0:c0 + DECODE_C_TILE] = mixed_qkv[t:t + 1, c0:c0 + DECODE_C_TILE]
     return (query, key, value, conv_state)
 
 
@@ -706,64 +711,65 @@ def recurrent_kda(
         kn_gm[r0 : r0 + DECODE_NORM_ROWS_TILE, :] = k_unit
     state_2d = pl.reshape(recurrent_state, [pl.tensor.dim(recurrent_state, 0) * LOCAL_KDA_H * KDA_DIM, KDA_DIM])
     out_rows = pl.reshape(output, [t_dim, LOCAL_KDA_H * KDA_DIM])
-    with pl.spmd(tasks, name_hint="decode_kda", deps=[norm_tid]):
-        task = pl.tile.get_block_idx()
-        request = task // (LOCAL_KDA_H * lanes)
-        h = task // lanes % LOCAL_KDA_H
-        v0 = task % lanes * DECODE_V_TILE
-        begin = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
-        end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
-        for t in pl.range(begin, end):
-            step = t - begin
-            qk_row = t * LOCAL_KDA_H + h
-            q_row = qn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
-            k_row = kn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
-            exp_buffer = pl.create_tensor([1, KDA_DIM], dtype=pl.FP32)
-            decay_tile = pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0])
-            exp_buffer[:, :] = pl.reshape(decay_tile, [1, KDA_DIM])
-            g_row = accurate_exp(exp_buffer)
-            beta_s = pl.read(beta, [t, h])
-            source_col = pl.min(step, 1) * (step + 1)
-            row = pl.cast(pl.read(state_rows, [request, source_col]), pl.INDEX)
-            if row < 0:
-                row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
-            destination = pl.cast(pl.read(state_rows, [request, step + 2]), pl.INDEX)
-            if destination < 0:
-                destination = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
-            srow = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
-            drow = (destination * LOCAL_KDA_H + h) * KDA_DIM + v0
-            state_tile = state_2d[srow:srow + DECODE_V_TILE, 0:KDA_DIM]
-            decayed = pl.col_expand_mul(state_tile, g_row)
-            kv_buffer = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
-            kv_buffer[:, :] = pl.col_expand_mul(decayed, k_row)
-            kv_col = accurate_row_sum(kv_buffer)
-            value_tile = pl.slice(value, [1, 1, DECODE_V_TILE], [t, h, v0], drop_dims=[0])
-            v_row_v4_rows = pl.reshape(value_tile, [1, DECODE_V_TILE])
-            v_row = pl.cast(v_row_v4_rows, pl.FP32)
-            v_col_full = pl.full([COL_REP_TILE, DECODE_V_TILE], dtype=pl.FP32, value=1.0)
-            v_col_col_expand_mul = pl.col_expand_mul(v_col_full, v_row)
-            v_col_transpose = pl.transpose(v_col_col_expand_mul, 0, 1)
-            v_col_row_sum = pl.row_sum(v_col_transpose)
-            v_col = pl.mul(v_col_row_sum, 1.0 / COL_REP_TILE)
-            delta_col = pl.mul(pl.sub(v_col, kv_col), beta_s)
-            updated_full = pl.full([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
-            updated_row_expand_mul = pl.row_expand_mul(updated_full, delta_col)
-            updated_col_expand_mul = pl.col_expand_mul(updated_row_expand_mul, k_row)
-            updated = pl.add(decayed, updated_col_expand_mul)
-            state_2d[drow : drow + DECODE_V_TILE, 0:KDA_DIM] = updated
-            if t + 1 == end:
-                final_row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
-                final_offset = (final_row * LOCAL_KDA_H + h) * KDA_DIM + v0
-                state_2d[final_offset:final_offset + DECODE_V_TILE, 0:KDA_DIM] = updated
-            # Keep the state/query dot product in the same FP32 reduction domain
-            # as the recurrent update.
-            out_products = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
-            out_products[:, :] = pl.col_expand_mul(updated, q_row)
-            out_sum = accurate_row_sum(out_products)
-            out_row = pl.reshape(out_sum, [1, DECODE_V_TILE])
-            ocol = h * KDA_DIM + v0
-            out_row_bf16 = pl.cast(out_row, pl.BF16, mode="rint")
-            out_rows[t : t + 1, ocol : ocol + DECODE_V_TILE] = pl.set_validshape(out_row_bf16, 1, DECODE_V_TILE)
+    # Strip-mine request/head/value partitions across a bounded AIV worker pool.
+    with pl.spmd(pl.min(tasks, DECODE_WORKERS_TILE), name_hint="decode_kda", deps=[norm_tid]):
+        for task in pl.range(pl.tile.get_block_idx(), tasks, DECODE_WORKERS_TILE):
+            request = task // (LOCAL_KDA_H * lanes)
+            h = task // lanes % LOCAL_KDA_H
+            v0 = task % lanes * DECODE_V_TILE
+            begin = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+            end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+            for t in pl.range(begin, end):
+                step = t - begin
+                qk_row = t * LOCAL_KDA_H + h
+                q_row = qn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
+                k_row = kn_gm[qk_row : qk_row + 1, 0:KDA_DIM]
+                exp_buffer = pl.create_tensor([1, KDA_DIM], dtype=pl.FP32)
+                decay_tile = pl.slice(decay, [1, 1, KDA_DIM], [t, h, 0], drop_dims=[0])
+                exp_buffer[:, :] = pl.reshape(decay_tile, [1, KDA_DIM])
+                g_row = accurate_exp(exp_buffer)
+                beta_s = pl.read(beta, [t, h])
+                source_col = pl.min(step, 1) * (step + 1)
+                row = pl.cast(pl.read(state_rows, [request, source_col]), pl.INDEX)
+                if row < 0:
+                    row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+                destination = pl.cast(pl.read(state_rows, [request, step + 2]), pl.INDEX)
+                if destination < 0:
+                    destination = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+                srow = (row * LOCAL_KDA_H + h) * KDA_DIM + v0
+                drow = (destination * LOCAL_KDA_H + h) * KDA_DIM + v0
+                state_tile = state_2d[srow:srow + DECODE_V_TILE, 0:KDA_DIM]
+                decayed = pl.col_expand_mul(state_tile, g_row)
+                kv_buffer = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
+                kv_buffer[:, :] = pl.col_expand_mul(decayed, k_row)
+                kv_col = accurate_row_sum(kv_buffer)
+                value_tile = pl.slice(value, [1, 1, DECODE_V_TILE], [t, h, v0], drop_dims=[0])
+                v_row_v4_rows = pl.reshape(value_tile, [1, DECODE_V_TILE])
+                v_row = pl.cast(v_row_v4_rows, pl.FP32)
+                v_col_full = pl.full([COL_REP_TILE, DECODE_V_TILE], dtype=pl.FP32, value=1.0)
+                v_col_col_expand_mul = pl.col_expand_mul(v_col_full, v_row)
+                v_col_transpose = pl.transpose(v_col_col_expand_mul, 0, 1)
+                v_col_row_sum = pl.row_sum(v_col_transpose)
+                v_col = pl.mul(v_col_row_sum, 1.0 / COL_REP_TILE)
+                delta_col = pl.mul(pl.sub(v_col, kv_col), beta_s)
+                updated_full = pl.full([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32, value=1.0)
+                updated_row_expand_mul = pl.row_expand_mul(updated_full, delta_col)
+                updated_col_expand_mul = pl.col_expand_mul(updated_row_expand_mul, k_row)
+                updated = pl.add(decayed, updated_col_expand_mul)
+                state_2d[drow : drow + DECODE_V_TILE, 0:KDA_DIM] = updated
+                if t + 1 == end:
+                    final_row = pl.cast(pl.read(state_rows, [request, 1]), pl.INDEX)
+                    final_offset = (final_row * LOCAL_KDA_H + h) * KDA_DIM + v0
+                    state_2d[final_offset:final_offset + DECODE_V_TILE, 0:KDA_DIM] = updated
+                # Keep the state/query dot product in the same FP32 reduction domain
+                # as the recurrent update.
+                out_products = pl.create_tensor([DECODE_V_TILE, KDA_DIM], dtype=pl.FP32)
+                out_products[:, :] = pl.col_expand_mul(updated, q_row)
+                out_sum = accurate_row_sum(out_products)
+                out_row = pl.reshape(out_sum, [1, DECODE_V_TILE])
+                ocol = h * KDA_DIM + v0
+                out_row_bf16 = pl.cast(out_row, pl.BF16, mode="rint")
+                out_rows[t : t + 1, ocol : ocol + DECODE_V_TILE] = pl.set_validshape(out_row_bf16, 1, DECODE_V_TILE)
     return (output, recurrent_state)
 
 
