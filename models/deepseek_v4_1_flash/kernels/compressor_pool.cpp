@@ -125,7 +125,7 @@ __aicore__ inline bool can_publish(__gm__ int64_t* args, int token) {
     int request = read_metadata(data<int32_t>(args, 7) + token);
     if (request < 0 || request >= requests) return false;
     int block = read_metadata(data<int32_t>(args, 8) + request);
-    if (block < 0 || block >= args[15]) return false;
+    if (block < 0 || block >= args[14]) return false;
     int position = read_metadata(data<int32_t>(args, 3) + token);
     if (position < 0 || position % 2 == 0) return false;
     int start = read_metadata(data<int32_t>(args, 6) + request);
@@ -160,7 +160,7 @@ __aicore__ inline void flush(__gm__ int64_t* args, int rows, uint16_t active,
     using SlotGM = GlobalTensor<int64_t, TileShape2D<int64_t, 1, DYNAMIC>, BaseShape2D<int64_t, 1, 128>>;
     Slots future(128);
     TASSIGN(future, 82240);
-    int count_tokens = args[14];
+    int count_tokens = args[13];
     int first = tokens.GetValue(0);
     for (int row = 1; row < rows; ++row) {
         if (tokens.GetValue(row) < first) first = tokens.GetValue(row);
@@ -191,12 +191,17 @@ __aicore__ inline void flush(__gm__ int64_t* args, int rows, uint16_t active,
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     pool_rows(output.data(), current_kv.data(), current_score.data(), previous_kv.data(),
               previous_score.data(), weight.data(), pool_scratch.data(), active, rows);
+    auto cache_tensor = reinterpret_cast<__gm__ Tensor*>(args[12]);
+    auto cache_data = data<uint8_t>(args, 12);
+    auto scale_data = reinterpret_cast<__gm__ bfloat16_t*>(cache_data + 256);
+    int64_t scale_stride = cache_tensor->strides[1] / sizeof(bfloat16_t);
     publish_rows<false>(output, cosine, sine, packed, scales, quant_scratch, targets, tokens, rows,
-                        65536, 79552, 81600, data<bfloat16_t>(args, 5), data<uint8_t>(args, 12), data<bfloat16_t>(args, 13));
+                        65536, 79552, 81600, data<bfloat16_t>(args, 5), cache_data, scale_data,
+                        cache_tensor->strides[1], scale_stride);
 }
 
 __aicore__ inline void run(__gm__ int64_t* args) {
-    int count_tokens = args[14], blocks = args[15];
+    int count_tokens = args[13], blocks = args[14];
     int worker = get_block_idx(args), workers = get_block_num(args);
     int request_count = reinterpret_cast<__gm__ Tensor*>(args[8])->shapes[0];
     using Meta = Tile<TileType::Vec, int32_t, 1, 32, BLayout::RowMajor, 1, DYNAMIC>;

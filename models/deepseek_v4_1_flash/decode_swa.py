@@ -9,8 +9,13 @@
 """SWA decode attention with mHC."""
 
 
+from utils import packed_cache_compare
+
 import pypto.language as pl
-from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_GROUP
+
+from quant import pack_quantized_cache, unpack_quantized_cache
+
+from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_BYTES
 from sparse_attention import _attend_window_project
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding, hc_post
@@ -59,8 +64,7 @@ def decode_swa(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     attention_output: pl.Tensor[[LOCAL_T_DYN, D], pl.BF16],
     attention_hidden: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     attention_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
@@ -90,11 +94,11 @@ def decode_swa(
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=32)
     cache_ready = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
-        window_slots, window_cache, window_cache_scale,
+        window_slots, window_cache,
         num_tokens, x_ready,
     )
     _attend_window_project(
-        q, window_indices, window_cache, window_cache_scale, attn_sink,
+        q, window_indices, window_cache, attn_sink,
         wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attention_output,
         num_tokens, cache_ready,
     )
@@ -130,8 +134,7 @@ def l2_decode_swa(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     attention_output: pl.InOut[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
@@ -148,7 +151,7 @@ def l2_decode_swa(
         wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale,
+        window_cache,
         attention_output, attention_hidden, attention_pre_mix,
         num_tokens,
     )
@@ -179,8 +182,7 @@ def l3_decode_swa(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     attention_output: pl.InOut[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
@@ -204,7 +206,7 @@ def l3_decode_swa(
         wo_a, wo_a_scale, wo_b, wo_b_scale_r,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale,
+        window_cache,
         attention_output, attention_hidden, attention_pre_mix,
         num_tokens, device=0,
     )
@@ -266,9 +268,14 @@ def build_swa_specs(args):
                 values["attn_sink"].fill_(1000)
     specs = []
     for name, shape, dtype in zip(SWA_INPUT_NAMES, leaf_shapes, dtypes):
-        if name == "x":
+        if name in ("x", "window_cache_scale"):
             continue
-        initialize = None if values is None else partial(torch.clone, values[name])
+        if name == "window_cache":
+            shape, dtype = [pages, 128, 1, WINDOW_CACHE_BYTES], torch.uint8
+            cache = None if values is None else pack_quantized_cache(values[name], values["window_cache_scale"])
+            initialize = None if cache is None else partial(torch.clone, cache)
+        else:
+            initialize = None if values is None else partial(torch.clone, values[name])
         specs.append(TensorSpec(name, shape, dtype, init_value=initialize))
     local = getattr(args, "local_tokens", args.tokens)
     generator = torch.Generator().manual_seed(args.seed + 1000)
@@ -316,6 +323,8 @@ def golden_swa(tensors, *, reference=None):
     from hc import golden_hc_collapse, golden_mhc_mixes, golden_hc_post
     from rmsnorm import golden_rms_norm
 
+    fields = dict(tensors)
+    fields["window_cache"], fields["window_cache_scale"] = unpack_quantized_cache(tensors["window_cache"], False, head_dim=tensors["kv_norm_weight"].numel())
     active = int(tensors["num_tokens"])
     pre_mix, post_mix, residual_mix = golden_mhc_mixes(
         tensors["x_hc"],
@@ -325,22 +334,20 @@ def golden_swa(tensors, *, reference=None):
     collapsed = golden_hc_collapse(tensors["x_hc"], tensors["incoming_pre_mix"]).to(torch.bfloat16)
     normalized = golden_rms_norm(collapsed[:active], tensors["attn_norm_weight"])
     if reference is None:
-        inputs = {name: normalized if name == "x" else tensors[name] for name in SWA_INPUT_NAMES}
+        inputs = {name: normalized if name == "x" else fields[name] for name in SWA_INPUT_NAMES}
         cache_rows = tensors["window_cache"].shape[0] * 128
         shared_cache = tensors["attn_sink"].numel() != 64 and active >= 32 and cache_rows <= active * 128
         partial, cache, scale = swa_official_reference(inputs, shared_cache=shared_cache)
         tensors["attention_output"][:active].copy_(partial.bfloat16())
-        tensors["window_cache"].view(torch.uint8).copy_(cache.contiguous().view(torch.uint8))
-        tensors["window_cache_scale"].copy_(scale)
+        tensors["window_cache"].copy_(pack_quantized_cache(cache, scale))
     else:
         import inspect
 
         parameters = inspect.signature(reference).parameters
-        inputs = {name: normalized if name == "x" else tensors[name] for name in parameters}
+        inputs = {name: normalized if name == "x" else fields[name] for name in parameters}
         computed = reference(**inputs)
         tensors["attention_output"][:active].copy_(computed["output"])
-        for name in ("window_cache", "window_cache_scale"):
-            tensors[name].view(torch.uint8).copy_(computed[name].contiguous().view(torch.uint8))
+        tensors["window_cache"].copy_(pack_quantized_cache(computed["window_cache"], computed["window_cache_scale"]))
     tensors["attention_hidden"].zero_()
     tensors["attention_output"][active:].zero_()
     if active:
@@ -394,15 +401,18 @@ if __name__ == "__main__":
             "attention_hidden": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "attention_pre_mix": ratio_allclose(atol=1e-4, rtol=1e-4),
             "attention_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
-            "window_cache": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window cache", mapping_shape=(args.tokens,),
-                block_size=128, leading_rank_axis=False,
-                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.01,
-            ),
-            "window_cache_scale": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window cache scale", mapping_shape=(args.tokens,),
-                block_size=128, leading_rank_axis=False,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            "window_cache": packed_cache_compare(
+                mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window cache", mapping_shape=(args.tokens,),
+                    block_size=128, leading_rank_axis=False,
+                    atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.01,
+                ),
+                mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window cache scale", mapping_shape=(args.tokens,),
+                    block_size=128, leading_rank_axis=False,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.0,
+                ),
+                fp4=False,
             ),
         },
         config={

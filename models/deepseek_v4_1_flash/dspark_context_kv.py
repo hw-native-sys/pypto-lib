@@ -9,12 +9,14 @@
 """Publish one V4.1 DSpark draft layer's context KV into its SWA cache."""
 
 import pypto.language as pl
+
+
 import torch
 
-from config import FLASH, ORI_BLOCKS_DYN
+from config import FLASH, ORI_BLOCKS_DYN, WINDOW_CACHE_BYTES
 from qkv_proj_rope import golden_rope_interleave, quantize_projection_input, kv_proj, window_publish
 from gemm import golden_mxfp8_linear_grouped_sum
-from quant import quantize_mxfp8_cache
+from quant import quantize_mxfp8_cache, pack_quantized_cache, unpack_quantized_cache
 from rmsnorm import golden_rms_norm
 
 
@@ -74,8 +76,7 @@ def dspark_context_kv(
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     context_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Use the draft layer's own WKV, norm, and paged cache mapping."""
@@ -86,10 +87,10 @@ def dspark_context_kv(
     projected = kv_proj(kv_input_payload, kv_input_scales, wkv, wkv_scale, projected, num_tokens, worker_limit=32)
     window_publish(
         projected, kv_norm_weight, rope_cos, rope_sin,
-        context_slots, window_cache, window_cache_scale,
+        context_slots, window_cache,
         num_tokens, window_input_ready,
     )
-    return window_cache, window_cache_scale
+    return window_cache
 
 
 @pl.jit
@@ -101,8 +102,7 @@ def dspark_context_kv_test(
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     context_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_cache: pl.InOut[pl.Tensor[[3, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[3, ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // 32], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[3, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Publish through a middle-layer view while retaining both guard layers."""
@@ -111,7 +111,6 @@ def dspark_context_kv_test(
     rope_sin.bind_dynamic(0, T_DYN)
     context_slots.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
-    window_cache_scale.bind_dynamic(1, ORI_BLOCKS_DYN)
     dspark_context_kv(
         main_x,
         wkv,
@@ -121,10 +120,9 @@ def dspark_context_kv_test(
         rope_sin,
         context_slots,
         window_cache[1],
-        window_cache_scale[1],
         num_tokens,
     )
-    return window_cache, window_cache_scale
+    return window_cache
 
 
 def _compare_context_cache(
@@ -141,12 +139,10 @@ def _compare_context_cache(
     slots = inputs["context_slots"]
     layer_rows = actual_outputs["window_cache"].shape[1] * 128
     active = slots[slots >= 0].long().unique() + layer_rows
-    actual = dequantize_mxfp8_cache(
-        actual_outputs["window_cache"], actual_outputs["window_cache_scale"]
-    ).reshape(-1, HEAD_DIM)
-    expected = dequantize_mxfp8_cache(
-        expected_outputs["window_cache"], expected_outputs["window_cache_scale"]
-    ).reshape(-1, HEAD_DIM)
+    actual_payload, actual_scale = unpack_quantized_cache(actual_outputs["window_cache"], False)
+    expected_payload, expected_scale = unpack_quantized_cache(expected_outputs["window_cache"], False)
+    actual = dequantize_mxfp8_cache(actual_payload, actual_scale).reshape(-1, HEAD_DIM)
+    expected = dequantize_mxfp8_cache(expected_payload, expected_scale).reshape(-1, HEAD_DIM)
     relative_l2 = (actual[active].float() - expected[active].float()).norm() / expected[
         active
     ].float().norm().clamp_min(1e-12)
@@ -154,10 +150,10 @@ def _compare_context_cache(
     inactive[active] = False
     untouched = all(
         torch.equal(
-            actual_outputs[name].contiguous().view(torch.uint8).reshape(actual.shape[0], -1)[inactive],
-            expected_outputs[name].contiguous().view(torch.uint8).reshape(actual.shape[0], -1)[inactive],
+            actual_field.contiguous().view(torch.uint8).reshape(actual.shape[0], -1)[inactive],
+            expected_field.contiguous().view(torch.uint8).reshape(actual.shape[0], -1)[inactive],
         )
-        for name in ("window_cache", "window_cache_scale")
+        for actual_field, expected_field in ((actual_payload, expected_payload), (actual_scale, expected_scale))
     )
     return bool(torch.isfinite(relative_l2) and relative_l2 <= 0.05 and untouched), (
         f"active context KV relative L2={relative_l2.item():.6g}; inactive rows unchanged={untouched}"
@@ -196,6 +192,7 @@ if __name__ == "__main__":
     slots = torch.tensor([0, 1, 127, 128, 255, -1, -1, -1], dtype=torch.int64)
 
     def golden(values):
+        cache_payload, cache_factors = unpack_quantized_cache(values["window_cache"][1], False)
         payload, scale = golden_context_kv_cache(
             values["main_x"],
             values["wkv"],
@@ -204,11 +201,10 @@ if __name__ == "__main__":
             values["rope_cos"],
             values["rope_sin"],
             values["context_slots"],
-            values["window_cache"][1],
-            values["window_cache_scale"][1],
+            cache_payload,
+            cache_factors,
         )
-        values["window_cache"][1].copy_(payload)
-        values["window_cache_scale"][1].copy_(scale)
+        values["window_cache"][1].copy_(pack_quantized_cache(payload, scale))
 
     specs = [
         TensorSpec("main_x", [tokens, D], torch.bfloat16, init_value=main_x),
@@ -218,13 +214,11 @@ if __name__ == "__main__":
         TensorSpec("rope_cos", [tokens, ROPE_DIM // 2], torch.float32, init_value=cos),
         TensorSpec("rope_sin", [tokens, ROPE_DIM // 2], torch.float32, init_value=sin),
         TensorSpec("context_slots", [tokens], torch.int64, init_value=slots),
-        TensorSpec("window_cache", [3, 2, 128, 1, HEAD_DIM], torch.float8_e4m3fn, init_value=cache),
-        TensorSpec(
-            "window_cache_scale", [3, 2, 128, 1, HEAD_DIM // 32], torch.bfloat16, init_value=cache_scale
-        ),
+        TensorSpec("window_cache", [3, 2, 128, 1, WINDOW_CACHE_BYTES], torch.uint8,
+                   init_value=pack_quantized_cache(cache, cache_scale)),
         ScalarSpec("num_tokens", torch.int32, tokens, compile_runtime=True),
     ]
-    compare = {name: _compare_context_cache for name in ("window_cache", "window_cache_scale")}
+    compare = {"window_cache": _compare_context_cache}
     result = run(
         fn=dspark_context_kv_test,
         specs=specs,

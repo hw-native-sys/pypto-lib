@@ -10,11 +10,16 @@
 """C2A full decode attention with mHC."""
 
 
+from utils import packed_cache_compare
+
 import pypto.language as pl
+
+from quant import pack_quantized_cache, unpack_quantized_cache
+
 from config import (
     FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
     Q_START_DYN, STATE_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, STATE_CAPACITY,
-    WINDOW_CACHE_GROUP,
+    WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from compressor import STATE_WIDTH, c2a_compressor_project
 from compressor import c2a_compressor_publish
@@ -72,10 +77,8 @@ def decode_c2a_full(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
@@ -122,7 +125,7 @@ def decode_c2a_full(
     kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=32)
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
-        window_slots, window_cache, window_cache_scale,
+        window_slots, window_cache,
         num_tokens, cache_ready,
     )
 
@@ -133,7 +136,7 @@ def decode_c2a_full(
     compressed_publish_tid = c2a_compressor_publish(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
         state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
-        compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache, compressed_cache_scale,
+        compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache,
     )
 
     select_tid = decode_c2a_indexer(
@@ -148,7 +151,7 @@ def decode_c2a_full(
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
-        query, window_indices, window_cache, window_cache_scale, topk_indices, compressed_cache, compressed_cache_scale,
+        query, window_indices, window_cache, topk_indices, compressed_cache,
         attn_sink, attended, num_tokens, chunk_done, compressed_keys=INDEX_TOPK,
     )
     o_proj(
@@ -187,10 +190,8 @@ def l2_decode_c2a_full(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -234,8 +235,8 @@ def l2_decode_c2a_full(
         wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale,
+        window_cache,
+        compressed_cache,
         token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         position_ids,
@@ -276,10 +277,8 @@ def l3_decode_c2a_full(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     token_to_req_indices: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -328,8 +327,8 @@ def l3_decode_c2a_full(
         wo_a, wo_a_scale, wo_b, wo_b_scale_mx,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale,
+        window_cache,
+        compressed_cache,
         token_to_req_indices, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         position_ids,
@@ -360,6 +359,8 @@ def golden_c2a(tensors, mode="full"):
     from utils import _publish_quantized_cache
 
     t = dict(tensors)
+    t["window_cache"], t["window_cache_scale"] = unpack_quantized_cache(tensors["window_cache"], False, head_dim=tensors["kv_norm_weight"].numel())
+    t["compressed_cache"], t["compressed_cache_scale"] = unpack_quantized_cache(tensors["compressed_cache"], True, head_dim=tensors["kv_norm_weight"].numel())
     if "x_hc" in t:
         x_hc = t["x_hc"]
         next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
@@ -438,8 +439,8 @@ def golden_c2a(tensors, mode="full"):
     )
 
     for name, value in (
-        ("window_cache", window_cache), ("window_cache_scale", window_cache_scale),
-        ("compressed_cache", compressed_cache), ("compressed_cache_scale", compressed_cache_scale),
+        ("window_cache", pack_quantized_cache(window_cache, window_cache_scale)),
+        ("compressed_cache", pack_quantized_cache(compressed_cache, compressed_cache_scale)),
         ("index_cache", index_cache), ("index_cache_scale", index_cache_scale),
         ("state_cache", state_cache), ("topk_indices", topk_indices), ("candidate_mask", None),
         ("pool_block_ids", None), ("pool_block_counts", None),
@@ -630,12 +631,13 @@ def build_c2a_specs(
         f"window_pages={window_pages} compressed_pages={compressed_pages} "
         f"index_block_table={tuple(index_block_table.shape)}"
     )
+    values["window_cache"] = pack_quantized_cache(values["window_cache"], values.pop("window_cache_scale"))
+    values["compressed_cache"] = pack_quantized_cache(values["compressed_cache"], values.pop("compressed_cache_scale"))
     if mode == "reuse":
         source = values
         published = {name: value.clone() for name, value in source.items()}
         golden_c2a(published)
         values["compressed_cache"] = published["compressed_cache"]
-        values["compressed_cache_scale"] = published["compressed_cache_scale"]
         values["compressed_indices"] = published["topk_indices"]
         reachable = int((published["topk_indices"] >= 0).sum())
         print(
@@ -721,29 +723,35 @@ if __name__ == "__main__":
         compare_fn={
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "window_cache": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+            "window_cache": packed_cache_compare(
+                mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window_cache",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+                ),
+                mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window_cache_scale",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.0,
+                ),
+                fp4=False,
             ),
-            "window_cache_scale": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
-            "compressed_cache": mapped_fp4_cache_compare(
-                "compressed_slots", pool_name="compressed_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                max_error_ratio=0.005,
-            ),
-            "compressed_cache_scale": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="compressed_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+            "compressed_cache": packed_cache_compare(
+                mapped_fp4_cache_compare(
+                    "compressed_slots", pool_name="compressed_cache",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    max_error_ratio=0.005,
+                ),
+                mapped_pool_ratio_allclose(
+                    "compressed_slots", pool_name="compressed_cache_scale",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                ),
+                fp4=True,
             ),
             "index_cache": mapped_fp4_cache_compare(
                 "compressed_slots", pool_name="index_cache",

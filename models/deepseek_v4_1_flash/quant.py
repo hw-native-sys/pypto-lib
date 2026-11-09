@@ -11,7 +11,10 @@
 import torch
 import pypto.language as pl
 
-from config import FLASH as M
+from config import (
+    FLASH as M, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
+    WINDOW_CACHE_GROUP, COMPRESSED_CACHE_GROUP,
+)
 
 
 # model config
@@ -447,3 +450,41 @@ def unpack_mxfp4_weight_tiles(
         codes = FP4_E4M3_CODES.to(torch.uint8)[nibbles_kn.to(torch.long)]
         output[batch] = codes.view(torch.float8_e4m3fn)
     return output.reshape(*lead, k, n)
+
+
+def pack_quantized_cache(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Store each FP8/FP4 payload row followed by its group-wise BF16 factors."""
+    fp4 = payload.dtype == torch.uint8
+    head_dim = payload.shape[-1] * (2 if fp4 else 1)
+    group = COMPRESSED_CACHE_GROUP if fp4 else WINDOW_CACHE_GROUP
+    if payload.dtype not in (torch.uint8, torch.float8_e4m3fn) or head_dim % group:
+        raise ValueError("Cache payload must use the configured FP8 or packed FP4 row layout")
+    if scales.dtype != torch.bfloat16 or scales.shape != (*payload.shape[:-1], head_dim // group):
+        raise ValueError("Cache factors must use the configured BF16 group layout")
+    return torch.cat((payload.view(torch.uint8), scales.view(torch.uint8)), dim=-1)
+
+
+def unpack_quantized_cache(
+    cache: torch.Tensor, fp4: bool, *, head_dim: int = M.head_dim,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expose writable payload and BF16 factor views sharing the packed storage.
+
+    Rows contain FP8 bytes or packed FP4 nibbles first, followed by BF16
+    factors. Both returned tensors retain the packed row stride; writes to
+    either field update the original cache without allocating another pool.
+    ``head_dim`` is explicit for reduced-width mathematical reference fixtures;
+    device fixtures use the configured model width by default.
+    """
+    width = head_dim // 2 if fp4 else head_dim
+    group = COMPRESSED_CACHE_GROUP if fp4 else WINDOW_CACHE_GROUP
+    row_bytes = COMPRESSED_CACHE_BYTES if fp4 else WINDOW_CACHE_BYTES
+    if head_dim != M.head_dim:
+        row_bytes = width + 2 * (head_dim // group)
+    if head_dim <= 0 or head_dim % group:
+        raise ValueError("Cache head dimension must contain complete quantization groups")
+    if cache.dtype != torch.uint8 or cache.shape[-1] != row_bytes:
+        raise ValueError("Packed cache must use the configured byte-row layout")
+    payload = cache[..., :width]
+    if not fp4:
+        payload = payload.view(torch.float8_e4m3fn)
+    return payload, cache[..., width:].view(torch.bfloat16)
