@@ -90,6 +90,7 @@ from config import (
     STATE_CAPACITY,
     MOE_TOKENS,
     DSPARK_DRAFT_LAYERS,
+    DSPARK_LAST_TARGET_LAYER,
     DSPARK_TARGET_LAYER_IDS,
 )
 
@@ -614,8 +615,10 @@ def l2_prefill_fwd(
             next_hidden, next_pre, hc_window, hc_arrived,
             rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, layer + 1, moe_ready,
         )
-        if layer >= DSPARK_TARGET_LAYER_IDS[0]:
-            target_column = (layer - DSPARK_TARGET_LAYER_IDS[0]) * D
+        # This residual enters the next layer's attention.
+        target_layer = layer + 1
+        if target_layer >= DSPARK_TARGET_LAYER_IDS[0] and target_layer <= DSPARK_LAST_TARGET_LAYER:
+            target_column = (target_layer - DSPARK_TARGET_LAYER_IDS[0]) * D
             for core in pl.spmd(48, name_hint="prefill_dspark_target_hidden", deps=[moe_ready]):
                 for token in pl.range(core, CAPACITY, 48):
                     if token < active:
@@ -1958,9 +1961,7 @@ if __name__ == "__main__":
                                             runtime.copy_to(handle.data_ptr, upload_buffer.data_ptr(), size, dst_offset=offset, worker_id=rank)
                             runtime(*arguments, config=cfg)
                         target_hidden = torch.empty((RANKS, CAPACITY, DSPARK_MAIN_IN), dtype=torch.bfloat16)
-                        final_hc = torch.empty((RANKS, CAPACITY, HC_MULT, D), dtype=torch.float32)
                         runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("dspark_target_hidden")], target_hidden)
-                        runtime.copy_stacked_from(arguments[PREFILL_TENSORS.index("x_hc_out")], final_hc)
             except Exception:
                 if benchmark and trace_path.exists():
                     print(trace_path.read_text(), file=sys.stderr)
@@ -1970,8 +1971,6 @@ if __name__ == "__main__":
             if benchmark:
                 stats = _parse_stats_from_strace(trace_path.read_text(), rounds=rounds, warmup=warmup, distributed=True)
                 _report_bench(stats, compiled, l3=True, resident=True)
-            final_tap = target_hidden[:, :, 2 * D : 3 * D]
-            expected_final_tap = final_hc.mean(dim=2).to(torch.bfloat16)
             if not torch.isfinite(target_hidden.float()).all():
                 raise AssertionError("DSpark prefill target hidden contains non-finite values")
             expected_tap = torch.zeros((RANKS, CAPACITY, D), dtype=torch.bfloat16)
@@ -1982,8 +1981,6 @@ if __name__ == "__main__":
                 tap_rows = target_hidden[:, :, tap * D : (tap + 1) * D]
                 if not torch.equal(tap_rows, expected_tap):
                     raise AssertionError(f"DSpark prefill layer {layer} tap differs from the zero-weight reference")
-            if not torch.equal(final_tap, expected_final_tap):
-                raise AssertionError("DSpark prefill final tap does not match final HC state")
             print("[FWD] Execution and all DSpark taps passed the zero-weight reference; full numerical accuracy was not validated.", flush=True)
         if not result.passed:
             raise SystemExit(result.error or 1)

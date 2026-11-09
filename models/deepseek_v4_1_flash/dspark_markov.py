@@ -578,10 +578,10 @@ def _markov_sample_from_hidden(
     confidences.bind_dynamic(0, B_DYN)
     batch = pl.tensor.dim(num_sampled, 0)
     rows = batch * DSPARK_QUERY_WIDTH
-    flat_hidden = pl.create_tensor([rows, D], dtype=pl.BF16)
-    flat_hidden[:, :] = pl.reshape(head_hidden, [rows, D])
+    flat_hidden = pl.reshape(head_hidden, [rows, D])
     normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
-    for block in pl.spmd((rows + 7) // 8, name_hint="dspark_final_norm"):
+    with pl.spmd((rows + 7) // 8, name_hint="dspark_final_norm") as logits_ready_tid:
+        block = pl.tile.get_block_idx()
         rms_norm_tiled(flat_hidden, final_norm_weight, normalized, block, rows, output_fp32=False)
     base_logits = pl.create_tensor([batch, DSPARK_QUERY_WIDTH, VOCAB], dtype=pl.FP32)
     flat_logits = pl.reshape(base_logits, [rows, VOCAB])
@@ -593,7 +593,8 @@ def _markov_sample_from_hidden(
     completed_epochs = logits_epoch + MAX_LOGIT_CHUNKS - 1
     for chunk in pl.unroll(MAX_LOGIT_CHUNKS):
         row_indices = pl.create_tensor([MAX_LOGIT_ROWS], dtype=pl.INT32)
-        for core in pl.spmd(1, name_hint="dspark_logit_rows"):
+        with pl.spmd(1, name_hint="dspark_logit_rows", deps=[logits_ready_tid]):
+            core = pl.tile.get_block_idx()
             for row in pl.range(core * MAX_LOGIT_ROWS, (core + 1) * MAX_LOGIT_ROWS):
                 source = pl.cast(-1, pl.INT32)
                 global_row = chunk * MAX_LOGIT_ROWS + row
@@ -615,7 +616,8 @@ def _markov_sample_from_hidden(
             logits_epoch + chunk,
             completed_epochs,
         )
-        for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="dspark_pack_logits", deps=[logits_ready_tid]):
+        with pl.spmd(MAX_LOGIT_ROWS, name_hint="dspark_pack_logits", deps=[logits_ready_tid]) as logits_ready_tid:
+            row = pl.tile.get_block_idx()
             global_row = chunk * MAX_LOGIT_ROWS + row
             if global_row < rows:
                 for offset in pl.range(0, VOCAB, VOCAB_TILE):
