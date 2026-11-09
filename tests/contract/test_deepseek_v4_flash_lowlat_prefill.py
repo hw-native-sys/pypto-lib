@@ -55,8 +55,8 @@ def test_cache_views_share_storage_and_page_tables_preserve_rows():
     assert converted["ori_block_table"][0, 0, :12].tolist() == [0, 1, 2, 3, -1, -1, -1, -1, 8, 9, 10, 11]
     assert converted["csa_compress_state_block_table"][0, 0, :6].tolist() == [0, 1, 2, 3, 4, 5]
     tables["block_table"][2, 0, 0] = 3
-    with pytest.raises(ValueError, match="agree within"):
-        prefill_block_tables(tables)
+    converted = prefill_block_tables(tables)
+    assert converted["ori_block_table"][2, 0, :4].tolist() == [12, 13, 14, 15]
 
 
 def test_only_owned_cache_pages_are_initialized():
@@ -100,6 +100,10 @@ def test_prefill_metadata_matches_page_geometry_and_padding():
                                      rope_cos=cos, rope_sin=sin, max_logit_rows=128, terminal=False)
     assert short["hca_cmp_slot_mapping_full"][0].tolist() == [-1, -1, -1, -1]
     assert bool((short["logit_row_indices"] == -1).all())
+    tables["block_table"][1, 0, :2] = torch.tensor([1, 0], dtype=torch.int32)
+    per_rank = prepare_prefill_metadata(tokens, start_pos=125, tables=tables, caches=_cache_metadata(),
+                                       rope_cos=cos, rope_sin=sin, max_logit_rows=128, terminal=True)
+    assert per_rank["ori_slot_mapping_full"][1, :5].tolist() == [253, 254, 255, 0, 1]
     tables["block_table"][:, :, 1] = 0
     with pytest.raises(ValueError, match="overwrite its live SWA history"):
         prepare_prefill_metadata(tokens, start_pos=125, tables=tables, caches=_cache_metadata(),

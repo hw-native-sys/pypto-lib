@@ -133,9 +133,6 @@ def _table(table, name):
         raise ValueError(f"{name} must have shape [8, 1, pages]")
     if bool((table < -1).any()):
         raise ValueError(f"{name} contains an invalid page id")
-    for base in (0, CP_SIZE):
-        if not torch.equal(table[base : base + CP_SIZE], table[base : base + 1].expand(CP_SIZE, -1, -1)):
-            raise ValueError(f"{name} must agree within each prefill CP group")
     return table
 
 
