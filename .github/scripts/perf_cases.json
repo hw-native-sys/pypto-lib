@@ -667,6 +667,32 @@
         "--shard",
         "0"
       ]
+    },
+    {
+      "case_id": "glm5.3-flash-prefill-moe-full-ep2-t64",
+      "entrypoint": "models/glm5_3_flash/layer.py",
+      "platform": "a2a3",
+      "device_count": 2,
+      "arguments": [
+        "--ep",
+        "2",
+        "--tokens",
+        "64",
+        "--num-tokens",
+        "64"
+      ]
+    },
+    {
+      "case_id": "glm5.3-flash-decode-moe-full-ep2-t16",
+      "entrypoint": "models/glm5_3_flash/decode_layer.py",
+      "platform": "a2a3",
+      "device_count": 2,
+      "arguments": [
+        "--ep",
+        "2",
+        "--num-tokens",
+        "16"
+      ]
     }
   ],
   "reference_profiles": {
