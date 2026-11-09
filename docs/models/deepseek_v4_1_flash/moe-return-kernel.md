@@ -72,7 +72,7 @@ use 64 AIV. The common maximum budget is 64 AIV, not identical work assignment.
 For small M48 traffic, the larger of the two rank medians increased from
 17.214 to 20.476 us; this is an observed regression, not a speedup. The initial
 capture used devices 0/1 on November 6, and the revised capture used devices
-1/2 on November 9. Both ranks and the original samples remain visible.
+1/3 on November 9. Both ranks and the original samples remain visible.
 
 The 144-row case is uniform EP2 routing. The 9-row case models the average
 traffic to one of 32 expert ranks: `48 * 6 / 32 = 9` rows. The 279-row case
@@ -116,8 +116,8 @@ For small M72 traffic, rank 1 changed from 22.805 to 17.148 us, while rank 0
 changed from 16.997 to 20.977 us. The larger rank median therefore changed
 from 22.805 to 20.977 us, not to 17.148 us. The slower rank changed; the
 measurements do not establish that a fixed 5-us cost was eliminated or that
-both ranks are consistently below 20 us. Initial and revised M72 small-traffic
-captures both used devices 1/2 in separate runs.
+both ranks are consistently below 20 us. The initial M72 small-traffic capture used devices 1/2; the revised capture
+used devices 1/3, in a separate run.
 
 The C++ and original DSL paths have 80 physical output rows and zero the final
 eight; the CANN fixtures have 72 physical rows. All return the same 72 valid
@@ -125,7 +125,7 @@ BF16 rows. The C++ interval includes this padding work. The same native body
 supports both token counts; there is no separate tuned M48 implementation.
 
 All initial C++ and CANN samples were retained. The current revised C++ was
-captured once per listed condition on November 9, on devices 1/2, with 5
+captured once per listed condition on November 9, on devices 1/3, with 5
 warmups and 100 samples per rank. No original C++ or CANN performance
 condition was recollected. The older M72 uniform C++/CANN captures used
 devices 4/5. Device and source identities are retained per capture.
@@ -200,6 +200,8 @@ The descriptor change was checked on 1,881 CPU ranges across EP2/4/8 metadata,
 including empty experts and partial source segments. This is an index-mapping
 check, not an EP4/8 device-performance claim. The revised native kernel passed
 exact two-round device checks for all six routing cases at both token counts.
+Six additional exact cases cover the production extent of 80 physical rows
+with 48 active tokens, including mixed active counts `[0, 37]`.
 
 ## Validation and reproduction
 

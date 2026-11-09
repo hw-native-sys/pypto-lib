@@ -15864,6 +15864,63 @@
         "tokens_per_rank": 72,
         "physical_tokens": 80
       }
-    ]
+    ],
+    "production_padding_validation": {
+      "physical_tokens": 80,
+      "active_tokens": 48,
+      "cases": [
+        {
+          "case": "pair",
+          "passed": true,
+          "devices": [
+            3,
+            6
+          ]
+        },
+        {
+          "case": "uniform",
+          "passed": true,
+          "devices": [
+            3,
+            6
+          ]
+        },
+        {
+          "case": "remote",
+          "passed": true,
+          "devices": [
+            3,
+            6
+          ]
+        },
+        {
+          "case": "hot",
+          "passed": true,
+          "devices": [
+            3,
+            6
+          ]
+        },
+        {
+          "case": "mixed",
+          "passed": true,
+          "devices": [
+            3,
+            6
+          ]
+        },
+        {
+          "case": "zero",
+          "passed": true,
+          "devices": [
+            3,
+            6
+          ]
+        }
+      ],
+      "source_sha256": "131ab0bb0740a147d1da1a51da08ff9bf3b0319e3f157bc87812fa45461ff385",
+      "performance_sampling": false
+    },
+    "quantile_convention": "cpp_p10_us and cpp_p90_us use nearest-rank percentiles (sorted indices9 and89 for100samples)"
   }
 }
