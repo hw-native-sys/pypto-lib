@@ -981,6 +981,51 @@ Use `--case tp_reduce` for the collective alone, or a local case such as
 python models/glm5_3_flash/lm_head.py -p a2a3 -d 0,1 --compile-only
 ```
 
+### Native arithmetic for Sinkhorn and convolution
+
+The mHC Sinkhorn normalization uses FP32 `row_sum` and `div` for its
+replicated 4x4 nonnegative matrix. The 20 row/column iterations, quadrant
+scaling and epsilon placement are preserved. KDA convolution uses native
+FP32 `exp` and `div` for SiLU across bulk, request-head and recurrent paths;
+the four taps retain sequential FP32 accumulation and the output rounds
+once to BF16. The former `accurate_silu` helper is replaced by `silu`.
+Other compensated primitives retain their existing consumers.
+
+The FP64-derived goldens and numerical acceptance limits are unchanged.
+TP8 and TP16 checks cover zero, cancellation and scaled inputs, odd token
+counts, prefix snapshots, speculative state restoration, the exact BF16
+convolution boundary fixture, and mHC coefficients composed with BF16
+stream collapse. Checkpoint-weight checks use attention/FFN mHC weights
+from layers 0, 23 and 44, and convolution weights from layers 0, 22 and 44,
+with seeded synthetic activations. Coefficients pass all points at
+`atol=1e-5, rtol=1e-3`; convolution and recurrent outputs pass all points at
+`atol=rtol=0.02`; convolution state copies and the boundary key are exact.
+The composed mHC BF16 output retains `atol=1e-4, rtol=1/128`.
+
+On a2a3 TP8, complete mHC mixing against mainline `79be1fd` falls from
+1073.8 to 1027.5 us at 32 rows, and from 4576.7 to 4393.1 us at 192 rows.
+The projection work in that baseline dominates the complete operator.
+
+The following separate comparison applies only these arithmetic changes
+on top of the Cube projections and bounded workers in PR #1730 at
+`e821d1f`. It does not include those earlier optimizations in the speedup.
+
+| Operator | Case | Before (us) | After (us) | Speedup |
+|---|---|---:|---:|---:|
+| Complete mHC mixing | 32 rows | 139.2 | 93.6 | 1.49x |
+| Complete mHC mixing | 192 rows | 530.9 | 348.0 | 1.53x |
+| Recurrent convolution | Capacity 32, one active request | 24.5 | 21.3 | 1.15x |
+| Recurrent convolution | Capacity 32, 32 one-token requests | 105.3 | 46.1 | 2.28x |
+| Recurrent convolution | Capacity 192, lengths `[6, 0, 2, 1] * 8` | 200.0 | 66.6 | 3.00x |
+
+Each pair uses the same device, 100 timed rounds after five warmups,
+frozen input/golden replay and the device effective-time median.
+Convolution shapes are `[capacity, 3072]`, weights `[4, 3072]`, state
+`[320, 3, 3072]`, request offsets `[33]` and metadata `[32, 14]`.
+These are single-operator measurements; whole-model generation has not
+been remeasured with these arithmetic changes. Passing the component
+gates does not establish bitwise equality for all model outputs.
+
 ## Validation
 
 `decode_fwd.py` exports the complete production decode L3 entry. Component validation stays with the operators in `kda.py`,

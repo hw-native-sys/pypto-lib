@@ -26,8 +26,8 @@ from models.glm5_3_flash.config import (
     TP_SIZE, D, Glm53FlashConfig,
 )
 from models.glm5_3_flash.elementwise import (
-    accurate_divide, accurate_exp, accurate_row_sum, accurate_rsqrt, accurate_sigmoid, accurate_silu,
-    accurate_sqrt,
+    accurate_divide, accurate_exp, accurate_row_sum, accurate_rsqrt, accurate_sigmoid,
+    accurate_sqrt, silu,
 )
 from models.glm5_3_flash.linear import bf16_matmul, golden_bf16_linear
 from models.glm5_3_flash.rmsnorm import l2norm, reference_l2norm, rms_norm_gated
@@ -129,7 +129,7 @@ def kda_conv_prefill(
                 acc = pl.add(acc, acc_col_expand_mul)
             activation_input = pl.create_tensor([CONV_T_TILE, C_TILE], dtype=pl.FP32)
             activation_input[:, :] = acc
-            activated = accurate_silu(activation_input, CONV_T_TILE, C_TILE)
+            activated = silu(activation_input, CONV_T_TILE, C_TILE)
             out_tile = pl.set_validshape(pl.cast(activated, pl.BF16, mode="rint"), rows, C_TILE)
             if c0 < LOCAL_KDA_QKV_DIM:
                 q_flat[p0 : p0 + CONV_T_TILE, c0 : c0 + C_TILE] = out_tile
@@ -208,9 +208,9 @@ def kda_conv_prefill(
             input0[:, :] = acc0
             input1[:, :] = acc1
             input2[:, :] = acc2
-            act0 = accurate_silu(input0, 1, C_TILE)
-            act1 = accurate_silu(input1, 1, C_TILE)
-            act2 = accurate_silu(input2, 1, C_TILE)
+            act0 = silu(input0, 1, C_TILE)
+            act1 = silu(input1, 1, C_TILE)
+            act2 = silu(input2, 1, C_TILE)
             v0 = pl.min(pl.max(length, 0), 1)
             v1 = pl.min(pl.max(length - 1, 0), 1)
             v2 = pl.min(pl.max(length - 2, 0), 1)
@@ -316,7 +316,7 @@ def kda_conv_recurrent(
                 acc = pl.add(acc_add_2, acc_mul_4)
                 activation_arg_activated = pl.create_tensor([1, DECODE_C_TILE], dtype=pl.FP32)
                 activation_arg_activated[:, :] = acc
-                activated = accurate_silu(activation_arg_activated, 1, DECODE_C_TILE)
+                activated = silu(activation_arg_activated, 1, DECODE_C_TILE)
                 out_tile = pl.cast(activated, pl.BF16, mode="rint")
                 if c0 < LOCAL_KDA_QKV_DIM:
                     q_flat[t : t + 1, c0 : c0 + DECODE_C_TILE] = out_tile

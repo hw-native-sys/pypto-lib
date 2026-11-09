@@ -6,9 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Compensated FP32 arithmetic for GLM decode gates and reductions.
+"""FP32 activations and compensated arithmetic for GLM gates and reductions.
 
-These model primitives retain extra product/reduction bits before the FP32
+Compensated primitives retain extra product/reduction bits before the FP32
 rounding boundary. Inputs must be finite and keep splitter products normal;
 normalization denominators must be positive. Row reductions accept at most
 128 columns so their fixed-point accumulator cannot overflow."""
@@ -119,16 +119,16 @@ def accurate_sigmoid(x: pl.Tensor[[M, N], pl.FP32], ROWS: pl.constexpr, COLS: pl
 
 
 @pl.jit.inline
-def accurate_silu(x: pl.Tensor[[M, N], pl.FP32], ROWS: pl.constexpr, COLS: pl.constexpr):
-    """Evaluate SiLU with one FP32 division before the activation is rounded."""
+def silu(x: pl.Tensor[[M, N], pl.FP32], ROWS: pl.constexpr, COLS: pl.constexpr):
+    """Evaluate FP32 SiLU for BF16 convolution outputs."""
     value = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
     value[:, :] = x
     argument = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
     argument[:, :] = pl.neg(value)
-    exponential = accurate_exp(argument)
+    exponential = pl.exp(argument)
     denominator = pl.create_tensor([ROWS, COLS], dtype=pl.FP32)
     denominator[:, :] = pl.add(exponential, 1.0)
-    return accurate_divide(value, denominator)
+    return pl.div(value, denominator)
 
 
 @pl.jit.inline
