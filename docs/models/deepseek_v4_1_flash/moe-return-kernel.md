@@ -45,11 +45,27 @@ already weighted. CANN still performs its unit-weight multiplication.
 Each cell is the median of 100 samples after 5 warmups, in microseconds.
 Ranks are reported separately, without selecting the fastest rank.
 
-| Remote / local expert rows per rank | C++ rank 0 | CANN rank 0 | C++ rank 1 | CANN rank 1 |
-| --- | ---: | ---: | ---: | ---: |
-| 9 / 279 | 17.214 | 15.997 | 14.055 | 15.844 |
-| 144 / 144 | 58.501 | 58.302 | 49.660 | 57.438 |
-| 279 / 9 | 100.009 | 102.088 | 95.197 | 100.913 |
+The **before** column reports the original split DSL's stages separately:
+S = scatter, N = notify, W = defer-wait registration, R = reduce. Each value
+is the median of the stage's maximum per-core body execution time. W is not
+the communication-wait duration. The deferred wait takes place outside these
+bodies and overlaps runtime scheduling, so the retained traces do not provide
+a comparable complete-return kernel latency for the original path. Do not
+sum these stages or calculate a before/after speedup from this table.
+
+The **after** and CANN columns cover their respective complete fused kernel
+execution intervals, as defined below. The original M48 DSL uses 64 scatter
+workers, 24 reduce workers, and one each for notify/wait; both fused kernels
+use 64 AIV. The common maximum budget is 64 AIV, not identical work assignment.
+
+| Remote / local rows per rank | Rank | Before: DSL S / N / W / R | After: fused C++ | CANN |
+| --- | --- | --- | ---: | ---: |
+| 9 / 279 | 0 | 3.023 / 1.522 / 1.178 / 4.491 | 17.214 | 15.997 |
+| 9 / 279 | 1 | 2.967 / 1.569 / 1.316 / 4.532 | 14.055 | 15.844 |
+| 144 / 144 | 0 | 35.096 / 1.551 / 1.255 / 5.271 | 58.501 | 58.302 |
+| 144 / 144 | 1 | 35.511 / 1.518 / 1.249 / 5.217 | 49.660 | 57.438 |
+| 279 / 9 | 0 | 74.558 / 1.519 / 1.274 / 5.419 | 100.009 | 102.088 |
+| 279 / 9 | 1 | 75.628 / 1.517 / 1.208 / 5.397 | 95.197 | 100.913 |
 
 The 144-row case is uniform EP2 routing. The 9-row case models the average
 traffic to one of 32 expert ranks: `48 * 6 / 32 = 9` rows. The 279-row case
@@ -74,23 +90,36 @@ precise percentage speedup. The supplementary maximum per-core C++ execution
 metric is retained in the data file and is not substituted for either column.
 An initial inter-rank barrier is outside both measured kernels.
 
-## Matched 72-token measurement
+## Matched 72-token measurements
 
-The additional uniform EP2 case has 72 active tokens, 432 valid expert rows per
-rank, 36 rows per expert, and 216 remote rows. Dtypes, accumulation, maximum
-64-AIV budget, warmup/sample counts, source implementation, and timing boundary
-match the 48-token comparison. Both implementations ran on devices 4 and 5.
+Both M72 cases have 72 active tokens, 432 valid expert rows per rank, and 36
+rows per expert. The small-traffic case has 14 remote / 418 local rows; the
+uniform EP2 case has 216 remote / 216 local rows. Dtypes, accumulation, maximum
+64-AIV budget, warmup/sample counts, and kernel timing definitions match M48.
+The original DSL uses 64 scatter, 40 reduce, and one notify/wait worker each.
 
-| Case | C++ rank 0 | CANN rank 0 | C++ rank 1 | CANN rank 1 |
-| --- | ---: | ---: | ---: | ---: |
-| 72 active tokens, 216 remote rows | 82.321 | 80.739 | 73.420 | 80.803 |
+| Remote / local rows per rank | Rank | Before: DSL S / N / W / R | After: fused C++ | CANN |
+| --- | --- | --- | ---: | ---: |
+| 14 / 418 | 0 | 3.808 / 1.395 / 1.202 / 4.615 | 16.997 | 17.798 |
+| 14 / 418 | 1 | 3.798 / 1.731 / 1.361 / 4.611 | 22.805 | 17.898 |
+| 216 / 216 | 0 | 55.042 / 1.468 / 1.256 / 5.341 | 82.321 | 80.739 |
+| 216 / 216 | 1 | 56.716 / 1.763 / 1.313 / 5.330 | 73.420 | 80.803 |
 
-The production C++ path has 80 physical output rows and zeros the final eight;
-the CANN fixture has 72 physical rows. Both return the same 72 valid BF16 rows.
-The C++ interval includes this padding work. The same native body supports both
-token counts; there is no separate tuned 48-token implementation. This was the
-only new matched performance condition collected for the PR; the existing
-48-token captures were retained.
+For small M72 traffic, C++ rank 1 is about 4.9 us slower than CANN and exceeds
+20 us. The rank difference is retained; the result does not establish a
+uniform sub-20-us latency across both ranks.
+
+The C++ and original DSL paths have 80 physical output rows and zero the final
+eight; the CANN fixtures have 72 physical rows. All return the same 72 valid
+BF16 rows. The C++ interval includes this padding work. The same native body
+supports both token counts; there is no separate tuned M48 implementation.
+
+The M48 captures and M72 uniform C++/CANN captures from November 6 were reused.
+Only missing conditions were collected on November 9: M72 small-traffic
+C++/CANN and M72 small/uniform DSL baselines, all on devices 1 and 2. The retained
+M72 uniform C++/CANN measurements used devices 4 and 5. Raw samples retain rank
+and device identity; no fastest-rank selection or repeated known-condition
+sampling was used. All new captures passed exact output checks.
 
 The composed MoE passed its original golden tolerances for active-token counts
 `[48, 48]`, `[72, 72]`, and `[0, 37]`. Standalone 48- and 72-token routing cases
@@ -100,8 +129,13 @@ second round and reuse of the communication window.
 ## Sources and retained evidence
 
 [`moe-return-kernel-results.json`](moe-return-kernel-results.json) contains the
-per-sample durations, both ranks, raw-evidence hashes, configuration, and source
-revisions. The 48-token measurements were reused, not recollected for this PR.
+per-sample durations, original DSL stage timings, both ranks, raw-evidence
+hashes, configuration, and source revisions. The original DSL was extracted
+from pypto-lib revision `2562a862f917ed76b67cdb064d3a9b74e156e8b4`, with the
+preceding FFN outside measurement and an explicit start barrier. M72 changes
+only its shapes and active-token count. These are historical baseline
+measurements, not a new benchmark of current main. The 48-token measurements
+were reused, not recollected for this PR.
 Recompiling this PR's native source produced the same 10,784-byte `.text` as the
 measured kernel, with SHA256
 `180f7d7fe6cf4de34f84d3f2122297273e2cd86c86c6932ee266dcc9f686d918`.
