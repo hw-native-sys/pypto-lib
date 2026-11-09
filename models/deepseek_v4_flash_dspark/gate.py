@@ -31,15 +31,16 @@ N_HASH_LAYERS = M.num_hash_layers
 # tiling
 NORM_TOKEN_TILE = 4
 GATE_T_TILE = 8
-GATE_M_TILE = min(64, ((T + GATE_T_TILE - 1) // GATE_T_TILE) * GATE_T_TILE)  # Fully initialized token tiles at every supported TP.
-GATE_N_TILE = 32        # expert columns per gate spmd block
+GATE_M_TILE = 16 if T <= 8 else min(64, ((T + GATE_T_TILE - 1) // GATE_T_TILE) * GATE_T_TILE)
+GATE_N_TILE = 16 if T <= 8 else 32
 assert N_EXPERTS % GATE_N_TILE == 0
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 D_TILE = 256
 ROW_PAD = 8
 FFN_REDUCE_TILE = D // ROW_PAD
 assert D % ROW_PAD == 0
-GATE_D_TILE = 512
+GATE_D_TILE = 2048 if T <= 8 else 512
+GATE_WEIGHT_CACHE = pl.CachePolicy.BYPASS if T <= 8 else pl.CachePolicy.DEFAULT
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
 SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
@@ -162,6 +163,7 @@ def _gate(
     # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
     for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
+        pl.set_cache_policy(gate_w, GATE_WEIGHT_CACHE)
         tg = gb_idx // GATE_N_BLOCKS
         nb = gb_idx % GATE_N_BLOCKS
         t1 = tg * GATE_M_TILE
@@ -202,7 +204,8 @@ def _gate(
             # Tail [TOPK, TOPK_PAD) zeroed so fillpad drops it from the sum.
             hs_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
             for hs_tt in pl.range(GATE_T_TILE):
-                hs_token = pl.cast(pl.read(input_ids, [t1 + hs_tt]), pl.INDEX)
+                hs_row = pl.min(t1 + hs_tt, T - 1)
+                hs_token = pl.cast(pl.read(input_ids, [hs_row]), pl.INDEX)
                 for hs_k in pl.range(TOPK):
                     pl.write(hs_idx_tile, [hs_tt, hs_k], pl.read(tid2eid, [hs_token, hs_k]))
                 for hs_pad_k in pl.range(TOPK, TOPK_PAD):
