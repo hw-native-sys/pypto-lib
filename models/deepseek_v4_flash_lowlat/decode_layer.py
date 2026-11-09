@@ -1156,6 +1156,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False,
                         help="persist inputs and golden outputs for replay")
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--seed", type=int, default=0, help="Seed for the generated correctness fixture.")
     if __package__:
         from .config import CONTEXT_CAPACITY
     else:
@@ -1163,6 +1164,11 @@ if __name__ == "__main__":
 
     parser.add_argument("--max-seq-len", type=int, default=CONTEXT_CAPACITY, help="import-time context capacity (default 1048576)")
     args = parser.parse_args()
+
+    import torch
+
+    torch.manual_seed(args.seed)
+    print(f"decode_layer fixture seed: {args.seed}", flush=True)
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
