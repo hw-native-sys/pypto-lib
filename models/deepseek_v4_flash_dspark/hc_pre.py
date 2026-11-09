@@ -13,7 +13,7 @@ from math import gcd
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ, MOE_TOKENS
 from rmsnorm import rms_norm_apply, rms_norm_inverse
 
 
@@ -43,7 +43,7 @@ PRE_POST_WORKERS = 16
 RMS_K_TILE = 512
 LINEAR_K_TILE = 256
 D_TILE = 256
-D_SPMD = gcd(4096, D)
+D_SPMD = gcd(1024 if MOE_TOKENS <= 8 else 4096, D)
 LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_WORKERS = 16  # bounded hc_pre_linear workers
@@ -177,8 +177,8 @@ def hc_pre_gates(
     # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
     # 32B tile, 4 cols valid -- a bare 4-wide slice allocs a 16B tile ptoas rejects). comb gate
     # lives in comb_sinkhorn.
-    # Only the final partial token tile uses these fixed-size staging buffers.
-    post_tail_store = pl.create_tensor([T_TILE, HC_PAD], dtype=pl.FP32)
+    # Tile-disjoint staging for row-wise gate publication.
+    post_tail_store = pl.create_tensor([token_tiles * T_TILE, HC_PAD], dtype=pl.FP32)
     for ob_worker in pl.spmd(pl.min(token_tiles, PRE_POST_WORKERS), name_hint="split_pre_post", allow_early_resolve=True):
         for ob in pl.range(ob_worker, token_tiles, pl.min(token_tiles, PRE_POST_WORKERS)):
             t0 = ob * T_TILE
@@ -188,19 +188,26 @@ def hc_pre_gates(
             )
             pl.store(mixes_total, [t0, 0], mixes_raw)
             pl.store(pre_val, [t0, 0], pre_val_store)
-            if pl.tensor.dim(post, 0) < T_TILE:
-                pl.store(post_pad, [0, 0], post_tail_store)
+            if MOE_TOKENS <= 8:
+                pl.store(post_pad, [t0, 0], post_tail_store)
                 for post_row in pl.range(valid_rows):
-                    post_value = pl.load(post_tail_store, [post_row, 0], [1, HC_PAD], valid_shape=[1, HC_MULT])
+                    post_value = pl.load(post_tail_store, [t0 + post_row, 0], [1, HC_PAD], valid_shape=[1, HC_MULT])
                     pl.store(post_value, [t0 + post_row, 0], post)
+
             else:
-                if valid_rows == T_TILE:
-                    post_full_tile = pl.set_validshape(post_pad, T_TILE, HC_MULT)
-                    pl.store(post_full_tile, [t0, 0], post)
+                if pl.tensor.dim(post, 0) < T_TILE:
+                    pl.store(post_pad, [t0, 0], post_tail_store)
+                    for post_row in pl.range(valid_rows):
+                        post_value = pl.load(post_tail_store, [t0 + post_row, 0], [1, HC_PAD], valid_shape=[1, HC_MULT])
+                        pl.store(post_value, [t0 + post_row, 0], post)
                 else:
-                    pl.store(post_pad, [0, 0], post_tail_store)
-                    post_tile = pl.load(post_tail_store, [0, 0], [T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    pl.store(post_tile, [t0, 0], post)
+                    if valid_rows == T_TILE:
+                        post_full_tile = pl.set_validshape(post_pad, T_TILE, HC_MULT)
+                        pl.store(post_full_tile, [t0, 0], post)
+                    else:
+                        pl.store(post_pad, [t0, 0], post_tail_store)
+                        post_tile = pl.load(post_tail_store, [t0, 0], [T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                        pl.store(post_tile, [t0, 0], post)
 
     _hc_pre_combinations(mixes_raw, inv_rms, hc_base, comb, t_dim, scale2, row_recip)
     return pre_val_store
@@ -221,7 +228,7 @@ def _hc_pre_combinations(
     hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])
     # comb_sinkhorn: comb gate from mixes_raw cols 8/12/16/20, softmax, then a
     # column-first 20-iteration Sinkhorn -> comb.
-    comb_tail_store = pl.create_tensor([COMB_T_TILE, HC_PAD * HC_MULT], dtype=pl.FP32)
+    comb_tail_store = pl.create_tensor([token_tiles * COMB_T_TILE, HC_PAD * HC_MULT], dtype=pl.FP32)
     for ob in pl.spmd(token_tiles, name_hint="comb_sinkhorn", allow_early_resolve=True):
         t0 = ob * COMB_T_TILE
         valid_rows = pl.min(COMB_T_TILE, t_dim - t0)
@@ -320,38 +327,49 @@ def _hc_pre_combinations(
             row2_cur = pl.div(row2_norm, col_sum)
             row3_cur = pl.div(row3_norm, col_sum)
 
-        if pl.tensor.dim(comb, 0) < COMB_T_TILE:
-            pl.store(row0_cur, [0, 0 * HC_PAD], comb_tail_store)
-            pl.store(row1_cur, [0, 1 * HC_PAD], comb_tail_store)
-            pl.store(row2_cur, [0, 2 * HC_PAD], comb_tail_store)
-            pl.store(row3_cur, [0, 3 * HC_PAD], comb_tail_store)
+        if MOE_TOKENS <= 8:
+            pl.store(row0_cur, [t0, 0 * HC_PAD], comb_tail_store)
+            pl.store(row1_cur, [t0, 1 * HC_PAD], comb_tail_store)
+            pl.store(row2_cur, [t0, 2 * HC_PAD], comb_tail_store)
+            pl.store(row3_cur, [t0, 3 * HC_PAD], comb_tail_store)
             for comb_row in pl.range(valid_rows):
                 for hc_row in pl.unroll(HC_MULT):
-                    comb_value = pl.load(comb_tail_store, [comb_row, hc_row * HC_PAD], [1, HC_PAD], valid_shape=[1, HC_MULT])
+                    comb_value = pl.load(comb_tail_store, [t0 + comb_row, hc_row * HC_PAD], [1, HC_PAD], valid_shape=[1, HC_MULT])
                     pl.store(comb_value, [t0 + comb_row, hc_row * HC_MULT], comb)
+
         else:
-            if valid_rows == COMB_T_TILE:
-                row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
-                row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
-                row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
-                row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
-                pl.store(row0_out, [t0, 0 * HC_MULT], comb)
-                pl.store(row1_out, [t0, 1 * HC_MULT], comb)
-                pl.store(row2_out, [t0, 2 * HC_MULT], comb)
-                pl.store(row3_out, [t0, 3 * HC_MULT], comb)
+            if pl.tensor.dim(comb, 0) < COMB_T_TILE:
+                pl.store(row0_cur, [t0, 0 * HC_PAD], comb_tail_store)
+                pl.store(row1_cur, [t0, 1 * HC_PAD], comb_tail_store)
+                pl.store(row2_cur, [t0, 2 * HC_PAD], comb_tail_store)
+                pl.store(row3_cur, [t0, 3 * HC_PAD], comb_tail_store)
+                for comb_row in pl.range(valid_rows):
+                    for hc_row in pl.unroll(HC_MULT):
+                        comb_value = pl.load(comb_tail_store, [t0 + comb_row, hc_row * HC_PAD], [1, HC_PAD], valid_shape=[1, HC_MULT])
+                        pl.store(comb_value, [t0 + comb_row, hc_row * HC_MULT], comb)
             else:
-                pl.store(row0_cur, [0, 0 * HC_PAD], comb_tail_store)
-                pl.store(row1_cur, [0, 1 * HC_PAD], comb_tail_store)
-                pl.store(row2_cur, [0, 2 * HC_PAD], comb_tail_store)
-                pl.store(row3_cur, [0, 3 * HC_PAD], comb_tail_store)
-                row0_tail = pl.load(comb_tail_store, [0, 0 * HC_PAD], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                row1_tail = pl.load(comb_tail_store, [0, 1 * HC_PAD], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                row2_tail = pl.load(comb_tail_store, [0, 2 * HC_PAD], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                row3_tail = pl.load(comb_tail_store, [0, 3 * HC_PAD], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                pl.store(row0_tail, [t0, 0 * HC_MULT], comb)
-                pl.store(row1_tail, [t0, 1 * HC_MULT], comb)
-                pl.store(row2_tail, [t0, 2 * HC_MULT], comb)
-                pl.store(row3_tail, [t0, 3 * HC_MULT], comb)
+                if valid_rows == COMB_T_TILE:
+                    row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
+                    row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
+                    row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
+                    row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
+                    pl.store(row0_out, [t0, 0 * HC_MULT], comb)
+                    pl.store(row1_out, [t0, 1 * HC_MULT], comb)
+                    pl.store(row2_out, [t0, 2 * HC_MULT], comb)
+                    pl.store(row3_out, [t0, 3 * HC_MULT], comb)
+                else:
+                    pl.store(row0_cur, [t0, 0 * HC_PAD], comb_tail_store)
+                    pl.store(row1_cur, [t0, 1 * HC_PAD], comb_tail_store)
+                    pl.store(row2_cur, [t0, 2 * HC_PAD], comb_tail_store)
+                    pl.store(row3_cur, [t0, 3 * HC_PAD], comb_tail_store)
+                    row0_tail = pl.load(comb_tail_store, [t0, 0 * HC_PAD], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    row1_tail = pl.load(comb_tail_store, [t0, 1 * HC_PAD], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    row2_tail = pl.load(comb_tail_store, [t0, 2 * HC_PAD], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    row3_tail = pl.load(comb_tail_store, [t0, 3 * HC_PAD], [COMB_T_TILE, HC_PAD], valid_shape=[valid_rows, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    pl.store(row0_tail, [t0, 0 * HC_MULT], comb)
+                    pl.store(row1_tail, [t0, 1 * HC_MULT], comb)
+                    pl.store(row2_tail, [t0, 2 * HC_MULT], comb)
+                    pl.store(row3_tail, [t0, 3 * HC_MULT], comb)
 
     return comb
 
