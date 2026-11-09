@@ -175,45 +175,21 @@ jobs:
           # A5 MXFP8 entries require float8_e8m0fnu from newer Torch.
           torch-version: 'torch==2.10.0'
 
-      - name: Run model tests (${{ matrix.platform }}, via task-submit)
-        id: sweep
-        shell: bash
+      - name: Select all device models
+        id: selection
         env:
-          PYPTO_LOG_LEVEL: error
-          PYPTO_WARNING_LEVEL: none
-          # Quiet simpler's runtime logger — see the sim job for the full note.
-          PYPTO_RUNTIME_LOG: error
-          MODEL_PLATFORM: ${{ matrix.platform }}
-          PYPTO_BENCH: '0'  # Correctness only; the dedicated performance job owns timing.
+          PLATFORM: ${{ matrix.platform }}
         run: |
           source activate.sh
-          FILES=$(python .github/scripts/detect_changes.py --all --root models --platform "$MODEL_PLATFORM")
-          : > results.tsv
-          failed=()
-          for f in $FILES; do
-            echo "::group::$f"
-            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1 || true)
-            ndev=${ndev:-1}
-            device_flags=()
-            if [ "$ndev" -gt 1 ]; then
-              device_flags+=(--device-num "$ndev" --ignore-whitelist)
-            fi
-            if task-submit --device auto "${device_flags[@]}" --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYPTO_BENCH=0 PYTHONPATH=$GITHUB_WORKSPACE/checkout python $f -p $MODEL_PLATFORM -d \$TASK_DEVICE"; then
-              status=pass
-            else
-              status=fail
-              failed+=("$f")
-              echo "::error file=${f}::FAIL"
-            fi
-            echo "[model][$MODEL_PLATFORM] $f: $status"
-            printf '%s\t%s\n' "$f" "$status" >> results.tsv
-            echo "::endgroup::"
-          done
-          if [ ${#failed[@]} -ne 0 ]; then
-            printf 'FAILED: %s\n' "${failed[@]}"
-            exit 1
-          fi
+          files=$(python .github/scripts/detect_changes.py --all --root models --platform "$PLATFORM")
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
+      - name: Run device tests
+        id: sweep
+        uses: ./.github/actions/run-device-tests
+        with:
+          platform: ${{ matrix.platform }}
+          files: ${{ steps.selection.outputs.files }}
 
       - name: Kill orphaned task-submit tasks
         if: always()

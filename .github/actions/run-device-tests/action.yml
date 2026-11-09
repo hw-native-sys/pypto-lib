@@ -1,0 +1,21 @@
+name: Run device tests
+description: Run selected device entries with common correctness defaults and deadlines.
+
+inputs:
+  platform:
+    description: a2a3 or a5.
+    required: true
+  files:
+    description: Space-separated entry paths from detect_changes.py; empty runs no cases.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Run selected cases
+      shell: bash
+      working-directory: checkout
+      env:
+        FILES: ${{ inputs.files }}
+        PLATFORM: ${{ inputs.platform }}
+      run: bash .github/scripts/run_device_tests.sh

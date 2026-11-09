@@ -801,21 +801,6 @@ runs:
           retry_native "$1" py_install --no-build-isolation "$1" "${settings[@]}"
         }
 
-        # Limit only the simpler wheel build, not the separate PyPTO build.
-        # The target also belongs in the wheel-cache key below.
-        simpler_target="${SIMPLER_BUILD_TARGET:-}"
-        case "$simpler_target" in
-          ''|build_package_a2a3) ;;
-          *) echo "::error::unsupported simpler build target: $simpler_target"; exit 1 ;;
-        esac
-        with_simpler_target() {
-          if [ -n "$simpler_target" ]; then
-            SKBUILD_BUILD_TARGETS="$simpler_target" "$@"
-          else
-            "$@"
-          fi
-        }
-
         # ----------------------------------------------------------------------
         # Wheel cache — a second layer above ccache, aimed at a different axis.
         #
@@ -927,9 +912,6 @@ runs:
             cann_id="$cann_id-$(sha256sum "$cann_info" | cut -c1-12)"
           fi
           simpler_rt="$RUNTIME_PLATFORM-$cann_id"
-        fi
-        if [ -n "$simpler_target" ]; then
-          simpler_rt="$simpler_rt-$simpler_target"
         fi
         if [ -z "$pypto_tree" ] || [ -z "$simpler_tree" ] ||
            [ -z "$toolchain_prefix" ] || [ -z "$build_inputs" ]; then
@@ -1070,16 +1052,16 @@ runs:
         esac
 
         simpler_slot="$wheel_cache/$simpler_key"
-        rc=0; with_simpler_target ensure_slot "$simpler_slot" "$PYPTO_SRC/runtime" || rc=$?
+        rc=0; ensure_slot "$simpler_slot" "$PYPTO_SRC/runtime" || rc=$?
         case "$rc" in
           0) echo "wheel cache: simpler <- $simpler_key"
              install_slot "$simpler_slot" 'simpler' || {
                echo "::warning::wheel cache slot vanished — installing simpler in place"
-               with_simpler_target retry_build "$PYPTO_SRC/runtime" || exit 1
+               retry_build "$PYPTO_SRC/runtime" || exit 1
              } ;;
           2) exit 1 ;;
           *) echo "::warning::wheel cache unusable — installing simpler in place"
-             with_simpler_target retry_build "$PYPTO_SRC/runtime" || exit 1 ;;
+             retry_build "$PYPTO_SRC/runtime" || exit 1 ;;
         esac
         # Fail fast if the venv cannot import what was just installed. It catches
         # a broken venv here rather than ten minutes later in the test step, and
