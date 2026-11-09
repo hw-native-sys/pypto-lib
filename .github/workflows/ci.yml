@@ -271,6 +271,7 @@ jobs:
           path: |
             checkout/build_output/**/report/codegen_errors.txt
             checkout/build_output/**/*.pto
+            checkout/ci_failure_data/decode_layer/**
 
       - name: Kill orphaned task-submit tasks
         if: always()

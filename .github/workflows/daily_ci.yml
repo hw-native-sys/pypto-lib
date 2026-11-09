@@ -202,6 +202,14 @@ jobs:
         working-directory: checkout
         run: rm -rf build_output
 
+      - name: Upload decode_layer failure snapshot
+        if: ${{ always() && failure() && hashFiles('checkout/ci_failure_data/decode_layer/**') != '' }}
+        uses: ./.github/actions/upload-results
+        with:
+          name: decode-layer-failure-${{ matrix.platform }}
+          path: checkout/ci_failure_data/decode_layer
+          if-no-files-found: error
+
       - name: Upload results artifact
         # Gated on the sweep having started — see the sim job's upload step
         # for the full note. This job is where the bare always() actually
