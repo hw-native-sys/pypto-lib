@@ -12,15 +12,17 @@ matches a particular 910B variant. CANN's
 explicitly distinguishes the physical card from the single-DIE meaning of
 its device parameters. Verify the capture's logical-device-to-DIE mapping.
 
-- One kernel on one DIE: use that DIE's work, time, Cube peak, and HBM peak.
+- One kernel on one DIE: use that DIE's work, time, and Cube peak, with the
+  shared 1.6-TB/s HBM bandwidth denominator below.
 - Whole physical card: sum work on both DIEs over a common execution window
-  and sum their compute and local-memory bandwidth peaks. An idle DIE still
-  belongs in a whole-card denominator.
+  and sum their compute peaks. An idle DIE still belongs in the whole-card
+  compute denominator. HBM bandwidth remains shared at 1.6 TB/s; two DIEs do
+  not double it.
 - Do not double one DIE's FLOPs just because it belongs to an A3 card. Do not
   sum two durations for concurrent execution. Cross-DIE timestamps need a
   common clock or a measured shared wall-time window.
 - Keep HBM traffic and inter-DIE link traffic separate. Shared addressing
-  does not make remote memory as accessible as local HBM at its peak rate.
+  does not justify adding another HBM bandwidth denominator.
 
 ## Cube reference peaks
 
@@ -75,49 +77,48 @@ Do not transfer the 950 MXFP8 peak or scale layout to A2/A3.
 
 ## HBM bandwidth evidence and MBU
 
-Obtain the target SKU's HBM bandwidth from its hardware specification or an
-explicit user-provided reference. Record whether the number is per DIE,
-physical card, or server; use decimal TB/s. Do not infer HBM bandwidth from
-Cube frequency, HBM capacity, or undocumented `ddr_rate` platform fields.
+Use **1.6 TB/s** (decimal) for A2/A3 GEMM bandwidth utilization. This is the
+shared-bandwidth hardware assumption explicitly supplied by the user on
+2026-11-09, rather than a new device measurement. Two DIEs share this bandwidth;
+retain 1.6 TB/s for both single-DIE work and combined work on those two DIEs.
+Do not multiply it by the DIE count or infer it from Cube frequency, HBM
+capacity, or undocumented `ddr_rate` platform fields.
 
-The [Atlas 800T A3 product page](https://e.huawei.com/cn/products/computing/ascend/atlas-800t-a3)
-lists eight processors, 8 x 128 GB memory, and 3.2 TB/s memory bandwidth.
-This is a useful reference lead, not a universal per-DIE constant. Confirm
-the bandwidth scope and target SKU in the hardware specification before use.
-If 3.2 TB/s is confirmed as the sum of two identical DIEs' local HBM peaks,
-the corresponding per-DIE denominator is 1.6 TB/s. That division is conditional.
-It does not establish the bandwidth of every A2 SKU.
-
-The [A2 whitepaper landing page](https://e.huawei.com/cn/documents/products/computing/b0b253c4d5da4e05ba80a39e3dc65fd2)
-is another primary reference. Its PDF tables were not verified when this
-reference was created; no universal A2 bandwidth default is recorded here.
-If bandwidth is unknown, report effective TB/s and leave MBU uncomputed.
+Calculate read and write bandwidth separately and use the higher utilization.
+Both directions use the same 1.6-TB/s denominator; their rates are not added.
 
 For an ordinary FP16/BF16 GEMM with two-byte output and no additional tensors:
 
 ```text
 F = 2*M*N*K
-Q = 2*M*K + 2*K*N + 2*M*N
+Q_read = 2*M*K + 2*K*N
+Q_write = 2*M*N
+peak_TB_s = 1.6
 compute_utilization_pct = 100 * F / (t_us * 1e6 * peak_TFLOPS)
-effective_bandwidth_pct = 100 * Q / (t_us * 1e6 * peak_TB_s)
-actual_HBM_MBU_pct = 100 * measured_HBM_bytes / (t_us * 1e6 * peak_TB_s)
+read_utilization_pct = 100 * Q_read / (t_us * 1e6 * peak_TB_s)
+write_utilization_pct = 100 * Q_write / (t_us * 1e6 * peak_TB_s)
+effective_bandwidth_pct = max(read_utilization_pct, write_utilization_pct)
+actual_HBM_MBU_pct = 100 * max(measured_HBM_read_bytes, measured_HBM_write_bytes) / (t_us * 1e6 * peak_TB_s)
 ```
 
-Q is logical read-once/write-once traffic, not measured HBM traffic. Adapt it
-for output precision, bias, input C, quantization scales/zero-points, temporary
+Q_read and Q_write are logical read-once/write-once traffic, not measured HBM
+traffic. Adapt them for output precision, bias, input C, quantization
+scales/zero-points, temporary
 buffers, or fused stages. The helper's `--scale-group` recipe describes
 K-group scales on both operands; it is not a generic A2/A3 quantization format.
 
-For whole-card MBU, sum each DIE's measured HBM bytes in the common window;
-count replicated reads on both DIEs. Attribute the sum to the selected work
-only with kernel-attributed measurements or an exclusive window on both DIEs;
-otherwise report device-wide window utilization. Cross-DIE traffic requires identifying
-which HBM controllers served it rather than blindly doubling logical bytes.
+For whole-card MBU, aggregate measured reads and writes separately over the
+common window, then take the larger bandwidth and divide by 1.6 TB/s. Count
+actual replicated reads, but do not count a shared controller counter twice
+when it appears under both DIEs. Attribute traffic to the selected work only
+with kernel-attributed measurements or an exclusive window on both DIEs;
+otherwise report device-wide window utilization. Cross-DIE traffic requires
+identifying which HBM controllers served it rather than doubling logical bytes.
 
 ## Calculator example
 
 This is illustrative FP16 arithmetic, not a measured A2/A3 run. It assumes a
-24-AIC, 1800-MHz DIE and an independently confirmed 1.6 TB/s HBM peak:
+24-AIC, 1800-MHz DIE and the shared 1.6-TB/s HBM bandwidth above:
 
 ```bash
 python .claude/skills/hw-util/scripts/calculate.py \
@@ -126,7 +127,10 @@ python .claude/skills/hw-util/scripts/calculate.py \
   --a-bytes 2 --b-bytes 2 --out-bytes 2
 ```
 
-Without measured traffic, the actual HBM MBU remains unknown. Omit `--peak-tb-s` if
-that bandwidth assumption has not been established. For whole-card accounting
-or nonstandard traffic, calculate the sums explicitly rather than pretending
-the aggregate is one larger dense GEMM.
+This example reads 4,194,304 bytes and writes 2,097,152 bytes. At 100 us,
+the read and write utilization are 2.62144% and 1.31072%; the effective bandwidth
+utilization is their maximum, 2.62144%.
+
+Without separate measured read/write traffic, the actual HBM MBU remains
+unknown. For whole-card accounting or nonstandard traffic, calculate the
+directional sums explicitly rather than treating the aggregate as one larger GEMM.
