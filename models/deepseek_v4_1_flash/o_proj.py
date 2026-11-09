@@ -392,7 +392,7 @@ def o_proj_with_hc_validation(
         sublayer, num_tokens, worker_limit=32,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps)
+    hc_post(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps, active=-1)
     return sublayer, output
 
 

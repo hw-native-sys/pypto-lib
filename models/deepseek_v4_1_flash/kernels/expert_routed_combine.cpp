@@ -389,20 +389,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
     } else {
         receiveTokens(args, block - senders, receivers, 0, early);
     }
-    // Inactive physical rows have no incoming contributions.
-    if (active + block < tokens) {
-        pipe_barrier(PIPE_ALL);
-        Row zeros;
-        TASSIGN(zeros, 0);
-        TEXPANDS(zeros, static_cast<bfloat16_t>(0));
-        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        auto* result = tensorData<bfloat16_t>(args, 5);
-        for (int token = active + block; token < tokens; token += workers) {
-            GlobalRow out(result + token * WIDTH);
-            TSTORE(out, zeros);
-        }
-        pipe_barrier(PIPE_ALL);
-    }
 #endif
 }

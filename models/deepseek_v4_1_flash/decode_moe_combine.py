@@ -72,7 +72,7 @@ def _combine_routed(
     routes: pl.Tensor,
     output: pl.Tensor,
     shared: pl.Tensor,
-    result: pl.Out[pl.Tensor],
+    result: pl.InOut[pl.Tensor],
     target: pl.InOut[pld.DistributedTensor[[ROUTE_T_DYN, PACKED_WIDTH], pl.BF16]],
     signals: pld.DistributedTensor,
     experts: pl.Scalar[pl.INDEX],
@@ -104,11 +104,12 @@ def combine_routed(
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     stride: pl.constexpr = MOE_RECV_MAX,
 ):
-    """Return compact weighted expert rows and their completion dependency.
+    """Write active compact weighted expert rows and return their completion dependency.
 
     Each active token has six unique destination slots. Counts are bounded
-    by stride, and output is compact in expert/source order. The caller
-    allocates target first at the 512-byte-aligned communication domain base and
+    by stride, and output is compact in expert/source order. Result rows beyond
+    active are unchanged. The caller allocates target first at the 512-byte-aligned
+    communication domain base and
     fences prior peer consumption before reusing target; decode's next
     input dispatch provides that fence. Signals is an unused ABI slot.
     """
@@ -150,8 +151,8 @@ def _validate_rank(
     shared_first: pl.Tensor[[MOE_TOKENS, D], pl.BF16],
     shared_second: pl.Tensor[[MOE_TOKENS, D], pl.BF16],
     active_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
-    result_first: pl.Out[pl.Tensor[[MOE_TOKENS, D], pl.BF16]],
-    result_second: pl.Out[pl.Tensor[[MOE_TOKENS, D], pl.BF16]],
+    result_first: pl.InOut[pl.Tensor[[MOE_TOKENS, D], pl.BF16]],
+    result_second: pl.InOut[pl.Tensor[[MOE_TOKENS, D], pl.BF16]],
     target: pld.DistributedTensor[[MOE_TOKENS * TOPK, PACKED_WIDTH], pl.BF16],
     signals: pld.DistributedTensor[[EP_SIZE, VALIDATION_EXPERTS, 128], pl.INT32],
     rank: pl.Scalar[pl.INT32],
@@ -187,8 +188,8 @@ def validate_return(
     shared_first: pl.Tensor[[EP_SIZE, MOE_TOKENS, D], pl.BF16],
     shared_second: pl.Tensor[[EP_SIZE, MOE_TOKENS, D], pl.BF16],
     active_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
-    result_first: pl.Out[pl.Tensor[[EP_SIZE, MOE_TOKENS, D], pl.BF16]],
-    result_second: pl.Out[pl.Tensor[[EP_SIZE, MOE_TOKENS, D], pl.BF16]],
+    result_first: pl.InOut[pl.Tensor[[EP_SIZE, MOE_TOKENS, D], pl.BF16]],
+    result_second: pl.InOut[pl.Tensor[[EP_SIZE, MOE_TOKENS, D], pl.BF16]],
 ):
     target_buffer = pld.alloc_window_buffer([MOE_TOKENS * TOPK, PACKED_WIDTH], dtype=pl.BF16)
     signal_buffer = pld.alloc_window_buffer([EP_SIZE, VALIDATION_EXPERTS, 128], dtype=pl.INT32)
@@ -277,18 +278,18 @@ def build_case(name, benchmark=False):
                     compact += 1
             counts[destination, expert, 0] = local_row
 
-    def reference(routed, shared_value):
+    def reference(routed, shared_value, guard):
         result = shared_value.float().clone()
         for slot in range(TOPK):
             result.add_(routed[:, :, slot].float())
         for rank in range(EP_SIZE):
-            result[rank, int(active[rank]):] = 0
+            result[rank, int(active[rank]):] = guard
         return result.bfloat16()
 
     return {
         "first": first, "second": second, "counts": counts, "routes": routes, "metadata": metadata,
         "shared_first": shared, "shared_second": next_shared, "active_tokens": active,
-        "result_first": reference(values, shared), "result_second": reference(next_values, next_shared),
+        "result_first": reference(values, shared, 127), "result_second": reference(next_values, next_shared, -127),
         "expert_ids": expert_ids, "route_values": values,
     }
 
@@ -311,10 +312,13 @@ if __name__ == "__main__":
     runtime_dir = args.runtime_dir
     for case_name in cases:
         values = build_case(case_name, benchmark=args.benchmark_fixture)
+        initial = dict(values)
+        initial["result_first"] = torch.full_like(values["result_first"], 127)
+        initial["result_second"] = torch.full_like(values["result_second"], -127)
         specs = [
             TensorSpec(
                 name, list(values[name].shape), values[name].dtype,
-                init_value=partial(torch.clone, values[name]),
+                init_value=partial(torch.clone, initial[name]),
             )
             for name in validate_return.param_names
         ]

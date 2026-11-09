@@ -105,7 +105,7 @@ def decode_swa(
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps)
+    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps, active=-1)
     return attention_hidden, attention_pre_mix
 
 

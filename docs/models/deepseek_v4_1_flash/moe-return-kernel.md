@@ -16,8 +16,11 @@ provides both the production `combine_routed` call and its standalone golden
 validation. It consumes the existing routed FFN's compact BF16 W2 output;
 route weighting stays before activation quantization. Each active token has
 six unique destination slots. The receiver accumulates the BF16 shared result
-first, then slots 0 through 5 in FP32, and rounds once to BF16. Inactive physical
-rows are zeroed.
+first, then slots 0 through 5 in FP32, and rounds once to BF16. Only rows
+`[0, active)` are written; inactive physical output rows are left unchanged.
+The composed MoE passes `active` to HC post, which does not load inactive
+sublayer rows and uses zero sublayer contribution for their residual mixing.
+The allocated capacity remains aligned, without a separate zero-fill kernel.
 
 The native body uses 64 AIV workers, initially split into 32 senders and 32
 receivers. Senders participate in remaining token reductions after finishing
@@ -63,16 +66,16 @@ use 64 AIV. The common maximum budget is 64 AIV, not identical work assignment.
 
 | Remote / local rows per rank | Rank | Pre-PR DSL S / N / W / R | Final C++ | CANN |
 | --- | --- | --- | ---: | ---: |
-| 9 / 279 | 0 | 3.023 / 1.522 / 1.178 / 4.491 | 20.476 | 15.997 |
-| 9 / 279 | 1 | 2.967 / 1.569 / 1.316 / 4.532 | 13.632 | 15.844 |
-| 144 / 144 | 0 | 35.096 / 1.551 / 1.255 / 5.271 | 58.500 | 58.302 |
-| 144 / 144 | 1 | 35.511 / 1.518 / 1.249 / 5.217 | 49.068 | 57.438 |
-| 279 / 9 | 0 | 74.558 / 1.519 / 1.274 / 5.419 | 102.745 | 102.088 |
-| 279 / 9 | 1 | 75.628 / 1.517 / 1.208 / 5.397 | 91.394 | 100.913 |
+| 9 / 279 | 0 | 3.023 / 1.522 / 1.178 / 4.491 | 16.752 | 15.997 |
+| 9 / 279 | 1 | 2.967 / 1.569 / 1.316 / 4.532 | 12.734 | 15.844 |
+| 144 / 144 | 0 | 35.096 / 1.551 / 1.255 / 5.271 | 57.686 | 58.302 |
+| 144 / 144 | 1 | 35.511 / 1.518 / 1.249 / 5.217 | 49.174 | 57.438 |
+| 279 / 9 | 0 | 74.558 / 1.519 / 1.274 / 5.419 | 100.891 | 102.088 |
+| 279 / 9 | 1 | 75.628 / 1.517 / 1.208 / 5.397 | 92.975 | 100.913 |
 
-For small M48 traffic, final C++ rank 0 is slower than CANN while rank 1
-is faster. Report both ranks; selecting only the faster rank would hide this
-imbalance. Capture devices and dates are recorded with the retained samples.
+For small M48 traffic, final C++ measures 16.752 / 12.734 us
+on ranks 0 / 1. Report both ranks; selecting only the faster rank would hide
+the rank imbalance. These are separate captures from the retained CANN data.
 
 The 144-row case is uniform EP2 routing. The 9-row case models the average
 traffic to one of 32 expert ranks: `48 * 6 / 32 = 9` rows. The 279-row case
@@ -107,26 +110,28 @@ The original DSL uses 64 scatter, 40 reduce, and one notify/wait worker each.
 
 | Remote / local rows per rank | Rank | Pre-PR DSL S / N / W / R | Final C++ | CANN |
 | --- | --- | --- | ---: | ---: |
-| 14 / 418 | 0 | 3.808 / 1.395 / 1.202 / 4.615 | 20.977 | 17.798 |
-| 14 / 418 | 1 | 3.798 / 1.731 / 1.361 / 4.611 | 17.148 | 17.898 |
-| 216 / 216 | 0 | 55.042 / 1.468 / 1.256 / 5.341 | 82.204 | 80.739 |
-| 216 / 216 | 1 | 56.716 / 1.763 / 1.313 / 5.330 | 72.848 | 80.803 |
+| 14 / 418 | 0 | 3.808 / 1.395 / 1.202 / 4.615 | 16.886 | 17.798 |
+| 14 / 418 | 1 | 3.798 / 1.731 / 1.361 / 4.611 | 19.902 | 17.898 |
+| 216 / 216 | 0 | 55.042 / 1.468 / 1.256 / 5.341 | 71.150 | 80.739 |
+| 216 / 216 | 1 | 56.716 / 1.763 / 1.313 / 5.330 | 82.757 | 80.803 |
 
-For small M72 traffic, final C++ measures 20.977 / 17.148 us on ranks 0 / 1,
-versus CANN's 17.798 / 17.898 us. This does not establish that both ranks are
-consistently below 20 us or that the rank imbalance has been resolved.
+For small M72 traffic, final C++ measures 16.886 / 19.902 us
+on ranks 0 / 1, versus CANN's 17.798 / 17.898 us. The measurements do not
+isolate the effect of padding-store removal from capture/device variability.
 
-The C++ and original DSL paths have 80 physical output rows and zero the final
-eight; the CANN fixtures have 72 physical rows. All return the same 72 valid
-BF16 rows. The C++ interval includes this padding work. The same native body
+The C++ and original DSL paths have 80 physical output rows; the CANN
+fixtures have 72. The original DSL zeroes the final eight rows. Final C++
+leaves them untouched and returns the same 72 valid BF16 rows. The same native body
 supports both token counts; there is no separate tuned M48 implementation.
 
 All existing DSL, intermediate C++ and CANN samples were retained. Final
-C++ was captured once per listed condition on November 9, on devices 1/3,
+C++ was captured once per listed condition on November 9, on devices 2/3,
 with 5 warmups and 100 samples per rank. M48 CANN captures used devices 0/1
 on November 6; M72 uniform used 4/5, and M72 small traffic used 1/2.
 Device and source identities are retained per capture. No existing
-performance condition was recollected for this presentation.
+baseline performance condition was recollected; only the new implementation
+was sampled. The table reports the active-prefix source, not an intermediate
+C++ version.
 
 The raw level-1 trace contains body start/end per physical core, not logical
 block roles, packet-arrival times, or poll/copy/reduction phase boundaries.
@@ -134,10 +139,12 @@ It cannot attribute rank differences precisely to communication waits or
 individual source operations. Kernel-internal waiting remains included in
 the final C++ and CANN columns.
 
-The composed MoE passed its original golden tolerances for active-token counts
-`[48, 48]`, `[72, 72]`, and `[0, 37]`. Standalone 48- and 72-token routing cases
-passed exact two-round checks, including different shared/payload data in the
-second round and reuse of the communication window.
+Before the active-prefix update, the composed MoE passed its original golden
+tolerances for active-token counts `[48, 48]`, `[72, 72]`, and `[0, 37]`.
+This update compiled the composed MoE and validated the changed combine and
+HC kernels separately, as detailed below; full composed device validation
+was not rerun locally. Standalone cases include changed second-round data
+and reuse of the communication window.
 
 ## Sources and retained evidence
 
@@ -147,13 +154,14 @@ hashes, configuration, and source revisions. The original DSL was extracted
 from pypto-lib revision `2562a862f917ed76b67cdb064d3a9b74e156e8b4`, with the
 preceding FFN outside measurement and an explicit start barrier. M72 changes
 only its shapes and active-token count. These are historical baseline
-measurements, not a new benchmark of current main. The 48-token measurements
-were reused, not recollected for this PR.
+measurements, not a new benchmark of current main. The 48-token DSL and CANN
+baselines were reused, not recollected for this PR.
 The initial C++ reference had a 10,784-byte `.text` with SHA256
 `180f7d7fe6cf4de34f84d3f2122297273e2cd86c86c6932ee266dcc9f686d918`.
 That identity proof applies only to the initial implementation. The revised
-kernel has different executable bytes, recorded under `revised_cpp`; its
-source and runtime-loaded binaries were checked against the new build.
+kernel with padding writes is archived under `revised_cpp`. Current active-prefix
+source, runtime-loaded native text, samples and validation are recorded under
+`active_prefix_cpp`; the main tables use that record.
 The original `cases` and `implementation` records remain unchanged.
 
 Communication-context offsets still come from the compiling runtime's
@@ -180,7 +188,7 @@ the fixed model kernel. The JSON retains the full detail audit.
 | --- | --- | --- |
 | Poll-flag initialization | Initial C++ cleared 1,152 int32 elements each poll; CANN clears only the comparison tail | Clear only 0-48 tail elements, retaining the V-to-MTE2 ordering fence |
 | Sender packet markers | Initial C++ issued up to eight separate fills; CANN fills used buffers together | One fill of the used packet slots; event lifetime is unchanged |
-| Output padding | C++ has padded physical rows; the CANN M72 fixture does not | Only blocks owning padding rows initialize/store zeros; output shape is unchanged |
+| Output capacity | C++ retains an aligned physical extent; the CANN M72 fixture uses 72 rows | Write only active rows. HC post masks inactive sublayer loads while preserving residual outputs; no padding stores or separate zero-fill task |
 | Route descriptors | CANN receives prepared triples; C++ reconstructs them inside the kernel | Merge contiguous route reads within each expert across source ranks; 54 to 43 route DMA calls per rank for M72 small traffic |
 | Core split and token order | Both use send/receive roles, two-token progression, ordered slot prefixes and similar sender permutations | Preserve these policies; a different send ordinal alone does not prove a timing cause |
 | Shared and weighted inputs | C++ starts from shared and consumes already-weighted rows; CANN adds shared later and multiplies route scales | Preserve the model's numerical/input contract; matched fixtures keep shared zero and CANN scales one |
@@ -192,10 +200,14 @@ evidence; no source-level work count is converted into an unmeasured saving.
 
 The descriptor change was checked on 1,881 CPU ranges across EP2/4/8 metadata,
 including empty experts and partial source segments. This is an index-mapping
-check, not an EP4/8 device-performance claim. The revised native kernel passed
-exact two-round device checks for all six routing cases at both token counts.
-Six additional exact cases cover the production extent of 80 physical rows
-with 48 active tokens, including mixed active counts `[0, 37]`.
+check, not an EP4/8 device-performance claim. The active-prefix native kernel
+passed exact two-round device checks for
+all six routing cases at 48/48, 48/80 and 72/80 active/physical extents.
+Inactive output rows retain distinct first/second-round sentinels. Six exact
+HC post checks cover active counts 0, 37, 48, 72, 80 and all rows; inactive
+sublayer inputs contain NaNs, while expected outputs use zero sublayer
+contributions and unchanged residual mixing. The ordinary HC post entry
+also passed with the explicit all-row contract.
 
 ## Validation and reproduction
 
@@ -206,8 +218,8 @@ The standalone entry rejects `--sim` explicitly.
 The standalone entry checks two consecutive calls using the same communication
 window and different payload/shared inputs. It covers distributed routing,
 concentrated experts, empty experts, unequal active-token counts, all-zero
-counts, poisoned unused capacity, and zeroed padding. Outputs are compared
-exactly against the ordered FP32/BF16 reference.
+counts, poisoned unused capacity, and preserved output-tail sentinels. Outputs
+are compared exactly against the ordered FP32/BF16 reference.
 
 Run from the repository root with an A5 environment and an allocated device
 pair (replace `0,1` with the assigned devices):

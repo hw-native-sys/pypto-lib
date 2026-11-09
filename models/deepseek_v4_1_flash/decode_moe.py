@@ -263,7 +263,7 @@ def moe(
         hc_post_deps = pl.array.create(2, pl.TASK_ID)
         hc_post_deps[0] = output_ready
         hc_post_deps[1] = mixes_ready
-        hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps)
+        hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps, active=num_tokens)
     return x_next
 
 

@@ -482,7 +482,7 @@ def prefill_moe(
         hc_post_deps = pl.array.create(2, pl.TASK_ID)
         hc_post_deps[0] = round_ready
         hc_post_deps[1] = mixes_ready
-        hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps)
+        hc_post(sublayer, x_hc, post_mix, residual_mix, x_next, deps=hc_post_deps, active=-1)
     return x_next
 
 
@@ -1071,7 +1071,7 @@ def prefill_ffn_restore(
         ffn_owned, ffn_window, ffn_arrived, ffn_output, group_base, tp_rank, num_tokens, ffn_epoch,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(ffn_output, x_hc, post_mix, residual_mix, x_hc_out, deps=hc_post_deps)
+    hc_post(ffn_output, x_hc, post_mix, residual_mix, x_hc_out, deps=hc_post_deps, active=-1)
     return x_hc_out
 
 
