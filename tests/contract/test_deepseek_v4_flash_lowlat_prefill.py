@@ -8,7 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import ctypes
-from types import SimpleNamespace
+import importlib
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -16,7 +18,7 @@ import torch
 from models.deepseek_v4_flash_lowlat.prefill_cache import (
     CACHE_LAYOUTS, initialize_cache_pages, prefill_block_tables, prefill_cache_views,
 )
-from models.deepseek_v4_flash_lowlat.prefill_fwd import prefill_arguments
+from models.deepseek_v4_flash_lowlat.prefill_fwd import load_prefill_program, prefill_arguments
 from models.deepseek_v4_flash_lowlat.prefill_metadata import (
     prefill_tap_positions, prepare_prefill_hidden, prepare_prefill_metadata,
 )
@@ -149,3 +151,27 @@ def test_decode_ring_counts_are_expanded_for_prefill():
         prepare_prefill_metadata(torch.tensor([3]), start_pos=0, tables=tables, caches=_cache_metadata(),
                                  rope_cos=cos, rope_sin=cos, max_logit_rows=128, terminal=True,
                                  block_counts=invalid)
+
+
+def test_prefill_uses_ordered_kv_without_changing_existing_module(monkeypatch):
+    existing = ModuleType("qkv_proj_rope")
+    existing.kv_proj_rope = object()
+    monkeypatch.setitem(sys.modules, "qkv_proj_rope", existing)
+    old_projection = existing.kv_proj_rope
+    old_path, old_argv = list(sys.path), list(sys.argv)
+    _, module = load_prefill_program()
+    ordered = importlib.import_module("models.deepseek_v4_flash_lowlat.drafter.qkv_proj_rope").kv_proj_rope
+    for name in ("prefill_attention_swa_cp", "prefill_attention_csa_cp", "prefill_attention_hca_cp"):
+        assert getattr(module, name)._func.__globals__["kv_proj_rope"] is ordered
+    assert sys.modules["qkv_proj_rope"] is existing
+    assert existing.kv_proj_rope is old_projection
+    assert sys.path == old_path and sys.argv == old_argv
+
+
+def test_prefill_rejects_incompatible_ordered_kv_geometry(monkeypatch):
+    ordered = importlib.import_module("models.deepseek_v4_flash_lowlat.drafter.qkv_proj_rope")
+    monkeypatch.setattr(ordered, "KV_OK", ordered.KV_OK + 1)
+    old_path, old_argv = list(sys.path), list(sys.argv)
+    with pytest.raises(RuntimeError, match="KV_OK"):
+        load_prefill_program()
+    assert sys.path == old_path and sys.argv == old_argv

@@ -48,9 +48,24 @@ def load_prefill_program():
 
     Load during single-threaded setup, before creating Workers. The two CP4
     groups must each receive the same batch-one prompt; EP8 still spans both
-    groups. Compile or register the returned ``l3_prefill_fwd`` normally.
+    groups. Use the lowlat ordered split-K KV projection within this isolated
+    prefill import so replicas do not depend on atomic arrival order. Compile
+    or register the returned ``l3_prefill_fwd`` normally.
     """
     with _dspark_prefill_import():
+        qkv = importlib.import_module("qkv_proj_rope")
+        ordered_qkv = importlib.import_module("models.deepseek_v4_flash_lowlat.drafter.qkv_proj_rope")
+        geometry = (
+            "D", "HEAD_DIM", "ROPE_DIM", "NOPE_DIM", "EPS", "PREFILL_DENSE_TILE", "MATMUL_T_TILE",
+            "KV_TILE", "KV_M_TILE", "KV_DENSE_M_TILE", "KV_N_TILE", "KV_K_TILE", "KV_OK", "KV_OM",
+            "KV_SPLIT_K_TILE", "KV_RMS_T_TILE",
+        )
+        mismatched = [name for name in geometry if getattr(qkv, name) != getattr(ordered_qkv, name)]
+        if mismatched:
+            raise RuntimeError("Prefill KV projection geometry differs from lowlat: " + ", ".join(mismatched))
+        # qkv is the isolated DSpark module created by _dspark_prefill_import;
+        # no pre-existing decode module is changed by this selection.
+        qkv.kv_proj_rope = ordered_qkv.kv_proj_rope
         module = importlib.import_module("prefill_fwd")
         if module.N_RANKS != 8 or module.TP_SIZE != 4 or module.LM_HEAD_TP_SIZE != 4:
             raise RuntimeError("Unexpected DSpark prefill parallel geometry")
