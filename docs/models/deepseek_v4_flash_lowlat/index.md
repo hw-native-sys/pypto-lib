@@ -377,6 +377,54 @@ RoPE inputs.
 
 ## Batch-one DSpark request serving
 
+### Prefill handoff
+
+`prefill_fwd.load_prefill_program()` loads the existing DSpark chunked
+43-layer forward with CP4/EP8 geometry. Both CP groups receive the same
+batch-one prompt; each group contributes its own rank-local tokens and has
+replicated attention caches. The prefill and low-latency decode programs must
+be registered with the same Worker before its device buffers are allocated.
+
+`prefill_cache.prefill_cache_views` borrows each owning decode cache buffer
+through that Worker's `view_tensor` API. The cache bytes remain in place:
+prefill uses 32-row raw-KV pages and 2-row ratio-4 state pages, while decode
+views the same rows as 128-row and 4-row pages. `prefill_block_tables` splits
+and pads the scheduler's decode tables, and `prefill_slot_mappings` derives
+physical rows for each active position. The caller retains both the owning
+buffers and the prefill views until all dependent dispatches complete; only
+the original owning allocations may be freed. `initialize_cache_pages`
+initializes newly owned pages, including the compressor score sentinel,
+without clearing other requests' or shared-prefix pages.
+
+`prefill_metadata` packs each prompt chunk and its RoPE rows for both groups.
+The caller must provide enough non-aliased cache pages for the whole chunk and
+the preceding sliding window. The metadata helper rejects missing pages,
+out-of-bounds writes, and overwritten live history. Prefix checkpoints are
+not requested by this helper. Inputs passed as host tensors to a prepared
+Worker must use shared storage allocated before the Worker starts.
+
+`prefill_weights` converts the existing W8A8 decode weights for the upstream
+prefill layout. It packs Q and indexer projections in NZ form, regroups the
+output projection for CP4, combines two vocabulary shards for the prefill LM
+head, and converts each layer's TP8 intermediate slices into EP8 experts.
+The shared expert is separated from the decode bank's final expert slot.
+Convert and upload one layer or rank at a time; prefill and decode weight
+layouts have different storage requirements and cannot be treated as aliases.
+
+After each completed prefill chunk, `prefill_state.capture_prefill_outputs`
+retains the actual layer-40/41/42 target taps from one CP group in a
+128-position history ring. `prefill_bootstrap` publishes that ring on owner 0
+and the first sampled token, committed anchor, remaining output budget and
+epoch on all eight ranks. `prefill_bootstrap_metadata` builds the drafter's
+absolute-anchor metadata banks using its own page tables and RoPE inputs.
+The caller initializes the drafter cache and supplies the actual sampling,
+grammar, allocation and request-lifetime inputs. A failed or incomplete
+prefill must not be admitted as a ready decode request.
+
+These helpers do not by themselves constitute a serving runner or a
+performance result. Full prefill-to-decode validation and request latency
+remain separate from the shared-buffer and weight-layout checks.
+
 
 This deployment retains five draft tokens and six target verification rows.
 It complements the [wide-batch DSpark model](../deepseek_v4_flash_dspark/index.md).
