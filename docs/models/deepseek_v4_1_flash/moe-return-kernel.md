@@ -2,12 +2,10 @@
 
 The Flash TopK-6 decode path uses a stock ISA C++ kernel for expert return,
 arrival polling, shared-plus-routed reduction, and packet-marker cleanup.
-The tables compare the pre-PR split DSL with the final C++ implementation;
-AscendC A5 MTE `MoEDistributeCombine` is the external reference. Intermediate
-C++ measurements remain in the raw evidence, outside the performance tables.
-The original DSL has stage-level timings rather than a comparable complete
-kernel interval, so these data do not establish an overall before/after
-speedup. This is a kernel comparison, not a full-MoE or runtime speedup claim.
+The tables compare the final C++ implementation with AscendC A5 MTE
+`MoEDistributeCombine`. Both columns report complete kernel execution
+intervals, with the instrumentation differences described below. This is a
+kernel comparison, not a full-MoE or runtime speedup claim.
 
 ## Integration and numerical contract
 
@@ -51,27 +49,18 @@ already weighted. CANN still performs its unit-weight multiplication.
 Each cell is the median of 100 samples after 5 warmups, in microseconds.
 Ranks are reported separately, without selecting the fastest rank.
 
-The **split DSL** column reports the original split DSL's stages separately:
-S = scatter, N = notify, W = defer-wait registration, R = reduce. Each value
-is the median of the stage's maximum per-core body execution time. W is not
-the communication-wait duration. The deferred wait takes place outside these
-bodies and overlaps runtime scheduling, so the retained traces do not provide
-a comparable complete-return kernel latency for the original path. Do not
-sum these stages or calculate a before/after speedup from this table.
+Final C++ and CANN both use 64 AIV cores. Each column covers its complete
+fused kernel execution interval, including internal arrival polling and
+protocol cleanup.
 
-Final C++ and CANN cover their respective complete fused kernel
-execution intervals, as defined below. The original M48 DSL uses 64 scatter
-workers, 24 reduce workers, and one each for notify/wait; both fused kernels
-use 64 AIV. The common maximum budget is 64 AIV, not identical work assignment.
-
-| Remote / local rows per rank | Rank | Pre-PR DSL S / N / W / R | Final C++ | CANN |
-| --- | --- | --- | ---: | ---: |
-| 9 / 279 | 0 | 3.023 / 1.522 / 1.178 / 4.491 | 16.752 | 15.997 |
-| 9 / 279 | 1 | 2.967 / 1.569 / 1.316 / 4.532 | 12.734 | 15.844 |
-| 144 / 144 | 0 | 35.096 / 1.551 / 1.255 / 5.271 | 57.686 | 58.302 |
-| 144 / 144 | 1 | 35.511 / 1.518 / 1.249 / 5.217 | 49.174 | 57.438 |
-| 279 / 9 | 0 | 74.558 / 1.519 / 1.274 / 5.419 | 100.891 | 102.088 |
-| 279 / 9 | 1 | 75.628 / 1.517 / 1.208 / 5.397 | 92.975 | 100.913 |
+| Remote / local rows per rank | Rank | Final C++ | CANN |
+| --- | --- | ---: | ---: |
+| 9 / 279 | 0 | 16.752 | 15.997 |
+| 9 / 279 | 1 | 12.734 | 15.844 |
+| 144 / 144 | 0 | 57.686 | 58.302 |
+| 144 / 144 | 1 | 49.174 | 57.438 |
+| 279 / 9 | 0 | 100.891 | 102.088 |
+| 279 / 9 | 1 | 92.975 | 100.913 |
 
 For small M48 traffic, final C++ measures 16.752 / 12.734 us
 on ranks 0 / 1. Report both ranks; selecting only the faster rank would hide
@@ -106,26 +95,24 @@ Both M72 cases have 72 active tokens, 432 valid expert rows per rank, and 36
 rows per expert. The small-traffic case has 14 remote / 418 local rows; the
 uniform EP2 case has 216 remote / 216 local rows. Dtypes, accumulation, maximum
 64-AIV budget, warmup/sample counts, and kernel timing definitions match M48.
-The original DSL uses 64 scatter, 40 reduce, and one notify/wait worker each.
 
-| Remote / local rows per rank | Rank | Pre-PR DSL S / N / W / R | Final C++ | CANN |
-| --- | --- | --- | ---: | ---: |
-| 14 / 418 | 0 | 3.808 / 1.395 / 1.202 / 4.615 | 16.886 | 17.798 |
-| 14 / 418 | 1 | 3.798 / 1.731 / 1.361 / 4.611 | 19.902 | 17.898 |
-| 216 / 216 | 0 | 55.042 / 1.468 / 1.256 / 5.341 | 71.150 | 80.739 |
-| 216 / 216 | 1 | 56.716 / 1.763 / 1.313 / 5.330 | 82.757 | 80.803 |
+| Remote / local rows per rank | Rank | Final C++ | CANN |
+| --- | --- | ---: | ---: |
+| 14 / 418 | 0 | 16.886 | 17.798 |
+| 14 / 418 | 1 | 19.902 | 17.898 |
+| 216 / 216 | 0 | 71.150 | 80.739 |
+| 216 / 216 | 1 | 82.757 | 80.803 |
 
 For small M72 traffic, final C++ measures 16.886 / 19.902 us
 on ranks 0 / 1, versus CANN's 17.798 / 17.898 us. The measurements do not
 isolate the effect of padding-store removal from capture/device variability.
 
-The C++ and original DSL paths have 80 physical output rows; the CANN
-fixtures have 72. The original DSL zeroes the final eight rows. Final C++
-leaves them untouched and returns the same 72 valid BF16 rows. The same native body
+C++ retains 80 physical output rows; the CANN fixture has 72. Final C++
+leaves the eight inactive rows untouched and returns the same 72 valid BF16
+rows. The same native body
 supports both token counts; there is no separate tuned M48 implementation.
 
-All existing DSL, intermediate C++ and CANN samples were retained. Final
-C++ was captured once per listed condition on November 9, on devices 2/3,
+Existing raw measurements remain archived. Final C++ was captured once per listed condition on November 9, on devices 2/3,
 with 5 warmups and 100 samples per rank. M48 CANN captures used devices 0/1
 on November 6; M72 uniform used 4/5, and M72 small traffic used 1/2.
 Device and source identities are retained per capture. No existing
@@ -148,21 +135,12 @@ and reuse of the communication window.
 
 ## Sources and retained evidence
 
-[`moe-return-kernel-results.json`](moe-return-kernel-results.json) contains the
-per-sample durations, original DSL stage timings, both ranks, raw-evidence
-hashes, configuration, and source revisions. The original DSL was extracted
-from pypto-lib revision `2562a862f917ed76b67cdb064d3a9b74e156e8b4`, with the
-preceding FFN outside measurement and an explicit start barrier. M72 changes
-only its shapes and active-token count. These are historical baseline
-measurements, not a new benchmark of current main. The 48-token DSL and CANN
-baselines were reused, not recollected for this PR.
-The initial C++ reference had a 10,784-byte `.text` with SHA256
-`180f7d7fe6cf4de34f84d3f2122297273e2cd86c86c6932ee266dcc9f686d918`.
-That identity proof applies only to the initial implementation. The revised
-kernel with padding writes is archived under `revised_cpp`. Current active-prefix
-source, runtime-loaded native text, samples and validation are recorded under
-`active_prefix_cpp`; the main tables use that record.
-The original `cases` and `implementation` records remain unchanged.
+[`moe-return-kernel-results.json`](moe-return-kernel-results.json) contains
+per-sample durations for both ranks, raw-evidence hashes, configuration, and
+source revisions. The tables use `active_prefix_cpp` for the final C++ source,
+runtime-loaded native text and samples, and retained CANN records from `cases`.
+Earlier measurements remain archived for provenance and are not part of the
+performance comparison. No existing reference measurements were recollected.
 
 Communication-context offsets still come from the compiling runtime's
 `CommContext` header through `offsetof`. The dtype, 64-AIV budget, token
