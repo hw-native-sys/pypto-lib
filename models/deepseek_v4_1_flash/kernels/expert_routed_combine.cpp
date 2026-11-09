@@ -88,27 +88,28 @@ AICORE inline void prepareDescriptors(__gm__ int64_t* args, __ubuf__ int32_t* co
     int compactBase = 0;
     for (int expert = 0; expert < experts; ++expert) {
         const int count = counts[expert];
-        if (compactBase < end && compactBase + count > begin) {
+        if (count > 0 && compactBase < end && compactBase + count > begin) {
+            const int firstRow = begin > compactBase ? begin - compactBase : 0;
+            const int lastRow = end < compactBase + count ? end - compactBase : count;
+            auto* routes = loadMetadata<1024>(routesGM + expert * stride + firstRow, lastRow - firstRow, 14336);
             int sourceBase = 0;
             for (int peer = 0; peer < ranks; ++peer) {
                 const int sourceEnd = sourceBase + metadata[peer * experts + expert];
-                const int first = begin > compactBase + sourceBase ? begin - compactBase : sourceBase;
-                int last = end < compactBase + sourceEnd ? end - compactBase : sourceEnd;
-                if (last > count) last = count;
+                const int first = firstRow > sourceBase ? firstRow : sourceBase;
+                const int last = lastRow < sourceEnd ? lastRow : sourceEnd;
                 if (first < last) {
-                    auto* routes = loadMetadata<1024>(routesGM + expert * stride + first, last - first, 14336);
                     for (int row = first; row < last; ++row) {
                         const int index = (compactBase + row - begin) * 3;
-                        const int route = routes[row - first];
+                        const int route = routes[row - firstRow];
                         descriptors[index] = peer;
                         descriptors[index + 1] = route / TOPK;
                         descriptors[index + 2] = route % TOPK;
                     }
-                    set_flag(PIPE_S, PIPE_MTE2, EVENT_ID4);
-                    wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID4);
                 }
                 sourceBase = sourceEnd;
             }
+            set_flag(PIPE_S, PIPE_MTE2, EVENT_ID4);
+            wait_flag(PIPE_S, PIPE_MTE2, EVENT_ID4);
         }
         compactBase += count;
     }
@@ -136,13 +137,13 @@ AICORE inline void sendRows(__gm__ int64_t* args, int worker, int senders, int r
         windows[peer] = reinterpret_cast<uint64_t>(target) + context[COMM_WINDOWS_WORD + peer] - context[COMM_WINDOWS_WORD + rank];
     }
     set_loop_size_ubtoout((1u << 21) | 1u);
-    using MarkerTile = Tile<TileType::Vec, int32_t, 1, PACKED_BYTES / 4>;
+    using MarkerTile = Tile<TileType::Vec, int32_t, 1, SLOTS * PACKED_BYTES / 4,
+                            BLayout::RowMajor, 1, DYNAMIC>;
+    MarkerTile marker;
+    TASSIGN(marker, PACKED_BASE);
+    marker.SetValidCol((rows < SLOTS ? rows : SLOTS) * PACKED_BYTES / 4);
+    TEXPANDS(marker, int32_t(ARRIVED));
     for (int slot = 0; slot < SLOTS; ++slot) {
-        if (slot < rows) {
-            MarkerTile marker;
-            TASSIGN(marker, PACKED_BASE + slot * PACKED_BYTES);
-            TEXPANDS(marker, int32_t(ARRIVED));
-        }
         set_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(slot));
         set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(slot));
     }
@@ -210,8 +211,13 @@ AICORE inline int readyPrefix(__gm__ bfloat16_t* source, int begin)
     TASSIGN(values, 122880);
     TASSIGN(bits, 131072);
     flags.SetValidRow((TOPK - begin) * PACKETS);
-    values.SetValidCol(FLAG_CAPACITY);
-    TEXPANDS(values, int32_t(0));
+    if (compareCount > flagCount) {
+        using FlagTail = Tile<TileType::Vec, int32_t, 1, 64, BLayout::RowMajor, 1, DYNAMIC>;
+        FlagTail tail;
+        TASSIGN(tail, 122880 + flagCount * sizeof(int32_t));
+        tail.SetValidCol(compareCount - flagCount);
+        TEXPANDS(tail, int32_t(0));
+    }
     set_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID6);
     Global global(reinterpret_cast<__gm__ int32_t*>(source + begin * PACKED_COLS) + 120,
@@ -384,7 +390,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
         receiveTokens(args, block - senders, receivers, 0, early);
     }
     // Inactive physical rows have no incoming contributions.
-    if (active < tokens) {
+    if (active + block < tokens) {
         pipe_barrier(PIPE_ALL);
         Row zeros;
         TASSIGN(zeros, 0);
