@@ -51,7 +51,8 @@ PROJECTION_MM_T_TILE = 16  # cube M tile; rows are a 16-row boxed tile
 QA_N_TILE = 128  # q_a_proj output-column tile
 KVA_N_TILE = 128  # kv_a_proj output-column tile
 QB_N_TILE = 128  # q_b_proj output-column tile
-ABSORB_N_TILE = 128  # absorb_query output-column tile
+ABSORB_N_TILE = 256  # absorb_query output-column tile
+ABSORB_M_TILE = 64  # absorb_query token tile
 
 PREFILL_SOFTMAX_SCALE = QK_DIM**-0.5
 PREFILL_NEG_INF = -1.0e20  # finite floor; a true -inf would make an all-masked row NaN
@@ -323,33 +324,20 @@ def absorb_query(
 ):
     """Multiply each query head by the BF16 key projection into latent space."""
     t_dim = pl.tensor.dim(query, 0)
-    t_mm = ((t_dim + PROJECTION_MM_T_TILE - 1) // PROJECTION_MM_T_TILE) * PROJECTION_MM_T_TILE
+    t_mm = ((t_dim + ABSORB_M_TILE - 1) // ABSORB_M_TILE) * ABSORB_M_TILE
     absorbed_flat = pl.reshape(absorbed, [t_dim, LOCAL_H * KV_LORA])
-    for head in pl.parallel(LOCAL_H):
-        query_head = pl.create_tensor([t_dim, QK_DIM], dtype=pl.BF16)
-        weight_head = pl.create_tensor([QK_DIM, KV_LORA], dtype=pl.BF16)
-        for block in pl.spmd(t_mm // PROJECTION_MM_T_TILE, name_hint="mla_query_head"):
-            t0 = block * PROJECTION_MM_T_TILE
-            rows = pl.min(PROJECTION_MM_T_TILE, t_dim - t0)
-            part = pl.slice(query, [PROJECTION_MM_T_TILE, 1, QK_DIM], [t0, head, 0], valid_shape=[rows, 1, QK_DIM], drop_dims=[1])
-            query_head[t0 : t0 + PROJECTION_MM_T_TILE, :] = part
-        for block in pl.spmd((QK_DIM // 128) * (KV_LORA // 128), name_hint="mla_key_head"):
-            k0 = (block // (KV_LORA // 128)) * 128
-            n0 = (block % (KV_LORA // 128)) * 128
-            weight_part = pl.slice(w_k, [1, 128, 128], [head, k0, n0], drop_dims=[0])
-            weight_head[k0 : k0 + 128, n0 : n0 + 128] = weight_part
-        for block in pl.spmd(KV_LORA // ABSORB_N_TILE, name_hint="mla_absorb_query"):
-            n0 = block * ABSORB_N_TILE
-            for tc in pl.range(t_mm // PROJECTION_MM_T_TILE):
-                t0 = tc * PROJECTION_MM_T_TILE
-                rows = pl.min(PROJECTION_MM_T_TILE, t_dim - t0)
-                acc = bf16_linear(
-                    query_head, weight_head, t0, n0, rows, pl.cast(ABSORB_N_TILE, pl.INDEX), PROJECTION_MM_T_TILE,
-                    ABSORB_N_TILE, QK_DIM, False,
-                )
-                value = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, ABSORB_N_TILE)
-                absorbed_col = head * KV_LORA + n0
-                absorbed_flat[t0:t0 + PROJECTION_MM_T_TILE, absorbed_col:absorbed_col + ABSORB_N_TILE] = value
+    for block in pl.spmd(LOCAL_H * (t_mm // ABSORB_M_TILE) * (KV_LORA // ABSORB_N_TILE), name_hint="mla_absorb_query"):
+        head = block // ((t_mm // ABSORB_M_TILE) * (KV_LORA // ABSORB_N_TILE))
+        t0 = ((block // (KV_LORA // ABSORB_N_TILE)) % (t_mm // ABSORB_M_TILE)) * ABSORB_M_TILE
+        n0 = (block % (KV_LORA // ABSORB_N_TILE)) * ABSORB_N_TILE
+        rows = pl.min(ABSORB_M_TILE, t_dim - t0)
+        query_part = pl.slice(query, [ABSORB_M_TILE, 1, QK_DIM], [t0, head, 0], valid_shape=[rows, 1, QK_DIM], drop_dims=[1])
+        query_full = pl.set_validshape(pl.fillpad(query_part, pad_value=pl.PadValue.zero), ABSORB_M_TILE, QK_DIM)
+        weight_part = pl.slice(w_k, [1, QK_DIM, ABSORB_N_TILE], [head, 0, n0], drop_dims=[0])
+        acc = pl.matmul(query_full, weight_part, out_dtype=pl.FP32)
+        value = pl.set_validshape(pl.cast(acc, pl.BF16, mode="rint"), rows, ABSORB_N_TILE)
+        absorbed_col = head * KV_LORA + n0
+        absorbed_flat[t0:t0 + ABSORB_M_TILE, absorbed_col:absorbed_col + ABSORB_N_TILE] = value
     return absorbed
 
 
@@ -1850,6 +1838,38 @@ def run_output_case(argv=None):
             raise SystemExit(result.error or 1)
 
 
+def run_absorb_case(argv=None):
+    """Validate query absorption at token-tile boundaries and requested shapes."""
+    from golden import ratio_allclose, run
+
+    parser = argparse.ArgumentParser(description="MLA query absorption validation")
+    parser.add_argument("--tp", type=int, choices=[TP_SIZE], default=TP_SIZE)
+    parser.add_argument("--ep", type=int, choices=[EP_SIZE], default=EP_SIZE)
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--tokens", type=int, nargs="+", default=[1, 32, 63, 64, 65])
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args(argv)
+    if any(tokens < 1 for tokens in args.tokens):
+        parser.error("--tokens must be positive")
+
+    for tokens in args.tokens:
+        result = run(
+            fn=mla_absorb_query_test,
+            specs=build_mla_absorb_tensor_specs(tokens),
+            golden_fn=golden_mla_absorb_case,
+            config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
+            rtol=1.0 / 128,
+            atol=0.0001,
+            compare_fn={"absorbed": ratio_allclose(atol=0.0001, rtol=1.0 / 128, max_error_ratio=0)},
+            compile_only=args.compile_only,
+        )
+        print(f"absorb_query tokens={tokens}: {result}")
+        if not result.passed:
+            raise SystemExit(result.error or 1)
+
+
 def run_projection_case(argv=None):
     """Prove the goldens on CPU, then validate the prolog and the absorption on device.
 
@@ -2042,7 +2062,7 @@ def run_decode_case(argv=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, add_help=False)
-    components = ["all", "projection", "cache", "output", "decode", "prefill"]
+    components = ["all", "projection", "absorb", "cache", "output", "decode", "prefill"]
     parser.add_argument("--component", choices=components, default="all")
     options, remaining = parser.parse_known_args(argv)
     if options.component == "all" and any(arg in ("-h", "--help") for arg in remaining):
@@ -2051,6 +2071,7 @@ def main(argv=None):
         help_parser.parse_args(argv)
     cases = {
         "projection": run_projection_case,
+        "absorb": run_absorb_case,
         "cache": run_cache_case,
         "output": run_output_case,
         "decode": run_decode_case,

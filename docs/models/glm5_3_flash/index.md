@@ -281,8 +281,51 @@ checks; changing attention index order would not correct those score values.
 
 ### Query absorption performance
 
-`absorb_query` schedules independent heads with `pl.parallel`, preserving
-compensated FP32 accumulation and the BF16 output boundary.
+`absorb_query` computes each head's `[T, 256] @ [256, 512]` projection with
+64-row, 256-column Cube tiles and the full 256-element reduction. One SPMD
+launch distributes head, token-tile and output-column work together. The
+kernel loads the original query and weight layouts directly, without
+per-head GM copies. Cube accumulates in FP32; the AIV side pads query tails
+and rounds the result to BF16 before writing it back. Every tensor row is
+still computed, including capacity rows supplied by serving.
+
+The previous implementation used one valid K element per padded Cube call,
+with AIV compensation after every partial product. The new reduction order
+is not guaranteed bitwise equal to that implementation. Validation retains
+`atol=1e-4`, `rtol=1/128`, and requires zero out-of-tolerance elements in the
+dedicated absorption entry.
+
+TP8 measurements on a2a3 with PTOAS 0.72 use the serving tensor capacities
+of 32 and 192 rows, eight local heads, 100 timed rounds after five warmups,
+and frozen inputs and FP64-derived golden outputs on the same device. These
+are single-device Effective (`orch`/`sched` window) medians for complete query absorption,
+including the old per-head copies, with swimlane capture disabled.
+
+| Query rows | Previous (us) | Tiled Cube (us) | Speedup |
+|---|---:|---:|---:|
+| 32 | 2919.84 | 23.41 | 124.73x |
+| 192 | 17301.12 | 43.77 | 395.28x |
+
+The 64-by-256 tile uses 256 KiB Mat, 64 KiB Acc, and 160 KiB Vec including
+cross-core pipe buffers in the allocation IR. A 128-by-256 tile was rejected:
+its 320 KiB Vec requirement exceeds the platform's 184 KiB limit. These
+operator results do not establish full-model throughput gains.
+
+Validation covers 1, 32, 63, 64, 65 and 192 rows at TP8 and TP16, plus
+checkpoint weights from layers 3, 23 and 43 at both shard sizes. Full prefill,
+decode and reset graphs also pass CPU compilation and serving ABI checks.
+
+Run bounded token-tail checks or select benchmark shapes with:
+
+```bash
+python models/glm5_3_flash/attention.py --component absorb --tp 8 --ep 8 -p a2a3 -d 0
+PYPTO_BENCH=1 python models/glm5_3_flash/attention.py --component absorb --tp 8 --ep 8 -p a2a3 -d 0 --tokens 32 192
+```
+
+#### Earlier head-parallel implementation
+
+The earlier implementation scheduled independent heads with `pl.parallel`,
+preserving compensated FP32 accumulation and the BF16 output boundary.
 
 Standalone measurements against `b931df2`: a2a3, PTOAS 0.65, 17 query rows,
 single-device TP-shard shapes, 100 timed rounds after five warmups. Each
@@ -302,20 +345,43 @@ waits; standalone speedups do not establish a serving improvement.
 
 ### mHC projection performance
 
-The narrow `mhc_linear` projection uses independent token/output-channel tasks
-on the vector cores. Each task reduces 128-element K chunks and retains both
-reduction parts with compensated FP32 accumulation. RMS normalization and
-Sinkhorn mixing retain their existing implementation and precision checks.
+The narrow `mhc_linear` coefficient projection runs on the cube: 16-token row
+blocks against the 24 mixing rows, padded to the 32-column accumulator width.
+The 16,384-element reduction is split into eight 2,048-element segments so that
+a single 16-row block still fills the cube cores; a second scope sums the eight
+segment partials in FP32. `mhc_rms` keeps its eight-way K partition and FP32
+partial merge. The stream operators `mhc_pre`, `mhc_post`, and `mhc_head` use
+1,024-element hidden tiles. Their BF16 rounding boundaries and the Sinkhorn
+coefficient computation are unchanged.
 
-At whole-model row capacities, the complete `mhc_mixes` component measures
-40.833 -> 0.759 ms for 16 rows and 44.620 -> 3.174 ms for 128 rows. These are
+The component was measured against the already vectorized implementation at
+commit `838079c` (whose mHC implementation matches main `2230490`). On a2a3
+with PyPTO `ff2e0a4` and PTOAS 0.72, the complete `mhc_mixes` component has
+these device-effective medians with 100 timed rounds after five warmups:
+
+| Token rows | Before (microseconds) | After (microseconds) | Speedup |
+|---|---:|---:|---:|
+| 16 | 764.0 | 133.4 | 5.73x |
+| 128 | 3193.0 | 396.1 | 8.06x |
+| 32 | 1072.9 | 140.3 | 7.65x |
+| 192 | 4575.8 | 533.2 | 8.58x |
+
+These cases replay identical frozen inputs against the CPU golden. The worst
+observed deviation is 3.6e-7 absolute and 1.0e-6 relative on `post_mix`, and no
+point of any shape falls outside the unchanged component comparator
+(`atol=1e-5, rtol=1e-3`). The 16/128-row cases reproduce the captured TP8/EP8
+serving shapes; 32/192 also cover the newer forward capacities. These component
+results do not establish a whole-model throughput gain.
+
+The earlier vectorization, measured against the scalar-K implementation, reduced
+the complete `mhc_mixes` component from 40.833 -> 0.759 ms for 16 rows and 44.620 -> 3.174 ms for 128 rows. These are
 device-effective medians on a2a3 device 0 with PTOAS 0.67, 100 timed rounds
 after five warmups, replaying frozen inputs and golden outputs. All three
 mix outputs are bitwise equal to the original implementation and pass the
 unchanged `atol=1e-5, rtol=0.001` comparator. Component timings are not
 whole-model speedups.
 
-Whole-model generation on 2026-11-04 compares this projection against the
+Whole-model generation on 2026-11-04 compares the earlier vectorized projection against the
 retained attention-optimized baseline: serving PR #286 (`b1138f4`) and lib
 PR #1631 (`88c0b2d`), with identical attention changes in both variants.
 The published W8A8 checkpoint runs on a2a3 devices 0-7, TP8/EP8/DP1,
@@ -420,6 +486,155 @@ The earlier full-model swimlane interval for `kda_projection_output` includes
 scheduling overlap with QKV. It must not be compared to these isolated timings
 as if it were pure compute time. No whole-model performance run includes this
 follow-up yet; the generation results below describe the prior implementation.
+
+### Batched cube KDA projections
+
+`kda_projection_qkv` and `kda_output_proj` now issue cube matmuls instead of
+per-token row dots. Both batch 16 tokens per block: QKV uses N=64 with K=256,
+and the output projection uses N=128 with K=128 so the 128-column staging stays
+inside the vector buffer budget. The gate projections also use batched cube
+matmuls as described below; router logits keep the row-dot path.
+
+Measured on the same a2a3 device against the row-dot implementation at
+`9981c6c`, with 100 timed rounds after five warmups:
+
+| Component | Rows | Before (ms) | After (ms) | Speedup |
+|---|---:|---:|---:|---:|
+| Complete KDA front-end | 16 | 8.407 | 1.190 | 7.06x |
+| Complete KDA front-end | 128 | 65.864 | 7.763 | 8.48x |
+| KDA output, including normalization | 1 | 0.217 | 0.084 | 2.60x |
+| KDA output, including normalization | 16 | 2.680 | 0.089 | 30.2x |
+| KDA output, including normalization | 128 | 21.017 | 0.357 | 58.9x |
+
+The batched outputs are not bitwise equal to the row-dot baseline: mixed QKV
+deviates by at most 7.8e-3 absolute (one BF16 ULP at magnitude 1) and the TP
+exchange output by at most 3.9e-3, with no point outside the unchanged
+`atol=0.02, rtol=0.02` comparator. BF16 rounding before the TP exchange and the
+token padding contract are unchanged.
+
+### Batched cube KDA gate projections
+
+`kda_projection_bottleneck` batches 16 token rows with N=32 and K=256 for
+the two 128-channel low-rank projections. Its beta projection uses the same
+16-row batch with N=16 and K=256, retaining the zero-padded beta weights.
+`kda_projection_output` batches 16 rows with N=64 and K=128 for both the
+decay-logit and output-gate projections. All intermediate projection outputs
+still round to BF16 before their next consumer. The gate stages continue to
+process all capacity rows, while QKV retains its active-row limit.
+
+The comparison uses the vector gate implementation at `faeaf67` as baseline,
+on a2a3 device 0 with PyPTO `ff2e0a4` and PTOAS 0.72. Values are single-card
+device-effective medians from 100 timed rounds after five warmups, replaying
+identical frozen inputs and CPU goldens. The TP8/EP8 serving capture uses
+32 capacity rows / one active row for decode and 192 capacity rows / 32 active
+rows for the final prefill chunk. Isolated stage probes use the production
+SPMD bodies; the bottleneck probe starts with already padded beta weights.
+
+| Operator or component | Capacity / active rows | Before (microseconds) | After (microseconds) | Speedup |
+|---|---:|---:|---:|---:|
+| `kda_projection_bottleneck` | 32 / 1 | 1519.4 | 104.7 | 14.51x |
+| `kda_projection_bottleneck` | 192 / 32 | 8084.0 | 283.0 | 28.57x |
+| `kda_projection_output` | 32 / 1 | 403.1 | 37.1 | 10.87x |
+| `kda_projection_output` | 192 / 32 | 2235.1 | 163.8 | 13.65x |
+| Complete KDA front-end | 32 / 1 | 2069.7 | 230.1 | 8.99x |
+| Complete KDA front-end | 192 / 32 | 10615.2 | 779.5 | 13.62x |
+
+All benchmark outputs pass the existing `atol=0.02, rtol=0.02` tolerances,
+with no out-of-tolerance elements. The default projection validation also
+passes single-row, empty-active, padded, ragged-tail and fully active ragged
+cases on TP8 and TP16. These changes alter floating-point accumulation order;
+they do not promise bitwise equality to the vector implementation. These are
+operator/component results, not whole-model throughput measurements.
+
+### Serving measurements with the gate and query-absorption changes
+
+The incremental comparison starts at `faeaf67`, which already includes the
+mHC, KDA QKV and KDA output-projection Cube implementations. Each subsequent
+row adds only the named optimization to that baseline. All runs use the
+same eight a2a3 devices, TP8/EP8/DP1, concurrency one, 160 input tokens and
+128 output tokens. One warmup request precedes three measured requests;
+the table reports medians of host-observed serving latency and throughput,
+with startup and profiling excluded.
+
+The serving integration uses PR [#286](https://github.com/hw-native-sys/pypto-serving/pull/286)
+at `60c8773` with the ABI-11 adapter, PyPTO `ff2e0a4`, runtime `31f9e72`,
+PTOAS 0.72 and CANN 9.0. The model is the published GLM-5.3-Flash
+vLLM-Ascend A3 W8A8 checkpoint. Greedy decoding uses seed 5353 and ignores
+EOS until 128 tokens; MTP and prefix caching are disabled. Prefill chunks
+contain 32 active tokens, with prefill/decode capacities of 192/32 rows.
+
+| Implementation | Output tokens/s | TTFT (s) | TPOT (ms) | Request time (s) |
+|---|---:|---:|---:|---:|
+| `faeaf67` | 2.7875 | 6.819 | 308.26 | 45.919 |
+| Add batched KDA gate projections | 3.4648 | 5.176 | 250.03 | 36.943 |
+| Also add tiled MLA query absorption | 6.5377 | 1.863 | 139.49 | 19.579 |
+
+Adding query absorption increases throughput by 88.7% relative to the KDA
+gate version and reduces TPOT by 44.2%. All four requests within each run,
+and the 128 output token IDs across these versions, match exactly for the
+fixed prompt. This checks generation consistency, not agreement with an
+external model reference.
+
+Separate level-4 rank-zero captures cover all 45 layers and the vocabulary
+head for the last prefill chunk and first decode step. MLA query-projection
+task intervals, merged across simultaneous core executions, fall from
+642.751 to 0.351 ms in prefill and from 108.360 to 0.123 ms in decode after
+query absorption is tiled. These instrumented spans are diagnostic, not
+the unprofiled benchmark medians above.
+
+### Bounded recurrent KDA workers
+
+`recurrent_kda` distributes its request/head/value partitions across at most
+48 AIV workers. Each worker visits partitions with stride 48, retaining the
+original 16-value-row state tile and sequential token loop. Empty request
+slots still undergo metadata checks inside the worker; they no longer create
+one runtime block per partition. Normalization and FP32 arithmetic are unchanged.
+
+For TP8 with 32 request slots, the recurrent launch falls from
+`32 * 8 * (128 / 16) = 2048` blocks to 48. One active request has only 64 useful
+partitions, making empty-block dispatch the main target. This applies to both
+the `decode_kda` and compiler-suffixed `decode_kda_0` scopes.
+
+The following isolated measurements compare against `fc87600` on the same
+a2a3 device, using 100 timed rounds after five warmups and replaying frozen
+golden inputs. Times are device effective-time medians for normalization plus
+recurrence. Shapes match serving: Q/K/V `[32, 8, 128]`, state
+`[320, 8, 128, 128]`, request offsets `[33]`, and state metadata `[32, 14]`.
+
+| Active requests | Before (us) | After (us) | Speedup |
+|---|---:|---:|---:|
+| 1 | 578.6 | 67.9 | 8.52x |
+| 32 | 780.7 | 635.7 | 1.23x |
+
+These are operator measurements; the whole-model results above precede this
+scheduling change. Whole-model throughput has not been remeasured for it.
+
+### Bounded recurrent convolution workers
+
+`kda_conv_recurrent` also caps its launch at 48 AIV workers, retaining the
+128-channel partition, four-tap FP32 convolution, corrected SiLU, and BF16
+state/output boundaries. It interleaves the two request halves so TP8 workers
+visit consecutive request slots rather than repeatedly selecting even or odd
+requests. This improves work distribution for uneven multi-token batches.
+Each partition still processes its tokens sequentially and writes the same
+snapshot and private working-state rows.
+
+With 32 TP8 request slots, the launch falls from 768 blocks to 48; one active
+request has only 24 useful partitions. The compiler-suffixed
+`kda_conv_recurrent_0` uses this same implementation.
+
+Compared against `fc87600` on the same a2a3 device, with frozen golden replay,
+100 timed rounds and five warmups, isolated device effective-time medians are:
+
+| Case | Input rows | Before (us) | After (us) | Speedup |
+|---|---:|---:|---:|---:|
+| One active request | 32 | 165.3 | 25.9 | 6.38x |
+| 32 one-token requests | 32 | 202.7 | 107.0 | 1.89x |
+| Uneven request lengths `[6, 0, 2, 1] * 8` | 192 | 270.4 | 202.0 | 1.34x |
+
+The serving-shaped decode inputs are `[32, 3072]`, weights `[4, 3072]`,
+convolution state `[320, 3, 3072]`, request offsets `[33]`, and state metadata
+`[32, 14]`. These operator results do not include a new whole-model benchmark.
 
 ### KDA QKV active capacity rows
 
