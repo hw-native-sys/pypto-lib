@@ -302,32 +302,29 @@ waits; standalone speedups do not establish a serving improvement.
 
 ### mHC projection performance
 
-The narrow `mhc_linear` projection partitions each token's 16,384-element
-reduction into eight independent 2,048-element segments per eight output
-channels. Each task reduces 1,024-element K tiles and accumulates the segment
-sum in FP32. A second scope sums the eight segment partials. The projection
-launch is capped at the existing model worker limit, with excess segments
-assigned by a strided loop.
+The narrow `mhc_linear` coefficient projection runs on the cube: 16-token row
+blocks against the 24 mixing rows, padded to the 32-column accumulator width.
+The 16,384-element reduction is split into eight 2,048-element segments so that
+a single 16-row block still fills the cube cores; a second scope sums the eight
+segment partials in FP32. `mhc_rms` keeps its eight-way K partition and FP32
+partial merge. The stream operators `mhc_pre`, `mhc_post`, and `mhc_head` use
+1,024-element hidden tiles. Their BF16 rounding boundaries and the Sinkhorn
+coefficient computation are unchanged.
 
-`mhc_rms` uses the same eight-way K partition for each eight-token tile and
-sums the segment partials before normalization. The stream operators
-`mhc_pre`, `mhc_post`, and `mhc_head` use 1,024-element hidden tiles. Their
-BF16 rounding boundaries and the Sinkhorn coefficient computation are unchanged.
-
-The split reductions were measured against the already vectorized implementation
-at commit `838079c` (whose mHC implementation matches main `2230490`). On a2a3
+The component was measured against the already vectorized implementation at
+commit `838079c` (whose mHC implementation matches main `2230490`). On a2a3
 with PyPTO `ff2e0a4` and PTOAS 0.72, the complete `mhc_mixes` component has
 these device-effective medians with 100 timed rounds after five warmups:
 
 | Token rows | Before (microseconds) | After (microseconds) | Speedup |
 |---|---:|---:|---:|
-| 16 | 764.0 | 208.4 | 3.67x |
-| 128 | 3193.0 | 1084.4 | 2.94x |
-| 32 | 1072.9 | 312.9 | 3.43x |
-| 192 | 4575.8 | 1569.3 | 2.92x |
+| 16 | 764.0 | 133.4 | 5.73x |
+| 128 | 3193.0 | 396.1 | 8.06x |
+| 32 | 1072.9 | 140.3 | 7.65x |
+| 192 | 4575.8 | 533.2 | 8.58x |
 
 These cases replay identical frozen inputs against the CPU golden. The worst
-observed deviation is 4.8e-7 absolute and 1.1e-6 relative on `post_mix`, and no
+observed deviation is 3.6e-7 absolute and 1.0e-6 relative on `post_mix`, and no
 point of any shape falls outside the unchanged component comparator
 (`atol=1e-5, rtol=1e-3`). The 16/128-row cases reproduce the captured TP8/EP8
 serving shapes; 32/192 also cover the newer forward capacities. These component
@@ -446,6 +443,32 @@ The earlier full-model swimlane interval for `kda_projection_output` includes
 scheduling overlap with QKV. It must not be compared to these isolated timings
 as if it were pure compute time. No whole-model performance run includes this
 follow-up yet; the generation results below describe the prior implementation.
+
+### Batched cube KDA projections
+
+`kda_projection_qkv` and `kda_output_proj` now issue cube matmuls instead of
+per-token row dots. Both batch 16 tokens per block: QKV uses N=64 with K=256,
+and the output projection uses N=128 with K=128 so the 128-column staging stays
+inside the vector buffer budget. The first-stage and second-stage gate
+projections and the router logits keep the row-dot path and the tile configs
+above.
+
+Measured on the same a2a3 device against the row-dot implementation at
+`9981c6c`, with 100 timed rounds after five warmups:
+
+| Component | Rows | Before (ms) | After (ms) | Speedup |
+|---|---:|---:|---:|---:|
+| Complete KDA front-end | 16 | 8.407 | 1.190 | 7.06x |
+| Complete KDA front-end | 128 | 65.864 | 7.763 | 8.48x |
+| KDA output, including normalization | 1 | 0.217 | 0.084 | 2.60x |
+| KDA output, including normalization | 16 | 2.680 | 0.089 | 30.2x |
+| KDA output, including normalization | 128 | 21.017 | 0.357 | 58.9x |
+
+The batched outputs are not bitwise equal to the row-dot baseline: mixed QKV
+deviates by at most 7.8e-3 absolute (one BF16 ULP at magnitude 1) and the TP
+exchange output by at most 3.9e-3, with no point outside the unchanged
+`atol=0.02, rtol=0.02` comparator. BF16 rounding before the TP exchange and the
+token padding contract are unchanged.
 
 ### KDA QKV active capacity rows
 

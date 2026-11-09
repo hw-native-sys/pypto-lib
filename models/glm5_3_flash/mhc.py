@@ -25,6 +25,7 @@ from models.glm5_3_flash.elementwise import (
     accurate_rsqrt, accurate_sigmoid,
 )
 from models.glm5_3_flash.kda import PROJECTION_WORKERS_TILE
+from models.glm5_3_flash.linear import bf16_matmul
 from models.glm5_3_flash.rmsnorm import unweighted_rms_norm
 from models.glm5_3_flash.utils import _assert_close, _check, _randn, _report
 
@@ -42,10 +43,9 @@ LINEAR_T_TILE = 16  # coefficient scratch row padding
 COMB_T_TILE = 8  # token tile of the softmax / Sinkhorn scope
 POST_COEFF_TILE = 16  # minimum 32-byte BF16 vector row
 RMS_K_TILE = 1024  # HC_DIM reduction chunk of the sum of squares
-LINEAR_N_TILE = 8
-LINEAR_K_TILE = 1024
-LINEAR_PART_TILE = 2048
 RMS_PART_TILE = 2048
+LINEAR_K_TILE = 512  # cube K tile of the coefficient projection
+LINEAR_PARTS = HC_DIM // 2048  # K segments that keep every cube core busy
 
 
 @pl.jit.inline
@@ -115,34 +115,26 @@ def mhc_mixes(
         inverse = accurate_rsqrt(rms_arg)
         inv_rms[t0 : t0 + RMS_T_TILE, 0:1] = pl.reshape(inverse, [RMS_T_TILE, 1])
 
-    linear_part_rows = t_dim * (HC_DIM // LINEAR_PART_TILE)
+    linear_tiles = t_linear // LINEAR_T_TILE
+    linear_part_rows = linear_tiles * LINEAR_PARTS * LINEAR_T_TILE
     linear_partial = pl.create_tensor([linear_part_rows, MIX_PAD], dtype=pl.FP32)
-    linear_tasks = t_dim * (HC_DIM // LINEAR_PART_TILE) * (MIX_HC // LINEAR_N_TILE)
-    for worker in pl.spmd(pl.min(linear_tasks, PROJECTION_WORKERS_TILE), name_hint="mhc_linear"):
-        for block in pl.range(worker, linear_tasks, PROJECTION_WORKERS_TILE):
-            token = block // ((HC_DIM // LINEAR_PART_TILE) * (MIX_HC // LINEAR_N_TILE))
-            split = block // (MIX_HC // LINEAR_N_TILE) % (HC_DIM // LINEAR_PART_TILE)
-            column = block % (MIX_HC // LINEAR_N_TILE) * LINEAR_N_TILE
-            total = pl.full([1, LINEAR_N_TILE], dtype=pl.FP32, value=0.0)
-            for offset in pl.pipeline(0, LINEAR_PART_TILE, LINEAR_K_TILE, stage=2):
-                k0 = split * LINEAR_PART_TILE + offset
-                source = pl.cast(x_flat[token:token + 1, k0:k0 + LINEAR_K_TILE], pl.FP32)
-                weights = pl.cast(function[column:column + LINEAR_N_TILE, k0:k0 + LINEAR_K_TILE], pl.FP32)
-                products = pl.create_tensor([LINEAR_N_TILE, LINEAR_K_TILE], dtype=pl.FP32)
-                products[:, :] = pl.col_expand_mul(weights, source)
-                partial = pl.reshape(pl.row_sum(products), [1, LINEAR_N_TILE])
-                total = pl.add(total, partial)
-            row = token * (HC_DIM // LINEAR_PART_TILE) + split
-            linear_partial[row:row + 1, column:column + LINEAR_N_TILE] = total
+    for block in pl.spmd(linear_tiles * LINEAR_PARTS, name_hint="mhc_linear"):
+        tile = block // LINEAR_PARTS
+        part = block % LINEAR_PARTS
+        t0 = tile * LINEAR_T_TILE
+        rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+        linear_partial[block * LINEAR_T_TILE : block * LINEAR_T_TILE + LINEAR_T_TILE, :] = bf16_matmul(
+            x_flat, function, t0, 0, part * (HC_DIM // LINEAR_PARTS), rows, pl.cast(MIX_HC, pl.INDEX),
+            LINEAR_T_TILE, MIX_PAD, LINEAR_K_TILE, HC_DIM // LINEAR_PARTS,
+        )
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
-    for block in pl.spmd(t_dim * (MIX_HC // LINEAR_N_TILE), name_hint="mhc_linear_reduce"):
-        token = block // (MIX_HC // LINEAR_N_TILE)
-        column = block % (MIX_HC // LINEAR_N_TILE) * LINEAR_N_TILE
-        total = pl.full([1, LINEAR_N_TILE], dtype=pl.FP32, value=0.0)
-        for split in pl.range(HC_DIM // LINEAR_PART_TILE):
-            row = token * (HC_DIM // LINEAR_PART_TILE) + split
-            total = pl.add(total, linear_partial[row:row + 1, column:column + LINEAR_N_TILE])
-        mixes_raw[token:token + 1, column:column + LINEAR_N_TILE] = total
+    for tile in pl.spmd(linear_tiles, name_hint="mhc_linear_reduce"):
+        t0 = tile * LINEAR_T_TILE
+        total = pl.full([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
+        for part in pl.range(LINEAR_PARTS):
+            row = (tile * LINEAR_PARTS + part) * LINEAR_T_TILE
+            total = pl.add(total, linear_partial[row:row + LINEAR_T_TILE, :])
+        mixes_raw[t0:t0 + LINEAR_T_TILE, 0:MIX_PAD] = total
 
     residual_flat = pl.reshape(residual_mix, [t_dim * HC_MULT, HC_MULT])
     for t in pl.spmd(t_dim, name_hint="mhc_coefficients"):

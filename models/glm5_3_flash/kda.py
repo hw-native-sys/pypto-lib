@@ -29,7 +29,7 @@ from models.glm5_3_flash.elementwise import (
     accurate_divide, accurate_exp, accurate_row_sum, accurate_rsqrt, accurate_sigmoid, accurate_silu,
     accurate_sqrt,
 )
-from models.glm5_3_flash.linear import bf16_linear_row, golden_bf16_linear
+from models.glm5_3_flash.linear import bf16_linear_row, bf16_matmul, golden_bf16_linear
 from models.glm5_3_flash.rmsnorm import l2norm, reference_l2norm, rms_norm_gated
 from models.glm5_3_flash.utils import _assert_close, _randn
 
@@ -54,10 +54,11 @@ QKV_PAD_N_TILE = 256
 PROJECTION_N_TILE = 16
 PROJECTION_K_TILE = 512
 PROJECTION_PIPELINE_TILE = 1
+PROJECTION_MM_N_TILE = 64  # cube N tile of the batched q/k/v projection
+PROJECTION_MM_K_TILE = 256  # cube K tile shared by the batched projections
 GATE_PROJECTION_N_TILE = 64
-OUTPUT_PROJECTION_N_TILE = 32
-OUTPUT_PROJECTION_K_TILE = 256
-OUTPUT_PROJECTION_PIPELINE_TILE = 2
+OUTPUT_PROJECTION_MM_N_TILE = 128  # cube N tile of the batched output projection
+OUTPUT_PROJECTION_MM_K_TILE = 128  # narrower K tile keeps the 128-column staging inside Vec
 BETA_N_TILE = 16  # 32-byte BF16 output row
 BETA_PAD = ((LOCAL_KDA_H + 15) // 16) * 16
 
@@ -417,23 +418,38 @@ def kda_projection(
             else:
                 w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
-    qkv_tasks = live_tokens * (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE)
+    qkv_n_tiles = LOCAL_KDA_QKV_DIM // PROJECTION_MM_N_TILE
+    qkv_tasks = ((live_tokens + PROJECTION_T_TILE - 1) // PROJECTION_T_TILE) * qkv_n_tiles
     qkv_workers = pl.max(1, pl.min(qkv_tasks, PROJECTION_WORKERS_TILE))
     with pl.spmd(qkv_workers, name_hint="kda_projection_qkv"):
         for task in pl.range(pl.tile.get_block_idx(), qkv_tasks, PROJECTION_WORKERS_TILE):
-            t0 = task // (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE)
-            n0 = task % (LOCAL_KDA_QKV_DIM // PROJECTION_N_TILE) * PROJECTION_N_TILE
-            acc_q = bf16_linear_row(x, w_q, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+            t0 = task // qkv_n_tiles * PROJECTION_T_TILE
+            n0 = task % qkv_n_tiles * PROJECTION_MM_N_TILE
+            rows = pl.min(PROJECTION_T_TILE, live_tokens - t0)
+            columns = pl.cast(PROJECTION_MM_N_TILE, pl.INDEX)
+            acc_q = bf16_matmul(
+                x, w_q, t0, n0, pl.cast(0, pl.INDEX), rows, columns, PROJECTION_T_TILE, PROJECTION_MM_N_TILE, PROJECTION_MM_K_TILE, D,
+            )
             acc_q_bf16 = pl.cast(acc_q, pl.BF16, mode="rint")
-            mixed_qkv[t0:t0 + 1, n0:n0 + PROJECTION_N_TILE] = acc_q_bf16
-            acc_k = bf16_linear_row(x, w_k, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+            mixed_qkv[t0:t0 + PROJECTION_T_TILE, n0:n0 + PROJECTION_MM_N_TILE] = pl.set_validshape(
+                acc_q_bf16, rows, PROJECTION_MM_N_TILE,
+            )
+            acc_k = bf16_matmul(
+                x, w_k, t0, n0, pl.cast(0, pl.INDEX), rows, columns, PROJECTION_T_TILE, PROJECTION_MM_N_TILE, PROJECTION_MM_K_TILE, D,
+            )
             acc_k_bf16 = pl.cast(acc_k, pl.BF16, mode="rint")
             k0 = LOCAL_KDA_QKV_DIM + n0
-            mixed_qkv[t0:t0 + 1, k0:k0 + PROJECTION_N_TILE] = acc_k_bf16
-            acc_v = bf16_linear_row(x, w_v, t0, n0, PROJECTION_N_TILE, D, PROJECTION_K_TILE, PROJECTION_PIPELINE_TILE)
+            mixed_qkv[t0:t0 + PROJECTION_T_TILE, k0:k0 + PROJECTION_MM_N_TILE] = pl.set_validshape(
+                acc_k_bf16, rows, PROJECTION_MM_N_TILE,
+            )
+            acc_v = bf16_matmul(
+                x, w_v, t0, n0, pl.cast(0, pl.INDEX), rows, columns, PROJECTION_T_TILE, PROJECTION_MM_N_TILE, PROJECTION_MM_K_TILE, D,
+            )
             acc_v_bf16 = pl.cast(acc_v, pl.BF16, mode="rint")
             v0 = 2 * LOCAL_KDA_QKV_DIM + n0
-            mixed_qkv[t0:t0 + 1, v0:v0 + PROJECTION_N_TILE] = acc_v_bf16
+            mixed_qkv[t0:t0 + PROJECTION_T_TILE, v0:v0 + PROJECTION_MM_N_TILE] = pl.set_validshape(
+                acc_v_bf16, rows, PROJECTION_MM_N_TILE,
+            )
     if live_tokens < t_dim:
         pad_tiles = (t_dim - live_tokens + PROJECTION_T_TILE - 1) // PROJECTION_T_TILE
         pad_tasks = pad_tiles * (CONV_DIM // QKV_PAD_N_TILE)
@@ -572,17 +588,23 @@ def kda_output(
         activated = pl.mul(normed, gate_sigmoid)
         activated_bf16 = pl.cast(activated, pl.BF16, mode="rint")
         gated_rows[r0 : r0 + OUTPUT_NORM_ROWS_TILE, 0:KDA_DIM] = pl.set_validshape(activated_bf16, rows, KDA_DIM)
-    with pl.spmd(pl.min(t_dim * (D // OUTPUT_PROJECTION_N_TILE), PROJECTION_WORKERS_TILE), name_hint="kda_output_proj"):
-        for task in pl.range(pl.tile.get_block_idx(), t_dim * (D // OUTPUT_PROJECTION_N_TILE), PROJECTION_WORKERS_TILE):
-            t0 = task // (D // OUTPUT_PROJECTION_N_TILE)
-            d0 = task % (D // OUTPUT_PROJECTION_N_TILE) * OUTPUT_PROJECTION_N_TILE
-            partial = bf16_linear_row(
-                gated, w_o, t0, d0,
-                OUTPUT_PROJECTION_N_TILE, LOCAL_KDA_QKV_DIM, OUTPUT_PROJECTION_K_TILE, OUTPUT_PROJECTION_PIPELINE_TILE,
+    output_n_tiles = D // OUTPUT_PROJECTION_MM_N_TILE
+    output_tasks = ((t_dim + PROJECTION_T_TILE - 1) // PROJECTION_T_TILE) * output_n_tiles
+    output_workers = pl.min(output_tasks, PROJECTION_WORKERS_TILE)
+    for worker in pl.spmd(output_workers, name_hint="kda_output_proj"):
+        for task in pl.range(worker, output_tasks, PROJECTION_WORKERS_TILE):
+            t0 = task // output_n_tiles * PROJECTION_T_TILE
+            d0 = task % output_n_tiles * OUTPUT_PROJECTION_MM_N_TILE
+            rows = pl.min(PROJECTION_T_TILE, t_dim - t0)
+            partial = bf16_matmul(
+                gated, w_o, t0, d0, pl.cast(0, pl.INDEX), rows, pl.cast(OUTPUT_PROJECTION_MM_N_TILE, pl.INDEX),
+                PROJECTION_T_TILE, OUTPUT_PROJECTION_MM_N_TILE, OUTPUT_PROJECTION_MM_K_TILE, LOCAL_KDA_QKV_DIM,
             )
             local_bf16 = pl.cast(partial, pl.BF16, mode="rint")
             exchange_value = pl.cast(local_bf16, pl.FP32)
-            output[t0:t0 + 1, d0:d0 + OUTPUT_PROJECTION_N_TILE] = exchange_value
+            output[t0:t0 + PROJECTION_T_TILE, d0:d0 + OUTPUT_PROJECTION_MM_N_TILE] = pl.set_validshape(
+                exchange_value, rows, OUTPUT_PROJECTION_MM_N_TILE,
+            )
     return output
 
 
@@ -2318,7 +2340,9 @@ def run_projection_case(argv=None):
             fn=kda_projection_test,
             specs=projection_build_tensor_specs(capacity, active),
             golden_fn=golden_kda_projection_tensors,
-            compare_fn={"mixed_qkv": ratio_allclose(rtol=0, atol=0, max_error_ratio=0)},
+            # The batched cube projection is not bitwise equal to the per-token
+            # vector dots; hold it to the file's BF16 gate instead.
+            compare_fn={"mixed_qkv": ratio_allclose(atol=0.02, rtol=0.02, max_error_ratio=0)},
             config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
             save_data=args.save_data,
             golden_data=args.golden_data,
