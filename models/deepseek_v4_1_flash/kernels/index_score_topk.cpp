@@ -219,13 +219,16 @@ namespace {
         template <int SHIFT>
         __tf__ __aicore__ void packed_histogram(__ubuf__ uint16_t* keys, __ubuf__ uint16_t* hist, int width, uint32_t prefix) {
             __VEC_SCOPE__ {
-                vector_u16 h0, h1;
+                vector_u16 h0, h1, h2, h3;
                 vector_u8 lo, hi;
                 vector_bool selected;
                 vbr(h0, uint16_t(0));
                 vbr(h1, uint16_t(0));
+                vbr(h2, uint16_t(0));
+                vbr(h3, uint16_t(0));
                 uint32_t remaining = width;
-                for (uint16_t c = 0; c < (width + 255) / 256; ++c) {
+                const int blocks = (width + 255) / 256;
+                for (uint16_t c = 0; c < blocks; c += 2) {
                     auto mask = CreatePredicate<uint8_t>(remaining);
                     vlds(lo, hi, (__ubuf__ uint8_t*)keys, c * 512, DINTLV_B8);
                     if constexpr (SHIFT == 8) {
@@ -237,8 +240,23 @@ namespace {
                         chistv2(h0, lo, selected, Bin_N0);
                         chistv2(h1, lo, selected, Bin_N1);
                     }
+                    if (c + 1 < blocks) {
+                        mask = CreatePredicate<uint8_t>(remaining);
+                        vlds(lo, hi, (__ubuf__ uint8_t*)keys, (c + 1) * 512, DINTLV_B8);
+                        if constexpr (SHIFT == 8) {
+                            chistv2(h2, hi, mask, Bin_N0);
+                            chistv2(h3, hi, mask, Bin_N1);
+                        }
+                        else {
+                            vcmps_eq(selected, hi, uint8_t(prefix >> 8), mask);
+                            chistv2(h2, lo, selected, Bin_N0);
+                            chistv2(h3, lo, selected, Bin_N1);
+                        }
+                    }
                 }
                 auto full = pset_b16(PAT_ALL);
+                vadd(h0, h0, h2, full, MODE_ZEROING);
+                vadd(h1, h1, h3, full, MODE_ZEROING);
                 vsts(h0, hist, 0, NORM_B16, full);
                 vsts(h1, hist, 128, NORM_B16, full);
             }
@@ -638,6 +656,10 @@ namespace {
                     TEXTRACT(scale1, query_scale, 96, 0);
 #else
                     prepare_query(args, begin, count, query_pipe);
+                    int offset = get_subblockid() * 3;
+                    int visible0 = offset < count ? (gathered_rows ? maximum : minimum(read(data<int32_t>(args, 7) + begin + offset), width)) : 0;
+                    int visible1 = offset + 1 < count ? (gathered_rows ? maximum : minimum(read(data<int32_t>(args, 7) + begin + offset + 1), width)) : 0;
+                    int visible2 = offset + 2 < count ? (gathered_rows ? maximum : minimum(read(data<int32_t>(args, 7) + begin + offset + 2), width)) : 0;
 #endif
                     for (int panel = 0; panel < panel_count; ++panel) {
                         int logical = (first_panel + panel) * 256;
@@ -668,6 +690,7 @@ namespace {
                             TASSIGN(right_scale, GetScaleAddr(right.data()));
                             TASSIGN(dot0, 0);
                             TASSIGN(dot1, 98304);
+                            if (transferred > 0) wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
                             for (int piece = 0; piece < 2; ++piece) {
                                 int page = piece == 0 ? page0 : page1;
                                 if (page < 0) page = page0 >= 0 ? page0 : page1;
@@ -675,19 +698,23 @@ namespace {
                                 KeyScale part_scale;
                                 TASSIGN(part, 65536 + piece * 4096);
                                 TASSIGN(part_scale, 81920 + piece * 512);
-                                GM<F4, 128, 128, 128, 128, Layout::DN> kg(data<F4>(args, 3) + page * 8192);
+                                GM<F4, 128, 128, 128, 128, Layout::DN> kg(data<F4>(args, 3) + static_cast<int64_t>(page) * 8192);
                                 GM<S, 4, 128, 4, 128, Layout::MX_B_DN> sg(data<S>(args, 4) + page * 512);
                                 TLOAD(part, kg);
                                 TLOAD(part_scale, sg);
                             }
                             set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
                             wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+                            if (transferred > 0) wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
                             TMOV(right, key);
                             TMOV(right_scale, key_scale);
+                            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
                             set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
                             wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+                            if (transferred > 0) wait_flag(PIPE_FIX, PIPE_M, EVENT_ID2);
                             TMATMUL_MX(dot0, left0, scale0, right, right_scale);
                             TMATMUL_MX(dot1, left1, scale1, right, right_scale);
+                            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
                             set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
                             wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
                             int slot = transferred % 2;
@@ -706,10 +733,10 @@ namespace {
                                 TMOV<Received, DotPart, AccToVecMode::SingleModeVec0>(received, first_half);
                                 TMOV<Received, DotPart, AccToVecMode::SingleModeVec1>(received, second_half);
                             }
+                            set_flag(PIPE_FIX, PIPE_M, EVENT_ID2);
                             set_intra_block(PIPE_FIX, slot * 2);
                             set_intra_block(PIPE_FIX, slot * 2 + 16);
                             ++transferred;
-                            pipe_barrier(PIPE_ALL);
                         }
 #else
                         if (have_dot) wait_intra_block(PIPE_V, (transferred % 2) * 2);
@@ -726,10 +753,9 @@ namespace {
                             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                             TCVT(pool_valid, raw_valid, RoundMode::CAST_NONE);
                         }
-                        int offset = get_subblockid() * 3;
-                        int n0 = offset < count ? (gathered_rows ? maximum : minimum(read(data<int32_t>(args, 7)+begin+offset), width))-logical : 0;
-                        int n1 = offset+1 < count ? (gathered_rows ? maximum : minimum(read(data<int32_t>(args, 7)+begin+offset+1), width))-logical : 0;
-                        int n2 = offset+2 < count ? (gathered_rows ? maximum : minimum(read(data<int32_t>(args, 7)+begin+offset+2), width))-logical : 0;
+                        int n0 = visible0 - logical;
+                        int n1 = visible1 - logical;
+                        int n2 = visible2 - logical;
                         if (n0<0)n0 = 0;
                         if (n1<0)n1 = 0;
                         if (n2<0)n2 = 0;
@@ -761,6 +787,11 @@ namespace {
                 }
             }
 #if defined(__DAV_CUBE__)
+            if (transferred > 0) {
+                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+                wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+                wait_flag(PIPE_FIX, PIPE_M, EVENT_ID2);
+            }
             for (int slot = 0; slot < minimum(2, transferred); ++slot) {
                 wait_intra_block(PIPE_FIX, slot * 2 + 1);
                 wait_intra_block(PIPE_FIX, slot * 2 + 17);

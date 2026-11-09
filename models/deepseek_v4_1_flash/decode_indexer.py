@@ -394,36 +394,35 @@ def _plan_index_runs(
     width: pl.Scalar[pl.INDEX],
     skip_short: pl.constexpr,
 ):
-    """Plan contiguous request groups of at most six query rows."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_plan_req") as plan_tid:
-        run_count = pl.cast(0, pl.INT32)
-        run_start = pl.cast(0, pl.INT32)
-        previous_request = pl.cast(-1, pl.INT32)
-        maximum_visible = pl.cast(0, pl.INT32)
-        for token in pl.range(num_tokens):
-            request = pl.read(request_ids, [token])
-            if token > 0:
-                if request != previous_request or token - run_start == 6:
-                    pl.write(runs, [0, run_count], run_start)
-                    pl.write(runs, [1, run_count], pl.cast(token, pl.INT32))
-                    pl.write(runs, [2, run_count], maximum_visible)
-                    run_count = run_count + pl.cast(1, pl.INT32)
-                    run_start = pl.cast(token, pl.INT32)
-                    maximum_visible = pl.cast(0, pl.INT32)
-            visible = pl.cast(pl.max(0, pl.min(pl.read(lengths, [token]), width)), pl.INT32)
-            if skip_short:
-                if visible <= INDEX_TOPK:
-                    visible = pl.cast(0, pl.INT32)
-            maximum_visible = pl.max(maximum_visible, visible)
-            pl.write(runs, [3, token + 1], run_count)
-            previous_request = request
-        if num_tokens > 0:
-            pl.write(runs, [0, run_count], run_start)
-            pl.write(runs, [1, run_count], num_tokens)
-            pl.write(runs, [2, run_count], maximum_visible)
-            run_count = run_count + pl.cast(1, pl.INT32)
-        pl.write(runs, [3, 0], run_count)
-    return plan_tid
+    """Publish request groups synchronously before using their count to size shards."""
+    run_count = pl.cast(0, pl.INT32)
+    run_start = pl.cast(0, pl.INT32)
+    previous_request = pl.cast(-1, pl.INT32)
+    maximum_visible = pl.cast(0, pl.INT32)
+    for token in pl.range(num_tokens):
+        request = pl.read(request_ids, [token])
+        if token > 0:
+            if request != previous_request or token - run_start == 6:
+                pl.write(runs, [0, run_count], run_start)
+                pl.write(runs, [1, run_count], pl.cast(token, pl.INT32))
+                pl.write(runs, [2, run_count], maximum_visible)
+                run_count = run_count + pl.cast(1, pl.INT32)
+                run_start = pl.cast(token, pl.INT32)
+                maximum_visible = pl.cast(0, pl.INT32)
+        visible = pl.cast(pl.max(0, pl.min(pl.read(lengths, [token]), width)), pl.INT32)
+        if skip_short:
+            if visible <= INDEX_TOPK:
+                visible = pl.cast(0, pl.INT32)
+        maximum_visible = pl.max(maximum_visible, visible)
+        pl.write(runs, [3, token + 1], run_count)
+        previous_request = request
+    if num_tokens > 0:
+        pl.write(runs, [0, run_count], run_start)
+        pl.write(runs, [1, run_count], num_tokens)
+        pl.write(runs, [2, run_count], maximum_visible)
+        run_count = run_count + pl.cast(1, pl.INT32)
+    pl.write(runs, [3, 0], run_count)
+    return run_count
 
 
 @pl.jit.inline(auto_scope=False)
@@ -648,8 +647,7 @@ def score_select_paged(
     width = pl.tensor.dim(scores, 1)
     capacity = pl.tensor.dim(output, 0)
     runs = pl.create_tensor([4, capacity + 1], dtype=pl.INT32)
-    plan_tid = _plan_index_runs(request_ids, lengths, runs, num_tokens, width, c2a)
-    run_count = pl.read(runs, [3, 0])
+    run_count = _plan_index_runs(request_ids, lengths, runs, num_tokens, width, c2a)
     workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
     panels = (width + 255) // 256
     shards = workers
@@ -675,7 +673,7 @@ def score_select_paged(
     score_rows = pl.slice(scores, [capacity, width], [0, 0])
     candidate_keys = pl.create_tensor([capacity, shards * INDEX_TOPK], dtype=pl.UINT16)
     candidate_indices = pl.create_tensor([capacity, shards * INDEX_TOPK], dtype=pl.INT32)
-    with pl.spmd(workers, name_hint="idx_score_topk", sync_start=True, deps=[cache_ready, query_ready, weights_ready, plan_tid]) as mix_tid:
+    with pl.spmd(workers, name_hint="idx_score_topk", sync_start=True, deps=[cache_ready, query_ready, weights_ready]) as mix_tid:
         mixed_output = _idx_score_topk(
             query_rows, scale_rows, weight_rows, index_cache, index_cache_scale,
             block_table, request_rows, length_rows, mixed_output, runs, candidate_keys, candidate_indices,
