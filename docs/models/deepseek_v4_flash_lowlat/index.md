@@ -415,6 +415,8 @@ for the chunk to complete. The caller supplies the original prefill sampling,
 grammar, allocation and request-lifetime inputs, and consumes its outputs.
 
 
+### Deployment
+
 This deployment retains five draft tokens and six target verification rows.
 It complements the [wide-batch DSpark model](../deepseek_v4_flash_dspark/index.md).
 
