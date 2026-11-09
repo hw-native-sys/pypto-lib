@@ -71,9 +71,8 @@ from models.glm5_3_flash.lm_head import HEAD_VOCAB_PAD as HEAD_VOCAB_PAD
 from models.glm5_3_flash.mhc import MhcTensors, _test_mhc, combine_streams
 from models.glm5_3_flash.rmsnorm import reference_rms_norm
 from models.glm5_3_flash.utils import (
-    _FF_DOWN, _FF_FUSED, _FF_GATE, _FF_UP, ROLES, TEXT_LAYER_ROOTS, Checkpoint, QuantDescription,
-    CacheTables, _as_batch_seqs, _assert_close, _find, _pad_to, _prefill_model as _prefill_model, _prefixed,
-    _read_quant, _resolve_name, _resolve_top_name, _scale_of, _try_find, _weight_shape,
+    _FF_DOWN, _FF_FUSED, _FF_GATE, _FF_UP, OFFSET_SUFFIXES, SCALE_SUFFIXES, TEXT_LAYER_ROOTS, Checkpoint, QuantDescription,
+    CacheTables, _as_batch_seqs, _assert_close, _ffn_sources, _pad_to, _prefill_model as _prefill_model, _read_quant, _resolve_name, _resolve_top_name, _scale_of, _weight_shape,
     build_forward_metadata, build_indexer_chunk_metadata, check_ffn_scales, fuse_gate_up, gather_rows,
     golden_split_kv_b, layer_prefix, layer_prefixes, layer_router, load_shared_expert, load_tensors,
     pack_int8_nz, read_reference_float, scaled_model_from_config, shard_dense_mlp, shard_routed_experts,
@@ -1223,11 +1222,9 @@ def _fused_ffn_at(
     """``_fused_ffn`` carried over an explicit geometry: hidden and intermediate
     come from the staging model instead of the module constants, so scaled
     fixtures load through the same read/fuse pipeline as the deployment."""
-    fmt = {"e": expert} if expert is not None else {}
-    fused_role, fused_down_role, gate_role, up_role, down_role = roles
-    fused_name = _try_find(tensors, _prefixed(prefixes, ROLES[fused_role], **fmt))
-    down_name = _find(tensors, _prefixed(prefixes, ROLES[fused_down_role] + ROLES[down_role], **fmt))
-    if fused_name is not None:
+    inputs, down_name = _ffn_sources(tensors, prefixes, roles, expert)
+    if len(inputs) == 1:
+        fused_name = inputs[0]
         if _weight_shape(tensors, fused_name) != (2 * intermediate, hidden):
             raise ValueError(f"{fused_name} must have shape {(2 * intermediate, hidden)}")
         if channels == slice(None):
@@ -1238,8 +1235,7 @@ def _fused_ffn_at(
             up, up_scale = _read_quant(tensors, fused_name, up_rows)
             gate_up, gate_up_scale = fuse_gate_up(gate, up, gate_scale, up_scale)
     else:
-        gate_name = _find(tensors, _prefixed(prefixes, ROLES[gate_role], **fmt))
-        up_name = _find(tensors, _prefixed(prefixes, ROLES[up_role], **fmt))
+        gate_name, up_name = inputs
         if _weight_shape(tensors, gate_name) != (intermediate, hidden) or _weight_shape(tensors, up_name) != (
             intermediate,
             hidden,
@@ -1415,25 +1411,70 @@ class ResidentPrefillWeights:
         self._embed_name = self._resolve([root + "embed_tokens.weight" for root in _TEXT_MODEL_ROOTS], "embed_tokens")
         self._validate_member_header(self._embed_name, (model.vocab_size, hidden), torch.bfloat16)
         self._lm_head_name = self._resolve(("lm_head.weight",), "lm_head")
+        for name in (self._embed_name, self._lm_head_name):
+            self._validate_member_header(name, (model.vocab_size, hidden), torch.bfloat16)
+            if self._label(name) != "FLOAT":
+                raise ValueError(f"{name} must be declared FLOAT")
+        for layer in self._family_layers["dense"]:
+            self._validate_ffn_headers(layer, "dense", model.intermediate_size)
+        for layer in self._family_layers["moe"]:
+            self._validate_ffn_headers(layer, "shared", model.moe_intermediate_size)
+            for expert in range(model.n_routed_experts):
+                self._validate_ffn_headers(layer, "routed", model.moe_intermediate_size, expert)
 
     def _validate_member_header(self, name: str, expected_shape: tuple[int, ...], dtype: torch.dtype) -> None:
-        """Header-only shape and label gate; skipped for header-less fixture views.
-
-        ``Checkpoint`` validates dtype at read time (``_float`` accepts only
-        BF16/FP32 storage, ``quant`` only INT8); here the shape is checked from
-        the shard header so a layout mismatch fails before any payload moves.
-        """
+        """Validate source geometry, quantization label and actual storage dtype."""
         shape_of = getattr(self.checkpoint, "shape", None)
-        if shape_of is None:
-            return
-        shape = shape_of(name)
-        if tuple(shape) != expected_shape:
-            raise ValueError(f"{name} has shape {tuple(shape)}, expected {expected_shape}")
+        if shape_of is not None and tuple(shape_of(name)) != expected_shape:
+            raise ValueError(f"{name} has shape {tuple(shape_of(name))}, expected {expected_shape}")
         label = self._label(name)
-        if label == "W8A8_DYNAMIC" and dtype != torch.bfloat16:
-            # Only the MLA projections are INT8 in storage; every other member
-            # must be FLOAT, and dequantizing one would silently change its ABI.
-            raise ValueError(f"{name} is {label}; only BF16 members may dequantize, view is {dtype}")
+        if label == "W8A8_DYNAMIC":
+            if dtype != torch.bfloat16:
+                raise ValueError(f"{name} is {label}; only BF16 members may dequantize, view is {dtype}")
+            self._validate_quant_header(name, expected_shape)
+        else:
+            self._validate_storage_dtype(name, quantized=False)
+
+    def _validate_storage_dtype(self, name: str, *, quantized: bool) -> None:
+        """Accept INT8 matrices or floating storage, including header-only fixtures."""
+        dtype_of = getattr(self.checkpoint, "dtype", None)
+        if dtype_of is None:
+            return
+        storage = dtype_of(name)
+        if quantized:
+            valid = storage in ("I8", torch.int8)
+            expected = "INT8"
+        else:
+            valid = (storage.is_floating_point if isinstance(storage, torch.dtype)
+                     else storage == "BF16" or storage.startswith("F"))
+            expected = "floating point"
+        if not valid:
+            raise ValueError(f"{name} must have {expected} storage, got {storage}")
+
+    def _validate_quant_header(self, name: str, expected_shape: tuple[int, ...]) -> None:
+        """Validate a quantized matrix and both per-output auxiliary tensors."""
+        if self._label(name) != "W8A8_DYNAMIC":
+            raise ValueError(f"{name} must be declared W8A8_DYNAMIC")
+        shape_of = getattr(self.checkpoint, "shape", None)
+        if shape_of is not None and tuple(shape_of(name)) != expected_shape:
+            raise ValueError(f"{name} has shape {tuple(shape_of(name))}, expected {expected_shape}")
+        self._validate_storage_dtype(name, quantized=True)
+        for suffixes, role in ((SCALE_SUFFIXES, "scale"), (OFFSET_SUFFIXES, "offset")):
+            auxiliary = self._resolve([name + suffix for suffix in suffixes], f"{name} {role}")
+            if shape_of is not None and tuple(shape_of(auxiliary)) not in ((expected_shape[0],), (expected_shape[0], 1)):
+                raise ValueError(f"{auxiliary} needs one {role} per output row of {name}")
+            self._validate_storage_dtype(auxiliary, quantized=False)
+
+    def _validate_ffn_headers(self, layer: int, kind: str, intermediate: int, expert: int | None = None) -> None:
+        """Resolve every FFN projection across all EP owners without reading payloads."""
+        try:
+            inputs, down = _ffn_sources(self.checkpoint, layer_prefixes(layer), _ffn_roles(kind), expert)
+        except KeyError as error:
+            raise ValueError(f"checkpoint is missing {kind} FFN on layer {layer}, expert {expert}: {error}") from error
+        rows = 2 * intermediate if len(inputs) == 1 else intermediate
+        for name in inputs:
+            self._validate_quant_header(name, (rows, self.model.hidden_size))
+        self._validate_quant_header(down, (self.model.hidden_size, intermediate))
 
     def _build_stacks(self) -> None:
         """Compute every stack's per-rank shape from the geometry alone."""
@@ -1588,7 +1629,10 @@ class ResidentPrefillWeights:
                 [root + f"{self._mtp_layer}.embed_tokens.weight" for root in TEXT_LAYER_ROOTS],
                 "MTP embedding",
             )
-        return gather_rows(self.checkpoint, name, ids).to(torch.bfloat16)
+        rows = gather_rows(self.checkpoint, name, ids)
+        if not rows.is_floating_point():
+            raise ValueError(f"{name} must have floating-point storage, got {rows.dtype}")
+        return rows.to(torch.bfloat16)
 
     def mtp_head_shard(self, rank: int) -> torch.Tensor:
         """Read the MTP-owned vocabulary shard without assuming tied tables."""
@@ -1608,6 +1652,8 @@ class ResidentPrefillWeights:
             expected = (self.model.vocab_size, self.model.hidden_size)
             if tuple(head.shape) != expected:
                 raise ValueError(f"lm_head has shape {tuple(head.shape)}, expected {expected}")
+            if not head.is_floating_point():
+                raise ValueError(f"{self._lm_head_name} must have floating-point storage, got {head.dtype}")
             self._lm_head_cache = head.to(torch.bfloat16).contiguous()
         return self._lm_head_cache
 
@@ -1623,7 +1669,10 @@ class ResidentPrefillWeights:
         """
         label = self._label(name)
         if label == "FLOAT":
-            return self.checkpoint.read(name).to(dtype)
+            value = self.checkpoint.read(name)
+            if not value.is_floating_point():
+                raise ValueError(f"{name} is FLOAT but has non-floating storage {value.dtype}")
+            return value.to(dtype)
         if dtype != torch.bfloat16:
             raise ValueError(f"{name} is {label}; only BF16 consumers may dequantize, asked for {dtype}")
         weight, scale = _read_quant(self.checkpoint, name)
@@ -2841,10 +2890,10 @@ def run_weight_checks(argv=None):
     else:
         raise AssertionError("a non-zero MLA weight_offset should have been rejected")
     bad_ffn_offset = build_tiny_fixture(
-        mutate=lambda tensors, labels: tensors.update({"model.layers.1.mlp.experts.0.gate_proj.weight_offset": torch.ones(16, 1)}),
+        mutate=lambda tensors, labels: tensors.update({"model.layers.1.mlp.experts.0.gate_proj.weight_offset": torch.ones(TINY.moe_intermediate_size, 1)}),
     )
-    bad_ffn_weights = ResidentPrefillWeights.load(bad_ffn_offset, tp_size=2, ep_size=2, model=TINY)
     try:
+        bad_ffn_weights = ResidentPrefillWeights.load(bad_ffn_offset, tp_size=2, ep_size=2, model=TINY)
         bad_ffn_weights._moe_layer(1, ep_rank=0)
     except ValueError:
         pass

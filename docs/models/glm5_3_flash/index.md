@@ -572,6 +572,14 @@ and native compilation pass on the matched toolchain. These compile checks
 establish build compatibility; numerical device validation and performance
 measurements remain separate gates.
 
+### Checkpoint preflight and golden buffers
+
+Checkpoint preflight validates actual storage dtypes and every dense, shared
+and routed expert projection before device allocation. Shape and dtype
+headers are cached per shard without materializing weight payloads. Output
+initializers used by the golden harness have independent storage so a device
+write cannot overwrite its reference output.
+
 ### MoE expert parallelism
 
 The complete forward selects the MoE transport at compile time. Prefill uses
