@@ -879,33 +879,6 @@ def build_cp_tensor_specs(cp_size: int = CP_SIZE, *, num_tokens: int | None = No
 
     for name, value in build_csa_leaf_metadata(cp_size, metadata, raw, raw_ctx).items():
         specs.append(TensorSpec(name, list(value.shape), value.dtype, init_value=value))
-    for part in range(LOCAL_PARTS):
-        specs.extend(
-            [
-                TensorSpec(
-                    f"main_state_workspace{part}",
-                    [
-                        cp_size,
-                        CSA_STATE_PHYSICAL_BLOCKS,
-                        MAIN_STATE_BLOCK_SIZE,
-                        MAIN_STATE_DIM,
-                    ],
-                    torch.float32,
-                    init_value=0.0,
-                ),
-                TensorSpec(
-                    f"inner_state_workspace{part}",
-                    [
-                        cp_size,
-                        CSA_INNER_STATE_PHYSICAL_BLOCKS,
-                        INNER_STATE_BLOCK_SIZE,
-                        INNER_STATE_DIM,
-                    ],
-                    torch.float32,
-                    init_value=0.0,
-                ),
-            ]
-        )
     specs.append(TensorSpec("x_out", list(x_hc.shape), torch.float32))
     golden_prefill_cp_csa._ctx = { "cp_size": cp_size, **raw_ctx, }
     owner_spec = TensorSpec("cache_owner_rank_t", [cp_size, 1], torch.int32, init_value=0)
@@ -2616,10 +2589,6 @@ def prefill_cp_csa_rank(
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
-    main_state_workspace0: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
-    inner_state_workspace0: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
-    main_state_workspace1: pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
-    inner_state_workspace1: pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
     compress_state: pl.InOut[pl.Tensor[[MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[MAIN_STATE_MAX_BLOCKS], pl.INT32],
     inner_compress_state: pl.InOut[pl.Tensor[[INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32]],
@@ -2685,6 +2654,12 @@ def prefill_cp_csa_rank(
     # Keeping it child-local avoids changing the standalone test's host
     # interface / build_tensor_specs (the token is not a host-visible output).
     completion_token = pl.create_tensor([NUM_MOE_WAVES, 1, 8], dtype=pl.FP32)
+    # Local compressor scratch is initialized by the rank program and does
+    # not belong to the standalone test's host ABI.
+    main_state_workspace0 = pl.create_tensor([CSA_STATE_PHYSICAL_BLOCKS, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
+    inner_state_workspace0 = pl.create_tensor([CSA_INNER_STATE_PHYSICAL_BLOCKS, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32)
+    main_state_workspace1 = pl.create_tensor([CSA_STATE_PHYSICAL_BLOCKS, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], dtype=pl.FP32)
+    inner_state_workspace1 = pl.create_tensor([CSA_INNER_STATE_PHYSICAL_BLOCKS, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], dtype=pl.FP32)
     return prefill_attention_csa(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape,
@@ -2766,10 +2741,6 @@ def prefill_cp_csa_test(
     leaf_main_state_slots_input: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
     leaf_inner_state_slots_input: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_COMPRESS_LEAVES, T], pl.INT64],
     leaf_num_tokens_input: pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_COMPRESS_LEAVES], pl.INT32],
-    main_state_workspace0: pl.Tensor[[CP_SIZE, MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
-    inner_state_workspace0: pl.Tensor[[CP_SIZE, INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
-    main_state_workspace1: pl.Tensor[[CP_SIZE, MAIN_STATE_BLOCKS_DYN, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
-    inner_state_workspace1: pl.Tensor[[CP_SIZE, INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
     x_out: pl.Out[pl.Tensor[[CP_SIZE, LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D], pl.FP32]],
 ):
     hidden_tail_buf = pld.alloc_window_buffer([CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
@@ -2820,10 +2791,6 @@ def prefill_cp_csa_test(
             hadamard_idx,
             idx_wq_b, idx_wq_b_scale, idx_weights_proj,
             inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-            main_state_workspace0[rank],
-            inner_state_workspace0[rank],
-            main_state_workspace1[rank],
-            inner_state_workspace1[rank],
             compress_state[rank],
             compress_state_block_table[rank],
             inner_compress_state[rank], inner_compress_state_block_table[rank],
