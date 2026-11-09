@@ -21,6 +21,7 @@ from models.deepseek_v4_flash_lowlat.prefill_cache import (
 from models.deepseek_v4_flash_lowlat.prefill_metadata import (
     prefill_tap_positions, prepare_prefill_hidden, prepare_prefill_metadata,
 )
+from models.deepseek_v4_flash_lowlat.prefill_sequential import prefill_with_single
 from models.deepseek_v4_flash_lowlat.prefill_state import update_prefill_tail
 from models.deepseek_v4_flash_lowlat.prefill_weights import (
     attention_layer_weights, lm_head_weight, moe_layer_weights, prompt_embeddings,
@@ -184,3 +185,56 @@ def test_drafter_banks_use_absolute_anchor_and_physical_pages():
     assert banks["context_group_slot_mapping_bank"][0, 10, 0, :11].tolist() == list(range(11))
     assert banks["query_group_position_ids_bank"][0, 10, :5].tolist() == [11, 12, 13, 14, 15]
     assert torch.equal(banks["query_freqs_cos_bank"][0, 10, 0], rope[11])
+
+
+def test_single_weight_prefill_builds_the_last_128_rows_and_state():
+    inputs = {
+        "position_ids": torch.zeros((8, 1), dtype=torch.int32).share_memory_(),
+        "kv_seq_lens": torch.zeros((8, 1), dtype=torch.int32).share_memory_(),
+        "input_ids": torch.zeros((8, 1), dtype=torch.int64).share_memory_(),
+        "sampling_positions": torch.zeros((8, 1), dtype=torch.int32).share_memory_(),
+        "logit_row_indices": torch.zeros((8, 1), dtype=torch.int32).share_memory_(),
+        "num_tokens_per_owner": torch.zeros(8, dtype=torch.int32).share_memory_(),
+    }
+    feature = torch.empty((1, 12288), dtype=torch.bfloat16)
+    sample = torch.empty((1, 8), dtype=torch.int32)
+    feature_shard = SimpleNamespace(data_ptr=feature.data_ptr())
+    sample_shard = SimpleNamespace(data_ptr=sample.data_ptr())
+    inputs["dspark_target_hidden_out"] = SimpleNamespace(
+        shape=(8, 1, 12288), dtype=torch.bfloat16, worker_ids=tuple(range(8)), shards=[feature_shard] * 8,
+    )
+    inputs["sampled_ids"] = SimpleNamespace(
+        shape=(8, 1, 8), dtype=torch.int32, worker_ids=tuple(range(8)), shards=[sample_shard] * 8,
+    )
+    metadata = {"params": [{"name": name + "__ssa_v0"} for name in inputs]}
+
+    class Worker:
+        def __init__(self):
+            self.seen = []
+            self.reads = 0
+
+        def submit(self, program, *args, config):
+            position = len(self.seen)
+            assert program == "single" and len(args) == len(inputs) and config is None
+            assert bool((inputs["position_ids"] == position).all())
+            assert bool((inputs["kv_seq_lens"] == position + 1).all())
+            assert bool((inputs["input_ids"] == position).all())
+            self.seen.append(position)
+            feature.fill_(position)
+            sample.fill_(position + 1)
+            return SimpleNamespace(result=lambda: None)
+
+        def copy_from(self, dst, src, size, *, worker_id):
+            assert worker_id == 0
+            self.reads += 1
+            ctypes.memmove(dst, src, size)
+
+    worker = Worker()
+    first, ring, state = prefill_with_single(worker, "single", metadata, inputs, torch.arange(130),
+                                            max_new_tokens=32, epoch=9)
+    assert worker.seen == list(range(130))
+    assert worker.reads == 129
+    assert first == 130 and state[0].tolist() == [9, 129, 31, 130]
+    assert torch.equal(state, state[:1].expand(8, -1))
+    assert ring[0, 0] == 128 and ring[1, 0] == 129 and ring[2, 0] == 2
+    assert not bool(ring[128:].any())
