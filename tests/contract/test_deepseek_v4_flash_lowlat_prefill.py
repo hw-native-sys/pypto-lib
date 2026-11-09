@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from models.deepseek_v4_flash_lowlat.prefill_cache import (
-    CACHE_LAYOUTS, initialize_cache_pages, prefill_block_tables, prefill_cache_views,
+    CACHE_LAYOUTS, initialize_cache_pages, prefill_block_tables, prefill_cache_views, prefill_slot_mappings,
 )
 from models.deepseek_v4_flash_lowlat.prefill_fwd import load_prefill_program, prefill_arguments
 from models.deepseek_v4_flash_lowlat.prefill_metadata import (
@@ -183,3 +183,18 @@ def test_prefill_rejects_incompatible_ordered_kv_geometry(monkeypatch):
     with pytest.raises(RuntimeError, match="KV_OK"):
         load_prefill_program()
     assert sys.path == old_path and sys.argv == old_argv
+
+
+def test_hca_state_ring_covers_the_entire_parallel_publication():
+    tables = _tables()
+    counts = torch.tensor([2, 2, 2, 2, 16, 2, 2], dtype=torch.int32).view(1, 1, 7).repeat(8, 1, 1)
+    short_positions = torch.arange(128, dtype=torch.int64).repeat(8, 1)
+    prefill_slot_mappings(short_positions, tables, _cache_metadata(), block_counts=counts)
+
+    long_positions = torch.arange(169, dtype=torch.int64).repeat(8, 1)
+    with pytest.raises(ValueError, match="hca_state_slot_mapping_full aliases"):
+        prefill_slot_mappings(long_positions, tables, _cache_metadata(), block_counts=counts)
+
+    counts[:, :, 4] = 17
+    mapping = prefill_slot_mappings(long_positions, tables, _cache_metadata(), block_counts=counts)
+    assert torch.unique(mapping["hca_state_slot_mapping_full"][0, -136:]).numel() == 136

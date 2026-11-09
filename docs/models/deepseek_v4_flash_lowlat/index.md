@@ -402,8 +402,10 @@ against its own cache allocation. Pass the existing `block_counts` when the
 compressor tables use the decode ring layout.
 The caller must provide enough non-aliased cache pages for the whole chunk and
 the preceding sliding window. The metadata helper rejects missing pages,
-out-of-bounds writes, and overwritten live history. Prefix checkpoints are
-not requested by this helper. Inputs passed as host tensors to a prepared
+out-of-bounds writes, and overwritten live history. The HCA state must also
+provide distinct rows for the kernel's 128-row history plus one DSpark decode
+transaction when a prefill tile publishes that many rows. Prefix checkpoints
+are not requested by this helper. Inputs passed as host tensors to a prepared
 Worker must use shared storage allocated before the Worker starts.
 
 `prefill_fwd.prepare_prefill_bindings` combines the caller's prefill-format
