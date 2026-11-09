@@ -21,7 +21,7 @@ import torch
 
 from models.glm5_3_flash.config import FLASH, HC_DIM, HC_MULT, MIX_HC, D, Glm53FlashConfig
 from models.glm5_3_flash.elementwise import (
-    _sum_fp32_reference, accurate_divide, accurate_exp, accurate_row_sum,
+    _sum_fp32_reference, accurate_exp,
     accurate_rsqrt, accurate_sigmoid,
 )
 from models.glm5_3_flash.kda import PROJECTION_WORKERS_TILE
@@ -59,11 +59,11 @@ def sinkhorn_normalize(
         rows[:, :] = pl.transpose(values, 0, 1)
     else:
         rows[:, :] = values
-    totals = accurate_row_sum(rows)
+    totals = pl.row_sum(rows)
     ones = pl.full([HC_PAD, HC_PAD], dtype=pl.FP32, value=1.0)
     denominator = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
     denominator[:, :] = pl.row_expand_mul(ones, pl.add(pl.mul(totals, 0.5), EPS))
-    normalized = accurate_divide(rows, denominator)
+    normalized = pl.div(rows, denominator)
     result = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
     if COLUMNS:
         result[:, :] = pl.transpose(normalized, 0, 1)
