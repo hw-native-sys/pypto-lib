@@ -722,6 +722,23 @@ def recurrent_kda(
     return (output, recurrent_state)
 
 
+@pl.jit
+def recurrent_kda_test(
+    query: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    key: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    value: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],
+    decay: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.FP32],
+    beta: pl.Tensor[[T_DYN, BETA_PAD], pl.FP32],
+    recurrent_state: pl.InOut[pl.Tensor[[KDA_STATE_DYN, LOCAL_KDA_H, KDA_DIM, KDA_DIM], pl.FP32]],
+    query_start_loc: pl.Tensor[[Q_START_DYN], pl.INT32],
+    state_rows: pl.Tensor[[B_DYN, KDA_METADATA_DYN], pl.INT32],
+    output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16]],
+):
+    """Validate the production recurrence with prepared request metadata."""
+    recurrent_kda(query, key, value, decay, beta, recurrent_state, query_start_loc, state_rows, output)
+    return output, recurrent_state
+
+
 @pl.jit.inline
 def decode_kda(
     query: pl.Tensor[[T_DYN, LOCAL_KDA_H, KDA_DIM], pl.BF16],

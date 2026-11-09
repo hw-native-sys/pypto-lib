@@ -28,6 +28,9 @@ to select a stage, such as `kda.py --component convolution` or
 to that stage. `prefill_fwd.py` runs CPU weight checks without a checkpoint;
 `--check reference` runs the independent CPU backbone checks.
 
+See [KDA core comparison](kda-comparison.md) for separate prefill/decode performance
+cases and shared-input precision/performance comparison with vLLM Ascend.
+
 ## Why W8A8, and why a2a3 forces it
 
 The released checkpoint is FP8 blockwise (`e4m3`, 128x128, dynamic activations).

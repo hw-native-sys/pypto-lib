@@ -312,6 +312,396 @@
       ]
     },
     {
+      "case_id": "glm5.3-flash-a3-v2-kda-decode-b1-t1-tp8",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "decode",
+        "--tp",
+        "8",
+        "--ep",
+        "8",
+        "--requests",
+        "1",
+        "--tokens",
+        "1",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-decode-b4-t4-tp8",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "decode",
+        "--tp",
+        "8",
+        "--ep",
+        "8",
+        "--requests",
+        "4",
+        "--tokens",
+        "4",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-decode-b32-t32-tp8",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "decode",
+        "--tp",
+        "8",
+        "--ep",
+        "8",
+        "--requests",
+        "32",
+        "--tokens",
+        "32",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-prefill-b1-t128-tp8",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "prefill",
+        "--tp",
+        "8",
+        "--ep",
+        "8",
+        "--requests",
+        "1",
+        "--tokens",
+        "128",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-prefill-b4-t128-tp8",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "prefill",
+        "--tp",
+        "8",
+        "--ep",
+        "8",
+        "--requests",
+        "4",
+        "--tokens",
+        "128",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-prefill-b1-t8192-tp8",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "prefill",
+        "--tp",
+        "8",
+        "--ep",
+        "8",
+        "--requests",
+        "1",
+        "--tokens",
+        "8192",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-verify-b32q6-tp8",
+      "suite": "glm5.3-flash",
+      "entrypoint": "models/glm5_3_flash/kda.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--component",
+        "verify",
+        "--tp",
+        "8",
+        "--ep",
+        "8",
+        "--requests",
+        "32",
+        "--query-len",
+        "6",
+        "--seed",
+        "1024"
+      ]
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-decode-b1-t1-tp16",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "decode",
+        "--tp",
+        "16",
+        "--ep",
+        "16",
+        "--requests",
+        "1",
+        "--tokens",
+        "1",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-decode-b4-t4-tp16",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "decode",
+        "--tp",
+        "16",
+        "--ep",
+        "16",
+        "--requests",
+        "4",
+        "--tokens",
+        "4",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-decode-b32-t32-tp16",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "decode",
+        "--tp",
+        "16",
+        "--ep",
+        "16",
+        "--requests",
+        "32",
+        "--tokens",
+        "32",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-prefill-b1-t128-tp16",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "prefill",
+        "--tp",
+        "16",
+        "--ep",
+        "16",
+        "--requests",
+        "1",
+        "--tokens",
+        "128",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-prefill-b4-t128-tp16",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "prefill",
+        "--tp",
+        "16",
+        "--ep",
+        "16",
+        "--requests",
+        "4",
+        "--tokens",
+        "128",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-prefill-b1-t8192-tp16",
+      "suite": "glm5.3-flash",
+      "reference_profile": "glm5.3-flash-kda-v2",
+      "entrypoint": "models/glm5_3_flash/kda_benchmark.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--engine",
+        "pto",
+        "--phase",
+        "prefill",
+        "--tp",
+        "16",
+        "--ep",
+        "16",
+        "--requests",
+        "1",
+        "--tokens",
+        "8192",
+        "--seed",
+        "1024"
+      ],
+      "comparison": {
+        "engine": "vllm-ascend",
+        "shared_inputs": true,
+        "entrypoint": "models/glm5_3_flash/kda_benchmark.py"
+      }
+    },
+    {
+      "case_id": "glm5.3-flash-a3-v2-kda-verify-b32q6-tp16",
+      "suite": "glm5.3-flash",
+      "entrypoint": "models/glm5_3_flash/kda.py",
+      "platform": "a2a3",
+      "device_count": 1,
+      "arguments": [
+        "--component",
+        "verify",
+        "--tp",
+        "16",
+        "--ep",
+        "16",
+        "--requests",
+        "32",
+        "--query-len",
+        "6",
+        "--seed",
+        "1024"
+      ]
+    },
+    {
       "case_id": "glm5.3-flash-a3-v1-kda-projection-t192",
       "suite": "glm5.3-flash",
       "reference_profile": "glm5.3-flash-a3-v1",
@@ -358,7 +748,7 @@
       ]
     },
     {
-      "case_id": "glm5.3-flash-a3-v1-kda-verify-b32q6",
+      "case_id": "glm5.3-flash-a3-v1-kda-prefill-b32q6",
       "suite": "glm5.3-flash",
       "reference_profile": "glm5.3-flash-a3-v1",
       "entrypoint": "models/glm5_3_flash/kda.py",
@@ -760,6 +1150,17 @@
         "quant_method": "w8a8",
         "activation_scheme": "dynamic"
       }
+    },
+    "glm5.3-flash-kda-v2": {
+      "scope": "KDA core plus Q/K normalization on one local TP8/TP16 shard; projections, convolution, gate/beta preprocessing and collectives excluded.",
+      "query_key_value_dtype": "bfloat16",
+      "gate_beta_state_dtype": "float32",
+      "state_layout": "V,K",
+      "head_dim": 128,
+      "seed": 1024,
+      "state_policy": "Read-only seeds and disjoint working destinations; every timed call starts from the same initial state.",
+      "comparison": "Use identical frozen inputs with kda_benchmark.py. Report each implementation versus the shared FP32 recurrence and versus each other. Prefill BF16 boundaries and chunk sizes may differ.",
+      "version_policy": "Change the case ID for an intentional input, layout, precision or timing-boundary change."
     }
   }
 }

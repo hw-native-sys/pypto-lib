@@ -177,6 +177,8 @@ def prepare_case(args):
         with payload_path.open("wb") as stream:
             cloudpickle.dump(payload, stream)
         metadata = {"case_id": case["case_id"], "function": kwargs["fn"].__name__,
+                    "function_module": (kwargs["fn"].__module__ if kwargs["fn"].__module__ != "__main__"
+                                        else case["entrypoint"].removesuffix(".py").replace("/", ".")),
                     "runtime_dir": str(build)}
         return result
 
@@ -185,6 +187,9 @@ def prepare_case(args):
     golden.run = freeze
     try:
         runpy.run_path(str(ROOT / case["entrypoint"]), run_name="__main__")
+    except SystemExit as exit_status:
+        if exit_status.code not in (None, 0):
+            raise
     finally:
         golden.run = original_run
     if calls != 1 or metadata is None:
@@ -204,7 +209,8 @@ def replay_prepared(case, selected, output, prepared):
     data = prepared.parent / "frozen/data"
     if not any((data / "out").glob("*.pt")):
         raise ValueError("prepared case has no correctness reference")
-    module = importlib.import_module(case["entrypoint"].removesuffix(".py").replace("/", "."))
+    entry_module = case["entrypoint"].removesuffix(".py").replace("/", ".")
+    module = importlib.import_module(metadata.get("function_module", entry_module))
     fn = getattr(module, metadata["function"])
     with (prepared.parent / "prepared-payload.pkl").open("rb") as stream:
         payload = cloudpickle.load(stream)
