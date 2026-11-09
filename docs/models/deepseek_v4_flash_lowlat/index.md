@@ -410,18 +410,6 @@ head, and converts each layer's TP8 intermediate slices into EP8 experts.
 The shared expert is separated from the decode bank's final expert slot.
 Convert and upload one layer or rank at a time; prefill and decode weight
 layouts have different storage requirements and cannot be treated as aliases.
-Both layouts need their own resident storage. A deployment must account for
-that memory before registering a request; retaining both may not fit on a
-single set of devices.
-
-For a cold request on devices that already hold the decode weights,
-`prefill_sequential.prefill_with_single` can use the public single-token target
-program with those same weights and cache allocations. It executes one target
-forward per prompt token, retains the last 128 target-feature rows, and returns
-the first sampled token and bootstrap history/state. The caller publishes the
-returned history/state with `prefill_bootstrap.publish_bootstrap`. This avoids
-an EP-layout weight copy, but its prompt latency grows with prompt length; use
-the chunked prefill program where its distinct weight layout can be deployed.
 
 After each completed prefill chunk, `prefill_state.capture_prefill_outputs`
 retains the actual layer-40/41/42 target taps from one CP group in a
