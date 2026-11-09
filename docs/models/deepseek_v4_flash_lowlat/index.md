@@ -377,13 +377,13 @@ RoPE inputs.
 
 ## Batch-one DSpark request serving
 
-### Prefill handoff
+### Prefill
 
 `prefill_fwd.load_prefill_program()` loads the existing DSpark chunked
 43-layer forward with CP4/EP8 geometry. Both CP groups receive the same
 batch-one prompt; each group contributes its own rank-local tokens and has
-replicated attention caches. The prefill and low-latency decode programs must
-be registered with the same Worker before its device buffers are allocated.
+replicated attention caches. The serving caller supplies the prefill program's
+own weight tensors and scratch buffers in the generated metadata's layout.
 
 `prefill_cache.prefill_cache_views` borrows each owning decode cache buffer
 through that Worker's `view_tensor` API. The cache bytes remain in place:
@@ -403,27 +403,11 @@ out-of-bounds writes, and overwritten live history. Prefix checkpoints are
 not requested by this helper. Inputs passed as host tensors to a prepared
 Worker must use shared storage allocated before the Worker starts.
 
-`prefill_weights` converts the existing W8A8 decode weights for the upstream
-prefill layout. It packs Q and indexer projections in NZ form, regroups the
-output projection for CP4, combines two vocabulary shards for the prefill LM
-head, and converts each layer's TP8 intermediate slices into EP8 experts.
-The shared expert is separated from the decode bank's final expert slot.
-Convert and upload one layer or rank at a time; prefill and decode weight
-layouts have different storage requirements and cannot be treated as aliases.
-
-After each completed prefill chunk, `prefill_state.capture_prefill_outputs`
-retains the actual layer-40/41/42 target taps from one CP group in a
-128-position history ring. `prefill_bootstrap` publishes that ring on owner 0
-and the first sampled token, committed anchor, remaining output budget and
-epoch on all eight ranks. `prefill_bootstrap_metadata` builds the drafter's
-absolute-anchor metadata banks using its own page tables and RoPE inputs.
-The caller initializes the drafter cache and supplies the actual sampling,
-grammar, allocation and request-lifetime inputs. A failed or incomplete
-prefill must not be admitted as a ready decode request.
-
-These helpers do not by themselves constitute a serving runner or a
-performance result. Full prefill-to-decode validation and request latency
-remain separate from the shared-buffer and weight-layout checks.
+`prefill_fwd.prepare_prefill_bindings` combines the caller's prefill-format
+weights, input metadata and scratch with the cache views. `submit_prefill`
+orders the bindings using the actual generated parameter metadata and waits
+for the chunk to complete. The caller supplies the original prefill sampling,
+grammar, allocation and request-lifetime inputs, and consumes its outputs.
 
 
 This deployment retains five draft tokens and six target verification rows.

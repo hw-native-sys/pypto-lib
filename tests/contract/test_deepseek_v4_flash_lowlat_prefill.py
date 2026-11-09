@@ -13,26 +13,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from models.deepseek_v4_flash_lowlat.prefill_bootstrap_metadata import build_drafter_metadata_banks
-from models.deepseek_v4_flash_lowlat.prefill_bootstrap import prepare_bootstrap
 from models.deepseek_v4_flash_lowlat.prefill_cache import (
     CACHE_LAYOUTS, initialize_cache_pages, prefill_block_tables, prefill_cache_views,
 )
+from models.deepseek_v4_flash_lowlat.prefill_fwd import prefill_arguments
 from models.deepseek_v4_flash_lowlat.prefill_metadata import (
     prefill_tap_positions, prepare_prefill_hidden, prepare_prefill_metadata,
 )
-from models.deepseek_v4_flash_lowlat.prefill_state import update_prefill_tail
-from models.deepseek_v4_flash_lowlat.prefill_weights import (
-    attention_layer_weights, lm_head_weight, moe_layer_weights, prompt_embeddings,
-)
-
-
-def _unpack_nz(value):
-    rows, columns = value.shape[-2:]
-    c0 = 32 // value.element_size()
-    blocked = value.reshape(-1, columns // c0, rows // 16, 16, c0)
-    return blocked.permute(0, 2, 3, 1, 4).contiguous().reshape(value.shape)
-
 
 def _tables():
     counts = {
@@ -98,6 +85,7 @@ def test_prefill_metadata_matches_page_geometry_and_padding():
                                     max_logit_rows=128, terminal=True)
     assert meta["query_start_loc"][0].tolist() == [0, 5]
     assert meta["input_ids"][:4].tolist() == [[3, 9], [2, 5], [7, 0], [0, 0]]
+    assert prefill_tap_positions(125, 5).tolist() == [[125, 126], [127, 128], [129, -1], [-1, -1]]
     assert meta["ori_slot_mapping_full"][0].tolist() == [125, 126, 127, 128, 129, -1, -1, -1]
     assert meta["hca_cmp_slot_mapping_full"][0].tolist() == [-1, -1, 0, -1, -1, -1, -1, -1]
     assert meta["csa_cmp_slot_mapping_full"][0].tolist() == [-1, -1, 31, -1, -1, -1, -1, -1]
@@ -122,65 +110,10 @@ def test_prefill_metadata_matches_page_geometry_and_padding():
                                  max_logit_rows=128, terminal=True)
 
 
-def test_prefill_tail_and_first_decode_state_across_ring_wrap():
-    history = torch.zeros((128, 12288), dtype=torch.bfloat16)
-    positions = torch.full((128,), -1, dtype=torch.int64)
-    for start, count in ((0, 130), (130, 7)):
-        local_positions = prefill_tap_positions(start, count)
-        features = local_positions.clamp(min=0).to(torch.bfloat16).unsqueeze(-1).expand(-1, -1, 12288)
-        update_prefill_tail(history, positions, features, local_positions)
-    ring, state = prepare_bootstrap(history, positions, prompt_length=137, first_token=42,
-                                    max_new_tokens=2048, epoch=9)
-    assert torch.equal(state, torch.tensor([[9, 136, 2047, 42]]).expand(8, 4))
-    assert positions[136 % 128] == 136 and ring[136 % 128, 0] == 136
-    assert not bool(ring[128:].any())
-    positions[9] = -1
-    with pytest.raises(ValueError, match="last prompt positions"):
-        prepare_bootstrap(history, positions, prompt_length=137, first_token=42, max_new_tokens=2048, epoch=9)
-
-
-def test_attention_and_lm_head_weight_conversion():
-    wqa = torch.arange(32 * 16).reshape(32, 16).bfloat16()
-    wqb = torch.arange(16 * 32).reshape(16, 32).to(torch.int8)
-    woa = torch.arange(8 * 16 * 16).reshape(8, 16, 16).bfloat16()
-    wob = torch.arange(32 * 8 * 16).reshape(32, 8 * 16).to(torch.int8)
-    out = attention_layer_weights(wq_a=wqa, wq_b=wqb, wo_a=woa, wo_b=wob, rank=5)
-    assert torch.equal(_unpack_nz(out["wq_a"]), wqa)
-    assert torch.equal(_unpack_nz(out["wq_b"]), wqb)
-    assert torch.equal(out["wo_a"], woa[2:4])
-    assert torch.equal(out["wo_b"], wob.reshape(32, 8, 16).permute(1, 0, 2)[2:4])
-    shards = [torch.full((16, 16), rank, dtype=torch.bfloat16) for rank in range(8)]
-    assert torch.equal(_unpack_nz(lm_head_weight(shards, 6)), torch.cat(shards[4:6]))
-    embedded = prompt_embeddings(torch.tensor([0, 17, 127], dtype=torch.int64), shards)
-    assert embedded[:, 0].tolist() == [0, 1, 7]
-
-
-def test_tp_expert_weights_become_ep_and_shared_weights():
-    shards = []
-    for rank in range(8):
-        shards.append({
-            "routed_w1": torch.full((9, 16, 32), rank + 1, dtype=torch.int8),
-            "routed_w3": torch.full((9, 16, 32), rank + 11, dtype=torch.int8),
-            "routed_w2": torch.full((9, 32, 16), rank + 21, dtype=torch.int8),
-            "routed_w1_scale": torch.full((9, 16), rank + 0.5),
-            "routed_w3_scale": torch.full((9, 16), rank + 1.5),
-            "routed_w2_scale": torch.arange(9 * 32, dtype=torch.float32).reshape(9, 32),
-        })
-    out = moe_layer_weights(shards, 3)
-    assert torch.equal(_unpack_nz(out["routed_w1"]), torch.cat([s["routed_w1"][3:4] for s in shards], dim=1))
-    assert torch.equal(_unpack_nz(out["shared_w2"]), torch.cat([s["routed_w2"][-1] for s in shards], dim=1))
-    assert torch.equal(out["routed_w2_scale"], shards[0]["routed_w2_scale"][3:4])
-    shards[7]["routed_w2_scale"][3, 0] += 1
-    with pytest.raises(ValueError, match="scales differ"):
-        moe_layer_weights(shards, 3)
-
-
-def test_drafter_banks_use_absolute_anchor_and_physical_pages():
-    tables = torch.arange(32768, dtype=torch.int32).reshape(1, 1, 1, -1).expand(4, 3, 1, -1).contiguous()
-    rope = torch.arange(40 * 64, dtype=torch.float32).reshape(40, 64).bfloat16()
-    banks = build_drafter_metadata_banks(tables, rope, -rope, max_anchor=10)
-    assert banks["context_group_position_ids_bank"].shape == (4, 11, 512)
-    assert banks["context_group_position_ids_bank"][0, 10, :12].tolist() == list(range(11)) + [-1]
-    assert banks["context_group_slot_mapping_bank"][0, 10, 0, :11].tolist() == list(range(11))
-    assert banks["query_group_position_ids_bank"][0, 10, :5].tolist() == [11, 12, 13, 14, 15]
-    assert torch.equal(banks["query_freqs_cos_bank"][0, 10, 0], rope[11])
+def test_prefill_arguments_follow_the_generated_metadata():
+    weights = object()
+    prompt = object()
+    metadata = {"params": [{"name": "prompt__ssa_v0"}, {"name": "weights__ssa_v0"}]}
+    assert prefill_arguments(metadata, {"weights": weights, "prompt": prompt}) == (prompt, weights)
+    with pytest.raises(ValueError, match="Missing prefill arguments"):
+        prefill_arguments(metadata, {"prompt": prompt})
