@@ -83,6 +83,9 @@ from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_ro
 from utils import paged_slots, window_metadata
 from engram import ENGRAM_K, KV_OUT, HostEngram, engram_from_rows
 from lm_head import MAX_LOGIT_ROWS, lm_head, greedy_sample
+from gate import gather_routing_bias
+
+BIAS_DYN = pl.dynamic("PREFILL_FORWARD_BIAS_DYN")
 from prefill_moe import AUX_WIDTH, ROUTE_WIDTH, clear_moe_signals
 from prefill_moe import prefill_moe_slabs
 from compressor import STATE_WIDTH
@@ -493,7 +496,7 @@ def l2_prefill_fwd(
     hc_ffn_base: pl.Tensor[[N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[N_LAYERS * D], pl.BF16],
     gate_weight: pl.Tensor[[N_LAYERS * N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_LAYERS * N_EXPERTS], pl.FP32],
+    correction_bias: pl.Tensor[[BIAS_DYN], pl.FP32],
     routed_w1: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
     routed_w2: pl.Tensor[[N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
@@ -554,6 +557,7 @@ def l2_prefill_fwd(
     rank: pl.Scalar[pl.INT32],
 ):
     """Run both CED stages and retire communication signals after the decoder."""
+    correction_bias.bind_dynamic(0, BIAS_DYN)
     compressed_cache.bind_dynamic(1, PAGES)
     state_cache.bind_dynamic(1, STATE_BLOCKS_DYN)
     state_block_table.bind_dynamic(0, B_DYN)
@@ -731,7 +735,17 @@ def l2_prefill_fwd(
         layer_index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(index_wq_b_scale, [Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], [index_source * (Q_LORA // MX_GROUP), 0])
         layer_index_weights: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ] = index_weights_proj[index_source]
         layer_gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16] = pl.slice(gate_weight, [N_EXPERTS, D], [layer * N_EXPERTS, 0])
-        layer_gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32] = pl.slice(correction_bias, [N_EXPERTS], [layer * N_EXPERTS])
+        bias_rows = pl.tensor.dim(correction_bias, 0) // (N_LAYERS * N_EXPERTS)
+        bias_length = bias_rows * N_EXPERTS
+        source_bias = pl.slice(correction_bias, [bias_length], [layer * bias_length])
+        stage_gate_bias = pl.create_tensor([bias_length], dtype=pl.FP32)
+        if stage == 0:
+            gather_routing_bias(source_bias, identity_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS)
+        else:
+            gather_routing_bias(source_bias, replay_rows, stage_gate_bias, moe_ready, n_experts=N_EXPERTS)
+        local_bias_rows = pl.min(bias_rows, LOCAL_CAPACITY)
+        layer_gate_bias = pl.create_tensor([local_bias_rows * N_EXPERTS], dtype=pl.FP32)
+        gather_routing_bias(stage_gate_bias, q_rows[stage], layer_gate_bias, moe_ready, n_experts=N_EXPERTS)
         layer_routed_w1: pl.Tensor[[LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w1, [LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
         layer_routed_w1_scale: pl.Tensor[[LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(routed_w1_scale, [LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], [layer * (LOCAL_EXPERTS * (D // MX_GROUP)), 0])
         layer_routed_w2: pl.Tensor[[LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8] = pl.slice(routed_w2, [LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], [layer * LOCAL_EXPERTS, 0, 0])
@@ -765,6 +779,7 @@ def l2_prefill_fwd(
                 engram_from_rows(
                     engram_lookup[engram_slot], engram_wkv[engram_slot], layer_engram_scale,
                     engram_weight[engram_slot], hidden, hidden,
+                    mask_zero_rows=True,
                 )
         with pl.scope():
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
@@ -940,7 +955,7 @@ def l3_prefill_fwd(
     hc_ffn_base: pl.Tensor[[RANKS, N_LAYERS * MIX_HC], pl.FP32],
     ffn_norm_weight: pl.Tensor[[RANKS, N_LAYERS * D], pl.BF16],
     gate_weight: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[RANKS, N_LAYERS * N_EXPERTS], pl.FP32],
+    correction_bias: pl.Tensor[[RANKS, BIAS_DYN], pl.FP32],
     routed_w1: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
     routed_w1_scale: pl.Tensor[[RANKS, N_LAYERS * (LOCAL_EXPERTS * (D // MX_GROUP)), MOE_INTER], pl.FP8E8M0],
     routed_w2: pl.Tensor[[RANKS, N_LAYERS * LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
@@ -1030,8 +1045,13 @@ def l3_prefill_fwd(
     reset_persistent_windows=False; signals are retired at forward completion.
     After request completion, release pages and reset the request slot in all C2A sources before
     assigning them to another request; failed calls require cache restoration
-    or reset before retry. Engram consumes host lookup rows; vision and DSpark have no inputs here.
+    or reset before retry. Engram consumes host lookup rows, with zero rows
+    suppressing its update. correction_bias accepts the text layout
+    [RANKS, N_LAYERS * N_EXPERTS] or flattened per-token biases
+    [RANKS, N_LAYERS * CAPACITY * N_EXPERTS] in encoder input-row order.
+    Decoder replay and slab ownership gather the corresponding token bias.
     """
+    correction_bias.bind_dynamic(1, BIAS_DYN)
     freqs_cos.bind_dynamic(2, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, ROPE_ROWS_DYN)
     compressed_cache.bind_dynamic(2, PAGES)
@@ -1203,8 +1223,9 @@ _DTYPES = {
 class PrefillCheckpoint:
     """Read requested original checkpoint tensors and selected embedding rows."""
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, weights_root: str | Path | None = None):
         self.root = Path(root).resolve()
+        self.weights_root = self.root if weights_root is None else Path(weights_root).resolve()
         config = json.loads((self.root / "config.json").read_text())
         text = config["text_config"]
         quant = config.get("quantization_config", {})
@@ -1237,8 +1258,8 @@ class PrefillCheckpoint:
     def tensor(self, name: str) -> torch.Tensor:
         """Return an owned CPU tensor without loading the rest of its shard."""
         shard = self.weight_map[name]
-        path = (self.root / shard).resolve()
-        if not path.is_relative_to(self.root):
+        path = (self.weights_root / shard).resolve()
+        if not path.is_relative_to(self.weights_root):
             raise ValueError(f"checkpoint shard leaves its root: {shard}")
         with path.open("rb") as file:
             header_size = struct.unpack("<Q", file.read(8))[0]
@@ -1265,8 +1286,8 @@ class PrefillCheckpoint:
             raise ValueError("table row ids must have an integer dtype")
         ids = rows.to(dtype=torch.int64, device="cpu").flatten()
         shard = self.weight_map[name]
-        path = (self.root / shard).resolve()
-        if not path.is_relative_to(self.root):
+        path = (self.weights_root / shard).resolve()
+        if not path.is_relative_to(self.weights_root):
             raise ValueError(f"checkpoint shard leaves its root: {shard}")
         with path.open("rb") as file:
             header_size = struct.unpack("<Q", file.read(8))[0]
@@ -1695,6 +1716,8 @@ def prepare_resident_inputs(
     rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
     engram: HostEngram,
     request_id: int = 0,
+    token_mask: torch.Tensor | None = None,
+    image_spans: Sequence[tuple[int, torch.Tensor]] = (),
 ) -> dict[str, torch.Tensor]:
     """Prepare packed embeddings and Engram histories for one DP group.
 
@@ -1713,6 +1736,25 @@ def prepare_resident_inputs(
         raise ValueError("token id is outside the checkpoint vocabulary")
     ids = ids.long()
     embedding = weights.lookup_rows(ids)
+    if token_mask is not None:
+        token_mask = torch.as_tensor(token_mask, device="cpu")
+        if token_mask.dtype != torch.bool or token_mask.shape != ids.shape:
+            raise ValueError("Engram token_mask must be a boolean vector matching token IDs")
+    if image_spans:
+        if query_lens is not None or not isinstance(start_pos, Integral):
+            raise ValueError("image spans require one request and an absolute start position")
+        token_mask = torch.ones(count, dtype=torch.bool) if token_mask is None else token_mask.clone()
+        previous_end = 0
+        for position, span in image_spans:
+            if (position < previous_end or span.ndim != 2 or span.shape[1] != D
+                    or span.dtype != torch.bfloat16 or span.device.type != "cpu"):
+                raise ValueError("image spans must be ordered CPU BF16 matrices with the model hidden width")
+            end = position + len(span)
+            begin, limit = max(start_pos, position), min(start_pos + count, end)
+            if begin < limit:
+                embedding[begin - start_pos:limit - start_pos] = span[begin - position:limit - position]
+                token_mask[begin - start_pos:limit - start_pos] = False
+            previous_end = end
 
     values = prepare_prefill_inputs(
         embedding, capacity, start_pos=start_pos, query_lens=query_lens, request_capacity=request_capacity,
@@ -1725,7 +1767,9 @@ def prepare_resident_inputs(
     for request, (length, prefix) in enumerate(zip(lengths, starts)):
         if length:
             history_key = request_id if query_lens is None else (request_id, request)
-            rows = engram.lookup(ids[offset:offset + length], length, prefix, request_id=history_key)
+            mask = None if token_mask is None else token_mask[offset:offset + length]
+            rows = engram.lookup(ids[offset:offset + length], length, prefix,
+                                 request_id=history_key, token_mask=mask)
             values["engram_lookup"][:, offset:offset + length] = rows
         offset += length
     return values
@@ -1812,7 +1856,8 @@ def prepare_decode_inputs(values):
     return result
 
 
-def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk_size=None, decode_compiled=None):
+def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk_size=None, decode_compiled=None,
+             prompt_token_ids=None, image_spans=None, ring_heap=RING_HEAP_BYTES):
     """Generate one independent continuation per rank using resident checkpoint weights.
 
     Prefill and subsequent one-token calls retain native device caches. Only
@@ -1830,7 +1875,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     # Validate the host-row Engram ABI and compilation shapes.
     parameters = compiled._get_metadata()[0]
     if (len(parameters) != len(PREFILL_TENSORS)
-            or parameters[0].shape != [RANKS, CAPACITY, D]):
+            or tuple(parameters[0].shape) != (RANKS, CAPACITY, D)):
         raise ValueError("--runtime-dir must contain prefill compiled for the same EP and capacity with host Engram rows")
     decode_names = []
     if decode_compiled is not None:
@@ -1840,7 +1885,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             raise ValueError("decode artifact must use the host-row Engram ABI")
         decode_shape = decode_parameters[0].shape
         decode_rows = DECODE_INPUT_MAX_TOKENS
-        if (decode_shape[:2] != [RANKS, 2] or decode_shape[2] not in (-1, decode_rows)
+        if (tuple(decode_shape[:2]) != (RANKS, 2) or decode_shape[2] not in (-1, decode_rows)
                 or decode_shape[3] != ENGRAM_K):
             raise ValueError("decode artifact must match EP and the configured decode capacity")
     if len(device_ids) != RANKS or len(set(device_ids)) != RANKS or len(prompts) != RANKS:
@@ -1854,13 +1899,25 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         raise ValueError("checkpoint is missing the official prompt encoder")
     encoding = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(encoding)
-    sequences = [
+    sequences = prompt_token_ids if prompt_token_ids is not None else [
         tokenizer.encode(
             encoding.encode_messages([{"role": "user", "content": prompt}], thinking_mode="chat"),
             add_special_tokens=False,
         ).ids
         for prompt in prompts
     ]
+    if prompt_token_ids is not None:
+        if len(prompt_token_ids) != RANKS:
+            raise ValueError("provide one encoded token sequence per rank")
+        sequences = [list(ids) for ids in prompt_token_ids]
+    image_spans = [[] for _ in device_ids] if image_spans is None else image_spans
+    if len(image_spans) != RANKS:
+        raise ValueError("provide one image span list per rank")
+    multimodal = any(image_spans)
+    text_bias = vision_bias = None
+    if multimodal:
+        text_bias = torch.stack([checkpoint.tensor(f"layers.{layer}.ffn.gate.bias") for layer in range(N_LAYERS)])
+        vision_bias = torch.stack([checkpoint.tensor(f"layers.{layer}.ffn.gate.bias_vl") for layer in range(N_LAYERS)])
     chunk_size = CAPACITY if chunk_size is None else chunk_size
     if not 1 <= chunk_size <= CAPACITY:
         raise ValueError("chunk_size must fit CAPACITY and be at most 4096")
@@ -1875,7 +1932,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     weights = ResidentPrefillWeights(checkpoint, ep_size=RANKS)
     engram = HostEngram(checkpoint, tokenizer)
     config = RunConfig(
-        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, ring_heap=RING_HEAP_BYTES,
+        backend_type=BackendType.Ascend950, execution_mode=ExecutionMode.ONBOARD, ring_heap=ring_heap,
         distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
     )
     outputs = {
@@ -1894,6 +1951,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
     constants.update(("freqs_cos", "freqs_sin"))
     generated = [[] for _ in prompts]
     finished = [False] * RANKS
+    image_rows_seen = [0] * RANKS
     # Host control tensors must be shared and registered before the chip-worker fork.
     decode_counts = {
         name: torch.zeros(RANKS, dtype=torch.int32).share_memory_()
@@ -1915,12 +1973,15 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
             inputs = prepare_resident_inputs(
                 weights, sequences[rank][:chunk_size], CAPACITY,
                 max_seq_len=max_seq_len, rope_tables=rope_tables,
-                engram=engram, request_id=rank,
+                engram=engram, request_id=rank, image_spans=image_spans[rank],
             )
             rope_tables = inputs["freqs_cos"], inputs["freqs_sin"]
             host_cache.append({name: inputs[name] for name in cache_names})
             for name in PREFILL_TENSORS:
-                if name in weights.tensor_layouts:
+                if name == "correction_bias" and multimodal:
+                    shape = (N_LAYERS * CAPACITY * N_EXPERTS,)
+                    tensors[name] = runtime.alloc_tensor(shape, torch.float32, worker_id=rank)
+                elif name in weights.tensor_layouts:
                     shape, dtype = weights.tensor_layouts[name]
                     tensors[name] = runtime.alloc_tensor(shape, dtype, worker_id=rank)
                 elif name in outputs:
@@ -1967,6 +2028,9 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                         source = per_rank[rank][DECODE_CACHE_NAMES[name]]
                         tensors[name] = DeviceTensor(source.data_ptr, cache_views[name].shape, source.dtype,
                                                      buffer=source.buffer)
+                    elif name == "correction_bias" and multimodal:
+                        bias = text_bias.flatten().contiguous()
+                        tensors[name] = runtime.alloc_tensor(bias.shape, bias.dtype, init=bias, worker_id=rank)
                     elif name == "dspark_target_hidden":
                         tensors[name] = runtime.alloc_tensor(
                             (decode_rows, DSPARK_MAIN_IN), torch.bfloat16, worker_id=rank,
@@ -1996,8 +2060,22 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
                     weights, token_ids, capacity,
                     start_pos=committed[rank], max_seq_len=max_seq_len,
                     cache_state=host_cache[rank], rope_tables=rope_tables,
-                    engram=engram, request_id=rank,
+                    engram=engram, request_id=rank, image_spans=() if decode else image_spans[rank],
                 )
+                if multimodal and not decode:
+                    from gate import prepare_routing_bias
+
+                    mask = torch.zeros(len(token_ids), dtype=torch.bool)
+                    for position, span in image_spans[rank]:
+                        begin = max(committed[rank], position)
+                        end = min(committed[rank] + len(token_ids), position + len(span))
+                        if begin < end:
+                            mask[begin - committed[rank]:end - committed[rank]] = True
+                    bias = prepare_routing_bias(text_bias.float(), vision_bias.float(), mask, capacity)
+                    runtime.copy_to(tensors["correction_bias"].data_ptr, bias.data_ptr(), bias.numel() * 4,
+                                    worker_id=rank)
+                    print("VISION_PREFILL_ROWS", rank, committed[rank], len(token_ids), int(mask.sum()), flush=True)
+                    image_rows_seen[rank] += int(mask.sum())
                 if decode:
                     runtime.copy_to(
                         per_rank[rank]["logit_rows"].data_ptr, inputs["logit_rows"].data_ptr(),
@@ -2060,6 +2138,7 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
         "full_prefix_recomputation": False, "engram_enabled": True, "engram_lookup_device": "host",
         "continuation_forward": "decode_fwd" if decode_compiled is not None else "prefill_fwd",
         "shared_resident_weights": decode_compiled is not None,
+        "image_rows_injected": image_rows_seen,
         "layers_per_forward": 40, "l2_invocations_per_rank_per_forward": 1,
         "seconds": time.monotonic() - start,
         "cases": [
