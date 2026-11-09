@@ -27,9 +27,12 @@ SEQ_LEN = 3584  # 7 * 512 — page & stack clean
 MAX_BLOCKS = SEQ_LEN // BLOCK_SIZE  # 28
 NUM_BLOCKS = BATCH * MAX_BLOCKS  # 448
 NUM_TASKS = BATCH * NUM_KV_HEADS  # 128
-ATTN_SPMD_BLOCKS = 24  # static upper bound only (sizes TRANSFER_ROWS); the
-# launch width itself is the run's cluster count — see the note in
-# paged_attention_pypto_swpipe below.
+# Static platform cap (PLATFORM_MAX_BLOCKDIM): the largest SPMD width any
+# supported die may report via pl.system.available_cluster_count(). This only
+# sizes the transfer buffer (TRANSFER_ROWS) — it is never a launch width; the
+# swpipe launch itself uses the run's cluster count (see the note in
+# paged_attention_pypto_swpipe).
+TRANSFER_BUFFER_BLOCK_CAP = 24
 PRE_LAUNCH = 2
 TRANSFER_SLOTS = PRE_LAUNCH + 1
 FFTS_WORKSPACE_ELEMENTS = 256
@@ -39,7 +42,7 @@ PV_READY_EVENT = 2
 ROW_TILE = 16
 AIV_ROW_TILE = 8
 AIV_LANE0_ROWS = 2
-TRANSFER_ROWS = ATTN_SPMD_BLOCKS * TRANSFER_SLOTS * ROW_TILE
+TRANSFER_ROWS = TRANSFER_BUFFER_BLOCK_CAP * TRANSFER_SLOTS * ROW_TILE
 SCALE = 1.0 / math.sqrt(HEAD_DIM)
 KCACHE_ROWS = NUM_BLOCKS * BLOCK_SIZE
 HALF_DIM = HEAD_DIM // 2
@@ -104,8 +107,9 @@ def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention AP
     # >=24-cluster dies (the CI pool). On this host's 910B3 (20 clusters/die)
     # the AICPU runtime aborted the decode dispatch with rc=-7 (507018,
     # "require_sync_start block_num=24 > limit=20 (deadlock guaranteed)")).
-    # TRANSFER_ROWS stays sized from the static ATTN_SPMD_BLOCKS=24 cap, so a
-    # smaller runtime width merely leaves the tail rows unused.
+    # TRANSFER_ROWS stays sized from the static TRANSFER_BUFFER_BLOCK_CAP=24
+    # platform cap, so a smaller runtime width merely leaves the tail rows
+    # unused.
     attn_blocks = pl.system.available_cluster_count()
     active_batch = pl.tensor.dim(seq_lens, 0)
     num_tasks = active_batch * NUM_KV_HEADS

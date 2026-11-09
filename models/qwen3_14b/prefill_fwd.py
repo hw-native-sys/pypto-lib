@@ -110,17 +110,18 @@ ATTN_GI_STAT_ROWS = ATTN_TOK_GROUP * ATTN_GI_GROUP * Q_HEAD_BATCH_PAD
 ATTN_PHASE_MICRO_GROUPS = (FINALIZE_TOK_GROUP + ATTN_TOK_GROUP - 1) // ATTN_TOK_GROUP
 ATTN_GI_BLOCKS = (TOTAL_Q_GROUPS + ATTN_GI_GROUP - 1) // ATTN_GI_GROUP
 ATTN_PHASE_WORK_ITEMS = ATTN_PHASE_MICRO_GROUPS * ATTN_GI_BLOCKS
-# Launch width for both sync-start attention phases. Both carry a hard MIX
-# syncall (pl.system.syncall / qwen_fai_syncall_mix), which needs full
-# occupancy + sync_start; the HardSyncallOccupancyValid verifier therefore
-# requires the width to equal the run's cluster count. The upstream literal 24
-# only holds on >=24-cluster dies (the CI pool); on this host's 910B3 (20
-# clusters/die) the AICPU runtime rejected the first prefill with rc=-7
-# (507018, "require_sync_start block_num=24 > limit=20 (deadlock
-# guaranteed)")). The two kernels below pass pl.system.available_cluster_count()
-# instead — the run's own geometry (20 here, 24 on the CI pool), the portable
-# spelling the verifier prescribes.
-ATTN_PHASE_SPMD_BLOCKS = 20
+# Hard-syncall launch-width rule (applies to both sync-start attention phases
+# below). Both kernels carry a hard MIX syncall (pl.system.syncall /
+# qwen_fai_syncall_mix), which needs full occupancy + sync_start, and every
+# literal spelling is unportable somewhere: 24 only holds on >=24-cluster dies
+# (the CI pool) — on this host's 910B3 (20 clusters/die) the AICPU runtime
+# rejected the first prefill with rc=-7 (507018, "require_sync_start
+# block_num=24 > limit=20 (deadlock guaranteed)") — while 20 fails the
+# HardSyncallOccupancyValid verifier on every target (partial occupancy vs the
+# static SoC count of 24). Both launches therefore pass
+# pl.system.available_cluster_count(): the run's own geometry (20 here, 24 on
+# the CI pool), the portable spelling the verifier prescribes. Launch widths
+# live only at those call sites; no module constant stores one.
 ATTN_PHASE_SCORE_ROWS = ATTN_PHASE_WORK_ITEMS * ATTN_GI_SCORE_ROWS
 ATTN_PHASE_STAT_ROWS = ATTN_PHASE_WORK_ITEMS * ATTN_GI_STAT_ROWS
 ATTN_PHASE_ACC_SCORE_ROWS = ATTN_PHASE_MICRO_GROUPS * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_PAD
@@ -218,7 +219,7 @@ def _attention_phase_window(
     k_cache_bsnd = pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])
     v_cache_bsnd = pl.reshape(v_cache, [cache_token_rows, KV_HIDDEN])
     # Hard-syncall launch width: this run's cluster count, not a baked literal
-    # (see the ATTN_PHASE_SPMD_BLOCKS note at the top of this file).
+    # (see the launch-width rule at the top of this file).
     attn_phase_blocks = pl.system.available_cluster_count()
     cur_mi_phase = pl.create_tensor([ATTN_PHASE_ACC_STAT_ROWS, 1], dtype=pl.FP32)
     if finalize_tok > 0:
@@ -569,7 +570,7 @@ def _attention_phase_window_full_single_block(
     k_cache_bsnd = pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])
     v_cache_bsnd = pl.reshape(v_cache, [cache_token_rows, KV_HIDDEN])
     # Hard-syncall launch width: this run's cluster count, not a baked literal
-    # (see the ATTN_PHASE_SPMD_BLOCKS note at the top of this file).
+    # (see the launch-width rule at the top of this file).
     attn_phase_blocks = pl.system.available_cluster_count()
     with pl.spmd(
         attn_phase_blocks,
