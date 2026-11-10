@@ -117,6 +117,7 @@ def initialize_cache_pages(worker, name, root, pages_by_rank):
 
     The caller supplies pages exclusively owned by this request. Shared prefix
     pages and retained pages from a previous prefill chunk must not be listed.
+    The distributed Worker's copy_to stages non-inherited CPU buffers.
     """
     if name not in CACHE_LAYOUTS:
         raise ValueError(f"Unknown cache family: {name}")
@@ -289,6 +290,20 @@ def prefill_slot_mappings(positions, decode_tables, caches, *, block_counts=None
         start, end = int(valid_positions[0]), int(valid_positions[-1]) + 1
         if not torch.equal(valid_positions, torch.arange(start, end, device=positions.device)):
             raise ValueError("Prefill positions must be consecutive and followed by padding")
+        # A later chunk can read the preceding 128 HCA projections. Check both
+        # the incoming history and the history retained after each 512-row tile.
+        # The caller must also keep their logical-to-physical mapping unchanged
+        # between chunks; uniqueness alone cannot establish the stored values.
+        boundaries = list(range(start, end, 512)) + [end]
+        for boundary in boundaries:
+            history = torch.arange(max(0, boundary - 128), boundary, dtype=torch.int64, device=positions.device)
+            history = history.unsqueeze(0).expand(RANKS, -1)
+            physical = _physical_rows(decode_tables["hca_compress_state_block_table"], history, 8, 8,
+                                      counts=counts.get("hca_compress_state_block_table"))
+            _check_rows("HCA history", physical, caches["hca_compress_state"], "hca_compress_state")
+            for rank in range(RANKS):
+                if physical.shape[1] != torch.unique(physical[rank]).numel():
+                    raise ValueError(f"HCA history aliases live rows on rank {rank}")
         old_start = max(0, start - 127)
         window = torch.arange(old_start, end, dtype=torch.int64, device=positions.device)
         window = window.unsqueeze(0).expand(RANKS, -1)

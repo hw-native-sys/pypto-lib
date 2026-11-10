@@ -198,3 +198,22 @@ def test_hca_state_ring_covers_the_entire_parallel_publication():
     counts[:, :, 4] = 17
     mapping = prefill_slot_mappings(long_positions, tables, _cache_metadata(), block_counts=counts)
     assert torch.unique(mapping["hca_state_slot_mapping_full"][0, -136:]).numel() == 136
+
+
+def test_hca_state_ring_preserves_history_across_chunks():
+    tables = _tables()
+    counts = torch.tensor([2, 2, 2, 2, 1, 2, 2], dtype=torch.int32).view(1, 1, 7).repeat(8, 1, 1)
+    first = torch.arange(0, 8, dtype=torch.int64).repeat(8, 1)
+    second = torch.arange(8, 16, dtype=torch.int64).repeat(8, 1)
+    prefill_slot_mappings(first, tables, _cache_metadata(), block_counts=counts)
+    with pytest.raises(ValueError, match="HCA history"):
+        prefill_slot_mappings(second, tables, _cache_metadata(), block_counts=counts)
+
+    counts[:, :, 4] = 16
+    for start in (0, 8, 120, 128, 136):
+        positions = torch.arange(start, start + 8, dtype=torch.int64).repeat(8, 1)
+        prefill_slot_mappings(positions, tables, _cache_metadata(), block_counts=counts)
+
+    tables["hca_compress_state_block_table"][3, 0, 1] = 0
+    with pytest.raises(ValueError, match="HCA history"):
+        prefill_slot_mappings(second, tables, _cache_metadata(), block_counts=counts)

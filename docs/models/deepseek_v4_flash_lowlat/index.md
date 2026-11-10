@@ -401,12 +401,19 @@ Physical page IDs may differ between ranks; each rank's table is converted
 against its own cache allocation. Pass the existing `block_counts` when the
 compressor tables use the decode ring layout.
 The caller must provide enough non-aliased cache pages for the whole chunk and
-the preceding sliding window. The metadata helper rejects missing pages,
-out-of-bounds writes, and overwritten live history. The HCA state must also
+the preceding sliding window, and preserve the page mappings and stored values
+of live history across chunks. The metadata helper rejects missing pages,
+out-of-bounds writes, and aliased HCA history. The HCA state must also
 provide distinct rows for the kernel's 128-row history plus one DSpark decode
 transaction when a prefill tile publishes that many rows. Prefix checkpoints
-are not requested by this helper. Inputs passed as host tensors to a prepared
-Worker must use shared storage allocated before the Worker starts.
+are not requested by this helper. Host tensors passed directly to a prepared
+Worker submission must use shared storage allocated before the Worker starts.
+For cache initialization, the distributed Worker's `copy_to` stages
+non-inherited CPU buffers.
+
+For single-machine prefill and decode, the caller uses the same rank-local
+cache allocations and waits for each prefill dispatch before dependent decode
+work. The scheduler and request lifetime remain the serving caller's job.
 
 `prefill_fwd.prepare_prefill_bindings` combines the caller's prefill-format
 weights, input metadata and scratch with the cache views. `submit_prefill`
