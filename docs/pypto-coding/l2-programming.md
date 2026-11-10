@@ -229,31 +229,39 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
 ```
 
 Larger fused regions (RMSNorm + projection + residual) follow the same shape.
-Two knobs belong to this region kind and no other: `pl.split` splits it so the
-units ping-pong on the two halves, and `pl.cross_core_slot` sizes the pipe
-between them (see [`optimizations`](#optimizations) below).
+Explicit `pl.split_aiv` regions and shard/gather boundaries partition the vector
+work. `pl.cross_core_slot` sizes the pipe between the cores (see
+[`optimizations`](#optimizations) below).
 
 ---
 
 ## `optimizations`
 
-`optimizations=[...]` attaches per-region codegen passes to a `pl.at` block
-(or a `pl.spmd` loop — same kwarg). Two entries are in use:
+`optimizations=[...]` configures a `pl.at` or `pl.spmd` region. Use
+`pl.cross_core_slot(slot_num=N)` to size the cross-core pipe. Function-level
+`pl.split(UP_DOWN/LEFT_RIGHT)` no longer implicitly halves mixed kernels.
 
-- **`pl.split(pl.SplitMode...)`** — split the region in half so the cube and
-  vector units ping-pong on the two halves (cube on one half while vec runs
-  the epilogue on the other). It applies **only to a mixed cube + vector
-  region** ([Mixed kernel](#mixed-kernel)); a pure-cube or
-  pure-vector region has nothing to ping-pong.
-  The mode picks the axis:
-  - `pl.SplitMode.NONE` — the default; no split.
-  - `pl.SplitMode.UP_DOWN` — split vertically (rows / height halved).
-  - `pl.SplitMode.LEFT_RIGHT` — split horizontally (cols / width halved).
+Use an explicit AIV region and name every crossing. The body already describes
+one lane's computation; input slices and output offsets are not rewritten.
+`pl.aiv_shard` inherits `mode` from `pl.split_aiv` and has no `mode` argument.
 
-  Reach for it when a region's unified buffer (UB) would otherwise exceed the
-  per-core limit — typically a wide FP32 vector epilogue stacked on a matmul
-  accumulator — since splitting also keeps the accumulator on-chip instead of
-  spilling to a GM scratch round-trip.
+```python
+with pl.at(level=pl.Level.CORE_GROUP):
+    acc = pl.matmul(a, b, out_dtype=pl.FP32)
+    for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+        half = pl.aiv_shard(acc)
+        row = lane * HALF_ROWS
+        out[row:row + HALF_ROWS, :] = pl.add(half, bias[row:row + HALF_ROWS, :])
+```
+
+Use `pl.aic_gather` for a vector result consumed by cube work. `NONE` regions
+retain their full-width explicit crossing and task-parallel behavior. Ordinary
+unsplit mixed kernels retain full-width implicit communication.
+
+The PyPTO compiler change and the lib migrations must be deployed together.
+The Qwen3 TQ draft's projection and gate/up epilogues now use explicit boundaries;
+`tests/test_tq_explicit_epilogues.py` checks their actual lane bodies against torch
+on both compiler backends without requiring model-sized weights or an NPU.
 
 - **`pl.cross_core_slot(slot_num=N)`** — ring depth of the automatic
   cube↔vector pipe. It sizes a channel; it does not partition work. Raising it
@@ -266,11 +274,6 @@ between them (see [`optimizations`](#optimizations) below).
   attribute and warns; write `pl.cross_core_slot(slot_num=N)` in new code.
 
 ```python
-# split form on a mixed region whose FP32 epilogue would blow the UB budget
-for ob in pl.spmd(INTER // INTER_TILE, name_hint="gate_up_silu",
-                  optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
-    ...
-
 # shrink the cube->vector ring so its reserved buffer fits UB
 with pl.at(level=pl.Level.CORE_GROUP, name_hint="indexer",
            optimizations=[pl.cross_core_slot(slot_num=2)]):
