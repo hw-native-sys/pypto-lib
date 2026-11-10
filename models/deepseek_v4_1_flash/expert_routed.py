@@ -84,9 +84,10 @@ MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * M
 
 # PyPTO W13 projection tiling, mirroring kernels/expert_routed_w13.cpp. The
 # extern uses M_TILE/N_TILE/K_TILE = 64/256/256; the PyPTO K tile is halved
-# because pl.cast has no direct packed-FP4 to FP8E4M3 path. The chain is
-# legalized as fp4 -> BF16 -> FP32 -> FP8E4M3, so it holds an FP32 tile four
-# times the width of the FP8 result; at K 128 that peak is 128 KB and fits.
+# because the decode is single-buffered in Vec and its live set is wide: the
+# packed source, the FP16 and INT16 index tiles, the gather scratch and the
+# gathered codes are all alive at once, about 144 KB at K 128. At K 256 that
+# would be ~288 KB against a 192 KB Vec.
 # Every projection must run on a FULL row tile: narrowing an MX_A_ZZ
 # activation-scale load with valid_shape is silently miscompiled. A full tile
 # stays inside the expert's stride only if the tile divides it, so the tile is
@@ -97,6 +98,11 @@ MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * M
 # which MX_A_ZZ needs. Clamping a partial last tile instead would need pl.min,
 # whose result the MX offset prover cannot see through.
 W13_M_TILE = gcd(RECV_MAX, 80)
+# gcd(32k, 80) is 80 or 16 and nothing else, and at 16 the weight panels are
+# decoded five times as often. Assert the good case so a config change that
+# drops to 16 is visible rather than silently slow.
+assert W13_M_TILE % 16 == 0
+assert RECV_MAX % W13_M_TILE == 0
 W13_N_TILE = MX_MM_INTER_TILE
 W13_K_TILE = MX_K_TILE // 2
 W13_N_BLOCKS = MOE_INTER // W13_N_TILE
@@ -106,9 +112,10 @@ W13_SCALE_K = W13_K_TILE // MX_GROUP
 # K slice starting at k therefore collapses to n_block * K + k, where K is the
 # projection's reduction width (D for W1/W3).
 W13_PACKED_EXPERT_ROWS = MX_W1_PACKED_ROWS
-# Route weights are copied in 16-row chunks, matching the granularity the
-# compact row layout already guarantees, so only the final chunk of an expert
-# carries a runtime valid extent.
+# Route weights are copied in 16-row chunks. Every chunk carries a runtime
+# valid extent, so the chunking buys nothing over a single [1, count] row
+# load; the extern does exactly that and issues one contiguous burst where
+# this issues 16 four-byte descriptors per chunk. Worth revisiting.
 # MXFP4 decode lookup table. PyPTO warns that pl.cast from packed FP4 to
 # FP8E4M3FN expands to FP4->BF16->FP32->FP8 and tells you to prefer a LUT
 # gather; this is that gather. The table is indexed by the whole packed BYTE,
@@ -455,10 +462,24 @@ def routed_w13_pypto(
     SwiGLU and W2 stages consume either indistinguishably.
 
     Each work item owns one [W13_M_TILE, W13_N_TILE] output tile and computes
-    both projections for it, so the activation tiles are loaded once for the
-    gate and up halves. The extern instead makes gate and up separate work
-    items; the output tiling and the row-rotated core assignment are the same,
-    so the load balance differs only in granularity.
+    both projections for it, where the extern makes gate and up separate work
+    items. Two caveats, both measured rather than assumed:
+
+    - This does NOT share the activation loads between the two projections.
+      Each call re-issues its own loads and there is no cross-loop CSE pass,
+      so the A payload and A scale are fetched twice per work item.
+    - The owner formula is the extern's, but it is applied to a work-index
+      space half as long over tiles 1.25x taller, so the load balance is
+      materially worse, not merely coarser: for counts (0, 1, 159, 160) the
+      extern's critical path is 4 of 126 items (~1.5% imbalance) against 2 of
+      45 items here (~42%).
+
+    Rows past an expert's count are read -- up to a full tile of its padded,
+    poisoned capacity -- and multiplied, then discarded by the masked store.
+    At deployment shapes, where the average per-expert count is well under
+    the row tile, that is several times the extern's MAC count: the extern
+    narrows the matmul to the valid rows and this cannot, because narrowing
+    the MX_A_ZZ scale load is silently miscompiled.
     """
     with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_pypto", deps=[input_ready]) as ready:
         core = pl.tile.get_block_idx()
