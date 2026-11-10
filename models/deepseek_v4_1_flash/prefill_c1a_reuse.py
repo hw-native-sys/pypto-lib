@@ -107,7 +107,7 @@ def prefill_c1a_reuse_attention(
             wq_b, wq_b_scale,
             rope_cos, rope_sin,
             query_latent, query,
-            num_tokens, qa_worker_limit=24, qb_worker_limit=24,
+            num_tokens, qa_worker_limit=24, qb_worker_limit=32,
             padded_rows=proj_payload_padded_rows,
             qa_row_tile=256, qb_row_tile=128,
         )
