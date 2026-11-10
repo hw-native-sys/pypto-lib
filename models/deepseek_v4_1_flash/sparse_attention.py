@@ -1091,7 +1091,13 @@ def _attend_window_project(
     total_rows = pl.tensor.dim(output, 0)
     attended = pl.create_tensor([total_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     swa_attention_partial(query, window, window_indices, sink, attended, num_tokens, source_ready)
-    output = o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens, worker_limit=32)
+    output = o_proj(
+        attended,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin,
+        output, num_tokens,
+        worker_limit=32, oa_row_tile=80, ob_row_tile=80,
+    )
     return output
 
 
@@ -2293,7 +2299,11 @@ def l2_attend_project(
         sink, attended, num_tokens, source_ready,
     )
     o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, output, num_tokens, worker_limit=32,
+        attended,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin,
+        output, num_tokens,
+        worker_limit=32, oa_row_tile=80, ob_row_tile=80,
     )
     return output
 

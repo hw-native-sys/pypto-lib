@@ -97,7 +97,7 @@ def prefill_c2a_reuse_attention(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x, num_tokens)
+    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x, num_tokens, row_tile=256)
     q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
@@ -106,8 +106,13 @@ def prefill_c2a_reuse_attention(
         qr, query,
         num_tokens, qa_worker_limit=24, qb_worker_limit=24,
         padded_rows=proj_payload_padded_rows,
+        qa_row_tile=256, qb_row_tile=128,
     )
-    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=8)
+    kv_projection = kv_proj(
+        proj_payload, proj_scales,
+        wkv, wkv_scale,
+        kv_projection, num_tokens, worker_limit=8, row_tile=256,
+    )
     window_publish_tid = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache,
@@ -121,7 +126,11 @@ def prefill_c2a_reuse_attention(
         attn_sink, attended, num_tokens, source_ready,
     )
     o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, worker_limit=32,
+        attended,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin,
+        partial, num_tokens,
+        worker_limit=32, oa_row_tile=128, ob_row_tile=256,
     )
     return partial
 
@@ -184,7 +193,7 @@ def prefill_c2a_reuse_sp(
     for hc_norm_block_worker in pl.spmd(hc_norm_block_workers, name_hint="rms_norm"):
         for hc_norm_block in pl.range(hc_norm_block_worker, hc_norm_block_blocks, hc_norm_block_workers):
             rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
-    prefill_sp_input_allgather(
+    attn_input, gathered = prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input,
         group_base, tp_rank, num_tokens, attention_epoch,
     )
@@ -204,7 +213,7 @@ def prefill_c2a_reuse_sp(
         group_base, tp_rank, num_tokens, attention_epoch,
     )
     prefill_sp_post(
-        attn_output, x_hc, post_mix, residual_mix, x_hc_out, next_pre_mix, tp_rank, num_tokens,
+        attn_output, x_hc, post_mix, residual_mix, x_hc_out, next_pre_mix, tp_rank, num_tokens, gathered,
     )
     return x_hc_out
 

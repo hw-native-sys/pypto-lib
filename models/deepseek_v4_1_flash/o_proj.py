@@ -54,7 +54,8 @@ O_OUT_SCALE_COLS = pl.dynamic("O_OUT_SCALE_COLS")
 O_VECTOR_WORKERS = 64
 O_A_N_TILE = 256
 O_B_N_TILE = 160 if LOCAL_O_WIDTH == 8192 else 256
-D_TILE = D
+SP_REDUCE_ROW_TILE = 2
+SP_PUBLISH_ROW_TILE = 16
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_quant_vf.cpp",
@@ -87,6 +88,7 @@ def _o_proj_a(
     output_width: pl.Scalar[pl.INDEX],
     active_rows: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
+    row_tile: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Round the O-A result to BF16 and quantize on the paired Vector cores."""
     return output, output_scale
@@ -101,8 +103,9 @@ def _o_proj_b(
     weight_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     output: pl.Out[pl.Tensor],
     rows: pl.Scalar[pl.INDEX], reduction: pl.Scalar[pl.INDEX],
+    row_tile: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
-    """Project an 80-row group; scales contain MX_A_ZZ and MX_B_NN bytes."""
+    """Project MXFP8 rows with packed MX_A_ZZ and MX_B_NN scales."""
     ...
 
 
@@ -118,10 +121,14 @@ def o_proj(
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     worker_limit: pl.constexpr = 32,
+    oa_row_tile: pl.constexpr = 80,
+    ob_row_tile: pl.constexpr = 80,
 ):
     """Project row groups to BF16; both weights hold NZ bytes in logical [K, N] shapes."""
     total_rows = pl.tensor.dim(output, 0)
-    padded_rows = ((total_rows + 79) // 80) * 80
+    # Native row tiles: OA M80/M128 and OB M80/M256.
+    ob_padded_rows = ((total_rows + ob_row_tile - 1) // ob_row_tile) * ob_row_tile
+    padded_rows = ((ob_padded_rows + oa_row_tile - 1) // oa_row_tile) * oa_row_tile
     payload_all = pl.create_tensor([LOCAL_O_GROUPS * padded_rows, O_GROUP_IN], dtype=pl.FP8E4M3FN)
     scales_all = pl.create_tensor([LOCAL_O_GROUPS, padded_rows * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
     vector_workers = pl.max(1, pl.min(O_VECTOR_WORKERS, 2 * pl.system.available_cluster_count()))
@@ -131,17 +138,17 @@ def o_proj(
         )
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-    oa_tasks = (padded_rows // 80) * (LOCAL_O_WIDTH // O_A_N_TILE)
+    oa_tasks = (padded_rows // oa_row_tile) * (LOCAL_O_WIDTH // O_A_N_TILE)
     oa_workers = pl.max(1, pl.min(oa_tasks, pl.system.available_cluster_count()))
     with pl.spmd(oa_workers, name_hint="proj_o_a_quant"):
         payload, activation_scale = _o_proj_a(
             payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
-            LOCAL_O_WIDTH, num_tokens, padded_rows,
+            LOCAL_O_WIDTH, num_tokens, padded_rows, oa_row_tile,
         )
-    ob_tasks = (padded_rows // 80) * (D // O_B_N_TILE)
+    ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * (D // O_B_N_TILE)
     ob_workers = pl.max(1, pl.min(ob_tasks, worker_limit))
     with pl.spmd(ob_workers, name_hint="proj_o_b"):
-        output = _o_proj_b(payload, wo_b, activation_scale, wo_b_scale, output, total_rows, LOCAL_O_WIDTH)
+        output = _o_proj_b(payload, wo_b, activation_scale, wo_b_scale, output, total_rows, LOCAL_O_WIDTH, ob_row_tile)
     return output
 
 
@@ -228,7 +235,7 @@ def prefill_sp_output_reduce_scatter(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    """Sum BF16 head-TP contributions in FP32 for this rank's token rows."""
+    """Push contributions into source-rank receive slots and sum locally in FP32."""
     local_tokens = pl.tensor.dim(output, 0)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_reuse", allow_early_resolve=False) as reuse_tid:
         for peer in pl.range(TP_SIZE):
@@ -238,9 +245,21 @@ def prefill_sp_output_reduce_scatter(
             )
     with pl.spmd(64, name_hint="sp_reduce_publish", deps=[reuse_tid]) as copied_tid:
         worker = pl.tile.get_block_idx()
-        for row in pl.range(worker, num_tokens, 64):
-            publish_value = pl.load(partial, [row, 0], [1, D])
-            pld.tile.remote_store(publish_value, output_window, peer=group_base + tp_rank, offsets=[row, 0])
+        for owner in pl.range(TP_SIZE):
+            active = pl.max(0, pl.min(local_tokens, num_tokens - owner * local_tokens))
+            blocks = (active + SP_PUBLISH_ROW_TILE - 1) // SP_PUBLISH_ROW_TILE
+            for block in pl.range(worker, blocks, 64):
+                local_row = block * SP_PUBLISH_ROW_TILE
+                row = owner * local_tokens + local_row
+                target_row = tp_rank * local_tokens + local_row
+                if local_row + SP_PUBLISH_ROW_TILE <= active:
+                    publish_value = pl.load(partial, [row, 0], [SP_PUBLISH_ROW_TILE, D])
+                    pld.tile.remote_store(publish_value, output_window, group_base + owner, [target_row, 0])
+                else:
+                    for tail in pl.range(local_row, active):
+                        tail_publish = pl.load(partial, [owner * local_tokens + tail, 0], [1, D])
+                        target_tail = tp_rank * local_tokens + tail
+                        pld.tile.remote_store(tail_publish, output_window, group_base + owner, [target_tail, 0])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_notify", deps=[copied_tid]) as publish_tid:
         for peer in pl.range(TP_SIZE):
             pld.system.notify(
@@ -253,20 +272,29 @@ def prefill_sp_output_reduce_scatter(
             pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1, cmp=pld.WaitCmp.Ge)
     with pl.spmd(64, name_hint="sp_reduce_scatter", deps=[wait_tid]) as reduce_tid:
         worker = pl.tile.get_block_idx()
-        for tile in pl.range(worker, local_tokens * (D // D_TILE), 64):
-            local_row = tile // (D // D_TILE)
-            col = tile % (D // D_TILE) * D_TILE
+        local_peer = group_base + tp_rank
+        for block in pl.range(worker, (local_tokens + SP_REDUCE_ROW_TILE - 1) // SP_REDUCE_ROW_TILE, 64):
+            local_row = block * SP_REDUCE_ROW_TILE
             row = tp_rank * local_tokens + local_row
-            acc = pl.tile.full([1, D_TILE], dtype=pl.FP32, value=0.0)
-            if row < num_tokens:
+            if local_row + SP_REDUCE_ROW_TILE <= local_tokens and row + SP_REDUCE_ROW_TILE <= num_tokens:
+                acc = pl.tile.full([SP_REDUCE_ROW_TILE, D], dtype=pl.FP32, value=0.0)
                 for peer in pl.range(TP_SIZE):
-                    value = pld.tile.remote_load(
-                        output_window,
-                        peer=group_base + peer, offsets=[row, col], shape=[1, D_TILE],
-                    )
+                    source_row = peer * local_tokens + local_row
+                    value = pld.tile.remote_load(output_window, local_peer, [source_row, 0], [SP_REDUCE_ROW_TILE, D])
                     acc = pl.add(acc, pl.cast(value, pl.FP32))
-            result = pl.cast(acc, pl.BF16, mode="rint")
-            output = pl.store(result, [local_row, col], output)
+                result = pl.cast(acc, pl.BF16, mode="rint")
+                output = pl.store(result, [local_row, 0], output)
+            else:
+                for tail in pl.range(local_row, pl.min(local_row + SP_REDUCE_ROW_TILE, local_tokens)):
+                    target_row = tp_rank * local_tokens + tail
+                    tail_acc = pl.tile.full([1, D], dtype=pl.FP32, value=0.0)
+                    if target_row < num_tokens:
+                        for peer in pl.range(TP_SIZE):
+                            source_row = peer * local_tokens + tail
+                            tail_value = pld.tile.remote_load(output_window, local_peer, [source_row, 0], [1, D])
+                            tail_acc = pl.add(tail_acc, pl.cast(tail_value, pl.FP32))
+                    tail_result = pl.cast(tail_acc, pl.BF16, mode="rint")
+                    output = pl.store(tail_result, [tail, 0], output)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_release", deps=[reduce_tid]) as release_tid:
         for peer in pl.range(TP_SIZE):
             pld.system.notify(
@@ -359,7 +387,7 @@ def o_proj_validation(
     output.bind_dynamic(0, T_DYN)
     o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        output, num_tokens, worker_limit=32,
+        output, num_tokens, worker_limit=32, oa_row_tile=80, ob_row_tile=80,
     )
     return output
 
@@ -389,7 +417,7 @@ def o_proj_with_hc_validation(
     output.bind_dynamic(0, T_DYN)
     o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        sublayer, num_tokens, worker_limit=32,
+        sublayer, num_tokens, worker_limit=32, oa_row_tile=80, ob_row_tile=80,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps)

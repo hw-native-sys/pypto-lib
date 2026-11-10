@@ -81,7 +81,7 @@ def decode_c2a_reuse(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens)
+    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens, row_tile=80)
     q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
@@ -90,8 +90,13 @@ def decode_c2a_reuse(
         qr, query,
         num_tokens, qa_worker_limit=32, qb_worker_limit=32,
         padded_rows=proj_payload_padded_rows,
+        qa_row_tile=80, qb_row_tile=80,
     )
-    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=32)
+    kv_projection = kv_proj(
+        proj_payload, proj_scales,
+        wkv, wkv_scale,
+        kv_projection, num_tokens, worker_limit=32, row_tile=80,
+    )
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache,
@@ -107,7 +112,11 @@ def decode_c2a_reuse(
         attn_sink, attended, num_tokens, chunk_done, compressed_keys=INDEX_TOPK,
     )
     o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out, num_tokens, worker_limit=32,
+        attended,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin,
+        attn_out, num_tokens,
+        worker_limit=32, oa_row_tile=80, ob_row_tile=80,
     )
 
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)

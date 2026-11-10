@@ -264,34 +264,29 @@ def prefill_sp_post(
     next_pre_mix: pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    gathered: pl.Scalar[pl.TASK_ID],
 ):
-    """Run local mHC-post, writing active values and zero padding in one producer.
-
-    A later pure-output clear is not an ordering edge for the post task. Each
-    residual element is instead written exactly once, with hc_post's FP32
-    accumulation order and FP32 output.
-    """
+    """Mix active local rows and zero the disjoint inactive output rows."""
     tokens = pl.tensor.dim(residual, 0)
-    residual_flat = pl.reshape(residual, [tokens, HC_MULT * D])
-    mix_flat = pl.reshape(residual_mix, [tokens, HC_MULT * HC_MULT])
-    output_flat = pl.reshape(output, [tokens, HC_MULT * D])
-    for worker in pl.spmd(64, name_hint="sp_mhc_post"):
-        for block in pl.range(worker, tokens * HC_MULT, 64):
-            row = block // HC_MULT
-            out_h = block % HC_MULT
-            for col in pl.pipeline(0, D, 1024, stage=2):
-                value = pl.full([1, 1024], dtype=pl.FP32, value=0.0)
-                if tp_rank * tokens + row < num_tokens:
-                    hidden = pl.cast(sublayer[row:row + 1, col:col + 1024], pl.FP32)
-                    value = pl.mul(hidden, pl.read(post_mix, [row, out_h]))
-                    for in_h in pl.unroll(HC_MULT):
-                        lane = residual_flat[row:row + 1, in_h * D + col:in_h * D + col + 1024]
-                        value = pl.add(value, pl.mul(lane, pl.read(mix_flat, [row, in_h * HC_MULT + out_h])))
-                output_flat[row:row + 1, out_h * D + col:out_h * D + col + 1024] = value
     active = pl.max(0, pl.min(tokens, num_tokens - tp_rank * tokens))
+    if active > 0:
+        active_sublayer = sublayer[:active, :]
+        active_residual = residual[:active, :, :]
+        active_post = post_mix[:active, :]
+        active_mix = residual_mix[:active, :, :]
+        active_output = output[:active, :, :]
+        workers = pl.min(active * (D // D_TILE) * HC_MULT, POST_WORKER_TILE)
+        with pl.spmd(workers, name_hint="sp_mhc_post", deps=[gathered]):
+            _hc_post(active_sublayer, active_residual, active_post, active_mix, active_output, active)
     if active < tokens:
-        for worker in pl.spmd(32, name_hint="sp_mix_zero_padding"):
+        with pl.spmd(32, name_hint="sp_mix_zero_padding", deps=[gathered]):
+            worker = pl.tile.get_block_idx()
             for row in pl.range(active + worker, tokens, 32):
+                # Reduce-scatter supplies zeros for inactive rows.
+                zero_source = pl.cast(sublayer[row:row + 1, 0:16], pl.FP32)
+                zero_output = pl.full([1, HC_MULT * D], dtype=pl.FP32, value=0.0)
+                zero_output = pl.assemble(zero_output, zero_source, [0, 0])
+                output[row:row + 1, :, :] = pl.reshape(zero_output, [1, HC_MULT, D])
                 zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
                 next_pre_mix[row:row + 1, :] = pl.set_validshape(zero_mix, 1, HC_MULT)
     return output, next_pre_mix
