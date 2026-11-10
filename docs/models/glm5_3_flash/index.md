@@ -983,36 +983,69 @@ python models/glm5_3_flash/lm_head.py -p a2a3 -d 0,1 --compile-only
 
 ### Precision-compensation audit
 
-Custom precision compensation is no longer used in device kernels. Native
-FP32 exp, reciprocal, sqrt, division and row sums replace the polynomial,
-Dekker/Newton and fixed-point high/low helpers. FP32 accumulation replaces
-TwoSum-style correction in dot products, RMSNorm, mHC stream mixing,
-TP reduction, MoE combine and vision attention. Router top-k normalization
-uses a native row sum. The obsolete compensated-helper validation entry is
-removed with its implementation; consumer goldens and acceptance thresholds
-are unchanged. Independent CPU references still use FP64.
+Native FP32 arithmetic replaces custom exp, reciprocal, sqrt and division
+corrections, compensated row sums and accumulations across KDA, mHC stream
+mixing, TP reduction, routing, MoE combine and vision attention. Three
+custom correction groups remain in the shared linear and RMSNorm kernels:
 
-Only three call sites retain the native `rsqrt(high_precision=True)` mode.
-Each has an operator-level counterexample with the same inputs, reference
-and acceptance criteria; no custom Newton or product-error correction is
-added after the native instruction.
+- `bf16_linear` retains TwoSum residual accumulation of FP32 dot products.
+- `rmsnorm` retains `accurate_row_sum_parts` and the squared-sum residual
+  carried between chunks. It rounds the high/low sum and uses native `div`;
+  `accurate_divide_parts` is not retained.
+- `rmsnorm` uses `accurate_rsqrt`: a native high-precision initial value
+  followed by a Newton correction with both multiplication-error terms.
 
-| Retained site | Failure with `high_precision=False` | Result with `True`, without custom compensation |
+The 24-layer vision forward ablation freezes inputs and Torch goldens for
+seeds 5355, 5356 and 5357, with grid `[[1, 2, 2], [1, 2, 6]]` and workspace
+shape `[1, 16, 1024]`. The existing comparison is `atol=rtol=0.02`, allowing
+at most 5% of points beyond tolerance. The following percentages describe
+failing points in `workspace_a` and `workspace_b`, not relative L2 error.
+
+| Removed or simplified correction | Counterexample | Workspace error percentages |
 | --- | --- | --- |
-| `mhc_mixes` inverse RMS | TP8, 192 tokens, seed 3: pre/post/residual coefficients have 13/768, 122/768 and 532/3072 points beyond `atol=1e-5, rtol=1e-3`; the allowed error ratio is 0.5%. | Pass |
-| `rmsnorm_quant` inverse RMS | 32x4096 random fixture: 5,342 INT8 mismatches exceed the 0.1% budget; 7/32 scales fail `rtol=1e-6`. The rounding fixture has 15,360 INT8 mismatches. | Pass |
-| `rmsnorm` inverse RMS | TP8 native MLA projection with layer-3 checkpoint weights: 615/65,536 query values at 32 tokens and 2,974/393,216 at 192 tokens exceed `atol=rtol=0.01`, with no failures allowed. | Pass |
+| Linear TwoSum accumulation, retaining the former RMSNorm corrections | Seed 5355, hardware | 33.28% / 32.04% |
+| RMSNorm squared-sum correction | Seed 5356, hardware | 17.36% / 16.46% |
+| RMSNorm squared-sum correction | Seed 5355, simulator | 25.26% / 24.27% |
+| RMSNorm Newton correction, retaining the high-precision native initial value | Seed 5355, hardware | 7.14% / 6.27% |
+| Either multiplication-error term, or both terms, in the Newton residual | Seed 5356, hardware | 14.56% / 13.72% |
+| High-precision initial value, retaining the full Newton correction | Seeds 5355 / 5356 / 5357, hardware | 33.81% / 32.54%; 35.71% / 34.64%; 36.40% / 35.41% |
+
+Keeping these three groups passes all three fixtures on hardware and in
+simulation. The first two seeds have zero workspace points beyond tolerance;
+the third has 0.85% / 0.43%. The lower-precision initial value passes the
+simulator fixtures and isolated RMSNorm/MLA checks but fails composed vision
+on hardware, so simulator success alone does not justify removing it.
+The retained candidate also passes RMSNorm and TP8 native MLA projection
+with layer-3 checkpoint weights at 32 and 192 tokens. Goldens, thresholds,
+BF16/INT8 boundaries and padding contracts are unchanged.
+
+Hardware checks use PyPTO `ff2e0a4e`, runtime `31f9e72e` and PTOAS 0.72.
+The CI-revision simulator checks use PyPTO `1dedb26c`, runtime `355ce301`,
+PTO-ISA `5487a6b0` and PTOAS 0.72. These are different toolchain revisions,
+not an assertion that the full CI machine environment was reproduced.
+
+This is the minimum among the tested correction variants and fixtures,
+under the existing internal-workspace CI contract. Without these custom
+corrections, final vision `features` still pass the three hardware fixtures:
+only 0.11%, 0.25% and 0.12% of their elements exceed tolerance. The workspace
+counterexamples therefore do not establish that each correction is
+indispensable for answer quality or every possible input.
+
+Three shared call sites retain native `rsqrt(high_precision=True)`:
+
+| Retained site | Counterexample with default precision |
+| --- | --- |
+| `mhc_mixes` inverse RMS | TP8, 192 tokens, seed 3: pre/post/residual coefficients have 13/768, 122/768 and 532/3072 points beyond `atol=1e-5, rtol=1e-3`; the allowed error ratio is 0.5%. Native high precision passes without custom correction. |
+| `rmsnorm_quant` inverse RMS | 32x4096 random fixture: 5,342 INT8 mismatches exceed the 0.1% budget; 7/32 scales fail `rtol=1e-6`. The rounding fixture has 15,360 INT8 mismatches. Native high precision passes without custom correction. |
+| `rmsnorm` inverse-root initial value | All three hardware vision fixtures fail even with the full Newton residual correction, as shown above. |
 
 KDA output normalization, KDA prefill Q/K normalization and vision merger
 normalization use `high_precision=False`; their existing operator checks
-pass in that mode. The three retained sites apply to the shared operators,
-without shape-specific precision branches.
-
-The audit covers serving capacities 32 and 192 for the text components,
-plus bounded vision, dot-product, exact cache-byte and quantization-boundary
-checks. The TP8 reducer includes repeated window reuse; isolated MoE combine
-covers zero, one and full-capacity active rows. These are operator accuracy
-results, not full-model generation-quality or throughput measurements.
+pass in that mode. No shape-specific precision branches are added.
+`bf16_linear_row`, quantized RMSNorm, vision-local arithmetic and native
+RMSNorm mean division do not regain custom corrections. Unused compensated
+helpers and their obsolete standalone validation entry remain removed;
+independent CPU references still use FP64.
 
 The router's learned `correction_bias`, epsilon terms, softmax max
 subtraction, FP32 accumulation and model-defined BF16/INT8 rounding
@@ -1022,9 +1055,11 @@ implementations and do not justify retaining their precision corrections.
 
 ### Precision-cleanup generation and performance validation
 
-The final cleanup passes 33 operator case groups and 46 golden runs with
-unchanged consumer acceptance criteria. The full-model short-answer check
-uses 12 unique questions and two repeats, temperature zero, the same W8A8
+The earlier cleanup, before the minimum vision corrections above were
+restored, passed 33 operator case groups and 46 golden runs. Those checks
+covered vision components but omitted the composed 24-layer vision forward
+case. They are not a complete accuracy verdict for the final revision.
+The full-model short-answer check uses 12 unique questions and two repeats, temperature zero, the same W8A8
 checkpoint and TP8/EP8 configuration. Both versions answer all 12 questions
 correctly; all 14 final answers match. Full generated token sequences match
 in 13/14 comparisons: one extraction answer omits the baseline's reasoning
@@ -1033,7 +1068,10 @@ is a bounded short-answer regression, not a standardized accuracy benchmark
 or a long-generation quality evaluation.
 
 A separate serving throughput test compares main `35211954` plus the
-Sinkhorn/convolution cleanup with the same base plus this full audit.
+Sinkhorn/convolution cleanup with the same base plus the earlier full audit,
+before restoring the minimum vision corrections. These measurements do not
+measure the final retained-correction revision; its full-model performance
+has not been remeasured.
 Both variants use the same eight a2a3 devices, published W8A8 checkpoint,
 serving PR #286 with ABI-11 adaptations, PyPTO `ff2e0a4e`, runtime
 `31f9e72e` and PTOAS 0.72. The case is TP8/EP8, concurrency one, 160 input
@@ -1074,7 +1112,8 @@ scaling and epsilon placement are preserved. KDA convolution uses native
 FP32 `exp` and `div` for SiLU across bulk, request-head and recurrent paths;
 the four taps retain sequential FP32 accumulation and the output rounds
 once to BF16. The former `accurate_silu` helper is replaced by `silu`.
-The remaining custom compensation is removed by the audit above.
+The audit above limits remaining custom compensation to shared linear
+accumulation and RMSNorm.
 
 The FP64-derived goldens and numerical acceptance limits are unchanged.
 TP8 and TP16 checks cover zero, cancellation and scaled inputs, odd token
