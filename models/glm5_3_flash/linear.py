@@ -104,6 +104,33 @@ def bf16_linear_row(
 
 
 @pl.jit.inline
+def bf16_matmul(
+    x: pl.Tensor[[DOT_M, DOT_K], pl.BF16],
+    weight: pl.Tensor[[DOT_W0, DOT_W1], pl.BF16],
+    x_start: pl.Scalar[pl.INDEX],
+    w_start: pl.Scalar[pl.INDEX],
+    k_start: pl.Scalar[pl.INDEX],
+    valid_rows: pl.Scalar[pl.INDEX],
+    weight_rows: pl.Scalar[pl.INDEX],
+    M_TILE: pl.constexpr,
+    N_TILE: pl.constexpr,
+    K_TILE: pl.constexpr,
+    K_DIM: pl.constexpr,
+):
+    """Accumulate ``x[start:start+M] @ weight[rows].T`` over K tiles in FP32."""
+    total = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+    for offset in pl.range(0, K_DIM, K_TILE):
+        k0 = k_start + offset
+        x_part = pl.slice(x, [M_TILE, K_TILE], [x_start, k0], valid_shape=[valid_rows, K_TILE])
+        x_full = pl.set_validshape(pl.fillpad(x_part, pad_value=pl.PadValue.zero), M_TILE, K_TILE)
+        w_part = pl.slice(weight, [N_TILE, K_TILE], [w_start, k0], valid_shape=[weight_rows, K_TILE])
+        w_full = pl.set_validshape(pl.fillpad(w_part, pad_value=pl.PadValue.zero), N_TILE, K_TILE)
+        partial = pl.matmul(x_full, w_full, out_dtype=pl.FP32, b_trans=True)
+        total = pl.add(total, partial)
+    return total
+
+
+@pl.jit.inline
 def bf16_projection(
     x: pl.Tensor[[DOT_M, DOT_K], pl.BF16],
     weight: pl.Tensor[[DOT_W0, DOT_K], pl.BF16],
