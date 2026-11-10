@@ -84,10 +84,9 @@ MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * M
 
 # PyPTO W13 projection tiling, mirroring kernels/expert_routed_w13.cpp. The
 # extern uses M_TILE/N_TILE/K_TILE = 64/256/256; the PyPTO K tile is halved
-# because the decode is single-buffered in Vec and its live set is wide: the
-# packed source, the FP16 and INT16 index tiles, the gather scratch and the
-# gathered codes are all alive at once, about 144 KB at K 128. At K 256 that
-# would be ~288 KB against a 192 KB Vec.
+# because the decode's live set is wide -- packed source, FP16 and INT16
+# index tiles, gather scratch and gathered codes are all alive at once -- and
+# it has to fit W13_K_STAGE times over. See W13_K_STAGE for the sweep.
 # Every projection must run on a FULL row tile: narrowing an MX_A_ZZ
 # activation-scale load with valid_shape is silently miscompiled. A full tile
 # stays inside the expert's stride only if the tile divides it, so the tile is
@@ -104,7 +103,7 @@ W13_M_TILE = gcd(RECV_MAX, 80)
 assert W13_M_TILE % 16 == 0
 assert RECV_MAX % W13_M_TILE == 0
 W13_N_TILE = MX_MM_INTER_TILE
-W13_K_TILE = MX_K_TILE // 2
+W13_K_TILE = MX_K_TILE // 4
 W13_N_BLOCKS = MOE_INTER // W13_N_TILE
 W13_SCALE_K = W13_K_TILE // MX_GROUP
 # A packed weight plane stores one (n_block, k_block) panel as MX_K_TILE rows
@@ -112,6 +111,17 @@ W13_SCALE_K = W13_K_TILE // MX_GROUP
 # K slice starting at k therefore collapses to n_block * K + k, where K is the
 # projection's reduction width (D for W1/W3).
 W13_PACKED_EXPERT_ROWS = MX_W1_PACKED_ROWS
+# The extern multi-buffers everything: A and scale stages 2 deep, two L1 slots
+# for the decoded weight panel, four raw packed panels prefetched and two NZ
+# tiles. None of that arrives by itself here -- AutoTileMatmulL0 does not
+# dispatch on matmul_mx, and the slot lowering only triggers on pl.pipeline --
+# so the K loop asks for it explicitly. Depth and K tile are coupled through
+# the Vec budget, and the pair below is the measured optimum (case full, 50
+# rounds, PyPTO effective_us): K 128 / depth 1 = 546, K 64 / depth 1 = 636,
+# K 64 / depth 2 = 461, K 64 / depth 3 = 538. K 128 at depth 2 does not fit
+# (361 KB of a 246 KB Vec) and K 32 is rejected outright -- matmul_mx needs a
+# physical K divisible by 64.
+W13_K_STAGE = 2
 # Route weights are copied in 16-row chunks. Every chunk carries a runtime
 # valid extent, so the chunking buys nothing over a single [1, count] row
 # load; the extern does exactly that and issues one contiguous burst where
@@ -411,7 +421,7 @@ def _w13_projection(
     b0 = pl.reinterpret_view(pl.reinterpret_view(codes0, pl.INT8), pl.FP8E4M3FN)
     b_scale0 = pl.load(weight_scale, [scale_row, col], [W13_SCALE_K, W13_N_TILE])
     acc = pl.matmul_mx(a0, a_scale0, b0, b_scale0)
-    for k0 in pl.range(W13_K_TILE, D, W13_K_TILE):
+    for k0 in pl.pipeline(W13_K_TILE, D, W13_K_TILE, stage=W13_K_STAGE):
         a = pl.load(x, [x_row, k0], [W13_M_TILE, W13_K_TILE])
         a_scale = pl.load(x_scale_zz, [x_row, k0 // MX_GROUP], [W13_M_TILE, W13_SCALE_K])
         packed = pl.load(weight_flat, [panel_row + k0, 0], [W13_K_TILE, MX_PACKED_LANE_COLS])
