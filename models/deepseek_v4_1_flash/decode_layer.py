@@ -29,6 +29,11 @@ from decode_c1a_reuse import decode_c1a_reuse
 from decode_c2a_full import decode_c2a_full
 from decode_c2a_reuse import decode_c2a_reuse
 from decode_swa import decode_swa
+from decode_indexer import (
+    project_index_key, project_index_weights, select_candidate_block_pool,
+    publish_index_rows_pypto, project_index_query_pypto,
+    score_select_paged_pypto, score_select_reindex_pypto,
+)
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 from decode_moe import (
     moe, AUX_WIDTH, EP_SIZE, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, clear_moe_signals,
@@ -51,10 +56,97 @@ MIX_HC = M.mix_hc
 INDEX_H = M.index_n_heads
 INDEX_DIM = M.index_head_dim
 INDEX_TOPK = M.index_topk
+QUERY_WIDTH = INDEX_H * INDEX_DIM
+SCALE_WIDTH = INDEX_H * (INDEX_DIM // 32)
 N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
 MOE_INTER = M.moe_intermediate_size
 MX_GROUP = M.weight_block_size[0]
+
+
+# Dynamic shape variables.
+PAYLOAD_ROWS_DYN = pl.dynamic("INDEX_QUERY_PAYLOAD_ROWS")
+SCALE_BYTES_DYN = pl.dynamic("INDEX_QUERY_SCALE_BYTES")
+SCORE_WIDTH_DYN = pl.dynamic("INDEX_FUNCTIONAL_SCORE_WIDTH")
+
+
+@pl.jit.inline(auto_scope=False)
+def indexer_functional_pypto(
+    payload: pl.Tensor[[PAYLOAD_ROWS_DYN, Q_LORA], pl.FP8E4M3FN],
+    weight: pl.Tensor[[Q_LORA, QUERY_WIDTH], pl.FP8E4M3FN, pl.NZ],
+    activation_scale: pl.Tensor[[1, SCALE_BYTES_DYN], pl.FP8E8M0],
+    weight_scale: pl.Tensor[[Q_LORA // 32, QUERY_WIDTH], pl.FP8E8M0],
+    query_cosine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    query_sine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    key_cosine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    key_sine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    latent: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    index_wk: pl.Tensor[[HEAD_DIM, INDEX_DIM], pl.BF16, pl.NZ],
+    norm_weight: pl.Tensor[[INDEX_DIM], pl.BF16],
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
+    slots: pl.Tensor[[T_DYN], pl.INT64],
+    index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
+    index_cache_scale: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 32], pl.FP8E8M0],
+    block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    lengths: pl.Tensor[[T_DYN], pl.INT32],
+    pool_block_ids: pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32],
+    pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
+    scores: pl.Tensor[[T_DYN, SCORE_WIDTH_DYN], pl.FP32],
+    output: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    mode: pl.Scalar[pl.INT32],
+    entry_ready: pl.Scalar[pl.TASK_ID],
+    latent_ready: pl.Scalar[pl.TASK_ID],
+    cache_ready: pl.Scalar[pl.TASK_ID],
+    pool_ready: pl.Scalar[pl.TASK_ID],
+):
+    """Publish full/C2A keys or reindex existing cache state with explicit readiness."""
+    tokens = pl.tensor.dim(x, 0)
+    index_ready = cache_ready
+    if mode != 2:
+        projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
+        key_tid = project_index_key(latent, index_wk, projected_key, num_tokens, latent_ready, max_workers=16)
+        index_ready = publish_index_rows_pypto(
+            projected_key, norm_weight, key_cosine, key_sine, slots, index_cache, index_cache_scale,
+            num_tokens, cache_ready, key_tid,
+        )
+
+    raw_weights = pl.create_tensor([tokens, INDEX_H], dtype=pl.BF16)
+    weights_tid = project_index_weights(x, index_weights_proj, raw_weights, num_tokens, entry_ready)
+    query = pl.create_tensor([tokens, QUERY_WIDTH // 2], dtype=pl.UINT8)
+    query_scale = pl.create_tensor([tokens, SCALE_WIDTH], dtype=pl.FP8E8M0)
+    query_tid = project_index_query_pypto(
+        payload, weight, activation_scale, weight_scale, query_cosine, query_sine,
+        query, query_scale, num_tokens, entry_ready,
+    )
+
+    if mode == 2:
+        reindexed = score_select_reindex_pypto(
+            query, query_scale, raw_weights, index_cache, index_cache_scale,
+            block_table, request_ids, lengths, pool_block_ids, pool_block_counts,
+            scores, output, num_tokens, index_ready, query_tid, weights_tid, pool_ready,
+        )
+        completed = reindexed
+    elif mode == 1:
+        c2a_selected, c2a_scores_done = score_select_paged_pypto(
+            query, query_scale, raw_weights, index_cache, index_cache_scale,
+            block_table, request_ids, lengths, scores, output,
+            num_tokens, index_ready, query_tid, weights_tid, 0, True,
+        )
+        completed = c2a_selected
+    else:
+        paged_selected, paged_scores_done = score_select_paged_pypto(
+            query, query_scale, raw_weights, index_cache, index_cache_scale,
+            block_table, request_ids, lengths, scores, output,
+            num_tokens, index_ready, query_tid, weights_tid, pl.tensor.dim(pool_block_ids, 1), False,
+        )
+        published_pool = select_candidate_block_pool(
+            scores, lengths, pool_block_ids, pool_block_counts, num_tokens, paged_scores_done,
+        )
+        completed = pl.system.task_dummy(deps=[paged_selected, published_pool])
+    return completed
 
 
 @pl.jit
