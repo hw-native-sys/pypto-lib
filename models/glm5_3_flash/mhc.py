@@ -20,10 +20,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import FLASH, HC_DIM, HC_MULT, MIX_HC, D, Glm53FlashConfig
-from models.glm5_3_flash.elementwise import (
-    _sum_fp32_reference, accurate_exp,
-    accurate_rsqrt, accurate_sigmoid,
-)
+from models.glm5_3_flash.elementwise import _sum_fp32_reference, sigmoid_fp32
 from models.glm5_3_flash.kda import PROJECTION_WORKERS_TILE
 from models.glm5_3_flash.linear import bf16_matmul
 from models.glm5_3_flash.rmsnorm import unweighted_rms_norm
@@ -112,7 +109,8 @@ def mhc_mixes(
             sq_sum = pl.add(sq_sum, rms_partial[row:row + 1, :])
         rms_arg = pl.create_tensor([1, RMS_T_TILE], dtype=pl.FP32)
         rms_arg[:, :] = pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)
-        inverse = accurate_rsqrt(rms_arg)
+        # Default rsqrt exceeds the FP32 mix-coefficient error budget at 192 tokens.
+        inverse = pl.rsqrt(rms_arg, high_precision=True)
         inv_rms[t0 : t0 + RMS_T_TILE, 0:1] = pl.reshape(inverse, [RMS_T_TILE, 1])
 
     linear_tiles = t_linear // LINEAR_T_TILE
@@ -156,8 +154,8 @@ def mhc_mixes(
         post_logits = pl.create_tensor([1, HC_PAD], dtype=pl.FP32)
         pre_logits[:, :] = pl.add(pl.mul(pl.mul(pre_raw, inv), s0), pre_base)
         post_logits[:, :] = pl.add(pl.mul(pl.mul(post_raw, inv), s1), post_base)
-        pre_sigmoid = accurate_sigmoid(pre_logits, 1, HC_PAD)
-        post_sigmoid = accurate_sigmoid(post_logits, 1, HC_PAD)
+        pre_sigmoid = sigmoid_fp32(pre_logits, 1, HC_PAD)
+        post_sigmoid = sigmoid_fp32(post_logits, 1, HC_PAD)
         pre = pl.add(pre_sigmoid, HC_EPS)
         post = pl.mul(post_sigmoid, 2.0)
         pre_mix[t : t + 1, :] = pl.set_validshape(pre, 1, HC_MULT)
@@ -175,7 +173,7 @@ def mhc_mixes(
         logits[:, :] = pl.add(pl.mul(pl.mul(comb_raw, inv), s2), biases)
         exp_argument = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
         exp_argument[:, :] = pl.row_expand_sub(logits, pl.row_max(logits))
-        exps_value = accurate_exp(exp_argument)
+        exps_value = pl.exp(exp_argument)
         values = pl.create_tensor([HC_PAD, HC_PAD], dtype=pl.FP32)
         values[:, :] = exps_value
         normalized = sinkhorn_normalize(values, False, 0.0)
@@ -215,17 +213,12 @@ def mhc_pre(
         t = pl.tile.get_block_idx()
         for d0 in pl.pipeline(0, D, MIX_D_TILE, stage=2):
             value = pl.mul(pl.cast(x_flat[t:t + 1, d0:d0 + MIX_D_TILE], target_type=pl.FP32), pl.read(pre_mix, [t, 0]))
-            correction = pl.full([1, MIX_D_TILE], dtype=pl.FP32, value=0.0)
             for stream in pl.unroll(HC_MULT - 1):
                 head = stream + 1
                 tile = x_flat[t : t + 1, head * D + d0 : head * D + d0 + MIX_D_TILE]
                 partial = pl.mul(pl.cast(tile, target_type=pl.FP32), pl.read(pre_mix, [t, head]))
-                updated = pl.add(value, partial)
-                recovered = pl.sub(updated, value)
-                error = pl.add(pl.sub(value, pl.sub(updated, recovered)), pl.sub(partial, recovered))
-                correction = pl.add(correction, error)
-                value = updated
-            output[t:t + 1, d0:d0 + MIX_D_TILE] = pl.cast(pl.add(value, correction), target_type=pl.BF16, mode="rint")
+                value = pl.add(value, partial)
+            output[t:t + 1, d0:d0 + MIX_D_TILE] = pl.cast(value, target_type=pl.BF16, mode="rint")
     return output, pre_tid
 
 
@@ -270,18 +263,13 @@ def mhc_post(
             x_tile = pl.cast(sublayer[t : t + 1, d0 : d0 + MIX_D_TILE], target_type=pl.FP32)
             update = pl.cast(pl.mul(x_tile, pl.read(post_rounded, [t, out_h])), pl.BF16, mode="rint")
             value = pl.full([1, MIX_D_TILE], dtype=pl.FP32, value=0.0)
-            correction = pl.full([1, MIX_D_TILE], dtype=pl.FP32, value=0.0)
             for in_h in pl.unroll(HC_MULT):
                 residual_tile = residual_flat[t : t + 1, in_h * D + d0 : in_h * D + d0 + MIX_D_TILE]
                 partial_cast = pl.cast(residual_tile, target_type=pl.FP32)
                 partial_read = pl.read(residual_rounded, [t, in_h * HC_MULT + out_h])
                 partial = pl.mul(partial_cast, partial_read)
-                updated = pl.add(value, partial)
-                recovered = pl.sub(updated, value)
-                error = pl.add(pl.sub(value, pl.sub(updated, recovered)), pl.sub(partial, recovered))
-                correction = pl.add(correction, error)
-                value = updated
-            residual_bf16 = pl.cast(pl.add(value, correction), pl.BF16, mode="rint")
+                value = pl.add(value, partial)
+            residual_bf16 = pl.cast(value, pl.BF16, mode="rint")
             combined = pl.add(pl.cast(update, pl.FP32), pl.cast(residual_bf16, pl.FP32))
             output_flat[t:t + 1, out_h * D + d0:out_h * D + d0 + MIX_D_TILE] = pl.cast(combined, target_type=pl.BF16, mode="rint")
     return output
@@ -298,18 +286,12 @@ def mhc_head(
     for t in pl.spmd(t_dim, name_hint="mhc_head"):
         for d0 in pl.pipeline(0, D, MIX_D_TILE, stage=2):
             value = pl.cast(x_flat[t : t + 1, d0 : d0 + MIX_D_TILE], target_type=pl.FP32)
-            correction = pl.full([1, MIX_D_TILE], dtype=pl.FP32, value=0.0)
             for stream in pl.unroll(HC_MULT - 1):
                 head = stream + 1
                 tile = x_flat[t : t + 1, head * D + d0 : head * D + d0 + MIX_D_TILE]
                 partial = pl.cast(tile, target_type=pl.FP32)
-                updated = pl.add(value, partial)
-                recovered = pl.sub(updated, value)
-                error = pl.add(pl.sub(value, pl.sub(updated, recovered)), pl.sub(partial, recovered))
-                correction = pl.add(correction, error)
-                value = updated
-            output_value_add = pl.add(value, correction)
-            output_value_mul = pl.mul(output_value_add, 1.0 / HC_MULT)
+                value = pl.add(value, partial)
+            output_value_mul = pl.mul(value, 1.0 / HC_MULT)
             output[t:t + 1, d0:d0 + MIX_D_TILE] = pl.cast(output_value_mul, target_type=pl.BF16, mode="rint")
     return output
 

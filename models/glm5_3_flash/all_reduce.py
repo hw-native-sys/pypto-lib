@@ -86,17 +86,12 @@ def tp_all_reduce(
             row = tile // (D // TP_D_TILE)
             col = tile % (D // TP_D_TILE) * TP_D_TILE
             acc = pl.tile.full([1, TP_D_TILE], dtype=pl.FP32, value=0.0)
-            correction = pl.tile.full([1, TP_D_TILE], dtype=pl.FP32, value=0.0)
             for peer in pl.range(EP_SIZE):
                 peer_value = pld.tile.remote_load(
                     exchange, peer=group_base + peer, offsets=[row, col], shape=[1, TP_D_TILE],
                 )
-                updated = pl.add(acc, peer_value)
-                recovered = pl.sub(updated, acc)
-                error = pl.add(pl.sub(acc, pl.sub(updated, recovered)), pl.sub(peer_value, recovered))
-                correction = pl.add(correction, error)
-                acc = updated
-            output = pl.store(pl.cast(pl.add(acc, correction), pl.BF16, mode="rint"), [row, col], output)
+                acc = pl.add(acc, peer_value)
+            output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp_release", deps=[reduce_tid]) as release_tid:
         for peer in pl.range(EP_SIZE):

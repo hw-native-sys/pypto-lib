@@ -981,6 +981,91 @@ Use `--case tp_reduce` for the collective alone, or a local case such as
 python models/glm5_3_flash/lm_head.py -p a2a3 -d 0,1 --compile-only
 ```
 
+### Precision-compensation audit
+
+Custom precision compensation is no longer used in device kernels. Native
+FP32 exp, reciprocal, sqrt, division and row sums replace the polynomial,
+Dekker/Newton and fixed-point high/low helpers. FP32 accumulation replaces
+TwoSum-style correction in dot products, RMSNorm, mHC stream mixing,
+TP reduction, MoE combine and vision attention. Router top-k normalization
+uses a native row sum. The obsolete compensated-helper validation entry is
+removed with its implementation; consumer goldens and acceptance thresholds
+are unchanged. Independent CPU references still use FP64.
+
+Only three call sites retain the native `rsqrt(high_precision=True)` mode.
+Each has an operator-level counterexample with the same inputs, reference
+and acceptance criteria; no custom Newton or product-error correction is
+added after the native instruction.
+
+| Retained site | Failure with `high_precision=False` | Result with `True`, without custom compensation |
+| --- | --- | --- |
+| `mhc_mixes` inverse RMS | TP8, 192 tokens, seed 3: pre/post/residual coefficients have 13/768, 122/768 and 532/3072 points beyond `atol=1e-5, rtol=1e-3`; the allowed error ratio is 0.5%. | Pass |
+| `rmsnorm_quant` inverse RMS | 32x4096 random fixture: 5,342 INT8 mismatches exceed the 0.1% budget; 7/32 scales fail `rtol=1e-6`. The rounding fixture has 15,360 INT8 mismatches. | Pass |
+| `rmsnorm` inverse RMS | TP8 native MLA projection with layer-3 checkpoint weights: 615/65,536 query values at 32 tokens and 2,974/393,216 at 192 tokens exceed `atol=rtol=0.01`, with no failures allowed. | Pass |
+
+KDA output normalization, KDA prefill Q/K normalization and vision merger
+normalization use `high_precision=False`; their existing operator checks
+pass in that mode. The three retained sites apply to the shared operators,
+without shape-specific precision branches.
+
+The audit covers serving capacities 32 and 192 for the text components,
+plus bounded vision, dot-product, exact cache-byte and quantization-boundary
+checks. The TP8 reducer includes repeated window reuse; isolated MoE combine
+covers zero, one and full-capacity active rows. These are operator accuracy
+results, not full-model generation-quality or throughput measurements.
+
+The router's learned `correction_bias`, epsilon terms, softmax max
+subtraction, FP32 accumulation and model-defined BF16/INT8 rounding
+boundaries remain part of the model computation. They are not removable
+roundoff compensation. Earlier performance sections describe historical
+implementations and do not justify retaining their precision corrections.
+
+### Precision-cleanup generation and performance validation
+
+The final cleanup passes 33 operator case groups and 46 golden runs with
+unchanged consumer acceptance criteria. The full-model short-answer check
+uses 12 unique questions and two repeats, temperature zero, the same W8A8
+checkpoint and TP8/EP8 configuration. Both versions answer all 12 questions
+correctly; all 14 final answers match. Full generated token sequences match
+in 13/14 comparisons: one extraction answer omits the baseline's reasoning
+text but preserves the final answer. Input lengths are 22-223 tokens. This
+is a bounded short-answer regression, not a standardized accuracy benchmark
+or a long-generation quality evaluation.
+
+A separate serving throughput test compares main `35211954` plus the
+Sinkhorn/convolution cleanup with the same base plus this full audit.
+Both variants use the same eight a2a3 devices, published W8A8 checkpoint,
+serving PR #286 with ABI-11 adaptations, PyPTO `ff2e0a4e`, runtime
+`31f9e72e` and PTOAS 0.72. The case is TP8/EP8, concurrency one, 160 input
+and 128 output tokens, with 32-token prefill chunks and prefix caching
+disabled. Timing observes the host serving stream and excludes startup
+and profiling. One warmup precedes three measured requests; the table
+reports medians. Throughput is 128 divided by complete request time;
+TPOT excludes the first token and divides by the remaining 127 tokens.
+
+| Metric | Before full audit | After full audit | Change |
+| --- | ---: | ---: | ---: |
+| Output throughput (tokens/s) | 8.044 | 10.376 | +28.98% |
+| Time to first token (s) | 1.687 | 1.513 | -10.31% |
+| Time per subsequent token (ms) | 112.074 | 85.340 | -23.85% |
+| Complete request time (s) | 15.912 | 12.336 | -22.47% |
+
+Throughput samples are 8.003, 8.052 and 8.044 tokens/s before cleanup,
+and 10.292, 10.376 and 10.401 tokens/s after cleanup. All eight requests,
+including warmups, produce the same 128 token IDs. This fixed throughput
+prompt is separate from the short-answer quality check.
+
+A separate native rank-0 capture covers all 45 layers and the vocabulary
+head for the final 32-token prefill chunk and first decode step. The
+physical-core execution spans are 285.708 ms and 65.826 ms respectively;
+these are single profiled dispatches, not all 128 decode steps or the
+unprofiled latency statistics above. The official swimlane export retains
+scheduler and dependency events. The smaller prefill browser trace keeps
+all physical-core execution events; both browser traces render execution
+lanes. Decode dependency-arrow import warnings do not remove execution
+slices. Raw captures, source snapshots and browser-validation records are
+retained with the benchmark artifacts, outside the source repository.
+
 ### Native arithmetic for Sinkhorn and convolution
 
 The mHC Sinkhorn normalization uses FP32 `row_sum` and `div` for its
@@ -989,7 +1074,7 @@ scaling and epsilon placement are preserved. KDA convolution uses native
 FP32 `exp` and `div` for SiLU across bulk, request-head and recurrent paths;
 the four taps retain sequential FP32 accumulation and the output rounds
 once to BF16. The former `accurate_silu` helper is replaced by `silu`.
-Other compensated primitives retain their existing consumers.
+The remaining custom compensation is removed by the audit above.
 
 The FP64-derived goldens and numerical acceptance limits are unchanged.
 TP8 and TP16 checks cover zero, cancellation and scaled inputs, odd token
@@ -1274,8 +1359,8 @@ frame-segmented attention/MLP blocks, downsampling and the merger on an
 allocated NPU.
 Position-only FP32 RoPE constants are prepared with the input metadata and
 gathered on device. The attention reference rounds independent FP64
-exponentials, sums and reciprocals at the FP32 boundaries; compensated
-reductions retain those boundaries in the device implementation.
+exponentials, sums and reciprocals at the FP32 boundaries. The device uses
+native FP32 arithmetic and retains the model-defined BF16 boundaries.
 The validation driver with image/video inputs
 expands image/video markers and replaces the corresponding embedding rows
 before seeding all four streams.
