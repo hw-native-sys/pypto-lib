@@ -24,7 +24,10 @@ from config import (
     SUPPORTED_TP_SIZES,
     TP_SIZE,
 )
-from lm_head import GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS, TP_SIZE as LM_HEAD_TP_SIZE, VOCAB_PER_TP, lm_head
+from lm_head import (
+    GROUP_LOGIT_ROWS, LM_HEAD_M_TILE, MAX_LOGIT_ROWS, TP_SIZE as LM_HEAD_TP_SIZE,
+    VOCAB_PER_TP, lm_head, lm_head_project,
+)
 from rmsnorm import rms_norm_tiled
 
 
@@ -552,7 +555,7 @@ def markov_sample_validation(
 def _markov_sample_from_hidden(
     head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
     num_sampled: pl.Tensor[[B_DYN], pl.INT32],
     last_sampled: pl.Tensor[[B_DYN], pl.INT64],
     next_prefill_tokens: pl.Tensor[[B_DYN], pl.INT64],
@@ -585,58 +588,74 @@ def _markov_sample_from_hidden(
         rms_norm_tiled(flat_hidden, final_norm_weight, normalized, block, rows, output_fp32=False)
     base_logits = pl.create_tensor([batch, DSPARK_QUERY_WIDTH, VOCAB], dtype=pl.FP32)
     flat_logits = pl.reshape(base_logits, [rows, VOCAB])
-    group_base = rank // TP_SIZE * TP_SIZE
-    tp_rank = rank % TP_SIZE
-    # Keep the producer event outside a dynamic pl.range. PTOAS requires
-    # values returned from an inline call to remain in one SSA scope; a fixed
-    # maximum also lets the final LM-head event gate Markov sampling safely.
-    completed_epochs = logits_epoch + MAX_LOGIT_CHUNKS - 1
-    for chunk in pl.unroll(MAX_LOGIT_CHUNKS):
-        row_indices = pl.create_tensor([MAX_LOGIT_ROWS], dtype=pl.INT32)
-        with pl.spmd(1, name_hint="dspark_logit_rows", deps=[logits_ready_tid]):
-            core = pl.tile.get_block_idx()
-            for row in pl.range(core * MAX_LOGIT_ROWS, (core + 1) * MAX_LOGIT_ROWS):
-                source = pl.cast(-1, pl.INT32)
+    if TP_SIZE == 1:
+        logits_ready_tid = lm_head_project(normalized, lm_head_weight, flat_logits, LM_HEAD_M_TILE)
+        # The caller supplies the already resolved anchor: decode passes the
+        # accepted target token, while prefill passes next_prefill_tokens.
+        markov_sample_inline(
+            base_logits,
+            head_hidden,
+            anchor_ids,
+            markov_w1,
+            markov_w2,
+            confidence_weight,
+            draft_ids,
+            confidences,
+            logits_ready_tid,
+        )
+    else:
+        group_base = rank // TP_SIZE * TP_SIZE
+        tp_rank = rank % TP_SIZE
+        # Keep the producer event outside a dynamic pl.range. PTOAS requires
+        # values returned from an inline call to remain in one SSA scope; a fixed
+        # maximum also lets the final LM-head event gate Markov sampling safely.
+        completed_epochs = logits_epoch + MAX_LOGIT_CHUNKS - 1
+        for chunk in pl.unroll(MAX_LOGIT_CHUNKS):
+            row_indices = pl.create_tensor([MAX_LOGIT_ROWS], dtype=pl.INT32)
+            with pl.spmd(1, name_hint="dspark_logit_rows", deps=[logits_ready_tid]):
+                core = pl.tile.get_block_idx()
+                for row in pl.range(core * MAX_LOGIT_ROWS, (core + 1) * MAX_LOGIT_ROWS):
+                    source = pl.cast(-1, pl.INT32)
+                    global_row = chunk * MAX_LOGIT_ROWS + row
+                    if global_row < rows:
+                        source = pl.cast(global_row, pl.INT32)
+                    pl.write(row_indices, [row], source)
+            logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
+            logits, logits_ready_tid = lm_head(
+                normalized,
+                lm_head_weight,
+                row_indices,
+                logits,
+                hidden_window,
+                hidden_done,
+                logits_window,
+                logits_done,
+                group_base,
+                tp_rank,
+                logits_epoch + chunk,
+                completed_epochs,
+            )
+            with pl.spmd(MAX_LOGIT_ROWS, name_hint="dspark_pack_logits", deps=[logits_ready_tid]) as logits_ready_tid:
+                row = pl.tile.get_block_idx()
                 global_row = chunk * MAX_LOGIT_ROWS + row
                 if global_row < rows:
-                    source = pl.cast(global_row, pl.INT32)
-                pl.write(row_indices, [row], source)
-        logits = pl.create_tensor([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-        logits, logits_ready_tid = lm_head(
-            normalized,
-            lm_head_weight,
-            row_indices,
-            logits,
-            hidden_window,
-            hidden_done,
-            logits_window,
-            logits_done,
-            group_base,
-            tp_rank,
-            logits_epoch + chunk,
-            completed_epochs,
+                    for offset in pl.range(0, VOCAB, VOCAB_TILE):
+                        flat_logits[global_row : global_row + 1, offset : offset + VOCAB_TILE] = logits[
+                            row : row + 1, offset : offset + VOCAB_TILE
+                        ]
+        # The caller supplies the already resolved anchor: decode passes the
+        # accepted target token, while prefill passes next_prefill_tokens.
+        markov_sample_inline(
+            base_logits,
+            head_hidden,
+            anchor_ids,
+            markov_w1,
+            markov_w2,
+            confidence_weight,
+            draft_ids,
+            confidences,
+            logits_ready_tid,
         )
-        with pl.spmd(MAX_LOGIT_ROWS, name_hint="dspark_pack_logits", deps=[logits_ready_tid]) as logits_ready_tid:
-            row = pl.tile.get_block_idx()
-            global_row = chunk * MAX_LOGIT_ROWS + row
-            if global_row < rows:
-                for offset in pl.range(0, VOCAB, VOCAB_TILE):
-                    flat_logits[global_row : global_row + 1, offset : offset + VOCAB_TILE] = logits[
-                        row : row + 1, offset : offset + VOCAB_TILE
-                    ]
-    # The caller supplies the already resolved anchor: decode passes the
-    # accepted target token, while prefill passes next_prefill_tokens.
-    markov_sample_inline(
-        base_logits,
-        head_hidden,
-        anchor_ids,
-        markov_w1,
-        markov_w2,
-        confidence_weight,
-        draft_ids,
-        confidences,
-        logits_ready_tid,
-    )
     return draft_ids, confidences
 
 
@@ -648,7 +667,7 @@ l2_markov_sample_from_hidden = pl.jit(auto_scope=False)(_markov_sample_from_hidd
 def l3_markov_sample_from_hidden(
     head_hidden: pl.Tensor[[EP_SIZE, B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
     final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[EP_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[EP_SIZE, D, VOCAB_PER_TP], pl.BF16],
     num_sampled: pl.Tensor[[EP_SIZE, B_DYN], pl.INT32],
     last_sampled: pl.Tensor[[EP_SIZE, B_DYN], pl.INT64],
     next_prefill_tokens: pl.Tensor[[EP_SIZE, B_DYN], pl.INT64],

@@ -350,7 +350,7 @@ def l2_prefill_fwd(
     index_scales: pl.InOut[pl.Tensor[[4, PAGES, 128, 1, 4], pl.FP8E8M0]],
     state_cache: pl.InOut[pl.Tensor[[3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     final_norm_weight: pl.Tensor[[D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB // TP_SIZE, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[D, VOCAB // TP_SIZE], pl.BF16, pl.NZ],
     logit_rows: pl.Tensor[[16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[CAPACITY, HC_MULT], pl.FP32]],
@@ -709,7 +709,7 @@ def l3_prefill_fwd(
     index_scales: pl.InOut[pl.Tensor[[RANKS, 4, PAGES, 128, 1, 4], pl.FP8E8M0]],
     state_cache: pl.InOut[pl.Tensor[[RANKS, 3, STATE_BLOCKS_DYN, C.STATE_CAPACITY, STATE_WIDTH], pl.FP32]],
     final_norm_weight: pl.Tensor[[RANKS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[RANKS, VOCAB // TP_SIZE, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[RANKS, D, VOCAB // TP_SIZE], pl.BF16],
     logit_rows: pl.Tensor[[RANKS, 16], pl.INT32],
     x_hc_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT, D], pl.FP32]],
     pre_mix_out: pl.Out[pl.Tensor[[RANKS, CAPACITY, HC_MULT], pl.FP32]],
@@ -1102,7 +1102,7 @@ def forward_weight_layouts(local_experts: int):
         "shared_w3": ((layers, d, inter), torch.float8_e4m3fn),
         "shared_w3_scale": ((layers * (d // 32), inter), torch.float8_e8m0fnu),
         "final_norm_weight": ((d,), torch.bfloat16),
-        "lm_head_weight": ((M.vocab_size // TP_SIZE, d), torch.bfloat16),
+        "lm_head_weight": ((d, M.vocab_size // TP_SIZE), torch.bfloat16),
     }
 
 
@@ -1160,7 +1160,7 @@ class ResidentPrefillWeights:
         self.entries.extend((
             ("c1a_compressor_wkv", f"layers.{c1a_source}.attn.compressor.wkv.weight", 0, 1, "bf16_nz"),
             ("final_norm_weight", "norm.weight", 0, 1, "plain"),
-            ("lm_head_weight", "head.weight", 0, 1, "plain"),
+            ("lm_head_weight", "head.weight", 0, 1, "bf16_nz"),
         ))
         for slot, layer in enumerate(M.engram_layer_ids):
             self.entries.append(("engram_wkv", f"layers.{layer}.engram.wkv", slot, 2, "fp8"))
@@ -1228,9 +1228,10 @@ class ResidentPrefillWeights:
                     value = checkpoint.tensor(name)
                     if value.dtype not in (torch.float32, torch.bfloat16):
                         raise ValueError(f"unsupported inference weight dtype: {name}")
-                    valid_head = value.dtype == torch.bfloat16 and tuple(value.shape) == shape
-                    if target == "lm_head_weight" and not valid_head:
-                        raise ValueError("the native LM head requires the released BF16 checkpoint matrix")
+                    if target == "lm_head_weight":
+                        valid_head = value.dtype == torch.bfloat16 and tuple(value.shape) == (shape[-1], shape[-2])
+                        if not valid_head:
+                            raise ValueError("the native LM head requires the released BF16 checkpoint matrix")
                     value = value.to(dtype)
                     if kind in ("transpose", "bf16_nz"):
                         value = value.t()

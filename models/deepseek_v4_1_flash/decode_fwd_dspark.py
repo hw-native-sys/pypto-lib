@@ -477,9 +477,6 @@ TARGET_FWD_SIGNAL_PAD = target_fwd.SIGNAL_PAD
 TARGET_FWD_MOE_TOKENS = target_fwd.MOE_TOKENS
 TARGET_FWD_TOPK = target_fwd.TOPK
 TARGET_FWD_GROUP_LOGIT_ROWS = target_fwd.GROUP_LOGIT_ROWS
-SAMPLING_GROUP_LOGIT_ROWS = sampling.GROUP_LOGIT_ROWS
-SAMPLING_MAX_LOGIT_ROWS = sampling.MAX_LOGIT_ROWS
-SAMPLING_VOCAB = sampling.VOCAB
 DRAFT_PREFILL_MAX_TOKENS = draft.PREFILL_MAX_TOKENS
 DRAFT_RECV_MAX = draft.RECV_MAX
 DRAFT_AUX_WIDTH = draft.AUX_WIDTH
@@ -575,7 +572,7 @@ def l3_decode_fwd_dspark(
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[EP_SIZE, TARGET_FWD_VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[EP_SIZE, D, TARGET_FWD_VOCAB_PER_TP], pl.BF16],
     logit_row_indices: pl.Tensor[[EP_SIZE, TARGET_FWD_MAX_LOGIT_ROWS], pl.INT32],
     target_logits: pl.Out[pl.Tensor[[EP_SIZE, TARGET_FWD_MAX_LOGIT_ROWS, TARGET_FWD_VOCAB], pl.FP32]],
     target_backbone_sampled_ids: pl.Out[pl.Tensor[[EP_SIZE, TARGET_FWD_MAX_LOGIT_ROWS, TARGET_FWD_SAMPLED_IDS_PAD], pl.INT32]],
@@ -641,7 +638,7 @@ def l3_decode_fwd_dspark(
     attention_epoch: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
     markov_final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    markov_lm_head_weight: pl.Tensor[[EP_SIZE, MARKOV_VOCAB_PER_TP, D], pl.BF16],
+    markov_lm_head_weight: pl.Tensor[[EP_SIZE, D, MARKOV_VOCAB_PER_TP], pl.BF16],
     markov_markov_w1: pl.Tensor[[EP_SIZE, MARKOV_VOCAB, MARKOV_MARKOV_RANK], pl.BF16],
     markov_markov_w2: pl.Tensor[[EP_SIZE, MARKOV_VOCAB, MARKOV_MARKOV_RANK], pl.BF16],
     markov_confidence_weight: pl.Tensor[[EP_SIZE, 1, D + MARKOV_MARKOV_RANK], pl.FP32],
@@ -747,19 +744,10 @@ def l3_decode_fwd_dspark(
         )
 
     # Sample target.
-    sampling_hidden_window_buf = pld.alloc_window_buffer([SAMPLING_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    sampling_hidden_done_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    sampling_logits_window_buf = pld.alloc_window_buffer([SAMPLING_MAX_LOGIT_ROWS, SAMPLING_VOCAB], dtype=pl.FP32)
-    sampling_logits_done_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        sampling_hidden_window = pld.window(sampling_hidden_window_buf, [SAMPLING_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        sampling_hidden_done = pld.window(sampling_hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        sampling_logits_window = pld.window(sampling_logits_window_buf, [SAMPLING_MAX_LOGIT_ROWS, SAMPLING_VOCAB], dtype=pl.FP32)
-        sampling_logits_done = pld.window(sampling_logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         sample_target_rank(
             x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank], active_widths[rank],
-            target_sampled_ids[rank], sampling_hidden_window, sampling_hidden_done, sampling_logits_window,
-            sampling_logits_done, rank, device=rank,
+            target_sampled_ids[rank], device=rank,
         )
 
     # Accept target.
@@ -990,7 +978,6 @@ def run_recurrent_decode_case(*, devices: tuple[int, ...], compile_only: bool = 
         "moe_num_tokens": ROWS,
     }
     aliases = {
-        "draft_embedding_weight": "lm_head_weight",
         "markov_lm_head_weight": "lm_head_weight",
     }
     specs = {}
