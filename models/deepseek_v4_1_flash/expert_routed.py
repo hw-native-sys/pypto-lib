@@ -491,7 +491,16 @@ def routed_w13_pypto(
     narrows the matmul to the valid rows and this cannot, because narrowing
     the MX_A_ZZ scale load is silently miscompiled.
     """
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_pypto", deps=[input_ready]) as ready:
+    # The extern is declared dual_aiv_dispatch=True and splits the K rows of
+    # each packed panel by get_subblockid(), so its decode runs on both vector
+    # lanes. pl.split(UP_DOWN) is the equivalent: the compiler halves the
+    # region's vector work on the row axis and places the cross-core boundary.
+    # Both route-weight planes are single-column, so a flat view makes a row
+    # range contiguous and lets the copy move it as one row vector.
+    route_flat = pl.tensor.view(route_weights, [1, experts * stride], layout=pl.ND)
+    compact_flat = pl.tensor.view(compact_weights, [1, W13_ROWS], layout=pl.ND)
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_pypto", deps=[input_ready],
+                 optimizations=[pl.split(pl.SplitMode.UP_DOWN)]) as ready:
         core = pl.tile.get_block_idx()
         work_base = 0
         activation_base = 0
@@ -537,21 +546,25 @@ def routed_w13_pypto(
                         # at ``count``: compact rows are packed across experts,
                         # so writing a padded tail would race with the next
                         # expert's own rows.
-                        if block == 0:
-                            for chunk in pl.range((valid + ROUTE_COPY_ROWS - 1) // ROUTE_COPY_ROWS):
-                                chunk_row = row + chunk * ROUTE_COPY_ROWS
-                                chunk_valid = pl.min(ROUTE_COPY_ROWS, count - chunk_row)
-                                weight_rows = pl.load(
-                                    route_weights, [expert * stride + chunk_row, 0],
-                                    [ROUTE_COPY_ROWS, 1], valid_shape=[chunk_valid, 1],
-                                )
-                                compact_weights = pl.store(
-                                    pl.set_validshape(weight_rows, chunk_valid, 1),
-                                    [activation_base + chunk_row, 0], compact_weights,
-                                )
+                        # As the extern does: one contiguous [1, valid] row
+                        # vector, on vector lane 0 only. The row-vector shape
+                        # matters under the UP_DOWN split -- a [n, 1] column
+                        # tile gets halved on the row axis and each lane then
+                        # copies half the rows, while a single-row tile cannot
+                        # be split. It is also one MTE2 burst instead of
+                        # ceil(valid/16) x 16 four-byte descriptors.
+                        if block == 0 and pl.tile.get_subblock_idx() == 0:
+                            weight_row = pl.load(
+                                route_flat, [0, expert * stride + row], [1, W13_M_TILE],
+                                valid_shape=[1, valid],
+                            )
+                            compact_flat = pl.store(
+                                pl.set_validshape(weight_row, 1, valid),
+                                [0, activation_base + row], compact_flat,
+                            )
             work_base = work_base + row_tiles * W13_N_BLOCKS
             activation_base = activation_base + count
-    return pair, compact_weights, ready
+    return pair, compact_flat, ready
 
 
 @pl.jit.extern(
@@ -1006,11 +1019,13 @@ def l2_routed_w13_pypto(
 ):
     """Validation entry for the PyPTO W13 projection; the model uses the extern."""
     ready = pl.system.task_dummy(deps=[])
-    pair, compact_weights, _w13_ready = routed_w13_pypto(
+    # The compacted weights come back as the flat [1, W13_ROWS] view the
+    # kernel writes through; it aliases the same buffer as compact_weights.
+    pair, compact_flat, _w13_ready = routed_w13_pypto(
         x, x_scale, counts, w1, w1_scale, w3, w3_scale, fp4_lut, pair,
         route_weights, compact_weights, ready, N_LOCAL_EXPERTS, RECV_MAX,
     )
-    return pair, compact_weights
+    return pair, compact_flat
 
 
 def golden_routed_w13(tensors):
