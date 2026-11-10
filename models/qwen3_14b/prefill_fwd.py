@@ -2321,6 +2321,8 @@ def golden_qwen3_14b_prefill(tensors):
         * torch.rsqrt(variance + eps)
         * final_norm_weight.float()
     ).bfloat16()
+    tensors["k_cache"].copy_(k_cache)
+    tensors["v_cache"].copy_(v_cache)
     tensors["out"][:] = tiled_lm_head(final_normed, lm_head_weight, LM_HEAD_K_CHUNK, VOCAB_CHUNK)
 
 
