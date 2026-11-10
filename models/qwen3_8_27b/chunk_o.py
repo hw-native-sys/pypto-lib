@@ -65,9 +65,10 @@ def _gdn_chunk_o(
     k_flat = pl.reshape(k, [t_dim, KEY_WIDTH])
     v_flat = pl.reshape(v, [t_dim, VAL_WIDTH])
     o_flat = pl.reshape(o_out, [t_dim, VAL_WIDTH])
-    for c0 in pl.spmd(t_dim // CHUNK_TILE, name_hint="chunk_o",
-                      optimizations=[pl.cross_core_slot(slot_num=1),
-                                     pl.split(pl.SplitMode.UP_DOWN)]):
+    for c0 in pl.spmd(
+        t_dim // CHUNK_TILE, name_hint="chunk_o",
+        optimizations=[pl.cross_core_slot(slot_num=1), pl.split(pl.SplitMode.UP_DOWN)],
+    ):
         t0 = c0 * CHUNK_TILE
         for hh in pl.range(H):
             d0 = hh * D
@@ -98,8 +99,8 @@ def _gdn_chunk_o(
             vc = v_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
             intra = pl.matmul(gated, vc, out_dtype=pl.FP32)
 
-            o_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D] = pl.cast(pl.add(inter, intra),
-                                                           target_type=pl.FP16, mode="rint")
+            o_tile = pl.cast(pl.add(inter, intra), target_type=pl.FP16, mode="rint")
+            o_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D] = o_tile
     return o_out
 
 
@@ -107,9 +108,11 @@ gdn_chunk_o = pl.jit.inline(_gdn_chunk_o)
 gdn_chunk_o_test = pl.jit(_gdn_chunk_o)
 
 
-
-def chunk_o_ref(q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
-            state: torch.Tensor, g_sum: torch.Tensor, chunk: int) -> torch.Tensor:
+def chunk_o_ref(
+    q: torch.Tensor, k: torch.Tensor, v_new: torch.Tensor,
+    state: torch.Tensor, g_sum: torch.Tensor,
+    chunk: int,
+) -> torch.Tensor:
     """S7: the chunk output, inter-chunk plus intra-chunk. -> [T, H, D].
 
     The causal mask includes the diagonal here, unlike :func:`scaled_dot_kkt.kkt_ref`'s.
@@ -175,16 +178,11 @@ def build_tensor_specs(t: int = BENCH_SEQ):
         return (rows >= cols).float()      # inclusive diagonal
 
     return [
-        TensorSpec("q", [t, HG, D], torch.float16,
-                   init_value=draw("q")),
-        TensorSpec("k", [t, HG, D], torch.float16,
-                   init_value=draw("k")),
-        TensorSpec("v", [t, H, D], torch.float16,
-                   init_value=draw("v_new16")),
-        TensorSpec("state", [nc * H * D, D], torch.float16,
-                   init_value=draw("state", flat_state)),
-        TensorSpec("g_sum", [H, t], torch.float32,
-                   init_value=draw("g_sum", to_hT)),
+        TensorSpec("q", [t, HG, D], torch.float16, init_value=draw("q")),
+        TensorSpec("k", [t, HG, D], torch.float16, init_value=draw("k")),
+        TensorSpec("v", [t, H, D], torch.float16, init_value=draw("v_new16")),
+        TensorSpec("state", [nc * H * D, D], torch.float16, init_value=draw("state", flat_state)),
+        TensorSpec("g_sum", [H, t], torch.float32, init_value=draw("g_sum", to_hT)),
         TensorSpec("mask", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_mask),
         TensorSpec("o_out", [t, H, D], torch.float16),
     ]

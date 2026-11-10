@@ -54,9 +54,10 @@ def _gdn_scaled_dot_kkt(
     # BSND [T, Hg, D] viewed as [T, Hg*D]: a per-head slice is a strided 2D window
     k_flat = pl.reshape(k, [t_dim, KEY_WIDTH])
     a_flat = pl.reshape(a_out, [t_dim, A_WIDTH])
-    for c0 in pl.spmd(t_dim // CHUNK_TILE, name_hint="scaled_dot_kkt",
-                      optimizations=[pl.cross_core_slot(slot_num=SLOT_NUM),
-                                     pl.split(pl.SplitMode.UP_DOWN)]):
+    for c0 in pl.spmd(
+        t_dim // CHUNK_TILE, name_hint="scaled_dot_kkt",
+        optimizations=[pl.cross_core_slot(slot_num=SLOT_NUM), pl.split(pl.SplitMode.UP_DOWN)],
+    ):
         t0 = c0 * CHUNK_TILE
         msk = mask[:, :]                       # constant, held for the whole scope
         for hh in pl.range(H):
@@ -110,8 +111,8 @@ def kkt_ref(k: torch.Tensor, beta: torch.Tensor, g_sum: torch.Tensor, chunk: int
             gc = gf[t0 : t0 + chunk, hh]
             diff = gc[:, None] - gc[None, :]
             decay = torch.where(diff <= 0, torch.exp(diff), torch.zeros_like(diff))
-            out[t0 : t0 + chunk, hh, :] = (
-                (kc @ kc.T) * decay * bf[t0 : t0 + chunk, hh, None] * strict_lower)
+            gated = (kc @ kc.T) * decay * bf[t0 : t0 + chunk, hh, None]
+            out[t0 : t0 + chunk, hh, :] = gated * strict_lower
     return out
 
 
@@ -144,12 +145,9 @@ def build_tensor_specs(t: int = BENCH_SEQ):
         return (rows > cols).float()
 
     return [
-        TensorSpec("k", [t, HG, D], torch.float16,
-                   init_value=draw("k")),
-        TensorSpec("beta", [H, t], torch.float32,
-                   init_value=draw("beta", to_hT)),
-        TensorSpec("g_sum", [H, t], torch.float32,
-                   init_value=draw("g_sum", to_hT)),
+        TensorSpec("k", [t, HG, D], torch.float16, init_value=draw("k")),
+        TensorSpec("beta", [H, t], torch.float32, init_value=draw("beta", to_hT)),
+        TensorSpec("g_sum", [H, t], torch.float32, init_value=draw("g_sum", to_hT)),
         TensorSpec("mask", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_mask),
         TensorSpec("a_out", [t, H, CHUNK_TILE], torch.float16),
     ]

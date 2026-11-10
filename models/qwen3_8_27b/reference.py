@@ -123,8 +123,9 @@ def frob_ok(ftol: float = FTOL, diff_thd: float = DIFF_THD, pct_thd: float = PCT
         else:
             # The relation, not a fixed ">": a per-point failure can carry a healthy norm.
             stats = f"frob={value:.4g} ({'>' if value > ftol else '<='}{ftol})"
-        head = (f"    {stats}, max diff={float((act - exp).abs().max()):.4g}, "
-                f"peak |ref|={float(exp.abs().max()):.4g}")
+        max_diff = float((act - exp).abs().max())
+        peak = float(exp.abs().max())
+        head = f"    {stats}, max diff={max_diff:.4g}, peak |ref|={peak:.4g}"
         return False, f"{head}\n{detail}"
 
     cmp.__name__ = "frob_ok"

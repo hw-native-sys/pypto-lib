@@ -88,13 +88,11 @@ def build_tensor_specs(t: int = BENCH_SEQ):
 
         return make
 
-
     def init_tril():
         return torch.tril(torch.ones(CHUNK_TILE, CHUNK_TILE, dtype=torch.float32))
 
     return [
-        TensorSpec("g", [t, H], torch.float32,
-                   init_value=draw("g")),
+        TensorSpec("g", [t, H], torch.float32, init_value=draw("g")),
         TensorSpec("tril", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_tril),
         TensorSpec("g_sum", [H, t], torch.float32),
     ]

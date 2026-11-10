@@ -6,17 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Gated DeltaNet solve_tril: the unit-triangular inverse (I + A)^-1 per (chunk, head).
-
-`A = D + N` with D block-diagonal in blocks of BLOCK_TILE and N strictly
-block-lower, so
-
-    I + A = (I + D)(I + Xd N),   Xd = (I + D)^-1
-    (I + A)^-1 = (I + M)^-1 Xd,  M = Xd N
-
-Each factor comes from the doubling `X = I - D; Y = D @ D; X += X @ Y; Y = Y @ Y`,
-exact because D^BLOCK_TILE = 0 and M^(CHUNK_TILE/BLOCK_TILE) = 0.
-"""
+"""Gated DeltaNet solve_tril: the unit-triangular inverse (I + A)^-1 per (chunk, head)."""
 import pypto.language as pl
 import torch
 
@@ -35,7 +25,7 @@ D = QWEN3_8_27B.linear_value_head_dim       # head dimension; unused here, drawn
 
 # tiling
 A_WIDTH = H * CHUNK_TILE
-BLOCK_TILE = 16         # doubling block; see the split above
+BLOCK_TILE = 16         # doubling block; derivation in docs/models/qwen3_8_27b/index.md
 
 # validation
 # One chunk, the cross-chunk recurrence, then eight chunks. The token count must be a
@@ -51,9 +41,8 @@ if CHUNK_TILE & (CHUNK_TILE - 1):
     raise ValueError(f"CHUNK_TILE must be a power of two, got {CHUNK_TILE}")
 if BLOCK_TILE & (BLOCK_TILE - 1) or BLOCK_TILE < 4 or CHUNK_TILE % BLOCK_TILE or BLOCK_TILE >= CHUNK_TILE:
     raise ValueError(f"BLOCK_TILE must be a power of two in [4, {CHUNK_TILE}), got {BLOCK_TILE}")
-NBLK = CHUNK_TILE // BLOCK_TILE
-ND_IN = BLOCK_TILE.bit_length() - 2          # X updates for (I + D)^-1, since D^BLOCK_TILE = 0
-ND_OUT = NBLK.bit_length() - 2          # X updates for (I + M)^-1, since M^NBLK = 0
+ND_IN = BLOCK_TILE.bit_length() - 2                     # X updates for (I + D)^-1
+ND_OUT = (CHUNK_TILE // BLOCK_TILE).bit_length() - 2    # X updates for (I + M)^-1
 
 
 def _gdn_solve_tril(
@@ -96,9 +85,9 @@ def _gdn_solve_tril(
             xd = pl.matmul_acc(xa, xc, yc)
             xdf = pl.cast(xd, target_type=pl.FP16, mode="rint")
 
-            # --- -M = Xd (-N), strictly block-lower, so M^nblk = 0. The negated N
-            # carries the sign `I - M` needs into the accumulator, and (-M)^2 = M^2
-            # leaves the squaring below unchanged.
+            # --- -M = Xd (-N), strictly block-lower, so M^(CHUNK_TILE // BLOCK_TILE) = 0.
+            # The negated N carries the sign `I - M` needs into the accumulator, and
+            # (-M)^2 = M^2 leaves the squaring below unchanged.
             nm = pl.mul(a_flat[t0 : t0 + CHUNK_TILE, col : col + CHUNK_TILE], m_low[:, :])
             mn = pl.matmul(xdf, nm, out_dtype=pl.FP32)         # -M
             mf = pl.cast(mn, target_type=pl.FP16, mode="rint")
@@ -154,7 +143,7 @@ def solve_tril_ref(a: torch.Tensor, chunk: int) -> torch.Tensor:
     eye = torch.eye(chunk, dtype=REF_DTYPE)
     for t0 in range(0, t, chunk):
         for hh in range(h):
-            out[t0 : t0 + chunk, hh, :] = torch.linalg.inv( eye + af[t0 : t0 + chunk, hh, :])
+            out[t0 : t0 + chunk, hh, :] = torch.linalg.inv(eye + af[t0 : t0 + chunk, hh, :])
     return out
 
 
@@ -183,14 +172,10 @@ def build_tensor_specs(t: int = BENCH_SEQ):
         return make
 
     return [
-        TensorSpec("a_in", [t, H, CHUNK_TILE], torch.float16,
-                   init_value=draw("a16")),
-        TensorSpec("eye", [CHUNK_TILE, CHUNK_TILE], torch.float16,
-                   init_value=lambda: eye_block(CHUNK_TILE)),
-        TensorSpec("m_diag", [CHUNK_TILE, CHUNK_TILE], torch.float16,
-                   init_value=lambda: blk_masks()[0]),
-        TensorSpec("m_low", [CHUNK_TILE, CHUNK_TILE], torch.float16,
-                   init_value=lambda: blk_masks()[1]),
+        TensorSpec("a_in", [t, H, CHUNK_TILE], torch.float16, init_value=draw("a16")),
+        TensorSpec("eye", [CHUNK_TILE, CHUNK_TILE], torch.float16, init_value=lambda: eye_block(CHUNK_TILE)),
+        TensorSpec("m_diag", [CHUNK_TILE, CHUNK_TILE], torch.float16, init_value=lambda: blk_masks()[0]),
+        TensorSpec("m_low", [CHUNK_TILE, CHUNK_TILE], torch.float16, init_value=lambda: blk_masks()[1]),
         TensorSpec("t_out", [t, H, CHUNK_TILE], torch.float16),
     ]
 

@@ -91,9 +91,11 @@ gdn_wy_fast = pl.jit.inline(_gdn_wy_fast)
 gdn_wy_fast_test = pl.jit(_gdn_wy_fast)
 
 
-def wy_fast_ref(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
-            a_inv: torch.Tensor, g_sum: torch.Tensor,
-            chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
+def wy_fast_ref(
+    k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
+    a_inv: torch.Tensor, g_sum: torch.Tensor,
+    chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """S5: the WY representation. -> (W, U), both [T, H, D]."""
     t, hg, d = k.shape
     h = v.shape[1]
@@ -106,9 +108,9 @@ def wy_fast_ref(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor,
             ab = af[t0 : t0 + chunk, hh, :]
             bc = bf[t0 : t0 + chunk, hh, None]
             gc = gf[t0 : t0 + chunk, hh, None]
+            kg = kf[t0 : t0 + chunk, hh // grp, :] * bc * torch.exp(gc)
             u[t0 : t0 + chunk, hh, :] = ab @ (vf[t0 : t0 + chunk, hh, :] * bc)
-            w[t0 : t0 + chunk, hh, :] = ab @ (
-                kf[t0 : t0 + chunk, hh // grp, :] * bc * torch.exp(gc))
+            w[t0 : t0 + chunk, hh, :] = ab @ kg
     return w, u
 
 
@@ -138,15 +140,11 @@ def build_tensor_specs(t: int = BENCH_SEQ):
         return make
 
     return [
-        TensorSpec("k", [t, HG, D], torch.float16,
-                   init_value=draw("k")),
+        TensorSpec("k", [t, HG, D], torch.float16, init_value=draw("k")),
         TensorSpec("v", [t, H, D], torch.float16, init_value=draw("v")),
-        TensorSpec("a_in", [t, H, CHUNK_TILE], torch.float16,
-                   init_value=draw("a_inv16")),
-        TensorSpec("beta", [H, t], torch.float32,
-                   init_value=draw("beta", to_hT)),
-        TensorSpec("g_sum", [H, t], torch.float32,
-                   init_value=draw("g_sum", to_hT)),
+        TensorSpec("a_in", [t, H, CHUNK_TILE], torch.float16, init_value=draw("a_inv16")),
+        TensorSpec("beta", [H, t], torch.float32, init_value=draw("beta", to_hT)),
+        TensorSpec("g_sum", [H, t], torch.float32, init_value=draw("g_sum", to_hT)),
         TensorSpec("w_out", [t, H, D], torch.float16),
         TensorSpec("u_out", [t, H, D], torch.float16),
     ]

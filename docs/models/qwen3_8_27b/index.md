@@ -23,8 +23,14 @@ against it without a translation table.
 | Linear-attention head dim | 128 for both key and value |
 | Short convolution | depthwise, kernel 4, over all 10240 q/k/v channels |
 | Chunk length | 128 — our tiling choice, not a model constant |
-| Platform | Ascend A2/A3 (`-p a2a3`); A5 through the daily job |
+| Platform | Ascend A2/A3 (`-p a2a3`) |
 | Quantization | none — this layer has no weights; it consumes activations |
+
+A2/A3 is the only platform this directory claims in
+[`.github/ci_platforms.json`](../../../.github/ci_platforms.json), so it is the only
+one the daily job runs for these entries, and the only one they have been validated
+on device. Every entry also accepts `-p a5`, but the A5 evidence so far is a manual
+simulator run: no A5 device validation and no daily A5 coverage.
 
 Grouped-query attention is the shape that matters here: value head `h` reads key
 head `h // 3`. q and k carry 16 heads; v, beta, the gate, the state and the
@@ -44,8 +50,39 @@ PTO-ISA implementation splits it. Each file is a standalone entry point.
 | [chunk_h.py](../../../models/qwen3_8_27b/chunk_h.py) | the inter-chunk state recurrence and `V_new` |
 | [chunk_o.py](../../../models/qwen3_8_27b/chunk_o.py) | the chunk output, inter-chunk plus intra-chunk |
 
+### How `solve_tril` inverts a chunk
+
 `solve_tril` is the delta-rule triangular inversion of
-[arXiv:2605.21325](https://arxiv.org/abs/2605.21325).
+[arXiv:2605.21325](https://arxiv.org/abs/2605.21325). `A` is strictly lower
+triangular, so `I + A` is unit triangular and its inverse is a finite Neumann
+series. The kernel reaches it by block doubling rather than by a sequential
+substitution, which keeps the work in the cube.
+
+Split `A = D + N`, with `D` block-diagonal in blocks of `BLOCK_TILE` and `N`
+strictly block-lower. Then
+
+```text
+I + A      = (I + D)(I + Xd N),   Xd = (I + D)^-1
+(I + A)^-1 = (I + M)^-1 Xd,       M  = Xd N
+```
+
+Both factors come from the same doubling step:
+
+```text
+X = I - D;  Y = D @ D
+repeat:  X += X @ Y;  Y = Y @ Y
+```
+
+`X` starts at two terms of the series and each update doubles the term count, so
+the inner factor is exact after `log2(BLOCK_TILE) - 1` updates (`ND_IN` in the
+file, since `D` is nilpotent at `D^BLOCK_TILE`) and the outer factor after
+`log2(CHUNK_TILE / BLOCK_TILE) - 1` (`ND_OUT`, since `M^(CHUNK_TILE /
+BLOCK_TILE) = 0`). Off a power of two the product stops short and the kernel
+returns a truncated inverse with no other symptom, so `solve_tril.py` refuses
+such a `CHUNK_TILE` or `BLOCK_TILE` at import.
+
+The masks that select `D` and `N` are negated, so the accumulator forms `I - D`
+and `I - M` directly; the squaring steps are unaffected because `(-M)^2 = M^2`.
 
 ## The layer
 
@@ -55,11 +92,11 @@ allocated inside it and never leave; only q, k, v, the gate and beta come in, an
 only the output goes out. It is scored end to end against the float64 reference
 rather than stage by stage.
 
-The operators are shared, not duplicated: each `build_kernel` takes `inline`, so
-the same source is either a program of its own or a callee here. The one
-difference from running the stages back to back is that `solve_tril` writes
-`A_inv` as FP16 directly instead of FP32 for a host-side narrowing, since FP16 is
-what its consumer reads.
+The operators are shared, not duplicated: each file decorates one body twice —
+`pl.jit.inline` for the callee this layer calls, `pl.jit` for the standalone
+program the operator's own entry point runs. Both names wrap the same source, so
+the layer and the stages run back to back compute the same thing: `solve_tril`
+writes `A_inv` as FP16 on either path, which is what `wy_fast` reads.
 
 This is the delta rule alone. The four input projections, the depthwise
 convolution over q/k/v, the output gate, the gated RMSNorm and `out_proj` are the
@@ -73,9 +110,11 @@ golden, and scores the device result with the harness's `ratio_reldiff` per poin
 relative Frobenius norm over the whole output.
 [reference.py](../../../models/qwen3_8_27b/reference.py) holds only what they share: the
 drawn inputs, the two layout conversions and the acceptance criterion.
-A default invocation runs each entry's `DEFAULT_CASES`: a single chunk where the entry
-supports one, the cross-chunk recurrence, and the minimum dispatch. `--seq-len` runs one
-shape instead, and `BENCH_SEQ = 8192` is the prefill shape a performance run names.
+A default invocation runs each entry's `DEFAULT_CASES`: one chunk, the cross-chunk
+recurrence and eight chunks (128, 256, 1024 tokens) for the five operators that accept a
+single chunk; `chunk_cumsum` and `gdn_layer` dispatch `CHUNK_TILE * GROUP_TILE = 512`
+tokens at a time, so they run 512 and 1024 instead. `--seq-len` runs one shape
+instead, and `BENCH_SEQ = 8192` is the prefill shape a performance run names.
 `PYPTO_BENCH=1` turns any of them into a benchmark, and the harness prints the median
 `effective_us`.
 

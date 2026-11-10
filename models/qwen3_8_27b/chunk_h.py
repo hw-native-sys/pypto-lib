@@ -64,9 +64,10 @@ def _gdn_chunk_h(
     w_flat = pl.reshape(w, [t_dim, VAL_WIDTH])
     u_flat = pl.reshape(u, [t_dim, VAL_WIDTH])
     v_flat = pl.reshape(v_new, [t_dim, VAL_WIDTH])
-    for hh in pl.spmd(H, name_hint="chunk_h",
-                      optimizations=[pl.cross_core_slot(slot_num=1),
-                                     pl.split(pl.SplitMode.UP_DOWN)]):
+    for hh in pl.spmd(
+        H, name_hint="chunk_h",
+        optimizations=[pl.cross_core_slot(slot_num=1), pl.split(pl.SplitMode.UP_DOWN)],
+    ):
         s0 = pl.full([D, D], dtype=pl.FP32, value=0.0)
         for c, (s_cur,) in pl.range(t_dim // CHUNK_TILE, init_values=(s0,)):
             t0 = c * CHUNK_TILE
@@ -113,8 +114,10 @@ gdn_chunk_h = pl.jit.inline(_gdn_chunk_h)
 gdn_chunk_h_test = pl.jit(_gdn_chunk_h)
 
 
-def chunk_h_ref(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.Tensor,
-            chunk: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def chunk_h_ref(
+    k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.Tensor,
+    chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """S6: the inter-chunk state recurrence.
 
     Returns the state snapshot ENTERING each chunk, [NCHUNK, H, D, D]; the
@@ -138,8 +141,8 @@ def chunk_h_ref(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.
             state[ci, hh] = s
             vc = uf[t0 : t0 + chunk, hh, :] - wf[t0 : t0 + chunk, hh, :] @ s
             v_new[t0 : t0 + chunk, hh, :] = vc
-            kv = (kf[t0 : t0 + chunk, hh // grp, :].T
-                  @ (vc * torch.exp(g_last - gc)[:, None]))
+            vg = vc * torch.exp(g_last - gc)[:, None]
+            kv = kf[t0 : t0 + chunk, hh // grp, :].T @ vg
             s = torch.exp(g_last) * s + kv
         final_state[hh] = s
     return state, v_new, final_state
@@ -176,14 +179,10 @@ def build_tensor_specs(t: int = BENCH_SEQ):
     nc = t // CHUNK_TILE
 
     return [
-        TensorSpec("k", [t, HG, D], torch.float16,
-                   init_value=draw("k")),
-        TensorSpec("w", [t, H, D], torch.float16,
-                   init_value=draw("w16")),
-        TensorSpec("u", [t, H, D], torch.float16,
-                   init_value=draw("u16")),
-        TensorSpec("g_sum", [H, t], torch.float32,
-                   init_value=draw("g_sum", to_hT)),
+        TensorSpec("k", [t, HG, D], torch.float16, init_value=draw("k")),
+        TensorSpec("w", [t, H, D], torch.float16, init_value=draw("w16")),
+        TensorSpec("u", [t, H, D], torch.float16, init_value=draw("u16")),
+        TensorSpec("g_sum", [H, t], torch.float32, init_value=draw("g_sum", to_hT)),
         TensorSpec("state", [nc * H * D, D], torch.float16),
         TensorSpec("v_new", [t, H, D], torch.float16),
     ]

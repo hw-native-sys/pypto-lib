@@ -111,9 +111,11 @@ gdn_layer = pl.jit.inline(_gdn_layer)
 gdn_layer_test = pl.jit(_gdn_layer)
 
 
-
-def delta_rule_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-               beta: torch.Tensor, g: torch.Tensor, chunk: int) -> dict[str, torch.Tensor]:
+def delta_rule_ref(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    beta: torch.Tensor, g: torch.Tensor,
+    chunk: int,
+) -> dict[str, torch.Tensor]:
     """All six stages on the given inputs; every intermediate, `o` the output.
 
     Values crossing a stage boundary are narrowed to the dtype the kernels
@@ -168,17 +170,12 @@ def build_tensor_specs(t: int = BENCH_SEQ):
         TensorSpec("k", [t, HG, D], torch.float16, init_value=draw("k")),
         TensorSpec("v", [t, H, D], torch.float16, init_value=draw("v")),
         TensorSpec("g", [t, H], torch.float32, init_value=draw("g")),
-        TensorSpec("beta", [H, t], torch.float32,
-                   init_value=draw("beta", to_hT)),
+        TensorSpec("beta", [H, t], torch.float32, init_value=draw("beta", to_hT)),
         TensorSpec("tril", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_tril),
-        TensorSpec("mask_strict", [CHUNK_TILE, CHUNK_TILE], torch.float32,
-                   init_value=init_mask_strict),
-        TensorSpec("eye", [CHUNK_TILE, CHUNK_TILE], torch.float16,
-                   init_value=lambda: solve_tril.eye_block(CHUNK_TILE)),
-        TensorSpec("m_diag", [CHUNK_TILE, CHUNK_TILE], torch.float16,
-                   init_value=lambda: solve_tril.blk_masks()[0]),
-        TensorSpec("m_low", [CHUNK_TILE, CHUNK_TILE], torch.float16,
-                   init_value=lambda: solve_tril.blk_masks()[1]),
+        TensorSpec("mask_strict", [CHUNK_TILE, CHUNK_TILE], torch.float32, init_value=init_mask_strict),
+        TensorSpec("eye", [CHUNK_TILE, CHUNK_TILE], torch.float16, init_value=lambda: solve_tril.eye_block(CHUNK_TILE)),
+        TensorSpec("m_diag", [CHUNK_TILE, CHUNK_TILE], torch.float16, init_value=lambda: solve_tril.blk_masks()[0]),
+        TensorSpec("m_low", [CHUNK_TILE, CHUNK_TILE], torch.float16, init_value=lambda: solve_tril.blk_masks()[1]),
         TensorSpec("o_out", [t, H, D], torch.float16),
     ]
 
@@ -186,9 +183,11 @@ def build_tensor_specs(t: int = BENCH_SEQ):
 def golden_gdn_layer(tensors):
     """The whole chain in float64 on the tensors the kernel was given, scored end to end."""
     chunk = tensors["tril"].shape[0]
-    st = delta_rule_ref(tensors["q"].double(), tensors["k"].double(),
-                        tensors["v"].double(), tensors["beta"].t().double(),
-                        tensors["g"].double(), chunk)
+    st = delta_rule_ref(
+        tensors["q"].double(), tensors["k"].double(), tensors["v"].double(),
+        tensors["beta"].t().double(), tensors["g"].double(),
+        chunk,
+    )
     tensors["o_out"].copy_(st["o"])
 
 
