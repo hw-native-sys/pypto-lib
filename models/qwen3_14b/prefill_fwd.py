@@ -957,8 +957,8 @@ def _out_proj_aic_phase(
 def prefill_layer(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
     seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
-    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
-    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
     group_p0: pl.Scalar[pl.INDEX],
     active_prefill_tokens: pl.Scalar[pl.INDEX],
     input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
@@ -1012,10 +1012,10 @@ def prefill_layer(
         resid1_mtile = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.FP32)
         window_done_row = pl.slice(window_done, [1, 8], [b, 0])
         post_norm_tids = pl.array.create(MLP_M_TILE // TOK_TILE, pl.TASK_ID)
-        original_token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX) + group_p0
+        original_token_base = pl.cast(pl.tensor.read(host_chunk_offsets, [b]), pl.INDEX) + group_p0
         token_base = pl.cast(b * MLP_M_TILE, pl.INDEX)
         seq_len_b = pl.tensor.read(seq_lens, [b])
-        full_chunk_len_b = pl.tensor.read(chunk_lens, [b])
+        full_chunk_len_b = pl.tensor.read(host_chunk_lens, [b])
         group_p0_i32 = pl.cast(group_p0, pl.INT32)
         chunk_start = seq_len_b - full_chunk_len_b
         remaining_tok = full_chunk_len_b - group_p0_i32
@@ -1471,8 +1471,8 @@ def prefill_layer(
     return out
 
 
-@pl.jit(auto_scope=False)
-def prefill_fwd(
+@pl.jit.inline(auto_scope=False)
+def _prefill_fwd(
     input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
     seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
     chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
@@ -1497,12 +1497,17 @@ def prefill_fwd(
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
     embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    out: pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    DRAIN_WINDOW: pl.constexpr,
 ) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
     input_ids.bind_dynamic(0, PREFILL_TOKENS_DYN)
     seq_lens.bind_dynamic(0, BATCH_DYN)
     chunk_lens.bind_dynamic(0, BATCH_DYN)
     chunk_offsets.bind_dynamic(0, BATCH_DYN)
+    host_chunk_lens.bind_dynamic(0, BATCH_DYN)
+    host_chunk_offsets.bind_dynamic(0, BATCH_DYN)
     out.bind_dynamic(0, BATCH_DYN)
     block_table.bind_dynamic(0, BLOCK_TABLE_FLAT_DYN)
     slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
@@ -1515,9 +1520,9 @@ def prefill_fwd(
     final_hidden = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
     kv_tail = pl.array.create(NUM_LAYERS * BATCH_PAD, pl.TASK_ID)
 
-    max_chunk_len = pl.tensor.read(chunk_lens, [0])
+    max_chunk_len = pl.tensor.read(host_chunk_lens, [0])
     for b in pl.range(1, batch):
-        max_chunk_len = pl.max(max_chunk_len, pl.tensor.read(chunk_lens, [b]))
+        max_chunk_len = pl.max(max_chunk_len, pl.tensor.read(host_chunk_lens, [b]))
 
     group_blocks = (max_chunk_len + MLP_M_TILE - 1) // MLP_M_TILE
     for p0_idx in pl.range(group_blocks):
@@ -1528,8 +1533,8 @@ def prefill_fwd(
             if batch == 1:
                 window_hidden_pair = pl.create_tensor([2 * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
                 window_done = pl.create_tensor([NUM_LAYERS * BATCH_PAD, 8], dtype=pl.FP32)
-                token_base = pl.cast(pl.tensor.read(chunk_offsets, [0]), pl.INDEX)
-                chunk_len_b = pl.tensor.read(chunk_lens, [0])
+                token_base = pl.cast(pl.tensor.read(host_chunk_offsets, [0]), pl.INDEX)
+                chunk_len_b = pl.tensor.read(host_chunk_lens, [0])
                 valid_tok = pl.min(MLP_M_TILE, pl.max(chunk_len_b - p0, 0))
 
                 with pl.spmd(
@@ -1573,8 +1578,8 @@ def prefill_fwd(
                         window_next = prefill_layer(
                             window_hidden,
                             seq_lens,
-                            chunk_lens,
-                            chunk_offsets,
+                            host_chunk_lens,
+                            host_chunk_offsets,
                             pl.cast(p0, pl.INDEX),
                             pl.cast(MLP_M_TILE, pl.INDEX),
                             input_rms_weight,
@@ -1599,10 +1604,11 @@ def prefill_fwd(
                             layer_idx,
                             kv_tail,
                         )
-                if num_layers_actual > 0:
-                    window_fence_idx = (num_layers_actual - 1) * BATCH_PAD
-                    window_fence = pl.tensor.read(window_done, [window_fence_idx, 0])
-                    pl.tensor.write(window_done, [window_fence_idx, 0], window_fence)
+                if DRAIN_WINDOW:
+                    if num_layers_actual > 0:
+                        window_fence_idx = (num_layers_actual - 1) * BATCH_PAD
+                        window_fence = pl.tensor.read(window_done, [window_fence_idx, 0])
+                        pl.tensor.write(window_done, [window_fence_idx, 0], window_fence)
                 if chunk_len_b > 0:
                     last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
                     if p0_idx == last_group:
@@ -1676,8 +1682,8 @@ def prefill_fwd(
                         group_next = prefill_layer(
                             group_hidden,
                             seq_lens,
-                            chunk_lens,
-                            chunk_offsets,
+                            host_chunk_lens,
+                            host_chunk_offsets,
                             pl.cast(p0, pl.INDEX),
                             pl.cast(batch * MLP_M_TILE, pl.INDEX),
                             input_rms_weight,
@@ -1702,16 +1708,17 @@ def prefill_fwd(
                             layer_idx,
                             kv_tail,
                         )
-                if num_layers_actual > 0:
-                    window_fence_base = (num_layers_actual - 1) * BATCH_PAD
-                    for fence_b in pl.range(batch):
-                        fence_chunk_len = pl.tensor.read(chunk_lens, [fence_b])
-                        if p0 < fence_chunk_len:
-                            window_fence_idx = window_fence_base + fence_b
-                            window_fence = pl.tensor.read(window_done, [window_fence_idx, 0])
-                            pl.tensor.write(window_done, [window_fence_idx, 0], window_fence)
+                if DRAIN_WINDOW:
+                    if num_layers_actual > 0:
+                        window_fence_base = (num_layers_actual - 1) * BATCH_PAD
+                        for fence_b in pl.range(batch):
+                            fence_chunk_len = pl.tensor.read(host_chunk_lens, [fence_b])
+                            if p0 < fence_chunk_len:
+                                window_fence_idx = window_fence_base + fence_b
+                                window_fence = pl.tensor.read(window_done, [window_fence_idx, 0])
+                                pl.tensor.write(window_done, [window_fence_idx, 0], window_fence)
                 for b in pl.parallel(0, batch, 1):
-                    chunk_len_b = pl.tensor.read(chunk_lens, [b])
+                    chunk_len_b = pl.tensor.read(host_chunk_lens, [b])
                     if chunk_len_b > 0:
                         last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
                         if p0_idx == last_group:
@@ -1733,6 +1740,128 @@ def prefill_fwd(
 
     out = rms_lm_head(final_hidden, final_norm_weight, lm_head_weight, seq_lens, out)
     return out
+
+
+@pl.jit(auto_scope=False)
+def prefill_fwd(
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
+    return _prefill_fwd(
+        input_ids,
+        seq_lens,
+        chunk_lens,
+        chunk_offsets,
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        block_table,
+        slot_mapping,
+        k_cache,
+        v_cache,
+        wo,
+        post_rms_weight,
+        w_gate,
+        w_up,
+        w_down,
+        final_norm_weight,
+        lm_head_weight,
+        embed_weight,
+        out,
+        chunk_lens,
+        chunk_offsets,
+        True,
+    )
+
+
+@pl.jit(auto_scope=False)
+def _prefill_fwd_hbg(
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
+    return _prefill_fwd(
+        input_ids,
+        seq_lens,
+        chunk_lens,
+        chunk_offsets,
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        block_table,
+        slot_mapping,
+        k_cache,
+        v_cache,
+        wo,
+        post_rms_weight,
+        w_gate,
+        w_up,
+        w_down,
+        final_norm_weight,
+        lm_head_weight,
+        embed_weight,
+        out,
+        host_chunk_lens,
+        host_chunk_offsets,
+        False,
+    )
 
 
 def build_tensor_specs(
@@ -2195,8 +2324,45 @@ def golden_qwen3_14b_prefill(tensors):
     tensors["out"][:] = tiled_lm_head(final_normed, lm_head_weight, LM_HEAD_K_CHUNK, VOCAB_CHUNK)
 
 
-if __name__ == "__main__":
+def _run_hbg_golden(device: int):
+    from dataclasses import replace
+
+    from golden import run
+    from pypto.ir.distributed_compiled_program import DistributedConfig
+    from pypto.pypto_core import passes
+
+    specs = build_tensor_specs(
+        batch=2, max_seq=64, num_layers=1, use_max_seq=True, chunk_start=16, chunk_size=16,
+    )
+    post_rms_weight = next(spec for spec in specs if spec.name == "post_rms_weight")
+    specs.remove(post_rms_weight)
+    # The HOST entry takes the MLP weights before the post-attention RMS weight.
+    final_norm_index = next(index for index, spec in enumerate(specs) if spec.name == "final_norm_weight")
+    specs.insert(final_norm_index, post_rms_weight)
+    control_specs = [
+        replace(spec, name=f"host_{spec.name}")
+        for spec in specs if spec.name in ("chunk_lens", "chunk_offsets")
+    ]
+    runtime = "host_build_graph"
+    with passes.PassContext([], runtime=passes.runtime_kind_from_name(runtime)):
+        return run(
+            fn=qwen3_prefill_hbg_host,
+            specs=[*specs, *control_specs],
+            golden_fn=golden_qwen3_14b_prefill,
+            config=dict(
+                backend_type="a2a3",
+                execution_mode=False,
+                device_id=device,
+                distributed_config=DistributedConfig(device_ids=[device], num_sub_workers=0, runtime=runtime),
+            ),
+            rtol=5e-3,
+            atol=5e-3,
+        )
+
+
+def _main():
     import argparse
+    import os
     from golden import run
 
     parser = argparse.ArgumentParser()
@@ -2246,6 +2412,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.execution_mode:
         parser.error("this entry requires hardware; --sim is unsupported")
+
+    benchmark = os.environ.get("PYPTO_BENCH", "").strip() not in ("", "0", "false", "False")
+    profile = args.enable_chip_swimlane or args.enable_scope_stats or args.enable_dep_gen
+    if args.backend_type == "a2a3" and not (args.no_golden or benchmark or profile or args.save_data):
+        # Start the HOST entry's child worker before the L2 test opens CANN in this process.
+        print("[RUN] HBG chunked prefill golden", flush=True)
+        hbg_result = _run_hbg_golden(args.device)
+        if not hbg_result.passed:
+            raise SystemExit(hbg_result.error or 1)
 
     result = run(
         fn=prefill_fwd,
@@ -2331,3 +2506,68 @@ def qwen3_prefill_host(  # noqa: PLR0913 — HOST entry over prefill_fwd for ser
         embed_weight,
         out,
     )
+
+
+@pl.jit.host
+def qwen3_prefill_hbg_host(  # noqa: PLR0913 — separate HOST control tensors for HBG
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+) -> pl.Tensor:
+    return _prefill_fwd_hbg(
+        input_ids,
+        seq_lens,
+        chunk_lens,
+        chunk_offsets,
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        block_table,
+        slot_mapping,
+        k_cache,
+        v_cache,
+        wo,
+        post_rms_weight,
+        w_gate,
+        w_up,
+        w_down,
+        final_norm_weight,
+        lm_head_weight,
+        embed_weight,
+        out,
+        host_chunk_lens,
+        host_chunk_offsets,
+    )
+
+
+if __name__ == "__main__":
+    _main()
