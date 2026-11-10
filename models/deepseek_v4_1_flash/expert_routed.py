@@ -26,8 +26,8 @@ if __name__ == "__main__":
     parser.add_argument("--ep", type=int, choices=[2, 4, 8], default=2)
     parser.add_argument("--experts-per-rank", type=int, default=4)
     parser.add_argument("--case", choices=["all", "bounds", "tails", "zero", "full", "balanced"], default="all")
-    parser.add_argument("--mode", choices=["chain", "swiglu"], default="chain",
-                        help="chain validates the full routed expert; swiglu validates the activation alone")
+    parser.add_argument("--mode", choices=["all", "chain", "swiglu"], default="all",
+                        help="swiglu validates the activation alone, chain the full routed expert")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -418,27 +418,40 @@ def routed_swiglu_quant_pypto(
             # SiLU composed from exp and div: PyPTO has no sigmoid primitive and
             # the extern uses the same hardware exp, so the two agree to the
             # instruction's own accuracy rather than to torch's.
-            sigmoid = pl.add(pl.exp(pl.neg(gate)), 1.0)
-            values = pl.mul(pl.div(gate, sigmoid), up)
+            negated = pl.neg(gate)
+            exponential = pl.exp(negated)
+            sigmoid = pl.add(exponential, 1.0)
+            activated = pl.div(gate, sigmoid)
+            gated = pl.mul(activated, up)
             # Loaded here rather than beside the activation: holding the weight
             # column across the exp keeps a third tile live through the widest
             # point of the body.
             weight = pl.load(weights, [row, 0], [SWIGLU_ROW_TILE, 1])
-            values = pl.row_expand_mul(values, weight)
+            values = pl.row_expand_mul(gated, weight)
             groups = pl.reshape(values, [SWIGLU_GROUP_ROWS, MX_GROUP])
             # Upward (ceil) E8M0: adding 2**23 - 1 carries any nonzero mantissa
             # into the exponent field, so the shift yields the biased exponent
             # of the next power of two. Floor first, then scale, as the extern
             # does -- the order is observable when amax is below the floor.
             amax_tmp = pl.tile.create([SWIGLU_GROUP_ROWS, MX_GROUP], dtype=pl.FP32)
-            amax = pl.mul(pl.maximum(pl.row_max(pl.abs(groups), amax_tmp), SWIGLU_SCALE_FLOOR), SWIGLU_MAX_INV)
-            exponent = pl.shrs(pl.add(pl.reinterpret_view(amax, pl.INT32), 8388607), 23)
+            magnitude = pl.abs(groups)
+            group_max = pl.row_max(magnitude, amax_tmp)
+            floored = pl.maximum(group_max, SWIGLU_SCALE_FLOOR)
+            amax = pl.mul(floored, SWIGLU_MAX_INV)
+            amax_bits = pl.reinterpret_view(amax, pl.INT32)
+            carried = pl.add(amax_bits, 8388607)
+            exponent = pl.shrs(carried, 23)
             # Multiply by 2**(127 - exponent) rather than dividing by the scale:
             # both are exact powers of two, and 254 - exponent stays a normal
             # float across the representable E8M0 range.
-            factor = pl.reinterpret_view(pl.shls(pl.add(pl.neg(exponent), 254), 23), pl.FP32)
-            scaled = pl.reshape(pl.row_expand_mul(groups, factor), [SWIGLU_ROW_TILE, MOE_INTER])
-            bounded = pl.minimum(pl.maximum(scaled, -SWIGLU_FP8_MAX), SWIGLU_FP8_MAX)
+            negated_exponent = pl.neg(exponent)
+            reciprocal_exponent = pl.add(negated_exponent, 254)
+            factor_bits = pl.shls(reciprocal_exponent, 23)
+            factor = pl.reinterpret_view(factor_bits, pl.FP32)
+            normalized = pl.row_expand_mul(groups, factor)
+            scaled = pl.reshape(normalized, [SWIGLU_ROW_TILE, MOE_INTER])
+            lifted = pl.maximum(scaled, -SWIGLU_FP8_MAX)
+            bounded = pl.minimum(lifted, SWIGLU_FP8_MAX)
             quantized = pl.cast(bounded, pl.FP8E4M3FN, mode="rint")
             payload = pl.store(quantized, [row, 0], payload)
             # Reshape to a row while the codes are still INT32: a [N, 1] tile of
@@ -447,8 +460,12 @@ def routed_swiglu_quant_pypto(
             exponent_row = pl.reshape(exponent, [1, SWIGLU_GROUP_ROWS])
             # E8M0 codes are the raw biased exponent; wrap past 127 into INT8
             # before the narrowing cast so the byte pattern is preserved.
-            wrapped = pl.sub(exponent_row, pl.mul(pl.shrs(exponent_row, 7), 256))
-            codes = pl.reinterpret_view(pl.reinterpret_view(pl.cast(wrapped, pl.INT8), pl.UINT8), pl.FP8E8M0)
+            sign_bit = pl.shrs(exponent_row, 7)
+            wrap = pl.mul(sign_bit, 256)
+            wrapped = pl.sub(exponent_row, wrap)
+            narrowed = pl.cast(wrapped, pl.INT8)
+            code_bytes = pl.reinterpret_view(narrowed, pl.UINT8)
+            codes = pl.reinterpret_view(code_bytes, pl.FP8E8M0)
             # Group-major order already matches the flat row-major scale plane,
             # so one row tile's codes form a single contiguous run.
             scales = pl.store(codes, [0, row * SWIGLU_SCALE_COLS], scales)
@@ -914,8 +931,19 @@ def _swiglu_row_split(inputs):
     return total, ((total + SWIGLU_ROW_TILE - 1) // SWIGLU_ROW_TILE) * SWIGLU_ROW_TILE
 
 
+def _e4m3_rank(raw):
+    """Map FP8E4M3 bytes onto a signed magnitude order so neighbours differ by one.
+
+    Codes are sign-magnitude, so the raw byte only orders values within one
+    sign. Negating the magnitude for negative codes makes the whole encoding
+    monotone, and then adjacent representable values are exactly one apart.
+    """
+    magnitude = (raw & 0x7F).to(torch.int16)
+    return torch.where((raw & 0x80) != 0, -magnitude, magnitude)
+
+
 def compare_swiglu_payload(actual, expected, *, inputs, **kwargs):
-    """Compare active FP8 payload bytes, allowing one-ULP exp rounding drift."""
+    """Compare active FP8 payload codes, allowing at most one E4M3 ULP of drift."""
     from golden import ratio_reldiff
 
     total, padded = _swiglu_row_split(inputs)
@@ -926,9 +954,19 @@ def compare_swiglu_payload(actual, expected, *, inputs, **kwargs):
         return False, f"payload rows past the tail tile (>= {padded}) were written"
     if total == 0:
         return True, ""
-    # The device computes SiLU from a hardware exp while the golden uses torch's,
+    # The device composes SiLU from a hardware exp while the golden uses torch's,
     # so a value sitting near an E4M3 rounding midpoint may land one code apart.
-    # One E4M3 ULP is 2**-3 relative; anything larger is a real divergence.
+    # Bound that directly on the codes: ratio_reldiff alone would not, because
+    # its per-point cap is unbounded by default and its absolute-error shortcut
+    # admits a zero against a small nonzero. One code is the whole budget.
+    drift = (_e4m3_rank(actual_rows[:total].view(torch.uint8))
+             - _e4m3_rank(expected_rows[:total].view(torch.uint8))).abs()
+    worst = int(drift.max().item())
+    if worst > 1:
+        count = int((drift > 1).sum().item())
+        return False, f"{count} payload codes differ by more than one E4M3 ULP (worst {worst})"
+    # Delegate the distribution check to the shared comparator as well, so the
+    # share of elements allowed to drift at all stays bounded.
     comparator = ratio_reldiff(diff_thd=0.0625, pct_thd=0.01)
     return comparator(actual_rows[:total].float(), expected_rows[:total].float(), inputs=inputs, **kwargs)
 
@@ -988,9 +1026,13 @@ def validate_routed_swiglu(args):
                 specs=build_swiglu_specs(case),
                 golden_fn=golden_routed_swiglu_quant,
                 compare_fn={"payload": compare_swiglu_payload, "scales": compare_swiglu_scales},
-                config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
-                            device_id=args.device),
+                golden_data=args.golden_data,
+                save_data=args.save_data,
                 compile_only=args.compile_only,
+                runtime_dir=args.runtime_dir,
+                config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                            device_id=args.device, enable_chip_swimlane=args.enable_chip_swimlane,
+                            dump_passes=args.dump_passes),
             )
             if not result.passed:
                 raise RuntimeError(f"{label} {case}: {result.error}")
@@ -1004,8 +1046,12 @@ def validate_routed_swiglu(args):
 if __name__ == "__main__":
     from golden import run
 
-    if args.mode == "swiglu":
+    # The activation entries are standalone, so they run first and always:
+    # the chain below only exercises the extern, and the PyPTO formulation
+    # needs default coverage of its own to catch regressions.
+    if args.mode in ("all", "swiglu"):
         validate_routed_swiglu(args)
+    if args.mode == "swiglu":
         raise SystemExit(0)
 
     cases = ("bounds", "tails", "zero") if args.case == "all" else (args.case,)
