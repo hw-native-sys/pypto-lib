@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Token-sharded packed-prefill SWA with local mHC and head-TP attention."""
+"""Token-sharded packed-prefill SWA with local HC and head-TP attention."""
 
 
 from utils import packed_cache_compare
@@ -30,10 +30,10 @@ from config import (
     MAX_BATCH_PER_DP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, PREFILL_MAX_TOKENS, SP_T_DYN,
     WINDOW_CACHE_BYTES,
 )
-from hc import golden_mhc_mixes
-from hc import golden_hc_post, prefill_sp_post
-from hc import golden_hc_collapse, hc_pre, zero_bf16_padding
-from rmsnorm import golden_rms_norm, rms_norm_tiled
+from hc import golden_hc_mixes
+from hc import golden_hc_post, hc_post
+from hc import golden_hc_collapse, hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
+from rmsnorm import golden_rms_norm
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter
 from prefill_cp_allgather import prefill_sp_input_allgather
@@ -201,23 +201,14 @@ def prefill_swa(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    """Gather local mHC inputs, reduce-scatter SWA partials, and update local streams."""
+    """Gather local HC inputs, reduce-scatter SWA partials, and update local streams."""
     tokens = pl.tensor.dim(x_hc, 0)
-    collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_pre(
-        x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        collapsed, next_pre_mix, post_mix, residual_mix,
-        rms_worker_limit=24, head_worker_limit=24,
-    )
-    norm_tokens = pl.tensor.dim(collapsed, 0)
-    norm_block_blocks = (norm_tokens + 7) // 8
-    norm_block_workers = pl.min(norm_block_blocks, 64)
-    for norm_block_worker in pl.spmd(norm_block_workers, name_hint="rms_norm"):
-        for norm_block in pl.range(norm_block_worker, norm_block_blocks, norm_block_workers):
-            rms_norm_tiled(collapsed, attn_norm_weight, local_hidden, norm_block, norm_tokens, output_fp32=False)
+    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, local_hidden, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     zero_bf16_padding(local_hidden, pl.min(tokens, pl.tensor.dim(local_hidden, 0)))
     hidden, gathered = prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, hidden,
@@ -236,9 +227,28 @@ def prefill_swa(
         partial, output_window, output_arrived, attn_out,
         group_base, tp_rank, num_tokens, attention_epoch,
     )
-    prefill_sp_post(
-        attn_out, x_hc, post_mix, residual_mix, output, next_pre_mix, tp_rank, num_tokens, gathered,
-    )
+    hc_rows = pl.tensor.dim(x_hc, 0)
+    hc_active = pl.max(0, pl.min(hc_rows, num_tokens - (tp_rank) * hc_rows))
+    if hc_active > 0:
+        hc_sublayer = attn_out[:hc_active, :]
+        hc_residual = x_hc[:hc_active, :, :]
+        hc_post_mix = post_mix[:hc_active, :]
+        hc_residual_mix = residual_mix[:hc_active, :, :]
+        hc_output = output[:hc_active, :, :]
+        hc_post_deps = pl.array.create(2, pl.TASK_ID)
+        hc_post_deps[0] = gathered
+        hc_post(hc_sublayer, hc_residual, hc_post_mix, hc_residual_mix, hc_output, deps=hc_post_deps)
+    if hc_active < hc_rows:
+        with pl.spmd(32, name_hint="sp_mix_zero_padding", deps=[gathered]):
+            worker = pl.tile.get_block_idx()
+            for row in pl.range(hc_active + worker, hc_rows, 32):
+                # Reduce-scatter supplies zeros for inactive rows.
+                zero_source = pl.cast(attn_out[row:row + 1, 0:16], pl.FP32)
+                zero_output = pl.full([1, HC_MULT * D], dtype=pl.FP32, value=0.0)
+                zero_output = pl.assemble(zero_output, zero_source, [0, 0])
+                output[row:row + 1, :, :] = pl.reshape(zero_output, [1, HC_MULT, D])
+                zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
+                next_pre_mix[row:row + 1, :] = pl.set_validshape(zero_mix, 1, HC_MULT)
     return output, next_pre_mix
 
 
@@ -250,7 +260,7 @@ HC_INPUT_NAMES = (
 )
 
 
-# Layer-0 mHC fixture statistics from DeepSeek-V4.1-Flash at
+# Layer-0 HC fixture statistics from DeepSeek-V4.1-Flash at
 # dba1be0a40aa45a94ad051997016db3960a90277, model-00003-of-00048.safetensors.
 HC_FIXTURE_FN_STD = 0.0225357748568058
 HC_FIXTURE_SCALE = (0.06304993480443954, 0.011977050453424454, 0.06153993308544159)
@@ -543,7 +553,7 @@ def golden_prefill_swa_case(tensors):
         active = int(tensors["num_tokens"][base, 0]) if "num_tokens" in tensors else tokens
         x_hc = tensors["x_hc"][group].flatten(0, 1)[:tokens].clone()
         x_hc[active:] = 0
-        pre_mix, post_mix, residual_mix = golden_mhc_mixes(
+        pre_mix, post_mix, residual_mix = golden_hc_mixes(
             x_hc, tensors["hc_attn_fn"][base],
             tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base],
         )
@@ -568,7 +578,7 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run
     from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill SWA + mHC: A5 precision and timing")
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill SWA + HC: A5 precision and timing")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
@@ -581,7 +591,7 @@ if __name__ == "__main__":
     parser.add_argument("--case", default="mixed", choices=["mixed", "prefix", "shuffle", "masked", "zero", "sink"])
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--fixture", choices=["checkpoint", "random"], default="checkpoint",
-                        help="checkpoint mHC scale/base with synthetic weights, or random stress parameters")
+                        help="checkpoint HC scale/base with synthetic weights, or random stress parameters")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")

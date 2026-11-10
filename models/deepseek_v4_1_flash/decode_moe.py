@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4.1 decode MoE with mHC and expert parallelism."""
+"""DeepSeek-V4.1 decode MoE with HC and expert parallelism."""
 
 from dataclasses import replace
 import sys
@@ -36,13 +36,13 @@ config.N_LOCAL_EXPERTS = _experts_per_rank
 
 
 from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
-from gate import gate
+from gate import gate_from_bf16
 from expert_shared import expert_shared
 from expert_routed import (
     dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
 )
-from hc import hc_pre, hc_post
+from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
 
 
 # model config
@@ -178,15 +178,14 @@ def moe(
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     topk: pl.constexpr = TOPK,
 ) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
-    """Run delayed mHC pre-mix, MoE, and residual expansion."""
+    """Run delayed HC pre-mix, MoE, and residual expansion."""
     t = MOE_TOKENS
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
-    mixes_ready = hc_pre(
-        x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, next_pre_mix, post_mix, residual_mix,
-        rms_worker_limit=64, head_worker_limit=64,
-    )
+    x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
+    hc_head_norm_store(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=64)
+    mixes_ready = hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
     # MoE transport and routed-result scope.
     with pl.scope():
@@ -194,8 +193,8 @@ def moe(
         x_norm_scale = pl.create_tensor([1, t * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         indices = pl.create_tensor([MOE_TOKENS, topk], dtype=pl.INT32)
         weights = pl.create_tensor([t, topk], dtype=pl.FP32)
-        gate(
-            x_mixed, norm_weight, gate_weight, correction_bias, num_tokens,
+        gate_from_bf16(
+            x_norm, gate_weight, correction_bias, num_tokens,
             x_norm_mx, x_norm_scale, indices, weights, n_experts=EP_SIZE * local_experts, topk=topk,
         )
         if BALANCED_ROUTING:
@@ -338,7 +337,7 @@ def l3_moe(
     moe_epoch: pl.Scalar[pl.INT32],
     force_topk: pl.Tensor[[EP_SIZE, MOE_TOKENS, TOPK], pl.INT32],
 ):
-    """EP host driver for the mHC-wrapped Flash MoE block."""
+    """EP host driver for the HC-wrapped Flash MoE block."""
     recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
@@ -407,7 +406,7 @@ def _route_bias():
 
 
 def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
-    """Build mHC, expert weights, EP outputs, and runtime specifications."""
+    """Build HC, expert weights, EP outputs, and runtime specifications."""
     import math
     import torch
     from functools import partial
@@ -516,9 +515,9 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
 
 
 def golden_moe(tensors):
-    """Compose the validated mHC references around the MoE reference."""
+    """Compose the validated HC references around the MoE reference."""
     import torch
-    from hc import golden_mhc_mixes, golden_hc_collapse, golden_hc_post
+    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
     from rmsnorm import golden_rms_norm_tiled
     from gate import golden_gate_normalized_core
     from expert_shared import golden_expert_shared
@@ -531,7 +530,7 @@ def golden_moe(tensors):
     residual_mix = torch.zeros(EP_SIZE, MOE_TOKENS, HC_MULT, HC_MULT, dtype=torch.float32)
     x_mixed = torch.zeros(EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16)
     for rank in range(EP_SIZE):
-        pre, post, residual = golden_mhc_mixes(
+        pre, post, residual = golden_hc_mixes(
             x_hc[rank],
             tensors['hc_ffn_fn'][rank], tensors['hc_ffn_scale'][rank], tensors['hc_ffn_base'][rank],
         )
@@ -554,8 +553,6 @@ def golden_moe(tensors):
     all_scale_logical = []
     all_shared = []
 
-    dummy_tid2eid = torch.zeros(M.vocab_size, TOPK, dtype=torch.int32)
-    dummy_input_ids = torch.zeros(MOE_TOKENS, dtype=torch.int64)
 
     for src in range(EP_SIZE):
         active = int(counts[src])
@@ -567,10 +564,7 @@ def golden_moe(tensors):
             "x_normed": golden_rms_norm_tiled(x_mixed[src], tensors['norm_weight'][src]),
             "gate_w": tensors["gate_weight"][src],
             "gate_bias": tensors["correction_bias"][src],
-            "layer_id": 0,
             "num_tokens": active,
-            "tid2eid": dummy_tid2eid,
-            "input_ids": dummy_input_ids,
             "x_norm_mx": x_norm_mx,
             "x_norm_scale": x_norm_scale,
             "indices": indices,
@@ -675,7 +669,7 @@ def golden_moe(tensors):
     tensors["x_next"][:] = x_next
 
 
-def _local_mhc_compare(num_tokens):
+def _local_hc_compare(num_tokens):
     """Compare the complete local-token output for every EP rank."""
     import torch
     from golden.validation import ratio_reldiff
@@ -743,7 +737,7 @@ def _local_mhc_compare(num_tokens):
                     )
         return True, ""
 
-    compare.__name__ = f"local_mhc_compare(num_tokens={counts.tolist()})"
+    compare.__name__ = f"local_hc_compare(num_tokens={counts.tolist()})"
     return compare
 
 
@@ -804,7 +798,7 @@ if __name__ == "__main__":
     compare_fn = {
         "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
         "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-        "x_next": _local_mhc_compare(counts),
+        "x_next": _local_hc_compare(counts),
     }
 
     result = run(

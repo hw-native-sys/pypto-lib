@@ -755,7 +755,7 @@ def l3_prefill_fwd(
     Residual/pre-mix outputs describe these rows after layer 39. The DSpark
     output packs HC-mean hidden states from layers 37, 38 and 39 per row.
     New tokens
-    start from their own embedding and identity pre-mix; historical mHC state
+    start from their own embedding and identity pre-mix; historical HC state
     is represented by the committed KV/index/compressor caches.
 
     Zero-count ranks participate in EP communication without publishing cache

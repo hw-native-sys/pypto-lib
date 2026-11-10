@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4.1 packed-prefill attention and MoE layer with mHC."""
+"""DeepSeek-V4.1 packed-prefill attention and MoE layer with HC."""
 
 import argparse
 import functools
@@ -65,7 +65,7 @@ from golden import ScalarSpec, TensorSpec, mapped_pool_ratio_allclose, ratio_all
 from golden.validation import ratio_reldiff
 from hc import (
     HC_INPUT_NAMES, make_hc_inputs,
-    golden_mhc_mixes, golden_hc_post, golden_hc_collapse,
+    golden_hc_mixes, golden_hc_post, golden_hc_collapse,
 )
 from prefill_moe import (
     AUX_WIDTH, EP_SIZE, MX_GROUP, N_LOCAL_EXPERTS, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD,
@@ -398,7 +398,7 @@ MOE_REPLICATED_NAMES = MOE_GATE_NAMES + MOE_SHARED_NAMES
 # Cached replicated and rank-local fixtures.
 @functools.lru_cache(maxsize=None)
 def make_ffn_hc_inputs(seed):
-    """FFN-sublayer mHC coefficients and the RMSNorm weight the MoE gate applies."""
+    """FFN-sublayer HC coefficients and the RMSNorm weight the MoE gate applies."""
     import math
 
     gen = torch.Generator().manual_seed(seed)
@@ -462,7 +462,7 @@ def golden_moe_sublayer(tensors, x_hc_mid, attn_pre_mix, tokens):
     mixes = {}
     for base in range(0, world, TP_SIZE):
         mid = x_hc_mid[base]
-        pre, post, comb = golden_mhc_mixes(
+        pre, post, comb = golden_hc_mixes(
             mid, tensors["hc_ffn_fn"][base], tensors["hc_ffn_scale"][base], tensors["hc_ffn_base"][base],
         )
         hidden = golden_hc_collapse(mid, attn_pre_mix[base]).to(torch.bfloat16)
@@ -537,7 +537,7 @@ def make_layer_golden(mode):
         for base in range(0, world, TP_SIZE):
             ranks = range(base, base + TP_SIZE)
             x_hc = tensors["x_hc"][base]
-            pre, post, comb = golden_mhc_mixes(
+            pre, post, comb = golden_hc_mixes(
                 x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base],
             )
             collapsed = golden_hc_collapse(x_hc, tensors["pre_mix"][base]).to(torch.bfloat16)
@@ -572,7 +572,7 @@ def make_layer_golden(mode):
 class StagedMoeReference:
     """The MoE reference re-run on the device's own ``ffn_input`` (teacher forcing).
 
-    The MoE quantizes its input to MXFP8 per group of 32, so one BF16 ULP out of the mHC
+    The MoE quantizes its input to MXFP8 per group of 32, so one BF16 ULP out of the HC
     collapse can move a group scale and with it a routed row; the sublayer therefore keeps its
     standalone budget against this reference while ``ffn_input`` is checked against the golden.
     """
@@ -602,7 +602,7 @@ def compare_ffn_input(actual, expected, *, inputs, actual_outputs, **kwargs):
         valid, _ = check(actual[base], replay, inputs=inputs, actual_outputs=actual_outputs, **kwargs)
         passed &= valid
         passed &= report_stage("ffn_input(end-to-end)", actual[base], expected[base])[0] <= 0.01
-    return passed, "mHC collapse replayed on the device's residual stream, per token row"
+    return passed, "HC collapse replayed on the device's residual stream, per token row"
 
 
 def compare_hc_mixes_output(name, source_name, weight_prefix, coefficient=0):
@@ -614,7 +614,7 @@ def compare_hc_mixes_output(name, source_name, weight_prefix, coefficient=0):
         passed = True
         for base in range(0, actual.shape[0], TP_SIZE):
             stream = inputs["x_hc"][base] if source_name is None else actual_outputs[source_name][base]
-            replay = golden_mhc_mixes(
+            replay = golden_hc_mixes(
                 stream, inputs[f"{weight_prefix}_fn"][base], inputs[f"{weight_prefix}_scale"][base],
                 inputs[f"{weight_prefix}_base"][base],
             )[coefficient]
@@ -634,7 +634,7 @@ def compare_expanded_stream(name, sublayer_name, source_name, weight_prefix, end
         passed = True
         for base in range(0, actual.shape[0], TP_SIZE):
             stream = inputs["x_hc"][base] if source_name is None else actual_outputs[source_name][base]
-            _, post, comb = golden_mhc_mixes(
+            _, post, comb = golden_hc_mixes(
                 stream, inputs[f"{weight_prefix}_fn"][base], inputs[f"{weight_prefix}_scale"][base],
                 inputs[f"{weight_prefix}_base"][base],
             )

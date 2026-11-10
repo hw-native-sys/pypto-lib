@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
-"""C2A full decode attention with mHC."""
+"""C2A full decode attention with HC."""
 
 
 from utils import packed_cache_compare
@@ -354,10 +354,10 @@ def l3_decode_c2a_full(
 
 
 def golden_c2a(tensors, mode="full"):
-    """Compute mHC pre, C2A attention, cache updates, and mHC post."""
+    """Compute HC pre, C2A attention, cache updates, and HC post."""
     import torch
     from compressor import golden_c2a_compressor
-    from hc import golden_mhc_mixes, golden_hc_collapse, golden_hc_post
+    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
     from rmsnorm import golden_rms_norm
     from qkv_proj_rope import golden_qkv_proj_rope, golden_rope_tail
     from decode_indexer import golden_c2a_index
@@ -372,7 +372,7 @@ def golden_c2a(tensors, mode="full"):
     t["compressed_cache"], t["compressed_cache_scale"] = unpack_quantized_cache(tensors["compressed_cache"], True, head_dim=tensors["kv_norm_weight"].numel())
     if "x_hc" in t:
         x_hc = t["x_hc"]
-        next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
+        next_pre_mix, post_mix, residual_mix = golden_hc_mixes(
             x_hc, t["hc_attn_fn"], t["hc_attn_scale"], t["hc_attn_base"],
         )
         attention_input = golden_hc_collapse(x_hc, t["pre_mix"]).to(torch.bfloat16)
@@ -473,7 +473,7 @@ def golden_c2a(tensors, mode="full"):
 def build_c2a_specs(
     mode, tokens=24, requests=6, seed=17, case="mixed", start_pos=None, query_lens=None, *, param_names=None,
 ):
-    """Build C2A mHC, attention, cache, and runtime specifications."""
+    """Build C2A HC, attention, cache, and runtime specifications."""
     import torch
     import math
     from config import MAX_BATCH_PER_DP, BLOCK_SIZE
@@ -699,7 +699,7 @@ if __name__ == "__main__":
     import argparse
     from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="TP1 A5 mHC C2A full validation")
+    parser = argparse.ArgumentParser(description="TP1 A5 HC C2A full validation")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)

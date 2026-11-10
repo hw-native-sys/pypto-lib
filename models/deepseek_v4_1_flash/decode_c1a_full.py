@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
-"""C1A full decode attention with mHC."""
+"""C1A full decode attention with HC."""
 
 
 from utils import packed_cache_compare
@@ -350,7 +350,7 @@ def l3_decode_c1a_full(
 
 
 def golden_c1a(tensors, mode="full"):
-    """Compute mHC pre, C1A attention, cache updates, and mHC post."""
+    """Compute HC pre, C1A attention, cache updates, and HC post."""
     import torch
 
     from compressor import golden_c1a_compressor
@@ -366,14 +366,14 @@ def golden_c1a(tensors, mode="full"):
     )
     from utils import _publish_quantized_cache
 
-    from hc import golden_mhc_mixes, golden_hc_collapse, golden_hc_post
+    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
     from rmsnorm import golden_rms_norm
 
     a = dict(tensors)
     a["window_cache"], a["window_cache_scale"] = unpack_quantized_cache(tensors["window_cache"], False, head_dim=tensors["kv_norm_weight"].numel())
     a["compressed_cache"], a["compressed_cache_scale"] = unpack_quantized_cache(tensors["compressed_cache"], True, head_dim=tensors["kv_norm_weight"].numel())
     x_hc = a["x_hc"]
-    next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
+    next_pre_mix, post_mix, residual_mix = golden_hc_mixes(
         x_hc, a["hc_attn_fn"], a["hc_attn_scale"], a["hc_attn_base"],
     )
     attention_input = golden_hc_collapse(x_hc, a["pre_mix"]).to(torch.bfloat16)
@@ -450,7 +450,7 @@ def golden_c1a(tensors, mode="full"):
 def build_c1a_specs(
     mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None, query_lens=None, *, param_names=None,
 ):
-    """Build C1A mHC, attention, cache, and runtime tensor specifications."""
+    """Build C1A HC, attention, cache, and runtime tensor specifications."""
     import torch
 
     from functools import partial
@@ -596,7 +596,7 @@ def build_c1a_specs(
     generator = torch.Generator().manual_seed(seed)
     local_tokens = tokens
     values["x_hc"] = torch.randn(local_tokens, HC_MULT, D, generator=generator)
-    # Incoming staggered mHC mix.
+    # Incoming staggered HC mix.
     values["pre_mix"] = torch.sigmoid(torch.randn(local_tokens, HC_MULT, generator=generator))
     values["hc_attn_fn"] = torch.randn(MIX_HC, HC_DIM, generator=generator) / math.sqrt(HC_DIM)
     values["hc_attn_scale"] = torch.randn(3, generator=generator)
@@ -627,7 +627,7 @@ if __name__ == "__main__":
 
     from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="TP1 A5 mHC C1A full validation")
+    parser = argparse.ArgumentParser(description="TP1 A5 HC C1A full validation")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
