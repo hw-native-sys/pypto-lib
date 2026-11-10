@@ -18,7 +18,7 @@ import pypto.language as pl
 import torch
 
 from models.glm5_3_flash.config import FLASH, D
-from models.glm5_3_flash.elementwise import _sum_fp32_reference
+from models.glm5_3_flash.elementwise import _sum_fp32_reference, accurate_row_sum_parts, accurate_rsqrt
 from models.glm5_3_flash.quantization import INT8_SCALE_MAX, quantize_per_token_int8
 from models.glm5_3_flash.utils import _check, _report
 
@@ -44,6 +44,7 @@ def rmsnorm(
         t0 = block * NORM_T_TILE
         valid_rows = pl.min(NORM_T_TILE, t_dim - t0)
         square_sum = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
+        square_error = pl.full([1, NORM_T_TILE], dtype=pl.FP32, value=0.0)
         for norm_k in pl.pipeline(0, width, NORM_D_TILE, stage=1):
             norm_columns = pl.min(NORM_D_TILE, width - norm_k)
             norm_part = pl.slice(x, [NORM_T_TILE, NORM_D_TILE], [t0, norm_k], valid_shape=[valid_rows, norm_columns])
@@ -51,18 +52,25 @@ def rmsnorm(
             norm_square = pl.create_tensor([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32)
             norm_square[:, :] = pl.full([NORM_T_TILE, NORM_D_TILE], dtype=pl.FP32, value=0.0)
             norm_square[:, :] = pl.mul(norm_value, norm_value)
-            row_sum = pl.row_sum(norm_square)
-            part_sum = pl.reshape(row_sum, [1, NORM_T_TILE])
-            square_sum = pl.add(square_sum, part_sum)
-        sum_buffer = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
+            part_high, part_low = accurate_row_sum_parts(norm_square, 128)
+            part_sum = pl.reshape(part_high, [1, NORM_T_TILE])
+            part_error = pl.reshape(part_low, [1, NORM_T_TILE])
+            updated_sum = pl.add(square_sum, part_sum)
+            recovered = pl.sub(updated_sum, square_sum)
+            error = pl.add(pl.sub(square_sum, pl.sub(updated_sum, recovered)), pl.sub(part_sum, recovered))
+            square_error = pl.add(square_error, pl.add(error, part_error))
+            square_sum = updated_sum
+        sum_high = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
+        sum_low = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
         denominator = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
-        sum_buffer[:, :] = square_sum
+        sum_high[:, :] = square_sum
+        sum_low[:, :] = square_error
         denominator[:, :] = pl.add(pl.mul(square_sum, 0.0), pl.cast(pl.cast(width, pl.INT32), pl.FP32))
-        mean = pl.div(sum_buffer, denominator)
+        rounded_sum = pl.add(sum_high, sum_low)
+        mean = pl.div(rounded_sum, denominator)
         norm_argument = pl.create_tensor([1, NORM_T_TILE], dtype=pl.FP32)
         norm_argument[:, :] = pl.add(mean, EPS)
-        # MLA W8A8 query validation requires the high-precision inverse RMS.
-        inverse = pl.rsqrt(norm_argument, high_precision=True)
+        inverse = accurate_rsqrt(norm_argument)
         inv_rms = pl.reshape(inverse, [NORM_T_TILE, 1])
         for k0 in pl.pipeline(0, width, NORM_D_TILE, stage=2):
             norm_columns = pl.min(NORM_D_TILE, width - k0)

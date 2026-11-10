@@ -44,8 +44,9 @@ def bf16_linear(
     K_DIM: pl.constexpr,
     B_TRANS: pl.constexpr,
 ):
-    """Accumulate BF16 dot-product blocks with FP32 sums."""
+    """Accumulate BF16 dot-product blocks with compensated FP32 sums."""
     total = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
+    correction = pl.full([M_TILE, N_TILE], dtype=pl.FP32, value=0.0)
     for k0 in pl.pipeline(0, K_DIM, 1, stage=1):
         x_part = pl.slice(x, [M_TILE, DOT_K_TILE], [x_start, k0], valid_shape=[valid_rows, 1])
         x_full = pl.set_validshape(pl.fillpad(x_part, pad_value=pl.PadValue.zero), M_TILE, DOT_K_TILE)
@@ -57,8 +58,13 @@ def bf16_linear(
             w_forward = pl.slice(weight, [DOT_K_TILE, N_TILE], [k0, w_start], valid_shape=[1, weight_rows])
             w_forward_full = pl.set_validshape(pl.fillpad(w_forward, pad_value=pl.PadValue.zero), DOT_K_TILE, N_TILE)
             partial = pl.matmul(x_full, w_forward_full, out_dtype=pl.FP32)
-        total = pl.add(total, partial)
-    return total
+        updated = pl.add(total, partial)
+        recovered = pl.sub(updated, total)
+        left_error = pl.sub(total, pl.sub(updated, recovered))
+        right_error = pl.sub(partial, recovered)
+        correction = pl.add(correction, pl.add(left_error, right_error))
+        total = updated
+    return pl.add(total, correction)
 
 
 @pl.jit.inline
