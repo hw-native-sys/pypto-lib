@@ -177,6 +177,7 @@ def moe(
     force_topk: pl.Tensor,
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     topk: pl.constexpr = TOPK,
+    dispatch_worker_limit: pl.constexpr = 0,
 ) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
     """Run delayed HC pre-mix, MoE, and residual expansion."""
     t = MOE_TOKENS
@@ -224,7 +225,7 @@ def moe(
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
             data_arrived, num_tokens, ep_rank, moe_epoch,
-            local_experts=local_experts, topk=topk,
+            local_experts=local_experts, topk=topk, dispatch_worker_limit=dispatch_worker_limit,
         )
 
         scatter_done = expert_routed_scatter(
@@ -302,7 +303,8 @@ def l2_moe(
         next_pre_mix, x_mixed, x_next,
         recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
         data_arrived, routed_output, combine_arrived,
-        local_num_tokens, ep_rank, moe_epoch, force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
+        local_num_tokens, ep_rank, moe_epoch, force_topk,
+        local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
     )
     clear_moe_signals(x_next, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_next

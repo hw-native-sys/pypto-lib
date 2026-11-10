@@ -387,7 +387,7 @@ def decode_encoder(
                 data_arrived,
                 routed_output, combine_arrived,
                 local_moe_tokens, rank, layer + 1,
-                force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
+                force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
             )
     return x_hc, pre_mix, token_rope_cos, token_rope_sin
 
@@ -653,7 +653,7 @@ def decode_decoder(
                 data_arrived,
                 routed_output, combine_arrived,
                 local_moe_tokens, rank, layer + 1,
-                force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
+                force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=0,
             )
         # This residual enters the next layer's attention.
         target_layer = layer + 1
