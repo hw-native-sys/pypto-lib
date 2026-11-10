@@ -351,7 +351,7 @@ def _routed_w2(
 
 
 @pl.jit.inline(auto_scope=False)
-def _expert_routed_output(
+def expert_routed_output(
     x: pl.Tensor,
     x_scale: pl.Tensor,
     weights: pl.Tensor,
@@ -423,7 +423,7 @@ def expert_routed_scatter(
     """Compute active expert rows and scatter each source interval to its route destinations."""
     recv_x_flat = pl.reshape(recv_x, [local_experts * RECV_MAX, D])
     route_weights = pl.reshape(recv_weights, [local_experts * RECV_MAX, 1])
-    output, down_ready = _expert_routed_output(
+    output, down_ready = expert_routed_output(
         recv_x_flat, recv_mx_scale, route_weights, recv_expert_count,
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale, input_ready,
@@ -490,7 +490,7 @@ def local_compute_test(
     input_ready = pl.system.task_dummy(deps=[])
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
     route_weights = pl.reshape(recv_weights, [N_LOCAL_EXPERTS * RECV_MAX, 1])
-    output, down_ready = _expert_routed_output(
+    output, down_ready = expert_routed_output(
         recv_x_flat, recv_mx_scale, route_weights, recv_expert_count,
         routed_w1_packed, routed_w1_scale, routed_w3_packed, routed_w3_scale,
         routed_w2_packed, routed_w2_scale, input_ready,

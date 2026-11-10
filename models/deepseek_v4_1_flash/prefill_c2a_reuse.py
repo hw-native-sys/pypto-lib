@@ -278,7 +278,7 @@ def prefill_c2a_reuse(
         attention_partial, output_window, output_arrived, attn_output, group_base, tp_rank, num_tokens, attention_epoch,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_output, x_hc, post_mix, residual_mix, x_hc_out, deps=hc_post_deps)
+    hc_post(attn_output, x_hc, post_mix, residual_mix, x_hc_out, deps=hc_post_deps, active=-1)
     return x_hc_out
 
 

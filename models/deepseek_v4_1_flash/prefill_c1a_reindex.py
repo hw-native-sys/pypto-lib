@@ -550,7 +550,7 @@ def prefill_c1a_reindex(
         scatter_output=False, use_candidates=True,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
+    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps, active=-1)
     return output
 
 

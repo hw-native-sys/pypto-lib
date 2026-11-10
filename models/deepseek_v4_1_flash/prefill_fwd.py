@@ -580,7 +580,7 @@ def l2_prefill_fwd(
             inv_rms, mix_partials = hc_project(owner_hidden, layer_attn_fn, rms_worker_limit=64)
             hc_sinkhorn(inv_rms, mix_partials, layer_attn_scale, layer_attn_base, owner_pre, owner_post, owner_residual)
             hc_post_deps = pl.array.create(2, pl.TASK_ID)
-            hc_post(owner_output, owner_hidden, owner_post, owner_residual, owner_destination, deps=hc_post_deps)
+            hc_post(owner_output, owner_hidden, owner_post, owner_residual, owner_destination, deps=hc_post_deps, active=-1)
         moe_ready = prefill_moe_slabs(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,

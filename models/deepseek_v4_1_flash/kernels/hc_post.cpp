@@ -27,7 +27,7 @@ using Mix = Vec<float, 1, 32>;
 __tf__ __aicore__ inline void mix_streams(
     Streams::TileDType __out__ output, Hidden::TileDType __in__ hidden,
     Streams::TileDType __in__ residual, Mix::TileDType __in__ coefficients,
-    uint16_t first, uint16_t count) {
+    uint16_t first, uint16_t count, bool has_sublayer) {
     auto dst = (__ubuf__ float*)__cce_get_tile_ptr(output);
     auto x = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(hidden);
     auto r = (__ubuf__ float*)__cce_get_tile_ptr(residual);
@@ -35,7 +35,7 @@ __tf__ __aicore__ inline void mix_streams(
 #if defined(__CPU_SIM)
     for (int h = first; h < first + count; ++h) {
         for (int k = 0; k < 2560; ++k) {
-            float value = static_cast<float>(x[k]) * c[h];
+            float value = (has_sublayer ? static_cast<float>(x[k]) : 0.0f) * c[h];
             for (int i = 0; i < 4; ++i) value = value + r[i * 2560 + k] * c[8 + i * 4 + h];
             dst[h * 2560 + k] = value;
         }
@@ -46,8 +46,12 @@ __tf__ __aicore__ inline void mix_streams(
         for (uint16_t k = 0; k < 40; ++k) {
             RegTensor<bfloat16_t> rounded;
             RegTensor<float> value, x0, r0, r1, r2, r3, coef, term;
-            vlds(rounded, x, k * 64, UNPK_B16);
-            vcvt(x0, rounded, full, PART_EVEN);
+            if (has_sublayer) {
+                vlds(rounded, x, k * 64, UNPK_B16);
+                vcvt(x0, rounded, full, PART_EVEN);
+            } else {
+                vbr(x0, 0.0f);
+            }
             vlds(r0, r, k * 64, NORM);
             vlds(r1, r, 2560 + k * 64, NORM);
             vlds(r2, r, 5120 + k * 64, NORM);
@@ -75,6 +79,7 @@ __tf__ __aicore__ inline void mix_streams(
 }
 __aicore__ inline void process(__gm__ int64_t* args, int chunk, int first, int count) {
     int row = chunk / 2, column = chunk % 2 * 2560;
+    const bool has_sublayer = args[6] < 0 || row < args[6];
     Hidden hidden;
     Streams residual, output;
     using Post = Tile<TileType::Vec, float, 1, 8, BLayout::RowMajor, 1, 4>;
@@ -96,13 +101,13 @@ __aicore__ inline void process(__gm__ int64_t* args, int chunk, int first, int c
         data<float>(args, 2) + row * 4);
     GlobalTensor<float, TileShape2D<float, 1, 16>, BaseShape2D<float, 1, 16>> m(
         data<float>(args, 3) + row * 16);
-    TLOAD(hidden, x);
+    if (has_sublayer) TLOAD(hidden, x);
     TLOAD(residual, r);
     TLOAD(post, p);
     TLOAD(res_mix, m);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    mix_streams(output.data(), hidden.data(), residual.data(), mix.data(), first, count);
+    mix_streams(output.data(), hidden.data(), residual.data(), mix.data(), first, count, has_sublayer);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     if (count == 4) {

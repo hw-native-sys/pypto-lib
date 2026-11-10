@@ -412,7 +412,7 @@ def draft_layer(
     zero_bf16_padding(attention_output, num_tokens)
     attention_hidden = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps)
+    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps, active=-1)
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     moe(
         attention_hidden,

@@ -231,7 +231,7 @@ def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
                include_dirs=(pto_isa_include_dir(),))
 def _hc_post(
     sublayer: pl.Tensor, residual: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
-    output: pl.Out[pl.Tensor], tokens: pl.Scalar[pl.INDEX],
+    output: pl.Out[pl.Tensor], tokens: pl.Scalar[pl.INDEX], active: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
     """Mix four residual streams with ordered FP32 register operations."""
     ...
@@ -245,12 +245,13 @@ def hc_post(
     residual_mix: pl.Tensor,
     output: pl.Tensor,
     deps: pl.Array[2, pl.TASK_ID],
+    active: pl.Scalar[pl.INT32],
 ):
-    """Mix all four residual streams after the supplied producer dependencies."""
+    """Mix residual streams with a zero sublayer beyond active; -1 includes every row."""
     tokens = pl.tensor.dim(sublayer, 0)
     workers = pl.min(tokens * (D // D_TILE) * HC_MULT, POST_WORKER_TILE)
     with pl.spmd(workers, name_hint="hc_post", deps=[deps]):
-        _hc_post(sublayer, residual, post_mix, residual_mix, output, tokens)
+        _hc_post(sublayer, residual, post_mix, residual_mix, output, tokens, active)
     return output
 
 
@@ -470,7 +471,7 @@ def l2_hc_post(
     residual_mix.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps)
+    hc_post(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps, active=-1)
     return output
 
 

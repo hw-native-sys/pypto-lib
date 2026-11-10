@@ -168,7 +168,7 @@ def decode_c1a_full(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out, num_tokens, worker_limit=32,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
+    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps, active=-1)
     return output
 
 
