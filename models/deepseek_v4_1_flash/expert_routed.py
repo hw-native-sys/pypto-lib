@@ -26,6 +26,8 @@ if __name__ == "__main__":
     parser.add_argument("--ep", type=int, choices=[2, 4, 8], default=2)
     parser.add_argument("--experts-per-rank", type=int, default=4)
     parser.add_argument("--case", choices=["all", "bounds", "tails", "zero", "full", "balanced"], default="all")
+    parser.add_argument("--mode", choices=["all", "chain", "w13"], default="all",
+                        help="w13 validates the gate/up projection alone, chain the full routed expert")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -78,6 +80,33 @@ MX_PACKED_LANE_COLS = MX_MM_INTER_TILE // 2
 MX_W1_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W3_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * MX_PACKED_LANE_ROWS
+
+# PyPTO W13 projection tiling, mirroring kernels/expert_routed_w13.cpp. The
+# extern uses M_TILE/N_TILE/K_TILE = 64/256/256; the PyPTO K tile is halved
+# because pl.cast has no direct packed-FP4 to FP8E4M3 path (see the FP4
+# operator-support table in the PyPTO docs), so the unpack holds a BF16
+# intermediate of the same extent alongside the packed source and the FP8
+# result. 128 keeps all three inside Vec.
+# 32, not the extern's 64, because every projection must run on a FULL row
+# tile: narrowing an MX_A_ZZ activation-scale load with valid_shape is
+# silently miscompiled. A full tile stays inside the expert's stride only if
+# the tile divides it, and RECV_MAX = EP_SIZE * MOE_TOKENS is a multiple of 32
+# but not of 64. Clamping the last tile instead would need pl.min, whose
+# result the MX offset prover cannot see through.
+W13_M_TILE = 32
+W13_N_TILE = MX_MM_INTER_TILE
+W13_K_TILE = MX_K_TILE // 2
+W13_N_BLOCKS = MOE_INTER // W13_N_TILE
+W13_SCALE_K = W13_K_TILE // MX_GROUP
+# A packed weight plane stores one (n_block, k_block) panel as MX_K_TILE rows
+# of MX_PACKED_LANE_COLS bytes, panels ordered n-major. The row offset of the
+# K slice starting at k therefore collapses to n_block * K + k, where K is the
+# projection's reduction width (D for W1/W3).
+W13_PACKED_EXPERT_ROWS = MX_W1_PACKED_ROWS
+# Route weights are copied in 16-row chunks, matching the granularity the
+# compact row layout already guarantees, so only the final chunk of an expert
+# carries a runtime valid extent.
+ROUTE_COPY_ROWS = 16
 
 
 @pl.jit.inline(auto_scope=False)
@@ -304,6 +333,162 @@ def _routed_w13(
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Store compact BF16 projections and route weights with the same row order."""
     return pair, compact_weights
+
+
+@pl.jit.inline(auto_scope=False)
+def _w13_projection(
+    x: pl.Tensor,
+    x_scale: pl.Tensor,
+    weight: pl.Tensor,
+    weight_scale: pl.Tensor,
+    x_row: pl.Scalar[pl.INDEX],
+    expert: pl.Scalar[pl.INDEX],
+    col: pl.Scalar[pl.INDEX],
+    experts: pl.constexpr,
+    stride: pl.constexpr,
+):
+    """Accumulate one [W13_M_TILE, W13_N_TILE] MXFP4 x MXFP8 projection tile.
+
+    The packed plane of one expert holds its (n_block, k_block) panels
+    n-major, each MX_K_TILE rows of MX_PACKED_LANE_COLS bytes, so the K slice
+    starting at ``k`` lives at ``expert * W13_PACKED_EXPERT_ROWS +
+    col // W13_N_TILE * D + k``.
+
+    Both activation loads take the whole W13_M_TILE row extent. Narrowing
+    them with valid_shape is what the caller must avoid: a partial valid row
+    extent on the MX_A_ZZ scale tile is silently miscompiled, so the caller
+    keeps every tile full and bounds only its store.
+
+    The views are rebuilt here rather than hoisted to the caller because an
+    inline parameter must carry statically inferable tensor metadata, which a
+    view produced in the caller does not.
+    """
+    x_scale_zz = pl.tensor.view(x_scale, [experts * stride, K_SCALE], layout=pl.MX_A_ZZ)
+    weight_flat = pl.tensor.view(
+        weight, [experts * W13_PACKED_EXPERT_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND,
+    )
+    panel_row = expert * W13_PACKED_EXPERT_ROWS + col // W13_N_TILE * D
+    scale_row = expert * K_SCALE
+    a0 = pl.load(x, [x_row, 0], [W13_M_TILE, W13_K_TILE])
+    a_scale0 = pl.load(x_scale_zz, [x_row, 0], [W13_M_TILE, W13_SCALE_K])
+    # Each packed byte carries two E2M1 nibbles adjacent along N, low nibble
+    # first, so the numerical cast expands the column extent 2:1 back to
+    # W13_N_TILE. BF16 is an exact intermediate -- all sixteen E2M1 values are
+    # representable in BF16 and in FP8E4M3 -- so this reproduces the extern's
+    # single TCVT bit for bit. It is spelled out rather than left to
+    # pl.cast(fp4, pl.FP8E4M3FN), which legalizes through BF16 *and* FP32; the
+    # FP32 intermediate does not fit alongside the rest of the working set.
+    packed0 = pl.load(weight_flat, [panel_row, 0], [W13_K_TILE, MX_PACKED_LANE_COLS])
+    b0 = pl.cast(pl.cast(pl.reinterpret_view(packed0, pl.FP4E2M1X2), pl.BF16), pl.FP8E4M3FN)
+    b_scale0 = pl.load(weight_scale, [scale_row, col], [W13_SCALE_K, W13_N_TILE])
+    acc = pl.matmul_mx(a0, a_scale0, b0, b_scale0)
+    for k0 in pl.range(W13_K_TILE, D, W13_K_TILE):
+        a = pl.load(x, [x_row, k0], [W13_M_TILE, W13_K_TILE])
+        a_scale = pl.load(x_scale_zz, [x_row, k0 // MX_GROUP], [W13_M_TILE, W13_SCALE_K])
+        packed = pl.load(weight_flat, [panel_row + k0, 0], [W13_K_TILE, MX_PACKED_LANE_COLS])
+        b = pl.cast(pl.cast(pl.reinterpret_view(packed, pl.FP4E2M1X2), pl.BF16), pl.FP8E4M3FN)
+        b_scale = pl.load(
+            weight_scale, [scale_row + k0 // MX_GROUP, col], [W13_SCALE_K, W13_N_TILE],
+        )
+        acc = pl.matmul_mx_acc(acc, a, a_scale, b, b_scale)
+    return acc
+
+
+@pl.jit.inline(auto_scope=False)
+def routed_w13_pypto(
+    x: pl.Tensor,
+    x_scale: pl.Tensor,
+    counts: pl.Tensor,
+    w1: pl.Tensor,
+    w1_scale: pl.Tensor,
+    w3: pl.Tensor,
+    w3_scale: pl.Tensor,
+    pair: pl.Tensor,
+    route_weights: pl.Tensor,
+    compact_weights: pl.Tensor,
+    input_ready: pl.Scalar[pl.TASK_ID],
+    experts: pl.constexpr,
+    stride: pl.constexpr,
+):
+    """PyPTO equivalent of :func:`_routed_w13`, kept for precision only.
+
+    The model still calls the extern; this entry exists so the PyPTO
+    formulation stays validated while its performance is tuned separately.
+    Remove ``_routed_w13`` and ``kernels/expert_routed_w13.cpp`` only once
+    this reaches parity.
+
+    Input rows are expert-strided (``expert * stride + row``) while the gate
+    and up columns of ``pair`` and the rows of ``compact_weights`` are compact
+    across experts, matching the extern's row order exactly so the existing
+    SwiGLU and W2 stages consume either indistinguishably.
+
+    Each work item owns one [W13_M_TILE, W13_N_TILE] output tile and computes
+    both projections for it, so the activation tiles are loaded once for the
+    gate and up halves. The extern instead makes gate and up separate work
+    items; the output tiling and the row-rotated core assignment are the same,
+    so the load balance differs only in granularity.
+    """
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_pypto", deps=[input_ready]) as ready:
+        core = pl.tile.get_block_idx()
+        work_base = 0
+        activation_base = 0
+        for expert in pl.range(experts):
+            count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
+            row_tiles = (count + W13_M_TILE - 1) // W13_M_TILE
+            # Work items are walked in index order and filtered by owner rather
+            # than entered at a rotated start. The assignment is the extern's --
+            # item w of this expert belongs to core (work_base + w) % blocks,
+            # which keeps consecutive experts filling the same core ring instead
+            # of all restarting at core 0 -- but phrasing it this way keeps the
+            # row offset a plain loop variable. The MX_A_ZZ slice checker only
+            # proves a block offset non-negative and 16-aligned through
+            # constants, loop variables, sums and floor-divisions, so a rotated
+            # loop start would make the activation scale load unprovable.
+            for row_tile in pl.range(row_tiles):
+                # The tile is always loaded whole; only the store is bounded
+                # by the true count. Rows past the count hold this expert's
+                # padded capacity, which the specs poison, but their products
+                # are never stored.
+                row = row_tile * W13_M_TILE
+                valid = pl.min(W13_M_TILE, count - row)
+                x_row = expert * stride + row
+                out_row = activation_base + row
+                for block in pl.range(W13_N_BLOCKS):
+                    if (work_base + row_tile * W13_N_BLOCKS + block) % ROUTED_CUBE_WORKER_TILE == core:
+                        col = block * W13_N_TILE
+                        gate = _w13_projection(
+                            x, x_scale, w1, w1_scale, x_row, expert, col, experts, stride,
+                        )
+                        pair = pl.store(
+                            pl.set_validshape(gate, valid, W13_N_TILE), [out_row, col], pair,
+                        )
+                        up = _w13_projection(
+                            x, x_scale, w3, w3_scale, x_row, expert, col, experts, stride,
+                        )
+                        pair = pl.store(
+                            pl.set_validshape(up, valid, W13_N_TILE), [out_row, MOE_INTER + col], pair,
+                        )
+                        # The owner of the first column block also carries the
+                        # route weights, so the copy runs once per row tile
+                        # rather than once per output tile. It must stop exactly
+                        # at ``count``: compact rows are packed across experts,
+                        # so writing a padded tail would race with the next
+                        # expert's own rows.
+                        if block == 0:
+                            for chunk in pl.range((valid + ROUTE_COPY_ROWS - 1) // ROUTE_COPY_ROWS):
+                                chunk_row = row + chunk * ROUTE_COPY_ROWS
+                                chunk_valid = pl.min(ROUTE_COPY_ROWS, count - chunk_row)
+                                weight_rows = pl.load(
+                                    route_weights, [expert * stride + chunk_row, 0],
+                                    [ROUTE_COPY_ROWS, 1], valid_shape=[chunk_valid, 1],
+                                )
+                                compact_weights = pl.store(
+                                    pl.set_validshape(weight_rows, chunk_valid, 1),
+                                    [activation_base + chunk_row, 0], compact_weights,
+                                )
+            work_base = work_base + row_tiles * W13_N_BLOCKS
+            activation_base = activation_base + count
+    return pair, compact_weights, ready
 
 
 @pl.jit.extern(
@@ -710,37 +895,233 @@ def build_tensor_specs(case="bounds", *, tail_offset=0):
     ]
 
 
+# Standalone W13 projection validation. The extern kernel and the PyPTO
+# formulation are held to the same golden so the PyPTO path stays correct while
+# its performance is tuned; the model keeps calling the extern either way.
+W13_ROWS = ((N_LOCAL_EXPERTS * RECV_MAX + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
+PAIR_SENTINEL = 73.0
+WEIGHT_SENTINEL = -41.0
+
+
+@pl.jit(auto_scope=False)
+def l2_routed_w13(
+    x: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.FP8E4M3FN],
+    x_scale: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
+    counts: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    route_weights: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, 1], pl.FP32],
+    pair: pl.InOut[pl.Tensor[[W13_ROWS, 2 * MOE_INTER], pl.BF16]],
+    compact_weights: pl.InOut[pl.Tensor[[W13_ROWS, 1], pl.FP32]],
+):
+    """Validation entry for the extern W13 projection the model uses."""
+    ready = pl.system.task_dummy(deps=[])
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13", deps=[ready]):
+        pair, compact_weights = _routed_w13(
+            x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
+            route_weights, compact_weights,
+            N_LOCAL_EXPERTS, RECV_MAX, D, MOE_INTER, W13_ROWS, N_LOCAL_EXPERTS * RECV_MAX,
+        )
+    return pair, compact_weights
+
+
+@pl.jit(auto_scope=False)
+def l2_routed_w13_pypto(
+    x: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.FP8E4M3FN],
+    x_scale: pl.Tensor[[1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], pl.FP8E8M0],
+    counts: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
+    w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
+    route_weights: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, 1], pl.FP32],
+    pair: pl.InOut[pl.Tensor[[W13_ROWS, 2 * MOE_INTER], pl.BF16]],
+    compact_weights: pl.InOut[pl.Tensor[[W13_ROWS, 1], pl.FP32]],
+):
+    """Validation entry for the PyPTO W13 projection; the model uses the extern."""
+    ready = pl.system.task_dummy(deps=[])
+    pair, compact_weights, _w13_ready = routed_w13_pypto(
+        x, x_scale, counts, w1, w1_scale, w3, w3_scale, pair,
+        route_weights, compact_weights, ready, N_LOCAL_EXPERTS, RECV_MAX,
+    )
+    return pair, compact_weights
+
+
+def golden_routed_w13(tensors):
+    """Torch reference for the compact BF16 gate/up projections and route weights."""
+    from quant import unpack_mx_scale_codes as decode_e8m0_codes
+    from gemm import golden_gemm_mxfp8_to_fp32_dequantized as matmul_mx_golden
+
+    x = tensors["x"]
+    x_scale = decode_e8m0_codes(
+        tensors["x_scale"].reshape(N_LOCAL_EXPERTS * RECV_MAX, K_SCALE), side="a",
+    )
+    w1_scale = decode_e8m0_codes(tensors["w1_scale"], side="b").reshape(
+        N_LOCAL_EXPERTS, K_SCALE, MOE_INTER,
+    )
+    w3_scale = decode_e8m0_codes(tensors["w3_scale"], side="b").reshape(
+        N_LOCAL_EXPERTS, K_SCALE, MOE_INTER,
+    )
+    pair = tensors["pair"]
+    compact_weights = tensors["compact_weights"]
+    packed_shape = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE), MX_K_TILE * MX_MM_INTER_TILE // 4)
+    compact = 0
+    for expert, count in enumerate(tensors["counts"].reshape(-1).tolist()):
+        if count == 0:
+            continue
+        begin = expert * RECV_MAX
+        x_sub = x[begin:begin + count]
+        x_scale_sub = x_scale[begin:begin + count]
+        w1_fp8 = unpack_mxfp4_weight_tiles(
+            tensors["w1"][expert].reshape(packed_shape), D, MOE_INTER, MX_K_TILE, MX_MM_INTER_TILE,
+        )
+        w3_fp8 = unpack_mxfp4_weight_tiles(
+            tensors["w3"][expert].reshape(packed_shape), D, MOE_INTER, MX_K_TILE, MX_MM_INTER_TILE,
+        )
+        gate = matmul_mx_golden(x_sub, x_scale_sub, w1_fp8, w1_scale[expert])
+        up = matmul_mx_golden(x_sub, x_scale_sub, w3_fp8, w3_scale[expert])
+        pair[compact:compact + count, :MOE_INTER] = gate.bfloat16()
+        pair[compact:compact + count, MOE_INTER:] = up.bfloat16()
+        compact_weights[compact:compact + count] = tensors["route_weights"][begin:begin + count]
+        compact += count
+
+
+def _w13_active_rows(inputs):
+    """Total compact rows the projection defines."""
+    return int(inputs["counts"].sum().item())
+
+
+def compare_w13_pair(actual, expected, *, inputs, **kwargs):
+    """Compare active gate/up columns and require the inactive rows untouched."""
+    from golden import ratio_reldiff
+
+    total = _w13_active_rows(inputs)
+    actual_rows = actual.reshape(W13_ROWS, 2 * MOE_INTER)
+    expected_rows = expected.reshape_as(actual_rows)
+    tail = actual_rows[total:]
+    if not torch.equal(tail, torch.full_like(tail, PAIR_SENTINEL)):
+        return False, f"projection rows past the active total ({total}) were written"
+    if total == 0:
+        return True, ""
+    comparator = ratio_reldiff(diff_thd=2e-3, pct_thd=0.01)
+    return comparator(actual_rows[:total], expected_rows[:total], inputs=inputs, **kwargs)
+
+
+def compare_w13_weights(actual, expected, *, inputs, **kwargs):
+    """Route weights are copied, not computed, so require them bit-exact."""
+    total = _w13_active_rows(inputs)
+    actual_rows = actual.reshape(W13_ROWS, 1)
+    expected_rows = expected.reshape_as(actual_rows)
+    tail = actual_rows[total:]
+    if not torch.equal(tail, torch.full_like(tail, WEIGHT_SENTINEL)):
+        return False, f"route weight rows past the active total ({total}) were written"
+    if total == 0 or torch.equal(actual_rows[:total], expected_rows[:total]):
+        return True, ""
+    wrong = int((actual_rows[:total] != expected_rows[:total]).sum().item())
+    return False, f"{wrong} of {total} compact route weights differ"
+
+
+def build_w13_specs(case="bounds", *, tail_offset=0):
+    """Build W13 inputs with poisoned inactive capacity and lazy packed weights."""
+    from functools import cache
+
+    from golden import TensorSpec
+    from quant import pack_mx_a_scale, quantize_mxfp8_upward_e8m0
+
+    counts = validation_counts(case, tail_offset=tail_offset)
+
+    @cache
+    def activations():
+        generator = torch.Generator().manual_seed(20261110)
+        source = torch.randn(N_LOCAL_EXPERTS * RECV_MAX, D, dtype=torch.bfloat16, generator=generator)
+        payload, codes = quantize_mxfp8_upward_e8m0(source.float())
+        codes = codes.view(torch.uint8)
+        route = torch.rand(N_LOCAL_EXPERTS * RECV_MAX, 1, generator=generator)
+        # Nothing past an expert's count is defined; poison it so a read shows up.
+        for expert, count in enumerate(counts.reshape(-1).tolist()):
+            begin = expert * RECV_MAX
+            payload.view(torch.uint8)[begin + count:begin + RECV_MAX] = 127
+            codes[begin + count:begin + RECV_MAX] = 255
+            route[begin + count:begin + RECV_MAX] = float("nan")
+        packed_codes = pack_mx_a_scale(codes).view(torch.float8_e8m0fnu)
+        return payload, packed_codes.reshape(1, -1), route
+
+    @cache
+    def routed_weights():
+        return gen_routed_mxfp4_weights(N_LOCAL_EXPERTS, ROUTED_DEQUANT_STD, seed_base=10)
+
+    fp8 = torch.float8_e4m3fn
+    e8m0 = torch.float8_e8m0fnu
+    return [
+        TensorSpec("x", [N_LOCAL_EXPERTS * RECV_MAX, D], fp8, init_value=lambda: activations()[0]),
+        TensorSpec("x_scale", [1, N_LOCAL_EXPERTS * RECV_MAX * K_SCALE], e8m0, init_value=lambda: activations()[1]),
+        TensorSpec("counts", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=counts),
+        TensorSpec("w1", [N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], torch.uint8, init_value=lambda: routed_weights()[0]),
+        TensorSpec("w1_scale", [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], e8m0, init_value=lambda: routed_weights()[1]),
+        TensorSpec("w3", [N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], torch.uint8, init_value=lambda: routed_weights()[2]),
+        TensorSpec("w3_scale", [N_LOCAL_EXPERTS * K_SCALE, MOE_INTER], e8m0, init_value=lambda: routed_weights()[3]),
+        TensorSpec("route_weights", [N_LOCAL_EXPERTS * RECV_MAX, 1], torch.float32, init_value=lambda: activations()[2]),
+        TensorSpec("pair", [W13_ROWS, 2 * MOE_INTER], torch.bfloat16, init_value=PAIR_SENTINEL),
+        TensorSpec("compact_weights", [W13_ROWS, 1], torch.float32, init_value=WEIGHT_SENTINEL),
+    ]
+
+
 if __name__ == "__main__":
     from golden import run
 
+    run_config = dict(
+        dump_passes=args.dump_passes,
+        backend_type=args.backend_type,
+        execution_mode=args.execution_mode,
+        device_id=args.device,
+        enable_chip_swimlane=args.enable_chip_swimlane,
+    )
+
+    def _run(label, fn, specs, golden_fn, compare_fn):
+        result = run(
+            fn=fn,
+            specs=specs,
+            golden_fn=golden_fn,
+            golden_data=args.golden_data,
+            save_data=args.save_data,
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir,
+            config=run_config,
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn=compare_fn,
+        )
+        if not result.passed:
+            print(f"{label}: FAILED")
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+
     cases = ("bounds", "tails", "zero") if args.case == "all" else (args.case,)
+    modes = ("w13", "chain") if args.mode == "all" else (args.mode,)
     for case in cases:
         tail_rounds = (6 + N_LOCAL_EXPERTS - 1) // N_LOCAL_EXPERTS if case == "tails" else 1
         for tail_round in range(tail_rounds):
-            print(f"Local routed compute: case={case}, tail_round={tail_round}, experts={N_LOCAL_EXPERTS}, stride={RECV_MAX}")
-            result = run(
-                fn=local_compute_test,
-                specs=build_tensor_specs(case, tail_offset=tail_round * N_LOCAL_EXPERTS),
-                golden_fn=golden_local_compute,
-                golden_data=args.golden_data,
-                save_data=args.save_data,
-                compile_only=args.compile_only,
-                runtime_dir=args.runtime_dir,
-                config=dict(
-                    dump_passes=args.dump_passes,
-                    backend_type=args.backend_type,
-                    execution_mode=args.execution_mode,
-                    device_id=args.device,
-                    enable_chip_swimlane=args.enable_chip_swimlane,
-                ),
-                rtol=1e-3,
-                atol=1e-3,
-                compare_fn={"routed_y": compare_local_compute},
-            )
-            if not result.passed:
-                if result.error:
-                    print(result.error)
-                raise SystemExit(1)
+            offset = tail_round * N_LOCAL_EXPERTS
+            if "w13" in modes:
+                # Both entries run against the same golden so the extern and
+                # the PyPTO formulation stay interchangeable row for row.
+                for label, entry in (("extern", l2_routed_w13), ("pypto", l2_routed_w13_pypto)):
+                    print(f"Routed W13 ({label}): case={case}, tail_round={tail_round}, experts={N_LOCAL_EXPERTS}, stride={RECV_MAX}")
+                    _run(
+                        f"Routed W13 ({label})", entry,
+                        build_w13_specs(case, tail_offset=offset), golden_routed_w13,
+                        {"pair": compare_w13_pair, "compact_weights": compare_w13_weights},
+                    )
+            if "chain" in modes:
+                print(f"Local routed compute: case={case}, tail_round={tail_round}, experts={N_LOCAL_EXPERTS}, stride={RECV_MAX}")
+                _run(
+                    "Local routed compute", local_compute_test,
+                    build_tensor_specs(case, tail_offset=offset), golden_local_compute,
+                    {"routed_y": compare_local_compute},
+                )
             if args.compile_only or args.golden_data:
                 break
         if args.compile_only or args.golden_data:
