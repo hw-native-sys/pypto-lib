@@ -26,6 +26,8 @@ if __name__ == "__main__":
     parser.add_argument("--ep", type=int, choices=[2, 4, 8], default=2)
     parser.add_argument("--experts-per-rank", type=int, default=4)
     parser.add_argument("--case", choices=["all", "bounds", "tails", "zero", "full", "balanced"], default="all")
+    parser.add_argument("--mode", choices=["chain", "swiglu"], default="chain",
+                        help="chain validates the full routed expert; swiglu validates the activation alone")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -78,6 +80,29 @@ MX_PACKED_LANE_COLS = MX_MM_INTER_TILE // 2
 MX_W1_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W3_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * MX_PACKED_LANE_ROWS
 MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * MX_PACKED_LANE_ROWS
+
+# SwiGLU activation tiling and MXFP8 quantization constants, matching
+# kernels/expert_routed_swiglu.cpp so both paths quantize identically.
+SWIGLU_FP8_MAX = 448.0
+SWIGLU_MAX_INV = 1.0 / SWIGLU_FP8_MAX
+SWIGLU_SCALE_FLOOR = 1e-4
+# Every tile row must be 32-byte aligned, and that drives the whole shape.
+# The extern splits a row into 768-column tiles and writes a [16, 24] E8M0
+# Codes tile; 24 bytes is not a legal PyPTO tile row. Widening the column tile
+# to the next legal width (1024) does not divide MOE_INTER, and a tile window
+# reaching past the end of the tensor faults in MTE even when valid_shape is
+# narrower. So each work item takes a whole row instead, and the scale codes go
+# out as one flat contiguous run: the plane is row-major [rows, H_SCALE], so a
+# whole number of rows is contiguous and only the row tile has to stay aligned.
+SWIGLU_SCALE_COLS = MOE_INTER // MX_GROUP
+# H_SCALE is 72, so the flat run is 32-byte aligned for multiples of four rows,
+# and a single-column FP32 weight load needs at least eight rows for its own
+# column to be aligned. Eight it is -- half the extern's row tile, because the
+# FP32 activation and the equally large pl.row_max scratch share 240 KB of Vec.
+SWIGLU_ROW_TILE = 8
+# Shapes of the group-major view a row tile folds into, precomputed so they stay
+# compile-time constants inside the traced body.
+SWIGLU_GROUP_ROWS = SWIGLU_ROW_TILE * SWIGLU_SCALE_COLS
 
 
 @pl.jit.inline(auto_scope=False)
@@ -330,6 +355,104 @@ def _routed_swiglu_quant(
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Apply FP32 weighted SwiGLU and upward group-32 MXFP8 quantization."""
     return payload, scales
+
+
+@pl.jit.inline(auto_scope=False)
+def routed_swiglu_quant_pypto(
+    pair: pl.Tensor,
+    weights: pl.Tensor,
+    counts: pl.Tensor,
+    payload: pl.Tensor,
+    scales: pl.Tensor,
+    w13_ready: pl.Scalar[pl.TASK_ID],
+    experts: pl.constexpr,
+):
+    """PyPTO equivalent of :func:`_routed_swiglu_quant`, kept for precision only.
+
+    The model still calls the extern; this entry exists so the PyPTO
+    formulation stays validated while its performance is tuned separately.
+    Remove ``_routed_swiglu_quant`` and ``kernels/expert_routed_swiglu.cpp``
+    only once this reaches parity.
+
+    ``pair`` holds gate in columns ``[0, MOE_INTER)`` and up in
+    ``[MOE_INTER, 2 * MOE_INTER)`` of the same compact row, ``weights`` one
+    FP32 route weight per compact row. Rows are compact across experts, so the
+    active row count is the sum of ``counts`` and is only known on device --
+    that sum replaces the extern's vectorized ``reduceCounts`` reduction.
+
+    Unlike the extern this takes no ``hidden`` argument: the tile shapes are
+    fixed to MOE_INTER by the 32-byte scale-row alignment described above.
+    """
+    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant_pypto", deps=[w13_ready]) as ready:
+        core = pl.tile.get_block_idx()
+        # Counts are immutable after w13_ready and number only a handful of
+        # experts, so a scalar accumulate is cheaper than the extern's vector
+        # reduction plus the Vector-to-Scalar flag needed to read it back.
+        rows = pl.cast(0, pl.INDEX)
+        for expert in pl.range(experts):
+            rows = rows + pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
+        work_count = (rows + SWIGLU_ROW_TILE - 1) // SWIGLU_ROW_TILE
+        for work in pl.range(core, work_count, ROUTED_VECTOR_WORKER_TILE):
+            row = work * SWIGLU_ROW_TILE
+            # Every extent here is static. A runtime valid extent on the tail
+            # tile breaks 32-byte alignment -- seven rows of the FP32 weight
+            # column are 28 bytes, and seven rows of scale codes are 504 --
+            # and the resulting narrow transfers fault in MTE on device. The
+            # tensors are padded to a multiple of MX_M_TILE, so a full row tile
+            # is always in bounds; the surplus rows are computed and written
+            # from whatever the padded capacity holds. That is sound because
+            # rows past the active total are scratch: W2 reads only the active
+            # ones, and the extern simply leaves them at their prior value.
+            gate_rows = pl.load(pair, [row, 0], [SWIGLU_ROW_TILE, MOE_INTER])
+            up_rows = pl.load(pair, [row, MOE_INTER], [SWIGLU_ROW_TILE, MOE_INTER])
+            gate_bf = gate_rows
+            up_bf = up_rows
+            # Clamp in BF16 before widening: the bound is exactly representable,
+            # so this matches the extern's FP32 clamp while keeping one fewer
+            # full-width FP32 tile alive across the widening.
+            if SWIGLU_LIMIT > 0.0:
+                gate_bf = pl.minimum(gate_bf, SWIGLU_LIMIT)
+                up_bf = pl.maximum(pl.minimum(up_bf, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+            gate = pl.cast(gate_bf, pl.FP32)
+            up = pl.cast(up_bf, pl.FP32)
+            # SiLU composed from exp and div: PyPTO has no sigmoid primitive and
+            # the extern uses the same hardware exp, so the two agree to the
+            # instruction's own accuracy rather than to torch's.
+            sigmoid = pl.add(pl.exp(pl.neg(gate)), 1.0)
+            values = pl.mul(pl.div(gate, sigmoid), up)
+            # Loaded here rather than beside the activation: holding the weight
+            # column across the exp keeps a third tile live through the widest
+            # point of the body.
+            weight = pl.load(weights, [row, 0], [SWIGLU_ROW_TILE, 1])
+            values = pl.row_expand_mul(values, weight)
+            groups = pl.reshape(values, [SWIGLU_GROUP_ROWS, MX_GROUP])
+            # Upward (ceil) E8M0: adding 2**23 - 1 carries any nonzero mantissa
+            # into the exponent field, so the shift yields the biased exponent
+            # of the next power of two. Floor first, then scale, as the extern
+            # does -- the order is observable when amax is below the floor.
+            amax_tmp = pl.tile.create([SWIGLU_GROUP_ROWS, MX_GROUP], dtype=pl.FP32)
+            amax = pl.mul(pl.maximum(pl.row_max(pl.abs(groups), amax_tmp), SWIGLU_SCALE_FLOOR), SWIGLU_MAX_INV)
+            exponent = pl.shrs(pl.add(pl.reinterpret_view(amax, pl.INT32), 8388607), 23)
+            # Multiply by 2**(127 - exponent) rather than dividing by the scale:
+            # both are exact powers of two, and 254 - exponent stays a normal
+            # float across the representable E8M0 range.
+            factor = pl.reinterpret_view(pl.shls(pl.add(pl.neg(exponent), 254), 23), pl.FP32)
+            scaled = pl.reshape(pl.row_expand_mul(groups, factor), [SWIGLU_ROW_TILE, MOE_INTER])
+            bounded = pl.minimum(pl.maximum(scaled, -SWIGLU_FP8_MAX), SWIGLU_FP8_MAX)
+            quantized = pl.cast(bounded, pl.FP8E4M3FN, mode="rint")
+            payload = pl.store(quantized, [row, 0], payload)
+            # Reshape to a row while the codes are still INT32: a [N, 1] tile of
+            # one-byte codes has a 1-byte row, and reshaping that to [1, N]
+            # faults in MTE. At INT32 both layouts stay 32-byte aligned.
+            exponent_row = pl.reshape(exponent, [1, SWIGLU_GROUP_ROWS])
+            # E8M0 codes are the raw biased exponent; wrap past 127 into INT8
+            # before the narrowing cast so the byte pattern is preserved.
+            wrapped = pl.sub(exponent_row, pl.mul(pl.shrs(exponent_row, 7), 256))
+            codes = pl.reinterpret_view(pl.reinterpret_view(pl.cast(wrapped, pl.INT8), pl.UINT8), pl.FP8E8M0)
+            # Group-major order already matches the flat row-major scale plane,
+            # so one row tile's codes form a single contiguous run.
+            scales = pl.store(codes, [0, row * SWIGLU_SCALE_COLS], scales)
+    return payload, scales, ready
 
 
 @pl.jit.extern(
@@ -717,8 +840,173 @@ def build_tensor_specs(case="bounds", *, tail_offset=0):
     ]
 
 
+# Standalone SwiGLU activation validation. The extern kernel and the PyPTO
+# formulation are held to the same golden so the PyPTO path stays correct while
+# its performance is tuned; the model keeps calling the extern either way.
+SWIGLU_ROWS = ((N_LOCAL_EXPERTS * RECV_MAX + MX_M_TILE - 1) // MX_M_TILE) * MX_M_TILE
+PAYLOAD_SENTINEL = 0x5A
+SCALE_SENTINEL = 0xA5
+
+
+@pl.jit(auto_scope=False)
+def l2_routed_swiglu_quant(
+    pair: pl.Tensor[[SWIGLU_ROWS, 2 * MOE_INTER], pl.BF16],
+    compact_weights: pl.Tensor[[SWIGLU_ROWS, 1], pl.FP32],
+    counts: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    payload: pl.InOut[pl.Tensor[[SWIGLU_ROWS, MOE_INTER], pl.FP8E4M3FN]],
+    scales: pl.InOut[pl.Tensor[[1, SWIGLU_ROWS * H_SCALE], pl.FP8E8M0]],
+):
+    """Validation entry for the extern activation kernel the model uses."""
+    ready = pl.system.task_dummy(deps=[])
+    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant", deps=[ready]):
+        payload, scales = _routed_swiglu_quant(
+            pair, compact_weights, counts, payload, scales,
+            N_LOCAL_EXPERTS, RECV_MAX, MOE_INTER, N_LOCAL_EXPERTS * RECV_MAX,
+        )
+    return payload, scales
+
+
+@pl.jit(auto_scope=False)
+def l2_routed_swiglu_quant_pypto(
+    pair: pl.Tensor[[SWIGLU_ROWS, 2 * MOE_INTER], pl.BF16],
+    compact_weights: pl.Tensor[[SWIGLU_ROWS, 1], pl.FP32],
+    counts: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    payload: pl.InOut[pl.Tensor[[SWIGLU_ROWS, MOE_INTER], pl.FP8E4M3FN]],
+    scales: pl.InOut[pl.Tensor[[1, SWIGLU_ROWS * H_SCALE], pl.FP8E8M0]],
+):
+    """Validation entry for the PyPTO activation; the model uses the extern."""
+    ready = pl.system.task_dummy(deps=[])
+    payload, scales, activation_ready = routed_swiglu_quant_pypto(
+        pair, compact_weights, counts, payload, scales, ready, N_LOCAL_EXPERTS,
+    )
+    return payload, scales
+
+
+def golden_routed_swiglu_quant(tensors):
+    """Torch reference for the weighted clamped SwiGLU and its MXFP8 quantization."""
+    import torch.nn.functional as F
+
+    from quant import quantize_mxfp8_upward_e8m0
+
+    total = int(tensors["counts"].sum().item())
+    payload = tensors["payload"].view(torch.uint8)
+    codes = tensors["scales"].view(torch.uint8).reshape(SWIGLU_ROWS, H_SCALE)
+    if total == 0:
+        return
+    pair = tensors["pair"][:total].float()
+    gate, up = pair[:, :MOE_INTER], pair[:, MOE_INTER:]
+    if SWIGLU_LIMIT > 0:
+        gate = gate.clamp(max=SWIGLU_LIMIT)
+        up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+    hidden = F.silu(gate) * up * tensors["compact_weights"][:total].float()
+    values, scale_codes = quantize_mxfp8_upward_e8m0(hidden)
+    # Only the active rows are defined. The extern leaves the rest untouched;
+    # the PyPTO path also writes the remainder of the tail row tile. Both must
+    # leave everything past that tile boundary at the sentinel, which is what
+    # the comparators check -- the gap itself is ignored.
+    payload[:total] = values.view(torch.uint8)
+    codes[:total] = scale_codes
+
+
+def _swiglu_row_split(inputs):
+    """Return the active row total and the end of the tail row tile."""
+    total = int(inputs["counts"].sum().item())
+    return total, ((total + SWIGLU_ROW_TILE - 1) // SWIGLU_ROW_TILE) * SWIGLU_ROW_TILE
+
+
+def compare_swiglu_payload(actual, expected, *, inputs, **kwargs):
+    """Compare active FP8 payload bytes, allowing one-ULP exp rounding drift."""
+    from golden import ratio_reldiff
+
+    total, padded = _swiglu_row_split(inputs)
+    actual_rows = actual.reshape(SWIGLU_ROWS, MOE_INTER)
+    expected_rows = expected.reshape(SWIGLU_ROWS, MOE_INTER)
+    tail_actual = actual_rows[padded:].view(torch.uint8)
+    if not torch.equal(tail_actual, torch.full_like(tail_actual, PAYLOAD_SENTINEL)):
+        return False, f"payload rows past the tail tile (>= {padded}) were written"
+    if total == 0:
+        return True, ""
+    # The device computes SiLU from a hardware exp while the golden uses torch's,
+    # so a value sitting near an E4M3 rounding midpoint may land one code apart.
+    # One E4M3 ULP is 2**-3 relative; anything larger is a real divergence.
+    comparator = ratio_reldiff(diff_thd=0.0625, pct_thd=0.01)
+    return comparator(actual_rows[:total].float(), expected_rows[:total].float(), inputs=inputs, **kwargs)
+
+
+def compare_swiglu_scales(actual, expected, *, inputs, **kwargs):
+    """Require exact E8M0 codes; a group amax is not exp-sensitive enough to drift."""
+    total, padded = _swiglu_row_split(inputs)
+    actual_rows = actual.view(torch.uint8).reshape(SWIGLU_ROWS, H_SCALE)
+    expected_rows = expected.view(torch.uint8).reshape(SWIGLU_ROWS, H_SCALE)
+    tail = actual_rows[padded:]
+    if not torch.equal(tail, torch.full_like(tail, SCALE_SENTINEL)):
+        return False, f"scale codes past the tail tile (>= {padded}) were written"
+    if total == 0:
+        return True, ""
+    if torch.equal(actual_rows[:total], expected_rows[:total]):
+        return True, ""
+    wrong = int((actual_rows[:total] != expected_rows[:total]).sum().item())
+    return False, f"{wrong} of {total * H_SCALE} active scale codes differ"
+
+
+def build_swiglu_specs(case="bounds", *, tail_offset=0):
+    """Build activation inputs with NaN-poisoned inactive capacity."""
+    from golden import TensorSpec
+
+    counts = validation_counts(case, tail_offset=tail_offset)
+    total = int(counts.sum().item())
+    generator = torch.Generator().manual_seed(20261110)
+    # W13 emits BF16 projections; this spread straddles the SWIGLU_LIMIT clamp.
+    pair = (torch.randn(SWIGLU_ROWS, 2 * MOE_INTER, generator=generator) * 6.0).bfloat16()
+    weights = torch.rand(SWIGLU_ROWS, 1, generator=generator)
+    # Nothing past the active total is defined; poison it so a read shows up.
+    pair[total:] = float("nan")
+    weights[total:] = float("nan")
+    fp8, e8m0 = torch.float8_e4m3fn, torch.float8_e8m0fnu
+    payload = torch.full((SWIGLU_ROWS, MOE_INTER), PAYLOAD_SENTINEL, dtype=torch.uint8).view(fp8)
+    scales = torch.full((1, SWIGLU_ROWS * H_SCALE), SCALE_SENTINEL, dtype=torch.uint8).view(e8m0)
+    return [
+        TensorSpec("pair", [SWIGLU_ROWS, 2 * MOE_INTER], torch.bfloat16, init_value=pair),
+        TensorSpec("compact_weights", [SWIGLU_ROWS, 1], torch.float32, init_value=weights),
+        TensorSpec("counts", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=counts),
+        TensorSpec("payload", [SWIGLU_ROWS, MOE_INTER], fp8, init_value=payload),
+        TensorSpec("scales", [1, SWIGLU_ROWS * H_SCALE], e8m0, init_value=scales),
+    ]
+
+
+def validate_routed_swiglu(args):
+    """Run the extern and PyPTO activation entries against one golden."""
+    from golden import run
+
+    records = []
+    cases = ("bounds", "tails", "zero") if args.case == "all" else (args.case,)
+    for case in cases:
+        for label, entry in (("swiglu", l2_routed_swiglu_quant),
+                             ("swiglu-pypto", l2_routed_swiglu_quant_pypto)):
+            result = run(
+                fn=entry,
+                specs=build_swiglu_specs(case),
+                golden_fn=golden_routed_swiglu_quant,
+                compare_fn={"payload": compare_swiglu_payload, "scales": compare_swiglu_scales},
+                config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                            device_id=args.device),
+                compile_only=args.compile_only,
+            )
+            if not result.passed:
+                raise RuntimeError(f"{label} {case}: {result.error}")
+            status = ("COMPILE_ONLY" if args.compile_only
+                      else "SIM_VALIDATED" if args.execution_mode else "DEVICE_VALIDATED")
+            print(status, label, f"case={case}", result.work_dir)
+            records.append(dict(mode=label, case=case, passed=result.passed))
+    return records
+
+
 if __name__ == "__main__":
     from golden import run
+
+    if args.mode == "swiglu":
+        validate_routed_swiglu(args)
+        raise SystemExit(0)
 
     cases = ("bounds", "tails", "zero") if args.case == "all" else (args.case,)
     for case in cases:
