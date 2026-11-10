@@ -486,8 +486,7 @@ def decode_layer_tq(
         resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN], dtype=pl.FP32)
 
         # out_proj: fused cube matmul + vec residual.
-        for ob in pl.spmd(Q_OUT_BLOCKS, name_hint="out_proj",
-                          optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+        for ob in pl.spmd(Q_OUT_BLOCKS, name_hint="out_proj"):
             o0 = ob * Q_OUT_CHUNK
             o_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
             for kb in pl.range(0, HIDDEN_BLOCKS):
@@ -495,8 +494,14 @@ def decode_layer_tq(
                 a_chunk = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0])
                 w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, o0])
                 o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk, init_cond=(kb == 0))
-            resid = pl.cast(pl.slice(current_hidden, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]), target_type=pl.FP32)
-            resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
+            # The cube accumulates the full tile; each AIV owns explicit rows.
+            for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                o_half = pl.aiv_shard(o_acc)
+                row = lane * (BATCH_TILE // 2)
+                batch_row = b0 + row
+                resid = current_hidden[batch_row:batch_row + BATCH_TILE // 2, o0:o0 + Q_OUT_CHUNK]
+                resid_fp32 = pl.cast(resid, target_type=pl.FP32)
+                resid1_tile[row:row + BATCH_TILE // 2, o0:o0 + Q_OUT_CHUNK] = pl.add(o_half, resid_fp32)
 
         # Post-attention RMSNorm.
         post_norm_tile = pl.create_tensor([BATCH_TILE, HIDDEN], dtype=pl.BF16)
@@ -518,8 +523,7 @@ def decode_layer_tq(
 
         # gate_up_silu: fused gate + up + SiLU.
         mlp_tile = pl.create_tensor([BATCH_TILE, INTERMEDIATE], dtype=pl.BF16)
-        for ob in pl.spmd(MLP_OUT_BLOCKS, name_hint="gate_up_silu",
-                          optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+        for ob in pl.spmd(MLP_OUT_BLOCKS, name_hint="gate_up_silu"):
             mlp_o0 = ob * 256  # MLP_OUT_CHUNK = 256
             gate_acc = pl.create_tensor([BATCH_TILE, 256], dtype=pl.FP32)
             up_acc = pl.create_tensor([BATCH_TILE, 256], dtype=pl.FP32)
@@ -530,13 +534,17 @@ def decode_layer_tq(
                 wu = pl.slice(w_up, [K_CHUNK, 256], [layer_hidden_base + k0, mlp_o0])
                 gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg, init_cond=(kb == 0))
                 up_acc = pl.matmul_acc(up_acc, post_chunk, wu, init_cond=(kb == 0))
-            sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
-            mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
-            mlp_tile = pl.assemble(mlp_tile, pl.cast(mlp_chunk, target_type=pl.BF16), [0, mlp_o0])
+            for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                gate_half = pl.aiv_shard(gate_acc)
+                up_half = pl.aiv_shard(up_acc)
+                row = lane * (BATCH_TILE // 2)
+                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_half)), 1.0))
+                mlp_chunk = pl.mul(pl.mul(gate_half, sigmoid), up_half)
+                mlp_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
+                mlp_tile[row:row + BATCH_TILE // 2, mlp_o0:mlp_o0 + 256] = mlp_bf16
 
         # down_proj: fused cube matmul + vec residual.
-        for dob in pl.spmd(HIDDEN_BLOCKS, name_hint="down_proj",
-                          optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+        for dob in pl.spmd(HIDDEN_BLOCKS, name_hint="down_proj"):
             d0 = dob * K_CHUNK
             down_acc = pl.create_tensor([BATCH_TILE, K_CHUNK], dtype=pl.FP32)
             for ob in pl.range(0, MLP_OUT_BLOCKS):
@@ -544,9 +552,14 @@ def decode_layer_tq(
                 down_mlp = pl.slice(mlp_tile, [BATCH_TILE, 256], [0, down_o0])
                 w_down_chunk = pl.slice(w_down, [256, K_CHUNK], [layer_inter_base + down_o0, d0])
                 down_acc = pl.matmul_acc(down_acc, down_mlp, w_down_chunk, init_cond=(ob == 0))
-            resid_chunk_fp32 = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, d0])
-            out_chunk = pl.add(down_acc, resid_chunk_fp32)
-            next_hidden = pl.assemble(next_hidden, pl.cast(out_chunk, target_type=pl.BF16), [b0, d0])
+            for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                down_half = pl.aiv_shard(down_acc)
+                row = lane * (BATCH_TILE // 2)
+                resid_chunk_fp32 = resid1_tile[row:row + BATCH_TILE // 2, d0:d0 + K_CHUNK]
+                out_chunk = pl.add(down_half, resid_chunk_fp32)
+                out_bf16 = pl.cast(out_chunk, target_type=pl.BF16)
+                batch_row = b0 + row
+                next_hidden[batch_row:batch_row + BATCH_TILE // 2, d0:d0 + K_CHUNK] = out_bf16
 
     return next_hidden
 
