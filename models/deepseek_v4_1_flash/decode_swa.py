@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""SWA decode attention with mHC."""
+"""SWA decode attention with HC."""
 
 
 from utils import packed_cache_compare
@@ -218,7 +218,7 @@ def l3_decode_swa(
 
 
 def build_swa_specs(args):
-    """Build SWA attention operands, mHC boundaries, and runtime specifications."""
+    """Build SWA attention operands, HC boundaries, and runtime specifications."""
     from golden import ScalarSpec, TensorSpec
     import torch
     from functools import partial
@@ -322,16 +322,16 @@ def build_swa_specs(args):
 
 
 def golden_swa(tensors, *, reference=None):
-    """Compose TP1 mHC, normalization, QKV, attention and output references."""
+    """Compose TP1 HC, normalization, QKV, attention and output references."""
     import torch
     from sparse_attention import SWA_INPUT_NAMES, swa_official_reference
-    from hc import golden_hc_collapse, golden_mhc_mixes, golden_hc_post
+    from hc import golden_hc_collapse, golden_hc_mixes, golden_hc_post
     from rmsnorm import golden_rms_norm
 
     fields = dict(tensors)
     fields["window_cache"], fields["window_cache_scale"] = unpack_quantized_cache(tensors["window_cache"], False, head_dim=tensors["kv_norm_weight"].numel())
     active = int(tensors["num_tokens"])
-    pre_mix, post_mix, residual_mix = golden_mhc_mixes(
+    pre_mix, post_mix, residual_mix = golden_hc_mixes(
         tensors["x_hc"],
         tensors["hc_attn_fn"], tensors["hc_attn_scale"], tensors["hc_attn_base"],
     )

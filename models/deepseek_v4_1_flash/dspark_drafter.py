@@ -27,7 +27,7 @@ from config import (
 )
 from o_proj import prefill_tp_output_all_reduce
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
-from hc import hc_head, hc_post, hc_pre, zero_bf16_padding
+from hc import hc_head, hc_head_norm, hc_post, hc_project, hc_sinkhorn, zero_bf16_padding
 from expert_routed import (
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
@@ -40,7 +40,7 @@ from decode_moe import AUX_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
 
 from dspark_attention import dspark_attention
 from dspark_context_kv import dspark_context_kv
-from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes
+from hc import golden_hc_collapse, golden_hc_post, golden_hc_mixes
 from config import (
     DSPARK_DRAFT_LAYERS,
     DSPARK_N_ROUTED_EXPERTS,
@@ -358,19 +358,14 @@ def draft_layer(
     attention_epoch: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    """Run one V4.1 draft decoder layer with delayed mHC boundaries."""
-    attention_input = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+    """Run one V4.1 draft decoder layer with delayed HC boundaries."""
     normalized_attention = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     attention_pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     post_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([MOE_TOKENS, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_pre(
-        x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attention_input, attention_pre_mix, post_mix, residual_mix,
-        rms_worker_limit=64, head_worker_limit=64,
-    )
-    for block in pl.spmd((MOE_TOKENS + 7) // 8, name_hint="dspark_attn_norm"):
-        rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, MOE_TOKENS, output_fp32=False)
+    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, normalized_attention, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
     zero_bf16_padding(normalized_attention, num_tokens)
     attention_partial = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     dspark_attention(
@@ -1046,7 +1041,7 @@ def golden_dspark_drafter(tensors):
         incoming_pre = torch.zeros(query_tokens, HC_MULT)
         incoming_pre[:, 0] = 1
         for layer in range(DSPARK_DRAFT_LAYERS):
-            _, post, residual = golden_mhc_mixes(
+            _, post, residual = golden_hc_mixes(
                 x_hc, tensors["hc_attn_fn"][rank, layer],
                 tensors["hc_attn_scale"][rank, layer], tensors["hc_attn_base"][rank, layer],
             )
@@ -1054,7 +1049,7 @@ def golden_dspark_drafter(tensors):
                 torch.zeros(query_tokens, D, dtype=torch.bfloat16), x_hc,
                 post, residual,
             ).float()
-            next_pre, moe_post, moe_residual = golden_mhc_mixes(
+            next_pre, moe_post, moe_residual = golden_hc_mixes(
                 attention_hidden, tensors["hc_ffn_fn"][rank, layer],
                 tensors["hc_ffn_scale"][rank, layer], tensors["hc_ffn_base"][rank, layer],
             )

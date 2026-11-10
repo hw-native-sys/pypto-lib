@@ -492,7 +492,7 @@ from decode_c1a_full import golden_c1a
 from decode_c2a_full import golden_c2a
 from decode_swa import golden_swa
 from gate import golden_gate_reference as gate
-from hc import golden_mhc_mixes, golden_hc_post, golden_hc_collapse
+from hc import golden_hc_mixes, golden_hc_post, golden_hc_collapse
 from rmsnorm import golden_rms_norm
 from sparse_attention import golden_swa_attention
 
@@ -640,7 +640,7 @@ def golden_decode_layer(
     moe_inputs: Mapping[str, Any],
     num_tokens: int | None = None,
 ) -> DecodeLayerGoldenResult:
-    """Evaluate the mHC-Attention-mHC-MoE-mHC Block order."""
+    """Evaluate the HC-Attention-HC-MoE-HC Block order."""
     if num_tokens is not None and num_tokens != x_hc.shape[0]:
         raise ValueError("Block golden currently requires all capacity rows to be active")
     layer = M.layer_config(layer_id)
@@ -699,7 +699,7 @@ def golden_decode_layer(
     attention_hidden = attention_tensors["output"]
     attn_pre = attention_tensors["next_pre_mix"]
     attention_input = attention_tensors["attention_input"]
-    next_pre_mix, ffn_post, ffn_residual = golden_mhc_mixes(
+    next_pre_mix, ffn_post, ffn_residual = golden_hc_mixes(
         attention_hidden, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
     )
     ffn_input = golden_hc_collapse(attention_hidden, attn_pre).to(torch.bfloat16)
@@ -748,7 +748,7 @@ def _fixture_extent(dim, global_tokens):
 
 
 def build_tensor_specs(layer_id=0, seed=0):
-    """Build an L3 SWA decode block fixture with mHC and EP MoE."""
+    """Build an L3 SWA decode block fixture with HC and EP MoE."""
     if decode_layer_kind(layer_id) != DecodeLayerKind.SWA:
         raise ValueError("the complete-layer fixture currently supports SWA layers 0 and 1")
 
@@ -794,8 +794,8 @@ def build_tensor_specs(layer_id=0, seed=0):
         if name in l3_decode_layer.param_names:
             by_name[name] = spec if name == spec.name else replace(spec, name=name)
 
-    mhc_generator = torch.Generator().manual_seed(seed + 73)
-    hc_ffn_fn = torch.randn(MIX_HC, HC_DIM, generator=mhc_generator) * 0.0635
+    hc_generator = torch.Generator().manual_seed(seed + 73)
+    hc_ffn_fn = torch.randn(MIX_HC, HC_DIM, generator=hc_generator) * 0.0635
     hc_ffn_scale = torch.tensor([0.11334, 0.035901, 0.058183])
     hc_ffn_base = torch.tensor([
         2.4153, -2.0252, -2.0019, -2.1947,
@@ -805,12 +805,12 @@ def build_tensor_specs(layer_id=0, seed=0):
         -2.0428, -3.3478, 3.0893, -3.4166,
         -1.8144, -3.8147, -3.1307, 1.7862,
     ])
-    calibrated_mhc = {
+    calibrated_hc = {
         "hc_ffn_fn": hc_ffn_fn,
         "hc_ffn_scale": hc_ffn_scale,
         "hc_ffn_base": hc_ffn_base,
     }
-    for name, value in calibrated_mhc.items():
+    for name, value in calibrated_hc.items():
         stacked = value.unsqueeze(0).expand(EP_SIZE, *value.shape).contiguous()
         by_name[name] = replace(by_name[name], init_value=lambda stacked=stacked: stacked.clone())
 
@@ -900,9 +900,9 @@ def _compare_active_rows_per_rank(compare, counts):
 
 def _compare_moe_from_actual_attention(counts):
     """Validate MoE against the actual, already-validated Attention boundary."""
-    from decode_moe import _local_mhc_compare, golden_moe
+    from decode_moe import _local_hc_compare, golden_moe
 
-    compare_moe = _local_mhc_compare(counts)
+    compare_moe = _local_hc_compare(counts)
 
     def compare(actual, expected, *, actual_outputs, inputs, **kwargs):
         actual_f = actual.float()
@@ -932,9 +932,9 @@ def _compare_moe_from_actual_attention(counts):
 
 
 def _compare_next_pre_mix_from_actual_attention(counts):
-    """Check mHC coefficients independently of accepted Attention error."""
+    """Check HC coefficients independently of accepted Attention error."""
     from golden import ratio_allclose
-    from hc import golden_mhc_mixes
+    from hc import golden_hc_mixes
 
     compare_mixes = _compare_active_rows_per_rank(ratio_allclose(atol=2.5e-5, rtol=5e-3, max_error_ratio=0.03), counts)
 
@@ -942,7 +942,7 @@ def _compare_next_pre_mix_from_actual_attention(counts):
         conditioned = torch.zeros_like(expected)
         for rank, active in enumerate(counts.tolist()):
             if active:
-                pre, _, _ = golden_mhc_mixes(
+                pre, _, _ = golden_hc_mixes(
                     actual_outputs["attention_hidden"][rank, :active],
                     inputs["hc_ffn_fn"][rank], inputs["hc_ffn_scale"][rank],
                     inputs["hc_ffn_base"][rank],

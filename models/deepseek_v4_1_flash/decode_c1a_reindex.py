@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
-"""C1A reindex decode attention with mHC."""
+"""C1A reindex decode attention with HC."""
 
 from utils import packed_cache_compare
 
@@ -307,7 +307,7 @@ if __name__ == "__main__":
 
     from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="TP1 A5 mHC C1A reindex validation")
+    parser = argparse.ArgumentParser(description="TP1 A5 HC C1A reindex validation")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)

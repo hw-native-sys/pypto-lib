@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Packed-prefill C2A Reuse wired through mHC."""
+"""Packed-prefill C2A Reuse wired through HC."""
 
 
 import pypto.language as pl
@@ -16,7 +16,7 @@ import pypto.language.distributed as pld
 import functools
 import torch
 
-from hc import hc_pre
+from hc import hc_head_norm, hc_project, hc_sinkhorn
 from config import (
     FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, PREFILL_MAX_TOKENS, SP_T_DYN,
     WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
@@ -26,7 +26,7 @@ from o_proj import (
     retire_prefill_signals,
     prefill_sp_output_reduce_scatter, prefill_tp_output_all_reduce, golden_o_proj,
 )
-from hc import prefill_sp_post, hc_post
+from hc import hc_post
 from prefill_c2a_full import (
     REUSE_INPUT_NAMES, make_c2a_inputs, golden_reference_c2a,
     _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
@@ -36,7 +36,7 @@ from o_proj import o_proj
 from sparse_attention import attend_packed
 from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
 from quant import quantize_mxfp8_cache
-from rmsnorm import golden_rms_norm, rms_norm_tiled
+from rmsnorm import golden_rms_norm
 
 
 # model config
@@ -176,23 +176,14 @@ def prefill_c2a_reuse_sp(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    """Run one C2A Reuse attention sublayer between mHC pre and post; see ``prefill_c2a_full``."""
+    """Run one C2A Reuse attention sublayer between HC pre and post; see ``prefill_c2a_full``."""
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_pre(
-        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        hc_collapsed, next_pre_mix, post_mix, residual_mix,
-        rms_worker_limit=16, head_worker_limit=16,
-    )
-    hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
-    hc_norm_block_blocks = (hc_norm_tokens + 7) // 8
-    hc_norm_block_workers = pl.min(hc_norm_block_blocks, 32)
-    for hc_norm_block_worker in pl.spmd(hc_norm_block_workers, name_hint="rms_norm"):
-        for hc_norm_block in pl.range(hc_norm_block_worker, hc_norm_block_blocks, hc_norm_block_workers):
-            rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
+    hc_head_norm(x_hc, pre_mix, attn_norm_weight, local_hidden, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     attn_input, gathered = prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input,
         group_base, tp_rank, num_tokens, attention_epoch,
@@ -212,9 +203,28 @@ def prefill_c2a_reuse_sp(
         partial, output_window, output_arrived, attn_output,
         group_base, tp_rank, num_tokens, attention_epoch,
     )
-    prefill_sp_post(
-        attn_output, x_hc, post_mix, residual_mix, x_hc_out, next_pre_mix, tp_rank, num_tokens, gathered,
-    )
+    hc_rows = pl.tensor.dim(x_hc, 0)
+    hc_active = pl.max(0, pl.min(hc_rows, num_tokens - (tp_rank) * hc_rows))
+    if hc_active > 0:
+        hc_sublayer = attn_output[:hc_active, :]
+        hc_residual = x_hc[:hc_active, :, :]
+        hc_post_mix = post_mix[:hc_active, :]
+        hc_residual_mix = residual_mix[:hc_active, :, :]
+        hc_output = x_hc_out[:hc_active, :, :]
+        hc_post_deps = pl.array.create(2, pl.TASK_ID)
+        hc_post_deps[0] = gathered
+        hc_post(hc_sublayer, hc_residual, hc_post_mix, hc_residual_mix, hc_output, deps=hc_post_deps)
+    if hc_active < hc_rows:
+        with pl.spmd(32, name_hint="sp_mix_zero_padding", deps=[gathered]):
+            worker = pl.tile.get_block_idx()
+            for row in pl.range(hc_active + worker, hc_rows, 32):
+                # Reduce-scatter supplies zeros for inactive rows.
+                zero_source = pl.cast(attn_output[row:row + 1, 0:16], pl.FP32)
+                zero_output = pl.full([1, HC_MULT * D], dtype=pl.FP32, value=0.0)
+                zero_output = pl.assemble(zero_output, zero_source, [0, 0])
+                x_hc_out[row:row + 1, :, :] = pl.reshape(zero_output, [1, HC_MULT, D])
+                zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
+                next_pre_mix[row:row + 1, :] = pl.set_validshape(zero_mix, 1, HC_MULT)
     return x_hc_out
 
 
@@ -257,22 +267,13 @@ def prefill_c2a_reuse(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    """Run one C2A Reuse attention sublayer between mHC pre and post; see ``prefill_c2a_full``."""
+    """Run one C2A Reuse attention sublayer between HC pre and post; see ``prefill_c2a_full``."""
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_pre(
-        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        hc_collapsed, next_pre_mix, post_mix, residual_mix,
-        rms_worker_limit=16, head_worker_limit=16,
-    )
-    hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
-    hc_norm_block_blocks = (hc_norm_tokens + 7) // 8
-    hc_norm_block_workers = pl.min(hc_norm_block_blocks, 32)
-    for hc_norm_block_worker in pl.spmd(hc_norm_block_workers, name_hint="rms_norm"):
-        for hc_norm_block in pl.range(hc_norm_block_worker, hc_norm_block_blocks, hc_norm_block_workers):
-            rms_norm_tiled(hc_collapsed, attn_norm_weight, attn_input, hc_norm_block, hc_norm_tokens, output_fp32=False)
+    hc_head_norm(x_hc, pre_mix, attn_norm_weight, attn_input, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
     attention_tokens = pl.tensor.dim(attn_input, 0)
     attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
     prefill_c2a_reuse_attention(
@@ -544,7 +545,7 @@ if __name__ == "__main__":
     from prefill_c2a_full import PREFILL_ATTN_RING_HEAP, golden_prefill_c2a, build_specs, make_compare
     from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C2A reuse with mHC: A5 precision")
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C2A reuse with HC: A5 precision")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
