@@ -83,10 +83,9 @@ MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * M
 
 # PyPTO W13 projection tiling, mirroring kernels/expert_routed_w13.cpp. The
 # extern uses M_TILE/N_TILE/K_TILE = 64/256/256; the PyPTO K tile is halved
-# because pl.cast has no direct packed-FP4 to FP8E4M3 path (see the FP4
-# operator-support table in the PyPTO docs), so the unpack holds a BF16
-# intermediate of the same extent alongside the packed source and the FP8
-# result. 128 keeps all three inside Vec.
+# because pl.cast has no direct packed-FP4 to FP8E4M3 path. The chain is
+# legalized as fp4 -> BF16 -> FP32 -> FP8E4M3, so it holds an FP32 tile four
+# times the width of the FP8 result; at K 128 that peak is 128 KB and fits.
 # 32, not the extern's 64, because every projection must run on a FULL row
 # tile: narrowing an MX_A_ZZ activation-scale load with valid_shape is
 # silently miscompiled. A full tile stays inside the expert's stride only if
@@ -373,20 +372,26 @@ def _w13_projection(
     a_scale0 = pl.load(x_scale_zz, [x_row, 0], [W13_M_TILE, W13_SCALE_K])
     # Each packed byte carries two E2M1 nibbles adjacent along N, low nibble
     # first, so the numerical cast expands the column extent 2:1 back to
-    # W13_N_TILE. BF16 is an exact intermediate -- all sixteen E2M1 values are
-    # representable in BF16 and in FP8E4M3 -- so this reproduces the extern's
-    # single TCVT bit for bit. It is spelled out rather than left to
-    # pl.cast(fp4, pl.FP8E4M3FN), which legalizes through BF16 *and* FP32; the
-    # FP32 intermediate does not fit alongside the rest of the working set.
+    # W13_N_TILE. The decode is exact -- all sixteen E2M1 values are
+    # representable in FP8E4M3 -- but it is not cheap: PTOAS legalizes it as
+    # fp4 -> BF16 -> FP32 -> FP8E4M3, three TCVT passes whose FP32 temporary is
+    # four times the width of the result, and the generated kernel then adds a
+    # RowMajor-to-NZ TMOV before pushing the tile to the cube. Measured on A5,
+    # that decode is 92% of this entry's runtime: removing it and nothing else
+    # takes effective_us from 2810 to 371 against the extern's 156. The extern
+    # instead decodes with one TCVT on the AIV. Spelling the chain out by hand
+    # does not help -- pl.cast(fp4, pl.FP8E4M3FN) lowers to the same three
+    # passes -- so the fix has to be reuse or a cheaper decode, not a different
+    # spelling here.
     packed0 = pl.load(weight_flat, [panel_row, 0], [W13_K_TILE, MX_PACKED_LANE_COLS])
-    b0 = pl.cast(pl.cast(pl.reinterpret_view(packed0, pl.FP4E2M1X2), pl.BF16), pl.FP8E4M3FN)
+    b0 = pl.cast(pl.reinterpret_view(packed0, pl.FP4E2M1X2), pl.FP8E4M3FN)
     b_scale0 = pl.load(weight_scale, [scale_row, col], [W13_SCALE_K, W13_N_TILE])
     acc = pl.matmul_mx(a0, a_scale0, b0, b_scale0)
     for k0 in pl.range(W13_K_TILE, D, W13_K_TILE):
         a = pl.load(x, [x_row, k0], [W13_M_TILE, W13_K_TILE])
         a_scale = pl.load(x_scale_zz, [x_row, k0 // MX_GROUP], [W13_M_TILE, W13_SCALE_K])
         packed = pl.load(weight_flat, [panel_row + k0, 0], [W13_K_TILE, MX_PACKED_LANE_COLS])
-        b = pl.cast(pl.cast(pl.reinterpret_view(packed, pl.FP4E2M1X2), pl.BF16), pl.FP8E4M3FN)
+        b = pl.cast(pl.reinterpret_view(packed, pl.FP4E2M1X2), pl.FP8E4M3FN)
         b_scale = pl.load(
             weight_scale, [scale_row + k0 // MX_GROUP, col], [W13_SCALE_K, W13_N_TILE],
         )
