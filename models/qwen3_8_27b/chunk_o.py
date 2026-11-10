@@ -37,6 +37,10 @@ GRP = H // HG                               # value heads sharing one key head
 KEY_WIDTH = HG * D
 VAL_WIDTH = H * D
 
+# tiling
+AIV_LANES = 2                               # vector lanes one core group drives
+ROW_TILE = CHUNK_TILE // AIV_LANES          # chunk rows one lane owns
+
 # validation
 # One chunk, the cross-chunk recurrence, then eight chunks. The token count must be a
 # multiple of CHUNK_TILE.
@@ -67,7 +71,7 @@ def _gdn_chunk_o(
     o_flat = pl.reshape(o_out, [t_dim, VAL_WIDTH])
     for c0 in pl.spmd(
         t_dim // CHUNK_TILE, name_hint="chunk_o",
-        optimizations=[pl.cross_core_slot(slot_num=1), pl.split(pl.SplitMode.UP_DOWN)],
+        optimizations=[pl.cross_core_slot(slot_num=1)],
     ):
         t0 = c0 * CHUNK_TILE
         for hh in pl.range(H):
@@ -77,30 +81,41 @@ def _gdn_chunk_o(
             dg0 = (hh // GRP) * D
             qc = q_flat[t0 : t0 + CHUNK_TILE, dg0 : dg0 + D]
             g_row = g_sum[hh : hh + 1, t0 : t0 + CHUNK_TILE]
-            g_col = pl.reshape(g_row, [CHUNK_TILE, 1])
-            # exp before the [1,C]->[C,1] reshape, not after (pypto#2947)
-            eg = pl.reshape(pl.exp(g_row), [CHUNK_TILE, 1])
 
             row = c0 * VAL_WIDTH + d0
             s_blk = state[row : row + D, 0 : D]
-            inter = pl.row_expand_mul(pl.matmul(qc, s_blk), eg)
+            qs = pl.matmul(qc, s_blk)
 
             # A matmul result, not pl.create_tensor: the accumulator must be a tile
             # private to this core group, not a tensor every chunk in flight shares.
             kc = k_flat[t0 : t0 + CHUNK_TILE, dg0 : dg0 + D]
             qk = pl.matmul(qc, kc, b_trans=True)
-            diff = pl.full([CHUNK_TILE, CHUNK_TILE], dtype=pl.FP32, value=0.0)
-            diff = pl.row_expand_add(diff, g_col)
-            diff = pl.col_expand_sub(diff, g_row)
-            decay = pl.exp(pl.minimum(diff, 0.0))
-            gate = pl.mul(decay, mask[:, :])
-            # a matmul's result dtype follows its CONSUMER, not its operands
-            gated = pl.cast(pl.mul(qk, gate), target_type=pl.FP16, mode="rint")
-            vc = v_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
-            intra = pl.matmul(gated, vc, out_dtype=pl.FP32)
 
-            o_tile = pl.cast(pl.add(inter, intra), target_type=pl.FP16, mode="rint")
-            o_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D] = o_tile
+            # The gate is the row-split half of the chunk: each lane shards both
+            # cube results by row and gathers its gated half back for the cube.
+            for gate_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                r0 = gate_aiv * ROW_TILE
+                g_lane = g_sum[hh : hh + 1, t0 + r0 : t0 + r0 + ROW_TILE]
+                g_col = pl.reshape(g_lane, [ROW_TILE, 1])
+                # exp before the [1,C]->[C,1] reshape, not after (pypto#2947)
+                eg = pl.reshape(pl.exp(g_lane), [ROW_TILE, 1])
+                inter = pl.row_expand_mul(pl.aiv_shard(qs), eg)
+                diff = pl.full([ROW_TILE, CHUNK_TILE], dtype=pl.FP32, value=0.0)
+                diff = pl.row_expand_add(diff, g_col)
+                diff = pl.col_expand_sub(diff, g_row)
+                decay = pl.exp(pl.minimum(diff, 0.0))
+                gate = pl.mul(decay, mask[r0 : r0 + ROW_TILE, :])
+                # a matmul's result dtype follows its CONSUMER, not its operands
+                gated = pl.cast(pl.mul(pl.aiv_shard(qk), gate), target_type=pl.FP16, mode="rint")
+                gated_full = pl.aic_gather(gated)
+            vc = v_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
+            intra = pl.matmul(gated_full, vc, out_dtype=pl.FP32)
+
+            # inter stays in the lane that computed it; intra arrives row-sharded.
+            for out_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                r0 = out_aiv * ROW_TILE
+                o_tile = pl.cast(pl.add(inter, pl.aiv_shard(intra)), target_type=pl.FP16, mode="rint")
+                o_flat[t0 + r0 : t0 + r0 + ROW_TILE, d0 : d0 + D] = o_tile
     return o_out
 
 

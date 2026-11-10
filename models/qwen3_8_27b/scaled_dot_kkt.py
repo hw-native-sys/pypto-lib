@@ -28,6 +28,8 @@ KEY_WIDTH = HG * D
 # tiling
 A_WIDTH = H * CHUNK_TILE
 COL_TILE = 128          # columns of A per matmul
+AIV_LANES = 2           # vector lanes one core group drives
+ROW_TILE = CHUNK_TILE // AIV_LANES      # chunk rows one lane owns
 SLOT_NUM = 1            # cross-core ring depth; the default cannot hold a
                         # [CHUNK_TILE, COL_TILE] FP32 crossing tile (pypto#2903)
 
@@ -56,7 +58,7 @@ def _gdn_scaled_dot_kkt(
     a_flat = pl.reshape(a_out, [t_dim, A_WIDTH])
     for c0 in pl.spmd(
         t_dim // CHUNK_TILE, name_hint="scaled_dot_kkt",
-        optimizations=[pl.cross_core_slot(slot_num=SLOT_NUM), pl.split(pl.SplitMode.UP_DOWN)],
+        optimizations=[pl.cross_core_slot(slot_num=SLOT_NUM)],
     ):
         t0 = c0 * CHUNK_TILE
         msk = mask[:, :]                       # constant, held for the whole scope
@@ -65,24 +67,27 @@ def _gdn_scaled_dot_kkt(
             # model reaches by repeat_interleave. GRP == 1 leaves this an identity.
             d0 = (hh // GRP) * D
             kc = k_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
-            # g_sum and beta are head-major [H, T]: one head's chunk views as
-            # [1, CHUNK_TILE] for a row broadcast and [CHUNK_TILE, 1] for a column one.
-            g_col = pl.reshape(g_sum[hh : hh + 1, t0 : t0 + CHUNK_TILE], [CHUNK_TILE, 1])
-            beta_col = pl.reshape(beta[hh : hh + 1, t0 : t0 + CHUNK_TILE], [CHUNK_TILE, 1])
             for j0 in pl.unroll(0, CHUNK_TILE, COL_TILE):
                 kj = k_flat[t0 + j0 : t0 + j0 + COL_TILE, d0 : d0 + D]
                 scores = pl.matmul(kc, kj, b_trans=True)
+                # The columns are whole; only the score rows split across the lanes.
                 g_row = g_sum[hh : hh + 1, t0 + j0 : t0 + j0 + COL_TILE]
-                diff = pl.full([CHUNK_TILE, COL_TILE], dtype=pl.FP32, value=0.0)
-                diff = pl.row_expand_add(diff, g_col)
-                diff = pl.col_expand_sub(diff, g_row)
-                decay = pl.exp(pl.minimum(diff, 0.0))
-                gated = pl.mul(scores, decay)
-                gated = pl.row_expand_mul(gated, beta_col)
-                masked = pl.mul(gated, msk[:, j0 : j0 + COL_TILE])
-                masked16 = pl.cast(masked, target_type=pl.FP16, mode="rint")
-                col = hh * CHUNK_TILE + j0
-                a_flat[t0 : t0 + CHUNK_TILE, col : col + COL_TILE] = masked16
+                for score_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                    r0 = score_aiv * ROW_TILE
+                    # g_sum and beta are head-major [H, T]: this lane's rows view as
+                    # [1, ROW_TILE] from the tensor and [ROW_TILE, 1] for a column broadcast.
+                    g_col = pl.reshape(g_sum[hh : hh + 1, t0 + r0 : t0 + r0 + ROW_TILE], [ROW_TILE, 1])
+                    beta_col = pl.reshape(beta[hh : hh + 1, t0 + r0 : t0 + r0 + ROW_TILE], [ROW_TILE, 1])
+                    diff = pl.full([ROW_TILE, COL_TILE], dtype=pl.FP32, value=0.0)
+                    diff = pl.row_expand_add(diff, g_col)
+                    diff = pl.col_expand_sub(diff, g_row)
+                    decay = pl.exp(pl.minimum(diff, 0.0))
+                    gated = pl.mul(pl.aiv_shard(scores), decay)
+                    gated = pl.row_expand_mul(gated, beta_col)
+                    masked = pl.mul(gated, msk[r0 : r0 + ROW_TILE, j0 : j0 + COL_TILE])
+                    masked16 = pl.cast(masked, target_type=pl.FP16, mode="rint")
+                    col = hh * CHUNK_TILE + j0
+                    a_flat[t0 + r0 : t0 + r0 + ROW_TILE, col : col + COL_TILE] = masked16
     return a_out
 
 

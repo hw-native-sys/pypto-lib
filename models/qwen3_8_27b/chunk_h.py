@@ -37,6 +37,11 @@ GRP = H // HG                               # value heads sharing one key head
 KEY_WIDTH = HG * D
 VAL_WIDTH = H * D
 
+# tiling
+AIV_LANES = 2                               # vector lanes one core group drives
+ROW_TILE = CHUNK_TILE // AIV_LANES          # chunk rows one lane owns
+STATE_TILE = D // AIV_LANES                 # state rows one lane owns
+
 # validation
 # One chunk, the cross-chunk recurrence, then eight chunks. The token count must be a
 # multiple of CHUNK_TILE.
@@ -66,9 +71,12 @@ def _gdn_chunk_h(
     v_flat = pl.reshape(v_new, [t_dim, VAL_WIDTH])
     for hh in pl.spmd(
         H, name_hint="chunk_h",
-        optimizations=[pl.cross_core_slot(slot_num=1), pl.split(pl.SplitMode.UP_DOWN)],
+        optimizations=[pl.cross_core_slot(slot_num=1)],
     ):
-        s0 = pl.full([D, D], dtype=pl.FP32, value=0.0)
+        # The carried state is per-lane from the start: each lane owns STATE_TILE
+        # of its D rows and never holds the whole [D, D] tile.
+        for _ in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.NONE):
+            s0 = pl.full([STATE_TILE, D], dtype=pl.FP32, value=0.0)
         for c, (s_cur,) in pl.range(t_dim // CHUNK_TILE, init_values=(s0,)):
             t0 = c * CHUNK_TILE
             row = (c * H + hh) * D
@@ -76,36 +84,42 @@ def _gdn_chunk_h(
             # GQA: K comes from key head hh // GRP; W, U and the state are per
             # value head.
             dg0 = (hh // GRP) * D
-
-            s16 = pl.cast(s_cur, target_type=pl.FP16, mode="rint")
-            state[row : row + D, 0:D] = s16                 # state ENTERING this chunk
-
-            # coeff[i] = exp(g_last - g_i), decay = exp(g_last); both arguments <= 0
             g_last = pl.read(g_sum, [hh, t0 + CHUNK_TILE - 1])
-            g_row = g_sum[hh : hh + 1, t0 : t0 + CHUNK_TILE]
-            zero_row = pl.full([1, CHUNK_TILE], dtype=pl.FP32, value=0.0)
-            neg_g = pl.sub(zero_row, g_row)
-            # exp before the [1,C]->[C,1] reshape, not after (pypto#2947)
-            coeff = pl.reshape(pl.exp(pl.add(neg_g, g_last)), [CHUNK_TILE, 1])
-            zero_d = pl.full([1, D], dtype=pl.FP32, value=0.0)
-            decay = pl.reshape(pl.exp(pl.add(zero_d, g_last)), [D, 1])
 
+            for state_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                sr0 = state_aiv * STATE_TILE
+                s16 = pl.cast(s_cur, target_type=pl.FP16, mode="rint")
+                state[row + sr0 : row + sr0 + STATE_TILE, 0:D] = s16   # state ENTERING this chunk
+                s16_full = pl.aic_gather(s16)                          # the cube needs both halves
             wc = w_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
-            ws = pl.matmul(wc, s16, out_dtype=pl.FP32)
-            uc = u_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
-            vc = pl.sub(pl.cast(uc, target_type=pl.FP32), ws)   # V_new = U - W @ S
-            vc16 = pl.cast(vc, target_type=pl.FP16, mode="rint")
+            ws = pl.matmul(wc, s16_full, out_dtype=pl.FP32)
 
             # S = exp(g_last) * S + K^T @ (coeff * V_new). The decay goes on V, not
-            # on K: K^T (V c) == (K c)^T V. Under pl.split a matmul whose transposed
-            # operand came from the vector unit cannot be lowered (pypto#2902).
+            # on K: K^T (V c) == (K c)^T V. A matmul whose transposed operand came
+            # from the vector unit cannot be lowered (pypto#2902).
+            for v_aiv in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                r0 = v_aiv * ROW_TILE
+                # coeff[i] = exp(g_last - g_i), argument <= 0
+                g_lane = g_sum[hh : hh + 1, t0 + r0 : t0 + r0 + ROW_TILE]
+                zero_row = pl.full([1, ROW_TILE], dtype=pl.FP32, value=0.0)
+                neg_g = pl.sub(zero_row, g_lane)
+                # exp before the [1,C]->[C,1] reshape, not after (pypto#2947)
+                coeff = pl.reshape(pl.exp(pl.add(neg_g, g_last)), [ROW_TILE, 1])
+                uc = u_flat[t0 + r0 : t0 + r0 + ROW_TILE, d0 : d0 + D]
+                vc = pl.sub(pl.cast(uc, target_type=pl.FP32), pl.aiv_shard(ws))   # V_new = U - W @ S
+                vc16 = pl.cast(vc, target_type=pl.FP16, mode="rint")
+                v_flat[t0 + r0 : t0 + r0 + ROW_TILE, d0 : d0 + D] = vc16
+                vs = pl.row_expand_mul(vc, coeff)
+                vs16 = pl.cast(vs, target_type=pl.FP16, mode="rint")
+                vs16_full = pl.aic_gather(vs16)
             kc = k_flat[t0 : t0 + CHUNK_TILE, dg0 : dg0 + D]
-            vs = pl.row_expand_mul(vc, coeff)
-            vs16 = pl.cast(vs, target_type=pl.FP16, mode="rint")
-            kv = pl.matmul(kc, vs16, a_trans=True, out_dtype=pl.FP32)
-            s_next = pl.add(pl.row_expand_mul(s_cur, decay), kv)
+            kv = pl.matmul(kc, vs16_full, a_trans=True, out_dtype=pl.FP32)
 
-            v_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D] = vc16
+            for _ in pl.split_aiv(AIV_LANES, mode=pl.SplitMode.UP_DOWN):
+                # decay = exp(g_last) on every row, so the lane builds its own width
+                zero_d = pl.full([1, STATE_TILE], dtype=pl.FP32, value=0.0)
+                decay = pl.reshape(pl.exp(pl.add(zero_d, g_last)), [STATE_TILE, 1])
+                s_next = pl.add(pl.row_expand_mul(s_cur, decay), pl.aiv_shard(kv))
             s_end, = pl.yield_(s_next)
     return state, v_new
 
