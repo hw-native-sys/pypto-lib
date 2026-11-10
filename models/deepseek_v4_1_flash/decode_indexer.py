@@ -12,7 +12,7 @@ from pathlib import Path
 
 from pypto.runtime import pto_isa_include_dir
 
-from gemm import gemm_bf16_to_bf16
+from gemm import gemm_bf16_to_bf16, gemm_mxfp8_to_bf16
 import pypto.language as pl
 from config import (
     B_DYN, FLASH, INDEX_BLOCKS_DYN, INDEX_CACHE_GROUP, INDEX_POOL_BLOCKS_DYN,
@@ -27,6 +27,7 @@ INDEX_H = FLASH.index_n_heads
 INDEX_DIM = FLASH.index_head_dim
 INDEX_TOPK = FLASH.index_topk
 Q_LORA = FLASH.q_lora_rank
+QUERY_WIDTH = INDEX_H * INDEX_DIM
 ROPE_DIM = FLASH.qk_rope_head_dim
 CANDIDATE_BLOCK_SIZE = FLASH.candidate_block_size
 CANDIDATE_TOPK_BLOCKS = FLASH.candidate_topk_blocks
@@ -47,6 +48,9 @@ SCORE_ROWS_TILE = SCORE_RUN_TILE * INDEX_H
 SCORE_BATCH_TILE = 16
 SCORE_SHARD_CACHE = 25600
 SCORE_MERGE_CACHE = 16384
+PROJ_M_TILE = 80
+PROJ_K_TILE = 128
+PROJ_N_TILE = 128
 
 
 CANDIDATE_WORKER_TILE = 12
@@ -72,6 +76,224 @@ def _idx_q(
 ) -> pl.Tensor:
     """Project and quantize query heads with two C-to-V transfers per cube worker."""
     ...
+
+
+@pl.jit.inline(auto_scope=False)
+def project_index_query_pypto(
+    payload: pl.Tensor,
+    weight: pl.Tensor,
+    activation_scale: pl.Tensor,
+    weight_scale: pl.Tensor,
+    cosine: pl.Tensor,
+    sine: pl.Tensor,
+    output: pl.Tensor,
+    output_scale: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+):
+    tokens = pl.tensor.dim(output, 0)
+    padded = pl.tensor.dim(payload, 0)
+    scale_chunks = padded // PROJ_M_TILE
+    scale_chunk_width = PROJ_M_TILE * (Q_LORA // 32)
+    a_backing = pl.reshape(activation_scale, [scale_chunks, scale_chunk_width])
+    projected = pl.create_tensor([tokens, QUERY_WIDTH], dtype=pl.BF16)
+    last_projection = ready
+    for row in pl.range(0, num_tokens, PROJ_M_TILE):
+        projection_scale_row = row // PROJ_M_TILE
+        projected_rows, projection_tid = gemm_mxfp8_to_bf16(
+            payload, a_backing, weight, weight_scale, projected, num_tokens,
+            row, 0, 0,
+            Q_LORA, QUERY_WIDTH, "idx_q_projection", PROJ_N_TILE, PROJ_K_TILE,
+            1, projection_scale_row, row, PROJ_M_TILE, last_projection, 16, 2,
+        )
+        projected = projected_rows
+        last_projection = projection_tid
+
+    with pl.spmd(16, name_hint="idx_q_rope_quant_reg", deps=[last_projection]) as completed:
+        worker = pl.tile.get_block_idx()
+        for token in pl.range(worker, num_tokens, 16):
+            cos_row = pl.tile.load(cosine, [token, 0], [1, 32], target_memory=pl.MemorySpace.Vec)
+            sin_row = pl.tile.load(sine, [token, 0], [1, 32], target_memory=pl.MemorySpace.Vec)
+            cos_pad = pl.tile.full([1, 64], dtype=pl.FP32, value=0.0)
+            sin_pad = pl.tile.full([1, 64], dtype=pl.FP32, value=0.0)
+            cos_pad[0:1, 0:32] = cos_row
+            sin_pad[0:1, 0:32] = sin_row
+            cos_vec = pl.reshape(pl.tile.move(cos_pad, target_memory=pl.MemorySpace.Vec), [64])
+            sin_vec = pl.reshape(pl.tile.move(sin_pad, target_memory=pl.MemorySpace.Vec), [64])
+            for head in pl.range(INDEX_H):
+                source = pl.tile.load(projected, [token, head * INDEX_DIM], [1, INDEX_DIM], target_memory=pl.MemorySpace.Vec)
+                source_vec = pl.reshape(source, [INDEX_DIM])
+                packed = pl.tile.full([128], dtype=pl.UINT8, value=0)
+                packed = pl.tile.move(packed, target_memory=pl.MemorySpace.Vec)
+                exponent_tile = pl.tile.full([128], dtype=pl.INT32, value=0)
+                exponent_tile = pl.tile.move(exponent_tile, target_memory=pl.MemorySpace.Vec)
+                scratch = pl.tile.full([64], dtype=pl.FP32, value=0.0)
+                scratch = pl.tile.move(scratch, target_memory=pl.MemorySpace.Vec)
+                with pl.reg_scope():
+                    r0_mask = pl.reg.full_mask(lanes=64)
+                    r0_first = pl.reg.active_mask(32, lanes=64)
+                    r0_second = pl.reg.mask_not(r0_first)
+                    r0_raw = pl.reg.load(source_vec, 0, lanes=64)
+                    r0_half = pl.reg.interpret_cast(r0_raw, dtype=pl.UINT16)
+                    r0_bits = pl.reg.convert(r0_half, dtype=pl.UINT32)
+                    r0_bits = pl.reg.shift_lefts(r0_bits, 16, r0_mask)
+                    r0_values = pl.reg.interpret_cast(r0_bits, dtype=pl.FP32)
+                    r0_magnitude = pl.reg.abs(r0_values)
+                    r0_lo_max = pl.reg.reduce_max(r0_magnitude, r0_first)
+                    r0_hi_max = pl.reg.reduce_max(r0_magnitude, r0_second)
+                    scratch = pl.reg.store(scratch, value=r0_lo_max)
+                    r0_lo_values = pl.reg.load(scratch, lanes=64)
+                    r0_zeros = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+                    r0_lo_values = pl.reg.gather_lanes(r0_lo_values, r0_zeros)
+                    scratch = pl.reg.store(scratch, value=r0_hi_max)
+                    r0_hi_values = pl.reg.load(scratch, lanes=64)
+                    r0_hi_values = pl.reg.gather_lanes(r0_hi_values, r0_zeros)
+                    r0_maximum = pl.reg.select(r0_first, r0_lo_values, r0_hi_values)
+                    r0_minimum = pl.reg.broadcast(6.0 * 2.0**-126, lanes=64, dtype=pl.FP32)
+                    r0_maximum = pl.reg.maximum(r0_maximum, r0_minimum)
+                    r0_raw_scale = pl.reg.muls(r0_maximum, 1.0 / 6.0, r0_mask)
+                    r0_scale_bits = pl.reg.interpret_cast(r0_raw_scale, dtype=pl.INT32)
+                    r0_scale_bits = pl.reg.adds(r0_scale_bits, 8388607, r0_mask)
+                    r0_exponent = pl.reg.shift_rights(r0_scale_bits, 23, r0_mask)
+                    r0_factor_bits = pl.reg.shift_lefts(r0_exponent, 23, r0_mask)
+                    r0_factor = pl.reg.interpret_cast(r0_factor_bits, dtype=pl.FP32)
+                    r0_normalized = pl.reg.div(r0_values, r0_factor)
+                    r0_magnitude = pl.reg.abs(r0_normalized)
+                    r0_codes = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+                    r0_selected0 = pl.reg.compares(r0_magnitude, 0.25, r0_mask, predicate="gt")
+                    r0_level0 = pl.reg.broadcast(1, lanes=64, dtype=pl.INT32)
+                    r0_codes = pl.reg.select(r0_selected0, r0_level0, r0_codes)
+                    r0_selected1 = pl.reg.compares(r0_magnitude, 0.75, r0_mask, predicate="ge")
+                    r0_level1 = pl.reg.broadcast(2, lanes=64, dtype=pl.INT32)
+                    r0_codes = pl.reg.select(r0_selected1, r0_level1, r0_codes)
+                    r0_selected2 = pl.reg.compares(r0_magnitude, 1.25, r0_mask, predicate="gt")
+                    r0_level2 = pl.reg.broadcast(3, lanes=64, dtype=pl.INT32)
+                    r0_codes = pl.reg.select(r0_selected2, r0_level2, r0_codes)
+                    r0_selected3 = pl.reg.compares(r0_magnitude, 1.75, r0_mask, predicate="ge")
+                    r0_level3 = pl.reg.broadcast(4, lanes=64, dtype=pl.INT32)
+                    r0_codes = pl.reg.select(r0_selected3, r0_level3, r0_codes)
+                    r0_selected4 = pl.reg.compares(r0_magnitude, 2.5, r0_mask, predicate="gt")
+                    r0_level4 = pl.reg.broadcast(5, lanes=64, dtype=pl.INT32)
+                    r0_codes = pl.reg.select(r0_selected4, r0_level4, r0_codes)
+                    r0_selected5 = pl.reg.compares(r0_magnitude, 3.5, r0_mask, predicate="ge")
+                    r0_level5 = pl.reg.broadcast(6, lanes=64, dtype=pl.INT32)
+                    r0_codes = pl.reg.select(r0_selected5, r0_level5, r0_codes)
+                    r0_selected6 = pl.reg.compares(r0_magnitude, 5.0, r0_mask, predicate="gt")
+                    r0_level6 = pl.reg.broadcast(7, lanes=64, dtype=pl.INT32)
+                    r0_codes = pl.reg.select(r0_selected6, r0_level6, r0_codes)
+                    r0_value_bits = pl.reg.interpret_cast(r0_normalized, dtype=pl.INT32)
+                    r0_sign = pl.reg.shift_rights(r0_value_bits, 28, r0_mask)
+                    r0_sign_mask = pl.reg.broadcast(8, lanes=64, dtype=pl.INT32)
+                    r0_sign = pl.reg.bitwise_and(r0_sign, r0_sign_mask)
+                    r0_codes = pl.reg.bitwise_or(r0_codes, r0_sign)
+                    r0_even_codes, r0_odd_codes = pl.reg.dintlv(r0_codes, r0_codes, r0_mask)
+                    r0_odd_codes = pl.reg.shift_lefts(r0_odd_codes, 4, r0_mask)
+                    r0_packed_codes = pl.reg.bitwise_or(r0_even_codes, r0_odd_codes)
+                    r0_signed = pl.reg.convert(r0_packed_codes, dtype=pl.INT8, saturate=False)
+                    r0_bytes = pl.reg.interpret_cast(r0_signed, dtype=pl.UINT8)
+                    packed = pl.reg.store(packed, 0, r0_bytes, r0_first)
+                    exponent_tile = pl.reg.store(exponent_tile, 0, r0_exponent)
+                with pl.reg_scope():
+                    r1_mask = pl.reg.full_mask(lanes=64)
+                    r1_first = pl.reg.active_mask(32, lanes=64)
+                    r1_second = pl.reg.mask_not(r1_first)
+                    r1_raw = pl.reg.load(source_vec, 64, lanes=64)
+                    r1_half = pl.reg.interpret_cast(r1_raw, dtype=pl.UINT16)
+                    r1_bits = pl.reg.convert(r1_half, dtype=pl.UINT32)
+                    r1_bits = pl.reg.shift_lefts(r1_bits, 16, r1_mask)
+                    r1_values = pl.reg.interpret_cast(r1_bits, dtype=pl.FP32)
+                    r1_even, r1_odd = pl.reg.dintlv(r1_values, r1_values, r1_mask)
+                    r1_cos = pl.reg.load(cos_vec, lanes=64)
+                    r1_sin = pl.reg.load(sin_vec, lanes=64)
+                    r1_ec = pl.reg.mul(r1_even, r1_cos)
+                    r1_os = pl.reg.mul(r1_odd, r1_sin)
+                    r1_es = pl.reg.mul(r1_even, r1_sin)
+                    r1_oc = pl.reg.mul(r1_odd, r1_cos)
+                    r1_real = pl.reg.sub(r1_ec, r1_os)
+                    r1_imag = pl.reg.add(r1_es, r1_oc)
+                    r1_rotated, r1_unused = pl.reg.intlv(r1_real, r1_imag, r1_mask)
+                    r1_rotation_bits = pl.reg.interpret_cast(r1_rotated, dtype=pl.UINT32)
+                    r1_high = pl.reg.shift_rights(r1_rotation_bits, 16, r1_mask)
+                    r1_one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
+                    r1_lsb = pl.reg.bitwise_and(r1_high, r1_one)
+                    r1_bias = pl.reg.broadcast(32767, lanes=64, dtype=pl.UINT32)
+                    r1_rounded = pl.reg.add(pl.reg.add(r1_rotation_bits, r1_bias), r1_lsb)
+                    r1_keep = pl.reg.broadcast(4294901760, lanes=64, dtype=pl.UINT32)
+                    r1_rounded = pl.reg.bitwise_and(r1_rounded, r1_keep)
+                    r1_values = pl.reg.interpret_cast(r1_rounded, dtype=pl.FP32)
+                    r1_magnitude = pl.reg.abs(r1_values)
+                    r1_lo_max = pl.reg.reduce_max(r1_magnitude, r1_first)
+                    r1_hi_max = pl.reg.reduce_max(r1_magnitude, r1_second)
+                    scratch = pl.reg.store(scratch, value=r1_lo_max)
+                    r1_lo_values = pl.reg.load(scratch, lanes=64)
+                    r1_zeros = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT32)
+                    r1_lo_values = pl.reg.gather_lanes(r1_lo_values, r1_zeros)
+                    scratch = pl.reg.store(scratch, value=r1_hi_max)
+                    r1_hi_values = pl.reg.load(scratch, lanes=64)
+                    r1_hi_values = pl.reg.gather_lanes(r1_hi_values, r1_zeros)
+                    r1_maximum = pl.reg.select(r1_first, r1_lo_values, r1_hi_values)
+                    r1_minimum = pl.reg.broadcast(6.0 * 2.0**-126, lanes=64, dtype=pl.FP32)
+                    r1_maximum = pl.reg.maximum(r1_maximum, r1_minimum)
+                    r1_raw_scale = pl.reg.muls(r1_maximum, 1.0 / 6.0, r1_mask)
+                    r1_scale_bits = pl.reg.interpret_cast(r1_raw_scale, dtype=pl.INT32)
+                    r1_scale_bits = pl.reg.adds(r1_scale_bits, 8388607, r1_mask)
+                    r1_exponent = pl.reg.shift_rights(r1_scale_bits, 23, r1_mask)
+                    r1_factor_bits = pl.reg.shift_lefts(r1_exponent, 23, r1_mask)
+                    r1_factor = pl.reg.interpret_cast(r1_factor_bits, dtype=pl.FP32)
+                    r1_normalized = pl.reg.div(r1_values, r1_factor)
+                    r1_magnitude = pl.reg.abs(r1_normalized)
+                    r1_codes = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+                    r1_selected0 = pl.reg.compares(r1_magnitude, 0.25, r1_mask, predicate="gt")
+                    r1_level0 = pl.reg.broadcast(1, lanes=64, dtype=pl.INT32)
+                    r1_codes = pl.reg.select(r1_selected0, r1_level0, r1_codes)
+                    r1_selected1 = pl.reg.compares(r1_magnitude, 0.75, r1_mask, predicate="ge")
+                    r1_level1 = pl.reg.broadcast(2, lanes=64, dtype=pl.INT32)
+                    r1_codes = pl.reg.select(r1_selected1, r1_level1, r1_codes)
+                    r1_selected2 = pl.reg.compares(r1_magnitude, 1.25, r1_mask, predicate="gt")
+                    r1_level2 = pl.reg.broadcast(3, lanes=64, dtype=pl.INT32)
+                    r1_codes = pl.reg.select(r1_selected2, r1_level2, r1_codes)
+                    r1_selected3 = pl.reg.compares(r1_magnitude, 1.75, r1_mask, predicate="ge")
+                    r1_level3 = pl.reg.broadcast(4, lanes=64, dtype=pl.INT32)
+                    r1_codes = pl.reg.select(r1_selected3, r1_level3, r1_codes)
+                    r1_selected4 = pl.reg.compares(r1_magnitude, 2.5, r1_mask, predicate="gt")
+                    r1_level4 = pl.reg.broadcast(5, lanes=64, dtype=pl.INT32)
+                    r1_codes = pl.reg.select(r1_selected4, r1_level4, r1_codes)
+                    r1_selected5 = pl.reg.compares(r1_magnitude, 3.5, r1_mask, predicate="ge")
+                    r1_level5 = pl.reg.broadcast(6, lanes=64, dtype=pl.INT32)
+                    r1_codes = pl.reg.select(r1_selected5, r1_level5, r1_codes)
+                    r1_selected6 = pl.reg.compares(r1_magnitude, 5.0, r1_mask, predicate="gt")
+                    r1_level6 = pl.reg.broadcast(7, lanes=64, dtype=pl.INT32)
+                    r1_codes = pl.reg.select(r1_selected6, r1_level6, r1_codes)
+                    r1_value_bits = pl.reg.interpret_cast(r1_normalized, dtype=pl.INT32)
+                    r1_sign = pl.reg.shift_rights(r1_value_bits, 28, r1_mask)
+                    r1_sign_mask = pl.reg.broadcast(8, lanes=64, dtype=pl.INT32)
+                    r1_sign = pl.reg.bitwise_and(r1_sign, r1_sign_mask)
+                    r1_codes = pl.reg.bitwise_or(r1_codes, r1_sign)
+                    r1_even_codes, r1_odd_codes = pl.reg.dintlv(r1_codes, r1_codes, r1_mask)
+                    r1_odd_codes = pl.reg.shift_lefts(r1_odd_codes, 4, r1_mask)
+                    r1_packed_codes = pl.reg.bitwise_or(r1_even_codes, r1_odd_codes)
+                    r1_signed = pl.reg.convert(r1_packed_codes, dtype=pl.INT8, saturate=False)
+                    r1_bytes = pl.reg.interpret_cast(r1_signed, dtype=pl.UINT8)
+                    packed = pl.reg.store(packed, 32, r1_bytes, r1_first)
+                    exponent_tile = pl.reg.store(exponent_tile, 64, r1_exponent)
+                scale = pl.tile.full([64], dtype=pl.UINT8, value=0)
+                scale = pl.tile.move(scale, target_memory=pl.MemorySpace.Vec)
+                with pl.reg_scope():
+                    r2_mask = pl.reg.full_mask(lanes=64)
+                    r2_four = pl.reg.active_mask(4, lanes=64)
+                    r2_offsets = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                    r2_offsets = pl.reg.muls(r2_offsets, 32, r2_mask)
+                    r2_values = pl.reg.gather(exponent_tile, r2_offsets, r2_four)
+                    r2_bytes_i8 = pl.reg.convert(r2_values, dtype=pl.INT8, saturate=False)
+                    r2_bytes_u8 = pl.reg.interpret_cast(r2_bytes_i8, dtype=pl.UINT8)
+                    scale = pl.reg.store(scale, value=r2_bytes_u8, mask=r2_four)
+                payload_row = pl.reshape(packed, [1, 128])
+                output = pl.store(pl.set_validshape(payload_row, 1, 64), [token, head * 64], output)
+                scale_row = pl.reshape(scale, [1, 64])
+                encoded = pl.reinterpret_view(scale_row, pl.FP8E8M0)
+                output_scale = pl.store(pl.set_validshape(encoded, 1, 4), [token, head * 4], output_scale)
+                pl.system.barrier(pipe=pl.PipeType.ALL)
+    return completed
 
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "index_score_topk.cpp",
