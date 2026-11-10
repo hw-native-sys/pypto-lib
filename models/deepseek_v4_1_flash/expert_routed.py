@@ -96,13 +96,21 @@ SWIGLU_SCALE_FLOOR = 1e-4
 # whole number of rows is contiguous and only the row tile has to stay aligned.
 SWIGLU_SCALE_COLS = MOE_INTER // MX_GROUP
 # H_SCALE is 72, so the flat run is 32-byte aligned for multiples of four rows,
-# and a single-column FP32 weight load needs at least eight rows for its own
+# and the single-column FP32 weight load needs at least eight rows for its own
 # column to be aligned. Eight it is -- half the extern's row tile, because the
-# FP32 activation and the equally large pl.row_max scratch share 240 KB of Vec.
+# widened FP32 gate and up tiles and the FP32 result scratch have to coexist in
+# 240 KB of Vec buffer.
 SWIGLU_ROW_TILE = 8
-# Shapes of the group-major view a row tile folds into, precomputed so they stay
-# compile-time constants inside the traced body.
+# Scale codes per row tile: the group-major order a row tile folds into, which
+# is exactly the contiguous run stored to the scale plane.
 SWIGLU_GROUP_ROWS = SWIGLU_ROW_TILE * SWIGLU_SCALE_COLS
+# One A5 vector register holds 64 FP32 lanes, which is two MX_GROUP groups, so a
+# register chunk can close the whole group-32 quantization without spilling.
+SWIGLU_LANES = 64
+SWIGLU_CHUNKS = MOE_INTER // SWIGLU_LANES
+SWIGLU_GROUPS_PER_CHUNK = SWIGLU_LANES // MX_GROUP
+# reduceCounts reduces at most one register's worth of experts per pass.
+SWIGLU_COUNT_LANES = SWIGLU_LANES
 
 
 @pl.jit.inline(auto_scope=False)
@@ -369,105 +377,171 @@ def routed_swiglu_quant_pypto(
 ):
     """PyPTO equivalent of :func:`_routed_swiglu_quant`, kept for precision only.
 
-    The model still calls the extern; this entry exists so the PyPTO
-    formulation stays validated while its performance is tuned separately.
-    Remove ``_routed_swiglu_quant`` and ``kernels/expert_routed_swiglu.cpp``
-    only once this reaches parity.
+    Written with ``pl.reg`` so it mirrors the extern's ``__VEC_SCOPE__`` regions
+    one to one: the activation chain stays in vector registers between a single
+    load and a single store, and ``reduceCounts`` is a register reduction rather
+    than a scalar loop. A Tile-op formulation of the same math needs 17 passes
+    over an 8x2304 FP32 tile, since every intermediate becomes a UB tile.
 
-    ``pair`` holds gate in columns ``[0, MOE_INTER)`` and up in
-    ``[MOE_INTER, 2 * MOE_INTER)`` of the same compact row, ``weights`` one
-    FP32 route weight per compact row. Rows are compact across experts, so the
-    active row count is the sum of ``counts`` and is only known on device --
-    that sum replaces the extern's vectorized ``reduceCounts`` reduction.
+    The model still calls the extern; this entry exists so the PyPTO formulation
+    stays validated while its performance is tuned. Remove
+    ``_routed_swiglu_quant`` and ``kernels/expert_routed_swiglu.cpp`` only once
+    this reaches parity.
 
-    Unlike the extern this takes no ``hidden`` argument: the tile shapes are
-    fixed to MOE_INTER by the 32-byte scale-row alignment described above.
+    Three ``pl.reg`` gaps shape the result, none of them fatal:
+
+    - No BF16 conversion in registers, so the widening is a Tile-level
+      ``pl.cast`` ahead of the scope -- one full-width pass per operand, which
+      is far cheaper than emulating it on all 288 chunk iterations.
+    - No grouped reduction (no ``vcgmax`` equivalent). The group-32 maximum is a
+      five-step rotate-and-max butterfly over ``gather_lanes``, which also
+      leaves the result broadcast across the group, so the reciprocal needs no
+      separate broadcast.
+    - No FP8 support at all. The payload therefore leaves the scope as FP32 and
+      one Tile-level cast narrows it to FP8E4M3; that is the single remaining
+      full-width UB pass.
+
+    One scope covers the whole row tile. A scope lowers to a VF helper call, so
+    opening one per row would multiply that call overhead by SWIGLU_ROW_TILE.
     """
+    # Tensor-level view: inside the device scope pl.reshape lowers as a
+    # tile op, which pl.load does not accept as a source.
+    counts_row = pl.reshape(counts, [1, experts])
     with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_swiglu_quant_pypto", deps=[w13_ready]) as ready:
         core = pl.tile.get_block_idx()
-        # Counts are immutable after w13_ready and number only a handful of
-        # experts, so a scalar accumulate is cheaper than the extern's vector
-        # reduction plus the Vector-to-Scalar flag needed to read it back.
+        # reduceCounts, as the extern's second __VEC_SCOPE__ does it: one vector
+        # reduction per register of experts, then the scalar handed back across
+        # the Vector-to-Scalar boundary. create_group_mask is the plt_b32 tail
+        # predicate (it accepts a dynamic active count, which active_mask does
+        # not), and the hand-back is a tile read after the scope rather than a
+        # PIPE_V -> PIPE_S flag pair. A register's worth of INT32 is the
+        # smallest allocatable extent, so the tile is SWIGLU_COUNT_LANES wide
+        # with only the real experts declared valid.
+        # This cannot be factored into a helper -- a reg_scope must sit
+        # lexically inside the function that opens the device scope.
         rows = pl.cast(0, pl.INDEX)
-        for expert in pl.range(experts):
-            rows = rows + pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
+        for first in pl.range(0, experts, SWIGLU_COUNT_LANES):
+            remaining = pl.min(SWIGLU_COUNT_LANES, experts - first)
+            counts_tile = pl.load(counts_row, [0, first], [1, SWIGLU_COUNT_LANES],
+                                  valid_shape=[1, remaining], target_memory=pl.MemorySpace.Vec)
+            counts_flat = pl.reshape(counts_tile, [SWIGLU_COUNT_LANES])
+            total_tile = pl.tile.create([SWIGLU_COUNT_LANES], dtype=pl.INT32,
+                                        target_memory=pl.MemorySpace.Vec)
+            with pl.reg_scope():
+                count_mask = pl.reg.create_group_mask(remaining, num_groups=1,
+                                                      group_size=SWIGLU_COUNT_LANES)
+                count_lane = pl.reg.index_gen(0, lanes=SWIGLU_COUNT_LANES, dtype=pl.UINT32)
+                count_values = pl.reg.gather(counts_flat, count_lane, count_mask)
+                count_total = pl.reg.reduce_sum(count_values, count_mask)
+                total_written = pl.reg.store(total_tile, 0, value=count_total)
+            rows = rows + pl.cast(pl.tile.read(total_written, [0]), pl.INDEX)
         work_count = (rows + SWIGLU_ROW_TILE - 1) // SWIGLU_ROW_TILE
         for work in pl.range(core, work_count, ROUTED_VECTOR_WORKER_TILE):
             row = work * SWIGLU_ROW_TILE
-            # Every extent here is static. A runtime valid extent on the tail
-            # tile breaks 32-byte alignment -- seven rows of the FP32 weight
-            # column are 28 bytes, and seven rows of scale codes are 504 --
-            # and the resulting narrow transfers fault in MTE on device. The
-            # tensors are padded to a multiple of MX_M_TILE, so a full row tile
-            # is always in bounds; the surplus rows are computed and written
-            # from whatever the padded capacity holds. That is sound because
-            # rows past the active total are scratch: W2 reads only the active
-            # ones, and the extern simply leaves them at their prior value.
-            gate_rows = pl.load(pair, [row, 0], [SWIGLU_ROW_TILE, MOE_INTER])
-            up_rows = pl.load(pair, [row, MOE_INTER], [SWIGLU_ROW_TILE, MOE_INTER])
-            gate_bf = gate_rows
-            up_bf = up_rows
-            # Clamp in BF16 before widening: the bound is exactly representable,
-            # so this matches the extern's FP32 clamp while keeping one fewer
-            # full-width FP32 tile alive across the widening.
-            if SWIGLU_LIMIT > 0.0:
-                gate_bf = pl.minimum(gate_bf, SWIGLU_LIMIT)
-                up_bf = pl.maximum(pl.minimum(up_bf, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-            gate = pl.cast(gate_bf, pl.FP32)
-            up = pl.cast(up_bf, pl.FP32)
-            # SiLU composed from exp and div: PyPTO has no sigmoid primitive and
-            # the extern uses the same hardware exp, so the two agree to the
-            # instruction's own accuracy rather than to torch's.
-            negated = pl.neg(gate)
-            exponential = pl.exp(negated)
-            sigmoid = pl.add(exponential, 1.0)
-            activated = pl.div(gate, sigmoid)
-            gated = pl.mul(activated, up)
-            # Loaded here rather than beside the activation: holding the weight
-            # column across the exp keeps a third tile live through the widest
-            # point of the body.
-            weight = pl.load(weights, [row, 0], [SWIGLU_ROW_TILE, 1])
-            values = pl.row_expand_mul(gated, weight)
-            groups = pl.reshape(values, [SWIGLU_GROUP_ROWS, MX_GROUP])
-            # Upward (ceil) E8M0: adding 2**23 - 1 carries any nonzero mantissa
-            # into the exponent field, so the shift yields the biased exponent
-            # of the next power of two. Floor first, then scale, as the extern
-            # does -- the order is observable when amax is below the floor.
-            amax_tmp = pl.tile.create([SWIGLU_GROUP_ROWS, MX_GROUP], dtype=pl.FP32)
-            magnitude = pl.abs(groups)
-            group_max = pl.row_max(magnitude, amax_tmp)
-            floored = pl.maximum(group_max, SWIGLU_SCALE_FLOOR)
-            amax = pl.mul(floored, SWIGLU_MAX_INV)
-            amax_bits = pl.reinterpret_view(amax, pl.INT32)
-            carried = pl.add(amax_bits, 8388607)
-            exponent = pl.shrs(carried, 23)
-            # Multiply by 2**(127 - exponent) rather than dividing by the scale:
-            # both are exact powers of two, and 254 - exponent stays a normal
-            # float across the representable E8M0 range.
-            negated_exponent = pl.neg(exponent)
-            reciprocal_exponent = pl.add(negated_exponent, 254)
-            factor_bits = pl.shls(reciprocal_exponent, 23)
-            factor = pl.reinterpret_view(factor_bits, pl.FP32)
-            normalized = pl.row_expand_mul(groups, factor)
-            scaled = pl.reshape(normalized, [SWIGLU_ROW_TILE, MOE_INTER])
-            lifted = pl.maximum(scaled, -SWIGLU_FP8_MAX)
-            bounded = pl.minimum(lifted, SWIGLU_FP8_MAX)
-            quantized = pl.cast(bounded, pl.FP8E4M3FN, mode="rint")
+            gate_tile = pl.load(pair, [row, 0], [SWIGLU_ROW_TILE, MOE_INTER],
+                                target_memory=pl.MemorySpace.Vec)
+            up_tile = pl.load(pair, [row, MOE_INTER], [SWIGLU_ROW_TILE, MOE_INTER],
+                              target_memory=pl.MemorySpace.Vec)
+            weight_tile = pl.load(weights, [row, 0], [SWIGLU_ROW_TILE, 1],
+                                  target_memory=pl.MemorySpace.Vec)
+            # pl.reg.convert has no BF16 pair, but the widening does not have to
+            # happen in registers: one Tile-level cast per operand is a single
+            # full-width pass, where widening by hand inside the chunk loop cost
+            # three ops per operand on every one of the 288 iterations.
+            gate_wide = pl.cast(gate_tile, pl.FP32)
+            up_wide = pl.cast(up_tile, pl.FP32)
+            # reg.load needs a contiguous one-dimensional Vec view; views are free.
+            gate_flat = pl.reshape(gate_wide, [SWIGLU_ROW_TILE * MOE_INTER])
+            up_flat = pl.reshape(up_wide, [SWIGLU_ROW_TILE * MOE_INTER])
+            weight_flat = pl.reshape(weight_tile, [SWIGLU_ROW_TILE])
+            scaled_flat = pl.tile.create([SWIGLU_ROW_TILE * MOE_INTER], dtype=pl.FP32,
+                                         target_memory=pl.MemorySpace.Vec)
+            code_flat = pl.tile.create([SWIGLU_GROUP_ROWS], dtype=pl.INT8,
+                                       target_memory=pl.MemorySpace.Vec)
+            with pl.reg_scope():
+                active = pl.reg.full_mask(lanes=SWIGLU_LANES)
+                group_span = pl.reg.broadcast(MX_GROUP - 1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                group_mask = pl.reg.broadcast(-MX_GROUP, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                lane_span = pl.reg.broadcast(SWIGLU_LANES - 1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                bias = pl.reg.broadcast(254, lanes=SWIGLU_LANES, dtype=pl.INT32)
+                lane_id = pl.reg.index_gen(0, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                group_base = pl.reg.bitwise_and(lane_id, group_mask, active)
+                # Rotate-by-k indices within each group of MX_GROUP lanes.
+                rot16 = pl.reg.bitwise_or(group_base, pl.reg.bitwise_and(
+                    pl.reg.adds(lane_id, 16, active), group_span, active), active)
+                rot8 = pl.reg.bitwise_or(group_base, pl.reg.bitwise_and(
+                    pl.reg.adds(lane_id, 8, active), group_span, active), active)
+                rot4 = pl.reg.bitwise_or(group_base, pl.reg.bitwise_and(
+                    pl.reg.adds(lane_id, 4, active), group_span, active), active)
+                rot2 = pl.reg.bitwise_or(group_base, pl.reg.bitwise_and(
+                    pl.reg.adds(lane_id, 2, active), group_span, active), active)
+                rot1 = pl.reg.bitwise_or(group_base, pl.reg.bitwise_and(
+                    pl.reg.adds(lane_id, 1, active), group_span, active), active)
+                # Lane i reads lane MX_GROUP*i, so lanes 0 and 1 compact this
+                # chunk's two group exponents; the wrap keeps unused lanes in
+                # range, and only the first two are stored.
+                code_pick = pl.reg.bitwise_and(
+                    pl.reg.muls(lane_id, MX_GROUP, active), lane_span, active)
+                code_store = pl.reg.active_mask(SWIGLU_GROUPS_PER_CHUNK, lanes=SWIGLU_LANES)
+                # Scatter rather than a masked store: the code run starts at a
+                # dynamic two-element offset and a masked store needs a provably
+                # aligned destination. Byte tiles take UINT16 offsets.
+                code_lane = pl.reg.index_gen(0, lanes=SWIGLU_LANES, dtype=pl.UINT16)
+                for lane_row in pl.hardware_loop(SWIGLU_ROW_TILE):
+                    # Every lane reads the same weight element; gather is how a
+                    # UB value is broadcast inside the scope.
+                    route_index = pl.reg.broadcast(
+                        pl.cast(lane_row, pl.UINT32), lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                    route_v = pl.reg.gather(weight_flat, route_index, active)
+                    for chunk in pl.hardware_loop(SWIGLU_CHUNKS):
+                        offset = lane_row * MOE_INTER + chunk * SWIGLU_LANES
+                        gate = pl.reg.load(gate_flat, offset, lanes=SWIGLU_LANES)
+                        up = pl.reg.load(up_flat, offset, lanes=SWIGLU_LANES)
+                        gate_c = pl.reg.minimums(gate, SWIGLU_LIMIT, active)
+                        up_low = pl.reg.minimums(up, SWIGLU_LIMIT, active)
+                        up_c = pl.reg.maximums(up_low, -SWIGLU_LIMIT, active)
+                        neg_gate = pl.reg.neg(gate_c, active)
+                        gate_exp = pl.reg.exp(neg_gate, active)
+                        denom = pl.reg.adds(gate_exp, 1.0, active)
+                        silu = pl.reg.div(gate_c, denom, active)
+                        gated = pl.reg.mul(silu, up_c, active)
+                        values = pl.reg.mul(gated, route_v, active)
+                        # Rotate-and-max butterfly: after five steps every lane
+                        # holds its own group's maximum, which doubles as the
+                        # broadcast the rescale below needs.
+                        mag0 = pl.reg.abs(values, active)
+                        mag1 = pl.reg.maximum(mag0, pl.reg.gather_lanes(mag0, rot16), active)
+                        mag2 = pl.reg.maximum(mag1, pl.reg.gather_lanes(mag1, rot8), active)
+                        mag3 = pl.reg.maximum(mag2, pl.reg.gather_lanes(mag2, rot4), active)
+                        mag4 = pl.reg.maximum(mag3, pl.reg.gather_lanes(mag3, rot2), active)
+                        group_max = pl.reg.maximum(mag4, pl.reg.gather_lanes(mag4, rot1), active)
+                        floored = pl.reg.maximums(group_max, SWIGLU_SCALE_FLOOR, active)
+                        amax = pl.reg.muls(floored, SWIGLU_MAX_INV, active)
+                        amax_bits = pl.reg.interpret_cast(amax, dtype=pl.INT32)
+                        carried = pl.reg.adds(amax_bits, 8388607, active)
+                        exponent = pl.reg.shift_rights(carried, 23, active)
+                        recip_exp = pl.reg.sub(bias, exponent, active)
+                        recip_bits = pl.reg.shift_lefts(recip_exp, 23, active)
+                        recip = pl.reg.interpret_cast(recip_bits, dtype=pl.FP32)
+                        normalized = pl.reg.mul(values, recip, active)
+                        lifted = pl.reg.maximums(normalized, -SWIGLU_FP8_MAX, active)
+                        bounded = pl.reg.minimums(lifted, SWIGLU_FP8_MAX, active)
+                        # Fresh names: reassigning the destination would make
+                        # these loop-carried, which VF lowering rejects. Both
+                        # alias the Vec storage the Tile pass below reads.
+                        scaled_alias = pl.reg.store(scaled_flat, offset, value=bounded)
+                        picked = pl.reg.gather_lanes(exponent, code_pick)
+                        code = pl.reg.convert(picked, dtype=pl.INT8, saturate=False)
+                        code_offset = lane_row * SWIGLU_SCALE_COLS + chunk * SWIGLU_GROUPS_PER_CHUNK
+                        code_index = pl.reg.adds(code_lane, pl.cast(code_offset, pl.UINT16), active)
+                        code_alias = pl.reg.scatter(code_flat, code_index, code, code_store)
+            # The only full-width Tile pass left: pl.reg has no FP8 conversion.
+            scaled_tile = pl.reshape(scaled_flat, [SWIGLU_ROW_TILE, MOE_INTER])
+            quantized = pl.cast(scaled_tile, pl.FP8E4M3FN, mode="rint")
             payload = pl.store(quantized, [row, 0], payload)
-            # Reshape to a row while the codes are still INT32: a [N, 1] tile of
-            # one-byte codes has a 1-byte row, and reshaping that to [1, N]
-            # faults in MTE. At INT32 both layouts stay 32-byte aligned.
-            exponent_row = pl.reshape(exponent, [1, SWIGLU_GROUP_ROWS])
-            # E8M0 codes are the raw biased exponent; wrap past 127 into INT8
-            # before the narrowing cast so the byte pattern is preserved.
-            sign_bit = pl.shrs(exponent_row, 7)
-            wrap = pl.mul(sign_bit, 256)
-            wrapped = pl.sub(exponent_row, wrap)
-            narrowed = pl.cast(wrapped, pl.INT8)
-            code_bytes = pl.reinterpret_view(narrowed, pl.UINT8)
+            code_row = pl.reshape(code_flat, [1, SWIGLU_GROUP_ROWS])
+            code_bytes = pl.reinterpret_view(code_row, pl.UINT8)
             codes = pl.reinterpret_view(code_bytes, pl.FP8E8M0)
-            # Group-major order already matches the flat row-major scale plane,
-            # so one row tile's codes form a single contiguous run.
             scales = pl.store(codes, [0, row * SWIGLU_SCALE_COLS], scales)
     return payload, scales, ready
 
