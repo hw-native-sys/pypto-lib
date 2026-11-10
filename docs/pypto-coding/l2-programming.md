@@ -259,9 +259,8 @@ retain their full-width explicit crossing and task-parallel behavior. Ordinary
 unsplit mixed kernels retain full-width implicit communication.
 
 The PyPTO compiler change and the lib migrations must be deployed together.
-The Qwen3 TQ draft's projection and gate/up epilogues now use explicit boundaries;
-`tests/test_tq_explicit_epilogues.py` checks their actual lane bodies against torch
-on both compiler backends without requiring model-sized weights or an NPU.
+The Qwen3 TQ draft's projection and gate/up epilogues use explicit boundaries
+and per-lane input slices and output offsets.
 
 - **`pl.cross_core_slot(slot_num=N)`** — ring depth of the automatic
   cube↔vector pipe. It sizes a channel; it does not partition work. Raising it
