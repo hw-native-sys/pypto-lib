@@ -82,9 +82,15 @@ def dspark_context_kv(
     """Use the draft layer's own WKV, norm, and paged cache mapping."""
     tokens = pl.tensor.dim(main_x, 0)
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(main_x, num_tokens)
+    kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(
+        main_x, num_tokens, row_tile=80,
+    )
     window_input_ready = pl.system.task_dummy(deps=[])
-    projected = kv_proj(kv_input_payload, kv_input_scales, wkv, wkv_scale, projected, num_tokens, worker_limit=32)
+    projected = kv_proj(
+        kv_input_payload, kv_input_scales,
+        wkv, wkv_scale,
+        projected, num_tokens, worker_limit=32, row_tile=80,
+    )
     window_publish(
         projected, kv_norm_weight, rope_cos, rope_sin,
         context_slots, window_cache,

@@ -81,7 +81,7 @@ def decode_swa(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens)
+    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens, row_tile=80)
     q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
@@ -90,8 +90,13 @@ def decode_swa(
         qr, q,
         num_tokens, qa_worker_limit=32, qb_worker_limit=32,
         padded_rows=proj_payload_padded_rows,
+        qa_row_tile=80, qb_row_tile=80,
     )
-    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=32)
+    kv_projection = kv_proj(
+        proj_payload, proj_scales,
+        wkv, wkv_scale,
+        kv_projection, num_tokens, worker_limit=32, row_tile=80,
+    )
     cache_ready = window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
         window_slots, window_cache,
