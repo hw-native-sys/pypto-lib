@@ -83,10 +83,11 @@ MX_W3_PACKED_ROWS = (2 * (D // MX_K_TILE) * (MOE_INTER // MX_MM_INTER_TILE)) * M
 MX_W2_PACKED_ROWS = (2 * (MOE_INTER // MX_K_TILE) * (D // MX_W2_D_OUT_TILE)) * MX_PACKED_LANE_ROWS
 
 # PyPTO W13 projection tiling, mirroring kernels/expert_routed_w13.cpp. The
-# extern uses M_TILE/N_TILE/K_TILE = 64/256/256; the PyPTO K tile is halved
-# because the decode's live set is wide -- packed source, FP16 and INT16
-# index tiles, gather scratch and gathered codes are all alive at once -- and
-# it has to fit W13_K_STAGE times over. See W13_K_STAGE for the sweep.
+# extern uses M_TILE/N_TILE/K_TILE = 64/256/256; N_TILE matches it here,
+# and the K tile matches it as well, once the gather's workspace stopped
+# claiming a full tile (see the scratch in _w13_projection): the decode's live
+# set has to fit W13_K_STAGE times over, and a full-size workspace put K 256
+# out of reach. See W13_K_STAGE for the sweep.
 # Every projection must run on a FULL row tile: narrowing an MX_A_ZZ
 # activation-scale load with valid_shape is silently miscompiled. A full tile
 # stays inside the expert's stride only if the tile divides it, so the tile is
@@ -103,7 +104,7 @@ W13_M_TILE = gcd(RECV_MAX, 80)
 assert W13_M_TILE % 16 == 0
 assert RECV_MAX % W13_M_TILE == 0
 W13_N_TILE = MX_MM_INTER_TILE
-W13_K_TILE = MX_K_TILE // 4
+W13_K_TILE = MX_K_TILE
 W13_N_BLOCKS = MOE_INTER // W13_N_TILE
 W13_SCALE_K = W13_K_TILE // MX_GROUP
 # A packed weight plane stores one (n_block, k_block) panel as MX_K_TILE rows
@@ -116,11 +117,11 @@ W13_PACKED_EXPERT_ROWS = MX_W1_PACKED_ROWS
 # tiles. None of that arrives by itself here -- AutoTileMatmulL0 does not
 # dispatch on matmul_mx, and the slot lowering only triggers on pl.pipeline --
 # so the K loop asks for it explicitly. Depth and K tile are coupled through
-# the Vec budget, and the pair below is the measured optimum (case full, 50
-# rounds, PyPTO effective_us): K 128 / depth 1 = 546, K 64 / depth 1 = 636,
-# K 64 / depth 2 = 461, K 64 / depth 3 = 538. K 128 at depth 2 does not fit
-# (361 KB of a 246 KB Vec) and K 32 is rejected outright -- matmul_mx needs a
-# physical K divisible by 64.
+# the Vec budget; measured optimum (case full, 50 rounds, PyPTO effective_us):
+# K 256 / depth 2 = 254, K 128 / depth 3 = 256, K 128 / depth 2 = 258,
+# K 128 / depth 4 = 258, K 64 / depth 2 = 276. Depth 1 is far worse at every
+# tile (546 at K 128). K 32 is rejected outright -- matmul_mx needs a physical
+# K divisible by 64.
 W13_K_STAGE = 2
 # Route weights are copied in 16-row chunks. Every chunk carries a runtime
 # valid extent, so the chunking buys nothing over a single [1, count] row
@@ -414,7 +415,7 @@ def _w13_projection(
     # cheap intermediate -- unlike the FP32 the cast legalization would use,
     # it is the same width as the result.
     index0 = pl.cast(pl.cast(packed0, pl.FP16), pl.INT16)
-    scratch0 = pl.tile.create([W13_K_TILE, MX_PACKED_LANE_COLS], dtype=pl.INT16)
+    scratch0 = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
     codes0 = pl.tile.gather(lut, index0, scratch0)
     # reinterpret_view only crosses INT8 <-> FP8E4M3FN, so widen the view in
     # two metadata-only steps; the column extent doubles with the first.
@@ -430,7 +431,10 @@ def _w13_projection(
         # cheap intermediate -- unlike the FP32 the cast legalization would use,
         # it is the same width as the result.
         index = pl.cast(pl.cast(packed, pl.FP16), pl.INT16)
-        scratch = pl.tile.create([W13_K_TILE, MX_PACKED_LANE_COLS], dtype=pl.INT16)
+        # The A5 index form does not constrain the gather workspace, so keep
+        # it minimal: a full-size one costs a whole extra tile of Vec per
+        # pipeline stage and was what kept the K tile below the extern's 256.
+        scratch = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
         codes = pl.tile.gather(lut, index, scratch)
         # reinterpret_view only crosses INT8 <-> FP8E4M3FN, so widen the view in
         # two metadata-only steps; the column extent doubles with the first.
