@@ -70,12 +70,19 @@ Qwen3-14B has 40 attention heads over 8 KV heads, so each KV head carries
 **5** Q heads. Five is odd and prime, and that one number shaped the whole
 attention thread.
 
-Every `SplitMode.UP_DOWN` row-split fusion — the standard way to fuse a cube
-matmul with its vector epilogue on this hardware — **rejects it**:
+With the historical implicit-splitting compiler, every `SplitMode.UP_DOWN`
+row-split fusion of a cube matmul and its vector epilogue **rejected it**:
 `SplitVectorKernel requires an even split dimension, got 5`. Drop `UP_DOWN` and
 the fallback fails differently: the `row_expand_div` output's `valid_shape`
 stays uninitialised inside a mixed root, so a `[5, HEAD_DIM]` subview fails IR
 validation (#349).
+
+Current split mixed kernels use explicit `pl.split_aiv` regions with `pl.aiv_shard` /
+`pl.aic_gather` boundaries and lane-specific slices and stores; function-level
+`pl.split(UP_DOWN)` no longer halves the body. See the
+[mixed-kernel contract](../../pypto-coding/l2-programming.md#optimizations).
+The compiler diagnostics and transformations below describe the historical
+implementation.
 
 The tree spent three changes finding an answer:
 
