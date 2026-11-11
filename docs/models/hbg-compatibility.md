@@ -56,8 +56,17 @@ assigning each published row its own physical cache slot.
 
 Lib `6a39eda` compiled the standalone `decode_fwd.py` entry in TMR and
 HBG with the same toolchain at TP1/EP2/DP2 and one synthetic weight
-bank. The check used `--compile-only`. The component goldens above
-provide the hardware precision evidence.
+bank. The check used `--compile-only`. On A5 hardware, the same
+fixture passed the TMR execution and output-padding checks with
+Simpler `0569c779`.
+
+HBG passed the same two-card execution check with a runtime candidate
+based on Simpler `0569c779` that routes predicated MIX and multi-block
+tasks to the AICPU scheduler. This runtime pairing also passed the
+standalone C1A reindex golden with start positions 8192 and 4096 and
+query lengths 1 and 2. The forward check covers execution, inactive
+logit and token rows, and sampled-ID padding. The standalone goldens
+cover numerical accuracy.
 
 ## PyPTO and Simpler dependencies
 
