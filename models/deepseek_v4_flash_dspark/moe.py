@@ -257,6 +257,7 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
         raise ValueError("Invalid physical expert capacity")
     LOCAL_EXPERTS = local_experts
     LOCAL_META_SLOTS = (LOCAL_EXPERTS + 15) // 16 * 16
+    SEND_ROUTE_TILE = ((T * TOPK + 7) // 8) * 8
     expert_routed_tile = make_expert_routed_tile(LOCAL_EXPERTS)
     route_eplb, export_eplb = make_moe_eplb(
         enabled=enable_eplb, logical_experts=N_EXPERTS_GLOBAL, ranks=N_RANKS,
@@ -290,6 +291,9 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
     ) -> pl.Scalar[pl.TASK_ID]:
         # Flat 2-D view kept outside the scope so it stays a tensor view, not a tile.
         recv_x_out_flat = pl.reshape(recv_x_out, [LOCAL_EXPERTS * RECV_MAX, D])
+        send_counts = pl.create_tensor([N_RANKS, LOCAL_META_SLOTS], dtype=pl.INT32)
+        send_starts = pl.create_tensor([N_RANKS, LOCAL_META_SLOTS], dtype=pl.INT32)
+        send_routes = pl.create_tensor([1, SEND_ROUTE_TILE], dtype=pl.INT32)
 
         # Meta and payload arrivals ride two independent windows: `arrived` and
         # `data_arrived`.
@@ -299,7 +303,7 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="dispatch_meta_publish",
-            allow_early_resolve=True,
+            allow_early_resolve=False,
         ) as _meta_push_tid:
             active_tokens = pl.cast(num_tokens, pl.INDEX)
             if active_tokens < 0:
@@ -320,18 +324,37 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
                     if eid >= 0:
                         dst = eid // LOCAL_EXPERTS
                         loc_e = eid - dst * LOCAL_EXPERTS
-                        cursor[dst * LOCAL_EXPERTS + loc_e] = cursor[dst * LOCAL_EXPERTS + loc_e] + 1
+                        lane = dst * LOCAL_EXPERTS + loc_e
+                        cursor[lane] = cursor[lane] + 1
 
             # One meta row per dst (all LOCAL_EXPERTS counts, zeros included), then bump the
             # per-source arrival counter. AtomicAdd on a monotonic window is
             # order-independent, so a late notify from an earlier epoch cannot clobber it.
             meta_tile = pl.tile.full([1, LOCAL_META_SLOTS], dtype=pl.INT32, value=0)
+            starts_tile = pl.tile.full([1, LOCAL_META_SLOTS], dtype=pl.INT32, value=0)
+            write_positions = pl.array.create(N_RANKS * LOCAL_EXPERTS, pl.INT32)
+            packed_offset = pl.const(0, pl.INT32)
             for dst in pl.range(N_RANKS):
                 for e in pl.range(LOCAL_EXPERTS):
-                    pl.tile.write(meta_tile, [0, e], cursor[dst * LOCAL_EXPERTS + e])
+                    lane = dst * LOCAL_EXPERTS + e
+                    pl.tile.write(meta_tile, [0, e], cursor[lane])
+                    pl.tile.write(starts_tile, [0, e], packed_offset)
+                    write_positions[lane] = packed_offset
+                    packed_offset = packed_offset + cursor[lane]
+                pl.tile.store(meta_tile, [dst, 0], send_counts)
+                pl.tile.store(starts_tile, [dst, 0], send_starts)
                 pld.tile.remote_store(meta_tile, target=recv_meta, peer=dst, offsets=[my_rank, 0])
                 if dst != my_rank:
                     pld.system.notify(target=arrived, peer=dst, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+            packed_routes = pl.tile.full([1, SEND_ROUTE_TILE], dtype=pl.INT32, value=0)
+            for pack_token in pl.range(active_tokens):
+                for pack_choice in pl.range(TOPK):
+                    expert = pl.tile.read(indices_tile, [pack_token, pack_choice])
+                    if expert >= 0:
+                        packed_slot = write_positions[expert]
+                        pl.tile.write(packed_routes, [0, packed_slot], pl.cast(pack_token * TOPK + pack_choice, pl.INT32))
+                        write_positions[expert] = packed_slot + 1
+            pl.tile.store(packed_routes, [0, 0], send_routes)
 
         # A deferred waiter must be a registration-only task. It cannot follow the
         # route counting and publication work in the producer task above.
@@ -358,54 +381,32 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
                     acc = acc + count
                 pl.write(recv_count_out, [e, 0], acc)
 
-        # Move the bulk payload (x / aux / route) to each destination lane. One block
-        # per (dst, local expert), each with its own slot counter; token-major order
-        # matches the meta pass's per-(dst, loc_e) cumulative count.
-        with pl.spmd(N_RANKS * LOCAL_EXPERTS, name_hint="dispatch_push", allow_early_resolve=True) as push_tid:
+        # Each lane consumes the token-major route list published with its count.
+        with pl.spmd(N_RANKS * LOCAL_EXPERTS, name_hint="dispatch_push", deps=[_meta_push_tid], allow_early_resolve=True) as push_tid:
             push_block = pl.tile.get_block_idx()
             dst = push_block // LOCAL_EXPERTS
             loc_e = push_block - dst * LOCAL_EXPERTS
-            active_tokens = pl.cast(num_tokens, pl.INDEX)
-            if active_tokens < 0:
-                active_tokens = pl.cast(0, pl.INDEX)
-            if active_tokens > T:
-                active_tokens = pl.cast(T, pl.INDEX)
-
             e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
-
-            indices_tile = pl.tile.load(indices, [0, 0], [T, IDX_PAD], valid_shape=[T, TOPK])
-            weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
-            # This block's rows fill the contiguous lane (loc_e, my_rank, 0..n), so aux
-            # and route ship as one remote_store. The lane tile always stores
-            # MAX_PER_SRC rows; slots >= n are never read back.
-            aux_lane = pl.tile.full([MAX_PER_SRC, AUX_PAD], dtype=pl.FP32, value=0.0)
-            route_lane = pl.tile.full([MAX_PER_SRC, IDX_PAD], dtype=pl.INT32, value=0)
-            slot_ctr = pl.array.create(1, pl.INT32)
-            slot_ctr[0] = 0
-            for t in pl.range(active_tokens):
-                for k in pl.range(TOPK):
-                    eid = pl.tile.read(indices_tile, [t, k])
-                    d = eid // LOCAL_EXPERTS
-                    le = eid - d * LOCAL_EXPERTS
-                    if le == loc_e:
-                        if d == dst:
-                            slot = slot_ctr[0]
-                            slot_ctr[0] = slot + 1
-                            # lane (loc_e, my_rank, slot) on peer=dst
-                            row = e_lane_base + slot
-                            pld.tensor.put(
-                                dst=recv_x,
-                                peer=dst,
-                                src=x_norm_i8,
-                                dst_offsets=[row, 0],
-                                src_offsets=[t, 0],
-                                shape=[1, D],
-                            )
-                            pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
-                            pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(weights_tile, [t, k]))
-                            pl.tile.write(route_lane, [slot, 0], pl.cast(t * TOPK + k, pl.INT32))
-            pld.tile.remote_store(aux_lane, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
-            pld.tile.remote_store(route_lane, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
+            lane_count = pl.cast(pl.read(send_counts, [dst, loc_e]), pl.INDEX)
+            if lane_count > 0:
+                lane_start = pl.cast(pl.read(send_starts, [dst, loc_e]), pl.INDEX)
+                lane_routes = pl.tile.load(send_routes, [0, 0], [1, SEND_ROUTE_TILE])
+                weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
+                aux_lane = pl.tile.full([MAX_PER_SRC, AUX_PAD], dtype=pl.FP32, value=0.0)
+                route_lane = pl.tile.full([MAX_PER_SRC, IDX_PAD], dtype=pl.INT32, value=0)
+                for slot in pl.range(lane_count):
+                    route = pl.tile.read(lane_routes, [0, lane_start + slot])
+                    token = pl.cast(route // TOPK, pl.INDEX)
+                    choice = pl.cast(route % TOPK, pl.INDEX)
+                    row = e_lane_base + slot
+                    pld.tensor.put(dst=recv_x, peer=dst, src=x_norm_i8, dst_offsets=[row, 0], src_offsets=[token, 0], shape=[1, D])
+                    pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [token, 0]))
+                    pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(weights_tile, [token, choice]))
+                    pl.tile.write(route_lane, [slot, 0], route)
+                aux_valid = pl.set_validshape(aux_lane, lane_count, AUX_PAD)
+                route_valid = pl.set_validshape(route_lane, lane_count, IDX_PAD)
+                pld.tile.remote_store(aux_valid, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
+                pld.tile.remote_store(route_valid, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
 
             # Payload-arrival notify folded into the push: a block signals its own
             # destination after its own puts, so a peer sees LOCAL_EXPERTS notifies per
