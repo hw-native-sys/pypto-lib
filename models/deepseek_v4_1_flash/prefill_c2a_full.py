@@ -1306,7 +1306,7 @@ def build_specs(args, mode, initial_state, *, make_inputs=None):
         TensorSpec("attn_output", [world_size, local, D], torch.bfloat16, resident="stacked"),
         TensorSpec("next_pre_mix", [world_size, local, HC_MULT], torch.float32, resident="stacked"),
         TensorSpec("x_hc_out", [world_size, local, HC_MULT, D], torch.float32, resident="stacked"),
-        TensorSpec("num_tokens", [world_size, 1], torch.int32, resident="stacked",
+        TensorSpec("num_tokens", [world_size, 1], torch.int32,
                    init_value=torch.tensor(counts, dtype=torch.int32).repeat_interleave(TP_SIZE).reshape(-1, 1)),
         ScalarSpec(
             "attention_epoch",

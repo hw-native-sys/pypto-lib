@@ -15,7 +15,8 @@ Coverage is limited to the models and configurations listed here.
 
 ## A5 V4.1 forward port
 
-The forward-port baseline is Lib `eae7902015d84817707da32034ab8b44039be336`.
+The first decode ports used Lib `eae7902015d84817707da32034ab8b44039be336`.
+The C2A prefill port brings in Lib main `f3427958fbf81afe974b208980ff49d0838c83a4`.
 Lib [#1763](https://github.com/hw-native-sys/pypto-lib/pull/1763) adds
 register indexer and stable TopK implementations. The current C1A decode
 entry still calls `score_select_paged`, so validate the active entry when
@@ -26,7 +27,10 @@ and HBG on the prepared A5 toolchain. The port schedules the paged
 index plan and sparse-attention scratch initialization on the device.
 The C1A reuse golden also passed under both runtimes after moving the
 dense-versus-sparse decision to device-side predicates. The EP2 layer 1
-golden passed under TMR and HBG with the prepared toolchain. Full EP4
+golden passed under TMR and HBG with the prepared toolchain. C2A prefill
+passed TMR and HBG golden at TP1/DP2 with 48 rows per DP group and six
+requests in the long fixture. Score routing now uses device predicates,
+and the golden passes the orchestration token count from CPU. Full EP4
 Serving qualification remains open.
 
 Start with the current EP2 decode-layer golden under TMR and HBG. Validate
