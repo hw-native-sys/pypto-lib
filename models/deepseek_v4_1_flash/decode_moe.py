@@ -199,9 +199,9 @@ def moe(
             x_norm_mx, x_norm_scale, indices, weights, n_experts=EP_SIZE * local_experts, topk=topk,
         )
         if BALANCED_ROUTING:
-            for token in pl.spmd(num_tokens, name_hint="moe_forced_routes"):
-                forced = pl.load(force_topk, [token, 0], [1, 8], valid_shape=[1, topk])
-                indices = pl.store(forced, [token, 0], indices)
+            dispatch_indices = force_topk
+        else:
+            dispatch_indices = indices
 
         shared_output = pl.create_tensor([t, D], dtype=pl.BF16)
         shared_result = expert_shared(
@@ -220,7 +220,7 @@ def moe(
         recv_count_local = pl.create_tensor([local_experts, 1], dtype=pl.INT32)
         recv_meta_local = pl.create_tensor([EP_SIZE, local_experts], dtype=pl.INT32)
         input_ready = dispatch(
-            indices, x_norm_mx, x_norm_scale, weights,
+            dispatch_indices, x_norm_mx, x_norm_scale, weights,
             recv_x_local, recv_scale_local_backing,
             recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
             recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
