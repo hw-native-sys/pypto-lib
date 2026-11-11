@@ -497,14 +497,19 @@ def routed_w13_pypto(
     """
     # The extern is declared dual_aiv_dispatch=True and splits the K rows of
     # each packed panel by get_subblockid(), so its decode runs on both vector
-    # lanes. pl.split(UP_DOWN) is the equivalent: the compiler halves the
-    # region's vector work on the row axis and places the cross-core boundary.
+    # lanes; this runs on one. pl.split(pl.SplitMode.UP_DOWN) used to be the
+    # equivalent, but implicit AIV splitting was removed from mixed kernels and
+    # the mandated replacement cannot be used here: opening a pl.split_aiv
+    # region puts the function in manual mode, where tile.set_validshape is
+    # rejected outside every region, and it is the only way to bound this
+    # kernel's accumulator store to a runtime row count. Revisit when that
+    # restriction lifts -- the decode is vector-bound, so the second lane was
+    # worth about 1.7x while the implicit split still worked.
     # Both route-weight planes are single-column, so a flat view makes a row
     # range contiguous and lets the copy move it as one row vector.
     route_flat = pl.tensor.view(route_weights, [1, experts * stride], layout=pl.ND)
     compact_flat = pl.tensor.view(compact_weights, [1, W13_ROWS], layout=pl.ND)
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_pypto", deps=[input_ready],
-                 optimizations=[pl.split(pl.SplitMode.UP_DOWN)]) as ready:
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_pypto", deps=[input_ready]) as ready:
         core = pl.tile.get_block_idx()
         work_base = 0
         activation_base = 0
@@ -552,7 +557,8 @@ def routed_w13_pypto(
                         # expert's own rows.
                         # As the extern does: one contiguous [1, valid] row
                         # vector, on vector lane 0 only. The row-vector shape
-                        # matters under the UP_DOWN split -- a [n, 1] column
+                        # and the lane guard are what a vector-lane split needs:
+                        # a [n, 1] column
                         # tile gets halved on the row axis and each lane then
                         # copies half the rows, while a single-row tile cannot
                         # be split. It is also one MTE2 burst instead of
