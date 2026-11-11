@@ -28,21 +28,17 @@ TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
 
 # tiling
-GATE_T_TILE = 8
-GATE_CAST_TILE = 4
+GATE_T_TILE = 4
 assert T % GATE_T_TILE == 0
 GATE_M_TILE = 16
 GATE_N_TILE = 16
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 QUANT_TILE = 256
-QUANT_TASK_TILE = QUANT_TILE * 4
+QUANT_TASK_TILE = QUANT_TILE
 assert D % QUANT_TASK_TILE == 0
 MX_GROUP = 32
 MX_SCALE_GROUPS = D // MX_GROUP
-SCORE_PAD = 32 if N_EXPERTS <= 32 else 256 if N_EXPERTS <= 256 else 384
 QUANT_WORKER_TILE = 24 if T > 80 else 64
-CAST_WORKER_TILE = 8 if T > 80 else 64
-WEIGHT_WORKER_TILE = 4 if T > 80 else 64
 ROUTE_WORKER_TILE = 24 if T > 80 else 64
 TOPK_PAD = 8
 SORT_PAD = TOPK_PAD * 2
@@ -106,58 +102,6 @@ def _gate_pre_route_vf(
     return indices, weights, biased_scores
 
 
-if SCORE_PAD == 32:
-    @pl.jit.inline
-    def route_topk_row(
-        score_row: pl.Tensor[[1, 32], pl.FP32],
-        idx_init: pl.Tensor[[1, 32], pl.UINT32],
-    ) -> pl.Tensor[[1, TOPK_PAD], pl.INT32]:
-        """Sort one 32-expert router row and return its leading expert ids."""
-
-        sorted_pairs = pl.sort32(score_row, idx_init)
-        return pl.gather(
-            sorted_pairs[:, 0:SORT_PAD],
-            mask_pattern=pl.tile.MaskPattern.P1010,
-            output_dtype=pl.INT32,
-        )
-elif SCORE_PAD == 256:
-    @pl.jit.inline
-    def route_topk_row(
-        score_row: pl.Tensor[[1, 256], pl.FP32],
-        idx_init: pl.Tensor[[1, 256], pl.UINT32],
-    ) -> pl.Tensor[[1, TOPK_PAD], pl.INT32]:
-        """Sort one 256-expert router row and return its leading expert ids."""
-
-        sorted_32 = pl.sort32(score_row, idx_init)
-        sorted_64 = pl.mrgsort(sorted_32, block_len=64)
-        sorted_pairs = pl.mrgsort(sorted_64[:, 0:256], sorted_64[:, 256:512])
-        return pl.gather(
-            sorted_pairs[:, 0:SORT_PAD],
-            mask_pattern=pl.tile.MaskPattern.P1010,
-            output_dtype=pl.INT32,
-        )
-else:
-    @pl.jit.inline
-    def route_topk_row(
-        score_row: pl.Tensor[[1, 384], pl.FP32],
-        idx_init: pl.Tensor[[1, 384], pl.UINT32],
-    ) -> pl.Tensor[[1, TOPK_PAD], pl.INT32]:
-        """Sort one 384-expert router row and return its leading expert ids."""
-
-        sorted_32 = pl.sort32(score_row, idx_init)
-        sorted_64 = pl.mrgsort(sorted_32, block_len=64)
-        sorted_pairs = pl.mrgsort(
-            sorted_64[:, 0:256],
-            sorted_64[:, 256:512],
-            sorted_64[:, 512:768],
-        )
-        return pl.gather(
-            sorted_pairs[:, 0:SORT_PAD],
-            mask_pattern=pl.tile.MaskPattern.P1010,
-            output_dtype=pl.INT32,
-        )
-
-
 def golden_gate_reference(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -185,6 +129,12 @@ def gate_from_bf16(
     topk: pl.constexpr = TOPK,
 ):
     """Route normalized BF16 rows with caller-zeroed inactive and padded rows."""
+    if n_experts <= 32:
+        score_pad = 32
+    elif n_experts <= 256:
+        score_pad = 256
+    else:
+        score_pad = 384
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
@@ -196,31 +146,13 @@ def gate_from_bf16(
     with pl.spmd(pl.min((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), QUANT_WORKER_TILE), name_hint="x_norm_mx_quant"):
         x_norm_mx, x_norm_scale = _gate_quant_vf(xg_buf, x_norm_mx, x_norm_scale)
 
-    router_input = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
-    router_weight = pl.create_tensor([n_experts, D], dtype=pl.FP32)
-    cast_blocks = T_PAD // GATE_CAST_TILE
-    cast_workers = pl.min(cast_blocks, CAST_WORKER_TILE)
-    for worker in pl.spmd(cast_workers, name_hint="gate_projection_input"):
-        for block in pl.range(worker, cast_blocks, cast_workers):
-            row = block * GATE_CAST_TILE
-            input_value = pl.load(xg_buf, [row, 0], [GATE_CAST_TILE, D])
-            router_input = pl.store(pl.cast(input_value, pl.FP32), [row, 0], router_input)
-    weight_blocks = (n_experts + GATE_CAST_TILE - 1) // GATE_CAST_TILE
-    weight_workers = pl.min(weight_blocks, WEIGHT_WORKER_TILE)
-    for worker in pl.spmd(weight_workers, name_hint="gate_projection_weight"):
-        for block in pl.range(worker, weight_blocks, weight_workers):
-            row = block * GATE_CAST_TILE
-            valid_rows = pl.min(GATE_CAST_TILE, n_experts - row)
-            weight_value = pl.load(gate_w, [row, 0], [GATE_CAST_TILE, D], valid_shape=[valid_rows, D])
-            router_weight = pl.store(pl.cast(weight_value, pl.FP32), [row, 0], router_weight)
-
-    biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    biased_scores_buf = pl.create_tensor([T_PAD, score_pad], dtype=pl.FP32)
     with pl.spmd(1, name_hint="gate_pre_route"):
         indices, weights, biased_scores_buf = _gate_pre_route_vf(
             indices, weights, biased_scores_buf, active_tokens, n_experts, topk,
         )
 
-    route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    route_scores_buf = pl.create_tensor([T_PAD, score_pad], dtype=pl.FP32)
     # Reserve both engines before any local Cube-to-Vector transfer.
     # Bound synchronous cohorts to the target A5 core count.
     gate_tasks = task_gate_tiles * ((n_experts + GATE_N_TILE - 1) // GATE_N_TILE)
@@ -228,7 +160,7 @@ def gate_from_bf16(
     gate_workers = pl.max(1, pl.min(gate_tasks, gate_worker_limit))
     with pl.spmd(gate_workers, name_hint="gate", sync_start=True):
         route_scores_buf, biased_scores_buf = _gate_scores_vf(
-            router_input, router_weight, gate_bias, route_scores_buf, biased_scores_buf, gate_tasks,
+            xg_buf, gate_w, gate_bias, route_scores_buf, biased_scores_buf, gate_tasks,
         )
 
     # V4.1 uses score-only top-k: the V4 hash-route loop is dropped so that PTOAS
@@ -241,32 +173,52 @@ def gate_from_bf16(
                 biased_scores_buf, route_scores_buf, indices, weights, active_tokens, ROUTE_SCALE, topk,
             )
     else:
-        task_route_tiles = (task_tokens + GATE_T_TILE * (1 + topk % 2) - 1) // (GATE_T_TILE * (1 + topk % 2))
+        # Scalar route stores own complete 64-byte cache lines.
+        if topk % 2 != 0:
+            route_rows = 16
+        elif topk % 4 != 0:
+            route_rows = 8
+        else:
+            route_rows = GATE_T_TILE
+        task_route_tiles = (task_tokens + route_rows - 1) // route_rows
         for ts_idx in pl.spmd(task_route_tiles, name_hint="route_sort"):
-            t1 = ts_idx * GATE_T_TILE * (1 + topk % 2)
+            t1 = ts_idx * route_rows
             # ptoas pto.tmrgsort requires a single source row.
-            topk_idx_tile = pl.create_tensor([GATE_T_TILE * (1 + topk % 2), TOPK_PAD], dtype=pl.INT32)
-            sr_idx_init = pl.create_tensor([1, SCORE_PAD], dtype=pl.UINT32)
-            sr_index_range = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
+            topk_idx_tile = pl.create_tensor([route_rows, TOPK_PAD], dtype=pl.INT32)
+            sr_idx_init = pl.create_tensor([1, score_pad], dtype=pl.UINT32)
+            sr_index_range = pl.arange(0, [1, score_pad], dtype=pl.UINT32)
             sr_idx_init[:, :] = sr_index_range
-            for sr_tt in pl.range(GATE_T_TILE * (1 + topk % 2)):
+            for sr_tt in pl.range(route_rows):
                 sr_t = t1 + sr_tt
-                sr_row = pl.slice(biased_scores_buf, [1, SCORE_PAD], [sr_t, 0])
-                sr_i = route_topk_row(sr_row, sr_idx_init)
+                sr_row = pl.slice(biased_scores_buf, [1, score_pad], [sr_t, 0])
+                sorted_32 = pl.sort32(sr_row, sr_idx_init)
+                if n_experts <= 32:
+                    sorted_pairs = sorted_32
+                elif n_experts <= 256:
+                    sorted_64 = pl.mrgsort(sorted_32, block_len=64)
+                    sorted_pairs = pl.mrgsort(sorted_64[:, 0:256], sorted_64[:, 256:512])
+                else:
+                    sorted_64 = pl.mrgsort(sorted_32, block_len=64)
+                    first = sorted_64[:, 0:256]
+                    second = sorted_64[:, 256:512]
+                    third = sorted_64[:, 512:768]
+                    sorted_pairs = pl.mrgsort(first, second, third)
+                selected_pairs = sorted_pairs[:, 0:SORT_PAD]
+                sr_i = pl.gather(selected_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                 topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
 
-            local_scores = pl.create_tensor([GATE_T_TILE * (1 + topk % 2), SCORE_PAD], dtype=pl.FP32)
-            local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE * (1 + topk % 2), :]
+            local_scores = pl.create_tensor([route_rows, score_pad], dtype=pl.FP32)
+            local_scores[:, :] = route_scores_buf[t1 : t1 + route_rows, :]
             gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
-            gather_valid = pl.set_validshape(gather_all, GATE_T_TILE * (1 + topk % 2), topk)
+            gather_valid = pl.set_validshape(gather_all, route_rows, topk)
             topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
-            topk_idx_read = pl.create_tensor([GATE_T_TILE * (1 + topk % 2), TOPK_PAD], dtype=pl.INT32)
+            topk_idx_read = pl.create_tensor([route_rows, TOPK_PAD], dtype=pl.INT32)
             topk_idx_read[:, :] = topk_idx_tile[:, :]
             topk_sum = pl.row_sum(topk_vals_pad)
-            denom = pl.reshape(topk_sum, [GATE_T_TILE * (1 + topk % 2), 1])
+            denom = pl.reshape(topk_sum, [route_rows, 1])
             topk_normalized = pl.row_expand_div(topk_vals_pad, denom)
             normalized_weights = pl.mul(topk_normalized, ROUTE_SCALE)
-            for wt_tt in pl.range(GATE_T_TILE * (1 + topk % 2)):
+            for wt_tt in pl.range(route_rows):
                 wt_out_t = t1 + wt_tt
                 if wt_out_t < active_tokens:
                     for wt_k in pl.range(topk):
