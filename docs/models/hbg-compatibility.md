@@ -8,7 +8,7 @@ qualification covers request state, completion, and retirement in Serving.
 | Platform and model | Historical validation | Current branch coverage |
 | --- | --- | --- |
 | A3 Qwen3-14B BF16 | The integrated 40-layer single-card stack passed five Serving cases in each of HBG eager and explicit Graph. A split prefill candidate also passed TMR, HBG eager, and Graph golden checks. | Lib [#1758](https://github.com/hw-native-sys/pypto-lib/pull/1758) and [#1762](https://github.com/hw-native-sys/pypto-lib/pull/1762) supply eager prefill and its KV golden correction. Explicit prefill MLP recording passed standalone golden on this branch. Per-layer decode recording passed an eight-token Serving golden in HBG eager and Graph. Request-local token feedback passed its standalone state golden and single- and multi-request checks in both HBG modes with the matching Serving review snapshot. |
-| A3 DeepSeek V4 Flash MTP K1 | The 43-layer eight-card integrated stack completed a 64-input, 128-output HTTP case with both HBG configurations. Default HBG records selected prefill regions. The explicit Graph configuration also records decode attention. | Bounded prefill, fused K1 decode, and explicit Graph entry code are on this branch. The updated source passed the 43-layer eager HTTP check. Explicit Graph has compiled and is under native retest. MTP prefill and the LM head used ordinary HBG in the historical run. |
+| A3 DeepSeek V4 Flash MTP K1 | The 43-layer eight-card integrated stack completed a 64-input, 128-output HTTP case with both HBG configurations. Default HBG records selected prefill regions. The explicit Graph configuration also records decode attention. | Bounded prefill, fused K1 decode, and explicit Graph entry code are on this branch. The updated source passed the 43-layer HTTP check in eager and explicit Graph. MTP prefill and the LM head used ordinary HBG in the historical run. |
 | A5 DeepSeek V4.1 Flash | Synchronous HBG with TWAIT and AICPU compatibility scheduling passed 40-layer EP4/DP4/TP1 HTTP lifecycle checks at 8,192 input tokens. Two teacher-forced repetitions matched TMR byte-for-byte across 222 corresponding comparison steps for logits and effective KV and compressor state. | Port against current Lib main. Recheck indexer dependencies, routed MoE workspace ownership, and communication waits against the current implementation. Explicit Graph, resident-only scheduling, and whole-model Async await qualification. |
 
 Coverage is limited to the models and configurations listed here.
@@ -79,8 +79,9 @@ override because PyPTO still pins `355ce301`.
 
 The updated Lib DeepSeek model subtree
 `8646694d8364698fa517539f6632fef709c0b49b` passed the native eight-card,
-43-layer fused K1 HBG eager HTTP test with 64 prompt tokens, 128 generated
-tokens, and normal shutdown. This run used PTOAS v0.70, PyPTO
+43-layer fused K1 HTTP test in HBG eager and explicit Graph. Both runs
+used 64 prompt tokens, generated 128 tokens, returned identical text,
+and shut down normally. This run used PTOAS v0.70, PyPTO
 `7f7ce3b01019b87c70c5ffbbea4f354c442d7321`, and Simpler
 `90fcb00898b58f86bb491dcca8e51b4d4812dc36`. The Serving review tree
 `521089e0aaeecc40324fbff9de401804c7ca8f29` is based on `979bfa25`
@@ -90,12 +91,13 @@ PyPTO main plus #3321 combination has separate offline evidence.
 
 The companion Serving patch also replays on Serving main
 `6474df7d42e9342c8b74613a8258bf6776f71713`. The resulting Serving tree
-`d66cfd545b8f5b22f17b20e74f209a4df0166800` passed 156 targeted
+`e19166cf766b09ec89d0f7d3e9c9893ce8275c0c` passed 156 targeted
 DeepSeek, Qwen request-state, and CLI tests with Lib `b0945fe`. The
-DeepSeek executor configures its compiler from the model's selected chip
-runtime, matching Serving #308's compile-context checks.
+CLI preserves the selected chip runtime in the model configuration. The
+DeepSeek executor uses that value for code generation, matching Serving
+#308's compile-context checks.
 Use the reviewed Serving patch for this tree. Its SHA-256 is
-`ebee14b1abcba7e4ddfa0cc4ef9ccfd233df5577e04642127445175b5cb2a88e`.
+`0172718dd53fd2ba3ea7e6248ad33d69786feec79d9486aff1f36c7372bce14a`.
 The eight-card validation with this Serving tree and the PyPTO main
 plus #3321 compiler is queued separately.
 
