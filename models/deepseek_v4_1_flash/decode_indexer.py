@@ -1499,8 +1499,7 @@ def _score_index_rows(
                                 )
                                 query_left_scale0 = pl.tile.move(query_scale_mat0, target_memory=pl.MemorySpace.LeftScale)
                                 dot0 = pl.matmul_mx(query_left0, query_left_scale0, keys_right, key_right_scale)
-                                rounded_dot0 = pl.cast(dot0, pl.BF16, mode="rint")
-                                dot_backing = pl.store(rounded_dot0, [staging_slot * SCORE_ROWS_TILE, 0], dot_backing)
+                                dot_backing = pl.store(dot0, [staging_slot * SCORE_ROWS_TILE, 0], dot_backing)
                                 query_scale1 = pl.tile.slice(pl.reinterpret_view(query_zz, pl.FP8E8M0), [96, 4], [96, 0])
                                 query_scale_mat1 = pl.tile.move(
                                     query_scale1, target_memory=pl.MemorySpace.Mat,
@@ -1508,8 +1507,7 @@ def _score_index_rows(
                                 )
                                 query_left_scale1 = pl.tile.move(query_scale_mat1, target_memory=pl.MemorySpace.LeftScale)
                                 dot1 = pl.matmul_mx(query_left1, query_left_scale1, keys_right, key_right_scale)
-                                rounded_dot1 = pl.cast(dot1, pl.BF16, mode="rint")
-                                dot_backing = pl.store(rounded_dot1, [staging_slot * SCORE_ROWS_TILE + 96, 0], dot_backing)
+                                dot_backing = pl.store(dot1, [staging_slot * SCORE_ROWS_TILE + 96, 0], dot_backing)
 
         with pl.spmd(workers, name_hint="idx_score_reduce", deps=[dot_tid, weights_ready]) as completed:
             worker = pl.tile.get_block_idx()
