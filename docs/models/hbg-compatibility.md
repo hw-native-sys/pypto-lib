@@ -33,6 +33,11 @@ requests in the long fixture. Score routing now uses device predicates,
 and the golden passes the orchestration token count from CPU. Full EP4
 Serving qualification remains open.
 
+The TP1 final LM head passed logits and sampled-ID goldens with zero
+and eight active rows under TMR and HBG using PyPTO `fc50efe7`, Simpler
+`0569c779`, and PTOAS v0.72. Row indices now stay on the device. The
+all-padding case uses the regular projection and sampling path.
+
 Start with the current EP2 decode-layer golden under TMR and HBG. Validate
 any indexer fix, routed MoE workspace reuse, or communication wait change
 against its current callers. Qualify the forward port on the full EP4

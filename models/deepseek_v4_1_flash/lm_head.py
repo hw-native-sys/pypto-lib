@@ -464,32 +464,6 @@ def lm_head_sample(
 
 
 @pl.jit.inline(auto_scope=False)
-def _lm_head_has_rows(logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32]):
-    active = pl.cast(0, pl.INT32)
-    for row in pl.range(MAX_LOGIT_ROWS):
-        if active == 0:
-            source_row = pl.read(logit_row_indices, [row])
-            if source_row >= 0:
-                active = pl.cast(1, pl.INT32)
-    return active
-
-
-@pl.jit.inline(auto_scope=False)
-def _lm_head_zero_outputs(logits: pl.Tensor, sampled_ids: pl.Tensor):
-    with pl.spmd((VOCAB + LOGITS_COMM_TILE - 1) // LOGITS_COMM_TILE, name_hint="lm_head_empty"):
-        block = pl.tile.get_block_idx()
-        col = block * LOGITS_COMM_TILE
-        cols = pl.min(LOGITS_COMM_TILE, VOCAB - col)
-        zeros = pl.tile.full([MAX_LOGIT_ROWS, LOGITS_COMM_TILE], dtype=pl.FP32, value=0.0)
-        valid_zeros = pl.set_validshape(zeros, MAX_LOGIT_ROWS, cols)
-        logits = pl.store(valid_zeros, [0, col], logits)
-        if block == 0:
-            empty_ids = pl.tile.full([MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
-            sampled_ids = pl.store(empty_ids, [0, 0], sampled_ids)
-    return logits, sampled_ids
-
-
-@pl.jit.inline(auto_scope=False)
 def lm_head_with_sampling(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
@@ -506,27 +480,21 @@ def lm_head_with_sampling(
     completed_epochs: pl.Scalar[pl.INT32],
 ):
     """Project logits and sample top-1 tokens in one opaque L2 entry."""
-    active = pl.cast(1, pl.INT32)
-    if TP_SIZE == 1:
-        active = _lm_head_has_rows(logit_row_indices)
-    if active > 0:
-        logits, projected = lm_head(
-            hidden_states,
-            lm_head_weight,
-            logit_row_indices,
-            logits,
-            hidden_window,
-            hidden_done,
-            logits_window,
-            logits_done,
-            group_base,
-            tp_rank,
-            done_epoch,
-            completed_epochs,
-        )
-        greedy_sample(logits, sampled_ids, projected)
-    else:
-        logits, sampled_ids = _lm_head_zero_outputs(logits, sampled_ids)
+    logits, projected = lm_head(
+        hidden_states,
+        lm_head_weight,
+        logit_row_indices,
+        logits,
+        hidden_window,
+        hidden_done,
+        logits_window,
+        logits_done,
+        group_base,
+        tp_rank,
+        done_epoch,
+        completed_epochs,
+    )
+    greedy_sample(logits, sampled_ids, projected)
     return logits, sampled_ids
 
 
@@ -622,22 +590,16 @@ def _final_output(
 ):
     """Compose final HC, Norm and LM head from the current layer state."""
     x_hc.bind_dynamic(0, T_DYN)
-    active = pl.cast(1, pl.INT32)
-    if TP_SIZE == 1:
-        active = _lm_head_has_rows(logit_row_indices)
-    if active > 0:
-        rows = pl.tensor.dim(x_hc, 0)
-        collapsed = pl.create_tensor([rows, D], dtype=pl.BF16)
-        hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
-        normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
-        for norm_block in pl.spmd((rows + 7) // 8, name_hint="final_rms_norm"):
-            rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, norm_block, rows)
-        lm_head_with_sampling(
-            normalized, lm_head_weight, logit_row_indices, logits, sampled_ids,
-            hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,
-        )
-    else:
-        logits, sampled_ids = _lm_head_zero_outputs(logits, sampled_ids)
+    rows = pl.tensor.dim(x_hc, 0)
+    collapsed = pl.create_tensor([rows, D], dtype=pl.BF16)
+    hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
+    normalized = pl.create_tensor([rows, D], dtype=pl.BF16)
+    for norm_block in pl.spmd((rows + 7) // 8, name_hint="final_rms_norm"):
+        rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, norm_block, rows)
+    lm_head_with_sampling(
+        normalized, lm_head_weight, logit_row_indices, logits, sampled_ids,
+        hidden_window, hidden_done, logits_window, logits_done, group_base, tp_rank, done_epoch, completed_epochs,
+    )
     return logits, sampled_ids
 
 
