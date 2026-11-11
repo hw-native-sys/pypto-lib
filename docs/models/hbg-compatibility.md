@@ -84,6 +84,40 @@ with the matching runtime selection and bounded-entry routing. The
 review tree also uses the shared Lib request-planning contract. The
 PyPTO main plus #3321 combination has separate offline evidence.
 
+The companion Serving patch also replays on Serving main
+`6474df7d42e9342c8b74613a8258bf6776f71713`. The resulting Serving tree
+`1263802bd255cd0441b9b82b24f21fbdc0988825` passed 156 targeted
+DeepSeek, Qwen request-state, and CLI tests with Lib `b0945fe`.
+Use the reviewed Serving patch for this tree. Its SHA-256 is
+`189e9f3066976c55f47b2d7e2b3ace2726aaa6fcb168ce6fb012f6cd5fd55a4e`.
+The eight-card validation with this Serving tree and the PyPTO main
+plus #3321 compiler is queued separately.
+
+### Start the A3 DeepSeek server
+
+From the matching Serving checkout, point `PYPTO_LIB_ROOT` at Lib
+`dev/hbg`. Use the hardware and toolchain from the native result above.
+Set `MODEL_DIR` to the V4 Flash MTP W8A8 checkpoint and `DEVICES` to
+the eight comma-separated device IDs allocated by your scheduler.
+
+```bash
+export PYPTO_LIB_ROOT=/path/to/pypto-lib
+python -m pypto_serving.cli.main \
+  --model "$MODEL_DIR" --served-model-name dsv4-flash-w8a8 \
+  --backend npu --platform a2a3 --devices "$DEVICES" \
+  --pypto-runtime host_build_graph --dp 8 --ep 8 --block-size 128 \
+  --max-model-len 260 --max-num-seqs 8 --max-num-batched-tokens 1024 \
+  --npu-memory-utilization 0.90 --long-prefill-token-threshold 1024 \
+  --num-speculative-tokens 1 --no-enable-prefix-caching \
+  --ring-dep-pool 16384 --ring-task-window 262144 --ring-heap 1073741824 \
+  --host 127.0.0.1 --port 8000
+```
+
+Append `--hbg-graph` to select explicit Graph decode. Check
+`/health` before requesting a completion. The native test uses the
+64-input, 128-output case, validates the returned usage, and checks
+that the worker shuts down.
+
 ## Reproducing the component checks
 
 Use the Lib branch with the [installation workflow](../get-started/installation.md).
