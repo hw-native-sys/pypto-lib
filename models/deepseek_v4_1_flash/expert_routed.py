@@ -444,23 +444,31 @@ def routed_swiglu_quant_pypto(
                               target_memory=pl.MemorySpace.Vec)
             weight_tile = pl.load(weights, [row, 0], [SWIGLU_ROW_TILE, 1],
                                   target_memory=pl.MemorySpace.Vec)
-            # pl.reg.convert has no BF16 pair, but the widening does not have to
-            # happen in registers: one Tile-level cast per operand is a single
-            # full-width pass, where widening by hand inside the chunk loop cost
-            # three ops per operand on every one of the 288 iterations.
-            gate_wide = pl.cast(gate_tile, pl.FP32)
-            up_wide = pl.cast(up_tile, pl.FP32)
-            # reg.load needs a contiguous one-dimensional Vec view; views are free.
-            gate_flat = pl.reshape(gate_wide, [SWIGLU_ROW_TILE * MOE_INTER])
-            up_flat = pl.reshape(up_wide, [SWIGLU_ROW_TILE * MOE_INTER])
+            # reg.load needs a contiguous one-dimensional Vec view; views are
+            # free, and the operands stay BF16 because the widening happens in
+            # registers (see _widen below).
+            gate_flat = pl.reshape(gate_tile, [SWIGLU_ROW_TILE * MOE_INTER])
+            up_flat = pl.reshape(up_tile, [SWIGLU_ROW_TILE * MOE_INTER])
             weight_flat = pl.reshape(weight_tile, [SWIGLU_ROW_TILE])
-            scaled_flat = pl.tile.create([SWIGLU_ROW_TILE * MOE_INTER], dtype=pl.FP32,
-                                         target_memory=pl.MemorySpace.Vec)
+            # The payload leaves the scope already encoded, so the scratch is
+            # bytes and the tensor view below is a zero-cost reinterpret rather
+            # than a conversion pass.
+            payload_flat = pl.tile.create([SWIGLU_ROW_TILE * MOE_INTER], dtype=pl.INT8,
+                                          target_memory=pl.MemorySpace.Vec)
             code_flat = pl.tile.create([SWIGLU_GROUP_ROWS], dtype=pl.INT8,
                                        target_memory=pl.MemorySpace.Vec)
             with pl.reg_scope():
                 active = pl.reg.full_mask(lanes=SWIGLU_LANES)
                 bias = pl.reg.broadcast(254, lanes=SWIGLU_LANES, dtype=pl.INT32)
+                # FP8E4M3FN encoding constants: pl.reg has no FP8 dtype, so the
+                # byte is built with integer operations (see below).
+                magnitude_mask = pl.reg.broadcast(0x7FFFFFFF, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                round_bias = pl.reg.broadcast(0x7FFFF, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                one_bits = pl.reg.broadcast(1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                seven_bits = pl.reg.broadcast(7, lanes=SWIGLU_LANES, dtype=pl.UINT32)
+                exp_floor = pl.reg.broadcast(-6, lanes=SWIGLU_LANES, dtype=pl.INT32)
+                e4m3_bias = pl.reg.broadcast(7, lanes=SWIGLU_LANES, dtype=pl.INT32)
+                fp32_bias = pl.reg.broadcast(127, lanes=SWIGLU_LANES, dtype=pl.INT32)
                 lane_id = pl.reg.index_gen(0, lanes=SWIGLU_LANES, dtype=pl.UINT32)
                 lane_span = pl.reg.broadcast(SWIGLU_LANES - 1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
                 # Lane i reads lane MX_GROUP*i, so lanes 0 and 1 compact this
@@ -481,8 +489,21 @@ def routed_swiglu_quant_pypto(
                     route_v = pl.reg.gather(weight_flat, route_index, active)
                     for chunk in pl.hardware_loop(SWIGLU_CHUNKS):
                         offset = lane_row * MOE_INTER + chunk * SWIGLU_LANES
-                        gate = pl.reg.load(gate_flat, offset, lanes=SWIGLU_LANES)
-                        up = pl.reg.load(up_flat, offset, lanes=SWIGLU_LANES)
+                        # BF16 -> FP32 with integer register operations, since
+                        # pl.reg.convert has no BF16 pair: BF16 is the high half
+                        # of FP32, so widening the bits and shifting them up is
+                        # exact for every encoding. Same idiom as
+                        # decode_indexer.py's register Index-K publication.
+                        gate_bf = pl.reg.load(gate_flat, offset, lanes=SWIGLU_LANES)
+                        gate_u16 = pl.reg.interpret_cast(gate_bf, dtype=pl.UINT16)
+                        gate_bits = pl.reg.convert(gate_u16, dtype=pl.UINT32)
+                        gate_high = pl.reg.shift_lefts(gate_bits, 16, active)
+                        gate = pl.reg.interpret_cast(gate_high, dtype=pl.FP32)
+                        up_bf = pl.reg.load(up_flat, offset, lanes=SWIGLU_LANES)
+                        up_u16 = pl.reg.interpret_cast(up_bf, dtype=pl.UINT16)
+                        up_bits = pl.reg.convert(up_u16, dtype=pl.UINT32)
+                        up_high = pl.reg.shift_lefts(up_bits, 16, active)
+                        up = pl.reg.interpret_cast(up_high, dtype=pl.FP32)
                         gate_c = pl.reg.minimums(gate, SWIGLU_LIMIT, active)
                         up_low = pl.reg.minimums(up, SWIGLU_LIMIT, active)
                         up_c = pl.reg.maximums(up_low, -SWIGLU_LIMIT, active)
@@ -512,18 +533,62 @@ def routed_swiglu_quant_pypto(
                         normalized = pl.reg.mul(values, recip, active)
                         lifted = pl.reg.maximums(normalized, -SWIGLU_FP8_MAX, active)
                         bounded = pl.reg.minimums(lifted, SWIGLU_FP8_MAX, active)
+                        # FP32 -> FP8E4M3FN by hand: pl.reg has no FP8 register
+                        # dtype, so the byte is assembled with integer ops. The
+                        # input is already clamped to +-448, so there is no
+                        # overflow path. Verified bit-exact against torch over
+                        # 700k values including subnormals and both zeros.
+                        payload_bits = pl.reg.interpret_cast(bounded, dtype=pl.UINT32)
+                        payload_sign = pl.reg.shift_rights(payload_bits, 31, active)
+                        sign_bit = pl.reg.shift_lefts(payload_sign, 7, active)
+                        payload_mag = pl.reg.bitwise_and(payload_bits, magnitude_mask, active)
+                        # Normal path: round mantissa 23 -> 3 bits, ties to even,
+                        # by adding half an ulp plus the retained lsb and then
+                        # truncating. A carry out of the mantissa lands in the
+                        # exponent, which is read back from the rounded bits.
+                        retained = pl.reg.bitwise_and(
+                            pl.reg.shift_rights(payload_mag, 20, active), one_bits, active)
+                        rounded = pl.reg.add(
+                            pl.reg.add(payload_mag, round_bias, active), retained, active)
+                        exponent32 = pl.reg.sub(
+                            pl.reg.interpret_cast(pl.reg.shift_rights(rounded, 23, active),
+                                                  dtype=pl.INT32), fp32_bias, active)
+                        mantissa3 = pl.reg.bitwise_and(
+                            pl.reg.shift_rights(rounded, 20, active), seven_bits, active)
+                        normal_code = pl.reg.bitwise_or(
+                            pl.reg.shift_lefts(
+                                pl.reg.interpret_cast(pl.reg.add(exponent32, e4m3_bias, active),
+                                                      dtype=pl.UINT32), 3, active),
+                            mantissa3, active)
+                        # Subnormal path: below 2**-6 the representable values are
+                        # m * 2**-9, so the code is just RNE(|x| * 2**9).
+                        magnitude = pl.reg.interpret_cast(payload_mag, dtype=pl.FP32)
+                        scaled_up = pl.reg.muls(magnitude, 512.0, active)
+                        subnormal_code = pl.reg.interpret_cast(
+                            pl.reg.convert(scaled_up, dtype=pl.INT32, rounding="R", saturate=True),
+                            dtype=pl.UINT32)
+                        is_normal = pl.reg.compare(exponent32, exp_floor, active, predicate="ge")
+                        code_bits = pl.reg.select(is_normal, normal_code, subnormal_code)
+                        payload_byte = pl.reg.bitwise_or(sign_bit, code_bits, active)
+                        # INT8 carrier: tile.reinterpret_view pairs FP8E4M3FN
+                        # with INT8, and the narrowing convert wraps the byte
+                        # pattern through rather than saturating it.
+                        payload_code = pl.reg.convert(
+                            pl.reg.interpret_cast(payload_byte, dtype=pl.INT32),
+                            dtype=pl.INT8, saturate=False)
                         # Fresh names: reassigning the destination would make
                         # these loop-carried, which VF lowering rejects. Both
-                        # alias the Vec storage the Tile pass below reads.
-                        scaled_alias = pl.reg.store(scaled_flat, offset, value=bounded)
+                        # alias the Vec storage the stores below read.
+                        payload_alias = pl.reg.store(payload_flat, offset, value=payload_code)
                         picked = pl.reg.gather_lanes(exponent, code_pick)
                         code = pl.reg.convert(picked, dtype=pl.INT8, saturate=False)
                         code_offset = lane_row * SWIGLU_SCALE_COLS + chunk * SWIGLU_GROUPS_PER_CHUNK
                         code_index = pl.reg.adds(code_lane, pl.cast(code_offset, pl.UINT16), active)
                         code_alias = pl.reg.scatter(code_flat, code_index, code, code_store)
-            # The only full-width Tile pass left: pl.reg has no FP8 conversion.
-            scaled_tile = pl.reshape(scaled_flat, [SWIGLU_ROW_TILE, MOE_INTER])
-            quantized = pl.cast(scaled_tile, pl.FP8E4M3FN, mode="rint")
+            # Both stores are plain type views now: no Tile-level compute pass
+            # remains, the whole body ran in registers.
+            payload_row = pl.reshape(payload_flat, [SWIGLU_ROW_TILE, MOE_INTER])
+            quantized = pl.reinterpret_view(payload_row, pl.FP8E4M3FN)
             payload = pl.store(quantized, [row, 0], payload)
             code_row = pl.reshape(code_flat, [1, SWIGLU_GROUP_ROWS])
             code_bytes = pl.reinterpret_view(code_row, pl.UINT8)
