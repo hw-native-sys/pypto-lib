@@ -137,7 +137,7 @@ __tf__ __aicore__ inline void accumulate(
     }
 }
 
-template <typename State>
+template <typename State, bool ClampDenominator = false>
 __tf__ __aicore__ inline void normalization(
     typename State::TileDType __out__ multiplier, typename State::TileDType __in__ maximum,
     typename State::TileDType __in__ denominator, typename State::TileDType __in__ sinks) {
@@ -159,6 +159,7 @@ __tf__ __aicore__ inline void normalization(
         vsub(s, s, mx, heads, MODE_ZEROING);
         vexp(s, s, heads, MODE_ZEROING);
         vadd(s, l, s, heads, MODE_ZEROING);
+        if constexpr (ClampDenominator) vmaxs(s, s, 1.0f, heads, MODE_ZEROING);
         vdiv(s, corr, s, heads, MODE_ZEROING);
         vsts(s, dst, 0, NORM_B32, heads);
         // The PV finish consumes this multiplier through vector loads.

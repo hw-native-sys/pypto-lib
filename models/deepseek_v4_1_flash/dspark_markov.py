@@ -6,11 +6,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """V4.1 DSpark five-step Markov sampling."""
+
+from pathlib import Path
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
+from pypto.runtime import pto_isa_include_dir
 
 from config import (
     B_DYN,
@@ -90,16 +94,34 @@ def golden_markov_from_state(
 MARKOV_RANK = DSPARK_MARKOV_RANK
 MARKOV_BATCH_TILE = 16
 VOCAB_TILE = 128
-HIDDEN_TILE = 256
 MARKOV_CORES = 48
-ARGMAX_ROWS = 8
 RESULT_STRIDE = 16
 MAX_LOGIT_CHUNKS = (MAX_BATCH_PER_DP * DSPARK_QUERY_WIDTH + MAX_LOGIT_ROWS - 1) // MAX_LOGIT_ROWS
 
-assert VOCAB % VOCAB_TILE == 0
-assert D % HIDDEN_TILE == 0
+if (D, MARKOV_RANK, DSPARK_QUERY_WIDTH) != (5120, 256, 5):
+    raise ValueError("native Markov recurrence requires hidden_size=5120, rank=256, and five steps")
+if VOCAB % 256 != 0:
+    raise ValueError("native Markov recurrence requires complete 256-column vocabulary panels")
 if LM_HEAD_TP_SIZE != TP_SIZE:
     raise ValueError(f"DSpark LM head TP={LM_HEAD_TP_SIZE} differs from drafter TP={TP_SIZE}")
+
+
+@pl.jit.inline(auto_scope=False)
+def _markov_embedding(
+    previous_ids: pl.Tensor,
+    markov_w1: pl.Tensor,
+    embedding: pl.Tensor,
+    batch: pl.Scalar[pl.INDEX],
+    id_stride: pl.Scalar[pl.INDEX],
+    token_ready_tid: pl.Scalar[pl.TASK_ID],
+):
+    with pl.spmd(batch, name_hint="dspark_markov_embedding", deps=[token_ready_tid]) as embedding_tid:
+        request = pl.tile.get_block_idx()
+        if request < batch:
+            token = pl.cast(pl.read(previous_ids, [request * id_stride]), pl.INDEX)
+            embedding[request : request + 1, :] = markov_w1[token : token + 1, :]
+
+    return embedding_tid
 
 
 @pl.jit.inline
@@ -113,11 +135,7 @@ def markov_head(
 ):
     """Evaluate W2[W1[previous_id]] over the complete draft vocabulary."""
     batch = pl.tensor.dim(previous_ids, 0)
-    with pl.spmd(batch, name_hint="dspark_markov_embedding", deps=[token_ready_tid]) as embedding_tid:
-        request = pl.tile.get_block_idx()
-        if request < batch:
-            token = pl.cast(pl.read(previous_ids, [request]), pl.INDEX)
-            embedding[request : request + 1, :] = markov_w1[token : token + 1, :]
+    embedding_tid = _markov_embedding(previous_ids, markov_w1, embedding, batch, pl.const(1, pl.INDEX), token_ready_tid)
 
     padded_batch = (batch + MARKOV_BATCH_TILE - 1) // MARKOV_BATCH_TILE * MARKOV_BATCH_TILE
     work_items = (padded_batch // MARKOV_BATCH_TILE) * (VOCAB // VOCAB_TILE)
@@ -174,186 +192,26 @@ def markov_head_from_state(
     return markov_head(previous_ids, markov_w1, markov_w2, embedding, bias, anchor_tid)
 
 
-@pl.jit.inline
-def markov_greedy_step(
-    base_logits: pl.Tensor[[B_DYN, VOCAB], pl.FP32],
-    head_hidden: pl.Tensor[[B_DYN, D], pl.BF16],
-    embedding: pl.Tensor[[B_DYN, MARKOV_RANK], pl.BF16],
-    bias: pl.Tensor[[B_DYN, VOCAB], pl.FP32],
-    confidence_weight: pl.Tensor[[1, D + MARKOV_RANK], pl.FP32],
-    next_ids: pl.Tensor[[B_DYN, RESULT_STRIDE], pl.INT32],
-    confidence: pl.Tensor[[B_DYN, RESULT_STRIDE], pl.FP32],
-    bias_ready_tid: pl.Scalar[pl.TASK_ID] = None,
-    logits_ready_tid: pl.Scalar[pl.TASK_ID] = None,
-    hidden_ready_tid: pl.Scalar[pl.TASK_ID] = None,
-):
-    """Greedy argmax with stable lowest-id ties and the confidence head."""
-    batch = pl.tensor.dim(base_logits, 0)
-    with pl.spmd(
-        batch,
-        name_hint="dspark_markov_greedy",
-        deps=[bias_ready_tid, logits_ready_tid, hidden_ready_tid],
-    ) as greedy_tid:
-        request = pl.tile.get_block_idx()
-        if request < batch:
-            best_score = pl.cast(-3.402823e38, pl.FP32)
-            best_id = pl.cast(0, pl.INT32)
-            for chunk in pl.range(VOCAB // VOCAB_TILE):
-                start = chunk * VOCAB_TILE
-                scores = pl.full([ARGMAX_ROWS, VOCAB_TILE], dtype=pl.FP32, value=-3.402823e38)
-                scores[0:1, :] = pl.add(
-                    base_logits[request : request + 1, start : start + VOCAB_TILE],
-                    bias[request : request + 1, start : start + VOCAB_TILE],
-                )
-                index = pl.read(pl.row_argmax(scores), [0, 0])
-                score = pl.read(scores, [0, pl.cast(index, pl.INDEX)])
-                if score > best_score:
-                    best_score = score
-                    best_id = pl.cast(start, pl.INT32) + index
-            pl.write(next_ids, [request, 0], best_id)
-
-            logit = pl.full([1, ARGMAX_ROWS], dtype=pl.FP32, value=0.0)
-            for offset in pl.range(0, D, HIDDEN_TILE):
-                hidden = pl.cast(head_hidden[request : request + 1, offset : offset + HIDDEN_TILE], pl.FP32)
-                weight = confidence_weight[0:1, offset : offset + HIDDEN_TILE]
-                padded_hidden = pl.full([ARGMAX_ROWS, HIDDEN_TILE], dtype=pl.FP32, value=0.0)
-                padded_hidden[0:1, :] = hidden
-                logit = pl.add(
-                    logit,
-                    pl.reshape(pl.row_sum(pl.col_expand_mul(padded_hidden, weight)), [1, ARGMAX_ROWS]),
-                )
-            markov = pl.cast(embedding[request : request + 1, :], pl.FP32)
-            weight = confidence_weight[0:1, D : D + MARKOV_RANK]
-            padded_markov = pl.full([ARGMAX_ROWS, MARKOV_RANK], dtype=pl.FP32, value=0.0)
-            padded_markov[0:1, :] = markov
-            logit = pl.add(
-                logit,
-                pl.reshape(pl.row_sum(pl.col_expand_mul(padded_markov, weight)), [1, ARGMAX_ROWS]),
-            )
-            probability = pl.recip(pl.add(pl.exp(pl.neg(logit)), 1.0))
-            pl.write(confidence, [request, 0], pl.read(probability, [0, 0]))
-    return next_ids, confidence, greedy_tid
-
-
-@pl.jit.inline
-def _sample_step(
-    base_logits: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, VOCAB], pl.FP32],
-    head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
-    previous_ids: pl.Tensor[[B_DYN], pl.INT64],
-    markov_w1: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
-    markov_w2: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
-    confidence_weight: pl.Tensor[[1, D + MARKOV_RANK], pl.FP32],
-    draft_ids: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.INT32],
-    confidences: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32],
-    step: pl.Scalar[pl.INT32],
-    ready_tid: pl.Scalar[pl.TASK_ID] = None,
-    base_logits_ready_tid: pl.Scalar[pl.TASK_ID] = None,
-):
-    batch = pl.tensor.dim(previous_ids, 0)
-    embedding = pl.create_tensor([batch, MARKOV_RANK], dtype=pl.BF16)
-    bias = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
-    next_ids = pl.create_tensor([batch, RESULT_STRIDE], dtype=pl.INT32)
-    confidence = pl.create_tensor([batch, RESULT_STRIDE], dtype=pl.FP32)
-    head_embedding, head_bias, embedding_tid, bias_tid = markov_head(
-        previous_ids, markov_w1, markov_w2, embedding, bias, ready_tid
-    )
-    logits_step = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
-    hidden_step = pl.create_tensor([batch, D], dtype=pl.BF16)
-    with pl.spmd(
-        MARKOV_CORES,
-        name_hint="dspark_markov_logits_step",
-        deps=[base_logits_ready_tid],
-    ) as logits_tid:
-        worker = pl.tile.get_block_idx()
-        for task in pl.range(worker, batch * (VOCAB // VOCAB_TILE), MARKOV_CORES):
-            request = task // (VOCAB // VOCAB_TILE)
-            start = (task % (VOCAB // VOCAB_TILE)) * VOCAB_TILE
-            logits_tile = pl.slice(base_logits, [1, 1, VOCAB_TILE], [request, step, start])
-            logits_step[request : request + 1, start : start + VOCAB_TILE] = pl.reshape(
-                logits_tile, [1, VOCAB_TILE]
-            )
-    with pl.spmd(MARKOV_CORES, name_hint="dspark_markov_hidden_step") as hidden_tid:
-        worker = pl.tile.get_block_idx()
-        for task in pl.range(worker, batch * (D // HIDDEN_TILE), MARKOV_CORES):
-            request = task // (D // HIDDEN_TILE)
-            start = (task % (D // HIDDEN_TILE)) * HIDDEN_TILE
-            hidden_tile = pl.slice(head_hidden, [1, 1, HIDDEN_TILE], [request, step, start])
-            hidden_step[request : request + 1, start : start + HIDDEN_TILE] = pl.reshape(
-                hidden_tile, [1, HIDDEN_TILE]
-            )
-    next_ids_out, confidence_out, greedy_tid = markov_greedy_step(
-        logits_step, hidden_step, head_embedding, head_bias, confidence_weight, next_ids, confidence,
-        bias_tid, logits_tid, hidden_tid,
-    )
-    next_previous_ids = pl.create_tensor([batch], dtype=pl.INT64)
-    with pl.spmd(1, name_hint="dspark_markov_advance", deps=[greedy_tid]) as advance_tid:
-        worker = pl.tile.get_block_idx()
-        for request in pl.range(worker, batch):
-            token = pl.read(next_ids_out, [request, 0])
-            pl.write(next_previous_ids, [request], pl.cast(token, pl.INT64))
-            pl.write(confidences, [request, step], pl.read(confidence_out, [request, 0]))
-    return next_previous_ids, draft_ids, confidences, advance_tid
-
-
-@pl.jit.inline
-def _sample_step_from_state(
-    base_logits: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, VOCAB], pl.FP32],
-    head_hidden: pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH, D], pl.BF16],
-    previous_ids: pl.Tensor[[B_DYN], pl.INT64],
-    num_sampled: pl.Tensor[[B_DYN], pl.INT32],
-    last_sampled: pl.Tensor[[B_DYN], pl.INT64],
-    next_prefill_tokens: pl.Tensor[[B_DYN], pl.INT64],
-    markov_w1: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
-    markov_w2: pl.Tensor[[VOCAB, MARKOV_RANK], pl.BF16],
-    confidence_weight: pl.Tensor[[1, D + MARKOV_RANK], pl.FP32],
-    draft_ids: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
-    confidences: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
-    step: pl.Scalar[pl.INT32],
-    ready_tid: pl.Scalar[pl.TASK_ID] = None,
-):
-    batch = pl.tensor.dim(previous_ids, 0)
-    embedding = pl.create_tensor([batch, MARKOV_RANK], dtype=pl.BF16)
-    bias = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
-    next_ids = pl.create_tensor([batch, RESULT_STRIDE], dtype=pl.INT32)
-    confidence = pl.create_tensor([batch, RESULT_STRIDE], dtype=pl.FP32)
-    # The caller has already resolved the state into an explicit anchor.  Use
-    # that tensor directly so the first step has the same dependency and
-    # cache semantics as subsequent recurrence steps.
-    state_embedding, state_bias, embedding_tid, bias_tid = markov_head(
-        previous_ids, markov_w1, markov_w2, embedding, bias, ready_tid
-    )
-    logits_step = pl.create_tensor([batch, VOCAB], dtype=pl.FP32)
-    hidden_step = pl.create_tensor([batch, D], dtype=pl.BF16)
-    with pl.spmd(MARKOV_CORES, name_hint="dspark_markov_logits_step") as logits_tid:
-        worker = pl.tile.get_block_idx()
-        for task in pl.range(worker, batch * (VOCAB // VOCAB_TILE), MARKOV_CORES):
-            request = task // (VOCAB // VOCAB_TILE)
-            start = (task % (VOCAB // VOCAB_TILE)) * VOCAB_TILE
-            logits_tile = pl.slice(base_logits, [1, 1, VOCAB_TILE], [request, step, start])
-            logits_step[request : request + 1, start : start + VOCAB_TILE] = pl.reshape(
-                logits_tile, [1, VOCAB_TILE]
-            )
-    with pl.spmd(MARKOV_CORES, name_hint="dspark_markov_hidden_step") as hidden_tid:
-        worker = pl.tile.get_block_idx()
-        for task in pl.range(worker, batch * (D // HIDDEN_TILE), MARKOV_CORES):
-            request = task // (D // HIDDEN_TILE)
-            start = (task % (D // HIDDEN_TILE)) * HIDDEN_TILE
-            hidden_tile = pl.slice(head_hidden, [1, 1, HIDDEN_TILE], [request, step, start])
-            hidden_step[request : request + 1, start : start + HIDDEN_TILE] = pl.reshape(
-                hidden_tile, [1, HIDDEN_TILE]
-            )
-    next_ids_out, confidence_out, greedy_tid = markov_greedy_step(
-        logits_step, hidden_step, state_embedding, state_bias, confidence_weight, next_ids, confidence,
-        bias_tid, logits_tid, hidden_tid,
-    )
-    next_previous_ids = pl.create_tensor([batch], dtype=pl.INT64)
-    with pl.spmd(1, name_hint="dspark_markov_advance", deps=[greedy_tid]) as advance_tid:
-        worker = pl.tile.get_block_idx()
-        for request in pl.range(worker, batch):
-            token = pl.read(next_ids_out, [request, 0])
-            pl.write(next_previous_ids, [request], pl.cast(token, pl.INT64))
-            pl.write(confidences, [request, step], pl.read(confidence_out, [request, 0]))
-    return next_previous_ids, draft_ids, confidences, advance_tid
+@pl.jit.extern(core_type="mixed", dual_aiv_dispatch=True,
+               aic_source=Path(__file__).parent / "kernels" / "markov_recurrence.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "markov_recurrence.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _markov_recurrence_native(
+    base_logits: pl.Tensor,
+    embedding: pl.Out[pl.Tensor],
+    markov_w2: pl.Tensor,
+    partial_scores: pl.Out[pl.Tensor],
+    partial_ids: pl.Out[pl.Tensor],
+    head_hidden: pl.Tensor,
+    markov_w1: pl.Tensor,
+    confidence_weight: pl.Tensor,
+    draft_state: pl.Out[pl.Tensor],
+    confidence_state: pl.Out[pl.Tensor],
+    draft_ids: pl.Out[pl.Tensor],
+    confidences: pl.Out[pl.Tensor],
+    anchor_ids: pl.Tensor,
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor]:
+    return embedding, partial_scores, partial_ids, draft_state, confidence_state, draft_ids, confidences
 
 
 def _markov_sample(
@@ -374,85 +232,23 @@ def _markov_sample(
     draft_ids.bind_dynamic(0, B_DYN)
     confidences.bind_dynamic(0, B_DYN)
     batch = pl.tensor.dim(anchor_ids, 0)
-    previous_ids = pl.create_tensor([batch], dtype=pl.INT64)
-    with pl.spmd(1, name_hint="dspark_markov_anchor") as anchor_tid:
-        worker = pl.tile.get_block_idx()
-        for request in pl.range(worker, batch):
-            pl.write(previous_ids, [request], pl.read(anchor_ids, [request]))
-    previous_ids_0, draft_ids_0, confidences_0, ready_0 = _sample_step(
-        base_logits,
-        head_hidden,
-        previous_ids,
-        markov_w1,
-        markov_w2,
-        confidence_weight,
-        draft_ids,
-        confidences,
-        pl.const(0, pl.INT32),
-        anchor_tid,
-        base_logits_ready_tid,
-    )
-    previous_ids_1, draft_ids_1, confidences_1, ready_1 = _sample_step(
-        base_logits,
-        head_hidden,
-        previous_ids_0,
-        markov_w1,
-        markov_w2,
-        confidence_weight,
-        draft_ids,
-        confidences,
-        pl.const(1, pl.INT32),
-        ready_0,
-        base_logits_ready_tid,
-    )
-    previous_ids_2, draft_ids_2, confidences_2, ready_2 = _sample_step(
-        base_logits,
-        head_hidden,
-        previous_ids_1,
-        markov_w1,
-        markov_w2,
-        confidence_weight,
-        draft_ids,
-        confidences,
-        pl.const(2, pl.INT32),
-        ready_1,
-        base_logits_ready_tid,
-    )
-    previous_ids_3, draft_ids_3, confidences_3, ready_3 = _sample_step(
-        base_logits,
-        head_hidden,
-        previous_ids_2,
-        markov_w1,
-        markov_w2,
-        confidence_weight,
-        draft_ids,
-        confidences,
-        pl.const(3, pl.INT32),
-        ready_2,
-        base_logits_ready_tid,
-    )
-    previous_ids_4, draft_ids_4, confidences_4, ready_4 = _sample_step(
-        base_logits,
-        head_hidden,
-        previous_ids_3,
-        markov_w1,
-        markov_w2,
-        confidence_weight,
-        draft_ids,
-        confidences,
-        pl.const(4, pl.INT32),
-        ready_3,
-        base_logits_ready_tid,
-    )
-    with pl.spmd(1, name_hint="dspark_markov_publish", deps=[ready_4]):
-        worker = pl.tile.get_block_idx()
-        for request in pl.range(worker, batch):
-            pl.write(draft_ids, [request, 0], pl.cast(pl.read(previous_ids_0, [request]), pl.INT32))
-            pl.write(draft_ids, [request, 1], pl.cast(pl.read(previous_ids_1, [request]), pl.INT32))
-            pl.write(draft_ids, [request, 2], pl.cast(pl.read(previous_ids_2, [request]), pl.INT32))
-            pl.write(draft_ids, [request, 3], pl.cast(pl.read(previous_ids_3, [request]), pl.INT32))
-            pl.write(draft_ids, [request, 4], pl.cast(pl.read(previous_ids_4, [request]), pl.INT32))
-    return draft_ids, confidences
+    embedding = pl.create_tensor([batch, MARKOV_RANK], dtype=pl.BF16)
+    logits_view = pl.slice(base_logits, [batch, DSPARK_QUERY_WIDTH, VOCAB], [0, 0, 0])
+    hidden_view = pl.slice(head_hidden, [batch, DSPARK_QUERY_WIDTH, D], [0, 0, 0])
+    partial_scores = pl.create_tensor([batch, 32, RESULT_STRIDE], dtype=pl.FP32)
+    partial_ids = pl.create_tensor([batch, 32, RESULT_STRIDE], dtype=pl.INT32)
+    draft_state = pl.create_tensor([batch, DSPARK_QUERY_WIDTH, RESULT_STRIDE], dtype=pl.INT64)
+    confidence_state = pl.create_tensor([batch, DSPARK_QUERY_WIDTH, RESULT_STRIDE], dtype=pl.FP32)
+    ids_view = pl.slice(draft_ids, [batch, DSPARK_QUERY_WIDTH], [0, 0])
+    conf_view = pl.slice(confidences, [batch, DSPARK_QUERY_WIDTH], [0, 0])
+    anchors_view = pl.slice(anchor_ids, [batch], [0])
+    workers = pl.min(32, pl.system.available_cluster_count())
+    with pl.spmd(workers, name_hint="dspark_markov_recurrence", sync_start=True, deps=[base_logits_ready_tid]):
+        embedding, partial_scores, partial_ids, draft_state, confidence_state, published_ids, published_confidences = _markov_recurrence_native(
+            logits_view, embedding, markov_w2, partial_scores, partial_ids, hidden_view,
+            markov_w1, confidence_weight, draft_state, confidence_state, ids_view, conf_view, anchors_view,
+        )
+    return published_ids, published_confidences
 
 
 def _markov_sample_from_state(
@@ -492,39 +288,10 @@ def _markov_sample_from_state(
             if pl.read(num_sampled, [request]) > 0:
                 token = pl.read(last_sampled, [request])
             pl.write(previous_ids, [request], pl.cast(token, pl.INT64))
-    previous_ids_0, draft_ids_0, confidences_0, ready_0 = _sample_step(
-        base_logits, head_hidden, previous_ids,
-        markov_w1, markov_w2, confidence_weight,
-        draft_ids, confidences, pl.const(0, pl.INT32), anchor_tid,
+    markov_sample_inline(
+        base_logits, head_hidden, previous_ids, markov_w1, markov_w2, confidence_weight,
+        draft_ids, confidences, anchor_tid,
     )
-    previous_ids_1, draft_ids_1, confidences_1, ready_1 = _sample_step(
-        base_logits, head_hidden, previous_ids_0, markov_w1, markov_w2, confidence_weight,
-        draft_ids, confidences, pl.const(1, pl.INT32),
-        ready_0,
-    )
-    previous_ids_2, draft_ids_2, confidences_2, ready_2 = _sample_step(
-        base_logits, head_hidden, previous_ids_1, markov_w1, markov_w2, confidence_weight,
-        draft_ids, confidences, pl.const(2, pl.INT32),
-        ready_1,
-    )
-    previous_ids_3, draft_ids_3, confidences_3, ready_3 = _sample_step(
-        base_logits, head_hidden, previous_ids_2, markov_w1, markov_w2, confidence_weight,
-        draft_ids, confidences, pl.const(3, pl.INT32),
-        ready_2,
-    )
-    previous_ids_4, draft_ids_4, confidences_4, ready_4 = _sample_step(
-        base_logits, head_hidden, previous_ids_3, markov_w1, markov_w2, confidence_weight,
-        draft_ids, confidences, pl.const(4, pl.INT32),
-        ready_3,
-    )
-    with pl.spmd(1, name_hint="dspark_markov_publish", deps=[ready_4]):
-        worker = pl.tile.get_block_idx()
-        for request in pl.range(worker, batch):
-            pl.write(draft_ids, [request, 0], pl.cast(pl.read(previous_ids_0, [request]), pl.INT32))
-            pl.write(draft_ids, [request, 1], pl.cast(pl.read(previous_ids_1, [request]), pl.INT32))
-            pl.write(draft_ids, [request, 2], pl.cast(pl.read(previous_ids_2, [request]), pl.INT32))
-            pl.write(draft_ids, [request, 3], pl.cast(pl.read(previous_ids_3, [request]), pl.INT32))
-            pl.write(draft_ids, [request, 4], pl.cast(pl.read(previous_ids_4, [request]), pl.INT32))
     return draft_ids, confidences
 
 
@@ -718,28 +485,31 @@ def l3_markov_sample_from_hidden(
         )
 
 
-def run_markov_case(*, platform: str = "a5sim", device_id: int = 0,
+def run_markov_case(*, platform: str = "a5", device_id: int = 0,
                     compile_only: bool = False):
     """Validate the complete five-token Markov recurrence."""
+    if platform != "a5":
+        raise ValueError("V4.1 Markov native kernels require A5 device execution; simulator support is unavailable")
     from golden import TensorSpec, run
 
     batch = 12
-    previous = torch.zeros(batch, dtype=torch.int64)
+    previous = torch.arange(batch, dtype=torch.int64) * (DSPARK_QUERY_WIDTH + 1)
     base = torch.zeros(batch, DSPARK_QUERY_WIDTH, VOCAB, dtype=torch.float32)
-    base[:, :, 13] = 1.0
     hidden = torch.zeros(batch, DSPARK_QUERY_WIDTH, D, dtype=torch.bfloat16)
-    hidden[:, :, 0] = 1.0
+    hidden[:, :, 0] = torch.arange(batch, dtype=torch.float32)[:, None] / 4.0 - 1.0
+    hidden[:, :, 0] += torch.arange(DSPARK_QUERY_WIDTH, dtype=torch.float32) / 16.0
     w1 = torch.zeros(VOCAB, MARKOV_RANK, dtype=torch.bfloat16)
-    w1[0, 0] = 16.0
-    for token in range(1, 5):
-        w1[token, token] = 16.0
-    w2 = torch.zeros_like(w1)
-    w2.fill_(-16.0)
-    for token in range(5):
-        w2[token + 1, token] = 16.0
+    w2 = torch.full_like(w1, -16.0)
+    for request in range(batch):
+        for step in range(DSPARK_QUERY_WIDTH):
+            token = request * (DSPARK_QUERY_WIDTH + 1) + step
+            w1[token, token] = 16.0
+            w2[0, token] = 16.0
+            w2[token + 1, token] = 16.0
+            base[request, step, token + 1] = 1.0
     confidence_weight = torch.zeros(1, D + MARKOV_RANK)
     confidence_weight[0, 0] = 1.0
-    confidence_weight[0, D] = 0.5
+    confidence_weight[0, D:] = 1.0 / 32.0
 
     def golden(values):
         ids, probabilities = golden_markov_sample(
@@ -786,7 +556,7 @@ if __name__ == "__" + "main__":
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=SUPPORTED_TP_SIZES)
     parser.add_argument("--dp", type=int, default=DP_SIZE)
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=SUPPORTED_EP_SIZES)
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()

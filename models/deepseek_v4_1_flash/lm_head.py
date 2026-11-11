@@ -16,14 +16,16 @@ The public selected-row interface has 16 row slots. TP1 selects and projects
 locally. TP groups gather owner rows and exchange vocabulary shards within
 that group, then retire communication signals after all readers complete.
 Complete a dispatch on every rank before replacing shared inputs or reusing
-its windows. The DSpark target consumes a separate 80-row masked batch.
+its windows. DSpark sampling applies token and width masks directly to its 72 output IDs.
 """
 
 import sys
+from pathlib import Path
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
+from pypto.runtime import pto_isa_include_dir
 
 # Standalone LM-head validation defaults to TP2/DP1.
 
@@ -37,7 +39,6 @@ from quant import pack_bf16_nz, unpack_bf16_nz
 D = M.hidden_size
 VOCAB = M.vocab_size
 LM_HEAD_WEIGHT_LAYOUT = "bf16_nz_kn"
-LM_HEAD_WEIGHT_CACHE = getattr(pl.CachePolicy, "NOT_ALLOC_KEEP", pl.CachePolicy.DEFAULT)
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -72,14 +73,10 @@ TEST_TOKENS = 16  # standalone fixture: hidden rows per card
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 
 # Tiling
-FUSED_K_TILE = 128
-FUSED_VOCAB_TILE = 512 if TP_SIZE < 8 else 256
 LM_HEAD_M_TILE = 80
-LM_HEAD_STAGE = 3
 GROUP_M_TILE = min(LM_HEAD_M_TILE, GROUP_LOGIT_ROWS)
 HIDDEN_GATHER_TILE = 512
 LOGITS_COMM_TILE = 2048
-VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
 FUSED_LM_HEAD_CORES = 32
 # Repeated projections advance epochs and clear signals after the final projection.
@@ -105,7 +102,6 @@ LOGITS_COMM_BLOCKS = min(
 )
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
 
-assert D % FUSED_K_TILE == 0
 assert D % HIDDEN_GATHER_TILE == 0
 assert VOCAB % TP_SIZE == 0
 assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
@@ -114,30 +110,18 @@ assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE
 assert REPEAT in _REPEAT_CHOICES, f"--repeat must be one of {_REPEAT_CHOICES} (got {REPEAT})"
 
 
-@pl.jit.inline(auto_scope=False)
-def _lm_head_project_tile(
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "lm_head_projection.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _lm_head_projection(
     hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
-    row: pl.Scalar[pl.INDEX],
-    col: pl.Scalar[pl.INDEX],
-    valid_rows: pl.Scalar[pl.INDEX],
-    m_tile: pl.constexpr,
-    n_tile: pl.constexpr,
-):
-    first_a = pl.load(hidden_states, [row, 0], [m_tile, FUSED_K_TILE],
-                      valid_shape=[valid_rows, FUSED_K_TILE], target_memory=pl.Mem.Mat)
-    first_a_full = pl.set_validshape(first_a, m_tile, FUSED_K_TILE)
-    first_b = pl.load(lm_head_weight, [0, col], [FUSED_K_TILE, n_tile],
-                      target_memory=pl.Mem.Mat, cache=LM_HEAD_WEIGHT_CACHE)
-    accum = pl.matmul(first_a_full, first_b, out_dtype=pl.FP32)
-    for k in pl.pipeline(FUSED_K_TILE, D, FUSED_K_TILE, stage=LM_HEAD_STAGE):
-        a = pl.load(hidden_states, [row, k], [m_tile, FUSED_K_TILE],
-                    valid_shape=[valid_rows, FUSED_K_TILE], target_memory=pl.Mem.Mat)
-        a_full = pl.set_validshape(a, m_tile, FUSED_K_TILE)
-        b = pl.load(lm_head_weight, [k, col], [FUSED_K_TILE, n_tile],
-                    target_memory=pl.Mem.Mat, cache=LM_HEAD_WEIGHT_CACHE)
-        accum = pl.matmul_acc(accum, a_full, b)
-    return accum
+    lm_head_weight: pl.Tensor,
+    logits: pl.Out[pl.Tensor],
+    rows: pl.Scalar[pl.INDEX],
+    vocabulary: pl.Scalar[pl.INDEX],
+    row_tile: pl.Scalar[pl.INDEX],
+) -> pl.Tensor:
+    """Project BF16 hidden states against packed NZ vocabulary weights."""
+    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -150,31 +134,7 @@ def lm_head_project(
     """Write vocabulary logits in place and return the completion task."""
     rows = pl.tensor.dim(logits, 0)
     with pl.spmd(FUSED_LM_HEAD_CORES, name_hint="lm_head_matmul") as projected:
-        worker = pl.tile.get_block_idx()
-        for row in pl.range(0, rows, m_tile):
-            valid_rows = pl.min(m_tile, rows - row)
-            tile_count = (VOCAB_PER_TP // FUSED_VOCAB_TILE + FUSED_LM_HEAD_CORES - 1 - worker) // FUSED_LM_HEAD_CORES
-            accum = pl.tile.create([m_tile, FUSED_VOCAB_TILE], dtype=pl.FP32)
-            for step in pl.pipeline(0, tile_count * (D // FUSED_K_TILE), 1, stage=LM_HEAD_STAGE):
-                k = step % (D // FUSED_K_TILE) * FUSED_K_TILE
-                col = (worker + step // (D // FUSED_K_TILE) * FUSED_LM_HEAD_CORES) * FUSED_VOCAB_TILE
-                a = pl.load(hidden_states, [row, k], [m_tile, FUSED_K_TILE],
-                            valid_shape=[valid_rows, FUSED_K_TILE], target_memory=pl.Mem.Mat)
-                a_full = pl.set_validshape(a, m_tile, FUSED_K_TILE)
-                b = pl.load(lm_head_weight, [k, col], [FUSED_K_TILE, FUSED_VOCAB_TILE],
-                            target_memory=pl.Mem.Mat, cache=LM_HEAD_WEIGHT_CACHE)
-                accum = pl.matmul_acc(accum, a_full, b, init_cond=(k == 0))
-                if k + FUSED_K_TILE == D:
-                    valid_accum = pl.set_validshape(accum, valid_rows, FUSED_VOCAB_TILE)
-                    logits = pl.store(valid_accum, [row, col], logits)
-            if VOCAB_TAIL != 0:
-                if worker == (VOCAB_PER_TP // FUSED_VOCAB_TILE) % FUSED_LM_HEAD_CORES:
-                    col = VOCAB_PER_TP // FUSED_VOCAB_TILE * FUSED_VOCAB_TILE
-                    tail_accum = _lm_head_project_tile(
-                        hidden_states, lm_head_weight, row, col, valid_rows, m_tile, VOCAB_TAIL,
-                    )
-                    valid_tail = pl.set_validshape(tail_accum, valid_rows, VOCAB_TAIL)
-                    logits = pl.store(valid_tail, [row, col], logits)
+        _lm_head_projection(hidden_states, lm_head_weight, logits, rows, VOCAB_PER_TP, m_tile)
     return projected
 
 
@@ -456,16 +416,50 @@ def greedy_sample(
     return sampled_ids
 
 
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "lm_head_sample.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "lm_head_sample.cpp",
+               dual_aiv_dispatch=True, include_dirs=(pto_isa_include_dir(),))
+def _lm_head_sample_partial(
+    hidden_states: pl.Tensor,
+    lm_head_weight: pl.Tensor,
+    partial_values: pl.Out[pl.Tensor],
+    partial_indices: pl.Out[pl.Tensor],
+    active_widths: pl.Tensor,
+    rows: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    return partial_values, partial_indices
+
+
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "lm_head_sample_merge.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _lm_head_sample_merge(
+    partial_values: pl.Tensor,
+    partial_indices: pl.Tensor,
+    sampled_ids: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def lm_head_sample(
-    hidden_states: pl.Tensor[[LM_HEAD_M_TILE, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[D, VOCAB_PER_TP], pl.BF16, pl.NZ],
+    hidden_states: pl.Tensor,
+    lm_head_weight: pl.Tensor[[D, VOCAB], pl.BF16, pl.NZ],
+    active_widths: pl.Tensor,
     sampled_ids: pl.Tensor,
+    ready: pl.Scalar[pl.TASK_ID] = None,
 ):
-    """Project a masked TP1 batch and select its requested token IDs."""
-    logits = pl.create_tensor([LM_HEAD_M_TILE, VOCAB], dtype=pl.FP32)
-    projected = lm_head_project(hidden_states, lm_head_weight, logits, LM_HEAD_M_TILE)
-    greedy_sample(logits, sampled_ids, projected)
+    """Project and greedily sample the bounded TP1 verification rows."""
+    rows = pl.tensor.dim(sampled_ids, 0)
+    partial_values = pl.create_tensor([FUSED_LM_HEAD_CORES, LM_HEAD_M_TILE], dtype=pl.FP32)
+    partial_indices = pl.create_tensor([FUSED_LM_HEAD_CORES, LM_HEAD_M_TILE], dtype=pl.INT32)
+    with pl.spmd(FUSED_LM_HEAD_CORES, name_hint="lm_head_sample_partial", deps=[ready],
+                 allow_early_resolve=True) as projected:
+        partial_values, partial_indices = _lm_head_sample_partial(
+            hidden_states, lm_head_weight, partial_values, partial_indices, active_widths, rows,
+        )
+    with pl.spmd((rows + SAMPLED_IDS_PAD - 1) // SAMPLED_IDS_PAD,
+                 name_hint="lm_head_sample_merge", deps=[projected]):
+        sampled_ids = _lm_head_sample_merge(partial_values, partial_indices, sampled_ids)
     return sampled_ids
 
 
@@ -683,6 +677,31 @@ def l3_lm_head(
             )
 
 
+@pl.jit(auto_scope=False)
+def lm_head_sample_validation(
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[D, VOCAB], pl.BF16, pl.NZ],
+    active_widths: pl.Tensor[[12], pl.INT32],
+    sampled_ids: pl.Out[pl.Tensor[[72, SAMPLED_IDS_PAD], pl.INT32]],
+):
+    ready = pl.system.task_dummy(deps=[])
+    return lm_head_sample(hidden_states, lm_head_weight, active_widths, sampled_ids, ready)
+
+
+def golden_lm_head_sample(tensors):
+    import torch
+
+    hidden = tensors["hidden_states"].float()
+    weight = unpack_bf16_nz(tensors["lm_head_weight"]).float()
+    ids = torch.argmax(torch.matmul(hidden, weight), dim=-1).to(torch.int32)
+    output = tensors["sampled_ids"]
+    output.zero_()
+    rows = min(hidden.shape[0], output.shape[0])
+    row_indices = torch.arange(rows)
+    active = row_indices % 6 < tensors["active_widths"][row_indices // 6]
+    output[:rows, 0] = torch.where(active, ids[:rows], 0)
+
+
 def golden_lm_head(tensors):
     import torch
 
@@ -719,6 +738,39 @@ def golden_final_output(tensors):
         normalized = golden_rms_norm_tiled(collapsed, tensors["final_norm_weight"][rank])
         hidden.append(normalized.to(torch.bfloat16))
     golden_lm_head({**tensors, "hidden_states": torch.stack(hidden)})
+
+
+def build_sample_tensor_specs():
+    import torch
+    from golden import TensorSpec
+
+    tokens = 47
+
+    def init_hidden():
+        return torch.eye(tokens, D, dtype=torch.bfloat16)
+
+    def init_weight():
+        weight = torch.zeros(D, VOCAB, dtype=torch.bfloat16)
+        for row in range(tokens):
+            if row % 3 == 0:
+                # Equal maxima: worker 8 has the earlier ID than worker 0.
+                weight[row, 4096 + row] = 2
+                weight[row, 16384 + row] = 2
+            elif row % 3 == 1:
+                weight[row, VOCAB - 1 - row // 3] = 3
+            else:
+                weight[row, 512 * row + 31] = 4
+        return pack_bf16_nz(weight)
+
+    def init_widths():
+        return torch.tensor([6, 3, 0, 1, 5, 2, 6, 6, 6, 0, 4, 6], dtype=torch.int32)
+
+    return [
+        TensorSpec("hidden_states", [tokens, D], torch.bfloat16, init_value=init_hidden),
+        TensorSpec("lm_head_weight", [D, VOCAB], torch.bfloat16, init_value=init_weight),
+        TensorSpec("active_widths", [12], torch.int32, init_value=init_widths),
+        TensorSpec("sampled_ids", [72, SAMPLED_IDS_PAD], torch.int32),
+    ]
 
 
 def build_tensor_specs(num_tokens=TEST_TOKENS, *, final=False):
@@ -825,42 +877,70 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--final-output", action="store_true", help="include final HC collapse and Norm")
+    parser.add_argument("--fused-sample", action="store_true", help="validate only the TP1 fused sampler")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
-    required_devices = WORLD_SIZE
+    if args.fused_sample and (args.execution_mode or args.final_output):
+        parser.error("--fused-sample requires device execution without --final-output")
+    required_devices = 1 if args.fused_sample else WORLD_SIZE
     assert len(device_ids) >= required_devices, (
         f"need at least {required_devices} devices, got {device_ids}"
     )
     assert args.tp == TP_SIZE and args.dp == DP_SIZE and args.repeat == REPEAT
     assert 0 <= args.num_tokens <= TEST_TOKENS
 
-    result = run(
-        fn=l3_final_output if args.final_output else l3_lm_head,
-        specs=build_tensor_specs(args.num_tokens, final=args.final_output),
-        golden_fn=golden_final_output if args.final_output else golden_lm_head,
-        compare_fn={
-            "logits": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "sampled_ids": compare_sampled_ids,
-        },
-        compile_only=args.compile_only,
-        runtime_dir=args.runtime_dir,
-        config=dict(
-            dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:required_devices],
-                num_sub_workers=0,
+    if not args.fused_sample:
+        result = run(
+            fn=l3_final_output if args.final_output else l3_lm_head,
+            specs=build_tensor_specs(args.num_tokens, final=args.final_output),
+            golden_fn=golden_final_output if args.final_output else golden_lm_head,
+            compare_fn={
+                "logits": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+                "sampled_ids": compare_sampled_ids,
+            },
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir,
+            config=dict(
+                dump_passes=args.dump_passes,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:required_devices],
+                    num_sub_workers=0,
+                ),
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                enable_chip_swimlane=args.enable_chip_swimlane,
             ),
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+            rtol=1e-3,
+            atol=1e-3,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+
+    # Default device validation also covers the TP1 sampler on the first card.
+    default_sample = not (args.execution_mode or args.final_output or args.runtime_dir)
+    if args.fused_sample or default_sample:
+        result = run(
+            fn=lm_head_sample_validation,
+            specs=build_sample_tensor_specs(),
+            golden_fn=golden_lm_head_sample,
+            compile_only=args.compile_only,
+            runtime_dir=args.runtime_dir if args.fused_sample else None,
+            config=dict(
+                dump_passes=args.dump_passes,
+                backend_type=args.backend_type,
+                execution_mode=False,
+                device_id=device_ids[0],
+                enable_chip_swimlane=args.enable_chip_swimlane,
+            ),
+            rtol=0,
+            atol=0,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
