@@ -42,6 +42,17 @@ __aicore__ inline int read(__gm__ int32_t* ptr) {
 
 __aicore__ inline int minimum(int a, int b) { return a < b ? a : b; }
 
+__aicore__ inline int active_shards(__gm__ int64_t* args, int groups, int panels, int workers) {
+    if (args[19]) return int(args[21]);
+    int count = workers;
+    if (panels > 100) {
+        int needed = (groups * panels + 99) / 100;
+        if (needed > count) count = needed;
+    }
+    return minimum(int(args[21]), count);
+}
+
+
 #if defined(__DAV_VEC__)
 __aicore__ inline void prepare_query(__gm__ int64_t* args, int begin, int count, QueryPipe& pipe) {
     if (get_subblockid() == 0) {
@@ -546,7 +557,7 @@ namespace {
                     continue;
                 }
                 int group = read(data<int32_t>(args, 9) + 3 * stride + token + 1);
-                int owners = minimum(shards, total);
+                int owners = minimum(active_shards(args, total / panels, panels, workers), total);
                 int first = ((group * panels + 1) * owners - 1) / total;
                 int last = (((group + 1) * panels) * owners - 1) / total;
                 int carry = 0;
@@ -618,7 +629,7 @@ namespace {
             int groups = read(data<int32_t>(args, 9) + 3 * stride);
             int panels = (width + 255) / 256;
             int block = get_block_idx(args), workers = get_block_num(args);
-            int owners = minimum(int(args[21]), groups * panels);
+            int owners = minimum(active_shards(args, groups, panels, workers), groups * panels);
             int transferred = 0;
             for (int shard = block; shard < owners; shard += workers) {
                 int first = groups * panels * shard / owners;
