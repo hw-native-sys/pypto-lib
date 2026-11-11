@@ -69,7 +69,45 @@ override because PyPTO still pins `355ce301`.
 | --- | --- |
 | Qwen3-14B prefill and decode | Eager and Graph compiled with both the pinned runtime and Simpler main. With Simpler main, each mode passed an eight-token Serving precision test on one A3 card with Lib `f4711ad` and the matching Serving review snapshot. |
 | DeepSeek V4 Flash MTP prefill | The candidate compiled main prefill and MTP prefill. These candidate kernels are still being migrated into the shared Lib model. |
-| DeepSeek V4 Flash MTP fused decode | The candidate stopped in the PyPTO parser on `pl.submit(_moe_expert_chunk_recorded, ...)` with both Simpler versions. PyPTO [#3321](https://github.com/hw-native-sys/pypto/pull/3321) covers submitted JIT callables. A single-PR comparison is in progress. |
+| DeepSeek V4 Flash MTP fused decode | The candidate stopped in the PyPTO parser on `pl.submit(_moe_expert_chunk_recorded, ...)` with both Simpler versions. PyPTO [#3321](https://github.com/hw-native-sys/pypto/pull/3321) covers submitted JIT callables. With only #3321 head `c295a9e1` merged into that PyPTO main, the fused decode compiled in eager and explicit Graph. This establishes the parser dependency for the candidate. The full request is tracked separately. |
+
+## Reproducing the component checks
+
+Use the Lib branch with the [installation workflow](../get-started/installation.md).
+
+For A3 DeepSeek fused decode, build PyPTO from
+`fc50efe71ab1e6adbfd7703d3f6ac8b209d85c0b` with the changes from
+`c295a9e170bbb3613b19797304352dadf3791ad4`. The latter is the tested
+head of PyPTO #3321. Fetch it from `refs/pull/3321/head` in the PyPTO
+upstream repository and confirm the SHA before merging it locally.
+The offline probe selected Simpler `0569c779` explicitly and used PTOAS v0.72.
+Full-model serving also needs the matching bounded prefill and fused
+decode routing in Serving.
+
+For A5 C1A reuse, Lib `32c9860` passed both TMR and HBG golden with PyPTO
+`fc50efe7`, Simpler `0569c779`, and PTOAS v0.72. After setting up that
+pairing, run from the Lib root on an allocated A5 card. Set the device ID
+to the scheduler allocation.
+
+```bash
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+device=0
+entry=models/deepseek_v4_1_flash/decode_c1a_reuse.py
+python "$entry" -p a5 -d "$device" --start-pos 8192,4096 --query-lens 1,2 --case ragged
+python - "$entry" -p a5 -d "$device" --start-pos 8192,4096 --query-lens 1,2 --case ragged <<'PY'
+import runpy
+import sys
+from pathlib import Path
+
+from pypto.pypto_core import passes
+
+entry = Path(sys.argv[1]).resolve()
+sys.argv = [str(entry), *sys.argv[2:]]
+sys.path.insert(0, str(entry.parent))
+with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
+    runpy.run_path(str(entry), run_name="__main__")
+PY
+```
 
 ## Tested version combinations
 
