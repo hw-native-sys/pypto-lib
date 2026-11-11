@@ -46,7 +46,8 @@ SCORE_TILE = 256
 SCORE_RUN_TILE = 6
 SCORE_ROWS_TILE = SCORE_RUN_TILE * INDEX_H
 SCORE_BATCH_TILE = 16
-SCORE_SHARD_CACHE = 25600
+SCORE_SHARD_PANELS_TILE = 16
+SCORE_SHARD_CACHE = SCORE_SHARD_PANELS_TILE * SCORE_TILE
 SCORE_MERGE_CACHE = 16384
 PROJ_M_TILE = 80
 PROJ_K_TILE = 128
@@ -1310,9 +1311,7 @@ def _score_index_rows(
     packed_keys = pl.reinterpret_view(staged_keys, pl.FP4E2M1X2)
     staged_scales = pl.create_tensor([batch_capacity, SCORE_TILE * 4], dtype=pl.UINT8)
     panel_valid = pl.create_tensor([panel_slots], dtype=pl.INT32)
-    shards = workers
-    if panels > 100:
-        shards = pl.max(workers, (work_count + 99) // 100)
+    shards = pl.max(workers, (work_count + SCORE_SHARD_PANELS_TILE - 1) // SCORE_SHARD_PANELS_TILE)
     owners = pl.min(shards, work_count)
     previous_batch = runs_ready
     batch_limit = pl.max(1, work_count)
@@ -1624,11 +1623,6 @@ def _select_index_topk_sharded(
     with pl.spmd(workers, name_hint="idx_topk_shards_reg", deps=[ready]) as local_done:
         worker = pl.tile.get_block_idx()
         for shard in pl.range(worker, shards, workers):
-            empty_keys = pl.tile.full([1, INDEX_TOPK], dtype=pl.UINT16, value=0)
-            empty_ids = pl.tile.full([1, INDEX_TOPK], dtype=pl.INT32, value=-1)
-            for clear_token in pl.range(num_tokens):
-                candidate_keys = pl.store(empty_keys, [clear_token, shard * INDEX_TOPK], candidate_keys)
-                candidate_ids = pl.store(empty_ids, [clear_token, shard * INDEX_TOPK], candidate_ids)
             if shard < owners:
                 first = pl.cast(total * shard // owners, pl.INT32)
                 finish = pl.cast(total * (shard + 1) // owners, pl.INT32)
@@ -2310,12 +2304,11 @@ def score_select_paged_pypto(
         pl.INDEX,
     )
     workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
-    shards = pl.cast(workers, pl.INT32)
-    if panels > 100:
-        shards = pl.cast(
-            pl.max(workers, (run_count * panels + 99) // 100),
-            pl.INT32,
-        )
+    work_count = run_count * panels
+    shards = pl.cast(
+        pl.max(workers, (work_count + SCORE_SHARD_PANELS_TILE - 1) // SCORE_SHARD_PANELS_TILE),
+        pl.INT32,
+    )
     selected = _select_index_topk_sharded(scores, physical, lengths, runs, output, num_tokens, shards, completed, c2a)
     return selected, completed
 
@@ -2361,12 +2354,11 @@ def score_select_reindex_pypto(
         pl.INDEX,
     )
     workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
-    shards = pl.cast(workers, pl.INT32)
-    if panels > 100:
-        shards = pl.cast(
-            pl.max(workers, (run_count * panels + 99) // 100),
-            pl.INT32,
-        )
+    work_count = run_count * panels
+    shards = pl.cast(
+        pl.max(workers, (work_count + SCORE_SHARD_PANELS_TILE - 1) // SCORE_SHARD_PANELS_TILE),
+        pl.INT32,
+    )
     return _select_index_topk_sharded(scores, physical, lengths, runs, output, num_tokens, shards, completed, False)
 
 
