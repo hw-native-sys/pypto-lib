@@ -157,7 +157,7 @@ def decode_c1a_full(
         index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
         scores, topk_indices,
         num_tokens, index_ready, query_tid, weights_tid,
-        pl.tensor.dim(pool_block_ids, 1), False,
+        pl.tensor.dim(pool_block_ids, 1), False, request_ids, False,
     )
     pool_tid = select_candidate_block_pool(
         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,

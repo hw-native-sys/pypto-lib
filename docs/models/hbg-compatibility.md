@@ -24,7 +24,10 @@ checking the historical device-count and dependency fixes.
 The C1A decode component passed a single-card, 36-row golden under TMR
 and HBG on the prepared A5 toolchain. The port schedules the paged
 index plan and sparse-attention scratch initialization on the device.
-The EP2 full layer and EP4 Serving qualification remain separate.
+The C1A reuse golden also passed under both runtimes after moving the
+dense-versus-sparse decision to device-side predicates. The EP2 layer 1
+golden passed under TMR and HBG with the prepared toolchain. Full EP4
+Serving qualification remains open.
 
 Start with the current EP2 decode-layer golden under TMR and HBG. Validate
 any indexer fix, routed MoE workspace reuse, or communication wait change
