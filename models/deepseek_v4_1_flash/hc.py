@@ -16,7 +16,8 @@ import torch
 import torch.nn.functional as F
 from pypto.runtime import pto_isa_include_dir
 
-from config import FLASH as M, SP_T_DYN, T_DYN
+from config import FLASH as M, T_DYN
+
 
 
 # model config
@@ -31,22 +32,25 @@ NORM_EPS = M.rms_norm_eps
 
 # tiling
 MIX_PAD = 32
-HC_PAD = 8
 T_TILE = 8
 LINEAR_T_TILE = 16
 HF32_LINEAR_T_TILE = 80  # Matches M_TILE in kernels/hc_linear.cpp.
 SINKHORN_T_TILE = 6
+SINKHORN_WIDE_T_TILE = 16
 SINKHORN_WORKER_TILE = 12
 RMS_K_TILE = 1024
 LINEAR_OK = 4
 D_TILE = 2560
-PRE_T_TILE = 2
-HEAD_D_TILE = 5120
+PRE_T_TILE = 8
 PRE_NORM_T_TILE = 8
+PRE_NORM_STORE_T_TILE = 2
 POST_WORKER_TILE = 64
 
 
-@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "hc_linear.cpp",
+_KERNELS = Path(__file__).parent / "kernels"
+
+
+@pl.jit.extern(core_type="aic", source=_KERNELS / "hc_linear.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _hc_linear(
     x: pl.Tensor,
@@ -59,13 +63,14 @@ def _hc_linear(
     ...
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "hc_sinkhorn.cpp",
+@pl.jit.extern(core_type="aiv", source=_KERNELS / "hc_sinkhorn.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _hc_sinkhorn(
     partials: pl.Tensor, inv_rms: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
     pre_mix: pl.Out[pl.Tensor], post_mix: pl.Out[pl.Tensor], residual_mix: pl.Out[pl.Tensor],
     tokens: pl.Scalar[pl.INDEX], padded_rows: pl.Scalar[pl.INDEX],
     eps: pl.Scalar[pl.FP32], iterations: pl.Scalar[pl.INDEX],
+    row_tile: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Compute FP32 coefficients in a register-resident VF."""
     ...
@@ -76,14 +81,17 @@ def hc_sinkhorn(
     inv_rms: pl.Tensor, partials: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
     pre_mix: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
 ):
-    """Normalize six independent HC matrices per vector worker."""
+    """Normalize HC matrices in batches of up to sixteen rows."""
     tokens = pl.tensor.dim(pre_mix, 0)
     padded_rows = pl.tensor.dim(inv_rms, 0)
-    blocks = (tokens + SINKHORN_T_TILE - 1) // SINKHORN_T_TILE
+    row_tile = pl.cast(SINKHORN_T_TILE, pl.INDEX)
+    if tokens > SINKHORN_T_TILE * SINKHORN_WORKER_TILE:
+        row_tile = pl.cast(SINKHORN_WIDE_T_TILE, pl.INDEX)
+    blocks = (tokens + row_tile - 1) // row_tile
     workers = pl.min(blocks, SINKHORN_WORKER_TILE)
-    with pl.spmd(workers, name_hint="mhc_sinkhorn") as ready:
+    with pl.spmd(workers, name_hint="hc_sinkhorn") as ready:
         _hc_sinkhorn(partials, inv_rms, scale, base, pre_mix, post_mix, residual_mix,
-                     tokens, padded_rows, HC_EPS, HC_SINKHORN_ITER)
+                     tokens, padded_rows, HC_EPS, HC_SINKHORN_ITER, row_tile)
     return ready
 
 
@@ -97,7 +105,7 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     rms_blocks = (t_dim + T_TILE - 1) // T_TILE
     rms_workers = pl.max(pl.min(rms_blocks, rms_worker_limit), 1)
-    for worker in pl.spmd(rms_workers, name_hint="mhc_rms"):
+    for worker in pl.spmd(rms_workers, name_hint="hc_rms"):
         for block in pl.range(worker, rms_blocks, rms_workers):
             t0 = block * T_TILE
             valid_rows = pl.min(T_TILE, t_dim - t0)
@@ -119,10 +127,26 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
     tasks = ((t_dim + HF32_LINEAR_T_TILE - 1) // HF32_LINEAR_T_TILE) * LINEAR_OK
     workers = pl.min(tasks, pl.system.available_cluster_count())
-    with pl.spmd(workers, name_hint="mhc_linear"):
+    with pl.spmd(workers, name_hint="hc_linear"):
         _hc_linear(x_flat, function, mixes_partials, t_dim, t_linear)
 
     return inv_rms, mixes_partials
+
+
+@pl.jit.extern(core_type="aiv", source=_KERNELS / "hc_collapse.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _hc_collapse(
+    x: pl.Tensor,
+    pre_mix: pl.Tensor,
+    norm_weight: pl.Tensor,
+    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    collapsed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    rows: pl.Scalar[pl.INDEX],
+    active_rows: pl.Scalar[pl.INDEX],
+    mode: pl.Scalar[pl.INDEX],
+):
+    """Collapse streams; mode 1 normalizes, and mode 2 also stores raw BF16 rows."""
+    ...
 
 
 @pl.jit.inline
@@ -134,44 +158,14 @@ def hc_head(
 ):
     """Collapse HC streams with the delayed pre-mix and BF16 rounding."""
     t_dim = pl.tensor.dim(x_hc, 0)
-    x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
+    input_view = pl.reshape(x_hc, [t_dim, HC_MULT, D])
+    mix_view = pl.reshape(pre_mix, [t_dim, HC_MULT])
+    output_view = pl.reshape(output, [t_dim, D])
+    collapsed_view = pl.reshape(output, [t_dim, D])
     workers = pl.max(pl.min((t_dim + PRE_T_TILE - 1) // PRE_T_TILE, worker_limit), 1)
-    rows_per_worker = (t_dim + workers - 1) // workers
-    for block in pl.spmd(workers, name_hint="hc_collapse", allow_early_resolve=True):
-        for t in pl.range(block * rows_per_worker, pl.min((block + 1) * rows_per_worker, t_dim)):
-            pre_tile = pl.load(pre_mix, [t, 0], [1, HC_PAD], valid_shape=[1, HC_MULT])
-            pre0 = pl.tile.read(pre_tile, [0, 0])
-            pre1 = pl.tile.read(pre_tile, [0, 1])
-            pre2 = pl.tile.read(pre_tile, [0, 2])
-            pre3 = pl.tile.read(pre_tile, [0, 3])
-            for d0 in pl.pipeline(0, D, HEAD_D_TILE, stage=2):
-                x0 = pl.load(x_flat, [t, d0], [1, HEAD_D_TILE])
-                x1 = pl.load(x_flat, [t, D + d0], [1, HEAD_D_TILE])
-                x2 = pl.load(x_flat, [t, 2 * D + d0], [1, HEAD_D_TILE])
-                x3 = pl.load(x_flat, [t, 3 * D + d0], [1, HEAD_D_TILE])
-                y0 = pl.mul(x0, pre0)
-                y1 = pl.mul(x1, pre1)
-                y2 = pl.mul(x2, pre2)
-                y3 = pl.mul(x3, pre3)
-                y01 = pl.add(y0, y1)
-                y23 = pl.add(y2, y3)
-                y_tile = pl.add(y01, y23)
-                y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-                pl.store(y_bf16, [t, d0], output)
+    with pl.spmd(workers, name_hint="hc_collapse", allow_early_resolve=True):
+        _hc_collapse(input_view, mix_view, mix_view, output_view, collapsed_view, t_dim, t_dim, 0)
     return output
-
-
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "hc_collapse_norm.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def hc_collapse_norm(
-    x: pl.Tensor,
-    pre_mix: pl.Tensor,
-    norm_weight: pl.Tensor,
-    output: pl.Out[pl.Tensor],
-    rows: pl.Scalar[pl.INDEX],
-):
-    """Collapse and normalize eight HC rows with BF16 rounding."""
-    ...
 
 
 @pl.jit.inline(auto_scope=False)
@@ -185,30 +179,36 @@ def hc_head_norm(
     """Collapse eight HC rows and normalize their rounded BF16 values."""
     tokens = pl.tensor.dim(x_hc, 0)
     workers = pl.min((tokens + PRE_NORM_T_TILE - 1) // PRE_NORM_T_TILE, worker_limit)
+    input_view = pl.reshape(x_hc, [tokens, HC_MULT, D])
+    mix_view = pl.reshape(pre_mix, [tokens, HC_MULT])
+    output_view = pl.reshape(output, [tokens, D])
+    collapsed_view = pl.reshape(output, [tokens, D])
     with pl.spmd(workers, name_hint="hc_collapse_norm") as ready:
-        hc_collapse_norm(x_hc, pre_mix, norm_weight, output, tokens)
+        _hc_collapse(input_view, mix_view, norm_weight, output_view, collapsed_view, tokens, tokens, 1)
     return ready
 
 
-@pl.jit.inline
-def hc_pre(
+@pl.jit.inline(auto_scope=False)
+def hc_head_norm_store(
     x_hc: pl.Tensor,
-    incoming_pre_mix: pl.Tensor,
-    function: pl.Tensor,
-    scale: pl.Tensor,
-    base: pl.Tensor,
+    pre_mix: pl.Tensor,
+    norm_weight: pl.Tensor,
     output: pl.Tensor,
-    next_pre_mix: pl.Tensor,
-    post_mix: pl.Tensor,
-    residual_mix: pl.Tensor,
-    rms_worker_limit: pl.constexpr,
-    head_worker_limit: pl.constexpr,
+    collapsed: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    worker_limit: pl.constexpr,
 ):
-    """Generate delayed HC coefficients and collapse the incoming streams."""
-    inv_rms, partials = hc_project(x_hc, function, rms_worker_limit=rms_worker_limit)
-    mixes_ready = hc_sinkhorn(inv_rms, partials, scale, base, next_pre_mix, post_mix, residual_mix)
-    hc_head(x_hc, incoming_pre_mix, output, worker_limit=head_worker_limit)
-    return mixes_ready
+    """Collapse all rows, normalize active rows, and zero normalized padding."""
+    tokens = pl.tensor.dim(x_hc, 0)
+    active_rows = pl.max(pl.min(pl.cast(num_tokens, pl.INDEX), tokens), 0)
+    workers = pl.min((tokens + PRE_NORM_STORE_T_TILE - 1) // PRE_NORM_STORE_T_TILE, worker_limit)
+    input_view = pl.reshape(x_hc, [tokens, HC_MULT, D])
+    mix_view = pl.reshape(pre_mix, [tokens, HC_MULT])
+    output_view = pl.reshape(output, [tokens, D])
+    collapsed_view = pl.reshape(collapsed, [tokens, D])
+    with pl.spmd(workers, name_hint="hc_collapse_norm_store") as ready:
+        _hc_collapse(input_view, mix_view, norm_weight, output_view, collapsed_view, tokens, active_rows, 2)
+    return ready
 
 
 @pl.jit.inline
@@ -227,7 +227,7 @@ def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
                 x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "hc_post.cpp",
+@pl.jit.extern(core_type="aiv", source=_KERNELS / "hc_post.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _hc_post(
     sublayer: pl.Tensor, residual: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
@@ -254,49 +254,6 @@ def hc_post(
     return output
 
 
-@pl.jit.inline
-def prefill_sp_post(
-    sublayer: pl.Tensor[[SP_T_DYN, D], pl.BF16],
-    residual: pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32],
-    post_mix: pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32],
-    residual_mix: pl.Tensor[[SP_T_DYN, HC_MULT, HC_MULT], pl.FP32],
-    output: pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32],
-    next_pre_mix: pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32],
-    tp_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Run local mHC-post, writing active values and zero padding in one producer.
-
-    A later pure-output clear is not an ordering edge for the post task. Each
-    residual element is instead written exactly once, with hc_post's FP32
-    accumulation order and FP32 output.
-    """
-    tokens = pl.tensor.dim(residual, 0)
-    residual_flat = pl.reshape(residual, [tokens, HC_MULT * D])
-    mix_flat = pl.reshape(residual_mix, [tokens, HC_MULT * HC_MULT])
-    output_flat = pl.reshape(output, [tokens, HC_MULT * D])
-    for worker in pl.spmd(64, name_hint="sp_mhc_post"):
-        for block in pl.range(worker, tokens * HC_MULT, 64):
-            row = block // HC_MULT
-            out_h = block % HC_MULT
-            for col in pl.pipeline(0, D, 1024, stage=2):
-                value = pl.full([1, 1024], dtype=pl.FP32, value=0.0)
-                if tp_rank * tokens + row < num_tokens:
-                    hidden = pl.cast(sublayer[row:row + 1, col:col + 1024], pl.FP32)
-                    value = pl.mul(hidden, pl.read(post_mix, [row, out_h]))
-                    for in_h in pl.unroll(HC_MULT):
-                        lane = residual_flat[row:row + 1, in_h * D + col:in_h * D + col + 1024]
-                        value = pl.add(value, pl.mul(lane, pl.read(mix_flat, [row, in_h * HC_MULT + out_h])))
-                output_flat[row:row + 1, out_h * D + col:out_h * D + col + 1024] = value
-    active = pl.max(0, pl.min(tokens, num_tokens - tp_rank * tokens))
-    if active < tokens:
-        for worker in pl.spmd(32, name_hint="sp_mix_zero_padding"):
-            for row in pl.range(active + worker, tokens, 32):
-                zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
-                next_pre_mix[row:row + 1, :] = pl.set_validshape(zero_mix, 1, HC_MULT)
-    return output, next_pre_mix
-
-
 def _round_hf32(value: torch.Tensor) -> torch.Tensor:
     """Round finite FP32 values to E8M10, with halfway values away from zero."""
     bits = value.contiguous().view(torch.int32)
@@ -304,7 +261,7 @@ def _round_hf32(value: torch.Tensor) -> torch.Tensor:
     return torch.where(torch.isfinite(value), rounded, value)
 
 
-def golden_mhc_mixes(
+def golden_hc_mixes(
     x_hc: torch.Tensor,
     function: torch.Tensor,
     scale: torch.Tensor,
@@ -353,7 +310,7 @@ def golden_hc_post(
 
 def golden_l2_hc_pre(tensors):
     """Compute the four outputs with the incoming mix independent of the next mix."""
-    pre_mix, post_mix, residual_mix = golden_mhc_mixes(
+    pre_mix, post_mix, residual_mix = golden_hc_mixes(
         tensors["x_hc"], tensors["function"], tensors["scale"], tensors["base"],
     )
     tensors["pre_mix"][:] = pre_mix
@@ -379,7 +336,7 @@ HC_INPUT_NAMES = ("x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_bas
 
 
 def make_hc_inputs(tokens, seed, case):
-    """mHC inputs with distinct per-token magnitudes so both RMS statistics stay observable."""
+    """HC inputs with distinct per-token magnitudes so both RMS statistics stay observable."""
     gen = torch.Generator().manual_seed(seed)
     magnitudes = (0.5 + torch.arange(tokens) % 4).reshape(-1, 1, 1)
     x_hc = (torch.randn(tokens, HC_MULT, D, generator=gen) * magnitudes).bfloat16().float()
@@ -415,7 +372,9 @@ def l2_hc_pre(
     pre_mix.bind_dynamic(0, T_DYN)
     post_mix.bind_dynamic(0, T_DYN)
     residual_mix.bind_dynamic(0, T_DYN)
-    hc_pre(x_hc, incoming_pre_mix, function, scale, base, output, pre_mix, post_mix, residual_mix, rms_worker_limit=64, head_worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, function, rms_worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, scale, base, pre_mix, post_mix, residual_mix)
+    hc_head(x_hc, incoming_pre_mix, output, worker_limit=64)
     return output
 
 

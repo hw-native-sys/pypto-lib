@@ -11,16 +11,24 @@
 """DeepSeek V4.1 DSpark projection, metadata, and three-layer drafter."""
 
 from dataclasses import dataclass
+from pathlib import Path
 import inspect
 import pypto.language as pl
+
+from quant import unpack_quantized_cache
+from utils import packed_cache_compare
+
 import pypto.language.distributed as pld
 import torch
 
 import config as C
-from config import BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, PREFILL_MAX_TOKENS, TP_SIZE, TABLE_DYN
+from config import (
+    BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, PREFILL_MAX_TOKENS, TP_SIZE, TABLE_DYN,
+    WINDOW_CACHE_BYTES,
+)
 from o_proj import prefill_tp_output_all_reduce
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
-from hc import hc_head, hc_post, hc_pre, zero_bf16_padding
+from hc import hc_head, hc_head_norm, hc_post, hc_project, hc_sinkhorn, zero_bf16_padding
 from expert_routed import (
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
@@ -29,11 +37,13 @@ from expert_routed import (
 )
 from input_pack import pack_x_hc
 from utils import paged_slots
+from pypto.runtime import pto_isa_include_dir
 from decode_moe import AUX_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
 
 from dspark_attention import dspark_attention
-from dspark_context_kv import dspark_context_kv
-from hc import golden_hc_collapse, golden_hc_post, golden_mhc_mixes
+from dspark_context_kv import dspark_context_kv_quantized
+from qkv_proj_rope import quantize_projection_input
+from hc import golden_hc_collapse, golden_hc_post, golden_hc_mixes
 from config import (
     DSPARK_DRAFT_LAYERS,
     DSPARK_N_ROUTED_EXPERTS,
@@ -174,6 +184,18 @@ def golden_query_metadata(
     return DSparkQueryMetadata(token_ids, positions, query_slots, window_indices, window_lens)
 
 
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "dspark_projection.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _dspark_projection_native(
+    target_hidden: pl.Tensor,
+    main_proj_weight: pl.Tensor,
+    projected: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Project target taps directly into BF16 rows with Cube Fixpipe stores."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def dspark_proj(
     target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
@@ -185,19 +207,9 @@ def dspark_proj(
     """Project the ordered target taps and normalize only active token rows."""
     tokens = pl.tensor.dim(target_hidden, 0)
     projected = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    for block in pl.spmd((num_tokens + 15) // 16 * (D // 128), name_hint="dspark_main_proj"):
-        row = block // (D // 128) * 16
-        col = block % (D // 128) * 128
-        rows = pl.min(16, num_tokens - row)
-        acc = pl.create_tensor([16, 128], dtype=pl.FP32)
-        for k in pl.range(0, MAIN_IN, 256):
-            source = pl.slice(target_hidden, [16, 256], [row, k], valid_shape=[rows, 256])
-            weight = pl.slice(main_proj_weight, [256, 128], [k, col])
-            acc = pl.matmul_acc(acc, source, weight, init_cond=(k == 0))
-        projected[row : row + 16, col : col + 128] = pl.set_validshape(
-            pl.cast(acc, pl.BF16, mode="rint"), rows, 128
-        )
-    for block in pl.spmd((num_tokens + 7) // 8, name_hint="dspark_main_norm"):
+    with pl.spmd(32, name_hint="dspark_main_proj") as projected_ready:
+        projected = _dspark_projection_native(target_hidden, main_proj_weight, projected, num_tokens)
+    for block in pl.spmd((num_tokens + 7) // 8, name_hint="dspark_main_norm", deps=[projected_ready]):
         rms_norm_tiled(projected, main_norm_weight, main_x, block, num_tokens, output_fp32=False)
     return main_x
 
@@ -215,6 +227,22 @@ def dspark_proj_test(
     return dspark_proj(target_hidden, main_proj_weight, main_norm_weight, main_x, num_tokens)
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "dspark_metadata.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _dspark_metadata_native(
+    anchor_ids: pl.Tensor,
+    first_query_positions: pl.Tensor,
+    block_tables: pl.Tensor,
+    query_ids: pl.Out[pl.Tensor],
+    query_positions: pl.Out[pl.Tensor],
+    query_slots: pl.Out[pl.Tensor],
+    window_indices: pl.Out[pl.Tensor],
+    window_lens: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    """Publish draft query metadata from paged request tables."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def dspark_metadata(
     anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
@@ -227,49 +255,34 @@ def dspark_metadata(
     window_lens: pl.Tensor[[DSPARK_DRAFT_LAYERS, B_DYN], pl.INT32],
 ):
     batch = pl.tensor.dim(anchor_ids, 0)
-    for worker in pl.spmd(1, name_hint="dspark_query_metadata"):
-        for request_offset in pl.range(batch):
-            request = worker + request_offset
-            first = pl.read(first_query_positions, [request])
-            anchor = pl.read(anchor_ids, [request])
-            active = first > 0
-            prefix_start = pl.max(first - DSPARK_WINDOW, 0)
-            context_len = first - prefix_start
-            visible_len = pl.cast(context_len + DSPARK_QUERY_WIDTH, pl.INT32)
-            if not active:
-                visible_len = pl.cast(0, pl.INT32)
-            for offset in pl.range(DSPARK_QUERY_WIDTH):
-                token = request * DSPARK_QUERY_WIDTH + offset
-                token_id = pl.cast(0, pl.INT64)
-                if active:
-                    token_id = pl.cast(DSPARK_NOISE_TOKEN_ID, pl.INT64)
-                if active and offset == 0:
-                    token_id = anchor
-                pl.write(query_ids, [token], token_id)
-                position = pl.cast(0, pl.INT32)
-                if active:
-                    position = pl.cast(first + offset, pl.INT32)
-                pl.write(query_positions, [token], position)
-            for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                pl.write(window_lens, [layer, request], pl.cast(visible_len, pl.INT32))
-                for query in pl.range(DSPARK_QUERY_WIDTH):
-                    token = request * DSPARK_QUERY_WIDTH + query
-                    pl.write(query_slots, [layer, token], pl.cast(-1, pl.INT64))
-                for offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
-                    slot = pl.cast(-1, pl.INT32)
-                    if offset < visible_len:
-                        position = pl.cast(prefix_start + offset, pl.INT32)
-                        logical_block = position // BLOCK_SIZE
-                        physical_block = pl.read(
-                            block_tables, [layer, request, pl.cast(logical_block, pl.INDEX)]
-                        )
-                        slot = pl.cast(physical_block * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT32)
-                    for query in pl.range(DSPARK_QUERY_WIDTH):
-                        token = request * DSPARK_QUERY_WIDTH + query
-                        pl.write(window_indices, [layer, token, offset], slot)
-                        if active and offset == context_len + query:
-                            pl.write(query_slots, [layer, token], pl.cast(slot, pl.INT64))
+    workers = pl.max(1, pl.min(batch * DSPARK_DRAFT_LAYERS, 64))
+    with pl.spmd(workers, name_hint="dspark_query_metadata"):
+        query_ids = _dspark_metadata_native(
+            anchor_ids, first_query_positions, block_tables, query_ids, query_positions,
+            query_slots, window_indices, window_lens,
+        )
     return query_ids, query_positions, query_slots, window_indices, window_lens
+
+
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "dspark_pad_queries.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _dspark_pad_queries_native(
+    query_ids: pl.Tensor,
+    query_slots: pl.Tensor,
+    window_indices: pl.Tensor,
+    query_rope_cos: pl.Tensor,
+    query_rope_sin: pl.Tensor,
+    padded_ids: pl.Out[pl.Tensor],
+    padded_slots: pl.Out[pl.Tensor],
+    padded_indices: pl.Out[pl.Tensor],
+    rope_cos: pl.Out[pl.Tensor],
+    rope_sin: pl.Out[pl.Tensor],
+    pre_mix: pl.Out[pl.Tensor],
+    first_token: pl.Scalar[pl.INDEX],
+    active_tokens: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor]:
+    """Pack one query chunk and initialize its incoming HC coefficients."""
+    return padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix
 
 
 @pl.jit.inline
@@ -315,7 +328,6 @@ def draft_layer(
     window_slots: pl.Tensor,
     window_indices: pl.Tensor,
     window_cache: pl.Tensor,
-    window_cache_scale: pl.Tensor,
     hc_ffn_fn: pl.Tensor,
     hc_ffn_scale: pl.Tensor,
     hc_ffn_base: pl.Tensor,
@@ -352,19 +364,14 @@ def draft_layer(
     attention_epoch: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    """Run one V4.1 draft decoder layer with delayed mHC boundaries."""
-    attention_input = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+    """Run one V4.1 draft decoder layer with delayed HC boundaries."""
     normalized_attention = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     attention_pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     post_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([MOE_TOKENS, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_pre(
-        x_hc, incoming_pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base,
-        attention_input, attention_pre_mix, post_mix, residual_mix,
-        rms_worker_limit=64, head_worker_limit=64,
-    )
-    for block in pl.spmd((MOE_TOKENS + 7) // 8, name_hint="dspark_attn_norm"):
-        rms_norm_tiled(attention_input, attn_norm_weight, normalized_attention, block, MOE_TOKENS, output_fp32=False)
+    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, normalized_attention, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
     zero_bf16_padding(normalized_attention, num_tokens)
     attention_partial = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
     dspark_attention(
@@ -387,7 +394,6 @@ def draft_layer(
         window_slots,
         window_indices,
         window_cache,
-        window_cache_scale,
         attention_partial,
         num_tokens,
     )
@@ -444,7 +450,7 @@ def draft_layer(
         num_tokens,
         rank,
         moe_epoch,
-        force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
+        force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=64,
     )
     return x_next, next_pre_mix
 
@@ -483,12 +489,7 @@ def _dspark_drafter(
     wo_b: pl.Tensor[[DSPARK_DRAFT_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
     window_cache: pl.InOut[
-        pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]
-    ],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[
-            [DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // MX_GROUP], pl.BF16
-        ]
+        pl.Tensor[[DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]
     ],
     hc_ffn_fn: pl.Tensor[[DSPARK_DRAFT_LAYERS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[DSPARK_DRAFT_LAYERS, 3], pl.FP32],
@@ -555,7 +556,6 @@ def _dspark_drafter(
     block_tables.bind_dynamic(1, B_DYN)
     block_tables.bind_dynamic(2, TABLE_DYN)
     window_cache.bind_dynamic(1, C.ORI_BLOCKS_DYN)
-    window_cache_scale.bind_dynamic(1, C.ORI_BLOCKS_DYN)
     head_hidden.bind_dynamic(0, B_DYN)
     context_tokens = pl.tensor.dim(target_hidden, 0)
     batch = pl.tensor.dim(num_sampled, 0)
@@ -582,10 +582,16 @@ def _dspark_drafter(
         window_lens,
     )
 
+    context_payload, context_scales, context_padded_rows = quantize_projection_input(
+        main_x, context_tokens, row_tile=80,
+    )
     for layer in pl.unroll(DSPARK_DRAFT_LAYERS):
         layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[layer]
-        dspark_context_kv(
-            main_x,
+        context_projected = pl.create_tensor([context_tokens, HEAD_DIM], dtype=pl.BF16)
+        dspark_context_kv_quantized(
+            context_payload,
+            context_scales,
+            context_projected,
             wkv[layer],
             layer_wkv_scale,
             kv_norm_weight[layer],
@@ -593,7 +599,6 @@ def _dspark_drafter(
             context_rope_sin,
             context_slots[layer],
             window_cache[layer],
-            window_cache_scale[layer],
             context_tokens,
         )
 
@@ -607,36 +612,15 @@ def _dspark_drafter(
         )
         rope_cos = pl.create_tensor([MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
         rope_sin = pl.create_tensor([MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
-        for _ in pl.spmd(1, name_hint="dspark_pad_queries"):
-            for token in pl.range(MOE_TOKENS):
-                token_id = pl.cast(0, pl.INT64)
-                if token < active_tokens:
-                    source = first_token + token
-                    token_id = pl.read(query_ids, [source])
-                    rope_cos[token : token + 1, :] = query_rope_cos[source : source + 1, :]
-                    rope_sin[token : token + 1, :] = query_rope_sin[source : source + 1, :]
-                pl.write(padded_ids, [token], token_id)
-                for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                    slot = pl.cast(-1, pl.INT64)
-                    if token < active_tokens:
-                        slot = pl.read(query_slots, [layer, first_token + token])
-                    pl.write(padded_slots, [layer, token], slot)
-                    for offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
-                        index = pl.cast(-1, pl.INT32)
-                        if token < active_tokens:
-                            index = pl.read(window_indices, [layer, first_token + token, offset])
-                        pl.write(padded_indices, [layer, token, offset], index)
-
+        pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
+        with pl.spmd(64, name_hint="dspark_pad_queries"):
+            padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix = _dspark_pad_queries_native(
+                query_ids, query_slots, window_indices, query_rope_cos, query_rope_sin,
+                padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix,
+                first_token, active_tokens,
+            )
         x_hc = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
         pack_x_hc(padded_ids, embedding_weight, x_hc, hidden_tile=512)
-        pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
-        for _ in pl.spmd(1, name_hint="dspark_initial_pre_mix"):
-            for token in pl.range(MOE_TOKENS):
-                for lane in pl.range(HC_MULT):
-                    value = pl.cast(0.0, pl.FP32)
-                    if lane == 0:
-                        value = pl.cast(1.0, pl.FP32)
-                    pl.write(pre_mix, [token, lane], value)
 
         for layer in pl.unroll(DSPARK_DRAFT_LAYERS):
             layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[
@@ -697,7 +681,6 @@ def _dspark_drafter(
                 padded_slots[layer],
                 padded_indices[layer],
                 window_cache[layer],
-                window_cache_scale[layer],
                 hc_ffn_fn[layer],
                 hc_ffn_scale[layer],
                 hc_ffn_base[layer],
@@ -741,7 +724,7 @@ def _dspark_drafter(
         hc_head(x_hc, pre_mix, padded_head, worker_limit=64)
         for row in pl.spmd(active_tokens, name_hint="dspark_head_unpad"):
             flat_head_hidden[first_token + row : first_token + row + 1, :] = padded_head[row : row + 1, :]
-    return head_hidden, window_cache, window_cache_scale
+    return head_hidden, window_cache
 
 
 dspark_drafter = pl.jit.inline(auto_scope=False)(_dspark_drafter)
@@ -786,15 +769,7 @@ def l3_dspark_drafter(
     ],
     wo_b: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     wo_b_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0],
-    window_cache: pl.InOut[
-        pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]
-    ],
-    window_cache_scale: pl.InOut[
-        pl.Tensor[
-            [C.EP_SIZE, DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM // MX_GROUP],
-            pl.BF16,
-        ]
-    ],
+    window_cache: pl.InOut[pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, C.ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     hc_ffn_fn: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[C.EP_SIZE, DSPARK_DRAFT_LAYERS, MIX_HC], pl.FP32],
@@ -843,7 +818,6 @@ def l3_dspark_drafter(
     block_tables.bind_dynamic(2, B_DYN)
     block_tables.bind_dynamic(3, TABLE_DYN)
     window_cache.bind_dynamic(2, C.ORI_BLOCKS_DYN)
-    window_cache_scale.bind_dynamic(2, C.ORI_BLOCKS_DYN)
     head_hidden.bind_dynamic(1, B_DYN)
 
     attention_output_buf = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
@@ -903,7 +877,6 @@ def l3_dspark_drafter(
             wo_b[rank],
             wo_b_scale[rank],
             window_cache[rank],
-            window_cache_scale[rank],
             hc_ffn_fn[rank],
             hc_ffn_scale[rank],
             hc_ffn_base[rank],
@@ -1013,8 +986,12 @@ def build_drafter_specs():
             value[:, :, 0] = 32
             value[:, :, 1] = 33
             return value
-        if name in ("context_rope_cos", "query_rope_cos", "window_cache_scale"):
+        if name in ("context_rope_cos", "query_rope_cos"):
             return 1
+        if name == "window_cache":
+            value = torch.zeros(shape, dtype=torch.uint8)
+            value[..., HEAD_DIM:].view(torch.bfloat16).fill_(1.0)
+            return value
         if name == "target_hidden":
             return 0.25
         if name == "main_norm_weight":
@@ -1040,6 +1017,7 @@ def golden_dspark_drafter(tensors):
     """Reference the three zero-weight draft layers without calling device kernels."""
     from quant import quantize_mxfp8_cache
 
+    cache_payload, cache_factors = unpack_quantized_cache(tensors["window_cache"], False)
     batch = tensors["num_sampled"].shape[1]
     query_tokens = batch * DSPARK_QUERY_WIDTH
     for rank in range(EP_SIZE):
@@ -1054,7 +1032,7 @@ def golden_dspark_drafter(tensors):
         incoming_pre = torch.zeros(query_tokens, HC_MULT)
         incoming_pre[:, 0] = 1
         for layer in range(DSPARK_DRAFT_LAYERS):
-            _, post, residual = golden_mhc_mixes(
+            _, post, residual = golden_hc_mixes(
                 x_hc, tensors["hc_attn_fn"][rank, layer],
                 tensors["hc_attn_scale"][rank, layer], tensors["hc_attn_base"][rank, layer],
             )
@@ -1062,7 +1040,7 @@ def golden_dspark_drafter(tensors):
                 torch.zeros(query_tokens, D, dtype=torch.bfloat16), x_hc,
                 post, residual,
             ).float()
-            next_pre, moe_post, moe_residual = golden_mhc_mixes(
+            next_pre, moe_post, moe_residual = golden_hc_mixes(
                 attention_hidden, tensors["hc_ffn_fn"][rank, layer],
                 tensors["hc_ffn_scale"][rank, layer], tensors["hc_ffn_base"][rank, layer],
             )
@@ -1076,15 +1054,15 @@ def golden_dspark_drafter(tensors):
             valid_slots = slots[slots >= 0]
             if valid_slots.numel():
                 payload, scale = quantize_mxfp8_cache(torch.zeros(valid_slots.numel(), HEAD_DIM))
-                tensors["window_cache"][rank, layer].reshape(-1, HEAD_DIM)[valid_slots] = payload
-                tensors["window_cache_scale"][rank, layer].reshape(-1, HEAD_DIM // MX_GROUP)[valid_slots] = scale
+                cache_payload[rank, layer].reshape(-1, HEAD_DIM)[valid_slots] = payload
+                cache_factors[rank, layer].reshape(-1, HEAD_DIM // MX_GROUP)[valid_slots] = scale
             context_slots = tensors["context_slots"][rank, layer]
             active = context_slots >= 0
             rows = context_slots[active].long()
             if rows.numel():
                 context_payload, context_scale = quantize_mxfp8_cache(torch.zeros(rows.numel(), HEAD_DIM))
-                tensors["window_cache"][rank, layer].reshape(-1, HEAD_DIM)[rows] = context_payload
-                tensors["window_cache_scale"][rank, layer].reshape(-1, HEAD_DIM // MX_GROUP)[rows] = context_scale
+                cache_payload[rank, layer].reshape(-1, HEAD_DIM)[rows] = context_payload
+                cache_factors[rank, layer].reshape(-1, HEAD_DIM // MX_GROUP)[rows] = context_scale
 
         collapsed = golden_hc_collapse(x_hc, incoming_pre)
         tensors["head_hidden"][rank] = collapsed.reshape(batch, DSPARK_QUERY_WIDTH, D).to(torch.bfloat16)
@@ -1100,11 +1078,13 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=C.SUPPORTED_TP_SIZES)
     parser.add_argument("--dp", type=int, default=C.DP_SIZE)
     parser.add_argument("--ep", type=int, default=C.EP_SIZE, choices=C.SUPPORTED_EP_SIZES)
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
+    if args.execution_mode or args.platform == "a5sim":
+        parser.error("DSpark native kernels require A5 device execution; simulator support is unavailable")
     if (args.tp, args.dp, args.ep) != (C.TP_SIZE, C.DP_SIZE, C.EP_SIZE):
         parser.error("--tp/--dp/--ep must match the import-time configuration")
     if args.mode == "all":
@@ -1221,13 +1201,13 @@ if __name__ == "__main__":
             return nonzero and bool(close), f"nonzero={nonzero}, allclose={bool(close)}"
 
         def compare_cache(actual, expected, **_kwargs):
-            return bool(torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))), "cache payload"
+            return bool(torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))), "cache field storage"
 
         result = run(
             fn=l3_dspark_drafter,
             specs=build_drafter_specs(),
             golden_fn=golden_dspark_drafter,
-            compare_fn={"head_hidden": compare_head, "window_cache": compare_cache},
+            compare_fn={"head_hidden": compare_head, "window_cache": packed_cache_compare(compare_cache, compare_cache, fp4=False)},
             config={
                 "backend_type": "a5",
                 "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),

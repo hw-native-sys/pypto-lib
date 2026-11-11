@@ -7,10 +7,15 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
-"""C1A full decode attention with mHC."""
+"""C1A full decode attention with HC."""
 
+
+from utils import packed_cache_compare
 
 import pypto.language as pl
+
+from quant import pack_quantized_cache, unpack_quantized_cache
+
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_paged,
@@ -20,8 +25,8 @@ from o_proj import o_proj
 from sparse_attention import gather_sparse_attention
 from hc import hc_project, hc_sinkhorn, hc_head_norm, hc_post
 from config import (
-    LOCAL_T_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, WINDOW_CACHE_GROUP, FLASH as M, B_DYN,
-    CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN,
+    LOCAL_T_DYN, INDEX_CACHE_GROUP, FLASH as M, B_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN,
+    INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from compressor import C1A_PROJ_M_TILE, C1A_PROJ_N_TILE, c1a_compressor_project, c1a_compressor_publish
 
@@ -68,10 +73,8 @@ def decode_c1a_full(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
@@ -104,7 +107,7 @@ def decode_c1a_full(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens)
+    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens, row_tile=80)
     qr, query, qb_payload, qb_scales = q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
@@ -113,11 +116,16 @@ def decode_c1a_full(
         qr, query,
         num_tokens, qa_worker_limit=32, qb_worker_limit=32,
         padded_rows=proj_payload_padded_rows,
+        qa_row_tile=80, qb_row_tile=80,
     )
-    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=32)
+    kv_projection = kv_proj(
+        proj_payload, proj_scales,
+        wkv, wkv_scale,
+        kv_projection, num_tokens, worker_limit=32, row_tile=80,
+    )
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
-        window_slots, window_cache, window_cache_scale,
+        window_slots, window_cache,
         num_tokens, x_ready,
     )
     projected = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
@@ -128,7 +136,7 @@ def decode_c1a_full(
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     compressed_ready = c1a_compressor_publish(
         projected, compressor_norm_weight, latent, compressed_rope_cos, compressed_rope_sin,
-        compressed_slots, compressed_cache, compressed_cache_scale,
+        compressed_slots, compressed_cache,
         num_tokens, x_ready, pc_tid,
     )
     projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
@@ -158,11 +166,15 @@ def decode_c1a_full(
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
-        query, window_indices, window_cache, window_cache_scale, topk_indices, compressed_cache, compressed_cache_scale,
+        query, window_indices, window_cache, topk_indices, compressed_cache,
         attn_sink, attended, num_tokens, selection_ready, compressed_keys=INDEX_TOPK,
     )
     o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out, num_tokens, worker_limit=32,
+        attended,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin,
+        attn_out, num_tokens,
+        worker_limit=32, oa_row_tile=80, ob_row_tile=80,
     )
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
@@ -194,10 +206,8 @@ def l2_decode_c1a_full(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -238,7 +248,7 @@ def l2_decode_c1a_full(
         wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+        window_cache, compressed_cache,
         request_ids, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         compressed_rope_cos, compressed_rope_sin,
@@ -276,10 +286,8 @@ def l3_decode_c1a_full(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16]],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
     index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
@@ -327,7 +335,7 @@ def l3_decode_c1a_full(
         wo_a, wo_a_scale, wo_b, wo_b_scale_r,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+        window_cache, compressed_cache,
         request_ids, compressed_lens,
         index_cache, index_cache_scale, index_block_table,
         compressed_rope_cos, compressed_rope_sin,
@@ -342,7 +350,7 @@ def l3_decode_c1a_full(
 
 
 def golden_c1a(tensors, mode="full"):
-    """Compute mHC pre, C1A attention, cache updates, and mHC post."""
+    """Compute HC pre, C1A attention, cache updates, and HC post."""
     import torch
 
     from compressor import golden_c1a_compressor
@@ -358,12 +366,14 @@ def golden_c1a(tensors, mode="full"):
     )
     from utils import _publish_quantized_cache
 
-    from hc import golden_mhc_mixes, golden_hc_collapse, golden_hc_post
+    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
     from rmsnorm import golden_rms_norm
 
     a = dict(tensors)
+    a["window_cache"], a["window_cache_scale"] = unpack_quantized_cache(tensors["window_cache"], False, head_dim=tensors["kv_norm_weight"].numel())
+    a["compressed_cache"], a["compressed_cache_scale"] = unpack_quantized_cache(tensors["compressed_cache"], True, head_dim=tensors["kv_norm_weight"].numel())
     x_hc = a["x_hc"]
-    next_pre_mix, post_mix, residual_mix = golden_mhc_mixes(
+    next_pre_mix, post_mix, residual_mix = golden_hc_mixes(
         x_hc, a["hc_attn_fn"], a["hc_attn_scale"], a["hc_attn_base"],
     )
     attention_input = golden_hc_collapse(x_hc, a["pre_mix"]).to(torch.bfloat16)
@@ -420,8 +430,8 @@ def golden_c1a(tensors, mode="full"):
     hidden = golden_hc_post(output.to(torch.bfloat16), x_hc, post_mix, residual_mix)
     tensors["next_pre_mix"].copy_(next_pre_mix)
     for name, value in (
-        ("window_cache", window), ("window_cache_scale", window_scale),
-        ("compressed_cache", compressed), ("compressed_cache_scale", compressed_scale),
+        ("window_cache", pack_quantized_cache(window, window_scale)),
+        ("compressed_cache", pack_quantized_cache(compressed, compressed_scale)),
         ("index_cache", index), ("index_cache_scale", index_scale),
         ("state_cache", None), ("topk_indices", topk), ("candidate_mask", None),
         ("pool_block_ids", pool_block_ids), ("pool_block_counts", pool_block_counts),
@@ -440,7 +450,7 @@ def golden_c1a(tensors, mode="full"):
 def build_c1a_specs(
     mode, tokens, pages, requests=1, seed=17, case="random", start_pos=None, query_lens=None, *, param_names=None,
 ):
-    """Build C1A mHC, attention, cache, and runtime tensor specifications."""
+    """Build C1A HC, attention, cache, and runtime tensor specifications."""
     import torch
 
     from functools import partial
@@ -586,7 +596,7 @@ def build_c1a_specs(
     generator = torch.Generator().manual_seed(seed)
     local_tokens = tokens
     values["x_hc"] = torch.randn(local_tokens, HC_MULT, D, generator=generator)
-    # Incoming staggered mHC mix.
+    # Incoming staggered HC mix.
     values["pre_mix"] = torch.sigmoid(torch.randn(local_tokens, HC_MULT, generator=generator))
     values["hc_attn_fn"] = torch.randn(MIX_HC, HC_DIM, generator=generator) / math.sqrt(HC_DIM)
     values["hc_attn_scale"] = torch.randn(3, generator=generator)
@@ -595,6 +605,8 @@ def build_c1a_specs(
     values["attn_norm_weight"] = (torch.randn(D, generator=generator) * 0.1 + 1.0).to(torch.bfloat16)
     values["output"] = torch.zeros(local_tokens, HC_MULT, D, dtype=torch.float32)
     values["next_pre_mix"] = torch.zeros(local_tokens, HC_MULT, dtype=torch.float32)
+    values["window_cache"] = pack_quantized_cache(values["window_cache"], values.pop("window_cache_scale"))
+    values["compressed_cache"] = pack_quantized_cache(values["compressed_cache"], values.pop("compressed_cache_scale"))
     names = l3_decode_c1a_full.param_names if param_names is None else param_names
     specs = [
         TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=partial(torch.clone, values[name]))
@@ -615,7 +627,7 @@ if __name__ == "__main__":
 
     from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="TP1 A5 mHC C1A full validation")
+    parser = argparse.ArgumentParser(description="TP1 A5 HC C1A full validation")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
@@ -634,8 +646,6 @@ if __name__ == "__main__":
     parser.set_defaults(tokens=72, requests=12, pages=8, startpos=[8192] * 12)
     args = parser.parse_args()
     configure_decode_workload(args, parser)
-    if args.tokens != 72:
-        parser.error("this decode entry requires 72 query tokens")
     if args.startpos is not None:
         max_end = max(pos + length for pos, length in zip(args.startpos, args.query_lens))
         args.pages = (max_end + 127) // 128
@@ -668,29 +678,35 @@ if __name__ == "__main__":
             "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
-            "window_cache": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+            "window_cache": packed_cache_compare(
+                mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window_cache",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+                ),
+                mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window_cache_scale",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                ),
+                fp4=False,
             ),
-            "window_cache_scale": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
-            ),
-            "compressed_cache": mapped_fp4_cache_compare(
-                "compressed_slots", pool_name="compressed_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                max_error_ratio=0.005,
-            ),
-            "compressed_cache_scale": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="compressed_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+            "compressed_cache": packed_cache_compare(
+                mapped_fp4_cache_compare(
+                    "compressed_slots", pool_name="compressed_cache",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    max_error_ratio=0.005,
+                ),
+                mapped_pool_ratio_allclose(
+                    "compressed_slots", pool_name="compressed_cache_scale",
+                    mapping_shape=(args.tokens,),
+                    block_size=BLOCK_SIZE, leading_rank_axis=False,
+                    atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                ),
+                fp4=True,
             ),
             "index_cache": mapped_fp4_cache_compare(
                 "compressed_slots", pool_name="index_cache",

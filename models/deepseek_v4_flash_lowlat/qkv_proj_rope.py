@@ -34,9 +34,8 @@ T_DYN = pl.dynamic('LOWLAT_TARGET_T_DYN')  # T = B * S
 # model config
 D = M.hidden_size
 H = M.num_attention_heads
-# Attention is head-sharded: this card computes group `my_rank`'s heads
-# only. q / q_proj_i32 keep their full [.., H, ..] shape -- the other
-# groups' columns are simply never written, and never read.
+# Each call projects a contiguous head span. q / q_proj_i32 keep their full
+# [.., H, ..] shape; heads outside the span are never written or read.
 if M.o_groups <= 0 or H % M.o_groups:
     raise ValueError(f"Q projection requires H divisible by positive o_groups, got H={H}, o_groups={M.o_groups}")
 Q_HEADS_LOCAL = H // M.o_groups
@@ -229,6 +228,7 @@ def qkv_proj_rope(
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
     late_dep: pl.Scalar[pl.TASK_ID],
     q_head_base: pl.Scalar[pl.INT32],
+    q_head_count: pl.constexpr,
     q_rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     q_rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     q_rope_swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
@@ -325,7 +325,7 @@ def qkv_proj_rope(
     # One output-column fragment per task.
     q_col_base = pl.cast(q_head_base, pl.INDEX) * HEAD_DIM
     for qproj_n_idx in pl.spmd(
-        (Q_HEADS_LOCAL * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul", allow_early_resolve=True
+        (q_head_count * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul", allow_early_resolve=True
     ):
         w_col0 = q_col_base + qproj_n_idx * QPROJ_MM_N_TILE
         for tc in pl.range(t_matmul // QPROJ_M_TILE):
@@ -350,7 +350,7 @@ def qkv_proj_rope(
     # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
     for hg_idx in pl.spmd(
-        Q_HEADS_LOCAL // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True
+        q_head_count // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True
     ):
         hg = pl.cast(q_head_base, pl.INDEX) + hg_idx * Q_ROPE_H_TILE
         for tg_idx in pl.range((t_dim + Q_ROPE_T_TILE - 1) // Q_ROPE_T_TILE):
@@ -522,7 +522,7 @@ def qkv_proj_rope(
     return q
 
 
-# Head group this standalone entry exercises; the layer drivers pass my_rank * Q_HEADS_LOCAL.
+# Head group exercised by the standalone entry.
 TEST_Q_HEAD_BASE = 0
 
 
@@ -552,9 +552,7 @@ def qkv_proj_rope_test(
 
     # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
     late_dep = pl.system.task_dummy(deps=[])
-    # One card's head shard. The kernel is head-sharded and writes only
-    # q[:, q_head_base : q_head_base + Q_HEADS_LOCAL]; this entry models group 0,
-    # and the golden leaves the other groups' heads at their zero init.
+    # This entry exercises group 0 and writes only its Q_HEADS_LOCAL heads.
     t_dim = pl.tensor.dim(x, 0)
     q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
@@ -575,7 +573,7 @@ def qkv_proj_rope_test(
         qr,
         qr_scale,
         late_dep,
-        TEST_Q_HEAD_BASE, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
+        TEST_Q_HEAD_BASE, Q_HEADS_LOCAL, q_rope_cos_il, q_rope_sin_signed, q_rope_swap_idx,
     )
     return q
 

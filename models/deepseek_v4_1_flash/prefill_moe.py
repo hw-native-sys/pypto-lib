@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4.1 prefill MoE with compact TP owner rows and mHC."""
+"""DeepSeek-V4.1 prefill MoE with compact TP owner rows and HC."""
 
 import argparse
 from dataclasses import replace
@@ -47,15 +47,15 @@ from config import FLASH as M
 from config import EP_SIZE, TP_SIZE, SUPPORTED_EP_SIZES
 from config import MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
 from config import T_DYN, PREFILL_MAX_TOKENS, SUPPORTED_TP_SIZES
-from gate import gate_normalized as npu_gate
+from gate import gate_from_bf16
 from expert_shared import expert_shared
 from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
     expert_routed_scatter,
 )
-from hc import golden_mhc_mixes, golden_hc_collapse, golden_hc_post
-from hc import hc_head, hc_head_norm, hc_project, hc_sinkhorn, hc_post, hc_pre
-from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
+from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
+from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
+from rmsnorm import golden_rms_norm_tiled
 from o_proj import prefill_tp_output_all_reduce, retire_prefill_signals
 from input_pack import gather_rows
 from prefill_cp_allgather import prefill_cp_restore_hc
@@ -397,14 +397,13 @@ def prefill_moe(
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
-    """Run delayed mHC pre-mix, MoE, and residual expansion."""
+    """Run delayed HC pre-mix, MoE, and residual expansion."""
     t = MOE_TOKENS
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
-    ffn_input = pl.create_tensor([t, D], dtype=pl.BF16)
-    hc_head_norm(x_hc, pre_mix, norm_weight, ffn_input, worker_limit=24)
-    hc_head(x_hc, pre_mix, x_mixed, worker_limit=8)
-    inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=16)
+    ffn_input = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+    hc_head_norm_store(x_hc, pre_mix, norm_weight, ffn_input, x_mixed, num_tokens, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=64)
     mixes_ready = hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
 
     # MoE transport and routed-result scope.
@@ -420,7 +419,7 @@ def prefill_moe(
         x_norm_scale = pl.create_tensor([1, t * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         indices = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
         weights = pl.create_tensor([t, TOPK], dtype=pl.FP32)
-        npu_gate(
+        gate_from_bf16(
             ffn_input, gate_weight, correction_bias, num_tokens,
             x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
         )
@@ -780,7 +779,7 @@ def l3_prefill_moe(
     num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    """EP host driver for the mHC-wrapped Flash MoE block."""
+    """EP host driver for the HC-wrapped Flash MoE block."""
     recv_meta_buf = pld.alloc_window_buffer([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
     recv_scale_buf = pld.alloc_window_buffer([N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], dtype=pl.UINT8)
@@ -959,22 +958,13 @@ def prefill_moe_sublayer(
     tp_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ):
-    """Collapse mHC streams, normalize compact TP owner rows, and run the EP MoE."""
-    hc_pre(
-        x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        ffn_input, next_pre_mix, post_mix, residual_mix,
-        rms_worker_limit=64, head_worker_limit=64,
-    )
-    # Compact interleaved TP owner rows for the EP local-token ABI.
-    local_ffn_input = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-    _compact_local_tokens(ffn_input, local_ffn_input, num_tokens, tp_rank)
-    norm_tokens = pl.tensor.dim(local_ffn_input, 0)
+    """Collapse and normalize HC streams, compact TP owner rows, and run the EP MoE."""
+    ffn_normed = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
+    hc_head_norm_store(x_hc, pre_mix, ffn_norm_weight, ffn_normed, ffn_input, num_tokens, worker_limit=64)
+    inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
     local_ffn_normed = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-    norm_block_blocks = (norm_tokens + 7) // 8
-    norm_block_workers = pl.min(norm_block_blocks, 64)
-    for norm_block_worker in pl.spmd(norm_block_workers, name_hint="rms_norm"):
-        for norm_block in pl.range(norm_block_worker, norm_block_blocks, norm_block_workers):
-            rms_norm_tiled(local_ffn_input, ffn_norm_weight, local_ffn_normed, norm_block, norm_tokens, output_fp32=False)
+    _compact_local_tokens(ffn_normed, local_ffn_normed, num_tokens, tp_rank)
 
     local_num_tokens = _local_token_count(num_tokens, tp_rank)
     local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
@@ -988,7 +978,7 @@ def prefill_moe_sublayer(
         x_norm_scale = pl.create_tensor([1, TOKENS * (D // MX_GROUP)], dtype=pl.FP8E8M0)
         indices = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
         weights = pl.create_tensor([TOKENS, TOPK], dtype=pl.FP32)
-        npu_gate(
+        gate_from_bf16(
             local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
             x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
         )
@@ -1066,7 +1056,7 @@ def prefill_ffn_restore(
     num_tokens: pl.Scalar[pl.INT32],
     ffn_epoch: pl.Scalar[pl.INT32],
 ):
-    """Sum TP routed partials and expand the residual stream with mHC."""
+    """Sum TP routed partials and expand the residual stream with HC."""
     prefill_tp_output_all_reduce(
         ffn_owned, ffn_window, ffn_arrived, ffn_output, group_base, tp_rank, num_tokens, ffn_epoch,
     )
@@ -1200,7 +1190,7 @@ def _build_moe_tensor_specs(num_tokens: int = MOE_TOKENS):
 
 
 def build_tensor_specs(num_tokens: int = MOE_TOKENS):
-    """Build the default mHC+MoE integration fixture."""
+    """Build the default HC+MoE integration fixture."""
     import torch
     from golden.spec import TensorSpec
 
@@ -1230,7 +1220,7 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
     hc_ffn_scale = hc_ffn_scale.unsqueeze(0).expand(EP_SIZE, -1).contiguous()
     hc_ffn_base = hc_ffn_base.unsqueeze(0).expand(EP_SIZE, -1).contiguous()
 
-    mhc_specs = [
+    hc_specs = [
         TensorSpec(
             "x_hc", [EP_SIZE, MOE_TOKENS, HC_MULT, D],
             torch.float32, init_value=lambda: x_hc,
@@ -1255,9 +1245,9 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
     next_pre_mix_spec = TensorSpec('next_pre_mix', [EP_SIZE, MOE_TOKENS, HC_MULT], torch.float32)
     x_mixed_spec = TensorSpec('x_mixed', [EP_SIZE, MOE_TOKENS, D], torch.bfloat16)
     x_next_spec = TensorSpec('x_next', [EP_SIZE, MOE_TOKENS, HC_MULT, D], torch.float32)
-    # MoE ABI order: mHC inputs, weights, outputs, runtime inputs.
+    # MoE ABI order: HC inputs, weights, outputs, runtime inputs.
     output_specs = [next_pre_mix_spec, x_mixed_spec, x_next_spec]
-    specs = mhc_specs + common_specs + output_specs + runtime_specs
+    specs = hc_specs + common_specs + output_specs + runtime_specs
     for spec in specs:
         if spec.name in {
             "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
@@ -1345,8 +1335,6 @@ def _golden_moe_core(tensors):
     all_scale_logical = []
     all_shared = []
 
-    dummy_tid2eid = torch.zeros(M.vocab_size, TOPK, dtype=torch.int32)
-    dummy_input_ids = torch.zeros(MOE_TOKENS, dtype=torch.int64)
 
     for src in range(EP_SIZE):
         active = int(counts[src])
@@ -1360,10 +1348,7 @@ def _golden_moe_core(tensors):
             ),
             "gate_w": tensors["gate_weight"][src],
             "gate_bias": tensors["correction_bias"][src],
-            "layer_id": 0,
             "num_tokens": active,
-            "tid2eid": dummy_tid2eid,
-            "input_ids": dummy_input_ids,
             "x_norm_mx": x_norm_mx,
             "x_norm_scale": x_norm_scale,
             "indices": indices,
@@ -1462,7 +1447,7 @@ def _golden_moe_core(tensors):
 
 
 def golden_moe(tensors):
-    """Compose the validated mHC references around the MoE reference."""
+    """Compose the validated HC references around the MoE reference."""
     import torch
 
     x_hc = tensors["x_hc"]
@@ -1471,7 +1456,7 @@ def golden_moe(tensors):
     residual_mix = torch.zeros(EP_SIZE, MOE_TOKENS, HC_MULT, HC_MULT, dtype=torch.float32)
     x_mixed = torch.zeros(EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16)
     for rank in range(EP_SIZE):
-        pre, post, residual = golden_mhc_mixes(
+        pre, post, residual = golden_hc_mixes(
             x_hc[rank],
             tensors['hc_ffn_fn'][rank], tensors['hc_ffn_scale'][rank], tensors['hc_ffn_base'][rank],
         )
@@ -1483,7 +1468,7 @@ def golden_moe(tensors):
     tensors["next_pre_mix"][:] = next_pre_mix
     tensors["x_mixed"][:] = x_mixed
 
-    # Compose the MoE reference with mHC inputs and outputs.
+    # Compose the MoE reference with HC inputs and outputs.
     moe_tensors = dict(tensors)
     moe_tensors["x"] = x_mixed
     sublayer = torch.zeros(EP_SIZE, MOE_TOKENS, D, dtype=torch.bfloat16)
@@ -1496,7 +1481,7 @@ def golden_moe(tensors):
     tensors["x_next"][:] = x_next
 
 
-def _local_mhc_compare(num_tokens):
+def _local_hc_compare(num_tokens):
     """Compare the complete local-token output for every EP rank."""
     from golden.validation import ratio_reldiff
 
@@ -1563,7 +1548,7 @@ def _local_mhc_compare(num_tokens):
                     )
         return True, ""
 
-    compare.__name__ = f"local_mhc_compare(num_tokens={counts.tolist()})"
+    compare.__name__ = f"local_hc_compare(num_tokens={counts.tolist()})"
     return compare
 
 
@@ -1648,7 +1633,7 @@ if __name__ == "__main__":
         compare_fn = {
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "x_next": _local_mhc_compare(counts),
+            "x_next": _local_hc_compare(counts),
         }
 
     result = run(

@@ -43,6 +43,7 @@ the table below lists common entry points, not an exhaustive skill catalog.
 | Performance measurement or tuning | [Benchmarking rules](rules/benchmarking.md) and [performance guide](../docs/debug-and-tune/performance-tuning.md); use [perf](skills/perf/SKILL.md) to run a case and collect a chip swimlane or raw timing, or the matching tuning skill |
 | Cube tile tuning | [Cube tile tuning skill](skills/cube-tile-tuning/SKILL.md) |
 | In-core profiling | [In-core profiling skill](skills/incore-profiling/SKILL.md) |
+| Hardware utilization analysis | [Hardware utilization skill](skills/hw-util/SKILL.md) |
 | Precision debugging | [Precision guide](../docs/debug-and-tune/precision-tuning.md); use [precision bisect](skills/bisect-precision/SKILL.md) for a reproducible revision regression |
 | Compile/runtime failures or suspected upstream bugs | [Problem handling rules](rules/problem-handling.md) and [debugging guide](../docs/debug-and-tune/debugging.md) |
 | Commit, PR, review fixes, or issue creation | [Commit](skills/git-commit/SKILL.md), [PR](skills/github-pr/SKILL.md), [PR fixes](skills/fix-pr/SKILL.md), or [issue](skills/create-issue/SKILL.md) workflow |

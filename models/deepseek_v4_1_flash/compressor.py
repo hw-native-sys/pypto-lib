@@ -11,12 +11,13 @@
 from pathlib import Path
 
 import pypto.language as pl
+
 from pypto.runtime import pto_isa_include_dir
 import torch
 
 from config import (
-    FLASH as M, TP_SIZE, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN,
-    T_DYN, COMPRESSED_CACHE_GROUP, CMP_BLOCKS_DYN,
+    FLASH as M, TP_SIZE, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN, CMP_BLOCKS_DYN,
+    COMPRESSED_CACHE_BYTES,
 )
 from quant import unpack_bf16_nz
 from rmsnorm import golden_rms_norm
@@ -79,7 +80,6 @@ def _c1a_compress(
     source: pl.Tensor,
     slots: pl.Tensor,
     cache: pl.InOut[pl.Tensor],
-    scales: pl.InOut[pl.Tensor],
     cosine: pl.Tensor,
     sine: pl.Tensor,
     norm_weight: pl.Tensor,
@@ -98,8 +98,7 @@ def c1a_compressor_publish(
     cosine: pl.Tensor,
     sine: pl.Tensor,
     slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    scales: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
+    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
     source_ready: pl.Scalar[pl.TASK_ID],
@@ -108,7 +107,7 @@ def c1a_compressor_publish(
     active_tokens = pl.cast(num_tokens, pl.INT32)
     workers = pl.max(pl.min(active_tokens, 8), 1)
     with pl.spmd(workers, name_hint="c1a_compress", deps=[cache_ready, source_ready]) as published:
-        cache = _c1a_compress(source, slots, cache, scales, cosine, sine, norm_weight, latent, active_tokens)
+        cache = _c1a_compress(source, slots, cache, cosine, sine, norm_weight, latent, active_tokens)
     return published
 
 
@@ -181,7 +180,6 @@ def _c2a_compress(
     cosine: pl.Tensor,
     sine: pl.Tensor,
     cache: pl.InOut[pl.Tensor],
-    scales: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     num_state_blocks: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
@@ -205,8 +203,7 @@ def c2a_compressor_publish(
     cosine: pl.Tensor,
     sine: pl.Tensor,
     slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    scales: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
+    cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
 ):
     """Pool and publish rows with state reads and writes owned by physical block."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
@@ -261,7 +258,7 @@ def c2a_compressor_publish(
         _c2a_compress(
             kv_proj, score_proj, native_state, position_ids, norm_weight, latent,
             mapped_starts, mapped_requests, mapped_blocks,
-            slots, cosine, sine, cache, scales, active_tokens, native_count,
+            slots, cosine, sine, cache, active_tokens, native_count,
         )
     return completed
 
@@ -282,14 +279,13 @@ def c2a_state_feedback_test(
     latent: pl.InOut[pl.Tensor[[8, HEAD_DIM], pl.BF16]],
 ):
     """Validate the ring retained after a six-row speculative verification window."""
-    cache = pl.create_tensor([1, 128, 1, HEAD_DIM // 2], dtype=pl.UINT8)
-    scales = pl.create_tensor([1, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], dtype=pl.BF16)
+    cache = pl.create_tensor([1, 128, 1, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8)
     state_ready = pl.system.task_dummy(deps=[])
     state_table = pl.reshape(state_blocks, [8, 1])
     c2a_compressor_publish(
         kv, score, query_starts, positions, request_ids, state_table,
         state_cache, norm_weight, latent, pl.cast(6, pl.INT32), state_ready,
-        cosine, sine, slots, cache, scales,
+        cosine, sine, slots, cache,
     )
     return state_cache, latent
 

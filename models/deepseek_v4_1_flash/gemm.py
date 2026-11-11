@@ -43,10 +43,11 @@ def gemm_mxfp8_to_bf16(
     scale_row: pl.Scalar[pl.INDEX],
     payload_row: pl.Scalar[pl.INDEX],
     m_tile: pl.constexpr,
+    ready: pl.Scalar[pl.TASK_ID],
     max_workers: pl.constexpr = 2147483647,
     k_stages: pl.constexpr = 2,
 ):
-    """Project one prequantized row tile into BF16 output."""
+    """Project one prequantized row tile and return BF16 output and completion task."""
     scale_slice = activation_scale_backing[scale_row:scale_row + 1, :]
     activation_scale = pl.tensor.view(scale_slice, [m_tile, width // 32], layout=pl.MX_A_ZZ)
     scale_group_size = (width // 32) * output_width
@@ -57,7 +58,8 @@ def gemm_mxfp8_to_bf16(
     scale_group = pl.tensor.view(scale_group_backing, [width // 32, output_width], layout=pl.MX_B_NN)
     available_clusters = pl.system.available_cluster_count()
     workers = pl.min(pl.min(output_width // n_tile, max_workers), available_clusters)
-    for worker in pl.spmd(workers, name_hint=name_hint, sync_start=True):
+    with pl.spmd(workers, name_hint=name_hint, sync_start=True, deps=[ready]) as completed:
+        worker = pl.tile.get_block_idx()
         full_a = pl.load(payload, [payload_row, 0], [m_tile, width], target_memory=pl.MemorySpace.Mat)
         block_num = pl.tile.get_block_num()
         for wave in pl.range((output_width // n_tile + block_num - 1) // block_num):
@@ -70,7 +72,7 @@ def gemm_mxfp8_to_bf16(
                 else:
                     a0 = pl.load(payload, [payload_row, 0], [m_tile, k_tile])
                 sa0 = pl.load(activation_scale, [0, 0], [m_tile, k_tile // 32])
-                b0 = pl.load(weight, [weight_row, n0], [k_tile, n_tile])
+                b0 = pl.load(weight, [weight_row, n0], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
                 sb0 = pl.load(scale_group, [0, n0], [k_tile // 32, n_tile])
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
                 for k0 in pl.pipeline(k_tile, width, k_tile, stage=k_stages):
@@ -79,7 +81,7 @@ def gemm_mxfp8_to_bf16(
                     else:
                         a = pl.load(payload, [payload_row, k0], [m_tile, k_tile])
                     sa = pl.load(activation_scale, [0, k0 // 32], [m_tile, k_tile // 32])
-                    b = pl.load(weight, [weight_row + k0, n0], [k_tile, n_tile])
+                    b = pl.load(weight, [weight_row + k0, n0], [k_tile, n_tile], target_memory=pl.MemorySpace.Mat)
                     sb = pl.load(scale_group, [k0 // 32, n0], [k_tile // 32, n_tile])
                     acc = pl.matmul_mx_acc(acc, a, sa, b, sb)
                 output_n = output_col + n0
@@ -90,7 +92,7 @@ def gemm_mxfp8_to_bf16(
                     value = pl.cast(acc, pl.BF16, mode="rint")
                     valid_bf16 = pl.set_validshape(value, rows, n_tile)
                     output = pl.store(valid_bf16, [t0, output_n], output)
-    return output
+    return output, completed
 
 
 @pl.jit.inline(auto_scope=False)
@@ -120,7 +122,9 @@ def gemm_bf16_via_mxfp8_to_bf16_staged(
             quant_chunks = 1
             if group_count > 1 and width % (2 * MX_K_TILE) == 0:
                 quant_chunks = 2
-            for block in pl.spmd(width // (MX_K_TILE * quant_chunks), name_hint=quant_name):
+            quant_workers = width // (MX_K_TILE * quant_chunks)
+            with pl.spmd(quant_workers, name_hint=quant_name) as quantized_tid:
+                block = pl.tile.get_block_idx()
                 rows = pl.min(MX_M_TILE, num_tokens - t0)
                 for chunk in pl.unroll(2):
                     if chunk == 0 or (group_count > 1 and width % (2 * MX_K_TILE) == 0):
@@ -131,11 +135,13 @@ def gemm_bf16_via_mxfp8_to_bf16_staged(
                         scale_offset = k0 // MX_K_TILE * MX_M_TILE * (MX_K_TILE // 32)
                         packed_flat = pl.reshape(packed_scale, [1, MX_M_TILE * (MX_K_TILE // 32)])
                         scale_backing = pl.store(packed_flat, [0, scale_offset], scale_backing)
-            output = gemm_mxfp8_to_bf16(
+            projected_output, projection_completed = gemm_mxfp8_to_bf16(
                 payload, scale_backing, weight_flat, scale, output, num_tokens,
                 t0, group * width, group * output_width,
-                width, output_width, name_hint, n_tile, k_tile,  group_count, 0, 0, MX_M_TILE, max_workers, 2,
+                width, output_width, name_hint, n_tile, k_tile,
+                group_count, 0, 0, MX_M_TILE, quantized_tid, max_workers, 2,
             )
+            output = projected_output
     return output
 
 

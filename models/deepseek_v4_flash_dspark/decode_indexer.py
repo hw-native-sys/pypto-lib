@@ -842,7 +842,9 @@ def indexer_score_topk_forest(
             qh_quant_tid, weights_tid, cache_write_tid, stream_leaves,
         )
     else:
-        score_workers = pl.min(TOPK_SCORE_WORKERS, pl.system.available_cluster_count())
+        score_leaves = pl.max((pl.min(max_topk_cache_len, TOPK_MAX_CANDIDATES) + TOPK_CANDIDATES_PER_LEAF - 1) // TOPK_CANDIDATES_PER_LEAF, 1)
+        score_items = pl.tensor.dim(position_ids, 0) // SCORE_QUERY_TILE * score_leaves
+        score_workers = pl.min(pl.min(TOPK_SCORE_WORKERS, pl.system.available_cluster_count()), score_items)
         with pl.spmd(
             score_workers,
             name_hint="indexer_score_topk_leaf",
@@ -1021,7 +1023,8 @@ def indexer_score_topk_forest(
 
     with pl.scope():
         if max_topk_cache_len <= TOPK_CANDIDATES_PER_LEAF:
-            with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_topk_single_leaf_publish", deps=[score_tid], allow_early_resolve=True):
+            single_leaf_query_workers = pl.min(TOPK_QUERY_WORKERS, pl.tensor.dim(position_ids, 0))
+            with pl.spmd(single_leaf_query_workers, name_hint="indexer_topk_single_leaf_publish", deps=[score_tid], allow_early_resolve=True):
                 indexer_topk_single_leaf_publish(position_ids, kv_seq_lens, score_arena, topk_scores, topk_idxs)
         elif stream_score > 0:
             with pl.spmd(TOPK_QUERY_WORKERS, name_hint="indexer_topk_query_merge", deps=[score_tid], allow_early_resolve=True):
@@ -1129,8 +1132,9 @@ def indexer_qr_hadamard_mm(
 
     # Query Hadamard FP32 intermediate.
     qh_acc_gm = pl.create_tensor([bs_heads, IDX_HEAD_DIM], dtype=pl.FP32)
+    qh_active_workers = pl.min(QH_WORKERS, bs_heads // QH_MM_TILE)
     with pl.spmd(
-        QH_WORKERS, name_hint="qr_hadamard_matmul", deps=[qh_mm_dep],
+        qh_active_workers, name_hint="qr_hadamard_matmul", deps=[qh_mm_dep],
         allow_early_resolve=True,
     ) as qh_mm_tid:
         qh_worker = pl.tile.get_block_idx()
@@ -1141,13 +1145,14 @@ def indexer_qr_hadamard_mm(
             qh_acc = pl.matmul(qr_bf16[o0 : o0 + QH_MM_TILE, :], qh_hadamard, out_dtype=pl.FP32)
             qh_acc_gm[o0 : o0 + QH_MM_TILE, :] = qh_acc
 
+    qh_quant_units = (bs_heads + QH_QUANT_TILE - 1) // QH_QUANT_TILE
+    qh_quant_active_workers = pl.min(QH_QUANT_WORKERS, qh_quant_units)
     with pl.spmd(
-        QH_QUANT_WORKERS,
+        qh_quant_active_workers,
         name_hint="qr_hadamard_quant",
         allow_early_resolve=True,
     ) as qh_quant_tid:
         qh_quant_worker = pl.tile.get_block_idx()
-        qh_quant_units = (bs_heads + QH_QUANT_TILE - 1) // QH_QUANT_TILE
         for idx in pl.range(qh_quant_worker, qh_quant_units, QH_QUANT_WORKERS):
             o0 = idx * QH_QUANT_TILE
             qh_rows = pl.min(QH_QUANT_TILE, bs_heads - o0)
@@ -1233,8 +1238,9 @@ def indexer_weights_score(
     weights = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
     weights_partial = pl.create_tensor([WEIGHTS_OK * T_PAD, IDX_N_HEADS], dtype=pl.FP32)
     # Caller-ordered weights projection.
+    active_weights_workers = pl.min(weights_workers, WEIGHTS_OK * row_blocks)
     with pl.spmd(
-        weights_workers, name_hint="weights_proj", deps=[weights_gate_dep], allow_early_resolve=True
+        active_weights_workers, name_hint="weights_proj", deps=[weights_gate_dep], allow_early_resolve=True
     ) as _weights_tid:
         # Weight reads bypass L2.
         pl.set_cache_policy(weights_proj, pl.CachePolicy.BYPASS)
@@ -1296,7 +1302,9 @@ def indexer_weights_score(
         # One block-diagonal weight matrix per query pair: token t occupies row t
         # and the head block [t*IDX_N_HEADS, (t+1)*IDX_N_HEADS), everything else
         # zero, so a single matmul reduces both tokens of the pair.
-        for w_pair in pl.unroll(MM_ROW_TILE // SCORE_QUERY_TILE):
+        w_active_rows = pl.min(MM_ROW_TILE, bs - w_r0)
+        w_active_pairs = (w_active_rows + SCORE_QUERY_TILE - 1) // SCORE_QUERY_TILE
+        for w_pair in pl.range(w_active_pairs):
             w_pair_row = (w_r0 // SCORE_QUERY_TILE + w_pair) * MM_ROW_TILE
             if stream_score == 0:
                 pl.tile.store(

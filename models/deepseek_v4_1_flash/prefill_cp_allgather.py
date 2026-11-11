@@ -20,7 +20,7 @@ HC_DIM = M.hc_dim
 HC_MULT = M.hc_mult
 
 # Tiling.
-D_TILE = D
+SP_GATHER_ROW_TILE = 16
 
 
 @pl.jit.inline(auto_scope=False)
@@ -34,7 +34,7 @@ def prefill_sp_input_allgather(
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
-    """Gather contiguous token shards and zero the inactive global rows."""
+    """Push token shards into global-row receive slots and gather from the local window."""
     local_tokens = pl.tensor.dim(local_hidden, 0)
     tokens = pl.tensor.dim(hidden, 0)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_gather_reuse", allow_early_resolve=False) as reuse_tid:
@@ -46,9 +46,19 @@ def prefill_sp_input_allgather(
     with pl.spmd(64, name_hint="sp_gather_publish", deps=[reuse_tid]) as copied_tid:
         worker = pl.tile.get_block_idx()
         active = pl.max(0, pl.min(local_tokens, num_tokens - tp_rank * local_tokens))
-        for row in pl.range(worker, active, 64):
-            publish_value = pl.load(local_hidden, [row, 0], [1, D])
-            pld.tile.remote_store(publish_value, input_window, peer=group_base + tp_rank, offsets=[row, 0])
+        for block in pl.range(worker, (active + SP_GATHER_ROW_TILE - 1) // SP_GATHER_ROW_TILE, 64):
+            row = block * SP_GATHER_ROW_TILE
+            target_row = tp_rank * local_tokens + row
+            if row + SP_GATHER_ROW_TILE <= active:
+                publish_value = pl.load(local_hidden, [row, 0], [SP_GATHER_ROW_TILE, D])
+                for peer in pl.range(TP_SIZE):
+                    pld.tile.remote_store(publish_value, input_window, group_base + peer, [target_row, 0])
+            else:
+                for tail in pl.range(row, active):
+                    tail_publish = pl.load(local_hidden, [tail, 0], [1, D])
+                    for peer in pl.range(TP_SIZE):
+                        target_tail = tp_rank * local_tokens + tail
+                        pld.tile.remote_store(tail_publish, input_window, group_base + peer, [target_tail, 0])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_gather_notify", deps=[copied_tid]) as publish_tid:
         for peer in pl.range(TP_SIZE):
             pld.system.notify(
@@ -61,20 +71,19 @@ def prefill_sp_input_allgather(
             pld.system.wait(input_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1, cmp=pld.WaitCmp.Ge)
     with pl.spmd(64, name_hint="sp_gather_copy", deps=[wait_tid]) as copy_tid:
         worker = pl.tile.get_block_idx()
-        for tile in pl.range(worker, tokens * (D // D_TILE), 64):
-            row = tile // (D // D_TILE)
-            col = tile % (D // D_TILE) * D_TILE
-            if row < num_tokens:
-                source = row // local_tokens
-                source_row = row % local_tokens
-                value = pld.tile.remote_load(
-                    input_window,
-                    peer=group_base + source, offsets=[source_row, col], shape=[1, D_TILE],
-                )
-                hidden = pl.store(value, [row, col], hidden)
+        local_peer = group_base + tp_rank
+        for block in pl.range(worker, (tokens + SP_GATHER_ROW_TILE - 1) // SP_GATHER_ROW_TILE, 64):
+            row = block * SP_GATHER_ROW_TILE
+            if row + SP_GATHER_ROW_TILE <= num_tokens:
+                value = pld.tile.remote_load(input_window, local_peer, [row, 0], [SP_GATHER_ROW_TILE, D])
+                hidden = pl.store(value, [row, 0], hidden)
             else:
-                zero = pl.tile.full([1, D_TILE], dtype=pl.BF16, value=0.0)
-                hidden = pl.store(zero, [row, col], hidden)
+                for tail in pl.range(row, pl.min(row + SP_GATHER_ROW_TILE, tokens)):
+                    if tail < num_tokens:
+                        tail_value = pld.tile.remote_load(input_window, local_peer, [tail, 0], [1, D])
+                    else:
+                        tail_value = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+                    hidden = pl.store(tail_value, [tail, 0], hidden)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_gather_release", deps=[copy_tid]) as release_tid:
         for peer in pl.range(TP_SIZE):
             pld.system.notify(
@@ -82,12 +91,12 @@ def prefill_sp_input_allgather(
                 peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
             )
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_gather_consumed", deps=[release_tid],
-               allow_early_resolve=False):
+               allow_early_resolve=False) as consumed_tid:
         for peer in pl.range(TP_SIZE):
             pld.system.wait(input_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
         anchor = pl.read(hidden, [0, 0])
         pl.write(hidden, [0, 0], anchor)
-    return hidden
+    return hidden, consumed_tid
 
 
 @pl.jit.inline(auto_scope=False)

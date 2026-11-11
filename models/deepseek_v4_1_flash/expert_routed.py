@@ -177,47 +177,52 @@ def push_dispatch_payload(
     input_ready: pl.Scalar[pl.TASK_ID],
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     topk: pl.constexpr = TOPK,
+    dispatch_worker_limit: pl.constexpr = 0,
 ):
     """Send each expert lane directly from FP8 inputs and paired MX scale tiles."""
     workers = EP_WORLD_SIZE * local_experts
-    with pl.spmd(workers, name_hint="dispatch_push", deps=[input_ready], allow_early_resolve=False) as ready:
-        block = pl.tile.get_block_idx()
-        peer = block // local_experts
-        expert = block % local_experts
+    worker_tile = workers
+    if dispatch_worker_limit > 0:
+        worker_tile = pl.min(workers, dispatch_worker_limit)
+    with pl.spmd(worker_tile, name_hint="dispatch_push", deps=[input_ready], allow_early_resolve=False) as ready:
+        core = pl.tile.get_block_idx()
         active = pl.min(pl.max(pl.cast(num_tokens, pl.INDEX), 0), MOE_TOKENS)
-        base = expert * RECV_MAX + rank * MOE_TOKENS
         ids = pl.load(indices, [0, 0], [MOE_TOKENS, 8], valid_shape=[MOE_TOKENS, topk])
         route_weights = pl.load(weights, [0, 0], [MOE_TOKENS, 8], valid_shape=[MOE_TOKENS, topk])
-        weight_lane = pl.tile.full([MOE_TOKENS, 8], dtype=pl.FP32, value=0.0)
-        route_lane = pl.tile.full([MOE_TOKENS, 8], dtype=pl.INT32, value=0)
-        cursor = pl.array.create(1, pl.INT32)
-        cursor[0] = 0
-        for batch in pl.range((active + 15) // 16):
-            first = batch * 16
-            scales = pl.load(packed_scale, [0, first * K_SCALE], [1, 16 * K_SCALE])
-            scale_bytes = pl.reinterpret_view(scales, pl.UINT8)
-            pairs = pl.reinterpret_view(scale_bytes, pl.UINT16, shape=[K_SCALE // 2, 16])
-            pairs_nd = pl.transpose(pairs, 0, 1)
-            bytes_nd = pl.reinterpret_view(pairs_nd, pl.UINT8, shape=[16, K_SCALE])
-            for token in pl.range(first, pl.min(first + 16, active)):
-                for top in pl.range(topk):
-                    eid = pl.tile.read(ids, [token, top])
-                    if eid == block:
-                        slot = cursor[0]
-                        cursor[0] = slot + 1
-                        row = base + slot
-                        values = pl.load(payload, [token, 0], [1, D])
-                        value_bytes = pl.reinterpret_view(values, pl.INT8)
-                        pld.tile.remote_store(value_bytes, target=recv_x, peer=peer, offsets=[row, 0])
-                        scale_row = pl.slice(bytes_nd, [1, K_SCALE], [token - first, 0])
-                        pld.tile.remote_store(scale_row, target=recv_scale, peer=peer, offsets=[row, 0])
-                        value = pl.tile.read(route_weights, [token, top])
-                        pl.tile.write(weight_lane, [slot, 0], value)
-                        route = pl.cast(token * topk + top, pl.INT32)
-                        pl.tile.write(route_lane, [slot, 0], route)
-        pl.tile.write(route_lane, [0, 1], cursor[0])
-        pld.tile.remote_store(weight_lane, target=recv_weights, peer=peer, offsets=[base, 0])
-        pld.tile.remote_store(route_lane, target=recv_routes, peer=peer, offsets=[base, 0])
+        for block in pl.range(core, workers, worker_tile):
+            peer = block // local_experts
+            expert = block % local_experts
+            base = expert * RECV_MAX + rank * MOE_TOKENS
+            weight_lane = pl.tile.full([MOE_TOKENS, 8], dtype=pl.FP32, value=0.0)
+            route_lane = pl.tile.full([MOE_TOKENS, 8], dtype=pl.INT32, value=0)
+            cursor = pl.array.create(1, pl.INT32)
+            cursor[0] = 0
+            for batch in pl.range((active + 15) // 16):
+                first = batch * 16
+                scales = pl.load(packed_scale, [0, first * K_SCALE], [1, 16 * K_SCALE])
+                scale_bytes = pl.reinterpret_view(scales, pl.UINT8)
+                pairs = pl.reinterpret_view(scale_bytes, pl.UINT16, shape=[K_SCALE // 2, 16])
+                pairs_nd = pl.transpose(pairs, 0, 1)
+                bytes_nd = pl.reinterpret_view(pairs_nd, pl.UINT8, shape=[16, K_SCALE])
+                for token in pl.range(first, pl.min(first + 16, active)):
+                    for top in pl.range(topk):
+                        eid = pl.tile.read(ids, [token, top])
+                        if eid == block:
+                            slot = cursor[0]
+                            cursor[0] = slot + 1
+                            row = base + slot
+                            values = pl.load(payload, [token, 0], [1, D])
+                            value_bytes = pl.reinterpret_view(values, pl.INT8)
+                            pld.tile.remote_store(value_bytes, target=recv_x, peer=peer, offsets=[row, 0])
+                            scale_row = pl.slice(bytes_nd, [1, K_SCALE], [token - first, 0])
+                            pld.tile.remote_store(scale_row, target=recv_scale, peer=peer, offsets=[row, 0])
+                            value = pl.tile.read(route_weights, [token, top])
+                            pl.tile.write(weight_lane, [slot, 0], value)
+                            route = pl.cast(token * topk + top, pl.INT32)
+                            pl.tile.write(route_lane, [slot, 0], route)
+            pl.tile.write(route_lane, [0, 1], cursor[0])
+            pld.tile.remote_store(weight_lane, target=recv_weights, peer=peer, offsets=[base, 0])
+            pld.tile.remote_store(route_lane, target=recv_routes, peer=peer, offsets=[base, 0])
     return ready
 
 
@@ -244,12 +249,14 @@ def dispatch(
     moe_epoch: pl.Scalar[pl.INT32],
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     topk: pl.constexpr = TOPK,
+    dispatch_worker_limit: pl.constexpr = 0,
 ):
     stage_anchor = pl.system.task_dummy(deps=[])
     _push_tid = push_dispatch_payload(
         indices, x_norm_mx, x_norm_scale, weights,
         recv_x, recv_scale, recv_weights, recv_routes,
         num_tokens, my_rank, stage_anchor, local_experts=local_experts, topk=topk,
+        dispatch_worker_limit=dispatch_worker_limit,
     )
     # Publish one epoch only after every local payload store completes.
     with pl.at(

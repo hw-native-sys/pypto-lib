@@ -6,7 +6,7 @@
 // INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
-// FP32 HC coefficients with four register-resident Sinkhorn rows.
+// FP32 HC coefficients with compile-time row tiling.
 #include <cstdint>
 #if defined(__CPU_SIM)
 #include <algorithm>
@@ -18,10 +18,12 @@
 
 using namespace pto;
 namespace {
-constexpr int ROWS = 6;
+template <int ROWS>
 using Input = Tile<TileType::Vec, float, ROWS, 32, BLayout::RowMajor, DYNAMIC, 32>;
 using Small = Tile<TileType::Vec, float, 1, 32, BLayout::RowMajor, 1, DYNAMIC>;
+template <int ROWS>
 using Output = Tile<TileType::Vec, float, ROWS, 8, BLayout::RowMajor, DYNAMIC, 4>;
+template <int ROWS>
 using Comb = Tile<TileType::Vec, float, ROWS, 16, BLayout::RowMajor, DYNAMIC, 16>;
 
 __aicore__ inline __gm__ float* data(__gm__ int64_t* args, int index) {
@@ -30,10 +32,11 @@ __aicore__ inline __gm__ float* data(__gm__ int64_t* args, int index) {
 }
 
 #if defined(__DAV_VEC__)
+template <int ROWS>
 __tf__ __aicore__ inline void coefficients(
-    Output::TileDType __out__ pre, Output::TileDType __out__ post, Comb::TileDType __out__ comb,
-    Input::TileDType __in__ p0, Input::TileDType __in__ p1,
-    Input::TileDType __in__ p2, Input::TileDType __in__ p3,
+    typename Output<ROWS>::TileDType __out__ pre, typename Output<ROWS>::TileDType __out__ post, typename Comb<ROWS>::TileDType __out__ comb,
+    typename Input<ROWS>::TileDType __in__ p0, typename Input<ROWS>::TileDType __in__ p1,
+    typename Input<ROWS>::TileDType __in__ p2, typename Input<ROWS>::TileDType __in__ p3,
     Small::TileDType __in__ inverse, Small::TileDType __in__ bias,
     Small::TileDType __in__ scales, uint16_t rows, float eps, uint16_t iterations) {
     auto a0 = (__ubuf__ float*)__cce_get_tile_ptr(p0);
@@ -329,14 +332,15 @@ __tf__ __aicore__ inline void coefficients(
 #endif
 }
 
+template <int ROWS>
 __aicore__ inline void sinkhorn(__gm__ int64_t* args) {
     const int tokens = args[7];
     const int padded = args[8];
     const float eps = *reinterpret_cast<__gm__ float*>(&args[9]);
     const int iterations = args[10];
     Small bias(24), scales(3);
-    TASSIGN(bias, 4224);
-    TASSIGN(scales, 4352);
+    TASSIGN(bias, ROWS == 6 ? 4224 : 8320);
+    TASSIGN(scales, ROWS == 6 ? 4352 : 8448);
     using SShape = TileShape2D<float, 1, DYNAMIC>;
     using SStride = BaseShape2D<float, 1, DYNAMIC>;
     GlobalTensor<float, SShape, SStride> bg(data(args, 3), SShape(1, 24), SStride(1, 24));
@@ -346,17 +350,17 @@ __aicore__ inline void sinkhorn(__gm__ int64_t* args) {
     for (int start = get_block_idx(args) * ROWS; start < tokens; start += get_block_num(args) * ROWS) {
         int rows = tokens - start < ROWS ? tokens - start : ROWS;
         Small inverse(rows);
-        TASSIGN(inverse, 4096);
-        Input p0(rows), p1(rows), p2(rows), p3(rows);
-        Output pre(rows), post(rows);
-        Comb comb(rows);
+        TASSIGN(inverse, ROWS == 6 ? 4096 : 8192);
+        Input<ROWS> p0(rows), p1(rows), p2(rows), p3(rows);
+        Output<ROWS> pre(rows), post(rows);
+        Comb<ROWS> comb(rows);
         TASSIGN(p0, 0);
-        TASSIGN(p1, 768);
-        TASSIGN(p2, 1536);
-        TASSIGN(p3, 2304);
-        TASSIGN(pre, 4608);
-        TASSIGN(post, 4864);
-        TASSIGN(comb, 5120);
+        TASSIGN(p1, ROWS == 6 ? 768 : 2048);
+        TASSIGN(p2, ROWS == 6 ? 1536 : 4096);
+        TASSIGN(p3, ROWS == 6 ? 2304 : 6144);
+        TASSIGN(pre, ROWS == 6 ? 4608 : 8576);
+        TASSIGN(post, ROWS == 6 ? 4864 : 9088);
+        TASSIGN(comb, ROWS == 6 ? 5120 : 9600);
         using Shape = TileShape2D<float, DYNAMIC, 32>;
         using Stride = BaseShape2D<float, DYNAMIC, 32>;
         GlobalTensor<float, Shape, Stride> g0(data(args, 0) + (0 * padded + start) * 32,
@@ -375,7 +379,7 @@ __aicore__ inline void sinkhorn(__gm__ int64_t* args) {
         TLOAD(inverse, ig);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        coefficients(pre.data(), post.data(), comb.data(), p0.data(), p1.data(), p2.data(), p3.data(),
+        coefficients<ROWS>(pre.data(), post.data(), comb.data(), p0.data(), p1.data(), p2.data(), p3.data(),
                      inverse.data(), bias.data(), scales.data(), rows, eps, iterations);
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -397,6 +401,10 @@ __aicore__ inline void sinkhorn(__gm__ int64_t* args) {
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__)
-    sinkhorn(args);
+    if (args[11] == 6) {
+        sinkhorn<6>(args);
+    } else {
+        sinkhorn<16>(args);
+    }
 #endif
 }

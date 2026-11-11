@@ -6,13 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""C2A reuse decode attention with mHC."""
+"""C2A reuse decode attention with HC."""
 
+
+from utils import packed_cache_compare
 
 import pypto.language as pl
+
+
 from config import (
-    FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, COMPRESSED_CACHE_GROUP,
-    WINDOW_CACHE_GROUP,
+    FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, WINDOW_CACHE_BYTES,
+    COMPRESSED_CACHE_BYTES,
 )
 from hc import hc_head_norm, hc_project, hc_sinkhorn, hc_post
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
@@ -61,10 +65,8 @@ def decode_c2a_reuse(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN],
-    window_cache_scale: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
+    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
     next_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
@@ -79,7 +81,7 @@ def decode_c2a_reuse(
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens)
+    proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x_norm, num_tokens, row_tile=80)
     q_proj_rope(
         proj_payload, proj_scales,
         wq_a, wq_a_scale, q_norm_weight,
@@ -88,11 +90,16 @@ def decode_c2a_reuse(
         qr, query,
         num_tokens, qa_worker_limit=32, qb_worker_limit=32,
         padded_rows=proj_payload_padded_rows,
+        qa_row_tile=80, qb_row_tile=80,
     )
-    kv_projection = kv_proj(proj_payload, proj_scales, wkv, wkv_scale, kv_projection, num_tokens, worker_limit=32)
+    kv_projection = kv_proj(
+        proj_payload, proj_scales,
+        wkv, wkv_scale,
+        kv_projection, num_tokens, worker_limit=32, row_tile=80,
+    )
     window_publish(
         kv_projection, kv_norm_weight, rope_cos, rope_sin,
-        window_slots, window_cache, window_cache_scale,
+        window_slots, window_cache,
         num_tokens, cache_ready,
     )
 
@@ -101,11 +108,15 @@ def decode_c2a_reuse(
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
-        query, window_indices, window_cache, window_cache_scale, compressed_indices, compressed_cache, compressed_cache_scale,
+        query, window_indices, window_cache, compressed_indices, compressed_cache,
         attn_sink, attended, num_tokens, chunk_done, compressed_keys=INDEX_TOPK,
     )
     o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, attn_out, num_tokens, worker_limit=32,
+        attended,
+        wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin,
+        attn_out, num_tokens,
+        worker_limit=32, oa_row_tile=80, ob_row_tile=80,
     )
 
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
@@ -140,10 +151,8 @@ def l2_decode_c2a_reuse(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
@@ -162,8 +171,8 @@ def l2_decode_c2a_reuse(
         wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale,
+        window_cache,
+        compressed_cache,
         compressed_indices,
         output, next_pre_mix,
         num_tokens,
@@ -195,10 +204,8 @@ def l3_decode_c2a_reuse(
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8],
-    compressed_cache_scale: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.BF16],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
@@ -221,8 +228,8 @@ def l3_decode_c2a_reuse(
         wo_a, wo_a_scale, wo_b, wo_b_scale_mx,
         rope_cos, rope_sin,
         window_slots, window_indices,
-        window_cache, window_cache_scale,
-        compressed_cache, compressed_cache_scale,
+        window_cache,
+        compressed_cache,
         compressed_indices,
         output, next_pre_mix,
         num_tokens, device=0,
@@ -239,7 +246,7 @@ if __name__ == "__main__":
     import argparse
     from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="TP1 A5 mHC C2A reuse validation")
+    parser = argparse.ArgumentParser(description="TP1 A5 HC C2A reuse validation")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
@@ -270,15 +277,18 @@ if __name__ == "__main__":
         compare_fn={
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "window_cache": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window cache", mapping_shape=(args.tokens,),
-                block_size=128, leading_rank_axis=False,
-                atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
-            ),
-            "window_cache_scale": mapped_pool_ratio_allclose(
-                "window_slots", pool_name="window cache scale", mapping_shape=(args.tokens,),
-                block_size=128, leading_rank_axis=False,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
+            "window_cache": packed_cache_compare(
+                mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window cache", mapping_shape=(args.tokens,),
+                    block_size=128, leading_rank_axis=False,
+                    atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+                ),
+                mapped_pool_ratio_allclose(
+                    "window_slots", pool_name="window cache scale", mapping_shape=(args.tokens,),
+                    block_size=128, leading_rank_axis=False,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.0,
+                ),
+                fp4=False,
             ),
         },
         compile_only=args.compile_only,

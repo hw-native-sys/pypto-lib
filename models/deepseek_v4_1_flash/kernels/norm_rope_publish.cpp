@@ -201,10 +201,15 @@ __aicore__ inline void flush_rows(__gm__ int64_t* args, int rows, Vec<int64_t, 8
         TASSIGN(codes, 14336 + row * 32);
         using PayloadShape = TileShape2D<uint8_t, DYNAMIC, 512>;
         using CodeShape = TileShape2D<uint8_t, DYNAMIC, 32>;
-        GlobalTensor<uint8_t, PayloadShape, BaseShape2D<uint8_t, 8, 512>> output_gm(
-            data<uint8_t>(args, 5) + slot * 512, PayloadShape(count, 512));
-        GlobalTensor<uint8_t, CodeShape, BaseShape2D<uint8_t, 8, 32>> scale_gm(
-            data<uint8_t>(args, 6) + slot * 32, CodeShape(count, 32));
+        using RowStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
+        int64_t payload_stride = reinterpret_cast<__gm__ Tensor*>(args[5])->strides[1];
+        int64_t scale_stride = payload_stride;
+        auto scale_base = data<uint8_t>(args, 5) + 512;
+        GlobalTensor<uint8_t, PayloadShape, RowStride> output_gm(
+            data<uint8_t>(args, 5) + slot * payload_stride, PayloadShape(count, 512),
+            RowStride(1, 1, 1, payload_stride, 1));
+        GlobalTensor<uint8_t, CodeShape, RowStride> scale_gm(
+            scale_base + slot * scale_stride, CodeShape(count, 32), RowStride(1, 1, 1, scale_stride, 1));
         TSTORE(output_gm, payload);
         TSTORE(scale_gm, codes);
         // Preserve input order between runs, including repeated cache slots.
@@ -227,7 +232,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     TASSIGN(weight, 14592);
     GM<bfloat16_t, 512> weight_gm(data<bfloat16_t>(args, 1));
     TLOAD(weight, weight_gm);
-    int tokens = args[7];
+    int tokens = args[6];
     int worker = get_block_idx(args);
     int workers = get_block_num(args);
     int pending = 0;

@@ -29,8 +29,9 @@ from config import (
     EP_SIZE,
     FLASH,
     MAX_BATCH_PER_DP,
-    TP_SIZE,
+    TP_SIZE, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
+from quant import unpack_quantized_cache
 from decode_fwd import FWD_C1A_TABLE_DYN, FWD_C2A_TABLE_DYN
 from dspark_drafter import l3_dspark_drafter
 from dspark_markov import l3_markov_sample_from_hidden
@@ -410,9 +411,7 @@ TARGET_FWD_LOCAL_O_WIDTH = target_fwd.LOCAL_O_WIDTH
 TARGET_FWD_ROPE_ROWS_DYN = target_fwd.ROPE_ROWS_DYN
 TARGET_FWD_ROPE_DIM = target_fwd.ROPE_DIM
 TARGET_FWD_FWD_ORI_BLOCKS_DYN = target_fwd.FWD_ORI_BLOCKS_DYN
-TARGET_FWD_WINDOW_CACHE_GROUP = target_fwd.WINDOW_CACHE_GROUP
 TARGET_FWD_FWD_CMP_BLOCKS_DYN = target_fwd.FWD_CMP_BLOCKS_DYN
-TARGET_FWD_COMPRESSED_CACHE_GROUP = target_fwd.COMPRESSED_CACHE_GROUP
 TARGET_FWD_FWD_INDEX_BLOCKS_DYN = target_fwd.FWD_INDEX_BLOCKS_DYN
 TARGET_FWD_INDEX_DIM = target_fwd.INDEX_DIM
 TARGET_FWD_INDEX_CACHE_GROUP = target_fwd.INDEX_CACHE_GROUP
@@ -478,9 +477,6 @@ TARGET_FWD_SIGNAL_PAD = target_fwd.SIGNAL_PAD
 TARGET_FWD_MOE_TOKENS = target_fwd.MOE_TOKENS
 TARGET_FWD_TOPK = target_fwd.TOPK
 TARGET_FWD_GROUP_LOGIT_ROWS = target_fwd.GROUP_LOGIT_ROWS
-SAMPLING_GROUP_LOGIT_ROWS = sampling.GROUP_LOGIT_ROWS
-SAMPLING_MAX_LOGIT_ROWS = sampling.MAX_LOGIT_ROWS
-SAMPLING_VOCAB = sampling.VOCAB
 DRAFT_PREFILL_MAX_TOKENS = draft.PREFILL_MAX_TOKENS
 DRAFT_RECV_MAX = draft.RECV_MAX
 DRAFT_AUX_WIDTH = draft.AUX_WIDTH
@@ -538,10 +534,8 @@ def l3_decode_fwd_dspark(
     wo_b_scale: pl.Tensor[[EP_SIZE, TARGET_FWD_WEIGHT_BANK_SIZE * (TARGET_FWD_LOCAL_O_WIDTH // TARGET_FWD_MX_GROUP), D], pl.FP8E8M0],
     freqs_cos: pl.Tensor[[EP_SIZE, 2, TARGET_FWD_ROPE_ROWS_DYN, TARGET_FWD_ROPE_DIM // 2], pl.FP32],
     freqs_sin: pl.Tensor[[EP_SIZE, 2, TARGET_FWD_ROPE_ROWS_DYN, TARGET_FWD_ROPE_DIM // 2], pl.FP32],
-    window_cache_pool: pl.InOut[pl.Tensor[[EP_SIZE, TARGET_FWD_FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, TARGET_FWD_HEAD_DIM], pl.FP8E4M3FN]],
-    window_cache_scale_pool: pl.InOut[pl.Tensor[[EP_SIZE, TARGET_FWD_FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, TARGET_FWD_HEAD_DIM // TARGET_FWD_WINDOW_CACHE_GROUP], pl.BF16]],
-    compressed_cache_pool: pl.InOut[pl.Tensor[[EP_SIZE, TARGET_FWD_FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, TARGET_FWD_HEAD_DIM // 2], pl.UINT8]],
-    compressed_cache_scale_pool: pl.InOut[pl.Tensor[[EP_SIZE, TARGET_FWD_FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, TARGET_FWD_HEAD_DIM // TARGET_FWD_COMPRESSED_CACHE_GROUP], pl.BF16]],
+    window_cache_pool: pl.InOut[pl.Tensor[[EP_SIZE, TARGET_FWD_FWD_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
+    compressed_cache_pool: pl.InOut[pl.Tensor[[EP_SIZE, TARGET_FWD_FWD_CMP_BLOCKS_DYN, BLOCK_SIZE, 1, COMPRESSED_CACHE_BYTES], pl.UINT8]],
     index_cache_pool: pl.InOut[pl.Tensor[[EP_SIZE, TARGET_FWD_FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, TARGET_FWD_INDEX_DIM // 2], pl.UINT8]],
     index_cache_scale_pool: pl.InOut[pl.Tensor[[EP_SIZE, TARGET_FWD_FWD_INDEX_BLOCKS_DYN, BLOCK_SIZE, 1, TARGET_FWD_INDEX_DIM // TARGET_FWD_INDEX_CACHE_GROUP], pl.FP8E8M0]],
     c2a_index_block_table: pl.Tensor[[EP_SIZE, TARGET_FWD_B_DYN, TARGET_FWD_FWD_C2A_TABLE_DYN], pl.INT32],
@@ -578,7 +572,7 @@ def l3_decode_fwd_dspark(
     moe_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     attention_num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[EP_SIZE, TARGET_FWD_VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[EP_SIZE, D, TARGET_FWD_VOCAB_PER_TP], pl.BF16],
     logit_row_indices: pl.Tensor[[EP_SIZE, TARGET_FWD_MAX_LOGIT_ROWS], pl.INT32],
     target_logits: pl.Out[pl.Tensor[[EP_SIZE, TARGET_FWD_MAX_LOGIT_ROWS, TARGET_FWD_VOCAB], pl.FP32]],
     target_backbone_sampled_ids: pl.Out[pl.Tensor[[EP_SIZE, TARGET_FWD_MAX_LOGIT_ROWS, TARGET_FWD_SAMPLED_IDS_PAD], pl.INT32]],
@@ -621,8 +615,7 @@ def l3_decode_fwd_dspark(
     draft_wo_a_scale: pl.Tensor[[DRAFT_EP_SIZE, DSPARK_DRAFT_LAYERS, DRAFT_LOCAL_O_GROUPS, DRAFT_O_GROUP_IN // DRAFT_MX_GROUP, DRAFT_O_LORA], pl.FP8E8M0],
     draft_wo_b: pl.Tensor[[DRAFT_EP_SIZE, DSPARK_DRAFT_LAYERS, DRAFT_LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     draft_wo_b_scale: pl.Tensor[[DRAFT_EP_SIZE, DSPARK_DRAFT_LAYERS, DRAFT_LOCAL_O_WIDTH // DRAFT_MX_GROUP, D], pl.FP8E8M0],
-    draft_window_cache: pl.InOut[pl.Tensor[[DRAFT_EP_SIZE, DSPARK_DRAFT_LAYERS, DRAFT_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, DRAFT_HEAD_DIM], pl.FP8E4M3FN]],
-    draft_window_cache_scale: pl.InOut[pl.Tensor[[DRAFT_EP_SIZE, DSPARK_DRAFT_LAYERS, DRAFT_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, DRAFT_HEAD_DIM // DRAFT_MX_GROUP], pl.BF16]],
+    draft_window_cache: pl.InOut[pl.Tensor[[DRAFT_EP_SIZE, DSPARK_DRAFT_LAYERS, DRAFT_ORI_BLOCKS_DYN, BLOCK_SIZE, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
     draft_hc_ffn_fn: pl.Tensor[[DRAFT_EP_SIZE, DSPARK_DRAFT_LAYERS, DRAFT_MIX_HC, DRAFT_HC_DIM], pl.FP32],
     draft_hc_ffn_scale: pl.Tensor[[DRAFT_EP_SIZE, DSPARK_DRAFT_LAYERS, 3], pl.FP32],
     draft_hc_ffn_base: pl.Tensor[[DRAFT_EP_SIZE, DSPARK_DRAFT_LAYERS, DRAFT_MIX_HC], pl.FP32],
@@ -645,7 +638,7 @@ def l3_decode_fwd_dspark(
     attention_epoch: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
     markov_final_norm_weight: pl.Tensor[[EP_SIZE, D], pl.BF16],
-    markov_lm_head_weight: pl.Tensor[[EP_SIZE, MARKOV_VOCAB_PER_TP, D], pl.BF16],
+    markov_lm_head_weight: pl.Tensor[[EP_SIZE, D, MARKOV_VOCAB_PER_TP], pl.BF16],
     markov_markov_w1: pl.Tensor[[EP_SIZE, MARKOV_VOCAB, MARKOV_MARKOV_RANK], pl.BF16],
     markov_markov_w2: pl.Tensor[[EP_SIZE, MARKOV_VOCAB, MARKOV_MARKOV_RANK], pl.BF16],
     markov_confidence_weight: pl.Tensor[[EP_SIZE, 1, D + MARKOV_MARKOV_RANK], pl.FP32],
@@ -664,9 +657,7 @@ def l3_decode_fwd_dspark(
     freqs_cos.bind_dynamic(2, TARGET_FWD_ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(2, TARGET_FWD_ROPE_ROWS_DYN)
     window_cache_pool.bind_dynamic(1, TARGET_FWD_FWD_ORI_BLOCKS_DYN)
-    window_cache_scale_pool.bind_dynamic(1, TARGET_FWD_FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(1, TARGET_FWD_FWD_CMP_BLOCKS_DYN)
-    compressed_cache_scale_pool.bind_dynamic(1, TARGET_FWD_FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(1, TARGET_FWD_FWD_INDEX_BLOCKS_DYN)
     index_cache_scale_pool.bind_dynamic(1, TARGET_FWD_FWD_INDEX_BLOCKS_DYN)
     c2a_index_block_table.bind_dynamic(1, TARGET_FWD_B_DYN)
@@ -680,7 +671,6 @@ def l3_decode_fwd_dspark(
     draft_sin.bind_dynamic(1, STATE_OPS_ROPE_ROWS_DYN)
     zero_prefill_tokens.bind_dynamic(1, DRAFT_B_DYN)
     draft_window_cache.bind_dynamic(2, DRAFT_ORI_BLOCKS_DYN)
-    draft_window_cache_scale.bind_dynamic(2, DRAFT_ORI_BLOCKS_DYN)
     draft_head_hidden.bind_dynamic(1, DRAFT_B_DYN)
     draft_ids.bind_dynamic(1, MARKOV_B_DYN)
     confidences.bind_dynamic(1, MARKOV_B_DYN)
@@ -733,8 +723,8 @@ def l3_decode_fwd_dspark(
             hc_attn_base[rank], attn_norm_weight[rank], wq_a[rank], q_norm_weight[rank], wq_b[rank],
             wkv[rank], kv_norm_weight[rank], attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank],
             freqs_cos[rank], freqs_sin[rank], window_slots[rank], window_indices[rank],
-            window_cache_pool[rank], window_cache_scale_pool[rank], compressed_cache_pool[rank],
-            compressed_cache_scale_pool[rank], request_ids[rank], position_ids[rank], index_cache_pool[rank],
+            window_cache_pool[rank], compressed_cache_pool[rank],
+            request_ids[rank], position_ids[rank], index_cache_pool[rank],
             index_cache_scale_pool[rank], c2a_index_block_table[rank], c1a_index_block_table[rank],
             c2a_compressor_wkv[rank], c2a_compressor_wgate[rank], c1a_compressor_wkv[rank],
             query_starts[rank], state_block_table[rank], state_cache_pool[rank],
@@ -754,19 +744,10 @@ def l3_decode_fwd_dspark(
         )
 
     # Sample target.
-    sampling_hidden_window_buf = pld.alloc_window_buffer([SAMPLING_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    sampling_hidden_done_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    sampling_logits_window_buf = pld.alloc_window_buffer([SAMPLING_MAX_LOGIT_ROWS, SAMPLING_VOCAB], dtype=pl.FP32)
-    sampling_logits_done_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
-        sampling_hidden_window = pld.window(sampling_hidden_window_buf, [SAMPLING_GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        sampling_hidden_done = pld.window(sampling_hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        sampling_logits_window = pld.window(sampling_logits_window_buf, [SAMPLING_MAX_LOGIT_ROWS, SAMPLING_VOCAB], dtype=pl.FP32)
-        sampling_logits_done = pld.window(sampling_logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         sample_target_rank(
             x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank], active_widths[rank],
-            target_sampled_ids[rank], sampling_hidden_window, sampling_hidden_done, sampling_logits_window,
-            sampling_logits_done, rank, device=rank,
+            target_sampled_ids[rank], device=rank,
         )
 
     # Accept target.
@@ -822,7 +803,7 @@ def l3_decode_fwd_dspark(
             draft_q_norm_weight[rank], draft_wq_b[rank], draft_wq_b_scale[rank], draft_wkv[rank],
             draft_wkv_scale[rank], draft_kv_norm_weight[rank], draft_attn_sink[rank], draft_wo_a[rank],
             draft_wo_a_scale[rank], draft_wo_b[rank], draft_wo_b_scale[rank], draft_window_cache[rank],
-            draft_window_cache_scale[rank], draft_hc_ffn_fn[rank], draft_hc_ffn_scale[rank],
+            draft_hc_ffn_fn[rank], draft_hc_ffn_scale[rank],
             draft_hc_ffn_base[rank], draft_ffn_norm_weight[rank], draft_gate_weight[rank],
             draft_correction_bias[rank], draft_routed_w1[rank], draft_routed_w1_scale[rank],
             draft_routed_w2[rank], draft_routed_w2_scale[rank], draft_routed_w3[rank],
@@ -991,14 +972,12 @@ def run_recurrent_decode_case(*, devices: tuple[int, ...], compile_only: bool = 
         "freqs_sin": target_sin.unsqueeze(0).repeat(EP_SIZE, 1, 1, 1),
         "draft_cos": 1.0,
         "draft_main_norm_weight": 1.0,
-        "draft_window_cache_scale": 1.0,
         "markov_final_norm_weight": 1.0,
         "logit_row_indices": -1,
         "attention_num_tokens": ROWS,
         "moe_num_tokens": ROWS,
     }
     aliases = {
-        "draft_embedding_weight": "lm_head_weight",
         "markov_lm_head_weight": "lm_head_weight",
     }
     specs = {}
@@ -1017,6 +996,10 @@ def run_recurrent_decode_case(*, devices: tuple[int, ...], compile_only: bool = 
         dtype = target_fwd._torch_dtype(ann.dtype)
         base = target_specs.get(name)
         value = initial.get(name, base.init_value if base is not None else None)
+        if name == "draft_window_cache":
+            value = torch.zeros(shape, dtype=torch.uint8)
+            _, factors = unpack_quantized_cache(value, False)
+            factors.fill_(1.0)
         if value is None and dtype == torch.float8_e8m0fnu:
             value = 1.0
         specs[name] = TensorSpec(name, shape, dtype, init_value=value)

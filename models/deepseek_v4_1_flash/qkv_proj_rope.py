@@ -58,6 +58,7 @@ def _proj_q_a(
     weight_scale: pl.Tensor,
     output: pl.Out[pl.Tensor[[QA_OUTPUT_ROWS, Q_LORA], pl.BF16]],
     rows: pl.Scalar[pl.INDEX],
+    row_tile: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Project ND activations and NZ weights with packed MX scales."""
     return output
@@ -76,6 +77,7 @@ def _proj_q_b(
     rows: pl.Scalar[pl.INDEX],
     output_width: pl.Scalar[pl.INDEX],
     row_start: pl.Scalar[pl.INDEX],
+    row_tile: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Project Q and rotate the BF16-rounded tail on the paired Vector core."""
     return output
@@ -91,6 +93,7 @@ def _proj_kv(
     output: pl.Out[pl.Tensor[[KV_OUTPUT_ROWS, HEAD_DIM], pl.BF16]],
     rows: pl.Scalar[pl.INDEX],
     row_start: pl.Scalar[pl.INDEX],
+    row_tile: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
     """Project ND activations and NZ weights with packed MX scales."""
     return output
@@ -127,10 +130,14 @@ def q_norm_quant(
 def quantize_projection_input(
     x: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
+    row_tile: pl.constexpr = 80,
 ):
-    """Quantize shared Q/KV input into M80-padded payload and M16-packed scales."""
+    """Quantize shared Q/KV inputs with padded rows and M16-packed scales."""
     capacity = pl.tensor.dim(x, 0)
-    padded_rows = ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
+    projection_rows = ((capacity + row_tile - 1) // row_tile) * row_tile
+    # Index-Q reads M80-padded input rows.
+    index_rows = ((capacity + PROJ_M_TILE - 1) // PROJ_M_TILE) * PROJ_M_TILE
+    padded_rows = pl.max(projection_rows, index_rows)
     payload = pl.create_tensor([padded_rows, D], dtype=pl.FP8E4M3FN)
     scales = pl.create_tensor([1, padded_rows * (D // 32)], dtype=pl.FP8E8M0)
     quant_blocks = (padded_rows // MX_M_TILE) * (D // MX_K_TILE)
@@ -157,16 +164,23 @@ def q_proj_rope(
     padded_rows: pl.Scalar[pl.INDEX],
     qa_worker_limit: pl.constexpr = 32,
     qb_worker_limit: pl.constexpr = 32,
+    qa_row_tile: pl.constexpr = 80,
+    qb_row_tile: pl.constexpr = 80,
 ):
     """Project NZ QA/QB weights, rotate Q, and retain normalized rows for Index-Q."""
+    # Native QA tiles: M80/N64 or M256/N128; QB tiles: M80/N256 or M128/N256.
+    if qa_row_tile == 256:
+        qa_n_tile = 128
+    else:
+        qa_n_tile = Q_A_N_TILE
     payload_rows = padded_rows
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     projected = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.BF16)
-    qa_tasks = ((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE) * (Q_LORA // Q_A_N_TILE)
+    qa_tasks = ((num_tokens + qa_row_tile - 1) // qa_row_tile) * (Q_LORA // qa_n_tile)
     qa_workers = pl.max(pl.min(qa_tasks, qa_worker_limit), 1)
     with pl.spmd(qa_workers, name_hint="proj_q_a"):
-        projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens)
+        projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_row_tile)
     norm_workers = pl.max(pl.min(payload_rows // MX_M_TILE, 32), 1)
     latent_rows = pl.tensor.dim(query_latent, 0)
     norm_latent = pl.tensor.slice(query_latent, [latent_rows, Q_LORA], [0, 0])
@@ -174,12 +188,12 @@ def q_proj_rope(
     norm_scales = pl.tensor.slice(qb_scales, [1, payload_rows * (Q_LORA // 32)], [0, 0])
     with pl.spmd(norm_workers, name_hint="q_norm_quant"):
         q_norm_quant(projected, q_norm_weight, norm_latent, norm_payload, norm_scales, num_tokens)
-    qb_tasks = ((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
+    qb_tasks = ((num_tokens + qb_row_tile - 1) // qb_row_tile) * (LOCAL_H * HEAD_DIM // Q_B_N_TILE)
     qb_workers = pl.max(pl.min(qb_tasks, qb_worker_limit), 1)
     with pl.spmd(qb_workers, name_hint="proj_q_b"):
         query = _proj_q_b(
             qb_payload, wq_b, qb_scales, wq_b_scale,
-            query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0,
+            query, rope_cos, rope_sin, num_tokens, LOCAL_H * HEAD_DIM, 0, qb_row_tile,
         )
     return query_latent, query, qb_payload, qb_scales
 
@@ -193,7 +207,6 @@ def norm_rope_publish(
     sine: pl.Tensor,
     slots: pl.Tensor,
     cache: pl.InOut[pl.Tensor],
-    scales: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor:
     """Normalize and rotate BF16 rows, then quantize and publish group-32 FP8 cache pages."""
@@ -209,12 +222,18 @@ def kv_proj(
     kv_projection: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     worker_limit: pl.constexpr = 32,
+    row_tile: pl.constexpr = 80,
 ):
-    """Project NZ KV weights to BF16 rows in M80 groups."""
-    tasks = ((num_tokens + PROJ_M_TILE - 1) // PROJ_M_TILE) * (HEAD_DIM // KV_N_TILE)
+    """Project NZ KV weights to BF16 with bounded active rows."""
+    # Native KV tiles: M80/N64 or M256/N256.
+    if row_tile == 256:
+        n_tile = 256
+    else:
+        n_tile = KV_N_TILE
+    tasks = ((num_tokens + row_tile - 1) // row_tile) * (HEAD_DIM // n_tile)
     workers = pl.max(pl.min(tasks, worker_limit), 1)
     with pl.spmd(workers, name_hint="proj_kv", sync_start=True):
-        kv_projection = _proj_kv(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0)
+        kv_projection = _proj_kv(payload, wkv, scales, wkv_scale, kv_projection, num_tokens, 0, row_tile)
     return kv_projection
 
 
@@ -226,26 +245,15 @@ def window_publish(
     rope_sin: pl.Tensor,
     slots: pl.Tensor,
     cache: pl.Tensor,
-    cache_scale: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
 ):
     """Fuse RMSNorm, RoPE, group-32 FP8 quantization, and window cache publication."""
     workers = pl.max(1, pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE))
-    blocks = pl.tensor.dim(cache_scale, 0)
-    local_scales = pl.create_tensor([blocks, 128, 1, HEAD_DIM // 32], dtype=pl.BF16)
-    local_rows = pl.reshape(local_scales, [blocks * 128, HEAD_DIM // 32])
     with pl.spmd(workers, name_hint="norm_rope_pub_win", deps=[cache_ready]) as published:
-        cache = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, local_scales, num_tokens)
-    output_rows = pl.reshape(cache_scale, [blocks * 128, HEAD_DIM // 32])
-    with pl.spmd(1, name_hint="publish_window_scales", deps=[published]) as completed:
-        worker = pl.tile.get_block_idx()
-        for token in pl.range(worker, num_tokens):
-            slot = pl.read(slots, [token])
-            if slot >= 0 and slot < blocks * 128:
-                scale = pl.load(local_rows, [slot, 0], [1, HEAD_DIM // 32])
-                pl.store(scale, [slot, 0], output_rows)
-    return completed
+        cache = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, num_tokens)
+    return published
+
 
 
 def golden_rope_interleave(

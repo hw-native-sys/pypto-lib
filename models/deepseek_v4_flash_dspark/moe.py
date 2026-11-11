@@ -51,7 +51,8 @@ TOKEN_CAPACITY_SPECIFIED = any(arg == "--token-capacity" or arg.startswith("--to
 if TOKEN_CAPACITY_SPECIFIED and (MOE_TOKEN_CAPACITY <= 0 or (MOE_TOKEN_CAPACITY > 64 and MOE_TOKEN_CAPACITY % 64 != 0)):
     raise ValueError("--token-capacity must be positive and, above 64, a multiple of 64")
 config.MOE_TOKENS = MOE_TOKEN_CAPACITY
-config.RECV_MAX = ((EP * config.MOE_TOKENS + 63) // 64) * 64
+_RECV_ALIGNMENT = 16 if MOE_TOKEN_CAPACITY <= 8 else 64
+config.RECV_MAX = ((EP * config.MOE_TOKENS + _RECV_ALIGNMENT - 1) // _RECV_ALIGNMENT) * _RECV_ALIGNMENT
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -137,8 +138,8 @@ PREFILL_MOE_GROUPED_EXPERT_TILE = 16
 PREFILL_MOE_ROUTES_PER_SRC = T * TOPK
 PREFILL_MOE_PEER_CAP = PREFILL_MOE_ROUTES_PER_SRC
 PREFILL_MOE_TOTAL_CAP = N_RANKS * PREFILL_MOE_PEER_CAP
-_PREFILL_GROUPED_ROWS = PREFILL_MOE_TOTAL_CAP + N_LOCAL * (PREFILL_RECV_TILE - 1)
-PREFILL_MOE_GROUPED_TOTAL_CAP = (_PREFILL_GROUPED_ROWS + PREFILL_RECV_TILE - 1) // PREFILL_RECV_TILE * PREFILL_RECV_TILE
+PREFILL_MOE_GROUPED_ROWS = PREFILL_MOE_TOTAL_CAP + N_LOCAL * (PREFILL_RECV_TILE - 1)
+PREFILL_MOE_GROUPED_TOTAL_CAP = (PREFILL_MOE_GROUPED_ROWS + PREFILL_RECV_TILE - 1) // PREFILL_RECV_TILE * PREFILL_RECV_TILE
 PREFILL_MOE_SEND_SCALE_PAD = 16
 PREFILL_SOURCE_PACK_BLOCKS = N_RANKS
 PREFILL_RESORT_BLOCKS_PER_EXPERT = 1
@@ -257,6 +258,7 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
         raise ValueError("Invalid physical expert capacity")
     LOCAL_EXPERTS = local_experts
     LOCAL_META_SLOTS = (LOCAL_EXPERTS + 15) // 16 * 16
+    PUSH_GROUPS = max(1, LOCAL_EXPERTS // N_RANKS) if T <= 8 else LOCAL_EXPERTS
     SEND_ROUTE_TILE = ((T * TOPK + 7) // 8) * 8
     expert_routed_tile = make_expert_routed_tile(LOCAL_EXPERTS)
     route_eplb, export_eplb = make_moe_eplb(
@@ -382,35 +384,36 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
                 pl.write(recv_count_out, [e, 0], acc)
 
         # Each lane consumes the token-major route list published with its count.
-        with pl.spmd(N_RANKS * LOCAL_EXPERTS, name_hint="dispatch_push", deps=[_meta_push_tid], allow_early_resolve=True) as push_tid:
+        with pl.spmd(N_RANKS * PUSH_GROUPS, name_hint="dispatch_push", deps=[_meta_push_tid], allow_early_resolve=True) as push_tid:
             push_block = pl.tile.get_block_idx()
-            dst = push_block // LOCAL_EXPERTS
-            loc_e = push_block - dst * LOCAL_EXPERTS
-            e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
-            lane_count = pl.cast(pl.read(send_counts, [dst, loc_e]), pl.INDEX)
-            if lane_count > 0:
-                lane_start = pl.cast(pl.read(send_starts, [dst, loc_e]), pl.INDEX)
-                lane_routes = pl.tile.load(send_routes, [0, 0], [1, SEND_ROUTE_TILE])
-                weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
-                aux_lane = pl.tile.full([MAX_PER_SRC, AUX_PAD], dtype=pl.FP32, value=0.0)
-                route_lane = pl.tile.full([MAX_PER_SRC, IDX_PAD], dtype=pl.INT32, value=0)
-                for slot in pl.range(lane_count):
-                    route = pl.tile.read(lane_routes, [0, lane_start + slot])
-                    token = pl.cast(route // TOPK, pl.INDEX)
-                    choice = pl.cast(route % TOPK, pl.INDEX)
-                    row = e_lane_base + slot
-                    pld.tensor.put(dst=recv_x, peer=dst, src=x_norm_i8, dst_offsets=[row, 0], src_offsets=[token, 0], shape=[1, D])
-                    pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [token, 0]))
-                    pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(weights_tile, [token, choice]))
-                    pl.tile.write(route_lane, [slot, 0], route)
-                aux_valid = pl.set_validshape(aux_lane, lane_count, AUX_PAD)
-                route_valid = pl.set_validshape(route_lane, lane_count, IDX_PAD)
-                pld.tile.remote_store(aux_valid, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
-                pld.tile.remote_store(route_valid, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
+            dst = push_block // PUSH_GROUPS
+            push_group = push_block - dst * PUSH_GROUPS
+            for loc_e in pl.range(push_group, LOCAL_EXPERTS, PUSH_GROUPS):
+                e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
+                lane_count = pl.cast(pl.read(send_counts, [dst, loc_e]), pl.INDEX)
+                if lane_count > 0:
+                    lane_start = pl.cast(pl.read(send_starts, [dst, loc_e]), pl.INDEX)
+                    lane_routes = pl.tile.load(send_routes, [0, 0], [1, SEND_ROUTE_TILE])
+                    weights_tile = pl.tile.load(weights, [0, 0], [T, AUX_PAD], valid_shape=[T, TOPK])
+                    aux_lane = pl.tile.full([MAX_PER_SRC, AUX_PAD], dtype=pl.FP32, value=0.0)
+                    route_lane = pl.tile.full([MAX_PER_SRC, IDX_PAD], dtype=pl.INT32, value=0)
+                    for slot in pl.range(lane_count):
+                        route = pl.tile.read(lane_routes, [0, lane_start + slot])
+                        token = pl.cast(route // TOPK, pl.INDEX)
+                        choice = pl.cast(route % TOPK, pl.INDEX)
+                        row = e_lane_base + slot
+                        pld.tensor.put(dst=recv_x, peer=dst, src=x_norm_i8, dst_offsets=[row, 0], src_offsets=[token, 0], shape=[1, D])
+                        pl.tile.write(aux_lane, [slot, AUX_SCALE], pl.read(x_norm_scale, [token, 0]))
+                        pl.tile.write(aux_lane, [slot, AUX_W], pl.tile.read(weights_tile, [token, choice]))
+                        pl.tile.write(route_lane, [slot, 0], route)
+                    aux_valid = pl.set_validshape(aux_lane, lane_count, AUX_PAD)
+                    route_valid = pl.set_validshape(route_lane, lane_count, IDX_PAD)
+                    pld.tile.remote_store(aux_valid, target=recv_aux, peer=dst, offsets=[e_lane_base, 0])
+                    pld.tile.remote_store(route_valid, target=recv_route, peer=dst, offsets=[e_lane_base, 0])
 
             # Payload-arrival notify folded into the push: a block signals its own
-            # destination after its own puts, so a peer sees LOCAL_EXPERTS notifies per
-            # source per epoch and the wait below expects LOCAL_EXPERTS * moe_epoch. The
+            # destination after its own puts, so a peer sees PUSH_GROUPS notifies per
+            # source per epoch and the wait below expects PUSH_GROUPS * moe_epoch. The
             # count must bump only after this block's puts issue in program order:
             # recv_aux / recv_route ride a non-draining remote_store and a PIPE_ALL
             # barrier is not a cross-rank DDR fence (PTOAS#872).
@@ -423,54 +426,82 @@ def make_moe(local_experts: int, *, enable_eplb: bool = False):
                     pld.system.defer_wait(
                         signal=data_arrived,
                         offsets=[src, 0],
-                        expected=pl.cast(moe_epoch * LOCAL_EXPERTS, pl.INT32),
+                        expected=pl.cast(moe_epoch * PUSH_GROUPS, pl.INT32),
                         cmp=pld.WaitCmp.Ge,
                     )
 
-        # Gather lanes into the compact per-expert buffers: one task per expert
-        # receive tile. deps on _wait_tid for the incoming payload; this rank's own
-        # dst == my_rank puts are already ordered by the local RAW edges on
-        # recv_x / recv_aux / recv_route. deps on _meta_tid for recv_meta_local, which is
-        # manual_dep and so has no auto edge from the cumsum.
-        # Scalar metadata stores need whole 64-byte lines per task: RECV_MAX and
-        # RECV_TILE are both multiples of 16 FP32/INT32 elements, so an expert row
-        # starts on a line and every tile boundary lands on one.
-        gather_tids = pl.array.create(LOCAL_EXPERTS, pl.TASK_ID)
-        for e in pl.parallel(LOCAL_EXPERTS):
-            gather_tile_tids = pl.array.create(TILES_PER_EXPERT, pl.TASK_ID)
-            expert_rows = pl.cast(pl.read(recv_count_out, [e, 0]), pl.INDEX)
-            expert_tiles = (expert_rows + RECV_TILE - 1) // RECV_TILE
-            for tile in pl.parallel(expert_tiles):
-                tile_row = tile * RECV_TILE
-                tile_end = pl.min(tile_row + RECV_TILE, expert_rows)
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    name_hint="dispatch_gather",
-                    deps=[_wait_tid, _meta_tid],
-                    # Keep the routed expert tasks off the cores until this gather retires.
-                    allow_early_resolve=False,
-                ) as gather_tile_tid:
-                    e_base_row = e * RECV_MAX
-                    source_begin = pl.cast(0, pl.INDEX)
-                    for src in pl.range(N_RANKS):
-                        n = pl.cast(pl.read(recv_meta_local, [src, e]), pl.INDEX)
-                        source_end = source_begin + n
-                        src_base_row = e_base_row + src * MAX_PER_SRC
-                        gather_begin = pl.max(tile_row, source_begin)
-                        gather_end = pl.min(tile_end, source_end)
-                        for out_col in pl.range(gather_begin, gather_end):
-                            in_row = src_base_row + (out_col - source_begin)
-                            out_row = e_base_row + out_col
-                            recv_x_out_flat[out_row : out_row + 1, :] = recv_x[in_row : in_row + 1, :]
-                            pl.write(recv_scale_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_SCALE]))
-                            pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
-                            pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
-                        source_begin = source_end
-                gather_tile_tids[tile] = gather_tile_tid
-            gather_tids[e] = pl.system.task_dummy(deps=[gather_tile_tids])
+        if T <= 8:
+            # Compact source-major payloads with one block per local expert.
+            with pl.spmd(
+                LOCAL_EXPERTS,
+                name_hint="dispatch_gather",
+                deps=[_wait_tid, _meta_tid],
+                allow_early_resolve=False,
+            ) as gather_tid:
+                e = pl.tile.get_block_idx()
+                e_base_row = e * RECV_MAX
+                source_begin = pl.cast(0, pl.INDEX)
+                for src in pl.range(N_RANKS):
+                    n = pl.cast(pl.read(recv_meta_local, [src, e]), pl.INDEX)
+                    src_base_row = e_base_row + src * MAX_PER_SRC
+                    for slot in pl.range(n):
+                        in_row = src_base_row + slot
+                        out_col = source_begin + slot
+                        out_row = e_base_row + out_col
+                        recv_x_out_flat[out_row : out_row + 1, :] = recv_x[in_row : in_row + 1, :]
+                        pl.write(recv_scale_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_SCALE]))
+                        pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
+                        pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
+                    source_begin = source_begin + n
+            gather_done = gather_tid
 
-        _gather_tid = pl.system.task_dummy(deps=[gather_tids[e] for e in range(LOCAL_EXPERTS)])
-        return _gather_tid
+        else:
+            # Gather lanes into the compact per-expert buffers: one task per expert
+            # receive tile. deps on _wait_tid for the incoming payload; this rank's own
+            # dst == my_rank puts are already ordered by the local RAW edges on
+            # recv_x / recv_aux / recv_route. deps on _meta_tid for recv_meta_local, which is
+            # manual_dep and so has no auto edge from the cumsum.
+            # Scalar metadata stores need whole 64-byte lines per task: RECV_MAX and
+            # RECV_TILE are both multiples of 16 FP32/INT32 elements, so an expert row
+            # starts on a line and every tile boundary lands on one.
+            gather_tids = pl.array.create(LOCAL_EXPERTS, pl.TASK_ID)
+            for e in pl.parallel(LOCAL_EXPERTS):
+                gather_tile_tids = pl.array.create(TILES_PER_EXPERT, pl.TASK_ID)
+                expert_rows = pl.cast(pl.read(recv_count_out, [e, 0]), pl.INDEX)
+                expert_tiles = (expert_rows + RECV_TILE - 1) // RECV_TILE
+                for tile in pl.parallel(expert_tiles):
+                    tile_row = tile * RECV_TILE
+                    tile_end = pl.min(tile_row + RECV_TILE, expert_rows)
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="dispatch_gather",
+                        deps=[_wait_tid, _meta_tid],
+                        # Keep the routed expert tasks off the cores until this gather retires.
+                        allow_early_resolve=False,
+                    ) as gather_tile_tid:
+                        e_base_row = e * RECV_MAX
+                        source_begin = pl.cast(0, pl.INDEX)
+                        for src in pl.range(N_RANKS):
+                            n = pl.cast(pl.read(recv_meta_local, [src, e]), pl.INDEX)
+                            source_end = source_begin + n
+                            src_base_row = e_base_row + src * MAX_PER_SRC
+                            gather_begin = pl.max(tile_row, source_begin)
+                            gather_end = pl.min(tile_end, source_end)
+                            for out_col in pl.range(gather_begin, gather_end):
+                                in_row = src_base_row + (out_col - source_begin)
+                                out_row = e_base_row + out_col
+                                recv_x_out_flat[out_row : out_row + 1, :] = recv_x[in_row : in_row + 1, :]
+                                pl.write(recv_scale_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_SCALE]))
+                                pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
+                                pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
+                            source_begin = source_end
+                    gather_tile_tids[tile] = gather_tile_tid
+                gather_tids[e] = pl.system.task_dummy(deps=[gather_tile_tids])
+
+            _gather_tid = pl.system.task_dummy(deps=[gather_tids[e] for e in range(LOCAL_EXPERTS)])
+            gather_done = _gather_tid
+
+        return gather_done
 
 
     @pl.jit.inline(auto_scope=False)
