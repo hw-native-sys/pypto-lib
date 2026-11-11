@@ -50,9 +50,8 @@ from expert_routed import (
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS,
     expert_routed_scatter,
 )
-from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
+from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
 from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
-from rmsnorm import golden_rms_norm_tiled
 from input_pack import gather_rows
 
 
@@ -1116,9 +1115,7 @@ def _golden_moe_core(tensors):
         indices = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.int32)
         weights = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.float32)
         golden_gate_normalized_core({
-            "x_normed": golden_rms_norm_tiled(
-                tensors["x"][src], tensors["norm_weight"][src]
-            ),
+            "x_normed": golden_hc_norm(tensors["x"][src], tensors["norm_weight"][src]),
             "gate_w": tensors["gate_weight"][src],
             "gate_bias": tensors["correction_bias"][src],
             "num_tokens": active,

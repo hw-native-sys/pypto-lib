@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """V4.1 HC coefficient generation, stream collapse, residual expansion, and final collapse."""
 
 import math
@@ -517,16 +518,25 @@ def golden_hc_collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     return (first_pair + second_pair).to(x.dtype)
 
 
-def golden_hc_head_norm(x: torch.Tensor, pre_mix: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Collapse to BF16 and normalize with 64-lane FP32 accumulation and pairwise reduction."""
-    collapsed = golden_hc_collapse(x, pre_mix).bfloat16().float()
-    partial = torch.zeros((*collapsed.shape[:-1], 64), dtype=torch.float32, device=collapsed.device)
-    for begin in range(0, D, 64):
-        partial.add_(collapsed[..., begin:begin + 64].square())
+def golden_hc_norm(collapsed: torch.Tensor, norm_weight: torch.Tensor) -> torch.Tensor:
+    """Normalize BF16 HC rows with sequential 64-lane FP32 accumulators."""
+    value = collapsed.float()
+    width = value.shape[-1]
+    square = value.square().reshape(*value.shape[:-1], width // 64, 64)
+    partial = torch.zeros_like(square[..., 0, :])
+    for chunk in range(width // 64):
+        partial = partial + square[..., chunk, :]
     while partial.shape[-1] > 1:
-        partial = partial[..., ::2] + partial[..., 1::2]
-    inverse = 1.0 / torch.sqrt(partial * (1.0 / D) + NORM_EPS)
-    return (collapsed * inverse * weight.float()).bfloat16()
+        partial = partial[..., 0::2] + partial[..., 1::2]
+    argument = partial * (1.0 / width) + NORM_EPS
+    inverse = torch.ones_like(argument) / torch.sqrt(argument)
+    return (value * inverse * norm_weight.float()).to(torch.bfloat16)
+
+
+def golden_hc_head_norm(x: torch.Tensor, pre_mix: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Collapse four HC streams to BF16 and normalize the resulting rows."""
+    collapsed = golden_hc_collapse(x, pre_mix).bfloat16()
+    return golden_hc_norm(collapsed, weight)
 
 
 def golden_hc_post(

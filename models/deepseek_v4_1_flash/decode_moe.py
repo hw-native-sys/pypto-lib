@@ -519,8 +519,7 @@ def build_moe_specs(num_tokens=MOE_TOKENS, *, initialize=True):
 def golden_moe(tensors):
     """Compose the validated HC references around the MoE reference."""
     import torch
-    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
-    from rmsnorm import golden_rms_norm_tiled
+    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
     from gate import golden_gate_normalized_core
     from expert_shared import golden_expert_shared
     from expert_routed import golden_expert_routed
@@ -563,7 +562,7 @@ def golden_moe(tensors):
         indices = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.int32)
         weights = torch.zeros(MOE_TOKENS, TOPK, dtype=torch.float32)
         golden_gate_normalized_core({
-            "x_normed": golden_rms_norm_tiled(x_mixed[src], tensors['norm_weight'][src]),
+            "x_normed": golden_hc_norm(x_mixed[src], tensors['norm_weight'][src]),
             "gate_w": tensors["gate_weight"][src],
             "gate_bias": tensors["correction_bias"][src],
             "num_tokens": active,

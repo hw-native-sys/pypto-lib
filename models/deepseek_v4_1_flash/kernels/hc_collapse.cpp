@@ -15,6 +15,10 @@
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"
+#if !defined(__CPU_SIM)
+#include <pto/npu/a5/custom/TSqrtHp.hpp>
+#include <pto/npu/a5/custom/Div754.hpp>
+#endif
 using namespace pto;
 namespace {
 template <typename T, int R, int C>
@@ -100,13 +104,13 @@ __tf__ __aicore__ inline void collapse_norm(
                 vmul(square, value, value, full, MODE_ZEROING);
                 vadd(sum, sum, square, full, MODE_ZEROING);
             }
-            RegTensor<float> inverse, one;
+            RegTensor<float> inverse, one, root;
             vcadd(sum, sum, full, MODE_ZEROING);
             vmuls(inverse, sum, 1.0f / 5120.0f, full, MODE_ZEROING);
             vadds(inverse, inverse, 1.0e-6f, full, MODE_ZEROING);
-            vsqrt(inverse, inverse, full, MODE_ZEROING);
+            SqrtFloatImpl<float, RegTensor<float>>(root, inverse, full);
             vdup(one, 1.0f, full, MODE_ZEROING);
-            vdiv(inverse, one, inverse, full, MODE_ZEROING);
+            DivIEEE754FloatImpl<float, RegTensor<float>>(inverse, one, root, full);
             vdup(inverse, inverse, full, POS_LOWEST, MODE_ZEROING);
             mem_bar(VST_VLD);
             for (uint16_t k = 0; k < 80; ++k) {

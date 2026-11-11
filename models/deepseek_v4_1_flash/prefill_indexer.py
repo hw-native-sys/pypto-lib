@@ -719,11 +719,13 @@ def _prefill_index_scores(
     query_flat = pl.reshape(query, [query_rows, INDEX_DIM])
     table_width = pl.tensor.dim(block_table, 1)
     requests = pl.tensor.dim(block_table, 0)
-    with pl.spmd(32, name_hint="prefill_index_mx_scores", deps=[plan_tid, clear_tid, decoded_tid],
+    # Initial V2C FIFO writes require the paired Cube's L1 to be available.
+    workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
+    with pl.spmd(workers, name_hint="prefill_index_mx_scores", sync_start=True, deps=[plan_tid, clear_tid, decoded_tid],
                  optimizations=[pl.cross_core_slot(slot_num=2)]) as score_tid:
         worker = pl.tile.get_block_idx()
         work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)
-        for work in pl.range(worker, work_items, 32):
+        for work in pl.range(worker, work_items, workers):
             lower = pl.cast(0, pl.INDEX)
             upper = groups
             for _ in pl.range(32):
