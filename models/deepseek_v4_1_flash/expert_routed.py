@@ -1098,7 +1098,10 @@ def validate_routed_swiglu(args):
     from golden import run
 
     records = []
-    cases = ("bounds", "tails", "zero") if args.case == "all" else (args.case,)
+    # full is in the default set: bounds tops out at 320 of the 640-row
+    # capacity, so without it the last rows are never active and a regression
+    # that corrupts them at full occupancy would pass.
+    cases = ("bounds", "tails", "zero", "full") if args.case == "all" else (args.case,)
     for case in cases:
         for label, entry in (("swiglu", l2_routed_swiglu_quant),
                              ("swiglu-pypto", l2_routed_swiglu_quant_pypto)):
