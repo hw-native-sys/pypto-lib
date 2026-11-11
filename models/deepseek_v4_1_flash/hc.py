@@ -467,9 +467,14 @@ def hc_post(
 ):
     """Mix all four residual streams after the supplied producer dependencies."""
     tokens = pl.tensor.dim(sublayer, 0)
+    sublayer_view = pl.reshape(sublayer, [tokens, D])
+    residual_view = pl.reshape(residual, [tokens, HC_MULT, D])
+    post_view = pl.reshape(post_mix, [tokens, HC_MULT])
+    mix_view = pl.reshape(residual_mix, [tokens, HC_MULT, HC_MULT])
+    output_view = pl.reshape(output, [tokens, HC_MULT, D])
     workers = pl.min(tokens * (D // D_TILE) * HC_MULT, POST_WORKER_TILE)
     with pl.spmd(workers, name_hint="hc_post", deps=[deps]):
-        _hc_post(sublayer, residual, post_mix, residual_mix, output, tokens)
+        _hc_post(sublayer_view, residual_view, post_view, mix_view, output_view, tokens)
     return output
 
 

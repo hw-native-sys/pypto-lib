@@ -239,8 +239,7 @@ def golden_prepare_target(
     return ids, positions, widths
 
 
-@pl.jit
-def prepare_target_rank(
+def _prepare_target_rank(
     slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
     state_tokens: pl.Tensor[[DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64],
@@ -279,6 +278,9 @@ def prepare_target_rank(
                 pl.write(position_ids, [request, offset], position)
     return input_ids, position_ids, active_widths
 
+prepare_target = pl.jit.inline(auto_scope=False)(_prepare_target_rank)
+prepare_target_rank = pl.jit(auto_scope=False)(_prepare_target_rank)
+
 
 def golden_accept_target(
     slot_ids: torch.Tensor,
@@ -316,8 +318,7 @@ def golden_accept_target(
     return tokens, meta, accepted_ids, accepted_counts
 
 
-@pl.jit
-def accept_target_rank(
+def _accept_target_rank(
     slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
     active_widths: pl.Tensor[[DECODE_BATCH], pl.INT32],
@@ -389,6 +390,9 @@ def accept_target_rank(
                 pl.write(context_positions, [request, offset], position)
     return state_tokens, state_meta, accepted_ids, accepted_counts
 
+accept_target = pl.jit.inline(auto_scope=False)(_accept_target_rank)
+accept_target_rank = pl.jit(auto_scope=False)(_accept_target_rank)
+
 
 def golden_commit_drafts(
     slot_ids: torch.Tensor,
@@ -417,8 +421,7 @@ def golden_commit_drafts(
     return tokens, meta, committed
 
 
-@pl.jit
-def commit_drafts_rank(
+def _commit_drafts_rank(
     slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
     generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
     draft_ids: pl.Tensor[[DECODE_BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
@@ -447,9 +450,11 @@ def commit_drafts_rank(
             pl.write(committed, [request], published)
     return state_tokens, state_meta, committed
 
+commit_drafts = pl.jit.inline(auto_scope=False)(_commit_drafts_rank)
+commit_drafts_rank = pl.jit(auto_scope=False)(_commit_drafts_rank)
 
-@pl.jit
-def prepare_drafter_geometry_rank(
+
+def _prepare_drafter_geometry_rank(
     context_valid: pl.Tensor[[DECODE_BATCH, ROWS], pl.INT32],
     context_positions: pl.Tensor[[DECODE_BATCH, ROWS], pl.INT32],
     first_query_positions: pl.Tensor[[DECODE_BATCH], pl.INT32],
@@ -503,6 +508,9 @@ def prepare_drafter_geometry_rank(
                     pl.write(query_rope_cos, [row, col], cos)
                     pl.write(query_rope_sin, [row, col], sin)
     return context_slots, context_rope_cos, context_rope_sin, query_rope_cos, query_rope_sin
+
+prepare_drafter_geometry = pl.jit.inline(auto_scope=False)(_prepare_drafter_geometry_rank)
+prepare_drafter_geometry_rank = pl.jit(auto_scope=False)(_prepare_drafter_geometry_rank)
 
 
 @pl.jit
