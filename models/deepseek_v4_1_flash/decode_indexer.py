@@ -744,69 +744,12 @@ def score_select_reindex(
     weights_ready: pl.Scalar[pl.TASK_ID],
     pool_ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Route identity candidate pools to paged MIX and sparse pools to gathered MIX."""
-    capacity = pl.tensor.dim(pool_block_ids, 1)
-    width = pl.tensor.dim(scores, 1)
-    table_width = pl.tensor.dim(block_table, 1)
-    request_count = pl.tensor.dim(block_table, 0)
-    cache_pages = pl.tensor.dim(index_cache, 0)
-    flags = pl.create_tensor([32, 32], dtype=pl.INT32)
-    with pl.spmd(32, name_hint="idx_plan_pool", deps=[cache_ready, pool_ready]) as plan_tid:
-        worker = pl.tile.get_block_idx()
-        dense = pl.cast(1, pl.INT32)
-        mismatch = pl.tile.full([1, 64], dtype=pl.FP32, value=0.0)
-        for token in pl.range(worker, num_tokens, 32):
-            count = pl.max(0, pl.min(pl.read(pool_block_counts, [token]), capacity))
-            visible = pl.max(0, pl.read(lengths, [token]))
-            request = pl.read(request_ids, [token])
-            if count != (visible + 7) // 8 or visible > width or visible > table_width * 128:
-                dense = pl.cast(0, pl.INT32)
-            if request < 0 or request >= request_count:
-                dense = pl.cast(0, pl.INT32)
-            if dense == 1:
-                for start in pl.range(0, count, 1024):
-                    active = pl.min(1024, count - start)
-                    raw = pl.load(pool_block_ids, [token, start], [1, 1024], valid_shape=[1, active])
-                    ids = pl.tile.fillpad(raw, pad_value=pl.PadValue.zero)
-                    lanes = pl.tile.arange(0, [1, 1024], dtype=pl.INT32)
-                    expected = pl.add(lanes, pl.cast(start, pl.INT32))
-                    error = pl.abs(pl.cast(pl.sub(ids, expected), pl.FP32))
-                    valid = pl.tile.cmps(lanes, pl.cast(active, pl.INT32), cmp_type=2)
-                    error = pl.tile.select(valid, error, 0.0)
-                    mismatch = pl.add(mismatch, pl.col_sum(pl.reshape(error, [16, 64])))
-                page_count = (visible + 127) // 128
-                for start in pl.range(0, page_count, 128):
-                    active = pl.min(128, page_count - start)
-                    raw_pages = pl.load(block_table, [request, start], [1, 128], valid_shape=[1, active])
-                    pages = pl.tile.fillpad(raw_pages, pad_value=pl.PadValue.zero)
-                    bad = pl.tile.cmps(pages, pl.cast(cache_pages, pl.INT32), cmp_type=5)
-                    page_errors = pl.tile.select(bad, pl.tile.full([1, 128], dtype=pl.FP32, value=1.0), 0.0)
-                    mismatch = pl.add(mismatch, pl.col_sum(pl.reshape(page_errors, [2, 64])))
-        sums = pl.col_sum(pl.reshape(mismatch, [8, 8]))
-        for lane in pl.unroll(8):
-            if pl.tile.read(sums, [0, lane]) != 0.0:
-                dense = pl.cast(0, pl.INT32)
-        pl.write(flags, [worker, 0], dense)
-    route = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_reduce_pool_route", deps=[plan_tid]) as route_tid:
-        dense = pl.cast(1, pl.INT32)
-        for worker in pl.range(32):
-            dense = dense * pl.read(flags, [worker, 0])
-        pl.write(route, [0], dense)
-    tokens = pl.tensor.dim(output, 0)
-    dense_width = pl.min(width, table_width * 128)
-    paged_scores = pl.create_tensor([tokens, dense_width], dtype=pl.FP32)
-    paged, _ = score_select_paged(
-        query, query_scale, weights, index_cache, index_cache_scale,
-        block_table, request_ids, lengths, paged_scores, output,
-        num_tokens, route_tid, query_ready, weights_ready, capacity, False, route, True,
-    )
-    pooled = _score_select_pool(
+    """Score candidate pools with the same gathered path for dense and sparse histories."""
+    return _score_select_pool(
         query, query_scale, weights, index_cache, index_cache_scale,
         block_table, request_ids, lengths, pool_block_ids, pool_block_counts, scores, output,
-        num_tokens, cache_ready, query_ready, weights_ready, route_tid, route,
+        num_tokens, cache_ready, query_ready, weights_ready, pool_ready,
     )
-    return pl.system.task_dummy(deps=[paged, pooled])
 
 
 @pl.jit.inline(auto_scope=False)
@@ -828,7 +771,6 @@ def _score_select_pool(
     query_ready: pl.Scalar[pl.TASK_ID],
     weights_ready: pl.Scalar[pl.TASK_ID],
     pool_ready: pl.Scalar[pl.TASK_ID],
-    route: pl.Tensor[[1], pl.INT32],
 ):
     """Gather candidate blocks and select compact scores with physical-row mappings."""
     capacity = pl.tensor.dim(pool_block_ids, 1)
@@ -849,7 +791,7 @@ def _score_select_pool(
     runs = pl.create_tensor([4, tokens + 1], dtype=pl.INT32)
     table_width = pl.tensor.dim(block_table, 1)
     request_count = pl.tensor.dim(block_table, 0)
-    with pl.spmd(32, name_hint="idx_gather_pool", deps=[cache_ready, pool_ready], predicate=(route[0] == 0)) as gather_tid:
+    with pl.spmd(32, name_hint="idx_gather_pool", deps=[cache_ready, pool_ready]) as gather_tid:
         worker = pl.tile.get_block_idx()
         for work in pl.range(worker, num_tokens * panels, 32):
             token = work // panels
@@ -895,7 +837,7 @@ def _score_select_pool(
             pl.store(scale_bytes, [0, row_offset * _SCALE_COUNT], scales)
             pl.store(valid_lanes, [0, row_offset], valid)
             pl.store(physical_lanes, [0, row_offset], physical)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_plan_pool_runs", deps=[pool_ready], predicate=(route[0] == 0)) as runs_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_plan_pool_runs", deps=[pool_ready]) as runs_tid:
         for token in pl.range(num_tokens):
             count = pl.max(0, pl.min(pl.read(pool_block_counts, [token]), capacity))
             pl.write(runs, [0, token], pl.cast(token, pl.INT32))
@@ -914,7 +856,7 @@ def _score_select_pool(
     length_rows = pl.reshape(lengths, [tokens])
     output_rows = pl.reshape(output, [tokens, INDEX_TOPK])
     score_rows = pl.slice(scores, [tokens, width], [0, 0])
-    with pl.spmd(workers, name_hint="idx_score_topk", sync_start=True, deps=[gather_tid, runs_tid, query_ready, weights_ready], predicate=(route[0] == 0)) as mix_tid:
+    with pl.spmd(workers, name_hint="idx_score_topk", sync_start=True, deps=[gather_tid, runs_tid, query_ready, weights_ready]) as mix_tid:
         _idx_pool_score_topk(
             query_rows, scale_rows, weight_rows, payloads, scales,
             block_table, request_rows, length_rows, output_rows, runs, candidate_keys, candidate_indices,
@@ -942,8 +884,6 @@ def score_select_paged(
     weights_ready: pl.Scalar[pl.TASK_ID],
     pool_capacity: pl.Scalar[pl.INDEX],
     c2a: pl.constexpr,
-    route: pl.Tensor,
-    routed: pl.constexpr,
 ):
     """Score history shards and merge their TopK within one MIX."""
     width = pl.tensor.dim(scores, 1)
@@ -975,27 +915,14 @@ def score_select_paged(
     score_rows = pl.slice(scores, [capacity, width], [0, 0])
     candidate_keys = pl.create_tensor([capacity, shards * INDEX_TOPK], dtype=pl.UINT16)
     candidate_indices = pl.create_tensor([capacity, shards * INDEX_TOPK], dtype=pl.INT32)
-    completion = pl.array.create(1, pl.TASK_ID)
-    completion[0] = plan_tid
-    if routed:
-        with pl.spmd(workers, name_hint="idx_score_topk", sync_start=True, deps=[plan_tid, query_ready, weights_ready, cache_ready], predicate=(route[0] != 0)) as mix_tid:
-            mixed_output = _idx_score_topk(
-                query_rows, scale_rows, weight_rows, index_cache, index_cache_scale,
-                block_table, request_rows, length_rows, mixed_output, runs, candidate_keys, candidate_indices,
-                block_table, block_table, score_rows, width, run_stride, table_width, active_tokens, 0,
-                emit_scores, shards, direct_short,
-            )
-        completion[0] = mix_tid
-    else:
-        with pl.spmd(workers, name_hint="idx_score_topk", sync_start=True, deps=[plan_tid, query_ready, weights_ready]) as mix_tid:
-            mixed_output = _idx_score_topk(
-                query_rows, scale_rows, weight_rows, index_cache, index_cache_scale,
-                block_table, request_rows, length_rows, mixed_output, runs, candidate_keys, candidate_indices,
-                block_table, block_table, score_rows, width, run_stride, table_width, active_tokens, 0,
-                emit_scores, shards, direct_short,
-            )
-        completion[0] = mix_tid
-    return completion[0], completion[0]
+    with pl.spmd(workers, name_hint="idx_score_topk", sync_start=True, deps=[plan_tid, query_ready, weights_ready]) as mix_tid:
+        mixed_output = _idx_score_topk(
+            query_rows, scale_rows, weight_rows, index_cache, index_cache_scale,
+            block_table, request_rows, length_rows, mixed_output, runs, candidate_keys, candidate_indices,
+            block_table, block_table, score_rows, width, run_stride, table_width, active_tokens, 0,
+            emit_scores, shards, direct_short,
+        )
+    return mix_tid, mix_tid
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2420,7 +2347,6 @@ def decode_c2a_indexer(
         query, query_scale, raw_weights, index_cache, index_cache_scale,
         index_block_table, token_to_req_indices, compressed_lens, scores, topk_indices,
         num_tokens, index_publish_tid, query_tid, weights_tid, score_width // CANDIDATE_BLOCK_SIZE, True,
-        token_to_req_indices, False,
     )
     return selected_tid
 
