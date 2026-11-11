@@ -11,6 +11,7 @@
 """DeepSeek V4.1 DSpark projection, metadata, and three-layer drafter."""
 
 from dataclasses import dataclass
+from pathlib import Path
 import inspect
 import pypto.language as pl
 
@@ -36,10 +37,12 @@ from expert_routed import (
 )
 from input_pack import pack_x_hc
 from utils import paged_slots
+from pypto.runtime import pto_isa_include_dir
 from decode_moe import AUX_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
 
 from dspark_attention import dspark_attention
-from dspark_context_kv import dspark_context_kv
+from dspark_context_kv import dspark_context_kv_quantized
+from qkv_proj_rope import quantize_projection_input
 from hc import golden_hc_collapse, golden_hc_post, golden_hc_mixes
 from config import (
     DSPARK_DRAFT_LAYERS,
@@ -181,6 +184,18 @@ def golden_query_metadata(
     return DSparkQueryMetadata(token_ids, positions, query_slots, window_indices, window_lens)
 
 
+@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "dspark_projection.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _dspark_projection_native(
+    target_hidden: pl.Tensor,
+    main_proj_weight: pl.Tensor,
+    projected: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Project target taps directly into BF16 rows with Cube Fixpipe stores."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def dspark_proj(
     target_hidden: pl.Tensor[[T_DYN, MAIN_IN], pl.BF16],
@@ -192,19 +207,9 @@ def dspark_proj(
     """Project the ordered target taps and normalize only active token rows."""
     tokens = pl.tensor.dim(target_hidden, 0)
     projected = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    for block in pl.spmd((num_tokens + 15) // 16 * (D // 128), name_hint="dspark_main_proj"):
-        row = block // (D // 128) * 16
-        col = block % (D // 128) * 128
-        rows = pl.min(16, num_tokens - row)
-        acc = pl.create_tensor([16, 128], dtype=pl.FP32)
-        for k in pl.range(0, MAIN_IN, 256):
-            source = pl.slice(target_hidden, [16, 256], [row, k], valid_shape=[rows, 256])
-            weight = pl.slice(main_proj_weight, [256, 128], [k, col])
-            acc = pl.matmul_acc(acc, source, weight, init_cond=(k == 0))
-        projected[row : row + 16, col : col + 128] = pl.set_validshape(
-            pl.cast(acc, pl.BF16, mode="rint"), rows, 128
-        )
-    for block in pl.spmd((num_tokens + 7) // 8, name_hint="dspark_main_norm"):
+    with pl.spmd(32, name_hint="dspark_main_proj") as projected_ready:
+        projected = _dspark_projection_native(target_hidden, main_proj_weight, projected, num_tokens)
+    for block in pl.spmd((num_tokens + 7) // 8, name_hint="dspark_main_norm", deps=[projected_ready]):
         rms_norm_tiled(projected, main_norm_weight, main_x, block, num_tokens, output_fp32=False)
     return main_x
 
@@ -222,6 +227,22 @@ def dspark_proj_test(
     return dspark_proj(target_hidden, main_proj_weight, main_norm_weight, main_x, num_tokens)
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "dspark_metadata.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _dspark_metadata_native(
+    anchor_ids: pl.Tensor,
+    first_query_positions: pl.Tensor,
+    block_tables: pl.Tensor,
+    query_ids: pl.Out[pl.Tensor],
+    query_positions: pl.Out[pl.Tensor],
+    query_slots: pl.Out[pl.Tensor],
+    window_indices: pl.Out[pl.Tensor],
+    window_lens: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    """Publish draft query metadata from paged request tables."""
+    ...
+
+
 @pl.jit.inline(auto_scope=False)
 def dspark_metadata(
     anchor_ids: pl.Tensor[[B_DYN], pl.INT64],
@@ -234,49 +255,34 @@ def dspark_metadata(
     window_lens: pl.Tensor[[DSPARK_DRAFT_LAYERS, B_DYN], pl.INT32],
 ):
     batch = pl.tensor.dim(anchor_ids, 0)
-    for worker in pl.spmd(1, name_hint="dspark_query_metadata"):
-        for request_offset in pl.range(batch):
-            request = worker + request_offset
-            first = pl.read(first_query_positions, [request])
-            anchor = pl.read(anchor_ids, [request])
-            active = first > 0
-            prefix_start = pl.max(first - DSPARK_WINDOW, 0)
-            context_len = first - prefix_start
-            visible_len = pl.cast(context_len + DSPARK_QUERY_WIDTH, pl.INT32)
-            if not active:
-                visible_len = pl.cast(0, pl.INT32)
-            for offset in pl.range(DSPARK_QUERY_WIDTH):
-                token = request * DSPARK_QUERY_WIDTH + offset
-                token_id = pl.cast(0, pl.INT64)
-                if active:
-                    token_id = pl.cast(DSPARK_NOISE_TOKEN_ID, pl.INT64)
-                if active and offset == 0:
-                    token_id = anchor
-                pl.write(query_ids, [token], token_id)
-                position = pl.cast(0, pl.INT32)
-                if active:
-                    position = pl.cast(first + offset, pl.INT32)
-                pl.write(query_positions, [token], position)
-            for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                pl.write(window_lens, [layer, request], pl.cast(visible_len, pl.INT32))
-                for query in pl.range(DSPARK_QUERY_WIDTH):
-                    token = request * DSPARK_QUERY_WIDTH + query
-                    pl.write(query_slots, [layer, token], pl.cast(-1, pl.INT64))
-                for offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
-                    slot = pl.cast(-1, pl.INT32)
-                    if offset < visible_len:
-                        position = pl.cast(prefix_start + offset, pl.INT32)
-                        logical_block = position // BLOCK_SIZE
-                        physical_block = pl.read(
-                            block_tables, [layer, request, pl.cast(logical_block, pl.INDEX)]
-                        )
-                        slot = pl.cast(physical_block * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT32)
-                    for query in pl.range(DSPARK_QUERY_WIDTH):
-                        token = request * DSPARK_QUERY_WIDTH + query
-                        pl.write(window_indices, [layer, token, offset], slot)
-                        if active and offset == context_len + query:
-                            pl.write(query_slots, [layer, token], pl.cast(slot, pl.INT64))
+    workers = pl.max(1, pl.min(batch * DSPARK_DRAFT_LAYERS, 64))
+    with pl.spmd(workers, name_hint="dspark_query_metadata"):
+        query_ids = _dspark_metadata_native(
+            anchor_ids, first_query_positions, block_tables, query_ids, query_positions,
+            query_slots, window_indices, window_lens,
+        )
     return query_ids, query_positions, query_slots, window_indices, window_lens
+
+
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "dspark_pad_queries.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _dspark_pad_queries_native(
+    query_ids: pl.Tensor,
+    query_slots: pl.Tensor,
+    window_indices: pl.Tensor,
+    query_rope_cos: pl.Tensor,
+    query_rope_sin: pl.Tensor,
+    padded_ids: pl.Out[pl.Tensor],
+    padded_slots: pl.Out[pl.Tensor],
+    padded_indices: pl.Out[pl.Tensor],
+    rope_cos: pl.Out[pl.Tensor],
+    rope_sin: pl.Out[pl.Tensor],
+    pre_mix: pl.Out[pl.Tensor],
+    first_token: pl.Scalar[pl.INDEX],
+    active_tokens: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor]:
+    """Pack one query chunk and initialize its incoming HC coefficients."""
+    return padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix
 
 
 @pl.jit.inline
@@ -444,7 +450,7 @@ def draft_layer(
         num_tokens,
         rank,
         moe_epoch,
-        force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
+        force_topk, local_experts=N_LOCAL_EXPERTS, topk=TOPK, dispatch_worker_limit=64,
     )
     return x_next, next_pre_mix
 
@@ -576,10 +582,16 @@ def _dspark_drafter(
         window_lens,
     )
 
+    context_payload, context_scales, context_padded_rows = quantize_projection_input(
+        main_x, context_tokens, row_tile=80,
+    )
     for layer in pl.unroll(DSPARK_DRAFT_LAYERS):
         layer_wkv_scale: pl.Tensor[[D // MX_GROUP, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[layer]
-        dspark_context_kv(
-            main_x,
+        context_projected = pl.create_tensor([context_tokens, HEAD_DIM], dtype=pl.BF16)
+        dspark_context_kv_quantized(
+            context_payload,
+            context_scales,
+            context_projected,
             wkv[layer],
             layer_wkv_scale,
             kv_norm_weight[layer],
@@ -600,36 +612,15 @@ def _dspark_drafter(
         )
         rope_cos = pl.create_tensor([MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
         rope_sin = pl.create_tensor([MOE_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
-        for _ in pl.spmd(1, name_hint="dspark_pad_queries"):
-            for token in pl.range(MOE_TOKENS):
-                token_id = pl.cast(0, pl.INT64)
-                if token < active_tokens:
-                    source = first_token + token
-                    token_id = pl.read(query_ids, [source])
-                    rope_cos[token : token + 1, :] = query_rope_cos[source : source + 1, :]
-                    rope_sin[token : token + 1, :] = query_rope_sin[source : source + 1, :]
-                pl.write(padded_ids, [token], token_id)
-                for layer in pl.range(DSPARK_DRAFT_LAYERS):
-                    slot = pl.cast(-1, pl.INT64)
-                    if token < active_tokens:
-                        slot = pl.read(query_slots, [layer, first_token + token])
-                    pl.write(padded_slots, [layer, token], slot)
-                    for offset in pl.range(DSPARK_SWA_INDEX_WIDTH):
-                        index = pl.cast(-1, pl.INT32)
-                        if token < active_tokens:
-                            index = pl.read(window_indices, [layer, first_token + token, offset])
-                        pl.write(padded_indices, [layer, token, offset], index)
-
+        pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
+        with pl.spmd(64, name_hint="dspark_pad_queries"):
+            padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix = _dspark_pad_queries_native(
+                query_ids, query_slots, window_indices, query_rope_cos, query_rope_sin,
+                padded_ids, padded_slots, padded_indices, rope_cos, rope_sin, pre_mix,
+                first_token, active_tokens,
+            )
         x_hc = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
         pack_x_hc(padded_ids, embedding_weight, x_hc, hidden_tile=512)
-        pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
-        for _ in pl.spmd(1, name_hint="dspark_initial_pre_mix"):
-            for token in pl.range(MOE_TOKENS):
-                for lane in pl.range(HC_MULT):
-                    value = pl.cast(0.0, pl.FP32)
-                    if lane == 0:
-                        value = pl.cast(1.0, pl.FP32)
-                    pl.write(pre_mix, [token, lane], value)
 
         for layer in pl.unroll(DSPARK_DRAFT_LAYERS):
             layer_wq_a_scale: pl.Tensor[[D // MX_GROUP, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[
@@ -1087,11 +1078,13 @@ if __name__ == "__main__":
     parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=C.SUPPORTED_TP_SIZES)
     parser.add_argument("--dp", type=int, default=C.DP_SIZE)
     parser.add_argument("--ep", type=int, default=C.EP_SIZE, choices=C.SUPPORTED_EP_SIZES)
-    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5sim")
+    parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=",".join(str(rank) for rank in range(EP_SIZE)))
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
+    if args.execution_mode or args.platform == "a5sim":
+        parser.error("DSpark native kernels require A5 device execution; simulator support is unavailable")
     if (args.tp, args.dp, args.ep) != (C.TP_SIZE, C.DP_SIZE, C.EP_SIZE):
         parser.error("--tp/--dp/--ep must match the import-time configuration")
     if args.mode == "all":

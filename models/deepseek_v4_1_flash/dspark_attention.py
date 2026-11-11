@@ -6,8 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """DSpark sliding-window attention over history and all five query rows."""
 
+from pathlib import Path
+from pypto.runtime import pto_isa_include_dir
 from utils import packed_cache_compare
 
 import pypto.language as pl
@@ -34,41 +37,53 @@ Q_LORA = FLASH.q_lora_rank
 ROPE_DIM = FLASH.qk_rope_head_dim
 
 
-M_TILE = 16
+QUERY_HEAD_TILE = max(32, LOCAL_H)
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 
 
-@pl.jit.inline
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "dspark_gather.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _gather_dspark_window_native(
+    cache: pl.Tensor,
+    indices: pl.Tensor,
+    selected: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Gather and dequantize DSpark windows with guarded query reuse."""
+    ...
+
+
+@pl.jit.inline(auto_scope=False)
 def gather_dspark_window(
     cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     selected: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    cache_rows = pl.tensor.dim(cache, 0) * 128
-    raw = pl.reshape(cache, [cache_rows, WINDOW_CACHE_BYTES])
-    for block in pl.spmd(num_tokens * (DSPARK_SWA_INDEX_WIDTH // 16), name_hint="dspark_cache_gather"):
-        token = block // (DSPARK_SWA_INDEX_WIDTH // 16)
-        for i in pl.range(block % (DSPARK_SWA_INDEX_WIDTH // 16) * 16, block % (DSPARK_SWA_INDEX_WIDTH // 16) * 16 + 16):
-            row_i32 = pl.read(indices, [token, i])
-            column = i * HEAD_DIM
-            if row_i32 >= 0:
-                row = pl.cast(row_i32, pl.INDEX)
-                payload_bytes = raw[row:row + 1, :HEAD_DIM]
-                signed = pl.reinterpret_view(payload_bytes, pl.INT8)
-                payload = pl.reinterpret_view(signed, pl.FP8E4M3FN)
-                value = pl.reshape(pl.cast(payload, pl.FP32), [HEAD_DIM // 32, 32])
-                scale_bytes = raw[row:row + 1, HEAD_DIM:WINDOW_CACHE_BYTES]
-                scale_row = pl.reinterpret_view(scale_bytes, pl.BF16)
-                scale = pl.reshape(pl.cast(scale_row, pl.FP32), [HEAD_DIM // 32, 1])
-                decoded = pl.cast(pl.row_expand_mul(value, scale), pl.BF16, mode="rint")
-                selected[token:token + 1, column:column + HEAD_DIM] = pl.reshape(decoded, [1, HEAD_DIM])
-            else:
-                selected[token:token + 1, column:column + HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+    groups = (num_tokens + DSPARK_QUERY_WIDTH - 1) // DSPARK_QUERY_WIDTH
+    workers = pl.max(1, pl.min(groups * (DSPARK_SWA_INDEX_WIDTH // 32), 64))
+    with pl.spmd(workers, name_hint="dspark_cache_gather"):
+        selected = _gather_dspark_window_native(cache, indices, selected, num_tokens)
     return selected
 
 
-@pl.jit.inline
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "dspark_attention_core.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "dspark_attention_core.cpp",
+               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
+def _attend_dspark_native(
+    query: pl.Tensor,
+    selected: pl.Tensor,
+    indices: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    heads: pl.Scalar[pl.INT32],
+) -> pl.Tensor:
+    """Attend selected K64 tiles with paired ownership and BF16 probabilities."""
+    ...
+
+
+@pl.jit.inline(auto_scope=False)
 def attend_dspark_window(
     query: pl.Tensor[[MOE_TOKENS, LOCAL_H * HEAD_DIM], pl.BF16],
     selected: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], pl.BF16],
@@ -77,50 +92,19 @@ def attend_dspark_window(
     output: pl.Tensor[[MOE_TOKENS, LOCAL_H * HEAD_DIM], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    tokens = pl.tensor.dim(query, 0)
-    head_rows = tokens * LOCAL_H
-    cache_rows = tokens * DSPARK_SWA_INDEX_WIDTH
-    qflat = pl.reshape(query, [head_rows, HEAD_DIM])
-    kflat = pl.reshape(selected, [cache_rows, HEAD_DIM])
-    oflat = pl.reshape(output, [head_rows, HEAD_DIM])
-    for block in pl.spmd(num_tokens * (LOCAL_H // M_TILE), name_hint="dspark_online_attention"):
-        token = block // (LOCAL_H // M_TILE)
-        head = block % (LOCAL_H // M_TILE) * M_TILE
-        q0 = token * LOCAL_H + head
-        maximum = pl.full([1, M_TILE], dtype=pl.FP32, value=-1e30)
-        denominator = pl.full([1, M_TILE], dtype=pl.FP32, value=0.0)
-        numerator = pl.full([M_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-        for part in pl.range(DSPARK_SWA_INDEX_WIDTH // 64):
-            k0 = token * DSPARK_SWA_INDEX_WIDTH + part * 64
-            q = qflat[q0:q0 + M_TILE, :]
-            kv = kflat[k0:k0 + 64, :]
-            scores = pl.mul(pl.matmul(q, kv, b_trans=True), SOFTMAX_SCALE)
-            idx = pl.cast(indices[token:token + 1, part * 64:part * 64 + 64], pl.FP32)
-            valid = pl.minimum(pl.maximum(pl.add(idx, 1.0), 0.0), 1.0)
-            bias = pl.mul(pl.sub(valid, 1.0), 1e30)
-            scores = pl.col_expand_add(scores, bias)
-            next_max = pl.maximum(maximum, pl.reshape(pl.row_max(scores), [1, M_TILE]))
-            correction = pl.exp(pl.sub(maximum, next_max))
-            probabilities = pl.col_expand_mul(
-                pl.exp(pl.row_expand_sub(scores, pl.reshape(next_max, [M_TILE, 1]))), valid
-            )
-            denominator = pl.add(
-                pl.mul(denominator, correction), pl.reshape(pl.row_sum(probabilities), [1, M_TILE])
-            )
-            weights = pl.cast(probabilities, pl.BF16, mode="rint")
-            weighted = pl.matmul(weights, kv)
-            numerator = pl.add(
-                pl.row_expand_mul(numerator, pl.reshape(correction, [M_TILE, 1])), weighted
-            )
-            maximum = next_max
-        sinks = pl.reshape(sink[head:head + M_TILE], [1, M_TILE])
-        final_max = pl.maximum(maximum, sinks)
-        correction = pl.exp(pl.sub(maximum, final_max))
-        denominator = pl.add(pl.mul(denominator, correction), pl.exp(pl.sub(sinks, final_max)))
-        result = pl.row_expand_mul(
-            numerator, pl.reshape(pl.div(correction, denominator), [M_TILE, 1])
-        )
-        oflat[q0:q0 + M_TILE, :] = pl.cast(result, pl.BF16, mode="rint")
+    workers = pl.max(1, pl.min(num_tokens, 32))
+    if LOCAL_H < 32:
+        padded_query = pl.create_tensor([MOE_TOKENS, QUERY_HEAD_TILE * HEAD_DIM], dtype=pl.BF16)
+        for row in pl.spmd(num_tokens, name_hint="dspark_pad_heads"):
+            padded = pl.full([1, QUERY_HEAD_TILE * HEAD_DIM], dtype=pl.BF16, value=0.0)
+            active_query = query[row : row + 1, :]
+            padded = pl.assemble(padded, active_query, [0, 0])
+            padded_query[row : row + 1, :] = padded
+        with pl.spmd(workers, name_hint="dspark_online_attention"):
+            output = _attend_dspark_native(padded_query, selected, indices, sink, output, num_tokens, LOCAL_H)
+    else:
+        with pl.spmd(workers, name_hint="dspark_online_attention"):
+            output = _attend_dspark_native(query, selected, indices, sink, output, num_tokens, LOCAL_H)
     return output
 
 
@@ -174,9 +158,9 @@ def dspark_attention(
         num_tokens, window_input_ready,
     )
     selected = pl.create_tensor([MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH * HEAD_DIM], dtype=pl.BF16)
-    gather_result = gather_dspark_window(window_cache, window_indices, selected, num_tokens)
+    selected = gather_dspark_window(window_cache, window_indices, selected, num_tokens)
     attended = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attend_result = attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
+    attended = attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
     o_proj_result = o_proj(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin, output, num_tokens, worker_limit=32, oa_row_tile=80, ob_row_tile=80,
@@ -253,6 +237,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("DSpark native attention requires A5 device execution; simulator support is unavailable")
     import torch
 
     from golden import ScalarSpec, TensorSpec, ratio_allclose, run

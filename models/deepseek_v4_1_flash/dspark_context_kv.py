@@ -85,6 +85,28 @@ def dspark_context_kv(
     kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(
         main_x, num_tokens, row_tile=80,
     )
+    dspark_context_kv_quantized(
+        kv_input_payload, kv_input_scales, projected, wkv, wkv_scale,
+        kv_norm_weight, rope_cos, rope_sin, context_slots, window_cache, num_tokens,
+    )
+    return window_cache
+
+
+@pl.jit.inline(auto_scope=False)
+def dspark_context_kv_quantized(
+    kv_input_payload: pl.Tensor,
+    kv_input_scales: pl.Tensor,
+    projected: pl.Tensor,
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    context_slots: pl.Tensor,
+    window_cache: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Project shared quantized context inputs through one layer's own weights."""
     window_input_ready = pl.system.task_dummy(deps=[])
     projected = kv_proj(
         kv_input_payload, kv_input_scales,
