@@ -13,6 +13,20 @@ qualification covers request state, completion, and retirement in Serving.
 
 Coverage is limited to the models and configurations listed here.
 
+## A5 V4.1 forward port
+
+The forward-port baseline is Lib `eae7902015d84817707da32034ab8b44039be336`.
+Lib [#1763](https://github.com/hw-native-sys/pypto-lib/pull/1763) adds
+register indexer and stable TopK implementations. The current C1A decode
+entry still calls `score_select_paged`, so validate the active entry when
+checking the historical device-count and dependency fixes.
+
+Start with the current EP2 decode-layer golden under TMR and HBG. Validate
+any indexer fix, routed MoE workspace reuse, or communication wait change
+against its current callers. Qualify the forward port on the full EP4
+model with teacher-forced output and state comparisons and the Serving
+request lifecycle.
+
 ## PyPTO and Simpler dependencies
 
 As checked on 2026-11-11, PyPTO main
