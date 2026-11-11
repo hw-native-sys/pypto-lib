@@ -28,7 +28,7 @@ def paged_attention_pypto_swpipe(...):
         core = pl.tile.get_block_idx()
 
         # 1. Prepare the current token: Q/K norm, RoPE, and K/V cache append (Chapter 4).
-        for aiv_id in pl.split_aiv(2):
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
             phase0(...)
 
         publish_gm_and_sync_mixed_cores()
@@ -44,7 +44,7 @@ def paged_attention_pypto_swpipe(...):
                     consume_pv(stack=tick - 2)
 
             # AIV loop
-            for aiv_id in pl.split_aiv(2):
+            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
                 for tick in pl.range(stack_count + 2):
                     if tick < stack_count:
                         # 3. Softmax: update m/l and write P (Chapter 6).
@@ -221,8 +221,8 @@ of work and assigns tasks to 24 cores.
 The AIC and AIV loops execute concurrently. Three READY events constrain the
 ordering inside each stack.
 
-`pl.split_aiv(2)` makes two AIV lanes execute one copy of the vector code each;
-AIC executes the QK and PV matrix multiplications.
+`pl.split_aiv(2, mode=pl.SplitMode.NONE)` makes two AIV lanes execute one copy
+of the vector code each; AIC executes the QK and PV matrix multiplications.
 
 ### 3.2 Launch 24 cores { #step-3-2 }
 

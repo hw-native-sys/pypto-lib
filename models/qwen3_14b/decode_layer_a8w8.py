@@ -724,7 +724,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             down_part_row = down_k_split * BATCH_PAD
             with pl.at(
                 level=pl.Level.CORE_GROUP,
-                optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
+                optimizations=[pl.cross_core_slot(slot_num=2)],
                 no_dep_args=[down_acc_parts],
                 name_hint="down_dual_proj",
                 deps=[silu_barrier],

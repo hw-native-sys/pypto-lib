@@ -307,7 +307,7 @@ def _prefill_indexer_score_topk(
     kv_scale_flat = pl.reshape(idx_kv_scale, [idx_cache_rows, 1])
     with pl.spmd(
         TOPK_SCORE_WORKERS, name_hint="prefill_idx_score_leaf_wave", deps=[completion[0]],
-        optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
+        optimizations=[pl.cross_core_slot(slot_num=2)],
     ) as score_tid:
         worker = pl.tile.get_block_idx()
         global_leaf_base = 0
