@@ -90,10 +90,12 @@ PyPTO main plus #3321 combination has separate offline evidence.
 
 The companion Serving patch also replays on Serving main
 `6474df7d42e9342c8b74613a8258bf6776f71713`. The resulting Serving tree
-`1263802bd255cd0441b9b82b24f21fbdc0988825` passed 156 targeted
-DeepSeek, Qwen request-state, and CLI tests with Lib `b0945fe`.
+`d66cfd545b8f5b22f17b20e74f209a4df0166800` passed 156 targeted
+DeepSeek, Qwen request-state, and CLI tests with Lib `b0945fe`. The
+DeepSeek executor configures its compiler from the model's selected chip
+runtime, matching Serving #308's compile-context checks.
 Use the reviewed Serving patch for this tree. Its SHA-256 is
-`189e9f3066976c55f47b2d7e2b3ace2726aaa6fcb168ce6fb012f6cd5fd55a4e`.
+`ebee14b1abcba7e4ddfa0cc4ef9ccfd233df5577e04642127445175b5cb2a88e`.
 The eight-card validation with this Serving tree and the PyPTO main
 plus #3321 compiler is queued separately.
 
