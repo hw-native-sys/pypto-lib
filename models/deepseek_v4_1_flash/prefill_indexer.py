@@ -659,10 +659,13 @@ def _prefill_index_scores(
     capacity = pl.tensor.dim(pool_ids, 1)
     prefix_rows = groups + 1
     prefix = pl.create_tensor([prefix_rows], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_index_plan", deps=[ready, route_ready], predicate=(route[route_index] != 0)) as plan_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_index_plan", deps=[ready, route_ready]) as plan_tid:
         total = pl.cast(0, pl.INDEX)
         pl.write(prefix, [0], pl.cast(total, pl.INT32))
-        for group in pl.range(groups):
+        active_groups = pl.cast(0, pl.INDEX)
+        if pl.read(route, [route_index]) != 0:
+            active_groups = groups
+        for group in pl.range(active_groups):
             visible = pl.cast(0, pl.INDEX)
             for row in pl.unroll(query_tile):
                 token = group * query_tile + row
@@ -678,9 +681,12 @@ def _prefill_index_scores(
             pl.write(prefix, [group + 1], pl.cast(total, pl.INT32))
 
     output_panels = (width + 127) // 128
-    with pl.spmd(32, name_hint="prefill_index_score_clear", deps=[ready, route_ready], predicate=(route[route_index] != 0)) as clear_tid:
+    with pl.spmd(32, name_hint="prefill_index_score_clear", deps=[ready, route_ready]) as clear_tid:
         worker = pl.tile.get_block_idx()
-        for work in pl.range(worker, num_tokens * output_panels, 32):
+        clear_tokens = pl.cast(0, pl.INT32)
+        if pl.read(route, [route_index]) != 0:
+            clear_tokens = num_tokens
+        for work in pl.range(worker, clear_tokens * output_panels, 32):
             token = work // output_panels
             begin = (work % output_panels) * 128
             clear_value = pl.reinterpret_view(pl.tile.full([1, 128], dtype=pl.INT32, value=-8388608), pl.FP32)
@@ -697,10 +703,13 @@ def _prefill_index_scores(
         decoded_rows = cache_rows
         decoded_cols = INDEX_DIM
     decoded_keys = pl.create_tensor([decoded_rows, decoded_cols], dtype=pl.FP8E4M3FN)
-    with pl.spmd(8, name_hint="prefill_index_cache_decode", deps=[ready, route_ready], predicate=(route[route_index] != 0)) as decoded_tid:
+    with pl.spmd(8, name_hint="prefill_index_cache_decode", deps=[ready, route_ready]) as decoded_tid:
         decode_worker = pl.tile.get_block_idx()
         decode_lut = fp4_e4m3_lut()
-        for decode_row in pl.range(decode_worker * 128, cache_rows, 8 * 128):
+        decode_limit = pl.cast(0, pl.INDEX)
+        if pl.read(route, [route_index]) != 0:
+            decode_limit = cache_rows
+        for decode_row in pl.range(decode_worker * 128, decode_limit, 8 * 128):
             decode_packed = pl.load(packed_flat, [decode_row, 0], [128, INDEX_DIM // 2])
             decode_signed = pl.reinterpret_view(decode_packed, pl.INT8)
             decode_bytes = pl.ands(pl.cast(decode_signed, pl.INT16), 255)
@@ -723,10 +732,11 @@ def _prefill_index_scores(
     table_width = pl.tensor.dim(block_table, 1)
     requests = pl.tensor.dim(block_table, 0)
     with pl.spmd(32, name_hint="prefill_index_mx_scores", deps=[plan_tid, clear_tid, decoded_tid, route_ready],
-                 predicate=(route[route_index] != 0),
                  optimizations=[pl.cross_core_slot(slot_num=2)]) as score_tid:
         worker = pl.tile.get_block_idx()
-        work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)
+        work_items = pl.cast(0, pl.INDEX)
+        if pl.read(route, [route_index]) != 0:
+            work_items = pl.cast(pl.read(prefix, [groups]), pl.INDEX)
         for work in pl.range(worker, work_items, 32):
             lower = pl.cast(0, pl.INDEX)
             upper = groups
