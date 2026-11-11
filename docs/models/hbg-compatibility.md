@@ -38,13 +38,6 @@ and eight active rows under TMR and HBG using PyPTO `fc50efe7`, Simpler
 `0569c779`, and PTOAS v0.72. Row indices now stay on the device. The
 all-padding case uses the regular projection and sampling path.
 
-The current EP4 candidate passed offline HBG code generation for both
-prefill and decode using PyPTO `fc50efe7`, Simpler `0569c779`, and PTOAS
-v0.72. The prefill candidate also reuses the host-read encoder token
-count at the C1A index publication call. That final prefill change awaits
-the 40-layer EP4 hardware check. A separate EP2 MoE golden covers mixed
-empty and non-empty ranks to check the communication path.
-
 Start with the current EP2 decode-layer golden under TMR and HBG. Validate
 any indexer fix, routed MoE workspace reuse, or communication wait change
 against its current callers. Qualify the forward port on the full EP4
@@ -85,7 +78,7 @@ override because PyPTO still pins `355ce301`.
 | --- | --- |
 | Qwen3-14B prefill and decode | Eager and Graph compiled with both the pinned runtime and Simpler main. With Simpler main, each mode passed an eight-token Serving precision test on one A3 card with Lib `f4711ad` and the matching Serving review snapshot. |
 | DeepSeek V4 Flash MTP prefill | The candidate compiled main prefill and MTP prefill. These candidate kernels are still being migrated into the shared Lib model. |
-| DeepSeek V4 Flash MTP fused decode | The candidate stopped in the PyPTO parser on `pl.submit(_moe_expert_chunk_recorded, ...)` with both Simpler versions. PyPTO [#3321](https://github.com/hw-native-sys/pypto/pull/3321) covers submitted JIT callables. With only #3321 head `c295a9e1` merged into that PyPTO main, the fused decode compiled in eager and explicit Graph. This establishes the parser dependency for the candidate. The full request is tracked separately. |
+| DeepSeek V4 Flash MTP fused decode | The fused decode compiled in eager and explicit Graph with PyPTO [#3321](https://github.com/hw-native-sys/pypto/pull/3321) head `c295a9e1` merged into that PyPTO main. This entry uses #3321 support for submitted JIT callables. See the native integration section for the qualified HTTP configuration. |
 
 ## A3 DeepSeek native integration
 
@@ -110,15 +103,6 @@ DeepSeek executor uses that value for code generation, matching Serving
 #308's compile-context checks.
 Use the reviewed Serving patch for this tree. Its SHA-256 is
 `0172718dd53fd2ba3ea7e6248ad33d69786feec79d9486aff1f36c7372bce14a`.
-With PyPTO main plus #3321, Simpler main `0569c779`, and PTOAS v0.72,
-the eight-card eager run loaded the model and stopped during the 260-token
-workspace prefill before the server became healthy. HBG rejected the
-reachable dummy-ready population at the 32,768-entry queue ceiling
-(`READY_QUEUE_OVERFLOW`, scheduler error 104).
-Simpler [#2932](https://github.com/hw-native-sys/simpler/pull/2932) sizes
-the queues from the configured task window. The A3 runtime build with
-its head `1a9082541` applied to `0569c779` succeeded. The corresponding
-eight-card HTTP rerun is pending.
 
 ### Start the A3 DeepSeek server
 
