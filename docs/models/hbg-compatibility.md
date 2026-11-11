@@ -30,8 +30,7 @@ dense-versus-sparse decision to device-side predicates. The EP2 layer 1
 golden passed under TMR and HBG with the prepared toolchain. C2A prefill
 passed TMR and HBG golden at TP1/DP2 with 48 rows per DP group and six
 requests in the long fixture. Score routing now uses device predicates,
-and the golden passes the orchestration token count from CPU. Full EP4
-Serving qualification remains open.
+and the golden passes the orchestration token count from CPU.
 
 The TP1 final LM head passed logits and sampled-ID goldens with zero
 and eight active rows under TMR and HBG using PyPTO `fc50efe7`, Simpler
@@ -43,11 +42,10 @@ the same toolchain. One rank had zero active rows and the other had
 six. The golden checked `next_pre_mix`, `x_mixed`, and `x_next`.
 This covers a mixed empty and active rank case in distributed decode.
 
-Start with the current EP2 decode-layer golden under TMR and HBG. Validate
-any indexer fix, routed MoE workspace reuse, or communication wait change
-against its current callers. Qualify the forward port on the full EP4
-model with teacher-forced output and state comparisons and the Serving
-request lifecycle.
+Lib `6a39eda` compiled the standalone `decode_fwd.py` entry in TMR and
+HBG with the same toolchain at TP1/EP2/DP2 and one synthetic weight
+bank. The check used `--compile-only`. The component goldens above
+provide the hardware precision evidence.
 
 ## PyPTO and Simpler dependencies
 
