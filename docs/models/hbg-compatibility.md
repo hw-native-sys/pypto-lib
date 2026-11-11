@@ -60,13 +60,13 @@ bank. The check used `--compile-only`. On A5 hardware, the same
 fixture passed the TMR execution and output-padding checks with
 Simpler `0569c779`.
 
-HBG passed the same two-card execution check with a runtime candidate
-based on Simpler `0569c779` that routes predicated MIX and multi-block
-tasks to the AICPU scheduler. This runtime pairing also passed the
-standalone C1A reindex golden with start positions 8192 and 4096 and
-query lengths 1 and 2. The forward check covers execution, inactive
-logit and token rows, and sampled-ID padding. The standalone goldens
-cover numerical accuracy.
+Lib `33f7acd` passed the same two-card HBG execution check with
+PyPTO `fc50efe7`, Simpler `0569c779`, and PTOAS v0.72. C1A reindex
+uses gathered scoring for both dense and sparse candidate pools.
+The standalone reindex golden passed in TMR and HBG at start positions
+1024/2048 and 20000/4096, with query lengths 1/2 in both cases.
+The forward check covers execution, inactive logit and token rows, and
+sampled-ID padding. The standalone goldens cover numerical accuracy.
 
 ## PyPTO and Simpler dependencies
 
