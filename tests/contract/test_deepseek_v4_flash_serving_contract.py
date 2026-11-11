@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import pytest
+import torch
 
 from models.deepseek_v4_flash_mtp import config
 from models.deepseek_v4_flash_mtp.serving_contract import (
@@ -53,3 +54,28 @@ def test_deepseek_v4_flash_prefill_padding_rejects_non_integer_extents(
 def test_deepseek_v4_flash_contract_matches_kernel_prefill_shape() -> None:
     assert config.PREFILL_BATCH == CONTRACT.max_prefill_requests_per_partition
     assert config.PREFILL_SEQ == CONTRACT.prefill_tile_tokens
+
+
+def test_hbg_prefill_request_plan_uses_each_owners_absolute_position() -> None:
+    counts = torch.tensor([1, 0, 2049, 1025], dtype=torch.int32)
+    positions = torch.tensor([[128], [2048], [0], [129]], dtype=torch.int32)
+
+    plan = CONTRACT.prefill_request_plan(counts, positions, max_segment_tiles=2)
+
+    assert plan.tolist() == [
+        [1, 0, 1, 128, 128],
+        [0, 1, 0, 128, 2048],
+        [0, 2, 2049, 257, 0],
+        [1, 3, 1025, 129, 129],
+    ]
+
+
+def test_hbg_prefill_history_tail_respects_page_boundary_and_unmapped_rows() -> None:
+    counts = torch.tensor([1, 1, 1, 0], dtype=torch.int32)
+    positions = torch.tensor([[128], [129], [256], [129]], dtype=torch.int32)
+    plan = CONTRACT.prefill_request_plan(counts, positions)
+    block_table = torch.tensor([[5, 6], [2, 3], [4, -1], [8, 9]], dtype=torch.int32)
+
+    slots = CONTRACT.prefill_history_tail_slots(plan, block_table)
+
+    assert slots.tolist() == [767, 384, -1, -1]
