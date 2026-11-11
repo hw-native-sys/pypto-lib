@@ -31,6 +31,7 @@ import os
 from pathlib import Path
 
 import pypto.language as pl
+from request_token_state import STATE_SLOTS_DYN, commit_request_tokens, load_request_tokens
 import torch
 from pypto.backend import BackendType, set_backend_type
 
@@ -2626,3 +2627,109 @@ def qwen3_decode_graph_host(
         next_hidden,
     )
     return logits, sampled_ids, next_hidden
+
+
+def make_request_feedback_entry(decode_fn):
+    """Compose request-slot token state with an existing decode implementation."""
+    record_layer_graph = decode_fn is decode_fwd_graph
+
+    @pl.jit
+    def feedback_decode(
+        input_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
+        wq: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
+        wk: pl.Tensor[[NUM_LAYERS * HIDDEN, KV_HIDDEN], pl.BF16],
+        wv: pl.Tensor[[NUM_LAYERS * HIDDEN, KV_HIDDEN], pl.BF16],
+        q_norm_weight: pl.Tensor[[NUM_LAYERS, HEAD_DIM], pl.FP32],
+        k_norm_weight: pl.Tensor[[NUM_LAYERS, HEAD_DIM], pl.FP32],
+        seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+        block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+        slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
+        rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+        rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+        k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+        v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+        wo: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
+        w_gate: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+        w_up: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+        w_down: pl.Tensor[[NUM_LAYERS * INTERMEDIATE, HIDDEN], pl.BF16],
+        post_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
+        final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+        lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+        out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+        embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+        request_control: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
+        sampled_ids: pl.Out[pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+        next_hidden: pl.Out[pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16]],
+        request_state: pl.InOut[pl.Tensor[[STATE_SLOTS_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+    ) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor]:
+        request_state.bind_dynamic(0, STATE_SLOTS_DYN)
+        batch = pl.tensor.dim(request_control, 0)
+        feedback_tokens = pl.create_tensor([batch, SAMPLED_IDS_PAD], dtype=pl.INT32)
+        feedback_tokens = load_request_tokens(request_state, request_control, feedback_tokens)
+        score_transfer = pl.create_tensor([PA_TRANSFER_ROWS, PA_STACK_TOKENS], dtype=pl.FP32)
+        probability_transfer = pl.create_tensor([PA_TRANSFER_ROWS, PA_STACK_TOKENS], dtype=pl.BF16)
+        pv_transfer = pl.create_tensor([PA_TRANSFER_ROWS, HEAD_DIM], dtype=pl.FP32)
+        ffts_workspace = pl.create_tensor([PA_FFTS_WORKSPACE_ELEMENTS], dtype=pl.INT64)
+        # TASK_ID arrays start invalid.  Leave the initial scratch carry invalid so
+        # the first PA has no artificial, unflagged dummy predecessor; every later
+        # carry is a real allow_early_resolve producer.
+        scratch_ready = pl.array.create(1, pl.TASK_ID)
+        logits, sampled_ids, next_hidden = _decode_fwd_body(
+            input_rms_weight, wq, wk,
+            wv, q_norm_weight, k_norm_weight,
+            seq_lens, block_table, slot_mapping,
+            rope_cos, rope_sin, k_cache,
+            v_cache, wo, w_gate,
+            w_up, w_down, post_rms_weight,
+            final_norm_weight, lm_head_weight, out,
+            embed_weight, feedback_tokens, sampled_ids,
+            next_hidden, score_transfer, probability_transfer, pv_transfer,
+            ffts_workspace, scratch_ready, record_layer_graph,
+        )
+        request_state, sampled_ids = commit_request_tokens(
+            request_state, request_control, feedback_tokens, sampled_ids,
+        )
+        return logits, sampled_ids, next_hidden, request_state
+
+    @pl.jit.host
+    def feedback_host(
+        input_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
+        wq: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
+        wk: pl.Tensor[[NUM_LAYERS * HIDDEN, KV_HIDDEN], pl.BF16],
+        wv: pl.Tensor[[NUM_LAYERS * HIDDEN, KV_HIDDEN], pl.BF16],
+        q_norm_weight: pl.Tensor[[NUM_LAYERS, HEAD_DIM], pl.FP32],
+        k_norm_weight: pl.Tensor[[NUM_LAYERS, HEAD_DIM], pl.FP32],
+        seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+        block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+        slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
+        rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+        rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+        k_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+        v_cache: pl.InOut[pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16]],
+        wo: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
+        w_gate: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+        w_up: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+        w_down: pl.Tensor[[NUM_LAYERS * INTERMEDIATE, HIDDEN], pl.BF16],
+        post_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
+        final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+        lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+        out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+        embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+        request_control: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
+        sampled_ids: pl.Out[pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+        next_hidden: pl.Out[pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16]],
+        request_state: pl.InOut[pl.Tensor[[STATE_SLOTS_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+    ) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor, pl.Tensor]:
+        return feedback_decode(
+            input_rms_weight, wq, wk,
+            wv, q_norm_weight, k_norm_weight,
+            seq_lens, block_table, slot_mapping,
+            rope_cos, rope_sin, k_cache,
+            v_cache, wo, w_gate,
+            w_up, w_down, post_rms_weight,
+            final_norm_weight, lm_head_weight, out,
+            embed_weight, request_control, sampled_ids,
+            next_hidden, request_state,
+        )
+
+    return feedback_host
