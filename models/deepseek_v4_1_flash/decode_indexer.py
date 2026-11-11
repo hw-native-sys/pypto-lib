@@ -581,42 +581,6 @@ def select_candidate_block_pool(
     return pool_tid
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "idx_k_norm_rope_publish.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _idx_k_norm_rope_publish(
-    source: pl.Tensor,
-    weight: pl.Tensor,
-    cosine: pl.Tensor,
-    sine: pl.Tensor,
-    slots: pl.Tensor,
-    cache: pl.InOut[pl.Tensor],
-    scales: pl.InOut[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Normalize, rotate, and publish group-32 MXFP4 index keys with E8M0 scales."""
-    ...
-
-
-@pl.jit.inline(auto_scope=False)
-def publish_index_rows(
-    source: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
-    weight: pl.Tensor[[INDEX_DIM], pl.BF16],
-    cosine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    sine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-    scales: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
-    num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    kv_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Fuse index RMSNorm, BF16 RoPE, and cache publication with one writer per page."""
-    workers = pl.max(1, pl.min(num_tokens, 4))
-    with pl.spmd(workers, name_hint="idx_k_norm_rope_publish", deps=[cache_ready, kv_ready]) as published:
-        cache = _idx_k_norm_rope_publish(source, weight, cosine, sine, slots, cache, scales, num_tokens)
-    return published
-
-
 @pl.jit.inline(auto_scope=False)
 def publish_index_rows_pypto(
     source: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
@@ -630,11 +594,7 @@ def publish_index_rows_pypto(
     cache_ready: pl.Scalar[pl.TASK_ID],
     kv_ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Publish index keys with the PyPTO register functional implementation.
-
-    C1A/C2A decode keep using publish_index_rows until this implementation
-    passes performance acceptance.
-    """
+    """Publish normalized and rotated MXFP4 index keys with one writer per page."""
     slot_capacity = pl.tensor.dim(slots, 0)
     slots_matrix = pl.reshape(slots, [1, slot_capacity])
     workers = pl.max(1, pl.min(num_tokens, 4))
@@ -2591,7 +2551,7 @@ def decode_c2a_indexer(
     tokens = pl.tensor.dim(latent, 0)
     projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     projected_tid = project_index_key(latent, index_wk, projected_key, num_tokens, latent_ready, max_workers=32)
-    index_publish_tid = publish_index_rows(
+    index_publish_tid = publish_index_rows_pypto(
         projected_key, index_norm_weight, compressed_rope_cos, compressed_rope_sin, compressed_slots,
         index_cache, index_cache_scale, num_tokens, cache_ready, projected_tid,
     )

@@ -19,7 +19,7 @@ from quant import pack_quantized_cache, unpack_quantized_cache
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_paged,
-    publish_index_rows, project_index_key,
+    publish_index_rows_pypto, project_index_key,
 )
 from o_proj import o_proj
 from sparse_attention import gather_sparse_attention
@@ -141,7 +141,7 @@ def decode_c1a_full(
     )
     projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     pk_tid = project_index_key(latent, index_wk, projected_key, num_tokens, compressed_ready, max_workers=8)
-    index_ready = publish_index_rows(
+    index_ready = publish_index_rows_pypto(
         projected_key, index_norm_weight, compressed_rope_cos, compressed_rope_sin, compressed_slots,
         index_cache, index_cache_scale, num_tokens, x_ready, pk_tid,
     )
