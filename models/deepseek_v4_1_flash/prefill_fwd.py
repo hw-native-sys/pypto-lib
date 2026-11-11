@@ -514,7 +514,7 @@ def l2_prefill_fwd(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,
                     compressed_cache[3], index_cache[3], index_scales[3],
-                    pl.read(counts, [0]),
+                    encoder_count,
                 )
                 gathered_hidden = pl.reshape(hidden, [CAPACITY, HC_DIM])
                 source_hidden = pl.reshape(encoder_hidden, [CAPACITY, HC_DIM])

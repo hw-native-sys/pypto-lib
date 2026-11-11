@@ -920,7 +920,7 @@ def build_c1a_sp_specs(args, initial_state):
     for name, shape, dtype in (('attn_input', [tokens, D], torch.bfloat16), ('attn_output', [local, D], torch.bfloat16), ('next_pre_mix', [local, HC_MULT], torch.float32), ('x_hc_out', [local, HC_MULT, D], torch.float32)):
         specs.append(TensorSpec(name, [world, *shape], dtype, resident='stacked'))
     counts = torch.tensor(args.dp_tokens, dtype=torch.int32).repeat_interleave(TP_SIZE).reshape(-1, 1)
-    specs.append(TensorSpec('num_tokens', [world, 1], torch.int32, init_value=counts, resident='stacked'))
+    specs.append(TensorSpec('num_tokens', [world, 1], torch.int32, init_value=counts))
     specs.append(ScalarSpec(
         'attention_epoch', torch.int32, 1, compile_runtime=True,
         benchmark_step=None,
