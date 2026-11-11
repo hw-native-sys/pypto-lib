@@ -460,23 +460,9 @@ def routed_swiglu_quant_pypto(
                                        target_memory=pl.MemorySpace.Vec)
             with pl.reg_scope():
                 active = pl.reg.full_mask(lanes=SWIGLU_LANES)
-                group_span = pl.reg.broadcast(MX_GROUP - 1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                group_mask = pl.reg.broadcast(-MX_GROUP, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                lane_span = pl.reg.broadcast(SWIGLU_LANES - 1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
                 bias = pl.reg.broadcast(254, lanes=SWIGLU_LANES, dtype=pl.INT32)
                 lane_id = pl.reg.index_gen(0, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                group_base = pl.reg.bitwise_and(lane_id, group_mask, active)
-                # Rotate-by-k indices within each group of MX_GROUP lanes.
-                rot16 = pl.reg.bitwise_or(group_base, pl.reg.bitwise_and(
-                    pl.reg.adds(lane_id, 16, active), group_span, active), active)
-                rot8 = pl.reg.bitwise_or(group_base, pl.reg.bitwise_and(
-                    pl.reg.adds(lane_id, 8, active), group_span, active), active)
-                rot4 = pl.reg.bitwise_or(group_base, pl.reg.bitwise_and(
-                    pl.reg.adds(lane_id, 4, active), group_span, active), active)
-                rot2 = pl.reg.bitwise_or(group_base, pl.reg.bitwise_and(
-                    pl.reg.adds(lane_id, 2, active), group_span, active), active)
-                rot1 = pl.reg.bitwise_or(group_base, pl.reg.bitwise_and(
-                    pl.reg.adds(lane_id, 1, active), group_span, active), active)
+                lane_span = pl.reg.broadcast(SWIGLU_LANES - 1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
                 # Lane i reads lane MX_GROUP*i, so lanes 0 and 1 compact this
                 # chunk's two group exponents; the wrap keeps unused lanes in
                 # range, and only the first two are stored.
@@ -506,15 +492,15 @@ def routed_swiglu_quant_pypto(
                         silu = pl.reg.div(gate_c, denom, active)
                         gated = pl.reg.mul(silu, up_c, active)
                         values = pl.reg.mul(gated, route_v, active)
-                        # Rotate-and-max butterfly: after five steps every lane
-                        # holds its own group's maximum, which doubles as the
-                        # broadcast the rescale below needs.
-                        mag0 = pl.reg.abs(values, active)
-                        mag1 = pl.reg.maximum(mag0, pl.reg.gather_lanes(mag0, rot16), active)
-                        mag2 = pl.reg.maximum(mag1, pl.reg.gather_lanes(mag1, rot8), active)
-                        mag3 = pl.reg.maximum(mag2, pl.reg.gather_lanes(mag2, rot4), active)
-                        mag4 = pl.reg.maximum(mag3, pl.reg.gather_lanes(mag3, rot2), active)
-                        group_max = pl.reg.maximum(mag4, pl.reg.gather_lanes(mag4, rot1), active)
+                        # Grouped reduction plus group_broadcast: exactly the
+                        # vcgmax the extern calls, replacing a five-step
+                        # rotate-and-max butterfly over gather_lanes. The result
+                        # is widened immediately -- carrying the narrow
+                        # per-group value through the scale chain leaves the VMI
+                        # layout planner with no legal plan for the component.
+                        magnitude = pl.reg.abs(values, active)
+                        group_peak = pl.reg.reduce_max(magnitude, active, group_size=MX_GROUP)
+                        group_max = pl.reg.group_broadcast(group_peak, lanes=SWIGLU_LANES)
                         floored = pl.reg.maximums(group_max, SWIGLU_SCALE_FLOOR, active)
                         amax = pl.reg.muls(floored, SWIGLU_MAX_INV, active)
                         amax_bits = pl.reg.interpret_cast(amax, dtype=pl.INT32)
