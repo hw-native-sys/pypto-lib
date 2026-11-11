@@ -40,6 +40,7 @@ B_DYN = pl.dynamic("GLM53_B_DYN")
 TABLE_DYN = pl.dynamic("GLM53_TABLE_DYN")
 T_DYN = pl.dynamic("GLM53_T_DYN")
 
+CACHE_WORKERS_TILE = 48
 MLA_CACHE_QUANT_TILE = 128
 MLA_CACHE_WIDTH = KV_LORA + KV_LORA // MLA_CACHE_QUANT_TILE * 4
 
@@ -542,46 +543,46 @@ def mla_cache_write(
 ):
     """Quantize normalized BF16 latents and scatter packed INT8 payload/FP32 scales."""
     tokens = pl.tensor.dim(latent, 0)
-    with pl.spmd(tokens, name_hint="mla_cache_write") as write_tid:
-        token = pl.tile.get_block_idx()
-        slot_i32 = pl.read(slots, [token])
-        if slot_i32 >= 0:
-            slot = pl.cast(slot_i32, pl.INDEX)
-            tail_bits = pl.full([1, 8], dtype=pl.INT32, value=0)
-            for block in pl.range(KV_LORA // MLA_CACHE_QUANT_TILE):
-                col = block * MLA_CACHE_QUANT_TILE
-                value = pl.cast(latent[token:token + 1, col:col + MLA_CACHE_QUANT_TILE], pl.FP32)
-                repeated = pl.col_expand_add(pl.full([8, MLA_CACHE_QUANT_TILE], dtype=pl.FP32, value=0.0), value)
-                amax = pl.row_max(pl.abs(repeated))
-                maximum = pl.read(amax, [0, 0])
-                if maximum > 0.0:
-                    max_lanes = pl.create_tensor([1, 8], dtype=pl.FP32)
-                    max_lanes[:, :] = pl.reshape(amax, [1, 8])
-                    one_lanes = pl.create_tensor([1, 8], dtype=pl.FP32)
-                    one_lanes[:, :] = pl.full([1, 8], dtype=pl.FP32, value=1.0)
-                    reciprocal_lanes = pl.div(one_lanes, max_lanes)
-                    inverse_lanes = pl.mul(reciprocal_lanes, 127.0)
-                    inverse_column = pl.reshape(inverse_lanes, [8, 1])
-                    scaled = pl.row_expand_mul(repeated, inverse_column)
-                    integer = pl.cast(scaled, pl.INT32, mode="rint")
-                    bounded = pl.minimum(pl.maximum(integer, -127), 127)
-                    half = pl.cast(bounded, pl.FP16)
-                    codes = pl.cast(half, pl.INT8, mode="trunc")
-                    cache[slot:slot + 1, col:col + MLA_CACHE_QUANT_TILE] = pl.set_validshape(codes, 1, MLA_CACHE_QUANT_TILE)
-                    scale_lanes = pl.mul(max_lanes, 1.0 / 127.0)
-                    scale_bits = pl.reinterpret_view(scale_lanes, pl.INT32)
-                    pl.write(tail_bits, [0, 4 + block], pl.read(scale_bits, [0, 0]))
-                    if block == KV_LORA // MLA_CACHE_QUANT_TILE - 1:
-                        code_bits = pl.reinterpret_view(codes, pl.INT32)
-                        for word in pl.unroll(4):
-                            pl.write(tail_bits, [0, word], pl.read(code_bits, [0, MLA_CACHE_QUANT_TILE // 4 - 4 + word]))
-                else:
-                    zeros = pl.full([1, MLA_CACHE_QUANT_TILE], dtype=pl.FP16, value=0.0)
-                    zero_codes = pl.cast(zeros, pl.INT8, mode="trunc")
-                    cache[slot:slot + 1, col:col + MLA_CACHE_QUANT_TILE] = zero_codes
-                    pl.write(tail_bits, [0, 4 + block], pl.cast(0, pl.INT32))
-            packed_tail = pl.reinterpret_view(tail_bits, pl.INT8)
-            cache[slot:slot + 1, KV_LORA - 16:MLA_CACHE_WIDTH] = packed_tail
+    with pl.spmd(pl.min(tokens, CACHE_WORKERS_TILE), name_hint="mla_cache_write") as write_tid:
+        for token in pl.range(pl.tile.get_block_idx(), tokens, CACHE_WORKERS_TILE):
+            slot_i32 = pl.read(slots, [token])
+            if slot_i32 >= 0:
+                slot = pl.cast(slot_i32, pl.INDEX)
+                tail_bits = pl.full([1, 8], dtype=pl.INT32, value=0)
+                for block in pl.range(KV_LORA // MLA_CACHE_QUANT_TILE):
+                    col = block * MLA_CACHE_QUANT_TILE
+                    value = pl.cast(latent[token:token + 1, col:col + MLA_CACHE_QUANT_TILE], pl.FP32)
+                    repeated = pl.col_expand_add(pl.full([8, MLA_CACHE_QUANT_TILE], dtype=pl.FP32, value=0.0), value)
+                    amax = pl.row_max(pl.abs(repeated))
+                    maximum = pl.read(amax, [0, 0])
+                    if maximum > 0.0:
+                        max_lanes = pl.create_tensor([1, 8], dtype=pl.FP32)
+                        max_lanes[:, :] = pl.reshape(amax, [1, 8])
+                        one_lanes = pl.create_tensor([1, 8], dtype=pl.FP32)
+                        one_lanes[:, :] = pl.full([1, 8], dtype=pl.FP32, value=1.0)
+                        reciprocal_lanes = pl.div(one_lanes, max_lanes)
+                        inverse_lanes = pl.mul(reciprocal_lanes, 127.0)
+                        inverse_column = pl.reshape(inverse_lanes, [8, 1])
+                        scaled = pl.row_expand_mul(repeated, inverse_column)
+                        integer = pl.cast(scaled, pl.INT32, mode="rint")
+                        bounded = pl.minimum(pl.maximum(integer, -127), 127)
+                        half = pl.cast(bounded, pl.FP16)
+                        codes = pl.cast(half, pl.INT8, mode="trunc")
+                        cache[slot:slot + 1, col:col + MLA_CACHE_QUANT_TILE] = pl.set_validshape(codes, 1, MLA_CACHE_QUANT_TILE)
+                        scale_lanes = pl.mul(max_lanes, 1.0 / 127.0)
+                        scale_bits = pl.reinterpret_view(scale_lanes, pl.INT32)
+                        pl.write(tail_bits, [0, 4 + block], pl.read(scale_bits, [0, 0]))
+                        if block == KV_LORA // MLA_CACHE_QUANT_TILE - 1:
+                            code_bits = pl.reinterpret_view(codes, pl.INT32)
+                            for word in pl.unroll(4):
+                                pl.write(tail_bits, [0, word], pl.read(code_bits, [0, MLA_CACHE_QUANT_TILE // 4 - 4 + word]))
+                    else:
+                        zeros = pl.full([1, MLA_CACHE_QUANT_TILE], dtype=pl.FP16, value=0.0)
+                        zero_codes = pl.cast(zeros, pl.INT8, mode="trunc")
+                        cache[slot:slot + 1, col:col + MLA_CACHE_QUANT_TILE] = zero_codes
+                        pl.write(tail_bits, [0, 4 + block], pl.cast(0, pl.INT32))
+                packed_tail = pl.reinterpret_view(tail_bits, pl.INT8)
+                cache[slot:slot + 1, KV_LORA - 16:MLA_CACHE_WIDTH] = packed_tail
 
     return write_tid
 

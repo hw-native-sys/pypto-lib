@@ -180,15 +180,15 @@ def int8_linear_tile(
 
 
 @pl.jit.inline
-def w8a8_projection_fp32(
+def w8a8_projection_bf16(
     x: pl.Tensor[[DOT_M, DOT_K], pl.BF16],
     weight: pl.Tensor[[DOT_W0, DOT_K], pl.INT8],
     weight_scale: pl.Tensor[[DOT_W0], pl.FP32],
-    output: pl.Tensor[[DOT_M, DOT_W0], pl.FP32],
+    output: pl.Tensor[[DOT_M, DOT_W0], pl.BF16],
     K_DIM: pl.constexpr,
     N_DIM: pl.constexpr,
 ):
-    """Quantize each activation row and publish dequantized INT32 cube sums."""
+    """Quantize activation rows and round dequantized Cube results directly to BF16."""
     rows = pl.tensor.dim(x, 0)
     token_scale = pl.create_tensor([rows, 8], dtype=pl.FP32)
     quantized = pl.create_tensor([rows, K_DIM], dtype=pl.INT8)
@@ -203,30 +203,8 @@ def w8a8_projection_fp32(
             quantized, weight, token_scale, weight_scale, row0, col0, valid_rows, valid_columns, 16, 128,
             K_DIM,
         )
-        output[row0 : row0 + 16, col0 : col0 + 128] = pl.set_validshape(result, valid_rows, valid_columns)
-    return output
-
-
-@pl.jit.inline
-def w8a8_projection_bf16(
-    x: pl.Tensor[[DOT_M, DOT_K], pl.BF16],
-    weight: pl.Tensor[[DOT_W0, DOT_K], pl.INT8],
-    weight_scale: pl.Tensor[[DOT_W0], pl.FP32],
-    output: pl.Tensor[[DOT_M, DOT_W0], pl.BF16],
-    K_DIM: pl.constexpr,
-    N_DIM: pl.constexpr,
-):
-    """Preserve the BF16 boundary after native W8A8 projection."""
-    rows = pl.tensor.dim(x, 0)
-    projected = pl.create_tensor([rows, N_DIM], dtype=pl.FP32)
-    w8a8_projection_fp32(x, weight, weight_scale, projected, K_DIM, N_DIM)
-    for block in pl.spmd(((rows + 7) // 8) * ((N_DIM + 127) // 128), name_hint="w8a8_projection_bf16"):
-        row0 = block // ((N_DIM + 127) // 128) * 8
-        col0 = block % ((N_DIM + 127) // 128) * 128
-        valid_rows = pl.min(8, rows - row0)
-        valid_columns = pl.min(128, N_DIM - col0)
-        source = pl.slice(projected, [8, 128], [row0, col0], valid_shape=[valid_rows, valid_columns])
-        output[row0 : row0 + 8, col0 : col0 + 128] = pl.cast(source, pl.BF16, mode="rint")
+        narrowed = pl.cast(result, pl.BF16, mode="rint")
+        output[row0 : row0 + 16, col0 : col0 + 128] = pl.set_validshape(narrowed, valid_rows, valid_columns)
     return output
 
 

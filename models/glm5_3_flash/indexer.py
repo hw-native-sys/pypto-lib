@@ -39,6 +39,7 @@ POOL_PAGES_DYN = pl.dynamic("GLM53_POOL_PAGES_DYN")
 TABLE_DYN = pl.dynamic("GLM53_TABLE_DYN")
 T_DYN = pl.dynamic("GLM53_T_DYN")
 
+CACHE_WORKERS_TILE = 48
 SORT_TILE = 2048
 PAIR_WIDTH = 2 * KPOOL_SELECT_K
 K_NORM_EPS = 1e-6
@@ -61,7 +62,6 @@ POOL_GATHER_WORKERS = 48
 # resident decode batch of 32 requests of ``DECODE_ROWS_PER_REQUEST`` rows.
 INDEXER_PERSISTENT_MAX_TOKENS = 32 * DECODE_ROWS_PER_REQUEST
 
-POOL_STAGE_DYN = pl.dynamic("GLM53_POOL_STAGE_DYN")
 POOL_VALID_WIDTH = 8
 POOL_QUANT_TILE = 64
 # Rows per cache-write block: the key half loads as one wide BF16 tile and
@@ -663,69 +663,81 @@ def indexer_cache_write(
 
 
 @pl.jit.incore
+def indexer_tail_publish(
+    raw_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
+    index_slots: pl.Tensor[[T_DYN], pl.INT32],
+    index_tail_slots: pl.Tensor[[T_DYN], pl.INT32],
+) -> None:
+    """Publish cache rows into the current request tails."""
+    tokens = pl.tensor.dim(index_slots, 0)
+    for token in pl.range(pl.tile.get_block_idx(), tokens, CACHE_WORKERS_TILE):
+        destination = pl.read(index_tail_slots, [token])
+        if destination >= 0:
+            source = pl.cast(pl.read(index_slots, [token]), pl.INDEX)
+            target = pl.cast(destination, pl.INDEX)
+            tail_row = pl.load(raw_cache, [source, 0], [1, INDEX_STATE_WIDTH])
+            pl.store(tail_row, [target, 0], raw_cache)
+
+
+@pl.jit.incore
 def _indexer_pool_write_event(
     raw_cache: pl.Tensor[[TABLE_DYN * BLOCK_SIZE, INDEX_STATE_WIDTH], pl.FP32],
     compress_ape: pl.Tensor[[INDEX_KPOOL, INDEX_DIM], pl.BF16],
     pool_token_slots: pl.Tensor[[POOL_EVENTS_DYN, INDEX_KPOOL], pl.INT32],
-    pool_stage: pl.Tensor[[POOL_STAGE_DYN, INDEX_DIM], pl.FP32],
+    pool_slots: pl.Tensor[[POOL_EVENTS_DYN], pl.INT32],
+    pool_cache: pl.Tensor[[INDEX_BLOCKS_DYN * INDEX_STATE_BLOCK_SIZE, INDEX_DIM], pl.BF16],
     pool_valid: pl.Tensor[[POOL_EVENTS_DYN, POOL_VALID_WIDTH], pl.INT32],
 ) -> None:
-    """Close one pool event; the caller gives this scope one block per event.
-
-    The softmax runs per dimension over the four pool lanes in FP32, matching the
-    reference numerics: ``weights = softmax(gate + ape)`` along the lane axis, then
-    ``pool_key = sum(weights * key)``. The FP32 pooled key lands in the
-    contiguous ``pool_stage`` row of its event; a second scope rounds the
-    staged rows to BF16 and scatters them to the paged destinations. An event with a ``-1`` member slot is a padded pool: it stages a
-    zero row and reports ``pool_valid = 0`` so the scorer can drop it. The staged
-    row is always written, which keeps the epilogue's input fully defined.
-    """
-    event = pl.tile.get_block_idx()
-    slot0 = pl.read(pool_token_slots, [event, 0])
-    slot1 = pl.read(pool_token_slots, [event, 1])
-    slot2 = pl.read(pool_token_slots, [event, 2])
-    slot3 = pl.read(pool_token_slots, [event, 3])
-    members_present = pl.min(pl.min(slot0, slot1), pl.min(slot2, slot3))
-    # 0/1 flag in column 0 of a [1, 8] INT32 tile, the narrowest store the
-    # 32-byte vector alignment accepts. Slot 0 is a legal raw row, so the flag
-    # comes from the branch condition, not from clamping the slot value.
-    flag_tile = pl.tile.full([1, POOL_VALID_WIDTH], dtype=pl.INT32, value=0)
-    if members_present >= 0:
-        # Per-lane logits and keys, kept as [1, INDEX_DIM] rows so every step is
-        # an elementwise row operation; the softmax reduces over the four lanes.
-        key0 = pl.load(raw_cache, [pl.cast(slot0, pl.INDEX), 0], [1, INDEX_DIM])
-        key1 = pl.load(raw_cache, [pl.cast(slot1, pl.INDEX), 0], [1, INDEX_DIM])
-        key2 = pl.load(raw_cache, [pl.cast(slot2, pl.INDEX), 0], [1, INDEX_DIM])
-        key3 = pl.load(raw_cache, [pl.cast(slot3, pl.INDEX), 0], [1, INDEX_DIM])
-        gate0 = pl.load(raw_cache, [pl.cast(slot0, pl.INDEX), INDEX_DIM], [1, INDEX_DIM])
-        gate1 = pl.load(raw_cache, [pl.cast(slot1, pl.INDEX), INDEX_DIM], [1, INDEX_DIM])
-        gate2 = pl.load(raw_cache, [pl.cast(slot2, pl.INDEX), INDEX_DIM], [1, INDEX_DIM])
-        gate3 = pl.load(raw_cache, [pl.cast(slot3, pl.INDEX), INDEX_DIM], [1, INDEX_DIM])
-        ape0 = pl.cast(pl.load(compress_ape, [0, 0], [1, INDEX_DIM]), pl.FP32, mode="none")
-        ape1 = pl.cast(pl.load(compress_ape, [1, 0], [1, INDEX_DIM]), pl.FP32, mode="none")
-        ape2 = pl.cast(pl.load(compress_ape, [2, 0], [1, INDEX_DIM]), pl.FP32, mode="none")
-        ape3 = pl.cast(pl.load(compress_ape, [3, 0], [1, INDEX_DIM]), pl.FP32, mode="none")
-        logit0 = pl.add(gate0, ape0)
-        logit1 = pl.add(gate1, ape1)
-        logit2 = pl.add(gate2, ape2)
-        logit3 = pl.add(gate3, ape3)
-        lane_max = pl.maximum(pl.maximum(logit0, logit1), pl.maximum(logit2, logit3))
-        weight0 = pl.exp(pl.sub(logit0, lane_max))
-        weight1 = pl.exp(pl.sub(logit1, lane_max))
-        weight2 = pl.exp(pl.sub(logit2, lane_max))
-        weight3 = pl.exp(pl.sub(logit3, lane_max))
-        denominator = pl.add(pl.add(weight0, weight1), pl.add(weight2, weight3))
-        weighted_sum = pl.mul(weight0, key0)
-        weighted_sum = pl.add(weighted_sum, pl.mul(weight1, key1))
-        weighted_sum = pl.add(weighted_sum, pl.mul(weight2, key2))
-        weighted_sum = pl.add(weighted_sum, pl.mul(weight3, key3))
-        pool_key = pl.div(weighted_sum, denominator)
-        pl.store(pool_key, [event, 0], pool_stage)
-        pl.tile.write(flag_tile, [0, 0], pl.const(1, pl.INT32))
-    else:
-        zero_row = pl.tile.full([1, INDEX_DIM], dtype=pl.FP32, value=0.0)
-        pl.store(zero_row, [event, 0], pool_stage)
-    pl.store(flag_tile, [event, 0], pool_valid)
+    """Pool four FP32 key/gate rows and publish BF16 keys with validity flags."""
+    events = pl.tensor.dim(pool_token_slots, 0)
+    for event in pl.range(pl.tile.get_block_idx(), events, CACHE_WORKERS_TILE):
+        destination = pl.cast(pl.read(pool_slots, [event]), pl.INDEX)
+        slot0 = pl.read(pool_token_slots, [event, 0])
+        slot1 = pl.read(pool_token_slots, [event, 1])
+        slot2 = pl.read(pool_token_slots, [event, 2])
+        slot3 = pl.read(pool_token_slots, [event, 3])
+        members_present = pl.min(pl.min(slot0, slot1), pl.min(slot2, slot3))
+        # 0/1 flag in column 0 of a [1, 8] INT32 tile, the narrowest store the
+        # 32-byte vector alignment accepts. Slot 0 is a legal raw row, so the flag
+        # comes from the branch condition, not from clamping the slot value.
+        flag_tile = pl.tile.full([1, POOL_VALID_WIDTH], dtype=pl.INT32, value=0)
+        if members_present >= 0:
+            # Per-lane logits and keys, kept as [1, INDEX_DIM] rows so every step is
+            # an elementwise row operation; the softmax reduces over the four lanes.
+            key0 = pl.load(raw_cache, [pl.cast(slot0, pl.INDEX), 0], [1, INDEX_DIM])
+            key1 = pl.load(raw_cache, [pl.cast(slot1, pl.INDEX), 0], [1, INDEX_DIM])
+            key2 = pl.load(raw_cache, [pl.cast(slot2, pl.INDEX), 0], [1, INDEX_DIM])
+            key3 = pl.load(raw_cache, [pl.cast(slot3, pl.INDEX), 0], [1, INDEX_DIM])
+            gate0 = pl.load(raw_cache, [pl.cast(slot0, pl.INDEX), INDEX_DIM], [1, INDEX_DIM])
+            gate1 = pl.load(raw_cache, [pl.cast(slot1, pl.INDEX), INDEX_DIM], [1, INDEX_DIM])
+            gate2 = pl.load(raw_cache, [pl.cast(slot2, pl.INDEX), INDEX_DIM], [1, INDEX_DIM])
+            gate3 = pl.load(raw_cache, [pl.cast(slot3, pl.INDEX), INDEX_DIM], [1, INDEX_DIM])
+            ape0 = pl.cast(pl.load(compress_ape, [0, 0], [1, INDEX_DIM]), pl.FP32, mode="none")
+            ape1 = pl.cast(pl.load(compress_ape, [1, 0], [1, INDEX_DIM]), pl.FP32, mode="none")
+            ape2 = pl.cast(pl.load(compress_ape, [2, 0], [1, INDEX_DIM]), pl.FP32, mode="none")
+            ape3 = pl.cast(pl.load(compress_ape, [3, 0], [1, INDEX_DIM]), pl.FP32, mode="none")
+            logit0 = pl.add(gate0, ape0)
+            logit1 = pl.add(gate1, ape1)
+            logit2 = pl.add(gate2, ape2)
+            logit3 = pl.add(gate3, ape3)
+            lane_max = pl.maximum(pl.maximum(logit0, logit1), pl.maximum(logit2, logit3))
+            weight0 = pl.exp(pl.sub(logit0, lane_max))
+            weight1 = pl.exp(pl.sub(logit1, lane_max))
+            weight2 = pl.exp(pl.sub(logit2, lane_max))
+            weight3 = pl.exp(pl.sub(logit3, lane_max))
+            denominator = pl.add(pl.add(weight0, weight1), pl.add(weight2, weight3))
+            weighted_sum = pl.mul(weight0, key0)
+            weighted_sum = pl.add(weighted_sum, pl.mul(weight1, key1))
+            weighted_sum = pl.add(weighted_sum, pl.mul(weight2, key2))
+            weighted_sum = pl.add(weighted_sum, pl.mul(weight3, key3))
+            pool_key = pl.div(weighted_sum, denominator)
+            pooled = pl.cast(pool_key, pl.BF16, mode="rint")
+            pl.store(pooled, [destination, 0], pool_cache)
+            pl.tile.write(flag_tile, [0, 0], pl.const(1, pl.INT32))
+        else:
+            zero_row = pl.tile.full([1, INDEX_DIM], dtype=pl.BF16, value=0.0)
+            pl.store(zero_row, [destination, 0], pool_cache)
+        pl.store(flag_tile, [event, 0], pool_valid)
 
 
 @pl.jit.inline
@@ -739,15 +751,9 @@ def indexer_pool_write(
 ):
     """Compress four FP32 key/gate rows into one BF16 pooled key."""
     events = pl.tensor.dim(pool_token_slots, 0)
-    pool_stage = pl.create_tensor([events, INDEX_DIM], dtype=pl.FP32)
-    with pl.spmd(events, name_hint="indexer_pool_write") as pool_tid:
-        _indexer_pool_write_event(raw_cache, compress_ape, pool_token_slots, pool_stage, pool_valid)
-    with pl.spmd(events, name_hint="indexer_pool_store", deps=[pool_tid]) as store_tid:
-        event = pl.tile.get_block_idx()
-        destination = pl.cast(pl.read(pool_slots, [event]), pl.INDEX)
-        pooled = pl.cast(pool_stage[event:event + 1, :], pl.BF16, mode="rint")
-        pool_cache[destination:destination + 1, :] = pooled
-    return store_tid
+    with pl.spmd(pl.min(events, CACHE_WORKERS_TILE), name_hint="indexer_pool_write") as pool_tid:
+        _indexer_pool_write_event(raw_cache, compress_ape, pool_token_slots, pool_slots, pool_cache, pool_valid)
+    return pool_tid
 
 
 @pl.jit

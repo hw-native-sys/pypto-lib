@@ -636,6 +636,129 @@ The serving-shaped decode inputs are `[32, 3072]`, weights `[4, 3072]`,
 convolution state `[320, 3, 3072]`, request offsets `[33]`, and state metadata
 `[32, 14]`. These operator results do not include a new whole-model benchmark.
 
+### Bounded prefill and connecting-operator workers
+
+The shared mHC RMS, pre/post mixing, post coefficients, MoE shard addition,
+padding/scatter clearing, KDA convolution, decay, and weight stacking scopes
+distribute their original partitions across at most 48 AIV workers. KDA
+prefill chunk, inverse, W/U, and scan stages use at most 24 mixed worker
+groups. Tile arithmetic, precision corrections, and output/state ownership
+remain unchanged. The scan seeds nonempty request states in a separate AIV
+stage and visits request/head/value partitions in request-major order.
+
+Measured against `983b217` on a2a3 device 0, with frozen golden replay,
+100 timed rounds and five warmups, device effective-time medians are:
+
+| Component, capacity 192 | Before (us) | After (us) | Speedup |
+|---|---:|---:|---:|
+| mHC post | 280.85 | 69.00 | 4.07x |
+| MoE shared-shard addition | 135.45 | 21.30 | 6.36x |
+| KDA prefill convolution | 234.90 | 48.00 | 4.89x |
+| Complete KDA prefill | 1673.35 | 274.95 | 6.09x |
+| Complete KDA projection | 743.75 | 683.00 | 1.09x |
+
+The prefill fixtures use 32 active tokens in capacity 192, with TP8 local
+dimensions and 32 request slots. Nineteen operator cases pass the existing
+golden tolerances, including decode capacity 32, full prefill batches, and
+gaps between active requests. Stateful cases check the complete state pool.
+
+A matched serving run uses the same eight a2a3 devices, TP8/EP8, concurrency
+one, 160 input tokens and 128 output tokens, with one warmup and three timed
+requests. Host-observed medians exclude initialization and profiling:
+
+| Metric | Before | After |
+|---|---:|---:|
+| Output throughput (tokens/s) | 8.565 | 9.891 |
+| Time to first token (s) | 1.564 | 1.110 |
+| Time per output token (ms) | 105.37 | 92.97 |
+| Request latency (s) | 14.945 | 12.941 |
+
+Throughput samples range from 8.38 to 9.05 tokens/s before and 9.49 to
+10.01 afterward. All four requests produce identical 128-token sequences
+across the two versions. This is generation consistency for one fixed prompt,
+not an external model-accuracy evaluation. The serving revision is `60c8773`
+with its recorded ABI adaptations; the pinned PyPTO/simpler/PTOAS stack is
+`ff2e0a4` / `31f9e72` / `0.72` for both versions. These results include the
+earlier recurrent-worker changes and the new prefill/connecting-scope changes.
+
+Separate level-4 rank-zero captures cover all 45 layers and the vocabulary
+head for the last prefill chunk and first decode step. Prefill physical
+records fall from 726,896 to 322,800, including an AIV sub-3-us block reduction
+from 270,726 to 47,975. The captured device span falls from 289.02 to 184.54 ms.
+Decode records fall from 100,573 to 87,837 and its captured span from 69.51 to
+66.64 ms. These single instrumented dispatches are diagnostic, not the
+unprofiled serving medians. The initial decode TP wait remains about 8.1 ms.
+
+### Projection epilogues and bounded cache workers
+
+The W8A8 projection rounds its dequantized FP32 tile to BF16 before the
+producer stores it. This removes the FP32 intermediate tensor and the
+separate BF16 conversion scope while preserving the INT8 quantization,
+FP32 dequantization, and BF16 rounding boundaries. The shared path serves
+the MLA QA, QB, KV, and output projections.
+
+Indexer pooling similarly rounds and stores each pooled key in the pool
+producer. Its completion token now covers both the BF16 cache write and
+validity publication; tail-cache publication still depends on that token.
+The separate pool-store scope and FP32 staging tensor are removed.
+
+MLA cache writes, indexer pool events, tail publication, and KDA output
+normalization cap their launches at 48 workers. A worker
+visits the original partitions with stride 48, preserving per-tile
+arithmetic, masked-slot handling, and cache ownership. Sparse and padded
+capacity still requires checking metadata inside each worker.
+
+Measured against the preceding bounded-worker implementation on a2a3
+device 0, using TP8/EP8 local dimensions, frozen input/reference replay,
+100 timed rounds and five warmups, complete operator effective-time medians
+are:
+
+| Component | Capacity/events | Before (us) | After (us) | Speedup |
+|---|---:|---:|---:|---:|
+| W8A8 QA projection | 192 | 579.90 | 505.30 | 1.15x |
+| W8A8 QB projection | 192 | 369.45 | 270.70 | 1.36x |
+| W8A8 KV projection | 192 | 232.00 | 205.60 | 1.13x |
+| W8A8 output projection | 192 | 836.90 | 647.20 | 1.29x |
+| KDA output, including normalization | 192 | 487.50 | 461.10 | 1.06x |
+| MLA cache write, 32 active rows | 192 | 41.70 | 22.00 | 1.90x |
+| Indexer tail publication, 32 active rows | 192 | 43.50 | 19.30 | 2.25x |
+| Indexer pool write, sparse events | 80 | 47.20 | 19.55 | 2.41x |
+
+At capacity 32 the four W8A8 projections improve by 1.10x--1.24x.
+The cache and tail worker loops do not reduce the launch count at that
+capacity: measured latency changes from 16.55 to 17.20 us and from 16.45
+to 16.60 us, respectively. Full 192-row cache and tail cases improve by
+1.57x and 2.18x; fully populated pooling improves by 2.30x.
+
+Separate native captures confirm removal of all 768 output-projection
+cast blocks and reduction of normalization/cache/tail blocks from 192 to
+48 each. Pooling and its former store stage together fall from 160 to
+48 blocks. These are AIV physical block counts, not logical graph-task
+counts. Captured normalization span falls from 59.00 to 16.86 us, but
+Cube projection dominates the complete KDA output, explaining its smaller
+1.06x wall-time improvement.
+
+The candidate QKV-padding worker cap was rejected: complete sparse
+projection latency changes from 674.90 to 683.90 us, while zero/full cases
+show little change. Its function is restored exactly to the tested baseline.
+Reducing padding block count alone is not a demonstrated speedup.
+
+All 28 paired candidate cases pass native validation, and optimized
+outputs match baseline device outputs bitwise. The same case coverage
+passes simulation; the final restored projection function is identical
+to the baseline. Coverage includes empty/full active batches, ragged
+shapes, masked cache slots, and sparse pooling. W8A8 timing fixtures use
+integer-valued BF16 inputs with exact CPU checks; the full-cache fixture
+also uses exact integer-valued blocks while preserving zero/near-zero
+blocks. Two original random-input baseline cases encounter quantization
+rounding-boundary differences from the CPU reference. Their saved original
+inputs pass separate exact comparisons against baseline device outputs;
+these checks establish equivalence, not independent CPU-reference accuracy.
+Acceptance tolerances and model arithmetic are unchanged.
+
+No new serving benchmark accompanies this second pass. The serving
+measurements above describe the preceding implementation.
+
 ### KDA QKV active capacity rows
 
 The shared KDA projection takes `query_start_loc` and uses its final offset
