@@ -548,9 +548,17 @@ def build_c1a_specs(
         physical_pages = token_tables.gather(1, (positions // 128)[:, None]).squeeze(-1).long()
         values["compressed_slots"] = physical_pages * 128 + positions % 128
     if case == "ragged":
+        page_rows = PAGES * 128
+        ragged_groups = (TOKENS + 3) // 4
         for t in range(TOKENS):
-            length = (PAGES * 128, 0, 7, 129)[t % 4]
-            values["compressed_lens"][t] = min(length, PAGES * 128)
+            length = (page_rows, 0, 7, 129)[t % 4]
+            if mode == "full":
+                # Each live row publishes a cache entry. Keep the three non-empty
+                # length bands disjoint even when requests share a block table.
+                group = t // 4
+                middle_length = min(129, page_rows - ragged_groups)
+                length = (page_rows - group, 0, 7 + group, middle_length - group)[t % 4]
+            values["compressed_lens"][t] = min(length, page_rows)
             values["window_indices"][t, (0 if t % 4 == 1 else 17) :] = -1
             values["compressed_indices"][t, (0 if t % 4 == 1 else 31) :] = -1
             if t % 4 == 1:

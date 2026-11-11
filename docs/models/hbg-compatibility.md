@@ -51,6 +51,9 @@ with `--case mixed`, `decode_c2a_reuse.py` with `--case long`, and
 --case ragged --start-pos 8192,8192,8192,8192 --query-lens 1,1,1,1
 ```
 
+The C1A full ragged fixture with 72 rows also passed TMR and HBG after
+assigning each published row its own physical cache slot.
+
 Lib `6a39eda` compiled the standalone `decode_fwd.py` entry in TMR and
 HBG with the same toolchain at TP1/EP2/DP2 and one synthetic weight
 bank. The check used `--compile-only`. The component goldens above
