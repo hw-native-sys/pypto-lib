@@ -1,0 +1,70 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+.Python
+*.so
+
+# Packaging / distribution
+.eggs/
+*.egg-info/
+*.egg
+dist/
+build/
+sdist/
+wheels/
+develop-eggs/
+*.manifest
+*.spec
+
+# Project build artifacts
+build_output/
+pa_build/
+site/
+.site-theme/
+
+# Virtual environments
+.env/
+.venv/
+env/
+venv/
+ENV/
+
+# CI-generated g++-15 / gcc-15 shims, written next to the per-job venv
+toolchain-bin/
+
+# Testing / coverage / type-checking caches
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs / editors
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Project-specific
+KNOWN_PYPTO_ISSUES.md*
+KNOWN_PYPTO_ISSUES/
+# Retained so a developer's pre-rename local log stays ignored
+KNOWN_ISSUES.md

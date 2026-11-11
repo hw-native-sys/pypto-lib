@@ -1,0 +1,657 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+# ci: devices=2
+"""GLM-5.3-Flash decode expert dispatch, execution and combination."""
+
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+if __name__ == "__main__" and not any(tok == "--ep" or tok.startswith("--ep=") for tok in sys.argv):
+    sys.argv += ["--ep", "2"]
+
+import pypto.language as pl
+import pypto.language.distributed as pld
+import torch
+
+from models.glm5_3_flash.config import EP_SIZE, FLASH, N_LOCAL_EXPERTS, TOPK, D
+from models.glm5_3_flash.expert_routed import expert_routed, golden_expert_routed_fn
+from models.glm5_3_flash.quantization import quantize_per_token_int8
+from models.glm5_3_flash.utils import gen_routed_weight
+
+LANE_ROWS_DYN = pl.dynamic("GLM53_DECODE_MOE_LANE_ROWS_DYN")
+ROUTE_ROWS_DYN = pl.dynamic("GLM53_DECODE_MOE_ROUTE_ROWS_DYN")
+
+N_RANKS = EP_SIZE
+MOE_INTER = FLASH.moe_intermediate_size
+T = 16  # decode capacity exercised by this entry (token rows per rank)
+TOPK_ACTIVE = TOPK
+N_ROUTES = T * TOPK
+LANE_CAP = N_ROUTES  # dropless per (source, destination) lane bound
+LANE_ROWS = N_RANKS * LANE_CAP
+AUX_SCALE, AUX_W, AUX_ROUTE, AUX_EXPERT = 0, 1, 2, 3
+AUX_PAD = 16  # one 64-byte line per lane row: 32-byte rows would share lines
+COUNT_PAD = 16  # one 64-byte line per source row for the same reason
+
+
+@pl.jit.inline
+def moe_pack(
+    route_indices: pl.Tensor[[T, TOPK], pl.INT32],
+    route_weights: pl.Tensor[[T, TOPK], pl.FP32],
+    x_int8: pl.Tensor[[T, D], pl.INT8],
+    x_scale: pl.Tensor[[T, 1], pl.FP32],
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Push this rank's routes into the destination lanes.
+
+    One block per destination scans the routes in ``(t, k)`` order and fills its
+    lane; a final single-instance block publishes the per-destination count and
+    the payload barrier after the push block retires.
+    """
+    active = pl.cast(num_tokens, pl.INDEX)
+    if active < 0:
+        active = pl.cast(0, pl.INDEX)
+    if active > T:
+        active = pl.cast(T, pl.INDEX)
+    dst_cols = pl.create_tensor([N_RANKS], dtype=pl.INT32)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_ep_pack_count") as count_tid:
+        for d in pl.range(N_RANKS):
+            pl.write(dst_cols, [d], pl.cast(0, pl.INT32))
+        for t in pl.range(active):
+            for k in pl.range(TOPK):
+                e = pl.read(route_indices, [t, k])
+                dst = pl.cast(e // N_LOCAL_EXPERTS, pl.INDEX)
+                pl.write(dst_cols, [dst], pl.cast(pl.read(dst_cols, [dst]) + 1, pl.INT32))
+
+    with pl.spmd(num_ranks, name_hint="moe_ep_pack_push", deps=[count_tid]) as push_tid:
+        d = pl.tile.get_block_idx()
+        lane_slot = pl.cast(0, pl.INDEX)
+        for t in pl.range(active):
+            for k in pl.range(TOPK):
+                e = pl.read(route_indices, [t, k])
+                dst = pl.cast(e // N_LOCAL_EXPERTS, pl.INDEX)
+                if dst == d:
+                    # The row lands in the *destination's* window, so it is
+                    # addressed by the source lane (my_rank), not by d.
+                    lane_row = pl.cast(my_rank, pl.INDEX) * LANE_CAP + lane_slot
+                    pld.tensor.put(
+                        dst=lane_x, peer=d, src=x_int8, dst_offsets=[lane_row, 0], src_offsets=[t, 0],
+                        shape=[1, D],
+                    )
+                    aux = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
+                    pl.tile.write(aux, [0, AUX_SCALE], pl.read(x_scale, [t, 0]))
+                    pl.tile.write(aux, [0, AUX_W], pl.read(route_weights, [t, k]))
+                    push_route_i32 = pl.cast(t * TOPK + k, pl.INT32)
+                    pl.tile.write(aux, [0, AUX_ROUTE], pl.cast(push_route_i32, pl.FP32))
+                    d_i32 = pl.cast(d, pl.INT32)
+                    push_expert_i32 = pl.cast(e - d_i32 * N_LOCAL_EXPERTS, pl.INT32)
+                    pl.tile.write(aux, [0, AUX_EXPERT], pl.cast(push_expert_i32, pl.FP32))
+                    pld.tile.remote_store(aux, target=lane_aux, peer=d, offsets=[lane_row, 0])
+                    lane_slot = lane_slot + 1
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_ep_pack_notify", deps=[push_tid]) as _notify_tid:
+        # Count carries how many rows landed in each destination's lane; the
+        # ready flag is the payload barrier the receiver waits on. Both follow
+        # the puts in program order.
+        for d in pl.range(num_ranks):
+            count_tile = pl.tile.full([1, COUNT_PAD], dtype=pl.INT32, value=0)
+            pl.tile.write(count_tile, [0, 0], pl.read(dst_cols, [d]))
+            pld.tile.remote_store(count_tile, target=lane_count, peer=d, offsets=[my_rank, 0])
+            if d != my_rank:
+                # Increment this source's counter once for the current call.
+                pld.system.notify(target=lane_ready, peer=d, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+
+    # The notify block must retire before any consumer reads this rank's own
+    # lane: the arrival wait only covers peers, so the local count/ready writes
+    # ride this TaskId rather than the push's.
+    return _notify_tid
+
+
+@pl.jit.inline
+def moe_arrive(
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    arrive_x: pl.Tensor[[LANE_ROWS, D], pl.INT8],
+    arrive_scale: pl.Tensor[[LANE_ROWS, 1], pl.FP32],
+    arrive_weight: pl.Tensor[[LANE_ROWS, 1], pl.FP32],
+    arrive_route: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
+    arrive_expert: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
+    arrive_src: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
+    arrive_total: pl.Tensor[[1], pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+    pack_tid: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Wait for the peer payloads, then flatten this rank's lanes source-major."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_ep_arrive_wait", deps=[pack_tid]) as wait_tid:
+        for src in pl.range(num_ranks):
+            if src != my_rank:
+                pld.system.wait(signal=lane_ready, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+
+    src_base = pl.create_tensor([N_RANKS], dtype=pl.INT32)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_ep_arrive_prefix", deps=[wait_tid]) as prefix_tid:
+        running = pl.cast(0, pl.INDEX)
+        for s in pl.range(num_ranks):
+            pl.write(src_base, [s], pl.cast(running, pl.INT32))
+            n_rows = pl.cast(pl.read(lane_count, [s, 0]), pl.INDEX)
+            for i in pl.range(n_rows):
+                flat = running + i
+                lane_row = s * LANE_CAP + i
+                pl.write(arrive_scale, [flat, 0], pl.read(lane_aux, [lane_row, AUX_SCALE]))
+                pl.write(arrive_weight, [flat, 0], pl.read(lane_aux, [lane_row, AUX_W]))
+                pl.write(arrive_route, [flat, 0], pl.cast(pl.read(lane_aux, [lane_row, AUX_ROUTE]), pl.INT32))
+                pl.write(arrive_expert, [flat, 0], pl.cast(pl.read(lane_aux, [lane_row, AUX_EXPERT]), pl.INT32))
+                pl.write(arrive_src, [flat, 0], pl.cast(s, pl.INT32))
+            running = running + n_rows
+        pl.write(arrive_total, [0], pl.cast(running, pl.INT32))
+
+    with pl.spmd(num_ranks, name_hint="moe_ep_arrive_copy", deps=[prefix_tid]) as _arrive_tid:
+        s = pl.tile.get_block_idx()
+        base = pl.cast(pl.read(src_base, [s]), pl.INDEX)
+        n_rows = pl.cast(pl.read(lane_count, [s, 0]), pl.INDEX)
+        for i in pl.range(n_rows):
+            flat = base + i
+            lane_row = s * LANE_CAP + i
+            arrive_x[flat : flat + 1, :] = lane_x[lane_row : lane_row + 1, :]
+
+    return prefix_tid
+
+
+@pl.jit.inline
+def moe_dispatch(
+    route_expert: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
+    route_src: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
+    route_id: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
+    route_x: pl.Tensor[[LANE_ROWS, D], pl.INT8],
+    route_scale: pl.Tensor[[LANE_ROWS, 1], pl.FP32],
+    route_weight: pl.Tensor[[LANE_ROWS, 1], pl.FP32],
+    route_count: pl.Tensor[[1], pl.INT32],
+    recv_x: pl.Tensor[[LANE_ROWS, D], pl.INT8],
+    recv_scale: pl.Tensor[[LANE_ROWS, 1], pl.FP32],
+    recv_weight: pl.Tensor[[LANE_ROWS, 1], pl.FP32],
+    recv_src: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
+    recv_route: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
+    expert_offsets: pl.Tensor[[N_LOCAL_EXPERTS + 1], pl.INT32],
+):
+    """Stable expert-major regroup of this rank's arrived routes.
+
+    Capacity tails are never read: every loop here and in ``expert_routed`` is
+    bounded by an exact count (``route_count`` here, the expert offsets there),
+    so rows a call did not write — which may decode as NaN/Inf — are never
+    consumed.
+    """
+    n_routes = pl.cast(pl.read(route_count, [0]), pl.INDEX)
+    if n_routes < 0:
+        n_routes = pl.cast(0, pl.INDEX)
+    if n_routes > LANE_ROWS:
+        n_routes = pl.cast(LANE_ROWS, pl.INDEX)
+    bucket = pl.create_tensor([LANE_ROWS], dtype=pl.INT32)
+
+    cursor = pl.create_tensor([N_LOCAL_EXPERTS], dtype=pl.INT32)
+    expert_cols = pl.create_tensor([N_LOCAL_EXPERTS], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_ep_dispatch_count") as count_tid:
+        for e in pl.range(N_LOCAL_EXPERTS):
+            pl.write(expert_cols, [e], pl.cast(0, pl.INT32))
+        for r in pl.range(n_routes):
+            e = pl.cast(pl.read(route_expert, [r, 0]), pl.INDEX)
+            pl.write(expert_cols, [e], pl.cast(pl.read(expert_cols, [e]) + 1, pl.INT32))
+        running = pl.cast(0, pl.INT32)
+        for e in pl.range(N_LOCAL_EXPERTS):
+            pl.write(expert_offsets, [e], running)
+            pl.write(cursor, [e], running)
+            running = running + pl.read(expert_cols, [e])
+        pl.write(expert_offsets, [N_LOCAL_EXPERTS], running)
+        # One instance owns every scalar aux write: the 4-byte [row, 0] entries
+        # share 64-byte lines, and concurrent blocks would drop each other's
+        # stores there. The payload rows below are whole 4 KB rows and stay
+        # expert-parallel.
+        for r in pl.range(n_routes):
+            e = pl.cast(pl.read(route_expert, [r, 0]), pl.INDEX)
+            slot = pl.read(cursor, [e])
+            pl.write(cursor, [e], pl.cast(slot + 1, pl.INT32))
+            flat_slot = pl.cast(slot, pl.INDEX)
+            pl.write(bucket, [flat_slot], pl.cast(r, pl.INT32))
+            pl.write(recv_scale, [flat_slot, 0], pl.read(route_scale, [r, 0]))
+            pl.write(recv_weight, [flat_slot, 0], pl.read(route_weight, [r, 0]))
+            pl.write(recv_src, [flat_slot, 0], pl.read(route_src, [r, 0]))
+            pl.write(recv_route, [flat_slot, 0], pl.read(route_id, [r, 0]))
+
+    with pl.spmd(N_LOCAL_EXPERTS, name_hint="moe_ep_dispatch_gather", deps=[count_tid]) as _gather_tid:
+        e = pl.tile.get_block_idx()
+        base = pl.cast(pl.read(expert_offsets, [e]), pl.INDEX)
+        n_rows = pl.cast(pl.read(expert_cols, [e]), pl.INDEX)
+        for i in pl.range(n_rows):
+            flat_slot = base + i
+            r = pl.cast(pl.read(bucket, [flat_slot]), pl.INDEX)
+            recv_x[flat_slot : flat_slot + 1, :] = route_x[r : r + 1, :]
+
+    return recv_x
+
+
+@pl.jit.inline(auto_scope=False)
+def moe_return(
+    expert_out: pl.Tensor[[LANE_ROWS, D], pl.FP32],
+    recv_src: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
+    recv_route: pl.Tensor[[LANE_ROWS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
+    route_count: pl.Tensor[[1], pl.INT32],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Put every expert row back to its owner's route slot."""
+    n_rows = pl.cast(pl.read(route_count, [0]), pl.INDEX)
+    if n_rows < 0:
+        n_rows = pl.cast(0, pl.INDEX)
+    if n_rows > LANE_ROWS:
+        n_rows = pl.cast(LANE_ROWS, pl.INDEX)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_ep_return", allow_early_resolve=True) as return_tid:
+        for r in pl.range(n_rows):
+            src = pl.read(recv_src, [r, 0])
+            slot = pl.cast(pl.read(recv_route, [r, 0]), pl.INDEX)
+            pld.tensor.put(
+                dst=slot_out, peer=src, src=expert_out, dst_offsets=[slot, 0], src_offsets=[r, 0],
+                shape=[1, D],
+            )
+
+    return return_tid
+
+
+@pl.jit.inline
+def moe_return_notify(
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    return_tid: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Increment every peer's return counter after the return puts retire."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_ep_return_notify", deps=[return_tid]) as sync_tid:
+        for peer in pl.range(num_ranks):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=return_ready, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+    return sync_tid
+
+
+@pl.jit.inline
+def moe_combine(
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+    sync_tid: pl.Scalar[pl.TASK_ID],
+) -> pl.Tensor[[T, D], pl.FP32]:
+    """Wait for every peer's returns, then sum the TOPK slots of each token."""
+    active = pl.cast(num_tokens, pl.INDEX)
+    if active < 0:
+        active = pl.cast(0, pl.INDEX)
+    if active > T:
+        active = pl.cast(T, pl.INDEX)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_ep_combine_wait", deps=[sync_tid]) as wait_tid:
+        for src in pl.range(num_ranks):
+            if src != my_rank:
+                pld.system.wait(signal=return_ready, offsets=[src, 0], expected=epoch, cmp=pld.WaitCmp.Ge)
+
+    # One block per capacity row: rows past ``active`` are written as zeros so a
+    # run with fewer active tokens still leaves a defined output.
+    with pl.spmd(T, name_hint="moe_ep_combine", deps=[wait_tid]) as _combine_tid:
+        t = pl.tile.get_block_idx()
+        acc = pl.full([1, D], dtype=pl.FP32, value=0.0)
+        correction = pl.full([1, D], dtype=pl.FP32, value=0.0)
+        if t < active:
+            for k in pl.range(TOPK):
+                slot = t * TOPK + k
+                value = slot_out[slot : slot + 1, :]
+                updated = pl.add(acc, value)
+                recovered = pl.sub(updated, acc)
+                error = pl.add(pl.sub(acc, pl.sub(updated, recovered)), pl.sub(value, recovered))
+                correction = pl.add(correction, error)
+                acc = updated
+        y[t : t + 1, :] = pl.add(acc, correction)
+
+    return y
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_moe(
+    route_indices: pl.Tensor[[T, TOPK], pl.INT32],
+    route_weights: pl.Tensor[[T, TOPK], pl.FP32],
+    x_int8: pl.Tensor[[T, D], pl.INT8],
+    x_scale: pl.Tensor[[T, 1], pl.FP32],
+    w_gate_up: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+):
+    """One rank's orchestration of the six stages."""
+
+    pack_tid = moe_pack(
+        route_indices, route_weights, x_int8, x_scale, lane_x, lane_aux, lane_count, lane_ready, num_tokens,
+        num_ranks, my_rank,
+    )
+    arrive_total = pl.create_tensor([1], dtype=pl.INT32)
+    arrive_src = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
+    arrive_expert = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
+    arrive_route = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
+    arrive_weight = pl.create_tensor([LANE_ROWS, 1], dtype=pl.FP32)
+    arrive_scale = pl.create_tensor([LANE_ROWS, 1], dtype=pl.FP32)
+    arrive_x = pl.create_tensor([LANE_ROWS, D], dtype=pl.INT8)
+    moe_arrive(
+        lane_x, lane_aux, lane_count, lane_ready, arrive_x, arrive_scale, arrive_weight, arrive_route,
+        arrive_expert, arrive_src, arrive_total, num_ranks, my_rank, epoch, pack_tid,
+    )
+    expert_offsets = pl.create_tensor([N_LOCAL_EXPERTS + 1], dtype=pl.INT32)
+    recv_route = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
+    recv_src = pl.create_tensor([LANE_ROWS, 1], dtype=pl.INT32)
+    recv_weight = pl.create_tensor([LANE_ROWS, 1], dtype=pl.FP32)
+    recv_scale = pl.create_tensor([LANE_ROWS, 1], dtype=pl.FP32)
+    recv_x = pl.create_tensor([LANE_ROWS, D], dtype=pl.INT8)
+    moe_dispatch(
+        arrive_expert, arrive_src, arrive_route, arrive_x, arrive_scale, arrive_weight, arrive_total, recv_x,
+        recv_scale, recv_weight, recv_src, recv_route, expert_offsets,
+    )
+    expert_out = pl.create_tensor([LANE_ROWS, D], dtype=pl.FP32)
+    expert_routed(
+        recv_x, recv_scale, w_gate_up, w_gate_up_scale,
+        w_down, w_down_scale, expert_offsets, recv_weight, expert_out,
+    )
+    return_tid = moe_return(expert_out, recv_src, recv_route, slot_out, arrive_total)
+    sync_tid = moe_return_notify(return_ready, num_ranks, my_rank, return_tid)
+    moe_combine(slot_out, return_ready, y, num_tokens, num_ranks, my_rank, epoch, sync_tid)
+    return y
+
+
+@pl.jit(auto_scope=False)
+def l2_decode_moe(
+    route_indices: pl.Tensor[[T, TOPK], pl.INT32],
+    route_weights: pl.Tensor[[T, TOPK], pl.FP32],
+    x_int8: pl.Tensor[[T, D], pl.INT8],
+    x_scale: pl.Tensor[[T, 1], pl.FP32],
+    w_gate_up: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+):
+    """Run the routed decode MoE as a standalone L2 entry."""
+    decode_moe(
+        route_indices, route_weights, x_int8, x_scale,
+        w_gate_up, w_gate_up_scale, w_down, w_down_scale, y,
+        lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready,
+        num_tokens, num_ranks, my_rank, epoch,
+    )
+    return y
+
+
+@pl.jit.host
+def l3_decode_moe(
+    route_indices: pl.Tensor[[N_RANKS, T, TOPK], pl.INT32],
+    route_weights: pl.Tensor[[N_RANKS, T, TOPK], pl.FP32],
+    x_int8: pl.Tensor[[N_RANKS, T, D], pl.INT8],
+    x_scale: pl.Tensor[[N_RANKS, T, 1], pl.FP32],
+    w_gate_up: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    w_gate_up_scale: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    w_down: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    w_down_scale: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, D], pl.FP32],
+    y: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.FP32]],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+):
+    """Launch one rank's orchestration per chip, sharing the window buffers."""
+    lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, D], dtype=pl.INT8)
+    lane_aux_buf = pld.alloc_window_buffer([LANE_ROWS, AUX_PAD], dtype=pl.FP32)
+    lane_count_buf = pld.alloc_window_buffer([N_RANKS, COUNT_PAD], dtype=pl.INT32)
+    lane_ready_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    slot_out_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.FP32)
+    return_ready_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+
+    # Repeat the same inputs with successive epochs to exercise window reuse.
+    # Each rank completes combine before starting its next dispatch.
+    for call in pl.range(2):
+        for r in pl.range(pld.world_size()):
+            lane_x = pld.window(lane_x_buf, [LANE_ROWS, D], dtype=pl.INT8)
+            lane_aux = pld.window(lane_aux_buf, [LANE_ROWS, AUX_PAD], dtype=pl.FP32)
+            lane_count = pld.window(lane_count_buf, [N_RANKS, COUNT_PAD], dtype=pl.INT32)
+            lane_ready = pld.window(lane_ready_buf, [N_RANKS, 1], dtype=pl.INT32)
+            slot_out = pld.window(slot_out_buf, [N_ROUTES, D], dtype=pl.FP32)
+            return_ready = pld.window(return_ready_buf, [N_RANKS, 1], dtype=pl.INT32)
+            l2_decode_moe(
+                route_indices[r], route_weights[r], x_int8[r], x_scale[r], w_gate_up[r], w_gate_up_scale[r],
+                w_down[r], w_down_scale[r], y[r], lane_x, lane_aux, lane_count, lane_ready, slot_out,
+                return_ready, num_tokens, num_ranks, r, pl.cast(call + 1, pl.INT32), device=r,
+            )
+
+
+def golden_routed_ep(tensors):
+    """Rank-aware torch reference for the routed branch: pack, arrive, regroup,
+    experts, return, combine.
+
+    The transport is emulated by placing every payload into the destination
+    rank's lane of the source that computed it, which is exactly what the two
+    kernels move over the wire. The expert maths is deferred to
+    ``expert_routed``'s golden so the reference stays single-sourced.
+
+    Returns the per-rank routed output ``[N_RANKS, T, D]``; the EP entry writes
+    it to ``y``, while the layer composition adds the shared-expert result.
+    """
+
+    num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
+    x_next = torch.zeros(N_RANKS, T, D, dtype=torch.float32)
+
+    # Stage 1: pack every source rank's routes into destination lanes.
+    lane_x = torch.zeros(N_RANKS, LANE_ROWS, D, dtype=torch.int8)
+    lane_aux = torch.zeros(N_RANKS, LANE_ROWS, AUX_PAD, dtype=torch.float32)
+    lane_count = torch.zeros(N_RANKS, N_RANKS, dtype=torch.int64)
+    for src in range(N_RANKS):
+        for t in range(num_tokens):
+            for k in range(TOPK):
+                e = int(tensors["route_indices"][src, t, k])
+                dst = e // N_LOCAL_EXPERTS
+                slot = int(lane_count[src, dst])
+                lane_count[src, dst] += 1
+                row = src * LANE_CAP + slot
+                lane_x[dst, row] = tensors["x_int8"][src, t]
+                lane_aux[dst, row, AUX_SCALE] = tensors["x_scale"][src, t, 0]
+                lane_aux[dst, row, AUX_W] = tensors["route_weights"][src, t, k]
+                lane_aux[dst, row, AUX_ROUTE] = t * TOPK + k
+                lane_aux[dst, row, AUX_EXPERT] = e - dst * N_LOCAL_EXPERTS
+
+    # Stage 2-5: per destination, flatten source-major, regroup by expert,
+    # evaluate the local experts, and return each row to its owner's slot.
+    slot_out = torch.zeros(N_RANKS, N_ROUTES, D, dtype=torch.float32)
+    for dst in range(N_RANKS):
+        flat_expert = []
+        flat_route = []
+        flat_src = []
+        recv_x = []
+        recv_scale = []
+        recv_weight = []
+        expert_offsets = [0]
+        for src in range(N_RANKS):
+            for i in range(int(lane_count[src, dst])):
+                row = src * LANE_CAP + i
+                flat_expert.append(int(lane_aux[dst, row, AUX_EXPERT]))
+                flat_route.append(int(lane_aux[dst, row, AUX_ROUTE]))
+                flat_src.append(src)
+                recv_x.append(lane_x[dst, row])
+                recv_scale.append(lane_aux[dst, row, AUX_SCALE])
+                recv_weight.append(lane_aux[dst, row, AUX_W])
+        total = len(flat_expert)
+        counts = [0] * N_LOCAL_EXPERTS
+        for e in flat_expert:
+            counts[e] += 1
+        for e in range(N_LOCAL_EXPERTS):
+            expert_offsets.append(expert_offsets[-1] + counts[e])
+        order = sorted(range(total), key=lambda r: flat_expert[r])
+        x_flat = torch.zeros(LANE_ROWS, D, dtype=torch.int8)
+        s_flat = torch.zeros(LANE_ROWS, 1, dtype=torch.float32)
+        w_flat = torch.zeros(LANE_ROWS, 1, dtype=torch.float32)
+        for slot, r in enumerate(order):
+            x_flat[slot] = recv_x[r]
+            s_flat[slot] = recv_scale[r]
+            w_flat[slot] = recv_weight[r]
+        work = {
+            "x_int8": x_flat,
+            "x_scale": s_flat,
+            "w_gate_up": tensors["w_gate_up"][dst],
+            "w_gate_up_scale": tensors["w_gate_up_scale"][dst],
+            "w_down": tensors["w_down"][dst],
+            "w_down_scale": tensors["w_down_scale"][dst],
+            "expert_offsets": torch.tensor(expert_offsets, dtype=torch.int32),
+            "route_weights": w_flat,
+            "output": torch.zeros(LANE_ROWS, D, dtype=torch.float32),
+        }
+        golden_expert_routed_fn(work)
+        expert_out = work["output"].float()
+        for slot, r in enumerate(order):
+            slot_out[flat_src[r], flat_route[r]] = expert_out[slot]
+
+    # Stage 6: token sum of the TOPK slots.
+    for r in range(N_RANKS):
+        for t in range(num_tokens):
+            x_next[r, t] = slot_out[r, t * TOPK : (t + 1) * TOPK].double().sum(dim=0).float()
+
+    return x_next
+
+
+def golden_decode_moe(tensors):
+    """Routed-branch expected output for the EP entry."""
+    tensors["y"][:] = golden_routed_ep(tensors)
+
+
+def build_tensor_specs(num_tokens=T, *, loopback=False, num_ranks=EP_SIZE):
+    from golden import ScalarSpec, TensorSpec
+
+    num_tokens = max(0, min(T, int(num_tokens)))
+
+    def init_route_indices():
+        # Global expert ids spread across the EP ranks so peer lanes move data.
+        # Loopback has no peers, so every route has to land on this rank.
+        gen = torch.Generator().manual_seed(7)
+        bound = N_LOCAL_EXPERTS if loopback else N_RANKS * N_LOCAL_EXPERTS
+        return torch.randint(0, bound, (N_RANKS, T, TOPK), generator=gen).to(torch.int32)
+
+    ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2}
+    (w_gu_i8, w_gu_s) = gen_routed_weight((N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
+    w2_i8, w2_s = gen_routed_weight((N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
+
+    x_bf16 = torch.randn(N_RANKS, T, D, dtype=torch.bfloat16)
+
+    def init_x_int8():
+
+        x_i8, _ = quantize_per_token_int8(x_bf16.reshape(N_RANKS * T, D))
+        return x_i8.reshape(N_RANKS, T, D)
+
+    def init_x_scale():
+
+        _, x_sd = quantize_per_token_int8(x_bf16.reshape(N_RANKS * T, D))
+        return x_sd.reshape(N_RANKS, T, 1)
+
+    return [
+        TensorSpec("route_indices", [N_RANKS, T, TOPK], torch.int32, init_value=init_route_indices),
+        TensorSpec("route_weights", [N_RANKS, T, TOPK], torch.float32, init_value=lambda : torch.rand(N_RANKS, T, TOPK)),
+        TensorSpec("x_int8", [N_RANKS, T, D], torch.int8, init_value=init_x_int8),
+        TensorSpec("x_scale", [N_RANKS, T, 1], torch.float32, init_value=init_x_scale),
+        TensorSpec("w_gate_up", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8, init_value=lambda : w_gu_i8),
+        TensorSpec("w_gate_up_scale", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda : w_gu_s),
+        TensorSpec("w_down", [N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
+        TensorSpec("w_down_scale", [N_RANKS, N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
+        TensorSpec("y", [N_RANKS, T, D], torch.float32),
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
+        ScalarSpec("num_ranks", torch.int32, num_ranks),
+    ]
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from pypto.ir import DistributedConfig
+
+    from golden import ratio_reldiff, run
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("--ep", type=int, default=2, help="expert-parallel size / rank count")
+    parser.add_argument(
+        "-d", "--device", type=str, default=",".join((str(i) for i in range(N_RANKS))),
+        help=f"comma-separated device ids (need {N_RANKS})",
+    )
+    parser.add_argument("--num-tokens", type=int, default=T)
+    parser.add_argument(
+        "--loopback", action="store_true", default=False,
+        help="transport-free single-rank path (needs one device, num_ranks=1)",
+    )
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    args = parser.parse_args()
+
+    device_ids = [int(d) for d in args.device.split(",")]
+    if args.loopback:
+        assert len(device_ids) == 1, f"loopback needs exactly one device, got {device_ids}"
+        num_ranks = 1
+    else:
+        assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
+        num_ranks = len(device_ids)
+
+    result = run(
+        fn=l3_decode_moe,
+        specs=build_tensor_specs(args.num_tokens, loopback=args.loopback, num_ranks=num_ranks),
+        golden_fn=golden_decode_moe,
+        config=dict(
+            dump_passes=args.dump_passes,
+            backend_type=args.backend_type, execution_mode=args.execution_mode,
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            enable_chip_swimlane=args.enable_chip_swimlane,
+        ),
+        rtol=0.001,
+        atol=0.001,
+        compare_fn={"y": ratio_reldiff(diff_thd=0.003, pct_thd=0.01, valid_rows=1 if args.loopback else None)},
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)

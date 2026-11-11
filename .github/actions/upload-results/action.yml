@@ -1,0 +1,69 @@
+name: Upload a results artifact
+description: >-
+  actions/upload-artifact with one retry, for the self-hosted runners.
+  The artifact service is reached over three separate calls (CreateArtifact,
+  a blob PUT, FinalizeArtifact), and on these runners the two twirp calls to
+  *.actions.githubusercontent.com are intermittently reset: roughly one nightly
+  upload in eight dies ~3s in with `Unable to make request: ECONNRESET`, on
+  either call, on any of the hosts. The blob PUT in between usually succeeds --
+  the payload is a 1 KB results table, so this is not a size or bandwidth limit.
+
+  The artifact client does not retry it. Its twirp client retries five times
+  with backoff on HTTP 5xx, but a raw socket error is re-thrown before that loop
+  (`NetworkError.isNetworkErrorCode`: ECONNRESET, ENOTFOUND, ETIMEDOUT,
+  ECONNREFUSED, EHOSTUNREACH), on the theory that a self-hosted runner which
+  cannot reach an endpoint will not reach it a second time either. That holds
+  for a firewalled runner and not for a reset one, so the retry is ours to add.
+
+  A second failure fails the job. The results table is the whole point of the
+  nightly sweep, and the summary job renders a missing one as
+  ":warning: No results artifact" -- silently green with no data is the one
+  outcome worse than red.
+
+inputs:
+  name:
+    description: Artifact name.
+    required: true
+  path:
+    description: Files to upload (one path or a newline-separated list).
+    required: true
+  if-no-files-found:
+    description: warn | error | ignore, as upload-artifact defines them.
+    required: false
+    default: warn
+
+runs:
+  using: composite
+  steps:
+    - name: Upload ${{ inputs.name }}
+      id: attempt1
+      # A literal, never `${{ inputs.<something> }}`: an expression here is
+      # ignored by the runner in a composite step (actions/runner#2418), which
+      # would turn every flaked upload back into a failed job.
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+
+    # artifact-id is empty exactly when nothing was published -- the documented
+    # signal for a failed upload, and the one that stays true whether the call
+    # that died was CreateArtifact or FinalizeArtifact.
+    - name: Wait before retrying ${{ inputs.name }}
+      if: steps.attempt1.outputs.artifact-id == ''
+      shell: bash
+      run: |
+        echo "::warning::${{ inputs.name }} did not upload; retrying once in 15s"
+        sleep 15
+
+    - name: Retry ${{ inputs.name }}
+      if: steps.attempt1.outputs.artifact-id == ''
+      # overwrite: a Finalize whose *response* was lost still leaves the artifact
+      # created server-side, and v4 refuses a duplicate name without this.
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+        overwrite: true

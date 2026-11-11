@@ -1,0 +1,362 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+# ci: devices=2
+"""GLM-5.3-Flash decode MoE FFN composition and validation."""
+
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+if __name__ == "__main__" and not any(tok == "--ep" or tok.startswith("--ep=") for tok in sys.argv):
+    sys.argv += ["--ep", "2"]
+
+
+import pypto.language as pl
+import pypto.language.distributed as pld
+import torch
+
+from models.glm5_3_flash.config import EP_SIZE, HC_DIM, MIX_HC, N_EXPERTS, N_LOCAL_EXPERTS, TOPK, D
+from models.glm5_3_flash.decode_moe import (
+    AUX_PAD, COUNT_PAD, LANE_ROWS, LANE_ROWS_DYN, MOE_INTER, N_RANKS, N_ROUTES, ROUTE_ROWS_DYN, T,
+    decode_moe, golden_routed_ep,
+)
+from models.glm5_3_flash.expert_routed import build_checkpoint_moe_specs
+from models.glm5_3_flash.expert_shared import (
+    MOE_INTER as SHARED_INTER, expert_shared, golden_moe_tp_combine, moe_tp_combine,
+)
+from models.glm5_3_flash.gate import gate, make_correction_bias, moe_gate
+from models.glm5_3_flash.mhc import hc_mixes, hc_pre, hc_seed
+from models.glm5_3_flash.quantization import INT8_AMAX_EPS, INT8_SCALE_MAX
+from models.glm5_3_flash.rmsnorm import golden_rmsnorm_quant
+from models.glm5_3_flash.utils import gen_routed_weight, pack_int8_nz
+
+
+@pl.jit.inline(auto_scope=False)
+def decode_mlp(
+    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    w_gate_up: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    shared_w_gate_up: pl.Tensor[[2 * SHARED_INTER, D], pl.INT8, pl.NZ],
+    shared_w_gate_up_scale: pl.Tensor[[2 * SHARED_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[D, SHARED_INTER], pl.INT8, pl.NZ],
+    shared_w_down_scale: pl.Tensor[[D], pl.FP32],
+    y: pl.Tensor[[T, D], pl.FP32],
+    lane_x: pld.DistributedTensor[[LANE_ROWS_DYN, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS_DYN, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[ROUTE_ROWS_DYN, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    shared_exchange: pld.DistributedTensor[[T, D], pl.FP32],
+    shared_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+):
+    """Run EP routed experts and reduce shared TP shards over replicated tokens."""
+    x_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+
+    # Block head: normalized router and the INT8 view both branches reuse.
+    x_int8 = pl.create_tensor([T, D], dtype=pl.INT8)
+    route_indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
+    route_weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
+    moe_gate(
+        x_mixed, norm_weight, gate_weight, correction_bias, route_weights, route_indices, x_int8, x_scale,
+        num_tokens,
+    )
+
+    routed = pl.create_tensor([T, D], dtype=pl.FP32)
+    decode_moe(
+        route_indices, route_weights, x_int8, x_scale,
+        w_gate_up, w_gate_up_scale, w_down, w_down_scale, routed,
+        lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready,
+        num_tokens, num_ranks, my_rank, epoch,
+    )
+
+    # Shared branch: each TP rank computes its intermediate-channel shard.
+    shared_out = pl.create_tensor([T, D], dtype=pl.FP32)
+    expert_shared(
+        x_int8, x_scale, shared_w_gate_up, shared_w_gate_up_scale, shared_w_down, shared_w_down_scale,
+        shared_out,
+    )
+    moe_tp_combine(routed, shared_out, shared_exchange, shared_ready, y, num_tokens, my_rank, epoch)
+    return y
+
+
+@pl.jit(auto_scope=False)
+def l2_decode_layer(
+    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    norm_weight: pl.Tensor[[D], pl.BF16],
+    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    w_gate_up: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    w_gate_up_scale: pl.Tensor[[N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    w_down: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    w_down_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    shared_w_gate_up: pl.Tensor[[2 * SHARED_INTER, D], pl.INT8, pl.NZ],
+    shared_w_gate_up_scale: pl.Tensor[[2 * SHARED_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[D, SHARED_INTER], pl.INT8, pl.NZ],
+    shared_w_down_scale: pl.Tensor[[D], pl.FP32],
+    y: pl.Out[pl.Tensor[[T, D], pl.FP32]],
+    lane_x: pld.DistributedTensor[[LANE_ROWS, D], pl.INT8],
+    lane_aux: pld.DistributedTensor[[LANE_ROWS, AUX_PAD], pl.FP32],
+    lane_count: pld.DistributedTensor[[N_RANKS, COUNT_PAD], pl.INT32],
+    lane_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    slot_out: pld.DistributedTensor[[N_ROUTES, D], pl.FP32],
+    return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    shared_exchange: pld.DistributedTensor[[T, D], pl.FP32],
+    shared_ready: pld.DistributedTensor[[EP_SIZE, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    epoch: pl.Scalar[pl.INT32],
+):
+    """Run EP routed experts and reduce shared TP shards over replicated tokens."""
+    decode_mlp(
+        x_mixed, norm_weight, gate_weight, correction_bias, w_gate_up, w_gate_up_scale,
+        w_down, w_down_scale,
+        shared_w_gate_up, shared_w_gate_up_scale, shared_w_down, shared_w_down_scale, y, lane_x, lane_aux,
+        lane_count, lane_ready, slot_out, return_ready, shared_exchange, shared_ready,
+        num_tokens, num_ranks, my_rank, epoch,
+    )
+    return y
+
+
+@pl.jit.host
+def l3_decode_layer(
+    x_mixed: pl.Tensor[[N_RANKS, T, D], pl.BF16],
+    norm_weight: pl.Tensor[[N_RANKS, D], pl.BF16],
+    gate_weight: pl.Tensor[[N_RANKS, N_EXPERTS, D], pl.BF16],
+    correction_bias: pl.Tensor[[N_RANKS, N_EXPERTS], pl.FP32],
+    w_gate_up: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], pl.INT8],
+    w_gate_up_scale: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], pl.FP32],
+    w_down: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    w_down_scale: pl.Tensor[[N_RANKS, N_LOCAL_EXPERTS, D], pl.FP32],
+    shared_w_gate_up: pl.Tensor[[N_RANKS, 2 * SHARED_INTER, D], pl.INT8],
+    shared_w_gate_up_scale: pl.Tensor[[N_RANKS, 2 * SHARED_INTER], pl.FP32],
+    shared_w_down: pl.Tensor[[N_RANKS, D, SHARED_INTER], pl.INT8],
+    shared_w_down_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
+    y: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.FP32]],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_ranks: pl.Scalar[pl.INT32],
+):
+    """Launch replicated tokens with EP experts and shared TP weight shards."""
+    lane_x_buf = pld.alloc_window_buffer([LANE_ROWS, D], dtype=pl.INT8)
+    lane_aux_buf = pld.alloc_window_buffer([LANE_ROWS, AUX_PAD], dtype=pl.FP32)
+    lane_count_buf = pld.alloc_window_buffer([N_RANKS, COUNT_PAD], dtype=pl.INT32)
+    lane_ready_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    slot_out_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.FP32)
+    return_ready_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    shared_exchange_buf = pld.alloc_window_buffer([T, D], dtype=pl.FP32)
+    shared_ready_buf = pld.alloc_window_buffer([EP_SIZE, 1], dtype=pl.INT32)
+    # Repeat the EP path over the same windows with a fresh barrier epoch.
+    for call in pl.range(2):
+        for r in pl.range(pld.world_size()):
+            lane_x = pld.window(lane_x_buf, [LANE_ROWS, D], dtype=pl.INT8)
+            lane_aux = pld.window(lane_aux_buf, [LANE_ROWS, AUX_PAD], dtype=pl.FP32)
+            lane_count = pld.window(lane_count_buf, [N_RANKS, COUNT_PAD], dtype=pl.INT32)
+            lane_ready = pld.window(lane_ready_buf, [N_RANKS, 1], dtype=pl.INT32)
+            slot_out = pld.window(slot_out_buf, [N_ROUTES, D], dtype=pl.FP32)
+            return_ready = pld.window(return_ready_buf, [N_RANKS, 1], dtype=pl.INT32)
+            shared_exchange = pld.window(shared_exchange_buf, [T, D], dtype=pl.FP32)
+            shared_ready = pld.window(shared_ready_buf, [EP_SIZE, 1], dtype=pl.INT32)
+            l2_decode_layer(
+                x_mixed[r], norm_weight[r], gate_weight[r], correction_bias[r], w_gate_up[r],
+                w_gate_up_scale[r],
+                w_down[r], w_down_scale[r],
+                shared_w_gate_up[r], shared_w_gate_up_scale[r], shared_w_down[r], shared_w_down_scale[r],
+                y[r], lane_x, lane_aux, lane_count, lane_ready, slot_out, return_ready, shared_exchange, shared_ready,
+                num_tokens, num_ranks,
+                r, pl.cast(call + 1, pl.INT32), device=r,
+            )
+
+
+def golden_decode_layer(tensors):
+    """Combine EP routed rows and shared TP partials for replicated tokens."""
+
+    num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
+
+    # Block head, per rank, with the same torch references gate.py's test uses.
+    route_indices = torch.zeros(N_RANKS, T, TOPK, dtype=torch.int32)
+    route_weights = torch.zeros(N_RANKS, T, TOPK, dtype=torch.float32)
+    x_int8 = torch.zeros(N_RANKS, T, D, dtype=torch.int8)
+    x_scale = torch.zeros(N_RANKS, T, 1, dtype=torch.float32)
+    for r in range(N_RANKS):
+        x_norm, quantized, scale = golden_rmsnorm_quant(tensors["x_mixed"][r], tensors["norm_weight"][r])
+        weights, indices = gate(x_norm, tensors["gate_weight"][r], tensors["correction_bias"][r])
+        route_weights[r], route_indices[r] = weights, indices
+        x_int8[r], x_scale[r] = quantized, scale
+    if num_tokens < T:
+        route_weights[:, num_tokens:] = 0
+        route_indices[:, num_tokens:] = 0
+        x_scale[:, num_tokens:] = 0
+
+    routed = golden_routed_ep(
+        {
+            "route_indices": route_indices,
+            "route_weights": route_weights,
+            "x_int8": x_int8,
+            "x_scale": x_scale,
+            "w_gate_up": tensors["w_gate_up"],
+            "w_gate_up_scale": tensors["w_gate_up_scale"],
+            "w_down": tensors["w_down"],
+            "w_down_scale": tensors["w_down_scale"],
+            "num_tokens": num_tokens,
+        },
+    )
+
+    tensors["y"][:] = golden_moe_tp_combine(tensors, routed, x_int8, x_scale, num_tokens)
+
+
+def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, layer_id=3, hidden=None):
+    """Build generated fixtures or load a checkpoint's complete MoE FFN weights."""
+    if checkpoint is not None:
+
+        return build_checkpoint_moe_specs(
+            checkpoint, layer_id, capacity=T, num_tokens=num_tokens, num_ranks=num_ranks, hidden=hidden,
+        )
+    if hidden is not None:
+        raise ValueError("hidden activations require checkpoint weights")
+
+    from golden import ScalarSpec, TensorSpec
+
+    num_tokens = max(0, min(T, int(num_tokens)))
+
+    def quantize_rows(weight, dequant_std):
+        """Symmetric per-output-channel INT8 quant, rescaled to ``dequant_std``."""
+        amax = weight.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+        s = amax / INT8_SCALE_MAX
+        w_i8 = torch.round(weight / s).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+        s = (s.squeeze(-1) * (dequant_std / (w_i8.float() * s).std())).float()
+        return w_i8, s
+
+    # Quantize one shared FFN and split its gate/up rows and down columns.
+    def gen_fused_shared(dequant_std, chan_cv):
+        w = torch.randn(2 * MOE_INTER, D) * torch.exp(chan_cv * torch.randn(2 * MOE_INTER, 1))
+        w_i8, s = quantize_rows(w, dequant_std)
+        shards, scale_shards = [], []
+        for rank in range(N_RANKS):
+            first = rank * SHARED_INTER
+            gate = slice(first, first + SHARED_INTER)
+            up = slice(MOE_INTER + first, MOE_INTER + first + SHARED_INTER)
+            shards.append(torch.cat((w_i8[gate], w_i8[up])))
+            scale_shards.append(torch.cat((s[gate], s[up])))
+        weights, scales = torch.stack(shards), torch.stack(scale_shards)
+        return weights, scales
+
+    def gen_down_shared(dequant_std, chan_cv):
+        w = torch.randn(D, MOE_INTER) * torch.exp(chan_cv * torch.randn(D, 1))
+        w_i8, s = quantize_rows(w, dequant_std)
+        weights = torch.stack([w_i8[:, r * SHARED_INTER:(r + 1) * SHARED_INTER] for r in range(N_RANKS)])
+        scales = s.unsqueeze(0).expand(N_RANKS, D).contiguous()
+        return weights, scales
+
+    gen = torch.Generator().manual_seed(7)
+
+    emb = torch.randn(1, T, D, generator=gen).bfloat16().expand(N_RANKS, T, D)
+    hc_fn = torch.randn(MIX_HC, HC_DIM, generator=gen).to(torch.bfloat16)
+    hc_scale = torch.rand(3, generator=gen)
+    hc_base = torch.randn(MIX_HC, generator=gen)
+    with torch.no_grad():
+        x_hc = hc_seed(emb)
+        pre_mix = hc_mixes(x_hc, hc_fn, hc_scale, hc_base)[0]
+        x_mixed = hc_pre(x_hc, pre_mix)
+    # The router is replicated as well: only the routed experts are EP-sharded.
+    gate_row = torch.randn(N_EXPERTS, D, generator=gen) / (D**0.5)
+    gate_weight = gate_row.unsqueeze(0).expand(N_RANKS, *gate_row.shape).contiguous()
+
+    ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2}
+    SHARED_DEQUANT_STD = {"w1": 1.71e-2, "w2": 1.68e-2}
+    (w_gu_i8, w_gu_s) = gen_routed_weight((N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
+    w2_i8, w2_s = gen_routed_weight((N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
+    shared_gu_i8, shared_gu_s = gen_fused_shared(SHARED_DEQUANT_STD["w1"], 0.50)
+    shared_w2_i8, shared_w2_s = gen_down_shared(SHARED_DEQUANT_STD["w2"], 0.33)
+
+    return [
+        TensorSpec("x_mixed", [N_RANKS, T, D], torch.bfloat16, init_value=lambda: x_mixed),
+        TensorSpec("norm_weight", [N_RANKS, D], torch.bfloat16, init_value=lambda : torch.ones(N_RANKS, D, dtype=torch.bfloat16)),
+        TensorSpec("gate_weight", [N_RANKS, N_EXPERTS, D], torch.bfloat16, init_value=lambda: gate_weight),
+        # One global top-8 expert set, replicated across the EP ranks.
+        TensorSpec("correction_bias", [N_RANKS, N_EXPERTS], torch.float32, init_value=lambda : make_correction_bias(N_RANKS, N_EXPERTS, TOPK)),
+        TensorSpec("w_gate_up", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER, D], torch.int8, init_value=lambda : w_gu_i8),
+        TensorSpec("w_gate_up_scale", [N_RANKS, N_LOCAL_EXPERTS, 2 * MOE_INTER], torch.float32, init_value=lambda : w_gu_s),
+        TensorSpec("w_down", [N_RANKS, N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
+        TensorSpec("w_down_scale", [N_RANKS, N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
+        TensorSpec("shared_w_gate_up", [N_RANKS, 2 * SHARED_INTER, D], torch.int8, init_value=lambda : pack_int8_nz(shared_gu_i8)),
+        TensorSpec("shared_w_gate_up_scale", [N_RANKS, 2 * SHARED_INTER], torch.float32, init_value=lambda : shared_gu_s),
+        TensorSpec("shared_w_down", [N_RANKS, D, SHARED_INTER], torch.int8, init_value=lambda : pack_int8_nz(shared_w2_i8)),
+        TensorSpec("shared_w_down_scale", [N_RANKS, D], torch.float32, init_value=lambda: shared_w2_s),
+        TensorSpec("y", [N_RANKS, T, D], torch.float32),
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
+        ScalarSpec("num_ranks", torch.int32, num_ranks),
+    ]
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from pypto.ir import DistributedConfig
+
+    from golden import ratio_reldiff, run
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("--ep", type=int, default=2, help="expert-parallel size / rank count")
+    parser.add_argument(
+        "-d", "--device", type=str, default=",".join((str(i) for i in range(N_RANKS))),
+        help=f"comma-separated device ids (need {N_RANKS})",
+    )
+    parser.add_argument("--num-tokens", type=int, default=None, help="active rows; defaults to hidden rows or capacity")
+    parser.add_argument("--checkpoint", type=Path, help="W8A8 checkpoint directory; default: generated weights")
+    parser.add_argument("--layer", type=int, default=3, help="checkpoint MoE layer index (default: 3)")
+    parser.add_argument("--hidden", type=Path, help="saved BF16 [EP, active tokens, D] x_mixed; requires --checkpoint")
+    parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    args = parser.parse_args()
+
+    if args.hidden is not None and args.checkpoint is None:
+        parser.error("--hidden requires --checkpoint")
+    hidden = torch.load(args.hidden, map_location="cpu", weights_only=True) if args.hidden is not None else None
+    if hidden is not None and (not isinstance(hidden, torch.Tensor) or hidden.ndim != 3):
+        parser.error("--hidden must contain a BF16 tensor shaped [EP, active tokens, D]")
+    num_tokens = args.num_tokens if args.num_tokens is not None else hidden.shape[1] if hidden is not None else T
+
+    device_ids = [int(d) for d in args.device.split(",")]
+    assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
+    num_ranks = len(device_ids)
+
+    result = run(
+        fn=l3_decode_layer,
+        specs=build_tensor_specs(num_tokens, num_ranks=num_ranks, checkpoint=args.checkpoint, layer_id=args.layer, hidden=hidden),
+        golden_fn=golden_decode_layer,
+        config=dict(
+            dump_passes=args.dump_passes,
+            backend_type=args.backend_type, execution_mode=args.execution_mode,
+            distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
+            enable_chip_swimlane=args.enable_chip_swimlane,
+        ),
+        rtol=0.001,
+        atol=0.001,
+        compare_fn={"y": ratio_reldiff(diff_thd=0.01, pct_thd=0.05)},
+        compile_only=args.compile_only,
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
