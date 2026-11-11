@@ -8,7 +8,7 @@ qualification covers request state, completion, and retirement in Serving.
 | Platform and model | Historical validation | Current branch coverage |
 | --- | --- | --- |
 | A3 Qwen3-14B BF16 | The integrated 40-layer single-card stack passed five Serving cases in each of HBG eager and explicit Graph. A split prefill candidate also passed TMR, HBG eager, and Graph golden checks. | Lib [#1758](https://github.com/hw-native-sys/pypto-lib/pull/1758) and [#1762](https://github.com/hw-native-sys/pypto-lib/pull/1762) supply eager prefill and its KV golden correction. Explicit prefill MLP recording passed standalone golden on this branch. Per-layer decode recording passed an eight-token Serving golden in HBG eager and Graph. Request-local token feedback passed its standalone state golden and single- and multi-request checks in both HBG modes with the matching Serving review snapshot. |
-| A3 DeepSeek V4 Flash MTP K1 | The 43-layer eight-card integrated stack completed a 64-input, 128-output HTTP case with both HBG configurations. Default HBG records selected prefill regions. The explicit Graph configuration also records decode attention. | Port bounded prefill and fused K1 decode into the shared model implementation and validate the Serving ABI and replay boundaries. MTP prefill and the LM head used ordinary HBG in the historical run. |
+| A3 DeepSeek V4 Flash MTP K1 | The 43-layer eight-card integrated stack completed a 64-input, 128-output HTTP case with both HBG configurations. Default HBG records selected prefill regions. The explicit Graph configuration also records decode attention. | Bounded prefill, fused K1 decode, and explicit Graph entry code are on this branch. The updated source passed the 43-layer eager HTTP check. Explicit Graph has compiled and is under native retest. MTP prefill and the LM head used ordinary HBG in the historical run. |
 | A5 DeepSeek V4.1 Flash | Synchronous HBG with TWAIT and AICPU compatibility scheduling passed 40-layer EP4/DP4/TP1 HTTP lifecycle checks at 8,192 input tokens. Two teacher-forced repetitions matched TMR byte-for-byte across 222 corresponding comparison steps for logits and effective KV and compressor state. | Port against current Lib main. Recheck indexer dependencies, routed MoE workspace ownership, and communication waits against the current implementation. Explicit Graph, resident-only scheduling, and whole-model Async await qualification. |
 
 Coverage is limited to the models and configurations listed here.
@@ -70,6 +70,19 @@ override because PyPTO still pins `355ce301`.
 | Qwen3-14B prefill and decode | Eager and Graph compiled with both the pinned runtime and Simpler main. With Simpler main, each mode passed an eight-token Serving precision test on one A3 card with Lib `f4711ad` and the matching Serving review snapshot. |
 | DeepSeek V4 Flash MTP prefill | The candidate compiled main prefill and MTP prefill. These candidate kernels are still being migrated into the shared Lib model. |
 | DeepSeek V4 Flash MTP fused decode | The candidate stopped in the PyPTO parser on `pl.submit(_moe_expert_chunk_recorded, ...)` with both Simpler versions. PyPTO [#3321](https://github.com/hw-native-sys/pypto/pull/3321) covers submitted JIT callables. With only #3321 head `c295a9e1` merged into that PyPTO main, the fused decode compiled in eager and explicit Graph. This establishes the parser dependency for the candidate. The full request is tracked separately. |
+
+## A3 DeepSeek native integration
+
+The updated Lib DeepSeek model subtree
+`8646694d8364698fa517539f6632fef709c0b49b` passed the native eight-card,
+43-layer fused K1 HBG eager HTTP test with 64 prompt tokens, 128 generated
+tokens, and normal shutdown. This run used PTOAS v0.70, PyPTO
+`7f7ce3b01019b87c70c5ffbbea4f354c442d7321`, and Simpler
+`90fcb00898b58f86bb491dcca8e51b4d4812dc36`. The Serving review tree
+`521089e0aaeecc40324fbff9de401804c7ca8f29` is based on `979bfa25`
+with the matching runtime selection and bounded-entry routing. The
+review tree also uses the shared Lib request-planning contract. The
+PyPTO main plus #3321 combination has separate offline evidence.
 
 ## Reproducing the component checks
 
