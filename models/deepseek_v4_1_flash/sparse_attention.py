@@ -1138,6 +1138,204 @@ def gather_packed(
     return selected, indices, gathered
 
 
+REG_LANES = 64
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_packed_pypto(
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    wi: pl.Tensor[[T_DYN, 128], pl.INT32],
+    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    selected: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS, HEAD_DIM], pl.BF16],
+    indices: pl.Tensor[[SELECTED_ROWS, SELECTED_KEYS], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    ready: pl.Scalar[pl.TASK_ID],
+    max_workers: pl.constexpr,
+    name_hint: pl.constexpr,
+):
+    """PyPTO equivalent of :func:`gather_packed`, kept for precision only.
+
+    Numerically bit-exact with the extern kernel, but roughly 2x slower on
+    device because the generated synchronization serializes MTE2, VECTOR and
+    MTE3 instead of overlapping them. The model therefore still calls
+    :func:`gather_packed`; this entry exists so the PyPTO formulation stays
+    validated while that is tuned. Remove ``_gather_packed_rows`` and
+    ``kernels/gather_packed.cpp`` only once this reaches parity.
+
+    Each block owns ``GATHER_KEY_TILE`` keys of one token: the window cache
+    supplies the first ``WINDOW_KEYS`` columns and the compressed cache the
+    rest. Only the selected rows are decoded, so the cost follows the selection
+    rather than the pool size.
+    """
+    window_rows = pl.tensor.dim(window, 0) * 128
+    w = pl.reshape(window, [window_rows, WINDOW_CACHE_BYTES])
+    compressed_rows = pl.tensor.dim(compressed, 0) * 128
+    c = pl.reshape(compressed, [compressed_rows, COMPRESSED_CACHE_BYTES])
+    selected_rows = pl.tensor.dim(selected, 0) * SELECTED_KEYS
+    dst = pl.reshape(selected, [selected_rows, HEAD_DIM])
+    parts = SELECTED_KEYS // GATHER_KEY_TILE
+    workers = pl.max(1, pl.min(num_tokens * parts, max_workers))
+    with pl.spmd(workers, name_hint=name_hint, deps=[ready]) as gathered:
+        worker = pl.tile.get_block_idx()
+        # for (int block = worker; block < tokens * 20; block += workers)
+        # TASSIGN(zero, ...); TEXPANDS(zero, 0.0f) — produced once outside the
+        # loop so the V -> MTE3 event below also covers it. Creating it after
+        # that event let MTE3 read it before V had filled it.
+        zero = pl.tile.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        for block in pl.range(worker, num_tokens * parts, workers):
+            token = block // parts
+            column = block % parts * GATHER_KEY_TILE
+            row_base = token * SELECTED_KEYS + column
+            ids = pl.tile.create([1, GATHER_KEY_TILE], dtype=pl.INT32)
+            if column < WINDOW_KEYS:
+                ids = pl.tile.load(wi, [token, column], [1, GATHER_KEY_TILE])
+                # set_flag(PIPE_MTE2, PIPE_S); wait_flag(PIPE_MTE2, PIPE_S)
+                # The row addresses come from scalar reads of ids, so the load
+                # must have landed before GetValue runs.
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.S, 0)
+                pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.S, 0)
+                w_payload = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM], dtype=pl.UINT8,
+                                           target_memory=pl.MemorySpace.Vec)
+                w_factors = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM // 16], dtype=pl.UINT8,
+                                           target_memory=pl.MemorySpace.Vec)
+                for lane in pl.range(GATHER_KEY_TILE):
+                    # A masked key reads row 0; its output row is zeroed below.
+                    w_row = pl.cast(pl.max(pl.tile.read(ids, [0, lane]), 0), pl.INDEX)
+                    w_payload = pl.tile.gather_row(w_payload, w, [lane, 0], [w_row, 0], [1, HEAD_DIM])
+                    w_factors = pl.tile.gather_row(
+                        w_factors, w, [lane, 0], [w_row, HEAD_DIM], [1, HEAD_DIM // 16])
+                # load_rows tail: set_flag(PIPE_MTE2, PIPE_V); wait_flag(...)
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+                pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+                # decode_window, statement for statement. The extern's three TCVTs
+                # are Tile-level there and stay Tile-level here; only its
+                # __VEC_SCOPE__ becomes a reg_scope.
+                # TCVT(factors, scales, CAST_RINT)
+                w_factors_f32 = pl.cast(pl.reinterpret_view(w_factors, pl.BF16), pl.FP32)
+                # TCVT(values, payload, CAST_RINT)
+                w_values = pl.cast(
+                    pl.reinterpret_view(pl.reinterpret_view(w_payload, pl.INT8), pl.FP8E4M3FN), pl.FP32)
+                # multiply_groups<5>(values, values, factors) — in place, as in the
+                # extern, which passes values.data() as both input and output.
+                w_vflat = pl.reshape(w_values, [GATHER_KEY_TILE * HEAD_DIM])
+                w_fflat = pl.reshape(w_factors_f32, [GATHER_KEY_TILE * (HEAD_DIM // 32)])
+                with pl.reg_scope():
+                    # MaskReg full = pset_b32(PAT_ALL)
+                    w_full = pl.reg.full_mask(lanes=REG_LANES)
+                    # vci(index, 0, INC_ORDER)
+                    w_index = pl.reg.index_gen(0, lanes=REG_LANES, dtype=pl.UINT32)
+                    # vshrs(index, index, GroupShift, full, MODE_ZEROING)
+                    w_index = pl.reg.shift_rights(w_index, 5, w_full)
+                    for w_chunk in pl.hardware_loop(GATHER_KEY_TILE * HEAD_DIM // REG_LANES):
+                        # vlds(value, input, chunk * 64, NORM)
+                        w_value = pl.reg.load(w_vflat, w_chunk * REG_LANES, lanes=REG_LANES)
+                        # vgather2(factor, factors + chunk * (64 >> GroupShift), index, full)
+                        # The extern advances the base pointer, which is free
+                        # address arithmetic. reg.gather takes one index vector
+                        # and a sliced view is rejected inside a reg_scope, so the
+                        # offset folds into the index with a single vector-scalar
+                        # add rather than a broadcast plus a vector add.
+                        w_factor = pl.reg.gather(
+                            w_fflat,
+                            pl.reg.adds(w_index, pl.cast(w_chunk * (REG_LANES >> 5), pl.UINT32),
+                                        w_full),
+                            w_full)
+                        # vmul(result, value, factor, full, MODE_ZEROING)
+                        w_result = pl.reg.mul(w_value, w_factor, w_full)
+                        # vsts(result, output, chunk * 64, NORM_B32, full) — the alias
+                        # is discarded because rebinding the tile would make it a
+                        # loop-carried value, which VF hardware loops reject.
+                        w_alias = pl.reg.store(w_vflat, w_chunk * REG_LANES, w_result, w_full)
+                # TCVT(output, values, CAST_RINT)
+                w_out = pl.cast(pl.reshape(w_vflat, [GATHER_KEY_TILE, HEAD_DIM]),
+                                 pl.BF16, mode="rint")
+                # set_flag(PIPE_V, PIPE_MTE3); wait_flag(PIPE_V, PIPE_MTE3)
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
+                pl.tile.store(w_out, [row_base, 0], dst)
+            else:
+                ids = pl.tile.load(ci, [token, column - WINDOW_KEYS], [1, GATHER_KEY_TILE])
+                # set_flag(PIPE_MTE2, PIPE_S); wait_flag(PIPE_MTE2, PIPE_S)
+                # The row addresses come from scalar reads of ids, so the load
+                # must have landed before GetValue runs.
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.S, 0)
+                pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.S, 0)
+                c_payload = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM // 2], dtype=pl.UINT8,
+                                           target_memory=pl.MemorySpace.Vec)
+                c_factors = pl.tile.create([GATHER_KEY_TILE, HEAD_DIM // 8], dtype=pl.UINT8,
+                                           target_memory=pl.MemorySpace.Vec)
+                for lane in pl.range(GATHER_KEY_TILE):
+                    c_row = pl.cast(pl.max(pl.tile.read(ids, [0, lane]), 0), pl.INDEX)
+                    c_payload = pl.tile.gather_row(
+                        c_payload, c, [lane, 0], [c_row, 0], [1, HEAD_DIM // 2])
+                    c_factors = pl.tile.gather_row(
+                        c_factors, c, [lane, 0], [c_row, HEAD_DIM // 2], [1, HEAD_DIM // 8])
+                # load_rows tail: set_flag(PIPE_MTE2, PIPE_V); wait_flag(...)
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+                pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+                # decode_compressed, statement for statement.
+                # TCVT(factors, scales, CAST_RINT)
+                c_factors_f32 = pl.cast(pl.reinterpret_view(c_factors, pl.BF16), pl.FP32)
+                # TCVT(output, payload, CAST_RINT) — FP4 reaches FP32 through BF16
+                # in the extern, so both casts are kept in that order.
+                c_bf16 = pl.cast(pl.reinterpret_view(c_payload, pl.FP4E2M1X2), pl.BF16)
+                # TCVT(values, output, CAST_RINT)
+                c_values = pl.cast(c_bf16, pl.FP32)
+                # multiply_groups<4>(values, values, factors) — in place.
+                c_vflat = pl.reshape(c_values, [GATHER_KEY_TILE * HEAD_DIM])
+                c_fflat = pl.reshape(c_factors_f32, [GATHER_KEY_TILE * (HEAD_DIM // 16)])
+                with pl.reg_scope():
+                    # MaskReg full = pset_b32(PAT_ALL)
+                    c_full = pl.reg.full_mask(lanes=REG_LANES)
+                    # vci(index, 0, INC_ORDER)
+                    c_index = pl.reg.index_gen(0, lanes=REG_LANES, dtype=pl.UINT32)
+                    # vshrs(index, index, GroupShift, full, MODE_ZEROING)
+                    c_index = pl.reg.shift_rights(c_index, 4, c_full)
+                    for c_chunk in pl.hardware_loop(GATHER_KEY_TILE * HEAD_DIM // REG_LANES):
+                        # vlds(value, input, chunk * 64, NORM)
+                        c_value = pl.reg.load(c_vflat, c_chunk * REG_LANES, lanes=REG_LANES)
+                        # vgather2(factor, factors + chunk * (64 >> GroupShift), index, full)
+                        # The extern advances the base pointer, which is free
+                        # address arithmetic. reg.gather takes one index vector
+                        # and a sliced view is rejected inside a reg_scope, so the
+                        # offset folds into the index with a single vector-scalar
+                        # add rather than a broadcast plus a vector add.
+                        c_factor = pl.reg.gather(
+                            c_fflat,
+                            pl.reg.adds(c_index, pl.cast(c_chunk * (REG_LANES >> 4), pl.UINT32),
+                                        c_full),
+                            c_full)
+                        # vmul(result, value, factor, full, MODE_ZEROING)
+                        c_result = pl.reg.mul(c_value, c_factor, c_full)
+                        # vsts(result, output, chunk * 64, NORM_B32, full)
+                        c_alias = pl.reg.store(c_vflat, c_chunk * REG_LANES, c_result, c_full)
+                # TCVT(output, values, CAST_RINT)
+                c_out = pl.cast(pl.reshape(c_vflat, [GATHER_KEY_TILE, HEAD_DIM]),
+                                 pl.BF16, mode="rint")
+                # set_flag(PIPE_V, PIPE_MTE3); wait_flag(PIPE_V, PIPE_MTE3)
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
+                pl.tile.store(c_out, [row_base, 0], dst)
+            # Masked keys gathered row 0 above; overwrite those rows with zeros.
+            # Independent stores keep this off the decoded tile's dependency chain.
+            for lane in pl.range(GATHER_KEY_TILE):
+                if pl.tile.read(ids, [0, lane]) < 0:
+                    # The extern has pipe_barrier(PIPE_MTE3) here to order the
+                    # overlapping full-tile and masked-row stores. PyPTO has no
+                    # equivalent: system.barrier takes only V, M or ALL, and
+                    # set_flag needs two different pipes, so neither MTE3 -> S
+                    # nor a round trip through S reproduces it. The ordering is
+                    # left to the compiler.
+                    pl.tile.store(zero, [row_base + lane, 0], dst)
+            pl.tile.store(ids, [token, column], indices)
+            # Complete all UB readers before the next tile reuses the buffers.
+            pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.MTE2, 0)
+            pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.MTE2, 0)
+        pl.system.barrier(pipe=pl.PipeType.ALL)
+    return selected, indices, gathered
+
+
 def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY_TILE, max_workers=32):
     """Build chunked sink attention with an optional Vector query startup."""
     sync_start = not vector_query
@@ -1778,6 +1976,29 @@ def l2_gather_packed(
     selected_ret, indices_ret, gathered = gather_packed(
         window, compressed, window_part, compressed_part,
         selected, indices, num_tokens, ready, max_workers=GATHER_WORKERS, name_hint="gather_packed",
+    )
+    return selected, indices
+
+
+@pl.jit(auto_scope=False)
+def l2_gather_packed_pypto(
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    wi: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
+    ci: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    selected: pl.InOut[pl.Tensor[[T_DYN, SELECTED_KEYS, HEAD_DIM], pl.BF16]],
+    indices: pl.InOut[pl.Tensor[[T_DYN, SELECTED_KEYS], pl.INT32]],
+    num_tokens: pl.Scalar[pl.INT32],
+    start: pl.Scalar[pl.INT32],
+):
+    """Validation entry for the PyPTO gather; the model uses l2_gather_packed."""
+    window_part = pl.slice(wi, [num_tokens, WINDOW_KEYS], [start, 0])
+    compressed_part = pl.slice(ci, [num_tokens, INDEX_TOPK], [start, 0])
+    ready = pl.system.task_dummy(deps=[])
+    selected_ret, indices_ret, gathered = gather_packed_pypto(
+        window, compressed, window_part, compressed_part,
+        selected, indices, num_tokens, ready, max_workers=GATHER_WORKERS,
+        name_hint="gather_packed_pypto",
     )
     return selected, indices
 
