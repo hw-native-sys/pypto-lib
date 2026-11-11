@@ -9,7 +9,7 @@ qualification covers request state, completion, and retirement in Serving.
 | --- | --- | --- |
 | A3 Qwen3-14B BF16 | The integrated 40-layer single-card stack passed five Serving cases in each of HBG eager and explicit Graph. A split prefill candidate also passed TMR, HBG eager, and Graph golden checks. | Lib [#1758](https://github.com/hw-native-sys/pypto-lib/pull/1758) and [#1762](https://github.com/hw-native-sys/pypto-lib/pull/1762) supply eager prefill and its KV golden correction. Explicit prefill MLP recording passed standalone golden on this branch. Per-layer decode recording passed an eight-token Serving golden in HBG eager and Graph. Request-local token feedback passed its standalone state golden and single- and multi-request checks in both HBG modes with the matching Serving review snapshot. |
 | A3 DeepSeek V4 Flash MTP K1 | The 43-layer eight-card integrated stack completed a 64-input, 128-output HTTP case with both HBG configurations. Default HBG records selected prefill regions. The explicit Graph configuration also records decode attention. | Bounded prefill, fused K1 decode, and explicit Graph entry code are on this branch. The updated source passed the 43-layer HTTP check in eager and explicit Graph. MTP prefill and the LM head used ordinary HBG in the historical run. |
-| A5 DeepSeek V4.1 Flash | Synchronous HBG with TWAIT and AICPU compatibility scheduling passed 40-layer EP4/DP4/TP1 HTTP lifecycle checks at 8,192 input tokens. Two teacher-forced repetitions matched TMR byte-for-byte across 222 corresponding comparison steps for logits and effective KV and compressor state. | Port against current Lib main. Recheck indexer dependencies, routed MoE workspace ownership, and communication waits against the current implementation. Explicit Graph, resident-only scheduling, and whole-model Async await qualification. |
+| A5 DeepSeek V4.1 Flash | Synchronous HBG with TWAIT and AICPU compatibility scheduling passed 40-layer EP4/DP4/TP1 HTTP lifecycle checks at 8,192 input tokens. Two teacher-forced repetitions matched TMR byte-for-byte across 222 corresponding comparison steps for logits and effective KV and compressor state. | Standalone C1A and C2A prefill and decode goldens, routed MoE, final LM head, and a two-card Lib decode execution check passed with the toolchain below. |
 
 Coverage is limited to the models and configurations listed here.
 
@@ -67,6 +67,14 @@ The standalone reindex golden passed in TMR and HBG at start positions
 1024/2048 and 20000/4096, with query lengths 1/2 in both cases.
 The forward check covers execution, inactive logit and token rows, and
 sampled-ID padding. The standalone goldens cover numerical accuracy.
+
+Lib `5fbd7d4` passed the A5 prefill C1A full, C2A full, and
+C1A reindex goldens in TMR and HBG using PyPTO `fc50efe7`, Simpler
+`0569c779`, and PTOAS v0.72. These were two-card TP1/DP2 standalone
+checks with the `long` fixtures. C1A used sharded wiring. The indexer
+keeps paired, paged, and pooled scoring, and checks the selected route
+inside the device kernels. The Lib `prefill_fwd.py` entry also compiled
+in both runtimes at TP1/EP2/DP2 with synthetic weights.
 
 ## PyPTO and Simpler dependencies
 
