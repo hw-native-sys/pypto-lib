@@ -42,6 +42,15 @@ the same toolchain. One rank had zero active rows and the other had
 six. The golden checked `next_pre_mix`, `x_mixed`, and `x_next`.
 This covers a mixed empty and active rank case in distributed decode.
 
+Lib `6a39eda` passed single-card decode attention goldens in TMR and
+HBG with the same toolchain. The tested entries were `decode_swa.py`
+with `--case mixed`, `decode_c2a_reuse.py` with `--case long`, and
+`decode_c1a_full.py` with the following ragged workload:
+
+```text
+--case ragged --start-pos 8192,8192,8192,8192 --query-lens 1,1,1,1
+```
+
 Lib `6a39eda` compiled the standalone `decode_fwd.py` entry in TMR and
 HBG with the same toolchain at TP1/EP2/DP2 and one synthetic weight
 bank. The check used `--compile-only`. The component goldens above
