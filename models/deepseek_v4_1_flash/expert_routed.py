@@ -397,9 +397,9 @@ def routed_swiglu_quant_pypto(
       five-step rotate-and-max butterfly over ``gather_lanes``, which also
       leaves the result broadcast across the group, so the reciprocal needs no
       separate broadcast.
-    - No FP8 support at all. The payload therefore leaves the scope as FP32 and
-      one Tile-level cast narrows it to FP8E4M3; that is the single remaining
-      full-width UB pass.
+    - FP8E4M3FN is not a general register dtype, but pypto#3334 added the
+      FP32 conversion and the reinterpretation of its result as bytes, which is
+      all the payload path needs.
 
     One scope covers the whole row tile. A scope lowers to a VF helper call, so
     opening one per row would multiply that call overhead by SWIGLU_ROW_TILE.
@@ -460,15 +460,6 @@ def routed_swiglu_quant_pypto(
             with pl.reg_scope():
                 active = pl.reg.full_mask(lanes=SWIGLU_LANES)
                 bias = pl.reg.broadcast(254, lanes=SWIGLU_LANES, dtype=pl.INT32)
-                # FP8E4M3FN encoding constants: pl.reg has no FP8 dtype, so the
-                # byte is built with integer operations (see below).
-                magnitude_mask = pl.reg.broadcast(0x7FFFFFFF, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                round_bias = pl.reg.broadcast(0x7FFFF, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                one_bits = pl.reg.broadcast(1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                seven_bits = pl.reg.broadcast(7, lanes=SWIGLU_LANES, dtype=pl.UINT32)
-                exp_floor = pl.reg.broadcast(-6, lanes=SWIGLU_LANES, dtype=pl.INT32)
-                e4m3_bias = pl.reg.broadcast(7, lanes=SWIGLU_LANES, dtype=pl.INT32)
-                fp32_bias = pl.reg.broadcast(127, lanes=SWIGLU_LANES, dtype=pl.INT32)
                 lane_id = pl.reg.index_gen(0, lanes=SWIGLU_LANES, dtype=pl.UINT32)
                 lane_span = pl.reg.broadcast(SWIGLU_LANES - 1, lanes=SWIGLU_LANES, dtype=pl.UINT32)
                 # Lane i reads lane MX_GROUP*i, so lanes 0 and 1 compact this
@@ -533,49 +524,14 @@ def routed_swiglu_quant_pypto(
                         normalized = pl.reg.mul(values, recip, active)
                         lifted = pl.reg.maximums(normalized, -SWIGLU_FP8_MAX, active)
                         bounded = pl.reg.minimums(lifted, SWIGLU_FP8_MAX, active)
-                        # FP32 -> FP8E4M3FN by hand: pl.reg has no FP8 register
-                        # dtype, so the byte is assembled with integer ops. The
-                        # input is already clamped to +-448, so there is no
-                        # overflow path. Verified bit-exact against torch over
-                        # 700k values including subnormals and both zeros.
-                        payload_bits = pl.reg.interpret_cast(bounded, dtype=pl.UINT32)
-                        payload_sign = pl.reg.shift_rights(payload_bits, 31, active)
-                        sign_bit = pl.reg.shift_lefts(payload_sign, 7, active)
-                        payload_mag = pl.reg.bitwise_and(payload_bits, magnitude_mask, active)
-                        # Normal path: round mantissa 23 -> 3 bits, ties to even,
-                        # by adding half an ulp plus the retained lsb and then
-                        # truncating. A carry out of the mantissa lands in the
-                        # exponent, which is read back from the rounded bits.
-                        retained = pl.reg.bitwise_and(
-                            pl.reg.shift_rights(payload_mag, 20, active), one_bits, active)
-                        rounded = pl.reg.add(
-                            pl.reg.add(payload_mag, round_bias, active), retained, active)
-                        exponent32 = pl.reg.sub(
-                            pl.reg.interpret_cast(pl.reg.shift_rights(rounded, 23, active),
-                                                  dtype=pl.INT32), fp32_bias, active)
-                        mantissa3 = pl.reg.bitwise_and(
-                            pl.reg.shift_rights(rounded, 20, active), seven_bits, active)
-                        normal_code = pl.reg.bitwise_or(
-                            pl.reg.shift_lefts(
-                                pl.reg.interpret_cast(pl.reg.add(exponent32, e4m3_bias, active),
-                                                      dtype=pl.UINT32), 3, active),
-                            mantissa3, active)
-                        # Subnormal path: below 2**-6 the representable values are
-                        # m * 2**-9, so the code is just RNE(|x| * 2**9).
-                        magnitude = pl.reg.interpret_cast(payload_mag, dtype=pl.FP32)
-                        scaled_up = pl.reg.muls(magnitude, 512.0, active)
-                        subnormal_code = pl.reg.interpret_cast(
-                            pl.reg.convert(scaled_up, dtype=pl.INT32, rounding="R", saturate=True),
-                            dtype=pl.UINT32)
-                        is_normal = pl.reg.compare(exponent32, exp_floor, active, predicate="ge")
-                        code_bits = pl.reg.select(is_normal, normal_code, subnormal_code)
-                        payload_byte = pl.reg.bitwise_or(sign_bit, code_bits, active)
-                        # INT8 carrier: tile.reinterpret_view pairs FP8E4M3FN
-                        # with INT8, and the narrowing convert wraps the byte
-                        # pattern through rather than saturating it.
-                        payload_code = pl.reg.convert(
-                            pl.reg.interpret_cast(payload_byte, dtype=pl.INT32),
-                            dtype=pl.INT8, saturate=False)
+                        # FP32 -> FP8E4M3FN in one instruction. pypto#3334
+                        # added the pair, with the rounding and saturation the
+                        # extern asks for through ROUND_R and RS_ENABLE. The
+                        # result is viewed as INT8 because that is the carrier
+                        # tile.reinterpret_view pairs with FP8E4M3FN.
+                        encoded = pl.reg.convert(bounded, dtype=pl.FP8E4M3FN,
+                                                 rounding="R", saturate=True)
+                        payload_code = pl.reg.interpret_cast(encoded, dtype=pl.INT8)
                         # Fresh names: reassigning the destination would make
                         # these loop-carried, which VF lowering rejects. Both
                         # alias the Vec storage the stores below read.
