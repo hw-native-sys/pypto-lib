@@ -56,6 +56,18 @@ Programs. Qwen Program prefill
 preemption recovery
 [#312](https://github.com/hw-native-sys/pypto-serving/pull/312) remain open.
 
+## Mainline integration evidence
+
+The following checks used PyPTO `fc50efe7` and Simpler `0569c779` with
+PTOAS v0.72. The Simpler main experiment selected an explicit runtime
+override because PyPTO still pins `355ce301`.
+
+| A3 model and entry | Result |
+| --- | --- |
+| Qwen3-14B prefill and decode | Eager and Graph compiled with both the pinned runtime and Simpler main. With Simpler main, each mode passed an eight-token Serving precision test on one A3 card with Lib `f4711ad` and the matching Serving review snapshot. |
+| DeepSeek V4 Flash MTP prefill | The candidate compiled main prefill and MTP prefill. These candidate kernels are still being migrated into the shared Lib model. |
+| DeepSeek V4 Flash MTP fused decode | The candidate stopped in the PyPTO parser on `pl.submit(_moe_expert_chunk_recorded, ...)` with both Simpler versions. PyPTO [#3321](https://github.com/hw-native-sys/pypto/pull/3321) covers submitted JIT callables. A single-PR comparison is in progress. |
+
 ## Tested version combinations
 
 | Validation | PyPTO | Simpler | Lib | Serving |
