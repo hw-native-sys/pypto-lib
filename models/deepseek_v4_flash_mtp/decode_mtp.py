@@ -9,6 +9,12 @@
 # ci: devices=2
 """DeepSeek-V4 MTP decode layer: projection, SWA attention, MoE, HC head, RMSNorm, and LM head."""
 
+
+if __name__ == "__main__":
+    from graph_cli import dispatch_graph_cli
+
+    dispatch_graph_cli(__file__)
+
 import argparse
 
 import pypto.language as pl
@@ -847,6 +853,9 @@ def main():
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--runtime", choices=("tmr", "hbg"), default=None)
+    parser.add_argument("--graph", action="store_true", help="Requires --runtime hbg.")
+    parser.add_argument("--hbg-graph", action="store_true", help="Select explicit HBG Graph execution.")
     args = parser.parse_args()
     assert N_RANKS == args.ep, f"import-time N_RANKS must match --ep, got {N_RANKS} vs {args.ep}"
     assert LM_HEAD_TP_SIZE == args.tp, (

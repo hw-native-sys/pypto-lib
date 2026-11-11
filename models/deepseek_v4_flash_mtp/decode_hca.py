@@ -14,6 +14,12 @@ Companion files: attention_swa.py (ratio=0)
                  attention_csa_draft.py (ratio=4)."""
 
 
+if __name__ == "__main__":
+    from graph_cli import dispatch_graph_cli
+
+    dispatch_graph_cli(__file__)
+
+
 import pypto.language as pl
 
 from config import (
@@ -566,6 +572,9 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--runtime", choices=("tmr", "hbg"), default=None)
+    parser.add_argument("--graph", action="store_true", help="Requires --runtime hbg.")
+    parser.add_argument("--hbg-graph", action="store_true", help="Select explicit HBG Graph execution.")
     args = parser.parse_args()
 
     result = run(

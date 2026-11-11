@@ -2552,8 +2552,8 @@ def prefill_attention_csa(
     # Terminal rank-complete task: deps=[resource_done_tid] (the four-path
     # fan-in) AND an AUTO dep on the four x_out tile producers established by
     # the slice-copy reads of x_out_flat below. Writes one tile slice per
-    # distinct token row --禁止反复覆盖同一个 [0:1, 0:1, 0:8]，否则前面三次写可能
-    # 被 dead-store elimination 消除 (user design requirement). Each row is
+    # distinct token row -- never overwrite the same [0:1, 0:1, 0:8] region,
+    # or dead-store elimination may remove the first three writes (user design requirement). Each row is
     # 8 × FP32 = 32B, satisfying the pto.alloc_tile 32-byte column alignment.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_rank_complete", deps=[resource_done_tid]):
         for tile in pl.range(NUM_MOE_WAVES):
