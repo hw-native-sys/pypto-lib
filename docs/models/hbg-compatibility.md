@@ -38,6 +38,11 @@ and eight active rows under TMR and HBG using PyPTO `fc50efe7`, Simpler
 `0569c779`, and PTOAS v0.72. Row indices now stay on the device. The
 all-padding case uses the regular projection and sampling path.
 
+The standalone EP2 decode MoE golden passed under TMR and HBG with
+the same toolchain. One rank had zero active rows and the other had
+six. The golden checked `next_pre_mix`, `x_mixed`, and `x_next`.
+This covers a mixed empty and active rank case in distributed decode.
+
 Start with the current EP2 decode-layer golden under TMR and HBG. Validate
 any indexer fix, routed MoE workspace reuse, or communication wait change
 against its current callers. Qualify the forward port on the full EP4
