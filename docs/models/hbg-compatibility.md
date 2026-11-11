@@ -38,6 +38,13 @@ and eight active rows under TMR and HBG using PyPTO `fc50efe7`, Simpler
 `0569c779`, and PTOAS v0.72. Row indices now stay on the device. The
 all-padding case uses the regular projection and sampling path.
 
+The current EP4 candidate passed offline HBG code generation for both
+prefill and decode using PyPTO `fc50efe7`, Simpler `0569c779`, and PTOAS
+v0.72. The prefill candidate also reuses the host-read encoder token
+count at the C1A index publication call. That final prefill change awaits
+the 40-layer EP4 hardware check. A separate EP2 MoE golden covers mixed
+empty and non-empty ranks to check the communication path.
+
 Start with the current EP2 decode-layer golden under TMR and HBG. Validate
 any indexer fix, routed MoE workspace reuse, or communication wait change
 against its current callers. Qualify the forward port on the full EP4
@@ -103,8 +110,15 @@ DeepSeek executor uses that value for code generation, matching Serving
 #308's compile-context checks.
 Use the reviewed Serving patch for this tree. Its SHA-256 is
 `0172718dd53fd2ba3ea7e6248ad33d69786feec79d9486aff1f36c7372bce14a`.
-The eight-card validation with this Serving tree and the PyPTO main
-plus #3321 compiler is queued separately.
+With PyPTO main plus #3321, Simpler main `0569c779`, and PTOAS v0.72,
+the eight-card eager run loaded the model and stopped during the 260-token
+workspace prefill before the server became healthy. HBG rejected the
+reachable dummy-ready population at the 32,768-entry queue ceiling
+(`READY_QUEUE_OVERFLOW`, scheduler error 104).
+Simpler [#2932](https://github.com/hw-native-sys/simpler/pull/2932) sizes
+the queues from the configured task window. The A3 runtime build with
+its head `1a9082541` applied to `0569c779` succeeded. The corresponding
+eight-card HTTP rerun is pending.
 
 ### Start the A3 DeepSeek server
 
@@ -140,7 +154,9 @@ For A3 DeepSeek fused decode, build PyPTO from
 `c295a9e170bbb3613b19797304352dadf3791ad4`. The latter is the tested
 head of PyPTO #3321. Fetch it from `refs/pull/3321/head` in the PyPTO
 upstream repository and confirm the SHA before merging it locally.
-The offline probe selected Simpler `0569c779` explicitly and used PTOAS v0.72.
+The offline probe selected Simpler `0569c779` explicitly and used PTOAS
+v0.72. Main prefill, fused K1 decode, and MTP prefill each generated code
+in both HBG modes with that compiler and runtime pairing.
 Full-model serving also needs the matching bounded prefill and fused
 decode routing in Serving.
 
