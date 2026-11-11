@@ -461,6 +461,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             allow_early_resolve=True,
             deps=[prev_normed_q_deps[i] for i in range(2)],
         ) as q_proj_tid:
+            pl.set_cache_policy(wq, pl.CachePolicy.BYPASS)
             q_blk = pl.get_block_idx()
             q_nt = q_blk // QKV_OK
             q_ks = q_blk % QKV_OK
@@ -524,6 +525,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             allow_early_resolve=True,
             deps=[kv_seed_tid],
         ) as k_proj_tid:
+            pl.set_cache_policy(wk, pl.CachePolicy.BYPASS)
             k_blk = pl.get_block_idx()
             k_nt = k_blk // QKV_OK
             k_ks = k_blk % QKV_OK
@@ -548,6 +550,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             allow_early_resolve=True,
             deps=[kv_seed_tid],
         ) as v_proj_tid:
+            pl.set_cache_policy(wv, pl.CachePolicy.BYPASS)
             v_blk = pl.get_block_idx()
             v_nt = v_blk // QKV_OK
             v_ks = v_blk % QKV_OK
@@ -780,6 +783,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 name_hint="gate_proj",
                 deps=[cast_tids[k_split]],
             ) as gate_spmd_tid:
+                pl.set_cache_policy(w_gate, pl.CachePolicy.BYPASS)
                 spmd_gate_n_out = pl.get_block_idx()
                 spmd_gate_n0 = spmd_gate_n_out * MLP_TN
                 spmd_gate_c_acc = pl.create_tensor([BATCH_PAD, MLP_TN], dtype=pl.FP32)
@@ -807,6 +811,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 name_hint="up_proj",
                 deps=[cast_tids[k_split]],
             ) as up_spmd_tid:
+                pl.set_cache_policy(w_up, pl.CachePolicy.BYPASS)
                 spmd_up_n_out = pl.get_block_idx()
                 spmd_up_n0 = spmd_up_n_out * MLP_TN
                 spmd_up_c_acc = pl.create_tensor([BATCH_PAD, MLP_TN], dtype=pl.FP32)
@@ -840,6 +845,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     name_hint="gate_proj",
                     deps=[gate_late_tids[k_split]],
                 ) as gate_tid:
+                    pl.set_cache_policy(w_gate, pl.CachePolicy.BYPASS)
                     c_acc = pl.create_tensor([BATCH_PAD, MLP_TN], dtype=pl.FP32)
                     for lk in pl.pipeline(0, MLP_N_SUB_K, stage=2):
                         ks_off = lk * MLP_INNER_TK
@@ -857,6 +863,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     name_hint="up_proj",
                     deps=[up_late_tids[k_split]],
                 ) as up_tid:
+                    pl.set_cache_policy(w_up, pl.CachePolicy.BYPASS)
                     c_acc = pl.create_tensor([BATCH_PAD, MLP_TN], dtype=pl.FP32)
                     for lk in pl.pipeline(0, MLP_N_SUB_K, stage=2):
                         ks_off = lk * MLP_INNER_TK
@@ -913,6 +920,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                         silu_tids[k_split]
                     ],  # down_seed flows through MLP, output projection, and attention
                 ) as down_tid:
+                    pl.set_cache_policy(w_down, pl.CachePolicy.BYPASS)
                     c_acc = pl.create_tensor([BATCH_PAD, DOWN_TN], dtype=pl.FP32)
                     for lk in pl.pipeline(0, N_SUB_K, stage=2):
                         ks_off = lk * DOWN_TK
