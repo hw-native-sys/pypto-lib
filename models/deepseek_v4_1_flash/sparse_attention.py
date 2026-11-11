@@ -2714,6 +2714,9 @@ if __name__ == "__main__":
                 if rows > 1:
                     window_indices[0] = -1
                     compressed_indices[0] = -1
+                    window_indices[1, 0] = torch.iinfo(torch.int32).min
+                    compressed_indices[1, 0] = torch.iinfo(torch.int32).min
+                    compressed_indices[1, 32:64] = torch.arange(0, 64, 2, dtype=torch.int32)
                 sink = torch.linspace(-2, 3, LOCAL_H)
                 extents = torch.tensor([128, INDEX_TOPK], dtype=torch.int32).repeat(rows, 1)
                 wp, ws = quantize_mxfp8_cache(window.reshape(-1, 128, 1, HEAD_DIM))
