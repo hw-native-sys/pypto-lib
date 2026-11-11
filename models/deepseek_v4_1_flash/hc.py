@@ -35,7 +35,9 @@ MIX_PAD = 32
 HC_PAD = 8
 T_TILE = 8
 LINEAR_T_TILE = 16
-HF32_LINEAR_T_TILE = 80  # Matches M_TILE in kernels/hc_linear.cpp.
+HF32_LINEAR_T_TILE = 80
+HF32_LINEAR_K_L1_TILE = 512
+HF32_LINEAR_K_L0_TILE = 64
 SINKHORN_T_TILE = 6
 SINKHORN_WIDE_T_TILE = 16
 SINKHORN_WORKER_TILE = 12
@@ -49,19 +51,6 @@ POST_WORKER_TILE = 64
 
 
 _KERNELS = Path(__file__).parent / "kernels"
-
-
-@pl.jit.extern(core_type="aic", source=_KERNELS / "hc_linear.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _hc_linear(
-    x: pl.Tensor,
-    weight: pl.Tensor,
-    partials: pl.Out[pl.Tensor],
-    rows: pl.Scalar[pl.INDEX],
-    padded_rows: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Project FP32 HC operands with nearest-away HF32 and FP32 accumulation."""
-    ...
 
 
 @pl.jit.inline
@@ -352,8 +341,37 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
     tasks = ((t_dim + HF32_LINEAR_T_TILE - 1) // HF32_LINEAR_T_TILE) * LINEAR_OK
     workers = pl.min(tasks, pl.system.available_cluster_count())
-    with pl.spmd(workers, name_hint="hc_linear"):
-        _hc_linear(x_flat, function, mixes_partials, t_dim, t_linear)
+    for worker in pl.spmd(workers, name_hint="hc_linear"):
+        for task in pl.range(worker, tasks, pl.tile.get_block_num()):
+            t0 = (task // LINEAR_OK) * HF32_LINEAR_T_TILE
+            split = task % LINEAR_OK
+            k_base = split * (HC_DIM // LINEAR_OK)
+            valid_rows = pl.min(HF32_LINEAR_T_TILE, t_dim - t0)
+            acc = pl.tile.create([HF32_LINEAR_T_TILE, MIX_PAD], pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+            acc = pl.set_validshape(acc, valid_rows, MIX_HC)
+            for kb in pl.pipeline((HC_DIM // LINEAR_OK) // HF32_LINEAR_K_L1_TILE, stage=2):
+                k0 = k_base + kb * HF32_LINEAR_K_L1_TILE
+                a_l1 = pl.load(
+                    x_flat, [t0, k0], [HF32_LINEAR_T_TILE, HF32_LINEAR_K_L1_TILE],
+                    valid_shape=[valid_rows, HF32_LINEAR_K_L1_TILE], target_memory=pl.Mem.Mat,
+                )
+                b_l1 = pl.load(
+                    function, [0, k0], [MIX_PAD, HF32_LINEAR_K_L1_TILE],
+                    valid_shape=[MIX_HC, HF32_LINEAR_K_L1_TILE], target_memory=pl.Mem.Mat,
+                )
+                b_l1_t = pl.tile.transpose_view(b_l1)
+                for inner in pl.pipeline(HF32_LINEAR_K_L1_TILE // HF32_LINEAR_K_L0_TILE, stage=2):
+                    k_l0 = inner * HF32_LINEAR_K_L0_TILE
+                    left = pl.tile.extract(
+                        a_l1, 0, k_l0, [HF32_LINEAR_T_TILE, HF32_LINEAR_K_L0_TILE], target_memory=pl.Mem.Left,
+                    )
+                    right = pl.tile.extract(
+                        b_l1_t, k_l0, 0, [HF32_LINEAR_K_L0_TILE, MIX_PAD], target_memory=pl.Mem.Right,
+                    )
+                    first = kb * (HF32_LINEAR_K_L1_TILE // HF32_LINEAR_K_L0_TILE) + inner == 0
+                    acc = pl.tile.matmul_acc(acc, left, right, init_cond=first, tf32_mode="round_away")
+            partial = split * t_linear + t0
+            pl.store(acc, [partial, 0], mixes_partials)
 
     return inv_rms, mixes_partials
 
