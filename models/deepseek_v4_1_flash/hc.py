@@ -93,11 +93,11 @@ def hc_sinkhorn(
             s0_scalar = pl.tile.read(scales, [0, 0])
             s1_scalar = pl.tile.read(scales, [0, 1])
             s2_scalar = pl.tile.read(scales, [0, 2])
-            # Physical padding stays private to UB. Only the logical rows/columns
-            # are stored; inactive scatter destinations never become outputs.
-            pre = pl.tile.full([48], dtype=pl.FP32, value=0.0)
-            post = pl.tile.full([48], dtype=pl.FP32, value=0.0)
-            comb = pl.tile.full([96], dtype=pl.FP32, value=0.0)
+            # Scatter overwrites every valid output element before it is stored.
+            # Allocate UB without initializing padding, matching the C++ kernel.
+            pre = pl.create_tile([48], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            post = pl.create_tile([48], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            comb = pl.create_tile([96], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
             with pl.reg_scope():
                 full = pl.reg.full_mask(lanes=64)
                 lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
