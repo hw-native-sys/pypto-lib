@@ -954,6 +954,114 @@ def _out_proj_aic_phase(
 
 
 @pl.jit.inline(auto_scope=False)
+def _prefill_mlp_band(
+    post_norm_mtile: pl.Tensor[[MLP_M_TILE, HIDDEN], pl.BF16],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    gate_up_acc_b: pl.Tensor[[2 * MLP_M_TILE, MLP_BAND_WIDTH], pl.FP32],
+    mlp_silu_b: pl.Tensor[[MLP_M_TILE, MLP_BAND_WIDTH], pl.BF16],
+    mlp_out_acc_tile: pl.Tensor[[MLP_M_TILE, HIDDEN], pl.FP32],
+    layer_hidden_base: pl.Scalar[pl.INT32],
+    layer_inter_base: pl.Scalar[pl.INT32],
+    band_ob0: pl.Scalar[pl.INDEX],
+    band_inter0: pl.Scalar[pl.INDEX],
+    band_core_rot: pl.Scalar[pl.INDEX],
+    post_norm_ready: pl.Scalar[pl.TASK_ID],
+    seed_tid: pl.Scalar[pl.TASK_ID],
+    down_chain: pl.Array[MLP_PROJ_BANDS, pl.TASK_ID],
+    mlp_band: pl.Scalar[pl.INDEX],
+):
+    down_n_blocks = HIDDEN // K_CHUNK
+    band_k_chunks = MLP_BAND_WIDTH // MLP_OUT_CHUNK
+    silu_band_blocks = MLP_BAND_WIDTH // SILU_OUT_CHUNK
+    with pl.manual_scope():
+        with pl.spmd(
+            GATE_UP_SPMD_BLOCKS,
+            name_hint="gate_up_proj_spmd",
+            deps=[post_norm_ready],
+        ) as gate_up_tid:
+            gu_core = (pl.tile.get_block_idx() + band_core_rot) % GATE_UP_SPMD_BLOCKS
+            for rel_ob in pl.range(gu_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
+                o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
+                gate_acc = pl.create_tensor([MLP_M_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
+                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
+                    k0 = kb * K_CHUNK
+                    pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
+                    wgi = pl.slice(
+                        w_gate,
+                        [K_CHUNK, MLP_OUT_CHUNK],
+                        [layer_hidden_base + k0, o0],
+                    )
+                    gate_acc = pl.matmul_acc(gate_acc, pci, wgi, init_cond=(kb == 0))
+                gate_up_acc_b = pl.assemble(
+                    gate_up_acc_b,
+                    gate_acc,
+                    [0, rel_ob * MLP_OUT_CHUNK],
+                )
+
+            up_core = (gu_core + UP_PROJ_CORE_SHIFT) % GATE_UP_SPMD_BLOCKS
+            for rel_ob in pl.range(up_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
+                o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
+                up_acc = pl.create_tensor([MLP_M_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
+                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
+                    k0 = kb * K_CHUNK
+                    pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
+                    wui = pl.slice(
+                        w_up,
+                        [K_CHUNK, MLP_OUT_CHUNK],
+                        [layer_hidden_base + k0, o0],
+                    )
+                    up_acc = pl.matmul_acc(up_acc, pci, wui, init_cond=(kb == 0))
+                gate_up_acc_b = pl.assemble(
+                    gate_up_acc_b,
+                    up_acc,
+                    [MLP_M_TILE, rel_ob * MLP_OUT_CHUNK],
+                )
+
+        with pl.spmd(SILU_SPMD_BLOCKS, name_hint="silu_spmd", deps=[gate_up_tid]) as silu_tid:
+            silu_core = pl.tile.get_block_idx()
+            for rel_sb in pl.range(silu_core, silu_band_blocks, SILU_SPMD_BLOCKS):
+                so0 = rel_sb * SILU_OUT_CHUNK
+                silu_gate = pl.slice(gate_up_acc_b, [MLP_M_TILE, SILU_OUT_CHUNK], [0, so0])
+                silu_up = pl.slice(gate_up_acc_b, [MLP_M_TILE, SILU_OUT_CHUNK], [MLP_M_TILE, so0])
+                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(silu_gate)), 1.0))
+                mlp_chunk = pl.mul(pl.mul(silu_gate, sigmoid), silu_up)
+                mlp_silu_b = pl.assemble(
+                    mlp_silu_b,
+                    pl.cast(mlp_chunk, target_type=pl.BF16),
+                    [0, so0],
+                )
+
+        with pl.spmd(
+            DOWN_PROJ_SPMD_BLOCKS,
+            name_hint="down_proj_spmd",
+            deps=[seed_tid, silu_tid],
+        ) as down_tid:
+            down_core = pl.tile.get_block_idx()
+            for hb in pl.range(down_core, down_n_blocks, DOWN_PROJ_SPMD_BLOCKS):
+                h0 = hb * K_CHUNK
+                down_acc = pl.create_tensor([MLP_M_TILE, K_CHUNK], dtype=pl.FP32)
+                for cb in pl.pipeline(0, band_k_chunks, stage=2):
+                    c0 = cb * MLP_OUT_CHUNK
+                    msi = pl.slice(mlp_silu_b, [MLP_M_TILE, MLP_OUT_CHUNK], [0, c0])
+                    wdi = pl.slice(
+                        w_down,
+                        [MLP_OUT_CHUNK, K_CHUNK],
+                        [layer_inter_base + band_inter0 + c0, h0],
+                    )
+                    down_acc = pl.matmul_acc(down_acc, msi, wdi, init_cond=(cb == 0))
+                mlp_out_acc_tile = pl.assemble(
+                    mlp_out_acc_tile,
+                    down_acc,
+                    [0, h0],
+                    atomic=pl.AtomicType.Add,
+                )
+        pl.array.update_element(down_chain, mlp_band, down_tid)
+    return mlp_out_acc_tile
+
+
+@pl.jit.inline(auto_scope=False)
 def prefill_layer(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
     seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
@@ -982,6 +1090,7 @@ def prefill_layer(
     window_done: pl.Tensor[[BATCH_PAD, 8], pl.FP32],
     layer_idx: pl.Scalar[pl.INT32],
     kv_tail: pl.Array[NUM_LAYERS * BATCH_PAD, pl.TASK_ID],
+    record_mlp_graph: pl.constexpr,
 ) -> pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16]:
     hidden_states.bind_dynamic(0, PREFILL_TOKENS_DYN)
     out.bind_dynamic(0, PREFILL_TOKENS_DYN)
@@ -1004,8 +1113,6 @@ def prefill_layer(
     # instead of every writer into a layer-wide packed tensor.
     prefill_tokens = active_prefill_tokens
     down_n_blocks = HIDDEN // K_CHUNK
-    band_k_chunks = MLP_BAND_WIDTH // MLP_OUT_CHUNK
-    silu_band_blocks = MLP_BAND_WIDTH // SILU_OUT_CHUNK
 
     for b in pl.parallel(0, batch, 1):
         post_norm_mtile = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.BF16, manual_dep=True)
@@ -1360,89 +1467,28 @@ def prefill_layer(
                     mlp_silu_b = pl.create_tensor([MLP_M_TILE, MLP_BAND_WIDTH], dtype=pl.BF16)
 
                     band_core_rot = (mlp_band * MLP_BAND_CORE_ROT_STEP) % GATE_UP_SPMD_BLOCKS
-                    with pl.manual_scope():
-                        with pl.spmd(
-                            GATE_UP_SPMD_BLOCKS,
-                            name_hint="gate_up_proj_spmd",
-                            deps=[post_norm_ready],
-                        ) as gate_up_tid:
-                            gu_core = (pl.tile.get_block_idx() + band_core_rot) % GATE_UP_SPMD_BLOCKS
-                            for rel_ob in pl.range(gu_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
-                                o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
-                                gate_acc = pl.create_tensor([MLP_M_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
-                                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
-                                    k0 = kb * K_CHUNK
-                                    pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
-                                    wgi = pl.slice(
-                                        w_gate,
-                                        [K_CHUNK, MLP_OUT_CHUNK],
-                                        [layer_hidden_base + k0, o0],
-                                    )
-                                    gate_acc = pl.matmul_acc(gate_acc, pci, wgi, init_cond=(kb == 0))
-                                gate_up_acc_b = pl.assemble(
-                                    gate_up_acc_b,
-                                    gate_acc,
-                                    [0, rel_ob * MLP_OUT_CHUNK],
-                                )
-
-                            up_core = (gu_core + UP_PROJ_CORE_SHIFT) % GATE_UP_SPMD_BLOCKS
-                            for rel_ob in pl.range(up_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
-                                o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
-                                up_acc = pl.create_tensor([MLP_M_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
-                                for kb in pl.pipeline(0, HIDDEN_BLOCKS, stage=2):
-                                    k0 = kb * K_CHUNK
-                                    pci = pl.slice(post_norm_mtile, [MLP_M_TILE, K_CHUNK], [0, k0])
-                                    wui = pl.slice(
-                                        w_up,
-                                        [K_CHUNK, MLP_OUT_CHUNK],
-                                        [layer_hidden_base + k0, o0],
-                                    )
-                                    up_acc = pl.matmul_acc(up_acc, pci, wui, init_cond=(kb == 0))
-                                gate_up_acc_b = pl.assemble(
-                                    gate_up_acc_b,
-                                    up_acc,
-                                    [MLP_M_TILE, rel_ob * MLP_OUT_CHUNK],
-                                )
-
-                        with pl.spmd(SILU_SPMD_BLOCKS, name_hint="silu_spmd", deps=[gate_up_tid]) as silu_tid:
-                            silu_core = pl.tile.get_block_idx()
-                            for rel_sb in pl.range(silu_core, silu_band_blocks, SILU_SPMD_BLOCKS):
-                                so0 = rel_sb * SILU_OUT_CHUNK
-                                silu_gate = pl.slice(gate_up_acc_b, [MLP_M_TILE, SILU_OUT_CHUNK], [0, so0])
-                                silu_up = pl.slice(gate_up_acc_b, [MLP_M_TILE, SILU_OUT_CHUNK], [MLP_M_TILE, so0])
-                                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(silu_gate)), 1.0))
-                                mlp_chunk = pl.mul(pl.mul(silu_gate, sigmoid), silu_up)
-                                mlp_silu_b = pl.assemble(
-                                    mlp_silu_b,
-                                    pl.cast(mlp_chunk, target_type=pl.BF16),
-                                    [0, so0],
-                                )
-
-                        with pl.spmd(
-                            DOWN_PROJ_SPMD_BLOCKS,
-                            name_hint="down_proj_spmd",
-                            deps=[seed_tid, silu_tid],
-                        ) as down_tid:
-                            down_core = pl.tile.get_block_idx()
-                            for hb in pl.range(down_core, down_n_blocks, DOWN_PROJ_SPMD_BLOCKS):
-                                h0 = hb * K_CHUNK
-                                down_acc = pl.create_tensor([MLP_M_TILE, K_CHUNK], dtype=pl.FP32)
-                                for cb in pl.pipeline(0, band_k_chunks, stage=2):
-                                    c0 = cb * MLP_OUT_CHUNK
-                                    msi = pl.slice(mlp_silu_b, [MLP_M_TILE, MLP_OUT_CHUNK], [0, c0])
-                                    wdi = pl.slice(
-                                        w_down,
-                                        [MLP_OUT_CHUNK, K_CHUNK],
-                                        [layer_inter_base + band_inter0 + c0, h0],
-                                    )
-                                    down_acc = pl.matmul_acc(down_acc, msi, wdi, init_cond=(cb == 0))
-                                mlp_out_acc_tile = pl.assemble(
-                                    mlp_out_acc_tile,
-                                    down_acc,
-                                    [0, h0],
-                                    atomic=pl.AtomicType.Add,
-                                )
-                        down_chain[mlp_band] = down_tid
+                    if record_mlp_graph:
+                        with pl.graph("qwen_prefill_mlp_band", deps=[post_norm_ready, seed_tid]) as band_done:
+                            graph_invalid_dependency = pl.system.task_invalid()
+                            graph_local_down_chain = pl.array.create(MLP_PROJ_BANDS, pl.TASK_ID)
+                            mlp_out_acc_tile = _prefill_mlp_band(
+                                post_norm_mtile, w_gate, w_up, w_down,
+                                gate_up_acc_b, mlp_silu_b, mlp_out_acc_tile,
+                                layer_hidden_base, layer_inter_base,
+                                band_ob0, band_inter0, band_core_rot,
+                                graph_invalid_dependency, graph_invalid_dependency,
+                                graph_local_down_chain, 0,
+                            )
+                        down_chain[mlp_band] = band_done
+                    else:
+                        mlp_out_acc_tile = _prefill_mlp_band(
+                            post_norm_mtile, w_gate, w_up, w_down,
+                            gate_up_acc_b, mlp_silu_b, mlp_out_acc_tile,
+                            layer_hidden_base, layer_inter_base,
+                            band_ob0, band_inter0, band_core_rot,
+                            post_norm_ready, seed_tid,
+                            down_chain, mlp_band,
+                        )
 
             valid_tt = pl.min(MLP_M_TILE, prefill_tokens - m0)
             with pl.spmd(
@@ -1501,6 +1547,7 @@ def _prefill_fwd(
     host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
     host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
     DRAIN_WINDOW: pl.constexpr,
+    record_mlp_graph: pl.constexpr,
 ) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
     input_ids.bind_dynamic(0, PREFILL_TOKENS_DYN)
     seq_lens.bind_dynamic(0, BATCH_DYN)
@@ -1603,6 +1650,7 @@ def _prefill_fwd(
                             window_done_layer,
                             layer_idx,
                             kv_tail,
+                            record_mlp_graph,
                         )
                 if DRAIN_WINDOW:
                     if num_layers_actual > 0:
@@ -1707,6 +1755,7 @@ def _prefill_fwd(
                             window_done_layer,
                             layer_idx,
                             kv_tail,
+                            record_mlp_graph,
                         )
                 if DRAIN_WINDOW:
                     if num_layers_actual > 0:
@@ -1799,6 +1848,7 @@ def prefill_fwd(
         chunk_lens,
         chunk_offsets,
         True,
+        False,
     )
 
 
@@ -1831,6 +1881,7 @@ def _prefill_fwd_hbg(
     out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
     host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
     host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    record_mlp_graph: pl.constexpr,
 ) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
     return _prefill_fwd(
         input_ids,
@@ -1861,6 +1912,7 @@ def _prefill_fwd_hbg(
         host_chunk_lens,
         host_chunk_offsets,
         False,
+        record_mlp_graph,
     )
 
 
@@ -2326,7 +2378,7 @@ def golden_qwen3_14b_prefill(tensors):
     tensors["out"][:] = tiled_lm_head(final_normed, lm_head_weight, LM_HEAD_K_CHUNK, VOCAB_CHUNK)
 
 
-def _run_hbg_golden(device: int):
+def _run_hbg_golden(device: int, *, record_mlp_graph: bool = False):
     from dataclasses import replace
 
     from golden import run
@@ -2348,7 +2400,7 @@ def _run_hbg_golden(device: int):
     runtime = "host_build_graph"
     with passes.PassContext([], runtime=passes.runtime_kind_from_name(runtime)):
         return run(
-            fn=qwen3_prefill_hbg_host,
+            fn=qwen3_prefill_hbg_graph_host if record_mlp_graph else qwen3_prefill_hbg_host,
             specs=[*specs, *control_specs],
             golden_fn=golden_qwen3_14b_prefill,
             config=dict(
@@ -2568,8 +2620,71 @@ def qwen3_prefill_hbg_host(  # noqa: PLR0913 — separate HOST control tensors f
         out,
         host_chunk_lens,
         host_chunk_offsets,
+        False,
     )
 
 
 if __name__ == "__main__":
     _main()
+
+
+@pl.jit.host
+def qwen3_prefill_hbg_graph_host(  # noqa: PLR0913 — separate HOST control tensors for HBG
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+    input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
+    rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    host_chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    host_chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
+) -> pl.Tensor:
+    return _prefill_fwd_hbg(
+        input_ids,
+        seq_lens,
+        chunk_lens,
+        chunk_offsets,
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        block_table,
+        slot_mapping,
+        k_cache,
+        v_cache,
+        wo,
+        post_rms_weight,
+        w_gate,
+        w_up,
+        w_down,
+        final_norm_weight,
+        lm_head_weight,
+        embed_weight,
+        out,
+        host_chunk_lens,
+        host_chunk_offsets,
+        True,
+    )

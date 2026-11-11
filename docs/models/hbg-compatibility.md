@@ -7,7 +7,7 @@ qualification covers request state, completion, and retirement in Serving.
 
 | Platform and model | Historical validation | Current branch coverage |
 | --- | --- | --- |
-| A3 Qwen3-14B BF16 | The integrated 40-layer single-card stack passed five Serving cases in each of HBG eager and explicit Graph. A split prefill candidate also passed TMR, HBG eager, and Graph golden checks. | Lib [#1758](https://github.com/hw-native-sys/pypto-lib/pull/1758) and [#1762](https://github.com/hw-native-sys/pypto-lib/pull/1762) supply eager prefill and its KV golden correction. Explicit prefill and decode recording and request-local token feedback are tracked independently. |
+| A3 Qwen3-14B BF16 | The integrated 40-layer single-card stack passed five Serving cases in each of HBG eager and explicit Graph. A split prefill candidate also passed TMR, HBG eager, and Graph golden checks. | Lib [#1758](https://github.com/hw-native-sys/pypto-lib/pull/1758) and [#1762](https://github.com/hw-native-sys/pypto-lib/pull/1762) supply eager prefill and its KV golden correction. Explicit prefill MLP recording passed standalone golden on this branch. Decode recording and request-local token feedback are tracked independently. |
 | A3 DeepSeek V4 Flash MTP K1 | The 43-layer eight-card integrated stack completed a 64-input, 128-output HTTP case with both HBG configurations. Default HBG records selected prefill regions. The explicit Graph configuration also records decode attention. | Port bounded prefill and fused K1 decode into the shared model implementation and validate the Serving ABI and replay boundaries. MTP prefill and the LM head used ordinary HBG in the historical run. |
 | A5 DeepSeek V4.1 Flash | Synchronous HBG with TWAIT and AICPU compatibility scheduling passed 40-layer EP4/DP4/TP1 HTTP lifecycle checks at 8,192 input tokens. Two teacher-forced repetitions matched TMR byte-for-byte across 222 corresponding comparison steps for logits and effective KV and compressor state. | Port against current Lib main. Recheck indexer dependencies, routed MoE workspace ownership, and communication waits against the current implementation. Explicit Graph, resident-only scheduling, and whole-model Async await qualification. |
 
@@ -43,6 +43,7 @@ preemption recovery
 | --- | --- | --- | --- | --- |
 | A3 historical Qwen and DeepSeek integration | `7f7ce3b01` | `90fcb0089` | `fbe9cec70` | `6ac05e563` |
 | A3 Qwen split prefill golden, PTOAS v0.72 | `11967c7bf27dfc50f2ebd0ef06e2a847b2253d9a` (#3323 CI merge snapshot) | `355ce3015e3e344d1fc3a61c206ee01823ce292c` | `da5350d2` plus prefill recording | Standalone |
+| A3 Qwen branch prefill golden, PTOAS v0.72 | `11967c7bf27dfc50f2ebd0ef06e2a847b2253d9a` | `355ce3015e3e344d1fc3a61c206ee01823ce292c` | `f693535` plus prefill MLP recording | Standalone, TMR/eager/Graph |
 | A5 V4.1 synchronous HBG | `8a11f4e6` plus snapshot patch | `31f9e72e` plus snapshot patch | `740bc389` plus snapshot patch | `29fed17d` plus snapshot patch |
 
 The A5 synchronous model generated TWAIT. The historical PyPTO and Simpler
