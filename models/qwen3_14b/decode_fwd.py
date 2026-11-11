@@ -211,6 +211,31 @@ assert N_SPLITS_OUT * OUT_TN == HIDDEN
 assert K_SPLITS_OUT * OUT_TK == HIDDEN
 assert OUT_N_SUB_K * OUT_INNER_TK == OUT_TK
 assert N_PER_CAST_K * OUT_TN == MLP_K_SLICE
+
+N_OUT_DIRECT = N_SPLITS_OUT * K_SPLITS_OUT - N_OUT_DIRECT_BLOCKS
+_OUT_TILES_PER_CAST = N_PER_CAST_K * K_SPLITS_OUT  # tiles of one residual-cast slice
+
+
+def _out_direct_split_points():
+    pts = [N_OUT_DIRECT]
+    pt = ((N_OUT_DIRECT // _OUT_TILES_PER_CAST) + 1) * _OUT_TILES_PER_CAST
+    while pt < N_SPLITS_OUT * K_SPLITS_OUT:
+        pts.append(pt)
+        pt += _OUT_TILES_PER_CAST
+    pts.append(N_SPLITS_OUT * K_SPLITS_OUT)
+    return tuple(pts)
+
+
+OUT_DIRECT_SPLIT_POINTS = _out_direct_split_points()
+
+# One named constant per segment: pl.unroll() only accepts compile-time integer
+# literals or resolvable constant names, not subscript expressions.
+OUT_SEG0_START = OUT_DIRECT_SPLIT_POINTS[0]
+OUT_SEG1_START = OUT_DIRECT_SPLIT_POINTS[1]
+OUT_SEG2_START = OUT_DIRECT_SPLIT_POINTS[2]
+OUT_SEG0_WIDTH = OUT_DIRECT_SPLIT_POINTS[1] - OUT_DIRECT_SPLIT_POINTS[0]
+OUT_SEG1_WIDTH = OUT_DIRECT_SPLIT_POINTS[2] - OUT_DIRECT_SPLIT_POINTS[1]
+OUT_SEG2_WIDTH = OUT_DIRECT_SPLIT_POINTS[3] - OUT_DIRECT_SPLIT_POINTS[2]
 assert GATE_UP_SPMD_N < MLP_ON
 
 
@@ -629,11 +654,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         out_tids = pl.array.create(N_SPLITS_OUT * K_SPLITS_OUT, pl.TASK_ID)
 
         # 14e2635 critical-wave split: defer the first 26 tiles through an
-        # unflagged dummy, while the final 24 tiles are one SPMD dispatch
-        # directly gated by FAI.  The direct dispatch intentionally has no
-        # allow_early_resolve flag.
+        # unflagged dummy.  The deferred region is split at residual-cast slice
+        # boundaries (OUT_DIRECT_SEGMENTS, derived at module level), so each
+        # cast slice starts as soon as its own out_proj tiles finish instead of
+        # waiting for the whole 24-tile region.  The direct dispatches
+        # intentionally have no allow_early_resolve flag.
         out_proj_dummy = pl.system.task_dummy(deps=[attn_done_tid])
-        N_OUT_DIRECT = N_SPLITS_OUT * K_SPLITS_OUT - N_OUT_DIRECT_BLOCKS
         for out_idx in pl.parallel(0, N_OUT_DIRECT):
             n_out_proj = out_idx // K_SPLITS_OUT
             k_split_out = out_idx % K_SPLITS_OUT
@@ -660,11 +686,11 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             out_tids[out_idx] = out_tid
 
         with pl.spmd(
-            N_OUT_DIRECT_BLOCKS,
+            OUT_SEG0_WIDTH,
             name_hint="out_proj",
             deps=[attn_done_tid],
-        ) as out_proj_direct_tid:
-            out_idx = N_OUT_DIRECT + pl.get_block_idx()
+        ) as out_proj_direct_tid_0:
+            out_idx = OUT_SEG0_START + pl.get_block_idx()
             n_out_proj = out_idx // K_SPLITS_OUT
             k_split_out = out_idx % K_SPLITS_OUT
             n_op = n_out_proj * OUT_TN
@@ -690,8 +716,76 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 ]
                 out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k, init_cond=(out_lk == 0))
             attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add)
-        for _block in pl.unroll(N_OUT_DIRECT_BLOCKS):
-            out_tids[N_OUT_DIRECT + _block] = out_proj_direct_tid
+        for _block in pl.unroll(OUT_SEG0_WIDTH):
+            out_tids[OUT_SEG0_START + _block] = out_proj_direct_tid_0
+
+        with pl.spmd(
+            OUT_SEG1_WIDTH,
+            name_hint="out_proj",
+            deps=[attn_done_tid],
+        ) as out_proj_direct_tid_1:
+            out_idx = OUT_SEG1_START + pl.get_block_idx()
+            n_out_proj = out_idx // K_SPLITS_OUT
+            k_split_out = out_idx % K_SPLITS_OUT
+            n_op = n_out_proj * OUT_TN
+            k_op = k_split_out * OUT_TK
+            # This peel is NOT foldable into init_cond: with a create_tensor
+            # accumulator ptoas rejects the region with "'pto.tmatmul' op expects
+            # dst to be in the acc address space". The pl.at out_proj above takes
+            # init_cond fine; only this pl.spmd copy does not.
+            out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
+            out_w0 = wo[
+                layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN
+            ]
+            out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
+            for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
+                out_ks_off = out_lk * OUT_INNER_TK
+                out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
+                out_w_k = wo[
+                    layer_hidden_base + k_op + out_ks_off : layer_hidden_base
+                    + k_op
+                    + out_ks_off
+                    + OUT_INNER_TK,
+                    n_op : n_op + OUT_TN,
+                ]
+                out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k, init_cond=(out_lk == 0))
+            attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add)
+        for _block in pl.unroll(OUT_SEG1_WIDTH):
+            out_tids[OUT_SEG1_START + _block] = out_proj_direct_tid_1
+
+        with pl.spmd(
+            OUT_SEG2_WIDTH,
+            name_hint="out_proj",
+            deps=[attn_done_tid],
+        ) as out_proj_direct_tid_2:
+            out_idx = OUT_SEG2_START + pl.get_block_idx()
+            n_out_proj = out_idx // K_SPLITS_OUT
+            k_split_out = out_idx % K_SPLITS_OUT
+            n_op = n_out_proj * OUT_TN
+            k_op = k_split_out * OUT_TK
+            # This peel is NOT foldable into init_cond: with a create_tensor
+            # accumulator ptoas rejects the region with "'pto.tmatmul' op expects
+            # dst to be in the acc address space". The pl.at out_proj above takes
+            # init_cond fine; only this pl.spmd copy does not.
+            out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
+            out_w0 = wo[
+                layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN
+            ]
+            out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
+            for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
+                out_ks_off = out_lk * OUT_INNER_TK
+                out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
+                out_w_k = wo[
+                    layer_hidden_base + k_op + out_ks_off : layer_hidden_base
+                    + k_op
+                    + out_ks_off
+                    + OUT_INNER_TK,
+                    n_op : n_op + OUT_TN,
+                ]
+                out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k, init_cond=(out_lk == 0))
+            attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add)
+        for _block in pl.unroll(OUT_SEG2_WIDTH):
+            out_tids[OUT_SEG2_START + _block] = out_proj_direct_tid_2
 
         # Tiled residual + BF16 cast.
         for k_slice in pl.unroll(K_SPLITS_MLP):
