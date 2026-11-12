@@ -15,7 +15,7 @@ import pypto.language as pl
 from pypto.runtime import pto_isa_include_dir
 import torch
 
-from config import FLASH as M, TP_SIZE
+from config import FLASH as M
 from gemm import (
     MX_M_TILE, MX_K_TILE,
     golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_linear_grouped_sum,
@@ -35,7 +35,7 @@ QB_SCALE_COLS = pl.dynamic("QB_SCALE_COLS")
 QB_OUTPUT_ROWS = pl.dynamic("QB_OUTPUT_ROWS")
 
 # model config
-LOCAL_H = M.num_attention_heads // TP_SIZE
+LOCAL_H = M.num_attention_heads
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim

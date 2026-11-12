@@ -60,7 +60,7 @@ CANDIDATE_SCORE_TILE = 1024
 CANDIDATE_LEAF_TILE = 8192
 CANDIDATE_SHORT_LEAF_TILE = 2048
 CANDIDATE_MAX_LEAVES = (FLASH.max_position_embeddings // CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_LEAF_TILE + 1
-INDEX_SCORE_POSITIONS_DYN = pl.dynamic("V41_INDEX_SCORE_POSITIONS_DYN")
+INDEX_SCORE_POSITIONS_DYN = pl.dynamic("INDEX_SCORE_POSITIONS_DYN")
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "idx_q.cpp",
                aiv_source=Path(__file__).parent / "kernels" / "idx_q.cpp", dual_aiv_dispatch=True,

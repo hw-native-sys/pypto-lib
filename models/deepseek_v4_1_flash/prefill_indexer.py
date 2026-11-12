@@ -64,7 +64,7 @@ CANDIDATE_SCORE_TILE = 1024
 CANDIDATE_LEAF_TILE = 8192
 CANDIDATE_SHORT_LEAF_TILE = 2048
 CANDIDATE_MAX_LEAVES = (M.max_position_embeddings // CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_LEAF_TILE + 1
-INDEX_SCORE_POSITIONS_DYN = pl.dynamic("V41_INDEX_SCORE_POSITIONS_DYN")
+INDEX_SCORE_POSITIONS_DYN = pl.dynamic("INDEX_SCORE_POSITIONS_DYN")
 
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "idx_q.cpp",
@@ -1497,54 +1497,37 @@ def golden_prefill_indexer(
     weights = (x.float() @ unpack_bf16_nz(weights_proj).float()).bfloat16()
     weights = (weights.float() * INDEX_SCORE_SCALE).bfloat16()
     keys = index_cache.flatten(0, 1).squeeze(-2)
-    for token in range(tokens):
-        length = max(0, int(compressed_lens[token]))
-        positions = torch.arange(length)
-        if pool_block_ids is not None:
-            count = int(pool_block_counts[token])
-            positions = (pool_block_ids[token, :count, None].long() * 8 + torch.arange(8)).flatten()
-            positions = positions[(positions >= 0) & (positions < length)]
-        if not positions.numel():
-            continue
-        pages = block_table[int(request_ids[token]), positions // 128]
-        present = (pages >= 0) & (pages < index_cache.shape[0])
-        positions, pages = positions[present], pages[present]
-        physical = pages.long() * 128 + positions % 128
-        if c2a and length <= topk:
-            selected[token, :physical.numel()] = physical.int()
-            continue
-        dots = (query[token].float() @ keys[physical].T.float()).bfloat16().float().relu()
-        weighted = (dots * weights[token].float()[:, None]).bfloat16().float()
-        values = weighted.sum(0).bfloat16().float()
-        scores[token, positions] = values
-        count = min(topk, positions.numel())
-        if count:
-            chosen = torch.argsort(values, descending=True, stable=True)[:count]
-            order = physical[chosen].argsort() if c2a else positions[chosen].argsort()
-            selected[token, :count] = physical[chosen[order]].int()
+    torch_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        for token in range(tokens):
+            length = max(0, int(compressed_lens[token]))
+            positions = torch.arange(length)
+            if pool_block_ids is not None:
+                count = int(pool_block_counts[token])
+                positions = (pool_block_ids[token, :count, None].long() * 8 + torch.arange(8)).flatten()
+                positions = positions[(positions >= 0) & (positions < length)]
+            if not positions.numel():
+                continue
+            pages = block_table[int(request_ids[token]), positions // 128]
+            present = (pages >= 0) & (pages < index_cache.shape[0])
+            positions, pages = positions[present], pages[present]
+            physical = pages.long() * 128 + positions % 128
+            if c2a and length <= topk:
+                selected[token, :physical.numel()] = physical.int()
+                continue
+            dots = (query[token].float() @ keys[physical].T.float()).bfloat16().float().relu()
+            weighted = (dots * weights[token].float()[:, None]).bfloat16().float()
+            values = weighted.sum(0).bfloat16().float()
+            scores[token, positions] = values
+            count = min(topk, positions.numel())
+            if count:
+                chosen = torch.argsort(values, descending=True, stable=True)[:count]
+                order = physical[chosen].argsort() if c2a else positions[chosen].argsort()
+                selected[token, :count] = physical[chosen[order]].int()
+    finally:
+        torch.set_num_threads(torch_threads)
     return scores, selected
-
-
-def golden_prefill_index_scores(mode, rank, cache_outputs, inputs):
-    """Use the same Prefill profile for the existing cutoff comparator."""
-    from qkv_proj_rope import golden_qkv_proj_rope
-
-    payload = cache_outputs["index_cache"] if mode == "full" else inputs["index_cache"]
-    scales = cache_outputs["index_cache_scale"] if mode == "full" else inputs["index_cache_scale"]
-    keys = dequantize_mxfp4_cache(payload[rank], scales[rank], 32, "e8m0").bfloat16()
-    _, _, latent = golden_qkv_proj_rope(
-        inputs["x"][rank], inputs["wq_a"][rank], inputs["wq_a_scale"][rank], inputs["q_norm_weight"][rank],
-        inputs["wq_b"][rank], inputs["wq_b_scale"][rank], inputs["wkv"][rank], inputs["wkv_scale"][rank],
-        inputs["kv_norm_weight"][rank], inputs["rope_cos"][rank], inputs["rope_sin"][rank],
-        sequential_query=True,
-    )
-    pool = {} if mode == "full" else {name: inputs[name][rank] for name in ("pool_block_ids", "pool_block_counts")}
-    scores, _ = golden_prefill_indexer(
-        inputs["x"][rank], latent, inputs["request_ids"][rank], keys, inputs["index_block_table"][rank],
-        inputs["compressed_lens"][rank], inputs["index_wq_b"][rank], inputs["index_wq_b_scale"][rank],
-        inputs["index_weights_proj"][rank], inputs["rope_cos"][rank], inputs["rope_sin"][rank], **pool,
-    )
-    return scores
 
 
 def index_pool_block_capacity(score_width: int) -> int:

@@ -35,7 +35,7 @@ config.FLASH = replace(config.FLASH, n_routed_experts=_test_experts)
 config.N_LOCAL_EXPERTS = _experts_per_rank
 
 
-from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
+from config import FLASH as M, EP_SIZE, MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, T_DYN, ROUTE_T_DYN
 from gate import gate_from_bf16
 from expert_shared import expert_shared
 from expert_routed import (
@@ -140,8 +140,8 @@ def combine_scattered(
 
 @pl.jit.inline(auto_scope=False)
 def moe(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -160,9 +160,9 @@ def moe(
     shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    x_mixed: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
-    x_next: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor,
     recv_x: pld.DistributedTensor,
     recv_scale: pld.DistributedTensor,
@@ -178,7 +178,7 @@ def moe(
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     topk: pl.constexpr = TOPK,
     dispatch_worker_limit: pl.constexpr = 0,
-) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
+) -> pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]:
     """Run delayed HC pre-mix, MoE, and residual expansion."""
     t = MOE_TOKENS
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
@@ -252,8 +252,8 @@ def moe(
 
 @pl.jit
 def l2_moe(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -272,9 +272,9 @@ def l2_moe(
     shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
     shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
     shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    x_mixed: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
-    x_next: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
@@ -287,12 +287,12 @@ def l2_moe(
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
     force_topk: pl.Tensor[[MOE_TOKENS, TOPK], pl.INT32],
-) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
-    x_hc.bind_dynamic(0, LOCAL_T_DYN)
-    pre_mix.bind_dynamic(0, LOCAL_T_DYN)
-    next_pre_mix.bind_dynamic(0, LOCAL_T_DYN)
-    x_mixed.bind_dynamic(0, LOCAL_T_DYN)
-    x_next.bind_dynamic(0, LOCAL_T_DYN)
+) -> pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]:
+    x_hc.bind_dynamic(0, T_DYN)
+    pre_mix.bind_dynamic(0, T_DYN)
+    next_pre_mix.bind_dynamic(0, T_DYN)
+    x_mixed.bind_dynamic(0, T_DYN)
+    x_next.bind_dynamic(0, T_DYN)
     local_num_tokens = pl.read(num_tokens, [ep_rank])
     moe(
         x_hc, pre_mix, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,

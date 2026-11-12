@@ -27,9 +27,7 @@ import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 from pypto.runtime import pto_isa_include_dir
 
-# Standalone LM-head validation defaults to TP2/DP1.
-
-from config import DP_SIZE as CONFIG_DP_SIZE, FLASH as M, TP_SIZE as CONFIG_TP_SIZE
+from config import EP_SIZE, FLASH as M, LM_HEAD_TP_SIZE, SUPPORTED_LM_HEAD_TP_SIZES
 from hc import hc_head, golden_hc_collapse
 from rmsnorm import rms_norm_tiled_compensated, golden_rms_norm_tiled
 from quant import pack_bf16_nz, unpack_bf16_nz
@@ -44,11 +42,8 @@ LM_HEAD_WEIGHT_LAYOUT = "bf16_nz_kn"
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
 HC_MULT = M.hc_mult
 
-# Parallelism. Static in the frontend, so both worlds are parsed off argv here.
-# Imported kernels inherit TP from the composing program.
-_TP_CHOICES = (1, 2, 4, 8)
+# Standalone validation request groups.
 _DP_CHOICES = (1, 2, 4, 8)
-_TP_DEFAULT = 2 if __name__ == "__main__" else CONFIG_TP_SIZE
 
 
 def _parse_int_argv(name, default=None):
@@ -60,17 +55,16 @@ def _parse_int_argv(name, default=None):
     return default
 
 
-TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
 # DP groups built by the l3_lm_head fixture; the kernel carries no DP extent.
-DP_SIZE: int = _parse_int_argv("--dp") or (1 if __name__ == "__main__" else CONFIG_DP_SIZE)
-WORLD_SIZE = TP_SIZE * DP_SIZE
-VOCAB_PER_TP = VOCAB // TP_SIZE
+DP_SIZE = _parse_int_argv("--dp", 1) if __name__ == "__main__" else EP_SIZE // LM_HEAD_TP_SIZE
+WORLD_SIZE = LM_HEAD_TP_SIZE * DP_SIZE if __name__ == "__main__" else EP_SIZE
+VOCAB_PER_TP = VOCAB // LM_HEAD_TP_SIZE
 
 # Small decode fixture size (not DECODE_MAX_TOKENS). TP1 * 16 == 16 satisfies
 # the matmul M % 16 == 0 constraint on Pro's simpler path.
 MAX_LOGIT_ROWS = 16
 TEST_TOKENS = 16  # standalone fixture: hidden rows per card
-GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
+GROUP_LOGIT_ROWS = LM_HEAD_TP_SIZE * MAX_LOGIT_ROWS
 
 # Tiling
 LM_HEAD_M_TILE = 80
@@ -103,10 +97,10 @@ LOGITS_COMM_BLOCKS = min(
 LOGITS_TAIL_BLOCK = N_LOGITS_COMM_TILES % LOGITS_COMM_BLOCKS
 
 assert D % HIDDEN_GATHER_TILE == 0
-assert VOCAB % TP_SIZE == 0
+assert VOCAB % LM_HEAD_TP_SIZE == 0
 assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
-assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
-assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE})"
+if __name__ == "__main__" and DP_SIZE not in _DP_CHOICES:
+    raise ValueError(f"--dp must be one of {_DP_CHOICES}, got {DP_SIZE}")
 assert REPEAT in _REPEAT_CHOICES, f"--repeat must be one of {_REPEAT_CHOICES} (got {REPEAT})"
 
 
@@ -145,15 +139,15 @@ def lm_head(
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
     completed_epochs: pl.Scalar[pl.INT32],
 ) -> tuple[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32], pl.Scalar[pl.TASK_ID]]:
-    if TP_SIZE == 1:
+    if LM_HEAD_TP_SIZE == 1:
         selected_hidden = pl.create_tensor([MAX_LOGIT_ROWS, D], dtype=pl.BF16)
         for row in pl.spmd(MAX_LOGIT_ROWS, name_hint="lm_head_select_rows"):
             source_row_raw = pl.read(logit_row_indices, [row])
@@ -189,7 +183,7 @@ def lm_head(
                 selected_hidden[row : row + 1, :] = hidden_states[source_row : source_row + 1, :]
 
             # Self-target rides the same put; put drains before the notify issues.
-            for peer_tp in pl.range(TP_SIZE):
+            for peer_tp in pl.range(LM_HEAD_TP_SIZE):
                 pld.tensor.put(
                     dst=hidden_window,
                     peer=group_base + peer_tp,
@@ -200,7 +194,7 @@ def lm_head(
                 )
 
             # Notify folded into the push: MAX_LOGIT_ROWS notifies per source per epoch.
-            for peer_tp in pl.range(TP_SIZE):
+            for peer_tp in pl.range(LM_HEAD_TP_SIZE):
                 if peer_tp != tp_rank:
                     pld.system.notify(
                         target=hidden_done,
@@ -213,7 +207,7 @@ def lm_head(
         # Wait after all local hidden-row publishes complete.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch_wait", deps=[_dispatch_push_tid],
                    allow_early_resolve=False) as _dwait_tid:
-            for owner_tp in pl.range(TP_SIZE):
+            for owner_tp in pl.range(LM_HEAD_TP_SIZE):
                 if owner_tp != tp_rank:
                     pld.system.wait(
                         signal=hidden_done,
@@ -239,7 +233,7 @@ def lm_head(
         with pl.spmd(LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_push", deps=[_project_tid]) as _push_tid:
             blk = pl.tile.get_block_idx()
             vocab_base = tp_rank * VOCAB_PER_TP
-            for owner_tp in pl.range(TP_SIZE):
+            for owner_tp in pl.range(LM_HEAD_TP_SIZE):
                 source_row_base = owner_tp * MAX_LOGIT_ROWS
 
                 # put, not tile.remote_store: remote_store does not drain before the
@@ -272,7 +266,7 @@ def lm_head(
 
             # Notify folded into the push: each block signals every peer after its own
             # stores, so a peer sees LOGITS_COMM_BLOCKS notifies per source per epoch.
-            for owner_tp in pl.range(TP_SIZE):
+            for owner_tp in pl.range(LM_HEAD_TP_SIZE):
                 if owner_tp != tp_rank:
                     pld.system.notify(
                         target=logits_done,
@@ -285,7 +279,7 @@ def lm_head(
         # Wait after all local vocab-shard publishes complete.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_combine_wait", deps=[_push_tid],
                    allow_early_resolve=False) as _cwait_tid:
-            for src_tp in pl.range(TP_SIZE):
+            for src_tp in pl.range(LM_HEAD_TP_SIZE):
                 if src_tp != tp_rank:
                     pld.system.wait(
                         signal=logits_done,
@@ -300,7 +294,7 @@ def lm_head(
             LOGITS_COMM_BLOCKS, name_hint="lm_head_combine_gather", deps=[_cwait_tid]
         ) as _gather_tid:
             gblk = pl.tile.get_block_idx()
-            for src_tp in pl.range(TP_SIZE):
+            for src_tp in pl.range(LM_HEAD_TP_SIZE):
                 src_vocab_base = src_tp * VOCAB_PER_TP
                 for ob in pl.range(gblk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
                     o0 = ob * LOGITS_COMM_TILE
@@ -315,14 +309,14 @@ def lm_head(
 
         # Publish completion of every local logits-window reader.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_readback_notify", deps=[_gather_tid]) as _readback_notify_tid:
-            for peer in pl.range(TP_SIZE):
+            for peer in pl.range(LM_HEAD_TP_SIZE):
                 if peer != tp_rank:
                     pld.system.notify(
                         logits_done, peer=group_base + peer, offsets=[tp_rank, 0],
                         value=1, op=pld.NotifyOp.AtomicAdd,
                     )
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_readback_wait") as _readback_wait_tid:
-            for peer in pl.range(TP_SIZE):
+            for peer in pl.range(LM_HEAD_TP_SIZE):
                 if peer != tp_rank:
                     pld.system.defer_wait(
                         logits_done, offsets=[peer, 0], expected=done_epoch * (LOGITS_COMM_BLOCKS + 1), cmp=pld.WaitCmp.Ge,
@@ -333,7 +327,7 @@ def lm_head(
         ) as _retire_tid:
             anchor = pl.read(logits, [0, 0])
             if done_epoch == completed_epochs:
-                for peer in pl.range(TP_SIZE):
+                for peer in pl.range(LM_HEAD_TP_SIZE):
                     if peer != tp_rank:
                         pld.system.notify(
                             hidden_done, peer=group_base + tp_rank, offsets=[peer, 0],
@@ -497,9 +491,9 @@ def lm_head_with_sampling(
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
@@ -507,7 +501,7 @@ def lm_head_with_sampling(
 ):
     """Project logits and sample top-1 tokens in one opaque L2 entry."""
     active = pl.cast(1, pl.INT32)
-    if TP_SIZE == 1:
+    if LM_HEAD_TP_SIZE == 1:
         active = _lm_head_has_rows(logit_row_indices)
     if active > 0:
         logits, projected = lm_head(
@@ -538,9 +532,9 @@ def l2_lm_head(
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
@@ -586,20 +580,20 @@ def l3_final_output(
     """
     x_hc.bind_dynamic(1, T_DYN)
     hidden_buffer = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    hidden_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    hidden_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     logits_buffer = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-    logits_done_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for epoch_idx in pl.range(REPEAT):
         for rank in pl.range(pld.world_size()):
             hidden_window = pld.window(hidden_buffer, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-            hidden_done = pld.window(hidden_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+            hidden_done = pld.window(hidden_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
             logits_window = pld.window(logits_buffer, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-            logits_done = pld.window(logits_done_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+            logits_done = pld.window(logits_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
             l2_final_output(
                 x_hc[rank], pre_mix[rank], final_norm_weight[rank], lm_head_weight[rank],
                 logit_row_indices[rank], logits[rank], sampled_ids[rank],
                 hidden_window, hidden_done, logits_window, logits_done,
-                rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, epoch_idx + 1, REPEAT, device=rank,
+                rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, rank % LM_HEAD_TP_SIZE, epoch_idx + 1, REPEAT, device=rank,
             )
 
 
@@ -612,9 +606,9 @@ def _final_output(
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
@@ -623,7 +617,7 @@ def _final_output(
     """Compose final HC, Norm and LM head from the current layer state."""
     x_hc.bind_dynamic(0, T_DYN)
     active = pl.cast(1, pl.INT32)
-    if TP_SIZE == 1:
+    if LM_HEAD_TP_SIZE == 1:
         active = _lm_head_has_rows(logit_row_indices)
     if active > 0:
         rows = pl.tensor.dim(x_hc, 0)
@@ -659,21 +653,21 @@ def l3_lm_head(
     # and every card receives only its own full-vocabulary logits.
     hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
     logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * VOCAB * 4)
-    hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
-    logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+    hidden_done_buf = pld.alloc_window_buffer(LM_HEAD_TP_SIZE * 4)
+    logits_done_buf = pld.alloc_window_buffer(LM_HEAD_TP_SIZE * 4)
 
     # Epochs advance inside a dispatch; the final projection clears its signals.
     for epoch_idx in pl.range(REPEAT):
         for r in pl.range(pld.world_size()):
             hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-            hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+            hidden_done = pld.window(hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
             logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-            logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+            logits_done = pld.window(logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
             l2_lm_head(
                 hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
                 sampled_ids[r],
                 hidden_window, hidden_done, logits_window, logits_done,
-                r // TP_SIZE * TP_SIZE, r % TP_SIZE, epoch_idx + 1, REPEAT, device=r,
+                r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE, epoch_idx + 1, REPEAT, device=r,
             )
 
 
@@ -706,10 +700,10 @@ def golden_lm_head(tensors):
     import torch
 
     hidden = tensors["hidden_states"].float()
-    # Card r holds shard r % TP_SIZE, so concatenating shards in index order
+    # Card r holds shard r % LM_HEAD_TP_SIZE, so concatenating shards in index order
     # reproduces the global vocabulary order every owner assembles.
     weight = unpack_bf16_nz(tensors["lm_head_weight"]).float()
-    full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=-1)
+    full_weight = torch.cat([weight[tp] for tp in range(LM_HEAD_TP_SIZE)], dim=-1)
     full_logits = []
     for owner_rank in range(WORLD_SIZE):
         selected = torch.zeros((MAX_LOGIT_ROWS, D), dtype=torch.float32)
@@ -783,15 +777,15 @@ def build_tensor_specs(num_tokens=TEST_TOKENS, *, final=False):
         return (torch.randn(WORLD_SIZE, TEST_TOKENS, D) * 0.1).to(torch.bfloat16)
 
     def init_lm_head_weight():
-        checkpoint = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+        checkpoint = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
         shards = pack_bf16_nz(checkpoint.transpose(-1, -2).contiguous())
-        return torch.stack([shards[r % TP_SIZE] for r in range(WORLD_SIZE)], dim=0)
+        return torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(WORLD_SIZE)], dim=0)
 
     def init_logit_row_indices():
         indices = torch.full((WORLD_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
         indices[:, :active] = torch.arange(active, dtype=torch.int32)
         if final and DP_SIZE > 1:
-            indices[-TP_SIZE:] = -1
+            indices[-LM_HEAD_TP_SIZE:] = -1
         return indices
 
     specs = [
@@ -802,7 +796,7 @@ def build_tensor_specs(num_tokens=TEST_TOKENS, *, final=False):
             init_value=init_hidden_states,
         ),
         # One vocab shard per world rank: card r carries a copy of shard
-        # r % TP_SIZE, matching how resident args are handed out per rank. Keep
+        # r % LM_HEAD_TP_SIZE, matching how resident args are handed out per rank. Keep
         # each rank-local shard on its consuming card across dispatches.
         TensorSpec(
             "lm_head_weight",
@@ -863,7 +857,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
+    parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=SUPPORTED_LM_HEAD_TP_SIZES,
                         help="LM-head tensor-parallel world size")
     parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES),
                         help="DP groups (world size = tp * dp)")
@@ -889,7 +883,7 @@ if __name__ == "__main__":
     assert len(device_ids) >= required_devices, (
         f"need at least {required_devices} devices, got {device_ids}"
     )
-    assert args.tp == TP_SIZE and args.dp == DP_SIZE and args.repeat == REPEAT
+    assert args.lm_head_tp == LM_HEAD_TP_SIZE and args.dp == DP_SIZE and args.repeat == REPEAT
     assert 0 <= args.num_tokens <= TEST_TOKENS
 
     if not args.fused_sample:

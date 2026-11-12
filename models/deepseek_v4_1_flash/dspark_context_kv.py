@@ -20,7 +20,7 @@ from quant import quantize_mxfp8_cache, pack_quantized_cache, unpack_quantized_c
 from rmsnorm import golden_rms_norm
 
 
-T_DYN = pl.dynamic("V41_DSPARK_CONTEXT_T_DYN")
+T_DYN = pl.dynamic("DSPARK_CONTEXT_T_DYN")
 D = FLASH.hidden_size
 HEAD_DIM = FLASH.head_dim
 ROPE_DIM = FLASH.qk_rope_head_dim

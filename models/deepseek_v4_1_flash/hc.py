@@ -213,16 +213,10 @@ def hc_head_norm_store(
 
 @pl.jit.inline
 def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
-    """Clear physical rows that belong to an empty or partial TP slab.
-
-    A TP rank with no logical token still publishes one fixed-capacity slab so
-    every rank executes the same distributed window protocol.  Clearing the
-    unused rows makes that padding deterministic and prevents an empty owner
-    from publishing uninitialized data.
-    """
+    """Zero padding rows beyond the local active token count."""
     tokens = pl.tensor.dim(x, 0)
     if tokens > 0 and valid_rows < tokens:
-        for row in pl.spmd(tokens, name_hint="decode_sp_zero_padding"):
+        for row in pl.spmd(tokens, name_hint="zero_bf16_padding"):
             if row >= valid_rows:
                 x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
@@ -254,41 +248,6 @@ def hc_post(
     return output
 
 
-@pl.jit.inline(auto_scope=False)
-def hc_post_padding(
-    residual: pl.Tensor,
-    post_mix: pl.Tensor,
-    residual_mix: pl.Tensor,
-    output: pl.Tensor,
-    valid_rows: pl.Scalar[pl.INT32],
-    source_ready: pl.Scalar[pl.TASK_ID],
-    zero_output: pl.constexpr,
-):
-    """Complete inactive rows after a fused active prefix, preserving each caller's padding policy."""
-    rows = pl.tensor.dim(output, 0)
-    padding_workers = pl.system.available_cluster_count()
-    if valid_rows < rows:
-        if zero_output:
-            output_flat = pl.reshape(output, [rows * HC_MULT, D])
-            with pl.spmd(padding_workers, name_hint="hc_zero_padding", deps=[source_ready]):
-                worker = pl.tile.get_block_idx()
-                for row in pl.range(valid_rows * HC_MULT + worker, rows * HC_MULT, padding_workers):
-                    zeros = pl.tile.full([1, D], dtype=pl.FP32, value=0.0)
-                    output_flat = pl.store(zeros, [row, 0], output_flat)
-        else:
-            padding = pl.create_tensor([rows - valid_rows, D], dtype=pl.BF16)
-            with pl.spmd(padding_workers, name_hint="hc_padding_input", deps=[source_ready]) as padding_ready:
-                worker = pl.tile.get_block_idx()
-                for row in pl.range(worker, rows - valid_rows, padding_workers):
-                    zero_input = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
-                    padding = pl.store(zero_input, [row, 0], padding)
-            deps = pl.array.create(2, pl.TASK_ID)
-            deps[0] = padding_ready
-            hc_post(
-                padding, residual[valid_rows:rows, :, :], post_mix[valid_rows:rows, :],
-                residual_mix[valid_rows:rows, :, :], output[valid_rows:rows, :, :], deps=deps,
-            )
-    return output
 
 
 def _round_hf32(value: torch.Tensor) -> torch.Tensor:
@@ -333,6 +292,18 @@ def golden_hc_collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     return (first_pair + second_pair).to(x.dtype)
 
 
+def golden_hc_head_norm(x: torch.Tensor, pre_mix: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Collapse to BF16 and normalize with 64-lane FP32 accumulation and pairwise reduction."""
+    collapsed = golden_hc_collapse(x, pre_mix).bfloat16().float()
+    partial = torch.zeros((*collapsed.shape[:-1], 64), dtype=torch.float32, device=collapsed.device)
+    for begin in range(0, D, 64):
+        partial.add_(collapsed[..., begin:begin + 64].square())
+    while partial.shape[-1] > 1:
+        partial = partial[..., ::2] + partial[..., 1::2]
+    inverse = 1.0 / torch.sqrt(partial * (1.0 / D) + NORM_EPS)
+    return (collapsed * inverse * weight.float()).bfloat16()
+
+
 def golden_hc_post(
     sublayer: torch.Tensor,
     residual: torch.Tensor,
@@ -373,17 +344,35 @@ HC_INPUT_NAMES = ("x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_bas
 
 
 def make_hc_inputs(tokens, seed, case):
-    """HC inputs with distinct per-token magnitudes so both RMS statistics stay observable."""
+    """Seeded HC fixtures with V4.1 layer-1 attention weight statistics."""
     gen = torch.Generator().manual_seed(seed)
     magnitudes = (0.5 + torch.arange(tokens) % 4).reshape(-1, 1, 1)
     x_hc = (torch.randn(tokens, HC_MULT, D, generator=gen) * magnitudes).bfloat16().float()
+
+    # Per-row standard deviations and gate parameters from the V4.1 Flash 1017 checkpoint.
+    function_std = torch.tensor([
+        0.029376, 0.031490, 0.055490, 0.049310, 0.023323, 0.181760, 0.112393, 0.096347,
+        0.033303, 0.034775, 0.035849, 0.039710, 0.033325, 0.030450, 0.034318, 0.033540,
+        0.033511, 0.050113, 0.030742, 0.028955, 0.027775, 0.029948, 0.031218, 0.038125,
+    ])
+    scale = torch.tensor([0.070230, 0.019080, 0.172269])
+    base = torch.tensor([
+        -2.338990, 2.601740, -2.912670, -3.033931, -0.503342, -0.577662, -3.500769, -2.494710,
+        2.750622, -2.458451, -3.305034, -3.223911, -2.937424, 2.832767, -0.933163, -2.659624,
+        -2.655424, -1.275563, 2.152474, -3.270429, -2.550060, -2.554717, -2.587215, 2.604832,
+    ])
+
+    # Incoming gates use the preceding layer's FFN pre-gate weight statistics.
+    incoming_std = torch.tensor([0.041462, 0.027009, 0.054705, 0.025310]) * math.sqrt(HC_DIM) * 0.031293
+    incoming_base = torch.tensor([2.531060, -2.808948, -3.796850, -2.947976])
+    incoming_logits = torch.randn(tokens, HC_MULT, generator=gen) * incoming_std + incoming_base
     values = {
         "x_hc": x_hc,
-        "pre_mix": torch.sigmoid(torch.randn(tokens, HC_MULT, generator=gen)) + M.hc_eps,
-        "hc_attn_fn": torch.randn(MIX_HC, HC_DIM, generator=gen) / math.sqrt(HC_DIM),
-        "hc_attn_scale": torch.randn(3, generator=gen),
-        "hc_attn_base": torch.randn(MIX_HC, generator=gen),
-        "attn_norm_weight": (torch.randn(D, generator=gen) * 0.1 + 1).bfloat16(),
+        "pre_mix": torch.sigmoid(incoming_logits) + HC_EPS,
+        "hc_attn_fn": torch.randn(MIX_HC, HC_DIM, generator=gen) * function_std[:, None],
+        "hc_attn_scale": scale,
+        "hc_attn_base": base,
+        "attn_norm_weight": (torch.randn(D, generator=gen) * 0.001745 + 0.021617).bfloat16(),
     }
     if case == "zero":
         values["x_hc"] = torch.zeros_like(x_hc)
@@ -420,30 +409,13 @@ def build_l2_hc_pre_specs(batch: int = 33, sequence: int = 1):
     from golden import TensorSpec
 
     tokens = batch * sequence
-    generator = torch.Generator().manual_seed(3)
-    incoming_generator = torch.Generator().manual_seed(5)
-
-    def init_x_hc():
-        return torch.randn(tokens, HC_MULT, D, generator=generator)
-
-    def init_incoming_pre_mix():
-        return torch.sigmoid(torch.randn(tokens, HC_MULT, generator=incoming_generator)) + HC_EPS
-
-    def init_function():
-        return torch.randn(MIX_HC, HC_DIM, generator=generator) / math.sqrt(HC_DIM)
-
-    def init_scale():
-        return torch.randn(3, generator=generator)
-
-    def init_base():
-        return torch.randn(MIX_HC, generator=generator)
-
+    inputs = make_hc_inputs(tokens, seed=3, case="normal")
     return [
-        TensorSpec("x_hc", [tokens, HC_MULT, D], torch.float32, init_value=init_x_hc),
-        TensorSpec("incoming_pre_mix", [tokens, HC_MULT], torch.float32, init_value=init_incoming_pre_mix),
-        TensorSpec("function", [MIX_HC, HC_DIM], torch.float32, init_value=init_function),
-        TensorSpec("scale", [3], torch.float32, init_value=init_scale),
-        TensorSpec("base", [MIX_HC], torch.float32, init_value=init_base),
+        TensorSpec("x_hc", [tokens, HC_MULT, D], torch.float32, init_value=inputs["x_hc"]),
+        TensorSpec("incoming_pre_mix", [tokens, HC_MULT], torch.float32, init_value=inputs["pre_mix"]),
+        TensorSpec("function", [MIX_HC, HC_DIM], torch.float32, init_value=inputs["hc_attn_fn"]),
+        TensorSpec("scale", [3], torch.float32, init_value=inputs["hc_attn_scale"]),
+        TensorSpec("base", [MIX_HC], torch.float32, init_value=inputs["hc_attn_base"]),
         TensorSpec("output", [tokens, D], torch.bfloat16),
         TensorSpec("pre_mix", [tokens, HC_MULT], torch.float32),
         TensorSpec("post_mix", [tokens, HC_MULT], torch.float32),

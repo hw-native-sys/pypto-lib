@@ -19,7 +19,7 @@ from compressor import golden_c1a_compressor
 from compressor import golden_c2a_compressor
 from qkv_proj_rope import golden_qkv_proj_rope as qkv_proj_rope
 from qkv_proj_rope import golden_rope_interleave as rope_interleave
-from o_proj import golden_o_proj, golden_grouped_output, o_proj
+from o_proj import golden_o_proj, golden_grouped_output, o_proj_hc_post
 from qkv_proj_rope import golden_rope_tail
 from rmsnorm import golden_rms_norm
 from golden import TensorSpec
@@ -40,7 +40,7 @@ import pypto.language as pl
 from pypto.runtime import pto_isa_include_dir
 
 from config import (
-    FLASH as M, CMP_BLOCKS_DYN, MAX_BATCH_PER_DP, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, WINDOW_CACHE_BYTES,
+    FLASH as M, CMP_BLOCKS_DYN, DECODE_BATCH, ORI_BLOCKS_DYN, T_DYN, WINDOW_CACHE_BYTES,
     COMPRESSED_CACHE_BYTES,
 )
 
@@ -58,11 +58,12 @@ D = M.hidden_size
 Q_LORA = M.q_lora_rank
 ROPE_DIM = M.qk_rope_head_dim
 O_LORA = M.o_lora_rank
-LOCAL_O_GROUPS = M.o_groups // TP_SIZE
-LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+LOCAL_O_GROUPS = M.o_groups
+LOCAL_O_WIDTH = M.o_groups * M.o_lora_rank
 O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
 INDEX_TOPK = M.index_topk
-LOCAL_H = M.num_attention_heads // TP_SIZE
+HC_MULT = M.hc_mult
+LOCAL_H = M.num_attention_heads
 WINDOW_KEYS = M.sliding_window
 SELECTED_KEYS = WINDOW_KEYS + INDEX_TOPK
 SCALE = HEAD_DIM**-0.5
@@ -74,7 +75,7 @@ SWA_SCALE_BYTES = SWA_GROUPS * 2
 CUBE_HEADS = max(16, LOCAL_H)
 HEAD_TILE = min(32, CUBE_HEADS)
 QUERY_HEAD_TILE = min(16, LOCAL_H)
-KEY_TILE = 320 if TP_SIZE == 1 else 128
+KEY_TILE = 320
 GATHER_KEY_TILE = 32
 TOKEN_TILE = 512
 WORKERS = 32
@@ -85,18 +86,18 @@ SHARED_GATHER_WORKERS = 64
 CACHE_MAX_ROWS = 32768
 PACKED_QUERY_TILE = 32
 PACKED_COHORT_TILE = 24
-PACKED_HEAD_TILE = min(32, CUBE_HEADS) if TP_SIZE == 1 else 16
-PACKED_KEY_TILE = 128 if TP_SIZE == 1 else 64
-PACKED_ATTEND_SLOT_TILE = 1 if TP_SIZE == 1 else 2
+PACKED_HEAD_TILE = min(32, CUBE_HEADS)
+PACKED_KEY_TILE = 128
+PACKED_ATTEND_SLOT_TILE = 1
 PACKED_KEY_PARTS = SELECTED_KEYS // PACKED_KEY_TILE
 
 
 # SWA tiling.
-SWA_HEAD_TILE = min(64 if TP_SIZE == 1 else 32, max(16, LOCAL_H))
+SWA_HEAD_TILE = min(64, max(16, LOCAL_H))
 # Leave Vector space for the value-preserving query startup before QK.
 SWA_SHARED_HEAD_TILE = min(32, max(16, LOCAL_H))
 SWA_GATHER_TILE = 32
-SWA_SELECTED_GATHER_TILE = 64 if TP_SIZE == 1 else SWA_GATHER_TILE
+SWA_SELECTED_GATHER_TILE = 64
 SWA_WORKER_TILE = 32
 SWA_CROSS_CORE_SLOT_TILE = 1
 SWA_RUN_TILE = 32
@@ -187,8 +188,6 @@ def gather_window_batched(
                     if pl.tile.read(ids, [0, lane]) < 0:
                         pl.tile.store(zero, [token * SWA_WINDOW + column + lane, 0], dst)
     return gathered
-
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -322,8 +321,6 @@ def decode_shared_cache(
             decoded = pl.reshape(decoded_bf16, [SWA_GATHER_TILE, HEAD_DIM])
             pl.tile.store(decoded, [row, 0], decoded_flat)
     return ready
-
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -666,10 +663,6 @@ def swa_attention(
     return output
 
 
-
-
-
-
 @pl.jit(auto_scope=False)
 def l2_sparse_attention_swa(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -681,8 +674,6 @@ def l2_sparse_attention_swa(
 ):
     output = swa_attention(query, cache, indices, sink, output, num_tokens)
     return output
-
-
 
 
 SWA_INPUT_NAMES = (
@@ -757,7 +748,7 @@ def swa_official_reference(tensors, *, shared_cache=False, key_tile=128):
     return output, cache, cache_scale
 
 
-def make_swa_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
+def make_swa_inputs(batch=DECODE_BATCH, seed=17, position=127):
     """Distinct request pages, ragged visibility, nontrivial scales and rotary phases."""
     from quant import pack_fp8_nz
     gen = torch.Generator().manual_seed(seed)
@@ -799,8 +790,8 @@ def make_swa_inputs(batch=MAX_BATCH_PER_DP, seed=17, position=127):
 
 
 def make_packed_swa_inputs(tokens=257, requests=4, seed=17, case="mixed", start_pos=None, query_lens=None):
-    if not 1 <= requests <= min(MAX_BATCH_PER_DP, tokens):
-        raise ValueError(f"requests must be in [1, min({MAX_BATCH_PER_DP}, tokens)]")
+    if requests < 1 or tokens < 1:
+        raise ValueError("requests and tokens must be positive")
     values = make_swa_inputs(1, seed=seed)
     gen = torch.Generator().manual_seed(seed + 1000)
     lengths = torch.tensor(packed_query_lengths(tokens, requests, query_lens), dtype=torch.int64)
@@ -1071,36 +1062,6 @@ def gather_sparse_attention(
     return attended
 
 
-@pl.jit.inline(auto_scope=False)
-def _attend_window_project(
-    query: pl.Tensor,
-    window_indices: pl.Tensor,
-    window: pl.Tensor,
-    sink: pl.Tensor,
-    wo_a: pl.Tensor,
-    wo_a_scale: pl.Tensor,
-    wo_b: pl.Tensor,
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor,
-    rope_sin: pl.Tensor,
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    source_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Attend a published window cache and project its active query prefix."""
-    total_rows = pl.tensor.dim(output, 0)
-    attended = pl.create_tensor([total_rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    swa_attention_partial(query, window, window_indices, sink, attended, num_tokens, source_ready)
-    output = o_proj(
-        attended,
-        wo_a, wo_a_scale, wo_b, wo_b_scale,
-        rope_cos, rope_sin,
-        output, num_tokens,
-        oa_row_tile=80, ob_row_tile=80,
-    )
-    return output
-
-
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "gather_packed.cpp",
                include_dirs=(pto_isa_include_dir(),))
 def _gather_packed_rows(
@@ -1360,8 +1321,7 @@ def make_attend_selected_chunk(*, vector_query=False, selected_rows=PACKED_QUERY
         key_flat = pl.reshape(selected, [selected_rows * SELECTED_KEYS, HEAD_DIM])
         attend_tasks = active * (LOCAL_H // PACKED_HEAD_TILE)
         workers = attend_tasks
-        if TP_SIZE == 1:
-            workers = pl.min(attend_tasks, max_workers)
+        workers = pl.min(attend_tasks, max_workers)
         if sync_start:
             workers = pl.min(workers, pl.system.available_cluster_count())
         # Direct-Q Cube transfers require ownership of the paired Vector UB.
@@ -1441,9 +1401,6 @@ def _attend_cube(
             head = block % ((CUBE_HEADS + HEAD_TILE - 1) // HEAD_TILE) * HEAD_TILE
             q0 = token * CUBE_HEADS + head
             q = qflat[q0:q0 + HEAD_TILE, :]
-            if TP_SIZE != 1:
-                # Retain the Vector startup workaround outside the validated TP1 path.
-                q = pl.cast(pl.cast(q, pl.FP32), pl.BF16, mode="rint")
             maximum = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=-1e30)
             denominator = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
             numerator = pl.full([HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
@@ -1498,7 +1455,7 @@ def _attend_padded(
     num_tokens: pl.Scalar[pl.INT32],
     selected_ready: pl.Scalar[pl.TASK_ID],
 ):
-    # Cube uses at least 16 rows. TP8 retains only its eight real heads.
+    # Cube tiles pad the head dimension to at least 16 rows.
     rows = pl.tensor.dim(query, 0)
     qflat = pl.reshape(query, [rows * LOCAL_H, HEAD_DIM])
     padded_query = pl.create_tensor([rows, CUBE_HEADS * HEAD_DIM], dtype=pl.BF16)
@@ -1537,7 +1494,7 @@ def _attend_padded(
 
 
 attend_selected = _attend_cube if LOCAL_H >= 16 else _attend_padded
-attend_c2a_chunk = make_attend_selected_chunk(vector_query=TP_SIZE != 1)
+attend_c2a_chunk = make_attend_selected_chunk(vector_query=False)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1808,7 +1765,7 @@ def attend_packed(
                 compressed, sink, output, num_tokens, ready,
             )
         else:
-            if TP_SIZE == 1 and num_tokens <= 12:
+            if num_tokens <= 12:
                 ready = attend_packed_cohorts(
                     query, window_indices, window, compressed_indices,
                     compressed, sink, output, num_tokens, ready,
@@ -2496,7 +2453,7 @@ def golden_compressed_attention(
 
 
 @pl.jit(auto_scope=False)
-def l2_attend_project(
+def l2_attend_project_hc_post(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
@@ -2509,7 +2466,10 @@ def l2_attend_project(
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
+    output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     source_ready = pl.system.task_dummy(deps=[])
@@ -2519,18 +2479,18 @@ def l2_attend_project(
         query, window_indices, window, compressed_indices, compressed,
         sink, attended, num_tokens, source_ready,
     )
-    o_proj(
+    o_proj_hc_post(
         attended,
         wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin,
-        output, num_tokens,
-        oa_row_tile=80, ob_row_tile=80,
+        residual, post_mix, residual_mix, output, num_tokens,
+        oa_row_tile=80, ob_row_tile=128,
     )
     return output
 
 
 @pl.jit(auto_scope=False)
-def l2_attend_window_project(
+def l2_attend_window_project_hc_post(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     window_indices: pl.Tensor[[T_DYN, WINDOW_KEYS], pl.INT32],
     window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
@@ -2541,14 +2501,20 @@ def l2_attend_window_project(
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
+    output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     source_ready = pl.system.task_dummy(deps=[])
-    output = _attend_window_project(
-        query, window_indices, window, sink,
-        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        output, num_tokens, source_ready,
+    rows = pl.tensor.dim(output, 0)
+    attended = pl.create_tensor([rows, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
+    swa_attention_partial(query, window, window_indices, sink, attended, num_tokens, source_ready)
+    o_proj_hc_post(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        residual, post_mix, residual_mix, output, num_tokens,
+        oa_row_tile=80, ob_row_tile=128,
     )
     return output
 
@@ -2556,7 +2522,7 @@ def l2_attend_window_project(
 def build_attend_project_specs(rows, active, *, compressed):
     """Build packed-cache fixtures with poisoned inactive rows and shared projection weights."""
     from golden import ScalarSpec
-    from o_proj import build_o_proj_specs
+    from o_proj import build_o_proj_hc_post_specs
 
     values = {}
 
@@ -2594,7 +2560,7 @@ def build_attend_project_specs(rows, active, *, compressed):
     shapes.append(("sink", [LOCAL_H], torch.float32))
     specs = [TensorSpec(name, shape, dtype, init_value=lambda name=name: inputs()[name])
              for name, shape, dtype in shapes]
-    projection = build_o_proj_specs(rows, pad_to_tile=False)
+    projection = build_o_proj_hc_post_specs(rows, pad_to_tile=False)
     specs += [spec for spec in projection if spec.name not in ("attended", "num_tokens")]
     return specs + [ScalarSpec("num_tokens", torch.int32, active, compile_runtime=True)]
 
@@ -2602,8 +2568,11 @@ def build_attend_project_specs(rows, active, *, compressed):
 def golden_attend_project(tensors):
     """Compose sparse-attention and output-projection references with BF16 rounding."""
     active = int(tensors["num_tokens"])
-    tensors["output"].zero_()
+    from hc import golden_hc_post
+
+    projection = torch.zeros_like(tensors["residual"][:, 0, :], dtype=torch.bfloat16)
     if active == 0:
+        tensors["output"].copy_(golden_hc_post(projection, tensors["residual"], tensors["post_mix"], tensors["residual_mix"]))
         return
     query = tensors["query"][:active].unflatten(-1, (LOCAL_H, HEAD_DIM))
     window = dequantize_mxfp8_cache(*unpack_quantized_cache(tensors["window"], False)).bfloat16()
@@ -2619,12 +2588,15 @@ def golden_attend_project(tensors):
         tensors["wo_a"], tensors["wo_b"], tensors["wo_b_scale"],
         wo_a_scale=tensors["wo_a_scale"], output_dtype=torch.bfloat16, sequential_projection=True,
     )
-    tensors["output"][:active].copy_(projected)
+    projection[:active].copy_(projected)
+    tensors["output"].copy_(golden_hc_post(projection, tensors["residual"], tensors["post_mix"], tensors["residual_mix"]))
 
 
 def validate_attend_project(args):
-    """Validate production projection branches, 80-row boundaries and zero-filled inactive groups."""
+    """Validate fused attention projection and HC post across active-row boundaries."""
+    import functools
     from golden import ratio_allclose, run
+    from o_proj import compare_o_proj_hc_post
 
     cases = [(17, 13), (96, 81), (96, 72)]
     if args.rows is not None:
@@ -2633,14 +2605,16 @@ def validate_attend_project(args):
     records = []
     for mode in modes:
         compressed = mode == "project-packed"
-        entry = l2_attend_project if compressed else l2_attend_window_project
+        entry = l2_attend_project_hc_post if compressed else l2_attend_window_project_hc_post
         for rows, active in cases:
             print(f"[ATTEND_PROJECT] {mode}: capacity={rows}, active={active}, local_heads={LOCAL_H}", flush=True)
             result = run(
                 entry,
                 build_attend_project_specs(rows, active, compressed=compressed),
                 golden_fn=golden_attend_project,
-                compare_fn={"output": ratio_allclose(atol=1e-2, rtol=1.0 / 128, valid_rows=active, zero_tail=True)},
+                compare_fn={
+                    "output": functools.partial(compare_o_proj_hc_post, compare=ratio_allclose(atol=1e-2, rtol=1.0 / 128)),
+                },
                 config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
                 compile_only=args.compile_only,
             )
@@ -2650,7 +2624,6 @@ def validate_attend_project(args):
             status = "COMPILE_ONLY" if args.compile_only else "SIM_VALIDATED" if args.execution_mode else "DEVICE_VALIDATED"
             print(status, mode, f"rows={rows} active={active}", result.work_dir)
     return records
-
 
 
 if __name__ == "__main__":
@@ -2668,7 +2641,6 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4, 8])
     rows_help = "single row count; gather and projection default to boundary cases, sparse MLA to 72"
     parser.add_argument("--rows", type=int, help=rows_help)
     mode_choices = ["gather", "packed", "bf16", "both", "c2a", "swa",
@@ -2679,10 +2651,6 @@ if __name__ == "__main__":
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--runtime-dir", type=str)
     args = parser.parse_args()
-    if args.tp != TP_SIZE:
-        raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
-    if args.mode == "c2a" and TP_SIZE != 1:
-        parser.error("C2A standalone validation requires --tp 1")
     if args.mode in ("swa", "all") and (args.fixture or args.runtime_dir):
         raise ValueError("--fixture and --runtime-dir require a sparse MLA mode: packed, bf16 or c2a")
     if args.runtime_dir and args.mode == "both":
@@ -2726,14 +2694,14 @@ if __name__ == "__main__":
             else:
                 query = fixture["q"]
                 if list(query.shape) != [rows, LOCAL_H, HEAD_DIM]:
-                    raise ValueError("Fixture query shape does not match --rows and --tp")
+                    raise ValueError("Fixture query shape does not match --rows and attention heads")
                 window, compressed = fixture["w"], fixture["c"]
                 window_indices, compressed_indices = fixture["wi"], fixture["ci"]
                 sink, extents = fixture["sink"], fixture["extents"]
                 wp, ws, cp, cs = fixture["wp"], fixture["ws"], fixture["cp"], fixture["cs"]
 
             modes = ["packed", "bf16"] if args.mode in ("both", "all") else [args.mode]
-            if args.mode == "all" and TP_SIZE == 1:
+            if args.mode == "all":
                 modes.append("c2a")
             for mode in modes:
                 reference_mode = "packed" if mode == "c2a" else mode

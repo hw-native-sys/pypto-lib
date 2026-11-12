@@ -16,6 +16,9 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import config as C
 
+if C.EP_SIZE % C.LM_HEAD_TP_SIZE:
+    raise ValueError("EP must be divisible by LM head TP")
+
 _shape_parser = argparse.ArgumentParser(add_help=False)
 _default_experts = C.FLASH.n_routed_experts // C.EP_SIZE if C.EP_SIZE in (4, 8) else 64
 _shape_parser.add_argument("--experts-per-rank", type=int, default=_default_experts)
@@ -30,7 +33,7 @@ if WEIGHT_BANK_SIZE not in (1, C.FLASH.num_hidden_layers):
 
 
 from config import (
-    FLASH as M, B_DYN, LOCAL_T_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, DECODE_MAX_TOKENS,
+    FLASH as M, LM_HEAD_TP_SIZE, B_DYN, Q_START_DYN, ROUTE_T_DYN, T_DYN, BLOCK_SIZE, DECODE_MAX_TOKENS,
     DECODE_INPUT_MAX_TOKENS, INDEX_CACHE_GROUP, STATE_CAPACITY, MOE_TOKENS, DSPARK_DRAFT_LAYERS,
     DSPARK_LAST_TARGET_LAYER, DSPARK_TARGET_LAYER_IDS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
@@ -90,22 +93,22 @@ FIXTURE_SEQUENCE = 6
 FIXTURE_TOKENS = FIXTURE_BATCH * FIXTURE_SEQUENCE
 
 
-FWD_ORI_BLOCKS_DYN = pl.dynamic("V41_FWD_ORI_BLOCKS_DYN")
-FWD_CMP_BLOCKS_DYN = pl.dynamic("V41_FWD_CMP_BLOCKS_DYN")
-FWD_INDEX_BLOCKS_DYN = pl.dynamic("V41_FWD_INDEX_BLOCKS_DYN")
-FWD_STATE_BLOCKS_DYN = pl.dynamic("V41_FWD_STATE_BLOCKS_DYN")
-FWD_C2A_TABLE_DYN = pl.dynamic("V41_FWD_C2A_TABLE_DYN")
-FWD_C1A_TABLE_DYN = pl.dynamic("V41_FWD_C1A_TABLE_DYN")
+FWD_ORI_BLOCKS_DYN = pl.dynamic("FWD_ORI_BLOCKS_DYN")
+FWD_CMP_BLOCKS_DYN = pl.dynamic("FWD_CMP_BLOCKS_DYN")
+FWD_INDEX_BLOCKS_DYN = pl.dynamic("FWD_INDEX_BLOCKS_DYN")
+FWD_STATE_BLOCKS_DYN = pl.dynamic("FWD_STATE_BLOCKS_DYN")
+FWD_C2A_TABLE_DYN = pl.dynamic("FWD_C2A_TABLE_DYN")
+FWD_C1A_TABLE_DYN = pl.dynamic("FWD_C1A_TABLE_DYN")
 
 
 @pl.jit.inline(auto_scope=False)
 def decode_encoder(
-    engram_lookup: pl.Tensor[[2, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
+    engram_lookup: pl.Tensor[[2, T_DYN, ENGRAM_K], pl.BF16],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
-    x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    x_hc: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    pre_mix: pl.InOut[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     hc_attn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
@@ -185,14 +188,14 @@ def decode_encoder(
     shared_w2_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0],
     shared_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
 ) -> tuple[
-    pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
     pl.Tensor[[DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], pl.FP32],
 ]:
     attention_count = pl.read(attention_num_tokens, [rank])
-    x_hc.bind_dynamic(0, LOCAL_T_DYN)
-    pre_mix.bind_dynamic(0, LOCAL_T_DYN)
+    x_hc.bind_dynamic(0, T_DYN)
+    pre_mix.bind_dynamic(0, T_DYN)
     window_cache_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
@@ -205,13 +208,12 @@ def decode_encoder(
     position_ids.bind_dynamic(0, T_DYN)
     freqs_cos.bind_dynamic(1, ROPE_ROWS_DYN)
     freqs_sin.bind_dynamic(1, ROPE_ROWS_DYN)
-    global_tokens = pl.tensor.dim(position_ids, 0)
-    compressed_token_rope_cos = pl.slice(token_rope_cos, [global_tokens, ROPE_DIM // 2], [0, 0])
-    compressed_token_rope_sin = pl.slice(token_rope_sin, [global_tokens, ROPE_DIM // 2], [0, 0])
-    base_rope_cos = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
-    base_rope_sin = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
-    c2a_rope_cos = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
-    c2a_rope_sin = pl.create_tensor([global_tokens, ROPE_DIM // 2], dtype=pl.FP32)
+    compressed_token_rope_cos = pl.slice(token_rope_cos, [tokens, ROPE_DIM // 2], [0, 0])
+    compressed_token_rope_sin = pl.slice(token_rope_sin, [tokens, ROPE_DIM // 2], [0, 0])
+    base_rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+    base_rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+    c2a_rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
+    c2a_rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
     materialize_rope_rows(
         freqs_cos[0], freqs_sin[0], position_ids, attention_count, base_rope_cos, base_rope_sin, False,
         worker_limit=32,
@@ -225,7 +227,7 @@ def decode_encoder(
         freqs_cos[1], freqs_sin[1], position_ids, attention_count, c2a_rope_cos, c2a_rope_sin, True,
         worker_limit=32,
     )
-    c2a_compressed_lens = pl.create_tensor([global_tokens], dtype=pl.INT32)
+    c2a_compressed_lens = pl.create_tensor([tokens], dtype=pl.INT32)
     prepare_compressed_lens(position_ids, c2a_compressed_lens, 1)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
     compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
@@ -233,7 +235,7 @@ def decode_encoder(
     state_blocks_per_source = pl.tensor.dim(state_cache_pool, 0) // C2A_SOURCE_COUNT
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
-    topk_indices = pl.create_tensor([global_tokens, INDEX_TOPK], dtype=pl.INT32)
+    topk_indices = pl.create_tensor([tokens, INDEX_TOPK], dtype=pl.INT32)
     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
     for layer in pl.range(0, 20):
@@ -392,9 +394,9 @@ def decode_encoder(
 
 @pl.jit.inline(auto_scope=False)
 def decode_decoder(
-    x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    dspark_target_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, DSPARK_MAIN_IN], pl.BF16]],
+    x_hc: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    pre_mix: pl.InOut[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[T_DYN, DSPARK_MAIN_IN], pl.BF16]],
     hc_attn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
@@ -473,9 +475,9 @@ def decode_decoder(
     shared_w3_scale: pl.Tensor[[WEIGHT_BANK_SIZE * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0],
 ):
     attention_count = pl.read(attention_num_tokens, [rank])
-    x_hc.bind_dynamic(0, LOCAL_T_DYN)
-    pre_mix.bind_dynamic(0, LOCAL_T_DYN)
-    dspark_target_hidden.bind_dynamic(0, LOCAL_T_DYN)
+    x_hc.bind_dynamic(0, T_DYN)
+    pre_mix.bind_dynamic(0, T_DYN)
+    dspark_target_hidden.bind_dynamic(0, T_DYN)
     window_cache_pool.bind_dynamic(0, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(0, FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(0, FWD_INDEX_BLOCKS_DYN)
@@ -486,21 +488,20 @@ def decode_decoder(
     state_cache_pool.bind_dynamic(0, FWD_STATE_BLOCKS_DYN)
     tokens = pl.tensor.dim(x_hc, 0)
     position_ids.bind_dynamic(0, T_DYN)
-    global_tokens = pl.tensor.dim(position_ids, 0)
-    compressed_token_rope_cos = pl.slice(token_rope_cos, [global_tokens, ROPE_DIM // 2], [0, 0])
-    compressed_token_rope_sin = pl.slice(token_rope_sin, [global_tokens, ROPE_DIM // 2], [0, 0])
-    c1a_compressed_lens = pl.create_tensor([global_tokens], dtype=pl.INT32)
+    compressed_token_rope_cos = pl.slice(token_rope_cos, [tokens, ROPE_DIM // 2], [0, 0])
+    compressed_token_rope_sin = pl.slice(token_rope_sin, [tokens, ROPE_DIM // 2], [0, 0])
+    c1a_compressed_lens = pl.create_tensor([tokens], dtype=pl.INT32)
     prepare_compressed_lens(position_ids, c1a_compressed_lens, 0)
     window_blocks_per_layer = pl.tensor.dim(window_cache_pool, 0) // N_LAYERS
     compressed_blocks_per_source = pl.tensor.dim(compressed_cache_pool, 0) // KV_SOURCE_COUNT
     index_blocks_per_source = pl.tensor.dim(index_cache_pool, 0) // KV_SOURCE_COUNT
     attention_hidden = pl.create_tensor([tokens, HC_MULT, D], dtype=pl.FP32)
     attention_pre_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
-    topk_indices = pl.create_tensor([global_tokens, INDEX_TOPK], dtype=pl.INT32)
+    topk_indices = pl.create_tensor([tokens, INDEX_TOPK], dtype=pl.INT32)
     pool_blocks_raw = pl.tensor.dim(c1a_index_block_table, 1) * (BLOCK_SIZE // CANDIDATE_BLOCK_SIZE)
     pool_block_capacity = pl.min(CANDIDATE_TOPK_BLOCKS, pl.max(32, (pool_blocks_raw + 31) // 32 * 32))
-    pool_block_ids = pl.create_tensor([global_tokens, pool_block_capacity], dtype=pl.INT32)
-    pool_block_counts = pl.create_tensor([global_tokens], dtype=pl.INT32)
+    pool_block_ids = pl.create_tensor([tokens, pool_block_capacity], dtype=pl.INT32)
+    pool_block_counts = pl.create_tensor([tokens], dtype=pl.INT32)
     x_mixed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     local_moe_tokens = pl.read(moe_num_tokens, [rank])
     for layer in pl.range(20, 40):
@@ -669,13 +670,13 @@ def decode_decoder(
 
 @pl.jit(auto_scope=False)
 def l2_decode_fwd(
-    engram_lookup: pl.Tensor[[2, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
+    engram_lookup: pl.Tensor[[2, T_DYN, ENGRAM_K], pl.BF16],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[2, HC_MULT, D], pl.FP32],
-    x_hc: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    pre_mix: pl.InOut[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    dspark_target_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, DSPARK_MAIN_IN], pl.BF16]],
+    x_hc: pl.InOut[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    pre_mix: pl.InOut[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[T_DYN, DSPARK_MAIN_IN], pl.BF16]],
     hc_attn_fn: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[WEIGHT_BANK_SIZE * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
@@ -760,9 +761,9 @@ def l2_decode_fwd(
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     sampled_ids: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[1, 1], pl.INT32],
+    hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[1, 1], pl.INT32],
+    logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
 ):
     compressed_token_rope_cos = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_token_rope_sin = pl.create_tensor([DECODE_INPUT_MAX_TOKENS, ROPE_DIM // 2], dtype=pl.FP32)
@@ -838,20 +839,20 @@ def l2_decode_fwd(
         result, encoder_pre_mix, final_norm_weight, lm_head_weight,
         logit_row_indices, logits, sampled_ids,
         hidden_window, hidden_done, logits_window, logits_done,
-        rank, 0, 1, 1,
+        rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, rank % LM_HEAD_TP_SIZE, 1, 1,
     )
     return final_logits, final_sampled_ids
 
 
 @pl.jit.host
 def l3_decode_fwd(
-    engram_lookup: pl.Tensor[[EP_SIZE, 2, LOCAL_T_DYN, ENGRAM_K], pl.BF16],
+    engram_lookup: pl.Tensor[[EP_SIZE, 2, T_DYN, ENGRAM_K], pl.BF16],
     engram_wkv: pl.Tensor[[EP_SIZE, 2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[EP_SIZE, 2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
     engram_weight: pl.Tensor[[EP_SIZE, 2, HC_MULT, D], pl.FP32],
-    x_hc: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    pre_mix: pl.InOut[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
-    dspark_target_hidden: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, DSPARK_MAIN_IN], pl.BF16]],
+    x_hc: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN, HC_MULT, D], pl.FP32]],
+    pre_mix: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN, HC_MULT], pl.FP32]],
+    dspark_target_hidden: pl.Out[pl.Tensor[[EP_SIZE, T_DYN, DSPARK_MAIN_IN], pl.BF16]],
     hc_attn_fn: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[EP_SIZE, WEIGHT_BANK_SIZE * MIX_HC], pl.FP32],
@@ -975,8 +976,8 @@ def l3_decode_fwd(
     has three source slices, each with caller-owned request slots. Native
     prefill caches alias these pools by flattening their source/page dimensions.
 
-    attention_num_tokens is per rank; TP peers supply equal group counts.
-    TP1 uses padded 80-row local x_hc/pre_mix slabs, with up to 72 active rows.
+    attention_num_tokens is the active row count on each independent attention rank.
+    Decode uses padded 80-row local x_hc/pre_mix slabs, with up to 72 active rows.
     Idle ranks use zero counts, -1 publication slots and empty query ranges;
     they still participate in EP collectives. Each new token starts from its
     embedding and identity pre-mix. After layer 39, final HC collapse and
@@ -992,9 +993,9 @@ def l3_decode_fwd(
     Reset a reused request slot in all C2A sources after its users complete. Restore or reset mutated state before retrying failed
     calls. Engram consumes host lookup rows; vision and DSpark require no inputs here.
     """
-    x_hc.bind_dynamic(1, LOCAL_T_DYN)
-    pre_mix.bind_dynamic(1, LOCAL_T_DYN)
-    dspark_target_hidden.bind_dynamic(1, LOCAL_T_DYN)
+    x_hc.bind_dynamic(1, T_DYN)
+    pre_mix.bind_dynamic(1, T_DYN)
+    dspark_target_hidden.bind_dynamic(1, T_DYN)
     window_cache_pool.bind_dynamic(1, FWD_ORI_BLOCKS_DYN)
     compressed_cache_pool.bind_dynamic(1, FWD_CMP_BLOCKS_DYN)
     index_cache_pool.bind_dynamic(1, FWD_INDEX_BLOCKS_DYN)
@@ -1022,9 +1023,9 @@ def l3_decode_fwd(
         [EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], dtype=pl.INT32
     )
     head_hidden_buffer = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    head_hidden_done_buffer = pld.alloc_window_buffer([1, 1], dtype=pl.INT32)
+    head_hidden_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     head_logits_buffer = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-    head_logits_done_buffer = pld.alloc_window_buffer([1, 1], dtype=pl.INT32)
+    head_logits_done_buffer = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buffer, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buffer, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
@@ -1047,9 +1048,9 @@ def l3_decode_fwd(
             dtype=pl.INT32,
         )
         head_hidden = pld.window(head_hidden_buffer, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        head_hidden_done = pld.window(head_hidden_done_buffer, [1, 1], dtype=pl.INT32)
+        head_hidden_done = pld.window(head_hidden_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         head_logits = pld.window(head_logits_buffer, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-        head_logits_done = pld.window(head_logits_done_buffer, [1, 1], dtype=pl.INT32)
+        head_logits_done = pld.window(head_logits_done_buffer, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         l2_decode_fwd(
             engram_lookup[rank], engram_wkv[rank], engram_wkv_scale[rank], engram_weight[rank],
             x_hc[rank], pre_mix[rank], dspark_target_hidden[rank],
@@ -1118,9 +1119,8 @@ def _fixture_extent(dim):
     name = repr(dim)
     extents = {
         "ROPE_ROWS_DYN": FIXTURE_SEQUENCE,
-        "LOCAL_T_DYN": MOE_TOKENS,
         "Q_START_DYN": FIXTURE_BATCH + 1,
-        "T_DYN": FIXTURE_TOKENS,
+        "T_DYN": MOE_TOKENS,
         "FWD_ORI_BLOCKS_DYN": N_LAYERS * FIXTURE_BATCH,
         "FWD_CMP_BLOCKS_DYN": KV_SOURCE_COUNT * FIXTURE_BATCH,
         "FWD_INDEX_BLOCKS_DYN": KV_SOURCE_COUNT * FIXTURE_BATCH,
@@ -1136,7 +1136,7 @@ def _fixture_extent(dim):
 
 
 def build_tensor_specs():
-    """Build the TP1 twelve-request decode smoke fixture."""
+    """Build the twelve-request decode smoke fixture."""
     from golden import TensorSpec
     from decode_moe import _route_bias
 
@@ -1156,6 +1156,13 @@ def build_tensor_specs():
         slots = paged_slots(position_ids, request_ids, table, BLOCK_SIZE, ratio, True)
         metadata_rows[family + "_compressed_slots"] = slots
         metadata_rows[family + "_index_block_table"] = table
+    for name in ("window_slots", "window_indices", "c2a_compressed_slots", "c1a_compressed_slots"):
+        value = metadata_rows[name]
+        padded = torch.full((MOE_TOKENS, *value.shape[1:]), -1, dtype=value.dtype)
+        padded[:FIXTURE_TOKENS] = value
+        metadata_rows[name] = padded
+    request_ids = torch.nn.functional.pad(request_ids, (0, MOE_TOKENS - FIXTURE_TOKENS), value=-1)
+    position_ids = torch.nn.functional.pad(position_ids, (0, MOE_TOKENS - FIXTURE_TOKENS), value=-1)
     for name in l3_decode_fwd.param_names:
         annotation = signature.parameters[name].annotation
         shape = [_fixture_extent(dim) for dim in annotation.shape]
@@ -1202,7 +1209,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("--tp", type=int, default=C.TP_SIZE, choices=[1])
+    parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=C.SUPPORTED_LM_HEAD_TP_SIZES)
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--dp", type=int, default=C.DP_SIZE, choices=[2, 4, 8])
     parser.add_argument("--experts-per-rank", type=int, default=N_LOCAL_EXPERTS, help="routed experts on each EP rank")
@@ -1215,12 +1222,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.execution_mode:
         parser.error("this forward entry requires hardware; --sim is unsupported")
-    if (args.tp, args.ep, args.dp, args.experts_per_rank) != (C.TP_SIZE, EP_SIZE, C.DP_SIZE, N_LOCAL_EXPERTS):
-        parser.error("--tp/--ep/--dp/--experts-per-rank must match the import-time configuration")
+    if (args.ep, args.dp, args.experts_per_rank) != (EP_SIZE, C.DP_SIZE, N_LOCAL_EXPERTS):
+        parser.error("--ep/--dp/--experts-per-rank must match the import-time configuration")
     if args.weight_bank_size != WEIGHT_BANK_SIZE:
         parser.error("--weight-bank-size must match the import-time configuration")
-    if args.tp != 1:
-        parser.error("the decode_fwd smoke fixture requires --tp 1")
     devices = [int(device) for device in args.device.split(",") if device]
     if len(devices) != EP_SIZE or len(set(devices)) != EP_SIZE:
         parser.error(f"need exactly {EP_SIZE} distinct devices, got {devices}")
