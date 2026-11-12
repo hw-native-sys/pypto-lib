@@ -42,7 +42,7 @@ from expert_routed import (
     dispatch,
     MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS, expert_routed_scatter,
 )
-from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
+from hc import hc_pre, hc_normalize, hc_post
 
 
 # model config
@@ -184,9 +184,12 @@ def moe(
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([t, D], dtype=pl.BF16)
-    hc_head_norm_store(x_hc, pre_mix, norm_weight, x_norm, x_mixed, num_tokens, worker_limit=64)
-    inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=64)
-    mixes_ready = hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+    mixes_ready = hc_pre(
+        x_hc, pre_mix,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        x_mixed, next_pre_mix, post_mix, residual_mix,
+    )
+    hc_normalize(x_mixed, norm_weight, x_norm, num_tokens)
 
     # MoE transport and routed-result scope.
     with pl.scope():

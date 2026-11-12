@@ -51,7 +51,7 @@ from expert_routed import (
     expert_routed_scatter,
 )
 from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
-from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
+from hc import hc_pre, hc_normalize, hc_post
 from input_pack import gather_rows
 
 
@@ -392,9 +392,12 @@ def prefill_moe(
     post_mix = pl.create_tensor([t, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([t, HC_MULT, HC_MULT], dtype=pl.FP32)
     ffn_input = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
-    hc_head_norm_store(x_hc, pre_mix, norm_weight, ffn_input, x_mixed, num_tokens, worker_limit=64)
-    inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=64)
-    mixes_ready = hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
+    mixes_ready = hc_pre(
+        x_hc, pre_mix,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        x_mixed, next_pre_mix, post_mix, residual_mix,
+    )
+    hc_normalize(x_mixed, norm_weight, ffn_input, num_tokens)
 
     # MoE transport and routed-result scope.
     with pl.scope():
