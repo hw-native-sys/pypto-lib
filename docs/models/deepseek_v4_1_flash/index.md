@@ -74,6 +74,46 @@ Attention entries own chunk scheduling and dependencies around that shared
 implementation. MoE dispatches local token rows to EP expert owners and combines
 the results back into the local HC state.
 
+## C2A compression and cache epilogue
+
+Full C2A layers use two independently callable operators in both decode and
+prefill:
+
+- `compressor.c2a_compressor` projects KV and gate values in FP32, applies pair
+  softmax pooling, stores BF16 pooled rows, and updates the FP32 request ring.
+  It returns a completion dependency and writes caller-owned pooled rows and
+  eligible publication slots. Inactive padding remains untouched.
+- `compressor_epilogue.compressor_epilogue` fuses RMSNorm, the pre-RoPE latent
+  output used by Index-K, partial interleaved RoPE, group-16 MXFP4 quantization,
+  and scatter into the 320-byte compressed-cache rows. C1A uses the same
+  epilogue with its nearest-even tie convention; C2A retains its existing
+  quantization convention and BF16 scale encoding.
+
+The compressor uses one mixed Cube/vector task. Each row/channel tile reuses
+input panels for paired KV/gate projection and pools its own projected rows.
+A unique owner for each physical state block and channel slice handles
+historical first rows and request-ordered ring writes. Boundary and remote
+state-support rows are projected locally when required, so tiles only
+synchronize within their own Cube/vector group. Logical worker counts use
+the runtime's available cluster count and do not require a fixed core count.
+
+The epilogue assigns each cache slot to one worker, which preserves input-order
+last-writer behavior for duplicate slots. Vector selection compacts the owned
+token indices. Small batches use 16 logical owners and larger batches use 64;
+these are work shards that can run in waves on the available vector cores.
+Separate normalized and rotary UB buffers overlap latent writes
+with RoPE and quantization; payload and scales are published together as one
+320-byte row.
+
+Standalone validation examples:
+
+```bash
+python models/deepseek_v4_1_flash/compressor.py -p a5 -d 0 --tokens 17 --padding 3 --start-position 13
+python models/deepseek_v4_1_flash/compressor.py -p a5 -d 0 --pool-case aliased
+python models/deepseek_v4_1_flash/compressor_epilogue.py -p a5 -d 0 --round-even 0
+python models/deepseek_v4_1_flash/compressor_epilogue.py -p a5 -d 0 --round-even 1
+```
+
 ## Parallel configuration
 
 | Component | Contract |

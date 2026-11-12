@@ -21,8 +21,8 @@ from config import (
     Q_START_DYN, STATE_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, STATE_CAPACITY,
     WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
-from compressor import STATE_WIDTH, c2a_compressor_project
-from compressor import c2a_compressor_publish
+from compressor import STATE_WIDTH, c2a_compressor
+from compressor_epilogue import compressor_epilogue
 from hc import hc_pre, hc_normalize
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj_hc_post
@@ -140,14 +140,16 @@ def decode_c2a_full(
         num_tokens, cache_ready,
     )
 
-    compressor_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
-    compressor_score = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.FP32)
-    c2a_compressor_project(x_norm, compressor_wkv, compressor_wgate, compressor_kv, compressor_score, num_tokens, n_tile=64)
+    pooled = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+    publish_slots = pl.create_tensor([tokens], dtype=pl.INT64)
+    compressor_ready = c2a_compressor(
+        x_norm, compressor_wkv, compressor_wgate, query_start_loc, position_ids, token_to_req_indices,
+        state_block_table, state_cache, compressed_slots, pooled, publish_slots, num_tokens, cache_ready,
+    )
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    compressed_publish_tid = c2a_compressor_publish(
-        compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
-        state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
-        compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache,
+    compressed_publish_tid = compressor_epilogue(
+        pooled, compressor_norm_weight, latent, compressed_rope_cos, compressed_rope_sin,
+        publish_slots, compressed_cache, num_tokens, cache_ready, compressor_ready, round_even=0,
     )
 
     select_tid = decode_c2a_indexer(

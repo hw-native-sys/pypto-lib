@@ -21,7 +21,8 @@ from config import (
     INDEX_CACHE_GROUP, STATE_BLOCKS_DYN, STATE_CAPACITY, Q_START_DYN, CP_SIZE, PREFILL_MAX_TOKENS,
     WINDOW_CACHE_BYTES, CMP_BLOCKS_DYN, COMPRESSED_CACHE_BYTES,
 )
-from compressor import c2a_compressor_project, c2a_compressor_publish, STATE_WIDTH
+from compressor import c2a_compressor, STATE_WIDTH
+from compressor_epilogue import compressor_epilogue
 from hc import hc_pre, hc_normalize, golden_hc_head_norm, golden_hc_mixes, golden_hc_post, zero_bf16_padding
 from o_proj import o_proj_hc_post, retire_prefill_signals
 from prefill_c1a_full import (
@@ -156,17 +157,17 @@ def prefill_c2a_full(
             kv_write_slots, window_cache,
             kv_token_count, normalized_ready,
         )
-        compressor_kv = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.FP32)
-        compressor_score = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.FP32)
-        c2a_compressor_project(
-            kv_hidden, w_compressor_kv, w_compressor_gate, compressor_kv, compressor_score,
-            kv_token_count, n_tile=128,
+        pooled = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.BF16)
+        publish_slots = pl.create_tensor([kv_capacity], dtype=pl.INT64)
+        compressor_ready = c2a_compressor(
+            kv_hidden, w_compressor_kv, w_compressor_gate,
+            kv_query_start, kv_position_ids, kv_request_ids, state_block_table, state_cache,
+            compressed_write_slots, pooled, publish_slots, kv_token_count, normalized_ready,
         )
         compressed_latent = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.BF16)
-        compressed_published = c2a_compressor_publish(
-            compressor_kv, compressor_score, kv_query_start, kv_position_ids, kv_request_ids,
-            state_block_table, state_cache, w_compressor_norm, compressed_latent, kv_token_count, normalized_ready,
-            compressed_rope_cos, compressed_rope_sin, compressed_write_slots, compressed_cache,
+        compressed_published = compressor_epilogue(
+            pooled, w_compressor_norm, compressed_latent, compressed_rope_cos, compressed_rope_sin,
+            publish_slots, compressed_cache, kv_token_count, normalized_ready, compressor_ready, round_even=0,
         )
         compressed_ready = publish_c2a_index_key(
             compressed_latent, w_index_k, w_index_norm, compressed_rope_cos, compressed_rope_sin,
@@ -576,17 +577,17 @@ def prefill_c2a_full_cp(
             kv_write_slots, window_cache,
             kv_token_count, gathered,
         )
-        compressor_kv = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.FP32)
-        compressor_score = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.FP32)
-        c2a_compressor_project(
-            kv_hidden, w_compressor_kv, w_compressor_gate, compressor_kv, compressor_score,
-            kv_token_count, n_tile=128,
+        pooled = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.BF16)
+        publish_slots = pl.create_tensor([kv_capacity], dtype=pl.INT64)
+        compressor_ready = c2a_compressor(
+            kv_hidden, w_compressor_kv, w_compressor_gate,
+            kv_query_start, kv_position_ids, kv_request_ids, state_block_table, state_cache,
+            compressed_write_slots, pooled, publish_slots, kv_token_count, gathered,
         )
         compressed_latent = pl.create_tensor([kv_capacity, HEAD_DIM], dtype=pl.BF16)
-        compressed_published = c2a_compressor_publish(
-            compressor_kv, compressor_score, kv_query_start, kv_position_ids, kv_request_ids,
-            state_block_table, state_cache, w_compressor_norm, compressed_latent, kv_token_count, gathered,
-            compressed_rope_cos, compressed_rope_sin, compressed_write_slots, compressed_cache,
+        compressed_published = compressor_epilogue(
+            pooled, w_compressor_norm, compressed_latent, compressed_rope_cos, compressed_rope_sin,
+            publish_slots, compressed_cache, kv_token_count, gathered, compressor_ready, round_even=0,
         )
         compressed_ready = publish_c2a_index_key(
             compressed_latent, w_index_k, w_index_norm, compressed_rope_cos, compressed_rope_sin,
