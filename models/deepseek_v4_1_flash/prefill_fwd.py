@@ -80,7 +80,6 @@ from config import (
 )
 
 from prefill_cp_allgather import prefill_cp_restore_hc
-from hc import hc_post
 from hc import hc_head, hc_head_norm, hc_project, hc_sinkhorn
 from input_pack import gather_rows, pack_x_hc, prepare_compressed_lens
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, prepare_forward_rope_tables
@@ -92,7 +91,7 @@ from prefill_moe import prefill_moe_slabs
 from compressor import STATE_WIDTH
 from prefill_c1a_full import prefill_publish_decoder
 from prefill_swa import prefill_swa_attention
-from o_proj import retire_prefill_signals, prefill_tp_output_all_reduce
+from o_proj import retire_prefill_signals
 from prefill_c2a_full import prefill_c2a_full_attention
 from prefill_c2a_reuse import prefill_c2a_reuse_attention
 from prefill_c1a_reindex import prefill_c1a_reindex_attention
@@ -188,28 +187,27 @@ def prefill_attention(
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor,
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
     mode: pl.Scalar[pl.INT32],
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
 ):
     if mode == 0:
-        tokens = pl.tensor.dim(x, 0)
-        partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
         prefill_swa_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
             wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
             rope_cos, rope_sin, window_slots, window_indices, window_cache,
-            output_arrived, partial, num_tokens, attention_epoch,
-        )
-        prefill_tp_output_all_reduce(
-            partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
+            output_arrived, output, num_tokens, attention_epoch,
+            output_window=output_window, group_base=group_base, tp_rank=tp_rank,
+            scatter_output=True, zero_padding=False,
+            residual=residual, post_mix=post_mix, residual_mix=residual_mix,
         )
     elif mode == 1:
-        attention_tokens = pl.tensor.dim(x, 0)
-        attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
         prefill_c2a_full_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
@@ -219,25 +217,23 @@ def prefill_attention(
             c2a_index_block_table, position_ids, compressed_rope_cos, compressed_rope_sin, compressor_wkv,
             compressor_wgate, query_start_loc, state_block_table, state_cache, compressor_norm_weight,
             c2a_compressed_slots, index_wk, index_norm_weight, index_wq_b, index_wq_b_scale,
-            index_weights_proj, topk_indices, output_arrived, attention_partial, num_tokens,
+            index_weights_proj, topk_indices, output_arrived, output, num_tokens,
             attention_epoch,
-        )
-        prefill_tp_output_all_reduce(
-            attention_partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
+            output_window=output_window, group_base=group_base, tp_rank=tp_rank,
+            scatter_output=True, zero_padding=False,
+            residual=residual, post_mix=post_mix, residual_mix=residual_mix,
         )
     elif mode == 2:
-        attention_tokens = pl.tensor.dim(x, 0)
-        attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.BF16)
         prefill_c2a_reuse_attention(
             x, wq_a, wq_a_scale, q_norm_weight, wq_b,
             wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
             wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
             window_slots, window_indices, window_cache, compressed_cache,
-            topk_indices, output_arrived, attention_partial, num_tokens,
+            topk_indices, output_arrived, output, num_tokens,
             attention_epoch,
-        )
-        prefill_tp_output_all_reduce(
-            attention_partial, output_window, output_arrived, output, group_base, tp_rank, num_tokens, attention_epoch,
+            output_window=output_window, group_base=group_base, tp_rank=tp_rank,
+            scatter_output=True, zero_padding=False,
+            residual=residual, post_mix=post_mix, residual_mix=residual_mix,
         )
     elif mode == 3:
         prefill_c1a_reindex_attention(
@@ -249,7 +245,8 @@ def prefill_attention(
             c1a_index_block_table, pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices, output_window, output_arrived, output, group_base,
             tp_rank, num_tokens, attention_epoch,
-            use_candidates=False, scatter_output=False,
+            use_candidates=False, scatter_output=True, zero_padding=False,
+            residual=residual, post_mix=post_mix, residual_mix=residual_mix,
         )
     elif mode == 4:
         prefill_c1a_reindex_attention(
@@ -261,7 +258,8 @@ def prefill_attention(
             c1a_index_block_table, pool_block_ids, pool_block_counts, index_wq_b, index_wq_b_scale, index_weights_proj,
             topk_indices, output_window, output_arrived, output, group_base,
             tp_rank, num_tokens, attention_epoch,
-            scatter_output=False, use_candidates=True,
+            scatter_output=True, zero_padding=False, use_candidates=True,
+            residual=residual, post_mix=post_mix, residual_mix=residual_mix,
         )
     elif mode == 5:
         prefill_c1a_reuse_attention(
@@ -271,7 +269,8 @@ def prefill_attention(
             window_slots, window_indices, window_cache, compressed_cache,
             topk_indices, output_window, output_arrived, output,
             group_base, tp_rank, num_tokens, attention_epoch,
-            scatter_output=False,
+            scatter_output=True, zero_padding=False,
+            residual=residual, post_mix=post_mix, residual_mix=residual_mix,
         )
     return output
 
@@ -532,13 +531,15 @@ def l2_prefill_fwd(
             attn_post = pl.create_tensor([CAPACITY, HC_MULT], dtype=pl.FP32)
             attn_residual = pl.create_tensor([CAPACITY, HC_MULT, HC_MULT], dtype=pl.FP32)
             normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-            attn_output = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
-            with pl.spmd(32, name_hint="prefill_attention_zero"):
-                worker = pl.tile.get_block_idx()
-                zeros = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
-                for row in pl.range(worker, CAPACITY, 32):
-                    pl.store(zeros, [row, 0], attn_output)
             hc_head_norm(hidden, delayed_pre, layer_attn_norm, normalized, worker_limit=64)
+            owner_begin = rank % TP_SIZE * (CAPACITY // TP_SIZE)
+            owner_hidden = pl.slice(hidden, [CAPACITY // TP_SIZE, HC_MULT, D], [owner_begin, 0, 0])
+            owner_pre = pl.slice(attn_pre, [CAPACITY // TP_SIZE, HC_MULT], [owner_begin, 0])
+            owner_post = pl.slice(attn_post, [CAPACITY // TP_SIZE, HC_MULT], [owner_begin, 0])
+            owner_residual = pl.slice(attn_residual, [CAPACITY // TP_SIZE, HC_MULT, HC_MULT], [owner_begin, 0, 0])
+            owner_destination = pl.slice(attn_hidden, [CAPACITY // TP_SIZE, HC_MULT, D], [owner_begin, 0, 0])
+            inv_rms, mix_partials = hc_project(owner_hidden, layer_attn_fn, rms_worker_limit=64)
+            hc_sinkhorn(inv_rms, mix_partials, layer_attn_scale, layer_attn_base, owner_pre, owner_post, owner_residual)
             mode = 0
             cache_slot = 0
             rope_slot = 0
@@ -557,30 +558,19 @@ def l2_prefill_fwd(
                 if (layer - 2) % 6 == 0:
                     mode = 1
             state_slot = pl.min(cache_slot, 2)
-            if active > 0:
-                prefill_attention(
-                    normalized, layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_wkv_scale, layer_kv_norm,
-                    layer_attn_sink, layer_wo_a, layer_wo_a_scale, layer_wo_b, layer_wo_b_scale, rope_cos[rope_slot], rope_sin[rope_slot],
-                    window_slots[stage], window_indices[stage], window_cache[layer],
-                    compressed_cache[cache_slot], token_to_req_indices[stage],
-                    c2a_compressed_lens, c1a_compressed_lens, index_cache[cache_slot], index_scales[cache_slot],
-                    c2a_index_block_table, c1a_index_block_table, position_ids[stage], compressed_cos, compressed_sin,
-                    layer_compressor_wkv, layer_compressor_wgate, query_start_loc[stage], state_block_table, state_cache[state_slot],
-                    layer_compressor_norm, c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale,
-                    layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
-                    attn_output, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, layer + 1, mode,
-                )
-            owner_begin = rank % TP_SIZE * (CAPACITY // TP_SIZE)
-            owner_hidden = pl.slice(hidden, [CAPACITY // TP_SIZE, HC_MULT, D], [owner_begin, 0, 0])
-            owner_output = pl.slice(attn_output, [CAPACITY // TP_SIZE, D], [owner_begin, 0])
-            owner_pre = pl.slice(attn_pre, [CAPACITY // TP_SIZE, HC_MULT], [owner_begin, 0])
-            owner_post = pl.slice(attn_post, [CAPACITY // TP_SIZE, HC_MULT], [owner_begin, 0])
-            owner_residual = pl.slice(attn_residual, [CAPACITY // TP_SIZE, HC_MULT, HC_MULT], [owner_begin, 0, 0])
-            owner_destination = pl.slice(attn_hidden, [CAPACITY // TP_SIZE, HC_MULT, D], [owner_begin, 0, 0])
-            inv_rms, mix_partials = hc_project(owner_hidden, layer_attn_fn, rms_worker_limit=64)
-            hc_sinkhorn(inv_rms, mix_partials, layer_attn_scale, layer_attn_base, owner_pre, owner_post, owner_residual)
-            hc_post_deps = pl.array.create(2, pl.TASK_ID)
-            hc_post(owner_output, owner_hidden, owner_post, owner_residual, owner_destination, deps=hc_post_deps)
+            prefill_attention(
+                normalized, layer_wq_a, layer_wq_a_scale, layer_q_norm, layer_wq_b, layer_wq_b_scale, layer_wkv, layer_wkv_scale, layer_kv_norm,
+                layer_attn_sink, layer_wo_a, layer_wo_a_scale, layer_wo_b, layer_wo_b_scale, rope_cos[rope_slot], rope_sin[rope_slot],
+                window_slots[stage], window_indices[stage], window_cache[layer],
+                compressed_cache[cache_slot], token_to_req_indices[stage],
+                c2a_compressed_lens, c1a_compressed_lens, index_cache[cache_slot], index_scales[cache_slot],
+                c2a_index_block_table, c1a_index_block_table, position_ids[stage], compressed_cos, compressed_sin,
+                layer_compressor_wkv, layer_compressor_wgate, query_start_loc[stage], state_block_table, state_cache[state_slot],
+                layer_compressor_norm, c2a_compressed_slots, layer_index_wk, layer_index_norm, layer_index_wq_b, layer_index_wq_b_scale,
+                layer_index_weights, pool_block_ids, pool_block_counts, topk_indices, attention_window, attention_arrived,
+                owner_destination, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, layer + 1, mode,
+                residual=owner_hidden, post_mix=owner_post, residual_mix=owner_residual,
+            )
         moe_ready = prefill_moe_slabs(
             attn_hidden, attn_pre, layer_ffn_fn, layer_ffn_scale, layer_ffn_base, layer_ffn_norm, layer_gate_weight, layer_gate_bias,
             layer_routed_w1, layer_routed_w1_scale, layer_routed_w2, layer_routed_w2_scale, layer_routed_w3, layer_routed_w3_scale,

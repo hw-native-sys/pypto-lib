@@ -1096,7 +1096,7 @@ def _attend_window_project(
         wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin,
         output, num_tokens,
-        worker_limit=32, oa_row_tile=80, ob_row_tile=80,
+        oa_row_tile=80, ob_row_tile=80,
     )
     return output
 
@@ -2524,7 +2524,7 @@ def l2_attend_project(
         wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin,
         output, num_tokens,
-        worker_limit=32, oa_row_tile=80, ob_row_tile=80,
+        oa_row_tile=80, ob_row_tile=80,
     )
     return output
 

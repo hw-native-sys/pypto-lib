@@ -26,9 +26,8 @@ from config import (
     BLOCK_SIZE, B_DYN, EP_SIZE, FLASH, MOE_TOKENS, PREFILL_MAX_TOKENS, TP_SIZE, TABLE_DYN,
     WINDOW_CACHE_BYTES,
 )
-from o_proj import prefill_tp_output_all_reduce
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
-from hc import hc_head, hc_head_norm, hc_post, hc_project, hc_sinkhorn, zero_bf16_padding
+from hc import hc_head, hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
 from expert_routed import (
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
@@ -40,7 +39,8 @@ from utils import paged_slots
 from pypto.runtime import pto_isa_include_dir
 from decode_moe import AUX_WIDTH, RECV_MAX, ROUTE_WIDTH, SIGNAL_PAD, moe
 
-from dspark_attention import dspark_attention
+from dspark_attention import dspark_attention_partial
+from o_proj import o_proj, o_proj_hc_post, prefill_output_reduce_hc_post
 from dspark_context_kv import dspark_context_kv_quantized
 from qkv_proj_rope import quantize_projection_input
 from hc import golden_hc_collapse, golden_hc_post, golden_hc_mixes
@@ -373,8 +373,7 @@ def draft_layer(
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
     zero_bf16_padding(normalized_attention, num_tokens)
-    attention_partial = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
-    dspark_attention(
+    attended, window_cache = dspark_attention_partial(
         normalized_attention,
         wq_a,
         wq_a_scale,
@@ -385,35 +384,32 @@ def draft_layer(
         wkv_scale,
         kv_norm_weight,
         attn_sink,
-        wo_a,
-        wo_a_scale,
-        wo_b,
-        wo_b_scale,
         rope_cos,
         rope_sin,
         window_slots,
         window_indices,
         window_cache,
-        attention_partial,
         num_tokens,
     )
-    attention_output = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
-    group_base = rank // TP_SIZE * TP_SIZE
-    tp_rank = rank % TP_SIZE
-    prefill_tp_output_all_reduce(
-        attention_partial,
-        attention_output_window,
-        attention_output_arrived,
-        attention_output,
-        group_base,
-        tp_rank,
-        num_tokens,
-        attention_epoch,
-    )
-    zero_bf16_padding(attention_output, num_tokens)
     attention_hidden = pl.create_tensor([MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden, deps=hc_post_deps)
+    if TP_SIZE == 1:
+        o_proj_hc_post(
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
+            oa_row_tile=80, ob_row_tile=128,
+        )
+    else:
+        attention_partial = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+        o_proj(
+            attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+            attention_partial, num_tokens, oa_row_tile=80, ob_row_tile=80,
+        )
+        prefill_output_reduce_hc_post(
+            attention_partial, attention_output_window, attention_output_arrived,
+            x_hc, post_mix, residual_mix, attention_hidden,
+            rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens, attention_epoch,
+            scatter_output=False, zero_padding=False,
+        )
     force_topk = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
     moe(
         attention_hidden,

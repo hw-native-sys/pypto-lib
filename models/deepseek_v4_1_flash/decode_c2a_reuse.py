@@ -18,9 +18,9 @@ from config import (
     FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, WINDOW_CACHE_BYTES,
     COMPRESSED_CACHE_BYTES,
 )
-from hc import hc_head_norm, hc_project, hc_sinkhorn, hc_post
+from hc import hc_head_norm, hc_project, hc_sinkhorn
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from o_proj import o_proj
+from o_proj import o_proj_hc_post
 from sparse_attention import gather_sparse_attention
 
 # model config
@@ -105,24 +105,18 @@ def decode_c2a_reuse(
 
     chunk_done = cache_ready
 
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
         query, window_indices, window_cache, compressed_indices, compressed_cache,
         attn_sink, attended, num_tokens, chunk_done, compressed_keys=INDEX_TOPK,
     )
-    o_proj(
-        attended,
-        wo_a, wo_a_scale, wo_b, wo_b_scale,
-        rope_cos, rope_sin,
-        attn_out, num_tokens,
-        worker_limit=32, oa_row_tile=80, ob_row_tile=80,
-    )
-
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
+    o_proj_hc_post(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        x_hc, post_mix, residual_mix, output, num_tokens,
+        oa_row_tile=80, ob_row_tile=128,
+    )
     return output, next_pre_mix
 
 

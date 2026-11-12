@@ -254,6 +254,43 @@ def hc_post(
     return output
 
 
+@pl.jit.inline(auto_scope=False)
+def hc_post_padding(
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
+    valid_rows: pl.Scalar[pl.INT32],
+    source_ready: pl.Scalar[pl.TASK_ID],
+    zero_output: pl.constexpr,
+):
+    """Complete inactive rows after a fused active prefix, preserving each caller's padding policy."""
+    rows = pl.tensor.dim(output, 0)
+    padding_workers = pl.system.available_cluster_count()
+    if valid_rows < rows:
+        if zero_output:
+            output_flat = pl.reshape(output, [rows * HC_MULT, D])
+            with pl.spmd(padding_workers, name_hint="hc_zero_padding", deps=[source_ready]):
+                worker = pl.tile.get_block_idx()
+                for row in pl.range(valid_rows * HC_MULT + worker, rows * HC_MULT, padding_workers):
+                    zeros = pl.tile.full([1, D], dtype=pl.FP32, value=0.0)
+                    output_flat = pl.store(zeros, [row, 0], output_flat)
+        else:
+            padding = pl.create_tensor([rows - valid_rows, D], dtype=pl.BF16)
+            with pl.spmd(padding_workers, name_hint="hc_padding_input", deps=[source_ready]) as padding_ready:
+                worker = pl.tile.get_block_idx()
+                for row in pl.range(worker, rows - valid_rows, padding_workers):
+                    zero_input = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+                    padding = pl.store(zero_input, [row, 0], padding)
+            deps = pl.array.create(2, pl.TASK_ID)
+            deps[0] = padding_ready
+            hc_post(
+                padding, residual[valid_rows:rows, :, :], post_mix[valid_rows:rows, :],
+                residual_mix[valid_rows:rows, :, :], output[valid_rows:rows, :, :], deps=deps,
+            )
+    return output
+
+
 def _round_hf32(value: torch.Tensor) -> torch.Tensor:
     """Round finite FP32 values to E8M10, with halfway values away from zero."""
     bits = value.contiguous().view(torch.int32)

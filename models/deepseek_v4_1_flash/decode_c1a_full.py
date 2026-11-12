@@ -21,9 +21,9 @@ from decode_indexer import (
     select_candidate_block_pool, c1a_index, score_select_paged,
     publish_index_rows, project_index_key,
 )
-from o_proj import o_proj
+from o_proj import o_proj_hc_post
 from sparse_attention import gather_sparse_attention
-from hc import hc_project, hc_sinkhorn, hc_head_norm, hc_post
+from hc import hc_project, hc_sinkhorn, hc_head_norm
 from config import (
     LOCAL_T_DYN, INDEX_CACHE_GROUP, FLASH as M, B_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN,
     INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
@@ -163,21 +163,16 @@ def decode_c1a_full(
         scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
     )
     selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_ready])
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
         query, window_indices, window_cache, topk_indices, compressed_cache,
         attn_sink, attended, num_tokens, selection_ready, compressed_keys=INDEX_TOPK,
     )
-    o_proj(
-        attended,
-        wo_a, wo_a_scale, wo_b, wo_b_scale,
-        rope_cos, rope_sin,
-        attn_out, num_tokens,
-        worker_limit=32, oa_row_tile=80, ob_row_tile=80,
+    o_proj_hc_post(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        x_hc, post_mix, residual_mix, output, num_tokens,
+        oa_row_tile=80, ob_row_tile=128,
     )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output
 
 

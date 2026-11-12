@@ -12,6 +12,7 @@
 
 import argparse
 import functools
+import math
 import os
 import sys
 
@@ -138,7 +139,6 @@ def l2_prefill_layer_attention(
     compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
     compressed_indices: pl.Tensor[[TOKENS, INDEX_TOPK], pl.INT32],
     attn_input: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
-    attn_output: pl.Out[pl.Tensor[[TOKENS, D], pl.BF16]],
     attn_pre_mix: pl.Out[pl.Tensor[[TOKENS, HC_MULT], pl.FP32]],
     x_hc_mid: pl.Out[pl.Tensor[[TOKENS, HC_MULT, D], pl.FP32]],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
@@ -155,12 +155,12 @@ def l2_prefill_layer_attention(
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight,
         attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices,
         window_cache, compressed_cache,
-        compressed_indices, output_window, output_arrived, attn_input, attn_output,
+        compressed_indices, output_window, output_arrived, attn_input,
         attn_pre_mix, x_hc_mid, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, num_tokens,
         attention_epoch,
     )
     retire_prefill_signals(x_hc_mid, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
-    return x_hc_mid, attn_pre_mix, attn_output, attn_input, window_cache
+    return x_hc_mid, attn_pre_mix, attn_input, window_cache
 
 
 @pl.jit
@@ -291,7 +291,6 @@ def l3_prefill_layer(
     shared_w3_scale: pl.Tensor[[EP_SIZE, D // MX_GROUP, MOE_INTER], pl.FP8E8M0],
     token_owners: pl.Tensor[[EP_SIZE, TOKENS], pl.INT32],
     attn_input: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
-    attn_output: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
     attn_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT], pl.FP32]],
     x_hc_mid: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, HC_MULT, D], pl.FP32]],
     ffn_input: pl.Out[pl.Tensor[[EP_SIZE, TOKENS, D], pl.BF16]],
@@ -324,7 +323,7 @@ def l3_prefill_layer(
             wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank],
             window_slots[rank], window_indices[rank], window_cache[rank],
             compressed_cache[rank], compressed_indices[rank],
-            attn_input[rank], attn_output[rank], attn_pre_mix[rank], x_hc_mid[rank],
+            attn_input[rank], attn_pre_mix[rank], x_hc_mid[rank],
             attention_data, attention_signal, rank, num_tokens, layer_epoch, device=rank,
         )
 
@@ -531,7 +530,6 @@ def make_layer_golden(mode):
         world = tensors["x_hc"].shape[0]
         tokens = tensors["x_hc"].shape[1]
         attn_input = torch.empty(world, tokens, D, dtype=torch.bfloat16)
-        attn_output = torch.empty(world, tokens, D, dtype=torch.bfloat16)
         attn_pre_mix = torch.empty(world, tokens, HC_MULT, dtype=torch.float32)
         x_hc_mid = torch.empty(world, tokens, HC_MULT, D, dtype=torch.float32)
         for base in range(0, world, TP_SIZE):
@@ -550,11 +548,10 @@ def make_layer_golden(mode):
             mid = golden_hc_post(attention, x_hc, post, comb)
             for rank in ranks:
                 attn_input[rank] = x
-                attn_output[rank] = attention
                 attn_pre_mix[rank] = pre
                 x_hc_mid[rank] = mid
         outputs = {
-            "attn_input": attn_input, "attn_output": attn_output,
+            "attn_input": attn_input,
             "attn_pre_mix": attn_pre_mix, "x_hc_mid": x_hc_mid,
             **golden_moe_sublayer(tensors, x_hc_mid, attn_pre_mix, tokens),
         }
@@ -623,6 +620,43 @@ def compare_hc_mixes_output(name, source_name, weight_prefix, coefficient=0):
         return passed, "hc_mixes replay within its budget"
 
     return compare
+
+
+
+def compare_attention_hc(attention):
+    """Propagate the original projection and HC budgets across the fused boundary."""
+
+    def compare(actual, expected, *, inputs, actual_outputs, **kwargs):
+        projected = attention(inputs, actual_outputs)["attn_output"]
+        passed = bool(torch.isfinite(actual).all())
+        details = []
+        for rank in range(actual.shape[0]):
+            stream = inputs["x_hc"][rank]
+            _, post, comb = golden_hc_mixes(
+                stream, inputs["hc_attn_fn"][rank], inputs["hc_attn_scale"][rank], inputs["hc_attn_base"][rank],
+            )
+            replay = golden_hc_post(projected[rank], stream, post, comb)
+            if not bool(torch.isfinite(replay).all()):
+                return False, f"rank {rank}: non-finite HC replay"
+            # Projection: atol=.01, rtol=1/128, at most .5% outliers.
+            # HC replay: atol=.0001, rtol=1/256, at most .2% outliers.
+            # HC scales projection error by post[h]. Its own relative tolerance
+            # is evaluated at that perturbed value, so include the same bound there.
+            projection_error = 1e-2 + projected[rank].float().abs() / 128
+            propagated = post.abs().unsqueeze(-1) * projection_error.unsqueeze(-2)
+            tolerance = propagated + 1e-4 + (replay.abs() + propagated) / 256
+            errors = (actual[rank] - replay).abs() > tolerance
+            error_count = int(errors.sum())
+            # The union of the two original outlier sets is bounded by .5% + .2%.
+            allowed = HC_MULT * math.ceil(projected[rank].numel() * 0.005) + math.ceil(errors.numel() * 0.002)
+            valid = error_count <= allowed
+            passed &= valid
+            passed &= report_stage("x_hc_mid(end-to-end)", actual[rank], expected[rank])[0] <= 0.01
+            details.append(f"rank {rank}: {error_count}/{errors.numel()} outside the composed budget")
+        return passed, "; ".join(details) + "; end-to-end rel L2 <= 0.01"
+
+    return compare
+
 
 
 def compare_expanded_stream(name, sublayer_name, source_name, weight_prefix, end_to_end_bound):
@@ -728,8 +762,7 @@ def make_layer_compare(mode, tokens, initial_state, world_size):
     compare = {
         "attn_input": ratio_allclose(atol=1e-4, rtol=2**-8, max_error_ratio=0.002),
         "attn_pre_mix": compare_hc_mixes_output("attn_pre_mix", None, "hc_attn"),
-        "attn_output": attention.compare("attn_output", ratio_allclose(atol=1e-2, rtol=1.0 / 128)),
-        "x_hc_mid": compare_expanded_stream("x_hc_mid", "attn_output", None, "hc_attn", 0.01),
+        "x_hc_mid": compare_attention_hc(attention),
         "ffn_input": compare_ffn_input,
         "next_pre_mix": compare_hc_mixes_output("next_pre_mix", "x_hc_mid", "hc_ffn"),
         "ffn_post_mix": compare_hc_mixes_output("ffn_post_mix", "x_hc_mid", "hc_ffn", coefficient=1),
@@ -834,7 +867,6 @@ def build_specs(args, mode, initial_state):
     ]
     specs += [
         TensorSpec("attn_input", [world_size, args.tokens, D], torch.bfloat16, resident="stacked"),
-        TensorSpec("attn_output", [world_size, args.tokens, D], torch.bfloat16, resident="stacked"),
         TensorSpec("attn_pre_mix", [world_size, args.tokens, HC_MULT], torch.float32, resident="stacked"),
         TensorSpec("x_hc_mid", [world_size, args.tokens, HC_MULT, D], torch.float32, resident="stacked"),
         TensorSpec("ffn_input", [world_size, args.tokens, D], torch.bfloat16, resident="stacked"),
