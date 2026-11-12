@@ -59,7 +59,8 @@ CSA_COMPRESS_RATIO = 4
 
 # One state replica per TP rank, indexed by the group-local drafter lease; the
 # fused wrapper publishes each updated row to its three peers.
-STATE_CAPACITY = DECODE_BATCH
+# Persistent request leases are independent of the per-step decode batch.
+STATE_CAPACITY = 64
 STATE_VALID = 0
 STATE_GENERATION = 1
 STATE_ANCHOR_POSITION = 2
