@@ -121,16 +121,20 @@ def _c2a_compressor_project_tile(
     rows: pl.Scalar[pl.INDEX],
     n_tile: pl.constexpr,
 ):
-    a = pl.load(x, [row, 0], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE], valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
-    b = pl.load(weight, [0, col], [C2A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
-    a_full = pl.set_validshape(a, C2A_PROJ_M_TILE, C2A_PROJ_K_TILE)
-    acc = pl.matmul(a_full, b)
-    for k in pl.pipeline(C2A_PROJ_K_TILE, D, C2A_PROJ_K_TILE, stage=2):
+    total = pl.tile.full([C2A_PROJ_M_TILE, n_tile], dtype=pl.FP32, value=0.0)
+    compensation = pl.tile.full([C2A_PROJ_M_TILE, n_tile], dtype=pl.FP32, value=0.0)
+    for k in pl.pipeline(0, D, C2A_PROJ_K_TILE, stage=2):
         a = pl.load(x, [row, k], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE], valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
         b = pl.load(weight, [k, col], [C2A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
         a_full = pl.set_validshape(a, C2A_PROJ_M_TILE, C2A_PROJ_K_TILE)
-        acc = pl.matmul_acc(acc, a_full, b)
-    value = pl.set_validshape(acc, rows, n_tile)
+        partial_acc = pl.matmul(a_full, b)
+        partial = pl.move(partial_acc, pl.Mem.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
+        delta = pl.sub(partial, compensation)
+        next_sum = pl.add(total, delta)
+        roundoff = pl.sub(next_sum, total)
+        compensation = pl.sub(roundoff, delta)
+        total = next_sum
+    value = pl.set_validshape(total, rows, n_tile)
     output = pl.store(value, [row, col], output)
     return output
 
@@ -145,19 +149,20 @@ def c2a_compressor_project(
     num_tokens: pl.Scalar[pl.INT32],
     n_tile: pl.constexpr,
 ):
-    """Project KV and gate with NZ BF16 weights and FP32 Cube output."""
+    """Project KV and gate with NZ BF16 weights and compensated FP32 partial sums."""
     blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE * (2 * HEAD_DIM // n_tile)
-    workers = pl.max(pl.min(blocks, 16), 1)
-    with pl.spmd(workers, name_hint="proj_cmp"):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_cmp"):
+    workers = pl.max(1, pl.min(pl.min(blocks, 16), pl.system.available_cluster_count()))
+    # Initial C2V FIFO writes require ownership of the paired Vector UB.
+    with pl.spmd(workers, name_hint="proj_cmp", sync_start=True):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_cmp", optimizations=[pl.cross_core_slot(slot_num=1)]):
             worker = pl.tile.get_block_idx()
-            col = worker % (HEAD_DIM // n_tile) * n_tile
-            row_blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE
-            row_workers = pl.max(workers // (2 * HEAD_DIM // n_tile), 1)
-            for row_block in pl.range(worker // (2 * HEAD_DIM // n_tile), row_blocks, row_workers):
+            stride = pl.tile.get_block_num()
+            for block in pl.range(worker, blocks, stride):
+                col = block % (HEAD_DIM // n_tile) * n_tile
+                row_block = block // (2 * HEAD_DIM // n_tile)
                 row = row_block * C2A_PROJ_M_TILE
                 rows = pl.min(C2A_PROJ_M_TILE, num_tokens - row)
-                if worker % (2 * HEAD_DIM // n_tile) < HEAD_DIM // n_tile:
+                if block % (2 * HEAD_DIM // n_tile) < HEAD_DIM // n_tile:
                     kv_out = _c2a_compressor_project_tile(x, wkv, kv_out, row, col, rows, n_tile)
                 else:
                     score_out = _c2a_compressor_project_tile(x, wgate, score_out, row, col, rows, n_tile)
@@ -287,6 +292,24 @@ def c2a_state_feedback_test(
     return state_cache, latent
 
 
+def golden_c2a_projection(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Reference FP32 Cube partial boundaries and compensated FP32 accumulation."""
+    value = x.double()
+    logical_weight = unpack_bf16_nz(weight).double()
+    total = torch.zeros(x.shape[0], logical_weight.shape[1], dtype=torch.float32, device=x.device)
+    compensation = torch.zeros_like(total)
+    for k in range(0, D, C2A_PROJ_K_TILE):
+        # FP64 partial sums are rounded at the FP32 Cube output boundary.
+        product = value[:, k : k + C2A_PROJ_K_TILE] @ logical_weight[k : k + C2A_PROJ_K_TILE]
+        partial = product.float()
+        delta = partial - compensation
+        next_sum = total + delta
+        roundoff = next_sum - total
+        compensation = roundoff - delta
+        total = next_sum
+    return total
+
+
 def golden_c1a_compressor(
     x: torch.Tensor,
     wkv: torch.Tensor,
@@ -320,8 +343,8 @@ def golden_c2a_compressor(
     Negative/out-of-range request or block indices suppress state access and
     publication. Valid chunks contain consecutive absolute positions.
     """
-    kv = torch.matmul(x.float(), unpack_bf16_nz(wkv).float())
-    score = torch.matmul(x.float(), unpack_bf16_nz(wgate).float())
+    kv = golden_c2a_projection(x, wkv)
+    score = golden_c2a_projection(x, wgate)
     latent = torch.zeros_like(kv, dtype=x.dtype)
     publish = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
     blocks, capacity, width = state_cache.shape

@@ -351,7 +351,7 @@ def golden_c2a(tensors, mode="full"):
     """Compute HC pre, C2A attention, cache updates, and HC post."""
     import torch
     from compressor import golden_c2a_compressor
-    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
+    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
     from rmsnorm import golden_rms_norm
     from qkv_proj_rope import golden_qkv_proj_rope, golden_rope_tail
     from decode_indexer import golden_c2a_index
@@ -370,7 +370,7 @@ def golden_c2a(tensors, mode="full"):
             x_hc, t["hc_attn_fn"], t["hc_attn_scale"], t["hc_attn_base"],
         )
         attention_input = golden_hc_collapse(x_hc, t["pre_mix"]).to(torch.bfloat16)
-        x = golden_rms_norm(attention_input, t["attn_norm_weight"])
+        x = golden_hc_norm(attention_input, t["attn_norm_weight"])
     else:
         x = t["x"]
     t["x"] = x

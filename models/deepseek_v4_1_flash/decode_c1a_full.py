@@ -361,8 +361,7 @@ def golden_c1a(tensors, mode="full"):
     )
     from utils import _publish_quantized_cache
 
-    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
-    from rmsnorm import golden_rms_norm
+    from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
 
     a = dict(tensors)
     a["window_cache"], a["window_cache_scale"] = unpack_quantized_cache(tensors["window_cache"], False, head_dim=tensors["kv_norm_weight"].numel())
@@ -372,7 +371,7 @@ def golden_c1a(tensors, mode="full"):
         x_hc, a["hc_attn_fn"], a["hc_attn_scale"], a["hc_attn_base"],
     )
     attention_input = golden_hc_collapse(x_hc, a["pre_mix"]).to(torch.bfloat16)
-    x = golden_rms_norm(attention_input, a["attn_norm_weight"])
+    x = golden_hc_norm(attention_input, a["attn_norm_weight"])
     a["x"] = x
     q, kv, qr = golden_qkv_proj_rope(
         x, a["wq_a"], a["wq_a_scale"], a["q_norm_weight"], a["wq_b"], a["wq_b_scale"],

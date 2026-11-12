@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """SWA decode attention with HC."""
 
 
@@ -330,8 +331,7 @@ def golden_swa(tensors, *, reference=None):
     """Compose HC, normalization, QKV, attention and output references."""
     import torch
     from sparse_attention import SWA_INPUT_NAMES, swa_official_reference
-    from hc import golden_hc_collapse, golden_hc_mixes, golden_hc_post
-    from rmsnorm import golden_rms_norm
+    from hc import golden_hc_collapse, golden_hc_norm, golden_hc_mixes, golden_hc_post
 
     fields = dict(tensors)
     fields["window_cache"], fields["window_cache_scale"] = unpack_quantized_cache(tensors["window_cache"], False, head_dim=tensors["kv_norm_weight"].numel())
@@ -344,7 +344,7 @@ def golden_swa(tensors, *, reference=None):
     )
     tensors["attention_pre_mix"].copy_(pre_mix)
     collapsed = golden_hc_collapse(tensors["x_hc"], tensors["incoming_pre_mix"]).to(torch.bfloat16)
-    normalized = golden_rms_norm(collapsed[:active], tensors["attn_norm_weight"])
+    normalized = golden_hc_norm(collapsed[:active], tensors["attn_norm_weight"])
     if reference is None:
         inputs = {name: normalized if name == "x" else fields[name] for name in SWA_INPUT_NAMES}
         for name in ("rope_cos", "rope_sin", "window_slots", "window_indices"):

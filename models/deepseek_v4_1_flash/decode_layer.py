@@ -490,8 +490,7 @@ from decode_c1a_full import golden_c1a
 from decode_c2a_full import golden_c2a
 from decode_swa import golden_swa
 from gate import golden_gate_reference as gate
-from hc import golden_hc_mixes, golden_hc_post, golden_hc_collapse
-from rmsnorm import golden_rms_norm
+from hc import golden_hc_mixes, golden_hc_post, golden_hc_collapse, golden_hc_norm
 from sparse_attention import golden_swa_attention
 
 
@@ -595,7 +594,7 @@ def golden_decode_moe(
 ) -> torch.Tensor:
     """Evaluate one rank's dense MoE math without the EP transport harness."""
     shape = x.shape
-    normalized = golden_rms_norm(x.reshape(-1, shape[-1]), norm_weight)
+    normalized = golden_hc_norm(x.reshape(-1, shape[-1]), norm_weight)
     active_tokens = normalized.shape[0] if num_tokens is None else num_tokens
     if not 0 <= active_tokens <= normalized.shape[0]:
         raise ValueError("num_tokens must fit the local decode capacity")
