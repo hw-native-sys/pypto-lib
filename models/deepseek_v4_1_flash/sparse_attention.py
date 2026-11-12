@@ -1279,6 +1279,378 @@ def sparse_vf_decode_pypto(
     return gathered
 
 
+@pl.jit.incore(level=pl.Level.AIC)
+def sparse_vf_pipeline_cube(
+    query: pl.Tensor,
+    decoded: pl.Tensor,
+    selected_ids: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    v2c_buffer = pl.reserve_buffer(name="sparse_vf_pipeline_weights", size=65536)
+    c2v_peer = pl.import_peer_buffer(name="sparse_vf_pipeline_scores", peer_func="sparse_vf_pipeline_vector")
+    pl.aic_initialize_pipe(c2v_consumer_buf=c2v_peer, v2c_consumer_buf=v2c_buffer, dir_mask=3, slot_size=32768, slot_num=2)
+    keys = WINDOW_KEYS + compressed_keys
+    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), WORKERS)
+    workers = pl.max(1, workers)
+    worker = pl.tile.get_block_idx()
+    for block in pl.range(worker, num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), workers):
+        token = block // (LOCAL_H // SPARSE_VF_HEAD_TILE)
+        head = block % (LOCAL_H // SPARSE_VF_HEAD_TILE) * SPARSE_VF_HEAD_TILE
+        q0 = token * LOCAL_H + head
+        q = pl.tile.load(query, [q0, 0], [SPARSE_VF_CUBE_HEAD_TILE, HEAD_DIM], valid_shape=[SPARSE_VF_HEAD_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+        k0_0 = token * keys + 0 * SPARSE_VF_KEY_TILE
+        kv_0 = pl.tile.load(decoded, [k0_0, 0], [SPARSE_VF_KEY_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+        key_0 = pl.tile.transpose_view(kv_0)
+        qk_0 = pl.tile.matmul(q, key_0)
+        pl.tpush_to_aiv(qk_0, split=0)
+        if compressed_keys > 0:
+            k0_1 = token * keys + 1 * SPARSE_VF_KEY_TILE
+            kv_1 = pl.tile.load(decoded, [k0_1, 0], [SPARSE_VF_KEY_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+            key_1 = pl.tile.transpose_view(kv_1)
+            qk_1 = pl.tile.matmul(q, key_1)
+            pl.tpush_to_aiv(qk_1, split=0)
+            weights_0 = pl.tpop_from_aiv(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=0)
+            weights_left_0 = pl.tile.move(weights_0, pl.MemorySpace.Left)
+            pl.tfree_to_aiv(weights_0)
+            for value_column_0 in pl.range(0, HEAD_DIM, 256):
+                value_mat_0 = pl.tile.slice(kv_0, [SPARSE_VF_KEY_TILE, 256], [0, value_column_0])
+                value_right_0 = pl.tile.move(value_mat_0, pl.MemorySpace.Right)
+                weighted_0 = pl.tile.matmul(weights_left_0, value_right_0)
+                pl.tpush_to_aiv(weighted_0, split=0)
+            k0_2 = token * keys + 2 * SPARSE_VF_KEY_TILE
+            kv_2 = pl.tile.load(decoded, [k0_2, 0], [SPARSE_VF_KEY_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+            key_2 = pl.tile.transpose_view(kv_2)
+            qk_2 = pl.tile.matmul(q, key_2)
+            pl.tpush_to_aiv(qk_2, split=0)
+            weights_1 = pl.tpop_from_aiv(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=0)
+            weights_left_1 = pl.tile.move(weights_1, pl.MemorySpace.Left)
+            pl.tfree_to_aiv(weights_1)
+            for value_column_1 in pl.range(0, HEAD_DIM, 256):
+                value_mat_1 = pl.tile.slice(kv_1, [SPARSE_VF_KEY_TILE, 256], [0, value_column_1])
+                value_right_1 = pl.tile.move(value_mat_1, pl.MemorySpace.Right)
+                weighted_1 = pl.tile.matmul(weights_left_1, value_right_1)
+                pl.tpush_to_aiv(weighted_1, split=0)
+            k0_3 = token * keys + 3 * SPARSE_VF_KEY_TILE
+            kv_3 = pl.tile.load(decoded, [k0_3, 0], [SPARSE_VF_KEY_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+            key_3 = pl.tile.transpose_view(kv_3)
+            qk_3 = pl.tile.matmul(q, key_3)
+            pl.tpush_to_aiv(qk_3, split=0)
+            weights_2 = pl.tpop_from_aiv(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=0)
+            weights_left_2 = pl.tile.move(weights_2, pl.MemorySpace.Left)
+            pl.tfree_to_aiv(weights_2)
+            for value_column_2 in pl.range(0, HEAD_DIM, 256):
+                value_mat_2 = pl.tile.slice(kv_2, [SPARSE_VF_KEY_TILE, 256], [0, value_column_2])
+                value_right_2 = pl.tile.move(value_mat_2, pl.MemorySpace.Right)
+                weighted_2 = pl.tile.matmul(weights_left_2, value_right_2)
+                pl.tpush_to_aiv(weighted_2, split=0)
+            k0_4 = token * keys + 4 * SPARSE_VF_KEY_TILE
+            kv_4 = pl.tile.load(decoded, [k0_4, 0], [SPARSE_VF_KEY_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+            key_4 = pl.tile.transpose_view(kv_4)
+            qk_4 = pl.tile.matmul(q, key_4)
+            pl.tpush_to_aiv(qk_4, split=0)
+            weights_3 = pl.tpop_from_aiv(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=0)
+            weights_left_3 = pl.tile.move(weights_3, pl.MemorySpace.Left)
+            pl.tfree_to_aiv(weights_3)
+            for value_column_3 in pl.range(0, HEAD_DIM, 256):
+                value_mat_3 = pl.tile.slice(kv_3, [SPARSE_VF_KEY_TILE, 256], [0, value_column_3])
+                value_right_3 = pl.tile.move(value_mat_3, pl.MemorySpace.Right)
+                weighted_3 = pl.tile.matmul(weights_left_3, value_right_3)
+                pl.tpush_to_aiv(weighted_3, split=0)
+            weights_4 = pl.tpop_from_aiv(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=0)
+            weights_left_4 = pl.tile.move(weights_4, pl.MemorySpace.Left)
+            pl.tfree_to_aiv(weights_4)
+            for value_column_4 in pl.range(0, HEAD_DIM, 256):
+                value_mat_4 = pl.tile.slice(kv_4, [SPARSE_VF_KEY_TILE, 256], [0, value_column_4])
+                value_right_4 = pl.tile.move(value_mat_4, pl.MemorySpace.Right)
+                weighted_4 = pl.tile.matmul(weights_left_4, value_right_4)
+                pl.tpush_to_aiv(weighted_4, split=0)
+        else:
+            weights_0 = pl.tpop_from_aiv(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=0)
+            weights_left_0 = pl.tile.move(weights_0, pl.MemorySpace.Left)
+            pl.tfree_to_aiv(weights_0)
+            for value_column_0 in pl.range(0, HEAD_DIM, 256):
+                value_mat_0 = pl.tile.slice(kv_0, [SPARSE_VF_KEY_TILE, 256], [0, value_column_0])
+                value_right_0 = pl.tile.move(value_mat_0, pl.MemorySpace.Right)
+                weighted_0 = pl.tile.matmul(weights_left_0, value_right_0)
+                pl.tpush_to_aiv(weighted_0, split=0)
+    return output
+
+
+@pl.jit.incore(level=pl.Level.AIV)
+def sparse_vf_pipeline_vector(
+    query: pl.Tensor,
+    decoded: pl.Tensor,
+    selected_ids: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    c2v_buffer = pl.reserve_buffer(name="sparse_vf_pipeline_scores", size=65536)
+    v2c_peer = pl.import_peer_buffer(name="sparse_vf_pipeline_weights", peer_func="sparse_vf_pipeline_cube")
+    pl.aiv_initialize_pipe(c2v_consumer_buf=c2v_buffer, v2c_consumer_buf=v2c_peer, dir_mask=3, slot_size=32768, slot_num=2)
+    keys = WINDOW_KEYS + compressed_keys
+    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), WORKERS)
+    workers = pl.max(1, workers)
+    worker = pl.tile.get_block_idx()
+    for block in pl.range(worker, num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), workers):
+        token = block // (LOCAL_H // SPARSE_VF_HEAD_TILE)
+        head = block % (LOCAL_H // SPARSE_VF_HEAD_TILE) * SPARSE_VF_HEAD_TILE
+        q0 = token * LOCAL_H + head
+        maximum = pl.tile.full([1, SPARSE_VF_CUBE_HEAD_TILE], dtype=pl.FP32, value=-1e30)
+        denominator = pl.tile.full([1, SPARSE_VF_CUBE_HEAD_TILE], dtype=pl.FP32, value=0.0)
+        numerator = pl.tile.full([SPARSE_VF_CUBE_HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+        reduction_tmp = pl.tile.create([SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        qk_vec_0 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, split=0)
+        scores_0 = pl.mul(qk_vec_0, SCALE)
+        ids_0 = pl.tile.load(selected_ids, [token, 0 * SPARSE_VF_KEY_TILE], [1, SPARSE_VF_KEY_TILE], target_memory=pl.MemorySpace.Vec)
+        idx_0 = pl.cast(ids_0, pl.FP32)
+        positive_0 = pl.add(idx_0, 1.0)
+        nonnegative_0 = pl.maximum(positive_0, 0.0)
+        valid_0 = pl.minimum(nonnegative_0, 1.0)
+        masked_0 = pl.sub(valid_0, 1.0)
+        penalty_0 = pl.mul(masked_0, 1e30)
+        scores_0 = pl.col_expand_add(scores_0, penalty_0)
+        row_max_0 = pl.tile.row_max(scores_0, reduction_tmp)
+        tile_max_0 = pl.tile.reshape(row_max_0, [1, SPARSE_VF_CUBE_HEAD_TILE])
+        next_max_0 = pl.maximum(maximum, tile_max_0)
+        max_delta_0 = pl.sub(maximum, next_max_0)
+        correction_0 = pl.exp(max_delta_0)
+        next_max_col_0 = pl.tile.reshape(next_max_0, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+        shifted_0 = pl.row_expand_sub(scores_0, next_max_col_0)
+        exponentials_0 = pl.exp(shifted_0)
+        probabilities_0 = pl.col_expand_mul(exponentials_0, valid_0)
+        row_sum_0 = pl.tile.row_sum(probabilities_0, reduction_tmp)
+        tile_sum_0 = pl.tile.reshape(row_sum_0, [1, SPARSE_VF_CUBE_HEAD_TILE])
+        corrected_sum_0 = pl.mul(denominator, correction_0)
+        denominator = pl.add(corrected_sum_0, tile_sum_0)
+        weights_vec_0 = pl.cast(probabilities_0, pl.BF16, mode="rint")
+        maximum = next_max_0
+        pl.tpush_to_aic(weights_vec_0, split=0)
+        pl.tfree_to_aic(qk_vec_0)
+        if compressed_keys > 0:
+            qk_vec_1 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, split=0)
+            scores_1 = pl.mul(qk_vec_1, SCALE)
+            ids_1 = pl.tile.load(selected_ids, [token, 1 * SPARSE_VF_KEY_TILE], [1, SPARSE_VF_KEY_TILE], target_memory=pl.MemorySpace.Vec)
+            idx_1 = pl.cast(ids_1, pl.FP32)
+            positive_1 = pl.add(idx_1, 1.0)
+            nonnegative_1 = pl.maximum(positive_1, 0.0)
+            valid_1 = pl.minimum(nonnegative_1, 1.0)
+            masked_1 = pl.sub(valid_1, 1.0)
+            penalty_1 = pl.mul(masked_1, 1e30)
+            scores_1 = pl.col_expand_add(scores_1, penalty_1)
+            row_max_1 = pl.tile.row_max(scores_1, reduction_tmp)
+            tile_max_1 = pl.tile.reshape(row_max_1, [1, SPARSE_VF_CUBE_HEAD_TILE])
+            next_max_1 = pl.maximum(maximum, tile_max_1)
+            max_delta_1 = pl.sub(maximum, next_max_1)
+            correction_1 = pl.exp(max_delta_1)
+            next_max_col_1 = pl.tile.reshape(next_max_1, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            shifted_1 = pl.row_expand_sub(scores_1, next_max_col_1)
+            exponentials_1 = pl.exp(shifted_1)
+            probabilities_1 = pl.col_expand_mul(exponentials_1, valid_1)
+            row_sum_1 = pl.tile.row_sum(probabilities_1, reduction_tmp)
+            tile_sum_1 = pl.tile.reshape(row_sum_1, [1, SPARSE_VF_CUBE_HEAD_TILE])
+            corrected_sum_1 = pl.mul(denominator, correction_1)
+            denominator = pl.add(corrected_sum_1, tile_sum_1)
+            weights_vec_1 = pl.cast(probabilities_1, pl.BF16, mode="rint")
+            maximum = next_max_1
+            pl.tpush_to_aic(weights_vec_1, split=0)
+            pl.tfree_to_aic(qk_vec_1)
+            correction_col_0 = pl.tile.reshape(correction_0, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            weighted_vec_0_0 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_0_0 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 0])
+            scaled_0_0 = pl.row_expand_mul(previous_0_0, correction_col_0)
+            updated_0_0 = pl.add(scaled_0_0, weighted_vec_0_0)
+            numerator = pl.tile.assemble(numerator, updated_0_0, [0, 0])
+            pl.tfree_to_aic(weighted_vec_0_0)
+            weighted_vec_0_256 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_0_256 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 256])
+            scaled_0_256 = pl.row_expand_mul(previous_0_256, correction_col_0)
+            updated_0_256 = pl.add(scaled_0_256, weighted_vec_0_256)
+            numerator = pl.tile.assemble(numerator, updated_0_256, [0, 256])
+            pl.tfree_to_aic(weighted_vec_0_256)
+            qk_vec_2 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, split=0)
+            scores_2 = pl.mul(qk_vec_2, SCALE)
+            ids_2 = pl.tile.load(selected_ids, [token, 2 * SPARSE_VF_KEY_TILE], [1, SPARSE_VF_KEY_TILE], target_memory=pl.MemorySpace.Vec)
+            idx_2 = pl.cast(ids_2, pl.FP32)
+            positive_2 = pl.add(idx_2, 1.0)
+            nonnegative_2 = pl.maximum(positive_2, 0.0)
+            valid_2 = pl.minimum(nonnegative_2, 1.0)
+            masked_2 = pl.sub(valid_2, 1.0)
+            penalty_2 = pl.mul(masked_2, 1e30)
+            scores_2 = pl.col_expand_add(scores_2, penalty_2)
+            row_max_2 = pl.tile.row_max(scores_2, reduction_tmp)
+            tile_max_2 = pl.tile.reshape(row_max_2, [1, SPARSE_VF_CUBE_HEAD_TILE])
+            next_max_2 = pl.maximum(maximum, tile_max_2)
+            max_delta_2 = pl.sub(maximum, next_max_2)
+            correction_2 = pl.exp(max_delta_2)
+            next_max_col_2 = pl.tile.reshape(next_max_2, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            shifted_2 = pl.row_expand_sub(scores_2, next_max_col_2)
+            exponentials_2 = pl.exp(shifted_2)
+            probabilities_2 = pl.col_expand_mul(exponentials_2, valid_2)
+            row_sum_2 = pl.tile.row_sum(probabilities_2, reduction_tmp)
+            tile_sum_2 = pl.tile.reshape(row_sum_2, [1, SPARSE_VF_CUBE_HEAD_TILE])
+            corrected_sum_2 = pl.mul(denominator, correction_2)
+            denominator = pl.add(corrected_sum_2, tile_sum_2)
+            weights_vec_2 = pl.cast(probabilities_2, pl.BF16, mode="rint")
+            maximum = next_max_2
+            pl.tpush_to_aic(weights_vec_2, split=0)
+            pl.tfree_to_aic(qk_vec_2)
+            correction_col_1 = pl.tile.reshape(correction_1, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            weighted_vec_1_0 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_1_0 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 0])
+            scaled_1_0 = pl.row_expand_mul(previous_1_0, correction_col_1)
+            updated_1_0 = pl.add(scaled_1_0, weighted_vec_1_0)
+            numerator = pl.tile.assemble(numerator, updated_1_0, [0, 0])
+            pl.tfree_to_aic(weighted_vec_1_0)
+            weighted_vec_1_256 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_1_256 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 256])
+            scaled_1_256 = pl.row_expand_mul(previous_1_256, correction_col_1)
+            updated_1_256 = pl.add(scaled_1_256, weighted_vec_1_256)
+            numerator = pl.tile.assemble(numerator, updated_1_256, [0, 256])
+            pl.tfree_to_aic(weighted_vec_1_256)
+            qk_vec_3 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, split=0)
+            scores_3 = pl.mul(qk_vec_3, SCALE)
+            ids_3 = pl.tile.load(selected_ids, [token, 3 * SPARSE_VF_KEY_TILE], [1, SPARSE_VF_KEY_TILE], target_memory=pl.MemorySpace.Vec)
+            idx_3 = pl.cast(ids_3, pl.FP32)
+            positive_3 = pl.add(idx_3, 1.0)
+            nonnegative_3 = pl.maximum(positive_3, 0.0)
+            valid_3 = pl.minimum(nonnegative_3, 1.0)
+            masked_3 = pl.sub(valid_3, 1.0)
+            penalty_3 = pl.mul(masked_3, 1e30)
+            scores_3 = pl.col_expand_add(scores_3, penalty_3)
+            row_max_3 = pl.tile.row_max(scores_3, reduction_tmp)
+            tile_max_3 = pl.tile.reshape(row_max_3, [1, SPARSE_VF_CUBE_HEAD_TILE])
+            next_max_3 = pl.maximum(maximum, tile_max_3)
+            max_delta_3 = pl.sub(maximum, next_max_3)
+            correction_3 = pl.exp(max_delta_3)
+            next_max_col_3 = pl.tile.reshape(next_max_3, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            shifted_3 = pl.row_expand_sub(scores_3, next_max_col_3)
+            exponentials_3 = pl.exp(shifted_3)
+            probabilities_3 = pl.col_expand_mul(exponentials_3, valid_3)
+            row_sum_3 = pl.tile.row_sum(probabilities_3, reduction_tmp)
+            tile_sum_3 = pl.tile.reshape(row_sum_3, [1, SPARSE_VF_CUBE_HEAD_TILE])
+            corrected_sum_3 = pl.mul(denominator, correction_3)
+            denominator = pl.add(corrected_sum_3, tile_sum_3)
+            weights_vec_3 = pl.cast(probabilities_3, pl.BF16, mode="rint")
+            maximum = next_max_3
+            pl.tpush_to_aic(weights_vec_3, split=0)
+            pl.tfree_to_aic(qk_vec_3)
+            correction_col_2 = pl.tile.reshape(correction_2, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            weighted_vec_2_0 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_2_0 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 0])
+            scaled_2_0 = pl.row_expand_mul(previous_2_0, correction_col_2)
+            updated_2_0 = pl.add(scaled_2_0, weighted_vec_2_0)
+            numerator = pl.tile.assemble(numerator, updated_2_0, [0, 0])
+            pl.tfree_to_aic(weighted_vec_2_0)
+            weighted_vec_2_256 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_2_256 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 256])
+            scaled_2_256 = pl.row_expand_mul(previous_2_256, correction_col_2)
+            updated_2_256 = pl.add(scaled_2_256, weighted_vec_2_256)
+            numerator = pl.tile.assemble(numerator, updated_2_256, [0, 256])
+            pl.tfree_to_aic(weighted_vec_2_256)
+            qk_vec_4 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, split=0)
+            scores_4 = pl.mul(qk_vec_4, SCALE)
+            ids_4 = pl.tile.load(selected_ids, [token, 4 * SPARSE_VF_KEY_TILE], [1, SPARSE_VF_KEY_TILE], target_memory=pl.MemorySpace.Vec)
+            idx_4 = pl.cast(ids_4, pl.FP32)
+            positive_4 = pl.add(idx_4, 1.0)
+            nonnegative_4 = pl.maximum(positive_4, 0.0)
+            valid_4 = pl.minimum(nonnegative_4, 1.0)
+            masked_4 = pl.sub(valid_4, 1.0)
+            penalty_4 = pl.mul(masked_4, 1e30)
+            scores_4 = pl.col_expand_add(scores_4, penalty_4)
+            row_max_4 = pl.tile.row_max(scores_4, reduction_tmp)
+            tile_max_4 = pl.tile.reshape(row_max_4, [1, SPARSE_VF_CUBE_HEAD_TILE])
+            next_max_4 = pl.maximum(maximum, tile_max_4)
+            max_delta_4 = pl.sub(maximum, next_max_4)
+            correction_4 = pl.exp(max_delta_4)
+            next_max_col_4 = pl.tile.reshape(next_max_4, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            shifted_4 = pl.row_expand_sub(scores_4, next_max_col_4)
+            exponentials_4 = pl.exp(shifted_4)
+            probabilities_4 = pl.col_expand_mul(exponentials_4, valid_4)
+            row_sum_4 = pl.tile.row_sum(probabilities_4, reduction_tmp)
+            tile_sum_4 = pl.tile.reshape(row_sum_4, [1, SPARSE_VF_CUBE_HEAD_TILE])
+            corrected_sum_4 = pl.mul(denominator, correction_4)
+            denominator = pl.add(corrected_sum_4, tile_sum_4)
+            weights_vec_4 = pl.cast(probabilities_4, pl.BF16, mode="rint")
+            maximum = next_max_4
+            pl.tpush_to_aic(weights_vec_4, split=0)
+            pl.tfree_to_aic(qk_vec_4)
+            correction_col_3 = pl.tile.reshape(correction_3, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            weighted_vec_3_0 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_3_0 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 0])
+            scaled_3_0 = pl.row_expand_mul(previous_3_0, correction_col_3)
+            updated_3_0 = pl.add(scaled_3_0, weighted_vec_3_0)
+            numerator = pl.tile.assemble(numerator, updated_3_0, [0, 0])
+            pl.tfree_to_aic(weighted_vec_3_0)
+            weighted_vec_3_256 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_3_256 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 256])
+            scaled_3_256 = pl.row_expand_mul(previous_3_256, correction_col_3)
+            updated_3_256 = pl.add(scaled_3_256, weighted_vec_3_256)
+            numerator = pl.tile.assemble(numerator, updated_3_256, [0, 256])
+            pl.tfree_to_aic(weighted_vec_3_256)
+            correction_col_4 = pl.tile.reshape(correction_4, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            weighted_vec_4_0 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_4_0 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 0])
+            scaled_4_0 = pl.row_expand_mul(previous_4_0, correction_col_4)
+            updated_4_0 = pl.add(scaled_4_0, weighted_vec_4_0)
+            numerator = pl.tile.assemble(numerator, updated_4_0, [0, 0])
+            pl.tfree_to_aic(weighted_vec_4_0)
+            weighted_vec_4_256 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_4_256 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 256])
+            scaled_4_256 = pl.row_expand_mul(previous_4_256, correction_col_4)
+            updated_4_256 = pl.add(scaled_4_256, weighted_vec_4_256)
+            numerator = pl.tile.assemble(numerator, updated_4_256, [0, 256])
+            pl.tfree_to_aic(weighted_vec_4_256)
+        else:
+            correction_col_0 = pl.tile.reshape(correction_0, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            weighted_vec_0_0 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_0_0 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 0])
+            scaled_0_0 = pl.row_expand_mul(previous_0_0, correction_col_0)
+            updated_0_0 = pl.add(scaled_0_0, weighted_vec_0_0)
+            numerator = pl.tile.assemble(numerator, updated_0_0, [0, 0])
+            pl.tfree_to_aic(weighted_vec_0_0)
+            weighted_vec_0_256 = pl.tpop_from_aic(shape=[SPARSE_VF_CUBE_HEAD_TILE, 256], dtype=pl.FP32, split=0)
+            previous_0_256 = pl.tile.slice(numerator, [SPARSE_VF_CUBE_HEAD_TILE, 256], [0, 256])
+            scaled_0_256 = pl.row_expand_mul(previous_0_256, correction_col_0)
+            updated_0_256 = pl.add(scaled_0_256, weighted_vec_0_256)
+            numerator = pl.tile.assemble(numerator, updated_0_256, [0, 256])
+            pl.tfree_to_aic(weighted_vec_0_256)
+        sinks = pl.tile.load(sink, [0, head], [1, SPARSE_VF_CUBE_HEAD_TILE], valid_shape=[1, SPARSE_VF_HEAD_TILE], target_memory=pl.MemorySpace.Vec)
+        final_max = pl.maximum(maximum, sinks)
+        final_delta = pl.sub(maximum, final_max)
+        correction = pl.exp(final_delta)
+        sink_delta = pl.sub(sinks, final_max)
+        sink_weight = pl.exp(sink_delta)
+        corrected_total = pl.mul(denominator, correction)
+        total = pl.add(corrected_total, sink_weight)
+        ratio = pl.div(correction, total)
+        multiplier = pl.tile.reshape(ratio, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+        normalized = pl.row_expand_mul(numerator, multiplier)
+        result = pl.cast(normalized, pl.BF16, mode="rint")
+        valid_result = pl.set_validshape(result, SPARSE_VF_HEAD_TILE, HEAD_DIM)
+        pl.tile.store(valid_result, [q0, 0], output)
+    return output
+
+
+@pl.jit.incore(level=pl.Level.CORE_GROUP)
+def sparse_vf_pipeline_group(
+    query: pl.Tensor,
+    decoded: pl.Tensor,
+    selected_ids: pl.Tensor,
+    sink: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    cube_output = sparse_vf_pipeline_cube(query, decoded, selected_ids, sink, output, num_tokens, compressed_keys=compressed_keys)
+    vector_output = sparse_vf_pipeline_vector(query, decoded, selected_ids, sink, cube_output, num_tokens, compressed_keys=compressed_keys)
+    return vector_output
+
+
 @pl.jit.inline(auto_scope=False)
 def sparse_vf_attend_pypto(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -1290,80 +1662,93 @@ def sparse_vf_attend_pypto(
     decoded_ready: pl.Scalar[pl.TASK_ID],
     compressed_keys: pl.constexpr,
 ):
-    """Attend decoded BF16 keys with tiled online softmax, BF16 probabilities and one sink."""
-    keys = WINDOW_KEYS + compressed_keys
-    parts = keys // SPARSE_VF_KEY_TILE
-    tokens = pl.tensor.dim(query, 0)
-    qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
-    oflat = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
-    sink_row = pl.reshape(sink, [1, LOCAL_H])
-    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), WORKERS)
-    workers = pl.max(1, workers)
-    with pl.spmd(
-        workers, name_hint="sparse_vf_attend", deps=[decoded_ready],
-        optimizations=[pl.cross_core_slot(slot_num=1)],
-    ) as attended:
-        worker = pl.tile.get_block_idx()
-        for block in pl.range(worker, num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), workers):
-            token = block // (LOCAL_H // SPARSE_VF_HEAD_TILE)
-            head = block % (LOCAL_H // SPARSE_VF_HEAD_TILE) * SPARSE_VF_HEAD_TILE
-            q0 = token * LOCAL_H + head
-            # Pad Cube rows without reading heads from the next token.
-            q = pl.slice(qflat, [SPARSE_VF_CUBE_HEAD_TILE, HEAD_DIM], [q0, 0],
-                         valid_shape=[SPARSE_VF_HEAD_TILE, HEAD_DIM])
-            maximum = pl.full([1, SPARSE_VF_CUBE_HEAD_TILE], dtype=pl.FP32, value=-1e30)
-            denominator = pl.full([1, SPARSE_VF_CUBE_HEAD_TILE], dtype=pl.FP32, value=0.0)
-            numerator = pl.full([SPARSE_VF_CUBE_HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-            for part in pl.range(parts):
-                k0 = token * keys + part * SPARSE_VF_KEY_TILE
-                kv = decoded[k0:k0 + SPARSE_VF_KEY_TILE, :]
-                # Compute scaled QK scores and mask invalid keys.
-                qk = pl.matmul(q, kv, b_trans=True, out_dtype=pl.FP32)
-                scores = pl.mul(qk, SCALE)
-                column = part * SPARSE_VF_KEY_TILE
-                ids = selected_ids[token:token + 1, column:column + SPARSE_VF_KEY_TILE]
-                idx = pl.cast(ids, pl.FP32)
-                positive = pl.add(idx, 1.0)
-                nonnegative = pl.maximum(positive, 0.0)
-                valid = pl.minimum(nonnegative, 1.0)
-                masked = pl.sub(valid, 1.0)
-                penalty = pl.mul(masked, 1e30)
-                scores = pl.col_expand_add(scores, penalty)
-                row_max = pl.row_max(scores)
-                tile_max = pl.reshape(row_max, [1, SPARSE_VF_CUBE_HEAD_TILE])
-                next_max = pl.maximum(maximum, tile_max)
-                max_delta = pl.sub(maximum, next_max)
-                correction = pl.exp(max_delta)
-                next_max_col = pl.reshape(next_max, [SPARSE_VF_CUBE_HEAD_TILE, 1])
-                shifted = pl.row_expand_sub(scores, next_max_col)
-                exponentials = pl.exp(shifted)
-                probabilities = pl.col_expand_mul(exponentials, valid)
-                row_sum = pl.row_sum(probabilities)
-                tile_sum = pl.reshape(row_sum, [1, SPARSE_VF_CUBE_HEAD_TILE])
-                corrected_sum = pl.mul(denominator, correction)
-                denominator = pl.add(corrected_sum, tile_sum)
-                # Accumulate BF16 PV with the online-softmax correction.
-                weights = pl.cast(probabilities, pl.BF16, mode="rint")
-                weighted = pl.matmul(weights, kv, out_dtype=pl.FP32)
-                correction_col = pl.reshape(correction, [SPARSE_VF_CUBE_HEAD_TILE, 1])
-                scaled = pl.row_expand_mul(numerator, correction_col)
-                numerator = pl.add(scaled, weighted)
-                maximum = next_max
-            # Normalize the accumulated values with the sink contribution.
-            sinks = pl.slice(sink_row, [1, SPARSE_VF_CUBE_HEAD_TILE], [0, head],
-                             valid_shape=[1, SPARSE_VF_HEAD_TILE])
-            final_max = pl.maximum(maximum, sinks)
-            final_delta = pl.sub(maximum, final_max)
-            correction = pl.exp(final_delta)
-            sink_delta = pl.sub(sinks, final_max)
-            sink_weight = pl.exp(sink_delta)
-            corrected_total = pl.mul(denominator, correction)
-            total = pl.add(corrected_total, sink_weight)
-            ratio = pl.div(correction, total)
-            multiplier = pl.reshape(ratio, [SPARSE_VF_CUBE_HEAD_TILE, 1])
-            normalized = pl.row_expand_mul(numerator, multiplier)
-            result = pl.cast(normalized, pl.BF16, mode="rint")
-            oflat[q0:q0 + SPARSE_VF_HEAD_TILE, :] = result[:SPARSE_VF_HEAD_TILE, :]
+    """Use explicit on-chip pipeline for packed keys; preserve single-part SWA."""
+    attended = pl.system.task_invalid()
+    if compressed_keys > 0:
+        tokens = pl.tensor.dim(query, 0)
+        qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
+        oflat = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
+        sink_row = pl.reshape(sink, [1, LOCAL_H])
+        workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), WORKERS)
+        workers = pl.max(1, workers)
+        with pl.spmd(workers, name_hint="sparse_vf_attend", deps=[decoded_ready]) as packed_attended:
+            pipeline_output = sparse_vf_pipeline_group(qflat, decoded, selected_ids, sink_row, oflat, num_tokens, compressed_keys=compressed_keys)
+        attended = packed_attended
+    else:
+        keys = WINDOW_KEYS + compressed_keys
+        parts = keys // SPARSE_VF_KEY_TILE
+        tokens = pl.tensor.dim(query, 0)
+        qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
+        oflat = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
+        sink_row = pl.reshape(sink, [1, LOCAL_H])
+        workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), WORKERS)
+        workers = pl.max(1, workers)
+        with pl.spmd(
+            workers, name_hint="sparse_vf_attend", deps=[decoded_ready],
+            optimizations=[pl.cross_core_slot(slot_num=1)],
+        ) as swa_attended:
+            worker = pl.tile.get_block_idx()
+            for block in pl.range(worker, num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), workers):
+                token = block // (LOCAL_H // SPARSE_VF_HEAD_TILE)
+                head = block % (LOCAL_H // SPARSE_VF_HEAD_TILE) * SPARSE_VF_HEAD_TILE
+                q0 = token * LOCAL_H + head
+                # Pad Cube rows without reading heads from the next token.
+                q = pl.slice(qflat, [SPARSE_VF_CUBE_HEAD_TILE, HEAD_DIM], [q0, 0],
+                             valid_shape=[SPARSE_VF_HEAD_TILE, HEAD_DIM])
+                maximum = pl.full([1, SPARSE_VF_CUBE_HEAD_TILE], dtype=pl.FP32, value=-1e30)
+                denominator = pl.full([1, SPARSE_VF_CUBE_HEAD_TILE], dtype=pl.FP32, value=0.0)
+                numerator = pl.full([SPARSE_VF_CUBE_HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                for part in pl.range(parts):
+                    k0 = token * keys + part * SPARSE_VF_KEY_TILE
+                    kv = decoded[k0:k0 + SPARSE_VF_KEY_TILE, :]
+                    # Compute scaled QK scores and mask invalid keys.
+                    qk = pl.matmul(q, kv, b_trans=True, out_dtype=pl.FP32)
+                    scores = pl.mul(qk, SCALE)
+                    column = part * SPARSE_VF_KEY_TILE
+                    ids = selected_ids[token:token + 1, column:column + SPARSE_VF_KEY_TILE]
+                    idx = pl.cast(ids, pl.FP32)
+                    positive = pl.add(idx, 1.0)
+                    nonnegative = pl.maximum(positive, 0.0)
+                    valid = pl.minimum(nonnegative, 1.0)
+                    masked = pl.sub(valid, 1.0)
+                    penalty = pl.mul(masked, 1e30)
+                    scores = pl.col_expand_add(scores, penalty)
+                    row_max = pl.row_max(scores)
+                    tile_max = pl.reshape(row_max, [1, SPARSE_VF_CUBE_HEAD_TILE])
+                    next_max = pl.maximum(maximum, tile_max)
+                    max_delta = pl.sub(maximum, next_max)
+                    correction = pl.exp(max_delta)
+                    next_max_col = pl.reshape(next_max, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+                    shifted = pl.row_expand_sub(scores, next_max_col)
+                    exponentials = pl.exp(shifted)
+                    probabilities = pl.col_expand_mul(exponentials, valid)
+                    row_sum = pl.row_sum(probabilities)
+                    tile_sum = pl.reshape(row_sum, [1, SPARSE_VF_CUBE_HEAD_TILE])
+                    corrected_sum = pl.mul(denominator, correction)
+                    denominator = pl.add(corrected_sum, tile_sum)
+                    # Accumulate BF16 PV with the online-softmax correction.
+                    weights = pl.cast(probabilities, pl.BF16, mode="rint")
+                    weighted = pl.matmul(weights, kv, out_dtype=pl.FP32)
+                    correction_col = pl.reshape(correction, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+                    scaled = pl.row_expand_mul(numerator, correction_col)
+                    numerator = pl.add(scaled, weighted)
+                    maximum = next_max
+                # Normalize the accumulated values with the sink contribution.
+                sinks = pl.slice(sink_row, [1, SPARSE_VF_CUBE_HEAD_TILE], [0, head],
+                                 valid_shape=[1, SPARSE_VF_HEAD_TILE])
+                final_max = pl.maximum(maximum, sinks)
+                final_delta = pl.sub(maximum, final_max)
+                correction = pl.exp(final_delta)
+                sink_delta = pl.sub(sinks, final_max)
+                sink_weight = pl.exp(sink_delta)
+                corrected_total = pl.mul(denominator, correction)
+                total = pl.add(corrected_total, sink_weight)
+                ratio = pl.div(correction, total)
+                multiplier = pl.reshape(ratio, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+                normalized = pl.row_expand_mul(numerator, multiplier)
+                result = pl.cast(normalized, pl.BF16, mode="rint")
+                oflat[q0:q0 + SPARSE_VF_HEAD_TILE, :] = result[:SPARSE_VF_HEAD_TILE, :]
+        attended = swa_attended
     return attended
 
 
