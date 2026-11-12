@@ -615,7 +615,7 @@ def _routed_w2(
 # W2 uses aligned expert-strided staging for compact MX_A_ZZ activations.
 W2_M_TILE = gcd(RECV_MAX, 80)
 W2_N_TILE = MX_W2_D_OUT_TILE
-W2_K_TILE = MX_K_TILE
+W2_K_TILE = 128
 W2_K_STAGE = 2
 
 
