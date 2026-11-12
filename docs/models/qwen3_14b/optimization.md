@@ -510,10 +510,14 @@ a 2-layer makespan from 2114.6 to 2090.4 µs.
 When 50 output-projection tiles become ready at once and the consumer only needs
 some of them to start, splitting the dispatch pays.
 
-`out_proj` splits its 50 `(n, k)` tiles into two waves: the last 24 are one SPMD
-dispatch gated **directly** on the attention TaskId, and the other 26 are
-deferred behind an unflagged `pl.system.task_dummy(deps=[attn_done_tid])`. The
-direct dispatch deliberately carries no `allow_early_resolve`. #794 applied the
+`out_proj` splits its 50 `(n, k)` tiles into two waves: the last 24 go out as
+three SPMD dispatches gated **directly** on the attention TaskId, and the other
+26 are deferred behind an unflagged `pl.system.task_dummy(deps=[attn_done_tid])`.
+The direct region is segmented at residual-cast slice boundaries
+(`OUT_DIRECT_SPLIT_POINTS`, derived from the `N_PER_CAST_K * K_SPLITS_OUT` tiles
+each cast slice consumes), so a downstream cast slice starts as soon as its own
+out_proj tiles finish instead of waiting for the whole 24-tile region. The
+direct dispatches deliberately carry no `allow_early_resolve`. #794 applied the
 same pattern to `gate_proj` / `up_proj`: the leading `GATE_UP_SPMD_N = 6` N-tiles
 go out as `pl.spmd` per K-split gated on the corresponding cast, and tiles
 `n ≥ 6` route through a per-K `task_dummy` funnel.
