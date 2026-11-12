@@ -42,6 +42,8 @@ INDEX_WEIGHT_K_SPLIT_TILE = 4
 INDEX_WEIGHT_K_TILE = 256
 INDEX_PROJ_K_TILE = 256
 INDEX_KEY_BYTE_TILE = 256
+INDEX_KEY_ROW_TILE = 8
+INDEX_KEY_SLOT_TILE = 32
 SCORE_TILE = 256
 SCORE_RUN_TILE = 6
 SCORE_ROWS_TILE = SCORE_RUN_TILE * INDEX_H
@@ -579,44 +581,8 @@ def select_candidate_block_pool(
     return pool_tid
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "idx_k_norm_rope_publish.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _idx_k_norm_rope_publish(
-    source: pl.Tensor,
-    weight: pl.Tensor,
-    cosine: pl.Tensor,
-    sine: pl.Tensor,
-    slots: pl.Tensor,
-    cache: pl.InOut[pl.Tensor],
-    scales: pl.InOut[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Normalize, rotate, and publish group-32 MXFP4 index keys with E8M0 scales."""
-    ...
-
-
 @pl.jit.inline(auto_scope=False)
 def publish_index_rows(
-    source: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
-    weight: pl.Tensor[[INDEX_DIM], pl.BF16],
-    cosine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    sine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    slots: pl.Tensor[[T_DYN], pl.INT64],
-    cache: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8],
-    scales: pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0],
-    num_tokens: pl.Scalar[pl.INT32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-    kv_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Fuse index RMSNorm, BF16 RoPE, and cache publication with one writer per page."""
-    workers = pl.max(1, pl.min(num_tokens, 4))
-    with pl.spmd(workers, name_hint="idx_k_norm_rope_publish", deps=[cache_ready, kv_ready]) as published:
-        cache = _idx_k_norm_rope_publish(source, weight, cosine, sine, slots, cache, scales, num_tokens)
-    return published
-
-
-@pl.jit.inline(auto_scope=False)
-def publish_index_rows_pypto(
     source: pl.Tensor[[T_DYN, INDEX_DIM], pl.BF16],
     weight: pl.Tensor[[INDEX_DIM], pl.BF16],
     cosine: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
@@ -628,11 +594,9 @@ def publish_index_rows_pypto(
     cache_ready: pl.Scalar[pl.TASK_ID],
     kv_ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Publish index keys with the PyPTO register functional implementation.
-
-    C1A/C2A decode keep using publish_index_rows until this implementation
-    passes performance acceptance.
-    """
+    """Publish normalized and rotated MXFP4 index keys with one writer per page."""
+    slot_capacity = pl.tensor.dim(slots, 0)
+    slots_matrix = pl.reshape(slots, [1, slot_capacity])
     workers = pl.max(1, pl.min(num_tokens, 4))
     cache_rows = pl.tensor.dim(cache, 0) * 128
     cache_flat = pl.reshape(cache, [cache_rows, INDEX_DIM // 2])
@@ -640,120 +604,113 @@ def publish_index_rows_pypto(
     with pl.spmd(workers, name_hint="idx_k_norm_rope_publish", deps=[cache_ready, kv_ready]) as published:
         worker = pl.tile.get_block_idx()
         gamma_tile = pl.load(weight, [0], [INDEX_DIM], target_memory=pl.MemorySpace.Vec)
-        for token in pl.range(num_tokens):
-            slot_i64 = pl.read(slots, [token])
-            if slot_i64 >= 0:
-                slot = pl.cast(slot_i64, pl.INDEX)
-                if (slot // 128) % workers == worker:
-                    source_tile = pl.load(source, [token, 0], [1, INDEX_DIM], target_memory=pl.MemorySpace.Vec)
-                    source_tile = pl.reshape(source_tile, [INDEX_DIM])
-                    cos_tile = pl.load(cosine, [token, 0], [1, ROPE_DIM // 2], target_memory=pl.MemorySpace.Vec)
-                    sin_tile = pl.load(sine, [token, 0], [1, ROPE_DIM // 2], target_memory=pl.MemorySpace.Vec)
-                    cos_tile = pl.reshape(cos_tile, [ROPE_DIM // 2])
-                    sin_tile = pl.reshape(sin_tile, [ROPE_DIM // 2])
-                    payload = pl.tile.full([INDEX_KEY_BYTE_TILE], dtype=pl.UINT8, value=0)
-                    scale_bytes = pl.tile.full([INDEX_KEY_BYTE_TILE], dtype=pl.UINT8, value=0)
-                    with pl.reg_scope():
-                        full = pl.reg.full_mask(lanes=64)
-                        lower = pl.reg.active_mask(32, lanes=64)
-                        index = pl.reg.index_gen(0, lanes=64, dtype=pl.INT32)
-                        one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
-                        bit_one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
-                        bf16_mask = pl.reg.broadcast(4294901760, lanes=64, dtype=pl.UINT32)
-                        cos_index = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
-                        cos_mask = pl.reg.broadcast(31, lanes=64, dtype=pl.UINT32)
-                        cos_index = pl.reg.bitwise_and(cos_index, cos_mask)
-                        cosv = pl.reg.gather(cos_tile, cos_index, full)
-                        sinv = pl.reg.gather(sin_tile, cos_index, full)
+        source_batch = pl.tile.create(
+            [INDEX_KEY_ROW_TILE, INDEX_DIM], pl.BF16,
+            target_memory=pl.MemorySpace.Vec,
+        )
+        cosine_batch = pl.tile.create(
+            [INDEX_KEY_ROW_TILE, ROPE_DIM // 2], pl.FP32,
+            target_memory=pl.MemorySpace.Vec,
+        )
+        sine_batch = pl.tile.create(
+            [INDEX_KEY_ROW_TILE, ROPE_DIM // 2], pl.FP32,
+            target_memory=pl.MemorySpace.Vec,
+        )
+        payload_batch = pl.tile.full([INDEX_KEY_ROW_TILE, INDEX_KEY_BYTE_TILE], dtype=pl.UINT8, value=0)
+        scale_batch = pl.tile.full([INDEX_KEY_ROW_TILE, INDEX_KEY_BYTE_TILE], dtype=pl.UINT8, value=0)
+        slots_buffer = pl.tile.create([1, INDEX_KEY_SLOT_TILE], pl.INT64, target_memory=pl.MemorySpace.Vec)
+        targets = pl.array.create(INDEX_KEY_ROW_TILE, pl.INT64)
+        for (batch_cursor,) in pl.while_(init_values=(pl.cast(0, pl.INDEX),)):
+            pl.cond(batch_cursor < num_tokens)
+            for (scan_cursor, pending) in pl.while_(init_values=(batch_cursor, pl.cast(0, pl.INDEX))):
+                pl.cond(scan_cursor < num_tokens and pending < INDEX_KEY_ROW_TILE)
+                next_pending = pending
+                slot_lane = scan_cursor % INDEX_KEY_SLOT_TILE
+                if slot_lane == 0:
+                    slot_count = pl.min(INDEX_KEY_SLOT_TILE, num_tokens - scan_cursor)
+                    loaded_slots = pl.tile.gather_row(
+                        slots_buffer, slots_matrix,
+                        [0, 0], [0, scan_cursor], [1, INDEX_KEY_SLOT_TILE],
+                        valid_shape=[1, slot_count],
+                    )
+                    pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.S, 7)
+                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.S, 7)
+                slot_i64 = pl.tile.read(slots_buffer, [0, slot_lane])
+                if slot_i64 >= 0:
+                    slot = pl.cast(slot_i64, pl.INDEX)
+                    if (slot // 128) % workers == worker:
+                        targets[pending] = slot_i64
+                        loaded_source = pl.tile.gather_row(
+                            source_batch, source,
+                            [pending, 0], [scan_cursor, 0], [1, INDEX_DIM],
+                        )
+                        loaded_cosine = pl.tile.gather_row(
+                            cosine_batch, cosine,
+                            [pending, 0], [scan_cursor, 0], [1, ROPE_DIM // 2],
+                        )
+                        loaded_sine = pl.tile.gather_row(
+                            sine_batch, sine,
+                            [pending, 0], [scan_cursor, 0], [1, ROPE_DIM // 2],
+                        )
+                        next_pending = pending + 1
+                next_scan = scan_cursor + 1
+                final_scan, final_pending = pl.yield_(next_scan, next_pending)
+            if final_pending > 0:
+                source_values = pl.reshape(source_batch, [INDEX_KEY_ROW_TILE * INDEX_DIM])
+                cosine_values = pl.reshape(cosine_batch, [INDEX_KEY_ROW_TILE * (ROPE_DIM // 2)])
+                sine_values = pl.reshape(sine_batch, [INDEX_KEY_ROW_TILE * (ROPE_DIM // 2)])
+                payload_values = pl.reshape(payload_batch, [INDEX_KEY_ROW_TILE * INDEX_KEY_BYTE_TILE])
+                scale_values = pl.reshape(scale_batch, [INDEX_KEY_ROW_TILE * INDEX_KEY_BYTE_TILE])
+                pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+                pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.V, 0)
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.S, 1)
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.S, 1)
+                with pl.reg_scope():
+                    full = pl.reg.full_mask(lanes=64)
+                    lower = pl.reg.active_mask(32, lanes=64)
+                    one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+                    cos_index = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                    cos_mask = pl.reg.broadcast(31, lanes=64, dtype=pl.UINT32)
+                    cos_index = pl.reg.bitwise_and(cos_index, cos_mask)
+                    gamma0_bf = pl.reg.load(gamma_tile, offset=0, lanes=64)
+                    gamma0 = pl.reg.convert(gamma0_bf, dtype=pl.FP32)
+                    gamma1_bf = pl.reg.load(gamma_tile, offset=64, lanes=64)
+                    gamma1 = pl.reg.convert(gamma1_bf, dtype=pl.FP32)
+                    first_index = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+                    second_index = pl.reg.broadcast(32, lanes=64, dtype=pl.INT32)
+                    for row in pl.hardware_loop(final_pending):
+                        cos_offset = pl.cast(row * (ROPE_DIM // 2), pl.UINT32)
+                        row_cos_index = pl.reg.adds(cos_index, cos_offset, full)
+                        cosv = pl.reg.gather(cosine_values, row_cos_index, full)
+                        sinv = pl.reg.gather(sine_values, row_cos_index, full)
 
-                        # Expand BF16 bits with existing integer register operations.
-                        source0_bf = pl.reg.load(source_tile, offset=0, lanes=64)
-                        source0_u16 = pl.reg.interpret_cast(source0_bf, dtype=pl.UINT16)
-                        source0_bits = pl.reg.convert(source0_u16, dtype=pl.UINT32)
-                        source0_bits = pl.reg.shift_lefts(source0_bits, 16, full)
-                        source0 = pl.reg.interpret_cast(source0_bits, dtype=pl.FP32)
-                        gamma0_bf = pl.reg.load(gamma_tile, offset=0, lanes=64)
-                        gamma0_u16 = pl.reg.interpret_cast(gamma0_bf, dtype=pl.UINT16)
-                        gamma0_bits = pl.reg.convert(gamma0_u16, dtype=pl.UINT32)
-                        gamma0_bits = pl.reg.shift_lefts(gamma0_bits, 16, full)
-                        gamma0 = pl.reg.interpret_cast(gamma0_bits, dtype=pl.FP32)
+                        # Convert BF16 source values to FP32.
+                        source0_bf = pl.reg.load(source_values, offset=row * INDEX_DIM, lanes=64)
+                        source0 = pl.reg.convert(source0_bf, dtype=pl.FP32)
                         square0 = pl.reg.mul(source0, source0)
-                        source1_bf = pl.reg.load(source_tile, offset=64, lanes=64)
-                        source1_u16 = pl.reg.interpret_cast(source1_bf, dtype=pl.UINT16)
-                        source1_bits = pl.reg.convert(source1_u16, dtype=pl.UINT32)
-                        source1_bits = pl.reg.shift_lefts(source1_bits, 16, full)
-                        source1 = pl.reg.interpret_cast(source1_bits, dtype=pl.FP32)
-                        gamma1_bf = pl.reg.load(gamma_tile, offset=64, lanes=64)
-                        gamma1_u16 = pl.reg.interpret_cast(gamma1_bf, dtype=pl.UINT16)
-                        gamma1_bits = pl.reg.convert(gamma1_u16, dtype=pl.UINT32)
-                        gamma1_bits = pl.reg.shift_lefts(gamma1_bits, 16, full)
-                        gamma1 = pl.reg.interpret_cast(gamma1_bits, dtype=pl.FP32)
+                        source1_bf = pl.reg.load(source_values, offset=row * INDEX_DIM + 64, lanes=64)
+                        source1 = pl.reg.convert(source1_bf, dtype=pl.FP32)
                         square1 = pl.reg.mul(source1, source1)
 
-                        # Match the two adjacent-pair 64-lane sum trees in the C++ kernel.
-                        stride0 = pl.reg.broadcast(1, lanes=64, dtype=pl.INT32)
-                        indices0 = pl.reg.bitwise_xor(index, stride0)
-                        peer0_0 = pl.reg.gather_lanes(square0, indices0)
-                        square0 = pl.reg.add(square0, peer0_0)
-                        peer1_0 = pl.reg.gather_lanes(square1, indices0)
-                        square1 = pl.reg.add(square1, peer1_0)
-                        stride1 = pl.reg.broadcast(2, lanes=64, dtype=pl.INT32)
-                        indices1 = pl.reg.bitwise_xor(index, stride1)
-                        peer0_1 = pl.reg.gather_lanes(square0, indices1)
-                        square0 = pl.reg.add(square0, peer0_1)
-                        peer1_1 = pl.reg.gather_lanes(square1, indices1)
-                        square1 = pl.reg.add(square1, peer1_1)
-                        stride2 = pl.reg.broadcast(4, lanes=64, dtype=pl.INT32)
-                        indices2 = pl.reg.bitwise_xor(index, stride2)
-                        peer0_2 = pl.reg.gather_lanes(square0, indices2)
-                        square0 = pl.reg.add(square0, peer0_2)
-                        peer1_2 = pl.reg.gather_lanes(square1, indices2)
-                        square1 = pl.reg.add(square1, peer1_2)
-                        stride3 = pl.reg.broadcast(8, lanes=64, dtype=pl.INT32)
-                        indices3 = pl.reg.bitwise_xor(index, stride3)
-                        peer0_3 = pl.reg.gather_lanes(square0, indices3)
-                        square0 = pl.reg.add(square0, peer0_3)
-                        peer1_3 = pl.reg.gather_lanes(square1, indices3)
-                        square1 = pl.reg.add(square1, peer1_3)
-                        stride4 = pl.reg.broadcast(16, lanes=64, dtype=pl.INT32)
-                        indices4 = pl.reg.bitwise_xor(index, stride4)
-                        peer0_4 = pl.reg.gather_lanes(square0, indices4)
-                        square0 = pl.reg.add(square0, peer0_4)
-                        peer1_4 = pl.reg.gather_lanes(square1, indices4)
-                        square1 = pl.reg.add(square1, peer1_4)
-                        stride5 = pl.reg.broadcast(32, lanes=64, dtype=pl.INT32)
-                        indices5 = pl.reg.bitwise_xor(index, stride5)
-                        peer0_5 = pl.reg.gather_lanes(square0, indices5)
-                        square0 = pl.reg.add(square0, peer0_5)
-                        peer1_5 = pl.reg.gather_lanes(square1, indices5)
-                        square1 = pl.reg.add(square1, peer1_5)
-                        square_sum = pl.reg.add(square0, square1)
+                        # Reduce each 64-lane half before combining the two sums.
+                        sum0 = pl.reg.reduce_sum(square0, full, reassoc=True)
+                        sum1 = pl.reg.reduce_sum(square1, full, reassoc=True)
+                        sum0_full = pl.reg.broadcast(sum0, lanes=64, dtype=pl.FP32)
+                        sum1_full = pl.reg.broadcast(sum1, lanes=64, dtype=pl.FP32)
+                        square_sum = pl.reg.add(sum0_full, sum1_full)
                         mean = pl.reg.muls(square_sum, 0.0078125, full)
                         shifted = pl.reg.adds(mean, INDEX_KEY_EPS, full)
                         denominator = pl.reg.sqrt(shifted)
                         inverse = pl.reg.div(one, denominator)
 
-                        # Normalize segment 0; preserve the BF16 RNE boundary in FP32 bits.
+                        # Normalize segment 0 and round through BF16.
                         values0 = pl.reg.mul(source0, inverse)
                         values0 = pl.reg.mul(values0, gamma0)
-                        values0_bits = pl.reg.interpret_cast(values0, dtype=pl.UINT32)
-                        values0_high = pl.reg.shift_rights(values0_bits, 16, full)
-                        values0_lsb = pl.reg.bitwise_and(values0_high, bit_one)
-                        values0_bias = pl.reg.adds(values0_lsb, 32767, full)
-                        values0_bits = pl.reg.add(values0_bits, values0_bias)
-                        values0_bits = pl.reg.bitwise_and(values0_bits, bf16_mask)
-                        values0 = pl.reg.interpret_cast(values0_bits, dtype=pl.FP32)
+                        values0_bf = pl.reg.convert(values0, dtype=pl.BF16, rounding="R", saturate=False)
+                        values0 = pl.reg.convert(values0_bf, dtype=pl.FP32)
                         maximum0 = pl.reg.abs(values0)
-                        max_peer0_0 = pl.reg.gather_lanes(maximum0, indices0)
-                        maximum0 = pl.reg.maximum(maximum0, max_peer0_0)
-                        max_peer0_1 = pl.reg.gather_lanes(maximum0, indices1)
-                        maximum0 = pl.reg.maximum(maximum0, max_peer0_1)
-                        max_peer0_2 = pl.reg.gather_lanes(maximum0, indices2)
-                        maximum0 = pl.reg.maximum(maximum0, max_peer0_2)
-                        max_peer0_3 = pl.reg.gather_lanes(maximum0, indices3)
-                        maximum0 = pl.reg.maximum(maximum0, max_peer0_3)
-                        max_peer0_4 = pl.reg.gather_lanes(maximum0, indices4)
-                        maximum0 = pl.reg.maximum(maximum0, max_peer0_4)
+                        group_max0 = pl.reg.reduce_max(maximum0, full, group_size=32)
+                        maximum0 = pl.reg.group_broadcast(group_max0, lanes=64)
                         maximum0 = pl.reg.maximums(maximum0, 7.052966104933725e-38, full)
                         raw_scale0 = pl.reg.muls(maximum0, 0.16666666666666666, full)
                         scale_bits0 = pl.reg.interpret_cast(raw_scale0, dtype=pl.INT32)
@@ -795,18 +752,13 @@ def publish_index_rows_pypto(
                         packed0 = pl.reg.bitwise_or(low0, high0)
                         packed0 = pl.reg.convert(packed0, dtype=pl.INT8, saturate=False)
                         packed0 = pl.reg.interpret_cast(packed0, dtype=pl.UINT8)
-                        payload = pl.reg.store(payload, offset=0, value=packed0, mask=lower)
+                        stored_payload0 = pl.reg.store(payload_values, offset=row * INDEX_KEY_BYTE_TILE, value=packed0, mask=lower)
 
-                        # Normalize segment 1; preserve the BF16 RNE boundary in FP32 bits.
+                        # Normalize segment 1 and round through BF16.
                         values1 = pl.reg.mul(source1, inverse)
                         values1 = pl.reg.mul(values1, gamma1)
-                        values1_bits = pl.reg.interpret_cast(values1, dtype=pl.UINT32)
-                        values1_high = pl.reg.shift_rights(values1_bits, 16, full)
-                        values1_lsb = pl.reg.bitwise_and(values1_high, bit_one)
-                        values1_bias = pl.reg.adds(values1_lsb, 32767, full)
-                        values1_bits = pl.reg.add(values1_bits, values1_bias)
-                        values1_bits = pl.reg.bitwise_and(values1_bits, bf16_mask)
-                        values1 = pl.reg.interpret_cast(values1_bits, dtype=pl.FP32)
+                        values1_bf = pl.reg.convert(values1, dtype=pl.BF16, rounding="R", saturate=False)
+                        values1 = pl.reg.convert(values1_bf, dtype=pl.FP32)
                         # Rotate adjacent pairs in the trailing 64 lanes without FMA contraction.
                         even, odd = pl.reg.dintlv(values1, values1, full)
                         real_a = pl.reg.mul(even, cosv)
@@ -816,24 +768,11 @@ def publish_index_rows_pypto(
                         real = pl.reg.sub(real_a, real_b)
                         imag = pl.reg.add(imag_a, imag_b)
                         rotated, unused = pl.reg.intlv(real, imag, full)
-                        rotated_bits = pl.reg.interpret_cast(rotated, dtype=pl.UINT32)
-                        rotated_high = pl.reg.shift_rights(rotated_bits, 16, full)
-                        rotated_lsb = pl.reg.bitwise_and(rotated_high, bit_one)
-                        rotated_bias = pl.reg.adds(rotated_lsb, 32767, full)
-                        rotated_bits = pl.reg.add(rotated_bits, rotated_bias)
-                        rotated_bits = pl.reg.bitwise_and(rotated_bits, bf16_mask)
-                        rotated = pl.reg.interpret_cast(rotated_bits, dtype=pl.FP32)
+                        rotated_bf = pl.reg.convert(rotated, dtype=pl.BF16, rounding="R", saturate=False)
+                        rotated = pl.reg.convert(rotated_bf, dtype=pl.FP32)
                         maximum1 = pl.reg.abs(rotated)
-                        max_peer1_0 = pl.reg.gather_lanes(maximum1, indices0)
-                        maximum1 = pl.reg.maximum(maximum1, max_peer1_0)
-                        max_peer1_1 = pl.reg.gather_lanes(maximum1, indices1)
-                        maximum1 = pl.reg.maximum(maximum1, max_peer1_1)
-                        max_peer1_2 = pl.reg.gather_lanes(maximum1, indices2)
-                        maximum1 = pl.reg.maximum(maximum1, max_peer1_2)
-                        max_peer1_3 = pl.reg.gather_lanes(maximum1, indices3)
-                        maximum1 = pl.reg.maximum(maximum1, max_peer1_3)
-                        max_peer1_4 = pl.reg.gather_lanes(maximum1, indices4)
-                        maximum1 = pl.reg.maximum(maximum1, max_peer1_4)
+                        group_max1 = pl.reg.reduce_max(maximum1, full, group_size=32)
+                        maximum1 = pl.reg.group_broadcast(group_max1, lanes=64)
                         maximum1 = pl.reg.maximums(maximum1, 7.052966104933725e-38, full)
                         raw_scale1 = pl.reg.muls(maximum1, 0.16666666666666666, full)
                         scale_bits1 = pl.reg.interpret_cast(raw_scale1, dtype=pl.INT32)
@@ -875,11 +814,9 @@ def publish_index_rows_pypto(
                         packed1 = pl.reg.bitwise_or(low1, high1)
                         packed1 = pl.reg.convert(packed1, dtype=pl.INT8, saturate=False)
                         packed1 = pl.reg.interpret_cast(packed1, dtype=pl.UINT8)
-                        payload = pl.reg.store(payload, offset=32, value=packed1, mask=lower)
+                        stored_payload1 = pl.reg.store(stored_payload0, offset=row * INDEX_KEY_BYTE_TILE + 32, value=packed1, mask=lower)
 
                         # Pack four scale codes into one aligned 32-bit word.
-                        first_index = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
-                        second_index = pl.reg.broadcast(32, lanes=64, dtype=pl.INT32)
                         exp0 = pl.reg.gather_lanes(exponent0, first_index)
                         exp1 = pl.reg.gather_lanes(exponent0, second_index)
                         exp2 = pl.reg.gather_lanes(exponent1, first_index)
@@ -892,17 +829,25 @@ def publish_index_rows_pypto(
                         scale_word = pl.reg.bitwise_or(lower_word, upper_word)
                         scale_value = pl.reg.interpret_cast(scale_word, dtype=pl.UINT8)
                         scale_mask = pl.reg.active_mask(4, lanes=256)
-                        scale_bytes = pl.reg.store(scale_bytes, offset=0, value=scale_value, mask=scale_mask)
-                    payload_row = pl.reshape(payload, [1, INDEX_KEY_BYTE_TILE])
-                    scale_row = pl.reshape(scale_bytes, [1, INDEX_KEY_BYTE_TILE])
-                    payload_row = pl.set_validshape(payload_row, 1, INDEX_DIM // 2)
-                    scale_row = pl.set_validshape(scale_row, 1, _SCALE_COUNT)
+                        stored_scales = pl.reg.store(scale_values, offset=row * INDEX_KEY_BYTE_TILE, value=scale_value, mask=scale_mask)
+                pl.system.set_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
+                pl.system.wait_flag(pl.PipeType.V, pl.PipeType.MTE3, 0)
+                for write_row in pl.range(final_pending):
+                    target = pl.cast(targets[write_row], pl.INDEX)
+                    payload_row = pl.tile.slice(payload_batch, [1, INDEX_KEY_BYTE_TILE], [write_row, 0], valid_shape=[1, INDEX_DIM // 2])
+                    scale_row = pl.tile.slice(scale_batch, [1, INDEX_KEY_BYTE_TILE], [write_row, 0], valid_shape=[1, _SCALE_COUNT])
                     encoded = pl.reinterpret_view(scale_row, pl.FP8E8M0)
-                    pl.store(payload_row, [slot, 0], cache_flat)
-                    pl.store(encoded, [slot, 0], scale_flat)
+                    pl.store(payload_row, [target, 0], cache_flat)
+                    pl.store(encoded, [target, 0], scale_flat)
                     # Serialize repeated slots and adjacent four-byte scale writes.
-                    pl.system.barrier(pipe=pl.PipeType.ALL)
+                    pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.S, 7)
+                    pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.S, 7)
+                pl.system.set_flag(pl.PipeType.MTE3, pl.PipeType.MTE2, 0)
+                pl.system.wait_flag(pl.PipeType.MTE3, pl.PipeType.MTE2, 0)
+            next_batch_cursor = pl.yield_(final_scan)
+        pl.system.barrier(pipe=pl.PipeType.ALL)
     return published
+
 
 @pl.jit.inline(auto_scope=False)
 def _plan_index_runs(
