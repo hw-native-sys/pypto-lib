@@ -7,6 +7,8 @@
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
 // Rotary embedding and group-16 cache publication with selectable E2M1 rounding.
+// Batch maxima/scale phases and packed cache rows adapted from Huawei Technologies
+// kv_compress_epilog_v2_quant_fp4_g16.h, Copyright (c) 2026, under the same license.
 #pragma once
 #include <cstdint>
 #include <pto/pto-inst.hpp>
@@ -32,19 +34,17 @@ __aicore__ inline __gm__ T* data(__gm__ int64_t* args, int index) {
 #if defined(__DAV_VEC__)
 template <bool RoundEven>
 __tf__ __aicore__ inline void quantize(
-    Batch<uint8_t, 256>::TileDType __out__ packed,
-    Batch<bfloat16_t, 32>::TileDType __out__ scales,
+    Batch<uint8_t, 320>::TileDType __out__ packed,
     Batch<bfloat16_t, 512>::TileDType __in__ raw,
-    Vec<float, 32>::TileDType __out__ scratch, uint16_t rows) {
+    Batch<float, 32>::TileDType __out__ scratch, uint16_t rows) {
     auto src_base = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(raw);
     auto dst_base = (__ubuf__ uint8_t*)__cce_get_tile_ptr(packed);
     auto rounded_scales = (__ubuf__ float*)__cce_get_tile_ptr(scratch);
-    auto factors_base = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(scales);
 #if defined(__CPU_SIM)
     for (int row = 0; row < rows; ++row) {
         auto src = src_base + row * 512;
-        auto dst = dst_base + row * 256;
-        auto factors = factors_base + row * 32;
+        auto dst = dst_base + row * 320;
+        auto factors = reinterpret_cast<__ubuf__ bfloat16_t*>(dst + 256);
         for (int group = 0; group < 32; ++group) {
             float maximum = 0.0f;
             for (int i = 0; i < 16; ++i) maximum = std::max(maximum, std::abs(static_cast<float>(src[group * 16 + i])));
@@ -74,8 +74,8 @@ __tf__ __aicore__ inline void quantize(
         vdup(abs_mask, (uint16_t)0x7fff, full16, MODE_ZEROING);
         for (uint16_t row = 0; row < rows; ++row) {
             auto src = src_base + row * 512;
-            auto dst = dst_base + row * 256;
-            auto factors = factors_base + row * 32;
+            auto dst = dst_base + row * 320;
+            auto factors = reinterpret_cast<__ubuf__ bfloat16_t*>(dst + 256);
             vector_align max_store;
             for (uint16_t chunk = 0; chunk < 4; ++chunk) {
                 RegTensor<bfloat16_t> values;
@@ -86,7 +86,10 @@ __tf__ __aicore__ inline void quantize(
                 vstus(max_store, 8, (RegTensor<bfloat16_t>&)maximum, factors + chunk * 8);
             }
             vstas(max_store, factors, 0);
-            mem_bar(VST_VLD);
+        }
+        mem_bar(VST_VLD);
+        for (uint16_t row = 0; row < rows; ++row) {
+            auto factors = reinterpret_cast<__ubuf__ bfloat16_t*>(dst_base + row * 320 + 256);
             RegTensor<bfloat16_t> bf_scales;
             RegTensor<float> maxima, rounded;
             vlds(bf_scales, factors, 0, UNPK_B16);
@@ -96,55 +99,60 @@ __tf__ __aicore__ inline void quantize(
             vcvt(bf_scales, maxima, lower, ROUND_R, RS_DISABLE, PART_EVEN);
             vcvt(rounded, bf_scales, lower, PART_EVEN);
             vsts(bf_scales, factors, 0, PK_B32, lower);
-            vsts(rounded, rounded_scales, 0, NORM_B32, lower);
-            mem_bar(VST_VLD);
+            vsts(rounded, rounded_scales, row * 32, NORM_B32, lower);
+        }
+        mem_bar(VST_VLD);
+        uint32_t packed_count = 64;
+        MaskReg packed16 = plt_b16(packed_count, POST_UPDATE);
+        RegTensor<uint32_t> magnitude_mask, sign_mask32, low_mask, jam_mask;
+        vdup(magnitude_mask, (uint32_t)0x7fffffff, full, MODE_ZEROING);
+        vdup(sign_mask32, (uint32_t)0x80000000, full, MODE_ZEROING);
+        vdup(low_mask, (uint32_t)0xffff, full, MODE_ZEROING);
+        vdup(jam_mask, (uint32_t)0x10000, full, MODE_ZEROING);
+        for (uint16_t row = 0; row < rows; ++row) {
+            auto src = src_base + row * 512;
+            auto dst = dst_base + row * 320;
             RegTensor<uint32_t> indices;
             vci((RegTensor<int32_t>&)indices, 0, INC_ORDER);
             vshrs(indices, indices, (uint32_t)4, full, MODE_ZEROING);
             for (uint16_t chunk = 0; chunk < 8; ++chunk) {
                 RegTensor<bfloat16_t> bf_values;
-                RegTensor<float> values, magnitude, scale, normalized;
+                RegTensor<float> values, scale, normalized;
                 vlds(bf_values, src, chunk * 64, UNPK_B16);
                 vcvt(values, bf_values, full, PART_EVEN);
-                vgather2(scale, rounded_scales + chunk * 4, indices, full);
+                vgather2(scale, rounded_scales + row * 32 + chunk * 4, indices, full);
                 vdiv(normalized, values, scale, full, MODE_ZEROING);
-                vabs(magnitude, normalized, full);
-                RegTensor<int32_t> codes, level, sign, sign_mask;
-                vdup(codes, 0, full, MODE_ZEROING);
+                RegTensor<uint32_t> bits, absolute, sign_zero, low, jammed;
+                vand(absolute, (RegTensor<uint32_t>&)normalized, magnitude_mask, full, MODE_ZEROING);
+                vand(sign_zero, (RegTensor<uint32_t>&)normalized, sign_mask32, full, MODE_ZEROING);
                 MaskReg selected;
-                vcmps_gt(selected, magnitude, 0.25f, full);
-                vdup(level, 1, full, MODE_ZEROING);
-                vsel(codes, level, codes, selected);
-                if constexpr (RoundEven) { vcmps_ge(selected, magnitude, 0.75f, full); }
-                else { vcmps_gt(selected, magnitude, 0.75f, full); }
-                vdup(level, 2, full, MODE_ZEROING);
-                vsel(codes, level, codes, selected);
-                vcmps_gt(selected, magnitude, 1.25f, full);
-                vdup(level, 3, full, MODE_ZEROING);
-                vsel(codes, level, codes, selected);
-                if constexpr (RoundEven) { vcmps_ge(selected, magnitude, 1.75f, full); }
-                else { vcmps_gt(selected, magnitude, 1.75f, full); }
-                vdup(level, 4, full, MODE_ZEROING);
-                vsel(codes, level, codes, selected);
-                vcmps_gt(selected, magnitude, 2.5f, full);
-                vdup(level, 5, full, MODE_ZEROING);
-                vsel(codes, level, codes, selected);
-                if constexpr (RoundEven) { vcmps_ge(selected, magnitude, 3.5f, full); }
-                else { vcmps_gt(selected, magnitude, 3.5f, full); }
-                vdup(level, 6, full, MODE_ZEROING);
-                vsel(codes, level, codes, selected);
-                vcmps_gt(selected, magnitude, 5.0f, full);
-                vdup(level, 7, full, MODE_ZEROING);
-                vsel(codes, level, codes, selected);
-                vshrs(sign, (RegTensor<int32_t>&)normalized, 28, full, MODE_ZEROING);
-                vdup(sign_mask, 8, full, MODE_ZEROING);
-                vand(sign, sign, sign_mask, full, MODE_ZEROING);
-                vor(codes, codes, sign, full, MODE_ZEROING);
-                RegTensor<int32_t> even, odd, bytes;
-                vdintlv(even, odd, codes, codes);
-                vshls(odd, odd, 4, lower, MODE_ZEROING);
-                vor(bytes, even, odd, lower, MODE_ZEROING);
-                vsts(bytes, (__ubuf__ int32_t*)(dst + chunk * 32), 0, PK4_B32, lower);
+                // Manual encoding maps NaNs to zero magnitude while retaining the sign.
+                vcmps_gt(selected, absolute, (uint32_t)0x7f800000, full);
+                vsel(bits, sign_zero, (RegTensor<uint32_t>&)normalized, selected);
+                if constexpr (!RoundEven) {
+                    // Only these RNE ties round upward; C2A requires the lower magnitude.
+                    MaskReg tie, next_tie;
+                    vcmps_eq(tie, absolute, (uint32_t)0x3f400000, full);
+                    vcmps_eq(next_tie, absolute, (uint32_t)0x3fe00000, full);
+                    por(tie, tie, next_tie, full);
+                    vcmps_eq(next_tie, absolute, (uint32_t)0x40600000, full);
+                    por(tie, tie, next_tie, full);
+                    vadds(jammed, bits, (uint32_t)-1, full, MODE_ZEROING);
+                    vsel(bits, jammed, bits, tie);
+                }
+                // Round-to-odd BF16 preserves the side of every FP4 midpoint; plain
+                // BF16 rounding would introduce double-rounding at those boundaries.
+                vand(low, bits, low_mask, full, MODE_ZEROING);
+                vcmps_ne(selected, low, (uint32_t)0, full);
+                vor(jammed, bits, jam_mask, full, MODE_ZEROING);
+                vsel(bits, jammed, bits, selected);
+                RegTensor<bfloat16_t> bf_bridge;
+                RegTensor<uint16_t> dense, unused;
+                vcvt(bf_bridge, (RegTensor<float>&)bits, full, ROUND_Z, RS_DISABLE, PART_EVEN);
+                vdintlv(dense, unused, (RegTensor<uint16_t>&)bf_bridge, (RegTensor<uint16_t>&)bf_bridge);
+                vector_f4e2m1x2 fp4;
+                vcvt(fp4, (vector_bf16&)dense, packed16, ROUND_R, PART_P0);
+                vsts((RegTensor<uint8_t>&)fp4, dst, chunk * 32, PK4_B32, packed16);
             }
         }
     }
@@ -197,43 +205,5 @@ __tf__ __aicore__ inline void rotate(
 #endif
 }
 
-template <bool RoundEven>
-__aicore__ inline void publish_rows(
-    Batch<bfloat16_t, 512>& input, Batch<float, 32>& cosine, Batch<float, 32>& sine,
-    Batch<uint8_t, 256>& packed, Batch<bfloat16_t, 32>& scales, Vec<float, 32>& scratch,
-    Vec<int64_t, 8>& targets, Vec<int32_t, 8>& tokens, int rows,
-    int input_address, int packed_address, int scales_address,
-    __gm__ bfloat16_t* latent, __gm__ uint8_t* cache, __gm__ bfloat16_t* cache_scales,
-    int64_t cache_stride, int64_t scale_stride) {
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    for (int row = 0; row < rows; ++row) {
-        Vec<bfloat16_t, 512> value;
-        TASSIGN(value, input_address + row * 1024);
-        GM<bfloat16_t, 512> latent_gm(latent + (int64_t)tokens.GetValue(row) * 512);
-        TSTORE(latent_gm, value);
-    }
-    // Finish storing the unrotated latent before changing its UB buffer.
-    set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-    rotate(input.data(), input.data(), cosine.data(), sine.data(), rows);
-    quantize<RoundEven>(packed.data(), scales.data(), input.data(), scratch.data(), rows);
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    for (int row = 0; row < rows; ++row) {
-        int64_t slot = targets.GetValue(row);
-        if (slot < 0) continue;
-        Vec<uint8_t, 256> payload;
-        Vec<bfloat16_t, 32> factor;
-        TASSIGN(payload, packed_address + row * 256);
-        TASSIGN(factor, scales_address + row * 64);
-        GM<uint8_t, 256> output_gm(cache + slot * cache_stride);
-        GM<bfloat16_t, 32> scales_gm(cache_scales + slot * scale_stride);
-        TSTORE(output_gm, payload);
-        TSTORE(scales_gm, factor);
-        pipe_barrier(PIPE_MTE3);
-    }
-    pipe_barrier(PIPE_ALL);
-}
 #endif
 } // namespace

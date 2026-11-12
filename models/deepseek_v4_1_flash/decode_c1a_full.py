@@ -28,7 +28,8 @@ from config import (
     INDEX_CACHE_GROUP, FLASH as M, B_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN,
     INDEX_POOL_BLOCKS_DYN, ORI_BLOCKS_DYN, TABLE_DYN, T_DYN, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
-from compressor import C1A_PROJ_M_TILE, C1A_PROJ_N_TILE, c1a_compressor_project, c1a_compressor_publish
+from compressor import C1A_PROJ_M_TILE, C1A_PROJ_N_TILE, c1a_compressor_project
+from compressor_epilogue import compressor_epilogue
 
 # model config
 LOCAL_H = M.num_attention_heads
@@ -138,10 +139,10 @@ def decode_c1a_full(
         m_tile=C1A_PROJ_M_TILE, n_tile=C1A_PROJ_N_TILE,
     )
     latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    compressed_ready = c1a_compressor_publish(
+    compressed_ready = compressor_epilogue(
         projected, compressor_norm_weight, latent, compressed_rope_cos, compressed_rope_sin,
         compressed_slots, compressed_cache,
-        num_tokens, x_ready, pc_tid,
+        num_tokens, x_ready, pc_tid, round_even=1,
     )
     projected_key = pl.create_tensor([tokens, INDEX_DIM], dtype=pl.BF16)
     pk_tid = project_index_key(latent, index_wk, projected_key, num_tokens, compressed_ready, max_workers=8)

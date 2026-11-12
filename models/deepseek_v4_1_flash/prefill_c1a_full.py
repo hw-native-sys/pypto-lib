@@ -21,7 +21,8 @@ from config import (
     INDEX_CACHE_GROUP, INDEX_POOL_BLOCKS_DYN, STATE_CAPACITY, CP_SIZE, PREFILL_MAX_TOKENS,
     WINDOW_CACHE_BYTES, CMP_BLOCKS_DYN, COMPRESSED_CACHE_BYTES,
 )
-from compressor import c1a_compressor_project, c1a_compressor_publish
+from compressor import c1a_compressor_project
+from compressor_epilogue import compressor_epilogue
 from hc import (
     hc_pre, hc_normalize, make_hc_inputs, golden_hc_head_norm, golden_hc_mixes, golden_hc_post, zero_bf16_padding,
 )
@@ -92,10 +93,10 @@ def prefill_publish_decoder(
         x, w_compressor_kv, compressed_projection, num_tokens, projection_ready, m_tile=80, n_tile=128,
     )
     compressed_latent = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    compressed_ready = c1a_compressor_publish(
+    compressed_ready = compressor_epilogue(
         compressed_projection, w_compressor_norm, compressed_latent, compressed_rope_cos, compressed_rope_sin,
         compressed_write_slots, compressed_cache,
-        num_tokens, projection_ready, projection_done,
+        num_tokens, projection_ready, projection_done, round_even=1,
     )
     index_ready = publish_c1a_index_key(
         compressed_latent, w_index_k, w_index_norm, compressed_rope_cos, compressed_rope_sin,
