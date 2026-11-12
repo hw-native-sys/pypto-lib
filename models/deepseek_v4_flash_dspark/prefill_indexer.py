@@ -10,8 +10,6 @@
 
 import pypto.language as pl
 
-from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
-
 from config import (
     FLASH as M,
     BLOCK_SIZE,
@@ -381,7 +379,7 @@ def _prefill_indexer_dense_tile(
     # sums/products with constants are provable, not a quotient).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
@@ -662,7 +660,7 @@ def prefill_indexer(
     # sums/products with constants are provable, not a quotient).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
@@ -713,24 +711,6 @@ def prefill_indexer(
 
 
 @pl.jit.inline(auto_scope=False)
-def prepare_indexer_query_rope(
-    rope_dup_idx_template: pl.Tensor[[1, ROPE_HEAD_DIM], pl.INT32],
-    rope_swap_idx_template: pl.Tensor[[ROPE_ROW_TILE, ROPE_HEAD_DIM], pl.INT32],
-    rope_sign_template: pl.Tensor[[1, ROPE_HEAD_DIM], pl.FP32],
-    cache_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Prepare the reusable query RoPE templates after cache publication."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_rope_index_prepare", deps=[cache_ready]) as ready:
-        for rope_c in pl.range(ROPE_HEAD_DIM):
-            rope_lane = rope_c % 2
-            pl.write(rope_dup_idx_template, [0, rope_c], pl.cast(rope_c // 2, pl.INT32))
-            pl.write(rope_sign_template, [0, rope_c], pl.cast(pl.cast(rope_lane * 2 - 1, pl.INT32), pl.FP32))
-            for rope_r in pl.range(ROPE_ROW_TILE):
-                pl.write(rope_swap_idx_template, [rope_r, rope_c], pl.cast(rope_c + 1 - rope_lane * 2, pl.INT32))
-    return ready
-
-
-@pl.jit.inline(auto_scope=False)
 def prefill_indexer_query(
     x: pl.Tensor[[Q_T_DYN, D], pl.BF16],
     qr: pl.Tensor[[Q_T_DYN, Q_LORA], pl.INT8],
@@ -741,7 +721,7 @@ def prefill_indexer_query(
     # sums/products with constants are provable, not a quotient).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[Q_T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[Q_T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
@@ -760,10 +740,17 @@ def prefill_indexer_query(
     rope_dup_idx_template = pl.create_tensor([1, ROPE_HEAD_DIM], dtype=pl.INT32)
     rope_swap_idx_template = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
     rope_sign_template = pl.create_tensor([1, ROPE_HEAD_DIM], dtype=pl.FP32)
-    query_cache_ready = completion[0]
-    rope_prepare_tid = prepare_indexer_query_rope(
-        rope_dup_idx_template, rope_swap_idx_template, rope_sign_template, query_cache_ready,
-    )
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_idx_rope_index_prepare",
+        deps=[completion[0]],
+    ) as rope_prepare_tid:
+        for rope_c in pl.range(ROPE_HEAD_DIM):
+            rope_lane = rope_c % 2
+            pl.write(rope_dup_idx_template, [0, rope_c], pl.cast(rope_c // 2, pl.INT32))
+            pl.write(rope_sign_template, [0, rope_c], pl.cast(pl.cast(rope_lane * 2 - 1, pl.INT32), pl.FP32))
+            for rope_r in pl.range(ROPE_ROW_TILE):
+                pl.write(rope_swap_idx_template, [rope_r, rope_c], pl.cast(rope_c + 1 - rope_lane * 2, pl.INT32))
 
     # Reusable score and pair arenas.
     score_arena = pl.create_tensor([PREFILL_DENSE_TILE, INDEXER_MAX_CANDIDATES], dtype=pl.FP32, manual_dep=True)
@@ -965,7 +952,7 @@ def prefill_indexer_test(
     # sums/products with constants are provable, not a quotient).
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16, pl.NZ],
     cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],

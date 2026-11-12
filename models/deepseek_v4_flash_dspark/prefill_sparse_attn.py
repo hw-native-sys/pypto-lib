@@ -662,7 +662,6 @@ def _sparse_attn_wave(
     rope_sin_signed: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
     rope_swap_idx: pl.Tensor[[HEAD_TILE, ROPE_DIM], pl.INT32],
     prior_merge_tid: pl.Scalar[pl.TASK_ID],
-    compute_dep: pl.Scalar[pl.TASK_ID],
     query_base: pl.Scalar[pl.INDEX],
     dense_query_base: pl.Scalar[pl.INDEX],
 ) -> pl.Scalar[pl.TASK_ID]:
@@ -800,7 +799,7 @@ def _sparse_attn_wave(
     mi_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
     li_transfer = pl.create_tensor([transfer_heads, 1], dtype=pl.FP32)
     ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
-    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[gather_ori_tid, gather_cmp_tid, compute_dep], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[gather_ori_tid, gather_cmp_tid], allow_early_resolve=True) as qk_tid:
         qk_core = pl.tile.get_block_idx()
         pl.system.set_ffts(ffts_workspace)
         qk_rows = pl.min(PREFILL_QUERY_TILE, pl.max(pl.min(t_dim, active_rows) - query_base, 0))
@@ -1080,7 +1079,6 @@ def _sparse_attn_heads(
                     rope_cos_il,
                     rope_sin_signed,
                     rope_swap_idx,
-                    prior_merge_tid,
                     prior_merge_tid,
                     query_base,
                     dense_query_base,

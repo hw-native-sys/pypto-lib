@@ -12,7 +12,7 @@ from math import prod
 
 import torch
 
-from models.deepseek_v4_flash_dspark.config import DECODE_SEQ as DSPARK_DECODE_SEQ
+from .prefill_ops.config import DECODE_SEQ as PREFILL_STATE_ROWS
 
 
 RANKS = 8
@@ -267,7 +267,7 @@ def prefill_slot_mappings(positions, decode_tables, caches, *, block_counts=None
             # tile once its predecessor's tail has been consumed.
             # The HCA prefill kernel publishes its 128-row history plus one
             # DSpark decode transaction in the same parallel state update.
-            tail = 128 + DSPARK_DECODE_SEQ if name == "hca_state_slot_mapping_full" else 8
+            tail = 128 + PREFILL_STATE_ROWS if name == "hca_state_slot_mapping_full" else 8
             windows = ([active[start : start + 512][-tail:] for start in range(0, active.numel(), 512)]
                        if "state_slot_mapping" in name else [active])
             if any(window.numel() != torch.unique(window).numel() for window in windows):

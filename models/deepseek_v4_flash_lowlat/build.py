@@ -67,19 +67,13 @@ def artifact_directory(compiled):
     return Path(compiled.output_dir).resolve()
 
 
-def source_manifest(*, prefill=False):
+def source_manifest():
     root = Path(__file__).resolve().parent
     sources = {
         str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in sorted(root.rglob("*"))
         if p.suffix in (".py", ".cpp", ".inc")
     }
-    if prefill:
-        shared = root.parent / "deepseek_v4_flash_dspark"
-        sources.update({
-            "../deepseek_v4_flash_dspark/" + p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in sorted(shared.glob("*.py"))
-        })
     return sources
 
 
@@ -101,7 +95,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
     from pypto.runtime import ExecutionMode, RunConfig
 
     configure_cache(CacheConfig(enabled=True, root=Path(cache_root), readonly=False))
-    before = source_manifest(prefill=profile == "prefill")
+    before = source_manifest()
     saved_argv = sys.argv
     try:
         # The single-query and verification profiles freeze the shared operators
@@ -169,7 +163,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
                 or hashlib.sha256(actual.encode()).hexdigest() != item["selected_source_sha256"]
             ):
                 raise RuntimeError("Selected native source differs from the reviewed graft")
-    if before != source_manifest(prefill=profile == "prefill"):
+    if before != source_manifest():
         raise RuntimeError("Pipeline sources changed during compilation")
     report = dict(
         status="GENERATED_NOT_NATIVE_OR_DEVICE_TESTED",

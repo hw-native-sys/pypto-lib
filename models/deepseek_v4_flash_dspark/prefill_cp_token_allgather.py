@@ -14,7 +14,7 @@ from math import gcd
 import sys
 
 # runtime configuration
-_TP_CHOICES = (1, 2, 4, 8)
+_TP_CHOICES = (1, 2, 4)
 _TP_DEFAULT = 2
 
 

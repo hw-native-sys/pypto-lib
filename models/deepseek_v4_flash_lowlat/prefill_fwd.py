@@ -24,9 +24,9 @@ _HCA_LAYERS = 20
 
 
 @contextmanager
-def _dspark_prefill_import(*, query_pipeline=False):
-    """Isolate the upstream model's import-time TP8/DP1 configuration."""
-    source = Path(__file__).resolve().parent.parent / "deepseek_v4_flash_dspark"
+def _prefill_import(*, query_pipeline=False):
+    """Isolate the private prefill operators' import-time TP8 configuration."""
+    source = Path(__file__).resolve().parent / "prefill_ops"
     names = tuple(path.stem for path in source.glob("*.py"))
     missing = object()
     with _IMPORT_LOCK:
@@ -58,7 +58,7 @@ def load_prefill_programs(*, mode="chunk"):
     """
     if mode not in ("chunk", "serial"):
         raise ValueError("Prefill mode must be chunk or serial")
-    with _dspark_prefill_import(query_pipeline=mode == "chunk"):
+    with _prefill_import(query_pipeline=mode == "chunk"):
         qkv = importlib.import_module("qkv_proj_rope")
         ordered_qkv = importlib.import_module("models.deepseek_v4_flash_lowlat.drafter.qkv_proj_rope")
         geometry = (

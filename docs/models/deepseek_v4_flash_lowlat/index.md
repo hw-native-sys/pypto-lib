@@ -386,8 +386,9 @@ attention queries. Bind the decode Worker's existing TP8 weight banks, original
 quantization scales, and cache allocations. The chunk entry reshapes contiguous
 layer banks through borrowed device views and never uploads another weight set.
 Query LoRA, query expansion, indexer-gate and vocabulary projections keep the
-decode banks' ND storage. The isolated import selects the corresponding shared
-operator annotations; callers must not repack these resident banks into NZ.
+decode banks' ND storage. The isolated import loads lowlat's private copies in
+`prefill_ops/`; callers must not repack these resident banks into NZ. The DSpark
+model's operators and configuration remain unchanged.
 `load_prefill_programs(mode="serial")` loads the six component entries for the
 same TP8 numerical baseline.
 
@@ -474,7 +475,9 @@ the actual reconstructed input, with no fixed short-prompt fallback.
 
 The report records chunk/tile sizes, the exact-prefetch mode, two slots, and
 the retained eight projection replicas. Code generation, native compilation,
-and host binding checks alone do not establish device equivalence. A reconstructed
+and host binding checks alone do not establish device equivalence. The checks
+below apply to the shared-storage artifact before the private-operator relocation;
+the relocated artifact requires its own device rerun. A reconstructed
 AgentX request of 16,384 tokens passed full-output and cache byte-digest checks
 against the frozen TP8 component baseline. On the same Worker, 64 subsequent
 single-query decode steps retained the original weight/cache allocations and
