@@ -15,7 +15,7 @@ from .compressor_core import RING_ROWS_DYN
 from .c2_prefill_pool import compressor_ratio2_prefill
 from .operator_config import B_DYN, Q_START_DYN, STATE_BLOCKS_DYN
 from .qkv_proj_rope import make_bf16_projection_staged
-from .indexer import INDEX_HEADS, WEIGHT_ROWS_TILE, QUANT_ROWS_TILE
+from .decode_indexer import INDEX_HEADS, WEIGHT_ROWS_TILE, QUANT_ROWS_TILE
 
 
 def make_wk_input_observed_inline(capacity):

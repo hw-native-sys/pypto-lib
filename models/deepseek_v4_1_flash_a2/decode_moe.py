@@ -32,6 +32,20 @@ from models.deepseek_v4_1_flash_a2.config import FLASH
 from models.deepseek_v4_1_flash_a2.moe_router import make_moe_router_inline
 from models.deepseek_v4_1_flash_a2.moe_shared import make_shared_moe_w8a8_inline
 from models.deepseek_v4_1_flash_a2.quant import make_dynamic_int8_quantize
+from models.deepseek_v4_1_flash_a2.moe import (
+    make_routed_expert_projection,
+    make_routed_expert_w8a8,
+    make_shared_expert_projection,
+    make_shared_expert_w8a8,
+    make_w8a8_expert_projection,
+    routed_expert_reference,
+    shared_expert_reference,
+    w8a8_expert_linear,
+)
+from models.deepseek_v4_1_flash_a2.moe_router import make_moe_router
+from models.deepseek_v4_1_flash_a2.moe_shared import make_shared_moe_w8a8
+from models.deepseek_v4_1_flash_a2.moe_routed import expert_routed_inline
+from models.deepseek_v4_1_flash_a2.moe_dispatch import make_dispatch_layout, make_route_restore
 
 
 # EP2 product topology and Decode capacity.
@@ -60,7 +74,14 @@ from models.deepseek_v4_1_flash_a2.moe_routed import expert_routed_tile
 _ROUTER_CONFIG = asdict(FLASH)
 _ROUTER_CONFIG["image_sentinel_base_id"] = 129257
 ROUTER = make_moe_router_inline(T, _ROUTER_CONFIG)
-QUANTIZE = make_dynamic_int8_quantize(T, D)
+# CANN's fused EP2 dispatch quantizes normalized rows with FP16 truncation
+# followed by a rounded INT8 store.  The legacy mode remains available for a
+# controlled comparison while other model paths keep their existing contract.
+QUANTIZE = make_dynamic_int8_quantize(
+    T,
+    D,
+    cann_dispatch=os.environ.get("PYPTO_EP2_INPUT_QUANT", "legacy") == "cann",
+)
 SHARED = make_shared_moe_w8a8_inline(T, _ROUTER_CONFIG, fused_activation=True)
 # Temporary NPU diagnosis switch.  It is consumed only by the local EP2
 # runner to isolate the two additive MoE branches; the formal path remains
@@ -313,18 +334,23 @@ def decode_ep2_combine(
     active_rows = pl.min(pl.max(pl.cast(active, pl.INDEX), 0), T)
     with pl.spmd(T, name_hint="dsv41_ep2_combine", deps=[wait_tid]):
         token = pl.tile.get_block_idx()
-        routed = pl.full([1, D], dtype=pl.FP32, value=0.0)
         if token < active_rows:
+            # The fused reference stores each routed expert result as BF16 and
+            # widens that value at combine.  Keep this per-route rounding
+            # boundary before the FP32 reduction; narrowing the aggregate
+            # after summation changes the observable MoE output.
+            routed = pl.full([1, D], dtype=pl.FP32, value=0.0)
             for route in pl.range(TOPK):
                 slot = token * TOPK + route
-                routed = pl.add(routed, slot_out[slot:slot + 1, :])
+                routed_row = pl.cast(slot_out[slot:slot + 1, :], pl.BF16, mode="rint")
+                routed = pl.add(routed, pl.cast(routed_row, pl.FP32))
             shared = pl.cast(shared_output[token:token + 1, :], pl.FP32)
             if _DEBUG_COMPONENT == 1:
                 combined = routed
             elif _DEBUG_COMPONENT == 2:
                 combined = shared
             else:
-                combined = pl.add(routed, shared)
+                combined = pl.add(shared, routed)
             output[token:token + 1, :] = pl.cast(combined, pl.BF16, mode="rint")
         else:
             output[token:token + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
@@ -334,7 +360,7 @@ def decode_ep2_combine(
 @pl.jit(auto_scope=False)
 def decode_ep2_rank(
     value: pl.Tensor[[T, D], pl.BF16],
-    router_value: pl.Tensor[[T, D], pl.BF16],
+    router_value: pl.Tensor[[T, D], pl.FP32],
     gate_weight: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     text_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     vision_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
@@ -368,6 +394,8 @@ def decode_ep2_rank(
     x_int8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     QUANTIZE(value, x_int8, x_scale, active)
+    pl.dump_tag(x_int8)
+    pl.dump_tag(x_scale)
     ROUTER(value, router_value, gate_weight, text_bias, vision_bias, input_ids, logits, route_ids, route_weights, active)
 
     pack_tid = decode_ep2_pack(
@@ -435,7 +463,7 @@ def decode_ep2_rank(
 @pl.jit.host
 def decode_ep2(
     value: pl.Tensor[[EP_SIZE, T, D], pl.BF16],
-    router_value: pl.Tensor[[EP_SIZE, T, D], pl.BF16],
+    router_value: pl.Tensor[[EP_SIZE, T, D], pl.FP32],
     gate_weight: pl.Tensor[[EP_SIZE, N_EXPERTS, D], pl.FP32],
     text_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
     vision_bias: pl.Tensor[[EP_SIZE, N_EXPERTS], pl.FP32],
@@ -518,3 +546,38 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+__all__ = [
+    "D",
+    "EP_SIZE",
+    "MOE_INTER",
+    "N_EXPERTS",
+    "N_LOCAL_EXPERTS",
+    "T",
+    "TOPK",
+    "decode_ep2",
+    "decode_ep2_arrive",
+    "decode_ep2_combine",
+    "decode_ep2_pack",
+    "decode_ep2_rank",
+    "decode_ep2_regroup",
+    "decode_ep2_return",
+    "expert_routed_inline",
+    "expert_routed_tile",
+    "make_dispatch_layout",
+    "make_moe_router",
+    "make_moe_router_inline",
+    "make_routed_expert_projection",
+    "make_routed_expert_w8a8",
+    "make_route_restore",
+    "make_shared_expert_projection",
+    "make_shared_expert_w8a8",
+    "make_shared_moe_w8a8",
+    "make_shared_moe_w8a8_inline",
+    "make_w8a8_expert_projection",
+    "product_contract",
+    "routed_expert_reference",
+    "shared_expert_reference",
+    "w8a8_expert_linear",
+]

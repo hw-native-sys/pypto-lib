@@ -17,8 +17,8 @@ from .ecotech_full2_observed import (
 from .ecotech_full2_readback import make_readback_entries
 from .ecotech_swa_prefill import GEOMETRY, make_builders
 from .hc import make_hc_post_inline
-from .indexer import make_empty_selection, make_sparse_controls
-from .prefill_norm import make_prefill_norm
+from .decode_indexer import make_empty_selection, make_sparse_controls
+from .rmsnorm import make_prefill_norm
 from .sparse_consumer_prefill import make_consumer_sparse_core
 
 

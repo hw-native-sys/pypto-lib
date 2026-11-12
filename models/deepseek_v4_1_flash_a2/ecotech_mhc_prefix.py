@@ -51,7 +51,11 @@ def make_ecotech_mhc_prefix(capacity, config):
         window_latent: pl.InOut[pl.Tensor[[capacity, 512], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        hc_pre(x, hc_function, hc_scale, hc_base, incoming, next_pre, post, comb, collapsed, active)
+        collapsed_fp32 = pl.create_tensor([capacity, 5120], dtype=pl.FP32)
+        hc_pre(
+            x, hc_function, hc_scale, hc_base, incoming, next_pre, post, comb,
+            collapsed, collapsed_fp32, active,
+        )
         project(
             collapsed, attn_norm_weight, query_norm_weight,
             wqa_weight, wqa_scale, index_weight, index_scale, wkv_weight, wkv_scale,

@@ -17,7 +17,7 @@ from .ecotech_shared import make_ecotech_shared_inline
 from .hc import make_hc_post_inline
 from .hc_pre_runtime import hc_pre_host
 from .runtime_utils import tensor_sha as _tensor_sha
-from .prefill_norm import make_prefill_norm
+from .rmsnorm import make_prefill_norm
 
 
 def _make_post(capacity, config):

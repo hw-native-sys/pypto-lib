@@ -36,16 +36,16 @@ PRODUCT_ENTRYPOINTS = (
     "decode_fwd.py",
     "decode_replay.py",
     "decode_candidates.py",
-    "decode_moe_ep2.py",
-    "decode_layer_ep2.py",
+    "decode_moe.py",
+    "decode_layer_l0.py",
 )
 VALIDATION_ENTRYPOINTS = (
     "decode_acceptance.py",
     "decode_asset_contract.py",
     "decode_gate.py",
     "decode_reference.py",
-    "decode_ep2_compile.py",
-    "decode_layer_ep2_compile.py",
+    "decode_moe_compile.py",
+    "decode_layer_l0_compile.py",
 )
 REFERENCE_ONLY_SUFFIXES = ("_runtime.py",)
 FORBIDDEN_PRODUCT_IMPORTS = ("vllm", "vllm_ascend", "torch_npu")
@@ -190,7 +190,7 @@ CONTRACT: dict[str, Any] = {
     "implementation": {
         "status": "ep2_composition_compile_pass_npu_not_run",
         "formal_ready": False,
-        "formal_entrypoint": "models.deepseek_v4_1_flash_a2.decode_moe_ep2.decode_ep2",
+        "formal_entrypoint": "models.deepseek_v4_1_flash_a2.decode_moe.decode_ep2",
         "blockers": [
             "EP2 driver NPU execution gate",
             "same-input EP2 vLLM-Ascend reference capture",

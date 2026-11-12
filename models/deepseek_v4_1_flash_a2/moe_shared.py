@@ -103,7 +103,45 @@ def make_shared_moe_w8a8_inline(capacity, config, *, fused_activation=False):
     pack_down = make_pack_weight(intermediate, hidden)
     dot_gate_up = make_dot(capacity, hidden, gate_up_width)
     dot_down = make_dot(capacity, intermediate, hidden)
+    # vLLM's quantized down projection emits BF16 before the shared/routed
+    # combine. Keep the fused activation's FP32 intermediates, but preserve
+    # that output boundary.
     dequant_down = make_dequantize(capacity, hidden)
+
+    if fused_activation:
+
+        @pl.jit.inline
+        def shared_moe_w8a8_inline_fused(
+            x: pl.Tensor[[capacity, hidden], pl.BF16],
+            gate_up_weight: pl.Tensor[[hidden, gate_up_width], pl.INT8],
+            gate_up_scale: pl.Tensor[[gate_up_width], pl.FP32],
+            down_weight: pl.Tensor[[intermediate, hidden], pl.INT8],
+            down_scale: pl.Tensor[[hidden], pl.FP32],
+            output: pl.Tensor[[capacity, hidden], pl.BF16],
+            active: pl.Scalar[pl.INT32],
+        ):
+            x_payload = pl.create_tensor([capacity, hidden], dtype=pl.INT8)
+            x_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+            quant_x(x, x_payload, x_scale, active)
+
+            gate_up_packed = pl.create_tensor([gate_up_packed_rows, N_TILE], dtype=pl.INT8)
+            pack_gate_up(gate_up_weight, gate_up_packed)
+            gate_up_acc = pl.create_tensor([capacity, gate_up_width], dtype=pl.INT32)
+            dot_gate_up(x_payload, gate_up_packed, gate_up_acc, active)
+            activation = pl.create_tensor([capacity, intermediate], dtype=activation_dtype)
+            activate(gate_up_acc, gate_up_scale, x_scale, activation, active)
+
+            hidden_payload = pl.create_tensor([capacity, intermediate], dtype=pl.INT8)
+            hidden_scale = pl.create_tensor([capacity, 8], dtype=pl.FP32)
+            quant_hidden(activation, hidden_payload, hidden_scale, active)
+            down_packed = pl.create_tensor([down_packed_rows, N_TILE], dtype=pl.INT8)
+            pack_down(down_weight, down_packed)
+            down_acc = pl.create_tensor([capacity, hidden], dtype=pl.INT32)
+            dot_down(hidden_payload, down_packed, down_acc, active)
+            dequant_down(down_acc, down_scale, hidden_scale, output, active)
+            return output
+
+        return shared_moe_w8a8_inline_fused
 
     @pl.jit.inline
     def shared_moe_w8a8_inline(

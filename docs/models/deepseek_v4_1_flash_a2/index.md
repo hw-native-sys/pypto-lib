@@ -41,9 +41,9 @@ safetensors headers. The manifest does not hash or copy tensor payloads.
 | `layer2_c1c2.py`, `c2_prefill_pool.py`, `ecotech_full2_*.py` | Ratio-two projection, ring state, pooling, cache publication and index observation. The width-128 index publisher includes the accepted 16-row quantization and reciprocal correction. |
 | `ratio1_prefill.py` | Ratio-one publication starting at an actual BF16 compressor projection. This is a distinct input boundary from the FP32 ratio-two compressor. |
 | `ecotech_prefill_consumer.py`, `indexer.py`, `sparse_consumer_prefill.py` | Consumer projections, causal controls and sparse attention stages. |
-| `decode_c2a_full.py`, `decode_c2a_reuse.py`, `decode_c1a_full.py`, `decode_c1a_reuse.py`, `decode_c1a_reindex.py` | A2/A3 stage owners for L14/L15/L19/L20/L21/L24/L25. `layer14_15.py` and `layers19_25.py` remain aggregate compatibility providers. |
+| `decode_c2a_full.py`, `decode_c2a_reuse.py`, `decode_c1a_full.py`, `decode_c1a_reuse.py`, `decode_c1a_reindex.py` | A2/A3 stage owners for L14/L15/L19/L20/L21/L24/L25. `decode_c2a_common.py` and `decode_layer_stages.py` remain shared compatibility providers. |
 | `decode_fwd.py`, `decode_replay.py` | Bounded PyPTO L0 SWA Decode ABI, single-step entry, and fixed 1/2/8-step state replay. These entries do not claim checkpoint accuracy, full-model, or distributed Decode coverage. |
-| `decode_layer_ep2.py` | Complete PyPTO L0 composition for the DP2/TP1/EP2 gate: mHC attention/cache, FFN mHC, routed/shared MoE dispatch/combine, and output restoration. The representative active-request case has an A3 result; the formal multi-case gate remains `not_run`. |
+| `decode_layer_l0.py` | Complete PyPTO L0 composition for the DP2/TP1/EP2 gate: mHC attention/cache, FFN mHC, routed/shared MoE dispatch/combine, and output restoration. The representative active-request case has an A3 result; the formal multi-case gate remains `not_run`. |
 | `decode_candidates.py`, `decode_acceptance.py`, `decode_asset_contract.py`, `decode_gate.py` | Search K=2 candidate registry, independent Decode contract, asset structure validation, product import closure scan, runtime identity capture, and fail-closed layer/topology gate reporting. |
 | `decode_checkpoint_manifest.py`, `decode_weights.py`, `decode_weight_abi.py` | Read-only Aurora metadata/header audit, lazy tensor resolver, and host-only W8A8-to-EP2 ABI packing; none performs product computation. |
 | `candidate_pool.py`, `raw_checkpoint.py` | A2/A3 candidate metadata and raw checkpoint loading. |
@@ -143,14 +143,17 @@ and host changes needed for relocation. Its `decode_files` records identify the
 new PyPTO Decode entry points and explicitly keep their accuracy evidence
 separate from source migration. Dependencies extracted from the original
 parent model retain their compute definitions in this flat directory.
-The port includes the L14 Engram observation interface, L1 native boundaries,
-and the final L20 index-publication candidate.
+The port includes the L1/L14 Engram observation interfaces, C2A source/reuse
+cache publication, and the C1A source/reindex/reuse candidate state boundary.
 
-The local tree contains bounded PyPTO L0 single-step and fixed-step SWA Decode
-entries plus the independently compiled EP2 routed/shared MoE entry. These
-entries make no claim of validated C1A/C2A chaining, mHC/residual, Engram
-residency, checkpoint-backed routing, distributed NPU execution, CP/SP,
-stacked layers, whole-network score, or serving support.
+The local tree contains bounded PyPTO L0 entries, complete layer composition
+entries for the retained L1/L2/L3/L14/L15/L19/L20/L21/L24/L25 EP2 matrix, and
+the independently compiled EP2 routed/shared MoE entry. The current paired
+representative replays pass for L1, L2, L3, L14, L19, L20, L21, L24 and L25.
+L15 reaches the complete replay but remains a precision failure because its
+observable `moe_output` exposes a PyPTO routed/shared split while the vLLM
+capture exposes a fused boundary. Composition and compile coverage do not
+promote a layer without a same-request replay.
 The independent vLLM-Ascend capture is described by
 [`decode_reference.py`](../../../models/deepseek_v4_1_flash_a2/decode_reference.py)
 and is not imported by the product path.
@@ -220,7 +223,7 @@ visible devices and runtime library path; it never imports vLLM in the product
 process.
 
 The bounded entries accept the full state ABI, while the independent
-`decode_moe_ep2.py` product entry owns the PyPTO EP2 dispatch/combine,
+`decode_moe.py` product entry owns the PyPTO EP2 dispatch/combine,
 192-expert-per-rank routed shard, and shared-expert merge. The real two-card
 MoE boundary has executed on A3 with the checkpoint and the vLLM-Ascend
 capture input; `logits`, `route_ids`, `route_weights`, and the merged MoE
@@ -230,9 +233,13 @@ output pass the `rtol=0.05, atol=0.05` gate. The evidence is recorded in
 The same PyPTO MoE boundary replay has also passed for L1, L2, L3, L14, L15,
 L19, L20, L21, L24 and L25 using their layer-specific vLLM-Ascend captures.
 Those reports compare logits, exact top-six route IDs, route weights and the
-merged routed/shared output. They are component evidence only; each complete
-physical layer remains `not_run` until its attention, cache/index, mHC and
-Engram state are composed and compared.
+merged routed/shared output. They are component evidence only. The complete
+physical-layer replays currently pass for L1, L2, L3, L14, L19, L20, L21, L24
+and L25. L15 has a complete same-request replay with attention, cache/index,
+HC, routing and final output passing; its observable `moe_output` remains
+outside the fixed gate (`max_abs=0.132812`, `mean_abs=0.0017201`) because the
+reference capture fuses routed and shared expert results before exposing that
+boundary.
 
 The complete L0 composition has also executed on the same two-card A3
 topology with mHC attention, SWA cache read/write, FFN residual, routed/shared
@@ -245,8 +252,10 @@ vLLM-Ascend contract is
 
 The formal EP2 status remains `not_run` until the required no-local-input
 collective, finished/inactive rows, unequal-length batch, slot reuse, and
-additional request-state cases are covered. Complete C1A/C2A, Engram, CP/SP
-and the requested 16-device gates remain separate blockers.
+additional request-state cases are covered. The new C1A/C2A and Engram
+compositions still require same-request paired captures and NPU replay before
+they can change the layer precision status; CP/SP and the requested 16-device
+gates remain separate blockers.
 
 ## Checks without a device
 
@@ -254,8 +263,8 @@ Compile the bounded Decode ABI without allocating a device:
 
 ```bash
 PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_fwd -p a2a3 --sim --compile-only
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_ep2_compile
-PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_layer_ep2_compile
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_moe_compile
+PYTHONPATH=$PWD python -m models.deepseek_v4_1_flash_a2.decode_layer_l0_compile
 ```
 
 Compile the deterministic single-context state replay for each supported step
@@ -282,12 +291,12 @@ they do not replace numerical comparison against an independent reference.
 The A2/A3 decoder adaptation is integrated into this same flat package. The
 decoder contract is shared through `config.py`, `operator_config.py`,
 `engram.py`, and `sparse_attention.py`; W8A8 quantization and GEMM live in
-`quant.py` and `gemm.py`. The decoder entry points use the A5 file names:
-`decode_c2a_full.py`, `decode_c2a_reuse.py`, `decode_c1a_full.py`,
-`decode_c1a_reuse.py`, and `decode_c1a_reindex.py`. The CPU references and
-bounded PyPTO validators are direct modules in this directory, with no nested
-`verifier` package. The original `layer14_15.py` and `layers19_25.py` imports
-remain available during migration.
+`quant.py` and `gemm.py`. The complete EP2 layer entries are
+`decode_layer_engram.py` (L1), `decode_layer_c2a.py` (L2/L3/L14/L15/L19),
+and `decode_layer_c1a.py` (L20/L21/L24/L25). The CPU references and bounded
+PyPTO validators remain direct modules in this directory, with no nested
+`verifier` package. The original stage files and aggregate imports remain
+available during migration.
 
 The old external validator suite is intentionally excluded from this session.
 The retained A2/A3 ABI is BF16 hidden and cache rows, INT8 weights and index

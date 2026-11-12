@@ -14,7 +14,7 @@ import torch
 from .ecotech_linear import make_ecotech_dynamic_linear, prepare_ecotech_dynamic_weight
 from .hc import make_hc_pre_inline
 from .ops import make_norm, make_rope
-from .prefill_norm import make_prefill_norm
+from .rmsnorm import make_prefill_norm
 from .swa import make_swa_inline
 
 
@@ -91,7 +91,11 @@ def make_builders(capacity=16, config=None):
         normed: pl.InOut[pl.Tensor[[capacity, 5120], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        pre(x, hc_function, hc_scale, hc_base, incoming, next_pre, post, comb, collapsed, active)
+        collapsed_fp32 = pl.create_tensor([capacity, 5120], dtype=pl.FP32)
+        pre(
+            x, hc_function, hc_scale, hc_base, incoming, next_pre, post, comb,
+            collapsed, collapsed_fp32, active,
+        )
         norm(collapsed, norm_weight, normed, active)
         return next_pre, post, comb, collapsed, normed
 

@@ -68,3 +68,35 @@ def make_ecotech_dynamic_linear(capacity, input_width, output_width, combine_sca
         return output
 
     return linear
+
+
+def padded_dimensions(input_width, output_width):
+    """Return A2-aligned K and N dimensions for the tail projection."""
+
+    if type(input_width) is not int or type(output_width) is not int or input_width <= 0 or output_width <= 0:
+        raise ValueError("Require positive logical dimensions")
+    if input_width % 32 or output_width % 32:
+        raise ValueError("This tail path requires logical K/32 and N/32")
+    return ((input_width + 255) // 256) * 256, ((output_width + 63) // 64) * 64
+
+
+def prepare_ecotech_tail_weight(weight_nk, source_scale, source_offset):
+    """Pad an original NK INT8 projection for the shared dynamic linear path."""
+
+    values = (weight_nk, source_scale, source_offset)
+    if any(value.device.type != "cpu" for value in values):
+        raise ValueError("Checkpoint preprocessing requires CPU operands")
+    if weight_nk.ndim != 2 or weight_nk.dtype != torch.int8:
+        raise ValueError("Require source NK INT8 bytes")
+    output_width, input_width = weight_nk.shape
+    padded_k, padded_n = padded_dimensions(input_width, output_width)
+    for value in (source_scale, source_offset):
+        if value.shape != (output_width, 1) or value.dtype != torch.float32:
+            raise ValueError("Require original F32 [N,1] scale/offset")
+    padded_weight = torch.zeros((padded_n, padded_k), dtype=torch.int8)
+    padded_weight[:output_width, :input_width].copy_(weight_nk)
+    padded_scale = torch.ones((padded_n, 1), dtype=torch.float32)
+    padded_scale[:output_width].copy_(source_scale)
+    padded_offset = torch.zeros((padded_n, 1), dtype=torch.float32)
+    padded_offset[:output_width].copy_(source_offset)
+    return prepare_ecotech_dynamic_weight(padded_weight, padded_scale, padded_offset)

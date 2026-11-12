@@ -18,7 +18,7 @@ import torch
 from golden import normalize_config
 from pypto.ir import DistributedConfig
 
-from .decode_layer_ep2 import (
+from .decode_layer import (
     CHANNELS,
     D,
     EP_SIZE,

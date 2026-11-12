@@ -1,3 +1,13 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+# -----------------------------------------------------------------------------------------------------------
 """DeepSeek V4.1 A2/A3 decoder stages for layers 14 and 15.
 
 Layer 14 is the ratio-2 source layer.  It publishes the BF16 compressed KV
@@ -24,14 +34,12 @@ from .engram import HASH_COLS, HEAD_DIM, HC, HIDDEN, LOOKUP_WIDTH, engram_refere
 from .quant import w8a8_linear
 from .sparse_attention import make_sparse_attention, sparse_attention_reference
 from .index_cache import quantize_index_cache
-from .indexer_prepare import (
-    make_indexer_prepare,
-    prepare_indexer_indices_reference,
-)
-from .indexer_query import make_l3_indexer_query
-from .indexer_select import (
+from .decode_indexer import (
     indexer_select_reference,
+    make_indexer_prepare,
     make_indexer_select,
+    make_l3_indexer_query,
+    prepare_indexer_indices_reference,
 )
 from .norm_rope import make_rope, make_rmsnorm, rms_norm_reference, rope_reference
 from .output_proj import make_output_projection

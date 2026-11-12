@@ -12,7 +12,7 @@ import pypto.language as pl
 
 from .ecotech_shared import make_ecotech_shared_inline
 from .hc import make_hc_post_inline, make_hc_pre_inline
-from .prefill_norm import make_prefill_norm
+from .rmsnorm import make_prefill_norm
 
 
 def make_ecotech_mhc_ffn(capacity, config, intermediate=2304):
@@ -59,11 +59,16 @@ def make_ecotech_mhc_ffn(capacity, config, intermediate=2304):
         shared_output: pl.InOut[pl.Tensor[[capacity, 5120], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        hc_pre(x, attn_function, attn_scale, attn_base, incoming, attn_pre, attn_post, attn_comb, attn_collapsed, active)
+        attn_collapsed_fp32 = pl.create_tensor([capacity, 5120], dtype=pl.FP32)
+        hc_pre(
+            x, attn_function, attn_scale, attn_base, incoming, attn_pre, attn_post,
+            attn_comb, attn_collapsed, attn_collapsed_fp32, active,
+        )
         hc_post(attention_sublayer, x, attn_post, attn_comb, changed_hidden, active)
+        ffn_collapsed_fp32 = pl.create_tensor([capacity, 5120], dtype=pl.FP32)
         hc_pre(
             changed_hidden, ffn_function, ffn_scale, ffn_base,
-            attn_pre, ffn_pre, ffn_post, ffn_comb, ffn_collapsed,
+            attn_pre, ffn_pre, ffn_post, ffn_comb, ffn_collapsed, ffn_collapsed_fp32,
             active,
         )
         norm(ffn_collapsed, norm_weight, normed, active)

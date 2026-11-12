@@ -12,15 +12,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from .layer14_15 import (
+from .decode_c2a_common import (
     LAYER15,
     Layer15A2A3Contract,
     layer15_reuse_reference,
     make_layer15_stages,
     validate_layer14_15_contract,
 )
-from .layers19_25 import LAYER19, c2a_reuse_reference, make_decoder_layer_stages
-from .layers19_25 import DecoderLayerA2A3Contract
+from .decode_layer_stages import LAYER19, c2a_reuse_reference, make_decoder_layer_stages
+from .decode_layer_stages import DecoderLayerA2A3Contract
 
 
 decode_c2a_reuse = c2a_reuse_reference

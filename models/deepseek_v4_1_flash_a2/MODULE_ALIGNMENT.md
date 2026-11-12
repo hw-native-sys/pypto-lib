@@ -57,15 +57,18 @@ Status values mean:
 
 | A5 module | A2 owner | Status | Layer or responsibility |
 | --- | --- | --- | --- |
-| `decode_c2a_full.py` | `decode_c2a_full.py`, `layer14_15.py` | partial | L14 C2A source; the old aggregate remains a compatibility provider. |
-| `decode_c2a_reuse.py` | `decode_c2a_reuse.py`, `layer14_15.py`, `layers19_25.py` | aligned | L15 and L19 C2A reuse contracts. |
-| `decode_c1a_full.py` | `decode_c1a_full.py`, `layers19_25.py`, `candidate_pool.py` | aligned | L20 C1A source, compressor, QLI, and candidate blocks. |
-| `decode_c1a_reuse.py` | `decode_c1a_reuse.py`, `layers19_25.py` | aligned | L21 and L25 C1A cache reuse contracts. |
-| `decode_c1a_reindex.py` | `decode_c1a_reindex.py`, `layers19_25.py`, `indexer_select.py`, `indexer_prepare.py` | aligned | L24 index refresh followed by sparse attention. |
+| `decode_c2a_full.py` | `decode_c2a_full.py`, `decode_c2a_common.py` | partial | L14 C2A source; the shared provider remains behind the canonical entry. |
+| `decode_c2a_reuse.py` | `decode_c2a_reuse.py`, `decode_c2a_common.py`, `decode_layer_stages.py` | aligned | L15 and L19 C2A reuse contracts. |
+| `decode_c1a_full.py` | `decode_c1a_full.py`, `decode_layer_stages.py`, `candidate_pool.py` | aligned | L20 C1A source, compressor, QLI, and candidate blocks. |
+| `decode_c1a_reuse.py` | `decode_c1a_reuse.py`, `decode_layer_stages.py` | aligned | L21 and L25 C1A cache reuse contracts. |
+| `decode_c1a_reindex.py` | `decode_c1a_reindex.py`, `decode_layer_stages.py`, `indexer_select.py`, `indexer_prepare.py` | aligned | L24 index refresh followed by sparse attention. |
 | `decode_indexer.py` | `indexer.py`, `indexer_query.py`, `indexer_select.py`, `indexer_prepare.py`, `index_cache.py`, `candidate_pool.py`, `qli_*` | split | QLI and candidate selection are separated at A2 native boundaries. |
+| `decode_indexer.py` | `decode_indexer.py` | aligned | Canonical A2 entry re-exports query, selection, preparation, cache, and candidate stages. |
 | `decode_swa.py` | `swa_attention.py`, `swa_native.py`, `swa_scheduler.py` | split | Decoder name remains a compatibility export; implementation is shared. |
 | `decode_moe.py` | `moe.py`, `moe_router.py`, `moe_dispatch.py`, `moe_combine.py`, `moe_*_runtime.py` | split | W8A8 expert leaves, metadata, and dispatch are separate. |
-| `decode_layer.py` | `decode_c2a_*.py`, `decode_c1a_*.py`, `layer14_15.py`, `layers19_25.py` | partial | Layer contracts and stage factories; complete A5 forward is deferred. |
+| `decode_moe.py` | `decode_moe.py` | aligned | Canonical EP2 orchestration entry; expert and runtime leaves remain separate. |
+| `decode_layer.py` | `decode_c2a_*.py`, `decode_c1a_*.py`, `decode_c2a_common.py`, `decode_layer_stages.py` | partial | Layer contracts and stage factories; complete A5 forward is deferred. |
+| `decode_layer.py` | `decode_layer.py` | aligned | Canonical layer selector for the supported EP2 physical-layer entries. |
 | `decode_fwd.py` | `layer0.py`, `prefill.py`, `decode_c2a_*.py`, `decode_c1a_*.py` | partial | Independent layer composition only; no serving or whole-network runner. |
 
 The migrated L19-L25 schedule is fixed in the canonical decode files:
@@ -90,8 +93,9 @@ L25: C1A reuse <- L20 cache and L24 index selection
 | `prefill_swa.py` | `ecotech_swa_prefill.py`, `swa.py`, `swa_cache.py` | aligned | BF16 SWA publication and attention. |
 | `prefill_indexer.py` | `indexer*.py`, `index_cache.py`, `c1c2.py` | split | Index preparation and cache publication are independent. |
 | `prefill_moe.py` | `moe.py`, `moe_router.py`, `moe_dispatch.py`, `moe_combine.py` | split | A2 W8A8 shared/routed expert path. |
-| `prefill_layer.py` | `layer0.py`, `layer0_single_card.py`, `layer2_prefill.py`, `layer14_15.py` | partial | Single-layer composition and references. |
+| `prefill_layer.py` | `layer0.py`, `layer0_single_card.py`, `layer2_prefill.py`, `decode_c2a_common.py` | partial | Single-layer composition and references. |
 | `prefill_fwd.py` | `prefill.py`, `attention.py`, `attention_block.py` | partial | Existing A2 prefill entries; no A5 distributed runner. |
+| `prefill_fwd.py` | `prefill_fwd.py` | aligned | Canonical A2 Prefill composition entry. |
 | `prefill_cp_allgather.py` | none | out of scope | A2 single-card target does not accept the A5 collective ABI. |
 
 ## A2 current ownership groups
@@ -103,7 +107,7 @@ should follow these logical groups:
 | --- | --- | --- |
 | Shared leaves | `config.py`, `operator_config.py`, `runtime_config.py`, `ops.py`, `gemm.py`, `quant.py`, `norm_rope.py`, `rmsnorm.py`, `staged.py`, `qkv.py`, `qkv_w8a8.py`, `qkv_proj_rope.py`, `o_proj.py`, `output_proj.py`, `grouped_output.py`, `sparse_attention.py`, `swa.py`, `swa_attention.py`, `swa_cache.py`, `decode_swa.py` | A2/A3 tensor ABI and reusable computation. |
 | Cache and index stages | `compressor*.py`, `c1c2.py`, `c2_prefill_pool.py`, `ratio1_prefill.py`, `index_cache.py`, `indexer*.py`, `candidate_pool.py`, `sparse_consumer_prefill.py` | C1A/C2A publication, QLI, candidate selection, and cache ownership. |
-| Layer composition | `attention*.py`, `prefill.py`, `prefill_norm.py`, `layer0*.py`, `layer2_*.py`, `decode_c2a_*.py`, `decode_c1a_*.py`, `layer14_15.py`, `layers19_25.py`, `ecotech_*.py` | Bounded layer and path composition. The two aggregate decoder files remain compatibility providers during migration. |
+| Layer composition | `attention*.py`, `prefill*.py`, `rmsnorm.py`, `layer0*.py`, `layer2_*.py`, `decode_layer.py`, `decode_c2a_*.py`, `decode_c1a_*.py`, `decode_c2a_common.py`, `decode_layer_stages.py`, `ecotech_*.py` | Bounded layer and path composition. Canonical entries select the existing stage owners. |
 | HC, Engram, and MoE | `hc.py`, `engram*.py`, `moe.py`, `moe_*.py` | Model-specific side paths and W8A8 expert boundaries. |
 | Runtime boundaries | `*_native.py`, `*_runtime.py`, `*_boundary.py`, `*_scheduler.py`, `smla_staging.py`, `projection_runtime.py`, `runtime_utils.py`, `scheduler_utils.py`, `bf16_linear_native.py` | Native calls, descriptors, scheduling metadata, and identity checks. |
 | Validation and data | `raw_checkpoint.py`, `weights.py`, `source_manifest.json` | Checkpoint loading and implementation source receipts. Precision, vLLM capture, and test entry points live under `/data/disk/sunhaolun/captrue_and_vllm/models/deepseek_v4_1_flash_a2/`. |

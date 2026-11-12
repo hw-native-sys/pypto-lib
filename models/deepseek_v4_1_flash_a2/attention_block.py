@@ -74,7 +74,11 @@ def make_attention_block(capacity, config):
         active: pl.Scalar[pl.INT32],
     ):
 
-        pre(x_hc, hc_function, hc_scale, hc_base, incoming, next_pre, post, comb, collapsed, active)
+        collapsed_fp32 = pl.create_tensor([capacity, hidden], dtype=pl.FP32)
+        pre(
+            x_hc, hc_function, hc_scale, hc_base, incoming, next_pre, post, comb,
+            collapsed, collapsed_fp32, active,
+        )
         for block in pl.spmd((active + NORM_T_TILE - 1) // NORM_T_TILE, name_hint="a2_block_norm"):
             rms_norm_tiled(collapsed, norm_weight, normed, block, active)
         attention(

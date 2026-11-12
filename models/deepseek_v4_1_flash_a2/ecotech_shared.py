@@ -11,8 +11,7 @@
 import pypto.language as pl
 import torch
 
-from .ecotech_linear import prepare_ecotech_dynamic_weight
-from .ecotech_linear_tail import prepare_ecotech_tail_weight
+from .ecotech_linear import prepare_ecotech_dynamic_weight, prepare_ecotech_tail_weight
 from .ops import make_dequantize, make_dot, make_pack_weight, make_quantize
 
 

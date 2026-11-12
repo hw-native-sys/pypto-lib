@@ -39,6 +39,7 @@ def make_hc_pre_inline(capacity, config):
         post: pl.Tensor[[capacity, hc], pl.FP32],
         comb: pl.Tensor[[capacity, hc, hc], pl.FP32],
         collapsed: pl.Tensor[[capacity, hidden], pl.BF16],
+        collapsed_fp32: pl.Tensor[[capacity, hidden], pl.FP32],
         active: pl.Scalar[pl.INT32],
     ):
         flat = pl.reshape(x, [capacity, flat_width])
@@ -107,27 +108,30 @@ def make_hc_pre_inline(capacity, config):
                     logical = 2 * hc + (row % hc) * hc + column % hc
                     value = pl.read(projected, [token, logical]) * scale2 + pl.read(base, [logical])
                     pl.tile.write(logits, [row, column], value)
+            logits_valid = pl.set_validshape(logits, hc, hc)
+            logits_padded = pl.fillpad(logits_valid, pad_value=pl.PadValue.min)
             row_tmp = pl.create_tile([MIX_TILE, MIX_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            row_max = pl.row_max(logits, row_tmp)
-            shifted = pl.row_expand_sub(logits, row_max)
+            row_max = pl.row_max(logits_padded, row_tmp)
+            shifted = pl.row_expand_sub(logits_padded, row_max)
             exponential = pl.exp(shifted)
             row_sum = pl.row_sum(exponential, row_tmp)
-            row_sum = pl.mul(row_sum, hc / MIX_TILE)
-            probabilities = pl.row_expand_div(exponential, row_sum)
-            probabilities = pl.add(probabilities, eps)
-            column_sum = pl.col_sum(probabilities)
-            column_sum = pl.mul(column_sum, hc / MIX_TILE)
+            probabilities_softmax = pl.add(pl.row_expand_div(exponential, row_sum), eps)
+            probabilities_valid = pl.set_validshape(probabilities_softmax, hc, hc)
+            probabilities_padded = pl.fillpad(probabilities_valid, pad_value=pl.PadValue.zero)
+            column_sum = pl.col_sum(probabilities_padded)
             column_sum = pl.add(column_sum, eps)
-            probabilities = pl.col_expand_div(probabilities, column_sum)
+            probabilities = pl.col_expand_div(probabilities_padded, column_sum)
             for _ in pl.range(iterations - 1):
-                row_sum = pl.row_sum(probabilities, row_tmp)
-                row_sum = pl.mul(row_sum, hc / MIX_TILE)
+                iter_valid = pl.set_validshape(probabilities, hc, hc)
+                iter_padded = pl.fillpad(iter_valid, pad_value=pl.PadValue.zero)
+                row_sum = pl.row_sum(iter_padded, row_tmp)
                 row_sum = pl.add(row_sum, eps)
-                probabilities = pl.row_expand_div(probabilities, row_sum)
-                column_sum = pl.col_sum(probabilities)
-                column_sum = pl.mul(column_sum, hc / MIX_TILE)
+                row_normalized = pl.row_expand_div(iter_padded, row_sum)
+                row_normalized_valid = pl.set_validshape(row_normalized, hc, hc)
+                row_normalized_padded = pl.fillpad(row_normalized_valid, pad_value=pl.PadValue.zero)
+                column_sum = pl.col_sum(row_normalized_padded)
                 column_sum = pl.add(column_sum, eps)
-                probabilities = pl.col_expand_div(probabilities, column_sum)
+                probabilities = pl.col_expand_div(row_normalized_padded, column_sum)
             for row in pl.unroll(hc):
                 comb_value = pl.slice(probabilities, [1, MIX_TILE], [row, 0], valid_shape=[1, hc])
                 pl.store(comb_value, [token, row * hc], comb_flat)
@@ -143,6 +147,7 @@ def make_hc_pre_inline(capacity, config):
                 coefficient = pl.read(incoming, [token, stream])
                 term = pl.mul(source_fp32, coefficient)
                 collapsed_tile = pl.add(collapsed_tile, term)
+            collapsed_fp32[token:token + 1, offset:offset + D_TILE] = collapsed_tile
             collapsed[token:token + 1, offset:offset + D_TILE] = pl.cast(collapsed_tile, pl.BF16, mode="rint")
         return next_pre, post, comb, collapsed
 
@@ -210,7 +215,11 @@ def make_hc(capacity, config):
         merged: pl.InOut[pl.Tensor[[capacity, hc, hidden], pl.BF16]],
         active: pl.Scalar[pl.INT32],
     ):
-        pre(x, function, scale, base, incoming, next_pre, post, comb, collapsed, active)
+        collapsed_fp32 = pl.create_tensor([capacity, hidden], dtype=pl.FP32)
+        pre(
+            x, function, scale, base, incoming, next_pre, post, comb,
+            collapsed, collapsed_fp32, active,
+        )
         post_fn(sublayer, x, post, comb, merged, active)
         return next_pre, post, comb, collapsed, merged
 

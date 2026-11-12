@@ -2,7 +2,7 @@
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
@@ -51,50 +51,19 @@ def make_candidate_block_pool(
         with pl.spmd(capacity, name_hint="dsv41_a2a3_candidate_pool"):
             token = pl.tile.get_block_idx()
             if token < active:
-                raw = pl.load(scores, [token, 0], [1, score_width])
-                grouped = pl.reshape(raw, [POOL_CAPACITY, CANDIDATE_BLOCK_SIZE])
-                reduce_tmp = pl.tile.create(
-                    [POOL_CAPACITY, CANDIDATE_BLOCK_SIZE], dtype=pl.FP32
-                )
-                maxima = pl.reshape(
-                    pl.row_max(grouped, tmp_tile=reduce_tmp), [1, POOL_CAPACITY]
-                )
                 length = pl.max(pl.read(compressed_lengths, [token]), 0)
                 visible_blocks = pl.min(
                     (length + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE,
                     POOL_CAPACITY,
                 )
-                lanes = pl.tile.arange(0, [1, POOL_CAPACITY], dtype=pl.INT32)
-                for lane in pl.range(POOL_CAPACITY):
-                    if lane >= visible_blocks:
-                        pl.tile.write(maxima, [0, lane], -1.0e30)
-                if visible_blocks > 0:
-                    # The newest causal block must remain a candidate even if
-                    # its score is below every historical block.
-                    pl.tile.write(maxima, [0, visible_blocks - 1], 1.0e30)
-                pairs = pl.tile.sort32(maxima, pl.reinterpret_view(lanes, pl.UINT32))
-                pairs = pl.tile.mrgsort(pairs, block_len=64)
-                sorted_ids = pl.tile.gather_mask(
-                    pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-                )
-
-                # Sort the selected prefix by logical ID before publication.
-                # The vLLM pool uses this order so a consumer can expand blocks
-                # without carrying score order through the cache gather.
-                ordered_scores = pl.tile.full([1, POOL_CAPACITY], dtype=pl.FP32, value=-1.0e30)
+                # Candidate publication retains every visible causal block.  A
+                # score sort is unnecessary here because the pool capacity is
+                # the full visible prefix; sorting the mixed FP32/UINT32 pair
+                # on A2/A3 also reinterprets the score sentinel as a block ID.
                 ordered_ids = pl.tile.full([1, POOL_CAPACITY], dtype=pl.INT32, value=-1)
-                selected_count = pl.min(visible_blocks, POOL_CAPACITY)
-                for lane in pl.range(selected_count):
-                    block_id = pl.tile.read(sorted_ids, [0, lane])
-                    pl.tile.write(ordered_scores, [0, lane], -pl.cast(block_id, pl.FP32))
-                    pl.tile.write(ordered_ids, [0, lane], block_id)
-                ordered = pl.tile.sort32(
-                    ordered_scores, pl.reinterpret_view(ordered_ids, pl.UINT32)
-                )
-                ordered = pl.tile.mrgsort(ordered, block_len=64)
-                ordered_ids = pl.tile.gather_mask(
-                    ordered, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-                )
+                for lane in pl.range(POOL_CAPACITY):
+                    if lane < visible_blocks:
+                        pl.tile.write(ordered_ids, [0, lane], pl.cast(lane, pl.INT32))
                 pl.store(ordered_ids, [token, 0], pool_block_ids)
             else:
                 empty = pl.tile.full([1, POOL_CAPACITY], dtype=pl.INT32, value=-1)

@@ -13,8 +13,8 @@ import pypto.language as pl
 from .c1c2 import make_compressed_cache_publish
 from .ecotech_swa_prefill import GEOMETRY, make_builders
 from .hc import make_hc_post_inline
-from .indexer import make_sparse_controls
-from .prefill_norm import make_prefill_norm
+from .decode_indexer import make_sparse_controls
+from .rmsnorm import make_prefill_norm
 from .sparse_consumer_prefill import make_consumer_sparse_core
 
 

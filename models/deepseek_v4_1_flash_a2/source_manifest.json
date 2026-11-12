@@ -123,24 +123,6 @@
       "import_relocation": true
     },
     {
-      "file": "ecotech_linear_tail.py",
-      "source": "models/deepseek_v4_1_flash/a2_w8a8/ecotech_linear_tail.py",
-      "source_sha256": "1816bf97f83528fcbebf2608cecac69ef8f543b7246c88b4b0c4daf07aa8ed36",
-      "extracted_symbols": null,
-      "preserved_definition_ast_sha256": {
-        "padded_dimensions": "a15d2687ce1a547f7dea118c530463611e65f075aef4640a3bfd4453663e887e",
-        "prepare_ecotech_tail_weight": "c028985d0a1028add977fbc86d66202dcd507886f16c0a986957354d2c23cc59",
-        "_make_pad_input": "17825912b8a685403e20c617e4e34bb498a48a155432e4039ed6578a31711016",
-        "_make_crop_output": "dbd90856e6737ff80085b16196384a812461355c7006b0958cbc15ee497ce893",
-        "make_ecotech_tail_linear": "db2e8229fbdb49d82db5b4d3fac7c3b84d320354865d1f319c2854669d2cdb77",
-        "prepare_ecotech_token_scales": "8a2f11e931191ca1058ff0221eb6c2bbebcda66e706d91b00eef9eece7b2f662",
-        "make_ecotech_int8_tail_linear": "5fc793abecd3bdc7b29b5a1589eeb383ac596ebb472ee921901e476893da4f22"
-      },
-      "migrated_sha256": "aa3149c847a256b4be62e35eff59e905112a5233fb3ef1a033d1efad2fb9bcd3",
-      "L20_freeze_source_match": true,
-      "import_relocation": true
-    },
-    {
       "file": "ecotech_mhc_ffn.py",
       "source": "models/deepseek_v4_1_flash/a2_w8a8/ecotech_mhc_ffn.py",
       "source_sha256": "8e5a437b21ee240251b5cc35d4f68c9995b4e1558c56ae4c3fedbfb0751c3f47",
@@ -505,18 +487,6 @@
       "import_relocation": true
     },
     {
-      "file": "prefill_norm.py",
-      "source": "models/deepseek_v4_1_flash/a2_w8a8/prefill_norm.py",
-      "source_sha256": "e43cd78f79d46d077e933976163202dc0586763b2c2c8a7b6156aed827d96d77",
-      "extracted_symbols": null,
-      "preserved_definition_ast_sha256": {
-        "make_prefill_norm": "4ce7f40585d56ca716e715fae44d76c32c804c3263e656e1cee1d4d0a63378ed"
-      },
-      "migrated_sha256": "a902e9c26c69feb917ac326a4bf855e5da1c30525cd389bb4d4050c2457b9039",
-      "L20_freeze_source_match": true,
-      "import_relocation": true
-    },
-    {
       "file": "sparse_consumer_prefill.py",
       "source": "models/deepseek_v4_1_flash/a2_w8a8/sparse_consumer_prefill.py",
       "source_sha256": "e224ff53d39ef84238ed047ee273acd5cbad847c6325d35f9747e7b5c708ce29",
@@ -806,17 +776,6 @@
       ]
     },
     {
-      "file": "engram_ecotech_observed.py",
-      "source": "accepted-L14/engram_ecotech_observed.py",
-      "source_sha256": "9315d79de79b79ecc8e011724f36095afff706456986cfc00167c0751fa0b529",
-      "extracted_symbols": null,
-      "preserved_definition_ast_sha256": {
-        "make_engram_ecotech_observed": "ca18a0d107bfcefc5ce88f5edf27c9f9ab19b5bda66db4a1c8816341ec952758"
-      },
-      "migrated_sha256": "27e171057c9915a36cd689617dd406318b4a634da931dea1f7e5f1c0acf5da64",
-      "import_relocation": true
-    },
-    {
       "file": "swa_native.py",
       "source": "accepted-L1/registered_leaf.py",
       "source_sha256": "30d5d2cdefa511a924419671fcb384bd193491f94c4866d94a0650e067fb6d7a",
@@ -1005,29 +964,29 @@
       "accuracy_evidence": "state_abi_only"
     },
     {
-      "file": "decode_moe_ep2.py",
-      "sha256": "ed28ab6019a072ea73ba8b65ed4e2b3889dc2313345b2ab765a730f5e90b6a56",
+      "file": "decode_moe.py",
+      "sha256": "0e055ff737c2c6f60d136ced8867437b83427a5c8a343aab54d7c1d609553567",
       "role": "PyPTO-only EP2 Decode routed/shared MoE dispatch, local expert and combine driver",
       "product_compute": true,
       "accuracy_evidence": "not_run"
     },
     {
-      "file": "decode_layer_ep2.py",
-      "sha256": "f73e31c66caa8b0a379c48c08a9915d461baea292d25952343f68c67f9f6cc9f",
+      "file": "decode_layer_l0.py",
+      "sha256": "639f5251c78351b1a657033d28e5a3e6d42938c84ab008af4daafad5973e3cbe",
       "role": "complete PyPTO L0 Decode composition of mHC attention, cache, EP2 MoE and mHC output",
       "product_compute": true,
       "accuracy_evidence": "not_run"
     },
     {
-      "file": "decode_ep2_compile.py",
-      "sha256": "224c839f35b4109fcdd790e29a7adab9c3882b261e14b4631471dc41b5aa4d81",
+      "file": "decode_moe_compile.py",
+      "sha256": "03d497e6a8a496698b91382c1a5fb207291dd51048bbeef7992c2f6ec1f23832",
       "role": "A3 PyPTO EP2 code-generation entry; physical NZ lowering evidence only",
       "product_compute": false,
       "accuracy_evidence": "compile_only"
     },
     {
-      "file": "decode_layer_ep2_compile.py",
-      "sha256": "cd74144763d24b5ef6bdea65bc706b71448ac4f6465eaf59a2fc3f731f1b6863",
+      "file": "decode_layer_l0_compile.py",
+      "sha256": "5d7007b735a2ad2dffa37a7188e130f7386aa924da633ff4cba4749aab23499c",
       "role": "A3 PyPTO complete L0 EP2 composition code-generation entry",
       "product_compute": false,
       "accuracy_evidence": "compile_only"

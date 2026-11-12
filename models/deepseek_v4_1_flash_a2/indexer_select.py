@@ -217,4 +217,141 @@ def make_indexer_select(
     return kernel
 
 
-__all__ = ["INDEX_HEADS", "INDEX_HEAD_DIM", "INDEX_TOPK", "indexer_select_reference", "make_indexer_select"]
+def make_indexer_select_restricted(
+    capacity: int,
+    key_capacity: int,
+    *,
+    heads: int = INDEX_HEADS,
+    head_dim: int = INDEX_HEAD_DIM,
+    topk: int = INDEX_TOPK,
+    compress_ratio: int = 1,
+    candidate_block_size: int = 8,
+    candidate_block_capacity: int = 64,
+):
+    """Select C1A QLI rows inside the source candidate block pool."""
+
+    if capacity <= 0 or capacity % HEAD_TILE:
+        raise ValueError("capacity must be a positive multiple of 16")
+    if heads != INDEX_HEADS or head_dim != INDEX_HEAD_DIM:
+        raise ValueError("A2/A3 QLI uses 32 heads x 128")
+    if key_capacity != KEY_CAPACITY or topk != INDEX_TOPK:
+        raise ValueError("A2/A3 restricted QLI uses fixed 512 rows and topk")
+    if compress_ratio != 1 or candidate_block_size != 8:
+        raise ValueError("C1A reindex uses ratio-1 eight-row candidate blocks")
+    if candidate_block_capacity <= 0:
+        raise ValueError("candidate block capacity must be positive")
+
+    @pl.jit.incore
+    def select_one(
+        query: pl.Tensor[[capacity, heads, head_dim], pl.INT8],
+        query_scale: pl.Tensor[[capacity, heads], pl.FP16],
+        key: pl.Tensor[[key_capacity, head_dim], pl.INT8],
+        key_scale: pl.Tensor[[key_capacity], pl.FP16],
+        weights: pl.Tensor[[capacity, heads], pl.FP16],
+        positions: pl.Tensor[[capacity], pl.INT32],
+        candidate_blocks: pl.Tensor[[capacity, candidate_block_capacity], pl.INT32],
+        candidate_counts: pl.Tensor[[capacity], pl.INT32],
+        running_pairs: pl.Tensor[[capacity, 2 * topk], pl.FP32],
+        scores: pl.Tensor[[capacity, key_capacity], pl.FP32],
+        indices: pl.Tensor[[capacity, topk], pl.INT32],
+    ) -> None:
+        token = pl.tile.get_block_idx()
+        pl.store(
+            pl.tile.full([1, key_capacity], dtype=pl.FP32, value=NEGATIVE_INF),
+            [token, 0],
+            scores,
+        )
+        for k0 in pl.range(0, key_capacity, KEY_TILE):
+            key_tile = key[k0:k0 + KEY_TILE, :]
+            scale_tile = pl.reshape(pl.cast(key_scale[k0:k0 + KEY_TILE], pl.FP32), [1, KEY_TILE])
+            total = pl.full([1, KEY_TILE], dtype=pl.FP32, value=0.0)
+            for h0 in pl.range(0, heads, HEAD_TILE):
+                q_tile = pl.reshape(query[token:token + 1, h0:h0 + HEAD_TILE, :], [HEAD_TILE, head_dim])
+                dots = pl.matmul(q_tile, key_tile, b_trans=True, out_dtype=pl.INT32)
+                dots = pl.cast(dots, pl.FP32, mode="none")
+                q_scale_tile = pl.reshape(
+                    pl.cast(query_scale[token, h0:h0 + HEAD_TILE], pl.FP32), [HEAD_TILE, 1]
+                )
+                weight_tile = pl.reshape(
+                    pl.cast(weights[token, h0:h0 + HEAD_TILE], pl.FP32), [HEAD_TILE, 1]
+                )
+                dots = pl.row_expand_mul(dots, q_scale_tile)
+                dots = pl.col_expand_mul(dots, scale_tile)
+                dots = pl.maximum(dots, 0.0)
+                dots = pl.row_expand_mul(dots, weight_tile)
+                total = pl.add(total, pl.reshape(pl.col_sum(dots), [1, KEY_TILE]))
+            visible = pl.min(pl.read(positions, [token]) + 1, key_capacity)
+            for lane in pl.range(KEY_TILE):
+                key_index = k0 + lane
+                block_id = key_index // candidate_block_size
+                allowed = False
+                for candidate in pl.range(candidate_block_capacity):
+                    if candidate < pl.read(candidate_counts, [token]):
+                        if pl.read(candidate_blocks, [token, candidate]) == block_id:
+                            allowed = True
+                if key_index >= visible or not allowed:
+                    pl.write(total, [0, lane], NEGATIVE_INF)
+            scores[token:token + 1, k0:k0 + KEY_TILE] = total
+
+        row = pl.load(scores, [token, 0], [1, SORT_LEAF])
+        row = pl.tile.fillpad(row, pad_value=pl.PadValue.min)
+        ramp = pl.tile.arange(0, [1, SORT_LEAF], dtype=pl.INT32)
+        leaf_pairs = pl.tile.sort32(
+            row,
+            pl.reinterpret_view(ramp, pl.UINT32),
+            tmp=pl.tile.create([1, 2 * SORT_LEAF], dtype=pl.FP32),
+        )
+        leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=64)
+        leaf_pairs = pl.tile.mrgsort(leaf_pairs, block_len=256)
+        leaf_pairs = pl.tile.slice(leaf_pairs, [1, 2 * topk], [0, 0])
+        pl.store(leaf_pairs, [token, 0], running_pairs)
+        pairs = pl.load(running_pairs, [token, 0], [1, 2 * topk])
+        picked = pl.tile.gather_mask(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+        for lane in pl.range(topk):
+            score = pl.read(running_pairs, [token, 2 * lane])
+            if score <= NEGATIVE_INF / 2:
+                pl.tile.write(picked, [0, lane], pl.cast(-1, pl.INT32))
+        pl.store(picked, [token, 0], indices)
+
+    @pl.jit
+    def kernel(
+        query: pl.Tensor[[capacity, heads, head_dim], pl.INT8],
+        query_scale: pl.Tensor[[capacity, heads], pl.FP16],
+        key: pl.Tensor[[key_capacity, head_dim], pl.INT8],
+        key_scale: pl.Tensor[[key_capacity], pl.FP16],
+        weights: pl.Tensor[[capacity, heads], pl.FP16],
+        positions: pl.Tensor[[capacity], pl.INT32],
+        candidate_blocks: pl.Tensor[[capacity, candidate_block_capacity], pl.INT32],
+        candidate_counts: pl.Tensor[[capacity], pl.INT32],
+        scores: pl.Out[pl.Tensor[[capacity, key_capacity], pl.FP32]],
+        indices: pl.Out[pl.Tensor[[capacity, topk], pl.INT32]],
+        active: pl.Scalar[pl.INT32],
+    ):
+        running_pairs = pl.create_tensor([capacity, 2 * topk], dtype=pl.FP32)
+        with pl.spmd(active, name_hint="dsv41_a2a3_qli_select_restricted"):
+            select_one(
+                query,
+                query_scale,
+                key,
+                key_scale,
+                weights,
+                positions,
+                candidate_blocks,
+                candidate_counts,
+                running_pairs,
+                scores,
+                indices,
+            )
+        return scores, indices
+
+    return kernel
+
+
+__all__ = [
+    "INDEX_HEADS",
+    "INDEX_HEAD_DIM",
+    "INDEX_TOPK",
+    "indexer_select_reference",
+    "make_indexer_select",
+    "make_indexer_select_restricted",
+]

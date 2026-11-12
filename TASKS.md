@@ -142,11 +142,12 @@ top-six route IDs, route weights and the merged routed/shared output at
 
 These 20 reports have `status=pass` and `formal_accuracy=not_run` by design;
 their cache/state field is `not_applicable_at_moe_boundary`. They do not
-establish a complete physical layer result. The complete-layer runner still
-has only the L0 SWA composition and a single contiguous `active` scalar, so
-the ten target layers remain `not_run` until their Engram/C1A/C2A/index/cache
-composition and request-state ABI are implemented and captured with real
-history cache state.
+establish a complete physical layer result. The complete-layer runner now has
+layer-specific Engram, C2A, C1A, index/cache, mHC and MoE compositions for the
+ten target layers. The current paired complete-layer evidence is: L1, L2, L3,
+L14, L19, L20, L21, L24 and L25 pass; L15 reaches the complete replay but
+remains a precision failure at the fixed gate because its observable
+`moe_output` does not match the fused vLLM boundary.
 
 The supplied Aurora W8A8 Dynamic export is registered as an external
 checkpoint asset. Its index references 270 quantized shard files using the
@@ -169,9 +170,9 @@ of L0, L1, L2, L3, L14, L15, L19, L20, L21, L24 and L25 under
 `.pypto-a3-state/decode-assets/layers/`. Each plan fixes the layer mode,
 compression/cache source, weight shards, Engram assets, EP2 topology, input
 state boundary, reference command, product command status and recovery rule.
-It never creates placeholder token/cache/capture files. The only complete
-product layer entrypoint currently exposed is L0; all other product replay
-commands remain blocked until their full A2/A3 layer composition is added.
+It never creates placeholder token/cache/capture files. The product runner
+exposes all retained EP2 layer compositions; reuse and reindex commands remain
+blocked until source state and target request metadata match exactly.
 The verifier also rejects generic layer/MoE captures for non-SWA layers: C2A
 and C1A require semantic compressed-KV, index-cache/scale and (for C1A)
 candidate-pool state, while L1/L14 require captured Engram rows.
@@ -181,8 +182,8 @@ candidate-pool state, while L1/L14 require captured Engram rows.
 | product import/dependency scan | `pass` | Keep vLLM/Torch-NPU out of the product closure |
 | Aurora checkpoint metadata/header audit | `pass` | Keep the external manifest and set `DEEPSEEK_V41_CHECKPOINT` for jobs |
 | bounded L0 PyPTO compile/ABI | `bounded_only` | Does not establish checkpoint accuracy |
-| EP2 PyPTO MoE code generation | `pass` | `decode_ep2_compile`; compiler artifact has physical NZ lowering |
-| complete L0 EP2 PyPTO composition code generation | `pass` | `decode_layer_ep2_compile`; mHC/attention/cache/MoE composition compiles |
+| EP2 PyPTO MoE code generation | `pass` | `decode_moe_compile`; compiler artifact has physical NZ lowering |
+| complete L0 EP2 PyPTO composition code generation | `pass` | `decode_layer_l0_compile`; mHC/attention/cache/MoE composition compiles |
 | DP2/TP1/EP2 MoE boundary Decode | `pass` | `.pypto-a3-state/product/decode-ep2-l0-v25e.json`; real two-card A3 route/output gate passed |
 | DP2/TP1/EP2 complete physical layer representative Decode | `pass` | `task_20261106_042451_245850019523`; `.pypto-a3-state/product/decode-layer-ep2-l0-v29.json`; output, router input, routes, MoE, FFN state, and cache pages compared on A3 |
 | L1 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261106_182455_412234226294`; `.pypto-a3-state/product/decode-ep2-l1-moe-v2.json`; logits, exact route IDs, route weights, and output compared on devices 2,3 |
@@ -195,8 +196,16 @@ candidate-pool state, while L1/L14 require captured Engram rows.
 | L21 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261107_023110_224905330745`; `.pypto-a3-state/product/decode-ep2-l21-moe-v1.json`; logits, exact route IDs, route weights, and output compared on devices 2,3 |
 | L24 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261107_023325_226337011669`; `.pypto-a3-state/product/decode-ep2-l24-moe-v1.json`; logits, exact route IDs, route weights, and output compared on devices 2,3 |
 | L25 EP2 PyPTO/vLLM-Ascend MoE boundary replay | `pass` | `task_20261107_023325_22633697697`; `.pypto-a3-state/product/decode-ep2-l25-moe-v1.json`; logits, exact route IDs, route weights, and output compared on devices 0,1 |
-| L1/L2/L3 complete physical Decode | `not_run` | The current runner covers the MoE boundary only; each layer still needs its own attention/cache/index/mHC composition and cache/state comparison |
-| L14/L15/L19 complete physical Decode | `not_run` | The new two-card runs cover only the MoE boundary; C2A compression/index/cache and mHC/attention composition are not executed |
+| L1 complete physical Decode | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l1-current.json`; Engram/SWA, mHC, MoE and output boundaries pass on the paired A3 replay |
+| L2 complete physical Decode | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l2-v26.json`; C2A cache/index, mHC, MoE and output boundaries pass on the paired A3 replay |
+| L3 complete physical Decode | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l3-final.json`; current C2A consumer, cache/index, mHC, MoE and output boundaries pass on the paired A3 replay |
+| L14 complete physical Decode | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l14-v4.json`; Engram/C2A, mHC, MoE and output boundaries pass on the paired A3 replay |
+| L15 complete physical Decode | `fail` | `.pypto-a3-state/product/decode-layer-ep2-l15-final.json`; attention/cache/index/HC/router/routes/output pass, while observable `moe_output` remains outside `atol=0.05, rtol=0.05` (`max_abs=0.132812`, `mean_abs=0.0017201`) because the reference uses a fused routed/shared boundary |
+| L19 complete physical Decode | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l19-v2.json`; C2A reuse, mHC, MoE and output boundaries pass on the paired A3 replay |
+| L20 complete physical Decode | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l20-final.json`; current C1A source, cache/index, mHC, MoE and output boundaries pass on the paired A3 replay |
+| L21 complete physical Decode | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l21-v35.json`; C1A reuse with source candidate/cache state passes on the paired A3 replay |
+| L24 complete physical Decode | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l24-v35.json`; C1A reindex/cache, mHC, MoE and output boundaries pass on the paired A3 replay |
+| L25 complete physical Decode | `pass` | `.pypto-a3-state/product/decode-layer-ep2-l25-final.json`; source candidate/cache, attention, HC, MoE and final output pass on the paired A3 replay |
 | L14/L15 vLLM-Ascend reference capture | `not_run` | Layer-root construction reaches 60.43 GiB per rank before the next 2.11 GiB W2 allocation; CPU offload 16/32/96 GiB does not apply until after FusedMoEFactory construction |
 | DP2/TP1/EP2 formal Decode gate | `not_run` | Add no-local-input, finished/inactive, unequal-length, slot-reuse and additional request-state cases |
 | DP8/TP2/EP16 complete single layer | `not_run` | Allocate 16 queued cards and run the complete composition |
@@ -210,7 +219,7 @@ candidate-pool state, while L1/L14 require captured Engram rows.
 | independent layer contract matrix | `pass` | `.pypto-a3-state/decode-assets/layer-contracts.json`; metadata/setup only, formal status remains `not_run` |
 | capacity-16 stage inventory | `pass` | `.pypto-a3-state/decode-assets/layer-stage-inventory.json`; stage construction only, no NPU or accuracy claim |
 | no-device per-layer preflight | `pass` | `.pypto-a3-state/decode-assets/layer-preflight.json` and `layers/l*/plan.json`; 11 isolated plans, no synthetic input/cache assets |
-| per-layer capture/replay execution plan | `pass` | `.pypto-a3-state/decode-assets/layer-contracts.json`; fixed EP2 vLLM-Ascend commands are recorded for all 11 layers, while only the complete L0 PyPTO replay is executable and the other ten remain blocked by missing layer compositions |
+| per-layer capture/replay execution plan | `pass` | `.pypto-a3-state/decode-assets/layer-contracts.json`; fixed EP2 vLLM-Ascend commands and product runner paths are recorded for all 11 layers; source/consumer pairs remain fail-closed until request metadata matches |
 
 No status in this table may be promoted from the historical Prefill evidence,
 CPU golden, simulator replay, TP1 diagnosis, single expert, or native
@@ -227,7 +236,7 @@ The following checks were run in the pinned shared environment on 2026-11-05:
 | product import/dependency scan | `pass` | `python -m models.deepseek_v4_1_flash_a2.decode_acceptance --static-scan` |
 | PyPTO single-step compile | `pass` | `decode_fwd -p a2a3 --sim --compile-only` |
 | PyPTO replay compile | `pass` | `decode_replay --steps 1/2/8 -p a2a3 --sim --compile-only` |
-| EP2 PyPTO MoE code generation | `pass` | `decode_ep2_compile`; `.pypto-a3-state/decode-ep2-compile.json`; A3 artifact generated with 384 routed experts and 192 local experts per rank |
+| EP2 PyPTO MoE code generation | `pass` | `decode_moe_compile`; `.pypto-a3-state/decode-ep2-compile.json`; A3 artifact generated with 384 routed experts and 192 local experts per rank |
 | real Aurora EP2 weight ABI probe | `pass` | `decode_weight_abi.py`; one real layer-0 expert, router, and shared expert packed in the vLLM environment; NZ round-trip and W2 zero-tail checks passed |
 | Decode asset structure verifier | `pass` | `decode_asset_contract.py`; current report rejects the absent input, history-cache, and reference-capture files before queue submission |
 | Aurora checkpoint manifest | `pass` | `.pypto-a3-state/deepseek-v41-checkpoint-manifest.json`; metadata/header audit only |

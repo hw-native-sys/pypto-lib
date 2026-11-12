@@ -145,6 +145,7 @@ def make_c2_index_publish_projected_inline(capacity, config, cache_blocks=2):
         source_sin: pl.Tensor[[capacity, pairs], pl.FP32],
         positions: pl.Tensor[[capacity], pl.INT32],
         compressed_slots: pl.Tensor[[capacity], pl.INT64],
+        index_slots: pl.Tensor[[capacity], pl.INT64],
         query_start: pl.Tensor[[Q_START_DYN], pl.INT32],
         requests: pl.Tensor[[capacity], pl.INT32],
         state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
@@ -186,7 +187,7 @@ def make_c2_index_publish_projected_inline(capacity, config, cache_blocks=2):
         project_index(compressed, index_wk, projected_index, active)
         norm_index(projected_index, index_norm, index_key, active)
         rope_index(index_key, source_cos, source_sin, index_key, active)
-        publish_index(index_key, compressed_slots, index_cache, index_scale, active)
+        publish_index(index_key, index_slots, index_cache, index_scale, active)
         return state, compressed, compressed_cache, index_key, index_cache, index_scale
 
     return publish
@@ -211,6 +212,7 @@ def make_c2_index_publish_inline(capacity, config, cache_blocks=2):
         source_sin: pl.Tensor[[capacity, pairs], pl.FP32],
         positions: pl.Tensor[[capacity], pl.INT32],
         compressed_slots: pl.Tensor[[capacity], pl.INT64],
+        index_slots: pl.Tensor[[capacity], pl.INT64],
         query_start: pl.Tensor[[Q_START_DYN], pl.INT32],
         requests: pl.Tensor[[capacity], pl.INT32],
         state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
@@ -228,7 +230,7 @@ def make_c2_index_publish_inline(capacity, config, cache_blocks=2):
         score_ready = project_kv(x, compressor_wgate, score_proj, active)
         publish_projected(
             kv_proj, score_proj, compressor_norm, index_wk, index_norm,
-            source_cos, source_sin, positions, compressed_slots,
+            source_cos, source_sin, positions, compressed_slots, index_slots,
             query_start, requests, state_block_table,
             state, compressed_cache, index_cache, index_scale,
             compressed, index_key,
@@ -276,6 +278,7 @@ def make_layer2_c1c2(capacity, config):
         index_wk: pl.Tensor[[HEAD_DIM, INDEX_WIDTH], pl.BF16],
         index_norm: pl.Tensor[[INDEX_WIDTH], pl.BF16],
         compressed_slots: pl.Tensor[[capacity], pl.INT64],
+        index_slots: pl.Tensor[[capacity], pl.INT64],
         query_start: pl.Tensor[[Q_START_DYN], pl.INT32],
         requests: pl.Tensor[[capacity], pl.INT32],
         state_block_table: pl.Tensor[[B_DYN, 1], pl.INT32],
@@ -295,7 +298,7 @@ def make_layer2_c1c2(capacity, config):
 
         publish_c2(
             x, compressor_wkv, compressor_wgate, compressor_norm, index_wk, index_norm,
-            rope_cos, rope_sin, positions32, compressed_slots, query_start, requests,
+            rope_cos, rope_sin, positions32, compressed_slots, index_slots, query_start, requests,
             state_block_table, state, compressed_cache, index_cache, index_scale,
             compressed, index_key, active,
         )

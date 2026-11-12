@@ -90,11 +90,13 @@ def w8a8_linear(
     return result
 
 
-def make_dynamic_int8_quantize(capacity: int, width: int):
+def make_dynamic_int8_quantize(capacity: int, width: int, *, cann_dispatch: bool = False):
     """Build a PyPTO kernel for BF16 to INT8 per-token quantization.
 
     The scale uses the vLLM/A2/A3 contract directly: one FP32 dequantization
-    scale per token, stored as ``[T, 1]``.
+    scale per token, stored as ``[T, 1]``.  CANN's fused EP2 dispatch path
+    uses FP16 truncation before its rounded INT8 store; other paths retain
+    the existing INT32 staging sequence.
     """
 
     if capacity % 8 or width % K_TILE:
@@ -122,8 +124,15 @@ def make_dynamic_int8_quantize(capacity: int, width: int):
                 source_fp32 = pl.cast(pl.slice(value, [8, K_TILE], [t0, k0]), pl.FP32)
                 normalized = pl.row_expand_mul(source_fp32, inverse)
                 bounded = pl.minimum(pl.maximum(normalized, -127.0), 127.0)
-                rounded = pl.cast(bounded, pl.INT32, mode="rint")
-                payload[t0:t0 + 8, k0:k0 + K_TILE] = pl.cast(rounded, pl.INT8, mode="trunc")
+                if cann_dispatch:
+                    payload[t0:t0 + 8, k0:k0 + K_TILE] = pl.cast(
+                        pl.cast(bounded, target_type=pl.FP16, mode="trunc"),
+                        target_type=pl.INT8,
+                        mode="round",
+                    )
+                else:
+                    rounded = pl.cast(bounded, pl.INT32, mode="rint")
+                    payload[t0:t0 + 8, k0:k0 + K_TILE] = pl.cast(rounded, pl.INT8, mode="trunc")
         return payload, scales
 
     return quantize

@@ -56,7 +56,7 @@ def make_bf16_linear(capacity: int, width: int, output_width: int):
             for k0 in pl.pipeline(0, width, 256, stage=2):
                 lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
                 lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
-                rhs = weight[k0:k0 + 256, n0:n0 + n_tile]
+                rhs = pl.slice(weight, [256, n_tile], [k0, n0])
                 acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
             output[t0:t0 + 16, n0:n0 + n_tile] = pl.set_validshape(
                 pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile
@@ -90,7 +90,9 @@ def make_fp32_linear(capacity: int, width: int, output_width: int):
             for k0 in pl.pipeline(0, width, 256, stage=2):
                 lhs = pl.slice(value, [16, 256], [t0, k0], valid_shape=[rows, 256])
                 lhs = pl.set_validshape(pl.fillpad(lhs, pad_value=pl.PadValue.zero), 16, 256)
-                rhs = weight[k0:k0 + 256, n0:n0 + n_tile]
+                rhs = pl.slice(weight, [256, n_tile], [k0, n0])
+                lhs = pl.cast(lhs, pl.FP32, mode="rint")
+                rhs = pl.cast(rhs, pl.FP32, mode="rint")
                 acc = pl.matmul_acc(acc, lhs, rhs, init_cond=(k0 == 0))
             output[t0:t0 + 16, n0:n0 + n_tile] = pl.set_validshape(
                 pl.cast(acc, pl.BF16, mode="rint"), rows, n_tile

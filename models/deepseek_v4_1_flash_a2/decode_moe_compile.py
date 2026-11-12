@@ -30,7 +30,7 @@ import torch
 from pypto.ir import DistributedConfig
 from golden import normalize_config
 
-from models.deepseek_v4_1_flash_a2.decode_moe_ep2 import (
+from models.deepseek_v4_1_flash_a2.decode_moe import (
     D,
     EP_SIZE,
     MOE_INTER,
@@ -46,7 +46,7 @@ def _dummy_args() -> list[torch.Tensor | int]:
 
     return [
         torch.empty([EP_SIZE, T, D], dtype=torch.bfloat16),
-        torch.empty([EP_SIZE, T, D], dtype=torch.bfloat16),
+        torch.empty([EP_SIZE, T, D], dtype=torch.float32),
         torch.empty([EP_SIZE, N_EXPERTS, D], dtype=torch.float32),
         torch.empty([EP_SIZE, N_EXPERTS], dtype=torch.float32),
         torch.empty([EP_SIZE, N_EXPERTS], dtype=torch.float32),

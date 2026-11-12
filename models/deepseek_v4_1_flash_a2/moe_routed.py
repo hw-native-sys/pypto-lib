@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 MoE routed expert with BF16 W2 output and FP32 weighted routes."""
+"""DeepSeek-V4 MoE routed expert with BF16 W2 output and route weighting."""
 import os
 
 import pypto.language as pl
@@ -81,11 +81,15 @@ def expert_routed_tile(
     w2_base = local_e * D
     h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER_PAD], dtype=pl.INT8)
     h_tile_scale_dq = pl.create_tensor([RECV_TILE, QUANT_SCALE_PAD], dtype=pl.FP32, manual_dep=True)
+    pl.dump_tag(h_tile_i8)
+    pl.dump_tag(h_tile_scale_dq)
     quant_tids = pl.array.create(1, pl.TASK_ID)
 
     with pl.scope():
         gate_tile_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
         up_tile_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
+        pl.dump_tag(gate_tile_i32)
+        pl.dump_tag(up_tile_i32)
 
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm", deps=[inputs_ready]):
             block = pl.tile.get_block_idx()
@@ -118,6 +122,7 @@ def expert_routed_tile(
                 up_tile_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
 
         h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+        pl.dump_tag(h_tile_fp32)
         with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act"):
             block = pl.tile.get_block_idx()
             inter_base = block * (ACT_GATE_INNER * ACT_INTER_TILE)
@@ -166,6 +171,18 @@ def expert_routed_tile(
                 denominator = pl.add(pl.exp(pl.neg(gate_fp32)), 1.0)
                 silu = pl.div(gate_fp32, denominator)
                 activated = pl.mul(silu, up_fp32)
+                # vLLM-Ascend applies the normalized route probability before
+                # the W2 activation quantizer. Preserve the BF16 boundary used
+                # by the fused expert path before staging back to FP32.
+                route_weight = pl.reshape(
+                    recv_weights[local_e : local_e + 1, tile_row : tile_row + RECV_TILE],
+                    [RECV_TILE, 1],
+                )
+                route_weight_bf16 = pl.cast(route_weight, target_type=pl.BF16, mode="rint")
+                activated = pl.row_expand_mul(
+                    pl.cast(pl.cast(activated, target_type=pl.BF16, mode="rint"), target_type=pl.FP32),
+                    pl.cast(route_weight_bf16, target_type=pl.FP32, mode="none"),
+                )
                 activated = pl.set_validshape(activated, valid_rows, ACT_INTER_TILE)
                 h_tile_fp32[:, inter0 : inter0 + ACT_INTER_TILE] = pl.fillpad(activated, pad_value=pl.PadValue.zero)
 
@@ -195,23 +212,30 @@ def expert_routed_tile(
             for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
                 h_quant_chunk = h_tile_fp32[quant_row : quant_row + QUANT_ROW_TILE, k0 : k0 + QUANT_TILE]
                 h_scaled = pl.row_expand_mul(h_quant_chunk, quant_scale_col)
-                h_fp16 = pl.cast(h_scaled, target_type=pl.FP16, mode="rint")
+                # CANN's A2 dequant_swiglu_quant rounds the normalized value
+                # to INT32 before the INT8 store, with an FP16 staging cast.
+                h_quant_i32 = pl.cast(h_scaled, target_type=pl.INT32, mode="rint")
                 h_tile_i8[
                     quant_row : quant_row + QUANT_ROW_TILE,
                     k0 : k0 + QUANT_TILE,
                 ] = pl.cast(
-                    h_fp16,
+                    pl.cast(h_quant_i32, target_type=pl.FP16, mode="rint"),
                     target_type=pl.INT8,
                     mode="rint",
                 )
             # The final W2 K tile also reads the aligned activation tail.
             h_padding_fp32 = pl.full([QUANT_ROW_TILE, MOE_INTER_PAD - MOE_INTER], dtype=pl.FP32, value=0.0)
-            h_padding_fp16 = pl.cast(h_padding_fp32, target_type=pl.FP16, mode="rint")
-            h_padding = pl.cast(h_padding_fp16, target_type=pl.INT8, mode="rint")
+            h_padding_i32 = pl.cast(h_padding_fp32, target_type=pl.INT32, mode="rint")
+            h_padding = pl.cast(
+                pl.cast(h_padding_i32, target_type=pl.FP16, mode="rint"),
+                target_type=pl.INT8,
+                mode="rint",
+            )
             h_tile_i8[quant_row : quant_row + QUANT_ROW_TILE, MOE_INTER : MOE_INTER_PAD] = h_padding
         quant_tids[0] = quant_tid
 
     y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
+    pl.dump_tag(y_i32)
     with pl.spmd(
         D // (W2_INNER * D_OUT_TILE),
         name_hint="exp_w2_mm",
@@ -240,9 +264,6 @@ def expert_routed_tile(
     ) as w2_act_tid:
         block = pl.tile.get_block_idx()
         d_base = block * (W2_ACT_INNER * D_OUT_TILE_ACT)
-        route_weight = pl.reshape(recv_weights[local_e : local_e + 1, tile_row : tile_row + RECV_TILE], [RECV_TILE, 1])
-        route_weight_bf16 = pl.cast(route_weight, target_type=pl.BF16, mode="rint")
-        route_weight_fp32 = pl.cast(route_weight_bf16, target_type=pl.FP32)
         row_scale = pl.row_max(h_tile_scale_dq)
         for inner in pl.pipeline(W2_ACT_INNER, stage=2):
             d0 = d_base + inner * D_OUT_TILE_ACT
@@ -257,8 +278,8 @@ def expert_routed_tile(
             y_channels = pl.col_expand_mul(y_fp32, w2_scale_tile)
             y_fp32 = pl.row_expand_mul(y_channels, row_scale)
             y_bf16 = pl.cast(y_fp32, target_type=pl.BF16, mode="rint")
-            y_rounded = pl.cast(y_bf16, target_type=pl.FP32)
-            recv_y_tile[:, d0 : d0 + D_OUT_TILE_ACT] = pl.row_expand_mul(y_rounded, route_weight_fp32)
+            y_rounded = pl.cast(y_bf16, target_type=pl.FP32, mode="none")
+            recv_y_tile[:, d0 : d0 + D_OUT_TILE_ACT] = y_rounded
     return w2_act_tid
 
 

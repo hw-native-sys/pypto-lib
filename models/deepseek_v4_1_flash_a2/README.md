@@ -18,9 +18,15 @@ shapes are in `operator_config.py`, while runtime TP sizing is in
 leaves. Decoder paths follow the A5 file names: `decode_c2a_full.py` owns L14,
 `decode_c2a_reuse.py` owns L15/L19, `decode_c1a_full.py` owns L20,
 `decode_c1a_reuse.py` owns L21/L25, and `decode_c1a_reindex.py` owns L24.
-`layer14_15.py` and `layers19_25.py` remain aggregate compatibility providers.
+`decode_c2a_common.py` and `decode_layer_stages.py` remain shared compatibility
+providers behind the canonical A5-shaped entries.
 Shared SWA compute is owned by `swa_attention.py`; `decode_swa.py` remains a
 compatibility export for existing callers.
+
+Canonical A5-shaped composition entries are `decode_layer.py`, `decode_moe.py`,
+`decode_indexer.py`, `prefill_fwd.py`, and `prefill_layer.py`. They select or
+re-export the A2 owners without changing the W8A8/BF16 tensor ABI. The original
+EP2 module paths remain available while callers migrate.
 
 `decode_acceptance.py`, `decode_gate.py`, `decode_reference.py`, and
 `decode_shape_contract.py` define the independent Decode session. The product
