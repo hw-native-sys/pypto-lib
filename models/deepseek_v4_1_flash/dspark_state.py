@@ -14,20 +14,18 @@ import torch
 
 from config import (
     BLOCK_SIZE,
-    DECODE_ROWS_PER_REQUEST,
+    DECODE_SEQ,
     DSPARK_DRAFT_LAYERS,
     DSPARK_QUERY_WIDTH,
     EP_SIZE,
     FLASH,
-    MAX_BATCH_PER_DP,
+    DECODE_BATCH,
     TABLE_DYN,
     T_DYN,
-    TP_SIZE,
 )
 
 
-BATCH = MAX_BATCH_PER_DP
-ROWS = DECODE_ROWS_PER_REQUEST
+ROWS = DECODE_SEQ
 STATE_VALID = 0
 STATE_GENERATION = 1
 STATE_ANCHOR = 2
@@ -39,10 +37,8 @@ STATE_TOKEN_WIDTH = ROWS
 PREFILL_SAMPLE_ROWS = 16
 SAMPLED_STRIDE = 8
 ROPE_HALF = FLASH.qk_rope_head_dim // 2
-ROPE_ROWS_DYN = pl.dynamic("V41_DSPARK_ROPE_ROWS_DYN")
+ROPE_ROWS_DYN = pl.dynamic("DSPARK_ROPE_ROWS_DYN")
 
-if TP_SIZE != 1:
-    raise ValueError("DSpark request state currently requires TP1")
 
 
 def golden_bootstrap(
@@ -93,7 +89,7 @@ def golden_bootstrap_inputs(tensors, _params):
         row = int(tensors["sampled_rows"][request])
         prompt = int(tensors["prompt_lengths"][request])
         limit = int(tensors["position_limits"][request])
-        if not (0 <= slot < BATCH and 0 <= row < PREFILL_SAMPLE_ROWS and 0 < prompt < limit):
+        if not (0 <= slot < DECODE_BATCH and 0 <= row < PREFILL_SAMPLE_ROWS and 0 < prompt < limit):
             continue
         meta = tensors["state_meta"][slot]
         if int(meta[STATE_VALID]) != 0 or int(meta[STATE_GENERATION]) != int(tensors["generations"][request]):
@@ -105,25 +101,25 @@ def golden_bootstrap_inputs(tensors, _params):
 
 @pl.jit
 def bootstrap_inputs_rank(
-    slot_ids: pl.Tensor[[BATCH], pl.INT32],
-    generations: pl.Tensor[[BATCH], pl.INT32],
-    prompt_lengths: pl.Tensor[[BATCH], pl.INT32],
-    position_limits: pl.Tensor[[BATCH], pl.INT32],
-    sampled_rows: pl.Tensor[[BATCH], pl.INT32],
+    slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    prompt_lengths: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    position_limits: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    sampled_rows: pl.Tensor[[DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[PREFILL_SAMPLE_ROWS, SAMPLED_STRIDE], pl.INT32],
-    state_meta: pl.Tensor[[BATCH, STATE_META_WIDTH], pl.INT32],
-    next_prefill_tokens: pl.Out[pl.Tensor[[BATCH], pl.INT64]],
-    first_query_positions: pl.Out[pl.Tensor[[BATCH], pl.INT32]],
+    state_meta: pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32],
+    next_prefill_tokens: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT64]],
+    first_query_positions: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
 ):
     for _core in pl.spmd(1, name_hint="dspark_bootstrap_inputs"):
-        for request in pl.range(BATCH):
+        for request in pl.range(DECODE_BATCH):
             pl.write(next_prefill_tokens, [request], pl.cast(0, pl.INT64))
             pl.write(first_query_positions, [request], pl.cast(-1, pl.INT32))
             slot = pl.read(slot_ids, [request])
             row = pl.read(sampled_rows, [request])
             prompt = pl.read(prompt_lengths, [request])
             limit = pl.read(position_limits, [request])
-            if slot >= 0 and slot < BATCH and row >= 0 and row < PREFILL_SAMPLE_ROWS:
+            if slot >= 0 and slot < DECODE_BATCH and row >= 0 and row < PREFILL_SAMPLE_ROWS:
                 valid = pl.read(state_meta, [slot, STATE_VALID])
                 generation = pl.read(state_meta, [slot, STATE_GENERATION])
                 expected = pl.read(generations, [request])
@@ -137,15 +133,15 @@ def bootstrap_inputs_rank(
 
 @pl.jit.host
 def l3_bootstrap_inputs(
-    slot_ids: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    generations: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    prompt_lengths: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    position_limits: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    sampled_rows: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
+    slot_ids: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
+    generations: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
+    prompt_lengths: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
+    position_limits: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
+    sampled_rows: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[EP_SIZE, PREFILL_SAMPLE_ROWS, SAMPLED_STRIDE], pl.INT32],
-    state_meta: pl.Tensor[[EP_SIZE, BATCH, STATE_META_WIDTH], pl.INT32],
-    next_prefill_tokens: pl.Out[pl.Tensor[[EP_SIZE, BATCH], pl.INT64]],
-    first_query_positions: pl.Out[pl.Tensor[[EP_SIZE, BATCH], pl.INT32]],
+    state_meta: pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_META_WIDTH], pl.INT32],
+    next_prefill_tokens: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT64]],
+    first_query_positions: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32]],
 ):
     for rank in pl.range(pld.world_size()):
         bootstrap_inputs_rank(
@@ -157,23 +153,23 @@ def l3_bootstrap_inputs(
 
 @pl.jit
 def publish_bootstrap_rank(
-    slot_ids: pl.Tensor[[BATCH], pl.INT32],
-    generations: pl.Tensor[[BATCH], pl.INT32],
-    prompt_lengths: pl.Tensor[[BATCH], pl.INT32],
-    position_limits: pl.Tensor[[BATCH], pl.INT32],
-    sampled_rows: pl.Tensor[[BATCH], pl.INT32],
+    slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    prompt_lengths: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    position_limits: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    sampled_rows: pl.Tensor[[DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[PREFILL_SAMPLE_ROWS, SAMPLED_STRIDE], pl.INT32],
-    draft_ids: pl.Tensor[[BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
-    state_tokens: pl.InOut[pl.Tensor[[BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[BATCH, STATE_META_WIDTH], pl.INT32]],
+    draft_ids: pl.Tensor[[DECODE_BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
+    state_tokens: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
+    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32]],
 ):
     for _core in pl.spmd(1, name_hint="dspark_bootstrap_publish"):
-        for request in pl.range(BATCH):
+        for request in pl.range(DECODE_BATCH):
             slot = pl.read(slot_ids, [request])
             row = pl.read(sampled_rows, [request])
             prompt = pl.read(prompt_lengths, [request])
             limit = pl.read(position_limits, [request])
-            if slot >= 0 and slot < BATCH and row >= 0 and row < PREFILL_SAMPLE_ROWS:
+            if slot >= 0 and slot < DECODE_BATCH and row >= 0 and row < PREFILL_SAMPLE_ROWS:
                 if prompt > 0 and prompt < limit:
                     generation = pl.read(state_meta, [slot, STATE_GENERATION])
                     expected = pl.read(generations, [request])
@@ -197,15 +193,15 @@ def publish_bootstrap_rank(
 
 @pl.jit.host
 def l3_publish_bootstrap(
-    slot_ids: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    generations: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    prompt_lengths: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    position_limits: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    sampled_rows: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
+    slot_ids: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
+    generations: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
+    prompt_lengths: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
+    position_limits: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
+    sampled_rows: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
     sampled_ids: pl.Tensor[[EP_SIZE, PREFILL_SAMPLE_ROWS, SAMPLED_STRIDE], pl.INT32],
-    draft_ids: pl.Tensor[[EP_SIZE, BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
-    state_tokens: pl.InOut[pl.Tensor[[EP_SIZE, BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, BATCH, STATE_META_WIDTH], pl.INT32]],
+    draft_ids: pl.Tensor[[EP_SIZE, DECODE_BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
+    state_tokens: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
+    state_meta: pl.InOut[pl.Tensor[[EP_SIZE, DECODE_BATCH, STATE_META_WIDTH], pl.INT32]],
 ):
     for rank in pl.range(pld.world_size()):
         publish_bootstrap_rank(
@@ -243,23 +239,22 @@ def golden_prepare_target(
     return ids, positions, widths
 
 
-@pl.jit
-def prepare_target_rank(
-    slot_ids: pl.Tensor[[BATCH], pl.INT32],
-    generations: pl.Tensor[[BATCH], pl.INT32],
-    state_tokens: pl.Tensor[[BATCH, STATE_TOKEN_WIDTH], pl.INT64],
-    state_meta: pl.Tensor[[BATCH, STATE_META_WIDTH], pl.INT32],
-    input_ids: pl.Out[pl.Tensor[[BATCH, ROWS], pl.INT64]],
-    position_ids: pl.Out[pl.Tensor[[BATCH, ROWS], pl.INT32]],
-    active_widths: pl.Out[pl.Tensor[[BATCH], pl.INT32]],
+def _prepare_target_rank(
+    slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    state_tokens: pl.Tensor[[DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64],
+    state_meta: pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32],
+    input_ids: pl.Out[pl.Tensor[[DECODE_BATCH, ROWS], pl.INT64]],
+    position_ids: pl.Out[pl.Tensor[[DECODE_BATCH, ROWS], pl.INT32]],
+    active_widths: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
 ):
     for _core in pl.spmd(1, name_hint="dspark_prepare_target"):
-        for request in pl.range(BATCH):
+        for request in pl.range(DECODE_BATCH):
             width = pl.cast(0, pl.INT32)
             anchor = pl.cast(0, pl.INT32)
             limit = pl.cast(1, pl.INT32)
             slot = pl.read(slot_ids, [request])
-            if slot >= 0 and slot < BATCH:
+            if slot >= 0 and slot < DECODE_BATCH:
                 valid = pl.read(state_meta, [slot, STATE_VALID])
                 generation = pl.read(state_meta, [slot, STATE_GENERATION])
                 expected = pl.read(generations, [request])
@@ -282,6 +277,9 @@ def prepare_target_rank(
                 pl.write(input_ids, [request, offset], token)
                 pl.write(position_ids, [request, offset], position)
     return input_ids, position_ids, active_widths
+
+prepare_target = pl.jit.inline(auto_scope=False)(_prepare_target_rank)
+prepare_target_rank = pl.jit(auto_scope=False)(_prepare_target_rank)
 
 
 def golden_accept_target(
@@ -320,32 +318,31 @@ def golden_accept_target(
     return tokens, meta, accepted_ids, accepted_counts
 
 
-@pl.jit
-def accept_target_rank(
-    slot_ids: pl.Tensor[[BATCH], pl.INT32],
-    generations: pl.Tensor[[BATCH], pl.INT32],
-    active_widths: pl.Tensor[[BATCH], pl.INT32],
-    sampled_ids: pl.Tensor[[BATCH * ROWS, SAMPLED_STRIDE], pl.INT32],
-    state_tokens: pl.InOut[pl.Tensor[[BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[BATCH, STATE_META_WIDTH], pl.INT32]],
-    accepted_ids: pl.Out[pl.Tensor[[BATCH, ROWS], pl.INT32]],
-    accepted_counts: pl.Out[pl.Tensor[[BATCH], pl.INT32]],
-    context_valid: pl.Out[pl.Tensor[[BATCH, ROWS], pl.INT32]],
-    context_positions: pl.Out[pl.Tensor[[BATCH, ROWS], pl.INT32]],
-    num_sampled: pl.Out[pl.Tensor[[BATCH], pl.INT32]],
-    last_sampled: pl.Out[pl.Tensor[[BATCH], pl.INT64]],
-    anchor_ids: pl.Out[pl.Tensor[[BATCH], pl.INT64]],
-    first_query_positions: pl.Out[pl.Tensor[[BATCH], pl.INT32]],
+def _accept_target_rank(
+    slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    active_widths: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    sampled_ids: pl.Tensor[[DECODE_BATCH * ROWS, SAMPLED_STRIDE], pl.INT32],
+    state_tokens: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
+    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32]],
+    accepted_ids: pl.Out[pl.Tensor[[DECODE_BATCH, ROWS], pl.INT32]],
+    accepted_counts: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
+    context_valid: pl.Out[pl.Tensor[[DECODE_BATCH, ROWS], pl.INT32]],
+    context_positions: pl.Out[pl.Tensor[[DECODE_BATCH, ROWS], pl.INT32]],
+    num_sampled: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
+    last_sampled: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT64]],
+    anchor_ids: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT64]],
+    first_query_positions: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
 ):
     for _core in pl.spmd(1, name_hint="dspark_accept_target"):
-        for request in pl.range(BATCH):
+        for request in pl.range(DECODE_BATCH):
             accepted = pl.cast(0, pl.INT32)
             anchor = pl.cast(0, pl.INT32)
             can_draft = pl.cast(0, pl.INT32)
             next_token = pl.cast(0, pl.INT64)
             slot = pl.read(slot_ids, [request])
             width = pl.read(active_widths, [request])
-            if slot >= 0 and slot < BATCH and width > 0 and width <= ROWS:
+            if slot >= 0 and slot < DECODE_BATCH and width > 0 and width <= ROWS:
                 valid = pl.read(state_meta, [slot, STATE_VALID])
                 generation = pl.read(state_meta, [slot, STATE_GENERATION])
                 expected = pl.read(generations, [request])
@@ -393,6 +390,9 @@ def accept_target_rank(
                 pl.write(context_positions, [request, offset], position)
     return state_tokens, state_meta, accepted_ids, accepted_counts
 
+accept_target = pl.jit.inline(auto_scope=False)(_accept_target_rank)
+accept_target_rank = pl.jit(auto_scope=False)(_accept_target_rank)
+
 
 def golden_commit_drafts(
     slot_ids: torch.Tensor,
@@ -421,20 +421,19 @@ def golden_commit_drafts(
     return tokens, meta, committed
 
 
-@pl.jit
-def commit_drafts_rank(
-    slot_ids: pl.Tensor[[BATCH], pl.INT32],
-    generations: pl.Tensor[[BATCH], pl.INT32],
-    draft_ids: pl.Tensor[[BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
-    state_tokens: pl.InOut[pl.Tensor[[BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
-    state_meta: pl.InOut[pl.Tensor[[BATCH, STATE_META_WIDTH], pl.INT32]],
-    committed: pl.Out[pl.Tensor[[BATCH], pl.INT32]],
+def _commit_drafts_rank(
+    slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    generations: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    draft_ids: pl.Tensor[[DECODE_BATCH, DSPARK_QUERY_WIDTH], pl.INT32],
+    state_tokens: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_TOKEN_WIDTH], pl.INT64]],
+    state_meta: pl.InOut[pl.Tensor[[DECODE_BATCH, STATE_META_WIDTH], pl.INT32]],
+    committed: pl.Out[pl.Tensor[[DECODE_BATCH], pl.INT32]],
 ):
     for _core in pl.spmd(1, name_hint="dspark_commit_drafts"):
-        for request in pl.range(BATCH):
+        for request in pl.range(DECODE_BATCH):
             published = pl.cast(0, pl.INT32)
             slot = pl.read(slot_ids, [request])
-            if slot >= 0 and slot < BATCH:
+            if slot >= 0 and slot < DECODE_BATCH:
                 valid = pl.read(state_meta, [slot, STATE_VALID])
                 generation = pl.read(state_meta, [slot, STATE_GENERATION])
                 expected = pl.read(generations, [request])
@@ -451,20 +450,22 @@ def commit_drafts_rank(
             pl.write(committed, [request], published)
     return state_tokens, state_meta, committed
 
+commit_drafts = pl.jit.inline(auto_scope=False)(_commit_drafts_rank)
+commit_drafts_rank = pl.jit(auto_scope=False)(_commit_drafts_rank)
 
-@pl.jit
-def prepare_drafter_geometry_rank(
-    context_valid: pl.Tensor[[BATCH, ROWS], pl.INT32],
-    context_positions: pl.Tensor[[BATCH, ROWS], pl.INT32],
-    first_query_positions: pl.Tensor[[BATCH], pl.INT32],
-    block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, BATCH, TABLE_DYN], pl.INT32],
+
+def _prepare_drafter_geometry_rank(
+    context_valid: pl.Tensor[[DECODE_BATCH, ROWS], pl.INT32],
+    context_positions: pl.Tensor[[DECODE_BATCH, ROWS], pl.INT32],
+    first_query_positions: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, DECODE_BATCH, TABLE_DYN], pl.INT32],
     rope_cos_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
     rope_sin_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
-    context_slots: pl.Out[pl.Tensor[[DSPARK_DRAFT_LAYERS, BATCH * ROWS], pl.INT64]],
-    context_rope_cos: pl.Out[pl.Tensor[[BATCH * ROWS, ROPE_HALF], pl.FP32]],
-    context_rope_sin: pl.Out[pl.Tensor[[BATCH * ROWS, ROPE_HALF], pl.FP32]],
-    query_rope_cos: pl.Out[pl.Tensor[[BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
-    query_rope_sin: pl.Out[pl.Tensor[[BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
+    context_slots: pl.Out[pl.Tensor[[DSPARK_DRAFT_LAYERS, DECODE_BATCH * ROWS], pl.INT64]],
+    context_rope_cos: pl.Out[pl.Tensor[[DECODE_BATCH * ROWS, ROPE_HALF], pl.FP32]],
+    context_rope_sin: pl.Out[pl.Tensor[[DECODE_BATCH * ROWS, ROPE_HALF], pl.FP32]],
+    query_rope_cos: pl.Out[pl.Tensor[[DECODE_BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
+    query_rope_sin: pl.Out[pl.Tensor[[DECODE_BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
 ):
     block_tables.bind_dynamic(2, TABLE_DYN)
     rope_cos_table.bind_dynamic(0, ROPE_ROWS_DYN)
@@ -472,7 +473,7 @@ def prepare_drafter_geometry_rank(
     table_blocks = pl.tensor.dim(block_tables, 2)
     rope_rows = pl.tensor.dim(rope_cos_table, 0)
     for _core in pl.spmd(1, name_hint="dspark_drafter_geometry"):
-        for request in pl.range(BATCH):
+        for request in pl.range(DECODE_BATCH):
             first = pl.read(first_query_positions, [request])
             for offset in pl.range(ROWS):
                 row = request * ROWS + offset
@@ -508,21 +509,24 @@ def prepare_drafter_geometry_rank(
                     pl.write(query_rope_sin, [row, col], sin)
     return context_slots, context_rope_cos, context_rope_sin, query_rope_cos, query_rope_sin
 
+prepare_drafter_geometry = pl.jit.inline(auto_scope=False)(_prepare_drafter_geometry_rank)
+prepare_drafter_geometry_rank = pl.jit(auto_scope=False)(_prepare_drafter_geometry_rank)
+
 
 @pl.jit
 def prepare_prefill_drafter_geometry_rank(
     positions: pl.Tensor[[T_DYN], pl.INT32],
     request_ids: pl.Tensor[[T_DYN], pl.INT32],
     num_tokens: pl.Tensor[[1], pl.INT32],
-    first_query_positions: pl.Tensor[[BATCH], pl.INT32],
-    block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, BATCH, TABLE_DYN], pl.INT32],
+    first_query_positions: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    block_tables: pl.Tensor[[DSPARK_DRAFT_LAYERS, DECODE_BATCH, TABLE_DYN], pl.INT32],
     rope_cos_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
     rope_sin_table: pl.Tensor[[ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
     context_slots: pl.Out[pl.Tensor[[DSPARK_DRAFT_LAYERS, T_DYN], pl.INT64]],
     context_rope_cos: pl.Out[pl.Tensor[[T_DYN, ROPE_HALF], pl.FP32]],
     context_rope_sin: pl.Out[pl.Tensor[[T_DYN, ROPE_HALF], pl.FP32]],
-    query_rope_cos: pl.Out[pl.Tensor[[BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
-    query_rope_sin: pl.Out[pl.Tensor[[BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
+    query_rope_cos: pl.Out[pl.Tensor[[DECODE_BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
+    query_rope_sin: pl.Out[pl.Tensor[[DECODE_BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
 ):
     positions.bind_dynamic(0, T_DYN)
     request_ids.bind_dynamic(0, T_DYN)
@@ -540,7 +544,7 @@ def prepare_prefill_drafter_geometry_rank(
         for row in pl.range(tokens):
             position = pl.read(positions, [row])
             request = pl.read(request_ids, [row])
-            active = row < active_tokens and request >= 0 and request < BATCH
+            active = row < active_tokens and request >= 0 and request < DECODE_BATCH
             active = active and position >= 0 and position < rope_rows
             for col in pl.range(ROPE_HALF):
                 cos = pl.cast(0.0, pl.FP32)
@@ -557,7 +561,7 @@ def prepare_prefill_drafter_geometry_rank(
                     if physical >= 0:
                         slot = pl.cast(physical * BLOCK_SIZE + position % BLOCK_SIZE, pl.INT64)
                 pl.write(context_slots, [layer, row], slot)
-        for request in pl.range(BATCH):
+        for request in pl.range(DECODE_BATCH):
             first = pl.read(first_query_positions, [request])
             for offset in pl.range(DSPARK_QUERY_WIDTH):
                 row = request * DSPARK_QUERY_WIDTH + offset
@@ -579,15 +583,15 @@ def l3_prepare_prefill_drafter_geometry(
     positions: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     request_ids: pl.Tensor[[EP_SIZE, T_DYN], pl.INT32],
     num_tokens: pl.Tensor[[EP_SIZE, 1], pl.INT32],
-    first_query_positions: pl.Tensor[[EP_SIZE, BATCH], pl.INT32],
-    block_tables: pl.Tensor[[EP_SIZE, DSPARK_DRAFT_LAYERS, BATCH, TABLE_DYN], pl.INT32],
+    first_query_positions: pl.Tensor[[EP_SIZE, DECODE_BATCH], pl.INT32],
+    block_tables: pl.Tensor[[EP_SIZE, DSPARK_DRAFT_LAYERS, DECODE_BATCH, TABLE_DYN], pl.INT32],
     rope_cos_table: pl.Tensor[[EP_SIZE, ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
     rope_sin_table: pl.Tensor[[EP_SIZE, ROPE_ROWS_DYN, ROPE_HALF], pl.FP32],
     context_slots: pl.Out[pl.Tensor[[EP_SIZE, DSPARK_DRAFT_LAYERS, T_DYN], pl.INT64]],
     context_rope_cos: pl.Out[pl.Tensor[[EP_SIZE, T_DYN, ROPE_HALF], pl.FP32]],
     context_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, T_DYN, ROPE_HALF], pl.FP32]],
-    query_rope_cos: pl.Out[pl.Tensor[[EP_SIZE, BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
-    query_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
+    query_rope_cos: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
+    query_rope_sin: pl.Out[pl.Tensor[[EP_SIZE, DECODE_BATCH * DSPARK_QUERY_WIDTH, ROPE_HALF], pl.FP32]],
 ):
     positions.bind_dynamic(1, T_DYN)
     request_ids.bind_dynamic(1, T_DYN)
@@ -617,10 +621,10 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
-    slots = torch.arange(BATCH, dtype=torch.int32)
+    slots = torch.arange(DECODE_BATCH, dtype=torch.int32)
     sampled_rows = slots.clone()
     prompts = torch.tensor([1, 122, 123, 125, 127, 128, 0, 125, 125, 125, 125, 125], dtype=torch.int32)
-    meta = torch.zeros(BATCH, STATE_META_WIDTH, dtype=torch.int32)
+    meta = torch.zeros(DECODE_BATCH, STATE_META_WIDTH, dtype=torch.int32)
     meta[:, STATE_GENERATION] = 7
     meta[7, STATE_GENERATION] = 6
     meta[8, STATE_VALID] = 1
@@ -630,15 +634,15 @@ if __name__ == "__main__":
     sampled_ids = torch.zeros(PREFILL_SAMPLE_ROWS, SAMPLED_STRIDE, dtype=torch.int32)
     sampled_ids[:, 0] = torch.arange(100, 100 + PREFILL_SAMPLE_ROWS)
     specs = [
-        TensorSpec("slot_ids", [BATCH], torch.int32, init_value=slots),
-        TensorSpec("generations", [BATCH], torch.int32, init_value=7),
-        TensorSpec("prompt_lengths", [BATCH], torch.int32, init_value=prompts),
-        TensorSpec("position_limits", [BATCH], torch.int32, init_value=128),
-        TensorSpec("sampled_rows", [BATCH], torch.int32, init_value=sampled_rows),
+        TensorSpec("slot_ids", [DECODE_BATCH], torch.int32, init_value=slots),
+        TensorSpec("generations", [DECODE_BATCH], torch.int32, init_value=7),
+        TensorSpec("prompt_lengths", [DECODE_BATCH], torch.int32, init_value=prompts),
+        TensorSpec("position_limits", [DECODE_BATCH], torch.int32, init_value=128),
+        TensorSpec("sampled_rows", [DECODE_BATCH], torch.int32, init_value=sampled_rows),
         TensorSpec("sampled_ids", [PREFILL_SAMPLE_ROWS, SAMPLED_STRIDE], torch.int32, init_value=sampled_ids),
-        TensorSpec("state_meta", [BATCH, STATE_META_WIDTH], torch.int32, init_value=meta),
-        TensorSpec("next_prefill_tokens", [BATCH], torch.int64),
-        TensorSpec("first_query_positions", [BATCH], torch.int32),
+        TensorSpec("state_meta", [DECODE_BATCH, STATE_META_WIDTH], torch.int32, init_value=meta),
+        TensorSpec("next_prefill_tokens", [DECODE_BATCH], torch.int64),
+        TensorSpec("first_query_positions", [DECODE_BATCH], torch.int32),
     ]
     result = run(
         fn=bootstrap_inputs_rank, specs=specs,

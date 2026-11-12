@@ -16,7 +16,7 @@ from pypto.runtime import pto_isa_include_dir
 import torch
 
 from config import (
-    FLASH as M, TP_SIZE, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN, CMP_BLOCKS_DYN,
+    FLASH as M, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN, CMP_BLOCKS_DYN,
     COMPRESSED_CACHE_BYTES,
 )
 from quant import unpack_bf16_nz
@@ -248,11 +248,8 @@ def c2a_compressor_publish(
                         if pl.read(token_to_req_indices, [token]) == request:
                             pl.write(mapped_requests, [token], count)
                     count = pl.cast(count + 1, pl.INT32)
-    # TP1 decode retains its measured request-based worker policy.
-    if TP_SIZE == 1:
-        workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
-    else:
-        workers = pl.max(pl.min(native_blocks, 32), 1)
+    # Request-based decode worker count.
+    workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
     native_count = pl.cast(native_blocks, pl.INT32)
     with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as completed:
         _c2a_compress(
@@ -295,8 +292,14 @@ def golden_c1a_compressor(
     wkv: torch.Tensor,
     norm_weight: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute C1A NZ-weight projection followed by RMSNorm."""
-    projected = torch.matmul(x.float(), unpack_bf16_nz(wkv).float()).to(x.dtype)
+    """Compute C1A projection with K-tile FP32 accumulation followed by RMSNorm."""
+    weight = unpack_bf16_nz(wkv).float()
+    source = x.float()
+    projected = torch.zeros((*x.shape[:-1], weight.shape[-1]), dtype=torch.float32, device=x.device)
+    for begin in range(0, x.shape[-1], C1A_PROJ_K_TILE):
+        end = begin + C1A_PROJ_K_TILE
+        projected.add_(torch.matmul(source[..., begin:end], weight[begin:end]))
+    projected = projected.to(x.dtype)
     return golden_rms_norm(projected, norm_weight)
 
 
@@ -356,6 +359,7 @@ def golden_c2a_compressor(
 
 if __name__ == "__main__":
     import argparse
+    import functools
 
     from golden import TensorSpec, ratio_allclose, run
     from quant import pack_bf16_nz
@@ -392,10 +396,8 @@ if __name__ == "__main__":
             weight, gate, values["norm_weight"],
         )[0])
 
-    compare_ring = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
-
-    def compare_feedback(actual, expected, **kwargs):
-        ok, detail = compare_ring(actual, expected, **kwargs)
+    def compare_feedback(actual, expected, *, compare, **kwargs):
+        ok, detail = compare(actual, expected, **kwargs)
         next_position = args.start_position + args.accepted
         if not ok or next_position % 2 == 0:
             return ok, detail
@@ -429,7 +431,9 @@ if __name__ == "__main__":
     result = run(
         fn=c2a_state_feedback_test, specs=specs, golden_fn=golden,
         compare_fn={
-            "state_cache": compare_feedback,
+            "state_cache": functools.partial(
+                compare_feedback, compare=ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            ),
             "latent": ratio_allclose(atol=1e-3, rtol=1e-3, valid_rows=6, zero_tail=True),
         },
         config={"backend_type": "a5", "device_id": args.device,

@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4.1 prefill MoE with compact TP owner rows and HC."""
+"""DeepSeek-V4.1 prefill MoE with local token rows and HC."""
 
 import argparse
 from dataclasses import replace
@@ -18,9 +18,6 @@ import torch
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
-
-if __name__ == "__main__" and not any(arg == "--tp" or arg.startswith("--tp=") for arg in sys.argv):
-    sys.argv += ["--tp", "2"]
 
 import config
 
@@ -44,9 +41,9 @@ if __name__ == "__main__":
 
 
 from config import FLASH as M
-from config import EP_SIZE, TP_SIZE, SUPPORTED_EP_SIZES
+from config import EP_SIZE, SUPPORTED_EP_SIZES
 from config import MOE_TOKENS, MOE_RECV_MAX, N_LOCAL_EXPERTS, LOCAL_T_DYN, ROUTE_T_DYN
-from config import T_DYN, PREFILL_MAX_TOKENS, SUPPORTED_TP_SIZES
+from config import T_DYN
 from gate import gate_from_bf16
 from expert_shared import expert_shared
 from expert_routed import (
@@ -56,13 +53,7 @@ from expert_routed import (
 from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_post
 from hc import hc_head_norm_store, hc_project, hc_sinkhorn, hc_post
 from rmsnorm import golden_rms_norm_tiled
-from o_proj import prefill_tp_output_all_reduce, retire_prefill_signals
 from input_pack import gather_rows
-from prefill_cp_allgather import prefill_cp_restore_hc
-
-
-if EP_SIZE % TP_SIZE:
-    raise ValueError(f"EP{EP_SIZE} must be divisible by TP{TP_SIZE}")
 
 
 # model config
@@ -79,7 +70,7 @@ MX_GROUP = M.weight_block_size[0]
 # Standalone validation shapes.
 _entry_parser = argparse.ArgumentParser(add_help=False)
 _entry_parser.add_argument("--entry", choices=("local", "slabs"), default="slabs")
-_entry_parser.add_argument("--slab-capacity", type=int, default=(2 * MOE_TOKENS + 16) * TP_SIZE)
+_entry_parser.add_argument("--slab-capacity", type=int, default=(2 * MOE_TOKENS + 16))
 _entry_options = _entry_parser.parse_known_args()[0]
 VALIDATE_SLABS = _entry_options.entry == "slabs"
 SLAB_CAPACITY = _entry_options.slab_capacity
@@ -561,8 +552,8 @@ def prefill_moe_slabs(
     source_hidden = pl.reshape(x_hc, [capacity, HC_DIM])
     round_completion = pl.array.create(1, pl.TASK_ID)
     round_completion[0] = reuse_ready
-    owner_capacity = capacity // TP_SIZE
-    owner_begin = ep_rank % TP_SIZE * owner_capacity
+    owner_capacity = capacity
+    owner_begin = 0
     rounds = (owner_capacity + MOE_TOKENS - 1) // MOE_TOKENS
     for round_id in pl.range(rounds):
         begin = owner_begin + round_id * MOE_TOKENS
@@ -715,13 +706,11 @@ def l2_prefill_moe_slabs(
     data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
     routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
-    hc_window: pld.DistributedTensor[[SLAB_CAPACITY, HC_DIM + 16], pl.FP32],
-    hc_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     num_tokens: pl.Tensor[[EP_SIZE], pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]:
-    """Validate forward's contiguous ownership, bounded slabs and HC restore."""
+    """Validate bounded MoE slabs on each rank."""
     capacity = pl.tensor.dim(x_hc, 0)
     slab_hidden = pl.create_tensor([2 * MOE_TOKENS, HC_MULT, D], dtype=pl.FP32)
     slab_pre = pl.create_tensor([2 * MOE_TOKENS, HC_MULT], dtype=pl.FP32)
@@ -742,11 +731,9 @@ def l2_prefill_moe_slabs(
         routed_output, combine_arrived, slab_hidden, slab_pre, slab_mixed, slab_rows,
         initialized, active, ep_rank, moe_epoch, capacity=SLAB_CAPACITY,
     )
-    prefill_cp_restore_hc(
-        x_next, next_pre_mix, hc_window, hc_arrived,
-        ep_rank // TP_SIZE * TP_SIZE, ep_rank % TP_SIZE, moe_epoch, completed,
-    )
-    retire_prefill_signals(x_next, hc_arrived, ep_rank // TP_SIZE * TP_SIZE, ep_rank % TP_SIZE)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_slabs_complete", deps=[completed]):
+        anchor = pl.read(x_next, [0, 0, 0])
+        pl.write(x_next, [0, 0, 0], anchor)
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived, anchor_indices=(0, 0, 0))
     return x_next
 
@@ -792,8 +779,6 @@ def l3_prefill_moe(
 
     rank_count = pld.world_size()
     if VALIDATE_SLABS:
-        hc_window_buf = pld.alloc_window_buffer([SLAB_CAPACITY, HC_DIM + 16], dtype=pl.FP32)
-        hc_arrived_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
         for r in pl.range(rank_count):
             recv_meta = pld.window(recv_meta_buf, [EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
             recv_x = pld.window(recv_x_buf, [N_LOCAL_EXPERTS * RECV_MAX, D], dtype=pl.INT8)
@@ -817,8 +802,6 @@ def l3_prefill_moe(
             shared_w1_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w1_scale[r]
             shared_w2_scale_r: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = shared_w2_scale[r]
             shared_w3_scale_r: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN] = shared_w3_scale[r]
-            hc_window = pld.window(hc_window_buf, [SLAB_CAPACITY, HC_DIM + 16], dtype=pl.FP32)
-            hc_arrived = pld.window(hc_arrived_buf, [TP_SIZE, 1], dtype=pl.INT32)
             l2_prefill_moe_slabs(
                 x_hc[r], pre_mix[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
                 norm_weight[r], gate_weight[r], correction_bias[r],
@@ -828,7 +811,7 @@ def l3_prefill_moe(
                 next_pre_mix[r], x_mixed[r], x_next[r],
                 recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
                 arrived, data_arrived, routed_output, combine_arrived,
-                hc_window, hc_arrived, num_tokens, r, moe_epoch, device=r,
+                num_tokens, r, moe_epoch, device=r,
             )
     else:
         for r in pl.range(rank_count):
@@ -865,204 +848,6 @@ def l3_prefill_moe(
                 arrived, data_arrived, routed_output, combine_arrived,
                 num_tokens, r, moe_epoch, device=r,
             )
-
-
-@pl.jit.inline
-def _local_token_count(num_tokens: pl.Scalar[pl.INT32], tp_rank: pl.Scalar[pl.INT32]):
-    """Map the replicated TP token prefix to this rank's compact local prefix."""
-    # Native INDEX scalar for local row counts and addresses.
-    return (num_tokens + TP_SIZE - 1 - tp_rank) // TP_SIZE
-
-
-@pl.jit.inline
-def _compact_local_tokens(
-    source: pl.Tensor[[T_DYN, D], pl.BF16],
-    compact: pl.Tensor[[T_DYN, D], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-):
-    """Pack this TP rank's interleaved owner rows into the local-token ABI prefix."""
-    tokens = pl.tensor.dim(source, 0)
-    local_tokens = _local_token_count(num_tokens, tp_rank)
-    for row in pl.spmd(tokens, name_hint="prefill_moe_compact"):
-        value = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
-        if row < local_tokens:
-            source_row = row * TP_SIZE + tp_rank
-            value = pl.tile.load(source, [source_row, 0], [1, D])
-        pl.tile.store(value, [row, 0], compact, shapes=[1, D])
-    return compact
-
-
-@pl.jit.inline
-def _scatter_local_tokens(
-    compact: pl.Tensor[[T_DYN, D], pl.BF16],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    compact_ready: pl.Scalar[pl.TASK_ID],
-):
-    """Scatter compact local MoE rows back into the original TP token positions."""
-    tokens = pl.tensor.dim(output, 0)
-    local_tokens = _local_token_count(num_tokens, tp_rank)
-    with pl.spmd(tokens, name_hint="prefill_moe_scatter_zero") as zero_tid:
-        row = pl.tile.get_block_idx()
-        zero = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
-        pl.tile.store(zero, [row, 0], output, shapes=[1, D])
-    with pl.spmd(tokens, name_hint="prefill_moe_scatter", deps=[zero_tid, compact_ready]):
-        row = pl.tile.get_block_idx()
-        if row < local_tokens:
-            dst_row = row * TP_SIZE + tp_rank
-            value = pl.tile.load(compact, [row, 0], [1, D])
-            pl.tile.store(value, [dst_row, 0], output, shapes=[1, D])
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_moe_sublayer(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    ffn_norm_weight: pl.Tensor[[D], pl.BF16],
-    gate_weight: pl.Tensor[[N_EXPERTS, D], pl.BF16],
-    correction_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MX_W1_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS * (MOE_INTER // MX_GROUP), D], pl.FP8E8M0, pl.MX_B_NN],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MX_W3_PACKED_ROWS, MX_PACKED_LANE_COLS], pl.UINT8],
-    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS * (D // MX_GROUP), MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w1_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w2_scale: pl.Tensor[[MOE_INTER // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN],
-    shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w3_scale: pl.Tensor[[D // MX_GROUP, MOE_INTER], pl.FP8E8M0, pl.MX_B_NN],
-    recv_meta: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D // MX_GROUP], pl.UINT8],
-    recv_weights: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, AUX_WIDTH], pl.FP32],
-    recv_routes: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, ROUTE_WIDTH], pl.INT32],
-    arrived: pld.DistributedTensor[[EP_SIZE, SIGNAL_PAD], pl.INT32],
-    data_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[EP_SIZE, N_LOCAL_EXPERTS, SIGNAL_PAD], pl.INT32],
-    ffn_input: pl.Tensor[[T_DYN, D], pl.BF16],
-    ffn_owned: pl.Tensor[[T_DYN, D], pl.BF16],
-    next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
-    num_tokens: pl.Scalar[pl.INT32],
-    ep_rank: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    moe_epoch: pl.Scalar[pl.INT32],
-):
-    """Collapse and normalize HC streams, compact TP owner rows, and run the EP MoE."""
-    ffn_normed = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-    hc_head_norm_store(x_hc, pre_mix, ffn_norm_weight, ffn_normed, ffn_input, num_tokens, worker_limit=64)
-    inv_rms, partials = hc_project(x_hc, hc_ffn_fn, rms_worker_limit=64)
-    hc_sinkhorn(inv_rms, partials, hc_ffn_scale, hc_ffn_base, next_pre_mix, post_mix, residual_mix)
-    local_ffn_normed = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-    _compact_local_tokens(ffn_normed, local_ffn_normed, num_tokens, tp_rank)
-
-    local_num_tokens = _local_token_count(num_tokens, tp_rank)
-    local_ffn_owned = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-    with pl.scope():
-        with pl.spmd(TOKENS, name_hint="moe_output_zero") as _output_zero_tid:
-            zero_t = pl.tile.get_block_idx()
-            zero_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
-            local_ffn_owned = pl.store(zero_row, [zero_t, 0], local_ffn_owned)
-
-        x_norm_mx = pl.create_tensor([TOKENS, D], dtype=pl.FP8E4M3FN)
-        x_norm_scale = pl.create_tensor([1, TOKENS * (D // MX_GROUP)], dtype=pl.FP8E8M0)
-        indices = pl.create_tensor([MOE_TOKENS, TOPK], dtype=pl.INT32)
-        weights = pl.create_tensor([TOKENS, TOPK], dtype=pl.FP32)
-        gate_from_bf16(
-            local_ffn_normed, gate_weight, correction_bias, local_num_tokens,
-            x_norm_mx, x_norm_scale, indices, weights, n_experts=N_EXPERTS, topk=TOPK,
-        )
-        dispatch_indices = indices
-
-        shared_output = pl.create_tensor([TOKENS, D], dtype=pl.BF16)
-        shared_result = expert_shared(
-            x_norm_mx, x_norm_scale,
-            shared_w1, shared_w1_scale,
-            shared_w3, shared_w3_scale,
-            shared_w2, shared_w2_scale,
-            shared_output,
-        )
-
-        recv_x_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.FP8E4M3FN)
-        # Contiguous ND backing for the routed-expert MX_A_ZZ view.
-        recv_scale_local_backing = pl.create_tensor([1, N_LOCAL_EXPERTS * RECV_MAX * (D // MX_GROUP)], dtype=pl.FP8E8M0)
-        recv_weight_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
-        recv_route_local = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
-        recv_count_local = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
-        recv_meta_local = pl.create_tensor([EP_SIZE, N_LOCAL_EXPERTS], dtype=pl.INT32)
-        input_ready = dispatch(
-            dispatch_indices, x_norm_mx, x_norm_scale, weights,
-            recv_x_local, recv_scale_local_backing,
-            recv_weight_local, recv_route_local, recv_count_local, recv_meta_local,
-            recv_meta, recv_x, recv_scale, recv_weights, recv_routes,
-            arrived, data_arrived, local_num_tokens, ep_rank, moe_epoch,
-        )
-
-        scatter_done = expert_routed_scatter(
-            recv_x_local, recv_scale_local_backing,
-            recv_weight_local, recv_count_local,
-            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-            routed_w2, routed_w2_scale,
-            recv_route_local, recv_meta_local,
-            routed_output, input_ready, local_experts=N_LOCAL_EXPERTS, topk=TOPK,
-        )
-        output_ready = combine_scattered(
-            shared_result, local_ffn_owned,
-            routed_output, combine_arrived,
-            _output_zero_tid, scatter_done,
-            local_num_tokens, ep_rank, moe_epoch,
-        )
-        # Complete all peer readers before reusing the windows.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_release", deps=[output_ready]) as released:
-            for peer in pl.range(EP_SIZE):
-                if peer != ep_rank:
-                    pld.system.notify(
-                        target=combine_arrived, peer=peer, offsets=[ep_rank, 1, 0],
-                        value=moe_epoch, op=pld.NotifyOp.Set,
-                    )
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_round_released", deps=[released]) as round_ready:
-            for peer in pl.range(EP_SIZE):
-                if peer != ep_rank:
-                    pld.system.defer_wait(
-                        signal=combine_arrived, offsets=[peer, 1, 0],
-                        expected=moe_epoch, cmp=pld.WaitCmp.Ge,
-                    )
-        _scatter_local_tokens(local_ffn_owned, ffn_owned, num_tokens, tp_rank, round_ready)
-    return ffn_owned
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_ffn_restore(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    ffn_owned: pl.Tensor[[T_DYN, D], pl.BF16],
-    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
-    ffn_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
-    ffn_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    ffn_output: pl.Tensor[[T_DYN, D], pl.BF16],
-    x_hc_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    ffn_epoch: pl.Scalar[pl.INT32],
-):
-    """Sum TP routed partials and expand the residual stream with HC."""
-    prefill_tp_output_all_reduce(
-        ffn_owned, ffn_window, ffn_arrived, ffn_output, group_base, tp_rank, num_tokens, ffn_epoch,
-    )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(ffn_output, x_hc, post_mix, residual_mix, x_hc_out, deps=hc_post_deps)
-    return x_hc_out
 
 
 def _gen_routed_mx_weights_fixture(n_experts, dequant_std, seed_base=0):
@@ -1258,14 +1043,11 @@ def build_tensor_specs(num_tokens: int = MOE_TOKENS):
 
 
 def build_slab_specs(counts):
-    """Replicate nonzero prompt rows per TP group with bounded MoE weights."""
+    """Build independent nonzero prompt rows per rank with bounded MoE weights."""
     specs = build_tensor_specs(MOE_TOKENS)
     generator = torch.Generator().manual_seed(73)
-    groups = EP_SIZE // TP_SIZE
-    hidden = torch.randn(groups, SLAB_CAPACITY, HC_MULT, D, generator=generator).bfloat16().float()
-    pre = torch.sigmoid(torch.randn(groups, SLAB_CAPACITY, HC_MULT, generator=generator)) + M.hc_eps
-    hidden = hidden.repeat_interleave(TP_SIZE, dim=0)
-    pre = pre.repeat_interleave(TP_SIZE, dim=0)
+    hidden = torch.randn(EP_SIZE, SLAB_CAPACITY, HC_MULT, D, generator=generator).bfloat16().float()
+    pre = torch.sigmoid(torch.randn(EP_SIZE, SLAB_CAPACITY, HC_MULT, generator=generator)) + M.hc_eps
     token_names = {"x_hc", "pre_mix", "next_pre_mix", "x_mixed", "x_next"}
     for spec in specs:
         if spec.name in token_names:
@@ -1280,14 +1062,13 @@ def build_slab_specs(counts):
 
 
 def golden_moe_slabs(tensors):
-    """Evaluate each contiguous owner slab, then restore the complete TP prompt."""
+    """Evaluate each rank's prompt in bounded MoE slabs."""
     capacity = tensors["x_hc"].shape[1]
-    owner_rows = capacity // TP_SIZE
     output_names = ("next_pre_mix", "x_mixed", "x_next")
     for name in output_names:
         tensors[name].zero_()
-    for offset in range(0, owner_rows, MOE_TOKENS):
-        rows = min(MOE_TOKENS, owner_rows - offset)
+    for offset in range(0, capacity, MOE_TOKENS):
+        rows = min(MOE_TOKENS, capacity - offset)
         slab = dict(tensors)
         for name in ("x_hc", "pre_mix", *output_names):
             shape = list(tensors[name].shape)
@@ -1295,7 +1076,7 @@ def golden_moe_slabs(tensors):
             slab[name] = torch.zeros(shape, dtype=tensors[name].dtype)
         counts = torch.zeros(EP_SIZE, dtype=torch.int32)
         for rank in range(EP_SIZE):
-            begin = (rank % TP_SIZE) * owner_rows + offset
+            begin = offset
             active = max(0, min(rows, int(tensors["num_tokens"][rank]) - begin))
             counts[rank] = active
             for name in ("x_hc", "pre_mix"):
@@ -1303,17 +1084,9 @@ def golden_moe_slabs(tensors):
         slab["num_tokens"] = counts
         golden_moe(slab)
         for rank in range(EP_SIZE):
-            begin = (rank % TP_SIZE) * owner_rows + offset
+            begin = offset
             for name in output_names:
                 tensors[name][rank, begin:begin + rows].copy_(slab[name][rank, :rows])
-    for base in range(0, EP_SIZE, TP_SIZE):
-        for name in ("next_pre_mix", "x_next"):
-            restored = torch.cat([
-                tensors[name][base + owner, owner * owner_rows:(owner + 1) * owner_rows]
-                for owner in range(TP_SIZE)
-            ], dim=0)
-            for rank in range(base, base + TP_SIZE):
-                tensors[name][rank].copy_(restored)
 
 
 def _golden_moe_core(tensors):
@@ -1559,7 +1332,6 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=list(SUPPORTED_EP_SIZES))
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(SUPPORTED_TP_SIZES))
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(EP_SIZE)))
     parser.add_argument(
         "--experts-per-rank", type=int, default=N_LOCAL_EXPERTS,
@@ -1568,7 +1340,7 @@ if __name__ == "__main__":
     parser.add_argument("--entry", choices=("local", "slabs"), default=_entry_options.entry)
     parser.add_argument("--slab-capacity", type=int, default=SLAB_CAPACITY)
     parser.add_argument("--tokens", type=int, default=MOE_TOKENS)
-    parser.add_argument("--num-tokens", type=int, default=SLAB_CAPACITY // TP_SIZE + 1 if VALIDATE_SLABS else MOE_TOKENS)
+    parser.add_argument("--num-tokens", type=int, default=SLAB_CAPACITY - 1 if VALIDATE_SLABS else MOE_TOKENS)
     parser.add_argument(
         "--num-tokens-per-rank", type=str, default=None,
         help="comma-separated local counts (overrides --num-tokens)",
@@ -1589,10 +1361,10 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",") if d != ""]
     if len(device_ids) != EP_SIZE:
         raise SystemExit(f"need exactly {EP_SIZE} device ids for EP{EP_SIZE}, got {device_ids}")
-    if args.ep != EP_SIZE or args.tp != TP_SIZE:
+    if args.ep != EP_SIZE:
         raise SystemExit(
-            "--ep/--tp are parsed by config.py before argparse; run the module "
-            "with the desired values, for example `python models/deepseek_v4_1_flash/prefill_moe.py --ep 8 --tp 2 ...`"
+            "--ep are parsed by config.py before argparse; run the module "
+            "with the desired values, for example `python models/deepseek_v4_1_flash/prefill_moe.py --ep 8 ...`"
         )
 
     entry = l3_prefill_moe
@@ -1606,16 +1378,13 @@ if __name__ == "__main__":
                 "--num-tokens-per-rank must be comma-separated integers"
             ) from exc
     if VALIDATE_SLABS:
-        if SLAB_CAPACITY <= 0 or SLAB_CAPACITY % TP_SIZE:
-            parser.error("--slab-capacity must be positive and divisible by TP")
+        if SLAB_CAPACITY <= 0:
+            parser.error("--slab-capacity must be positive")
         counts = torch.as_tensor(count_value, dtype=torch.int32).reshape(-1)
         if counts.numel() == 1:
             counts = counts.expand(EP_SIZE).clone()
         if counts.numel() != EP_SIZE or bool(((counts < 0) | (counts > SLAB_CAPACITY)).any()):
             parser.error("slab counts must provide an active prefix in [0, capacity] per rank")
-        grouped = counts.reshape(-1, TP_SIZE)
-        if not bool((grouped == grouped[:, :1]).all()):
-            parser.error("slab counts must agree within each TP group")
         specs = build_slab_specs(counts)
         golden_fn = golden_moe_slabs
         compare_fn = {

@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # Re-enable CPU validation when flat MX scale packing is corrected:
 # https://github.com/hw-native-sys/pto-isa/issues/357
-"""V4.1 inverse RoPE, grouped W8A8 MXFP8 output projection, and TP reductions."""
+"""V4.1 inverse RoPE, grouped W8A8 MXFP8 output projection, and HC post."""
 
 from pathlib import Path
 
@@ -22,19 +22,17 @@ from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential, golden_mxfp8_lin
 
 import pypto.language as pl
 from pypto.runtime import pto_isa_include_dir
-from hc import hc_post
 import pypto.language.distributed as pld
 
 from config import (
-    PREFILL_MAX_TOKENS,
-    FLASH as M, SP_T_DYN, T_DYN, TP_SIZE,
+    FLASH as M, T_DYN,
 )
 
 
 # model config
-LOCAL_H = M.num_attention_heads // TP_SIZE
-LOCAL_O_GROUPS = M.o_groups // TP_SIZE
-LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+LOCAL_H = M.num_attention_heads
+LOCAL_O_GROUPS = M.o_groups
+LOCAL_O_WIDTH = M.o_groups * M.o_lora_rank
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -50,12 +48,8 @@ O_IN_SCALE_COLS = pl.dynamic("O_IN_SCALE_COLS")
 O_OUT_SCALE_COLS = pl.dynamic("O_OUT_SCALE_COLS")
 
 # tiling
-# TP1 decode retains its measured tiles and worker counts.
-O_VECTOR_WORKERS = 64
 O_A_N_TILE = 256
-O_B_N_TILE = 160 if LOCAL_O_WIDTH == 8192 else 256
-SP_REDUCE_ROW_TILE = 2
-SP_PUBLISH_ROW_TILE = 16
+OB_HC_POST_COLUMNS = 27  # 26 full N192 tiles plus one N128 tile.
 
 
 @pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "o_quant_vf.cpp",
@@ -94,23 +88,27 @@ def _o_proj_a(
     return output, output_scale
 
 
-@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "o_proj_b.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _o_proj_b(
+@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "o_proj_b_hc_post.cpp",
+               aiv_source=Path(__file__).parent / "kernels" / "o_proj_b_hc_post.cpp",
+               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
+def _o_proj_b_hc_post(
     payload: pl.Tensor[[O_PAD_ROWS, LOCAL_O_WIDTH], pl.FP8E4M3FN],
     weight: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
     activation_scale: pl.Tensor[[1, O_OUT_SCALE_COLS], pl.FP8E8M0],
     weight_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
     output: pl.Out[pl.Tensor],
-    rows: pl.Scalar[pl.INDEX], reduction: pl.Scalar[pl.INDEX],
+    rows: pl.Scalar[pl.INDEX],
     row_tile: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
-    """Project MXFP8 rows with packed MX_A_ZZ and MX_B_NN scales."""
-    ...
+    """Fuse runtime-M O-B with SplitM HC-post."""
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
-def o_proj(
+def o_proj_hc_post(
     attended: pl.Tensor,
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
@@ -118,38 +116,44 @@ def o_proj(
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
-    worker_limit: pl.constexpr = 32,
     oa_row_tile: pl.constexpr = 80,
-    ob_row_tile: pl.constexpr = 80,
+    ob_row_tile: pl.constexpr = 128,
 ):
-    """Project row groups to BF16; both weights hold NZ bytes in logical [K, N] shapes."""
+    """Return HC output and completion after consuming each N192/N128 accumulator."""
     total_rows = pl.tensor.dim(output, 0)
-    # Native row tiles: OA M80/M128 and OB M80/M256.
-    ob_padded_rows = ((total_rows + ob_row_tile - 1) // ob_row_tile) * ob_row_tile
-    padded_rows = ((ob_padded_rows + oa_row_tile - 1) // oa_row_tile) * oa_row_tile
+    oa_tile = oa_row_tile
+    if total_rows > oa_row_tile:
+        oa_tile = 128
+    padded_rows = ((total_rows + oa_tile - 1) // oa_tile) * oa_tile
     payload_all = pl.create_tensor([LOCAL_O_GROUPS * padded_rows, O_GROUP_IN], dtype=pl.FP8E4M3FN)
     scales_all = pl.create_tensor([LOCAL_O_GROUPS, padded_rows * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
-    vector_workers = pl.max(1, pl.min(O_VECTOR_WORKERS, 2 * pl.system.available_cluster_count()))
+    vector_workers = 2 * pl.system.available_cluster_count()
     with pl.spmd(vector_workers, name_hint="quant_o_vf"):
         payload_all, scales_all = _quant_o_vf(
             attended, rope_cos, rope_sin, payload_all, scales_all, num_tokens, LOCAL_O_GROUPS, padded_rows,
         )
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-    oa_tasks = (padded_rows // oa_row_tile) * (LOCAL_O_WIDTH // O_A_N_TILE)
+    oa_tasks = (padded_rows // oa_tile) * (LOCAL_O_WIDTH // O_A_N_TILE)
     oa_workers = pl.max(1, pl.min(oa_tasks, pl.system.available_cluster_count()))
     with pl.spmd(oa_workers, name_hint="proj_o_a_quant"):
         payload, activation_scale = _o_proj_a(
             payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
-            LOCAL_O_WIDTH, num_tokens, padded_rows, oa_row_tile,
+            LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
         )
-    ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * (D // O_B_N_TILE)
-    ob_workers = pl.max(1, pl.min(ob_tasks, worker_limit))
-    with pl.spmd(ob_workers, name_hint="proj_o_b"):
-        output = _o_proj_b(payload, wo_b, activation_scale, wo_b_scale, output, total_rows, LOCAL_O_WIDTH, ob_row_tile)
-    return output
+    ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * OB_HC_POST_COLUMNS
+    ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
+    with pl.spmd(ob_workers, name_hint="proj_o_b_hc_post") as ready:
+        output = _o_proj_b_hc_post(
+            payload, wo_b, activation_scale, wo_b_scale,
+            residual, post_mix, residual_mix, output, total_rows, ob_row_tile,
+        )
+    return output, ready
 
 
 def grouped_mxfp8_linear(
@@ -208,169 +212,25 @@ def golden_o_proj(
 @pl.jit.inline(auto_scope=False)
 def retire_prefill_signals(
     completion_anchor: pl.Tensor,
-    arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    arrived: pld.DistributedTensor,
     group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
+    group_rank: pl.Scalar[pl.INT32],
+    group_size: pl.constexpr,
 ):
     """Clear ready and consumed signals at a serialized entry boundary."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_signal_retire", allow_early_resolve=False):
         anchor = pl.read(completion_anchor, [0, 0, 0])
-        for peer in pl.range(TP_SIZE):
+        for peer in pl.range(group_size):
             pld.system.notify(
-                arrived, peer=group_base + tp_rank, offsets=[peer, 0],
+                arrived, peer=group_base + group_rank, offsets=[peer, 0],
                 value=0, op=pld.NotifyOp.Set,
             )
         pl.write(completion_anchor, [0, 0, 0], anchor)
     return completion_anchor
 
 
-@pl.jit.inline(auto_scope=False)
-def prefill_sp_output_reduce_scatter(
-    partial: pl.Tensor[[T_DYN, D], pl.BF16],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
-    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[SP_T_DYN, D], pl.BF16],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-):
-    """Push contributions into source-rank receive slots and sum locally in FP32."""
-    local_tokens = pl.tensor.dim(output, 0)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_reuse", allow_early_resolve=False) as reuse_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(
-                output_arrived,
-                offsets=[peer, 0], expected=(attention_epoch - 1) * 2, cmp=pld.WaitCmp.Ge,
-            )
-    with pl.spmd(64, name_hint="sp_reduce_publish", deps=[reuse_tid]) as copied_tid:
-        worker = pl.tile.get_block_idx()
-        for owner in pl.range(TP_SIZE):
-            active = pl.max(0, pl.min(local_tokens, num_tokens - owner * local_tokens))
-            blocks = (active + SP_PUBLISH_ROW_TILE - 1) // SP_PUBLISH_ROW_TILE
-            for block in pl.range(worker, blocks, 64):
-                local_row = block * SP_PUBLISH_ROW_TILE
-                row = owner * local_tokens + local_row
-                target_row = tp_rank * local_tokens + local_row
-                if local_row + SP_PUBLISH_ROW_TILE <= active:
-                    publish_value = pl.load(partial, [row, 0], [SP_PUBLISH_ROW_TILE, D])
-                    pld.tile.remote_store(publish_value, output_window, group_base + owner, [target_row, 0])
-                else:
-                    for tail in pl.range(local_row, active):
-                        tail_publish = pl.load(partial, [owner * local_tokens + tail, 0], [1, D])
-                        target_tail = tp_rank * local_tokens + tail
-                        pld.tile.remote_store(tail_publish, output_window, group_base + owner, [target_tail, 0])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_notify", deps=[copied_tid]) as publish_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.notify(
-                output_arrived,
-                peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-            )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_wait", deps=[publish_tid],
-               allow_early_resolve=False) as wait_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2 - 1, cmp=pld.WaitCmp.Ge)
-    with pl.spmd(64, name_hint="sp_reduce_scatter", deps=[wait_tid]) as reduce_tid:
-        worker = pl.tile.get_block_idx()
-        local_peer = group_base + tp_rank
-        for block in pl.range(worker, (local_tokens + SP_REDUCE_ROW_TILE - 1) // SP_REDUCE_ROW_TILE, 64):
-            local_row = block * SP_REDUCE_ROW_TILE
-            row = tp_rank * local_tokens + local_row
-            if local_row + SP_REDUCE_ROW_TILE <= local_tokens and row + SP_REDUCE_ROW_TILE <= num_tokens:
-                acc = pl.tile.full([SP_REDUCE_ROW_TILE, D], dtype=pl.FP32, value=0.0)
-                for peer in pl.range(TP_SIZE):
-                    source_row = peer * local_tokens + local_row
-                    value = pld.tile.remote_load(output_window, local_peer, [source_row, 0], [SP_REDUCE_ROW_TILE, D])
-                    acc = pl.add(acc, pl.cast(value, pl.FP32))
-                result = pl.cast(acc, pl.BF16, mode="rint")
-                output = pl.store(result, [local_row, 0], output)
-            else:
-                for tail in pl.range(local_row, pl.min(local_row + SP_REDUCE_ROW_TILE, local_tokens)):
-                    target_row = tp_rank * local_tokens + tail
-                    tail_acc = pl.tile.full([1, D], dtype=pl.FP32, value=0.0)
-                    if target_row < num_tokens:
-                        for peer in pl.range(TP_SIZE):
-                            source_row = peer * local_tokens + tail
-                            tail_value = pld.tile.remote_load(output_window, local_peer, [source_row, 0], [1, D])
-                            tail_acc = pl.add(tail_acc, pl.cast(tail_value, pl.FP32))
-                    tail_result = pl.cast(tail_acc, pl.BF16, mode="rint")
-                    output = pl.store(tail_result, [tail, 0], output)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_release", deps=[reduce_tid]) as release_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.notify(
-                output_arrived,
-                peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-            )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sp_reduce_consumed", deps=[release_tid],
-               allow_early_resolve=False):
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
-        anchor = pl.read(output, [0, 0])
-        pl.write(output, [0, 0], anchor)
-    return output
-
-
-@pl.jit.inline(auto_scope=False)
-def prefill_tp_output_all_reduce(
-    output_partial: pl.Tensor[[T_DYN, D], pl.BF16],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
-    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor[[T_DYN, D], pl.BF16],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-):
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_reuse", allow_early_resolve=False) as reuse_tid:
-        for peer in pl.range(TP_SIZE):
-            previous_epoch = (attention_epoch - 1) * 2
-            pld.system.wait(output_arrived, offsets=[peer, 0], expected=previous_epoch, cmp=pld.WaitCmp.Ge)
-    with pl.spmd(64, name_hint="prefill_tp_publish", deps=[reuse_tid]) as publish_tid:
-        worker = pl.tile.get_block_idx()
-        for row in pl.range(worker, num_tokens, 64):
-            col = 0
-            value = pl.load(output_partial, [row, col], [1, D])
-            pld.tile.remote_store(value, output_window, peer=group_base + tp_rank, offsets=[row, col])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_ready", deps=[publish_tid]) as ready_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.notify(
-                output_arrived,
-                peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-            )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_wait", deps=[ready_tid],
-               allow_early_resolve=False) as wait_tid:
-        for peer in pl.range(TP_SIZE):
-            ready_epoch = attention_epoch * 2 - 1
-            pld.system.wait(output_arrived, offsets=[peer, 0], expected=ready_epoch, cmp=pld.WaitCmp.Ge)
-    with pl.spmd(64, name_hint="prefill_tp_reduce", deps=[wait_tid]) as reduce_tid:
-        worker = pl.tile.get_block_idx()
-        for row in pl.range(worker, num_tokens, 64):
-            col = 0
-            acc = pl.tile.full([1, D], dtype=pl.FP32, value=0.0)
-            for peer in pl.range(TP_SIZE):
-                value = pld.tile.remote_load(
-                    output_window,
-                    peer=group_base + peer, offsets=[row, col], shape=[1, D],
-                )
-                acc = pl.add(acc, pl.cast(value, pl.FP32))
-            output = pl.store(pl.cast(acc, pl.BF16, mode="rint"), [row, col], output)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_release", deps=[reduce_tid]) as release_tid:
-        for peer in pl.range(TP_SIZE):
-            pld.system.notify(
-                output_arrived,
-                peer=group_base + peer, offsets=[tp_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd,
-            )
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_tp_consumed", deps=[release_tid],
-               allow_early_resolve=False):
-        for peer in pl.range(TP_SIZE):
-            pld.system.wait(output_arrived, offsets=[peer, 0], expected=attention_epoch * 2, cmp=pld.WaitCmp.Ge)
-        anchor = pl.read(output, [0, 0])
-        pl.write(output, [0, 0], anchor)
-    return output
-
-
 @pl.jit
-def o_proj_validation(
+def o_proj_hc_post_validation(
     attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
     wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
     wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
@@ -378,29 +238,6 @@ def o_proj_validation(
     wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
     rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    output: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    attended.bind_dynamic(0, T_DYN)
-    rope_cos.bind_dynamic(0, T_DYN)
-    rope_sin.bind_dynamic(0, T_DYN)
-    output.bind_dynamic(0, T_DYN)
-    o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        output, num_tokens, worker_limit=32, oa_row_tile=80, ob_row_tile=80,
-    )
-    return output
-
-@pl.jit
-def o_proj_with_hc_validation(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    sublayer: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
@@ -410,18 +247,16 @@ def o_proj_with_hc_validation(
     attended.bind_dynamic(0, T_DYN)
     rope_cos.bind_dynamic(0, T_DYN)
     rope_sin.bind_dynamic(0, T_DYN)
-    sublayer.bind_dynamic(0, T_DYN)
     residual.bind_dynamic(0, T_DYN)
     post_mix.bind_dynamic(0, T_DYN)
     residual_mix.bind_dynamic(0, T_DYN)
     output.bind_dynamic(0, T_DYN)
-    o_proj(
+    o_proj_hc_post(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        sublayer, num_tokens, worker_limit=32, oa_row_tile=80, ob_row_tile=80,
+        residual, post_mix, residual_mix, output, num_tokens,
+        oa_row_tile=80, ob_row_tile=128,
     )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps)
-    return sublayer, output
+    return output
 
 
 def build_o_proj_specs(active_tokens: int, *, pad_to_tile: bool = True):
@@ -492,7 +327,6 @@ def build_o_proj_hc_post_specs(active_tokens: int = 72, *, pad_to_tile: bool = F
     specs = [spec for spec in specs if spec.name not in ("output", "num_tokens")]
     generator = torch.Generator().manual_seed(29)
     return specs + [
-        TensorSpec("sublayer", [tokens, D], torch.bfloat16),
         TensorSpec("residual", [tokens, HC_MULT, D], torch.float32,
                    init_value=lambda: torch.randn(tokens, HC_MULT, D, generator=generator)),
         TensorSpec("post_mix", [tokens, HC_MULT], torch.float32,
@@ -508,61 +342,56 @@ def golden_o_proj_hc_post_validation(tensors):
     """Compute independent BF16 output projection followed by FP32 HC mixing."""
     from hc import golden_hc_post
 
-    projected = dict(tensors, output=tensors["sublayer"])
+    sublayer = torch.zeros_like(tensors["output"][:, 0, :], dtype=torch.bfloat16)
+    projected = dict(tensors, output=sublayer)
     golden_o_proj_validation(projected)
     tensors["output"].copy_(golden_hc_post(
-        tensors["sublayer"], tensors["residual"], tensors["post_mix"], tensors["residual_mix"],
+        sublayer, tensors["residual"], tensors["post_mix"], tensors["residual_mix"],
     ))
 
 
-def compare_o_proj_hc_post(actual, _expected, *, actual_outputs, expected_outputs, inputs, **kwargs):
-    """Check FP32 HC mixing independently of the separately checked BF16 projection."""
+def compare_o_proj_hc_post(actual, expected, *, inputs, compare, **kwargs):
+    """Check active projection tolerance and strict inactive-row residual mixing."""
     from golden import ratio_allclose
-    from hc import golden_hc_post
 
-    expected = golden_hc_post(
-        actual_outputs["sublayer"], inputs["residual"], inputs["post_mix"], inputs["residual_mix"],
-    )
-    compare = ratio_allclose(atol=1e-6, rtol=1e-5, max_error_ratio=0.0)
-    return compare(
-        actual, expected, actual_outputs=actual_outputs, expected_outputs=expected_outputs, inputs=inputs, **kwargs,
-    )
+    active = int(inputs["num_tokens"])
+    passed, detail = True, "no active rows"
+    if active:
+        passed, detail = compare(actual[:active], expected[:active], inputs=inputs, **kwargs)
+    if active < actual.shape[0]:
+        compare_tail = ratio_allclose(atol=1e-6, rtol=1e-5, max_error_ratio=0.0)
+        tail_ok, tail_detail = compare_tail(actual[active:], expected[active:], inputs=inputs, **kwargs)
+        return passed and tail_ok, f"{detail}; inactive rows: {tail_detail}"
+    return passed, detail
 
 
 if __name__ == "__main__":
     import argparse
-
+    import functools
     from golden import ratio_allclose, run
 
-    parser = argparse.ArgumentParser(description="V4.1 output projection branch and padding validation")
+    parser = argparse.ArgumentParser(description="V4.1 fused output projection and HC post validation")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tp", type=int, choices=[1, 2, 4, 8], default=TP_SIZE)
-    parser.add_argument("--case", choices=["all", "empty", "fast", "tail", "hc-post"], default="all")
+    parser.add_argument("--tokens", type=int, help="active rows for a single padded case")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     args = parser.parse_args()
-    cases = (("empty", 0), ("fast", 12), ("tail", 17))
-    for name, active in cases:
-        if args.case not in ("all", name):
-            continue
-        print(f"[O_PROJ] {name}: active={active}", flush=True)
-        active_compare = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
-
-        def compare(actual, expected, **kwargs):
-            if active == 0:
-                zeroed = torch.equal(actual, expected)
-                return zeroed, f"empty input zeros output={zeroed}"
-            passed, detail = active_compare(actual[:active], expected[:active], **kwargs)
-            inactive_ok = torch.equal(actual[active:], expected[active:])
-            return passed and inactive_ok, f"{detail}; inactive rows zeroed={inactive_ok}"
-
+    if args.tokens is not None and args.tokens < 0:
+        parser.error("tokens must be nonnegative")
+    cases = ((0, True), (17, True), (72, False), (129, True))
+    if args.tokens is not None:
+        cases = ((args.tokens, True),)
+    for active, padded in cases:
+        print(f"[O_PROJ] active={active}, padded={padded}, FP32 HC post", flush=True)
         result = run(
-            fn=o_proj_validation,
-            specs=build_o_proj_specs(active),
-            golden_fn=golden_o_proj_validation,
-            compare_fn={"output": compare},
+            fn=o_proj_hc_post_validation,
+            specs=build_o_proj_hc_post_specs(active, pad_to_tile=padded),
+            golden_fn=golden_o_proj_hc_post_validation,
+            compare_fn={
+                "output": functools.partial(compare_o_proj_hc_post, compare=ratio_allclose(atol=1e-2, rtol=1.0 / 128)),
+            },
             config={
                 "backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device,
             },
@@ -571,22 +400,3 @@ if __name__ == "__main__":
         )
         if not result.passed:
             raise SystemExit(result.error or 1)
-    if args.case in ("all", "hc-post"):
-        for active, padded in ((72, False), (17, True), (0, True), (81, True)):
-            print(f"[O_PROJ] hc-post: active={active}, padded={padded}, FP32 HC post", flush=True)
-            result = run(
-                fn=o_proj_with_hc_validation,
-                specs=build_o_proj_hc_post_specs(active, pad_to_tile=padded),
-                golden_fn=golden_o_proj_hc_post_validation,
-                compare_fn={
-                    "sublayer": ratio_allclose(atol=1e-2, rtol=1.0 / 128, valid_rows=active, zero_tail=True),
-                    "output": compare_o_proj_hc_post,
-                },
-                config={
-                    "backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device,
-                },
-                compile_only=args.compile_only,
-                save_data=args.save_data,
-            )
-            if not result.passed:
-                raise SystemExit(result.error or 1)

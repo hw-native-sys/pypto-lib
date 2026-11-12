@@ -49,7 +49,7 @@ if __name__ == "__main__":
 
 from config import FLASH as M
 from config import EP_SIZE as EP_WORLD_SIZE, MOE_RECV_MAX as RECV_MAX
-from config import ROUTE_T_DYN, N_LOCAL_EXPERTS, MOE_TOKENS
+from config import N_LOCAL_EXPERTS, MOE_TOKENS
 
 ROUTED_CUBE_WORKER_TILE = 28 if MOE_TOKENS > 80 else 32
 ROUTED_VECTOR_WORKER_TILE = 32 if MOE_TOKENS > 80 else 64
@@ -912,7 +912,7 @@ def expert_routed_scatter(
     routed_w2_scale: pl.Tensor[None, pl.FP8E8M0, pl.MX_B_NN],
     recv_route: pl.Tensor,
     recv_meta: pl.Tensor,
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+    routed_output: pld.DistributedTensor,
     input_ready: pl.Scalar[pl.TASK_ID],
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
     topk: pl.constexpr = M.num_experts_per_tok,

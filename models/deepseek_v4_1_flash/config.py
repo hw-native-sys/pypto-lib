@@ -236,9 +236,10 @@ FLASH = DeepSeekV41Config(
 )
 
 
-BLOCK_SIZE = 128
-MAX_BATCH_PER_DP = 12
+DECODE_BATCH = 12
 DSPARK_SPEC_TOKENS = 5
+DECODE_SEQ = DSPARK_SPEC_TOKENS + 1
+BLOCK_SIZE = 128
 DSPARK_DRAFT_LAYERS = 3
 DSPARK_N_ROUTED_EXPERTS = 128
 DSPARK_NUM_EXPERTS_PER_TOK = 3
@@ -248,10 +249,9 @@ DSPARK_QUERY_WIDTH = DSPARK_SPEC_TOKENS
 DSPARK_SWA_INDEX_WIDTH = (FLASH.sliding_window + DSPARK_QUERY_WIDTH + 63) // 64 * 64
 DSPARK_MARKOV_RANK = 256
 DSPARK_NOISE_TOKEN_ID = 128799
-DECODE_ROWS_PER_REQUEST = DSPARK_SPEC_TOKENS + 1
 # Retain every verified row until acceptance selects the next decode position.
-STATE_CAPACITY = (DECODE_ROWS_PER_REQUEST + 7) // 8 * 8
-DECODE_MAX_TOKENS = MAX_BATCH_PER_DP * DECODE_ROWS_PER_REQUEST
+STATE_CAPACITY = (DECODE_SEQ + 7) // 8 * 8
+DECODE_MAX_TOKENS = DECODE_BATCH * DECODE_SEQ
 PREFILL_MAX_TOKENS = 8192
 WINDOW_CACHE_GROUP = 32
 COMPRESSED_CACHE_GROUP = 16
@@ -261,57 +261,47 @@ COMPRESSED_CACHE_BYTES = FLASH.head_dim // 2 + 2 * (FLASH.head_dim // COMPRESSED
 
 
 # Shared symbolic dimensions
-T_DYN = pl.dynamic("V41_T_DYN")
-LOCAL_T_DYN = pl.dynamic("V41_LOCAL_T_DYN")
-SP_T_DYN = pl.dynamic("V41_SP_T_DYN")
-ROUTE_T_DYN = pl.dynamic("V41_ROUTE_T_DYN")
-B_DYN = pl.dynamic("V41_B_DYN")
-STATE_BLOCKS_DYN = pl.dynamic("V41_STATE_BLOCKS_DYN")
-Q_START_DYN = pl.dynamic("V41_Q_START_DYN")
-TABLE_DYN = pl.dynamic("V41_TABLE_DYN")
-ORI_BLOCKS_DYN = pl.dynamic("V41_ORI_BLOCKS_DYN")
-CMP_BLOCKS_DYN = pl.dynamic("V41_CMP_BLOCKS_DYN")
-INDEX_BLOCKS_DYN = pl.dynamic("V41_INDEX_BLOCKS_DYN")
-CMP_POSITIONS_DYN = pl.dynamic("V41_CMP_POSITIONS_DYN")
-INDEX_POOL_BLOCKS_DYN = pl.dynamic("V41_INDEX_POOL_BLOCKS_DYN")
-INDEX_POOL_POSITIONS_DYN = pl.dynamic("V41_INDEX_POOL_POSITIONS_DYN")
+RANKS_DYN = pl.dynamic("RANKS_DYN")
+T_DYN = pl.dynamic("T_DYN")
+LOCAL_T_DYN = pl.dynamic("LOCAL_T_DYN")
+ROUTE_T_DYN = pl.dynamic("ROUTE_T_DYN")
+B_DYN = pl.dynamic("B_DYN")
+STATE_BLOCKS_DYN = pl.dynamic("STATE_BLOCKS_DYN")
+Q_START_DYN = pl.dynamic("Q_START_DYN")
+TABLE_DYN = pl.dynamic("TABLE_DYN")
+ORI_BLOCKS_DYN = pl.dynamic("ORI_BLOCKS_DYN")
+CMP_BLOCKS_DYN = pl.dynamic("CMP_BLOCKS_DYN")
+INDEX_BLOCKS_DYN = pl.dynamic("INDEX_BLOCKS_DYN")
+CMP_POSITIONS_DYN = pl.dynamic("CMP_POSITIONS_DYN")
+INDEX_POOL_BLOCKS_DYN = pl.dynamic("INDEX_POOL_BLOCKS_DYN")
+INDEX_POOL_POSITIONS_DYN = pl.dynamic("INDEX_POOL_POSITIONS_DYN")
 
 
 # Parallel configuration
-SUPPORTED_TP_SIZES = (1, 2, 4, 8)
+SUPPORTED_LM_HEAD_TP_SIZES = (1, 2, 4, 8)
+SUPPORTED_CP_SIZES = (1, 2, 4, 8)
 SUPPORTED_EP_SIZES = (2, 4, 8)
 
 
-def _parse_parallel_size(name: str, default: int) -> int:
+def _parse_parallel_size(name: str, default: int, choices: Tuple[int, ...]) -> int:
     flag = f"--{name}"
+    size = default
     for index, argument in enumerate(sys.argv):
-        if argument == flag and index + 1 < len(sys.argv):
-            return int(sys.argv[index + 1])
-        if argument.startswith(f"{flag}="):
-            return int(argument.split("=", 1)[1])
-    return default
-
-
-TP_SIZE = _parse_parallel_size("tp", 1)
-if TP_SIZE not in SUPPORTED_TP_SIZES:
-    raise ValueError(f"--tp must be one of {SUPPORTED_TP_SIZES}, got {TP_SIZE}")
-if FLASH.num_attention_heads % TP_SIZE or FLASH.o_groups % TP_SIZE:
-    raise ValueError(f"attention heads and output groups must be divisible by TP{TP_SIZE}")
-
-
-def get_ep_size() -> int:
-    """Resolve the EP size independently of the attention TP size."""
-    dp = _parse_parallel_size("dp", 0)
-    size = _parse_parallel_size("ep", TP_SIZE * dp if dp else 2)
-    if size not in SUPPORTED_EP_SIZES:
-        raise ValueError(f"--ep must be one of {SUPPORTED_EP_SIZES}, got {size}")
-    if size % TP_SIZE:
-        raise ValueError(f"EP{size} must be divisible by TP{TP_SIZE}")
-    if dp and size != TP_SIZE * dp:
-        raise ValueError(f"--ep {size} must equal --tp {TP_SIZE} * --dp {dp}")
-    if FLASH.n_routed_experts % size:
-        raise ValueError(f"{FLASH.n_routed_experts} routed experts cannot be evenly sharded across EP{size}")
+        if argument == flag:
+            if index + 1 == len(sys.argv):
+                raise ValueError(f"{flag} requires an integer")
+            size = int(sys.argv[index + 1])
+        elif argument.startswith(f"{flag}="):
+            size = int(argument.split("=", 1)[1])
+    if size not in choices:
+        raise ValueError(f"{flag} must be one of {choices}, got {size}")
     return size
+
+
+LM_HEAD_TP_SIZE = _parse_parallel_size("lm-head-tp", 1, SUPPORTED_LM_HEAD_TP_SIZES)
+CP_SIZE = _parse_parallel_size("cp", 1, SUPPORTED_CP_SIZES)
+EP_SIZE = _parse_parallel_size("ep", 2, SUPPORTED_EP_SIZES)
+DP_SIZE = EP_SIZE // CP_SIZE
 
 
 def set_moe_tokens(tokens: int) -> None:
@@ -324,8 +314,6 @@ def set_moe_tokens(tokens: int) -> None:
 
 
 # Shared MoE deployment dimensions
-EP_SIZE = get_ep_size()
-DP_SIZE = EP_SIZE // TP_SIZE
 N_LOCAL_EXPERTS = FLASH.n_routed_experts // EP_SIZE
 MOE_TOKENS = (DECODE_MAX_TOKENS + 15) // 16 * 16
 MOE_RECV_MAX = EP_SIZE * MOE_TOKENS

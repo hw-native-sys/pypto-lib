@@ -17,15 +17,15 @@ import pypto.language as pl
 from quant import pack_quantized_cache, unpack_quantized_cache
 
 from config import (
-    FLASH as M, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
+    FLASH as M, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
     Q_START_DYN, STATE_BLOCKS_DYN, COMPRESSED_CACHE_GROUP, INDEX_CACHE_GROUP, STATE_CAPACITY,
     WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from compressor import STATE_WIDTH, c2a_compressor_project
 from compressor import c2a_compressor_publish
-from hc import hc_head_norm, hc_project, hc_sinkhorn, hc_post
+from hc import hc_head_norm, hc_project, hc_sinkhorn
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from o_proj import o_proj
+from o_proj import o_proj_hc_post
 from sparse_attention import gather_sparse_attention
 from decode_indexer import decode_c2a_indexer
 
@@ -54,8 +54,8 @@ RATIO = 2
 
 @pl.jit.inline(auto_scope=False)
 def decode_c2a_full(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -100,8 +100,8 @@ def decode_c2a_full(
     index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    output: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    next_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     tokens = pl.tensor.dim(x_hc, 0)
@@ -153,31 +153,25 @@ def decode_c2a_full(
 
     chunk_done = pl.system.task_dummy(deps=[select_tid, compressed_publish_tid])
 
-    attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     gather_sparse_attention(
         query, window_indices, window_cache, topk_indices, compressed_cache,
         attn_sink, attended, num_tokens, chunk_done, compressed_keys=INDEX_TOPK,
     )
-    o_proj(
-        attended,
-        wo_a, wo_a_scale, wo_b, wo_b_scale,
-        rope_cos, rope_sin,
-        attn_out, num_tokens,
-        worker_limit=32, oa_row_tile=80, ob_row_tile=80,
-    )
-
     inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
     hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
+    o_proj_hc_post(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        x_hc, post_mix, residual_mix, output, num_tokens,
+        oa_row_tile=80, ob_row_tile=128,
+    )
     return output, next_pre_mix
 
 
 @pl.jit
 def l2_decode_c2a_full(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -222,11 +216,11 @@ def l2_decode_c2a_full(
     index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16, pl.NZ],
     topk_indices: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
-    output: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_hc.bind_dynamic(0, LOCAL_T_DYN)
+    x_hc.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
@@ -263,8 +257,8 @@ def l2_decode_c2a_full(
 
 @pl.jit.host
 def l3_decode_c2a_full(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -309,11 +303,11 @@ def l3_decode_c2a_full(
     index_wq_b_scale: pl.Tensor[[Q_LORA // MX_GROUP, INDEX_H * INDEX_DIM], pl.FP8E8M0],
     index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
     topk_indices: pl.InOut[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
-    output: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    next_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_hc.bind_dynamic(0, LOCAL_T_DYN)
+    x_hc.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
     index_cache.bind_dynamic(0, INDEX_BLOCKS_DYN)
@@ -476,7 +470,7 @@ def build_c2a_specs(
     """Build C2A HC, attention, cache, and runtime specifications."""
     import torch
     import math
-    from config import MAX_BATCH_PER_DP, BLOCK_SIZE
+    from config import DECODE_BATCH, BLOCK_SIZE
     from utils import packed_query_lengths, paged_slots, window_metadata
     from quant import (
         pack_bf16_nz, pack_fp8_nz,
@@ -490,8 +484,8 @@ def build_c2a_specs(
 
     if case not in ("mixed", "long", "masked", "zero"):
         raise ValueError(f"unsupported case {case!r}")
-    if not 1 <= requests <= min(MAX_BATCH_PER_DP, tokens):
-        raise ValueError(f"requests must be in [1, min({MAX_BATCH_PER_DP}, tokens)]")
+    if not 1 <= requests <= min(DECODE_BATCH, tokens):
+        raise ValueError(f"requests must be in [1, min({DECODE_BATCH}, tokens)]")
     gen = torch.Generator().manual_seed(seed)
 
     lengths = [tokens // requests + (index < tokens % requests) for index in range(requests)]
@@ -553,8 +547,8 @@ def build_c2a_specs(
     compressor_wgate = (torch.randn(D, HEAD_DIM, generator=gen) / math.sqrt(D)).bfloat16()
     wo_a_values = torch.randn(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN, generator=gen)
     # Predecessor projections in each request's ring block.
-    pending = torch.randn(MAX_BATCH_PER_DP, D, generator=gen).bfloat16().float()
-    state_cache = torch.zeros(MAX_BATCH_PER_DP + 1, STATE_CAPACITY, STATE_WIDTH)
+    pending = torch.randn(DECODE_BATCH, D, generator=gen).bfloat16().float()
+    state_cache = torch.zeros(DECODE_BATCH + 1, STATE_CAPACITY, STATE_WIDTH)
     state_block_table = torch.arange(requests - 1, -1, -1, dtype=torch.int32).unsqueeze(1) + 1
     for request, prefix in enumerate(prefixes):
         if prefix:
@@ -699,13 +693,13 @@ if __name__ == "__main__":
     import argparse
     from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="TP1 A5 HC C2A full validation")
+    parser = argparse.ArgumentParser(description="A5 HC C2A full validation")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     startpos_help = "one starting position per request; omitted: default validation workload"
     parser.add_argument("--start-pos", "--startpos", dest="startpos", type=parse_decode_startpos, help=startpos_help)
-    query_help = "one query length per start-pos; omitted: config.DECODE_ROWS_PER_REQUEST each"
+    query_help = "one query length per start-pos; omitted: config.DECODE_SEQ each"
     parser.add_argument("--query-lens", type=parse_decode_query_lens, help=query_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=["mixed", "long", "masked", "zero"], default="mixed")

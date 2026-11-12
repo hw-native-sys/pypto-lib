@@ -19,17 +19,18 @@ from quant import pack_quantized_cache, unpack_quantized_cache
 
 
 from config import (
-    DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, MOE_TOKENS, ORI_BLOCKS_DYN, TP_SIZE,
+    DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, MOE_TOKENS, ORI_BLOCKS_DYN,
     WINDOW_CACHE_BYTES,
 )
-from o_proj import o_proj
+from o_proj import o_proj_hc_post
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 
 
+HC_MULT = FLASH.hc_mult
 D = FLASH.hidden_size
 HEAD_DIM = FLASH.head_dim
-LOCAL_H = FLASH.num_attention_heads // TP_SIZE
-LOCAL_O_GROUPS = FLASH.o_groups // TP_SIZE
+LOCAL_H = FLASH.num_attention_heads
+LOCAL_O_GROUPS = FLASH.o_groups
 LOCAL_O_WIDTH = LOCAL_O_GROUPS * FLASH.o_lora_rank
 O_GROUP_IN = FLASH.num_attention_heads * HEAD_DIM // FLASH.o_groups
 O_LORA = FLASH.o_lora_rank
@@ -109,7 +110,7 @@ def attend_dspark_window(
 
 
 @pl.jit.inline(auto_scope=False)
-def dspark_attention(
+def dspark_attention_partial(
     x: pl.Tensor,
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
@@ -120,16 +121,11 @@ def dspark_attention(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     window_slots: pl.Tensor,
     window_indices: pl.Tensor,
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     qr = pl.create_tensor([MOE_TOKENS, Q_LORA], dtype=pl.BF16)
@@ -161,11 +157,7 @@ def dspark_attention(
     selected = gather_dspark_window(window_cache, window_indices, selected, num_tokens)
     attended = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attended = attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
-    o_proj_result = o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale,
-        rope_cos, rope_sin, output, num_tokens, worker_limit=32, oa_row_tile=80, ob_row_tile=80,
-    )
-    return output, window_cache
+    return attended, window_cache
 
 
 @pl.jit
@@ -189,15 +181,23 @@ def dspark_attention_test(
     window_slots: pl.Tensor[[MOE_TOKENS], pl.INT64],
     window_indices: pl.Tensor[[MOE_TOKENS, DSPARK_SWA_INDEX_WIDTH], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    output: pl.Out[pl.Tensor[[MOE_TOKENS, D], pl.BF16]],
+    residual: pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32],
+    post_mix: pl.Tensor[[MOE_TOKENS, HC_MULT], pl.FP32],
+    residual_mix: pl.Tensor[[MOE_TOKENS, HC_MULT, HC_MULT], pl.FP32],
+    output: pl.Out[pl.Tensor[[MOE_TOKENS, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
-    return dspark_attention(
+    attended, window_cache = dspark_attention_partial(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-        kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        window_slots, window_indices, window_cache, output, num_tokens,
+        kv_norm_weight, attn_sink, rope_cos, rope_sin,
+        window_slots, window_indices, window_cache, num_tokens,
     )
+    o_proj_hc_post(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        residual, post_mix, residual_mix, output, num_tokens, oa_row_tile=80, ob_row_tile=128,
+    )
+    return output, window_cache
 
 
 def make_attention_inputs(seed: int = 43):
@@ -230,6 +230,7 @@ def make_attention_inputs(seed: int = 43):
 
 if __name__ == "__main__":
     import argparse
+    import functools
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark non-causal SWA validation")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
@@ -243,6 +244,8 @@ if __name__ == "__main__":
 
     from golden import ScalarSpec, TensorSpec, ratio_allclose, run
     from sparse_attention import SWA_INPUT_NAMES, swa_official_reference
+    from o_proj import build_o_proj_hc_post_specs, compare_o_proj_hc_post
+    from hc import golden_hc_post
 
     values = make_attention_inputs()
 
@@ -255,8 +258,9 @@ if __name__ == "__main__":
             for name in SWA_INPUT_NAMES
         }
         output, cache, cache_scale = swa_official_reference(reference_inputs, key_tile=64)
-        tensors["output"].zero_()
-        tensors["output"][:DSPARK_QUERY_WIDTH].copy_(output)
+        projection = torch.zeros((MOE_TOKENS, D), dtype=torch.bfloat16)
+        projection[:DSPARK_QUERY_WIDTH].copy_(output)
+        tensors["output"].copy_(golden_hc_post(projection, tensors["residual"], tensors["post_mix"], tensors["residual_mix"]))
         tensors["window_cache"].copy_(pack_quantized_cache(cache, cache_scale))
 
     def compare_payload(actual, expected, **_kwargs):
@@ -265,10 +269,9 @@ if __name__ == "__main__":
     values["window_cache"] = pack_quantized_cache(values["window_cache"], values.pop("window_cache_scale"))
     specs = [TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=values[name])
              for name in SWA_INPUT_NAMES if name != "window_cache_scale"]
-    specs += [
-        TensorSpec("output", [MOE_TOKENS, D], torch.bfloat16),
-        ScalarSpec("num_tokens", torch.int32, DSPARK_QUERY_WIDTH, compile_runtime=True),
-    ]
+    hc_specs = build_o_proj_hc_post_specs(MOE_TOKENS, pad_to_tile=False)
+    specs += [spec for spec in hc_specs if spec.name in ("residual", "post_mix", "residual_mix", "output")]
+    specs.append(ScalarSpec("num_tokens", torch.int32, DSPARK_QUERY_WIDTH, compile_runtime=True))
     result = run(
         fn=dspark_attention_test,
         specs=specs,
@@ -279,7 +282,9 @@ if __name__ == "__main__":
                 ratio_allclose(max_error_ratio=0.0),
                 fp4=False,
             ),
-            "output": ratio_allclose(atol=0.03, rtol=0.03, max_error_ratio=0.001),
+            "output": functools.partial(
+                compare_o_proj_hc_post, compare=ratio_allclose(atol=0.03, rtol=0.03, max_error_ratio=0.001),
+            ),
         },
         config={"backend_type": args.backend_type, "device_id": args.device,
                 "execution_mode": args.execution_mode},

@@ -71,7 +71,7 @@ def prepare_forward_rope_tables(
     return freqs_cos, freqs_sin
 
 
-ROPE_ROWS_DYN = pl.dynamic("V41_ROPE_ROWS_DYN")
+ROPE_ROWS_DYN = pl.dynamic("ROPE_ROWS_DYN")
 
 
 @pl.jit.inline

@@ -32,9 +32,12 @@ NORM_EPS = M.rms_norm_eps
 
 # tiling
 MIX_PAD = 32
+HC_PAD = 8
 T_TILE = 8
 LINEAR_T_TILE = 16
-HF32_LINEAR_T_TILE = 80  # Matches M_TILE in kernels/hc_linear.cpp.
+HF32_LINEAR_T_TILE = 80
+HF32_LINEAR_K_L1_TILE = 512
+HF32_LINEAR_K_L0_TILE = 64
 SINKHORN_T_TILE = 6
 SINKHORN_WIDE_T_TILE = 16
 SINKHORN_WORKER_TILE = 12
@@ -50,49 +53,260 @@ POST_WORKER_TILE = 64
 _KERNELS = Path(__file__).parent / "kernels"
 
 
-@pl.jit.extern(core_type="aic", source=_KERNELS / "hc_linear.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _hc_linear(
-    x: pl.Tensor,
-    weight: pl.Tensor,
-    partials: pl.Out[pl.Tensor],
-    rows: pl.Scalar[pl.INDEX],
-    padded_rows: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Project FP32 HC operands with nearest-away HF32 and FP32 accumulation."""
-    ...
-
-
-@pl.jit.extern(core_type="aiv", source=_KERNELS / "hc_sinkhorn.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _hc_sinkhorn(
-    partials: pl.Tensor, inv_rms: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
-    pre_mix: pl.Out[pl.Tensor], post_mix: pl.Out[pl.Tensor], residual_mix: pl.Out[pl.Tensor],
-    tokens: pl.Scalar[pl.INDEX], padded_rows: pl.Scalar[pl.INDEX],
-    eps: pl.Scalar[pl.FP32], iterations: pl.Scalar[pl.INDEX],
-    row_tile: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Compute FP32 coefficients in a register-resident VF."""
-    ...
-
-
 @pl.jit.inline
 def hc_sinkhorn(
     inv_rms: pl.Tensor, partials: pl.Tensor, scale: pl.Tensor, base: pl.Tensor,
     pre_mix: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
 ):
-    """Normalize HC matrices in batches of up to sixteen rows."""
+    """Normalize six HC matrices per worker, keeping all four rows in registers."""
     tokens = pl.tensor.dim(pre_mix, 0)
     padded_rows = pl.tensor.dim(inv_rms, 0)
-    row_tile = pl.cast(SINKHORN_T_TILE, pl.INDEX)
-    if tokens > SINKHORN_T_TILE * SINKHORN_WORKER_TILE:
-        row_tile = pl.cast(SINKHORN_WIDE_T_TILE, pl.INDEX)
-    blocks = (tokens + row_tile - 1) // row_tile
+    inverse_flat = pl.reshape(inv_rms, [1, padded_rows])
+    scale_flat = pl.reshape(scale, [1, 3])
+    bias_flat = pl.reshape(base, [1, MIX_HC])
+    comb_flat = pl.reshape(residual_mix, [tokens, HC_MULT * HC_MULT])
+    blocks = (tokens + SINKHORN_T_TILE - 1) // SINKHORN_T_TILE
     workers = pl.min(blocks, SINKHORN_WORKER_TILE)
-    with pl.spmd(workers, name_hint="hc_sinkhorn") as ready:
-        _hc_sinkhorn(partials, inv_rms, scale, base, pre_mix, post_mix, residual_mix,
-                     tokens, padded_rows, HC_EPS, HC_SINKHORN_ITER, row_tile)
+    with pl.spmd(workers, name_hint="mhc_sinkhorn") as ready:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, workers):
+            start = block * SINKHORN_T_TILE
+            rows = pl.min(SINKHORN_T_TILE, tokens - start)
+            p0 = pl.load(partials, [start, 0], [6, 32], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
+            p1 = pl.load(partials, [padded_rows + start, 0], [6, 32], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
+            p2 = pl.load(partials, [2 * padded_rows + start, 0], [6, 32], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
+            p3 = pl.load(partials, [3 * padded_rows + start, 0], [6, 32], valid_shape=[rows, 32], target_memory=pl.MemorySpace.Vec)
+            inverse = pl.load(inverse_flat, [0, start], [1, 32], valid_shape=[1, rows], target_memory=pl.MemorySpace.Vec)
+            bias = pl.load(bias_flat, [0, 0], [1, 32], valid_shape=[1, MIX_HC], target_memory=pl.MemorySpace.Vec)
+            scales = pl.load(scale_flat, [0, 0], [1, 8], valid_shape=[1, 3], target_memory=pl.MemorySpace.Vec)
+            s0_scalar = pl.tile.read(scales, [0, 0])
+            s1_scalar = pl.tile.read(scales, [0, 1])
+            s2_scalar = pl.tile.read(scales, [0, 2])
+            # Scatter overwrites every valid output element before it is stored.
+            # Allocate UB without initializing padding, matching the C++ kernel.
+            pre = pl.create_tile([48], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            post = pl.create_tile([48], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            comb = pl.create_tile([96], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            with pl.reg_scope():
+                full = pl.reg.full_mask(lanes=64)
+                lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+                mask = pl.reg.active_mask(rows * HC_MULT, lanes=64)
+                token = pl.reg.shift_rights(lane, 2, full)
+                low_bits = pl.reg.broadcast(3, lanes=64, dtype=pl.UINT32)
+                column = pl.reg.bitwise_and(lane, low_bits, full)
+                index = pl.reg.shift_lefts(token, 5, full)
+                index = pl.reg.add(index, column, full)
+                index4 = pl.reg.adds(index, 4, full)
+                index8 = pl.reg.adds(index, 8, full)
+                index12 = pl.reg.adds(index, 12, full)
+                index16 = pl.reg.adds(index, 16, full)
+                index20 = pl.reg.adds(index, 20, full)
+                bias_index4 = pl.reg.adds(column, 4, full)
+                bias_index8 = pl.reg.adds(column, 8, full)
+                bias_index12 = pl.reg.adds(column, 12, full)
+                bias_index16 = pl.reg.adds(column, 16, full)
+                bias_index20 = pl.reg.adds(column, 20, full)
+                pre_index = pl.reg.shift_lefts(token, 3, full)
+                pre_index = pl.reg.add(pre_index, column, full)
+                comb_index = pl.reg.shift_lefts(token, 4, full)
+                comb_index = pl.reg.add(comb_index, column, full)
+                comb_index4 = pl.reg.adds(comb_index, 4, full)
+                comb_index8 = pl.reg.adds(comb_index, 8, full)
+                comb_index12 = pl.reg.adds(comb_index, 12, full)
+                xor1 = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
+                xor2 = pl.reg.broadcast(2, lanes=64, dtype=pl.UINT32)
+                perm1 = pl.reg.bitwise_xor(lane, xor1, full)
+                perm2 = pl.reg.bitwise_xor(lane, xor2, full)
+                rms = pl.reg.gather(inverse, token, mask)
+                s0 = pl.reg.broadcast(s0_scalar, lanes=64, dtype=pl.FP32)
+                s1 = pl.reg.broadcast(s1_scalar, lanes=64, dtype=pl.FP32)
+                s2 = pl.reg.broadcast(s2_scalar, lanes=64, dtype=pl.FP32)
+                one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+                pre_value = pl.reg.gather(p0, index, mask)
+                part = pl.reg.gather(p1, index, mask)
+                pre_value = pl.reg.add(pre_value, part, mask)
+                part = pl.reg.gather(p2, index, mask)
+                pre_value = pl.reg.add(pre_value, part, mask)
+                part = pl.reg.gather(p3, index, mask)
+                pre_value = pl.reg.add(pre_value, part, mask)
+                pre_value = pl.reg.mul(pre_value, rms, mask)
+                pre_value = pl.reg.mul(pre_value, s0, mask)
+                bias_value = pl.reg.gather(bias, column, mask)
+                pre_value = pl.reg.add(pre_value, bias_value, mask)
+                post_value = pl.reg.gather(p0, index4, mask)
+                part = pl.reg.gather(p1, index4, mask)
+                post_value = pl.reg.add(post_value, part, mask)
+                part = pl.reg.gather(p2, index4, mask)
+                post_value = pl.reg.add(post_value, part, mask)
+                part = pl.reg.gather(p3, index4, mask)
+                post_value = pl.reg.add(post_value, part, mask)
+                post_value = pl.reg.mul(post_value, rms, mask)
+                post_value = pl.reg.mul(post_value, s1, mask)
+                bias_value = pl.reg.gather(bias, bias_index4, mask)
+                post_value = pl.reg.add(post_value, bias_value, mask)
+                m0 = pl.reg.gather(p0, index8, mask)
+                part = pl.reg.gather(p1, index8, mask)
+                m0 = pl.reg.add(m0, part, mask)
+                part = pl.reg.gather(p2, index8, mask)
+                m0 = pl.reg.add(m0, part, mask)
+                part = pl.reg.gather(p3, index8, mask)
+                m0 = pl.reg.add(m0, part, mask)
+                m0 = pl.reg.mul(m0, rms, mask)
+                m0 = pl.reg.mul(m0, s2, mask)
+                bias_value = pl.reg.gather(bias, bias_index8, mask)
+                m0 = pl.reg.add(m0, bias_value, mask)
+                m1 = pl.reg.gather(p0, index12, mask)
+                part = pl.reg.gather(p1, index12, mask)
+                m1 = pl.reg.add(m1, part, mask)
+                part = pl.reg.gather(p2, index12, mask)
+                m1 = pl.reg.add(m1, part, mask)
+                part = pl.reg.gather(p3, index12, mask)
+                m1 = pl.reg.add(m1, part, mask)
+                m1 = pl.reg.mul(m1, rms, mask)
+                m1 = pl.reg.mul(m1, s2, mask)
+                bias_value = pl.reg.gather(bias, bias_index12, mask)
+                m1 = pl.reg.add(m1, bias_value, mask)
+                m2 = pl.reg.gather(p0, index16, mask)
+                part = pl.reg.gather(p1, index16, mask)
+                m2 = pl.reg.add(m2, part, mask)
+                part = pl.reg.gather(p2, index16, mask)
+                m2 = pl.reg.add(m2, part, mask)
+                part = pl.reg.gather(p3, index16, mask)
+                m2 = pl.reg.add(m2, part, mask)
+                m2 = pl.reg.mul(m2, rms, mask)
+                m2 = pl.reg.mul(m2, s2, mask)
+                bias_value = pl.reg.gather(bias, bias_index16, mask)
+                m2 = pl.reg.add(m2, bias_value, mask)
+                m3 = pl.reg.gather(p0, index20, mask)
+                part = pl.reg.gather(p1, index20, mask)
+                m3 = pl.reg.add(m3, part, mask)
+                part = pl.reg.gather(p2, index20, mask)
+                m3 = pl.reg.add(m3, part, mask)
+                part = pl.reg.gather(p3, index20, mask)
+                m3 = pl.reg.add(m3, part, mask)
+                m3 = pl.reg.mul(m3, rms, mask)
+                m3 = pl.reg.mul(m3, s2, mask)
+                bias_value = pl.reg.gather(bias, bias_index20, mask)
+                m3 = pl.reg.add(m3, bias_value, mask)
+                pre_value = pl.reg.muls(pre_value, -1.0, mask)
+                pre_value = pl.reg.exp(pre_value, mask)
+                pre_value = pl.reg.adds(pre_value, 1.0, mask)
+                pre_value = pl.reg.div(one, pre_value, mask)
+                pre_value = pl.reg.adds(pre_value, HC_EPS, mask)
+                pre = pl.reg.scatter(pre, pre_index, pre_value, mask)
+                post_value = pl.reg.muls(post_value, -1.0, mask)
+                post_value = pl.reg.exp(post_value, mask)
+                post_value = pl.reg.adds(post_value, 1.0, mask)
+                post_value = pl.reg.div(one, post_value, mask)
+                post_value = pl.reg.muls(post_value, 2.0, mask)
+                post = pl.reg.scatter(post, pre_index, post_value, mask)
+                # XOR1 pairs adjacent columns, XOR2 combines the two pairs.
+                # This keeps the original (c0+c1)+(c2+c3) reduction order.
+                adjacent = pl.reg.gather_lanes(m0, perm1)
+                red = pl.reg.maximum(m0, adjacent, full)
+                adjacent = pl.reg.gather_lanes(red, perm2)
+                red = pl.reg.maximum(red, adjacent, full)
+                m0 = pl.reg.sub(m0, red, mask)
+                m0 = pl.reg.exp(m0, mask)
+                adjacent = pl.reg.gather_lanes(m0, perm1)
+                red = pl.reg.add(m0, adjacent, full)
+                adjacent = pl.reg.gather_lanes(red, perm2)
+                red = pl.reg.add(red, adjacent, full)
+                m0 = pl.reg.div(m0, red, mask)
+                m0 = pl.reg.adds(m0, HC_EPS, mask)
+                adjacent = pl.reg.gather_lanes(m1, perm1)
+                red = pl.reg.maximum(m1, adjacent, full)
+                adjacent = pl.reg.gather_lanes(red, perm2)
+                red = pl.reg.maximum(red, adjacent, full)
+                m1 = pl.reg.sub(m1, red, mask)
+                m1 = pl.reg.exp(m1, mask)
+                adjacent = pl.reg.gather_lanes(m1, perm1)
+                red = pl.reg.add(m1, adjacent, full)
+                adjacent = pl.reg.gather_lanes(red, perm2)
+                red = pl.reg.add(red, adjacent, full)
+                m1 = pl.reg.div(m1, red, mask)
+                m1 = pl.reg.adds(m1, HC_EPS, mask)
+                adjacent = pl.reg.gather_lanes(m2, perm1)
+                red = pl.reg.maximum(m2, adjacent, full)
+                adjacent = pl.reg.gather_lanes(red, perm2)
+                red = pl.reg.maximum(red, adjacent, full)
+                m2 = pl.reg.sub(m2, red, mask)
+                m2 = pl.reg.exp(m2, mask)
+                adjacent = pl.reg.gather_lanes(m2, perm1)
+                red = pl.reg.add(m2, adjacent, full)
+                adjacent = pl.reg.gather_lanes(red, perm2)
+                red = pl.reg.add(red, adjacent, full)
+                m2 = pl.reg.div(m2, red, mask)
+                m2 = pl.reg.adds(m2, HC_EPS, mask)
+                adjacent = pl.reg.gather_lanes(m3, perm1)
+                red = pl.reg.maximum(m3, adjacent, full)
+                adjacent = pl.reg.gather_lanes(red, perm2)
+                red = pl.reg.maximum(red, adjacent, full)
+                m3 = pl.reg.sub(m3, red, mask)
+                m3 = pl.reg.exp(m3, mask)
+                adjacent = pl.reg.gather_lanes(m3, perm1)
+                red = pl.reg.add(m3, adjacent, full)
+                adjacent = pl.reg.gather_lanes(red, perm2)
+                red = pl.reg.add(red, adjacent, full)
+                m3 = pl.reg.div(m3, red, mask)
+                m3 = pl.reg.adds(m3, HC_EPS, mask)
+                total = pl.reg.add(m0, m1, mask)
+                total = pl.reg.add(total, m2, mask)
+                total = pl.reg.add(total, m3, mask)
+                total = pl.reg.adds(total, HC_EPS, mask)
+                m0 = pl.reg.div(m0, total, mask)
+                m1 = pl.reg.div(m1, total, mask)
+                m2 = pl.reg.div(m2, total, mask)
+                m3 = pl.reg.div(m3, total, mask)
+                for iteration, (m0, m1, m2, m3) in pl.hardware_loop(HC_SINKHORN_ITER - 1, init_values=(m0, m1, m2, m3)):
+                    adjacent = pl.reg.gather_lanes(m0, perm1)
+                    red = pl.reg.add(m0, adjacent, full)
+                    adjacent = pl.reg.gather_lanes(red, perm2)
+                    red = pl.reg.add(red, adjacent, full)
+                    red = pl.reg.adds(red, HC_EPS, mask)
+                    m0 = pl.reg.div(m0, red, mask)
+                    adjacent = pl.reg.gather_lanes(m1, perm1)
+                    red = pl.reg.add(m1, adjacent, full)
+                    adjacent = pl.reg.gather_lanes(red, perm2)
+                    red = pl.reg.add(red, adjacent, full)
+                    red = pl.reg.adds(red, HC_EPS, mask)
+                    m1 = pl.reg.div(m1, red, mask)
+                    adjacent = pl.reg.gather_lanes(m2, perm1)
+                    red = pl.reg.add(m2, adjacent, full)
+                    adjacent = pl.reg.gather_lanes(red, perm2)
+                    red = pl.reg.add(red, adjacent, full)
+                    red = pl.reg.adds(red, HC_EPS, mask)
+                    m2 = pl.reg.div(m2, red, mask)
+                    adjacent = pl.reg.gather_lanes(m3, perm1)
+                    red = pl.reg.add(m3, adjacent, full)
+                    adjacent = pl.reg.gather_lanes(red, perm2)
+                    red = pl.reg.add(red, adjacent, full)
+                    red = pl.reg.adds(red, HC_EPS, mask)
+                    m3 = pl.reg.div(m3, red, mask)
+                    total = pl.reg.add(m0, m1, mask)
+                    total = pl.reg.add(total, m2, mask)
+                    total = pl.reg.add(total, m3, mask)
+                    total = pl.reg.adds(total, HC_EPS, mask)
+                    m0 = pl.reg.div(m0, total, mask)
+                    m1 = pl.reg.div(m1, total, mask)
+                    m2 = pl.reg.div(m2, total, mask)
+                    m3 = pl.reg.div(m3, total, mask)
+                    m0, m1, m2, m3 = pl.yield_(m0, m1, m2, m3)
+                comb = pl.reg.scatter(comb, comb_index, m0, mask)
+                comb = pl.reg.scatter(comb, comb_index4, m1, mask)
+                comb = pl.reg.scatter(comb, comb_index8, m2, mask)
+                comb = pl.reg.scatter(comb, comb_index12, m3, mask)
+            pre = pl.reshape(pre, [6, 8])
+            post = pl.reshape(post, [6, 8])
+            comb = pl.reshape(comb, [6, 16])
+            pre = pl.set_validshape(pre, rows, HC_MULT)
+            post = pl.set_validshape(post, rows, HC_MULT)
+            comb = pl.set_validshape(comb, rows, HC_MULT * HC_MULT)
+            pl.store(pre, [start, 0], pre_mix)
+            pl.store(post, [start, 0], post_mix)
+            pl.store(comb, [start, 0], comb_flat)
     return ready
+
 
 
 @pl.jit.inline
@@ -127,8 +341,37 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
     mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
     tasks = ((t_dim + HF32_LINEAR_T_TILE - 1) // HF32_LINEAR_T_TILE) * LINEAR_OK
     workers = pl.min(tasks, pl.system.available_cluster_count())
-    with pl.spmd(workers, name_hint="hc_linear"):
-        _hc_linear(x_flat, function, mixes_partials, t_dim, t_linear)
+    for worker in pl.spmd(workers, name_hint="hc_linear"):
+        for task in pl.range(worker, tasks, pl.tile.get_block_num()):
+            t0 = (task // LINEAR_OK) * HF32_LINEAR_T_TILE
+            split = task % LINEAR_OK
+            k_base = split * (HC_DIM // LINEAR_OK)
+            valid_rows = pl.min(HF32_LINEAR_T_TILE, t_dim - t0)
+            acc = pl.tile.create([HF32_LINEAR_T_TILE, MIX_PAD], pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+            acc = pl.set_validshape(acc, valid_rows, MIX_HC)
+            for kb in pl.pipeline((HC_DIM // LINEAR_OK) // HF32_LINEAR_K_L1_TILE, stage=2):
+                k0 = k_base + kb * HF32_LINEAR_K_L1_TILE
+                a_l1 = pl.load(
+                    x_flat, [t0, k0], [HF32_LINEAR_T_TILE, HF32_LINEAR_K_L1_TILE],
+                    valid_shape=[valid_rows, HF32_LINEAR_K_L1_TILE], target_memory=pl.Mem.Mat,
+                )
+                b_l1 = pl.load(
+                    function, [0, k0], [MIX_PAD, HF32_LINEAR_K_L1_TILE],
+                    valid_shape=[MIX_HC, HF32_LINEAR_K_L1_TILE], target_memory=pl.Mem.Mat,
+                )
+                b_l1_t = pl.tile.transpose_view(b_l1)
+                for inner in pl.pipeline(HF32_LINEAR_K_L1_TILE // HF32_LINEAR_K_L0_TILE, stage=2):
+                    k_l0 = inner * HF32_LINEAR_K_L0_TILE
+                    left = pl.tile.extract(
+                        a_l1, 0, k_l0, [HF32_LINEAR_T_TILE, HF32_LINEAR_K_L0_TILE], target_memory=pl.Mem.Left,
+                    )
+                    right = pl.tile.extract(
+                        b_l1_t, k_l0, 0, [HF32_LINEAR_K_L0_TILE, MIX_PAD], target_memory=pl.Mem.Right,
+                    )
+                    first = kb * (HF32_LINEAR_K_L1_TILE // HF32_LINEAR_K_L0_TILE) + inner == 0
+                    acc = pl.tile.matmul_acc(acc, left, right, init_cond=first, tf32_mode="round_away")
+            partial = split * t_linear + t0
+            pl.store(acc, [partial, 0], mixes_partials)
 
     return inv_rms, mixes_partials
 
@@ -213,16 +456,10 @@ def hc_head_norm_store(
 
 @pl.jit.inline
 def zero_bf16_padding(x: pl.Tensor, valid_rows: pl.Scalar[pl.INT32]):
-    """Clear physical rows that belong to an empty or partial TP slab.
-
-    A TP rank with no logical token still publishes one fixed-capacity slab so
-    every rank executes the same distributed window protocol.  Clearing the
-    unused rows makes that padding deterministic and prevents an empty owner
-    from publishing uninitialized data.
-    """
+    """Zero padding rows beyond the local active token count."""
     tokens = pl.tensor.dim(x, 0)
     if tokens > 0 and valid_rows < tokens:
-        for row in pl.spmd(tokens, name_hint="decode_sp_zero_padding"):
+        for row in pl.spmd(tokens, name_hint="zero_bf16_padding"):
             if row >= valid_rows:
                 x[row : row + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
 
@@ -237,6 +474,88 @@ def _hc_post(
     ...
 
 
+@pl.jit.inline(auto_scope=False)
+def hc_post_regscope_block(
+    sublayer: pl.Tensor,
+    residual_rows: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix_flat: pl.Tensor,
+    output_rows: pl.Tensor,
+    block: pl.Scalar[pl.INDEX],
+    stream_tile: pl.constexpr,
+):
+    """Mix a hidden-width tile using register accumulators."""
+    pair_block = block // (D // D_TILE)
+    t = pair_block // (HC_MULT // stream_tile)
+    out_base = (pair_block % (HC_MULT // stream_tile)) * stream_tile
+    d0 = (block % (D // D_TILE)) * D_TILE
+    row = t * HC_MULT
+    x_tile = pl.tile.load(sublayer, [t, d0], [1, D_TILE], target_memory=pl.Mem.Vec)
+    x_tile = pl.tile.reshape(x_tile, [D_TILE])
+    post = pl.tile.load(post_mix, [t, 0], [1, 8], valid_shape=[1, HC_MULT], target_memory=pl.Mem.Vec)
+    post = pl.tile.reshape(post, [8])
+    mix = pl.tile.load(residual_mix_flat, [t, 0], [1, HC_MULT * HC_MULT], target_memory=pl.Mem.Vec)
+    mix = pl.tile.reshape(mix, [HC_MULT * HC_MULT])
+    residual = pl.tile.load(residual_rows, [row, d0], [HC_MULT, D_TILE], target_memory=pl.Mem.Vec)
+    residual = pl.tile.reshape(residual, [HC_MULT * D_TILE])
+    output = pl.tile.create([stream_tile * D_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    with pl.reg_scope():
+        mask = pl.reg.full_mask(lanes=64)
+        for segment in pl.hardware_loop(D_TILE // 64):
+            offset = segment * 64
+            x = pl.reg.convert(pl.reg.load(x_tile, offset, lanes=64), dtype=pl.FP32)
+            r0 = pl.reg.load(residual, offset, lanes=64)
+            r1 = pl.reg.load(residual, D_TILE + offset, lanes=64)
+            r2 = pl.reg.load(residual, 2 * D_TILE + offset, lanes=64)
+            r3 = pl.reg.load(residual, 3 * D_TILE + offset, lanes=64)
+            for stream in pl.unroll(stream_tile):
+                h = out_base + stream
+                c0 = pl.reg.broadcast(pl.reg.load(post, h, lanes=1), lanes=64, dtype=pl.FP32)
+                c1 = pl.reg.broadcast(pl.reg.load(mix, h, lanes=1), lanes=64, dtype=pl.FP32)
+                c2 = pl.reg.broadcast(pl.reg.load(mix, HC_MULT + h, lanes=1), lanes=64, dtype=pl.FP32)
+                c3 = pl.reg.broadcast(pl.reg.load(mix, 2 * HC_MULT + h, lanes=1), lanes=64, dtype=pl.FP32)
+                c4 = pl.reg.broadcast(pl.reg.load(mix, 3 * HC_MULT + h, lanes=1), lanes=64, dtype=pl.FP32)
+                value = pl.reg.mul(x, c0, mask)
+                value = pl.reg.add(value, pl.reg.mul(r0, c1, mask), mask)
+                value = pl.reg.add(value, pl.reg.mul(r1, c2, mask), mask)
+                value = pl.reg.add(value, pl.reg.mul(r2, c3, mask), mask)
+                value = pl.reg.add(value, pl.reg.mul(r3, c4, mask), mask)
+                written = pl.reg.store(output, stream * D_TILE + offset, value)
+    output = pl.tile.reshape(output, [stream_tile, D_TILE])
+    pl.tile.store(output, [row + out_base, d0], output_rows)
+    return output_rows
+
+
+@pl.jit.inline
+def hc_post_regscope(
+    sublayer: pl.Tensor,
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
+    deps: pl.Array[2, pl.TASK_ID],
+):
+    """Mix HC streams with an opt-in A5 RegScope implementation."""
+    t_dim = pl.tensor.dim(sublayer, 0)
+    residual_rows = pl.reshape(residual, [t_dim * HC_MULT, D])
+    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
+    output_rows = pl.reshape(output, [t_dim * HC_MULT, D])
+    total_work = t_dim * (D // D_TILE)
+    full_work = total_work // POST_WORKER_TILE * POST_WORKER_TILE
+    tail_work = (total_work - full_work) * HC_MULT
+    workers = pl.min(total_work * HC_MULT, POST_WORKER_TILE)
+    with pl.spmd(workers, name_hint="hc_post", deps=[deps]):
+        worker = pl.tile.get_block_idx()
+        for block in pl.pipeline(worker, full_work, POST_WORKER_TILE, stage=1):
+            hc_post_regscope_block(sublayer, residual_rows, post_mix, residual_mix_flat, output_rows, block, HC_MULT)
+        for tail in pl.range(worker, tail_work, POST_WORKER_TILE):
+            tail_chunk = full_work + tail // HC_MULT
+            tail_stream = (tail_chunk // (D // D_TILE)) * HC_MULT + tail % HC_MULT
+            tail_block = tail_stream * (D // D_TILE) + tail_chunk % (D // D_TILE)
+            hc_post_regscope_block(sublayer, residual_rows, post_mix, residual_mix_flat, output_rows, tail_block, 1)
+    return output
+
+
 @pl.jit.inline
 def hc_post(
     sublayer: pl.Tensor,
@@ -248,10 +567,17 @@ def hc_post(
 ):
     """Mix all four residual streams after the supplied producer dependencies."""
     tokens = pl.tensor.dim(sublayer, 0)
+    sublayer_view = pl.reshape(sublayer, [tokens, D])
+    residual_view = pl.reshape(residual, [tokens, HC_MULT, D])
+    post_view = pl.reshape(post_mix, [tokens, HC_MULT])
+    mix_view = pl.reshape(residual_mix, [tokens, HC_MULT, HC_MULT])
+    output_view = pl.reshape(output, [tokens, HC_MULT, D])
     workers = pl.min(tokens * (D // D_TILE) * HC_MULT, POST_WORKER_TILE)
     with pl.spmd(workers, name_hint="hc_post", deps=[deps]):
-        _hc_post(sublayer, residual, post_mix, residual_mix, output, tokens)
+        _hc_post(sublayer_view, residual_view, post_view, mix_view, output_view, tokens)
     return output
+
+
 
 
 def _round_hf32(value: torch.Tensor) -> torch.Tensor:
@@ -296,6 +622,18 @@ def golden_hc_collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     return (first_pair + second_pair).to(x.dtype)
 
 
+def golden_hc_head_norm(x: torch.Tensor, pre_mix: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Collapse to BF16 and normalize with 64-lane FP32 accumulation and pairwise reduction."""
+    collapsed = golden_hc_collapse(x, pre_mix).bfloat16().float()
+    partial = torch.zeros((*collapsed.shape[:-1], 64), dtype=torch.float32, device=collapsed.device)
+    for begin in range(0, D, 64):
+        partial.add_(collapsed[..., begin:begin + 64].square())
+    while partial.shape[-1] > 1:
+        partial = partial[..., ::2] + partial[..., 1::2]
+    inverse = 1.0 / torch.sqrt(partial * (1.0 / D) + NORM_EPS)
+    return (collapsed * inverse * weight.float()).bfloat16()
+
+
 def golden_hc_post(
     sublayer: torch.Tensor,
     residual: torch.Tensor,
@@ -336,17 +674,35 @@ HC_INPUT_NAMES = ("x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_bas
 
 
 def make_hc_inputs(tokens, seed, case):
-    """HC inputs with distinct per-token magnitudes so both RMS statistics stay observable."""
+    """Seeded HC fixtures with V4.1 layer-1 attention weight statistics."""
     gen = torch.Generator().manual_seed(seed)
     magnitudes = (0.5 + torch.arange(tokens) % 4).reshape(-1, 1, 1)
     x_hc = (torch.randn(tokens, HC_MULT, D, generator=gen) * magnitudes).bfloat16().float()
+
+    # Per-row standard deviations and gate parameters from the V4.1 Flash 1017 checkpoint.
+    function_std = torch.tensor([
+        0.029376, 0.031490, 0.055490, 0.049310, 0.023323, 0.181760, 0.112393, 0.096347,
+        0.033303, 0.034775, 0.035849, 0.039710, 0.033325, 0.030450, 0.034318, 0.033540,
+        0.033511, 0.050113, 0.030742, 0.028955, 0.027775, 0.029948, 0.031218, 0.038125,
+    ])
+    scale = torch.tensor([0.070230, 0.019080, 0.172269])
+    base = torch.tensor([
+        -2.338990, 2.601740, -2.912670, -3.033931, -0.503342, -0.577662, -3.500769, -2.494710,
+        2.750622, -2.458451, -3.305034, -3.223911, -2.937424, 2.832767, -0.933163, -2.659624,
+        -2.655424, -1.275563, 2.152474, -3.270429, -2.550060, -2.554717, -2.587215, 2.604832,
+    ])
+
+    # Incoming gates use the preceding layer's FFN pre-gate weight statistics.
+    incoming_std = torch.tensor([0.041462, 0.027009, 0.054705, 0.025310]) * math.sqrt(HC_DIM) * 0.031293
+    incoming_base = torch.tensor([2.531060, -2.808948, -3.796850, -2.947976])
+    incoming_logits = torch.randn(tokens, HC_MULT, generator=gen) * incoming_std + incoming_base
     values = {
         "x_hc": x_hc,
-        "pre_mix": torch.sigmoid(torch.randn(tokens, HC_MULT, generator=gen)) + M.hc_eps,
-        "hc_attn_fn": torch.randn(MIX_HC, HC_DIM, generator=gen) / math.sqrt(HC_DIM),
-        "hc_attn_scale": torch.randn(3, generator=gen),
-        "hc_attn_base": torch.randn(MIX_HC, generator=gen),
-        "attn_norm_weight": (torch.randn(D, generator=gen) * 0.1 + 1).bfloat16(),
+        "pre_mix": torch.sigmoid(incoming_logits) + HC_EPS,
+        "hc_attn_fn": torch.randn(MIX_HC, HC_DIM, generator=gen) * function_std[:, None],
+        "hc_attn_scale": scale,
+        "hc_attn_base": base,
+        "attn_norm_weight": (torch.randn(D, generator=gen) * 0.001745 + 0.021617).bfloat16(),
     }
     if case == "zero":
         values["x_hc"] = torch.zeros_like(x_hc)
@@ -383,30 +739,13 @@ def build_l2_hc_pre_specs(batch: int = 33, sequence: int = 1):
     from golden import TensorSpec
 
     tokens = batch * sequence
-    generator = torch.Generator().manual_seed(3)
-    incoming_generator = torch.Generator().manual_seed(5)
-
-    def init_x_hc():
-        return torch.randn(tokens, HC_MULT, D, generator=generator)
-
-    def init_incoming_pre_mix():
-        return torch.sigmoid(torch.randn(tokens, HC_MULT, generator=incoming_generator)) + HC_EPS
-
-    def init_function():
-        return torch.randn(MIX_HC, HC_DIM, generator=generator) / math.sqrt(HC_DIM)
-
-    def init_scale():
-        return torch.randn(3, generator=generator)
-
-    def init_base():
-        return torch.randn(MIX_HC, generator=generator)
-
+    inputs = make_hc_inputs(tokens, seed=3, case="normal")
     return [
-        TensorSpec("x_hc", [tokens, HC_MULT, D], torch.float32, init_value=init_x_hc),
-        TensorSpec("incoming_pre_mix", [tokens, HC_MULT], torch.float32, init_value=init_incoming_pre_mix),
-        TensorSpec("function", [MIX_HC, HC_DIM], torch.float32, init_value=init_function),
-        TensorSpec("scale", [3], torch.float32, init_value=init_scale),
-        TensorSpec("base", [MIX_HC], torch.float32, init_value=init_base),
+        TensorSpec("x_hc", [tokens, HC_MULT, D], torch.float32, init_value=inputs["x_hc"]),
+        TensorSpec("incoming_pre_mix", [tokens, HC_MULT], torch.float32, init_value=inputs["pre_mix"]),
+        TensorSpec("function", [MIX_HC, HC_DIM], torch.float32, init_value=inputs["hc_attn_fn"]),
+        TensorSpec("scale", [3], torch.float32, init_value=inputs["hc_attn_scale"]),
+        TensorSpec("base", [MIX_HC], torch.float32, init_value=inputs["hc_attn_base"]),
         TensorSpec("output", [tokens, D], torch.bfloat16),
         TensorSpec("pre_mix", [tokens, HC_MULT], torch.float32),
         TensorSpec("post_mix", [tokens, HC_MULT], torch.float32),
@@ -430,6 +769,25 @@ def l2_hc_post(
     output.bind_dynamic(0, T_DYN)
     hc_post_deps = pl.array.create(2, pl.TASK_ID)
     hc_post(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps)
+    return output
+
+
+@pl.jit
+def l2_hc_post_regscope(
+    sublayer: pl.Tensor[[T_DYN, D], pl.BF16],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
+    output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+):
+    """Validate the opt-in A5 RegScope HC post implementation."""
+    sublayer.bind_dynamic(0, T_DYN)
+    residual.bind_dynamic(0, T_DYN)
+    post_mix.bind_dynamic(0, T_DYN)
+    residual_mix.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, T_DYN)
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post_regscope(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps)
     return output
 
 
@@ -510,7 +868,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--batch", type=int, default=33)
     parser.add_argument("--sequence", type=int, default=1)
-    parser.add_argument("--op", choices=["pre", "post", "head", "all"], default="all")
+    parser.add_argument("--op", choices=["pre", "post", "post-regscope", "head", "all"], default="all")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--golden-data")
@@ -524,6 +882,8 @@ if __name__ == "__main__":
         ("post", l2_hc_post, build_l2_hc_post_specs, golden_l2_hc_post),
         ("head", l2_hc_head, build_l2_hc_head_specs, golden_l2_hc_head),
     ]
+    if args.op == "post-regscope":
+        cases = [("post-regscope", l2_hc_post_regscope, build_l2_hc_post_specs, golden_l2_hc_post)]
     failures = []
     for name, fn, build_specs, golden_fn in cases:
         if args.op != "all" and args.op != name:
@@ -536,7 +896,7 @@ if __name__ == "__main__":
                 "residual_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             }
             compare_fn["output"] = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
-        elif name == "post":
+        elif name in ("post", "post-regscope"):
             compare_fn = {"output": ratio_allclose(atol=1e-6, rtol=1e-5)}
         else:
             compare_fn = {"output": ratio_allclose(atol=1e-4, rtol=1.0 / 128)}

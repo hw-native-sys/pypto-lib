@@ -14,7 +14,7 @@ import torch
 
 
 import config as C
-from config import BLOCK_SIZE, FLASH as M, TP_SIZE
+from config import BLOCK_SIZE, FLASH as M
 from golden import ScalarSpec
 
 
@@ -26,7 +26,7 @@ def parse_decode_startpos(value):
         positions = [int(item) for item in value.split(",")]
     except ValueError as error:
         raise argparse.ArgumentTypeError("start-pos must be a comma-separated list of integers") from error
-    limit = min(C.MAX_BATCH_PER_DP, C.DECODE_MAX_TOKENS)
+    limit = min(C.DECODE_BATCH, C.DECODE_MAX_TOKENS)
     if not 1 <= len(positions) <= limit:
         raise argparse.ArgumentTypeError(f"start-pos must contain between 1 and {limit} positions")
     max_start = M.max_position_embeddings - 1
@@ -56,7 +56,7 @@ def configure_decode_workload(args, parser):
         return
     args.requests = len(args.startpos)
     if args.query_lens is None:
-        args.query_lens = [C.DECODE_ROWS_PER_REQUEST] * args.requests
+        args.query_lens = [C.DECODE_SEQ] * args.requests
     if len(args.query_lens) != args.requests:
         parser.error("--query-lens must contain one length per --start-pos value")
     args.tokens = sum(args.query_lens)
@@ -67,12 +67,66 @@ def configure_decode_workload(args, parser):
         parser.error("a query block exceeds max_position_embeddings")
 
 
+def parse_prefill_groups(value):
+    """Parse comma-separated request values, with semicolons separating DP groups."""
+    import argparse
+
+    try:
+        return [[int(item) for item in group.split(",")] for group in value.split(";")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("use comma-separated integers and semicolons between DP groups") from error
+
+
+def prefill_batch_layout(args):
+    """Resolve independent per-DP request lengths and absolute starting positions."""
+    lengths = getattr(args, "query_lens", None)
+    counts = getattr(args, "dp_tokens", None)
+    if lengths is None:
+        counts = counts if counts is not None else [args.tokens] * args.dp
+        requests = getattr(args, "requests", 1)
+        if requests < 1 or len(counts) != args.dp:
+            raise ValueError("requests must be positive and dp-tokens must contain one count per DP")
+        lengths = [[count // requests + (index < count % requests) for index in range(requests)] for count in counts]
+    elif len(lengths) == 1:
+        lengths = lengths * args.dp
+    if len(lengths) != args.dp or any(not group for group in lengths):
+        raise ValueError("query-lens must provide one nonempty request list per DP, or one list to broadcast")
+    if counts is not None and [sum(group) for group in lengths] != list(counts):
+        raise ValueError("dp-tokens must equal the sum of query-lens in each DP")
+    if any(n < 0 for group in lengths for n in group) or any(sum(group) > args.tokens for group in lengths):
+        raise ValueError("request lengths must be nonnegative and fit the per-DP token capacity")
+    if C.CP_SIZE > 1 and any(len(group) != 1 for group in lengths):
+        raise ValueError("CP > 1 requires one prefill request per DP group")
+    starts = getattr(args, "start_pos", None)
+    if starts is None:
+        starts = [[127 if getattr(args, "case", "normal") == "prefix" else 0] * len(group) for group in lengths]
+    elif len(starts) == 1:
+        starts = starts * args.dp
+    if len(starts) != args.dp or any(len(p) != len(q) for p, q in zip(starts, lengths)):
+        raise ValueError("start-pos must match each DP group's request list")
+    if any(p < 0 or p + n > M.max_position_embeddings for ps, ns in zip(starts, lengths) for p, n in zip(ps, ns)):
+        raise ValueError("each request must fit max_position_embeddings")
+    return lengths, starts
+
+
+def prefill_fixture_lengths(lengths, tokens):
+    """Append physical padding to the final request in a packed fixture."""
+    padded = list(lengths)
+    padded[-1] += tokens - sum(padded)
+    return padded
+
+
+def prefill_window_pages(lengths, starts):
+    """Count the paged SWA fixture's retained and current rows, including its spare page."""
+    return 1 + sum((p + n + 128) // 128 - max(0, p - 127) // 128 + 1 for p, n in zip(starts, lengths))
+
+
 def packed_query_lengths(tokens, requests, query_lens=None):
     """Use explicit request lengths or a balanced packed token split."""
     if query_lens is None:
         return [tokens // requests + (index < tokens % requests) for index in range(requests)]
-    if len(query_lens) != requests or sum(query_lens) != tokens or any(length <= 0 for length in query_lens):
-        raise ValueError("query_lens must contain one positive length per request and sum to tokens")
+    if len(query_lens) != requests or sum(query_lens) != tokens or any(length < 0 for length in query_lens):
+        raise ValueError("query_lens must contain one nonnegative length per request and sum to tokens")
     return list(query_lens)
 
 
@@ -174,13 +228,6 @@ def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload
     return arguments
 
 
-def token_shards(value, local_tokens):
-    """Pad scheduled rows and split them in contiguous TP rank order."""
-    padded = value.new_zeros(TP_SIZE * local_tokens, *value.shape[1:])
-    padded[:value.shape[0]].copy_(value)
-    return padded.reshape(TP_SIZE, local_tokens, *value.shape[1:])
-
-
 def _copy_cache_rows(destination: torch.Tensor, source: torch.Tensor, rows: torch.Tensor) -> None:
     destination_rows = destination.flatten(0, 1).view(torch.uint8)
     source_rows = source.contiguous().view(torch.uint8).reshape_as(destination_rows[rows])
@@ -220,7 +267,7 @@ def decode_cache_views(cache_state):
 
 
 def prepare_decode_inputs(values):
-    """Lower one request's current prefill metadata to the TP1 decode input contract."""
+    """Lower one request's current prefill metadata to the decode input contract."""
     embedding = values["embedding"].float()
     result = {
         "x_hc": embedding[:, None, :].expand(-1, M.hc_mult, -1).contiguous(),
@@ -247,3 +294,20 @@ def packed_cache_compare(payload_compare, scale_compare, *, fp4: bool):
         scale_ok, scale_detail = scale_compare(actual_scale, expected_scale, **kwargs)
         return payload_ok and scale_ok, "\n".join(filter(None, (payload_detail, scale_detail)))
     return compare
+
+
+def prefill_head_tail_rows(query_lengths, cp_size):
+    """Return original packed row IDs per PCP rank using request-local DualChunkSwap."""
+    if cp_size < 1 or any(length < 0 for length in query_lengths):
+        raise ValueError("CP size must be positive and scheduled lengths nonnegative")
+    rows = [[] for _ in range(cp_size)]
+    offset = 0
+    for length in query_lengths:
+        width = (length + 2 * cp_size - 1) // (2 * cp_size)
+        for rank in range(cp_size):
+            for chunk in (rank, 2 * cp_size - 1 - rank):
+                begin = min(chunk * width, length)
+                end = min(begin + width, length)
+                rows[rank].extend(range(offset + begin, offset + end))
+        offset += length
+    return [torch.tensor(rank_rows, dtype=torch.int32) for rank_rows in rows]

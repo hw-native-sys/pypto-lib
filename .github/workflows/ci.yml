@@ -11,6 +11,8 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# A5 jobs use the `pr` runner pool for pull requests, main pushes, and manual runs.
+# CPU and A3 jobs keep their existing shared runner selection.
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
@@ -211,7 +213,7 @@ jobs:
       fail-fast: false
       matrix:
         platform: ${{ fromJSON(needs.detect-changes.outputs.device_matrix) }}
-    runs-on: ${{ fromJSON(matrix.platform == 'a5' && '["self-hosted", "linux", "npu-a5"]' || '["self-hosted", "linux", "npu", "a3"]') }}
+    runs-on: ${{ fromJSON(matrix.platform == 'a5' && '["self-hosted", "linux", "npu-a5", "pr"]' || '["self-hosted", "linux", "npu", "a3"]') }}
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
     # --max-time 900 run), or the job dies before task-submit's own timeout can
     # ever fire — and the first queued case would eat the whole job budget.
