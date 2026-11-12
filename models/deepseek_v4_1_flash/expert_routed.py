@@ -94,58 +94,14 @@ SWIGLU_GROUPS_PER_CHUNK = SWIGLU_LANES // MX_GROUP
 SWIGLU_COUNT_LANES = SWIGLU_LANES
 SWIGLU_SCALE_SCRATCH_TILE = SWIGLU_ROW_TILE * (MOE_INTER // SWIGLU_LANES) * 8
 
-# PyPTO W13 projection tiling, mirroring kernels/expert_routed_w13.cpp. The
-# extern uses M_TILE/N_TILE/K_TILE = 64/256/256; N_TILE matches it here,
-# and the K tile matches it as well, once the gather's workspace stopped
-# claiming a full tile (see the scratch in _w13_projection): the decode's live
-# set has to fit W13_K_STAGE times over, and a full-size workspace put K 256
-# out of reach. See W13_K_STAGE for the sweep.
-# Every projection must run on a FULL row tile: narrowing an MX_A_ZZ
-# activation-scale load with valid_shape is silently miscompiled. A full tile
-# stays inside the expert's stride only if the tile divides it, so the tile is
-# the largest divisor of the stride that is still a sane cube M. It also sets
-# how often the weight panels are decoded -- decode cost scales with the row
-# tile count -- so bigger is better until the accumulator stops fitting in L0C.
-# RECV_MAX is always a multiple of 32, so the gcd is always a multiple of 16,
-# which MX_A_ZZ needs. Clamping a partial last tile instead would need pl.min,
-# whose result the MX offset prover cannot see through.
+# Full activation-scale row tiles divide each expert's padded stride.
 W13_M_TILE = gcd(RECV_MAX, 80)
-# gcd(32k, 80) is 80 or 16 and nothing else, and at 16 the weight panels are
-# decoded five times as often. Assert the good case so a config change that
-# drops to 16 is visible rather than silently slow.
-assert W13_M_TILE % 16 == 0
-assert RECV_MAX % W13_M_TILE == 0
 W13_N_TILE = MX_MM_INTER_TILE
-W13_K_TILE = MX_K_TILE
-W13_N_BLOCKS = MOE_INTER // W13_N_TILE
+W13_K_TILE = MX_K_TILE // 2
 W13_SCALE_K = W13_K_TILE // MX_GROUP
-# A packed weight plane stores one (n_block, k_block) panel as MX_K_TILE rows
-# of MX_PACKED_LANE_COLS bytes, panels ordered n-major. The row offset of the
-# K slice starting at k therefore collapses to n_block * K + k, where K is the
-# projection's reduction width (D for W1/W3).
 W13_PACKED_EXPERT_ROWS = MX_W1_PACKED_ROWS
-# The extern multi-buffers everything: A and scale stages 2 deep, two L1 slots
-# for the decoded weight panel, four raw packed panels prefetched and two NZ
-# tiles. None of that arrives by itself here -- AutoTileMatmulL0 does not
-# dispatch on matmul_mx, and the slot lowering only triggers on pl.pipeline --
-# so the K loop asks for it explicitly. Depth and K tile are coupled through
-# the Vec budget; measured optimum (case full, 50 rounds, PyPTO effective_us):
-# K 256 / depth 2 = 254, K 128 / depth 3 = 256, K 128 / depth 2 = 258,
-# K 128 / depth 4 = 258, K 64 / depth 2 = 276. Depth 1 is far worse at every
-# tile (546 at K 128). K 32 is rejected outright -- matmul_mx needs a physical
-# K divisible by 64.
 W13_K_STAGE = 2
-# Route weights are copied in 16-row chunks. Every chunk carries a runtime
-# valid extent, so the chunking buys nothing over a single [1, count] row
-# load; the extern does exactly that and issues one contiguous burst where
-# this issues 16 four-byte descriptors per chunk. Worth revisiting.
-# MXFP4 decode lookup table. PyPTO warns that pl.cast from packed FP4 to
-# FP8E4M3FN expands to FP4->BF16->FP32->FP8 and tells you to prefer a LUT
-# gather; this is that gather. The table is indexed by the whole packed BYTE,
-# not by a nibble, so one INT16 entry carries both decoded FP8E4M3 bytes and a
-# single gather decodes two values at once.
 FP4_LUT_SIZE = 256
-ROUTE_COPY_ROWS = 16
 
 
 @pl.jit.inline(auto_scope=False)
@@ -394,22 +350,7 @@ def _w13_projection(
     experts: pl.constexpr,
     stride: pl.constexpr,
 ):
-    """Accumulate one [W13_M_TILE, W13_N_TILE] MXFP4 x MXFP8 projection tile.
-
-    The packed plane of one expert holds its (n_block, k_block) panels
-    n-major, each MX_K_TILE rows of MX_PACKED_LANE_COLS bytes, so the K slice
-    starting at ``k`` lives at ``expert * W13_PACKED_EXPERT_ROWS +
-    col // W13_N_TILE * D + k``.
-
-    Both activation loads take the whole W13_M_TILE row extent. Narrowing
-    them with valid_shape is what the caller must avoid: a partial valid row
-    extent on the MX_A_ZZ scale tile is silently miscompiled, so the caller
-    keeps every tile full and bounds only its store.
-
-    The views are rebuilt here rather than hoisted to the caller because an
-    inline parameter must carry statically inferable tensor metadata, which a
-    view produced in the caller does not.
-    """
+    """Accumulate one gate or up tile with byte-indexed FP4 decoding."""
     x_scale_zz = pl.tensor.view(x_scale, [experts * stride, K_SCALE], layout=pl.MX_A_ZZ)
     weight_flat = pl.tensor.view(
         weight, [experts * W13_PACKED_EXPERT_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND,
@@ -418,26 +359,12 @@ def _w13_projection(
     scale_row = expert * K_SCALE
     a0 = pl.load(x, [x_row, 0], [W13_M_TILE, W13_K_TILE])
     a_scale0 = pl.load(x_scale_zz, [x_row, 0], [W13_M_TILE, W13_SCALE_K])
-    # Each packed byte carries two E2M1 nibbles adjacent along N, so decoding
-    # expands the column extent 2:1 back to W13_N_TILE. The decode is exact:
-    # all sixteen E2M1 values are representable in FP8E4M3.
-    #
-    # pl.cast from packed FP4 straight to FP8E4M3FN would be one line, but
-    # PTOAS legalizes it as fp4 -> BF16 -> FP32 -> FP8E4M3 -- three TCVT passes
-    # whose FP32 temporary is four times the width of the result -- and warns
-    # about it, recommending a LUT gather. That cast was 92% of this entry's
-    # runtime when measured on A5. This is the gather it asks for.
+    # Decode two FP4 values per byte into adjacent FP8 lanes.
     lut = pl.load(fp4_lut, [0, 0], [1, FP4_LUT_SIZE])
     packed0 = pl.load(weight_flat, [panel_row, 0], [W13_K_TILE, MX_PACKED_LANE_COLS])
-    # uint8 indices need two hops: pto.tcvt has no uint8 to int16 path,
-    # and the gather takes INT16 indices against a 16-bit table. FP16 is the
-    # cheap intermediate -- unlike the FP32 the cast legalization would use,
-    # it is the same width as the result.
     index0 = pl.cast(pl.cast(packed0, pl.FP16), pl.INT16)
     scratch0 = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
     codes0 = pl.tile.gather(lut, index0, scratch0)
-    # reinterpret_view only crosses INT8 <-> FP8E4M3FN, so widen the view in
-    # two metadata-only steps; the column extent doubles with the first.
     b0 = pl.reinterpret_view(pl.reinterpret_view(codes0, pl.INT8), pl.FP8E4M3FN)
     b_scale0 = pl.load(weight_scale, [scale_row, col], [W13_SCALE_K, W13_N_TILE])
     acc = pl.matmul_mx(a0, a_scale0, b0, b_scale0)
@@ -445,22 +372,11 @@ def _w13_projection(
         a = pl.load(x, [x_row, k0], [W13_M_TILE, W13_K_TILE])
         a_scale = pl.load(x_scale_zz, [x_row, k0 // MX_GROUP], [W13_M_TILE, W13_SCALE_K])
         packed = pl.load(weight_flat, [panel_row + k0, 0], [W13_K_TILE, MX_PACKED_LANE_COLS])
-        # uint8 indices need two hops: pto.tcvt has no uint8 to int16 path,
-        # and the gather takes INT16 indices against a 16-bit table. FP16 is the
-        # cheap intermediate -- unlike the FP32 the cast legalization would use,
-        # it is the same width as the result.
         index = pl.cast(pl.cast(packed, pl.FP16), pl.INT16)
-        # The A5 index form does not constrain the gather workspace, so keep
-        # it minimal: a full-size one costs a whole extra tile of Vec per
-        # pipeline stage and was what kept the K tile below the extern's 256.
         scratch = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
         codes = pl.tile.gather(lut, index, scratch)
-        # reinterpret_view only crosses INT8 <-> FP8E4M3FN, so widen the view in
-        # two metadata-only steps; the column extent doubles with the first.
         b = pl.reinterpret_view(pl.reinterpret_view(codes, pl.INT8), pl.FP8E4M3FN)
-        b_scale = pl.load(
-            weight_scale, [scale_row + k0 // MX_GROUP, col], [W13_SCALE_K, W13_N_TILE],
-        )
+        b_scale = pl.load(weight_scale, [scale_row + k0 // MX_GROUP, col], [W13_SCALE_K, W13_N_TILE])
         acc = pl.matmul_mx_acc(acc, a, a_scale, b, b_scale)
     return acc
 
@@ -482,50 +398,10 @@ def routed_w13_pypto(
     experts: pl.constexpr,
     stride: pl.constexpr,
 ):
-    """PyPTO equivalent of :func:`_routed_w13`, kept for precision only.
+    """Compute compact BF16 gate/up rows and copy their route weights.
 
-    The model still calls the extern; this entry exists so the PyPTO
-    formulation stays validated while its performance is tuned separately.
-    Remove ``_routed_w13`` and ``kernels/expert_routed_w13.cpp`` only once
-    this reaches parity.
-
-    Input rows are expert-strided (``expert * stride + row``) while the gate
-    and up columns of ``pair`` and the rows of ``compact_weights`` are compact
-    across experts, matching the extern's row order exactly so the existing
-    SwiGLU and W2 stages consume either indistinguishably.
-
-    Each work item owns one [W13_M_TILE, W13_N_TILE] output tile and computes
-    both projections for it, where the extern makes gate and up separate work
-    items. Two caveats, both measured rather than assumed:
-
-    - This does NOT share the activation loads between the two projections.
-      Each call re-issues its own loads and there is no cross-loop CSE pass,
-      so the A payload and A scale are fetched twice per work item.
-    - The owner formula is the extern's, but it is applied to a work-index
-      space half as long over tiles 1.25x taller, so the load balance is
-      materially worse, not merely coarser: for counts (0, 1, 159, 160) the
-      extern's critical path is 4 of 126 items (~1.5% imbalance) against 2 of
-      45 items here (~42%).
-
-    Rows past an expert's count are read -- up to a full tile of its padded,
-    poisoned capacity -- and multiplied, then discarded by the masked store.
-    At deployment shapes, where the average per-expert count is well under
-    the row tile, that is several times the extern's MAC count: the extern
-    narrows the matmul to the valid rows and this cannot, because narrowing
-    the MX_A_ZZ scale load is silently miscompiled.
+    The existing model keeps the extern until native latency reaches parity.
     """
-    # The extern is declared dual_aiv_dispatch=True and splits the K rows of
-    # each packed panel by get_subblockid(), so its decode runs on both vector
-    # lanes; this runs on one. pl.split(pl.SplitMode.UP_DOWN) used to be the
-    # equivalent, but implicit AIV splitting was removed from mixed kernels and
-    # the mandated replacement cannot be used here: opening a pl.split_aiv
-    # region puts the function in manual mode, where tile.set_validshape is
-    # rejected outside every region, and it is the only way to bound this
-    # kernel's accumulator store to a runtime row count. Revisit when that
-    # restriction lifts -- the decode is vector-bound, so the second lane was
-    # worth about 1.7x while the implicit split still worked.
-    # Both route-weight planes are single-column, so a flat view makes a row
-    # range contiguous and lets the copy move it as one row vector.
     route_flat = pl.tensor.view(route_weights, [1, experts * stride], layout=pl.ND)
     compact_flat = pl.tensor.view(compact_weights, [1, W13_ROWS], layout=pl.ND)
     with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_pypto", deps=[input_ready]) as ready:
@@ -535,63 +411,42 @@ def routed_w13_pypto(
         for expert in pl.range(experts):
             count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
             row_tiles = (count + W13_M_TILE - 1) // W13_M_TILE
-            # Work items are walked in index order and filtered by owner rather
-            # than entered at a rotated start. The assignment is the extern's --
-            # item w of this expert belongs to core (work_base + w) % blocks,
-            # which keeps consecutive experts filling the same core ring instead
-            # of all restarting at core 0 -- but phrasing it this way keeps the
-            # row offset a plain loop variable. The MX_A_ZZ slice checker only
-            # proves a block offset non-negative and 16-aligned through
-            # constants, loop variables, sums and floor-divisions, so a rotated
-            # loop start would make the activation scale load unprovable.
             for row_tile in pl.range(row_tiles):
-                # The tile is always loaded whole; only the store is bounded
-                # by the true count. Rows past the count hold this expert's
-                # padded capacity, which the specs poison, but their products
-                # are never stored.
+                # Keep MX_A_ZZ scale loads full and narrow only output stores.
                 row = row_tile * W13_M_TILE
                 valid = pl.min(W13_M_TILE, count - row)
                 x_row = expert * stride + row
                 out_row = activation_base + row
-                for block in pl.range(W13_N_BLOCKS):
-                    if (work_base + row_tile * W13_N_BLOCKS + block) % ROUTED_CUBE_WORKER_TILE == core:
-                        col = block * W13_N_TILE
-                        gate = _w13_projection(
-                            x, x_scale, w1, w1_scale, fp4_lut, x_row, expert, col, experts, stride,
-                        )
-                        pair = pl.store(
-                            pl.set_validshape(gate, valid, W13_N_TILE), [out_row, col], pair,
-                        )
-                        up = _w13_projection(
-                            x, x_scale, w3, w3_scale, fp4_lut, x_row, expert, col, experts, stride,
-                        )
-                        pair = pl.store(
-                            pl.set_validshape(up, valid, W13_N_TILE), [out_row, MOE_INTER + col], pair,
-                        )
-                        # The owner of the first column block also carries the
-                        # route weights, so the copy runs once per row tile
-                        # rather than once per output tile. It must stop exactly
-                        # at ``count``: compact rows are packed across experts,
-                        # so writing a padded tail would race with the next
-                        # expert's own rows.
-                        # As the extern does: one contiguous [1, valid] row
-                        # vector, on vector lane 0 only. The row-vector shape
-                        # and the lane guard are what a vector-lane split needs:
-                        # a [n, 1] column
-                        # tile gets halved on the row axis and each lane then
-                        # copies half the rows, while a single-row tile cannot
-                        # be split. It is also one MTE2 burst instead of
-                        # ceil(valid/16) x 16 four-byte descriptors.
-                        if block == 0 and pl.tile.get_subblock_idx() == 0:
-                            weight_row = pl.load(
-                                route_flat, [0, expert * stride + row], [1, W13_M_TILE],
-                                valid_shape=[1, valid],
-                            )
-                            compact_flat = pl.store(
-                                pl.set_validshape(weight_row, 1, valid),
-                                [0, activation_base + row], compact_flat,
-                            )
-            work_base = work_base + row_tiles * W13_N_BLOCKS
+                for projection in pl.range(2):
+                    for block in pl.range((MOE_INTER // W13_N_TILE)):
+                        work = (row_tile * 2 + projection) * (MOE_INTER // W13_N_TILE) + block
+                        if (work_base + work) % ROUTED_CUBE_WORKER_TILE == core:
+                            col = block * W13_N_TILE
+                            if projection == 0:
+                                gate = _w13_projection(
+                                    x, x_scale, w1, w1_scale, fp4_lut, x_row, expert, col, experts, stride,
+                                )
+                                pair = pl.store(
+                                    pl.set_validshape(gate, valid, W13_N_TILE), [out_row, col], pair,
+                                )
+                            else:
+                                up = _w13_projection(
+                                    x, x_scale, w3, w3_scale, fp4_lut, x_row, expert, col, experts, stride,
+                                )
+                                pair = pl.store(
+                                    pl.set_validshape(up, valid, W13_N_TILE), [out_row, MOE_INTER + col], pair,
+                                )
+                            # The first gate column copies the compact route-weight row.
+                            if projection == 0 and block == 0 and pl.tile.get_subblock_idx() == 0:
+                                weight_row = pl.load(
+                                    route_flat, [0, expert * stride + row], [1, W13_M_TILE],
+                                    valid_shape=[1, valid],
+                                )
+                                compact_flat = pl.store(
+                                    pl.set_validshape(weight_row, 1, valid),
+                                    [0, activation_base + row], compact_flat,
+                                )
+            work_base = work_base + row_tiles * (2 * (MOE_INTER // W13_N_TILE))
             activation_base = activation_base + count
     return pair, compact_flat, ready
 
