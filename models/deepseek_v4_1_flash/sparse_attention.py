@@ -116,6 +116,12 @@ SPARSE_VF_PIPE_SLOT_BYTES = SPARSE_VF_PIPE_CUBE_HEAD_TILE * 256 * 4 // (2 if SPA
 SPARSE_VF_PIPE_BUFFER_BYTES = SPARSE_VF_PIPE_SLOT_BYTES * 2
 SPARSE_VF_REG_TILE = 128
 
+SPARSE_VF_FUSED_HEAD_TILE = min(64, LOCAL_H)
+SPARSE_VF_FUSED_CUBE_HEAD_TILE = max(16, SPARSE_VF_FUSED_HEAD_TILE)
+SPARSE_VF_FUSED_AIV_HEAD_TILE = SPARSE_VF_FUSED_CUBE_HEAD_TILE // 2
+SPARSE_VF_FUSED_GATHER_TILE = 32
+SPARSE_VF_FUSED_SCALE_TILE = 8
+
 # Sparse VF packed-cache layout.
 SPARSE_VF_WINDOW_GROUP = 32
 SPARSE_VF_COMPRESSED_GROUP = 16
@@ -1739,6 +1745,622 @@ def sparse_vf_attend_pypto(
     return attended
 
 
+@pl.jit.incore(level=pl.Level.AIC)
+def sparse_vf_fused_cube(
+    qflat: pl.Tensor,
+    window_indices: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    window_flat: pl.Tensor,
+    compressed_flat: pl.Tensor,
+    sink_row: pl.Tensor,
+    oflat: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    pl.func_attr({'split_aiv': True})
+    keys = WINDOW_KEYS + compressed_keys
+    parts = keys // SPARSE_VF_KEY_TILE
+    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), WORKERS)
+    workers = pl.max(1, workers)
+    kv_ring = pl.system.reserve_buffer(name='sparse_kv_ring', size=393216)
+    p_ring = pl.system.reserve_buffer(name='sparse_p_ring', size=16384)
+    pv_peer = pl.system.import_peer_buffer(name='sparse_qk_ring', peer_func='sparse_vf_fused_vector')
+    pl.system.aic_initialize_pipe(pv_peer, dir_mask=1, slot_size=16384, slot_num=1, id=0)
+    pl.system.aic_initialize_pipe(v2c_consumer_buf=kv_ring, dir_mask=2, slot_size=131072, slot_num=3, id=1)
+    pl.system.aic_initialize_pipe(v2c_consumer_buf=p_ring, dir_mask=2, slot_size=16384, slot_num=1, id=2)
+    pv_peer_next = pl.system.import_peer_buffer(name='sparse_pv_ring', peer_func='sparse_vf_fused_vector')
+    pl.system.aic_initialize_pipe(pv_peer_next, dir_mask=1, slot_size=16384, slot_num=1, id=3)
+    worker = pl.tile.get_block_idx()
+    for block in pl.range(worker, num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), workers):
+        token = block // (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE)
+        head = block % (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE) * SPARSE_VF_FUSED_HEAD_TILE
+        q0 = token * LOCAL_H + head
+        q = pl.tile.load(qflat, [q0, 0], [SPARSE_VF_FUSED_CUBE_HEAD_TILE, HEAD_DIM], valid_shape=[SPARSE_VF_FUSED_HEAD_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+        if compressed_keys > 0:
+            kv_0 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_KEY_TILE, HEAD_DIM], dtype=pl.BF16, split=1, id=1)
+            kt_0 = pl.tile.transpose_view(kv_0)
+            qk_0 = pl.tile.matmul(q, kt_0)
+            pl.system.tpush_to_aiv(qk_0, split=1, id=0)
+            kv_1 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_KEY_TILE, HEAD_DIM], dtype=pl.BF16, split=1, id=1)
+            kt_1 = pl.tile.transpose_view(kv_1)
+            qk_1 = pl.tile.matmul(q, kt_1)
+            pl.system.tpush_to_aiv(qk_1, split=1, id=0)
+            weights_0 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_FUSED_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=1, id=2)
+            for value_column in pl.range(0, HEAD_DIM, 128):
+                value_0 = pl.tile.slice(kv_0, [SPARSE_VF_KEY_TILE, 128], [0, value_column])
+                pv_0 = pl.matmul(weights_0, value_0, out_dtype=pl.FP32)
+                pl.system.tpush_to_aiv(pv_0, split=1, id=3)
+            pl.system.tfree_to_aiv(weights_0, id=2)
+            pl.system.tfree_to_aiv(kv_0, id=1)
+            kv_2 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_KEY_TILE, HEAD_DIM], dtype=pl.BF16, split=1, id=1)
+            kt_2 = pl.tile.transpose_view(kv_2)
+            qk_2 = pl.tile.matmul(q, kt_2)
+            pl.system.tpush_to_aiv(qk_2, split=1, id=0)
+            weights_1 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_FUSED_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=1, id=2)
+            for value_column in pl.range(0, HEAD_DIM, 128):
+                value_1 = pl.tile.slice(kv_1, [SPARSE_VF_KEY_TILE, 128], [0, value_column])
+                pv_1 = pl.matmul(weights_1, value_1, out_dtype=pl.FP32)
+                pl.system.tpush_to_aiv(pv_1, split=1, id=3)
+            pl.system.tfree_to_aiv(weights_1, id=2)
+            pl.system.tfree_to_aiv(kv_1, id=1)
+            kv_3 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_KEY_TILE, HEAD_DIM], dtype=pl.BF16, split=1, id=1)
+            kt_3 = pl.tile.transpose_view(kv_3)
+            qk_3 = pl.tile.matmul(q, kt_3)
+            pl.system.tpush_to_aiv(qk_3, split=1, id=0)
+            weights_2 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_FUSED_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=1, id=2)
+            for value_column in pl.range(0, HEAD_DIM, 128):
+                value_2 = pl.tile.slice(kv_2, [SPARSE_VF_KEY_TILE, 128], [0, value_column])
+                pv_2 = pl.matmul(weights_2, value_2, out_dtype=pl.FP32)
+                pl.system.tpush_to_aiv(pv_2, split=1, id=3)
+            pl.system.tfree_to_aiv(weights_2, id=2)
+            pl.system.tfree_to_aiv(kv_2, id=1)
+            kv_4 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_KEY_TILE, HEAD_DIM], dtype=pl.BF16, split=1, id=1)
+            kt_4 = pl.tile.transpose_view(kv_4)
+            qk_4 = pl.tile.matmul(q, kt_4)
+            pl.system.tpush_to_aiv(qk_4, split=1, id=0)
+            weights_3 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_FUSED_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=1, id=2)
+            for value_column in pl.range(0, HEAD_DIM, 128):
+                value_3 = pl.tile.slice(kv_3, [SPARSE_VF_KEY_TILE, 128], [0, value_column])
+                pv_3 = pl.matmul(weights_3, value_3, out_dtype=pl.FP32)
+                pl.system.tpush_to_aiv(pv_3, split=1, id=3)
+            pl.system.tfree_to_aiv(weights_3, id=2)
+            pl.system.tfree_to_aiv(kv_3, id=1)
+            weights_4 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_FUSED_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=1, id=2)
+            for value_column in pl.range(0, HEAD_DIM, 128):
+                value_4 = pl.tile.slice(kv_4, [SPARSE_VF_KEY_TILE, 128], [0, value_column])
+                pv_4 = pl.matmul(weights_4, value_4, out_dtype=pl.FP32)
+                pl.system.tpush_to_aiv(pv_4, split=1, id=3)
+            pl.system.tfree_to_aiv(weights_4, id=2)
+            pl.system.tfree_to_aiv(kv_4, id=1)
+        else:
+            kv_0 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_KEY_TILE, HEAD_DIM], dtype=pl.BF16, split=1, id=1)
+            kt_0 = pl.tile.transpose_view(kv_0)
+            qk_0 = pl.tile.matmul(q, kt_0)
+            pl.system.tpush_to_aiv(qk_0, split=1, id=0)
+            weights_0 = pl.system.tpop_from_aiv(shape=[SPARSE_VF_FUSED_CUBE_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.BF16, split=1, id=2)
+            for value_column in pl.range(0, HEAD_DIM, 128):
+                value_0 = pl.tile.slice(kv_0, [SPARSE_VF_KEY_TILE, 128], [0, value_column])
+                pv_0 = pl.matmul(weights_0, value_0, out_dtype=pl.FP32)
+                pl.system.tpush_to_aiv(pv_0, split=1, id=3)
+            pl.system.tfree_to_aiv(weights_0, id=2)
+            pl.system.tfree_to_aiv(kv_0, id=1)
+    return oflat
+
+
+
+@pl.jit.incore(level=pl.Level.AIV)
+def sparse_vf_fused_vector(
+    qflat: pl.Tensor,
+    window_indices: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    window_flat: pl.Tensor,
+    compressed_flat: pl.Tensor,
+    sink_row: pl.Tensor,
+    oflat: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    pl.func_attr({'split_aiv': True, 'dual_aiv_dispatch': True})
+    keys = WINDOW_KEYS + compressed_keys
+    parts = keys // SPARSE_VF_KEY_TILE
+    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), WORKERS)
+    workers = pl.max(1, workers)
+    aiv_id = pl.tile.get_subblock_idx()
+    pv_ring = pl.system.reserve_buffer(name='sparse_qk_ring', size=16384)
+    kv_peer = pl.system.import_peer_buffer(name='sparse_kv_ring', peer_func='sparse_vf_fused_cube')
+    p_peer = pl.system.import_peer_buffer(name='sparse_p_ring', peer_func='sparse_vf_fused_cube')
+    pl.system.aiv_initialize_pipe(pv_ring, dir_mask=1, slot_size=16384, slot_num=1, id=0)
+    pl.system.aiv_initialize_pipe(v2c_consumer_buf=kv_peer, dir_mask=2, slot_size=131072, slot_num=3, id=1)
+    pl.system.aiv_initialize_pipe(v2c_consumer_buf=p_peer, dir_mask=2, slot_size=16384, slot_num=1, id=2)
+    pv_ring_next = pl.system.reserve_buffer(name='sparse_pv_ring', size=16384)
+    pl.system.aiv_initialize_pipe(pv_ring_next, dir_mask=1, slot_size=16384, slot_num=1, id=3)
+    scale_w_lanes = pl.tile.ci(0, [1, 2 * SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS], dtype=pl.INT16)
+    scale_w_duplicate_indices = pl.shr(scale_w_lanes, 1)
+    scale_c_lanes = pl.tile.ci(0, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM], dtype=pl.INT16)
+    scale_c_indices = pl.shr(scale_c_lanes, SPARSE_VF_COMPRESSED_SHIFT)
+    scale_gather_tmp = pl.tile.create([1, 16], dtype=pl.INT16, target_memory=pl.MemorySpace.Vec)
+    worker = pl.tile.get_block_idx()
+    for block in pl.range(worker, num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), workers):
+        token = block // (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE)
+        head = block % (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE) * SPARSE_VF_FUSED_HEAD_TILE
+        q0 = token * LOCAL_H + head
+        maximum = pl.tile.full([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, value=-1e+30)
+        denominator = pl.tile.full([1, SPARSE_VF_FUSED_AIV_HEAD_TILE], dtype=pl.FP32, value=0.0)
+        numerator_0 = pl.tile.full([SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, value=0.0)
+        numerator_1 = pl.tile.full([SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, value=0.0)
+        numerator_2 = pl.tile.full([SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, value=0.0)
+        numerator_3 = pl.tile.full([SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, value=0.0)
+        for prefetch_part in pl.range(pl.min(parts, 2)):
+            column = prefetch_part * SPARSE_VF_KEY_TILE
+            kv_half = pl.tile.create([SPARSE_VF_KEY_TILE // 2, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
+            for key_offset in pl.range(0, SPARSE_VF_KEY_TILE // 2, SPARSE_VF_FUSED_GATHER_TILE):
+                first_key = column + aiv_id * (SPARSE_VF_KEY_TILE // 2) + key_offset
+                if compressed_keys > 0:
+                    if column < WINDOW_KEYS:
+                        gather_ids = pl.tile.load(window_indices, [token, first_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        fw_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        # Gather contiguous rows in one DMA.
+                        fw_first = pl.tile.read(gather_ids, [0, 0])
+                        fw_contiguous = pl.cast(0, pl.INT32)
+                        if fw_first >= 0:
+                            fw_contiguous = pl.cast(1, pl.INT32)
+                            for fw_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fw_check_row = pl.tile.read(gather_ids, [0, fw_check_lane])
+                                if fw_check_row != fw_first + fw_check_lane:
+                                    fw_contiguous = pl.cast(0, pl.INT32)
+                        if fw_contiguous != 0:
+                            fw_start = pl.cast(fw_first, pl.INDEX)
+                            fw_raw = pl.tile.gather_row(fw_raw, window_flat, [0, 0], [fw_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                        else:
+                            for fw_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fw_a = pl.tile.read(gather_ids, [0, fw_lane])
+                                fw_b = pl.tile.read(gather_ids, [0, fw_lane + 1])
+                                fw_lower = pl.min(fw_a, fw_b)
+                                fw_upper = pl.max(fw_a, fw_b)
+                                fw_pair = pl.cast(0, pl.INT32)
+                                if fw_lower >= 0:
+                                    if fw_upper == fw_lower + 1:
+                                        fw_pair = pl.cast(1, pl.INT32)
+                                if fw_pair != 0:
+                                    # Sort each pair of valid row indices.
+                                    fw_physical = pl.cast(fw_lower, pl.INDEX)
+                                    fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical, 0], [2, WINDOW_CACHE_BYTES])
+                                else:
+                                    if fw_a >= 0:
+                                        fw_physical_a = pl.cast(fw_a, pl.INDEX)
+                                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                    if fw_b >= 0:
+                                        fw_physical_b = pl.cast(fw_b, pl.INDEX)
+                                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane + 1, 0], [fw_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                        for fw_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fw_cast_row0 = fw_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fw_raw_chunk = pl.tile.slice(fw_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fw_cast_row0, 0])
+                            fw_signed = pl.reinterpret_view(fw_raw_chunk, pl.INT8)
+                            fw_packed = pl.reinterpret_view(fw_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                            fw_codes = fw_packed[:, :HEAD_DIM]
+                            fw_values_fp32 = pl.cast(fw_codes, pl.FP32)
+                            fw_values = pl.cast(fw_values_fp32, pl.BF16, mode='rint')
+                            fw_bits = pl.reinterpret_view(fw_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                            fw_scales = pl.reinterpret_view(fw_bits, pl.BF16)
+                            fw_scale_view = fw_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                            fw_dense_scales = pl.tile.move(fw_scale_view, pl.MemorySpace.Vec)
+                            fw_value_flat = pl.tile.reshape(fw_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fw_scale_row = pl.tile.reshape(fw_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                            fw_scale_bits = pl.tile.reinterpret_view(fw_scale_row, pl.INT16)
+                            fw_duplicated_bits = pl.tile.gather(fw_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                            fw_expanded_bits = pl.tile.gather(fw_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                            fw_expanded = pl.tile.reinterpret_view(fw_expanded_bits, pl.BF16)
+                            fw_scaled_flat = pl.col_expand_mul(fw_value_flat, fw_expanded)
+                            fw_result = pl.tile.reshape(fw_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fw_result, [key_offset + fw_cast_row0, 0])
+                    else:
+                        compressed_key = first_key - WINDOW_KEYS
+                        gather_ids = pl.tile.load(compressed_indices, [token, compressed_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        fc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        # Gather contiguous rows in one DMA.
+                        fc_first = pl.tile.read(gather_ids, [0, 0])
+                        fc_contiguous = pl.cast(0, pl.INT32)
+                        if fc_first >= 0:
+                            fc_contiguous = pl.cast(1, pl.INT32)
+                            for fc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fc_check_row = pl.tile.read(gather_ids, [0, fc_check_lane])
+                                if fc_check_row != fc_first + fc_check_lane:
+                                    fc_contiguous = pl.cast(0, pl.INT32)
+                        if fc_contiguous != 0:
+                            fc_start = pl.cast(fc_first, pl.INDEX)
+                            fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [0, 0], [fc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
+                        else:
+                            for fc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fc_a = pl.tile.read(gather_ids, [0, fc_lane])
+                                fc_b = pl.tile.read(gather_ids, [0, fc_lane + 1])
+                                fc_lower = pl.min(fc_a, fc_b)
+                                fc_upper = pl.max(fc_a, fc_b)
+                                fc_pair = pl.cast(0, pl.INT32)
+                                if fc_lower >= 0:
+                                    if fc_upper == fc_lower + 1:
+                                        fc_pair = pl.cast(1, pl.INT32)
+                                if fc_pair != 0:
+                                    # Sort each pair of valid row indices.
+                                    fc_physical = pl.cast(fc_lower, pl.INDEX)
+                                    fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane, 0], [fc_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                                else:
+                                    if fc_a >= 0:
+                                        fc_physical_a = pl.cast(fc_a, pl.INDEX)
+                                        fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane, 0], [fc_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                    if fc_b >= 0:
+                                        fc_physical_b = pl.cast(fc_b, pl.INDEX)
+                                        fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane + 1, 0], [fc_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                        for fc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fc_cast_row0 = fc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fc_raw_chunk = pl.tile.slice(fc_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fc_cast_row0, 0])
+                            fc_packed = pl.reinterpret_view(fc_raw_chunk, pl.FP4E2M1X2)
+                            fc_codes = fc_packed[:, :SPARSE_VF_HALF_DIM]
+                            fc_values = pl.cast(fc_codes, pl.BF16)
+                            fc_bits = pl.reinterpret_view(fc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fc_scales = pl.reinterpret_view(fc_bits, pl.BF16)
+                            fc_scale_view = fc_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                            fc_dense_scales = pl.tile.move(fc_scale_view, pl.MemorySpace.Vec)
+                            fc_value_flat = pl.tile.reshape(fc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fc_scale_row = pl.tile.reshape(fc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
+                            fc_scale_bits = pl.tile.reinterpret_view(fc_scale_row, pl.INT16)
+                            fc_expanded_bits = pl.tile.gather(fc_scale_bits, scale_c_indices, scale_gather_tmp)
+                            fc_expanded = pl.tile.reinterpret_view(fc_expanded_bits, pl.BF16)
+                            fc_scaled_flat = pl.col_expand_mul(fc_value_flat, fc_expanded)
+                            fc_result = pl.tile.reshape(fc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fc_result, [key_offset + fc_cast_row0, 0])
+                else:
+                    gather_ids = pl.tile.load(window_indices, [token, first_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    fw_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fw_first = pl.tile.read(gather_ids, [0, 0])
+                    fw_contiguous = pl.cast(0, pl.INT32)
+                    if fw_first >= 0:
+                        fw_contiguous = pl.cast(1, pl.INT32)
+                        for fw_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fw_check_row = pl.tile.read(gather_ids, [0, fw_check_lane])
+                            if fw_check_row != fw_first + fw_check_lane:
+                                fw_contiguous = pl.cast(0, pl.INT32)
+                    if fw_contiguous != 0:
+                        fw_start = pl.cast(fw_first, pl.INDEX)
+                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [0, 0], [fw_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                    else:
+                        for fw_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fw_a = pl.tile.read(gather_ids, [0, fw_lane])
+                            fw_b = pl.tile.read(gather_ids, [0, fw_lane + 1])
+                            fw_lower = pl.min(fw_a, fw_b)
+                            fw_upper = pl.max(fw_a, fw_b)
+                            fw_pair = pl.cast(0, pl.INT32)
+                            if fw_lower >= 0:
+                                if fw_upper == fw_lower + 1:
+                                    fw_pair = pl.cast(1, pl.INT32)
+                            if fw_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fw_physical = pl.cast(fw_lower, pl.INDEX)
+                                fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical, 0], [2, WINDOW_CACHE_BYTES])
+                            else:
+                                if fw_a >= 0:
+                                    fw_physical_a = pl.cast(fw_a, pl.INDEX)
+                                    fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                if fw_b >= 0:
+                                    fw_physical_b = pl.cast(fw_b, pl.INDEX)
+                                    fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane + 1, 0], [fw_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                    for fw_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fw_cast_row0 = fw_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fw_raw_chunk = pl.tile.slice(fw_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fw_cast_row0, 0])
+                        fw_signed = pl.reinterpret_view(fw_raw_chunk, pl.INT8)
+                        fw_packed = pl.reinterpret_view(fw_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                        fw_codes = fw_packed[:, :HEAD_DIM]
+                        fw_values_fp32 = pl.cast(fw_codes, pl.FP32)
+                        fw_values = pl.cast(fw_values_fp32, pl.BF16, mode='rint')
+                        fw_bits = pl.reinterpret_view(fw_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fw_scales = pl.reinterpret_view(fw_bits, pl.BF16)
+                        fw_scale_view = fw_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                        fw_dense_scales = pl.tile.move(fw_scale_view, pl.MemorySpace.Vec)
+                        fw_value_flat = pl.tile.reshape(fw_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fw_scale_row = pl.tile.reshape(fw_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                        fw_scale_bits = pl.tile.reinterpret_view(fw_scale_row, pl.INT16)
+                        fw_duplicated_bits = pl.tile.gather(fw_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                        fw_expanded_bits = pl.tile.gather(fw_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                        fw_expanded = pl.tile.reinterpret_view(fw_expanded_bits, pl.BF16)
+                        fw_scaled_flat = pl.col_expand_mul(fw_value_flat, fw_expanded)
+                        fw_result = pl.tile.reshape(fw_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fw_result, [key_offset + fw_cast_row0, 0])
+            pl.system.tpush_to_aic(kv_half, split=1, id=1)
+        for part in pl.range(parts):
+            column = part * SPARSE_VF_KEY_TILE
+            qk_half = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, split=1, id=0)
+            scores = pl.mul(qk_half, SCALE)
+            column = part * SPARSE_VF_KEY_TILE
+            if column < WINDOW_KEYS:
+                ids = pl.tile.load(window_indices, [token, column], [1, SPARSE_VF_KEY_TILE])
+            else:
+                c_column = column - WINDOW_KEYS
+                ids = pl.tile.load(compressed_indices, [token, c_column], [1, SPARSE_VF_KEY_TILE])
+            idx = pl.cast(ids, pl.FP32)
+            positive = pl.add(idx, 1.0)
+            nonnegative = pl.maximum(positive, 0.0)
+            valid = pl.minimum(nonnegative, 1.0)
+            masked = pl.sub(valid, 1.0)
+            penalty = pl.mul(masked, 1e+30)
+            scores = pl.col_expand_add(scores, penalty)
+            softmax_tmp = pl.tile.create([SPARSE_VF_FUSED_AIV_HEAD_TILE, SPARSE_VF_KEY_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            row_max = pl.tile.row_max(scores, softmax_tmp)
+            tile_max = pl.reshape(row_max, [1, SPARSE_VF_FUSED_AIV_HEAD_TILE])
+            next_max = pl.maximum(maximum, tile_max)
+            max_delta = pl.sub(maximum, next_max)
+            correction = pl.exp(max_delta)
+            next_max_col = pl.reshape(next_max, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
+            shifted = pl.row_expand_sub(scores, next_max_col)
+            exponentials = pl.exp(shifted)
+            probabilities = pl.col_expand_mul(exponentials, valid)
+            row_sum = pl.tile.row_sum(probabilities, softmax_tmp)
+            tile_sum = pl.reshape(row_sum, [1, SPARSE_VF_FUSED_AIV_HEAD_TILE])
+            corrected_sum = pl.mul(denominator, correction)
+            denominator = pl.add(corrected_sum, tile_sum)
+            maximum = next_max
+            weights = pl.cast(probabilities, pl.BF16, mode='rint')
+            pl.system.tfree_to_aic(qk_half, id=0)
+            pl.system.tpush_to_aic(weights, split=1, id=2)
+            if part + 2 < parts:
+                column = (part + 2) * SPARSE_VF_KEY_TILE
+                kv_half = pl.tile.create([SPARSE_VF_KEY_TILE // 2, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
+                for key_offset in pl.range(0, SPARSE_VF_KEY_TILE // 2, SPARSE_VF_FUSED_GATHER_TILE):
+                    first_key = column + aiv_id * (SPARSE_VF_KEY_TILE // 2) + key_offset
+                    if compressed_keys > 0:
+                        if column < WINDOW_KEYS:
+                            gather_ids = pl.tile.load(window_indices, [token, first_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                            fw_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                            # Gather contiguous rows in one DMA.
+                            fw_first = pl.tile.read(gather_ids, [0, 0])
+                            fw_contiguous = pl.cast(0, pl.INT32)
+                            if fw_first >= 0:
+                                fw_contiguous = pl.cast(1, pl.INT32)
+                                for fw_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                    fw_check_row = pl.tile.read(gather_ids, [0, fw_check_lane])
+                                    if fw_check_row != fw_first + fw_check_lane:
+                                        fw_contiguous = pl.cast(0, pl.INT32)
+                            if fw_contiguous != 0:
+                                fw_start = pl.cast(fw_first, pl.INDEX)
+                                fw_raw = pl.tile.gather_row(fw_raw, window_flat, [0, 0], [fw_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                            else:
+                                for fw_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                    fw_a = pl.tile.read(gather_ids, [0, fw_lane])
+                                    fw_b = pl.tile.read(gather_ids, [0, fw_lane + 1])
+                                    fw_lower = pl.min(fw_a, fw_b)
+                                    fw_upper = pl.max(fw_a, fw_b)
+                                    fw_pair = pl.cast(0, pl.INT32)
+                                    if fw_lower >= 0:
+                                        if fw_upper == fw_lower + 1:
+                                            fw_pair = pl.cast(1, pl.INT32)
+                                    if fw_pair != 0:
+                                        # Sort each pair of valid row indices.
+                                        fw_physical = pl.cast(fw_lower, pl.INDEX)
+                                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical, 0], [2, WINDOW_CACHE_BYTES])
+                                    else:
+                                        if fw_a >= 0:
+                                            fw_physical_a = pl.cast(fw_a, pl.INDEX)
+                                            fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                        if fw_b >= 0:
+                                            fw_physical_b = pl.cast(fw_b, pl.INDEX)
+                                            fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane + 1, 0], [fw_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                            for fw_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                                fw_cast_row0 = fw_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                                fw_raw_chunk = pl.tile.slice(fw_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fw_cast_row0, 0])
+                                fw_signed = pl.reinterpret_view(fw_raw_chunk, pl.INT8)
+                                fw_packed = pl.reinterpret_view(fw_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                                fw_codes = fw_packed[:, :HEAD_DIM]
+                                fw_values_fp32 = pl.cast(fw_codes, pl.FP32)
+                                fw_values = pl.cast(fw_values_fp32, pl.BF16, mode='rint')
+                                fw_bits = pl.reinterpret_view(fw_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                                fw_scales = pl.reinterpret_view(fw_bits, pl.BF16)
+                                fw_scale_view = fw_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                                fw_dense_scales = pl.tile.move(fw_scale_view, pl.MemorySpace.Vec)
+                                fw_value_flat = pl.tile.reshape(fw_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                                fw_scale_row = pl.tile.reshape(fw_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                                fw_scale_bits = pl.tile.reinterpret_view(fw_scale_row, pl.INT16)
+                                fw_duplicated_bits = pl.tile.gather(fw_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                                fw_expanded_bits = pl.tile.gather(fw_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                                fw_expanded = pl.tile.reinterpret_view(fw_expanded_bits, pl.BF16)
+                                fw_scaled_flat = pl.col_expand_mul(fw_value_flat, fw_expanded)
+                                fw_result = pl.tile.reshape(fw_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                                kv_half = pl.tile.assemble(kv_half, fw_result, [key_offset + fw_cast_row0, 0])
+                        else:
+                            compressed_key = first_key - WINDOW_KEYS
+                            gather_ids = pl.tile.load(compressed_indices, [token, compressed_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                            fc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                            # Gather contiguous rows in one DMA.
+                            fc_first = pl.tile.read(gather_ids, [0, 0])
+                            fc_contiguous = pl.cast(0, pl.INT32)
+                            if fc_first >= 0:
+                                fc_contiguous = pl.cast(1, pl.INT32)
+                                for fc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                    fc_check_row = pl.tile.read(gather_ids, [0, fc_check_lane])
+                                    if fc_check_row != fc_first + fc_check_lane:
+                                        fc_contiguous = pl.cast(0, pl.INT32)
+                            if fc_contiguous != 0:
+                                fc_start = pl.cast(fc_first, pl.INDEX)
+                                fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [0, 0], [fc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
+                            else:
+                                for fc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                    fc_a = pl.tile.read(gather_ids, [0, fc_lane])
+                                    fc_b = pl.tile.read(gather_ids, [0, fc_lane + 1])
+                                    fc_lower = pl.min(fc_a, fc_b)
+                                    fc_upper = pl.max(fc_a, fc_b)
+                                    fc_pair = pl.cast(0, pl.INT32)
+                                    if fc_lower >= 0:
+                                        if fc_upper == fc_lower + 1:
+                                            fc_pair = pl.cast(1, pl.INT32)
+                                    if fc_pair != 0:
+                                        # Sort each pair of valid row indices.
+                                        fc_physical = pl.cast(fc_lower, pl.INDEX)
+                                        fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane, 0], [fc_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                                    else:
+                                        if fc_a >= 0:
+                                            fc_physical_a = pl.cast(fc_a, pl.INDEX)
+                                            fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane, 0], [fc_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                        if fc_b >= 0:
+                                            fc_physical_b = pl.cast(fc_b, pl.INDEX)
+                                            fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane + 1, 0], [fc_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                            for fc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                                fc_cast_row0 = fc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                                fc_raw_chunk = pl.tile.slice(fc_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fc_cast_row0, 0])
+                                fc_packed = pl.reinterpret_view(fc_raw_chunk, pl.FP4E2M1X2)
+                                fc_codes = fc_packed[:, :SPARSE_VF_HALF_DIM]
+                                fc_values = pl.cast(fc_codes, pl.BF16)
+                                fc_bits = pl.reinterpret_view(fc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                                fc_scales = pl.reinterpret_view(fc_bits, pl.BF16)
+                                fc_scale_view = fc_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                                fc_dense_scales = pl.tile.move(fc_scale_view, pl.MemorySpace.Vec)
+                                fc_value_flat = pl.tile.reshape(fc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                                fc_scale_row = pl.tile.reshape(fc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
+                                fc_scale_bits = pl.tile.reinterpret_view(fc_scale_row, pl.INT16)
+                                fc_expanded_bits = pl.tile.gather(fc_scale_bits, scale_c_indices, scale_gather_tmp)
+                                fc_expanded = pl.tile.reinterpret_view(fc_expanded_bits, pl.BF16)
+                                fc_scaled_flat = pl.col_expand_mul(fc_value_flat, fc_expanded)
+                                fc_result = pl.tile.reshape(fc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                                kv_half = pl.tile.assemble(kv_half, fc_result, [key_offset + fc_cast_row0, 0])
+                    else:
+                        gather_ids = pl.tile.load(window_indices, [token, first_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        fw_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        # Gather contiguous rows in one DMA.
+                        fw_first = pl.tile.read(gather_ids, [0, 0])
+                        fw_contiguous = pl.cast(0, pl.INT32)
+                        if fw_first >= 0:
+                            fw_contiguous = pl.cast(1, pl.INT32)
+                            for fw_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fw_check_row = pl.tile.read(gather_ids, [0, fw_check_lane])
+                                if fw_check_row != fw_first + fw_check_lane:
+                                    fw_contiguous = pl.cast(0, pl.INT32)
+                        if fw_contiguous != 0:
+                            fw_start = pl.cast(fw_first, pl.INDEX)
+                            fw_raw = pl.tile.gather_row(fw_raw, window_flat, [0, 0], [fw_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                        else:
+                            for fw_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fw_a = pl.tile.read(gather_ids, [0, fw_lane])
+                                fw_b = pl.tile.read(gather_ids, [0, fw_lane + 1])
+                                fw_lower = pl.min(fw_a, fw_b)
+                                fw_upper = pl.max(fw_a, fw_b)
+                                fw_pair = pl.cast(0, pl.INT32)
+                                if fw_lower >= 0:
+                                    if fw_upper == fw_lower + 1:
+                                        fw_pair = pl.cast(1, pl.INT32)
+                                if fw_pair != 0:
+                                    # Sort each pair of valid row indices.
+                                    fw_physical = pl.cast(fw_lower, pl.INDEX)
+                                    fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical, 0], [2, WINDOW_CACHE_BYTES])
+                                else:
+                                    if fw_a >= 0:
+                                        fw_physical_a = pl.cast(fw_a, pl.INDEX)
+                                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                    if fw_b >= 0:
+                                        fw_physical_b = pl.cast(fw_b, pl.INDEX)
+                                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane + 1, 0], [fw_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                        for fw_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fw_cast_row0 = fw_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fw_raw_chunk = pl.tile.slice(fw_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fw_cast_row0, 0])
+                            fw_signed = pl.reinterpret_view(fw_raw_chunk, pl.INT8)
+                            fw_packed = pl.reinterpret_view(fw_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                            fw_codes = fw_packed[:, :HEAD_DIM]
+                            fw_values_fp32 = pl.cast(fw_codes, pl.FP32)
+                            fw_values = pl.cast(fw_values_fp32, pl.BF16, mode='rint')
+                            fw_bits = pl.reinterpret_view(fw_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                            fw_scales = pl.reinterpret_view(fw_bits, pl.BF16)
+                            fw_scale_view = fw_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                            fw_dense_scales = pl.tile.move(fw_scale_view, pl.MemorySpace.Vec)
+                            fw_value_flat = pl.tile.reshape(fw_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fw_scale_row = pl.tile.reshape(fw_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                            fw_scale_bits = pl.tile.reinterpret_view(fw_scale_row, pl.INT16)
+                            fw_duplicated_bits = pl.tile.gather(fw_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                            fw_expanded_bits = pl.tile.gather(fw_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                            fw_expanded = pl.tile.reinterpret_view(fw_expanded_bits, pl.BF16)
+                            fw_scaled_flat = pl.col_expand_mul(fw_value_flat, fw_expanded)
+                            fw_result = pl.tile.reshape(fw_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fw_result, [key_offset + fw_cast_row0, 0])
+                pl.system.tpush_to_aic(kv_half, split=1, id=1)
+            correction_col = pl.reshape(correction, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
+            weighted_0 = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, split=1, id=3)
+            scaled_0 = pl.row_expand_mul(numerator_0, correction_col)
+            numerator_0 = pl.add(scaled_0, weighted_0)
+            pl.system.tfree_to_aic(weighted_0, id=3)
+            weighted_1 = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, split=1, id=3)
+            scaled_1 = pl.row_expand_mul(numerator_1, correction_col)
+            numerator_1 = pl.add(scaled_1, weighted_1)
+            pl.system.tfree_to_aic(weighted_1, id=3)
+            weighted_2 = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, split=1, id=3)
+            scaled_2 = pl.row_expand_mul(numerator_2, correction_col)
+            numerator_2 = pl.add(scaled_2, weighted_2)
+            pl.system.tfree_to_aic(weighted_2, id=3)
+            weighted_3 = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, split=1, id=3)
+            scaled_3 = pl.row_expand_mul(numerator_3, correction_col)
+            numerator_3 = pl.add(scaled_3, weighted_3)
+            pl.system.tfree_to_aic(weighted_3, id=3)
+        lane_head = head + aiv_id * SPARSE_VF_FUSED_AIV_HEAD_TILE
+        remaining = SPARSE_VF_FUSED_HEAD_TILE - aiv_id * SPARSE_VF_FUSED_AIV_HEAD_TILE
+        valid_heads = pl.min(remaining, SPARSE_VF_FUSED_AIV_HEAD_TILE)
+        if valid_heads > 0:
+            sinks = pl.tile.load(sink_row, [0, lane_head], [1, SPARSE_VF_FUSED_AIV_HEAD_TILE], valid_shape=[1, valid_heads])
+            final_max = pl.maximum(maximum, sinks)
+            final_delta = pl.sub(maximum, final_max)
+            correction = pl.exp(final_delta)
+            sink_delta = pl.sub(sinks, final_max)
+            sink_weight = pl.exp(sink_delta)
+            corrected_total = pl.mul(denominator, correction)
+            total = pl.add(corrected_total, sink_weight)
+            ratio = pl.div(correction, total)
+            multiplier = pl.reshape(ratio, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
+            store_start = q0 + aiv_id * SPARSE_VF_FUSED_AIV_HEAD_TILE
+            normalized_0 = pl.row_expand_mul(numerator_0, multiplier)
+            result_0 = pl.cast(normalized_0, pl.BF16, mode='rint')
+            valid_result_0 = pl.tile.set_validshape(result_0, valid_heads, 128)
+            pl.tile.store(valid_result_0, [store_start, 0], oflat)
+            normalized_1 = pl.row_expand_mul(numerator_1, multiplier)
+            result_1 = pl.cast(normalized_1, pl.BF16, mode='rint')
+            valid_result_1 = pl.tile.set_validshape(result_1, valid_heads, 128)
+            pl.tile.store(valid_result_1, [store_start, 128], oflat)
+            normalized_2 = pl.row_expand_mul(numerator_2, multiplier)
+            result_2 = pl.cast(normalized_2, pl.BF16, mode='rint')
+            valid_result_2 = pl.tile.set_validshape(result_2, valid_heads, 128)
+            pl.tile.store(valid_result_2, [store_start, 256], oflat)
+            normalized_3 = pl.row_expand_mul(numerator_3, multiplier)
+            result_3 = pl.cast(normalized_3, pl.BF16, mode='rint')
+            valid_result_3 = pl.tile.set_validshape(result_3, valid_heads, 128)
+            pl.tile.store(valid_result_3, [store_start, 384], oflat)
+    return oflat
+
+
+
+@pl.jit.incore(level=pl.Level.CORE_GROUP)
+def sparse_vf_fused_group(
+    qflat: pl.Tensor,
+    window_indices: pl.Tensor,
+    compressed_indices: pl.Tensor,
+    window_flat: pl.Tensor,
+    compressed_flat: pl.Tensor,
+    sink_row: pl.Tensor,
+    oflat: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    compressed_keys: pl.constexpr,
+):
+    oflat = sparse_vf_fused_cube(
+        qflat,
+        window_indices, compressed_indices,
+        window_flat, compressed_flat,
+        sink_row,
+        oflat,
+        num_tokens, compressed_keys=compressed_keys,
+    )
+    oflat = sparse_vf_fused_vector(
+        qflat,
+        window_indices, compressed_indices,
+        window_flat, compressed_flat,
+        sink_row,
+        oflat,
+        num_tokens, compressed_keys=compressed_keys,
+    )
+    return oflat
+
+
+
 @pl.jit.inline(auto_scope=False)
 def gather_sparse_attention_pypto(
     query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
@@ -1752,20 +2374,50 @@ def gather_sparse_attention_pypto(
     source_ready: pl.Scalar[pl.TASK_ID],
     compressed_keys: pl.constexpr,
 ):
-    """Decode packed FP8/FP4 caches to GM and attend by token and head tile."""
-    keys = WINDOW_KEYS + compressed_keys
-    active_rows = pl.max(1, num_tokens)
-    rows = active_rows * keys
-    decoded = pl.create_tensor([rows, HEAD_DIM], dtype=pl.BF16)
-    selected_ids = pl.create_tensor([active_rows, keys], dtype=pl.INT32)
-    gathered = sparse_vf_decode_pypto(
-        window_indices, window, compressed_indices, compressed, decoded, selected_ids,
-        num_tokens, source_ready, compressed_keys=compressed_keys,
-    )
-    return sparse_vf_attend_pypto(
-        query, decoded, selected_ids, sink, output, num_tokens, gathered,
-        compressed_keys=compressed_keys,
-    )
+    """Fuse packed-cache decoding and attention; keep single-part SWA scheduling."""
+    attended = pl.system.task_invalid()
+    if compressed_keys > 0 and LOCAL_H >= 32:
+        window_rows = pl.tensor.dim(window, 0) * 128
+        window_flat = pl.reshape(window, [window_rows, WINDOW_CACHE_BYTES])
+        compressed_rows = pl.tensor.dim(compressed, 0) * 128
+        compressed_flat = pl.reshape(compressed, [compressed_rows, COMPRESSED_CACHE_BYTES])
+        tokens = pl.tensor.dim(query, 0)
+        qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
+        oflat = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
+        sink_row = pl.reshape(sink, [1, LOCAL_H])
+        workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), WORKERS)
+        workers = pl.max(1, workers)
+        with pl.spmd(workers, name_hint='sparse_vf_fused', deps=[source_ready]) as fused:
+            sparse_vf_fused_group(
+                qflat,
+                window_indices, compressed_indices,
+                window_flat, compressed_flat,
+                sink_row,
+                oflat,
+                num_tokens, compressed_keys=compressed_keys,
+            )
+        attended = fused
+    else:
+        keys = WINDOW_KEYS + compressed_keys
+        active_rows = pl.max(1, num_tokens)
+        rows = active_rows * keys
+        decoded = pl.create_tensor([rows, HEAD_DIM], dtype=pl.BF16)
+        selected_ids = pl.create_tensor([active_rows, keys], dtype=pl.INT32)
+        gathered = sparse_vf_decode_pypto(
+            window_indices, window,
+            compressed_indices, compressed,
+            decoded, selected_ids,
+            num_tokens, source_ready, compressed_keys=compressed_keys,
+        )
+        attended = sparse_vf_attend_pypto(
+            query,
+            decoded, selected_ids,
+            sink,
+            output,
+            num_tokens, gathered, compressed_keys=compressed_keys,
+        )
+    return attended
+
 
 
 @pl.jit.inline(auto_scope=False)
