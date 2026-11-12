@@ -22,9 +22,7 @@ from config import (
     WINDOW_CACHE_BYTES, CMP_BLOCKS_DYN, COMPRESSED_CACHE_BYTES,
 )
 from compressor import c2a_compressor_project, c2a_compressor_publish, STATE_WIDTH
-from hc import (
-    golden_hc_head_norm, golden_hc_mixes, golden_hc_post, hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding,
-)
+from hc import hc_pre, hc_normalize, golden_hc_head_norm, golden_hc_mixes, golden_hc_post, zero_bf16_padding
 from o_proj import o_proj_hc_post, retire_prefill_signals
 from prefill_c1a_full import (
     compressed_prefill_shapes, make_compressed_prefill_initializer, compare_compressed_topk,
@@ -134,9 +132,13 @@ def prefill_c2a_full(
     q_capacity = pl.tensor.dim(hc_input, 0)
     post_mix = pl.create_tensor([q_capacity, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([q_capacity, HC_MULT, HC_MULT], dtype=pl.FP32)
-    normalized_ready = hc_head_norm(hc_input, hc_pre_mix, w_attn_norm, kv_hidden, worker_limit=64)
-    inv_rms, partials = hc_project(hc_input, hc_attn_fn, rms_worker_limit=64)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, hc_next_pre_mix, post_mix, residual_mix)
+    hc_collapsed = pl.create_tensor([q_capacity, D], dtype=pl.BF16)
+    hc_pre(
+        hc_input, hc_pre_mix,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        hc_collapsed, hc_next_pre_mix, post_mix, residual_mix,
+    )
+    normalized_ready = hc_normalize(hc_collapsed, w_attn_norm, kv_hidden, q_capacity)
     zero_bf16_padding(kv_hidden, kv_token_count)
     if kv_token_count > 0:
         kv_capacity = pl.tensor.dim(kv_hidden, 0)
@@ -539,9 +541,13 @@ def prefill_c2a_full_cp(
     q_hidden = pl.create_tensor([q_capacity, D], dtype=pl.BF16)
     post_mix = pl.create_tensor([q_capacity, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([q_capacity, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_head_norm(hc_input, hc_pre_mix, w_attn_norm, q_hidden, worker_limit=64)
-    inv_rms, partials = hc_project(hc_input, hc_attn_fn, rms_worker_limit=64)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, hc_next_pre_mix, post_mix, residual_mix)
+    hc_collapsed = pl.create_tensor([q_capacity, D], dtype=pl.BF16)
+    hc_pre(
+        hc_input, hc_pre_mix,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        hc_collapsed, hc_next_pre_mix, post_mix, residual_mix,
+    )
+    hc_normalize(hc_collapsed, w_attn_norm, q_hidden, q_capacity)
     zero_bf16_padding(q_hidden, q_token_count)
     kv_hidden, gathered = prefill_cp_input_allgather(
         q_hidden, cp_hidden_window, cp_hidden_arrived, kv_restore_indices, kv_hidden,

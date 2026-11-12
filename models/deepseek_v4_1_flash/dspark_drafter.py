@@ -27,7 +27,7 @@ from config import (
     WINDOW_CACHE_BYTES,
 )
 from rmsnorm import golden_rms_norm_tiled, rms_norm_tiled
-from hc import hc_head, hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
+from hc import hc_pre, hc_normalize, hc_head, zero_bf16_padding
 from expert_routed import (
     MX_PACKED_LANE_COLS,
     MX_W1_PACKED_ROWS,
@@ -366,9 +366,13 @@ def draft_layer(
     attention_pre_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     post_mix = pl.create_tensor([MOE_TOKENS, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([MOE_TOKENS, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, normalized_attention, worker_limit=64)
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
+    hc_collapsed = pl.create_tensor([MOE_TOKENS, D], dtype=pl.BF16)
+    hc_pre(
+        x_hc, incoming_pre_mix,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        hc_collapsed, attention_pre_mix, post_mix, residual_mix,
+    )
+    hc_normalize(hc_collapsed, attn_norm_weight, normalized_attention, MOE_TOKENS)
     zero_bf16_padding(normalized_attention, num_tokens)
     attended, window_cache = dspark_attention_partial(
         normalized_attention,
