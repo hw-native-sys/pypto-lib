@@ -119,7 +119,7 @@ SPARSE_VF_REG_TILE = 128
 SPARSE_VF_FUSED_HEAD_TILE = min(64, LOCAL_H)
 SPARSE_VF_FUSED_CUBE_HEAD_TILE = max(16, SPARSE_VF_FUSED_HEAD_TILE)
 SPARSE_VF_FUSED_AIV_HEAD_TILE = SPARSE_VF_FUSED_CUBE_HEAD_TILE // 2
-SPARSE_VF_FUSED_GATHER_TILE = 32
+SPARSE_VF_FUSED_GATHER_TILE = 16
 SPARSE_VF_FUSED_SCALE_TILE = 8
 
 # Sparse VF packed-cache layout.
@@ -1893,178 +1893,671 @@ def sparse_vf_fused_vector(
         for prefetch_part in pl.range(pl.min(parts, 2)):
             column = prefetch_part * SPARSE_VF_KEY_TILE
             kv_half = pl.tile.create([SPARSE_VF_KEY_TILE // 2, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
-            for key_offset in pl.range(0, SPARSE_VF_KEY_TILE // 2, SPARSE_VF_FUSED_GATHER_TILE):
-                first_key = column + aiv_id * (SPARSE_VF_KEY_TILE // 2) + key_offset
-                if compressed_keys > 0:
-                    if column < WINDOW_KEYS:
-                        gather_ids = pl.tile.load(window_indices, [token, first_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
-                        fw_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                        # Gather contiguous rows in one DMA.
-                        fw_first = pl.tile.read(gather_ids, [0, 0])
-                        fw_contiguous = pl.cast(0, pl.INT32)
-                        if fw_first >= 0:
-                            fw_contiguous = pl.cast(1, pl.INT32)
-                            for fw_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                                fw_check_row = pl.tile.read(gather_ids, [0, fw_check_lane])
-                                if fw_check_row != fw_first + fw_check_lane:
-                                    fw_contiguous = pl.cast(0, pl.INT32)
-                        if fw_contiguous != 0:
-                            fw_start = pl.cast(fw_first, pl.INDEX)
-                            fw_raw = pl.tile.gather_row(fw_raw, window_flat, [0, 0], [fw_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
-                        else:
-                            for fw_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                                fw_a = pl.tile.read(gather_ids, [0, fw_lane])
-                                fw_b = pl.tile.read(gather_ids, [0, fw_lane + 1])
-                                fw_lower = pl.min(fw_a, fw_b)
-                                fw_upper = pl.max(fw_a, fw_b)
-                                fw_pair = pl.cast(0, pl.INT32)
-                                if fw_lower >= 0:
-                                    if fw_upper == fw_lower + 1:
-                                        fw_pair = pl.cast(1, pl.INT32)
-                                if fw_pair != 0:
-                                    # Sort each pair of valid row indices.
-                                    fw_physical = pl.cast(fw_lower, pl.INDEX)
-                                    fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical, 0], [2, WINDOW_CACHE_BYTES])
-                                else:
-                                    if fw_a >= 0:
-                                        fw_physical_a = pl.cast(fw_a, pl.INDEX)
-                                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical_a, 0], [1, WINDOW_CACHE_BYTES])
-                                    if fw_b >= 0:
-                                        fw_physical_b = pl.cast(fw_b, pl.INDEX)
-                                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane + 1, 0], [fw_physical_b, 0], [1, WINDOW_CACHE_BYTES])
-                        for fw_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
-                            fw_cast_row0 = fw_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
-                            fw_raw_chunk = pl.tile.slice(fw_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fw_cast_row0, 0])
-                            fw_signed = pl.reinterpret_view(fw_raw_chunk, pl.INT8)
-                            fw_packed = pl.reinterpret_view(fw_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
-                            fw_codes = fw_packed[:, :HEAD_DIM]
-                            fw_values_fp32 = pl.cast(fw_codes, pl.FP32)
-                            fw_values = pl.cast(fw_values_fp32, pl.BF16, mode='rint')
-                            fw_bits = pl.reinterpret_view(fw_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                            fw_scales = pl.reinterpret_view(fw_bits, pl.BF16)
-                            fw_scale_view = fw_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                            fw_dense_scales = pl.tile.move(fw_scale_view, pl.MemorySpace.Vec)
-                            fw_value_flat = pl.tile.reshape(fw_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fw_scale_row = pl.tile.reshape(fw_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                            fw_scale_bits = pl.tile.reinterpret_view(fw_scale_row, pl.INT16)
-                            fw_duplicated_bits = pl.tile.gather(fw_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                            fw_expanded_bits = pl.tile.gather(fw_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                            fw_expanded = pl.tile.reinterpret_view(fw_expanded_bits, pl.BF16)
-                            fw_scaled_flat = pl.col_expand_mul(fw_value_flat, fw_expanded)
-                            fw_result = pl.tile.reshape(fw_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fw_result, [key_offset + fw_cast_row0, 0])
-                    else:
-                        compressed_key = first_key - WINDOW_KEYS
-                        gather_ids = pl.tile.load(compressed_indices, [token, compressed_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
-                        fc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                        # Gather contiguous rows in one DMA.
-                        fc_first = pl.tile.read(gather_ids, [0, 0])
-                        fc_contiguous = pl.cast(0, pl.INT32)
-                        if fc_first >= 0:
-                            fc_contiguous = pl.cast(1, pl.INT32)
-                            for fc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                                fc_check_row = pl.tile.read(gather_ids, [0, fc_check_lane])
-                                if fc_check_row != fc_first + fc_check_lane:
-                                    fc_contiguous = pl.cast(0, pl.INT32)
-                        if fc_contiguous != 0:
-                            fc_start = pl.cast(fc_first, pl.INDEX)
-                            fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [0, 0], [fc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
-                        else:
-                            for fc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                                fc_a = pl.tile.read(gather_ids, [0, fc_lane])
-                                fc_b = pl.tile.read(gather_ids, [0, fc_lane + 1])
-                                fc_lower = pl.min(fc_a, fc_b)
-                                fc_upper = pl.max(fc_a, fc_b)
-                                fc_pair = pl.cast(0, pl.INT32)
-                                if fc_lower >= 0:
-                                    if fc_upper == fc_lower + 1:
-                                        fc_pair = pl.cast(1, pl.INT32)
-                                if fc_pair != 0:
-                                    # Sort each pair of valid row indices.
-                                    fc_physical = pl.cast(fc_lower, pl.INDEX)
-                                    fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane, 0], [fc_physical, 0], [2, COMPRESSED_CACHE_BYTES])
-                                else:
-                                    if fc_a >= 0:
-                                        fc_physical_a = pl.cast(fc_a, pl.INDEX)
-                                        fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane, 0], [fc_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
-                                    if fc_b >= 0:
-                                        fc_physical_b = pl.cast(fc_b, pl.INDEX)
-                                        fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane + 1, 0], [fc_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
-                        for fc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
-                            fc_cast_row0 = fc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
-                            fc_raw_chunk = pl.tile.slice(fc_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fc_cast_row0, 0])
-                            fc_packed = pl.reinterpret_view(fc_raw_chunk, pl.FP4E2M1X2)
-                            fc_codes = fc_packed[:, :SPARSE_VF_HALF_DIM]
-                            fc_values = pl.cast(fc_codes, pl.BF16)
-                            fc_bits = pl.reinterpret_view(fc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                            fc_scales = pl.reinterpret_view(fc_bits, pl.BF16)
-                            fc_scale_view = fc_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                            fc_dense_scales = pl.tile.move(fc_scale_view, pl.MemorySpace.Vec)
-                            fc_value_flat = pl.tile.reshape(fc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fc_scale_row = pl.tile.reshape(fc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
-                            fc_scale_bits = pl.tile.reinterpret_view(fc_scale_row, pl.INT16)
-                            fc_expanded_bits = pl.tile.gather(fc_scale_bits, scale_c_indices, scale_gather_tmp)
-                            fc_expanded = pl.tile.reinterpret_view(fc_expanded_bits, pl.BF16)
-                            fc_scaled_flat = pl.col_expand_mul(fc_value_flat, fc_expanded)
-                            fc_result = pl.tile.reshape(fc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fc_result, [key_offset + fc_cast_row0, 0])
-                else:
-                    gather_ids = pl.tile.load(window_indices, [token, first_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
-                    fw_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+            first_key_base = column + aiv_id * (SPARSE_VF_KEY_TILE // 2)
+            if compressed_keys > 0:
+                if column < WINDOW_KEYS:
+                    ids_fwa = pl.tile.load(window_indices, [token, first_key_base + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    ids_fwb = pl.tile.load(window_indices, [token, first_key_base + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    fwa_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                     # Gather contiguous rows in one DMA.
-                    fw_first = pl.tile.read(gather_ids, [0, 0])
-                    fw_contiguous = pl.cast(0, pl.INT32)
-                    if fw_first >= 0:
-                        fw_contiguous = pl.cast(1, pl.INT32)
-                        for fw_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                            fw_check_row = pl.tile.read(gather_ids, [0, fw_check_lane])
-                            if fw_check_row != fw_first + fw_check_lane:
-                                fw_contiguous = pl.cast(0, pl.INT32)
-                    if fw_contiguous != 0:
-                        fw_start = pl.cast(fw_first, pl.INDEX)
-                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [0, 0], [fw_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                    fwa_first = pl.tile.read(ids_fwa, [0, 0])
+                    fwa_contiguous = pl.cast(0, pl.INT32)
+                    if fwa_first >= 0:
+                        fwa_contiguous = pl.cast(1, pl.INT32)
+                        for fwa_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fwa_check_row = pl.tile.read(ids_fwa, [0, fwa_check_lane])
+                            if fwa_check_row != fwa_first + fwa_check_lane:
+                                fwa_contiguous = pl.cast(0, pl.INT32)
+                    if fwa_contiguous != 0:
+                        fwa_start = pl.cast(fwa_first, pl.INDEX)
+                        fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [0, 0], [fwa_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
                     else:
-                        for fw_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                            fw_a = pl.tile.read(gather_ids, [0, fw_lane])
-                            fw_b = pl.tile.read(gather_ids, [0, fw_lane + 1])
-                            fw_lower = pl.min(fw_a, fw_b)
-                            fw_upper = pl.max(fw_a, fw_b)
-                            fw_pair = pl.cast(0, pl.INT32)
-                            if fw_lower >= 0:
-                                if fw_upper == fw_lower + 1:
-                                    fw_pair = pl.cast(1, pl.INT32)
-                            if fw_pair != 0:
+                        for fwa_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fwa_a = pl.tile.read(ids_fwa, [0, fwa_lane])
+                            fwa_b = pl.tile.read(ids_fwa, [0, fwa_lane + 1])
+                            fwa_lower = pl.min(fwa_a, fwa_b)
+                            fwa_upper = pl.max(fwa_a, fwa_b)
+                            fwa_pair = pl.cast(0, pl.INT32)
+                            if fwa_lower >= 0:
+                                if fwa_upper == fwa_lower + 1:
+                                    fwa_pair = pl.cast(1, pl.INT32)
+                            if fwa_pair != 0:
                                 # Sort each pair of valid row indices.
-                                fw_physical = pl.cast(fw_lower, pl.INDEX)
-                                fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical, 0], [2, WINDOW_CACHE_BYTES])
+                                fwa_physical = pl.cast(fwa_lower, pl.INDEX)
+                                fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane, 0], [fwa_physical, 0], [2, WINDOW_CACHE_BYTES])
                             else:
-                                if fw_a >= 0:
-                                    fw_physical_a = pl.cast(fw_a, pl.INDEX)
-                                    fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical_a, 0], [1, WINDOW_CACHE_BYTES])
-                                if fw_b >= 0:
-                                    fw_physical_b = pl.cast(fw_b, pl.INDEX)
-                                    fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane + 1, 0], [fw_physical_b, 0], [1, WINDOW_CACHE_BYTES])
-                    for fw_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
-                        fw_cast_row0 = fw_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
-                        fw_raw_chunk = pl.tile.slice(fw_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fw_cast_row0, 0])
-                        fw_signed = pl.reinterpret_view(fw_raw_chunk, pl.INT8)
-                        fw_packed = pl.reinterpret_view(fw_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
-                        fw_codes = fw_packed[:, :HEAD_DIM]
-                        fw_values_fp32 = pl.cast(fw_codes, pl.FP32)
-                        fw_values = pl.cast(fw_values_fp32, pl.BF16, mode='rint')
-                        fw_bits = pl.reinterpret_view(fw_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                        fw_scales = pl.reinterpret_view(fw_bits, pl.BF16)
-                        fw_scale_view = fw_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                        fw_dense_scales = pl.tile.move(fw_scale_view, pl.MemorySpace.Vec)
-                        fw_value_flat = pl.tile.reshape(fw_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                        fw_scale_row = pl.tile.reshape(fw_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                        fw_scale_bits = pl.tile.reinterpret_view(fw_scale_row, pl.INT16)
-                        fw_duplicated_bits = pl.tile.gather(fw_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                        fw_expanded_bits = pl.tile.gather(fw_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                        fw_expanded = pl.tile.reinterpret_view(fw_expanded_bits, pl.BF16)
-                        fw_scaled_flat = pl.col_expand_mul(fw_value_flat, fw_expanded)
-                        fw_result = pl.tile.reshape(fw_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                        kv_half = pl.tile.assemble(kv_half, fw_result, [key_offset + fw_cast_row0, 0])
+                                if fwa_a >= 0:
+                                    fwa_physical_a = pl.cast(fwa_a, pl.INDEX)
+                                    fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane, 0], [fwa_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                if fwa_b >= 0:
+                                    fwa_physical_b = pl.cast(fwa_b, pl.INDEX)
+                                    fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane + 1, 0], [fwa_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                    fwb_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fwb_first = pl.tile.read(ids_fwb, [0, 0])
+                    fwb_contiguous = pl.cast(0, pl.INT32)
+                    if fwb_first >= 0:
+                        fwb_contiguous = pl.cast(1, pl.INT32)
+                        for fwb_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fwb_check_row = pl.tile.read(ids_fwb, [0, fwb_check_lane])
+                            if fwb_check_row != fwb_first + fwb_check_lane:
+                                fwb_contiguous = pl.cast(0, pl.INT32)
+                    if fwb_contiguous != 0:
+                        fwb_start = pl.cast(fwb_first, pl.INDEX)
+                        fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [0, 0], [fwb_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                    else:
+                        for fwb_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fwb_a = pl.tile.read(ids_fwb, [0, fwb_lane])
+                            fwb_b = pl.tile.read(ids_fwb, [0, fwb_lane + 1])
+                            fwb_lower = pl.min(fwb_a, fwb_b)
+                            fwb_upper = pl.max(fwb_a, fwb_b)
+                            fwb_pair = pl.cast(0, pl.INT32)
+                            if fwb_lower >= 0:
+                                if fwb_upper == fwb_lower + 1:
+                                    fwb_pair = pl.cast(1, pl.INT32)
+                            if fwb_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fwb_physical = pl.cast(fwb_lower, pl.INDEX)
+                                fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane, 0], [fwb_physical, 0], [2, WINDOW_CACHE_BYTES])
+                            else:
+                                if fwb_a >= 0:
+                                    fwb_physical_a = pl.cast(fwb_a, pl.INDEX)
+                                    fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane, 0], [fwb_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                if fwb_b >= 0:
+                                    fwb_physical_b = pl.cast(fwb_b, pl.INDEX)
+                                    fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane + 1, 0], [fwb_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                    for fwa_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fwa_cast_row0 = fwa_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fwa_raw_chunk = pl.tile.slice(fwa_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwa_cast_row0, 0])
+                        fwa_signed = pl.reinterpret_view(fwa_raw_chunk, pl.INT8)
+                        fwa_packed = pl.reinterpret_view(fwa_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                        fwa_codes = fwa_packed[:, :HEAD_DIM]
+                        fwa_values_fp32 = pl.cast(fwa_codes, pl.FP32)
+                        fwa_values = pl.cast(fwa_values_fp32, pl.BF16, mode='rint')
+                        fwa_bits = pl.reinterpret_view(fwa_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwa_scales = pl.reinterpret_view(fwa_bits, pl.BF16)
+                        fwa_scale_view = fwa_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                        fwa_dense_scales = pl.tile.move(fwa_scale_view, pl.MemorySpace.Vec)
+                        fwa_value_flat = pl.tile.reshape(fwa_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwa_scale_row = pl.tile.reshape(fwa_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                        fwa_scale_bits = pl.tile.reinterpret_view(fwa_scale_row, pl.INT16)
+                        fwa_duplicated_bits = pl.tile.gather(fwa_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                        fwa_expanded_bits = pl.tile.gather(fwa_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                        fwa_expanded = pl.tile.reinterpret_view(fwa_expanded_bits, pl.BF16)
+                        fwa_scaled_flat = pl.col_expand_mul(fwa_value_flat, fwa_expanded)
+                        fwa_result = pl.tile.reshape(fwa_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fwa_result, [0 + fwa_cast_row0, 0])
+                    ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fwc_first = pl.tile.read(ids_fwc, [0, 0])
+                    fwc_contiguous = pl.cast(0, pl.INT32)
+                    if fwc_first >= 0:
+                        fwc_contiguous = pl.cast(1, pl.INT32)
+                        for fwc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fwc_check_row = pl.tile.read(ids_fwc, [0, fwc_check_lane])
+                            if fwc_check_row != fwc_first + fwc_check_lane:
+                                fwc_contiguous = pl.cast(0, pl.INT32)
+                    if fwc_contiguous != 0:
+                        fwc_start = pl.cast(fwc_first, pl.INDEX)
+                        fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [0, 0], [fwc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                    else:
+                        for fwc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fwc_a = pl.tile.read(ids_fwc, [0, fwc_lane])
+                            fwc_b = pl.tile.read(ids_fwc, [0, fwc_lane + 1])
+                            fwc_lower = pl.min(fwc_a, fwc_b)
+                            fwc_upper = pl.max(fwc_a, fwc_b)
+                            fwc_pair = pl.cast(0, pl.INT32)
+                            if fwc_lower >= 0:
+                                if fwc_upper == fwc_lower + 1:
+                                    fwc_pair = pl.cast(1, pl.INT32)
+                            if fwc_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fwc_physical = pl.cast(fwc_lower, pl.INDEX)
+                                fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane, 0], [fwc_physical, 0], [2, WINDOW_CACHE_BYTES])
+                            else:
+                                if fwc_a >= 0:
+                                    fwc_physical_a = pl.cast(fwc_a, pl.INDEX)
+                                    fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane, 0], [fwc_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                if fwc_b >= 0:
+                                    fwc_physical_b = pl.cast(fwc_b, pl.INDEX)
+                                    fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane + 1, 0], [fwc_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                    for fwb_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fwb_cast_row0 = fwb_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fwb_raw_chunk = pl.tile.slice(fwb_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwb_cast_row0, 0])
+                        fwb_signed = pl.reinterpret_view(fwb_raw_chunk, pl.INT8)
+                        fwb_packed = pl.reinterpret_view(fwb_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                        fwb_codes = fwb_packed[:, :HEAD_DIM]
+                        fwb_values_fp32 = pl.cast(fwb_codes, pl.FP32)
+                        fwb_values = pl.cast(fwb_values_fp32, pl.BF16, mode='rint')
+                        fwb_bits = pl.reinterpret_view(fwb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwb_scales = pl.reinterpret_view(fwb_bits, pl.BF16)
+                        fwb_scale_view = fwb_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                        fwb_dense_scales = pl.tile.move(fwb_scale_view, pl.MemorySpace.Vec)
+                        fwb_value_flat = pl.tile.reshape(fwb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwb_scale_row = pl.tile.reshape(fwb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                        fwb_scale_bits = pl.tile.reinterpret_view(fwb_scale_row, pl.INT16)
+                        fwb_duplicated_bits = pl.tile.gather(fwb_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                        fwb_expanded_bits = pl.tile.gather(fwb_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                        fwb_expanded = pl.tile.reinterpret_view(fwb_expanded_bits, pl.BF16)
+                        fwb_scaled_flat = pl.col_expand_mul(fwb_value_flat, fwb_expanded)
+                        fwb_result = pl.tile.reshape(fwb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fwb_result, [16 + fwb_cast_row0, 0])
+                    ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    fwd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fwd_first = pl.tile.read(ids_fwd, [0, 0])
+                    fwd_contiguous = pl.cast(0, pl.INT32)
+                    if fwd_first >= 0:
+                        fwd_contiguous = pl.cast(1, pl.INT32)
+                        for fwd_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fwd_check_row = pl.tile.read(ids_fwd, [0, fwd_check_lane])
+                            if fwd_check_row != fwd_first + fwd_check_lane:
+                                fwd_contiguous = pl.cast(0, pl.INT32)
+                    if fwd_contiguous != 0:
+                        fwd_start = pl.cast(fwd_first, pl.INDEX)
+                        fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [0, 0], [fwd_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                    else:
+                        for fwd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fwd_a = pl.tile.read(ids_fwd, [0, fwd_lane])
+                            fwd_b = pl.tile.read(ids_fwd, [0, fwd_lane + 1])
+                            fwd_lower = pl.min(fwd_a, fwd_b)
+                            fwd_upper = pl.max(fwd_a, fwd_b)
+                            fwd_pair = pl.cast(0, pl.INT32)
+                            if fwd_lower >= 0:
+                                if fwd_upper == fwd_lower + 1:
+                                    fwd_pair = pl.cast(1, pl.INT32)
+                            if fwd_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fwd_physical = pl.cast(fwd_lower, pl.INDEX)
+                                fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane, 0], [fwd_physical, 0], [2, WINDOW_CACHE_BYTES])
+                            else:
+                                if fwd_a >= 0:
+                                    fwd_physical_a = pl.cast(fwd_a, pl.INDEX)
+                                    fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane, 0], [fwd_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                if fwd_b >= 0:
+                                    fwd_physical_b = pl.cast(fwd_b, pl.INDEX)
+                                    fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane + 1, 0], [fwd_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                    for fwc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fwc_cast_row0 = fwc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fwc_raw_chunk = pl.tile.slice(fwc_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwc_cast_row0, 0])
+                        fwc_signed = pl.reinterpret_view(fwc_raw_chunk, pl.INT8)
+                        fwc_packed = pl.reinterpret_view(fwc_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                        fwc_codes = fwc_packed[:, :HEAD_DIM]
+                        fwc_values_fp32 = pl.cast(fwc_codes, pl.FP32)
+                        fwc_values = pl.cast(fwc_values_fp32, pl.BF16, mode='rint')
+                        fwc_bits = pl.reinterpret_view(fwc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwc_scales = pl.reinterpret_view(fwc_bits, pl.BF16)
+                        fwc_scale_view = fwc_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                        fwc_dense_scales = pl.tile.move(fwc_scale_view, pl.MemorySpace.Vec)
+                        fwc_value_flat = pl.tile.reshape(fwc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwc_scale_row = pl.tile.reshape(fwc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                        fwc_scale_bits = pl.tile.reinterpret_view(fwc_scale_row, pl.INT16)
+                        fwc_duplicated_bits = pl.tile.gather(fwc_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                        fwc_expanded_bits = pl.tile.gather(fwc_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                        fwc_expanded = pl.tile.reinterpret_view(fwc_expanded_bits, pl.BF16)
+                        fwc_scaled_flat = pl.col_expand_mul(fwc_value_flat, fwc_expanded)
+                        fwc_result = pl.tile.reshape(fwc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fwc_result, [32 + fwc_cast_row0, 0])
+                    for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
+                        fwd_signed = pl.reinterpret_view(fwd_raw_chunk, pl.INT8)
+                        fwd_packed = pl.reinterpret_view(fwd_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                        fwd_codes = fwd_packed[:, :HEAD_DIM]
+                        fwd_values_fp32 = pl.cast(fwd_codes, pl.FP32)
+                        fwd_values = pl.cast(fwd_values_fp32, pl.BF16, mode='rint')
+                        fwd_bits = pl.reinterpret_view(fwd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwd_scales = pl.reinterpret_view(fwd_bits, pl.BF16)
+                        fwd_scale_view = fwd_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                        fwd_dense_scales = pl.tile.move(fwd_scale_view, pl.MemorySpace.Vec)
+                        fwd_value_flat = pl.tile.reshape(fwd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwd_scale_row = pl.tile.reshape(fwd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                        fwd_scale_bits = pl.tile.reinterpret_view(fwd_scale_row, pl.INT16)
+                        fwd_duplicated_bits = pl.tile.gather(fwd_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                        fwd_expanded_bits = pl.tile.gather(fwd_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                        fwd_expanded = pl.tile.reinterpret_view(fwd_expanded_bits, pl.BF16)
+                        fwd_scaled_flat = pl.col_expand_mul(fwd_value_flat, fwd_expanded)
+                        fwd_result = pl.tile.reshape(fwd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fwd_result, [48 + fwd_cast_row0, 0])
+                else:
+                    ids_fca = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    ids_fcb = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    fca_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fca_first = pl.tile.read(ids_fca, [0, 0])
+                    fca_contiguous = pl.cast(0, pl.INT32)
+                    if fca_first >= 0:
+                        fca_contiguous = pl.cast(1, pl.INT32)
+                        for fca_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fca_check_row = pl.tile.read(ids_fca, [0, fca_check_lane])
+                            if fca_check_row != fca_first + fca_check_lane:
+                                fca_contiguous = pl.cast(0, pl.INT32)
+                    if fca_contiguous != 0:
+                        fca_start = pl.cast(fca_first, pl.INDEX)
+                        fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [0, 0], [fca_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
+                    else:
+                        for fca_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fca_a = pl.tile.read(ids_fca, [0, fca_lane])
+                            fca_b = pl.tile.read(ids_fca, [0, fca_lane + 1])
+                            fca_lower = pl.min(fca_a, fca_b)
+                            fca_upper = pl.max(fca_a, fca_b)
+                            fca_pair = pl.cast(0, pl.INT32)
+                            if fca_lower >= 0:
+                                if fca_upper == fca_lower + 1:
+                                    fca_pair = pl.cast(1, pl.INT32)
+                            if fca_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fca_physical = pl.cast(fca_lower, pl.INDEX)
+                                fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                            else:
+                                if fca_a >= 0:
+                                    fca_physical_a = pl.cast(fca_a, pl.INDEX)
+                                    fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                if fca_b >= 0:
+                                    fca_physical_b = pl.cast(fca_b, pl.INDEX)
+                                    fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane + 1, 0], [fca_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                    fcb_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fcb_first = pl.tile.read(ids_fcb, [0, 0])
+                    fcb_contiguous = pl.cast(0, pl.INT32)
+                    if fcb_first >= 0:
+                        fcb_contiguous = pl.cast(1, pl.INT32)
+                        for fcb_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fcb_check_row = pl.tile.read(ids_fcb, [0, fcb_check_lane])
+                            if fcb_check_row != fcb_first + fcb_check_lane:
+                                fcb_contiguous = pl.cast(0, pl.INT32)
+                    if fcb_contiguous != 0:
+                        fcb_start = pl.cast(fcb_first, pl.INDEX)
+                        fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [0, 0], [fcb_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
+                    else:
+                        for fcb_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fcb_a = pl.tile.read(ids_fcb, [0, fcb_lane])
+                            fcb_b = pl.tile.read(ids_fcb, [0, fcb_lane + 1])
+                            fcb_lower = pl.min(fcb_a, fcb_b)
+                            fcb_upper = pl.max(fcb_a, fcb_b)
+                            fcb_pair = pl.cast(0, pl.INT32)
+                            if fcb_lower >= 0:
+                                if fcb_upper == fcb_lower + 1:
+                                    fcb_pair = pl.cast(1, pl.INT32)
+                            if fcb_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fcb_physical = pl.cast(fcb_lower, pl.INDEX)
+                                fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                            else:
+                                if fcb_a >= 0:
+                                    fcb_physical_a = pl.cast(fcb_a, pl.INDEX)
+                                    fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                if fcb_b >= 0:
+                                    fcb_physical_b = pl.cast(fcb_b, pl.INDEX)
+                                    fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane + 1, 0], [fcb_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                    for fca_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fca_cast_row0 = fca_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fca_raw_chunk = pl.tile.slice(fca_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fca_cast_row0, 0])
+                        fca_packed = pl.reinterpret_view(fca_raw_chunk, pl.FP4E2M1X2)
+                        fca_codes = fca_packed[:, :SPARSE_VF_HALF_DIM]
+                        fca_values = pl.cast(fca_codes, pl.BF16)
+                        fca_bits = pl.reinterpret_view(fca_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fca_scales = pl.reinterpret_view(fca_bits, pl.BF16)
+                        fca_scale_view = fca_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                        fca_dense_scales = pl.tile.move(fca_scale_view, pl.MemorySpace.Vec)
+                        fca_value_flat = pl.tile.reshape(fca_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fca_scale_row = pl.tile.reshape(fca_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
+                        fca_scale_bits = pl.tile.reinterpret_view(fca_scale_row, pl.INT16)
+                        fca_expanded_bits = pl.tile.gather(fca_scale_bits, scale_c_indices, scale_gather_tmp)
+                        fca_expanded = pl.tile.reinterpret_view(fca_expanded_bits, pl.BF16)
+                        fca_scaled_flat = pl.col_expand_mul(fca_value_flat, fca_expanded)
+                        fca_result = pl.tile.reshape(fca_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fca_result, [0 + fca_cast_row0, 0])
+                    ids_fcc = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    fcc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fcc_first = pl.tile.read(ids_fcc, [0, 0])
+                    fcc_contiguous = pl.cast(0, pl.INT32)
+                    if fcc_first >= 0:
+                        fcc_contiguous = pl.cast(1, pl.INT32)
+                        for fcc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fcc_check_row = pl.tile.read(ids_fcc, [0, fcc_check_lane])
+                            if fcc_check_row != fcc_first + fcc_check_lane:
+                                fcc_contiguous = pl.cast(0, pl.INT32)
+                    if fcc_contiguous != 0:
+                        fcc_start = pl.cast(fcc_first, pl.INDEX)
+                        fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [0, 0], [fcc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
+                    else:
+                        for fcc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fcc_a = pl.tile.read(ids_fcc, [0, fcc_lane])
+                            fcc_b = pl.tile.read(ids_fcc, [0, fcc_lane + 1])
+                            fcc_lower = pl.min(fcc_a, fcc_b)
+                            fcc_upper = pl.max(fcc_a, fcc_b)
+                            fcc_pair = pl.cast(0, pl.INT32)
+                            if fcc_lower >= 0:
+                                if fcc_upper == fcc_lower + 1:
+                                    fcc_pair = pl.cast(1, pl.INT32)
+                            if fcc_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fcc_physical = pl.cast(fcc_lower, pl.INDEX)
+                                fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                            else:
+                                if fcc_a >= 0:
+                                    fcc_physical_a = pl.cast(fcc_a, pl.INDEX)
+                                    fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                if fcc_b >= 0:
+                                    fcc_physical_b = pl.cast(fcc_b, pl.INDEX)
+                                    fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane + 1, 0], [fcc_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                    for fcb_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fcb_cast_row0 = fcb_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fcb_raw_chunk = pl.tile.slice(fcb_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcb_cast_row0, 0])
+                        fcb_packed = pl.reinterpret_view(fcb_raw_chunk, pl.FP4E2M1X2)
+                        fcb_codes = fcb_packed[:, :SPARSE_VF_HALF_DIM]
+                        fcb_values = pl.cast(fcb_codes, pl.BF16)
+                        fcb_bits = pl.reinterpret_view(fcb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fcb_scales = pl.reinterpret_view(fcb_bits, pl.BF16)
+                        fcb_scale_view = fcb_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                        fcb_dense_scales = pl.tile.move(fcb_scale_view, pl.MemorySpace.Vec)
+                        fcb_value_flat = pl.tile.reshape(fcb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fcb_scale_row = pl.tile.reshape(fcb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
+                        fcb_scale_bits = pl.tile.reinterpret_view(fcb_scale_row, pl.INT16)
+                        fcb_expanded_bits = pl.tile.gather(fcb_scale_bits, scale_c_indices, scale_gather_tmp)
+                        fcb_expanded = pl.tile.reinterpret_view(fcb_expanded_bits, pl.BF16)
+                        fcb_scaled_flat = pl.col_expand_mul(fcb_value_flat, fcb_expanded)
+                        fcb_result = pl.tile.reshape(fcb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fcb_result, [16 + fcb_cast_row0, 0])
+                    ids_fcd = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    fcd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fcd_first = pl.tile.read(ids_fcd, [0, 0])
+                    fcd_contiguous = pl.cast(0, pl.INT32)
+                    if fcd_first >= 0:
+                        fcd_contiguous = pl.cast(1, pl.INT32)
+                        for fcd_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fcd_check_row = pl.tile.read(ids_fcd, [0, fcd_check_lane])
+                            if fcd_check_row != fcd_first + fcd_check_lane:
+                                fcd_contiguous = pl.cast(0, pl.INT32)
+                    if fcd_contiguous != 0:
+                        fcd_start = pl.cast(fcd_first, pl.INDEX)
+                        fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [0, 0], [fcd_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
+                    else:
+                        for fcd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fcd_a = pl.tile.read(ids_fcd, [0, fcd_lane])
+                            fcd_b = pl.tile.read(ids_fcd, [0, fcd_lane + 1])
+                            fcd_lower = pl.min(fcd_a, fcd_b)
+                            fcd_upper = pl.max(fcd_a, fcd_b)
+                            fcd_pair = pl.cast(0, pl.INT32)
+                            if fcd_lower >= 0:
+                                if fcd_upper == fcd_lower + 1:
+                                    fcd_pair = pl.cast(1, pl.INT32)
+                            if fcd_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fcd_physical = pl.cast(fcd_lower, pl.INDEX)
+                                fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                            else:
+                                if fcd_a >= 0:
+                                    fcd_physical_a = pl.cast(fcd_a, pl.INDEX)
+                                    fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                if fcd_b >= 0:
+                                    fcd_physical_b = pl.cast(fcd_b, pl.INDEX)
+                                    fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane + 1, 0], [fcd_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                    for fcc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fcc_cast_row0 = fcc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fcc_raw_chunk = pl.tile.slice(fcc_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcc_cast_row0, 0])
+                        fcc_packed = pl.reinterpret_view(fcc_raw_chunk, pl.FP4E2M1X2)
+                        fcc_codes = fcc_packed[:, :SPARSE_VF_HALF_DIM]
+                        fcc_values = pl.cast(fcc_codes, pl.BF16)
+                        fcc_bits = pl.reinterpret_view(fcc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fcc_scales = pl.reinterpret_view(fcc_bits, pl.BF16)
+                        fcc_scale_view = fcc_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                        fcc_dense_scales = pl.tile.move(fcc_scale_view, pl.MemorySpace.Vec)
+                        fcc_value_flat = pl.tile.reshape(fcc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fcc_scale_row = pl.tile.reshape(fcc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
+                        fcc_scale_bits = pl.tile.reinterpret_view(fcc_scale_row, pl.INT16)
+                        fcc_expanded_bits = pl.tile.gather(fcc_scale_bits, scale_c_indices, scale_gather_tmp)
+                        fcc_expanded = pl.tile.reinterpret_view(fcc_expanded_bits, pl.BF16)
+                        fcc_scaled_flat = pl.col_expand_mul(fcc_value_flat, fcc_expanded)
+                        fcc_result = pl.tile.reshape(fcc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fcc_result, [32 + fcc_cast_row0, 0])
+                    for fcd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fcd_cast_row0 = fcd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fcd_raw_chunk = pl.tile.slice(fcd_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcd_cast_row0, 0])
+                        fcd_packed = pl.reinterpret_view(fcd_raw_chunk, pl.FP4E2M1X2)
+                        fcd_codes = fcd_packed[:, :SPARSE_VF_HALF_DIM]
+                        fcd_values = pl.cast(fcd_codes, pl.BF16)
+                        fcd_bits = pl.reinterpret_view(fcd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                        fcd_scales = pl.reinterpret_view(fcd_bits, pl.BF16)
+                        fcd_scale_view = fcd_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                        fcd_dense_scales = pl.tile.move(fcd_scale_view, pl.MemorySpace.Vec)
+                        fcd_value_flat = pl.tile.reshape(fcd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fcd_scale_row = pl.tile.reshape(fcd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
+                        fcd_scale_bits = pl.tile.reinterpret_view(fcd_scale_row, pl.INT16)
+                        fcd_expanded_bits = pl.tile.gather(fcd_scale_bits, scale_c_indices, scale_gather_tmp)
+                        fcd_expanded = pl.tile.reinterpret_view(fcd_expanded_bits, pl.BF16)
+                        fcd_scaled_flat = pl.col_expand_mul(fcd_value_flat, fcd_expanded)
+                        fcd_result = pl.tile.reshape(fcd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fcd_result, [48 + fcd_cast_row0, 0])
+            else:
+                ids_fwa = pl.tile.load(window_indices, [token, first_key_base + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                ids_fwb = pl.tile.load(window_indices, [token, first_key_base + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                fwa_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                # Gather contiguous rows in one DMA.
+                fwa_first = pl.tile.read(ids_fwa, [0, 0])
+                fwa_contiguous = pl.cast(0, pl.INT32)
+                if fwa_first >= 0:
+                    fwa_contiguous = pl.cast(1, pl.INT32)
+                    for fwa_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                        fwa_check_row = pl.tile.read(ids_fwa, [0, fwa_check_lane])
+                        if fwa_check_row != fwa_first + fwa_check_lane:
+                            fwa_contiguous = pl.cast(0, pl.INT32)
+                if fwa_contiguous != 0:
+                    fwa_start = pl.cast(fwa_first, pl.INDEX)
+                    fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [0, 0], [fwa_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                else:
+                    for fwa_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                        fwa_a = pl.tile.read(ids_fwa, [0, fwa_lane])
+                        fwa_b = pl.tile.read(ids_fwa, [0, fwa_lane + 1])
+                        fwa_lower = pl.min(fwa_a, fwa_b)
+                        fwa_upper = pl.max(fwa_a, fwa_b)
+                        fwa_pair = pl.cast(0, pl.INT32)
+                        if fwa_lower >= 0:
+                            if fwa_upper == fwa_lower + 1:
+                                fwa_pair = pl.cast(1, pl.INT32)
+                        if fwa_pair != 0:
+                            # Sort each pair of valid row indices.
+                            fwa_physical = pl.cast(fwa_lower, pl.INDEX)
+                            fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane, 0], [fwa_physical, 0], [2, WINDOW_CACHE_BYTES])
+                        else:
+                            if fwa_a >= 0:
+                                fwa_physical_a = pl.cast(fwa_a, pl.INDEX)
+                                fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane, 0], [fwa_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                            if fwa_b >= 0:
+                                fwa_physical_b = pl.cast(fwa_b, pl.INDEX)
+                                fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane + 1, 0], [fwa_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                fwb_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                # Gather contiguous rows in one DMA.
+                fwb_first = pl.tile.read(ids_fwb, [0, 0])
+                fwb_contiguous = pl.cast(0, pl.INT32)
+                if fwb_first >= 0:
+                    fwb_contiguous = pl.cast(1, pl.INT32)
+                    for fwb_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                        fwb_check_row = pl.tile.read(ids_fwb, [0, fwb_check_lane])
+                        if fwb_check_row != fwb_first + fwb_check_lane:
+                            fwb_contiguous = pl.cast(0, pl.INT32)
+                if fwb_contiguous != 0:
+                    fwb_start = pl.cast(fwb_first, pl.INDEX)
+                    fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [0, 0], [fwb_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                else:
+                    for fwb_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                        fwb_a = pl.tile.read(ids_fwb, [0, fwb_lane])
+                        fwb_b = pl.tile.read(ids_fwb, [0, fwb_lane + 1])
+                        fwb_lower = pl.min(fwb_a, fwb_b)
+                        fwb_upper = pl.max(fwb_a, fwb_b)
+                        fwb_pair = pl.cast(0, pl.INT32)
+                        if fwb_lower >= 0:
+                            if fwb_upper == fwb_lower + 1:
+                                fwb_pair = pl.cast(1, pl.INT32)
+                        if fwb_pair != 0:
+                            # Sort each pair of valid row indices.
+                            fwb_physical = pl.cast(fwb_lower, pl.INDEX)
+                            fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane, 0], [fwb_physical, 0], [2, WINDOW_CACHE_BYTES])
+                        else:
+                            if fwb_a >= 0:
+                                fwb_physical_a = pl.cast(fwb_a, pl.INDEX)
+                                fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane, 0], [fwb_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                            if fwb_b >= 0:
+                                fwb_physical_b = pl.cast(fwb_b, pl.INDEX)
+                                fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane + 1, 0], [fwb_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                for fwa_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                    fwa_cast_row0 = fwa_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                    fwa_raw_chunk = pl.tile.slice(fwa_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwa_cast_row0, 0])
+                    fwa_signed = pl.reinterpret_view(fwa_raw_chunk, pl.INT8)
+                    fwa_packed = pl.reinterpret_view(fwa_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                    fwa_codes = fwa_packed[:, :HEAD_DIM]
+                    fwa_values_fp32 = pl.cast(fwa_codes, pl.FP32)
+                    fwa_values = pl.cast(fwa_values_fp32, pl.BF16, mode='rint')
+                    fwa_bits = pl.reinterpret_view(fwa_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                    fwa_scales = pl.reinterpret_view(fwa_bits, pl.BF16)
+                    fwa_scale_view = fwa_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                    fwa_dense_scales = pl.tile.move(fwa_scale_view, pl.MemorySpace.Vec)
+                    fwa_value_flat = pl.tile.reshape(fwa_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                    fwa_scale_row = pl.tile.reshape(fwa_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                    fwa_scale_bits = pl.tile.reinterpret_view(fwa_scale_row, pl.INT16)
+                    fwa_duplicated_bits = pl.tile.gather(fwa_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                    fwa_expanded_bits = pl.tile.gather(fwa_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                    fwa_expanded = pl.tile.reinterpret_view(fwa_expanded_bits, pl.BF16)
+                    fwa_scaled_flat = pl.col_expand_mul(fwa_value_flat, fwa_expanded)
+                    fwa_result = pl.tile.reshape(fwa_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                    kv_half = pl.tile.assemble(kv_half, fwa_result, [0 + fwa_cast_row0, 0])
+                ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                # Gather contiguous rows in one DMA.
+                fwc_first = pl.tile.read(ids_fwc, [0, 0])
+                fwc_contiguous = pl.cast(0, pl.INT32)
+                if fwc_first >= 0:
+                    fwc_contiguous = pl.cast(1, pl.INT32)
+                    for fwc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                        fwc_check_row = pl.tile.read(ids_fwc, [0, fwc_check_lane])
+                        if fwc_check_row != fwc_first + fwc_check_lane:
+                            fwc_contiguous = pl.cast(0, pl.INT32)
+                if fwc_contiguous != 0:
+                    fwc_start = pl.cast(fwc_first, pl.INDEX)
+                    fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [0, 0], [fwc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                else:
+                    for fwc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                        fwc_a = pl.tile.read(ids_fwc, [0, fwc_lane])
+                        fwc_b = pl.tile.read(ids_fwc, [0, fwc_lane + 1])
+                        fwc_lower = pl.min(fwc_a, fwc_b)
+                        fwc_upper = pl.max(fwc_a, fwc_b)
+                        fwc_pair = pl.cast(0, pl.INT32)
+                        if fwc_lower >= 0:
+                            if fwc_upper == fwc_lower + 1:
+                                fwc_pair = pl.cast(1, pl.INT32)
+                        if fwc_pair != 0:
+                            # Sort each pair of valid row indices.
+                            fwc_physical = pl.cast(fwc_lower, pl.INDEX)
+                            fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane, 0], [fwc_physical, 0], [2, WINDOW_CACHE_BYTES])
+                        else:
+                            if fwc_a >= 0:
+                                fwc_physical_a = pl.cast(fwc_a, pl.INDEX)
+                                fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane, 0], [fwc_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                            if fwc_b >= 0:
+                                fwc_physical_b = pl.cast(fwc_b, pl.INDEX)
+                                fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane + 1, 0], [fwc_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                for fwb_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                    fwb_cast_row0 = fwb_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                    fwb_raw_chunk = pl.tile.slice(fwb_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwb_cast_row0, 0])
+                    fwb_signed = pl.reinterpret_view(fwb_raw_chunk, pl.INT8)
+                    fwb_packed = pl.reinterpret_view(fwb_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                    fwb_codes = fwb_packed[:, :HEAD_DIM]
+                    fwb_values_fp32 = pl.cast(fwb_codes, pl.FP32)
+                    fwb_values = pl.cast(fwb_values_fp32, pl.BF16, mode='rint')
+                    fwb_bits = pl.reinterpret_view(fwb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                    fwb_scales = pl.reinterpret_view(fwb_bits, pl.BF16)
+                    fwb_scale_view = fwb_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                    fwb_dense_scales = pl.tile.move(fwb_scale_view, pl.MemorySpace.Vec)
+                    fwb_value_flat = pl.tile.reshape(fwb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                    fwb_scale_row = pl.tile.reshape(fwb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                    fwb_scale_bits = pl.tile.reinterpret_view(fwb_scale_row, pl.INT16)
+                    fwb_duplicated_bits = pl.tile.gather(fwb_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                    fwb_expanded_bits = pl.tile.gather(fwb_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                    fwb_expanded = pl.tile.reinterpret_view(fwb_expanded_bits, pl.BF16)
+                    fwb_scaled_flat = pl.col_expand_mul(fwb_value_flat, fwb_expanded)
+                    fwb_result = pl.tile.reshape(fwb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                    kv_half = pl.tile.assemble(kv_half, fwb_result, [16 + fwb_cast_row0, 0])
+                ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                fwd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                # Gather contiguous rows in one DMA.
+                fwd_first = pl.tile.read(ids_fwd, [0, 0])
+                fwd_contiguous = pl.cast(0, pl.INT32)
+                if fwd_first >= 0:
+                    fwd_contiguous = pl.cast(1, pl.INT32)
+                    for fwd_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                        fwd_check_row = pl.tile.read(ids_fwd, [0, fwd_check_lane])
+                        if fwd_check_row != fwd_first + fwd_check_lane:
+                            fwd_contiguous = pl.cast(0, pl.INT32)
+                if fwd_contiguous != 0:
+                    fwd_start = pl.cast(fwd_first, pl.INDEX)
+                    fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [0, 0], [fwd_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                else:
+                    for fwd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                        fwd_a = pl.tile.read(ids_fwd, [0, fwd_lane])
+                        fwd_b = pl.tile.read(ids_fwd, [0, fwd_lane + 1])
+                        fwd_lower = pl.min(fwd_a, fwd_b)
+                        fwd_upper = pl.max(fwd_a, fwd_b)
+                        fwd_pair = pl.cast(0, pl.INT32)
+                        if fwd_lower >= 0:
+                            if fwd_upper == fwd_lower + 1:
+                                fwd_pair = pl.cast(1, pl.INT32)
+                        if fwd_pair != 0:
+                            # Sort each pair of valid row indices.
+                            fwd_physical = pl.cast(fwd_lower, pl.INDEX)
+                            fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane, 0], [fwd_physical, 0], [2, WINDOW_CACHE_BYTES])
+                        else:
+                            if fwd_a >= 0:
+                                fwd_physical_a = pl.cast(fwd_a, pl.INDEX)
+                                fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane, 0], [fwd_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                            if fwd_b >= 0:
+                                fwd_physical_b = pl.cast(fwd_b, pl.INDEX)
+                                fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane + 1, 0], [fwd_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                for fwc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                    fwc_cast_row0 = fwc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                    fwc_raw_chunk = pl.tile.slice(fwc_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwc_cast_row0, 0])
+                    fwc_signed = pl.reinterpret_view(fwc_raw_chunk, pl.INT8)
+                    fwc_packed = pl.reinterpret_view(fwc_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                    fwc_codes = fwc_packed[:, :HEAD_DIM]
+                    fwc_values_fp32 = pl.cast(fwc_codes, pl.FP32)
+                    fwc_values = pl.cast(fwc_values_fp32, pl.BF16, mode='rint')
+                    fwc_bits = pl.reinterpret_view(fwc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                    fwc_scales = pl.reinterpret_view(fwc_bits, pl.BF16)
+                    fwc_scale_view = fwc_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                    fwc_dense_scales = pl.tile.move(fwc_scale_view, pl.MemorySpace.Vec)
+                    fwc_value_flat = pl.tile.reshape(fwc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                    fwc_scale_row = pl.tile.reshape(fwc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                    fwc_scale_bits = pl.tile.reinterpret_view(fwc_scale_row, pl.INT16)
+                    fwc_duplicated_bits = pl.tile.gather(fwc_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                    fwc_expanded_bits = pl.tile.gather(fwc_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                    fwc_expanded = pl.tile.reinterpret_view(fwc_expanded_bits, pl.BF16)
+                    fwc_scaled_flat = pl.col_expand_mul(fwc_value_flat, fwc_expanded)
+                    fwc_result = pl.tile.reshape(fwc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                    kv_half = pl.tile.assemble(kv_half, fwc_result, [32 + fwc_cast_row0, 0])
+                for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                    fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                    fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
+                    fwd_signed = pl.reinterpret_view(fwd_raw_chunk, pl.INT8)
+                    fwd_packed = pl.reinterpret_view(fwd_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                    fwd_codes = fwd_packed[:, :HEAD_DIM]
+                    fwd_values_fp32 = pl.cast(fwd_codes, pl.FP32)
+                    fwd_values = pl.cast(fwd_values_fp32, pl.BF16, mode='rint')
+                    fwd_bits = pl.reinterpret_view(fwd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                    fwd_scales = pl.reinterpret_view(fwd_bits, pl.BF16)
+                    fwd_scale_view = fwd_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                    fwd_dense_scales = pl.tile.move(fwd_scale_view, pl.MemorySpace.Vec)
+                    fwd_value_flat = pl.tile.reshape(fwd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                    fwd_scale_row = pl.tile.reshape(fwd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                    fwd_scale_bits = pl.tile.reinterpret_view(fwd_scale_row, pl.INT16)
+                    fwd_duplicated_bits = pl.tile.gather(fwd_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                    fwd_expanded_bits = pl.tile.gather(fwd_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                    fwd_expanded = pl.tile.reinterpret_view(fwd_expanded_bits, pl.BF16)
+                    fwd_scaled_flat = pl.col_expand_mul(fwd_value_flat, fwd_expanded)
+                    fwd_result = pl.tile.reshape(fwd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                    kv_half = pl.tile.assemble(kv_half, fwd_result, [48 + fwd_cast_row0, 0])
             pl.system.tpush_to_aic(kv_half, split=1, id=1)
         for part in pl.range(parts):
             column = part * SPARSE_VF_KEY_TILE
@@ -2104,178 +2597,671 @@ def sparse_vf_fused_vector(
             if part + 2 < parts:
                 column = (part + 2) * SPARSE_VF_KEY_TILE
                 kv_half = pl.tile.create([SPARSE_VF_KEY_TILE // 2, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
-                for key_offset in pl.range(0, SPARSE_VF_KEY_TILE // 2, SPARSE_VF_FUSED_GATHER_TILE):
-                    first_key = column + aiv_id * (SPARSE_VF_KEY_TILE // 2) + key_offset
-                    if compressed_keys > 0:
-                        if column < WINDOW_KEYS:
-                            gather_ids = pl.tile.load(window_indices, [token, first_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
-                            fw_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                            # Gather contiguous rows in one DMA.
-                            fw_first = pl.tile.read(gather_ids, [0, 0])
-                            fw_contiguous = pl.cast(0, pl.INT32)
-                            if fw_first >= 0:
-                                fw_contiguous = pl.cast(1, pl.INT32)
-                                for fw_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                                    fw_check_row = pl.tile.read(gather_ids, [0, fw_check_lane])
-                                    if fw_check_row != fw_first + fw_check_lane:
-                                        fw_contiguous = pl.cast(0, pl.INT32)
-                            if fw_contiguous != 0:
-                                fw_start = pl.cast(fw_first, pl.INDEX)
-                                fw_raw = pl.tile.gather_row(fw_raw, window_flat, [0, 0], [fw_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
-                            else:
-                                for fw_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                                    fw_a = pl.tile.read(gather_ids, [0, fw_lane])
-                                    fw_b = pl.tile.read(gather_ids, [0, fw_lane + 1])
-                                    fw_lower = pl.min(fw_a, fw_b)
-                                    fw_upper = pl.max(fw_a, fw_b)
-                                    fw_pair = pl.cast(0, pl.INT32)
-                                    if fw_lower >= 0:
-                                        if fw_upper == fw_lower + 1:
-                                            fw_pair = pl.cast(1, pl.INT32)
-                                    if fw_pair != 0:
-                                        # Sort each pair of valid row indices.
-                                        fw_physical = pl.cast(fw_lower, pl.INDEX)
-                                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical, 0], [2, WINDOW_CACHE_BYTES])
-                                    else:
-                                        if fw_a >= 0:
-                                            fw_physical_a = pl.cast(fw_a, pl.INDEX)
-                                            fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical_a, 0], [1, WINDOW_CACHE_BYTES])
-                                        if fw_b >= 0:
-                                            fw_physical_b = pl.cast(fw_b, pl.INDEX)
-                                            fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane + 1, 0], [fw_physical_b, 0], [1, WINDOW_CACHE_BYTES])
-                            for fw_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
-                                fw_cast_row0 = fw_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
-                                fw_raw_chunk = pl.tile.slice(fw_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fw_cast_row0, 0])
-                                fw_signed = pl.reinterpret_view(fw_raw_chunk, pl.INT8)
-                                fw_packed = pl.reinterpret_view(fw_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
-                                fw_codes = fw_packed[:, :HEAD_DIM]
-                                fw_values_fp32 = pl.cast(fw_codes, pl.FP32)
-                                fw_values = pl.cast(fw_values_fp32, pl.BF16, mode='rint')
-                                fw_bits = pl.reinterpret_view(fw_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                                fw_scales = pl.reinterpret_view(fw_bits, pl.BF16)
-                                fw_scale_view = fw_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                                fw_dense_scales = pl.tile.move(fw_scale_view, pl.MemorySpace.Vec)
-                                fw_value_flat = pl.tile.reshape(fw_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                                fw_scale_row = pl.tile.reshape(fw_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                                fw_scale_bits = pl.tile.reinterpret_view(fw_scale_row, pl.INT16)
-                                fw_duplicated_bits = pl.tile.gather(fw_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                                fw_expanded_bits = pl.tile.gather(fw_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                                fw_expanded = pl.tile.reinterpret_view(fw_expanded_bits, pl.BF16)
-                                fw_scaled_flat = pl.col_expand_mul(fw_value_flat, fw_expanded)
-                                fw_result = pl.tile.reshape(fw_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                                kv_half = pl.tile.assemble(kv_half, fw_result, [key_offset + fw_cast_row0, 0])
-                        else:
-                            compressed_key = first_key - WINDOW_KEYS
-                            gather_ids = pl.tile.load(compressed_indices, [token, compressed_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
-                            fc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                            # Gather contiguous rows in one DMA.
-                            fc_first = pl.tile.read(gather_ids, [0, 0])
-                            fc_contiguous = pl.cast(0, pl.INT32)
-                            if fc_first >= 0:
-                                fc_contiguous = pl.cast(1, pl.INT32)
-                                for fc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                                    fc_check_row = pl.tile.read(gather_ids, [0, fc_check_lane])
-                                    if fc_check_row != fc_first + fc_check_lane:
-                                        fc_contiguous = pl.cast(0, pl.INT32)
-                            if fc_contiguous != 0:
-                                fc_start = pl.cast(fc_first, pl.INDEX)
-                                fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [0, 0], [fc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
-                            else:
-                                for fc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                                    fc_a = pl.tile.read(gather_ids, [0, fc_lane])
-                                    fc_b = pl.tile.read(gather_ids, [0, fc_lane + 1])
-                                    fc_lower = pl.min(fc_a, fc_b)
-                                    fc_upper = pl.max(fc_a, fc_b)
-                                    fc_pair = pl.cast(0, pl.INT32)
-                                    if fc_lower >= 0:
-                                        if fc_upper == fc_lower + 1:
-                                            fc_pair = pl.cast(1, pl.INT32)
-                                    if fc_pair != 0:
-                                        # Sort each pair of valid row indices.
-                                        fc_physical = pl.cast(fc_lower, pl.INDEX)
-                                        fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane, 0], [fc_physical, 0], [2, COMPRESSED_CACHE_BYTES])
-                                    else:
-                                        if fc_a >= 0:
-                                            fc_physical_a = pl.cast(fc_a, pl.INDEX)
-                                            fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane, 0], [fc_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
-                                        if fc_b >= 0:
-                                            fc_physical_b = pl.cast(fc_b, pl.INDEX)
-                                            fc_raw = pl.tile.gather_row(fc_raw, compressed_flat, [fc_lane + 1, 0], [fc_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
-                            for fc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
-                                fc_cast_row0 = fc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
-                                fc_raw_chunk = pl.tile.slice(fc_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fc_cast_row0, 0])
-                                fc_packed = pl.reinterpret_view(fc_raw_chunk, pl.FP4E2M1X2)
-                                fc_codes = fc_packed[:, :SPARSE_VF_HALF_DIM]
-                                fc_values = pl.cast(fc_codes, pl.BF16)
-                                fc_bits = pl.reinterpret_view(fc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
-                                fc_scales = pl.reinterpret_view(fc_bits, pl.BF16)
-                                fc_scale_view = fc_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                                fc_dense_scales = pl.tile.move(fc_scale_view, pl.MemorySpace.Vec)
-                                fc_value_flat = pl.tile.reshape(fc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                                fc_scale_row = pl.tile.reshape(fc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
-                                fc_scale_bits = pl.tile.reinterpret_view(fc_scale_row, pl.INT16)
-                                fc_expanded_bits = pl.tile.gather(fc_scale_bits, scale_c_indices, scale_gather_tmp)
-                                fc_expanded = pl.tile.reinterpret_view(fc_expanded_bits, pl.BF16)
-                                fc_scaled_flat = pl.col_expand_mul(fc_value_flat, fc_expanded)
-                                fc_result = pl.tile.reshape(fc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                                kv_half = pl.tile.assemble(kv_half, fc_result, [key_offset + fc_cast_row0, 0])
-                    else:
-                        gather_ids = pl.tile.load(window_indices, [token, first_key], [1, SPARSE_VF_FUSED_GATHER_TILE])
-                        fw_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                first_key_base = column + aiv_id * (SPARSE_VF_KEY_TILE // 2)
+                if compressed_keys > 0:
+                    if column < WINDOW_KEYS:
+                        ids_fwa = pl.tile.load(window_indices, [token, first_key_base + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        ids_fwb = pl.tile.load(window_indices, [token, first_key_base + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        fwa_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
                         # Gather contiguous rows in one DMA.
-                        fw_first = pl.tile.read(gather_ids, [0, 0])
-                        fw_contiguous = pl.cast(0, pl.INT32)
-                        if fw_first >= 0:
-                            fw_contiguous = pl.cast(1, pl.INT32)
-                            for fw_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                                fw_check_row = pl.tile.read(gather_ids, [0, fw_check_lane])
-                                if fw_check_row != fw_first + fw_check_lane:
-                                    fw_contiguous = pl.cast(0, pl.INT32)
-                        if fw_contiguous != 0:
-                            fw_start = pl.cast(fw_first, pl.INDEX)
-                            fw_raw = pl.tile.gather_row(fw_raw, window_flat, [0, 0], [fw_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                        fwa_first = pl.tile.read(ids_fwa, [0, 0])
+                        fwa_contiguous = pl.cast(0, pl.INT32)
+                        if fwa_first >= 0:
+                            fwa_contiguous = pl.cast(1, pl.INT32)
+                            for fwa_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fwa_check_row = pl.tile.read(ids_fwa, [0, fwa_check_lane])
+                                if fwa_check_row != fwa_first + fwa_check_lane:
+                                    fwa_contiguous = pl.cast(0, pl.INT32)
+                        if fwa_contiguous != 0:
+                            fwa_start = pl.cast(fwa_first, pl.INDEX)
+                            fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [0, 0], [fwa_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
                         else:
-                            for fw_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                                fw_a = pl.tile.read(gather_ids, [0, fw_lane])
-                                fw_b = pl.tile.read(gather_ids, [0, fw_lane + 1])
-                                fw_lower = pl.min(fw_a, fw_b)
-                                fw_upper = pl.max(fw_a, fw_b)
-                                fw_pair = pl.cast(0, pl.INT32)
-                                if fw_lower >= 0:
-                                    if fw_upper == fw_lower + 1:
-                                        fw_pair = pl.cast(1, pl.INT32)
-                                if fw_pair != 0:
+                            for fwa_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fwa_a = pl.tile.read(ids_fwa, [0, fwa_lane])
+                                fwa_b = pl.tile.read(ids_fwa, [0, fwa_lane + 1])
+                                fwa_lower = pl.min(fwa_a, fwa_b)
+                                fwa_upper = pl.max(fwa_a, fwa_b)
+                                fwa_pair = pl.cast(0, pl.INT32)
+                                if fwa_lower >= 0:
+                                    if fwa_upper == fwa_lower + 1:
+                                        fwa_pair = pl.cast(1, pl.INT32)
+                                if fwa_pair != 0:
                                     # Sort each pair of valid row indices.
-                                    fw_physical = pl.cast(fw_lower, pl.INDEX)
-                                    fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical, 0], [2, WINDOW_CACHE_BYTES])
+                                    fwa_physical = pl.cast(fwa_lower, pl.INDEX)
+                                    fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane, 0], [fwa_physical, 0], [2, WINDOW_CACHE_BYTES])
                                 else:
-                                    if fw_a >= 0:
-                                        fw_physical_a = pl.cast(fw_a, pl.INDEX)
-                                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane, 0], [fw_physical_a, 0], [1, WINDOW_CACHE_BYTES])
-                                    if fw_b >= 0:
-                                        fw_physical_b = pl.cast(fw_b, pl.INDEX)
-                                        fw_raw = pl.tile.gather_row(fw_raw, window_flat, [fw_lane + 1, 0], [fw_physical_b, 0], [1, WINDOW_CACHE_BYTES])
-                        for fw_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
-                            fw_cast_row0 = fw_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
-                            fw_raw_chunk = pl.tile.slice(fw_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fw_cast_row0, 0])
-                            fw_signed = pl.reinterpret_view(fw_raw_chunk, pl.INT8)
-                            fw_packed = pl.reinterpret_view(fw_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
-                            fw_codes = fw_packed[:, :HEAD_DIM]
-                            fw_values_fp32 = pl.cast(fw_codes, pl.FP32)
-                            fw_values = pl.cast(fw_values_fp32, pl.BF16, mode='rint')
-                            fw_bits = pl.reinterpret_view(fw_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
-                            fw_scales = pl.reinterpret_view(fw_bits, pl.BF16)
-                            fw_scale_view = fw_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                            fw_dense_scales = pl.tile.move(fw_scale_view, pl.MemorySpace.Vec)
-                            fw_value_flat = pl.tile.reshape(fw_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
-                            fw_scale_row = pl.tile.reshape(fw_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
-                            fw_scale_bits = pl.tile.reinterpret_view(fw_scale_row, pl.INT16)
-                            fw_duplicated_bits = pl.tile.gather(fw_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
-                            fw_expanded_bits = pl.tile.gather(fw_duplicated_bits, scale_c_indices, scale_gather_tmp)
-                            fw_expanded = pl.tile.reinterpret_view(fw_expanded_bits, pl.BF16)
-                            fw_scaled_flat = pl.col_expand_mul(fw_value_flat, fw_expanded)
-                            fw_result = pl.tile.reshape(fw_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
-                            kv_half = pl.tile.assemble(kv_half, fw_result, [key_offset + fw_cast_row0, 0])
+                                    if fwa_a >= 0:
+                                        fwa_physical_a = pl.cast(fwa_a, pl.INDEX)
+                                        fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane, 0], [fwa_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                    if fwa_b >= 0:
+                                        fwa_physical_b = pl.cast(fwa_b, pl.INDEX)
+                                        fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane + 1, 0], [fwa_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                        fwb_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        # Gather contiguous rows in one DMA.
+                        fwb_first = pl.tile.read(ids_fwb, [0, 0])
+                        fwb_contiguous = pl.cast(0, pl.INT32)
+                        if fwb_first >= 0:
+                            fwb_contiguous = pl.cast(1, pl.INT32)
+                            for fwb_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fwb_check_row = pl.tile.read(ids_fwb, [0, fwb_check_lane])
+                                if fwb_check_row != fwb_first + fwb_check_lane:
+                                    fwb_contiguous = pl.cast(0, pl.INT32)
+                        if fwb_contiguous != 0:
+                            fwb_start = pl.cast(fwb_first, pl.INDEX)
+                            fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [0, 0], [fwb_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                        else:
+                            for fwb_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fwb_a = pl.tile.read(ids_fwb, [0, fwb_lane])
+                                fwb_b = pl.tile.read(ids_fwb, [0, fwb_lane + 1])
+                                fwb_lower = pl.min(fwb_a, fwb_b)
+                                fwb_upper = pl.max(fwb_a, fwb_b)
+                                fwb_pair = pl.cast(0, pl.INT32)
+                                if fwb_lower >= 0:
+                                    if fwb_upper == fwb_lower + 1:
+                                        fwb_pair = pl.cast(1, pl.INT32)
+                                if fwb_pair != 0:
+                                    # Sort each pair of valid row indices.
+                                    fwb_physical = pl.cast(fwb_lower, pl.INDEX)
+                                    fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane, 0], [fwb_physical, 0], [2, WINDOW_CACHE_BYTES])
+                                else:
+                                    if fwb_a >= 0:
+                                        fwb_physical_a = pl.cast(fwb_a, pl.INDEX)
+                                        fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane, 0], [fwb_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                    if fwb_b >= 0:
+                                        fwb_physical_b = pl.cast(fwb_b, pl.INDEX)
+                                        fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane + 1, 0], [fwb_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                        for fwa_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fwa_cast_row0 = fwa_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fwa_raw_chunk = pl.tile.slice(fwa_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwa_cast_row0, 0])
+                            fwa_signed = pl.reinterpret_view(fwa_raw_chunk, pl.INT8)
+                            fwa_packed = pl.reinterpret_view(fwa_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                            fwa_codes = fwa_packed[:, :HEAD_DIM]
+                            fwa_values_fp32 = pl.cast(fwa_codes, pl.FP32)
+                            fwa_values = pl.cast(fwa_values_fp32, pl.BF16, mode='rint')
+                            fwa_bits = pl.reinterpret_view(fwa_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                            fwa_scales = pl.reinterpret_view(fwa_bits, pl.BF16)
+                            fwa_scale_view = fwa_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                            fwa_dense_scales = pl.tile.move(fwa_scale_view, pl.MemorySpace.Vec)
+                            fwa_value_flat = pl.tile.reshape(fwa_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fwa_scale_row = pl.tile.reshape(fwa_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                            fwa_scale_bits = pl.tile.reinterpret_view(fwa_scale_row, pl.INT16)
+                            fwa_duplicated_bits = pl.tile.gather(fwa_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                            fwa_expanded_bits = pl.tile.gather(fwa_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                            fwa_expanded = pl.tile.reinterpret_view(fwa_expanded_bits, pl.BF16)
+                            fwa_scaled_flat = pl.col_expand_mul(fwa_value_flat, fwa_expanded)
+                            fwa_result = pl.tile.reshape(fwa_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fwa_result, [0 + fwa_cast_row0, 0])
+                        ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        # Gather contiguous rows in one DMA.
+                        fwc_first = pl.tile.read(ids_fwc, [0, 0])
+                        fwc_contiguous = pl.cast(0, pl.INT32)
+                        if fwc_first >= 0:
+                            fwc_contiguous = pl.cast(1, pl.INT32)
+                            for fwc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fwc_check_row = pl.tile.read(ids_fwc, [0, fwc_check_lane])
+                                if fwc_check_row != fwc_first + fwc_check_lane:
+                                    fwc_contiguous = pl.cast(0, pl.INT32)
+                        if fwc_contiguous != 0:
+                            fwc_start = pl.cast(fwc_first, pl.INDEX)
+                            fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [0, 0], [fwc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                        else:
+                            for fwc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fwc_a = pl.tile.read(ids_fwc, [0, fwc_lane])
+                                fwc_b = pl.tile.read(ids_fwc, [0, fwc_lane + 1])
+                                fwc_lower = pl.min(fwc_a, fwc_b)
+                                fwc_upper = pl.max(fwc_a, fwc_b)
+                                fwc_pair = pl.cast(0, pl.INT32)
+                                if fwc_lower >= 0:
+                                    if fwc_upper == fwc_lower + 1:
+                                        fwc_pair = pl.cast(1, pl.INT32)
+                                if fwc_pair != 0:
+                                    # Sort each pair of valid row indices.
+                                    fwc_physical = pl.cast(fwc_lower, pl.INDEX)
+                                    fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane, 0], [fwc_physical, 0], [2, WINDOW_CACHE_BYTES])
+                                else:
+                                    if fwc_a >= 0:
+                                        fwc_physical_a = pl.cast(fwc_a, pl.INDEX)
+                                        fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane, 0], [fwc_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                    if fwc_b >= 0:
+                                        fwc_physical_b = pl.cast(fwc_b, pl.INDEX)
+                                        fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane + 1, 0], [fwc_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                        for fwb_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fwb_cast_row0 = fwb_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fwb_raw_chunk = pl.tile.slice(fwb_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwb_cast_row0, 0])
+                            fwb_signed = pl.reinterpret_view(fwb_raw_chunk, pl.INT8)
+                            fwb_packed = pl.reinterpret_view(fwb_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                            fwb_codes = fwb_packed[:, :HEAD_DIM]
+                            fwb_values_fp32 = pl.cast(fwb_codes, pl.FP32)
+                            fwb_values = pl.cast(fwb_values_fp32, pl.BF16, mode='rint')
+                            fwb_bits = pl.reinterpret_view(fwb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                            fwb_scales = pl.reinterpret_view(fwb_bits, pl.BF16)
+                            fwb_scale_view = fwb_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                            fwb_dense_scales = pl.tile.move(fwb_scale_view, pl.MemorySpace.Vec)
+                            fwb_value_flat = pl.tile.reshape(fwb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fwb_scale_row = pl.tile.reshape(fwb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                            fwb_scale_bits = pl.tile.reinterpret_view(fwb_scale_row, pl.INT16)
+                            fwb_duplicated_bits = pl.tile.gather(fwb_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                            fwb_expanded_bits = pl.tile.gather(fwb_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                            fwb_expanded = pl.tile.reinterpret_view(fwb_expanded_bits, pl.BF16)
+                            fwb_scaled_flat = pl.col_expand_mul(fwb_value_flat, fwb_expanded)
+                            fwb_result = pl.tile.reshape(fwb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fwb_result, [16 + fwb_cast_row0, 0])
+                        ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        fwd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        # Gather contiguous rows in one DMA.
+                        fwd_first = pl.tile.read(ids_fwd, [0, 0])
+                        fwd_contiguous = pl.cast(0, pl.INT32)
+                        if fwd_first >= 0:
+                            fwd_contiguous = pl.cast(1, pl.INT32)
+                            for fwd_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fwd_check_row = pl.tile.read(ids_fwd, [0, fwd_check_lane])
+                                if fwd_check_row != fwd_first + fwd_check_lane:
+                                    fwd_contiguous = pl.cast(0, pl.INT32)
+                        if fwd_contiguous != 0:
+                            fwd_start = pl.cast(fwd_first, pl.INDEX)
+                            fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [0, 0], [fwd_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                        else:
+                            for fwd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fwd_a = pl.tile.read(ids_fwd, [0, fwd_lane])
+                                fwd_b = pl.tile.read(ids_fwd, [0, fwd_lane + 1])
+                                fwd_lower = pl.min(fwd_a, fwd_b)
+                                fwd_upper = pl.max(fwd_a, fwd_b)
+                                fwd_pair = pl.cast(0, pl.INT32)
+                                if fwd_lower >= 0:
+                                    if fwd_upper == fwd_lower + 1:
+                                        fwd_pair = pl.cast(1, pl.INT32)
+                                if fwd_pair != 0:
+                                    # Sort each pair of valid row indices.
+                                    fwd_physical = pl.cast(fwd_lower, pl.INDEX)
+                                    fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane, 0], [fwd_physical, 0], [2, WINDOW_CACHE_BYTES])
+                                else:
+                                    if fwd_a >= 0:
+                                        fwd_physical_a = pl.cast(fwd_a, pl.INDEX)
+                                        fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane, 0], [fwd_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                    if fwd_b >= 0:
+                                        fwd_physical_b = pl.cast(fwd_b, pl.INDEX)
+                                        fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane + 1, 0], [fwd_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                        for fwc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fwc_cast_row0 = fwc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fwc_raw_chunk = pl.tile.slice(fwc_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwc_cast_row0, 0])
+                            fwc_signed = pl.reinterpret_view(fwc_raw_chunk, pl.INT8)
+                            fwc_packed = pl.reinterpret_view(fwc_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                            fwc_codes = fwc_packed[:, :HEAD_DIM]
+                            fwc_values_fp32 = pl.cast(fwc_codes, pl.FP32)
+                            fwc_values = pl.cast(fwc_values_fp32, pl.BF16, mode='rint')
+                            fwc_bits = pl.reinterpret_view(fwc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                            fwc_scales = pl.reinterpret_view(fwc_bits, pl.BF16)
+                            fwc_scale_view = fwc_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                            fwc_dense_scales = pl.tile.move(fwc_scale_view, pl.MemorySpace.Vec)
+                            fwc_value_flat = pl.tile.reshape(fwc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fwc_scale_row = pl.tile.reshape(fwc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                            fwc_scale_bits = pl.tile.reinterpret_view(fwc_scale_row, pl.INT16)
+                            fwc_duplicated_bits = pl.tile.gather(fwc_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                            fwc_expanded_bits = pl.tile.gather(fwc_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                            fwc_expanded = pl.tile.reinterpret_view(fwc_expanded_bits, pl.BF16)
+                            fwc_scaled_flat = pl.col_expand_mul(fwc_value_flat, fwc_expanded)
+                            fwc_result = pl.tile.reshape(fwc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fwc_result, [32 + fwc_cast_row0, 0])
+                        for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
+                            fwd_signed = pl.reinterpret_view(fwd_raw_chunk, pl.INT8)
+                            fwd_packed = pl.reinterpret_view(fwd_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                            fwd_codes = fwd_packed[:, :HEAD_DIM]
+                            fwd_values_fp32 = pl.cast(fwd_codes, pl.FP32)
+                            fwd_values = pl.cast(fwd_values_fp32, pl.BF16, mode='rint')
+                            fwd_bits = pl.reinterpret_view(fwd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                            fwd_scales = pl.reinterpret_view(fwd_bits, pl.BF16)
+                            fwd_scale_view = fwd_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                            fwd_dense_scales = pl.tile.move(fwd_scale_view, pl.MemorySpace.Vec)
+                            fwd_value_flat = pl.tile.reshape(fwd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fwd_scale_row = pl.tile.reshape(fwd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                            fwd_scale_bits = pl.tile.reinterpret_view(fwd_scale_row, pl.INT16)
+                            fwd_duplicated_bits = pl.tile.gather(fwd_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                            fwd_expanded_bits = pl.tile.gather(fwd_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                            fwd_expanded = pl.tile.reinterpret_view(fwd_expanded_bits, pl.BF16)
+                            fwd_scaled_flat = pl.col_expand_mul(fwd_value_flat, fwd_expanded)
+                            fwd_result = pl.tile.reshape(fwd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fwd_result, [48 + fwd_cast_row0, 0])
+                    else:
+                        ids_fca = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        ids_fcb = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        fca_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        # Gather contiguous rows in one DMA.
+                        fca_first = pl.tile.read(ids_fca, [0, 0])
+                        fca_contiguous = pl.cast(0, pl.INT32)
+                        if fca_first >= 0:
+                            fca_contiguous = pl.cast(1, pl.INT32)
+                            for fca_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fca_check_row = pl.tile.read(ids_fca, [0, fca_check_lane])
+                                if fca_check_row != fca_first + fca_check_lane:
+                                    fca_contiguous = pl.cast(0, pl.INT32)
+                        if fca_contiguous != 0:
+                            fca_start = pl.cast(fca_first, pl.INDEX)
+                            fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [0, 0], [fca_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
+                        else:
+                            for fca_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fca_a = pl.tile.read(ids_fca, [0, fca_lane])
+                                fca_b = pl.tile.read(ids_fca, [0, fca_lane + 1])
+                                fca_lower = pl.min(fca_a, fca_b)
+                                fca_upper = pl.max(fca_a, fca_b)
+                                fca_pair = pl.cast(0, pl.INT32)
+                                if fca_lower >= 0:
+                                    if fca_upper == fca_lower + 1:
+                                        fca_pair = pl.cast(1, pl.INT32)
+                                if fca_pair != 0:
+                                    # Sort each pair of valid row indices.
+                                    fca_physical = pl.cast(fca_lower, pl.INDEX)
+                                    fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                                else:
+                                    if fca_a >= 0:
+                                        fca_physical_a = pl.cast(fca_a, pl.INDEX)
+                                        fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                    if fca_b >= 0:
+                                        fca_physical_b = pl.cast(fca_b, pl.INDEX)
+                                        fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane + 1, 0], [fca_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                        fcb_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        # Gather contiguous rows in one DMA.
+                        fcb_first = pl.tile.read(ids_fcb, [0, 0])
+                        fcb_contiguous = pl.cast(0, pl.INT32)
+                        if fcb_first >= 0:
+                            fcb_contiguous = pl.cast(1, pl.INT32)
+                            for fcb_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fcb_check_row = pl.tile.read(ids_fcb, [0, fcb_check_lane])
+                                if fcb_check_row != fcb_first + fcb_check_lane:
+                                    fcb_contiguous = pl.cast(0, pl.INT32)
+                        if fcb_contiguous != 0:
+                            fcb_start = pl.cast(fcb_first, pl.INDEX)
+                            fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [0, 0], [fcb_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
+                        else:
+                            for fcb_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fcb_a = pl.tile.read(ids_fcb, [0, fcb_lane])
+                                fcb_b = pl.tile.read(ids_fcb, [0, fcb_lane + 1])
+                                fcb_lower = pl.min(fcb_a, fcb_b)
+                                fcb_upper = pl.max(fcb_a, fcb_b)
+                                fcb_pair = pl.cast(0, pl.INT32)
+                                if fcb_lower >= 0:
+                                    if fcb_upper == fcb_lower + 1:
+                                        fcb_pair = pl.cast(1, pl.INT32)
+                                if fcb_pair != 0:
+                                    # Sort each pair of valid row indices.
+                                    fcb_physical = pl.cast(fcb_lower, pl.INDEX)
+                                    fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                                else:
+                                    if fcb_a >= 0:
+                                        fcb_physical_a = pl.cast(fcb_a, pl.INDEX)
+                                        fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                    if fcb_b >= 0:
+                                        fcb_physical_b = pl.cast(fcb_b, pl.INDEX)
+                                        fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane + 1, 0], [fcb_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                        for fca_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fca_cast_row0 = fca_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fca_raw_chunk = pl.tile.slice(fca_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fca_cast_row0, 0])
+                            fca_packed = pl.reinterpret_view(fca_raw_chunk, pl.FP4E2M1X2)
+                            fca_codes = fca_packed[:, :SPARSE_VF_HALF_DIM]
+                            fca_values = pl.cast(fca_codes, pl.BF16)
+                            fca_bits = pl.reinterpret_view(fca_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fca_scales = pl.reinterpret_view(fca_bits, pl.BF16)
+                            fca_scale_view = fca_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                            fca_dense_scales = pl.tile.move(fca_scale_view, pl.MemorySpace.Vec)
+                            fca_value_flat = pl.tile.reshape(fca_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fca_scale_row = pl.tile.reshape(fca_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
+                            fca_scale_bits = pl.tile.reinterpret_view(fca_scale_row, pl.INT16)
+                            fca_expanded_bits = pl.tile.gather(fca_scale_bits, scale_c_indices, scale_gather_tmp)
+                            fca_expanded = pl.tile.reinterpret_view(fca_expanded_bits, pl.BF16)
+                            fca_scaled_flat = pl.col_expand_mul(fca_value_flat, fca_expanded)
+                            fca_result = pl.tile.reshape(fca_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fca_result, [0 + fca_cast_row0, 0])
+                        ids_fcc = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        fcc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        # Gather contiguous rows in one DMA.
+                        fcc_first = pl.tile.read(ids_fcc, [0, 0])
+                        fcc_contiguous = pl.cast(0, pl.INT32)
+                        if fcc_first >= 0:
+                            fcc_contiguous = pl.cast(1, pl.INT32)
+                            for fcc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fcc_check_row = pl.tile.read(ids_fcc, [0, fcc_check_lane])
+                                if fcc_check_row != fcc_first + fcc_check_lane:
+                                    fcc_contiguous = pl.cast(0, pl.INT32)
+                        if fcc_contiguous != 0:
+                            fcc_start = pl.cast(fcc_first, pl.INDEX)
+                            fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [0, 0], [fcc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
+                        else:
+                            for fcc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fcc_a = pl.tile.read(ids_fcc, [0, fcc_lane])
+                                fcc_b = pl.tile.read(ids_fcc, [0, fcc_lane + 1])
+                                fcc_lower = pl.min(fcc_a, fcc_b)
+                                fcc_upper = pl.max(fcc_a, fcc_b)
+                                fcc_pair = pl.cast(0, pl.INT32)
+                                if fcc_lower >= 0:
+                                    if fcc_upper == fcc_lower + 1:
+                                        fcc_pair = pl.cast(1, pl.INT32)
+                                if fcc_pair != 0:
+                                    # Sort each pair of valid row indices.
+                                    fcc_physical = pl.cast(fcc_lower, pl.INDEX)
+                                    fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                                else:
+                                    if fcc_a >= 0:
+                                        fcc_physical_a = pl.cast(fcc_a, pl.INDEX)
+                                        fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                    if fcc_b >= 0:
+                                        fcc_physical_b = pl.cast(fcc_b, pl.INDEX)
+                                        fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane + 1, 0], [fcc_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                        for fcb_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fcb_cast_row0 = fcb_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fcb_raw_chunk = pl.tile.slice(fcb_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcb_cast_row0, 0])
+                            fcb_packed = pl.reinterpret_view(fcb_raw_chunk, pl.FP4E2M1X2)
+                            fcb_codes = fcb_packed[:, :SPARSE_VF_HALF_DIM]
+                            fcb_values = pl.cast(fcb_codes, pl.BF16)
+                            fcb_bits = pl.reinterpret_view(fcb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fcb_scales = pl.reinterpret_view(fcb_bits, pl.BF16)
+                            fcb_scale_view = fcb_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                            fcb_dense_scales = pl.tile.move(fcb_scale_view, pl.MemorySpace.Vec)
+                            fcb_value_flat = pl.tile.reshape(fcb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fcb_scale_row = pl.tile.reshape(fcb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
+                            fcb_scale_bits = pl.tile.reinterpret_view(fcb_scale_row, pl.INT16)
+                            fcb_expanded_bits = pl.tile.gather(fcb_scale_bits, scale_c_indices, scale_gather_tmp)
+                            fcb_expanded = pl.tile.reinterpret_view(fcb_expanded_bits, pl.BF16)
+                            fcb_scaled_flat = pl.col_expand_mul(fcb_value_flat, fcb_expanded)
+                            fcb_result = pl.tile.reshape(fcb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fcb_result, [16 + fcb_cast_row0, 0])
+                        ids_fcd = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                        fcd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                        # Gather contiguous rows in one DMA.
+                        fcd_first = pl.tile.read(ids_fcd, [0, 0])
+                        fcd_contiguous = pl.cast(0, pl.INT32)
+                        if fcd_first >= 0:
+                            fcd_contiguous = pl.cast(1, pl.INT32)
+                            for fcd_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                                fcd_check_row = pl.tile.read(ids_fcd, [0, fcd_check_lane])
+                                if fcd_check_row != fcd_first + fcd_check_lane:
+                                    fcd_contiguous = pl.cast(0, pl.INT32)
+                        if fcd_contiguous != 0:
+                            fcd_start = pl.cast(fcd_first, pl.INDEX)
+                            fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [0, 0], [fcd_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
+                        else:
+                            for fcd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                                fcd_a = pl.tile.read(ids_fcd, [0, fcd_lane])
+                                fcd_b = pl.tile.read(ids_fcd, [0, fcd_lane + 1])
+                                fcd_lower = pl.min(fcd_a, fcd_b)
+                                fcd_upper = pl.max(fcd_a, fcd_b)
+                                fcd_pair = pl.cast(0, pl.INT32)
+                                if fcd_lower >= 0:
+                                    if fcd_upper == fcd_lower + 1:
+                                        fcd_pair = pl.cast(1, pl.INT32)
+                                if fcd_pair != 0:
+                                    # Sort each pair of valid row indices.
+                                    fcd_physical = pl.cast(fcd_lower, pl.INDEX)
+                                    fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                                else:
+                                    if fcd_a >= 0:
+                                        fcd_physical_a = pl.cast(fcd_a, pl.INDEX)
+                                        fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                    if fcd_b >= 0:
+                                        fcd_physical_b = pl.cast(fcd_b, pl.INDEX)
+                                        fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane + 1, 0], [fcd_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                        for fcc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fcc_cast_row0 = fcc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fcc_raw_chunk = pl.tile.slice(fcc_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcc_cast_row0, 0])
+                            fcc_packed = pl.reinterpret_view(fcc_raw_chunk, pl.FP4E2M1X2)
+                            fcc_codes = fcc_packed[:, :SPARSE_VF_HALF_DIM]
+                            fcc_values = pl.cast(fcc_codes, pl.BF16)
+                            fcc_bits = pl.reinterpret_view(fcc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fcc_scales = pl.reinterpret_view(fcc_bits, pl.BF16)
+                            fcc_scale_view = fcc_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                            fcc_dense_scales = pl.tile.move(fcc_scale_view, pl.MemorySpace.Vec)
+                            fcc_value_flat = pl.tile.reshape(fcc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fcc_scale_row = pl.tile.reshape(fcc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
+                            fcc_scale_bits = pl.tile.reinterpret_view(fcc_scale_row, pl.INT16)
+                            fcc_expanded_bits = pl.tile.gather(fcc_scale_bits, scale_c_indices, scale_gather_tmp)
+                            fcc_expanded = pl.tile.reinterpret_view(fcc_expanded_bits, pl.BF16)
+                            fcc_scaled_flat = pl.col_expand_mul(fcc_value_flat, fcc_expanded)
+                            fcc_result = pl.tile.reshape(fcc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fcc_result, [32 + fcc_cast_row0, 0])
+                        for fcd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                            fcd_cast_row0 = fcd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                            fcd_raw_chunk = pl.tile.slice(fcd_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcd_cast_row0, 0])
+                            fcd_packed = pl.reinterpret_view(fcd_raw_chunk, pl.FP4E2M1X2)
+                            fcd_codes = fcd_packed[:, :SPARSE_VF_HALF_DIM]
+                            fcd_values = pl.cast(fcd_codes, pl.BF16)
+                            fcd_bits = pl.reinterpret_view(fcd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_COMPRESSED_HALFWORDS])
+                            fcd_scales = pl.reinterpret_view(fcd_bits, pl.BF16)
+                            fcd_scale_view = fcd_scales[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                            fcd_dense_scales = pl.tile.move(fcd_scale_view, pl.MemorySpace.Vec)
+                            fcd_value_flat = pl.tile.reshape(fcd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                            fcd_scale_row = pl.tile.reshape(fcd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS])
+                            fcd_scale_bits = pl.tile.reinterpret_view(fcd_scale_row, pl.INT16)
+                            fcd_expanded_bits = pl.tile.gather(fcd_scale_bits, scale_c_indices, scale_gather_tmp)
+                            fcd_expanded = pl.tile.reinterpret_view(fcd_expanded_bits, pl.BF16)
+                            fcd_scaled_flat = pl.col_expand_mul(fcd_value_flat, fcd_expanded)
+                            fcd_result = pl.tile.reshape(fcd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                            kv_half = pl.tile.assemble(kv_half, fcd_result, [48 + fcd_cast_row0, 0])
+                else:
+                    ids_fwa = pl.tile.load(window_indices, [token, first_key_base + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    ids_fwb = pl.tile.load(window_indices, [token, first_key_base + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    fwa_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fwa_first = pl.tile.read(ids_fwa, [0, 0])
+                    fwa_contiguous = pl.cast(0, pl.INT32)
+                    if fwa_first >= 0:
+                        fwa_contiguous = pl.cast(1, pl.INT32)
+                        for fwa_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fwa_check_row = pl.tile.read(ids_fwa, [0, fwa_check_lane])
+                            if fwa_check_row != fwa_first + fwa_check_lane:
+                                fwa_contiguous = pl.cast(0, pl.INT32)
+                    if fwa_contiguous != 0:
+                        fwa_start = pl.cast(fwa_first, pl.INDEX)
+                        fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [0, 0], [fwa_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                    else:
+                        for fwa_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fwa_a = pl.tile.read(ids_fwa, [0, fwa_lane])
+                            fwa_b = pl.tile.read(ids_fwa, [0, fwa_lane + 1])
+                            fwa_lower = pl.min(fwa_a, fwa_b)
+                            fwa_upper = pl.max(fwa_a, fwa_b)
+                            fwa_pair = pl.cast(0, pl.INT32)
+                            if fwa_lower >= 0:
+                                if fwa_upper == fwa_lower + 1:
+                                    fwa_pair = pl.cast(1, pl.INT32)
+                            if fwa_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fwa_physical = pl.cast(fwa_lower, pl.INDEX)
+                                fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane, 0], [fwa_physical, 0], [2, WINDOW_CACHE_BYTES])
+                            else:
+                                if fwa_a >= 0:
+                                    fwa_physical_a = pl.cast(fwa_a, pl.INDEX)
+                                    fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane, 0], [fwa_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                if fwa_b >= 0:
+                                    fwa_physical_b = pl.cast(fwa_b, pl.INDEX)
+                                    fwa_raw = pl.tile.gather_row(fwa_raw, window_flat, [fwa_lane + 1, 0], [fwa_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                    fwb_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fwb_first = pl.tile.read(ids_fwb, [0, 0])
+                    fwb_contiguous = pl.cast(0, pl.INT32)
+                    if fwb_first >= 0:
+                        fwb_contiguous = pl.cast(1, pl.INT32)
+                        for fwb_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fwb_check_row = pl.tile.read(ids_fwb, [0, fwb_check_lane])
+                            if fwb_check_row != fwb_first + fwb_check_lane:
+                                fwb_contiguous = pl.cast(0, pl.INT32)
+                    if fwb_contiguous != 0:
+                        fwb_start = pl.cast(fwb_first, pl.INDEX)
+                        fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [0, 0], [fwb_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                    else:
+                        for fwb_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fwb_a = pl.tile.read(ids_fwb, [0, fwb_lane])
+                            fwb_b = pl.tile.read(ids_fwb, [0, fwb_lane + 1])
+                            fwb_lower = pl.min(fwb_a, fwb_b)
+                            fwb_upper = pl.max(fwb_a, fwb_b)
+                            fwb_pair = pl.cast(0, pl.INT32)
+                            if fwb_lower >= 0:
+                                if fwb_upper == fwb_lower + 1:
+                                    fwb_pair = pl.cast(1, pl.INT32)
+                            if fwb_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fwb_physical = pl.cast(fwb_lower, pl.INDEX)
+                                fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane, 0], [fwb_physical, 0], [2, WINDOW_CACHE_BYTES])
+                            else:
+                                if fwb_a >= 0:
+                                    fwb_physical_a = pl.cast(fwb_a, pl.INDEX)
+                                    fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane, 0], [fwb_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                if fwb_b >= 0:
+                                    fwb_physical_b = pl.cast(fwb_b, pl.INDEX)
+                                    fwb_raw = pl.tile.gather_row(fwb_raw, window_flat, [fwb_lane + 1, 0], [fwb_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                    for fwa_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fwa_cast_row0 = fwa_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fwa_raw_chunk = pl.tile.slice(fwa_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwa_cast_row0, 0])
+                        fwa_signed = pl.reinterpret_view(fwa_raw_chunk, pl.INT8)
+                        fwa_packed = pl.reinterpret_view(fwa_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                        fwa_codes = fwa_packed[:, :HEAD_DIM]
+                        fwa_values_fp32 = pl.cast(fwa_codes, pl.FP32)
+                        fwa_values = pl.cast(fwa_values_fp32, pl.BF16, mode='rint')
+                        fwa_bits = pl.reinterpret_view(fwa_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwa_scales = pl.reinterpret_view(fwa_bits, pl.BF16)
+                        fwa_scale_view = fwa_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                        fwa_dense_scales = pl.tile.move(fwa_scale_view, pl.MemorySpace.Vec)
+                        fwa_value_flat = pl.tile.reshape(fwa_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwa_scale_row = pl.tile.reshape(fwa_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                        fwa_scale_bits = pl.tile.reinterpret_view(fwa_scale_row, pl.INT16)
+                        fwa_duplicated_bits = pl.tile.gather(fwa_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                        fwa_expanded_bits = pl.tile.gather(fwa_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                        fwa_expanded = pl.tile.reinterpret_view(fwa_expanded_bits, pl.BF16)
+                        fwa_scaled_flat = pl.col_expand_mul(fwa_value_flat, fwa_expanded)
+                        fwa_result = pl.tile.reshape(fwa_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fwa_result, [0 + fwa_cast_row0, 0])
+                    ids_fwc = pl.tile.load(window_indices, [token, first_key_base + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    fwc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fwc_first = pl.tile.read(ids_fwc, [0, 0])
+                    fwc_contiguous = pl.cast(0, pl.INT32)
+                    if fwc_first >= 0:
+                        fwc_contiguous = pl.cast(1, pl.INT32)
+                        for fwc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fwc_check_row = pl.tile.read(ids_fwc, [0, fwc_check_lane])
+                            if fwc_check_row != fwc_first + fwc_check_lane:
+                                fwc_contiguous = pl.cast(0, pl.INT32)
+                    if fwc_contiguous != 0:
+                        fwc_start = pl.cast(fwc_first, pl.INDEX)
+                        fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [0, 0], [fwc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                    else:
+                        for fwc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fwc_a = pl.tile.read(ids_fwc, [0, fwc_lane])
+                            fwc_b = pl.tile.read(ids_fwc, [0, fwc_lane + 1])
+                            fwc_lower = pl.min(fwc_a, fwc_b)
+                            fwc_upper = pl.max(fwc_a, fwc_b)
+                            fwc_pair = pl.cast(0, pl.INT32)
+                            if fwc_lower >= 0:
+                                if fwc_upper == fwc_lower + 1:
+                                    fwc_pair = pl.cast(1, pl.INT32)
+                            if fwc_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fwc_physical = pl.cast(fwc_lower, pl.INDEX)
+                                fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane, 0], [fwc_physical, 0], [2, WINDOW_CACHE_BYTES])
+                            else:
+                                if fwc_a >= 0:
+                                    fwc_physical_a = pl.cast(fwc_a, pl.INDEX)
+                                    fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane, 0], [fwc_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                if fwc_b >= 0:
+                                    fwc_physical_b = pl.cast(fwc_b, pl.INDEX)
+                                    fwc_raw = pl.tile.gather_row(fwc_raw, window_flat, [fwc_lane + 1, 0], [fwc_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                    for fwb_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fwb_cast_row0 = fwb_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fwb_raw_chunk = pl.tile.slice(fwb_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwb_cast_row0, 0])
+                        fwb_signed = pl.reinterpret_view(fwb_raw_chunk, pl.INT8)
+                        fwb_packed = pl.reinterpret_view(fwb_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                        fwb_codes = fwb_packed[:, :HEAD_DIM]
+                        fwb_values_fp32 = pl.cast(fwb_codes, pl.FP32)
+                        fwb_values = pl.cast(fwb_values_fp32, pl.BF16, mode='rint')
+                        fwb_bits = pl.reinterpret_view(fwb_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwb_scales = pl.reinterpret_view(fwb_bits, pl.BF16)
+                        fwb_scale_view = fwb_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                        fwb_dense_scales = pl.tile.move(fwb_scale_view, pl.MemorySpace.Vec)
+                        fwb_value_flat = pl.tile.reshape(fwb_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwb_scale_row = pl.tile.reshape(fwb_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                        fwb_scale_bits = pl.tile.reinterpret_view(fwb_scale_row, pl.INT16)
+                        fwb_duplicated_bits = pl.tile.gather(fwb_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                        fwb_expanded_bits = pl.tile.gather(fwb_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                        fwb_expanded = pl.tile.reinterpret_view(fwb_expanded_bits, pl.BF16)
+                        fwb_scaled_flat = pl.col_expand_mul(fwb_value_flat, fwb_expanded)
+                        fwb_result = pl.tile.reshape(fwb_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fwb_result, [16 + fwb_cast_row0, 0])
+                    ids_fwd = pl.tile.load(window_indices, [token, first_key_base + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
+                    fwd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    # Gather contiguous rows in one DMA.
+                    fwd_first = pl.tile.read(ids_fwd, [0, 0])
+                    fwd_contiguous = pl.cast(0, pl.INT32)
+                    if fwd_first >= 0:
+                        fwd_contiguous = pl.cast(1, pl.INT32)
+                        for fwd_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
+                            fwd_check_row = pl.tile.read(ids_fwd, [0, fwd_check_lane])
+                            if fwd_check_row != fwd_first + fwd_check_lane:
+                                fwd_contiguous = pl.cast(0, pl.INT32)
+                    if fwd_contiguous != 0:
+                        fwd_start = pl.cast(fwd_first, pl.INDEX)
+                        fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [0, 0], [fwd_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, WINDOW_CACHE_BYTES])
+                    else:
+                        for fwd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fwd_a = pl.tile.read(ids_fwd, [0, fwd_lane])
+                            fwd_b = pl.tile.read(ids_fwd, [0, fwd_lane + 1])
+                            fwd_lower = pl.min(fwd_a, fwd_b)
+                            fwd_upper = pl.max(fwd_a, fwd_b)
+                            fwd_pair = pl.cast(0, pl.INT32)
+                            if fwd_lower >= 0:
+                                if fwd_upper == fwd_lower + 1:
+                                    fwd_pair = pl.cast(1, pl.INT32)
+                            if fwd_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fwd_physical = pl.cast(fwd_lower, pl.INDEX)
+                                fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane, 0], [fwd_physical, 0], [2, WINDOW_CACHE_BYTES])
+                            else:
+                                if fwd_a >= 0:
+                                    fwd_physical_a = pl.cast(fwd_a, pl.INDEX)
+                                    fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane, 0], [fwd_physical_a, 0], [1, WINDOW_CACHE_BYTES])
+                                if fwd_b >= 0:
+                                    fwd_physical_b = pl.cast(fwd_b, pl.INDEX)
+                                    fwd_raw = pl.tile.gather_row(fwd_raw, window_flat, [fwd_lane + 1, 0], [fwd_physical_b, 0], [1, WINDOW_CACHE_BYTES])
+                    for fwc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fwc_cast_row0 = fwc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fwc_raw_chunk = pl.tile.slice(fwc_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwc_cast_row0, 0])
+                        fwc_signed = pl.reinterpret_view(fwc_raw_chunk, pl.INT8)
+                        fwc_packed = pl.reinterpret_view(fwc_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                        fwc_codes = fwc_packed[:, :HEAD_DIM]
+                        fwc_values_fp32 = pl.cast(fwc_codes, pl.FP32)
+                        fwc_values = pl.cast(fwc_values_fp32, pl.BF16, mode='rint')
+                        fwc_bits = pl.reinterpret_view(fwc_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwc_scales = pl.reinterpret_view(fwc_bits, pl.BF16)
+                        fwc_scale_view = fwc_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                        fwc_dense_scales = pl.tile.move(fwc_scale_view, pl.MemorySpace.Vec)
+                        fwc_value_flat = pl.tile.reshape(fwc_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwc_scale_row = pl.tile.reshape(fwc_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                        fwc_scale_bits = pl.tile.reinterpret_view(fwc_scale_row, pl.INT16)
+                        fwc_duplicated_bits = pl.tile.gather(fwc_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                        fwc_expanded_bits = pl.tile.gather(fwc_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                        fwc_expanded = pl.tile.reinterpret_view(fwc_expanded_bits, pl.BF16)
+                        fwc_scaled_flat = pl.col_expand_mul(fwc_value_flat, fwc_expanded)
+                        fwc_result = pl.tile.reshape(fwc_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fwc_result, [32 + fwc_cast_row0, 0])
+                    for fwd_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
+                        fwd_cast_row0 = fwd_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
+                        fwd_raw_chunk = pl.tile.slice(fwd_raw, [SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES], [fwd_cast_row0, 0])
+                        fwd_signed = pl.reinterpret_view(fwd_raw_chunk, pl.INT8)
+                        fwd_packed = pl.reinterpret_view(fwd_signed, pl.FP8E4M3FN, shape=[SPARSE_VF_FUSED_SCALE_TILE, WINDOW_CACHE_BYTES])
+                        fwd_codes = fwd_packed[:, :HEAD_DIM]
+                        fwd_values_fp32 = pl.cast(fwd_codes, pl.FP32)
+                        fwd_values = pl.cast(fwd_values_fp32, pl.BF16, mode='rint')
+                        fwd_bits = pl.reinterpret_view(fwd_raw_chunk, pl.INT16, shape=[SPARSE_VF_FUSED_SCALE_TILE, SPARSE_VF_WINDOW_HALFWORDS])
+                        fwd_scales = pl.reinterpret_view(fwd_bits, pl.BF16)
+                        fwd_scale_view = fwd_scales[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                        fwd_dense_scales = pl.tile.move(fwd_scale_view, pl.MemorySpace.Vec)
+                        fwd_value_flat = pl.tile.reshape(fwd_values, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
+                        fwd_scale_row = pl.tile.reshape(fwd_dense_scales, [1, SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS])
+                        fwd_scale_bits = pl.tile.reinterpret_view(fwd_scale_row, pl.INT16)
+                        fwd_duplicated_bits = pl.tile.gather(fwd_scale_bits, scale_w_duplicate_indices, scale_gather_tmp)
+                        fwd_expanded_bits = pl.tile.gather(fwd_duplicated_bits, scale_c_indices, scale_gather_tmp)
+                        fwd_expanded = pl.tile.reinterpret_view(fwd_expanded_bits, pl.BF16)
+                        fwd_scaled_flat = pl.col_expand_mul(fwd_value_flat, fwd_expanded)
+                        fwd_result = pl.tile.reshape(fwd_scaled_flat, [SPARSE_VF_FUSED_SCALE_TILE, HEAD_DIM])
+                        kv_half = pl.tile.assemble(kv_half, fwd_result, [48 + fwd_cast_row0, 0])
                 pl.system.tpush_to_aic(kv_half, split=1, id=1)
             correction_col = pl.reshape(correction, [SPARSE_VF_FUSED_AIV_HEAD_TILE, 1])
             weighted_0 = pl.system.tpop_from_aic(shape=[SPARSE_VF_FUSED_AIV_HEAD_TILE, 128], dtype=pl.FP32, split=1, id=3)
