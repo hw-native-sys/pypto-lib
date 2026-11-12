@@ -169,7 +169,7 @@ def moe(
     recv_weights: pld.DistributedTensor,
     recv_routes: pld.DistributedTensor,
     data_arrived: pld.DistributedTensor,
-    routed_output: pld.DistributedTensor[[ROUTE_T_DYN, D], pl.BF16],
+    routed_output: pld.DistributedTensor,
     combine_arrived: pld.DistributedTensor,
     num_tokens: pl.Scalar[pl.INT32],
     ep_rank: pl.Scalar[pl.INT32],

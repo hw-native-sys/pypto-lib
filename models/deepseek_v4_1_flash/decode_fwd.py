@@ -668,8 +668,7 @@ def decode_decoder(
     return x_hc
 
 
-@pl.jit(auto_scope=False)
-def l2_decode_fwd(
+def _l2_decode_fwd(
     engram_lookup: pl.Tensor[[2, T_DYN, ENGRAM_K], pl.BF16],
     engram_wkv: pl.Tensor[[2, ENGRAM_K, KV_OUT], pl.FP8E4M3FN],
     engram_wkv_scale: pl.Tensor[[2 * (ENGRAM_K // 32), KV_OUT], pl.FP8E8M0],
@@ -842,6 +841,9 @@ def l2_decode_fwd(
         rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, rank % LM_HEAD_TP_SIZE, 1, 1,
     )
     return final_logits, final_sampled_ids
+
+decode_fwd = pl.jit.inline(auto_scope=False)(_l2_decode_fwd)
+l2_decode_fwd = pl.jit(auto_scope=False)(_l2_decode_fwd)
 
 
 @pl.jit.host
