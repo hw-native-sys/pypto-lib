@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """PyPTO sparse MLA with packed-cache dequantization and sink-aware Cube attention."""
 
 from collections.abc import Callable
@@ -102,6 +103,32 @@ SWA_CROSS_CORE_SLOT_TILE = 1
 SWA_RUN_TILE = 32
 SWA_RUN_PARTS = SWA_WINDOW // SWA_RUN_TILE
 SWA_RUN_DESCRIPTOR_WIDTH = 8
+
+# Sparse VF tiling.
+SPARSE_VF_KEY_TILE = 128
+SPARSE_VF_GATHER_TILE = 32
+SPARSE_VF_HEAD_TILE = min(32, LOCAL_H)
+SPARSE_VF_CUBE_HEAD_TILE = max(16, SPARSE_VF_HEAD_TILE)
+SPARSE_VF_REG_TILE = 128
+
+# Sparse VF packed-cache layout.
+SPARSE_VF_WINDOW_GROUP = 32
+SPARSE_VF_COMPRESSED_GROUP = 16
+SPARSE_VF_WINDOW_GROUPS = HEAD_DIM // SPARSE_VF_WINDOW_GROUP
+SPARSE_VF_COMPRESSED_GROUPS = HEAD_DIM // SPARSE_VF_COMPRESSED_GROUP
+SPARSE_VF_HALF_DIM = HEAD_DIM // 2
+SPARSE_VF_WINDOW_HALFWORDS = WINDOW_CACHE_BYTES // 2
+SPARSE_VF_COMPRESSED_HALFWORDS = COMPRESSED_CACHE_BYTES // 2
+SPARSE_VF_WINDOW_SCALE_OFFSET = HEAD_DIM // 2
+SPARSE_VF_COMPRESSED_SCALE_OFFSET = HEAD_DIM // 4
+SPARSE_VF_WINDOW_SCALE_END = SPARSE_VF_WINDOW_SCALE_OFFSET + SPARSE_VF_WINDOW_GROUPS
+SPARSE_VF_COMPRESSED_SCALE_END = SPARSE_VF_COMPRESSED_SCALE_OFFSET + SPARSE_VF_COMPRESSED_GROUPS
+# Lane index -> group index for the register scale pass.
+SPARSE_VF_WINDOW_SHIFT = 5
+SPARSE_VF_COMPRESSED_SHIFT = 4
+SPARSE_VF_WINDOW_STEP = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUP
+SPARSE_VF_COMPRESSED_STEP = SPARSE_VF_REG_TILE // SPARSE_VF_COMPRESSED_GROUP
+
 
 
 @pl.jit.inline(auto_scope=False)
@@ -683,6 +710,26 @@ def l2_sparse_attention_swa(
     return output
 
 
+@pl.jit(auto_scope=False)
+def l2_sparse_attention_swa_pypto(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    indices: pl.Tensor[[T_DYN, SWA_WINDOW], pl.INT32],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.InOut[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Validate the PyPTO sparse-attention rewrite on the window-only route."""
+    query.bind_dynamic(0, T_DYN)
+    cache.bind_dynamic(0, ORI_BLOCKS_DYN)
+    source_ready = pl.system.task_dummy(deps=[])
+    gather_sparse_attention_pypto(
+        query, indices, cache, indices, cache, sink, output, num_tokens, source_ready,
+        compressed_keys=0,
+    )
+    return output
+
+
 
 
 SWA_INPUT_NAMES = (
@@ -1069,6 +1116,249 @@ def gather_sparse_attention(
             balanced, cache_mode=compressed_keys,
         )
     return attended
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_vf_decode_pypto(
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    decoded: pl.Tensor,
+    selected_ids: pl.Tensor,
+    num_tokens: pl.Scalar[pl.INT32],
+    source_ready: pl.Scalar[pl.TASK_ID],
+    compressed_keys: pl.constexpr,
+):
+    """Gather packed FP8/FP4 cache rows and apply BF16 group scales in registers."""
+    keys = WINDOW_KEYS + compressed_keys
+    window_rows = pl.tensor.dim(window, 0) * 128
+    window_flat = pl.reshape(window, [window_rows, WINDOW_CACHE_BYTES])
+    if compressed_keys > 0:
+        # Window-only callers have no compressed-cache view.
+        compressed_rows = pl.tensor.dim(compressed, 0) * 128
+        compressed_flat = pl.reshape(compressed, [compressed_rows, COMPRESSED_CACHE_BYTES])
+    workers = pl.min(num_tokens * (keys // SPARSE_VF_GATHER_TILE), WORKERS)
+    workers = pl.max(1, workers)
+    # A register scope cannot share a kernel with matmul operations.
+    with pl.spmd(workers, name_hint="sparse_vf_decode", deps=[source_ready]) as gathered:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, num_tokens * (keys // SPARSE_VF_GATHER_TILE), workers):
+            token = block // (keys // SPARSE_VF_GATHER_TILE)
+            column = block % (keys // SPARSE_VF_GATHER_TILE) * SPARSE_VF_GATHER_TILE
+            destination = token * keys + column
+            if column < WINDOW_KEYS:
+                # Scalar index reads require an explicit Tile load.
+                ids = pl.tile.load(window_indices, [token, column], [1, SPARSE_VF_GATHER_TILE])
+                raw = pl.tile.create([SPARSE_VF_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, target_memory=pl.MemorySpace.Vec)
+                zero_row = pl.tile.full([1, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                for lane in pl.range(SPARSE_VF_GATHER_TILE):
+                    row = pl.tile.read(ids, [0, lane])
+                    physical = pl.cast(pl.max(row, 0), pl.INDEX)
+                    raw = pl.tile.gather_row(
+                        raw, window_flat, [lane, 0], [physical, 0], [1, WINDOW_CACHE_BYTES],
+                    )
+                    # Clear masked payloads and scales, including NaNs read from row 0.
+                    if row < 0:
+                        raw[lane:lane + 1, :] = zero_row
+                # Preserve the packed row pitch across reinterpretation and slicing.
+                signed_bytes = pl.reinterpret_view(raw, pl.INT8)
+                payload_all = pl.reinterpret_view(
+                    signed_bytes, pl.FP8E4M3FN, shape=[SPARSE_VF_GATHER_TILE, WINDOW_CACHE_BYTES],
+                )
+                codes = payload_all[:, :HEAD_DIM]
+                values_fp32 = pl.cast(codes, pl.FP32)
+                values = pl.cast(values_fp32, pl.BF16, mode="rint")
+                factor_bits = pl.reinterpret_view(
+                    raw, pl.INT16, shape=[SPARSE_VF_GATHER_TILE, SPARSE_VF_WINDOW_HALFWORDS],
+                )
+                scale_all = pl.reinterpret_view(factor_bits, pl.BF16)
+                scale_view = scale_all[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                # Materialize dense BF16 scale storage before flattening for register gathers.
+                factors_fp32 = pl.cast(scale_view, pl.FP32)
+                factors = pl.cast(factors_fp32, pl.BF16, mode="rint")
+                pl.tile.store(ids, [token, column], selected_ids)
+                value_flat = pl.reshape(values, [SPARSE_VF_GATHER_TILE * HEAD_DIM])
+                factor_flat = pl.reshape(
+                    factors, [SPARSE_VF_GATHER_TILE * SPARSE_VF_WINDOW_GROUPS],
+                )
+                # Apply each group scale to its register lanes.
+                with pl.reg_scope():
+                    w_full = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                    w_group = pl.reg.index_gen(0, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
+                    w_group = pl.reg.shift_rights(w_group, SPARSE_VF_WINDOW_SHIFT, w_full)
+                    for w_chunk in pl.hardware_loop(SPARSE_VF_GATHER_TILE * HEAD_DIM // SPARSE_VF_REG_TILE):
+                        w_base = pl.cast(w_chunk * SPARSE_VF_WINDOW_STEP, pl.UINT16)
+                        w_offset = pl.reg.adds(w_group, w_base, w_full)
+                        w_value = pl.reg.load(value_flat, w_chunk * SPARSE_VF_REG_TILE, lanes=SPARSE_VF_REG_TILE)
+                        w_factor = pl.reg.gather(factor_flat, w_offset, w_full)
+                        w_scaled = pl.reg.mul(w_value, w_factor, w_full)
+                        w_write = pl.reg.store(value_flat, w_chunk * SPARSE_VF_REG_TILE, w_scaled, w_full)
+                scaled_values = pl.reshape(value_flat, [SPARSE_VF_GATHER_TILE, HEAD_DIM])
+                pl.tile.store(scaled_values, [destination, 0], decoded)
+            if compressed_keys > 0:
+                if column >= WINDOW_KEYS:
+                    c_column = column - WINDOW_KEYS
+                    c_ids = pl.tile.load(compressed_indices, [token, c_column], [1, SPARSE_VF_GATHER_TILE])
+                    c_raw = pl.tile.create([SPARSE_VF_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, target_memory=pl.MemorySpace.Vec)
+                    c_zero_row = pl.tile.full([1, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    for c_lane in pl.range(SPARSE_VF_GATHER_TILE):
+                        c_row = pl.tile.read(c_ids, [0, c_lane])
+                        c_physical = pl.cast(pl.max(c_row, 0), pl.INDEX)
+                        c_raw = pl.tile.gather_row(
+                            c_raw, compressed_flat, [c_lane, 0], [c_physical, 0],
+                            [1, COMPRESSED_CACHE_BYTES],
+                        )
+                        if c_row < 0:
+                            c_raw[c_lane:c_lane + 1, :] = c_zero_row
+                    # Each FP4E2M1X2 carrier contains two FP4 values.
+                    c_payload_all = pl.reinterpret_view(c_raw, pl.FP4E2M1X2)
+                    c_codes = c_payload_all[:, :SPARSE_VF_HALF_DIM]
+                    values = pl.cast(c_codes, pl.BF16)
+                    c_factor_bits = pl.reinterpret_view(
+                        c_raw, pl.INT16,
+                        shape=[SPARSE_VF_GATHER_TILE, SPARSE_VF_COMPRESSED_HALFWORDS],
+                    )
+                    c_scale_all = pl.reinterpret_view(c_factor_bits, pl.BF16)
+                    c_scale_view = c_scale_all[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                    c_factors_fp32 = pl.cast(c_scale_view, pl.FP32)
+                    c_factors = pl.cast(c_factors_fp32, pl.BF16, mode="rint")
+                    pl.tile.store(c_ids, [token, column], selected_ids)
+                    c_value_flat = pl.reshape(values, [SPARSE_VF_GATHER_TILE * HEAD_DIM])
+                    c_factor_flat = pl.reshape(
+                        c_factors, [SPARSE_VF_GATHER_TILE * SPARSE_VF_COMPRESSED_GROUPS],
+                    )
+                    with pl.reg_scope():
+                        c_full = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
+                        c_group = pl.reg.index_gen(0, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
+                        c_group = pl.reg.shift_rights(c_group, SPARSE_VF_COMPRESSED_SHIFT, c_full)
+                        for c_chunk in pl.hardware_loop(SPARSE_VF_GATHER_TILE * HEAD_DIM // SPARSE_VF_REG_TILE):
+                            c_base = pl.cast(c_chunk * SPARSE_VF_COMPRESSED_STEP, pl.UINT16)
+                            c_offset = pl.reg.adds(c_group, c_base, c_full)
+                            c_value = pl.reg.load(c_value_flat, c_chunk * SPARSE_VF_REG_TILE, lanes=SPARSE_VF_REG_TILE)
+                            c_factor = pl.reg.gather(c_factor_flat, c_offset, c_full)
+                            c_scaled = pl.reg.mul(c_value, c_factor, c_full)
+                            c_write = pl.reg.store(c_value_flat, c_chunk * SPARSE_VF_REG_TILE, c_scaled, c_full)
+                    c_scaled_values = pl.reshape(c_value_flat, [SPARSE_VF_GATHER_TILE, HEAD_DIM])
+                    pl.tile.store(c_scaled_values, [destination, 0], decoded)
+    return gathered
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_vf_attend_pypto(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    decoded: pl.Tensor,
+    selected_ids: pl.Tensor,
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    decoded_ready: pl.Scalar[pl.TASK_ID],
+    compressed_keys: pl.constexpr,
+):
+    """Attend decoded BF16 keys with tiled online softmax, BF16 probabilities and one sink."""
+    keys = WINDOW_KEYS + compressed_keys
+    parts = keys // SPARSE_VF_KEY_TILE
+    tokens = pl.tensor.dim(query, 0)
+    qflat = pl.reshape(query, [tokens * LOCAL_H, HEAD_DIM])
+    oflat = pl.reshape(output, [tokens * LOCAL_H, HEAD_DIM])
+    sink_row = pl.reshape(sink, [1, LOCAL_H])
+    workers = pl.min(num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), WORKERS)
+    workers = pl.max(1, workers)
+    with pl.spmd(
+        workers, name_hint="sparse_vf_attend", deps=[decoded_ready],
+        optimizations=[pl.cross_core_slot(slot_num=1)],
+    ) as attended:
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, num_tokens * (LOCAL_H // SPARSE_VF_HEAD_TILE), workers):
+            token = block // (LOCAL_H // SPARSE_VF_HEAD_TILE)
+            head = block % (LOCAL_H // SPARSE_VF_HEAD_TILE) * SPARSE_VF_HEAD_TILE
+            q0 = token * LOCAL_H + head
+            # Pad Cube rows without reading heads from the next token.
+            q = pl.slice(qflat, [SPARSE_VF_CUBE_HEAD_TILE, HEAD_DIM], [q0, 0],
+                         valid_shape=[SPARSE_VF_HEAD_TILE, HEAD_DIM])
+            maximum = pl.full([1, SPARSE_VF_CUBE_HEAD_TILE], dtype=pl.FP32, value=-1e30)
+            denominator = pl.full([1, SPARSE_VF_CUBE_HEAD_TILE], dtype=pl.FP32, value=0.0)
+            numerator = pl.full([SPARSE_VF_CUBE_HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+            for part in pl.range(parts):
+                k0 = token * keys + part * SPARSE_VF_KEY_TILE
+                kv = decoded[k0:k0 + SPARSE_VF_KEY_TILE, :]
+                # Compute scaled QK scores and mask invalid keys.
+                qk = pl.matmul(q, kv, b_trans=True, out_dtype=pl.FP32)
+                scores = pl.mul(qk, SCALE)
+                column = part * SPARSE_VF_KEY_TILE
+                ids = selected_ids[token:token + 1, column:column + SPARSE_VF_KEY_TILE]
+                idx = pl.cast(ids, pl.FP32)
+                positive = pl.add(idx, 1.0)
+                nonnegative = pl.maximum(positive, 0.0)
+                valid = pl.minimum(nonnegative, 1.0)
+                masked = pl.sub(valid, 1.0)
+                penalty = pl.mul(masked, 1e30)
+                scores = pl.col_expand_add(scores, penalty)
+                row_max = pl.row_max(scores)
+                tile_max = pl.reshape(row_max, [1, SPARSE_VF_CUBE_HEAD_TILE])
+                next_max = pl.maximum(maximum, tile_max)
+                max_delta = pl.sub(maximum, next_max)
+                correction = pl.exp(max_delta)
+                next_max_col = pl.reshape(next_max, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+                shifted = pl.row_expand_sub(scores, next_max_col)
+                exponentials = pl.exp(shifted)
+                probabilities = pl.col_expand_mul(exponentials, valid)
+                row_sum = pl.row_sum(probabilities)
+                tile_sum = pl.reshape(row_sum, [1, SPARSE_VF_CUBE_HEAD_TILE])
+                corrected_sum = pl.mul(denominator, correction)
+                denominator = pl.add(corrected_sum, tile_sum)
+                # Accumulate BF16 PV with the online-softmax correction.
+                weights = pl.cast(probabilities, pl.BF16, mode="rint")
+                weighted = pl.matmul(weights, kv, out_dtype=pl.FP32)
+                correction_col = pl.reshape(correction, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+                scaled = pl.row_expand_mul(numerator, correction_col)
+                numerator = pl.add(scaled, weighted)
+                maximum = next_max
+            # Normalize the accumulated values with the sink contribution.
+            sinks = pl.slice(sink_row, [1, SPARSE_VF_CUBE_HEAD_TILE], [0, head],
+                             valid_shape=[1, SPARSE_VF_HEAD_TILE])
+            final_max = pl.maximum(maximum, sinks)
+            final_delta = pl.sub(maximum, final_max)
+            correction = pl.exp(final_delta)
+            sink_delta = pl.sub(sinks, final_max)
+            sink_weight = pl.exp(sink_delta)
+            corrected_total = pl.mul(denominator, correction)
+            total = pl.add(corrected_total, sink_weight)
+            ratio = pl.div(correction, total)
+            multiplier = pl.reshape(ratio, [SPARSE_VF_CUBE_HEAD_TILE, 1])
+            normalized = pl.row_expand_mul(numerator, multiplier)
+            result = pl.cast(normalized, pl.BF16, mode="rint")
+            oflat[q0:q0 + SPARSE_VF_HEAD_TILE, :] = result[:SPARSE_VF_HEAD_TILE, :]
+    return attended
+
+
+@pl.jit.inline(auto_scope=False)
+def gather_sparse_attention_pypto(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+    source_ready: pl.Scalar[pl.TASK_ID],
+    compressed_keys: pl.constexpr,
+):
+    """Decode packed FP8/FP4 caches to GM and attend by token and head tile."""
+    keys = WINDOW_KEYS + compressed_keys
+    active_rows = pl.max(1, num_tokens)
+    rows = active_rows * keys
+    decoded = pl.create_tensor([rows, HEAD_DIM], dtype=pl.BF16)
+    selected_ids = pl.create_tensor([active_rows, keys], dtype=pl.INT32)
+    gathered = sparse_vf_decode_pypto(
+        window_indices, window, compressed_indices, compressed, decoded, selected_ids,
+        num_tokens, source_ready, compressed_keys=compressed_keys,
+    )
+    return sparse_vf_attend_pypto(
+        query, decoded, selected_ids, sink, output, num_tokens, gathered,
+        compressed_keys=compressed_keys,
+    )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1881,6 +2171,29 @@ def l2_sparse_attention(
     return output
 
 
+@pl.jit(auto_scope=False)
+def l2_sparse_attention_pypto(
+    query: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
+    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
+    compressed: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    output: pl.Out[pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16]],
+):
+    """Validate the PyPTO sparse-attention rewrite on the window plus compressed route."""
+    query.bind_dynamic(0, T_DYN)
+    window.bind_dynamic(0, ORI_BLOCKS_DYN)
+    compressed.bind_dynamic(0, CMP_BLOCKS_DYN)
+    rows = pl.tensor.dim(query, 0)
+    source_ready = pl.system.task_dummy(deps=[])
+    gather_sparse_attention_pypto(
+        query, window_indices, window, compressed_indices, compressed, sink, output,
+        rows, source_ready, compressed_keys=INDEX_TOPK,
+    )
+    return output
+
+
 _attend_cohort = make_attend_selected_chunk(
     vector_query=False, selected_rows=PACKED_COHORT_TILE, max_workers=16,
 )
@@ -2193,21 +2506,25 @@ def validate_swa_core(args):
         cases = tuple(SWA_DRAIN_CASES)
     else:
         cases = (args.swa_case,)
+    entries = (("production", l2_sparse_attention_swa), ("pypto", l2_sparse_attention_swa_pypto))
+    if args.impl != "both":
+        entries = tuple((name, entry) for name, entry in entries if name == args.impl)
     records = []
     for case in cases:
         inputs, reference = make_swa_case(case)
-        result = run(
-            l2_sparse_attention_swa, build_swa_specs(inputs),
-            golden_fn=golden_swa_core,
-            compare_fn={"output": partial(compare_swa_core, reference=reference)},
-            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-            compile_only=args.compile_only, save_data=True,
-        )
-        records.append(dict(mode="swa", case=case, passed=result.passed, work_dir=str(result.work_dir)))
-        if not result.passed:
-            raise RuntimeError(result.error)
-        status = "COMPILE_ONLY" if args.compile_only else "SIM_VALIDATED" if args.execution_mode else "DEVICE_VALIDATED"
-        print(status, "swa", case, result.work_dir)
+        for impl, entry in entries:
+            result = run(
+                entry, build_swa_specs(inputs),
+                golden_fn=golden_swa_core,
+                compare_fn={"output": partial(compare_swa_core, reference=reference)},
+                config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+                compile_only=args.compile_only, save_data=True,
+            )
+            records.append(dict(mode="swa", impl=impl, case=case, passed=result.passed, work_dir=str(result.work_dir)))
+            if not result.passed:
+                raise RuntimeError(result.error)
+            status = "COMPILE_ONLY" if args.compile_only else "SIM_VALIDATED" if args.execution_mode else "DEVICE_VALIDATED"
+            print(status, "swa", impl, case, result.work_dir)
     return records
 
 
@@ -2674,6 +2991,8 @@ if __name__ == "__main__":
     mode_choices = ["gather", "packed", "bf16", "both", "c2a", "swa",
                     "project", "project-packed", "project-swa", "all"]
     parser.add_argument("--mode", default="all", choices=mode_choices)
+    parser.add_argument("--impl", default="both", choices=["production", "pypto", "both"],
+                        help="implementation for SWA and packed validation; production keeps model dispatch")
     parser.add_argument("--swa-case", default="all", choices=["gather", "plain", "runs", "drains", "all"])
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--fixture", type=Path)
@@ -2681,12 +3000,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.tp != TP_SIZE:
         raise ValueError(f"--tp {args.tp} does not match configured TP_SIZE {TP_SIZE}")
+    if args.execution_mode and args.impl != "production" and args.mode in ("swa", "packed", "both", "all"):
+        parser.error("PyPTO sparse VF requires real A5 execution; use --impl production with --sim")
     if args.mode == "c2a" and TP_SIZE != 1:
         parser.error("C2A standalone validation requires --tp 1")
     if args.mode in ("swa", "all") and (args.fixture or args.runtime_dir):
         raise ValueError("--fixture and --runtime-dir require a sparse MLA mode: packed, bf16 or c2a")
     if args.runtime_dir and args.mode == "both":
         raise ValueError("--runtime-dir requires one --mode")
+    if args.runtime_dir and args.mode == "packed" and args.impl == "both":
+        parser.error("--runtime-dir requires one --impl: production or pypto")
     if (args.mode == "gather" or args.mode.startswith("project")) and (args.fixture or args.runtime_dir):
         raise ValueError("Gather and projection validation generate their own boundary fixtures")
     if args.rows is not None and args.rows < 1:
@@ -2771,20 +3094,26 @@ if __name__ == "__main__":
                 def golden(tensors):
                     tensors["output"].copy_(reference.bfloat16().to(result_dtype))
 
-                result = run(
-                    entry,
-                    specs,
-                    golden_fn=golden,
-                    compare_fn={"output": ratio_allclose(atol=0.003, rtol=0.03, max_error_ratio=0.0)},
-                    config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-                    compile_only=args.compile_only,
-                    runtime_dir=args.runtime_dir,
-                )
-                records.append(dict(mode=mode, rows=rows, passed=result.passed, work_dir=str(result.work_dir)))
-                if not result.passed:
-                    raise RuntimeError(result.error)
-                status = "COMPILE_ONLY" if args.compile_only else "SIM_VALIDATED" if args.execution_mode else "DEVICE_VALIDATED"
-                print(status, mode, f"rows={rows}", result.work_dir)
+                entries = (("production", entry),)
+                if mode == "packed":
+                    entries += (("pypto", l2_sparse_attention_pypto),)
+                    if args.impl != "both":
+                        entries = tuple((name, kernel) for name, kernel in entries if name == args.impl)
+                for impl, kernel in entries:
+                    result = run(
+                        kernel,
+                        specs,
+                        golden_fn=golden,
+                        compare_fn={"output": ratio_allclose(atol=0.003, rtol=0.03, max_error_ratio=0.0)},
+                        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+                        compile_only=args.compile_only,
+                        runtime_dir=args.runtime_dir,
+                    )
+                    records.append(dict(mode=mode, impl=impl, rows=rows, passed=result.passed, work_dir=str(result.work_dir)))
+                    if not result.passed:
+                        raise RuntimeError(result.error)
+                    status = "COMPILE_ONLY" if args.compile_only else "SIM_VALIDATED" if args.execution_mode else "DEVICE_VALIDATED"
+                    print(status, mode, impl, f"rows={rows}", result.work_dir)
         if args.mode == "all":
             records.extend(validate_gather_packed(args))
             records.extend(validate_swa_core(args))
