@@ -362,7 +362,7 @@ def routed_w13_pypto(
     w3_flat = pl.tensor.view(w3, [experts * W13_PACKED_EXPERT_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
     x_scale_zz = pl.tensor.view(x_scale, [experts * stride, K_SCALE], layout=pl.MX_A_ZZ)
     route_flat = pl.tensor.view(route_weights, [1, experts * stride], layout=pl.ND)
-    compact_flat = pl.tensor.view(compact_weights, [1, W13_ROWS], layout=pl.ND)
+    compact_flat = pl.tensor.view(compact_weights, [1, compact_weights.shape[0]], layout=pl.ND)
     with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_dual", deps=[input_ready]) as ready:
         core = pl.tile.get_block_idx()
         lut = pl.load(fp4_lut, [0, 0], [1, FP4_LUT_SIZE])
@@ -642,8 +642,8 @@ def routed_w2_pypto(
 ):
     """Project compact MXFP8 activations with expert-specific MXFP4 weights.
 
-    Payload and output capacity are at least experts * stride rows.
     Activation scales contain compact row-major E8M0 codes.
+    Payload storage covers the full physical row tiles loaded by the GEMM.
     """
     weight_flat = pl.tensor.view(weight, [experts * MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
     with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w2_pypto", deps=[input_ready]) as ready:
@@ -662,7 +662,7 @@ def routed_w2_pypto(
                         panel = expert * MX_W2_PACKED_ROWS + block * MOE_INTER
                         a = pl.load(payload, [compact + row, 0], [W2_M_TILE, W2_K_TILE])
                         for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                            scale_nd = pl.tensor.view(scales, [experts * stride, H_SCALE], layout=pl.ND)
+                            scale_nd = pl.tensor.view(scales, [payload.shape[0], H_SCALE], layout=pl.ND)
                             scale_row = compact + row + lane * (W2_M_TILE // 2)
                             scale_chunk = pl.load(scale_nd, [scale_row, 0], [W2_HALF_M_TILE, W2_SCALE_ROW_TILE], valid_shape=[W2_HALF_M_TILE, W2_SCALE_K_TILE])
                             # Compact valid scale pairs from the padded ND rows.
