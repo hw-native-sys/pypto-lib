@@ -312,6 +312,137 @@
       ]
     },
     {
+      "case_id": "dsv4.1-flash-prefill-swa-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_swa.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-c1a-full-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_c1a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-c1a-reindex-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_c1a_reindex.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-c1a-reuse-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_c1a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-c2a-full-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_c2a_full.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-c2a-reuse-dp1-cp1-t1024",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_c2a_reuse.py",
+      "platform": "a5",
+      "device_count": 1,
+      "arguments": [
+        "--dp",
+        "1",
+        "--cp",
+        "1",
+        "--tokens",
+        "1024",
+        "--requests",
+        "1",
+        "--case",
+        "normal"
+      ]
+    },
+    {
+      "case_id": "dsv4.1-flash-prefill-moe-dp2-cp1-ep2-t1024-e48",
+      "entrypoint": "models/deepseek_v4_1_flash/prefill_moe.py",
+      "platform": "a5",
+      "device_count": 2,
+      "arguments": [
+        "--ep",
+        "2",
+        "--entry",
+        "slabs",
+        "--tokens",
+        "1024",
+        "--slab-capacity",
+        "1024",
+        "--num-tokens",
+        "1024",
+        "--experts-per-rank",
+        "48"
+      ],
+      "runtime_config": {
+        "ring_heap": 2147483648
+      }
+    },
+    {
       "case_id": "glm5.3-flash-a3-v1-kda-projection-t192",
       "suite": "glm5.3-flash",
       "reference_profile": "glm5.3-flash-a3-v1",
