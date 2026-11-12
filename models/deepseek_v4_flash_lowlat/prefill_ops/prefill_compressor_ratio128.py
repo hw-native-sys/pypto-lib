@@ -9,6 +9,12 @@
 """DeepSeek-V4 packed prefill compressor for the ratio-128 state cache."""
 
 import pypto.language as pl
+import pypto.language.distributed as pld
+from projection_exchange import (
+    PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
+    PROJECTION_WINDOW_COLS, PROJECTION_WINDOW_ROWS,
+    projection_prepare, projection_exchange, projection_release,
+)
 from utils import checkpoint_ends_tensor
 
 from config import (
@@ -77,6 +83,384 @@ HCA_C128_RMS_PAD_ROWS = ((MAX_CMP_WRITES + HCA_C128_RMS_TILE - 1) // HCA_C128_RM
 assert PREFILL_STATE_TILE % PROJ_ROW_TILE == 0
 assert PREFILL_STATE_TILE % COMPRESS_RATIO == 0
 assert HCA_STATE_BLOCK_NUM == DECODE_BATCH * HCA_STATE_BLOCKS_PER_REQUEST
+
+
+@pl.jit.inline(auto_scope=False)
+def _prefill_compressor_ratio128_projection_tile(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    kv_proj_scratch: pl.Tensor[[PREFILL_STATE_TILE, OUT_DIM], pl.FP32],
+    score_proj_scratch: pl.Tensor[[PREFILL_STATE_TILE, OUT_DIM], pl.FP32],
+    tile_base: pl.Scalar[pl.INDEX],
+    tile_rows: pl.Scalar[pl.INDEX],
+    previous_consumer: pl.Scalar[pl.TASK_ID],
+):
+    readiness = pl.array.create(2, pl.TASK_ID)
+    readiness[0] = previous_consumer
+    readiness[1] = previous_consumer
+    t_dim = pl.tensor.dim(x, 0)
+    x_flat = pl.reshape(x, [t_dim, D])
+    proj_full_rows = (tile_rows // PROJ_ROW_TILE) * PROJ_ROW_TILE
+    proj_padded_rows = ((tile_rows + PROJ_TAIL_ROW_TILE - 1) // PROJ_TAIL_ROW_TILE) * PROJ_TAIL_ROW_TILE
+
+    if proj_full_rows > 0:
+        with pl.spmd(
+            (OUT_DIM // OUT_TILE) * PROJ_FULL_ROW_BLOCKS,
+            name_hint="prefill_hca_c128_kv_score_proj_full",
+            deps=[previous_consumer],
+        ) as full_projection:
+            proj_idx = pl.tile.get_block_idx()
+            proj_n = proj_idx // PROJ_FULL_ROW_BLOCKS
+            proj_row_block = proj_idx - proj_n * PROJ_FULL_ROW_BLOCKS
+            o0 = proj_n * OUT_TILE
+            local_t0 = proj_row_block * PROJ_ROW_TILE
+            if local_t0 < proj_full_rows:
+                global_t0 = tile_base + local_t0
+                kv_acc = pl.create_tensor([PROJ_ROW_TILE, OUT_TILE], dtype=pl.FP32)
+                score_acc = pl.create_tensor([PROJ_ROW_TILE, OUT_TILE], dtype=pl.FP32)
+                for kb in pl.pipeline(0, D // K_TILE, stage=2):
+                    k0 = kb * K_TILE
+                    x_tile = x_flat[
+                        global_t0 : global_t0 + PROJ_ROW_TILE,
+                        k0 : k0 + K_TILE,
+                    ]
+                    wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+                    wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+                    kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True, init_cond=(k0 == 0))
+                    score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True, init_cond=(k0 == 0))
+                kv_proj_scratch[
+                    local_t0 : local_t0 + PROJ_ROW_TILE,
+                    o0 : o0 + OUT_TILE,
+                ] = kv_acc
+                score_proj_scratch[
+                    local_t0 : local_t0 + PROJ_ROW_TILE,
+                    o0 : o0 + OUT_TILE,
+                ] = score_acc
+
+        readiness[0] = full_projection
+    if proj_full_rows < proj_padded_rows:
+        with pl.spmd(
+            (OUT_DIM // OUT_TILE) * PROJ_TAIL_ROW_BLOCKS,
+            name_hint="prefill_hca_c128_kv_score_proj_tail",
+            deps=[previous_consumer],
+        ) as tail_projection:
+            tail_idx = pl.tile.get_block_idx()
+            tail_n = tail_idx // PROJ_TAIL_ROW_BLOCKS
+            tail_row_block = tail_idx - tail_n * PROJ_TAIL_ROW_BLOCKS
+            tail_o0 = tail_n * OUT_TILE
+            tail_t0 = proj_full_rows + tail_row_block * PROJ_TAIL_ROW_TILE
+            if tail_t0 < proj_padded_rows:
+                tail_valid_rows = pl.min(PROJ_TAIL_ROW_TILE, tile_rows - tail_t0)
+                tail_global_t0 = tile_base + tail_t0
+                kv_tail_acc = pl.create_tensor([PROJ_TAIL_ROW_TILE, OUT_TILE], dtype=pl.FP32)
+                score_tail_acc = pl.create_tensor([PROJ_TAIL_ROW_TILE, OUT_TILE], dtype=pl.FP32)
+                for tail_kb in pl.pipeline(0, D // K_TILE, stage=2):
+                    tail_k0 = tail_kb * K_TILE
+                    x_tail = pl.slice(
+                        x_flat,
+                        [PROJ_TAIL_ROW_TILE, K_TILE],
+                        [tail_global_t0, tail_k0],
+                        valid_shape=[tail_valid_rows, K_TILE],
+                    )
+                    wkv_tail = wkv[
+                        tail_o0 : tail_o0 + OUT_TILE,
+                        tail_k0 : tail_k0 + K_TILE,
+                    ]
+                    wgate_tail = wgate[
+                        tail_o0 : tail_o0 + OUT_TILE,
+                        tail_k0 : tail_k0 + K_TILE,
+                    ]
+                    kv_tail_acc = pl.matmul_acc(kv_tail_acc, x_tail, wkv_tail, b_trans=True, init_cond=(tail_k0 == 0))
+                    score_tail_acc = pl.matmul_acc(score_tail_acc, x_tail, wgate_tail, b_trans=True, init_cond=(tail_k0 == 0))
+                kv_proj_scratch[
+                    tail_t0 : tail_t0 + PROJ_TAIL_ROW_TILE,
+                    tail_o0 : tail_o0 + OUT_TILE,
+                ] = kv_tail_acc
+                score_proj_scratch[
+                    tail_t0 : tail_t0 + PROJ_TAIL_ROW_TILE,
+                    tail_o0 : tail_o0 + OUT_TILE,
+                ] = score_tail_acc
+
+        readiness[1] = tail_projection
+    return pl.system.task_dummy(deps=[readiness[0], readiness[1]])
+
+
+@pl.jit.inline(auto_scope=False)
+def _prefill_compressor_ratio128_consume_tile(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    compress_state: pl.InOut[
+        pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
+    ],
+    compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    rope_dup_idx_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.INT32],
+    rope_swap_idx_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.INT32],
+    rope_sign_template: pl.Tensor[[HCA_C128_RMS_TILE, ROPE_HEAD_DIM], pl.FP32],
+    state_order_fence: pl.InOut[pl.Tensor[[1], pl.INT32]],
+    request_start: pl.Scalar[pl.INDEX],
+    tile_base: pl.Scalar[pl.INDEX],
+    tile_rows: pl.Scalar[pl.INDEX],
+    checkpoint_ends: pl.Tensor[[CHECKPOINTS_PER_TILE], pl.INT32],
+    kv_proj_scratch: pl.Tensor[[PREFILL_STATE_TILE, OUT_DIM], pl.FP32],
+    score_proj_scratch: pl.Tensor[[PREFILL_STATE_TILE, OUT_DIM], pl.FP32],
+    consumer_ready: pl.Scalar[pl.TASK_ID],
+    consumed: pl.Array[1, pl.TASK_ID],
+):
+    state_block_num = pl.tensor.dim(compress_state, 0)
+    cmp_block_num = pl.tensor.dim(cmp_kv, 0)
+    compress_state_flat = pl.reshape(
+        compress_state,
+        [state_block_num * HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+    )
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
+
+    write_pos_map = pl.create_tensor([1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32)
+    write_dst_map = pl.create_tensor([1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32)
+    write_src_map = pl.create_tensor([1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_write_map"):
+        write_pos_map[0:1, 0:HCA_C128_RMS_PAD_ROWS] = pl.full(
+            [1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32, value=0
+        )
+        write_dst_map[0:1, 0:HCA_C128_RMS_PAD_ROWS] = pl.full(
+            [1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32, value=-1
+        )
+        write_src_map[0:1, 0:HCA_C128_RMS_PAD_ROWS] = pl.full([1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32, value=-1)
+        map_seen = pl.cast(0, pl.INDEX)
+        for map_local in pl.range(tile_rows):
+            map_global = tile_base + map_local
+            map_slot_raw = pl.read(cmp_slot_mapping, [map_global])
+            if map_slot_raw >= 0:
+                pl.write(write_pos_map, [0, map_seen], pl.read(position_ids, [map_global]))
+                pl.write(write_dst_map, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
+                pl.write(write_src_map, [0, map_seen], pl.cast(map_global, pl.INT32))
+                map_seen = map_seen + 1
+
+    pooled_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
+    with pl.spmd(
+        MAX_CMP_WRITES * (HEAD_DIM // HEAD_TILE), name_hint="prefill_hca_c128_softmax_pool"
+    , deps=[consumer_ready]) as pool_tid:
+        pool_idx = pl.tile.get_block_idx()
+        _state_order_anchor = pl.read(state_order_fence, [0])
+        write_i = pool_idx // (HEAD_DIM // HEAD_TILE)
+        hb = pool_idx - write_i * (HEAD_DIM // HEAD_TILE)
+        h0 = hb * HEAD_TILE
+        pool_kv_tile = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
+        pool_score_tile = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
+        write_slot_raw = pl.read(write_dst_map, [0, write_i])
+        if write_slot_raw >= 0:
+            write_pos = pl.read(write_pos_map, [0, write_i])
+            write_src = pl.cast(pl.read(write_src_map, [0, write_i]), pl.INDEX)
+            pool_start = write_pos + 1 - COMPRESS_RATIO
+            for pool_state_i in pl.range(STATE_LEN):
+                pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.full(
+                    [1, HEAD_TILE],
+                    dtype=pl.FP32,
+                    value=0.0,
+                )
+                pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.full(
+                    [1, HEAD_TILE],
+                    dtype=pl.FP32,
+                    value=0.0,
+                )
+                pool_abs = pool_start + pool_state_i
+                pool_source = write_src - pl.cast(write_pos - pool_abs, pl.INDEX)
+                if pool_source < tile_base:
+                    pool_state_row_raw = pl.cast(-1, pl.INT64)
+                    if pool_source >= request_start:
+                        pool_state_row_raw = pl.read(state_slot_mapping, [pool_source])
+                    else:
+                        pool_state_block = pl.cast(pool_abs // HCA_STATE_BLOCK_SIZE, pl.INDEX)
+                        pool_state_intra = pl.cast(pool_abs % HCA_STATE_BLOCK_SIZE, pl.INDEX)
+                        pool_phys_block_raw = pl.read(compress_state_block_table, [pool_state_block])
+                        if pool_phys_block_raw >= 0:
+                            pool_state_row_raw = pl.cast(pool_phys_block_raw * HCA_STATE_BLOCK_SIZE, pl.INT64)
+                            pool_state_row_raw = pool_state_row_raw + pool_state_intra
+                    if pool_state_row_raw >= 0:
+                        pool_state_row = pl.cast(pool_state_row_raw, pl.INDEX)
+                        pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
+                            pool_state_row : pool_state_row + 1,
+                            h0 : h0 + HEAD_TILE,
+                        ]
+                        pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
+                            pool_state_row : pool_state_row + 1,
+                            OUT_DIM + h0 : OUT_DIM + h0 + HEAD_TILE,
+                        ]
+                else:
+                    pool_local = pool_source - tile_base
+                    pool_ape_slot = pl.cast(pool_abs % COMPRESS_RATIO, pl.INDEX)
+                    pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = kv_proj_scratch[
+                        pool_local : pool_local + 1,
+                        h0 : h0 + HEAD_TILE,
+                    ]
+                    pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.add(
+                        score_proj_scratch[
+                            pool_local : pool_local + 1,
+                            h0 : h0 + HEAD_TILE,
+                        ],
+                        ape[
+                            pool_ape_slot : pool_ape_slot + 1,
+                            h0 : h0 + HEAD_TILE,
+                        ],
+                    )
+            # Vectorized softmax over all STATE_LEN slots: transpose the assembled
+            # [STATE_LEN, HEAD_TILE] tile, then row_max/exp/sum/div and the weighted sum.
+            pool_score_t = pl.transpose(pool_score_tile, axis1=0, axis2=1)
+            pool_kv_t = pl.transpose(pool_kv_tile, axis1=0, axis2=1)
+            score_max = pl.row_max(pool_score_t)
+            score_exp = pl.exp(pl.row_expand_sub(pool_score_t, score_max))
+            score_sum = pl.row_sum(score_exp)
+            score_prob = pl.row_expand_div(score_exp, score_sum)
+            pooled_chunk_t = pl.row_sum(pl.mul(pool_kv_t, score_prob))
+            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + HEAD_TILE] = pl.reshape(
+                pooled_chunk_t, [1, HEAD_TILE]
+            )
+        else:
+            pooled_zero = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
+            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + HEAD_TILE] = pooled_zero
+
+    tail_rows = pl.min(tile_rows, STATE_STORAGE_LEN)
+    tail_base = tile_rows - tail_rows
+    tile_position = pl.read(position_ids, [tile_base])
+    checkpoint_rows = pl.cast(0, pl.INDEX)
+    previous_end = pl.cast(0, pl.INT32)
+    if pl.read(checkpoint_ends, [0]) > 0:
+        for checkpoint_i in pl.range(CHECKPOINTS_PER_TILE):
+            checkpoint_end = pl.read(checkpoint_ends, [checkpoint_i])
+            checkpoint_begin = pl.max(tile_position, pl.max(checkpoint_end - STATE_LEN, previous_end))
+            checkpoint_stop = pl.min(tile_position + tail_base, checkpoint_end)
+            checkpoint_rows = checkpoint_rows + pl.max(0, checkpoint_stop - checkpoint_begin)
+            previous_end = pl.max(previous_end, checkpoint_end)
+    with pl.spmd(
+        tail_rows + checkpoint_rows,
+        name_hint="prefill_hca_c128_state_tail_update",
+        deps=[pool_tid],
+    ) as state_update_tid:
+        tail_i = pl.tile.get_block_idx()
+        update_local = tail_base + tail_i
+        if tail_i >= tail_rows:
+            checkpoint_offset = tail_i - tail_rows
+            selected_previous = pl.cast(0, pl.INT32)
+            for selected_i in pl.range(CHECKPOINTS_PER_TILE):
+                selected_end = pl.read(checkpoint_ends, [selected_i])
+                selected_begin = pl.max(tile_position, pl.max(selected_end - STATE_LEN, selected_previous))
+                selected_stop = pl.min(tile_position + tail_base, selected_end)
+                selected_rows = pl.max(0, selected_stop - selected_begin)
+                if checkpoint_offset >= 0 and checkpoint_offset < selected_rows:
+                    update_local = selected_begin - tile_position + checkpoint_offset
+                checkpoint_offset = checkpoint_offset - selected_rows
+                selected_previous = pl.max(selected_previous, selected_end)
+        update_global = tile_base + update_local
+        state_row_raw = pl.read(state_slot_mapping, [update_global])
+        if state_row_raw >= 0:
+            state_row = pl.cast(state_row_raw, pl.INDEX)
+            update_pos = pl.read(position_ids, [update_global])
+            ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
+            compress_state_flat[state_row : state_row + 1, 0:OUT_DIM] = kv_proj_scratch[
+                update_local : update_local + 1,
+                0:OUT_DIM,
+            ]
+            compress_state_flat[
+                state_row : state_row + 1,
+                OUT_DIM:COMPRESS_STATE_DIM,
+            ] = pl.add(
+                score_proj_scratch[
+                    update_local : update_local + 1,
+                    0:OUT_DIM,
+                ],
+                ape[ape_slot : ape_slot + 1, 0:OUT_DIM],
+            )
+
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="prefill_hca_c128_state_order_commit",
+        deps=[state_update_tid],
+    ):
+        pool_sample = pl.read(pooled_kv_pad, [0, 0])
+        fence_bit = pl.cast(pool_sample == pool_sample, pl.INT32)
+        pl.write(state_order_fence, [0], fence_bit * fence_bit)
+
+    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
+    normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
+    for rms_blk in pl.spmd(
+        HCA_C128_RMS_PAD_ROWS // HCA_C128_RMS_TILE, name_hint="prefill_hca_c128_rmsnorm_rope"
+    ):
+        r0 = rms_blk * HCA_C128_RMS_TILE
+        cos_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
+        sin_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
+        for norm_i in pl.range(HCA_C128_RMS_TILE):
+            norm_slot_raw = pl.read(write_dst_map, [0, r0 + norm_i])
+            if norm_slot_raw >= 0:
+                write_src = pl.cast(pl.read(write_src_map, [0, r0 + norm_i]), pl.INDEX)
+                cos_row = pl.cast(
+                    cmp_freqs_cos[write_src : write_src + 1, 0:ROPE_HALF], target_type=pl.FP32
+                )
+                sin_row = pl.cast(
+                    cmp_freqs_sin[write_src : write_src + 1, 0:ROPE_HALF], target_type=pl.FP32
+                )
+                cos_b[norm_i : norm_i + 1, 0:ROPE_HALF] = cos_row
+                sin_b[norm_i : norm_i + 1, 0:ROPE_HALF] = sin_row
+        partial_sq = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.FP32, value=0.0)
+        for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
+            rms_h0 = rms_kb * HEAD_TILE
+            kv_rms_chunk = pooled_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, rms_h0 : rms_h0 + HEAD_TILE]
+            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
+            partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(kv_rms_sq), [1, HCA_C128_RMS_TILE]))
+
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, 1.0 / HEAD_DIM), EPS), [HCA_C128_RMS_TILE, 1])
+        inv_rms = pl.recip(pl.sqrt(variance))
+        for norm_kb in pl.pipeline(NOPE_HEAD_DIM // HEAD_TILE, stage=2):
+            norm_h0 = norm_kb * HEAD_TILE
+            kv_norm_chunk = pooled_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, norm_h0 : norm_h0 + HEAD_TILE]
+            gamma = pl.cast(norm_w_2d[:, norm_h0 : norm_h0 + HEAD_TILE], pl.FP32)
+            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
+            normed_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, norm_h0 : norm_h0 + HEAD_TILE] = normed_chunk
+
+        kv_rope = pooled_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM]
+        gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM:HEAD_DIM], pl.FP32)
+        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope, inv_rms), gamma_rope)
+        # A3 interleaved swap-gather: one data gather + sign trick.
+        # out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]; idx built in-kernel from pl.arange.
+        # The index templates are prepared at the parent scope. Level-3 child
+        # scopes do not run PTOPlanMemory, so generating TCI/arange here would
+        # require an unavailable implicit temporary in PTOAS 0.54.
+        rope_dup_idx = rope_dup_idx_template[:, :]
+        rope_swap_idx = rope_swap_idx_template[:, :]
+        rope_sign = rope_sign_template[:, :]
+        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
+        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
+        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
+        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
+        normed_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_rot
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_kv_finalize"):
+        for final_i in pl.range(MAX_CMP_WRITES):
+            final_cmp_row_raw = pl.read(write_dst_map, [0, final_i])
+            if final_cmp_row_raw >= 0:
+                final_cmp_row = pl.cast(final_cmp_row_raw, pl.INDEX)
+                for final_hb in pl.range(HEAD_DIM // HEAD_TILE):
+                    final_h0 = final_hb * HEAD_TILE
+                    final_chunk = normed_kv_pad[final_i : final_i + 1, final_h0 : final_h0 + HEAD_TILE]
+                    cmp_kv_flat[final_cmp_row : final_cmp_row + 1, final_h0 : final_h0 + HEAD_TILE] = pl.cast(
+                        final_chunk,
+                        target_type=pl.BF16,
+                        mode="rint",
+                    )
+
+    # Writes through the flattened views already update the caller-owned buffers; a dynamic
+    # reshape-back is not valid in this nested inline kernel.
+
+    consumed[0] = pl.system.task_dummy(deps=[pool_tid, state_update_tid])
+    return cmp_kv, compress_state
 
 
 @pl.jit.inline(auto_scope=False)
@@ -437,6 +821,8 @@ def _prefill_compressor_ratio128_tile(
     return cmp_kv, compress_state
 
 
+
+
 def _prefill_compressor_ratio128(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
@@ -533,6 +919,154 @@ def _prefill_compressor_ratio128(
                     tile_rows,
                     state_checkpoint_ends[request, request_offset // PREFILL_STATE_TILE],
                 )
+    return cmp_kv, compress_state
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_compressor_ratio128_cp(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
+    state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
+    compress_state: pl.InOut[
+        pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
+    ],
+    compress_state_block_table: pl.Tensor[[REQUESTS_DYN, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cmp_freqs_cos: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_freqs_sin: pl.Tensor[[T_DYN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    projection_window: pld.DistributedTensor[[PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], pl.FP32],
+    projection_prepared: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_ready: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_peers: pl.Tensor[[PROJECTION_RANKS], pl.INT32],
+    projection_epochs: pl.Array[PROJECTION_KINDS, pl.INT32],
+    projection_rank: pl.Scalar[pl.INT32],
+    projection_d: pl.constexpr,
+):
+    """Compress packed requests independently through ordered 512-row state tiles.
+
+    Each request slice delimited by ``query_start_loc`` must use consecutive positions.
+    """
+    x.bind_dynamic(0, T_DYN)
+    query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
+    state_checkpoint_ends.bind_dynamic(0, REQUESTS_DYN)
+    state_checkpoint_ends.bind_dynamic(1, CHECKPOINT_TILES_DYN)
+    compress_state.bind_dynamic(0, STATE_BLOCK_NUM_DYN)
+    compress_state_block_table.bind_dynamic(0, REQUESTS_DYN)
+    cmp_kv.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
+    cmp_freqs_cos.bind_dynamic(0, T_DYN)
+    cmp_freqs_sin.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    cmp_slot_mapping.bind_dynamic(0, T_DYN)
+    state_slot_mapping.bind_dynamic(0, T_DYN)
+    request_count = pl.tensor.dim(query_start_loc, 0) - 1
+    rope_dup_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_swap_idx_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_sign_template = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_rope_index_prepare"):
+        # Scalar construction avoids TCI's implicit temporary, which is not
+        # available when this inline program is itself nested under HCA.
+        for rope_r in pl.range(HCA_C128_RMS_TILE):
+            for rope_c in pl.range(ROPE_HEAD_DIM):
+                rope_lane = rope_c % 2
+                pl.write(
+                    rope_dup_idx_template,
+                    [rope_r, rope_c],
+                    pl.cast(rope_c // 2, pl.INT32),
+                )
+                pl.write(
+                    rope_swap_idx_template,
+                    [rope_r, rope_c],
+                    pl.cast(rope_c + 1 - rope_lane * 2, pl.INT32),
+                )
+                pl.write(
+                    rope_sign_template,
+                    [rope_r, rope_c],
+                    pl.cast(pl.cast(rope_lane * 2 - 1, pl.INT32), pl.FP32),
+                )
+
+    # One GM-resident token orders each tile's pool and bounded state-tail commit.
+    state_order_fence = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_state_order_init"):
+        pl.write(state_order_fence, [0], pl.cast(0, pl.INT32))
+    projection_local_kv = pl.create_tensor([2 * PREFILL_STATE_TILE, OUT_DIM], dtype=pl.FP32)
+    projection_local_gate = pl.create_tensor([2 * PREFILL_STATE_TILE, OUT_DIM], dtype=pl.FP32)
+    projection_released = pl.array.create(2, pl.TASK_ID)
+    projection_released[0] = pl.system.task_dummy(deps=[])
+    projection_released[1] = projection_released[0]
+    for request in pl.range(request_count):
+        request_start = pl.cast(pl.read(query_start_loc, [request]), pl.INDEX)
+        request_end = pl.cast(pl.read(query_start_loc, [request + 1]), pl.INDEX)
+        request_table = compress_state_block_table[request]
+        for request_offset in pl.range(0, request_end - request_start, PREFILL_STATE_TILE):
+            tile_base = request_start + request_offset
+            tile_rows = pl.min(PREFILL_STATE_TILE, request_end - tile_base)
+            with pl.scope():
+                projection_epochs[4] = projection_epochs[4] + 1
+                epoch = projection_epochs[0] + projection_epochs[1] + projection_epochs[2]
+                epoch = epoch + projection_epochs[3] + projection_epochs[4] + projection_epochs[5]
+                slot = (epoch - 1) % 2
+                slot_row = slot * PREFILL_STATE_TILE
+                kv_proj_scratch = projection_local_kv[slot_row:slot_row + PREFILL_STATE_TILE, :]
+                score_proj_scratch = projection_local_gate[slot_row:slot_row + PREFILL_STATE_TILE, :]
+                previous_consumer = projection_released[slot]
+                slot_reusable, targets_ready = projection_prepare(
+                    projection_prepared, projection_consumed, projection_peers, projection_rank, epoch,
+                    previous_consumer, 4, projection_d,
+                )
+                produced = pl.array.create(1, pl.TASK_ID)
+                produced[0] = slot_reusable
+                owner = pl.read(projection_peers, [(epoch - 1) % (PROJECTION_RANKS // projection_d)])
+                if projection_rank == owner:
+                    projected_tile_tid = _prefill_compressor_ratio128_projection_tile(
+                        x, wkv, wgate, kv_proj_scratch, score_proj_scratch, tile_base, tile_rows,
+                        slot_reusable,
+                    )
+                    produced[0] = projected_tile_tid
+                producer_done = produced[0]
+                consumer_ready = projection_exchange(
+                    kv_proj_scratch, score_proj_scratch, projection_window, projection_ready,
+                    projection_peers, projection_rank, epoch, tile_rows, producer_done, targets_ready, 4,
+                    projection_d, OUT_DIM, True,
+                )
+                consumed = pl.array.create(1, pl.TASK_ID)
+                _prefill_compressor_ratio128_consume_tile(
+                    x,
+                    compress_state,
+                    request_table,
+                    wkv,
+                    wgate,
+                    ape,
+                    norm_w,
+                    cmp_freqs_cos,
+                    cmp_freqs_sin,
+                    cmp_kv,
+                    position_ids,
+                    cmp_slot_mapping,
+                    state_slot_mapping,
+                    rope_dup_idx_template,
+                    rope_swap_idx_template,
+                    rope_sign_template,
+                    state_order_fence,
+                    request_start,
+                    tile_base,
+                    tile_rows,
+                    state_checkpoint_ends[request, request_offset // PREFILL_STATE_TILE],
+                    kv_proj_scratch, score_proj_scratch, consumer_ready, consumed,
+                )
+                local_consumed = consumed[0]
+                released_tile_tid = projection_release(
+                    projection_consumed, projection_peers, projection_rank, epoch, local_consumed, 4,
+                    projection_d,
+                )
+                projection_released[slot] = released_tile_tid
     return cmp_kv, compress_state
 
 

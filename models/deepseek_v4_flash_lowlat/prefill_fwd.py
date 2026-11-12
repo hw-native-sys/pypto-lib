@@ -24,11 +24,17 @@ _HCA_LAYERS = 20
 
 
 @contextmanager
-def _prefill_import(*, query_pipeline=False):
+def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None):
     """Isolate the private prefill operators' import-time TP8 configuration."""
+    projection_degrees = dict(projection_degrees or {})
+    for family, degree in projection_degrees.items():
+        if family not in ("swa", "csa", "hca") or type(degree) is not int or degree not in (1, 2, 4, 8):
+            raise ValueError("Projection degrees require swa/csa/hca and d=1/2/4/8")
     source = Path(__file__).resolve().parent / "prefill_ops"
     names = tuple(path.stem for path in source.glob("*.py"))
     missing = object()
+    if type(indexer_arenas) is not int or indexer_arenas not in (1, 2):
+        raise ValueError("Prefill indexer arenas must be one or two")
     with _IMPORT_LOCK:
         old_modules = {name: sys.modules.get(name, missing) for name in names}
         old_path, old_argv = list(sys.path), list(sys.argv)
@@ -37,6 +43,9 @@ def _prefill_import(*, query_pipeline=False):
         sys.path.insert(0, str(source))
         sys.argv = ["lowlat-prefill", "--tp", "8", "--ep", "8", "--dp", "1", "--lm-head-tp", "8"]
         sys.argv += ["--prefill-query-pipeline", "1" if query_pipeline else "0", "--prefill-resident-weights"]
+        sys.argv += ["--prefill-indexer-arenas", str(indexer_arenas)]
+        for family, degree in projection_degrees.items():
+            sys.argv += ["--prefill-projection-" + family + "-d", str(degree)]
         try:
             yield
         finally:
@@ -49,7 +58,7 @@ def _prefill_import(*, query_pipeline=False):
                     sys.modules[name] = module
 
 
-def load_prefill_programs(*, mode="chunk"):
+def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None):
     """Return the TP8 attention, MoE, tap, and head entries for compilation.
 
     Load in a single-threaded setup process before creating Workers. ``chunk``
@@ -58,7 +67,9 @@ def load_prefill_programs(*, mode="chunk"):
     """
     if mode not in ("chunk", "serial"):
         raise ValueError("Prefill mode must be chunk or serial")
-    with _prefill_import(query_pipeline=mode == "chunk"):
+    if mode == "serial" and indexer_arenas != 1:
+        raise ValueError("Multiple indexer arenas require the chunk query pipeline")
+    with _prefill_import(query_pipeline=mode == "chunk", indexer_arenas=indexer_arenas, projection_degrees=projection_degrees):
         qkv = importlib.import_module("qkv_proj_rope")
         ordered_qkv = importlib.import_module("models.deepseek_v4_flash_lowlat.drafter.qkv_proj_rope")
         geometry = (
@@ -131,6 +142,47 @@ def _checked_arguments(metadata, bindings):
     return arguments
 
 
+def prepare_projection_bindings(*, topology=None, projection_degrees=None, epoch_bases=None):
+    """Allocate rank-local projection metadata before preparing the owning Worker.
+
+    Keep degrees and topology fixed for a communication domain. After each completed
+    chunk, advance bases with ``advance_projection_epochs`` before the next submit.
+    No per-tile device result is used to determine these counters.
+    """
+    import torch
+
+    degrees = {family: 8 for family in ("swa", "csa", "hca")}
+    degrees.update(projection_degrees or {})
+    if set(degrees) != {"swa", "csa", "hca"} or any(type(d) is not int or d not in (1, 2, 4, 8) for d in degrees.values()):
+        raise ValueError("Projection degrees require swa/csa/hca and d=1/2/4/8")
+    bases = [0] * 6 if epoch_bases is None else list(epoch_bases)
+    if len(bases) != 6 or any(type(n) is not int or n < 0 for n in bases) or sum(bases) >= 2**31 - 1:
+        raise ValueError("Six nonnegative INT32 projection epoch bases are required")
+    peers = torch.full((8, 3, 8), -1, dtype=torch.int32)
+    with _prefill_import():
+        planner = importlib.import_module("projection_exchange").projection_groups
+        for index, family in enumerate(("swa", "csa", "hca")):
+            degree = degrees[family]
+            if degree == 8:
+                peers[:, index, 0] = torch.arange(8, dtype=torch.int32)
+            else:
+                if topology is None:
+                    raise ValueError("Shared projection requires actual rank topology")
+                peers[:, index] = torch.tensor(planner(topology, degree), dtype=torch.int32)
+    epochs = torch.tensor(bases, dtype=torch.int32).repeat(8, 1)
+    return {"projection_peers": peers.share_memory_(), "projection_epoch_bases": epochs.share_memory_()}
+
+
+def advance_projection_epochs(bases, request_lengths, *, projection_degrees, layers=43):
+    """Calculate the next whole-chunk bases from request lengths and the layer schedule."""
+    with _prefill_import():
+        advance = importlib.import_module("projection_exchange").projection_epoch_advance
+        result = advance(bases, request_lengths, layers=layers)
+    families = ("swa", "csa", "hca", "csa", "hca", "csa")
+    return [base if projection_degrees.get(family, 8) == 8 else end
+            for base, end, family in zip(bases, result, families)]
+
+
 def prepare_prefill_bindings(worker, caches, weights, inputs, scratch):
     """Bind caller-owned TP8 weights, shared caches, input metadata and scratch."""
     from .prefill_cache import prefill_cache_views
@@ -191,6 +243,9 @@ def _attention_bindings(worker, metadata, bindings, layer, x_hc):
     kind = "swa" if layer < 2 else ("csa" if layer % 2 == 0 else "hca")
     rows = _metadata_rows(metadata[kind])
     result = {"x_hc_full": x_hc, "x_out_full": bindings["attn_stage"]}
+    for name in ("projection_peers", "projection_epoch_bases"):
+        if name in rows:
+            result[name] = bindings[name]
     for name in ("hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w", "wq_a", "wq_b",
                  "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv", "attn_sink", "wo_b_scale"):
         result[name] = _layer_weight(worker, bindings, rows, name, name, layer, _LAYERS)

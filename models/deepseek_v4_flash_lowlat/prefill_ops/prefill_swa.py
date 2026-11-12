@@ -10,6 +10,12 @@
 """DeepSeek-V4 packed prefill SWA attention: single-die at --tp 1, context-parallel above it."""
 
 import pypto.language as pl
+from projection_exchange import (
+    PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
+    PROJECTION_WINDOW_COLS, PROJECTION_WINDOW_ROWS,
+    projection_degree, projection_tensor_specs,
+)
+from qkv_proj_rope import kv_proj_rope_cp
 
 from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 import pypto.language.distributed as pld
@@ -62,6 +68,9 @@ from qkv_proj_rope import (
     rope_prepare,
 )
 from rmsnorm import golden_rms_norm, rms_norm
+
+
+PROJECTION_D = projection_degree("swa")
 
 
 # Dynamic shape variables. The single-die path runs on one token axis; the
@@ -245,6 +254,13 @@ def prefill_attention_swa_cp_core(
     attn_out_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
     late_dep: pl.Scalar[pl.TASK_ID],
     o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    projection_window: pld.DistributedTensor[[PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], pl.FP32],
+    projection_prepared: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_ready: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_peers: pl.Tensor[[PROJECTION_RANKS], pl.INT32],
+    projection_epochs: pl.Array[PROJECTION_KINDS, pl.INT32],
+    projection_rank: pl.Scalar[pl.INT32],
 ):
     """SWA attention body: local queries/output projection and replicated full KV."""
     q_dim = pl.tensor.dim(x_normed_local, 0)
@@ -266,7 +282,14 @@ def prefill_attention_swa_cp_core(
     rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
 
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep)
+    if PROJECTION_D < 8:
+        kv_proj_rope_cp(
+            x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep,
+            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers,
+            projection_epochs, projection_rank, 0, PROJECTION_D,
+        )
+    else:
+        kv_proj_rope(x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep)
 
     block_num = pl.tensor.dim(kv_cache, 0)
     kv_cache_flat = pl.reshape(kv_cache, [block_num * BLOCK_SIZE, HEAD_DIM])
@@ -364,6 +387,12 @@ def prefill_attention_swa_cp(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     weight_epoch: pl.Scalar[pl.INT32],
+    projection_window: pld.DistributedTensor[[PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], pl.FP32],
+    projection_prepared: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_ready: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_peers: pl.Tensor[[3, PROJECTION_RANKS], pl.INT32],
+    projection_epochs: pl.Array[PROJECTION_KINDS, pl.INT32],
 ):
     """DSA-CP SWA with replicated HC state at both layer boundaries."""
     o_proj_weight_dep = gather_o_proj_full_weights(
@@ -412,6 +441,7 @@ def prefill_attention_swa_cp(
         wo_a_full, wo_b_full, wo_b_scale,
         attn_out_local,
         late_dep, o_proj_weight_dep,
+        projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[0], projection_epochs, group_base + tp_rank,
     )
 
     attn_out_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
@@ -459,7 +489,16 @@ def prefill_attention_swa_cp_test(
     o_proj_weight_consumed: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
+    projection_window: pld.DistributedTensor[[PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], pl.FP32],
+    projection_prepared: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_ready: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_peers: pl.Tensor[[3, PROJECTION_RANKS], pl.INT32],
+    projection_epoch_bases: pl.Tensor[[PROJECTION_KINDS], pl.INT32],
 ):
+    projection_epochs = pl.array.create(PROJECTION_KINDS, pl.INT32)
+    for projection_kind in pl.unroll(PROJECTION_KINDS):
+        projection_epochs[projection_kind] = pl.read(projection_epoch_bases, [projection_kind])
     """Run one DSA-CP rank's SWA block with replicated layer-boundary state."""
     x_hc_full.bind_dynamic(0, CP_KV_T_DYN)
     freqs_cos.bind_dynamic(0, CP_KV_T_DYN)
@@ -492,6 +531,7 @@ def prefill_attention_swa_cp_test(
         o_proj_weight_ready, o_proj_weight_consumed,
         o_proj_order_fence,
         group_base, tp_rank, pl.const(1, pl.INT32),
+        projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
     )
     return kv_cache, x_out_full
 
@@ -522,6 +562,8 @@ def l3_prefill_attention_swa_cp(
     wo_b: pl.Tensor[[TP_SIZE, O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[TP_SIZE, D], pl.FP32],
     x_out_full: pl.Out[pl.Tensor[[TP_SIZE, CP_KV_T_DYN, HC_MULT, D], pl.FP32]],
+    projection_peers: pl.Tensor[[TP_SIZE, 3, PROJECTION_RANKS], pl.INT32],
+    projection_epoch_bases: pl.Tensor[[TP_SIZE, PROJECTION_KINDS], pl.INT32],
 ):
     """Launch one CP group's SWA block, one child per rank."""
     x_hc_full.bind_dynamic(1, CP_KV_T_DYN)
@@ -542,7 +584,17 @@ def l3_prefill_attention_swa_cp(
     o_proj_weight_ready_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     o_proj_weight_consumed_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
+    projection_window_buf = pld.alloc_window_buffer([PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], dtype=pl.FP32)
+    projection_prepared_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+    projection_ready_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+    projection_consumed_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+
     for rank in pl.range(pld.world_size()):
+        projection_window = pld.window(projection_window_buf, [PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], dtype=pl.FP32)
+        projection_prepared = pld.window(projection_prepared_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+        projection_ready = pld.window(projection_ready_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+        projection_consumed = pld.window(projection_consumed_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+
         gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
         gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         o_proj_wo_a_window = pld.window(
@@ -567,6 +619,7 @@ def l3_prefill_attention_swa_cp(
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_ready, o_proj_weight_consumed,
             0, rank,
+            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[rank], projection_epoch_bases[rank],
             device=rank,
         )
 
@@ -883,7 +936,7 @@ def build_cp_tensor_specs(
                 spec.name, [tp_size, *spec.shape], spec.dtype,
                 init_value=cp_stack(value, tp_size),
             ))
-    return specs
+    return (specs) + projection_tensor_specs(tp_size)
 
 
 def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE):

@@ -9,6 +9,10 @@
 """DSpark batch-one TP8/DP1 prefill device forward."""
 
 import pypto.language as pl
+from projection_exchange import (
+    PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
+    PROJECTION_WINDOW_COLS, PROJECTION_WINDOW_ROWS,
+)
 import pypto.language.distributed as pld
 
 from models.deepseek_v4_flash_lowlat.prefill_moe import (
@@ -254,7 +258,16 @@ def prefill_tp8_fwd(
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    projection_window: pld.DistributedTensor[[PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], pl.FP32],
+    projection_prepared: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_ready: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_peers: pl.Tensor[[3, PROJECTION_RANKS], pl.INT32],
+    projection_epoch_bases: pl.Tensor[[PROJECTION_KINDS], pl.INT32],
 ):
+    projection_epochs = pl.array.create(PROJECTION_KINDS, pl.INT32)
+    for projection_kind in pl.unroll(PROJECTION_KINDS):
+        projection_epochs[projection_kind] = pl.read(projection_epoch_bases, [projection_kind])
     """Run prefill; a zero query_start_loc terminal marks an empty DP group.
 
     Query boundaries must agree across each TP/CP group. Empty groups retain
@@ -367,6 +380,7 @@ def prefill_tp8_fwd(
                     o_proj_weight_ready, o_proj_weight_consumed,
                     layer_completion,
                     group_base, tp_rank, layer_l0 + pl.const(1, pl.INT32),
+                    projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
                 )
 
         with pl.scope():
@@ -445,6 +459,7 @@ def prefill_tp8_fwd(
                     o_proj_weight_ready, o_proj_weight_consumed,
                     layer_completion,
                     group_base, tp_rank, layer_l1 + pl.const(1, pl.INT32),
+                    projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
                 )
 
         with pl.scope():
@@ -595,6 +610,7 @@ def prefill_tp8_fwd(
                         o_proj_weight_ready, o_proj_weight_consumed,
                         layer_completion,
                         group_base, tp_rank, csa_layer + pl.const(1, pl.INT32),
+                        projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
                     )
 
             with pl.scope():
@@ -712,6 +728,7 @@ def prefill_tp8_fwd(
                         o_proj_weight_ready, o_proj_weight_consumed,
                         layer_completion,
                         group_base, tp_rank, hca_layer + pl.const(1, pl.INT32),
+                        projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
                     )
 
             with pl.scope():
@@ -867,6 +884,7 @@ def prefill_tp8_fwd(
                     o_proj_weight_ready, o_proj_weight_consumed,
                     layer_completion,
                     group_base, tp_rank, layer_last + pl.const(1, pl.INT32),
+                    projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
                 )
 
         with pl.scope():
@@ -1032,6 +1050,8 @@ def l3_prefill_tp8_fwd(
     grammar_mask: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     terminal: pl.Scalar[pl.INT32],
+    projection_peers: pl.Tensor[[N_RANKS, 3, PROJECTION_RANKS], pl.INT32],
+    projection_epoch_bases: pl.Tensor[[N_RANKS, PROJECTION_KINDS], pl.INT32],
 ):
     """Run layer-major DSA-CP over a caller-padded physical token extent.
 
@@ -1091,7 +1111,17 @@ def l3_prefill_tp8_fwd(
     lm_head_logits_window_buf = pld.alloc_window_buffer([MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
     lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
 
+    projection_window_buf = pld.alloc_window_buffer([PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], dtype=pl.FP32)
+    projection_prepared_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+    projection_ready_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+    projection_consumed_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+
     for r in pl.range(pld.world_size()):
+        projection_window = pld.window(projection_window_buf, [PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], dtype=pl.FP32)
+        projection_prepared = pld.window(projection_prepared_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+        projection_ready = pld.window(projection_ready_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+        projection_consumed = pld.window(projection_consumed_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+
         tp_reduce_window = pld.window(tp_reduce_window_buf, [REDUCE_WINDOW_ROWS, D], dtype=pl.FP32)
         tp_reduce_signal = pld.window(tp_reduce_signal_buf, [N_RANKS, 1], dtype=pl.INT32)
         gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
@@ -1157,6 +1187,7 @@ def l3_prefill_tp8_fwd(
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
             r,
+            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[r], projection_epoch_bases[r],
             device=r,
         )
     return x_out, logits, sampled_ids, dspark_target_hidden

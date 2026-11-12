@@ -12,6 +12,12 @@
 import functools
 
 import pypto.language as pl
+from projection_exchange import (
+    PROJECTION_KINDS, PROJECTION_RANKS, PROJECTION_SIGNAL_ROWS,
+    PROJECTION_WINDOW_COLS, PROJECTION_WINDOW_ROWS,
+    projection_degree, projection_tensor_specs,
+)
+from qkv_proj_rope import kv_proj_rope_cp
 
 from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 from utils import checkpoint_ends_tensor
@@ -27,6 +33,8 @@ from config import (
     PREFILL_SEQ,
 )
 
+from prefill_compressor_ratio4 import compressor_ratio4_cp
+from prefill_indexer_compressor import prefill_indexer_compressor_cp
 from prefill_compressor_ratio4 import (
     CSA_STATE_BLOCK_NUM,
     CSA_STATE_BLOCK_SIZE,
@@ -112,6 +120,9 @@ from qkv_proj_rope import kv_proj_rope, q_proj_rope, rope_prepare
 # Largest runtime token count the prefill path accepts (Issue #905 P4).
 PREFILL_MAX_TOKENS = 8192
 
+PROJECTION_D = projection_degree("csa")
+
+
 # Dynamic shape variables.
 T_DYN = pl.dynamic("PREFILL_CSA_T_DYN")
 CP_Q_T_DYN = pl.dynamic("PREFILL_CSA_CP_Q_T_DYN")
@@ -165,6 +176,9 @@ CSA_TOPK_TOKEN_TILE = 2
 CSA_CACHE_WRITE_TILE = 64
 CSA_ROPE_TILE = 8
 QUERY_PIPELINE = bool(_parse_int_argv("--prefill-query-pipeline", 0))
+INDEXER_ARENAS = _parse_int_argv("--prefill-indexer-arenas", 1)
+if INDEXER_ARENAS not in (1, 2):
+    raise ValueError("Prefill indexer arenas must be one or two")
 
 assert COMPRESS_RATIO == INDEXER_COMPRESS_RATIO
 assert PREFILL_ATTN_BLOCKS <= VALID_BLOCK_MASK_COLS
@@ -1099,7 +1113,7 @@ def _quant_w_per_output_channel_local(w):
 
 
 @pl.jit.inline(auto_scope=False)
-def prefill_csa_query_pipeline(
+def _prefill_csa_pipeline_schedule(
     x: pl.Tensor,
     qr: pl.Tensor,
     qr_scale: pl.Tensor,
@@ -1127,6 +1141,10 @@ def prefill_csa_query_pipeline(
     wo_b: pl.Tensor,
     wo_b_scale: pl.Tensor,
     attn_out: pl.Tensor,
+    scores: pl.Tensor[[INDEXER_QUERY_TILE, INDEXER_MAX_CANDIDATES], pl.FP32],
+    pairs: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
+    next_scores: pl.Tensor[[INDEXER_QUERY_TILE, INDEXER_MAX_CANDIDATES], pl.FP32],
+    next_pairs: pl.Tensor[[TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], pl.FP32],
     cache_ready: pl.Scalar[pl.TASK_ID],
     o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
 ):
@@ -1137,8 +1155,9 @@ def prefill_csa_query_pipeline(
     swap_idx = pl.create_tensor([INDEXER_ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
     sign = pl.create_tensor([1, ROPE_HEAD_DIM], dtype=pl.FP32)
     indexer_ready = prepare_indexer_query_rope(dup_idx, swap_idx, sign, cache_ready)
-    scores = pl.create_tensor([INDEXER_QUERY_TILE, INDEXER_MAX_CANDIDATES], dtype=pl.FP32, manual_dep=True)
-    pairs = pl.create_tensor([TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32, manual_dep=True)
+    selection_retired = pl.array.create(INDEXER_ARENAS, pl.TASK_ID)
+    for arena in pl.unroll(INDEXER_ARENAS):
+        selection_retired[arena] = indexer_ready
     selected = pl.array.create(1, pl.TASK_ID)
     selected[0] = indexer_ready
 
@@ -1174,13 +1193,32 @@ def prefill_csa_query_pipeline(
                 query_base = tile_base + dense_base
                 if dense_base < tile_rows:
                     query_rows = pl.min(PREFILL_QUERY_TILE, tile_rows - dense_base)
-                    _prefill_indexer_dense_tile(
-                        x, qr, qr_scale, idx_wq_b, idx_wq_b_scale, weights_proj,
-                        idx_cos, idx_sin, hadamard, idx_kv_cache, idx_kv_scale, idx_block_table,
-                        request_ids, topk, position_ids, dup_idx, swap_idx, sign,
-                        scores, pairs, selected, query_base, query_rows,
-                    )
+                    arena = block % INDEXER_ARENAS
                     lane = block % 2
+                    selected[0] = selection_retired[arena]
+                    if INDEXER_ARENAS == 2:
+                        if arena == 0:
+                            _prefill_indexer_dense_tile(
+                                x, qr, qr_scale, idx_wq_b, idx_wq_b_scale, weights_proj,
+                                idx_cos, idx_sin, hadamard, idx_kv_cache, idx_kv_scale, idx_block_table,
+                                request_ids, topk, position_ids, dup_idx, swap_idx, sign,
+                                scores, pairs, selected, query_base, query_rows,
+                            )
+                        else:
+                            _prefill_indexer_dense_tile(
+                                x, qr, qr_scale, idx_wq_b, idx_wq_b_scale, weights_proj,
+                                idx_cos, idx_sin, hadamard, idx_kv_cache, idx_kv_scale, idx_block_table,
+                                request_ids, topk, position_ids, dup_idx, swap_idx, sign,
+                                next_scores, next_pairs, selected, query_base, query_rows,
+                            )
+                    else:
+                        _prefill_indexer_dense_tile(
+                            x, qr, qr_scale, idx_wq_b, idx_wq_b_scale, weights_proj,
+                            idx_cos, idx_sin, hadamard, idx_kv_cache, idx_kv_scale, idx_block_table,
+                            request_ids, topk, position_ids, dup_idx, swap_idx, sign,
+                            scores, pairs, selected, query_base, query_rows,
+                        )
+                    selection_retired[arena] = selected[0]
                     kv = pl.slice(kv_slots, [kv_rows, HEAD_DIM], [lane * kv_rows, 0])
                     bias = pl.slice(bias_slots, [PREFILL_QUERY_TILE, SPARSE_PREFILL_SPARSE_PAD], [lane * PREFILL_QUERY_TILE, 0])
                     mi = pl.slice(mi_slots, [PREFILL_QUERY_STATS_ROWS, 1], [lane * PREFILL_QUERY_STATS_ROWS, 0])
@@ -1200,6 +1238,70 @@ def prefill_csa_query_pipeline(
                 packed, wo_a, wo_b, wo_b_scale, attn_out, tile_base, tile_rows,
                 heads_ready, o_proj_weight_dep,
             )
+    return attn_out
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_csa_query_pipeline(
+    x: pl.Tensor,
+    qr: pl.Tensor,
+    qr_scale: pl.Tensor,
+    idx_wq_b: pl.Tensor,
+    idx_wq_b_scale: pl.Tensor,
+    weights_proj: pl.Tensor,
+    idx_cos: pl.Tensor,
+    idx_sin: pl.Tensor,
+    hadamard: pl.Tensor,
+    idx_kv_cache: pl.Tensor,
+    idx_kv_scale: pl.Tensor,
+    idx_block_table: pl.Tensor,
+    position_ids: pl.Tensor,
+    request_ids: pl.Tensor,
+    q: pl.Tensor,
+    kv_cache: pl.Tensor,
+    swa_indices: pl.Tensor,
+    cmp_kv: pl.Tensor,
+    cmp_block_table: pl.Tensor,
+    valid_block_mask: pl.Tensor,
+    attn_sink: pl.Tensor,
+    freqs_cos: pl.Tensor,
+    freqs_sin: pl.Tensor,
+    wo_a: pl.Tensor,
+    wo_b: pl.Tensor,
+    wo_b_scale: pl.Tensor,
+    attn_out: pl.Tensor,
+    cache_ready: pl.Scalar[pl.TASK_ID],
+    o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Allocate bounded indexer arenas and dispatch the shared query schedule."""
+    scores = pl.create_tensor([INDEXER_QUERY_TILE, INDEXER_MAX_CANDIDATES], dtype=pl.FP32, manual_dep=True)
+    pairs = pl.create_tensor([TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32, manual_dep=True)
+    if INDEXER_ARENAS == 2:
+        next_scores = pl.create_tensor([INDEXER_QUERY_TILE, INDEXER_MAX_CANDIDATES], dtype=pl.FP32, manual_dep=True)
+        next_pairs = pl.create_tensor([TOPK_ARENA_ROWS, TOPK_PAIR_WIDTH], dtype=pl.FP32, manual_dep=True)
+        _prefill_csa_pipeline_schedule(
+            x, qr, qr_scale, idx_wq_b,
+            idx_wq_b_scale, weights_proj, idx_cos, idx_sin,
+            hadamard, idx_kv_cache, idx_kv_scale, idx_block_table,
+            position_ids, request_ids, q, kv_cache,
+            swa_indices, cmp_kv, cmp_block_table, valid_block_mask,
+            attn_sink, freqs_cos, freqs_sin, wo_a,
+            wo_b, wo_b_scale, attn_out, scores,
+            pairs, next_scores, next_pairs, cache_ready,
+            o_proj_weight_dep,
+        )
+    else:
+        _prefill_csa_pipeline_schedule(
+            x, qr, qr_scale, idx_wq_b,
+            idx_wq_b_scale, weights_proj, idx_cos, idx_sin,
+            hadamard, idx_kv_cache, idx_kv_scale, idx_block_table,
+            position_ids, request_ids, q, kv_cache,
+            swa_indices, cmp_kv, cmp_block_table, valid_block_mask,
+            attn_sink, freqs_cos, freqs_sin, wo_a,
+            wo_b, wo_b_scale, attn_out, scores,
+            pairs, scores, pairs, cache_ready,
+            o_proj_weight_dep,
+        )
     return attn_out
 
 
@@ -1263,6 +1365,13 @@ def prefill_attention_csa_cp_core(
     attn_out_local: pl.Tensor[[CP_Q_T_DYN, D], pl.BF16],
     late_dep: pl.Scalar[pl.TASK_ID],
     o_proj_weight_dep: pl.Scalar[pl.TASK_ID],
+    projection_window: pld.DistributedTensor[[PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], pl.FP32],
+    projection_prepared: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_ready: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_peers: pl.Tensor[[PROJECTION_RANKS], pl.INT32],
+    projection_epochs: pl.Array[PROJECTION_KINDS, pl.INT32],
+    projection_rank: pl.Scalar[pl.INT32],
 ):
     """CSA attention body: local queries/indexer and replicated full KV state."""
     q_dim = pl.tensor.dim(x_normed_local, 0)
@@ -1284,7 +1393,14 @@ def prefill_attention_csa_cp_core(
     rope_prepare(freqs_cos_full, freqs_sin_full, kv_cos_il, kv_sin_signed, kv_swap_idx)
 
     kv_full = pl.create_tensor([kv_dim, HEAD_DIM], dtype=pl.BF16)
-    kv_proj_rope(x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep)
+    if PROJECTION_D < 8:
+        kv_proj_rope_cp(
+            x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep,
+            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers,
+            projection_epochs, projection_rank, 1, PROJECTION_D,
+        )
+    else:
+        kv_proj_rope(x_normed_full, wkv, gamma_ckv, kv_cos_il, kv_sin_signed, kv_swap_idx, kv_full, late_dep)
 
     ori_block_num = pl.tensor.dim(kv_cache, 0)
     ori_cache_rows = ori_block_num * BLOCK_SIZE
@@ -1300,29 +1416,55 @@ def prefill_attention_csa_cp_core(
                     write_row = pl.cast(write_row_raw, pl.INDEX)
                     kv_cache_flat[write_row : write_row + 1, :] = kv_full[write_t : write_t + 1, :]
 
-    compressor_ratio4(
-        x_normed_full,
-        query_start_loc, state_checkpoint_ends,
-        compress_state, compress_state_block_table,
-        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_freqs_cos_full, cmp_freqs_sin_full,
-        cmp_kv,
-        position_ids_full, cmp_slot_mapping_full, state_slot_mapping_full,
-    )
+    if PROJECTION_D < 8:
+        compressor_ratio4_cp(
+            x_normed_full,
+            query_start_loc, state_checkpoint_ends,
+            compress_state, compress_state_block_table,
+            cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+            cmp_freqs_cos_full, cmp_freqs_sin_full,
+            cmp_kv,
+            position_ids_full, cmp_slot_mapping_full, state_slot_mapping_full,
+            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs, projection_rank, PROJECTION_D,
+        )
+    else:
+        compressor_ratio4(
+            x_normed_full,
+            query_start_loc, state_checkpoint_ends,
+            compress_state, compress_state_block_table,
+            cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+            cmp_freqs_cos_full, cmp_freqs_sin_full,
+            cmp_kv,
+            position_ids_full, cmp_slot_mapping_full, state_slot_mapping_full,
+        )
 
     # Gathered-stream indexer cache with global positions and mappings.
     indexer_cache_ready = pl.array.create(1, pl.TASK_ID)
-    prefill_indexer_compressor(
-        x_normed_full,
-        query_start_loc, state_checkpoint_ends,
-        inner_compress_state, inner_compress_state_block_table,
-        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        cmp_freqs_cos_full, cmp_freqs_sin_full,
-        hadamard_idx,
-        idx_kv_cache, idx_kv_scale,
-        position_ids_full, idx_slot_mapping_full, inner_state_slot_mapping_full,
-        indexer_cache_ready,
-    )
+    if PROJECTION_D < 8:
+        prefill_indexer_compressor_cp(
+            x_normed_full,
+            query_start_loc, state_checkpoint_ends,
+            inner_compress_state, inner_compress_state_block_table,
+            inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+            cmp_freqs_cos_full, cmp_freqs_sin_full,
+            hadamard_idx,
+            idx_kv_cache, idx_kv_scale,
+            position_ids_full, idx_slot_mapping_full, inner_state_slot_mapping_full,
+            indexer_cache_ready,
+            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs, projection_rank, PROJECTION_D,
+        )
+    else:
+        prefill_indexer_compressor(
+            x_normed_full,
+            query_start_loc, state_checkpoint_ends,
+            inner_compress_state, inner_compress_state_block_table,
+            inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+            cmp_freqs_cos_full, cmp_freqs_sin_full,
+            hadamard_idx,
+            idx_kv_cache, idx_kv_scale,
+            position_ids_full, idx_slot_mapping_full, inner_state_slot_mapping_full,
+            indexer_cache_ready,
+        )
 
     # Local indexer queries with half-width FP32 RoPE.
     idx_cos = pl.create_tensor([q_dim, HALF_ROPE], dtype=pl.FP32)
@@ -1480,6 +1622,12 @@ def prefill_attention_csa_cp(
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     weight_epoch: pl.Scalar[pl.INT32],
+    projection_window: pld.DistributedTensor[[PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], pl.FP32],
+    projection_prepared: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_ready: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_peers: pl.Tensor[[3, PROJECTION_RANKS], pl.INT32],
+    projection_epochs: pl.Array[PROJECTION_KINDS, pl.INT32],
 ):
     """DSA-CP CSA with replicated HC state at both layer boundaries."""
     o_proj_weight_dep = gather_o_proj_full_weights(
@@ -1538,6 +1686,7 @@ def prefill_attention_csa_cp(
         wo_a_full, wo_b_full, wo_b_scale,
         attn_out_local,
         late_dep, o_proj_weight_dep,
+        projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[1], projection_epochs, group_base + tp_rank,
     )
 
     attn_out_full = pl.create_tensor([kv_dim, D], dtype=pl.BF16)
@@ -1618,7 +1767,16 @@ def prefill_attention_csa_cp_test(
     o_proj_weight_consumed: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
+    projection_window: pld.DistributedTensor[[PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], pl.FP32],
+    projection_prepared: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_ready: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_consumed: pld.DistributedTensor[[PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], pl.INT32],
+    projection_peers: pl.Tensor[[3, PROJECTION_RANKS], pl.INT32],
+    projection_epoch_bases: pl.Tensor[[PROJECTION_KINDS], pl.INT32],
 ):
+    projection_epochs = pl.array.create(PROJECTION_KINDS, pl.INT32)
+    for projection_kind in pl.unroll(PROJECTION_KINDS):
+        projection_epochs[projection_kind] = pl.read(projection_epoch_bases, [projection_kind])
     """Run one CP rank's query share with replicated CSA layer boundaries."""
     x_hc_full.bind_dynamic(0, CP_KV_T_DYN)
     query_start_loc.bind_dynamic(0, QUERY_START_LOC_DYN)
@@ -1684,6 +1842,7 @@ def prefill_attention_csa_cp_test(
         o_proj_weight_ready, o_proj_weight_consumed,
         o_proj_order_fence,
         group_base, tp_rank, pl.const(1, pl.INT32),
+        projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers, projection_epochs,
     )
     return x_out_full
 
@@ -1749,6 +1908,8 @@ def l3_prefill_attention_csa_cp(
     wo_b: pl.Tensor[[TP_SIZE, O_PROJ_LOCAL_GROUPS, D, O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[TP_SIZE, D], pl.FP32],
     x_out_full: pl.Out[pl.Tensor[[TP_SIZE, CP_KV_T_DYN, HC_MULT, D], pl.FP32]],
+    projection_peers: pl.Tensor[[TP_SIZE, 3, PROJECTION_RANKS], pl.INT32],
+    projection_epoch_bases: pl.Tensor[[TP_SIZE, PROJECTION_KINDS], pl.INT32],
 ):
     """Launch one CP group's CSA block, one child per rank."""
     x_hc_full.bind_dynamic(1, CP_KV_T_DYN)
@@ -1786,7 +1947,17 @@ def l3_prefill_attention_csa_cp(
     o_proj_weight_ready_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     o_proj_weight_consumed_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
+    projection_window_buf = pld.alloc_window_buffer([PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], dtype=pl.FP32)
+    projection_prepared_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+    projection_ready_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+    projection_consumed_buf = pld.alloc_window_buffer([PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+
     for rank in pl.range(pld.world_size()):
+        projection_window = pld.window(projection_window_buf, [PROJECTION_WINDOW_ROWS, PROJECTION_WINDOW_COLS], dtype=pl.FP32)
+        projection_prepared = pld.window(projection_prepared_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+        projection_ready = pld.window(projection_ready_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+        projection_consumed = pld.window(projection_consumed_buf, [PROJECTION_SIGNAL_ROWS, PROJECTION_RANKS], dtype=pl.INT32)
+
         gather_window = pld.window(gather_window_buf, [PREFILL_GROUP_CAP, D], dtype=pl.BF16)
         gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         o_proj_wo_a_window = pld.window(
@@ -1826,6 +1997,7 @@ def l3_prefill_attention_csa_cp(
             o_proj_wo_a_window, o_proj_wo_b_window,
             o_proj_weight_ready, o_proj_weight_consumed,
             0, rank,
+            projection_window, projection_prepared, projection_ready, projection_consumed, projection_peers[rank], projection_epoch_bases[rank],
             device=rank,
         )
 
@@ -1903,7 +2075,7 @@ def build_cp_tensor_specs(
                 spec.name, [tp_size, *spec.shape], spec.dtype,
                 init_value=cp_stack(value, tp_size),
             ))
-    return specs
+    return (specs) + projection_tensor_specs(tp_size)
 
 
 def build_ragged2_cp_tensor_specs(tp_size: int = TP_SIZE, checkpoint_ends: tuple[int, int] = (0, 0)):

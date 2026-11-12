@@ -77,12 +77,52 @@ def source_manifest():
     return sources
 
 
-def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=16384):
+def _validate_target_capacity(metadata, profile, max_seq_len):
+    """Reject generated verification ABIs that truncate decode cache metadata."""
+    from .native_decode import (
+        CSA_CMP_MAX_BLOCKS, CSA_IDX_CACHE_MAX_BLOCKS, CSA_INNER_STATE_MAX_BLOCKS,
+        CSA_MAIN_STATE_MAX_BLOCKS, HCA_CMP_MAX_BLOCKS, HCA_COMPRESS_STATE_MAX_BLOCKS,
+        MAX_SEQ_LEN, ORI_TABLE_MAX_BLOCKS, ROPE_HEAD_DIM,
+    )
+
+    if MAX_SEQ_LEN != max_seq_len:
+        raise RuntimeError("Decode shapes are already frozen at another maximum sequence length")
+    prefix = "" if profile == "single" else "s_"
+    expected = {
+        "freqs_cos": [8, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM],
+        "freqs_sin": [8, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM],
+        "block_table": [8, 1, ORI_TABLE_MAX_BLOCKS],
+        "hca_cmp_block_table": [8, 1, HCA_CMP_MAX_BLOCKS],
+        "csa_cmp_block_table": [8, 1, CSA_CMP_MAX_BLOCKS],
+        "idx_block_table": [8, 1, CSA_IDX_CACHE_MAX_BLOCKS],
+        "hca_compress_state_block_table": [8, 1, HCA_COMPRESS_STATE_MAX_BLOCKS],
+        "csa_compress_state_block_table": [8, 1, CSA_MAIN_STATE_MAX_BLOCKS],
+        "csa_inner_compress_state_block_table": [8, 1, CSA_INNER_STATE_MAX_BLOCKS],
+    }
+    actual = {row["name"].split("__ssa", 1)[0]: row.get("shape") for row in metadata["params"]}
+    for name, shape in expected.items():
+        if actual.get(prefix + name) != shape:
+            raise RuntimeError(f"Generated target capacity differs for {prefix + name}: {actual.get(prefix + name)} != {shape}")
+
+
+def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=1048576,
+                    prefill_indexer_arenas=1, projection_degrees=None):
     """Compile one immutable source profile; device IDs describe topology only."""
     if profile not in ("single", "one", "two", "rsag", "prefill"):
         raise ValueError("Unknown request-pipeline source profile")
     if type(max_seq_len) is not int or max_seq_len < 1:
         raise ValueError("Maximum sequence length must be a positive integer")
+    if type(prefill_indexer_arenas) is not int or prefill_indexer_arenas not in (1, 2):
+        raise ValueError("Prefill indexer arenas must be one or two")
+    if profile != "prefill" and prefill_indexer_arenas != 1:
+        raise ValueError("Indexer arena selection applies only to prefill")
+    degrees = {family: 8 for family in ("swa", "csa", "hca")}
+    degrees.update(projection_degrees or {})
+    if set(degrees) != {"swa", "csa", "hca"} or any(type(d) is not int or d not in (1, 2, 4, 8) for d in degrees.values()):
+        raise ValueError("Projection degrees require swa/csa/hca and d=1/2/4/8")
+    if profile != "prefill" and any(d != 8 for d in degrees.values()):
+        raise ValueError("Projection degree selection applies only to prefill")
+    projection_degrees = degrees
     if (
         len(device_ids) != 8
         or len(set(device_ids)) != 8
@@ -116,7 +156,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         if profile == "prefill":
             from .prefill_fwd import load_prefill_programs
 
-            function = load_prefill_programs()["chunk"]
+            function = load_prefill_programs(indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees)["chunk"]
             kwargs = {}
             selected_source = None
         elif profile == "single":
@@ -145,14 +185,16 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         compiled = function.compile(config=config, **kwargs)
     directory = artifact_directory(compiled)
     metadata = json.loads((directory / "distributed_meta.json").read_text())
-    expected_parameters = len(function.param_names) if profile == "prefill" else (83 if profile == "single" else 155)
+    expected_parameters = len(function.param_names) if profile == "prefill" else (81 if profile == "single" else 153)
     if len(metadata["params"]) != expected_parameters:
         raise RuntimeError("The actual public parameter contract changed")
+    if profile != "prefill":
+        _validate_target_capacity(metadata, profile, max_seq_len)
     if selected_source:
         # A validated GENERATED cache hit does not re-enter the generation hook.
         # Validate its source choice instead of mistaking the hit for new work.
         selection = json.loads((directory / "report/native-w2-source-selection.json").read_text())
-        if selection["source_sha256"] != selected_source or len(selection["selected"]) != 10:
+        if selection["source_sha256"] != selected_source or len(selection["selected"]) not in (2, 10):
             raise RuntimeError("Cached program has a different native implementation")
         for item in selection["selected"]:
             original = directory / "report/original-native-source" / item["source"]
@@ -188,7 +230,8 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         report["prefill_plan"] = dict(
             chunk_tokens=8192, kv_tile_tokens=512, query_block_tokens=128,
             attention_cp=8, moe_tp=8, lm_head_tp=8,
-            projection_replicas=8, prefetch="exact", transfer_slots=2,
+            projection_replicas=projection_degrees, prefetch="exact", transfer_slots=2,
+            indexer_arenas=prefill_indexer_arenas,
             resident_projection_layout="ND",
             dispatches_per_chunk=1, tp8_baseline_bitwise_verified=False,
         )
@@ -200,7 +243,8 @@ def main():
     parser.add_argument("--profile", choices=["single", "one", "two", "rsag", "prefill"], required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
-    parser.add_argument("--max-seq-len", type=int, default=16384)
+    parser.add_argument("--max-seq-len", type=int, default=1048576)
+    parser.add_argument("--prefill-indexer-arenas", type=int, choices=(1, 2), default=1)
     parser.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     parser.add_argument(
         "--ptoas-timeout-seconds",
@@ -208,6 +252,8 @@ def main():
         default=180,
         help="Per-kernel assembler deadline, between 1 and 600 seconds",
     )
+    for family in ("swa", "csa", "hca"):
+        parser.add_argument("--projection-" + family + "-d", type=int, choices=(1, 2, 4, 8), default=8)
     args = parser.parse_args()
     if args.report.exists():
         parser.error("The report already exists; preserve it and choose a new run directory")
@@ -219,6 +265,8 @@ def main():
         device_ids=devices,
         ptoas_timeout_seconds=args.ptoas_timeout_seconds,
         max_seq_len=args.max_seq_len,
+        prefill_indexer_arenas=args.prefill_indexer_arenas,
+        projection_degrees={family: getattr(args, "projection_" + family + "_d") for family in ("swa", "csa", "hca")},
     )
     report["generation_seconds"] = time.monotonic() - started
     args.report.parent.mkdir(parents=True, exist_ok=True)

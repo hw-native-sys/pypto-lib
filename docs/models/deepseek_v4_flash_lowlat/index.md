@@ -5,6 +5,57 @@ ranks by default. The verification width remains eight tokens, and the eight
 attention projection groups are assigned four per rank. It is an experimental
 decode implementation, not a `pypto-serving` deployment contract.
 
+## Context capacity
+
+The model and the program builder default to 1,048,576 positions. Prompt
+length, outer prefill chunk size, and compiled context capacity are separate:
+a 16K smoke input still requires room for all following decode and speculative
+positions. Native single-query and streaming entries derive RoPE, KV page-table
+and compressor-state page-table extents from the same configured capacity.
+The builder checks these generated extents before accepting an artifact.
+
+An explicit smaller `--max-seq-len` produces a bounded validation artifact;
+it does not change the model's default context limit. Physical cache allocations
+remain request-owned and use dynamic pool dimensions. Configured capacity and
+successful code generation do not establish long-context device correctness or
+performance; each reported run must state its actual prompt and output lengths.
+
+The indexer uses one score/selection arena by default. The internal build option
+`--prefill-indexer-arenas 2` enables an experimental pair of independent arenas;
+it is recorded in the generated prefill plan. The two bounded KV gather slots
+are independent of this choice. Two-arena experiments have no confirmed
+end-to-end speedup in the representative 16K scope; each generated artifact
+requires its own correctness and performance qualification. Histogram selection
+and EMA recall are not implemented by that option.
+
+The prefill plan supports projection replication degrees 1, 2, 4, and 8 for
+SWA, CSA, and HCA. Degree 8 remains the default for 8192-token chunks. Shared
+degrees distribute pure 512-token KV and compressor projections using two
+bounded FP32 transport slots; normalization, RoPE, pooling, ordered state
+updates, and local cache-page mappings remain rank-local. These settings do
+not change the attention CP8, MoE TP8, or vocabulary TP8 layouts.
+
+Generated prefill metadata includes `projection_peers` and
+`projection_epoch_bases`. Callers use `prepare_projection_bindings` and bind
+these inputs with the other chunk metadata. Shared degrees require the actual
+rank topology. With retained communication windows, advance epochs only after
+successful chunk completion using `advance_projection_epochs`; keep topology
+and degrees fixed, and discard a failed communication domain. No per-tile
+host wait is required. Current 16K measurements do not establish a whole
+prefill speedup for shared degrees.
+
+Drafter metadata banks may cover a bounded interval of absolute anchor
+positions. The device derives its base from the first owner-zero query position;
+old banks starting at anchor zero retain the same indexing. The interval must
+cover every submitted parent, including drained lookahead work. Reusing a
+program at a larger anchor does not require banks for all earlier positions.
+
+Native single-query programs expose 81 parameters, and native streaming programs
+expose 153. They consume the group-sharded O-proj weights directly; the unused
+replicated `wo_a` and `wo_b` inputs have been removed. Callers bind the actual
+generated metadata and regenerate older native artifacts. The standalone
+forward's golden-facing entry retains its full-weight reference inputs.
+
 ## Precision contract
 
 The native HC stream uses FP32 at `hc_pre` input and `hc_post` residual/output,
