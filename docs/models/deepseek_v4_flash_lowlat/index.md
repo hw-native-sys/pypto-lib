@@ -431,6 +431,12 @@ decode metadata, scratch and any retained ABI buffers during Worker setup,
 before prefill. Borrowed views require no physical layout conversion; first-use
 program/domain preparation and normal dispatch synchronization remain separate
 latency costs.
+Registering a decode program with `extra_compiled` does not eagerly create its
+communication domains. A caller that needs a warm first decode can run a startup
+invocation on separately initialized scratch caches before prefill, retaining the
+same prepared Worker. That invocation must not bind the real request caches.
+The first real decode then reuses the domain; normal per-dispatch buffer resets,
+input staging and completion fences still contribute to latency.
 
 `prefill_fwd.prepare_prefill_bindings` combines the caller's resident decode-format
 weights, input metadata and scratch with the cache views. `submit_prefill`
