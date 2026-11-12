@@ -1138,7 +1138,10 @@ def sparse_vf_decode_pypto(
         # Window-only callers have no compressed-cache view.
         compressed_rows = pl.tensor.dim(compressed, 0) * 128
         compressed_flat = pl.reshape(compressed, [compressed_rows, COMPRESSED_CACHE_BYTES])
-    workers = pl.min(num_tokens * (keys // SPARSE_VF_GATHER_TILE), WORKERS)
+    worker_limit = WORKERS
+    if compressed_keys > 0:
+        worker_limit = 2 * WORKERS
+    workers = pl.min(num_tokens * (keys // SPARSE_VF_GATHER_TILE), worker_limit)
     workers = pl.max(1, workers)
     # A register scope cannot share a kernel with matmul operations.
     with pl.spmd(workers, name_hint="sparse_vf_decode", deps=[source_ready]) as gathered:
@@ -1150,17 +1153,28 @@ def sparse_vf_decode_pypto(
             if column < WINDOW_KEYS:
                 # Scalar index reads require an explicit Tile load.
                 ids = pl.tile.load(window_indices, [token, column], [1, SPARSE_VF_GATHER_TILE])
-                raw = pl.tile.create([SPARSE_VF_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, target_memory=pl.MemorySpace.Vec)
-                zero_row = pl.tile.full([1, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                for lane in pl.range(SPARSE_VF_GATHER_TILE):
-                    row = pl.tile.read(ids, [0, lane])
-                    physical = pl.cast(pl.max(row, 0), pl.INDEX)
+                raw = pl.tile.full([SPARSE_VF_GATHER_TILE, WINDOW_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                first = pl.tile.read(ids, [0, 0])
+                contiguous = pl.cast(0, pl.INT32)
+                if first >= 0:
+                    contiguous = pl.cast(1, pl.INT32)
+                    for check_lane in pl.range(1, SPARSE_VF_GATHER_TILE):
+                        check_row = pl.tile.read(ids, [0, check_lane])
+                        if check_row != first + check_lane:
+                            contiguous = pl.cast(0, pl.INT32)
+                if contiguous != 0:
+                    start = pl.cast(first, pl.INDEX)
                     raw = pl.tile.gather_row(
-                        raw, window_flat, [lane, 0], [physical, 0], [1, WINDOW_CACHE_BYTES],
+                        raw, window_flat, [0, 0], [start, 0], [SPARSE_VF_GATHER_TILE, WINDOW_CACHE_BYTES],
                     )
-                    # Clear masked payloads and scales, including NaNs read from row 0.
-                    if row < 0:
-                        raw[lane:lane + 1, :] = zero_row
+                else:
+                    for lane in pl.range(SPARSE_VF_GATHER_TILE):
+                        row = pl.tile.read(ids, [0, lane])
+                        if row >= 0:
+                            physical = pl.cast(row, pl.INDEX)
+                            raw = pl.tile.gather_row(
+                                raw, window_flat, [lane, 0], [physical, 0], [1, WINDOW_CACHE_BYTES],
+                            )
                 # Preserve the packed row pitch across reinterpretation and slicing.
                 signed_bytes = pl.reinterpret_view(raw, pl.INT8)
                 payload_all = pl.reinterpret_view(
@@ -1173,14 +1187,11 @@ def sparse_vf_decode_pypto(
                     raw, pl.INT16, shape=[SPARSE_VF_GATHER_TILE, SPARSE_VF_WINDOW_HALFWORDS],
                 )
                 scale_all = pl.reinterpret_view(factor_bits, pl.BF16)
-                scale_view = scale_all[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
-                # Materialize dense BF16 scale storage before flattening for register gathers.
-                factors_fp32 = pl.cast(scale_view, pl.FP32)
-                factors = pl.cast(factors_fp32, pl.BF16, mode="rint")
+                # Read group scales directly from their packed row pitch.
                 pl.tile.store(ids, [token, column], selected_ids)
                 value_flat = pl.reshape(values, [SPARSE_VF_GATHER_TILE * HEAD_DIM])
                 factor_flat = pl.reshape(
-                    factors, [SPARSE_VF_GATHER_TILE * SPARSE_VF_WINDOW_GROUPS],
+                    scale_all, [SPARSE_VF_GATHER_TILE * SPARSE_VF_WINDOW_HALFWORDS],
                 )
                 # Apply each group scale to its register lanes.
                 with pl.reg_scope():
@@ -1188,7 +1199,10 @@ def sparse_vf_decode_pypto(
                     w_group = pl.reg.index_gen(0, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
                     w_group = pl.reg.shift_rights(w_group, SPARSE_VF_WINDOW_SHIFT, w_full)
                     for w_chunk in pl.hardware_loop(SPARSE_VF_GATHER_TILE * HEAD_DIM // SPARSE_VF_REG_TILE):
-                        w_base = pl.cast(w_chunk * SPARSE_VF_WINDOW_STEP, pl.UINT16)
+                        w_row = w_chunk // (HEAD_DIM // SPARSE_VF_REG_TILE)
+                        w_part = w_chunk % (HEAD_DIM // SPARSE_VF_REG_TILE)
+                        w_row_base = w_row * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
+                        w_base = pl.cast(w_row_base + w_part * SPARSE_VF_WINDOW_STEP, pl.UINT16)
                         w_offset = pl.reg.adds(w_group, w_base, w_full)
                         w_value = pl.reg.load(value_flat, w_chunk * SPARSE_VF_REG_TILE, lanes=SPARSE_VF_REG_TILE)
                         w_factor = pl.reg.gather(factor_flat, w_offset, w_full)
@@ -1200,17 +1214,30 @@ def sparse_vf_decode_pypto(
                 if column >= WINDOW_KEYS:
                     c_column = column - WINDOW_KEYS
                     c_ids = pl.tile.load(compressed_indices, [token, c_column], [1, SPARSE_VF_GATHER_TILE])
-                    c_raw = pl.tile.create([SPARSE_VF_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, target_memory=pl.MemorySpace.Vec)
-                    c_zero_row = pl.tile.full([1, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                    for c_lane in pl.range(SPARSE_VF_GATHER_TILE):
-                        c_row = pl.tile.read(c_ids, [0, c_lane])
-                        c_physical = pl.cast(pl.max(c_row, 0), pl.INDEX)
+                    c_raw = pl.tile.full([SPARSE_VF_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
+                    c_first = pl.tile.read(c_ids, [0, 0])
+                    c_contiguous = pl.cast(0, pl.INT32)
+                    if c_first >= 0:
+                        c_contiguous = pl.cast(1, pl.INT32)
+                        for c_check_lane in pl.range(1, SPARSE_VF_GATHER_TILE):
+                            c_check_row = pl.tile.read(c_ids, [0, c_check_lane])
+                            if c_check_row != c_first + c_check_lane:
+                                c_contiguous = pl.cast(0, pl.INT32)
+                    if c_contiguous != 0:
+                        c_start = pl.cast(c_first, pl.INDEX)
                         c_raw = pl.tile.gather_row(
-                            c_raw, compressed_flat, [c_lane, 0], [c_physical, 0],
-                            [1, COMPRESSED_CACHE_BYTES],
+                            c_raw, compressed_flat, [0, 0], [c_start, 0],
+                            [SPARSE_VF_GATHER_TILE, COMPRESSED_CACHE_BYTES],
                         )
-                        if c_row < 0:
-                            c_raw[c_lane:c_lane + 1, :] = c_zero_row
+                    else:
+                        for c_lane in pl.range(SPARSE_VF_GATHER_TILE):
+                            c_row = pl.tile.read(c_ids, [0, c_lane])
+                            if c_row >= 0:
+                                c_physical = pl.cast(c_row, pl.INDEX)
+                                c_raw = pl.tile.gather_row(
+                                    c_raw, compressed_flat, [c_lane, 0], [c_physical, 0],
+                                    [1, COMPRESSED_CACHE_BYTES],
+                                )
                     # Each FP4E2M1X2 carrier contains two FP4 values.
                     c_payload_all = pl.reinterpret_view(c_raw, pl.FP4E2M1X2)
                     c_codes = c_payload_all[:, :SPARSE_VF_HALF_DIM]
@@ -1220,20 +1247,22 @@ def sparse_vf_decode_pypto(
                         shape=[SPARSE_VF_GATHER_TILE, SPARSE_VF_COMPRESSED_HALFWORDS],
                     )
                     c_scale_all = pl.reinterpret_view(c_factor_bits, pl.BF16)
-                    c_scale_view = c_scale_all[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
-                    c_factors_fp32 = pl.cast(c_scale_view, pl.FP32)
-                    c_factors = pl.cast(c_factors_fp32, pl.BF16, mode="rint")
+                    # Read FP4 group scales directly from the packed cache row.
                     pl.tile.store(c_ids, [token, column], selected_ids)
                     c_value_flat = pl.reshape(values, [SPARSE_VF_GATHER_TILE * HEAD_DIM])
                     c_factor_flat = pl.reshape(
-                        c_factors, [SPARSE_VF_GATHER_TILE * SPARSE_VF_COMPRESSED_GROUPS],
+                        c_scale_all, [SPARSE_VF_GATHER_TILE * SPARSE_VF_COMPRESSED_HALFWORDS],
                     )
                     with pl.reg_scope():
                         c_full = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
                         c_group = pl.reg.index_gen(0, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
                         c_group = pl.reg.shift_rights(c_group, SPARSE_VF_COMPRESSED_SHIFT, c_full)
                         for c_chunk in pl.hardware_loop(SPARSE_VF_GATHER_TILE * HEAD_DIM // SPARSE_VF_REG_TILE):
-                            c_base = pl.cast(c_chunk * SPARSE_VF_COMPRESSED_STEP, pl.UINT16)
+                            c_scale_row = c_chunk // (HEAD_DIM // SPARSE_VF_REG_TILE)
+                            c_part = c_chunk % (HEAD_DIM // SPARSE_VF_REG_TILE)
+                            c_row_base = c_scale_row * SPARSE_VF_COMPRESSED_HALFWORDS
+                            c_row_base = c_row_base + SPARSE_VF_COMPRESSED_SCALE_OFFSET
+                            c_base = pl.cast(c_row_base + c_part * SPARSE_VF_COMPRESSED_STEP, pl.UINT16)
                             c_offset = pl.reg.adds(c_group, c_base, c_full)
                             c_value = pl.reg.load(c_value_flat, c_chunk * SPARSE_VF_REG_TILE, lanes=SPARSE_VF_REG_TILE)
                             c_factor = pl.reg.gather(c_factor_flat, c_offset, c_full)
