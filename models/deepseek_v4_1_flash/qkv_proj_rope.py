@@ -393,13 +393,14 @@ def proj_kv_pypto(
                 if base + worker < 8:
                     row = mt * 80
                     col = (base + worker) * 64
-                    a0 = pl.load(payload, [row, 0], [80, 256], target_memory=pl.Mem.Mat)
+                    full_a = pl.load(payload, [row, 0], [80, 5120], target_memory=pl.Mem.Mat)
+                    a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
                     sa0 = pl.load(sa, [0, 0], [80, 8])
                     b0 = pl.load(weight, [0, col], [256, 64], target_memory=pl.Mem.Mat)
                     sb0 = pl.load(weight_scale, [0, col], [8, 64])
                     acc = pl.matmul_mx(a0, sa0, b0, sb0)
                     for k in pl.pipeline(256, 5120, 256, stage=2):
-                        av = pl.load(payload, [row, k], [80, 256], target_memory=pl.Mem.Mat)
+                        av = pl.tile.slice(full_a, [80, 256], [0, k])
                         sav = pl.load(sa, [0, k // 32], [80, 8])
                         bv = pl.load(weight, [k, col], [256, 64], target_memory=pl.Mem.Mat)
                         sbv = pl.load(weight_scale, [k // 32, col], [8, 64])
