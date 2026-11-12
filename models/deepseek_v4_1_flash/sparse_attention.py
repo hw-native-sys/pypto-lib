@@ -127,6 +127,7 @@ SPARSE_VF_WINDOW_GROUP = 32
 SPARSE_VF_COMPRESSED_GROUP = 16
 SPARSE_VF_WINDOW_GROUPS = HEAD_DIM // SPARSE_VF_WINDOW_GROUP
 SPARSE_VF_COMPRESSED_GROUPS = HEAD_DIM // SPARSE_VF_COMPRESSED_GROUP
+SPARSE_VF_INDEX_TILE = SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_COMPRESSED_GROUPS
 SPARSE_VF_HALF_DIM = HEAD_DIM // 2
 SPARSE_VF_WINDOW_HALFWORDS = WINDOW_CACHE_BYTES // 2
 SPARSE_VF_COMPRESSED_HALFWORDS = COMPRESSED_CACHE_BYTES // 2
@@ -1876,8 +1877,11 @@ def sparse_vf_fused_vector(
     pl.system.aiv_initialize_pipe(pv_ring_next, dir_mask=1, slot_size=16384, slot_num=1, id=3)
     scale_w_lanes = pl.tile.ci(0, [1, 2 * SPARSE_VF_FUSED_SCALE_TILE * SPARSE_VF_WINDOW_GROUPS], dtype=pl.INT16)
     scale_w_duplicate_indices = pl.shr(scale_w_lanes, 1)
-    scale_c_lanes = pl.tile.ci(0, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM], dtype=pl.INT16)
-    scale_c_indices = pl.shr(scale_c_lanes, SPARSE_VF_COMPRESSED_SHIFT)
+    scale_c_lanes = pl.tile.ci(0, [1, SPARSE_VF_INDEX_TILE], dtype=pl.INT16)
+    scale_c_column = pl.tile.reshape(scale_c_lanes, [SPARSE_VF_INDEX_TILE, 1])
+    scale_c_target = pl.tile.create([SPARSE_VF_INDEX_TILE, SPARSE_VF_COMPRESSED_GROUP], pl.INT16, pl.MemorySpace.Vec)
+    scale_c_expanded = pl.tile.row_expand(scale_c_target, scale_c_column)
+    scale_c_indices = pl.tile.reshape(scale_c_expanded, [1, SPARSE_VF_FUSED_SCALE_TILE * HEAD_DIM])
     scale_gather_tmp = pl.tile.create([1, 16], dtype=pl.INT16, target_memory=pl.MemorySpace.Vec)
     worker = pl.tile.get_block_idx()
     for block in pl.range(worker, num_tokens * (LOCAL_H // SPARSE_VF_FUSED_HEAD_TILE), workers):
