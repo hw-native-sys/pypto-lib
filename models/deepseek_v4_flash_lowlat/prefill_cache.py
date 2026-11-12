@@ -16,7 +16,7 @@ from models.deepseek_v4_flash_dspark.config import DECODE_SEQ as DSPARK_DECODE_S
 
 
 RANKS = 8
-CP_SIZE = 4
+CP_SIZE = 8
 
 # name: (layers, decode rows per page, prefill rows per page, trailing shape, dtype)
 CACHE_LAYOUTS = {
@@ -228,7 +228,7 @@ def prefill_slot_mappings(positions, decode_tables, caches, *, block_counts=None
     if bool((positions < -1).any()):
         raise ValueError("Only -1 may mark a padded position")
     if not torch.equal(positions, positions[:1].expand(RANKS, -1)):
-        raise ValueError("The two prefill CP groups must process the same positions")
+        raise ValueError("All prefill ranks must process the same positions")
     valid = positions >= 0
     if bool((valid[:, 1:] & ~valid[:, :-1]).any()):
         raise ValueError("Padding must follow every active position")

@@ -13,6 +13,8 @@ import inspect
 
 import pypto.language as pl
 
+from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
+
 from config import (
     FLASH as M,
     DECODE_BATCH,
@@ -288,7 +290,7 @@ def rope_prepare(
 @pl.jit.inline(auto_scope=False)
 def q_proj_qr(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
@@ -423,7 +425,7 @@ def q_proj_qr(
 
 @pl.jit.inline(auto_scope=False)
 def q_proj_q_matmul(
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     qr_i8_matmul: pl.Tensor[[QPROJ_T_PAD, Q_LORA], pl.INT8],
     q_proj_i32: pl.Tensor[[QPROJ_T_PAD, H * HEAD_DIM], pl.INT32],
     tile_rows: pl.Scalar[pl.INDEX],
@@ -668,7 +670,7 @@ def q_proj_q_dequant(
 
 @pl.jit.inline(auto_scope=False)
 def _q_proj_q_stream(
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
@@ -754,7 +756,7 @@ def _q_proj_q_stream(
 @pl.jit.inline(auto_scope=False)
 def q_proj_q(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
@@ -789,8 +791,8 @@ def q_proj_q(
 @pl.jit.inline(auto_scope=False)
 def q_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
@@ -1048,8 +1050,8 @@ def kv_proj_rope(
 @pl.jit.inline(auto_scope=False)
 def qkv_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -1097,8 +1099,8 @@ def qkv_proj_rope(
 @pl.jit
 def qkv_proj_rope_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -1148,8 +1150,8 @@ SPLIT_T_LOCAL = SPLIT_T_FULL // 4
 def q_kv_split_test(
     x_local: pl.Tensor[[SPLIT_T_LOCAL, D], pl.BF16],
     x_full: pl.Tensor[[SPLIT_T_FULL, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos_local: pl.Tensor[[SPLIT_T_LOCAL, ROPE_DIM], pl.BF16],

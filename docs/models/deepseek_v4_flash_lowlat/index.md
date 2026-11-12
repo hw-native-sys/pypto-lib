@@ -379,11 +379,17 @@ RoPE inputs.
 
 ### Prefill
 
-`prefill_fwd.load_prefill_program()` loads the existing DSpark chunked
-43-layer forward with CP4/EP8 geometry. Both CP groups receive the same
-batch-one prompt; each group contributes its own rank-local tokens and has
-replicated attention caches. The serving caller supplies the prefill program's
-own weight tensors and scratch buffers in the generated metadata's layout.
+`prefill_fwd.load_prefill_programs()` loads one 43-layer chunk program with
+CP8 attention, TP8 MoE intermediate shards, and a TP8 vocabulary head. Each
+rank holds the complete chunk's HC input and owns a consecutive eighth of its
+attention queries. Bind the decode Worker's existing TP8 weight banks, original
+quantization scales, and cache allocations. The chunk entry reshapes contiguous
+layer banks through borrowed device views and never uploads another weight set.
+Query LoRA, query expansion, indexer-gate and vocabulary projections keep the
+decode banks' ND storage. The isolated import selects the corresponding shared
+operator annotations; callers must not repack these resident banks into NZ.
+`load_prefill_programs(mode="serial")` loads the six component entries for the
+same TP8 numerical baseline.
 
 `prefill_cache.prefill_cache_views` borrows each owning decode cache buffer
 through that Worker's `view_tensor` API. The cache bytes remain in place:
@@ -396,7 +402,7 @@ the original owning allocations may be freed. `initialize_cache_pages`
 initializes newly owned pages, including the compressor score sentinel,
 without clearing other requests' or shared-prefix pages.
 
-`prefill_metadata` packs each prompt chunk and its RoPE rows for both groups.
+`prefill_metadata` packs each prompt chunk and its RoPE rows for the CP8 group.
 Physical page IDs may differ between ranks; each rank's table is converted
 against its own cache allocation. Pass the existing `block_counts` when the
 compressor tables use the decode ring layout.
@@ -414,12 +420,64 @@ non-inherited CPU buffers.
 For single-machine prefill and decode, the caller uses the same rank-local
 cache allocations and waits for each prefill dispatch before dependent decode
 work. The scheduler and request lifetime remain the serving caller's job.
+Prepare both programs on one Worker using `extra_compiled`, retain the owning
+decode cache tensors, and pass their borrowed views to prefill. After terminal
+prefill completes, use its sampled token as the next decode input at the prompt
+length, with `kv_seq_lens` including that input. Decode uses the original block
+tables and counts, including compressor state; it does not use the expanded
+prefill page tables or reinitialize the retained cache pages. The decode RoPE
+capacity must cover the prompt and all subsequent generated positions. Allocate
+decode metadata, scratch and any retained ABI buffers during Worker setup,
+before prefill. Borrowed views require no physical layout conversion; first-use
+program/domain preparation and normal dispatch synchronization remain separate
+latency costs.
 
-`prefill_fwd.prepare_prefill_bindings` combines the caller's prefill-format
+`prefill_fwd.prepare_prefill_bindings` combines the caller's resident decode-format
 weights, input metadata and scratch with the cache views. `submit_prefill`
-orders the bindings using the actual generated parameter metadata and waits
-for the chunk to complete. The caller supplies the original prefill sampling,
-grammar, allocation and request-lifetime inputs, and consumes its outputs.
+orders the bindings using the actual generated parameter metadata. The chunk
+program submits all layers once and waits once before returning. Its final HC
+output aliases the supplied `x_hc`; `x_hc_next` is scratch for the serial
+baseline only. The `terminal` scalar runs the learned head and sampling only
+on the final chunk. The caller supplies the original sampling, grammar,
+allocation and request-lifetime inputs, and consumes its outputs. Submit chunks
+in order, retaining the owning allocations through the final completion.
+
+CSA coordinates 128-query indexer blocks with two bounded gather slots.
+Gather waits for that block's exact top-512 selection and the previous consumer
+of its slot. QK/PV waits for its gather and the preceding attention block.
+The existing 512-row output-projection tile and all attention arithmetic remain
+in their owning operators. The indexer score/pair arenas and the two KV slots
+are reused across blocks; their lifetime ends with the layer's device scope.
+This permits subsequent index scoring and gather to become ready before the
+preceding attention finishes. Generated dependencies establish eligibility;
+actual overlap and wall-time benefit still require device measurements.
+
+Generate the chunk artifact without a Worker using:
+
+```bash
+python -m models.deepseek_v4_flash_lowlat.build \
+  --profile prefill --cache build_output/prefill-cache \
+  --report ../experiments/lowlat-prefill/pr1747/builds/prefill-generated.json
+```
+
+Keep experiment scripts, case manifests, datasets and timing reports under the
+workspace's `experiments/` directory. `build_output/` owns generated compiler
+artifacts and JIT caches. Experimental callers select explicit AgentX trace and
+request identities; input length, padding and chunk boundaries must come from
+the actual reconstructed input, with no fixed short-prompt fallback.
+
+The report records chunk/tile sizes, the exact-prefetch mode, two slots, and
+the retained eight projection replicas. Code generation, native compilation,
+and host binding checks alone do not establish device equivalence. A reconstructed
+AgentX request of 16,384 tokens passed full-output and cache byte-digest checks
+against the frozen TP8 component baseline. On the same Worker, 64 subsequent
+single-query decode steps retained the original weight/cache allocations and
+matched a copied-cache control for sampled IDs, logits, hidden states and final
+cache contents. This qualifies the tested allocation handoff; longer contexts
+and complete serving sessions remain unvalidated. Histogram/EMA early prefetch, projection sharing across
+ranks, and tile-specific cache publication dependencies are not implemented.
+Their configuration must not be advertised as available or selected from
+unmeasured cost estimates.
 
 
 ### Deployment

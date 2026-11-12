@@ -37,7 +37,7 @@ def prefill_tap_positions(start_pos, token_count):
 
 def prepare_prefill_metadata(tokens, *, start_pos, tables, caches, rope_cos, rope_sin, max_logit_rows, terminal,
                              block_counts=None):
-    """Build the B1 CP4/EP8 prompt metadata for one chunk.
+    """Build B1 prompt metadata for one eight-rank group and one chunk.
 
     ``rope_cos`` and ``rope_sin`` are the existing decode tables with the
     uncompressed and compressed profiles at indices 0 and 1. Cache tables
@@ -78,6 +78,11 @@ def prepare_prefill_metadata(tokens, *, start_pos, tables, caches, rope_cos, rop
                                             for rank in range(RANKS)]),
         "input_ids": torch.stack([token_rows[(rank % CP_SIZE) * local : (rank % CP_SIZE + 1) * local]
                                    for rank in range(RANKS)]),
+        "input_ids_full": _replicate(token_rows),
+        "local_request_ids": torch.stack([
+            torch.where(torch.arange(rank * local, (rank + 1) * local) < logical, 0, -1).to(torch.int32)
+            for rank in range(RANKS)
+        ]),
         "logit_row_indices": torch.full((RANKS, max_logit_rows), -1, dtype=torch.int32),
     }
     if terminal:

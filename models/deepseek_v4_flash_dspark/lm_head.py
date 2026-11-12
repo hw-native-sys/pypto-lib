@@ -13,6 +13,8 @@ from math import gcd
 import sys
 
 import pypto.language as pl
+
+from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 import pypto.language.distributed as pld
 from pypto.ir import DistributedConfig
 
@@ -111,7 +113,7 @@ assert VOCAB < GREEDY_INDEX_SENTINEL, "sentinel must lose every row_min against 
 @pl.jit.inline(auto_scope=False)
 def lm_head(
     hidden_states: pl.Tensor,
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -350,7 +352,7 @@ def lm_head(
 @pl.jit
 def l2_lm_head(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
@@ -518,7 +520,7 @@ def greedy_sample(
 @pl.jit
 def l2_lm_head_sample(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, pl.NZ],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     grammar_mask: pl.Tensor[[MAX_LOGIT_ROWS, GREEDY_GRID_ROWS, GRAMMAR_SEGMENT_WORDS], pl.INT16],

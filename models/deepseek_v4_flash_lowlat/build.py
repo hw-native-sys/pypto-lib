@@ -67,19 +67,28 @@ def artifact_directory(compiled):
     return Path(compiled.output_dir).resolve()
 
 
-def source_manifest():
+def source_manifest(*, prefill=False):
     root = Path(__file__).resolve().parent
-    return {
+    sources = {
         str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in sorted(root.rglob("*"))
         if p.suffix in (".py", ".cpp", ".inc")
     }
+    if prefill:
+        shared = root.parent / "deepseek_v4_flash_dspark"
+        sources.update({
+            "../deepseek_v4_flash_dspark/" + p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(shared.glob("*.py"))
+        })
+    return sources
 
 
-def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180):
+def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=16384):
     """Compile one immutable source profile; device IDs describe topology only."""
-    if profile not in ("single", "one", "two", "rsag"):
+    if profile not in ("single", "one", "two", "rsag", "prefill"):
         raise ValueError("Unknown request-pipeline source profile")
+    if type(max_seq_len) is not int or max_seq_len < 1:
+        raise ValueError("Maximum sequence length must be a positive integer")
     if (
         len(device_ids) != 8
         or len(set(device_ids)) != 8
@@ -92,7 +101,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
     from pypto.runtime import ExecutionMode, RunConfig
 
     configure_cache(CacheConfig(enabled=True, root=Path(cache_root), readonly=False))
-    before = source_manifest()
+    before = source_manifest(prefill=profile == "prefill")
     saved_argv = sys.argv
     try:
         # The single-query and verification profiles freeze the shared operators
@@ -106,11 +115,17 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
             "--spec-tokens",
             "0" if profile == "single" else "5",
             "--max-seq-len",
-            "16384",
+            str(max_seq_len),
             "--moe-banks",
             "43",
         ]
-        if profile == "single":
+        if profile == "prefill":
+            from .prefill_fwd import load_prefill_programs
+
+            function = load_prefill_programs()["chunk"]
+            kwargs = {}
+            selected_source = None
+        elif profile == "single":
             module = importlib.import_module(".native_single", __package__)
             function = module.l3_decode_fwd
             kwargs = {}
@@ -136,7 +151,8 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         compiled = function.compile(config=config, **kwargs)
     directory = artifact_directory(compiled)
     metadata = json.loads((directory / "distributed_meta.json").read_text())
-    if len(metadata["params"]) != (83 if profile == "single" else 155):
+    expected_parameters = len(function.param_names) if profile == "prefill" else (83 if profile == "single" else 155)
+    if len(metadata["params"]) != expected_parameters:
         raise RuntimeError("The actual public parameter contract changed")
     if selected_source:
         # A validated GENERATED cache hit does not re-enter the generation hook.
@@ -153,9 +169,9 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
                 or hashlib.sha256(actual.encode()).hexdigest() != item["selected_source_sha256"]
             ):
                 raise RuntimeError("Selected native source differs from the reviewed graft")
-    if before != source_manifest():
+    if before != source_manifest(prefill=profile == "prefill"):
         raise RuntimeError("Pipeline sources changed during compilation")
-    return compiled, dict(
+    report = dict(
         status="GENERATED_NOT_NATIVE_OR_DEVICE_TESTED",
         profile=profile,
         artifact_dir=str(directory),
@@ -166,6 +182,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         native_w2_source_sha256=selected_source,
         old_binaries_loaded=False,
         ptoas_timeout_seconds=ptoas_timeout_seconds,
+        max_seq_len=max_seq_len,
         model_weights_loaded=False,
         Worker=0,
         NPU=0,
@@ -173,13 +190,23 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         arithmetic_contract="historical_fast_approximation",
         reference_bitwise_guaranteed=False,
     )
+    if profile == "prefill":
+        report["prefill_plan"] = dict(
+            chunk_tokens=8192, kv_tile_tokens=512, query_block_tokens=128,
+            attention_cp=8, moe_tp=8, lm_head_tp=8,
+            projection_replicas=8, prefetch="exact", transfer_slots=2,
+            resident_projection_layout="ND",
+            dispatches_per_chunk=1, tp8_baseline_bitwise_verified=False,
+        )
+    return compiled, report
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=["single", "one", "two", "rsag"], required=True)
+    parser.add_argument("--profile", choices=["single", "one", "two", "rsag", "prefill"], required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--max-seq-len", type=int, default=16384)
     parser.add_argument("--devices", default="0,1,2,3,4,5,6,7")
     parser.add_argument(
         "--ptoas-timeout-seconds",
@@ -197,6 +224,7 @@ def main():
         cache_root=args.cache,
         device_ids=devices,
         ptoas_timeout_seconds=args.ptoas_timeout_seconds,
+        max_seq_len=args.max_seq_len,
     )
     report["generation_seconds"] = time.monotonic() - started
     args.report.parent.mkdir(parents=True, exist_ok=True)

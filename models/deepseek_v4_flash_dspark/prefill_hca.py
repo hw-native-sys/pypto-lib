@@ -10,6 +10,8 @@
 """DeepSeek-V4 packed prefill HCA (ratio-128) attention over one contiguous run of <=T tokens."""
 
 import pypto.language as pl
+
+from projection_weight_layout import PROJECTION_WEIGHT_LAYOUT
 from utils import checkpoint_ends_tensor
 
 from config import (
@@ -121,8 +123,8 @@ def _prefill_attention_hca(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -808,8 +810,8 @@ def prefill_attention_hca_cp_core(
     query_start_loc: pl.Tensor[[QUERY_START_LOC_DYN], pl.INT32],
     state_checkpoint_ends: pl.Tensor[[REQUESTS_DYN, CHECKPOINT_TILES_DYN, CHECKPOINTS_PER_TILE], pl.INT32],
     local_request_ids: pl.Tensor[[CP_Q_T_DYN], pl.INT32],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -998,8 +1000,8 @@ def prefill_attention_hca_cp(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -1125,8 +1127,8 @@ def prefill_attention_hca_cp_test(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, pl.NZ],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, pl.NZ],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16, PROJECTION_WEIGHT_LAYOUT],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8, PROJECTION_WEIGHT_LAYOUT],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
