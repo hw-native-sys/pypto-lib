@@ -25,17 +25,17 @@ from sparse_attention import (
     swa_official_reference as golden_reference,
     make_swa_inputs as make_inputs, make_packed_swa_inputs as make_packed_inputs,
 )
-from o_proj import o_proj
+from o_proj import o_proj, o_proj_hc_post, prefill_output_reduce_hc_post
 from config import (
     MAX_BATCH_PER_DP, FLASH as M, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, PREFILL_MAX_TOKENS, SP_T_DYN,
     WINDOW_CACHE_BYTES,
 )
 from hc import golden_hc_mixes
-from hc import golden_hc_post, hc_post
+from hc import golden_hc_post, hc_post_padding
 from hc import golden_hc_collapse, hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
 from rmsnorm import golden_rms_norm
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter
+from o_proj import retire_prefill_signals
 from prefill_cp_allgather import prefill_sp_input_allgather
 
 
@@ -83,35 +83,47 @@ def prefill_swa_attention(
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    partial: pl.Tensor[[T_DYN, D], pl.BF16],
+    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    scatter_output: pl.constexpr,
+    zero_padding: pl.constexpr = True,
 ):
-    """Write BF16 head-TP partials for packed causal SWA; write slots must be unique."""
+    """Project chunked SWA into HC streams; write slots must be unique."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_prefill_previous_epoch", allow_early_resolve=False) as cache_ready:
-        for peer in pl.range(TP_SIZE):
-            previous_epoch = (attention_epoch - 1) * 2
-            pld.system.wait(output_arrived, offsets=[peer, 0], expected=previous_epoch, cmp=pld.WaitCmp.Ge)
+        if TP_SIZE > 1:
+            for peer in pl.range(TP_SIZE):
+                previous_epoch = (attention_epoch - 1) * 2
+                pld.system.wait(output_arrived, offsets=[peer, 0], expected=previous_epoch, cmp=pld.WaitCmp.Ge)
     tokens = pl.tensor.dim(x, 0)
-    kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-    # Gate every projection tile before scratch storage is reused by a new epoch.
-    with pl.spmd(WORKER_TILE, name_hint="prefill_swa_begin", deps=[cache_ready]):
-        worker = pl.tile.get_block_idx()
-        for row in pl.range(worker, num_tokens, WORKER_TILE):
-            kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(
-        x, num_tokens, row_tile=256,
-    )
-    kv_projection = kv_proj(
-        kv_input_payload, kv_input_scales,
-        wkv, wkv_scale,
-        kv_projection, num_tokens, worker_limit=8, row_tile=256,
-    )
-    chunk_done = window_publish(
-        kv_projection, kv_norm_weight, rope_cos, rope_sin,
-        window_slots, window_cache,
-        num_tokens, cache_ready,
-    )
+    partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    chunk_done = pl.system.task_dummy(deps=[])
+    if num_tokens > 0:
+        kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
+        # Gate every projection tile before scratch storage is reused by a new epoch.
+        with pl.spmd(WORKER_TILE, name_hint="prefill_swa_begin", deps=[cache_ready]):
+            worker = pl.tile.get_block_idx()
+            for row in pl.range(worker, num_tokens, WORKER_TILE):
+                kv_projection[row : row + 1, :] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        kv_input_payload, kv_input_scales, kv_input_payload_padded_rows = quantize_projection_input(
+            x, num_tokens, row_tile=256,
+        )
+        kv_projection = kv_proj(
+            kv_input_payload, kv_input_scales,
+            wkv, wkv_scale,
+            kv_projection, num_tokens, worker_limit=8, row_tile=256,
+        )
+        chunk_done = window_publish(
+            kv_projection, kv_norm_weight, rope_cos, rope_sin,
+            window_slots, window_cache,
+            num_tokens, cache_ready,
+        )
     chunk_x = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
     chunk_cos = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
     chunk_sin = pl.create_tensor([QUERY_TILE, ROPE_DIM // 2], dtype=pl.FP32)
@@ -120,8 +132,9 @@ def prefill_swa_attention(
     q = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     chunk_partial = pl.create_tensor([QUERY_TILE, D], dtype=pl.BF16)
 
+    attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     for start in pl.range(0, num_tokens, QUERY_TILE):
-        active = pl.min(QUERY_TILE, num_tokens - start)
+        active = pl.max(0, pl.min(QUERY_TILE, num_tokens - start))
         # The prior chunk must finish reading every reusable scratch buffer.
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_stage", deps=[chunk_done]) as stage_tid:
             worker = pl.tile.get_block_idx()
@@ -131,35 +144,53 @@ def prefill_swa_attention(
                 chunk_cos[row:row + 1, :] = rope_cos[source_row:source_row + 1, :]
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
-        q_input_payload, q_input_scales, q_input_payload_padded_rows = quantize_projection_input(
-            chunk_x, active, row_tile=256,
-        )
-        q_proj_rope(
-            q_input_payload, q_input_scales,
-            wq_a, wq_a_scale, q_norm_weight,
-            wq_b, wq_b_scale,
-            chunk_cos, chunk_sin,
-            qr, q,
-            active, qa_worker_limit=24, qb_worker_limit=24,
-            padded_rows=q_input_payload_padded_rows,
-            qa_row_tile=256, qb_row_tile=128,
-        )
-        attended = pl.create_tensor([QUERY_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        swa_attention_partial(q, window_cache, chunk_indices, attn_sink, attended, active, stage_tid)
-        o_proj(
-            attended,
-            wo_a, wo_a_scale, wo_b, wo_b_scale,
-            chunk_cos, chunk_sin,
-            chunk_partial, active,
-            worker_limit=32, oa_row_tile=128, ob_row_tile=256,
-        )
+        if active > 0:
+            q_input_payload, q_input_scales, q_input_payload_padded_rows = quantize_projection_input(
+                chunk_x, active, row_tile=256,
+            )
+            q_proj_rope(
+                q_input_payload, q_input_scales,
+                wq_a, wq_a_scale, q_norm_weight,
+                wq_b, wq_b_scale,
+                chunk_cos, chunk_sin,
+                qr, q,
+                active, qa_worker_limit=24, qb_worker_limit=24,
+                padded_rows=q_input_payload_padded_rows,
+                qa_row_tile=256, qb_row_tile=128,
+            )
+            swa_attention_partial(q, window_cache, chunk_indices, attn_sink, attended, active, stage_tid)
+        if TP_SIZE == 1:
+            projection_done = stage_tid
+            if active > 0:
+                _chunk_output, projection_done = o_proj_hc_post(
+                    attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_cos, chunk_sin,
+                    residual[start:start + active, :, :], post_mix[start:start + active, :],
+                    residual_mix[start:start + active, :, :], output[start:start + active, :, :], active,
+                    oa_row_tile=128, ob_row_tile=128,
+                )
+            chunk_done = projection_done
+        else:
+            o_proj(
+                attended,
+                wo_a, wo_a_scale, wo_b, wo_b_scale,
+                chunk_cos, chunk_sin,
+                chunk_partial, active,
+                oa_row_tile=128, ob_row_tile=256,
+            )
 
-        with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
-            worker = pl.tile.get_block_idx()
-            for row in pl.range(worker, active, WORKER_TILE):
-                partial[start + row:start + row + 1, :] = chunk_partial[row:row + 1, :]
-        chunk_done = collect_tid
-    return partial
+            with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
+                worker = pl.tile.get_block_idx()
+                for row in pl.range(worker, active, WORKER_TILE):
+                    partial[start + row:start + row + 1, :] = chunk_partial[row:row + 1, :]
+            chunk_done = collect_tid
+    if TP_SIZE > 1:
+        prefill_output_reduce_hc_post(
+            partial, output_window, output_arrived, residual, post_mix, residual_mix, output,
+            group_base, tp_rank, num_tokens, attention_epoch, scatter_output=scatter_output, zero_padding=zero_padding,
+        )
+    else:
+        hc_post_padding(residual, post_mix, residual_mix, output, num_tokens, chunk_done, zero_output=zero_padding)
+    return output
 
 
 @pl.jit.inline(auto_scope=False)
@@ -193,7 +224,6 @@ def prefill_swa(
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     hidden: pl.Tensor[[T_DYN, D], pl.BF16],
-    attn_out: pl.Tensor[[SP_T_DYN, D], pl.BF16],
     output: pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32],
     next_pre_mix: pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32],
     group_base: pl.Scalar[pl.INT32],
@@ -214,41 +244,27 @@ def prefill_swa(
         local_hidden, input_window, input_arrived, hidden,
         group_base, tp_rank, num_tokens, attention_epoch,
     )
-    group_tokens = pl.tensor.dim(hidden, 0)
-    partial = pl.create_tensor([group_tokens, D], dtype=pl.BF16)
-    if num_tokens > 0:
-        prefill_swa_attention(
-            hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
-            wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
-            rope_cos, rope_sin, window_slots, window_indices, window_cache,
-            output_arrived, partial, num_tokens, attention_epoch,
-        )
-    prefill_sp_output_reduce_scatter(
-        partial, output_window, output_arrived, attn_out,
-        group_base, tp_rank, num_tokens, attention_epoch,
+    prefill_swa_attention(
+        hidden, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
+        wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
+        rope_cos, rope_sin, window_slots, window_indices, window_cache,
+        output_arrived, output, num_tokens, attention_epoch,
+        output_window=output_window, group_base=group_base, tp_rank=tp_rank,
+        residual=x_hc, post_mix=post_mix, residual_mix=residual_mix, scatter_output=True, zero_padding=True,
     )
     hc_rows = pl.tensor.dim(x_hc, 0)
     hc_active = pl.max(0, pl.min(hc_rows, num_tokens - (tp_rank) * hc_rows))
-    if hc_active > 0:
-        hc_sublayer = attn_out[:hc_active, :]
-        hc_residual = x_hc[:hc_active, :, :]
-        hc_post_mix = post_mix[:hc_active, :]
-        hc_residual_mix = residual_mix[:hc_active, :, :]
-        hc_output = output[:hc_active, :, :]
-        hc_post_deps = pl.array.create(2, pl.TASK_ID)
-        hc_post_deps[0] = gathered
-        hc_post(hc_sublayer, hc_residual, hc_post_mix, hc_residual_mix, hc_output, deps=hc_post_deps)
     if hc_active < hc_rows:
         with pl.spmd(32, name_hint="sp_mix_zero_padding", deps=[gathered]):
             worker = pl.tile.get_block_idx()
             for row in pl.range(hc_active + worker, hc_rows, 32):
-                # Reduce-scatter supplies zeros for inactive rows.
-                zero_source = pl.cast(attn_out[row:row + 1, 0:16], pl.FP32)
-                zero_output = pl.full([1, HC_MULT * D], dtype=pl.FP32, value=0.0)
-                zero_output = pl.assemble(zero_output, zero_source, [0, 0])
-                output[row:row + 1, :, :] = pl.reshape(zero_output, [1, HC_MULT, D])
                 zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
                 next_pre_mix[row:row + 1, :] = pl.set_validshape(zero_mix, 1, HC_MULT)
+    if num_tokens == 0:
+        # Empty attention skips the gathered input read; retain its consumption dependency.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="empty_attention_input_done", deps=[gathered], allow_early_resolve=False):
+            anchor = pl.read(output, [0, 0, 0])
+            pl.write(output, [0, 0, 0], anchor)
     return output, next_pre_mix
 
 
@@ -333,7 +349,6 @@ def l2_prefill_swa(
     output: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32]],
     next_pre_mix: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32]],
     hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    attn_out: pl.Out[pl.Tensor[[SP_T_DYN, D], pl.BF16]],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
     input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
@@ -352,12 +367,12 @@ def l2_prefill_swa(
         wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale,
         wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale,
         rope_cos, rope_sin, window_slots, window_indices, window_cache,
-        input_window, input_arrived, output_window, output_arrived, hidden, attn_out, output, next_pre_mix,
+        input_window, input_arrived, output_window, output_arrived, hidden, output, next_pre_mix,
         rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active_tokens, attention_epoch,
     )
     retire_prefill_signals(output, input_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     retire_prefill_signals(output, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
-    return output, next_pre_mix, hidden, attn_out, window_cache
+    return output, next_pre_mix, hidden, window_cache
 
 
 @pl.jit.host
@@ -389,7 +404,6 @@ def l3_prefill_swa(
     output: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT, D], pl.FP32]],
     next_pre_mix: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT], pl.FP32]],
     hidden: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, D], pl.BF16]],
-    attn_out: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, D], pl.BF16]],
     num_tokens: pl.Tensor[[RANKS_DYN, 1], pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
 ):
@@ -420,7 +434,7 @@ def l3_prefill_swa(
             wkv[rank], wkv_scale_r, kv_norm_weight[rank], attn_sink[rank],
             wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank], rope_sin[rank],
             window_slots[rank], window_indices[rank], window_cache[rank],
-            output[rank], next_pre_mix[rank], hidden[rank], attn_out[rank], input_data, input_signal, data, signal,
+            output[rank], next_pre_mix[rank], hidden[rank], input_data, input_signal, data, signal,
             num_tokens[rank], rank, attention_epoch,
             device=rank,
         )
@@ -514,7 +528,7 @@ def build_hc_specs(args):
     specs += [TensorSpec("output", [world_size, local_tokens, HC_MULT, D], torch.float32, resident="stacked"),
               TensorSpec("next_pre_mix", [world_size, local_tokens, HC_MULT], torch.float32, resident="stacked"),
               TensorSpec("hidden", [world_size, args.tokens, D], bf, resident="stacked"),
-              TensorSpec("attn_out", [world_size, local_tokens, D], bf, resident="stacked"),
+
               TensorSpec("num_tokens", [world_size, 1], torch.int32, init_value=lambda: rank_counts, resident="stacked"),
               ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True,
                          benchmark_step=None)]
@@ -567,7 +581,6 @@ def golden_prefill_swa_case(tensors):
         output = golden_hc_post(reduced, x_hc, post_mix, residual_mix)
         output[active:] = 0
         tensors["hidden"][group].copy_(hidden.unsqueeze(0).expand(TP_SIZE, -1, -1))
-        tensors["attn_out"][group].copy_(token_shards(reduced, local_tokens))
         tensors["output"][group].copy_(token_shards(output, local_tokens))
 
 
@@ -618,6 +631,9 @@ if __name__ == "__main__":
     torch.set_num_threads(8)
     print(f"[SWA+HC] tokens={args.tokens} requests={args.requests} TP={TP_SIZE} DP={args.dp} "
           f"case={args.case} fixture={args.fixture} seed={args.seed} devices={devices}")
+    output_check = ratio_allclose(atol=1e-2, rtol=1.0 / 128)
+    if args.case == "zero":
+        output_check = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
     result = run(
         fn=l3_prefill_swa,
         specs=build_hc_specs(args),
@@ -636,12 +652,7 @@ if __name__ == "__main__":
         compare_fn={
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "hidden": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            # Zero, masked and sink outputs are exactly zero, so any residue is a failure.
-            "attn_out": (
-                ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
-                if args.case in ("masked", "zero", "sink") else ratio_allclose(atol=1e-2, rtol=1.0 / 128)
-            ),
-            "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "output": output_check,
             "window_cache": packed_cache_compare(
                 mapped_pool_ratio_allclose(
                     "window_slots", pool_name="window_cache",

@@ -266,7 +266,6 @@ def decode_encoder(
             layer_wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN] = wo_b[weight_layer]
             layer_wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // MX_GROUP, D], pl.FP8E8M0, pl.MX_B_NN] = pl.slice(wo_b_scale, [LOCAL_O_WIDTH // MX_GROUP, D], [weight_layer * (LOCAL_O_WIDTH // MX_GROUP), 0])
             if layer < 2:
-                swa_attention_output = pl.create_tensor([tokens, D], dtype=pl.BF16)
                 decode_swa(
                     x_hc, pre_mix,
                     layer_hc_fn, layer_hc_scale, layer_hc_base,
@@ -282,7 +281,6 @@ def decode_encoder(
                     base_rope_cos, base_rope_sin,
                     window_slots, window_indices,
                     layer_window_cache,
-                    swa_attention_output,
                     attention_hidden, attention_pre_mix, attention_count,
                 )
             elif (layer - 2) % 6 == 0:

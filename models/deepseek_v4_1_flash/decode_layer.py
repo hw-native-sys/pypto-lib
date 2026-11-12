@@ -110,7 +110,6 @@ def l2_decode_layer(
     pool_block_ids: pl.InOut[pl.Tensor[[T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
     pool_block_counts: pl.InOut[pl.Tensor[[T_DYN], pl.INT32]],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    attention_output: pl.Out[pl.Tensor[[LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -174,7 +173,7 @@ def l2_decode_layer(
             rope_cos, rope_sin,
             window_slots, window_indices,
             window_cache,
-            attention_output, attention_hidden, attention_pre_mix,
+            attention_hidden, attention_pre_mix,
             attention_num_tokens,
         )
     elif layer_id < 20:
@@ -363,7 +362,6 @@ def l3_decode_layer(
     pool_block_ids: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN, INDEX_POOL_BLOCKS_DYN], pl.INT32]],
     pool_block_counts: pl.InOut[pl.Tensor[[EP_SIZE, T_DYN], pl.INT32]],
     compressed_indices: pl.Tensor[[EP_SIZE, T_DYN, INDEX_TOPK], pl.INT32],
-    attention_output: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, D], pl.BF16]],
     attention_hidden: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
     attention_pre_mix: pl.Out[pl.Tensor[[EP_SIZE, LOCAL_T_DYN, HC_MULT], pl.FP32]],
     hc_ffn_fn: pl.Tensor[[EP_SIZE, MIX_HC, HC_DIM], pl.FP32],
@@ -456,7 +454,7 @@ def l3_decode_layer(
             index_wk[rank], index_norm_weight[rank],
             index_wq_b[rank], index_wq_b_scale_rank, index_weights_proj[rank],
             topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], compressed_indices[rank],
-            attention_output[rank], attention_hidden[rank], attention_pre_mix[rank],
+            attention_hidden[rank], attention_pre_mix[rank],
             hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
             ffn_norm_weight[rank],
             gate_weight[rank],
@@ -870,7 +868,6 @@ def golden_l3_decode_layer(tensors):
                 group[name] = value[group_base]
             else:
                 group[name] = value
-        group["attention_output"] = tensors["attention_output"][group_base]
         group["attention_hidden"] = attention_hidden[group_base]
         group["attention_pre_mix"] = attention_pre_mix[group_base]
         group["num_tokens"] = global_tokens
@@ -1191,11 +1188,6 @@ if __name__ == "__main__":
             "topk_indices": exact,
             "pool_block_ids": exact,
             "pool_block_counts": exact,
-            # Attention output budget includes FP8 cache rounding boundaries.
-            "attention_output": _compare_active_rows_per_rank(
-                ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.025),
-                counts,
-            ),
             "attention_hidden": _compare_active_rows_per_rank(
                 ratio_allclose(atol=1e-2, rtol=1.0 / 128, max_error_ratio=0.02),
                 counts,

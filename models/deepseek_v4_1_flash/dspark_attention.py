@@ -109,7 +109,7 @@ def attend_dspark_window(
 
 
 @pl.jit.inline(auto_scope=False)
-def dspark_attention(
+def dspark_attention_partial(
     x: pl.Tensor,
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
     wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
@@ -120,16 +120,11 @@ def dspark_attention(
     wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
     kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     window_slots: pl.Tensor,
     window_indices: pl.Tensor,
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
 ):
     qr = pl.create_tensor([MOE_TOKENS, Q_LORA], dtype=pl.BF16)
@@ -161,11 +156,7 @@ def dspark_attention(
     selected = gather_dspark_window(window_cache, window_indices, selected, num_tokens)
     attended = pl.create_tensor([MOE_TOKENS, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     attended = attend_dspark_window(q, selected, window_indices, attn_sink, attended, num_tokens)
-    o_proj_result = o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale,
-        rope_cos, rope_sin, output, num_tokens, worker_limit=32, oa_row_tile=80, ob_row_tile=80,
-    )
-    return output, window_cache
+    return attended, window_cache
 
 
 @pl.jit
@@ -193,11 +184,17 @@ def dspark_attention_test(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
-    return dspark_attention(
+    attended, window_cache = dspark_attention_partial(
         x, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-        kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        window_slots, window_indices, window_cache, output, num_tokens,
+        kv_norm_weight, attn_sink, rope_cos, rope_sin,
+        window_slots, window_indices, window_cache, num_tokens,
     )
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        output, num_tokens, oa_row_tile=80, ob_row_tile=80,
+    )
+    return output, window_cache
+
 
 
 def make_attention_inputs(seed: int = 43):

@@ -23,7 +23,7 @@ from quant import pack_quantized_cache, unpack_quantized_cache
 
 import pypto.language.distributed as pld
 import torch
-from golden import ScalarSpec, TensorSpec, ratio_allclose, ratio_reldiff, run, mapped_pool_ratio_allclose
+from golden import ScalarSpec, TensorSpec, ratio_allclose, run, mapped_pool_ratio_allclose
 from pypto.ir import DistributedConfig
 from config import (
     FLASH as M, TP_SIZE, T_DYN, ORI_BLOCKS_DYN, CMP_BLOCKS_DYN, INDEX_BLOCKS_DYN, B_DYN, TABLE_DYN,
@@ -31,17 +31,16 @@ from config import (
     BLOCK_SIZE, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
 )
 from hc import golden_hc_mixes
-from hc import golden_hc_post, hc_post
+from hc import golden_hc_post
 from hc import golden_hc_collapse, hc_head_norm, hc_head_norm_store, hc_project, hc_sinkhorn
 from rmsnorm import golden_rms_norm
-from o_proj import o_proj
+from o_proj import prefill_project_hc_post, retire_prefill_signals
 from sparse_attention import (
     attend_packed, golden_compressed_attention, golden_prefill_c1a_attention,
 )
 from hc import HC_INPUT_NAMES, make_hc_inputs
 from utils import token_shards
 from prefill_cp_allgather import prefill_sp_input_allgather
-from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, prefill_tp_output_all_reduce
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from compressor import c1a_compressor_project, c1a_compressor_publish
 from prefill_indexer import (
@@ -149,11 +148,15 @@ def prefill_c1a_full_attention(
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     attention_epoch: pl.Scalar[pl.INT32],
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
     scatter_output: pl.constexpr = False,
+    zero_padding: pl.constexpr = True,
 ):
     """Publish ratio-1 caches, select sparse rows, and compute packed C1A."""
     tokens = pl.tensor.dim(x, 0)
-    partial = pl.create_tensor([tokens, D], dtype=pl.BF16)
+    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     query_latent = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x, num_tokens, row_tile=256)
@@ -196,28 +199,15 @@ def prefill_c1a_full_attention(
             num_tokens, source_ready,
         )
 
-        attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
         attend_packed(
             query, window_indices, window_cache, topk_indices, compressed_cache,
             attn_sink, attended, num_tokens, window_ready,
         )
-        o_proj(
-            attended,
-            wo_a, wo_a_scale, wo_b, wo_b_scale,
-            rope_cos, rope_sin,
-            partial, num_tokens,
-            worker_limit=32, oa_row_tile=128, ob_row_tile=256,
-        )
-    if scatter_output:
-        prefill_sp_output_reduce_scatter(
-            partial, output_window, output_arrived, output,
-            group_base, tp_rank, num_tokens, attention_epoch,
-        )
-    else:
-        prefill_tp_output_all_reduce(
-            partial, output_window, output_arrived, output,
-            group_base, tp_rank, num_tokens, attention_epoch,
-        )
+    prefill_project_hc_post(
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
+        residual, post_mix, residual_mix, output, output_window, output_arrived,
+        group_base, tp_rank, num_tokens, attention_epoch, scatter_output=scatter_output, zero_padding=zero_padding,
+    )
     return output
 
 
@@ -477,14 +467,12 @@ def wrap_attention_compare(compare):
 
     def compare_hc(actual, expected, *, inputs, actual_outputs, expected_outputs, **kwargs):
         attention_inputs = {**inputs, "x": expected_outputs["attn_input"]}
-        attention_actual = {**actual_outputs, "output": actual_outputs["attn_out"]}
-        attention_expected = {**expected_outputs, "output": expected_outputs["attn_out"]}
         return compare(
             actual,
             expected,
             inputs=attention_inputs,
-            actual_outputs=attention_actual,
-            expected_outputs=attention_expected,
+            actual_outputs=actual_outputs,
+            expected_outputs=expected_outputs,
             **kwargs,
         )
 
@@ -638,7 +626,6 @@ def l2_prefill_c1a_full_sharded(
     pool_block_counts: pl.InOut[pl.Tensor[[T_DYN], pl.INT32]],
     compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
     attn_input: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    attn_output: pl.Out[pl.Tensor[[SP_T_DYN, D], pl.BF16]],
     next_pre_mix: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32]],
     x_hc_out: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32]],
     input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
@@ -672,7 +659,6 @@ def l2_prefill_c1a_full_sharded(
     pool_block_ids.bind_dynamic(1, INDEX_POOL_BLOCKS_DYN)
     compressed_indices.bind_dynamic(0, T_DYN)
     attn_input.bind_dynamic(0, T_DYN)
-    attn_output.bind_dynamic(0, SP_T_DYN)
     next_pre_mix.bind_dynamic(0, SP_T_DYN)
     x_hc_out.bind_dynamic(0, SP_T_DYN)
     active = pl.read(num_tokens, [0])
@@ -699,31 +685,23 @@ def l2_prefill_c1a_full_sharded(
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos, compressed_rope_sin,
         compressor_wkv, compressor_norm_weight, compressed_slots, index_wk, index_norm_weight, index_wq_b,
         index_wq_b_scale, index_weights_proj, topk_indices, pool_block_ids, pool_block_counts, output_window, output_arrived,
-        attn_output, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, attention_epoch,
-        scatter_output=True,
+        x_hc_out, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, attention_epoch,
+        scatter_output=True, zero_padding=True,
+        residual=x_hc, post_mix=post_mix, residual_mix=residual_mix,
     )
     hc_rows = pl.tensor.dim(x_hc, 0)
     hc_active = pl.max(0, pl.min(hc_rows, active - (rank % TP_SIZE) * hc_rows))
-    if hc_active > 0:
-        hc_sublayer = attn_output[:hc_active, :]
-        hc_residual = x_hc[:hc_active, :, :]
-        hc_post_mix = post_mix[:hc_active, :]
-        hc_residual_mix = residual_mix[:hc_active, :, :]
-        hc_output = x_hc_out[:hc_active, :, :]
-        hc_post_deps = pl.array.create(2, pl.TASK_ID)
-        hc_post_deps[0] = gathered
-        hc_post(hc_sublayer, hc_residual, hc_post_mix, hc_residual_mix, hc_output, deps=hc_post_deps)
     if hc_active < hc_rows:
         with pl.spmd(32, name_hint="sp_mix_zero_padding", deps=[gathered]):
             worker = pl.tile.get_block_idx()
             for row in pl.range(hc_active + worker, hc_rows, 32):
-                # Reduce-scatter supplies zeros for inactive rows.
-                zero_source = pl.cast(attn_output[row:row + 1, 0:16], pl.FP32)
-                zero_output = pl.full([1, HC_MULT * D], dtype=pl.FP32, value=0.0)
-                zero_output = pl.assemble(zero_output, zero_source, [0, 0])
-                x_hc_out[row:row + 1, :, :] = pl.reshape(zero_output, [1, HC_MULT, D])
                 zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
                 next_pre_mix[row:row + 1, :] = pl.set_validshape(zero_mix, 1, HC_MULT)
+    if active == 0:
+        # Empty attention skips the gathered input read; retain its consumption dependency.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="empty_attention_input_done", deps=[gathered], allow_early_resolve=False):
+            anchor = pl.read(x_hc_out, [0, 0, 0])
+            pl.write(x_hc_out, [0, 0, 0], anchor)
     retire_prefill_signals(x_hc_out, input_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     retire_prefill_signals(x_hc_out, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
     return x_hc_out
@@ -776,7 +754,6 @@ def l3_prefill_c1a_full_sharded(
     pool_block_counts: pl.InOut[pl.Tensor[[RANKS_DYN, T_DYN], pl.INT32]],
     compressed_indices: pl.Tensor[[RANKS_DYN, T_DYN, INDEX_TOPK], pl.INT32],
     attn_input: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, D], pl.BF16]],
-    attn_output: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, D], pl.BF16]],
     next_pre_mix: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT], pl.FP32]],
     x_hc_out: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Tensor[[RANKS_DYN, 1], pl.INT32],
@@ -806,7 +783,6 @@ def l3_prefill_c1a_full_sharded(
     pool_block_ids.bind_dynamic(2, INDEX_POOL_BLOCKS_DYN)
     compressed_indices.bind_dynamic(1, T_DYN)
     attn_input.bind_dynamic(1, T_DYN)
-    attn_output.bind_dynamic(1, SP_T_DYN)
     next_pre_mix.bind_dynamic(1, SP_T_DYN)
     x_hc_out.bind_dynamic(1, SP_T_DYN)
     input_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
@@ -834,7 +810,7 @@ def l3_prefill_c1a_full_sharded(
             compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank], index_wk[rank],
             index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r, index_weights_proj[rank],
             topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], compressed_indices[rank], attn_input[rank],
-            attn_output[rank], next_pre_mix[rank], x_hc_out[rank], input_window, input_arrived, output_window,
+            next_pre_mix[rank], x_hc_out[rank], input_window, input_arrived, output_window,
             output_arrived, num_tokens[rank], rank, attention_epoch, device=rank,
         )
 
@@ -917,7 +893,7 @@ def build_c1a_sp_specs(args, initial_state):
         values['compressed_lens'][rank, active:] = 0
     initial_state.update({name: values[name].clone() for name in set().union(*STATE_NAMES.values())})
     specs = [TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=values[name], resident='stacked') for name in hc_keys + LEAF_NAMES]
-    for name, shape, dtype in (('attn_input', [tokens, D], torch.bfloat16), ('attn_output', [local, D], torch.bfloat16), ('next_pre_mix', [local, HC_MULT], torch.float32), ('x_hc_out', [local, HC_MULT, D], torch.float32)):
+    for name, shape, dtype in (('attn_input', [tokens, D], torch.bfloat16), ('next_pre_mix', [local, HC_MULT], torch.float32), ('x_hc_out', [local, HC_MULT, D], torch.float32)):
         specs.append(TensorSpec(name, [world, *shape], dtype, resident='stacked'))
     counts = torch.tensor(args.dp_tokens, dtype=torch.int32).repeat_interleave(TP_SIZE).reshape(-1, 1)
     specs.append(TensorSpec('num_tokens', [world, 1], torch.int32, init_value=counts, resident='stacked'))
@@ -933,8 +909,7 @@ def make_c1a_sp_compare(mode, initial_state, world_size, tokens):
     Low-bit rounding boundaries can change a few published cache codes in
     long prefills. Payloads and BF16 compressed scales allow 1% unequal
     mapped elements; window/index scales and all unmapped rows remain exact.
-    Full-attention output uses C2A's ratio_reldiff budget. This checks a
-    bounded mismatch fraction, not a dequantized L2 error bound.
+    The fused HC output retains its absolute and relative error budgets.
     """
     exact = ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0)
 
@@ -980,7 +955,6 @@ def make_c1a_sp_compare(mode, initial_state, world_size, tokens):
     compares = {
         "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-        "attn_output": ratio_reldiff(diff_thd=0.01, pct_thd=0.05) if mode == "full" else ratio_allclose(atol=1e-2, rtol=1.0 / 128),
         "x_hc_out": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
         "window_cache": packed_cache_compare(
             mapped_pool_ratio_allclose(
@@ -1064,7 +1038,7 @@ def golden_c1a_sp(tensors, *, mode, reference):
         output[active:] = 0
         pre[active:] = 0
         tensors["attn_input"][group].copy_(x.expand_as(tensors["attn_input"][group]))
-        for name, value in (("attn_output", attention), ("next_pre_mix", pre), ("x_hc_out", output)):
+        for name, value in (("next_pre_mix", pre), ("x_hc_out", output)):
             tensors[name][group].copy_(token_shards(value, local))
 
 
@@ -1157,7 +1131,6 @@ def prefill_c1a_full(
     output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     hidden: pl.Tensor[[T_DYN, D], pl.BF16],
     attn_input: pl.Tensor[[T_DYN, D], pl.BF16],
-    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
     output: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     group_base: pl.Scalar[pl.INT32],
@@ -1181,12 +1154,11 @@ def prefill_c1a_full(
         index_cache, index_cache_scale, index_block_table, compressed_rope_cos,
         compressed_rope_sin, compressor_wkv, compressor_norm_weight, compressed_slots,
         index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj,
-        topk_indices, pool_block_ids, pool_block_counts, output_window, output_arrived, attn_out,
+        topk_indices, pool_block_ids, pool_block_counts, output_window, output_arrived, output,
         group_base, tp_rank, num_tokens, attention_epoch,
-        scatter_output=False,
+        scatter_output=False, zero_padding=False,
+        residual=x_hc, post_mix=post_mix, residual_mix=residual_mix,
     )
-    hc_post_deps = pl.array.create(2, pl.TASK_ID)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output, deps=hc_post_deps)
     return output
 
 
@@ -1248,7 +1220,6 @@ def l2_prefill_c1a_full(
     next_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
     attn_input: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    attn_out: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
     output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
     tp_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -1267,7 +1238,7 @@ def l2_prefill_c1a_full(
         compressed_rope_sin, compressor_wkv, compressor_norm_weight, compressed_slots,
         index_wk, index_norm_weight, index_wq_b, index_wq_b_scale, index_weights_proj,
         topk_indices, pool_block_ids, pool_block_counts, output_window, output_arrived,
-        hidden, attn_input, attn_out, output, next_pre_mix, 0, tp_rank, num_tokens, 1,
+        hidden, attn_input, output, next_pre_mix, 0, tp_rank, num_tokens, 1,
     )
     retire_prefill_signals(output, output_arrived, 0, tp_rank)
     return output
@@ -1333,7 +1304,6 @@ def l3_prefill_c1a_full(
     next_pre_mix: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT], pl.FP32]],
     hidden: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, D], pl.BF16]],
     attn_input: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, D], pl.BF16]],
-    attn_out: pl.InOut[pl.Tensor[[TP_SIZE, T_DYN, D], pl.BF16]],
     output: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -1364,7 +1334,7 @@ def l3_prefill_c1a_full(
             compressor_wkv[rank], compressor_norm_weight[rank], compressed_slots[rank],
             index_wk[rank], index_norm_weight[rank], index_wq_b[rank], index_wq_b_scale_r,
             index_weights_proj[rank], topk_indices[rank], pool_block_ids[rank], pool_block_counts[rank], output_window,
-            output_arrived, next_pre_mix[rank], hidden[rank], attn_input[rank], attn_out[rank], output[rank],
+            output_arrived, next_pre_mix[rank], hidden[rank], attn_input[rank], output[rank],
             rank, num_tokens, device=rank,
         )
 
@@ -1408,10 +1378,6 @@ def build_hc_tensor_specs(token_count=32, case_name=CASE_DEFAULT, active_tokens=
         TensorSpec("next_pre_mix", [TP_SIZE, tokens, HC_MULT], torch.float32),
         TensorSpec("hidden", [TP_SIZE, tokens, D], torch.bfloat16),
         TensorSpec("attn_input", [TP_SIZE, tokens, D], torch.bfloat16),
-        TensorSpec(
-            "attn_out", [TP_SIZE, tokens, D], torch.bfloat16,
-            init_value=torch.zeros(TP_SIZE, tokens, D, dtype=torch.bfloat16),
-        ),
         TensorSpec("output", [TP_SIZE, tokens, HC_MULT, D], torch.float32),
         ScalarSpec("num_tokens", torch.int32, active_tokens),
     ]
@@ -1429,11 +1395,12 @@ def golden_prefill_c1a_full_case(tensors):
     active = int(tensors["num_tokens"])
     output = tensors["output"]
     tensors["x"] = attn_input.unsqueeze(0).expand(TP_SIZE, -1, -1)
-    tensors["output"] = tensors["attn_out"]
+    projected = torch.zeros_like(tensors["attn_input"])
+    tensors["output"] = projected
     apply_distributed_golden("full", golden_prefill_attn_c1a_full, tensors, active)
-    tensors["attn_out"][:, active:].zero_()
+    projected[:, active:].zero_()
     tensors["attn_input"][:] = attn_input.unsqueeze(0)
-    hc_output = golden_hc_post(tensors["attn_out"][0], tensors["x_hc"][0], post_mix, residual_mix)
+    hc_output = golden_hc_post(projected[0], tensors["x_hc"][0], post_mix, residual_mix)
     tensors["output"] = output
     tensors["next_pre_mix"][:] = next_pre_mix.unsqueeze(0)
     tensors["hidden"][:] = hidden.unsqueeze(0)
@@ -1501,7 +1468,6 @@ if __name__ == "__main__":
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "hidden": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "attn_input": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "attn_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
             "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
             "window_cache": packed_cache_compare(
                 mapped_pool_ratio_allclose(
