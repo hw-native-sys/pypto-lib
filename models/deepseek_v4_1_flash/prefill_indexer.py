@@ -1540,3 +1540,78 @@ def index_pool_block_capacity(score_width: int) -> int:
     blocks = max(1, (score_width + block_size - 1) // block_size)
     aligned = (blocks + 31) // 32 * 32
     return min(M.candidate_topk_blocks, aligned)
+
+
+def compare_compressed_topk(
+    actual, expected, *, inputs, actual_outputs, expected_outputs, ratio, mode, cutoff_atol, cutoff_rtol, **kwargs,
+):
+    """Check causal membership, ordering, padding and the supplied cutoff budget."""
+    from config import CP_SIZE
+    from utils import prefill_head_tail_rows
+    from qkv_proj_rope import golden_qkv_proj_rope
+
+    if actual.shape != expected.shape or actual.dtype != expected.dtype:
+        return False, "Top-K shape or dtype mismatch"
+    for rank in range(actual.shape[0]):
+        active = int(inputs["q_token_count"][rank, 0]) if CP_SIZE > 1 else int(inputs["kv_token_count"][rank, 0])
+        if not bool((actual[rank, active:] == -1).all()):
+            return False, f"rank {rank}: Top-K padding must be -1"
+        scores = None
+        for row in range(active):
+            ar, er = actual[rank, row], expected[rank, row]
+            if torch.equal(ar, er):
+                continue
+            av, ev = ar[ar >= 0].long(), er[er >= 0].long()
+            if bool((ar < -1).any()) or not bool((ar[av.numel():] == -1).all()):
+                return False, f"rank {rank} row {row}: invalid Top-K padding"
+            if av.numel() != ev.numel() or av.unique().numel() != av.numel():
+                return False, f"rank {rank} row {row}: invalid Top-K count or duplicates"
+            length = int(inputs["q_compressed_lens"][rank, row])
+            request = int(inputs["q_request_ids"][rank, row])
+            logical = torch.arange(length)
+            physical = inputs["index_block_table"][rank, request, logical // 128].long() * 128 + logical % 128
+            inverse = {int(p): int(l) for p, l in zip(physical, logical)}
+            if any(int(p) not in inverse for p in av):
+                return False, f"rank {rank} row {row}: noncausal Top-K member"
+            order = av.tolist() if ratio == 2 and length > M.index_topk else [inverse[int(p)] for p in av]
+            if any(a >= b for a, b in zip(order, order[1:])):
+                return False, f"rank {rank} row {row}: invalid Top-K ordering"
+            if mode == "reindex":
+                count = int(inputs["q_pool_block_counts"][rank, row])
+                pool = set(inputs["q_pool_block_ids"][rank, row, :count].tolist())
+                if any(inverse[int(p)] // 8 not in pool for p in av):
+                    return False, f"rank {rank} row {row}: Top-K outside candidate pool"
+            missing, extra = sorted(set(ev.tolist()) - set(av.tolist())), sorted(set(av.tolist()) - set(ev.tolist()))
+            if not missing:
+                continue
+            if scores is None:
+                base = rank // CP_SIZE * CP_SIZE
+                count = int(inputs["kv_token_count"][base, 0])
+                rows = prefill_head_tail_rows([count], CP_SIZE)[rank % CP_SIZE].long()
+                hidden = actual_outputs["kv_hidden"][rank, rows]
+                cos = inputs["q_rope_cos"][rank, :active] if CP_SIZE > 1 else inputs["kv_rope_cos"][rank, :active]
+                sin = inputs["q_rope_sin"][rank, :active] if CP_SIZE > 1 else inputs["kv_rope_sin"][rank, :active]
+                _, _, latent = golden_qkv_proj_rope(
+                    hidden, inputs["wq_a"][rank], inputs["wq_a_scale"][rank], inputs["wq_norm"][rank],
+                    inputs["wq_b"][rank], inputs["wq_b_scale"][rank], inputs["wkv"][rank], inputs["wkv_scale"][rank],
+                    inputs["wkv_norm"][rank], cos, sin, sequential_query=True,
+                )
+                cache = actual_outputs if mode == "full" else inputs
+                keys = dequantize_mxfp4_cache(cache["index_cache"][rank], cache["index_cache_scale"][rank], 32, "e8m0").bfloat16()
+                pool_args = {}
+                if mode == "reindex":
+                    pool_args = {name: inputs["q_" + name][rank, :active] for name in ("pool_block_ids", "pool_block_counts")}
+                scores, _ = golden_prefill_indexer(
+                    hidden, latent, inputs["q_request_ids"][rank, :active], keys, inputs["index_block_table"][rank],
+                    inputs["q_compressed_lens"][rank, :active], inputs["w_index_q"][rank], inputs["w_index_q_scale"][rank],
+                    inputs["w_index_score"][rank], cos, sin, c2a=ratio == 2, **pool_args,
+                )
+            missed = torch.sort(scores[row, [inverse[p] for p in missing]], descending=True).values
+            added = torch.sort(scores[row, [inverse[p] for p in extra]], descending=True).values
+            finite = scores[row][torch.isfinite(scores[row])]
+            tolerance = cutoff_atol + cutoff_rtol * torch.maximum(missed.abs(), finite.abs().amax())
+            if not bool((missed - added <= tolerance).all()):
+                worst = int(torch.argmax(missed - added - tolerance))
+                detail = f"missing={float(missed[worst]):.8g}, replacement={float(added[worst]):.8g}"
+                return False, f"rank {rank} row {row}: Top-K cutoff {detail}, tolerance={float(tolerance[worst]):.8g}"
+    return True, "causal Top-K with bounded cutoff drift"

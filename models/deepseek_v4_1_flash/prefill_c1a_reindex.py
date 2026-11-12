@@ -19,7 +19,7 @@ from config import (
     INDEX_POOL_BLOCKS_DYN, CP_SIZE, PREFILL_MAX_TOKENS, WINDOW_CACHE_BYTES, CMP_BLOCKS_DYN, COMPRESSED_CACHE_BYTES,
 )
 from prefill_indexer import prefill_indexer
-from sparse_attention import attend_packed
+from sparse_attention import gather_sparse_attention
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj_hc_post, retire_prefill_signals
 from hc import hc_pre, hc_normalize, zero_bf16_padding
@@ -188,9 +188,9 @@ def prefill_c1a_reindex(
                 pool=True, c2a=False,
             )
             attention_ready = pl.system.task_dummy(deps=[stage_tid, kv_ready, index_ready])
-            attend_packed(
+            gather_sparse_attention(
                 q, chunk_window_indices, window_cache, chunk_topk_indices, compressed_cache,
-                attn_sink, attended, active, attention_ready,
+                attn_sink, attended, active, attention_ready, compressed_keys=INDEX_TOPK,
             )
             _chunk_output, projection_done = o_proj_hc_post(
                 attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
@@ -545,9 +545,9 @@ def prefill_c1a_reindex_cp(
                 pool=True, c2a=False,
             )
             attention_ready = pl.system.task_dummy(deps=[stage_tid, kv_ready, index_ready])
-            attend_packed(
+            gather_sparse_attention(
                 q, chunk_window_indices, window_cache, chunk_topk_indices, compressed_cache,
-                attn_sink, attended, active, attention_ready,
+                attn_sink, attended, active, attention_ready, compressed_keys=INDEX_TOPK,
             )
             _chunk_output, projection_done = o_proj_hc_post(
                 attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
@@ -770,72 +770,6 @@ def l3_prefill_c1a_reindex_cp(
             device=rank,
         )
 
-def build_c1a_reindex_specs(args, entry):
-    import torch
-
-    from utils import prefill_batch_layout
-    from golden import ScalarSpec, TensorSpec
-    from prefill_c1a_full import compressed_prefill_shapes, make_compressed_prefill_initializer
-
-    shapes = compressed_prefill_shapes(args, ratio=1)
-    ranks, tokens, local_tokens, pages, compressed_pages, table_pages, pool_capacity = shapes
-    requests = max(map(len, prefill_batch_layout(args)[0]))
-    initialize = make_compressed_prefill_initializer(args, entry, ratio=1, mode="reindex")
-    bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
-    specs = [
-        TensorSpec("hc_input", [ranks, local_tokens, HC_MULT, D], torch.float32),
-        TensorSpec("hc_pre_mix", [ranks, local_tokens, HC_MULT], torch.float32),
-        TensorSpec("hc_attn_fn", [ranks, MIX_HC, HC_DIM], torch.float32),
-        TensorSpec("hc_attn_scale", [ranks, 3], torch.float32),
-        TensorSpec("hc_attn_base", [ranks, MIX_HC], torch.float32),
-        TensorSpec("w_attn_norm", [ranks, D], bf),
-        TensorSpec("wq_a", [ranks, D, Q_LORA], fp),
-        TensorSpec("wq_a_scale", [ranks, D // 32, Q_LORA], mx),
-        TensorSpec("wq_norm", [ranks, Q_LORA], bf),
-        TensorSpec("wq_b", [ranks, Q_LORA, LOCAL_H * HEAD_DIM], fp),
-        TensorSpec("wq_b_scale", [ranks, Q_LORA // 32, LOCAL_H * HEAD_DIM], mx),
-        TensorSpec("wkv", [ranks, D, HEAD_DIM], fp),
-        TensorSpec("wkv_scale", [ranks, D // 32, HEAD_DIM], mx),
-        TensorSpec("wkv_norm", [ranks, HEAD_DIM], bf),
-        TensorSpec("attn_sink", [ranks, LOCAL_H], torch.float32),
-        TensorSpec("wo_a", [ranks, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], fp),
-        TensorSpec("wo_a_scale", [ranks, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], mx),
-        TensorSpec("wo_b", [ranks, LOCAL_O_WIDTH, D], fp),
-        TensorSpec("wo_b_scale", [ranks, LOCAL_O_WIDTH // 32, D], mx),
-        TensorSpec("w_index_q", [ranks, Q_LORA, INDEX_H * INDEX_DIM], fp),
-        TensorSpec("w_index_q_scale", [ranks, Q_LORA // 32, INDEX_H * INDEX_DIM], mx),
-        TensorSpec("w_index_score", [ranks, D, INDEX_H], bf),
-        TensorSpec("q_rope_cos", [ranks, local_tokens, ROPE_DIM // 2], torch.float32),
-        TensorSpec("q_rope_sin", [ranks, local_tokens, ROPE_DIM // 2], torch.float32),
-        TensorSpec("q_window_indices", [ranks, local_tokens, 128], torch.int32),
-        TensorSpec("q_request_ids", [ranks, local_tokens], torch.int32),
-        TensorSpec("q_compressed_lens", [ranks, local_tokens], torch.int32),
-        TensorSpec("q_pool_block_ids", [ranks, local_tokens, pool_capacity], torch.int32),
-        TensorSpec("q_pool_block_counts", [ranks, local_tokens], torch.int32),
-        TensorSpec("q_token_count", [ranks, 1], torch.int32),
-        TensorSpec("kv_rope_cos", [ranks, tokens, ROPE_DIM // 2], torch.float32),
-        TensorSpec("kv_rope_sin", [ranks, tokens, ROPE_DIM // 2], torch.float32),
-        TensorSpec("kv_write_slots", [ranks, tokens], torch.int64),
-        TensorSpec("kv_token_count", [ranks, 1], torch.int32),
-        TensorSpec("window_cache", [ranks, pages, 128, 1, WINDOW_CACHE_BYTES], torch.uint8),
-        TensorSpec("compressed_cache", [ranks, compressed_pages, 128, 1, COMPRESSED_CACHE_BYTES], torch.uint8),
-        TensorSpec("index_cache", [ranks, compressed_pages, 128, 1, INDEX_DIM // 2], torch.uint8),
-        TensorSpec("index_cache_scale", [ranks, compressed_pages, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], mx),
-        TensorSpec("index_block_table", [ranks, requests, table_pages], torch.int32),
-        TensorSpec("kv_restore_indices", [ranks, tokens], torch.int32),
-        TensorSpec("kv_hidden", [ranks, tokens, D], bf),
-        TensorSpec("hc_output", [ranks, local_tokens, HC_MULT, D], torch.float32),
-        TensorSpec("hc_next_pre_mix", [ranks, local_tokens, HC_MULT], torch.float32),
-        TensorSpec("q_topk_indices", [ranks, local_tokens, INDEX_TOPK], torch.int32),
-    ]
-    for spec in specs:
-        spec.resident = "stacked"
-        if spec.name not in ("kv_hidden", "hc_output", "hc_next_pre_mix", "q_topk_indices"):
-            spec.init_value = lambda name=spec.name: initialize(name)
-    specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None))
-    by_name = {spec.name: spec for spec in specs}
-    return [by_name[name] for name in entry.param_names]
-
 
 if __name__ == "__main__":
     import argparse
@@ -844,8 +778,9 @@ if __name__ == "__main__":
 
     from config import SUPPORTED_CP_SIZES
     from golden import mapped_pool_ratio_allclose, ratio_allclose, run
-    from prefill_c1a_full import golden_c1a_prefill, compare_compressed_topk
-    from utils import packed_cache_compare
+    from prefill_c1a_full import golden_c1a_prefill, build_c1a_specs
+    from prefill_indexer import compare_compressed_topk
+    from quant import packed_cache_compare
     from pypto.ir import DistributedConfig
 
     from utils import parse_prefill_groups
@@ -881,7 +816,7 @@ if __name__ == "__main__":
     entry = l3_prefill_c1a_reindex if CP_SIZE == 1 else l3_prefill_c1a_reindex_cp
     result = run(
         fn=entry,
-        specs=build_c1a_reindex_specs(args, entry),
+        specs=build_c1a_specs(args, entry, mode="reindex"),
         golden_fn=functools.partial(golden_c1a_prefill, mode="reindex"),
         compile_only=args.compile_only,
         save_data=args.save_data,

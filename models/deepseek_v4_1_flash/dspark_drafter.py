@@ -16,7 +16,7 @@ import inspect
 import pypto.language as pl
 
 from quant import unpack_quantized_cache
-from utils import packed_cache_compare
+from quant import packed_cache_compare
 
 import pypto.language.distributed as pld
 import torch

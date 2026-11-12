@@ -9,7 +9,7 @@
 # ci: no-sim
 """C1A reindex decode attention with HC."""
 
-from utils import packed_cache_compare
+from quant import packed_cache_compare
 
 import pypto.language as pl
 

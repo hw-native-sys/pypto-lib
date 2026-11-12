@@ -11,12 +11,11 @@
 
 from pathlib import Path
 from pypto.runtime import pto_isa_include_dir
-from utils import packed_cache_compare
+from quant import packed_cache_compare
 
 import pypto.language as pl
 
 from quant import pack_quantized_cache, unpack_quantized_cache
-
 
 from config import (
     DSPARK_QUERY_WIDTH, DSPARK_SWA_INDEX_WIDTH, FLASH, MOE_TOKENS, ORI_BLOCKS_DYN,
@@ -200,13 +199,85 @@ def dspark_attention_test(
     return output, window_cache
 
 
-def make_attention_inputs(seed: int = 43):
-    """Prepare five queries sharing history and all current KV rows."""
+def golden_dspark_attention(tensors):
+    """Compose QKV, shared-history attention, output projection and HC references."""
     import torch
+    from hc import golden_hc_post
+    from o_proj import golden_o_proj
+    from qkv_proj_rope import golden_qkv_proj_rope
+    from quant import quantize_mxfp8_cache
+    from sparse_attention import golden_gather_sparse_attention
+    from quant import _publish_quantized_cache
 
-    from sparse_attention import make_swa_inputs
+    active = int(tensors["num_tokens"])
+    payload, factors = unpack_quantized_cache(tensors["window_cache"], False)
+    inputs = dict(tensors, window_cache=payload, window_cache_scale=factors)
+    for name in ("x", "rope_cos", "rope_sin", "window_slots", "window_indices"):
+        inputs[name] = inputs[name][:active]
+    projection = torch.zeros((MOE_TOKENS, D), dtype=torch.bfloat16)
+    packed_cache = tensors["window_cache"]
+    if active:
+        query, window_kv, _ = golden_qkv_proj_rope(
+            inputs["x"], inputs["wq_a"], inputs["wq_a_scale"], inputs["q_norm_weight"],
+            inputs["wq_b"], inputs["wq_b_scale"], inputs["wkv"], inputs["wkv_scale"], inputs["kv_norm_weight"],
+            inputs["rope_cos"], inputs["rope_sin"], sequential_query=True,
+        )
+        cache, scale = _publish_quantized_cache(
+            inputs["window_cache"], inputs["window_cache_scale"], window_kv, inputs["window_slots"], quantize_mxfp8_cache,
+        )
+        packed_cache = pack_quantized_cache(cache, scale)
+        indices = inputs["window_indices"]
+        attended = golden_gather_sparse_attention(
+            query, indices, packed_cache, indices, packed_cache, inputs["attn_sink"],
+            compressed_keys=0, key_tile=64,
+        )
+        projected = golden_o_proj(
+            attended, inputs["rope_cos"], inputs["rope_sin"], inputs["wo_a"], inputs["wo_b"], inputs["wo_b_scale"],
+            wo_a_scale=inputs["wo_a_scale"], sequential_projection=True,
+        )
+        projection[:active].copy_(projected)
+    tensors["output"].copy_(golden_hc_post(projection, tensors["residual"], tensors["post_mix"], tensors["residual_mix"]))
+    tensors["window_cache"].copy_(packed_cache)
 
-    values = make_swa_inputs(batch=DSPARK_QUERY_WIDTH, seed=seed)
+
+def build_attention_specs(seed: int = 43):
+    """Build five shared-history queries, HC inputs and runtime specifications."""
+    import torch
+    from golden import ScalarSpec, TensorSpec
+    from o_proj import build_o_proj_hc_post_specs
+    import math
+    from quant import pack_fp8_nz, pack_mx_b_scale
+    from quant import quantize_mxfp8_upward_reference, quantize_grouped_mxfp8_weight
+    from quant import quantize_mxfp8_cache
+
+    gen = torch.Generator().manual_seed(seed)
+
+    def rand(*shape):
+        return torch.randn(*shape, generator=gen)
+
+    def weight(k, n):
+        payload, scales = quantize_mxfp8_upward_reference(rand(n, k) / math.sqrt(k))
+        return (payload.T.contiguous(), pack_mx_b_scale(scales.T.contiguous()).view(torch.float8_e8m0fnu))
+
+    qa, qas = weight(D, Q_LORA)
+    qb, qbs = weight(Q_LORA, LOCAL_H * HEAD_DIM)
+    kv, kvs = weight(D, HEAD_DIM)
+    ob, obs = weight(LOCAL_O_WIDTH, D)
+    qa = pack_fp8_nz(qa)
+    qb = pack_fp8_nz(qb)
+    kv = pack_fp8_nz(kv)
+    ob = pack_fp8_nz(ob)
+    cache, cache_scale = quantize_mxfp8_cache(rand(DSPARK_QUERY_WIDTH + 1, 128, 1, HEAD_DIM).to(torch.bfloat16))
+    values = dict(
+        x=rand(DSPARK_QUERY_WIDTH, D).to(torch.bfloat16),
+        wq_a=qa, wq_a_scale=qas, q_norm_weight=(rand(Q_LORA) * 0.1 + 1).to(torch.bfloat16),
+        wq_b=qb, wq_b_scale=qbs,
+        wkv=kv, wkv_scale=kvs, kv_norm_weight=(rand(HEAD_DIM) * 0.1 + 1).to(torch.bfloat16),
+        attn_sink=rand(LOCAL_H) * 2,
+    )
+    wo_a = (rand(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN) / math.sqrt(O_GROUP_IN)).to(torch.bfloat16)
+    values["wo_a"], values["wo_a_scale"] = quantize_grouped_mxfp8_weight(wo_a)
+    values.update(wo_b=ob, wo_b_scale=obs)
     positions = torch.arange(2, 2 + DSPARK_QUERY_WIDTH)
     angles = positions.float()[:, None] * (
         10000.0 ** (-torch.arange(0, ROPE_DIM, 2).float() / ROPE_DIM)
@@ -225,7 +296,12 @@ def make_attention_inputs(seed: int = 43):
         padded = torch.full((MOE_TOKENS, *current.shape[1:]), fill, dtype=current.dtype)
         padded[:DSPARK_QUERY_WIDTH] = current
         values[name] = padded
-    return values
+    values["window_cache"] = pack_quantized_cache(cache, cache_scale)
+    specs = [TensorSpec(name, list(value.shape), value.dtype, init_value=value) for name, value in values.items()]
+    hc_specs = build_o_proj_hc_post_specs(MOE_TOKENS, pad_to_tile=False)
+    specs += [spec for spec in hc_specs if spec.name in ("residual", "post_mix", "residual_mix", "output")]
+    specs.append(ScalarSpec("num_tokens", torch.int32, DSPARK_QUERY_WIDTH, compile_runtime=True))
+    return specs
 
 
 if __name__ == "__main__":
@@ -240,45 +316,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.execution_mode:
         parser.error("DSpark native attention requires A5 device execution; simulator support is unavailable")
-    import torch
+    from golden import ratio_allclose, run
+    from o_proj import compare_o_proj_hc_post
 
-    from golden import ScalarSpec, TensorSpec, ratio_allclose, run
-    from sparse_attention import SWA_INPUT_NAMES, swa_official_reference
-    from o_proj import build_o_proj_hc_post_specs, compare_o_proj_hc_post
-    from hc import golden_hc_post
-
-    values = make_attention_inputs()
-
-    def golden(tensors):
-        payload, factors = unpack_quantized_cache(tensors["window_cache"], False)
-        fields = dict(tensors, window_cache=payload, window_cache_scale=factors)
-        row_inputs = ("x", "rope_cos", "rope_sin", "window_slots", "window_indices")
-        reference_inputs = {
-            name: fields[name][:DSPARK_QUERY_WIDTH] if name in row_inputs else fields[name]
-            for name in SWA_INPUT_NAMES
-        }
-        output, cache, cache_scale = swa_official_reference(reference_inputs, key_tile=64)
-        projection = torch.zeros((MOE_TOKENS, D), dtype=torch.bfloat16)
-        projection[:DSPARK_QUERY_WIDTH].copy_(output)
-        tensors["output"].copy_(golden_hc_post(projection, tensors["residual"], tensors["post_mix"], tensors["residual_mix"]))
-        tensors["window_cache"].copy_(pack_quantized_cache(cache, cache_scale))
-
-    def compare_payload(actual, expected, **_kwargs):
-        return bool(torch.allclose(actual.float(), expected.float(), rtol=0.05, atol=0.05)), "FP8 payload"
-
-    values["window_cache"] = pack_quantized_cache(values["window_cache"], values.pop("window_cache_scale"))
-    specs = [TensorSpec(name, list(values[name].shape), values[name].dtype, init_value=values[name])
-             for name in SWA_INPUT_NAMES if name != "window_cache_scale"]
-    hc_specs = build_o_proj_hc_post_specs(MOE_TOKENS, pad_to_tile=False)
-    specs += [spec for spec in hc_specs if spec.name in ("residual", "post_mix", "residual_mix", "output")]
-    specs.append(ScalarSpec("num_tokens", torch.int32, DSPARK_QUERY_WIDTH, compile_runtime=True))
     result = run(
         fn=dspark_attention_test,
-        specs=specs,
-        golden_fn=golden,
+        specs=build_attention_specs(),
+        golden_fn=golden_dspark_attention,
         compare_fn={
             "window_cache": packed_cache_compare(
-                compare_payload,
+                ratio_allclose(rtol=0.05, atol=0.05, max_error_ratio=0.0),
                 ratio_allclose(max_error_ratio=0.0),
                 fp4=False,
             ),

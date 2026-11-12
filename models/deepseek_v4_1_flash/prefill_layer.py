@@ -39,7 +39,7 @@ from config import (
 from prefill_c1a_reuse import (
     l2_prefill_c1a_reuse, l2_prefill_c1a_reuse_cp, l3_prefill_c1a_reuse, l3_prefill_c1a_reuse_cp,
 )
-from prefill_c2a_reuse import build_c2a_reuse_specs
+from prefill_c2a_full import build_c2a_specs
 from prefill_c2a_full import golden_c2a_prefill
 from prefill_moe import (
     AUX_WIDTH, ROUTE_WIDTH, SIGNAL_PAD, RECV_MAX, N_LOCAL_EXPERTS,
@@ -410,7 +410,7 @@ def l3_prefill_layer_cp(
 def build_layer_specs(args, entry):
     """Compose attention fixtures with the shared MoE weight fixture."""
     attention = l3_prefill_c1a_reuse if CP_SIZE == 1 else l3_prefill_c1a_reuse_cp
-    specs = build_c2a_reuse_specs(args, attention)
+    specs = build_c2a_specs(args, attention, mode="reuse")
     for spec in build_moe_specs(MOE_TOKENS):
         if spec.name in ("x_hc", "pre_mix", "num_tokens", "moe_epoch"):
             continue
@@ -480,7 +480,7 @@ class LayerMoeReference:
 
 if __name__ == "__main__":
     from golden import mapped_pool_ratio_allclose, ratio_allclose, ratio_reldiff, run
-    from utils import packed_cache_compare
+    from quant import packed_cache_compare
     from pypto.ir import DistributedConfig
 
     from utils import parse_prefill_groups

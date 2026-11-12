@@ -10,7 +10,7 @@
 """C1A full decode attention with HC."""
 
 
-from utils import packed_cache_compare
+from quant import packed_cache_compare
 
 import pypto.language as pl
 
@@ -359,11 +359,9 @@ def golden_c1a(tensors, mode="full"):
         golden_index_key, golden_select_candidate_block_pool, golden_c1a_index_scores,
         golden_pool_index_scores, golden_c1a_index_topk,
     )
-    from sparse_attention import golden_selected_attention
-    from quant import (
-        quantize_mxfp4_cache, quantize_mxfp8_cache, dequantize_mxfp4_cache, dequantize_mxfp8_cache,
-    )
-    from utils import _publish_quantized_cache
+    from sparse_attention import golden_gather_sparse_attention
+    from quant import quantize_mxfp4_cache, quantize_mxfp8_cache
+    from quant import _publish_quantized_cache
 
     from hc import golden_hc_mixes, golden_hc_collapse, golden_hc_norm, golden_hc_post
 
@@ -418,9 +416,12 @@ def golden_c1a(tensors, mode="full"):
         topk = golden_c1a_index_topk(scores, physical, lengths, pool_block_counts)
         if mode == "full":
             pool_block_ids, pool_block_counts = golden_select_candidate_block_pool(scores, lengths)
-    window_value = dequantize_mxfp8_cache(window, window_scale).to(x.dtype)
-    compressed_value = dequantize_mxfp4_cache(compressed, compressed_scale, 16, "bf16").to(x.dtype)
-    attended = golden_selected_attention(q, window_value, a["window_indices"], compressed_value, topk, a["attn_sink"])
+    packed_window = pack_quantized_cache(window, window_scale)
+    packed_compressed = pack_quantized_cache(compressed, compressed_scale)
+    attended = golden_gather_sparse_attention(
+        q, a["window_indices"], packed_window, topk, packed_compressed, a["attn_sink"],
+        compressed_keys=INDEX_TOPK,
+    )
     output = golden_o_proj(
         attended, a["rope_cos"], a["rope_sin"], a["wo_a"], a["wo_b"], a["wo_b_scale"],
         wo_a_scale=a["wo_a_scale"], sequential_projection=True,
@@ -428,8 +429,8 @@ def golden_c1a(tensors, mode="full"):
     hidden = golden_hc_post(output.to(torch.bfloat16), x_hc, post_mix, residual_mix)
     tensors["next_pre_mix"].copy_(next_pre_mix)
     for name, value in (
-        ("window_cache", pack_quantized_cache(window, window_scale)),
-        ("compressed_cache", pack_quantized_cache(compressed, compressed_scale)),
+        ("window_cache", packed_window),
+        ("compressed_cache", packed_compressed),
         ("index_cache", index), ("index_cache_scale", index_scale),
         ("state_cache", None), ("topk_indices", topk), ("candidate_mask", None),
         ("pool_block_ids", pool_block_ids), ("pool_block_counts", pool_block_counts),
