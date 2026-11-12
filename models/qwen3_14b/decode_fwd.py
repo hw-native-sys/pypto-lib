@@ -227,6 +227,9 @@ def _out_direct_split_points():
 
 
 OUT_DIRECT_SPLIT_POINTS = _out_direct_split_points()
+# _decode_layer expands the direct region as exactly three pl.spmd dispatches;
+# a different N_OUT_DIRECT_BLOCKS needs a matching dispatch count there.
+assert len(OUT_DIRECT_SPLIT_POINTS) == 4, "out_proj direct region must split into exactly 3 segments"
 
 # One named constant per segment: pl.unroll() only accepts compile-time integer
 # literals or resolvable constant names, not subscript expressions.
@@ -654,9 +657,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         out_tids = pl.array.create(N_SPLITS_OUT * K_SPLITS_OUT, pl.TASK_ID)
 
         # 14e2635 critical-wave split: defer the first 26 tiles through an
-        # unflagged dummy.  The deferred region is split at residual-cast slice
-        # boundaries (OUT_DIRECT_SEGMENTS, derived at module level), so each
-        # cast slice starts as soon as its own out_proj tiles finish instead of
+        # unflagged dummy, while the final 24 tiles are gated directly by FAI.
+        # The direct region is split at residual-cast slice boundaries
+        # (OUT_DIRECT_SPLIT_POINTS, derived at module level), so each cast
+        # slice starts as soon as its own out_proj tiles finish instead of
         # waiting for the whole 24-tile region.  The direct dispatches
         # intentionally have no allow_early_resolve flag.
         out_proj_dummy = pl.system.task_dummy(deps=[attn_done_tid])
