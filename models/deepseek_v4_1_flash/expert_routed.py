@@ -95,9 +95,9 @@ SWIGLU_COUNT_LANES = SWIGLU_LANES
 SWIGLU_SCALE_SCRATCH_TILE = SWIGLU_ROW_TILE * (MOE_INTER // SWIGLU_LANES) * 8
 
 # Full activation-scale row tiles divide each expert's padded stride.
-W13_M_TILE = gcd(RECV_MAX, 80)
+W13_M_TILE = gcd(RECV_MAX, 160)
 W13_N_TILE = MX_MM_INTER_TILE
-W13_K_TILE = MX_K_TILE // 2
+W13_K_TILE = MX_K_TILE
 W13_SCALE_K = W13_K_TILE // MX_GROUP
 W13_PACKED_EXPERT_ROWS = MX_W1_PACKED_ROWS
 W13_K_STAGE = 2
@@ -338,50 +338,6 @@ def _routed_w13(
 
 
 @pl.jit.inline(auto_scope=False)
-def _w13_projection(
-    x: pl.Tensor,
-    x_scale: pl.Tensor,
-    weight: pl.Tensor,
-    weight_scale: pl.Tensor,
-    fp4_lut: pl.Tensor,
-    x_row: pl.Scalar[pl.INDEX],
-    expert: pl.Scalar[pl.INDEX],
-    col: pl.Scalar[pl.INDEX],
-    experts: pl.constexpr,
-    stride: pl.constexpr,
-):
-    """Accumulate one gate or up tile with byte-indexed FP4 decoding."""
-    x_scale_zz = pl.tensor.view(x_scale, [experts * stride, K_SCALE], layout=pl.MX_A_ZZ)
-    weight_flat = pl.tensor.view(
-        weight, [experts * W13_PACKED_EXPERT_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND,
-    )
-    panel_row = expert * W13_PACKED_EXPERT_ROWS + col // W13_N_TILE * D
-    scale_row = expert * K_SCALE
-    a0 = pl.load(x, [x_row, 0], [W13_M_TILE, W13_K_TILE])
-    a_scale0 = pl.load(x_scale_zz, [x_row, 0], [W13_M_TILE, W13_SCALE_K])
-    # Decode two FP4 values per byte into adjacent FP8 lanes.
-    lut = pl.load(fp4_lut, [0, 0], [1, FP4_LUT_SIZE])
-    packed0 = pl.load(weight_flat, [panel_row, 0], [W13_K_TILE, MX_PACKED_LANE_COLS])
-    index0 = pl.cast(pl.cast(packed0, pl.FP16), pl.INT16)
-    scratch0 = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
-    codes0 = pl.tile.gather(lut, index0, scratch0)
-    b0 = pl.reinterpret_view(pl.reinterpret_view(codes0, pl.INT8), pl.FP8E4M3FN)
-    b_scale0 = pl.load(weight_scale, [scale_row, col], [W13_SCALE_K, W13_N_TILE])
-    acc = pl.matmul_mx(a0, a_scale0, b0, b_scale0)
-    for k0 in pl.pipeline(W13_K_TILE, D, W13_K_TILE, stage=W13_K_STAGE):
-        a = pl.load(x, [x_row, k0], [W13_M_TILE, W13_K_TILE])
-        a_scale = pl.load(x_scale_zz, [x_row, k0 // MX_GROUP], [W13_M_TILE, W13_SCALE_K])
-        packed = pl.load(weight_flat, [panel_row + k0, 0], [W13_K_TILE, MX_PACKED_LANE_COLS])
-        index = pl.cast(pl.cast(packed, pl.FP16), pl.INT16)
-        scratch = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
-        codes = pl.tile.gather(lut, index, scratch)
-        b = pl.reinterpret_view(pl.reinterpret_view(codes, pl.INT8), pl.FP8E4M3FN)
-        b_scale = pl.load(weight_scale, [scale_row + k0 // MX_GROUP, col], [W13_SCALE_K, W13_N_TILE])
-        acc = pl.matmul_mx_acc(acc, a, a_scale, b, b_scale)
-    return acc
-
-
-@pl.jit.inline(auto_scope=False)
 def routed_w13_pypto(
     x: pl.Tensor,
     x_scale: pl.Tensor,
@@ -398,56 +354,102 @@ def routed_w13_pypto(
     experts: pl.constexpr,
     stride: pl.constexpr,
 ):
-    """Compute compact BF16 gate/up rows and copy their route weights.
+    """Compute compact BF16 gate/up projections with two weight-decoding lanes.
 
-    The existing model keeps the extern until native latency reaches parity.
+    Model callers retain the extern until native latency reaches parity.
     """
+    w1_flat = pl.tensor.view(w1, [experts * W13_PACKED_EXPERT_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
+    w3_flat = pl.tensor.view(w3, [experts * W13_PACKED_EXPERT_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
+    x_scale_zz = pl.tensor.view(x_scale, [experts * stride, K_SCALE], layout=pl.MX_A_ZZ)
     route_flat = pl.tensor.view(route_weights, [1, experts * stride], layout=pl.ND)
     compact_flat = pl.tensor.view(compact_weights, [1, W13_ROWS], layout=pl.ND)
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_pypto", deps=[input_ready]) as ready:
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w13_dual", deps=[input_ready]) as ready:
         core = pl.tile.get_block_idx()
+        lut = pl.load(fp4_lut, [0, 0], [1, FP4_LUT_SIZE])
         work_base = 0
-        activation_base = 0
+        active_base = 0
         for expert in pl.range(experts):
             count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
             row_tiles = (count + W13_M_TILE - 1) // W13_M_TILE
             for row_tile in pl.range(row_tiles):
-                # Keep MX_A_ZZ scale loads full and narrow only output stores.
                 row = row_tile * W13_M_TILE
-                valid = pl.min(W13_M_TILE, count - row)
                 x_row = expert * stride + row
-                out_row = activation_base + row
+                out_row = active_base + row
+                valid = pl.min(W13_M_TILE, count - row)
                 for projection in pl.range(2):
-                    for block in pl.range((MOE_INTER // W13_N_TILE)):
+                    for block in pl.range(MOE_INTER // W13_N_TILE):
                         work = (row_tile * 2 + projection) * (MOE_INTER // W13_N_TILE) + block
                         if (work_base + work) % ROUTED_CUBE_WORKER_TILE == core:
                             col = block * W13_N_TILE
                             if projection == 0:
-                                gate = _w13_projection(
-                                    x, x_scale, w1, w1_scale, fp4_lut, x_row, expert, col, experts, stride,
-                                )
-                                pair = pl.store(
-                                    pl.set_validshape(gate, valid, W13_N_TILE), [out_row, col], pair,
-                                )
+                                gate_panel = expert * W13_PACKED_EXPERT_ROWS + block * D
+                                gate_scale_row = expert * K_SCALE
+                                gate_a0 = pl.load(x, [x_row, 0], [W13_M_TILE, W13_K_TILE])
+                                gate_as0 = pl.load(x_scale_zz, [x_row, 0], [W13_M_TILE, W13_SCALE_K])
+                                for gate_lane0 in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                                    gate_packed_row0 = gate_panel + gate_lane0 * (W13_K_TILE // 2)
+                                    gate_packed0 = pl.load(w1_flat, [gate_packed_row0, 0], [W13_K_TILE // 2, MX_PACKED_LANE_COLS])
+                                    gate_index0 = pl.cast(pl.cast(gate_packed0, pl.FP16), pl.INT16)
+                                    gate_tmp0 = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
+                                    gate_codes0 = pl.tile.gather(lut, gate_index0, gate_tmp0)
+                                    gate_fp80 = pl.reinterpret_view(pl.reinterpret_view(gate_codes0, pl.INT8), pl.FP8E4M3FN)
+                                    gate_b0 = pl.aic_gather(gate_fp80)
+                                gate_bs0 = pl.load(w1_scale, [gate_scale_row, col], [W13_SCALE_K, W13_N_TILE])
+                                gate_acc = pl.matmul_mx(gate_a0, gate_as0, gate_b0, gate_bs0)
+                                for gate_k in pl.pipeline(W13_K_TILE, D, W13_K_TILE, stage=W13_K_STAGE):
+                                    gate_a = pl.load(x, [x_row, gate_k], [W13_M_TILE, W13_K_TILE])
+                                    gate_as = pl.load(x_scale_zz, [x_row, gate_k // MX_GROUP], [W13_M_TILE, W13_SCALE_K])
+                                    for gate_lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                                        gate_packed_row = gate_panel + gate_k + gate_lane * (W13_K_TILE // 2)
+                                        gate_packed = pl.load(w1_flat, [gate_packed_row, 0], [W13_K_TILE // 2, MX_PACKED_LANE_COLS])
+                                        gate_index = pl.cast(pl.cast(gate_packed, pl.FP16), pl.INT16)
+                                        gate_tmp = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
+                                        gate_codes = pl.tile.gather(lut, gate_index, gate_tmp)
+                                        gate_fp8 = pl.reinterpret_view(pl.reinterpret_view(gate_codes, pl.INT8), pl.FP8E4M3FN)
+                                        gate_b = pl.aic_gather(gate_fp8)
+                                    gate_bs = pl.load(w1_scale, [gate_scale_row + gate_k // MX_GROUP, col], [W13_SCALE_K, W13_N_TILE])
+                                    gate_acc = pl.matmul_mx_acc(gate_acc, gate_a, gate_as, gate_b, gate_bs)
+                                # Narrow an Acc view while retaining the full matmul tile.
+                                gate_valid = pl.tile.slice(gate_acc, [W13_M_TILE, W13_N_TILE], [0, 0], valid_shape=[valid, W13_N_TILE])
+                                pair = pl.store(gate_valid, [out_row, col], pair)
                             else:
-                                up = _w13_projection(
-                                    x, x_scale, w3, w3_scale, fp4_lut, x_row, expert, col, experts, stride,
-                                )
-                                pair = pl.store(
-                                    pl.set_validshape(up, valid, W13_N_TILE), [out_row, MOE_INTER + col], pair,
-                                )
-                            # The first gate column copies the compact route-weight row.
-                            if projection == 0 and block == 0 and pl.tile.get_subblock_idx() == 0:
-                                weight_row = pl.load(
-                                    route_flat, [0, expert * stride + row], [1, W13_M_TILE],
-                                    valid_shape=[1, valid],
-                                )
-                                compact_flat = pl.store(
-                                    pl.set_validshape(weight_row, 1, valid),
-                                    [0, activation_base + row], compact_flat,
-                                )
-            work_base = work_base + row_tiles * (2 * (MOE_INTER // W13_N_TILE))
-            activation_base = activation_base + count
+                                up_panel = expert * W13_PACKED_EXPERT_ROWS + block * D
+                                up_scale_row = expert * K_SCALE
+                                up_a0 = pl.load(x, [x_row, 0], [W13_M_TILE, W13_K_TILE])
+                                up_as0 = pl.load(x_scale_zz, [x_row, 0], [W13_M_TILE, W13_SCALE_K])
+                                for up_lane0 in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                                    up_packed_row0 = up_panel + up_lane0 * (W13_K_TILE // 2)
+                                    up_packed0 = pl.load(w3_flat, [up_packed_row0, 0], [W13_K_TILE // 2, MX_PACKED_LANE_COLS])
+                                    up_index0 = pl.cast(pl.cast(up_packed0, pl.FP16), pl.INT16)
+                                    up_tmp0 = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
+                                    up_codes0 = pl.tile.gather(lut, up_index0, up_tmp0)
+                                    up_fp80 = pl.reinterpret_view(pl.reinterpret_view(up_codes0, pl.INT8), pl.FP8E4M3FN)
+                                    up_b0 = pl.aic_gather(up_fp80)
+                                up_bs0 = pl.load(w3_scale, [up_scale_row, col], [W13_SCALE_K, W13_N_TILE])
+                                up_acc = pl.matmul_mx(up_a0, up_as0, up_b0, up_bs0)
+                                for up_k in pl.pipeline(W13_K_TILE, D, W13_K_TILE, stage=W13_K_STAGE):
+                                    up_a = pl.load(x, [x_row, up_k], [W13_M_TILE, W13_K_TILE])
+                                    up_as = pl.load(x_scale_zz, [x_row, up_k // MX_GROUP], [W13_M_TILE, W13_SCALE_K])
+                                    for up_lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                                        up_packed_row = up_panel + up_k + up_lane * (W13_K_TILE // 2)
+                                        up_packed = pl.load(w3_flat, [up_packed_row, 0], [W13_K_TILE // 2, MX_PACKED_LANE_COLS])
+                                        up_index = pl.cast(pl.cast(up_packed, pl.FP16), pl.INT16)
+                                        up_tmp = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
+                                        up_codes = pl.tile.gather(lut, up_index, up_tmp)
+                                        up_fp8 = pl.reinterpret_view(pl.reinterpret_view(up_codes, pl.INT8), pl.FP8E4M3FN)
+                                        up_b = pl.aic_gather(up_fp8)
+                                    up_bs = pl.load(w3_scale, [up_scale_row + up_k // MX_GROUP, col], [W13_SCALE_K, W13_N_TILE])
+                                    up_acc = pl.matmul_mx_acc(up_acc, up_a, up_as, up_b, up_bs)
+                                # Narrow an Acc view while retaining the full matmul tile.
+                                up_valid = pl.tile.slice(up_acc, [W13_M_TILE, W13_N_TILE], [0, 0], valid_shape=[valid, W13_N_TILE])
+                                pair = pl.store(up_valid, [out_row, MOE_INTER + col], pair)
+                            for route_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                                if projection == 0 and block == 0 and route_lane == 0:
+                                    route_row = expert * stride + row
+                                    route = pl.load(route_flat, [0, route_row], [1, W13_M_TILE], valid_shape=[1, valid])
+                                    compact_flat = pl.store(route, [0, out_row], compact_flat)
+            work_base = work_base + row_tiles * 2 * (MOE_INTER // W13_N_TILE)
+            active_base = active_base + count
     return pair, compact_flat, ready
 
 
