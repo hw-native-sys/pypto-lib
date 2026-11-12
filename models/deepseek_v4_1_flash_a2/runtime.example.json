@@ -1,0 +1,7 @@
+{
+  "physical_device": 0,
+  "vllm_python": "<vllm-ascend Python executable>",
+  "vllm_pythonpath": ["<vllm source root>", "<vllm-ascend source root>"],
+  "hc_vendor": "<installed HC custom OPP vendor directory>",
+  "hc_manifest": "<HC library SHA256 manifest JSON>"
+}

@@ -1,0 +1,72 @@
+{
+  "repository": "https://github.com/Adelaide999/pypto-lib",
+  "base": "eed3280972f6743fc46d68219bcb108596e64578",
+  "target": "addb655f7b4f4a4ce56af875724a04d79d3fe325",
+  "decode_session": "deepseek-v4.1-flash-a3-decode",
+  "current_head_before_decode_fixes": "7cd0bd3d48a2aaac1189c76b6931227318803c03",
+  "cherry_pick_x": {
+    "required": true,
+    "execution_evidence": "verified_in_temporary_clean_clone",
+    "proof_worktree": "/tmp/pypto-decode-cherry-pick-proof-20261104-2/repo",
+    "generated_commits": [
+      "b76f321946c620cd4507e965ed54a9c0d93ec4d4",
+      "286300578cecd2b1589407e273bb6e9a515defe1",
+      "2f8671af7bc9d1c3d5a3468f5c2f22b073726c21",
+      "56ef874b66126e3710758a7f9f717305a6e278cd"
+    ],
+    "generated_metadata": [
+      {"commit": "b76f321946c620cd4507e965ed54a9c0d93ec4d4", "author": "Adelaide999", "email": "73272686+Adelaide999@users.noreply.github.com", "author_time": "2026-10-31T10:13:30+08:00", "source": "500858a9abd6ce1d3796a5e26a4bb597cdf622e4"},
+      {"commit": "286300578cecd2b1589407e273bb6e9a515defe1", "author": "sunhaolun", "email": "sunhaolun3@huawei.com", "author_time": "2026-10-31T17:51:06+08:00", "source": "d401f4e82e6348aee1566118c0c768b66e70504d"},
+      {"commit": "2f8671af7bc9d1c3d5a3468f5c2f22b073726c21", "author": "Lun7777", "email": "1055318345@qq.com", "author_time": "2026-11-02T10:00:49+08:00", "source": "c0f23d56800fbd34d4b3442d5df9565be387a955"},
+      {"commit": "56ef874b66126e3710758a7f9f717305a6e278cd", "author": "Lun7777", "email": "1055318345@qq.com", "author_time": "2026-11-02T14:36:58+08:00", "source": "addb655f7b4f4a4ce56af875724a04d79d3fe325"}
+    ],
+    "result_tree": "116493ca2094d9237868be8abfabf9d8c51e1227",
+    "source_checkout": "unavailable_in_current_workspace",
+    "provided_receipt": "unavailable_in_current_workspace",
+    "recovery": "Recreate a clean worktree from the base and run git cherry-pick -x in the listed order before formal promotion."
+  },
+  "verification": {
+    "history_is_linear": true,
+    "source_checkout": "unavailable_in_current_workspace",
+    "provided_receipt": "unavailable_in_current_workspace",
+    "note": "The exact requested commits and parent ancestry are present; no cherry-pick commit was rewritten."
+  },
+  "commits": [
+    {
+      "order": 1,
+      "commit": "500858a9abd6ce1d3796a5e26a4bb597cdf622e4",
+      "parent": "eed3280972f6743fc46d68219bcb108596e64578",
+      "tree": "1099e0a8adab9bcdc054ed8448b0278894c04429",
+      "author": "Adelaide999",
+      "email": "73272686+Adelaide999@users.noreply.github.com",
+      "author_time": "2026-10-31T10:13:30+08:00"
+    },
+    {
+      "order": 2,
+      "commit": "d401f4e82e6348aee1566118c0c768b66e70504d",
+      "parent": "500858a9abd6ce1d3796a5e26a4bb597cdf622e4",
+      "tree": "73dce1d21fe0bc25011e0a47df299021749e01e7",
+      "author": "sunhaolun",
+      "email": "sunhaolun3@huawei.com",
+      "author_time": "2026-10-31T17:51:06+08:00"
+    },
+    {
+      "order": 3,
+      "commit": "c0f23d56800fbd34d4b3442d5df9565be387a955",
+      "parent": "d401f4e82e6348aee1566118c0c768b66e70504d",
+      "tree": "4fb472bb680be6ef0fa89115112fd9000b75d874",
+      "author": "Lun7777",
+      "email": "1055318345@qq.com",
+      "author_time": "2026-11-02T10:00:49+08:00"
+    },
+    {
+      "order": 4,
+      "commit": "addb655f7b4f4a4ce56af875724a04d79d3fe325",
+      "parent": "c0f23d56800fbd34d4b3442d5df9565be387a955",
+      "tree": "116493ca2094d9237868be8abfabf9d8c51e1227",
+      "author": "Lun7777",
+      "email": "1055318345@qq.com",
+      "author_time": "2026-11-02T14:36:58+08:00"
+    }
+  ]
+}
