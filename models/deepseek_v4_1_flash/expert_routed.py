@@ -389,7 +389,7 @@ def routed_w13_pypto(
                                 for gate_lane0 in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
                                     gate_packed_row0 = gate_panel + gate_lane0 * (W13_K_TILE // 2)
                                     gate_packed0 = pl.load(w1_flat, [gate_packed_row0, 0], [W13_K_TILE // 2, MX_PACKED_LANE_COLS])
-                                    gate_index0 = pl.cast(pl.cast(gate_packed0, pl.FP16), pl.INT16)
+                                    gate_index0 = pl.reinterpret_view(pl.cast(gate_packed0, pl.UINT16), pl.INT16)
                                     gate_tmp0 = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
                                     gate_codes0 = pl.tile.gather(lut, gate_index0, gate_tmp0)
                                     gate_fp80 = pl.reinterpret_view(pl.reinterpret_view(gate_codes0, pl.INT8), pl.FP8E4M3FN)
@@ -402,7 +402,7 @@ def routed_w13_pypto(
                                     for gate_lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
                                         gate_packed_row = gate_panel + gate_k + gate_lane * (W13_K_TILE // 2)
                                         gate_packed = pl.load(w1_flat, [gate_packed_row, 0], [W13_K_TILE // 2, MX_PACKED_LANE_COLS])
-                                        gate_index = pl.cast(pl.cast(gate_packed, pl.FP16), pl.INT16)
+                                        gate_index = pl.reinterpret_view(pl.cast(gate_packed, pl.UINT16), pl.INT16)
                                         gate_tmp = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
                                         gate_codes = pl.tile.gather(lut, gate_index, gate_tmp)
                                         gate_fp8 = pl.reinterpret_view(pl.reinterpret_view(gate_codes, pl.INT8), pl.FP8E4M3FN)
@@ -420,7 +420,7 @@ def routed_w13_pypto(
                                 for up_lane0 in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
                                     up_packed_row0 = up_panel + up_lane0 * (W13_K_TILE // 2)
                                     up_packed0 = pl.load(w3_flat, [up_packed_row0, 0], [W13_K_TILE // 2, MX_PACKED_LANE_COLS])
-                                    up_index0 = pl.cast(pl.cast(up_packed0, pl.FP16), pl.INT16)
+                                    up_index0 = pl.reinterpret_view(pl.cast(up_packed0, pl.UINT16), pl.INT16)
                                     up_tmp0 = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
                                     up_codes0 = pl.tile.gather(lut, up_index0, up_tmp0)
                                     up_fp80 = pl.reinterpret_view(pl.reinterpret_view(up_codes0, pl.INT8), pl.FP8E4M3FN)
@@ -433,7 +433,7 @@ def routed_w13_pypto(
                                     for up_lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
                                         up_packed_row = up_panel + up_k + up_lane * (W13_K_TILE // 2)
                                         up_packed = pl.load(w3_flat, [up_packed_row, 0], [W13_K_TILE // 2, MX_PACKED_LANE_COLS])
-                                        up_index = pl.cast(pl.cast(up_packed, pl.FP16), pl.INT16)
+                                        up_index = pl.reinterpret_view(pl.cast(up_packed, pl.UINT16), pl.INT16)
                                         up_tmp = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
                                         up_codes = pl.tile.gather(lut, up_index, up_tmp)
                                         up_fp8 = pl.reinterpret_view(pl.reinterpret_view(up_codes, pl.INT8), pl.FP8E4M3FN)
