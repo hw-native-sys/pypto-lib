@@ -61,6 +61,7 @@ SP_PUBLISH_ROW_TILE = 16
 # kernel_entry selects run_native<80> for groups >= 8, the only shape this model
 # builds (LOCAL_O_GROUPS == 8), so the row tile is a compile-time constant here.
 O_QUANT_ROW_TILE = 80
+O_QUANT_WORKERS = 40
 O_QUANT_HEADS_PER_GROUP = 8
 O_QUANT_LANES = 64                      # FP32 lanes in one 256-byte vector register
 O_QUANT_GROUP = 32                      # MX quantization group
@@ -123,7 +124,7 @@ def quant_o_vf_pypto(
     scale_view = pl.tensor.view(
         scales, [LOCAL_O_GROUPS * scale_block_rows, O_QUANT_HEADS_PER_GROUP * O_QUANT_SCALE_COLS]
     )
-    workers = pl.max(1, pl.min(O_VECTOR_WORKERS, 2 * pl.system.available_cluster_count()))
+    workers = pl.max(1, pl.min(O_QUANT_WORKERS, 2 * pl.system.available_cluster_count()))
     with pl.spmd(workers, name_hint="quant_o_vf_pypto") as published:
         worker = pl.tile.get_block_idx()
         worker_count = pl.tile.get_block_num()
@@ -169,10 +170,8 @@ def quant_o_vf_pypto(
                 pl.tile.set_validshape(sin_tile, O_QUANT_ROW_TILE, O_QUANT_ROPE_PAIRS),
                 [O_QUANT_TRIG_TILE],
             )
-            # The kernel's trailing `for row in [active_rows, Rows)` loop writes
-            # zeros into both outputs; a zero-filled scratch tile is that store.
-            quantized = pl.tile.full([O_QUANT_VALUE_TILE], pl.INT8, 0)
-            codes = pl.tile.full([O_QUANT_CODE_TILE], pl.UINT16, 0)
+            quantized = pl.tile.create([O_QUANT_VALUE_TILE], pl.INT8, target_memory=pl.MemorySpace.Vec)
+            codes = pl.tile.create([O_QUANT_CODE_TILE], pl.UINT16, target_memory=pl.MemorySpace.Vec)
 
             # --- rotate_tail: inverse RoPE over the trailing 64 BF16 columns ---
             with pl.reg_scope():
@@ -190,14 +189,10 @@ def quant_o_vf_pypto(
                 pair_index = pl.reg.shift_rights(lane, 1, full)
                 even = pl.reg.compare(ix1, lane, full, predicate="gt")
                 for row in pl.hardware_loop(rows):
-                    # vgather2 offsets its base pointer; reg.gather takes one
-                    # index vector, so the row origin is broadcast and added.
-                    trig_base = pl.reg.broadcast(
-                        pl.cast(row * O_QUANT_ROPE_PAIRS, pl.UINT32), lanes=O_QUANT_LANES, dtype=pl.UINT32
-                    )
-                    trig_index = pl.reg.add(pair_index, trig_base)
-                    cosine_v = pl.reg.gather(cos_flat, trig_index, full)
-                    sine_v = pl.reg.gather(sin_flat, trig_index, full)
+                    # Match vgather2(cos/sin + row * 32, pair_index, all).
+                    trig_base = row * O_QUANT_ROPE_PAIRS
+                    cosine_v = pl.reg.gather(cos_flat, pair_index, full, base_offset=trig_base)
+                    sine_v = pl.reg.gather(sin_flat, pair_index, full, base_offset=trig_base)
                     sine_v = pl.reg.muls(sine_v, -1.0, full)
                     raw = pl.reg.load(value, offset=row * HEAD_DIM + O_QUANT_ROPE_START, lanes=O_QUANT_LANES)
                     rotated = pl.reg.convert(raw, dtype=pl.FP32)
@@ -210,72 +205,101 @@ def quant_o_vf_pypto(
                     raw = pl.reg.convert(rotated, dtype=pl.BF16, rounding="R", saturate=False)
                     rotated_back = pl.reg.store(value, offset=row * HEAD_DIM + O_QUANT_ROPE_START, value=raw)
 
-            # --- quant_vf: per-32-element MXFP8 quantization of all 512 columns ---
+            # --- quant_vf: two 256-element chunks, matching the C++ work item ---
             with pl.reg_scope():
-                full = pl.reg.full_mask(lanes=O_QUANT_LANES)
-                one_lane = pl.reg.active_mask(1, lanes=2 * O_QUANT_LANES)
-                izero = pl.reg.broadcast(0, lanes=O_QUANT_LANES, dtype=pl.INT32)
-                ione = pl.reg.broadcast(1, lanes=O_QUANT_LANES, dtype=pl.INT32)
-                zero = pl.reg.broadcast(0.0, lanes=O_QUANT_LANES, dtype=pl.FP32)
-                onef = pl.reg.broadcast(1.0, lanes=O_QUANT_LANES, dtype=pl.FP32)
-                low = pl.reg.broadcast(-448.0, lanes=O_QUANT_LANES, dtype=pl.FP32)
-                high = pl.reg.broadcast(448.0, lanes=O_QUANT_LANES, dtype=pl.FP32)
-                upper = pl.reg.broadcast(O_QUANT_GROUP, lanes=O_QUANT_LANES, dtype=pl.UINT32)
-                # The kernel decodes 256 elements at a time: a DINTLV_B16 load
-                # plus the PART_EVEN / PART_ODD halves of four vcvts spread them
-                # over four FP32 registers, so that one MX group of 32 lands on
-                # the eight lanes vcgmax reduces over. pl.reg.reduce_max takes
-                # the group width as a parameter, so that permutation buys
-                # nothing here: one register holds 64 contiguous elements,
-                # group_size=32 reduces its two MX groups directly, and both the
-                # FP8 store and the scale pack stay contiguous.
+                full = pl.reg.full_mask(lanes=64)
+                compact_mask = pl.reg.full_mask(lanes=8)
+                four = pl.reg.active_mask(4, lanes=16)
+                scale_mask = pl.reg.full_mask(lanes=16)
+                scale_lane = pl.reg.index_gen(0, lanes=16, dtype=pl.UINT16)
+                scatter_offset = pl.reg.shift_lefts(scale_lane, 4, scale_mask)
+                izero = pl.reg.broadcast(0, lanes=8, dtype=pl.INT32)
+                reciprocal_bias = pl.reg.broadcast(254, lanes=64, dtype=pl.INT32)
+                ione = pl.reg.broadcast(1, lanes=64, dtype=pl.INT32)
+                zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+                onef = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
+                low = pl.reg.broadcast(-448.0, lanes=64, dtype=pl.FP32)
+                high = pl.reg.broadcast(448.0, lanes=64, dtype=pl.FP32)
+                zero_payload = pl.reg.broadcast(0, lanes=256, dtype=pl.INT8)
+                zero_scales = pl.reg.broadcast(0, lanes=16, dtype=pl.UINT16)
                 for row in pl.hardware_loop(rows):
-                    for quarter in pl.hardware_loop(HEAD_DIM // O_QUANT_LANES):
-                        offset = row * HEAD_DIM + quarter * O_QUANT_LANES
-                        quarter_bits = pl.reg.load(value, offset=offset, lanes=O_QUANT_LANES)
-                        magnitudes = pl.reg.convert(quarter_bits, dtype=pl.FP32)
-                        amax = pl.reg.reduce_max(
-                            pl.reg.abs(magnitudes, full), full, group_size=O_QUANT_GROUP
-                        )
-                        spread = pl.reg.group_broadcast(amax, lanes=O_QUANT_LANES)
-                        exponent = pl.reg.interpret_cast(spread, dtype=pl.INT32)
-                        exponent = pl.reg.shift_rights(exponent, 23, full)
-                        exponent = pl.reg.adds(exponent, -8, full)
-                        exponent = pl.reg.maximum(exponent, izero)
-                        nonzero = pl.reg.maximum(exponent, ione)
-                        divisor = pl.reg.shift_lefts(nonzero, 23, full)
-                        divisor = pl.reg.interpret_cast(divisor, dtype=pl.FP32)
+                    # Fixed chunks expose their addresses to automatic dependency analysis.
+                    for chunk in pl.unroll(2):
+                        offset_u32 = pl.cast(row, pl.UINT32) * HEAD_DIM + pl.cast(chunk, pl.UINT32) * 256
+                        offset = pl.cast(offset_u32, pl.INDEX)
+                        first = pl.reg.load(value, offset=offset, lanes=128)
+                        second = pl.reg.load(value, offset=offset + 128, lanes=128)
+                        even_bits, odd_bits = pl.reg.dintlv(first, second)
+                        even_x128 = pl.reg.convert(even_bits, dtype=pl.FP32)
+                        odd_x128 = pl.reg.convert(odd_bits, dtype=pl.FP32)
+                        x0, x2 = pl.reg.channel_split(even_x128)
+                        x1, x3 = pl.reg.channel_split(odd_x128)
+                        m0 = pl.reg.abs(x0, full)
+                        m1 = pl.reg.abs(x1, full)
+                        m2 = pl.reg.abs(x2, full)
+                        m3 = pl.reg.abs(x3, full)
+                        m0 = pl.reg.maximum(m0, m1, full)
+                        m2 = pl.reg.maximum(m2, m3, full)
+                        m0 = pl.reg.maximum(m0, m2, full)
+                        maximum = pl.reg.reduce_max(m0, full, group_size=8)
+                        compact_exp = pl.reg.interpret_cast(maximum, dtype=pl.INT32)
+                        compact_exp = pl.reg.shift_rights(compact_exp, 23, compact_mask)
+                        compact_exp = pl.reg.adds(compact_exp, -8, compact_mask)
+                        compact_exp = pl.reg.maximum(compact_exp, izero, compact_mask)
+                        exponent = pl.reg.group_broadcast(compact_exp, lanes=64)
+                        nonzero = pl.reg.maximum(exponent, ione, full)
+                        # The divisor is 2**(nonzero - 127); its exact reciprocal
+                        # has exponent 254 - nonzero and replaces division with mul.
+                        reciprocal_exp = pl.reg.sub(reciprocal_bias, nonzero, full)
+                        reciprocal_bits = pl.reg.shift_lefts(reciprocal_exp, 23, full)
+                        reciprocal = pl.reg.interpret_cast(reciprocal_bits, dtype=pl.FP32)
                         nonzero_mask = pl.reg.compares(exponent, 0, full, predicate="gt")
                         floor_mask = pl.reg.select(nonzero_mask, onef, zero)
-                        scaled = pl.reg.div(magnitudes, divisor)
-                        scaled = pl.reg.mul(scaled, floor_mask)
-                        scaled = pl.reg.maximum(scaled, low)
-                        scaled = pl.reg.minimum(scaled, high)
-                        quant = pl.reg.convert(
-                            scaled, dtype=pl.FP8E4M3FN, rounding="R", saturate=False
+                        x0 = pl.reg.mul(x0, reciprocal, full)
+                        x0 = pl.reg.mul(x0, floor_mask, full)
+                        x0 = pl.reg.maximum(x0, low, full)
+                        x0 = pl.reg.minimum(x0, high, full)
+                        x1 = pl.reg.mul(x1, reciprocal, full)
+                        x1 = pl.reg.mul(x1, floor_mask, full)
+                        x1 = pl.reg.maximum(x1, low, full)
+                        x1 = pl.reg.minimum(x1, high, full)
+                        x2 = pl.reg.mul(x2, reciprocal, full)
+                        x2 = pl.reg.mul(x2, floor_mask, full)
+                        x2 = pl.reg.maximum(x2, low, full)
+                        x2 = pl.reg.minimum(x2, high, full)
+                        x3 = pl.reg.mul(x3, reciprocal, full)
+                        x3 = pl.reg.mul(x3, floor_mask, full)
+                        x3 = pl.reg.maximum(x3, low, full)
+                        x3 = pl.reg.minimum(x3, high, full)
+                        merged = pl.reg.channel_merge(x0, x1, x2, x3)
+                        quant = pl.reg.convert(merged, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
+                        quant_bytes = pl.reg.interpret_cast(quant, dtype=pl.INT8)
+                        stored = pl.reg.store(quantized, offset=offset, value=quant_bytes)
+                        even_exp, odd_exp = pl.reg.dintlv(compact_exp, compact_exp)
+                        odd_exp = pl.reg.shift_lefts(odd_exp, 8, compact_mask)
+                        pair_bits = pl.reg.bitwise_or(even_exp, odd_exp, compact_mask)
+                        pair_halves = pl.reg.interpret_cast(pair_bits, dtype=pl.UINT16)
+                        pairs, unused_high = pl.reg.dintlv(pair_halves, pair_halves)
+                        # The native VF uses a nonnegative uint16 row counter.
+                        row_u32 = pl.cast(row, pl.UINT32)
+                        chunk_u32 = pl.cast(chunk, pl.UINT32)
+                        scale_base_u32 = row_u32 // 16 * 128 + row_u32 % 16 + chunk_u32 * 64
+                        scale_base = pl.cast(scale_base_u32, pl.INDEX)
+                        scattered = pl.reg.scatter(codes, scatter_offset, pairs, four, base_offset=scale_base)
+                for tail in pl.hardware_loop(O_QUANT_ROW_TILE - rows):
+                    row = rows + tail
+                    for chunk in pl.unroll(2):
+                        offset_u32 = pl.cast(row, pl.UINT32) * HEAD_DIM + pl.cast(chunk, pl.UINT32) * 256
+                        offset = pl.cast(offset_u32, pl.INDEX)
+                        stored_zero = pl.reg.store(quantized, offset=offset, value=zero_payload)
+                        # The native VF uses a nonnegative uint16 row counter.
+                        row_u32 = pl.cast(row, pl.UINT32)
+                        chunk_u32 = pl.cast(chunk, pl.UINT32)
+                        scale_base_u32 = row_u32 // 16 * 128 + row_u32 % 16 + chunk_u32 * 64
+                        scale_base = pl.cast(scale_base_u32, pl.INDEX)
+                        zeroed_scale = pl.reg.scatter(
+                            codes, scatter_offset, zero_scales, four, base_offset=scale_base,
                         )
-                        stored = pl.reg.store(
-                            quantized, offset=offset, value=pl.reg.interpret_cast(quant, dtype=pl.INT8)
-                        )
-                        # Both exponents of this register pack into the single
-                        # UINT16 the A-scale layout keeps at (block, head, g/2, r):
-                        # the even group is its low byte and the odd group its high
-                        # byte, which is exactly the kernel's e0 | e1 << 8.
-                        odd_exponent = pl.reg.gather_lanes(exponent, upper)
-                        packed = pl.reg.shift_lefts(odd_exponent, 8, full)
-                        packed = pl.reg.bitwise_or(exponent, packed)
-                        pairs = pl.reg.interpret_cast(packed, dtype=pl.UINT16)
-                        code_index = pl.reg.broadcast(
-                            pl.cast(
-                                (row // O_QUANT_SCALE_BLOCK) * (O_QUANT_SCALE_COLS // 2)
-                                + row % O_QUANT_SCALE_BLOCK
-                                + quarter * O_QUANT_SCALE_BLOCK,
-                                pl.UINT16,
-                            ),
-                            lanes=2 * O_QUANT_LANES,
-                            dtype=pl.UINT16,
-                        )
-                        scattered = pl.reg.scatter(codes, code_index, pairs, one_lane)
 
             payload_tile = pl.tile.reinterpret_view(
                 pl.tile.reshape(quantized, [O_QUANT_ROW_TILE, HEAD_DIM]), pl.FP8E4M3FN
