@@ -128,6 +128,8 @@ SPARSE_VF_WINDOW_SHIFT = 5
 SPARSE_VF_COMPRESSED_SHIFT = 4
 SPARSE_VF_WINDOW_STEP = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUP
 SPARSE_VF_COMPRESSED_STEP = SPARSE_VF_REG_TILE // SPARSE_VF_COMPRESSED_GROUP
+SPARSE_VF_WINDOW_SCALE_ROW_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_GROUPS
+SPARSE_VF_COMPRESSED_SCALE_ROW_TILE = SPARSE_VF_REG_TILE // SPARSE_VF_COMPRESSED_GROUPS
 
 
 
@@ -1187,27 +1189,32 @@ def sparse_vf_decode_pypto(
                     raw, pl.INT16, shape=[SPARSE_VF_GATHER_TILE, SPARSE_VF_WINDOW_HALFWORDS],
                 )
                 scale_all = pl.reinterpret_view(factor_bits, pl.BF16)
-                # Read group scales directly from their packed row pitch.
+                scale_view = scale_all[:, SPARSE_VF_WINDOW_SCALE_OFFSET:SPARSE_VF_WINDOW_SCALE_END]
+                factors = pl.tile.move(scale_view, pl.MemorySpace.Vec)
                 pl.tile.store(ids, [token, column], selected_ids)
                 value_flat = pl.reshape(values, [SPARSE_VF_GATHER_TILE * HEAD_DIM])
                 factor_flat = pl.reshape(
-                    scale_all, [SPARSE_VF_GATHER_TILE * SPARSE_VF_WINDOW_HALFWORDS],
+                    factors, [SPARSE_VF_GATHER_TILE * SPARSE_VF_WINDOW_GROUPS],
                 )
-                # Apply each group scale to its register lanes.
+                # Expand each scale table in registers before the BF16 multiply.
                 with pl.reg_scope():
                     w_full = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
                     w_group = pl.reg.index_gen(0, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
                     w_group = pl.reg.shift_rights(w_group, SPARSE_VF_WINDOW_SHIFT, w_full)
-                    for w_chunk in pl.hardware_loop(SPARSE_VF_GATHER_TILE * HEAD_DIM // SPARSE_VF_REG_TILE):
-                        w_row = w_chunk // (HEAD_DIM // SPARSE_VF_REG_TILE)
-                        w_part = w_chunk % (HEAD_DIM // SPARSE_VF_REG_TILE)
-                        w_row_base = w_row * SPARSE_VF_WINDOW_HALFWORDS + SPARSE_VF_WINDOW_SCALE_OFFSET
-                        w_base = pl.cast(w_row_base + w_part * SPARSE_VF_WINDOW_STEP, pl.UINT16)
-                        w_offset = pl.reg.adds(w_group, w_base, w_full)
-                        w_value = pl.reg.load(value_flat, w_chunk * SPARSE_VF_REG_TILE, lanes=SPARSE_VF_REG_TILE)
-                        w_factor = pl.reg.gather(factor_flat, w_offset, w_full)
-                        w_scaled = pl.reg.mul(w_value, w_factor, w_full)
-                        w_write = pl.reg.store(value_flat, w_chunk * SPARSE_VF_REG_TILE, w_scaled, w_full)
+                    for w_table in pl.hardware_loop(SPARSE_VF_GATHER_TILE // SPARSE_VF_WINDOW_SCALE_ROW_TILE):
+                        w_table_offset = w_table * SPARSE_VF_REG_TILE
+                        w_table_values = pl.reg.load(factor_flat, w_table_offset, lanes=SPARSE_VF_REG_TILE)
+                        w_table_bits = pl.reg.interpret_cast(w_table_values, dtype=pl.UINT16)
+                        for w_chunk in pl.hardware_loop(SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_STEP):
+                            w_base = pl.cast(w_chunk * SPARSE_VF_WINDOW_STEP, pl.UINT16)
+                            w_indices = pl.reg.adds(w_group, w_base, w_full)
+                            w_lane_bits = pl.reg.gather_lanes(w_table_bits, w_indices)
+                            w_factor = pl.reg.interpret_cast(w_lane_bits, dtype=pl.BF16)
+                            w_table_base = w_table * (SPARSE_VF_REG_TILE // SPARSE_VF_WINDOW_STEP)
+                            w_offset = (w_table_base + w_chunk) * SPARSE_VF_REG_TILE
+                            w_value = pl.reg.load(value_flat, w_offset, lanes=SPARSE_VF_REG_TILE)
+                            w_scaled = pl.reg.mul(w_value, w_factor, w_full)
+                            w_write = pl.reg.store(value_flat, w_offset, w_scaled)
                 scaled_values = pl.reshape(value_flat, [SPARSE_VF_GATHER_TILE, HEAD_DIM])
                 pl.tile.store(scaled_values, [destination, 0], decoded)
             if compressed_keys > 0:
@@ -1247,27 +1254,31 @@ def sparse_vf_decode_pypto(
                         shape=[SPARSE_VF_GATHER_TILE, SPARSE_VF_COMPRESSED_HALFWORDS],
                     )
                     c_scale_all = pl.reinterpret_view(c_factor_bits, pl.BF16)
-                    # Read FP4 group scales directly from the packed cache row.
+                    c_scale_view = c_scale_all[:, SPARSE_VF_COMPRESSED_SCALE_OFFSET:SPARSE_VF_COMPRESSED_SCALE_END]
+                    c_factors = pl.tile.move(c_scale_view, pl.MemorySpace.Vec)
                     pl.tile.store(c_ids, [token, column], selected_ids)
                     c_value_flat = pl.reshape(values, [SPARSE_VF_GATHER_TILE * HEAD_DIM])
                     c_factor_flat = pl.reshape(
-                        c_scale_all, [SPARSE_VF_GATHER_TILE * SPARSE_VF_COMPRESSED_HALFWORDS],
+                        c_factors, [SPARSE_VF_GATHER_TILE * SPARSE_VF_COMPRESSED_GROUPS],
                     )
                     with pl.reg_scope():
                         c_full = pl.reg.full_mask(lanes=SPARSE_VF_REG_TILE)
                         c_group = pl.reg.index_gen(0, lanes=SPARSE_VF_REG_TILE, dtype=pl.UINT16)
                         c_group = pl.reg.shift_rights(c_group, SPARSE_VF_COMPRESSED_SHIFT, c_full)
-                        for c_chunk in pl.hardware_loop(SPARSE_VF_GATHER_TILE * HEAD_DIM // SPARSE_VF_REG_TILE):
-                            c_scale_row = c_chunk // (HEAD_DIM // SPARSE_VF_REG_TILE)
-                            c_part = c_chunk % (HEAD_DIM // SPARSE_VF_REG_TILE)
-                            c_row_base = c_scale_row * SPARSE_VF_COMPRESSED_HALFWORDS
-                            c_row_base = c_row_base + SPARSE_VF_COMPRESSED_SCALE_OFFSET
-                            c_base = pl.cast(c_row_base + c_part * SPARSE_VF_COMPRESSED_STEP, pl.UINT16)
-                            c_offset = pl.reg.adds(c_group, c_base, c_full)
-                            c_value = pl.reg.load(c_value_flat, c_chunk * SPARSE_VF_REG_TILE, lanes=SPARSE_VF_REG_TILE)
-                            c_factor = pl.reg.gather(c_factor_flat, c_offset, c_full)
-                            c_scaled = pl.reg.mul(c_value, c_factor, c_full)
-                            c_write = pl.reg.store(c_value_flat, c_chunk * SPARSE_VF_REG_TILE, c_scaled, c_full)
+                        for c_table in pl.hardware_loop(SPARSE_VF_GATHER_TILE // SPARSE_VF_COMPRESSED_SCALE_ROW_TILE):
+                            c_table_offset = c_table * SPARSE_VF_REG_TILE
+                            c_table_values = pl.reg.load(c_factor_flat, c_table_offset, lanes=SPARSE_VF_REG_TILE)
+                            c_table_bits = pl.reg.interpret_cast(c_table_values, dtype=pl.UINT16)
+                            for c_chunk in pl.hardware_loop(SPARSE_VF_REG_TILE // SPARSE_VF_COMPRESSED_STEP):
+                                c_base = pl.cast(c_chunk * SPARSE_VF_COMPRESSED_STEP, pl.UINT16)
+                                c_indices = pl.reg.adds(c_group, c_base, c_full)
+                                c_lane_bits = pl.reg.gather_lanes(c_table_bits, c_indices)
+                                c_factor = pl.reg.interpret_cast(c_lane_bits, dtype=pl.BF16)
+                                c_table_base = c_table * (SPARSE_VF_REG_TILE // SPARSE_VF_COMPRESSED_STEP)
+                                c_offset = (c_table_base + c_chunk) * SPARSE_VF_REG_TILE
+                                c_value = pl.reg.load(c_value_flat, c_offset, lanes=SPARSE_VF_REG_TILE)
+                                c_scaled = pl.reg.mul(c_value, c_factor, c_full)
+                                c_write = pl.reg.store(c_value_flat, c_offset, c_scaled)
                     c_scaled_values = pl.reshape(c_value_flat, [SPARSE_VF_GATHER_TILE, HEAD_DIM])
                     pl.tile.store(c_scaled_values, [destination, 0], decoded)
     return gathered
