@@ -320,260 +320,23 @@ def proj_q_b_pypto(
         for worker in pl.spmd(pl.min(worker_limit, width // 256)):
             row = mt * 80
             full_a = pl.load(payload, [row, 0], [80, 1280], target_memory=pl.Mem.Mat)
-            sa_cache_0 = pl.load(sa, [0, 0], [80, 4], target_memory=pl.Mem.Mat)
-            sa_cache_1 = pl.load(sa, [0, 4], [80, 4], target_memory=pl.Mem.Mat)
-            sa_cache_2 = pl.load(sa, [0, 8], [80, 4], target_memory=pl.Mem.Mat)
-            sa_cache_3 = pl.load(sa, [0, 12], [80, 4], target_memory=pl.Mem.Mat)
-            sa_cache_4 = pl.load(sa, [0, 16], [80, 4], target_memory=pl.Mem.Mat)
-            sa_cache_5 = pl.load(sa, [0, 20], [80, 4], target_memory=pl.Mem.Mat)
-            sa_cache_6 = pl.load(sa, [0, 24], [80, 4], target_memory=pl.Mem.Mat)
-            sa_cache_7 = pl.load(sa, [0, 28], [80, 4], target_memory=pl.Mem.Mat)
-            sa_cache_8 = pl.load(sa, [0, 32], [80, 4], target_memory=pl.Mem.Mat)
-            sa_cache_9 = pl.load(sa, [0, 36], [80, 4], target_memory=pl.Mem.Mat)
-            pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 7)
-            pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 7)
-            sb_cache_0 = pl.load(weight_scale, [0, worker * 256], [4, 256], target_memory=pl.Mem.Mat)
-            sb_cache_1 = pl.load(weight_scale, [4, worker * 256], [4, 256], target_memory=pl.Mem.Mat)
-            sb_cache_2 = pl.load(weight_scale, [8, worker * 256], [4, 256], target_memory=pl.Mem.Mat)
-            sb_cache_3 = pl.load(weight_scale, [12, worker * 256], [4, 256], target_memory=pl.Mem.Mat)
-            sb_cache_4 = pl.load(weight_scale, [16, worker * 256], [4, 256], target_memory=pl.Mem.Mat)
-            sb_cache_5 = pl.load(weight_scale, [20, worker * 256], [4, 256], target_memory=pl.Mem.Mat)
-            sb_cache_6 = pl.load(weight_scale, [24, worker * 256], [4, 256], target_memory=pl.Mem.Mat)
-            sb_cache_7 = pl.load(weight_scale, [28, worker * 256], [4, 256], target_memory=pl.Mem.Mat)
-            sb_cache_8 = pl.load(weight_scale, [32, worker * 256], [4, 256], target_memory=pl.Mem.Mat)
-            sb_cache_9 = pl.load(weight_scale, [36, worker * 256], [4, 256], target_memory=pl.Mem.Mat)
-            pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 6)
-            for preload in pl.range(4):
-                if preload * 256 < 1280:
-                    b_pre: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[preload], pl.Mem.Mat] = pl.load(weight, [preload * 256, worker * 256], [256, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, preload)
-            pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-            pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-            pl.system.set_flag(pl.PipeType.FIX, pl.PipeType.M, 4)
             for base in pl.range(0, width // 256, worker_limit):
                 if base + worker < width // 256:
                     col = (base + worker) * 256
-                    wave = base // worker_limit
-                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 6)
-                    acc = pl.tile.create([80, 256], pl.FP32, target_memory=pl.Mem.Acc)
-                    slot = (wave + 0) % 4
-                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
-                    bv: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[slot], pl.Mem.Mat] = pl.tile.create([256, 256], pl.FP8E4M3FN, target_memory=pl.Mem.Mat)
-                    k = 0 * 256 + 0 * 128
-                    sa_part = sa_cache_0
-                    sb_part = sb_cache_0
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-                    a_l0: pl.Tile[[80, 128], pl.FP8E4M3FN, pl.MemRef('a_l0', slots=2)[0], pl.Mem.Left] = pl.tile.extract(full_a, 0, k, [80, 128], target_memory=pl.Mem.Left)
-                    b_l0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('b_l0', slots=2)[0], pl.Mem.Right] = pl.tile.extract(bv, 0 * 128, 0, [128, 256], target_memory=pl.Mem.Right)
-                    sa_l0: pl.Tile[[80, 4], pl.FP8E8M0, pl.MemRef('sa_l0', slots=4)[0 * 2], pl.Mem.LeftScale] = pl.tile.move(sa_part, target_memory=pl.Mem.LeftScale)
-                    sb_l0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef('sb_l0', slots=4)[0 * 2], pl.Mem.RightScale] = pl.tile.move(sb_part, target_memory=pl.Mem.RightScale)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        sb_cache_0 = pl.load(weight_scale, [0, col + worker_limit * 256], [4, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
-                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
-                    pl.system.wait_flag(pl.PipeType.FIX, pl.PipeType.M, 4)
-                    acc = pl.matmul_mx(a_l0, sa_l0, b_l0, sb_l0)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-                    k = 0 * 256 + 1 * 128
-                    sa_part = sa_cache_1
-                    sb_part = sb_cache_1
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-                    a_l0: pl.Tile[[80, 128], pl.FP8E4M3FN, pl.MemRef('a_l0', slots=2)[1], pl.Mem.Left] = pl.tile.extract(full_a, 0, k, [80, 128], target_memory=pl.Mem.Left)
-                    b_l0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('b_l0', slots=2)[1], pl.Mem.Right] = pl.tile.extract(bv, 1 * 128, 0, [128, 256], target_memory=pl.Mem.Right)
-                    sa_l0: pl.Tile[[80, 4], pl.FP8E8M0, pl.MemRef('sa_l0', slots=4)[1 * 2], pl.Mem.LeftScale] = pl.tile.move(sa_part, target_memory=pl.Mem.LeftScale)
-                    sb_l0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef('sb_l0', slots=4)[1 * 2], pl.Mem.RightScale] = pl.tile.move(sb_part, target_memory=pl.Mem.RightScale)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        sb_cache_1 = pl.load(weight_scale, [4, col + worker_limit * 256], [4, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
-                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
-                    acc = pl.matmul_mx_acc(acc, a_l0, sa_l0, b_l0, sb_l0)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-                    next_col = col
-                    if next_col < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
-                        b_next: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[slot], pl.Mem.Mat] = pl.load(weight, [1024, next_col], [256, 256], target_memory=pl.Mem.Mat)
-                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
-                    slot = (wave + 1) % 4
-                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
-                    bv: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[slot], pl.Mem.Mat] = pl.tile.create([256, 256], pl.FP8E4M3FN, target_memory=pl.Mem.Mat)
-                    k = 1 * 256 + 0 * 128
-                    sa_part = sa_cache_2
-                    sb_part = sb_cache_2
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-                    a_l0: pl.Tile[[80, 128], pl.FP8E4M3FN, pl.MemRef('a_l0', slots=2)[0], pl.Mem.Left] = pl.tile.extract(full_a, 0, k, [80, 128], target_memory=pl.Mem.Left)
-                    b_l0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('b_l0', slots=2)[0], pl.Mem.Right] = pl.tile.extract(bv, 0 * 128, 0, [128, 256], target_memory=pl.Mem.Right)
-                    sa_l0: pl.Tile[[80, 4], pl.FP8E8M0, pl.MemRef('sa_l0', slots=4)[0 * 2], pl.Mem.LeftScale] = pl.tile.move(sa_part, target_memory=pl.Mem.LeftScale)
-                    sb_l0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef('sb_l0', slots=4)[0 * 2], pl.Mem.RightScale] = pl.tile.move(sb_part, target_memory=pl.Mem.RightScale)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        sb_cache_2 = pl.load(weight_scale, [8, col + worker_limit * 256], [4, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
-                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
-                    acc = pl.matmul_mx_acc(acc, a_l0, sa_l0, b_l0, sb_l0)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-                    k = 1 * 256 + 1 * 128
-                    sa_part = sa_cache_3
-                    sb_part = sb_cache_3
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-                    a_l0: pl.Tile[[80, 128], pl.FP8E4M3FN, pl.MemRef('a_l0', slots=2)[1], pl.Mem.Left] = pl.tile.extract(full_a, 0, k, [80, 128], target_memory=pl.Mem.Left)
-                    b_l0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('b_l0', slots=2)[1], pl.Mem.Right] = pl.tile.extract(bv, 1 * 128, 0, [128, 256], target_memory=pl.Mem.Right)
-                    sa_l0: pl.Tile[[80, 4], pl.FP8E8M0, pl.MemRef('sa_l0', slots=4)[1 * 2], pl.Mem.LeftScale] = pl.tile.move(sa_part, target_memory=pl.Mem.LeftScale)
-                    sb_l0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef('sb_l0', slots=4)[1 * 2], pl.Mem.RightScale] = pl.tile.move(sb_part, target_memory=pl.Mem.RightScale)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        sb_cache_3 = pl.load(weight_scale, [12, col + worker_limit * 256], [4, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
-                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
-                    acc = pl.matmul_mx_acc(acc, a_l0, sa_l0, b_l0, sb_l0)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-                    next_col = col + worker_limit * 256
-                    if next_col < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
-                        b_next: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[slot], pl.Mem.Mat] = pl.load(weight, [0, next_col], [256, 256], target_memory=pl.Mem.Mat)
-                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
-                    slot = (wave + 2) % 4
-                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
-                    bv: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[slot], pl.Mem.Mat] = pl.tile.create([256, 256], pl.FP8E4M3FN, target_memory=pl.Mem.Mat)
-                    k = 2 * 256 + 0 * 128
-                    sa_part = sa_cache_4
-                    sb_part = sb_cache_4
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-                    a_l0: pl.Tile[[80, 128], pl.FP8E4M3FN, pl.MemRef('a_l0', slots=2)[0], pl.Mem.Left] = pl.tile.extract(full_a, 0, k, [80, 128], target_memory=pl.Mem.Left)
-                    b_l0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('b_l0', slots=2)[0], pl.Mem.Right] = pl.tile.extract(bv, 0 * 128, 0, [128, 256], target_memory=pl.Mem.Right)
-                    sa_l0: pl.Tile[[80, 4], pl.FP8E8M0, pl.MemRef('sa_l0', slots=4)[0 * 2], pl.Mem.LeftScale] = pl.tile.move(sa_part, target_memory=pl.Mem.LeftScale)
-                    sb_l0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef('sb_l0', slots=4)[0 * 2], pl.Mem.RightScale] = pl.tile.move(sb_part, target_memory=pl.Mem.RightScale)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        sb_cache_4 = pl.load(weight_scale, [16, col + worker_limit * 256], [4, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
-                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
-                    acc = pl.matmul_mx_acc(acc, a_l0, sa_l0, b_l0, sb_l0)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-                    k = 2 * 256 + 1 * 128
-                    sa_part = sa_cache_5
-                    sb_part = sb_cache_5
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-                    a_l0: pl.Tile[[80, 128], pl.FP8E4M3FN, pl.MemRef('a_l0', slots=2)[1], pl.Mem.Left] = pl.tile.extract(full_a, 0, k, [80, 128], target_memory=pl.Mem.Left)
-                    b_l0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('b_l0', slots=2)[1], pl.Mem.Right] = pl.tile.extract(bv, 1 * 128, 0, [128, 256], target_memory=pl.Mem.Right)
-                    sa_l0: pl.Tile[[80, 4], pl.FP8E8M0, pl.MemRef('sa_l0', slots=4)[1 * 2], pl.Mem.LeftScale] = pl.tile.move(sa_part, target_memory=pl.Mem.LeftScale)
-                    sb_l0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef('sb_l0', slots=4)[1 * 2], pl.Mem.RightScale] = pl.tile.move(sb_part, target_memory=pl.Mem.RightScale)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        sb_cache_5 = pl.load(weight_scale, [20, col + worker_limit * 256], [4, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
-                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
-                    acc = pl.matmul_mx_acc(acc, a_l0, sa_l0, b_l0, sb_l0)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-                    next_col = col + worker_limit * 256
-                    if next_col < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
-                        b_next: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[slot], pl.Mem.Mat] = pl.load(weight, [256, next_col], [256, 256], target_memory=pl.Mem.Mat)
-                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
-                    slot = (wave + 3) % 4
-                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
-                    bv: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[slot], pl.Mem.Mat] = pl.tile.create([256, 256], pl.FP8E4M3FN, target_memory=pl.Mem.Mat)
-                    k = 3 * 256 + 0 * 128
-                    sa_part = sa_cache_6
-                    sb_part = sb_cache_6
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-                    a_l0: pl.Tile[[80, 128], pl.FP8E4M3FN, pl.MemRef('a_l0', slots=2)[0], pl.Mem.Left] = pl.tile.extract(full_a, 0, k, [80, 128], target_memory=pl.Mem.Left)
-                    b_l0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('b_l0', slots=2)[0], pl.Mem.Right] = pl.tile.extract(bv, 0 * 128, 0, [128, 256], target_memory=pl.Mem.Right)
-                    sa_l0: pl.Tile[[80, 4], pl.FP8E8M0, pl.MemRef('sa_l0', slots=4)[0 * 2], pl.Mem.LeftScale] = pl.tile.move(sa_part, target_memory=pl.Mem.LeftScale)
-                    sb_l0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef('sb_l0', slots=4)[0 * 2], pl.Mem.RightScale] = pl.tile.move(sb_part, target_memory=pl.Mem.RightScale)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        sb_cache_6 = pl.load(weight_scale, [24, col + worker_limit * 256], [4, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
-                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
-                    acc = pl.matmul_mx_acc(acc, a_l0, sa_l0, b_l0, sb_l0)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-                    k = 3 * 256 + 1 * 128
-                    sa_part = sa_cache_7
-                    sb_part = sb_cache_7
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-                    a_l0: pl.Tile[[80, 128], pl.FP8E4M3FN, pl.MemRef('a_l0', slots=2)[1], pl.Mem.Left] = pl.tile.extract(full_a, 0, k, [80, 128], target_memory=pl.Mem.Left)
-                    b_l0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('b_l0', slots=2)[1], pl.Mem.Right] = pl.tile.extract(bv, 1 * 128, 0, [128, 256], target_memory=pl.Mem.Right)
-                    sa_l0: pl.Tile[[80, 4], pl.FP8E8M0, pl.MemRef('sa_l0', slots=4)[1 * 2], pl.Mem.LeftScale] = pl.tile.move(sa_part, target_memory=pl.Mem.LeftScale)
-                    sb_l0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef('sb_l0', slots=4)[1 * 2], pl.Mem.RightScale] = pl.tile.move(sb_part, target_memory=pl.Mem.RightScale)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        sb_cache_7 = pl.load(weight_scale, [28, col + worker_limit * 256], [4, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
-                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
-                    acc = pl.matmul_mx_acc(acc, a_l0, sa_l0, b_l0, sb_l0)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-                    next_col = col + worker_limit * 256
-                    if next_col < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
-                        b_next: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[slot], pl.Mem.Mat] = pl.load(weight, [512, next_col], [256, 256], target_memory=pl.Mem.Mat)
-                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
-                    slot = (wave + 4) % 4
-                    pl.system.wait_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
-                    bv: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[slot], pl.Mem.Mat] = pl.tile.create([256, 256], pl.FP8E4M3FN, target_memory=pl.Mem.Mat)
-                    k = 4 * 256 + 0 * 128
-                    sa_part = sa_cache_8
-                    sb_part = sb_cache_8
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-                    a_l0: pl.Tile[[80, 128], pl.FP8E4M3FN, pl.MemRef('a_l0', slots=2)[0], pl.Mem.Left] = pl.tile.extract(full_a, 0, k, [80, 128], target_memory=pl.Mem.Left)
-                    b_l0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('b_l0', slots=2)[0], pl.Mem.Right] = pl.tile.extract(bv, 0 * 128, 0, [128, 256], target_memory=pl.Mem.Right)
-                    sa_l0: pl.Tile[[80, 4], pl.FP8E8M0, pl.MemRef('sa_l0', slots=4)[0 * 2], pl.Mem.LeftScale] = pl.tile.move(sa_part, target_memory=pl.Mem.LeftScale)
-                    sb_l0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef('sb_l0', slots=4)[0 * 2], pl.Mem.RightScale] = pl.tile.move(sb_part, target_memory=pl.Mem.RightScale)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        sb_cache_8 = pl.load(weight_scale, [32, col + worker_limit * 256], [4, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
-                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 0)
-                    acc = pl.matmul_mx_acc(acc, a_l0, sa_l0, b_l0, sb_l0)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-                    k = 4 * 256 + 1 * 128
-                    sa_part = sa_cache_9
-                    sb_part = sb_cache_9
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-                    a_l0: pl.Tile[[80, 128], pl.FP8E4M3FN, pl.MemRef('a_l0', slots=2)[1], pl.Mem.Left] = pl.tile.extract(full_a, 0, k, [80, 128], target_memory=pl.Mem.Left)
-                    b_l0: pl.Tile[[128, 256], pl.FP8E4M3FN, pl.MemRef('b_l0', slots=2)[1], pl.Mem.Right] = pl.tile.extract(bv, 1 * 128, 0, [128, 256], target_memory=pl.Mem.Right)
-                    sa_l0: pl.Tile[[80, 4], pl.FP8E8M0, pl.MemRef('sa_l0', slots=4)[1 * 2], pl.Mem.LeftScale] = pl.tile.move(sa_part, target_memory=pl.Mem.LeftScale)
-                    sb_l0: pl.Tile[[4, 256], pl.FP8E8M0, pl.MemRef('sb_l0', slots=4)[1 * 2], pl.Mem.RightScale] = pl.tile.move(sb_part, target_memory=pl.Mem.RightScale)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, 6)
-                        sb_cache_9 = pl.load(weight_scale, [36, col + worker_limit * 256], [4, 256], target_memory=pl.Mem.Mat)
-                    pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
-                    pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.M, 1)
-                    acc = pl.matmul_mx_acc(acc, a_l0, sa_l0, b_l0, sb_l0)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-                    next_col = col + worker_limit * 256
-                    if next_col < width:
-                        pl.system.set_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
-                        pl.system.wait_flag(pl.PipeType.MTE1, pl.PipeType.MTE2, slot)
-                        b_next: pl.Tile[[256, 256], pl.FP8E4M3FN, pl.MemRef('b_l1', slots=4)[slot], pl.Mem.Mat] = pl.load(weight, [768, next_col], [256, 256], target_memory=pl.Mem.Mat)
-                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, slot)
-                    if col + worker_limit * 256 < width:
-                        pl.system.set_flag(pl.PipeType.MTE2, pl.PipeType.MTE1, 6)
-                    pl.system.set_flag(pl.PipeType.M, pl.PipeType.FIX, 0)
-                    pl.system.wait_flag(pl.PipeType.M, pl.PipeType.FIX, 0)
+                    a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
+                    sa0 = pl.load(sa, [0, 0], [80, 8])
+                    b0 = pl.load(weight, [0, col], [256, 256], target_memory=pl.Mem.Mat)
+                    sb0 = pl.load(weight_scale, [0, col], [8, 256])
+                    acc = pl.matmul_mx(a0, sa0, b0, sb0)
+                    for k in pl.pipeline(256, 1280, 256, stage=4):
+                        av = pl.tile.slice(full_a, [80, 256], [0, k])
+                        sav = pl.load(sa, [0, k // 32], [80, 8])
+                        bv = pl.load(weight, [k, col], [256, 256], target_memory=pl.Mem.Mat)
+                        sbv = pl.load(weight_scale, [k // 32, col], [8, 256])
+                        acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
                     valid = pl.set_validshape(acc, pl.min(80, rows - row), 256)
                     projected = pl.store(valid, [row, col], projected)
-                    pl.system.set_flag(pl.PipeType.FIX, pl.PipeType.M, 4)
-            pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 0)
-            pl.system.wait_flag(pl.PipeType.M, pl.PipeType.MTE1, 1)
-            pl.system.wait_flag(pl.PipeType.FIX, pl.PipeType.M, 4)
-            pl.system.barrier(pipe=pl.PipeType.ALL)
-    for task in pl.spmd((rows + 79) // 80 * (width // 512)):
+    for task in pl.spmd(((rows + 79) // 80) * (width // 512)):
         row = task // (width // 512) * 80
         col = task % (width // 512) * 512
         valid_rows = pl.min(80, rows - row)
@@ -587,7 +350,7 @@ def proj_q_b_pypto(
             pair = pl.reg.shift_rights(lane, 1, full)
             swap = pl.reg.bitwise_xor(lane, one)
             odd_bit = pl.reg.bitwise_and(lane, one)
-            is_even = pl.reg.compares(odd_bit, 0, full, predicate='eq')
+            is_even = pl.reg.compares(odd_bit, 0, full, predicate="eq")
             for r in pl.hardware_loop(valid_rows):
                 trig_offset = pl.cast(r * 32, pl.UINT32)
                 trig_index = pl.reg.adds(pair, trig_offset, full)
@@ -601,7 +364,7 @@ def proj_q_b_pypto(
                 real = pl.reg.sub(a, b)
                 imag = pl.reg.add(b, a)
                 rotated = pl.reg.select(is_even, real, imag)
-                bf = pl.reg.convert(rotated, dtype=pl.BF16, rounding='R', saturate=False)
+                bf = pl.reg.convert(rotated, dtype=pl.BF16, rounding="R", saturate=False)
                 _rotated = pl.reg.store(source, offset=r * 512 + 448, value=bf)
         valid_source = pl.set_validshape(source, valid_rows, 512)
         output = pl.store(valid_source, [row_start + row, col], output)
