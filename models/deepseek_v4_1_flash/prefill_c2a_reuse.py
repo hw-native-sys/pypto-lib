@@ -6,42 +6,19 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Packed-prefill C2A Reuse wired through HC."""
+"""C2A reuse prefill."""
 
 
-import pypto.language as pl
-
-
-import pypto.language.distributed as pld
-import functools
-import torch
-
-from hc import hc_head_norm, hc_project, hc_sinkhorn
-from config import (
-    FLASH as M, CMP_BLOCKS_DYN, ORI_BLOCKS_DYN, T_DYN, TP_SIZE, PREFILL_MAX_TOKENS, SP_T_DYN,
-    WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES,
-)
-from prefill_cp_allgather import prefill_sp_input_allgather
-from o_proj import (
-    retire_prefill_signals,
-    golden_o_proj,
-)
-from prefill_c2a_full import (
-    REUSE_INPUT_NAMES, make_c2a_inputs, golden_reference_c2a,
-    _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
-)
-from qkv_proj_rope import golden_rope_tail, quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from o_proj import prefill_project_hc_post
-from sparse_attention import attend_packed
-from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
-from quant import quantize_mxfp8_cache
-from rmsnorm import golden_rms_norm
+from config import FLASH as M, CP_SIZE, PREFILL_MAX_TOKENS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES
+from prefill_c1a_reuse import l3_prefill_c1a_reuse, l3_prefill_c1a_reuse_cp
 
 
 # model config
-LOCAL_H = M.num_attention_heads // TP_SIZE
-LOCAL_O_GROUPS = M.o_groups // TP_SIZE
-LOCAL_O_WIDTH = M.o_groups // TP_SIZE * M.o_lora_rank
+LOCAL_H = M.num_attention_heads
+LOCAL_O_GROUPS = M.o_groups
+LOCAL_O_WIDTH = M.o_groups * M.o_lora_rank
+PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
+
 D = M.hidden_size
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
@@ -54,533 +31,135 @@ MIX_HC = M.mix_hc
 INDEX_TOPK = M.index_topk
 
 
-@pl.jit.inline(auto_scope=False)
-def prefill_c2a_reuse_attention(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output: pl.Tensor,
-    num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    residual: pl.Tensor,
-    post_mix: pl.Tensor,
-    residual_mix: pl.Tensor,
-    scatter_output: pl.constexpr,
-    zero_padding: pl.constexpr = True,
-):
-    """Compute C2A attention and fuse its projection into HC streams."""
-    tokens = pl.tensor.dim(x, 0)
-    attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    if num_tokens > 0:
-        with pl.at(
-            level=pl.Level.CORE_GROUP, name_hint="c2a_reuse_previous_epoch", allow_early_resolve=False
-        ) as cache_ready:
-            if TP_SIZE > 1:
-                for peer in pl.range(TP_SIZE):
-                    pld.system.wait(
-                        output_arrived, offsets=[peer, 0], expected=(attention_epoch - 1) * 2,
-                        cmp=pld.WaitCmp.Ge,
-                    )
+def build_c2a_reuse_specs(args, entry):
+    import torch
+    from golden import ScalarSpec, TensorSpec
+    from prefill_c2a_full import compressed_prefill_shapes, make_compressed_prefill_initializer
 
-        qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
-        query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
-        proj_payload, proj_scales, proj_payload_padded_rows = quantize_projection_input(x, num_tokens, row_tile=256)
-        q_proj_rope(
-            proj_payload, proj_scales,
-            wq_a, wq_a_scale, q_norm_weight,
-            wq_b, wq_b_scale,
-            rope_cos, rope_sin,
-            qr, query,
-            num_tokens, qa_worker_limit=24, qb_worker_limit=24,
-            padded_rows=proj_payload_padded_rows,
-            qa_row_tile=256, qb_row_tile=128,
-        )
-        kv_projection = kv_proj(
-            proj_payload, proj_scales,
-            wkv, wkv_scale,
-            kv_projection, num_tokens, worker_limit=8, row_tile=256,
-        )
-        window_publish_tid = window_publish(
-            kv_projection, kv_norm_weight, rope_cos, rope_sin,
-            window_slots, window_cache,
-            num_tokens, cache_ready,
-        )
-
-        source_ready = pl.system.task_dummy(deps=[window_publish_tid, cache_ready])
-        attend_packed(
-            query, window_indices, window_cache, compressed_indices, compressed_cache,
-            attn_sink, attended, num_tokens, source_ready,
-        )
-    prefill_project_hc_post(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        residual, post_mix, residual_mix, output, output_window, output_arrived,
-        group_base, tp_rank, num_tokens, attention_epoch, scatter_output=scatter_output, zero_padding=zero_padding,
-    )
-    return output
-
-
-@pl.jit.inline
-def prefill_c2a_reuse_sp(
-    x_hc: pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32],
-    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[3], pl.FP32],
-    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
-    input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
-    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    attn_input: pl.Tensor[[T_DYN, D], pl.BF16],
-    next_pre_mix: pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32],
-    x_hc_out: pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-):
-    """Run one C2A Reuse attention sublayer between HC pre and post; see ``prefill_c2a_full``."""
-    tokens = pl.tensor.dim(x_hc, 0)
-    post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
-    residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_head_norm(x_hc, pre_mix, attn_norm_weight, local_hidden, worker_limit=64)
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
-    attn_input, gathered = prefill_sp_input_allgather(
-        local_hidden, input_window, input_arrived, attn_input,
-        group_base, tp_rank, num_tokens, attention_epoch,
-    )
-    group_tokens = pl.tensor.dim(attn_input, 0)
-    prefill_c2a_reuse_attention(
-        attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b,
-        wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        window_slots, window_indices, window_cache, compressed_cache,
-        compressed_indices, output_arrived, x_hc_out, num_tokens,
-        attention_epoch,
-        output_window=output_window, group_base=group_base, tp_rank=tp_rank,
-        residual=x_hc, post_mix=post_mix, residual_mix=residual_mix,
-        scatter_output=True, zero_padding=True,
-    )
-    hc_rows = pl.tensor.dim(x_hc, 0)
-    hc_active = pl.max(0, pl.min(hc_rows, num_tokens - (tp_rank) * hc_rows))
-    if hc_active < hc_rows:
-        with pl.spmd(32, name_hint="sp_mix_zero_padding", deps=[gathered]):
-            worker = pl.tile.get_block_idx()
-            for row in pl.range(hc_active + worker, hc_rows, 32):
-                zero_mix = pl.full([1, 8], dtype=pl.FP32, value=0.0)
-                next_pre_mix[row:row + 1, :] = pl.set_validshape(zero_mix, 1, HC_MULT)
-    if num_tokens == 0:
-        # Empty attention skips the gathered input read; retain its consumption dependency.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="empty_attention_input_done", deps=[gathered], allow_early_resolve=False):
-            anchor = pl.read(x_hc_out, [0, 0, 0])
-            pl.write(x_hc_out, [0, 0, 0], anchor)
-    return x_hc_out
-
-
-@pl.jit.inline
-def prefill_c2a_reuse(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[3], pl.FP32],
-    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
-    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    attn_input: pl.Tensor[[T_DYN, D], pl.BF16],
-    next_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    x_hc_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    group_base: pl.Scalar[pl.INT32],
-    tp_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-):
-    """Run one C2A Reuse attention sublayer between HC pre and post; see ``prefill_c2a_full``."""
-    tokens = pl.tensor.dim(x_hc, 0)
-    post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
-    residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_head_norm(x_hc, pre_mix, attn_norm_weight, attn_input, worker_limit=64)
-    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
-    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
-    attention_tokens = pl.tensor.dim(attn_input, 0)
-    prefill_c2a_reuse_attention(
-        attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b,
-        wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink,
-        wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        window_slots, window_indices, window_cache, compressed_cache,
-        compressed_indices, output_arrived, x_hc_out, num_tokens,
-        attention_epoch,
-        output_window=output_window, group_base=group_base, tp_rank=tp_rank,
-        residual=x_hc, post_mix=post_mix, residual_mix=residual_mix,
-        scatter_output=False, zero_padding=False,
-    )
-    return x_hc_out
-
-
-RANKS_DYN = pl.dynamic("RANKS_DYN")
-
-
-@pl.jit
-def l2_prefill_c2a_reuse(
-    x_hc: pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32],
-    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[3], pl.FP32],
-    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[D], pl.BF16],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
-    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
-    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    compressed_cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    compressed_indices: pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32],
-    attn_input: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    next_pre_mix: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT], pl.FP32]],
-    x_hc_out: pl.Out[pl.Tensor[[SP_T_DYN, HC_MULT, D], pl.FP32]],
-    input_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
-    input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    output_window: pld.DistributedTensor[[PREFILL_MAX_TOKENS, D], pl.BF16],
-    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Tensor[[1], pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-):
-    """Bind the runtime shapes and run the sublayer once on one rank."""
-    x_hc.bind_dynamic(0, SP_T_DYN)
-    attn_input.bind_dynamic(0, T_DYN)
-    window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
-    compressed_cache.bind_dynamic(0, CMP_BLOCKS_DYN)
-    active = pl.read(num_tokens, [0])
-    prefill_c2a_reuse_sp(
-        x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
-        wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
-        kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
-        window_slots, window_indices, window_cache,
-        compressed_cache, compressed_indices, input_window, input_arrived, output_window,
-        output_arrived, attn_input, next_pre_mix, x_hc_out,
-        rank // TP_SIZE * TP_SIZE, rank % TP_SIZE, active, attention_epoch,
-    )
-    retire_prefill_signals(x_hc_out, input_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
-    retire_prefill_signals(x_hc_out, output_arrived, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE)
-    return x_hc_out, next_pre_mix, attn_input, window_cache
-
-
-@pl.jit.host
-def l3_prefill_c2a_reuse(
-    x_hc: pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT, D], pl.FP32],
-    pre_mix: pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT], pl.FP32],
-    hc_attn_fn: pl.Tensor[[RANKS_DYN, MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[RANKS_DYN, 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[RANKS_DYN, MIX_HC], pl.FP32],
-    attn_norm_weight: pl.Tensor[[RANKS_DYN, D], pl.BF16],
-    wq_a: pl.Tensor[[RANKS_DYN, D, Q_LORA], pl.FP8E4M3FN],
-    wq_a_scale: pl.Tensor[[RANKS_DYN, D // 32, Q_LORA], pl.FP8E8M0],
-    q_norm_weight: pl.Tensor[[RANKS_DYN, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[RANKS_DYN, Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
-    wq_b_scale: pl.Tensor[[RANKS_DYN, Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0],
-    wkv: pl.Tensor[[RANKS_DYN, D, HEAD_DIM], pl.FP8E4M3FN],
-    wkv_scale: pl.Tensor[[RANKS_DYN, D // 32, HEAD_DIM], pl.FP8E8M0],
-    kv_norm_weight: pl.Tensor[[RANKS_DYN, HEAD_DIM], pl.BF16],
-    attn_sink: pl.Tensor[[RANKS_DYN, LOCAL_H], pl.FP32],
-    wo_a: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[RANKS_DYN, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[RANKS_DYN, LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[RANKS_DYN, LOCAL_O_WIDTH // 32, D], pl.FP8E8M0],
-    rope_cos: pl.Tensor[[RANKS_DYN, T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[RANKS_DYN, T_DYN, ROPE_DIM // 2], pl.FP32],
-    window_slots: pl.Tensor[[RANKS_DYN, T_DYN], pl.INT64],
-    window_indices: pl.Tensor[[RANKS_DYN, T_DYN, 128], pl.INT32],
-    window_cache: pl.InOut[pl.Tensor[[RANKS_DYN, ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    compressed_cache: pl.Tensor[[RANKS_DYN, CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
-    compressed_indices: pl.Tensor[[RANKS_DYN, T_DYN, INDEX_TOPK], pl.INT32],
-    attn_input: pl.Out[pl.Tensor[[RANKS_DYN, T_DYN, D], pl.BF16]],
-    next_pre_mix: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT], pl.FP32]],
-    x_hc_out: pl.Out[pl.Tensor[[RANKS_DYN, SP_T_DYN, HC_MULT, D], pl.FP32]],
-    num_tokens: pl.Tensor[[RANKS_DYN, 1], pl.INT32],
-    attention_epoch: pl.Scalar[pl.INT32],
-):
-    """Allocate the TP communication windows and launch one rank entry per device."""
-    x_hc.bind_dynamic(0, RANKS_DYN)
-    x_hc.bind_dynamic(1, SP_T_DYN)
-    attn_input.bind_dynamic(1, T_DYN)
-    window_cache.bind_dynamic(1, ORI_BLOCKS_DYN)
-    compressed_cache.bind_dynamic(1, CMP_BLOCKS_DYN)
-    input_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
-    input_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    data_buffer = pld.alloc_window_buffer([PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
-    signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    for rank in pl.range(pld.world_size()):
-        input_data = pld.window(input_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
-        input_signal = pld.window(input_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        data = pld.window(data_buffer, [PREFILL_MAX_TOKENS, D], dtype=pl.BF16)
-        signal = pld.window(signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
-        # Each rank consumes packed MX_B_NN scale rows.
-        wq_a_scale_r: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN] = wq_a_scale[rank]
-        wq_b_scale_r: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wq_b_scale[rank]
-        wo_b_scale_r: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN] = wo_b_scale[rank]
-        wkv_scale_r: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN] = wkv_scale[rank]
-        l2_prefill_c2a_reuse(
-            x_hc[rank], pre_mix[rank], hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
-            attn_norm_weight[rank], wq_a[rank], wq_a_scale_r, q_norm_weight[rank], wq_b[rank],
-            wq_b_scale_r, wkv[rank], wkv_scale_r, kv_norm_weight[rank],
-            attn_sink[rank], wo_a[rank], wo_a_scale[rank], wo_b[rank], wo_b_scale_r, rope_cos[rank],
-            rope_sin[rank], window_slots[rank], window_indices[rank], window_cache[rank],
-            compressed_cache[rank],
-            compressed_indices[rank], attn_input[rank], next_pre_mix[rank],
-            x_hc_out[rank], input_data, input_signal, data, signal, rank, num_tokens[rank], attention_epoch, device=rank,
-        )
-
-
-def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
-    """Ratio-2 reuse attention; publishes only the addressed sliding-window rows.
-
-    Same transcription as the full-mode reference, with the compressor, the index-key
-    publication and the indexer removed: the selection arrives as an input and the
-    compressed pool is read-only.
-    """
-    from quant import unpack_fp8_nz
-    t = inputs
-    x = t["x"]
-    tokens = x.shape[0]
-    head_dim = t["window_cache"].shape[-1]
-    local_heads = t["attn_sink"].numel()
-
-    qa_weight = unpack_fp8_nz(t["wq_a"])
-    qb_weight = unpack_fp8_nz(t["wq_b"])
-    kv_weight = unpack_fp8_nz(t["wkv"])
-    projected = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, qa_weight, t["wq_a_scale"])
-    qr = golden_rms_norm(projected, t["q_norm_weight"])
-    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, qb_weight, t["wq_b_scale"])
-    q = q.unflatten(-1, (local_heads, head_dim))
-    q = golden_rope_tail(q, t["rope_cos"], t["rope_sin"])
-    projected_kv = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, kv_weight, t["wkv_scale"])
-    kv = golden_rms_norm(projected_kv, t["kv_norm_weight"])
-    kv = golden_rope_tail(kv, t["rope_cos"], t["rope_sin"])
-
-    window_cache = t["window_cache"].clone()
-    window_cache_scale = t["window_cache_scale"].clone()
-    window_payload, window_scales = quantize_mxfp8_cache(kv)
-    window_slots = t["window_slots"].long()
-    window_valid = window_slots >= 0
-    window_rows = window_slots[window_valid]
-    # Boolean indexing of Float8 on CPU requires an exact FP32 roundtrip.
-    visible_payload = window_payload.float()[window_valid].to(window_payload.dtype)
-    _write_rows(window_cache, window_rows, visible_payload, head_dim)
-    window_cache_scale.reshape(-1, head_dim // MX_GROUP)[window_rows] = window_scales[window_valid]
-
-    window_values = (
-        window_cache.float() * window_cache_scale.float().repeat_interleave(MX_GROUP, -1)
-    ).reshape(-1, head_dim)
-    compressed_values = _flat_cache_rows(
-        t["compressed_cache"], t["compressed_cache_scale"], CMP_GROUP, "bf16"
-    )
-    window_indices = t["window_indices"].long()
-    compressed_indices = t["compressed_indices"].long()
-    gathered = torch.cat(
-        (
-            window_values[window_indices.clamp_min(0).reshape(-1)].reshape(tokens, -1, head_dim),
-            compressed_values[compressed_indices.clamp_min(0).reshape(-1)].reshape(
-                tokens, -1, head_dim
-            ),
-        ),
-        dim=1,
-    ).to(torch.bfloat16)
-    visible = torch.cat((window_indices >= 0, compressed_indices >= 0), dim=1)
-    gathered = gathered.masked_fill(~visible[..., None], 0)
-
-    maximum = torch.full((tokens, local_heads), -1e30)
-    denominator = torch.zeros_like(maximum)
-    numerator = torch.zeros(tokens, local_heads, head_dim, dtype=torch.float32)
-    for start in range(0, gathered.shape[1], ATTEND_TILE):
-        values = gathered[:, start : start + ATTEND_TILE].float()
-        logits = torch.einsum("thd,tkd->thk", q.float(), values) * head_dim**-0.5
-        logits = logits.masked_fill(~visible[:, None, start : start + ATTEND_TILE], -torch.inf)
-        new_maximum = torch.maximum(maximum, logits.amax(-1))
-        correction = (maximum - new_maximum).exp()
-        probabilities = (logits - new_maximum[..., None]).exp()
-        denominator = denominator * correction + probabilities.sum(-1)
-        numerator = numerator * correction[..., None] + torch.einsum(
-            "thk,tkd->thd", probabilities.to(torch.bfloat16).float(), values
-        )
-        maximum = new_maximum
-    final_maximum = torch.maximum(maximum, t["attn_sink"].float()[None])
-    correction = (maximum - final_maximum).exp()
-    denominator = denominator * correction + (t["attn_sink"].float()[None] - final_maximum).exp()
-    attended = (numerator * (correction / denominator)[..., None]).to(torch.bfloat16)
-
-    output = golden_o_proj(
-        attended, t["rope_cos"], t["rope_sin"], t["wo_a"], t["wo_b"], t["wo_b_scale"],
-        wo_a_scale=t["wo_a_scale"], output_dtype=torch.float32 if fp32_output else None,
-        sequential_projection=True,
-    )
-
-    return {
-        "output": output,
-        "window_cache": window_cache,
-        "window_cache_scale": window_cache_scale,
-    }
-
-
-def make_c2a_reuse_inputs(tokens=32, requests=6, seed=17, case="mixed", mode="decode", start_pos=None):
-    """Inputs for a reuse layer, taken from what a full layer actually published.
-
-    The compressed pool and the Top-K row list come from running the full-mode
-    reference on the same batch, so the fixture exercises the real Full-to-Reuse
-    hand-off rather than a synthetic selection.
-    """
-    source = make_c2a_inputs(tokens=tokens, requests=requests, seed=seed, case=case, mode=mode, start_pos=start_pos)
-    published = golden_reference_c2a(source)
-    values = {name: source[name] for name in REUSE_INPUT_NAMES if name != "compressed_indices"}
-    values["compressed_cache"] = published["compressed_cache"]
-    values["compressed_cache_scale"] = published["compressed_cache_scale"]
-    values["compressed_indices"] = published["topk_indices"]
-    reachable = int((published["topk_indices"] >= 0).sum())
-    print(
-        f"[FIXTURE] c2a reuse tokens={tokens} requests={requests} mode={mode} case={case} "
-        f"selected_rows={reachable} source_published_rows="
-        f"{int((source['compressed_slots'] >= 0).sum())}"
-    )
-    return values
+    shapes = compressed_prefill_shapes(args, ratio=2)
+    ranks, tokens, local_tokens, pages, compressed_pages, table_pages, pool_capacity = shapes
+    initialize = make_compressed_prefill_initializer(args, entry, ratio=2, mode="reuse")
+    bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
+    specs = [
+        TensorSpec("hc_input", [ranks, local_tokens, HC_MULT, D], torch.float32),
+        TensorSpec("hc_pre_mix", [ranks, local_tokens, HC_MULT], torch.float32),
+        TensorSpec("hc_attn_fn", [ranks, MIX_HC, HC_DIM], torch.float32),
+        TensorSpec("hc_attn_scale", [ranks, 3], torch.float32),
+        TensorSpec("hc_attn_base", [ranks, MIX_HC], torch.float32),
+        TensorSpec("w_attn_norm", [ranks, D], bf),
+        TensorSpec("wq_a", [ranks, D, Q_LORA], fp),
+        TensorSpec("wq_a_scale", [ranks, D // 32, Q_LORA], mx),
+        TensorSpec("wq_norm", [ranks, Q_LORA], bf),
+        TensorSpec("wq_b", [ranks, Q_LORA, LOCAL_H * HEAD_DIM], fp),
+        TensorSpec("wq_b_scale", [ranks, Q_LORA // 32, LOCAL_H * HEAD_DIM], mx),
+        TensorSpec("wkv", [ranks, D, HEAD_DIM], fp),
+        TensorSpec("wkv_scale", [ranks, D // 32, HEAD_DIM], mx),
+        TensorSpec("wkv_norm", [ranks, HEAD_DIM], bf),
+        TensorSpec("attn_sink", [ranks, LOCAL_H], torch.float32),
+        TensorSpec("wo_a", [ranks, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], fp),
+        TensorSpec("wo_a_scale", [ranks, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], mx),
+        TensorSpec("wo_b", [ranks, LOCAL_O_WIDTH, D], fp),
+        TensorSpec("wo_b_scale", [ranks, LOCAL_O_WIDTH // 32, D], mx),
+        TensorSpec("q_rope_cos", [ranks, local_tokens, ROPE_DIM // 2], torch.float32),
+        TensorSpec("q_rope_sin", [ranks, local_tokens, ROPE_DIM // 2], torch.float32),
+        TensorSpec("q_window_indices", [ranks, local_tokens, 128], torch.int32),
+        TensorSpec("q_compressed_indices", [ranks, local_tokens, INDEX_TOPK], torch.int32),
+        TensorSpec("q_token_count", [ranks, 1], torch.int32),
+        TensorSpec("kv_rope_cos", [ranks, tokens, ROPE_DIM // 2], torch.float32),
+        TensorSpec("kv_rope_sin", [ranks, tokens, ROPE_DIM // 2], torch.float32),
+        TensorSpec("kv_write_slots", [ranks, tokens], torch.int64),
+        TensorSpec("kv_token_count", [ranks, 1], torch.int32),
+        TensorSpec("window_cache", [ranks, pages, 128, 1, WINDOW_CACHE_BYTES], torch.uint8),
+        TensorSpec("compressed_cache", [ranks, compressed_pages, 128, 1, COMPRESSED_CACHE_BYTES], torch.uint8),
+        TensorSpec("kv_restore_indices", [ranks, tokens], torch.int32),
+        TensorSpec("kv_hidden", [ranks, tokens, D], bf),
+        TensorSpec("hc_output", [ranks, local_tokens, HC_MULT, D], torch.float32),
+        TensorSpec("hc_next_pre_mix", [ranks, local_tokens, HC_MULT], torch.float32),
+    ]
+    for spec in specs:
+        spec.resident = "stacked"
+        if spec.name not in ("kv_hidden", "hc_output", "hc_next_pre_mix"):
+            spec.init_value = lambda name=spec.name: initialize(name)
+    specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None))
+    by_name = {spec.name: spec for spec in specs}
+    return [by_name[name] for name in entry.param_names]
 
 
 if __name__ == "__main__":
     import argparse
-    import os
-
+    import functools
     import torch
 
-    from config import MAX_BATCH_PER_DP
-    from golden import run
-    from prefill_c2a_full import PREFILL_ATTN_RING_HEAP, golden_prefill_c2a, build_specs, make_compare
+    from config import SUPPORTED_CP_SIZES
+    from golden import mapped_pool_ratio_allclose, ratio_allclose, run
+    from prefill_c2a_full import golden_c2a_prefill
+    from utils import packed_cache_compare
     from pypto.ir import DistributedConfig
 
-    parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C2A reuse with HC: A5 precision")
+    from utils import parse_prefill_groups
+
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C2A reuse")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
-    parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
-    parser.add_argument("--tokens", type=int, default=48)
-    parser.add_argument("--dp-tokens", type=str, help="comma-separated active counts, one per DP group")
-    parser.add_argument("--requests", type=int, default=6)
-    parser.add_argument("--case", default="mixed", choices=["mixed", "long", "masked", "zero"])
+    parser.add_argument("-d", "--device", type=lambda value: [int(part) for part in value.split(",")], help="comma-separated device IDs")
+    parser.add_argument("--cp", type=int, default=CP_SIZE, choices=SUPPORTED_CP_SIZES)
+    parser.add_argument("--dp", type=int, default=1, choices=[1, 2, 4, 8])
+    parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument("--dp-tokens", type=lambda value: [int(part) for part in value.split(",")], help="active token counts per DP group")
+    parser.add_argument("--requests", type=int, default=1, help="request count per DP when query-lens is omitted")
+    parser.add_argument("--query-lens", type=parse_prefill_groups, help="request lengths, e.g. '17,15;32'")
+    parser.add_argument("--start-pos", type=parse_prefill_groups, help="request prefix lengths, e.g. '127,0;256'")
+    parser.add_argument("--case", default="normal", choices=["normal", "prefix"])
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--save-data", action="store_true")
+    parser.add_argument("--golden-data", help="replay a compatible data directory containing in/ and out/")
+    parser.add_argument("--enable-chip-swimlane", type=int, default=0, choices=range(5))
+    parser.add_argument("--enable-dep-gen", action="store_true")
     args = parser.parse_args()
-
-    args.bench = os.environ.get("PYPTO_BENCH", "0") == "1"
-    devices = list(range(TP_SIZE * args.dp))
-    if args.device:
-        devices = [int(value) for value in args.device.split(",")]
-    if len(devices) != TP_SIZE * args.dp or len(set(devices)) != len(devices) or min(devices) < 0:
-        parser.error(f"--device must name {TP_SIZE * args.dp} distinct non-negative device IDs")
+    devices = list(range(CP_SIZE * args.dp)) if args.device is None else args.device
+    if len(devices) != CP_SIZE * args.dp or len(set(devices)) != len(devices) or min(devices) < 0:
+        parser.error("device IDs must be distinct nonnegative integers, with count CP * DP")
     if not 1 <= args.tokens <= PREFILL_MAX_TOKENS:
-        parser.error(f"--tokens must be in [1, {PREFILL_MAX_TOKENS}]")
-    if not 1 <= args.requests <= min(MAX_BATCH_PER_DP, args.tokens):
-        parser.error(f"--requests must be in [1, {min(MAX_BATCH_PER_DP, args.tokens)}]")
-    args.dp_tokens = [int(value) for value in args.dp_tokens.split(",")] if args.dp_tokens else [args.tokens] * args.dp
-    if len(args.dp_tokens) != args.dp or any(count < 0 or count > args.tokens for count in args.dp_tokens):
-        parser.error("--dp-tokens must provide one count in [0, tokens] per DP group")
+        parser.error(f"tokens must be in [1, {PREFILL_MAX_TOKENS}]")
+    if args.dp_tokens is not None:
+        if len(args.dp_tokens) != args.dp or any(n < 0 or n > args.tokens for n in args.dp_tokens):
+            parser.error("dp-tokens must contain one count per DP group, each in [0, tokens]")
     torch.set_num_threads(8)
-
-    print(
-        f"[C2A-HC] mode=reuse tokens={args.tokens} requests={args.requests} TP={TP_SIZE} "
-        f"DP={args.dp} case={args.case} seed={args.seed} devices={devices}"
-    )
-    initial_state = {}
+    entry = l3_prefill_c1a_reuse if CP_SIZE == 1 else l3_prefill_c1a_reuse_cp
     result = run(
-        fn=l3_prefill_c2a_reuse,
-        specs=build_specs(args, "reuse", initial_state, make_inputs=make_c2a_reuse_inputs),
-        golden_fn=functools.partial(golden_prefill_c2a, mode="reuse", reference=golden_reference_c2a_reuse),
+        fn=entry,
+        specs=build_c2a_reuse_specs(args, entry),
+        golden_fn=functools.partial(golden_c2a_prefill, mode="reuse"),
         compile_only=args.compile_only,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
         config=dict(
             backend_type=args.backend_type,
             execution_mode=args.execution_mode,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
+            enable_chip_swimlane=args.enable_chip_swimlane,
+            enable_dep_gen=args.enable_dep_gen,
             ring_heap=PREFILL_ATTN_RING_HEAP,
         ),
-        compare_fn=make_compare("reuse", len(devices), args.tokens),
+        compare_fn={
+            "kv_hidden": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "hc_next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "hc_output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
+            "window_cache": packed_cache_compare(
+                mapped_pool_ratio_allclose(
+                    "kv_write_slots", pool_name="window_cache",
+                    mapping_shape=(len(devices), args.tokens), block_size=128, leading_rank_axis=True,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.01,
+                ),
+                mapped_pool_ratio_allclose(
+                    "kv_write_slots", pool_name="window_cache scale",
+                    mapping_shape=(len(devices), args.tokens), block_size=128, leading_rank_axis=True,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.0,
+                ),
+                fp4=False,
+            ),
+        },
     )
-    if args.compile_only and result.passed:
-        print("[C2A-HC] Compilation passed; device accuracy was NOT validated.")
     if not result.passed:
         raise SystemExit(result.error or 1)

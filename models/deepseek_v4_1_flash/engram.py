@@ -6,13 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""V4.1 Engram projection and residual gating from host rows or device-sharded lookup tables."""
+"""V4.1 Engram projection and residual gating from host rows or local lookup tables."""
 
 import math
-import sys
 
 import pypto.language as pl
-import pypto.language.distributed as pld
 import torch
 
 from config import FLASH as M, T_DYN
@@ -41,26 +39,6 @@ T_TILE = 16
 K_TILE = 128
 N_TILE = 256
 D_TILE = 512
-
-
-def _parse_tp_size() -> int:
-    """Read ``--tp`` from the command line (default 1 = single-rank)."""
-    for index, argument in enumerate(sys.argv):
-        if argument == "--tp" and index + 1 < len(sys.argv):
-            return int(sys.argv[index + 1])
-        if argument.startswith("--tp="):
-            return int(argument.split("=", 1)[1])
-    return 1
-
-
-TP_SIZE = _parse_tp_size()
-if TP_SIZE not in (1, 2, 4, 8):
-    raise ValueError(f"--tp must be one of (1, 2, 4, 8), got {TP_SIZE}")
-if NUM_EMBEDDINGS % TP_SIZE:
-    raise ValueError(f"NUM_EMBEDDINGS={NUM_EMBEDDINGS} not divisible by TP{TP_SIZE}")
-ROWS_PER_RANK = NUM_EMBEDDINGS // TP_SIZE
-# Static row capacity of the per-rank lookup window used by the TP all-reduce.
-TP_MAX_TOKENS = 256
 
 
 @pl.jit.inline
@@ -249,228 +227,6 @@ def l2_engram(
     return out
 
 
-@pl.jit.inline
-def engram_tp(
-    hash_ids: pl.Tensor[[T_DYN, N_HASH_COLS], pl.INT32],
-    engram_table: pl.Tensor[[ROWS_PER_RANK, HEAD_DIM], pl.BF16],
-    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
-    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    lookup_window: pld.DistributedTensor[[TP_MAX_TOKENS, ENGRAM_K], pl.BF16],
-    signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-):
-    """One TP rank: gather against the local table shard, all-reduce the lookup.
-
-    The gathered rows are linear in the table, so summing every rank's
-    zero-masked partial lookup reproduces the full-table gather. The reduction
-    is fused chunk-wise into the projection loop to keep tiles small.
-    """
-    t_dim = pl.tensor.dim(hash_ids, 0)
-    t_blocks = (t_dim + T_TILE - 1) // T_TILE
-    n_blocks = KV_OUT // N_TILE
-
-    # ---- Stage 0: masked gather from this rank's shard (off-shard rows -> 0)
-    lookup_partial = pl.create_tensor([t_dim, ENGRAM_K], dtype=pl.BF16)
-    with pl.spmd(t_blocks, name_hint="engram_tp_gather") as gather_tid:
-        t0 = pl.tile.get_block_idx() * T_TILE
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-        lookup = pl.create_tensor([T_TILE, ENGRAM_K], dtype=pl.BF16)
-        for c in pl.range(N_HASH_COLS):
-            for tt in pl.range(T_TILE):
-                if t0 + tt < t_dim:
-                    row = pl.read(hash_ids, [t0 + tt, c])
-                    local = row - my_rank * ROWS_PER_RANK
-                    clamped = pl.max(0, pl.min(ROWS_PER_RANK - 1, local))
-                    if local >= 0 and local < ROWS_PER_RANK:
-                        lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = engram_table[
-                            clamped : clamped + 1, 0:HEAD_DIM
-                        ]
-                    else:
-                        lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = pl.full(
-                            [1, HEAD_DIM], dtype=pl.BF16, value=0.0
-                        )
-                else:
-                    lookup[tt : tt + 1, c * HEAD_DIM : (c + 1) * HEAD_DIM] = pl.full(
-                        [1, HEAD_DIM], dtype=pl.BF16, value=0.0
-                    )
-        lookup_partial[t0 : t0 + T_TILE, 0:ENGRAM_K] = pl.set_validshape(
-            lookup, valid_rows, ENGRAM_K
-        )
-
-    # Publish this rank's partial lookup into its own window slice, then barrier.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="engram_tp_publish", deps=[gather_tid]
-    ) as publish_tid:
-        pld.tensor.put(
-            dst=lookup_window,
-            peer=my_rank,
-            src=lookup_partial,
-            dst_offsets=[0, 0],
-            src_offsets=[0, 0],
-            shape=[t_dim, ENGRAM_K],
-            chunk_rows=1,
-            chunk_cols=2048,
-        )
-        for peer in pl.range(TP_SIZE):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=signal,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="engram_tp_wait",
-        deps=[publish_tid],
-        allow_early_resolve=False,
-    ) as wait_tid:
-        for src in pl.range(TP_SIZE):
-            if src != my_rank:
-                pld.system.wait(
-                    signal=signal,
-                    offsets=[src, 0],
-                    expected=1,
-                    cmp=pld.WaitCmp.Ge,
-                )
-
-    # ---- Stage 1: all-reduce the lookup chunk-wise, project to key|value.
-    # Every element has exactly one non-zero contributor across the ranks, so
-    # the BF16 adds are exact and the matmul sees the full-table gather. The
-    # first K chunk goes through pl.matmul so the accumulator is produced in
-    # Acc memory; later chunks accumulate onto it.
-    kv = pl.create_tensor([t_dim, KV_OUT], dtype=pl.FP32)
-    with pl.spmd(t_blocks * n_blocks, name_hint="engram_tp_matmul", deps=[wait_tid]) as matmul_tid:
-        block = pl.tile.get_block_idx()
-        t0 = (block // n_blocks) * T_TILE
-        n0 = (block % n_blocks) * N_TILE
-        valid_rows = pl.min(T_TILE, t_dim - t0)
-        a0 = pl.load(
-            lookup_window,
-            [t0, 0],
-            [T_TILE, K_TILE],
-            target_memory=pl.MemorySpace.Vec,
-        )
-        for peer in pl.range(TP_SIZE):
-            if peer != my_rank:
-                a0 = pl.add(
-                    a0,
-                    pld.tile.remote_load(
-                        lookup_window, peer=peer, offsets=[t0, 0], shape=[T_TILE, K_TILE]
-                    ),
-                )
-        w0 = pl.load(wkv_weight, [0, n0], [K_TILE, N_TILE])
-        acc = pl.matmul(a0, w0, out_dtype=pl.FP32)
-        for kb in pl.range(1, ENGRAM_K // K_TILE):
-            k0 = kb * K_TILE
-            a_tile = pl.load(
-                lookup_window,
-                [t0, k0],
-                [T_TILE, K_TILE],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            for peer in pl.range(TP_SIZE):
-                if peer != my_rank:
-                    a_tile = pl.add(
-                        a_tile,
-                        pld.tile.remote_load(
-                            lookup_window,
-                            peer=peer,
-                            offsets=[t0, k0],
-                            shape=[T_TILE, K_TILE],
-                        ),
-                    )
-            w_tile = pl.load(wkv_weight, [k0, n0], [K_TILE, N_TILE])
-            acc = pl.matmul_acc(acc, a_tile, w_tile)
-        pl.store(pl.set_validshape(acc, valid_rows, N_TILE), [t0, n0], kv)
-
-    # Publish completion of all remote lookup readers.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="engram_tp_consumed", deps=[matmul_tid]) as consumed_tid:
-        for peer in pl.range(TP_SIZE):
-            if peer != my_rank:
-                pld.system.notify(signal, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="engram_tp_consumed_wait") as consumed_wait_tid:
-        for peer in pl.range(TP_SIZE):
-            if peer != my_rank:
-                pld.system.defer_wait(signal, offsets=[peer, 0], expected=2, cmp=pld.WaitCmp.Ge)
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="engram_tp_signal_retire",
-        deps=[consumed_tid, consumed_wait_tid], allow_early_resolve=False,
-    ):
-        anchor = pl.read(kv, [0, 0])
-        for peer in pl.range(TP_SIZE):
-            if peer != my_rank:
-                pld.system.notify(signal, peer=my_rank, offsets=[peer, 0], value=0, op=pld.NotifyOp.Set)
-        pl.write(kv, [0, 0], anchor)
-
-    # Gate and residual add after signal retirement.
-    x_flat = pl.reshape(x, [t_dim, HC_MULT * D])
-    x_fp32 = pl.create_tensor([t_dim, HC_MULT * D], dtype=pl.FP32)
-    engram_cast_to_fp32(x_flat, x_fp32)
-    x_hc_fp32 = pl.reshape(x_fp32, [t_dim, HC_MULT, D])
-    engram_gate(kv, weight, x_hc_fp32, out, output_fp32=False)
-    return out
-
-
-@pl.jit
-def l2_engram_tp(
-    hash_ids: pl.Tensor[[T_DYN, N_HASH_COLS], pl.INT32],
-    engram_table: pl.Tensor[[ROWS_PER_RANK, HEAD_DIM], pl.BF16],
-    wkv_weight: pl.Tensor[[ENGRAM_K, KV_OUT], pl.BF16],
-    weight: pl.Tensor[[HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16]],
-    lookup_window: pld.DistributedTensor[[TP_MAX_TOKENS, ENGRAM_K], pl.BF16],
-    signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-):
-    """Run the Engram block on one TP rank for standalone validation."""
-    hash_ids.bind_dynamic(0, T_DYN)
-    x.bind_dynamic(0, T_DYN)
-    out.bind_dynamic(0, T_DYN)
-    engram_tp(
-        hash_ids, engram_table, wkv_weight, weight, x, out,
-        lookup_window, signal, my_rank,
-    )
-    return out
-
-
-@pl.jit.host
-def l3_engram(
-    hash_ids: pl.Tensor[[TP_SIZE, T_DYN, N_HASH_COLS], pl.INT32],
-    engram_table: pl.Tensor[[TP_SIZE, ROWS_PER_RANK, HEAD_DIM], pl.BF16],
-    wkv_weight: pl.Tensor[[TP_SIZE, ENGRAM_K, KV_OUT], pl.BF16],
-    weight: pl.Tensor[[TP_SIZE, HC_MULT, D], pl.FP32],
-    x: pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.BF16],
-    out: pl.Out[pl.Tensor[[TP_SIZE, T_DYN, HC_MULT, D], pl.BF16]],
-):
-    """Launch one Engram TP group, every rank sharing the window buffers."""
-    hash_ids.bind_dynamic(1, T_DYN)
-    x.bind_dynamic(1, T_DYN)
-    out.bind_dynamic(1, T_DYN)
-
-    lookup_window_buf = pld.alloc_window_buffer([TP_MAX_TOKENS, ENGRAM_K], dtype=pl.BF16)
-    signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
-    for rank in pl.range(pld.world_size()):
-        lookup_window = pld.window(lookup_window_buf, [TP_MAX_TOKENS, ENGRAM_K], dtype=pl.BF16)
-        signal = pld.window(signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        l2_engram_tp(
-            hash_ids[rank],
-            engram_table[rank],
-            wkv_weight[rank],
-            weight[rank],
-            x[rank],
-            out[rank],
-            lookup_window,
-            signal,
-            rank,
-            device=rank,
-        )
-
-
 class HostEngram:
     """Hash text history and read selected FP8 checkpoint table rows on the CPU.
 
@@ -633,66 +389,6 @@ def golden_engram_case(tensors):
     )
 
 
-def build_engram_tp_tensor_specs(batch: int = 2, sequence: int = 4):
-    """Build stacked per-rank inputs for TP validation.
-
-    Ids, weights, and activations are identical on every rank; only the table
-    differs, holding each rank's row shard of the full table.
-    """
-    from golden import TensorSpec
-
-    tokens = batch * sequence
-    generator = torch.Generator().manual_seed(3)
-
-    def init_hash_ids():
-        ids = torch.randint(0, NUM_EMBEDDINGS, (tokens, N_HASH_COLS), generator=generator)
-        return ids.unsqueeze(0).repeat(TP_SIZE, 1, 1)
-
-    def init_table():
-        full = (torch.randn(NUM_EMBEDDINGS, HEAD_DIM, generator=generator) * 0.02).to(
-            torch.bfloat16
-        )
-        return full.reshape(TP_SIZE, ROWS_PER_RANK, HEAD_DIM)
-
-    def init_wkv():
-        w = (torch.randn(ENGRAM_K, KV_OUT, generator=generator) / math.sqrt(ENGRAM_K)).to(
-            torch.bfloat16
-        )
-        return w.unsqueeze(0).repeat(TP_SIZE, 1, 1)
-
-    def init_weight():
-        q = torch.rand(HC_MULT, D, generator=generator) + 0.5
-        k = torch.rand(HC_MULT, D, generator=generator) + 0.5
-        w = q * k
-        return w.unsqueeze(0).repeat(TP_SIZE, 1, 1)
-
-    def init_x():
-        v = torch.randn(tokens, HC_MULT, D, generator=generator).to(torch.bfloat16)
-        return v.unsqueeze(0).repeat(TP_SIZE, 1, 1, 1)
-
-    return [
-        TensorSpec("hash_ids", [TP_SIZE, tokens, N_HASH_COLS], torch.int32, init_value=init_hash_ids),
-        TensorSpec("engram_table", [TP_SIZE, ROWS_PER_RANK, HEAD_DIM], torch.bfloat16, init_value=init_table),
-        TensorSpec("wkv_weight", [TP_SIZE, ENGRAM_K, KV_OUT], torch.bfloat16, init_value=init_wkv),
-        TensorSpec("weight", [TP_SIZE, HC_MULT, D], torch.float32, init_value=init_weight),
-        TensorSpec("x", [TP_SIZE, tokens, HC_MULT, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("out", [TP_SIZE, tokens, HC_MULT, D], torch.bfloat16),
-    ]
-
-
-def golden_engram_tp_case(tensors):
-    """Fill the expected TP output: full-table result, identical on every rank."""
-    full_table = tensors["engram_table"].reshape(NUM_EMBEDDINGS, HEAD_DIM)
-    out = golden_engram(
-        tensors["hash_ids"][0],
-        full_table,
-        tensors["wkv_weight"][0],
-        tensors["weight"][0],
-        tensors["x"][0],
-    )
-    tensors["out"][:] = out.unsqueeze(0).expand_as(tensors["out"])
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -706,60 +402,31 @@ if __name__ == "__main__":
         "--device",
         type=str,
         default="0",
-        help="comma-separated device ids; must provide exactly --tp ids",
+        help="comma-separated device ids; provide one device id",
     )
-    parser.add_argument("--tp", type=int, default=1, choices=[1, 2, 4, 8])
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=4)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     args = parser.parse_args()
 
-    if args.tp != TP_SIZE:
-        raise ValueError(f"--tp {args.tp} disagrees with module TP_SIZE {TP_SIZE}")
     device_ids = [int(d) for d in args.device.split(",")]
-    if len(device_ids) != TP_SIZE:
-        raise ValueError(f"need exactly {TP_SIZE} device ids for tp={TP_SIZE}, got {device_ids}")
-    if TP_SIZE > 1 and args.batch * args.sequence > TP_MAX_TOKENS:
-        raise ValueError(
-            f"batch*sequence={args.batch * args.sequence} exceeds the TP window "
-            f"capacity {TP_MAX_TOKENS}"
-        )
+    if len(device_ids) != 1:
+        raise ValueError(f"need exactly one device id, got {device_ids}")
 
-    if TP_SIZE == 1:
-        result = run(
-            fn=l2_engram,
-            specs=build_engram_tensor_specs(args.batch, args.sequence),
-            golden_fn=golden_engram_case,
-            config={
-                "backend_type": args.backend_type, "execution_mode": args.execution_mode,
-                "device_id": device_ids[0],
-                "enable_chip_swimlane": args.enable_chip_swimlane,
-            },
-            rtol=1e-3,
-            atol=1e-3,
-            compare_fn={"out": ratio_allclose(atol=1e-3, rtol=1e-2)},
-            compile_only=args.compile_only,
-        )
-    else:
-        from pypto.ir import DistributedConfig
-
-        result = run(
-            fn=l3_engram,
-            specs=build_engram_tp_tensor_specs(args.batch, args.sequence),
-            golden_fn=golden_engram_tp_case,
-            config={
-                "backend_type": args.backend_type, "execution_mode": args.execution_mode,
-                "enable_chip_swimlane": args.enable_chip_swimlane,
-                "distributed_config": DistributedConfig(
-                    device_ids=device_ids,
-                    num_sub_workers=0,
-                ),
-            },
-            rtol=1e-3,
-            atol=1e-3,
-            compare_fn={"out": ratio_allclose(atol=1e-3, rtol=1e-2)},
-            compile_only=args.compile_only,
-        )
+    result = run(
+        fn=l2_engram,
+        specs=build_engram_tensor_specs(args.batch, args.sequence),
+        golden_fn=golden_engram_case,
+        config={
+            "backend_type": args.backend_type, "execution_mode": args.execution_mode,
+            "device_id": device_ids[0],
+            "enable_chip_swimlane": args.enable_chip_swimlane,
+        },
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={"out": ratio_allclose(atol=1e-3, rtol=1e-2)},
+        compile_only=args.compile_only,
+    )
     if not result.passed:
         raise SystemExit(result.error or 1)

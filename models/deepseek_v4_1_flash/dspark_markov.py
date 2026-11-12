@@ -23,13 +23,13 @@ from config import (
     DSPARK_QUERY_WIDTH,
     EP_SIZE,
     FLASH,
-    MAX_BATCH_PER_DP,
+    DECODE_BATCH,
     SUPPORTED_EP_SIZES,
-    SUPPORTED_TP_SIZES,
-    TP_SIZE,
+    SUPPORTED_LM_HEAD_TP_SIZES,
+    LM_HEAD_TP_SIZE,
 )
 from lm_head import (
-    GROUP_LOGIT_ROWS, LM_HEAD_M_TILE, MAX_LOGIT_ROWS, TP_SIZE as LM_HEAD_TP_SIZE,
+    GROUP_LOGIT_ROWS, LM_HEAD_M_TILE, MAX_LOGIT_ROWS,
     VOCAB_PER_TP, lm_head, lm_head_project,
 )
 from rmsnorm import rms_norm_tiled
@@ -96,14 +96,14 @@ MARKOV_BATCH_TILE = 16
 VOCAB_TILE = 128
 MARKOV_CORES = 48
 RESULT_STRIDE = 16
-MAX_LOGIT_CHUNKS = (MAX_BATCH_PER_DP * DSPARK_QUERY_WIDTH + MAX_LOGIT_ROWS - 1) // MAX_LOGIT_ROWS
+MAX_LOGIT_CHUNKS = (DECODE_BATCH * DSPARK_QUERY_WIDTH + MAX_LOGIT_ROWS - 1) // MAX_LOGIT_ROWS
 
 if (D, MARKOV_RANK, DSPARK_QUERY_WIDTH) != (5120, 256, 5):
     raise ValueError("native Markov recurrence requires hidden_size=5120, rank=256, and five steps")
 if VOCAB % 256 != 0:
     raise ValueError("native Markov recurrence requires complete 256-column vocabulary panels")
-if LM_HEAD_TP_SIZE != TP_SIZE:
-    raise ValueError(f"DSpark LM head TP={LM_HEAD_TP_SIZE} differs from drafter TP={TP_SIZE}")
+if EP_SIZE % LM_HEAD_TP_SIZE:
+    raise ValueError("EP must be divisible by LM head TP")
 
 
 @pl.jit.inline(auto_scope=False)
@@ -333,9 +333,9 @@ def _markov_sample_from_hidden(
     draft_ids: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.INT32]],
     confidences: pl.Out[pl.Tensor[[B_DYN, DSPARK_QUERY_WIDTH], pl.FP32]],
     hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
-    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
-    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     rank: pl.Scalar[pl.INT32],
     logits_epoch: pl.Scalar[pl.INT32],
 ):
@@ -355,7 +355,7 @@ def _markov_sample_from_hidden(
         rms_norm_tiled(flat_hidden, final_norm_weight, normalized, block, rows, output_fp32=False)
     base_logits = pl.create_tensor([batch, DSPARK_QUERY_WIDTH, VOCAB], dtype=pl.FP32)
     flat_logits = pl.reshape(base_logits, [rows, VOCAB])
-    if TP_SIZE == 1:
+    if LM_HEAD_TP_SIZE == 1:
         logits_ready_tid = lm_head_project(normalized, lm_head_weight, flat_logits, LM_HEAD_M_TILE)
         # The caller supplies the already resolved anchor: decode passes the
         # accepted target token, while prefill passes next_prefill_tokens.
@@ -371,8 +371,8 @@ def _markov_sample_from_hidden(
             logits_ready_tid,
         )
     else:
-        group_base = rank // TP_SIZE * TP_SIZE
-        tp_rank = rank % TP_SIZE
+        group_base = rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE
+        tp_rank = rank % LM_HEAD_TP_SIZE
         # Keep the producer event outside a dynamic pl.range. PTOAS requires
         # values returned from an inline call to remain in one SSA scope; a fixed
         # maximum also lets the final LM-head event gate Markov sampling safely.
@@ -454,14 +454,14 @@ def l3_markov_sample_from_hidden(
     draft_ids.bind_dynamic(1, B_DYN)
     confidences.bind_dynamic(1, B_DYN)
     hidden_window_buf = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    hidden_done_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     logits_window_buf = pld.alloc_window_buffer([MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-    logits_done_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for rank in pl.range(pld.world_size()):
         hidden_window = pld.window(hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        hidden_done = pld.window(hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
-        logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        logits_done = pld.window(logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         l2_markov_sample_from_hidden(
             head_hidden[rank],
             final_norm_weight[rank],
@@ -553,15 +553,15 @@ if __name__ == "__" + "main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="V4.1 DSpark Markov validation")
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=SUPPORTED_TP_SIZES)
+    parser.add_argument("--lm-head-tp", type=int, default=LM_HEAD_TP_SIZE, choices=SUPPORTED_LM_HEAD_TP_SIZES)
     parser.add_argument("--dp", type=int, default=DP_SIZE)
     parser.add_argument("--ep", type=int, default=EP_SIZE, choices=SUPPORTED_EP_SIZES)
     parser.add_argument("-p", "--platform", choices=("a5", "a5sim"), default="a5")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
-    if (args.tp, args.dp, args.ep) != (TP_SIZE, DP_SIZE, EP_SIZE):
-        parser.error("--tp/--dp/--ep must match the import-time configuration")
+    if (args.lm_head_tp, args.dp, args.ep) != (LM_HEAD_TP_SIZE, DP_SIZE, EP_SIZE):
+        parser.error("--lm-head-tp/--dp/--ep must match the import-time configuration")
     result = run_markov_case(
         platform=args.platform,
         device_id=args.device,

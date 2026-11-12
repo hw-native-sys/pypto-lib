@@ -15,7 +15,7 @@ import pypto.language as pl
 
 from quant import pack_quantized_cache, unpack_quantized_cache
 
-from config import FLASH as M, T_DYN, LOCAL_T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_BYTES
+from config import FLASH as M, T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_BYTES
 from sparse_attention import swa_attention_partial
 from o_proj import o_proj_hc_post
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
@@ -42,8 +42,8 @@ MX_GROUP = M.weight_block_size[0]
 
 @pl.jit.inline(auto_scope=False)
 def decode_swa(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -66,8 +66,8 @@ def decode_swa(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8],
-    attention_hidden: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    attention_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    attention_hidden: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    attention_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Run one SWA attention sublayer and emit the staggered mix for the next sublayer."""
@@ -116,8 +116,8 @@ def decode_swa(
 
 @pl.jit
 def l2_decode_swa(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -140,8 +140,8 @@ def l2_decode_swa(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    attention_hidden: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    attention_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Dispatch one production SWA composition to a device-selected JIT entry."""
@@ -163,8 +163,8 @@ def l2_decode_swa(
 
 @pl.jit.host
 def l3_decode_swa(
-    x_hc: pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32],
-    incoming_pre_mix: pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    incoming_pre_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -187,11 +187,11 @@ def l3_decode_swa(
     window_slots: pl.Tensor[[T_DYN], pl.INT64],
     window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
     window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, WINDOW_CACHE_BYTES], pl.UINT8]],
-    attention_hidden: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT, D], pl.FP32]],
-    attention_pre_mix: pl.Out[pl.Tensor[[LOCAL_T_DYN, HC_MULT], pl.FP32]],
+    attention_hidden: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    attention_pre_mix: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_hc.bind_dynamic(0, LOCAL_T_DYN)
+    x_hc.bind_dynamic(0, T_DYN)
     rope_cos.bind_dynamic(0, T_DYN)
     window_cache.bind_dynamic(0, ORI_BLOCKS_DYN)
     # MX_B_NN weight-scale views.
@@ -220,13 +220,13 @@ def build_swa_specs(args):
     from golden import ScalarSpec, TensorSpec
     import torch
     from functools import partial
-    from config import MAX_BATCH_PER_DP
+    from config import DECODE_BATCH
     from utils import packed_query_lengths
     from sparse_attention import SWA_INPUT_NAMES, make_swa_inputs, make_packed_swa_inputs
 
     if getattr(args, "dp", 1) != 1:
         raise ValueError("decode SWA specs describe one device")
-    packed = getattr(args, "start_pos", None) is not None or args.tokens > MAX_BATCH_PER_DP
+    packed = getattr(args, "start_pos", None) is not None or args.tokens > DECODE_BATCH
     packed = packed or args.requests != args.tokens or args.case in ("prefix", "shuffle")
     if packed:
         query_lens = getattr(args, "query_lens", None)
@@ -269,6 +269,10 @@ def build_swa_specs(args):
                 values["window_cache"].view(torch.uint8).zero_()
             elif args.case == "sink":
                 values["attn_sink"].fill_(1000)
+    capacity = getattr(args, "capacity", args.tokens)
+    if capacity < args.tokens:
+        raise ValueError("capacity must cover the scheduled tokens")
+    row_metadata = {"rope_cos", "rope_sin", "window_slots", "window_indices"}
     specs = []
     for name, shape, dtype in zip(SWA_INPUT_NAMES, leaf_shapes, dtypes):
         if name in ("x", "window_cache_scale"):
@@ -279,12 +283,18 @@ def build_swa_specs(args):
             initialize = None if cache is None else partial(torch.clone, cache)
         else:
             initialize = None if values is None else partial(torch.clone, values[name])
+        if name in row_metadata and capacity != args.tokens:
+            shape = [capacity, *shape[1:]]
+            if values is not None:
+                fill = -1 if name in ("window_slots", "window_indices") else 0
+                padded = torch.full(shape, fill, dtype=dtype)
+                padded[:args.tokens] = values[name]
+                initialize = partial(torch.clone, padded)
         specs.append(TensorSpec(name, shape, dtype, init_value=initialize))
-    local = getattr(args, "local_tokens", args.tokens)
     generator = torch.Generator().manual_seed(args.seed + 1000)
     shapes = {
-        "x_hc": [local, HC_MULT, D],
-        "incoming_pre_mix": [local, HC_MULT],
+        "x_hc": [capacity, HC_MULT, D],
+        "incoming_pre_mix": [capacity, HC_MULT],
         "hc_attn_fn": [MIX_HC, HC_DIM],
         "hc_attn_scale": [3],
         "hc_attn_base": [MIX_HC],
@@ -306,19 +316,18 @@ def build_swa_specs(args):
             stacked = value
         specs.append(TensorSpec(name, shape, value.dtype, init_value=stacked))
     for name, shape, dtype in (
-        ("attention_hidden", [local, HC_MULT, D], torch.float32),
-        ("attention_pre_mix", [local, HC_MULT], torch.float32),
+        ("attention_hidden", [capacity, HC_MULT, D], torch.float32),
+        ("attention_pre_mix", [capacity, HC_MULT], torch.float32),
     ):
         specs.append(TensorSpec(name, shape, dtype, init_value=0.0))
     specs.append(TensorSpec("gathered", [args.tokens, D], torch.bfloat16, init_value=13.0))
     specs.append(ScalarSpec("num_tokens", torch.int32, args.active_tokens))
-    specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None))
     by_name = {spec.name: spec for spec in specs}
     return [by_name[name] for name in l3_decode_swa.param_names]
 
 
 def golden_swa(tensors, *, reference=None):
-    """Compose TP1 HC, normalization, QKV, attention and output references."""
+    """Compose HC, normalization, QKV, attention and output references."""
     import torch
     from sparse_attention import SWA_INPUT_NAMES, swa_official_reference
     from hc import golden_hc_collapse, golden_hc_mixes, golden_hc_post
@@ -338,6 +347,8 @@ def golden_swa(tensors, *, reference=None):
     normalized = golden_rms_norm(collapsed[:active], tensors["attn_norm_weight"])
     if reference is None:
         inputs = {name: normalized if name == "x" else fields[name] for name in SWA_INPUT_NAMES}
+        for name in ("rope_cos", "rope_sin", "window_slots", "window_indices"):
+            inputs[name] = inputs[name][:active]
         cache_rows = tensors["window_cache"].shape[0] * 128
         shared_cache = tensors["attn_sink"].numel() != 64 and active >= 32 and cache_rows <= active * 128
         partial, cache, scale = swa_official_reference(inputs, shared_cache=shared_cache)
@@ -372,13 +383,13 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
     from golden import run
 
-    parser = argparse.ArgumentParser(description="DeepSeek V4.1 TP1 SWA decode composition")
+    parser = argparse.ArgumentParser(description="DeepSeek V4.1 SWA decode composition")
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     startpos_help = "one starting position per request; omitted: default validation workload"
     parser.add_argument("--start-pos", "--startpos", dest="startpos", type=parse_decode_startpos, help=startpos_help)
-    query_help = "one query length per start-pos; omitted: config.DECODE_ROWS_PER_REQUEST each"
+    query_help = "one query length per start-pos; omitted: config.DECODE_SEQ each"
     parser.add_argument("--query-lens", type=parse_decode_query_lens, help=query_help)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--case", choices=("mixed", "shuffle", "prefix"), default="mixed")
