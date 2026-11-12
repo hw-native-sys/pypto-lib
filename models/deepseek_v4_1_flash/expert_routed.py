@@ -614,11 +614,17 @@ def _routed_w2(
     ...
 
 
-# W2 uses aligned expert-strided staging for compact MX_A_ZZ activations.
-W2_M_TILE = gcd(RECV_MAX, 80)
+# Routed W2 projection and ND-to-ZZ activation scale conversion.
+W2_M_TILE = gcd(RECV_MAX, 160)
+W2_HALF_M_TILE = W2_M_TILE // 2
 W2_N_TILE = MX_W2_D_OUT_TILE
-W2_K_TILE = 128
+W2_K_TILE = 256
+W2_SCALE_K_TILE = W2_K_TILE // MX_GROUP
 W2_K_STAGE = 2
+W2_SCALE_ROW_TILE = 32
+W2_SCALE_WORD_TILE = W2_SCALE_ROW_TILE // 2
+W2_SCALE_INDEX_TILE = W2_HALF_M_TILE * (W2_SCALE_K_TILE // 2)
+W2_SCALE_TMP_TILE = ((64 + (W2_HALF_M_TILE // 16) * W2_SCALE_K_TILE + 31) // 32) * 32
 
 
 @pl.jit.inline(auto_scope=False)
@@ -637,42 +643,10 @@ def routed_w2_pypto(
     """Project compact MXFP8 activations with expert-specific MXFP4 weights.
 
     Payload and output capacity are at least experts * stride rows.
-    Scale staging stores full 16-row blocks; only active rows are consumed.
+    Activation scales contain compact row-major E8M0 codes.
     """
-    aligned_scale = pl.create_tensor([1, experts * stride * H_SCALE], dtype=pl.FP8E8M0)
-    with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="routed_w2_align", deps=[input_ready]) as aligned_ready:
-        core = pl.tile.get_block_idx()
-        compact = 0
-        for expert in pl.range(experts):
-            count = pl.cast(pl.read(counts, [expert, 0]), pl.INDEX)
-            for row in pl.range(core * 16, count, ROUTED_VECTOR_WORKER_TILE * 16):
-                valid = pl.min(16, count - row)
-                source = compact + row
-                scale_loaded = pl.load(scales, [0, source * H_SCALE], [1, 16 * H_SCALE], valid_shape=[1, valid * H_SCALE], target_memory=pl.MemorySpace.Vec)
-                scale_source = pl.reinterpret_view(scale_loaded, pl.UINT8)
-                packed_padded = pl.fillpad(scale_source, pad_value=0)
-                packed_words = pl.reinterpret_view(packed_padded, pl.INT16)
-                packed_flat = pl.reshape(packed_words, [16 * H_SCALE // 2])
-                packed_out = pl.create_tile([16 * H_SCALE // 2], dtype=pl.INT16, target_memory=pl.MemorySpace.Vec)
-                with pl.reg_scope():
-                    scale_index = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT16)
-                    scale_pair = pl.reg.shift_right(scale_index, pl.reg.broadcast(4, lanes=64, dtype=pl.UINT16))
-                    source_row = pl.reg.bitwise_and(scale_index, pl.reg.broadcast(15, lanes=64, dtype=pl.UINT16))
-                    row_start = pl.reg.mul(source_row, pl.reg.broadcast(H_SCALE // 2, lanes=64, dtype=pl.UINT16))
-                    offsets_base = pl.reg.add(row_start, scale_pair)
-                    for chunk in pl.hardware_loop(16 * H_SCALE // 128):
-                        group_offset = pl.cast(chunk * 4, pl.UINT16)
-                        offsets = pl.reg.adds(offsets_base, group_offset, pl.reg.full_mask(lanes=64))
-                        values = pl.reg.gather(packed_flat, offsets, pl.reg.full_mask(lanes=64))
-                        packed_alias = pl.reg.store(packed_out, chunk * 64, values)
-                packed_tile = pl.reshape(packed_out, [1, 16 * H_SCALE // 2])
-                packed_scale = pl.reinterpret_view(pl.reinterpret_view(packed_tile, pl.UINT8), pl.FP8E8M0)
-                aligned_scale = pl.store(packed_scale, [0, (expert * stride + row) * H_SCALE], aligned_scale)
-            compact = compact + count
-
-    x_scale_zz = pl.tensor.view(aligned_scale, [experts * stride, H_SCALE], layout=pl.MX_A_ZZ)
     weight_flat = pl.tensor.view(weight, [experts * MX_W2_PACKED_ROWS, MX_PACKED_LANE_COLS], layout=pl.ND)
-    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w2_pypto", deps=[aligned_ready]) as ready:
+    with pl.spmd(ROUTED_CUBE_WORKER_TILE, name_hint="routed_w2_pypto", deps=[input_ready]) as ready:
         core = pl.tile.get_block_idx()
         compact = 0
         work_base = 0
@@ -682,32 +656,68 @@ def routed_w2_pypto(
             for row_tile in pl.range(row_tiles):
                 row = row_tile * W2_M_TILE
                 valid = pl.min(W2_M_TILE, count - row)
-                x_row = expert * stride + row
                 for block in pl.range(D // W2_N_TILE):
                     if (work_base + row_tile * (D // W2_N_TILE) + block) % ROUTED_CUBE_WORKER_TILE == core:
                         col = block * W2_N_TILE
                         panel = expert * MX_W2_PACKED_ROWS + block * MOE_INTER
-                        lut = pl.load(fp4_lut, [0, 0], [1, FP4_LUT_SIZE])
                         a = pl.load(payload, [compact + row, 0], [W2_M_TILE, W2_K_TILE])
-                        a_scale = pl.load(x_scale_zz, [x_row, 0], [W2_M_TILE, W2_K_TILE // MX_GROUP])
-                        packed = pl.load(weight_flat, [panel, 0], [W2_K_TILE, MX_PACKED_LANE_COLS])
-                        index = pl.cast(pl.cast(packed, pl.FP16), pl.INT16)
-                        scratch = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
-                        codes = pl.tile.gather(lut, index, scratch)
-                        b = pl.reinterpret_view(pl.reinterpret_view(codes, pl.INT8), pl.FP8E4M3FN)
+                        for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                            scale_nd = pl.tensor.view(scales, [experts * stride, H_SCALE], layout=pl.ND)
+                            scale_row = compact + row + lane * (W2_M_TILE // 2)
+                            scale_chunk = pl.load(scale_nd, [scale_row, 0], [W2_HALF_M_TILE, W2_SCALE_ROW_TILE], valid_shape=[W2_HALF_M_TILE, W2_SCALE_K_TILE])
+                            # Compact valid scale pairs from the padded ND rows.
+                            scale_codes = pl.reinterpret_view(scale_chunk, pl.UINT8)
+                            scale_words = pl.reinterpret_view(scale_codes, pl.INT16)
+                            scale_padded = pl.fillpad_expand(scale_words, [W2_HALF_M_TILE, W2_SCALE_WORD_TILE], pad_value=0)
+                            scale_source = pl.reshape(scale_padded, [1, W2_HALF_M_TILE * W2_SCALE_WORD_TILE])
+                            scale_index = pl.tile.ci(0, [1, W2_SCALE_INDEX_TILE], dtype=pl.INT16)
+                            scale_lane = pl.tile.ands(scale_index, W2_SCALE_K_TILE // 2 - 1)
+                            scale_index_rows = pl.mul(scale_index, 32 // W2_SCALE_K_TILE)
+                            scale_index_cols = pl.mul(scale_lane, 32 // W2_SCALE_K_TILE - 1)
+                            scale_indices = pl.sub(scale_index_rows, scale_index_cols)
+                            scale_scratch = pl.tile.create([1, 32], dtype=pl.INT16)
+                            scale_compact = pl.tile.gather(scale_source, scale_indices, scale_scratch)
+                            scale_codes_flat = pl.reinterpret_view(scale_compact, pl.UINT8)
+                            scale_tmp = pl.tile.create([1, W2_SCALE_TMP_TILE], dtype=pl.UINT8)
+                            scale_zz = pl.tmov_x2zz(scale_codes_flat, scale_tmp, group_axis=1, dst_rows=W2_HALF_M_TILE, dst_cols=W2_SCALE_K_TILE)
+                            scale_fp8 = pl.reinterpret_view(scale_zz, pl.FP8E8M0)
+                            a_scale = pl.aic_gather(scale_fp8)
+                            lut = pl.load(fp4_lut, [0, 0], [1, FP4_LUT_SIZE])
+                            weight_row = panel + lane * (W2_K_TILE // 2)
+                            packed = pl.load(weight_flat, [weight_row, 0], [W2_K_TILE // 2, MX_PACKED_LANE_COLS])
+                            index = pl.cast(pl.cast(packed, pl.FP16), pl.INT16)
+                            scratch = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
+                            codes = pl.tile.gather(lut, index, scratch)
+                            b_half = pl.reinterpret_view(pl.reinterpret_view(codes, pl.INT8), pl.FP8E4M3FN)
+                            b = pl.aic_gather(b_half)
                         b_scale = pl.load(weight_scale, [expert * H_SCALE, col], [W2_K_TILE // MX_GROUP, W2_N_TILE])
                         acc = pl.matmul_mx(a, a_scale, b, b_scale)
                         for k in pl.pipeline(W2_K_TILE, MOE_INTER, W2_K_TILE, stage=W2_K_STAGE):
                             a = pl.load(payload, [compact + row, k], [W2_M_TILE, W2_K_TILE])
-                            a_scale = pl.load(x_scale_zz, [x_row, k // MX_GROUP], [W2_M_TILE, W2_K_TILE // MX_GROUP])
-                            packed = pl.load(weight_flat, [panel + k, 0], [W2_K_TILE, MX_PACKED_LANE_COLS])
-                            index = pl.cast(pl.cast(packed, pl.FP16), pl.INT16)
-                            scratch = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
-                            codes = pl.tile.gather(lut, index, scratch)
-                            b = pl.reinterpret_view(pl.reinterpret_view(codes, pl.INT8), pl.FP8E4M3FN)
+                            for lane in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                                scale_chunk = pl.load(scale_nd, [scale_row, k // MX_GROUP], [W2_HALF_M_TILE, W2_SCALE_ROW_TILE], valid_shape=[W2_HALF_M_TILE, W2_SCALE_K_TILE])
+                                scale_codes = pl.reinterpret_view(scale_chunk, pl.UINT8)
+                                scale_words = pl.reinterpret_view(scale_codes, pl.INT16)
+                                scale_padded = pl.fillpad_expand(scale_words, [W2_HALF_M_TILE, W2_SCALE_WORD_TILE], pad_value=0)
+                                scale_source = pl.reshape(scale_padded, [1, W2_HALF_M_TILE * W2_SCALE_WORD_TILE])
+                                scale_scratch = pl.tile.create([1, 32], dtype=pl.INT16)
+                                scale_compact = pl.tile.gather(scale_source, scale_indices, scale_scratch)
+                                scale_codes_flat = pl.reinterpret_view(scale_compact, pl.UINT8)
+                                scale_tmp = pl.tile.create([1, W2_SCALE_TMP_TILE], dtype=pl.UINT8)
+                                scale_zz = pl.tmov_x2zz(scale_codes_flat, scale_tmp, group_axis=1, dst_rows=W2_HALF_M_TILE, dst_cols=W2_SCALE_K_TILE)
+                                scale_fp8 = pl.reinterpret_view(scale_zz, pl.FP8E8M0)
+                                a_scale = pl.aic_gather(scale_fp8)
+                                weight_row = panel + k + lane * (W2_K_TILE // 2)
+                                packed = pl.load(weight_flat, [weight_row, 0], [W2_K_TILE // 2, MX_PACKED_LANE_COLS])
+                                index = pl.cast(pl.cast(packed, pl.FP16), pl.INT16)
+                                scratch = pl.tile.create([1, MX_PACKED_LANE_COLS], dtype=pl.INT16)
+                                codes = pl.tile.gather(lut, index, scratch)
+                                b_half = pl.reinterpret_view(pl.reinterpret_view(codes, pl.INT8), pl.FP8E4M3FN)
+                                b = pl.aic_gather(b_half)
                             b_scale = pl.load(weight_scale, [expert * H_SCALE + k // MX_GROUP, col], [W2_K_TILE // MX_GROUP, W2_N_TILE])
                             acc = pl.matmul_mx_acc(acc, a, a_scale, b, b_scale)
-                        output = pl.store(pl.set_validshape(acc, valid, W2_N_TILE), [compact + row, col], output)
+                        valid_acc = pl.tile.slice(acc, [W2_M_TILE, W2_N_TILE], [0, 0], valid_shape=[valid, W2_N_TILE])
+                        output = pl.store(valid_acc, [compact + row, col], output)
             work_base = work_base + row_tiles * (D // W2_N_TILE)
             compact = compact + count
     return output, ready
