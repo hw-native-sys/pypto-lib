@@ -240,15 +240,23 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", choices=("a2a3", "a5"), default="a2a3")
+    parser.add_argument("--sim", action="store_true")
     parser.add_argument("--ep", type=int, choices=(2, 4, 8, 16), default=2)
     parser.add_argument("--logical-experts", type=int, default=256)
     parser.add_argument("--redundant-experts", type=int, default=16)
-    parser.add_argument("-d", "--devices", required=True)
+    parser.add_argument("-d", "--devices", default=None)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
-    devices = [int(device) for device in args.devices.split(",")]
+    if args.devices is None and not args.sim:
+        parser.error("--devices is required for device execution")
+    try:
+        devices = list(range(args.ep)) if args.devices is None else [int(d) for d in args.devices.split(",")]
+    except ValueError:
+        parser.error("--devices must be a comma-separated integer list")
     if len(devices) != args.ep:
         parser.error("Device count must match EP")
+    if any(device < 0 for device in devices) or len(set(devices)) != len(devices):
+        parser.error("Device IDs must be distinct and non-negative")
     fn = make_routing_test(logical_experts=args.logical_experts, ranks=args.ep)
     result = run(
         fn=fn,
@@ -256,7 +264,7 @@ if __name__ == "__main__":
                                  redundant_experts=args.redundant_experts),
         golden_fn=golden_routing,
         compile_only=args.compile_only,
-        config=dict(backend_type=args.platform, execution_mode=False,
+        config=dict(backend_type=args.platform, execution_mode=args.sim,
                     distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0)),
         rtol=0,
         atol=0,
