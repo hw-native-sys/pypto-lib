@@ -65,9 +65,9 @@ KV_M_TILE = MATMUL_T_TILE  # kv_proj token (M) tile; decode pads from 8 real row
 KV_DENSE_M_TILE = 64
 KV_N_TILE = 256  # kv_proj HEAD_DIM (N) per matmul
 KV_K_TILE = 256  # kv_proj D (K) reduction tile   | divides KV_SPLIT_K_TILE
-KV_OK = 2  # kv_proj split-K factor         | two partials per zero-seeded FP32 output
+KV_OK = 4  # kv_proj split-K factor         | D//KV_OK cores share each N-group
 KV_OM = 3  # maximum kv_proj split-M factor
-KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=2048)
+KV_SPLIT_K_TILE = D // KV_OK  # kv_proj K per split (=1024)
 QPROJ_M_TILE = 128  # dense qproj token tile
 # qproj_matmul runs on persistent workers, one per physical AIC.
 QPROJ_WORKERS = 20
