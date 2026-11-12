@@ -475,14 +475,15 @@ the actual reconstructed input, with no fixed short-prompt fallback.
 
 The report records chunk/tile sizes, the exact-prefetch mode, two slots, and
 the retained eight projection replicas. Code generation, native compilation,
-and host binding checks alone do not establish device equivalence. The checks
-below apply to the shared-storage artifact before the private-operator relocation;
-the relocated artifact requires its own device rerun. A reconstructed
+and host binding checks alone do not establish device equivalence. The relocated
+private operators passed a rebuilt four-board TP8 device replay. A reconstructed
 AgentX request of 16,384 tokens passed full-output and cache byte-digest checks
 against the frozen TP8 component baseline. On the same Worker, 64 subsequent
 single-query decode steps retained the original weight/cache allocations and
-matched a copied-cache control for sampled IDs, logits, hidden states and final
-cache contents. This qualifies the tested allocation handoff; longer contexts
+matched a copied-cache control for all sampled IDs and final logits, hidden
+states and cache contents. The timing loop omits per-step diagnostic readbacks;
+its host-stepped latency is not the original speculative serving TPOT.
+This qualifies the tested allocation handoff; longer contexts
 and complete serving sessions remain unvalidated. Histogram/EMA early prefetch, projection sharing across
 ranks, and tile-specific cache publication dependencies are not implemented.
 Their configuration must not be advertised as available or selected from
