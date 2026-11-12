@@ -474,6 +474,88 @@ def _hc_post(
     ...
 
 
+@pl.jit.inline(auto_scope=False)
+def hc_post_regscope_block(
+    sublayer: pl.Tensor,
+    residual_rows: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix_flat: pl.Tensor,
+    output_rows: pl.Tensor,
+    block: pl.Scalar[pl.INDEX],
+    stream_tile: pl.constexpr,
+):
+    """Mix a hidden-width tile using register accumulators."""
+    pair_block = block // (D // D_TILE)
+    t = pair_block // (HC_MULT // stream_tile)
+    out_base = (pair_block % (HC_MULT // stream_tile)) * stream_tile
+    d0 = (block % (D // D_TILE)) * D_TILE
+    row = t * HC_MULT
+    x_tile = pl.tile.load(sublayer, [t, d0], [1, D_TILE], target_memory=pl.Mem.Vec)
+    x_tile = pl.tile.reshape(x_tile, [D_TILE])
+    post = pl.tile.load(post_mix, [t, 0], [1, 8], valid_shape=[1, HC_MULT], target_memory=pl.Mem.Vec)
+    post = pl.tile.reshape(post, [8])
+    mix = pl.tile.load(residual_mix_flat, [t, 0], [1, HC_MULT * HC_MULT], target_memory=pl.Mem.Vec)
+    mix = pl.tile.reshape(mix, [HC_MULT * HC_MULT])
+    residual = pl.tile.load(residual_rows, [row, d0], [HC_MULT, D_TILE], target_memory=pl.Mem.Vec)
+    residual = pl.tile.reshape(residual, [HC_MULT * D_TILE])
+    output = pl.tile.create([stream_tile * D_TILE], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    with pl.reg_scope():
+        mask = pl.reg.full_mask(lanes=64)
+        for segment in pl.hardware_loop(D_TILE // 64):
+            offset = segment * 64
+            x = pl.reg.convert(pl.reg.load(x_tile, offset, lanes=64), dtype=pl.FP32)
+            r0 = pl.reg.load(residual, offset, lanes=64)
+            r1 = pl.reg.load(residual, D_TILE + offset, lanes=64)
+            r2 = pl.reg.load(residual, 2 * D_TILE + offset, lanes=64)
+            r3 = pl.reg.load(residual, 3 * D_TILE + offset, lanes=64)
+            for stream in pl.unroll(stream_tile):
+                h = out_base + stream
+                c0 = pl.reg.broadcast(pl.reg.load(post, h, lanes=1), lanes=64, dtype=pl.FP32)
+                c1 = pl.reg.broadcast(pl.reg.load(mix, h, lanes=1), lanes=64, dtype=pl.FP32)
+                c2 = pl.reg.broadcast(pl.reg.load(mix, HC_MULT + h, lanes=1), lanes=64, dtype=pl.FP32)
+                c3 = pl.reg.broadcast(pl.reg.load(mix, 2 * HC_MULT + h, lanes=1), lanes=64, dtype=pl.FP32)
+                c4 = pl.reg.broadcast(pl.reg.load(mix, 3 * HC_MULT + h, lanes=1), lanes=64, dtype=pl.FP32)
+                value = pl.reg.mul(x, c0, mask)
+                value = pl.reg.add(value, pl.reg.mul(r0, c1, mask), mask)
+                value = pl.reg.add(value, pl.reg.mul(r1, c2, mask), mask)
+                value = pl.reg.add(value, pl.reg.mul(r2, c3, mask), mask)
+                value = pl.reg.add(value, pl.reg.mul(r3, c4, mask), mask)
+                written = pl.reg.store(output, stream * D_TILE + offset, value)
+    output = pl.tile.reshape(output, [stream_tile, D_TILE])
+    pl.tile.store(output, [row + out_base, d0], output_rows)
+    return output_rows
+
+
+@pl.jit.inline
+def hc_post_regscope(
+    sublayer: pl.Tensor,
+    residual: pl.Tensor,
+    post_mix: pl.Tensor,
+    residual_mix: pl.Tensor,
+    output: pl.Tensor,
+    deps: pl.Array[2, pl.TASK_ID],
+):
+    """Mix HC streams with an opt-in A5 RegScope implementation."""
+    t_dim = pl.tensor.dim(sublayer, 0)
+    residual_rows = pl.reshape(residual, [t_dim * HC_MULT, D])
+    residual_mix_flat = pl.reshape(residual_mix, [t_dim, HC_MULT * HC_MULT])
+    output_rows = pl.reshape(output, [t_dim * HC_MULT, D])
+    total_work = t_dim * (D // D_TILE)
+    full_work = total_work // POST_WORKER_TILE * POST_WORKER_TILE
+    tail_work = (total_work - full_work) * HC_MULT
+    workers = pl.min(total_work * HC_MULT, POST_WORKER_TILE)
+    with pl.spmd(workers, name_hint="hc_post", deps=[deps]):
+        worker = pl.tile.get_block_idx()
+        for block in pl.pipeline(worker, full_work, POST_WORKER_TILE, stage=1):
+            hc_post_regscope_block(sublayer, residual_rows, post_mix, residual_mix_flat, output_rows, block, HC_MULT)
+        for tail in pl.range(worker, tail_work, POST_WORKER_TILE):
+            tail_chunk = full_work + tail // HC_MULT
+            tail_stream = (tail_chunk // (D // D_TILE)) * HC_MULT + tail % HC_MULT
+            tail_block = tail_stream * (D // D_TILE) + tail_chunk % (D // D_TILE)
+            hc_post_regscope_block(sublayer, residual_rows, post_mix, residual_mix_flat, output_rows, tail_block, 1)
+    return output
+
+
 @pl.jit.inline
 def hc_post(
     sublayer: pl.Tensor,
@@ -685,6 +767,25 @@ def l2_hc_post(
     return output
 
 
+@pl.jit
+def l2_hc_post_regscope(
+    sublayer: pl.Tensor[[T_DYN, D], pl.BF16],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
+    output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+):
+    """Validate the opt-in A5 RegScope HC post implementation."""
+    sublayer.bind_dynamic(0, T_DYN)
+    residual.bind_dynamic(0, T_DYN)
+    post_mix.bind_dynamic(0, T_DYN)
+    residual_mix.bind_dynamic(0, T_DYN)
+    output.bind_dynamic(0, T_DYN)
+    hc_post_deps = pl.array.create(2, pl.TASK_ID)
+    hc_post_regscope(sublayer, residual, post_mix, residual_mix, output, deps=hc_post_deps)
+    return output
+
+
 def build_l2_hc_post_specs(batch: int = 33, sequence: int = 1):
     """Build BF16-valued residual streams and nonsymmetric mixing coefficients."""
     from golden import TensorSpec
@@ -762,7 +863,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--batch", type=int, default=33)
     parser.add_argument("--sequence", type=int, default=1)
-    parser.add_argument("--op", choices=["pre", "post", "head", "all"], default="all")
+    parser.add_argument("--op", choices=["pre", "post", "post-regscope", "head", "all"], default="all")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     parser.add_argument("--golden-data")
@@ -776,6 +877,8 @@ if __name__ == "__main__":
         ("post", l2_hc_post, build_l2_hc_post_specs, golden_l2_hc_post),
         ("head", l2_hc_head, build_l2_hc_head_specs, golden_l2_hc_head),
     ]
+    if args.op == "post-regscope":
+        cases = [("post-regscope", l2_hc_post_regscope, build_l2_hc_post_specs, golden_l2_hc_post)]
     failures = []
     for name, fn, build_specs, golden_fn in cases:
         if args.op != "all" and args.op != name:
@@ -788,7 +891,7 @@ if __name__ == "__main__":
                 "residual_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             }
             compare_fn["output"] = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
-        elif name == "post":
+        elif name in ("post", "post-regscope"):
             compare_fn = {"output": ratio_allclose(atol=1e-6, rtol=1e-5)}
         else:
             compare_fn = {"output": ratio_allclose(atol=1e-4, rtol=1.0 / 128)}
