@@ -5,5 +5,6 @@
   "models/deepseek_v4_flash_lowlat/": ["a2a3"],
   "models/deepseek_v4_flash_mtp/": ["a2a3"],
   "models/glm5_3_flash/": ["a2a3"],
-  "models/qwen3_14b/": ["a2a3"]
+  "models/qwen3_14b/": ["a2a3"],
+  "models/qwen3_8_27b/": ["a2a3"]
 }
