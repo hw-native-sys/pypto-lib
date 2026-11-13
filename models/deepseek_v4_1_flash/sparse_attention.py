@@ -2128,73 +2128,47 @@ def sparse_vf_fused_vector(
                     ids_fca = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     ids_fcb = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fca_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                    # Gather contiguous rows in one DMA.
-                    fca_first = pl.tile.read(ids_fca, [0, 0])
-                    fca_contiguous = pl.cast(0, pl.INT32)
-                    if fca_first >= 0:
-                        fca_contiguous = pl.cast(1, pl.INT32)
-                        for fca_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                            fca_check_row = pl.tile.read(ids_fca, [0, fca_check_lane])
-                            if fca_check_row != fca_first + fca_check_lane:
-                                fca_contiguous = pl.cast(0, pl.INT32)
-                    if fca_contiguous != 0:
-                        fca_start = pl.cast(fca_first, pl.INDEX)
-                        fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [0, 0], [fca_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
-                    else:
-                        for fca_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                            fca_a = pl.tile.read(ids_fca, [0, fca_lane])
-                            fca_b = pl.tile.read(ids_fca, [0, fca_lane + 1])
-                            fca_lower = pl.min(fca_a, fca_b)
-                            fca_upper = pl.max(fca_a, fca_b)
-                            fca_pair = pl.cast(0, pl.INT32)
-                            if fca_lower >= 0:
-                                if fca_upper == fca_lower + 1:
-                                    fca_pair = pl.cast(1, pl.INT32)
-                            if fca_pair != 0:
-                                # Sort each pair of valid row indices.
-                                fca_physical = pl.cast(fca_lower, pl.INDEX)
-                                fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical, 0], [2, COMPRESSED_CACHE_BYTES])
-                            else:
-                                if fca_a >= 0:
-                                    fca_physical_a = pl.cast(fca_a, pl.INDEX)
-                                    fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
-                                if fca_b >= 0:
-                                    fca_physical_b = pl.cast(fca_b, pl.INDEX)
-                                    fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane + 1, 0], [fca_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                    for fca_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                        fca_a = pl.tile.read(ids_fca, [0, fca_lane])
+                        fca_b = pl.tile.read(ids_fca, [0, fca_lane + 1])
+                        fca_lower = pl.min(fca_a, fca_b)
+                        fca_upper = pl.max(fca_a, fca_b)
+                        fca_pair = pl.cast(0, pl.INT32)
+                        if fca_lower >= 0:
+                            if fca_upper == fca_lower + 1:
+                                fca_pair = pl.cast(1, pl.INT32)
+                        if fca_pair != 0:
+                            # Sort each pair of valid row indices.
+                            fca_physical = pl.cast(fca_lower, pl.INDEX)
+                            fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                        else:
+                            if fca_a >= 0:
+                                fca_physical_a = pl.cast(fca_a, pl.INDEX)
+                                fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                            if fca_b >= 0:
+                                fca_physical_b = pl.cast(fca_b, pl.INDEX)
+                                fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane + 1, 0], [fca_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
                     fcb_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                    # Gather contiguous rows in one DMA.
-                    fcb_first = pl.tile.read(ids_fcb, [0, 0])
-                    fcb_contiguous = pl.cast(0, pl.INT32)
-                    if fcb_first >= 0:
-                        fcb_contiguous = pl.cast(1, pl.INT32)
-                        for fcb_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                            fcb_check_row = pl.tile.read(ids_fcb, [0, fcb_check_lane])
-                            if fcb_check_row != fcb_first + fcb_check_lane:
-                                fcb_contiguous = pl.cast(0, pl.INT32)
-                    if fcb_contiguous != 0:
-                        fcb_start = pl.cast(fcb_first, pl.INDEX)
-                        fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [0, 0], [fcb_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
-                    else:
-                        for fcb_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                            fcb_a = pl.tile.read(ids_fcb, [0, fcb_lane])
-                            fcb_b = pl.tile.read(ids_fcb, [0, fcb_lane + 1])
-                            fcb_lower = pl.min(fcb_a, fcb_b)
-                            fcb_upper = pl.max(fcb_a, fcb_b)
-                            fcb_pair = pl.cast(0, pl.INT32)
-                            if fcb_lower >= 0:
-                                if fcb_upper == fcb_lower + 1:
-                                    fcb_pair = pl.cast(1, pl.INT32)
-                            if fcb_pair != 0:
-                                # Sort each pair of valid row indices.
-                                fcb_physical = pl.cast(fcb_lower, pl.INDEX)
-                                fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical, 0], [2, COMPRESSED_CACHE_BYTES])
-                            else:
-                                if fcb_a >= 0:
-                                    fcb_physical_a = pl.cast(fcb_a, pl.INDEX)
-                                    fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
-                                if fcb_b >= 0:
-                                    fcb_physical_b = pl.cast(fcb_b, pl.INDEX)
-                                    fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane + 1, 0], [fcb_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                    for fcb_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                        fcb_a = pl.tile.read(ids_fcb, [0, fcb_lane])
+                        fcb_b = pl.tile.read(ids_fcb, [0, fcb_lane + 1])
+                        fcb_lower = pl.min(fcb_a, fcb_b)
+                        fcb_upper = pl.max(fcb_a, fcb_b)
+                        fcb_pair = pl.cast(0, pl.INT32)
+                        if fcb_lower >= 0:
+                            if fcb_upper == fcb_lower + 1:
+                                fcb_pair = pl.cast(1, pl.INT32)
+                        if fcb_pair != 0:
+                            # Sort each pair of valid row indices.
+                            fcb_physical = pl.cast(fcb_lower, pl.INDEX)
+                            fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                        else:
+                            if fcb_a >= 0:
+                                fcb_physical_a = pl.cast(fcb_a, pl.INDEX)
+                                fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                            if fcb_b >= 0:
+                                fcb_physical_b = pl.cast(fcb_b, pl.INDEX)
+                                fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane + 1, 0], [fcb_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
                     for fca_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                         fca_cast_row0 = fca_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                         fca_raw_chunk = pl.tile.slice(fca_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fca_cast_row0, 0])
@@ -2215,39 +2189,26 @@ def sparse_vf_fused_vector(
                         kv_half = pl.tile.assemble(kv_half, fca_result, [0 + fca_cast_row0, 0])
                     ids_fcc = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fcc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                    # Gather contiguous rows in one DMA.
-                    fcc_first = pl.tile.read(ids_fcc, [0, 0])
-                    fcc_contiguous = pl.cast(0, pl.INT32)
-                    if fcc_first >= 0:
-                        fcc_contiguous = pl.cast(1, pl.INT32)
-                        for fcc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                            fcc_check_row = pl.tile.read(ids_fcc, [0, fcc_check_lane])
-                            if fcc_check_row != fcc_first + fcc_check_lane:
-                                fcc_contiguous = pl.cast(0, pl.INT32)
-                    if fcc_contiguous != 0:
-                        fcc_start = pl.cast(fcc_first, pl.INDEX)
-                        fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [0, 0], [fcc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
-                    else:
-                        for fcc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                            fcc_a = pl.tile.read(ids_fcc, [0, fcc_lane])
-                            fcc_b = pl.tile.read(ids_fcc, [0, fcc_lane + 1])
-                            fcc_lower = pl.min(fcc_a, fcc_b)
-                            fcc_upper = pl.max(fcc_a, fcc_b)
-                            fcc_pair = pl.cast(0, pl.INT32)
-                            if fcc_lower >= 0:
-                                if fcc_upper == fcc_lower + 1:
-                                    fcc_pair = pl.cast(1, pl.INT32)
-                            if fcc_pair != 0:
-                                # Sort each pair of valid row indices.
-                                fcc_physical = pl.cast(fcc_lower, pl.INDEX)
-                                fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical, 0], [2, COMPRESSED_CACHE_BYTES])
-                            else:
-                                if fcc_a >= 0:
-                                    fcc_physical_a = pl.cast(fcc_a, pl.INDEX)
-                                    fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
-                                if fcc_b >= 0:
-                                    fcc_physical_b = pl.cast(fcc_b, pl.INDEX)
-                                    fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane + 1, 0], [fcc_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                    for fcc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                        fcc_a = pl.tile.read(ids_fcc, [0, fcc_lane])
+                        fcc_b = pl.tile.read(ids_fcc, [0, fcc_lane + 1])
+                        fcc_lower = pl.min(fcc_a, fcc_b)
+                        fcc_upper = pl.max(fcc_a, fcc_b)
+                        fcc_pair = pl.cast(0, pl.INT32)
+                        if fcc_lower >= 0:
+                            if fcc_upper == fcc_lower + 1:
+                                fcc_pair = pl.cast(1, pl.INT32)
+                        if fcc_pair != 0:
+                            # Sort each pair of valid row indices.
+                            fcc_physical = pl.cast(fcc_lower, pl.INDEX)
+                            fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                        else:
+                            if fcc_a >= 0:
+                                fcc_physical_a = pl.cast(fcc_a, pl.INDEX)
+                                fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                            if fcc_b >= 0:
+                                fcc_physical_b = pl.cast(fcc_b, pl.INDEX)
+                                fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane + 1, 0], [fcc_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
                     for fcb_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                         fcb_cast_row0 = fcb_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                         fcb_raw_chunk = pl.tile.slice(fcb_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcb_cast_row0, 0])
@@ -2268,39 +2229,26 @@ def sparse_vf_fused_vector(
                         kv_half = pl.tile.assemble(kv_half, fcb_result, [16 + fcb_cast_row0, 0])
                     ids_fcd = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
                     fcd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                    # Gather contiguous rows in one DMA.
-                    fcd_first = pl.tile.read(ids_fcd, [0, 0])
-                    fcd_contiguous = pl.cast(0, pl.INT32)
-                    if fcd_first >= 0:
-                        fcd_contiguous = pl.cast(1, pl.INT32)
-                        for fcd_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                            fcd_check_row = pl.tile.read(ids_fcd, [0, fcd_check_lane])
-                            if fcd_check_row != fcd_first + fcd_check_lane:
-                                fcd_contiguous = pl.cast(0, pl.INT32)
-                    if fcd_contiguous != 0:
-                        fcd_start = pl.cast(fcd_first, pl.INDEX)
-                        fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [0, 0], [fcd_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
-                    else:
-                        for fcd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                            fcd_a = pl.tile.read(ids_fcd, [0, fcd_lane])
-                            fcd_b = pl.tile.read(ids_fcd, [0, fcd_lane + 1])
-                            fcd_lower = pl.min(fcd_a, fcd_b)
-                            fcd_upper = pl.max(fcd_a, fcd_b)
-                            fcd_pair = pl.cast(0, pl.INT32)
-                            if fcd_lower >= 0:
-                                if fcd_upper == fcd_lower + 1:
-                                    fcd_pair = pl.cast(1, pl.INT32)
-                            if fcd_pair != 0:
-                                # Sort each pair of valid row indices.
-                                fcd_physical = pl.cast(fcd_lower, pl.INDEX)
-                                fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical, 0], [2, COMPRESSED_CACHE_BYTES])
-                            else:
-                                if fcd_a >= 0:
-                                    fcd_physical_a = pl.cast(fcd_a, pl.INDEX)
-                                    fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
-                                if fcd_b >= 0:
-                                    fcd_physical_b = pl.cast(fcd_b, pl.INDEX)
-                                    fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane + 1, 0], [fcd_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                    for fcd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                        fcd_a = pl.tile.read(ids_fcd, [0, fcd_lane])
+                        fcd_b = pl.tile.read(ids_fcd, [0, fcd_lane + 1])
+                        fcd_lower = pl.min(fcd_a, fcd_b)
+                        fcd_upper = pl.max(fcd_a, fcd_b)
+                        fcd_pair = pl.cast(0, pl.INT32)
+                        if fcd_lower >= 0:
+                            if fcd_upper == fcd_lower + 1:
+                                fcd_pair = pl.cast(1, pl.INT32)
+                        if fcd_pair != 0:
+                            # Sort each pair of valid row indices.
+                            fcd_physical = pl.cast(fcd_lower, pl.INDEX)
+                            fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                        else:
+                            if fcd_a >= 0:
+                                fcd_physical_a = pl.cast(fcd_a, pl.INDEX)
+                                fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                            if fcd_b >= 0:
+                                fcd_physical_b = pl.cast(fcd_b, pl.INDEX)
+                                fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane + 1, 0], [fcd_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
                     for fcc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                         fcc_cast_row0 = fcc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                         fcc_raw_chunk = pl.tile.slice(fcc_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcc_cast_row0, 0])
@@ -2830,73 +2778,47 @@ def sparse_vf_fused_vector(
                         ids_fca = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 0], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         ids_fcb = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 16], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fca_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                        # Gather contiguous rows in one DMA.
-                        fca_first = pl.tile.read(ids_fca, [0, 0])
-                        fca_contiguous = pl.cast(0, pl.INT32)
-                        if fca_first >= 0:
-                            fca_contiguous = pl.cast(1, pl.INT32)
-                            for fca_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                                fca_check_row = pl.tile.read(ids_fca, [0, fca_check_lane])
-                                if fca_check_row != fca_first + fca_check_lane:
-                                    fca_contiguous = pl.cast(0, pl.INT32)
-                        if fca_contiguous != 0:
-                            fca_start = pl.cast(fca_first, pl.INDEX)
-                            fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [0, 0], [fca_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
-                        else:
-                            for fca_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                                fca_a = pl.tile.read(ids_fca, [0, fca_lane])
-                                fca_b = pl.tile.read(ids_fca, [0, fca_lane + 1])
-                                fca_lower = pl.min(fca_a, fca_b)
-                                fca_upper = pl.max(fca_a, fca_b)
-                                fca_pair = pl.cast(0, pl.INT32)
-                                if fca_lower >= 0:
-                                    if fca_upper == fca_lower + 1:
-                                        fca_pair = pl.cast(1, pl.INT32)
-                                if fca_pair != 0:
-                                    # Sort each pair of valid row indices.
-                                    fca_physical = pl.cast(fca_lower, pl.INDEX)
-                                    fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical, 0], [2, COMPRESSED_CACHE_BYTES])
-                                else:
-                                    if fca_a >= 0:
-                                        fca_physical_a = pl.cast(fca_a, pl.INDEX)
-                                        fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
-                                    if fca_b >= 0:
-                                        fca_physical_b = pl.cast(fca_b, pl.INDEX)
-                                        fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane + 1, 0], [fca_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                        for fca_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fca_a = pl.tile.read(ids_fca, [0, fca_lane])
+                            fca_b = pl.tile.read(ids_fca, [0, fca_lane + 1])
+                            fca_lower = pl.min(fca_a, fca_b)
+                            fca_upper = pl.max(fca_a, fca_b)
+                            fca_pair = pl.cast(0, pl.INT32)
+                            if fca_lower >= 0:
+                                if fca_upper == fca_lower + 1:
+                                    fca_pair = pl.cast(1, pl.INT32)
+                            if fca_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fca_physical = pl.cast(fca_lower, pl.INDEX)
+                                fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                            else:
+                                if fca_a >= 0:
+                                    fca_physical_a = pl.cast(fca_a, pl.INDEX)
+                                    fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane, 0], [fca_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                if fca_b >= 0:
+                                    fca_physical_b = pl.cast(fca_b, pl.INDEX)
+                                    fca_raw = pl.tile.gather_row(fca_raw, compressed_flat, [fca_lane + 1, 0], [fca_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
                         fcb_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                        # Gather contiguous rows in one DMA.
-                        fcb_first = pl.tile.read(ids_fcb, [0, 0])
-                        fcb_contiguous = pl.cast(0, pl.INT32)
-                        if fcb_first >= 0:
-                            fcb_contiguous = pl.cast(1, pl.INT32)
-                            for fcb_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                                fcb_check_row = pl.tile.read(ids_fcb, [0, fcb_check_lane])
-                                if fcb_check_row != fcb_first + fcb_check_lane:
-                                    fcb_contiguous = pl.cast(0, pl.INT32)
-                        if fcb_contiguous != 0:
-                            fcb_start = pl.cast(fcb_first, pl.INDEX)
-                            fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [0, 0], [fcb_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
-                        else:
-                            for fcb_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                                fcb_a = pl.tile.read(ids_fcb, [0, fcb_lane])
-                                fcb_b = pl.tile.read(ids_fcb, [0, fcb_lane + 1])
-                                fcb_lower = pl.min(fcb_a, fcb_b)
-                                fcb_upper = pl.max(fcb_a, fcb_b)
-                                fcb_pair = pl.cast(0, pl.INT32)
-                                if fcb_lower >= 0:
-                                    if fcb_upper == fcb_lower + 1:
-                                        fcb_pair = pl.cast(1, pl.INT32)
-                                if fcb_pair != 0:
-                                    # Sort each pair of valid row indices.
-                                    fcb_physical = pl.cast(fcb_lower, pl.INDEX)
-                                    fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical, 0], [2, COMPRESSED_CACHE_BYTES])
-                                else:
-                                    if fcb_a >= 0:
-                                        fcb_physical_a = pl.cast(fcb_a, pl.INDEX)
-                                        fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
-                                    if fcb_b >= 0:
-                                        fcb_physical_b = pl.cast(fcb_b, pl.INDEX)
-                                        fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane + 1, 0], [fcb_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                        for fcb_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fcb_a = pl.tile.read(ids_fcb, [0, fcb_lane])
+                            fcb_b = pl.tile.read(ids_fcb, [0, fcb_lane + 1])
+                            fcb_lower = pl.min(fcb_a, fcb_b)
+                            fcb_upper = pl.max(fcb_a, fcb_b)
+                            fcb_pair = pl.cast(0, pl.INT32)
+                            if fcb_lower >= 0:
+                                if fcb_upper == fcb_lower + 1:
+                                    fcb_pair = pl.cast(1, pl.INT32)
+                            if fcb_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fcb_physical = pl.cast(fcb_lower, pl.INDEX)
+                                fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                            else:
+                                if fcb_a >= 0:
+                                    fcb_physical_a = pl.cast(fcb_a, pl.INDEX)
+                                    fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane, 0], [fcb_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                if fcb_b >= 0:
+                                    fcb_physical_b = pl.cast(fcb_b, pl.INDEX)
+                                    fcb_raw = pl.tile.gather_row(fcb_raw, compressed_flat, [fcb_lane + 1, 0], [fcb_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
                         for fca_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                             fca_cast_row0 = fca_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                             fca_raw_chunk = pl.tile.slice(fca_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fca_cast_row0, 0])
@@ -2917,39 +2839,26 @@ def sparse_vf_fused_vector(
                             kv_half = pl.tile.assemble(kv_half, fca_result, [0 + fca_cast_row0, 0])
                         ids_fcc = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 32], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fcc_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                        # Gather contiguous rows in one DMA.
-                        fcc_first = pl.tile.read(ids_fcc, [0, 0])
-                        fcc_contiguous = pl.cast(0, pl.INT32)
-                        if fcc_first >= 0:
-                            fcc_contiguous = pl.cast(1, pl.INT32)
-                            for fcc_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                                fcc_check_row = pl.tile.read(ids_fcc, [0, fcc_check_lane])
-                                if fcc_check_row != fcc_first + fcc_check_lane:
-                                    fcc_contiguous = pl.cast(0, pl.INT32)
-                        if fcc_contiguous != 0:
-                            fcc_start = pl.cast(fcc_first, pl.INDEX)
-                            fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [0, 0], [fcc_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
-                        else:
-                            for fcc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                                fcc_a = pl.tile.read(ids_fcc, [0, fcc_lane])
-                                fcc_b = pl.tile.read(ids_fcc, [0, fcc_lane + 1])
-                                fcc_lower = pl.min(fcc_a, fcc_b)
-                                fcc_upper = pl.max(fcc_a, fcc_b)
-                                fcc_pair = pl.cast(0, pl.INT32)
-                                if fcc_lower >= 0:
-                                    if fcc_upper == fcc_lower + 1:
-                                        fcc_pair = pl.cast(1, pl.INT32)
-                                if fcc_pair != 0:
-                                    # Sort each pair of valid row indices.
-                                    fcc_physical = pl.cast(fcc_lower, pl.INDEX)
-                                    fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical, 0], [2, COMPRESSED_CACHE_BYTES])
-                                else:
-                                    if fcc_a >= 0:
-                                        fcc_physical_a = pl.cast(fcc_a, pl.INDEX)
-                                        fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
-                                    if fcc_b >= 0:
-                                        fcc_physical_b = pl.cast(fcc_b, pl.INDEX)
-                                        fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane + 1, 0], [fcc_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                        for fcc_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fcc_a = pl.tile.read(ids_fcc, [0, fcc_lane])
+                            fcc_b = pl.tile.read(ids_fcc, [0, fcc_lane + 1])
+                            fcc_lower = pl.min(fcc_a, fcc_b)
+                            fcc_upper = pl.max(fcc_a, fcc_b)
+                            fcc_pair = pl.cast(0, pl.INT32)
+                            if fcc_lower >= 0:
+                                if fcc_upper == fcc_lower + 1:
+                                    fcc_pair = pl.cast(1, pl.INT32)
+                            if fcc_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fcc_physical = pl.cast(fcc_lower, pl.INDEX)
+                                fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                            else:
+                                if fcc_a >= 0:
+                                    fcc_physical_a = pl.cast(fcc_a, pl.INDEX)
+                                    fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane, 0], [fcc_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                if fcc_b >= 0:
+                                    fcc_physical_b = pl.cast(fcc_b, pl.INDEX)
+                                    fcc_raw = pl.tile.gather_row(fcc_raw, compressed_flat, [fcc_lane + 1, 0], [fcc_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
                         for fcb_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                             fcb_cast_row0 = fcb_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                             fcb_raw_chunk = pl.tile.slice(fcb_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcb_cast_row0, 0])
@@ -2970,39 +2879,26 @@ def sparse_vf_fused_vector(
                             kv_half = pl.tile.assemble(kv_half, fcb_result, [16 + fcb_cast_row0, 0])
                         ids_fcd = pl.tile.load(compressed_indices, [token, first_key_base - WINDOW_KEYS + 48], [1, SPARSE_VF_FUSED_GATHER_TILE])
                         fcd_raw = pl.tile.full([SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES], dtype=pl.UINT8, value=0)
-                        # Gather contiguous rows in one DMA.
-                        fcd_first = pl.tile.read(ids_fcd, [0, 0])
-                        fcd_contiguous = pl.cast(0, pl.INT32)
-                        if fcd_first >= 0:
-                            fcd_contiguous = pl.cast(1, pl.INT32)
-                            for fcd_check_lane in pl.range(1, SPARSE_VF_FUSED_GATHER_TILE):
-                                fcd_check_row = pl.tile.read(ids_fcd, [0, fcd_check_lane])
-                                if fcd_check_row != fcd_first + fcd_check_lane:
-                                    fcd_contiguous = pl.cast(0, pl.INT32)
-                        if fcd_contiguous != 0:
-                            fcd_start = pl.cast(fcd_first, pl.INDEX)
-                            fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [0, 0], [fcd_start, 0], [SPARSE_VF_FUSED_GATHER_TILE, COMPRESSED_CACHE_BYTES])
-                        else:
-                            for fcd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
-                                fcd_a = pl.tile.read(ids_fcd, [0, fcd_lane])
-                                fcd_b = pl.tile.read(ids_fcd, [0, fcd_lane + 1])
-                                fcd_lower = pl.min(fcd_a, fcd_b)
-                                fcd_upper = pl.max(fcd_a, fcd_b)
-                                fcd_pair = pl.cast(0, pl.INT32)
-                                if fcd_lower >= 0:
-                                    if fcd_upper == fcd_lower + 1:
-                                        fcd_pair = pl.cast(1, pl.INT32)
-                                if fcd_pair != 0:
-                                    # Sort each pair of valid row indices.
-                                    fcd_physical = pl.cast(fcd_lower, pl.INDEX)
-                                    fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical, 0], [2, COMPRESSED_CACHE_BYTES])
-                                else:
-                                    if fcd_a >= 0:
-                                        fcd_physical_a = pl.cast(fcd_a, pl.INDEX)
-                                        fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
-                                    if fcd_b >= 0:
-                                        fcd_physical_b = pl.cast(fcd_b, pl.INDEX)
-                                        fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane + 1, 0], [fcd_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
+                        for fcd_lane in pl.range(0, SPARSE_VF_FUSED_GATHER_TILE, 2):
+                            fcd_a = pl.tile.read(ids_fcd, [0, fcd_lane])
+                            fcd_b = pl.tile.read(ids_fcd, [0, fcd_lane + 1])
+                            fcd_lower = pl.min(fcd_a, fcd_b)
+                            fcd_upper = pl.max(fcd_a, fcd_b)
+                            fcd_pair = pl.cast(0, pl.INT32)
+                            if fcd_lower >= 0:
+                                if fcd_upper == fcd_lower + 1:
+                                    fcd_pair = pl.cast(1, pl.INT32)
+                            if fcd_pair != 0:
+                                # Sort each pair of valid row indices.
+                                fcd_physical = pl.cast(fcd_lower, pl.INDEX)
+                                fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical, 0], [2, COMPRESSED_CACHE_BYTES])
+                            else:
+                                if fcd_a >= 0:
+                                    fcd_physical_a = pl.cast(fcd_a, pl.INDEX)
+                                    fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane, 0], [fcd_physical_a, 0], [1, COMPRESSED_CACHE_BYTES])
+                                if fcd_b >= 0:
+                                    fcd_physical_b = pl.cast(fcd_b, pl.INDEX)
+                                    fcd_raw = pl.tile.gather_row(fcd_raw, compressed_flat, [fcd_lane + 1, 0], [fcd_physical_b, 0], [1, COMPRESSED_CACHE_BYTES])
                         for fcc_cast_chunk in pl.unroll(SPARSE_VF_FUSED_GATHER_TILE // SPARSE_VF_FUSED_SCALE_TILE):
                             fcc_cast_row0 = fcc_cast_chunk * SPARSE_VF_FUSED_SCALE_TILE
                             fcc_raw_chunk = pl.tile.slice(fcc_raw, [SPARSE_VF_FUSED_SCALE_TILE, COMPRESSED_CACHE_BYTES], [fcc_cast_row0, 0])
