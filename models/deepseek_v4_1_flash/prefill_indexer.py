@@ -806,6 +806,8 @@ def _prefill_index_scores(
                             lanes = pl.tile.arange(0, [1, part_rows], dtype=pl.INT32)
                             ones = pl.tile.full([1, part_rows], dtype=pl.INT32, value=1)
                             part_mask = pl.tile.cmps(lanes, pl.cast(valid_rows, pl.INT32), cmp_type=2)
+                            if pool:
+                                ones = pl.add(lanes, pl.cast(logical + 1, pl.INT32))
                             part_valid = pl.tile.select(part_mask, ones, 0)
                             valid_lanes = pl.tile.assemble(valid_lanes, part_valid, [0, part * part_rows])
             keys = pl.reinterpret_view(carrier, pl.FP8E4M3FN)
@@ -836,7 +838,11 @@ def _prefill_index_scores(
                         if length <= INDEX_TOPK:
                             length = pl.cast(0, pl.INDEX)
                     if pool:
-                        valid = valid_lanes
+                        positive = pl.tile.cmps(valid_lanes, 0, cmp_type=4)
+                        causal = pl.tile.cmps(valid_lanes, pl.cast(length + 1, pl.INT32), cmp_type=2)
+                        causal_ones = pl.tile.full([1, tile_n], dtype=pl.INT32, value=1)
+                        causal_valid = pl.tile.select(causal, causal_ones, 0)
+                        valid = pl.tile.select(positive, causal_valid, 0)
                     else:
                         positions = pl.add(pl.tile.arange(0, [1, tile_n], dtype=pl.INT32),
                                            pl.cast(begin, pl.INT32))
@@ -931,9 +937,9 @@ def _select_c1a_topk(
     roots = tokens * groups_per_token
     arena_rows = roots + tokens * TOPK_GROUP_LEAVES
     arena = pl.create_tensor([arena_rows, TOPK_PAIR_WIDTH], dtype=pl.FP32)
-    with pl.spmd(32, name_hint="prefill_index_topk_groups", deps=[ready]) as group_tid:
+    with pl.spmd(64, name_hint="prefill_index_topk_groups", deps=[ready]) as group_tid:
         worker = pl.tile.get_block_idx()
-        for token in pl.range(worker, num_tokens, 32):
+        for token in pl.range(worker, num_tokens, 64):
             visible = pl.min(pl.max(pl.read(lengths, [token]), 0), width)
             if pool:
                 visible = pl.min(pl.max(pl.read(pool_counts, [token]), 0) * 8, width)
@@ -955,9 +961,9 @@ def _select_c1a_topk(
                         valid = pl.min(TOPK_LEAF, work_visible - begin)
                         _sort_topk_leaf(scores, arena, token, begin, valid, scratch + leaf)
                     _merge_topk_pairs(arena, scratch, scratch + 1, root)
-    with pl.spmd(32, name_hint="prefill_index_topk_merge", deps=[group_tid]) as selected:
+    with pl.spmd(64, name_hint="prefill_index_topk_merge", deps=[group_tid]) as selected:
         worker = pl.tile.get_block_idx()
-        for token in pl.range(worker, num_tokens, 32):
+        for token in pl.range(worker, num_tokens, 64):
             visible = pl.min(pl.max(pl.read(lengths, [token]), 0), width)
             if pool:
                 visible = pl.min(pl.max(pl.read(pool_counts, [token]), 0) * 8, width)
@@ -1245,12 +1251,13 @@ def _prefill_pool_is_dense(
     pool_ids: pl.Tensor,
     pool_counts: pl.Tensor,
     lengths: pl.Tensor,
+    request_ids: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     score_width: pl.Scalar[pl.INDEX],
     table_width: pl.Scalar[pl.INDEX],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    """Identify complete candidate prefixes in logical block order."""
+    """Identify dense pools and four-query groups with matching candidate lists."""
     capacity = pl.tensor.dim(pool_ids, 1)
     flags = pl.create_tensor([32, 16], dtype=pl.INT32)
     with pl.spmd(32, name_hint="prefill_pool_plan", deps=[ready]) as planned:
@@ -1279,6 +1286,29 @@ def _prefill_pool_is_dense(
             if pl.tile.read(sums, [0, lane]) != 0.0:
                 dense = pl.cast(0, pl.INT32)
         pl.write(flags, [worker, 0], dense)
+        paired = pl.cast(num_tokens % 4 == 0, pl.INT32)
+        pair_error = pl.tile.full([1, 16], dtype=pl.FP32, value=0.0)
+        for token in pl.range(worker * 4, num_tokens, 128):
+            count = pl.max(0, pl.min(pl.read(pool_counts, [token]), capacity))
+            request = pl.read(request_ids, [token])
+            for row in pl.unroll(1, 4):
+                if token + row < num_tokens:
+                    other_count = pl.max(0, pl.min(pl.read(pool_counts, [token + row]), capacity))
+                    if other_count != count or pl.read(request_ids, [token + row]) != request:
+                        paired = pl.cast(0, pl.INT32)
+                    for start in pl.range(0, count, 128):
+                        active = pl.min(128, count - start)
+                        first = pl.load(pool_ids, [token, start], [1, 128], valid_shape=[1, active])
+                        other = pl.load(pool_ids, [token + row, start], [1, 128], valid_shape=[1, active])
+                        first = pl.tile.fillpad(first, pad_value=pl.PadValue.zero)
+                        other = pl.tile.fillpad(other, pad_value=pl.PadValue.zero)
+                        error = pl.abs(pl.sub(pl.cast(first, pl.FP32), pl.cast(other, pl.FP32)))
+                        pair_error = pl.add(pair_error, pl.col_sum(pl.reshape(error, [8, 16])))
+        pair_sums = pl.col_sum(pl.reshape(pair_error, [2, 8]))
+        for lane in pl.unroll(8):
+            if pl.tile.read(pair_sums, [0, lane]) != 0.0:
+                paired = pl.cast(0, pl.INT32)
+        pl.write(flags, [worker, 1], paired)
     return flags, planned
 
 
@@ -1340,11 +1370,16 @@ def prefill_indexer(
                 maximum_visible = pl.cast(0, pl.INDEX)
                 paired = pl.cast(0, pl.INT32)
                 dense = pl.cast(1, pl.INT32)
+                pool_paired = pl.cast(1, pl.INT32)
                 chunk_ready = completion[0]
                 if pool:
-                    flags, pool_plan = _prefill_pool_is_dense(chunk_pool, chunk_counts, chunk_lengths, count, width, pl.tensor.dim(table, 1), chunk_ready)
+                    flags, pool_plan = _prefill_pool_is_dense(
+                        chunk_pool, chunk_counts, chunk_lengths, chunk_requests,
+                        count, width, pl.tensor.dim(table, 1), chunk_ready,
+                    )
                     for worker in pl.range(32):
                         dense = dense * pl.read(flags, [worker, 0])
+                        pool_paired = pool_paired * pl.read(flags, [worker, 1])
                     chunk_ready = pool_plan
                 if dense != 0:
                     if width >= 256:
@@ -1379,6 +1414,14 @@ def prefill_indexer(
                             head_rows=INDEX_H, part_rows=128,
                         )
                         scoring[0] = paged_tid
+                    elif pool and pool_paired != 0:
+                        pooled_tid = _prefill_index_scores(
+                            query, query_scale, weights, cache, cache_scale, table,
+                            chunk_requests, chunk_lengths, chunk_pool, chunk_counts, chunk_scores,
+                            count, prepared, tile_n=128, query_tile=4, pool=True, skip_short=c2a,
+                            head_rows=4 * INDEX_H, part_rows=8,
+                        )
+                        scoring[0] = pooled_tid
                     else:
                         general_tid = _prefill_index_scores(
                             query, query_scale, weights, cache, cache_scale, table,

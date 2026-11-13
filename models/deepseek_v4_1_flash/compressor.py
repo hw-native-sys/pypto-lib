@@ -393,32 +393,23 @@ def c1a_compressor_publish_python(
     return published
 
 
-@pl.jit.inline
-def _c2a_compressor_project_tile(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    weight: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
-    output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    row: pl.Scalar[pl.INDEX],
-    col: pl.Scalar[pl.INDEX],
-    rows: pl.Scalar[pl.INDEX],
-    n_tile: pl.constexpr,
-):
-    total = pl.tile.full([C2A_PROJ_M_TILE, n_tile], dtype=pl.FP32, value=0.0)
-    compensation = pl.tile.full([C2A_PROJ_M_TILE, n_tile], dtype=pl.FP32, value=0.0)
-    for k in pl.pipeline(0, D, C2A_PROJ_K_TILE, stage=2):
-        a = pl.load(x, [row, k], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE], valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
-        b = pl.load(weight, [k, col], [C2A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
-        a_full = pl.set_validshape(a, C2A_PROJ_M_TILE, C2A_PROJ_K_TILE)
-        partial_acc = pl.matmul(a_full, b)
-        partial = pl.move(partial_acc, pl.Mem.Vec, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box)
-        delta = pl.sub(partial, compensation)
-        next_sum = pl.add(total, delta)
-        roundoff = pl.sub(next_sum, total)
-        compensation = pl.sub(roundoff, delta)
-        total = next_sum
-    value = pl.set_validshape(total, rows, n_tile)
-    output = pl.store(value, [row, col], output)
-    return output
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=Path(__file__).parent / "kernels" / "compressor_project.cpp",
+    aiv_source=Path(__file__).parent / "kernels" / "compressor_project.cpp",
+    include_dirs=(pto_isa_include_dir(),),
+)
+def _c2a_project_vf(
+    x: pl.Tensor,
+    wkv: pl.Tensor,
+    wgate: pl.Tensor,
+    kv_out: pl.Out[pl.Tensor],
+    score_out: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    n_tile: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """Project BF16 panels and accumulate compensated FP32 sums in Vector registers."""
+    return kv_out, score_out
 
 
 @pl.jit.inline
@@ -433,21 +424,9 @@ def c2a_compressor_project(
 ):
     """Project KV and gate with NZ BF16 weights and compensated FP32 partial sums."""
     blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE * (2 * HEAD_DIM // n_tile)
-    workers = pl.max(1, pl.min(pl.min(blocks, 16), pl.system.available_cluster_count()))
-    # Initial C2V FIFO writes require ownership of the paired Vector UB.
+    workers = pl.max(1, pl.min(pl.min(blocks, 32), pl.system.available_cluster_count()))
     with pl.spmd(workers, name_hint="proj_cmp", sync_start=True):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_cmp", optimizations=[pl.cross_core_slot(slot_num=1)]):
-            worker = pl.tile.get_block_idx()
-            stride = pl.tile.get_block_num()
-            for block in pl.range(worker, blocks, stride):
-                col = block % (HEAD_DIM // n_tile) * n_tile
-                row_block = block // (2 * HEAD_DIM // n_tile)
-                row = row_block * C2A_PROJ_M_TILE
-                rows = pl.min(C2A_PROJ_M_TILE, num_tokens - row)
-                if block % (2 * HEAD_DIM // n_tile) < HEAD_DIM // n_tile:
-                    kv_out = _c2a_compressor_project_tile(x, wkv, kv_out, row, col, rows, n_tile)
-                else:
-                    score_out = _c2a_compressor_project_tile(x, wgate, score_out, row, col, rows, n_tile)
+        kv_out, score_out = _c2a_project_vf(x, wkv, wgate, kv_out, score_out, num_tokens, n_tile)
     return kv_out, score_out
 
 
@@ -610,6 +589,9 @@ def _c2a_compress(
     cache: pl.InOut[pl.Tensor],
     num_tokens: pl.Scalar[pl.INT32],
     num_state_blocks: pl.Scalar[pl.INT32],
+    phase_begin: pl.constexpr,
+    phase_end: pl.constexpr,
+    token_parallel: pl.constexpr,
 ):
     worker = pl.tile.get_block_idx()
     workers = pl.tile.get_block_num()
@@ -618,7 +600,7 @@ def _c2a_compress(
     cache_flat = cache
     weight_row = pl.load(norm_weight, [0], [512], target_memory=pl.Mem.Vec)
     gamma = pl.reshape(weight_row, [512])
-    for phase in pl.range(2):
+    for phase in pl.range(phase_begin, phase_end):
         for request in pl.range(requests + 2):
             block = -1
             start = 0
@@ -640,6 +622,8 @@ def _c2a_compress(
             owner = request % workers
             if valid_block:
                 owner = block % workers
+            if token_parallel:
+                owner = request % workers
             start = pl.max(start, 0)
             end = pl.min(end, num_tokens)
             if owner == worker:
@@ -716,6 +700,7 @@ def _c2a_compress(
                         score = pl.load(score_proj, [token, 0], [1, 512], target_memory=pl.Mem.Vec)
                         pl.store(kv, [row, 0], state_flat)
                         pl.store(score, [row, 512], state_flat)
+    return state_cache, latent, cache
 
 
 @pl.jit.inline(auto_scope=False)
@@ -735,8 +720,9 @@ def c2a_compressor_publish(
     sine: pl.Tensor,
     slots: pl.Tensor[[T_DYN], pl.INT64],
     cache: pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, COMPRESSED_CACHE_BYTES], pl.UINT8],
+    parallel_tokens: pl.constexpr,
 ):
-    """Pool and publish rows with state reads and writes owned by physical block."""
+    """Pool token spans and publish the latest physical state slots."""
     active_tokens = pl.cast(num_tokens, pl.INT32)
     blocks = pl.cast(pl.tensor.dim(state_cache, 0), pl.INT32)
     requests = pl.tensor.dim(state_block_table, 0)
@@ -779,7 +765,6 @@ def c2a_compressor_publish(
                         if pl.read(token_to_req_indices, [token]) == request:
                             pl.write(mapped_requests, [token], count)
                     count = pl.cast(count + 1, pl.INT32)
-    # Request-based decode worker count.
     workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
     native_count = pl.cast(native_blocks, pl.INT32)
     native_rows = native_blocks * 4
@@ -787,12 +772,49 @@ def c2a_compressor_publish(
     cache_blocks = pl.tensor.dim(cache, 0)
     cache_rows = cache_blocks * 128
     cache_flat = pl.reshape(cache, [cache_rows, COMPRESSED_CACHE_BYTES])
-    with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as completed:
-        _c2a_compress(
-            kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
-            mapped_starts, mapped_requests, mapped_blocks,
-            slots, cosine, sine, cache_flat, active_tokens, native_count,
-        )
+    completed = state_ready
+    if parallel_tokens:
+        token_workers = pl.max(1, pl.min((active_tokens + 15) // 16, 64))
+        with pl.spmd(token_workers, name_hint="c2a_compress", deps=[mapped]) as pooled:
+            pooled_state, pooled_latent, pooled_cache = _c2a_compress(
+                kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
+                mapped_starts, mapped_requests, mapped_blocks,
+                slots, cosine, sine, cache_flat, active_tokens, native_count,
+                phase_begin=0, phase_end=1, token_parallel=True,
+            )
+        state_workers = pl.max(1, pl.min(native_rows, 64))
+        with pl.spmd(state_workers, name_hint="c2a_state_commit", deps=[pooled]) as branch_completed:
+            commit_worker = pl.tile.get_block_idx()
+            for state_row in pl.range(commit_worker, native_rows, state_workers):
+                found = pl.cast(0, pl.INT32)
+                for reverse_group in pl.range(groups):
+                    commit_group = groups - 1 - reverse_group
+                    commit_block = pl.read(mapped_blocks, [commit_group, 0])
+                    if found == 0 and commit_block == state_row // 4:
+                        commit_start = pl.max(0, pl.read(mapped_starts, [commit_group]))
+                        commit_end = pl.min(active_tokens, pl.read(mapped_starts, [commit_group + 1]))
+                        for commit_offset in pl.range(commit_end - commit_start):
+                            commit_token = commit_end - 1 - commit_offset
+                            commit_position = pl.read(position_ids, [commit_token])
+                            commit_request = pl.read(mapped_requests, [commit_token])
+                            valid_request = found == 0 and commit_request == commit_group
+                            valid_position = commit_position >= 0 and commit_position % 4 == state_row % 4
+                            if valid_request and valid_position:
+                                commit_kv = pl.load(kv_proj, [commit_token, 0], [1, HEAD_DIM])
+                                commit_score = pl.load(score_proj, [commit_token, 0], [1, HEAD_DIM])
+                                pl.store(commit_kv, [state_row, 0], pooled_state)
+                                pl.store(commit_score, [state_row, HEAD_DIM], pooled_state)
+                                found = pl.cast(1, pl.INT32)
+        completed = branch_completed
+    else:
+        with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as branch_completed:
+            _c2a_compress(
+                kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
+                mapped_starts, mapped_requests, mapped_blocks,
+                slots, cosine, sine, cache_flat, active_tokens, native_count,
+                phase_begin=0, phase_end=2, token_parallel=False,
+            )
+        completed = branch_completed
     return completed
 
 
@@ -818,7 +840,7 @@ def c2a_state_feedback_test(
     c2a_compressor_publish(
         kv, score, query_starts, positions, request_ids, state_table,
         state_cache, norm_weight, latent, pl.cast(6, pl.INT32), state_ready,
-        cosine, sine, slots, cache,
+        cosine, sine, slots, cache, parallel_tokens=False,
     )
     return state_cache, latent
 
