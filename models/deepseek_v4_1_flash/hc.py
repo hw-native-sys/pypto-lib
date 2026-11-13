@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from pypto.runtime import pto_isa_include_dir
 
 from config import FLASH as M, T_DYN
-
+from rmsnorm import golden_rms_norm
 
 
 # model config
@@ -46,7 +46,7 @@ RMS_K_TILE = 1024
 LINEAR_OK = 4
 D_TILE = 2560
 PRE_T_TILE = 8
-PRE_NORM_T_TILE = 8
+PRE_NORM_T_TILE = 4
 PRE_NORM_STORE_T_TILE = 2
 POST_WORKER_TILE = 64
 
@@ -378,7 +378,7 @@ def hc_project(x_hc: pl.Tensor, function: pl.Tensor, rms_worker_limit: pl.conste
 
 
 @pl.jit.extern(core_type="aiv", source=_KERNELS / "hc_collapse.cpp",
-               include_dirs=(pto_isa_include_dir(),))
+               include_dirs=(pto_isa_include_dir(), str(_KERNELS)))
 def _hc_collapse(
     x: pl.Tensor,
     pre_mix: pl.Tensor,
@@ -400,7 +400,7 @@ def hc_head(
     output: pl.Tensor,
     worker_limit: pl.constexpr,
 ):
-    """Collapse four HC streams with pairwise FP32 sums and BF16 rounding."""
+    """Collapse FP32 HC streams with ordered products and sums and BF16 output."""
     tokens = pl.tensor.dim(x_hc, 0)
     x_flat = pl.reshape(x_hc, [tokens, HC_DIM])
     mix_flat = pl.reshape(pre_mix, [1, tokens * HC_MULT])
@@ -436,8 +436,8 @@ def hc_head(
                         x2 = pl.reg.mul(x2, p2, full)
                         x3 = pl.reg.mul(x3, p3, full)
                         first = pl.reg.add(x0, x1, full)
-                        second = pl.reg.add(x2, x3, full)
-                        value = pl.reg.add(first, second, full)
+                        second = pl.reg.add(first, x2, full)
+                        value = pl.reg.add(second, x3, full)
                         rounded = pl.reg.convert(value, dtype=pl.BF16, rounding="R", saturate=False)
                         _stored = pl.reg.store(collapsed, offset=offset, value=rounded, mask=full)
                 collapsed = pl.reshape(collapsed, [1, D])
@@ -504,7 +504,7 @@ def _hc_post(
     sublayer: pl.Tensor, residual: pl.Tensor, post_mix: pl.Tensor, residual_mix: pl.Tensor,
     output: pl.Out[pl.Tensor], tokens: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor:
-    """Mix four residual streams with ordered FP32 register operations."""
+    """Mix FP32 residual streams with fused multiply-add."""
     ...
 
 
@@ -550,10 +550,10 @@ def hc_post_regscope_block(
                 c3 = pl.reg.broadcast(pl.reg.load(mix, 2 * HC_MULT + h, lanes=1), lanes=64, dtype=pl.FP32)
                 c4 = pl.reg.broadcast(pl.reg.load(mix, 3 * HC_MULT + h, lanes=1), lanes=64, dtype=pl.FP32)
                 value = pl.reg.mul(x, c0, mask)
-                value = pl.reg.add(value, pl.reg.mul(r0, c1, mask), mask)
-                value = pl.reg.add(value, pl.reg.mul(r1, c2, mask), mask)
-                value = pl.reg.add(value, pl.reg.mul(r2, c3, mask), mask)
-                value = pl.reg.add(value, pl.reg.mul(r3, c4, mask), mask)
+                value = pl.reg.mula(value, r0, c1, mask)
+                value = pl.reg.mula(value, r1, c2, mask)
+                value = pl.reg.mula(value, r2, c3, mask)
+                value = pl.reg.mula(value, r3, c4, mask)
                 written = pl.reg.store(output, stream * D_TILE + offset, value)
     output = pl.tile.reshape(output, [stream_tile, D_TILE])
     pl.tile.store(output, [row + out_base, d0], output_rows)
@@ -649,26 +649,17 @@ def golden_hc_mixes(
 
 
 def golden_hc_collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-    """Collapse four HC streams with the kernel's pairwise FP32 reduction."""
+    """Collapse four HC streams in recipe order with FP32 products and sums."""
     products = x.float() * pre_mix.float().unsqueeze(-1)
-    first_pair = products[..., 0, :] + products[..., 1, :]
-    second_pair = products[..., 2, :] + products[..., 3, :]
-    return (first_pair + second_pair).to(x.dtype)
+    total = torch.zeros_like(products[..., 0, :])
+    for stream in range(M.hc_mult):
+        total = total + products[..., stream, :]
+    return total.to(x.dtype)
 
 
 def golden_hc_norm(collapsed: torch.Tensor, norm_weight: torch.Tensor) -> torch.Tensor:
-    """Normalize BF16 HC rows with sequential 64-lane FP32 accumulators."""
-    value = collapsed.float()
-    width = value.shape[-1]
-    square = value.square().reshape(*value.shape[:-1], width // 64, 64)
-    partial = torch.zeros_like(square[..., 0, :])
-    for chunk in range(width // 64):
-        partial = partial + square[..., chunk, :]
-    while partial.shape[-1] > 1:
-        partial = partial[..., 0::2] + partial[..., 1::2]
-    argument = partial * (1.0 / width) + NORM_EPS
-    inverse = torch.ones_like(argument) / torch.sqrt(argument)
-    return (value * inverse * norm_weight.float()).to(torch.bfloat16)
+    """Apply the shared CANN RMSNorm reference to collapsed BF16 rows."""
+    return golden_rms_norm(collapsed, norm_weight)
 
 
 def golden_hc_head_norm(x: torch.Tensor, pre_mix: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -683,10 +674,13 @@ def golden_hc_post(
     post_mix: torch.Tensor,
     residual_mix: torch.Tensor,
 ) -> torch.Tensor:
-    """Expand a sublayer result and mix the four residual streams in FP32."""
-    update = post_mix.unsqueeze(-1) * sublayer.unsqueeze(-2)
-    skip = (residual_mix.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=-3)
-    return update.float() + skip.float()
+    """Mix and retain residual state in FP32 with fused multiply-add."""
+    value = post_mix.float().unsqueeze(-1) * sublayer.float().unsqueeze(-2)
+    for stream in range(M.hc_mult):
+        source = residual[..., stream, :].double().unsqueeze(-2)
+        coefficient = residual_mix[..., stream, :].double().unsqueeze(-1)
+        value = (value.double() + source * coefficient).float()
+    return value.to(residual.dtype)
 
 
 def golden_l2_hc_pre(tensors):
@@ -702,7 +696,7 @@ def golden_l2_hc_pre(tensors):
 
 
 def golden_l2_hc_post(tensors):
-    """Fill the expanded residual stream with FP32 accumulation and storage."""
+    """Fill FP32 residual state after fused accumulation."""
     tensors["output"][:] = golden_hc_post(
         tensors["sublayer"], tensors["residual"], tensors["post_mix"], tensors["residual_mix"],
     )

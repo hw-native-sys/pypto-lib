@@ -182,7 +182,7 @@ def q_proj_rope(
     qa_workers = pl.max(pl.min(qa_tasks, qa_worker_limit), 1)
     with pl.spmd(qa_workers, name_hint="proj_q_a"):
         projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_row_tile)
-    norm_workers = pl.max(pl.min(payload_rows // MX_M_TILE, 32), 1)
+    norm_workers = pl.max(pl.min(payload_rows // (MX_M_TILE // 2), 32), 1)
     latent_rows = pl.tensor.dim(query_latent, 0)
     norm_latent = pl.tensor.slice(query_latent, [latent_rows, Q_LORA], [0, 0])
     norm_payload = pl.tensor.slice(qb_payload, [payload_rows, Q_LORA], [0, 0])
@@ -435,7 +435,7 @@ def q_proj_rope_pypto(
     projected = proj_q_a_pypto(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit)
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
-    norm_workers = pl.max(pl.min(payload_rows // MX_M_TILE, 32), 1)
+    norm_workers = pl.max(pl.min(payload_rows // (MX_M_TILE // 2), 32), 1)
     latent_rows = pl.tensor.dim(query_latent, 0)
     norm_latent = query_latent[:latent_rows, :Q_LORA]
     norm_payload = qb_payload[:payload_rows, :Q_LORA]

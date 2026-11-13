@@ -17,7 +17,7 @@ from lm_head import (
     SAMPLED_IDS_PAD, VOCAB, VOCAB_PER_TP, GROUP_LOGIT_ROWS, MAX_LOGIT_ROWS,
     lm_head_sample, lm_head, greedy_sample,
 )
-from rmsnorm import rms_norm_tiled_compensated
+from rmsnorm import rms_norm
 
 
 D = FLASH.hidden_size
@@ -43,9 +43,7 @@ def sample_target(
 ):
     tokens = pl.tensor.dim(x_hc, 0)
     hc_head(x_hc, pre_mix, collapsed, worker_limit=64)
-    with pl.spmd((tokens + 7) // 8, name_hint="dspark_target_final_norm") as ready:
-        block = pl.tile.get_block_idx()
-        rms_norm_tiled_compensated(collapsed, final_norm_weight, normalized, block, tokens)
+    ready = rms_norm(collapsed, final_norm_weight, normalized, tokens, width=D, zero_tail=False)
     if LM_HEAD_TP_SIZE == 1:
         lm_head_sample(normalized, lm_head_weight, active_widths, sampled_ids, ready)
     else:

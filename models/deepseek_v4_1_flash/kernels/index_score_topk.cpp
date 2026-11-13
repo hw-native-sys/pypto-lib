@@ -18,14 +18,11 @@ namespace {
 namespace score_core {
 using F4 = float4_e2m1x2_t;
 using S = float8_e8m0_t;
-using QueryPipe = TPipe<4, Direction::DIR_V2C, 16384, 2, 2, true>;
 
 template <typename T, int R, int C, int BR, int BC, Layout L = Layout::ND>
 using GM = GlobalTensor<T, TileShape2D<T, R, C, L>, BaseShape2D<T, BR, BC, L>, L>;
 template <typename T, int R, int C>
 using Vec = Tile<TileType::Vec, T, R, C>;
-using QueryMat = Tile<TileType::Mat, F4, 192, 128, BLayout::ColMajor, 192, 128, SLayout::RowMajor>;
-using QueryVec = Tile<TileType::Vec, F4, 192, 128, BLayout::ColMajor, 192, 128, SLayout::RowMajor>;
 using QueryScale = Tile<TileType::Mat, S, 192, 4, BLayout::RowMajor, DYNAMIC, 4, SLayout::RowMajor, 32>;
 using KeyScale = Tile<TileType::Mat, S, 4, 128, BLayout::ColMajor, 4, 128, SLayout::ColMajor, 32>;
 
@@ -43,28 +40,7 @@ __aicore__ inline int read(__gm__ int32_t* ptr) {
 __aicore__ inline int minimum(int a, int b) { return a < b ? a : b; }
 
 #if defined(__DAV_VEC__)
-__aicore__ inline void prepare_query(__gm__ int64_t* args, int begin, int count, QueryPipe& pipe) {
-    if (get_subblockid() == 0) {
-        Tile<TileType::Vec, uint8_t, 192, 64, BLayout::RowMajor, DYNAMIC, 64> input(count * 32);
-        Vec<F4, 192, 128> packed;
-        QueryVec nz;
-        TASSIGN(input, 131072);
-        TASSIGN(packed, 131072);
-        TASSIGN(nz, 143360);
-        GM<uint8_t, DYNAMIC, 64, DYNAMIC, 64> gm(data<uint8_t>(args, 0) + begin * 2048,
-            TileShape2D<uint8_t, DYNAMIC, 64>(count * 32, 64),
-            BaseShape2D<uint8_t, DYNAMIC, 64>(count * 32, 64));
-        TLOAD(input, gm);
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        TMOV(nz, packed);
-        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        TPUSH<QueryPipe, QueryVec, TileSplitAxis::TILE_NO_SPLIT>(pipe, nz);
-        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-    }
-
+__aicore__ inline void prepare_weights(__gm__ int64_t* args, int begin, int count) {
     Tile<TileType::Vec, bfloat16_t, 6, 32, BLayout::RowMajor, DYNAMIC, 32> weight(count);
     Vec<bfloat16_t, 1, 192> weight_raw;
     Vec<float, 1, 192> scaled;
@@ -75,7 +51,7 @@ __aicore__ inline void prepare_query(__gm__ int64_t* args, int begin, int count,
     TASSIGN(rounded, 257280);
     GM<bfloat16_t, DYNAMIC, 32, DYNAMIC, 32> wg(data<bfloat16_t>(args, 2) + begin * 32,
         TileShape2D<bfloat16_t, DYNAMIC, 32>(count, 32), BaseShape2D<bfloat16_t, DYNAMIC, 32>(count, 32));
-    // Complete query layout conversion before loading weights.
+    // Preserve the previous fragment's vector reads before reusing weight storage.
     set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     TLOAD(weight, wg);
@@ -216,110 +192,156 @@ namespace {
                 write_cached_row(s20, s21, cache+51200+column, hist+512, v20, v21, span0, span1, column == 0, pool_valid, gathered);
             }
         }
-        template <int SHIFT>
-        __tf__ __aicore__ void packed_histogram(__ubuf__ uint16_t* keys, __ubuf__ uint16_t* hist, int width, uint32_t prefix) {
-            __VEC_SCOPE__ {
-                vector_u16 h0, h1, h2, h3;
-                vector_u8 lo, hi;
-                vector_bool selected;
+        __aicore__ inline void threshold_bin(vector_u16 h0, vector_u16 h1, vector_u16& rank,
+                                            vector_u16& bin, vector_u16& residual) {
+            vector_u16 i0, i1, c0, c1, previous0, previous1, zero, missing;
+            vector_bool ge0, ge1, before0, before1;
+            auto full = pset_b16(PAT_ALL);
+            vci((vector_s16&)i0, int16_t(0), INC_ORDER);
+            vci((vector_s16&)i1, int16_t(128), INC_ORDER);
+            vbr(zero, uint16_t(0));
+            vbr(missing, uint16_t(65535));
+            vcmp_ge(ge0, h0, rank, full);
+            vcmp_ge(ge1, h1, rank, full);
+            vsel(c0, i0, missing, ge0);
+            vsel(c1, i1, missing, ge1);
+            vmin(c0, c0, c1, full, MODE_ZEROING);
+            vcmin(c1, c0, full, MODE_ZEROING);
+            vdup(bin, c1, full, POS_LOWEST, MODE_ZEROING);
+            vcmp_lt(before0, i0, bin, full);
+            vcmp_lt(before1, i1, bin, full);
+            vsel(previous0, h0, zero, before0);
+            vsel(previous1, h1, zero, before1);
+            vmax(previous0, previous0, previous1, full, MODE_ZEROING);
+            vcmax(previous1, previous0, full, MODE_ZEROING);
+            vdup(previous0, previous1, full, POS_LOWEST, MODE_ZEROING);
+            vcmp_eq(ge0, i0, bin, full);
+            vcmp_eq(ge1, i1, bin, full);
+            vsel(c0, h0, zero, ge0);
+            vsel(c1, h1, zero, ge1);
+            vmax(c0, c0, c1, full, MODE_ZEROING);
+            vcmax(c1, c0, full, MODE_ZEROING);
+            vdup(c0, c1, full, POS_LOWEST, MODE_ZEROING);
+            vsub(residual, c0, rank, full, MODE_ZEROING);
+            vsub(rank, rank, previous0, full, MODE_ZEROING);
+        }
+        __aicore__ inline void find_threshold(__ubuf__ uint16_t* keys, int width,
+                                              __ubuf__ uint16_t* scratch, bool cached,
+                                              __ubuf__ uint16_t* cached_hist,
+                                              vector_u16& key_cutoff, vector_u16& key_boundary) {
+            vector_u16 h0, h1, h2, h3, rank, bin, residual, cutoff;
+            vector_u8 lo, hi, prefix;
+            vector_bool selected;
+            auto full = pset_b16(PAT_ALL);
+            if (cached) {
+                vlds(h0, cached_hist, 0, NORM);
+                vlds(h1, cached_hist, 128, NORM);
+            } else {
                 vbr(h0, uint16_t(0));
                 vbr(h1, uint16_t(0));
                 vbr(h2, uint16_t(0));
                 vbr(h3, uint16_t(0));
                 uint32_t remaining = width;
-                const int blocks = (width + 255) / 256;
-                for (uint16_t c = 0; c < blocks; c += 2) {
+                for (uint16_t c = 0; c < (width + 255) / 256; c += 2) {
                     auto mask = CreatePredicate<uint8_t>(remaining);
                     vlds(lo, hi, (__ubuf__ uint8_t*)keys, c * 512, DINTLV_B8);
-                    if constexpr (SHIFT == 8) {
-                        chistv2(h0, hi, mask, Bin_N0);
-                        chistv2(h1, hi, mask, Bin_N1);
-                    }
-                    else {
-                        vcmps_eq(selected, hi, uint8_t(prefix >> 8), mask);
-                        chistv2(h0, lo, selected, Bin_N0);
-                        chistv2(h1, lo, selected, Bin_N1);
-                    }
-                    if (c + 1 < blocks) {
+                    chistv2(h0, hi, mask, Bin_N0);
+                    chistv2(h1, hi, mask, Bin_N1);
+                    if (c + 1 < (width + 255) / 256) {
                         mask = CreatePredicate<uint8_t>(remaining);
                         vlds(lo, hi, (__ubuf__ uint8_t*)keys, (c + 1) * 512, DINTLV_B8);
-                        if constexpr (SHIFT == 8) {
-                            chistv2(h2, hi, mask, Bin_N0);
-                            chistv2(h3, hi, mask, Bin_N1);
-                        }
-                        else {
-                            vcmps_eq(selected, hi, uint8_t(prefix >> 8), mask);
-                            chistv2(h2, lo, selected, Bin_N0);
-                            chistv2(h3, lo, selected, Bin_N1);
-                        }
+                        chistv2(h2, hi, mask, Bin_N0);
+                        chistv2(h3, hi, mask, Bin_N1);
                     }
                 }
-                auto full = pset_b16(PAT_ALL);
                 vadd(h0, h0, h2, full, MODE_ZEROING);
                 vadd(h1, h1, h3, full, MODE_ZEROING);
-                vsts(h0, hist, 0, NORM_B16, full);
-                vsts(h1, hist, 128, NORM_B16, full);
             }
-        }
-        __aicore__ inline void select_bin(__ubuf__ uint16_t* hist, int shift, uint32_t& key, int& rank, int& count) {
-            set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-            int lo = 0, hi = 255;
-            for (int step = 0;step<8;++step) {
-                int mid = (lo+hi)/2;
-                if (hist[mid] >= rank)hi = mid;
-                else lo = mid+1;
-            }
-            int previous = lo?hist[lo-1]:0;
-            count = hist[lo]-previous;
-            rank -= previous;
-            key |= uint32_t(lo)<<shift;
-            set_flag(PIPE_S, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_S, PIPE_V, EVENT_ID0);
-        }
-        __tf__ __aicore__ void packed_equal(__ubuf__ uint16_t* out, __ubuf__ uint16_t* in, int width, uint32_t cutoff) {
-            __VEC_SCOPE__ {
-                vector_u16 key, index, squeezed;
-                vector_bool equal;
-                vector_align align;
-                sprclr(SPR_AR);
-                uint32_t remaining = width;
-                for (uint16_t c = 0;c<(width+127)/128;++c) {
-                    auto mask = CreatePredicate<uint16_t>(remaining);
-                    vlds(key, in, c*128, NORM);
-                    vci((vector_s16&)index, int16_t(c*128), INC_ORDER);
-                    vcmps_eq(equal, key, uint16_t(cutoff), mask);
-                    vsqz(squeezed, index, equal, MODE_STORED);
-                    vstur(align, squeezed, out, POST_UPDATE);
+            vbr(rank, uint16_t(width - 511));
+            threshold_bin(h0, h1, rank, bin, residual);
+            vpack(prefix, bin, LOWER);
+            auto full8 = pset_b8(PAT_ALL);
+            vdup(prefix, prefix, full8, POS_LOWEST, MODE_ZEROING);
+            vshls(cutoff, bin, 8, full, MODE_ZEROING);
+            vbr(h0, uint16_t(0));
+            vbr(h1, uint16_t(0));
+            vbr(h2, uint16_t(0));
+            vbr(h3, uint16_t(0));
+            uint32_t remaining = width;
+            for (uint16_t c = 0; c < (width + 255) / 256; c += 2) {
+                auto mask = CreatePredicate<uint8_t>(remaining);
+                vlds(lo, hi, (__ubuf__ uint8_t*)keys, c * 512, DINTLV_B8);
+                vcmp_eq(selected, hi, prefix, mask);
+                chistv2(h0, lo, selected, Bin_N0);
+                chistv2(h1, lo, selected, Bin_N1);
+                if (c + 1 < (width + 255) / 256) {
+                    mask = CreatePredicate<uint8_t>(remaining);
+                    vlds(lo, hi, (__ubuf__ uint8_t*)keys, (c + 1) * 512, DINTLV_B8);
+                    vcmp_eq(selected, hi, prefix, mask);
+                    chistv2(h2, lo, selected, Bin_N0);
+                    chistv2(h3, lo, selected, Bin_N1);
                 }
-                vstar(align, out);
+            }
+            vadd(h0, h0, h2, full, MODE_ZEROING);
+            vadd(h1, h1, h3, full, MODE_ZEROING);
+            threshold_bin(h0, h1, rank, bin, residual);
+            vor(cutoff, cutoff, bin, full, MODE_ZEROING);
+            vector_u16 key, lane, squeezed;
+            vector_align align;
+            auto out = scratch;
+            sprclr(SPR_AR);
+            remaining = width;
+            for (uint16_t c = 0; c < (width + 127) / 128; ++c) {
+                auto mask = CreatePredicate<uint16_t>(remaining);
+                vlds(key, keys, c * 128, NORM);
+                vci((vector_s16&)lane, int16_t(c * 128), INC_ORDER);
+                vcmp_eq(selected, key, cutoff, mask);
+                vsqz(squeezed, lane, selected, MODE_STORED);
+                vstur(align, squeezed, out, POST_UPDATE);
+            }
+            vstar(align, out);
+            mem_bar(VST_VLD);
+            vector_u32 index, shift, packed;
+            auto full32 = pset_b32(PAT_ALL);
+            vcvt(index, residual, full, PART_EVEN);
+            vbr(shift, 1u);
+            vand(shift, shift, index, full32, MODE_ZEROING);
+            vshls(shift, shift, 4, full32, MODE_ZEROING);
+            vshrs(index, index, 1, full32, MODE_ZEROING);
+            vgather2(packed, (__ubuf__ uint32_t*)scratch, index, full32);
+            vshr(packed, packed, (vector_s32&)shift, full32, MODE_ZEROING);
+            vpack(lane, packed, LOWER);
+            key_cutoff = cutoff;
+            vdup(key_boundary, lane, full, POS_LOWEST, MODE_ZEROING);
+        }
+        __tf__ __aicore__ void vector_threshold(__ubuf__ uint16_t* keys, int width,
+                                               __ubuf__ uint16_t* scratch, __ubuf__ uint16_t* result) {
+            __VEC_SCOPE__ {
+                vector_u16 cutoff, boundary;
+                find_threshold(keys, width, scratch, false, (__ubuf__ uint16_t*)0, cutoff, boundary);
+                auto full = pset_b16(PAT_ALL);
+                vsts(cutoff, result, 0, NORM_B16, full);
+                vsts(boundary, result, 128, NORM_B16, full);
             }
         }
         __aicore__ inline void packed_threshold(__ubuf__ uint16_t* keys, int width, int scratch, int hist_base,
-        bool cached, int cached_hist, uint32_t& cutoff, int& boundary) {
+        uint32_t& cutoff, int& boundary) {
             cutoff = 0x007f;
             boundary = -1;
             if (width>512) {
-                auto hist = ub<uint16_t>(hist_base);
-                int rank = width-511, count = 0;
-                cutoff = 0;
-                if (!cached)packed_histogram<8>(keys, hist, width, 0);
-                select_bin(cached?ub<uint16_t>(cached_hist):hist, 8, cutoff, rank, count);
-                packed_histogram<0>(keys, hist, width, cutoff);
-                select_bin(hist, 0, cutoff, rank, count);
-                packed_equal(ub<uint16_t>(scratch), keys, width, cutoff);
+                vector_threshold(keys, width, ub<uint16_t>(scratch), ub<uint16_t>(hist_base));
                 set_flag(PIPE_V, PIPE_S, EVENT_ID0);
                 wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-                boundary = (ub<uint16_t>(scratch))[count-rank];
+                cutoff = ub<uint16_t>(hist_base)[0];
+                boundary = ub<uint16_t>(hist_base)[128];
                 set_flag(PIPE_S, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_S, PIPE_V, EVENT_ID0);
             }
         }
-        template <bool MERGE>
         __tf__ __aicore__ void packed_select(__ubuf__ uint16_t* outk, __ubuf__ uint32_t* outi,
         __ubuf__ uint16_t* src, __ubuf__ uint32_t* ids, __ubuf__ uint32_t* table,
-        int width, uint32_t cutoff, int boundary, int logical_begin, bool gathered, bool map_output = true) {
-            auto output_indices = outi;
+        int width, uint32_t cutoff, int boundary, bool gathered, bool map_output) {
+            auto result = outi;
             __VEC_SCOPE__ {
                 vector_u32 key, lane, logical, tmp, page, squeezed, invalid, shift;
                 vector_u16 key16, zero16;
@@ -345,43 +367,103 @@ namespace {
                     por(keep, strict, eq, mask);
                     vcmps_gt(valid, key, 0x007fu, mask);
                     pand(keep, keep, valid, mask);
-                    if constexpr(MERGE) {
+                    {
                         vlds(logical, ids, c*64, NORM);
-                        if (map_output && gathered) {
-                            vgather2(page, table, logical, keep);
-                            logical = page;
-                        } else if (map_output) {
-                            vshrs(tmp, logical, 7, mask, MODE_ZEROING);
-                            vgather2(page, table, tmp, keep);
-                            vshls(page, page, 7, mask, MODE_ZEROING);
-                            vbr(tmp, 127u);
-                            vand(tmp, logical, tmp, mask, MODE_ZEROING);
-                            vadd(logical, page, tmp, mask, MODE_ZEROING);
-                        }
                     }
-                    else vadds(logical, lane, uint32_t(logical_begin), mask, MODE_ZEROING);
                     vsqz(squeezed, logical, keep, MODE_STORED);
                     vstur(align, squeezed, outi, POST_UPDATE);
                 }
                 vstar(align, outi);
-                if constexpr(!MERGE) {
+                // Map only the selected rows, retaining their logical order.
+                if (map_output) {
                     mem_bar(VST_VLD);
-                    for (uint16_t c = 0;c<8;++c) {
-                        vlds(logical, output_indices, c*64, NORM);
+                    for (uint16_t c = 0; c < 8; ++c) {
+                        vlds(logical, result, c * 64, NORM);
                         vcmps_ne(valid, logical, 0xffffffffu, full);
-                        vadds(tmp, logical, uint32_t(-logical_begin), full, MODE_ZEROING);
-                        vbr(shift, 1u);
-                        vand(shift, tmp, shift, full, MODE_ZEROING);
-                        vshls(shift, shift, 4, full, MODE_ZEROING);
-                        vshrs(tmp, tmp, 1, full, MODE_ZEROING);
-                        vbr(key, 0u);
-                        vgather2(key, (__ubuf__ uint32_t*)src, tmp, valid);
-                        vshr(key, key, (vector_s32&)shift, full, MODE_ZEROING);
-                        vpack(key16, key, LOWER);
-                        ppack(packed_mask, full, LOWER);
-                        vsts(key16, outk, c*64, NORM_B16, packed_mask);
+                        if (gathered) {
+                            vgather2(page, table, logical, valid);
+                            logical = page;
+                        } else {
+                            vshrs(tmp, logical, 7, full, MODE_ZEROING);
+                            vgather2(page, table, tmp, valid);
+                            vshls(page, page, 7, full, MODE_ZEROING);
+                            vbr(tmp, 127u);
+                            vand(tmp, logical, tmp, full, MODE_ZEROING);
+                            vadd(logical, page, tmp, full, MODE_ZEROING);
+                        }
+                        vsel(logical, logical, invalid, valid);
+                        vsts(logical, result, c * 64, NORM_B32, full);
                     }
                 }
+            }
+        }
+        __aicore__ inline void select_local(__ubuf__ uint16_t* outk, __ubuf__ uint32_t* outi,
+                                            __ubuf__ uint16_t* src, int width, vector_u16& cutoff,
+                                            vector_u16& boundary, int logical_begin) {
+            vector_u16 key, lane, squeezed, zero;
+            vector_bool eq, strict, early, keep, valid;
+            vector_align align;
+            auto full = pset_b16(PAT_ALL);
+            auto full32 = pset_b32(PAT_ALL);
+            auto packed = (__ubuf__ uint16_t*)0;
+            vbr(zero, uint16_t(65535));
+            for (uint16_t c = 0; c < 4; ++c) vsts(zero, packed, c * 128, NORM_B16, full);
+            mem_bar(VST_VST);
+            sprclr(SPR_AR);
+            uint32_t remaining = width;
+            for (uint16_t c = 0; c < (width + 127) / 128; ++c) {
+                auto mask = CreatePredicate<uint16_t>(remaining);
+                vlds(key, src, c * 128, NORM);
+                vci((vector_s16&)lane, int16_t(c * 128), INC_ORDER);
+                vcmp_gt(strict, key, cutoff, mask);
+                vcmp_eq(eq, key, cutoff, mask);
+                vcmp_le(early, (vector_s16&)lane, (vector_s16&)boundary, mask);
+                pand(eq, eq, early, mask);
+                por(keep, strict, eq, mask);
+                vcmps_gt(valid, key, uint16_t(0x007f), mask);
+                pand(keep, keep, valid, mask);
+                vsqz(squeezed, lane, keep, MODE_STORED);
+                vstur(align, squeezed, packed, POST_UPDATE);
+            }
+            vstar(align, packed);
+            mem_bar(VST_VLD);
+            vector_u16 interleaved, unused;
+            vector_u32 index, local, gathered, shift, invalid;
+            vbr(invalid, 0xffffffffu);
+            for (uint16_t c = 0; c < 8; ++c) {
+                vlds(lane, (__ubuf__ uint16_t*)0, c * 64, NORM);
+                vintlv(interleaved, unused, lane, lane);
+                vcvt(local, interleaved, full, PART_EVEN);
+                vcmps_ne(valid, local, 65535u, full32);
+                vadds(index, local, uint32_t(logical_begin), full32, MODE_ZEROING);
+                vsel(index, index, invalid, valid);
+                vsts(index, outi, c * 64, NORM_B32, full32);
+                vbr(shift, 1u);
+                vand(shift, local, shift, full32, MODE_ZEROING);
+                vshls(shift, shift, 4, full32, MODE_ZEROING);
+                vshrs(local, local, 1, full32, MODE_ZEROING);
+                vbr(gathered, 0u);
+                vgather2(gathered, (__ubuf__ uint32_t*)src, local, valid);
+                vshr(gathered, gathered, (vector_s32&)shift, full32, MODE_ZEROING);
+                vpack(key, gathered, LOWER);
+                vector_bool packed_mask;
+                ppack(packed_mask, full32, LOWER);
+                vsts(key, outk, c * 64, NORM_B16, packed_mask);
+            }
+        }
+        __tf__ __aicore__ void local_select(__ubuf__ uint16_t* outk, __ubuf__ uint32_t* outi,
+                                           __ubuf__ uint16_t* keys, int width, int logical_begin,
+                                           __ubuf__ uint16_t* cached_hist) {
+            __VEC_SCOPE__ {
+                vector_u16 cutoff, boundary;
+                if (width > 512) {
+                    find_threshold(keys, width, (__ubuf__ uint16_t*)0, true, cached_hist, cutoff, boundary);
+                    mem_bar(VLD_VST);
+                } else {
+                    vbr(cutoff, uint16_t(0x007f));
+                    vbr(boundary, uint16_t(65535));
+                }
+                select_local(outk, outi, keys, width, cutoff, boundary, logical_begin);
             }
         }
         __aicore__ inline void local_topk(__gm__ int64_t* args, int begin, int count, int logical, int width, int shard) {
@@ -390,25 +472,32 @@ namespace {
                 int group_offset = get_subblockid()*3+row;
                 if (group_offset >= count)continue;
                 auto keys = ub<uint16_t>(98304+row*51200);
-                uint32_t cutoff;
-                int boundary;
-                packed_threshold(keys, width, 0, 54272, true, 251904+row*512, cutoff, boundary);
                 CandidateKeys selected_keys;
                 CandidateIndices selected_indices;
-                TASSIGN(selected_keys, 51200);
-                TASSIGN(selected_indices, 52224);
-                packed_select<false>(selected_keys.data(), selected_indices.data(), keys, (__ubuf__ uint32_t*)0,
-                (__ubuf__ uint32_t*)0, width, cutoff, boundary, logical, false);
-                int index = ((begin+group_offset)*shards+shard)*512;
-                GM<uint16_t, 1, 512, 1, 512> kg(data<uint16_t>(args, 10)+index);
-                GM<uint32_t, 1, 512, 1, 512> ig(data<uint32_t>(args, 11)+index);
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                TSTORE(kg, selected_keys);
-                TSTORE(ig, selected_indices);
-                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+                TASSIGN(selected_keys, 51200 + row * 3072);
+                TASSIGN(selected_indices, 52224 + row * 3072);
+                local_select(selected_keys.data(), selected_indices.data(), keys, width, logical,
+                             ub<uint16_t>(251904 + row * 512));
             }
+            // Publish all local query rows through one strided DMA per output.
+            int first = get_subblockid() * 3;
+            int rows = minimum(3, count - first);
+            if (rows <= 0) return;
+            Tile<TileType::Vec, uint16_t, 3, 1536, BLayout::RowMajor, DYNAMIC, 512> keys(rows);
+            Tile<TileType::Vec, uint32_t, 3, 768, BLayout::RowMajor, DYNAMIC, 512> indices(rows);
+            TASSIGN(keys, 51200);
+            TASSIGN(indices, 52224);
+            int index = ((begin + first) * shards + shard) * 512;
+            GM<uint16_t, DYNAMIC, 512, DYNAMIC, DYNAMIC> kg(data<uint16_t>(args, 10) + index,
+                TileShape2D<uint16_t, DYNAMIC, 512>(rows, 512), BaseShape2D<uint16_t, DYNAMIC, DYNAMIC>(rows, shards * 512));
+            GM<uint32_t, DYNAMIC, 512, DYNAMIC, DYNAMIC> ig(data<uint32_t>(args, 11) + index,
+                TileShape2D<uint32_t, DYNAMIC, 512>(rows, 512), BaseShape2D<uint32_t, DYNAMIC, DYNAMIC>(rows, shards * 512));
+            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            TSTORE(kg, keys);
+            TSTORE(ig, indices);
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
         }
         __tf__ __aicore__ void compact_keys(__ubuf__ uint16_t* out, __ubuf__ uint16_t* keys,
                                             int width, uint32_t cutoff, int boundary) {
@@ -452,6 +541,26 @@ namespace {
                 }
             }
         }
+        __tf__ __aicore__ void block_maxima(__ubuf__ float* dst, __ubuf__ uint16_t* src, int width) {
+            __VEC_SCOPE__ {
+                vector_u32 keys, maxima, positive, negative, bits, sign;
+                vector_bool positive_mask;
+                auto full = pset_b32(PAT_ALL);
+                uint32_t count = 8;
+                auto reduced = CreatePredicate<uint32_t>(count);
+                vbr(sign, 0x8000u);
+                for (uint16_t c = 0; c < (width + 63) / 64; ++c) {
+                    vlds((vector_u16&)keys, src, c * 64, UNPK_B16);
+                    vcgmax(maxima, keys, full);
+                    vcmps_ge(positive_mask, maxima, 0x8000u, reduced);
+                    vxor(positive, maxima, sign, reduced, MODE_ZEROING);
+                    vnot(negative, maxima, reduced, MODE_ZEROING);
+                    vsel(bits, positive, negative, positive_mask);
+                    vshls(bits, bits, 16, reduced, MODE_ZEROING);
+                    vsts((vector_f32&)bits, dst, c * 8, NORM_B32, reduced);
+                }
+            }
+        }
         __aicore__ inline void store_scores(__gm__ int64_t* args, int begin, int count,
                                             int logical, int cached_width) {
             int width = args[15];
@@ -462,17 +571,13 @@ namespace {
             for (int row = 0; row < 3; ++row) {
                 int offset = get_subblockid() * 3 + row;
                 if (offset >= count) continue;
-                for (int column = 0; column < cached_width; column += 256) {
+                if (args[20] == 2) {
+                    block_maxima(ub<float>(4096), ub<uint16_t>(98304 + row * 51200), cached_width);
+                } else {
+                    for (int column = 0; column < cached_width; column += 256) {
                     unpack_scores(rounded.data(), ub<uint16_t>(98304 + row * 51200) + column);
                     TCVT(values, rounded, RoundMode::CAST_RINT);
-                    if (args[20] == 2) {
-                        Vec<float, 32, 8> grouped, scratch;
-                        Tile<TileType::Vec, float, 32, 1, BLayout::ColMajor> maxima;
-                        TASSIGN(grouped, 512);
-                        TASSIGN(scratch, 2048);
-                        TASSIGN(maxima, 4096 + column / 8 * 4);
-                        TROWMAX(maxima, grouped, scratch);
-                    } else {
+                    {
                         int valid = minimum(256, cached_width - column);
                         Tile<TileType::Vec, float, 1, 256, BLayout::RowMajor, 1, DYNAMIC> output(valid);
                         TASSIGN(output, 512);
@@ -484,6 +589,7 @@ namespace {
                         TSTORE(gm, output);
                         set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
                         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+                    }
                     }
                 }
                 if (args[20] == 2) {
@@ -609,9 +715,9 @@ namespace {
                     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                     uint32_t cutoff;
                     int boundary;
-                    packed_threshold(ub<uint16_t>(0), candidates, 32768, 131072, false, 0, cutoff, boundary);
-                    packed_select<true>(selected_keys.data(), selected_indices.data(), ub<uint16_t>(0),
-                        ub<uint32_t>(65536), mapping, candidates, cutoff, boundary, 0, gathered_rows != 0, final);
+                    packed_threshold(ub<uint16_t>(0), candidates, 32768, 131072, cutoff, boundary);
+                    packed_select(selected_keys.data(), selected_indices.data(), ub<uint16_t>(0),
+                        ub<uint32_t>(65536), mapping, candidates, cutoff, boundary, gathered_rows != 0, final);
                     if (final) {
                         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -633,7 +739,6 @@ namespace {
         }
 #endif
         __aicore__ inline void run(__gm__ int64_t* args) {
-            QueryPipe query_pipe(nullptr, 0, 0);
             int width = args[15], stride = args[16], table_width = args[17];
             int gathered_rows = args[19];
             int cache_pages = reinterpret_cast<__gm__ Tensor*>(args[3])->shapes[0];
@@ -655,10 +760,17 @@ namespace {
                     int maximum = read(data<int32_t>(args, 9) + 2 * stride + group_id);
                     int request = read(data<int32_t>(args, 6) + begin);
 #if defined(__DAV_CUBE__)
-                    QueryMat query;
+                    Tile<TileType::Mat, F4, 192, 128, BLayout::ColMajor, DYNAMIC, 128, SLayout::RowMajor> query(count * 32);
+                    TASSIGN(query, 0);
+                    GM<F4, DYNAMIC, 128, DYNAMIC, 128> qdata(data<F4>(args, 0) + begin * 2048,
+                        TileShape2D<F4, DYNAMIC, 128>(count * 32, 128),
+                        BaseShape2D<F4, DYNAMIC, 128>(count * 32, 128));
+                    // Query and scale L1 slots are reused across fragments.
+                    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+                    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+                    TLOAD(query, qdata);
                     QueryScale query_scale(count * 32);
                     TASSIGN(query_scale, 83200);
-                    TPOP<QueryPipe, QueryMat, TileSplitAxis::TILE_NO_SPLIT>(query_pipe, query);
                     using QS = TileShape2D<S, DYNAMIC, 4, Layout::MX_A_ND>;
                     using QD = BaseShape2D<S, DYNAMIC, 4, Layout::MX_A_ND>;
                     GlobalTensor<S, QS, QD, Layout::MX_A_ND> qg(data<S>(args, 1) + begin * 128,
@@ -672,12 +784,15 @@ namespace {
                     TASSIGN(left1, 16384);
                     TASSIGN(scale0, GetScaleAddr(left0.data()));
                     TASSIGN(scale1, GetScaleAddr(left1.data()));
+                    // Both query halves must finish MMAD before their L0A slots are replaced.
+                    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+                    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
                     TEXTRACT(left0, query, 0, 0);
                     TEXTRACT(left1, query, 96, 0);
                     TEXTRACT(scale0, query_scale, 0, 0);
                     TEXTRACT(scale1, query_scale, 96, 0);
 #else
-                    prepare_query(args, begin, count, query_pipe);
+                    prepare_weights(args, begin, count);
                     int offset = get_subblockid() * 3;
                     int visible0 = offset < count ? (gathered_rows ? maximum : minimum(read(data<int32_t>(args, 7) + begin + offset), width)) : 0;
                     int visible1 = offset + 1 < count ? (gathered_rows ? maximum : minimum(read(data<int32_t>(args, 7) + begin + offset + 1), width)) : 0;
@@ -706,20 +821,22 @@ namespace {
                             TileRight<F4, 128, 256> right;
                             TileRightScale<S, 4, 256> right_scale;
                             TileAcc<float, 96, 256> dot0, dot1;
-                            TASSIGN(key, 65536);
-                            TASSIGN(key_scale, 81920);
-                            TASSIGN(right, 0);
+                            int key_slot = transferred % 2;
+                            int key_event = key_slot + 2;
+                            TASSIGN(key, 65536 + key_slot * 65536);
+                            TASSIGN(key_scale, 81920 + key_slot * 65536);
+                            TASSIGN(right, key_slot * 16384);
                             TASSIGN(right_scale, GetScaleAddr(right.data()));
                             TASSIGN(dot0, 0);
                             TASSIGN(dot1, 98304);
-                            if (transferred > 0) wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+                            if (transferred >= 2) wait_flag(PIPE_MTE1, PIPE_MTE2, key_event);
                             for (int piece = 0; piece < 2; ++piece) {
                                 int page = piece == 0 ? page0 : page1;
                                 if (page < 0) page = page0 >= 0 ? page0 : page1;
                                 KeyPart part;
                                 KeyScale part_scale;
-                                TASSIGN(part, 65536 + piece * 4096);
-                                TASSIGN(part_scale, 81920 + piece * 512);
+                                TASSIGN(part, 65536 + key_slot * 65536 + piece * 4096);
+                                TASSIGN(part_scale, 81920 + key_slot * 65536 + piece * 512);
                                 GM<F4, 128, 128, 128, 128, Layout::DN> kg(data<F4>(args, 3) + static_cast<int64_t>(page) * 8192);
                                 GM<S, 4, 128, 4, 128, Layout::MX_B_DN> sg(data<S>(args, 4) + page * 512);
                                 TLOAD(part, kg);
@@ -727,36 +844,43 @@ namespace {
                             }
                             set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
                             wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-                            if (transferred > 0) wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+                            if (transferred >= 2) wait_flag(PIPE_M, PIPE_MTE1, key_event);
                             TMOV(right, key);
                             TMOV(right_scale, key_scale);
-                            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+                            set_flag(PIPE_MTE1, PIPE_MTE2, key_event);
                             set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
                             wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+                            int slot = transferred % 2;
+                            using Received = Tile<TileType::Vec, bfloat16_t, 96, 256, BLayout::RowMajor, 96, 256>;
+                            using DotPart = Tile<TileType::Acc, float, 96, 256, BLayout::ColMajor, 96, 256, SLayout::RowMajor>;
                             if (transferred > 0) wait_flag(PIPE_FIX, PIPE_M, EVENT_ID2);
                             TMATMUL_MX(dot0, left0, scale0, right, right_scale);
-                            TMATMUL_MX(dot1, left1, scale1, right, right_scale);
-                            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
                             set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+                            if (transferred > 0) wait_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
+                            TMATMUL_MX(dot1, left1, scale1, right, right_scale);
+                            set_flag(PIPE_M, PIPE_MTE1, key_event);
+                            set_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
                             wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-                            int slot = transferred % 2;
-                            if (transferred >= 2) {
-                                wait_intra_block(PIPE_FIX, slot * 2 + 1);
-                                wait_intra_block(PIPE_FIX, slot * 2 + 17);
-                            }
-                            using Received = Tile<TileType::Vec, bfloat16_t, 96, 256, BLayout::RowMajor, 96, 128>;
-                            using DotPart = Tile<TileType::Acc, float, 96, 256, BLayout::ColMajor, 96, 128, SLayout::RowMajor>;
-                            for (int piece = 0; piece < 2; ++piece) {
+                            if (transferred >= 2) wait_intra_block(PIPE_FIX, slot * 2 + 1);
+                            {
                                 Received received;
-                                DotPart first_half, second_half;
-                                TASSIGN(received, slot * 49152 + piece * 256);
-                                TASSIGN(first_half, piece * 49152);
-                                TASSIGN(second_half, 98304 + piece * 49152);
-                                TMOV<Received, DotPart, AccToVecMode::SingleModeVec0>(received, first_half);
-                                TMOV<Received, DotPart, AccToVecMode::SingleModeVec1>(received, second_half);
+                                DotPart half;
+                                TASSIGN(received, slot * 49152);
+                                TASSIGN(half, 0);
+                                TMOV<Received, DotPart, AccToVecMode::SingleModeVec0>(received, half);
                             }
                             set_flag(PIPE_FIX, PIPE_M, EVENT_ID2);
                             set_intra_block(PIPE_FIX, slot * 2);
+                            wait_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
+                            if (transferred >= 2) wait_intra_block(PIPE_FIX, slot * 2 + 17);
+                            {
+                                Received received;
+                                DotPart half;
+                                TASSIGN(received, slot * 49152);
+                                TASSIGN(half, 98304);
+                                TMOV<Received, DotPart, AccToVecMode::SingleModeVec1>(received, half);
+                            }
+                            set_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
                             set_intra_block(PIPE_FIX, slot * 2 + 16);
                             ++transferred;
                         }
@@ -796,9 +920,8 @@ namespace {
 #endif
                     }
 #if defined(__DAV_CUBE__)
-                    TFREE<QueryPipe, TileSplitAxis::TILE_NO_SPLIT>(query_pipe);
-                    wait_intra_block(PIPE_S, 6);
-                    wait_intra_block(PIPE_S, 22);
+                    wait_intra_block(PIPE_FIX, 6);
+                    wait_intra_block(PIPE_FIX, 22);
 #else
                     int cached_width = minimum(panel_count * 256, width - first_panel * 256);
                     local_topk(args, begin, count, first_panel * 256, cached_width, shard);
@@ -810,9 +933,12 @@ namespace {
             }
 #if defined(__DAV_CUBE__)
             if (transferred > 0) {
-                wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
-                wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID2);
+                for (int slot = 0; slot < minimum(2, transferred); ++slot) {
+                    wait_flag(PIPE_MTE1, PIPE_MTE2, slot + 2);
+                    wait_flag(PIPE_M, PIPE_MTE1, slot + 2);
+                }
                 wait_flag(PIPE_FIX, PIPE_M, EVENT_ID2);
+                wait_flag(PIPE_FIX, PIPE_M, EVENT_ID3);
             }
             for (int slot = 0; slot < minimum(2, transferred); ++slot) {
                 wait_intra_block(PIPE_FIX, slot * 2 + 1);
@@ -833,7 +959,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     set_ctrl(sbitset0(get_ctrl(), pto::MAD_MODE_BIT));
 #endif
     fused::run(args);
-    SYNCALL<SyncCoreType::Mix>();
+    SYNCALL<SyncCoreType::AIVOnly>();
 #if defined(__DAV_VEC__)
     fused::merge(args);
 #endif

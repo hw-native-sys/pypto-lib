@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 """Compression projections, rotary embedding, cache publication, and ratio-2 ring state."""
 
 from pathlib import Path
@@ -393,23 +394,28 @@ def c1a_compressor_publish_python(
     return published
 
 
-@pl.jit.extern(
-    core_type="mixed",
-    aic_source=Path(__file__).parent / "kernels" / "compressor_project.cpp",
-    aiv_source=Path(__file__).parent / "kernels" / "compressor_project.cpp",
-    include_dirs=(pto_isa_include_dir(),),
-)
-def _c2a_project_vf(
-    x: pl.Tensor,
-    wkv: pl.Tensor,
-    wgate: pl.Tensor,
-    kv_out: pl.Out[pl.Tensor],
-    score_out: pl.Out[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-    n_tile: pl.Scalar[pl.INDEX],
-) -> tuple[pl.Tensor, pl.Tensor]:
-    """Project BF16 panels and accumulate compensated FP32 sums in Vector registers."""
-    return kv_out, score_out
+@pl.jit.inline
+def _c2a_compressor_project_tile(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    weight: pl.Tensor[[D, HEAD_DIM], pl.BF16, pl.NZ],
+    output: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
+    row: pl.Scalar[pl.INDEX],
+    col: pl.Scalar[pl.INDEX],
+    rows: pl.Scalar[pl.INDEX],
+    n_tile: pl.constexpr,
+):
+    a = pl.load(x, [row, 0], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE], valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+    b = pl.load(weight, [0, col], [C2A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+    a_full = pl.set_validshape(a, C2A_PROJ_M_TILE, C2A_PROJ_K_TILE)
+    acc = pl.matmul(a_full, b)
+    for k in pl.pipeline(C2A_PROJ_K_TILE, D, C2A_PROJ_K_TILE, stage=2):
+        a = pl.load(x, [row, k], [C2A_PROJ_M_TILE, C2A_PROJ_K_TILE], valid_shape=[rows, C2A_PROJ_K_TILE], target_memory=pl.Mem.Mat)
+        b = pl.load(weight, [k, col], [C2A_PROJ_K_TILE, n_tile], target_memory=pl.Mem.Mat)
+        a_full = pl.set_validshape(a, C2A_PROJ_M_TILE, C2A_PROJ_K_TILE)
+        acc = pl.matmul_acc(acc, a_full, b)
+    value = pl.set_validshape(acc, rows, n_tile)
+    output = pl.store(value, [row, col], output)
+    return output
 
 
 @pl.jit.inline
@@ -422,12 +428,23 @@ def c2a_compressor_project(
     num_tokens: pl.Scalar[pl.INT32],
     n_tile: pl.constexpr,
 ):
-    """Project KV and gate with NZ BF16 weights and compensated FP32 partial sums."""
+    """Project KV and gate with NZ BF16 weights and FP32 Cube output."""
     blocks = (num_tokens + C2A_PROJ_M_TILE - 1) // C2A_PROJ_M_TILE * (2 * HEAD_DIM // n_tile)
-    workers = pl.max(1, pl.min(pl.min(blocks, 32), pl.system.available_cluster_count()))
+    workers = pl.max(pl.min(pl.min(blocks, 16), pl.system.available_cluster_count()), 1)
     with pl.spmd(workers, name_hint="proj_cmp", sync_start=True):
-        kv_out, score_out = _c2a_project_vf(x, wkv, wgate, kv_out, score_out, num_tokens, n_tile)
+        worker = pl.tile.get_block_idx()
+        for block in pl.range(worker, blocks, workers):
+            row = block // (2 * HEAD_DIM // n_tile) * C2A_PROJ_M_TILE
+            rows = pl.min(C2A_PROJ_M_TILE, num_tokens - row)
+            for panel in pl.unroll(2 * HEAD_DIM // n_tile):
+                if block % (2 * HEAD_DIM // n_tile) == panel:
+                    col = panel % (HEAD_DIM // n_tile) * n_tile
+                    if panel < HEAD_DIM // n_tile:
+                        kv_out = _c2a_compressor_project_tile(x, wkv, kv_out, row, col, rows, n_tile)
+                    else:
+                        score_out = _c2a_compressor_project_tile(x, wgate, score_out, row, col, rows, n_tile)
     return kv_out, score_out
+
 
 
 @pl.jit.inline(auto_scope=False)
@@ -443,7 +460,6 @@ def _pool_normalize(
     rotated = pl.create_tile([512], dtype=pl.BF16, target_memory=pl.Mem.Vec)
     with pl.reg_scope():
         full = pl.reg.full_mask(lanes=64)
-        total = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
         for chunk in pl.hardware_loop(8):
             a = pl.reg.load(ps, chunk * 64, lanes=64)
             b = pl.reg.load(cs, chunk * 64, lanes=64)
@@ -463,15 +479,46 @@ def _pool_normalize(
             bf = pl.reg.convert(pooled, dtype=pl.BF16, rounding="R", saturate=False)
             value = pl.reg.convert(bf, dtype=pl.FP32)
             _rounded_written = pl.reg.store(rounded, chunk * 64, value)
-            square = pl.reg.mul(value, value, full)
-            total = pl.reg.add(total, square, full)
-        reduced = pl.reg.reduce_sum(total, full, reassoc=True)
+        # Match the shared CANN RMSNorm: fold 512 columns to 256, then
+        # reduce each 64-lane block and the four block sums.
+        lane = pl.reg.index_gen(0, lanes=64, dtype=pl.UINT32)
+        partials = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        for chunk in pl.hardware_loop(4):
+            first = pl.reg.load(rounded, chunk * 64, lanes=64)
+            second = pl.reg.load(rounded, 256 + chunk * 64, lanes=64)
+            first_square = pl.reg.mul(first, first, full)
+            second_square = pl.reg.mul(second, second, full)
+            squares = pl.reg.add(first_square, second_square, full)
+            partial = pl.reg.reduce_sum(squares, full, reassoc=True)
+            partial = pl.reg.broadcast(partial, lanes=64, dtype=pl.FP32)
+            slot_index = pl.cast(chunk, pl.UINT32)
+            slot = pl.reg.compares(lane, slot_index, full, predicate="eq")
+            partials = pl.reg.select(slot, partial, partials)
+        active = pl.reg.active_mask(4, lanes=64)
+        reduced = pl.reg.reduce_sum(partials, active, reassoc=True)
         reduced = pl.reg.broadcast(reduced, lanes=64, dtype=pl.FP32)
         mean_square = pl.reg.muls(reduced, 1.0 / 512.0, full)
         variance = pl.reg.adds(mean_square, 1e-06, full)
-        rms = pl.reg.sqrt(variance, full)
         one = pl.reg.broadcast(1.0, lanes=64, dtype=pl.FP32)
-        inv = pl.reg.div(one, rms, full)
+        reciprocal = pl.reg.div(one, variance, full)
+        root = pl.reg.sqrt(reciprocal, full)
+        negative_half_variance = pl.reg.muls(variance, -0.5, full)
+        product = pl.reg.mul(negative_half_variance, root, full)
+        three_halves = pl.reg.broadcast(1.5, lanes=64, dtype=pl.FP32)
+        factor = pl.reg.mula(three_halves, product, root, full)
+        inverse = pl.reg.mul(root, factor, full)
+        negative_variance = pl.reg.muls(variance, -1.0, full)
+        correction = pl.reg.mula(one, negative_variance, reciprocal, full)
+        negative_inverse = pl.reg.muls(inverse, -1.0, full)
+        error = pl.reg.mula(reciprocal, negative_inverse, inverse, full)
+        correction = pl.reg.mula(correction, variance, error, full)
+        correction = pl.reg.mul(correction, inverse, full)
+        half = pl.reg.broadcast(0.5, lanes=64, dtype=pl.FP32)
+        inv = pl.reg.mula(inverse, correction, half, full)
+        variance_bits = pl.reg.interpret_cast(variance, dtype=pl.UINT32)
+        is_infinite = pl.reg.compares(variance_bits, 2139095040, full, predicate="eq")
+        zero = pl.reg.broadcast(0.0, lanes=64, dtype=pl.FP32)
+        inv = pl.reg.select(is_infinite, zero, inv)
         for chunk in pl.hardware_loop(8):
             value = pl.reg.load(rounded, chunk * 64, lanes=64)
             gamma_bf = pl.reg.load(weight, chunk * 64, lanes=64)
@@ -845,24 +892,6 @@ def c2a_state_feedback_test(
     return state_cache, latent
 
 
-def golden_c2a_projection(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Reference FP32 Cube partial boundaries and compensated FP32 accumulation."""
-    value = x.double()
-    logical_weight = unpack_bf16_nz(weight).double()
-    total = torch.zeros(x.shape[0], logical_weight.shape[1], dtype=torch.float32, device=x.device)
-    compensation = torch.zeros_like(total)
-    for k in range(0, D, C2A_PROJ_K_TILE):
-        # FP64 partial sums are rounded at the FP32 Cube output boundary.
-        product = value[:, k : k + C2A_PROJ_K_TILE] @ logical_weight[k : k + C2A_PROJ_K_TILE]
-        partial = product.float()
-        delta = partial - compensation
-        next_sum = total + delta
-        roundoff = next_sum - total
-        compensation = roundoff - delta
-        total = next_sum
-    return total
-
-
 def golden_c1a_compressor(
     x: torch.Tensor,
     wkv: torch.Tensor,
@@ -896,8 +925,8 @@ def golden_c2a_compressor(
     Negative/out-of-range request or block indices suppress state access and
     publication. Valid chunks contain consecutive absolute positions.
     """
-    kv = golden_c2a_projection(x, wkv)
-    score = golden_c2a_projection(x, wgate)
+    kv = torch.matmul(x.float(), unpack_bf16_nz(wkv).float())
+    score = torch.matmul(x.float(), unpack_bf16_nz(wgate).float())
     latent = torch.zeros_like(kv, dtype=x.dtype)
     publish = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
     blocks, capacity, width = state_cache.shape

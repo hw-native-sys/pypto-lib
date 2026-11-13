@@ -1088,7 +1088,8 @@ def score_select_paged(
     panels = (width + 255) // 256
     shards = workers
     if panels > 100:
-        shards = pl.max(workers, (run_count * panels + 99) // 100)
+        waves = (run_count * panels + workers * 100 - 1) // (workers * 100)
+        shards = workers * pl.max(1, waves)
     block_count = (width + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
     emit_scores = pl.cast(0, pl.INT32)
     if not c2a:

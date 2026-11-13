@@ -61,6 +61,10 @@ HC state → HC pre-mix / attention norm → Q/KV projection and RoPE
          → HC pre-mix / router → shared and routed experts → combine / HC post
 ```
 
+HC-post retains its completed residual state in FP32 for the next HC-pre.
+HC collapse rounds its FP32 sum to BF16 before RMSNorm and quantized
+projections. HC coefficients and residual mixing remain FP32.
+
 The output projection uses the fused O-B + HC-post implementation in
 [`o_proj.py`](../../../models/deepseek_v4_1_flash/o_proj.py).
 Attention entries own chunk scheduling and dependencies around that shared

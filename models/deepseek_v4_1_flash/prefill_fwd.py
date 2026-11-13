@@ -96,7 +96,7 @@ from o_proj import retire_prefill_signals
 from prefill_c2a_full import prefill_c2a_full, prefill_c2a_full_cp
 from prefill_c1a_reindex import prefill_c1a_reindex, prefill_c1a_reindex_cp
 from prefill_c1a_reuse import prefill_c1a_reuse, prefill_c1a_reuse_cp
-from rmsnorm import rms_norm_tiled
+from rmsnorm import rms_norm
 from expert_routed import MX_PACKED_LANE_COLS, MX_W1_PACKED_ROWS, MX_W2_PACKED_ROWS, MX_W3_PACKED_ROWS
 
 RANKS = C.EP_SIZE
@@ -717,14 +717,7 @@ def l2_prefill_fwd(
                 encoder_normalized = pl.create_tensor([CAPACITY, D], dtype=pl.BF16)
                 hc_head(encoder_hidden, encoder_pre, encoder_collapsed, worker_limit=64)
                 norm_tokens = pl.tensor.dim(encoder_collapsed, 0)
-                norm_block_blocks = (norm_tokens + 7) // 8
-                norm_block_workers = pl.min(norm_block_blocks, 64)
-                for norm_block_worker in pl.spmd(norm_block_workers, name_hint="rms_norm"):
-                    for norm_block in pl.range(norm_block_worker, norm_block_blocks, norm_block_workers):
-                        rms_norm_tiled(
-                            encoder_collapsed, layer_attn_norm, encoder_normalized, norm_block, norm_tokens,
-                            output_fp32=False,
-                        )
+                rms_norm(encoder_collapsed, layer_attn_norm, encoder_normalized, norm_tokens, width=D, zero_tail=False)
                 publisher_ready = prefill_publish_decoder(
                     encoder_normalized, c1a_compressor_wkv, layer_compressor_norm, layer_index_wk, layer_index_norm,
                     rope_cos[1], rope_sin[1], c1a_compressed_slots,

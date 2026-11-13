@@ -4,6 +4,9 @@
 // -----------------------------------------------------------------------------------------------------------
 // Runtime-M O-B N192 x26 + N128 with SplitM HC-post.
 #include "mxfp8_projection.hpp"
+#if defined(__CPU_SIM)
+#include <cmath>
+#endif
 
 using namespace mxfp8_projection;
 namespace {
@@ -105,10 +108,10 @@ __tf__ __aicore__ inline void mix_row(
         const float r3 = residual_output[3 * NT + k];
         for (int h = 0; h < 4; ++h) {
             float value = x * post[h];
-            value = value + r0 * residual_mix[h];
-            value = value + r1 * residual_mix[4 + h];
-            value = value + r2 * residual_mix[8 + h];
-            value = value + r3 * residual_mix[12 + h];
+            value = std::fma(r0, residual_mix[h], value);
+            value = std::fma(r1, residual_mix[4 + h], value);
+            value = std::fma(r2, residual_mix[8 + h], value);
+            value = std::fma(r3, residual_mix[12 + h], value);
             residual_output[h * NT + k] = value;
         }
     }
@@ -129,17 +132,21 @@ __tf__ __aicore__ inline void mix_row(
                 vlds(coef, post, h, BRC_B32);
                 vmul(value, x0, coef, full, MODE_ZEROING);
                 vlds(coef, residual_mix, h, BRC_B32);
-                vmul(term, r0, coef, full, MODE_ZEROING);
-                vadd(value, value, term, full, MODE_ZEROING);
+                term = r0;
+                vmadd(term, coef, value, full, MODE_ZEROING);
+                value = term;
                 vlds(coef, residual_mix, 4 + h, BRC_B32);
-                vmul(term, r1, coef, full, MODE_ZEROING);
-                vadd(value, value, term, full, MODE_ZEROING);
+                term = r1;
+                vmadd(term, coef, value, full, MODE_ZEROING);
+                value = term;
                 vlds(coef, residual_mix, 8 + h, BRC_B32);
-                vmul(term, r2, coef, full, MODE_ZEROING);
-                vadd(value, value, term, full, MODE_ZEROING);
+                term = r2;
+                vmadd(term, coef, value, full, MODE_ZEROING);
+                value = term;
                 vlds(coef, residual_mix, 12 + h, BRC_B32);
-                vmul(term, r3, coef, full, MODE_ZEROING);
-                vadd(value, value, term, full, MODE_ZEROING);
+                term = r3;
+                vmadd(term, coef, value, full, MODE_ZEROING);
+                value = term;
                 vsts(value, residual_output, h * NT + k * 64, NORM_B32, full);
             }
         }
