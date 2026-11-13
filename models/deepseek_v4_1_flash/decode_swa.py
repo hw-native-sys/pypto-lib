@@ -20,7 +20,7 @@ from config import FLASH as M, T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_BYTES, DECODE
 from sparse_attention import gather_sparse_attention
 from o_proj import o_proj_hc_post
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
-from hc import hc_pre, hc_normalize, zero_bf16_padding
+from hc import hc_head_norm, hc_project, hc_sinkhorn, zero_bf16_padding
 
 
 # model config
@@ -76,13 +76,7 @@ def decode_swa(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    hc_pre(
-        x_hc, incoming_pre_mix,
-        hc_attn_fn, hc_attn_scale, hc_attn_base,
-        hc_collapsed, attention_pre_mix, post_mix, residual_mix,
-    )
-    x_ready = hc_normalize(hc_collapsed, attn_norm_weight, x_norm, tokens)
+    x_ready = hc_head_norm(x_hc, incoming_pre_mix, attn_norm_weight, x_norm, worker_limit=64)
 
     zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
@@ -114,6 +108,8 @@ def decode_swa(
         q, window_indices, window_cache, window_indices, window_cache,
         attn_sink, attended, num_tokens, cache_ready, compressed_keys=0,
     )
+    inv_rms, partials = hc_project(x_hc, hc_attn_fn, rms_worker_limit=64)
+    hc_sinkhorn(inv_rms, partials, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix)
     o_proj_hc_post(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
