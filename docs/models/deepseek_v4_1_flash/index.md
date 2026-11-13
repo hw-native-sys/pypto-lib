@@ -61,13 +61,6 @@ HC state → HC pre-mix / attention norm → Q/KV projection and RoPE
          → HC pre-mix / router → shared and routed experts → combine / HC post
 ```
 
-Attention and MoE use the shared fused HC-pre kernel for raw-input RMS,
-HF32 projection, BF16 stream collapse, and HC coefficients. Attention/FFN
-RMSNorm runs separately on the collapsed BF16 rows. Above 128 rows, HC pre
-uses eight K partitions with 128-row tiles through 512 rows and 256-row
-tiles above that. Up to 128 rows, it retains the 64/80/96/128 row buckets.
-Both paths use the available device cluster count.
-
 The output projection uses the fused O-B + HC-post implementation in
 [`o_proj.py`](../../../models/deepseek_v4_1_flash/o_proj.py).
 Attention entries own chunk scheduling and dependencies around that shared
