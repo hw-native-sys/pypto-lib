@@ -161,7 +161,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     run_cpu(args);
 #elif defined(__DAV_VEC__)
     set_mask_norm(); set_vector_mask(-1, -1);
-    if (args[6] >= 8) run_native<80>(args);
+    if (args[6] >= 8) {
+        if (args[8] == 64 && args[5] > 80) run_native<64>(args);
+        else run_native<80>(args);
+    }
     else if (args[6] >= 4) run_native<64>(args);
     else if (args[6] >= 2) run_native<32>(args);
     else run_native<16>(args);

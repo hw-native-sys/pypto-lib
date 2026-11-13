@@ -63,6 +63,7 @@ def _quant_o_vf(
     active_rows: pl.Scalar[pl.INT32],
     groups: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
+    full_group_rows: pl.Scalar[pl.INDEX],
 ) -> tuple[pl.Tensor, pl.Tensor]:
     """Inverse-rotate BF16 tails and quantize projection inputs to OCP MXFP8."""
     # Preserve both extern Out values: https://github.com/hw-native-sys/pypto/issues/3249
@@ -255,9 +256,13 @@ def o_proj_hc_post(
     payload_all = pl.create_tensor([LOCAL_O_GROUPS * padded_rows, O_GROUP_IN], dtype=pl.FP8E4M3FN)
     scales_all = pl.create_tensor([LOCAL_O_GROUPS, padded_rows * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
     vector_workers = 2 * pl.system.available_cluster_count()
+    full_group_rows = 80
+    if oa_row_tile > 80:
+        full_group_rows = 64
     with pl.spmd(vector_workers, name_hint="quant_o_vf"):
         payload_all, scales_all = _quant_o_vf(
-            attended, rope_cos, rope_sin, payload_all, scales_all, num_tokens, LOCAL_O_GROUPS, padded_rows,
+            attended, rope_cos, rope_sin, payload_all, scales_all,
+            num_tokens, LOCAL_O_GROUPS, padded_rows, full_group_rows,
         )
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
@@ -411,7 +416,7 @@ def o_proj_hc_post_native_validation(
     vector_workers = 2 * pl.system.available_cluster_count()
     with pl.spmd(vector_workers, name_hint="quant_o_vf"):
         payload_all, scales_all = _quant_o_vf(
-            attended, rope_cos, rope_sin, payload_all, scales_all, num_tokens, LOCAL_O_GROUPS, padded_rows,
+            attended, rope_cos, rope_sin, payload_all, scales_all, num_tokens, LOCAL_O_GROUPS, padded_rows, 80,
         )
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)

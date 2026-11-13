@@ -141,7 +141,7 @@ def decode_c2a_full(
     compressed_publish_tid = c2a_compressor_publish(
         compressor_kv, compressor_score, query_start_loc, position_ids, token_to_req_indices,
         state_block_table, state_cache, compressor_norm_weight, latent, num_tokens, cache_ready,
-        compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache,
+        compressed_rope_cos, compressed_rope_sin, compressed_slots, compressed_cache, parallel_tokens=False,
     )
 
     select_tid = decode_c2a_indexer(

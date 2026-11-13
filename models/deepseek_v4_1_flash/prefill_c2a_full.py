@@ -167,6 +167,7 @@ def prefill_c2a_full(
             compressor_kv, compressor_score, kv_query_start, kv_position_ids, kv_request_ids,
             state_block_table, state_cache, w_compressor_norm, compressed_latent, kv_token_count, normalized_ready,
             compressed_rope_cos, compressed_rope_sin, compressed_write_slots, compressed_cache,
+            parallel_tokens=True,
         )
         compressed_ready = publish_c2a_index_key(
             compressed_latent, w_index_k, w_index_norm, compressed_rope_cos, compressed_rope_sin,
@@ -583,6 +584,7 @@ def prefill_c2a_full_cp(
             compressor_kv, compressor_score, kv_query_start, kv_position_ids, kv_request_ids,
             state_block_table, state_cache, w_compressor_norm, compressed_latent, kv_token_count, gathered,
             compressed_rope_cos, compressed_rope_sin, compressed_write_slots, compressed_cache,
+            parallel_tokens=True,
         )
         compressed_ready = publish_c2a_index_key(
             compressed_latent, w_index_k, w_index_norm, compressed_rope_cos, compressed_rope_sin,
