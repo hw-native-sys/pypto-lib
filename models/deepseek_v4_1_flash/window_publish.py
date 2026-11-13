@@ -136,7 +136,33 @@ def _flush(
     raw = pl.reshape(inputs, [ROW_TILE * HEAD_DIM])
     cos = pl.reshape(cosine, [ROW_TILE * 32])
     sin = pl.reshape(sine, [ROW_TILE * 32])
-    payload, factors = _postprocess(raw, weight, cos, sin, rows)
+    # Expose the populated prefix as valid columns for the specialized VF calls.
+    raw = pl.reshape(raw, [1, ROW_TILE * HEAD_DIM])
+    raw = pl.tile.slice(raw, [1, ROW_TILE * HEAD_DIM], [0, 0], valid_shape=[1, rows * HEAD_DIM])
+    raw = pl.reshape(raw, [ROW_TILE * HEAD_DIM])
+    cos = pl.reshape(cos, [1, ROW_TILE * 32])
+    cos = pl.tile.slice(cos, [1, ROW_TILE * 32], [0, 0], valid_shape=[1, rows * 32])
+    cos = pl.reshape(cos, [ROW_TILE * 32])
+    sin = pl.reshape(sin, [1, ROW_TILE * 32])
+    sin = pl.tile.slice(sin, [1, ROW_TILE * 32], [0, 0], valid_shape=[1, rows * 32])
+    sin = pl.reshape(sin, [ROW_TILE * 32])
+    # A constant row count lets PTOAS prove the VF buffers do not overlap.
+    if rows == 2:
+        payload, factors = _postprocess(raw, weight, cos, sin, 2)
+    elif rows == 3:
+        payload, factors = _postprocess(raw, weight, cos, sin, 3)
+    elif rows == 4:
+        payload, factors = _postprocess(raw, weight, cos, sin, 4)
+    elif rows == 5:
+        payload, factors = _postprocess(raw, weight, cos, sin, 5)
+    elif rows == 6:
+        payload, factors = _postprocess(raw, weight, cos, sin, 6)
+    elif rows == 7:
+        payload, factors = _postprocess(raw, weight, cos, sin, 7)
+    else:
+        # Keep the dynamic one-row tail: PTOAS 0.72 exhausts its layout search
+        # when specializing it. A full batch reaches here with constant ROW_TILE.
+        payload, factors = _postprocess(raw, weight, cos, sin, rows)
     payload_rows = pl.reshape(payload, [ROW_TILE, HEAD_DIM])
     factor_bytes = pl.reinterpret_view(factors, pl.UINT8)
     factor_rows = pl.reshape(factor_bytes, [ROW_TILE, HEAD_DIM // 16])
