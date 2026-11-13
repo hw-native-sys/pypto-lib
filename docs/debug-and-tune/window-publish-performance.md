@@ -1,6 +1,6 @@
 # Window publication: current C++ alignment
 
-Measurements below describe the source after alignment to upstream/main, fetched on 2026-11-13. The remote remains at `8bbc8f5ca6ac3fd72f9004f509099083d5be10c3`; rebasing the PR onto it was a no-op. The earlier PR revision `504bd07d` is retained as the before-alignment comparator. No compiler or runtime source changes are included.
+The initial measurements below describe revision `963bd6aa` after alignment to upstream/main, fetched on 2026-11-13. The remote remains at `8bbc8f5ca6ac3fd72f9004f509099083d5be10c3`; rebasing the PR onto it was a no-op. The earlier PR revision `504bd07d` is retained as the before-alignment comparator. No compiler or runtime source changes are included.
 
 ## Algorithm and data movement
 
@@ -12,7 +12,7 @@ Both C++ and Python use the following contract:
 - A 128-slot scan, negative-slot rejection, page ownership `(slot // 128) % workers`, and batches of eight accepted rows. Pending rows survive a scan boundary.
 - Input runs consist of consecutive tokens accepted by the same worker, bounded by the scan and remaining batch capacity. Each run emits three 2D loads into pending rows. No token-index staging buffer or second gather loop remains.
 - Output runs contain consecutive increasing destination slots only. Duplicate or descending slots split runs and retain source-order publication. Each run emits separate 2D payload and scale stores.
-- RoPE storage is compact `[8,32]`, without the former upper-half zero initialization. The vector load matches the C++ row stride of 32 FP32 values; only its lower 32 lanes contribute to rotation. Full batches pass constant eight and tails pass the pending row count.
+- RoPE storage is compact `[8,32]`, without the former upper-half zero initialization. The vector load matches the C++ row stride of 32 FP32 values; only its lower 32 lanes contribute to rotation. At revision `963bd6aa`, full batches passed constant eight and tails passed the pending row count.
 
 The source encodes dynamic transfer extents using `valid_shape`; generated C++ confirms dynamic row counts for the three TLOADs and both TSTOREs. The output loop uses explicit `pl.while_` state because a reduced natural-while inline example exposes a ConvertToSSA defect; this is recorded in the local upstream-issue log.
 
@@ -57,7 +57,7 @@ The single-capture event distribution is not the repeated benchmark distribution
 
 - [PTOAS #1754](https://github.com/hw-native-sys/PTOAS/issues/1754) tracks redundant VF VV_ALL. Full-row specialization and bounded dynamic tails remain in source; this update does not patch generated synchronization.
 - [PTOAS #1756](https://github.com/hw-native-sys/PTOAS/issues/1756) tracks false metadata MTE3/Scalar dependencies. The current packed uint8 path avoids the earlier metadata handshake. Required DMA readiness, buffer reuse, ordered publication and final drain remain.
-- Earlier PR revision 504bd07d measured 12-worker 41.55 us source versus 39.40 us after diagnostic tail-VV_ALL removal; its metadata-removal count was zero. Those values belong to the earlier image and must not be presented as results for this aligned source. No new VV_ALL/MTE3_S-removal diagnostic is measured here.
+- Earlier PR revision 504bd07d measured 12-worker 41.55 us source versus 39.40 us after diagnostic tail-VV_ALL removal; its metadata-removal count was zero. Those values belong to the earlier image and must not be presented as results for this aligned source. The new simulator-only VV_ALL diagnostic is reported below.
 - Python still packs scale words in registers and writes an aligned 256-byte vector; C++ uses ONEPT_B32 stores per pair. Python splits seven ordinary segments and the final RoPE segment; C++ branches inside an eight-segment loop. Mathematical stages and rounding are aligned on tested inputs, while instruction selection differs.
 - Python uses compiler-generated waits, address/clamp operations and MTE3 barriers. Generated C++ currently places an MTE3 barrier before each payload and scale store; C++ places one after each output run. The compiler policy is not changed by this operator migration.
 
@@ -76,3 +76,54 @@ Source SHA256:
 
 - `models/deepseek_v4_1_flash/window_publish.py`: `d30728e9f6d784cc92d14119d23513cdb32b3667331f787c63df098df09249b8`.
 - `models/deepseek_v4_1_flash/qkv_proj_rope.py`: `592678676fcd2f299c723ffb65aa9338283eaa3f6fcc84e70667acbf96456c49`.
+
+## Worker scaling and tail specialization
+
+Baseline: pypto-lib upstream/main 8bbc8f5ca6ac3fd72f9004f509099083d5be10c3, models/deepseek_v4_1_flash/kernels/norm_rope_publish.cpp (archived as replay/baseline.cpp). Before optimization: 963bd6aa, models/deepseek_v4_1_flash/window_publish.py. Same packed uint8 cache bytes, baseline ABI [780,128,544], Python ABI [99840,544].
+
+The frozen 72-slot input has twelve runs of six consecutive slots on distinct page owners. A single worker runs nine full batches; twelve workers each scan 72 slots and run one six-row tail. The run order and numerical algorithm are unchanged.
+
+| Simulator replay | AIV0 span (µs) | Main VF start (µs) | Main VF duration (µs) | Dynamic VF barriers |
+|---|---:|---:|---:|---:|
+| 1 C++ | 28.349 | 3.278 | 13.878 total / 9 | 0 |
+| 1 Python before | 24.562 | 3.487 | 11.939 total / 9 | 0 |
+| 12 C++ | 6.569 | 4.465 | 1.354 | 0 |
+| 12 Python before | 8.911 | 4.746 | 3.462 | 61 |
+| 12 Python diagnostic, VV_ALL removed | 6.709 | — | 1.444 | 12 |
+| 12 Python source specialization | 6.918 | 4.792 | 1.198 | 0 |
+
+The one-core replay sets logical worker 0 and logical block count to 1 or 12; it does not model 12-core contention. The raw trace anchor is the first positive-duration AIV0 event. All reported replay cache bytes match C++. Source specialization has four short post-compute VF events associated with branch-result tile moves; their intervals overlap, so they cannot be added to makespan.
+
+12-worker C++ → Python before: first useful MTE2 1.083 → 2.092 µs; last useful MTE2 completion 3.597 → 3.925 µs; same five transfers, busy interval union 1.414 → 1.094 µs. First MTE3 5.823 → 8.211 µs, after VF completes at 5.819 → 8.208 µs. Two writebacks, busy union 0.624 → 0.567 µs. The later MTE3 launch follows the longer VF, rather than longer DMA service. Startup has a smaller independent cost: first compute VF is 0.281 µs later. After specialization the first MTE3 is 6.104 µs and last DMA completion is 6.782 µs. For one worker, the eight VF-to-VF intervals are 10.092 µs total in C++ and 8.080 µs in Python.
+
+Original C++ postprocess (baseline.cpp:102,168):
+```cpp
+for (uint16_t row = 0; row < rows; ++row) {
+    // RMSNorm, RoPE and FP8 conversion omitted.
+    vsts(codes, (__ubuf__ uint32_t*)factors, row * 8 + segment, ONEPT_B32, full);
+}
+```
+Original Python dynamic VF (vf/vf_1.mlir:54,118):
+```mlir
+// Outer loop: row < %arg1; inner loop: seven ordinary segments.
+pto.vsts %115, %9[%80], %10 {dist = "PK4_B32"} : !pto.vreg<256xui8>, !pto.ptr<ui8, ub>, !pto.mask<b32>
+...
+pto.mem_bar "VV_ALL"
+```
+At rows=6 there are 42 segment barriers, six row-end barriers, and one before the final scale-vector store; twelve directed barriers complete the count of 61. Payload UB is [1024,4096) over six rows; scale words are stored at [0,256); source BF16 is read from [6400,12544), weight from [5376,6400), and RoPE physical reads from cosine [14592,15488) and sine [15616,16512). Only the lower 32 RoPE lanes are consumed. The VF reads and writes are disjoint in this path; caller-level DMA dependencies remain. The independent VV_ALL-only diagnostic isolates about 94% of the simulator gap.
+
+The source experiment dispatches constant row counts 2–7; one row keeps the dynamic fallback because a constant one-row VF exceeds PTOAS 0.72's layout frontier limit. Full batches still use constant eight. All 2–8 VFs lower without VV_ALL; the fallback retains the original barrier sites. Bounded dynamic loops and bounded row indices retained VV_ALL; the guarded fixed loop was rejected by VF codegen; segment unrolling hit the layout search limit. The raw simulator data includes the corresponding instruction PCs and transfer sizes.
+
+
+The one-worker source specialization replay takes 24.713 µs versus 24.562 µs before; its nine compute VFs total 11.937 µs versus 11.939 µs. The full-batch path still executes zero VF memory barriers.
+
+| Workers / device | C++ baseline (µs) | Python before (µs) | Python specialized (µs) |
+|---|---:|---:|---:|
+| 1 / 5 | 53.10 | 47.60 | 47.00 |
+| 12 / 0 | 38.00 | 39.30 | 36.50 |
+
+The same-device comparisons use three groups of 10 warmups and 100 timed rounds, with the order reversed in group two. The table reports the median of the three group medians for standalone `effective_us`. The 12-worker improvement is 2.80 µs (7.1%) versus the prior Python source. C++ and the specialized Python variant alternate in relative order across groups; the 1.50 µs difference between their median values is specific to this replay. All eight cases at each worker count match the entire C++ cache byte-for-byte, including untouched bytes. The 12-worker benchmark completed before a separate workflow-capture attempt failed during runtime initialization.
+
+Task evidence: corrected baseline replays `task_20261113_105442_340851431053` and `task_20261113_105443_34097149529`; specialization replay `task_20261113_111037_687371964` and `task_20261113_111453_96008429010`; device validation `task_20261113_111304_84246422730` and `task_20261113_111301_83963430859`.
+
+The separate 12-worker workflow capture on device 2 completed (task `task_20261113_111815_11604203433`). Across 12 kernel events, median/max `kernel-duration-us` were 7.059/7.183 µs for C++, 8.548/8.693 µs for Python before, and 6.716/6.952 µs after specialization. The one-worker optimized workflow capture was not collected after a runtime initialization failure; its repeated benchmark and simulator replay completed.
