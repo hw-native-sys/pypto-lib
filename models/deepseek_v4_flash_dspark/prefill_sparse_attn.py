@@ -86,11 +86,12 @@ QUANT_TOKEN_TILE = 8
 O_PROJ_PAD_ROWS = 256  # internal physical-tail alignment across Cube, quant and epilogue
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
-A_K_TILE = 256  # proj_a cube K frag
-B_K_TILE = 256  # proj_b_mm cube K frag
+A_K_TILE = 256  # proj_a GM-to-L1 K fragment
+B_K_TILE = 128  # proj_b_mm L0 K fragment
+B_L1_K_TILE = 512  # proj_b_mm GM-to-L1 K fragment
 QUANT_TILE = 512  # quant column tile over O_LORA
 PROJ_A_MM_N_TILE = 128  # proj_a cube N frag
-PROJ_B_MM_N_TILE = 256  # proj_b_mm cube N frag; Acc = PROJ_B_ROW_TILE*N*4 sits on the a2a3 L0C wall
+PROJ_B_MM_N_TILE = 128  # proj_b_mm cube N fragment
 PROJ_B_D_TILE = 512  # proj_b_mm D slab per task; its N frags loop inside the task
 PROJ_B_ACT_N_TILE = 512  # proj_b_act vector N frag
 QUANT_CHUNKS = 4  # quant dispatch width per group
@@ -101,7 +102,8 @@ ROPE_CS_T_TILE = 8  # rope cos/sin row block
 # T_PAD: a taller row tile reads into the next group's slab and writes past the end
 # of the row-indexed scratch.
 PROJ_A_ROW_TILE = min(128, T_PAD)
-PROJ_B_ROW_TILE = min(128, T_PAD)
+PROJ_B_ROW_TILE = min(256, T_PAD)
+O_PROJ_ROW_TILE = max(PROJ_A_ROW_TILE, PROJ_B_ROW_TILE)
 # Task-array fan-outs; named because a deps= list comprehension cannot be hoisted
 # out of the call (the tracer rejects a bare ListComp statement).
 PA_NFRAGS = O_LORA // PROJ_A_MM_N_TILE
@@ -1102,6 +1104,8 @@ def _sparse_attn_o_proj(
 ) -> pl.Scalar[pl.TASK_ID]:
     """Project one local-token dense tile into BF16 hidden rows."""
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
+    wo_a_2d = pl.reshape(wo_a, [O_GROUPS * O_LORA, O_GROUP_IN])
+    wo_b_2d = pl.reshape(wo_b, [O_GROUPS * D, O_LORA])
 
     # Chain merge, quantization, and projection through explicit task dependencies.
     o_r = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.FP32)
@@ -1111,9 +1115,9 @@ def _sparse_attn_o_proj(
     proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     proj_b_tids = pl.array.create(PB_DSLABS * O_GROUPS, pl.TASK_ID)
-    # Round physical tails up to a complete proj_a tile; only the final store
+    # Round physical tails up to complete projection tiles; only the final store
     # writes active rows.
-    o_compute_rows = ((tile_rows + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE) * PROJ_A_ROW_TILE
+    o_compute_rows = ((tile_rows + O_PROJ_ROW_TILE - 1) // O_PROJ_ROW_TILE) * O_PROJ_ROW_TILE
     proj_a_rows = o_compute_rows // PROJ_A_ROW_TILE
     quant_rows = o_compute_rows // QUANT_TOKEN_TILE
     proj_b_rows = o_compute_rows // PROJ_B_ROW_TILE
@@ -1127,21 +1131,19 @@ def _sparse_attn_o_proj(
             out_col_g = g * O_LORA
             for nf in pl.range(PA_NFRAGS):
                 n0 = nf * PROJ_A_MM_N_TILE
+                pa_col0 = out_col_g + n0
+                pa_output: pl.Tensor[
+                    [T_PAD, PROJ_A_MM_N_TILE], pl.FP32, pl.TensorView(stride=[O_GROUPS * O_LORA, 1])
+                ] = pl.slice(o_r, [T_PAD, PROJ_A_MM_N_TILE], [0, pa_col0])
                 with pl.spmd(proj_a_rows, name_hint="proj_a_mm", deps=[heads_dep, weight_dep]) as pa_tid:
-                    pa_rb = pl.tile.get_block_idx()
-                    pa_r0 = pa_rb * PROJ_A_ROW_TILE
+                    pa_r0 = pl.tile.get_block_idx() * PROJ_A_ROW_TILE
                     pa_src0 = row_base_o + pa_r0
-                    acc_a = pl.create_tensor([1, PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
-                    for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
-                        k0 = kb * A_K_TILE
-                        xa_k_chunk = o_packed[
-                            pa_src0 : pa_src0 + PROJ_A_ROW_TILE,
-                            k0 : k0 + A_K_TILE,
-                        ]
-                        wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
-                    # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
-                    o_r = pl.assemble(o_r, acc_a, [pa_r0, out_col_g + n0])
+                    acc_a = pl.create_tensor([PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+                    for kb in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=4):
+                        xa_k = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, kb])
+                        wa_k = pl.slice(wo_a_2d, [PROJ_A_MM_N_TILE, A_K_TILE], [pa_col0, kb])
+                        acc_a = pl.matmul_acc(acc_a, xa_k, wa_k, b_trans=True, init_cond=(kb == 0))
+                    pl.assemble(pa_output, acc_a, [pa_r0, 0])
                 proj_a_tids[g * PA_NFRAGS + nf] = pa_tid
 
         # quant[g]: per-group amax and symmetric INT8 quant over physical rows.
@@ -1188,25 +1190,27 @@ def _sparse_attn_o_proj(
             d0 = dc * PROJ_B_D_TILE
             for g in pl.range(O_GROUPS):
                 col_g = g * O_LORA
+                pb_col0 = g * D + d0
+                pb_output: pl.Tensor[
+                    [T_PAD, PROJ_B_D_TILE], pl.INT32, pl.TensorView(stride=[O_GROUPS * D, 1])
+                ] = pl.slice(partials, [T_PAD, PROJ_B_D_TILE], [0, pb_col0])
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
                     for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
-                        n0 = d0 + nf * PROJ_B_MM_N_TILE
+                        pb_out_n0 = nf * PROJ_B_MM_N_TILE
+                        pb_weight_row0 = pb_col0 + pb_out_n0
                         for pb_rb in pl.range(proj_b_rows):
                             pb_r0 = pb_rb * PROJ_B_ROW_TILE
-                            acc_b = pl.create_tensor([1, PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
-                            for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
-                                k0 = col_g + kb * B_K_TILE
-                                wb_k0 = kb * B_K_TILE
-                                b_act = o_r_i8[
-                                    pb_r0 : pb_r0 + PROJ_B_ROW_TILE,
-                                    k0 : k0 + B_K_TILE,
-                                ]
-                                b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, wb_k0 : wb_k0 + B_K_TILE]
-                                acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
-                            acc_b_2d = pl.reshape(acc_b, [PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE])
-                            partials[
-                                pb_r0 : pb_r0 + PROJ_B_ROW_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE
-                            ] = acc_b_2d
+                            acc_b = pl.tile.create([PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], pl.INT32, target_memory=pl.Mem.Acc)
+                            for kb in pl.pipeline(0, O_LORA, B_L1_K_TILE, stage=2):
+                                k0 = col_g + kb
+                                xb_l1 = pl.tile.load(o_r_i8, [pb_r0, k0], [PROJ_B_ROW_TILE, B_L1_K_TILE], target_memory=pl.Mem.Mat)
+                                wb_l1 = pl.tile.load(wo_b_2d, [pb_weight_row0, kb], [PROJ_B_MM_N_TILE, B_L1_K_TILE], target_memory=pl.Mem.Mat)
+                                wb_transposed = pl.tile.transpose_view(wb_l1)
+                                for ki in pl.pipeline(0, B_L1_K_TILE, B_K_TILE, stage=2):
+                                    xb_l0 = pl.tile.extract(xb_l1, 0, ki, [PROJ_B_ROW_TILE, B_K_TILE], target_memory=pl.Mem.Left)
+                                    wb_l0 = pl.tile.extract(wb_transposed, ki, 0, [B_K_TILE, PROJ_B_MM_N_TILE], target_memory=pl.Mem.Right)
+                                    acc_b = pl.tile.matmul_acc(acc_b, xb_l0, wb_l0, init_cond=(kb == 0 and ki == 0))
+                            pl.tile.store(acc_b, [pb_r0, pb_out_n0], pb_output)
                 proj_b_tids[dc * O_GROUPS + g] = pb_tid
 
     # Dequantize and sum per-group INT32 partials into the BF16 output.
@@ -1332,7 +1336,7 @@ def sparse_attn_compute(
                 dtype=pl.BF16,
                 manual_dep=True,
             )
-            packed_rows = ((tile_rows + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE) * PROJ_A_ROW_TILE
+            packed_rows = ((tile_rows + O_PROJ_ROW_TILE - 1) // O_PROJ_ROW_TILE) * O_PROJ_ROW_TILE
             packed_group_blocks = packed_rows * HEADS_PER_GROUP // PREFILL_QUERY_TILE
             with pl.spmd(O_GROUPS * packed_group_blocks, name_hint="prefill_sparse_packed_init") as packed_init_tid:
                 packed_block = pl.tile.get_block_idx()
