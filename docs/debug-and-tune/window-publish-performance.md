@@ -1,87 +1,78 @@
-# Window publication: PyPTO migration performance
+# Window publication: current C++ alignment
 
-This report describes a migration candidate, not a performance improvement over the current C++ kernel. Measurements are from real A5 hardware on 2026-11-13. The PR preserves the current packed cache and power-of-two scale encoding.
+Measurements below describe the source after alignment to upstream/main, fetched on 2026-11-13. The remote remains at `8bbc8f5ca6ac3fd72f9004f509099083d5be10c3`; rebasing the PR onto it was a no-op. The earlier PR revision `504bd07d` is retained as the before-alignment comparator. No compiler or runtime source changes are included.
 
-## Baseline and scope
+## Algorithm and data movement
 
-The baseline is `models/deepseek_v4_1_flash/kernels/norm_rope_publish.cpp` from pypto-lib `8bbc8f5ca6ac3fd72f9004f509099083d5be10c3`. It already batches contiguous source rows and contiguous destination runs. Earlier separate-payload/separate-scale measurements use an older implementation and must not be treated as the baseline for this PR.
+Both C++ and Python use the following contract:
 
-The current operator uses the Python implementation in `models/deepseek_v4_1_flash/window_publish.py`. Its caller retains page ownership and the existing task dependency. Cache storage is uint8 `[780,128,544]`: 512 FP8 payload bytes followed by 32 bytes holding 16 BF16 power-of-two scales per slot. Inputs are BF16 `[72,512]`, BF16 weight `[512]`, FP32 cosine/sine `[72,32]`, and int64 slots `[72]`. The normal workload executes 72 valid tokens; one-worker and 12-worker wrappers are measured separately.
+- BF16 source `[72,512]`, BF16 gamma `[512]`, FP32 cosine/sine `[72,32]`, int64 slots `[72]`, packed uint8 cache `[780,128,544]`. Each slot contains 512 FP8 payload bytes and 32 bytes of BF16 scales.
+- RMSNorm over 512 values, eight segments accumulated per 64 lanes, pairwise reduction, epsilon `1e-6`, and BF16 normalization rounding. RoPE rotates the final 64 values as 32 interleaved pairs, with BF16 rounding after rotation.
+- Group-32 absmax clamped to `1e-4`, multiplied by `1/448`, then rounded upward to a power of two through `(bits + 8388607) >> 23` and `exponent << 23`. The exact FP32 power-of-two scale is used for division and packed as BF16. FP8 conversion uses round R with saturation disabled.
+- A 128-slot scan, negative-slot rejection, page ownership `(slot // 128) % workers`, and batches of eight accepted rows. Pending rows survive a scan boundary.
+- Input runs consist of consecutive tokens accepted by the same worker, bounded by the scan and remaining batch capacity. Each run emits three 2D loads into pending rows. No token-index staging buffer or second gather loop remains.
+- Output runs contain consecutive increasing destination slots only. Duplicate or descending slots split runs and retain source-order publication. Each run emits separate 2D payload and scale stores.
+- RoPE storage is compact `[8,32]`, without the former upper-half zero initialization. The vector load matches the C++ row stride of 32 FP32 values; only its lower 32 lanes contribute to rotation. Full batches pass constant eight and tails pass the pending row count.
 
-The frozen input tensors were replayed, including the initial cache contents. Correctness compares every output cache byte against the exact current C++ result, including unmodified slots. Tests cover normal72, empty0, tail9, masked/duplicate slots, and a separately compiled136-token case crossing the128-slot scan boundary. Each case passes at1 and12 workers. The diagnostic passes normal/empty/tail/duplicate cases; cross-scan coverage belongs to the unmodified source candidate.
+The source encodes dynamic transfer extents using `valid_shape`; generated C++ confirms dynamic row counts for the three TLOADs and both TSTOREs. The output loop uses explicit `pl.while_` state because a reduced natural-while inline example exposes a ConvertToSSA defect; this is recorded in the local upstream-issue log.
 
-## Measurement protocol
+## Real-device protocol and results
 
-Compilation and assembly run offline through `task-submit --no-device`. Device tasks use `task-submit --device auto` and the allocated `TASK_DEVICE`; compilation is explicitly forbidden in the device replay. Each comparison uses one device allocation, three groups with10 warmups and100 timed rounds per group, alternates version order, and retains all100 samples. Benchmark tracing is disabled. Tables report the median of the three group medians; P95 is the nearest-rank95th percentile.
+Frozen CI-derived 72-token inputs and initial cache contents are replayed. Each worker-count comparison uses one allocated device, three groups of 10 warmups and 100 timed rounds, with reversed version order in group two. Compilation is offline through `task-submit --no-device`; device replay prohibits compilation and uses `task-submit --device auto`. `effective_us` is the standalone-wrapper device-domain orchestration/scheduler metric, not pure kernel time or full-model decode latency.
 
-`effective_us` is the golden harness device-domain orchestration/scheduler metric for this standalone wrapper. It excludes host setup, compilation, first loading and warmup; it is not pure kernel time or a full-model decode latency. Workflow captures run separately with chip-swimlane level4 and use the explicit `kernel-duration-us` field. Worker bars include setup and are not substituted for kernel duration. Cross-core sums are not wall time.
+| Workers / device | Version | Group medians (us) | Median of medians (us) | Group P95 (us) |
+|---|---|---|---:|---|
+| 1 / 5 | baseline | 54.60, 52.25, 53.95 | 53.95 | 57.60, 56.40, 57.20 |
+| 1 / 5 | previous | 67.95, 67.40, 67.35 | 67.40 | 71.50, 70.40, 70.20 |
+| 1 / 5 | current | 47.10, 48.35, 46.25 | 47.10 | 50.10, 51.60, 49.20 |
+| 12 / 7 | baseline | 36.20, 38.30, 36.75 | 36.75 | 39.60, 41.40, 39.70 |
+| 12 / 7 | previous | 40.55, 41.20, 42.60 | 41.20 | 43.30, 44.70, 45.80 |
+| 12 / 7 | current | 38.80, 39.30, 39.60 | 39.30 | 41.80, 42.80, 44.10 |
 
-## Real-device benchmark
+P95 is the nearest-rank 95th percentile of each 100-sample group. Raw samples and min/mean/median/P95/max are retained in the local metrics evidence. Cross-device absolute timings are not used to assign an optimization benefit.
 
-| Workers / device | Version | Group medians (us) | Median of medians (us) |
-|---|---|---|---:|
-| 1 / 3 | baseline | 54.85, 54.85, 55.10 | 54.85 |
-| 1 / 3 | current | 68.95, 67.90, 69.00 | 68.95 |
-| 1 / 3 | diagnostic | 68.65, 67.80, 66.90 | 67.80 |
-| 12 / 4 | baseline | 35.40, 36.80, 39.00 | 36.80 |
-| 12 / 4 | current | 41.05, 41.55, 42.00 | 41.55 |
-| 12 / 4 | diagnostic | 37.90, 40.30, 39.40 | 39.40 |
+| Workers | Before -> aligned source (us) | Change versus before | Aligned versus C++ |
+|---|---:|---:|---:|
+| 1 | 67.40 -> 47.10 | -30.1% | -12.7% |
+| 12 | 41.20 -> 39.30 | -4.6% | +6.9% |
 
-The diagnostic is a separately compiled image, not shipped source: it removes only generated VF `VV_ALL` calls, preserving directed `VLD_VST`/`VST_VLD`, DMA readiness/reuse protection, store ordering and final drain. The new packed-cache caller already has zero metadata MTE3-to-S handshake flags in its kernel body. Full-batch `rows=8` specialization already eliminates all full-batch VF memory barriers; the diagnostic removes three static `VV_ALL` sites only from the dynamic-tail VF. It does not apply a compiler fix.
+These are source-only results, with no generated-code barrier removal. No future latency target is claimed.
 
-| Workers | C++ -> current effective_us | Current regression | Measured diagnostic effective_us | Target |
-|---|---:|---:|---:|---|
-| 1 | 54.85 -> 68.95 | 25.7% | 67.80 | <= 54.85 us, matching baseline |
-| 12 | 36.80 -> 41.55 | 12.9% | 39.40 | <= 36.80 us, matching baseline |
+## Correctness and separate kernel captures
 
-The target is an acceptance goal, not an achieved result or a forecast. The diagnostic is the measured evidence for synchronization-related potential on this exact workload. It does not establish that a future compiler release or source rewrite will reproduce that result. In the one-worker normal72 case the dynamic-tail VF is not executed, so its diagnostic timing difference must not be attributed to eliminating executed barriers. Code placement and run-to-run variance remain possible explanations.
+Whole-cache byte comparisons against the current C++ baseline pass all eight cases at both one and twelve workers: normal72, empty0, tail9, masked/duplicate slots, fragmented accepted runs with ownership changes, all-invalid slots, nonconsecutive destinations, and a separately compiled 136-token case crossing the 128-slot scan boundary. Unwritten cache bytes are included. New slot patterns obtain their expected outputs from the frozen C++ binary; existing cases reuse archived C++ outputs.
 
-## Separate kernel captures
+Workflow captures are separate from timed benchmarks. Both worker-count captures run in separate allocations after the original 300-second job limit interrupted capture; all three benchmark groups had already completed and are retained. The capture card is recorded separately. Each row below is a single capture of one or 12 physical kernel events, using explicit `kernel-duration-us`, excluding setup-inclusive Worker spans.
 
-Each row below describes one clean workflow capture, not100 timed kernel samples. Twelve workers generate12 physical AIV kernel events. These are standalone Window workflows; full decode/CI workload integration timing is unmeasured.
+| Workers / version | Kernel-event median (us) | Kernel-event max (us) |
+|---|---:|---:|
+| 1/baseline | 32.658 | 32.658 |
+| 1/current | 26.318 | 26.318 |
+| 12/baseline | 6.868 | 7.088 |
+| 12/current | 8.503 | 8.772 |
 
-| Workers / version | Kernel events | Per-event median (us) | Per-event max (us) | Sum across events (us) |
-|---|---:|---:|---:|---:|
-| 1 / baseline | 1 | 31.622 | 31.622 | 31.622 |
-| 1 / current | 1 | 47.651 | 47.651 | 47.651 |
-| 1 / diagnostic | 1 | 47.627 | 47.627 | 47.627 |
-| 12 / baseline | 12 | 7.304 | 7.721 | 87.415 |
-| 12 / current | 12 | 10.148 | 10.487 | 121.897 |
-| 12 / diagnostic | 12 | 8.454 | 9.129 | 101.666 |
+The single-capture event distribution is not the repeated benchmark distribution. Concurrent kernel sums do not give wall time. Full-model integration latency and new-version simulator pipeline timing are not measured in this update. Historical separate-cache simulation results do not describe this packed-cache image.
 
-The sums include parallel execution and cannot be interpreted as elapsed time. Kernel makespan/overlap is not inferred from the setup-inclusive Worker span.
+## Synchronization and remaining lowering differences
 
-## Remaining implementation differences and issue tracking
+- [PTOAS #1754](https://github.com/hw-native-sys/PTOAS/issues/1754) tracks redundant VF VV_ALL. Full-row specialization and bounded dynamic tails remain in source; this update does not patch generated synchronization.
+- [PTOAS #1756](https://github.com/hw-native-sys/PTOAS/issues/1756) tracks false metadata MTE3/Scalar dependencies. The current packed uint8 path avoids the earlier metadata handshake. Required DMA readiness, buffer reuse, ordered publication and final drain remain.
+- Earlier PR revision 504bd07d measured 12-worker 41.55 us source versus 39.40 us after diagnostic tail-VV_ALL removal; its metadata-removal count was zero. Those values belong to the earlier image and must not be presented as results for this aligned source. No new VV_ALL/MTE3_S-removal diagnostic is measured here.
+- Python still packs scale words in registers and writes an aligned 256-byte vector; C++ uses ONEPT_B32 stores per pair. Python splits seven ordinary segments and the final RoPE segment; C++ branches inside an eight-segment loop. Mathematical stages and rounding are aligned on tested inputs, while instruction selection differs.
+- Python uses compiler-generated waits, address/clamp operations and MTE3 barriers. Generated C++ currently places an MTE3 barrier before each payload and scale store; C++ places one after each output run. The compiler policy is not changed by this operator migration.
 
-- C++ scans128 slots and batches consecutive accepted source rows into two-dimensional TLOADs. Python also scans128 slots, but stages token indices and issues per-row input/cosine/sine loads in a separate flush loop. A full Python batch has24 source/RoPE transfers.
+## Toolchain and evidence
 
-- C++ groups consecutive destination slots into two-dimensional TSTORE runs. Python publishes each accepted row separately, with separate payload and scale transfers. It preserves source order, including repeated slots, but does not yet match the baseline transfer grouping.
+PyPTO `9b00701173d80f4b1e0b356fbd326c574e6fe1a3`, PTOAS 0.72, CANN 9.3, A5/dav_3510, runtime `355ce3015e3e344d1fc3a61c206ee01823ce292c`, PTO ISA `5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f`.
 
-- Python keeps zero-initialized64-column RoPE backing buffers while consuming32 logical cosine/sine values per row. The mathematical masks and rounding match the baseline on the listed cases; compacting initialization/storage is a separate follow-up requiring measurement.
-
-- Full-batch calls pass constant8; the tail passes the actual pending count. This avoids the full-batch dynamic VF synchronization cost. No generated-code synchronization deletions are part of the PR source.
-
-- [PTOAS #1754](https://github.com/hw-native-sys/PTOAS/issues/1754) tracks redundant `VV_ALL` in bounded nested Window VF loops. It remains relevant to dynamic tails and is not closed by this migration.
-
-- [PTOAS #1756](https://github.com/hw-native-sys/PTOAS/issues/1756) tracks false MTE3/Scalar metadata dependencies for bounded dynamic UB `alloc_tile` addresses. The older FP8 reinterpretation path reproduced it; the current uint8 packed-cache publication path avoids that handshake. This PR does not fix the compiler analysis and must not close the issue.
-
-Matching the latest baseline requires addressing transfer grouping and remaining startup/address-preparation costs, then remeasuring. The earlier approximately60us expected result for the separate-cache layout cannot be carried across the changed algorithm, storage and C++ implementation.
-
-## Environment and evidence
-
-Selected PyPTO: `9b00701173d80f4b1e0b356fbd326c574e6fe1a3`; PTOAS0.72, CANN9.3, A5/dav_3510; runtime `355ce3015e3e344d1fc3a61c206ee01823ce292c`; PTO ISA `5487a6b0e8d9bd3653dbee8d7c874c667ee8db2f`. No shared runtime/compiler changes.
-
-Final formatted source was recompiled and its location-stripped caller PTO, generated caller C++, and both VF PTO inputs matched the measured build. Repository pre-commit hooks, focused lint and QKV/Window import integration passed. This is operator validation, not a full-model regression run.
-
-Task evidence:
-
-- Offline compilation: `task_20261113_093634_336968817686`;12 workers `task_20261113_093910_35166808899`;136-token shape `task_20261113_094225_369769922645`.
-- Source-to-measured-code comparison: `task_20261113_094409_37969282243`.
-- Single-worker benchmark/workflow: `task_20261113_094317_374603620271`.
-- Twelve-worker benchmark/workflow: `task_20261113_094828_402120524879`.
-- Initial cross-scan replays rejected the incompatible72-token artifact; separate136-token builds resolved the ABI mismatch. Failed attempts are excluded from all timing tables.
+- Initial natural-while compile exposed an inline SSA defect; the explicit-state form compiles. The reduced reproducer fails before PTOAS.
+- Successful compile/assembly tasks: `task_20261113_102042_15071279875`, `task_20261113_102126_155900311295`, `task_20261113_102215_161541311255`. The first assembly sweep encountered the preserved failed artifact; the corrected sweep selected only completed artifacts.
+- Twelve-worker correctness and benchmark: `task_20261113_102259_16574158548`; completed benchmark samples precede its 300-second capture timeout.
+- One-worker correctness/benchmark: `task_20261113_102459_17594103410`; its capture also hit the 300-second limit after all benchmark groups completed.
+- Separate captures and cross-scan checks: twelve workers `task_20261113_102939_202151119007`, one worker `task_20261113_103204_214552026572`.
+- Repository hooks, focused lint and QKV import check pass (`task_20261113_102508_176702610748`); the commit transaction repeats required checks.
 
 Source SHA256:
 
-- `models/deepseek_v4_1_flash/window_publish.py`: `5420f24c1b1389a5e06a98c4aef425f9cf5eac3ccbf68a6412c9b8ccd80c75c1`.
+- `models/deepseek_v4_1_flash/window_publish.py`: `d30728e9f6d784cc92d14119d23513cdb32b3667331f787c63df098df09249b8`.
 - `models/deepseek_v4_1_flash/qkv_proj_rope.py`: `592678676fcd2f299c723ffb65aa9338283eaa3f6fcc84e70667acbf96456c49`.
