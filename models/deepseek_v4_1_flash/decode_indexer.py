@@ -332,6 +332,41 @@ def _idx_pool_score_topk(
     ...
 
 
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "idx_gather_pool.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _idx_gather_pool(
+    index_cache: pl.Tensor,
+    index_cache_scale: pl.Tensor,
+    block_table: pl.Tensor,
+    request_ids: pl.Tensor,
+    lengths: pl.Tensor,
+    pool_block_ids: pl.Tensor,
+    pool_block_counts: pl.Tensor,
+    payloads: pl.Out[pl.Tensor],
+    scales: pl.Out[pl.Tensor],
+    valid: pl.Out[pl.Tensor],
+    physical: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    capacity: pl.Scalar[pl.INDEX],
+    gathered_rows: pl.Scalar[pl.INDEX],
+):
+    """Gather candidate payload and scale panels with physical-row metadata."""
+    ...
+
+
+@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "index_pool_select.cpp",
+               include_dirs=(pto_isa_include_dir(),))
+def _index_pool_select(
+    scores: pl.Tensor,
+    lengths: pl.Tensor,
+    output: pl.Out[pl.Tensor],
+    num_tokens: pl.Scalar[pl.INT32],
+    block_maxima: pl.Scalar[pl.INT32],
+):
+    """Select bounded candidate pools by exact FP32 maxima and stable logical IDs."""
+    ...
+
+
 @pl.jit.inline
 def _merge_candidate_pairs(
     arena: pl.Tensor,
@@ -437,6 +472,7 @@ def select_candidate_block_pool(
     pool_block_counts: pl.Tensor[[T_DYN], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     scores_ready: pl.Scalar[pl.TASK_ID],
+    precomputed_maxima: pl.constexpr = False,
 ):
     """Publish sorted logical candidate block IDs and per-query counts."""
     tokens = pl.tensor.dim(pool_block_ids, 0)
@@ -464,7 +500,18 @@ def select_candidate_block_pool(
                 pl.store(pl.tile.set_validshape(ids, 1, capacity), [token, 0], pool_block_ids)
             if worker == 0:
                 _publish_candidate_counts(compressed_lens, pool_block_counts, active_tokens, positions, capacity)
-        pool_tid = pl.yield_(all_tid)
+        pool_tid = all_tid
+    elif block_count <= 32768:
+        workers = pl.max(1, pl.min(tokens, 64))
+        active_count = pl.cast(active_tokens, pl.INT32)
+        input_format = pl.cast(0, pl.INT32)
+        if precomputed_maxima:
+            input_format = pl.cast(1, pl.INT32)
+        with pl.spmd(workers, name_hint="pool_select", deps=[scores_ready]) as selected_tid:
+            _index_pool_select(index_scores, compressed_lens, pool_block_ids, active_count, input_format)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="pool_count", deps=[selected_tid]) as count_tid:
+            _publish_candidate_counts(compressed_lens, pool_block_counts, active_tokens, positions, capacity)
+        pool_tid = count_tid
     else:
         padded_block_count = (block_count + CANDIDATE_LEAF_TILE - 1) // CANDIDATE_LEAF_TILE * CANDIDATE_LEAF_TILE
         score_tiles = (block_count + CANDIDATE_SCORE_TILE - 1) // CANDIDATE_SCORE_TILE
@@ -547,7 +594,7 @@ def select_candidate_block_pool(
             pl.store(pl.tile.set_validshape(sorted_ids, 1, capacity), [token, 0], pool_block_ids)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="pool_count", deps=[selected_tid]) as counts_tid:
             _publish_candidate_counts(compressed_lens, pool_block_counts, active_tokens, positions, capacity)
-        pool_tid = pl.yield_(counts_tid)
+        pool_tid = counts_tid
     return pool_tid
 
 
@@ -932,7 +979,7 @@ def score_select_reindex(
         selected, scores_tid = score_select_paged(
             query, query_scale, weights, index_cache, index_cache_scale,
             block_table, request_ids, lengths, paged_scores, output,
-            num_tokens, plan_tid, query_ready, weights_ready, capacity, False,
+            num_tokens, plan_tid, query_ready, weights_ready, capacity, False, False,
         )
         result = selected
     else:
@@ -972,63 +1019,17 @@ def _score_select_pool(
     gathered_rows = panels * 256
     total_rows = tokens * gathered_rows
     total_scales = total_rows * _SCALE_COUNT
-    cache_pages = pl.tensor.dim(index_cache, 0)
-    cache_rows = cache_pages * 128
-    cache_flat = pl.reshape(index_cache, [cache_rows, INDEX_DIM // 2])
-    scale_flat = pl.reshape(index_cache_scale, [cache_rows // 8, 32])
     payloads = pl.create_tensor([total_rows, INDEX_DIM // 2], dtype=pl.UINT8)
     scales = pl.create_tensor([1, total_scales], dtype=pl.UINT8)
     valid = pl.create_tensor([1, total_rows], dtype=pl.INT32)
     physical = pl.create_tensor([1, total_rows], dtype=pl.INT32)
     runs = pl.create_tensor([4, tokens + 1], dtype=pl.INT32)
     table_width = pl.tensor.dim(block_table, 1)
-    request_count = pl.tensor.dim(block_table, 0)
-    with pl.spmd(32, name_hint="idx_gather_pool", deps=[cache_ready, pool_ready]) as gather_tid:
-        worker = pl.tile.get_block_idx()
-        for work in pl.range(worker, num_tokens * panels, 32):
-            token = work // panels
-            panel = work % panels
-            slot_begin = panel * 32
-            count = pl.max(0, pl.min(pl.read(pool_block_counts, [token]), capacity))
-            request = pl.read(request_ids, [token])
-            visible = pl.max(0, pl.read(lengths, [token]))
-            packed = pl.tile.full([256, INDEX_DIM // 2], dtype=pl.INT8, value=0)
-            raw_scale = pl.tile.full([1, 256 * _SCALE_COUNT], dtype=pl.INT8, value=127)
-            valid_lanes = pl.tile.full([1, 256], dtype=pl.INT32, value=0)
-            physical_lanes = pl.tile.full([1, 256], dtype=pl.INT32, value=-1)
-            for block in pl.range(32):
-                slot = slot_begin + block
-                if slot < count:
-                    logical_block = pl.read(pool_block_ids, [token, slot])
-                    if logical_block >= 0 and logical_block < (visible + 7) // 8:
-                        logical_page = logical_block // 16
-                        if request >= 0 and request < request_count and logical_page < table_width:
-                            page = pl.read(block_table, [pl.cast(request, pl.INDEX), logical_page])
-                            if page >= 0 and page < cache_pages:
-                                physical_row = pl.cast(page, pl.INDEX) * 128 + (logical_block % 16) * 8
-                                payload_raw = pl.load(cache_flat, [physical_row, 0], [8, INDEX_DIM // 2], target_memory=pl.MemorySpace.Vec)
-                                payload = pl.reinterpret_view(payload_raw, pl.INT8)
-                                packed[block * 8:block * 8 + 8, :] = payload
-                                scales_raw = pl.load(scale_flat, [physical_row // 8, 0], [1, 32], target_memory=pl.MemorySpace.Vec)
-                                block_scale_bytes = pl.reinterpret_view(scales_raw, pl.UINT8)
-                                block_scales = pl.reinterpret_view(block_scale_bytes, pl.INT8)
-                                raw_scale[:, block * 32:block * 32 + 32] = block_scales
-                                lanes = pl.tile.arange(0, [1, 8], dtype=pl.INT32)
-                                remaining = pl.cast(pl.min(8, visible - logical_block * 8), pl.INT32)
-                                lane_valid = pl.tile.cmps(lanes, remaining, cmp_type=2)
-                                ones = pl.tile.full([1, 8], dtype=pl.INT32, value=1)
-                                block_valid = pl.tile.select(lane_valid, ones, 0)
-                                block_physical = pl.add(lanes, pl.cast(physical_row, pl.INT32))
-                                block_physical = pl.tile.select(lane_valid, block_physical, -1)
-                                valid_lanes[:, block * 8:block * 8 + 8] = block_valid
-                                physical_lanes[:, block * 8:block * 8 + 8] = block_physical
-            row_offset = token * gathered_rows + panel * 256
-            packed_bytes = pl.reinterpret_view(packed, pl.UINT8)
-            pl.store(packed_bytes, [row_offset, 0], payloads)
-            scale_bytes = pl.reinterpret_view(raw_scale, pl.UINT8)
-            pl.store(scale_bytes, [0, row_offset * _SCALE_COUNT], scales)
-            pl.store(valid_lanes, [0, row_offset], valid)
-            pl.store(physical_lanes, [0, row_offset], physical)
+    with pl.spmd(64, name_hint="idx_gather_pool", deps=[cache_ready, pool_ready]) as gather_tid:
+        _idx_gather_pool(
+            index_cache, index_cache_scale, block_table, request_ids, lengths, pool_block_ids, pool_block_counts,
+            payloads, scales, valid, physical, num_tokens, capacity, gathered_rows,
+        )
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_plan_pool_runs", deps=[pool_ready]) as runs_tid:
         for token in pl.range(num_tokens):
             count = pl.max(0, pl.min(pl.read(pool_block_counts, [token]), capacity))
@@ -1076,6 +1077,7 @@ def score_select_paged(
     weights_ready: pl.Scalar[pl.TASK_ID],
     pool_capacity: pl.Scalar[pl.INDEX],
     c2a: pl.constexpr,
+    emit_block_maxima: pl.constexpr = False,
 ):
     """Score history shards and merge their TopK within one MIX."""
     width = pl.tensor.dim(scores, 1)
@@ -1092,6 +1094,9 @@ def score_select_paged(
     if not c2a:
         if block_count > pl.min(pool_capacity, CANDIDATE_TOPK_BLOCKS):
             emit_scores = pl.cast(1, pl.INT32)
+            if emit_block_maxima:
+                if block_count <= 32768:
+                    emit_scores = pl.cast(2, pl.INT32)
     run_stride = pl.tensor.dim(runs, 1)
     table_width = pl.tensor.dim(block_table, 1)
     active_tokens = pl.cast(num_tokens, pl.INT32)
@@ -2538,7 +2543,7 @@ def decode_c2a_indexer(
     selected_tid, scores_tid = score_select_paged(
         query, query_scale, raw_weights, index_cache, index_cache_scale,
         index_block_table, token_to_req_indices, compressed_lens, scores, topk_indices,
-        num_tokens, index_publish_tid, query_tid, weights_tid, score_width // CANDIDATE_BLOCK_SIZE, True,
+        num_tokens, index_publish_tid, query_tid, weights_tid, score_width // CANDIDATE_BLOCK_SIZE, True, False,
     )
     return selected_tid
 

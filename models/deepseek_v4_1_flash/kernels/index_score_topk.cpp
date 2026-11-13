@@ -465,15 +465,37 @@ namespace {
                 for (int column = 0; column < cached_width; column += 256) {
                     unpack_scores(rounded.data(), ub<uint16_t>(98304 + row * 51200) + column);
                     TCVT(values, rounded, RoundMode::CAST_RINT);
-                    int valid = minimum(256, cached_width - column);
-                    Tile<TileType::Vec, float, 1, 256, BLayout::RowMajor, 1, DYNAMIC> output(valid);
-                    TASSIGN(output, 512);
+                    if (args[20] == 2) {
+                        Vec<float, 32, 8> grouped, scratch;
+                        Tile<TileType::Vec, float, 32, 1, BLayout::ColMajor> maxima;
+                        TASSIGN(grouped, 512);
+                        TASSIGN(scratch, 2048);
+                        TASSIGN(maxima, 4096 + column / 8 * 4);
+                        TROWMAX(maxima, grouped, scratch);
+                    } else {
+                        int valid = minimum(256, cached_width - column);
+                        Tile<TileType::Vec, float, 1, 256, BLayout::RowMajor, 1, DYNAMIC> output(valid);
+                        TASSIGN(output, 512);
+                        GM<float, 1, DYNAMIC, 1, DYNAMIC> gm(
+                            data<float>(args, 14) + (begin + offset) * width + logical + column,
+                            TileShape2D<float, 1, DYNAMIC>(1, valid), BaseShape2D<float, 1, DYNAMIC>(1, width));
+                        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                        TSTORE(gm, output);
+                        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+                        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+                    }
+                }
+                if (args[20] == 2) {
+                    int blocks = (cached_width + 7) / 8;
+                    Tile<TileType::Vec, float, 1, 3200, BLayout::RowMajor, 1, DYNAMIC> maxima(blocks);
+                    TASSIGN(maxima, 4096);
                     GM<float, 1, DYNAMIC, 1, DYNAMIC> gm(
-                        data<float>(args, 14) + (begin + offset) * width + logical + column,
-                        TileShape2D<float, 1, DYNAMIC>(1, valid), BaseShape2D<float, 1, DYNAMIC>(1, width));
+                        data<float>(args, 14) + (begin + offset) * width + logical / 8,
+                        TileShape2D<float, 1, DYNAMIC>(1, blocks), BaseShape2D<float, 1, DYNAMIC>(1, width));
                     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                    TSTORE(gm, output);
+                    TSTORE(gm, maxima);
                     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
                     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
                 }
