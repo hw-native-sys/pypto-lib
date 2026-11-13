@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
 # Re-enable CPU validation when flat MX scale packing is corrected:
 # https://github.com/hw-native-sys/pto-isa/issues/357
 """V4.1 inverse RoPE, grouped W8A8 MXFP8 output projection, and HC post."""
@@ -48,7 +49,6 @@ O_IN_SCALE_COLS = pl.dynamic("O_IN_SCALE_COLS")
 O_OUT_SCALE_COLS = pl.dynamic("O_OUT_SCALE_COLS")
 
 # tiling
-O_A_N_TILE = 256
 OB_HC_POST_COLUMNS = 27  # 26 full N192 tiles plus one N128 tile.
 
 
@@ -67,25 +67,6 @@ def _quant_o_vf(
     """Inverse-rotate BF16 tails and quantize projection inputs to OCP MXFP8."""
     # Preserve both extern Out values: https://github.com/hw-native-sys/pypto/issues/3249
     return payload, scales
-
-
-@pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "o_proj_a.cpp",
-               aiv_source=Path(__file__).parent / "kernels" / "o_proj_a.cpp",
-               include_dirs=(pto_isa_include_dir(),), dual_aiv_dispatch=True)
-def _o_proj_a(
-    payload: pl.Tensor[[O_GROUP_ROWS, O_GROUP_IN], pl.FP8E4M3FN],
-    weight: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    activation_scale: pl.Tensor[[LOCAL_O_GROUPS, O_IN_SCALE_COLS], pl.FP8E8M0],
-    weight_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    output: pl.Out[pl.Tensor[[O_PAD_ROWS, LOCAL_O_WIDTH], pl.FP8E4M3FN]],
-    output_scale: pl.Out[pl.Tensor[[1, O_OUT_SCALE_COLS], pl.FP8E8M0]],
-    output_width: pl.Scalar[pl.INDEX],
-    active_rows: pl.Scalar[pl.INT32],
-    padded_rows: pl.Scalar[pl.INDEX],
-    row_tile: pl.Scalar[pl.INDEX],
-) -> tuple[pl.Tensor, pl.Tensor]:
-    """Round the O-A result to BF16 and quantize on the paired Vector cores."""
-    return output, output_scale
 
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "o_proj_b_hc_post.cpp",
@@ -118,49 +99,50 @@ def o_proj_a_pypto(
     output_width: pl.Scalar[pl.INDEX],
     active_rows: pl.Scalar[pl.INT32],
     padded_rows: pl.Scalar[pl.INDEX],
+    row_tile: pl.constexpr = 80,
 ):
     projected = pl.create_tensor([padded_rows, output_width], dtype=pl.FP32)
-    for group in pl.parallel(output_width // 1024):
-        w: pl.Tensor[[4096, 1024], pl.FP8E4M3FN, pl.NZ] = weight[group]
-        sw = weight_scale[group]
+    for cube_group in pl.parallel(output_width // 1024):
+        w: pl.Tensor[[4096, 1024], pl.FP8E4M3FN, pl.NZ] = weight[cube_group]
+        sw = weight_scale[cube_group]
         sw = pl.tensor.view(sw, [128, 1024], layout=pl.MX_B_NN)
-        for mt in pl.parallel(padded_rows // 80):
-            row = mt * 80
-            scale_start = row * 128
-            scale_end = scale_start + 80 * 128
-            sa = activation_scale[group, scale_start:scale_end]
-            sa = pl.reshape(sa, [80, 128])
-            sa = pl.tensor.view(sa, [80, 128], layout=pl.MX_A_ZZ)
-            for nb in pl.spmd(4):
-                col = nb * 256
-                a0 = pl.load(payload, [group * padded_rows + row, 0], [80, 256], target_memory=pl.Mem.Mat)
-                sa0 = pl.load(sa, [0, 0], [80, 8])
-                b0 = pl.load(w, [0, col], [256, 256], target_memory=pl.Mem.Mat)
-                sb0 = pl.load(sw, [0, col], [8, 256])
+        for cube_mt in pl.parallel(padded_rows // row_tile):
+            cube_row = cube_mt * row_tile
+            scale_start = cube_row * 128
+            scale_end = scale_start + row_tile * 128
+            sa = activation_scale[cube_group, scale_start:scale_end]
+            sa = pl.reshape(sa, [row_tile, 128])
+            sa = pl.tensor.view(sa, [row_tile, 128], layout=pl.MX_A_ZZ)
+            for cube_nb in pl.spmd(4):
+                cube_col = cube_nb * 256
+                a0 = pl.load(payload, [cube_group * padded_rows + cube_row, 0], [row_tile, 256], target_memory=pl.Mem.Mat)
+                sa0 = pl.load(sa, [0, 0], [row_tile, 8])
+                b0 = pl.load(w, [0, cube_col], [256, 256], target_memory=pl.Mem.Mat)
+                sb0 = pl.load(sw, [0, cube_col], [8, 256])
                 acc = pl.matmul_mx(a0, sa0, b0, sb0)
                 for k in pl.pipeline(256, 4096, 256, stage=2):
-                    av = pl.load(payload, [group * padded_rows + row, k], [80, 256], target_memory=pl.Mem.Mat)
-                    sav = pl.load(sa, [0, k // 32], [80, 8])
-                    bv = pl.load(w, [k, col], [256, 256], target_memory=pl.Mem.Mat)
-                    sbv = pl.load(sw, [k // 32, col], [8, 256])
+                    av = pl.load(payload, [cube_group * padded_rows + cube_row, k], [row_tile, 256], target_memory=pl.Mem.Mat)
+                    sav = pl.load(sa, [0, k // 32], [row_tile, 8])
+                    bv = pl.load(w, [k, cube_col], [256, 256], target_memory=pl.Mem.Mat)
+                    sbv = pl.load(sw, [k // 32, cube_col], [8, 256])
                     acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
-                projected = pl.store(acc, [row, group * 1024 + col], projected)
+                projected = pl.store(acc, [cube_row, cube_group * 1024 + cube_col], projected)
     scale_rows = padded_rows // 16
     scale_cols = output_width // 2
     scales = pl.reshape(output_scale, [scale_rows, scale_cols])
     column_tiles = output_width // 256
-    for task in pl.spmd(padded_rows // 80 * column_tiles):
-        row = task // column_tiles * 80
+    for task in pl.spmd(padded_rows // row_tile * column_tiles):
+        row = task // column_tiles * row_tile
         group = task % column_tiles // 4
         nb = task % 4
         col = nb * 256
-        values = pl.load(projected, [row, group * 1024 + col], [80, 256], target_memory=pl.Mem.Vec)
-        flat = pl.reshape(values, [80 * 256])
-        valid_rows = pl.max(0, pl.min(80, active_rows - row))
-        quant_bytes = pl.create_tile([80 * 256], dtype=pl.INT8, target_memory=pl.Mem.Vec)
-        scale_pairs = pl.create_tile([80 * 256 // 64], dtype=pl.UINT16, target_memory=pl.Mem.Vec)
-        scale_bytes = pl.reinterpret_view(scale_pairs, pl.UINT8, shape=[80 * 256 // 32])
-        quant_words = pl.reinterpret_view(quant_bytes, pl.UINT32, shape=[80 * 256 // 4])
+        values = pl.load(projected, [row, group * 1024 + col], [row_tile, 256], target_memory=pl.Mem.Vec)
+        flat = pl.reshape(values, [row_tile * 256])
+        valid_rows = pl.max(0, pl.min(row_tile, active_rows - row))
+        quant_bytes = pl.create_tile([row_tile * 256], dtype=pl.INT8, target_memory=pl.Mem.Vec)
+        scale_pairs = pl.create_tile([row_tile * 256 // 64], dtype=pl.UINT16, target_memory=pl.Mem.Vec)
+        scale_bytes = pl.reinterpret_view(scale_pairs, pl.UINT8, shape=[row_tile * 256 // 32])
+        quant_words = pl.reinterpret_view(quant_bytes, pl.UINT32, shape=[row_tile * 256 // 4])
         with pl.reg_scope():
             q_full16 = pl.reg.full_mask(lanes=128)
             q_lane16 = pl.reg.index_gen(0, lanes=128, dtype=pl.UINT16)
@@ -172,7 +154,7 @@ def o_proj_a_pypto(
             q_scatter_relative = pl.reg.shift_lefts(q_lane16, 4, q_full16)
             q_four = pl.reg.active_mask(4, lanes=128)
             q_init_zero = pl.reg.broadcast(0, lanes=64, dtype=pl.UINT16)
-            for q_init in pl.hardware_loop(5):
+            for q_init in pl.hardware_loop(row_tile // 16):
                 _q_initialized = pl.reg.store(scale_pairs, offset=q_init * 64, value=q_init_zero)
             for q_r in pl.hardware_loop(valid_rows):
                 q_raw = pl.reg.load(flat, offset=q_r * 256, lanes=256)
@@ -216,15 +198,15 @@ def o_proj_a_pypto(
                 q_offsets = pl.reg.adds(q_scatter_relative, q_scale_base16, q_full16)
                 _q_scale_written = pl.reg.scatter(scale_pairs, q_offsets, q_packed, q_four)
             empty = pl.reg.broadcast(0, lanes=256, dtype=pl.INT8)
-            for inactive in pl.hardware_loop(80 - valid_rows):
+            for inactive in pl.hardware_loop(row_tile - valid_rows):
                 pad_row = valid_rows + inactive
                 _padding_written = pl.reg.store(quant_bytes, offset=pad_row * 256, value=empty)
-        quantized = pl.reshape(quant_bytes, [80, 256])
+        quantized = pl.reshape(quant_bytes, [row_tile, 256])
         quantized = pl.reinterpret_view(quantized, pl.FP8E4M3FN)
-        scale = pl.reshape(scale_bytes, [5, 256 // 2])
+        scale = pl.reshape(scale_bytes, [row_tile // 16, 256 // 2])
         scale = pl.reinterpret_view(scale, pl.FP8E8M0)
         output = pl.store(quantized, [row, group * 1024 + col], output)
-        packed = pl.reshape(scale, [5, 128])
+        packed = pl.reshape(scale, [row_tile // 16, 128])
         scales = pl.store(packed, [row // 16, group * 512 + nb * 128], scales)
     return output, output_scale
 
@@ -261,12 +243,15 @@ def o_proj_hc_post(
         )
     payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
     activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-    oa_tasks = (padded_rows // oa_tile) * (LOCAL_O_WIDTH // O_A_N_TILE)
-    oa_workers = pl.max(1, pl.min(oa_tasks, pl.system.available_cluster_count()))
-    with pl.spmd(oa_workers, name_hint="proj_o_a_quant"):
-        payload, activation_scale = _o_proj_a(
+    if total_rows > oa_row_tile:
+        payload, activation_scale = o_proj_a_pypto(
             payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
-            LOCAL_O_WIDTH, num_tokens, padded_rows, oa_tile,
+            LOCAL_O_WIDTH, num_tokens, padded_rows, row_tile=128,
+        )
+    else:
+        payload, activation_scale = o_proj_a_pypto(
+            payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
+            LOCAL_O_WIDTH, num_tokens, padded_rows, row_tile=oa_row_tile,
         )
     ob_tasks = ((total_rows + ob_row_tile - 1) // ob_row_tile) * OB_HC_POST_COLUMNS
     ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
@@ -378,54 +363,6 @@ def o_proj_hc_post_validation(
         residual, post_mix, residual_mix, output, num_tokens,
         oa_row_tile=80, ob_row_tile=128,
     )
-    return output
-
-
-@pl.jit
-def o_proj_hc_post_native_validation(
-    attended: pl.Tensor[[T_DYN, LOCAL_H * HEAD_DIM], pl.BF16],
-    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], pl.FP8E4M3FN],
-    wo_a_scale: pl.Tensor[[LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], pl.FP8E8M0],
-    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
-    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
-    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
-    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
-    post_mix: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
-    residual_mix: pl.Tensor[[T_DYN, HC_MULT, HC_MULT], pl.FP32],
-    output: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    """Validate native M80 O-A between C++ quantization and fused O-B/HC post."""
-    attended.bind_dynamic(0, T_DYN)
-    rope_cos.bind_dynamic(0, T_DYN)
-    rope_sin.bind_dynamic(0, T_DYN)
-    residual.bind_dynamic(0, T_DYN)
-    post_mix.bind_dynamic(0, T_DYN)
-    residual_mix.bind_dynamic(0, T_DYN)
-    output.bind_dynamic(0, T_DYN)
-    total_rows = pl.tensor.dim(output, 0)
-    padded_rows = ((total_rows + 79) // 80) * 80
-    payload_all = pl.create_tensor([LOCAL_O_GROUPS * padded_rows, O_GROUP_IN], dtype=pl.FP8E4M3FN)
-    scales_all = pl.create_tensor([LOCAL_O_GROUPS, padded_rows * (O_GROUP_IN // 32)], dtype=pl.FP8E8M0)
-    vector_workers = 2 * pl.system.available_cluster_count()
-    with pl.spmd(vector_workers, name_hint="quant_o_vf"):
-        payload_all, scales_all = _quant_o_vf(
-            attended, rope_cos, rope_sin, payload_all, scales_all, num_tokens, LOCAL_O_GROUPS, padded_rows,
-        )
-    payload = pl.create_tensor([padded_rows, LOCAL_O_WIDTH], dtype=pl.FP8E4M3FN)
-    activation_scale = pl.create_tensor([1, padded_rows * (LOCAL_O_WIDTH // 32)], dtype=pl.FP8E8M0)
-    payload, activation_scale = o_proj_a_pypto(
-        payload_all, wo_a, scales_all, wo_a_scale, payload, activation_scale,
-        LOCAL_O_WIDTH, num_tokens, padded_rows,
-    )
-    ob_tasks = ((total_rows + 127) // 128) * OB_HC_POST_COLUMNS
-    ob_workers = pl.max(1, pl.min(ob_tasks, pl.system.available_cluster_count()))
-    with pl.spmd(ob_workers, name_hint="proj_o_b_hc_post"):
-        output = _o_proj_b_hc_post(
-            payload, wo_b, activation_scale, wo_b_scale,
-            residual, post_mix, residual_mix, output, total_rows, 128,
-        )
     return output
 
 
@@ -545,20 +482,19 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tokens", type=int, help="active rows for a single padded case")
-    parser.add_argument("--native-oa", action="store_true", help="validate native M80 O-A with fused C++ O-B/HC post")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--save-data", action="store_true")
     args = parser.parse_args()
-    validation = o_proj_hc_post_native_validation if args.native_oa else o_proj_hc_post_validation
     if args.tokens is not None and args.tokens < 0:
         parser.error("tokens must be nonnegative")
-    cases = ((0, True), (17, True), (72, False), (129, True))
+    cases = ((0, True), (17, True), (72, False), (129, True),
+             (224, False), (225, False), (240, False), (241, False))
     if args.tokens is not None:
         cases = ((args.tokens, True),)
     for active, padded in cases:
         print(f"[O_PROJ] active={active}, padded={padded}, FP32 HC post", flush=True)
         result = run(
-            fn=validation,
+            fn=o_proj_hc_post_validation,
             specs=build_o_proj_hc_post_specs(active, pad_to_tile=padded),
             golden_fn=golden_o_proj_hc_post_validation,
             compare_fn={

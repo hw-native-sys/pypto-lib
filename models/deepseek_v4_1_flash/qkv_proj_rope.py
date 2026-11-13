@@ -24,9 +24,6 @@ from rmsnorm import golden_rms_norm
 
 
 # Dynamic shape variables.
-QA_INPUT_ROWS = pl.dynamic("QA_INPUT_ROWS")
-QA_SCALE_COLS = pl.dynamic("QA_SCALE_COLS")
-QA_OUTPUT_ROWS = pl.dynamic("QA_OUTPUT_ROWS")
 KV_INPUT_ROWS = pl.dynamic("KV_INPUT_ROWS")
 KV_SCALE_COLS = pl.dynamic("KV_SCALE_COLS")
 KV_OUTPUT_ROWS = pl.dynamic("KV_OUTPUT_ROWS")
@@ -42,27 +39,11 @@ ROPE_DIM = M.qk_rope_head_dim
 Q_LORA = M.q_lora_rank
 
 # tiling
-Q_A_N_TILE = 64
 Q_B_N_TILE = 256
 KV_N_TILE = 64
 PROJ_M_TILE = 80
 WINDOW_PUBLISH_WORKER_TILE = 12
 NATIVE_VALIDATION_WORKERS = 32
-
-
-@pl.jit.extern(core_type="aic", source=Path(__file__).parent / "kernels" / "proj_q_a.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _proj_q_a(
-    payload: pl.Tensor[[QA_INPUT_ROWS, D], pl.FP8E4M3FN],
-    weight: pl.Tensor,
-    activation_scale: pl.Tensor[[1, QA_SCALE_COLS], pl.FP8E8M0],
-    weight_scale: pl.Tensor,
-    output: pl.Out[pl.Tensor[[QA_OUTPUT_ROWS, Q_LORA], pl.BF16]],
-    rows: pl.Scalar[pl.INDEX],
-    row_tile: pl.Scalar[pl.INDEX],
-) -> pl.Tensor:
-    """Project ND activations and NZ weights with packed MX scales."""
-    return output
 
 
 @pl.jit.extern(core_type="mixed", aic_source=Path(__file__).parent / "kernels" / "proj_q_b.cpp",
@@ -169,19 +150,13 @@ def q_proj_rope(
     qb_row_tile: pl.constexpr = 80,
 ):
     """Project NZ QA/QB weights, rotate Q, and retain normalized rows for Index-Q."""
-    # Native QA tiles: M80/N64 or M256/N128; QB tiles: M80/N256 or M128/N256.
-    if qa_row_tile == 256:
-        qa_n_tile = 128
-    else:
-        qa_n_tile = Q_A_N_TILE
     payload_rows = padded_rows
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     projected = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.BF16)
-    qa_tasks = ((num_tokens + qa_row_tile - 1) // qa_row_tile) * (Q_LORA // qa_n_tile)
-    qa_workers = pl.max(pl.min(qa_tasks, qa_worker_limit), 1)
-    with pl.spmd(qa_workers, name_hint="proj_q_a"):
-        projected = _proj_q_a(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_row_tile)
+    projected = proj_q_a_pypto(
+        payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit, qa_row_tile,
+    )
     norm_workers = pl.max(pl.min(payload_rows // MX_M_TILE, 32), 1)
     latent_rows = pl.tensor.dim(query_latent, 0)
     norm_latent = pl.tensor.slice(query_latent, [latent_rows, Q_LORA], [0, 0])
@@ -266,32 +241,44 @@ def proj_q_a_pypto(
     output: pl.Tensor,
     rows: pl.Scalar[pl.INDEX],
     worker_limit: pl.constexpr = 32,
+    row_tile: pl.constexpr = 80,
 ):
+    if row_tile == 256:
+        n_tile = 128
+    else:
+        n_tile = 64
+    nz_weight: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN, pl.NZ] = weight[:, :]
     scale_width = weight.shape[0] // 32
-    for mt in pl.parallel((rows + 79) // 80):
-        scale_begin = mt * 80 * scale_width
-        scale_end = scale_begin + 80 * scale_width
+    for mt in pl.parallel((rows + row_tile - 1) // row_tile):
+        scale_begin = mt * row_tile * scale_width
+        scale_end = scale_begin + row_tile * scale_width
         sa = activation_scale[0, scale_begin:scale_end]
-        sa = pl.reshape(sa, [80, scale_width])
-        sa = pl.tensor.view(sa, [80, scale_width], layout=pl.MX_A_ZZ)
-        for worker in pl.spmd(pl.min(worker_limit, 20)):
-            for base in pl.range(0, 20, worker_limit):
-                if base + worker < 20:
-                    row = mt * 80
-                    col = (base + worker) * 64
-                    full_a = pl.load(payload, [row, 0], [80, 5120], target_memory=pl.Mem.Mat)
-                    a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
-                    sa0 = pl.load(sa, [0, 0], [80, 8])
-                    b0 = pl.load(weight, [0, col], [256, 64], target_memory=pl.Mem.Mat)
-                    sb0 = pl.load(weight_scale, [0, col], [8, 64])
+        sa = pl.reshape(sa, [row_tile, scale_width])
+        sa = pl.tensor.view(sa, [row_tile, scale_width], layout=pl.MX_A_ZZ)
+        for worker in pl.spmd(pl.min(worker_limit, Q_LORA // n_tile)):
+            for base in pl.range(0, Q_LORA // n_tile, worker_limit):
+                if base + worker < Q_LORA // n_tile:
+                    row = mt * row_tile
+                    col = (base + worker) * n_tile
+                    if row_tile == 80:
+                        full_a = pl.load(payload, [row, 0], [80, 5120], target_memory=pl.Mem.Mat)
+                        a0 = pl.tile.slice(full_a, [80, 256], [0, 0])
+                    else:
+                        a0 = pl.load(payload, [row, 0], [row_tile, 256], target_memory=pl.Mem.Mat)
+                    sa0 = pl.load(sa, [0, 0], [row_tile, 8])
+                    b0 = pl.load(nz_weight, [0, col], [256, n_tile], target_memory=pl.Mem.Mat)
+                    sb0 = pl.load(weight_scale, [0, col], [8, n_tile])
                     acc = pl.matmul_mx(a0, sa0, b0, sb0)
                     for k in pl.pipeline(256, 5120, 256, stage=2):
-                        av = pl.tile.slice(full_a, [80, 256], [0, k])
-                        sav = pl.load(sa, [0, k // 32], [80, 8])
-                        bv = pl.load(weight, [k, col], [256, 64], target_memory=pl.Mem.Mat)
-                        sbv = pl.load(weight_scale, [k // 32, col], [8, 64])
+                        if row_tile == 80:
+                            av = pl.tile.slice(full_a, [80, 256], [0, k])
+                        else:
+                            av = pl.load(payload, [row, k], [row_tile, 256], target_memory=pl.Mem.Mat)
+                        sav = pl.load(sa, [0, k // 32], [row_tile, 8])
+                        bv = pl.load(nz_weight, [k, col], [256, n_tile], target_memory=pl.Mem.Mat)
+                        sbv = pl.load(weight_scale, [k // 32, col], [8, n_tile])
                         acc = pl.matmul_mx_acc(acc, av, sav, bv, sbv)
-                    valid = pl.set_validshape(acc, pl.min(80, rows - row), 64)
+                    valid = pl.set_validshape(acc, pl.min(row_tile, rows - row), n_tile)
                     output = pl.store(valid, [row, col], output)
     return output
 
@@ -432,7 +419,7 @@ def q_proj_rope_pypto(
     """Project NZ QA/QB weights, rotate Q, and retain normalized rows for Index-Q."""
     payload_rows = padded_rows
     projected = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.BF16)
-    projected = proj_q_a_pypto(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit)
+    projected = proj_q_a_pypto(payload, wq_a, scales, wq_a_scale, projected, num_tokens, qa_worker_limit, row_tile=80)
     qb_payload = pl.create_tensor([payload_rows, Q_LORA], dtype=pl.FP8E4M3FN)
     qb_scales = pl.create_tensor([1, payload_rows * (Q_LORA // 32)], dtype=pl.FP8E8M0)
     norm_workers = pl.max(pl.min(payload_rows // MX_M_TILE, 32), 1)
@@ -495,7 +482,7 @@ def qkv_native(
 
 
 @pl.jit
-def qkv_cpp(
+def qkv_validation(
     payload: pl.Tensor,
     scales: pl.Tensor,
     wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
