@@ -157,10 +157,10 @@ def decode_c1a_full(
         index_cache, index_cache_scale, index_block_table, request_ids, compressed_lens,
         scores, topk_indices,
         num_tokens, index_ready, query_tid, weights_tid,
-        pl.tensor.dim(pool_block_ids, 1), False,
+        pl.tensor.dim(pool_block_ids, 1), False, True,
     )
     pool_tid = select_candidate_block_pool(
-        scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid,
+        scores, compressed_lens, pool_block_ids, pool_block_counts, num_tokens, scores_tid, True,
     )
     selection_ready = pl.system.task_dummy(deps=[topk_tid, pool_tid, compressed_ready])
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
@@ -566,6 +566,12 @@ def build_c1a_specs(
             values["compressed_slots"].fill_(-1)
     elif case == "sink":
         values["attn_sink"].fill_(10000)
+    elif case == "pool":
+        # Two repeated key magnitudes create ties across the candidate cutoff.
+        values["index_cache"].fill_(0x22)
+        values["index_cache"][::PAGES].fill_(0x44)
+        values["index_cache"][PAGES - 2::PAGES].fill_(0x44)
+        values["index_cache_scale"].view(torch.uint8).fill_(127)
 
     # Build sorted complete-block fixtures with the newest causal block.
     pool_capacity = index_pool_block_capacity(PAGES * 128)
@@ -619,6 +625,7 @@ if __name__ == "__main__":
     from utils import configure_decode_workload, parse_decode_query_lens, parse_decode_startpos
 
     import argparse
+    import os
 
     from pypto.ir import DistributedConfig
 
@@ -631,91 +638,112 @@ if __name__ == "__main__":
     query_help = "one query length per start-pos; omitted: config.DECODE_SEQ each"
     parser.add_argument("--query-lens", type=parse_decode_query_lens, help=query_help)
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--case", choices=["random", "ragged", "masked", "sink"], default="random")
+    case_help = "fixture; omitted: random plus a small tied candidate-pool correctness case"
+    parser.add_argument("--case", choices=["random", "ragged", "masked", "sink", "pool"], help=case_help)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    parser.set_defaults(tokens=72, requests=12, pages=8, startpos=[8192] * 12)
+    parser.set_defaults(tokens=72, requests=12, pages=8)
     args = parser.parse_args()
-    configure_decode_workload(args, parser)
-    if args.startpos is not None:
-        max_end = max(pos + length for pos, length in zip(args.startpos, args.query_lens))
-        args.pages = (max_end + 127) // 128
-    host = l3_decode_c1a_full
-    specs = build_c1a_specs(
-        "full", args.tokens, args.pages, args.requests, args.seed, args.case,
-        start_pos=args.startpos, query_lens=args.query_lens, param_names=host.param_names,
-    )
+    explicit_case = args.startpos is not None or args.query_lens is not None or args.case is not None
+    benchmark = os.environ.get("PYPTO_BENCH", "").strip() not in ("", "0", "false", "False")
+    args.case = args.case or "random"
+    if args.startpos is None:
+        if args.case == "pool":
+            args.startpos = [16513]
+            if args.query_lens is None:
+                args.query_lens = [2]
+        else:
+            args.startpos = [8192] * 12
+    cases = [args]
+    if not explicit_case and not benchmark and not args.golden_data and not args.runtime_dir:
+        pool_case = argparse.Namespace(**vars(args))
+        pool_case.case = "pool"
+        pool_case.startpos = [16513]
+        pool_case.query_lens = [2]
+        cases.append(pool_case)
+    for args in cases:
+        configure_decode_workload(args, parser)
+        if args.startpos is not None:
+            max_end = max(pos + length for pos, length in zip(args.startpos, args.query_lens))
+            args.pages = (max_end + 127) // 128
+        print(f"[C1A full] case={args.case} tokens={args.tokens} pages={args.pages}", flush=True)
+        host = l3_decode_c1a_full
+        specs = build_c1a_specs(
+            "full", args.tokens, args.pages, args.requests, args.seed, args.case,
+            start_pos=args.startpos, query_lens=args.query_lens, param_names=host.param_names,
+        )
 
-    result = run(
-        fn=host,
-        specs=specs,
-        golden_fn=golden_c1a,
-        compile_only=args.compile_only,
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            dump_passes=args.dump_passes,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compare_fn={
-            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-            "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-            "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
-            "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
-            "window_cache": packed_cache_compare(
-                mapped_pool_ratio_allclose(
-                    "window_slots", pool_name="window_cache",
-                    mapping_shape=(args.tokens,),
-                    block_size=BLOCK_SIZE, leading_rank_axis=False,
-                    atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
-                ),
-                mapped_pool_ratio_allclose(
-                    "window_slots", pool_name="window_cache_scale",
-                    mapping_shape=(args.tokens,),
-                    block_size=BLOCK_SIZE, leading_rank_axis=False,
-                    atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
-                ),
-                fp4=False,
+        pool_error_ratio = 0.0 if args.case == "pool" else 0.02
+        result = run(
+            fn=host,
+            specs=specs,
+            golden_fn=golden_c1a,
+            compile_only=args.compile_only,
+            save_data=args.save_data,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                dump_passes=args.dump_passes,
+                enable_chip_swimlane=args.enable_chip_swimlane,
+                distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),
             ),
-            "compressed_cache": packed_cache_compare(
-                mapped_fp4_cache_compare(
-                    "compressed_slots", pool_name="compressed_cache",
+            rtol=1e-3,
+            atol=1e-3,
+            compare_fn={
+                "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+                "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=pool_error_ratio),
+                "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+                "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+                "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),
+                "window_cache": packed_cache_compare(
+                    mapped_pool_ratio_allclose(
+                        "window_slots", pool_name="window_cache",
+                        mapping_shape=(args.tokens,),
+                        block_size=BLOCK_SIZE, leading_rank_axis=False,
+                        atol=2 ** -9, rtol=2 ** -3, max_error_ratio=0.0,
+                    ),
+                    mapped_pool_ratio_allclose(
+                        "window_slots", pool_name="window_cache_scale",
+                        mapping_shape=(args.tokens,),
+                        block_size=BLOCK_SIZE, leading_rank_axis=False,
+                        atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                    ),
+                    fp4=False,
+                ),
+                "compressed_cache": packed_cache_compare(
+                    mapped_fp4_cache_compare(
+                        "compressed_slots", pool_name="compressed_cache",
+                        mapping_shape=(args.tokens,),
+                        block_size=BLOCK_SIZE, leading_rank_axis=False,
+                        max_error_ratio=0.005,
+                    ),
+                    mapped_pool_ratio_allclose(
+                        "compressed_slots", pool_name="compressed_cache_scale",
+                        mapping_shape=(args.tokens,),
+                        block_size=BLOCK_SIZE, leading_rank_axis=False,
+                        atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                    ),
+                    fp4=True,
+                ),
+                "index_cache": mapped_fp4_cache_compare(
+                    "compressed_slots", pool_name="index_cache",
                     mapping_shape=(args.tokens,),
                     block_size=BLOCK_SIZE, leading_rank_axis=False,
                     max_error_ratio=0.005,
                 ),
-                mapped_pool_ratio_allclose(
-                    "compressed_slots", pool_name="compressed_cache_scale",
+                "index_cache_scale": mapped_pool_ratio_allclose(
+                    "compressed_slots", pool_name="index_cache_scale",
                     mapping_shape=(args.tokens,),
                     block_size=BLOCK_SIZE, leading_rank_axis=False,
-                    atol=0.0, rtol=2 ** -7, max_error_ratio=0.0,
+                    atol=0.0, rtol=0.0, max_error_ratio=0.0,
                 ),
-                fp4=True,
-            ),
-            "index_cache": mapped_fp4_cache_compare(
-                "compressed_slots", pool_name="index_cache",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                max_error_ratio=0.005,
-            ),
-            "index_cache_scale": mapped_pool_ratio_allclose(
-                "compressed_slots", pool_name="index_cache_scale",
-                mapping_shape=(args.tokens,),
-                block_size=BLOCK_SIZE, leading_rank_axis=False,
-                atol=0.0, rtol=0.0, max_error_ratio=0.0,
-            ),
-        },
-    )
-    if not result.passed:
-        raise SystemExit(result.error or 1)
+            },
+        )
+        if not result.passed:
+            raise SystemExit(result.error or 1)
