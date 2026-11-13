@@ -1669,7 +1669,8 @@ def _select_index_topk_sharded(
                                 cache_sign = pl.reg.broadcast(32768, lanes=64, dtype=pl.UINT32)
                                 cache_word = pl.reg.broadcast(65535, lanes=64, dtype=pl.UINT32)
                                 cache_invalid = pl.reg.broadcast(127, lanes=64, dtype=pl.UINT32)
-                                for cache_segment in pl.hardware_loop(cache_segments):
+                                cache_hist_initial = pl.reg.load(cached_high, lanes=256)
+                                for cache_segment, (cache_hist_acc,) in pl.hardware_loop(cache_segments, init_values=(cache_hist_initial,)):
                                     cache_input = pl.reg.load(cache_values, cache_segment * 64, lanes=64)
                                     cache_bits = pl.reg.interpret_cast(cache_input, dtype=pl.UINT32)
                                     cache_bf16 = pl.reg.shift_rights(cache_bits, 16, cache_mask)
@@ -1689,9 +1690,9 @@ def _select_index_topk_sharded(
                                     cache_high_i32 = pl.reg.interpret_cast(cache_high32, dtype=pl.INT32)
                                     cache_high_i8 = pl.reg.convert(cache_high_i32, dtype=pl.INT8, saturate=False)
                                     cache_high_bytes = pl.reg.interpret_cast(cache_high_i8, dtype=pl.UINT8)
-                                    cache_hist_previous = pl.reg.load(cached_high, lanes=256)
-                                    cache_hist_next = pl.reg.chist(cache_hist_previous, cache_high_bytes, cache_active)
-                                    _cache_hist_write = pl.reg.store(cached_high, value=cache_hist_next)
+                                    cache_hist_next = pl.reg.chist(cache_hist_acc, cache_high_bytes, cache_active)
+                                    cache_hist_final = pl.yield_(cache_hist_next)
+                                _cache_hist_write = pl.reg.store(cached_high, value=cache_hist_final)
                             local_cutoff = pl.cast(127, pl.INT32)
                             local_ties = pl.cast(INDEX_TOPK, pl.INT32)
                             if local_width > INDEX_TOPK:
@@ -1725,7 +1726,8 @@ def _select_index_topk_sharded(
                                 with pl.reg_scope():
                                     local_low_mask = pl.reg.full_mask(lanes=64)
                                     local_low_byte_mask = pl.reg.broadcast(255, lanes=64, dtype=pl.UINT32)
-                                    for local_low_segment in pl.hardware_loop(local_low_segments):
+                                    local_low_hist_initial = pl.reg.load(local_low_hist, lanes=256)
+                                    for local_low_segment, (local_low_hist_acc,) in pl.hardware_loop(local_low_segments, init_values=(local_low_hist_initial,)):
                                         local_low_keys16 = pl.reg.load(cached_keys, local_low_segment * 64, lanes=64)
                                         local_low_keys32 = pl.reg.convert(local_low_keys16, dtype=pl.UINT32)
                                         local_low_upper = pl.reg.shift_rights(local_low_keys32, 8, local_low_mask)
@@ -1737,9 +1739,9 @@ def _select_index_topk_sharded(
                                         local_low_active = pl.reg.compares(local_low_positions, local_width, local_low_mask, predicate="lt")
                                         local_low_matching = pl.reg.compares(local_low_upper, local_low_high, local_low_mask, predicate="eq")
                                         local_low_selected = pl.reg.mask_and(local_low_active, local_low_matching)
-                                        local_low_prior = pl.reg.load(local_low_hist, lanes=256)
-                                        local_low_next = pl.reg.chist(local_low_prior, local_low_bytes, local_low_selected)
-                                        _local_low_hist_write = pl.reg.store(local_low_hist, value=local_low_next)
+                                        local_low_next = pl.reg.chist(local_low_hist_acc, local_low_bytes, local_low_selected)
+                                        local_low_hist_final = pl.yield_(local_low_next)
+                                    _local_low_hist_write = pl.reg.store(local_low_hist, value=local_low_hist_final)
                                 local_low_search_lower = pl.cast(0, pl.INT32)
                                 local_low_search_upper = pl.cast(255, pl.INT32)
                                 for local_low_search_step in pl.range(8):
@@ -2029,7 +2031,8 @@ def _select_index_topk_sharded(
                         merge_segments = pl.cast((merge_width + 63) // 64, pl.INT32)
                         with pl.reg_scope():
                             merge_hist_mask = pl.reg.full_mask(lanes=64)
-                            for merge_hist_segment in pl.hardware_loop(merge_segments):
+                            merge_hist_initial = pl.reg.load(merge_high_hist, lanes=256)
+                            for merge_hist_segment, (merge_hist_acc,) in pl.hardware_loop(merge_segments, init_values=(merge_hist_initial,)):
                                 merge_hist_keys16 = pl.reg.load(merge_keys, merge_hist_segment * 64, lanes=64)
                                 merge_hist_keys = pl.reg.convert(merge_hist_keys16, dtype=pl.UINT32)
                                 merge_hist_high = pl.reg.shift_rights(merge_hist_keys, 8, merge_hist_mask)
@@ -2038,9 +2041,9 @@ def _select_index_topk_sharded(
                                 merge_hist_bytes = pl.reg.interpret_cast(merge_hist_i8, dtype=pl.UINT8)
                                 merge_hist_positions = pl.reg.index_gen(pl.cast(merge_hist_segment * 64, pl.INT32), lanes=64, dtype=pl.INT32)
                                 merge_hist_active = pl.reg.compares(merge_hist_positions, merge_width, merge_hist_mask, predicate="lt")
-                                merge_hist_previous = pl.reg.load(merge_high_hist, lanes=256)
-                                merge_hist_next = pl.reg.chist(merge_hist_previous, merge_hist_bytes, merge_hist_active)
-                                _merge_hist_write = pl.reg.store(merge_high_hist, value=merge_hist_next)
+                                merge_hist_next = pl.reg.chist(merge_hist_acc, merge_hist_bytes, merge_hist_active)
+                                merge_hist_final = pl.yield_(merge_hist_next)
+                            _merge_hist_write = pl.reg.store(merge_high_hist, value=merge_hist_final)
                         merge_cutoff = pl.cast(127, pl.INT32)
                         merge_ties = pl.cast(INDEX_TOPK, pl.INT32)
                         if merge_width > INDEX_TOPK:
@@ -2074,7 +2077,8 @@ def _select_index_topk_sharded(
                             with pl.reg_scope():
                                 merge_low_mask = pl.reg.full_mask(lanes=64)
                                 merge_low_byte_mask = pl.reg.broadcast(255, lanes=64, dtype=pl.UINT32)
-                                for merge_low_segment in pl.hardware_loop(merge_low_segments):
+                                merge_low_hist_initial = pl.reg.load(merge_low_hist, lanes=256)
+                                for merge_low_segment, (merge_low_hist_acc,) in pl.hardware_loop(merge_low_segments, init_values=(merge_low_hist_initial,)):
                                     merge_low_keys16 = pl.reg.load(merge_keys, merge_low_segment * 64, lanes=64)
                                     merge_low_keys32 = pl.reg.convert(merge_low_keys16, dtype=pl.UINT32)
                                     merge_low_upper = pl.reg.shift_rights(merge_low_keys32, 8, merge_low_mask)
@@ -2086,9 +2090,9 @@ def _select_index_topk_sharded(
                                     merge_low_active = pl.reg.compares(merge_low_positions, merge_width, merge_low_mask, predicate="lt")
                                     merge_low_matching = pl.reg.compares(merge_low_upper, merge_low_high, merge_low_mask, predicate="eq")
                                     merge_low_selected = pl.reg.mask_and(merge_low_active, merge_low_matching)
-                                    merge_low_prior = pl.reg.load(merge_low_hist, lanes=256)
-                                    merge_low_next = pl.reg.chist(merge_low_prior, merge_low_bytes, merge_low_selected)
-                                    _merge_low_hist_write = pl.reg.store(merge_low_hist, value=merge_low_next)
+                                    merge_low_next = pl.reg.chist(merge_low_hist_acc, merge_low_bytes, merge_low_selected)
+                                    merge_low_hist_final = pl.yield_(merge_low_next)
+                                _merge_low_hist_write = pl.reg.store(merge_low_hist, value=merge_low_hist_final)
                             merge_low_search_lower = pl.cast(0, pl.INT32)
                             merge_low_search_upper = pl.cast(255, pl.INT32)
                             for merge_low_search_step in pl.range(8):
