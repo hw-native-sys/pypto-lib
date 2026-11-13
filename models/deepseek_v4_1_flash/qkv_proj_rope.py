@@ -15,6 +15,8 @@ import pypto.language as pl
 from pypto.runtime import pto_isa_include_dir
 import torch
 
+from window_publish import norm_rope_publish
+
 from config import FLASH as M
 from gemm import (
     MX_M_TILE, MX_K_TILE,
@@ -199,21 +201,6 @@ def q_proj_rope(
     return query_latent, query, qb_payload, qb_scales
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "norm_rope_publish.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def norm_rope_publish(
-    source: pl.Tensor,
-    weight: pl.Tensor,
-    cosine: pl.Tensor,
-    sine: pl.Tensor,
-    slots: pl.Tensor,
-    cache: pl.InOut[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Normalize and rotate BF16 rows, then quantize and publish group-32 FP8 cache pages."""
-    ...
-
-
 @pl.jit.inline(auto_scope=False)
 def kv_proj(
     payload: pl.Tensor,
@@ -251,8 +238,10 @@ def window_publish(
 ):
     """Fuse RMSNorm, RoPE, group-32 FP8 quantization, and window cache publication."""
     workers = pl.max(1, pl.min(num_tokens, WINDOW_PUBLISH_WORKER_TILE))
+    cache_rows = pl.tensor.dim(cache, 0) * 128
+    flat_cache = pl.reshape(cache, [cache_rows, 544])
     with pl.spmd(workers, name_hint="norm_rope_pub_win", deps=[cache_ready]) as published:
-        cache = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, cache, num_tokens)
+        _published = norm_rope_publish(kv_projection, kv_norm_weight, rope_cos, rope_sin, slots, flat_cache, num_tokens)
     return published
 
 
