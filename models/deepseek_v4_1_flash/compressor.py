@@ -782,8 +782,11 @@ def c2a_compressor_publish(
     # Request-based decode worker count.
     workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
     native_count = pl.cast(native_blocks, pl.INT32)
-    native_flat = pl.reshape(native_state, [native_blocks * 4, STATE_WIDTH])
-    cache_flat = pl.reshape(cache, [pl.tensor.dim(cache, 0) * 128, COMPRESSED_CACHE_BYTES])
+    native_rows = native_blocks * 4
+    native_flat = pl.reshape(native_state, [native_rows, STATE_WIDTH])
+    cache_blocks = pl.tensor.dim(cache, 0)
+    cache_rows = cache_blocks * 128
+    cache_flat = pl.reshape(cache, [cache_rows, COMPRESSED_CACHE_BYTES])
     with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as completed:
         _c2a_compress(
             kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
