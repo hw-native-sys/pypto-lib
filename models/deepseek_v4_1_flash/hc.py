@@ -129,22 +129,6 @@ def hc_normalize(
     return ready
 
 
-@pl.jit.extern(core_type="aiv", source=_KERNELS / "hc_collapse.cpp",
-               include_dirs=(pto_isa_include_dir(),))
-def _hc_collapse(
-    x: pl.Tensor,
-    pre_mix: pl.Tensor,
-    norm_weight: pl.Tensor,
-    output: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    collapsed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
-    rows: pl.Scalar[pl.INDEX],
-    active_rows: pl.Scalar[pl.INDEX],
-    mode: pl.Scalar[pl.INDEX],
-):
-    """Collapse streams; mode 1 normalizes, and mode 2 also stores raw BF16 rows."""
-    ...
-
-
 @pl.jit.inline
 def hc_head(
     x_hc: pl.Tensor,
@@ -152,15 +136,48 @@ def hc_head(
     output: pl.Tensor,
     worker_limit: pl.constexpr,
 ):
-    """Collapse HC streams with the delayed pre-mix and BF16 rounding."""
-    t_dim = pl.tensor.dim(x_hc, 0)
-    input_view = pl.reshape(x_hc, [t_dim, HC_MULT, D])
-    mix_view = pl.reshape(pre_mix, [t_dim, HC_MULT])
-    output_view = pl.reshape(output, [t_dim, D])
-    collapsed_view = pl.reshape(output, [t_dim, D])
-    workers = pl.max(pl.min((t_dim + PRE_T_TILE - 1) // PRE_T_TILE, worker_limit), 1)
+    """Collapse four HC streams with pairwise FP32 sums and BF16 rounding."""
+    tokens = pl.tensor.dim(x_hc, 0)
+    x_flat = pl.reshape(x_hc, [tokens, HC_DIM])
+    mix_flat = pl.reshape(pre_mix, [1, tokens * HC_MULT])
+    workers = pl.max(pl.min((tokens + PRE_T_TILE - 1) // PRE_T_TILE, worker_limit), 1)
     with pl.spmd(workers, name_hint="hc_collapse", allow_early_resolve=True):
-        _hc_collapse(input_view, mix_view, mix_view, output_view, collapsed_view, t_dim, t_dim, 0)
+        block = pl.tile.get_block_idx()
+        for start in pl.range(block * PRE_T_TILE, tokens, pl.tile.get_block_num() * PRE_T_TILE):
+            rows = pl.min(PRE_T_TILE, tokens - start)
+            mix = pl.load(mix_flat, [0, start * HC_MULT], [1, MIX_PAD], valid_shape=[1, rows * HC_MULT], target_memory=pl.MemorySpace.Vec)
+            for local in pl.pipeline(rows, stage=2):
+                row = start + local
+                source = pl.load(x_flat, [row, 0], [1, HC_DIM], target_memory=pl.MemorySpace.Vec)
+                source = pl.reshape(source, [HC_DIM])
+                collapsed = pl.create_tile([D], dtype=pl.BF16, target_memory=pl.MemorySpace.Vec)
+                with pl.reg_scope():
+                    full = pl.reg.full_mask(lanes=64)
+                    mix0 = pl.reg.load(mix, offset=local * HC_MULT, lanes=1)
+                    mix1 = pl.reg.load(mix, offset=local * HC_MULT + 1, lanes=1)
+                    mix2 = pl.reg.load(mix, offset=local * HC_MULT + 2, lanes=1)
+                    mix3 = pl.reg.load(mix, offset=local * HC_MULT + 3, lanes=1)
+                    p0 = pl.reg.broadcast(mix0, lanes=64, dtype=pl.FP32)
+                    p1 = pl.reg.broadcast(mix1, lanes=64, dtype=pl.FP32)
+                    p2 = pl.reg.broadcast(mix2, lanes=64, dtype=pl.FP32)
+                    p3 = pl.reg.broadcast(mix3, lanes=64, dtype=pl.FP32)
+                    for chunk in pl.hardware_loop(D // 64):
+                        offset = chunk * 64
+                        x0 = pl.reg.load(source, offset=offset, lanes=64)
+                        x1 = pl.reg.load(source, offset=D + offset, lanes=64)
+                        x2 = pl.reg.load(source, offset=2 * D + offset, lanes=64)
+                        x3 = pl.reg.load(source, offset=3 * D + offset, lanes=64)
+                        x0 = pl.reg.mul(x0, p0, full)
+                        x1 = pl.reg.mul(x1, p1, full)
+                        x2 = pl.reg.mul(x2, p2, full)
+                        x3 = pl.reg.mul(x3, p3, full)
+                        first = pl.reg.add(x0, x1, full)
+                        second = pl.reg.add(x2, x3, full)
+                        value = pl.reg.add(first, second, full)
+                        rounded = pl.reg.convert(value, dtype=pl.BF16, rounding="R", saturate=False)
+                        _stored = pl.reg.store(collapsed, offset=offset, value=rounded, mask=full)
+                collapsed = pl.reshape(collapsed, [1, D])
+                pl.store(collapsed, [row, 0], output)
     return output
 
 
@@ -622,6 +639,8 @@ if __name__ == "__main__":
         shapes = [(args.batch, args.sequence)]
         if name == "pre" and not explicit_shape and not args.golden_data and not args.runtime_dir:
             shapes = [(rows, 1) for rows in (1, 65, 81, 97, 129, 513)]
+        if name == "head" and not explicit_shape and not args.golden_data and not args.runtime_dir:
+            shapes = [(rows, 1) for rows in (8, 9, 33)]
         for batch, sequence in shapes:
             print(f"[HC] {name} rows={batch * sequence}", flush=True)
             result = run(
