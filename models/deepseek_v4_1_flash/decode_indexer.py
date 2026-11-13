@@ -1268,14 +1268,18 @@ def _score_index_rows(
     pool_counts: pl.Tensor,
     scores: pl.Tensor,
     physical: pl.Tensor,
+    candidate_keys: pl.Tensor,
+    candidate_ids: pl.Tensor,
     runs: pl.Tensor,
     runs_ready: pl.Scalar[pl.TASK_ID],
     num_tokens: pl.Scalar[pl.INT32],
+    shards: pl.Scalar[pl.INT32],
     cache_ready: pl.Scalar[pl.TASK_ID],
     query_ready: pl.Scalar[pl.TASK_ID],
     weights_ready: pl.Scalar[pl.TASK_ID],
     pool_ready: pl.Scalar[pl.TASK_ID],
     pool: pl.constexpr,
+    direct_short: pl.constexpr,
 ):
     tokens = pl.tensor.dim(query, 0)
     query_rows = tokens * INDEX_H
@@ -1312,16 +1316,18 @@ def _score_index_rows(
     packed_keys = pl.reinterpret_view(staged_keys, pl.FP4E2M1X2)
     staged_scales = pl.create_tensor([batch_capacity, SCORE_TILE * 4], dtype=pl.UINT8)
     panel_valid = pl.create_tensor([panel_slots], dtype=pl.INT32)
-    shards = pl.max(workers, (work_count + SCORE_SHARD_PANELS_TILE - 1) // SCORE_SHARD_PANELS_TILE)
     owners = pl.min(shards, work_count)
     previous_batch = runs_ready
-    batch_limit = pl.max(1, work_count)
-    for batch_begin in pl.range(0, batch_limit, batch_capacity):
-        batch_end = pl.min(work_count, batch_begin + batch_capacity)
+    owner_divisor = pl.max(1, owners)
+    for first_shard in pl.range(0, pl.max(1, owners), workers):
+        end_shard = pl.min(owners, first_shard + workers)
+        batch_begin = work_count * first_shard // owner_divisor
+        batch_end = work_count * end_shard // owner_divisor
+        batch_work_count = batch_end - batch_begin
         with pl.spmd(vector_workers, name_hint="idx_score_gather_reg", deps=[cache_ready, pool_ready, query_ready, previous_batch]) as gather_tid:
             worker = pl.tile.get_block_idx()
-            for work in pl.range(batch_begin + worker, batch_end, vector_workers):
-                staging_slot = work - batch_begin
+            for staging_slot in pl.range(worker, batch_work_count, vector_workers):
+                work = batch_begin + staging_slot
                 run_id = work // panels
                 begin = (work % panels) * SCORE_TILE
                 first_token = pl.cast(
@@ -1510,93 +1516,413 @@ def _score_index_rows(
                                 dot1 = pl.matmul_mx(query_left1, query_left_scale1, keys_right, key_right_scale)
                                 dot_backing = pl.store(dot1, [staging_slot * SCORE_ROWS_TILE + 96, 0], dot_backing)
 
-        with pl.spmd(vector_workers, name_hint="idx_score_reduce", deps=[dot_tid, weights_ready]) as completed:
+        with pl.spmd(vector_workers, name_hint="idx_score_reduce_topk_reg", deps=[dot_tid, weights_ready]) as completed:
             worker = pl.tile.get_block_idx()
-            for work in pl.range(batch_begin + worker, batch_end, vector_workers):
-                staging_slot = work - batch_begin
-                run_id = work // panels
-                begin = (work % panels) * SCORE_TILE
-                first_token = pl.cast(
-                    pl.read(runs, [0, run_id]),
-                    pl.INDEX,
-                )
-                end_token = pl.cast(
-                    pl.read(runs, [1, run_id]),
-                    pl.INDEX,
-                )
-                for run_row in pl.range(end_token - first_token):
-                    token = first_token + run_row
-                    active = pl.min(SCORE_TILE, width - begin)
-                    reduce_dot = pl.tile.full([INDEX_H, SCORE_TILE], dtype=pl.BF16, value=0.0)
-                    if pl.read(panel_valid, [staging_slot * 16]) != 0:
-                        reduce_dot = pl.tile.load(
-                            dot_backing, [staging_slot * SCORE_ROWS_TILE + run_row * INDEX_H, 0],
-                            [INDEX_H, SCORE_TILE],
-                            target_memory=pl.MemorySpace.Vec,
-                        )
-                    weight_row = pl.tile.load(weights, [token, 0], [1, INDEX_H], target_memory=pl.MemorySpace.Vec)
-                    weight_pad = pl.tile.full([1, 64], dtype=pl.BF16, value=0.0)
-                    weight_pad = pl.tile.assemble(weight_pad, weight_row, [0, 0])
-                    weight_vec = pl.reshape(pl.tile.move(weight_pad, target_memory=pl.MemorySpace.Vec), [64])
-                    total = pl.tile.full([SCORE_TILE], dtype=pl.FP32, value=0.0)
-                    total = pl.tile.move(total, target_memory=pl.MemorySpace.Vec)
-                    reduce_dot = pl.reshape(reduce_dot, [INDEX_H * SCORE_TILE])
-                    reduce_mapping = pl.tile.load(
-                        physical, [token, begin],
-                        [1, SCORE_TILE], valid_shape=[1, active],
-                        target_memory=pl.MemorySpace.Vec,
+            for task in pl.range(worker, (end_shard - first_shard) * 2, vector_workers):
+                shard = first_shard + task // 2
+                lane = task % 2
+                first = work_count * shard // owner_divisor
+                finish = work_count * (shard + 1) // owner_divisor
+                first_run = first // panels
+                last_run = (finish - 1) // panels
+                for run_id in pl.range(first_run, last_run + 1):
+                    first_panel = pl.max(first, run_id * panels) - run_id * panels
+                    last_panel = pl.min(finish, (run_id + 1) * panels) - run_id * panels
+                    logical_begin = pl.cast(first_panel * SCORE_TILE, pl.INT32)
+                    local_width = pl.cast(
+                        pl.min((last_panel - first_panel) * SCORE_TILE, width - logical_begin),
+                        pl.INT32,
                     )
-                    reduce_mapping = pl.fillpad(reduce_mapping, pad_value=pl.PadValue.min)
-                    mapping_vec = pl.reshape(pl.set_validshape(reduce_mapping, 1, SCORE_TILE), [SCORE_TILE])
-                    with pl.reg_scope():
-                        r0_mask64 = pl.reg.full_mask(lanes=64)
-                        r0_mask = pl.reg.full_mask(lanes=128)
-                        r0_raw_weights = pl.reg.load(weight_vec, lanes=64)
-                        r0_weight_bits16 = pl.reg.interpret_cast(r0_raw_weights, dtype=pl.UINT16)
-                        r0_weight_bits = pl.reg.convert(r0_weight_bits16, dtype=pl.UINT32)
-                        r0_weight_bits = pl.reg.shift_lefts(r0_weight_bits, 16, r0_mask64)
-                        r0_weight_values = pl.reg.interpret_cast(r0_weight_bits, dtype=pl.FP32)
-                        r0_weight_values = pl.reg.muls(r0_weight_values, 0.015625, r0_mask64)
-                        r0_scaled_bits = pl.reg.interpret_cast(r0_weight_values, dtype=pl.UINT32)
-                        r0_high = pl.reg.shift_rights(r0_scaled_bits, 16, r0_mask64)
-                        r0_one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
-                        r0_lsb = pl.reg.bitwise_and(r0_high, r0_one)
-                        r0_bias = pl.reg.broadcast(32767, lanes=64, dtype=pl.UINT32)
-                        r0_rounded = pl.reg.add(pl.reg.add(r0_scaled_bits, r0_bias), r0_lsb)
-                        r0_halfwords = pl.reg.interpret_cast(r0_rounded, dtype=pl.UINT16)
-                        r0_even, r0_weights_bits = pl.reg.dintlv(r0_halfwords, r0_halfwords, r0_mask)
-                        r0_zero = pl.reg.broadcast(0.0, lanes=128, dtype=pl.BF16)
-                        for reduce_part in pl.hardware_loop(SCORE_TILE // 128):
-                            r0_acc = r0_zero
-                            for head in pl.unroll(INDEX_H):
-                                r0_dots = pl.reg.load(reduce_dot, head * SCORE_TILE + reduce_part * 128, lanes=128)
-                                r0_positive = pl.reg.maximum(r0_dots, r0_zero)
-                                r0_indices = pl.reg.broadcast(pl.cast(head, pl.UINT16), lanes=128, dtype=pl.UINT16)
-                                r0_repeated_bits = pl.reg.gather_lanes(r0_weights_bits, r0_indices)
-                                r0_repeated = pl.reg.interpret_cast(r0_repeated_bits, dtype=pl.BF16)
-                                r0_acc = pl.reg.mula(r0_acc, r0_positive, r0_repeated)
-                            r0_acc = pl.reg.add(r0_acc, r0_zero)
-                            r0_total_bits16 = pl.reg.interpret_cast(r0_acc, dtype=pl.UINT16)
-                            r0_total_bits = pl.reg.convert(r0_total_bits16, dtype=pl.UINT32)
-                            r0_total_bits = pl.reg.shift_lefts(r0_total_bits, 16, r0_mask)
-                            r0_values = pl.reg.interpret_cast(r0_total_bits, dtype=pl.FP32)
-                            r0_physical_ids = pl.reg.load(mapping_vec, reduce_part * 128, lanes=128)
-                            r0_valid = pl.reg.compares(r0_physical_ids, 0, r0_mask, predicate="ge")
-                            r0_invalid_bits = pl.reg.broadcast(-8388608, lanes=128, dtype=pl.INT32)
-                            r0_invalid = pl.reg.interpret_cast(r0_invalid_bits, dtype=pl.FP32)
-                            r0_values = pl.reg.select(r0_valid, r0_values, r0_invalid)
-                            _score_write = pl.reg.store(total, reduce_part * 128, r0_values)
-                    total_row = pl.reshape(total, [1, SCORE_TILE])
-                    scores = pl.store(pl.set_validshape(total_row, 1, active), [token, begin], scores)
+                    run_begin = pl.cast(pl.read(runs, [0, run_id]), pl.INDEX)
+                    run_end = pl.cast(pl.read(runs, [1, run_id]), pl.INDEX)
+                    for token in pl.range(run_begin + lane, run_end, 2):
+                        run_row = token - run_begin
+                        weight_row = pl.tile.load(weights, [token, 0], [1, INDEX_H], target_memory=pl.MemorySpace.Vec)
+                        weight_pad = pl.tile.full([1, 64], dtype=pl.BF16, value=0.0)
+                        weight_pad = pl.tile.assemble(weight_pad, weight_row, [0, 0])
+                        weight_vec = pl.reshape(pl.tile.move(weight_pad, target_memory=pl.MemorySpace.Vec), [64])
+                        compute_local = pl.cast(1, pl.INT32)
+                        if direct_short:
+                            if pl.read(lengths, [token]) <= INDEX_TOPK:
+                                compute_local = pl.cast(0, pl.INT32)
+                        cached_keys = pl.tile.full([SCORE_SHARD_CACHE], dtype=pl.UINT16, value=127)
+                        cached_keys = pl.tile.move(cached_keys, target_memory=pl.MemorySpace.Vec)
+                        cached_high = pl.tile.full([256], dtype=pl.UINT16, value=0)
+                        cached_high = pl.tile.move(cached_high, target_memory=pl.MemorySpace.Vec)
+                        for panel in pl.range(first_panel, last_panel):
+                            work = run_id * panels + panel
+                            staging_slot = work - batch_begin
+                            begin = panel * SCORE_TILE
+                            active = pl.min(SCORE_TILE, width - begin)
+                            reduce_dot = pl.tile.full([INDEX_H, SCORE_TILE], dtype=pl.BF16, value=0.0)
+                            if pl.read(panel_valid, [staging_slot * 16]) != 0:
+                                reduce_dot = pl.tile.load(
+                                    dot_backing, [staging_slot * SCORE_ROWS_TILE + run_row * INDEX_H, 0],
+                                    [INDEX_H, SCORE_TILE],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                            total = pl.tile.full([SCORE_TILE], dtype=pl.FP32, value=0.0)
+                            total = pl.tile.move(total, target_memory=pl.MemorySpace.Vec)
+                            reduce_dot = pl.reshape(reduce_dot, [INDEX_H * SCORE_TILE])
+                            reduce_mapping = pl.tile.load(
+                                physical, [token, begin],
+                                [1, SCORE_TILE], valid_shape=[1, active],
+                                target_memory=pl.MemorySpace.Vec,
+                            )
+                            reduce_mapping = pl.fillpad(reduce_mapping, pad_value=pl.PadValue.min)
+                            mapping_vec = pl.reshape(pl.set_validshape(reduce_mapping, 1, SCORE_TILE), [SCORE_TILE])
+                            with pl.reg_scope():
+                                r0_mask64 = pl.reg.full_mask(lanes=64)
+                                r0_mask = pl.reg.full_mask(lanes=128)
+                                r0_raw_weights = pl.reg.load(weight_vec, lanes=64)
+                                r0_weight_bits16 = pl.reg.interpret_cast(r0_raw_weights, dtype=pl.UINT16)
+                                r0_weight_bits = pl.reg.convert(r0_weight_bits16, dtype=pl.UINT32)
+                                r0_weight_bits = pl.reg.shift_lefts(r0_weight_bits, 16, r0_mask64)
+                                r0_weight_values = pl.reg.interpret_cast(r0_weight_bits, dtype=pl.FP32)
+                                r0_weight_values = pl.reg.muls(r0_weight_values, 0.015625, r0_mask64)
+                                r0_scaled_bits = pl.reg.interpret_cast(r0_weight_values, dtype=pl.UINT32)
+                                r0_high = pl.reg.shift_rights(r0_scaled_bits, 16, r0_mask64)
+                                r0_one = pl.reg.broadcast(1, lanes=64, dtype=pl.UINT32)
+                                r0_lsb = pl.reg.bitwise_and(r0_high, r0_one)
+                                r0_bias = pl.reg.broadcast(32767, lanes=64, dtype=pl.UINT32)
+                                r0_rounded = pl.reg.add(pl.reg.add(r0_scaled_bits, r0_bias), r0_lsb)
+                                r0_halfwords = pl.reg.interpret_cast(r0_rounded, dtype=pl.UINT16)
+                                r0_even, r0_weights_bits = pl.reg.dintlv(r0_halfwords, r0_halfwords, r0_mask)
+                                r0_zero = pl.reg.broadcast(0.0, lanes=128, dtype=pl.BF16)
+                                for reduce_part in pl.hardware_loop(SCORE_TILE // 128):
+                                    r0_acc = r0_zero
+                                    for head in pl.unroll(INDEX_H):
+                                        r0_dots = pl.reg.load(reduce_dot, head * SCORE_TILE + reduce_part * 128, lanes=128)
+                                        r0_positive = pl.reg.maximum(r0_dots, r0_zero)
+                                        r0_indices = pl.reg.broadcast(pl.cast(head, pl.UINT16), lanes=128, dtype=pl.UINT16)
+                                        r0_repeated_bits = pl.reg.gather_lanes(r0_weights_bits, r0_indices)
+                                        r0_repeated = pl.reg.interpret_cast(r0_repeated_bits, dtype=pl.BF16)
+                                        r0_acc = pl.reg.mula(r0_acc, r0_positive, r0_repeated)
+                                    r0_acc = pl.reg.add(r0_acc, r0_zero)
+                                    r0_total_bits16 = pl.reg.interpret_cast(r0_acc, dtype=pl.UINT16)
+                                    r0_total_bits = pl.reg.convert(r0_total_bits16, dtype=pl.UINT32)
+                                    r0_total_bits = pl.reg.shift_lefts(r0_total_bits, 16, r0_mask)
+                                    r0_values = pl.reg.interpret_cast(r0_total_bits, dtype=pl.FP32)
+                                    r0_physical_ids = pl.reg.load(mapping_vec, reduce_part * 128, lanes=128)
+                                    r0_valid = pl.reg.compares(r0_physical_ids, 0, r0_mask, predicate="ge")
+                                    r0_invalid_bits = pl.reg.broadcast(-8388608, lanes=128, dtype=pl.INT32)
+                                    r0_invalid = pl.reg.interpret_cast(r0_invalid_bits, dtype=pl.FP32)
+                                    r0_values = pl.reg.select(r0_valid, r0_values, r0_invalid)
+                                    _score_write = pl.reg.store(total, reduce_part * 128, r0_values)
+                            total_row = pl.reshape(total, [1, SCORE_TILE])
+                            scores = pl.store(pl.set_validshape(total_row, 1, active), [token, begin], scores)
+                            if compute_local == 1:
+                                panel_keys = pl.tile.full([SCORE_TILE], dtype=pl.UINT16, value=127)
+                                panel_keys = pl.tile.move(panel_keys, target_memory=pl.MemorySpace.Vec)
+                                panel_keys, cached_high = _cache_index_score_panel(total, panel_keys, cached_high, active)
+                                cache_begin = (panel - first_panel) * SCORE_TILE
+                                cached_key_rows = pl.reshape(cached_keys, [1, SCORE_SHARD_CACHE])
+                                panel_key_row = pl.reshape(panel_keys, [1, SCORE_TILE])
+                                cached_key_rows = pl.tile.assemble(cached_key_rows, panel_key_row, [0, cache_begin])
+                                cached_keys = pl.reshape(cached_key_rows, [SCORE_SHARD_CACHE])
+                        if compute_local == 1:
+                            candidate_keys, candidate_ids = _select_index_topk_local(
+                                cached_keys, cached_high, physical,
+                                candidate_keys, candidate_ids,
+                                token, logical_begin, local_width, shard,
+                            )
         previous_batch = completed
     return previous_batch
 
 @pl.jit.inline(auto_scope=False)
-def _select_index_topk_sharded(
+def _cache_index_score_panel(
+    total: pl.Tile[[SCORE_TILE], pl.FP32, pl.MemorySpace.Vec],
+    panel_keys: pl.Tile[[SCORE_TILE], pl.UINT16, pl.MemorySpace.Vec],
+    cached_high: pl.Tile[[256], pl.UINT16, pl.MemorySpace.Vec],
+    active: pl.Scalar[pl.INDEX],
+):
+    cache_active_width = pl.cast(active, pl.INT32)
+    cache_segments = SCORE_TILE // 64
+    cache_pack = pl.tile.full([128], dtype=pl.UINT16, value=0)
+    cache_pack = pl.tile.move(cache_pack, target_memory=pl.MemorySpace.Vec)
+    with pl.reg_scope():
+        cache_mask = pl.reg.full_mask(lanes=64)
+        cache_pack_mask = pl.reg.full_mask(lanes=128)
+        cache_sign = pl.reg.broadcast(32768, lanes=64, dtype=pl.UINT32)
+        cache_word = pl.reg.broadcast(65535, lanes=64, dtype=pl.UINT32)
+        cache_invalid = pl.reg.broadcast(127, lanes=64, dtype=pl.UINT32)
+        cache_hist_initial = pl.reg.load(cached_high, lanes=256)
+        for cache_segment, (cache_hist_acc,) in pl.hardware_loop(cache_segments, init_values=(cache_hist_initial,)):
+            cache_input = pl.reg.load(total, cache_segment * 64, lanes=64)
+            cache_bits = pl.reg.interpret_cast(cache_input, dtype=pl.UINT32)
+            cache_bf16 = pl.reg.shift_rights(cache_bits, 16, cache_mask)
+            cache_negative = pl.reg.compares(cache_bf16, 32768, cache_mask, predicate="ge")
+            cache_negative_key = pl.reg.bitwise_and(pl.reg.bitwise_not(cache_bf16), cache_word)
+            cache_positive_key = pl.reg.bitwise_xor(cache_bf16, cache_sign)
+            cache_key32 = pl.reg.select(cache_negative, cache_negative_key, cache_positive_key)
+            cache_positions = pl.reg.index_gen(pl.cast(cache_segment * 64, pl.INT32), lanes=64, dtype=pl.INT32)
+            cache_active = pl.reg.compares(cache_positions, cache_active_width, cache_mask, predicate="lt")
+            cache_key32 = pl.reg.select(cache_active, cache_key32, cache_invalid)
+            cache_key_halves = pl.reg.interpret_cast(cache_key32, dtype=pl.UINT16)
+            cache_key_even, cache_key_odd = pl.reg.dintlv(cache_key_halves, cache_key_halves, cache_pack_mask)
+            _cache_pack_write = pl.reg.store(cache_pack, value=cache_key_even)
+            cache_key16 = pl.reg.load(cache_pack, lanes=64)
+            _cache_key_write = pl.reg.store(panel_keys, cache_segment * 64, cache_key16)
+            cache_high32 = pl.reg.shift_rights(cache_key32, 8, cache_mask)
+            cache_high_i32 = pl.reg.interpret_cast(cache_high32, dtype=pl.INT32)
+            cache_high_i8 = pl.reg.convert(cache_high_i32, dtype=pl.INT8, saturate=False)
+            cache_high_bytes = pl.reg.interpret_cast(cache_high_i8, dtype=pl.UINT8)
+            cache_hist_next = pl.reg.chist(cache_hist_acc, cache_high_bytes, cache_active)
+            cache_hist_final = pl.yield_(cache_hist_next)
+        _cache_hist_write = pl.reg.store(cached_high, value=cache_hist_final)
+    return panel_keys, cached_high
+
+
+@pl.jit.inline(auto_scope=False)
+def _select_index_topk_local(
+    cached_keys: pl.Tile[[SCORE_SHARD_CACHE], pl.UINT16, pl.MemorySpace.Vec],
+    cached_high: pl.Tile[[256], pl.UINT16, pl.MemorySpace.Vec],
+    physical: pl.Tensor,
+    candidate_keys: pl.Tensor,
+    candidate_ids: pl.Tensor,
+    token: pl.Scalar[pl.INDEX],
+    logical_begin: pl.Scalar[pl.INT32],
+    local_width: pl.Scalar[pl.INT32],
+    shard: pl.Scalar[pl.INDEX],
+):
+    local_cutoff = pl.cast(127, pl.INT32)
+    local_ties = pl.cast(INDEX_TOPK, pl.INT32)
+    if local_width > INDEX_TOPK:
+        local_rank = pl.cast(local_width - INDEX_TOPK + 1, pl.INT32)
+        local_cutoff = pl.cast(0, pl.INT32)
+        local_high_search_lower = pl.cast(0, pl.INT32)
+        local_high_search_upper = pl.cast(255, pl.INT32)
+        for local_high_search_step in pl.range(8):
+            local_high_search_middle = pl.cast((local_high_search_lower + local_high_search_upper) // 2, pl.INT32)
+            local_high_search_cumulative = pl.cast(
+                pl.tile.read(cached_high, [pl.cast(local_high_search_middle, pl.INDEX)]),
+                pl.INT32,
+            )
+            if local_high_search_cumulative >= local_rank:
+                local_high_search_upper = local_high_search_middle
+            else:
+                local_high_search_lower = pl.cast(local_high_search_middle + 1, pl.INT32)
+        local_high_search_previous = pl.cast(0, pl.INT32)
+        if local_high_search_lower > 0:
+            local_high_search_previous = pl.cast(
+                pl.tile.read(cached_high, [pl.cast(local_high_search_lower - 1, pl.INDEX)]),
+                pl.INT32,
+            )
+        _local_high_search_bin_count = pl.cast(pl.tile.read(cached_high, [pl.cast(local_high_search_lower, pl.INDEX)]), pl.INT32) - local_high_search_previous
+        local_rank = pl.cast(local_rank - local_high_search_previous, pl.INT32)
+        local_cutoff = pl.cast(local_cutoff + local_high_search_lower * 256, pl.INT32)
+        local_low_hist = pl.tile.full([256], dtype=pl.UINT16, value=0)
+        local_low_hist = pl.tile.move(local_low_hist, target_memory=pl.MemorySpace.Vec)
+        local_low_segments = pl.cast((local_width + 63) // 64, pl.INT32)
+        local_low_high = pl.cast(local_cutoff // 256, pl.UINT32)
+        with pl.reg_scope():
+            local_low_mask = pl.reg.full_mask(lanes=64)
+            local_low_byte_mask = pl.reg.broadcast(255, lanes=64, dtype=pl.UINT32)
+            local_low_hist_initial = pl.reg.load(local_low_hist, lanes=256)
+            for local_low_segment, (local_low_hist_acc,) in pl.hardware_loop(local_low_segments, init_values=(local_low_hist_initial,)):
+                local_low_keys16 = pl.reg.load(cached_keys, local_low_segment * 64, lanes=64)
+                local_low_keys32 = pl.reg.convert(local_low_keys16, dtype=pl.UINT32)
+                local_low_upper = pl.reg.shift_rights(local_low_keys32, 8, local_low_mask)
+                local_low_lower = pl.reg.bitwise_and(local_low_keys32, local_low_byte_mask)
+                local_low_signed = pl.reg.interpret_cast(local_low_lower, dtype=pl.INT32)
+                local_low_bytes_i8 = pl.reg.convert(local_low_signed, dtype=pl.INT8, saturate=False)
+                local_low_bytes = pl.reg.interpret_cast(local_low_bytes_i8, dtype=pl.UINT8)
+                local_low_positions = pl.reg.index_gen(pl.cast(local_low_segment * 64, pl.INT32), lanes=64, dtype=pl.INT32)
+                local_low_active = pl.reg.compares(local_low_positions, local_width, local_low_mask, predicate="lt")
+                local_low_matching = pl.reg.compares(local_low_upper, local_low_high, local_low_mask, predicate="eq")
+                local_low_selected = pl.reg.mask_and(local_low_active, local_low_matching)
+                local_low_next = pl.reg.chist(local_low_hist_acc, local_low_bytes, local_low_selected)
+                local_low_hist_final = pl.yield_(local_low_next)
+            _local_low_hist_write = pl.reg.store(local_low_hist, value=local_low_hist_final)
+        local_low_search_lower = pl.cast(0, pl.INT32)
+        local_low_search_upper = pl.cast(255, pl.INT32)
+        for local_low_search_step in pl.range(8):
+            local_low_search_middle = pl.cast((local_low_search_lower + local_low_search_upper) // 2, pl.INT32)
+            local_low_search_cumulative = pl.cast(
+                pl.tile.read(local_low_hist, [pl.cast(local_low_search_middle, pl.INDEX)]),
+                pl.INT32,
+            )
+            if local_low_search_cumulative >= local_rank:
+                local_low_search_upper = local_low_search_middle
+            else:
+                local_low_search_lower = pl.cast(local_low_search_middle + 1, pl.INT32)
+        local_low_search_previous = pl.cast(0, pl.INT32)
+        if local_low_search_lower > 0:
+            local_low_search_previous = pl.cast(
+                pl.tile.read(local_low_hist, [pl.cast(local_low_search_lower - 1, pl.INDEX)]),
+                pl.INT32,
+            )
+        local_low_search_bin_count = pl.cast(pl.tile.read(local_low_hist, [pl.cast(local_low_search_lower, pl.INDEX)]), pl.INT32) - local_low_search_previous
+        local_rank = pl.cast(local_rank - local_low_search_previous, pl.INT32)
+        local_cutoff = pl.cast(local_cutoff + local_low_search_lower * 1, pl.INT32)
+        local_ties = pl.cast(local_low_search_bin_count - local_rank + 1, pl.INT32)
+    mapping_raw = pl.tile.load(
+        physical, [token, logical_begin],
+        [1, SCORE_SHARD_CACHE], valid_shape=[1, pl.cast(local_width, pl.INDEX)],
+        target_memory=pl.MemorySpace.Vec,
+    )
+    mapping_pad = pl.fillpad(mapping_raw, pad_value=pl.PadValue.min)
+    mapping_full = pl.set_validshape(mapping_pad, 1, SCORE_SHARD_CACHE)
+    local_mapping = pl.reshape(mapping_full, [SCORE_SHARD_CACHE])
+    local_keys = pl.tile.full([INDEX_TOPK], dtype=pl.UINT16, value=0)
+    local_keys = pl.tile.move(local_keys, target_memory=pl.MemorySpace.Vec)
+    local_ids = pl.tile.full([INDEX_TOPK], dtype=pl.INT32, value=-1)
+    local_ids = pl.tile.move(local_ids, target_memory=pl.MemorySpace.Vec)
+    local_select_state = pl.tile.full([128], dtype=pl.INT32, value=0)
+    local_select_state = pl.tile.move(local_select_state, target_memory=pl.MemorySpace.Vec)
+    with pl.reg_scope():
+        local_select_initial_ties = pl.reg.broadcast(local_ties, lanes=64, dtype=pl.INT32)
+        local_select_state = pl.reg.store(local_select_state, 64, local_select_initial_ties)
+    local_select_cutoff = pl.cast(local_cutoff, pl.UINT32)
+    local_select_segments = pl.cast((local_width + 63) // 64, pl.INT32)
+    local_select_offset_pack = pl.tile.full([128], dtype=pl.UINT16, value=0)
+    local_select_offset_pack = pl.tile.move(local_select_offset_pack, target_memory=pl.MemorySpace.Vec)
+    with pl.reg_scope():
+        local_select_mask = pl.reg.full_mask(lanes=64)
+        local_select_pack_mask = pl.reg.full_mask(lanes=128)
+        local_select_positions = pl.reg.index_gen(0, lanes=64, dtype=pl.INT32)
+        local_select_zero = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
+        local_select_one = pl.reg.broadcast(1, lanes=64, dtype=pl.INT32)
+        local_select_last = pl.reg.broadcast(63, lanes=64, dtype=pl.UINT32)
+        for local_select_segment in pl.hardware_loop(local_select_segments):
+            local_select_keys16 = pl.reg.load(cached_keys, local_select_segment * 64, lanes=64)
+            local_select_keys = pl.reg.convert(local_select_keys16, dtype=pl.UINT32)
+            local_select_ids = pl.reg.load(local_mapping, local_select_segment * 64, lanes=64)
+            local_select_valid = pl.reg.compares(local_select_ids, 0, local_select_mask, predicate="ge")
+            local_select_finite = pl.reg.compares(local_select_keys, 127, local_select_valid, predicate="gt")
+            local_select_strict = pl.reg.compares(local_select_keys, local_select_cutoff, local_select_finite, predicate="gt")
+            local_select_equal = pl.reg.compares(local_select_keys, local_select_cutoff, local_select_finite, predicate="eq")
+            local_select_equal_prefix = pl.reg.select(local_select_equal, local_select_one, local_select_zero)
+            local_select_equal_prior1 = pl.reg.adds(local_select_positions, -1, local_select_mask)
+            local_select_equal_prior1 = pl.reg.maximum(local_select_equal_prior1, local_select_zero)
+            local_select_equal_offset1 = pl.reg.interpret_cast(local_select_equal_prior1, dtype=pl.UINT32)
+            local_select_equal_shifted1 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset1)
+            local_select_equal_tail1 = pl.reg.compares(local_select_positions, 1, local_select_mask, predicate="ge")
+            local_select_equal_shifted1 = pl.reg.select(local_select_equal_tail1, local_select_equal_shifted1, local_select_zero)
+            local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted1)
+            local_select_equal_prior2 = pl.reg.adds(local_select_positions, -2, local_select_mask)
+            local_select_equal_prior2 = pl.reg.maximum(local_select_equal_prior2, local_select_zero)
+            local_select_equal_offset2 = pl.reg.interpret_cast(local_select_equal_prior2, dtype=pl.UINT32)
+            local_select_equal_shifted2 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset2)
+            local_select_equal_tail2 = pl.reg.compares(local_select_positions, 2, local_select_mask, predicate="ge")
+            local_select_equal_shifted2 = pl.reg.select(local_select_equal_tail2, local_select_equal_shifted2, local_select_zero)
+            local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted2)
+            local_select_equal_prior4 = pl.reg.adds(local_select_positions, -4, local_select_mask)
+            local_select_equal_prior4 = pl.reg.maximum(local_select_equal_prior4, local_select_zero)
+            local_select_equal_offset4 = pl.reg.interpret_cast(local_select_equal_prior4, dtype=pl.UINT32)
+            local_select_equal_shifted4 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset4)
+            local_select_equal_tail4 = pl.reg.compares(local_select_positions, 4, local_select_mask, predicate="ge")
+            local_select_equal_shifted4 = pl.reg.select(local_select_equal_tail4, local_select_equal_shifted4, local_select_zero)
+            local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted4)
+            local_select_equal_prior8 = pl.reg.adds(local_select_positions, -8, local_select_mask)
+            local_select_equal_prior8 = pl.reg.maximum(local_select_equal_prior8, local_select_zero)
+            local_select_equal_offset8 = pl.reg.interpret_cast(local_select_equal_prior8, dtype=pl.UINT32)
+            local_select_equal_shifted8 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset8)
+            local_select_equal_tail8 = pl.reg.compares(local_select_positions, 8, local_select_mask, predicate="ge")
+            local_select_equal_shifted8 = pl.reg.select(local_select_equal_tail8, local_select_equal_shifted8, local_select_zero)
+            local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted8)
+            local_select_equal_prior16 = pl.reg.adds(local_select_positions, -16, local_select_mask)
+            local_select_equal_prior16 = pl.reg.maximum(local_select_equal_prior16, local_select_zero)
+            local_select_equal_offset16 = pl.reg.interpret_cast(local_select_equal_prior16, dtype=pl.UINT32)
+            local_select_equal_shifted16 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset16)
+            local_select_equal_tail16 = pl.reg.compares(local_select_positions, 16, local_select_mask, predicate="ge")
+            local_select_equal_shifted16 = pl.reg.select(local_select_equal_tail16, local_select_equal_shifted16, local_select_zero)
+            local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted16)
+            local_select_equal_prior32 = pl.reg.adds(local_select_positions, -32, local_select_mask)
+            local_select_equal_prior32 = pl.reg.maximum(local_select_equal_prior32, local_select_zero)
+            local_select_equal_offset32 = pl.reg.interpret_cast(local_select_equal_prior32, dtype=pl.UINT32)
+            local_select_equal_shifted32 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset32)
+            local_select_equal_tail32 = pl.reg.compares(local_select_positions, 32, local_select_mask, predicate="ge")
+            local_select_equal_shifted32 = pl.reg.select(local_select_equal_tail32, local_select_equal_shifted32, local_select_zero)
+            local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted32)
+            local_select_remaining = pl.reg.load(local_select_state, 64, lanes=64)
+            local_select_quota = pl.reg.compare(local_select_equal_prefix, local_select_remaining, local_select_mask, predicate="le")
+            local_select_tied = pl.reg.mask_and(local_select_equal, local_select_quota)
+            local_select_keep = pl.reg.mask_or(local_select_strict, local_select_tied)
+            local_select_keep_prefix = pl.reg.select(local_select_keep, local_select_one, local_select_zero)
+            local_select_keep_prior1 = pl.reg.adds(local_select_positions, -1, local_select_mask)
+            local_select_keep_prior1 = pl.reg.maximum(local_select_keep_prior1, local_select_zero)
+            local_select_keep_offset1 = pl.reg.interpret_cast(local_select_keep_prior1, dtype=pl.UINT32)
+            local_select_keep_shifted1 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset1)
+            local_select_keep_tail1 = pl.reg.compares(local_select_positions, 1, local_select_mask, predicate="ge")
+            local_select_keep_shifted1 = pl.reg.select(local_select_keep_tail1, local_select_keep_shifted1, local_select_zero)
+            local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted1)
+            local_select_keep_prior2 = pl.reg.adds(local_select_positions, -2, local_select_mask)
+            local_select_keep_prior2 = pl.reg.maximum(local_select_keep_prior2, local_select_zero)
+            local_select_keep_offset2 = pl.reg.interpret_cast(local_select_keep_prior2, dtype=pl.UINT32)
+            local_select_keep_shifted2 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset2)
+            local_select_keep_tail2 = pl.reg.compares(local_select_positions, 2, local_select_mask, predicate="ge")
+            local_select_keep_shifted2 = pl.reg.select(local_select_keep_tail2, local_select_keep_shifted2, local_select_zero)
+            local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted2)
+            local_select_keep_prior4 = pl.reg.adds(local_select_positions, -4, local_select_mask)
+            local_select_keep_prior4 = pl.reg.maximum(local_select_keep_prior4, local_select_zero)
+            local_select_keep_offset4 = pl.reg.interpret_cast(local_select_keep_prior4, dtype=pl.UINT32)
+            local_select_keep_shifted4 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset4)
+            local_select_keep_tail4 = pl.reg.compares(local_select_positions, 4, local_select_mask, predicate="ge")
+            local_select_keep_shifted4 = pl.reg.select(local_select_keep_tail4, local_select_keep_shifted4, local_select_zero)
+            local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted4)
+            local_select_keep_prior8 = pl.reg.adds(local_select_positions, -8, local_select_mask)
+            local_select_keep_prior8 = pl.reg.maximum(local_select_keep_prior8, local_select_zero)
+            local_select_keep_offset8 = pl.reg.interpret_cast(local_select_keep_prior8, dtype=pl.UINT32)
+            local_select_keep_shifted8 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset8)
+            local_select_keep_tail8 = pl.reg.compares(local_select_positions, 8, local_select_mask, predicate="ge")
+            local_select_keep_shifted8 = pl.reg.select(local_select_keep_tail8, local_select_keep_shifted8, local_select_zero)
+            local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted8)
+            local_select_keep_prior16 = pl.reg.adds(local_select_positions, -16, local_select_mask)
+            local_select_keep_prior16 = pl.reg.maximum(local_select_keep_prior16, local_select_zero)
+            local_select_keep_offset16 = pl.reg.interpret_cast(local_select_keep_prior16, dtype=pl.UINT32)
+            local_select_keep_shifted16 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset16)
+            local_select_keep_tail16 = pl.reg.compares(local_select_positions, 16, local_select_mask, predicate="ge")
+            local_select_keep_shifted16 = pl.reg.select(local_select_keep_tail16, local_select_keep_shifted16, local_select_zero)
+            local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted16)
+            local_select_keep_prior32 = pl.reg.adds(local_select_positions, -32, local_select_mask)
+            local_select_keep_prior32 = pl.reg.maximum(local_select_keep_prior32, local_select_zero)
+            local_select_keep_offset32 = pl.reg.interpret_cast(local_select_keep_prior32, dtype=pl.UINT32)
+            local_select_keep_shifted32 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset32)
+            local_select_keep_tail32 = pl.reg.compares(local_select_positions, 32, local_select_mask, predicate="ge")
+            local_select_keep_shifted32 = pl.reg.select(local_select_keep_tail32, local_select_keep_shifted32, local_select_zero)
+            local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted32)
+            local_select_count = pl.reg.load(local_select_state, lanes=64)
+            local_select_destinations = pl.reg.add(local_select_keep_prefix, local_select_count)
+            local_select_destinations = pl.reg.adds(local_select_destinations, -1, local_select_mask)
+            local_select_addresses32 = pl.reg.interpret_cast(local_select_destinations, dtype=pl.UINT32)
+            local_select_address_halves = pl.reg.interpret_cast(local_select_addresses32, dtype=pl.UINT16)
+            local_select_address_even, local_select_address_odd = pl.reg.dintlv(
+                local_select_address_halves, local_select_address_halves,
+                local_select_pack_mask,
+            )
+            _local_select_pack_write = pl.reg.store(local_select_offset_pack, value=local_select_address_even)
+            local_select_addresses16 = pl.reg.load(local_select_offset_pack, lanes=64)
+            _local_select_ids_write = pl.reg.scatter(
+                local_ids, local_select_addresses32,
+                local_select_ids, local_select_keep,
+            )
+            _local_select_keys_write = pl.reg.scatter(
+                local_keys, local_select_addresses16,
+                local_select_keys16, local_select_keep,
+            )
+            local_select_kept_total = pl.reg.gather_lanes(local_select_keep_prefix, local_select_last)
+            local_select_equal_total = pl.reg.gather_lanes(local_select_equal_prefix, local_select_last)
+            local_select_next_count = pl.reg.add(local_select_count, local_select_kept_total)
+            local_select_next_ties = pl.reg.sub(local_select_remaining, local_select_equal_total)
+            local_select_next_ties = pl.reg.maximum(local_select_next_ties, local_select_zero)
+            _local_select_count_write = pl.reg.store(local_select_state, value=local_select_next_count)
+            _local_select_ties_write = pl.reg.store(local_select_state, 64, local_select_next_ties)
+    local_keys_row = pl.reshape(local_keys, [1, INDEX_TOPK])
+    local_ids_row = pl.reshape(local_ids, [1, INDEX_TOPK])
+    candidate_keys = pl.store(local_keys_row, [token, shard * INDEX_TOPK], candidate_keys)
+    candidate_ids = pl.store(local_ids_row, [token, shard * INDEX_TOPK], candidate_ids)
+    return candidate_keys, candidate_ids
+
+
+@pl.jit.inline(auto_scope=False)
+def _merge_index_topk_sharded(
     scores: pl.Tensor,
     physical: pl.Tensor,
     lengths: pl.Tensor,
     runs: pl.Tensor,
+    candidate_keys: pl.Tensor,
+    candidate_ids: pl.Tensor,
     output: pl.Tensor,
     num_tokens: pl.Scalar[pl.INT32],
     shards: pl.Scalar[pl.INT32],
@@ -1604,326 +1930,12 @@ def _select_index_topk_sharded(
     direct_short: pl.constexpr,
 ):
     width = pl.tensor.dim(scores, 1)
-    capacity = pl.tensor.dim(scores, 0)
     vector_workers = pl.max(1, pl.min(64, pl.system.available_aiv_count()))
-    run_count = pl.cast(
-        pl.read(runs, [3, 0]),
-        pl.INT32,
-    )
+    run_count = pl.cast(pl.read(runs, [3, 0]), pl.INT32)
     panels = pl.cast((width + 255) // 256, pl.INT32)
     total = pl.cast(run_count * panels, pl.INT32)
-    owners = pl.cast(
-        pl.min(shards, total),
-        pl.INT32,
-    )
-    candidate_width = shards * INDEX_TOPK
-    candidate_keys = pl.create_tensor([capacity, candidate_width], dtype=pl.UINT16)
-    candidate_ids = pl.create_tensor([capacity, candidate_width], dtype=pl.INT32)
-    with pl.spmd(vector_workers, name_hint="idx_topk_shards_reg", deps=[ready]) as local_done:
-        raw_worker = pl.tile.get_block_idx()
-        for task in pl.range(raw_worker, shards * 2, vector_workers):
-            shard = task // 2
-            lane = task % 2
-            if shard < owners:
-                first = pl.cast(total * shard // owners, pl.INT32)
-                finish = pl.cast(total * (shard + 1) // owners, pl.INT32)
-                first_run = first // panels
-                last_run = (finish - 1) // panels
-                for run_id in pl.range(first_run, last_run + 1):
-                    first_panel = pl.max(first, run_id * panels) - run_id * panels
-                    last_panel = pl.min(finish, (run_id + 1) * panels) - run_id * panels
-                    logical_begin = pl.cast(first_panel * 256, pl.INT32)
-                    local_width = pl.cast(
-                        pl.min((last_panel - first_panel) * 256, width - logical_begin),
-                        pl.INT32,
-                    )
-                    run_begin = pl.cast(
-                        pl.read(runs, [0, run_id]),
-                        pl.INT32,
-                    )
-                    run_end = pl.cast(
-                        pl.read(runs, [1, run_id]),
-                        pl.INT32,
-                    )
-                    for token in pl.range(run_begin + lane, run_end, 2):
-                        compute_local = pl.cast(1, pl.INT32)
-                        if direct_short:
-                            if pl.read(lengths, [token]) <= INDEX_TOPK:
-                                compute_local = pl.cast(0, pl.INT32)
-                        if compute_local == 1:
-                            cache_raw = pl.tile.load(
-                                scores, [token, logical_begin],
-                                [1, SCORE_SHARD_CACHE], valid_shape=[1, pl.cast(local_width, pl.INDEX)],
-                                target_memory=pl.MemorySpace.Vec,
-                            )
-                            cache_pad = pl.fillpad(cache_raw, pad_value=pl.PadValue.min)
-                            cache_full = pl.set_validshape(cache_pad, 1, SCORE_SHARD_CACHE)
-                            cache_values = pl.reshape(cache_full, [SCORE_SHARD_CACHE])
-                            cached_keys = pl.tile.full([SCORE_SHARD_CACHE], dtype=pl.UINT16, value=127)
-                            cached_keys = pl.tile.move(cached_keys, target_memory=pl.MemorySpace.Vec)
-                            cached_high = pl.tile.full([256], dtype=pl.UINT16, value=0)
-                            cached_high = pl.tile.move(cached_high, target_memory=pl.MemorySpace.Vec)
-                            cache_segments = pl.cast((local_width + 63) // 64, pl.INT32)
-                            cache_pack = pl.tile.full([128], dtype=pl.UINT16, value=0)
-                            cache_pack = pl.tile.move(cache_pack, target_memory=pl.MemorySpace.Vec)
-                            with pl.reg_scope():
-                                cache_mask = pl.reg.full_mask(lanes=64)
-                                cache_pack_mask = pl.reg.full_mask(lanes=128)
-                                cache_sign = pl.reg.broadcast(32768, lanes=64, dtype=pl.UINT32)
-                                cache_word = pl.reg.broadcast(65535, lanes=64, dtype=pl.UINT32)
-                                cache_invalid = pl.reg.broadcast(127, lanes=64, dtype=pl.UINT32)
-                                cache_hist_initial = pl.reg.load(cached_high, lanes=256)
-                                for cache_segment, (cache_hist_acc,) in pl.hardware_loop(cache_segments, init_values=(cache_hist_initial,)):
-                                    cache_input = pl.reg.load(cache_values, cache_segment * 64, lanes=64)
-                                    cache_bits = pl.reg.interpret_cast(cache_input, dtype=pl.UINT32)
-                                    cache_bf16 = pl.reg.shift_rights(cache_bits, 16, cache_mask)
-                                    cache_negative = pl.reg.compares(cache_bf16, 32768, cache_mask, predicate="ge")
-                                    cache_negative_key = pl.reg.bitwise_and(pl.reg.bitwise_not(cache_bf16), cache_word)
-                                    cache_positive_key = pl.reg.bitwise_xor(cache_bf16, cache_sign)
-                                    cache_key32 = pl.reg.select(cache_negative, cache_negative_key, cache_positive_key)
-                                    cache_positions = pl.reg.index_gen(pl.cast(cache_segment * 64, pl.INT32), lanes=64, dtype=pl.INT32)
-                                    cache_active = pl.reg.compares(cache_positions, local_width, cache_mask, predicate="lt")
-                                    cache_key32 = pl.reg.select(cache_active, cache_key32, cache_invalid)
-                                    cache_key_halves = pl.reg.interpret_cast(cache_key32, dtype=pl.UINT16)
-                                    cache_key_even, cache_key_odd = pl.reg.dintlv(cache_key_halves, cache_key_halves, cache_pack_mask)
-                                    _cache_pack_write = pl.reg.store(cache_pack, value=cache_key_even)
-                                    cache_key16 = pl.reg.load(cache_pack, lanes=64)
-                                    _cache_key_write = pl.reg.store(cached_keys, cache_segment * 64, cache_key16)
-                                    cache_high32 = pl.reg.shift_rights(cache_key32, 8, cache_mask)
-                                    cache_high_i32 = pl.reg.interpret_cast(cache_high32, dtype=pl.INT32)
-                                    cache_high_i8 = pl.reg.convert(cache_high_i32, dtype=pl.INT8, saturate=False)
-                                    cache_high_bytes = pl.reg.interpret_cast(cache_high_i8, dtype=pl.UINT8)
-                                    cache_hist_next = pl.reg.chist(cache_hist_acc, cache_high_bytes, cache_active)
-                                    cache_hist_final = pl.yield_(cache_hist_next)
-                                _cache_hist_write = pl.reg.store(cached_high, value=cache_hist_final)
-                            local_cutoff = pl.cast(127, pl.INT32)
-                            local_ties = pl.cast(INDEX_TOPK, pl.INT32)
-                            if local_width > INDEX_TOPK:
-                                local_rank = pl.cast(local_width - INDEX_TOPK + 1, pl.INT32)
-                                local_cutoff = pl.cast(0, pl.INT32)
-                                local_high_search_lower = pl.cast(0, pl.INT32)
-                                local_high_search_upper = pl.cast(255, pl.INT32)
-                                for local_high_search_step in pl.range(8):
-                                    local_high_search_middle = pl.cast((local_high_search_lower + local_high_search_upper) // 2, pl.INT32)
-                                    local_high_search_cumulative = pl.cast(
-                                        pl.tile.read(cached_high, [pl.cast(local_high_search_middle, pl.INDEX)]),
-                                        pl.INT32,
-                                    )
-                                    if local_high_search_cumulative >= local_rank:
-                                        local_high_search_upper = local_high_search_middle
-                                    else:
-                                        local_high_search_lower = pl.cast(local_high_search_middle + 1, pl.INT32)
-                                local_high_search_previous = pl.cast(0, pl.INT32)
-                                if local_high_search_lower > 0:
-                                    local_high_search_previous = pl.cast(
-                                        pl.tile.read(cached_high, [pl.cast(local_high_search_lower - 1, pl.INDEX)]),
-                                        pl.INT32,
-                                    )
-                                _local_high_search_bin_count = pl.cast(pl.tile.read(cached_high, [pl.cast(local_high_search_lower, pl.INDEX)]), pl.INT32) - local_high_search_previous
-                                local_rank = pl.cast(local_rank - local_high_search_previous, pl.INT32)
-                                local_cutoff = pl.cast(local_cutoff + local_high_search_lower * 256, pl.INT32)
-                                local_low_hist = pl.tile.full([256], dtype=pl.UINT16, value=0)
-                                local_low_hist = pl.tile.move(local_low_hist, target_memory=pl.MemorySpace.Vec)
-                                local_low_segments = pl.cast((local_width + 63) // 64, pl.INT32)
-                                local_low_high = pl.cast(local_cutoff // 256, pl.UINT32)
-                                with pl.reg_scope():
-                                    local_low_mask = pl.reg.full_mask(lanes=64)
-                                    local_low_byte_mask = pl.reg.broadcast(255, lanes=64, dtype=pl.UINT32)
-                                    local_low_hist_initial = pl.reg.load(local_low_hist, lanes=256)
-                                    for local_low_segment, (local_low_hist_acc,) in pl.hardware_loop(local_low_segments, init_values=(local_low_hist_initial,)):
-                                        local_low_keys16 = pl.reg.load(cached_keys, local_low_segment * 64, lanes=64)
-                                        local_low_keys32 = pl.reg.convert(local_low_keys16, dtype=pl.UINT32)
-                                        local_low_upper = pl.reg.shift_rights(local_low_keys32, 8, local_low_mask)
-                                        local_low_lower = pl.reg.bitwise_and(local_low_keys32, local_low_byte_mask)
-                                        local_low_signed = pl.reg.interpret_cast(local_low_lower, dtype=pl.INT32)
-                                        local_low_bytes_i8 = pl.reg.convert(local_low_signed, dtype=pl.INT8, saturate=False)
-                                        local_low_bytes = pl.reg.interpret_cast(local_low_bytes_i8, dtype=pl.UINT8)
-                                        local_low_positions = pl.reg.index_gen(pl.cast(local_low_segment * 64, pl.INT32), lanes=64, dtype=pl.INT32)
-                                        local_low_active = pl.reg.compares(local_low_positions, local_width, local_low_mask, predicate="lt")
-                                        local_low_matching = pl.reg.compares(local_low_upper, local_low_high, local_low_mask, predicate="eq")
-                                        local_low_selected = pl.reg.mask_and(local_low_active, local_low_matching)
-                                        local_low_next = pl.reg.chist(local_low_hist_acc, local_low_bytes, local_low_selected)
-                                        local_low_hist_final = pl.yield_(local_low_next)
-                                    _local_low_hist_write = pl.reg.store(local_low_hist, value=local_low_hist_final)
-                                local_low_search_lower = pl.cast(0, pl.INT32)
-                                local_low_search_upper = pl.cast(255, pl.INT32)
-                                for local_low_search_step in pl.range(8):
-                                    local_low_search_middle = pl.cast((local_low_search_lower + local_low_search_upper) // 2, pl.INT32)
-                                    local_low_search_cumulative = pl.cast(
-                                        pl.tile.read(local_low_hist, [pl.cast(local_low_search_middle, pl.INDEX)]),
-                                        pl.INT32,
-                                    )
-                                    if local_low_search_cumulative >= local_rank:
-                                        local_low_search_upper = local_low_search_middle
-                                    else:
-                                        local_low_search_lower = pl.cast(local_low_search_middle + 1, pl.INT32)
-                                local_low_search_previous = pl.cast(0, pl.INT32)
-                                if local_low_search_lower > 0:
-                                    local_low_search_previous = pl.cast(
-                                        pl.tile.read(local_low_hist, [pl.cast(local_low_search_lower - 1, pl.INDEX)]),
-                                        pl.INT32,
-                                    )
-                                local_low_search_bin_count = pl.cast(pl.tile.read(local_low_hist, [pl.cast(local_low_search_lower, pl.INDEX)]), pl.INT32) - local_low_search_previous
-                                local_rank = pl.cast(local_rank - local_low_search_previous, pl.INT32)
-                                local_cutoff = pl.cast(local_cutoff + local_low_search_lower * 1, pl.INT32)
-                                local_ties = pl.cast(local_low_search_bin_count - local_rank + 1, pl.INT32)
-                            mapping_raw = pl.tile.load(
-                                physical, [token, logical_begin],
-                                [1, SCORE_SHARD_CACHE], valid_shape=[1, pl.cast(local_width, pl.INDEX)],
-                                target_memory=pl.MemorySpace.Vec,
-                            )
-                            mapping_pad = pl.fillpad(mapping_raw, pad_value=pl.PadValue.min)
-                            mapping_full = pl.set_validshape(mapping_pad, 1, SCORE_SHARD_CACHE)
-                            local_mapping = pl.reshape(mapping_full, [SCORE_SHARD_CACHE])
-                            local_keys = pl.tile.full([INDEX_TOPK], dtype=pl.UINT16, value=0)
-                            local_keys = pl.tile.move(local_keys, target_memory=pl.MemorySpace.Vec)
-                            local_ids = pl.tile.full([INDEX_TOPK], dtype=pl.INT32, value=-1)
-                            local_ids = pl.tile.move(local_ids, target_memory=pl.MemorySpace.Vec)
-                            local_select_state = pl.tile.full([128], dtype=pl.INT32, value=0)
-                            local_select_state = pl.tile.move(local_select_state, target_memory=pl.MemorySpace.Vec)
-                            with pl.reg_scope():
-                                local_select_initial_ties = pl.reg.broadcast(local_ties, lanes=64, dtype=pl.INT32)
-                                local_select_state = pl.reg.store(local_select_state, 64, local_select_initial_ties)
-                            local_select_cutoff = pl.cast(local_cutoff, pl.UINT32)
-                            local_select_segments = pl.cast((local_width + 63) // 64, pl.INT32)
-                            local_select_offset_pack = pl.tile.full([128], dtype=pl.UINT16, value=0)
-                            local_select_offset_pack = pl.tile.move(local_select_offset_pack, target_memory=pl.MemorySpace.Vec)
-                            with pl.reg_scope():
-                                local_select_mask = pl.reg.full_mask(lanes=64)
-                                local_select_pack_mask = pl.reg.full_mask(lanes=128)
-                                local_select_positions = pl.reg.index_gen(0, lanes=64, dtype=pl.INT32)
-                                local_select_zero = pl.reg.broadcast(0, lanes=64, dtype=pl.INT32)
-                                local_select_one = pl.reg.broadcast(1, lanes=64, dtype=pl.INT32)
-                                local_select_last = pl.reg.broadcast(63, lanes=64, dtype=pl.UINT32)
-                                for local_select_segment in pl.hardware_loop(local_select_segments):
-                                    local_select_keys16 = pl.reg.load(cached_keys, local_select_segment * 64, lanes=64)
-                                    local_select_keys = pl.reg.convert(local_select_keys16, dtype=pl.UINT32)
-                                    local_select_ids = pl.reg.load(local_mapping, local_select_segment * 64, lanes=64)
-                                    local_select_valid = pl.reg.compares(local_select_ids, 0, local_select_mask, predicate="ge")
-                                    local_select_finite = pl.reg.compares(local_select_keys, 127, local_select_valid, predicate="gt")
-                                    local_select_strict = pl.reg.compares(local_select_keys, local_select_cutoff, local_select_finite, predicate="gt")
-                                    local_select_equal = pl.reg.compares(local_select_keys, local_select_cutoff, local_select_finite, predicate="eq")
-                                    local_select_equal_prefix = pl.reg.select(local_select_equal, local_select_one, local_select_zero)
-                                    local_select_equal_prior1 = pl.reg.adds(local_select_positions, -1, local_select_mask)
-                                    local_select_equal_prior1 = pl.reg.maximum(local_select_equal_prior1, local_select_zero)
-                                    local_select_equal_offset1 = pl.reg.interpret_cast(local_select_equal_prior1, dtype=pl.UINT32)
-                                    local_select_equal_shifted1 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset1)
-                                    local_select_equal_tail1 = pl.reg.compares(local_select_positions, 1, local_select_mask, predicate="ge")
-                                    local_select_equal_shifted1 = pl.reg.select(local_select_equal_tail1, local_select_equal_shifted1, local_select_zero)
-                                    local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted1)
-                                    local_select_equal_prior2 = pl.reg.adds(local_select_positions, -2, local_select_mask)
-                                    local_select_equal_prior2 = pl.reg.maximum(local_select_equal_prior2, local_select_zero)
-                                    local_select_equal_offset2 = pl.reg.interpret_cast(local_select_equal_prior2, dtype=pl.UINT32)
-                                    local_select_equal_shifted2 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset2)
-                                    local_select_equal_tail2 = pl.reg.compares(local_select_positions, 2, local_select_mask, predicate="ge")
-                                    local_select_equal_shifted2 = pl.reg.select(local_select_equal_tail2, local_select_equal_shifted2, local_select_zero)
-                                    local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted2)
-                                    local_select_equal_prior4 = pl.reg.adds(local_select_positions, -4, local_select_mask)
-                                    local_select_equal_prior4 = pl.reg.maximum(local_select_equal_prior4, local_select_zero)
-                                    local_select_equal_offset4 = pl.reg.interpret_cast(local_select_equal_prior4, dtype=pl.UINT32)
-                                    local_select_equal_shifted4 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset4)
-                                    local_select_equal_tail4 = pl.reg.compares(local_select_positions, 4, local_select_mask, predicate="ge")
-                                    local_select_equal_shifted4 = pl.reg.select(local_select_equal_tail4, local_select_equal_shifted4, local_select_zero)
-                                    local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted4)
-                                    local_select_equal_prior8 = pl.reg.adds(local_select_positions, -8, local_select_mask)
-                                    local_select_equal_prior8 = pl.reg.maximum(local_select_equal_prior8, local_select_zero)
-                                    local_select_equal_offset8 = pl.reg.interpret_cast(local_select_equal_prior8, dtype=pl.UINT32)
-                                    local_select_equal_shifted8 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset8)
-                                    local_select_equal_tail8 = pl.reg.compares(local_select_positions, 8, local_select_mask, predicate="ge")
-                                    local_select_equal_shifted8 = pl.reg.select(local_select_equal_tail8, local_select_equal_shifted8, local_select_zero)
-                                    local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted8)
-                                    local_select_equal_prior16 = pl.reg.adds(local_select_positions, -16, local_select_mask)
-                                    local_select_equal_prior16 = pl.reg.maximum(local_select_equal_prior16, local_select_zero)
-                                    local_select_equal_offset16 = pl.reg.interpret_cast(local_select_equal_prior16, dtype=pl.UINT32)
-                                    local_select_equal_shifted16 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset16)
-                                    local_select_equal_tail16 = pl.reg.compares(local_select_positions, 16, local_select_mask, predicate="ge")
-                                    local_select_equal_shifted16 = pl.reg.select(local_select_equal_tail16, local_select_equal_shifted16, local_select_zero)
-                                    local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted16)
-                                    local_select_equal_prior32 = pl.reg.adds(local_select_positions, -32, local_select_mask)
-                                    local_select_equal_prior32 = pl.reg.maximum(local_select_equal_prior32, local_select_zero)
-                                    local_select_equal_offset32 = pl.reg.interpret_cast(local_select_equal_prior32, dtype=pl.UINT32)
-                                    local_select_equal_shifted32 = pl.reg.gather_lanes(local_select_equal_prefix, local_select_equal_offset32)
-                                    local_select_equal_tail32 = pl.reg.compares(local_select_positions, 32, local_select_mask, predicate="ge")
-                                    local_select_equal_shifted32 = pl.reg.select(local_select_equal_tail32, local_select_equal_shifted32, local_select_zero)
-                                    local_select_equal_prefix = pl.reg.add(local_select_equal_prefix, local_select_equal_shifted32)
-                                    local_select_remaining = pl.reg.load(local_select_state, 64, lanes=64)
-                                    local_select_quota = pl.reg.compare(local_select_equal_prefix, local_select_remaining, local_select_mask, predicate="le")
-                                    local_select_tied = pl.reg.mask_and(local_select_equal, local_select_quota)
-                                    local_select_keep = pl.reg.mask_or(local_select_strict, local_select_tied)
-                                    local_select_keep_prefix = pl.reg.select(local_select_keep, local_select_one, local_select_zero)
-                                    local_select_keep_prior1 = pl.reg.adds(local_select_positions, -1, local_select_mask)
-                                    local_select_keep_prior1 = pl.reg.maximum(local_select_keep_prior1, local_select_zero)
-                                    local_select_keep_offset1 = pl.reg.interpret_cast(local_select_keep_prior1, dtype=pl.UINT32)
-                                    local_select_keep_shifted1 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset1)
-                                    local_select_keep_tail1 = pl.reg.compares(local_select_positions, 1, local_select_mask, predicate="ge")
-                                    local_select_keep_shifted1 = pl.reg.select(local_select_keep_tail1, local_select_keep_shifted1, local_select_zero)
-                                    local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted1)
-                                    local_select_keep_prior2 = pl.reg.adds(local_select_positions, -2, local_select_mask)
-                                    local_select_keep_prior2 = pl.reg.maximum(local_select_keep_prior2, local_select_zero)
-                                    local_select_keep_offset2 = pl.reg.interpret_cast(local_select_keep_prior2, dtype=pl.UINT32)
-                                    local_select_keep_shifted2 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset2)
-                                    local_select_keep_tail2 = pl.reg.compares(local_select_positions, 2, local_select_mask, predicate="ge")
-                                    local_select_keep_shifted2 = pl.reg.select(local_select_keep_tail2, local_select_keep_shifted2, local_select_zero)
-                                    local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted2)
-                                    local_select_keep_prior4 = pl.reg.adds(local_select_positions, -4, local_select_mask)
-                                    local_select_keep_prior4 = pl.reg.maximum(local_select_keep_prior4, local_select_zero)
-                                    local_select_keep_offset4 = pl.reg.interpret_cast(local_select_keep_prior4, dtype=pl.UINT32)
-                                    local_select_keep_shifted4 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset4)
-                                    local_select_keep_tail4 = pl.reg.compares(local_select_positions, 4, local_select_mask, predicate="ge")
-                                    local_select_keep_shifted4 = pl.reg.select(local_select_keep_tail4, local_select_keep_shifted4, local_select_zero)
-                                    local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted4)
-                                    local_select_keep_prior8 = pl.reg.adds(local_select_positions, -8, local_select_mask)
-                                    local_select_keep_prior8 = pl.reg.maximum(local_select_keep_prior8, local_select_zero)
-                                    local_select_keep_offset8 = pl.reg.interpret_cast(local_select_keep_prior8, dtype=pl.UINT32)
-                                    local_select_keep_shifted8 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset8)
-                                    local_select_keep_tail8 = pl.reg.compares(local_select_positions, 8, local_select_mask, predicate="ge")
-                                    local_select_keep_shifted8 = pl.reg.select(local_select_keep_tail8, local_select_keep_shifted8, local_select_zero)
-                                    local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted8)
-                                    local_select_keep_prior16 = pl.reg.adds(local_select_positions, -16, local_select_mask)
-                                    local_select_keep_prior16 = pl.reg.maximum(local_select_keep_prior16, local_select_zero)
-                                    local_select_keep_offset16 = pl.reg.interpret_cast(local_select_keep_prior16, dtype=pl.UINT32)
-                                    local_select_keep_shifted16 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset16)
-                                    local_select_keep_tail16 = pl.reg.compares(local_select_positions, 16, local_select_mask, predicate="ge")
-                                    local_select_keep_shifted16 = pl.reg.select(local_select_keep_tail16, local_select_keep_shifted16, local_select_zero)
-                                    local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted16)
-                                    local_select_keep_prior32 = pl.reg.adds(local_select_positions, -32, local_select_mask)
-                                    local_select_keep_prior32 = pl.reg.maximum(local_select_keep_prior32, local_select_zero)
-                                    local_select_keep_offset32 = pl.reg.interpret_cast(local_select_keep_prior32, dtype=pl.UINT32)
-                                    local_select_keep_shifted32 = pl.reg.gather_lanes(local_select_keep_prefix, local_select_keep_offset32)
-                                    local_select_keep_tail32 = pl.reg.compares(local_select_positions, 32, local_select_mask, predicate="ge")
-                                    local_select_keep_shifted32 = pl.reg.select(local_select_keep_tail32, local_select_keep_shifted32, local_select_zero)
-                                    local_select_keep_prefix = pl.reg.add(local_select_keep_prefix, local_select_keep_shifted32)
-                                    local_select_count = pl.reg.load(local_select_state, lanes=64)
-                                    local_select_destinations = pl.reg.add(local_select_keep_prefix, local_select_count)
-                                    local_select_destinations = pl.reg.adds(local_select_destinations, -1, local_select_mask)
-                                    local_select_addresses32 = pl.reg.interpret_cast(local_select_destinations, dtype=pl.UINT32)
-                                    local_select_address_halves = pl.reg.interpret_cast(local_select_addresses32, dtype=pl.UINT16)
-                                    local_select_address_even, local_select_address_odd = pl.reg.dintlv(
-                                        local_select_address_halves, local_select_address_halves,
-                                        local_select_pack_mask,
-                                    )
-                                    _local_select_pack_write = pl.reg.store(local_select_offset_pack, value=local_select_address_even)
-                                    local_select_addresses16 = pl.reg.load(local_select_offset_pack, lanes=64)
-                                    _local_select_ids_write = pl.reg.scatter(
-                                        local_ids, local_select_addresses32,
-                                        local_select_ids, local_select_keep,
-                                    )
-                                    _local_select_keys_write = pl.reg.scatter(
-                                        local_keys, local_select_addresses16,
-                                        local_select_keys16, local_select_keep,
-                                    )
-                                    local_select_kept_total = pl.reg.gather_lanes(local_select_keep_prefix, local_select_last)
-                                    local_select_equal_total = pl.reg.gather_lanes(local_select_equal_prefix, local_select_last)
-                                    local_select_next_count = pl.reg.add(local_select_count, local_select_kept_total)
-                                    local_select_next_ties = pl.reg.sub(local_select_remaining, local_select_equal_total)
-                                    local_select_next_ties = pl.reg.maximum(local_select_next_ties, local_select_zero)
-                                    _local_select_count_write = pl.reg.store(local_select_state, value=local_select_next_count)
-                                    _local_select_ties_write = pl.reg.store(local_select_state, 64, local_select_next_ties)
-                            local_keys_row = pl.reshape(local_keys, [1, INDEX_TOPK])
-                            local_ids_row = pl.reshape(local_ids, [1, INDEX_TOPK])
-                            candidate_keys = pl.store(local_keys_row, [token, shard * INDEX_TOPK], candidate_keys)
-                            candidate_ids = pl.store(local_ids_row, [token, shard * INDEX_TOPK], candidate_ids)
-    with pl.spmd(vector_workers, name_hint="idx_topk_merge_reg", deps=[local_done]) as completed:
+    owners = pl.cast(pl.min(shards, total), pl.INT32)
+    with pl.spmd(vector_workers, name_hint="idx_topk_merge_reg", deps=[ready]) as completed:
         merge_worker = pl.tile.get_block_idx()
         for merge_token in pl.range(merge_worker, num_tokens, vector_workers):
             final_ids = pl.tile.full([INDEX_TOPK], dtype=pl.INT32, value=-1)
@@ -2294,15 +2306,6 @@ def score_select_paged_pypto(
     run_stride = tokens + 1
     runs = pl.create_tensor([4, run_stride], dtype=pl.INT32)
     runs_ready = _plan_score_runs(request_ids, lengths, request_ids, runs, num_tokens, width, pl.cast(0, pl.INDEX), cache_ready, False)
-    completed = _score_index_rows(
-        query, query_scale, weights,
-        index_cache, index_cache_scale,
-        block_table, request_ids, lengths,
-        block_table, request_ids,
-        scores, physical, runs, runs_ready,
-        num_tokens, cache_ready, query_ready, weights_ready,
-        cache_ready, False,
-    )
     panels = (width + SCORE_TILE - 1) // SCORE_TILE
     run_count = pl.cast(
         pl.read(runs, [3, 0]),
@@ -2314,7 +2317,23 @@ def score_select_paged_pypto(
         pl.max(workers, (work_count + SCORE_SHARD_PANELS_TILE - 1) // SCORE_SHARD_PANELS_TILE),
         pl.INT32,
     )
-    selected = _select_index_topk_sharded(scores, physical, lengths, runs, output, num_tokens, shards, completed, c2a)
+    candidate_width = shards * INDEX_TOPK
+    candidate_keys = pl.create_tensor([tokens, candidate_width], dtype=pl.UINT16)
+    candidate_ids = pl.create_tensor([tokens, candidate_width], dtype=pl.INT32)
+    completed = _score_index_rows(
+        query, query_scale, weights,
+        index_cache, index_cache_scale,
+        block_table, request_ids, lengths,
+        block_table, request_ids,
+        scores, physical, candidate_keys, candidate_ids, runs, runs_ready,
+        num_tokens, shards, cache_ready, query_ready, weights_ready,
+        cache_ready, False, c2a,
+    )
+    selected = _merge_index_topk_sharded(
+        scores, physical, lengths, runs,
+        candidate_keys, candidate_ids, output,
+        num_tokens, shards, completed, c2a,
+    )
     return selected, completed
 
 @pl.jit.inline(auto_scope=False)
@@ -2344,15 +2363,6 @@ def score_select_reindex_pypto(
     runs = pl.create_tensor([4, run_stride], dtype=pl.INT32)
     capacity = pl.tensor.dim(pool_block_ids, 1)
     runs_ready = _plan_score_runs(request_ids, lengths, pool_block_counts, runs, num_tokens, width, capacity, pool_ready, True)
-    completed = _score_index_rows(
-        query, query_scale, weights,
-        index_cache, index_cache_scale,
-        block_table, request_ids, lengths,
-        pool_block_ids, pool_block_counts,
-        scores, physical, runs, runs_ready,
-        num_tokens, cache_ready, query_ready, weights_ready,
-        pool_ready, True,
-    )
     panels = (width + SCORE_TILE - 1) // SCORE_TILE
     run_count = pl.cast(
         pl.read(runs, [3, 0]),
@@ -2364,7 +2374,23 @@ def score_select_reindex_pypto(
         pl.max(workers, (work_count + SCORE_SHARD_PANELS_TILE - 1) // SCORE_SHARD_PANELS_TILE),
         pl.INT32,
     )
-    return _select_index_topk_sharded(scores, physical, lengths, runs, output, num_tokens, shards, completed, False)
+    candidate_width = shards * INDEX_TOPK
+    candidate_keys = pl.create_tensor([tokens, candidate_width], dtype=pl.UINT16)
+    candidate_ids = pl.create_tensor([tokens, candidate_width], dtype=pl.INT32)
+    completed = _score_index_rows(
+        query, query_scale, weights,
+        index_cache, index_cache_scale,
+        block_table, request_ids, lengths,
+        pool_block_ids, pool_block_counts,
+        scores, physical, candidate_keys, candidate_ids, runs, runs_ready,
+        num_tokens, shards, cache_ready, query_ready, weights_ready,
+        pool_ready, True, False,
+    )
+    return _merge_index_topk_sharded(
+        scores, physical, lengths, runs,
+        candidate_keys, candidate_ids, output,
+        num_tokens, shards, completed, False,
+    )
 
 
 @pl.jit.inline(auto_scope=False)
