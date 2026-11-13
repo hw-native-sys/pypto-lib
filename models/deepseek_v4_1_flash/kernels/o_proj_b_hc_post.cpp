@@ -28,12 +28,8 @@ constexpr int POST_UB = 172032;
 constexpr int RES_MIX_UB = 173312;
 constexpr int READY = 0, RELEASE = 1, FINISH = 2, STORE_DONE = 3, VEC_OFFSET = 16;
 static_assert(RES_MIX_UB + 40 * 16 * 4 <= 196608, "UB capacity exceeded");
-#if defined(__CPU_SIM)
-using SimPipe = TPipe<0, Direction::DIR_C2V, 65536, 1, 2>;
-#endif
 
 #if defined(__DAV_CUBE__)
-#if !defined(__CPU_SIM)
 template <int MT, int NT>
 __tf__ __aicore__ inline void move_valid_rows(
     typename Raw<MT, NT>::TileDType __out__ dst,
@@ -49,20 +45,11 @@ __tf__ __aicore__ inline void move_valid_rows(
         QuantMode_t::NoQuant, static_cast<uint8_t>(ReluPreMode::NoRelu), false, true,
         0, 0, false, false, 0, false, false, false, false, false, false);
 }
-#endif
 template <int MT>
 struct PostOutput {
-#if defined(__CPU_SIM)
-    SimPipe pipe;
-    __aicore__ PostOutput() : pipe(nullptr, 0, 0) {}
-#endif
     int rows;
     template <int NT>
     __aicore__ inline void operator()(AC<NT, MT>& acc) {
-#if defined(__CPU_SIM)
-        acc.SetValidRow((rows + 1) & ~1);
-        TPUSH<SimPipe, AC<NT, MT>, TileSplitAxis::TILE_UP_DOWN_ODD>(pipe, acc);
-#else
         wait_intra_block(PIPE_FIX, RELEASE);
         wait_intra_block(PIPE_FIX, RELEASE + VEC_OFFSET);
         Raw<MT, NT> raw;
@@ -70,17 +57,14 @@ struct PostOutput {
         move_valid_rows<MT, NT>(raw.data(), acc.data(), (rows + 1) & ~1);
         set_intra_block(PIPE_FIX, READY);
         set_intra_block(PIPE_FIX, READY + VEC_OFFSET);
-#endif
     }
     __aicore__ inline void finish() {
-#if !defined(__CPU_SIM)
         wait_intra_block(PIPE_FIX, RELEASE);
         wait_intra_block(PIPE_FIX, RELEASE + VEC_OFFSET);
         wait_intra_block(PIPE_FIX, STORE_DONE);
         wait_intra_block(PIPE_FIX, STORE_DONE + VEC_OFFSET);
         set_intra_block(PIPE_FIX, FINISH);
         set_intra_block(PIPE_FIX, FINISH + VEC_OFFSET);
-#endif
     }
 };
 #endif
@@ -95,24 +79,6 @@ __tf__ __aicore__ inline void mix_row(
     auto raw = (__ubuf__ float*)__cce_get_tile_ptr(raw_tile) + raw_row * NT;
     auto post = (__ubuf__ float*)__cce_get_tile_ptr(post_tile) + slot * 8;
     auto residual_mix = (__ubuf__ float*)__cce_get_tile_ptr(residual_mix_tile) + slot * 16;
-#if defined(__CPU_SIM)
-    for (int k = 0; k < NT; ++k) {
-        const bfloat16_t rounded = static_cast<bfloat16_t>(raw[k]);
-        const float x = static_cast<float>(rounded);
-        const float r0 = residual_output[k];
-        const float r1 = residual_output[NT + k];
-        const float r2 = residual_output[2 * NT + k];
-        const float r3 = residual_output[3 * NT + k];
-        for (int h = 0; h < 4; ++h) {
-            float value = x * post[h];
-            value = value + r0 * residual_mix[h];
-            value = value + r1 * residual_mix[4 + h];
-            value = value + r2 * residual_mix[8 + h];
-            value = value + r3 * residual_mix[12 + h];
-            residual_output[h * NT + k] = value;
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL), full16 = pset_b16(PAT_ALL);
         for (uint16_t k = 0; k < NT / 64; ++k) {
@@ -144,7 +110,6 @@ __tf__ __aicore__ inline void mix_row(
             }
         }
     }
-#endif
 }
 
 template <int NT>
@@ -183,12 +148,7 @@ __aicore__ inline void vector_task(__gm__ int64_t* args, int task, PostMix& post
     const int preload = valid < PRELOAD_ROWS ? valid : PRELOAD_ROWS;
     for (int local = 0; local < preload; ++local) preload_row<NT>(args, row + local, n, local);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-#if defined(__CPU_SIM)
-    SimPipe pipe(nullptr, 0, 0);
-    TPOP<SimPipe, Raw<MT, NT>, TileSplitAxis::TILE_UP_DOWN_ODD>(pipe, raw);
-#else
     wait_intra_block(PIPE_V, READY);
-#endif
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     for (int local = 0; local < valid; ++local) {
         const int slot = local % PRELOAD_ROWS;
@@ -213,11 +173,7 @@ __aicore__ inline void vector_task(__gm__ int64_t* args, int task, PostMix& post
     if (valid < PRELOAD_ROWS) {
         set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     }
-#if defined(__CPU_SIM)
-    TFREE<SimPipe, TileSplitAxis::TILE_UP_DOWN_ODD>(pipe);
-#else
     set_intra_block(PIPE_V, RELEASE);
-#endif
 }
 
 template <int MT>
@@ -229,9 +185,7 @@ __aicore__ inline void vector_entry(__gm__ int64_t* args) {
     ResMix res_mix;
     TASSIGN(post, POST_UB);
     TASSIGN(res_mix, RES_MIX_UB);
-#if !defined(__CPU_SIM)
     set_intra_block(PIPE_V, RELEASE);
-#endif
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     for (int task = get_block_idx(args); task < tasks; task += workers) {
         if (task % COLUMNS < FULL_COLUMNS) {
@@ -241,10 +195,8 @@ __aicore__ inline void vector_entry(__gm__ int64_t* args) {
         }
     }
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-#if !defined(__CPU_SIM)
     set_intra_block(PIPE_MTE3, STORE_DONE);
     wait_intra_block(PIPE_V, FINISH);
-#endif
     pipe_barrier(PIPE_ALL);
 }
 #endif

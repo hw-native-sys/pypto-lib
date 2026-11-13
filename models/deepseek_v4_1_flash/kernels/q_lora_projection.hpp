@@ -17,10 +17,6 @@ using ScaleB = BS<1280, 256>;
 template <int MT>
 using FullA = Tile<TileType::Mat, F, MT, 1280, BLayout::ColMajor, MT, 1280, SLayout::RowMajor, 512>;
 
-#if defined(__CPU_SIM)
-template <int MT>
-using QBRopePipe = TPipe<1, Direction::DIR_C2V, MT * 256, 2, 2>;
-#endif
 template <int MT>
 using QBRopeAcc = TileAcc<float, MT, 64>;
 template <int MT>
@@ -39,14 +35,7 @@ struct QBRopeTransfer {
 template <int MT>
 struct QBRopeTransfer<true, MT> {
     int transferred = 0;
-#if defined(__CPU_SIM)
-    QBRopePipe<MT> pipe;
-    __aicore__ QBRopeTransfer() : pipe(nullptr, 0, 0) {}
-#endif
     __aicore__ inline void push(QBRopeAcc<MT>& tail) {
-#if defined(__CPU_SIM)
-        TPUSH<QBRopePipe<MT>, QBRopeAcc<MT>, TileSplitAxis::TILE_NO_SPLIT>(pipe, tail);
-#else
         int slot = transferred % 2;
         // The vector lane owns both slots before the first transfer.
         wait_intra_block(PIPE_FIX, slot * 2 + 1);
@@ -54,11 +43,9 @@ struct QBRopeTransfer<true, MT> {
         TASSIGN(raw, slot * (MT * 256));
         TMOV<QBRopeRaw<MT>, QBRopeAcc<MT>, AccToVecMode::SingleModeVec0>(raw, tail);
         set_intra_block(PIPE_FIX, slot * 2);
-#endif
         ++transferred;
     }
     __aicore__ inline void finish() {
-#if !defined(__CPU_SIM)
         if (transferred > 0) {
             // Drain both credits, including an unused second startup slot.
             // Vector may return only after this final Cube acknowledgement.
@@ -66,7 +53,6 @@ struct QBRopeTransfer<true, MT> {
             wait_intra_block(PIPE_FIX, 3);
             set_intra_block(PIPE_FIX, 4);
         }
-#endif
     }
 };
 
@@ -226,20 +212,6 @@ __tf__ __aicore__ inline void qb_rotate_tail(
     auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(output);
     auto cp = (__ubuf__ float*)__cce_get_tile_ptr(cosine);
     auto sp = (__ubuf__ float*)__cce_get_tile_ptr(sine);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < rows; ++row) {
-        for (int pair = 0; pair < 32; ++pair) {
-            float even = static_cast<float>(static_cast<bfloat16_t>(src[row * 64 + pair * 2]));
-            float odd = static_cast<float>(static_cast<bfloat16_t>(src[row * 64 + pair * 2 + 1]));
-            float ec = even * cp[row * 32 + pair];
-            float os = odd * sp[row * 32 + pair];
-            float es = even * sp[row * 32 + pair];
-            float oc = odd * cp[row * 32 + pair];
-            dst[row * 64 + pair * 2] = static_cast<bfloat16_t>(ec - os);
-            dst[row * 64 + pair * 2 + 1] = static_cast<bfloat16_t>(es + oc);
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         uint32_t count = 32;
@@ -264,7 +236,6 @@ __tf__ __aicore__ inline void qb_rotate_tail(
             vsts(bf, dst, row * 64, PK_B32, full);
         }
     }
-#endif
 }
 
 template <int MT = 80>
@@ -279,9 +250,6 @@ __aicore__ inline void project_qb_rope(__gm__ int64_t* args, int row_offset = 0,
         if (((wave * workers + block) & 1) != 0) have_tail = true;
     }
     if (!have_tail) return;
-#if defined(__CPU_SIM)
-    QBRopePipe<MT> pipe(nullptr, 0, 0);
-#endif
     QBRopeAngles<MT> cosine, sine;
     QBRopeResult<MT> result;
     TASSIGN(cosine, (MT * 512));
@@ -306,30 +274,20 @@ __aicore__ inline void project_qb_rope(__gm__ int64_t* args, int row_offset = 0,
     }
     int received = 0;
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-#if !defined(__CPU_SIM)
     // No-tail lanes returned above. Active lanes lend two row-scaled slots;
     // the Cube consumes every credit and acknowledges their final return.
     set_intra_block(PIPE_V, 1);
     set_intra_block(PIPE_V, 3);
-#endif
     for (int wave = 0; wave < waves; ++wave) {
         int n = (wave * workers + block) * 256;
         if (n % 512 != 256) continue;
         int slot = received % 2;
         QBRopeRaw<MT> raw;
-#if defined(__CPU_SIM)
-        TPOP<QBRopePipe<MT>, QBRopeRaw<MT>, TileSplitAxis::TILE_NO_SPLIT>(pipe, raw);
-#else
         TASSIGN(raw, slot * (MT * 256));
         wait_intra_block(PIPE_V, slot * 2);
-#endif
         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
         qb_rotate_tail<MT>(result.data(), raw.data(), cosine.data(), sine.data(), rows);
-#if defined(__CPU_SIM)
-        TFREE<QBRopePipe<MT>, TileSplitAxis::TILE_NO_SPLIT>(pipe);
-#else
         set_intra_block(PIPE_V, slot * 2 + 1);
-#endif
         if (rows > 0) {
             using Shape = TileShape2D<bfloat16_t, DYNAMIC, 64>;
             using Stride = BaseShape2D<bfloat16_t, DYNAMIC, DYNAMIC>;
@@ -345,9 +303,7 @@ __aicore__ inline void project_qb_rope(__gm__ int64_t* args, int row_offset = 0,
         ++received;
     }
     wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-#if !defined(__CPU_SIM)
     wait_intra_block(PIPE_V, 4);
-#endif
     pipe_barrier(PIPE_ALL);
 }
 #endif

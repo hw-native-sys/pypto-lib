@@ -7,11 +7,6 @@
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
 // Pair pooling, RMS normalization, rotary cache publication, and ring-state update.
-#if defined(__CPU_SIM)
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#endif
 #include "compressor_publish.h"
 namespace {
 #if defined(__DAV_VEC__)
@@ -32,25 +27,6 @@ __tf__ __aicore__ inline void pool_rows(
     auto ps = (__ubuf__ float*)__cce_get_tile_ptr(previous_score);
     auto gamma = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(weight);
     auto rounded = (__ubuf__ float*)__cce_get_tile_ptr(scratch);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < rows; ++row) {
-        float square = 0;
-        for (int col = 0; col < 512; ++col) {
-            float v = 0;
-            if (mask & (1u << row)) {
-                int i = row * 512 + col;
-                float highest = std::max(cs[i], ps[i]);
-                float a = std::exp(ps[i] - highest), b = std::exp(cs[i] - highest);
-                v = static_cast<float>(static_cast<bfloat16_t>(pk[i] * (a / (a + b)) + ck[i] * (b / (a + b))));
-            }
-            rounded[col] = v;
-            square += v * v;
-        }
-        float inv = 1.0f / std::sqrt(square / 512.0f + 1.0e-6f);
-        for (int col = 0; col < 512; ++col)
-            dst[row * 512 + col] = static_cast<bfloat16_t>(rounded[col] * inv * static_cast<float>(gamma[col]));
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         for (uint16_t row = 0; row < rows; ++row) {
@@ -112,7 +88,6 @@ __tf__ __aicore__ inline void pool_rows(
             }
         }
     }
-#endif
 }
 
 __aicore__ inline int read_metadata(__gm__ int32_t* ptr) {

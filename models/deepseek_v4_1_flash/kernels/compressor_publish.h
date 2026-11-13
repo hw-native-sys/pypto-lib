@@ -40,31 +40,6 @@ __tf__ __aicore__ inline void quantize(
     auto dst_base = (__ubuf__ uint8_t*)__cce_get_tile_ptr(packed);
     auto rounded_scales = (__ubuf__ float*)__cce_get_tile_ptr(scratch);
     auto factors_base = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(scales);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < rows; ++row) {
-        auto src = src_base + row * 512;
-        auto dst = dst_base + row * 256;
-        auto factors = factors_base + row * 32;
-        for (int group = 0; group < 32; ++group) {
-            float maximum = 0.0f;
-            for (int i = 0; i < 16; ++i) maximum = std::max(maximum, std::abs(static_cast<float>(src[group * 16 + i])));
-            bfloat16_t stored = static_cast<bfloat16_t>(std::max(maximum * (1.0f / 6.0f), 0.001953125f));
-            factors[group] = stored;
-            for (int pair = 0; pair < 8; ++pair) {
-                int byte = 0;
-                for (int half = 0; half < 2; ++half) {
-                    float value = static_cast<float>(src[group * 16 + pair * 2 + half]) / static_cast<float>(stored);
-                    float mag = std::abs(value);
-                    int code = (mag > 0.25f) + (RoundEven ? mag >= 0.75f : mag > 0.75f) + (mag > 1.25f) + (RoundEven ? mag >= 1.75f : mag > 1.75f) +
-                               (mag > 2.5f) + (RoundEven ? mag >= 3.5f : mag > 3.5f) + (mag > 5.0f);
-                    code |= (std::bit_cast<int32_t>(value) >> 28) & 8;
-                    byte |= code << (half * 4);
-                }
-                dst[group * 8 + pair] = byte;
-            }
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         uint32_t half_count = 32;
@@ -148,7 +123,6 @@ __tf__ __aicore__ inline void quantize(
             }
         }
     }
-#endif
 }
 
 __tf__ __aicore__ inline void rotate(
@@ -160,16 +134,6 @@ __tf__ __aicore__ inline void rotate(
     auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(output);
     auto cp = (__ubuf__ float*)__cce_get_tile_ptr(cosine);
     auto sp = (__ubuf__ float*)__cce_get_tile_ptr(sine);
-#if defined(__CPU_SIM)
-    for (int row_index = 0; row_index < rows; ++row_index) {
-        for (int pair = 0; pair < 32; ++pair) {
-            float even = static_cast<float>(values[row_index * 512 + 448 + pair * 2]);
-            float odd = static_cast<float>(values[row_index * 512 + 449 + pair * 2]);
-            dst[row_index * 512 + 448 + pair * 2] = static_cast<bfloat16_t>(even * cp[row_index * 32 + pair] - odd * sp[row_index * 32 + pair]);
-            dst[row_index * 512 + 449 + pair * 2] = static_cast<bfloat16_t>(even * sp[row_index * 32 + pair] + odd * cp[row_index * 32 + pair]);
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         uint32_t count = 32;
@@ -194,7 +158,6 @@ __tf__ __aicore__ inline void rotate(
         }
         mem_bar(VST_VLD);
     }
-#endif
 }
 
 template <bool RoundEven>

@@ -6,8 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# Re-enable CPU validation when flat MX scale packing is corrected:
-# https://github.com/hw-native-sys/pto-isa/issues/357
+# ci: no-sim
+# Native A5 VF and Cube/Vector transfers require device execution.
 """V4.1 inverse RoPE, grouped W8A8 MXFP8 output projection, and HC post."""
 
 from pathlib import Path

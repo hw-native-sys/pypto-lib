@@ -6,6 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim
+# Native A5 VF pooling, normalization, quantization and RoPE require device execution.
 """Compression projections, rotary embedding, cache publication, and ratio-2 ring state."""
 
 from pathlib import Path

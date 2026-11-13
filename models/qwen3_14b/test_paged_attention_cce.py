@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
+# Native CCE attention kernels require device execution.
 """On-device correctness and performance driver for Qwen decode attention."""
 
 import argparse

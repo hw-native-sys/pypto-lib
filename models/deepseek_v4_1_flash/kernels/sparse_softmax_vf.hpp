@@ -12,7 +12,7 @@
 namespace sparse_softmax {
 using namespace pto;
 
-#if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+#if defined(__DAV_VEC__)
 template <typename Weights, typename Scores, typename Indices, typename State>
 __tf__ __aicore__ inline void update(
     typename Weights::TileDType __out__ weights, typename State::TileDType __out__ maximum,

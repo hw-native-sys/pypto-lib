@@ -7,11 +7,6 @@
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
 // RMS normalization, latent output, rotary embedding, and C1A cache publication.
-#if defined(__CPU_SIM)
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#endif
 #include "compressor_publish.h"
 namespace {
 #if defined(__DAV_VEC__)
@@ -22,18 +17,6 @@ __tf__ __aicore__ inline void normalize(
     auto src = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(input);
     auto dst = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(output);
     auto gamma = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(weight);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < rows; ++row) {
-        float square = 0;
-        for (int col = 0; col < 512; ++col) {
-            float value = static_cast<float>(src[row * 512 + col]);
-            square += value * value;
-        }
-        float inv = 1.0f / std::sqrt(square / 512.0f + 1.0e-6f);
-        for (int col = 0; col < 512; ++col)
-            dst[row * 512 + col] = static_cast<bfloat16_t>(static_cast<float>(src[row * 512 + col]) * inv * static_cast<float>(gamma[col]));
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         for (uint16_t row = 0; row < rows; ++row) {
@@ -66,7 +49,6 @@ __tf__ __aicore__ inline void normalize(
             }
         }
     }
-#endif
 }
 
 __aicore__ inline void flush(__gm__ int64_t* args, int rows, Vec<int64_t, 8>& targets, Vec<int32_t, 8>& tokens) {

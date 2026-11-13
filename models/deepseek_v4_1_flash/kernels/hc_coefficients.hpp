@@ -9,10 +9,6 @@
 // FP32 HC coefficients with compile-time row tiling.
 #pragma once
 #include <cstdint>
-#if defined(__CPU_SIM)
-#include <algorithm>
-#include <cmath>
-#endif
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"
@@ -50,42 +46,6 @@ __tf__ __aicore__ inline void coefficients(
     auto out_pre = (__ubuf__ float*)__cce_get_tile_ptr(pre);
     auto out_post = (__ubuf__ float*)__cce_get_tile_ptr(post);
     auto out_comb = (__ubuf__ float*)__cce_get_tile_ptr(comb);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < rows; ++row) {
-        float values[24];
-        for (int col = 0; col < 24; ++col) {
-            int offset = row * 32 + col;
-            float total = ((a0[offset] + a1[offset]) + a2[offset]) + a3[offset];
-            values[col] = total * inv[row] * scale[col < 4 ? 0 : col < 8 ? 1 : 2] + base[col];
-        }
-        for (int col = 0; col < 4; ++col) {
-            out_pre[row * 8 + col] = 1.0f / (1.0f + std::exp(-values[col])) + eps;
-            out_post[row * 8 + col] = 2.0f / (1.0f + std::exp(-values[col + 4]));
-        }
-        float matrix[4][4];
-        for (int r = 0; r < 4; ++r) {
-            float maximum = *std::max_element(values + 8 + r * 4, values + 12 + r * 4);
-            for (int c = 0; c < 4; ++c) matrix[r][c] = std::exp(values[8 + r * 4 + c] - maximum);
-            float sum = (matrix[r][0] + matrix[r][1]) + (matrix[r][2] + matrix[r][3]);
-            for (int c = 0; c < 4; ++c) matrix[r][c] = matrix[r][c] / sum + eps;
-        }
-        for (int iteration = 0; iteration < iterations; ++iteration) {
-            if (iteration > 0) {
-                for (int r = 0; r < 4; ++r) {
-                    float sum = (matrix[r][0] + matrix[r][1]) + (matrix[r][2] + matrix[r][3]) + eps;
-                    for (int c = 0; c < 4; ++c) matrix[r][c] /= sum;
-                }
-            }
-            for (int c = 0; c < 4; ++c) {
-                float sum = ((matrix[0][c] + matrix[1][c]) + matrix[2][c]) + matrix[3][c] + eps;
-                for (int r = 0; r < 4; ++r) matrix[r][c] /= sum;
-            }
-        }
-        for (int r = 0; r < 4; ++r) {
-            for (int c = 0; c < 4; ++c) out_comb[row * 16 + r * 4 + c] = matrix[r][c];
-        }
-    }
-#else
     __VEC_SCOPE__ {
         uint32_t count = rows * 4;
         MaskReg mask = plt_b32(count, POST_UPDATE);
@@ -330,7 +290,6 @@ __tf__ __aicore__ inline void coefficients(
         vscatter(m2, out_comb + 8, comb_index, mask);
         vscatter(m3, out_comb + 12, comb_index, mask);
     }
-#endif
 }
 
 #endif

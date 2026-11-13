@@ -8,19 +8,11 @@
 // -----------------------------------------------------------------------------------------------------------
 // MXFP8 query projection with two head-wise Cube-to-Vector transfers.
 #include <cstdint>
-#if defined(__CPU_SIM)
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#endif
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"
 
 using namespace pto;
-#if defined(__CPU_SIM)
-using SimPipe = TPipe<0, Direction::DIR_C2V, 20480, 2, 2>;
-#endif
 
 namespace {
 template <typename T, int R, int C>
@@ -46,37 +38,6 @@ __tf__ __aicore__ inline void quantize(
     auto exp = (__ubuf__ int32_t*)__cce_get_tile_ptr(scales);
     auto cp = (__ubuf__ float*)__cce_get_tile_ptr(cosine);
     auto sp = (__ubuf__ float*)__cce_get_tile_ptr(sine);
-#if defined(__CPU_SIM)
-    for (int head = 0; head < rows; ++head) {
-        float values[128];
-        for (int lane = 0; lane < 128; ++lane) values[lane] = static_cast<float>(static_cast<bfloat16_t>(src[head * 128 + lane]));
-        for (int pair = 0; pair < 32; ++pair) {
-            float even = values[64 + pair * 2];
-            float odd = values[65 + pair * 2];
-            values[64 + pair * 2] = static_cast<float>(static_cast<bfloat16_t>(even * cp[head * 32 + pair] - odd * sp[head * 32 + pair]));
-            values[65 + pair * 2] = static_cast<float>(static_cast<bfloat16_t>(even * sp[head * 32 + pair] + odd * cp[head * 32 + pair]));
-        }
-        for (int group = 0; group < 4; ++group) {
-            float maximum = 7.052966104933725e-38f;
-            for (int lane = 0; lane < 32; ++lane) maximum = std::max(maximum, std::abs(values[group * 32 + lane]));
-            int exponent = (std::bit_cast<int32_t>(maximum * (1.0f / 6.0f)) + 8388607) >> 23;
-            exp[head * 32 + group] = exponent;
-            float scale = std::bit_cast<float>(exponent << 23);
-            for (int pair = 0; pair < 16; ++pair) {
-                uint8_t packed_pair = 0;
-                for (int half = 0; half < 2; ++half) {
-                    float value = values[group * 32 + pair * 2 + half] / scale;
-                    float magnitude = std::abs(value);
-                    int code = (magnitude > 0.25f) + (magnitude >= 0.75f) + (magnitude > 1.25f) +
-                               (magnitude >= 1.75f) + (magnitude > 2.5f) + (magnitude >= 3.5f) + (magnitude > 5.0f);
-                    code |= (std::bit_cast<int32_t>(value) >> 28) & 8;
-                    packed_pair |= code << (half * 4);
-                }
-                dst[head * 64 + group * 16 + pair] = packed_pair;
-            }
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         uint32_t half_count = 32;
@@ -162,7 +123,6 @@ __tf__ __aicore__ inline void quantize(
             }
         }
     }
-#endif
 }
 #endif
 } // namespace
@@ -204,9 +164,6 @@ __aicore__ inline void multiply(FullA& am, FullB& bm, ScaleA& sa, ScaleB& sb, Ac
 
 __aicore__ inline void project(__gm__ int64_t* args, int block) {
     using namespace mxfp8_projection;
-#if defined(__CPU_SIM)
-    SimPipe pipe(nullptr, 0, 0);
-#endif
     FullA am;
     ScaleA sa;
     ScaleB sb;
@@ -242,9 +199,6 @@ __aicore__ inline void project(__gm__ int64_t* args, int block) {
             }
             set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
             wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
-#if defined(__CPU_SIM)
-            TPUSH<SimPipe, Acc, TileSplitAxis::TILE_UP_DOWN>(pipe, acc);
-#else
             wait_intra_block(PIPE_FIX, head * 2 + 1);
             wait_intra_block(PIPE_FIX, head * 2 + 17);
             Vec<float, 40, 128> received;
@@ -252,20 +206,17 @@ __aicore__ inline void project(__gm__ int64_t* args, int block) {
             TMOV<decltype(received), Acc, AccToVecMode::DualModeSplitM>(received, acc);
             set_intra_block(PIPE_FIX, head * 2);
             set_intra_block(PIPE_FIX, head * 2 + 16);
-#endif
         }
         wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
         wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
         pipe_barrier(PIPE_ALL);
     }
-#if !defined(__CPU_SIM)
     if (args[8] > 0) {
         wait_intra_block(PIPE_FIX, 1);
         wait_intra_block(PIPE_FIX, 17);
         wait_intra_block(PIPE_FIX, 3);
         wait_intra_block(PIPE_FIX, 19);
     }
-#endif
 }
 } // namespace
 #endif
@@ -274,9 +225,6 @@ __aicore__ inline void project(__gm__ int64_t* args, int block) {
 namespace {
 __aicore__ inline void finish(__gm__ int64_t* args, int block) {
     int sub = get_subblockid();
-#if defined(__CPU_SIM)
-    SimPipe pipe(nullptr, 0, 0);
-#endif
     Vec<float, 40, 32> cosine, sine;
     Vec<uint8_t, 40, 64> packed;
     Vec<int32_t, 40, 32> exponents;
@@ -286,13 +234,11 @@ __aicore__ inline void finish(__gm__ int64_t* args, int block) {
     TASSIGN(packed, 51200);
     TASSIGN(exponents, 53760);
     TASSIGN(scales, 58880);
-#if !defined(__CPU_SIM)
     // Both AIV receivers release their UB slots before the first C2V transfer.
     if (args[8] > 0) {
         set_intra_block(PIPE_V, 1);
         set_intra_block(PIPE_V, 3);
     }
-#endif
     for (int begin = 0; begin < args[8]; begin += 80) {
         int row = begin + sub * 40;
         int rows = args[8] - row;
@@ -313,11 +259,7 @@ __aicore__ inline void finish(__gm__ int64_t* args, int block) {
         for (int head = 0; head < 2; ++head) {
             Vec<float, 40, 128> raw;
             TASSIGN(raw, head * 20480);
-#if defined(__CPU_SIM)
-            TPOP<SimPipe, decltype(raw), TileSplitAxis::TILE_UP_DOWN>(pipe, raw);
-#else
             wait_intra_block(PIPE_V, head * 2);
-#endif
             if (rows > 0) {
                 quantize(packed.data(), exponents.data(), raw.data(), cosine.data(), sine.data(), rows);
                 TCVT(scales, exponents, RoundMode::CAST_RINT);
@@ -338,11 +280,7 @@ __aicore__ inline void finish(__gm__ int64_t* args, int block) {
                 TSTORE(sg, scale);
                 pipe_barrier(PIPE_ALL);
             }
-#if defined(__CPU_SIM)
-            TFREE<SimPipe, TileSplitAxis::TILE_UP_DOWN>(pipe);
-#else
             set_intra_block(PIPE_V, head * 2 + 1);
-#endif
         }
     }
     pipe_barrier(PIPE_ALL);
@@ -351,7 +289,7 @@ __aicore__ inline void finish(__gm__ int64_t* args, int block) {
 #endif
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-#if !defined(__CPU_SIM) && !defined(__COSTMODEL)
+#if !defined(__COSTMODEL)
     set_atomic_none();
 #if defined(__DAV_VEC__)
     set_mask_norm();

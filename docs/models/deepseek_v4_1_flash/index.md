@@ -152,6 +152,22 @@ checkpoint-level generation accuracy or a complete numerical forward golden.
 The configured context ceiling and supported parallel-size choices are not a
 claim that every size/sequence-length combination has been device validated.
 
+### CPU simulation
+
+The standalone `engram.py`, `gate.py`, `input_pack.py`, `lm_head.py`,
+`dspark_state.py`, and `vision.py` entries support A5 CPU simulation with
+`-p a5 --sim`. Their Tile kernels use the same initialization and computation
+on device and in simulation. The toolchain must include PTO-ISA's
+`set_atomic_none()` CPU compatibility declaration for gate and LM-head.
+
+Other executable entries marked `# ci: no-sim` use native A5 CCE/VF,
+VPTO, or Cube/Vector transfers that the simulator does not implement.
+This includes compressor pooling/normalization, DSpark context-KV
+quantization and cache publication, HC, Q/KV and output projection,
+sparse attention, and expert compute. Their composed attention, MoE,
+layer and forward entries require device execution. C++ kernels contain
+no separate CPU implementation; `no-sim` excludes only simulator CI.
+
 ## Vision
 
 [`vision.py`](../../../models/deepseek_v4_1_flash/vision.py) provides a BF16 ViT

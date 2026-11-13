@@ -13,18 +13,6 @@
 
 #include "tensor.h"
 
-#ifdef __CPU_SIM
-#ifndef __gm__
-#define __gm__
-#endif
-#ifndef __aicore__
-#define __aicore__ [aicore]
-#endif
-
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { (void)args; }
-
-#else
-
 #include "../kernel/fai_body.hpp"
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
@@ -40,5 +28,3 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         run_qwen_fai<false>(args);
     }
 }
-
-#endif
