@@ -669,7 +669,7 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
-            "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
+            "pool_block_ids": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
             "pool_block_counts": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.0),
             "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
             "output": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.01),

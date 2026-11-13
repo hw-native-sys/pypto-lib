@@ -49,12 +49,12 @@ __tf__ __aicore__ inline void quantize(
 #if defined(__CPU_SIM)
     for (int head = 0; head < rows; ++head) {
         float values[128];
-        for (int lane = 0; lane < 128; ++lane) values[lane] = static_cast<float>(static_cast<bfloat16_t>(src[head * 128 + lane]));
+        for (int lane = 0; lane < 128; ++lane) values[lane] = src[head * 128 + lane];
         for (int pair = 0; pair < 32; ++pair) {
             float even = values[64 + pair * 2];
             float odd = values[65 + pair * 2];
-            values[64 + pair * 2] = static_cast<float>(static_cast<bfloat16_t>(even * cp[head * 32 + pair] - odd * sp[head * 32 + pair]));
-            values[65 + pair * 2] = static_cast<float>(static_cast<bfloat16_t>(even * sp[head * 32 + pair] + odd * cp[head * 32 + pair]));
+            values[64 + pair * 2] = even * cp[head * 32 + pair] - odd * sp[head * 32 + pair];
+            values[65 + pair * 2] = even * sp[head * 32 + pair] + odd * cp[head * 32 + pair];
         }
         for (int group = 0; group < 4; ++group) {
             float maximum = 7.052966104933725e-38f;
@@ -67,8 +67,8 @@ __tf__ __aicore__ inline void quantize(
                 for (int half = 0; half < 2; ++half) {
                     float value = values[group * 32 + pair * 2 + half] / scale;
                     float magnitude = std::abs(value);
-                    int code = (magnitude > 0.25f) + (magnitude >= 0.75f) + (magnitude > 1.25f) +
-                               (magnitude >= 1.75f) + (magnitude > 2.5f) + (magnitude >= 3.5f) + (magnitude > 5.0f);
+                    int code = (magnitude >= 0.25f) + (magnitude >= 0.75f) + (magnitude >= 1.25f) +
+                               (magnitude >= 1.75f) + (magnitude >= 2.5f) + (magnitude >= 3.5f) + (magnitude >= 5.0f);
                     code |= (std::bit_cast<int32_t>(value) >> 28) & 8;
                     packed_pair |= code << (half * 4);
                 }
@@ -88,11 +88,8 @@ __tf__ __aicore__ inline void quantize(
             vlds(cosv, cp, head * 32, NORM);
             vlds(sinv, sp, head * 32, NORM);
             for (uint16_t segment = 0; segment < 2; ++segment) {
-                RegTensor<bfloat16_t> bf;
                 RegTensor<float> values;
                 vlds(values, src, head * 128 + segment * 64, NORM);
-                vcvt(bf, values, full, ROUND_R, RS_DISABLE, PART_EVEN);
-                vcvt(values, bf, full, PART_EVEN);
                 if (segment == 1) {
                     RegTensor<float> even, odd, a, b, real, imag, unused;
                     vdintlv(even, odd, values, values);
@@ -103,8 +100,6 @@ __tf__ __aicore__ inline void quantize(
                     vmul(b, odd, cosv, lower, MODE_ZEROING);
                     vadd(imag, a, b, lower, MODE_ZEROING);
                     vintlv(values, unused, real, imag);
-                    vcvt(bf, values, full, ROUND_R, RS_DISABLE, PART_EVEN);
-                    vcvt(values, bf, full, PART_EVEN);
                 }
                 RegTensor<float> magnitude, lo, hi, maximum, scale, normalized;
                 vabs(magnitude, values, full);
@@ -124,25 +119,25 @@ __tf__ __aicore__ inline void quantize(
                 RegTensor<int32_t> codes, level, sign, sign_mask;
                 vdup(codes, 0, full, MODE_ZEROING);
                 MaskReg selected;
-                vcmps_gt(selected, magnitude, 0.25f, full);
+                vcmps_ge(selected, magnitude, 0.25f, full);
                 vdup(level, 1, full, MODE_ZEROING);
                 vsel(codes, level, codes, selected);
                 vcmps_ge(selected, magnitude, 0.75f, full);
                 vdup(level, 2, full, MODE_ZEROING);
                 vsel(codes, level, codes, selected);
-                vcmps_gt(selected, magnitude, 1.25f, full);
+                vcmps_ge(selected, magnitude, 1.25f, full);
                 vdup(level, 3, full, MODE_ZEROING);
                 vsel(codes, level, codes, selected);
                 vcmps_ge(selected, magnitude, 1.75f, full);
                 vdup(level, 4, full, MODE_ZEROING);
                 vsel(codes, level, codes, selected);
-                vcmps_gt(selected, magnitude, 2.5f, full);
+                vcmps_ge(selected, magnitude, 2.5f, full);
                 vdup(level, 5, full, MODE_ZEROING);
                 vsel(codes, level, codes, selected);
                 vcmps_ge(selected, magnitude, 3.5f, full);
                 vdup(level, 6, full, MODE_ZEROING);
                 vsel(codes, level, codes, selected);
-                vcmps_gt(selected, magnitude, 5.0f, full);
+                vcmps_ge(selected, magnitude, 5.0f, full);
                 vdup(level, 7, full, MODE_ZEROING);
                 vsel(codes, level, codes, selected);
                 vshrs(sign, (RegTensor<int32_t>&)normalized, 28, full, MODE_ZEROING);

@@ -2546,8 +2546,8 @@ def decode_c2a_indexer(
 import torch
 import torch.nn.functional as F
 from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
-from quant import dequantize_mxfp4_cache, quantize_mxfp4_cache
-from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
+from quant import dequantize_mxfp4_cache, golden_index_query_fp4
+from gemm import golden_mxfp8_linear_grouped_sum
 from rmsnorm import golden_rms_norm
 
 
@@ -2595,12 +2595,6 @@ def mapped_fp4_cache_compare(
         return True, ""
 
     return compare
-
-
-def golden_index_query_fp4(value: torch.Tensor) -> torch.Tensor:
-    """Round group-32 index queries to E2M1 with upward E8M0 scales."""
-    payload, scales = quantize_mxfp4_cache(value, 32, "e8m0", round_to_even=True)
-    return dequantize_mxfp4_cache(payload, scales, 32, "e8m0").to(value.dtype)
 
 
 def golden_index_key(
@@ -2689,7 +2683,9 @@ def golden_c1a_index_scores(a, qr, index_payload, index_scale):
     # Logical page-table score columns.
     width = a["index_block_table"].shape[-1] * 128
     heads = a["index_weights_proj"].shape[-1]
-    iq = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, unpack_fp8_nz(a["index_wq_b"]), a["index_wq_b_scale"])
+    iq = golden_mxfp8_linear_grouped_sum(
+        qr, unpack_fp8_nz(a["index_wq_b"]), a["index_wq_b_scale"], output_dtype=torch.float32,
+    )
     if iq.shape[-1] % heads:
         raise RuntimeError(f"index query width {iq.shape[-1]} is not divisible by {heads} heads")
     dim = iq.shape[-1] // heads
@@ -2783,8 +2779,11 @@ def golden_c2a_index(t, qr, index_cache, index_cache_scale):
     index_dim = t["index_norm_weight"].numel()
     index_heads = t["index_weights_proj"].shape[-1]
     index_values = dequantize_mxfp4_cache(index_cache, index_cache_scale, INDEX_CACHE_GROUP, "e8m0").flatten(0, -2)
-    # Accumulate the index-query projection in sequential group-32 partials.
-    index_q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, unpack_fp8_nz(t["index_wq_b"]), t["index_wq_b_scale"]).unflatten(-1, (index_heads, index_dim))
+    # Keep the index-query projection and RoPE in FP32.
+    index_q = golden_mxfp8_linear_grouped_sum(
+        qr, unpack_fp8_nz(t["index_wq_b"]), t["index_wq_b_scale"], output_dtype=torch.float32,
+    )
+    index_q = index_q.unflatten(-1, (index_heads, index_dim))
     index_q = golden_rope_tail(index_q, t["rope_cos"], t["rope_sin"])
     index_q = golden_index_query_fp4(index_q)
     head_weights = ((x).float() @ unpack_bf16_nz(t["index_weights_proj"]).float()).to(torch.bfloat16).float()

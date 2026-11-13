@@ -21,8 +21,8 @@ import pypto.language as pl
 
 from config import INDEX_CACHE_GROUP, FLASH as M, INDEX_BLOCKS_DYN, INDEX_POOL_BLOCKS_DYN, T_DYN
 from rmsnorm import EPS, rms_norm, golden_rms_norm
-from quant import quantize_bf16_to_mxfp8, dequantize_mxfp4_cache, quantize_mxfp4_cache, fp4_e4m3_lut
-from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
+from quant import quantize_bf16_to_mxfp8, dequantize_mxfp4_cache, golden_index_query_fp4, fp4_e4m3_lut
+from gemm import golden_mxfp8_linear_grouped_sum
 from qkv_proj_rope import golden_rope_tail, golden_rope_interleave
 
 
@@ -1409,12 +1409,6 @@ def prefill_indexer(
     return completion[0]
 
 
-def golden_index_query_fp4(value: torch.Tensor) -> torch.Tensor:
-    """Round group-32 index queries to E2M1 with upward E8M0 scales."""
-    payload, scales = quantize_mxfp4_cache(value, 32, "e8m0", round_to_even=True)
-    return dequantize_mxfp4_cache(payload, scales, 32, "e8m0").to(value.dtype)
-
-
 def golden_index_key(
     latent: torch.Tensor,
     wk: torch.Tensor,
@@ -1493,7 +1487,8 @@ def golden_prefill_indexer(
     width = int(compressed_lens.max()) if tokens else 0
     scores = torch.full((tokens, width), -torch.inf, dtype=torch.float32)
     selected = torch.full((tokens, topk), -1, dtype=torch.int32)
-    query = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, unpack_fp8_nz(wq_b), wq_b_scale).reshape(tokens, INDEX_H, INDEX_DIM)
+    query = golden_mxfp8_linear_grouped_sum(qr, unpack_fp8_nz(wq_b), wq_b_scale, output_dtype=torch.float32)
+    query = query.reshape(tokens, INDEX_H, INDEX_DIM)
     query = golden_rope_tail(query, cos, sin)
     query = golden_index_query_fp4(query)
     weights = (x.float() @ unpack_bf16_nz(weights_proj).float()).bfloat16()
