@@ -195,6 +195,55 @@ decode_csa   … → decode_compressor_ratio4 (main, inner)
   [prefill_cp_token_allgather.py](../../../models/deepseek_v4_flash_dspark/prefill_cp_token_allgather.py)
   and [prefill_o_proj.py](../../../models/deepseek_v4_flash_dspark/prefill_o_proj.py).
 
+### Prefill grouped output projection
+
+The shared projection in
+[prefill_sparse_attn.py](../../../models/deepseek_v4_flash_dspark/prefill_sparse_attn.py)
+runs O-A, per-group activation quantization, O-B, then dequantization and
+group summation. Each 512-token physical tile uses eight groups: O-A is
+BF16 `[512,4096] x [4096,1024]`, and O-B is INT8
+`[512,1024] x [1024,4096]` with INT32 partials.
+
+O-A uses M128/N128, K256 loads and four pipeline stages over 2D weight
+views. O-B uses M256/N128, K512 loads into L1 and K128 extracts into L0,
+with two stages in both loops. Task output views retain their parent row
+strides. Physical tails are rounded to 256 rows through packed-input
+initialization and projection; the epilogue writes only active rows.
+
+The standalone projection mode calls this same implementation. Its default
+correctness cases cover 17, 129, 257 and 512 rows, with quantization ties,
+different group/channel scales, an output offset and untouched sentinel
+rows. Both the first and last O-A K fragments contribute nonzero values.
+The structured fixture uses exact BF16 comparisons against the full
+Torch matrix expressions:
+
+```bash
+python models/deepseek_v4_flash_dspark/prefill_sparse_attn.py \
+  --output-projection-only -p a2a3 --sim
+```
+
+Select a single tile for compilation and
+[in-core profiling](../../debug-and-tune/incore-simulator-profiling.md):
+
+```bash
+python models/deepseek_v4_flash_dspark/prefill_sparse_attn.py \
+  --output-projection-only --tokens 512 -p a2a3 --compile-only
+```
+
+The generated functions are `proj_a_mm`, `quant`, `proj_b_mm` and
+`proj_b_act`. For a representative O-A replay, wire group 0, N-fragment 0
+and row block 0; it computes M128/N128/K4096. For O-B, wire group 0,
+D-slab 0 and two M256 row blocks; one task computes M512/N512/K1024.
+Resolve scalar ordering and output-view pointer offsets from that build's
+PTO IR and orchestration before collecting.
+
+With the pinned PyPTO toolchain, PTOAS 0.67 and CANN 9.3 `dav_2201`,
+three-capture single-core CAModel replays of these workloads changed from
+about 16.54 to 14.95 us for O-A and 45.32 to 31.31 us for O-B. The paired
+replays used identical frozen synthetic inputs and exact FP32/INT32
+matrix comparisons. These are instruction-window measurements; device
+latency and full-prefill performance still require device measurements.
+
 ### MoE and output stages
 
 [moe.py](../../../models/deepseek_v4_flash_dspark/moe.py) is unchanged in shape
