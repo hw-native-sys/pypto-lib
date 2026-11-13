@@ -1,6 +1,6 @@
 # Window publication: current C++ alignment
 
-The initial measurements below describe revision `963bd6aa` after alignment to upstream/main, fetched on 2026-11-13. The remote remains at `8bbc8f5ca6ac3fd72f9004f509099083d5be10c3`; rebasing the PR onto it was a no-op. The earlier PR revision `504bd07d` is retained as the before-alignment comparator. No compiler or runtime source changes are included.
+The initial measurements below describe revision `963bd6aa` after alignment to upstream/main, fetched on 2026-11-13. The initial base was `8bbc8f5ca6ac3fd72f9004f509099083d5be10c3`. Publication later rebased onto `25b5c6ab`; its sole intervening change affects the separate Dspark prefill indexer. The Window C++ baseline is byte-identical (SHA256 `b335430b873f0345e4e9d5e6ebc9af203cd37ccd0933063518489fe01ecb62e6`). The earlier PR revision `504bd07d` is retained as the before-alignment comparator. No compiler or runtime source changes are included.
 
 ## Algorithm and data movement
 
@@ -119,10 +119,10 @@ The one-worker source specialization replay takes 24.713 µs versus 24.562 µs b
 
 | Workers / device | C++ baseline (µs) | Python before (µs) | Python specialized (µs) |
 |---|---:|---:|---:|
-| 1 / 5 | 53.10 | 47.60 | 47.00 |
-| 12 / 0 | 38.00 | 39.30 | 36.50 |
+| 1 / 5 | 53.10 | 47.60 | 47.05 |
+| 12 / 0 | 37.95 | 39.30 | 36.45 |
 
-The same-device comparisons use three groups of 10 warmups and 100 timed rounds, with the order reversed in group two. The table reports the median of the three group medians for standalone `effective_us`. The 12-worker improvement is 2.80 µs (7.1%) versus the prior Python source. C++ and the specialized Python variant alternate in relative order across groups; the 1.50 µs difference between their median values is specific to this replay. All eight cases at each worker count match the entire C++ cache byte-for-byte, including untouched bytes. The 12-worker benchmark completed before a separate workflow-capture attempt failed during runtime initialization.
+The same-device comparisons use three groups of 10 warmups and 100 timed rounds, with the order reversed in group two. The table reports the median of the three group medians for standalone `effective_us`. The 12-worker improvement is 2.85 µs (7.3%) versus the prior Python source. C++ and the specialized Python variant alternate in relative order across groups; the 1.50 µs difference between their median values is specific to this replay. All eight cases at each worker count match the entire C++ cache byte-for-byte, including untouched bytes. The 12-worker benchmark completed before a separate workflow-capture attempt failed during runtime initialization.
 
 Task evidence: corrected baseline replays `task_20261113_105442_340851431053` and `task_20261113_105443_34097149529`; specialization replay `task_20261113_111037_687371964` and `task_20261113_111453_96008429010`; device validation `task_20261113_111304_84246422730` and `task_20261113_111301_83963430859`.
 
