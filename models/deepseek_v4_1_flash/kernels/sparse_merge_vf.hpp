@@ -9,10 +9,6 @@
 // Merge adjacent sparse-attention tile intervals with one sink contribution.
 #pragma once
 #include <cstdint>
-#if defined(__CPU_SIM)
-#include <algorithm>
-#include <cmath>
-#endif
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"
@@ -27,7 +23,7 @@ using State = Tile<TileType::Vec, float, 1, HALF>;
 using Values = Tile<TileType::Vec, float, HALF, DIM>;
 using Result = Tile<TileType::Vec, bfloat16_t, HALF, DIM>;
 
-#if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+#if defined(__DAV_VEC__)
 __tf__ __aicore__ inline void merge_factors(
     State::TileDType __out__ weight_left, State::TileDType __out__ weight_right,
     State::TileDType __in__ max_left, State::TileDType __in__ sum_left,

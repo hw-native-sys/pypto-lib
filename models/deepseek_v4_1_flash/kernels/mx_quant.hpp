@@ -9,11 +9,6 @@
 // Group-32 OCP FP8 quantization with M16-packed E8M0 scales.
 #pragma once
 #include <cstdint>
-#if defined(__CPU_SIM)
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#endif
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"
@@ -31,7 +26,7 @@ __aicore__ inline int64_t stride(__gm__ int64_t* args, int i) {
     return reinterpret_cast<__gm__ Tensor*>(args[i])->strides[0];
 }
 
-#if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+#if defined(__DAV_VEC__)
 __aicore__ inline void quantize_pair(
     RegTensor<float> value, __ubuf__ uint8_t* dst, __ubuf__ uint16_t* codes,
     uint32_t offset, uint32_t scale_offset,
@@ -79,26 +74,6 @@ __tf__ __aicore__ inline void quantize(
     auto src = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(input);
     auto dst = (__ubuf__ uint8_t*)__cce_get_tile_ptr(output);
     auto codes = (__ubuf__ uint16_t*)__cce_get_tile_ptr(scales);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < 16; ++row) {
-        for (int group = 0; group < C / 32; ++group) {
-            float maximum = 0.0f;
-            for (int lane = 0; lane < 32; ++lane) {
-                float value = row < rows ? static_cast<float>(src[row * C + group * 32 + lane]) : 0.0f;
-                maximum = std::max(maximum, std::abs(value));
-            }
-            int exponent = std::max(int(std::bit_cast<uint32_t>(maximum) >> 23) - 8, 0);
-            float reciprocal = exponent ? std::bit_cast<float>(uint32_t(254 - exponent) << 23) : 0.0f;
-            reinterpret_cast<__ubuf__ uint8_t*>(codes)[group / 2 * 32 + row * 2 + group % 2] = exponent;
-            for (int lane = 0; lane < 32; ++lane) {
-                float value = row < rows ? static_cast<float>(src[row * C + group * 32 + lane]) : 0.0f;
-                value = std::clamp(value * reciprocal, -448.0f, 448.0f);
-                reinterpret_cast<__ubuf__ float8_e4m3_t*>(dst)[row * C + group * 32 + lane] =
-                    float8_e4m3_t(value, RoundMode::CAST_RINT);
-            }
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         uint32_t half_count = 32, byte_count = 64, scalar_count = 1;
@@ -135,7 +110,6 @@ __tf__ __aicore__ inline void quantize(
             }
         }
     }
-#endif
 }
 #endif
 } // namespace mx_quant

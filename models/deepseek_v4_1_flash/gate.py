@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4.1 MoE router: normalized BF16 input, quantization, projection, and top-k weights."""
 
+# Tile-based gate kernels share device and CPU-SIM initialization.
 from pathlib import Path
 
 import pypto.language as pl

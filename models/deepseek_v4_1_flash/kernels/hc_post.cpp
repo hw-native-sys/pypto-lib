@@ -32,15 +32,6 @@ __tf__ __aicore__ inline void mix_streams(
     auto x = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(hidden);
     auto r = (__ubuf__ float*)__cce_get_tile_ptr(residual);
     auto c = (__ubuf__ float*)__cce_get_tile_ptr(coefficients);
-#if defined(__CPU_SIM)
-    for (int h = first; h < first + count; ++h) {
-        for (int k = 0; k < 2560; ++k) {
-            float value = static_cast<float>(x[k]) * c[h];
-            for (int i = 0; i < 4; ++i) value = value + r[i * 2560 + k] * c[8 + i * 4 + h];
-            dst[h * 2560 + k] = value;
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         for (uint16_t k = 0; k < 40; ++k) {
@@ -71,7 +62,6 @@ __tf__ __aicore__ inline void mix_streams(
             }
         }
     }
-#endif
 }
 __aicore__ inline void process(__gm__ int64_t* args, int chunk, int first, int count) {
     int row = chunk / 2, column = chunk % 2 * 2560;

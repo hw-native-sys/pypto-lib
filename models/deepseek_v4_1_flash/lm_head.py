@@ -19,6 +19,7 @@ Complete a dispatch on every rank before replacing shared inputs or reusing
 its windows. DSpark sampling applies token and width masks directly to its 72 output IDs.
 """
 
+# Tile-based vocabulary projection shares device and CPU-SIM initialization.
 import sys
 from pathlib import Path
 

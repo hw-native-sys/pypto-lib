@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim
+# Native A5 VF, VPTO and Cube/Vector transfers require device execution.
 """PyPTO sparse MLA with packed-cache dequantization and sink-aware Cube attention."""
 """Gather sparse attention over packed FP8/FP4 caches with an attention sink."""
 

@@ -9,7 +9,7 @@
 #include <pto/pto-inst.hpp>
 namespace o_quant {
 using namespace pto;
-#if defined(__DAV_VEC__) && !defined(__CPU_SIM)
+#if defined(__DAV_VEC__)
 template <typename Output, typename Scales, typename Input, typename Trig>
 __tf__ __aicore__ inline void rotate_quant_vf(
     typename Output::TileDType __out__ output, typename Scales::TileDType __out__ scales,

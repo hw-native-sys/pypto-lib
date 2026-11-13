@@ -8,11 +8,6 @@
 // -----------------------------------------------------------------------------------------------------------
 // Window-key RMSNorm, BF16 RoPE, group-32 FP8 quantization, and page-owned publication.
 #include <cstdint>
-#if defined(__CPU_SIM)
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#endif
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 #include "intrinsic.h"
@@ -46,48 +41,6 @@ __tf__ __aicore__ inline void postprocess(
     auto gamma = (__ubuf__ bfloat16_t*)__cce_get_tile_ptr(weight);
     auto cp = (__ubuf__ float*)__cce_get_tile_ptr(cosine);
     auto sp = (__ubuf__ float*)__cce_get_tile_ptr(sine);
-#if defined(__CPU_SIM)
-    for (int row = 0; row < rows; ++row) {
-        float values[512];
-        float partial[64] = {};
-        for (int segment = 0; segment < 8; ++segment) {
-            for (int lane = 0; lane < 64; ++lane) {
-                float value = static_cast<float>(src[row * 512 + segment * 64 + lane]);
-                partial[lane] += value * value;
-            }
-        }
-        for (int width = 64; width > 1; width /= 2) {
-            for (int lane = 0; lane < width / 2; ++lane) {
-                partial[lane] = partial[lane * 2] + partial[lane * 2 + 1];
-            }
-        }
-        float inv = 1.0f / std::sqrt(partial[0] / 512.0f + 1.0e-6f);
-        for (int lane = 0; lane < 512; ++lane) {
-            values[lane] = static_cast<float>(static_cast<bfloat16_t>(
-                static_cast<float>(src[row * 512 + lane]) * inv * static_cast<float>(gamma[lane])));
-        }
-        for (int pair = 0; pair < 32; ++pair) {
-            float even = values[448 + pair * 2];
-            float odd = values[449 + pair * 2];
-            values[448 + pair * 2] = static_cast<float>(static_cast<bfloat16_t>(
-                even * cp[row * 32 + pair] - odd * sp[row * 32 + pair]));
-            values[449 + pair * 2] = static_cast<float>(static_cast<bfloat16_t>(
-                even * sp[row * 32 + pair] + odd * cp[row * 32 + pair]));
-        }
-        for (int group = 0; group < 16; ++group) {
-            float maximum = 1.0e-4f;
-            for (int lane = 0; lane < 32; ++lane) maximum = std::max(maximum, std::abs(values[group * 32 + lane]));
-            int32_t exponent = (std::bit_cast<int32_t>(maximum * (1.0f / 448.0f)) + 8388607) >> 23;
-            bfloat16_t scale = static_cast<bfloat16_t>(std::bit_cast<float>(exponent << 23));
-            factors[row * 16 + group] = scale;
-            auto output = reinterpret_cast<__ubuf__ float8_e4m3_t*>(dst);
-            for (int lane = 0; lane < 32; ++lane) {
-                output[row * 512 + group * 32 + lane] = float8_e4m3_t(
-                    values[group * 32 + lane] / static_cast<float>(scale), RoundMode::CAST_RINT);
-            }
-        }
-    }
-#else
     __VEC_SCOPE__ {
         MaskReg full = pset_b32(PAT_ALL);
         uint32_t half_count = 32;
@@ -169,7 +122,6 @@ __tf__ __aicore__ inline void postprocess(
             }
         }
     }
-#endif
 }
 
 __aicore__ inline void flush_rows(__gm__ int64_t* args, int rows, Vec<int64_t, 8>& targets) {

@@ -80,9 +80,7 @@ __aicore__ inline void initialize(__gm__ int64_t* args) {
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 #if defined(__DAV_VEC__)
-#if !defined(__CPU_SIM)
     set_atomic_none(); set_mask_norm(); set_vector_mask(-1, -1);
-#endif
     initialize(args);
 #endif
 }
