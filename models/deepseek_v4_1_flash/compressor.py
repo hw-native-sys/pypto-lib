@@ -19,6 +19,7 @@ from config import (
     FLASH as M, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN, T_DYN, CMP_BLOCKS_DYN,
     COMPRESSED_CACHE_BYTES,
 )
+from compressor_pool import compressor_pool_body as _c2a_compress
 from quant import unpack_bf16_nz
 from rmsnorm import golden_rms_norm
 
@@ -451,29 +452,6 @@ def c2a_compressor_project(
     return kv_out, score_out
 
 
-@pl.jit.extern(core_type="aiv", source=Path(__file__).parent / "kernels" / "compressor_pool.cpp",
-               include_dirs=(pto_isa_include_dir(), str(Path(__file__).parent / "kernels")))
-def _c2a_compress(
-    kv_proj: pl.Tensor,
-    score_proj: pl.Tensor,
-    state_cache: pl.InOut[pl.Tensor],
-    position_ids: pl.Tensor,
-    norm_weight: pl.Tensor,
-    latent: pl.InOut[pl.Tensor],
-    query_start_loc: pl.Tensor,
-    token_to_req_indices: pl.Tensor,
-    state_block_table: pl.Tensor,
-    slots: pl.Tensor,
-    cosine: pl.Tensor,
-    sine: pl.Tensor,
-    cache: pl.InOut[pl.Tensor],
-    num_tokens: pl.Scalar[pl.INT32],
-    num_state_blocks: pl.Scalar[pl.INT32],
-) -> pl.Tensor:
-    """Pool, normalize, publish compressed rows, and update request ring state."""
-    ...
-
-
 @pl.jit.inline(auto_scope=False)
 def c2a_compressor_publish(
     kv_proj: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
@@ -538,11 +516,13 @@ def c2a_compressor_publish(
     # Request-based decode worker count.
     workers = pl.max(pl.min(pl.tensor.dim(state_block_table, 0), 16), 1)
     native_count = pl.cast(native_blocks, pl.INT32)
+    native_flat = pl.reshape(native_state, [native_blocks * 4, STATE_WIDTH])
+    cache_flat = pl.reshape(cache, [pl.tensor.dim(cache, 0) * 128, COMPRESSED_CACHE_BYTES])
     with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as completed:
         _c2a_compress(
-            kv_proj, score_proj, native_state, position_ids, norm_weight, latent,
+            kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
             mapped_starts, mapped_requests, mapped_blocks,
-            slots, cosine, sine, cache, active_tokens, native_count,
+            slots, cosine, sine, cache_flat, active_tokens, native_count,
         )
     return completed
 
