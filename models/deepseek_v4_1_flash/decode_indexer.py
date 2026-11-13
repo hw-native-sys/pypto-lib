@@ -1301,6 +1301,7 @@ def _score_index_rows(
     query_storage = pl.create_tensor([query_storage_rows, INDEX_DIM // 2], dtype=pl.UINT8)
     query_fp4 = pl.reinterpret_view(query_storage, pl.FP4E2M1X2)
     workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
+    vector_workers = pl.max(1, pl.min(64, pl.system.available_aiv_count()))
     work_count = run_count * panels
     batch_capacity = pl.max(1, pl.min(work_count, workers * SCORE_BATCH_TILE))
     dot_rows = batch_capacity * SCORE_ROWS_TILE
@@ -1317,9 +1318,9 @@ def _score_index_rows(
     batch_limit = pl.max(1, work_count)
     for batch_begin in pl.range(0, batch_limit, batch_capacity):
         batch_end = pl.min(work_count, batch_begin + batch_capacity)
-        with pl.spmd(workers, name_hint="idx_score_gather_reg", deps=[cache_ready, pool_ready, query_ready, previous_batch]) as gather_tid:
+        with pl.spmd(vector_workers, name_hint="idx_score_gather_reg", deps=[cache_ready, pool_ready, query_ready, previous_batch]) as gather_tid:
             worker = pl.tile.get_block_idx()
-            for work in pl.range(batch_begin + worker, batch_end, workers):
+            for work in pl.range(batch_begin + worker, batch_end, vector_workers):
                 staging_slot = work - batch_begin
                 run_id = work // panels
                 begin = (work % panels) * SCORE_TILE
@@ -1509,9 +1510,9 @@ def _score_index_rows(
                                 dot1 = pl.matmul_mx(query_left1, query_left_scale1, keys_right, key_right_scale)
                                 dot_backing = pl.store(dot1, [staging_slot * SCORE_ROWS_TILE + 96, 0], dot_backing)
 
-        with pl.spmd(workers, name_hint="idx_score_reduce", deps=[dot_tid, weights_ready]) as completed:
+        with pl.spmd(vector_workers, name_hint="idx_score_reduce", deps=[dot_tid, weights_ready]) as completed:
             worker = pl.tile.get_block_idx()
-            for work in pl.range(batch_begin + worker, batch_end, workers):
+            for work in pl.range(batch_begin + worker, batch_end, vector_workers):
                 staging_slot = work - batch_begin
                 run_id = work // panels
                 begin = (work % panels) * SCORE_TILE
@@ -1604,7 +1605,7 @@ def _select_index_topk_sharded(
 ):
     width = pl.tensor.dim(scores, 1)
     capacity = pl.tensor.dim(scores, 0)
-    workers = pl.max(1, pl.min(32, pl.system.available_cluster_count()))
+    vector_workers = pl.max(1, pl.min(64, pl.system.available_aiv_count()))
     run_count = pl.cast(
         pl.read(runs, [3, 0]),
         pl.INT32,
@@ -1618,9 +1619,11 @@ def _select_index_topk_sharded(
     candidate_width = shards * INDEX_TOPK
     candidate_keys = pl.create_tensor([capacity, candidate_width], dtype=pl.UINT16)
     candidate_ids = pl.create_tensor([capacity, candidate_width], dtype=pl.INT32)
-    with pl.spmd(workers, name_hint="idx_topk_shards_reg", deps=[ready]) as local_done:
-        worker = pl.tile.get_block_idx()
-        for shard in pl.range(worker, shards, workers):
+    with pl.spmd(vector_workers, name_hint="idx_topk_shards_reg", deps=[ready]) as local_done:
+        raw_worker = pl.tile.get_block_idx()
+        for task in pl.range(raw_worker, shards * 2, vector_workers):
+            shard = task // 2
+            lane = task % 2
             if shard < owners:
                 first = pl.cast(total * shard // owners, pl.INT32)
                 finish = pl.cast(total * (shard + 1) // owners, pl.INT32)
@@ -1642,7 +1645,7 @@ def _select_index_topk_sharded(
                         pl.read(runs, [1, run_id]),
                         pl.INT32,
                     )
-                    for token in pl.range(run_begin, run_end):
+                    for token in pl.range(run_begin + lane, run_end, 2):
                         compute_local = pl.cast(1, pl.INT32)
                         if direct_short:
                             if pl.read(lengths, [token]) <= INDEX_TOPK:
@@ -1920,9 +1923,9 @@ def _select_index_topk_sharded(
                             local_ids_row = pl.reshape(local_ids, [1, INDEX_TOPK])
                             candidate_keys = pl.store(local_keys_row, [token, shard * INDEX_TOPK], candidate_keys)
                             candidate_ids = pl.store(local_ids_row, [token, shard * INDEX_TOPK], candidate_ids)
-    with pl.spmd(workers, name_hint="idx_topk_merge_reg", deps=[local_done]) as completed:
+    with pl.spmd(vector_workers, name_hint="idx_topk_merge_reg", deps=[local_done]) as completed:
         merge_worker = pl.tile.get_block_idx()
-        for merge_token in pl.range(merge_worker, num_tokens, workers):
+        for merge_token in pl.range(merge_worker, num_tokens, vector_workers):
             final_ids = pl.tile.full([INDEX_TOPK], dtype=pl.INT32, value=-1)
             final_ids = pl.tile.move(final_ids, target_memory=pl.MemorySpace.Vec)
             short = pl.cast(0, pl.INT32)
