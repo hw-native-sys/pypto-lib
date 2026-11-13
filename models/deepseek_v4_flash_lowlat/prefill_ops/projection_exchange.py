@@ -105,9 +105,9 @@ def projection_exchange(
             if my_rank == owner:
                 member = pl.tile.get_block_idx()
                 peer = pl.read(peers, [member])
-                pld.tensor.put(window, peer, kv, dst_offsets=[row, 0], src_offsets=[0, 0], shape=[rows, columns], chunk_rows=PROJECTION_ROW_TILE, chunk_cols=PROJECTION_COL_TILE)
+                pld.tensor.put(window, peer, kv, dst_offsets=[row, 0], src_offsets=[0, 0], shape=[rows, columns], chunk_rows=PROJECTION_ROW_TILE, chunk_cols=columns)
                 if has_gate:
-                    pld.tensor.put(window, peer, gate, dst_offsets=[row, columns], src_offsets=[0, 0], shape=[rows, columns], chunk_rows=PROJECTION_ROW_TILE, chunk_cols=PROJECTION_COL_TILE)
+                    pld.tensor.put(window, peer, gate, dst_offsets=[row, columns], src_offsets=[0, 0], shape=[rows, columns], chunk_rows=PROJECTION_ROW_TILE, chunk_cols=columns)
                 pld.system.notify(ready, peer, [lane, 0], value=1, op=pld.NotifyOp.AtomicAdd)
         published_tasks[0] = pushed_inner
     pushed = published_tasks[0]
