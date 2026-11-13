@@ -106,7 +106,7 @@ def _validate_target_capacity(metadata, profile, max_seq_len):
 
 
 def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=180, max_seq_len=1048576,
-                    prefill_indexer_arenas=1, projection_degrees=None):
+                    prefill_indexer_arenas=1, projection_degrees=None, prefill_moe_ready=False):
     """Compile one immutable source profile; device IDs describe topology only."""
     if profile not in ("single", "one", "two", "rsag", "prefill"):
         raise ValueError("Unknown request-pipeline source profile")
@@ -116,6 +116,10 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         raise ValueError("Prefill indexer arenas must be one or two")
     if profile != "prefill" and prefill_indexer_arenas != 1:
         raise ValueError("Indexer arena selection applies only to prefill")
+    if type(prefill_moe_ready) is not bool:
+        raise ValueError("Prefill MoE readiness must be a boolean compile option")
+    if profile != "prefill" and prefill_moe_ready:
+        raise ValueError("MoE readiness selection applies only to prefill")
     degrees = {family: 8 for family in ("swa", "csa", "hca")}
     degrees.update(projection_degrees or {})
     if set(degrees) != {"swa", "csa", "hca"} or any(type(d) is not int or d not in (1, 2, 4, 8) for d in degrees.values()):
@@ -156,7 +160,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         if profile == "prefill":
             from .prefill_fwd import load_prefill_programs
 
-            function = load_prefill_programs(indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees)["chunk"]
+            function = load_prefill_programs(indexer_arenas=prefill_indexer_arenas, projection_degrees=projection_degrees, moe_ready=prefill_moe_ready)["chunk"]
             kwargs = {}
             selected_source = None
         elif profile == "single":
@@ -216,6 +220,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
         public_parameters=len(metadata["params"]),
         sources=before,
         native_w2_source_sha256=selected_source,
+        prefill_moe_ready=bool(prefill_moe_ready) if profile == "prefill" else False,
         old_binaries_loaded=False,
         ptoas_timeout_seconds=ptoas_timeout_seconds,
         max_seq_len=max_seq_len,
@@ -232,6 +237,7 @@ def compile_program(profile, *, cache_root, device_ids, ptoas_timeout_seconds=18
             attention_cp=8, moe_tp=8, lm_head_tp=8,
             projection_replicas=projection_degrees, prefetch="exact", transfer_slots=2,
             indexer_arenas=prefill_indexer_arenas,
+            moe_ready=prefill_moe_ready,
             resident_projection_layout="ND",
             dispatches_per_chunk=1, tp8_baseline_bitwise_verified=False,
         )
@@ -254,6 +260,7 @@ def main():
     )
     for family in ("swa", "csa", "hca"):
         parser.add_argument("--projection-" + family + "-d", type=int, choices=(1, 2, 4, 8), default=8)
+    parser.add_argument("--prefill-moe-ready", action="store_true", help="Experimental bounded T8 compute/publish overlap")
     args = parser.parse_args()
     if args.report.exists():
         parser.error("The report already exists; preserve it and choose a new run directory")
@@ -266,6 +273,7 @@ def main():
         ptoas_timeout_seconds=args.ptoas_timeout_seconds,
         max_seq_len=args.max_seq_len,
         prefill_indexer_arenas=args.prefill_indexer_arenas,
+        prefill_moe_ready=args.prefill_moe_ready,
         projection_degrees={family: getattr(args, "projection_" + family + "_d") for family in ("swa", "csa", "hca")},
     )
     report["generation_seconds"] = time.monotonic() - started

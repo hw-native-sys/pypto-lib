@@ -28,6 +28,22 @@ end-to-end speedup in the representative 16K scope; each generated artifact
 requires its own correctness and performance qualification. Histogram selection
 and EMA recall are not implemented by that option.
 
+The opt-in build option `--prefill-moe-ready` permits two bounded T8 MoE
+compute waves to advance ahead of ordered TP publication. Peer waits use
+core-releasing deferred completion; rank-order FP32 summation and BF16
+rounding remain unchanged. Each compile plan must be loaded in a fresh setup
+process. The option is recorded in the prefill plan and remains off by default.
+It changes prefill scheduling only; native decode entries are unaffected.
+
+A fixed 16K batch-one replay on four dual-chip 910C boards measured prefill
+public submit-to-result medians of 20.290 s with the original d8 plan and
+15.516 s with d8 MoE readiness. Both modes used one retained Worker and the
+same TP8 weights, with one warmup and three ordinary requests. All complete
+output/cache byte hashes matched the frozen serial-native reference. Input
+preparation/upload and output hashing are outside that timing; it is not a
+serving or decode-TPOT measurement. Shared-projection d1 with readiness took
+15.881 s in the same comparison, so projection selection remains d8.
+
 The prefill plan supports projection replication degrees 1, 2, 4, and 8 for
 SWA, CSA, and HCA. Degree 8 remains the default for 8192-token chunks. Shared
 degrees distribute pure 512-token KV and compressor projections using two

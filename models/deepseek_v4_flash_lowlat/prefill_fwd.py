@@ -24,8 +24,10 @@ _HCA_LAYERS = 20
 
 
 @contextmanager
-def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None):
+def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degrees=None, moe_ready=False):
     """Isolate the private prefill operators' import-time TP8 configuration."""
+    if type(moe_ready) is not bool:
+        raise ValueError("Prefill MoE readiness must be a boolean compile option")
     projection_degrees = dict(projection_degrees or {})
     for family, degree in projection_degrees.items():
         if family not in ("swa", "csa", "hca") or type(degree) is not int or degree not in (1, 2, 4, 8):
@@ -44,6 +46,7 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
         sys.argv = ["lowlat-prefill", "--tp", "8", "--ep", "8", "--dp", "1", "--lm-head-tp", "8"]
         sys.argv += ["--prefill-query-pipeline", "1" if query_pipeline else "0", "--prefill-resident-weights"]
         sys.argv += ["--prefill-indexer-arenas", str(indexer_arenas)]
+        sys.argv += ["--prefill-moe-ready", "1" if moe_ready else "0"]
         for family, degree in projection_degrees.items():
             sys.argv += ["--prefill-projection-" + family + "-d", str(degree)]
         try:
@@ -58,10 +61,10 @@ def _prefill_import(*, query_pipeline=False, indexer_arenas=1, projection_degree
                     sys.modules[name] = module
 
 
-def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None):
+def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=None, moe_ready=False):
     """Return the TP8 attention, MoE, tap, and head entries for compilation.
 
-    Load in a single-threaded setup process before creating Workers. ``chunk``
+    Load each compile plan in a fresh setup process before creating Workers. ``chunk``
     composes all layers in one device program; ``serial`` loads the component
     baseline for the same TP8 weights and arithmetic.
     """
@@ -69,7 +72,7 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
         raise ValueError("Prefill mode must be chunk or serial")
     if mode == "serial" and indexer_arenas != 1:
         raise ValueError("Multiple indexer arenas require the chunk query pipeline")
-    with _prefill_import(query_pipeline=mode == "chunk", indexer_arenas=indexer_arenas, projection_degrees=projection_degrees):
+    with _prefill_import(query_pipeline=mode == "chunk", indexer_arenas=indexer_arenas, projection_degrees=projection_degrees, moe_ready=moe_ready):
         qkv = importlib.import_module("qkv_proj_rope")
         ordered_qkv = importlib.import_module("models.deepseek_v4_flash_lowlat.drafter.qkv_proj_rope")
         geometry = (
@@ -84,6 +87,8 @@ def load_prefill_programs(*, mode="chunk", indexer_arenas=1, projection_degrees=
         attention = {name: importlib.import_module("prefill_" + name) for name in ("swa", "csa", "hca")}
         head = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_head")
         moe = importlib.import_module("models.deepseek_v4_flash_lowlat.prefill_moe")
+        if bool(moe.PREFILL_MOE_READY) != moe_ready:
+            raise RuntimeError("Prefill MoE configuration is frozen; load each plan in a fresh process")
         if any(module.TP_SIZE != _RANKS or module.O_PROJ_LOCAL_GROUPS != 1 for module in attention.values()):
             raise RuntimeError("Unexpected TP8 prefill attention geometry")
         if head.TP_SIZE != _RANKS or (moe.N_RANKS, moe.N_BANK, moe.MOE_INTER) != (8, 257, 256):
