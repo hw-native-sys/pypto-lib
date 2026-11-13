@@ -624,6 +624,8 @@ W2_SCALE_K_TILE = W2_K_TILE // MX_GROUP
 W2_K_STAGE = 2
 W2_SCALE_ROW_TILE = 32
 W2_SCALE_WORD_TILE = W2_SCALE_ROW_TILE // 2
+W2_SCALE_RESIDENT_TILE = ((H_SCALE + 31) // 32) * 32
+W2_SCALE_RESIDENT_WORD_TILE = W2_SCALE_RESIDENT_TILE // 2
 W2_SCALE_INDEX_TILE = W2_HALF_M_TILE * (W2_SCALE_K_TILE // 2)
 W2_SCALE_TMP_TILE = ((64 + (W2_HALF_M_TILE // 16) * W2_SCALE_K_TILE + 31) // 32) * 32
 
@@ -698,9 +700,9 @@ def routed_w2_nz_vector(
     scale_nd = pl.tensor.view(scales, [payload.shape[0], H_SCALE], layout=pl.ND)
     scale_index = pl.tile.ci(0, [1, W2_SCALE_INDEX_TILE], dtype=pl.INT16)
     scale_lane = pl.tile.ands(scale_index, W2_SCALE_K_TILE // 2 - 1)
-    scale_index_rows = pl.mul(scale_index, 32 // W2_SCALE_K_TILE)
-    scale_index_cols = pl.mul(scale_lane, 32 // W2_SCALE_K_TILE - 1)
-    scale_indices = pl.sub(scale_index_rows, scale_index_cols)
+    scale_rows = pl.tile.shrs(scale_index, 2)
+    scale_index_rows = pl.mul(scale_rows, W2_SCALE_RESIDENT_WORD_TILE)
+    scale_base_indices = pl.add(scale_index_rows, scale_lane)
     core = pl.tile.get_block_idx()
     compact = 0
     work_base = 0
@@ -716,14 +718,15 @@ def routed_w2_nz_vector(
                     col = block * W2_N_TILE
                     panel = expert * MX_W2_PACKED_ROWS + block * MOE_INTER
                     scale_row = compact + input_row + lane * W2_HALF_M_TILE
+                    scale_resident = pl.load(scale_nd, [scale_row, 0], [W2_HALF_M_TILE, W2_SCALE_RESIDENT_TILE], valid_shape=[W2_HALF_M_TILE, H_SCALE], target_memory=pl.Mem.Vec)
+                    scale_resident_codes = pl.reinterpret_view(scale_resident, pl.UINT8)
+                    scale_resident_padded = pl.fillpad_expand(scale_resident_codes, [W2_HALF_M_TILE, W2_SCALE_RESIDENT_TILE], pad_value=0)
+                    scale_resident_words = pl.reinterpret_view(scale_resident_padded, pl.INT16)
+                    scale_source = pl.reshape(scale_resident_words, [1, W2_HALF_M_TILE * W2_SCALE_RESIDENT_WORD_TILE])
                     raw0: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=2)[0], pl.Mem.Vec] = pl.load(weight_flat, [panel + (0) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                     raw1: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=2)[1], pl.Mem.Vec] = pl.load(weight_flat, [panel + (W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                     idx_u16: pl.Tile[[128, 128], pl.UINT16, pl.MemRef("w2_index"), pl.Mem.Vec] = pl.cast(raw0, pl.UINT16)
-                    scale_chunk = pl.load(scale_nd, [scale_row, (0) // MX_GROUP], [W2_HALF_M_TILE, W2_SCALE_ROW_TILE], valid_shape=[W2_HALF_M_TILE, W2_SCALE_K_TILE])
-                    scale_codes = pl.reinterpret_view(scale_chunk, pl.UINT8)
-                    scale_words = pl.reinterpret_view(scale_codes, pl.INT16)
-                    scale_padded = pl.fillpad_expand(scale_words, [W2_HALF_M_TILE, W2_SCALE_WORD_TILE], pad_value=0)
-                    scale_source = pl.reshape(scale_padded, [1, W2_HALF_M_TILE * W2_SCALE_WORD_TILE])
+                    scale_indices = scale_base_indices
                     scale_scratch = pl.tile.create([1, 32], dtype=pl.INT16)
                     scale_compact = pl.tile.gather(scale_source, scale_indices, scale_scratch)
                     scale_codes_flat = pl.reinterpret_view(scale_compact, pl.UINT8)
@@ -740,11 +743,8 @@ def routed_w2_nz_vector(
                     raw0: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=2)[0], pl.Mem.Vec] = pl.load(weight_flat, [panel + (2 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                     for batch in pl.unroll(W2_K_TILE, MOE_INTER, 2 * W2_K_TILE):
                         idx_u16: pl.Tile[[128, 128], pl.UINT16, pl.MemRef("w2_index"), pl.Mem.Vec] = pl.cast(raw1, pl.UINT16)
-                        scale_chunk = pl.load(scale_nd, [scale_row, (batch) // MX_GROUP], [W2_HALF_M_TILE, W2_SCALE_ROW_TILE], valid_shape=[W2_HALF_M_TILE, W2_SCALE_K_TILE])
-                        scale_codes = pl.reinterpret_view(scale_chunk, pl.UINT8)
-                        scale_words = pl.reinterpret_view(scale_codes, pl.INT16)
-                        scale_padded = pl.fillpad_expand(scale_words, [W2_HALF_M_TILE, W2_SCALE_WORD_TILE], pad_value=0)
-                        scale_source = pl.reshape(scale_padded, [1, W2_HALF_M_TILE * W2_SCALE_WORD_TILE])
+                        scale_word_offset = pl.cast(batch // (2 * MX_GROUP), pl.INT16)
+                        scale_indices = pl.add(scale_base_indices, scale_word_offset)
                         scale_scratch = pl.tile.create([1, 32], dtype=pl.INT16)
                         scale_compact = pl.tile.gather(scale_source, scale_indices, scale_scratch)
                         scale_codes_flat = pl.reinterpret_view(scale_compact, pl.UINT8)
@@ -761,11 +761,8 @@ def routed_w2_nz_vector(
                         if batch + 2 * W2_K_TILE < MOE_INTER:
                             raw1: pl.Tile[[128, 128], pl.UINT8, pl.MemRef("w2_raw", slots=2)[1], pl.Mem.Vec] = pl.load(weight_flat, [panel + (batch + 2 * W2_K_TILE) + lane * 128, 0], [128, 128], target_memory=pl.Mem.Vec)
                         idx_u16: pl.Tile[[128, 128], pl.UINT16, pl.MemRef("w2_index"), pl.Mem.Vec] = pl.cast(raw0, pl.UINT16)
-                        scale_chunk = pl.load(scale_nd, [scale_row, (batch + W2_K_TILE) // MX_GROUP], [W2_HALF_M_TILE, W2_SCALE_ROW_TILE], valid_shape=[W2_HALF_M_TILE, W2_SCALE_K_TILE])
-                        scale_codes = pl.reinterpret_view(scale_chunk, pl.UINT8)
-                        scale_words = pl.reinterpret_view(scale_codes, pl.INT16)
-                        scale_padded = pl.fillpad_expand(scale_words, [W2_HALF_M_TILE, W2_SCALE_WORD_TILE], pad_value=0)
-                        scale_source = pl.reshape(scale_padded, [1, W2_HALF_M_TILE * W2_SCALE_WORD_TILE])
+                        scale_word_offset = pl.cast((batch + W2_K_TILE) // (2 * MX_GROUP), pl.INT16)
+                        scale_indices = pl.add(scale_base_indices, scale_word_offset)
                         scale_scratch = pl.tile.create([1, 32], dtype=pl.INT16)
                         scale_compact = pl.tile.gather(scale_source, scale_indices, scale_scratch)
                         scale_codes_flat = pl.reinterpret_view(scale_compact, pl.UINT8)
