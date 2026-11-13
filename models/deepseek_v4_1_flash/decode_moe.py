@@ -106,10 +106,10 @@ def combine_scattered(
     moe_epoch: pl.Scalar[pl.INT32],
     topk: pl.constexpr = TOPK,
 ):
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_notify", deps=[scatter_done], allow_early_resolve=False) as notify_tid:
-        for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.notify(target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
+    with pl.spmd(N_RANKS, name_hint="combine_notify", deps=[scatter_done], allow_early_resolve=False) as notify_tid:
+        peer = pl.tile.get_block_idx()
+        if peer != my_rank:
+            pld.system.notify(target=combine_arrived, peer=peer, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
 
     with pl.at(
         level=pl.Level.CORE_GROUP, name_hint="combine_wait",

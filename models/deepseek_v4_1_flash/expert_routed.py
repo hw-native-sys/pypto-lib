@@ -68,7 +68,7 @@ ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
 # tiling
 RECV_ROW_TILE = 16
 RECV_SCALE_TMP_TILE = ((64 + K_SCALE + 31) // 32) * 32
-GATHER_WORKERS = 64
+GATHER_WORKER_TILE = 64
 MX_M_TILE = 16
 MX_K_TILE = 256
 MX_MM_INTER_TILE = 256
@@ -97,32 +97,42 @@ def gather_routed_inputs(
     max_per_source: pl.constexpr,
     local_experts: pl.constexpr = N_LOCAL_EXPERTS,
 ):
-    """Gather source lanes and pack scales with aligned, count-driven workers."""
+    """Gather source lanes with expert-partitioned workers and pack MX scales."""
     x_flat = pl.reshape(x_out, [local_experts * RECV_MAX, D])
-    scale_nd = pl.create_tensor([local_experts * RECV_MAX, K_SCALE], dtype=pl.FP8E8M0)
-    with pl.spmd(GATHER_WORKERS, name_hint="dispatch_gather", deps=[wait_ready, publish_ready]) as ready:
+    count_routes = pl.tensor.view(recv_routes, [local_experts * EP_WORLD_SIZE, max_per_source * 8])
+    with pl.spmd(GATHER_WORKER_TILE, name_hint="dispatch_gather", deps=[wait_ready, publish_ready]) as ready:
         core = pl.tile.get_block_idx()
-        work_base = 0
-        for expert in pl.range(local_experts):
+        expert_groups = pl.min(local_experts, GATHER_WORKER_TILE)
+        expert_lane = core // expert_groups
+        for expert in pl.range(core % expert_groups, local_experts, expert_groups):
+            expert_workers = (GATHER_WORKER_TILE + expert_groups - 1 - expert % expert_groups) // expert_groups
+            source_count_values = pl.tile.full([EP_WORLD_SIZE, 8], dtype=pl.INT32, value=0)
+            count_lanes = pl.load(count_routes, [expert * EP_WORLD_SIZE, 0], [EP_WORLD_SIZE, 8])
             source_counts = pl.array.create(EP_WORLD_SIZE, pl.INT32)
             count = pl.cast(0, pl.INDEX)
             for src in pl.range(EP_WORLD_SIZE):
-                count_read = pl.read(recv_routes, [expert * RECV_MAX + src * max_per_source, 1])
+                count_read = pl.tile.read(count_lanes, [src, 1])
                 source_counts[src] = count_read
+                pl.tile.write(source_count_values, [src, 0], count_read)
                 count = count + pl.cast(count_read, pl.INDEX)
-                if core == 0:
-                    pl.write(recv_meta, [src, expert], count_read)
-                    pl.write(recv_meta_window, [src, expert], count_read)
-            if core == 0:
-                pl.write(counts, [expert, 0], pl.cast(count, pl.INT32))
+            if expert_lane == 0:
+                source_count_valid = pl.set_validshape(source_count_values, EP_WORLD_SIZE, 1)
+                recv_meta = pl.store(source_count_valid, [0, expert], recv_meta)
+                recv_meta_window = pl.store(source_count_valid, [0, expert], recv_meta_window)
+                expert_count_value = pl.tile.full([1, 8], dtype=pl.INT32, value=0)
+                pl.tile.write(expert_count_value, [0, 0], pl.cast(count, pl.INT32))
+                expert_count_valid = pl.set_validshape(expert_count_value, 1, 1)
+                counts = pl.store(expert_count_valid, [expert, 0], counts)
             work_count = (count + RECV_ROW_TILE - 1) // RECV_ROW_TILE
-            first = (core + GATHER_WORKERS - work_base % GATHER_WORKERS) % GATHER_WORKERS
-            for work in pl.range(first, work_count, GATHER_WORKERS):
+            for work in pl.range(expert_lane, work_count, expert_workers):
                 row_begin = work * RECV_ROW_TILE
                 row_end = pl.min(row_begin + RECV_ROW_TILE, count)
                 expert_base = expert * RECV_MAX
+                scale_values = pl.tile.full([RECV_ROW_TILE, K_SCALE], dtype=pl.UINT8, value=0)
+                weight_values = pl.tile.full([1, RECV_ROW_TILE], dtype=pl.FP32, value=0.0)
+                route_values = pl.tile.full([1, RECV_ROW_TILE], dtype=pl.INT32, value=0)
                 source_begin = 0
-                for src in pl.range(EP_WORLD_SIZE):
+                for src in pl.pipeline(EP_WORLD_SIZE, stage=2):
                     source_count_read = source_counts[src]
                     source_count = pl.cast(source_count_read, pl.INDEX)
                     source_end = source_begin + source_count
@@ -136,29 +146,28 @@ def gather_routed_inputs(
                         payload_raw = pl.load(recv_x, [source_row, 0], [RECV_ROW_TILE, D], valid_shape=[copy_rows, D])
                         payload = pl.reinterpret_view(payload_raw, pl.FP8E4M3FN)
                         x_flat = pl.store(payload, [output_row, 0], x_flat)
-                        scale_raw = pl.load(
-                            recv_scale, [source_row, 0], [RECV_ROW_TILE, K_SCALE],
-                            valid_shape=[copy_rows, K_SCALE],
-                        )
-                        scale = pl.reinterpret_view(scale_raw, pl.FP8E8M0)
-                        scale_nd = pl.store(scale, [output_row, 0], scale_nd)
-                        for row in pl.range(gather_begin, gather_end):
-                            metadata_row = source_base + row - source_begin
-                            weight = pl.read(recv_weights, [metadata_row, 0])
-                            pl.write(weights_out, [expert, row], weight)
-                            route = pl.read(recv_routes, [metadata_row, 0])
-                            pl.write(routes_out, [expert, row], route)
+                        scale_raw = pl.load(recv_scale, [source_row, 0], [RECV_ROW_TILE, K_SCALE], valid_shape=[copy_rows, K_SCALE])
+                        tile_offset = gather_begin - row_begin
+                        scale_values = pl.tile.assemble(scale_values, scale_raw, [tile_offset, 0])
+                        weight_rows = pl.load(recv_weights, [source_row, 0], [RECV_ROW_TILE, 8], valid_shape=[copy_rows, 8])
+                        route_rows = pl.load(recv_routes, [source_row, 0], [RECV_ROW_TILE, 8], valid_shape=[copy_rows, 8])
+                        for metadata_row in pl.range(copy_rows):
+                            weight_value = pl.tile.read(weight_rows, [metadata_row, 0])
+                            route_value = pl.tile.read(route_rows, [metadata_row, 0])
+                            pl.tile.write(weight_values, [0, tile_offset + metadata_row], weight_value)
+                            pl.tile.write(route_values, [0, tile_offset + metadata_row], route_value)
                     source_begin = source_end
-                # Each worker owns complete 64-byte metadata cache lines.
+                valid_rows = row_end - row_begin
+                weight_valid = pl.set_validshape(weight_values, 1, valid_rows)
+                route_valid = pl.set_validshape(route_values, 1, valid_rows)
+                weights_out = pl.store(weight_valid, [expert, row_begin], weights_out)
+                routes_out = pl.store(route_valid, [expert, row_begin], routes_out)
                 scale_row = expert_base + row_begin
-                scale_values = pl.load(scale_nd, [scale_row, 0], [RECV_ROW_TILE, K_SCALE])
-                scale_bytes = pl.reinterpret_view(scale_values, pl.UINT8)
                 temporary = pl.create_tile([1, RECV_SCALE_TMP_TILE], dtype=pl.UINT8)
-                packed = pl.tmov_x2zz(scale_bytes, temporary, group_axis=1, dst_rows=RECV_ROW_TILE, dst_cols=K_SCALE)
+                packed = pl.tmov_x2zz(scale_values, temporary, group_axis=1, dst_rows=RECV_ROW_TILE, dst_cols=K_SCALE)
                 packed_mx = pl.reinterpret_view(packed, pl.FP8E8M0)
                 packed_flat = pl.reshape(packed_mx, [1, RECV_ROW_TILE * K_SCALE])
                 scale_out = pl.store(packed_flat, [0, scale_row * K_SCALE], scale_out)
-            work_base = work_base + work_count
     return ready
 
 
@@ -187,7 +196,10 @@ def push_dispatch_payload(
     with pl.spmd(worker_tile, name_hint="dispatch_push", deps=[input_ready], allow_early_resolve=False) as ready:
         core = pl.tile.get_block_idx()
         active = pl.min(pl.max(pl.cast(num_tokens, pl.INDEX), 0), MOE_TOKENS)
-        ids = pl.load(indices, [0, 0], [MOE_TOKENS, 8], valid_shape=[MOE_TOKENS, topk])
+        ids_loaded = pl.load(indices, [0, 0], [MOE_TOKENS, 8], valid_shape=[active, topk])
+        ids_padded = pl.tile.full([MOE_TOKENS, 8], dtype=pl.INT32, value=-1)
+        ids_padded = pl.tile.assemble(ids_padded, ids_loaded, [0, 0])
+        flat_ids = pl.reshape(ids_padded, [1, MOE_TOKENS * 8])
         route_weights = pl.load(weights, [0, 0], [MOE_TOKENS, 8], valid_shape=[MOE_TOKENS, topk])
         for block in pl.range(core, workers, worker_tile):
             peer = block // local_experts
@@ -195,34 +207,52 @@ def push_dispatch_payload(
             base = expert * RECV_MAX + rank * MOE_TOKENS
             weight_lane = pl.tile.full([MOE_TOKENS, 8], dtype=pl.FP32, value=0.0)
             route_lane = pl.tile.full([MOE_TOKENS, 8], dtype=pl.INT32, value=0)
+            matched = pl.tile.cmps(flat_ids, pl.cast(block, pl.INT32), cmp_type=0)
+            # Each 32-bit mask word contains four eight-lane token predicates.
+            mask_words = pl.reinterpret_view(matched, pl.UINT32, shape=[1, ((MOE_TOKENS + 31) // 32) * 8])
+            scale_cache = pl.tile.full([16, K_SCALE], dtype=pl.UINT8, value=0)
+            last_batch = pl.array.create(1, pl.INT32)
+            last_batch[0] = -1
             cursor = pl.array.create(1, pl.INT32)
             cursor[0] = 0
-            for batch in pl.range((active + 15) // 16):
-                first = batch * 16
-                scales = pl.load(packed_scale, [0, first * K_SCALE], [1, 16 * K_SCALE])
-                scale_bytes = pl.reinterpret_view(scales, pl.UINT8)
-                pairs = pl.reinterpret_view(scale_bytes, pl.UINT16, shape=[K_SCALE // 2, 16])
-                pairs_nd = pl.transpose(pairs, 0, 1)
-                bytes_nd = pl.reinterpret_view(pairs_nd, pl.UINT8, shape=[16, K_SCALE])
-                for token in pl.range(first, pl.min(first + 16, active)):
-                    for top in pl.range(topk):
-                        eid = pl.tile.read(ids, [token, top])
-                        if eid == block:
-                            slot = cursor[0]
-                            cursor[0] = slot + 1
-                            row = base + slot
-                            values = pl.load(payload, [token, 0], [1, D])
-                            value_bytes = pl.reinterpret_view(values, pl.INT8)
-                            pld.tile.remote_store(value_bytes, target=recv_x, peer=peer, offsets=[row, 0])
-                            scale_row = pl.slice(bytes_nd, [1, K_SCALE], [token - first, 0])
-                            pld.tile.remote_store(scale_row, target=recv_scale, peer=peer, offsets=[row, 0])
-                            value = pl.tile.read(route_weights, [token, top])
-                            pl.tile.write(weight_lane, [slot, 0], value)
-                            route = pl.cast(token * topk + top, pl.INT32)
-                            pl.tile.write(route_lane, [slot, 0], route)
+            for word in pl.range((active + 3) // 4):
+                bits = pl.tile.read(mask_words, [0, word])
+                if bits != 0:
+                    for lane in pl.range(pl.min(4, active - word * 4)):
+                        token = word * 4 + lane
+                        token_bits = (bits >> pl.cast(lane * 8, pl.UINT32)) & pl.cast(255, pl.UINT32)
+                        if token_bits != 0:
+                            batch = token // 16
+                            if batch != pl.cast(last_batch[0], pl.INDEX):
+                                scales = pl.load(packed_scale, [0, batch * 16 * K_SCALE], [1, 16 * K_SCALE])
+                                scale_bytes = pl.reinterpret_view(scales, pl.UINT8)
+                                pairs = pl.reinterpret_view(scale_bytes, pl.UINT16, shape=[K_SCALE // 2, 16])
+                                pairs_nd = pl.transpose(pairs, 0, 1)
+                                bytes_nd = pl.reinterpret_view(pairs_nd, pl.UINT8, shape=[16, K_SCALE])
+                                scale_cache = pl.tile.assemble(scale_cache, bytes_nd, [0, 0])
+                                last_batch[0] = pl.cast(batch, pl.INT32)
+                            for top in pl.range(topk):
+                                top_bit = pl.cast(1, pl.UINT32) << pl.cast(top, pl.UINT32)
+                                if (token_bits & top_bit) != 0:
+                                    slot = cursor[0]
+                                    cursor[0] = slot + 1
+                                    row = base + slot
+                                    values = pl.load(payload, [token, 0], [1, D])
+                                    value_bytes = pl.reinterpret_view(values, pl.INT8)
+                                    pld.tile.remote_store(value_bytes, target=recv_x, peer=peer, offsets=[row, 0])
+                                    scale_row = pl.slice(scale_cache, [1, K_SCALE], [token % 16, 0])
+                                    pld.tile.remote_store(scale_row, target=recv_scale, peer=peer, offsets=[row, 0])
+                                    value = pl.tile.read(route_weights, [token, top])
+                                    pl.tile.write(weight_lane, [slot, 0], value)
+                                    route = pl.cast(token * topk + top, pl.INT32)
+                                    pl.tile.write(route_lane, [slot, 0], route)
             pl.tile.write(route_lane, [0, 1], cursor[0])
-            pld.tile.remote_store(weight_lane, target=recv_weights, peer=peer, offsets=[base, 0])
-            pld.tile.remote_store(route_lane, target=recv_routes, peer=peer, offsets=[base, 0])
+            sent_rows = pl.cast(cursor[0], pl.INDEX)
+            if sent_rows > 0:
+                weight_valid = pl.set_validshape(weight_lane, sent_rows, 8)
+                pld.tile.remote_store(weight_valid, target=recv_weights, peer=peer, offsets=[base, 0])
+            route_valid = pl.set_validshape(route_lane, pl.max(sent_rows, 1), 8)
+            pld.tile.remote_store(route_valid, target=recv_routes, peer=peer, offsets=[base, 0])
     return ready
 
 
@@ -259,16 +289,10 @@ def dispatch(
         dispatch_worker_limit=dispatch_worker_limit,
     )
     # Publish one epoch only after every local payload store completes.
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="dispatch_publish_epoch",
-        deps=[_push_tid], allow_early_resolve=False,
-    ) as _publish_tid:
-        for dst in pl.range(EP_WORLD_SIZE):
-            if dst != my_rank:
-                pld.system.notify(
-                    target=data_arrived, peer=dst, offsets=[my_rank, 0, 0],
-                    value=moe_epoch, op=pld.NotifyOp.Set,
-                )
+    with pl.spmd(EP_WORLD_SIZE, name_hint="dispatch_publish_epoch", deps=[_push_tid], allow_early_resolve=False) as _publish_tid:
+        dst = pl.tile.get_block_idx()
+        if dst != my_rank:
+            pld.system.notify(target=data_arrived, peer=dst, offsets=[my_rank, 0, 0], value=moe_epoch, op=pld.NotifyOp.Set)
 
     with pl.at(
         level=pl.Level.CORE_GROUP, name_hint="dispatch_wait",
@@ -437,12 +461,16 @@ def expert_routed_scatter(
         local_experts, RECV_MAX, D, MOE_INTER,
         (local_experts if local_experts < topk else topk) * RECV_MAX,
     )
+    flat_counts = pl.reshape(recv_expert_count, [1, local_experts])
+    metadata_cols = ((local_experts + 7) // 8) * 8
     with pl.spmd(ROUTED_VECTOR_WORKER_TILE, name_hint="ffn_scatter", deps=[down_ready]) as scatter_done:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_scatter", no_dep_args=[routed_output]):
             core = pl.tile.get_block_idx()
+            count_values = pl.load(flat_counts, [0, 0], [1, metadata_cols], valid_shape=[1, local_experts])
+            meta_values = pl.load(recv_meta, [0, 0], [EP_WORLD_SIZE, metadata_cols], valid_shape=[EP_WORLD_SIZE, local_experts])
             total_rows = 0
             for expert in pl.range(local_experts):
-                rows_read = pl.read(recv_expert_count, [expert, 0])
+                rows_read = pl.tile.read(count_values, [0, expert])
                 rows = pl.cast(rows_read, pl.INDEX)
                 total_rows = total_rows + rows
             rows_per_core = total_rows // ROUTED_VECTOR_WORKER_TILE
@@ -452,14 +480,14 @@ def expert_routed_scatter(
             core_end = core_begin + core_rows
             compact_base = 0
             for local_e in pl.range(local_experts):
-                count_read = pl.read(recv_expert_count, [local_e, 0])
+                count_read = pl.tile.read(count_values, [0, local_e])
                 count = pl.cast(count_read, pl.INDEX)
                 expert_begin = pl.max(compact_base, core_begin)
                 expert_end = pl.min(compact_base + count, core_end)
                 if expert_begin < expert_end:
                     source_begin = 0
                     for src in pl.range(EP_WORLD_SIZE):
-                        source_rows_read = pl.read(recv_meta, [src, local_e])
+                        source_rows_read = pl.tile.read(meta_values, [src, local_e])
                         source_rows = pl.cast(source_rows_read, pl.INDEX)
                         source_end = source_begin + source_rows
                         valid_end = pl.min(source_end, count)
