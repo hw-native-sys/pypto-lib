@@ -23,8 +23,8 @@ SLOT_TILE = 128
 def _postprocess(
     raw: pl.Tile[[ROW_TILE * HEAD_DIM], pl.BF16, pl.Mem.Vec],
     weight: pl.Tile[[HEAD_DIM], pl.BF16, pl.Mem.Vec],
-    cosine: pl.Tile[[ROW_TILE * 64], pl.FP32, pl.Mem.Vec],
-    sine: pl.Tile[[ROW_TILE * 64], pl.FP32, pl.Mem.Vec],
+    cosine: pl.Tile[[ROW_TILE * 32], pl.FP32, pl.Mem.Vec],
+    sine: pl.Tile[[ROW_TILE * 32], pl.FP32, pl.Mem.Vec],
     rows: pl.Scalar[pl.INDEX],
 ):
     packed = pl.tile.create([ROW_TILE * HEAD_DIM], dtype=pl.UINT8, target_memory=pl.Mem.Vec)
@@ -48,8 +48,8 @@ def _postprocess(
             mean = pl.reg.muls(total, 1.0 / HEAD_DIM, full)
             rms = pl.reg.sqrt(pl.reg.adds(mean, 1.0e-6, full), full)
             inverse = pl.reg.div(one, rms, full)
-            cos = pl.reg.load(cosine, row * 64, lanes=64)
-            sin = pl.reg.load(sine, row * 64, lanes=64)
+            cos = pl.reg.load(cosine, row * 32, lanes=64)
+            sin = pl.reg.load(sine, row * 32, lanes=64)
             for segment in pl.hardware_loop(HEAD_DIM // 64 - 1):
                 offset = row * HEAD_DIM + segment * 64
                 value = pl.reg.convert(pl.reg.load(raw, offset, lanes=64), dtype=pl.FP32)
@@ -67,8 +67,6 @@ def _postprocess(
                 exponent = pl.reg.shift_rights(rounded_bits, 23, full)
                 power_bits = pl.reg.shift_lefts(exponent, 23, full)
                 scale = pl.reg.interpret_cast(power_bits, dtype=pl.FP32)
-                bf_scale = pl.reg.convert(scale, dtype=pl.BF16, rounding="R", saturate=False)
-                scale = pl.reg.convert(bf_scale, dtype=pl.FP32)
                 quantized = pl.reg.div(value, scale, full)
                 fp8 = pl.reg.convert(quantized, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
                 bytes8 = pl.reg.interpret_cast(fp8, dtype=pl.UINT8)
@@ -106,8 +104,6 @@ def _postprocess(
             exponent = pl.reg.shift_rights(rounded_bits, 23, full)
             power_bits = pl.reg.shift_lefts(exponent, 23, full)
             scale = pl.reg.interpret_cast(power_bits, dtype=pl.FP32)
-            bf_scale = pl.reg.convert(scale, dtype=pl.BF16, rounding="R", saturate=False)
-            scale = pl.reg.convert(bf_scale, dtype=pl.FP32)
             quantized = pl.reg.div(value, scale, full)
             fp8 = pl.reg.convert(quantized, dtype=pl.FP8E4M3FN, rounding="R", saturate=False)
             bytes8 = pl.reg.interpret_cast(fp8, dtype=pl.UINT8)
@@ -129,36 +125,38 @@ def _postprocess(
 
 @pl.jit.inline(auto_scope=False)
 def _flush(
-    source: pl.Tensor,
-    cos_source: pl.Tensor,
-    sin_source: pl.Tensor,
-    tokens: pl.Tile[[ROW_TILE], pl.INT64, pl.Mem.Vec],
     inputs: pl.Tile[[ROW_TILE, HEAD_DIM], pl.BF16, pl.Mem.Vec],
     weight: pl.Tile[[HEAD_DIM], pl.BF16, pl.Mem.Vec],
-    cosine: pl.Tile[[ROW_TILE, 64], pl.FP32, pl.Mem.Vec],
-    sine: pl.Tile[[ROW_TILE, 64], pl.FP32, pl.Mem.Vec],
+    cosine: pl.Tile[[ROW_TILE, 32], pl.FP32, pl.Mem.Vec],
+    sine: pl.Tile[[ROW_TILE, 32], pl.FP32, pl.Mem.Vec],
     targets: pl.Tile[[ROW_TILE], pl.INT64, pl.Mem.Vec],
     rows: pl.Scalar[pl.INDEX],
     cache: pl.Tensor,
 ):
-    for row in pl.range(rows):
-        token = pl.cast(pl.tile.read(tokens, [row]), pl.INDEX)
-        inputs = pl.tile.gather_row(inputs, source, [row, 0], [token, 0], [1, HEAD_DIM])
-        cosine = pl.tile.gather_row(cosine, cos_source, [row, 0], [token, 0], [1, 32])
-        sine = pl.tile.gather_row(sine, sin_source, [row, 0], [token, 0], [1, 32])
     raw = pl.reshape(inputs, [ROW_TILE * HEAD_DIM])
-    cos = pl.reshape(cosine, [ROW_TILE * 64])
-    sin = pl.reshape(sine, [ROW_TILE * 64])
+    cos = pl.reshape(cosine, [ROW_TILE * 32])
+    sin = pl.reshape(sine, [ROW_TILE * 32])
     payload, factors = _postprocess(raw, weight, cos, sin, rows)
     payload_rows = pl.reshape(payload, [ROW_TILE, HEAD_DIM])
     factor_bytes = pl.reinterpret_view(factors, pl.UINT8)
     factor_rows = pl.reshape(factor_bytes, [ROW_TILE, HEAD_DIM // 16])
-    for row in pl.range(rows):
+    for (row,) in pl.while_(init_values=(pl.cast(0, pl.INDEX),)):
+        pl.cond(row < rows)
         slot = pl.tile.read(targets, [row])
-        value = pl.tile.slice(payload_rows, [1, HEAD_DIM], [row, 0])
-        factor = pl.tile.slice(factor_rows, [1, HEAD_DIM // 16], [row, 0])
-        pl.store(value, [slot, 0], cache)
-        pl.store(factor, [slot, HEAD_DIM], cache)
+        count = 1
+        scanning = True
+        while row + count < rows and scanning:
+            next_slot = pl.tile.read(targets, [row + count])
+            if next_slot == slot + count:
+                count = count + 1
+            else:
+                scanning = False
+        value = pl.tile.slice(payload_rows, [ROW_TILE, HEAD_DIM], [row, 0], valid_shape=[count, HEAD_DIM])
+        factor = pl.tile.slice(factor_rows, [ROW_TILE, HEAD_DIM // 16], [row, 0], valid_shape=[count, HEAD_DIM // 16])
+        _payload = pl.store(value, [slot, 0], cache)
+        _scales = pl.store(factor, [slot, HEAD_DIM], cache)
+        next_row = row + count
+        final_row = pl.yield_(next_row)
     return cache
 
 
@@ -177,29 +175,53 @@ def norm_rope_publish(
     workers = pl.tile.get_block_num()
     gamma = pl.load(weight, [0], [HEAD_DIM], target_memory=pl.Mem.Vec)
     inputs = pl.tile.create([ROW_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.Mem.Vec)
-    cosv = pl.tile.full([ROW_TILE, 64], dtype=pl.FP32, value=0.0)
-    sinv = pl.tile.full([ROW_TILE, 64], dtype=pl.FP32, value=0.0)
+    cosv = pl.tile.create([ROW_TILE, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+    sinv = pl.tile.create([ROW_TILE, 32], dtype=pl.FP32, target_memory=pl.Mem.Vec)
     targets = pl.tile.create([ROW_TILE], dtype=pl.INT64, target_memory=pl.Mem.Vec)
-    tokens = pl.tile.create([ROW_TILE], dtype=pl.INT64, target_memory=pl.Mem.Vec)
     pending = 0
     for base in pl.range(0, num_tokens, SLOT_TILE):
         count = pl.min(SLOT_TILE, num_tokens - base)
         slot_tile = pl.load(slots, [base], [SLOT_TILE], valid_shape=[count], target_memory=pl.Mem.Vec)
-        for lane in pl.range(count):
-            token = base + lane
+        lane = 0
+        while lane < count:
             slot = pl.tile.read(slot_tile, [lane])
+            accepted = False
             if slot >= 0:
                 unsigned_slot = pl.cast(slot, pl.UINT64)
                 owner = (unsigned_slot // PAGE_SIZE) % pl.cast(workers, pl.UINT64)
-                if owner == pl.cast(worker, pl.UINT64):
-                    _token = pl.tile.write(tokens, [pending], pl.cast(token, pl.INT64))
-                    _target = pl.tile.write(targets, [pending], slot)
-                    pending = pending + 1
-                    if pending == ROW_TILE:
-                        cache = _flush(
-                            source, cosine, sine, tokens, inputs, gamma, cosv, sinv, targets, ROW_TILE, cache
-                        )
-                        pending = 0
+                accepted = owner == pl.cast(worker, pl.UINT64)
+            if accepted:
+                run = 0
+                scanning = True
+                while lane + run < count and pending + run < ROW_TILE and scanning:
+                    target = pl.tile.read(slot_tile, [lane + run])
+                    owned = False
+                    if target >= 0:
+                        unsigned_target = pl.cast(target, pl.UINT64)
+                        target_owner = (unsigned_target // PAGE_SIZE) % pl.cast(workers, pl.UINT64)
+                        owned = target_owner == pl.cast(worker, pl.UINT64)
+                    if owned:
+                        _target = pl.tile.write(targets, [pending + run], target)
+                        run = run + 1
+                    else:
+                        scanning = False
+                token = base + lane
+                inputs = pl.tile.gather_row(
+                    inputs, source, [pending, 0], [token, 0], [ROW_TILE, HEAD_DIM], valid_shape=[run, HEAD_DIM]
+                )
+                cosv = pl.tile.gather_row(
+                    cosv, cosine, [pending, 0], [token, 0], [ROW_TILE, 32], valid_shape=[run, 32]
+                )
+                sinv = pl.tile.gather_row(
+                    sinv, sine, [pending, 0], [token, 0], [ROW_TILE, 32], valid_shape=[run, 32]
+                )
+                lane = lane + run
+                pending = pending + run
+                if pending == ROW_TILE:
+                    cache = _flush(inputs, gamma, cosv, sinv, targets, ROW_TILE, cache)
+                    pending = 0
+            else:
+                lane = lane + 1
     if pending > 0:
-        cache = _flush(source, cosine, sine, tokens, inputs, gamma, cosv, sinv, targets, pending, cache)
+        cache = _flush(inputs, gamma, cosv, sinv, targets, pending, cache)
     return cache
