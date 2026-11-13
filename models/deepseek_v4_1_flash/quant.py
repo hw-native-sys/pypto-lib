@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """V4.1 device and host quantization, checkpoint layouts, and weight fixtures."""
 
+from collections.abc import Callable
+
 import torch
 import pypto.language as pl
 
@@ -488,3 +490,40 @@ def unpack_quantized_cache(
     if not fp4:
         payload = payload.view(torch.float8_e4m3fn)
     return payload, cache[..., width:].view(torch.bfloat16)
+
+
+def _copy_cache_rows(destination: torch.Tensor, source: torch.Tensor, rows: torch.Tensor) -> None:
+    destination_rows = destination.flatten(0, 1).view(torch.uint8)
+    source_rows = source.contiguous().view(torch.uint8).reshape_as(destination_rows[rows])
+    destination_rows[rows] = source_rows
+
+
+def _publish_quantized_cache(
+    payload: torch.Tensor,
+    scale: torch.Tensor,
+    values: torch.Tensor,
+    slots: torch.Tensor,
+    quantize: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize and replace only mapped rows in a packed cache pair."""
+    updated_payload = payload.clone()
+    updated_scale = scale.clone()
+    valid = slots >= 0
+    rows = slots[valid].to(torch.int64)
+    if rows.numel():
+        row_payload, row_scale = quantize(values[valid])
+        _copy_cache_rows(updated_payload, row_payload, rows)
+        _copy_cache_rows(updated_scale, row_scale, rows)
+    return updated_payload, updated_scale
+
+
+def packed_cache_compare(payload_compare, scale_compare, *, fp4: bool):
+    """Compare explicit packed fields with independent numerical and mapped-row gates."""
+
+    def compare(actual, expected, **kwargs):
+        actual_payload, actual_scale = unpack_quantized_cache(actual, fp4)
+        expected_payload, expected_scale = unpack_quantized_cache(expected, fp4)
+        payload_ok, payload_detail = payload_compare(actual_payload, expected_payload, **kwargs)
+        scale_ok, scale_detail = scale_compare(actual_scale, expected_scale, **kwargs)
+        return payload_ok and scale_ok, "\n".join(filter(None, (payload_detail, scale_detail)))
+    return compare

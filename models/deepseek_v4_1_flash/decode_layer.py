@@ -11,7 +11,7 @@
 """DeepSeek-V4.1 decode attention and MoE block."""
 
 
-from utils import packed_cache_compare
+from quant import packed_cache_compare
 
 import pypto.language as pl
 
@@ -491,7 +491,6 @@ from decode_c2a_full import golden_c2a
 from decode_swa import golden_swa
 from gate import golden_gate_reference as gate
 from hc import golden_hc_mixes, golden_hc_post, golden_hc_collapse, golden_hc_norm
-from sparse_attention import golden_swa_attention
 
 
 class DecodeLayerKind(IntEnum):
@@ -667,7 +666,7 @@ def golden_decode_layer(
             "attention_output": torch.empty_like(x_hc[:, 0], dtype=torch.bfloat16),
             "num_tokens": x_hc.shape[0],
         })
-        golden_swa(attention_tensors, reference=golden_swa_attention)
+        golden_swa(attention_tensors)
         for name in (
             "compressed_cache", "compressed_cache_scale", "index_cache", "index_cache_scale", "state_cache",
             "topk_indices", "candidate_mask", "pool_block_ids", "pool_block_counts",

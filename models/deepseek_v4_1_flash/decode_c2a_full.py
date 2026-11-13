@@ -10,7 +10,7 @@
 """C2A full decode attention with HC."""
 
 
-from utils import packed_cache_compare
+from quant import packed_cache_compare
 
 import pypto.language as pl
 
@@ -359,11 +359,11 @@ def golden_c2a(tensors, mode="full"):
     from rmsnorm import golden_rms_norm
     from qkv_proj_rope import golden_qkv_proj_rope, golden_rope_tail
     from decode_indexer import golden_c2a_index
-    from sparse_attention import golden_selected_attention, KEY_TILE, PACKED_KEY_TILE
+    from sparse_attention import golden_gather_sparse_attention
     from o_proj import golden_o_proj
     from functools import partial
-    from quant import quantize_mxfp8_cache, quantize_mxfp4_cache, dequantize_mxfp4_cache, unpack_bf16_nz
-    from utils import _publish_quantized_cache
+    from quant import quantize_mxfp8_cache, quantize_mxfp4_cache, unpack_bf16_nz
+    from quant import _publish_quantized_cache
 
     t = dict(tensors)
     t["window_cache"], t["window_cache_scale"] = unpack_quantized_cache(tensors["window_cache"], False, head_dim=tensors["kv_norm_weight"].numel())
@@ -378,7 +378,6 @@ def golden_c2a(tensors, mode="full"):
     else:
         x = t["x"]
     t["x"] = x
-    head_dim = t["window_cache"].shape[-1]
 
     # Query/KV projection and rotary embedding.
     q, kv, qr = golden_qkv_proj_rope(
@@ -428,15 +427,11 @@ def golden_c2a(tensors, mode="full"):
         topk_indices = t["compressed_indices"]
 
     # Sparse attention over window and compressed rows.
-    window_values = window_cache.float()
-    window_scales = window_cache_scale.float().repeat_interleave(MX_GROUP, -1)
-    window_values = (window_values * window_scales).reshape(-1, head_dim)
-    compressed_values = dequantize_mxfp4_cache(compressed_cache, compressed_cache_scale, CMP_GROUP, "bf16")
-    compressed_values = compressed_values.flatten(0, -2)
-    attended = golden_selected_attention(
-        q, window_values.reshape(-1, 1, 1, head_dim), t["window_indices"],
-        compressed_values.reshape(-1, 1, 1, head_dim), topk_indices, t["attn_sink"],
-        key_tile=128 if q.shape[1] == 64 else KEY_TILE if q.shape[0] > 12 else PACKED_KEY_TILE,
+    packed_window = pack_quantized_cache(window_cache, window_cache_scale)
+    packed_compressed = pack_quantized_cache(compressed_cache, compressed_cache_scale)
+    attended = golden_gather_sparse_attention(
+        q, t["window_indices"], packed_window, topk_indices, packed_compressed, t["attn_sink"],
+        compressed_keys=INDEX_TOPK,
     )
 
     # Inverse RoPE and output projection.
@@ -446,8 +441,8 @@ def golden_c2a(tensors, mode="full"):
     )
 
     for name, value in (
-        ("window_cache", pack_quantized_cache(window_cache, window_cache_scale)),
-        ("compressed_cache", pack_quantized_cache(compressed_cache, compressed_cache_scale)),
+        ("window_cache", packed_window),
+        ("compressed_cache", packed_compressed),
         ("index_cache", index_cache), ("index_cache_scale", index_cache_scale),
         ("state_cache", state_cache), ("topk_indices", topk_indices), ("candidate_mask", None),
         ("pool_block_ids", None), ("pool_block_counts", None),

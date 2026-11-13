@@ -8,8 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Metadata lowering and shared validation helpers for prefill and decode."""
 
-from collections.abc import Callable
-
 import torch
 
 
@@ -226,74 +224,6 @@ def upload_forward_inputs(runtime, specs, parameters, ranks, host_inputs, upload
                 runtime.copy_to(handle.data_ptr, upload_buffer.data_ptr(), size, dst_offset=offset, worker_id=rank)
         arguments.append(StackedDeviceTensor(shards, tuple(spec.shape), tuple(range(ranks))))
     return arguments
-
-
-def _copy_cache_rows(destination: torch.Tensor, source: torch.Tensor, rows: torch.Tensor) -> None:
-    destination_rows = destination.flatten(0, 1).view(torch.uint8)
-    source_rows = source.contiguous().view(torch.uint8).reshape_as(destination_rows[rows])
-    destination_rows[rows] = source_rows
-
-
-def _publish_quantized_cache(
-    payload: torch.Tensor,
-    scale: torch.Tensor,
-    values: torch.Tensor,
-    slots: torch.Tensor,
-    quantize: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize and replace only mapped rows in a packed cache pair."""
-    updated_payload = payload.clone()
-    updated_scale = scale.clone()
-    valid = slots >= 0
-    rows = slots[valid].to(torch.int64)
-    if rows.numel():
-        row_payload, row_scale = quantize(values[valid])
-        _copy_cache_rows(updated_payload, row_payload, rows)
-        _copy_cache_rows(updated_scale, row_scale, rows)
-    return updated_payload, updated_scale
-
-
-DECODE_CACHE_NAMES = {
-    "window_cache_pool": "window_cache",
-    "compressed_cache_pool": "compressed_cache",
-    "index_cache_pool": "index_cache", "index_cache_scale_pool": "index_scales",
-    "state_cache_pool": "state_cache",
-}
-
-
-def decode_cache_views(cache_state):
-    """Alias contiguous prefill storage as decode pools by flattening source/page axes."""
-    return {target: cache_state[source].flatten(0, 1) for target, source in DECODE_CACHE_NAMES.items()}
-
-
-def prepare_decode_inputs(values):
-    """Lower one request's current prefill metadata to the decode input contract."""
-    embedding = values["embedding"].float()
-    result = {
-        "x_hc": embedding[:, None, :].expand(-1, M.hc_mult, -1).contiguous(),
-        "pre_mix": values["initial_pre"], "engram_lookup": values["engram_lookup"],
-        "logit_row_indices": values["logit_rows"],
-    }
-    # Prefill metadata has encoder/decoder stages; decode starts from encoder rows.
-    for name in ("window_slots", "window_indices", "token_to_req_indices", "position_ids", "query_start_loc"):
-        result[name] = values[name][0].contiguous()
-    for name in ("freqs_cos", "freqs_sin", "c2a_compressed_slots", "c1a_compressed_slots",
-                 "c2a_index_block_table", "c1a_index_block_table", "state_block_table"):
-        result[name] = values[name]
-    return result
-
-
-def packed_cache_compare(payload_compare, scale_compare, *, fp4: bool):
-    """Compare explicit packed fields with independent numerical and mapped-row gates."""
-    from quant import unpack_quantized_cache
-
-    def compare(actual, expected, **kwargs):
-        actual_payload, actual_scale = unpack_quantized_cache(actual, fp4)
-        expected_payload, expected_scale = unpack_quantized_cache(expected, fp4)
-        payload_ok, payload_detail = payload_compare(actual_payload, expected_payload, **kwargs)
-        scale_ok, scale_detail = scale_compare(actual_scale, expected_scale, **kwargs)
-        return payload_ok and scale_ok, "\n".join(filter(None, (payload_detail, scale_detail)))
-    return compare
 
 
 def prefill_head_tail_rows(query_lengths, cp_size):

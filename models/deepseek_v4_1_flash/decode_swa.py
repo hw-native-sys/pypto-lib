@@ -10,14 +10,14 @@
 """SWA decode attention with HC."""
 
 
-from utils import packed_cache_compare
+from quant import packed_cache_compare
 
 import pypto.language as pl
 
 from quant import pack_quantized_cache, unpack_quantized_cache
 
-from config import FLASH as M, T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_BYTES
-from sparse_attention import swa_attention_partial
+from config import FLASH as M, T_DYN, ORI_BLOCKS_DYN, WINDOW_CACHE_BYTES, DECODE_BATCH
+from sparse_attention import gather_sparse_attention
 from o_proj import o_proj_hc_post
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from hc import hc_pre, hc_normalize, zero_bf16_padding
@@ -110,7 +110,10 @@ def decode_swa(
         num_tokens, x_ready,
     )
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    swa_attention_partial(q, window_cache, window_indices, attn_sink, attended, num_tokens, cache_ready)
+    gather_sparse_attention(
+        q, window_indices, window_cache, window_indices, window_cache,
+        attn_sink, attended, num_tokens, cache_ready, compressed_keys=0,
+    )
     o_proj_hc_post(
         attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
         x_hc, post_mix, residual_mix, attention_hidden, num_tokens,
@@ -225,10 +228,14 @@ def build_swa_specs(args):
     from golden import ScalarSpec, TensorSpec
     import torch
     from functools import partial
-    from config import DECODE_BATCH
-    from utils import packed_query_lengths
-    from sparse_attention import SWA_INPUT_NAMES, make_swa_inputs, make_packed_swa_inputs
+    from utils import packed_query_lengths, window_metadata
+    from quant import quantize_mxfp8_cache
+    import math
+    from quant import pack_fp8_nz, pack_mx_b_scale
+    from quant import quantize_mxfp8_upward_reference, quantize_grouped_mxfp8_weight
 
+    if args.requests < 1 or args.tokens < 1:
+        raise ValueError("requests and tokens must be positive")
     if getattr(args, "dp", 1) != 1:
         raise ValueError("decode SWA specs describe one device")
     packed = getattr(args, "start_pos", None) is not None or args.tokens > DECODE_BATCH
@@ -245,45 +252,113 @@ def build_swa_specs(args):
         pages = 1 + sum((p + n + 128) // 128 - max(0, p - 127) // 128 + 1 for p, n in zip(prefixes, lengths))
     else:
         pages = args.tokens + 1
-    leaf_shapes = (
-        [args.tokens, D], [D, Q_LORA], [D // 32, Q_LORA], [Q_LORA],
-        [Q_LORA, LOCAL_H * HEAD_DIM], [Q_LORA // 32, LOCAL_H * HEAD_DIM],
-        [D, HEAD_DIM], [D // 32, HEAD_DIM], [HEAD_DIM], [LOCAL_H],
-        [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA],
-        [LOCAL_O_WIDTH, D], [LOCAL_O_WIDTH // 32, D],
-        [args.tokens, ROPE_DIM // 2], [args.tokens, ROPE_DIM // 2], [args.tokens], [args.tokens, 128],
-        [pages, 128, 1, HEAD_DIM], [pages, 128, 1, HEAD_DIM // 32],
-    )
     bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
-    dtypes = (bf, fp, mx, bf, fp, mx, fp, mx, bf, torch.float32, fp, mx, fp, mx,
-              torch.float32, torch.float32, torch.int64, torch.int32, fp, bf)
+    leaf_specs = (
+        ("wq_a", [D, Q_LORA], fp),
+        ("wq_a_scale", [D // 32, Q_LORA], mx),
+        ("q_norm_weight", [Q_LORA], bf),
+        ("wq_b", [Q_LORA, LOCAL_H * HEAD_DIM], fp),
+        ("wq_b_scale", [Q_LORA // 32, LOCAL_H * HEAD_DIM], mx),
+        ("wkv", [D, HEAD_DIM], fp),
+        ("wkv_scale", [D // 32, HEAD_DIM], mx),
+        ("kv_norm_weight", [HEAD_DIM], bf),
+        ("attn_sink", [LOCAL_H], torch.float32),
+        ("wo_a", [LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], fp),
+        ("wo_a_scale", [LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], mx),
+        ("wo_b", [LOCAL_O_WIDTH, D], fp),
+        ("wo_b_scale", [LOCAL_O_WIDTH // 32, D], mx),
+        ("rope_cos", [args.tokens, ROPE_DIM // 2], torch.float32),
+        ("rope_sin", [args.tokens, ROPE_DIM // 2], torch.float32),
+        ("window_slots", [args.tokens], torch.int64),
+        ("window_indices", [args.tokens, 128], torch.int32),
+        ("window_cache", [pages, 128, 1, WINDOW_CACHE_BYTES], torch.uint8),
+    )
     values = None
     if not getattr(args, "compile_only", False) and not getattr(args, "golden_data", None):
+        gen = torch.Generator().manual_seed(args.seed)
+
+        def rand(*shape):
+            return torch.randn(*shape, generator=gen)
+
+        def weight(k, n):
+            payload, scales = quantize_mxfp8_upward_reference(rand(n, k) / math.sqrt(k))
+            return payload.T.contiguous(), pack_mx_b_scale(scales.T.contiguous()).view(torch.float8_e8m0fnu)
+
+        qa, qas = weight(D, Q_LORA)
+        qb, qbs = weight(Q_LORA, LOCAL_H * HEAD_DIM)
+        kv, kvs = weight(D, HEAD_DIM)
+        ob, obs = weight(LOCAL_O_WIDTH, D)
+        values = dict(
+            wq_a=pack_fp8_nz(qa), wq_a_scale=qas,
+            q_norm_weight=(rand(Q_LORA) * 0.1 + 1).to(torch.bfloat16),
+            wq_b=pack_fp8_nz(qb), wq_b_scale=qbs,
+            wkv=pack_fp8_nz(kv), wkv_scale=kvs,
+            kv_norm_weight=(rand(HEAD_DIM) * 0.1 + 1).to(torch.bfloat16), attn_sink=rand(LOCAL_H) * 2,
+            wo_b=pack_fp8_nz(ob), wo_b_scale=obs,
+        )
+        wo_a = (rand(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN) / math.sqrt(O_GROUP_IN)).to(torch.bfloat16)
+        values["wo_a"], values["wo_a_scale"] = quantize_grouped_mxfp8_weight(wo_a)
+        cache_gen = torch.Generator().manual_seed(args.seed + 1000)
         if packed:
-            values = make_packed_swa_inputs(
-                args.tokens, args.requests, args.seed, args.case,
-                start_pos=getattr(args, "start_pos", None), query_lens=getattr(args, "query_lens", None),
-            )
+            input_lengths = torch.tensor(lengths, dtype=torch.int64)
+            prefix_tensor = torch.tensor(prefixes, dtype=torch.int64)
+            ids = torch.repeat_interleave(torch.arange(args.requests), input_lengths)
+            positions = torch.cat([torch.arange(p, p + n) for p, n in zip(prefixes, lengths)])
+            logical_capacity = int((prefix_tensor + input_lengths + 129).max()) // 128 + 1
+            table = torch.full((args.requests, logical_capacity), -1, dtype=torch.int32)
+            mappings = []
+            for request, (prefix, length) in enumerate(zip(prefixes, lengths)):
+                start = max(0, prefix - 127) // 128
+                end = (prefix + length + 128) // 128
+                mappings.extend((request, block) for block in range(start, end + 1))
+            physical_pages = torch.randperm(pages, generator=cache_gen)[:len(mappings)]
+            for (request, block), page in zip(mappings, physical_pages):
+                table[request, block] = page
+            slots, indices, _ = window_metadata(positions, ids, table)
+            if slots.unique().numel() != args.tokens:
+                raise ValueError("SWA fixture slots must be unique")
+            for row, (request, position) in enumerate(zip(ids.tolist(), positions.tolist())):
+                history = range(max(0, position - 127), position + 1)
+                expected = [int(table[request, p // 128]) * 128 + p % 128 for p in history]
+                if indices[row, :len(expected)].tolist() != expected or not (indices[row, len(expected):] == -1).all():
+                    raise ValueError("SWA fixture indices do not match the paged window")
         else:
-            values = make_swa_inputs(args.tokens, args.seed)
-            if args.case == "masked":
-                values["window_slots"].fill_(-1)
-                values["window_indices"].fill_(-1)
-            elif args.case == "zero":
-                values["x"].zero_()
-                values["window_cache"].view(torch.uint8).zero_()
-            elif args.case == "sink":
-                values["attn_sink"].fill_(1000)
+            positions = torch.full((args.tokens,), 127, dtype=torch.int64)
+            if args.tokens > 1:
+                positions[:min(args.tokens, 6)] = torch.tensor([0, 1, 63, 127, 128, 1048575])[:min(args.tokens, 6)]
+            physical_pages = torch.randperm(pages, generator=cache_gen)[:args.tokens]
+            slots = physical_pages.long() * 128 + positions.remainder(128)
+            indices = torch.full((args.tokens, 128), -1, dtype=torch.int32)
+            for row, position in enumerate(positions.tolist()):
+                length = min(position + 1, 128)
+                logical = torch.arange(position - length + 1, position + 1)
+                indices[row, :length] = (physical_pages[row] * 128 + logical.remainder(128)).to(torch.int32)
+        frequency = 10000.0 ** (-torch.arange(0, ROPE_DIM, 2).float() / ROPE_DIM)
+        angles = positions.float()[:, None] * frequency
+        cache_values = torch.randn(pages, 128, 1, HEAD_DIM, generator=cache_gen).bfloat16()
+        cache, scales = quantize_mxfp8_cache(cache_values)
+        values.update(
+            rope_cos=angles.cos(), rope_sin=angles.sin(), window_slots=slots, window_indices=indices,
+            window_cache=cache, window_cache_scale=scales,
+        )
+        if args.case == "shuffle":
+            order = torch.randperm(args.tokens, generator=cache_gen)
+            for name in ("rope_cos", "rope_sin", "window_slots", "window_indices"):
+                values[name] = values[name][order].contiguous()
+        if args.case == "masked":
+            values["window_slots"].fill_(-1)
+            values["window_indices"].fill_(-1)
+        elif args.case == "zero":
+            values["window_cache"].view(torch.uint8).zero_()
+        elif args.case == "sink":
+            values["attn_sink"].fill_(1000)
     capacity = getattr(args, "capacity", args.tokens)
     if capacity < args.tokens:
         raise ValueError("capacity must cover the scheduled tokens")
     row_metadata = {"rope_cos", "rope_sin", "window_slots", "window_indices"}
     specs = []
-    for name, shape, dtype in zip(SWA_INPUT_NAMES, leaf_shapes, dtypes):
-        if name in ("x", "window_cache_scale"):
-            continue
+    for name, shape, dtype in leaf_specs:
         if name == "window_cache":
-            shape, dtype = [pages, 128, 1, WINDOW_CACHE_BYTES], torch.uint8
             cache = None if values is None else pack_quantized_cache(values[name], values["window_cache_scale"])
             initialize = None if cache is None else partial(torch.clone, cache)
         else:
@@ -331,10 +406,14 @@ def build_swa_specs(args):
     return [by_name[name] for name in l3_decode_swa.param_names]
 
 
-def golden_swa(tensors, *, reference=None):
+def golden_swa(tensors):
     """Compose HC, normalization, QKV, attention and output references."""
     import torch
-    from sparse_attention import SWA_INPUT_NAMES, swa_official_reference
+    from sparse_attention import golden_gather_sparse_attention
+    from qkv_proj_rope import golden_qkv_proj_rope
+    from o_proj import golden_o_proj
+    from quant import quantize_mxfp8_cache
+    from quant import _publish_quantized_cache
     from hc import golden_hc_collapse, golden_hc_norm, golden_hc_mixes, golden_hc_post
 
     fields = dict(tensors)
@@ -349,23 +428,29 @@ def golden_swa(tensors, *, reference=None):
     tensors["attention_pre_mix"].copy_(pre_mix)
     collapsed = golden_hc_collapse(tensors["x_hc"], tensors["incoming_pre_mix"]).to(torch.bfloat16)
     normalized = golden_hc_norm(collapsed[:active], tensors["attn_norm_weight"])
-    if reference is None:
-        inputs = {name: normalized if name == "x" else fields[name] for name in SWA_INPUT_NAMES}
+    if active:
+        inputs = dict(fields, x=normalized)
         for name in ("rope_cos", "rope_sin", "window_slots", "window_indices"):
             inputs[name] = inputs[name][:active]
-        cache_rows = tensors["window_cache"].shape[0] * 128
-        shared_cache = tensors["attn_sink"].numel() != 64 and active >= 32 and cache_rows <= active * 128
-        partial, cache, scale = swa_official_reference(inputs, shared_cache=shared_cache)
-        tensors["attention_output"][:active].copy_(partial.bfloat16())
-        tensors["window_cache"].copy_(pack_quantized_cache(cache, scale))
-    else:
-        import inspect
-
-        parameters = inspect.signature(reference).parameters
-        inputs = {name: normalized if name == "x" else fields[name] for name in parameters}
-        computed = reference(**inputs)
-        tensors["attention_output"][:active].copy_(computed["output"])
-        tensors["window_cache"].copy_(pack_quantized_cache(computed["window_cache"], computed["window_cache_scale"]))
+        query, window_kv, _ = golden_qkv_proj_rope(
+            inputs["x"], inputs["wq_a"], inputs["wq_a_scale"], inputs["q_norm_weight"],
+            inputs["wq_b"], inputs["wq_b_scale"], inputs["wkv"], inputs["wkv_scale"], inputs["kv_norm_weight"],
+            inputs["rope_cos"], inputs["rope_sin"], sequential_query=True,
+        )
+        cache, scale = _publish_quantized_cache(
+            inputs["window_cache"], inputs["window_cache_scale"], window_kv, inputs["window_slots"], quantize_mxfp8_cache,
+        )
+        packed_cache = pack_quantized_cache(cache, scale)
+        indices = inputs["window_indices"]
+        attended = golden_gather_sparse_attention(
+            query, indices, packed_cache, indices, packed_cache, inputs["attn_sink"], compressed_keys=0,
+        )
+        projected = golden_o_proj(
+            attended, inputs["rope_cos"], inputs["rope_sin"], inputs["wo_a"], inputs["wo_b"], inputs["wo_b_scale"],
+            wo_a_scale=inputs["wo_a_scale"], sequential_projection=True,
+        )
+        tensors["attention_output"][:active].copy_(projected)
+        tensors["window_cache"].copy_(packed_cache)
     tensors["attention_hidden"].zero_()
     tensors["attention_output"][active:].zero_()
     if active:

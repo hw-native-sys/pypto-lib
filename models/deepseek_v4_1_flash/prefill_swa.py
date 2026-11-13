@@ -17,7 +17,7 @@ from config import (
     FLASH as M, RANKS_DYN, LOCAL_T_DYN, T_DYN, ORI_BLOCKS_DYN,
     CP_SIZE, PREFILL_MAX_TOKENS, WINDOW_CACHE_BYTES,
 )
-from sparse_attention import swa_attention_partial
+from sparse_attention import gather_sparse_attention
 from qkv_proj_rope import quantize_projection_input, q_proj_rope, kv_proj, window_publish
 from o_proj import o_proj_hc_post, retire_prefill_signals
 from hc import hc_pre, hc_normalize, zero_bf16_padding
@@ -146,7 +146,10 @@ def prefill_swa(
             )
             attended = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             attention_ready = pl.system.task_dummy(deps=[stage_tid, kv_ready])
-            swa_attention_partial(q, window_cache, chunk_window_indices, attn_sink, attended, active, attention_ready)
+            gather_sparse_attention(
+                q, chunk_window_indices, window_cache, chunk_window_indices, window_cache,
+                attn_sink, attended, active, attention_ready, compressed_keys=0,
+            )
             _chunk_output, projection_done = o_proj_hc_post(
                 attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
                 hc_input[start:start + active, :, :], post_mix[start:start + active, :],
@@ -403,7 +406,10 @@ def prefill_swa_cp(
             )
             attended = pl.create_tensor([Q_TILE, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
             attention_ready = pl.system.task_dummy(deps=[stage_tid, kv_ready])
-            swa_attention_partial(q, window_cache, chunk_window_indices, attn_sink, attended, active, attention_ready)
+            gather_sparse_attention(
+                q, chunk_window_indices, window_cache, chunk_window_indices, window_cache,
+                attn_sink, attended, active, attention_ready, compressed_keys=0,
+            )
             _chunk_output, projection_done = o_proj_hc_post(
                 attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_rope_cos, chunk_rope_sin,
                 hc_input[start:start + active, :, :], post_mix[start:start + active, :],
@@ -570,12 +576,19 @@ def l3_prefill_swa_cp(
 
 def build_swa_specs(args, entry):
     """Build independent DP request batches and optional single-request CP shards."""
+    import math
+
     import torch
     from golden import ScalarSpec, TensorSpec
     from hc import make_hc_inputs
-    from quant import pack_quantized_cache
-    from sparse_attention import make_packed_swa_inputs
-    from utils import prefill_head_tail_rows, prefill_batch_layout, prefill_fixture_lengths, prefill_window_pages
+    from quant import (
+        pack_fp8_nz, pack_mx_b_scale, pack_quantized_cache,
+        quantize_mxfp8_cache, quantize_mxfp8_upward_reference, quantize_grouped_mxfp8_weight,
+    )
+    from utils import (
+        prefill_head_tail_rows, prefill_batch_layout, prefill_fixture_lengths, prefill_window_pages,
+        window_metadata,
+    )
 
     query_lengths, starts = prefill_batch_layout(args)
     ranks = CP_SIZE * args.dp
@@ -598,9 +611,59 @@ def build_swa_specs(args, entry):
                 seed = args.seed + dp_rank * CP_SIZE
                 case = "mixed" if args.case == "normal" else args.case
                 lengths = fixture_lengths[dp_rank]
-                inputs = make_packed_swa_inputs(tokens, len(lengths), seed, case, starts[dp_rank], lengths)
-                inputs.pop("x")
-                inputs["window_cache"] = pack_quantized_cache(inputs["window_cache"], inputs.pop("window_cache_scale"))
+                if len(lengths) < 1 or tokens < 1:
+                    raise ValueError('requests and tokens must be positive')
+                gen = torch.Generator().manual_seed(seed)
+
+                def rand(*shape):
+                    return torch.randn(*shape, generator=gen)
+
+                def weight(k, n):
+                    payload, scales = quantize_mxfp8_upward_reference(rand(n, k) / math.sqrt(k))
+                    return (payload.T.contiguous(), pack_mx_b_scale(scales.T.contiguous()).view(torch.float8_e8m0fnu))
+                qa, qas = weight(D, Q_LORA)
+                qb, qbs = weight(Q_LORA, LOCAL_H * HEAD_DIM)
+                kv, kvs = weight(D, HEAD_DIM)
+                ob, obs = weight(LOCAL_O_WIDTH, D)
+                qa = pack_fp8_nz(qa)
+                qb = pack_fp8_nz(qb)
+                kv = pack_fp8_nz(kv)
+                ob = pack_fp8_nz(ob)
+                inputs = dict(
+                    wq_a=qa, wq_a_scale=qas, q_norm_weight=(rand(Q_LORA) * 0.1 + 1).to(torch.bfloat16),
+                    wq_b=qb, wq_b_scale=qbs,
+                    wkv=kv, wkv_scale=kvs, kv_norm_weight=(rand(HEAD_DIM) * 0.1 + 1).to(torch.bfloat16),
+                    attn_sink=rand(LOCAL_H) * 2,
+                    wo_b=ob, wo_b_scale=obs,
+                )
+                wo_a = (rand(LOCAL_O_GROUPS, O_LORA, O_GROUP_IN) / math.sqrt(O_GROUP_IN)).to(torch.bfloat16)
+                inputs['wo_a'], inputs['wo_a_scale'] = quantize_grouped_mxfp8_weight(wo_a)
+                gen = torch.Generator().manual_seed(seed + 1000)
+                input_lengths = torch.tensor(lengths, dtype=torch.int64)
+                prefixes = torch.tensor(starts[dp_rank], dtype=torch.int64)
+                ids = torch.repeat_interleave(torch.arange(len(lengths)), input_lengths)
+                positions = torch.cat([torch.arange(int(p), int(p + n)) for p, n in zip(prefixes, input_lengths)])
+                logical_capacity = int((prefixes + input_lengths + 129).max()) // 128 + 1
+                table = torch.full((len(lengths), logical_capacity), -1, dtype=torch.int32)
+                mappings = []
+                for request, (prefix, length) in enumerate(zip(prefixes.tolist(), input_lengths.tolist())):
+                    start = max(0, prefix - 127) // 128
+                    end = (prefix + length + 128) // 128
+                    mappings.extend(((request, block) for block in range(start, end + 1)))
+                input_pages = torch.randperm(len(mappings) + 1, generator=gen)[:len(mappings)]
+                for (request, block), page in zip(mappings, input_pages):
+                    table[request, block] = page
+                slots, indices, _ = window_metadata(positions, ids, table)
+                freq = 10000.0 ** (-torch.arange(0, ROPE_DIM, 2).float() / ROPE_DIM)
+                angles = positions.float()[:, None] * freq
+                cache_values = torch.randn(len(mappings) + 1, 128, 1, HEAD_DIM, generator=gen).bfloat16()
+                cache, scales = quantize_mxfp8_cache(cache_values)
+                inputs.update(
+                    rope_cos=angles.cos(), rope_sin=angles.sin(),
+                    window_slots=slots, window_indices=indices,
+                    window_cache=pack_quantized_cache(cache, scales),
+                )
+                print(f'[FIXTURE] tokens={tokens} requests={len(lengths)} lengths={lengths} prefixes={prefixes.tolist()}')
                 cache = inputs["window_cache"]
                 padding = cache.new_zeros((pages - cache.shape[0], *cache.shape[1:]))
                 inputs["window_cache"] = torch.cat((cache, padding))
@@ -623,7 +686,7 @@ def build_swa_specs(args, entry):
                     shard["q_token_count"] = torch.tensor([rows.numel()], dtype=torch.int32)
                     for source, target, fill in (
                         ("hc_input", "hc_input", 17.0), ("hc_pre_mix", "hc_pre_mix", 0),
-                        ("kv_rope_cos", "q_rope_cos", 0), ("kv_rope_sin", "q_rope_sin", 0),
+                        ("kv_rope_cos", "q_rope_cos", float("nan")), ("kv_rope_sin", "q_rope_sin", float("nan")),
                         ("window_indices", "q_window_indices", -1),
                     ):
                         value = inputs[source].new_full((local_tokens, *inputs[source].shape[1:]), fill)
@@ -689,7 +752,11 @@ def golden_swa(tensors):
     import torch
     from hc import golden_hc_head_norm, golden_hc_mixes, golden_hc_post
     from quant import pack_quantized_cache, unpack_quantized_cache
-    from sparse_attention import swa_official_reference
+    from sparse_attention import golden_gather_sparse_attention
+    from qkv_proj_rope import golden_qkv_proj_rope
+    from o_proj import golden_o_proj
+    from quant import quantize_mxfp8_cache
+    from quant import _publish_quantized_cache
     from utils import prefill_head_tail_rows
 
     ranks, tokens = tensors["kv_hidden"].shape[:2]
@@ -722,8 +789,24 @@ def golden_swa(tensors):
                 window_slots=tensors["kv_write_slots"][base, :active], window_indices=window_indices[:active],
                 window_cache=cache, window_cache_scale=scale,
             )
-            partial, cache, scale = swa_official_reference(fields, shared_cache=LOCAL_H != 64)
-            attn_output[:active] = partial.bfloat16()
+            query, window_kv, _ = golden_qkv_proj_rope(
+                fields["x"], fields["wq_a"], fields["wq_a_scale"], fields["q_norm_weight"],
+                fields["wq_b"], fields["wq_b_scale"], fields["wkv"], fields["wkv_scale"], fields["kv_norm_weight"],
+                fields["rope_cos"], fields["rope_sin"], sequential_query=True,
+            )
+            cache, scale = _publish_quantized_cache(
+                fields["window_cache"], fields["window_cache_scale"], window_kv, fields["window_slots"], quantize_mxfp8_cache,
+            )
+            packed_cache = pack_quantized_cache(cache, scale)
+            indices = fields["window_indices"]
+            attended = golden_gather_sparse_attention(
+                query, indices, packed_cache, indices, packed_cache, fields["attn_sink"], compressed_keys=0,
+            )
+            projected = golden_o_proj(
+                attended, fields["rope_cos"], fields["rope_sin"], fields["wo_a"], fields["wo_b"], fields["wo_b_scale"],
+                wo_a_scale=fields["wo_a_scale"], sequential_projection=True,
+            )
+            attn_output[:active] = projected
         hc_output = golden_hc_post(attn_output, hc_input, post_mix, residual_mix)
         packed_cache = pack_quantized_cache(cache, scale)
         for cp_rank, rows in enumerate(row_groups):
@@ -741,7 +824,7 @@ if __name__ == "__main__":
 
     from config import SUPPORTED_CP_SIZES
     from golden import mapped_pool_ratio_allclose, ratio_allclose, run
-    from utils import packed_cache_compare
+    from quant import packed_cache_compare
     from pypto.ir import DistributedConfig
 
     from utils import parse_prefill_groups

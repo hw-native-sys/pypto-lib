@@ -1679,6 +1679,36 @@ def prepare_resident_inputs(
     return values
 
 
+DECODE_CACHE_NAMES = {
+    "window_cache_pool": "window_cache",
+    "compressed_cache_pool": "compressed_cache",
+    "index_cache_pool": "index_cache", "index_cache_scale_pool": "index_scales",
+    "state_cache_pool": "state_cache",
+}
+
+
+def decode_cache_views(cache_state):
+    """Alias contiguous prefill storage as decode pools by flattening source/page axes."""
+    return {target: cache_state[source].flatten(0, 1) for target, source in DECODE_CACHE_NAMES.items()}
+
+
+def prepare_decode_inputs(values):
+    """Lower one request's current prefill metadata to the decode input contract."""
+    embedding = values["embedding"].float()
+    result = {
+        "x_hc": embedding[:, None, :].expand(-1, M.hc_mult, -1).contiguous(),
+        "pre_mix": values["initial_pre"], "engram_lookup": values["engram_lookup"],
+        "logit_row_indices": values["logit_rows"],
+    }
+    # Prefill metadata has encoder/decoder stages; decode starts from encoder rows.
+    for name in ("window_slots", "window_indices", "token_to_req_indices", "position_ids", "query_start_loc"):
+        result[name] = values[name][0].contiguous()
+    for name in ("freqs_cos", "freqs_sin", "c2a_compressed_slots", "c1a_compressed_slots",
+                 "c2a_index_block_table", "c1a_index_block_table", "state_block_table"):
+        result[name] = values[name]
+    return result
+
+
 def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk_size=None, decode_compiled=None):
     """Generate one independent continuation per rank using resident checkpoint weights.
 
@@ -1692,7 +1722,6 @@ def generate(checkpoint, compiled, device_ids, prompts, max_new_tokens, *, chunk
 
     from tokenizers import Tokenizer
     from pypto.runtime import DeviceTensor
-    from utils import DECODE_CACHE_NAMES, decode_cache_views, prepare_decode_inputs
 
     # Validate the host-row Engram ABI and compilation shapes.
     parameters = compiled._get_metadata()[0]

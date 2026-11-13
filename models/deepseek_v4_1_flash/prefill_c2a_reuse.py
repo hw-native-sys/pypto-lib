@@ -10,80 +10,11 @@
 """C2A reuse prefill."""
 
 
-from config import FLASH as M, CP_SIZE, PREFILL_MAX_TOKENS, WINDOW_CACHE_BYTES, COMPRESSED_CACHE_BYTES
+from config import CP_SIZE, PREFILL_MAX_TOKENS
 from prefill_c1a_reuse import l3_prefill_c1a_reuse, l3_prefill_c1a_reuse_cp
 
 
-# model config
-LOCAL_H = M.num_attention_heads
-LOCAL_O_GROUPS = M.o_groups
-LOCAL_O_WIDTH = M.o_groups * M.o_lora_rank
 PREFILL_ATTN_RING_HEAP = (1024 * 1024 * 1024,) * 4
-
-D = M.hidden_size
-HEAD_DIM = M.head_dim
-ROPE_DIM = M.qk_rope_head_dim
-Q_LORA = M.q_lora_rank
-O_LORA = M.o_lora_rank
-O_GROUP_IN = M.num_attention_heads * M.head_dim // M.o_groups
-HC_MULT = M.hc_mult
-HC_DIM = M.hc_dim
-MIX_HC = M.mix_hc
-INDEX_TOPK = M.index_topk
-
-
-def build_c2a_reuse_specs(args, entry):
-    import torch
-    from golden import ScalarSpec, TensorSpec
-    from prefill_c2a_full import compressed_prefill_shapes, make_compressed_prefill_initializer
-
-    shapes = compressed_prefill_shapes(args, ratio=2)
-    ranks, tokens, local_tokens, pages, compressed_pages, table_pages, pool_capacity = shapes
-    initialize = make_compressed_prefill_initializer(args, entry, ratio=2, mode="reuse")
-    bf, fp, mx = torch.bfloat16, torch.float8_e4m3fn, torch.float8_e8m0fnu
-    specs = [
-        TensorSpec("hc_input", [ranks, local_tokens, HC_MULT, D], torch.float32),
-        TensorSpec("hc_pre_mix", [ranks, local_tokens, HC_MULT], torch.float32),
-        TensorSpec("hc_attn_fn", [ranks, MIX_HC, HC_DIM], torch.float32),
-        TensorSpec("hc_attn_scale", [ranks, 3], torch.float32),
-        TensorSpec("hc_attn_base", [ranks, MIX_HC], torch.float32),
-        TensorSpec("w_attn_norm", [ranks, D], bf),
-        TensorSpec("wq_a", [ranks, D, Q_LORA], fp),
-        TensorSpec("wq_a_scale", [ranks, D // 32, Q_LORA], mx),
-        TensorSpec("wq_norm", [ranks, Q_LORA], bf),
-        TensorSpec("wq_b", [ranks, Q_LORA, LOCAL_H * HEAD_DIM], fp),
-        TensorSpec("wq_b_scale", [ranks, Q_LORA // 32, LOCAL_H * HEAD_DIM], mx),
-        TensorSpec("wkv", [ranks, D, HEAD_DIM], fp),
-        TensorSpec("wkv_scale", [ranks, D // 32, HEAD_DIM], mx),
-        TensorSpec("wkv_norm", [ranks, HEAD_DIM], bf),
-        TensorSpec("attn_sink", [ranks, LOCAL_H], torch.float32),
-        TensorSpec("wo_a", [ranks, LOCAL_O_GROUPS, O_GROUP_IN, O_LORA], fp),
-        TensorSpec("wo_a_scale", [ranks, LOCAL_O_GROUPS, O_GROUP_IN // 32, O_LORA], mx),
-        TensorSpec("wo_b", [ranks, LOCAL_O_WIDTH, D], fp),
-        TensorSpec("wo_b_scale", [ranks, LOCAL_O_WIDTH // 32, D], mx),
-        TensorSpec("q_rope_cos", [ranks, local_tokens, ROPE_DIM // 2], torch.float32),
-        TensorSpec("q_rope_sin", [ranks, local_tokens, ROPE_DIM // 2], torch.float32),
-        TensorSpec("q_window_indices", [ranks, local_tokens, 128], torch.int32),
-        TensorSpec("q_compressed_indices", [ranks, local_tokens, INDEX_TOPK], torch.int32),
-        TensorSpec("q_token_count", [ranks, 1], torch.int32),
-        TensorSpec("kv_rope_cos", [ranks, tokens, ROPE_DIM // 2], torch.float32),
-        TensorSpec("kv_rope_sin", [ranks, tokens, ROPE_DIM // 2], torch.float32),
-        TensorSpec("kv_write_slots", [ranks, tokens], torch.int64),
-        TensorSpec("kv_token_count", [ranks, 1], torch.int32),
-        TensorSpec("window_cache", [ranks, pages, 128, 1, WINDOW_CACHE_BYTES], torch.uint8),
-        TensorSpec("compressed_cache", [ranks, compressed_pages, 128, 1, COMPRESSED_CACHE_BYTES], torch.uint8),
-        TensorSpec("kv_restore_indices", [ranks, tokens], torch.int32),
-        TensorSpec("kv_hidden", [ranks, tokens, D], bf),
-        TensorSpec("hc_output", [ranks, local_tokens, HC_MULT, D], torch.float32),
-        TensorSpec("hc_next_pre_mix", [ranks, local_tokens, HC_MULT], torch.float32),
-    ]
-    for spec in specs:
-        spec.resident = "stacked"
-        if spec.name not in ("kv_hidden", "hc_output", "hc_next_pre_mix"):
-            spec.init_value = lambda name=spec.name: initialize(name)
-    specs.append(ScalarSpec("attention_epoch", torch.int32, 1, compile_runtime=True, benchmark_step=None))
-    by_name = {spec.name: spec for spec in specs}
-    return [by_name[name] for name in entry.param_names]
 
 
 if __name__ == "__main__":
@@ -93,8 +24,8 @@ if __name__ == "__main__":
 
     from config import SUPPORTED_CP_SIZES
     from golden import mapped_pool_ratio_allclose, ratio_allclose, run
-    from prefill_c2a_full import golden_c2a_prefill
-    from utils import packed_cache_compare
+    from prefill_c2a_full import golden_c2a_prefill, build_c2a_specs
+    from quant import packed_cache_compare
     from pypto.ir import DistributedConfig
 
     from utils import parse_prefill_groups
@@ -130,7 +61,7 @@ if __name__ == "__main__":
     entry = l3_prefill_c1a_reuse if CP_SIZE == 1 else l3_prefill_c1a_reuse_cp
     result = run(
         fn=entry,
-        specs=build_c2a_reuse_specs(args, entry),
+        specs=build_c2a_specs(args, entry, mode="reuse"),
         golden_fn=functools.partial(golden_c2a_prefill, mode="reuse"),
         compile_only=args.compile_only,
         save_data=args.save_data,
