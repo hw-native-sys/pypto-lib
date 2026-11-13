@@ -193,6 +193,20 @@ def _unpack_fp4(payload: torch.Tensor) -> torch.Tensor:
     return FP4_VALUES.to(payload.device)[indices.to(torch.long)]
 
 
+def golden_index_query_fp4(value: torch.Tensor) -> torch.Tensor:
+    """Round FP32 query groups to E2M1, with midpoint ties away from zero."""
+    grouped = value.float().unflatten(-1, (-1, 32))
+    maximum = grouped.abs().amax(dim=-1, keepdim=True)
+    raw_scale = (maximum / 6.0).clamp_min(2.0**-126)
+    scale = torch.exp2(torch.ceil(torch.log2(raw_scale)))
+    normalized = grouped / scale
+    levels = FP4_VALUES[:8].to(value.device)
+    boundaries = (levels[:-1] + levels[1:]) * 0.5
+    indices = torch.bucketize(normalized.abs().contiguous(), boundaries, right=True)
+    rounded = torch.copysign(levels[indices], normalized) * scale
+    return rounded.flatten(-2)
+
+
 def quantize_mxfp4_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize output-major ``[..., N, K]`` weights to checkpoint MXFP4 carriers."""
     if weight.shape[-1] % MX_GROUP:

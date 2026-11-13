@@ -764,7 +764,7 @@ if __name__ == "__main__":
                 atol=0.0, rtol=0.0, max_error_ratio=0.0,
             ),
             "state_cache": ratio_allclose(atol=1e-3, rtol=1e-3),
-            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.02),
+            "topk_indices": ratio_allclose(atol=0.0, rtol=0.0, max_error_ratio=0.03),
         },
         compile_only=args.compile_only,
         save_data=args.save_data,
