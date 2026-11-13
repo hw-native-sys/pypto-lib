@@ -103,6 +103,7 @@ nav:
       - Debugging: debug-and-tune/debugging.md
       - Precision tuning: debug-and-tune/precision-tuning.md
       - Performance tuning: debug-and-tune/performance-tuning.md
+      - Window publication performance: debug-and-tune/window-publish-performance.md
       - Task-timing slots: debug-and-tune/task-timing-slots.md
       - Dependencies and scheduling: debug-and-tune/dependency-and-scheduling.md
       - Ring heap and scope stats: debug-and-tune/ring-heap-and-scope-stats.md
