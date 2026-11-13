@@ -594,7 +594,7 @@ def _rotate_quantize(
 
 
 @pl.jit.incore
-def compressor_pool_body(
+def _c2a_compress(
     kv_proj: pl.Tensor,
     score_proj: pl.Tensor,
     state_cache: pl.InOut[pl.Tensor],
@@ -785,7 +785,7 @@ def c2a_compressor_publish(
     native_flat = pl.reshape(native_state, [native_blocks * 4, STATE_WIDTH])
     cache_flat = pl.reshape(cache, [pl.tensor.dim(cache, 0) * 128, COMPRESSED_CACHE_BYTES])
     with pl.spmd(workers, name_hint="c2a_compress", deps=[mapped]) as completed:
-        compressor_pool_body(
+        _c2a_compress(
             kv_proj, score_proj, native_flat, position_ids, norm_weight, latent,
             mapped_starts, mapped_requests, mapped_blocks,
             slots, cosine, sine, cache_flat, active_tokens, native_count,
