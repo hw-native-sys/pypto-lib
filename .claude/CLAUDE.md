@@ -41,6 +41,7 @@ the table below lists common entry points, not an exhaustive skill catalog.
 | Running a model | [Compile/runtime workflow](../docs/run-and-validate/compile-runtime-workflow.md#selecting-and-running-a-case) and the relevant [model documentation](../docs/models/index.md) |
 | Harness or validation changes | [Golden harness](../docs/run-and-validate/golden-harness.md) and [compile/runtime workflow](../docs/run-and-validate/compile-runtime-workflow.md) |
 | Performance measurement or tuning | [Benchmarking rules](rules/benchmarking.md) and [performance guide](../docs/debug-and-tune/performance-tuning.md); use [perf](skills/perf/SKILL.md) to run a case and collect a chip swimlane or raw timing, or the matching tuning skill |
+| Resource-constrained ideal schedule estimates | [Ideal schedule performance](skills/perf-ideal-schedule/SKILL.md) for level-1 capture, finite-core task scheduling, and model-bound verification |
 | Cube tile tuning | [Cube tile tuning skill](skills/cube-tile-tuning/SKILL.md) |
 | In-core profiling | [In-core profiling skill](skills/incore-profiling/SKILL.md) |
 | Hardware utilization analysis | [Hardware utilization skill](skills/hw-util/SKILL.md) |
