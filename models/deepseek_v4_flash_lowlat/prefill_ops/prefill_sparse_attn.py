@@ -683,7 +683,8 @@ def _sparse_gather_raw(
             name_hint="gather_ori_kv",
             deps=[prior_merge_tid],
         ) as gather_ori_tid:
-            _causal_gather_ori_kv_body(gather_blocks, query_base, t_dim, active_rows, swa_indices, sparse_bias, cmp_indices, local_request_ids, valid_block_mask, sparse_kv, ori_kv_flat)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                _causal_gather_ori_kv_body(gather_blocks, query_base, t_dim, active_rows, swa_indices, sparse_bias, cmp_indices, local_request_ids, valid_block_mask, sparse_kv, ori_kv_flat)
         causal_gather_ori_tid_choices[0] = gather_ori_tid
     gather_ori_tid = causal_gather_ori_tid_choices[0]
     return gather_ori_tid
@@ -727,7 +728,8 @@ def _sparse_gather_cmp(
             name_hint="gather_cmp_kv",
             deps=[prior_merge_tid],
         ) as gather_cmp_tid:
-            _causal_gather_cmp_kv_body(gather_cmp_token_blocks, query_base, t_dim, active_rows, local_request_ids, valid_block_mask, sparse_kv, cmp_indices, cmp_block_table, cmp_block_num, cmp_kv_flat)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                _causal_gather_cmp_kv_body(gather_cmp_token_blocks, query_base, t_dim, active_rows, local_request_ids, valid_block_mask, sparse_kv, cmp_indices, cmp_block_table, cmp_block_num, cmp_kv_flat)
         causal_gather_cmp_tid_choices[0] = gather_cmp_tid
     gather_cmp_tid = causal_gather_cmp_tid_choices[0]
     return gather_cmp_tid
@@ -772,7 +774,8 @@ def _sparse_gather_cmp_echo(
         causal_gather_cmp_tid_choices[0] = gather_cmp_tid_causal
     else:
         with pl.spmd(PREFILL_QUERY_TILE, name_hint="echo_exact_order_cmp_fill", deps=[prior_merge_tid]) as gather_cmp_tid:
-            _causal_echo_exact_order_cmp_fill_body(query_base, t_dim, active_rows, local_request_ids, valid_block_mask, sparse_kv, cmp_indices, echo_counts, echo_epoch, cmp_block_table, echo_map, cmp_block_num, cmp_kv_flat, echo_prefetched)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                _causal_echo_exact_order_cmp_fill_body(query_base, t_dim, active_rows, local_request_ids, valid_block_mask, sparse_kv, cmp_indices, echo_counts, echo_epoch, cmp_block_table, echo_map, cmp_block_num, cmp_kv_flat, echo_prefetched)
         causal_gather_cmp_tid_choices[0] = gather_cmp_tid
     gather_cmp_tid = causal_gather_cmp_tid_choices[0]
     return gather_cmp_tid
@@ -1511,295 +1514,6 @@ def prefill_sparse_attn_test(
         attn_out,
         o_proj_weight_dep,
     )
-
-
-def golden_prefill_sparse_attn(tensors):
-    """Self-contained torch reference for the cache-first sparse-attn entry."""
-    import torch
-
-    q = tensors["q"].float()
-    token_count = q.shape[0]
-    ori_kv = tensors["ori_kv"].float()
-    cmp_kv = tensors["cmp_kv"].float()
-    cmp_storage_block_size = cmp_kv.shape[1]
-    cmp_block_table = tensors["cmp_block_table"]
-    local_request_ids = tensors["local_request_ids"]
-    swa_indices = tensors["swa_indices"]
-    cmp_indices = tensors["cmp_indices"]
-    attn_sink = tensors["attn_sink"].float()
-    cos = tensors["freqs_cos"].float()
-    sin = tensors["freqs_sin"].float()
-    wo_a = tensors["wo_a"].float()
-    wo_b_i8 = tensors["wo_b"]
-    wo_b_scale = tensors["wo_b_scale"].float()
-
-    o = torch.zeros(token_count, H, HEAD_DIM)
-    for t in range(token_count):
-        request_id = int(local_request_ids[t].item())
-        if request_id < 0:
-            continue
-        gathered = []
-        for row_i in swa_indices[t].tolist():
-            row = int(row_i)
-            if row < 0:
-                continue
-            gathered.append(ori_kv.reshape(-1, HEAD_DIM)[row])
-        for raw_i in cmp_indices[t].tolist():
-            cmp_slot = int(raw_i)
-            if cmp_slot < 0 or cmp_slot >= cmp_block_table.shape[1] * cmp_storage_block_size:
-                continue
-            block_id = int(cmp_block_table[request_id, cmp_slot // cmp_storage_block_size].item())
-            intra = cmp_slot % cmp_storage_block_size
-            if block_id >= 0:
-                gathered.append(cmp_kv[block_id, intra, 0])
-
-        if not gathered:
-            continue
-        kv_rows = torch.stack(gathered, dim=0)
-
-        mi = None
-        li = None
-        oi = None
-        for tile_start in range(0, kv_rows.shape[0], PREFILL_ATTN_TILE):
-            kv_tile = kv_rows[tile_start : tile_start + PREFILL_ATTN_TILE]
-            scores = (q[t] @ kv_tile.T) * SOFTMAX_SCALE
-            cur_mi = scores.max(dim=-1, keepdim=True).values
-            exp_scores = torch.exp(scores - cur_mi)
-            cur_li = exp_scores.sum(dim=-1, keepdim=True)
-            exp_scores_bf16 = exp_scores.to(torch.bfloat16)
-            cur_oi = exp_scores_bf16.float() @ kv_tile.to(torch.bfloat16).float()
-            if mi is None:
-                mi = cur_mi
-                li = cur_li
-                oi = cur_oi
-            else:
-                mi_new = torch.maximum(mi, cur_mi)
-                alpha = torch.exp(mi - mi_new)
-                beta = torch.exp(cur_mi - mi_new)
-                li = alpha * li + beta * cur_li
-                oi = oi * alpha + cur_oi * beta
-                mi = mi_new
-
-        if mi is not None:
-            denom = li + torch.exp(attn_sink.unsqueeze(-1) - mi)
-            o[t] = oi / denom
-
-    rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
-    rope_even = rope_pair[..., 0]
-    rope_odd = rope_pair[..., 1]
-    cos_half = cos[:, :ROPE_HALF].unsqueeze(1)
-    sin_half = sin[:, :ROPE_HALF].unsqueeze(1)
-    inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
-    inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
-    o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
-    o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
-
-    o_model = o.float().view(token_count, O_GROUPS, O_GROUP_IN)
-    o_r = torch.einsum("tgd,grd->tgr", o_model, wo_a)  # [T, G, O_LORA]
-    # Per-group INT8 activation quant: one amax per O_LORA group, not per full row. Each
-    # group's INT32 partial is dequantized by its own per-row act scale -- the per-group
-    # scale cannot factor out of the K-sum -- then the per-channel weight scale is applied.
-    o_r_g = o_r.reshape(token_count, O_GROUPS, O_LORA)
-    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)  # [T, G, 1]
-    scale_q_g = INT8_SCALE_MAX / amax_g
-    o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dq_g = 1.0 / scale_q_g  # [T, G, 1]
-    wo_b_g = wo_b_i8  # already [GROUPS, D, O_LORA]
-    out = torch.zeros(token_count, D, dtype=torch.float32)
-    for g in range(O_GROUPS):
-        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[g].to(torch.int32).T  # [T, D]
-        out = out + p_g.float() * scale_dq_g[:, g]  # per-row group scale
-    out = out * wo_b_scale.unsqueeze(0)  # per-channel weight scale
-    tensors["attn_out"][:] = out.to(torch.bfloat16)
-
-
-def get_prefill_cmp_valid(compress_ratio: int, token_count: int) -> int:
-    """Map standalone ratio modes to visible compressed-cache length."""
-    if compress_ratio == 0:
-        return 0
-    if compress_ratio in (4, 128):
-        return min(IDX_TOPK, token_count // compress_ratio, CMP_MAX_BLOCKS * BLOCK_SIZE)
-    raise ValueError(
-        f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}"
-    )
-
-
-def build_tensor_specs(
-    compress_ratio: int = DEFAULT_COMPRESS_RATIO,
-    token_count: int = T,
-    ori_block_num: int = ORI_BLOCK_NUM,
-    cmp_block_num: int = CMP_BLOCK_NUM,
-):
-    import torch
-    from golden import TensorSpec
-    from utils import quant_w_per_channel, token_local_rope
-
-    if not 0 < token_count <= MAX_SEQ_LEN:
-        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
-    if ori_block_num <= 0 or cmp_block_num <= 0:
-        raise ValueError("dynamic cache block counts must be positive")
-    cmp_valid = get_prefill_cmp_valid(compress_ratio, token_count)
-    rope_positions = torch.arange(token_count, dtype=torch.int32)
-    shared_rope_cos, shared_rope_sin = token_local_rope(
-        M, compress_ratio, rope_positions,
-        max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
-    )
-
-    def init_q():
-        return ((torch.rand(token_count, H, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
-
-    def init_ori_kv():
-        return ((torch.rand(ori_block_num, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
-
-    def init_cmp_kv():
-        return ((torch.rand(cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
-
-    def init_cmp_block_table():
-        table = torch.zeros(1, CMP_MAX_BLOCKS, dtype=torch.int32)
-        for blk in range(CMP_MAX_BLOCKS):
-            table[0, blk] = blk % cmp_block_num
-        return table
-
-    def init_local_request_ids():
-        return torch.zeros(token_count, dtype=torch.int32)
-
-    def init_swa_indices():
-        idx = torch.full((token_count, WIN), -1, dtype=torch.int32)
-        for t in range(token_count):
-            window_start = max(0, t - WIN + 1)
-            window = torch.arange(window_start, t + 1, dtype=torch.int32)
-            idx[t, : window.numel()] = window
-        return idx
-
-    def init_cmp_indices():
-        idx = torch.full((token_count, IDX_TOPK), -1, dtype=torch.int32)
-        if compress_ratio:
-            for t in range(token_count):
-                comp_count = min(cmp_valid, (t + 1) // compress_ratio, IDX_TOPK)
-                if comp_count > 0:
-                    idx[t, :comp_count] = torch.arange(comp_count, dtype=torch.int32)
-        return idx
-
-    def init_valid_block_mask():
-        """Flag sparse blocks holding at least one valid index, as the real callers do."""
-        mask = torch.zeros(token_count, VALID_BLOCK_MASK_COLS, dtype=torch.int32)
-        swa = init_swa_indices()
-        cmp = init_cmp_indices()
-        for t in range(token_count):
-            for sb in range(PREFILL_ATTN_BLOCKS):
-                for ki in range(PREFILL_ATTN_TILE):
-                    k = sb * PREFILL_ATTN_TILE + ki
-                    if k >= SPARSE_BIAS_COLS:
-                        continue
-                    if k < WIN:
-                        raw = int(swa[t, k])
-                    elif k - WIN < SPARSE_CMP_BIAS_COLS:
-                        raw = int(cmp[t, k - WIN])
-                    else:
-                        continue
-                    if raw >= 0:
-                        mask[t, sb] = 1
-                        break
-        return mask
-
-    def init_attn_sink():
-        return torch.zeros(H)
-
-    def init_freqs_cos():
-        return shared_rope_cos.clone()
-
-    def init_freqs_sin():
-        return shared_rope_sin.clone()
-
-    def init_wo_a():
-        return ((torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN**-0.5).to(torch.bfloat16)
-
-    def init_wo_b():
-        return ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5).to(torch.bfloat16)
-
-    wo_b_i8, wo_b_scale = quant_w_per_channel(init_wo_b())
-    # wo_b's group axis matches wo_a's own [GROUPS, ...] convention: fold the
-    # flat [D, GROUPS*O_LORA] quant result into [GROUPS, D, O_LORA].
-    wo_b_i8_groups = wo_b_i8.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2).contiguous()
-
-    return [
-        TensorSpec("q", [token_count, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
-        TensorSpec(
-            "ori_kv", [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv
-        ),
-        TensorSpec("swa_indices", [token_count, WIN], torch.int32, init_value=init_swa_indices),
-        TensorSpec(
-            "cmp_kv", [cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv
-        ),
-        TensorSpec("cmp_block_table", [1, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("local_request_ids", [token_count], torch.int32, init_value=init_local_request_ids),
-        TensorSpec("cmp_indices", [token_count, IDX_TOPK], torch.int32, init_value=init_cmp_indices),
-        TensorSpec(
-            "valid_block_mask",
-            [token_count, VALID_BLOCK_MASK_COLS],
-            torch.int32,
-            init_value=init_valid_block_mask,
-        ),
-        TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("freqs_cos", [token_count, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
-        TensorSpec("freqs_sin", [token_count, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [O_GROUPS, D, O_LORA], torch.int8, init_value=lambda: wo_b_i8_groups),
-        TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("attn_out", [token_count, D], torch.bfloat16),
-    ]
-
-
-if __name__ == "__main__":
-    import argparse
-    from golden import ratio_allclose, run
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
-    parser.add_argument("--sim", dest="execution_mode", action="store_true")
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--compile-only", action="store_true", default=False)
-    ratio_choices = list(SUPPORTED_COMPRESS_RATIOS)
-    parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO, choices=ratio_choices)
-    parser.add_argument(
-        "--tokens", type=int, default=T, help=f"Physical token rows, up to {MAX_SEQ_LEN}."
-    )
-    parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
-    parser.add_argument("--cmp-block-num", type=int, default=CMP_BLOCK_NUM)
-    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
-    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
-    parser.add_argument("--enable-scope-stats", action="store_true", default=False)
-    parser.add_argument("--save-data", action="store_true", help="Save inputs and golden outputs for replay.")
-    parser.add_argument("--golden-data", type=str, default=None)
-    parser.add_argument("--dump-passes", action="store_true", default=False)
-    args = parser.parse_args()
-
-    result = run(
-        fn=prefill_sparse_attn_test,
-        specs=build_tensor_specs(args.compress_ratio, args.tokens, args.ori_block_num, args.cmp_block_num),
-        golden_fn=golden_prefill_sparse_attn,
-        save_data=args.save_data,
-        golden_data=args.golden_data,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            enable_pmu=args.enable_pmu,
-            enable_scope_stats=args.enable_scope_stats,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        compile_only=args.compile_only,
-        compare_fn={
-            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
 
 
 @pl.jit.inline(auto_scope=False)
@@ -2582,3 +2296,292 @@ def _causal_reader_echo_exact_order_cmp_fill(
     """Read persistent caches with explicit NoDep directions."""
     _causal_echo_exact_order_cmp_fill_body(query_base, t_dim, active_rows, local_request_ids, valid_block_mask, sparse_kv, cmp_indices, echo_counts, echo_epoch, cmp_block_table, echo_map, cmp_block_num, cmp_kv_flat, echo_prefetched)
     return sparse_kv, echo_counts
+
+
+def golden_prefill_sparse_attn(tensors):
+    """Self-contained torch reference for the cache-first sparse-attn entry."""
+    import torch
+
+    q = tensors["q"].float()
+    token_count = q.shape[0]
+    ori_kv = tensors["ori_kv"].float()
+    cmp_kv = tensors["cmp_kv"].float()
+    cmp_storage_block_size = cmp_kv.shape[1]
+    cmp_block_table = tensors["cmp_block_table"]
+    local_request_ids = tensors["local_request_ids"]
+    swa_indices = tensors["swa_indices"]
+    cmp_indices = tensors["cmp_indices"]
+    attn_sink = tensors["attn_sink"].float()
+    cos = tensors["freqs_cos"].float()
+    sin = tensors["freqs_sin"].float()
+    wo_a = tensors["wo_a"].float()
+    wo_b_i8 = tensors["wo_b"]
+    wo_b_scale = tensors["wo_b_scale"].float()
+
+    o = torch.zeros(token_count, H, HEAD_DIM)
+    for t in range(token_count):
+        request_id = int(local_request_ids[t].item())
+        if request_id < 0:
+            continue
+        gathered = []
+        for row_i in swa_indices[t].tolist():
+            row = int(row_i)
+            if row < 0:
+                continue
+            gathered.append(ori_kv.reshape(-1, HEAD_DIM)[row])
+        for raw_i in cmp_indices[t].tolist():
+            cmp_slot = int(raw_i)
+            if cmp_slot < 0 or cmp_slot >= cmp_block_table.shape[1] * cmp_storage_block_size:
+                continue
+            block_id = int(cmp_block_table[request_id, cmp_slot // cmp_storage_block_size].item())
+            intra = cmp_slot % cmp_storage_block_size
+            if block_id >= 0:
+                gathered.append(cmp_kv[block_id, intra, 0])
+
+        if not gathered:
+            continue
+        kv_rows = torch.stack(gathered, dim=0)
+
+        mi = None
+        li = None
+        oi = None
+        for tile_start in range(0, kv_rows.shape[0], PREFILL_ATTN_TILE):
+            kv_tile = kv_rows[tile_start : tile_start + PREFILL_ATTN_TILE]
+            scores = (q[t] @ kv_tile.T) * SOFTMAX_SCALE
+            cur_mi = scores.max(dim=-1, keepdim=True).values
+            exp_scores = torch.exp(scores - cur_mi)
+            cur_li = exp_scores.sum(dim=-1, keepdim=True)
+            exp_scores_bf16 = exp_scores.to(torch.bfloat16)
+            cur_oi = exp_scores_bf16.float() @ kv_tile.to(torch.bfloat16).float()
+            if mi is None:
+                mi = cur_mi
+                li = cur_li
+                oi = cur_oi
+            else:
+                mi_new = torch.maximum(mi, cur_mi)
+                alpha = torch.exp(mi - mi_new)
+                beta = torch.exp(cur_mi - mi_new)
+                li = alpha * li + beta * cur_li
+                oi = oi * alpha + cur_oi * beta
+                mi = mi_new
+
+        if mi is not None:
+            denom = li + torch.exp(attn_sink.unsqueeze(-1) - mi)
+            o[t] = oi / denom
+
+    rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
+    rope_even = rope_pair[..., 0]
+    rope_odd = rope_pair[..., 1]
+    cos_half = cos[:, :ROPE_HALF].unsqueeze(1)
+    sin_half = sin[:, :ROPE_HALF].unsqueeze(1)
+    inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
+    inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
+    o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
+    o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
+
+    o_model = o.float().view(token_count, O_GROUPS, O_GROUP_IN)
+    o_r = torch.einsum("tgd,grd->tgr", o_model, wo_a)  # [T, G, O_LORA]
+    # Per-group INT8 activation quant: one amax per O_LORA group, not per full row. Each
+    # group's INT32 partial is dequantized by its own per-row act scale -- the per-group
+    # scale cannot factor out of the K-sum -- then the per-channel weight scale is applied.
+    o_r_g = o_r.reshape(token_count, O_GROUPS, O_LORA)
+    amax_g = o_r_g.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)  # [T, G, 1]
+    scale_q_g = INT8_SCALE_MAX / amax_g
+    o_r_i8_g = torch.round(o_r_g * scale_q_g).to(torch.int32).to(torch.float16).to(torch.int8)
+    scale_dq_g = 1.0 / scale_q_g  # [T, G, 1]
+    wo_b_g = wo_b_i8  # already [GROUPS, D, O_LORA]
+    out = torch.zeros(token_count, D, dtype=torch.float32)
+    for g in range(O_GROUPS):
+        p_g = o_r_i8_g[:, g].to(torch.int32) @ wo_b_g[g].to(torch.int32).T  # [T, D]
+        out = out + p_g.float() * scale_dq_g[:, g]  # per-row group scale
+    out = out * wo_b_scale.unsqueeze(0)  # per-channel weight scale
+    tensors["attn_out"][:] = out.to(torch.bfloat16)
+
+
+def get_prefill_cmp_valid(compress_ratio: int, token_count: int) -> int:
+    """Map standalone ratio modes to visible compressed-cache length."""
+    if compress_ratio == 0:
+        return 0
+    if compress_ratio in (4, 128):
+        return min(IDX_TOPK, token_count // compress_ratio, CMP_MAX_BLOCKS * BLOCK_SIZE)
+    raise ValueError(
+        f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}"
+    )
+
+
+def build_tensor_specs(
+    compress_ratio: int = DEFAULT_COMPRESS_RATIO,
+    token_count: int = T,
+    ori_block_num: int = ORI_BLOCK_NUM,
+    cmp_block_num: int = CMP_BLOCK_NUM,
+):
+    import torch
+    from golden import TensorSpec
+    from utils import quant_w_per_channel, token_local_rope
+
+    if not 0 < token_count <= MAX_SEQ_LEN:
+        raise ValueError(f"token_count must be in [1, {MAX_SEQ_LEN}], got {token_count}")
+    if ori_block_num <= 0 or cmp_block_num <= 0:
+        raise ValueError("dynamic cache block counts must be positive")
+    cmp_valid = get_prefill_cmp_valid(compress_ratio, token_count)
+    rope_positions = torch.arange(token_count, dtype=torch.int32)
+    shared_rope_cos, shared_rope_sin = token_local_rope(
+        M, compress_ratio, rope_positions,
+        max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16,
+    )
+
+    def init_q():
+        return ((torch.rand(token_count, H, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
+
+    def init_ori_kv():
+        return ((torch.rand(ori_block_num, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
+
+    def init_cmp_kv():
+        return ((torch.rand(cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
+
+    def init_cmp_block_table():
+        table = torch.zeros(1, CMP_MAX_BLOCKS, dtype=torch.int32)
+        for blk in range(CMP_MAX_BLOCKS):
+            table[0, blk] = blk % cmp_block_num
+        return table
+
+    def init_local_request_ids():
+        return torch.zeros(token_count, dtype=torch.int32)
+
+    def init_swa_indices():
+        idx = torch.full((token_count, WIN), -1, dtype=torch.int32)
+        for t in range(token_count):
+            window_start = max(0, t - WIN + 1)
+            window = torch.arange(window_start, t + 1, dtype=torch.int32)
+            idx[t, : window.numel()] = window
+        return idx
+
+    def init_cmp_indices():
+        idx = torch.full((token_count, IDX_TOPK), -1, dtype=torch.int32)
+        if compress_ratio:
+            for t in range(token_count):
+                comp_count = min(cmp_valid, (t + 1) // compress_ratio, IDX_TOPK)
+                if comp_count > 0:
+                    idx[t, :comp_count] = torch.arange(comp_count, dtype=torch.int32)
+        return idx
+
+    def init_valid_block_mask():
+        """Flag sparse blocks holding at least one valid index, as the real callers do."""
+        mask = torch.zeros(token_count, VALID_BLOCK_MASK_COLS, dtype=torch.int32)
+        swa = init_swa_indices()
+        cmp = init_cmp_indices()
+        for t in range(token_count):
+            for sb in range(PREFILL_ATTN_BLOCKS):
+                for ki in range(PREFILL_ATTN_TILE):
+                    k = sb * PREFILL_ATTN_TILE + ki
+                    if k >= SPARSE_BIAS_COLS:
+                        continue
+                    if k < WIN:
+                        raw = int(swa[t, k])
+                    elif k - WIN < SPARSE_CMP_BIAS_COLS:
+                        raw = int(cmp[t, k - WIN])
+                    else:
+                        continue
+                    if raw >= 0:
+                        mask[t, sb] = 1
+                        break
+        return mask
+
+    def init_attn_sink():
+        return torch.zeros(H)
+
+    def init_freqs_cos():
+        return shared_rope_cos.clone()
+
+    def init_freqs_sin():
+        return shared_rope_sin.clone()
+
+    def init_wo_a():
+        return ((torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN**-0.5).to(torch.bfloat16)
+
+    def init_wo_b():
+        return ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5).to(torch.bfloat16)
+
+    wo_b_i8, wo_b_scale = quant_w_per_channel(init_wo_b())
+    # wo_b's group axis matches wo_a's own [GROUPS, ...] convention: fold the
+    # flat [D, GROUPS*O_LORA] quant result into [GROUPS, D, O_LORA].
+    wo_b_i8_groups = wo_b_i8.reshape(D, O_GROUPS, O_LORA).permute(1, 0, 2).contiguous()
+
+    return [
+        TensorSpec("q", [token_count, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
+        TensorSpec(
+            "ori_kv", [ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv
+        ),
+        TensorSpec("swa_indices", [token_count, WIN], torch.int32, init_value=init_swa_indices),
+        TensorSpec(
+            "cmp_kv", [cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv
+        ),
+        TensorSpec("cmp_block_table", [1, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
+        TensorSpec("local_request_ids", [token_count], torch.int32, init_value=init_local_request_ids),
+        TensorSpec("cmp_indices", [token_count, IDX_TOPK], torch.int32, init_value=init_cmp_indices),
+        TensorSpec(
+            "valid_block_mask",
+            [token_count, VALID_BLOCK_MASK_COLS],
+            torch.int32,
+            init_value=init_valid_block_mask,
+        ),
+        TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
+        TensorSpec("freqs_cos", [token_count, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin", [token_count, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
+        TensorSpec("wo_b", [O_GROUPS, D, O_LORA], torch.int8, init_value=lambda: wo_b_i8_groups),
+        TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
+        TensorSpec("attn_out", [token_count, D], torch.bfloat16),
+    ]
+
+
+if __name__ == "__main__":
+    import argparse
+    from golden import ratio_allclose, run
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    ratio_choices = list(SUPPORTED_COMPRESS_RATIOS)
+    parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO, choices=ratio_choices)
+    parser.add_argument(
+        "--tokens", type=int, default=T, help=f"Physical token rows, up to {MAX_SEQ_LEN}."
+    )
+    parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
+    parser.add_argument("--cmp-block-num", type=int, default=CMP_BLOCK_NUM)
+    parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
+    parser.add_argument("--enable-scope-stats", action="store_true", default=False)
+    parser.add_argument("--save-data", action="store_true", help="Save inputs and golden outputs for replay.")
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    args = parser.parse_args()
+
+    result = run(
+        fn=prefill_sparse_attn_test,
+        specs=build_tensor_specs(args.compress_ratio, args.tokens, args.ori_block_num, args.cmp_block_num),
+        golden_fn=golden_prefill_sparse_attn,
+        save_data=args.save_data,
+        golden_data=args.golden_data,
+        config=dict(
+            dump_passes=args.dump_passes,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
+            device_id=args.device,
+            enable_chip_swimlane=args.enable_chip_swimlane,
+            enable_pmu=args.enable_pmu,
+            enable_scope_stats=args.enable_scope_stats,
+        ),
+        rtol=1e-3,
+        atol=1e-3,
+        compile_only=args.compile_only,
+        compare_fn={
+            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+        },
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)

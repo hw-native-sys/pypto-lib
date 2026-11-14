@@ -223,7 +223,8 @@ def echo_prefetch_kv(
         causal_ready_choices[0] = ready_causal
     else:
         with pl.spmd(query_rows, name_hint="echo_prefetch_paged_kv", deps=[plan_ready]) as ready:
-            _causal_echo_prefetch_paged_kv_body(request_ids, query_base, counts, indices, cmp_table, blocks, cache, prefetched, logical_map)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                _causal_echo_prefetch_paged_kv_body(request_ids, query_base, counts, indices, cmp_table, blocks, cache, prefetched, logical_map)
         causal_ready_choices[0] = ready
     ready = causal_ready_choices[0]
     return ready
@@ -295,10 +296,11 @@ def echo_record_exact_end(
                     if (position + 1) // 4 >= ECHO_TOPK:
                         kth = pl.read(pairs, [query * groups_per_query, 2 * (ECHO_TOPK - 1)])
                         valid = pl.const(1.0, pl.FP32)
-        pl.write(record, [0, 0], physical_last)
-        pl.write(record, [0, 1], kth)
-        pl.write(record, [0, 2], valid)
-        pl.write(record, [0, 3], pl.cast(epoch, pl.FP32))
+        if found != 0:
+            pl.write(record, [0, 0], physical_last)
+            pl.write(record, [0, 1], kth)
+            pl.write(record, [0, 2], valid)
+            pl.write(record, [0, 3], pl.cast(epoch, pl.FP32))
     return recorded
 
 

@@ -40,7 +40,9 @@ unchanged. NaN score queries use the original gather fallback.
 The request-zero stream uses the preceding outer chunk's global final exact
 kth score for a per-layer EMA with alpha 0.5. Other packed requests retain
 exact scoring and gather without inheriting that prediction. The first chunk
-uses a neutral shift and initializes the estimate from its exact ending result.
+keeps the estimate invalid and performs exact selection and gather. Its global
+final exact kth score initializes the estimate; early prefetch begins only in a
+later chunk with a valid estimate. A valid numerical zero is an initialized EMA.
 An epoch replay retains the same input estimate instead of advancing EMA twice.
 Generated metadata includes required `echo_epoch`, `echo_first_chunk`, and an
 owned FP32 `echo_diagnostics` buffer with two snapshots per CSA layer. Epochs
