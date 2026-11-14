@@ -86,11 +86,12 @@ QUANT_TOKEN_TILE = 8
 O_PROJ_PAD_ROWS = 256  # internal physical-tail alignment across Cube, quant and epilogue
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
-A_K_TILE = 256  # proj_a cube K frag
-B_K_TILE = 256  # proj_b_mm cube K frag
+A_K_TILE = 256  # proj_a GM-to-L1 K fragment
+B_K_TILE = 128  # proj_b_mm L0 K fragment
+B_L1_K_TILE = 512  # proj_b_mm GM-to-L1 K fragment
 QUANT_TILE = 512  # quant column tile over O_LORA
 PROJ_A_MM_N_TILE = 128  # proj_a cube N frag
-PROJ_B_MM_N_TILE = 256  # proj_b_mm cube N frag; Acc = PROJ_B_ROW_TILE*N*4 sits on the a2a3 L0C wall
+PROJ_B_MM_N_TILE = 128  # proj_b_mm cube N fragment
 PROJ_B_D_TILE = 512  # proj_b_mm D slab per task; its N frags loop inside the task
 PROJ_B_ACT_N_TILE = 512  # proj_b_act vector N frag
 QUANT_CHUNKS = 4  # quant dispatch width per group
@@ -101,7 +102,8 @@ ROPE_CS_T_TILE = 8  # rope cos/sin row block
 # T_PAD: a taller row tile reads into the next group's slab and writes past the end
 # of the row-indexed scratch.
 PROJ_A_ROW_TILE = min(128, T_PAD)
-PROJ_B_ROW_TILE = min(128, T_PAD)
+PROJ_B_ROW_TILE = min(256, T_PAD)
+O_PROJ_ROW_TILE = max(PROJ_A_ROW_TILE, PROJ_B_ROW_TILE)
 # Task-array fan-outs; named because a deps= list comprehension cannot be hoisted
 # out of the call (the tracer rejects a bare ListComp statement).
 PA_NFRAGS = O_LORA // PROJ_A_MM_N_TILE
@@ -1102,6 +1104,8 @@ def _sparse_attn_o_proj(
 ) -> pl.Scalar[pl.TASK_ID]:
     """Project one local-token dense tile into BF16 hidden rows."""
     o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
+    wo_a_2d = pl.reshape(wo_a, [O_GROUPS * O_LORA, O_GROUP_IN])
+    wo_b_2d = pl.reshape(wo_b, [O_GROUPS * D, O_LORA])
 
     # Chain merge, quantization, and projection through explicit task dependencies.
     o_r = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.FP32)
@@ -1111,9 +1115,9 @@ def _sparse_attn_o_proj(
     proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     proj_b_tids = pl.array.create(PB_DSLABS * O_GROUPS, pl.TASK_ID)
-    # Round physical tails up to a complete proj_a tile; only the final store
+    # Round physical tails up to complete projection tiles; only the final store
     # writes active rows.
-    o_compute_rows = ((tile_rows + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE) * PROJ_A_ROW_TILE
+    o_compute_rows = ((tile_rows + O_PROJ_ROW_TILE - 1) // O_PROJ_ROW_TILE) * O_PROJ_ROW_TILE
     proj_a_rows = o_compute_rows // PROJ_A_ROW_TILE
     quant_rows = o_compute_rows // QUANT_TOKEN_TILE
     proj_b_rows = o_compute_rows // PROJ_B_ROW_TILE
@@ -1127,21 +1131,19 @@ def _sparse_attn_o_proj(
             out_col_g = g * O_LORA
             for nf in pl.range(PA_NFRAGS):
                 n0 = nf * PROJ_A_MM_N_TILE
+                pa_col0 = out_col_g + n0
+                pa_output: pl.Tensor[
+                    [T_PAD, PROJ_A_MM_N_TILE], pl.FP32, pl.TensorView(stride=[O_GROUPS * O_LORA, 1])
+                ] = pl.slice(o_r, [T_PAD, PROJ_A_MM_N_TILE], [0, pa_col0])
                 with pl.spmd(proj_a_rows, name_hint="proj_a_mm", deps=[heads_dep, weight_dep]) as pa_tid:
-                    pa_rb = pl.tile.get_block_idx()
-                    pa_r0 = pa_rb * PROJ_A_ROW_TILE
+                    pa_r0 = pl.tile.get_block_idx() * PROJ_A_ROW_TILE
                     pa_src0 = row_base_o + pa_r0
-                    acc_a = pl.create_tensor([1, PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
-                    for kb in pl.pipeline(0, O_GROUP_IN // A_K_TILE, stage=2):
-                        k0 = kb * A_K_TILE
-                        xa_k_chunk = o_packed[
-                            pa_src0 : pa_src0 + PROJ_A_ROW_TILE,
-                            k0 : k0 + A_K_TILE,
-                        ]
-                        wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True, init_cond=(kb == 0))
-                    # acc_a is 3D (wo_a keeps its group axis), which subscript-write cannot express.
-                    o_r = pl.assemble(o_r, acc_a, [pa_r0, out_col_g + n0])
+                    acc_a = pl.create_tensor([PROJ_A_ROW_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+                    for kb in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=4):
+                        xa_k = pl.slice(o_packed, [PROJ_A_ROW_TILE, A_K_TILE], [pa_src0, kb])
+                        wa_k = pl.slice(wo_a_2d, [PROJ_A_MM_N_TILE, A_K_TILE], [pa_col0, kb])
+                        acc_a = pl.matmul_acc(acc_a, xa_k, wa_k, b_trans=True, init_cond=(kb == 0))
+                    pl.assemble(pa_output, acc_a, [pa_r0, 0])
                 proj_a_tids[g * PA_NFRAGS + nf] = pa_tid
 
         # quant[g]: per-group amax and symmetric INT8 quant over physical rows.
@@ -1188,25 +1190,27 @@ def _sparse_attn_o_proj(
             d0 = dc * PROJ_B_D_TILE
             for g in pl.range(O_GROUPS):
                 col_g = g * O_LORA
+                pb_col0 = g * D + d0
+                pb_output: pl.Tensor[
+                    [T_PAD, PROJ_B_D_TILE], pl.INT32, pl.TensorView(stride=[O_GROUPS * D, 1])
+                ] = pl.slice(partials, [T_PAD, PROJ_B_D_TILE], [0, pb_col0])
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_b_mm", deps=[quant_tids[g]]) as pb_tid:
                     for nf in pl.range(PROJ_B_D_TILE // PROJ_B_MM_N_TILE):
-                        n0 = d0 + nf * PROJ_B_MM_N_TILE
+                        pb_out_n0 = nf * PROJ_B_MM_N_TILE
+                        pb_weight_row0 = pb_col0 + pb_out_n0
                         for pb_rb in pl.range(proj_b_rows):
                             pb_r0 = pb_rb * PROJ_B_ROW_TILE
-                            acc_b = pl.create_tensor([1, PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
-                            for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
-                                k0 = col_g + kb * B_K_TILE
-                                wb_k0 = kb * B_K_TILE
-                                b_act = o_r_i8[
-                                    pb_r0 : pb_r0 + PROJ_B_ROW_TILE,
-                                    k0 : k0 + B_K_TILE,
-                                ]
-                                b_weight = wo_b[g : g + 1, n0 : n0 + PROJ_B_MM_N_TILE, wb_k0 : wb_k0 + B_K_TILE]
-                                acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True, init_cond=(kb == 0))
-                            acc_b_2d = pl.reshape(acc_b, [PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE])
-                            partials[
-                                pb_r0 : pb_r0 + PROJ_B_ROW_TILE, g * D + n0 : g * D + n0 + PROJ_B_MM_N_TILE
-                            ] = acc_b_2d
+                            acc_b = pl.tile.create([PROJ_B_ROW_TILE, PROJ_B_MM_N_TILE], pl.INT32, target_memory=pl.Mem.Acc)
+                            for kb in pl.pipeline(0, O_LORA, B_L1_K_TILE, stage=2):
+                                k0 = col_g + kb
+                                xb_l1 = pl.tile.load(o_r_i8, [pb_r0, k0], [PROJ_B_ROW_TILE, B_L1_K_TILE], target_memory=pl.Mem.Mat)
+                                wb_l1 = pl.tile.load(wo_b_2d, [pb_weight_row0, kb], [PROJ_B_MM_N_TILE, B_L1_K_TILE], target_memory=pl.Mem.Mat)
+                                wb_transposed = pl.tile.transpose_view(wb_l1)
+                                for ki in pl.pipeline(0, B_L1_K_TILE, B_K_TILE, stage=2):
+                                    xb_l0 = pl.tile.extract(xb_l1, 0, ki, [PROJ_B_ROW_TILE, B_K_TILE], target_memory=pl.Mem.Left)
+                                    wb_l0 = pl.tile.extract(wb_transposed, ki, 0, [B_K_TILE, PROJ_B_MM_N_TILE], target_memory=pl.Mem.Right)
+                                    acc_b = pl.tile.matmul_acc(acc_b, xb_l0, wb_l0, init_cond=(kb == 0 and ki == 0))
+                            pl.tile.store(acc_b, [pb_r0, pb_out_n0], pb_output)
                 proj_b_tids[dc * O_GROUPS + g] = pb_tid
 
     # Dequantize and sum per-group INT32 partials into the BF16 output.
@@ -1332,7 +1336,7 @@ def sparse_attn_compute(
                 dtype=pl.BF16,
                 manual_dep=True,
             )
-            packed_rows = ((tile_rows + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE) * PROJ_A_ROW_TILE
+            packed_rows = ((tile_rows + O_PROJ_ROW_TILE - 1) // O_PROJ_ROW_TILE) * O_PROJ_ROW_TILE
             packed_group_blocks = packed_rows * HEADS_PER_GROUP // PREFILL_QUERY_TILE
             with pl.spmd(O_GROUPS * packed_group_blocks, name_hint="prefill_sparse_packed_init") as packed_init_tid:
                 packed_block = pl.tile.get_block_idx()
@@ -1463,6 +1467,92 @@ def prefill_sparse_attn_test(
         attn_out,
         o_proj_weight_dep,
     )
+
+
+@pl.jit(auto_scope=False)
+def prefill_o_projection_test(
+    packed: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[O_GROUPS, D, O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    tile_base: pl.Scalar[pl.INDEX],
+    tile_rows: pl.Scalar[pl.INDEX],
+):
+    """Run the shared output projection on one physical attention tile."""
+    attn_out.bind_dynamic(0, T_DYN)
+    with pl.scope():
+        heads_dep = pl.system.task_dummy(deps=[])
+        weight_dep = pl.system.task_dummy(deps=[])
+        _sparse_attn_o_proj(packed, wo_a, wo_b, wo_b_scale, attn_out, tile_base, tile_rows, heads_dep, weight_dep)
+    return attn_out
+
+
+def golden_prefill_o_projection(tensors):
+    """Reference grouped projection, quantization, dequantization, and row placement."""
+    import torch
+
+    rows = int(tensors["tile_rows"])
+    base = int(tensors["tile_base"])
+    packed = tensors["packed"].reshape(O_GROUPS, T_PAD, O_GROUP_IN)[:, :rows].float()
+    projected = torch.einsum("gtd,grd->tgr", packed, tensors["wo_a"].float())
+    amax = projected.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    scale_q = INT8_SCALE_MAX / amax
+    quantized = torch.round(projected * scale_q).to(torch.int32).to(torch.float16).to(torch.int8)
+    output = torch.zeros(rows, D, dtype=torch.float32)
+    for group in range(O_GROUPS):
+        partial = quantized[:, group].int() @ tensors["wo_b"][group].int().T
+        output = output + partial.float() * torch.reciprocal(scale_q[:, group])
+    output = output * tensors["wo_b_scale"].float().unsqueeze(0)
+    tensors["attn_out"][base:base + rows] = output.to(torch.bfloat16)
+
+
+def build_o_projection_tensor_specs(tile_rows: int, tile_base: int = 11):
+    """Build exact-value fixtures with group scales, quantization ties, and row sentinels."""
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    if not 0 < tile_rows <= T_PAD:
+        raise ValueError(f"tile_rows must be in [1, {T_PAD}], got {tile_rows}")
+    if tile_base < 0:
+        raise ValueError("tile_base must be nonnegative")
+    columns = [0, 129, 258, 387, 516, 645, 774, 903, 1023]
+    values = [0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 63.5, -126.5, 127.0]
+
+    def init_packed():
+        packed = torch.zeros(O_GROUPS, T_PAD, O_GROUP_IN, dtype=torch.bfloat16)
+        row_values = torch.tensor([0.0, 0.25, 1.0, 2.0])[torch.arange(T_PAD) % 4]
+        for group in range(O_GROUPS):
+            packed[group, :, 0] = row_values * (2.0 ** (group - 4))
+            packed[group, :, O_GROUP_IN - 1] = packed[group, :, 0]
+        return packed.reshape(O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM)
+
+    def init_wo_a():
+        weight = torch.zeros(O_GROUPS, O_LORA, O_GROUP_IN, dtype=torch.bfloat16)
+        weight[:, columns, 0] = torch.tensor(values, dtype=torch.bfloat16)
+        weight[:, columns, O_GROUP_IN - 1] = weight[:, columns, 0]
+        return weight
+
+    def init_wo_b():
+        weight = torch.zeros(O_GROUPS, D, O_LORA, dtype=torch.int8)
+        channels = torch.arange(D)
+        for group in range(O_GROUPS):
+            for index, column in enumerate(columns):
+                weight[group, :, column] = ((channels + group + index * 3) % 7 - 3).to(torch.int8)
+        return weight
+
+    def init_scale():
+        return torch.pow(2.0, (torch.arange(D) % 5 - 3).float())
+
+    return [
+        TensorSpec("packed", [O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], torch.bfloat16, init_value=init_packed),
+        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
+        TensorSpec("wo_b", [O_GROUPS, D, O_LORA], torch.int8, init_value=init_wo_b),
+        TensorSpec("wo_b_scale", [D], torch.float32, init_value=init_scale),
+        TensorSpec("attn_out", [tile_base + tile_rows + 13, D], torch.bfloat16, init_value=-31.5),
+        ScalarSpec("tile_base", torch.int64, tile_base, compile_runtime=True),
+        ScalarSpec("tile_rows", torch.int64, tile_rows, compile_runtime=True),
+    ]
 
 
 def golden_prefill_sparse_attn(tensors):
@@ -1713,9 +1803,10 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     ratio_choices = list(SUPPORTED_COMPRESS_RATIOS)
     parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO, choices=ratio_choices)
-    parser.add_argument(
-        "--tokens", type=int, default=T, help=f"Physical token rows, up to {MAX_SEQ_LEN}."
-    )
+    parser.add_argument("--tokens", type=int, default=None, help=f"Physical token rows, up to {MAX_SEQ_LEN}.")
+    parser.add_argument("--output-projection-only", action="store_true", help="Run the shared O-A/quant/O-B/epilogue.")
+    parser.add_argument("--tile-base", type=int, default=11, help="Output row offset for projection validation.")
+    parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
     parser.add_argument("--cmp-block-num", type=int, default=CMP_BLOCK_NUM)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -1726,21 +1817,51 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
+    config = dict(
+        dump_passes=args.dump_passes,
+        backend_type=args.backend_type,
+        execution_mode=args.execution_mode,
+        device_id=args.device,
+        enable_chip_swimlane=args.enable_chip_swimlane,
+        enable_pmu=args.enable_pmu,
+        enable_scope_stats=args.enable_scope_stats,
+    )
+    if args.output_projection_only:
+        if args.golden_data and args.tokens is None:
+            parser.error("--output-projection-only --golden-data requires --tokens")
+        token_cases = [T_PAD] if args.compile_only else [17, 129, 257, T_PAD]
+        if args.tokens is not None:
+            token_cases = [args.tokens]
+        runtime_dir = args.runtime_dir
+        for token_rows in token_cases:
+            result = run(
+                fn=prefill_o_projection_test,
+                specs=build_o_projection_tensor_specs(token_rows, args.tile_base),
+                golden_fn=golden_prefill_o_projection,
+                config=config,
+                compile_only=args.compile_only,
+                runtime_dir=runtime_dir,
+                save_data=args.save_data,
+                golden_data=args.golden_data,
+                compare_fn={"attn_out": ratio_allclose(atol=0, rtol=0, max_error_ratio=0)},
+            )
+            if not result.passed:
+                if result.error:
+                    print(result.error)
+                raise SystemExit(1)
+            if not args.compile_only:
+                runtime_dir = str(result.work_dir)
+        raise SystemExit(0)
+
+    token_count = T if args.tokens is None else args.tokens
     result = run(
         fn=prefill_sparse_attn_test,
-        specs=build_tensor_specs(args.compress_ratio, args.tokens, args.ori_block_num, args.cmp_block_num),
+        specs=build_tensor_specs(args.compress_ratio, token_count, args.ori_block_num, args.cmp_block_num),
         golden_fn=golden_prefill_sparse_attn,
         save_data=args.save_data,
         golden_data=args.golden_data,
-        config=dict(
-            dump_passes=args.dump_passes,
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-            enable_pmu=args.enable_pmu,
-            enable_scope_stats=args.enable_scope_stats,
-        ),
+        config=config,
+        runtime_dir=args.runtime_dir,
         rtol=1e-3,
         atol=1e-3,
         compile_only=args.compile_only,
