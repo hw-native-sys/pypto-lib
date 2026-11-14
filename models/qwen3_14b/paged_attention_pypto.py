@@ -27,7 +27,9 @@ SEQ_LEN = 3584  # 7 * 512 — page & stack clean
 MAX_BLOCKS = SEQ_LEN // BLOCK_SIZE  # 28
 NUM_BLOCKS = BATCH * MAX_BLOCKS  # 448
 NUM_TASKS = BATCH * NUM_KV_HEADS  # 128
-ATTN_SPMD_BLOCKS = 24
+# TRANSFER_ROWS sizing cap: the largest width any supported die reports.
+# The launch width is always pl.system.available_cluster_count().
+TRANSFER_BUFFER_BLOCK_CAP = 24
 PRE_LAUNCH = 2
 TRANSFER_SLOTS = PRE_LAUNCH + 1
 FFTS_WORKSPACE_ELEMENTS = 256
@@ -37,7 +39,7 @@ PV_READY_EVENT = 2
 ROW_TILE = 16
 AIV_ROW_TILE = 8
 AIV_LANE0_ROWS = 2
-TRANSFER_ROWS = ATTN_SPMD_BLOCKS * TRANSFER_SLOTS * ROW_TILE
+TRANSFER_ROWS = TRANSFER_BUFFER_BLOCK_CAP * TRANSFER_SLOTS * ROW_TILE
 SCALE = 1.0 / math.sqrt(HEAD_DIM)
 KCACHE_ROWS = NUM_BLOCKS * BLOCK_SIZE
 HALF_DIM = HEAD_DIM // 2
@@ -95,6 +97,10 @@ def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention AP
     scratch_ready_tid: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Run fused Q/K norm, RoPE, cache append, and dynamic paged attention."""
+    # Hard-syncall launch width: the run's cluster count (pypto-lib#1384).
+    # TRANSFER_ROWS keeps its static cap; a smaller width leaves tail rows
+    # unused.
+    attn_blocks = pl.system.available_cluster_count()
     active_batch = pl.tensor.dim(seq_lens, 0)
     num_tasks = active_batch * NUM_KV_HEADS
     query_rows = pl.tensor.dim(q_tnd_flat, 0)
@@ -107,7 +113,7 @@ def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention AP
     cache_base = layer_cache_base_token_rows
     out2d = pl.reshape(out, [query_rows, HEAD_DIM])
     with pl.spmd(
-        ATTN_SPMD_BLOCKS,
+        attn_blocks,
         name_hint="attn_swpipe_spmd",
         sync_start=True,
         allow_early_resolve=True,
@@ -258,7 +264,7 @@ def paged_attention_pypto_swpipe(  # noqa: PLR0913 -- fused Phase-0/attention AP
         pl.system.syncall(core_type=pl.KernelType.MIX)
         pl.system.cacheinvalid()
 
-        for task in pl.range(core, num_tasks, ATTN_SPMD_BLOCKS):
+        for task in pl.range(core, num_tasks, attn_blocks):
             batch = task // NUM_KV_HEADS
             kv_head = task % NUM_KV_HEADS
             seq_len = pl.read(seq_lens, [batch])
