@@ -1,0 +1,252 @@
+{
+  "scenario": {
+    "history_length": 8192,
+    "batch": 64,
+    "sequence": 6,
+    "tp": 1,
+    "query_heads": 64,
+    "head_dim": 512,
+    "platform": "a2a3",
+    "warmup": 2,
+    "rounds": 10,
+    "order": "ABBA",
+    "allocation": {
+      "device": "0",
+      "warmups": 2,
+      "rounds": 10,
+      "host_processes": 1
+    },
+    "profiling": false,
+    "sampling_policy": "Explicit experiment requirement: 2 warmups and 10 measurements per group; not the default CI 5/100 protocol.",
+    "host_processes": 1
+  },
+  "baseline_sha": "2af6b46beb7626f990235915b9a04a421d6715cb",
+  "toolchain": {
+    "pypto": "ff2e0a4ec3015c7bead91ca123ead3282f09f81e",
+    "simpler": "31f9e72ee6832cd198b77df18c1c305e7fd83676",
+    "pto_isa": "f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7"
+  },
+  "ptoas": "0.72",
+  "cann": "9.0.0",
+  "metrics": {
+    "effective": "enclosure of orch and sched intervals, including gaps, from device-clock STRACE",
+    "device_wall": "complete device launch interval, including graph/pre/post phases",
+    "host_wall": "chip.run host interval, includes input staging and validation; excludes worker registration and Python startup"
+  },
+  "groups": [
+    {
+      "implementation": "baseline",
+      "effective_us": [
+        574.8,
+        543.86,
+        531.179,
+        632.8,
+        616.94,
+        564.24,
+        617.04,
+        592.979,
+        527.08,
+        532.398
+      ],
+      "device_wall_us": [
+        961.8,
+        920.959,
+        961.04,
+        1026.32,
+        968.66,
+        957.219,
+        978.039,
+        1003.159,
+        964.2,
+        963.68
+      ],
+      "host_wall_us": [
+        8364.601,
+        8243.4,
+        8221.819,
+        8395.501,
+        8216.23,
+        8283.32,
+        8274.579,
+        8291.45,
+        8158.569,
+        8184.388
+      ],
+      "golden_passed": true
+    },
+    {
+      "implementation": "optimized",
+      "effective_us": [
+        440.9,
+        524.299,
+        451.38,
+        582.081,
+        433.92,
+        469.12,
+        466.698,
+        508.3,
+        440.72,
+        457.76
+      ],
+      "device_wall_us": [
+        878.5,
+        879.34,
+        900.96,
+        950.64,
+        808.74,
+        879.78,
+        883.42,
+        826.56,
+        882.32,
+        858.6
+      ],
+      "host_wall_us": [
+        9329.14,
+        9317.16,
+        9310.13,
+        9364.29,
+        9147.939,
+        9310.69,
+        9228.449,
+        9302.309,
+        9219.109,
+        9049.967
+      ],
+      "golden_passed": true
+    },
+    {
+      "implementation": "optimized",
+      "effective_us": [
+        513.901,
+        449.2,
+        451.64,
+        430.02,
+        471.28,
+        511.94,
+        480.0,
+        482.64,
+        434.499,
+        441.539
+      ],
+      "device_wall_us": [
+        879.42,
+        894.36,
+        881.8,
+        859.04,
+        885.84,
+        840.5,
+        872.68,
+        879.82,
+        902.62,
+        878.38
+      ],
+      "host_wall_us": [
+        9264.44,
+        9350.09,
+        9314.49,
+        9212.848,
+        9262.179,
+        9255.719,
+        9204.028,
+        9273.539,
+        9294.91,
+        9163.639
+      ],
+      "golden_passed": true
+    },
+    {
+      "implementation": "baseline",
+      "effective_us": [
+        526.979,
+        599.9,
+        583.179,
+        584.68,
+        583.021,
+        621.84,
+        565.199,
+        528.26,
+        615.801,
+        553.64
+      ],
+      "device_wall_us": [
+        967.62,
+        948.04,
+        993.66,
+        990.339,
+        1028.96,
+        1011.439,
+        962.859,
+        980.92,
+        984.7,
+        972.18
+      ],
+      "host_wall_us": [
+        9353.69,
+        9283.29,
+        9349.51,
+        9403.02,
+        9394.32,
+        9344.76,
+        9279.679,
+        9369.111,
+        9361.7,
+        9304.639
+      ],
+      "golden_passed": true
+    }
+  ],
+  "comparison": {
+    "effective_us": {
+      "baseline_mean_group_median": 576.31,
+      "optimized_mean_group_median": 461.8445,
+      "reduction_pct": 19.861793132168447
+    },
+    "device_wall_us": {
+      "baseline_mean_group_median": 973.375,
+      "optimized_mean_group_median": 879.5899999999999,
+      "reduction_pct": 9.635032746885841
+    },
+    "host_wall_us": {
+      "baseline_mean_group_median": 8805.294750000001,
+      "optimized_mean_group_median": 9284.7645,
+      "reduction_pct": -5.445243613224848
+    }
+  },
+  "source_sha256": {
+    "models/deepseek_v4_flash_dspark/decode_sparse_attn_csa.py": "7f17974860e0df1409181cbcb27277d9d68e1f4954372a90eff3c7c726529859",
+    "models/deepseek_v4_flash_dspark/kernels/csa/qk_pv_aic.cpp": "39e400aea0c76784312f7a7d7974ff870ec40d0228da67ce551ff1f75041717a",
+    "models/deepseek_v4_flash_dspark/kernels/csa/qk_pv_aiv.cpp": "f5c7d8fbc2510638bd0861e5b255294b2f8941d725e97de33e66e77ab80ef14f"
+  },
+  "validation": {
+    "device_golden_cases": [
+      "normal",
+      "short-window",
+      "mixed-topk",
+      "all-invalid",
+      "block-holes",
+      "causal-regression"
+    ],
+    "cpu_fused_golden_cases": [
+      "normal",
+      "mixed-topk",
+      "all-invalid",
+      "block-holes"
+    ],
+    "cpu_statistics_golden_cases": [
+      "mixed-topk",
+      "all-invalid"
+    ],
+    "metadata_reuse": {
+      "passed": true,
+      "launches": 6,
+      "device_buffers": "Window and compressed indices each keep one fixed allocation across all launches.",
+      "changes": "Rewrite valid row indices and negative padding before every launch.",
+      "reference": "Zero Q, unit cosine and zero sine: KV sum divided by valid-row count plus one zero attention sink.",
+      "comparison": "golden.ratio_allclose(atol=1e-4, rtol=1/128)"
+    },
+    "scope_limits": [
+      "No distributed TP > 1 hardware validation or full-network run.",
+      "CPU simulation validates correctness, not performance."
+    ]
+  }
+}

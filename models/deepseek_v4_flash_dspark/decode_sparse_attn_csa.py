@@ -110,6 +110,31 @@ if T % ATTENTION_PUBLISH_T_TILE != 0:
     raise ValueError("local token capacity must contain complete attention publish tiles")
 
 
+@pl.jit.extern(core_type="mixed", aic_source="kernels/csa/qk_pv_aic.cpp", aiv_source="kernels/csa/qk_pv_aiv.cpp", dual_aiv_dispatch=True)
+def _csa_qk_pv_fused(
+    ffts: pl.Tensor[[256], pl.INT64],
+    q: pl.Tensor[[T_DYN * H, HEAD_DIM], pl.BF16],
+    mask: pl.Tensor[[T_DYN, VALID_BLOCK_MASK_COLS], pl.INT32],
+    positions: pl.Tensor[[T_DYN, 1], pl.INT32],
+    window: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    original: pl.Tensor[[ORI_BLOCK_NUM_DYN * BLOCK_SIZE, HEAD_DIM], pl.BF16],
+    kv: pl.InOut[pl.Tensor[[NUM_QK_CORES * QK_TRANSFER_SLOTS * ATTN_K_TILE, HEAD_DIM], pl.BF16]],
+    score: pl.InOut[pl.Tensor[[NUM_QK_CORES * QK_TRANSFER_SLOTS * QK_H_TILE, ATTN_K_TILE], pl.FP32]],
+    probability: pl.InOut[pl.Tensor[[NUM_QK_CORES * QK_TRANSFER_SLOTS * QK_H_TILE, ATTN_K_TILE], pl.BF16]],
+    pv: pl.InOut[pl.Tensor[[NUM_QK_CORES * QK_TRANSFER_SLOTS * QK_H_TILE, HEAD_DIM], pl.FP32]],
+    swap: pl.Tensor[[H_TILE, ROPE_DIM], pl.INT32],
+    sink: pl.Tensor[[H, 1], pl.FP32],
+    indices: pl.Tensor[[T_DYN, CMP_TOPK], pl.INT32],
+    compressed: pl.Tensor[[CMP_BLOCK_NUM_DYN * BLOCK_SIZE, HEAD_DIM], pl.BF16],
+    bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
+    cos: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
+    sin: pl.Tensor[[T_PAD, ROPE_DIM], pl.FP32],
+    output: pl.InOut[pl.Tensor[[PACKED_ROWS_DYN, O_GROUP_IN], pl.BF16]],
+    tokens: pl.Scalar[pl.INDEX], workers: pl.Scalar[pl.INDEX], publish_tpad: pl.Scalar[pl.INDEX],
+) -> pl.Tensor[[PACKED_ROWS_DYN, O_GROUP_IN], pl.BF16]:
+    return output
+
+
 @pl.jit.inline(auto_scope=False)
 def _sparse_attn_csa(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
@@ -270,275 +295,228 @@ def _sparse_attn_csa(
     pv_transfer = pl.create_tensor([transfer_heads, HEAD_DIM], dtype=pl.FP32)
     ffts_workspace = pl.create_tensor([256], dtype=pl.INT64)
     qk_workers = pl.min(NUM_QK_CORES, pl.system.available_cluster_count())
-    with pl.spmd(qk_workers, name_hint="qk_pv", deps=[qk_plan_tid, rope_tid], allow_early_resolve=True) as qk_tid:
-        qk_core = pl.tile.get_block_idx()
-        pl.system.set_ffts(ffts_workspace)
-        qk_queries = 1
-        if FUSE_FINAL:
-            qk_queries = pl.max((t_dim * (H // QK_H_TILE) - qk_core + qk_workers - 1) // qk_workers, 1)
-        qk_work_count = qk_queries * SPARSE_BLOCKS
-        for qk_item in pl.range(qk_core, t_dim * (H // QK_H_TILE), qk_workers * qk_queries):
-            qk_t = qk_item // (H // QK_H_TILE)
-            qk_head_base = (qk_item % (H // QK_H_TILE)) * QK_H_TILE
-            qk_q = pl.load(
-                q_flat, [qk_t * H + qk_head_base, 0], [QK_H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
+    if FUSE_FINAL:
+        with pl.spmd(qk_workers, name_hint="qk_pv", deps=[qk_plan_tid, rope_tid], allow_early_resolve=True) as fused_tid:
+            o_packed_heads = _csa_qk_pv_fused(
+                ffts_workspace, q_flat, valid_block_mask, position_ids, window_swa_indices, ori_kv_flat,
+                kv_transfer, score_transfer, probability_transfer, pv_transfer,
+                rope_swap_idx, attn_sink_col, cmp_sparse_indices, cmp_kv_flat, sparse_bias,
+                rope_cos_il, rope_sin_signed, o_packed_heads, t_dim, qk_workers, T_PAD,
             )
-            qk_l1 = pl.create_tile([QK_TRANSFER_SLOTS * ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
-            for qk_tick in pl.range(qk_work_count + QK_PRE_LAUNCH):
-                if qk_tick < qk_work_count:
-                    qk_sb = qk_tick % SPARSE_BLOCKS
-                    gather_t = (qk_item + (qk_tick // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
-                    if qk_sb == 0:
-                        qk_q = pl.load(q_flat, [gather_t * H + qk_head_base, 0], [QK_H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
-                    qk_block_kind = pl.read(valid_block_mask, [gather_t, qk_sb])
-                    if qk_block_kind > 0:
-                        qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_tick % QK_TRANSFER_SLOTS
-                        qk_kv_row = qk_slot * ATTN_K_TILE
-                        qk_transfer_row = qk_slot * QK_H_TILE
-                        qk_l1_row = (qk_tick % QK_TRANSFER_SLOTS) * ATTN_K_TILE
-                        if qk_block_kind == 2:
-                            qk_window = qk_l1
-                            qk_pos = pl.cast(pl.read(position_ids, [gather_t, 0]), pl.INDEX)
-                            qk_win_head = (qk_pos - WIN + 1) % BLOCK_SIZE
-                            for qk_run in pl.unroll(SWA_RUNS):
-                                qk_lo = pl.max(qk_run * BLOCK_SIZE - qk_win_head, 0)
-                                qk_hi = pl.min((qk_run + 1) * BLOCK_SIZE - qk_win_head, WIN)
-                                if qk_hi > qk_lo:
-                                    qk_raw_row = pl.read(window_swa_indices, [gather_t, qk_lo])
-                                    qk_window = pl.gather_row(
-                                        qk_window, ori_kv_flat, [qk_l1_row + qk_lo, 0], [qk_raw_row, 0],
-                                        [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_hi - qk_lo, HEAD_DIM],
-                                    )
-                            qk_loaded = pl.yield_(qk_window)
-                        else:
-                            pl.system.sync_wait(QK_KV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
-                            qk_staged = pl.gather_row(
-                                qk_l1, kv_transfer, [qk_l1_row, 0], [qk_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
-                            )
-                            qk_loaded = pl.yield_(qk_staged)
-                        qk_l1_t = pl.tile.transpose_view(qk_loaded)
-                        qk_kv_t = pl.tile.slice(qk_l1_t, [HEAD_DIM, ATTN_K_TILE], [0, qk_l1_row])
-                        qk_scores = pl.matmul(qk_q, qk_kv_t, out_dtype=pl.FP32)
-                        pl.store(qk_scores, [qk_transfer_row, 0], score_transfer)
-                        pl.system.sync_set(
-                            QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX,
-                            ffts_mode=2, core_type=pl.KernelType.AIC,
-                        )
-                if qk_tick >= QK_PRE_LAUNCH:
-                    pv_work = qk_tick - QK_PRE_LAUNCH
-                    pv_sb = pv_work % SPARSE_BLOCKS
-                    pv_t = (qk_item + (pv_work // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
-                    if pl.read(valid_block_mask, [pv_t, pv_sb]) > 0:
-                        pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_work % QK_TRANSFER_SLOTS
-                        pv_transfer_row = pv_slot * QK_H_TILE
-                        pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
-                        pv_probability = pl.load(
-                            probability_transfer, [pv_transfer_row, 0], [QK_H_TILE, ATTN_K_TILE],
-                            target_memory=pl.MemorySpace.Mat,
-                        )
-                        pv_l1_row = (pv_work % QK_TRANSFER_SLOTS) * ATTN_K_TILE
-                        pv_probability_left = pl.tile.move(pv_probability, target_memory=pl.MemorySpace.Left)
-                        pv_first_right = pl.tile.extract(qk_l1, pv_l1_row, 0, [ATTN_K_TILE, 128], target_memory=pl.MemorySpace.Right)
-                        pv_previous = pl.tile.matmul(pv_probability_left, pv_first_right)
-                        for pv_n in pl.unroll(1, HEAD_DIM // 128):
-                            pv_next_right = pl.tile.extract(qk_l1, pv_l1_row, pv_n * 128, [ATTN_K_TILE, 128], target_memory=pl.MemorySpace.Right)
-                            pv_current = pl.tile.matmul(pv_probability_left, pv_next_right)
-                            pl.store(pv_previous, [pv_transfer_row, (pv_n - 1) * 128], pv_transfer)
-                            pv_previous = pv_current
-                        pl.store(pv_previous, [pv_transfer_row, HEAD_DIM - 128], pv_transfer)
-                        pl.system.sync_set(
-                            QK_PV_READY_EVENT, pipe=pl.PipeType.FIX,
-                            ffts_mode=2, core_type=pl.KernelType.AIC,
-                        )
-
-            for qk_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                pl.system.set_ffts(ffts_workspace)
-                qk_lane_head = qk_aiv * (QK_H_TILE // 2)
-                qk_lane_kv = qk_aiv * (ATTN_K_TILE // 2)
-                m_swap = pl.load(rope_swap_idx, [0, 0], [H_TILE, ROPE_DIM])
-                m_swap_f = pl.cast(m_swap, target_type=pl.FP32)
-                m_swap_source = pl.add(m_swap_f, NOPE_DIM)
-                m_row_ids = pl.tile.arange(0, [1, H_TILE], dtype=pl.INT32)
-                m_row_ids_f = pl.cast(m_row_ids, target_type=pl.FP32)
-                m_row_offsets = pl.mul(m_row_ids_f, HEAD_DIM)
-                m_row_offsets_col = pl.reshape(m_row_offsets, [H_TILE, 1])
-                m_swap_flat = pl.row_expand_add(m_swap_source, m_row_offsets_col)
-                m_swap_idx = pl.cast(m_swap_flat, target_type=pl.INT32)
-                m_gather_tmp = pl.create_tile([H_TILE, ROPE_DIM], dtype=pl.INT32)
-                running_m = pl.load(attn_sink_col, [qk_head_base + qk_lane_head, 0], [QK_H_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
-                running_l = pl.tile.muls(running_m, 0.0)
-                running_left = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-                running_right = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-                # Softmax statistics stay live until the delayed PV merge consumes their slot.
-                stats_ring = pl.create_tile([QK_TRANSFER_SLOTS * 2, QK_H_TILE // 2], dtype=pl.FP32)
-                for qk_tick, (m_iter, l_iter, left_iter, right_iter, stats_iter) in pl.range(
-                    qk_work_count + QK_PRE_LAUNCH + 1,
-                    init_values=(running_m, running_l, running_left, running_right, stats_ring),
-                ):
+        qk_tid = fused_tid
+    else:
+        with pl.spmd(qk_workers, name_hint="qk_pv", deps=[qk_plan_tid, rope_tid], allow_early_resolve=True) as stats_tid:
+            qk_core = pl.tile.get_block_idx()
+            pl.system.set_ffts(ffts_workspace)
+            qk_queries = 1
+            qk_work_count = qk_queries * SPARSE_BLOCKS
+            for qk_item in pl.range(qk_core, t_dim * (H // QK_H_TILE), qk_workers * qk_queries):
+                qk_t = qk_item // (H // QK_H_TILE)
+                qk_head_base = (qk_item % (H // QK_H_TILE)) * QK_H_TILE
+                qk_q = pl.load(
+                    q_flat, [qk_t * H + qk_head_base, 0], [QK_H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat,
+                )
+                qk_l1 = pl.create_tile([QK_TRANSFER_SLOTS * ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16, target_memory=pl.MemorySpace.Mat)
+                for qk_tick in pl.range(qk_work_count + QK_PRE_LAUNCH):
                     if qk_tick < qk_work_count:
                         qk_sb = qk_tick % SPARSE_BLOCKS
                         gather_t = (qk_item + (qk_tick // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
-                        if pl.read(valid_block_mask, [gather_t, qk_sb]) == 1:
+                        if qk_sb == 0:
+                            qk_q = pl.load(q_flat, [gather_t * H + qk_head_base, 0], [QK_H_TILE, HEAD_DIM], target_memory=pl.MemorySpace.Mat)
+                        qk_block_kind = pl.read(valid_block_mask, [gather_t, qk_sb])
+                        if qk_block_kind > 0:
                             qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_tick % QK_TRANSFER_SLOTS
                             qk_kv_row = qk_slot * ATTN_K_TILE
                             qk_transfer_row = qk_slot * QK_H_TILE
-                            qk_s0 = qk_sb * ATTN_K_TILE
-                            if qk_s0 < WIN:
-                                qk_kv_half = pl.tile.full([ATTN_K_TILE // 2, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                            qk_l1_row = (qk_tick % QK_TRANSFER_SLOTS) * ATTN_K_TILE
+                            if qk_block_kind == 2:
+                                qk_window = qk_l1
                                 qk_pos = pl.cast(pl.read(position_ids, [gather_t, 0]), pl.INDEX)
-                                qk_win_len = pl.min(qk_pos + 1, WIN)
-                                qk_win_start = qk_pos - qk_win_len + 1
-                                qk_head = (qk_win_start + qk_s0) % BLOCK_SIZE
-                                qk_rows = pl.min(pl.max(qk_win_len - qk_s0 - qk_lane_kv, 0), ATTN_K_TILE // 2)
+                                qk_win_head = (qk_pos - WIN + 1) % BLOCK_SIZE
                                 for qk_run in pl.unroll(SWA_RUNS):
-                                    qk_lo = pl.max(qk_run * BLOCK_SIZE - qk_head - qk_lane_kv, 0)
-                                    qk_hi = pl.min((qk_run + 1) * BLOCK_SIZE - qk_head - qk_lane_kv, qk_rows)
+                                    qk_lo = pl.max(qk_run * BLOCK_SIZE - qk_win_head, 0)
+                                    qk_hi = pl.min((qk_run + 1) * BLOCK_SIZE - qk_win_head, WIN)
                                     if qk_hi > qk_lo:
-                                        qk_raw_row = pl.read(window_swa_indices, [gather_t, qk_s0 + qk_lane_kv + qk_lo])
-                                        if qk_raw_row >= 0:
-                                            qk_kv_half = pl.gather_row(
-                                                qk_kv_half, ori_kv_flat, [qk_lo, 0], [qk_raw_row, 0],
-                                                [ATTN_K_TILE // 2, HEAD_DIM], valid_shape=[qk_hi - qk_lo, HEAD_DIM],
-                                            )
+                                        qk_raw_row = pl.read(window_swa_indices, [gather_t, qk_lo])
+                                        qk_window = pl.gather_row(
+                                            qk_window, ori_kv_flat, [qk_l1_row + qk_lo, 0], [qk_raw_row, 0],
+                                            [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_hi - qk_lo, HEAD_DIM],
+                                        )
+                                qk_loaded = pl.yield_(qk_window)
                             else:
-                                qk_cmp_k = qk_s0 + qk_lane_kv - WIN
-                                qk_src_masked = pl.load(cmp_sparse_indices, [gather_t, qk_cmp_k], [1, ATTN_K_TILE // 2])
-                                qk_kv_half = pl.tile.mgather(cmp_kv_flat, qk_src_masked, coalesce="row", gather_oob="zero")
-                            pl.store(qk_kv_half, [qk_kv_row + qk_lane_kv, 0], kv_transfer)
-                    if qk_tick > 0 and qk_tick <= qk_work_count:
-                        softmax_work = qk_tick - 1
-                        softmax_sb = softmax_work % SPARSE_BLOCKS
-                        softmax_t = (qk_item + (softmax_work // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
-                        if pl.read(valid_block_mask, [softmax_t, softmax_sb]) > 0:
-                            qk_slot = qk_core * QK_TRANSFER_SLOTS + softmax_work % QK_TRANSFER_SLOTS
-                            qk_transfer_row = qk_slot * QK_H_TILE
-                            qk_s0 = softmax_sb * ATTN_K_TILE
-                            pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
-                            qk_scores_half = pl.load(
-                                score_transfer, [qk_transfer_row + qk_lane_head, 0], [QK_H_TILE // 2, ATTN_K_TILE],
-                                target_memory=pl.MemorySpace.Vec,
-                            )
-                            qk_bias = pl.load(
-                                sparse_bias, [softmax_t, qk_s0], [1, ATTN_K_TILE], target_memory=pl.MemorySpace.Vec,
-                            )
-                            qk_scaled = pl.mul(qk_scores_half, SOFTMAX_SCALE)
-                            qk_masked = pl.col_expand_add(qk_scaled, qk_bias)
-                            qk_reduce_tmp = pl.create_tile([QK_H_TILE // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-                            qk_mi = pl.row_max(qk_masked, qk_reduce_tmp)
-                            qk_exp = pl.exp(pl.row_expand_sub(qk_masked, qk_mi))
-                            qk_li = pl.row_sum(qk_exp, qk_reduce_tmp)
-                            qk_probability = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                            pl.store(qk_probability, [qk_transfer_row + qk_lane_head, 0], probability_transfer)
+                                pl.system.sync_wait(QK_KV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+                                qk_staged = pl.gather_row(
+                                    qk_l1, kv_transfer, [qk_l1_row, 0], [qk_kv_row, 0], [ATTN_K_TILE, HEAD_DIM],
+                                )
+                                qk_loaded = pl.yield_(qk_staged)
+                            qk_l1_t = pl.tile.transpose_view(qk_loaded)
+                            qk_kv_t = pl.tile.slice(qk_l1_t, [HEAD_DIM, ATTN_K_TILE], [0, qk_l1_row])
+                            qk_scores = pl.matmul(qk_q, qk_kv_t, out_dtype=pl.FP32)
+                            pl.store(qk_scores, [qk_transfer_row, 0], score_transfer)
                             pl.system.sync_set(
-                                QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE3,
-                                ffts_mode=2, core_type=pl.KernelType.AIV,
+                                QK_SCORE_READY_EVENT, pipe=pl.PipeType.FIX,
+                                ffts_mode=2, core_type=pl.KernelType.AIC,
                             )
-                            stats_row = (softmax_work % QK_TRANSFER_SLOTS) * 2
-                            stats_m = pl.reshape(qk_mi, [1, QK_H_TILE // 2])
-                            stats_l = pl.reshape(qk_li, [1, QK_H_TILE // 2])
-                            stats_with_m = pl.tile.assemble(stats_iter, stats_m, [stats_row, 0])
-                            stats_with_l = pl.tile.assemble(stats_with_m, stats_l, [stats_row + 1, 0])
-                            stats_valid = pl.yield_(stats_with_l)
-                        else:
-                            stats_valid = pl.yield_(stats_iter)
-                        stats_next = pl.yield_(stats_valid)
-                    else:
-                        stats_next = pl.yield_(stats_iter)
-                    # Publish the next KV-ready event after the preceding softmax stores.
-                    if qk_tick < qk_work_count:
-                        publish_t = (qk_item + (qk_tick // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
-                        if pl.read(valid_block_mask, [publish_t, qk_tick % SPARSE_BLOCKS]) == 1:
-                            pl.system.sync_set(
-                                QK_KV_READY_EVENT, pipe=pl.PipeType.MTE3,
-                                ffts_mode=2, core_type=pl.KernelType.AIV,
-                            )
-                    if qk_tick >= QK_PRE_LAUNCH + 1:
-                        pv_work = qk_tick - QK_PRE_LAUNCH - 1
+                    if qk_tick >= QK_PRE_LAUNCH:
+                        pv_work = qk_tick - QK_PRE_LAUNCH
                         pv_sb = pv_work % SPARSE_BLOCKS
                         pv_t = (qk_item + (pv_work // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
                         if pl.read(valid_block_mask, [pv_t, pv_sb]) > 0:
                             pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_work % QK_TRANSFER_SLOTS
                             pv_transfer_row = pv_slot * QK_H_TILE
-                            pl.system.sync_wait(QK_PV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
-                            pv_stats_row = (pv_work % QK_TRANSFER_SLOTS) * 2
-                            pv_m_row = pl.tile.extract(stats_iter, pv_stats_row, 0, [1, QK_H_TILE // 2], target_memory=pl.MemorySpace.Vec)
-                            pv_l_row = pl.tile.extract(stats_iter, pv_stats_row + 1, 0, [1, QK_H_TILE // 2], target_memory=pl.MemorySpace.Vec)
-                            pv_m = pl.reshape(pv_m_row, [QK_H_TILE // 2, 1])
-                            pv_l = pl.reshape(pv_l_row, [QK_H_TILE // 2, 1])
-                            next_m = pl.maximum(m_iter, pv_m)
-                            alpha = pl.exp(pl.sub(m_iter, next_m))
-                            beta = pl.exp(pl.sub(pv_m, next_m))
-                            next_l = pl.add(pl.mul(alpha, l_iter), pl.mul(beta, pv_l))
-                            pv_left = pl.load(
-                                pv_transfer, [pv_transfer_row + qk_lane_head, 0], [QK_H_TILE // 2, HEAD_DIM // 2],
-                                target_memory=pl.MemorySpace.Vec,
+                            pl.system.sync_wait(QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
+                            pv_probability = pl.load(
+                                probability_transfer, [pv_transfer_row, 0], [QK_H_TILE, ATTN_K_TILE],
+                                target_memory=pl.MemorySpace.Mat,
                             )
-                            next_left = pl.add(pl.row_expand_mul(left_iter, alpha), pl.row_expand_mul(pv_left, beta))
-                            pv_right = pl.load(
-                                pv_transfer, [pv_transfer_row + qk_lane_head, HEAD_DIM // 2], [QK_H_TILE // 2, HEAD_DIM // 2],
-                                target_memory=pl.MemorySpace.Vec,
+                            pv_l1_row = (pv_work % QK_TRANSFER_SLOTS) * ATTN_K_TILE
+                            pv_probability_left = pl.tile.move(pv_probability, target_memory=pl.MemorySpace.Left)
+                            pv_first_right = pl.tile.extract(qk_l1, pv_l1_row, 0, [ATTN_K_TILE, 128], target_memory=pl.MemorySpace.Right)
+                            pv_previous = pl.tile.matmul(pv_probability_left, pv_first_right)
+                            for pv_n in pl.unroll(1, HEAD_DIM // 128):
+                                pv_next_right = pl.tile.extract(qk_l1, pv_l1_row, pv_n * 128, [ATTN_K_TILE, 128], target_memory=pl.MemorySpace.Right)
+                                pv_current = pl.tile.matmul(pv_probability_left, pv_next_right)
+                                pl.store(pv_previous, [pv_transfer_row, (pv_n - 1) * 128], pv_transfer)
+                                pv_previous = pv_current
+                            pl.store(pv_previous, [pv_transfer_row, HEAD_DIM - 128], pv_transfer)
+                            pl.system.sync_set(
+                                QK_PV_READY_EVENT, pipe=pl.PipeType.FIX,
+                                ffts_mode=2, core_type=pl.KernelType.AIC,
                             )
-                            next_right = pl.add(pl.row_expand_mul(right_iter, alpha), pl.row_expand_mul(pv_right, beta))
-                            m_valid, l_valid, left_valid, right_valid = pl.yield_(next_m, next_l, next_left, next_right)
-                        else:
-                            m_valid, l_valid, left_valid, right_valid = pl.yield_(m_iter, l_iter, left_iter, right_iter)
-                        # Publish on the final logical block, including an invalid final block.
-                        if FUSE_FINAL and pv_sb == SPARSE_BLOCKS - 1:
-                            m_cos_il = pl.load(rope_cos_il, [pv_t, 0], [1, ROPE_DIM])
-                            m_sin_signed = pl.load(rope_sin_signed, [pv_t, 0], [1, ROPE_DIM])
-                            for pub_h in pl.unroll((QK_H_TILE // 2) // H_TILE):
-                                pub_head = pub_h * H_TILE
-                                m_h0 = qk_head_base + qk_lane_head + pub_head
-                                # Extract ND rows before restoring column statistics, preserving head offsets.
-                                m_mi_row = pl.reshape(m_valid, [1, QK_H_TILE // 2])
-                                m_mi_part = pl.tile.extract(m_mi_row, 0, pub_head, [1, H_TILE], target_memory=pl.MemorySpace.Vec)
-                                m_mi = pl.reshape(m_mi_part, [H_TILE, 1])
-                                m_li_row = pl.reshape(l_valid, [1, QK_H_TILE // 2])
-                                m_li_part = pl.tile.extract(m_li_row, 0, pub_head, [1, H_TILE], target_memory=pl.MemorySpace.Vec)
-                                m_li = pl.reshape(m_li_part, [H_TILE, 1])
-                                m_left = pl.slice(left_valid, [H_TILE, HEAD_DIM // 2], [pub_head, 0])
-                                m_right = pl.slice(right_valid, [H_TILE, HEAD_DIM // 2], [pub_head, 0])
-                                m_oi = pl.concat(m_left, m_right)
-                                n_sink_bias = pl.load(attn_sink_col, [m_h0, 0], [H_TILE, 1])
-                                n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
-                                n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-                                n_full = pl.row_expand_div(m_oi, n_denom)
-                                n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
-                                # Inverse-RoPE head tile.
-                                m_rope = n_full[0:H_TILE, NOPE_DIM:HEAD_DIM]
-                                m_swapped = pl.tile.gather(n_full, m_swap_idx, m_gather_tmp)
-                                m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
-                                n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-                                n_full_bf16 = pl.concat(n_bf16[0:H_TILE, 0:NOPE_DIM], n_rope_bf16)
-
-                                n_group_bf16 = pl.reshape(n_full_bf16, [PUBLISH_GROUPS, O_GROUP_IN])
-                                n_pack_first = n_group_bf16[0:1, 0:O_GROUP_IN]
-                                n_pack_second = n_group_bf16[1:2, 0:O_GROUP_IN]
-                                n_pack_row = (m_h0 // HEADS_PER_GROUP) * T_PAD + pv_t
-                                n_pack_row_second = n_pack_row + T_PAD
-                                pl.store(n_pack_first, [n_pack_row, 0], o_packed_heads)
-                                pl.store(n_pack_second, [n_pack_row_second, 0], o_packed_heads)
-                        if FUSE_FINAL and pv_sb == SPARSE_BLOCKS - 1:
-                            reset_m = pl.load(attn_sink_col, [qk_head_base + qk_lane_head, 0], [QK_H_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
-                            reset_l = pl.tile.muls(reset_m, 0.0)
-                            reset_left = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-                            reset_right = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-                            m_reset, l_reset, left_reset, right_reset = pl.yield_(reset_m, reset_l, reset_left, reset_right)
+                for qk_aiv in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                    pl.system.set_ffts(ffts_workspace)
+                    qk_lane_head = qk_aiv * (QK_H_TILE // 2)
+                    qk_lane_kv = qk_aiv * (ATTN_K_TILE // 2)
+                    running_m = pl.load(attn_sink_col, [qk_head_base + qk_lane_head, 0], [QK_H_TILE // 2, 1], target_memory=pl.MemorySpace.Vec)
+                    running_l = pl.tile.muls(running_m, 0.0)
+                    running_left = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+                    running_right = pl.tile.full([QK_H_TILE // 2, HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+                    # Softmax statistics stay live until the delayed PV merge consumes their slot.
+                    stats_ring = pl.create_tile([QK_TRANSFER_SLOTS * 2, QK_H_TILE // 2], dtype=pl.FP32)
+                    for qk_tick, (m_iter, l_iter, left_iter, right_iter, stats_iter) in pl.range(
+                        qk_work_count + QK_PRE_LAUNCH + 1,
+                        init_values=(running_m, running_l, running_left, running_right, stats_ring),
+                    ):
+                        if qk_tick < qk_work_count:
+                            qk_sb = qk_tick % SPARSE_BLOCKS
+                            gather_t = (qk_item + (qk_tick // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
+                            if pl.read(valid_block_mask, [gather_t, qk_sb]) == 1:
+                                qk_slot = qk_core * QK_TRANSFER_SLOTS + qk_tick % QK_TRANSFER_SLOTS
+                                qk_kv_row = qk_slot * ATTN_K_TILE
+                                qk_transfer_row = qk_slot * QK_H_TILE
+                                qk_s0 = qk_sb * ATTN_K_TILE
+                                if qk_s0 < WIN:
+                                    qk_kv_half = pl.tile.full([ATTN_K_TILE // 2, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                                    qk_pos = pl.cast(pl.read(position_ids, [gather_t, 0]), pl.INDEX)
+                                    qk_win_len = pl.min(qk_pos + 1, WIN)
+                                    qk_win_start = qk_pos - qk_win_len + 1
+                                    qk_head = (qk_win_start + qk_s0) % BLOCK_SIZE
+                                    qk_rows = pl.min(pl.max(qk_win_len - qk_s0 - qk_lane_kv, 0), ATTN_K_TILE // 2)
+                                    for qk_run in pl.unroll(SWA_RUNS):
+                                        qk_lo = pl.max(qk_run * BLOCK_SIZE - qk_head - qk_lane_kv, 0)
+                                        qk_hi = pl.min((qk_run + 1) * BLOCK_SIZE - qk_head - qk_lane_kv, qk_rows)
+                                        if qk_hi > qk_lo:
+                                            qk_raw_row = pl.read(window_swa_indices, [gather_t, qk_s0 + qk_lane_kv + qk_lo])
+                                            if qk_raw_row >= 0:
+                                                qk_kv_half = pl.gather_row(
+                                                    qk_kv_half, ori_kv_flat, [qk_lo, 0], [qk_raw_row, 0],
+                                                    [ATTN_K_TILE // 2, HEAD_DIM], valid_shape=[qk_hi - qk_lo, HEAD_DIM],
+                                                )
+                                else:
+                                    qk_cmp_k = qk_s0 + qk_lane_kv - WIN
+                                    qk_src_masked = pl.load(cmp_sparse_indices, [gather_t, qk_cmp_k], [1, ATTN_K_TILE // 2])
+                                    qk_kv_half = pl.tile.mgather(cmp_kv_flat, qk_src_masked, coalesce="row", gather_oob="zero")
+                                pl.store(qk_kv_half, [qk_kv_row + qk_lane_kv, 0], kv_transfer)
+                        if qk_tick > 0 and qk_tick <= qk_work_count:
+                            softmax_work = qk_tick - 1
+                            softmax_sb = softmax_work % SPARSE_BLOCKS
+                            softmax_t = (qk_item + (softmax_work // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
+                            if pl.read(valid_block_mask, [softmax_t, softmax_sb]) > 0:
+                                qk_slot = qk_core * QK_TRANSFER_SLOTS + softmax_work % QK_TRANSFER_SLOTS
+                                qk_transfer_row = qk_slot * QK_H_TILE
+                                qk_s0 = softmax_sb * ATTN_K_TILE
+                                pl.system.sync_wait(QK_SCORE_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                                qk_scores_half = pl.load(
+                                    score_transfer, [qk_transfer_row + qk_lane_head, 0], [QK_H_TILE // 2, ATTN_K_TILE],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_bias = pl.load(
+                                    sparse_bias, [softmax_t, qk_s0], [1, ATTN_K_TILE], target_memory=pl.MemorySpace.Vec,
+                                )
+                                qk_scaled = pl.mul(qk_scores_half, SOFTMAX_SCALE)
+                                qk_masked = pl.col_expand_add(qk_scaled, qk_bias)
+                                qk_reduce_tmp = pl.create_tile([QK_H_TILE // 2, ATTN_K_TILE], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                                qk_mi = pl.row_max(qk_masked, qk_reduce_tmp)
+                                qk_exp = pl.exp(pl.row_expand_sub(qk_masked, qk_mi))
+                                qk_li = pl.row_sum(qk_exp, qk_reduce_tmp)
+                                qk_probability = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                                pl.store(qk_probability, [qk_transfer_row + qk_lane_head, 0], probability_transfer)
+                                pl.system.sync_set(
+                                    QK_PROB_READY_EVENT, pipe=pl.PipeType.MTE3,
+                                    ffts_mode=2, core_type=pl.KernelType.AIV,
+                                )
+                                stats_row = (softmax_work % QK_TRANSFER_SLOTS) * 2
+                                stats_m = pl.reshape(qk_mi, [1, QK_H_TILE // 2])
+                                stats_l = pl.reshape(qk_li, [1, QK_H_TILE // 2])
+                                stats_with_m = pl.tile.assemble(stats_iter, stats_m, [stats_row, 0])
+                                stats_with_l = pl.tile.assemble(stats_with_m, stats_l, [stats_row + 1, 0])
+                                stats_valid = pl.yield_(stats_with_l)
+                            else:
+                                stats_valid = pl.yield_(stats_iter)
+                            stats_next = pl.yield_(stats_valid)
                         else:
-                            m_reset, l_reset, left_reset, right_reset = pl.yield_(m_valid, l_valid, left_valid, right_valid)
-                        m_after, l_after, left_after, right_after = pl.yield_(m_reset, l_reset, left_reset, right_reset)
-                    else:
-                        m_after, l_after, left_after, right_after = pl.yield_(m_iter, l_iter, left_iter, right_iter)
-                    running_m, running_l, running_left, running_right, stats_ring = pl.yield_(
-                        m_after, l_after, left_after, right_after, stats_next,
-                    )
-                if not FUSE_FINAL:
+                            stats_next = pl.yield_(stats_iter)
+                        # Publish the next KV-ready event after the preceding softmax stores.
+                        if qk_tick < qk_work_count:
+                            publish_t = (qk_item + (qk_tick // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
+                            if pl.read(valid_block_mask, [publish_t, qk_tick % SPARSE_BLOCKS]) == 1:
+                                pl.system.sync_set(
+                                    QK_KV_READY_EVENT, pipe=pl.PipeType.MTE3,
+                                    ffts_mode=2, core_type=pl.KernelType.AIV,
+                                )
+                        if qk_tick >= QK_PRE_LAUNCH + 1:
+                            pv_work = qk_tick - QK_PRE_LAUNCH - 1
+                            pv_sb = pv_work % SPARSE_BLOCKS
+                            pv_t = (qk_item + (pv_work // SPARSE_BLOCKS) * qk_workers) // (H // QK_H_TILE)
+                            if pl.read(valid_block_mask, [pv_t, pv_sb]) > 0:
+                                pv_slot = qk_core * QK_TRANSFER_SLOTS + pv_work % QK_TRANSFER_SLOTS
+                                pv_transfer_row = pv_slot * QK_H_TILE
+                                pl.system.sync_wait(QK_PV_READY_EVENT, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIV)
+                                pv_stats_row = (pv_work % QK_TRANSFER_SLOTS) * 2
+                                pv_m_row = pl.tile.extract(stats_iter, pv_stats_row, 0, [1, QK_H_TILE // 2], target_memory=pl.MemorySpace.Vec)
+                                pv_l_row = pl.tile.extract(stats_iter, pv_stats_row + 1, 0, [1, QK_H_TILE // 2], target_memory=pl.MemorySpace.Vec)
+                                pv_m = pl.reshape(pv_m_row, [QK_H_TILE // 2, 1])
+                                pv_l = pl.reshape(pv_l_row, [QK_H_TILE // 2, 1])
+                                next_m = pl.maximum(m_iter, pv_m)
+                                alpha = pl.exp(pl.sub(m_iter, next_m))
+                                beta = pl.exp(pl.sub(pv_m, next_m))
+                                next_l = pl.add(pl.mul(alpha, l_iter), pl.mul(beta, pv_l))
+                                pv_left = pl.load(
+                                    pv_transfer, [pv_transfer_row + qk_lane_head, 0], [QK_H_TILE // 2, HEAD_DIM // 2],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                                next_left = pl.add(pl.row_expand_mul(left_iter, alpha), pl.row_expand_mul(pv_left, beta))
+                                pv_right = pl.load(
+                                    pv_transfer, [pv_transfer_row + qk_lane_head, HEAD_DIM // 2], [QK_H_TILE // 2, HEAD_DIM // 2],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                                next_right = pl.add(pl.row_expand_mul(right_iter, alpha), pl.row_expand_mul(pv_right, beta))
+                                m_valid, l_valid, left_valid, right_valid = pl.yield_(next_m, next_l, next_left, next_right)
+                            else:
+                                m_valid, l_valid, left_valid, right_valid = pl.yield_(m_iter, l_iter, left_iter, right_iter)
+                            m_after, l_after, left_after, right_after = pl.yield_(m_valid, l_valid, left_valid, right_valid)
+                        else:
+                            m_after, l_after, left_after, right_after = pl.yield_(m_iter, l_iter, left_iter, right_iter)
+                        running_m, running_l, running_left, running_right, stats_ring = pl.yield_(
+                            m_after, l_after, left_after, right_after, stats_next,
+                        )
                     qk_output_row = qk_t * H + qk_head_base + qk_lane_head
                     pl.store(running_m, [qk_output_row, 0], attn_mi)
                     pl.store(running_l, [qk_output_row, 0], attn_li)
                     pl.store(running_left, [qk_output_row, 0], attn_oi)
                     pl.store(running_right, [qk_output_row, HEAD_DIM // 2], attn_oi)
+        qk_tid = stats_tid
 
     return (
         attn_mi, attn_li, attn_oi,
