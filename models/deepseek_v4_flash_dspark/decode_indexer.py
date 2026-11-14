@@ -1096,7 +1096,8 @@ def indexer_qr_rope(
     dq_rope_workers = pl.min(dq_rope_units, DQ_ROPE_WORKERS)
     for dq_rope_worker in pl.spmd(dq_rope_workers, name_hint="idx_qr_dequant_rope", allow_early_resolve=True):
         swap_i = pl.tile.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
-        swap_tmp = pl.create_tile([1, ROPE_HEAD_DIM], dtype=pl.INT32)
+        # INT32 TREMS scratch includes two data areas, an aligned mask and an address block.
+        swap_tmp = pl.create_tile([1, 2 * ROPE_HEAD_DIM + ((ROPE_HEAD_DIM + 255) // 256) * 8 + 8], dtype=pl.INT32)
         swap_lane = pl.tile.rems(swap_i, 2, swap_tmp)
         swap_row = pl.tile.adds(pl.tile.sub(swap_i, pl.tile.muls(swap_lane, 2)), IDX_NOPE_HEAD_DIM + 1)
         swap_base = pl.create_tile([DEQUANT_T_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
