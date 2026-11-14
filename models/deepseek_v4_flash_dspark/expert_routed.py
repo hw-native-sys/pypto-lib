@@ -11,6 +11,8 @@
 
 import pypto.language as pl
 
+from expert_routed_m64 import expert_routed_tile_m64
+
 from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
                     EP, RECV_MAX, MOE_TOKENS)
 
@@ -27,7 +29,7 @@ SWIGLU_LIMIT = M.swiglu_limit
 N_LOCAL_EXPERTS = M.n_routed_experts // EP
 
 # tiling
-RECV_TILE = 16 if MOE_TOKENS <= 8 else 64
+RECV_TILE = 16 if MOE_TOKENS <= 8 else (128 if RECV_MAX % 128 == 0 else 64)
 W2_EXPERT_ROWS = (MOE_TOKENS * M.num_experts_per_tok + N_LOCAL_EXPERTS - 1) // N_LOCAL_EXPERTS
 K_TILE = 512
 INTER_K = 256 if W2_EXPERT_ROWS >= 2 * RECV_TILE else 512
@@ -36,14 +38,28 @@ MM_GATE_INNER = 2
 ACT_INTER_TILE = MOE_INTER // 2
 D_OUT_TILE = 512 if W2_EXPERT_ROWS >= 2 * RECV_TILE else 256
 QUANT_ROW_TILE = 8
-D_OUT_TILE_ACT = 512 if MOE_TOKENS <= 8 else 256
+D_OUT_TILE_ACT = 512 if MOE_TOKENS <= 8 else (128 if RECV_TILE == 128 else 256)
 W2_INNER = 2
 W2_ACT_INNER = 8
-ZERO_D_TILE = 1024
+ZERO_D_TILE = 512 if RECV_TILE == 128 else 1024
 ZERO_WORKERS = 40
 TILES_PER_EXPERT = RECV_MAX // RECV_TILE
+TAIL_TILE = min(64, RECV_TILE)
 
 assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
+
+
+@pl.jit.extern(core_type="aic", source="kernels/expert/gate_up.cpp")
+def _gate_up_native(
+    x: pl.Tensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
+    gate: pl.Out[pl.Tensor[[RECV_TILE, MOE_INTER], pl.INT32]],
+    up: pl.Out[pl.Tensor[[RECV_TILE, MOE_INTER], pl.INT32]],
+    w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
+    w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8, pl.NZ],
+    row: pl.Scalar[pl.INDEX],
+    expert: pl.Scalar[pl.INDEX],
+) -> tuple[pl.Tensor[[RECV_TILE, MOE_INTER], pl.INT32], pl.Tensor[[RECV_TILE, MOE_INTER], pl.INT32]]:
+    return gate, up
 
 
 @pl.jit.inline(auto_scope=False)
@@ -74,25 +90,10 @@ def expert_routed_tile(
         up_tile_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
 
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_up_mm", deps=[inputs_ready]):
-            # Reuse each input chunk across the two expert projections.
-            pl.set_cache_policy(routed_w1, pl.CachePolicy.BYPASS)
-            pl.set_cache_policy(routed_w3, pl.CachePolicy.BYPASS)
-            block = pl.tile.get_block_idx()
-            n_base = block * (MM_GATE_INNER * MM_INTER_TILE)
-            x_l1 = pl.create_l1([RECV_TILE, D], dtype=pl.INT8)
-            x_l1 = pl.gather_row(x_l1, recv_x_flat, [0, 0], [flat_tile_row, 0], [RECV_TILE, D])
-            for inner in pl.range(MM_GATE_INNER):
-                n0 = n_base + inner * MM_INTER_TILE
-                gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, D, K_TILE, stage=1):
-                    x_chunk = x_l1[:, k0 : k0 + K_TILE]
-                    w1_chunk = routed_w1[local_e : local_e + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                    w3_chunk = routed_w3[local_e : local_e + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                    gate_acc = pl.matmul_acc(gate_acc, x_chunk, w1_chunk, b_trans=True, init_cond=(k0 == 0))
-                    up_acc = pl.matmul_acc(up_acc, x_chunk, w3_chunk, b_trans=True, init_cond=(k0 == 0))
-                gate_tile_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(gate_acc, [RECV_TILE, MM_INTER_TILE])
-                up_tile_i32[:, n0 : n0 + MM_INTER_TILE] = pl.reshape(up_acc, [RECV_TILE, MM_INTER_TILE])
+            gate_tile_i32, up_tile_i32 = _gate_up_native(
+                recv_x_flat, gate_tile_i32, up_tile_i32,
+                routed_w1, routed_w3, flat_tile_row, local_e,
+            )
 
         with pl.spmd(RECV_TILE // QUANT_ROW_TILE, name_hint="exp_gate_up_act_q") as quant_tid:
             quant_block = pl.tile.get_block_idx()
@@ -239,15 +240,26 @@ def expert_routed_test(
             tile_row = tile * RECV_TILE
             valid_rows = pl.min(RECV_TILE, n_rows - tile_row)
             flat_tile_row = local_e * RECV_MAX + tile_row
-            with pl.scope():
-                recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
-                expert_routed_tile(
-                    recv_x, recv_scale_dq, recv_weights,
-                    routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
-                    recv_y_tile,
-                    local_e, tile_row, valid_rows, inputs_ready,
-                )
-                recv_y_flat[flat_tile_row : flat_tile_row + RECV_TILE, :] = recv_y_tile
+            if valid_rows > 64 or RECV_TILE <= 64:
+                with pl.scope():
+                    recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
+                    expert_routed_tile(
+                        recv_x, recv_scale_dq, recv_weights,
+                        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                        recv_y_tile,
+                        local_e, tile_row, valid_rows, inputs_ready,
+                    )
+                    recv_y_flat[flat_tile_row : flat_tile_row + RECV_TILE, :] = recv_y_tile
+            else:
+                with pl.scope():
+                    recv_y_tail = pl.create_tensor([TAIL_TILE, D], dtype=pl.BF16)
+                    expert_routed_tile_m64(
+                        recv_x, recv_scale_dq, recv_weights,
+                        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale,
+                        recv_y_tail,
+                        local_e, tile_row, valid_rows, inputs_ready,
+                    )
+                    recv_y_flat[flat_tile_row : flat_tile_row + TAIL_TILE, :] = recv_y_tail
     return recv_y
 
 

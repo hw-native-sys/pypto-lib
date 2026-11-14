@@ -209,6 +209,31 @@ rather than 8.
 all-gathers the group's hidden rows, projects them against this card's
 `vocab / tp` shard, and all-to-alls the logits back to their row owners.
 
+### Routed-expert gate/up row tiling
+
+The routed-expert path uses 128-row tiles when more than 64 rows remain, and
+retains the 64-row implementation for a shorter tail. Small decode keeps its
+16-row tile. The 128-row native gate/up kernel packs the two projections along
+the output-column axis in L1 and uses two L0 operand slots. It streams X and
+weights through two L1 slots and prefetches across output-column tiles.
+The gate/up results remain separate INT32 tensors consumed by the existing
+activation and quantization path. Zeroing and W2 output conversion use smaller
+column fragments to keep the larger row tile within UB capacity.
+
+This changes task granularity and weight reuse without increasing row padding
+relative to 64-row tiles. It preserves cached gate/up weights and the existing
+W2 cache policy. Performance depends on per-expert occupancy; a single-core
+simulator utilization figure is not a full-model performance result.
+
+The [recorded single-device comparison](expert-gate-up-benchmark.json) uses
+B64/S6, 16 local experts, receive capacity 256, and a cached-weight control.
+With two warmups and ten measurements per ABBA group, the complete expert
+chain's median device interval falls from 1207.160 to 1093.729 microseconds
+(9.40%). This includes W2 and activation stages, but excludes EP communication
+and the full network. The normal, boundary, and small-batch golden checks
+passed; the measured outputs also match the frozen control bit for bit.
+The MoE composition with the adaptive call sites has compile-only coverage.
+
 ### The DSpark drafter
 
 The drafter is a small model of its own, run after the target step over the
