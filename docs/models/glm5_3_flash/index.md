@@ -829,6 +829,34 @@ for EP2/EP4 and select 512 MiB for EP8 or 1 GiB for EP16 on ring zero. An enclos
 forward must additionally budget its own live allocations and pass sufficient
 runtime capacity; see [runtime ring sizing](../../debug-and-tune/ring-heap-and-scope-stats.md).
 
+### Complete MoE daily performance cases
+
+The [daily performance manifest](../../../.github/scripts/perf_cases.json)
+also includes two distributed complete-FFN workloads on a2a3:
+
+| Case | Entry | Tokens per rank | Devices |
+|---|---|---:|---:|
+| `glm5.3-flash-prefill-moe-full-ep2-t64` | `layer.py` | 64 | 2 |
+| `glm5.3-flash-decode-moe-full-ep2-t16` | `decode_layer.py` | 16 | 2 |
+
+Both start with BF16 hidden states and include input RMSNorm, activation
+quantization, router and TopK selection, EP dispatch, routed experts,
+return/combine, the complete replicated shared expert, and the final branch
+addition. They retain the entries' generated-weight fixtures and original
+Torch golden checks. Attention and mHC mixing are outside the measured FFN.
+
+These EP2 workloads supplement the versioned A3 local-shard reference cases;
+they do not use that profile's TP16 shared-expert slicing. The existing
+multi-device daily runner allocates two devices and executes each entry
+directly. No single-device CPU-preparation adapter is required.
+
+The manifest selects 100 timed rounds after 10 warmup rounds. Each entry
+executes two complete FFN transactions with successive notification epochs
+per round. The daily `Effective (us)` value is the fastest rank's median of
+those two-transaction totals. Results appear in the workflow run's Summary
+and performance artifacts; this metric is component device time, not
+whole-model generation latency.
+
 ### Routed expert measurements
 
 `expert_routed.py` pairs the INT8 Gate/Up projections around a resident L1
