@@ -33,7 +33,7 @@ template <typename T> __aicore__ inline __ubuf__ T *ub(int offset) {
     TASSIGN(tile, offset);
     return tile.data();
 }
-__tf__ __aicore__ void encode(__ubuf__ float* source, __ubuf__ uint32_t* keys, int begin, int last) {
+__tf__ __aicore__ void encode(__ubuf__ float* source, __ubuf__ uint32_t* keys, int begin, int last, int width) {
     __VEC_SCOPE__ {
         vector_f32 value;
         vector_u32 sign, positive, negative, key, tail, index;
@@ -41,7 +41,7 @@ __tf__ __aicore__ void encode(__ubuf__ float* source, __ubuf__ uint32_t* keys, i
         auto all = pset_b32(PAT_ALL);
         vbr(sign, uint32_t(0x80000000));
         vbr(tail, uint32_t(0xf149f2ca));
-        for (uint16_t chunk = 0; chunk < 16; ++chunk) {
+        for (uint16_t chunk = 0; chunk < (width + 63) / 64; ++chunk) {
             vlds(value, source, chunk * 64, NORM);
             vmaxs(value, value, -1e30f, all, MODE_ZEROING);
             vadds(value, value, 0.0f, all, MODE_ZEROING);
@@ -267,20 +267,20 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         uint32_t cutoff = 0;
         int boundary = -1;
         if (blocks > selected) {
-            for (int block = 0; block < blocks; block += 1024) {
-                if (args[5]) {
-                    int valid = minimum(1024, blocks - block);
-                    Tile<TileType::Vec, float, 1, 1024, BLayout::RowMajor, 1, DYNAMIC> input(valid);
-                    TASSIGN(input, 65536);
-                    GlobalTensor<float, TileShape2D<float, 1, DYNAMIC>, BaseShape2D<float, 1, DYNAMIC>> gm(
-                        data<float>(args, 0) + int64_t(token) * width + block,
-                        TileShape2D<float, 1, DYNAMIC>(1, valid), BaseShape2D<float, 1, DYNAMIC>(1, valid));
-                    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-                    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-                    TLOAD(input, gm);
-                    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                } else {
+            if (args[5]) {
+                Tile<TileType::Vec, float, 1, 32768, BLayout::RowMajor, 1, DYNAMIC> input(blocks);
+                TASSIGN(input, 0);
+                GlobalTensor<float, TileShape2D<float, 1, DYNAMIC>, BaseShape2D<float, 1, DYNAMIC>> gm(
+                    data<float>(args, 0) + int64_t(token) * width,
+                    TileShape2D<float, 1, DYNAMIC>(1, blocks), BaseShape2D<float, 1, DYNAMIC>(1, blocks));
+                set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+                wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+                TLOAD(input, gm);
+                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                encode(input.data(), ub<uint32_t>(131072), 0, blocks - 1, blocks);
+            } else {
+                for (int block = 0; block < blocks; block += 1024) {
                     int valid = minimum(8192, width - block * 8);
                     TEXPANDS(full, -1e30f);
                     Tile<TileType::Vec, float, 1, 8192, BLayout::RowMajor, 1, DYNAMIC> input(valid);
@@ -294,12 +294,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
                     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                     TROWMAX(maxima, grouped, tmp);
+                    encode(maxima.data(), ub<uint32_t>(131072) + block, block, blocks - 1, 1024);
                 }
-                encode(maxima.data(), ub<uint32_t>(98304) + block, block, blocks - 1);
             }
             pipe_barrier(PIPE_ALL);
             int rank = blocks - selected + 1, count = 0;
-            pack_upper_keys(ub<uint32_t>(98304), ub<uint16_t>(0), blocks);
+            pack_upper_keys(ub<uint32_t>(131072), ub<uint16_t>(0), blocks);
             packed_histogram<8>(ub<uint16_t>(0), ub<uint16_t>(73728), blocks, 0);
             choose_bin(ub<uint16_t>(73728), 24, cutoff, rank, count);
             packed_histogram<0>(ub<uint16_t>(0), ub<uint16_t>(73728), blocks, cutoff >> 16);
@@ -309,19 +309,19 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
                 if (cutoff < 0x80000000u)
                     cutoff |= 0xffffu;
             } else {
-                histogram<8>(ub<uint32_t>(98304), ub<uint16_t>(73728), blocks, cutoff);
+                histogram<8>(ub<uint32_t>(131072), ub<uint16_t>(73728), blocks, cutoff);
                 choose_bin(ub<uint16_t>(73728), 8, cutoff, rank, count);
-                histogram<0>(ub<uint32_t>(98304), ub<uint16_t>(73728), blocks, cutoff);
+                histogram<0>(ub<uint32_t>(131072), ub<uint16_t>(73728), blocks, cutoff);
                 choose_bin(ub<uint16_t>(73728), 0, cutoff, rank, count);
             }
-            equal_indices(ub<uint32_t>(98304), ub<uint16_t>(0), blocks, cutoff);
+            equal_indices(ub<uint32_t>(131072), ub<uint16_t>(0), blocks, cutoff);
             set_flag(PIPE_V, PIPE_S, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
             boundary = ub<uint16_t>(0)[count - rank];
             set_flag(PIPE_S, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_S, PIPE_V, EVENT_ID0);
         }
-        select(ub<uint32_t>(98304), ub<uint32_t>(65536), blocks, cutoff, boundary, blocks <= selected);
+        select(ub<uint32_t>(131072), ub<uint32_t>(65536), blocks, cutoff, boundary, blocks <= selected);
         Tile<TileType::Vec, uint32_t, 1, 2048, BLayout::RowMajor, 1, DYNAMIC> ids(capacity);
         TASSIGN(ids, 65536);
         GlobalTensor<uint32_t, TileShape2D<uint32_t, 1, DYNAMIC>, BaseShape2D<uint32_t, 1, DYNAMIC>> gm(

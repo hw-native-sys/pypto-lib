@@ -904,14 +904,14 @@ namespace {
         }
 
         __aicore__ inline void gather_pool_half(__gm__ int64_t* args, int panel, __gm__ uint8_t* ring,
-                                                bool reuse) {
+                                                int slot, bool reuse) {
             int lane = get_subblockid();
-            int ub_base = lane == 0 ? 0 : 65536;
+            int ub_base = lane == 0 ? (slot == 0 ? 0 : 147456) : (slot == 0 ? 65536 : 222208);
             auto physical = ub<uint32_t>(lane == 0 ? 49152 : 82944) + panel * 64 + lane * 32;
             auto payload = data<uint8_t>(args, 3);
             auto scale = data<uint8_t>(args, 4);
             if (reuse)
-                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
+                wait_flag(PIPE_MTE3, PIPE_MTE2, event_t(4 + slot));
 #pragma unroll 8
             for (int pair = 0; pair < 16; ++pair) {
                 uint64_t addresses = reinterpret_cast<__ubuf__ uint64_t*>(physical)[pair];
@@ -945,11 +945,11 @@ namespace {
             Vec<uint8_t, 1, 1024> scales;
             TASSIGN(keys, ub_base);
             TASSIGN(scales, ub_base + 16384);
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID4);
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID4);
+            set_flag(PIPE_MTE2, PIPE_MTE3, event_t(4 + slot));
+            wait_flag(PIPE_MTE2, PIPE_MTE3, event_t(4 + slot));
             store_value((GM<uint8_t, 256, 64, 256, 64>(ring + lane * 16384)), keys);
             store_value((GM<uint8_t, 1, 1024, 1, 1024>(ring + 32768 + lane * 1024)), scales);
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
+            set_flag(PIPE_MTE3, PIPE_MTE2, event_t(4 + slot));
         }
 #endif
 
@@ -987,7 +987,6 @@ namespace {
                 int panels = last_panel > first_panel ? last_panel - first_panel : 0;
                 auto metadata = data<int32_t>(args, 14) + worker * 20480 + 17408;
                 bool gathered_slot0 = false, gathered_slot1 = false;
-                bool gathered_once = false;
 #if defined(__DAV_CUBE__)
                 Tile<TileType::Mat, F4, 32, 128, BLayout::ColMajor, 32, 128, SLayout::RowMajor> query;
                 TASSIGN(query, 0);
@@ -1151,13 +1150,12 @@ namespace {
                     if (!direct) {
                         if (slot == 0 ? gathered_slot0 : gathered_slot1)
                             wait_intra_block(PIPE_MTE2, 9 + slot * 2);
-                        gather_pool_half(args, panel, ring, gathered_once);
+                        gather_pool_half(args, panel, ring, slot, slot == 0 ? gathered_slot0 : gathered_slot1);
                         set_intra_block(PIPE_MTE3, 8 + slot * 2);
                         if (slot == 0)
                             gathered_slot0 = true;
                         else
                             gathered_slot1 = true;
-                        gathered_once = true;
                     }
                     if (get_subblockid() == 1) {
                         wait_intra_block(PIPE_V, slot * 2);
@@ -1188,8 +1186,10 @@ namespace {
                     wait_intra_block(PIPE_MTE2, 9);
                 if (gathered_slot1)
                     wait_intra_block(PIPE_MTE2, 11);
-                if (gathered_once)
+                if (gathered_slot0)
                     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
+                if (gathered_slot1)
+                    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID5);
                 if (get_subblockid() == 1) {
                     CandidateKeys keys;
                     CandidateIndices indices;
@@ -1199,13 +1199,22 @@ namespace {
                     int cached_width = panels * 512;
                     local_select(keys.data(), indices.data(), ub<uint16_t>(98304), cached_width,
                                  first_panel * 512, ub<uint16_t>(251904));
-                    int output_offset = (token * workers + worker) * 512;
-                    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                    store_value((GM<uint16_t, 1, 512, 1, 512>(data<uint16_t>(args, 10) + output_offset)),
-                                keys);
-                    store_value((GM<uint32_t, 1, 512, 1, 512>(data<uint32_t>(args, 11) + output_offset)),
-                                indices);
+                    bool complete = first_panel == 0 && next == (token + 1) * token_panels;
+                    if (complete) {
+                        pool_map(indices.data(), ub<uint32_t>(134656), ub<uint32_t>(143360));
+                        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                        store_value((GM<uint32_t, 1, 512, 1, 512>(data<uint32_t>(args, 8) + token * 512)),
+                                    indices);
+                    } else {
+                        int output_offset = (token * workers + worker) * 512;
+                        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                        store_value((GM<uint16_t, 1, 512, 1, 512>(data<uint16_t>(args, 10) + output_offset)),
+                                    keys);
+                        store_value((GM<uint32_t, 1, 512, 1, 512>(data<uint32_t>(args, 11) + output_offset)),
+                                    indices);
+                    }
                     pipe_barrier(PIPE_ALL);
                     set_intra_block(PIPE_MTE3, 6);
                 } else {
@@ -1227,6 +1236,8 @@ namespace {
             for (int token = worker; token < tokens; token += workers * 2) {
                 int first = ((token * panels + 1) * owners - 1) / total;
                 int last = (((token + 1) * panels) * owners - 1) / total;
+                if (first == last)
+                    continue;
                 int count = (last - first + 1) * 512;
                 int offset = (token * workers + first) * 512;
                 Tile<TileType::Vec, uint16_t, 1, 16384, BLayout::RowMajor, 1, DYNAMIC> keys(count);
